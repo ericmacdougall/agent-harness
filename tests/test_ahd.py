@@ -71,6 +71,10 @@ def owner(agent, state, idle=1900, typ="task-owner", task="build the thing", tic
             "idle_s": idle, "ticket": ticket, "last_activity": last}
 
 
+def mono_deadline():
+    return time.monotonic() + 30
+
+
 class Scratch(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -267,7 +271,10 @@ class BadInputs(Scratch):
         self.assertEqual(list(self.ring()), [good["key"]])
         self.owners([owner("a1111111111111111", "SILENT")])
         self.daemon().tick()
-        self.assertEqual(self.alert_calls("raise"), [])  # already active: the torn tail did not hide it
+        # already active, so the torn tail did not hide it: the only raise is a refresh of the fixture's short text
+        calls = self.alert_calls("raise")
+        self.assertEqual(len(calls), 1)
+        self.assertIn('"updated": true', " ".join(calls[0]))
 
     def test_wal_asks_survive_malformed_lines_and_truncation(self):
         lines = [json.dumps({"at": "2027-01-15T07:00:00+00:00", "event": "ask", "id": "w1", "note": "need key"}),
@@ -423,6 +430,174 @@ class EscalationAndTickets(Scratch):
 
 
 AH_PY = HOOKS / "ah.py"
+
+
+class AlertTextRefresh(unittest.TestCase):
+    """ahd must not inherit the frozen text or the false-drop bug from ops-watch (GoodQA goodqa#14740)."""
+
+    def flag(self, message, severity="high"):
+        return {"severity": severity, "class": "liveness", "kind": "liveness", "subject": "s.t", "since": 100,
+                "message": message, "detail": {"ticket": "goodqa#1"}}
+
+    def ring(self, message, at="2027-01-15T07:00:00+00:00", severity="high"):
+        return {"k": {"event": "raise", "severity": severity, "message": message, "at": at}}
+
+    def test_state_change_at_the_same_severity_refreshes(self):
+        plan = ahd.plan_transitions({"k": self.flag("owner DROPPED: a1")}, self.ring("owner SILENT-HIGH: a1"), now=NOW)
+        self.assertEqual([(op, k) for op, k, _, _ in plan], [("raise", "k")])
+        self.assertTrue(plan[0][2]["detail"]["updated"])
+
+    def test_same_text_plans_nothing(self):
+        self.assertEqual(ahd.plan_transitions({"k": self.flag("same")}, self.ring("same"), now=NOW), [])
+
+    def test_lower_severity_replaces_the_stale_one(self):
+        plan = ahd.plan_transitions({"k": self.flag("x", "warning")}, self.ring("x"), now=NOW)
+        self.assertEqual(plan[0][2]["severity"], "warning")
+
+    def test_refresh_key_differs_by_text_and_repeats_for_the_same_text(self):
+        d = ahd.Daemon.__new__(ahd.Daemon)
+        d.host = "h"
+        plan = lambda m: ahd.plan_transitions({"k": self.flag(m)}, self.ring("old"), now=NOW)[0][2]
+        self.assertNotEqual(d.key_for("raise", "k", plan("one"), None), d.key_for("raise", "k", plan("two"), None))
+        self.assertEqual(d.key_for("raise", "k", plan("one"), None), d.key_for("raise", "k", plan("one"), None))
+
+    def test_refresh_posts_no_ticket_comment(self):
+        d = ahd.Daemon.__new__(ahd.Daemon)
+        d.host, d.policy, d.call = "h", {"goodqa_poster": ["darwin", "linux"]}, mock.Mock(return_value=(0, {}))
+        d.posts_goodqa = lambda: True
+        f = ahd.plan_transitions({"k": self.flag("new")}, self.ring("old"), now=NOW)[0][2]
+        d.ticket_comment("k", f, mono_deadline())
+        d.call.assert_not_called()
+
+    def test_only_real_owner_rows_alert(self):
+        rows = [dict(owner("a1111111", "returned", typ="general-purpose"), owner=False),
+                dict(owner("a2222222", "idle-helper", typ=None), owner=False),
+                owner("a3333333", "finishing", typ="general-purpose"),
+                owner("a4444444", "DROPPED", typ="general-purpose"),
+                dict(owner("a5555555", "DROPPED", typ="general-purpose"), owner=False)]  # only the owner check stops it
+        got = ahd.liveness_alerts({SESSION: {"owners": rows}}, ahd.load_policy())
+        self.assertEqual([f["detail"]["agent"] for f in got.values()], ["a4444444"])
+
+
+class FakeAhWriter:
+    """Idempotent on --key and writes through the real ops_watch.emit, so redaction and slot limits are the real ones.
+    What `ah alert raise` is expected to do; the real verb is not merged."""
+
+    def __init__(self, ring, at):
+        self.ring, self.at, self.seen, self.calls, self.writes = ring, at, set(), 0, 0
+
+    def call(self, verb, args, deadline, stdin=None):
+        self.calls += 1
+        opt = {args[i]: args[i + 1] for i in range(0, len(args) - 1, 2)}
+        if opt["--key"] in self.seen:
+            return 0, {"result": "duplicate"}
+        self.seen.add(opt["--key"])
+        self.writes += 1
+        import ops_watch
+        kind = verb.split()[-1]
+        ops_watch.emit({"host": ahd.host(), "source": "ahd", "event": kind, "severity": opt.get("--severity", "info"),
+                        "key": opt["--alert-key"], "message": opt.get("--message", "cleared"), "at": self.at(),
+                        "detail": json.loads(opt.get("--detail", "{}"))}, path=self.ring)
+        return 0, {"result": "applied"}
+
+
+class RefreshThroughARealRing(Scratch):
+    """Review round 1 of goodqa#14740. A tick is 60 s."""
+
+    KEY = "liveness:s/agent-a1"
+
+    def setUp(self):
+        super().setUp()
+        self.ring_file = self.home / ".agent-harness" / "state" / "alerts.jsonl"
+        self.ring_file.parent.mkdir(parents=True)
+        self.d = self.daemon()
+        self.ah = FakeAhWriter(self.ring_file, lambda: ahd.iso(self.t))
+        self.d.call = self.ah.call
+        self.d.posts_goodqa = lambda: False
+
+    def flag(self, message, severity="high", since=100):
+        return {"severity": severity, "class": "liveness", "kind": "liveness", "subject": "s.a1", "since": since,
+                "message": message, "detail": {"agent": "a1"}}
+
+    def tick(self, flag):
+        ring = ahd.ring_state(ahd.read_ring(), "ahd", ahd.host())
+        plan = ahd.plan_transitions({self.KEY: flag}, ring, now=self.t)
+        self.d.send(plan, time.monotonic() + 60)
+        return ahd.ring_state(ahd.read_ring(), "ahd", ahd.host())[self.KEY]
+
+    def wrap_the_ring(self):
+        import ops_watch
+        for i in range(ahd.RING_SLOTS + 8):
+            ops_watch.emit({"host": "other", "source": "noise", "event": "raise", "severity": "info", "key": f"n{i}",
+                            "message": "x", "at": ahd.iso(self.t)}, path=self.ring_file)
+
+    def test_redacted_text_writes_once_in_six_hours(self):
+        # emit redacts this, so the ring's text can never equal the message
+        message = "owner SILENT: a1 (general-purpose) fix auth redirect token=abcdef1234567890abcdef"
+        for i in range(360):
+            self.t = NOW + i * 60
+            row = self.tick(self.flag(message))
+        self.assertNotEqual(row["message"], message, "vacuous: emit did not change this text")
+        self.assertEqual(self.ah.writes, 1)
+        self.assertEqual(self.ah.calls, 1)
+
+    def test_redacted_text_writes_once_on_a_wrapped_ring(self):
+        self.wrap_the_ring()
+        message = "owner SILENT: a1 fix auth redirect token=abcdef1234567890abcdef"
+        for i in range(360):
+            self.t = NOW + i * 60
+            self.tick(self.flag(message))
+        self.assertEqual(self.ah.writes, 1)
+
+    def test_text_too_long_for_a_slot_stays_within_the_hourly_limit(self):
+        message = "\u6f22" * 390  # JSON-escaped past the slot, so emit cuts it and drops the detail
+        for i in range(360):
+            self.t = NOW + i * 60
+            row = self.tick(self.flag(message))
+        self.assertTrue(row["detail"].get("truncated"), "vacuous: the slot did not overflow")
+        self.assertLessEqual(self.ah.writes, 7)
+
+    def test_text_flipping_back_to_an_earlier_value_still_reaches_the_ring(self):
+        for i in range(12):
+            self.t = NOW + i * 600
+            text = "owner state A: a1" if i % 2 == 0 else "owner state B: a1"
+            row = self.tick(self.flag(text))
+            self.assertEqual(row["message"], text, i)
+
+    def test_severity_flipping_back_to_an_earlier_value_still_reaches_the_ring(self):
+        for i in range(12):
+            self.t = NOW + i * 600
+            severity = "high" if i % 2 == 0 else "warning"
+            row = self.tick(self.flag("same text", severity))
+            self.assertEqual(row["severity"], severity, i)
+
+    def test_severity_flapping_every_tick_is_bounded(self):
+        for i in range(60):
+            self.t = NOW + i * 60
+            self.tick(self.flag("same text", "high" if i % 2 == 0 else "warning"))
+        self.assertLessEqual(self.ah.writes, 25)
+
+    def test_a_rise_is_never_delayed(self):
+        self.tick(self.flag("same text", "warning"))
+        self.t = NOW + 1
+        self.assertEqual(self.tick(self.flag("same text", "high"))["severity"], "high")
+
+    def test_new_words_wait_for_the_limit_and_numbers_for_the_hour(self):
+        self.tick(self.flag("owner SILENT: a1 since 10"))
+        self.t = NOW + 60
+        self.assertEqual(self.tick(self.flag("owner DROPPED: a1 since 10"))["message"], "owner SILENT: a1 since 10")
+        self.t = NOW + 300
+        self.assertEqual(self.tick(self.flag("owner DROPPED: a1 since 10"))["message"], "owner DROPPED: a1 since 10")
+        self.t = NOW + 900
+        self.assertEqual(self.tick(self.flag("owner DROPPED: a1 since 20"))["message"], "owner DROPPED: a1 since 10")
+        self.t = NOW + 300 + 3600
+        self.assertEqual(self.tick(self.flag("owner DROPPED: a1 since 20"))["message"], "owner DROPPED: a1 since 20")
+
+    def test_non_string_ring_message_does_not_break_planning(self):
+        ring = {self.KEY: {"event": "raise", "severity": "high", "message": 7, "at": ahd.iso(NOW - 7200), "seq": 1,
+                           "detail": "not a dict"}}
+        plan = ahd.plan_transitions({self.KEY: self.flag("text")}, ring, now=NOW)
+        self.assertEqual([op for op, *_ in plan], ["raise"])
 
 
 @unittest.skipUnless(AH_PY.is_file(), "needs ah.py from feat/ah-query (feat/ahd is stacked on it)")
@@ -731,3 +906,103 @@ class MemoryBounds(Scratch):
         os.utime(self.main_wal, (NOW - 60, NOW - 60))
         self.policy["owners_wal_max_bytes"] = 1 << 20
         self.assertEqual(ahd.active_sessions(self.policy, NOW), [])
+
+
+OLD_SESSION = "99999999-2222-4333-8444-555555555555"
+
+
+class AlertNoise(Scratch):
+    """2026-11-06: #14848 going live raised 39 liveness alerts for owners `ah owners` already excused, and ~90
+    one-per-ask alerts for old asks. Liveness must follow ah's disposition rule; old asks cost one digest row."""
+
+    def test_live_disposition_excuses_liveness_like_ah_owners(self):
+        live = {"kind": "wait", "ref": "goodqa#1", "live": True}
+        rows = [dict(owner("a1111111", "DROPPED"), disposition=live, decision_required=False),
+                dict(owner("a2222222", "SILENT-HIGH"), disposition=live, decision_required=False),
+                dict(owner("a3333333", "DROPPED"), disposition=dict(live, live=False), decision_required=True),
+                dict(owner("a4444444", "DROPPED"), disposition=live, decision_required=True),  # wait target gone
+                owner("a5555555", "SILENT")]
+        got = ahd.liveness_alerts({SESSION: {"owners": rows}}, self.policy)
+        self.assertEqual(sorted(f["detail"]["agent"] for f in got.values()), ["a3333333", "a4444444", "a5555555"])
+
+    def wal_ask(self, path, ask_id):
+        with open(path, "a") as fh:
+            fh.write(json.dumps({"at": "2027-01-10T08:00:00+00:00", "event": "ask", "id": ask_id, "note": "n"}) + "\n")
+
+    def test_old_session_asks_fold_into_one_digest_and_current_ones_stay(self):
+        old = self.home / ".claude" / "wals" / OLD_SESSION
+        old.mkdir(parents=True)
+        for i in range(5):
+            self.wal_ask(old / "main.jsonl", f"wa{i:010x}")
+        os.utime(old / "main.jsonl", (NOW - 7200, NOW - 7200))  # inside the owner window, outside the ask window
+        self.wal_ask(self.main_wal, "wcurrent0001")
+        os.utime(self.main_wal, (NOW - 60, NOW - 60))
+        self.owners([])
+        self.owners([], session=OLD_SESSION)
+        d = self.daemon()
+        d.tick()
+        asks = sorted(k for k in d.last["desired"] if k.startswith("ask:"))
+        self.assertEqual(asks, ["ask:digest", "ask:wcurrent0001:due"])
+        dig = d.last["desired"]["ask:digest"]
+        self.assertEqual(dig["detail"]["asks"], 5)
+        self.assertIn("wa0000000000", dig["message"])
+        raised = [a for a in self.alert_calls("raise") if any(str(x).startswith("ask:") for x in a)]
+        self.assertEqual(len(raised), 2)
+
+    def test_digest_takes_the_highest_folded_severity(self):
+        flags = {"ask:a:due": {"severity": "info", "since": 5, "subject": "a", "detail": {"ask": "a", "session": "x"}},
+                 "ask:b:unowned": {"severity": "high", "since": 3, "subject": "b", "detail": {"ask": "b"}},
+                 "ask:ledger:error": {"severity": "warning", "since": 0, "subject": "ledger", "detail": {}}}
+        got = ahd.ask_digest(flags, set(), NOW)
+        self.assertEqual(sorted(got), ["ask:digest", "ask:ledger:error"])
+        self.assertEqual((got["ask:digest"]["severity"], got["ask:digest"]["since"]), ("high", 3))
+        self.assertEqual(ahd.ask_digest({}, set(), NOW), {})
+
+    def test_quiet_session_keeps_a_young_ask_and_folds_an_old_one_into_the_digest(self):
+        # review F1: a session waiting on the user stops writing; its fresh ask must keep escalating on its own key
+        quiet = self.home / ".claude" / "wals" / OLD_SESSION
+        quiet.mkdir(parents=True)
+        young = ahd.iso(NOW - 3600)
+        with open(quiet / "main.jsonl", "a") as fh:
+            fh.write(json.dumps({"at": young, "event": "ask", "id": "wyoung000001", "note": "n"}) + "\n")
+        self.wal_ask(quiet / "main.jsonl", "wold00000001")
+        os.utime(quiet / "main.jsonl", (NOW - 3500, NOW - 3500))
+        self.owners([])
+        self.owners([], session=OLD_SESSION)
+        self.policy["ask_current_window_seconds"] = 600
+        d = self.daemon()
+        d.tick()
+        asks = sorted(k for k in d.last["desired"] if k.startswith("ask:"))
+        self.assertEqual(asks, ["ask:digest", "ask:wyoung000001:due"])
+        self.assertIn("wold00000001", d.last["desired"]["ask:digest"]["message"])  # folded, not lost
+
+    def test_current_session_window_edges(self):
+        os.utime(self.main_wal, (NOW - 3600, NOW - 3600))
+        self.assertEqual(ahd.current_sessions([SESSION], self.policy, NOW), {SESSION[:8]})
+        os.utime(self.main_wal, (NOW - 3601, NOW - 3601))
+        self.assertEqual(ahd.current_sessions([SESSION], self.policy, NOW), set())
+        self.assertEqual(ahd.current_sessions(["00000000-0000-4000-8000-000000000000"], self.policy, NOW), set())
+
+    def test_torn_ledger_holds_the_digest_and_report_keeps_unowned(self):
+        # review F2 and F4
+        led = self.home / ".agent-harness" / "work-assignments.json"
+        led.parent.mkdir(parents=True, exist_ok=True)
+        led.write_text(json.dumps({"items": {"WA-1": {
+            "id": "WA-1", "state": "open", "owner": "unassigned", "description": "x",
+            "created": "2027-01-14T07:00:00Z", "state_since": "2027-01-14T07:00:00Z"}}}))
+        self.owners([])
+        old = self.home / ".claude" / "wals" / OLD_SESSION
+        old.mkdir(parents=True)
+        self.wal_ask(old / "main.jsonl", "wold00000002")
+        os.utime(old / "main.jsonl", (NOW - 7200, NOW - 7200))
+        self.owners([], session=OLD_SESSION)
+        d = self.daemon()
+        d.tick()
+        self.assertEqual(d.last["summary"]["unowned"], ["ask:WA-1:unowned"])
+        self.assertIn("ask:digest", self.ring())
+        before = len(self.alert_calls())
+        led.write_text("{torn")
+        self.t = NOW + 4000  # past the refresh rate limit: an unheld digest would be rewritten now
+        d.tick()
+        digest_writes = [a for a in self.alert_calls()[before:] if "ask:digest" in a]
+        self.assertEqual(digest_writes, [])

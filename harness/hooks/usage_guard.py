@@ -506,7 +506,10 @@ class UsageStore:
         if create:
             try:
                 path.mkdir(mode=0o700)
-                parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                # Resolve only the parent for the durability fsync: a symlinked parent such as macOS /tmp made the
+                # O_NOFOLLOW open raise NotADirectoryError. The leaf itself is never followed; the lstat check
+                # below still refuses a symlinked leaf (a symlinked store root is refused earlier, in __init__).
+                parent = os.open(os.path.realpath(path.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
                 try: os.fsync(parent)
                 finally: os.close(parent)
             except FileExistsError:

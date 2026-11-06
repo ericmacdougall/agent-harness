@@ -109,7 +109,8 @@ class LivenessTests(unittest.TestCase):
         self.assertEqual(self.c(9999, stopped=True), "DROPPED")
         self.assertEqual(self.c(53, stopped=True), "finishing")  # just stopped, handoff may still be coming
         self.assertEqual(self.c(25 * 60, stopped=True), "finishing")  # between turns is not a drop
-        self.assertEqual(self.c(9999, stopped=True, note="waiting on dev2 suite"), "waiting-on-dev2")
+        self.assertEqual(self.c(9999, stopped=True, note="waiting on dev2 suite"), "DROPPED")  # goodqa#14791 H3: a wait must name an ask, ticket or agent
+        self.assertEqual(self.c(9999, stopped=True, note="waiting on GoodQA goodqa#14791"), "waiting-on-GoodQA goodqa#14791")
         for helper in ("red-team", "fixer", "click-tester", "Explore"):
             self.assertEqual(self.c(9999, stopped=True, typ=helper), "returned", helper)
         self.assertEqual(liveness.classify(NOW, NOW - 9999, 0.0, True, None, "", "fixer", registered=True)["state"], "DROPPED")
@@ -428,8 +429,11 @@ class WriteTests(GoodQABase):
         self.assertIn("[review] ok so far", self.wal_rows("ownerx")[-1]["note"])
         self.assertEqual(len(FakeGoodQA.state["posted"]), 1)  # WAL and comment in one call
         wal = self.home / ".claude" / "wals" / SESSION / "main.jsonl"
-        jl(wal, [{"at": "2999-01-01T00:00:00Z", "event": "REALLY_TESTED", "id": "wq1", "note": "REALLY_TESTED t1: ran it"}])
-        d = ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"really_tested": "t1", "wal": str(wal)}]}, SESSION, "done-key-001")
+        jl(wal, [{"at": "2999-01-01T00:00:00Z", "event": "deploy", "id": "wde00000000a", "note": "DEPLOYED app v1.0.0 for ownerx"},
+                 {"at": "2999-01-01T00:00:01Z", "event": "REALLY_TESTED", "id": "wq1",
+                  "note": "REALLY_TESTED t1: ran it live on https://app.example"}])
+        d = ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"deployed": "wde00000000a"},
+                                                                         {"really_tested": "t1", "wal": str(wal)}]}, SESSION, "done-key-001")
         self.assertEqual(d["result"], "applied")
         self.assertEqual(self.wal_rows("ownerx")[-1]["event"], "result")
 
@@ -473,6 +477,7 @@ class WriteTests(GoodQABase):
         self.assertEqual(c.exception.code, "evidence")
 
     def test_done_with_real_commit(self):
+        """A real commit alone is merged, not live: done needs a deploy record and a live test (main WAL w07450081c12)."""
         self.reg()
         repo = self.home / "repo"
         repo.mkdir()
@@ -480,7 +485,14 @@ class WriteTests(GoodQABase):
         subprocess.run(["git", "init", "-q", str(repo)], check=True, env=env)
         subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "x"], check=True, env=env)
         sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
-        d = ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"commit": sha, "repo": str(repo)}]}, SESSION, "done-good-01")
+        with self.assertRaises(ah.AhError) as c:
+            ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"commit": sha, "repo": str(repo)}]}, SESSION, "done-good-01")
+        self.assertEqual(c.exception.code, "evidence")
+        wal = self.home / ".claude" / "wals" / SESSION / "main.jsonl"
+        jl(wal, [{"at": "2999-01-01T00:00:00Z", "event": "deploy", "id": "wde00000000b", "note": f"DEPLOYED app {sha[:12]} for ownerx"},
+                 {"at": "2999-01-01T00:00:01Z", "event": "result", "id": "wq2", "note": "REALLY_TESTED t1: live check passed"}])
+        d = ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"commit": sha, "repo": str(repo)}, {"deployed": "wde00000000b"},
+                                                                         {"really_tested": "t1", "wal": str(wal)}]}, SESSION, "done-good-02")
         self.assertEqual(d["result"], "applied")
 
     def test_unknown_task_and_bad_args_and_rejects_audited(self):
@@ -633,7 +645,9 @@ class ReviewRound1(GoodQABase):
             rc = ah.main(["doctor"])
         self.assertEqual(rc, 4)
         self.assertEqual(json.loads(out.getvalue()), {"ok": False, "code": "internal", "type": "ModuleNotFoundError"})
-        self.assertTrue(ah.doctor()["ok"])
+        with mock.patch.dict(os.environ, {"AH_EXPECT_AHD": "0"}):  # this test is about partial installs, not the daemon (goodqa#14791 S1d)
+            self.assertTrue(ah.doctor()["ok"])
+        self.assertFalse(ah.doctor()["ok"])  # with the daemon expected and not running, doctor fails
 
     def test_naive_iso_is_utc_and_user_at_host_rejected(self):
         self.assertEqual(ah.parse_ts("2026-11-04T10:00:00"), ah.parse_ts("2026-11-04T10:00:00Z"))
@@ -689,13 +703,19 @@ class WriterReview(WriteTests):
             ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"really_tested": "wother", "wal": str(other)}]},
                      SESSION, "ev-other-0001")
         self.assertEqual(c.exception.code, "evidence")
-        jl(wal, [{"at": "2000-01-01T00:00:00Z", "event": "result", "id": "wold", "note": "REALLY_TESTED t1: before the task existed"}])
+        jl(wal, [{"at": "2000-01-01T00:00:00Z", "event": "deploy", "id": "wde00000000d", "note": "DEPLOYED app v0.9.0 for ownerx"},
+                 {"at": "2000-01-01T00:00:01Z", "event": "result", "id": "wold",
+                  "note": "REALLY_TESTED t1: live, but before the task existed"}])
         with self.assertRaises(ah.AhError) as c:  # older than the register row proves nothing for this task
-            ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"really_tested": "t1", "wal": str(wal)}]},
+            ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"deployed": "wde00000000d"},
+                                                                         {"really_tested": "t1", "wal": str(wal)}]},
                      SESSION, "ev-old-00001")
+        self.assertIn("no REALLY_TESTED entry", str(c.exception))  # the registration-order rule, not a missing deploy
         self.assertEqual(c.exception.code, "evidence")
-        jl(wal, [{"at": "2999-01-01T00:00:00Z", "event": "result", "id": "wgood", "note": "REALLY_TESTED t1: ran it, exit 0"}])
-        ok = ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"really_tested": "t1", "wal": str(wal)}]},
+        jl(wal, [{"at": "2999-01-01T00:00:00Z", "event": "deploy", "id": "wde00000000c", "note": "INSTALLED harness v2.0.1 for ownerx"},
+                 {"at": "2999-01-01T00:00:01Z", "event": "result", "id": "wgood", "note": "REALLY_TESTED t1: ran it live, exit 0"}])
+        ok = ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"deployed": "wde00000000c"},
+                                                                          {"really_tested": "t1", "wal": str(wal)}]},
                       SESSION, "ev-good-0001")
         self.assertEqual(ok["result"], "applied")
 
@@ -774,10 +794,17 @@ class WriterReview(WriteTests):
         (self.home / ".claude" / "wals" / SESSION).mkdir(parents=True, exist_ok=True)
         ah.write(self.home, "task.register", {"task": "t9", "owner_agent": "ownerx", "session": SESSION, "ticket": "GoodQA goodqa#77",
                                               "scope": "s", "source": "inferred: ok x", "worktree": str(repo)}, SESSION, "reg-wt-00001")
+        wal = self.home / ".claude" / "wals" / SESSION / "main.jsonl"
+        jl(wal, [{"at": "2999-01-01T00:00:00Z", "event": "deploy", "id": "wde00000000e", "note": "DEPLOYED app v3.0.0 for ownerx"},
+                 {"at": "2999-01-01T00:00:01Z", "event": "result", "id": "wq9", "note": "REALLY_TESTED t9: live probe ok"}])
+        live = [{"deployed": "wde00000000e"}, {"really_tested": "t9", "wal": str(wal)}]
         with self.assertRaises(ah.AhError) as c:  # a real commit, but in some other repository
-            ah.write(self.home, "task.done", {"task": "t9", "evidence": [{"commit": shas[1], "repo": str(other)}]}, SESSION, "done-wt-0001")
+            ah.write(self.home, "task.done", {"task": "t9", "evidence": [{"commit": shas[1], "repo": str(other)}] + live},
+                     SESSION, "done-wt-0001")
         self.assertEqual(c.exception.code, "evidence")
-        ok = ah.write(self.home, "task.done", {"task": "t9", "evidence": [{"commit": shas[0], "repo": str(other)}]}, SESSION, "done-wt-0002")
+        self.assertIn("not in the registered checkout", str(c.exception))
+        ok = ah.write(self.home, "task.done", {"task": "t9", "evidence": [{"commit": shas[0], "repo": str(other)}] + live},
+                      SESSION, "done-wt-0002")
         self.assertEqual(ok["result"], "applied")
 
     def test_m2_reregister_does_not_reassign(self):

@@ -1,4 +1,5 @@
 import { openSettings } from './settings.js';
+import { openAsksView } from './asks.js';
 import { composerAction as resolveComposerAction, submissionMatches } from './composer.js';
 import { renderAgentControlNotice } from './agent-control.js';
 import { initReviewMap } from './review-map.js';
@@ -1256,6 +1257,7 @@ $('#quit-console').addEventListener('click', () => confirmAction({
     for (const node of $$('button, input, select, textarea')) node.disabled = true;
   },
 }));
+$('#asks-button').addEventListener('click', () => openAsksView({ api, el }));
 $('#settings-button').addEventListener('click', () => openSettings({ api, notify, el, refresh: loadState, filePicker, cwd: () => session()?.cwd || state.snapshot.defaultCwd || '' }));
 for (const button of $$('.segmented-control button')) {
   button.addEventListener('click', () => {

@@ -2305,6 +2305,49 @@ class DeliveryHelpers(unittest.TestCase):
         parents = cmd('git', 'rev-list', '--parents', '-n', '1', 'HEAD', cwd=self.repo).stdout.split()
         self.assertEqual(parents[1:], [self.base, self.feature_head])
 
+    def focused_args(self, pattern, *extra):
+        args = self.integrate_args(*extra)
+        args[args.index('--check') + 1] = 'python3 -m unittest discover -s tests -p ' + pattern
+        return args
+
+    def test_focused_check_by_literal_file_integrates(self):
+        self.add_feature_test()
+        (self.feature / 'tests' / 'test_other_failing.py').write_text(
+            'import unittest\nclass Other(unittest.TestCase):\n    def test_no(self):\n        self.fail("not selected")\n')
+        cmd('git', 'add', 'tests', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'unselected failing file', cwd=self.feature)
+        self.feature_head = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        result = subprocess.run(self.focused_args('test_check.py', '--timeout', '10'), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']), (0, 'INTEGRATED'), result.stdout + result.stderr)
+
+    def test_focused_check_that_fails_blocks_and_restores(self):
+        self.add_feature_test('import unittest\nclass Check(unittest.TestCase):\n    def test_no(self):\n        self.fail("intentional")\n')
+        result = subprocess.run(self.focused_args('test_check.py'), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status'], data.get('phase')), (3, 'BLOCKED_LOCAL', 'check'), result.stdout)
+        self.assert_restored()
+
+    def test_focused_check_matching_no_file_cannot_integrate(self):
+        self.add_feature_test()
+        result = subprocess.run(self.focused_args('test_missing.py'), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status'], data.get('phase'), data.get('merge_aborted')),
+                         (3, 'BLOCKED_LOCAL', 'check', True), result.stdout + result.stderr)
+        self.assert_restored()
+
+    def test_focused_check_with_glob_or_path_is_refused_before_merge(self):
+        self.add_feature_test()
+        for pattern in ("'test_*.py'", 'tests/test_check.py', '../test_check.py'):
+            with self.subTest(pattern=pattern):
+                result = subprocess.run(self.focused_args(pattern), text=True, capture_output=True,
+                                        env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+                data = json.loads(result.stdout)
+                self.assertEqual((result.returncode, data['status']), (2, 'BLOCKED_POLICY'), result.stdout)
+                self.assert_restored()
+
     def test_empty_unittest_discovery_cannot_merge_on_old_python(self):
         self.add_feature_test('import unittest\n')
         result = subprocess.run(self.integrate_args(), text=True, capture_output=True,

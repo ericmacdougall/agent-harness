@@ -325,6 +325,19 @@ def lifecycle_hook(data: dict, session: str) -> None:
             result = {"systemMessage": UNFINISHED}
         else:
             result = {}
+    if not interrupt and not result.get("decision"):  # P18 (goodqa#14791): the dropped-owner gate, same rule as Claude
+        try:
+            import dropped_gate  # noqa: PLC0415 - shipped beside this hook by install_codex
+            gate = dropped_gate.cmd_stop(dict(data, session_id=session))
+        except Exception:  # noqa: BLE001 - never block a Codex turn on a gate error
+            gate = {}
+        if gate:
+            if result.get("systemMessage"):
+                if gate.get("decision") == "block":
+                    gate["reason"] = result["systemMessage"] + " " + gate.get("reason", "")
+                elif gate.get("systemMessage"):
+                    gate["systemMessage"] = result["systemMessage"] + " " + gate["systemMessage"]
+            result = gate
     print(json.dumps(result))
 
 

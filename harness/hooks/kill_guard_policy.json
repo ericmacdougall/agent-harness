@@ -4,7 +4,7 @@
   "broad_verbs": ["pkill", "killall", "killall5", "skill", "slay", "fkill", "kill-port", "killport"],
   "windows_verbs": ["taskkill", "stop-process", "spps", "wmic"],
   "service_kill": {"systemctl": ["kill"], "launchctl": ["kill"], "tmux": ["kill-server"], "pm2": ["kill"], "loginctl": ["kill-session", "kill-user", "terminate-user", "terminate-session"]},
-  "script_kill_pattern": "(?i)(?<![a-z])(?:p|f|posix_)?kill(?![a-z])|killpg|terminate\\(|send_signal|taskkill|killall|invoke-cimmethod|getprocessbyid",
+  "script_kill_pattern": "(?i)(?<![a-z])(?:p|f|posix_)?kill(?![a-z])|killpg|terminate\\(|send_signal|taskkill|killall|invoke-cimmethod|getprocessbyid|raise_signal|sigqueue|pidfd_send_signal",
   "pid_finders": ["pgrep", "pidof", "ps", "lsof", "fuser", "pstree", "cat", "awk", "grep"],
   "ledger_max_lines": 2000,
   "child_timeout_seconds": 10

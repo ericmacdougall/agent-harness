@@ -10,6 +10,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hermetic  # noqa: E402
+
+hermetic.install()
+
 HOOKS = Path(__file__).resolve().parents[1] / 'harness/hooks'
 sys.path.insert(0, str(HOOKS))
 
@@ -167,6 +172,8 @@ class ReportFinalizationTests(unittest.TestCase):
             stdout, stderr = io.StringIO(), io.StringIO()
             with contextlib.ExitStack() as stack:
                 stack.enter_context(patch.object(sys, 'argv', argv))
+                # peer_review.main() opens the usage store; keep it out of the real ~/.agent-harness/usage.
+                stack.enter_context(patch.dict(os.environ, {'AGENT_HARNESS_USAGE_DIR': str(root / 'usage-state')}))
                 if helper == 'peer_review':  # reviewer CLIs are found by review_diagnostics, not shutil.which
                     stack.enter_context(patch.object(module.diagnostics, 'discover_executable', side_effect=lambda name, **kw: {
                         'name': name, 'path': 'fixture-model', 'source': 'PATH', 'rejected': [], 'searched': []}))

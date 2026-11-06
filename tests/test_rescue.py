@@ -1,3 +1,4 @@
+import atexit
 import importlib.util
 import json
 import os
@@ -10,6 +11,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hermetic  # noqa: E402
+
+hermetic.install()
 
 RESCUE = Path(__file__).resolve().parents[1] / 'harness/hooks/rescue.py'
 # Outer test watchdogs, not product deadlines. Validation runs several Git reads.
@@ -24,6 +29,36 @@ SPEC.loader.exec_module(rescue)
 def git(repo, *args):
     result = subprocess.run(['git', '-C', str(repo), *args], capture_output=True, text=True, check=True)
     return result.stdout.strip()
+
+
+_SCRUBBED = None
+_REVIEWER_NAMES = {'codex', 'claude', 'ssh'}
+
+
+def scrubbed_system_path():
+    """A directory of symlinks to the system tools minus any reviewer CLI or ssh (GoodQA #14560, #14633).
+
+    The tests build PATH from the fixture bin plus /usr/bin:/bin. On a host that has a real /usr/bin/codex (dev2) the
+    "Astra executable unavailable" test would find and launch the real model CLI after the fixture codex is removed.
+    """
+    global _SCRUBBED
+    if _SCRUBBED is None:
+        _SCRUBBED = Path(os.path.realpath(tempfile.mkdtemp(prefix='rescue-syspath-')))
+        atexit.register(shutil.rmtree, _SCRUBBED, True)
+        for directory in ('/usr/bin', '/bin'):
+            try:
+                names = sorted(os.listdir(directory))
+            except OSError:
+                continue
+            for name in names:
+                target = _SCRUBBED / name
+                if name in _REVIEWER_NAMES or target.exists() or target.is_symlink():
+                    continue
+                try:
+                    target.symlink_to(Path(directory, name))
+                except OSError:
+                    pass
+    return str(_SCRUBBED)
 
 
 class RescueTests(unittest.TestCase):
@@ -251,7 +286,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
                    '--output', str(output or self.output)]
         if wal is not None:
             command += ['--wal', str(wal)]
-        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin', **(env or {})}
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + scrubbed_system_path(), **(env or {})}
         return subprocess.run(command, text=True, capture_output=True, env=environment,
                               timeout=watchdog_seconds)
 
@@ -838,11 +873,30 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         self.assertIn('A disposable rescue packet', capture.read_text())
         self.assertNotIn('Fixture handoff', capture.read_text())
 
+    def test_scrubbed_system_path_cannot_resolve_a_real_reviewer_cli(self):
+        import shutil as sh
+        path = str(self.bin) + os.pathsep + scrubbed_system_path()
+        (self.bin / 'codex').unlink()
+        self.assertIsNone(sh.which('codex', path=path))
+        self.assertIsNone(sh.which('ssh', path=path))
+        self.assertIsNotNone(sh.which('git', path=path))
+        self.assertIsNotNone(sh.which('claude', path=path))  # only the fixture claude resolves
+        # invoke() itself must hand the helper that PATH, not /usr/bin:/bin
+        seen = {}
+
+        def fake_run(command, **kwargs):
+            seen['path'] = kwargs['env']['PATH']
+            return subprocess.CompletedProcess(command, 0, '', '')
+        with patch.object(subprocess, 'run', fake_run):
+            self.invoke()
+        self.assertEqual(seen['path'], path)
+        self.assertNotIn('/usr/bin', seen['path'].split(os.pathsep))
+
     def test_top_rung_is_never_launched_without_recorded_permission(self):
         capture = self.root / 'top-prompt.txt'
         command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),
                    '--output', str(self.output), '--rung', 'R5']
-        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin', 'CAPTURE_CODEX_PROMPT': str(capture)}
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + scrubbed_system_path(), 'CAPTURE_CODEX_PROMPT': str(capture)}
         result = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=STANDARD_HELPER_WATCHDOG_SECONDS)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn('needs the user', result.stderr); self.assertIn('never launched automatically', result.stderr)
@@ -865,7 +919,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         capture = self.root / 'astra-prompt.txt'
         command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),
                    '--output', str(self.output), '--task', 'rescue-t', '--rung', 'R5']
-        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin',
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + scrubbed_system_path(),
                        'CAPTURE_CODEX_PROMPT': str(capture), 'AGENT_HARNESS_ESCALATION_DIR': str(state), 'CODEX_ACTION': 'top'}
         result = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         self.assertEqual(result.returncode, 3, result.stderr)
@@ -889,7 +943,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         capture = self.root / 'r2-prompt.txt'
         command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),
                    '--output', str(self.output), '--task', 'rescue-r2']
-        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin',
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + scrubbed_system_path(),
                        'CAPTURE_CODEX_PROMPT': str(capture), 'AGENT_HARNESS_ESCALATION_DIR': str(state), 'CODEX_ACTION': 'r2'}
         result = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         self.assertEqual(result.returncode, 3, result.stderr)
@@ -901,7 +955,7 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         capture = self.root / 'claude-prompt.txt'
         command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),
                    '--output', str(self.output), '--author-harness', 'openai']
-        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + '/usr/bin:/bin',
+        environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + scrubbed_system_path(),
                        'CLAUDE_ACTION': 'other-harness', 'CAPTURE_CLAUDE_PROMPT': str(capture)}
         result = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         self.assertEqual(result.returncode, 3, result.stderr)

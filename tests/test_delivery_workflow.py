@@ -496,6 +496,31 @@ exec "$FIXTURE_REAL_GIT" "$@"
         state.write_bytes(before)
         self.assertEqual(command('git', 'rev-parse', 'HEAD', cwd=self.original, env=self.env).stdout.strip(), self.base)
 
+    def test_focused_baseline_check_must_run_a_test(self):
+        # GoodQA #14729: the focused form reaches finish --resolve-baseline; a pattern that runs no test must not resolve.
+        self.configure_github()
+        result, data = self.invoke(*self.prepare_args())
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.merge_remote()
+        code, _ = self.direct_finish(lambda module: mock.patch.object(module.OriginalScope, 'reserve_external',
+                                                                      side_effect=OSError('fixture reserve fault')))
+        self.assertEqual(code, 3)
+        state = Path(data['state'])
+        before = state.read_bytes()
+
+        def focused(pattern):
+            args = self.baseline_args(self.base)
+            args[args.index('--check') + 1] = 'python3 -m unittest discover -s tests -p ' + pattern
+            return args
+        empty, error = self.invoke(*focused('test_missing.py'))
+        self.assertEqual((empty.returncode, error['status']), (3, 'RECOVERY_REQUIRED'), empty.stdout)
+        self.assertEqual(state.read_bytes(), before)
+        globbed, error = self.invoke(*focused("'test_*.py'"))
+        self.assertEqual((globbed.returncode, error['status']), (2, 'BLOCKED_POLICY'), globbed.stdout)
+        self.assertEqual(state.read_bytes(), before)
+        passed, outcome = self.invoke(*focused('test_format.py'))
+        self.assertEqual((passed.returncode, outcome['status']), (0, 'RESOLVED_BASELINE'), passed.stdout)
+
     def test_baseline_negative_checks_and_transition_crashes_preserve_no_delivery(self):
         self.configure_github()
         result, data = self.invoke(*self.prepare_args())

@@ -17,6 +17,20 @@
    ]
   },
   {
+   "id": "log_backup:session-start",
+   "script": "log_backup.py",
+   "arg": "session-start",
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "pending",
+   "owner": "log backup (GoodQA #14471)",
+   "rules": [],
+   "known_gap": "opt-in: wired only where the log backup is installed (install.py --log-backup), so doctor reports it NOT-ENFORCED elsewhere"
+  },
+  {
    "id": "wal:prompt",
    "script": "wal.py",
    "arg": "prompt",
@@ -502,6 +516,64 @@
     "W21"
    ],
    "known_gap": "G10-slice8"
+  },
+  {
+   "id": "bg_lint:pretool",
+   "script": "bg_lint.py",
+   "arg": null,
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "dropped-gate:stop",
+   "script": "dropped_gate.py",
+   "arg": null,
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S23"
+   ]
+  },
+  {
+   "id": "dropped-gate:pretool",
+   "script": "dropped_gate.py",
+   "arg": "pretool",
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S23"
+   ]
+  },
+  {
+   "id": "dropped-gate:subagent-stop",
+   "script": "dropped_gate.py",
+   "arg": "subagent-stop",
+   "event": "SubagentStop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S23"
+   ]
   }
  ]
 }
