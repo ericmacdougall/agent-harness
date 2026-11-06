@@ -129,6 +129,19 @@ class Quarantine(Base):
         self.assertEqual(rc, 0, doc)
         self.assertTrue(self.rows()[-1].get("unsourced"))
 
+    def test_only_caller_error_codes_are_refused_transient_codes_still_quarantine(self):
+        """Review finding (2026-11-06): a resolver that times out or hits a malformed transcript is not the caller's
+        mistake; those rejections keep the warn-mode quarantine path instead of dropping the note."""
+        import wal_note
+        for code in ("bad-syntax", "ticket-missing", "transcript-missing", "inferred-nested", "excerpt-not-found"):
+            self.assertTrue(wal_note.caller_error(f"source rejected ({code}): x"), code)
+        for code in ("scan-timeout", "transcript-malformed", "wal-missing", "wal-malformed", "file-unreadable",
+                     "file-too-large", "internal", "rejected"):
+            self.assertFalse(wal_note.caller_error(f"source rejected ({code}): x"), code)
+        self.assertFalse(wal_note.caller_error("decision has no --source"))
+        self.assertFalse(wal_note.caller_error("provenance check failed (TypeError)"))
+        self.assertFalse(wal_note.caller_error(None))
+
     def test_inferred_free_text_input_names_the_input_not_the_source(self):
         """The rejection of `inferred: from <free text> -- why` must say which input is not a source; the old message
         said the Source must start with inferred: although it did (main WAL w8d5f765ea4c)."""
