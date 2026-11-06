@@ -1030,8 +1030,12 @@ def make_analyzer_class(cg):
             if host is not None and host + 1 < len(texts) and texts[host + 1] == '--':
                 args = args[:host + 1] + args[host + 2:]  # `mosh host -- cmd`, `ssh host -- cmd`
             self.remote += 1
+            # OpenSSH keeps reading options after the destination (`ssh dev2 -o HostName=prod kill 4242` reroutes),
+            # so an option word right after the host (anything but `--`) also makes the hop non-literal (review round 2).
+            after = texts[host + 1] if host is not None and host + 1 < len(texts) else ''
             literal = (host is not None and not (args[host].dynamic or args[host].subs or args[host].glob)
-                       and not any(a.dynamic or a.subs or a.glob for a in args[:host]) and plain_ssh_hop(texts, host))
+                       and not any(a.dynamic or a.subs or a.glob for a in args[:host]) and plain_ssh_hop(texts, host)
+                       and not (after.startswith('-') and after != '--'))
             self.remote_hosts.append(texts[host] if literal else None)
             try:
                 result = super().ssh(args, depth)

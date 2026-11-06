@@ -769,7 +769,8 @@ class RemoteSpawn(unittest.TestCase):
         kg.append_ledger(kg.remote_root('dev2'), 4242, self.START, home=self.home)
         same = lambda host, pid: self.START if (host, pid) == ('dev2', 4242) else None  # noqa: E731
         for cmd in ('ssh dev2 kill 4242', 'ssh dev2 kill -TERM 4242', "ssh dev2 'kill 4242'", 'ssh -p 22 dev2 -- kill 4242',
-                    'ssh -o BatchMode=yes -o ConnectTimeout=3 dev2 kill 4242', 'ssh -q -l eric -p2222 dev2 kill 4242'):
+                    'ssh -o BatchMode=yes -o ConnectTimeout=3 dev2 kill 4242', 'ssh -q -l eric -p2222 dev2 kill 4242',
+                    'ssh dev2 -- kill 4242'):
             with self.subTest(cmd):
                 self.assertEqual(self.decide(cmd, same)[0], 'allow', cmd)
         refused = {'other host': 'ssh t2-dev kill 4242', 'other pid': 'ssh dev2 kill 4243', 'mixed pids': 'ssh dev2 kill 4242 4243',
@@ -781,7 +782,10 @@ class RemoteSpawn(unittest.TestCase):
                    'config file': 'ssh -F evil.cfg dev2 kill 4242', 'jump': 'ssh -J gw dev2 kill 4242',
                    'proxyjump': 'ssh -o ProxyJump=gw dev2 kill 4242', 'proxycommand': "ssh -o 'ProxyCommand=nc prod 22' dev2 kill 4242",
                    'stdio forward': 'ssh -W prod:22 dev2 kill 4242', 'control socket': 'ssh -S ctl dev2 kill 4242',
-                   'variable option': 'ssh -o $OPT dev2 kill 4242', 'unknown flag': 'ssh -A dev2 kill 4242'}
+                   'variable option': 'ssh -o $OPT dev2 kill 4242', 'unknown flag': 'ssh -A dev2 kill 4242',
+                   # OpenSSH parses options after the destination too (review round 2)
+                   'option after host': 'ssh dev2 -o HostName=prod kill 4242', 'config after host': 'ssh dev2 -F evil.cfg kill 4242',
+                   'jump after host': 'ssh dev2 -J gw kill 4242', 'socket after host': 'ssh dev2 -S ctl kill 4242'}
         for label, cmd in refused.items():
             with self.subTest(label):
                 self.assertEqual(self.decide(cmd, same)[0], 'block', cmd)

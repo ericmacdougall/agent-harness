@@ -77,7 +77,7 @@ MAX_PACK_ENTRIES = 20000
 CLONE_SEARCH_ROOTS = ("~/.agent-harness/work", "~")  # where an existing clone of the same name is looked for
 MAX_SEARCH_ENTRIES = 6000
 CLONE_VALUE_OPTIONS = {"-b", "--branch", "-o", "--origin", "-u", "--upload-pack", "--template", "-c", "--config",
-                       "--separate-git-dir", "-j", "--jobs", "--server-option", "--bundle-uri", "--recurse-submodules"}
+                       "--separate-git-dir", "-j", "--jobs", "--server-option", "--bundle-uri"}  # bare --recurse-submodules takes no value
 HATCH = "HARNESS_LOCAL_OK"
 LOG_PATH = os.path.join(os.path.expanduser("~"), ".agent-harness", "logs", "heavy-job-guard.jsonl")
 
