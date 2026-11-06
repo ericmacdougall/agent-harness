@@ -156,6 +156,41 @@ class OwnersTests(Base):
         self.assertEqual(by["helperfix"]["state"], "returned")  # helper without a WAL file: not a drop
         self.assertEqual(data["counts"]["DROPPED"], 2)
 
+    def test_cli_owners_accepts_text_after_the_subcommand_and_hides_old_terminal_rows(self):
+        """`ah owners --text` (the form CLAUDE.md and the skill use) was rejected because --text sat only on the
+        parent parser, and the default listing carried hundreds of helpers returned days ago. Default: live, recent
+        and non-terminal rows; --all restores everything; counts and undisposed always cover every row."""
+        self.make()
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 3 * 86400), "event": "subagent", "agent_id": "oldhelper", "agent_type": "fixer"},
+                              {"at": iso(NOW - 3 * 86400 + 60), "event": "subagent_stop", "agent_id": "oldhelper", "agent_type": "fixer"}])
+
+        def cli(*argv):
+            out = io.StringIO()
+            with mock.patch.object(ah.time, "time", return_value=NOW), contextlib.redirect_stdout(out):
+                rc = ah.main(list(argv))
+            return rc, out.getvalue()
+
+        rc, text = cli("owners", "--session", SESSION, "--text")
+        self.assertEqual(rc, 0, text)
+        self.assertNotIn('"owners"', text)  # a human summary, not JSON
+        self.assertIn("aliveowner", text)
+        self.assertIn("dropowner", text)  # DROPPED rows always show
+        self.assertIn("doneowner", text)  # done minutes ago: recent
+        self.assertNotIn("oldhelper", text)  # returned three days ago: hidden by default
+        self.assertIn("hidden", text)
+        rc, text = cli("owners", "--session", SESSION, "--all", "--text")
+        self.assertEqual(rc, 0, text)
+        self.assertIn("oldhelper", text)
+        rc, raw = cli("owners", "--session", SESSION)
+        data = json.loads(raw)
+        self.assertNotIn("oldhelper", {r["agent_id"] for r in data["owners"]})
+        self.assertEqual(data["hidden"], 1)
+        self.assertEqual(data["counts"]["returned"], 3)  # counts still cover every row (helperfix, gpother, oldhelper)
+        self.assertIn("gpowner", data["undisposed"])
+        rc, raw = cli("owners", "--session", SESSION, "--all")
+        self.assertIn("oldhelper", {r["agent_id"] for r in json.loads(raw)["owners"]})
+
     def test_discovers_agents_missing_from_main_wal(self):
         """Owners that never appear as subagent events in main.jsonl (general-purpose) are found from task WALs and meta files."""
         self.make()

@@ -39,6 +39,8 @@ APPLY_OPS = ("alert.raise", "alert.clear")  # the only ops `ah apply --batch` ac
 APPLY_MAX_LINES = 200
 APPLY_MAX_BYTES = 1024 * 1024
 TASK_WAL_WINDOW_S = 48 * 3600  # a task-named WAL untouched this long is history (ahd owner_window_seconds)
+OWNERS_RECENT_S = 6 * 3600  # `ah owners` (CLI) hides terminal rows idle longer than this unless --all (2026-11-06)
+TERMINAL_STATES = frozenset({"done", "handoff", "returned", "idle-helper", "unverified-legacy", "superseded", "wontdo", "legacy"})
 WRAPPER = re.compile(r"^\s*<[A-Za-z][\w-]*[\s>/]")
 MAX_REQUEST = 256 * 1024
 SKIP_DARWIN = ("Library", "Desktop", "Documents", "Downloads", "Pictures", "Movies", "Music", "Applications")
@@ -1932,9 +1934,23 @@ def fmt_age(s):
     return f"{s // 3600}h{(s % 3600) // 60:02d}m" if s >= 3600 else f"{s // 60}m" if s >= 60 else f"{s}s"
 
 
+def recent_owners(data: dict) -> dict:
+    """The CLI default view: every row that is live, waiting, silent, dropped or needs a decision, plus terminal rows
+    (done, handoff, returned, helpers) that ended within OWNERS_RECENT_S. counts and undisposed still cover every row;
+    `hidden` says how many rows --all would add. Library callers (ops_watch, dropped_gate) use owners() unfiltered."""
+    def keep(r):
+        if r.get("decision_required") or r.get("state") not in TERMINAL_STATES:
+            return True
+        return r.get("idle_s") is not None and r["idle_s"] <= OWNERS_RECENT_S
+    rows = [r for r in data["owners"] if keep(r)]
+    return dict(data, owners=rows, hidden=len(data["owners"]) - len(rows), filter=f"recent<={OWNERS_RECENT_S // 3600}h")
+
+
 def render_text(cmd: str, data: dict) -> str:
     if cmd == "owners":
-        lines = [f"session {data['session']}  " + " ".join(f"{k}={v}" for k, v in sorted(data["counts"].items()))]
+        lines = [f"session {data['session']}  " + " ".join(f"{k}={v}" for k, v in sorted(data["counts"].items()))
+                 + (f"  hidden={data['hidden']} (terminal rows idle over {OWNERS_RECENT_S // 3600} h; --all shows them)"
+                    if data.get("hidden") else "")]
         for r in data["owners"]:
             lines.append(f"{r['state']:<14} idle {fmt_age(r['idle_s']):>7}  {r['agent_id'][:12]:<12} {r['type'] or '-':<12} "
                          f"{(r['ticket'] or '-'):<18} c-age {fmt_age(r['ticket_comment_age_s']):>6}  {(r['task'] or '')[:70]}")
@@ -2298,6 +2314,8 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
     o = sub.add_parser("owners")
     o.add_argument("--session")
+    o.add_argument("--text", action="store_true", default=argparse.SUPPRESS, help="human summary (also accepted before the subcommand)")
+    o.add_argument("--all", action="store_true", help=f"every row; the default hides terminal rows idle over {OWNERS_RECENT_S // 3600} h")
     o.add_argument("--comments", action="store_true", help="also fetch latest ticket comment age (network)")
     o.add_argument("--gate", action="store_true", help="exit 1 while any DROPPED owner has no live disposition")
     u = sub.add_parser("user-msg")
@@ -2450,7 +2468,8 @@ def run(args, home: Path) -> dict:
         s = args.session or env_session() or newest_session(home)
         if not s or not SESSION_RE.match(s):
             raise AhError("session_unknown", "no session: pass --session")
-        return owners(home, s, comments=comment_age if args.comments else None)
+        data = owners(home, s, comments=comment_age if args.comments else None)
+        return data if args.all else recent_owners(data)
     if cmd == "asks":
         return asks_view(home, args.session, args.all)
     if cmd == "requirements":

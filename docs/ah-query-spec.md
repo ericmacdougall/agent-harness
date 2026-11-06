@@ -9,7 +9,7 @@ Source: user "how we dont have proper tools/a cli in our harness that handles al
 
 ## Acceptance criteria
 
-- AC-1 `ah owners` lists every sub-agent with state live, quiet, SILENT, SILENT-HIGH, done, handoff, waiting-on-X, stopped or DROPPED, using `liveness.py` (shared with ops-watch). Verify by: tests.test_ah LivenessTests, OwnersTests.
+- AC-1 `ah owners` lists every sub-agent with state live, quiet, SILENT, SILENT-HIGH, done, handoff, waiting-on-X, stopped or DROPPED, using `liveness.py` (shared with ops-watch). Verify by: tests.test_ah LivenessTests, OwnersTests. The CLI default (since 2026-11-06) shows live, waiting, silent, dropped and decision-required rows plus terminal rows (done, handoff, returned, helpers) that ended within 6 h, and reports `hidden`; `--all` shows every row, and `counts` and `undisposed` always cover every row. `--text` is accepted before or after the subcommand. ahd and the dropped-workstreams scan pass `--all`; library callers use `owners()` unfiltered.
 - AC-2 `ah user-msg` resolves human turns, queued mid-turn messages and AskUserQuestion answers to `uuid:`, `queue:`, `answer:` ids. Verify by: UserMsgTests.
 - AC-3 `ah ticket comments` returns every comment, untruncated and valid JSON. Verify by: TicketTests.test_comments_untruncated_and_paginated.
 - AC-4 `ah disk` reports `/System/Volumes/Data` as the capacity volume on macOS and bounds its directory scan. Verify by: DiskTests.
