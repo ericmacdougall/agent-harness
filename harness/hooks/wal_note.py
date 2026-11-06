@@ -142,6 +142,12 @@ def main():
             record['assumption'] = True
     if args.event in SOURCED:
         mode, problem, assumption = provenance_check(args.event, args.source)
+        if problem and args.source and problem.startswith('source rejected'):
+            # A source that was given but does not parse or resolve is a caller error, whatever the mode: writing it
+            # anyway (quarantined) only moved the failure to the stop hook (main WAL w842c8dfc127, 2026-11-06).
+            print(json.dumps({'status': 'REFUSED', 'event': args.event, 'problem': problem[:300],
+                              'hint': 'nothing was written; fix the --source (see provenance.py) and retry'}), file=sys.stderr)
+            return 2
         if problem:
             if mode == 'enforce':
                 print(json.dumps({'status': 'REFUSED', 'event': args.event, 'problem': problem[:300],

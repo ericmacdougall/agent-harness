@@ -2022,6 +2022,13 @@ def note_cmd(home: Path, args) -> dict:
     if r.returncode != 0:
         plan["ok"] = False
         plan["stderr"] = r.stderr[-300:]
+        try:  # wal_note refused (rejected source: nothing written); surface its problem instead of a bare stderr tail
+            refusal = json.loads((r.stderr.strip().splitlines() or ["{}"])[-1])
+        except ValueError:
+            refusal = {}
+        if isinstance(refusal, dict) and refusal.get("status") == "REFUSED":
+            plan["refused"] = True
+            plan["problem"] = str(refusal.get("problem") or "")[:300]
     elif isinstance(plan.get("written"), dict) and plan["written"].get("warnings"):
         plan["ok"] = False  # written, but quarantined: the source did not resolve here (M2); say so instead of ok
         plan["quarantined"] = True

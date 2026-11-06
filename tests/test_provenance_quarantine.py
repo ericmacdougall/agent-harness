@@ -111,6 +111,35 @@ class Quarantine(Base):
         self.assertTrue(row.get("unsourced"))
         self.assertEqual(row["note"], "we go with python")
 
+    def test_rejected_source_is_refused_and_nothing_is_written(self):
+        """A source that was given but does not parse is a caller error: refuse it (exit 2, REFUSED) and append no
+        row, so the stop hook never has to quarantine it later (main WAL w842c8dfc127, 2026-11-06). Fail before the
+        fix: wal_note printed the rejection and still wrote the row with unsourced=True."""
+        before = len(self.rows())
+        for src in ("inferred: from af794b88 ledger read ; QAC journal whens -- free text inputs are not sources",
+                    "whatever I say", "ticket:not-a-ticket"):
+            with self.subTest(src):
+                rc, doc = self.note("--event", "decision", "--note", "we go with python", "--source", src)
+                self.assertEqual(rc, 2, doc)
+                self.assertEqual(doc.get("status"), "REFUSED")
+                self.assertIn("rejected", doc.get("problem", ""))
+                self.assertEqual(len(self.rows()), before)
+        # a missing source in warn mode still writes (quarantined), unchanged
+        rc, doc = self.note("--event", "decision", "--note", "no source at all")
+        self.assertEqual(rc, 0, doc)
+        self.assertTrue(self.rows()[-1].get("unsourced"))
+
+    def test_inferred_free_text_input_names_the_input_not_the_source(self):
+        """The rejection of `inferred: from <free text> -- why` must say which input is not a source; the old message
+        said the Source must start with inferred: although it did (main WAL w8d5f765ea4c)."""
+        import provenance
+        r = provenance.resolve("inferred: from af794b88 ledger read 22:10Z ; ticket:GoodQA goodqa#14902 -- the when collides")
+        self.assertFalse(r["ok"])
+        msg = r["problems"][0]["message"]
+        self.assertIn("af794b88 ledger read", msg)
+        self.assertIn("inferred input", msg)
+        self.assertNotIn("Source must start with", msg)
+
     def test_stop_lint_blocks_after_the_grace_bounded_and_names_the_fix(self):
         now = time.time()
         old = {"at": iso(now - 11 * 60), "event": "decision", "id": "wquar0000001", "note": "old unsourced", "unsourced": True}
@@ -210,16 +239,21 @@ class NoteSourceAuto(base.Env):
         self.assertEqual(p.returncode, 2)
         self.assertIn("allowlist", p.stderr)
 
-    def test_note_reports_a_quarantined_write_as_not_ok(self):
-        """M2: when the chosen source cannot be backed here, `ah note` must not say ok."""
+    def test_note_reports_a_rejected_source_as_refused_and_writes_nothing(self):
+        """M2: when the chosen source cannot be backed here, `ah note` must not say ok. Since the wal_note refusal
+        (2026-11-06) a rejected ancestor source (here a user: turn with no transcript on this host) is refused outright
+        and no row is appended, instead of being written quarantined."""
         now = time.time()
         with open(self.wal, "a") as fh:
-            fh.write(json.dumps({"at": iso(now - 600), "event": "scope", "id": "wsrc00000002", "note": "ticket-only ancestor",
-                                 "source": "ticket:GoodQA goodqa#99999999"}) + "\n")
+            fh.write(json.dumps({"at": iso(now - 600), "event": "scope", "id": "wsrc00000002", "note": "unbackable ancestor",
+                                 "source": 'user:12345678-1234-1234-1234-123456789abc/12345678-1234-1234-1234-123456789abd "gone"'}) + "\n")
+        before = len(self.rows())
         rc, done = self.ah("note", "--wal", str(self.wal), "--source", "auto", "--note", "follow-up")
         self.assertEqual(rc, 3, done)
         self.assertFalse(done["ok"])
-        self.assertTrue(done.get("quarantined"))
+        self.assertTrue(done.get("refused"), done)
+        self.assertIn("rejected", done.get("problem", ""))
+        self.assertEqual(len(self.rows()), before)
 
     def test_no_ancestor_is_refused_not_guessed(self):
         rc, plan = self.ah("note", "--wal", str(self.wal), "--source", "auto", "--dry-run", "--note", "orphan decision")
