@@ -370,6 +370,26 @@ class HookdTest(unittest.TestCase):
         self.assertEqual(self.client('wal.py', ['pretool'], payload('ls', i=2)).returncode, 0)
         self.assertEqual([r['tool_use_id'] for r in self.wal_lines()], ['toolu_t0', 'toolu_t1', 'toolu_t2'])
 
+    def test_stuck_writer_costs_at_most_one_short_timeout(self):
+        """Red-team M2: a writer that is alive but stopped must not stall every WAL hook for seconds."""
+        self.start()
+        self.assertEqual(self.client('wal.py', ['pretool'], payload('ls', i=0)).returncode, 0)
+        out = subprocess.run(['pgrep', '-P', str(self.server.pid)], capture_output=True, text=True).stdout.split()
+        self.assertTrue(out)
+        try:
+            for pid in out:
+                os.kill(int(pid), signal.SIGSTOP)
+            started = time.monotonic()
+            self.assertEqual(self.client('wal.py', ['pretool'], payload('ls', i=1)).returncode, 0)
+            self.assertLess(time.monotonic() - started, 2.5)
+            self.assertIn('toolu_t1', [r['tool_use_id'] for r in self.wal_lines()])  # appended directly, not lost
+        finally:
+            for pid in out:
+                try:
+                    os.kill(int(pid), signal.SIGCONT)
+                except OSError:
+                    pass
+
     def test_torn_tail_is_repaired(self):
         self.start()
         self.assertEqual(self.client('wal.py', ['pretool'], payload('ls', i=0)).returncode, 0)
@@ -468,15 +488,42 @@ class WiringTest(unittest.TestCase):
         scripts = {Path(h['args'][0]).name for h in self.handlers(self.install.merged_settings({}, self.claude))}
         self.assertEqual(scripts - set(self.hookd.SERVED), cold_by_design)
 
+    def real_hookc(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.claude = Path(tmp.name) / '.claude'
+        client = self.install.hookc_path(self.claude)
+        client.parent.mkdir(parents=True, exist_ok=True)
+        client.write_text('#!/bin/sh\nexit 2\n')
+        client.chmod(0o700)
+        return str(client)
+
     def test_doctor_accepts_the_client_only_for_the_same_script(self):
+        client = self.real_hookc()
         hooks_dir = self.claude / 'hooks'
-        ok = self.doctor.wired_path_ok(['/x/hookc', '--budget', '4', str(hooks_dir / 'wal.py'), 'pretool'],
+        ok = self.doctor.wired_path_ok([client, '--budget', '4', str(hooks_dir / 'wal.py'), 'pretool'],
                                        'wal.py', 'pretool', hooks_dir)
-        wrong = self.doctor.wired_path_ok(['/x/hookc', str(hooks_dir / 'bg_lint.py')], 'wal.py', 'pretool',
+        wrong = self.doctor.wired_path_ok([client, str(hooks_dir / 'bg_lint.py')], 'wal.py', 'pretool',
                                           hooks_dir)
         other = self.doctor.wired_path_ok(['/x/notc', str(hooks_dir / 'wal.py'), 'pretool'], 'wal.py', 'pretool',
                                           hooks_dir)
         self.assertEqual((ok, wrong, other), (True, False, False))
+
+    def test_doctor_rejects_a_hookc_that_is_not_the_installed_executable(self):
+        """Red-team M1: a missing, relocated or non-executable hookc must not pass doctor (fail-open guards and
+        blocking hooks would both misbehave while doctor reports green)."""
+        client = self.real_hookc()
+        hooks_dir = self.claude / 'hooks'
+        tail = ['--budget', '4', str(hooks_dir / 'wal.py'), 'pretool']
+        self.assertFalse(self.doctor.wired_path_ok(['/nonexistent/dir/hookc'] + tail, 'wal.py', 'pretool', hooks_dir))
+        Path(client).chmod(0o600)
+        self.assertFalse(self.doctor.wired_path_ok([client] + tail, 'wal.py', 'pretool', hooks_dir))
+        Path(client).chmod(0o700)
+        stray = self.claude.parent / 'elsewhere' / 'hookc'
+        stray.parent.mkdir(parents=True, exist_ok=True)
+        stray.write_text('#!/bin/sh\nexit 2\n')
+        stray.chmod(0o700)
+        self.assertFalse(self.doctor.wired_path_ok([str(stray)] + tail, 'wal.py', 'pretool', hooks_dir))
 
     def test_client_gate_list_matches_onfailure_block(self):
         source = (ROOT / 'tools' / 'hookc' / 'main.go').read_text()

@@ -72,6 +72,21 @@ def is_interpreter(tok: str) -> bool:
     return re.fullmatch(r"python[0-9.]*", Path(tok).name) is not None
 
 
+def hookc_ok(tok: str, hooks_dir: Path) -> bool:
+    """The client must be the installed ~/.agent-harness/bin/hookc (install.hookc_path), a regular executable file
+    owned by this user."""
+    want = os.path.normpath(str(hooks_dir.parent.parent / ".agent-harness" / "bin" / "hookc"))
+    path = os.path.normpath(os.path.expanduser(tok))
+    if path != want:
+        return False
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    import stat as stat_mod  # noqa: PLC0415
+    return stat_mod.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and os.access(path, os.X_OK)
+
+
 def wired_path_ok(toks: list[str], script: str, arg, hooks_dir: Path) -> bool:
     """The handler must run an interpreter on exactly hooks_dir/script (then arg), not merely mention its name."""
     want = os.path.normpath(str(hooks_dir / script))
@@ -79,7 +94,11 @@ def wired_path_ok(toks: list[str], script: str, arg, hooks_dir: Path) -> bool:
         return False
     if Path(toks[0]).name == "hookc":
         # hookd thin client (goodqa#14859): `hookc [--budget N] <script> args`; it runs `python3 <script> args`
-        # itself whenever the server cannot answer, so the same script is enforced either way.
+        # itself whenever the server cannot answer, so the same script is enforced either way. Only the installed
+        # client counts: a missing, relocated or non-executable hookc would make blocking hooks block everything
+        # and fail-open guards stop enforcing while doctor stayed green (red-team M1).
+        if not hookc_ok(toks[0], hooks_dir):
+            return False
         i = 3 if toks[1:2] == ["--budget"] else 1
     elif is_interpreter(toks[0]):
         i = 1
