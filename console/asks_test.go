@@ -255,3 +255,29 @@ func TestAsksViewOwnersPartialWhenOneSessionFails(t *testing.T) {
 		t.Fatalf("one failed session must mark owners partial, not unavailable: %s", out["owners"])
 	}
 }
+
+func TestAsksViewOwnersPartialWhenSessionCapHidesSessions(t *testing.T) {
+	m := happy()
+	var list []string
+	for i := 1; i <= askSessionCap+1; i++ {
+		id := fmt.Sprintf("s%d", i)
+		list = append(list, `{"session":"`+id+`","last_activity":"2999-01-01T00:00:00Z"}`)
+		m["owners --session "+id] = `{"session":"` + id + `","owners":[]}`
+	}
+	m["sessions"] = `{"sessions":[` + strings.Join(list, ",") + `]}`
+	fakeAh(t, m)
+	_, out := getAsks(t, "")
+	if !strings.Contains(string(out["owners"]), `"truncated":true`) {
+		t.Fatalf("sessions beyond the cap must mark owners partial: %s", out["owners"])
+	}
+}
+
+func TestAsksViewOwnersHonourAhTruncatedFlag(t *testing.T) {
+	m := happy()
+	m["owners --session s1"] = `{"session":"s1","owners":[{"agent_id":"a1","state":"live"}],"truncated":true}`
+	fakeAh(t, m)
+	_, out := getAsks(t, "")
+	if !strings.Contains(string(out["owners"]), `"truncated":true`) {
+		t.Fatalf("ah's truncated flag on owners must reach the page: %s", out["owners"])
+	}
+}

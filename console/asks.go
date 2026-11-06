@@ -255,8 +255,8 @@ func (a *app) askSection(ctx context.Context, scope []string, key string, strKey
 	return sec
 }
 
-func (a *app) ownerRows(ctx context.Context, sessions []string) viewSection {
-	sec := viewSection{Rows: []map[string]any{}}
+func (a *app) ownerRows(ctx context.Context, sessions []string, partialIn bool) viewSection {
+	sec := viewSection{Rows: []map[string]any{}, Truncated: partialIn}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	slots := make(chan struct{}, 2)
@@ -269,14 +269,18 @@ func (a *app) ownerRows(ctx context.Context, sessions []string) viewSection {
 			defer func() { <-slots }()
 			raw, err := askCached(ctx, "owners", "--session", s)
 			var list []any
+			var cut bool
 			if err == nil {
-				list, _, _, err = rowsOf(raw, "owners")
+				list, _, cut, err = rowsOf(raw, "owners")
 			}
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
 				failed++
 				return
+			}
+			if cut {
+				sec.Truncated = true // ah cut this session's owner scan short
 			}
 			for _, item := range list {
 				m, ok := item.(map[string]any)
@@ -328,14 +332,14 @@ func (a *app) ownerRows(ctx context.Context, sessions []string) viewSection {
 }
 
 // recentSessions: the newest few sessions with activity inside the window (owners cost ~1 s each).
-func (a *app) recentSessions(ctx context.Context) ([]string, error) {
+func (a *app) recentSessions(ctx context.Context) ([]string, bool, error) {
 	raw, err := askCached(ctx, "sessions")
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	list, _, _, err := rowsOfKey(raw, "sessions")
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	out := []string{}
 	for _, item := range list {
@@ -346,11 +350,12 @@ func (a *app) recentSessions(ctx context.Context) ([]string, error) {
 		if !askSessionRE.MatchString(s) || perr != nil || time.Since(t) > askRecentWindow {
 			continue
 		}
-		if out = append(out, s); len(out) >= askSessionCap {
-			break
+		if len(out) >= askSessionCap {
+			return out, true, nil // more recent sessions exist than the page reads: say the owners list is partial
 		}
+		out = append(out, s)
 	}
-	return out, nil
+	return out, false, nil
 }
 
 func rowsOfKey(raw []byte, key string) ([]any, int, bool, error) { return rowsOf(raw, key) }
@@ -384,14 +389,15 @@ func (a *app) asksViewHTTP(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer wg.Done()
 		sessions := []string{session}
+		capped := false
 		if session == "" {
 			var err error
-			if sessions, err = a.recentSessions(ctx); err != nil {
+			if sessions, capped, err = a.recentSessions(ctx); err != nil {
 				owners = unavailable(a.clean(err.Error()))
 				return
 			}
 		}
-		owners = a.ownerRows(ctx, sessions)
+		owners = a.ownerRows(ctx, sessions, capped)
 	}()
 	wg.Wait()
 	writeJSON(w, 200, map[string]any{"generated": time.Now().UTC().Format(time.RFC3339), "asks": asks, "owners": owners, "requirements": reqs})
