@@ -5750,10 +5750,10 @@
   },
   {
    "cmd": "K=(); echo \"kill 4004\" | \"${K[@]}\" grep kill",
-   "expect": "allow",
+   "expect": "block",
    "id": "EHOK-006",
    "shape": "EHOK",
-   "why": "an empty held head before a harmless command must stay allowed"
+   "why": "was allowed by 676c0e2 and listed as a harmless difference from main; with the N3 verb check after a dropped empty head it is refused, as main refuses it (a kill verb follows the empty head)"
   },
   {
    "cmd": "K=(); \"${K[@]}\" git status",
@@ -5810,6 +5810,293 @@
    "id": "XH-006",
    "shape": "XH",
    "why": "a lookup or print exemption must not apply to a held name, whose value the guard only guesses"
+  },
+  {
+   "cmd": "K=(); ${K[@]}${K[@]} pkill -f x",
+   "expect": "block",
+   "id": "ECH-001",
+   "shape": "ECH",
+   "why": "expansions that all resolve to nothing, concatenated, leave the next word as the command"
+  },
+  {
+   "cmd": "K=(); J=; ${K[@]}$J kill 4004",
+   "expect": "block",
+   "id": "ECH-002",
+   "shape": "ECH",
+   "why": "expansions that all resolve to nothing, concatenated, leave the next word as the command"
+  },
+  {
+   "cmd": "K=(); ${K}${K[@]} kill 4004",
+   "expect": "block",
+   "id": "ECH-003",
+   "shape": "ECH",
+   "why": "expansions that all resolve to nothing, concatenated, leave the next word as the command"
+  },
+  {
+   "cmd": "P=(sudo); [ \"$EUID\" -eq 0 ] && P=(); ${P[@]}${P[@]} pkill -f node",
+   "expect": "block",
+   "id": "ECH-004",
+   "shape": "ECH",
+   "why": "expansions that all resolve to nothing, concatenated, leave the next word as the command"
+  },
+  {
+   "cmd": "K=; $K$K pkill -f x",
+   "expect": "block",
+   "id": "ECH-005",
+   "shape": "ECH",
+   "why": "expansions that all resolve to nothing, concatenated, leave the next word as the command"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}${K[@]}\" kill 4004",
+   "expect": "block",
+   "id": "ECH-006",
+   "shape": "ECH",
+   "why": "expansions that all resolve to nothing, concatenated, leave the next word as the command"
+  },
+  {
+   "cmd": "K=; J=\"\"; \"$K$J\" kill 4004",
+   "expect": "block",
+   "id": "ECH-007",
+   "shape": "ECH",
+   "why": "expansions that all resolve to nothing, concatenated, leave the next word as the command"
+  },
+  {
+   "cmd": "K=(); J=; ${K[*]}${J} kill 4004",
+   "expect": "block",
+   "id": "ECH-008",
+   "shape": "ECH",
+   "why": "expansions that all resolve to nothing, concatenated, leave the next word as the command"
+  },
+  {
+   "cmd": "K=(); J=(); \"${K[@]}\"\"${J[@]}\" kill 4004",
+   "expect": "block",
+   "id": "ECH-009",
+   "shape": "ECH",
+   "why": "expansions that all resolve to nothing, concatenated, leave the next word as the command"
+  },
+  {
+   "cmd": "K=; J=; echo \"kill 4004\" | $K$J bash",
+   "expect": "block",
+   "id": "ECH-010",
+   "shape": "ECH",
+   "why": "expansions that all resolve to nothing, concatenated, leave the next word as the command"
+  },
+  {
+   "cmd": "K=(); echo \"pkill -f x\" | ${K[@]}${K[@]} sh",
+   "expect": "block",
+   "id": "ECH-011",
+   "shape": "ECH",
+   "why": "expansions that all resolve to nothing, concatenated, leave the next word as the command"
+  },
+  {
+   "cmd": "K=(); ${K[@]}${K[@]} echo hello",
+   "expect": "allow",
+   "id": "ECHOK-001",
+   "shape": "ECHOK",
+   "why": "a concatenated empty head before a harmless command must stay allowed"
+  },
+  {
+   "cmd": "K=; $K$K ls",
+   "expect": "allow",
+   "id": "ECHOK-002",
+   "shape": "ECHOK",
+   "why": "a concatenated empty head before a harmless command must stay allowed"
+  },
+  {
+   "cmd": "K=(); J=; ${K[@]}$J cat notes.txt",
+   "expect": "allow",
+   "id": "ECHOK-003",
+   "shape": "ECHOK",
+   "why": "a concatenated empty head before a harmless command must stay allowed"
+  },
+  {
+   "cmd": "K=; J=; \"$K$J\" grep -n x file",
+   "expect": "allow",
+   "id": "ECHOK-004",
+   "shape": "ECHOK",
+   "why": "a concatenated empty head before a harmless command must stay allowed"
+  },
+  {
+   "cmd": "K=(); ${K}${K[@]} git status",
+   "expect": "allow",
+   "id": "ECHOK-005",
+   "shape": "ECHOK",
+   "why": "a concatenated empty head before a harmless command must stay allowed"
+  },
+  {
+   "cmd": "K=; J=; echo \"kill 4004\" | $K$J cat",
+   "expect": "allow",
+   "id": "ECHOK-006",
+   "shape": "ECHOK",
+   "why": "a concatenated empty head before a harmless command must stay allowed"
+  },
+  {
+   "cmd": "K=; ${K:-kill} 4004",
+   "expect": "block",
+   "id": "ENE-001",
+   "shape": "ENE",
+   "why": "a word the shell does not expand to nothing (default, element, unknown, indirect, substitution, non-empty value) is never dropped"
+  },
+  {
+   "cmd": "K=(); ${K[@]:-kill} 4004",
+   "expect": "block",
+   "id": "ENE-002",
+   "shape": "ENE",
+   "why": "a word the shell does not expand to nothing (default, element, unknown, indirect, substitution, non-empty value) is never dropped"
+  },
+  {
+   "cmd": "K=(kill); ${K[0]} 4004",
+   "expect": "block",
+   "id": "ENE-003",
+   "shape": "ENE",
+   "why": "a word the shell does not expand to nothing (default, element, unknown, indirect, substitution, non-empty value) is never dropped"
+  },
+  {
+   "cmd": "K=; $K$UNKNOWN kill 4004",
+   "expect": "block",
+   "id": "ENE-004",
+   "shape": "ENE",
+   "why": "a word the shell does not expand to nothing (default, element, unknown, indirect, substitution, non-empty value) is never dropped"
+  },
+  {
+   "cmd": "K=; J=K; $K${!J} kill 4004",
+   "expect": "block",
+   "id": "ENE-005",
+   "shape": "ENE",
+   "why": "a word the shell does not expand to nothing (default, element, unknown, indirect, substitution, non-empty value) is never dropped"
+  },
+  {
+   "cmd": "K=; $K$(printf kill) 4004",
+   "expect": "block",
+   "id": "ENE-006",
+   "shape": "ENE",
+   "why": "a word the shell does not expand to nothing (default, element, unknown, indirect, substitution, non-empty value) is never dropped"
+  },
+  {
+   "cmd": "K=; J=kill; $K$J 4004",
+   "expect": "block",
+   "id": "ENE-007",
+   "shape": "ENE",
+   "why": "a word the shell does not expand to nothing (default, element, unknown, indirect, substitution, non-empty value) is never dropped"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" nocache kill 4004",
+   "expect": "block",
+   "id": "EHV-001",
+   "shape": "EHV",
+   "why": "after a head that expands to nothing, a kill verb among the next two words is refused, as main refuses it for a run-time command name"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" eatmydata kill 4004",
+   "expect": "block",
+   "id": "EHV-002",
+   "shape": "EHV",
+   "why": "after a head that expands to nothing, a kill verb among the next two words is refused, as main refuses it for a run-time command name"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" proxychains4 kill 4004",
+   "expect": "block",
+   "id": "EHV-003",
+   "shape": "EHV",
+   "why": "after a head that expands to nothing, a kill verb among the next two words is refused, as main refuses it for a run-time command name"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" xvfb-run kill 4004",
+   "expect": "block",
+   "id": "EHV-004",
+   "shape": "EHV",
+   "why": "after a head that expands to nothing, a kill verb among the next two words is refused, as main refuses it for a run-time command name"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" foo kill 4004",
+   "expect": "block",
+   "id": "EHV-005",
+   "shape": "EHV",
+   "why": "after a head that expands to nothing, a kill verb among the next two words is refused, as main refuses it for a run-time command name"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" kill -l",
+   "expect": "block",
+   "id": "EHV-006",
+   "shape": "EHV",
+   "why": "after a head that expands to nothing, a kill verb among the next two words is refused, as main refuses it for a run-time command name"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" which pkill",
+   "expect": "block",
+   "id": "EHV-007",
+   "shape": "EHV",
+   "why": "after a head that expands to nothing, a kill verb among the next two words is refused, as main refuses it for a run-time command name"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" echo kill 4004",
+   "expect": "block",
+   "id": "EHV-008",
+   "shape": "EHV",
+   "why": "after a head that expands to nothing, a kill verb among the next two words is refused, as main refuses it for a run-time command name"
+  },
+  {
+   "cmd": "K=; $K$K nocache pkill -f x",
+   "expect": "block",
+   "id": "EHV-009",
+   "shape": "EHV",
+   "why": "after a head that expands to nothing, a kill verb among the next two words is refused, as main refuses it for a run-time command name"
+  },
+  {
+   "cmd": "K=(); ${K[@]}${K[@]} eatmydata killall node",
+   "expect": "block",
+   "id": "EHV-010",
+   "shape": "EHV",
+   "why": "after a head that expands to nothing, a kill verb among the next two words is refused, as main refuses it for a run-time command name"
+  },
+  {
+   "cmd": "K=(); sudo \"${K[@]}\" nocache kill 4004",
+   "expect": "block",
+   "id": "EHV-011",
+   "shape": "EHV",
+   "why": "after a head that expands to nothing, a kill verb among the next two words is refused, as main refuses it for a run-time command name"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" nocache ls",
+   "expect": "allow",
+   "id": "EHVOK-001",
+   "shape": "EHVOK",
+   "why": "an empty head before harmless words must stay allowed"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" foo bar",
+   "expect": "allow",
+   "id": "EHVOK-002",
+   "shape": "EHVOK",
+   "why": "an empty head before harmless words must stay allowed"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" eatmydata make test",
+   "expect": "allow",
+   "id": "EHVOK-003",
+   "shape": "EHVOK",
+   "why": "an empty head before harmless words must stay allowed"
+  },
+  {
+   "cmd": "K=; $K$K xvfb-run npm test",
+   "expect": "allow",
+   "id": "EHVOK-004",
+   "shape": "EHVOK",
+   "why": "an empty head before harmless words must stay allowed"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" echo hello world",
+   "expect": "allow",
+   "id": "EHVOK-005",
+   "shape": "EHVOK",
+   "why": "an empty head before harmless words must stay allowed"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" which python3",
+   "expect": "allow",
+   "id": "EHVOK-006",
+   "shape": "EHVOK",
+   "why": "an empty head before harmless words must stay allowed"
   }
  ]
 }

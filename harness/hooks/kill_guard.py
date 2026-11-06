@@ -741,21 +741,32 @@ def make_analyzer_class(cg):
             return False
 
         def expands_to_nothing(self, word):
-            """A plain expansion of a known, empty or blank value: `K=(); "${K[@]}"`, `${K[*]}`, zsh `$K[@]`, `K=; $K`,
-            `${K}`. The shell drops it (or fails on it), so the word after it is the command; judging that word errs only
-            towards a refusal. `${K:-x}` and other operators, a picked element and an unknown name do not count."""
+            """A word whose expansions all resolve to nothing: `K=(); "${K[@]}"`, `${K[*]}`, zsh `$K[@]`, `K=; $K`, `${K}`,
+            and any concatenation of them (`${K[@]}${K[@]}`, `$K$J`, `"${K[@]}""${J[@]}"`; review N1 of 676c0e2). The
+            shell drops it (or fails on it), so the word after it is the command; judging that word errs only towards a
+            refusal. Decided on the resolved value, not the spelling: the word expands variables, no command
+            substitution, every resolved alternative is blank, and every variable it reads is known and untainted. An
+            unknown name resolves to `$NAME`, and `${K:-x}`, `${K[0]}`, `${!K}` and `${#K}` resolve to their text or a
+            marker, so none of them is blank and none is dropped."""
             if not word.vars or word.subs or any(a.strip() for a in word.alts):
                 return False
-            plain = r'"?(?:\$\{?([A-Za-z_][A-Za-z0-9_]*)(?:\[[@*]\])?\}?|\$([A-Za-z_][A-Za-z0-9_]*)\[[@*]\])"?'
-            match = re.fullmatch(plain, word.raw or '')
-            if not match:
-                return False
-            name = match.group(1) or match.group(2)
-            return name in self.ctx.vars and name not in self.ctx.tainted and not self.ctx.vars[name].strip()
+            return all(v in self.ctx.vars and v not in self.ctx.tainted for v in word.vars)
+
+        def drop_empty_head(self, words):
+            """The words left once leading words that expand to nothing are dropped. When any was dropped, main's
+            dynamic-head verb check still applies to what remains (review N3 of 676c0e2): main read the empty word as a
+            command built at run time and refused when a kill verb was among the next two words, so `K=(); "${K[@]}"
+            nocache kill 4004` (an unlisted wrapper) stays refused rather than judged as `nocache`."""
+            words = list(words)
+            dropped = False
+            while words and self.expands_to_nothing(words[0]):  # P=(sudo); [ root ] && P=(); "${P[@]}" pkill -f node
+                words, dropped = words[1:], True
+            if dropped and any(cg.norm_name(w.text) in (self.broad | self.windows | {'kill'}) for w in words[:2]):
+                self.block('dynamic-head', 'a command name that expands to nothing is followed by a kill verb')
+            return words
 
         def dispatch(self, words, cmd, pl, idx, depth):
-            while words and self.expands_to_nothing(words[0]):  # P=(sudo); [ root ] && P=(); "${P[@]}" pkill -f node
-                words = words[1:]
+            words = self.drop_empty_head(words)
             if not words:
                 return None
             return super().dispatch(words, cmd, pl, idx, depth)
@@ -860,6 +871,7 @@ def make_analyzer_class(cg):
                 self.ctx.vars.pop(words[1].text, None)
 
         def inner_words(self, words, depth, pl, idx, via_xargs=False):
+            words = self.drop_empty_head(words)  # K=(); sudo "${K[@]}" find ... -exec ...: find runs
             if via_xargs:
                 self.xargs += 1
             try:
