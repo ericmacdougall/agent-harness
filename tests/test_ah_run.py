@@ -2492,6 +2492,8 @@ class NativeReviewR9(HookFixture):
         self.assertEqual(ah_run.peel_wrapper('env A-B=1 rm x'), 'rm x')
         self.assertTrue(ah_run.parse_command('env "$v" rm x').uncertain)  # an expanded word may be a program or an option
         self.assertIn('state-variable', ah_run.lex("env 'PATH=/tmp/x' ls").reasons)  # env sets PATH, quoted or not
+        # the deny forms' fallback strip reads the same grammar (r9b mutant N1-env-prefix-no-plus survived without this)
+        self.assertEqual(ah_run.ENV_PREFIX.sub('', "A+=1 B='x y' C+=\"z\" rm x", count=1), 'rm x')
 
     def test_n1_neg_data_and_programs_are_not_assignments(self):
         """NEG: a `+=` or `=` word after the program is data, and `=x` starts no assignment to the shell."""
@@ -2537,7 +2539,8 @@ class NativeReviewR9(HookFixture):
             return any('without a later wait' in reason for reason in found)
         for command in ('wait; sleep 1 &', 'sleep 1 & (wait)', 'sleep 1 & true | wait', 'sleep 1 & wait 1', 'sleep 1 & false && wait',
                         'sleep 1 & wait &', 'sleep 1 & wait | cat', 'sleep 1 & { wait; }', 'sleep 1 & /usr/bin/wait', 'sleep 1 & WAIT',
-                        'sleep 1 & x=wait', 'sleep 1 & wait -n', 'sleep 1 |& wait'):
+                        'sleep 1 & x=wait', 'sleep 1 & wait -n', 'sleep 1 |& wait',
+                        'true; wait; sleep 1 &', 'sleep 1 & wait; sleep 2 &'):  # a wait before the last job (r9b mutant)
             self.assertTrue(flagged(command), command)
         for command in ('sleep 1 & wait', 'sleep 1 &\nwait $!', 'sleep 1 & wait "$!"', 'a & b & wait; echo', 'sleep 1 & wait && echo ok',
                         'sleep 1; wait', 'true'):
