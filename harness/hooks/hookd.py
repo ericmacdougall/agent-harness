@@ -190,6 +190,47 @@ def _main_block(path):
     raise ValueError('%s has no __main__ block' % os.path.basename(path))
 
 
+def _lazy_imports(paths):
+    """Top-level module names imported anywhere in `paths`, followed through harness modules, limited to
+    modules next to the hooks or in the standard library (never site-packages: the cold path may lack them)."""
+    import importlib.util
+    stdlib = os.path.dirname(os.__file__)
+    seen, found, queue = set(), set(), list(paths)
+    while queue:
+        path = queue.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            with open(path, 'rb') as handle:
+                tree = ast.parse(handle.read(), filename=path)
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name.split('.')[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module.split('.')[0]]
+            else:
+                continue
+            for name in names:
+                local = os.path.join(HOOKS_DIR, name + '.py')
+                if os.path.isfile(local):
+                    found.add(name)
+                    queue.append(local)
+                    continue
+                if name in sys.builtin_module_names:
+                    continue
+                try:
+                    spec = importlib.util.find_spec(name)
+                except (ImportError, ValueError):
+                    continue
+                origin = getattr(spec, 'origin', None) or ''
+                if origin.startswith(stdlib) and 'site-packages' not in origin:
+                    found.add(name)
+    return found
+
+
 def signature(path):
     try:
         st = os.stat(path)
@@ -232,6 +273,15 @@ def preload():
             except BaseException as error:  # noqa: BLE001 - an unloadable hook is simply not served
                 sys.modules.pop(name, None)
                 pre.errors[script] = type(error).__name__
+        # Modules the hooks import lazily (inside functions) would otherwise be imported again by every
+        # child. Import them here too: harness modules next to the hooks and standard-library modules.
+        for name in sorted(_lazy_imports([os.path.join(HOOKS_DIR, s) for s in pre.modules])):
+            if name in sys.modules:
+                continue
+            try:
+                importlib.import_module(name)
+            except BaseException:  # noqa: BLE001 - the child imports it itself, as the cold path does
+                sys.modules.pop(name, None)
     finally:
         os.environ = real_environ
     stdlib = os.path.dirname(os.__file__)
@@ -331,31 +381,109 @@ def _tmpfile(data=b''):
     return handle
 
 
+# Regex warm-up. The guards compile many patterns at run time; a forked child starts from the parent's `re`
+# cache, so each one would recompile them. A grandchild reports the patterns it compiled (one datagram each on
+# an anonymous socketpair only our children inherit), and the parent compiles them with plain re.compile,
+# which runs no hook code. Later forks then inherit a warm cache.
+_RE_REPORT = None          # child side of the socketpair (set by serve before any fork)
+RE_WARM_MAX = 2048         # distinct patterns the parent will compile
+RE_PATTERN_MAX = 1500      # bytes; one datagram must hold a pattern (macOS unix dgram limit is 2048)
+
+
+def _re_keys():
+    import re
+    return set(getattr(re, '_cache', {}))
+
+
+def _report_patterns(before):
+    import re
+    if _RE_REPORT is None:
+        return
+    for key in set(getattr(re, '_cache', {})) - before:
+        try:
+            kind, pattern, flags = key
+        except (TypeError, ValueError):
+            continue
+        if kind is str:
+            doc = {'t': 's', 'p': pattern, 'f': int(flags)}
+        elif kind is bytes:
+            doc = {'t': 'b', 'p': pattern.decode('latin-1'), 'f': int(flags)}
+        else:
+            continue
+        data = json.dumps(doc, separators=(',', ':')).encode()
+        if len(data) > RE_PATTERN_MAX:
+            continue
+        try:
+            _RE_REPORT.send(data)
+        except OSError:
+            return
+
+
+def _warm_patterns(rx, warmed):
+    """Parent: compile reported patterns (bounded). Pure stdlib work on strings; errors are ignored."""
+    import re
+    while True:
+        try:
+            data = rx.recv(4096)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError:
+            return
+        if len(warmed) >= RE_WARM_MAX:
+            continue
+        try:
+            doc = json.loads(data)
+            pattern = doc['p'] if doc['t'] == 's' else doc['p'].encode('latin-1')
+            key = (doc['t'], doc['p'], int(doc['f']))
+            if key not in warmed:
+                re.compile(pattern, int(doc['f']))
+                warmed.add(key)
+        except Exception:  # noqa: BLE001 - a bad report only costs a warm cache entry
+            continue
+
+
 def _fork_run(pre, script, argv, stdin_bytes, timeout):
     """Fork, run script's main in the grandchild with captured stdio. Returns (status, out, err) or raises
     TimeoutError after killing the grandchild."""
     fin, fout, ferr = _tmpfile(stdin_bytes), _tmpfile(), _tmpfile()
+    # Exit notification without polling: the grandchild holds the write end (non-inheritable, so programs it
+    # execs do not), and the read end sees EOF when the grandchild is gone.
+    done_r, done_w = os.pipe()
     pid = os.fork()
     if pid == 0:
+        os.close(done_r)
         try:
             os.dup2(fin.fileno(), 0)
             os.dup2(fout.fileno(), 1)
             os.dup2(ferr.fileno(), 2)
             _std_streams()
+            before = _re_keys()
             status = run_main(pre, script, argv)
+            try:
+                _report_patterns(before)
+            except Exception:  # noqa: BLE001
+                pass
         except BaseException:  # noqa: BLE001
             status = 1
         os._exit(status)
+    os.close(done_w)
     deadline = None if timeout is None else time.monotonic() + timeout
-    while True:
-        done, raw = os.waitpid(pid, os.WNOHANG)
-        if done:
-            break
-        if deadline is not None and time.monotonic() > deadline:
-            os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
-            raise TimeoutError
-        time.sleep(0.002)
+    try:
+        while True:
+            left = None if deadline is None else deadline - time.monotonic()
+            if left is not None and left <= 0:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                raise TimeoutError
+            try:
+                ready, _, _ = select.select([done_r], [], [], left)
+            except InterruptedError:
+                continue
+            if ready and not os.read(done_r, 1):
+                break
+    finally:
+        os.close(done_r)
+    _, raw = os.waitpid(pid, 0)
     status = os.waitstatus_to_exitcode(raw) if hasattr(os, 'waitstatus_to_exitcode') else (
         os.WEXITSTATUS(raw) if os.WIFEXITED(raw) else -os.WTERMSIG(raw))
     fout.seek(0)
@@ -633,6 +761,16 @@ def serve(max_children=DEFAULT_MAX_CHILDREN):
         return 0
     started = time.monotonic()
     pre = preload()
+    # Move every preloaded object to the permanent generation: a child's GC pass then neither scans nor
+    # writes to them, so they stay copy-on-write shared (measured: 4.6 -> 1.0 ms CPU per fork that collects).
+    import gc
+    gc.collect()
+    gc.freeze()
+    global _RE_REPORT
+    re_rx, _RE_REPORT = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    re_rx.setblocking(False)
+    _RE_REPORT.setblocking(False)
+    warmed = set()
     path = socket_path()
     try:
         os.unlink(path)
@@ -658,6 +796,8 @@ def serve(max_children=DEFAULT_MAX_CHILDREN):
         if pid == 0:
             listener.close()
             os.close(lock_fd)   # flock follows the open file: the writer must not keep the instance lock
+            re_rx.close()
+            _RE_REPORT.close()
             try:
                 writer_main(wal_module)
             finally:
@@ -679,7 +819,7 @@ def serve(max_children=DEFAULT_MAX_CHILDREN):
     def write_status():
         doc = {'pid': os.getpid(), 'started_at': time.time() - (time.monotonic() - started),
                'socket': path, 'children': len(children), 'loaded': sorted(pre.modules),
-               'load_errors': pre.errors, 'watch_files': len(pre.watch),
+               'load_errors': pre.errors, 'watch_files': len(pre.watch), 'warm_patterns': len(warmed),
                'env_keys_at_import': sorted(pre.env_read), **counts}
         import resource
         own, kids = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -734,10 +874,15 @@ def serve(max_children=DEFAULT_MAX_CHILDREN):
             time.sleep(0.005)
             continue
         try:
-            ready, _, _ = select.select([listener], [], [], 0.25)
+            ready, _, _ = select.select([listener, re_rx], [], [], 0.25)
         except InterruptedError:
             continue
-        if not ready:
+        if re_rx in ready:
+            before = len(warmed)
+            _warm_patterns(re_rx, warmed)
+            if len(warmed) != before:
+                gc.freeze()   # keep the new compiled patterns out of the children's GC scans
+        if listener not in ready:
             continue
         try:
             conn, _ = listener.accept()
