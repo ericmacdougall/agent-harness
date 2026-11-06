@@ -32,7 +32,8 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
          "ahd.py", "ahd_peek.py", "ahd_policy.json",
          "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py", "bg_job.py", "bg_lint.py",
-         "dropped_gate.py", "ask_reminders.py")  # dropped-owner gate and ask reminders (goodqa#14791)
+         "dropped_gate.py", "ask_reminders.py",  # dropped-owner gate and ask reminders (goodqa#14791)
+         "hookd.py")  # resident hook server (goodqa#14859)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -53,6 +54,51 @@ def managed_scripts(claude: Path) -> set[str]:
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
                          "dropped_gate.py")}
+
+
+def hookc_path(claude: Path) -> Path:
+    """The hookd thin client (tools/hookc), built at install time (goodqa#14859)."""
+    return claude.parent / ".agent-harness" / "bin" / "hookc"
+
+
+def hookd_served() -> set[str]:
+    """Script names hookd serves; the client form is wired only for these."""
+    import importlib.util  # noqa: PLC0415
+    spec = importlib.util.spec_from_file_location("_hookd_for_install", ROOT / "harness" / "hooks" / "hookd.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return set(module.SERVED)
+
+
+def is_managed_handler(hook: dict, scripts: set[str]) -> bool:
+    """A harness handler in either form: `python3 <script> ...` or `<.../hookc> [--budget N] <script> ...`."""
+    if hook.get("type") != "command":
+        return False
+    args = list(hook.get("args") or [])
+    if hook.get("command") == "python3":
+        return (args or [None])[0] in scripts
+    if Path(str(hook.get("command", ""))).name == "hookc":
+        if args[:1] == ["--budget"]:
+            args = args[2:]
+        return (args or [None])[0] in scripts
+    return False
+
+
+def uses_hookc(settings: dict) -> bool:
+    return any(Path(str(h.get("command", ""))).name == "hookc"
+               for groups in (settings.get("hooks") or {}).values() if isinstance(groups, list)
+               for group in groups if isinstance(group, dict)
+               for h in group.get("hooks", []) or [] if isinstance(h, dict))
+
+
+def hookc_handler(hook: dict, hookc: Path, served: set[str]) -> dict:
+    """`python3 <script> args` -> `<hookc> --budget B <script> args`, keeping timeout and onFailure. The budget is
+    the share of the host timeout hookd may use before hookc runs the cold hook with the rest."""
+    args = list(hook.get("args") or [])
+    if hook.get("command") != "python3" or not args or Path(args[0]).name not in served:
+        return hook
+    budget = max(2.0, round(float(hook.get("timeout", 10)) * 0.4, 1))
+    return {**hook, "command": str(hookc), "args": ["--budget", f"{budget:g}", *args]}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -200,7 +246,7 @@ def durable_scratch(claude: Path) -> Path:
 
 
 def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, provenance: bool = True,
-                    command_guard: bool = True, log_backup: bool = True) -> dict:
+                    command_guard: bool = True, log_backup: bool = True, hookd: bool = False) -> dict:
     settings = json.loads(json.dumps(current))
     env = settings.get("env", {})
     if not isinstance(env, dict):
@@ -216,18 +262,17 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
     hooks = settings.setdefault("hooks", {})
     scripts = managed_scripts(claude)
     wanted = managed_hooks(claude, provenance, command_guard, log_backup)
+    if hookd:  # same groups, same order: only served handlers switch to the thin client (goodqa#14859)
+        hookc, served = hookc_path(claude), hookd_served()
+        wanted = {event: [{**group, "hooks": [hookc_handler(h, hookc, served) for h in group.get("hooks", [])]}
+                          for group in groups] for event, groups in wanted.items()}
     for event in sorted(set(wanted) | set(managed_hooks(claude, True))):
         managed = wanted.get(event, [])
         entries = hooks.setdefault(event, [])
         had_entries = bool(entries)
         preserved = []
         for item in entries:
-            remaining = [
-                hook for hook in item.get("hooks", [])
-                if not (hook.get("type") == "command"
-                        and hook.get("command") == "python3"
-                        and (hook.get("args") or [None])[0] in scripts)
-            ]
+            remaining = [hook for hook in item.get("hooks", []) if not is_managed_handler(hook, scripts)]
             if remaining == item.get("hooks", []):
                 preserved.append(item)
             elif remaining:
@@ -619,23 +664,57 @@ def read_regular(path: Path, *, pinned_parent=None, retain_fd=None):
         return None
 
 
-def service_commands(claude: Path) -> list[list[str]]:
-    """Host services the harness runs: ahd, the deterministic monitor and scheduler (goodqa#14791). Each is
-    registered through its own unit installer after the files are in place; detector-only until S2 lands."""
-    return [[sys.executable, str(claude / "hooks" / "ahd.py"), "install", "--apply"]]
+def service_commands(claude: Path, hookd=None) -> list[list[str]]:
+    """Host services the harness runs: ahd, the deterministic monitor and scheduler (goodqa#14791), and hookd, the
+    resident hook server (goodqa#14859) when its client is wired. Each is registered through its own unit installer
+    after the files are in place; ahd is detector-only until S2 lands. hookd=False removes the hookd unit."""
+    cmds = [[sys.executable, str(claude / "hooks" / "ahd.py"), "install", "--apply"]]
+    if hookd is True:
+        cmds.append([sys.executable, str(claude / "hooks" / "hookd.py"), "install", "--apply"])
+    elif hookd is False:
+        cmds.append([sys.executable, str(claude / "hooks" / "hookd.py"), "install", "--apply", "--uninstall"])
+    return cmds
+
+
+def build_hookc(claude: Path, apply: bool, runner=None) -> str:
+    """Build tools/hookc (Go >= 1.21, stdlib only) into ~/.agent-harness/bin/hookc and check it runs. Raises
+    ValueError when no working client can be installed, so settings are never pointed at a missing binary."""
+    import subprocess  # noqa: PLC0415
+    import shutil  # noqa: PLC0415
+    dest = hookc_path(claude)
+    if not apply:
+        return f"would build {dest} (go build tools/hookc)"
+    runner = runner or (lambda argv, **kw: subprocess.run(argv, check=False, capture_output=True, timeout=300, **kw))
+    if shutil.which("go") is None:
+        if dest.is_file() and os.access(dest, os.X_OK):
+            return f"kept {dest} (go not found; using the installed client)"
+        raise ValueError("--hookd needs Go 1.21+ to build tools/hookc; install go or omit --hookd")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f".hookc.{os.getpid()}.tmp")
+    env = {**os.environ, "GOTOOLCHAIN": "local", "CGO_ENABLED": "0", "GOFLAGS": ""}
+    built = runner(["go", "build", "-trimpath", "-o", str(tmp), "."], cwd=str(ROOT / "tools" / "hookc"), env=env)
+    if built.returncode != 0 or not tmp.is_file():
+        raise ValueError("go build tools/hookc failed: " + (built.stderr or b"")[-300:].decode("utf-8", "replace"))
+    probe = runner([str(tmp)], input=b"")
+    if probe.returncode != 2 or b"usage: hookc" not in probe.stderr:  # no arguments: usage and exit 2
+        tmp.unlink()
+        raise ValueError("the built hookc did not pass its self-check; settings unchanged")
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, dest)
+    return f"built {dest}"
 
 
 class ServiceError(RuntimeError):
     """A host service failed to register; the files are already installed and stay installed."""
 
 
-def install_services(claude: Path, runner=None) -> list[str]:
+def install_services(claude: Path, runner=None, hookd=None) -> list[str]:
     import subprocess  # noqa: PLC0415
 
     runner = runner or (lambda argv: subprocess.run(argv, stdin=subprocess.DEVNULL, check=False, timeout=120,
                                                    capture_output=True, text=True))
     done = []
-    for argv in service_commands(claude):
+    for argv in service_commands(claude, hookd):
         label = " ".join(argv[1:])
         try:
             result = runner(argv)
@@ -651,7 +730,7 @@ def install_services(claude: Path, runner=None) -> list[str]:
 
 
 def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool = True,
-            command_guard: bool = True, log_backup=None, services: bool = False) -> list[str]:
+            command_guard: bool = True, log_backup=None, services: bool = False, hookd=None) -> list[str]:
     claude = home.expanduser().resolve() / ".claude"
     if log_backup is None:
         log_backup = log_backup_alert(home, None)
@@ -685,15 +764,21 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
         current_settings = json.loads(existing_settings[0].decode()) if existing_settings else {}
         if not isinstance(current_settings, dict):
             raise ValueError("settings.json must contain an object")
-        settings = merged_settings(current_settings, claude, durable_tmp, provenance, command_guard, log_backup)
+        # hookd: None keeps the current wiring; True wires the thin client; False restores python3 (rollback).
+        use_hookd = uses_hookc(current_settings) if hookd is None else hookd
+        hookd_note = build_hookc(claude, apply) if use_hookd else None
+        settings = merged_settings(current_settings, claude, durable_tmp, provenance, command_guard, log_backup,
+                                   hookd=use_hookd)
         # Read every payload before any managed write (also validate it in preview).
         payloads = [(destination, source.read_bytes()) for source, destination in files]
         payloads += [(instructions_path, instructions.encode()),
                      (settings_path, (json.dumps(settings, indent=2) + "\n").encode())]
-        changes = [str(path) for path in managed]
+        changes = [str(path) for path in managed] + ([hookd_note] if hookd_note else [])
+        service_hookd = True if use_hookd else (False if hookd is False else None)
         if not apply:
             if services:  # preview: name the service commands a real --apply --services run would execute
-                changes.extend("would run service: " + " ".join(argv[1:]) for argv in service_commands(claude))
+                changes.extend("would run service: " + " ".join(argv[1:])
+                               for argv in service_commands(claude, service_hookd))
             return changes
         for note in migrate_local_profiles(claude):
             print(f"  {note}")
@@ -754,10 +839,8 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
                 raise RuntimeError(f"Installation failed; rollback incomplete for {', '.join(failures)}; "
                                    f"restore from {backups}") from error
             raise
-        if services and not apply:
-            changes.extend("would run service: " + " ".join(argv[1:]) for argv in service_commands(claude))
         if apply and services:  # host services last, after every file is in place (goodqa#14791 S1d)
-            changes.extend("service: " + c for c in install_services(claude))
+            changes.extend("service: " + c for c in install_services(claude, hookd=service_hookd))
         return changes
     finally:
         pins.close()
@@ -1016,6 +1099,13 @@ def main() -> None:
     backup.add_argument("--no-log-backup", dest="log_backup", action="store_false",
                         help="remember not to install it; where installed, stop its scheduler job (files and "
                              "remote copies stay; see docs/operations.md, Agent log backup, for rollback)")
+    hookd = parser.add_mutually_exclusive_group()
+    hookd.add_argument("--hookd", dest="hookd", action="store_true", default=None,
+                       help="route the Claude hooks through the resident hook server: build ~/.agent-harness/bin/"
+                            "hookc, wire it into settings.json and (with --services) start hookd (goodqa#14859)")
+    hookd.add_argument("--no-hookd", dest="hookd", action="store_false",
+                       help="restore the plain python3 hook commands (rollback; with --services also removes the "
+                            "hookd unit). Without either flag the current wiring is kept")
     args = parser.parse_args()
     durable_tmp = durable_tmp_choice(args.home, args.durable_tmp)
     if args.apply and args.durable_tmp is not None:
@@ -1029,7 +1119,7 @@ def main() -> None:
     try:
         changes = install(args.home, args.apply, durable_tmp=durable_tmp, provenance=args.provenance,
                           command_guard=args.command_guard, log_backup=log_backup_alert(args.home, args.log_backup),
-                          services=args.services)
+                          services=args.services, hookd=args.hookd)
     except DirectoryPublicationError as error:
         parser.exit(1, f'Install failed: {error}\n')
     action = "Installed" if args.apply else "Would install"

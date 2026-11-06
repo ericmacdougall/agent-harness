@@ -75,11 +75,18 @@ def is_interpreter(tok: str) -> bool:
 def wired_path_ok(toks: list[str], script: str, arg, hooks_dir: Path) -> bool:
     """The handler must run an interpreter on exactly hooks_dir/script (then arg), not merely mention its name."""
     want = os.path.normpath(str(hooks_dir / script))
-    if not toks or not is_interpreter(toks[0]):
+    if not toks:
         return False
-    i = 1
-    while i < len(toks) and toks[i].startswith("-"):
-        i += 1
+    if Path(toks[0]).name == "hookc":
+        # hookd thin client (goodqa#14859): `hookc [--budget N] <script> args`; it runs `python3 <script> args`
+        # itself whenever the server cannot answer, so the same script is enforced either way.
+        i = 3 if toks[1:2] == ["--budget"] else 1
+    elif is_interpreter(toks[0]):
+        i = 1
+        while i < len(toks) and toks[i].startswith("-"):
+            i += 1
+    else:
+        return False
     if i >= len(toks) or os.path.normpath(os.path.expanduser(toks[i])) != want:
         return False
     rest = toks[i + 1:]

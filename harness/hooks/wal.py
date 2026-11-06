@@ -29,13 +29,33 @@ def safe_id(value: object) -> str:
     return f"z-{stem}-{digest}"
 
 
-def append(path: Path, record: dict) -> None:
+def check_path(path: Path) -> Path:
     root = Path.home() / ".claude" / "wals"
     if (path.parent.parent != root or path.suffix != ".jsonl"
             or not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", path.parent.name)
             or path.parent.name in {".", ".."}):
         raise ValueError("WAL path must be a per-session JSONL under ~/.claude/wals")
-    payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+    return root
+
+
+def encode(record: dict) -> bytes:
+    return (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+
+
+def append(path: Path, record: dict) -> None:
+    check_path(path)
+    append_lines(path, [encode(record)])
+
+
+def append_lines(path: Path, payloads: list) -> None:
+    """Append complete JSONL lines (each one record ending in a newline) under one lock with one fsync, in order.
+
+    hookd's writer uses this to group-commit concurrent hook records (GoodQA goodqa#14859)."""
+    root = check_path(path)
+    if not payloads or any(not isinstance(p, bytes) or not p.endswith(b"\n") or b"\n" in p[:-1]
+                           for p in payloads):
+        raise ValueError("WAL lines must be single complete JSONL records")
+    payload = b"".join(payloads)
     root.parent.mkdir(mode=0o700, exist_ok=True)
     # Pin each directory with an fd: never follow a redirected session or WAL path.
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
