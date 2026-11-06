@@ -6174,7 +6174,13 @@
 "group": "r9-N1",
 "kind": "hidden",
 "name": "plus-assign",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "A+=1 %s",
 "unstable": [],
@@ -6185,7 +6191,14 @@
 "group": "r9-N1",
 "kind": "hidden",
 "name": "env-any-equals",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "env A-B=1 %s",
 "unstable": [],
@@ -6196,7 +6209,14 @@
 "group": "r9-N1",
 "kind": "hidden",
 "name": "env-quoted-assign",
-"ran": [],
+"ran": [
+"bash3",
+"bash5",
+"dash",
+"ksh",
+"sh",
+"zsh"
+],
 "rewritten": "none",
 "shape": "env 'A=1' %s",
 "unstable": [],
