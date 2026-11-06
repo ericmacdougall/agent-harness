@@ -6168,6 +6168,39 @@
 "shape": "prlimit --nofile=64 %s",
 "unstable": [],
 "verdict": "certain"
+},
+{
+"deny": true,
+"group": "r9-N1",
+"kind": "hidden",
+"name": "plus-assign",
+"ran": [],
+"rewritten": "none",
+"shape": "A+=1 %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r9-N1",
+"kind": "hidden",
+"name": "env-any-equals",
+"ran": [],
+"rewritten": "none",
+"shape": "env A-B=1 %s",
+"unstable": [],
+"verdict": "certain"
+},
+{
+"deny": true,
+"group": "r9-N1",
+"kind": "hidden",
+"name": "env-quoted-assign",
+"ran": [],
+"rewritten": "none",
+"shape": "env 'A=1' %s",
+"unstable": [],
+"verdict": "certain"
 }
 ]
 }

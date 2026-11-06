@@ -2442,6 +2442,117 @@ class ProgramNames(HookFixture):
         self.assertEqual([rule.spec for rule in ah_run.folded_rules(rules)], ['RM:*', 'rm:*', 'rm:*'])
 
 
+class NativeReviewR9(HookFixture):
+    """The native Opus max review of 9e4d15b. N1: the shell's `NAME+=v` and env's own grammar (any word holding `=`) are
+    assignments to every reader, so the program after them is the one denied, asked and classified. N2: the escape classifier
+    reads through as many wrappers as the lexer (WRAPPER_DEPTH) and gives a reason past that. N3: a wait counts only when it
+    can wait for the job: the shell's own `wait` (no directory, no fold), run unconditionally in the current shell after the
+    job (not in a later subshell, a pipeline, an `&&`/`||` branch or another branch or loop of a compound), with no argument,
+    or `$!` for the latest job in its own list."""
+    PLUS = ('A+=1 rm -rf /tmp/zz', 'A+=1 B=2 RM -rf /tmp/zz', 'A+=1 nice rm -rf /tmp/zz', 'env A+=1 rm -rf /tmp/zz',
+            'env A-B=1 rm -rf /tmp/zz', "env 'A=1' rm -rf /tmp/zz", 'env "a b=1" rm -rf /tmp/zz', 'ENV A.B=1 RM -rf /tmp/zz',
+            'sudo A-B=1 rm -rf /tmp/zz')
+    WAITS_THAT_CANNOT = ('sleep 1 & /usr/bin/wait', 'sleep 1 & ./wait', 'sleep 1 & (wait)', 'sleep 1 & true | wait',
+                         'sleep 1 & wait | cat', 'sleep 1 & wait 1', 'sleep 1 & wait -n', 'sleep 1 & wait %1',
+                         'sleep 1 & false && wait', 'sleep 1 & true || wait', 'sleep 1 & wait &', 'sleep 1 & { wait; } | cat',
+                         'sleep 1 & WAIT', 'sleep 1 & if false; then wait; fi', 'sleep 1 & while false; do wait; done',
+                         'if true; then sleep 1 & else wait; fi', 'sleep 1 & echo $(wait)', 'sleep 1 & sleep 2 & wait $!',
+                         'for i in 1 2; do sleep 1 & done; wait $!', 'sleep 1 &\n(wait)', 'for i in 1 2; do wait; sleep 1 & done',
+                         'alias x=y; sleep 1 & (wait)', 'alias x=y; sleep 1 & true | wait', 'alias x=y; sleep 1 & wait 1',
+                         'alias x=y; sleep 1 & false && wait')
+    WAITS_THAT_DO = ('sleep 1 & wait', 'sleep 1 & wait $!', 'sleep 1 & wait "$!"', 'sleep 1 &\nwait', '( sleep 1 & wait )',
+                     '(sleep 5 &) ; wait', 'cmd1 & cmd2; wait', 'for i in 1 2; do sleep 1 & done; wait',
+                     'if true; then sleep 1 & wait; fi', 'while read x; do sleep 1 & wait $!; done < f',
+                     'sleep 1 & wait && echo done', 'sleep 1 & wait; echo done', '{ sleep 1 & wait; } | cat', 'sleep 1 & ! wait',
+                     '(sleep 1) & wait $!', 'alias x=y; sleep 1 & wait', 'alias x=y; sleep 1 &\nwait $!', 'alias x=y; a & b & wait')
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(host_table, 'resolve', lambda target, ssh_args=(), run=None: host_table.Resolved('elsewhere.example.test', 22))
+        patcher.start(); self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        ah_run.match_candidates.cache_clear()
+        super().tearDown()
+
+    def decision(self, command, mode, **lists):
+        self.settings('user', **lists)
+        ah_run.match_candidates.cache_clear()
+        return self.decide(command, permission_mode=mode).get('permissionDecision')
+
+    def test_n1_plus_assignments_and_env_words_are_read_past(self):
+        for command in self.PLUS + ('A=1 rm -rf /tmp/zz',):
+            self.assertEqual(self.decision(command, 'bypassPermissions', deny=['Bash(rm:*)']), 'deny', command)
+            self.assertEqual(self.decision(command, 'default', ask=['Bash(rm:*)'], allow=['Bash(*)']), 'ask', command)
+        for command in ('A+=1 setsid sleep 1', 'env A+=1 setsid sleep 1', 'env A-B=1 setsid sleep 1', 'A+=1 B=2 nohup sleep 1',
+                        "env 'A=1' nohup sleep 1", 'A+=1 NOHUP sleep 1', 'sudo A=1 setsid sleep 1', 'time A=1 setsid sleep 1',
+                        'sudo A-B=1 nohup sleep 1', 'nice A=1 B+=2 setsid sleep 1'):
+            self.assertTrue(ah_run.classify_escapes(command), command)
+        self.assertEqual(ah_run.peel_wrapper('A+=1 rm x'), 'rm x')
+        self.assertEqual(ah_run.peel_wrapper('env A-B=1 rm x'), 'rm x')
+        self.assertTrue(ah_run.parse_command('env "$v" rm x').uncertain)  # an expanded word may be a program or an option
+        self.assertIn('state-variable', ah_run.lex("env 'PATH=/tmp/x' ls").reasons)  # env sets PATH, quoted or not
+
+    def test_n1_neg_data_and_programs_are_not_assignments(self):
+        """NEG: a `+=` or `=` word after the program is data, and `=x` starts no assignment to the shell."""
+        for command in ('echo A+=1 rm -rf /tmp/zz', 'echo env A-B=1 rm', 'printf %s A+=1'):
+            self.assertNotEqual(self.decision(command, 'bypassPermissions', deny=['Bash(rm:*)']), 'deny', command)
+        self.assertEqual(ah_run.classify_escapes('echo A+=1 setsid'), [])
+        self.assertIsNone(ah_run.ASSIGNMENT.match('+=1'))
+        self.assertIsNone(ah_run.ASSIGNMENT.match('A-B=1'))  # to the shell this is a program word, to env an assignment
+
+    def test_n2_the_classifier_reads_as_many_wrappers_as_the_lexer(self):
+        self.assertEqual(ah_run.WRAPPER_DEPTH, 12)
+        for n in range(1, ah_run.WRAPPER_DEPTH):
+            for spelled in ('nice ', 'NICE ', 'nice -n 1 ', 'env ', 'env A=1 '):
+                command = spelled * n + 'setsid sleep 1'
+                self.assertFalse(ah_run.parse_command(command).uncertain, command)
+                self.assertTrue(ah_run.classify_escapes(command), command)
+        deep = 'nice ' * ah_run.WRAPPER_DEPTH + 'true'
+        self.assertTrue(ah_run.parse_command(deep).uncertain)
+        self.assertTrue(any('wrappers' in reason for reason in ah_run.classify_escapes(deep)), ah_run.classify_escapes(deep))
+        self.settings_policy('enforce')
+        self.assertEqual(self.decision('nice ' * 8 + 'setsid sleep 1', 'default', allow=['Bash(nice:*)']), 'deny')
+        self.assertEqual(self.decision('nice ' * 8 + 'sleep 1', 'default', allow=['Bash(nice:*)']), 'allow')  # NEG
+
+    def test_n3_a_wait_that_cannot_wait_for_the_job_does_not_count(self):
+        for command in self.WAITS_THAT_CANNOT:
+            self.assertTrue(any('without a later wait' in reason for reason in ah_run.classify_escapes(command)), command)
+        self.settings_policy('enforce')
+        for command in ('sleep 1 & /usr/bin/wait', 'sleep 1 & (wait)', 'sleep 1 & true | wait', 'sleep 1 & wait 1'):
+            self.assertEqual(self.decision(command, 'bypassPermissions'), 'deny', command)
+
+    def test_n3_neg_a_wait_that_waits_still_counts(self):
+        for command in self.WAITS_THAT_DO:
+            self.assertEqual(ah_run.classify_escapes(command), [], command)
+        self.assertEqual(ah_run.classify_escapes('a & ' * 3000 + 'wait'), [])
+        self.assertTrue(ah_run.classify_escapes('a & ' * 3000 + '(wait)'))
+
+    def test_n3_the_line_check_on_uncertain_text_reads_the_same_rule(self):
+        """On uncertain text every line is also read as text: a wait there counts only after the last background `&`, at a
+        command start after `;`, a newline or `&`, bare or with `$!`, ending before `;`, a newline, `&&`, `||` or the end."""
+        def flagged(command):
+            found = []
+            ah_run._classify_physical_lines(command, found, 0)
+            return any('without a later wait' in reason for reason in found)
+        for command in ('wait; sleep 1 &', 'sleep 1 & (wait)', 'sleep 1 & true | wait', 'sleep 1 & wait 1', 'sleep 1 & false && wait',
+                        'sleep 1 & wait &', 'sleep 1 & wait | cat', 'sleep 1 & { wait; }', 'sleep 1 & /usr/bin/wait', 'sleep 1 & WAIT',
+                        'sleep 1 & x=wait', 'sleep 1 & wait -n', 'sleep 1 |& wait'):
+            self.assertTrue(flagged(command), command)
+        for command in ('sleep 1 & wait', 'sleep 1 &\nwait $!', 'sleep 1 & wait "$!"', 'a & b & wait; echo', 'sleep 1 & wait && echo ok',
+                        'sleep 1; wait', 'true'):
+            self.assertFalse(flagged(command), command)
+
+    def test_n3_wait_counting_is_linear(self):
+        """A deep compound or many subshells cost one walk per scope, not per job and scope."""
+        for command in ('if true; then ' * 400 + 'a & ' * 400 + 'fi; ' * 400 + 'wait',
+                        'if true; then ' * 400 + 'a & ' * 400 + 'fi; ' * 400 + '(wait)',
+                        '( ' * 12 + 'a & ' * 3000 + ') ' * 12 + '; wait', 'a & (wait); ' * 2000):
+            started = time.monotonic()
+            ah_run.classify_escapes(command)
+            self.assertLess(time.monotonic() - started, 5, command[:40])
+
+
 class LauncherShell(unittest.TestCase):
     """r6 S31: the launcher runs bash or zsh by basename and falls back to bash, so the wrapped and unwrapped runs use a shell
     the hook's claim covers."""

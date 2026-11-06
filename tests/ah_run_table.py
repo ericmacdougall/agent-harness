@@ -199,6 +199,10 @@ NEW_ROWS = [  # (group, name, shape, kind); kind `limit` names what the hook doe
     ('r8-F2', 'test-subscript-name', 'p=\'$(\'; t="b[${p}%s >&3)]"; { test -v \'a[t]\'; } 3>&1', 'hidden'),
     ('r8-F2', 'bracket-subscript-name', 'p=\'$(\'; t="b[${p}%s >&3)]"; { [ -v \'a[t]\' ]; } 3>&1', 'hidden'),
     ('r8-limit', 'unknown-launcher', 'prlimit --nofile=64 %s', 'limit'),  # GoodQA goodqa#14793: a launcher outside the grammar
+    # r9 native review (Opus max): `NAME+=v` is an assignment to bash, zsh and ksh, and env reads any word holding `=` as one
+    ('r9-N1', 'plus-assign', 'A+=1 %s', 'hidden'),
+    ('r9-N1', 'env-any-equals', 'env A-B=1 %s', 'hidden'),
+    ('r9-N1', 'env-quoted-assign', "env 'A=1' %s", 'hidden'),
 ]
 RULE = 'Bash(echo HIDDEN-LINE:*)'
 SSH_STUB = '#!/bin/sh\n[ "$1" = "-G" ] && { for last; do :; done; printf "hostname %s\\nport 22\\n" "$last"; exit 0; }\ncat\n'

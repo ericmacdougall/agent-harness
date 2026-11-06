@@ -716,8 +716,9 @@ def ledger_cmd(args):
 INLINE_LIMIT = 64 * 1024
 PAYLOAD_CAP = 1 << 20
 AH_RUN_RULE = re.compile(r'(?:^|[\s/*])(?:ah-run|ah_run\.py)(?:$|[\s:*])')
-ASSIGNMENT = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
-ENV_PREFIX = re.compile(r'''^(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"[^"]*"|[^ \t\n]*)[ \t\n]+)+''')
+# the shell's assignment word, `NAME+=v` too (r9b N1): one grammar with the lexer's ASSIGN_WORD
+ASSIGNMENT = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*\+?=')
+ENV_PREFIX = re.compile(r'''^(?:[A-Za-z_][A-Za-z0-9_]*\+?=(?:'[^']*'|"[^"]*"|[^ \t\n]*)[ \t\n]+)+''')
 WRAPPER_PREFIX = re.compile(r'^(?:timeout[ \t\n]+(?:-[^ \t\n]+[ \t\n]+)*[0-9][^ \t\n]*|nice(?:[ \t\n]+-n[ \t\n]*[0-9]+|[ \t\n]+-[0-9]+)?|nohup|time|command|builtin|env)[ \t\n]+')
 KEYWORD_PREFIX = re.compile(r'^(?:then|do|else|elif|if|while|until|!|\{)[ \t\n]+')
 ESCAPE_NAMES = frozenset(('nohup', 'setsid', 'disown', 'screen', 'tmux', 'at', 'batch', 'crontab', 'osascript', 'coproc'))
@@ -748,6 +749,7 @@ HEREDOC_OPENER = re.compile(r"""<<(-?)[ \t]*(?:'([A-Za-z_][A-Za-z0-9_]*)'|"([A-Z
 HEREDOC_MARKER = re.compile(r'<<__HD(\d+)__')
 SIMPLE_BRACE = re.compile(r'\$\{[A-Za-z_][A-Za-z0-9_]*\}')
 MAX_GROUP_DEPTH = 16
+WRAPPER_DEPTH = 12  # wrappers the lexer, the deny forms and the escape classifier read through (r9b N2); past it, a reason
 WORD_END = ' \t\n;&|()<>'
 WORD_RUN = re.compile(r"[A-Za-z0-9_./:,+=@%^~*?!\]-]+")
 DQ_RUN = re.compile(r'[^"\\`$]+')
@@ -813,7 +815,10 @@ SSH_O_CLUSTER = re.compile(r'-[46AaCfGgKkMNnqsTtVvXxYy]*o')
 SSH_OPTION_CODE = re.compile(r'(?i)(proxycommand|knownhostscommand|localcommand|match)([ \t=]|$)')
 
 Word = collections.namedtuple('Word', 'raw value dynamic')  # raw: normalized text; value: quotes removed, a group is X
-Command = collections.namedtuple('Command', 'text words operator closer')  # words exclude keywords, redirects and targets
+# words exclude keywords, redirects and targets. path: the scopes the command runs in, outermost first: the list's root (0),
+# each subshell and each branch or loop body of a keyword compound, as ids unique within one lexer (r9b N3). prev: the
+# operator before it in its own list (None first).
+Command = collections.namedtuple('Command', 'text words operator closer path prev', defaults=((0,), None))
 
 
 class _WordBuf:
@@ -829,11 +834,12 @@ class _WordBuf:
 class _ListState:
     """One command list: the top level, a subshell or a substitution body."""
     __slots__ = ('closer', 'depth', 'group', 'commands', 'cur', 'words', 'stack', 'after_close', 'need_command', 'prev_op',
-                 'here_string', 'for_header', 'redirected', 'amp_redirect')
+                 'here_string', 'for_header', 'redirected', 'amp_redirect', 'path', 'frames')
 
-    def __init__(self, closer, depth, group, commands):
+    def __init__(self, closer, depth, group, commands, path=(0,)):
         self.closer, self.depth, self.group, self.commands = closer, depth, group, commands
         self.cur, self.words, self.stack = [], [], []
+        self.path, self.frames = path, []  # frames: one scope id per open keyword compound, beside stack (r9b N3)
         self.after_close = self.need_command = self.here_string = self.for_header = False
         self.redirected = self.amp_redirect = False
         self.prev_op = None
@@ -850,6 +856,7 @@ class _Lexer:
         self.bodies, self.openers, self.opener_spans, self.spans, self.pending = [], [], [], [], []
         self.continuations, self.body_lines = [], 0  # body_lines: lines the body reader read, for the R7-Q bound
         self.newline = self.pipeline = self.substitution = self.saw_nesting = self.stopped = self.ran_off_end = False
+        self.scopes = 0  # the last scope id given out (Command.path)
         self.first = self.n - len(text.lstrip(' \t\n'))
         self.last = len(text.rstrip(' \t\n'))
 
@@ -874,12 +881,12 @@ class _Lexer:
 
     # -- lists -------------------------------------------------------------------------------------------------
 
-    def _list(self, i, closer, depth, group, commands):
+    def _list(self, i, closer, depth, group, commands, path=(0,)):
         if depth > MAX_GROUP_DEPTH:
             self.reason('nesting')
             self.stopped = True
             return self.n
-        st, text, n = _ListState(closer, depth, group, commands), self.text, self.n
+        st, text, n = _ListState(closer, depth, group, commands, path), self.text, self.n
         while i < n and not self.stopped:
             ch = text[i]
             if ch in ' \t':
@@ -925,7 +932,7 @@ class _Lexer:
         elif words:
             self._check_command(words, st.prev_op, st.here_string)
         if text or words or closer:
-            st.commands.append(Command(text, tuple(words), operator, closer))
+            st.commands.append(Command(text, tuple(words), operator, closer, st.path + tuple(st.frames), st.prev_op))
         st.after_close = st.here_string = st.redirected = st.amp_redirect = False
 
     def _newline(self, i, st):
@@ -987,7 +994,7 @@ class _Lexer:
             self.reason('attached-paren')
         self._cut(st, '(')
         st.need_command = False
-        end = self._list(i + 1, ')', st.depth + 1, st.group, st.commands)
+        end = self._list(i + 1, ')', st.depth + 1, st.group, st.commands, st.path + tuple(st.frames) + (self._scope(),))
         st.after_close = True
         return end
 
@@ -1115,6 +1122,7 @@ class _Lexer:
             return True
         if name in ('if', 'while', 'until', '{', 'for'):
             stack.append('while' if name == 'until' else name)
+            st.frames.append(self._scope())
             st.for_header = name == 'for'
             return True
         closes = name in ('fi', 'done', '}')
@@ -1124,10 +1132,16 @@ class _Lexer:
             return True
         if closes:
             stack.pop()
+            st.frames.pop()
             st.after_close = True
         else:
             stack[-1] = {'then': 'then', 'elif': 'if', 'else': 'else', 'do': 'do'}[name]
+            st.frames[-1] = self._scope()  # each branch and loop body is its own scope: it may run zero times
         return True
+
+    def _scope(self):
+        self.scopes += 1
+        return self.scopes
 
     def _check_for_header(self, words):
         ok = bool(words) and bool(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', words[0].raw)) and (len(words) == 1 or words[1].raw == 'in')
@@ -1413,7 +1427,7 @@ class _Lexer:
         for value in values:
             if SUBSCRIPT_CODE.search(value):
                 self.reason('subscript-code')
-        for _ in range(12):
+        for _ in range(WRAPPER_DEPTH):
             while k < count and ASSIGN_WORD.match(raws[k]):
                 if raws[k].split('=', 1)[0].rstrip('+') in STATE_VARS:
                     self.reason('state-variable')
@@ -1444,8 +1458,8 @@ class _Lexer:
             if base == 'exec' and step >= count and not unknown:
                 self.reason('exec-redirect')  # later commands read and write through whatever it opened
             if base in ('env', 'sudo'):
-                for j in range(k + 1, step):
-                    if ASSIGN_WORD.match(raws[j]) and raws[j].split('=', 1)[0].rstrip('+') in STATE_VARS:
+                for j in range(k + 1, step):  # the words env reads as NAME=VALUE, quoted too (r9b N1)
+                    if '=' in values[j] and values[j].split('=', 1)[0].rstrip('+') in STATE_VARS:
                         self.reason('state-variable')
             k = step
         self.reason('wrapper-depth')
@@ -1642,7 +1656,9 @@ HEREDOC_HINT = ("Text in a heredoc inside $(...) is checked line by line as comm
                 "`git commit -F - <<'EOF'` for a commit message, `gh pr create --body-file - <<'EOF'` for a PR body.")
 PHYSICAL_SPLIT = re.compile(r'[;&|()`\n\r<>]|\$\(')  # a redirect can touch the word before it (`touch<<E`)
 BACKGROUND_AMP = re.compile(r'(?<![&<>])&(?=[ \t\n]|$)')
-LATER_WAIT = re.compile(r'(?:^|[ \t\n;&|(])wait(?=[ \t\n;&|)]|$)')
+# uncertain text (r9b N3): a bare `wait` or `wait $!` that starts a command after `;`, a newline or a single `&` (not `&&`,
+# `|`, `(` or `{`) and ends one before `;`, a newline, `&&`, `||` or the end; it must come after the last background `&`
+COUNTED_WAIT = re.compile(r'(?:[;\n]|(?<![&<>|])&)[ \t]*wait(?:[ \t]+(?:\$!|"\$!"))?[ \t]*(?=$|[;\n]|&&|\|\|)')
 SCRIPT_HOSTS = frozenset(('bash', 'sh', 'zsh', 'dash', 'ksh', 'source', '.'))
 SHELL_LINE_BLANKS = re.compile(r'[ \t\n]+')
 ANSI_IN_FRAGMENT = re.compile(r"\$'")
@@ -1855,7 +1871,8 @@ def _classify_physical_lines(command, reasons, depth):
     found = []
     for part in physical_parts(command):
         _classify_words([word.strip('\'"') for word in _blank_split(part)], found, [], depth)
-    if BACKGROUND_AMP.search(command) and not LATER_WAIT.search(command):
+    jobs = [match.start() for match in BACKGROUND_AMP.finditer(command)]
+    if jobs and not COUNTED_WAIT.search(command, jobs[-1]):
         found.append('background & without a later wait')
     found.extend('%s detaches a process from tracking' % name for name in literal_escape_names(command))
     reasons.extend('a line of a command the hook cannot parse with certainty: ' + reason for reason in found)
@@ -2093,9 +2110,11 @@ def _wrapper_scan(base, values, raws, k, dynamic=None):
             k += 1
         else:
             unknown, k = True, k + 1
-    elif base == 'env':
-        while k < count and ASSIGNMENT.match(raws[k]):
-            k += 1
+    elif base in ('env', 'sudo'):
+        # env's own grammar (GNU and BSD), and sudo's VAR=value: every word holding `=` before the program is an assignment,
+        # `A-B=1` and `'A=1'` too (r9b N1); an expanded word may be one, or the program
+        while k < count and (expands(k) or '=' in values[k]):
+            unknown, k = unknown or expands(k), k + 1
     return k, unknown
 
 
@@ -2157,7 +2176,7 @@ def _read_through(form):
 
 def _peeled_forms(segment, fold=True):
     forms, seen, current = [], set(), normalize_segment(segment)
-    for _ in range(12):
+    for _ in range(WRAPPER_DEPTH):
         if current in seen:
             break
         seen.add(current); forms.append(current)
@@ -2354,9 +2373,9 @@ def _is_attribution_key(key):
 def _classify_words(words, reasons, notes, depth):
     """Name the escape (if any) in one simple command; wrappers (env, timeout, sudo...) are looked through."""
     index = 0
-    while index < len(words) and ASSIGNMENT.match(words[index]):
-        index += 1
-    for _ in range(8):
+    for _ in range(WRAPPER_DEPTH):  # as many as the lexer reads (r9b N2)
+        while index < len(words) and ASSIGNMENT.match(words[index]):  # before each program, as the lexer reads (r9b N1)
+            index += 1
         if index >= len(words):
             return
         typed = words[index].rsplit('/', 1)[-1]
@@ -2410,6 +2429,7 @@ def _classify_words(words, reasons, notes, depth):
             continue
         break
     else:
+        reasons.append('wrappers nested deeper than %d: the program they run is not read' % WRAPPER_DEPTH)
         return
     if name in ESCAPE_NAMES:
         reasons.append('%s detaches a process from tracking' % name)
@@ -2470,16 +2490,56 @@ def _classify_text(command, reasons, notes, depth, prefix=''):
 def _classify_list(commands, reasons, notes, depth, uncertain):
     """The classifier over one command list. On uncertain text it also reads through what may be empty or a redirect."""
     entries = [[word.value for word in item.words] for item in commands]
-    # exact (r9 F1): on macOS `WAIT` finds /usr/bin/wait, a script whose own shell has no jobs to wait for
-    last_wait = max((position for position, words in enumerate(entries) if _command_word(words) == 'wait'), default=-1)
-    for position, (item, words) in enumerate(zip(commands, entries)):
+    for item, words in zip(commands, entries):
         _classify_words(words, reasons, notes, depth)
         if uncertain:
             through = _blank_split(_read_through(' '.join(words)))
             if through[:1] != words[:1]:  # only when another program runs: the words after it are quote-removed text
                 _classify_words(through, reasons, notes, depth)
-        if item.operator == '&' and (words or item.closer) and position >= last_wait:
-            reasons.append('background & without a later wait')
+    if _uncovered_job(commands, entries):
+        reasons.append('background & without a later wait')
+
+
+def _counted_wait(item, words):
+    """'all' for a wait that waits for every job of the shell it runs in, 'last' for `wait $!` (the latest job), None for
+    any other command (r9b N3). It is the shell's own builtin, spelled exactly: `/usr/bin/wait` or, on macOS, `WAIT` is a
+    script whose own shell has no jobs (r9 F1). It runs whenever the list reaches it, in the list's own shell: not after
+    `&&`, `||` or `|` (a branch, or a pipeline subshell), and not itself backgrounded or piped. Any argument but `$!`
+    (`wait 1`, `wait -n`, `wait %1`) may return before the job ends."""
+    if words[:1] != ['wait'] or item.prev not in (None, ';', '\n', '&') or item.operator not in (None, ';', '\n', '&&', '||'):
+        return None
+    if len(words) == 1:
+        return 'all'
+    return 'last' if words[1:] == ['$!'] else None
+
+
+def _uncovered_job(commands, entries):
+    """True when a background job has no later wait that waits for it (r9b N3). A bare wait covers the jobs started
+    before it in its own scope or one nested in it (Command.path): `(sleep 5 &) ; wait` (spec), a loop's jobs after `done`;
+    not a job outside it (`sleep 1 & (wait)`, `if c; then sleep 1 & else wait; fi`). `wait $!` covers only the latest job,
+    and only in its own scope. One backward pass: `waits` holds the scopes with a later bare wait, `covered` the scopes
+    already shown to have one at or above them (it only grows, as waits does), so each scope is walked once."""
+    waits, covered, latest = set(), set(), None  # latest: the scope of a later `wait $!` that no job has met yet
+    for item, words in zip(reversed(commands), reversed(entries)):
+        kind = _counted_wait(item, words)
+        if kind == 'all':
+            waits.add(item.path[-1])
+        elif kind == 'last':
+            latest = item.path
+        if item.operator != '&' or not (words or item.closer):
+            continue
+        bang, latest = latest, None  # `$!` names this job, the latest one, whatever its scope
+        if bang == item.path:
+            continue
+        walked = []
+        for scope in reversed(item.path):
+            if scope in waits or scope in covered:
+                covered.update(walked)
+                break
+            walked.append(scope)
+        else:
+            return True
+    return False
 
 
 def _classify_command(command, reasons, notes, depth):
@@ -2498,13 +2558,6 @@ def _classify_command(command, reasons, notes, depth):
     if not uncertain:
         for body in script_bodies(lexed):
             _classify_text(body, reasons, notes, depth + 1, 'heredoc script: ')
-
-
-def _command_word(words):
-    for word in words:
-        if not ASSIGNMENT.match(word):
-            return word.rsplit('/', 1)[-1]
-    return ''
 
 
 def analyze_escapes(command):
