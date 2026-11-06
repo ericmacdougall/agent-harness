@@ -32,7 +32,8 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
          "ahd.py", "ahd_peek.py", "ahd_policy.json",
          "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py", "bg_job.py", "bg_lint.py",
-         "dropped_gate.py", "ask_reminders.py")  # dropped-owner gate and ask reminders (goodqa#14791)
+         "dropped_gate.py", "ask_reminders.py",  # dropped-owner gate and ask reminders (goodqa#14791)
+         "prod_delete_guard.py")  # production-delete gate ported from Hawkeye (goodqa#14908)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -74,12 +75,14 @@ def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
-                         "dropped_gate.py")}
+                         "dropped_gate.py", "prod_delete_guard.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
 # SubagentStart/Stop WAL record, so no liveness check could see them stop (goodqa#14613, the Solve drop).
 SUBAGENT_MATCHER = ".*"
+# Must equal prod_delete_guard.MATCHER (tests/test_prod_delete_guard.py pins it): every tool path the guard judges.
+PROD_DELETE_MATCHER = r"Bash|mcp__hawkeye__run|.*d1_database_query|mcp__.*__(execute_sql|run_sql|query|sql)|mcp__.*__hyperdrive_.*"
 GOODQA_STATUS_TOOLS = (r"^mcp__.*[Gg][Oo][Oo][Dd][Qq][Aa].*__(close_issue_done|close_issue_wont_fix|update_issue|"
                        r"bulk_update_issues|archive_issue|reassign_issue|call_api)$")
 
@@ -136,6 +139,9 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     heavy_guard = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "heavy_job_guard.py")],
                    "timeout": 10}
     agent_gate = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "agent_gate.py")], "timeout": 10}
+    # Production-delete gate (goodqa#14908): fails open before a match and denies from inside after one, so no onFailure.
+    prod_delete = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "prod_delete_guard.py")],
+                   "timeout": 30}
 
     def command(event: str, fail_closed: bool = False) -> dict:
         hook = {"type": "command", "command": "python3", "args": [script, event], "timeout": 10}
@@ -182,6 +188,9 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
             # Route heavy Mac work (browsers, full suites, builds) to dev2; advisory for hostile probes.
             "matcher": "Bash",
             "hooks": [heavy_guard],
+        }, {
+            "matcher": PROD_DELETE_MATCHER,
+            "hooks": [prod_delete],
         }, {
             "matcher": "Agent|Task|Workflow",
             "hooks": [agent_gate],

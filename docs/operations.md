@@ -17,6 +17,7 @@
 | `watch-tests.py` | Polling test runner for source edits. |
 | `commit_policy.py`, `commit_policy.json`, `ticket_adapters.py` | Commit message policy: PreToolUse hook, git `commit-msg` backstop, range and GitHub checks, GoodQA ticket verification and delivery comments, waivers. |
 | `domain_gates.py`, `domain_checklists.json` | Blockchain domain gates: detect blockchain work from repo signals and supply a risk checklist, test scaffolds and follow-up prompts to specs and review prompts. |
+| `prod_delete_guard.py` | PreToolUse gate on destructive SQL against production databases, lifted only by a user-sourced, target-bound grant (ported from Hawkeye). |
 | `spec_flow.py`, `spec_policy.json`, `spec_template.md` | Spec-driven tickets: spec documents, spec reviews, per-criterion evidence, click-test records, sign-off and the done gate (CLI, plan-review ticket gate, PreToolUse hook on GoodQA status changes). |
 
 No background process is installed. Claude Code runs hooks, and the main agent invokes the other helpers when appropriate. The installer refuses symlinked managed files and directories, including its backup directory, before reading settings or writing files. Reinstallation preserves unrelated hooks even when they share an entry with a managed hook. The installer rejects non-regular managed files (including FIFOs) and files occupying managed directory paths. It reads all source payloads before writing, then backs up the captured original bytes in private files before replacing managed files. It keeps original directory and managed-file inodes open through installation and rollback. A missing directory is created under a random staging name, opened and checked while empty, then published under its final name; the installer does not infer that a newly opened final name is the directory it created. Each file write compares the captured parent and file identity; a replacement is refused before mutation. The published file inode is recorded before the directory `fsync`, so a later write error can still roll back that file. A descriptor for each published managed file remains open through rollback so its inode number cannot be recycled while the guard relies on it. Reads, replacements, and rollback traverse parents without following symlinks, and each replacement rechecks the visible parent after publication. A parent that moves during installation produces an error rather than a success report. On a caught write failure it attempts to restore the original bytes and permission bits of existing files and remove newly installed files. Restoration continues after an individual failure; an incomplete rollback reports affected paths and the backup directory. Backups and newly created empty directories remain. This is per-file atomic replacement with best-effort rollback, not a crash-safe transaction: power loss, process termination, or a second failure during recovery can still require manual restoration. In an eight-process disposable contention test, some installers may refuse an intervening directory creation and succeed on retry; the final installation remains coherent. Concurrent settings editors can still race over read-modify-write settings, so do not run them together.
@@ -614,6 +615,60 @@ The guard therefore does not close the incident class. It closes the kill words 
 | `kill_guard.py explain FILE [--cwd D]` | Show the decision for a command stored in a file. Runs nothing. |
 
 Install with `install.py --apply` and `install_codex.py --apply`; both register the kill guard together with the command guard, and `--no-command-guard` removes both registrations. Tests: `python3 -m unittest tests.test_kill_guard` (decides text only, signals nothing, safe anywhere). The live canary test, `tests/live_kill_canary.py`, starts its own sleepers and a canary, and runs only on dev2: `env -i HOME=$(mktemp -d) PATH=/usr/bin:/bin KILL_GUARD_LIVE=1 python3 tests/live_kill_canary.py`. Rules registry entry: `docs/rules/kill-guard.json`.
+
+## Production-delete guard
+
+`prod_delete_guard.py` is a PreToolUse hook. It refuses destructive SQL aimed at a production database unless a recorded, user-sourced grant covers it. It is a port of Hawkeye's `hawkeye-prod-delete-guard.py`, which ran on dev2 only (goodqa#14908, rule S28). The detection rules are Hawkeye's, unchanged. The grant store is the harness's own.
+
+### What it matches
+
+A call matches only when it carries a destructive verb (`DELETE FROM`, `DROP TABLE|DATABASE|INDEX`, `TRUNCATE`) together with an identifiable production target. The target must be one of these:
+
+- `wrangler d1 execute ... --remote`
+- a connection string (`postgres://`, `mysql://`, `mongodb://`, `redis://`, and similar) whose own text names `prod` or `production` as a name segment
+- a recognised database client (`psql`, `mysql`, `mongosh`, `sqlite3`, and others) whose `-h`, `--host`, `-d`, `--dbname`, `--database` or `--db` value names one
+- a tool that is production by construction: `mcp__*__d1_database_query` or `mcp__*__hyperdrive_*`
+
+The guard also reads the contents of a `--file` argument, up to 200,000 bytes.
+
+It judges `Bash` commands, the fields of `mcp__hawkeye__run`, and the `sql`, `query` and `statement` fields of database MCP tools.
+
+Prose that only mentions these words is ignored. A heredoc that also names a client and a prod host still matches, because shell text cannot be proven inert; Hawkeye accepted this limitation after three review rounds. A grant lifts it.
+
+### Fail direction
+
+- Before a match, any error allows.
+- After a match, any error denies.
+- If the grant file exists but cannot be read or parsed, the guard returns `ask`, so the user confirms.
+- If there is no grant file, there is no grant, and the call is denied.
+
+Register the hook without `onFailure`.
+
+### Granting
+
+When the user approves a production delete through AskUserQuestion, record the approval:
+
+```
+python3 ~/.claude/hooks/prod_delete_guard.py grant --user-source answer:<session>/<uuid> \
+    --target <host-or-db literal> --wal <session WAL> [--ttl 900] [--note TEXT]
+python3 ~/.claude/hooks/prod_delete_guard.py list
+```
+
+- `--user-source` must be a `user:` or `answer:` id. `ah user-msg` finds one.
+- `provenance.py` must resolve the source to a human turn less than 24 hours old.
+- A grant covers a command only when its `--target` literal (at least 3 characters) appears in the command.
+- The TTL defaults to 900 seconds and cannot exceed 3600.
+- The grant is written to the WAL first, through `wal_note.py`. Then it is stored in `~/.agent-harness/state/prod-delete-grants.json` (mode 0600). Expired grants are pruned on each write.
+- Each check resolves the grant's source again, so a grant whose turn no longer resolves stops working.
+
+Residual: provenance proves that the cited turn is a real human turn. It does not prove that the turn approves this particular delete. The WAL record and the target binding keep that claim narrow and auditable.
+
+### Commands and rollout
+
+- `install.py --apply` copies the hook and registers it with the matcher `Bash|mcp__hawkeye__run|.*d1_database_query|mcp__.*__(execute_sql|run_sql|query|sql)|mcp__.*__hyperdrive_.*`.
+- `doctor.py` runs two canaries: an allow for `ls`, and a deny for a `psql --host=prod-db... TRUNCATE`.
+- Tests: `python3 -m unittest tests.test_prod_delete_guard`. They judge text only and never run SQL.
+- Rollback: revert the commit and reinstall.
 
 ## Spec-driven tickets
 

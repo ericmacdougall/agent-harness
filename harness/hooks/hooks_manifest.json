@@ -443,6 +443,47 @@
    ]
   },
   {
+   "id": "prod_delete_guard:hook",
+   "script": "prod_delete_guard.py",
+   "arg": null,
+   "event": "PreToolUse",
+   "tools": [
+    "Bash",
+    "mcp__hawkeye__run",
+    "mcp__cloudflare__d1_database_query",
+    "mcp__pg__execute_sql"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S28"
+   ],
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+       "command": "ls"
+      }
+     },
+     "expect": "allow"
+    },
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+       "command": "psql --host=prod-db.example.invalid -c 'TRUNCATE sessions'"
+      }
+     },
+     "expect": "deny"
+    }
+   ]
+  },
+  {
    "id": "agent_gate:hook",
    "script": "agent_gate.py",
    "arg": null,
