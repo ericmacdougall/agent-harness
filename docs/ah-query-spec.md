@@ -41,7 +41,8 @@ Source: user "how we dont have proper tools/a cli in our harness that handles al
 A DROPPED owner (the shared `liveness.py` rule) must carry a live **disposition** or it is a defect that needs a decision now. `ah owners` rows carry `disposition` and `decision_required`; the document carries `undisposed`. `ah owners --gate` exits 1 while any owner is undisposed, so a "0 dropped" summary cannot be printed over a dropped owner. Dispositions go only through the `ah` writer (`task.dispose`: idempotent key, audit row, and a `disposition` entry in the session main WAL):
 
     ah task dispose --agent <id> --kind resumed                      live while activity follows within 30 min, or any later activity
-    ah task dispose --agent <id> --kind reassigned --ref <agent id>  live while the replacement is live
+    ah task dispose --agent <id> --kind reassigned --ref <agent id>  live while the replacement is live, or stopped but holding its own live
+                                                                     waiting/closed/reassigned disposition (inherited, and expires with it)
     ah task dispose --agent <id> --kind waiting --ref <ask id | GoodQA proj#N> --until <ISO>   expires at --until
     ah task dispose --agent <id> --kind closed --reason <why> --evidence <ticket | WAL id | sha>  permanent
 

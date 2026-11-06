@@ -233,6 +233,49 @@ class ReassignInheritsTargetWait(Base):
         self.dispose("reassigned", "key-tw-r5-0000", ref="middle")
         self.assertEqual(self.owners()["undisposed"], [])
 
+    def add_done_target(self, name="doneowner"):
+        """A target that stopped after a result note: `ah owners` shows it as done, not DROPPED."""
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 9000), "event": "subagent", "agent_id": name, "agent_type": "task-owner"},
+                              {"at": iso(NOW - 200), "event": "subagent_stop", "agent_id": name, "agent_type": "task-owner"}])
+        jl(w / ("agent-%s.jsonl" % name), [{"at": iso(NOW - 4000), "event": "result", "note": "slice done; waiting on goodqa#14883"}])
+
+    def test_reassigned_to_a_done_target_in_a_live_named_wait_holds(self):
+        """Main's repro 2026-11-06 (pet-leads-x -> a9830089): target state done + live waiting disposition."""
+        self.add_done_target()
+        self.wait("doneowner", "key-tw-6-0000", NOW + 3600, ref="GoodQA goodqa#14883")
+        self.dispose("reassigned", "key-tw-r6-0000", ref="doneowner")
+        by = {r["agent_id"]: r for r in self.owners()["owners"]}
+        self.assertEqual(by["doneowner"]["state"], "done")  # the fixture really has the repro shape
+        self.assertTrue(by["dropowner"]["disposition"]["live"])
+        self.assertNotIn("dropowner", self.owners()["undisposed"])
+
+    def test_reassigned_to_a_done_target_without_a_live_decision_still_blocks(self):
+        self.add_done_target()
+        self.dispose("reassigned", "key-tw-r7-0000", ref="doneowner")
+        self.assertIn("dropowner", self.owners()["undisposed"])
+        self.wait("doneowner", "key-tw-7-0000", NOW + 60, ref="GoodQA goodqa#14883")
+        self.assertIn("dropowner", self.owners(now=NOW + 61)["undisposed"])  # the inherited wait expires with it
+
+    def test_stale_resumed_on_a_done_target_does_not_cover(self):
+        """PR #107 review F1: `resumed` stays live forever once later activity exists; a target that resumed, then
+        finished, holds no wait and must not excuse work reassigned to it."""
+        self.add_done_target()
+        ah.write(self.home, "task.dispose", {"agent": "doneowner", "session": SESSION, "kind": "resumed",
+                                             "at": iso(NOW - 5000)}, SESSION, "key-tw-8-0000")
+        self.dispose("reassigned", "key-tw-r8-0000", ref="doneowner")
+        by = {r["agent_id"]: r for r in self.owners()["owners"]}
+        self.assertEqual(by["doneowner"]["state"], "done")
+        self.assertIn("dropowner", self.owners()["undisposed"])
+
+    def test_closed_done_target_covers_by_design(self):
+        self.add_done_target()
+        ah.write(self.home, "task.dispose", {"agent": "doneowner", "session": SESSION, "kind": "closed",
+                                             "at": iso(NOW), "reason": "work needs no owner",
+                                             "evidence": "GoodQA goodqa#14883"}, SESSION, "key-tw-9-0000")
+        self.dispose("reassigned", "key-tw-r9-0000", ref="doneowner")
+        self.assertNotIn("dropowner", self.owners()["undisposed"])
+
 
 class SubagentStopGate(Base):
     """I7: a sub-agent cannot end its turn with pending work and no armed waiter (desktop release owner, 2026-11-05)."""

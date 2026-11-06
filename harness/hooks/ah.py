@@ -365,11 +365,16 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             return False
         if t["state"] not in ("DROPPED", "done", "handoff", "returned"):
             return True
-        if t["state"] != "DROPPED":
-            return False
+        # Any non-live state (DROPPED, done, handoff, returned) is excused only by the target's own live disposition:
+        # an owner that returned a result and then went into a named wait still holds the work (main repro
+        # 2026-11-06: pet-leads-x reassigned to a done owner waiting on goodqa#14883).
         td = disp.get(agent_id)
         if td and td.get("kind") == "reassigned":
             return covered(td.get("ref"), seen + (agent_id,))
+        if td and td.get("kind") == "resumed" and t["state"] != "DROPPED":
+            # `resumed` stays live once any later activity exists; a target that resumed and then finished (done,
+            # handoff, returned) holds no wait, so only a named wait or closed excuses it (PR #107 review F1)
+            return False
         return liveness.disposition_live(td, now, last_activity=parse_ts(t["last_activity"]) or 0.0)
 
     for r in rows:
