@@ -281,9 +281,17 @@ class ReassignInheritsTargetWait(Base):
 
     def test_closed_done_target_covers_by_design(self):
         self.add_done_target()
+        # The dispose guard: `closed` means deployed live and tested, both naming this owner (docs/ah-query-spec.md).
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [
+            {"at": iso(NOW - 120), "event": "deploy", "id": "wd00000000a1",
+             "note": "DEPLOYED goodqa-web 1a2b3c4d5e6f to production for doneowner"},
+            {"at": iso(NOW - 60), "event": "check", "id": "wc00000000a2",
+             "note": "REALLY_TESTED LIVE-DONE: doneowner checked live at https://app.goodqa.example/health: pass"}])
         ah.write(self.home, "task.dispose", {"agent": "doneowner", "session": SESSION, "kind": "closed",
-                                             "at": iso(NOW), "reason": "work needs no owner",
-                                             "evidence": "GoodQA goodqa#14883"}, SESSION, "key-tw-9-0000")
+                                             "at": iso(NOW), "deployed": "wd00000000a1", "live_test": "LIVE-DONE",
+                                             "reason": "doneowner shipped slice one; health check on production passed"},
+                 SESSION, "key-tw-9-0000")
         self.dispose("reassigned", "key-tw-r9-0000", ref="doneowner")
         self.assertNotIn("dropowner", self.owners()["undisposed"])
 
