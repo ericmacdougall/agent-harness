@@ -70,6 +70,13 @@ BLOCK = [
     "python3 -c \"import re; print(re.__builtins__['__import__']('os').kill(1, 9))\"",
     "python3 -c \"import operator; operator.methodcaller('kill', 4242, 9)(__import__('os'))\"",
     "python3 -c \"print(open('/etc/hosts').read(), 'kill')\"",
+    # review of 2e668cf: module members outside the allowlist reach sys/os through an allowed import
+    "python3 -c \"import re; re.enum.sys.modules['os'].system('pkill -f node')\"",
+    "python3 -c \"import json; json.decoder.re.enum.sys.modules['os'].system('pkill -f node')\"",
+    "python3 -c \"import textwrap; textwrap.re.enum.sys.modules['os'].system('pkill -f node')\"",
+    "python3 -c \"from re import enum; enum.sys.modules['os'].system('pkill -f node')\"",
+    "python3 -c \"import re as r; r.enum.sys.modules['os'].system('pkill -f node')\"",
+    "python3 -c \"import re; re = 1; print('kill')\"",
     CLI + "ah.py --text kill --pid 4242 --reason x --foreign",
     CLI + "ah.py -- kill --pid 4242",
     CLI + "ah.py --te kill --pid 4242 --reason x",

@@ -120,33 +120,76 @@ PY_SAFE_CALLS = {'print', 'str', 'len', 'dict', 'list', 'sorted', 'int', 'repr',
 PY_SAFE_NODES = ('Module', 'Expr', 'Assign', 'Name', 'Load', 'Store', 'Constant', 'Call', 'keyword', 'Attribute', 'Dict',
                  'List', 'Tuple', 'Set', 'Subscript', 'Index', 'Slice', 'BinOp', 'JoinedStr', 'FormattedValue', 'Import',
                  'ImportFrom', 'alias', 'Add', 'Sub', 'Mult', 'Mod', 'Div')
+# Module members a data-only program may reach, as full dotted paths. Every other attribute of a module (re.enum,
+# json.decoder, textwrap.re ...) is a route to sys/os, so a chain must be a prefix of one of these or equal to it.
+PY_SAFE_MEMBERS = {'json.dumps', 'json.loads', 'json.load', 're.sub', 're.match', 're.search', 're.findall', 're.split',
+                   're.compile', 're.escape', 're.I', 're.IGNORECASE', 'datetime.datetime.now', 'datetime.datetime.utcnow',
+                   'datetime.datetime.fromisoformat', 'datetime.datetime.strptime', 'datetime.timedelta',
+                   'datetime.date.today', 'datetime.timezone.utc', 'time.time', 'time.strftime', 'time.gmtime',
+                   'time.localtime', 'textwrap.dedent', 'textwrap.indent', 'textwrap.fill', 'textwrap.shorten'}
+PY_SAFE_PREFIXES = {'.'.join(m.split('.')[:i]) for m in PY_SAFE_MEMBERS for i in range(1, len(m.split('.')) + 1)}
+# Methods of plain values (str, list, dict, dates, match objects). None of them returns a module or a function.
+PY_SAFE_METHODS = {'join', 'get', 'items', 'keys', 'values', 'upper', 'lower', 'strip', 'lstrip', 'rstrip', 'split',
+                   'splitlines', 'replace', 'startswith', 'endswith', 'append', 'extend', 'isoformat', 'strftime',
+                   'group', 'groups', 'title', 'count', 'index', 'find', 'ljust', 'rjust', 'center', 'zfill'}
+
+
+def _dotted(node, aliases):
+    """Real dotted path of a Name/Attribute chain rooted at an imported module, else None."""
+    import ast
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name) and node.id in aliases:
+        return '.'.join([aliases[node.id]] + parts[::-1])
+    return None
 
 
 def pure_data_python(code):
     """True when the program is built only from print/json-style calls on literals, so it cannot reach the OS. An
-    allowlist over the syntax tree: sys.modules, exec*/spawn*, getattr, dunders and every other module are out."""
+    allowlist over the syntax tree: sys.modules, exec*/spawn*, getattr, dunders, every other module and every module
+    member outside PY_SAFE_MEMBERS (re.enum.sys...) are out."""
     import ast
     try:
         tree = ast.parse(code)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False
+    aliases = {}  # local name -> real dotted path of an imported module or member
     for node in ast.walk(tree):
         kind = type(node).__name__
         if kind not in PY_SAFE_NODES:
             return False
         if isinstance(node, ast.Import):
-            if any(a.name.split('.')[0] not in PY_SAFE_IMPORTS for a in node.names):
-                return False
+            for a in node.names:
+                if a.name not in PY_SAFE_IMPORTS:  # `import os.path` or `import a.b` is never needed here
+                    return False
+                aliases[a.asname or a.name] = a.name
         elif isinstance(node, ast.ImportFrom):
-            if node.level or (node.module or '').split('.')[0] not in PY_SAFE_IMPORTS:
+            if node.level or node.module not in PY_SAFE_IMPORTS:
                 return False
+            for a in node.names:
+                path = node.module + '.' + a.name
+                if path not in PY_SAFE_PREFIXES:
+                    return False
+                aliases[a.asname or a.name] = path
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            if node.id.startswith('_'):
+                return False
+            if isinstance(node.ctx, ast.Store) and node.id in aliases:
+                return False  # rebinding an imported name could hide a different object
         elif isinstance(node, ast.Attribute):
             if node.attr.startswith('_'):
                 return False
-        elif isinstance(node, ast.Name):
-            if node.id.startswith('_'):
+            path = _dotted(node, aliases)
+            if path is not None:
+                if path not in PY_SAFE_PREFIXES:
+                    return False
+            elif node.attr not in PY_SAFE_METHODS:
                 return False
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id not in PY_SAFE_CALLS:
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id not in PY_SAFE_CALLS \
+                and node.func.id not in aliases:
             return False
     return True
 

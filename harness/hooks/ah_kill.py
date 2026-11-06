@@ -253,8 +253,8 @@ def session_ancestor(probe, table, pid):
 
 
 def in_own_scope(probe, table, pid, cwd, roots, worktree):
-    """True when pid is inside the caller's process tree (a descendant of the caller or of its session process) or
-    its cwd is inside the caller's worktree."""
+    """True when pid descends from one of `roots` or its cwd is inside the caller's worktree. The roots are only the
+    ah process itself, so in practice own scope means "cwd inside the caller's worktree"; anything else needs --foreign."""
     seen, cur = set(), pid
     for _ in range(64):
         if cur in roots:
