@@ -6159,35 +6159,35 @@
    "expect": "block",
    "id": "EIF-007",
    "shape": "EIF",
-   "why": "with IFS assigned, a head that holds nothing still vanishes and the kill verb after it runs; a value made of IFS letters is not dropped, since a quoted or zsh expansion is never split (review F4 of efe22db)"
+   "why": "a non-blank held value is never dropped, whatever IFS holds: quoted expansions and zsh run it as written (review F4 of efe22db); EIF-009 under bash splits into empty fields and does not kill, so refusing it is the safe side"
   },
   {
    "cmd": "IFS=kil; K=(kill); \"${K[@]}\" 4004",
    "expect": "block",
    "id": "EIF-008",
    "shape": "EIF",
-   "why": "with IFS assigned, a head that holds nothing still vanishes and the kill verb after it runs; a value made of IFS letters is not dropped, since a quoted or zsh expansion is never split (review F4 of efe22db)"
+   "why": "a non-blank held value is never dropped, whatever IFS holds: quoted expansions and zsh run it as written (review F4 of efe22db); EIF-009 under bash splits into empty fields and does not kill, so refusing it is the safe side"
   },
   {
    "cmd": "IFS=kil; K=kill; $K 4004",
    "expect": "block",
    "id": "EIF-009",
    "shape": "EIF",
-   "why": "with IFS assigned, a head that holds nothing still vanishes and the kill verb after it runs; a value made of IFS letters is not dropped, since a quoted or zsh expansion is never split (review F4 of efe22db)"
+   "why": "a non-blank held value is never dropped, whatever IFS holds: quoted expansions and zsh run it as written (review F4 of efe22db); EIF-009 under bash splits into empty fields and does not kill, so refusing it is the safe side"
   },
   {
    "cmd": "IFS=pkil; K=pkill; \"$K\" node",
    "expect": "block",
    "id": "EIF-010",
    "shape": "EIF",
-   "why": "with IFS assigned, a head that holds nothing still vanishes and the kill verb after it runs; a value made of IFS letters is not dropped, since a quoted or zsh expansion is never split (review F4 of efe22db)"
+   "why": "a non-blank held value is never dropped, whatever IFS holds: quoted expansions and zsh run it as written (review F4 of efe22db); EIF-009 under bash splits into empty fields and does not kill, so refusing it is the safe side"
   },
   {
    "cmd": "IFS=bash; S=bash; echo 'kill 4004' | \"$S\"",
    "expect": "block",
    "id": "EIF-011",
    "shape": "EIF",
-   "why": "with IFS assigned, a head that holds nothing still vanishes and the kill verb after it runs; a value made of IFS letters is not dropped, since a quoted or zsh expansion is never split (review F4 of efe22db)"
+   "why": "a non-blank held value is never dropped, whatever IFS holds: quoted expansions and zsh run it as written (review F4 of efe22db); EIF-009 under bash splits into empty fields and does not kill, so refusing it is the safe side"
   }
  ]
 }
