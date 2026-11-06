@@ -188,7 +188,98 @@ def cmd_subagent_stop(payload: dict, now: float | None = None) -> dict:
     return {"systemMessage": "dropped-owner gate: " + text + " It is now DROPPED and needs a disposition."}
 
 
-ACK_DISPOSE = re.compile(r"task[\s._-]+dispose\b(?=.*--kind[\s=]+[\"']?(?:resumed|reassigned|closed|legacy)\b)", re.S)
+ACK_KINDS = ("resumed", "reassigned", "closed", "legacy")
+PRETOOL_MAX = 100_000  # larger commands are judged by a cheap substring test (round 5, minor 2: no regex backtracking)
+_HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+_WRAPPERS = {"env", "nice", "command", "exec", "time", "nohup", "timeout", "sudo", "stdbuf", "builtin"}
+_SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
+_RUNS_TEXT = re.compile(r"(?:^|[\s;&|(])(?:(?:ba|z|da|k)?sh|fish|python[0-9.]*|eval|source|\.)(?:\s|$)")
+_KIND_WORD = re.compile(r"\b(?:" + "|".join(ACK_KINDS) + r")\b")
+
+
+def _strip_heredocs(cmd: str) -> str:
+    """Drop heredoc bodies: text fed to cat or a file is data, not a command (round 5, minor 3)."""
+    out, pos, at = [], 0, 0
+    for _ in range(64):
+        m = _HEREDOC.search(cmd, at)
+        if not m:
+            break
+        at = m.end()
+        head = cmd[cmd.rfind("\n", 0, m.start()) + 1:m.start()]
+        if _RUNS_TEXT.search(head):  # `bash <<EOF` runs its body: keep it
+            continue
+        body = cmd.find("\n", m.end())
+        if body < 0:
+            break
+        out.append(cmd[pos:body + 1])
+        end = re.compile(r"^[ \t]*" + re.escape(m.group(2)) + r"[ \t]*$", re.M).search(cmd, body + 1)
+        pos = at = end.end() if end else len(cmd)
+    out.append(cmd[pos:])
+    return "".join(out)
+
+
+def _segments(cmd: str):
+    """Shell words split into simple commands at ; & | && || ( ) and newlines. None when it does not tokenize."""
+    import shlex  # noqa: PLC0415
+    lex = shlex.shlex(cmd.replace("\\\n", " ").replace("\n", " ; "), posix=True, punctuation_chars=";&|()<>")
+    lex.whitespace_split = True
+    lex.commenters = ""
+    segs, cur = [], []
+    try:
+        for tok in lex:
+            if tok and set(tok) <= set(";&|()"):
+                segs.append(cur)
+                cur = []
+            else:
+                cur.append(tok)
+    except ValueError:  # an unbalanced quote
+        return None
+    segs.append(cur)
+    return segs
+
+
+def _acks(seg: list, depth: int = 0) -> bool:
+    """Whether one simple command is `[wrappers] [python] .../ah[.py] [global opts] task dispose ... --kind <ack>`."""
+    i = 0
+    while i < len(seg) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[i]) or seg[i] in _WRAPPERS
+                            or (i and seg[i - 1] in _WRAPPERS and (seg[i].startswith("-") or seg[i].isdigit()))
+                            or (i and seg[i - 1] in ("-n", "-u") and seg[i].lstrip("-").isdigit())):
+        i += 1
+    if i < len(seg) and (seg[i] == "eval" or (os.path.basename(seg[i]) in _SHELLS and "-c" in seg[i + 1:])):
+        rest = seg[i + 1:]
+        code = " ".join(rest[rest.index("-c") + 1:] if "-c" in rest else rest)
+        return acknowledges(code, depth + 1) if depth < 3 else ("dispose" in code and bool(_KIND_WORD.search(code)))
+    if i < len(seg) and os.path.basename(seg[i]).startswith("python"):
+        rest = seg[i + 1:]
+        if "-c" in rest:  # inline code: judged by what it says
+            code = " ".join(rest[rest.index("-c") + 1:])
+            return "dispose" in code and bool(_KIND_WORD.search(code))
+        i += 1
+        while i < len(seg) and seg[i].startswith("-"):
+            i += 1
+    if i >= len(seg) or os.path.basename(seg[i]) not in ("ah", "ah.py"):
+        return False
+    rest = [t for t in seg[i + 1:]]
+    words = [t for t in rest if not t.startswith("-")]
+    if words[:2] != ["task", "dispose"]:
+        return False
+    for j, tok in enumerate(rest):
+        name, eq, val = tok.partition("=")
+        if len(name) >= 3 and "--kind".startswith(name) and name.startswith("--"):
+            value = val if eq else (rest[j + 1] if j + 1 < len(rest) else "")
+            if value in ACK_KINDS or "$" in value or "`" in value:  # an expansion cannot be judged: deny
+                return True
+    return False
+
+
+def acknowledges(cmd: str, depth: int = 0) -> bool:
+    """Whether a Bash command runs an `ah task dispose` that resumes, reassigns, closes or legacies an owner."""
+    if len(cmd) > PRETOOL_MAX:
+        return "dispose" in cmd and bool(_KIND_WORD.search(cmd))
+    segs = _segments(_strip_heredocs(cmd))
+    if segs is None:
+        return "dispose" in cmd and bool(_KIND_WORD.search(cmd))
+    return any(_acks(s, depth) for s in segs if s)
 
 
 def cmd_pretool(payload: dict) -> dict:
@@ -198,8 +289,9 @@ def cmd_pretool(payload: dict) -> dict:
     advisory against an agent that hides the call; the dispose guard's evidence and burst rules do not rely on it."""
     if not payload.get("agent_id") or payload.get("tool_name") != "Bash":
         return {}
-    cmd = str((payload.get("tool_input") or {}).get("command") or "")
-    if not ACK_DISPOSE.search(cmd):
+    tool_input = payload.get("tool_input")
+    cmd = str((tool_input if isinstance(tool_input, dict) else {}).get("command") or "")
+    if not acknowledges(cmd):
         return {}
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                    "permissionDecisionReason": "dropped-owner gate (goodqa#14791): a sub-agent cannot "
@@ -208,12 +300,13 @@ def cmd_pretool(payload: dict) -> dict:
 
 
 def main(argv=None) -> int:
+    mode = (argv or sys.argv[1:] or ["stop"])[0]
     try:
         import safe_input  # noqa: PLC0415
-        payload = safe_input.safe_json_loads(safe_input.read_stdin_bounded(1 << 20).decode("utf-8", "replace"))
+        limit = (16 << 20) if mode == "pretool" else (1 << 20)  # a 2 MB command must not skip the pretool check
+        payload = safe_input.safe_json_loads(safe_input.read_stdin_bounded(limit).decode("utf-8", "replace"))
     except Exception:  # noqa: BLE001 - oversized or malformed hook input: gate nothing, never block on garbage
         payload = {}
-    mode = (argv or sys.argv[1:] or ["stop"])[0]
     try:
         payload = payload if isinstance(payload, dict) else {}
         out = (cmd_subagent_stop(payload) if mode == "subagent-stop" else cmd_pretool(payload) if mode == "pretool"

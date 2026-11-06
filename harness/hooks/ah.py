@@ -367,7 +367,16 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                      "state": verdict["state"], "severity": verdict["severity"],
                      "last_activity": iso(summary["last_at"]), "idle_s": None if idle == float("inf") else int(idle),
                      "ticket": summary["tickets"][0] if summary["tickets"] else None, "ticket_comment_age_s": None})
+    asks = ask_states(main)
+    for r in rows:  # round 5 MJ-1: a wait on an ask holds only while that ask is open in this session
+        target = r["state"][len("waiting-on-"):] if r["state"].startswith("waiting-on-") else ""
+        if r["owner"] and ASK_ID_RE.match(target) and asks.get(target) != "open":
+            r["flags"] = list(r.get("flags") or []) + [f"wait-ask-{asks.get(target, 'missing')}"]
+            r["state"], r["severity"] = "DROPPED", "high"
     disp = dispositions(home, session, led)
+    for d in disp.values():
+        if d.get("kind") == "waiting" and ASK_ID_RE.match(str(d.get("ref") or "")) and asks.get(d["ref"]) != "open":
+            d["until"] = min(float(d.get("until") or 0.0), float(d.get("at") or 0.0))  # answered: the wait is over
     by_id = {r["agent_id"]: r for r in rows}
 
     def covered(agent_id, seen=()):
@@ -1231,8 +1240,10 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         if not main_wal.is_file():
             raise AhError("session_unknown", f"no main WAL for session {args['session']!r}", 3)
         ref = args.get("ref") or ""
-        if args["kind"] == "waiting" and ASK_ID_RE.match(ref) and not _wal_has(main_wal, "ask", ref):
-            raise AhError("bad_request", f"task.dispose waiting: ask {ref} is not in this session's WAL", 3)
+        if args["kind"] == "waiting" and ASK_ID_RE.match(ref) and ask_states(main_wal).get(ref) != "open":
+            state = ask_states(main_wal).get(ref)
+            raise AhError("bad_request", f"task.dispose waiting: ask {ref} " + ("is already answered (ask_resolved)"
+                          if state == "resolved" else "is not in this session's WAL"), 3)
         if args["kind"] == "reassigned" and not (_wal_has(main_wal, "subagent", None, agent=ref)
                                                 or (main_wal.parent / f"{ref}.jsonl").is_file()):
             raise AhError("bad_request", f"task.dispose reassigned: {ref} is not an agent of this session", 3)
@@ -1248,6 +1259,29 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         _wal_append(home, main_wal, rec)
         out["wal"] = wid
     return out
+
+
+def ask_states(main_wal: Path) -> dict:
+    """{ask id: "open" | "resolved"} from the session main WAL (an `ask` entry, closed by `ask_resolved --ref`)."""
+    states = {}
+    try:
+        with open(main_wal, "rb") as handle:
+            for raw in handle:
+                if b'"ask' not in raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                if rec.get("event") == "ask" and ASK_ID_RE.match(str(rec.get("id") or "")):
+                    states.setdefault(rec["id"], "open")
+                elif rec.get("event") == "ask_resolved" and ASK_ID_RE.match(str(rec.get("ref") or "")):
+                    states[rec["ref"]] = "resolved"
+    except OSError:
+        pass
+    return states
 
 
 def _wal_has(path: Path, event: str, ident, agent=None) -> bool:
@@ -1369,6 +1403,10 @@ def _ticket_exists(ref: str):
         return None
 
 
+SERVER_STAMPED_OPS = ("task.dispose", "task.pending")
+SERVER_STAMPED_FIELDS = ("at", "ref_unverified")
+
+
 def server_now() -> str:
     """The writer's clock for stamped ops. No environment override: a caller-chosen time is a gate bypass
     (a forward-dated resumed would be live forever). Tests patch this function."""
@@ -1397,7 +1435,9 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
     key = key or derive_key(op, args, session)
     if not KEY_RE.match(key):
         raise AhError("bad_request", "idempotency key must be 8-128 chars of [A-Za-z0-9._:-]")
-    body_sha = hashlib.sha256(canonical([op, args]).encode()).hexdigest()
+    body = {k: v for k, v in args.items() if not (op in SERVER_STAMPED_OPS and k in SERVER_STAMPED_FIELDS)}
+    body_sha = hashlib.sha256(canonical([op, body]).encode()).hexdigest()  # a retry at a later second, or after
+    # GoodQA reachability flipped, is the same request: duplicate, not key_conflict (round 5, minor 4)
     who = actor(session)
     audit = store_dir(home) / "audit.jsonl"
     with StoreLock(home):
@@ -1943,7 +1983,16 @@ def build_parser():
     kp.add_argument("--agent", help="calling agent id for the audit row")
     kp.add_argument("--wal", help="caller WAL path (default: this session's main WAL)")
     kp.add_argument("--via", help=argparse.SUPPRESS)
+    _no_abbrev(p)
     return p
+
+
+def _no_abbrev(parser) -> None:
+    """`--kin closed` must not mean `--kind closed`: the pretool gate matches flags as written (round 5, minor 1)."""
+    parser.allow_abbrev = False
+    for action in parser._actions:
+        for child in (getattr(action, "choices", None) or {}).values() if isinstance(action, argparse._SubParsersAction) else ():
+            _no_abbrev(child)
 
 
 def session_of(args, home):
