@@ -242,6 +242,9 @@ class Compiled:
         self.ancestors = [self._segs(fmt(t, h)) for t in policy['ancestor_roots'] for h in homes]
         self.guard_globs = [fmt(t, h).casefold() for t in policy.get('guard_files', []) for h in homes]
         self.state_files = [fmt(t, h).casefold() for t in policy['state_files'] for h in homes]
+        # session transcripts are the record of user answers (approve-delete --no-backup reads them): Bash never
+        # writes there, except memory notes under projects/<dir>/memory/
+        self.transcript_roots = sorted({fmt('{home}/.claude/projects', h).casefold() for h in homes})
         # every home form, not only this machine's: a WAL under another host's work dir is still a WAL
         self.wal_regexes = [re.compile(policy['protected_work_wal_regex'].replace(
             '{home}', re.escape(h).replace(r'\*', '[^/]+')), re.I)
@@ -1068,6 +1071,22 @@ def norm_name(text):
         if base.endswith(suffix):
             base = base[:-len(suffix)]
     return base
+
+
+TRANSCRIPT_CODE_WRITE = re.compile(r'open\s*\([^)]*,\s*[\'"][^\'"]*[wax+]|\.write_(?:text|bytes)\s*\(|symlink|'
+                                   r'shutil\.(?:copy|move)|os\.(?:rename|replace|link)\s*\(|'
+                                   r'fs\.(?:write|append|symlink|copy|rename)|copyfile|hardlink')
+
+
+def transcript_write(c, folded):
+    """True when `folded` (an absolute casefolded path) is ~/.claude/projects or inside it, outside a memory folder."""
+    for root in getattr(c, 'transcript_roots', ()):
+        if folded == root:
+            return True
+        if folded.startswith(root + '/'):
+            parts = folded[len(root) + 1:].split('/')
+            return not (len(parts) >= 3 and parts[1] == 'memory')
+    return False
 
 
 def norm_path(text, ctx, cwd=None):
@@ -3310,6 +3329,9 @@ class Analyzer:
         for sample in ctx.c.state_files:
             if sample in low.replace('\\', '/') and re.search(r'open|write|copy|rename|replace|echo|dump', low):
                 ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or key directly', 'use command_guard.py approve-delete')
+        if '.claude/projects' in low.replace('\\', '/') and TRANSCRIPT_CODE_WRITE.search(low):
+            ctx.add(LOG_DELETE, 'transcript-forgery', 'script code writes under ~/.claude/projects (session '
+                    'transcripts)', 'only Claude Code writes transcripts')
 
     # ---- destructive
     #
@@ -3834,9 +3856,15 @@ class Analyzer:
     def state_dest(self, word):
         ctx = self.ctx
         for alt in word.all_alts() or word.alts[:32]:
-            if norm_path(alt, ctx).casefold() in ctx.c.state_files:
+            folded = norm_path(alt, ctx).casefold()
+            if folded in ctx.c.state_files:
                 ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or its key directly',
                         'use command_guard.py approve-delete after the Dropbox backup is verified')
+                return True
+            if transcript_write(ctx.c, folded):
+                ctx.add(LOG_DELETE, 'transcript-forgery', 'writes into ~/.claude/projects, where session transcripts '
+                        '(the record of user answers) live', 'only Claude Code writes transcripts; memory notes go '
+                        'under projects/<dir>/memory/')
                 return True
         return False
 
@@ -4271,6 +4299,10 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
         print('command_guard: internal error (%s); raw text looked clean, allowed' % type(error).__name__, file=sys.stderr)
         return 'allow', ''
     enforce = [f for f in findings if modes.get(f.category) == 'enforce']
+    if not enforce and getattr(marker, 'no_backup', None) and not sole_delete(command, marker.no_backup):
+        enforce = [Finding(LOG_DELETE, 'no-backup-compound', 'a no-backup delete approval is used only by a command '
+                           'that is just the delete; other segments could create work that exists nowhere else',
+                           'run `rm -rf <approved path>` on its own')]
     if enforce:
         return 'block', format_block(enforce[0], more=len(enforce) - 1)
     if findings:
@@ -4278,8 +4310,39 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
     return 'allow', ''
 
 
+def sole_delete(command, paths):
+    """True when `command` is exactly `rm [flags] [--] <path>` for one of `paths`: no other segment, no
+    substitution, redirect, background job or second line."""
+    import shlex
+    text = command if isinstance(command, str) else ' '.join(_quote_for_rebuild(str(c)) for c in command)
+    text = text.strip()
+    if not text or any(s in text for s in ('\n', '\r', '$', '`', '<(', '>(')):
+        return False
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=';&|()<>')
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return False
+    if not tokens or tokens[0] not in ('rm', '/bin/rm') or any(t and set(t) <= set(';&|()<>') for t in tokens):
+        return False
+    rest, operands, ended = tokens[1:], [], False
+    for t in rest:
+        if not ended and t == '--':
+            ended = True
+        elif not ended and re.fullmatch(r'-[rRfv]+|--(?:recursive|force|verbose)', t):
+            continue
+        elif not ended and t.startswith('-'):
+            return False
+        else:
+            operands.append(t)
+    return len(operands) == 1 and os.path.isabs(operands[0]) and os.path.realpath(operands[0]) in paths
+
+
 APPROVAL_ENV_RE = re.compile(r'(?:^|[\s;&|(`])(?:(?:export\s+|declare\s+-x\s+|typeset\s+-x\s+)?'
-                             r'(?:HOME|CLAUDE_CONFIG_DIR|ZDOTDIR)\s*=|env(?:\s|$)|unset\s+[^;&|]*\b(?:HOME|CLAUDE_CONFIG_DIR)\b)')
+                             r'(?:HOME|CLAUDE_CONFIG_DIR|ZDOTDIR|PATH|GIT_\w+|LD_\w+|DYLD_\w+|PYTHON\w*)\s*=|'
+                             r'(?:/usr)?(?:/bin/)?env(?:\s|$)|'
+                             r'unset\s+[^;&|]*\b(?:HOME|CLAUDE_CONFIG_DIR|PATH)\b)')
 
 
 def approval_env_override(command):
@@ -4422,6 +4485,7 @@ class Approvals:
         self.now = time.time() if now is None else now
         self.entries, self.key = load_marker(home)
         self.used = {}
+        self.no_backup = set()  # real paths covered by a no-backup entry: decide() then requires a sole delete
 
     def __call__(self, path):
         return self.covers(path)
@@ -4459,6 +4523,8 @@ class Approvals:
                     continue
             except (OSError, ValueError):
                 continue
+            if entry.get('kind') == NO_BACKUP_KIND:
+                self.no_backup.add(real)
             self.used[real] = entry.get('nonce')
             return True
         return False
@@ -4800,15 +4866,39 @@ NO_BACKUP_KIND = 'no-backup'
 IMAGE_FILE_SUFFIXES = ('.sparseimage', '.dmg')
 IMAGE_DIR_SUFFIXES = ('.sparsebundle',)
 NO_BACKUP_SOURCE_RE = re.compile(r'^answer:([A-Za-z0-9._-]{1,80})/([0-9a-fA-F-]{8,64})$')
-APPROVE_WORDS = re.compile(r'\bdelete\b', re.I)
+APPROVE_WORDS = re.compile(r'^\s*Delete\b', re.I)  # the selected option must start with "Delete"
 # "Delete, no backup" is an approval, so a bare "no" is not a decline word
-DECLINE_WORDS = re.compile(r"\b(?:not|don'?t|keep|leave|cancel)\b", re.I)
+DECLINE_WORDS = re.compile(r"\b(?:not|don'?t|keep|leave|cancel|nothing|never|later|yet|skip|hold|wait|instead)\b",
+                           re.I)
+# an absolute path in question text: ends at whitespace, a quote or bracket, or sentence punctuation
+QUESTION_PATH_RE = re.compile(r'(?<![\w.~-])/[^\s"\'`,;:()<>\[\]{}?!*|]+')
 DEFAULT_REMOTE_HOSTS = ('github.com', 't2-dev')
 # Repository config must not run anything while the guard inspects a clone: no fsmonitor, hooks, ext transport,
 # custom ssh command, credential helper or pager, and no prompt.
 _SAFE_GIT = ['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.ext.allow=never',
-             '-c', 'protocol.file.allow=never', '-c', 'core.sshCommand=ssh', '-c', 'credential.helper=',
-             '-c', 'core.pager=cat', '-c', 'core.untrackedCache=false']
+             '-c', 'protocol.file.allow=never', '-c', 'core.sshCommand=/usr/bin/ssh', '-c', 'credential.helper=',
+             '-c', 'core.pager=cat', '-c', 'core.untrackedCache=false', '-c', 'core.attributesFile=/dev/null']
+# git is run by an absolute system path, never looked up on the caller's PATH
+_GIT_BIN_CANDIDATES = ('/usr/bin/git', '/opt/homebrew/bin/git', '/usr/local/bin/git')
+
+
+def _git_bin():
+    for candidate in _GIT_BIN_CANDIDATES:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise ValueError('no system git found (%s)' % ', '.join(_GIT_BIN_CANDIDATES))
+
+
+def _git_env():
+    """A constructed environment: nothing from the caller but the ssh agent socket. PATH, GIT_EXEC_PATH,
+    GIT_CONFIG_GLOBAL, loader and Python variables cannot point git or ssh at a shim."""
+    env = {'PATH': '/usr/bin:/bin', 'HOME': _pinned_home(), 'LC_ALL': 'C', 'GIT_CONFIG_NOSYSTEM': '1',
+           'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_ATTR_NOSYSTEM': '1', 'GIT_TERMINAL_PROMPT': '0',
+           'GIT_OPTIONAL_LOCKS': '0', 'GIT_PAGER': 'cat', 'GIT_NO_REPLACE_OBJECTS': '1'}
+    sock = os.environ.get('SSH_AUTH_SOCK', '')
+    if sock.startswith('/') and '\n' not in sock:
+        env['SSH_AUTH_SOCK'] = sock
+    return env
 
 
 def _pinned_home():
@@ -4817,17 +4907,13 @@ def _pinned_home():
     return os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
 
 
-def _git(repo, *args, timeout=60):
-    """Run git against `repo` (or, with repo None, outside any repository so no repository config applies)."""
-    env = dict(os.environ, GIT_TERMINAL_PROMPT='0', GIT_OPTIONAL_LOCKS='0', GIT_PAGER='cat', LC_ALL='C',
-               GIT_NO_REPLACE_OBJECTS='1')
-    for name in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_CONFIG_PARAMETERS', 'GIT_SSH_COMMAND', 'GIT_SSH',
-                 'GIT_CONFIG', 'GIT_CONFIG_COUNT', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
-                 'GIT_CEILING_DIRECTORIES', 'GIT_NAMESPACE'):
-        env.pop(name, None)
+def _git(repo, *args, timeout=60, stdin=None):
+    """Run git against `repo` (or, with repo None, outside any repository so no repository config applies), by
+    an absolute path with a constructed environment."""
     where = ['-C', repo] if repo else ['-C', '/']
-    done = subprocess.run(_SAFE_GIT + where + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          env=env, timeout=timeout, check=False)
+    done = subprocess.run([_git_bin()] + _SAFE_GIT[1:] + where + list(args), stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, env=_git_env(), timeout=timeout, check=False,
+                          **({'input': stdin.encode()} if stdin is not None else {}))
     return done.returncode, done.stdout.decode('utf-8', 'replace')
 
 
@@ -4835,8 +4921,8 @@ def _attached_images():
     """Real paths of attached disk images (macOS hdiutil). Raises ValueError when that cannot be checked."""
     import plistlib
     try:
-        done = subprocess.run(['hdiutil', 'info', '-plist'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              timeout=30, check=False)
+        done = subprocess.run(['/usr/bin/hdiutil', 'info', '-plist'], stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, env={'PATH': '/usr/bin:/bin'}, timeout=30, check=False)
         data = plistlib.loads(done.stdout) if done.returncode == 0 else None
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         raise ValueError('cannot check whether the image is attached (hdiutil: %s)' % type(error).__name__)
@@ -4885,6 +4971,15 @@ def _no_backup_state(real, target, home=None, attached=None):
     code, top = _git(real, 'rev-parse', '--show-toplevel')
     if code != 0 or os.path.realpath(top.strip()) != real:
         raise ValueError('the path is not the top of its git working tree')
+    # filters run inside `git status` (clean, process): refuse any before status is asked anything
+    code, filters = _git(real, 'config', '--get-regexp', r'^filter\.')
+    if code not in (0, 1) or filters.strip():
+        raise ValueError('the repository configures a filter driver, which could hide edits and runs a program; '
+                         'refused')
+    if os.path.lexists(os.path.join(git_dir, 'info', 'attributes')):
+        raise ValueError('the repository has .git/info/attributes (local attributes, possibly filters); refused')
+    if os.path.lexists(os.path.join(git_dir, 'lfs')):
+        raise ValueError('the repository has a git LFS store (.git/lfs), whose objects may be pushed nowhere; refused')
     # submodules first: a gitlink also shows in status, and the accurate reason is the submodule
     code, staged = _git(real, 'ls-files', '-s', '-z')
     if code != 0 or any(rec.startswith('160000 ') for rec in staged.split('\0')) or \
@@ -4936,48 +5031,61 @@ def _remote_host(url):
 
 
 def _check_git_pushed(real, ls_remote=None, hosts=DEFAULT_REMOTE_HOSTS):
-    """A network remote on an allowlisted host whose live tip (asked from outside the repository, so no repository
-    insteadOf or config applies) is a tracking ref that contains HEAD. Raises ValueError otherwise."""
+    """Every commit reachable from HEAD or any local ref (tracking refs excluded) is reachable from a live head or
+    tag of an allowlisted network remote, listed now by ls-remote from outside the repository (no repository
+    insteadOf or config applies). Local remote-tracking refs never count: they can be stale or hand-set.
+    Raises ValueError otherwise."""
     allowed = {h.casefold() for h in hosts}
-    code, refs = _git(real, 'for-each-ref', '--contains', 'HEAD', '--format=%(refname) %(objectname)',
-                      'refs/remotes')
-    candidates = []
-    for line in refs.splitlines():
-        parts = line.split()
-        if len(parts) == 2 and not parts[0].endswith('/HEAD'):
-            rest = parts[0][len('refs/remotes/'):]
-            if '/' in rest:
-                remote, branch = rest.split('/', 1)
-                candidates.append((remote, branch, parts[1]))
-    seen_hosts = []
-    for remote, branch, sha in candidates[:8]:
-        code, url = _git(real, 'config', '--get', 'remote.%s.url' % remote)
+    code, urls = _git(real, 'config', '--get-regexp', r'^remote\..*\.url$')
+    live, answered, seen_hosts = set(), [], []
+    for line in urls.splitlines()[:8] if code == 0 else []:
+        key, _, url = line.partition(' ')
         url = url.strip()
-        host = _remote_host(url) if code == 0 else ''
+        host = _remote_host(url)
         seen_hosts.append(host or '(local or unparsed)')
         if not host or host not in allowed:
             continue
-        live = (ls_remote or _ls_remote)(real, url, branch)
-        if live == sha:
-            return {'remote': remote, 'branch': branch, 'url_host': host[:60]}
-    raise ValueError('no allowlisted network remote confirms it has HEAD (ls-remote tip of a tracking ref that '
-                     'contains HEAD; remote hosts seen: %s; allowed: %s)' % (', '.join(seen_hosts[:4]) or 'none',
-                                                                            ', '.join(sorted(allowed))))
+        shas = (ls_remote or _ls_remote)(url)
+        if shas is None:
+            continue
+        answered.append((key[len('remote.'):-len('.url')], host))
+        live.update(s for s in shas if re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', str(s)))
+    if not answered:
+        raise ValueError('no allowlisted network remote answered a live listing (remote hosts seen: %s; allowed: '
+                         '%s)' % (', '.join(seen_hosts[:4]) or 'none', ', '.join(sorted(allowed))))
+    # live shas this clone lacks cannot be negated; leaving them out only lists more, never hides a commit
+    present = []
+    if live:
+        code, out = _git(real, 'cat-file', '--batch-check=%(objectname) %(objecttype)', stdin='\n'.join(sorted(live))
+                         + '\n')
+        present = [line.split()[0] for line in out.splitlines() if line.endswith((' commit', ' tag'))]
+    missing = len(live) - len(present)
+    code, extra = _git(real, 'rev-list', '--max-count=1', '--exclude=refs/remotes/*', '--all', 'HEAD', '--stdin',
+                       stdin=''.join('^%s\n' % s for s in present))
+    if code != 0 or extra.strip():
+        raise ValueError('a commit on HEAD or a local branch, tag or other ref is on no live ref of an allowlisted '
+                         'network remote (%s)%s' % (', '.join('%s@%s' % a for a in answered[:3]),
+                                                     '; %d live refs are not in this clone: fetch first' % missing
+                                                     if missing else ''))
+    return {'remote': answered[0][0], 'url_host': answered[0][1][:60], 'live_refs': len(live)}
 
 
-def _ls_remote(real, url, branch):
-    code, out = _git(None, 'ls-remote', '--upload-pack=git-upload-pack', url, 'refs/heads/' + branch, timeout=60)
-    first = out.split()
-    return first[0] if code == 0 and first else None
+def _ls_remote(url):
+    """Live head and tag shas of `url` (one listing), or None when the remote did not answer."""
+    code, out = _git(None, 'ls-remote', '--upload-pack=git-upload-pack', url, 'refs/heads/*', 'refs/tags/*',
+                     timeout=60)
+    if code != 0:
+        return None
+    return [line.split()[0] for line in out.splitlines() if line.split()]
 
 
 def _askuser_question(provenance, path, record):
-    """JSON of the input of the main-conversation AskUserQuestion that `record` answers, or ''."""
+    """The input (a dict) of the main-conversation AskUserQuestion that `record` answers, or None."""
     blocks = (record.get('message') or {}).get('content') if isinstance(record, dict) else None
     use_id = blocks[0].get('tool_use_id') if isinstance(blocks, list) and blocks and isinstance(blocks[0], dict) \
         else None
     if not isinstance(use_id, str) or not use_id:
-        return ''
+        return None
     for line in provenance._lines_containing(path, use_id.encode()):
         if line is None:
             continue
@@ -4990,8 +5098,25 @@ def _askuser_question(provenance, path, record):
         for block in (rec.get('message') or {}).get('content') or []:
             if isinstance(block, dict) and block.get('type') == 'tool_use' and block.get('id') == use_id \
                     and block.get('name') == 'AskUserQuestion':
-                return json.dumps(block.get('input'), ensure_ascii=False, sort_keys=True)
-    return ''
+                return block.get('input') if isinstance(block.get('input'), dict) else None
+    return None
+
+
+def _real_transcript(provenance, session, claude):
+    """The transcript of `session` under <claude>/projects, refusing symlinks anywhere on the way and a session id
+    that is not the file's exact name (case-insensitive file systems would match a case variant)."""
+    projects = Path(claude) / 'projects'
+    if os.path.islink(str(projects)):
+        raise ValueError('the transcript store ~/.claude/projects is a symlink; refused')
+    tpath = Path(provenance.find_transcript(session, claude))
+    folder = tpath.parent
+    if os.path.islink(str(folder)) or os.path.islink(str(tpath)) or not os.path.isfile(str(tpath)):
+        raise ValueError('the transcript or its project folder is a symlink; refused')
+    if os.path.realpath(str(tpath)) != os.path.join(os.path.realpath(str(projects)), folder.name, tpath.name):
+        raise ValueError('the transcript is not inside ~/.claude/projects; refused')
+    if tpath.name not in os.listdir(str(folder)):
+        raise ValueError('the session id is not the transcript\'s exact name (case differs); refused')
+    return tpath
 
 
 def resolve_user_source(source, now=None, max_age=None, home=None):
@@ -5009,16 +5134,31 @@ def resolve_user_source(source, now=None, max_age=None, home=None):
         if str(HERE) not in sys.path:
             sys.path.insert(0, str(HERE))
         import provenance
+        tpath = _real_transcript(provenance, session, claude)
         turn = provenance.answer_turn(session, uid, home=claude)
+    except ValueError as error:
+        raise ValueError(str(error))
     except Exception as error:  # noqa: BLE001 - any failure to prove the turn is a refusal
         raise ValueError('the user source does not resolve to a real answer turn (%s)' % (
             str(getattr(error, 'code', '') or type(error).__name__)[:40]))
-    question = ''
     try:
-        tpath = provenance.find_transcript(session, claude)
-        question = _askuser_question(provenance, tpath, provenance.load_record(tpath, 'uuid', uid))
-    except Exception:  # noqa: BLE001 - no question found: the path check below refuses
-        question = ''
+        record = provenance.load_record(tpath, 'uuid', uid)
+        asked = _askuser_question(provenance, tpath, record)
+    except Exception:  # noqa: BLE001 - no question found: refused below
+        record, asked = None, None
+    questions = asked.get('questions') if isinstance(asked, dict) else None
+    answers = (record.get('toolUseResult') or {}).get('answers') if isinstance(record, dict) and \
+        isinstance(record.get('toolUseResult'), dict) else None
+    if not isinstance(questions, list) or len(questions) != 1 or not isinstance(questions[0], dict) or \
+            questions[0].get('multiSelect') or not isinstance(answers, dict) or len(answers) != 1:
+        raise ValueError('the answer must come from a single question, single-choice AskUserQuestion call; ask the '
+                         'user again with one question per path')
+    question = str(questions[0].get('question') or '')
+    (key, selected), = answers.items()
+    labels = [str(o.get('label')) for o in questions[0].get('options') or [] if isinstance(o, dict)]
+    if key != question or not isinstance(selected, str):
+        raise ValueError('the answer does not key the question that was asked; refused')
+    predefined = selected in labels
     stamp = str(turn.get('timestamp') or '')
     try:
         at = datetime.datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp()
@@ -5029,13 +5169,51 @@ def resolve_user_source(source, now=None, max_age=None, home=None):
         raise ValueError('the user source is older than %d hours; ask again' % (max_age // 3600))
     if at > now + 300:
         raise ValueError('the user source is dated in the future')
-    return {'kind': 'answer', 'session': session, 'uid': uid.lower(), 'at': at, 'text': str(turn.get('text') or ''),
-            'question': question}
+    return {'kind': 'answer', 'session': session, 'uid': uid.lower(), 'at': at, 'text': selected,
+            'question': question, 'predefined': predefined}
 
 
 def _canonical_source(source):
     m = NO_BACKUP_SOURCE_RE.match(str(source or ''))
-    return 'answer:%s/%s' % (m.group(1), m.group(2).lower()) if m else ''
+    return 'answer:%s/%s' % (m.group(1).casefold(), m.group(2).lower()) if m else ''
+
+
+def _question_names_only(question, real):
+    """'' when the question names `real` as a whole path and every other absolute path it names is an ancestor
+    of `real` (context such as "under ~/.agent-harness/work/"), else the reason."""
+    named = [p.rstrip('.').rstrip('/') or '/' for p in QUESTION_PATH_RE.findall(question or '')]
+    if real not in named:
+        return 'does not name the literal path %s' % real
+    others = [p for p in named if p != real and not real.startswith(p.rstrip('/') + '/')]
+    if others:
+        return 'names another path too (%s); ask one question per path' % others[0][:120]
+    return ''
+
+
+def _hook_wal_predates(wal_real, at, limit=4 << 20):
+    """True when the WAL holds a hook-written (pretool) entry dated before `at` (an epoch)."""
+    import datetime
+    try:
+        fd = os.open(wal_real, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        raw = os.read(fd, limit)
+    finally:
+        os.close(fd)
+    for line in raw.decode('utf-8', 'replace').splitlines():
+        if '"pretool"' not in line:
+            continue
+        try:
+            rec = json.loads(line)
+            when = datetime.datetime.fromisoformat(str(rec.get('at')).replace('Z', '+00:00')).timestamp()
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if isinstance(rec, dict) and rec.get('event') == 'pretool' and rec.get('tool_use_id') and when < at:
+            return True
+    return False
 
 
 def _uses_of_source(canonical, home=None):
@@ -5114,13 +5292,22 @@ def approve_delete_no_backup(path, user_source, wal, ttl=None, home=None, policy
                              'names the path; no excerpt)')
         turn = (resolver or resolve_user_source)(source, now=now, max_age=int(limits.get(
             'no_backup_max_source_age_seconds', 86400)), home=user_home)
-        wal_real = os.path.realpath(str(wal))
-        wals = os.path.join(user_home, '.claude', 'wals', turn['session']) + os.sep
-        if not wal_real.startswith(wals):
+        wal_text = str(wal)
+        wal_real = os.path.realpath(wal_text)
+        wals_root = os.path.realpath(os.path.join(user_home, '.claude', 'wals'))
+        if os.path.dirname(wal_real) != os.path.join(wals_root, turn['session']):
             raise ValueError('the answer is from session %s, but --wal is not a WAL of that session' % turn['session'])
-        if real not in str(turn.get('question') or ''):
-            raise ValueError('the AskUserQuestion this answer answers does not name the literal path %s; ask the user '
-                             'again naming it' % real)
+        if os.path.islink(wal_text) or wal_text != wal_real or not os.path.isfile(wal_real) or \
+                turn['session'] not in os.listdir(wals_root):
+            raise ValueError('--wal must be the existing, real WAL file of the session (no symlink, exact name)')
+        if not _hook_wal_predates(wal_real, float(turn['at'])):
+            raise ValueError('--wal has no hook-written entry that predates the answer; give the WAL of the session '
+                             'that asked (its main.jsonl)')
+        if turn.get('predefined') is not True:
+            raise ValueError('the answer is free text ("Other"), not a predefined option; ask the user again')
+        problem = _question_names_only(str(turn.get('question') or ''), real)
+        if problem:
+            raise ValueError('the AskUserQuestion this answer answers %s; ask the user again naming it' % problem)
         if not APPROVE_WORDS.search(turn.get('text') or '') or DECLINE_WORDS.search(turn.get('text') or ''):
             raise ValueError('the selected answer does not say delete (or it declines); ask the user again')
         target = _target_kind(real, home=user_home)
@@ -5146,8 +5333,10 @@ def approve_delete_no_backup(path, user_source, wal, ttl=None, home=None, policy
             audit('approved', entry, home=home, strict=True)
         _store_entry(entry, real, now, home, under_lock=count_and_audit)
     except ValueError as error:
+        # a refusal never creates the WAL: only an existing, real WAL file gets the record
+        wal_ok = bool(wal) and os.path.isfile(str(wal)) and not os.path.islink(str(wal))
         audit('refused', {'path': real, 'kind': NO_BACKUP_KIND, 'user_source': _canonical_source(source) or 'invalid',
-                          'reason': str(error)[:200]}, home=home, wal=wal)
+                          'reason': str(error)[:200]}, home=home, wal=wal if wal_ok else None)
         raise
     audit('approved', entry, home=home, wal=wal, to_file=False)
     return entry

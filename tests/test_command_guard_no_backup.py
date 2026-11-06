@@ -8,6 +8,7 @@ example main before this change) to show it failing first.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -34,13 +35,24 @@ def run(*args, cwd=None):
     return done.stdout.decode()
 
 
-def ok_resolver_for(*paths, text='Delete, no backup (Recommended)', session='sess-1'):
-    """A resolver for an answer in `session` whose AskUserQuestion names `paths` and whose selection is `text`."""
+def ok_resolver_for(*paths, text='Delete, no backup (Recommended)', session='sess-1', predefined=True):
+    """A resolver for an answer in `session`: one question naming `paths`, whose selected predefined option is
+    `text`."""
     def resolver(source, now=None, max_age=None, home=None):
         return {'kind': 'answer', 'session': session, 'uid': source.rsplit('/', 1)[-1].lower(), 'at': time.time(),
-                'text': text, 'question': json.dumps({'questions': [{'question': 'Delete %s?' % ', '.join(
-                    str(p) for p in paths)}]})}
+                'text': text, 'predefined': predefined,
+                'question': 'Delete %s without a backup?' % ' and '.join(str(p) for p in paths)}
     return resolver
+
+
+def hook_wal(path, at):
+    """A WAL with one hook-written (pretool) entry at epoch `at`, as the PreToolUse hook writes it."""
+    import datetime
+    stamp = datetime.datetime.fromtimestamp(at, datetime.timezone.utc).isoformat()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'a') as handle:
+        handle.write(json.dumps({'at': stamp, 'event': 'pretool', 'agent_id': 'a1', 'tool': 'Bash',
+                                 'tool_use_id': 'toolu_x', 'target_chars': 10}) + '\n')
 
 
 ok_resolver = ok_resolver_for()
@@ -59,6 +71,7 @@ class NoBackupCase(unittest.TestCase):
         self.task.mkdir(parents=True)
         self.policy = cg.load_policy(path=str(self.home / 'no-such-policy.json'))
         self.wal = str(self.home / '.claude/wals/sess-1/agent-nb.jsonl')
+        hook_wal(self.wal, time.time() - 600)  # the session's hooks wrote before the user answered
         self.remote = self.home / 'remote.git'
         run('git', 'init', '-q', '--bare', str(self.remote))
 
@@ -85,10 +98,11 @@ class NoBackupCase(unittest.TestCase):
         run('git', 'remote', 'set-url', 'origin', 'https://github.com/example/nb-test.git', cwd=path)
         return path
 
-    def ls_remote(self, real, url, branch):
-        done = subprocess.run(['git', '--git-dir', str(self.remote), 'rev-parse', '-q', '--verify',
-                               'refs/heads/' + branch], stdout=subprocess.PIPE, check=False)
-        return done.stdout.decode().strip() or None
+    def ls_remote(self, url):
+        """Every live head and tag sha of the bare remote (stands in for `git ls-remote <url>`)."""
+        done = subprocess.run(['git', '--git-dir', str(self.remote), 'for-each-ref', '--format=%(objectname)',
+                               'refs/heads', 'refs/tags'], stdout=subprocess.PIPE, check=False)
+        return done.stdout.decode().split()
 
     def image(self, name='disk.sparseimage'):
         path = self.task / name
@@ -176,11 +190,11 @@ class GitTarget(NoBackupCase):
 
     def test_remote_that_lacks_head_refused(self):
         path = self.clone()
-        self.refused(path, 'remote confirms it has HEAD', ls_remote=lambda real, url, branch: '0' * 40)
+        self.refused(path, 'allowlisted network remote', ls_remote=lambda url: ['0' * 40])
 
     def test_unreachable_remote_refused(self):
         path = self.clone()
-        self.refused(path, 'remote confirms it has HEAD', ls_remote=lambda real, url, branch: None)
+        self.refused(path, 'allowlisted network remote', ls_remote=lambda url: None)
 
     def test_no_remote_refused(self):
         path = self.task / 'lonely'
@@ -343,18 +357,15 @@ class UserSource(NoBackupCase):
                     cg.resolve_user_source(source, max_age=86400, home=str(self.home))
 
     def test_real_resolver_checks_age(self):
-        import provenance
-        saved = provenance.answer_turn
-        provenance.answer_turn = lambda session, uid, home=None: {'timestamp': '2026-01-01T00:00:00Z'}
-        try:
-            with self.assertRaises(ValueError) as caught:
-                cg.resolve_user_source(SOURCE, max_age=86400, home=str(self.home))
-            self.assertIn('older', str(caught.exception))
-            stamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-            provenance.answer_turn = lambda session, uid, home=None: {'timestamp': stamp}
-            self.assertEqual(cg.resolve_user_source(SOURCE, max_age=86400, home=str(self.home))['kind'], 'answer')
-        finally:
-            provenance.answer_turn = saved
+        path = self.image()
+        uid = transcript(self.home / '.claude', 'sess-1', str(path))
+        src = 'answer:sess-1/%s' % uid
+        self.assertEqual(cg.resolve_user_source(src, max_age=86400, home=str(self.home))['kind'], 'answer')
+        tfile = self.home / '.claude/projects/p/sess-1.jsonl'
+        tfile.write_text(re.sub(r'"timestamp": "[^"]+"', '"timestamp": "2026-01-01T00:00:00.000Z"', tfile.read_text()))
+        with self.assertRaises(ValueError) as caught:
+            cg.resolve_user_source(src, max_age=86400, home=str(self.home))
+        self.assertIn('older', str(caught.exception))
 
     def test_one_source_approves_a_bounded_number_of_paths(self):
         for i in range(4):
@@ -381,22 +392,28 @@ class Cli(NoBackupCase):
                 self.assertIn(b'refused', done.stderr)
 
 
-def transcript(home, session, path_text, answer='Delete, no backup (Recommended)', uid=None, origin_ok=True):
-    """Write a real-shaped transcript with one AskUserQuestion naming `path_text` and its answer. Returns the uuid."""
+OPTIONS = ('Delete, no backup (Recommended)', 'Leave them')
+
+
+def transcript(home, session, path_text, answer='Delete, no backup (Recommended)', uid=None, origin_ok=True,
+               options=OPTIONS, questions=None, answers=None, folder_name='p', multi=False):
+    """Write a real-shaped transcript with one AskUserQuestion naming `path_text` and its answer. Returns the uuid.
+    `questions`/`answers` override the single question and its answer map (several-question calls)."""
     import uuid as _uuid
     uid = uid or str(_uuid.uuid4())
     use = 'toolu_%s' % _uuid.uuid4().hex[:20]
     stamp = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
     question = 'Delete %s without a backup?' % path_text
+    asked = questions or [{'question': question, 'header': 'Cleanup', 'multiSelect': multi,
+                           'options': [{'label': o, 'description': o} for o in options]}]
     ask = {'type': 'assistant', 'uuid': str(_uuid.uuid4()), 'timestamp': stamp, 'sessionId': session,
            'message': {'role': 'assistant', 'content': [{'type': 'tool_use', 'id': use, 'name': 'AskUserQuestion',
-                                                         'input': {'questions': [{'question': question,
-                                                                                  'header': 'Cleanup'}]}}]}}
+                                                         'input': {'questions': asked}}]}}
     reply = {'type': 'user', 'uuid': uid, 'timestamp': stamp, 'sessionId': session,
              'message': {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': use,
                                                       'content': 'User answered'}]},
-             'toolUseResult': {'answers': {question: answer}}}
-    folder = Path(home) / 'projects' / 'p'
+             'toolUseResult': {'answers': answers or {question: answer}}}
+    folder = Path(home) / 'projects' / folder_name
     folder.mkdir(parents=True, exist_ok=True)
     with open(folder / (session + '.jsonl'), 'a') as handle:
         handle.write(json.dumps(ask) + '\n' + json.dumps(reply) + '\n')
@@ -459,7 +476,10 @@ class NativeReviewF1Environment(NoBackupCase):
                '--wal /w.jsonl' % SOURCE
         for cmd in ('CLAUDE_CONFIG_DIR=/tmp/fake ' + tail, 'env CLAUDE_CONFIG_DIR=/tmp/fake ' + tail,
                     'HOME=/tmp/fake ' + tail, 'export HOME=/tmp/fake; ' + tail, 'env ' + tail,
-                    'unset CLAUDE_CONFIG_DIR HOME; ' + tail):
+                    'unset CLAUDE_CONFIG_DIR HOME; ' + tail, 'PATH=/tmp/shim:$PATH ' + tail,
+                    'GIT_EXEC_PATH=/tmp/shim ' + tail, 'GIT_CONFIG_GLOBAL=/tmp/g ' + tail, '/usr/bin/env -i ' + tail,
+                    'export PATH=/tmp/shim:$PATH; ' + tail, 'DYLD_INSERT_LIBRARIES=/tmp/x.dylib ' + tail,
+                    'PYTHONPATH=/tmp/shim ' + tail):
             with self.subTest(cmd=cmd[:40]):
                 self.assertEqual(cg.decide(cmd, c)[0], 'block')
         self.assertEqual(cg.decide(tail, c)[0], 'allow')
@@ -515,7 +535,7 @@ class NativeReviewF2Remote(NoBackupCase):
         saved = cg._git
         cg._git = lambda repo, *args, **kw: (seen.append((repo, args[:1])), (1, ''))[1]
         try:
-            cg._ls_remote('/some/repo', 'https://github.com/o/r.git', 'main')
+            cg._ls_remote('https://github.com/o/r.git')
         finally:
             cg._git = saved
         self.assertEqual(seen, [(None, ('ls-remote',))])
@@ -738,6 +758,328 @@ class NativeReviewF8Images(NoBackupCase):
         self.assertEqual(entry['bytes'], 4096)
         lines = (self.home / '.agent-harness/state/log-delete-audit.jsonl').read_text().splitlines()
         self.assertEqual([json.loads(x).get('bytes') for x in lines if json.loads(x)['event'] == 'approved'], [4096])
+
+
+class Round3N1LiveRefs(NoBackupCase):
+    """N1: every local ref and HEAD must be reachable from one live ls-remote listing; tracking refs never count."""
+
+    def side_commit(self, path, branch='work'):
+        run('git', 'checkout', '-q', '-b', branch, cwd=path)
+        (path / 'w').write_text('unique work\n')
+        run('git', 'add', 'w', cwd=path)
+        run('git', 'commit', '-q', '-m', 'work', cwd=path)
+        return run('git', 'rev-parse', 'HEAD', cwd=path).strip()
+
+    def test_unpushed_branch_with_forged_tracking_ref_refused(self):
+        path = self.clone()
+        self.side_commit(path)
+        run('git', 'update-ref', 'refs/remotes/origin/work', 'HEAD', cwd=path)
+        run('git', 'checkout', '-q', 'main', cwd=path)
+        self.refused(path, 'no live ref of an allowlisted network remote')
+
+    def test_pushed_side_branch_approved(self):
+        path = self.clone()
+        sha = self.side_commit(path, 'feat')
+        run('git', 'push', '-q', str(self.remote), 'feat', cwd=path)
+        run('git', 'update-ref', 'refs/remotes/origin/feat', sha, cwd=path)
+        run('git', 'checkout', '-q', 'main', cwd=path)
+        self.assertEqual(self.approve(path)['target'], 'git')
+
+    def test_stale_tracking_ref_after_remote_branch_deleted_refused(self):
+        path = self.clone()
+        sha = self.side_commit(path, 'feat')
+        run('git', 'push', '-q', str(self.remote), 'feat', cwd=path)
+        run('git', 'update-ref', 'refs/remotes/origin/feat', sha, cwd=path)
+        run('git', 'checkout', '-q', 'main', cwd=path)
+        run('git', '--git-dir', str(self.remote), 'branch', '-q', '-D', 'feat')  # remote deleted it; clone never pruned
+        self.refused(path, 'no live ref of an allowlisted network remote')
+
+    def test_unpushed_detached_head_refused(self):
+        path = self.clone()
+        run('git', 'checkout', '-q', '--detach', cwd=path)
+        (path / 'd').write_text('d\n')
+        run('git', 'add', 'd', cwd=path)
+        run('git', 'commit', '-q', '-m', 'detached', cwd=path)
+        run('git', 'update-ref', 'refs/remotes/origin/main', 'HEAD', cwd=path)
+        self.refused(path, 'no live ref of an allowlisted network remote')
+
+    def test_unpushed_tag_refused_and_pushed_tag_approved(self):
+        path = self.clone()
+        self.side_commit(path, 'side')
+        run('git', 'tag', '-a', '-m', 'v', 'v1', cwd=path)
+        run('git', 'update-ref', 'refs/remotes/origin/side', 'HEAD', cwd=path)  # a hand-set tracking ref: no proof
+        run('git', 'checkout', '-q', 'main', cwd=path)
+        run('git', 'branch', '-q', '-D', 'side', cwd=path)
+        self.refused(path, 'no live ref of an allowlisted network remote')
+        run('git', 'push', '-q', str(self.remote), 'v1', cwd=path)
+        self.assertEqual(self.approve(path)['target'], 'git')
+
+    def test_remote_ahead_of_the_clone_needs_a_fetch(self):
+        path = self.clone()
+        other = self.task / 'other'
+        run('git', 'clone', '-q', '-b', 'main', str(self.remote), str(other))
+        (other / 'o').write_text('o\n')
+        run('git', 'add', 'o', cwd=other)
+        run('git', 'commit', '-q', '-m', 'o', cwd=other)
+        run('git', 'push', '-q', 'origin', 'main', cwd=other)
+        self.refused(path, 'fetch')
+
+    def test_live_listing_is_taken_once_per_remote_with_heads_and_tags(self):
+        seen = []
+        saved = cg._git
+        cg._git = lambda repo, *args, **kw: (seen.append((repo, args)), (0, 'a' * 40 + '\trefs/heads/main\n'))[1]
+        try:
+            self.assertEqual(cg._ls_remote('https://github.com/o/r.git'), ['a' * 40])
+        finally:
+            cg._git = saved
+        self.assertEqual(len(seen), 1)
+        self.assertIsNone(seen[0][0])
+        self.assertIn('refs/heads/*', seen[0][1])
+        self.assertIn('refs/tags/*', seen[0][1])
+
+
+class Round3N2Answer(NoBackupCase):
+    """N2: one question, one predefined option starting with Delete, naming exactly this path."""
+
+    def real(self, path, **kw):
+        uid = transcript(self.home / '.claude', 'sess-1', kw.pop('path_text', str(path)), **kw)
+        return 'answer:sess-1/%s' % uid
+
+    def test_never_delete_option_refused(self):
+        path = self.image()
+        src = self.real(path, answer='Never delete these', options=('Never delete these', 'Delete'))
+        self.refused(path, 'does not say delete', source=src, resolver=None)
+
+    def test_delete_nothing_yet_refused(self):
+        path = self.image()
+        src = self.real(path, answer='Delete nothing yet', options=('Delete nothing yet', 'Delete it'))
+        self.refused(path, 'does not say delete', source=src, resolver=None)
+
+    def test_free_text_other_answer_refused(self):
+        path = self.image()
+        src = self.real(path, answer='Delete it')  # not one of the offered options: typed into "Other"
+        self.refused(path, 'predefined option', source=src, resolver=None)
+
+    def test_two_question_call_refused(self):
+        a, b = self.image('a.dmg'), self.image('b.dmg')
+        qa, qb = 'Delete %s?' % a, 'What about %s?' % b
+        opts = [{'label': 'Delete', 'description': 'd'}, {'label': 'Move it to Dropbox first', 'description': 'm'}]
+        uid = transcript(self.home / '.claude', 'sess-1', '', questions=[
+            {'question': qa, 'header': 'A', 'multiSelect': False, 'options': opts},
+            {'question': qb, 'header': 'B', 'multiSelect': False, 'options': opts}],
+            answers={qa: 'Delete', qb: 'Move it to Dropbox first'})
+        self.refused(b, 'single question', source='answer:sess-1/%s' % uid, resolver=None)
+
+    def test_multi_select_refused(self):
+        path = self.image()
+        src = self.real(path, multi=True)
+        self.refused(path, 'single question', source=src, resolver=None)
+
+    def test_question_naming_two_paths_refused(self):
+        a, b = self.image('a.dmg'), self.image('b.dmg')
+        self.refused(b, 'names another path', resolver=ok_resolver_for(a, b))
+        src = self.real(b, path_text='%s and %s' % (a, b))
+        self.refused(b, 'names another path', source=src, resolver=None)
+
+    def test_prefix_named_path_is_not_this_path(self):
+        target = self.clone('mirror')
+        src = self.real(target, path_text=str(target) + '-old')
+        self.refused(target, 'does not name the literal path', source=src, resolver=None)
+        self.refused(target, 'does not name the literal path', resolver=ok_resolver_for(str(target) + '-old'))
+        self.refused(target, 'does not name the literal path', resolver=ok_resolver_for(str(target) + '/sub'))
+
+    def test_question_with_ancestor_context_and_punctuation_is_approved(self):
+        path = self.image()
+        src = self.real(path, path_text='%s (under %s/)' % (path, self.task))
+        self.assertEqual(self.approve(path, source=src, resolver=None)['target'], 'image')
+
+    def test_injected_resolver_without_predefined_flag_refused(self):
+        path = self.image()
+        self.refused(path, 'predefined option', resolver=ok_resolver_for(path, predefined=False))
+
+
+class Round3N3Environment(NoBackupCase):
+    """N3: git runs by an absolute path with a constructed environment; PATH and GIT_* shims cannot answer."""
+
+    def test_git_env_is_constructed(self):
+        seen = {}
+        real_run = subprocess.run
+
+        def spy(argv, **kw):
+            seen['argv'], seen['env'] = argv, kw.get('env')
+            return real_run(['true'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        saved = dict(os.environ)
+        os.environ.update(PATH='/tmp/shim:' + saved.get('PATH', ''), GIT_EXEC_PATH='/tmp/shim',
+                          GIT_CONFIG_GLOBAL='/tmp/g', GIT_SSH_VARIANT='ssh', GIT_TEMPLATE_DIR='/tmp/t')
+        cg.subprocess.run = spy
+        try:
+            cg._git(None, 'version')
+        finally:
+            cg.subprocess.run = real_run
+            os.environ.clear()
+            os.environ.update(saved)
+        env = seen['env']
+        self.assertTrue(os.path.isabs(seen['argv'][0]), seen['argv'][0])
+        self.assertEqual(env['PATH'], '/usr/bin:/bin')
+        self.assertEqual(env['GIT_CONFIG_GLOBAL'], '/dev/null')
+        self.assertEqual(env['GIT_CONFIG_NOSYSTEM'], '1')
+        allowed = {'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT', 'GIT_OPTIONAL_LOCKS',
+                   'GIT_PAGER', 'GIT_NO_REPLACE_OBJECTS', 'GIT_ATTR_NOSYSTEM'}
+        self.assertEqual({k for k in env if k.startswith('GIT_')} - allowed, set())
+        self.assertIn('core.sshCommand=/usr/bin/ssh', seen['argv'])
+
+    def test_path_shim_git_never_runs(self):
+        shim = self.home / 'shim'
+        shim.mkdir()
+        canary = self.home / 'canary'
+        (shim / 'git').write_text('#!/bin/sh\ntouch %s\nexit 1\n' % canary)
+        os.chmod(shim / 'git', 0o755)
+        repo = str(self.clone())
+        saved = os.environ.get('PATH', '')
+        os.environ['PATH'] = '%s:%s' % (shim, saved)
+        try:
+            code, _ = cg._git(repo, 'rev-parse', 'HEAD')
+        finally:
+            os.environ['PATH'] = saved
+        self.assertEqual(code, 0)
+        self.assertFalse(canary.exists())
+
+
+class Round3N4Filters(NoBackupCase):
+    """N4: repository filter config, info/attributes and LFS are refused before git status can run a filter."""
+
+    def hide(self, path, canary):
+        (path / '.git/info').mkdir(exist_ok=True)
+        (path / '.git/info/attributes').write_text('README filter=hide\n')
+        run('git', 'config', 'filter.hide.clean', "sh -c 'touch %s; cat'" % canary, cwd=path)
+
+    def test_clean_filter_refused_and_never_runs(self):
+        path = self.clone()
+        canary = self.home / 'filter-ran'
+        self.hide(path, canary)
+        (path / 'README').write_text('yo\n')
+        self.refused(path, 'filter')
+        self.assertFalse(canary.exists())
+
+    def test_filter_config_alone_refused(self):
+        path = self.clone()
+        run('git', 'config', 'filter.lfs.process', 'git-lfs filter-process', cwd=path)
+        self.refused(path, 'filter')
+
+    def test_info_attributes_alone_refused(self):
+        path = self.clone()
+        (path / '.git/info').mkdir(exist_ok=True)
+        (path / '.git/info/attributes').write_text('* -text\n')
+        self.refused(path, 'attributes')
+
+    def test_lfs_store_refused(self):
+        path = self.clone()
+        (path / '.git/lfs/objects').mkdir(parents=True)
+        self.refused(path, 'LFS')
+
+    def test_filter_added_after_approval_voids_it(self):
+        path = self.clone()
+        self.approve(path)
+        canary = self.home / 'filter-ran-late'
+        self.hide(path, canary)
+        self.assertFalse(self.approvals().covers(str(path)))
+        self.assertFalse(canary.exists())
+
+
+class Round3N5SoleSegment(NoBackupCase):
+    """N5: a no-backup approval is used only by a command whose only segment is the delete itself."""
+
+    def test_compound_commands_blocked_and_plain_delete_allowed(self):
+        path = self.clone()
+        self.approve(path)
+        c = cg.Compiled(self.policy, home=str(self.home))
+        for cmd in ('echo unique > %s/new.txt && rm -rf %s' % (path, path),
+                    'git -C %s commit --allow-empty -m wip && rm -rf %s' % (path, path),
+                    'echo x >> %s/README; git -C %s stash; rm -rf %s' % (path, path, path),
+                    'rm -rf %s; echo done' % path, 'rm -rf %s & sleep 1' % path,
+                    'rm -rf %s\necho next' % path, 'rm -rf %s $(true)' % path,
+                    'cd /tmp && rm -rf %s' % path):
+            with self.subTest(cmd=cmd[:50]):
+                self.assertEqual(cg.decide(cmd, c, marker=self.approvals())[0], 'block')
+        for cmd in ('rm -rf %s' % path, '/bin/rm -rf -- %s' % path, "rm -r -f '%s'" % path):
+            with self.subTest(cmd=cmd[:50]):
+                self.assertEqual(cg.decide(cmd, c, marker=self.approvals())[0], 'allow')
+
+
+class Round3N6Transcripts(NoBackupCase):
+    """N6: the answer counts only from a real (not symlinked) transcript, and Bash cannot write transcripts."""
+
+    def test_symlinked_project_dir_refused(self):
+        path = self.image()
+        forged = self.home / 'forged'
+        uid = transcript(forged, 'sess-1', str(path))
+        os.symlink(str(forged / 'projects' / 'p'), str(self.home / '.claude/projects/zz-link'))
+        self.refused(path, 'symlink', source='answer:sess-1/%s' % uid, resolver=None)
+
+    def test_symlinked_transcript_file_refused(self):
+        path = self.image()
+        forged = self.home / 'forged'
+        uid = transcript(forged, 'sess-1', str(path))
+        folder = self.home / '.claude/projects/q'
+        folder.mkdir()
+        os.symlink(str(forged / 'projects/p/sess-1.jsonl'), str(folder / 'sess-1.jsonl'))
+        self.refused(path, 'symlink', source='answer:sess-1/%s' % uid, resolver=None)
+
+    def test_bash_writes_into_projects_blocked(self):
+        c = cg.Compiled(self.policy, home=str(self.home))
+        p = '%s/.claude/projects' % self.home
+        for cmd in ('mkdir -p %s/zz && printf x > %s/zz/s.jsonl' % (p, p), 'cp /tmp/f.jsonl %s/zz/' % p,
+                    'ln -s /tmp/forged %s/zz-link' % p, 'echo x >> %s/p/a.jsonl' % p,
+                    'tee -a %s/p/a.jsonl < /tmp/f' % p, 'cp -r /tmp/forged %s' % p,
+                    "python3 -c \"open('%s/zz/s.jsonl','a').write('x')\"" % p):
+            with self.subTest(cmd=cmd[:60]):
+                self.assertEqual(cg.decide(cmd, c)[0], 'block')
+        for cmd in ('cat %s/p/a.jsonl' % p, 'grep -c x %s/p/a.jsonl' % p,
+                    'printf note > %s/-Users-x/memory/note.md' % p,
+                    "python3 -c \"print(open('%s/p/a.jsonl').read())\"" % p):
+            with self.subTest(cmd=cmd[:60]):
+                self.assertNotEqual(cg.decide(cmd, c)[0], 'block')
+
+
+class Round3N7SessionCase(NoBackupCase):
+    """N7: the session id is canonical and must be the transcript's exact name."""
+
+    def test_canonical_source_folds_the_session(self):
+        self.assertEqual(cg._canonical_source('answer:SESS-1/ABCDEF01-0000'), 'answer:sess-1/abcdef01-0000')
+
+    def test_session_case_variant_refused(self):
+        path = self.image()
+        uid = transcript(self.home / '.claude', 'sess-1', str(path))
+        self.refused(path, None, source='answer:SESS-1/%s' % uid, resolver=None,
+                     wal=str(self.home / '.claude/wals/SESS-1/agent-nb.jsonl'))
+
+    def test_case_variants_of_the_session_share_one_cap(self):
+        for i in range(4):
+            self.approve(self.image('c%d.dmg' % i))
+        self.refused(self.image('c9.dmg'), 'already approved', source=SOURCE.replace('sess-1', 'SESS-1'))
+
+
+class Round3N8Wal(NoBackupCase):
+    """N8: --wal must be an existing, real, hook-written WAL of the answer's session that predates the answer."""
+
+    def test_missing_wal_refused(self):
+        self.refused(self.image(), 'WAL', wal=str(self.home / '.claude/wals/sess-1/fresh.jsonl'))
+        self.assertFalse((self.home / '.claude/wals/sess-1/fresh.jsonl').exists())
+
+    def test_symlinked_wal_refused(self):
+        link = self.home / '.claude/wals/sess-1/link.jsonl'
+        os.symlink(self.wal, str(link))
+        self.refused(self.image(), 'WAL', wal=str(link))
+
+    def test_wal_written_only_after_the_answer_refused(self):
+        late = str(self.home / '.claude/wals/sess-1/late.jsonl')
+        hook_wal(late, time.time() + 120)
+        self.refused(self.image(), 'predate', wal=late)
+
+    def test_wal_without_hook_entries_refused(self):
+        notes = self.home / '.claude/wals/sess-1/notes.jsonl'
+        notes.write_text(json.dumps({'at': '2020-01-01T00:00:00+00:00', 'event': 'intent', 'note': 'x'}) + '\n')
+        self.refused(self.image(), 'predate', wal=str(notes))
 
 
 if __name__ == '__main__':

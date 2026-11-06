@@ -497,25 +497,27 @@ The approval is single use, signed with a local key and bound to the exact realp
 
 ### Deleting disposable copies without a backup (goodqa#14911)
 
-When the user approves deleting something without a backup, ask with AskUserQuestion and put the exact literal path of every target in the question. Then cite the answer:
+When the user approves deleting something without a backup, ask with AskUserQuestion: one question per path, in a call that asks only that question, naming the exact literal path, with a predefined option whose label starts with "Delete" (for example "Delete, no backup"). Then cite the answer:
 
 ```bash
 python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal path> --no-backup \
-  --user-source answer:<session>/<uuid> --wal ~/.claude/wals/<same session>/<WAL>.jsonl [--ttl S]
+  --user-source answer:<session>/<uuid> --wal ~/.claude/wals/<same session>/main.jsonl [--ttl S]
 ```
 
 The source must be exactly `answer:<session>/<uuid>`: no `user:` turn and no quoted excerpt. It must resolve, from the account's pinned `~/.claude`, to an AskUserQuestion answer that:
 
 - is at most 24 hours old;
-- answers a question whose input contains the literal path;
-- says "delete", and does not say not, don't, keep, leave or cancel;
-- is from the same session as the `--wal`.
+- answers a call with exactly one single-choice question, and that question is the key of the one answer;
+- is a predefined option, never "Other" free text, whose label starts with "Delete" and does not say not, don't, keep, leave, cancel, nothing, never, later, yet, skip, hold, wait or instead;
+- answers a question that names the literal path as a whole path (`.../mirror-old` does not name `.../mirror`), and names no other path except ancestors of it given as context;
+- comes from a real transcript: no symlinked `projects` folder, project folder or transcript, and the session id must be the file's exact name (case included);
+- is from the same session as the `--wal`, which must already exist as a real file (no symlink) and hold a hook-written `pretool` entry dated before the answer. Give the session's `main.jsonl`.
 
-The account home comes from the password database. The route refuses to run when `HOME` or `CLAUDE_CONFIG_DIR` points elsewhere, and the hook blocks any `approve-delete` command that sets `HOME` or `CLAUDE_CONFIG_DIR` or goes through `env`.
+The account home comes from the password database. The route refuses to run when `HOME` or `CLAUDE_CONFIG_DIR` points elsewhere. The hook blocks any `approve-delete` command that sets `HOME`, `CLAUDE_CONFIG_DIR`, `PATH`, a `GIT_*`, `LD_*`, `DYLD_*` or `PYTHON*` variable, or goes through `env`. Every git command the route runs uses a system git by absolute path (`/usr/bin/git`, then Homebrew's) with a constructed environment: `PATH=/usr/bin:/bin`, the pinned `HOME`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, no other caller variable but `SSH_AUTH_SOCK`, and `ssh` as `/usr/bin/ssh`. A PATH shim or `GIT_EXEC_PATH` helper cannot answer for git. Bash commands that write, copy or link into `~/.claude/projects` (outside `projects/<dir>/memory/`) are blocked as transcript forgery.
 
 Only two kinds of target qualify, and only when deleting them loses nothing:
 
-- **The top of a git working tree.** Every file must be committed, with no changed, untracked or ignored file. No index entry may be assume-unchanged, and no skip-worktree file may be present on disk (absent sparse-checkout files are fine). The tree must have no stash, no linked worktree, no submodule or gitlink, and no replace ref or graft. Every commit on any ref outside `refs/remotes`, including tags, notes and custom refs, must be on a remote-tracking ref. Finally, a remote whose URL is a network URL (`https://`, `ssh://` or `git@host:`) on an allowlisted host (`marker.no_backup_remote_hosts`: `github.com` and `t2-dev` by default) must confirm, through `git ls-remote` run outside the repository, that its branch tip equals a tracking ref that contains HEAD. A local path, a `file://` URL or the repository itself never counts. If the remote has moved on since the last fetch, run `git fetch` first.
+- **The top of a git working tree.** Every file must be committed, with no changed, untracked or ignored file. No index entry may be assume-unchanged, and no skip-worktree file may be present on disk (absent sparse-checkout files are fine). The tree must have no stash, no linked worktree, no submodule or gitlink, no replace ref or graft, no filter driver in its config, no `.git/info/attributes` and no LFS store (`.git/lfs`). These are checked before `git status` runs, because status would run a filter. Every remote whose URL is a network URL (`https://`, `ssh://` or `git@host:`) on an allowlisted host (`marker.no_backup_remote_hosts`: `github.com` and `t2-dev` by default) is listed once with `git ls-remote <url> refs/heads/* refs/tags/*`, run outside the repository. Every commit reachable from HEAD or any ref outside `refs/remotes` (branches, tags, notes, custom refs) must be reachable from those live shas. Local remote-tracking refs never count, because they can be stale or hand-set. A local path, a `file://` URL or the repository itself never counts. Live shas this clone lacks are left out, which can only refuse more; if the remote has moved on, run `git fetch` first.
 - **A disk image** (`.sparseimage`, `.dmg` or `.sparsebundle`) under `~/.agent-harness/work` that `hdiutil info` does not list as attached. Its size is recorded in the approval. Its contents are not inspected.
 
 The route also refuses in these cases:
@@ -525,14 +527,18 @@ The route also refuses in these cases:
 - the path uses a glob or variable, is relative, or goes through a symlink or `..`;
 - the TTL is above 3600 s.
 
-Repository config cannot run anything during the checks: fsmonitor, hooks, the ext and file transports, ssh command, credential helper and pager are all switched off, and replace objects are ignored.
+Repository config cannot run anything during the checks: fsmonitor, hooks, the ext and file transports, ssh command, credential helper, pager and attributes file are all switched off, filters are refused, and replace objects are ignored.
 
-The approval is single use and MAC-signed. It is bound to the exact path and its inode, and is recorded in the audit log and the WAL with the user source and expiry. At delete time the hook checks every local fact again. For a git tree that means status, index flags, submodules, replace refs, stash, worktrees, unpushed refs, HEAD and a digest of every ref. For an image it means size, mtime and attach state. A change in between voids the approval. The `ls-remote` proof is made at approval time only.
+The approval is single use and MAC-signed. It is bound to the exact path and its inode, and is recorded in the audit log and the WAL with the user source and expiry. At delete time the hook checks every local fact again. For a git tree that means status, index flags, submodules, replace refs, stash, worktrees, unpushed refs, HEAD and a digest of every ref. For an image it means size, mtime and attach state. A change in between voids the approval. The `ls-remote` proof is made at approval time only; at delete time the digest of every ref must be unchanged. A no-backup approval is used only by a command that is just `rm [-rRfv] [--] <approved path>`: any other segment, substitution, redirect, background job or second line is blocked, because an earlier segment could create work that exists nowhere else.
 
 Residuals, disclosed:
 - The check proves that the user answered a question naming the path and chose a "delete" answer. It does not read the question's wording beyond the path.
 - A same-user process can read the marker key, so the approval resists hand-edited markers, not an agent that sets out to forge one. This is the same as for the backup route.
 - Commits that only the reflog holds, and repositories that borrow this one's objects through alternates, are not checked.
+- The transcript store is agent-writable through the Write and Edit tools, which no hook judges, and through scripts run by name. A forged answer under a fresh project folder is therefore still possible; the route only refuses symlinks, Bash writes, case variants and a WAL that did not exist before the answer. The WAL check also trusts that `pretool` entries were written by the hook.
+- ssh still reads the user's `~/.ssh/config` (needed for `t2-dev`).
+- An allowlisted host constrains the host, not the repository path: `t2-dev` accepts any path, including a disposable worktree that may be cleaned up later. Prefer a GitHub remote as the proof.
+- The backup route does not have the sole-segment rule; there the backup was verified first.
 
 ### Commands
 
