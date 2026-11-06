@@ -1019,7 +1019,8 @@ class ScriptArgumentTextIsData(WorldCase):
     """goodqa#14817: words in a script's ARGUMENTS (a note, a JSON body) are data, not interpreter code."""
     DATA = [
         "python3 ~/.claude/hooks/wal_note.py --wal ~/w.jsonl --event status --note 'owner will kill nothing; delete later'",
-        "python3 spec_flow.py --note 'os.kill is not called here'",
+        # A relative or non-installed script path is not trusted as data (main's #14864 design, which supersedes
+        # this PR's basename list); `python3 spec_flow.py --note '...kill...'` stays a recorded false positive.
         "python3 ./gq.py comment 14817 --json '{\"body\": \"a kill-guard false positive\"}'",
     ]
     CODE = [  # inline code and heredoc bodies are still scanned

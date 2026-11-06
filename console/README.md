@@ -77,3 +77,9 @@ On Windows the full suite has never passed for this code (discard, torn-record a
 - `cancel()` and a stop verdict discard output the console has not read yet; an explicit stop is not a drain.
 - `app.close` waits for the process groups of runs still attached to a session (300 ms grace each, about one second at most per run). A run already detached before close (a closed tab, a discard, a replaced Codex client) is signalled when it is detached but not waited on; the console may exit before such a group has fully ended.
 - A tree with no caller verdict stops its group after a 7 second grace once the leader exits; production callers settle it, so this only bounds a caller that forgets.
+
+## Asks, owners and requirements view
+
+The **Asks** button in the top bar opens a read-only view with three tabs: asks (open, stale, waiting, blocked, resolved), owners (live, quiet, SILENT, DROPPED, done, handoff, with any disposition) and requirements. It refreshes every 30 seconds and filters by session, state, age and text. All sessions are shown by default.
+
+The console does not parse the ledgers. `GET /api/asks-view` (the normal bearer token applies) runs the installed `ah` CLI, `~/.claude/hooks/ah.py` (override with `AH_BIN`), with no shell, a 15 second deadline and an 8 MiB output cap: `ah asks --all`, `ah requirements --all`, `ah sessions` and `ah owners --session S` for the newest six sessions active in the last 72 hours (or the one session you pick). Each section fails on its own with an "unavailable" message. Rows are capped (2,000 asks and requirements, 3,000 owners), text is clipped and passed through the console's secret redaction, and a partial result is labelled. Needs an `ah` that has `asks`, `requirements` and `sessions`.
