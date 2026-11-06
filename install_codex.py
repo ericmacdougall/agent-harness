@@ -136,9 +136,10 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
             # Kill guard after the command guard, so main's trusted positions above it do not move (GoodQA #14590,
             # GoodQA #14506). --no-command-guard leaves out both.
             preserved.append({'hooks': [{'type': 'command', 'command': kill_guard, 'timeout': 30}]})
-            # Heavy-job guard last again, so every trusted position above keeps its hash. It fails open on its own
-            # errors and denies with exit 2 only for heavy work on the Mac. Codex trust for this new hook needs the
-            # user to review it in /hooks; until then Codex skips it (ops-watch codex:trust says so).
+        if event == 'PreToolUse':
+            # Heavy-job guard last, so every trusted position above keeps its hash; independent of --no-command-guard.
+            # It fails open on its own errors and denies with exit 2 only for heavy work on the Mac. Codex trust for
+            # this hook needs the user to review it in /hooks; until then Codex skips it (ops-watch codex:trust).
             preserved.append({'hooks': [{'type': 'command', 'command': heavy_guard, 'timeout': 30}]})
         hooks[event] = preserved
     return result

@@ -229,18 +229,100 @@ class HeavyCommandFamilies(unittest.TestCase):
             with self.subTest(command=command):
                 result = guard.decide(command, "/Users/eric/proj", MODES)
                 self.assertEqual((result["action"], result["rule"]), ("deny", rule), result)
-                self.assertIn("ah.py run --host t2-dev --", result["message"])
-                self.assertIn("ssh t2-dev ", result["message"])
+                host = "dev2" if "claude" in command else "t2-dev"  # claude is not logged in on t2-dev
+                self.assertIn(f"ssh {host} bash -lc", result["message"])
+                if host == "dev2":
+                    self.assertNotIn("ssh t2-dev ", result["message"])
 
     def test_quick_forms_stay_allowed(self):
         for command in self.ALLOWED:
             with self.subTest(command=command):
                 self.assertEqual(guard.decide(command, "/Users/eric/proj", MODES)["action"], "allow", command)
 
-    def test_the_route_line_carries_the_command_and_directory(self):
+    def test_the_route_line_is_runnable_on_the_host(self):
         message = guard.decide("pnpm install --frozen-lockfile", "/Users/eric/proj", MODES)["message"]
-        self.assertIn("ah.py run --host t2-dev -- pnpm install --frozen-lockfile", message)
-        self.assertIn("cd /Users/eric/proj && pnpm install --frozen-lockfile", message)
+        self.assertIn("rsync -a --exclude node_modules --exclude .git /Users/eric/proj/ t2-dev:~/proj/", message)
+        self.assertIn("ssh t2-dev bash -lc 'cd ~/proj && pnpm install --frozen-lockfile'", message)
+        self.assertNotIn("cd /Users/eric", message)  # a Mac path does not exist on the host
+        with mock.patch.object(guard, "ah_run_available", lambda: False):
+            self.assertIn("replaces steps 1-2 once goodqa#14548", guard.decide("pnpm install", "/Users/eric/proj", MODES)["message"])
+        with mock.patch.object(guard, "ah_run_available", lambda: True):
+            self.assertIn("ah.py run --host t2-dev -- pnpm install", guard.decide("pnpm install", "/Users/eric/proj", MODES)["message"])
+        piped = guard.decide("ls | xargs -P8 pnpm install", "/Users/eric/proj", MODES)["message"]
+        self.assertIn("ls | xargs -P8 pnpm install", piped)  # the whole command, pipe included
+        multi = guard.decide("pnpm install\npnpm build", "/Users/eric/proj", MODES)["message"]
+        self.assertIn("pnpm install\npnpm build", multi)  # newlines survive quoting
+        self.assertNotIn("...", guard.decide("pnpm install " + "x " * 400, "/Users/eric/proj", MODES)["message"])
+
+
+class ReviewRound4(unittest.TestCase):
+    """Native review B1/M1/minors of PR 103 at e78b427: each row failed against that head."""
+
+    def d(self, command, cwd="/Users/eric/proj"):
+        return guard.decide(command, cwd, MODES)
+
+    def test_b1_prompts_containing_loop_words_are_not_loops(self):
+        for command in ('claude -p "review this diff for bugs"', 'git log -5 | claude -p "summarize while ignoring merges"',
+                        "claude -p 'explain what happens until the lock is freed'",
+                        'for f in a b; do wc -l "$f"; done; claude -p "summarize"',
+                        'for f in a b c; do claude -p "one at a time $f"; done',  # sequential, not backgrounded
+                        'claude -p a; claude -p b; claude -p c', 'claude -p "a && b & c"'):
+            with self.subTest(command=command):
+                self.assertEqual(self.d(command)["action"], "allow", command)
+
+    def test_b1_real_background_fanout_is_denied_and_the_cap_plus_hatch_is_a_working_escape(self):
+        loop = 'for f in a b c; do claude -p "review $f" & done; wait'
+        self.assertEqual(self.d(loop)["rule"], "fan-out")
+        self.assertEqual(self.d("claude -p a & claude -p b & wait")["rule"], "fan-out")
+        capped = ("HARNESS_LOCAL_OK='needs local sessions' python3 ~/.claude/hooks/run_capped.py --max-rss-gb 4 -- "
+                  "bash -c 'claude -p a & claude -p b & wait'")
+        self.assertEqual(self.d(capped)["action"], "allow", self.d(capped))
+        uncapped = "HARNESS_LOCAL_OK='needs local sessions' claude -p a & claude -p b & wait"
+        self.assertEqual(self.d(uncapped)["action"], "deny")
+
+    def test_m1_claude_routes_to_dev2_and_others_to_t2_dev(self):
+        message = self.d('for f in a b; do claude -p "x $f" & done')["message"]
+        self.assertIn("ssh dev2 bash -lc", message)
+        self.assertNotIn("ssh t2-dev", message)
+        self.assertIn("not logged in", message)
+        self.assertIn("ssh t2-dev bash -lc", self.d("pnpm install")["message"])
+        with mock.patch.dict(os.environ, {"HARNESS_CLAUDE_ROUTE_HOST": "t2-dev"}):
+            self.assertIn("ssh t2-dev bash -lc", self.d("claude -p a & claude -p b &")["message"])
+
+    def test_docker_remote_engines_and_more_container_forms(self):
+        for command in ("docker --context t2-dev run x", "docker -H ssh://t2-dev run x", "DOCKER_HOST=ssh://t2-dev docker run x"):
+            self.assertEqual(self.d(command)["action"], "allow", command)
+        for command in ("docker compose --profile dev up", "docker compose --env-file e.cfg up", "docker container run x",
+                        "docker image pull x", "colima start", "podman machine start"):
+            self.assertEqual(self.d(command)["rule"], "container", command)
+
+    def test_installs_that_slipped_through(self):
+        for command in ("yarn", "yarn workspace web add left-pad", "pnpm -w add -D x", "npm clean-install", "npm cit",
+                        "npm install-test", "corepack pnpm install", "yarn install"):
+            self.assertEqual(self.d(command)["rule"], "install", command)
+        for command in ("yarn --version", "npm install --dry-run", "pnpm install --help"):
+            self.assertEqual(self.d(command)["action"], "allow", command)
+
+    def test_replay_forms(self):
+        for command in ("python3 scripts/replay.py", "pnpm tsx scripts/replay.ts", "node --import tsx scripts/replay.ts",
+                        "k6 run load.js", "pnpm run synthetic:full"):
+            self.assertEqual(self.d(command)["rule"], "replay", command)
+        for command in ("node --test tests/replay.test.mjs", "tsx src/replay.spec.ts", "node scripts/replay.js --help",
+                        "pnpm run stress-free-mode", "python3 scripts/replay.py --help"):
+            self.assertEqual(self.d(command)["action"], "allow", command)
+
+    def test_nan_epoch_is_stale_and_tiny_sizes_keep_their_estimate(self):
+        self.assertEqual(guard.record_epoch({"measured_at_epoch": float("nan")}), 0.0)
+        detail = guard.copy_event_detail({"cwd": ""}, {"detail": "cp copies at least 3.0 MiB onto this Mac"})
+        self.assertEqual(detail["est_bytes"], 3 * 1048576)
+
+
+class ClaudeRouteAndAuth(unittest.TestCase):
+    def test_claude_fanout_routes_to_dev2_with_the_reason_not_to_t2_dev(self):
+        message = guard.decide('for f in a b c; do claude -p "x $f" & done', "/Users/eric/p", MODES)["message"]
+        self.assertIn("ssh dev2 bash -lc", message)
+        self.assertNotIn("ssh t2-dev", message)
+        self.assertIn("not logged in", message)
 
 
 class RunGates(unittest.TestCase):

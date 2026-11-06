@@ -16,10 +16,14 @@ Contract
   logged to the session WAL. Browser, adversarial, media and fan-out work must
   ALSO run under run_capped.py; suites and builds only need the hatch.
 - Rules: browser, adversarial (hostile-input/fuzz scripts, /dev/zero, mkfifo,
-  perl alarm wrappers, scratchpad rt/ scripts), full-suite, build, media, fan-out.
+  perl alarm wrappers, scratchpad rt/ scripts), full-suite, build, install, replay, container, copy, media, fan-out.
   Big jobs are fine on dev2; nothing here caps them. On the Mac, run_capped.py's cap
   PAUSES a runaway and alerts (netwatch kills only as a last resort).
-  Default enforce for browser, full-suite and build (route to dev2); warn for media and
+  Default enforce for browser, full-suite, build, install (pnpm/npm/yarn/bun), replay (replay/synthetic/stress/soak
+  scripts, k6), container (docker/podman run/pull/up/start, colima), copy and fan-out (route to the fleet; GoodQA
+  goodqa#14817). Fan-out is enforced deliberately for xargs -P/parallel and for backgrounded or looped `claude -p`: they
+  need the hatch AND run_capped.py. Not covered (disclosed): pip/uv/bundle installs, codex exec, claude -p inside nested
+  shells; warn for media and
   fan-out; adversarial is advisory ONLY (never denied: breaking things with hostile input
   is the red team's job; the advice is dev2 or run_capped.py group cleanup). Override with
   HARNESS_HEAVY_GUARD=off|warn|enforce or heavy_job_guard.json next to this
@@ -786,19 +790,24 @@ def is_focused_test(args):
     return any(FILE_TARGET.search(t) for t in positional(args, ("-t", "--testNamePattern", "-c", "--config")))
 
 
-REPLAY_NAME = re.compile(r"(?:^|[:_./-])(?:replay|synthetic|stress|loadtest|load-test|soak)(?:$|[:_./-])", re.I)
+REPLAY_NAME = re.compile(r"(?:^|[:_./-])(?:replay|synthetic|stress|loadtest|load-test|soak)(?:\.(?:[cm]?[jt]s|py|sh))?"
+                         r"(?:[:_-](?:all|full|run|ci|prod|\d+))?$", re.I)
 
 
 def classify_pm(name, args):
     """npm/pnpm/yarn/bun: tests and builds. Returns None, (rule, detail) or ('recurse', argv)."""
-    valued = ("--prefix", "-C", "--filter", "-F", "-w", "--workspace", "--cwd", "--dir")
+    valued = ("--prefix", "-C", "--filter", "-F", "--workspace", "--cwd", "--dir") + (("-w",) if name == "npm" else ())
     pos = positional(args, valued)
     if not pos:
+        if name == "yarn" and not any(a in ("--help", "-h", "--version", "-v") for a in args):
+            return ("install", "yarn (a bare yarn installs)")
         return None
+    if name == "yarn" and pos[0] == "workspace" and len(pos) > 2:
+        pos = pos[2:]  # yarn workspace NAME add ...
     sub, rest = pos[0], pos[1:]
     if sub in ("exec", "dlx", "x") and rest:
         return ("recurse", rest)
-    if sub in ("playwright", "puppeteer", "vitest", "jest", "cypress", "next", "vite"):
+    if sub in ("playwright", "puppeteer", "vitest", "jest", "cypress", "next", "vite", "tsx", "ts-node", "node", "k6"):
         return ("recurse", [sub] + rest)
     if sub in ("run", "run-script") and rest:
         sub, rest = rest[0], rest[1:]
@@ -807,7 +816,8 @@ def classify_pm(name, args):
         return None if is_focused_test(after) else ("full-suite", f"{name} {sub}")
     if re.match(r"^build(?:[:_-].*)?$", sub) or sub in ("compile", "bundle"):
         return ("build", f"{name} {sub}")
-    if sub in ("install", "i", "ci", "add", "update", "upgrade", "up", "dedupe", "rebuild") and not any(
+    if sub in ("install", "i", "ci", "add", "update", "upgrade", "up", "dedupe", "rebuild", "clean-install", "cit",
+               "install-test", "it", "install-ci-test", "isntall") and not any(
             a in ("--help", "-h", "--version", "--dry-run") for a in args):
         return ("install", f"{name} {sub}")
     if REPLAY_NAME.search(sub):
@@ -1009,6 +1019,11 @@ def classify(argv, ctx, depth=0):
             return found
     if low == "claude" and any(a in ("-p", "--print") for a in args):
         ctx.claude_p = getattr(ctx, "claude_p", 0) + 1
+        ctx.claude_uncapped = getattr(ctx, "claude_uncapped", 0) + (0 if ctx.capped else 1)
+    if low == "corepack" and args:
+        return classify(args, ctx, depth + 1)
+    if low == "k6" and (positional(args) or [""])[0] == "run" and "--help" not in args:
+        return ("replay", "k6 run")
     if low in REMOTE_CMDS:
         return None  # already off-box
     if cmd == "run_capped.py":
@@ -1109,6 +1124,8 @@ def classify(argv, ctx, depth=0):
                 return ("browser", f"python -m {module}")
             return None
         first = (positional(args) or [""])[0]
+        if first.endswith(".py") and REPLAY_NAME.search(base(first)) and "--help" not in args and "-h" not in args:
+            return ("replay", f"python {base(first)}")
         if base(first) == "run_capped.py":
             return classify([first] + args[args.index(first) + 1:], ctx, depth + 1)
         if base(first) == "run_probe.py":
@@ -1126,8 +1143,9 @@ def classify(argv, ctx, depth=0):
                 code = args[args.index(flag) + 1]
                 if JS_BROWSER_IMPORT.search(code) or re.search(r"require\(\s*['\"](?:playwright|puppeteer)", code):
                     return ("browser", "node -e code that drives a browser")
-        script = next(iter(positional(args)), None)
-        if script and re.search(r"\.[cm]?[jt]s$", script) and REPLAY_NAME.search(base(script)):
+        script = next((p for p in positional(args, ("--import", "--require", "-r", "--loader", "--experimental-loader"))
+                       if re.search(r"\.[cm]?[jt]s$", p)), None)
+        if script and REPLAY_NAME.search(base(script)) and "--test" not in args and "--help" not in args and "-h" not in args:
             return ("replay", f"{low} {base(script)}")
         if script and re.search(r"\.[cm]?[jt]s$", script):
             sources = script_sources(script, ctx)
@@ -1185,8 +1203,18 @@ def classify(argv, ctx, depth=0):
         if sub == "build" or (low == "webpack" and sub not in ("serve", "watch")):
             return ("build", f"{low} {sub}".strip())
         return None
+    if low in ("colima", "lima", "limactl") and (positional(args) or [""])[0] == "start":
+        return ("container", f"{low} start")
     if low in ("docker", "docker-compose", "podman", "nerdctl"):
-        pos = positional(args, ("--context", "-H", "--host", "-f", "--file", "-p", "--project-name"))
+        if any(a in ("--context", "-c", "-H", "--host") or a.startswith(("--context=", "--host=")) for a in args[:6]) or any(
+                a.startswith("DOCKER_HOST=") and re.match(r"DOCKER_HOST=(?:ssh|tcp)://", a) for a in _assigns):
+            return None  # a remote engine: the work runs off this Mac
+        pos = positional(args, ("--context", "-H", "--host", "-f", "--file", "-p", "--project-name", "--profile", "--env-file",
+                                "--project-directory", "-c", "--log-level"))
+        if pos[:2] == ["machine", "start"]:
+            return ("container", f"{low} machine start")
+        if pos[:1] in (["container"], ["image"]) and len(pos) > 1:
+            pos = pos[1:]
         if "build" in pos[:2] or ("--build" in args and ("up" in pos or low == "docker-compose")):
             return ("build", f"{low} build")
         if (pos[:1] and pos[0] in ("run", "pull", "buildx", "create", "start", "up")) or (
@@ -1233,6 +1261,28 @@ def classify(argv, ctx, depth=0):
     return None
 
 
+def has_background(text: str) -> bool:
+    """An unquoted `&` that backgrounds a command (not &&, >&, &>, |&, 2>&1)."""
+    quote, i, n = None, 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch == "\\":
+            i += 1
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "&":
+            prev, nxt = text[i - 1:i], text[i + 1:i + 2]
+            if nxt != "&" and prev not in ("&", ">", "<", "|") and nxt != ">":
+                return True
+        i += 1
+    return False
+
+
 def scan_state(command: str, cwd: str, depth: int = 0, parent=None):
     """Walk every segment. Returns (hatch_reason_or_None, [(rule, detail, capped, segment)])."""
     text, heredocs = extract_heredocs(command[:MAX_COMMAND_CHARS])
@@ -1266,11 +1316,16 @@ def scan_state(command: str, cwd: str, depth: int = 0, parent=None):
                 ctx.cwd = os.path.normpath(target)
             continue
         ctx.capped = False
+        if rest and rest[0] in ("for", "while", "until"):
+            ctx.loop = True
         result = classify(argv, ctx, depth)
         if result:
             findings.append((result[0], result[1], ctx.capped, segment))
-    if getattr(ctx, "claude_p", 0) >= 3 or (getattr(ctx, "claude_p", 0) >= 1 and re.search(r"(?:^|[\s;&|(])(?:for|while|until)\s", text)):
-        findings.append(("fan-out", "claude -p fan-out (several or looped headless sessions)", False, command[:400]))
+    claude_n = getattr(ctx, "claude_p", 0)
+    if claude_n and has_background(text) and (claude_n >= 2 or getattr(ctx, "loop", False)):
+        # parsed shell keywords and unquoted & only: a quoted prompt that contains "for" or "&" is not a loop
+        findings.append(("fan-out", "claude -p fan-out (several or looped background headless sessions)",
+                         getattr(ctx, "claude_uncapped", 0) == 0, command[:2000]))
     return hatch, findings
 
 
@@ -1339,7 +1394,7 @@ def decide(command: str, cwd: str = None, modes=None):
             outcome = {"action": "allow", "rule": rule, "detail": detail, "hatch_reason": hatch.strip()}
         else:
             outcome = {"action": "deny" if mode == "enforce" else "warn", "rule": rule, "detail": detail,
-                       "message": deny_message(rule, detail, hatch, capped, _segment, cwd)}
+                       "message": deny_message(rule, detail, hatch, capped, command, cwd)}
         if SEVERITY[outcome["action"]] > SEVERITY[best["action"]] or (
                 outcome["action"] == "allow" and best["action"] == "allow" and outcome.get("hatch_reason")
                 and not best.get("hatch_reason")):
@@ -1360,28 +1415,69 @@ def route_host() -> str:
                 value = candidate if re.fullmatch(r"[A-Za-z0-9._-]{1,60}", candidate) else ""
         except Exception:
             value = ""
-    return value or "t2-dev"  # dev2 retires 11-09
+    return value or "t2-dev"
 
 
 def routed(text: str) -> str:
     return text.replace("ssh dev2 ", f"ssh {route_host()} ")
 
 
-def exact_route(segment, cwd):
-    """The same command on the routed host: `ah run --host H -- CMD` (ah run lands with goodqa#14548) and the ssh form."""
+def claude_route_host() -> str:
+    """Host for headless claude/codex work. Default dev2: the claude CLI on t2-dev is not logged in (known gap,
+    goodqa#14817), so `claude -p` must not be routed there. Override: HARNESS_CLAUDE_ROUTE_HOST or
+    heavy_job_guard.json "claude_route_host"; `doctor.py route-auth` flags a host whose claude is not authenticated."""
+    value = os.environ.get("HARNESS_CLAUDE_ROUTE_HOST", "")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,60}", value):
+        value = ""
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
+            if os.path.exists(path):
+                candidate = str(load_json_file(path).get("claude_route_host", ""))
+                value = candidate if re.fullmatch(r"[A-Za-z0-9._-]{1,60}", candidate) else ""
+        except Exception:
+            value = ""
+    return value or "dev2"
+
+
+def ah_run_available() -> bool:
+    return os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ah_run.py"))
+
+
+def exact_route(command, cwd, rule=None):
+    """The same command on the routed host, as it can really run there: the checkout is copied first (Mac paths do not
+    exist on the host), the WHOLE original command is quoted (pipes, newlines and loops survive), nothing is truncated.
+    `ah run --host H` is printed only when ah_run.py is installed (goodqa#14548)."""
     import shlex
-    host = route_host()
-    text = " ".join((segment or "").split())[:400]
-    if not text:
+    claude_work = rule == "fan-out" and bool(re.search(r"\bclaude\b", command or ""))
+    host = claude_route_host() if claude_work else route_host()
+    if not command or not command.strip():
         return ""
-    inner = f"cd {shlex.quote(cwd)} && {text}" if cwd else text
-    return (f"Exact equivalent on {host}:\n  python3 ~/.claude/hooks/ah.py run --host {host} -- {text}\n"
-            f"  (until ah run is installed)  ssh {host} {shlex.quote(inner)}")
+    folder = os.path.basename((cwd or "").rstrip("/"))
+    folder = folder if re.fullmatch(r"[A-Za-z0-9._-]{1,80}", folder or "") else ""
+    lines = [f"Exact equivalent on {host}:"]
+    if folder:
+        lines.append(f"  1. copy the checkout: rsync -a --exclude node_modules --exclude .git {shlex.quote(cwd.rstrip('/') + '/')} "
+                     f"{host}:~/{folder}/")
+    if len(command) > 3000:
+        lines.append("  2. the command is too long to print: save it to a script file in the checkout, copy it, and run "
+                     f"ssh {host} 'cd ~/{folder or '.'} && bash script.sh'")
+    else:
+        inner = f"cd ~/{folder} && {command}" if folder else command
+        lines.append(f"  {'2. ' if folder else ''}ssh {host} bash -lc {shlex.quote(inner)}")
+    if ah_run_available():
+        lines.append(f"  or: python3 ~/.claude/hooks/ah.py run --host {host} -- {command}")
+    else:
+        lines.append("  (`ah.py run --host HOST -- CMD` replaces steps 1-2 once goodqa#14548 is installed)")
+    if claude_work:
+        lines.append(f"  Note: claude on t2-dev is not logged in (known gap), so headless claude goes to {host} until dev2 retires on 11-09.")
+    return "\n".join(lines)
 
 
 def deny_message(rule, detail, hatch, capped, segment=None, cwd=None):
     base_msg = routed(_deny_message(rule, detail, hatch, capped))
-    extra = exact_route(segment, cwd) if rule not in NEVER_BLOCK else ""
+    if rule == "fan-out" and re.search(r"\bclaude\b", (segment or "") + detail):
+        base_msg = base_msg.replace(f"ssh {route_host()} ", f"ssh {claude_route_host()} ")  # claude is not logged in on t2-dev
+    extra = exact_route(segment, cwd, rule) if rule not in NEVER_BLOCK else ""
     return base_msg + ("\n" + extra if extra else "")
 
 
@@ -1397,7 +1493,7 @@ def _deny_message(rule, detail, hatch, capped):
                 "clone with --depth 1 or --filter=blob:none, or delete finished trees first. A single unanticipated "
                 f"local step may use {HATCH}=<reason> (one use per owner per hour, audited, refused above 85% disk).")
     head = (f"Heavy-job guard [{rule}]: {RULE_HELP.get(rule, 'heavy work')} ({detail}). "
-            "Large jobs belong on dev2, not the Mac (2026-11-04: an uncapped local process hit ~66 GB and reset the machine).")
+            "Large jobs belong on dev2/T2, not the Mac (2026-11-04: an uncapped local process hit ~66 GB and reset the machine).")
     lines = [head, "Run it there: ssh dev2 '<command>' (sync the checkout first if needed), or"]
     if valid_reason(hatch) and rule in CAPPED_RULES and not capped:
         lines.append(f"{HATCH} is set, but {rule} work on the Mac must ALSO run under the resource cap: {cap}")
@@ -1589,7 +1685,10 @@ def agent_of_key(key: str) -> str:
 def record_epoch(rec) -> float:
     """When the record was measured: measured_at_epoch, else the ISO measured_at of the agreed contract shape."""
     try:
-        return float(rec["measured_at_epoch"])
+        value = float(rec["measured_at_epoch"])
+        if value == value and abs(value) != float("inf"):
+            return value
+        return 0.0  # NaN or infinity: treat as unmeasured (stale), never as fresh
     except (KeyError, TypeError, ValueError):
         pass
     from datetime import datetime, timezone
@@ -1661,8 +1760,9 @@ def event_class(decision: dict) -> str:
 def copy_event_detail(payload: dict, decision: dict, hatch_uses=None) -> dict:
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else ""
     match = re.search(r"at least ([0-9.]+) GiB", decision.get("detail", ""))
+    mib = re.search(r"at least ([0-9.]+) MiB", decision.get("detail", ""))
     return {"agent": owner_of(payload), "task": work_owner_key(cwd) or "", "host": "mac",
-            "est_bytes": int(float(match.group(1)) * GIB) if match else None, "path_digest": path_digest(cwd),
+            "est_bytes": int(float(match.group(1)) * GIB) if match else (int(float(mib.group(1)) * 1048576) if mib else None), "path_digest": path_digest(cwd),
             "route": route_host(), "hatch_uses_1h": hatch_uses}
 
 
@@ -1758,6 +1858,14 @@ def main() -> int:
         return 0  # dev2 and other hosts are where the heavy work is supposed to run
     if os.environ.get("HARNESS_HEAVY_GUARD") == "off":
         return 0
+    try:
+        import socket
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
+        if os.path.exists(path) and socket.gethostname().split(".")[0].lower() in {
+                str(h).lower() for h in load_json_file(path).get("exempt_hosts", [])}:
+            return 0  # a host listed in heavy_job_guard.json "exempt_hosts" (for example the Mac mini) is a heavy-work host
+    except Exception:
+        pass
     try:
         import safe_input
         try:

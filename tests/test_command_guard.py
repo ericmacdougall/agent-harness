@@ -1166,9 +1166,9 @@ class InstallTests(unittest.TestCase):
         user = {'hooks': {'PreToolUse': [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': 'my-hook'}]}]}}
         without = self.install_codex.merge_hooks(user, codex, command_guard=False)['hooks']['PreToolUse']
         with_guard = self.install_codex.merge_hooks(user, codex)['hooks']['PreToolUse']
-        self.assertEqual(with_guard[:len(without)], without)
+        self.assertEqual(with_guard[:len(without) - 1], without[:-1])  # without the guards it still ends with the heavy guard
         # the command guard, the kill guard (GoodQA #14506), then the heavy-job guard (goodqa#14817)
-        self.assertEqual(len(with_guard), len(without) + 3)
+        self.assertEqual(len(with_guard), len(without) + 2)
         self.assertEqual(with_guard[-3]['hooks'][0]['command'], self.install_codex.guard_command(codex))
         self.assertEqual(with_guard[-2]['hooks'][0]['command'], self.install_codex.kill_guard_command(codex))
         self.assertEqual(with_guard[-1]['hooks'][0]['command'], self.install_codex.heavy_guard_command(codex))
