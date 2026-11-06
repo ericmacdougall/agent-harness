@@ -108,5 +108,32 @@ class ViewTests(unittest.TestCase):
         self.assertTrue(out["truncated"])
 
 
+    def test_requirement_free_fields_are_redacted(self):
+        secret = "sk-ant-api03-" + "B" * 40
+        self.wal(S1, [{"at": iso(NOW), "event": "requirement", "id": "w1", "note": "x", "source": "q",
+                       "ticket": "goodqa#1", "owner": "main " + secret, "evidence": ["ok", secret, {"a": 1}]}])
+        out = json.dumps(ah.requirements_view(self.home, S1, now=NOW))
+        self.assertNotIn("BBBBBBBBBBBB", out)
+
+    def test_budget_stops_resolving_inside_one_session(self):
+        rows = [{"at": iso(NOW), "event": "ask", "id": f"a{i}", "note": "n", "reason": "r", "source": "user:x/y \"z\""} for i in range(20)]
+        self.wal(S1, rows)
+        calls = []
+        prov = ah._prov()
+        real = prov.resolve
+        prov.resolve = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+        old, real_ledger = ah.VIEW_BUDGET_S, prov.ledger
+        ah.VIEW_BUDGET_S = 0.05
+        # the budget expires while the session is being read, i.e. inside one session
+        prov.ledger = lambda *a, **k: (__import__("time").sleep(0.15), real_ledger(*a, **k))[1]
+        try:
+            out = ah.asks_view(self.home, S1, now=NOW)
+        finally:
+            ah.VIEW_BUDGET_S = old
+            prov.resolve, prov.ledger = real, real_ledger
+        self.assertEqual(calls, [])
+        self.assertTrue(out["truncated"])
+
+
 if __name__ == "__main__":
     unittest.main()

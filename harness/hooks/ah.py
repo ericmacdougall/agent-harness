@@ -1410,7 +1410,11 @@ def asks_view(home: Path, session=None, every: bool = False, now=None) -> dict:
                 state = "resolved"
             else:
                 src = rec.get("source") or ""
-                res = prov.resolve(src, {"home": home / ".claude", "want_text": True}) if src else None
+                if src and time.monotonic() > deadline:
+                    limited = True  # out of budget: no more resolves; the row is shown as unverified, never as traced
+                    res = None
+                else:
+                    res = prov.resolve(src, {"home": home / ".claude", "want_text": True}) if src else None
                 if res is None or not res.get("ok"):
                     state = "blocked"
                 elif res.get("assumption"):
@@ -1430,6 +1434,16 @@ def asks_view(home: Path, session=None, every: bool = False, now=None) -> dict:
                 "resolved_at": (closed or {}).get("at"),
                 "surfaced_count": rec.get("surfaced_count") if isinstance(rec.get("surfaced_count"), int) else None})
     return {"generated": iso(now), "asks": rows, "total": total, "truncated": limited or total > len(rows)}
+
+
+def _clean_field(value, cap: int = 300):
+    """Redacted, clipped text for a free-form WAL field; anything that is not text or a list of text is dropped."""
+    import redact
+    if isinstance(value, list):
+        value = ", ".join(str(v) for v in value[:10] if isinstance(v, (str, int)))
+    if not isinstance(value, (str, int)):
+        return None
+    return redact.redact(str(value))[:cap] or None
 
 
 def requirements_view(home: Path, session=None, every: bool = False, now=None) -> dict:
@@ -1468,7 +1482,8 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
                 "source": redact.redact(str(rec.get("source") or ""))[:300],
                 "at": rec.get("at") or None, "age_s": int(now - at) if at else None,
                 "state": str(rec.get("state") or "recorded")[:20],
-                "ticket": rec.get("ticket"), "owner": rec.get("owner"), "evidence": rec.get("evidence")})
+                "ticket": _clean_field(rec.get("ticket")), "owner": _clean_field(rec.get("owner")),
+                "evidence": _clean_field(rec.get("evidence"))})
     return {"generated": iso(now), "requirements": rows, "total": total, "truncated": limited or total > len(rows)}
 
 

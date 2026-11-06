@@ -197,24 +197,25 @@ func (a *app) fill(row, m map[string]any, keys []string) {
 	}
 }
 
-func rowsOf(raw []byte, key string) ([]any, int, error) {
+func rowsOf(raw []byte, key string) ([]any, int, bool, error) {
 	var doc map[string]any
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	if err := dec.Decode(&doc); err != nil {
-		return nil, 0, errors.New("ah returned invalid JSON")
+		return nil, 0, false, errors.New("ah returned invalid JSON")
 	}
 	if ok, present := doc["ok"].(bool); present && !ok {
-		return nil, 0, errors.New("ah refused the request")
+		return nil, 0, false, errors.New("ah refused the request")
 	}
 	list, isList := doc[key].([]any)
 	if !isList {
-		return nil, 0, errors.New("ah returned an unexpected shape")
+		return nil, 0, false, errors.New("ah returned an unexpected shape")
 	}
 	total := len(list)
 	if t, ok := doc["total"].(float64); ok && int(t) >= total {
 		total = int(t)
 	}
-	return list, total, nil
+	partial, _ := doc["truncated"].(bool) // ah says its own scan was cut short (time budget or reader limit)
+	return list, total, partial, nil
 }
 
 func (a *app) askSection(ctx context.Context, scope []string, key string, strKeys []string, capN int, extra func(map[string]any, map[string]any)) viewSection {
@@ -223,11 +224,11 @@ func (a *app) askSection(ctx context.Context, scope []string, key string, strKey
 	if err != nil {
 		return unavailable(a.clean(err.Error()))
 	}
-	list, total, err := rowsOf(raw, key)
+	list, total, partial, err := rowsOf(raw, key)
 	if err != nil {
 		return unavailable(err.Error())
 	}
-	sec := viewSection{Rows: []map[string]any{}, Total: total}
+	sec := viewSection{Rows: []map[string]any{}, Total: total, Truncated: partial}
 	for _, item := range list {
 		m, ok := item.(map[string]any)
 		if !ok {
@@ -269,7 +270,7 @@ func (a *app) ownerRows(ctx context.Context, sessions []string) viewSection {
 			raw, err := askCached(ctx, "owners", "--session", s)
 			var list []any
 			if err == nil {
-				list, _, err = rowsOf(raw, "owners")
+				list, _, _, err = rowsOf(raw, "owners")
 			}
 			mu.Lock()
 			defer mu.Unlock()
@@ -320,6 +321,9 @@ func (a *app) ownerRows(ctx context.Context, sessions []string) viewSection {
 	if failed > 0 && len(sec.Rows) == 0 {
 		return unavailable("ah owners failed for every session")
 	}
+	if failed > 0 {
+		sec.Truncated = true // some sessions' owners are missing: say the list is partial
+	}
 	return sec
 }
 
@@ -329,7 +333,7 @@ func (a *app) recentSessions(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	list, _, err := rowsOfKey(raw, "sessions")
+	list, _, _, err := rowsOfKey(raw, "sessions")
 	if err != nil {
 		return nil, err
 	}
@@ -349,7 +353,7 @@ func (a *app) recentSessions(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
-func rowsOfKey(raw []byte, key string) ([]any, int, error) { return rowsOf(raw, key) }
+func rowsOfKey(raw []byte, key string) ([]any, int, bool, error) { return rowsOf(raw, key) }
 
 func (a *app) asksViewHTTP(w http.ResponseWriter, r *http.Request) {
 	session := r.URL.Query().Get("session")

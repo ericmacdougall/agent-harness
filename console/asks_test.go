@@ -234,3 +234,24 @@ func TestAsksRunIsSingleFlightAndFailuresAreBriefCached(t *testing.T) {
 		t.Fatalf("a just-failed run must not be restarted immediately, got %d runs", n)
 	}
 }
+
+func TestAsksViewHonoursAhTruncatedFlag(t *testing.T) {
+	m := happy()
+	m["asks --all"] = `{"asks":[{"id":"wA","state":"open"}],"total":1,"truncated":true}`
+	fakeAh(t, m)
+	_, out := getAsks(t, "")
+	if !strings.Contains(string(out["asks"]), `"truncated":true`) {
+		t.Fatalf("ah's truncated flag must reach the page: %s", out["asks"])
+	}
+}
+
+func TestAsksViewOwnersPartialWhenOneSessionFails(t *testing.T) {
+	m := happy()
+	m["sessions"] = `{"sessions":[{"session":"s1","last_activity":"2999-01-01T00:00:00Z"},{"session":"s2","last_activity":"2999-01-01T00:00:00Z"}]}`
+	m["owners --session s2"] = `garbage`
+	fakeAh(t, m)
+	_, out := getAsks(t, "")
+	if !strings.Contains(string(out["owners"]), `"truncated":true`) || strings.Contains(string(out["owners"]), `"error"`) {
+		t.Fatalf("one failed session must mark owners partial, not unavailable: %s", out["owners"])
+	}
+}
