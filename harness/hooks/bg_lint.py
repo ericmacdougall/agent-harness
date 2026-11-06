@@ -11,6 +11,9 @@ Patterns flagged (see docs/rules/bg-launch.json and tests/data/bg_lint_*.json):
                  is ls, cat or tail: the loop's exit status is then that command's, not the job's.
   pipestatus     PIPESTATUS read after `X=$(a | b)`: it holds the assignment's single status, so a per-stage check
                  written that way can never fail.
+  self-match-pgrep  a while/until loop polling `pgrep -f PATTERN` (or `ps | grep PATTERN` without `grep -v grep`)
+                 whose pattern also occurs in the loop's own shell command line, so it never exits. Suggests the
+                 `[t]sc` bracket trick, a PID wait or an exit file (incident 2026-11-06: 12 h on dev2).
 
 Lint reads stdin once, bounded; any internal error is swallowed (an advisory must not break a tool call).
 Stdlib only; Python 3.9+.
@@ -135,6 +138,44 @@ def find_wait_loop_tail(command, segments):
     return body_last[:60] if first_word(body_last) in TAIL_CMDS else None
 
 
+PGREP_CALL = re.compile(r"(?<![\w./-])pgrep\s+((?:-\S+\s+)*)(?:\"([^\"]*)\"|'([^']*)'|(\$?[^\s;&|)]+))")
+PS_GREP_CALL = re.compile(r"(?<![\w./-])ps\b[^|;&\n]*\|\s*grep\s+((?:-\S+\s+)*)(?:\"([^\"]*)\"|'([^']*)'|([^\s;&|)]+))")
+GREP_V_GREP = re.compile(r"\bgrep\s+(?:-\S+\s+)*-v\s+['\"]?grep\b")
+
+
+def _self_matching(flags, pattern):
+    """True when a full-command-line match on `pattern` also matches the shell running the loop: the loop's own
+    `bash -c '... pgrep -f PATTERN ...'` argv contains the pattern verbatim unless it uses the `[t]sc` trick."""
+    if not pattern or pattern.startswith("$") or pattern.startswith("["):
+        return False  # a variable or the bracket trick: cannot tell, or deliberately excluded
+    return "x" not in flags  # -x needs the whole line to equal the pattern, which the loop's shell line never does
+
+
+def find_self_matching_wait(segments):
+    """A while/until loop that polls `pgrep -f PATTERN` or `ps | grep PATTERN` with a pattern that occurs in the
+    loop's own command line (incident 2026-11-06: `while pgrep -f "tsc --noEmit"` ran 12 h on dev2 because it
+    matched the ssh'd bash that ran the loop)."""
+    texts = [t for _, t in segments]
+    loop_head = next((i for i, t in enumerate(texts) if LOOP_START.match(t)), None)
+    last_done = max((i for i, t in enumerate(texts) if first_word(t) == "done"), default=None)
+    if loop_head is None or last_done is None or last_done < loop_head:
+        return None
+    body = " ".join(f"{op} {t}" for op, t in segments[loop_head:last_done + 1])  # keep `|` so ps | grep is visible
+    for m in PGREP_CALL.finditer(body):
+        flags = "".join(f for f in m.group(1).split() if f.startswith("-") and not f.startswith("--"))
+        full = "f" in flags or "--full" in m.group(1)
+        pattern = m.group(2) or m.group(3) or m.group(4) or ""
+        if full and _self_matching(flags, pattern):
+            return "pgrep -f " + pattern[:40], "[%s]%s" % (pattern[0], pattern[1:40]) if pattern[0].isalnum() else "[t]sc ..."
+    if not GREP_V_GREP.search(body):
+        for m in PS_GREP_CALL.finditer(body):
+            flags = "".join(f for f in m.group(1).split() if f.startswith("-") and not f.startswith("--"))
+            pattern = m.group(2) or m.group(3) or m.group(4) or ""
+            if "v" not in flags and _self_matching(flags, pattern):
+                return "ps | grep " + pattern[:40], "[%s]%s" % (pattern[0], pattern[1:40]) if pattern[0].isalnum() else "[v]itest ..."
+    return None
+
+
 MAX_SUBST_SCAN = 4096
 MAX_SUBST_MATCHES = 200
 
@@ -197,6 +238,13 @@ def lint(command, _depth=0):
     if hit:
         out.append(("wait-loop-tail", "This wait/poll loop ends with `%s`; the loop's exit status is that command's, "
                                       "not the job's, so a failed job can look like success. %s" % (hit, SAFE)))
+    hit = find_self_matching_wait(segments)
+    if hit:
+        out.append(("self-match-pgrep", "This wait loop polls `%s`, and that pattern also occurs in the command line "
+                                        "of the shell running the loop, so the match never goes away and the loop "
+                                        "never exits (one ran 12 h on dev2). Use the bracket trick (`%s`), wait on a "
+                                        "PID (`kill -0 $PID` or `bg_job.py wait`), or poll for an exit file written "
+                                        "by the job (`cmd; echo $? > done.txt`)." % hit))
     hit = find_pipestatus_after_substitution(command)
     if hit:
         out.append(("pipestatus", "PIPESTATUS is read after a command-substitution assignment (`%s`); it holds only "
