@@ -870,6 +870,21 @@ class Round3N2Answer(NoBackupCase):
             answers={qa: 'Delete', qb: 'Move it to Dropbox first'})
         self.refused(b, 'single question', source='answer:sess-1/%s' % uid, resolver=None)
 
+    def test_two_questions_one_answer_refused(self):
+        b = self.image('b.dmg')
+        qb, qx = 'Delete %s without a backup?' % b, 'Anything else to clean?'
+        opts = [{'label': 'Delete, no backup', 'description': 'd'}, {'label': 'Leave it', 'description': 'k'}]
+        uid = transcript(self.home / '.claude', 'sess-1', '', questions=[
+            {'question': qb, 'header': 'B', 'multiSelect': False, 'options': opts},
+            {'question': qx, 'header': 'X', 'multiSelect': False, 'options': opts}],
+            answers={qb: 'Delete, no backup'})
+        self.refused(b, 'single question', source='answer:sess-1/%s' % uid, resolver=None)
+
+    def test_delete_must_lead_the_selected_option(self):
+        path = self.image()
+        src = self.real(path, answer='Please delete it', options=('Please delete it', 'Leave it'))
+        self.refused(path, 'does not say delete', source=src, resolver=None)
+
     def test_multi_select_refused(self):
         path = self.image()
         src = self.real(path, multi=True)
