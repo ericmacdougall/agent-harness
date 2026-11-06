@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
@@ -35,14 +36,26 @@ var (
 	// asksRun runs ah and returns bounded stdout; tests replace it.
 	asksRun = runAh
 
-	asksMu    sync.Mutex
-	asksCache = map[string]asksCacheEntry{}
+	asksMu     sync.Mutex
+	asksCache  = map[string]asksCacheEntry{}
+	asksFlight = map[string]*asksCall{}
 )
 
 type asksCacheEntry struct {
 	at  time.Time
 	out []byte
+	err error
 }
+
+// asksCall is one in-flight ah run shared by every concurrent caller of the same command (single-flight).
+type asksCall struct {
+	done chan struct{}
+	out  []byte
+	err  error
+}
+
+// asksFailTTL keeps a failed run briefly so a slow or broken ah is not restarted on every poll.
+const asksFailTTL = 5 * time.Second
 
 func asksCacheReset() {
 	asksMu.Lock()
@@ -90,30 +103,43 @@ func runAh(ctx context.Context, args ...string) ([]byte, error) {
 }
 
 func askCached(ctx context.Context, args ...string) ([]byte, error) {
-	key := string(bytes.Join(func() [][]byte {
-		b := make([][]byte, len(args))
-		for i, a := range args {
-			b[i] = []byte(a)
+	key := strings.Join(args, "\x00")
+	asksMu.Lock()
+	if e, ok := asksCache[key]; ok {
+		ttl := asksCacheTTL
+		if e.err != nil {
+			ttl = asksFailTTL
 		}
-		return b
-	}(), []byte{0}))
-	asksMu.Lock()
-	if e, ok := asksCache[key]; ok && time.Since(e.at) < asksCacheTTL {
+		if time.Since(e.at) < ttl {
+			asksMu.Unlock()
+			return e.out, e.err
+		}
+	}
+	if c, ok := asksFlight[key]; ok {
 		asksMu.Unlock()
-		return e.out, nil
+		select {
+		case <-c.done:
+			return c.out, c.err
+		case <-ctx.Done():
+			return nil, errors.New("request cancelled")
+		}
 	}
+	c := &asksCall{done: make(chan struct{})}
+	asksFlight[key] = c
 	asksMu.Unlock()
-	out, err := asksRun(ctx, args...)
-	if err != nil {
-		return nil, err
-	}
+	// The run is detached from this request so a closed tab does not abort work other callers share.
+	c.out, c.err = asksRun(context.WithoutCancel(ctx), args...)
 	asksMu.Lock()
+	delete(asksFlight, key)
 	if len(asksCache) > 64 {
 		asksCache = map[string]asksCacheEntry{}
 	}
-	asksCache[key] = asksCacheEntry{at: time.Now(), out: out}
+	if asksCacheTTL > 0 || c.err != nil {
+		asksCache[key] = asksCacheEntry{at: time.Now(), out: c.out, err: c.err}
+	}
 	asksMu.Unlock()
-	return out, nil
+	close(c.done)
+	return c.out, c.err
 }
 
 type viewSection struct {

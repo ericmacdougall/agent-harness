@@ -84,5 +84,29 @@ class ViewTests(unittest.TestCase):
             ah.asks_view(self.home, "../x", now=NOW)
 
 
+    def test_naive_timestamp_is_utc_and_idless_requirement_not_counted(self):
+        self.assertEqual(ah._epoch("2026-11-05T00:00:00"), ah._epoch("2026-11-05T00:00:00Z"))
+        self.wal(S1, [{"at": iso(NOW), "event": "requirement", "id": "", "note": "x", "source": "q"},
+                      {"at": iso(NOW), "event": "requirement", "id": "wOK", "note": "x", "source": "q"}])
+        out = ah.requirements_view(self.home, S1, now=NOW)
+        self.assertEqual((out["total"], out["truncated"]), (1, False))
+
+    def test_asks_flagged_truncated_when_reader_limit_is_hit(self):
+        n = ah._prov().MAX_HITS + 5
+        rows = [{"at": iso(NOW), "event": "ask", "id": f"a{i}", "note": "n", "reason": "r", "source": ""} for i in range(n)]
+        self.wal(S1, rows)
+        self.assertTrue(ah.asks_view(self.home, S1, now=NOW)["truncated"])
+
+    def test_view_stops_at_time_budget_and_says_truncated(self):
+        self.wal(S1, [{"at": iso(NOW), "event": "requirement", "id": "w1", "note": "x", "source": "q"}])
+        old = ah.VIEW_BUDGET_S
+        ah.VIEW_BUDGET_S = -1
+        try:
+            out = ah.requirements_view(self.home, every=True, now=NOW)
+        finally:
+            ah.VIEW_BUDGET_S = old
+        self.assertTrue(out["truncated"])
+
+
 if __name__ == "__main__":
     unittest.main()

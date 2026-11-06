@@ -1338,6 +1338,7 @@ def ahd_running_check(home: Path, now: float | None = None, max_beat_age: float 
 
 STALE_ASK_S = 24 * 3600
 VIEW_ROW_CAP = 2000
+VIEW_BUDGET_S = 8.0  # wall-clock budget per view; newest sessions first, then say truncated
 
 
 def _view_sessions(home: Path, session, every: bool) -> list:
@@ -1369,7 +1370,8 @@ def sessions_view(home: Path) -> dict:
 
 def _epoch(text):
     try:
-        return dt.datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
+        t = dt.datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+        return (t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)).timestamp()  # naive stamps are UTC, as in parse_ts
     except (ValueError, TypeError):
         return None
 
@@ -1379,14 +1381,25 @@ def asks_view(home: Path, session=None, every: bool = False, now=None) -> dict:
     import redact
     prov = _prov()
     now = time.time() if now is None else now
-    rows, total = [], 0
+    rows, total, limited = [], 0, False
+    deadline = time.monotonic() + VIEW_BUDGET_S
     for s in _view_sessions(home, session, every):
+        if time.monotonic() > deadline:
+            limited = True
+            break
         try:
             records = prov.ledger(s, home / ".claude")
         except Exception:  # one unreadable session must not hide the others
             continue
+        per_wal = {}
+        for rec in records:
+            per_wal[rec["_wal"]] = per_wal.get(rec["_wal"], 0) + 1
+        # the shared reader reads at most MAX_HITS ask and MAX_HITS ask_resolved lines per WAL: later ones are unseen
+        limited = limited or any(n >= prov.MAX_HITS for n in per_wal.values())
         for rec in records:
             total += 1
+            if time.monotonic() > deadline:
+                limited = True
             if len(rows) >= VIEW_ROW_CAP:
                 continue
             closed = rec.get("_closed")
@@ -1416,7 +1429,7 @@ def asks_view(home: Path, session=None, every: bool = False, now=None) -> dict:
                 "at": rec.get("at") or None, "age_s": age, "state": state,
                 "resolved_at": (closed or {}).get("at"),
                 "surfaced_count": rec.get("surfaced_count") if isinstance(rec.get("surfaced_count"), int) else None})
-    return {"generated": iso(now), "asks": rows, "total": total, "truncated": total > len(rows)}
+    return {"generated": iso(now), "asks": rows, "total": total, "truncated": limited or total > len(rows)}
 
 
 def requirements_view(home: Path, session=None, every: bool = False, now=None) -> dict:
@@ -1425,7 +1438,11 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
     prov = _prov()
     now = time.time() if now is None else now
     rows, total, limited = [], 0, False
+    deadline = time.monotonic() + VIEW_BUDGET_S
     for s in _view_sessions(home, session, every):
+        if time.monotonic() > deadline:
+            limited = True
+            break
         path = wal_dirs(home) / s / "main.jsonl"
         try:
             lines = list(prov._lines_containing(path, b'"event":"requirement"'))
@@ -1439,7 +1456,7 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
                 rec = prov.loads_line(line)
             except ValueError:
                 continue
-            if not isinstance(rec, dict) or rec.get("event") != "requirement":
+            if not isinstance(rec, dict) or rec.get("event") != "requirement" or not isinstance(rec.get("id"), str) or not rec["id"]:
                 continue
             total += 1
             if len(rows) >= VIEW_ROW_CAP:

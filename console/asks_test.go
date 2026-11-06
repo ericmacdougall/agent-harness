@@ -204,3 +204,33 @@ func TestAsksRunTimesOutAndCapsOutput(t *testing.T) {
 		t.Fatal("a hung ah must time out")
 	}
 }
+
+func TestAsksRunIsSingleFlightAndFailuresAreBriefCached(t *testing.T) {
+	old, oldTTL := asksRun, asksCacheTTL
+	asksCacheTTL = time.Second
+	asksCacheReset()
+	defer func() { asksRun, asksCacheTTL = old, oldTTL; asksCacheReset() }()
+	var calls int32
+	release := make(chan struct{})
+	asksRun = func(ctx context.Context, args ...string) ([]byte, error) {
+		atomic.AddInt32(&calls, 1)
+		<-release
+		return nil, errors.New("slow ah failed")
+	}
+	done := make(chan struct{}, 4)
+	for i := 0; i < 4; i++ {
+		go func() { _, _ = askCached(context.Background(), "asks", "--all"); done <- struct{}{} }()
+	}
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	for i := 0; i < 4; i++ {
+		<-done
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("concurrent callers must share one ah run, got %d", n)
+	}
+	_, _ = askCached(context.Background(), "asks", "--all")
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("a just-failed run must not be restarted immediately, got %d runs", n)
+	}
+}

@@ -44,7 +44,7 @@ export function sortRows(tab, rows) {
 export function openAsksView({ api, el }) {
   const dialog = document.querySelector('#asks-dialog');
   const body = dialog.querySelector('#asks-content');
-  const view = { tab: 'asks', data: null, session: 'all', state: { asks: 'all', owners: 'attention', requirements: 'all' }, age: 'any', text: '', shown: PAGE, generation: 0, timer: 0 };
+  const view = { tab: 'asks', data: null, session: 'all', state: { asks: 'all', owners: 'attention', requirements: 'all' }, age: 'any', text: '', shown: PAGE, generation: 0, timer: 0, closed: false, seen: new Set() };
 
   function shell() {
     body.replaceChildren();
@@ -164,7 +164,7 @@ export function openAsksView({ api, el }) {
     fillSelect(stateSelect, stateOptions());
     if (![...stateSelect.options].some(o => o.value === view.state[view.tab])) view.state[view.tab] = 'all';
     stateSelect.value = view.state[view.tab];
-    const sessions = new Set();
+    const sessions = view.seen;
     for (const [id] of TABS) for (const r of (view.data?.[id]?.rows || [])) if (r.session) sessions.add(r.session);
     const sessionSelect = body.querySelector('#asks-session');
     fillSelect(sessionSelect, [['all', 'All sessions'], ...[...sessions].sort().map(s => [s, `${s.slice(0, 8)}…`])]);
@@ -271,16 +271,19 @@ export function openAsksView({ api, el }) {
     }
   }
 
+  const token = {};
+  view.token = token;
   function tick() {
     view.timer = window.setTimeout(async () => {
-      if (!dialog.open) return;
+      if (!dialog.open || view.token !== token || view.closed) return;
       if (!document.hidden) await refresh(false);
+      if (!dialog.open || view.token !== token || view.closed) return;
       tick();
     }, REFRESH_MS);
   }
 
   shell();
-  dialog.onclose = () => { view.generation++; window.clearTimeout(view.timer); };
+  dialog.onclose = () => { view.closed = true; view.generation++; window.clearTimeout(view.timer); };
   if (!dialog.open) dialog.showModal();
   refresh(true);
   tick();
