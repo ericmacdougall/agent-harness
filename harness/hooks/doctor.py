@@ -246,6 +246,32 @@ def rules_report(rules: list[dict], findings: list[dict], hooks_dir: Path) -> li
     return rows
 
 
+def route_auth(hosts: list[str], runner=None) -> list[dict]:
+    """Is claude (and codex when present) logged in on each route host? Read-only `auth status` over ssh, bounded."""
+    runner = runner or (lambda host, cmd: subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "--", host, cmd],
+                                                         capture_output=True, text=True, timeout=25))
+    rows = []
+    for host in hosts:
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,60}", host):
+            rows.append({"host": host, "tool": "-", "state": "BAD-HOST", "detail": "not a plain host name"})
+            continue
+        for tool, cmd in (("claude", "bash -lc 'command -v claude >/dev/null && claude auth status 2>&1 | head -8'"),
+                          ("codex", "bash -lc 'command -v codex >/dev/null && codex login status 2>&1 | head -3'")):
+            try:
+                done = runner(host, cmd)
+                out = (done.stdout or "")
+            except (OSError, subprocess.SubprocessError) as exc:
+                rows.append({"host": host, "tool": tool, "state": "UNREACHABLE", "detail": type(exc).__name__})
+                continue
+            if not out.strip():
+                rows.append({"host": host, "tool": tool, "state": "MISSING", "detail": f"{tool} is not installed"})
+            elif re.search(r'"loggedIn"\s*:\s*true|logged in', out, re.I) and not re.search(r'"loggedIn"\s*:\s*false|not logged', out, re.I):
+                rows.append({"host": host, "tool": tool, "state": "AUTHENTICATED", "detail": ""})
+            else:
+                rows.append({"host": host, "tool": tool, "state": "NOT-LOGGED-IN", "detail": out.strip().splitlines()[0][:80]})
+    return rows
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -256,12 +282,21 @@ def main(argv=None) -> int:
     c.add_argument("--ssh")
     c.add_argument("--no-canary", action="store_true")
     c.add_argument("--json", action="store_true")
+    ra = sub.add_parser("route-auth", help="flag a route host whose claude/codex is not authenticated")
+    ra.add_argument("hosts", nargs="*", default=["dev2", "t2-dev"])
+    ra.add_argument("--json", action="store_true")
     r = sub.add_parser("rules-report")
     r.add_argument("--settings", default="~/.claude/settings.json")
     r.add_argument("--hooks-dir", default="~/.claude/hooks")
     r.add_argument("--canary", action="store_true", help="also run canaries (default: wiring only)")
     r.add_argument("--fail-on-p0", action="store_true", help="exit 1 when any P0 rule is not ENFORCED/PARTIAL")
     a = ap.parse_args(argv)
+    if a.cmd == "route-auth":
+        rows = route_auth(a.hosts)
+        for row in rows:
+            print(json.dumps(row) if a.json else f"{row['state']:14} {row['host']:10} {row['tool']:7} {row['detail']}")
+        return 1 if any(x["state"] in ("NOT-LOGGED-IN", "UNREACHABLE", "BAD-HOST") or (x["state"] == "MISSING" and x["tool"] == "claude")
+                        for x in rows) else 0
     try:
         manifest = load_json(MANIFEST)
     except (OSError, ValueError) as exc:

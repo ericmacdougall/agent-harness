@@ -1367,21 +1367,43 @@ def routed(text: str) -> str:
     return text.replace("ssh dev2 ", f"ssh {route_host()} ")
 
 
-def exact_route(segment, cwd):
+def claude_route_host() -> str:
+    """Host for headless claude/codex work. Default dev2: the claude CLI on t2-dev is not logged in (known gap,
+    goodqa#14817), so `claude -p` must not be routed there. Override: HARNESS_CLAUDE_ROUTE_HOST or
+    heavy_job_guard.json "claude_route_host"; `doctor.py route-auth` flags a host whose claude is not authenticated."""
+    value = os.environ.get("HARNESS_CLAUDE_ROUTE_HOST", "")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,60}", value):
+        value = ""
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
+            if os.path.exists(path):
+                candidate = str(load_json_file(path).get("claude_route_host", ""))
+                value = candidate if re.fullmatch(r"[A-Za-z0-9._-]{1,60}", candidate) else ""
+        except Exception:
+            value = ""
+    return value or "dev2"
+
+
+def exact_route(segment, cwd, rule=None):
     """The same command on the routed host: `ah run --host H -- CMD` (ah run lands with goodqa#14548) and the ssh form."""
     import shlex
-    host = route_host()
+    claude_work = rule == "fan-out" and bool(re.search(r"\bclaude\b", segment or ""))
+    host = claude_route_host() if claude_work else route_host()
     text = " ".join((segment or "").split())[:400]
     if not text:
         return ""
     inner = f"cd {shlex.quote(cwd)} && {text}" if cwd else text
     return (f"Exact equivalent on {host}:\n  python3 ~/.claude/hooks/ah.py run --host {host} -- {text}\n"
-            f"  (until ah run is installed)  ssh {host} {shlex.quote(inner)}")
+            f"  (until ah run is installed)  ssh {host} {shlex.quote(inner)}"
+            + (f"\n  Note: claude on t2-dev is not logged in (known gap), so headless claude goes to {host} until dev2 retires on 11-09."
+               if claude_work else ""))
 
 
 def deny_message(rule, detail, hatch, capped, segment=None, cwd=None):
     base_msg = routed(_deny_message(rule, detail, hatch, capped))
-    extra = exact_route(segment, cwd) if rule not in NEVER_BLOCK else ""
+    if rule == "fan-out" and re.search(r"\bclaude\b", (segment or "") + detail):
+        base_msg = base_msg.replace(f"ssh {route_host()} ", f"ssh {claude_route_host()} ")  # claude is not logged in on t2-dev
+    extra = exact_route(segment, cwd, rule) if rule not in NEVER_BLOCK else ""
     return base_msg + ("\n" + extra if extra else "")
 
 

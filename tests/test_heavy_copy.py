@@ -229,8 +229,11 @@ class HeavyCommandFamilies(unittest.TestCase):
             with self.subTest(command=command):
                 result = guard.decide(command, "/Users/eric/proj", MODES)
                 self.assertEqual((result["action"], result["rule"]), ("deny", rule), result)
-                self.assertIn("ah.py run --host t2-dev --", result["message"])
-                self.assertIn("ssh t2-dev ", result["message"])
+                host = "dev2" if "claude" in command else "t2-dev"  # claude is not logged in on t2-dev
+                self.assertIn(f"ah.py run --host {host} --", result["message"])
+                self.assertIn(f"ssh {host} ", result["message"])
+                if host == "dev2":
+                    self.assertNotIn("ssh t2-dev ", result["message"])
 
     def test_quick_forms_stay_allowed(self):
         for command in self.ALLOWED:
@@ -241,6 +244,31 @@ class HeavyCommandFamilies(unittest.TestCase):
         message = guard.decide("pnpm install --frozen-lockfile", "/Users/eric/proj", MODES)["message"]
         self.assertIn("ah.py run --host t2-dev -- pnpm install --frozen-lockfile", message)
         self.assertIn("cd /Users/eric/proj && pnpm install --frozen-lockfile", message)
+
+
+class ClaudeRouteAndAuth(unittest.TestCase):
+    def test_claude_fanout_routes_to_dev2_with_the_reason_not_to_t2_dev(self):
+        message = guard.decide('for f in a b c; do claude -p "x $f" & done', "/Users/eric/p", MODES)["message"]
+        self.assertIn("ah.py run --host dev2 --", message)
+        self.assertIn("ssh dev2 ", message)
+        self.assertNotIn("--host t2-dev", message)
+        self.assertIn("not logged in", message)
+        self.assertIn("--host t2-dev -- pnpm install", guard.decide("pnpm install", "/Users/eric/p", MODES)["message"])
+        with mock.patch.dict(os.environ, {"HARNESS_CLAUDE_ROUTE_HOST": "t2-dev"}):
+            self.assertIn("--host t2-dev", guard.decide("ls | xargs -P8 -n1 claude -p", "/x", MODES)["message"])
+
+    def test_doctor_flags_a_route_host_whose_claude_is_not_logged_in(self):
+        import doctor
+        outputs = {("dev2", "claude"): '{"loggedIn": true}', ("t2-dev", "claude"): '{"loggedIn": false, "authMethod": "none"}',
+                   ("dev2", "codex"): "Logged in using ChatGPT", ("t2-dev", "codex"): ""}
+
+        def runner(host, cmd):
+            tool = "claude" if "claude" in cmd else "codex"
+            return mock.Mock(stdout=outputs[(host, tool)])
+        rows = {(r["host"], r["tool"]): r["state"] for r in doctor.route_auth(["dev2", "t2-dev"], runner)}
+        self.assertEqual(rows, {("dev2", "claude"): "AUTHENTICATED", ("t2-dev", "claude"): "NOT-LOGGED-IN",
+                                ("dev2", "codex"): "AUTHENTICATED", ("t2-dev", "codex"): "MISSING"})
+        self.assertEqual(doctor.route_auth(["bad host;x"], runner)[0]["state"], "BAD-HOST")
 
 
 class RunGates(unittest.TestCase):
