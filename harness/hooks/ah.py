@@ -31,6 +31,13 @@ TICKET_RE = re.compile(r"^GoodQA\s+(?:([a-z0-9][a-z0-9-]{0,62})\s*)?#([1-9]\d{0,
 KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 ASK_ID_RE = re.compile(r"^w[0-9a-f]{11}$")
 OWNER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# ahd's writes (goodqa#14848): heartbeat beat, alert raise|clear, apply --batch
+SERVICE_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")  # a heartbeat service names a directory: no paths
+ALERT_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._/@-]{0,199}$")
+ALERT_SEVERITIES = ("info", "warning", "high", "critical")  # = ops_watch.SEVERITIES
+APPLY_OPS = ("alert.raise", "alert.clear")  # the only ops `ah apply --batch` accepts
+APPLY_MAX_LINES = 200
+APPLY_MAX_BYTES = 1024 * 1024
 TASK_WAL_WINDOW_S = 48 * 3600  # a task-named WAL untouched this long is history (ahd owner_window_seconds)
 WRAPPER = re.compile(r"^\s*<[A-Za-z][\w-]*[\s>/]")
 MAX_REQUEST = 256 * 1024
@@ -821,6 +828,16 @@ def precheck(op: str, args: dict) -> None:
                 (re.fullmatch(r"[0-9a-f]{7,40}", str(e.get("commit", ""))) and e.get("repo")))
             if not ok:
                 raise AhError("evidence", "each evidence item is {really_tested, wal} or {commit, repo}")
+    elif op in ("alert.raise", "alert.clear"):
+        need("alert_key", "source")
+        if not ALERT_KEY_RE.match(args["alert_key"]) or not SERVICE_RE.match(args["source"]):
+            raise AhError("bad_request", f"{op}: alert_key or source is malformed")
+        if op == "alert.raise":
+            need("message")
+            if args.get("severity") not in ALERT_SEVERITIES:
+                raise AhError("bad_request", f"alert.raise: severity must be one of {', '.join(ALERT_SEVERITIES)}")
+        if not isinstance(args.get("detail", {}), dict):
+            raise AhError("bad_request", f"{op}: detail must be a JSON object")
     elif op == "task.dispose":
         need("agent", "session", "kind", "at")
         if args["kind"] not in liveness.DISPOSITIONS:
@@ -1113,6 +1130,15 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         out["wal"] = wid
     elif op == "ticket.comment":
         comment(args["ticket"], args["body"])
+    elif op in ("alert.raise", "alert.clear"):
+        # The ops-watch ring is the one alert channel (goodqa#14591); emit() redacts and fsyncs. host is the short
+        # hostname, as ahd.host(), because ahd diffs its desired alerts against this host's ring entries.
+        import ops_watch  # noqa: PLC0415
+        kind = op.split(".", 1)[1]
+        out["ring_seq"] = ops_watch.emit({
+            "host": socket.gethostname().split(".")[0], "source": args["source"], "event": kind,
+            "severity": args.get("severity") or "info", "key": args["alert_key"], "check": args["source"],
+            "message": args.get("message") or "cleared", "detail": args.get("detail") or {}}, home=home)
     elif op == "task.dispose":
         main_wal = _wal_path(home, args["session"], "main")
         if not main_wal.is_file():
@@ -1322,6 +1348,56 @@ def doctor() -> dict:
         running = dict(running, ok=True, expected=False)
     checks.append(running)
     return {"ok": all(c["ok"] for c in checks), "checks": checks}
+
+
+def heartbeat_beat(home: Path, service: str, key: str | None = None) -> dict:
+    """Write ~/.agent-harness/state/<service>/heartbeat.json (atomic replace, 0600). Deliberately not ledgered: ahd
+    beats once a minute on every host, and the file's mtime is what ahd_running_check and the deadman read."""
+    if not isinstance(service, str) or not SERVICE_RE.match(service):
+        raise AhError("bad_request", "heartbeat beat: --service must be lowercase letters, digits and dashes")
+    if key is not None and not KEY_RE.match(key):
+        raise AhError("bad_request", "idempotency key must be 8-128 chars of [A-Za-z0-9._:-]")
+    d = home / ".agent-harness" / "state" / service
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    at = iso(time.time())
+    body = json.dumps({"service": service, "host": socket.gethostname().split(".")[0], "at": at,
+                       "pid": os.getppid(), "key": key}, sort_keys=True) + "\n"
+    tmp = d / f".heartbeat.{os.getpid()}.tmp"
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        os.write(fd, body.encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, d / "heartbeat.json")
+    return {"ok": True, "result": "applied", "service": service, "at": at}
+
+
+def apply_batch(home: Path, text: str, session) -> dict:
+    """`ah apply --batch -`: JSON lines {"op", "key", "args"} as ahd.send builds them. Only APPLY_OPS. Every line is
+    parsed and prechecked before any is written, so a bad line rejects the batch with nothing applied; each line
+    then goes through write(), so a replay of the same keys after a kill mid-tick reports duplicates."""
+    if len(text.encode("utf-8", "replace")) > APPLY_MAX_BYTES:
+        raise AhError("bad_request", f"apply: batch over {APPLY_MAX_BYTES} bytes")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines or len(lines) > APPLY_MAX_LINES:
+        raise AhError("bad_request", f"apply: a batch holds 1-{APPLY_MAX_LINES} lines")
+    plan = []
+    for n, ln in enumerate(lines, 1):
+        try:
+            row = json.loads(ln)
+        except ValueError:
+            raise AhError("bad_request", f"apply: line {n} is not JSON")
+        if not isinstance(row, dict) or row.get("op") not in APPLY_OPS or not isinstance(row.get("args"), dict) \
+                or not isinstance(row.get("key"), str) or not KEY_RE.match(row["key"]):
+            raise AhError("bad_request", f"apply: line {n} must be {{op: {'|'.join(APPLY_OPS)}, key, args}}")
+        precheck(row["op"], row["args"])
+        plan.append(row)
+    counts = {"applied": 0, "duplicate": 0}
+    for row in plan:
+        res = write(home, row["op"], row["args"], session, row["key"])
+        counts[res.get("result", "applied")] = counts.get(res.get("result", "applied"), 0) + 1
+    return dict({"ok": True, "lines": len(plan)}, **counts)
 
 
 def ahd_running_check(home: Path, now: float | None = None, max_beat_age: float = 300.0) -> dict:
@@ -1585,6 +1661,22 @@ def build_parser():
     sub.add_parser("doctor", help="check the import chain and file hashes of this install")
     sp = sub.add_parser("spool")
     sp.add_argument("action", choices=["drain"])
+    hb = sub.add_parser("heartbeat", help="record a service heartbeat (ahd, goodqa#14848)")
+    hb.add_argument("action", choices=["beat"])
+    hb.add_argument("--service", required=True)
+    hb.add_argument("--key")
+    al = sub.add_parser("alert", help="raise or clear an alert in the ops-watch ring (ahd, goodqa#14848)")
+    al.add_argument("action", choices=["raise", "clear"])
+    al.add_argument("--alert-key", required=True)
+    al.add_argument("--source", required=True)
+    al.add_argument("--key")
+    al.add_argument("--severity")
+    al.add_argument("--message")
+    al.add_argument("--detail", help="JSON object")
+    al.add_argument("--session")
+    ap = sub.add_parser("apply", help="apply a batch of alert ops from stdin (JSON lines)")
+    ap.add_argument("--batch", required=True, choices=["-"])
+    ap.add_argument("--session")
     w = sub.add_parser("write")
     ws = w.add_subparsers(dest="sub", required=True)
     wr = ws.add_parser("result")
@@ -1670,6 +1762,20 @@ def run(args, home: Path) -> dict:
         return doctor()
     if cmd == "spool":
         return spool_drain(home)
+    if cmd == "heartbeat":
+        return heartbeat_beat(home, args.service, args.key)
+    if cmd == "alert":
+        a = {"alert_key": args.alert_key, "source": args.source}
+        if args.action == "raise":
+            a.update(severity=args.severity or "", message=args.message or "")
+        if args.detail is not None:
+            try:
+                a["detail"] = json.loads(args.detail)
+            except ValueError:
+                raise AhError("bad_request", "alert: --detail must be a JSON object")
+        return write(home, f"alert.{args.action}", a, session_of(args, home), args.key)
+    if cmd == "apply":
+        return apply_batch(home, sys.stdin.read(APPLY_MAX_BYTES + 1), session_of(args, home))
     if cmd == "write":
         for row in _ledger(home):
             if row.get("key") == args.key:
