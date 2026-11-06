@@ -495,6 +495,32 @@ python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal path> --
 
 The approval is single use, signed with a local key and bound to the exact realpath, device, inode and a stat manifest. The hook consumes it under a lock, so of two commands racing for one approval exactly one runs. Every approval, refusal and use goes to `~/.agent-harness/state/log-delete-audit.jsonl` and to the WAL; report it in the ticket status. `revoke-delete` removes every approval.
 
+### Deleting disposable copies without a backup (goodqa#14911)
+
+When the user approves deleting something without a backup, in their own turn or an AskUserQuestion answer, cite that turn:
+
+```bash
+python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal path> --no-backup \
+  --user-source answer:<session>/<uuid> --wal <WAL path> [--ttl S]
+```
+
+Only two kinds of target qualify, and only when deleting them loses nothing:
+
+- **The top of a git working tree.** Every file must be committed, with no changed, untracked or ignored file. There must be no stash, no linked worktree, and no local commit missing from a remote-tracking ref. `git ls-remote` must also confirm that the remote's branch tip equals a tracking ref that contains HEAD. If the remote has moved on since the last fetch, run `git fetch` first.
+- **A disk image** (`.sparseimage`, `.dmg` or `.sparsebundle`) that `hdiutil info` does not list as attached.
+
+The route refuses in these cases:
+
+- the cited turn does not resolve to a real human turn or answer (`provenance.user_turn` / `answer_turn`), or is more than 24 hours old;
+- the same source has already approved 4 paths;
+- the path is a log, WAL, transcript or approval state (always refused, with no override), a harness root or one of its parents, or a top-level directory;
+- the path uses a glob or variable, is relative, or goes through a symlink or `..`;
+- the TTL is above 3600 s.
+
+Repository config cannot run anything during the checks: fsmonitor, hooks, the ext transport, ssh command, credential helper and pager are all switched off.
+
+The approval is single use and MAC-signed. It is bound to the exact path and its inode, and is recorded in the audit log and the WAL with the user source and expiry. The hook checks the state again at delete time: HEAD and clean status for a git tree, or size, mtime and attach state for an image. A change in between voids the approval.
+
 ### Commands
 
 | Command | Purpose |
