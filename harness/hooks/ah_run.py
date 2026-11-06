@@ -2130,6 +2130,28 @@ def _wrapper_step(base, values, raws, k):
     return _wrapper_scan(base, values, raws, k)[0]
 
 
+class _WordValues:
+    """The unquoted value of each raw word, worked out only when asked for: a peel step reads a few words at the front,
+    and unquoting every word of a 64 KiB command at every step cost most of the deny-form time (r9e F4)."""
+
+    def __init__(self, raws):
+        self.raws, self.cache = raws, {}
+
+    def __len__(self):
+        return len(self.raws)
+
+    def __getitem__(self, index):
+        if not isinstance(index, int):
+            raise TypeError('word values are read one index at a time')
+        if index < 0:
+            index += len(self.raws)
+        if not 0 <= index < len(self.raws):
+            raise IndexError(index)
+        if index not in self.cache:
+            self.cache[index] = raw_words(self.raws[index])[0][1]
+        return self.cache[index]
+
+
 def peel_wrapper(text, fold=True, run=False):
     """The command with its first wrapper removed (an env assignment or anything _wrapper_step reads), or None when it starts
     with no wrapper. `env -S` gives back its split string as the command. The wrapper's name is read folded unless fold is
@@ -2139,7 +2161,7 @@ def peel_wrapper(text, fold=True, run=False):
         if not spans:
             return None
         raws = [text[start:end] for start, end in spans]
-        values = [raw_words(raw)[0][1] for raw in raws]
+        values = _WordValues(raws)
         count = len(spans)
         if ASSIGNMENT.match(raws[0]):
             k = 1
