@@ -63,7 +63,8 @@ MAX_SEGMENT_WORDS = 8192  # words in one shell command; bounds the quadratic wra
 MAX_NESTED_SECONDS = 0.4  # wall-clock budget per decision for nested scans and uncertain-wrapper probes
 MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 DEFAULT_MODES = {"browser": "enforce", "adversarial": "warn", "full-suite": "enforce",
-                 "build": "enforce", "media": "warn", "fan-out": "warn", "oversize": "enforce", "copy": "enforce"}
+                 "build": "enforce", "media": "warn", "fan-out": "enforce", "oversize": "enforce", "copy": "enforce",
+                 "install": "enforce", "replay": "enforce", "container": "enforce"}
 CAPPED_RULES = {"browser", "media", "fan-out"}  # memory hogs: hatch alone is not enough
 NEVER_BLOCK = {"adversarial"}  # red-team/fuzz work is legitimate: advise (dev2, group cleanup), never deny
 HATCH = "HARNESS_LOCAL_OK"
@@ -76,6 +77,9 @@ RULE_HELP = {
     "build": "a production build is CPU/memory heavy",
     "media": "large media work (ffmpeg/whisper) is CPU/memory heavy",
     "fan-out": "parallel fan-out multiplies memory use",
+    "install": "a package install (pnpm/npm/yarn/bun) writes and unpacks thousands of files",
+    "replay": "a replay, synthetic or load script drives many requests and processes",
+    "container": "docker/podman images and containers use gigabytes of disk and memory",
     "copy": "a large copy, clone or worktree fills the Mac disk (it sits near full; work/pp407 grew 9 GB/h this way)",
     "oversize": "the guard cannot scan this whole command, so a heavy job could hide in the part it skips; "
                 "write it to a script file and run that (HARNESS_LOCAL_OK does not override this rule)",
@@ -782,6 +786,9 @@ def is_focused_test(args):
     return any(FILE_TARGET.search(t) for t in positional(args, ("-t", "--testNamePattern", "-c", "--config")))
 
 
+REPLAY_NAME = re.compile(r"(?:^|[:_./-])(?:replay|synthetic|stress|loadtest|load-test|soak)(?:$|[:_./-])", re.I)
+
+
 def classify_pm(name, args):
     """npm/pnpm/yarn/bun: tests and builds. Returns None, (rule, detail) or ('recurse', argv)."""
     valued = ("--prefix", "-C", "--filter", "-F", "-w", "--workspace", "--cwd", "--dir")
@@ -800,6 +807,11 @@ def classify_pm(name, args):
         return None if is_focused_test(after) else ("full-suite", f"{name} {sub}")
     if re.match(r"^build(?:[:_-].*)?$", sub) or sub in ("compile", "bundle"):
         return ("build", f"{name} {sub}")
+    if sub in ("install", "i", "ci", "add", "update", "upgrade", "up", "dedupe", "rebuild") and not any(
+            a in ("--help", "-h", "--version", "--dry-run") for a in args):
+        return ("install", f"{name} {sub}")
+    if REPLAY_NAME.search(sub):
+        return ("replay", f"{name} {sub}")
     return None
 
 
@@ -995,6 +1007,8 @@ def classify(argv, ctx, depth=0):
             found = None
         if found:
             return found
+    if low == "claude" and any(a in ("-p", "--print") for a in args):
+        ctx.claude_p = getattr(ctx, "claude_p", 0) + 1
     if low in REMOTE_CMDS:
         return None  # already off-box
     if cmd == "run_capped.py":
@@ -1113,6 +1127,8 @@ def classify(argv, ctx, depth=0):
                 if JS_BROWSER_IMPORT.search(code) or re.search(r"require\(\s*['\"](?:playwright|puppeteer)", code):
                     return ("browser", "node -e code that drives a browser")
         script = next(iter(positional(args)), None)
+        if script and re.search(r"\.[cm]?[jt]s$", script) and REPLAY_NAME.search(base(script)):
+            return ("replay", f"{low} {base(script)}")
         if script and re.search(r"\.[cm]?[jt]s$", script):
             sources = script_sources(script, ctx)
             if any(ctx.search(HOSTILE, s) for s in sources):
@@ -1173,6 +1189,10 @@ def classify(argv, ctx, depth=0):
         pos = positional(args, ("--context", "-H", "--host", "-f", "--file", "-p", "--project-name"))
         if "build" in pos[:2] or ("--build" in args and ("up" in pos or low == "docker-compose")):
             return ("build", f"{low} build")
+        if (pos[:1] and pos[0] in ("run", "pull", "buildx", "create", "start", "up")) or (
+                pos[:2] and pos[0] == "compose" and pos[1] in ("up", "run", "pull", "start")) or (
+                low == "docker-compose" and pos[:1] and pos[0] in ("up", "run", "pull", "start")):
+            return ("container", f"{low} {pos[0] if pos[0] != 'compose' else 'compose ' + pos[1]}")
         return None
     if low in PM:
         result = classify_pm(low, args)
@@ -1249,6 +1269,8 @@ def scan_state(command: str, cwd: str, depth: int = 0, parent=None):
         result = classify(argv, ctx, depth)
         if result:
             findings.append((result[0], result[1], ctx.capped, segment))
+    if getattr(ctx, "claude_p", 0) >= 3 or (getattr(ctx, "claude_p", 0) >= 1 and re.search(r"(?:^|[\s;&|(])(?:for|while|until)\s", text)):
+        findings.append(("fan-out", "claude -p fan-out (several or looped headless sessions)", False, "claude -p ..."))
     return hatch, findings
 
 
@@ -1317,7 +1339,7 @@ def decide(command: str, cwd: str = None, modes=None):
             outcome = {"action": "allow", "rule": rule, "detail": detail, "hatch_reason": hatch.strip()}
         else:
             outcome = {"action": "deny" if mode == "enforce" else "warn", "rule": rule, "detail": detail,
-                       "message": deny_message(rule, detail, hatch, capped)}
+                       "message": deny_message(rule, detail, hatch, capped, _segment, cwd)}
         if SEVERITY[outcome["action"]] > SEVERITY[best["action"]] or (
                 outcome["action"] == "allow" and best["action"] == "allow" and outcome.get("hatch_reason")
                 and not best.get("hatch_reason")):
@@ -1338,15 +1360,29 @@ def route_host() -> str:
                 value = candidate if re.fullmatch(r"[A-Za-z0-9._-]{1,60}", candidate) else ""
         except Exception:
             value = ""
-    return value or "dev2"
+    return value or "t2-dev"  # dev2 retires 11-09
 
 
 def routed(text: str) -> str:
     return text.replace("ssh dev2 ", f"ssh {route_host()} ")
 
 
-def deny_message(rule, detail, hatch, capped):
-    return routed(_deny_message(rule, detail, hatch, capped))
+def exact_route(segment, cwd):
+    """The same command on the routed host: `ah run --host H -- CMD` (ah run lands with goodqa#14548) and the ssh form."""
+    import shlex
+    host = route_host()
+    text = " ".join((segment or "").split())[:400]
+    if not text:
+        return ""
+    inner = f"cd {shlex.quote(cwd)} && {text}" if cwd else text
+    return (f"Exact equivalent on {host}:\n  python3 ~/.claude/hooks/ah.py run --host {host} -- {text}\n"
+            f"  (until ah run is installed)  ssh {host} {shlex.quote(inner)}")
+
+
+def deny_message(rule, detail, hatch, capped, segment=None, cwd=None):
+    base_msg = routed(_deny_message(rule, detail, hatch, capped))
+    extra = exact_route(segment, cwd) if rule not in NEVER_BLOCK else ""
+    return base_msg + ("\n" + extra if extra else "")
 
 
 def _deny_message(rule, detail, hatch, capped):

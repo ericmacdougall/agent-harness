@@ -210,6 +210,39 @@ class ReviewFindings(unittest.TestCase):
         self.assertLess(len(calls), 50)
 
 
+class HeavyCommandFamilies(unittest.TestCase):
+    """Coordinator P12 follow-up: installs, replays, containers and claude -p fan-out are denied on the Mac with the exact route."""
+
+    DENIED = [("pnpm install", "install"), ("npm ci", "install"), ("yarn add left-pad", "install"), ("bun install", "install"),
+              ("node scripts/solve-replay.js --all", "replay"), ("pnpm run synthetic:full", "replay"),
+              ("docker run --rm -it ubuntu bash", "container"), ("docker compose up -d", "container"),
+              ("docker pull postgres", "container"), ("podman run x", "container"),
+              ("for f in a b c; do claude -p \"review $f\" & done", "fan-out"),
+              ("claude -p a & claude -p b & claude -p c &", "fan-out"), ("ls | xargs -P8 -n1 claude -p", "fan-out"),
+              ("pytest", "full-suite"), ("python3 -m unittest discover -s tests", "full-suite"), ("npm test", "full-suite"),
+              ("pnpm build", "build")]
+    ALLOWED = ["pnpm --version", "npm --version", "docker ps", "docker logs web | tail", "claude -p 'one quick question'",
+               "node scripts/one-off.js", "pytest tests/test_one.py", "npm test -- src/a.test.ts", "git status"]
+
+    def test_denied_with_the_exact_route(self):
+        for command, rule in self.DENIED:
+            with self.subTest(command=command):
+                result = guard.decide(command, "/Users/eric/proj", MODES)
+                self.assertEqual((result["action"], result["rule"]), ("deny", rule), result)
+                self.assertIn("ah.py run --host t2-dev --", result["message"])
+                self.assertIn("ssh t2-dev ", result["message"])
+
+    def test_quick_forms_stay_allowed(self):
+        for command in self.ALLOWED:
+            with self.subTest(command=command):
+                self.assertEqual(guard.decide(command, "/Users/eric/proj", MODES)["action"], "allow", command)
+
+    def test_the_route_line_carries_the_command_and_directory(self):
+        message = guard.decide("pnpm install --frozen-lockfile", "/Users/eric/proj", MODES)["message"]
+        self.assertIn("ah.py run --host t2-dev -- pnpm install --frozen-lockfile", message)
+        self.assertIn("cd /Users/eric/proj && pnpm install --frozen-lockfile", message)
+
+
 class RunGates(unittest.TestCase):
     """The side-effecting front door: hatch limit, 85% disk refusal, over-budget block, ring and WAL audit."""
 
@@ -245,7 +278,7 @@ class RunGates(unittest.TestCase):
         self.assertEqual([e["key"] for e in events], ["heavy:copy:agentA"])
         detail = events[0]["detail"]
         self.assertEqual(detail["agent"], "agentA")
-        self.assertEqual(detail["route"], "dev2")
+        self.assertEqual(detail["route"], "t2-dev")
         self.assertNotIn("secret-dest", json.dumps(events))
         self.assertNotIn("/bigsrc", json.dumps(events))
 
@@ -403,7 +436,7 @@ class RunGates(unittest.TestCase):
             self.assertNotIn("ssh dev2 ", err)
             self.assertEqual(self.ring()[-1]["detail"]["route"], "t2")
         with mock.patch.dict(os.environ, {"HARNESS_ROUTE_HOST": "bad host;rm"}):
-            self.assertEqual(guard.route_host(), "dev2")
+            self.assertEqual(guard.route_host(), "t2-dev")
 
     def test_codex_payload_shapes_are_guarded(self):
         for tool_input in ({"cmd": "cp -r /bigsrc /Users/eric/x"}, {"command": ["bash", "-lc", "cp -r /bigsrc /Users/eric/x"]},

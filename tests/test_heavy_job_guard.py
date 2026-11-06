@@ -42,7 +42,7 @@ NORMAL = [
     "pytest tests/test_wal.py::TestWal::test_append", "python3 tests/test_wal.py", "npm test -- src/foo.test.ts",
     "npx vitest run src/foo.test.ts", "go test ./pkg/foo -run TestBar", "echo 'next build' > note.txt",
     "ssh dev2 'cd repo && pytest'", "ssh eric@192.0.2.7 'npm run build'", "rsync -a src/ dev2:src/",
-    "sed -n 1,40p heavy.py", "python3 -m json.tool < x.json", "node --version", "npm install --no-audit",
+    "sed -n 1,40p heavy.py", "python3 -m json.tool < x.json", "node --version", "npm --version",
     "docker ps", "docker logs web | tail", "cargo --version", "ffmpeg -version", "ffprobe -v error clip.mp4",
     "xargs -n1 echo < list.txt", "git ls-files -z | xargs -0 -P 6 grep -l foo", "ls | xargs -P2 echo", "playwright install chromium", "open -a 'Google Chrome' http://x",
     "tail -f server.log", "find . -name '*.py' | wc -l", "bash -c 'echo hi'", "env FOO=1 ls",
@@ -84,7 +84,7 @@ class Classification(unittest.TestCase):
                    "https://127.0.0.1:8791 --ignore-https-errors --out s.json > s.log 2>&1; tail -70 s.log | cut -c1-220")
         result = decide(command)
         self.assertEqual((result["action"], result["rule"]), ("deny", "browser"), result)
-        self.assertIn("ssh dev2", result["message"])
+        self.assertIn("ssh t2-dev", result["message"])
         relaunch = ("pkill -f site_sweep.py; cd " + d + " && python3 - <<'E'\ns=open('site_sweep.py').read()\nE\n"
                     "(./venv/bin/python site_sweep.py https://x --public > o.log 2>&1 &) ; ./venv/bin/python site_sweep.py https://y")
         self.assertEqual(decide(relaunch)["action"], "deny")
@@ -120,11 +120,11 @@ class Classification(unittest.TestCase):
         for command in ("pytest", "npm run build"):
             self.assertEqual(decide("HARNESS_LOCAL_OK='xcode needs the mac' " + command)["action"], "allow")
 
-    def test_media_and_fanout_warn_only(self):
+    def test_media_warns_and_fanout_is_denied(self):
         for command, rule in [("ffmpeg -i a.mov b.mp4", "media"), ("whisper a.wav", "media"),
                               ("ls | xargs -P8 -n1 curl", "fan-out"), ("parallel echo ::: a b", "fan-out")]:
             result = decide(command)
-            self.assertEqual((result["action"], result["rule"]), ("warn", rule))
+            self.assertEqual((result["action"], result["rule"]), ("warn" if rule == "media" else "deny", rule))
 
     def test_neg1_normal_commands_not_flagged(self):
         flagged = [c for c in NORMAL if decide(c, cwd=str(HOOKS.parents[1]))["action"] != "allow"]
@@ -145,7 +145,7 @@ class Classification(unittest.TestCase):
             result = decide(command)
             self.assertEqual(result["action"], "deny", command)
             self.assertIn("HARNESS_LOCAL_OK", result["message"], command)
-            self.assertIn("ssh dev2", result["message"], command)
+            self.assertIn("ssh t2-dev", result["message"], command)
             self.assertIn("dev2", result["message"])
 
     def test_guard_is_a_noop_off_the_mac_and_ssh_dev2_is_allowed_on_it(self):
@@ -424,7 +424,7 @@ class HookProcess(unittest.TestCase):
         done = self.run_hook(self.payload("pytest"))
         self.assertEqual(done.returncode, 2)
         self.assertIn("[full-suite]", done.stderr)
-        self.assertIn("ssh dev2", done.stderr)
+        self.assertIn("ssh t2-dev", done.stderr)
 
     def test_normal_and_non_bash_pass(self):
         self.assertEqual(self.run_hook(self.payload("git status")).returncode, 0)
