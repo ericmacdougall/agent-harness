@@ -24,7 +24,15 @@ Design rules:
   output.
 
 Usage:
-  hookd.py serve            run the server in the foreground (launchd/systemd run this)
+  hookd.py serve [--python P] [--max-children N]
+                            run the server in the foreground (launchd/systemd run this). P is the interpreter
+                            this server runs as, the one the cold path's `python3` must resolve to (default:
+                            python3 on PATH); a call from a client whose python3 differs is answered
+                            `fallback: interpreter`
+  The served call must behave as `python3 <hook>` would: a client whose PYTHON* variables differ from the
+  server's, or whose locale would give a cold interpreter a non-UTF-8 encoding, is sent to the cold path, and the
+  child's stdio error handlers follow the caller's locale (surrogateescape only in C/UTF-8 mode).
+  At the child cap a call is accepted and answered `fallback: busy` at once, so it goes cold without waiting.
   hookd.py status           JSON: socket, pid, uptime, served/fallback counts
   hookd.py install [--apply] [--uninstall]   service unit (launchd com.ericmacdougall.hookd / systemd hookd)
 """
@@ -246,8 +254,11 @@ def preload():
     import importlib.util
     pre = Preloaded()
     opened = set()
+    collecting = [True]
 
     def audit(event, args):
+        if not collecting[0]:
+            return
         if event == 'open' and args and isinstance(args[0], (str, bytes)):
             path = os.fsdecode(args[0])
             if not path.endswith(('.pyc',)) and os.path.isabs(path):
@@ -286,6 +297,7 @@ def preload():
                 sys.modules.pop(name, None)
     finally:
         os.environ = real_environ
+        collecting[0] = False
     stdlib = os.path.dirname(os.__file__)
     for module in list(sys.modules.values()):
         path = getattr(module, '__file__', None)
@@ -309,18 +321,53 @@ def env_mismatch(pre, env):
             return '*'
         if env.get(key) != value:
             return key
+    # PYTHON* variables change how an interpreter starts (path, encodings, UTF-8 mode, hash seed); the served
+    # child cannot redo that, so any difference from the server's own start-up values goes cold (review F3).
+    mine = {k: v for k, v in SERVER_ENV.items() if k.startswith('PYTHON')}
+    theirs = {k: v for k, v in env.items() if k.startswith('PYTHON')}
+    if mine != theirs:
+        return 'PYTHON*'
     return None
+
+
+SERVER_ENV = dict(os.environ)          # this process's environment at start (the unit's)
+SERVED_PYTHON = None                   # realpath of the interpreter this server runs as; set by serve()
+
+
+def cold_stdio():
+    """In the request child, after the caller's environment is installed: set LC_CTYPE as a fresh interpreter
+    does and return the stdio error handler it would use, or None when its locale encoding is not UTF-8 (the
+    served streams are UTF-8, so that call must go cold). C/POSIX turns on UTF-8 mode (PEP 538/540), which uses
+    surrogateescape; any other UTF-8 locale uses strict."""
+    import codecs
+    import locale
+    try:
+        name = locale.setlocale(locale.LC_CTYPE, '')
+    except locale.Error:
+        name = locale.setlocale(locale.LC_CTYPE, 'C')   # a bad locale leaves a fresh interpreter in C
+    if name in ('C', 'POSIX'):
+        return 'surrogateescape'
+    try:
+        encoding = codecs.lookup(locale.nl_langinfo(locale.CODESET)).name
+    except (LookupError, AttributeError, ValueError):
+        return None
+    if encoding != 'utf-8':
+        return None
+    return 'surrogateescape' if name.split('.')[0] == 'C' else 'strict'   # C.UTF-8 is a coercion target
 
 
 # --------------------------------------------------------------------------- child execution
 
+STDIO_ERRORS = 'surrogateescape'      # set per request by serve_one from cold_stdio()
+
+
 def _std_streams():
-    """Recreate sys.stdin/stdout/stderr over fds 0/1/2 the way a fresh interpreter does (UTF-8, no tty)."""
-    errors_in = 'surrogateescape'
+    """Recreate sys.stdin/stdout/stderr over fds 0/1/2 the way a fresh interpreter does (UTF-8, no tty), with
+    the error handler the caller's locale would give it."""
     sys.stdin = io.TextIOWrapper(io.BufferedReader(io.FileIO(0, 'rb', closefd=False)), encoding='utf-8',
-                                 errors=errors_in)
+                                 errors=STDIO_ERRORS)
     sys.stdout = io.TextIOWrapper(io.BufferedWriter(io.FileIO(1, 'wb', closefd=False)), encoding='utf-8',
-                                  errors='strict')
+                                  errors=STDIO_ERRORS)
     sys.stderr = io.TextIOWrapper(io.BufferedWriter(io.FileIO(2, 'wb', closefd=False)), encoding='utf-8',
                                   errors='backslashreplace', line_buffering=True)
     sys.__stdin__, sys.__stdout__, sys.__stderr__ = sys.stdin, sys.stdout, sys.stderr
@@ -543,6 +590,8 @@ def serve_one(pre, conn, counters_fd):
             reason = 'not-served'
         elif os.path.basename(script) not in pre.modules:
             reason = 'not-loaded'
+        elif SERVED_PYTHON is None or os.path.realpath(str(header.get('python') or '/')) != SERVED_PYTHON:
+            reason = 'interpreter'
         else:
             reason = env_mismatch(pre, env) and 'env'
         if reason is None:
@@ -555,6 +604,11 @@ def serve_one(pre, conn, counters_fd):
             os._exit(0)
         os.environ.clear()
         os.environ.update(env)
+        global STDIO_ERRORS
+        STDIO_ERRORS = cold_stdio()
+        if STDIO_ERRORS is None:
+            send_frame(conn, json.dumps({'v': PROTO, 'status': 'fallback', 'reason': 'locale'}).encode())
+            os._exit(0)
         os.umask(int(header.get('umask', 0o022)) & 0o777)
         client_pid = pid if pid else int(header.get('pid') or os.getpid())
         client_ppid = int(header.get('ppid') or 1)
@@ -759,7 +813,10 @@ def secure_run_dir():
     return path
 
 
-def serve(max_children=DEFAULT_MAX_CHILDREN):
+def serve(max_children=DEFAULT_MAX_CHILDREN, python=None):
+    global SERVED_PYTHON
+    import shutil
+    SERVED_PYTHON = os.path.realpath(python or shutil.which('python3') or sys.executable)
     os.umask(0o077)
     rdir = secure_run_dir()
     lock_fd = os.open(os.path.join(rdir, 'hookd.lock'), os.O_RDWR | os.O_CREAT, 0o600)
@@ -795,7 +852,7 @@ def serve(max_children=DEFAULT_MAX_CHILDREN):
     signal.signal(signal.SIGINT, lambda *_: state.update(stop=True))
     signal.signal(signal.SIGHUP, lambda *_: state.update(reexec=True))
     children = {}   # pid -> deadline (monotonic)
-    counts = {'served': 0, 'stale': 0, 'writer_restarts': 0}
+    counts = {'served': 0, 'stale': 0, 'busy': 0, 'writer_restarts': 0}
 
     def start_writer():
         wal_module = pre.modules.get('wal.py')
@@ -829,7 +886,8 @@ def serve(max_children=DEFAULT_MAX_CHILDREN):
         doc = {'pid': os.getpid(), 'started_at': time.time() - (time.monotonic() - started),
                'socket': path, 'children': len(children), 'loaded': sorted(pre.modules),
                'load_errors': pre.errors, 'watch_files': len(pre.watch), 'warm_patterns': len(warmed),
-               'env_keys_at_import': sorted(pre.env_read), **counts}
+               'env_keys_at_import': sorted(pre.env_read), 'python': SERVED_PYTHON,
+               'max_children': max_children, **counts}
         import resource
         own, kids = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
         doc['cpu_s'] = round(own.ru_utime + own.ru_stime, 3)
@@ -875,11 +933,12 @@ def serve(max_children=DEFAULT_MAX_CHILDREN):
             stop_writer()
             listener.close()
             os.close(lock_fd)
-            os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), 'serve'])
+            os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), 'serve', '--python',
+                                      SERVED_PYTHON, '--max-children', str(max_children)])
         if now - last_status > 5:
             write_status()
             last_status = now
-        if state['stop'] or len(children) >= max_children:
+        if state['stop']:
             time.sleep(0.005)
             continue
         try:
@@ -902,6 +961,16 @@ def serve(max_children=DEFAULT_MAX_CHILDREN):
                 time.sleep(0.05)
             continue
         conn.setblocking(True)
+        if len(children) >= max_children:
+            # At the cap: answer at once so the client goes cold now, not after its accept wait (review F2).
+            counts['busy'] += 1
+            try:
+                conn.settimeout(0.2)
+                send_frame(conn, json.dumps({'v': PROTO, 'status': 'fallback', 'reason': 'busy'}).encode())
+            except OSError:
+                pass
+            conn.close()
+            continue
         if state['reexec'] or stale_paths(pre):
             state['reexec'] = True
             counts['stale'] += 1
@@ -952,7 +1021,7 @@ def status_main():
 LABEL = 'com.ericmacdougall.hookd'
 
 
-def unit_files(script):
+def unit_files(script, python):
     """launchd agent (macOS) or systemd user unit (Linux). Default priority: hookd is on every tool call's path,
     so it is not niced like ahd. Memory is capped on Linux; on macOS the child cap bounds it."""
     h = home()
@@ -962,7 +1031,7 @@ def unit_files(script):
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>%s</string>
-<key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>%s</string><string>serve</string></array>
+<key>ProgramArguments</key><array><string>%s</string><string>%s</string><string>serve</string><string>--python</string><string>%s</string></array>
 <key>RunAtLoad</key><true/>
 <key>KeepAlive</key><true/>
 <key>ThrottleInterval</key><integer>5</integer>
@@ -970,13 +1039,13 @@ def unit_files(script):
 <key>StandardOutPath</key><string>/dev/null</string>
 <key>StandardErrorPath</key><string>%s/hookd.err</string>
 </dict></plist>
-""" % (LABEL, script, logs)
+""" % (LABEL, python, script, python, logs)
         return {os.path.join(h, 'Library', 'LaunchAgents', LABEL + '.plist'): plist}
     unit = """[Unit]
 Description=agent harness hook server (hookd, GoodQA goodqa#14859)
 
 [Service]
-ExecStart=/usr/bin/env python3 %s serve
+ExecStart=%s %s serve --python %s
 Restart=always
 RestartSec=2
 MemoryMax=1G
@@ -984,7 +1053,7 @@ TasksMax=256
 
 [Install]
 WantedBy=default.target
-""" % script
+""" % (python, script, python)
     return {os.path.join(h, '.config', 'systemd', 'user', 'hookd.service'): unit}
 
 
@@ -1003,7 +1072,11 @@ def service_cmds(files, start):
 def install_main(argv):
     import subprocess
     apply, remove = '--apply' in argv, '--uninstall' in argv
-    files = unit_files(os.path.abspath(__file__))
+    import shutil
+    # The interpreter the cold path will run: `python3` on this PATH (the installer runs from the agents' shell).
+    # hookd runs exactly that file, and answers `fallback: interpreter` to any client that resolves another.
+    python = os.path.realpath(shutil.which('python3') or sys.executable)
+    files = unit_files(os.path.abspath(__file__), python)
     if not remove:
         for path, body in files.items():
             print('%s %s' % ('write' if apply else 'would write', path))
@@ -1048,7 +1121,12 @@ def main(argv=None):
         print(__doc__)
         return 0
     if argv[0] == 'serve':
-        return serve()
+        import argparse
+        parser = argparse.ArgumentParser(prog='hookd.py serve')
+        parser.add_argument('--python')
+        parser.add_argument('--max-children', type=int, default=DEFAULT_MAX_CHILDREN)
+        opts = parser.parse_args(argv[1:])
+        return serve(max(1, opts.max_children), opts.python)
     if argv[0] == 'status':
         return status_main()
     if argv[0] == 'install':

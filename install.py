@@ -78,10 +78,16 @@ def is_managed_handler(hook: dict, scripts: set[str]) -> bool:
     if hook.get("command") == "python3":
         return (args or [None])[0] in scripts
     if Path(str(hook.get("command", ""))).name == "hookc":
-        if args[:1] == ["--budget"]:
-            args = args[2:]
-        return (args or [None])[0] in scripts
+        return (hookc_script_args(args) or [None])[0] in scripts
     return False
+
+
+def hookc_script_args(args: list) -> list:
+    """Drop hookc's own options (`--deadline N`, `--gate`, and the older `--budget N`) to reach `<script> args`."""
+    args = list(args)
+    while args and args[0] in ("--deadline", "--budget", "--gate"):
+        args = args[1:] if args[0] == "--gate" else args[2:]
+    return args
 
 
 def uses_hookc(settings: dict) -> bool:
@@ -91,14 +97,20 @@ def uses_hookc(settings: dict) -> bool:
                for h in group.get("hooks", []) or [] if isinstance(h, dict))
 
 
+# Enforcing hooks without onFailure: block whose verdict must still never become a host-timeout allow.
+HOOKC_EXTRA_GATES = {("provenance_hooks.py", "ask-gate")}
+
+
 def hookc_handler(hook: dict, hookc: Path, served: set[str]) -> dict:
-    """`python3 <script> args` -> `<hookc> --budget B <script> args`, keeping timeout and onFailure. The budget is
-    the share of the host timeout hookd may use before hookc runs the cold hook with the rest."""
+    """`python3 <script> args` -> `<hookc> --deadline T [--gate] <script> args`, keeping timeout and onFailure.
+    T is the host timeout: hookc answers within it, served or cold. When it cannot, a --gate hook blocks (exit 2)
+    instead of letting the host time it out, which a hook without onFailure: block would turn into an allow."""
     args = list(hook.get("args") or [])
     if hook.get("command") != "python3" or not args or Path(args[0]).name not in served:
         return hook
-    budget = max(2.0, round(float(hook.get("timeout", 10)) * 0.4, 1))
-    return {**hook, "command": str(hookc), "args": ["--budget", f"{budget:g}", *args]}
+    limit = float(hook.get("timeout", 10))
+    gate = hook.get("onFailure") == "block" or (Path(args[0]).name, (args[1:2] or [None])[0]) in HOOKC_EXTRA_GATES
+    return {**hook, "command": str(hookc), "args": ["--deadline", f"{limit:g}", *(["--gate"] if gate else []), *args]}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any

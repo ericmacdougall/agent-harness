@@ -914,6 +914,17 @@ Coexistence with the hand-installed script: it keeps its own lock directories (`
 
 Behaviour changes from the hand-installed script: lock takeover by rename (and only for a dead or non-log-backup holder or a lock over 24 h old), skip marker, primary-source rule, anchored excludes check, remote type check and pin, extended excludes, retries, rclone timeouts, `RCLONE_*` environment stripped except `RCLONE_CONFIG`.
 
+## Resident hook server (hookd)
+
+`hookd` (GoodQA goodqa#14859, `harness/hooks/hookd.py`) keeps the hook modules imported and forks a child per call, so a hook no longer pays for a cold Python start. The thin client `~/.agent-harness/bin/hookc` (`tools/hookc`, Go, stdlib only) replaces `python3` in each served settings entry: `hookc --deadline T [--gate] <hook.py> args`. It is opt-in.
+
+- Enable: `python3 install.py --apply --hookd --services` (needs Go 1.21+ to build hookc; the build is self-checked before settings point at it). Later installs keep the current wiring.
+- Status: `python3 ~/.claude/hooks/hookd.py status` prints pid, served, `busy` and `stale` counts, the pinned `python`, `children_cpu_s` and load errors. Logs: `~/.agent-harness/logs/hookd.log` (event, hook name, duration and outcome only; never env, stdin or output) and `hookd.err`.
+- Rollback: `python3 install.py --apply --no-hookd --services` restores the plain `python3` entries and removes the unit. The unit installer keeps `NAME.bak-STAMP` copies of a replaced plist or unit.
+- Timing: `T` is the entry's host timeout. hookc keeps one deadline a little under it across the connect, the served run and any cold run. If no verdict arrives in time, a `--gate` hook (every `onFailure: block` entry, plus provenance `ask-gate`) exits 2 with a `fail-closed` message, and other hooks exit 1, the same non-blocking error a host timeout gives. A served run that times out is never rerun cold.
+- Cold path: with hookd stopped, missing, busy (16 children; answered `fallback: busy` at once), stale (a hook or policy file changed; it re-execs), or when the caller differs from the server, hookc runs `python3 <hook>` itself. "Differs" means `python3` on the caller's PATH resolves to another file than the interpreter the unit runs (pinned at install, `--python`), a `PYTHON*` variable differs, an environment key read at import differs, or the caller's locale is not UTF-8.
+- Known limits: a served run that is cut off and then rerun cold (signal, oversize reply) can repeat a side effect, such as one duplicate WAL line for the same `tool_use_id`. The cold path stops only the `python3` it started at the deadline; an analyser it spawned ends on its own timeout.
+
 ## Design limits
 
 The policy is intentionally risk-scaled. The small fix path skips worktrees and review loops. A normal code task gets only relevant tests and documents. The agents must not infer that the presence of a test or a reviewer PASS proves quality. Independent checks, reviewer availability, UI tool access and remote permissions vary by environment; handoffs must say exactly what ran and what did not.

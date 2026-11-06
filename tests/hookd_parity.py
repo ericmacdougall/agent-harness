@@ -146,7 +146,8 @@ def run_hook(argv, payload, env, home, cwd):
 
 def start_server(home, run_dir, log):
     env = child_env(home, {'HOOKD_RUN_DIR': str(run_dir), 'HOOKD_LOG': str(log)})
-    proc = subprocess.Popen([sys.executable, str(HOOKS / 'hookd.py'), 'serve'], env=env, stdin=subprocess.DEVNULL,
+    python = os.path.realpath(shutil.which('python3', path=env.get('PATH')) or sys.executable)  # the cold path's python3
+    proc = subprocess.Popen([python, str(HOOKS / 'hookd.py'), 'serve', '--python', python], env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     sock = Path(run_dir) / 'hookd.sock'
     for _ in range(300):

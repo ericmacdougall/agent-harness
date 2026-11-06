@@ -68,9 +68,13 @@ class HookdTest(unittest.TestCase):
         env.update(extra)
         return env
 
-    def start(self, hooks=None):
+    # The interpreter the cold path runs (`python3` on PATH); the served one must be the same (review F3).
+    python = os.path.realpath(shutil.which('python3') or sys.executable)
+
+    def start(self, hooks=None, *extra):
         hooks = hooks or self.hooks
-        self.server = subprocess.Popen([sys.executable, str(Path(hooks) / 'hookd.py'), 'serve'], env=self.env(),
+        self.server = subprocess.Popen([self.python, str(Path(hooks) / 'hookd.py'), 'serve', '--python', self.python,
+                                        *extra], env=self.env(),
                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                        stderr=subprocess.DEVNULL, start_new_session=True)
         sock = self.run_dir / 'hookd.sock'
@@ -200,6 +204,153 @@ class HookdTest(unittest.TestCase):
         self.assertEqual(warm.returncode, 2)
         self.assertIn(b'cold path (no-accept)', warm.stderr)
         self.assertGreaterEqual(elapsed, 1.9)
+
+    # ------------------------------------------------------------------ one overall deadline (review F1)
+    def hang_after_request(self, delay):
+        def behaviour(conn):
+            self.frame(conn, {'v': 1, 'status': 'accepted'})
+            self.read_request(conn)
+            time.sleep(delay)
+        return behaviour
+
+    def timed(self, argv, data, **extra):
+        t0 = time.monotonic()
+        result = subprocess.run([str(self.hookc)] + argv, input=data, capture_output=True,
+                                env=self.env(**extra), cwd='/', timeout=60)
+        return result, time.monotonic() - t0
+
+    def test_served_hook_at_70pct_of_the_timeout_still_ends_inside_it(self):
+        """A served call that runs 0.7T and never answers must not be followed by a cold rerun past T."""
+        self.fake_server(self.hang_after_request(0.7 * 4 + 5))
+        warm, elapsed = self.timed(['--deadline', '4', '--gate', str(HOOKS / 'kill_guard.py'), 'hook'],
+                                   payload('ls -la'))   # an allow when run cold: a block here can only be fail-closed
+        self.assertLess(elapsed, 4.0)
+        self.assertEqual(warm.returncode, 2, warm.stderr)
+        self.assertIn(b'fail-closed', warm.stderr)
+
+    def test_served_answer_at_half_the_timeout_is_used(self):
+        def slow_ok(conn):
+            self.frame(conn, {'v': 1, 'status': 'accepted'})
+            self.read_request(conn)
+            time.sleep(0.5 * 4)
+            self.frame(conn, {'v': 1, 'status': 'ok', 'exit': 0})
+            self.frame(conn, b'served')
+            self.frame(conn, b'')
+        self.fake_server(slow_ok)
+        warm, elapsed = self.timed(['--deadline', '4', '--gate', str(HOOKS / 'kill_guard.py'), 'hook'],
+                                   payload('ls'))
+        self.assertLess(elapsed, 4.0)
+        self.assertEqual((warm.returncode, warm.stdout), (0, b'served'))
+
+    def test_server_timeout_answer_is_not_rerun_cold(self):
+        def timeout(conn):
+            self.frame(conn, {'v': 1, 'status': 'accepted'})
+            self.read_request(conn)
+            self.frame(conn, {'v': 1, 'status': 'fallback', 'reason': 'timeout'})
+        self.fake_server(timeout)
+        warm, _ = self.timed(['--deadline', '4', '--gate', str(HOOKS / 'kill_guard.py'), 'hook'], payload('ls'))
+        self.assertEqual(warm.returncode, 2)
+        self.assertIn(b'fail-closed', warm.stderr)
+        advisory, _ = self.timed(['--deadline', '4', str(HOOKS / 'bg_lint.py')], payload('ls'))
+        self.assertEqual(advisory.returncode, 1)          # a fail-open hook reports a non-blocking error
+        self.assertNotIn(b'fail-closed', advisory.stderr)
+
+    def test_slow_cold_gate_with_hookd_down_blocks_inside_the_timeout(self):
+        hooks = self.dir / 'slow'
+        hooks.mkdir()
+        (hooks / 'kill_guard.py').write_text('import time\ntime.sleep(30)\n')   # allows, but far too late
+        warm, elapsed = self.timed(['--deadline', '2', '--gate', str(hooks / 'kill_guard.py'), 'hook'], b'{}')
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(warm.returncode, 2)
+        self.assertIn(b'fail-closed', warm.stderr)
+
+    def test_stalled_accept_leaves_the_cold_run_its_time(self):
+        self.fake_server(lambda conn: time.sleep(6))
+        warm, elapsed = self.timed(['--deadline', '4', '--gate', str(HOOKS / 'kill_guard.py'), 'hook'],
+                                   payload(BLOCK_CMD))
+        self.assertEqual(warm.returncode, 2)
+        self.assertIn(b'cold path (no-accept)', warm.stderr)   # the real cold verdict, not a timeout block
+        self.assertLess(elapsed, 4.0)
+
+    def test_unknown_option_is_a_usage_error(self):
+        warm, _ = self.timed(['--nope', str(HOOKS / 'bg_lint.py')], payload('ls'))
+        self.assertEqual(warm.returncode, 2)
+        self.assertIn(b'usage: hookc', warm.stderr)
+
+    # ------------------------------------------------------------------ capacity (review F2)
+    def test_calls_over_the_child_cap_go_cold_without_a_stall(self):
+        hooks = self.dir / 'hooks'
+        shutil.copytree(HOOKS, hooks, ignore=shutil.ignore_patterns('__pycache__'))
+        target = hooks / 'bg_lint.py'
+        marker = '    sys.exit(main())\n'
+        text = target.read_text()
+        self.assertIn(marker, text)
+        target.write_text(text.replace(marker, "    import time as _t; _t.sleep(float(os.environ.get('HKT_HOLD', '0')))\n"
+                                               + marker))
+        self.assertIn('import os', text)
+        self.start(hooks, '--max-children', '1')
+        holder = threading.Thread(target=self.client, args=('bg_lint.py', [], payload('ls')),
+                                  kwargs={'hooks': hooks, 'HKT_HOLD': '4'})
+        holder.start()
+        try:
+            time.sleep(0.8)
+            second, elapsed = self.timed([str(hooks / 'bg_lint.py')], payload('ls'))
+            self.assertIn(b'server:busy', second.stderr)
+            self.assertLess(elapsed, 1.5)
+        finally:
+            holder.join()
+
+    # ------------------------------------------------------------------ interpreter and env (review F3)
+    def test_other_python_on_path_goes_cold(self):
+        self.start()
+        shim = self.dir / 'bin'
+        shim.mkdir()
+        (shim / 'python3').write_text('#!/bin/sh\nexec %s "$@"\n' % self.python)
+        (shim / 'python3').chmod(0o755)
+        warm = self.client('kill_guard.py', ['hook'], payload(BLOCK_CMD),
+                           PATH='%s:%s' % (shim, os.environ.get('PATH', '')))
+        self.assertEqual(warm.returncode, 2)
+        self.assertIn(b'server:interpreter', warm.stderr)
+
+    def test_python_env_difference_goes_cold(self):
+        self.start()
+        warm = self.client('kill_guard.py', ['hook'], payload(BLOCK_CMD), PYTHONIOENCODING='latin-1')
+        self.assertEqual(warm.returncode, 2)
+        self.assertIn(b'server:env', warm.stderr)
+
+    def test_non_utf8_locale_goes_cold(self):
+        import locale
+        try:
+            locale.setlocale(locale.LC_CTYPE, 'en_US.ISO8859-1')
+        except locale.Error:
+            self.skipTest('no ISO8859-1 locale on this host')
+        finally:
+            locale.setlocale(locale.LC_CTYPE, '')
+        self.start()
+        warm = self.client('kill_guard.py', ['hook'], payload(BLOCK_CMD), LANG='en_US.ISO8859-1', LC_ALL='')
+        self.assertEqual(warm.returncode, 2)
+        self.assertIn(b'server:locale', warm.stderr)
+
+    def test_invalid_utf8_stdin_matches_cold_in_both_locale_modes(self):
+        self.start()
+        data = b'{"session_id": "\xff\xfe", "tool_name": "Bash"}'
+        for lang in ('en_US.UTF-8', 'C'):
+            with self.subTest(lang=lang):
+                warm = self.client('wal.py', ['pretool'], data, LANG=lang, LC_ALL='')
+                self.assertNotIn(b'hookc: cold path', warm.stderr)
+                path = str(self.hooks / 'wal.py')
+                cold = subprocess.run(['python3', path, 'pretool'], input=data, capture_output=True,
+                                      env=self.env(LANG=lang, LC_ALL=''), cwd='/', timeout=60)
+                self.assertSame(warm, cold)
+
+    def test_unit_runs_the_pinned_interpreter(self):
+        sys.path.insert(0, str(HOOKS))
+        import hookd
+        files = hookd.unit_files('/x/hookd.py', '/opt/py/bin/python3.12')
+        (text,) = files.values()
+        self.assertIn('/opt/py/bin/python3.12', text)
+        self.assertIn('--python', text)
+        self.assertNotIn('/usr/bin/env python3', text)
 
     def test_server_fallback_answer_runs_cold(self):
         def fallback(conn):
@@ -468,9 +619,10 @@ class WiringTest(unittest.TestCase):
             if script in self.hookd.SERVED:
                 switched += 1
                 self.assertEqual(new['command'], str(self.claude.parent / '.agent-harness' / 'bin' / 'hookc'))
-                self.assertEqual(new['args'][0], '--budget')
-                self.assertLess(float(new['args'][1]), float(old.get('timeout', 10)))
-                self.assertEqual(new['args'][2:], old['args'])
+                self.assertEqual(new['args'][:2], ['--deadline', '%g' % float(old.get('timeout', 10))])
+                gate = old.get('onFailure') == 'block' or old['args'][1:2] == ['ask-gate']
+                self.assertEqual(new['args'][2] == '--gate', gate, old['args'])
+                self.assertEqual(new['args'][3 if gate else 2:], old['args'])
             else:
                 self.assertEqual(new, old)
         self.assertGreaterEqual(switched, 15)
@@ -508,6 +660,17 @@ class WiringTest(unittest.TestCase):
         other = self.doctor.wired_path_ok(['/x/notc', str(hooks_dir / 'wal.py'), 'pretool'], 'wal.py', 'pretool',
                                           hooks_dir)
         self.assertEqual((ok, wrong, other), (True, False, False))
+
+    def test_doctor_accepts_the_deadline_and_gate_options(self):
+        client = self.real_hookc()
+        hooks_dir = self.claude / 'hooks'
+        wal = str(hooks_dir / 'wal.py')
+        self.assertTrue(self.doctor.wired_path_ok([client, '--deadline', '10', '--gate', wal, 'pretool'],
+                                                  'wal.py', 'pretool', hooks_dir))
+        self.assertTrue(self.doctor.wired_path_ok([client, '--deadline', '10', wal, 'pretool'],
+                                                  'wal.py', 'pretool', hooks_dir))
+        self.assertFalse(self.doctor.wired_path_ok([client, '--deadline', '10', '--gate', '/x/wal.py', 'pretool'],
+                                                   'wal.py', 'pretool', hooks_dir))
 
     def test_doctor_rejects_a_hookc_that_is_not_the_installed_executable(self):
         """Red-team M1: a missing, relocated or non-executable hookc must not pass doctor (fail-open guards and

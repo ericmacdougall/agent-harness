@@ -93,13 +93,15 @@ def wired_path_ok(toks: list[str], script: str, arg, hooks_dir: Path) -> bool:
     if not toks:
         return False
     if Path(toks[0]).name == "hookc":
-        # hookd thin client (goodqa#14859): `hookc [--budget N] <script> args`; it runs `python3 <script> args`
+        # hookd thin client (goodqa#14859): `hookc [--deadline N] [--gate] <script> args`; it runs `python3 <script> args`
         # itself whenever the server cannot answer, so the same script is enforced either way. Only the installed
         # client counts: a missing, relocated or non-executable hookc would make blocking hooks block everything
         # and fail-open guards stop enforcing while doctor stayed green (red-team M1).
         if not hookc_ok(toks[0], hooks_dir):
             return False
-        i = 3 if toks[1:2] == ["--budget"] else 1
+        i = 1
+        while i < len(toks) and toks[i] in ("--deadline", "--budget", "--gate"):
+            i += 1 if toks[i] == "--gate" else 2
     elif is_interpreter(toks[0]):
         i = 1
         while i < len(toks) and toks[i].startswith("-"):
