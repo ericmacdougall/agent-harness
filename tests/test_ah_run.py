@@ -3420,5 +3420,49 @@ class NativeReviewR9c(unittest.TestCase):
         self.assertGreater(len(lexed.commands), 0)
         self.assertLess(peak, 32 * 2 ** 20, 'peak %.1f MiB' % (peak / 2 ** 20))
 
+
+class NativeReviewR9d(unittest.TestCase):
+    """r9d (Opus high review of d2c8172, goodqa#14548): F1 a keyword between assignment words (`A=1 ! A=1 ! ... rm x`)
+    kept every peel step free, so the deny forms grew with the input (O(n^2) memory and time). The total step count is now
+    capped at 3 * WRAPPER_DEPTH. Inputs stay at 1000 repeats (about 6 KiB) so the failing control finishes quickly."""
+
+    REPEATS = 1000
+    SHAPES = ('A=1 ! ', 'A=1 then ', 'A=1 { ', 'A=1 do ')
+
+    def tearDown(self):
+        ah_run.match_candidates.cache_clear()
+
+    def test_f1_keyword_between_assignments_keeps_forms_bounded(self):
+        for unit in self.SHAPES:
+            with self.subTest(unit=unit):
+                forms = ah_run._peeled_forms(unit * self.REPEATS + 'rm x')
+                self.assertLessEqual(len(forms), 6 * ah_run.WRAPPER_DEPTH, '%d forms' % len(forms))
+
+    def test_f1_match_candidates_stays_cheap(self):
+        import tracemalloc
+        for unit in self.SHAPES:
+            with self.subTest(unit=unit):
+                ah_run.match_candidates.cache_clear()
+                tracemalloc.start()
+                started = time.monotonic()
+                try:
+                    forms = ah_run.match_candidates(unit * self.REPEATS + 'rm x')
+                    peak = tracemalloc.get_traced_memory()[1]
+                finally:
+                    tracemalloc.stop()
+                elapsed = time.monotonic() - started
+                self.assertGreater(len(forms), 0)
+                self.assertLess(peak, 4 * 2 ** 20, 'peak %.1f MiB' % (peak / 2 ** 20))
+                self.assertLess(elapsed, 2.0, '%.2f s' % elapsed)
+
+    def test_f1_neg_cap_keeps_the_n1_and_wrapper_reach(self):
+        # The cap must not cut the r9c N1 reach (many assignments, then wrappers, then the program).
+        forms = ah_run._peeled_forms('A=1 ' * 4000 + 'nice ' * 5 + 'rm x')
+        self.assertIn('rm x', forms)
+        forms = ah_run._peeled_forms(('A=1 B=2 ' * 30 + 'nice ') * 5 + 'rm x')
+        self.assertIn('rm x', forms)
+        self.assertIn('wrapper-depth', ah_run.lex('nice ' * ah_run.WRAPPER_DEPTH + 'true').reasons)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -750,6 +750,7 @@ HEREDOC_MARKER = re.compile(r'<<__HD(\d+)__')
 SIMPLE_BRACE = re.compile(r'\$\{[A-Za-z_][A-Za-z0-9_]*\}')
 MAX_GROUP_DEPTH = 16
 WRAPPER_DEPTH = 12  # wrappers the lexer, the deny forms and the escape classifier read through (r9b N2); past it, a reason
+PEEL_STEPS = 3 * WRAPPER_DEPTH  # every peel step of the deny forms, free assignment steps included (r9d F1)
 WORD_END = ' \t\n;&|()<>'
 WORD_RUN = re.compile(r"[A-Za-z0-9_./:,+=@%^~*?!\]-]+")
 DQ_RUN = re.compile(r'[^"\\`$]+')
@@ -2187,10 +2188,12 @@ def _peeled_forms(segment, fold=True):
     any number of assignment words free, so the forms reach the same program (`A=1 ` twelve times before rm used to use up
     the bound). The first WRAPPER_DEPTH steps peel one word each, as before; after them a run of assignment words goes in one
     step, so a list stays O(WRAPPER_DEPTH) forms long whatever the number of assignments. A step is free only when the form
-    starts with an assignment as typed (not one the unquoting made) and the step shortened it, so the loop ends."""
+    starts with an assignment as typed (not one the unquoting made) and the step shortened it, so the loop ends. All steps
+    together stop at PEEL_STEPS (r9d F1): a keyword between assignment words (`A=1 ! A=1 ! ... rm x`) is stripped by
+    normalize_segment, so every step stayed free and the list grew with the input."""
     forms, seen, current = [], set(), normalize_segment(segment)
     steps = wrappers = 0
-    while wrappers < WRAPPER_DEPTH and current not in seen:
+    while wrappers < WRAPPER_DEPTH and steps < PEEL_STEPS and current not in seen:
         seen.add(current); forms.append(current)
         bare = _unquote_program(current)
         if bare and bare not in seen:
