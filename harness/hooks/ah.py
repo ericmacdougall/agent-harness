@@ -1334,6 +1334,159 @@ def ahd_running_check(home: Path, now: float | None = None, max_beat_age: float 
             "fix": None if ok else "python3 ~/.claude/hooks/ahd.py install --apply (or install.py --apply --services)"}
 
 
+# ------------------------------------------------------------------ asks / requirements / sessions (read-only views)
+
+STALE_ASK_S = 24 * 3600
+VIEW_ROW_CAP = 2000
+VIEW_BUDGET_S = 8.0  # wall-clock budget per view; newest sessions first, then say truncated
+
+
+def _view_sessions(home: Path, session, every: bool) -> list:
+    if every:
+        return [s for s, _ in list_sessions(home)]
+    s = session or env_session() or newest_session(home)
+    if not s or not SESSION_RE.match(s):
+        raise AhError("session_unknown", "no session: pass --session or --all")
+    return [s]
+
+
+def list_sessions(home: Path) -> list:
+    """(session id, main WAL mtime) newest first; only directories with a main WAL."""
+    out = []
+    try:
+        for entry in os.scandir(wal_dirs(home)):
+            main = Path(entry.path) / "main.jsonl"
+            if SESSION_RE.match(entry.name) and main.is_file():
+                out.append((entry.name, main.stat().st_mtime))
+    except OSError:
+        pass
+    return sorted(out, key=lambda x: -x[1])
+
+
+def sessions_view(home: Path) -> dict:
+    return {"generated": iso(time.time()),
+            "sessions": [{"session": s, "last_activity": iso(m)} for s, m in list_sessions(home)]}
+
+
+def _epoch(text):
+    try:
+        t = dt.datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+        return (t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)).timestamp()  # naive stamps are UTC, as in parse_ts
+    except (ValueError, TypeError):
+        return None
+
+
+def asks_view(home: Path, session=None, every: bool = False, now=None) -> dict:
+    """Every ask with its state. State: open | stale (open > 24 h) | resolved | assumption | blocked (untraceable)."""
+    import redact
+    prov = _prov()
+    now = time.time() if now is None else now
+    rows, total, limited = [], 0, False
+    deadline = time.monotonic() + VIEW_BUDGET_S
+    for s in _view_sessions(home, session, every):
+        if time.monotonic() > deadline:
+            limited = True
+            break
+        try:
+            records = prov.ledger(s, home / ".claude")
+        except Exception:  # one unreadable session must not hide the others
+            continue
+        per_wal = {}
+        for rec in records:
+            per_wal[rec["_wal"]] = per_wal.get(rec["_wal"], 0) + 1
+        # the shared reader reads at most MAX_HITS ask and MAX_HITS ask_resolved lines per WAL: later ones are unseen
+        limited = limited or any(n >= prov.MAX_HITS for n in per_wal.values())
+        for rec in records:
+            total += 1
+            if time.monotonic() > deadline:
+                limited = True
+            if len(rows) >= VIEW_ROW_CAP:
+                continue
+            closed = rec.get("_closed")
+            at = _epoch(rec.get("at"))
+            age = int(now - at) if at else None
+            label, state = None, "open"
+            if closed:
+                state = "resolved"
+            else:
+                src = rec.get("source") or ""
+                if src and time.monotonic() > deadline:
+                    limited = True  # out of budget: no more resolves; the row is shown as unverified, never as traced
+                    res = None
+                else:
+                    res = prov.resolve(src, {"home": home / ".claude", "want_text": True}) if src else None
+                if res is None or not res.get("ok"):
+                    state = "blocked"
+                elif res.get("assumption"):
+                    state = "assumption"
+                elif rec.get("waiting_on_user"):
+                    state = "waiting-on-user"
+                elif age is not None and age > STALE_ASK_S:
+                    state = "stale"
+                label = res.get("label") if res else None
+            rows.append({
+                "id": str(rec.get("id"))[:40], "session": s,
+                "text": redact.redact(str(rec.get("note") or ""))[:600],
+                "why": redact.redact(str(rec.get("reason") or ""))[:400],
+                "owner": Path(str(rec.get("_wal"))).stem,
+                "source": redact.redact(str(rec.get("source") or ""))[:300], "source_label": label,
+                "at": rec.get("at") or None, "age_s": age, "state": state,
+                "resolved_at": (closed or {}).get("at"),
+                "surfaced_count": rec.get("surfaced_count") if isinstance(rec.get("surfaced_count"), int) else None})
+    return {"generated": iso(now), "asks": rows, "total": total, "truncated": limited or total > len(rows)}
+
+
+def _clean_field(value, cap: int = 300):
+    """Redacted, clipped text for a free-form WAL field; anything that is not text or a list of text is dropped."""
+    import redact
+    if isinstance(value, list):
+        value = ", ".join(str(v) for v in value[:10] if isinstance(v, (str, int)))
+    if not isinstance(value, (str, int)):
+        return None
+    return redact.redact(str(value))[:cap] or None
+
+
+def requirements_view(home: Path, session=None, every: bool = False, now=None) -> dict:
+    """Requirement entries (event=requirement) from the main WAL of each session, read with provenance's reader."""
+    import redact
+    prov = _prov()
+    now = time.time() if now is None else now
+    rows, total, limited = [], 0, False
+    deadline = time.monotonic() + VIEW_BUDGET_S
+    for s in _view_sessions(home, session, every):
+        if time.monotonic() > deadline:
+            limited = True
+            break
+        path = wal_dirs(home) / s / "main.jsonl"
+        try:
+            lines = list(prov._lines_containing(path, b'"event":"requirement"'))
+        except Exception:
+            continue
+        limited = limited or len(lines) >= prov.MAX_HITS  # the shared reader stops at MAX_HITS lines: say so
+        for line in lines:
+            if line is None:
+                continue
+            try:
+                rec = prov.loads_line(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict) or rec.get("event") != "requirement" or not isinstance(rec.get("id"), str) or not rec["id"]:
+                continue
+            total += 1
+            if len(rows) >= VIEW_ROW_CAP:
+                continue
+            at = _epoch(rec.get("at"))
+            rows.append({
+                "id": str(rec.get("id") or "")[:40], "session": s,
+                "text": redact.redact(str(rec.get("note") or ""))[:600],
+                "source": redact.redact(str(rec.get("source") or ""))[:300],
+                "at": rec.get("at") or None, "age_s": int(now - at) if at else None,
+                "state": str(rec.get("state") or "recorded")[:20],
+                "ticket": _clean_field(rec.get("ticket")), "owner": _clean_field(rec.get("owner")),
+                "evidence": _clean_field(rec.get("evidence"))})
+    return {"generated": iso(now), "requirements": rows, "total": total, "truncated": limited or total > len(rows)}
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="ah", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--text", action="store_true", help="human summary instead of JSON")
@@ -1403,6 +1556,12 @@ def build_parser():
     for x in (r, st, dn, cc, dp):
         x.add_argument("--session")
         x.add_argument("--key", help="idempotency key (default: derived from the request)")
+    for name in ("asks", "requirements"):
+        v = sub.add_parser(name, help="read-only JSON view for the console")
+        v.add_argument("--session")
+        v.add_argument("--all", action="store_true", help="every session with a main WAL")
+        v.add_argument("--json", action="store_true", help="accepted for symmetry; output is always JSON")
+    sub.add_parser("sessions", help="sessions with a main WAL, newest first")
     sub.add_parser("doctor", help="check the import chain and file hashes of this install")
     sp = sub.add_parser("spool")
     sp.add_argument("action", choices=["drain"])
@@ -1437,6 +1596,12 @@ def run(args, home: Path) -> dict:
         if not s or not SESSION_RE.match(s):
             raise AhError("session_unknown", "no session: pass --session")
         return owners(home, s, comments=comment_age if args.comments else None)
+    if cmd == "asks":
+        return asks_view(home, args.session, args.all)
+    if cmd == "requirements":
+        return requirements_view(home, args.session, args.all)
+    if cmd == "sessions":
+        return sessions_view(home)
     if cmd == "user-msg":
         s = args.session or env_session()
         if not s:  # never guess "the newest transcript": a running helper session would win
