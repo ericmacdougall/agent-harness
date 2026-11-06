@@ -180,6 +180,60 @@ class GateTests(Base):
         self.assertIn("dropowner", out.get("systemMessage", ""))
 
 
+class ReassignInheritsTargetWait(Base):
+    """goodqa#14791 repeat defect (3x on 2026-11-06): a mission owner that pauses into a named wait is DROPPED to
+    `ah owners`; items reassigned to it flipped back to DROPPED and blocked Stop. A reassignment must inherit the
+    target's live disposition, bounded by that disposition's own expiry."""
+
+    def add_target(self, name="waitowner"):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 9000), "event": "subagent", "agent_id": name, "agent_type": "task-owner"},
+                              {"at": iso(NOW - 200), "event": "subagent_stop", "agent_id": name, "agent_type": "task-owner"}])
+        jl(w / ("agent-%s.jsonl" % name), [{"at": iso(NOW - 4000), "event": "intent", "note": "paused"}])
+
+    def wait(self, agent, key, until, ref="wa5b00000001"):
+        return ah.write(self.home, "task.dispose", {"agent": agent, "session": SESSION, "kind": "waiting", "at": iso(NOW),
+                                                    "until": iso(until), "ref": ref}, SESSION, key)
+
+    def test_reassigned_to_a_target_in_a_live_named_wait_holds(self):
+        self.add_target()
+        self.wait("waitowner", "key-tw-1-0000", NOW + 3600)
+        self.dispose("reassigned", "key-tw-r1-0000", ref="waitowner")
+        by = {r["agent_id"]: r for r in self.owners()["owners"]}
+        self.assertEqual(by["waitowner"]["state"], "DROPPED")  # the target itself is excused only by its wait
+        self.assertEqual(self.owners()["undisposed"], [])
+        self.assertEqual(self.stop(), {})
+
+    def test_inherited_wait_expires_with_the_targets_wait(self):
+        self.add_target()
+        self.wait("waitowner", "key-tw-2-0000", NOW + 3600)
+        self.dispose("reassigned", "key-tw-r2-0000", ref="waitowner")
+        later = NOW + 3601
+        self.assertEqual(self.owners(now=later)["undisposed"], ["dropowner", "waitowner"])
+        self.assertEqual(self.stop(now=later).get("decision"), "block")
+
+    def test_reassigned_to_a_dropped_target_without_a_decision_still_blocks(self):
+        self.add_target()
+        self.dispose("reassigned", "key-tw-r3-0000", ref="waitowner")
+        self.assertIn("dropowner", self.owners()["undisposed"])
+
+    def test_reassignment_cycle_does_not_excuse_either_owner(self):
+        self.add_target()
+        self.dispose("reassigned", "key-tw-r4-0000", ref="waitowner")
+        ah.write(self.home, "task.dispose", {"agent": "waitowner", "session": SESSION, "kind": "reassigned",
+                                             "at": iso(NOW), "ref": "dropowner"}, SESSION, "key-tw-r4b-0000")
+        self.assertEqual(self.owners()["undisposed"], ["dropowner", "waitowner"])
+
+    def test_chain_through_a_reassigned_target_reaches_the_live_wait(self):
+        self.add_target("waitowner")
+        self.add_target("middle")
+        self.wait("waitowner", "key-tw-5-0000", NOW + 3600)
+        ah.write(self.home, "task.dispose", {"agent": "middle", "session": SESSION, "kind": "reassigned",
+                                             "at": iso(NOW), "ref": "waitowner"}, SESSION, "key-tw-r5b-0000")
+        self.dispose("reassigned", "key-tw-r5-0000", ref="middle")
+        self.assertEqual(self.owners()["undisposed"], [])
+
+
 class SubagentStopGate(Base):
     """I7: a sub-agent cannot end its turn with pending work and no armed waiter (desktop release owner, 2026-11-05)."""
 

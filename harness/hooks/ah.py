@@ -345,12 +345,32 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                      "last_activity": iso(summary["last_at"]), "idle_s": None if idle == float("inf") else int(idle),
                      "ticket": summary["tickets"][0] if summary["tickets"] else None, "ticket_comment_age_s": None})
     disp = dispositions(home, session)
-    live_ids = {r["agent_id"] for r in rows if r["state"] not in ("DROPPED", "done", "handoff", "returned")}
+    by_id = {r["agent_id"]: r for r in rows}
+
+    def covered(agent_id, seen=()):
+        """A reassignment target holds the work when it is live, or is DROPPED but excused by its own live disposition
+        (a named wait, a fresh resume, closed, or a further reassignment). The chain is cycle-safe and each link
+        keeps its own expiry, so an inherited wait ends when the target's wait ends (goodqa#14791).
+        A `closed` target excuses work reassigned to it, by design: closing is the owner's permanent decision that
+        the work needs no owner. Reassigning to an owner therefore also hands over the right to close it."""
+        t = by_id.get(agent_id)
+        if t is None or agent_id in seen:
+            return False
+        if t["state"] not in ("DROPPED", "done", "handoff", "returned"):
+            return True
+        if t["state"] != "DROPPED":
+            return False
+        td = disp.get(agent_id)
+        if td and td.get("kind") == "reassigned":
+            return covered(td.get("ref"), seen + (agent_id,))
+        return liveness.disposition_live(td, now, last_activity=parse_ts(t["last_activity"]) or 0.0)
+
     for r in rows:
         d = disp.get(r["agent_id"])
         last_wal = parse_ts(r["last_activity"]) or 0.0
         alive = liveness.disposition_live(d, now, last_activity=last_wal,
-                                          replacement_live=bool(d and d.get("ref") in live_ids))
+                                          replacement_live=bool(d and d.get("kind") == "reassigned"
+                                                                and covered(d.get("ref"), (r["agent_id"],))))
         r["disposition"] = dict(d, live=alive) if d else None
         r["decision_required"] = bool(r["owner"] and r["state"] == "DROPPED" and not alive)
     # a wait on another agent holds only while that agent is live; a wait on a DROPPED, done or unknown agent is a drop
