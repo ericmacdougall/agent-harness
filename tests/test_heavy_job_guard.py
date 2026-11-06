@@ -55,6 +55,72 @@ def decide(command, cwd=None, modes=None):
     return guard.decide(command, cwd, modes or MODES)
 
 
+class BigClone(unittest.TestCase):
+    """goodqa#14927 item 9: full copies of a large repository onto the Mac get a warning (never a denial) that names
+    worktrees, git archive, partial clones and dev2. Pack files are sparse here, so nothing large is written."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.big = self.repo("goodqa", 600 * 2 ** 20)
+        self.small = self.repo("tiny", 2 ** 20)
+        self.work = self.root / "work" / "sess"  # a search root with a clone named after the repo
+        self.work.mkdir(parents=True)
+        os.symlink(self.big, self.work / "goodqa-review")  # symlinks are not followed: only a real directory counts
+        shutil.copytree(self.big, self.work / "GoodQA-rt")  # sparse pack: copies cheaply
+
+    def repo(self, name, pack_size):
+        path = self.root / name
+        (path / ".git" / "objects" / "pack").mkdir(parents=True)
+        with open(path / ".git" / "objects" / "pack" / "pack-1.pack", "wb") as handle:
+            handle.truncate(pack_size)
+        return path
+
+    def judge(self, command, modes=None):
+        with unittest.mock.patch.object(guard, "CLONE_SEARCH_ROOTS", (str(self.root / "work"),)):
+            return decide(command, cwd=str(self.root), modes=modes)
+
+    def test_big_local_copies_warn_with_the_alternatives(self):
+        for command in (f"git clone {self.big} /tmp/goodqa-copy", f"git clone goodqa copy2", f"cp -R {self.big} /tmp/copy",
+                        f"cp -a goodqa/ copy3", f"rsync -a --delete {self.big}/ /tmp/copy4/", "mkdir -p y && cp -r goodqa y/"):
+            with self.subTest(command):
+                result = self.judge(command)
+                self.assertEqual((result["action"], result["rule"]), ("warn", "big-clone"), result)
+                for phrase in ("git worktree add", "git archive HEAD | tar -x", "--filter=blob:none", "dev2"):
+                    self.assertIn(phrase, result["message"])
+                self.assertIn("0.6 GB", result["detail"])
+
+    def test_remote_url_is_judged_by_an_existing_clone_of_that_name(self):
+        result = self.judge("git clone https://github.com/ericmacdougall/GoodQA.git")
+        self.assertEqual((result["action"], result["rule"]), ("warn", "big-clone"), result)
+        self.assertIn(str(self.work / "GoodQA-rt"), result["detail"])
+        self.assertEqual(self.judge("git clone git@github.com:someone/unknown-repo.git").get("action"), "allow")
+
+    def test_small_partial_remote_and_non_recursive_copies_are_allowed(self):
+        for command in (f"git clone {self.small} /tmp/t", f"cp -R {self.small} /tmp/t2", f"cp {self.big}/README.md /tmp/",
+                        f"git clone --filter=blob:none {self.big} /tmp/t3", f"git clone --depth 1 {self.big} /tmp/t4",
+                        f"rsync -a {self.big}/ dev2:/srv/goodqa/", f"rsync -a dev2:/srv/goodqa/ {self.big}/",
+                        f"git -C {self.big} status", f"ls {self.big}", f"git clone {self.root}/nonexistent /tmp/t5"):
+            with self.subTest(command):
+                self.assertEqual(self.judge(command).get("action"), "allow", command)
+
+    def test_big_clone_never_denies_whatever_the_mode_table_says(self):
+        strict = dict(guard.DEFAULT_MODES, **{"big-clone": "enforce"})
+        self.assertEqual(self.judge(f"cp -R {self.big} /tmp/copy", modes=strict)["action"], "warn")
+        off = dict(guard.DEFAULT_MODES, **{"big-clone": "off"})
+        self.assertEqual(self.judge(f"cp -R {self.big} /tmp/copy", modes=off)["action"], "allow")
+
+    def test_pack_bytes_follows_a_worktree_gitdir_pointer(self):
+        wt = self.root / "goodqa-wt"
+        wt.mkdir()
+        (self.big / ".git" / "worktrees" / "goodqa-wt").mkdir(parents=True)
+        (self.big / ".git" / "worktrees" / "goodqa-wt" / "commondir").write_text("../..\n")
+        (wt / ".git").write_text(f"gitdir: {self.big}/.git/worktrees/goodqa-wt\n")
+        self.assertEqual(guard.pack_bytes(str(wt)), 600 * 2 ** 20)
+        self.assertIsNone(guard.pack_bytes(str(self.root / "not-a-repo")))
+
+
 class Classification(unittest.TestCase):
     def test_ac1_io_probe_is_routed_but_never_blocked(self):
         result = decide(IO_COMMAND)
