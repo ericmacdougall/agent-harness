@@ -346,6 +346,11 @@ def liveness_alerts(owner_docs: dict, policy: dict) -> dict:
             sev = LIVENESS_SEVERITY.get(r.get("state"))
             if not sev or r.get("owner") is not True:  # ahd only raises rows ah marks as owners
                 continue
+            # same rule as `ah owners` undisposed: a live disposition (named wait, resume, closed, reassignment to a
+            # live owner) excuses the row unless ah still marks it decision_required
+            disp = r.get("disposition")
+            if isinstance(disp, dict) and disp.get("live") is True and r.get("decision_required") is not True:
+                continue
             idle = r.get("idle_s") if isinstance(r.get("idle_s"), int) else None
             if sev == "high" and idle is not None and idle >= crit:
                 sev = "critical"
@@ -420,6 +425,45 @@ def wal_ask_alerts(pending: list, ts: float) -> dict:
                                      "message": f"ask {a['id']} awaits the user (reminder {stage + 1}): {a.get('text', '')}"[:300],
                                      "detail": {"ask": a["id"], "session": a.get("session"), "stage": stage,
                                                 "stop_block": False}}
+    return out
+
+
+def current_sessions(sessions: list, policy: dict, ts: float) -> set:
+    """8-char ids of main sessions whose WAL moved within ask_current_window_seconds: their asks alert one by one."""
+    window = policy.get("ask_current_window_seconds", 3600)
+    out = set()
+    for s in sessions:
+        try:
+            if ts - os.lstat(home() / ".claude" / "wals" / s / "main.jsonl").st_mtime <= window:
+                out.add(s[:8])
+        except OSError:
+            continue
+    return out
+
+
+def ask_digest(flags: dict, current: set, ts: float) -> dict:
+    """Keep individual ask alerts only for WAL asks from a current session (and the ledger error); fold every other
+    ask alert into one ask:digest per host at the highest folded severity, so old or foreign asks cost one row."""
+    out, folded = {}, []
+    for k, f in flags.items():
+        if k == "ask:ledger:error" or (f.get("detail") or {}).get("session") in current:
+            out[k] = f
+        else:
+            folded.append((k, f))
+    if folded:
+        kinds = {}
+        for k, _ in folded:
+            kind = k.rsplit(":", 1)[-1]
+            kinds[kind] = kinds.get(kind, 0) + 1
+        sev = max((f["severity"] for _, f in folded), key=lambda v: SEV.get(v, 0))
+        ids = sorted({str((f.get("detail") or {}).get("ask") or f.get("subject")) for _, f in folded})
+        out["ask:digest"] = {
+            "severity": sev, "class": "ask", "kind": "ask", "subject": "digest",
+            "since": int(min((f.get("since") or ts) for _, f in folded)),
+            "message": (f"{len(ids)} open ask(s) outside the current session ("
+                        + ", ".join(f"{n} {kind}" for kind, n in sorted(kinds.items())) + "): "
+                        + ", ".join(ids[:8]) + (" ..." if len(ids) > 8 else ""))[:300],
+            "detail": {"asks": len(ids), "kinds": kinds, "stop_block": False}}
     return out
 
 
@@ -585,8 +629,9 @@ class Daemon:
         events = read_ring()
         desired = {}
         desired.update(liveness_alerts(docs, self.policy))
-        desired.update(ask_alerts(asks, self.policy, ts))
-        desired.update(wal_ask_alerts(pending, ts))
+        ask_flags = dict(ask_alerts(asks, self.policy, ts))
+        ask_flags.update(wal_ask_alerts(pending, ts))
+        desired.update(ask_digest(ask_flags, current_sessions(sessions, self.policy, ts), ts))
         desired.update(ring_wrap_alert(events, ts, self.host))
         desired.update(wal_unsafe_alerts(blocked, ts))
         ring = ring_state(events, SOURCE, self.host)

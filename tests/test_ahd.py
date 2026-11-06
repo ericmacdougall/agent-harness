@@ -906,3 +906,54 @@ class MemoryBounds(Scratch):
         os.utime(self.main_wal, (NOW - 60, NOW - 60))
         self.policy["owners_wal_max_bytes"] = 1 << 20
         self.assertEqual(ahd.active_sessions(self.policy, NOW), [])
+
+
+OLD_SESSION = "99999999-2222-4333-8444-555555555555"
+
+
+class AlertNoise(Scratch):
+    """2026-11-06: #14848 going live raised 39 liveness alerts for owners `ah owners` already excused, and ~90
+    one-per-ask alerts for old asks. Liveness must follow ah's disposition rule; old asks cost one digest row."""
+
+    def test_live_disposition_excuses_liveness_like_ah_owners(self):
+        live = {"kind": "wait", "ref": "goodqa#1", "live": True}
+        rows = [dict(owner("a1111111", "DROPPED"), disposition=live, decision_required=False),
+                dict(owner("a2222222", "SILENT-HIGH"), disposition=live, decision_required=False),
+                dict(owner("a3333333", "DROPPED"), disposition=dict(live, live=False), decision_required=True),
+                dict(owner("a4444444", "DROPPED"), disposition=live, decision_required=True),  # wait target gone
+                owner("a5555555", "SILENT")]
+        got = ahd.liveness_alerts({SESSION: {"owners": rows}}, self.policy)
+        self.assertEqual(sorted(f["detail"]["agent"] for f in got.values()), ["a3333333", "a4444444", "a5555555"])
+
+    def wal_ask(self, path, ask_id):
+        with open(path, "a") as fh:
+            fh.write(json.dumps({"at": "2027-01-10T08:00:00+00:00", "event": "ask", "id": ask_id, "note": "n"}) + "\n")
+
+    def test_old_session_asks_fold_into_one_digest_and_current_ones_stay(self):
+        old = self.home / ".claude" / "wals" / OLD_SESSION
+        old.mkdir(parents=True)
+        for i in range(5):
+            self.wal_ask(old / "main.jsonl", f"wa{i:010x}")
+        os.utime(old / "main.jsonl", (NOW - 7200, NOW - 7200))  # inside the owner window, outside the ask window
+        self.wal_ask(self.main_wal, "wcurrent0001")
+        os.utime(self.main_wal, (NOW - 60, NOW - 60))
+        self.owners([])
+        self.owners([], session=OLD_SESSION)
+        d = self.daemon()
+        d.tick()
+        asks = sorted(k for k in d.last["desired"] if k.startswith("ask:"))
+        self.assertEqual(asks, ["ask:digest", "ask:wcurrent0001:due"])
+        dig = d.last["desired"]["ask:digest"]
+        self.assertEqual(dig["detail"]["asks"], 5)
+        self.assertIn("wa0000000000", dig["message"])
+        raised = [a for a in self.alert_calls("raise") if any(str(x).startswith("ask:") for x in a)]
+        self.assertEqual(len(raised), 2)
+
+    def test_digest_takes_the_highest_folded_severity(self):
+        flags = {"ask:a:due": {"severity": "info", "since": 5, "subject": "a", "detail": {"ask": "a", "session": "x"}},
+                 "ask:b:unowned": {"severity": "high", "since": 3, "subject": "b", "detail": {"ask": "b"}},
+                 "ask:ledger:error": {"severity": "warning", "since": 0, "subject": "ledger", "detail": {}}}
+        got = ahd.ask_digest(flags, set(), NOW)
+        self.assertEqual(sorted(got), ["ask:digest", "ask:ledger:error"])
+        self.assertEqual((got["ask:digest"]["severity"], got["ask:digest"]["since"]), ("high", 3))
+        self.assertEqual(ahd.ask_digest({}, set(), NOW), {})
