@@ -41,9 +41,14 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self.addCleanup(self.tmp.cleanup)
-        p = mock.patch.dict(os.environ, {"AH_HOME": str(self.home), "HOME": str(self.home), "AH_NOW": str(NOW)})  # server-side stamps on the fixture clock
+        p = mock.patch.dict(os.environ, {"AH_HOME": str(self.home), "HOME": str(self.home)})
+        clock = mock.patch.object(ah, "server_now", side_effect=lambda: iso(NOW))  # the writer clock, pinned in-process only
+        clock.start()
+        self.addCleanup(clock.stop)
         p.start()
         self.addCleanup(p.stop)
+        for k in ("CLAUDE_CODE_CHILD_SESSION", "AH_AGENT_ID", "AGENT_ID"):  # the runner may itself be a sub-agent;
+            os.environ.pop(k, None)  # patch.dict restores them. Tests act as main unless they set an identity.
         w = self.home / ".claude" / "wals" / SESSION
         jl(w / "main.jsonl", [
             {"at": iso(NOW - 9000), "event": "subagent", "agent_id": "dropowner", "agent_type": "task-owner"},

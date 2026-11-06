@@ -109,7 +109,7 @@ def pending_work(home: Path, session: str, agent: str) -> str | None:
     """Why the agent's own WAL says its work is unfinished, or None (handoff/result/named wait/empty)."""
     import ah  # noqa: PLC0415
     import liveness  # noqa: PLC0415
-    path = home / ".claude" / "wals" / session / f"agent-{agent}.jsonl"
+    path = ah.session_dir(home, session) / f"agent-{agent}.jsonl"  # either WAL root
     if not path.is_file():
         return None
     last = None

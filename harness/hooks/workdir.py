@@ -437,7 +437,7 @@ def _unpushed_repos(path: Path, max_depth: int = 3, budget_s: float = 20.0) -> l
     for root, dirs, _files in os.walk(path):
         is_repo = ".git" in dirs or os.path.isfile(os.path.join(root, ".git"))  # a worktree has a .git file
         if is_repo:
-            dirs[:] = [d for d in dirs if d != ".git"]
+            dirs[:] = []  # git answers for everything below a checkout; the depth cap never fires inside one (review M2)
             if time.monotonic() > deadline:
                 found.append({"repo": root, "reason": "budget exhausted: treated as unpushed"})
                 continue

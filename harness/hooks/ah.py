@@ -823,7 +823,13 @@ def derive_key(op: str, args: dict, session: str) -> str:
 
 
 def actor_id() -> str:
-    return os.environ.get("AH_AGENT_ID") or os.environ.get("AGENT_ID") or "main"
+    """The acting agent from the launcher env; "unknown" when absent (never a claimed "main")."""
+    return os.environ.get("AH_AGENT_ID") or os.environ.get("AGENT_ID") or "unknown"
+
+
+def in_child_session() -> bool:
+    """A sub-agent shell: Claude Code sets CLAUDE_CODE_CHILD_SESSION; such a shell can never acknowledge a handoff."""
+    return bool(os.environ.get("CLAUDE_CODE_CHILD_SESSION"))
 
 
 def actor(session, host=None):
@@ -1071,7 +1077,10 @@ def _wal_append(home: Path, path: Path, record: dict) -> None:
         raise AhError("bad_request", "WAL path must be a session JSONL under ~/.claude/wals or ~/.agent-harness/codex-wals", 3)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as e:
+        raise AhError("wal_unsafe", f"WAL {path.name} is not a writable regular file ({e.__class__.__name__}); a symlinked WAL is refused", 3)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         os.write(fd, payload)
@@ -1088,8 +1097,7 @@ def _task(ledger: list, name: str):
 def _evidence_ok(home: Path, ev: list, allowed: set, reg: dict) -> None:
     reg_ts = parse_ts(reg.get("received_at"))
     reg_args = reg["args"]
-    roots = [r.resolve() for r in wal_roots(home) if r.exists()]
-    root = roots[0] if roots else (home / ".claude" / "wals").resolve()
+    roots = [r.resolve() for r in wal_roots(home) if r.exists()] or [(home / ".claude" / "wals").resolve()]
     for e in ev:
         if "really_tested" in e:
             wid = e["really_tested"].strip()
@@ -1097,7 +1105,7 @@ def _evidence_ok(home: Path, ev: list, allowed: set, reg: dict) -> None:
                 p = Path(e["wal"]).expanduser().resolve(strict=True)
             except OSError:
                 raise AhError("evidence", f"WAL not found: {e['wal'][:80]}", 3)
-            if root not in p.parents:
+            if not any(root in p.parents for root in roots):
                 raise AhError("evidence", "evidence WAL must be under ~/.claude/wals", 3)
             if p not in allowed:
                 raise AhError("evidence", "evidence WAL must be this task's session or owner WAL", 3)
@@ -1208,8 +1216,9 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
             "severity": args.get("severity") or "info", "key": args["alert_key"], "check": args["source"],
             "message": args.get("message") or "cleared", "detail": args.get("detail") or {}}, home=home)
     elif op == "task.dispose":
-        if args["kind"] in ("resumed", "reassigned", "closed") and actor_id() == args["agent"]:
-            raise AhError("forbidden", f"task.dispose {args['kind']}: an owner cannot dispose itself; main or another agent records it", 3)
+        if args["kind"] in ("resumed", "reassigned", "closed") and (actor_id() == args["agent"] or in_child_session()):
+            raise AhError("forbidden", f"task.dispose {args['kind']}: a sub-agent or the owner itself cannot acknowledge; "
+                                       "main records it (waiting is allowed)", 3)
         main_wal = _wal_path(home, args["session"], "main")
         if not main_wal.is_file():
             raise AhError("session_unknown", f"no main WAL for session {args['session']!r}", 3)
@@ -1338,9 +1347,9 @@ def task_list(home: Path, open_only: bool = False) -> dict:
 
 
 def server_now() -> str:
-    """The writer's clock for stamped ops; AH_NOW (epoch) pins it for tests."""
-    env = os.environ.get("AH_NOW")
-    return iso(float(env)) if env else iso(time.time())
+    """The writer's clock for stamped ops. No environment override: a caller-chosen time is a gate bypass
+    (a forward-dated resumed would be live forever). Tests patch this function."""
+    return iso(time.time())
 
 
 def write(home: Path, op: str, args: dict, session: str, key: str | None = None) -> dict:
