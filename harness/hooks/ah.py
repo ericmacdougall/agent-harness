@@ -1410,6 +1410,8 @@ def build_parser():
     kp.add_argument("--tree", action="store_true", help="signal children first")
     kp.add_argument("--grace", type=float, default=10.0, help="seconds between SIGTERM and SIGKILL (default 10)")
     kp.add_argument("--host", help="run on dev2, t2-dev or ah-mac-mini over ssh")
+    kp.add_argument("--foreign", action="store_true",
+                    help="allow a process outside your worktree and process tree (audited; raises a high ops-watch notice)")
     kp.add_argument("--session")
     kp.add_argument("--agent", help="calling agent id for the audit row")
     kp.add_argument("--wal", help="caller WAL path (default: this session's main WAL)")
@@ -1482,10 +1484,10 @@ def run(args, home: Path) -> dict:
             agent = args.agent or os.environ.get("AH_AGENT_ID", "")
             if args.host:
                 return ah_kill.kill_remote(args.host, pids, (args.reason or "").strip(), args.tree, args.grace,
-                                           args.session or env_session(), agent, home)
+                                           args.session or env_session(), agent, home, foreign=args.foreign)
             return ah_kill.kill_local(pids, args.reason, args.tree, args.grace, home,
                                       session=args.session or env_session(), agent=agent, wal_path=args.wal,
-                                      via=args.via)
+                                      via=args.via, foreign=args.foreign)
         except ah_kill.KillError as e:
             raise AhError(e.code, str(e), e.exit_code)
     raise AhError("unknown_command", cmd)

@@ -1069,7 +1069,7 @@ def make_analyzer_class(cg):
             while i < len(rest):
                 t = rest[i]
                 key, eq, val = t.partition('=') if t.startswith('--') else (t, '', '')
-                if key == '--tree' and not eq:
+                if key in ('--tree', '--foreign') and not eq:
                     seen.add(key)
                     i += 1
                     continue

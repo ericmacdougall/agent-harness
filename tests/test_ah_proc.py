@@ -40,8 +40,16 @@ class FakeProbe:
     def user(self, uid):
         return "u%d" % uid
 
+    cwds = {}
+
     def cwd(self, pid):
-        return "/work/%d" % pid
+        return self.cwds.get(pid, "/work/%d" % pid)
+
+    def git_top(self, path):
+        return "/elsewhere" if path and path.startswith("/elsewhere") else None
+
+    def session_env(self, pid):
+        return "owner-sess-%d" % pid
 
     def table(self):
         return {pid: p["ppid"] for pid, p in self.procs.items()}
@@ -69,10 +77,13 @@ class KillBase(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)
         self.clock = Clock()
+        self.notices = []
         os.environ.pop("CLAUDE_PID", None)
 
     def run_kill(self, probe, pids, reason="runaway test", **kw):
         kw.setdefault("grace", 5)
+        kw.setdefault("worktree", "/work")
+        kw.setdefault("notify", lambda home, event: self.notices.append(event))
         return ak.kill_local(pids, reason, home=self.home, probe=probe, sleep=self.clock.sleep, clock=self.clock.now,
                              session="sess-1", agent="agent-x", own_pid=OWN, **kw)
 
@@ -400,7 +411,101 @@ class ReviewFixes(KillBase):
         self.assertIn("result", text)
 
 
+class NarrowedScope(KillBase):
+    def foreign(self, pid, cwd="/elsewhere/repo", ppid=1, **kw):
+        p = proc(pid, ppid, cmd="/usr/bin/python3 -m pytest")
+        probe = self.base(p)
+        probe.cwds = {pid: cwd}
+        return probe
+
+    def test_daemons_and_backup_jobs_are_always_refused_even_with_foreign(self):
+        for n, cmd in enumerate(("rclone sync /a b:", "/x/bin/harness-console", "/opt/netwatch/netwatch run",
+                                 "python3 /h/hookd.py serve", "python3 /h/ahd.py", "/bin/bash /h/log_backup.sh",
+                                 "/Users/e/.agent-harness/bin/log-backup.sh")):
+            with self.subTest(cmd=cmd):
+                probe = self.base(proc(1000 + n, 100, cmd=cmd))
+                out = self.run_kill(probe, [1000 + n], foreign=True)
+                self.assertEqual(out["results"][0]["status"], "refused", out)
+                self.assertRegex(out["results"][0]["detail"], "daemon|protected")
+                self.assertEqual(probe.sent, [])
+
+    def test_mcp_server_of_another_live_session_is_refused(self):
+        probe = self.base(proc(3100, 1, cmd="claude", comm="claude"),
+                          proc(3101, 3100, cmd="npm exec @modelcontextprotocol/server-x", comm="node"),
+                          proc(3102, 3101, cmd="node /x/mcp-server.js", comm="node"))
+        probe.cwds = {3102: "/work/x"}
+        out = self.run_kill(probe, [3102], foreign=True)
+        self.assertEqual(out["results"][0]["status"], "refused")
+        self.assertIn("another live session", out["results"][0]["detail"])
+        self.assertEqual(probe.sent, [])
+
+    def test_mcp_server_of_my_own_session_is_not_special(self):
+        probe = self.base(proc(3201, 3000, cmd="node /x/mcp-server.js", comm="node"))
+        out = self.run_kill(probe, [3201])
+        self.assertEqual(out["results"][0]["status"], "exited")
+
+    def test_foreign_target_without_flag_is_refused(self):
+        probe = self.foreign(1100)
+        out = self.run_kill(probe, [1100])
+        self.assertEqual(out["results"][0]["status"], "refused")
+        self.assertIn("--foreign", out["results"][0]["detail"])
+        self.assertEqual(probe.sent, [])
+        self.assertEqual(self.notices, [])
+        self.assertFalse(out["ok"])
+
+    def test_foreign_with_flag_records_owner_and_notifies_main(self):
+        probe = self.foreign(1101)
+        out = self.run_kill(probe, [1101], foreign=True, reason="runaway pytest of another owner")
+        self.assertEqual(out["results"][0]["status"], "exited")
+        intent = self.audit()[0]
+        self.assertTrue(intent["foreign"])
+        self.assertEqual(intent["cwd"], "/elsewhere/repo")
+        self.assertEqual(intent["target_worktree"], "/elsewhere")
+        self.assertIn("owner_session", intent)
+        self.assertEqual(len(self.notices), 1)
+        ev = self.notices[0]
+        self.assertEqual((ev["severity"], ev["event"], ev["source"]), ("high", "raise", "ops-watch"))
+        self.assertIn("1101", ev["message"])
+        self.assertEqual([r["event"] for r in self.audit()][:2], ["intent", "signal"])
+
+    def test_failed_notice_means_no_signal(self):
+        probe = self.foreign(1102)
+
+        def boom(home, event):
+            raise OSError("ring full")
+        with self.assertRaises(ak.KillError) as cm:
+            self.run_kill(probe, [1102], foreign=True, notify=boom)
+        self.assertEqual(cm.exception.code, "notice_failed")
+        self.assertEqual(probe.sent, [])
+        self.assertIn("aborted", [r["event"] for r in self.audit()])
+
+    def test_own_worktree_and_own_tree_need_no_flag_and_send_no_notice(self):
+        probe = self.foreign(1103, cwd="/work/sub")  # cwd inside my worktree
+        self.assertEqual(self.run_kill(probe, [1103])["results"][0]["status"], "exited")
+        probe = self.base(proc(1104, OWN, cmd="sleep 5"))  # child of the caller
+        probe.cwds = {1104: "/elsewhere/x"}
+        self.assertEqual(self.run_kill(probe, [1104])["results"][0]["status"], "exited")
+        probe = self.base(proc(1105, 4000, cmd="sleep 5"))  # under the caller's shell, under its claude session
+        probe.cwds = {1105: "/elsewhere/x"}
+        self.assertEqual(self.run_kill(probe, [1105])["results"][0]["status"], "exited")
+        self.assertEqual(self.notices, [])
+
+    def test_flag_does_not_lift_hard_refusals(self):
+        probe = self.base(proc(1106, 1, uid=0, cmd="/usr/bin/x"))
+        self.assertEqual(self.run_kill(probe, [1106], foreign=True)["results"][0]["status"], "refused")
+        self.assertEqual(self.notices, [])
+
+
 class Remote(KillBase):
+    def test_foreign_flag_is_forwarded(self):
+        seen = {}
+
+        def runner(argv, **kw):
+            seen["cmd"] = argv[-1]
+            return subprocess.CompletedProcess(argv, 0, stdout='{"ok": true, "run": "k1", "results": []}')
+        ak.kill_remote("dev2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True)
+        self.assertIn("--foreign", seen["cmd"])
+
     def test_host_allowlist_and_quoting(self):
         seen = {}
 
@@ -427,7 +532,7 @@ class GuardRule(unittest.TestCase):
             return kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp)[0]
 
     def test_literal_forms_pass(self):
-        for tail in ("--pid 4242 --reason 'runaway vite'", "--pid 4242,4243 --reason x --tree --grace 5",
+        for tail in ("--pid 4242 --reason 'runaway vite'", "--pid 4242,4243 --reason x --tree --foreign --grace 5",
                      "--pid=4242 --reason=stuck --host dev2", "--pid 12 --reason 'a b c' --agent a1b2 --session s-1"):
             self.assertEqual(self.verdict(self.A + tail), "allow", tail)
         self.assertEqual(self.verdict("python3 -I -B /Users/eric/.claude/hooks/ah.py kill --pid 9 --reason r"), "allow")

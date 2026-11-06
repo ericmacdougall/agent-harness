@@ -40,6 +40,12 @@ PROTECTED_PATH = re.compile(
     r"/(Google Chrome|Terminal|Finder|GoodQA[^/]*|Tailscale[^/]*|Dropbox[^/]*|Solve[^/]*)\.app(/|$)", re.I)
 SYSTEM_PATH = re.compile(r"^(/System/|/usr/libexec/|/sbin/|/usr/sbin/)")
 SHELLS = {"zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "csh", "-zsh", "-bash"}
+DAEMON_NAMES = {"rclone", "harness-console", "netwatch", "hookd", "ahd", "ahd_peek", "log_backup", "log-backup"}
+SESSION_COMM = {"claude", "codex"}
+MCP_WORD = re.compile(r"(?i)(?<![a-z])mcp(?![a-z])|modelcontextprotocol")
+REJECT_ROOTS = {"/", "/tmp", "/private/tmp", "/var", "/private/var", "/var/tmp", "/opt", "/usr", "/private", "/etc",
+                "/home", "/Users", "/mnt", "/srv", "/root"}
+SESSION_ENV = re.compile(r"CLAUDE_CODE_SESSION_ID=([A-Za-z0-9._-]{1,128})")
 PID_LIST = re.compile(r"[0-9]+(?:,[0-9]+)*")
 
 
@@ -115,6 +121,32 @@ class Probe:
                 return line[1:]
         return None
 
+    def git_top(self, path):
+        """Worktree root for a directory, or None (also None for HOME and system roots)."""
+        if not path or not os.path.isdir(path):
+            return None
+        try:
+            r = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                               timeout=8)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        top = r.stdout.strip()
+        if r.returncode != 0 or not top or top in REJECT_ROOTS or top == str(Path.home()):
+            return None
+        return top
+
+    def session_env(self, pid: int):
+        """CLAUDE_CODE_SESSION_ID of a process, best effort (ps eww shows the environment of own processes)."""
+        out = ""
+        try:
+            r = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
+                               timeout=8, env=dict(os.environ, LC_ALL="C"))
+            out = r.stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        m = SESSION_ENV.search(out)
+        return m.group(1) if m else None
+
     def table(self):
         """{pid: ppid} for every process."""
         rows = {}
@@ -150,7 +182,7 @@ def protected_ids(probe, own_pid: int):
     return ids
 
 
-def refusal(info, my_uid: int, protected: set):
+def refusal(info, my_uid: int, protected: set, probe=None, table=None):
     """Reason string when this process may never be signalled, else None. No flag reaches this function."""
     pid = info["pid"]
     if pid <= 1:
@@ -172,7 +204,44 @@ def refusal(info, my_uid: int, protected: set):
         return "interactive shell"
     if PROTECTED_PATH.search(comm) or PROTECTED_PATH.search(info.get("command") or ""):
         return "protected GUI app"
+    words = [comm] + (info.get("command") or "").split()[:4]
+    for w in words:
+        name = re.sub(r"\.(py|sh)$", "", os.path.basename(w).lower())
+        if name in DAEMON_NAMES:
+            return "harness daemon or backup job (%s)" % name
+    if probe is not None and table is not None and MCP_WORD.search(info.get("command") or ""):
+        owner = session_ancestor(probe, table, pid)
+        if owner is not None and owner not in protected:
+            return "MCP server of another live session (pid %d)" % owner
     return None
+
+
+def session_ancestor(probe, table, pid):
+    """Nearest claude/codex ancestor of pid (exclusive), or None."""
+    seen = set()
+    for _ in range(12):
+        pid = table.get(pid)
+        if not pid or pid <= 1 or pid in seen:
+            return None
+        seen.add(pid)
+        info = probe.info(pid)
+        if info and os.path.basename(info.get("comm") or "").lower() in SESSION_COMM:
+            return pid
+    return None
+
+
+def in_own_scope(probe, table, pid, cwd, roots, worktree):
+    """True when pid is inside the caller's process tree (a descendant of the caller or of its session process) or
+    its cwd is inside the caller's worktree."""
+    seen, cur = set(), pid
+    for _ in range(64):
+        if cur in roots:
+            return True
+        cur = table.get(cur)
+        if not cur or cur <= 1 or cur in seen:
+            break
+        seen.add(cur)
+    return bool(worktree and cwd and (cwd == worktree or cwd.startswith(worktree.rstrip("/") + "/")))
 
 
 def descendants(table: dict, root: int):
@@ -248,18 +317,31 @@ def parse_pids(text: str):
     return pids
 
 
-def snapshot(probe, pid, my_uid, protected, root=None, role="target"):
+def snapshot(probe, pid, my_uid, protected, root=None, role="target", scope=None):
     info = probe.info(pid)
     if info is None:
         return {"pid": pid, "role": role, "root": root, "status": "gone", "detail": "no such process"}
     rec = {"pid": pid, "role": role, "root": root, "ppid": info["ppid"], "user": probe.user(info["uid"]),
            "uid": info["uid"], "start": info["start"], "cmd": _clip(info["command"]), "cwd": probe.cwd(pid),
            "id": fingerprint(info), "_info": info}
-    why = refusal(info, my_uid, protected)
+    table = scope["table"] if scope else None
+    why = refusal(info, my_uid, protected, probe if scope else None, table)
     if why:
         rec["status"], rec["detail"] = "refused", why
     elif info["stat"].startswith("Z"):
         rec["status"], rec["detail"] = "gone", "already a zombie"
+    elif scope and not in_own_scope(probe, table, pid, rec["cwd"], scope["roots"], scope["worktree"]):
+        rec["scope"] = "foreign"
+        if not scope["foreign"]:
+            rec["status"] = "refused"
+            rec["detail"] = ("foreign: outside your worktree and process tree; pass --foreign to stop it "
+                             "(audited, and main is notified)")
+        else:
+            owner = session_ancestor(probe, table, pid)
+            rec["foreign"] = True
+            rec["target_worktree"] = probe.git_top(rec["cwd"])
+            rec["owner_pid"] = owner
+            rec["owner_session"] = probe.session_env(owner) if owner else None
     return rec
 
 
@@ -280,7 +362,8 @@ def alive(probe, rec) -> bool:
 
 
 def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=None, sleep=time.sleep,
-               clock=time.monotonic, session="", agent="", wal_path=None, via=None, own_pid=None):
+               clock=time.monotonic, session="", agent="", wal_path=None, via=None, own_pid=None, foreign=False,
+               worktree="auto", notify=None):
     reason = (reason or "").strip()
     if not reason:
         raise KillError("reason_required", "--reason is mandatory and must not be empty")
@@ -297,13 +380,29 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
     audit = Audit(home, default_wal(home, session, wal_path), caller)
     protected = protected_ids(probe, own_pid)
     run_id = "k" + uuid.uuid4().hex[:12]
-    table = probe.table() if tree else {}
+    table = probe.table()
+    roots = {own_pid}
+    chain, cur = [], own_pid
+    for _ in range(64):  # the caller's session process (nearest claude/codex ancestor) owns its whole tree
+        info = probe.info(cur)
+        if not info or info["ppid"] <= 1:
+            break
+        cur = info["ppid"]
+        parent = probe.info(cur)
+        if parent and os.path.basename(parent.get("comm") or "").lower() in SESSION_COMM:
+            roots.add(cur)
+            break
+    if os.environ.get("CLAUDE_PID", "").isdigit():
+        roots.add(int(os.environ["CLAUDE_PID"]))
+    if worktree == "auto":
+        worktree = probe.git_top(os.getcwd())
+    scope = {"table": table, "roots": roots, "worktree": worktree, "foreign": foreign}
     plan, seen = [], set()
     for root in pids:
         batch = []
         for child in (descendants(table, root) if tree else []):
-            batch.append(snapshot(probe, child, my_uid, protected, root=root, role="child"))
-        batch.append(snapshot(probe, root, my_uid, protected, role="target"))
+            batch.append(snapshot(probe, child, my_uid, protected, root=root, role="child", scope=scope))
+        batch.append(snapshot(probe, root, my_uid, protected, role="target", scope=scope))
         if tree and batch[-1].get("status") == "refused":
             # A refused root must not be bypassed by killing its children: the user asked for the tree.
             for rec in batch[:-1]:
@@ -318,6 +417,20 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
     for rec in plan:
         audit.row({"event": "intent" if rec in live else "refused", "run": run_id, "reason": reason,
                    "tree": tree, "grace": grace, **_public(rec)})
+    foreign_live = [r for r in live if r.get("foreign")]
+    if foreign_live:
+        event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "high", "check": "ah-kill",
+                 "key": "ah-kill:foreign:" + run_id,
+                 "message": "ah kill --foreign stopped/will stop %d process(es) outside the caller's tree: %s (reason: %s)" % (
+                     len(foreign_live), ", ".join(str(r["pid"]) for r in foreign_live), _clip(reason, 120)),
+                 "detail": {"run": run_id, "caller": caller, "reason": _clip(reason, 200), "targets": [
+                     {"pid": r["pid"], "cmd": _clip(r["cmd"], 120), "cwd": r["cwd"], "worktree": r.get("target_worktree"),
+                      "owner_session": r.get("owner_session")} for r in foreign_live]}}
+        try:
+            (notify or _ops_notice)(home, event)
+        except Exception as error:  # the notice is the point of --foreign: no notice, no signal
+            audit.row({"event": "aborted", "run": run_id, "why": "ops-watch notice failed: %s" % type(error).__name__})
+            raise KillError("notice_failed", "could not raise the ops-watch notice for a foreign stop; nothing was signalled", 3)
     audit.wal("ah kill %s: reason=%s targets=%s" % (run_id, _clip(reason, 200), ", ".join(
         "%d(%s)%s" % (r["pid"], os.path.basename((r.get("cmd") or "").split(" ")[0]), "" if r in live else " " + r["status"].upper())
         for r in plan)))
@@ -359,6 +472,17 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
             "results": [_public(r, result=True) for r in plan]}
 
 
+def _host():
+    import socket
+    return socket.gethostname().split(".")[0]
+
+
+def _ops_notice(home, event):
+    import ops_watch
+    event = dict(event, host=ops_watch.default_host())
+    ops_watch.emit(event, home=home)
+
+
 def _send(probe, audit, run_id, rec, sig, name) -> bool:
     """Recheck identity, then signal. False (and a status) when the pid is not the audited process."""
     try:
@@ -391,7 +515,7 @@ def _public(rec, result=False):
     return out
 
 
-def kill_remote(host, pids, reason, tree, grace, session="", agent="", home=None, runner=subprocess.run):
+def kill_remote(host, pids, reason, tree, grace, session="", agent="", home=None, runner=subprocess.run, foreign=False):
     if host not in HOSTS:
         raise KillError("bad_request", "--host must be one of %s" % ", ".join(HOSTS))
     home = home or Path.home()
@@ -399,6 +523,8 @@ def kill_remote(host, pids, reason, tree, grace, session="", agent="", home=None
         ",".join(str(p) for p in pids), shlex.quote(reason), grace, shlex.quote(session or agent or "unknown"))
     if tree:
         cmd += " --tree"
+    if foreign:
+        cmd += " --foreign"
     argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", host, cmd]
     audit = Audit(home, default_wal(home, session), {"session": session or None, "agent": agent or None})
     audit.row({"event": "remote", "host": host, "pids": pids, "reason": reason, "tree": tree})
