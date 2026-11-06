@@ -1358,6 +1358,13 @@ def build_parser():
     cc = ts.add_parser("comment")
     cc.add_argument("ticket", help="GoodQA <project>#N")
     cc.add_argument("--body", required=True)
+    tc = ts.add_parser("create", help="file a GoodQA ticket (idempotent on --key)")
+    tc.add_argument("--project", required=True)
+    tc.add_argument("--title", required=True)
+    tc.add_argument("--body-file", required=True)
+    tc.add_argument("--type", default="task")
+    tc.add_argument("--priority")
+    tc.add_argument("--key", help="idempotency key (default: hash of project, title and body)")
     for x in (g, c):
         x.add_argument("--project", default="goodqa")
     d = sub.add_parser("disk")
@@ -1404,6 +1411,18 @@ def build_parser():
     wr = ws.add_parser("result")
     wr.add_argument("--key", required=True)
     wr.add_argument("--session")
+    kp = sub.add_parser("kill", help="signal your own runaway processes: audited, with hard refusals (see ah_kill.py)")
+    kp.add_argument("--pid", required=True, help="N[,N...]")
+    kp.add_argument("--reason", required=True, help="why (mandatory, logged)")
+    kp.add_argument("--tree", action="store_true", help="signal children first")
+    kp.add_argument("--grace", type=float, default=10.0, help="seconds between SIGTERM and SIGKILL (default 10)")
+    kp.add_argument("--host", help="run on dev2, t2-dev or ah-mac-mini over ssh")
+    kp.add_argument("--foreign", action="store_true",
+                    help="allow a process outside your worktree and process tree (audited; raises a high ops-watch notice)")
+    kp.add_argument("--session")
+    kp.add_argument("--agent", help="calling agent id for the audit row")
+    kp.add_argument("--wal", help="caller WAL path (default: this session's main WAL)")
+    kp.add_argument("--via", help=argparse.SUPPRESS)
     return p
 
 
@@ -1426,6 +1445,12 @@ def run(args, home: Path) -> dict:
     if cmd == "disk":
         return disk(args.host, args.root, args.count, args.budget, not args.no_top)
     if cmd == "ticket":
+        if args.sub == "create":
+            import ah_ticket
+            try:
+                return ah_ticket.create(args.project, args.title, args.body_file, args.type, args.priority, args.key, home)
+            except ah_ticket.TicketCreateError as e:
+                raise AhError(e.code, str(e), e.exit_code)
         if args.sub == "get":
             return ticket_get(args.number, args.project)
         if args.sub == "comments":
@@ -1465,6 +1490,19 @@ def run(args, home: Path) -> dict:
             if row.get("key") == args.key:
                 return {"ok": True, "result": "applied", "id": row["id"], "seq": row["seq"], "key": args.key}
         return {"ok": True, "result": "unknown", "key": args.key}
+    if cmd == "kill":
+        import ah_kill
+        try:
+            pids = ah_kill.parse_pids(args.pid)
+            agent = args.agent or os.environ.get("AH_AGENT_ID", "")
+            if args.host:
+                return ah_kill.kill_remote(args.host, pids, (args.reason or "").strip(), args.tree, args.grace,
+                                           args.session or env_session(), agent, home, foreign=args.foreign)
+            return ah_kill.kill_local(pids, args.reason, args.tree, args.grace, home,
+                                      session=args.session or env_session(), agent=agent, wal_path=args.wal,
+                                      via=args.via, foreign=args.foreign)
+        except ah_kill.KillError as e:
+            raise AhError(e.code, str(e), e.exit_code)
     raise AhError("unknown_command", cmd)
 
 
