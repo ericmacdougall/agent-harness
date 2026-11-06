@@ -355,7 +355,7 @@ def liveness_alerts(owner_docs: dict, policy: dict) -> dict:
                 what = ""
             ticket = r.get("ticket") if isinstance(r.get("ticket"), str) else None
             since = parse_ts(r.get("last_activity")) or 0
-            if not re.match(r"^a[0-9a-f]{6,32}$", r["agent_id"]):
+            if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", r["agent_id"]):  # agents, auto-<hash> owners and task WALs
                 continue
             typ = r.get("type") if isinstance(r.get("type"), str) else "?"
             if peek.value_excluded([typ, ticket], policy):
@@ -401,6 +401,25 @@ def ask_alerts(asks: list, policy: dict, ts: float) -> dict:
         if st == "done" and not a.get("evidence") and ts - since <= policy.get("no_evidence_window_seconds", 7 * 86400):
             out[base + ":no-evidence"] = dict(common, severity="warning",
                                               message=f"ask {a['id']} closed without evidence")
+    return out
+
+
+def wal_ask_alerts(pending: list, ts: float) -> dict:
+    """P16 (goodqa#14791 I16): open WAL asks escalate on the bounded schedule in ask_reminders: stage 0 info,
+    stage 1 warning, stage 2+ high, so the ring (transitions on severity rise), the prompt context and the digest
+    re-surface them without a loop; a resolved ask is not in `pending`, so its alert clears."""
+    import ask_reminders  # noqa: PLC0415 - installed beside ahd
+    out = {}
+    for a in pending:
+        opened = a.get("at") or 0.0
+        stage = ask_reminders.stage_at(float(opened), ts) if opened else None
+        if stage is None:
+            continue
+        sev = "info" if stage == 0 else "warning" if stage == 1 else "high"
+        out[f"ask:{a['id']}:due"] = {"severity": sev, "class": "ask", "kind": "ask-due", "subject": a["id"], "since": int(opened),
+                                     "message": f"ask {a['id']} awaits the user (reminder {stage + 1}): {a.get('text', '')}"[:300],
+                                     "detail": {"ask": a["id"], "session": a.get("session"), "stage": stage,
+                                                "stop_block": False}}
     return out
 
 
@@ -567,6 +586,7 @@ class Daemon:
         desired = {}
         desired.update(liveness_alerts(docs, self.policy))
         desired.update(ask_alerts(asks, self.policy, ts))
+        desired.update(wal_ask_alerts(pending, ts))
         desired.update(ring_wrap_alert(events, ts, self.host))
         desired.update(wal_unsafe_alerts(blocked, ts))
         ring = ring_state(events, SOURCE, self.host)
@@ -776,6 +796,11 @@ def install(apply: bool) -> int:
         print(f"{'write' if apply else 'would write'} {p}")
         if apply:
             p.parent.mkdir(parents=True, exist_ok=True)
+            if p.exists():  # never overwrite a unit without a copy to roll back to
+                import shutil  # noqa: PLC0415
+                backup = p.with_name(p.name + ".bak-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+                shutil.copy2(p, backup)  # a unit file is small; copy2 keeps the daemon's read bound rule intact
+                print(f"backup {backup}")
             tmp = p.with_name(p.name + ".tmp")
             tmp.write_text(body)
             os.replace(tmp, p)
@@ -791,6 +816,27 @@ def install(apply: bool) -> int:
     return 0
 
 
+def uninstall(apply: bool) -> int:
+    """Stop the service and remove its unit; backups (.bak-*) stay."""
+    files = unit_files(Path(__file__).resolve())
+    if sys.platform == "darwin":
+        cmds = [["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"]]
+    else:
+        cmds = [["systemctl", "--user", "disable", "--now", "ahd.service"], ["systemctl", "--user", "daemon-reload"]]
+    for c in cmds:
+        print(("run " if apply else "would run ") + " ".join(c))
+        if apply:
+            subprocess.run(c, stdin=subprocess.DEVNULL, check=False)
+    for p in files:
+        print(f"{'remove' if apply else 'would remove'} {p}")
+        if apply:
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+    return 0
+
+
 # ---------------------------------------------------------------- CLI
 
 def main(argv=None) -> int:
@@ -801,9 +847,13 @@ def main(argv=None) -> int:
     sp.add_parser("report", help="one tick, then print the unowned / dropped / silent lists")
     i = sp.add_parser("install")
     i.add_argument("--apply", action="store_true")
+    un = sp.add_parser("uninstall", help="stop the service and remove its unit (backups stay)")
+    un.add_argument("--apply", action="store_true")
     a = ap.parse_args(argv)
     if a.cmd == "install":
         return install(a.apply)
+    if a.cmd == "uninstall":
+        return uninstall(a.apply)
     if a.cmd is None and not a.once:
         ap.print_help()
         return 2

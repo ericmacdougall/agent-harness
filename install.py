@@ -31,10 +31,12 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "liveness.py",
          "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
          "ahd.py", "ahd_peek.py", "ahd_policy.json",
-         "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py", "bg_job.py", "bg_lint.py")
+         "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py", "bg_job.py", "bg_lint.py",
+         "dropped_gate.py", "ask_reminders.py")  # dropped-owner gate and ask reminders (goodqa#14791)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
+SKILLS = ("check-dropped-workstreams/SKILL.md", "check-dropped-workstreams/scan.py")  # thin wrappers over ah
 TMPDIR_KEY = "CLAUDE_CODE_TMPDIR"
 INSTALL_STATE = "install-state.json"
 MAX_SOCKET_PATH = 100  # macOS sun_path is 104 bytes; Claude Code puts sockets in <root>/cc-socks/
@@ -49,7 +51,8 @@ class DirectoryPublicationError(OSError):
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
-                         "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py")}
+                         "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
+                         "dropped_gate.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -177,6 +180,13 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     if provenance:
         for event, groups in provenance_hook_groups(claude).items():
             managed.setdefault(event, []).extend(groups)
+    # Dropped-owner gate (goodqa#14791, docs/ah-query-spec.md): blocks the main agent's turn end while a DROPPED
+    # owner has no recorded disposition; bounded per problem signature; fails open on its own errors.
+    managed.setdefault("Stop", []).append({"hooks": [{"type": "command", "command": "python3",
+                                                       "args": [str(claude / "hooks" / "dropped_gate.py")], "timeout": 15}]})
+    managed.setdefault("SubagentStop", []).append({"matcher": SUBAGENT_MATCHER, "hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "dropped_gate.py"), "subagent-stop"],
+        "timeout": 15}]})
     # Local-ledger reminder (docs/ledger.md): rate limited and dismissible; fails open, so no onFailure.
     reminder = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "ledger_reminder.py")], "timeout": 3}
     for event in ("SessionStart", "UserPromptSubmit"):
@@ -609,14 +619,45 @@ def read_regular(path: Path, *, pinned_parent=None, retain_fd=None):
         return None
 
 
+def service_commands(claude: Path) -> list[list[str]]:
+    """Host services the harness runs: ahd, the deterministic monitor and scheduler (goodqa#14791). Each is
+    registered through its own unit installer after the files are in place; detector-only until S2 lands."""
+    return [[sys.executable, str(claude / "hooks" / "ahd.py"), "install", "--apply"]]
+
+
+class ServiceError(RuntimeError):
+    """A host service failed to register; the files are already installed and stay installed."""
+
+
+def install_services(claude: Path, runner=None) -> list[str]:
+    import subprocess  # noqa: PLC0415
+
+    runner = runner or (lambda argv: subprocess.run(argv, stdin=subprocess.DEVNULL, check=False, timeout=120,
+                                                   capture_output=True, text=True))
+    done = []
+    for argv in service_commands(claude):
+        label = " ".join(argv[1:])
+        try:
+            result = runner(argv)
+        except subprocess.TimeoutExpired as error:
+            raise ServiceError(f"service registration timed out after {error.timeout}s: {label}; files are installed, "
+                               "re-run `install.py --apply --services` or that command by hand") from error
+        rc = getattr(result, "returncode", 0)
+        if rc:
+            tail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "")[-300:]
+            raise ServiceError(f"service registration failed (exit {rc}): {label}; files are installed; {tail.strip()}")
+        done.append(label)
+    return done
+
+
 def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool = True,
-            command_guard: bool = True, log_backup=None) -> list[str]:
+            command_guard: bool = True, log_backup=None, services: bool = False) -> list[str]:
     claude = home.expanduser().resolve() / ".claude"
     if log_backup is None:
         log_backup = log_backup_alert(home, None)
     files = [
         *((ROOT / "harness" / folder / name, claude / folder / name)
-          for folder, names in (("agents", AGENTS), ("hooks", HOOKS), ("tools", TOOLS))
+          for folder, names in (("agents", AGENTS), ("hooks", HOOKS), ("tools", TOOLS), ("skills", SKILLS))
           for name in names),
     ]
     managed = [destination for _, destination in files] + [claude / "CLAUDE.md", claude / "settings.json"]
@@ -631,7 +672,7 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
     pins = DirectoryPins()
     try:
         for directory in (claude.parent, claude, claude / 'agents', claude / 'hooks',
-                          claude / 'tools', backup_root):
+                          claude / 'tools', claude / 'skills', claude / 'skills' / 'check-dropped-workstreams', backup_root):
             pins.capture(directory)
         instructions_path = claude / "CLAUDE.md"
         existing_instructions = read_regular(instructions_path, pinned_parent=pins.fd(claude),
@@ -651,6 +692,8 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
                      (settings_path, (json.dumps(settings, indent=2) + "\n").encode())]
         changes = [str(path) for path in managed]
         if not apply:
+            if services:  # preview: name the service commands a real --apply --services run would execute
+                changes.extend("would run service: " + " ".join(argv[1:]) for argv in service_commands(claude))
             return changes
         for note in migrate_local_profiles(claude):
             print(f"  {note}")
@@ -660,7 +703,8 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
         if originals[instructions_path] != existing_instructions or originals[settings_path] != existing_settings:
             raise OSError('User settings or instructions changed during installation preflight; retry')
         # Exclusive creation rejects a real directory that appears after snapshot.
-        for directory in (claude, claude / 'agents', claude / 'hooks', claude / 'tools', backup_root):
+        for directory in (claude, claude / 'agents', claude / 'hooks', claude / 'tools',
+                          claude / 'skills', claude / 'skills' / 'check-dropped-workstreams', backup_root):
             pins.create(directory)
         os.fchmod(pins.fd(backup_root), 0o700)  # backups can include env values
         pins.verify(backup_root)
@@ -672,8 +716,10 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
         for path in managed:
             if originals[path] is not None:
                 saved = backups / path.relative_to(claude)
-                if saved.parent != backups:
-                    pins.create(saved.parent)
+                if saved.parent != backups:  # create each level under the backup root (skills/<name>/ is two deep)
+                    rel = saved.parent.relative_to(backups)
+                    for i in range(1, len(rel.parts) + 1):
+                        pins.create(backups.joinpath(*rel.parts[:i]))
                 atomic_write(saved, originals[path][0], pinned_parent=pins.fd(saved.parent),
                              expected_target=None)
         installed = {}
@@ -708,6 +754,10 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
                 raise RuntimeError(f"Installation failed; rollback incomplete for {', '.join(failures)}; "
                                    f"restore from {backups}") from error
             raise
+        if services and not apply:
+            changes.extend("would run service: " + " ".join(argv[1:]) for argv in service_commands(claude))
+        if apply and services:  # host services last, after every file is in place (goodqa#14791 S1d)
+            changes.extend("service: " + c for c in install_services(claude))
         return changes
     finally:
         pins.close()
@@ -940,6 +990,8 @@ def log_backup_status(home: Path, apply: bool, flag=None) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="write changes; otherwise only preview paths")
+    parser.add_argument("--services", action="store_true",
+                        help="also register the host services (the ahd launchd/systemd job) after the files are installed")
     parser.add_argument("--home", type=Path, default=Path.home(), help=argparse.SUPPRESS)
     choice = parser.add_mutually_exclusive_group()
     choice.add_argument("--no-durable-tmp", dest="durable_tmp", action="store_false", default=None,
@@ -976,7 +1028,8 @@ def main() -> None:
                            "real directory, not a symlink\n")
     try:
         changes = install(args.home, args.apply, durable_tmp=durable_tmp, provenance=args.provenance,
-                          command_guard=args.command_guard, log_backup=log_backup_alert(args.home, args.log_backup))
+                          command_guard=args.command_guard, log_backup=log_backup_alert(args.home, args.log_backup),
+                          services=args.services)
     except DirectoryPublicationError as error:
         parser.exit(1, f'Install failed: {error}\n')
     action = "Installed" if args.apply else "Would install"

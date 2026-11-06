@@ -35,3 +35,26 @@ Source: user "how we dont have proper tools/a cli in our harness that handles al
 ## Ledger and spool
 
 `~/.agent-harness/state/ah/store/`: `ledger.jsonl` (seq, key, body sha, op, args, actor), `audit.jsonl` (applied, rejected, key_conflict), `spool/` (pending GoodQA comments, keyed by operationId), `store.lock` (flock). Index files live in `~/.agent-harness/state/ah-index/`.
+
+## Dropped-owner dispositions and the Stop gate (goodqa#14791)
+
+A DROPPED owner (the shared `liveness.py` rule) must carry a live **disposition** or it is a defect that needs a decision now. `ah owners` rows carry `disposition` and `decision_required`; the document carries `undisposed`. `ah owners --gate` exits 1 while any owner is undisposed, so a "0 dropped" summary cannot be printed over a dropped owner. Dispositions go only through the `ah` writer (`task.dispose`: idempotent key, audit row, and a `disposition` entry in the session main WAL):
+
+    ah task dispose --agent <id> --kind resumed                      live while activity follows within 30 min, or any later activity
+    ah task dispose --agent <id> --kind reassigned --ref <agent id>  live while the replacement is live
+    ah task dispose --agent <id> --kind waiting --ref <ask id | GoodQA proj#N> --until <ISO>   expires at --until
+    ah task dispose --agent <id> --kind closed --reason <why> --evidence <ticket | WAL id | sha>  permanent
+
+A `waiting` disposition must name an ask id that exists in the session WAL or a ticket (a wait cannot park work); the same rule applies to `waiting on <x>` notes in an owner WAL. A `status` or `result` row that `ah` writes on an owner's behalf carries `by: <actor>` and never counts as that owner's own activity.
+
+`harness/hooks/dropped_gate.py` is a Claude Code Stop hook (registered by `install.py`): it blocks the main agent's turn from ending while the session has undisposed DROPPED owners, names them with the exact `ah task dispose` lines, and is bounded to 3 blocks per problem signature (state under `~/.agent-harness/state/dropped-gate/`). Headless (`sdk-*`) and sub-agent sessions are not gated; any `ah` failure fails open with a message.
+
+The same hook in `subagent-stop` mode (registered on SubagentStop for every agent type) blocks a sub-agent once when it ends its turn with pending work (its own WAL ends in an open intent, status or similar, with no handoff, result or `waiting on <ask id|ticket|agent>`) and no live `ah-run` job; on the second stop it lets the turn end and writes a `task.pending` row through `ah`, so the owner is DROPPED at once instead of after the 30-minute finishing grace. Task-named WALs (`<task>.jsonl`) are owners in the same view: `liveness.classify_task_wal` makes them SILENT at 30 min, SILENT-HIGH at 60, DROPPED at 6 h without a terminal note or named wait, and done/handoff/waiting otherwise. `harness/skills/check-dropped-workstreams/scan.py` is installed as a thin wrapper over `ah owners --gate`.
+
+## Asks: presence gate and reminders (goodqa#14791 P16/P17)
+
+`provenance_hooks.py ask-gate` also checks presence: a modal AskUserQuestion is allowed only to the interactive main session while the user is present (a `prompt` event in the session main WAL within `ask_presence_minutes`, default 10; policy `ask_presence`: enforce | warn | off; `AH_USER_PRESENT=0|1` pins it for tests and the console). Otherwise the call is denied, the registered ask stays, a ring alert `ask:<id>:pending-user` notifies the user, and the caller is told to continue independent work and record `ah task dispose --kind waiting --ref <ask id>`. Sub-agents are always denied and routed to main. `ask_reminders.py` re-surfaces open asks on a bounded schedule (at once, +30 min, +2 h, then every 4 h, at most 42 repeats): ahd raises `ask:<id>:due` at info, warning, then high, so the ring, prompt context and digest carry them; each stage fires once and nothing fires after `ask_resolved`.
+
+## ahd must run (goodqa#14791 S1d)
+
+`install.py --apply --services` registers the ahd job after the files are installed (`ahd.py install --apply`: launchd on the Mac, a systemd user unit on Linux); a plain install never touches launchd or systemd. `ah doctor` carries an `ahd running` check (lock held or heartbeat fresher than 5 min) and fails while the daemon is down; `AH_EXPECT_AHD=0` turns it into a report on hosts that do not run it. `ahd_policy.json` runs in `mode: detector` with `restart.enabled: false` until the automatic-restart redesign (NEVER-LOSE.md S2) passes review.

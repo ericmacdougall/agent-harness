@@ -109,7 +109,8 @@ class LivenessTests(unittest.TestCase):
         self.assertEqual(self.c(9999, stopped=True), "DROPPED")
         self.assertEqual(self.c(53, stopped=True), "finishing")  # just stopped, handoff may still be coming
         self.assertEqual(self.c(25 * 60, stopped=True), "finishing")  # between turns is not a drop
-        self.assertEqual(self.c(9999, stopped=True, note="waiting on dev2 suite"), "waiting-on-dev2")
+        self.assertEqual(self.c(9999, stopped=True, note="waiting on dev2 suite"), "DROPPED")  # goodqa#14791 H3: a wait must name an ask, ticket or agent
+        self.assertEqual(self.c(9999, stopped=True, note="waiting on GoodQA goodqa#14791"), "waiting-on-GoodQA goodqa#14791")
         for helper in ("red-team", "fixer", "click-tester", "Explore"):
             self.assertEqual(self.c(9999, stopped=True, typ=helper), "returned", helper)
         self.assertEqual(liveness.classify(NOW, NOW - 9999, 0.0, True, None, "", "fixer", registered=True)["state"], "DROPPED")
@@ -633,7 +634,9 @@ class ReviewRound1(GoodQABase):
             rc = ah.main(["doctor"])
         self.assertEqual(rc, 4)
         self.assertEqual(json.loads(out.getvalue()), {"ok": False, "code": "internal", "type": "ModuleNotFoundError"})
-        self.assertTrue(ah.doctor()["ok"])
+        with mock.patch.dict(os.environ, {"AH_EXPECT_AHD": "0"}):  # this test is about partial installs, not the daemon (goodqa#14791 S1d)
+            self.assertTrue(ah.doctor()["ok"])
+        self.assertFalse(ah.doctor()["ok"])  # with the daemon expected and not running, doctor fails
 
     def test_naive_iso_is_utc_and_user_at_host_rejected(self):
         self.assertEqual(ah.parse_ts("2026-11-04T10:00:00"), ah.parse_ts("2026-11-04T10:00:00Z"))

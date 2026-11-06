@@ -4,6 +4,8 @@
   "plan_packet": "warn",
   "ask_user_question": "enforce",
   "stop_lint": "warn",
+  "ask_presence": "enforce",
+  "ask_presence_minutes": 10,
   "ticket_lookup": "enforce",
   "wal": {
     "requirement": "enforce",
