@@ -1270,7 +1270,7 @@ def scan_state(command: str, cwd: str, depth: int = 0, parent=None):
         if result:
             findings.append((result[0], result[1], ctx.capped, segment))
     if getattr(ctx, "claude_p", 0) >= 3 or (getattr(ctx, "claude_p", 0) >= 1 and re.search(r"(?:^|[\s;&|(])(?:for|while|until)\s", text)):
-        findings.append(("fan-out", "claude -p fan-out (several or looped headless sessions)", False, "claude -p ..."))
+        findings.append(("fan-out", "claude -p fan-out (several or looped headless sessions)", False, command[:400]))
     return hatch, findings
 
 
