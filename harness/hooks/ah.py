@@ -1321,6 +1321,7 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
 
 WAIT_LOOP_RE = re.compile(r"\b(?:until|while)\b.{0,400}?\b(?:sleep|pgrep|grep|inotifywait|wait)\b", re.S)
 WAITER_CAP = 20
+WAITER_PROBE_CAP = 50  # environment probes per dispose; each is one bounded `ps eww`
 
 
 def _ps_rows() -> list:
@@ -1376,6 +1377,7 @@ def leftover_waiters(home: Path, agent: str, session: str, ps_rows=None, session
     rows = _ps_rows() if ps_rows is None else ps_rows
     session_of = session_of or _session_env_of
     me = os.getpid()
+    probes = 0
     for pid, elapsed, command in rows:
         if len(found) >= WAITER_CAP:
             break
@@ -1383,7 +1385,12 @@ def leftover_waiters(home: Path, agent: str, session: str, ps_rows=None, session
             continue
         if agent and agent in command:
             scope = "agent"
-        elif session and (session in command or session_of(pid) == session):
+        elif session and session in command:
+            scope = "session"
+        elif session and probes < WAITER_PROBE_CAP:
+            probes += 1  # one `ps eww` per unattributed wait loop, capped (review LOW, 2026-11-06)
+            if session_of(pid) != session:
+                continue
             scope = "session"
         else:
             continue

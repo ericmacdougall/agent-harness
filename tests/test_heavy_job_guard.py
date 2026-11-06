@@ -83,6 +83,7 @@ class BigClone(unittest.TestCase):
 
     def test_big_local_copies_warn_with_the_alternatives(self):
         for command in (f"git clone {self.big} /tmp/goodqa-copy", f"git clone goodqa copy2", f"cp -R {self.big} /tmp/copy",
+                        f"git clone -b main --origin up {self.big} /tmp/copy5", f"git clone -q {self.big}",
                         f"cp -a goodqa/ copy3", f"rsync -a --delete {self.big}/ /tmp/copy4/", "mkdir -p y && cp -r goodqa y/"):
             with self.subTest(command):
                 result = self.judge(command)

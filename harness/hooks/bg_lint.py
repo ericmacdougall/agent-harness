@@ -242,9 +242,10 @@ def lint(command, _depth=0):
     if hit:
         out.append(("self-match-pgrep", "This wait loop polls `%s`, and that pattern also occurs in the command line "
                                         "of the shell running the loop, so the match never goes away and the loop "
-                                        "never exits (one ran 12 h on dev2). Use the bracket trick (`%s`), wait on a "
-                                        "PID (`kill -0 $PID` or `bg_job.py wait`), or poll for an exit file written "
-                                        "by the job (`cmd; echo $? > done.txt`)." % hit))
+                                        "never exits (one ran 12 h on dev2; a loop typed into an already-running shell "
+                                        "is the exception). Use the bracket trick (`%s`), wait on a PID (`kill -0 $PID` "
+                                        "or `bg_job.py wait`), or poll for an exit file written by the job "
+                                        "(`cmd; echo $? > done.txt`)." % hit))
     hit = find_pipestatus_after_substitution(command)
     if hit:
         out.append(("pipestatus", "PIPESTATUS is read after a command-substitution assignment (`%s`); it holds only "

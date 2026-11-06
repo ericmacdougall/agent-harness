@@ -76,6 +76,8 @@ BIG_PACK_BYTES = 500 * 1024 * 1024  # a repository whose packs exceed this is a 
 MAX_PACK_ENTRIES = 20000
 CLONE_SEARCH_ROOTS = ("~/.agent-harness/work", "~")  # where an existing clone of the same name is looked for
 MAX_SEARCH_ENTRIES = 6000
+CLONE_VALUE_OPTIONS = {"-b", "--branch", "-o", "--origin", "-u", "--upload-pack", "--template", "-c", "--config",
+                       "--separate-git-dir", "-j", "--jobs", "--server-option", "--bundle-uri", "--recurse-submodules"}
 HATCH = "HARNESS_LOCAL_OK"
 LOG_PATH = os.path.join(os.path.expanduser("~"), ".agent-harness", "logs", "heavy-job-guard.jsonl")
 
@@ -473,11 +475,21 @@ def big_copy_finding(low, args, ctx):
     for a URL. None otherwise, including partial clones (--filter, --depth, --reference, --shared) and remote rsync."""
     operands = [a for a in args if not a.startswith("-")]
     if low == "git":
-        if args[:1] != ["clone"] or len(operands) < 2:
+        if args[:1] != ["clone"]:
             return None
         if any(a.startswith(("--filter", "--depth", "--reference", "--shared", "--shallow")) or a == "-s" for a in args):
             return None
-        src = operands[1]
+        operands, skip = [], False  # value-taking clone options (-b main, --origin up ...) are not operands (review LOW)
+        for a in args[1:]:
+            if skip:
+                skip = False
+            elif a in CLONE_VALUE_OPTIONS:
+                skip = True
+            elif not a.startswith("-"):
+                operands.append(a)
+        if not operands:
+            return None
+        src = operands[0]
     elif low == "cp":
         flags = "".join(a[1:] for a in args if a.startswith("-") and not a.startswith("--"))
         if not (set("Rra") & set(flags) or "--recursive" in args) or len(operands) < 2:
