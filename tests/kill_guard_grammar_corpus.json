@@ -6097,6 +6097,27 @@
    "id": "EHVOK-006",
    "shape": "EHVOK",
    "why": "an empty head before harmless words must stay allowed"
+  },
+  {
+   "cmd": "K=(); sudo \"${K[@]}\" which pkill",
+   "expect": "block",
+   "id": "EHV-012",
+   "shape": "EHV",
+   "why": "behind a wrapper, a head that expands to nothing is dropped on the inner-words path; a kill verb among the next two words is still refused, as main refuses it"
+  },
+  {
+   "cmd": "K=(); timeout 5 \"${K[@]}\" echo kill 4004",
+   "expect": "block",
+   "id": "EHV-013",
+   "shape": "EHV",
+   "why": "behind a wrapper, a head that expands to nothing is dropped on the inner-words path; a kill verb among the next two words is still refused, as main refuses it"
+  },
+  {
+   "cmd": "K=(); xargs \"${K[@]}\" echo kill 4004",
+   "expect": "block",
+   "id": "EHV-014",
+   "shape": "EHV",
+   "why": "behind a wrapper, a head that expands to nothing is dropped on the inner-words path; a kill verb among the next two words is still refused, as main refuses it"
   }
  ]
 }
