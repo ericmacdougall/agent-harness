@@ -95,7 +95,7 @@ class SlowInputs(base.Env):
 class Hooks(base.Env):
     def setUp(self):
         super().setUp()
-        self.env = dict(os.environ, HOME=str(self.home))
+        self.env = dict(os.environ, HOME=str(self.home), AH_USER_PRESENT="1")  # presence pinned; AskGatePresence tests vary it
         self.sandbox_dir = self.sandbox()  # copy of the hooks whose installed policy this test controls (env can only tighten)
         main = self.wals / "main.jsonl"
         note = [sys.executable, str(self.sandbox_dir / "wal_note.py"), "--wal", str(main), "--event", "ask", "--note", "Confirm the staging key",
@@ -213,6 +213,50 @@ class Hooks(base.Env):
         self.assertEqual(self.run_hook("stop-lint", None, raw="{not json"), {})
         self.assertEqual(self.run_hook("stop-lint", None, raw="[" * 5000 + "]" * 5000), {})
         self.assertEqual(self.run_hook("ask-gate", None, raw=""), {})
+
+
+class AskGatePresence(Hooks):
+    """P17 (goodqa#14791 I17): a modal AskUserQuestion is allowed only to the interactive main while the user is present.
+    Fails on main 247c104: the gate knew nothing about presence or sub-agents."""
+
+    def test_away_user_is_denied_and_the_ask_stays_registered(self):
+        self.env["AH_USER_PRESENT"] = "0"
+        out = self.run_hook("ask-gate", self.ask_payload(f"Which key? [ask:{self.ask_id}]"))
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("away", reason)
+        self.assertIn(self.ask_id, reason)
+        self.assertIn("ah task dispose", reason)
+        ring = self.home / ".agent-harness" / "state" / "alerts.jsonl"
+        self.assertTrue(ring.exists())
+        self.assertIn(f"ask:{self.ask_id}:pending-user", ring.read_text(errors="replace"))
+
+    def test_present_user_is_allowed(self):
+        self.env["AH_USER_PRESENT"] = "1"
+        out = self.run_hook("ask-gate", self.ask_payload(f"Which key? [ask:{self.ask_id}]"))
+        self.assertNotIn("permissionDecision", out.get("hookSpecificOutput", {}))
+
+    def test_presence_comes_from_the_last_human_turn(self):
+        self.env.pop("AH_USER_PRESENT", None)
+        import datetime as dt
+        main = self.wals / "main.jsonl"
+        with open(main, "a") as fh:
+            old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=45)).isoformat()
+            fh.write(json.dumps({"at": old, "event": "prompt", "prompt_chars": 12}) + "\n")
+        denied = self.run_hook("ask-gate", self.ask_payload(f"Which key? [ask:{self.ask_id}]"))
+        self.assertEqual(denied["hookSpecificOutput"].get("permissionDecision"), "deny")
+        with open(main, "a") as fh:
+            fh.write(json.dumps({"at": dt.datetime.now(dt.timezone.utc).isoformat(), "event": "prompt", "prompt_chars": 5}) + "\n")
+        allowed = self.run_hook("ask-gate", self.ask_payload(f"Which key? [ask:{self.ask_id}]"))
+        self.assertNotIn("permissionDecision", allowed.get("hookSpecificOutput", {}))
+
+    def test_subagents_never_ask_and_are_routed_to_main(self):
+        self.env["AH_USER_PRESENT"] = "1"
+        payload = self.ask_payload(f"Which key? [ask:{self.ask_id}]")
+        payload["agent_id"] = "a1b2c3d4e5f60718"
+        out = self.run_hook("ask-gate", payload)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("SendMessage", out["hookSpecificOutput"]["permissionDecisionReason"])
 
 
 if __name__ == "__main__":

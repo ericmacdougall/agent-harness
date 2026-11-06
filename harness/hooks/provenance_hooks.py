@@ -300,14 +300,101 @@ def format_problems(bad: list) -> str:
             "Build the list from `provenance.py asks --session <id>`.")
 
 
-def cmd_stop_lint(payload: dict) -> dict:
-    mode = prov.load_policy().get("stop_lint", "warn")
-    if mode == "off":
+QUARANTINE_EVENTS = ("scope", "decision")
+QUARANTINE_MAX_BLOCKS = 3
+TOOL_WRITERS = frozenset({"escalation", "ahd", "dropped_gate", "ah-run"})
+
+
+def quarantined_entries(session: str, now: float, older_than_s: float) -> list:
+    """Unsourced scope/decision rows of the session main WAL older than the grace (P11, goodqa#14791)."""
+    import os  # noqa: PLC0415
+    path = Path(os.environ.get("AH_HOME") or Path.home()) / ".claude" / "wals" / session / "main.jsonl"
+    out = []
+    try:
+        tail = safe_input.read_tail(path, 4 << 20)
+    except Exception:  # noqa: BLE001
+        return out
+    recs = []
+    for raw in tail.splitlines():
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            recs.append(rec)
+    recited = {r.get("recites") for r in recs if r.get("recites") and r.get("source") and not r.get("unsourced")}  # only a backed re-cite clears (M2)
+    for rec in recs:
+        if rec.get("event") not in QUARANTINE_EVENTS or not rec.get("unsourced") or rec.get("id") in recited \
+                or rec.get("by") in TOOL_WRITERS:  # the allowlist, not any claim (M1)
+            continue
+        ts = None
+        try:
+            import datetime as dt  # noqa: PLC0415
+            ts = dt.datetime.fromisoformat(str(rec.get("at")).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            pass
+        if ts is not None and now - ts >= older_than_s:
+            out.append({"id": rec.get("id"), "event": rec["event"], "age_s": int(now - ts), "note": prov.clip(str(rec.get("note") or ""), 80)})
+    return out
+
+
+def quarantine_state_path(session: str) -> Path:
+    import os  # noqa: PLC0415
+    return Path(os.environ.get("AH_HOME") or Path.home()) / ".agent-harness" / "state" / "provenance-lint" / f"{session}.json"
+
+
+def quarantine_block(session: str, payload: dict, now: float | None = None) -> dict:
+    """Block the turn end (bounded per signature) while quarantined scope/decision rows are older than the grace."""
+    import os, time  # noqa: PLC0415
+    policy = prov.load_policy()
+    mode = policy.get("quarantine_lint", "enforce")
+    if mode == "off" or os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk") or payload.get("agent_id"):
         return {}
+    now = time.time() if now is None else now
+    rows = quarantined_entries(session, now, float(policy.get("quarantine_minutes", 10)) * 60)
+    if not rows:
+        return {}
+    ids = sorted(str(r["id"]) for r in rows)
+    text = (f"{len(rows)} WAL {'entry' if len(rows) == 1 else 'entries'} without a source for over the grace (goodqa#14791 P11): "
+            + "; ".join(f"{r['event']} {r['id']} ({r['age_s'] // 60}m): {r['note']}" for r in rows[:6])
+            + ". Cite each with `python3 ~/.claude/hooks/ah.py note --source auto --dry-run --wal <this WAL> --id <id>` "
+              "then without --dry-run, or relabel it as your assumption (inferred: ...). Nothing was dropped.")
+    import hashlib  # noqa: PLC0415
+    sig = hashlib.sha256(",".join(ids).encode()).hexdigest()[:16]
+    state_path = quarantine_state_path(session)
+    try:
+        state = safe_input.safe_json_loads(safe_input.read_bounded(state_path, 65536).decode("utf-8", "replace"))
+        state = state if isinstance(state, dict) else {}
+    except Exception:  # noqa: BLE001
+        state = {}
+    count = int((state.get("blocks") or {}).get(sig, 0))
+    if mode != "enforce" or payload.get("stop_hook_active") or count >= QUARANTINE_MAX_BLOCKS:
+        return {"systemMessage": "provenance quarantine: " + text}
+    state.setdefault("blocks", {})[sig] = count + 1
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        os.replace(tmp, state_path)
+    except OSError:
+        pass
+    return {"decision": "block", "reason": "Provenance quarantine: " + text}
+
+
+def cmd_stop_lint(payload: dict) -> dict:
     session = str(payload.get("session_id") or "")
     if not valid_session(session):
         return {}
+    quarantine = quarantine_block(session, payload)  # its own policy key, independent of stop_lint (review minor)
+    if quarantine.get("decision") == "block":
+        return quarantine
+    mode = prov.load_policy().get("stop_lint", "warn")
+    if mode == "off":
+        return quarantine
+    carried = quarantine.get("systemMessage")
     bad = lint_message(last_assistant_text(payload), session)
+    if not bad and carried:
+        return {"systemMessage": carried}
     if not bad:
         try:
             reminder_path(session).unlink()  # a clean message clears an older warn-mode reminder
@@ -325,7 +412,8 @@ def cmd_stop_lint(payload: dict) -> dict:
         path.write_text(text + "\n", encoding="utf-8")
     except OSError:
         pass
-    return {"systemMessage": "provenance warning (stop-lint, warn mode): " + str(len(bad)) + " ask item(s) without a traceable origin"}
+    return {"systemMessage": "provenance warning (stop-lint, warn mode): " + str(len(bad)) + " ask item(s) without a traceable origin"
+            + ((" " + carried) if carried else "")}
 
 
 def cmd_prompt(payload: dict) -> dict:
@@ -351,6 +439,88 @@ def cmd_prompt(payload: dict) -> dict:
                                    "additionalContext": "Provenance reminder: your last message had untraceable asks. " + text}}
 
 
+PRESENCE_MINUTES_DEFAULT = 10
+
+
+def last_human_turn(session: str) -> float:
+    """Epoch of the newest `prompt` event in the session main WAL (the UserPromptSubmit hook writes one per human
+    turn), or 0.0. Reads only the tail, never the prompt text."""
+    import os  # noqa: PLC0415
+    path = Path(os.environ.get("AH_HOME") or Path.home()) / ".claude" / "wals" / session / "main.jsonl"
+    newest = 0.0
+    try:
+        tail = safe_input.read_tail(path, 262144)
+        if True:
+            for raw in tail.splitlines():
+                if b'"prompt"' not in raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("event") == "prompt":
+                    import datetime as dt  # noqa: PLC0415
+                    try:
+                        ts = dt.datetime.fromisoformat(str(rec.get("at")).replace("Z", "+00:00"))
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=dt.timezone.utc)
+                        newest = max(newest, ts.timestamp())
+                    except (TypeError, ValueError):
+                        pass
+    except OSError:
+        return 0.0
+    return newest
+
+
+def user_present(session: str, now: float | None = None) -> bool:
+    import os, time  # noqa: PLC0415
+    minutes = prov.load_policy().get("ask_presence_minutes", PRESENCE_MINUTES_DEFAULT)
+    override = os.environ.get("AH_USER_PRESENT")  # tests and the console can pin presence
+    if override in ("0", "1"):
+        return override == "1"
+    now = time.time() if now is None else now
+    return now - last_human_turn(session) <= float(minutes) * 60
+
+
+def notify_pending_ask(session: str, ids: list, why: str) -> None:
+    """Ring alert per ask so the console, the prompt context and the digest carry it (P16/P17). Best effort."""
+    try:
+        import ops_watch  # noqa: PLC0415
+        for ask_id in ids or ["none"]:
+            ops_watch.emit({"host": ops_watch.default_host(), "source": "ask-gate", "event": "raise", "severity": "warning",
+                            "key": f"ask:{ask_id}:pending-user", "message": f"ask {ask_id} awaits the user ({why}); owner keeps working",
+                            "detail": {"session": session[:8], "ask": ask_id}})
+    except Exception:  # noqa: BLE001 - the gate decision never depends on the ring
+        pass
+
+
+def presence_block(payload: dict, session: str, ids: list) -> dict:
+    """P17 (goodqa#14791 I17): a modal question is allowed only to the interactive main while the user is present.
+    Otherwise the ask stays registered, the user is notified through the ring, and the caller continues."""
+    import os  # noqa: PLC0415
+    mode = prov.load_policy().get("ask_presence", "enforce")
+    if mode == "off":
+        return {}
+    ask_list = ", ".join(f"[ask:{i}]" for i in ids) or "the registered ask"
+    if payload.get("agent_id") or os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk"):
+        reason = (f"Sub-agents never call AskUserQuestion: route the question to main with SendMessage, citing {ask_list}, "
+                  "record `ah task dispose --agent <you> --kind waiting --ref <ask id> --until <ISO>` if you must wait, "
+                  "and continue every independent step.")
+        notify_pending_ask(session, ids, "asked by a sub-agent")
+    elif not user_present(session):
+        reason = (f"The user is away (no human turn within the presence window): {ask_list} stays registered and the user "
+                  "is notified; do not block on a modal. Continue all independent work, and if an item must wait, record "
+                  "`ah task dispose --agent <owner> --kind waiting --ref <ask id> --until <ISO>`. The answer routes back "
+                  "by ask id (`ah user-msg`).")
+        notify_pending_ask(session, ids, "user away")
+    else:
+        return {}
+    if mode == "enforce":
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": "Ask gate: " + reason}}
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "(warn mode) Ask gate: " + reason}}
+
+
 def cmd_ask_gate(payload: dict) -> dict:
     mode = prov.load_policy().get("ask_user_question", "enforce")
     if mode == "off" or payload.get("tool_name") != "AskUserQuestion":
@@ -367,7 +537,11 @@ def cmd_ask_gate(payload: dict) -> dict:
         outcome = cite(body, session)
         if not outcome["ok"]:
             problems.append(f"question {index}: {outcome['problem']}")
+    ids = [m.group(1) for m in ASK_ID.finditer(json.dumps(questions, ensure_ascii=False))]
     if not problems:
+        away = presence_block(payload, session, ids)
+        if away:
+            return away
         shown = [f"[ask:{m.group(1)}] = {prov.clip((find_ask(session, m.group(1)) or {}).get('note', ''), 100)}"
                  for m in ASK_ID.finditer(json.dumps(questions, ensure_ascii=False))]
         if shown:  # make an id reused for an unrelated question visible to the user

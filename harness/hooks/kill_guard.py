@@ -80,7 +80,7 @@ DEFAULT_POLICY = {
     'windows_verbs': ['taskkill', 'stop-process', 'spps', 'wmic'],
     'service_kill': {'systemctl': ['kill'], 'launchctl': ['kill'], 'tmux': ['kill-server'], 'pm2': ['kill'],
                      'loginctl': ['kill-session', 'kill-user', 'terminate-user', 'terminate-session']},
-    'script_kill_pattern': r'(?i)(?<![a-z])(?:p|f|posix_)?kill(?![a-z])|killpg|terminate\(|send_signal|taskkill|killall|invoke-cimmethod|getprocessbyid',
+    'script_kill_pattern': r'(?i)(?<![a-z])(?:p|f|posix_)?kill(?![a-z])|killpg|terminate\(|send_signal|taskkill|killall|invoke-cimmethod|getprocessbyid|raise_signal|sigqueue|pidfd_send_signal',
     'pid_finders': ['pgrep', 'pidof', 'ps', 'lsof', 'fuser', 'pstree', 'cat', 'awk', 'grep'],
     'ledger_max_lines': 2000,
     'child_timeout_seconds': 10,
@@ -112,6 +112,117 @@ RUN_OPTS = {'-c', '-s', '-i', '-e', '-lc', '-ic', '--command', '-l', '-S'}  # op
 LAUNCHERS = {'tmux', 'screen', 'at', 'batch', 'watch'}
 CLASSIC_VERBS = {'pkill', 'killall', 'killall5', 'skill', 'slay', 'taskkill', 'stop-process', 'spps'}
 PID_OPT_VALUE = re.compile(r'[0-9]+(?:,[0-9]+)*')
+# Harness CLIs whose arguments are data (a note, a search text), never code. ah.py kill is judged by is_ah_kill.
+AH_SUBCOMMANDS = {'owners', 'user-msg', 'ticket', 'disk', 'task', 'doctor', 'spool', 'write'}
+PY_LITERAL = re.compile(r"""('\'\'[\s\S]*?\'\'\'|"{3}[\s\S]*?"{3}|'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*")""")
+# Inline Python that only formats data (a closed set of syntax, calls and modules): its string literals are prose.
+PY_SAFE_IMPORTS = {'json', 're', 'datetime', 'time', 'textwrap'}
+PY_SAFE_CALLS = {'print', 'str', 'len', 'dict', 'list', 'sorted', 'int', 'repr', 'tuple', 'set', 'range', 'sum', 'min',
+                 'max', 'bool', 'float', 'enumerate', 'zip'}
+PY_SAFE_NODES = ('Module', 'Expr', 'Assign', 'Name', 'Load', 'Store', 'Constant', 'Call', 'keyword', 'Attribute', 'Dict',
+                 'List', 'Tuple', 'Set', 'Subscript', 'Index', 'Slice', 'BinOp', 'JoinedStr', 'FormattedValue', 'Import',
+                 'ImportFrom', 'alias', 'Add', 'Sub', 'Mult', 'Mod', 'Div')
+# Module members a data-only program may reach, as full dotted paths. Every other attribute of a module (re.enum,
+# json.decoder, textwrap.re ...) is a route to sys/os, so a chain must be a prefix of one of these or equal to it.
+PY_SAFE_MEMBERS = {'json.dumps', 'json.loads', 'json.load', 're.sub', 're.match', 're.search', 're.findall', 're.split',
+                   're.compile', 're.escape', 're.I', 're.IGNORECASE', 'datetime.datetime.now', 'datetime.datetime.utcnow',
+                   'datetime.datetime.fromisoformat', 'datetime.datetime.strptime', 'datetime.timedelta',
+                   'datetime.date.today', 'datetime.timezone.utc', 'time.time', 'time.strftime', 'time.gmtime',
+                   'time.localtime', 'textwrap.dedent', 'textwrap.indent', 'textwrap.fill', 'textwrap.shorten'}
+PY_SAFE_PREFIXES = {'.'.join(m.split('.')[:i]) for m in PY_SAFE_MEMBERS for i in range(1, len(m.split('.')) + 1)}
+# Methods of plain values (str, list, dict, dates, match objects). None of them returns a module or a function.
+PY_SAFE_METHODS = {'join', 'get', 'items', 'keys', 'values', 'upper', 'lower', 'strip', 'lstrip', 'rstrip', 'split',
+                   'splitlines', 'replace', 'startswith', 'endswith', 'append', 'extend', 'isoformat', 'strftime',
+                   'group', 'groups', 'title', 'count', 'index', 'find', 'ljust', 'rjust', 'center', 'zfill'}
+
+
+def _dotted(node, aliases):
+    """Real dotted path of a Name/Attribute chain rooted at an imported module, else None."""
+    import ast
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name) and node.id in aliases:
+        return '.'.join([aliases[node.id]] + parts[::-1])
+    return None
+
+
+def pure_data_python(code):
+    """True when the program is built only from print/json-style calls on literals, so it cannot reach the OS. An
+    allowlist over the syntax tree: sys.modules, exec*/spawn*, getattr, dunders, every other module and every module
+    member outside PY_SAFE_MEMBERS (re.enum.sys...) are out."""
+    import ast
+    import builtins
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    aliases = {}  # local name -> real dotted path of an imported module or member
+    for node in ast.walk(tree):
+        kind = type(node).__name__
+        if kind not in PY_SAFE_NODES:
+            return False
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name not in PY_SAFE_IMPORTS:  # `import os.path` or `import a.b` is never needed here
+                    return False
+                aliases[a.asname or a.name] = a.name
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or node.module not in PY_SAFE_IMPORTS:
+                return False
+            for a in node.names:
+                path = node.module + '.' + a.name
+                if path not in PY_SAFE_PREFIXES:
+                    return False
+                aliases[a.asname or a.name] = path
+    # A builtin or module is only ever safe as the thing being called or the head of a vetted attribute chain. In
+    # value position (key=eval, print = eval, repl=exec) a data program could hand code to a pure helper.
+    called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    heads = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Attribute):
+            h = n.value
+            while isinstance(h, ast.Attribute):
+                h = h.value
+            heads.add(id(h))
+    stored = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            if node.id.startswith('_'):
+                return False
+            if isinstance(node.ctx, ast.Store):
+                if node.id in aliases or hasattr(builtins, node.id):
+                    return False  # rebinding print/eval/an imported name could hide a different object
+            elif node.id in aliases:
+                if id(node) not in called and id(node) not in heads:
+                    return False
+            elif node.id in stored:
+                pass  # the program's own variable, only ever bound to vetted expressions
+            elif node.id in PY_SAFE_CALLS:
+                if id(node) not in called:
+                    return False
+            else:
+                return False  # any other builtin or unknown name (eval, exec, open, getattr, vars ...)
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith('_'):
+                return False
+            path = _dotted(node, aliases)
+            if path is not None:
+                if path not in PY_SAFE_PREFIXES:
+                    return False
+            elif node.attr not in PY_SAFE_METHODS:
+                return False
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id not in PY_SAFE_CALLS \
+                and node.func.id not in aliases:
+            return False
+    return True
+
+
+def hook_script_ok(raw, names):
+    """The raw word names ~/.claude/hooks/<name>.py or the same path under the caller's real HOME, nothing else."""
+    home = re.escape(str(Path.home()))
+    return bool(re.fullmatch(r'(?:~|%s)/\.claude/hooks/(?:%s)\.py' % (home, '|'.join(names)), raw or ''))
 
 
 # --------------------------------------------------------------------------- policy and small helpers
@@ -985,8 +1096,11 @@ def make_analyzer_class(cg):
                 if w.text.startswith(('--split-string=', '-S')) and len(w.text) > 2 and name == 'env':
                     self.script(w.text.split('=', 1)[1] if '=' in w.text else w.text[2:], depth + 1)
                 prev = args[i - 1].text if i else ''
-                value_of_other_option = prev.startswith('-') and prev not in RUN_OPTS and name not in LAUNCHERS \
-                    and not re.fullmatch(r'-[A-Za-z]*c', prev)
+                # `--command` runs a command only for su and runuser; `wrangler d1 execute --command "SELECT count(*)"`
+                # takes SQL. A value that mentions a kill verb is still re-read as a command line.
+                sql_like = prev == '--command' and name not in ('su', 'runuser') and not KILLISH.search(w.text)
+                value_of_other_option = prev.startswith('-') and (prev not in RUN_OPTS or sql_like) \
+                    and name not in LAUNCHERS and not re.fullmatch(r'-[A-Za-z]*c', prev)
                 if (' ' in w.text.strip() or ';' in w.text) and not w.text.startswith('-') \
                         and name not in ('xargs', 'parallel') and not value_of_other_option:
                     if remote:
@@ -1063,7 +1177,8 @@ def make_analyzer_class(cg):
                 if rest:
                     self.inner_words(args[args.index(rest[0]):], depth, pl, idx)
             elif name in cg.INTERPRETERS or INTERPRETER_NAME.fullmatch(name):
-                self.check_interpreter(name, texts, cmd)
+                if not self.is_ah_kill(name, args, cmd, depth) and not self.is_harness_cli(name, args, cmd, depth):
+                    self.check_interpreter(name, texts, cmd)
             self.check_spawn(name, args, texts, depth, pl, idx)
             self.check_text_runners(name, args, texts, cmd, depth)
 
@@ -1136,6 +1251,89 @@ def make_analyzer_class(cg):
             if hit:
                 self.block('indirect-kill', '`%s` runs a kill verb on targets the guard cannot list' % name)
 
+        def is_harness_cli(self, name, args, cmd, depth):
+            """`python3 [-I|-B|-u] ~/.claude/hooks/{ah,wal_note,provenance}.py ...`: the words after the script are
+            data for that script, so a note or search text that mentions kill is not signalling. `ah.py kill` is
+            excluded (is_ah_kill decides it), and so is any assignment prefix, quoted head or other script."""
+            if not name.startswith('python') or not INTERPRETER_NAME.fullmatch(name) or self.remote or depth:
+                return False
+            words = getattr(cmd, 'words', None) or []
+            if not words or words[0].raw is None or words[0].raw != name:
+                return False
+            i = 0
+            while i < len(args) and args[i].text in ('-I', '-B', '-u'):
+                i += 1
+            if i >= len(args) or not hook_script_ok(args[i].raw, ('ah', 'wal_note', 'provenance')):
+                return False
+            if args[i].text.endswith('/ah.py'):
+                # only a known non-kill subcommand (optionally after the top-level --text) makes the rest data
+                rest = [a.text for a in args[i + 1:]]
+                if rest[:1] == ['--text']:
+                    rest = rest[1:]
+                if not rest or rest[0] not in AH_SUBCOMMANDS:
+                    return False
+            return True
+
+        def is_ah_kill(self, name, args, cmd, depth):
+            """True only for the literal form `python3 [-I|-B|-u] ~/.claude/hooks/ah.py kill --pid N[,N] --reason R
+            [--tree] [--grace S] [--host H] [--agent A] [--session S]`. ah kill audits every pid and refuses
+            system, other-user, GUI and ancestor processes itself, so the guard only has to prove the form is
+            literal: no variable, substitution, glob, heredoc, `-c`, eval or second script. Anything else
+            returns False and is judged by the ordinary interpreter rules."""
+            if not INTERPRETER_NAME.fullmatch(name) or not name.startswith('python') or self.remote or depth:
+                return False
+            if any(getattr(r, 'body', None) or getattr(r, 'op', '').startswith('<') for r in getattr(cmd, 'redirs', [])):
+                return False
+            if any(a.dynamic or a.subs or a.glob for a in args):
+                return False
+            words = getattr(cmd, 'words', None) or []
+            if not words or words[0].raw is None or words[0].raw != name:
+                return False  # an assignment prefix (PYTHONPATH=x python3 ...) or a quoted head
+            texts = [a.text for a in args]
+            if not texts or texts[0] != '-I':
+                return False  # isolated mode ignores PYTHONPATH and user site, so a planted module cannot run first
+            i = 1
+            while i < len(texts) and texts[i] in ('-B', '-u'):
+                i += 1
+            # the raw word is matched: a quoted '~' is a literal directory, and .text has HOME expanded
+            if i + 1 >= len(texts) or not hook_script_ok(args[i].raw, ('ah',)) or texts[i + 1] != 'kill':
+                return False
+            if texts[i + 2:] in (['--help'], ['-h']):
+                return True  # usage text only: ah.py prints it and exits before any process is touched
+            rest, i, seen = texts[i + 2:], 0, set()
+            while i < len(rest):
+                t = rest[i]
+                key, eq, val = t.partition('=') if t.startswith('--') else (t, '', '')
+                if key in ('--tree', '--foreign') and not eq:
+                    seen.add(key)
+                    i += 1
+                    continue
+                if key not in ('--pid', '--reason', '--grace', '--host', '--agent', '--session'):
+                    return False
+                if not eq:
+                    if i + 1 >= len(rest):
+                        return False
+                    val, i = rest[i + 1], i + 1
+                i += 1
+                if key in seen:
+                    return False
+                seen.add(key)
+                if key == '--pid':
+                    if not PID_OPT_VALUE.fullmatch(val) or any(int(p) <= 1 for p in val.split(',')):
+                        return False
+                elif key == '--reason':
+                    if not val.strip():
+                        return False
+                elif key == '--grace':
+                    if not re.fullmatch(r'[0-9]{1,3}(?:\.[0-9]{1,2})?', val):
+                        return False
+                elif key == '--host':
+                    if val not in ('dev2', 't2-dev', 'ah-mac-mini'):
+                        return False
+                elif not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', val):
+                    return False
+            return '--pid' in seen and '--reason' in seen
+
         def check_interpreter(self, name, texts, cmd):
             body = ' '.join(texts)
             for redir in getattr(cmd, 'redirs', []):
@@ -1143,10 +1341,18 @@ def make_analyzer_class(cg):
                     body += '\n' + redir.body
                 elif redir.op == '<<<' and redir.target is not None:
                     body += '\n' + redir.target.text
-            body = body.replace('kill_guard', '')
+            body = body.replace('kill_guard', '').replace('kill-guard', '')  # the guard's own name
+            if name.startswith('python') and '-c' in texts and texts.index('-c') + 1 < len(texts):
+                code = texts[texts.index('-c') + 1]
+                if pure_data_python(code):  # a program that only formats data: prose in literals is not signalling
+                    body = body.replace(code, PY_LITERAL.sub("''", code), 1)
             body = re.sub(r'\b(?:os|process)\.kill\(\s*[\w.]+(?:\(\))?\s*,\s*0\s*\)', '', body)  # liveness probe
             if self.script_kill is not None and self.script_kill.search(body):
-                self.block('script-kill', 'interpreter code signals processes the guard cannot check')
+                if 'ah.py' in body and ' kill' in body:
+                    self.block('script-kill', 'the audited stop is `python3 -I ~/.claude/hooks/ah.py kill --pid N --reason R '
+                                              '[--host H] [--foreign]` (literal words, with -I; remote hosts via --host, not ssh)')
+                else:
+                    self.block('script-kill', 'interpreter code signals processes the guard cannot check')
 
         def check_netwatch(self, args):
             texts = [a.text for a in args]
@@ -1356,8 +1562,10 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
         return 'allow', '', '', ()
     rule, reason, pids = findings[0]
     message = block_message(rule, reason)
-    if len(findings) > 1:
-        message = one_line(message + ' (%d more)' % (len(findings) - 1), 520)
+    if len(findings) > 1:  # name every finding, so the blocked command can be fixed in one pass
+        also = '; '.join('[%s] %s' % (r, one_line(t, 160)) for r, t, _p in findings[1:9])
+        more = ' (+%d more)' % (len(findings) - 9) if len(findings) > 9 else ''
+        message = one_line(message + ' Also found: ' + also + more, 1600)
     if policy['mode'] == 'warn':
         return 'warn', rule, message.replace('BLOCKED', 'WARNING'), pids
     audit(rule, raw, pids, home)
