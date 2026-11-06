@@ -42,6 +42,7 @@ SYSTEM_PATH = re.compile(r"^(/System/|/usr/libexec/|/sbin/|/usr/sbin/)")
 SHELLS = {"zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "csh", "-zsh", "-bash"}
 DAEMON_NAMES = {"rclone", "harness-console", "netwatch", "hookd", "ahd", "ahd_peek", "log_backup", "log-backup"}
 SESSION_COMM = {"claude", "codex"}
+DAEMON_PREFIXES = ("rclone", "harness-console", "netwatch", "hookd", "log_backup", "log-backup")
 MCP_WORD = re.compile(r"(?i)(?<![a-z])mcp(?![a-z])|modelcontextprotocol")
 REJECT_ROOTS = {"/", "/tmp", "/private/tmp", "/var", "/private/var", "/var/tmp", "/opt", "/usr", "/private", "/etc",
                 "/home", "/Users", "/mnt", "/srv", "/root"}
@@ -204,15 +205,15 @@ def refusal(info, my_uid: int, protected: set, probe=None, table=None):
         return "interactive shell"
     if PROTECTED_PATH.search(comm) or PROTECTED_PATH.search(info.get("command") or ""):
         return "protected GUI app"
-    words = [comm] + (info.get("command") or "").split()[:4]
+    words = [comm] + (info.get("command") or "").split()[:8]
     for w in words:
         name = re.sub(r"\.(py|sh)$", "", os.path.basename(w).lower())
-        if name in DAEMON_NAMES:
+        if name in DAEMON_NAMES or name.startswith(DAEMON_PREFIXES):
             return "harness daemon or backup job (%s)" % name
     if probe is not None and table is not None and MCP_WORD.search(info.get("command") or ""):
         owner = session_ancestor(probe, table, pid)
-        if owner is not None and owner not in protected:
-            return "MCP server of another live session (pid %d)" % owner
+        if owner is not None:  # stopping one breaks that session's tools, mine included
+            return "MCP server of a live claude/codex session (pid %d)" % owner
     return None
 
 
@@ -381,19 +382,9 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
     protected = protected_ids(probe, own_pid)
     run_id = "k" + uuid.uuid4().hex[:12]
     table = probe.table()
+    # Own scope is the caller's own process tree and its worktree. The session process is deliberately not a root:
+    # every agent of a session hangs under it, so it would make every owner's processes "own".
     roots = {own_pid}
-    chain, cur = [], own_pid
-    for _ in range(64):  # the caller's session process (nearest claude/codex ancestor) owns its whole tree
-        info = probe.info(cur)
-        if not info or info["ppid"] <= 1:
-            break
-        cur = info["ppid"]
-        parent = probe.info(cur)
-        if parent and os.path.basename(parent.get("comm") or "").lower() in SESSION_COMM:
-            roots.add(cur)
-            break
-    if os.environ.get("CLAUDE_PID", "").isdigit():
-        roots.add(int(os.environ["CLAUDE_PID"]))
     if worktree == "auto":
         worktree = probe.git_top(os.getcwd())
     scope = {"table": table, "roots": roots, "worktree": worktree, "foreign": foreign}

@@ -11,6 +11,7 @@ import kill_guard as kg  # noqa: E402
 
 CLI = "python3 ~/.claude/hooks/"
 WAL = "/Users/eric/.claude/wals/s1/main.jsonl"
+HOME = str(Path.home())
 
 ALLOW = [
     CLI + "ah.py user-msg --text 'find the ah kill discussion'",
@@ -18,7 +19,7 @@ ALLOW = [
     CLI + "wal_note.py --wal %s --event status --note 'kill-guard follow-up: ah kill scope'" % WAL,
     CLI + "wal_note.py --wal %s --event decision --note 'kill 4242 was refused' --source inferred:x" % WAL,
     CLI + "provenance.py find-user --session s1 --text 'please kill it'",
-    "python3 -I /Users/eric/.claude/hooks/wal_note.py --wal %s --event check --note 'os.kill is blocked'" % WAL,
+    "python3 -I " + HOME + "/.claude/hooks/wal_note.py --wal %s --event check --note 'os.kill is blocked'" % WAL,
     "python3 -c \"title = 'ah kill: audited process stop command'; print(title)\"",
     "python3 -c 'import json; print(json.dumps({\"title\": \"kill-guard false positives\"}))'",
     "python3 -c \"print('the word kill appears here as data')\"",
@@ -46,7 +47,25 @@ BLOCK = [
     "python3 -c \"import subprocess; subprocess.Popen(['bash','-c','kill 4242'])\"",
     "kill 4242", "pkill -f vite", "bash -c 'kill 4242'",
     "node -e \"process.kill(4242)\"", "ruby -e 'Process.kill(9, 4242)'",
-    "node -e \"console.log('kill is data')\"",  # only Python literals are narrowed
+    "node -e \"console.log('kill is data')\"",  # only pure-data Python is narrowed
+    # red-team of 58ee560: code hidden in literals, comment desync, odd shell strings, argparse tricks, other homes
+    "python3 -c 'import os; f\"{os.kill(4242, 9)}\"'",
+    "python3 -c 'exec(\"import os; os.kill(4242, 9)\")'",
+    "python3 -c 'eval(\"__import__(\\\"os\\\").kill(4242,9)\")'",
+    "python3 -c 'exec(compile(\"import os\\nos.kill(1,9)\",\"x\",\"exec\"))'",
+    "python3 -c 'import os; getattr(os, \"pthread_kill\")(1, 9)'",
+    "python3 -c 'import os # \"\"\"\nos.kill(4242, 9) # \"\"\"'",
+    "python3 -c 'import os; os.system(\"command kill 1\")'",
+    "python3 -c 'import os; os.system(\"{ kill 1; }\")'",
+    "python3 -c 'import os; os.system(\"x=1 kill 1\")'",
+    "python3 -c 'import os; os.system(\"tmux kill-server\")'",
+    "python3 -c 'import os; print(\"kill\")'",
+    "python3 -c 'import subprocess; print(\"kill\")'",
+    CLI + "ah.py --text kill --pid 4242 --reason x --foreign",
+    CLI + "ah.py -- kill --pid 4242",
+    CLI + "ah.py --te kill --pid 4242 --reason x",
+    "python3 /Users/bob/.claude/hooks/ah.py user-msg --text 'kill 1'",
+    "python3 /home/bob/.claude/hooks/wal_note.py --note 'kill 1'",
 ]
 
 

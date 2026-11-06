@@ -436,13 +436,20 @@ class NarrowedScope(KillBase):
         probe.cwds = {3102: "/work/x"}
         out = self.run_kill(probe, [3102], foreign=True)
         self.assertEqual(out["results"][0]["status"], "refused")
-        self.assertIn("another live session", out["results"][0]["detail"])
+        self.assertIn("live claude/codex session", out["results"][0]["detail"])
         self.assertEqual(probe.sent, [])
 
-    def test_mcp_server_of_my_own_session_is_not_special(self):
+    def test_mcp_server_of_my_own_session_is_refused_too(self):
         probe = self.base(proc(3201, 3000, cmd="node /x/mcp-server.js", comm="node"))
-        out = self.run_kill(probe, [3201])
-        self.assertEqual(out["results"][0]["status"], "exited")
+        out = self.run_kill(probe, [3201], foreign=True)
+        self.assertEqual(out["results"][0]["status"], "refused")
+        self.assertEqual(probe.sent, [])
+
+    def test_daemon_name_variants(self):
+        for n, cmd in enumerate(("/x/harness-console-asks.v2 --serve", "Python -X dev -W ignore -u -B /h/ahd.py run",
+                                 "/bin/bash /x/log-backup.sh nightly")):
+            probe = self.base(proc(3300 + n, 100, cmd=cmd))
+            self.assertEqual(self.run_kill(probe, [3300 + n], foreign=True)["results"][0]["status"], "refused", cmd)
 
     def test_foreign_target_without_flag_is_refused(self):
         probe = self.foreign(1100)
@@ -485,10 +492,25 @@ class NarrowedScope(KillBase):
         probe = self.base(proc(1104, OWN, cmd="sleep 5"))  # child of the caller
         probe.cwds = {1104: "/elsewhere/x"}
         self.assertEqual(self.run_kill(probe, [1104])["results"][0]["status"], "exited")
-        probe = self.base(proc(1105, 4000, cmd="sleep 5"))  # under the caller's shell, under its claude session
-        probe.cwds = {1105: "/elsewhere/x"}
-        self.assertEqual(self.run_kill(probe, [1105])["results"][0]["status"], "exited")
         self.assertEqual(self.notices, [])
+
+    def test_other_agents_process_in_the_same_session_is_foreign(self):
+        probe = self.base(proc(1105, 4000, cmd="sleep 5"))  # sibling under the same claude session, other worktree
+        probe.cwds = {1105: "/elsewhere/x"}
+        out = self.run_kill(probe, [1105])
+        self.assertEqual(out["results"][0]["status"], "refused")
+        self.assertIn("--foreign", out["results"][0]["detail"])
+        probe = self.base(proc(1105, 4000, cmd="sleep 5"))
+        probe.cwds = {1105: "/elsewhere/x"}
+        self.assertEqual(self.run_kill(probe, [1105], foreign=True)["results"][0]["status"], "exited")
+        self.assertEqual(len(self.notices), 1)
+
+    def test_claude_pid_env_does_not_widen_scope(self):
+        probe = self.base(proc(1107, 100, cmd="sleep 5"))
+        probe.cwds = {1107: "/elsewhere/x"}
+        os.environ["CLAUDE_PID"] = "100"
+        self.addCleanup(os.environ.pop, "CLAUDE_PID", None)
+        self.assertEqual(self.run_kill(probe, [1107])["results"][0]["status"], "refused")
 
     def test_flag_does_not_lift_hard_refusals(self):
         probe = self.base(proc(1106, 1, uid=0, cmd="/usr/bin/x"))
@@ -535,7 +557,7 @@ class GuardRule(unittest.TestCase):
         for tail in ("--pid 4242 --reason 'runaway vite'", "--pid 4242,4243 --reason x --tree --foreign --grace 5",
                      "--pid=4242 --reason=stuck --host dev2", "--pid 12 --reason 'a b c' --agent a1b2 --session s-1"):
             self.assertEqual(self.verdict(self.A + tail), "allow", tail)
-        self.assertEqual(self.verdict("python3 -I -B /Users/eric/.claude/hooks/ah.py kill --pid 9 --reason r"), "allow")
+        self.assertEqual(self.verdict("python3 -I -B " + str(Path.home()) + "/.claude/hooks/ah.py kill --pid 9 --reason r"), "allow")
 
     def test_everything_else_stays_blocked(self):
         bad = [

@@ -111,13 +111,24 @@ LAUNCHERS = {'tmux', 'screen', 'at', 'batch', 'watch'}
 CLASSIC_VERBS = {'pkill', 'killall', 'killall5', 'skill', 'slay', 'taskkill', 'stop-process', 'spps'}
 PID_OPT_VALUE = re.compile(r'[0-9]+(?:,[0-9]+)*')
 # Harness CLIs whose arguments are data (a note, a search text), never code. ah.py kill is judged by is_ah_kill.
-HARNESS_CLI = re.compile(r'(?:~|/Users/(?!Shared/)[A-Za-z0-9_][A-Za-z0-9_.-]*|/home/[A-Za-z0-9_][A-Za-z0-9_.-]*)'
-                         r'/\.claude/hooks/(?:ah|wal_note|provenance)\.py')
-# Inside a Python string literal, kill counts only where it can run as a command: at the start, after a shell
-# separator, a path slash, or a wrapper word. "ah kill: ..." in a ticket title is data.
-LITERAL_COMMAND_USE = re.compile(r'(?i)(?:^|[;&|(`/\n]|\$\(|\b(?:sudo|xargs|exec|nohup|env|time|then|do|else|-exec)\s+)\s*(?:p|f)?kill')
+AH_SUBCOMMANDS = {'owners', 'user-msg', 'ticket', 'disk', 'task', 'doctor', 'spool', 'write'}
 PY_LITERAL = re.compile(r"""('\'\'[\s\S]*?\'\'\'|"{3}[\s\S]*?"{3}|'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*")""")
-AH_SCRIPT = re.compile(r'(?:~|/Users/(?!Shared/)[A-Za-z0-9_][A-Za-z0-9_.-]*|/home/[A-Za-z0-9_][A-Za-z0-9_.-]*)/\.claude/hooks/ah\.py')
+# Inline Python that cannot run text as code or reach the OS: only then are its string literals plain data.
+PY_NOT_PURE = re.compile(r"#|\\|__|\b(?:exec|eval|compile|getattr|setattr|delattr|globals|locals|vars|open|system|popen"
+                         r"|subprocess|spawn|ctypes|importlib|input|breakpoint)\b|\b[fFbBrRuU]{1,2}['\"]")
+PY_SAFE_IMPORTS = {'json', 'sys', 're', 'datetime', 'time', 'textwrap'}
+
+
+def pure_data_python(body):
+    if PY_NOT_PURE.search(body):
+        return False
+    return all(m.split('.')[0] in PY_SAFE_IMPORTS for m in re.findall(r'\b(?:import|from)\s+([A-Za-z_][\w.]*)', body))
+
+
+def hook_script_ok(raw, names):
+    """The raw word names ~/.claude/hooks/<name>.py or the same path under the caller's real HOME, nothing else."""
+    home = re.escape(str(Path.home()))
+    return bool(re.fullmatch(r'(?:~|%s)/\.claude/hooks/(?:%s)\.py' % (home, '|'.join(names)), raw or ''))
 
 
 # --------------------------------------------------------------------------- policy and small helpers
@@ -1060,10 +1071,15 @@ def make_analyzer_class(cg):
             i = 0
             while i < len(args) and args[i].text in ('-I', '-B', '-u'):
                 i += 1
-            if i >= len(args) or not HARNESS_CLI.fullmatch(args[i].raw or ''):
+            if i >= len(args) or not hook_script_ok(args[i].raw, ('ah', 'wal_note', 'provenance')):
                 return False
-            if args[i].text.endswith('/ah.py') and any(a.text == 'kill' for a in args[i + 1:i + 2]):
-                return False
+            if args[i].text.endswith('/ah.py'):
+                # only a known non-kill subcommand (optionally after the top-level --text) makes the rest data
+                rest = [a.text for a in args[i + 1:]]
+                if rest[:1] == ['--text']:
+                    rest = rest[1:]
+                if not rest or rest[0] not in AH_SUBCOMMANDS:
+                    return False
             return True
 
         def is_ah_kill(self, name, args, cmd, depth):
@@ -1088,7 +1104,7 @@ def make_analyzer_class(cg):
             while i < len(texts) and texts[i] in ('-B', '-u'):
                 i += 1
             # the raw word is matched: a quoted '~' is a literal directory, and .text has HOME expanded
-            if i + 1 >= len(texts) or not AH_SCRIPT.fullmatch(args[i].raw or '') or texts[i + 1] != 'kill':
+            if i + 1 >= len(texts) or not hook_script_ok(args[i].raw, ('ah',)) or texts[i + 1] != 'kill':
                 return False
             rest, i, seen = texts[i + 2:], 0, set()
             while i < len(rest):
@@ -1132,9 +1148,8 @@ def make_analyzer_class(cg):
                 elif redir.op == '<<<' and redir.target is not None:
                     body += '\n' + redir.target.text
             body = body.replace('kill_guard', '').replace('kill-guard', '')  # the guard's own name
-            if name.startswith('python') and '-c' in texts:
-                # inline Python: a string literal that is plain prose is data; one that can run as a command stays
-                body = PY_LITERAL.sub(lambda m: m.group(0) if LITERAL_COMMAND_USE.search(m.group(0)[1:-1]) else "''", body)
+            if name.startswith('python') and '-c' in texts and pure_data_python(body):
+                body = PY_LITERAL.sub("''", body)  # a program that only formats data: prose in literals is not signalling
             body = re.sub(r'\b(?:os|process)\.kill\(\s*[\w.]+(?:\(\))?\s*,\s*0\s*\)', '', body)  # liveness probe
             if self.script_kill is not None and self.script_kill.search(body):
                 self.block('script-kill', 'interpreter code signals processes the guard cannot check')
