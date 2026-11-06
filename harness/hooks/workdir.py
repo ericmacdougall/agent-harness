@@ -434,13 +434,19 @@ def _unpushed_repos(path: Path, max_depth: int = 3, budget_s: float = 20.0) -> l
     import subprocess  # noqa: PLC0415
     found, deadline = [], time.monotonic() + budget_s
     base_depth = len(Path(path).parts)
+    inside = []  # checkouts above the current dir: no depth cap below one (review M2), yet nested clones are found
     for root, dirs, _files in os.walk(path):
+        while inside and not (root == inside[-1] or root.startswith(inside[-1] + os.sep)):
+            inside.pop()
         is_repo = ".git" in dirs or os.path.isfile(os.path.join(root, ".git"))  # a worktree has a .git file
+        if ".git" in dirs:
+            dirs.remove(".git")
+        if time.monotonic() > deadline and (is_repo or dirs):
+            found.append({"repo": root, "reason": "budget exhausted: treated as unpushed"})
+            dirs[:] = []
+            continue
         if is_repo:
-            dirs[:] = []  # git answers for everything below a checkout; the depth cap never fires inside one (review M2)
-            if time.monotonic() > deadline:
-                found.append({"repo": root, "reason": "budget exhausted: treated as unpushed"})
-                continue
+            inside.append(root)  # keep walking: a gitignored nested clone or a submodule has its own history (round 3 M-a)
             env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
             try:
                 # every ref (branches, tags, stash) and a detached HEAD, minus what any remote has
@@ -453,7 +459,7 @@ def _unpushed_repos(path: Path, max_depth: int = 3, budget_s: float = 20.0) -> l
                         break
             except (OSError, subprocess.SubprocessError):
                 found.append({"repo": root, "reason": "git unavailable: treated as unpushed"})
-        elif len(Path(root).parts) - base_depth >= max_depth and dirs:
+        elif not inside and len(Path(root).parts) - base_depth >= max_depth and dirs:
             found.append({"repo": root, "reason": "depth overrun: unexamined subtree treated as unpushed"})
             dirs[:] = []
     return found

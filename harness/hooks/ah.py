@@ -828,12 +828,15 @@ def actor_id() -> str:
 
 
 def in_child_session() -> bool:
-    """A sub-agent shell: Claude Code sets CLAUDE_CODE_CHILD_SESSION; such a shell can never acknowledge a handoff."""
-    return bool(os.environ.get("CLAUDE_CODE_CHILD_SESSION"))
+    """Retired (S3b review round 3, B1): no environment variable tells main from a sub-agent. Main's own shell carries
+    CLAUDE_CODE_CHILD_SESSION=1 and AI_AGENT=claude-code_<v>_agent exactly like a sub-agent's (observed in main's
+    shell, 2026-11-05). The caller's identity comes from the hook payload instead: `dropped_gate.py pretool` denies
+    a sub-agent's acknowledging `ah task dispose` before it runs."""
+    return False
 
 
 def actor(session, host=None):
-    return {"session": session or "", "agent_id": os.environ.get("AH_AGENT_ID", "main"),
+    return {"session": session or "", "agent_id": actor_id(),
             "host": host or socket.gethostname()}
 
 
@@ -887,6 +890,11 @@ def precheck(op: str, args: dict) -> None:
         if args["kind"] == "waiting":
             if parse_ts(args.get("until") or "") is None:
                 raise AhError("bad_request", "task.dispose waiting: --until <ISO time> is required (when it expires)")
+            cap = WAIT_UNVERIFIED_MAX_S if args.get("ref_unverified") else WAIT_MAX_S
+            if parse_ts(args["until"]) - parse_ts(args["at"]) > cap:
+                raise AhError("bad_request", f"task.dispose waiting: --until may be at most {cap // 3600} h after now"
+                                             + (" (GoodQA could not confirm the ticket)" if args.get("ref_unverified") else "")
+                                             + "; renew the wait when it expires")
             ref = args.get("ref") or ""
             if not (ASK_ID_RE.match(ref) or TICKET_RE.match(ref)):
                 raise AhError("bad_request", "task.dispose waiting: --ref must be an ask id (w + 11 hex) or 'GoodQA <project>#N'; "
@@ -1216,7 +1224,7 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
             "severity": args.get("severity") or "info", "key": args["alert_key"], "check": args["source"],
             "message": args.get("message") or "cleared", "detail": args.get("detail") or {}}, home=home)
     elif op == "task.dispose":
-        if args["kind"] in ("resumed", "reassigned", "closed") and (actor_id() == args["agent"] or in_child_session()):
+        if args["kind"] in ("resumed", "reassigned", "closed") and actor_id() == args["agent"]:
             raise AhError("forbidden", f"task.dispose {args['kind']}: a sub-agent or the owner itself cannot acknowledge; "
                                        "main records it (waiting is allowed)", 3)
         main_wal = _wal_path(home, args["session"], "main")
@@ -1346,6 +1354,21 @@ def task_list(home: Path, open_only: bool = False) -> dict:
     return {"tasks": rows, "source": "direct"}
 
 
+WAIT_MAX_S = 7 * 86400  # a named wait expires within a week; it is renewed, never parked for years (review M-b)
+WAIT_UNVERIFIED_MAX_S = 86400  # when GoodQA cannot confirm the ticket a wait names
+
+
+def _ticket_exists(ref: str):
+    """True or False from GoodQA; None when it cannot be reached."""
+    try:
+        ticket_get(ref)
+        return True
+    except AhError as e:
+        return False if e.code == "not_found" else None
+    except Exception:  # noqa: BLE001 - no adapter, no key, no network: unknown, never "exists"
+        return None
+
+
 def server_now() -> str:
     """The writer's clock for stamped ops. No environment override: a caller-chosen time is a gate bypass
     (a forward-dated resumed would be live forever). Tests patch this function."""
@@ -1354,9 +1377,15 @@ def server_now() -> str:
 
 def write(home: Path, op: str, args: dict, session: str, key: str | None = None) -> dict:
     if op in ("task.dispose", "task.pending", "deadline.add"):
-        stamped = dict(args)
+        stamped = {k: v for k, v in args.items() if k != "ref_unverified"}  # set only here
         if op != "deadline.add":
             stamped["at"] = server_now()  # never the caller's clock (M4): a backdated disposition cannot be forged
+        if op == "task.dispose" and stamped.get("kind") == "waiting" and TICKET_RE.match(stamped.get("ref") or ""):
+            found = _ticket_exists(stamped["ref"])
+            if found is False:
+                raise AhError("bad_request", f"task.dispose waiting: {stamped['ref']} does not exist", 3)
+            if found is None:
+                stamped["ref_unverified"] = True
         args = stamped
     precheck(op, args)
     import redact
