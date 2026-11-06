@@ -983,6 +983,7 @@ class Tree(object):
         self.local_only = 0           # none: commits reachable only from this tree's HEAD/branch
         self.default_ref = ""
         self.merged = False
+        self.held_locally = False     # detached HEAD contained in a local branch or tag
 
     @property
     def disk_only(self) -> bool:
@@ -1038,6 +1039,10 @@ def inspect_tree(t: Tree, budget: Budget) -> bool:
     rc, refs = git(budget, t.top, "for-each-ref", "--count=1", "--contains", t.head,
                    "--format=%(refname)", *["refs/remotes/%s/" % r for r in names])
     t.on_remote = rc == 0 and bool(refs.strip())
+    if not t.branch and not t.on_remote:
+        rc, held = git(budget, t.top, "for-each-ref", "--count=1", "--contains", t.head, "--format=%(refname)",
+                       "refs/heads", "refs/tags")
+        t.held_locally = rc == 0 and bool(held.strip())
     for r in names:
         for cand in ("HEAD", "main", "master"):
             ref = "refs/remotes/%s/%s" % (r, cand)
@@ -1129,7 +1134,7 @@ def blocking_text(blockers: list, push: bool = True) -> str:
             out.append("      python3 ~/.claude/hooks/commit_policy.py check-message --file <message file>")
             out.append("      git -C %s commit -F <message file>" % q(t.top))
         if not push:
-            if t.disk_only and not t.branch:
+            if t.disk_only and not t.branch and not t.held_locally:
                 out.append("    commits on a detached HEAD at %s are on no branch: git gc can drop them once"
                            % t.head[:12])
                 out.append("    this tree moves, so name the work before you stop:")
@@ -1344,15 +1349,16 @@ def run(ev: dict, budget: Budget) -> "tuple[int, str, str]":
         if inspect_tree(t, budget):
             live.append(t)
     push = block_unpushed()
-    # a detached HEAD's commits are on no branch (gc can drop them), so they block even in report-only mode
-    blockers = [t for t in live if t.status or (t.disk_only and (push or not t.branch))]
+    # a detached HEAD whose commits no local branch or tag holds can lose them to gc, so it blocks even in
+    # report-only mode; a detached review or rescue tree at a branch's commit does not
+    blockers = [t for t in live if t.status or (t.disk_only and (push or not (t.branch or t.held_locally)))]
     for t in live:
         if t not in blockers:
             t.merged = branch_has_merged_work(t, budget)
     owned_tops = {t.top for t in owned}
     rep = report_lines(live, budget, duplicates(live, budget, owned_tops))
     for t in live:
-        if t.disk_only and not t.status and not push and t.branch:
+        if t.disk_only and not t.status and not push and (t.branch or t.held_locally):
             where = ("branch %s" % t.branch) if t.branch else ("detached HEAD at %s" % t.head[:12])
             rep.insert(0, "  UNPUSHED: %s  [%s, HEAD %s is on no %s branch]; publish it through deliver.py prepare "
                           "(or publish_feature.py) once reviewed" % (t.top, where, t.head[:12],

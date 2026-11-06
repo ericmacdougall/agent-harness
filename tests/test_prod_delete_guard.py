@@ -176,7 +176,7 @@ class Grants(Case):
     TARGET = "prod-db.example.com"
 
     def real_grant(self, target=None, ttl=600, **kw):
-        source = self.human_turn()
+        source = self.human_turn("Yes, run the delete on %s" % (target or self.TARGET))
         return pdg.grant(source, target or self.TARGET, str(self.wal), ttl=ttl, home=str(self.home), **kw)
 
     def stored(self):
@@ -267,7 +267,7 @@ class Grants(Case):
         uid = str(uuid.uuid4())
         (fake / "projects/x" / (SID + ".jsonl")).write_text(json.dumps({
             "type": "user", "uuid": uid, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "origin": {"kind": "human"}, "message": {"content": "yes"}}) + "\n")
+            "origin": {"kind": "human"}, "message": {"content": "yes, delete on %s" % self.TARGET}}) + "\n")
         os.environ["CLAUDE_CONFIG_DIR"] = str(fake)
         with self.assertRaises(ValueError):
             pdg.grant("user:%s/%s" % (SID, uid), self.TARGET, str(self.wal), home=str(self.home))
@@ -306,8 +306,8 @@ class Grants(Case):
         self.assertTrue(any("prod_delete_guard grant" in r.get("note", "") for r in wal))
 
     def test_grant_refusals_write_nothing(self):
-        source = self.human_turn()
-        old = self.human_turn(when="2026-01-01T00:00:00Z")
+        source = self.human_turn("delete on %s" % self.TARGET)
+        old = self.human_turn("delete on %s" % self.TARGET, when="2026-01-01T00:00:00Z")
         cases = (dict(user_source="inferred: from me -- x"), dict(user_source="ticket:GoodQA goodqa#1"),
                  dict(user_source="user:%s/%s" % (SID, uuid.uuid4())), dict(user_source=old),
                  dict(target="pr"), dict(target=" prod-db "), dict(ttl=0), dict(ttl=pdg.MAX_TTL + 1), dict(wal=""))
@@ -393,7 +393,7 @@ class Bypasses(Case):
         ev = {"tool_name": "mcp__cloudflare__d1_database_query",
               "tool_input": {"database_id": "panel-prod-d1", "sql": "DELETE FROM devices"}}
         self.assertEqual(self.verdict(ev), "deny")
-        pdg.grant(self.human_turn(), "panel-prod-d1", str(self.wal), home=str(self.home))
+        pdg.grant(self.human_turn("ok, delete on panel-prod-d1"), "panel-prod-d1", str(self.wal), home=str(self.home))
         self.assertEqual(self.verdict(ev), "allow")
         ev["tool_input"] = {"sql": "DELETE FROM devices"}  # no database named: nothing a grant can cover
         self.assertEqual(self.verdict(ev), "deny")
@@ -419,7 +419,7 @@ class HookProcess(Case):
         self.assertEqual((r.returncode, r.stdout), (0, ""))
 
     def test_cli_grant_and_list(self):
-        source = self.human_turn()
+        source = self.human_turn("Yes, truncate on prod-db.example.com")
         cmd = [sys.executable, str(HOOKS / "prod_delete_guard.py")]
         r = subprocess.run(cmd + ["grant", "--user-source", source, "--target", "prod-db.example.com", "--wal",
                                   str(self.wal), "--ttl", "120"], capture_output=True, text=True, timeout=60)
@@ -445,6 +445,119 @@ class Install(unittest.TestCase):
         self.assertNotIn("onFailure", groups[0]["hooks"][0])
         self.assertIn("prod_delete_guard.py", install.HOOKS)
         self.assertIn(str(claude / "hooks" / "prod_delete_guard.py"), install.managed_scripts(claude))
+
+
+class Round3(Case):
+    """Native re-review of 71d7e78 (hk-wave1-r2-71d7e78.md): R1-R6."""
+    TARGET = "prod-db"
+
+    def sql(self, name, text):
+        (self.home / name).write_text(text)
+        return self.home / name
+
+    def ev(self, command):
+        return dict(bash(command), cwd=str(self.home))
+
+    def test_r1_huge_destructive_command_decides_fast(self):
+        body = "DELETE FROM a; " * 200000  # about 3 MB in one quoted token
+        for command, want in (("psql -h prod-db -c '%s'" % body, "deny"), ("psql -h localhost -c '%s'" % body, "allow")):
+            with self.subTest(want=want):
+                start = time.monotonic()
+                self.assertEqual(self.verdict(bash(command)), want)
+                self.assertLess(time.monotonic() - start, 5.0)  # measured 1.3 s on the Mac; hook timeout is 30 s
+
+    def test_r2_fifo_sql_file_denies_without_hanging(self):
+        import threading
+        fifo = self.home / "q.sql"
+        os.mkfifo(fifo)
+        got = []
+        worker = threading.Thread(target=lambda: got.append(self.verdict(self.ev("psql -h prod-db -f %s" % fifo))),
+                                  daemon=True)
+        worker.start()
+        worker.join(3)
+        try:
+            self.assertFalse(worker.is_alive(), "the hook blocked on a FIFO")
+            self.assertEqual(got, ["deny"])
+        finally:
+            if worker.is_alive():  # release the blocked reader so the thread can end
+                os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+
+    def test_r3_other_ways_of_feeding_a_file(self):
+        self.sql("evil.sql", "DROP TABLE users;\n")
+        self.sql("q.sql", "SELECT 1;\n")
+        for command in ("cat evil.sql | psql -h prod-db", "psql -h prod-db -c '\\i evil.sql'",
+                        "psql -h prod-db -c '\\ir evil.sql'", 'psql -h prod-db <<< "$(cat evil.sql)"',
+                        'psql -h prod-db <<< "$(< evil.sql)"', "mysql -h prod-db -e 'source evil.sql'",
+                        "sqlite3 /srv/prod.db '.read evil.sql'",
+                        "cp evil.sql q.sql && psql -h prod-db -f q.sql",
+                        "cat evil.sql > q.sql; psql -h prod-db -f q.sql",
+                        "sed -i 's/SELECT 1/DROP TABLE t/' q.sql && psql -h prod-db < q.sql"):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(self.ev(command)), "deny")
+        for command in ("cat q.sql | psql -h prod-db", "psql -h prod-db -f q.sql", "cat evil.sql | psql -h localhost"):
+            with self.subTest(command=command):
+                self.assertEqual(self.verdict(self.ev(command)), "allow")
+
+    def test_r4_a_turn_that_does_not_name_the_target_funds_no_grant(self):
+        for text in ("thanks, looks good", "hi", "yes, delete on prod-db-10", "drop prod-dbx"):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError) as caught:
+                    pdg.grant(self.human_turn(text), "prod-db", str(self.wal), home=str(self.home))
+                self.assertIn("does not name", str(caught.exception))
+        self.assertFalse(pdg.grants_path(str(self.home)).exists())
+        pdg.grant(self.human_turn("Yes, DELETE the rows on PROD-DB."), "prod-db", str(self.wal), home=str(self.home))
+        self.assertAllowed("psql -h prod-db -c 'DELETE FROM t'")
+
+    def test_r4_source_older_than_an_hour_refused(self):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 2 * 3600))
+        with self.assertRaises(ValueError):
+            pdg.grant(self.human_turn("delete on prod-db", when=stamp), "prod-db", str(self.wal), home=str(self.home))
+
+    def answer(self, question, choice):
+        use, uid = "toolu_%s" % uuid.uuid4().hex[:16], str(uuid.uuid4())
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        ask = {"type": "assistant", "uuid": str(uuid.uuid4()), "timestamp": stamp, "sessionId": SID,
+               "message": {"role": "assistant", "content": [{"type": "tool_use", "id": use, "name": "AskUserQuestion",
+                                                             "input": {"questions": [{"question": question}]}}]}}
+        reply = {"type": "user", "uuid": uid, "timestamp": stamp, "sessionId": SID,
+                 "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use, "content": "ok"}]},
+                 "toolUseResult": {"answers": {question: choice}}}
+        path = self.home / ".claude/projects/p" / (SID + ".jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as fh:
+            fh.write(json.dumps(ask) + "\n" + json.dumps(reply) + "\n")
+        return "answer:%s/%s" % (SID, uid)
+
+    def test_r4_answer_to_a_question_naming_the_target_funds_a_grant(self):
+        good = self.answer("Run DELETE FROM sessions on prod-db?", "Yes (Recommended)")
+        pdg.grant(good, "prod-db", str(self.wal), home=str(self.home))
+        self.assertAllowed("psql -h prod-db -c 'DELETE FROM sessions'")
+        other = self.answer("Ship the release notes?", "Yes")
+        with self.assertRaises(ValueError):
+            pdg.grant(other, "prod-other", str(self.wal), home=str(self.home))
+
+    def test_r5_d1_target_skips_flags_and_flag_targets_refused(self):
+        desc, groups = pdg.targets_production("wrangler d1 execute --remote mydb --command 'DELETE FROM t'")
+        self.assertEqual(groups, [("mydb",)])
+        with self.assertRaises(ValueError):
+            pdg.grant(self.human_turn("delete on --remote"), "--remote", str(self.wal), home=str(self.home))
+
+    def test_r6_key_must_be_a_private_regular_file(self):
+        pdg.grant(self.human_turn("delete on prod-db"), "prod-db", str(self.wal), home=str(self.home))
+        key = pdg.key_path(str(self.home))
+        self.assertAllowed("psql -h prod-db -c 'DELETE FROM t'")
+        os.chmod(key, 0o644)
+        self.assertDenied("psql -h prod-db -c 'DELETE FROM t'")
+        os.chmod(key, 0o600)
+        os.link(key, self.home / "key-copy")
+        self.assertDenied("psql -h prod-db -c 'DELETE FROM t'")
+        os.unlink(self.home / "key-copy")
+        planted = self.home / "public.key"
+        planted.write_bytes(key.read_bytes())
+        os.chmod(planted, 0o600)
+        key.unlink()
+        os.symlink(planted, key)
+        self.assertDenied("psql -h prod-db -c 'DELETE FROM t'")
 
 
 if __name__ == "__main__":

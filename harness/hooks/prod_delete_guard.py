@@ -24,14 +24,21 @@ What counts as a production TARGET (each yields the exact target value a grant m
   - ssh <prod-host> running a DB client or wrangler        -> the host
   - docker exec <prod-container> running a DB client        -> the container
   - mcp__*__d1_database_query / hyperdrive_* (production by construction) -> the database id field
-The SQL is read from the command, from --file / psql -f files and from `< file` redirects. Relative
-paths resolve against the event's cwd, and ~ is expanded. A prod-targeted command whose SQL file
-cannot be read at hook time (missing, unreadable, or more than 8 files) is denied: it cannot be judged.
+The SQL is read from the command and, with a DB client in it, from --file / psql -f files, `< file`
+redirects, `$(< file)`, the arguments of `cat`, and psql `\i`/`\ir`, sqlite `.read` and mysql `source`.
+Relative paths resolve against the event's cwd, and ~ is expanded. Files are opened as regular files only
+(a FIFO or device cannot hang the hook). A prod-targeted command is denied when one of its SQL files cannot
+be judged at hook time: missing, not a regular file, unreadable, more than 8 files, or a path the same
+command writes (>, >>, tee, cp/mv/install/ln/rsync destination, sed -i), which would be read in its old
+state. Commands over 64 KiB are split on whitespace instead of shlex, so the hook decides well inside its
+30 s budget.
 Prose that merely mentions these words does not count; a heredoc that runs psql against a prod host
 does (Hawkeye's accepted over-refusal, H-2). Out of scope, disclosed: SQL built at run time
 (`base64 -d | psql`, variables holding the statement, scripts run by name), unnamed targets
-(a default PGHOST that is not in the hook's environment), and non-SQL deletes (API calls, rm on a
-data directory).
+(a default PGHOST that is not in the hook's environment, PGSERVICE), non-SQL deletes (API calls, rm on a
+data directory), statements DESTRUCTIVE does not cover (MySQL multi-table `DELETE t FROM t`, mongosh
+`deleteMany`/`drop`, redis-cli `FLUSHALL`/`FLUSHDB`/`DEL`), and `mcp__*__execute_sql`-style tools whose text
+does not name prod.
 
 Fail direction:
   - Before a match, any error allows. A parser bug must not block ordinary work.
@@ -42,16 +49,23 @@ Grants
                              [--ttl SECONDS] [--note TEXT]
   prod_delete_guard.py list
 - --user-source must be a user:<session>/<uuid> or answer:<session>/<uuid> id (ah user-msg finds one)
-  that provenance.py resolves, from the pinned ~/.claude, to a human turn at most 24 hours old.
+  that provenance.py resolves, from the pinned ~/.claude, to a human turn at most 1 hour old. The human
+  must have seen the exact target: it must appear as a whole name in their turn's text, or in the
+  AskUserQuestion they answered. A generic "looks good" funds no grant.
 - --target must equal, case-folded, one of the target values the guard extracts from the command
   (for example `prod-db.example.com`, or `app_production`). It is never a substring match. SQL
-  words and client names are refused as targets. A command with several
+  words, client names and names starting with "-" are refused as targets. A connection string's host
+  and database are alternatives, so a grant on a generic database name (`app`, `postgres`) covers that
+  database on every prod host (disclosed). A command with several
   prod targets needs a grant for each one.
 - The TTL defaults to 900 seconds and cannot exceed 3600. The grant can be reused until it expires.
 - Each grant is HMAC-signed with ~/.agent-harness/state/prod-delete.key (0600, created on first
   use). At check time the guard re-verifies the signature and the TTL and source-age bounds, and
   resolves the source again. command_guard refuses shell writes to the grant file and the key.
-  Residual, disclosed: a same-user agent that reads the key could sign a grant; provenance proves
+  The key is used only when it is a regular file, mode 0600, owned by the caller, with one link; it is
+  opened without following a symlink, and the store is replaced through an O_EXCL|O_NOFOLLOW temp file.
+  Residual, disclosed: a same-user process, or the Write and Edit tools (command_guard judges Bash only),
+  can read or plant the key and so sign a grant, skipping only the WAL record; provenance proves
   the cited turn is a real human turn, not that it approves this particular delete. The WAL record
   and the exact-target binding keep the claim auditable and narrow.
 
@@ -69,6 +83,7 @@ import os
 import re
 import secrets
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -85,15 +100,29 @@ DESTRUCTIVE = re.compile(
     r"|\bUPDATE\s+[\w.\"`\[\]]+\s+SET\b(?![^;]*\bWHERE\b)", re.I)
 SQL_COMMENT = re.compile(r"/\*.*?\*/", re.S)
 PROD_TOKEN = re.compile(r"(?:^|[\s_.\-/=@\"'])(prod|production)(?:$|[\s_.\-/:?#\"'])", re.I)
-D1_EXECUTE = re.compile(r"\bwrangler\b[^\n|;&]*\bd1\b\s+execute\s+([^\s;|&]+)?", re.I)
+D1_EXECUTE = re.compile(r"\bwrangler\b[^\n|;&]*\bd1\b\s+execute\s+(?:--?[\w-]+(?:=\S*)?\s+)*([^\s;|&-][^\s;|&]*)?",
+                        re.I)
 REMOTE_FLAG = re.compile(r"--remote\b")
 FILE_FLAG = re.compile(r"--file[=\s]+(\S+)")
 DB_CLIENT = re.compile(
     r"\b(psql|pg_dump|pg_restore|dropdb|createdb|mysql|mysqldump|mysqladmin|"
     r"mariadb|mongo|mongosh|mongodump|mongorestore|redis-cli|sqlite3)\b", re.I)
 DB_TARGET_FLAG = re.compile(r"(?:(?:--dbname|--database|--db|--host)[=\s]+|(?<![\w-])-[hd](?:\s+|(?=[^\s-])))(\S+)", re.I)
+CLIENT_NAMES = {"psql", "pg_dump", "pg_restore", "dropdb", "createdb", "mysql", "mysqldump", "mysqladmin", "mariadb",
+                "mongo", "mongosh", "mongodump", "mongorestore", "redis-cli", "sqlite3"}
 PSQL_FILE_FLAG = re.compile(r"\bpsql\b[^\n|;&]*?(?<![\w-])-f\s*(\S+)", re.I)
 REDIRECT_IN = re.compile(r"(?<![<\d])<\s*(?![<(])([^\s;|&<>]+)")
+CAT_ARGS = re.compile(r"(?:^|[\s;&|(`])cat\s+((?:[^\s|;&<>()`]+[ \t]*)+)")
+SUBST_IN = re.compile(r"\$\(\s*<\s*([^\s)]+)\s*\)")
+CLIENT_INCLUDE = re.compile(r"(?:\\ir?|(?<![\w$])\.read)\s+([^\s;'\"]+)")
+MYSQL_SOURCE = re.compile(r"\b(?:mysql|mariadb)\b[^\n|&]*?\bsource\s+([^\s;'\"]+)", re.I)
+WRITE_DEST = (
+    re.compile(r"(?<![<\d&])>{1,2}\|?\s*([^\s;|&<>]+)"),
+    re.compile(r"\btee\s+(?:-[a-z]+\s+)*([^\s;|&<>]+)"),
+    re.compile(r"\b(?:cp|mv|install|ln|rsync)\s+[^;|&\n]*?\s([^\s;|&<>]+)[ \t]*(?=$|[;|&\n])"),
+    re.compile(r"\bsed\s+(?:-[a-zA-Z]*i[a-zA-Z]*|--in-place)\b[^;|&\n]*\s([^\s;|&<>]+)[ \t]*(?=$|[;|&\n])"),
+)
+SHLEX_LIMIT = 64 * 1024
 CONN_STRING = re.compile(r"\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis)://\S+", re.I)
 ENV_ASSIGN = re.compile(r"(?:^|[\s;&|(])(PGHOST|PGDATABASE|DATABASE_URL|MYSQL_HOST)=([^\s;&|]+)")
 ENV_NAMES = ("PGHOST", "PGDATABASE", "DATABASE_URL", "MYSQL_HOST")
@@ -122,7 +151,7 @@ LOCK_NAME = "prod-delete-grants.lock"
 GRANT_SCOPE = "prod-db"
 DEFAULT_TTL = 900
 MAX_TTL = 3600
-MAX_SOURCE_AGE = 86400
+MAX_SOURCE_AGE = 3600
 CLOCK_SLACK = 60
 MIN_TARGET = 3
 MAX_GRANTS = 64
@@ -143,12 +172,27 @@ def _resolve_path(raw: str, cwd) -> str:
 
 
 def _read_sql_file(path: str):
-    """The file's text, or None when it is missing or unreadable (it cannot be judged)."""
+    """The file's text, or None when it is missing, not a regular file (a FIFO cannot hang the hook) or unreadable:
+    then it cannot be judged."""
+    import safe_input  # noqa: PLC0415
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            return fh.read(FILE_READ_LIMIT)
+        fd = safe_input.open_regular_file(path)
+    except safe_input.InputRejected:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            return fh.read(FILE_READ_LIMIT).decode("utf-8", "replace")
     except (OSError, ValueError):
         return None
+
+
+def _written_paths(command: str, cwd=None) -> set:
+    """Paths this command writes (>, >>, tee, cp/mv/install/ln/rsync destination, sed -i)."""
+    out = set()
+    for rx in WRITE_DEST:
+        for m in rx.finditer(command):
+            out.add(os.path.normpath(_resolve_path(m.group(1), cwd)))
+    return out
 
 
 def sql_text_for(command: str, cwd=None, unread=None) -> str:
@@ -158,9 +202,17 @@ def sql_text_for(command: str, cwd=None, unread=None) -> str:
     paths += [m.group(1) for m in PSQL_FILE_FLAG.finditer(command)]
     if DB_CLIENT.search(command) or D1_EXECUTE.search(command):
         paths += [m.group(1) for m in REDIRECT_IN.finditer(command)]
+        paths += [m.group(1) for m in SUBST_IN.finditer(command)]
+        paths += [m.group(1) for m in CLIENT_INCLUDE.finditer(command)]
+        paths += [m.group(1) for m in MYSQL_SOURCE.finditer(command)]
+        for m in CAT_ARGS.finditer(command):
+            paths += [w for w in m.group(1).split() if not w.startswith("-")]
+    written = _written_paths(command, cwd) if paths else set()
     text = command
     for raw in paths[:8]:
-        body = _read_sql_file(_resolve_path(raw, cwd))
+        resolved = _resolve_path(raw, cwd)
+        # a file this same command writes is judged in its old state at hook time, so it cannot be judged at all
+        body = None if os.path.normpath(resolved) in written else _read_sql_file(resolved)
         if body is None:
             if unread is not None:
                 unread.append(raw)
@@ -172,6 +224,10 @@ def sql_text_for(command: str, cwd=None, unread=None) -> str:
 
 
 def _words(command: str) -> list:
+    """Shell words. shlex is quadratic in one long quoted token, so a command over SHLEX_LIMIT is split on
+    whitespace instead: the hook must decide well inside its 30 s budget (R1)."""
+    if len(command) > SHLEX_LIMIT:
+        return command.split()
     try:
         return shlex.split(command, comments=False, posix=True)
     except ValueError:
@@ -238,7 +294,7 @@ def targets_production(command: str, env=None):
             if _prod(value):
                 add("a %s target (%s) naming prod/production" % (client.group(1), value), [value])
         for i, w in enumerate(words):
-            if DB_CLIENT.fullmatch(os.path.basename(w) or ""):
+            if w[w.rfind("/") + 1:].casefold() in CLIENT_NAMES:  # a set lookup: commands can hold 600k words
                 pos = _after(words, i, CLIENT_OPTS_WITH_VALUE)
                 if pos and not pos.startswith("-") and _prod(pos) and "://" not in pos and " " not in pos:
                     add("a %s positional database (%s) naming prod/production" % (w, pos), [pos])
@@ -253,7 +309,7 @@ def targets_production(command: str, env=None):
                 parts = _conn_parts(value) if "://" in value else [value]
                 add("%s names prod/production (%s)" % (name, value), parts)
     for i, w in enumerate(words):
-        base = os.path.basename(w)
+        base = w[w.rfind("/") + 1:]
         if base == "ssh":
             host = _after(words, i, {"-" + c for c in SSH_OPTS_WITH_VALUE})
             rest = " ".join(words[i + 1:])
@@ -337,9 +393,18 @@ def _read_key(home=None, create=False):
     if not os.path.lexists(path):
         return None
     try:
-        key = safe_input.read_bounded(path, 256)
-    except safe_input.InputRejected as exc:
-        raise StoreBroken("grant key unreadable (%s)" % exc.code) from exc
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) != 0o600 or st.st_uid != os.getuid() \
+                or st.st_nlink != 1:
+            raise StoreBroken("grant key is not a private regular file (a symlink, a link, another owner or "
+                              "mode %o); only `grant` creates it" % stat.S_IMODE(st.st_mode))
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as fh:
+            key = fh.read(257)
+    except OSError as exc:
+        raise StoreBroken("grant key unreadable (%s)" % type(exc).__name__) from exc
+    if len(key) > 256:
+        raise StoreBroken("grant key is too long")
     if len(key) < 32:
         raise StoreBroken("grant key is too short")
     return key
@@ -383,7 +448,43 @@ def resolve_user_source(source: str, home=None) -> dict:
         turn = (provenance.user_turn if kind == "user" else provenance.answer_turn)(session, uid, claude)
     except provenance.Problem as exc:
         raise ValueError("%s: %s" % (exc.code, exc)) from exc
+    turn = dict(turn, kind=kind, question="")
+    if kind == "answer":
+        try:
+            path = provenance.find_transcript(session, claude)
+            turn["question"] = _askuser_question(provenance, path, provenance.load_record(path, "uuid", uid))
+        except Exception:  # noqa: BLE001 - no question found: the answer must then name the target itself
+            pass
     return turn
+
+
+def _askuser_question(provenance, path, record) -> str:
+    """JSON of the input of the main-conversation AskUserQuestion that `record` answers, or ''."""
+    blocks = (record.get("message") or {}).get("content") if isinstance(record, dict) else None
+    use_id = blocks[0].get("tool_use_id") if isinstance(blocks, list) and blocks and isinstance(blocks[0], dict) \
+        else None
+    if not isinstance(use_id, str) or not use_id:
+        return ""
+    for line in provenance._lines_containing(path, use_id.encode()):
+        if line is None:
+            continue
+        try:
+            rec = provenance.loads_line(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or rec.get("type") != "assistant" or rec.get("isSidechain"):
+            continue
+        for block in (rec.get("message") or {}).get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id") == use_id \
+                    and block.get("name") == "AskUserQuestion":
+                return json.dumps(block.get("input"), ensure_ascii=False)
+    return ""
+
+
+def names_target(turn: dict, target: str) -> bool:
+    """The human saw the exact target: it is in their own turn's text, or in the AskUserQuestion they answered."""
+    seen = "%s\n%s" % (turn.get("text") or "", turn.get("question") or "")
+    return bool(re.search(r"(?<![\w.-])%s(?![\w-])" % re.escape(target.casefold()), seen.casefold()))
 
 
 def _epoch(ts) -> float:
@@ -396,7 +497,7 @@ def valid_target(target) -> str:
     """'' when the grant target is acceptable, else why not."""
     if not isinstance(target, str) or len(target) < MIN_TARGET or target != target.strip():
         return "--target must be at least %d characters with no surrounding space" % MIN_TARGET
-    if any(ch.isspace() for ch in target) or any(ch in target for ch in "*?[]$`;|&<>'\"#"):
+    if target.startswith("-") or any(ch.isspace() for ch in target) or any(ch in target for ch in "*?[]$`;|&<>'\"#"):
         return "--target must be one host or database name, with no spaces, quotes or wildcards"
     if target.casefold() in RESERVED_TARGETS or DB_CLIENT.fullmatch(target):
         return "--target %r is a keyword, a client name or bare prod; name the exact host or database" % target
@@ -456,8 +557,8 @@ def matching_grants(targets: list, home=None, now=None, resolver=None):
 def _write_grants(grants: list, home=None) -> None:
     path = grants_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".%d.tmp" % os.getpid())
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    tmp = path.with_name(path.name + ".%d.%s.tmp" % (os.getpid(), secrets.token_hex(4)))
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w") as fh:
         json.dump({"schema": 2, "grants": grants}, fh, indent=1, sort_keys=True)
         fh.write("\n")
@@ -489,6 +590,9 @@ def grant(user_source: str, target: str, wal, ttl: int = DEFAULT_TTL, note: str 
     if not 1 <= int(ttl) <= MAX_TTL:
         raise ValueError("--ttl must be between 1 and %d seconds" % MAX_TTL)
     turn = resolver(user_source, home)
+    if not names_target(turn, target):
+        raise ValueError("the cited turn does not name %s: ask the user with AskUserQuestion naming the exact target, "
+                         "then cite that answer" % target)
     source_ts = _epoch(turn.get("timestamp"))
     if now - source_ts > MAX_SOURCE_AGE or source_ts > now + CLOCK_SLACK:
         raise ValueError("the user source is older than %d hours (or in the future); ask again" % (MAX_SOURCE_AGE // 3600))

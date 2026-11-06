@@ -540,7 +540,7 @@
   "priority": "P1",
   "owner_overlap": "Hawkeye port goodqa#14908",
   "matrix_rows": "",
-  "partial_reason": "provenance proves the grant cites a real human turn, not that the turn approves this delete; SQL built at run time and unnamed default targets are not detected; a same-user process that reads the key can sign a grant",
+  "partial_reason": "a grant needs a human turn of at most 1 h that names the exact target, which shows the human saw the name, not that they approved this delete; SQL built at run time, unnamed default targets, PGSERVICE, MySQL multi-table DELETE, mongosh and redis-cli deletes are not detected; a connection-string grant on a generic database name covers it on every prod host; a same-user process or the Write/Edit tools can read or plant the key and sign a grant",
   "mechanisms": [
    "prod_delete_guard:hook"
   ]
@@ -605,7 +605,7 @@
   "source": "~/.claude/CLAUDE.md Write-ahead log",
   "rule": "Append a human-readable WAL intent before editing and a result after the check.",
   "enforcement": "ADVISORY",
-  "live_evidence": "wal.py pretool logs metadata (not semantic); wal_cadence.py (port of dev2 hawkeye-wal-cadence, goodqa#14908) nudges once per diff at Stop (linked-worktree cwd) and SubagentStop (the agent's own worktrees only).",
+  "live_evidence": "wal.py pretool logs metadata (not semantic); wal_cadence.py (port of dev2 hawkeye-wal-cadence, goodqa#14908) nudges once per diff at Stop (linked-worktree cwd) and SubagentStop (the agent's own worktrees only; trees elsewhere are not nudged).",
   "checkable": "YES",
   "checkable_reason": "Presence of intent/result entries by event type is deterministic.",
   "proposed_event": "Stop + SubagentStop",

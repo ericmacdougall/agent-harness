@@ -638,9 +638,14 @@ Each production target yields the exact name a grant must give:
 | `docker exec <prod-container>` running a database client | the container |
 | a tool that is production by construction: `mcp__*__d1_database_query` or `mcp__*__hyperdrive_*` | its `database_id` (or similar) field; with no such field the call is denied, because no grant can name it |
 
-The guard also reads the SQL in `--file`, `psql -f` and `< file` inputs, up to 200,000 bytes each. Relative paths resolve against the event's cwd, and `~` is expanded. A prod-targeted command whose SQL file cannot be read at hook time is denied, because it cannot be judged. That includes a file written earlier in the same command.
+The guard also reads the SQL in `--file`, `psql -f`, `< file` and `$(< file)` inputs, the arguments of `cat`, and psql `\i`/`\ir`, sqlite `.read` and mysql `source`, up to 200,000 bytes each and only as regular files (a FIFO cannot hang it). Relative paths resolve against the event's cwd, and `~` is expanded. A prod-targeted command is denied when one of its SQL files cannot be judged at hook time: missing, not a regular file, unreadable, or a path the same command writes (`>`, `tee`, `cp`, `mv`, `sed -i` and similar), because that file would be read in its old state. Commands over 64 KiB are tokenized by whitespace instead of shlex, so the hook decides well inside its 30 s timeout.
 
-Out of scope, disclosed: SQL built at run time (`base64 -d | psql`, a variable holding the statement, a script run by name), a default host that is not in the hook's environment, and deletes that are not SQL (API calls, removing a data directory).
+Out of scope, disclosed:
+- SQL built at run time (`base64 -d | psql`, a variable holding the statement, a script run by name);
+- a default host that is not in the hook's environment, and `PGSERVICE`;
+- deletes that are not SQL (API calls, removing a data directory);
+- statements the destructive list does not cover: MySQL multi-table `DELETE t FROM t`, mongosh `deleteMany` or `drop`, and redis-cli `FLUSHALL`, `FLUSHDB` or `DEL`;
+- database MCP tools such as `mcp__*__execute_sql` whose text does not name prod.
 
 It judges `Bash` commands, the fields of `mcp__hawkeye__run`, and the `sql`, `query` and `statement` fields of database MCP tools.
 
@@ -666,9 +671,10 @@ python3 ~/.claude/hooks/prod_delete_guard.py list
 ```
 
 - `--user-source` must be a `user:` or `answer:` id. `ah user-msg` finds one.
-- `provenance.py` must resolve the source to a human turn less than 24 hours old.
+- `provenance.py` must resolve the source to a human turn at most 1 hour old.
+- The human must have seen the exact target: it must appear as a whole name in their turn's text or in the AskUserQuestion they answered. Ask with AskUserQuestion naming the target, then cite that answer. A generic "looks good" funds no grant.
 - The source is resolved from the pinned `~/.claude` of the guard's home. `CLAUDE_CONFIG_DIR` is ignored.
-- `--target` must equal, case-folded, a target name the guard extracts from the command. It is never a substring match. SQL keywords, client names, and names with spaces, quotes or wildcards are refused. A command with several production targets needs a grant for each.
+- `--target` must equal, case-folded, a target name the guard extracts from the command. It is never a substring match. SQL keywords, client names, names starting with `-`, and names with spaces, quotes or wildcards are refused. A command with several production targets needs a grant for each. A connection string's host and database are alternatives, so a grant on a generic database name such as `app` or `postgres` covers that database on every prod host (disclosed).
 - The TTL defaults to 900 seconds and cannot exceed 3600. A grant can be reused until it expires.
 - The grant is written to the WAL first, through `wal_note.py`. Then it is stored, HMAC-signed, in `~/.agent-harness/state/prod-delete-grants.json` (mode 0600). The key is `~/.agent-harness/state/prod-delete.key` (32 random bytes, mode 0600, created on first use). Writes run under a lock, and expired or unsigned grants are pruned on each write.
 - Each check verifies the signature, the scope, the expiry, the TTL bound and the source-age bound again, and resolves the grant's source again. A grant whose turn no longer resolves, or whose timestamp has changed, stops working.
@@ -676,7 +682,8 @@ python3 ~/.claude/hooks/prod_delete_guard.py list
 
 Residuals, disclosed:
 - Provenance proves that the cited turn is a real human turn. It does not prove that the turn approves this particular delete. The WAL record and the exact-target binding keep that claim narrow and auditable.
-- A same-user process that reads the key (for example a script run by name) could sign a grant. The key protects against hand-edited JSON, not against an agent that sets out to forge one.
+- The key is used only when it is a regular file with mode 0600, owned by the caller, with one link, and it is opened without following a symlink. The store is replaced through an `O_EXCL|O_NOFOLLOW` temp file.
+- A same-user process, or the Write and Edit tools (command_guard judges Bash only), can read or plant the key and so sign a grant. That skips only the WAL record, because the `grant` command is itself agent-runnable. The key protects the audit trail against hand-edited JSON, not against an agent that sets out to forge one.
 
 ### Commands and rollout
 
@@ -699,7 +706,7 @@ Which worktree and which WAL it checks depends on the event:
 | Event | Worktree checked | WAL checked |
 |---|---|---|
 | `Stop` | the cwd, only when it is a linked worktree (the primary checkout belongs to the user) | `main.jsonl` |
-| `SubagentStop` | only worktrees directly under `~/.agent-harness/work/<session>/agent-<id>/`, never the cwd (a subagent's cwd is often main's checkout or another owner's tree) | `agent-<id>.jsonl` |
+| `SubagentStop` | only worktrees directly under `~/.agent-harness/work/<session>/agent-<id>/`, never the cwd (a subagent's cwd is often main's checkout or another owner's tree). An owner working in a tree elsewhere is not nudged. | `agent-<id>.jsonl` |
 
 The nudge names the files and gives the exact `wal_note.py` command.
 
@@ -722,7 +729,7 @@ Tests: `python3 -m unittest tests.test_wal_cadence`. They use temporary git repo
 
 1. It reads the agent's transcript and collects the linked worktrees that the agent created (`git worktree add`) or worked in. Working in a tree means an `Edit` or `Write` under it, or a mutating `git -C <tree>` or `cd <tree> && git ...` command. Only worktrees of repos under the repos dirs count. Those default to `~/repos` and `~/.agent-harness/work`.
 2. It skips any worktree that another transcript touched more recently, because that owner answers for it.
-3. It blocks once per distinct state (exit 2) when a remaining worktree has uncommitted changes, or has commits on a detached HEAD that no branch holds (git gc can drop those once the tree moves). The message lists the paths and the commit commands, with the message checked by `commit_policy.py check-message`, and for a detached HEAD the `git switch -c` that names the work.
+3. It blocks once per distinct state (exit 2) when a remaining worktree has uncommitted changes, or has commits on a detached HEAD that no local branch or tag holds (git gc can drop those once the tree moves). A detached review or rescue tree at a branch's commit is only reported. The message lists the paths and the commit commands, with the message checked by `commit_policy.py check-message`, and for a detached HEAD the `git switch -c` that names the work.
 4. Without blocking, it reports:
    - committed work on a named branch that is on no remote branch (`UNPUSHED`), to be published through `deliver.py prepare` or `publish_feature.py` once reviewed;
    - merged worktrees that are still on disk;

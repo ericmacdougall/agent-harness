@@ -134,6 +134,15 @@ class HarnessDefaults(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)  # named: back to report-only
         self.assertIn("UNPUSHED: %s" % self.wt, self.sysmsg(r))
 
+    def test_detached_head_at_a_local_branch_commit_is_reported_not_blocked(self):
+        # native re-review R7: a detached review/rescue tree at a commit feat/x holds loses nothing
+        self.commit_work()
+        self.git(self.wt, "switch", "-q", "--detach")
+        r = self.hook()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("switch -c", r.stderr)
+        self.assertIn("UNPUSHED: %s" % self.wt, self.sysmsg(r))
+
     def test_block_unpushed_config_and_env_restore_hawkeye_semantics(self):
         self.commit_work()
         cfg = self.home / ".agent-harness/state/worktree-hygiene.json"
