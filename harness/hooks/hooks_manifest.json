@@ -597,6 +597,44 @@
    "rules": [
     "S23"
    ]
+  },
+  {
+   "id": "wal_cadence:stop",
+   "script": "wal_cadence.py",
+   "arg": null,
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "W04"
+   ],
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "Stop",
+      "session_id": "doctor-canary",
+      "cwd": "/"
+     },
+     "expect": "allow"
+    }
+   ]
+  },
+  {
+   "id": "wal_cadence:subagent-stop",
+   "script": "wal_cadence.py",
+   "arg": null,
+   "event": "SubagentStop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "W04"
+   ]
   }
  ]
 }

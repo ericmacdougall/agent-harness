@@ -17,6 +17,7 @@
 | `watch-tests.py` | Polling test runner for source edits. |
 | `commit_policy.py`, `commit_policy.json`, `ticket_adapters.py` | Commit message policy: PreToolUse hook, git `commit-msg` backstop, range and GitHub checks, GoodQA ticket verification and delivery comments, waivers. |
 | `domain_gates.py`, `domain_checklists.json` | Blockchain domain gates: detect blockchain work from repo signals and supply a risk checklist, test scaffolds and follow-up prompts to specs and review prompts. |
+| `wal_cadence.py` | Stop/SubagentStop nudge (rule W04): one bounded block when a big uncommitted diff has no recent human-readable WAL entry (ported from Hawkeye). |
 | `prod_delete_guard.py` | PreToolUse gate on destructive SQL against production databases, lifted only by a user-sourced, target-bound grant (ported from Hawkeye). |
 | `spec_flow.py`, `spec_policy.json`, `spec_template.md` | Spec-driven tickets: spec documents, spec reviews, per-criterion evidence, click-test records, sign-off and the done gate (CLI, plan-review ticket gate, PreToolUse hook on GoodQA status changes). |
 
@@ -669,6 +670,35 @@ Residual: provenance proves that the cited turn is a real human turn. It does no
 - `doctor.py` runs two canaries: an allow for `ls`, and a deny for a `psql --host=prod-db... TRUNCATE`.
 - Tests: `python3 -m unittest tests.test_prod_delete_guard`. They judge text only and never run SQL.
 - Rollback: revert the commit and reinstall.
+
+## WAL cadence
+
+`wal_cadence.py` is a Stop and SubagentStop hook for rule W04. It nudges once when real work has piled up without a human-readable WAL entry. It is a port of Hawkeye's `hawkeye-wal-cadence.py`, which ran on dev2 only (goodqa#14908).
+
+The hook blocks the stop once (exit 2) when all of these hold:
+
+- The agent's worktree has at least 40 uncommitted source lines, tracked or untracked. Changes under `docs/`, `plans/`, `devstate/` and `audit/`, and `README.md` and `CONTRIBUTING.md`, do not count.
+- That agent's WAL has no `wal_note.py` entry with a note from the last 20 minutes. Hook metadata rows do not count.
+
+Which worktree and which WAL it checks depends on the event:
+
+| Event | Worktree checked | WAL checked |
+|---|---|---|
+| `Stop` | the cwd, only when it is a linked worktree (the primary checkout belongs to the user) | `main.jsonl` |
+| `SubagentStop` | the cwd, plus any worktree directly under `~/.agent-harness/work/<session>/agent-<id>/` | `agent-<id>.jsonl` |
+
+The nudge names the files and gives the exact `wal_note.py` command.
+
+The nudge is bounded:
+
+- It fires once per agent per distinct diff fingerprint. The state is kept in `~/.agent-harness/state/wal-cadence/<session>.json`.
+- It never fires on a repeated stop (`stop_hook_active`).
+- `HARNESS_WAL_CADENCE=off` turns it off.
+- Every internal error fails open, so the hook is registered without `onFailure`.
+
+Hawkeye's knowledge-net replication is not ported.
+
+Tests: `python3 -m unittest tests.test_wal_cadence`. They use temporary git repositories and linked worktrees only.
 
 ## Spec-driven tickets
 

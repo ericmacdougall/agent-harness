@@ -33,7 +33,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "ahd.py", "ahd_peek.py", "ahd_policy.json",
          "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py", "bg_job.py", "bg_lint.py",
          "dropped_gate.py", "ask_reminders.py",  # dropped-owner gate and ask reminders (goodqa#14791)
-         "prod_delete_guard.py")  # production-delete gate ported from Hawkeye (goodqa#14908)
+         "prod_delete_guard.py", "wal_cadence.py")  # Hawkeye ports (goodqa#14908)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -75,7 +75,7 @@ def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
-                         "dropped_gate.py", "prod_delete_guard.py")}
+                         "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -218,6 +218,11 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     managed.setdefault("SubagentStop", []).append({"matcher": SUBAGENT_MATCHER, "hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "dropped_gate.py"), "subagent-stop"],
         "timeout": 15}]})
+    # WAL cadence (rule W04, goodqa#14908): one bounded nudge when a big uncommitted diff has no recent WAL note.
+    # Fails open on its own errors, so no onFailure.
+    cadence = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "wal_cadence.py")], "timeout": 30}
+    managed.setdefault("Stop", []).append({"hooks": [cadence]})
+    managed.setdefault("SubagentStop", []).append({"matcher": SUBAGENT_MATCHER, "hooks": [dict(cadence)]})
     # The caller's identity for acknowledgements comes from the hook payload (review round 3, B1).
     managed.setdefault("PreToolUse", []).append({"matcher": "Bash", "hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "dropped_gate.py"), "pretool"],

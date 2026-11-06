@@ -601,7 +601,7 @@
   "source": "~/.claude/CLAUDE.md Write-ahead log",
   "rule": "Append a human-readable WAL intent before editing and a result after the check.",
   "enforcement": "ADVISORY",
-  "live_evidence": "wal.py pretool logs metadata (not semantic); dev2 hawkeye-wal-cadence Stop hook (dev2 only).",
+  "live_evidence": "wal.py pretool logs metadata (not semantic); wal_cadence.py (port of dev2 hawkeye-wal-cadence, goodqa#14908) nudges once per diff at Stop and SubagentStop.",
   "checkable": "YES",
   "checkable_reason": "Presence of intent/result entries by event type is deterministic.",
   "proposed_event": "Stop + SubagentStop",
@@ -611,8 +611,12 @@
   "priority": "P2",
   "owner_overlap": "port hawkeye-wal-cadence",
   "matrix_rows": "",
-  "mechanisms": [],
-  "planned_batch": "B4"
+  "mechanisms": [
+   "wal_cadence:stop",
+   "wal_cadence:subagent-stop"
+  ],
+  "planned_batch": "B4",
+  "partial_reason": "nudges only for 40+ uncommitted source lines with no human WAL note in 20 minutes, once per diff; it does not check intent-before-edit ordering"
  },
  {
   "id": "W05",
