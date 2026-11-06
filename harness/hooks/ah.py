@@ -1302,7 +1302,93 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
                 rec[k] = args[k]
         _wal_append(home, main_wal, rec)
         out["wal"] = wid
+        if args["kind"] in ("reassigned",) + tuple(liveness.CLOSING):  # the owner is retired: its waiters are leftovers
+            try:
+                waiters = leftover_waiters(home, args["agent"], args["session"])
+            except Exception:  # noqa: BLE001 - a process scan failure never blocks a disposition
+                waiters = []
+            if waiters:
+                out["leftover_waiters"] = waiters
+                pids = [str(w["pid"]) for w in waiters if w.get("kind") == "process"]
+                out["warning"] = (f"{len(waiters)} live waiter(s) still attributed to {args['agent']} or its session: "
+                                  + "; ".join(f"pid {w['pid']} ({w['elapsed']}, {w['scope']}) {w['command'][:80]}" if w.get("kind") == "process"
+                                              else f"ah-run {w['run']} {' '.join(w.get('argv') or [])[:80]}" for w in waiters)
+                                  + ". Each wake-up of a retired agent rereads its whole context: stop them "
+                                  + (f"(`ah kill --pid {','.join(pids)} --reason '<why>'`) " if pids else "")
+                                  + "or hand them to the replacement.")
     return out
+
+
+WAIT_LOOP_RE = re.compile(r"\b(?:until|while)\b.{0,400}?\b(?:sleep|pgrep|grep|inotifywait|wait)\b", re.S)
+WAITER_CAP = 20
+
+
+def _ps_rows() -> list:
+    """[(pid, elapsed, command)] for this user's processes, bounded; [] when ps is unavailable."""
+    try:
+        r = subprocess.run(["ps", "-u", str(os.getuid()), "-o", "pid=,etime=,command="], capture_output=True, text=True,
+                           timeout=15, env=dict(os.environ, LC_ALL="C", LANG="C"))
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = []
+    for line in r.stdout.splitlines()[:5000]:
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit():
+            rows.append((int(parts[0]), parts[1], parts[2]))
+    return rows
+
+
+def _session_env_of(pid: int):
+    """CLAUDE_CODE_SESSION_ID in a process's environment (ps eww shows it for own processes), else None."""
+    try:
+        r = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=8,
+                           env=dict(os.environ, LC_ALL="C"))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"CLAUDE_CODE_SESSION_ID=([A-Za-z0-9._-]{1,128})", r.stdout)
+    return m.group(1) if m else None
+
+
+def leftover_waiters(home: Path, agent: str, session: str, ps_rows=None, session_of=None) -> list:
+    """Live background waiters a retired owner may have left behind (goodqa#14927): wait loops (until/while with
+    sleep, grep or pgrep) whose command line names the agent (`scope: agent`) or whose environment carries this
+    session's id (`scope: session`), plus ah-run ledger rows attributed to the agent that have not ended. Read-only
+    and bounded; it never signals anything. 2026-11-06: a retired 580k-context agent was woken repeatedly by its own
+    `until grep` waiters, each wake a full context reread."""
+    import redact  # noqa: PLC0415
+    found = []
+    ledger = home / ".agent-harness" / "reserve" / "ledger"
+    try:
+        entries = sorted(os.scandir(ledger), key=lambda e: e.name)[-500:]
+    except OSError:
+        entries = []
+    for entry in entries:
+        if not entry.name.endswith(".json") or not entry.is_file(follow_symlinks=False):
+            continue
+        try:
+            with open(entry.path, "rb") as handle:
+                row = json.loads(handle.read(65536))  # input-ok: one bounded ledger row
+        except (OSError, ValueError):
+            continue
+        if isinstance(row, dict) and row.get("agent") == agent and not row.get("end"):
+            argv = row.get("argv") if isinstance(row.get("argv"), list) else []
+            found.append({"kind": "ah-run", "run": entry.name[:-5], "argv": [redact.redact(str(a))[:60] for a in argv[:8]]})
+    rows = _ps_rows() if ps_rows is None else ps_rows
+    session_of = session_of or _session_env_of
+    me = os.getpid()
+    for pid, elapsed, command in rows:
+        if len(found) >= WAITER_CAP:
+            break
+        if pid == me or not isinstance(command, str) or not WAIT_LOOP_RE.search(command):
+            continue
+        if agent and agent in command:
+            scope = "agent"
+        elif session and (session in command or session_of(pid) == session):
+            scope = "session"
+        else:
+            continue
+        found.append({"kind": "process", "pid": pid, "elapsed": elapsed, "scope": scope, "command": redact.redact(command)[:200]})
+    return found
 
 
 def ask_states(main_wal: Path) -> dict:
