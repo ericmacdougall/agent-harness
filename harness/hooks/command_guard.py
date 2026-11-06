@@ -132,7 +132,7 @@ DEFAULT_POLICY = {
                                'tests', 'test', 'server', 'worker', 'agent', 'harness', 'deliver', 'peer_review']},
     'marker': {'default_ttl_seconds': 900, 'max_ttl_seconds': 86400, 'max_walk_entries': 200000,
                'max_walk_seconds': 2.0, 'max_hash_bytes': 21474836480, 'recent_change_seconds': 600,
-               'approve_remote_types': ['dropbox']},
+               'approve_remote_types': ['dropbox'], 'no_backup_remote_hosts': ['github.com', 't2-dev']},
 }
 
 SECRET_DUMP, LOG_DELETE, BROAD_KILL = 'secret_dump', 'log_delete', 'broad_kill'
@@ -4236,6 +4236,10 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
     """('allow'|'warn'|'block', message). Never raises: budget failures block, bugs fall back to a raw-text scan."""
     compiled = compiled or Compiled(load_policy(), cwd=cwd)
     modes = compiled.policy['modes']
+    if approval_env_override(command):
+        return 'block', format_block(Finding(LOG_DELETE, 'approval-env', 'runs approve-delete with HOME, '
+                                             'CLAUDE_CONFIG_DIR or an env wrapper, which could point it at a forged '
+                                             'transcript or state', 'run command_guard.py approve-delete plainly'))
     try:
         findings = analyze(command, compiled, cwd=cwd, ps=ps, marker=marker)
     except (Blocked, RecursionError) as stop:
@@ -4272,6 +4276,16 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
     if findings:
         return 'warn', format_block(findings[0], warn=True)
     return 'allow', ''
+
+
+APPROVAL_ENV_RE = re.compile(r'(?:^|[\s;&|(`])(?:(?:export\s+|declare\s+-x\s+|typeset\s+-x\s+)?'
+                             r'(?:HOME|CLAUDE_CONFIG_DIR|ZDOTDIR)\s*=|env(?:\s|$)|unset\s+[^;&|]*\b(?:HOME|CLAUDE_CONFIG_DIR)\b)')
+
+
+def approval_env_override(command):
+    """True when a command that runs approve-delete also sets HOME/CLAUDE_CONFIG_DIR or goes through `env`."""
+    text = command if isinstance(command, str) else ' '.join(map(str, command or ()))
+    return 'approve-delete' in text and bool(APPROVAL_ENV_RE.search(text))
 
 
 def format_block(f, more=0, warn=False):
@@ -4327,25 +4341,32 @@ def load_marker(home=None):
     return (entries if isinstance(entries, list) else []), key
 
 
-def audit(event, fields, home=None, wal=None):
-    """Append one redacted line to the approval audit log (and the WAL when given). Never raises."""
+def audit(event, fields, home=None, wal=None, strict=False, to_file=True):
+    """Append one redacted line to the approval audit log (and the WAL when given). Never raises, except that with
+    strict=True a failed audit-file write raises ValueError (callers that count from the log need the line)."""
     record = {'ts': round(time.time(), 3), 'event': event}
     record.update({k: v for k, v in fields.items() if k in ('path', 'remote', 'manifest_sha256', 'files', 'reason',
                                                              'expires_at', 'nonce', 'rule', 'kind', 'target',
-                                                             'user_source')})
+                                                             'user_source', 'bytes')})
     try:
         import redact
         line = redact.redact(json.dumps(record, sort_keys=True))
     except Exception:  # noqa: BLE001
         line = json.dumps({'ts': record['ts'], 'event': event})
     try:
-        sd = state_dir(home)
-        sd.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(sd / AUDIT_NAME), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        with os.fdopen(fd, 'a') as handle:
-            handle.write(line + '\n')
-    except OSError:
-        pass
+        if to_file:
+            sd = state_dir(home)
+            sd.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(sd / AUDIT_NAME), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, 'a') as handle:
+                handle.write(line + '\n')
+                if strict:
+                    handle.flush()
+                    os.fsync(handle.fileno())
+    except OSError as error:
+        if strict:
+            raise ValueError('the approval audit log could not be written (%s); nothing approved'
+                             % type(error).__name__)
     if wal:
         note = 'command_guard %s: %s' % (event, line[:900])
         helper = HERE / 'wal_note.py'
@@ -4720,8 +4741,9 @@ def approve_delete(path, remote, verifier=None, pinned_digest=None, ttl=None, ho
     return entry
 
 
-def _store_entry(entry, real, now, home=None):
-    """MAC `entry` with the local key and write it to the marker, replacing any live entry for the same path."""
+def _store_entry(entry, real, now, home=None, under_lock=None):
+    """MAC `entry` with the local key and write it to the marker, replacing any live entry for the same path.
+    `under_lock`, when given, runs while the marker lock is held and before the write; raising aborts the write."""
     sd = state_dir(home)
     sd.mkdir(parents=True, exist_ok=True)
     os.chmod(str(sd), 0o700)
@@ -4738,6 +4760,8 @@ def _store_entry(entry, real, now, home=None):
     lock = os.open(str(sd / LOCK_NAME), os.O_WRONLY | os.O_CREAT, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        if under_lock is not None:
+            under_lock()
         entries, _ = load_marker(home)
         live = [e for e in entries if isinstance(e, dict) and float(e.get('expires_at', 0) or 0) > now
                 and e.get('path') != real]
@@ -4757,30 +4781,52 @@ def _store_entry(entry, real, now, home=None):
 
 # --------------------------------------------------------------------------- no-backup approval (goodqa#14911)
 #
-# A deletion the user approved in a real turn or AskUserQuestion answer, with no backup because the data is
-# disposable. Only two kinds of target qualify, and only when nothing would be lost:
-#   'git'    the root of a git working tree whose every file is committed (no untracked, ignored or changed file),
-#            with no stash, no linked worktree, no commit missing from a remote-tracking ref, and a remote whose
-#            branch tip (asked live with ls-remote) is the tracking ref that contains HEAD;
-#   'image'  a disk image file (.sparseimage, .dmg) or bundle (.sparsebundle) that is not attached.
-# Logs, WALs, transcripts and approval state are refused here unconditionally. The approval is single use, MAC'd,
-# bound to the exact literal path and its inode, and the hook re-checks the state that made it safe.
+# A deletion the user approved in an AskUserQuestion answer, with no backup because the data is disposable. Only two
+# kinds of target qualify, and only when nothing would be lost:
+#   'git'    the root of a git working tree whose every file is committed (no untracked, ignored or changed file, no
+#            assume-unchanged entry, no skip-worktree file present on disk), with no stash, no linked worktree, no
+#            submodule, no replace ref or graft, no commit on any ref (branches, tags, notes, anything outside
+#            refs/remotes) missing from a remote-tracking ref, and a network remote on an allowlisted host whose live
+#            branch tip (ls-remote, run outside the repository) is a tracking ref that contains HEAD;
+#   'image'  a disk image file (.sparseimage, .dmg) or bundle (.sparsebundle) under ~/.agent-harness/work that is not
+#            attached.
+# The source must be an `answer:` whose AskUserQuestion names the literal path, whose selected answer says delete,
+# and whose session is the session of the --wal. Transcripts are read from the pinned ~/.claude of the account's
+# home (pwd), never from CLAUDE_CONFIG_DIR or $HOME. Logs, WALs, transcripts and approval state are refused here
+# unconditionally. The approval is single use, MAC'd, bound to the exact literal path and its inode, and the hook
+# re-checks every local fact that made it safe.
 
 NO_BACKUP_KIND = 'no-backup'
 IMAGE_FILE_SUFFIXES = ('.sparseimage', '.dmg')
 IMAGE_DIR_SUFFIXES = ('.sparsebundle',)
+NO_BACKUP_SOURCE_RE = re.compile(r'^answer:([A-Za-z0-9._-]{1,80})/([0-9a-fA-F-]{8,64})$')
+APPROVE_WORDS = re.compile(r'\bdelete\b', re.I)
+# "Delete, no backup" is an approval, so a bare "no" is not a decline word
+DECLINE_WORDS = re.compile(r"\b(?:not|don'?t|keep|leave|cancel)\b", re.I)
+DEFAULT_REMOTE_HOSTS = ('github.com', 't2-dev')
 # Repository config must not run anything while the guard inspects a clone: no fsmonitor, hooks, ext transport,
 # custom ssh command, credential helper or pager, and no prompt.
 _SAFE_GIT = ['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.ext.allow=never',
-             '-c', 'core.sshCommand=ssh', '-c', 'credential.helper=', '-c', 'core.pager=cat',
-             '-c', 'core.untrackedCache=false']
+             '-c', 'protocol.file.allow=never', '-c', 'core.sshCommand=ssh', '-c', 'credential.helper=',
+             '-c', 'core.pager=cat', '-c', 'core.untrackedCache=false']
+
+
+def _pinned_home():
+    """The account's real home from the password database: an agent can set $HOME, not this."""
+    import pwd
+    return os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
 
 
 def _git(repo, *args, timeout=60):
-    env = dict(os.environ, GIT_TERMINAL_PROMPT='0', GIT_OPTIONAL_LOCKS='0', GIT_PAGER='cat', LC_ALL='C')
-    for name in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_CONFIG_PARAMETERS', 'GIT_SSH_COMMAND', 'GIT_SSH'):
+    """Run git against `repo` (or, with repo None, outside any repository so no repository config applies)."""
+    env = dict(os.environ, GIT_TERMINAL_PROMPT='0', GIT_OPTIONAL_LOCKS='0', GIT_PAGER='cat', LC_ALL='C',
+               GIT_NO_REPLACE_OBJECTS='1')
+    for name in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_CONFIG_PARAMETERS', 'GIT_SSH_COMMAND', 'GIT_SSH',
+                 'GIT_CONFIG', 'GIT_CONFIG_COUNT', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+                 'GIT_CEILING_DIRECTORIES', 'GIT_NAMESPACE'):
         env.pop(name, None)
-    done = subprocess.run(_SAFE_GIT + ['-C', repo] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    where = ['-C', repo] if repo else ['-C', '/']
+    done = subprocess.run(_SAFE_GIT + where + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           env=env, timeout=timeout, check=False)
     return done.returncode, done.stdout.decode('utf-8', 'replace')
 
@@ -4800,20 +4846,34 @@ def _attached_images():
             if isinstance(i, dict) and i.get('image-path')}
 
 
-def _target_kind(real):
+def _target_kind(real, home=None):
     low = real.casefold()
-    if os.path.isfile(real) and low.endswith(IMAGE_FILE_SUFFIXES):
-        return 'image'
-    if os.path.isdir(real) and low.endswith(IMAGE_DIR_SUFFIXES):
-        return 'image'
+    if low.endswith(IMAGE_FILE_SUFFIXES + IMAGE_DIR_SUFFIXES):
+        work = os.path.join(home or _pinned_home(), '.agent-harness', 'work') + os.sep
+        if not real.startswith(work):
+            raise ValueError('a disk image is deleted without a backup only under ~/.agent-harness/work')
+        if (os.path.isfile(real) and low.endswith(IMAGE_FILE_SUFFIXES)) or \
+                (os.path.isdir(real) and low.endswith(IMAGE_DIR_SUFFIXES)):
+            return 'image'
     dot_git = os.path.join(real, '.git')
     if os.path.isdir(real) and os.path.isdir(dot_git) and not os.path.islink(dot_git):
         return 'git'
     raise ValueError('only a git working tree root or a detached disk image can be deleted without a backup')
 
 
+def _image_size(real):
+    if os.path.isfile(real):
+        return os.lstat(real).st_size
+    total = 0
+    for root, _dirs, names in os.walk(real):
+        for name in names:
+            total += os.lstat(os.path.join(root, name)).st_size
+    return total
+
+
 def _no_backup_state(real, target, home=None, attached=None):
-    """The facts that make deleting `real` lose nothing, as a comparable dict. Raises ValueError when unsafe."""
+    """Every local fact that makes deleting `real` lose nothing, as a comparable dict. Raises ValueError when unsafe.
+    The hook runs it again at delete time, so a change after approval voids the approval."""
     if target == 'image':
         if real in (attached or _attached_images)():
             raise ValueError('the disk image is attached; detach it first (hdiutil detach)')
@@ -4821,33 +4881,64 @@ def _no_backup_state(real, target, home=None, attached=None):
         return {'size': st.st_size, 'mtime_ns': st.st_mtime_ns}
     if target != 'git':
         raise ValueError('unknown target kind')
+    git_dir = os.path.join(real, '.git')
     code, top = _git(real, 'rev-parse', '--show-toplevel')
     if code != 0 or os.path.realpath(top.strip()) != real:
         raise ValueError('the path is not the top of its git working tree')
+    # submodules first: a gitlink also shows in status, and the accurate reason is the submodule
+    code, staged = _git(real, 'ls-files', '-s', '-z')
+    if code != 0 or any(rec.startswith('160000 ') for rec in staged.split('\0')) or \
+            os.path.lexists(os.path.join(real, '.gitmodules')) or os.path.lexists(os.path.join(git_dir, 'modules')):
+        raise ValueError('the repository has submodules; their commits are not checked, so it is refused')
     code, status = _git(real, 'status', '--porcelain=v1', '--ignored', '--untracked-files=all', '-z')
     if code != 0 or status:
         raise ValueError('the working tree has changed, untracked or ignored files; they exist nowhere else')
-    code, head = _git(real, 'rev-parse', '--verify', 'HEAD')
-    if code != 0 or not head.strip():
-        raise ValueError('the working tree has no commit')
-    return {'head': head.strip()}
-
-
-def _check_git_pushed(real, ls_remote=None):
-    """No stash, no linked worktree, every local commit on a remote-tracking ref, and a live remote tip that is a
-    tracking ref containing HEAD. Raises ValueError otherwise."""
+    code, flagged = _git(real, 'ls-files', '-v', '-z')
+    if code != 0:
+        raise ValueError('cannot list the index')
+    for rec in flagged.split('\0'):
+        if len(rec) < 3:
+            continue
+        tag, name = rec[0], rec[2:]
+        if tag.islower():
+            raise ValueError('an index entry is marked assume-unchanged, so status cannot see its changes')
+        if tag == 'S' and os.path.lexists(os.path.join(real, name)):
+            raise ValueError('a skip-worktree file is present on disk, so status cannot see its changes')
+    code, replaced = _git(real, 'for-each-ref', '--format=%(refname)', 'refs/replace')
+    # A shallow boundary is fine: it cannot hide an unpushed tip, which rev-list below still lists itself.
+    if code != 0 or replaced.strip() or os.path.lexists(os.path.join(git_dir, 'info', 'grafts')):
+        raise ValueError('the repository has replace refs or grafts; refused')
     code, _ = _git(real, 'rev-parse', '-q', '--verify', 'refs/stash')
     if code == 0:
         raise ValueError('the repository has a stash; it exists nowhere else')
     code, trees = _git(real, 'worktree', 'list', '--porcelain')
-    if code != 0 or sum(1 for line in trees.splitlines() if line.startswith('worktree ')) > 1:
+    if code != 0 or sum(1 for line in trees.splitlines() if line.startswith('worktree ')) != 1:
         raise ValueError('the repository has linked worktrees; delete those first')
-    code, heads = _git(real, 'for-each-ref', '--format=%(objectname)', 'refs/heads')
-    tips = [h for h in heads.split() if h] + ['HEAD']
-    for tip in tips:
-        code, extra = _git(real, 'rev-list', '--max-count=1', tip, '--not', '--remotes')
-        if code != 0 or extra.strip():
-            raise ValueError('a local commit is on no remote-tracking ref (unpushed work)')
+    code, extra = _git(real, 'rev-list', '--max-count=1', '--exclude=refs/remotes/*', '--all', '--not', '--remotes')
+    if code != 0 or extra.strip():
+        raise ValueError('a commit on a local branch, tag or other ref is on no remote-tracking ref (unpushed work)')
+    code, head = _git(real, 'rev-parse', '--verify', 'HEAD')
+    if code != 0 or not head.strip():
+        raise ValueError('the working tree has no commit')
+    code, refs = _git(real, 'for-each-ref', '--format=%(objectname) %(refname)')
+    if code != 0:
+        raise ValueError('cannot list refs')
+    return {'head': head.strip(), 'refs_sha256': hashlib.sha256(refs.encode()).hexdigest(), 'worktrees': 1}
+
+
+def _remote_host(url):
+    """The host of a network git URL (https, ssh, git+ssh or scp-like), else ''. Local paths and file:// give ''."""
+    url = str(url or '').strip()
+    m = re.match(r'^(?:https|ssh|git\+ssh)://(?:[^@/\s]+@)?([A-Za-z0-9.-]+)(?::\d+)?/\S+$', url, re.I)
+    if not m and not url.startswith(('/', '.', '~')) and '://' not in url:
+        m = re.match(r'^(?:[A-Za-z0-9._-]+@)?([A-Za-z0-9.-]+):\S+$', url)
+    return m.group(1).casefold() if m else ''
+
+
+def _check_git_pushed(real, ls_remote=None, hosts=DEFAULT_REMOTE_HOSTS):
+    """A network remote on an allowlisted host whose live tip (asked from outside the repository, so no repository
+    insteadOf or config applies) is a tracking ref that contains HEAD. Raises ValueError otherwise."""
+    allowed = {h.casefold() for h in hosts}
     code, refs = _git(real, 'for-each-ref', '--contains', 'HEAD', '--format=%(refname) %(objectname)',
                       'refs/remotes')
     candidates = []
@@ -4858,38 +4949,76 @@ def _check_git_pushed(real, ls_remote=None):
             if '/' in rest:
                 remote, branch = rest.split('/', 1)
                 candidates.append((remote, branch, parts[1]))
+    seen_hosts = []
     for remote, branch, sha in candidates[:8]:
         code, url = _git(real, 'config', '--get', 'remote.%s.url' % remote)
         url = url.strip()
-        if code != 0 or not url or url.startswith('ext::'):
+        host = _remote_host(url) if code == 0 else ''
+        seen_hosts.append(host or '(local or unparsed)')
+        if not host or host not in allowed:
             continue
         live = (ls_remote or _ls_remote)(real, url, branch)
         if live == sha:
-            return {'remote': remote, 'branch': branch, 'url_host': url.split('://', 1)[-1].split('/', 1)[0][:60]}
-    raise ValueError('no remote confirms it has HEAD (ls-remote tip of a tracking ref that contains HEAD)')
+            return {'remote': remote, 'branch': branch, 'url_host': host[:60]}
+    raise ValueError('no allowlisted network remote confirms it has HEAD (ls-remote tip of a tracking ref that '
+                     'contains HEAD; remote hosts seen: %s; allowed: %s)' % (', '.join(seen_hosts[:4]) or 'none',
+                                                                            ', '.join(sorted(allowed))))
 
 
 def _ls_remote(real, url, branch):
-    code, out = _git(real, 'ls-remote', '--upload-pack=git-upload-pack', url, 'refs/heads/' + branch, timeout=60)
+    code, out = _git(None, 'ls-remote', '--upload-pack=git-upload-pack', url, 'refs/heads/' + branch, timeout=60)
     first = out.split()
     return first[0] if code == 0 and first else None
 
 
+def _askuser_question(provenance, path, record):
+    """JSON of the input of the main-conversation AskUserQuestion that `record` answers, or ''."""
+    blocks = (record.get('message') or {}).get('content') if isinstance(record, dict) else None
+    use_id = blocks[0].get('tool_use_id') if isinstance(blocks, list) and blocks and isinstance(blocks[0], dict) \
+        else None
+    if not isinstance(use_id, str) or not use_id:
+        return ''
+    for line in provenance._lines_containing(path, use_id.encode()):
+        if line is None:
+            continue
+        try:
+            rec = provenance.loads_line(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or rec.get('type') != 'assistant' or rec.get('isSidechain'):
+            continue
+        for block in (rec.get('message') or {}).get('content') or []:
+            if isinstance(block, dict) and block.get('type') == 'tool_use' and block.get('id') == use_id \
+                    and block.get('name') == 'AskUserQuestion':
+                return json.dumps(block.get('input'), ensure_ascii=False, sort_keys=True)
+    return ''
+
+
 def resolve_user_source(source, now=None, max_age=None, home=None):
-    """(kind, timestamp) of a real human turn or AskUserQuestion answer named by `user:<session>/<uuid>` or
-    `answer:<session>/<uuid>` (an optional quoted excerpt after it is ignored). Raises ValueError otherwise."""
+    """{'kind', 'session', 'uid', 'at', 'text', 'question'} of the AskUserQuestion answer named by
+    `answer:<session>/<uuid>`, read from <home>/.claude (home: the account home, pinned when None). Raises
+    ValueError otherwise. No excerpt or other trailing text is accepted."""
     import datetime
-    m = re.match(r'^(user|answer):([A-Za-z0-9._-]{1,80})/([0-9a-fA-F-]{8,64})(?:\s+".*")?\s*$', str(source or ''))
+    m = NO_BACKUP_SOURCE_RE.match(str(source or ''))
     if not m:
-        raise ValueError('--user-source must be user:<session>/<uuid> or answer:<session>/<uuid>')
-    kind, session, uid = m.groups()
+        raise ValueError('--user-source must be exactly answer:<session>/<uuid> (an AskUserQuestion answer that '
+                         'names the path; no excerpt)')
+    session, uid = m.groups()
+    claude = Path(home or _pinned_home()) / '.claude'
     try:
-        sys.path.insert(0, str(HERE))
+        if str(HERE) not in sys.path:
+            sys.path.insert(0, str(HERE))
         import provenance
-        turn = (provenance.user_turn if kind == 'user' else provenance.answer_turn)(session, uid, home=home)
+        turn = provenance.answer_turn(session, uid, home=claude)
     except Exception as error:  # noqa: BLE001 - any failure to prove the turn is a refusal
-        raise ValueError('the user source does not resolve to a real %s turn (%s)' % (
-            kind, str(getattr(error, 'code', '') or type(error).__name__)[:40]))
+        raise ValueError('the user source does not resolve to a real answer turn (%s)' % (
+            str(getattr(error, 'code', '') or type(error).__name__)[:40]))
+    question = ''
+    try:
+        tpath = provenance.find_transcript(session, claude)
+        question = _askuser_question(provenance, tpath, provenance.load_record(tpath, 'uuid', uid))
+    except Exception:  # noqa: BLE001 - no question found: the path check below refuses
+        question = ''
     stamp = str(turn.get('timestamp') or '')
     try:
         at = datetime.datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp()
@@ -4900,12 +5029,18 @@ def resolve_user_source(source, now=None, max_age=None, home=None):
         raise ValueError('the user source is older than %d hours; ask again' % (max_age // 3600))
     if at > now + 300:
         raise ValueError('the user source is dated in the future')
-    return kind, at
+    return {'kind': 'answer', 'session': session, 'uid': uid.lower(), 'at': at, 'text': str(turn.get('text') or ''),
+            'question': question}
 
 
-def _uses_of_source(source, home=None):
-    """How many no-backup approvals this source already gave. An audit log that exists but cannot be read counts
-    as the cap (fail closed)."""
+def _canonical_source(source):
+    m = NO_BACKUP_SOURCE_RE.match(str(source or ''))
+    return 'answer:%s/%s' % (m.group(1), m.group(2).lower()) if m else ''
+
+
+def _uses_of_source(canonical, home=None):
+    """How many no-backup approvals this canonical source already gave. An audit log that exists but cannot be
+    read counts as the cap (fail closed)."""
     path = state_dir(home) / AUDIT_NAME
     if not path.exists():
         return 0
@@ -4919,9 +5054,21 @@ def _uses_of_source(source, home=None):
             rec = json.loads(line)
         except ValueError:
             continue
-        if rec.get('event') == 'approved' and rec.get('kind') == NO_BACKUP_KIND and rec.get('user_source') == source:
+        if isinstance(rec, dict) and rec.get('event') == 'approved' and rec.get('kind') == NO_BACKUP_KIND and \
+                _canonical_source(rec.get('user_source')) == canonical:
             count += 1
     return count
+
+
+def _environment_refusal(user_home):
+    """Why the caller's environment points transcript or state lookups away from the account, else ''."""
+    configured = os.environ.get('CLAUDE_CONFIG_DIR')
+    if configured and os.path.realpath(configured) != os.path.join(user_home, '.claude'):
+        return 'CLAUDE_CONFIG_DIR points away from the account\'s ~/.claude; unset it'
+    env_home = os.environ.get('HOME')
+    if env_home and os.path.realpath(env_home) != user_home:
+        return 'HOME is not the account\'s home; unset the override'
+    return ''
 
 
 def approve_delete_no_backup(path, user_source, wal, ttl=None, home=None, policy=None, now=None, resolver=None,
@@ -4933,7 +5080,12 @@ def approve_delete_no_backup(path, user_source, wal, ttl=None, home=None, policy
     now = time.time() if now is None else now
     real = os.path.realpath(path) if isinstance(path, str) else ''
     source = str(user_source or '')[:300]
+    user_home = os.path.realpath(home) if home else _pinned_home()
     try:
+        if home is None:
+            problem = _environment_refusal(user_home)
+            if problem:
+                raise ValueError(problem)
         if not wal:
             raise ValueError('--wal is required: the approval is recorded there')
         if not isinstance(path, str) or not os.path.isabs(path):
@@ -4956,26 +5108,48 @@ def approve_delete_no_backup(path, user_source, wal, ttl=None, home=None, policy
         ttl = int(ttl or min(int(limits['default_ttl_seconds']), max_ttl))
         if ttl <= 0 or ttl > max_ttl:
             raise ValueError('ttl must be between 1 and %d seconds' % max_ttl)
-        (resolver or resolve_user_source)(source, now=now, max_age=int(limits.get('no_backup_max_source_age_seconds',
-                                                                                 86400)), home=home)
-        cap = int(limits.get('no_backup_max_paths_per_source', 4))
-        if _uses_of_source(source, home) >= cap:
-            raise ValueError('this user source already approved %d deletions; ask the user again' % cap)
-        target = _target_kind(real)
+        canonical = _canonical_source(source)
+        if not canonical:
+            raise ValueError('--user-source must be exactly answer:<session>/<uuid> (an AskUserQuestion answer that '
+                             'names the path; no excerpt)')
+        turn = (resolver or resolve_user_source)(source, now=now, max_age=int(limits.get(
+            'no_backup_max_source_age_seconds', 86400)), home=user_home)
+        wal_real = os.path.realpath(str(wal))
+        wals = os.path.join(user_home, '.claude', 'wals', turn['session']) + os.sep
+        if not wal_real.startswith(wals):
+            raise ValueError('the answer is from session %s, but --wal is not a WAL of that session' % turn['session'])
+        if real not in str(turn.get('question') or ''):
+            raise ValueError('the AskUserQuestion this answer answers does not name the literal path %s; ask the user '
+                             'again naming it' % real)
+        if not APPROVE_WORDS.search(turn.get('text') or '') or DECLINE_WORDS.search(turn.get('text') or ''):
+            raise ValueError('the selected answer does not say delete (or it declines); ask the user again')
+        target = _target_kind(real, home=user_home)
         state = _no_backup_state(real, target, home, attached=attached)
-        where = _check_git_pushed(real, ls_remote=ls_remote) if target == 'git' else None
+        where = _check_git_pushed(real, ls_remote=ls_remote, hosts=limits.get('no_backup_remote_hosts')
+                                  or DEFAULT_REMOTE_HOSTS) if target == 'git' else None
+        size = _image_size(real) if target == 'image' else None
         identity = list(_identity(real))
+        entry = {'kind': NO_BACKUP_KIND, 'target': target, 'path': real, 'identity': identity, 'state': state,
+                 'user_source': canonical, 'remote': 'none: user-approved, no backup', 'files': 0,
+                 'manifest_sha256': '', 'verified_at': now, 'expires_at': now + ttl, 'nonce': _secrets.token_hex(8)}
+        if where:
+            entry['pushed_to'] = where
+        if size is not None:
+            entry['bytes'] = size
+        cap = int(limits.get('no_backup_max_paths_per_source', 4))
+
+        def count_and_audit():
+            # under the marker lock: concurrent approvals cannot both pass the cap, and an approval whose audit
+            # record cannot be written (the cap is counted from it) is never stored
+            if _uses_of_source(canonical, home) >= cap:
+                raise ValueError('this user source already approved %d deletions; ask the user again' % cap)
+            audit('approved', entry, home=home, strict=True)
+        _store_entry(entry, real, now, home, under_lock=count_and_audit)
     except ValueError as error:
-        audit('refused', {'path': real, 'kind': NO_BACKUP_KIND, 'user_source': source, 'reason': str(error)[:200]},
-              home=home, wal=wal)
+        audit('refused', {'path': real, 'kind': NO_BACKUP_KIND, 'user_source': _canonical_source(source) or 'invalid',
+                          'reason': str(error)[:200]}, home=home, wal=wal)
         raise
-    entry = {'kind': NO_BACKUP_KIND, 'target': target, 'path': real, 'identity': identity, 'state': state,
-             'user_source': source, 'remote': 'none: user-approved, no backup', 'files': 0, 'manifest_sha256': '',
-             'verified_at': now, 'expires_at': now + ttl, 'nonce': _secrets.token_hex(8)}
-    if where:
-        entry['pushed_to'] = where
-    _store_entry(entry, real, now, home)
-    audit('approved', entry, home=home, wal=wal)
+    audit('approved', entry, home=home, wal=wal, to_file=False)
     return entry
 
 
@@ -5346,8 +5520,9 @@ def main(argv=None):
     appr.add_argument('--remote', help='named rclone remote mirroring --path, e.g. dropbox:backups/x')
     appr.add_argument('--no-backup', action='store_true',
                       help='user-approved deletion without a backup: a clean, pushed git working tree or a detached '
-                           'disk image only; needs --user-source (goodqa#14911)')
-    appr.add_argument('--user-source', help='user:<session>/<uuid> or answer:<session>/<uuid> of the approval')
+                           'disk image under ~/.agent-harness/work only; needs --user-source (goodqa#14911)')
+    appr.add_argument('--user-source', help='answer:<session>/<uuid> of the AskUserQuestion answer that names the '
+                                            'path (same session as --wal)')
     appr.add_argument('--wal', required=True, help='WAL that records this approval')
     appr.add_argument('--backup-verified-sha256', dest='digest')
     appr.add_argument('--ttl', type=int)
