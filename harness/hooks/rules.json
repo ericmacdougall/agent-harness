@@ -318,7 +318,7 @@
   "source": "OWNER-BRIEF-COMMON.md; ~/.claude/CLAUDE.md deliver",
   "rule": "Push feature branches (plain push, never force); nothing unique stays on one machine; Dropbox backups copy-only.",
   "enforcement": "HELPER-CHECKED",
-  "live_evidence": "dev2 has hawkeye-worktree-hygiene Stop hook (dev2 only); Mac none.",
+  "live_evidence": "worktree_hygiene.py (vendored dev2 hawkeye-worktree-hygiene, goodqa#14908) blocks a stop once per state on uncommitted work and reports unpushed commits, merged and duplicate worktrees.",
   "checkable": "YES",
   "checkable_reason": "git status/branch --no-merged vs remote is deterministic.",
   "proposed_event": "Stop and SubagentStop",
@@ -328,8 +328,12 @@
   "priority": "P1",
   "owner_overlap": "new; port dev2 hawkeye-worktree-hygiene",
   "matrix_rows": "",
-  "mechanisms": [],
-  "planned_batch": "B4"
+  "mechanisms": [
+   "worktree_hygiene:stop",
+   "worktree_hygiene:subagent-stop"
+  ],
+  "planned_batch": "B4",
+  "partial_reason": "unpushed commits are reported, not blocked, unless block_unpushed is set (harness publication goes through deliver.py); Dropbox copy-only backups are not checked by this hook"
  },
  {
   "id": "S19",

@@ -17,6 +17,7 @@
 | `watch-tests.py` | Polling test runner for source edits. |
 | `commit_policy.py`, `commit_policy.json`, `ticket_adapters.py` | Commit message policy: PreToolUse hook, git `commit-msg` backstop, range and GitHub checks, GoodQA ticket verification and delivery comments, waivers. |
 | `domain_gates.py`, `domain_checklists.json` | Blockchain domain gates: detect blockchain work from repo signals and supply a risk checklist, test scaffolds and follow-up prompts to specs and review prompts. |
+| `worktree_hygiene.py` | Stop/SubagentStop gate (rule S18): no turn ends with uncommitted work in a worktree it touched; reports unpushed, merged and duplicate worktrees (vendored from Hawkeye). |
 | `wal_cadence.py` | Stop/SubagentStop nudge (rule W04): one bounded block when a big uncommitted diff has no recent human-readable WAL entry (ported from Hawkeye). |
 | `prod_delete_guard.py` | PreToolUse gate on destructive SQL against production databases, lifted only by a user-sourced, target-bound grant (ported from Hawkeye). |
 | `spec_flow.py`, `spec_policy.json`, `spec_template.md` | Spec-driven tickets: spec documents, spec reviews, per-criterion evidence, click-test records, sign-off and the done gate (CLI, plan-review ticket gate, PreToolUse hook on GoodQA status changes). |
@@ -699,6 +700,47 @@ The nudge is bounded:
 Hawkeye's knowledge-net replication is not ported.
 
 Tests: `python3 -m unittest tests.test_wal_cadence`. They use temporary git repositories and linked worktrees only.
+
+## Worktree hygiene
+
+`worktree_hygiene.py` is a Stop and SubagentStop hook for rule S18. It stops a turn from ending while a worktree the agent created or worked in holds work that exists only on this disk. It is vendored from Hawkeye's `hawkeye-worktree-hygiene.py` (ericmacdougall/hawkeye 831ea85), which ran on dev2 only (goodqa#14908). Hawkeye's transcript reader, shell lexer, ownership hand-off, time budget and fail-open rules are unchanged.
+
+### How it works
+
+1. It reads the agent's transcript and collects the linked worktrees that the agent created (`git worktree add`) or worked in. Working in a tree means an `Edit` or `Write` under it, or a mutating `git -C <tree>` or `cd <tree> && git ...` command. Only worktrees of repos under the repos dirs count. Those default to `~/repos` and `~/.agent-harness/work`.
+2. It skips any worktree that another transcript touched more recently, because that owner answers for it.
+3. It blocks once per distinct state (exit 2) when a remaining worktree has uncommitted changes. The message lists the paths and the commit commands, with the message checked by `commit_policy.py check-message`.
+4. Without blocking, it reports:
+   - committed work that is on no remote branch (`UNPUSHED`), to be published through `deliver.py prepare` or `publish_feature.py` once reviewed;
+   - merged worktrees that are still on disk;
+   - duplicate worktrees;
+   - leftover detached worktrees.
+
+   Each report comes with its cleanup commands.
+
+Unpushed commits are reported, not blocked, because harness owners commit locally and publication goes through the identity-checked delivery helpers. To get Hawkeye's original behaviour, where unpushed commits also block, set `{"block_unpushed": true}` in `~/.agent-harness/state/worktree-hygiene.json`, or set `HARNESS_WORKTREE_HYGIENE_BLOCK_UNPUSHED=1`.
+
+### Settings
+
+| Setting | Effect |
+|---|---|
+| `HARNESS_WORKTREE_HYGIENE_REPOS_DIRS` (path list) | Overrides the repos dirs. |
+| `{"repos_dirs": [...]}` in the same config file | Overrides the repos dirs. |
+| `HARNESS_WORKTREE_HYGIENE_BUDGET_S` | Sets the time budget: 12 s by default, 15 s at most. |
+| `HARNESS_WORKTREE_GATE=off` | Disables the hook. |
+
+Hawkeye's `HAWKEYE_*` names for these settings are still accepted.
+
+### Guarantees
+
+- It never blocks on a repeated stop.
+- It fails open on any error or timeout.
+- It only reads: `GIT_OPTIONAL_LOCKS=0`, no fsmonitor, and no fetch, commit or remove.
+- Its state is kept in `~/.agent-harness/state/worktree-hygiene/` and pruned after 14 days.
+
+### Tests
+
+Run `python3 -m unittest tests.test_worktree_hygiene`. This runs Hawkeye's 108-check scenario suite (`tests/worktree_hygiene_scenarios.py`) and the harness-default cases. Both use temporary homes, bare origins and real worktrees.
 
 ## Spec-driven tickets
 
