@@ -62,9 +62,12 @@ class HookdTest(unittest.TestCase):
 
     # ------------------------------------------------------------------ helpers
     def env(self, **extra):
-        env = {k: v for k, v in os.environ.items() if not k.startswith(('HOOKD_', 'HOOKC_', 'CLAUDE_', 'AH_'))}
+        # Locale variables are set per case, never inherited (review round 1, F2): an ambient LC_CTYPE would
+        # override the LANG a test names.
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(('HOOKD_', 'HOOKC_', 'CLAUDE_', 'AH_', 'LC_')) and k != 'LANG'}
         env.update(HOME=str(self.home), HOOKD_RUN_DIR=str(self.run_dir), HOOKD_LOG=str(self.log),
-                   HOOKC_DEBUG='1', PYTHONDONTWRITEBYTECODE='1')
+                   HOOKC_DEBUG='1', PYTHONDONTWRITEBYTECODE='1', LANG='en_US.UTF-8')
         env.update(extra)
         return env
 
@@ -99,9 +102,9 @@ class HookdTest(unittest.TestCase):
         return subprocess.run([str(self.hookc), path] + args, input=data, capture_output=True,
                               env=self.env(**extra), cwd='/', timeout=60)
 
-    def cold(self, script, args, data, hooks=None):
+    def cold(self, script, args, data, hooks=None, **extra):
         path = str(Path(hooks or self.hooks) / script)
-        env = self.env()
+        env = self.env(**extra)
         return subprocess.run(['python3', path] + args, input=data, capture_output=True, env=env, cwd='/',
                               timeout=60)
 
@@ -334,14 +337,65 @@ class HookdTest(unittest.TestCase):
     def test_invalid_utf8_stdin_matches_cold_in_both_locale_modes(self):
         self.start()
         data = b'{"session_id": "\xff\xfe", "tool_name": "Bash"}'
-        for lang in ('en_US.UTF-8', 'C'):
-            with self.subTest(lang=lang):
-                warm = self.client('wal.py', ['pretool'], data, LANG=lang, LC_ALL='')
+        cases = [{'LANG': 'en_US.UTF-8'}, {'LANG': 'C'}, {'LC_CTYPE': 'UTF-8'}, {'LC_CTYPE': 'C.UTF-8'},
+                 {'LC_CTYPE': 'C.utf8'}, {'LC_ALL': 'C'}, {'LANG': 'no_SUCH.locale'}]
+        modes = set()
+        for extra in cases:
+            with self.subTest(**extra):
+                probe = subprocess.run([self.python, '-c', 'import sys; print(sys.stdin.errors)'],
+                                       env=self.env(**extra), capture_output=True, text=True,
+                                       stdin=subprocess.DEVNULL)
+                modes.add(probe.stdout.strip())
+                warm = self.client('wal.py', ['pretool'], data, **extra)
                 self.assertNotIn(b'hookc: cold path', warm.stderr)
-                path = str(self.hooks / 'wal.py')
-                cold = subprocess.run(['python3', path, 'pretool'], input=data, capture_output=True,
-                                      env=self.env(LANG=lang, LC_ALL=''), cwd='/', timeout=60)
+                cold = self.cold('wal.py', ['pretool'], data, **extra)
                 self.assertSame(warm, cold)
+        self.assertEqual(modes, {'strict', 'surrogateescape'})   # both handlers really exercised
+
+    def test_served_hook_sees_the_coerced_locale_a_cold_one_sees(self):
+        hooks = self.dir / 'probe'
+        shutil.copytree(HOOKS, hooks, ignore=shutil.ignore_patterns('__pycache__'))
+        target = hooks / 'bg_lint.py'
+        marker = '    sys.exit(main())\n'
+        probe = "    sys.stderr.write('LC=%s|%s\\n' % (os.environ.get('LC_CTYPE'), sys.stdout.errors))\n"
+        target.write_text(target.read_text().replace(marker, probe + marker))
+        self.start(hooks)
+        seen = set()
+        for extra in ({'LANG': 'C'}, {'LANG': 'en_US.UTF-8'}, {'LC_ALL': 'C'}, {'LC_CTYPE': 'UTF-8'}):
+            with self.subTest(**extra):
+                warm = self.client('bg_lint.py', [], payload('ls'), hooks=hooks, **extra)
+                self.assertNotIn(b'hookc: cold path', warm.stderr)
+                cold = self.cold('bg_lint.py', [], payload('ls'), hooks=hooks, **extra)
+                self.assertIn(b'LC=', cold.stderr)
+                seen.add(cold.stderr.split(b'LC=')[1].split(b'\n')[0])
+                self.assertSame(warm, cold)
+        self.assertGreaterEqual(len(seen), 3, seen)
+
+    def test_a_pin_that_is_not_the_running_interpreter_serves_nothing(self):
+        fake = self.dir / 'fakepy'
+        fake.write_text('#!/bin/sh\necho /nonexistent/python3\n')
+        fake.chmod(0o755)
+        self.server = subprocess.Popen([self.python, str(HOOKS / 'hookd.py'), 'serve', '--python', str(fake)],
+                                       env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL, start_new_session=True)
+        for _ in range(400):
+            if (self.run_dir / 'hookd.sock').exists() and (self.run_dir / 'status.json').exists():
+                break
+            time.sleep(0.025)
+        status = json.loads((self.run_dir / 'status.json').read_text())
+        self.assertIs(status['python_ok'], False)
+        warm = self.client('kill_guard.py', ['hook'], payload(BLOCK_CMD))
+        self.assertEqual(warm.returncode, 2)
+        self.assertIn(b'server:interpreter', warm.stderr)
+        self.assertIn('interpreter-mismatch', self.log.read_text())
+
+    def test_the_real_pin_is_recognised(self):
+        self.start()
+        for _ in range(400):
+            if (self.run_dir / 'status.json').exists():
+                break
+            time.sleep(0.025)
+        self.assertIs(json.loads((self.run_dir / 'status.json').read_text())['python_ok'], True)
 
     def test_unit_runs_the_pinned_interpreter(self):
         sys.path.insert(0, str(HOOKS))
@@ -671,6 +725,33 @@ class WiringTest(unittest.TestCase):
                                                   'wal.py', 'pretool', hooks_dir))
         self.assertFalse(self.doctor.wired_path_ok([client, '--deadline', '10', '--gate', '/x/wal.py', 'pretool'],
                                                    'wal.py', 'pretool', hooks_dir))
+
+    def test_doctor_checks_the_deadline_and_gate_against_the_entry(self):
+        ok = self.doctor.hookc_options_ok
+
+        def h(*args, **kw):
+            return dict({'type': 'command', 'command': '/h/.agent-harness/bin/hookc', 'args': list(args)}, **kw)
+        self.assertTrue(ok(h('--deadline', '10', '--gate', '/x/wal.py', 'pretool', timeout=10, onFailure='block'),
+                           'wal.py', 'pretool'))
+        self.assertFalse(ok(h('--deadline', '10', '/x/wal.py', 'pretool', timeout=10, onFailure='block'),
+                            'wal.py', 'pretool'))                       # a blocking hook without --gate
+        self.assertFalse(ok(h('--deadline', '30', '--gate', '/x/wal.py', 'pretool', timeout=10, onFailure='block'),
+                            'wal.py', 'pretool'))                       # a deadline past the host timeout
+        self.assertFalse(ok(h('--deadline', '10', '/x/p.py', 'ask-gate', timeout=10), 'provenance_hooks.py',
+                            'ask-gate'))                                # ask-gate enforces without onFailure
+        self.assertTrue(ok(h('--deadline', '5', '/x/bg_lint.py', timeout=5), 'bg_lint.py', None))
+        self.assertFalse(ok(h('--budget', '4', '/x/bg_lint.py', timeout=10), 'bg_lint.py', None))   # old form
+        self.assertFalse(ok(h('/x/bg_lint.py', timeout=10), 'bg_lint.py', None))   # no deadline at all
+        self.assertTrue(ok({'type': 'command', 'command': 'python3', 'args': ['/x/bg_lint.py']}, 'bg_lint.py', None))
+        wired = self.install.merged_settings({}, self.claude, hookd=True)
+        checked = 0
+        for handler in self.handlers(wired):
+            if Path(handler['command']).name == 'hookc':
+                args = handler['args'][2:]
+                args = args[1:] if args[0] == '--gate' else args
+                self.assertTrue(ok(handler, Path(args[0]).name, (args[1:2] or [None])[0]), handler)
+                checked += 1
+        self.assertGreaterEqual(checked, 15)
 
     def test_doctor_rejects_a_hookc_that_is_not_the_installed_executable(self):
         """Red-team M1: a missing, relocated or non-executable hookc must not pass doctor (fail-open guards and

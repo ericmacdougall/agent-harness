@@ -114,13 +114,44 @@ def wired_path_ok(toks: list[str], script: str, arg, hooks_dir: Path) -> bool:
     return rest == [] if arg is None else rest[:1] == [arg]
 
 
+HOOKC_EXTRA_GATES = {("provenance_hooks.py", "ask-gate")}  # keep in step with install.py
+
+
+def hookc_options_ok(handler: dict, script: str, arg) -> bool:
+    """A hookc handler must give the client its host timeout and, for a blocking hook, --gate: a deadline over the
+    entry's timeout, or a gate without --gate, lets the host time the hook out, which is an allow for a hook without
+    onFailure: block (goodqa#14859 review round 1, F4). The older --budget form predates the deadline: re-install."""
+    toks = flatten(handler)
+    if not toks or Path(toks[0]).name != "hookc":
+        return True
+    deadline, gate, i = None, False, 1
+    while i < len(toks) and toks[i] in ("--deadline", "--budget", "--gate"):
+        if toks[i] == "--gate":
+            gate, i = True, i + 1
+            continue
+        if toks[i] == "--budget" or i + 1 >= len(toks):
+            return False
+        try:
+            deadline = float(toks[i + 1])
+        except ValueError:
+            return False
+        i += 2
+    try:
+        limit = float(handler.get("timeout", 10))
+    except (TypeError, ValueError):
+        return False
+    must_gate = handler.get("onFailure") == "block" or (script, arg) in HOOKC_EXTRA_GATES
+    return deadline is not None and 0 < deadline <= limit and (gate or not must_gate)
+
+
 def find_hook(hooks: dict, event: str, script: str, arg, tools: list[str], hooks_dir: Path):
     for group in hooks.get(event, []) or []:
         if not isinstance(group, dict) or not matcher_covers(group.get("matcher"), tools):
             continue
         for handler in group.get("hooks", []) or []:
             if (isinstance(handler, dict) and handler.get("type", "command") == "command"
-                    and wired_path_ok(flatten(handler), script, arg, hooks_dir)):
+                    and wired_path_ok(flatten(handler), script, arg, hooks_dir)
+                    and hookc_options_ok(handler, script, arg)):
                 return handler
     return None
 

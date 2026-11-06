@@ -323,8 +323,8 @@ def env_mismatch(pre, env):
             return key
     # PYTHON* variables change how an interpreter starts (path, encodings, UTF-8 mode, hash seed); the served
     # child cannot redo that, so any difference from the server's own start-up values goes cold (review F3).
-    mine = {k: v for k, v in SERVER_ENV.items() if k.startswith('PYTHON')}
-    theirs = {k: v for k, v in env.items() if k.startswith('PYTHON')}
+    mine = {k: v for k, v in SERVER_ENV.items() if k.startswith('PYTHON') or k == 'DEVELOPER_DIR'}
+    theirs = {k: v for k, v in env.items() if k.startswith('PYTHON') or k == 'DEVELOPER_DIR'}
     if mine != theirs:
         return 'PYTHON*'
     return None
@@ -334,26 +334,40 @@ SERVER_ENV = dict(os.environ)          # this process's environment at start (th
 SERVED_PYTHON = None                   # realpath of the interpreter this server runs as; set by serve()
 
 
+COERCION_TARGETS = ('C.UTF-8', 'C.utf8', 'UTF-8')   # CPython's _TARGET_LOCALES, in its order
+
+
 def cold_stdio():
-    """In the request child, after the caller's environment is installed: set LC_CTYPE as a fresh interpreter
-    does and return the stdio error handler it would use, or None when its locale encoding is not UTF-8 (the
-    served streams are UTF-8, so that call must go cold). C/POSIX turns on UTF-8 mode (PEP 538/540), which uses
-    surrogateescape; any other UTF-8 locale uses strict."""
+    """In the request child, after the caller's environment is installed, do what a fresh interpreter does at start
+    (CPython 3.7+, Python/initconfig.c and pylifecycle.c) and return the stdio error handler it would use, or None
+    when its locale encoding is not UTF-8 (the served streams are UTF-8, so that call must go cold):
+    - setlocale(LC_CTYPE, ''); an invalid locale leaves "C";
+    - PEP 538: "C" with LC_ALL unset is coerced to the first target setlocale accepts, and LC_CTYPE is exported;
+    - stdio uses surrogateescape when the LC_CTYPE name is exactly C, POSIX or a coercion target, and in UTF-8 mode
+      (PEP 540: on for a C or POSIX locale); strict for every other name."""
     import codecs
     import locale
     try:
         name = locale.setlocale(locale.LC_CTYPE, '')
     except locale.Error:
-        name = locale.setlocale(locale.LC_CTYPE, 'C')   # a bad locale leaves a fresh interpreter in C
+        name = locale.setlocale(locale.LC_CTYPE, 'C')
+    if name == 'C' and not os.environ.get('LC_ALL') and os.environ.get('PYTHONCOERCECLOCALE') != '0':
+        for target in COERCION_TARGETS:
+            try:
+                name = locale.setlocale(locale.LC_CTYPE, target)
+            except locale.Error:
+                continue
+            os.environ['LC_CTYPE'] = target
+            return 'surrogateescape'
     if name in ('C', 'POSIX'):
-        return 'surrogateescape'
+        return 'surrogateescape'   # UTF-8 mode
     try:
         encoding = codecs.lookup(locale.nl_langinfo(locale.CODESET)).name
     except (LookupError, AttributeError, ValueError):
         return None
     if encoding != 'utf-8':
         return None
-    return 'surrogateescape' if name.split('.')[0] == 'C' else 'strict'   # C.UTF-8 is a coercion target
+    return 'surrogateescape' if name in COERCION_TARGETS else 'strict'
 
 
 # --------------------------------------------------------------------------- child execution
@@ -813,10 +827,26 @@ def secure_run_dir():
     return path
 
 
+def runs_as(pinned):
+    """Whether `pinned` starts the interpreter this process is (asked of it, so the macOS /usr/bin/python3 shim
+    counts as the CommandLineTools or Xcode python it runs). No threads exist yet: serve() calls this first."""
+    import subprocess
+    try:
+        out = subprocess.run([pinned, '-I', '-c', 'import os, sys; print(os.path.realpath(sys.executable))'],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.returncode == 0 and out.stdout.strip() == os.path.realpath(sys.executable)
+
+
 def serve(max_children=DEFAULT_MAX_CHILDREN, python=None):
     global SERVED_PYTHON
     import shutil
-    SERVED_PYTHON = os.path.realpath(python or shutil.which('python3') or sys.executable)
+    pinned = os.path.realpath(python or shutil.which('python3') or sys.executable)
+    python_ok = runs_as(pinned)
+    # A pin that is not this interpreter (a moved or upgraded python, a unit edited by hand) serves nothing: every
+    # call is answered `fallback: interpreter` and status shows python_ok false until the unit is reinstalled.
+    SERVED_PYTHON = pinned if python_ok else None
     os.umask(0o077)
     rdir = secure_run_dir()
     lock_fd = os.open(os.path.join(rdir, 'hookd.lock'), os.O_RDWR | os.O_CREAT, 0o600)
@@ -886,7 +916,7 @@ def serve(max_children=DEFAULT_MAX_CHILDREN, python=None):
         doc = {'pid': os.getpid(), 'started_at': time.time() - (time.monotonic() - started),
                'socket': path, 'children': len(children), 'loaded': sorted(pre.modules),
                'load_errors': pre.errors, 'watch_files': len(pre.watch), 'warm_patterns': len(warmed),
-               'env_keys_at_import': sorted(pre.env_read), 'python': SERVED_PYTHON,
+               'env_keys_at_import': sorted(pre.env_read), 'python': pinned, 'python_ok': python_ok,
                'max_children': max_children, **counts}
         import resource
         own, kids = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -899,6 +929,8 @@ def serve(max_children=DEFAULT_MAX_CHILDREN, python=None):
         os.replace(tmp, status_path)
 
     write_status()
+    if not python_ok:
+        log('interpreter-mismatch', pinned=pinned, running=os.path.realpath(sys.executable))
     log('start', pid=os.getpid(), loaded=len(pre.modules), errors=sorted(pre.errors), ms=int(
         (time.monotonic() - started) * 1000))
     last_status = time.monotonic()
@@ -934,7 +966,7 @@ def serve(max_children=DEFAULT_MAX_CHILDREN, python=None):
             listener.close()
             os.close(lock_fd)
             os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), 'serve', '--python',
-                                      SERVED_PYTHON, '--max-children', str(max_children)])
+                                      pinned, '--max-children', str(max_children)])
         if now - last_status > 5:
             write_status()
             last_status = now

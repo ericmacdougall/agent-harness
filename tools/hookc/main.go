@@ -323,17 +323,22 @@ func cold(c call, stdin []byte, why string) int {
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	cmd.WaitDelay = 100 * time.Millisecond // stop copying stdin once the hook is gone
 	err := cmd.Run()
-	if ctx.Err() != nil {
-		return noVerdict(c, "the cold run passed the deadline")
-	}
+	// A hook that exited on its own gave its verdict, even if the deadline passed just after: only a run that was
+	// killed (or never started) after the deadline has none.
 	if err == nil {
 		return 0
+	}
+	if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+		return cmd.ProcessState.ExitCode() // exited; only the stdin copy was cut short
 	}
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
 		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Exited() {
 			return ws.ExitStatus()
 		}
+	}
+	if ctx.Err() != nil {
+		return noVerdict(c, "the cold run passed the deadline")
 	}
 	fmt.Fprintf(os.Stderr, "hookc: the hook %s could not run (%v)\n", filepath.Base(c.script), err)
 	if c.gate {
