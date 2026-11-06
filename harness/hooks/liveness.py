@@ -81,7 +81,8 @@ def waiting_on(note: str):
 OWNER_TYPES = ("task-owner",)
 
 
-DISPOSITIONS = ("resumed", "reassigned", "waiting", "closed")
+DISPOSITIONS = ("resumed", "reassigned", "waiting", "closed", "legacy", "superseded", "wontdo")
+CLOSING = ("closed", "superseded", "wontdo")  # end an owner; only "closed" means done (deployed live and tested)
 RESUMED_GRACE_S = 30 * 60  # a "resumed" disposition must be followed by activity within this window
 
 
@@ -91,13 +92,16 @@ def disposition_live(disp: dict | None, now: float, last_activity: float = 0.0, 
     resumed     live only while activity follows it: within RESUMED_GRACE_S of its time, or any activity after it
     reassigned  live while the replacement agent is live (the caller resolves that)
     waiting     live until its `until` time (epoch seconds); it must cite an ask id or a ticket (checked at write)
-    closed      permanent
+    closed      permanent: done, deployed to live and tested (ah checks both records at write)
+    superseded  permanent, not done: the scope moved elsewhere; cites a ticket
+    wontdo      permanent, not done: nobody will do it; cites a ticket
+    legacy      permanent, not done: quiet before the gate was installed and unverified; `ah owners` keeps listing it
     """
     if not isinstance(disp, dict) or disp.get("kind") not in DISPOSITIONS:
         return False
     at = float(disp.get("at") or 0.0)
     kind = disp["kind"]
-    if kind == "closed":
+    if kind in ("closed", "legacy", "superseded", "wontdo"):
         return True
     if kind == "waiting":
         return now < float(disp.get("until") or 0.0)

@@ -9,6 +9,7 @@ after the bound, and on a repeated Stop (`stop_hook_active`), it lets the turn e
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -63,15 +64,50 @@ def message(undisposed: list, rows: dict) -> str:
             lines.append(f"  - {agent} handed off {age} ago and nobody acknowledged it: main (not the owner) records\n"
                          f"      ah task dispose --agent {agent} --kind resumed      (someone picked it up)\n"
                          f"      ah task dispose --agent {agent} --kind reassigned --ref <new agent id>\n"
-                         f"      ah task dispose --agent {agent} --kind closed --reason <why> --evidence <ticket|WAL id|sha>")
+                         f"      ah task dispose --agent {agent} --kind closed --reason <what you verified> --deployed <deploy WAL id> "
+                     f"--live-test <live REALLY_TESTED id>\n"
+                     f"      ah task dispose --agent {agent} --kind superseded|wontdo --ref <GoodQA ticket> --reason <why>")
             continue
         lines.append(f"  - {agent} DROPPED {age} ticket {r.get('ticket') or 'none'}: run one of\n"
                      f"      ah task dispose --agent {agent} --kind resumed   (after you resume or re-spawn it)\n"
                      f"      ah task dispose --agent {agent} --kind reassigned --ref <new agent id>\n"
                      f"      ah task dispose --agent {agent} --kind waiting --ref <ask id or GoodQA ticket> --until <ISO>\n"
-                     f"      ah task dispose --agent {agent} --kind closed --reason <why> --evidence <ticket|WAL id|sha>")
+                     f"      ah task dispose --agent {agent} --kind closed --reason <what you verified> --deployed <deploy WAL id> "
+                     f"--live-test <live REALLY_TESTED id>\n"
+                     f"      ah task dispose --agent {agent} --kind superseded|wontdo --ref <GoodQA ticket> --reason <why>")
     return ("Dropped owners need a decision before this turn ends (goodqa#14791):\n" + "\n".join(lines) +
             "\nA dropped owner is a defect: resume it, reassign it, name what it waits on, or close it with evidence.")
+
+
+GRANDFATHER_MAX = 50  # legacy rows one Stop may write
+
+
+def grandfather(session: str, data: dict, now=None) -> list:
+    """One-time grandfather (main's request, goodqa#14791): an undisposed owner whose last activity predates this
+    host's gate install time is recorded as `legacy` through ah, which re-checks the epoch and writes the audit row.
+    Owners that went quiet after the install are never touched. Returns the ids recorded."""
+    try:
+        import ah  # noqa: PLC0415
+        home = Path(os.environ.get("AH_HOME") or Path.home())
+        epoch = ah.gate_epoch(home)
+    except Exception:  # noqa: BLE001
+        return []
+    if not epoch:
+        return []
+    rows = {r["agent_id"]: r for r in data.get("owners") or []}
+    done = []
+    scope = getattr(ah, "owner_view_scope", None)  # a half-updated install falls back to one view per owner
+    with (scope(home, session, data) if scope else contextlib.nullcontext()):  # ah re-checks each owner, view read once
+        for agent in list(data.get("undisposed") or [])[:GRANDFATHER_MAX]:
+            last = ah.parse_ts((rows.get(agent) or {}).get("last_activity"))
+            if not last or last >= epoch:
+                continue
+            try:
+                ah.write(home, "task.dispose", {"agent": agent, "session": session, "kind": "legacy"}, session)
+                done.append(agent)
+            except Exception:  # noqa: BLE001 - a refused legacy row leaves the owner gated, which is the safe side
+                continue
+    return done
 
 
 def cmd_stop(payload: dict, now: float | None = None) -> dict:
@@ -86,8 +122,18 @@ def cmd_stop(payload: dict, now: float | None = None) -> dict:
     except Exception:  # noqa: BLE001 - no WAL, a partial install or an ah bug: fail open, never trap the turn
         return {}
     undisposed = list(data.get("undisposed") or [])
+    legacy = grandfather(session, data, now)
+    if legacy:
+        try:
+            data = ah.owners(Path(os.environ.get("AH_HOME") or Path.home()), session, now=now)
+        except Exception:  # noqa: BLE001
+            return {}
+        undisposed = list(data.get("undisposed") or [])
+    note = (f"dropped-owner gate: {len(legacy)} owner(s) quiet since before the gate was installed were recorded as "
+            "unverified-legacy (each has an audit row; `ah owners` lists them until someone follows up): "
+            + ", ".join(legacy)) if legacy else ""
     if not undisposed:
-        return {}
+        return {"systemMessage": note} if note else {}
     rows = {r["agent_id"]: r for r in data.get("owners") or []}
     text = message(undisposed, rows)
     sig = hashlib.sha256(",".join(undisposed).encode()).hexdigest()[:16]
@@ -188,7 +234,7 @@ def cmd_subagent_stop(payload: dict, now: float | None = None) -> dict:
     return {"systemMessage": "dropped-owner gate: " + text + " It is now DROPPED and needs a disposition."}
 
 
-ACK_KINDS = ("resumed", "reassigned", "closed", "legacy")
+ACK_KINDS = ("resumed", "reassigned", "closed", "legacy", "superseded", "wontdo")
 PRETOOL_MAX = 100_000  # larger commands are judged by a cheap substring test (round 5, minor 2: no regex backtracking)
 _HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 _WRAPPERS = {"env", "nice", "command", "exec", "time", "nohup", "timeout", "sudo", "stdbuf", "builtin"}
@@ -273,7 +319,8 @@ def _acks(seg: list, depth: int = 0) -> bool:
 
 
 def acknowledges(cmd: str, depth: int = 0) -> bool:
-    """Whether a Bash command runs an `ah task dispose` that resumes, reassigns, closes or legacies an owner."""
+    """Whether a Bash command runs an `ah task dispose` that resumes, reassigns, closes, supersedes, wontdoes or legacies
+    an owner."""
     if len(cmd) > PRETOOL_MAX:
         return "dispose" in cmd and bool(_KIND_WORD.search(cmd))
     segs = _segments(_strip_heredocs(cmd))
