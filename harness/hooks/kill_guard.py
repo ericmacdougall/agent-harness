@@ -1201,6 +1201,8 @@ def make_analyzer_class(cg):
             # the raw word is matched: a quoted '~' is a literal directory, and .text has HOME expanded
             if i + 1 >= len(texts) or not hook_script_ok(args[i].raw, ('ah',)) or texts[i + 1] != 'kill':
                 return False
+            if texts[i + 2:] in (['--help'], ['-h']):
+                return True  # usage text only: ah.py prints it and exits before any process is touched
             rest, i, seen = texts[i + 2:], 0, set()
             while i < len(rest):
                 t = rest[i]
@@ -1249,7 +1251,11 @@ def make_analyzer_class(cg):
                     body = body.replace(code, PY_LITERAL.sub("''", code), 1)
             body = re.sub(r'\b(?:os|process)\.kill\(\s*[\w.]+(?:\(\))?\s*,\s*0\s*\)', '', body)  # liveness probe
             if self.script_kill is not None and self.script_kill.search(body):
-                self.block('script-kill', 'interpreter code signals processes the guard cannot check')
+                if 'ah.py' in body and ' kill' in body:
+                    self.block('script-kill', 'the audited stop is `python3 -I ~/.claude/hooks/ah.py kill --pid N --reason R '
+                                              '[--host H] [--foreign]` (literal words, with -I; remote hosts via --host, not ssh)')
+                else:
+                    self.block('script-kill', 'interpreter code signals processes the guard cannot check')
 
         def check_netwatch(self, args):
             texts = [a.text for a in args]

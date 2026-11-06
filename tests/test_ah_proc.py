@@ -658,6 +658,42 @@ class GuardRule(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(self.verdict(cmd), "block")
 
+    def test_help_is_allowed_but_only_alone(self):
+        """goodqa#14864 P1: `ah.py kill --help` was blocked, so the form could not be discovered."""
+        self.assertEqual(self.verdict(self.A + "--help"), "allow")
+        self.assertEqual(self.verdict(self.A + "-h"), "allow")
+        for cmd in (self.A + "--help --pid 4242", self.A + "--help; pkill x", "python3 ~/.claude/hooks/ah.py kill --help && pkill x"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.verdict(cmd), "block")
+
+    def hook(self, cmd, cwd):
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": cwd, "hook_event_name": "PreToolUse"})
+        return subprocess.run([sys.executable, str(HOOKS / "kill_guard.py"), "hook"], input=payload, capture_output=True,
+                              text=True, cwd=cwd)
+
+    def test_documented_lines_pass_the_real_hook_from_any_cwd(self):
+        lines = [self.A + "--help",
+                 self.A + "--host t2-dev --pid 3821924,3822748 --reason 'stop leftover stubs' --foreign",
+                 self.A + "--pid 4242 --reason 'my own test server'"]
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = Path(tmp, ".claude", "wals", "sess")
+            sub.mkdir(parents=True)
+            for cwd in (tmp, str(sub)):
+                for cmd in lines:
+                    with self.subTest(cwd=cwd, cmd=cmd):
+                        self.assertEqual(self.hook(cmd, cwd).returncode, 0)
+
+    def test_block_message_names_the_audited_form(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.hook("python3 ~/.claude/hooks/ah.py kill --pid 4242 --reason x", tmp)
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("python3 -I ~/.claude/hooks/ah.py kill", out.stderr)
+        self.assertIn("--host", out.stderr)
+        with tempfile.TemporaryDirectory() as tmp:  # unrelated signalling keeps the generic message
+            other = self.hook("python3 -c 'import os; os.kill(4242, 9)'", tmp)
+        self.assertEqual(other.returncode, 2)
+        self.assertNotIn("audited stop", other.stderr)
+
     def test_chained_commands_are_each_judged(self):
         self.assertEqual(self.verdict(self.A + "--pid 4242 --reason x && pkill -f vite"), "block")
         self.assertEqual(self.verdict(self.A + "--pid 4242 --reason x; kill 99"), "block")
