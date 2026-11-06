@@ -156,7 +156,13 @@ class GateTests(Base):
     def test_closed_needs_reason_and_evidence_and_is_permanent(self):
         with self.assertRaises(ah.AhError):
             self.dispose("closed", "disp-closed-bad", reason="done enough")
-        self.dispose("closed", "disp-closed-ok", reason="superseded by #14800", evidence="GoodQA goodqa#14800")
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [
+            {"at": iso(NOW - 60), "event": "deploy", "id": "wde000000001", "note": "DEPLOYED app v1.2.0 for dropowner"},
+            {"at": iso(NOW - 30), "event": "check", "id": "wlt000000001",
+             "note": "REALLY_TESTED DG-LIVE-1: dropowner verified live on https://app.example: pass"}])
+        self.dispose("closed", "disp-closed-ok", reason="verified dropowner's v1.2.0 deploy serves and passes live",
+                     deployed="wde000000001", live_test="DG-LIVE-1")
         self.assertEqual(self.stop(now=NOW + 10 * 86400), {})
 
     def test_reassigned_is_live_only_while_the_replacement_is(self):
@@ -443,9 +449,10 @@ class TaskWalOwners(Base):
         self.assertIn(f"liveness:{SESSION[:8]}/agent-auto-9f2c1a", out)
 
     def dispose_task(self, name):
-        return ah.write(self.home, "task.dispose", {"agent": name, "session": SESSION, "kind": "closed", "at": iso(NOW),
-                                                    "reason": "review delivered elsewhere", "evidence": "GoodQA goodqa#14791"},
-                        SESSION, "disp-task-" + name)
+        with mock.patch.object(ah, "_ticket_exists", return_value=True):
+            return ah.write(self.home, "task.dispose", {"agent": name, "session": SESSION, "kind": "superseded", "at": iso(NOW),
+                                                        "reason": f"the {name} review moved to the delta reviewer agent",
+                                                        "ref": "GoodQA goodqa#14791"}, SESSION, "disp-task-" + name)
 
     def test_scan_wrapper_exit_code_follows_the_gate(self):
         """The wrapper runs `ah owners --gate` in a subprocess on the real clock, so this fixture uses real time."""
@@ -463,8 +470,10 @@ class TaskWalOwners(Base):
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         doc = json.loads(p.stdout)
         self.assertEqual([u["agent"] for u in doc["sessions"][0]["undisposed"]], ["realdrop"])
-        ah.write(self.home, "task.dispose", {"agent": "realdrop", "session": sess, "kind": "closed", "at": iso(real),
-                                             "reason": "superseded in test", "evidence": "GoodQA goodqa#14791"}, sess, "disp-realdrop-01")
+        with mock.patch.object(ah, "_ticket_exists", return_value=True):
+            ah.write(self.home, "task.dispose", {"agent": "realdrop", "session": sess, "kind": "wontdo", "at": iso(real),
+                                                 "reason": "the scan fixture owner exists only to exercise the wrapper",
+                                                 "ref": "GoodQA goodqa#14791"}, sess, "disp-realdrop-01")
         p = subprocess.run([sys.executable, "-I", str(scan), "--session", sess, "--text"], capture_output=True, text=True, env=env, timeout=120)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("gate clear", p.stdout)

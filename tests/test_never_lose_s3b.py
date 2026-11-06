@@ -89,8 +89,10 @@ class HandoffAck(Base):
         by = {r["agent_id"]: r for r in self.owners(now=NOW + 1000)["owners"]}  # 68 min later, nobody took it
         self.assertTrue(by["handoffowner"]["decision_required"])
         self.assertIn("handoff-unacked", by["handoffowner"]["flags"])
-        ah.write(self.home, "task.dispose", {"agent": "handoffowner", "session": SESSION, "kind": "closed", "at": iso(NOW),
-                                             "reason": "main merged the PR", "evidence": "GoodQA goodqa#14791"}, SESSION, "disp-ho-0001")
+        with mock.patch.object(ah, "_ticket_exists", return_value=True):
+            ah.write(self.home, "task.dispose", {"agent": "handoffowner", "session": SESSION, "kind": "superseded", "at": iso(NOW),
+                                                 "reason": "main folded this handoff into the S3 slice it already owns",
+                                                 "ref": "GoodQA goodqa#14791"}, SESSION, "disp-ho-0001")
         by = {r["agent_id"]: r for r in self.owners(now=NOW + 1000)["owners"]}
         self.assertFalse(by["handoffowner"]["decision_required"])
 
@@ -142,14 +144,16 @@ class ReviewRound1(Base):
                                {"at": iso(real - 100), "event": "subagent_stop", "agent_id": "cxonly000001", "agent_type": "task-owner"}])
         jl(cw / "agent-cxonly000001.jsonl", [{"at": iso(real - 4000), "event": "intent", "note": "codex work"}])
         self.assertFalse((self.home / ".claude" / "wals" / "sess-codex-only1").exists())
-        with mock.patch.object(ah, "server_now", side_effect=lambda: iso(real)):
+        with mock.patch.object(ah, "server_now", side_effect=lambda: iso(real)), \
+                mock.patch.object(ah, "_ticket_exists", return_value=True):
             doc = ah.owners(self.home, "sess-codex-only1", now=real)
             self.assertEqual(doc["undisposed"], ["cxonly000001"])
             import dropped_gate
             out = dropped_gate.cmd_stop({"session_id": "sess-codex-only1", "stop_hook_active": False}, now=real)
             self.assertEqual(out.get("decision"), "block")
-            r = ah.write(self.home, "task.dispose", {"agent": "cxonly000001", "session": "sess-codex-only1", "kind": "closed",
-                                                     "at": iso(real), "reason": "superseded in test", "evidence": "GoodQA goodqa#14791"},
+            r = ah.write(self.home, "task.dispose", {"agent": "cxonly000001", "session": "sess-codex-only1", "kind": "superseded",
+                                                     "at": iso(real), "reason": "the codex probe scope moved into the S3b slice tests",
+                                                     "ref": "GoodQA goodqa#14791"},
                          "sess-codex-only1", "disp-codex-0001")
             self.assertEqual(r["result"], "applied")
             rows = [json.loads(l) for l in (cw / "main.jsonl").read_text().splitlines()]

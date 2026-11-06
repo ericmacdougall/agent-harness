@@ -697,7 +697,7 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
 - both reviews `ACCEPT` that spec's core;
 - every criterion has evidence on that core;
 - the evidence on that core cites at least one commit and attaches at least one execution log (this applies to every ticket, including documentation-only work: cite the docs commit and a check log);
-- the latest click-test on that core passed with logs, by an independent tester, at a deployed commit containing every evidence commit (unless the spec says not-applicable); a click-test of an older spec version is stale;
+- the latest click-test on that core passed with logs, by an independent tester, on the live deployment (not a loopback URL), at a deployed commit containing every evidence commit; when the spec says not-applicable, an evidence record must cite a REALLY_TESTED run whose note names the deployed or installed sha or version and the live target it ran on, and does not say it was staging, pre-prod, local or not yet live (done means deployed to live and tested); a click-test of an older spec version is stale;
 - a valid sign-off exists on that core.
 
 Otherwise it lists each missing item with the command that fixes it. Under "Self-attested" it lists every check that rests on a name the helper cannot verify.

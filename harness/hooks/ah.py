@@ -377,6 +377,10 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     for d in disp.values():
         if d.get("kind") == "waiting" and ASK_ID_RE.match(str(d.get("ref") or "")) and asks.get(d["ref"]) != "open":
             d["until"] = min(float(d.get("until") or 0.0), float(d.get("at") or 0.0))  # answered: the wait is over
+    # a returned parent with live children is still doing the work through them (main's finding: a4720127 and its 7
+    # reviewers), so it counts as live for a reassignment (dispose guard)
+    live_parents = {r["parent"] for r in rows if r.get("parent")
+                    and r["state"] not in ("DROPPED", "done", "handoff", "returned")}
     by_id = {r["agent_id"]: r for r in rows}
 
     def covered(agent_id, seen=()):
@@ -388,7 +392,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         t = by_id.get(agent_id)
         if t is None or agent_id in seen:
             return False
-        if t["state"] not in ("DROPPED", "done", "handoff", "returned"):
+        if t["state"] not in ("DROPPED", "done", "handoff", "returned") or agent_id in live_parents:
             return True
         # Any non-live state (DROPPED, done, handoff, returned) is excused only by the target's own live disposition:
         # an owner that returned a result and then went into a named wait still holds the work (main repro
@@ -410,11 +414,16 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                                                                 and covered(d.get("ref"), (r["agent_id"],))))
         r["disposition"] = dict(d, live=alive) if d else None
         r["decision_required"] = bool(r["owner"] and r["state"] == "DROPPED" and not alive)
+        if d and d.get("kind") in ("legacy", "superseded", "wontdo") and r["state"] not in ("done", "handoff", "returned") \
+                and not r["state"].startswith(("live", "working", "waiting")):
+            label = "unverified-legacy" if d["kind"] == "legacy" else d["kind"]
+            r["state"], r["severity"] = label, "info"  # ended, never "done"
+            r["flags"] = list(r.get("flags") or []) + [label]
     for r in rows:  # I9: a handoff is real only once someone takes it (a disposition at/after the handoff)
         if r["owner"] and r["state"] == "handoff":
             handed = parse_ts(r["last_activity"]) or 0.0
             d = disp.get(r["agent_id"])
-            acked = bool(d and d.get("kind") in ("resumed", "reassigned", "closed") and float(d.get("at") or 0) >= handed - 10)
+            acked = bool(d and d.get("kind") in ("resumed", "reassigned") + GUARDED_KINDS and float(d.get("at") or 0) >= handed - 10)
             if not acked and now - handed >= HANDOFF_ACK_S:
                 r["decision_required"] = True
                 r["flags"] = list(r.get("flags") or []) + ["handoff-unacked"]
@@ -436,7 +445,8 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     missed = [d for d in dls if d["state"] == "missed" and not liveness.disposition_live(disp.get(d["id"]), now)]
     return {"session": session, "generated": iso(now), "counts": counts, "owners": rows, "source": "direct",
             "deadlines": dls,
-            "undisposed": sorted([r["agent_id"] for r in rows if r["decision_required"]] + [d["id"] for d in missed])}
+            "undisposed": sorted([r["agent_id"] for r in rows if r["decision_required"]] + [d["id"] for d in missed]),
+            "legacy_unverified": sorted(a for a, d in disp.items() if d.get("kind") == "legacy")}
 
 
 # ------------------------------------------------------------------ user-msg
@@ -871,13 +881,18 @@ def precheck(op: str, args: dict) -> None:
         need("task")
         ev = args.get("evidence")
         if not isinstance(ev, list) or not ev:
-            raise AhError("evidence", "task.done needs evidence: --really-tested ID --wal PATH or --commit SHA --repo PATH")
+            raise AhError("evidence", "task.done needs --deployed WID plus --really-tested ID --wal PATH (done means "
+                                      "deployed to live and tested)")
         for e in ev:
             ok = isinstance(e, dict) and (
                 (isinstance(e.get("really_tested"), str) and e["really_tested"].strip() and e.get("wal")) or
-                (re.fullmatch(r"[0-9a-f]{7,40}", str(e.get("commit", ""))) and e.get("repo")))
+                (re.fullmatch(r"[0-9a-f]{7,40}", str(e.get("commit", ""))) and e.get("repo")) or
+                bool(ASK_ID_RE.match(str(e.get("deployed", "")))))
             if not ok:
-                raise AhError("evidence", "each evidence item is {really_tested, wal} or {commit, repo}")
+                raise AhError("evidence", "each evidence item is {deployed}, {really_tested, wal} or {commit, repo}")
+        if not (any("deployed" in e for e in ev) and any("really_tested" in e for e in ev)):
+            raise AhError("evidence", "task.done: done means deployed to live and tested; give a deploy record "
+                                      "(--deployed WID) and a live REALLY_TESTED run. A commit or merge alone is not done")
     elif op in ("alert.raise", "alert.clear"):
         need("alert_key", "source")
         if not ALERT_KEY_RE.match(args["alert_key"]) or not SERVICE_RE.match(args["source"]):
@@ -911,12 +926,24 @@ def precheck(op: str, args: dict) -> None:
         elif args["kind"] == "reassigned":
             if not OWNER_ID_RE.match(args.get("ref") or ""):
                 raise AhError("bad_request", "task.dispose reassigned: --ref <replacement agent id> is required")
-        elif args["kind"] == "closed":
-            if len((args.get("reason") or "").strip()) < 8:
-                raise AhError("bad_request", "task.dispose closed: --reason (8+ characters) is required")
-            ev = args.get("evidence") or ""
-            if not (TICKET_RE.match(ev) or ASK_ID_RE.match(ev) or re.fullmatch(r"[0-9a-f]{7,40}", ev)):
-                raise AhError("bad_request", "task.dispose closed: --evidence must be a ticket, a WAL id or a commit sha")
+        elif args["kind"] in liveness.CLOSING:
+            reason = (args.get("reason") or "").strip()
+            if len(reason) < REASON_MIN or len(set(re.findall(r"[a-z0-9]+", reason.lower()))) < REASON_MIN_WORDS:
+                raise AhError("reason", f"task.dispose {args['kind']}: --reason must say what you verified about this "
+                                        f"owner ({REASON_MIN}+ characters, {REASON_MIN_WORDS}+ different words)")
+            if args["kind"] == "closed":
+                if not (ASK_ID_RE.match(args.get("deployed") or "") and LIVE_TEST_RE.match(args.get("live_test") or "")):
+                    raise AhError("evidence", "task.dispose closed means done, and done means deployed to live and tested: "
+                                              "--deployed <WAL id of the deploy or install record> --live-test <REALLY_TESTED "
+                                              "id run against the live target>. A merge or commit alone is not done; work "
+                                              "that will not ship is --kind superseded|wontdo --ref <ticket>")
+                if args.get("evidence"):
+                    raise AhError("evidence", "task.dispose closed: --evidence is retired; give --deployed and --live-test")
+            elif not TICKET_RE.match(args.get("ref") or ""):
+                raise AhError("evidence", f"task.dispose {args['kind']}: --ref 'GoodQA <project>#N' (the ticket that "
+                                          "records why) is required")
+        elif args["kind"] == "legacy" and (args.get("evidence") or args.get("deployed") or args.get("live_test")):
+            raise AhError("bad_request", "task.dispose legacy takes no evidence: it records that nobody verified the owner")
     elif op == "deadline.add":
         need("session", "at", "ref", "owner", "note")
         if parse_ts(args["at"]) is None:
@@ -1111,11 +1138,22 @@ def _task(ledger: list, name: str):
     return reg[-1] if reg else None
 
 
-def _evidence_ok(home: Path, ev: list, allowed: set, reg: dict) -> None:
+def _evidence_ok(home: Path, ev: list, allowed: set, reg: dict, ledger=None) -> None:
     reg_ts = parse_ts(reg.get("received_at"))
     reg_args = reg["args"]
+    ctx = _owner_context(home, reg_args["session"], reg_args["owner_agent"], ledger or [], task=reg_args["task"])
+    deploy_at = 0.0
+    for e in ev:
+        if "deployed" in e:
+            dep, _named = _deploy_record(home, reg_args["session"], e["deployed"], ctx)
+            deploy_at = max(deploy_at, parse_ts(dep.get("at")) or 0.0)
+    for e in ev:
+        if "really_tested" in e:  # done is a live test after the deploy (main WAL w07450081c12)
+            _live_test(home, reg_args["session"], e["really_tested"].strip(), None, deploy_at)
     roots = [r.resolve() for r in wal_roots(home) if r.exists()] or [(home / ".claude" / "wals").resolve()]
     for e in ev:
+        if "deployed" in e:
+            continue
         if "really_tested" in e:
             wid = e["really_tested"].strip()
             try:
@@ -1192,9 +1230,9 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         if not reg:
             raise AhError("unknown_task", f"task {args['task']!r} is not registered", 3)
         allowed = {_wal_path(home, r_["session"], a_).resolve() for r_ in [reg["args"]] for a_ in ("main", r_["owner_agent"])}
-        _evidence_ok(home, args["evidence"], allowed, reg)
+        _evidence_ok(home, args["evidence"], allowed, reg, ledger)
         r = reg["args"]
-        cites = "; ".join(e.get("really_tested") or e["commit"] for e in args["evidence"])
+        cites = "; ".join(e.get("really_tested") or e.get("deployed") or e["commit"] for e in args["evidence"])
         rec = {"at": now, "event": "result", "id": wid, "by": actor_id(), "note": f"task {args['task']} done; evidence: {cites}"[:3900]}
         _wal_append(home, _wal_path(home, r["session"], r["owner_agent"]), rec)
         out["wal"] = wid
@@ -1233,7 +1271,7 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
             "severity": args.get("severity") or "info", "key": args["alert_key"], "check": args["source"],
             "message": args.get("message") or "cleared", "detail": args.get("detail") or {}}, home=home)
     elif op == "task.dispose":
-        if args["kind"] in ("resumed", "reassigned", "closed") and actor_id() == args["agent"]:
+        if args["kind"] in ("resumed", "reassigned") + GUARDED_KINDS and actor_id() == args["agent"]:
             raise AhError("forbidden", f"task.dispose {args['kind']}: a sub-agent or the owner itself cannot acknowledge; "
                                        "main records it (waiting is allowed)", 3)
         main_wal = _wal_path(home, args["session"], "main")
@@ -1247,13 +1285,14 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         if args["kind"] == "reassigned" and not (_wal_has(main_wal, "subagent", None, agent=ref)
                                                 or (main_wal.parent / f"{ref}.jsonl").is_file()):
             raise AhError("bad_request", f"task.dispose reassigned: {ref} is not an agent of this session", 3)
-        ev = args.get("evidence") or ""
-        if args["kind"] == "closed" and ASK_ID_RE.match(ev) and not (_wal_has(main_wal, None, ev) or
-                _wal_has(_wal_path(home, args["session"], args["agent"]), None, ev)):
-            raise AhError("evidence", f"task.dispose closed: WAL id {ev} is not in this session's WALs", 3)
+        if (args["kind"] == "closed" and not args.get("deploy_at")) or (args["kind"] == "legacy" and not args.get("gate_epoch")) \
+                or (args["kind"] in ("superseded", "wontdo") and not args.get("ref_checked")):
+            raise AhError("evidence", f"task.dispose {args['kind']}: evidence was not verified", 3)  # preflight sets these
+        if args["kind"] in liveness.CLOSING:
+            _closing_checks(args, ledger, time.time())
         rec = {"at": now, "event": "disposition", "id": wid, "agent": args["agent"], "kind": args["kind"],
                "note": f"owner {args['agent']} {args['kind']}: {args.get('reason') or args.get('ref') or ''}"[:300]}
-        for k in ("until", "ref", "reason", "evidence"):
+        for k in ("until", "ref", "reason", "deployed", "live_test", "gate_epoch", "owner_last"):
             if args.get(k):
                 rec[k] = args[k]
         _wal_append(home, main_wal, rec)
@@ -1351,6 +1390,9 @@ def dispositions(home: Path, session: str, ledger=None) -> dict:
         if r.get("op") == "task.dispose" and a.get("session") == session:
             d = {"kind": a.get("kind"), "at": parse_ts(a.get("at")) or 0.0, "ref": a.get("ref"),
                  "reason": a.get("reason"), "evidence": a.get("evidence"), "seq": r.get("seq")}
+            for k in ("deployed", "live_test", "gate_epoch"):
+                if a.get(k):
+                    d[k] = a[k]
             if a.get("until"):
                 d["until"] = parse_ts(a["until"]) or 0.0
             if a["agent"] not in out or (d["seq"] or 0) >= (out[a["agent"]].get("seq") or 0):
@@ -1388,6 +1430,373 @@ def task_list(home: Path, open_only: bool = False) -> dict:
     return {"tasks": rows, "source": "direct"}
 
 
+# ------------------------------------------------------------------ dispose guard (goodqa#14791, the 19-owner loop)
+
+REASON_MIN = 40  # characters of a closing reason
+REASON_MIN_WORDS = 6  # different words in it
+REASON_REPEAT_S = 7 * 86400  # a normalized reason may not repeat another owner's within this window
+CLOSE_BURST_MAX = 3  # distinct owners one actor may try to close ...
+CLOSE_BURST_WINDOW_S = 600  # ... within this window; the next one is refused as a possible bulk close
+LIVE_TEST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+DEPLOY_EVENTS = {"deploy", "release", "install"}
+DEPLOY_NOTE_RE = re.compile(r"^\s*(DEPLOYED|INSTALLED|RELEASED)\b")
+SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+VERSION_RE = re.compile(r"\bv?\d+\.\d+(?:\.\d+)?\b")
+LIVE_RE = re.compile(r"\b(live|production|prod)\b|https?://(?!(?:localhost|127\.|0\.0\.0\.0|\[::1\]))", re.I)
+NOT_LIVE_RE = re.compile(r"https?://(?:localhost|127\.|0\.0\.0\.0|\[::1\])", re.I)
+# A note that says it was not live does not prove live, whatever else it says (spec_flow.NOT_LIVE_WORDS_RE is the twin).
+NOT_LIVE_WORDS_RE = re.compile(r"\b(?:not|never|isn't|wasn't|aren't|weren't)\s+(?:(?:yet|on|in|to|the|deployed|released)\s+)*"
+                               r"(?:live|prod|production)\b|\b(?:staging|pre-?prod(?:uction)?|locally|local[- ]only|dry[- ]run)\b",
+                               re.I)
+GUARDED_KINDS = ("closed", "superseded", "wontdo", "legacy")
+GUARD_FIELDS = ("deploy_specific", "live_specific", "gate_epoch", "owner_last", "ref_checked", "deploy_at")
+WAL_SCAN_MAX = 64 * 1024 * 1024  # bytes of a session's WALs searched for one evidence id
+
+
+def ring_host() -> str:
+    """The host name ahd uses for its ring rows (ahd.host()); one definition so ring_state matches."""
+    return socket.gethostname().split(".")[0]
+
+
+def _ring_alert(home: Path, key: str, severity: str, message: str, detail: dict) -> None:
+    """Raise one alert in the shared ops ring as source "ah", unless the same key is already raised. Best effort."""
+    try:
+        import ops_watch  # noqa: PLC0415
+        ring = home / ".agent-harness" / "state" / "alerts.jsonl"
+        latest = None
+        for e in ops_watch.read_ring(ring):
+            if e.get("source") == "ah" and e.get("key") == key and e.get("host") == ring_host():
+                latest = e
+        if latest and latest.get("event") == "raise" and latest.get("severity") == severity:
+            return
+        ops_watch.emit({"host": ring_host(), "source": "ah", "event": "raise", "severity": severity, "key": key,
+                        "message": message, "detail": detail}, path=ring)
+    except Exception:  # noqa: BLE001 - the refusal stands even when the ring cannot be written
+        pass
+
+
+def gate_epoch(home: Path, ledger=None):
+    """When the dropped-owner gate was installed on this host (epoch seconds), or None when unknown. install.py writes
+    the marker once; the earliest epoch a legacy row already used is pinned, so moving the marker cannot widen legacy."""
+    vals = []
+    p = home / ".agent-harness" / "state" / "dropped-gate" / "installed_at.json"
+    try:
+        st = os.lstat(p)
+        if st.st_size <= 4096 and (st.st_mode & 0o170000) == 0o100000:
+            v = parse_ts(json.loads(p.read_text()).get("at"))  # input-ok: 4 KiB regular file, checked above
+            if v:
+                vals.append(v)
+    except (OSError, ValueError, AttributeError):
+        pass
+    for r in (ledger if ledger is not None else _ledger(home)):
+        a = r.get("args") or {}
+        if r.get("op") == "task.dispose" and a.get("kind") == "legacy" and parse_ts(a.get("gate_epoch")):
+            vals.append(parse_ts(a["gate_epoch"]))
+    return min(vals) if vals else None
+
+
+def _norm_ticket(project, number) -> str:
+    return f"GoodQA {(project or 'goodqa').lower()}#{int(number)}"
+
+
+def _tickets_in(text: str) -> set:
+    out = set()
+    for m in re.finditer(r"(?:GoodQA\s+([a-z0-9-]+)\s*#|\b([a-z][a-z0-9-]*)#|GoodQA\s+#|(?<![\w#])#)(\d{1,10})\b",
+                         text or "", re.I):
+        out.add(_norm_ticket(m.group(1) or m.group(2), m.group(3)))
+    return out
+
+
+def _owner_context(home: Path, session: str, agent: str, ledger: list, task: str | None = None) -> dict:
+    """What evidence may name to be about this owner: its id, its registered task, and its tickets."""
+    ctx = {"agent": agent, "tasks": {task.lower()} if task and len(task) >= 4 else set(), "tickets": set(),
+           "branch": None, "repo": None}
+    for r in ledger:
+        a = r.get("args") or {}
+        if r.get("op") == "task.register" and (a.get("owner_agent") == agent or (task and a.get("task") == task)) \
+                and a.get("session") == session:
+            if len(a.get("task") or "") >= 4:
+                ctx["tasks"].add(a["task"].lower())
+            ctx["tickets"] |= _tickets_in(a.get("ticket") or "")
+            ctx["branch"], ctx["repo"] = a.get("branch") or ctx["branch"], a.get("worktree") or ctx["repo"]
+    path = _wal_path(home, session, agent)
+    if not path.is_file():
+        path = session_dir(home, session) / f"{agent}.jsonl"  # a task-named WAL
+    if path.is_file():
+        try:
+            for t in summarize_agent_wal(path, state_dir(home, "ah-index")).get("tickets") or []:
+                ctx["tickets"] |= _tickets_in(t)
+        except Exception:  # noqa: BLE001 - a WAL we cannot summarize gives no tickets, never a pass
+            pass
+    return ctx
+
+
+def _names_owner(text: str, ctx: dict):
+    """"id" or "task" when the text names this owner specifically, "ticket" when only through a shared ticket."""
+    text = text or ""
+    agent = ctx["agent"]
+    for tok in re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]*", text):
+        t = tok.rstrip("._-")
+        if t == agent or (len(t) >= 8 and re.fullmatch(r"a[0-9a-f]{7,}", agent) and agent.startswith(t)):
+            return "id"
+        if t.lower() in ctx["tasks"]:
+            return "task"
+    return "ticket" if _tickets_in(text) & ctx["tickets"] else None
+
+
+def _git(repo: str, *argv, timeout: float = 10.0):
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    return subprocess.run(["git", "-C", repo, *argv], capture_output=True, text=True, timeout=timeout, env=env)
+
+
+def _sha_contains_branch(ctx: dict, sha: str) -> None:
+    """A deployed sha must contain the owner's registered branch tip; otherwise what is live predates its work."""
+    branch, repo = ctx["branch"], ctx["repo"]
+    if not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", branch) or ".." in branch:
+        raise AhError("evidence", f"registered branch {branch!r} is not a plain branch name", 3)
+    try:
+        full = _git(repo, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}")
+        tip = None
+        for ref in (f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"):
+            r = _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+            if r.returncode == 0:
+                tip = r.stdout.strip()
+                break
+        if full.returncode != 0 or not tip:
+            raise AhError("evidence", f"deployed {sha} or branch {branch} is not in the registered checkout {repo}", 3)
+        if _git(repo, "merge-base", "--is-ancestor", tip, full.stdout.strip()).returncode != 0:
+            raise AhError("evidence", f"deployed {sha} does not contain {branch}: what is live predates this owner's work", 3)
+    except (OSError, subprocess.SubprocessError):
+        raise AhError("evidence_unverifiable", f"git could not read {repo}", 3)
+
+
+def _session_entries(home: Path, session: str, match):
+    """WAL entries of the session (any of its WALs) for which match(raw bytes, record) is true, oldest first."""
+    seen, out = 0, []
+    for f in sorted(session_dir(home, session).glob("*.jsonl")):
+        try:
+            if not os.path.isfile(f) or os.path.islink(f):
+                continue
+            with open(f, "rb") as handle:
+                for raw in handle:
+                    seen += len(raw)
+                    if seen > WAL_SCAN_MAX:
+                        raise AhError("evidence_unverifiable", "the session's WALs are too large to search", 3)
+                    rec = match(raw)
+                    if rec is not None:
+                        out.append(rec)
+        except OSError:
+            continue
+    return sorted(out, key=lambda r: parse_ts(r.get("at")) or 0.0)
+
+
+def _by_id(wid: str):
+    def match(raw):
+        if wid.encode() not in raw:
+            return None
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            return None
+        return rec if isinstance(rec, dict) and rec.get("id") == wid else None
+    return match
+
+
+def _by_test(tid: str):
+    head = f"REALLY_TESTED {tid}:"
+
+    def match(raw):
+        if head.encode() not in raw:
+            return None
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            return None
+        return rec if isinstance(rec, dict) and str(rec.get("note") or "").startswith(head) else None
+    return match
+
+
+def _deploy_record(home: Path, session: str, wid: str, ctx: dict) -> tuple:
+    """(record, how it names the owner): a deploy, install or release record about this owner, with a sha or version."""
+    recs = _session_entries(home, session, _by_id(wid))
+    if not recs:
+        raise AhError("evidence", f"deploy record {wid} is not in this session's WALs", 3)
+    rec = recs[-1]
+    note = str(rec.get("note") or "")
+    if not (rec.get("event") in DEPLOY_EVENTS or DEPLOY_NOTE_RE.match(note)):
+        raise AhError("evidence", f"{wid} is a {rec.get('event')!r} entry, not a deploy record (event deploy, release or "
+                                  "install, or a note starting DEPLOYED, INSTALLED or RELEASED); merged is not live", 3)
+    shas, version = SHA_RE.findall(note), VERSION_RE.search(note)
+    if not (shas or version):
+        raise AhError("evidence", f"deploy record {wid} names no deployed sha or version", 3)
+    named = _names_owner(note, ctx)
+    if not named:
+        raise AhError("evidence", f"deploy record {wid} does not name {ctx['agent']}, its task or its ticket", 3)
+    if ctx["branch"] and ctx["repo"] and shas:
+        _sha_contains_branch(ctx, shas[0])
+    return rec, named
+
+
+def _live_test(home: Path, session: str, tid: str, ctx, after: float) -> tuple:
+    """(record, how it names the owner): the latest REALLY_TESTED run of tid, against a live target, after the deploy.
+    ctx None skips the naming check (task.done: the test must already sit in the task's own WALs)."""
+    recs = _session_entries(home, session, _by_test(tid))
+    if not recs:
+        raise AhError("evidence", f"no REALLY_TESTED {tid} entry in this session's WALs", 3)
+    rec = recs[-1]
+    note = str(rec.get("note") or "")
+    if NOT_LIVE_RE.search(note) or not LIVE_RE.search(note):
+        raise AhError("evidence", f"REALLY_TESTED {tid} does not name a live target (live, production, or a non-local "
+                                  "URL); a local test is not done", 3)
+    said = NOT_LIVE_WORDS_RE.search(note)
+    if said:
+        raise AhError("evidence", f"REALLY_TESTED {tid} says {said.group(0)!r}: a run that was not on the live target is "
+                                  "not done; cite the run against the live deployment", 3)
+    if (parse_ts(rec.get("at")) or 0.0) < after:
+        raise AhError("evidence", f"REALLY_TESTED {tid} ran before the deploy it would prove", 3)
+    named = _names_owner(note, ctx) if ctx else "task"
+    if not named:
+        raise AhError("evidence", f"REALLY_TESTED {tid} does not name {ctx['agent']}, its task or its ticket", 3)
+    return rec, named
+
+
+_OWNER_VIEW_SCOPE: dict = {}
+
+
+class owner_view_scope:
+    """In-process only: lets the Stop gate's grandfather hand ah the owner view it just computed, so a legacy check of
+    up to 50 owners reads the WALs once instead of once per owner (which can outrun the 15 s Stop timeout). The view
+    is used only inside the `with` block and only for its (home, session); every other legacy check reads afresh."""
+    def __init__(self, home: Path, session: str, doc: dict):
+        self.key, self.doc = (str(home), session), doc
+
+    def __enter__(self):
+        _OWNER_VIEW_SCOPE[self.key] = self.doc
+        return self
+
+    def __exit__(self, *exc):
+        _OWNER_VIEW_SCOPE.pop(self.key, None)
+        return False
+
+
+def _legacy_last_activity(home: Path, session: str, agent: str, now) -> float | None:
+    doc = _OWNER_VIEW_SCOPE.get((str(home), session)) or owners(home, session, now=now)
+    row = next((r for r in doc["owners"] if r["agent_id"] == agent), None)
+    return parse_ts(row["last_activity"]) if row else None
+
+
+def _dispose_preflight(home: Path, args: dict) -> dict:
+    """Read-only checks before the store lock (WALs, git, the ticket API). Adds the guard fields."""
+    args = dict(args)
+    agent, session, kind = args["agent"], args["session"], args["kind"]
+    ledger = _ledger(home)
+    if kind == "legacy":
+        epoch = gate_epoch(home, ledger)
+        if not epoch:
+            raise AhError("legacy", "task.dispose legacy: the gate's install time is unknown on this host "
+                                    "(install.py writes it); legacy is only for owners that went quiet before the gate", 3)
+        last = _legacy_last_activity(home, session, agent, parse_ts(args["at"]))
+        if not last:
+            raise AhError("legacy", f"task.dispose legacy: {agent} is not an owner in this session", 3)
+        if last >= epoch:
+            raise AhError("legacy", f"task.dispose legacy: {agent} was active at {iso(last)}, after the gate was installed "
+                                    f"({iso(epoch)}); a drop since then needs a real disposition", 3)
+        args.update(gate_epoch=iso(epoch), owner_last=iso(last))
+        args.setdefault("reason", f"legacy: last activity {iso(last)} predates the dropped-owner gate ({iso(epoch)}); "
+                                  "not verified")
+        return args
+    if kind in ("superseded", "wontdo"):
+        found = _ticket_exists(args["ref"])
+        if found is False:
+            raise AhError("evidence", f"task.dispose {kind}: {args['ref']} does not exist", 3)
+        if found is None:
+            raise AhError("evidence_unverifiable", f"task.dispose {kind}: GoodQA could not confirm {args['ref']}; retry", 3)
+        args["ref_checked"] = True
+        return args
+    ctx = _owner_context(home, session, agent, ledger)
+    dep, dnamed = _deploy_record(home, session, args["deployed"], ctx)
+    _lt, lnamed = _live_test(home, session, args["live_test"], ctx, parse_ts(dep.get("at")) or 0.0)
+    args.update(deploy_specific=dnamed in ("id", "task"), live_specific=lnamed in ("id", "task"),
+                deploy_at=str(dep.get("at") or ""))
+    return args
+
+
+def _reason_shape(reason: str, agent: str) -> str:
+    s = (reason or "").lower().replace(agent.lower(), "<owner>")
+    s = re.sub(r"\b[0-9a-f]{7,}\b", "<hex>", s)
+    s = re.sub(r"#\d+", "#n", s)
+    s = re.sub(r"\d+", "0", s)
+    return re.sub(r"\s+", " ", s).strip(" .;:")
+
+
+def _closing_checks(args: dict, ledger: list, now: float) -> None:
+    """Under the store lock: shared evidence must name each owner, and no templated reasons."""
+    agent = args["agent"]
+    shape = _reason_shape(args.get("reason") or "", agent)
+    for r in ledger:
+        a = r.get("args") or {}
+        if r.get("op") != "task.dispose" or a.get("kind") not in liveness.CLOSING or a.get("agent") == agent:
+            continue
+        if args["kind"] == "closed" and a.get("kind") == "closed":
+            for field, specific in (("deployed", "deploy_specific"), ("live_test", "live_specific")):
+                if a.get(field) and a.get(field) == args.get(field) and not args.get(specific):
+                    raise AhError("evidence_reused", f"task.dispose closed: {field} {args[field]} already closed "
+                                                     f"{a.get('agent')} and names this owner only through a shared "
+                                                     "ticket; cite a record that names this owner", 3)
+        at = parse_ts(r.get("received_at")) or 0.0
+        if now - at < REASON_REPEAT_S and _reason_shape(a.get("reason") or "", a.get("agent") or "") == shape:
+            raise AhError("reason", f"task.dispose {args['kind']}: this reason repeats the one used for {a.get('agent')}; "
+                                    "say what you verified about this owner", 3)
+
+
+def _audit_tail(home: Path, limit: int = 1024 * 1024) -> list:
+    p = store_dir(home) / "audit.jsonl"
+    try:
+        with open(p, "rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - limit))
+            data = handle.read(limit)  # input-ok: bounded tail
+    except OSError:
+        return []
+    out = []
+    for raw in data.splitlines()[1 if size > limit else 0:]:
+        try:
+            row = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            out.append(row)
+    return out
+
+
+def _close_burst(home: Path, args: dict, who: dict, now: float) -> None:
+    """A burst of closes over many owners from one actor is refused and alerted (it is how 19 owners were cleared)."""
+    tried = set()
+    for row in _audit_tail(home):
+        a = row.get("actor") or {}
+        if row.get("op") == "task.dispose" and row.get("kind") in liveness.CLOSING and a.get("session") == who["session"] \
+                and a.get("agent_id") == who["agent_id"] and now - (parse_ts(row.get("at")) or 0.0) < CLOSE_BURST_WINDOW_S:
+            tried.add(row.get("agent"))
+    tried.discard(None)
+    if args.get("agent") in tried or len(tried) < CLOSE_BURST_MAX:
+        return
+    key = f"bulk-close:{who['session'][:8]}:{who['agent_id']}"
+    _ring_alert(home, key, "high",
+                f"possible bulk-close: {who['agent_id']} tried to close {len(tried) + 1} owners within "
+                f"{CLOSE_BURST_WINDOW_S // 60} min in session {who['session'][:8]}; refused (goodqa#14791)",
+                {"session": who["session"], "actor": who["agent_id"], "owners": sorted(tried | {args.get("agent")})[:20]})
+    raise AhError("bulk_close", f"task.dispose: {len(tried)} other owners were closed or tried within "
+                                f"{CLOSE_BURST_WINDOW_S // 60} min; closing owners in bulk is refused. Verify each one, "
+                                "and resume, reassign or name a wait for the rest", 3)
+
+
+def _audit_reject(home: Path, op: str, key, session, code: str, tag: dict) -> None:
+    with StoreLock(home):
+        _append_line(store_dir(home) / "audit.jsonl", {"at": iso(time.time()), "op": op, "key": key or "",
+                                                       "actor": actor(session), "result": "rejected", "code": code, **tag})
+
+
 WAIT_MAX_S = 7 * 86400  # a named wait expires within a week; it is renewed, never parked for years (review M-b)
 WAIT_UNVERIFIED_MAX_S = 86400  # when GoodQA cannot confirm the ticket a wait names
 
@@ -1414,6 +1823,8 @@ def server_now() -> str:
 
 
 def write(home: Path, op: str, args: dict, session: str, key: str | None = None) -> dict:
+    if op == "task.dispose":
+        args = {k: v for k, v in args.items() if k not in GUARD_FIELDS}  # only ah sets these
     if op in ("task.dispose", "task.pending", "deadline.add"):
         stamped = {k: v for k, v in args.items() if k != "ref_unverified"}  # set only here
         if op != "deadline.add":
@@ -1425,13 +1836,32 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
             if found is None:
                 stamped["ref_unverified"] = True
         args = stamped
-    precheck(op, args)
+    tag = {"kind": args.get("kind"), "agent": args.get("agent")} if op == "task.dispose" else {}
+    guarded = op == "task.dispose" and args.get("kind") in GUARDED_KINDS
+    try:
+        if op == "task.dispose" and args.get("kind") in ("resumed", "reassigned") + GUARDED_KINDS \
+                and actor_id() == args.get("agent"):  # first, so an owner's self-ack is named as such
+            raise AhError("forbidden", f"task.dispose {args['kind']}: an owner cannot acknowledge itself; main records it "
+                                       "(waiting is allowed)", 3)
+        if guarded and args.get("kind") in liveness.CLOSING:
+            _close_burst(home, args, actor(session), time.time())  # first: a burst is refused whatever its arguments
+        precheck(op, args)
+    except AhError as e:
+        if guarded:
+            _audit_reject(home, op, key, session, e.code, tag)
+        raise
     import redact
     if isinstance(args.get("source"), str):
         import wal_note
         if wal_note.SECRET_PATTERN.search(args["source"]):
             raise AhError("bad_request", "source appears to contain a credential; cite it without the secret", 2)
     args = {k: (v if k == "source" else _redact_args(v, redact.redact)) for k, v in args.items()}  # source is checked as typed
+    if guarded:
+        try:
+            args = _dispose_preflight(home, args)
+        except AhError as e:
+            _audit_reject(home, op, key, session, e.code, tag)
+            raise
     key = key or derive_key(op, args, session)
     if not KEY_RE.match(key):
         raise AhError("bad_request", "idempotency key must be 8-128 chars of [A-Za-z0-9._:-]")
@@ -1448,7 +1878,7 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
             if row.get("key") == key:
                 if row.get("sha") != body_sha:
                     _append_line(audit, {"at": iso(time.time()), "op": op, "key": key, "actor": who,
-                                         "result": "key_conflict"})
+                                         "result": "key_conflict", **tag})
                     raise AhError("key_conflict", "that key was used with a different request", 3)
                 if row.get("state", "applied") == "applied":
                     return {"ok": True, "result": "duplicate", "id": row["id"], "seq": row["seq"], "key": key}
@@ -1461,17 +1891,18 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
             out = _apply(home, op, args, key, ledger)
         except AhError as e:
             _append_line(audit, {"at": iso(time.time()), "op": op, "key": key, "actor": who,
-                                 "result": "rejected", "code": e.code})
+                                 "result": "rejected", "code": e.code, **tag})
             raise
         except Exception as e:  # never an unaudited traceback
             _append_line(audit, {"at": iso(time.time()), "op": op, "key": key, "actor": who,
-                                 "result": "rejected", "code": "internal"})
+                                 "result": "rejected", "code": "internal", **tag})
             raise AhError("internal", f"{type(e).__name__} while applying {op}", 3)
         rid = "ah" + hashlib.sha256(key.encode()).hexdigest()[:10]
         _append_line(store_dir(home) / "ledger.jsonl", {
             "state": "applied", "seq": seq, "id": rid, "key": key, "sha": body_sha, "op": op, "args": args, "actor": who,
             "received_at": iso(time.time())})
-        _append_line(audit, {"at": iso(time.time()), "op": op, "key": key, "actor": who, "result": "applied", "seq": seq})
+        _append_line(audit, {"at": iso(time.time()), "op": op, "key": key, "actor": who, "result": "applied", "seq": seq,
+                             **tag})
     reply = {"ok": True, "result": "applied", "id": rid, "seq": seq, "key": key}
     reply.update(out)
     if out.get("comment") == "pending":  # post now, outside the lock; on failure it stays spooled for the next drain
@@ -1910,13 +2341,17 @@ def build_parser():
     dn.add_argument("--wal")
     dn.add_argument("--commit", action="append", default=[])
     dn.add_argument("--repo")
+    dn.add_argument("--deployed", action="append", default=[], metavar="WID",
+                    help="WAL id of the deploy, release or install record (done means deployed live and tested)")
     dp = ks.add_parser("dispose", help="record the decision for a DROPPED owner: resumed, reassigned, waiting or closed")
     dp.add_argument("--agent", required=True)
     dp.add_argument("--kind", required=True, choices=list(liveness.DISPOSITIONS))
     dp.add_argument("--ref", help="waiting: ask id or ticket; reassigned: replacement agent id")
     dp.add_argument("--until", help="waiting: ISO time when the wait expires")
-    dp.add_argument("--reason", help="closed: why (8+ characters)")
-    dp.add_argument("--evidence", help="closed: ticket, WAL id or commit sha")
+    dp.add_argument("--reason", help="closed, superseded, wontdo: what you verified about this owner (40+ characters)")
+    dp.add_argument("--deployed", help="closed: WAL id of the deploy, release or install record naming this owner")
+    dp.add_argument("--live-test", dest="live_test", help="closed: REALLY_TESTED id run against the live target")
+    dp.add_argument("--evidence", help=argparse.SUPPRESS)  # retired: closed takes --deployed and --live-test
     for x in (r, st, dn, cc, dp):
         x.add_argument("--session")
         x.add_argument("--key", help="idempotency key (default: derived from the request)")
@@ -2044,7 +2479,7 @@ def run(args, home: Path) -> dict:
             return write(home, "task.register", a, s, args.key)
         if args.sub == "dispose":
             a = {"agent": args.agent, "session": s or "", "kind": args.kind, "at": iso(time.time())}
-            for opt in ("ref", "until", "reason", "evidence"):
+            for opt in ("ref", "until", "reason", "evidence", "deployed", "live_test"):
                 if getattr(args, opt):
                     a[opt] = getattr(args, opt)
             return write(home, "task.dispose", a, s, args.key)
@@ -2055,6 +2490,7 @@ def run(args, home: Path) -> dict:
             return write(home, "task.status", a, s, args.key)
         ev = [{"really_tested": i, "wal": args.wal or ""} for i in args.really_tested]
         ev += [{"commit": c, "repo": args.repo or ""} for c in args.commit]
+        ev += [{"deployed": d} for d in args.deployed]
         return write(home, "task.done", {"task": args.task, "evidence": ev}, s, args.key)
     if cmd == "deadline":
         s = session_of(args, home) or newest_session(home)
