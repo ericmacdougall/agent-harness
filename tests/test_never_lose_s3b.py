@@ -38,9 +38,14 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self.addCleanup(self.tmp.cleanup)
-        p = mock.patch.dict(os.environ, {"AH_HOME": str(self.home), "HOME": str(self.home), "AH_NOW": str(NOW)})  # server-side stamps on the fixture clock
+        p = mock.patch.dict(os.environ, {"AH_HOME": str(self.home), "HOME": str(self.home)})
+        clock = mock.patch.object(ah, "server_now", side_effect=lambda: iso(NOW))  # the writer clock, pinned in-process only
+        clock.start()
+        self.addCleanup(clock.stop)
         p.start()
         self.addCleanup(p.stop)
+        for k in ("CLAUDE_CODE_CHILD_SESSION", "AH_AGENT_ID", "AGENT_ID"):  # the runner may itself be a sub-agent;
+            os.environ.pop(k, None)  # patch.dict restores them. Tests act as main unless they set an identity.
         self.w = self.home / ".claude" / "wals" / SESSION
         jl(self.w / "main.jsonl", [{"at": iso(NOW - 9000), "event": "subagent", "agent_id": "handoffowner", "agent_type": "task-owner"},
                                    {"at": iso(NOW - 3000), "event": "subagent_stop", "agent_id": "handoffowner", "agent_type": "task-owner"}])
@@ -137,7 +142,7 @@ class ReviewRound1(Base):
                                {"at": iso(real - 100), "event": "subagent_stop", "agent_id": "cxonly000001", "agent_type": "task-owner"}])
         jl(cw / "agent-cxonly000001.jsonl", [{"at": iso(real - 4000), "event": "intent", "note": "codex work"}])
         self.assertFalse((self.home / ".claude" / "wals" / "sess-codex-only1").exists())
-        with mock.patch.dict(os.environ, {"AH_NOW": str(real)}):
+        with mock.patch.object(ah, "server_now", side_effect=lambda: iso(real)):
             doc = ah.owners(self.home, "sess-codex-only1", now=real)
             self.assertEqual(doc["undisposed"], ["cxonly000001"])
             import dropped_gate
@@ -165,6 +170,19 @@ class ReviewRound1(Base):
         self.assertEqual(rows[-1]["event"], "disposition")
         disp = ah.dispositions(self.home, SESSION)["handoffowner"]
         self.assertEqual(int(disp["at"]), int(NOW))  # the caller's backdated `at` was ignored
+
+    def test_env_clock_is_not_a_bypass_and_child_sessions_cannot_ack(self):
+        """Round 2 blocker and M1: no caller-chosen stamp; a sub-agent shell cannot acknowledge a handoff."""
+        with mock.patch.dict(os.environ, {"AH_NOW": str(NOW + 10 * 365 * 86400)}):
+            self.assertNotIn("AH_NOW", ah.server_now.__doc__ or "")
+            self.assertEqual(int(ah.parse_ts(ah.server_now())), int(NOW))  # the patched writer clock, not the env
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_CHILD_SESSION": "1"}, clear=False):
+            os.environ.pop("AH_AGENT_ID", None)
+            with self.assertRaises(ah.AhError) as cm:
+                ah.write(self.home, "task.dispose", {"agent": "handoffowner", "session": SESSION, "kind": "resumed", "at": iso(NOW)},
+                         SESSION, "child-ack-01")
+            self.assertEqual(cm.exception.code, "forbidden")
+        self.assertEqual(ah.actor_id(), "unknown") if not os.environ.get("AGENT_ID") else None
 
     def test_unknown_deadline_id_is_refused(self):
         with self.assertRaises(ah.AhError) as cm:
@@ -223,6 +241,12 @@ class PruneGuardDepth(unittest.TestCase):
             deeper.mkdir(parents=True)
             found = workdir._unpushed_repos(task / "x", max_depth=2)
             self.assertTrue(any("depth overrun" in f["reason"] for f in found))  # unexamined subtree is never pruned
+            # M2: a pushed checkout with deep source dirs is not "unexamined": git answered for it
+            (deep / "src" / "pkg" / "mod" / "sub").mkdir(parents=True)
+            self.git("push", "-q", "origin", "HEAD:refs/heads/wtbranch", cwd=wt, env=env)
+            overrun = [f for f in workdir._unpushed_repos(task) if "depth overrun" in f["reason"]]
+        self.assertEqual([f for f in overrun if f["repo"].startswith(str(deep))], [])  # nothing inside the checkout
+        self.assertEqual([f["repo"] for f in overrun], [str(task / "x" / "y" / "z")])  # the plain deep dir still is
 
 
 class CodexStopGate(Base):
