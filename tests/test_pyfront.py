@@ -198,7 +198,10 @@ class GateTable(unittest.TestCase):
                 continue  # Codex only blocks on these events
             for group in groups:
                 for hook in group["hooks"]:
-                    self.assert_gate(shlex.split(hook["command"])[1:])
+                    argv = shlex.split(hook["command"])[1:]
+                    if Path(argv[0]).name == "heavy_job_guard.py":
+                        continue  # advisory by design: it fails open on its own errors (goodqa#14817), so it is no gate
+                    self.assert_gate(argv)
                     checked += 1
         self.assertGreaterEqual(checked, 3)
 
