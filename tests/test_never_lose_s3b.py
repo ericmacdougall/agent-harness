@@ -332,5 +332,101 @@ class CodexStopGate(Base):
         self.assertIn("cxdrop000001", out.get("reason", ""))
 
 
+class ReviewRound5(Base):
+    """Round 5 (native Fable-high review of 198d09b): MJ-1 note waits never expired and never checked the ask; minors:
+    abbreviated flags passed the pretool deny, its regex went quadratic, it denied text that only quoted a dispose line,
+    and a retry with the same key after the clock or GoodQA reachability moved was a key_conflict."""
+    OPEN_ASK, RESOLVED_ASK, NO_ASK = "w0123456789a", "w0123456789b", "w0123456789c"
+
+    def stopped_with_note(self, agent, note, stopped):
+        jl(self.w / "main.jsonl", [{"at": iso(stopped - 100), "event": "subagent", "agent_id": agent, "agent_type": "task-owner"},
+                                   {"at": iso(stopped), "event": "subagent_stop", "agent_id": agent, "agent_type": "task-owner"}])
+        jl(self.w / f"agent-{agent}.jsonl", [{"at": iso(stopped - 50), "event": "status", "note": note}])
+
+    def asks(self):
+        jl(self.w / "main.jsonl", [{"at": iso(NOW - 7200), "event": "ask", "id": self.OPEN_ASK, "note": "which provider?"},
+                                   {"at": iso(NOW - 7100), "event": "ask", "id": self.RESOLVED_ASK, "note": "go?"},
+                                   {"at": iso(NOW - 7000), "event": "ask_resolved", "ref": self.RESOLVED_ASK, "note": "yes"}])
+
+    def test_a_note_wait_expires_and_an_ask_wait_needs_an_open_ask(self):
+        self.asks()
+        old = NOW - 30 * 86400
+        self.stopped_with_note("parkticket01", "waiting on GoodQA goodqa#99999999", old)
+        self.stopped_with_note("parkask00001", f"waiting on {self.NO_ASK}", old)
+        self.stopped_with_note("plaindrop001", "work", old)
+        self.stopped_with_note("freshopen001", f"waiting on {self.OPEN_ASK}", NOW - 3600)
+        self.stopped_with_note("freshdone001", f"waiting on {self.RESOLVED_ASK}", NOW - 3600)
+        self.stopped_with_note("freshnone001", f"waiting on {self.NO_ASK}", NOW - 3600)
+        self.stopped_with_note("freshtick001", "waiting on GoodQA goodqa#14791", NOW - 3600)
+        doc = self.owners()
+        und = set(doc["undisposed"])
+        for a in ("parkticket01", "parkask00001", "plaindrop001", "freshdone001", "freshnone001"):
+            self.assertIn(a, und, a)
+        for a in ("freshopen001", "freshtick001"):  # a fresh wait on an open ask, or a ticket within 24 h, still holds
+            self.assertNotIn(a, und, a)
+        import liveness
+        self.assertEqual(liveness.classify_task_wal(NOW, NOW - 2 * 86400, None, "waiting on GoodQA goodqa#1")["state"], "DROPPED")
+        self.assertTrue(liveness.classify_task_wal(NOW, NOW - 3600, None, "waiting on GoodQA goodqa#1")["state"].startswith("waiting-on"))
+
+    def test_a_dispose_wait_on_a_resolved_ask_is_refused(self):
+        self.asks()
+        args = {"agent": "handoffowner", "session": SESSION, "kind": "waiting", "at": iso(NOW), "until": iso(NOW + 3600)}
+        with self.assertRaises(ah.AhError):
+            ah.write(self.home, "task.dispose", dict(args, ref=self.RESOLVED_ASK), SESSION, "wait-resolved-01")
+        self.assertEqual(ah.write(self.home, "task.dispose", dict(args, ref=self.OPEN_ASK), SESSION, "wait-open-01")["result"],
+                         "applied")
+        self.stopped_with_note("plaindrop002", "work", NOW - 86400)
+        ah.write(self.home, "task.dispose", dict(args, agent="plaindrop002", ref=self.OPEN_ASK), SESSION, "wait-open-02")
+        self.assertNotIn("plaindrop002", self.owners()["undisposed"])
+        jl(self.w / "main.jsonl", [{"at": iso(NOW - 10), "event": "ask_resolved", "ref": self.OPEN_ASK, "note": "answered"}])
+        self.assertIn("plaindrop002", self.owners()["undisposed"])  # the answer ends the wait; the owner needs a decision
+
+    def test_a_retry_with_the_same_key_is_a_duplicate_after_the_clock_or_reachability_moves(self):
+        args = {"agent": "handoffowner", "session": SESSION, "kind": "waiting", "at": iso(NOW), "until": iso(NOW + 6 * 3600),
+                "ref": "GoodQA goodqa#14791"}
+        with mock.patch.object(ah, "_ticket_exists", return_value=None):
+            self.assertEqual(ah.write(self.home, "task.dispose", args, SESSION, "wait-retry-01")["result"], "applied")
+        with mock.patch.object(ah, "_ticket_exists", return_value=True), \
+                mock.patch.object(ah, "server_now", side_effect=lambda: iso(NOW + 40)):
+            self.assertEqual(ah.write(self.home, "task.dispose", args, SESSION, "wait-retry-01")["result"], "duplicate")
+
+    def test_abbreviated_flags_are_refused(self):
+        with self.assertRaises(SystemExit):
+            ah.build_parser().parse_args(["task", "dispose", "--agent", "a1", "--kin", "closed", "--reaso", "x"])
+
+    def test_pretool_matches_real_invocations_only_and_stays_linear(self):
+        import dropped_gate
+
+        def decide(cmd):
+            out = dropped_gate.cmd_pretool({"tool_name": "Bash", "agent_id": "a1", "tool_input": {"command": cmd}})
+            return (out.get("hookSpecificOutput") or {}).get("permissionDecision", "allow")
+        for cmd in ("cd /x && ah task dispose --agent a2 --kind=closed --reason r",
+                    "AH_X=1 python3 /h/ah.py --text task dispose --agent a2 --kind 'resumed'",
+                    "nice -n 5 ~/.claude/hooks/ah.py task dispose --agent a2 --kind legacy",
+                    "ah task dispose --agent a2 --kin closed",
+                    'ah task dispose --agent a2 --kind "$K"',
+                    "echo ok; ah task dispose --agent a2 --kind reassigned --ref a3",
+                    "bash -c 'ah task dispose --agent a2 --kind closed'",
+                    "ah task dispose --agent a2 \\\n  --kind resumed",
+                    "eval \"ah task dispose --agent a2 --kind closed\"",
+                    "bash <<'EOF'\nah task dispose --agent a2 --kind closed\nEOF",
+                    "python3 -c 'import ah; ah.write(h, \"task.dispose\", {\"kind\": \"closed\"}, s)'"):
+            self.assertEqual(decide(cmd), "deny", cmd)
+        for cmd in ("grep -n 'task dispose --kind closed' docs/ah-query-spec.md",
+                    "ah task dispose --agent a2 --kind waiting --ref w0123456789a --until 2027-01-01T00:00:00Z "
+                    "--reason 'not --kind closed'",
+                    'git commit -m "docs: ah task dispose --kind closed needs a deploy"',
+                    "cat > notes.md <<'EOF'\nah task dispose --agent a2 --kind closed\nEOF\nwc -l notes.md"):
+            self.assertEqual(decide(cmd), "allow", cmd)
+        t0 = time.monotonic()
+        decide("task dispose " * 70000)
+        self.assertLess(time.monotonic() - t0, 3.0)
+        big = json.dumps({"tool_name": "Bash", "agent_id": "a1",
+                          "tool_input": {"command": "ah task dispose --agent a2 --kind closed --reason " + "x" * (2 << 20)}})
+        p = subprocess.run([sys.executable, str(HOOKS / "dropped_gate.py"), "pretool"], capture_output=True, text=True,
+                           timeout=60, input=big)  # over the old 1 MiB read cap, which failed open
+        self.assertIn('"permissionDecision": "deny"', p.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

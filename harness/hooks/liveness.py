@@ -106,6 +106,18 @@ def disposition_live(disp: dict | None, now: float, last_activity: float = 0.0, 
     return (last_activity > at) or (now - at < RESUMED_GRACE_S)
 
 
+NOTE_WAIT_MAX_S = 24 * 3600  # a "waiting on <x>" WAL note holds at most this long after it was written (round 5,
+# MJ-1). liveness cannot confirm a ticket exists, so every note wait gets the unconfirmed cap; a longer wait is an
+# `ah task dispose --kind waiting`, which checks the ask or ticket and allows up to 7 days.
+
+
+def note_wait(note: str, note_at: float, now: float):
+    """waiting_on(note) while the note is younger than NOTE_WAIT_MAX_S; None once it has expired."""
+    if not note_at or now - note_at >= NOTE_WAIT_MAX_S:
+        return None
+    return waiting_on(note)
+
+
 TASK_ABANDON_S = 6 * 3600  # a task-named WAL (no process behind it) silent this long without a terminal note is DROPPED
 
 
@@ -116,7 +128,7 @@ def classify_task_wal(now: float, last_at: float, outcome: str | None, last_note
         return {"state": "done", "idle_s": idle, "severity": "info"}
     if outcome == "handoff":
         return {"state": "handoff", "idle_s": idle, "severity": "info"}
-    wait = waiting_on(last_note)
+    wait = note_wait(last_note, last_at, now)
     if wait:
         return {"state": f"waiting-on-{wait}", "idle_s": idle, "severity": "info"}
     if idle >= TASK_ABANDON_S:
@@ -140,7 +152,7 @@ def classify(now: float, last_wal: float, transcript_mtime: float, stopped: bool
         elif outcome == "handoff":
             state = "handoff"
         else:
-            wait = waiting_on(last_note)
+            wait = note_wait(last_note, last_wal, now)  # the note is the last WAL entry
             if wait:
                 state = f"waiting-on-{wait}"
             else:
