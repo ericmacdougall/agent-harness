@@ -283,15 +283,21 @@ class Grants(Case):
         self.assertDenied(self.CMD)
 
     def test_source_lookup_ignores_claude_config_dir(self):
+        # the answer lives only under CLAUDE_CONFIG_DIR: a lookup that honoured it would grant (mutant M23)
+        question, label = "Delete on %s?" % self.TARGET, "Yes, run the delete on %s" % self.TARGET
+        source = self.answer(question, label)
+        in_home = self.home / ".claude/projects/p" / (SID + ".jsonl")
         fake = self.home / "fake-claude"
         (fake / "projects/x").mkdir(parents=True)
-        uid = str(uuid.uuid4())
-        (fake / "projects/x" / (SID + ".jsonl")).write_text(json.dumps({
-            "type": "user", "uuid": uid, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "origin": {"kind": "human"}, "message": {"content": "yes, delete on %s" % self.TARGET}}) + "\n")
+        moved = fake / "projects/x" / (SID + ".jsonl")
+        moved.write_text(in_home.read_text())
+        in_home.write_text("")
         os.environ["CLAUDE_CONFIG_DIR"] = str(fake)
         with self.assertRaises(ValueError):
-            pdg.grant("user:%s/%s" % (SID, uid), self.TARGET, str(self.wal), home=str(self.home))
+            pdg.grant(source, self.TARGET, str(self.wal), home=str(self.home))
+        # control: the same answer under <home>/.claude grants, so the refusal above is about the location
+        in_home.write_text(moved.read_text())
+        pdg.grant(source, self.TARGET, str(self.wal), home=str(self.home))
 
     def test_corrupt_unreadable_or_unkeyed_store_denies(self):
         # native review F4: these used to give "ask"
@@ -568,6 +574,13 @@ class Round3(Case):
 
 class Round4(Case):
     """Native delta re-review of ca56501 (hk-wave1-r3-ca56501.md): B1-B7 and N1."""
+
+    def test_b4_database_past_the_option_scan_bound_fails_closed(self):
+        # past AFTER_SCAN option words the guard cannot tell which database psql uses: a delete denies (M49)
+        many = "psql " + "-v a=b " * 200 + "devdb -c 'DELETE FROM users'"
+        self.assertDenied(many)
+        self.assertIn("too long to judge its database", pdg.evaluate(bash(many), home=str(self.home))[1])
+        self.assertAllowed("psql " + "-v a=b " * 5 + "devdb -c 'DELETE FROM users'")  # control: within the bound
 
     def test_source_compiles_without_warnings(self):
         # dev2 (Python 3.12) printed "SyntaxWarning: invalid escape sequence" on every hook run
