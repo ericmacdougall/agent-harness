@@ -1144,7 +1144,8 @@ class Round4(NoBackupCase):
     def test_rb_only_the_exact_no_backup_label_approves(self):
         for label in ('Delete after backing up to Dropbox', 'Delete once the Dropbox copy is verified',
                       'Delete only if a backup exists', 'Delete with a backup first', 'Delete (back up first)',
-                      'Delete? No, back it up', 'Delete', 'Delete it, no backup please'):
+                      'Delete? No, back it up', 'Delete', 'Delete it, no backup please',
+                      'Delete, no backups exist so archive first', 'Delete, no backup (Recommended) after archiving'):
             with self.subTest(label=label):
                 path = self.image('rb-%d.dmg' % abs(hash(label)))
                 uid = self.real(path, answer=label, options=(label, 'Leave them'))
