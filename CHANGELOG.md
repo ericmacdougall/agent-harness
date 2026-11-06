@@ -15,6 +15,14 @@ group by pull request.
   budget (kit `disk_budget_gib` up to 20), alerts `disk:owner:<agent>` by name and writes
   `state/disk-budget/<agent>.json`; an over-budget owner cannot start a heavy copy. Nothing is killed or deleted.
   `install_codex.py` installs the guard for Codex (trust it in Codex `/hooks`).
+- Heavy families off the Mac (goodqa#14817). `heavy_job_guard.py` now denies package installs (pnpm/npm/yarn/bun),
+  replay/synthetic/stress/soak scripts and `k6 run`, docker/podman run, pull and compose up (remote engines are
+  allowed), and backgrounded or looped `claude -p` (unquoted `&` only; the cap plus `HARNESS_LOCAL_OK` is the
+  escape). `xargs -P` and `parallel` fan-out is enforced too. Each denial prints a runnable route: copy the
+  checkout, then `ssh HOST bash -lc '<whole command>'`. Default host `t2-dev` (`HARNESS_ROUTE_HOST`); headless
+  claude goes to `dev2` (`HARNESS_CLAUDE_ROUTE_HOST`) because claude is not logged in on t2-dev. Not covered:
+  pip/uv/bundle installs, `codex exec`, `claude -p` in nested shells. `exempt_hosts` in `heavy_job_guard.json`
+  switches the guard off on a heavy-work host such as the Mac mini.
 - `command_guard.py`: `rm` of a top-level git clone needs no Dropbox backup when git proves it clean, with nothing
   untracked, and every local commit reachable from a remote-tracking ref that matches the live remote
   (`reproducible_clone` policy). Any doubt keeps the existing approve-delete rule.
