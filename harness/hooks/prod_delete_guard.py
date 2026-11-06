@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PreToolUse hook: refuse destructive SQL aimed at a PRODUCTION database unless a recorded,
+r"""PreToolUse hook: refuse destructive SQL aimed at a PRODUCTION database unless a recorded,
 user-sourced, signed grant names that exact database (goodqa#14908, ported from Hawkeye's
 hawkeye-prod-delete-guard.py).
 

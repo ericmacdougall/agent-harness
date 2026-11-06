@@ -569,6 +569,14 @@ class Round3(Case):
 class Round4(Case):
     """Native delta re-review of ca56501 (hk-wave1-r3-ca56501.md): B1-B7 and N1."""
 
+    def test_source_compiles_without_warnings(self):
+        # dev2 (Python 3.12) printed "SyntaxWarning: invalid escape sequence" on every hook run
+        import warnings
+        source = (HOOKS / "prod_delete_guard.py").read_text()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            compile(source, "prod_delete_guard.py", "exec")
+
     def sql(self, name, text):
         (self.home / name).write_text(text)
         return self.home / name
