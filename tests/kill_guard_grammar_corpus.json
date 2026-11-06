@@ -5544,6 +5544,272 @@
    "id": "WSOK-059",
    "shape": "WSOK",
    "why": "text down a pipe that is not read as a program must stay allowed"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" kill 4004",
+   "expect": "block",
+   "id": "EH-001",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" pkill -f x",
+   "expect": "block",
+   "id": "EH-002",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=(); ${K[@]} kill 4004",
+   "expect": "block",
+   "id": "EH-003",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=(); ${K[*]} kill 4004",
+   "expect": "block",
+   "id": "EH-004",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=(); \"${K[*]}\" kill 4004",
+   "expect": "block",
+   "id": "EH-005",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=(); $K[@] kill 4004",
+   "expect": "block",
+   "id": "EH-006",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "declare -a K=(); \"${K[@]}\" kill 4004",
+   "expect": "block",
+   "id": "EH-007",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=(x); K=(); \"${K[@]}\" kill 4004",
+   "expect": "block",
+   "id": "EH-008",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "P=(sudo); [ \"$EUID\" -eq 0 ] && P=(); \"${P[@]}\" pkill -f node",
+   "expect": "block",
+   "id": "EH-009",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" killall node",
+   "expect": "block",
+   "id": "EH-010",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" sudo kill 4004",
+   "expect": "block",
+   "id": "EH-011",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" systemctl kill foo",
+   "expect": "block",
+   "id": "EH-012",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "P=(); \"${P[@]}\" timeout 5 kill 4004",
+   "expect": "block",
+   "id": "EH-013",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" sh -c 'kill 4004'",
+   "expect": "block",
+   "id": "EH-014",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=; $K pkill -f x",
+   "expect": "block",
+   "id": "EH-015",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=; $K kill 4004",
+   "expect": "block",
+   "id": "EH-016",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=''; ${K} kill 4004",
+   "expect": "block",
+   "id": "EH-017",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=\" \"; $K kill 4004",
+   "expect": "block",
+   "id": "EH-018",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" \"${K[@]}\" kill 4004",
+   "expect": "block",
+   "id": "EH-019",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=(); echo \"kill 4004\" | \"${K[@]}\" bash",
+   "expect": "block",
+   "id": "EH-020",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=; echo \"kill 4004\" | $K bash",
+   "expect": "block",
+   "id": "EH-021",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=(); printf 'pkill -f x\\n' | \"${K[@]}\" sh",
+   "expect": "block",
+   "id": "EH-022",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=(); echo \"kill 4004\" | timeout 5 \"${K[@]}\" bash",
+   "expect": "block",
+   "id": "EH-023",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=(); xargs kill < pids.txt; \"${K[@]}\" kill 4004",
+   "expect": "block",
+   "id": "EH-024",
+   "shape": "EH",
+   "why": "a held value that expands to nothing leaves the next word as the command, which must be judged"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" echo hello",
+   "expect": "allow",
+   "id": "EHOK-001",
+   "shape": "EHOK",
+   "why": "an empty held head before a harmless command must stay allowed"
+  },
+  {
+   "cmd": "K=; $K ls",
+   "expect": "allow",
+   "id": "EHOK-002",
+   "shape": "EHOK",
+   "why": "an empty held head before a harmless command must stay allowed"
+  },
+  {
+   "cmd": "K=(); echo hello | \"${K[@]}\" bash",
+   "expect": "allow",
+   "id": "EHOK-003",
+   "shape": "EHOK",
+   "why": "an empty held head before a harmless command must stay allowed"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" printf 'kill 4004\\n'",
+   "expect": "allow",
+   "id": "EHOK-004",
+   "shape": "EHOK",
+   "why": "an empty held head before a harmless command must stay allowed"
+  },
+  {
+   "cmd": "K=; echo \"kill 4004\" | $K cat",
+   "expect": "allow",
+   "id": "EHOK-005",
+   "shape": "EHOK",
+   "why": "an empty held head before a harmless command must stay allowed"
+  },
+  {
+   "cmd": "K=(); echo \"kill 4004\" | \"${K[@]}\" grep kill",
+   "expect": "allow",
+   "id": "EHOK-006",
+   "shape": "EHOK",
+   "why": "an empty held head before a harmless command must stay allowed"
+  },
+  {
+   "cmd": "K=(); \"${K[@]}\" git status",
+   "expect": "allow",
+   "id": "EHOK-007",
+   "shape": "EHOK",
+   "why": "an empty held head before a harmless command must stay allowed"
+  },
+  {
+   "cmd": "P=(); \"${P[@]}\" ls -la",
+   "expect": "allow",
+   "id": "EHOK-008",
+   "shape": "EHOK",
+   "why": "an empty held head before a harmless command must stay allowed"
+  },
+  {
+   "cmd": "K=(env); (K=(which)); \"${K[@]}\" kill 4004",
+   "expect": "block",
+   "id": "XH-001",
+   "shape": "XH",
+   "why": "a lookup or print exemption must not apply to a held name, whose value the guard only guesses"
+  },
+  {
+   "cmd": "K=(env); (K=(type)); \"${K[@]}\" kill 4004",
+   "expect": "block",
+   "id": "XH-002",
+   "shape": "XH",
+   "why": "a lookup or print exemption must not apply to a held name, whose value the guard only guesses"
+  },
+  {
+   "cmd": "K=(env); (K=(hash)); \"${K[@]}\" kill 4004",
+   "expect": "block",
+   "id": "XH-003",
+   "shape": "XH",
+   "why": "a lookup or print exemption must not apply to a held name, whose value the guard only guesses"
+  },
+  {
+   "cmd": "K=(env); (K=(whereis)); \"${K[@]}\" kill 4004",
+   "expect": "block",
+   "id": "XH-004",
+   "shape": "XH",
+   "why": "a lookup or print exemption must not apply to a held name, whose value the guard only guesses"
+  },
+  {
+   "cmd": "K=(kill); (K=(echo)); \"${K[@]}\" 4002(N) 4004",
+   "expect": "block",
+   "id": "XH-005",
+   "shape": "XH",
+   "why": "a lookup or print exemption must not apply to a held name, whose value the guard only guesses"
+  },
+  {
+   "cmd": "K=(kill); (K=(printf)); \"${K[@]}\" 4002(N) 4004",
+   "expect": "block",
+   "id": "XH-006",
+   "shape": "XH",
+   "why": "a lookup or print exemption must not apply to a held name, whose value the guard only guesses"
   }
  ]
 }

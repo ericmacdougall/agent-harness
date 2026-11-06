@@ -71,7 +71,8 @@ STOP_COMMANDS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'echo', 'printf', 'cat', 
                  'python', 'python3', 'node', 'ruby', 'perl', 'sleep', 'true', 'false', 'test', 'wc', 'sort', 'uniq',
                  'tee', 'diff', 'find', 'curl', 'wget', 'pytest', 'ssh', 'scp', 'rsync', 'tar', 'zip', 'unzip', 'date'}
 NAME_FIRST = {'gosu', 'chroot', 'flock', 'sg', 'su', 'runuser'}  # gosu git bash: the first operand is no command
-OVERRIDDEN = ('apply', 'command', 'inner_words', 'script', 'ssh', 'container', 'check_tokens', 'resolve', 'bind_loop_var')
+OVERRIDDEN = ('apply', 'command', 'dispatch', 'inner_words', 'script', 'ssh', 'container', 'check_tokens', 'resolve',
+              'bind_loop_var')
 
 DEFAULT_POLICY = {
     'mode': 'enforce',
@@ -683,6 +684,8 @@ def make_analyzer_class(cg):
         def reads_program(self, words):
             """True when this pipeline stage runs its stdin as shell code."""
             words = self._skip_assigns(cg.strip_reserved(words))[1]
+            while words and self.expands_to_nothing(words[0]):  # K=(); ... | "${K[@]}" bash: bash is the command
+                words = words[1:]
             if not words:
                 return False
             picked = self.picked_elements(words[0])
@@ -737,6 +740,26 @@ def make_analyzer_class(cg):
                         return False
             return False
 
+        def expands_to_nothing(self, word):
+            """A plain expansion of a known, empty or blank value: `K=(); "${K[@]}"`, `${K[*]}`, zsh `$K[@]`, `K=; $K`,
+            `${K}`. The shell drops it (or fails on it), so the word after it is the command; judging that word errs only
+            towards a refusal. `${K:-x}` and other operators, a picked element and an unknown name do not count."""
+            if not word.vars or word.subs or any(a.strip() for a in word.alts):
+                return False
+            plain = r'"?(?:\$\{?([A-Za-z_][A-Za-z0-9_]*)(?:\[[@*]\])?\}?|\$([A-Za-z_][A-Za-z0-9_]*)\[[@*]\])"?'
+            match = re.fullmatch(plain, word.raw or '')
+            if not match:
+                return False
+            name = match.group(1) or match.group(2)
+            return name in self.ctx.vars and name not in self.ctx.tainted and not self.ctx.vars[name].strip()
+
+        def dispatch(self, words, cmd, pl, idx, depth):
+            while words and self.expands_to_nothing(words[0]):  # P=(sudo); [ root ] && P=(); "${P[@]}" pkill -f node
+                words = words[1:]
+            if not words:
+                return None
+            return super().dispatch(words, cmd, pl, idx, depth)
+
         @staticmethod
         def shell_splits(word):
             """A held value is split into words only when it came from an unquoted variable, or from a quoted `[@]` or `[*]`.
@@ -790,8 +813,8 @@ def make_analyzer_class(cg):
                 bodies = [r.body or (r.target.text if r.op == '<<<' and r.target is not None else '') for r in cmd.redirs]
             rest = self._skip_assigns(words)[1]
             name = cg.norm_name(rest[0].text) if rest else ''
-            if not fed and (not rest or name in INERT_COMMANDS):
-                return
+            if not fed and (not rest or (name in INERT_COMMANDS and not rest[0].vars)):
+                return  # a held name is only the guard's guess of the value: K=(kill); (K=(echo)); "${K[@]}" 4002(N)
             if self.names_kill(' '.join([p for w in words for p in (w.text, w.raw or '', *w.subs)] + bodies)):
                 self.block(rule, reason)
                 return
@@ -894,9 +917,9 @@ def make_analyzer_class(cg):
             if name.startswith('g') and name[1:] in GNU_PREFIXED:
                 return self.apply(name[1:], words, cmd, pl, idx, depth)  # Homebrew coreutils: gtimeout, gxargs ...
             args = words[1:]
-            if name in ('command', 'builtin', 'type', 'which', 'whereis', 'hash') and (
+            if name in ('command', 'builtin', 'type', 'which', 'whereis', 'hash') and not words[0].vars and (
                     name in ('type', 'which', 'whereis', 'hash') or leading_lookup(args)):
-                return None  # asks where a program is; runs nothing
+                return None  # asks where a program is; runs nothing. Not for a held name: K=(env); (K=(which)); "${K[@]}"
             if name in ('export', 'declare', 'local', 'readonly', 'typeset'):
                 for a in args:
                     if '=' in a.text and not a.dynamic and not a.text.startswith('-'):
