@@ -371,6 +371,10 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         td = disp.get(agent_id)
         if td and td.get("kind") == "reassigned":
             return covered(td.get("ref"), seen + (agent_id,))
+        if td and td.get("kind") == "resumed" and t["state"] != "DROPPED":
+            # `resumed` stays live once any later activity exists; a target that resumed and then finished (done,
+            # handoff, returned) holds no wait, so only a named wait or closed excuses it (PR #107 review F1)
+            return False
         return liveness.disposition_live(td, now, last_activity=parse_ts(t["last_activity"]) or 0.0)
 
     for r in rows:

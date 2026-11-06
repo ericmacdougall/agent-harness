@@ -257,6 +257,25 @@ class ReassignInheritsTargetWait(Base):
         self.wait("doneowner", "key-tw-7-0000", NOW + 60, ref="GoodQA goodqa#14883")
         self.assertIn("dropowner", self.owners(now=NOW + 61)["undisposed"])  # the inherited wait expires with it
 
+    def test_stale_resumed_on_a_done_target_does_not_cover(self):
+        """PR #107 review F1: `resumed` stays live forever once later activity exists; a target that resumed, then
+        finished, holds no wait and must not excuse work reassigned to it."""
+        self.add_done_target()
+        ah.write(self.home, "task.dispose", {"agent": "doneowner", "session": SESSION, "kind": "resumed",
+                                             "at": iso(NOW - 5000)}, SESSION, "key-tw-8-0000")
+        self.dispose("reassigned", "key-tw-r8-0000", ref="doneowner")
+        by = {r["agent_id"]: r for r in self.owners()["owners"]}
+        self.assertEqual(by["doneowner"]["state"], "done")
+        self.assertIn("dropowner", self.owners()["undisposed"])
+
+    def test_closed_done_target_covers_by_design(self):
+        self.add_done_target()
+        ah.write(self.home, "task.dispose", {"agent": "doneowner", "session": SESSION, "kind": "closed",
+                                             "at": iso(NOW), "reason": "work needs no owner",
+                                             "evidence": "GoodQA goodqa#14883"}, SESSION, "key-tw-9-0000")
+        self.dispose("reassigned", "key-tw-r9-0000", ref="doneowner")
+        self.assertNotIn("dropowner", self.owners()["undisposed"])
+
 
 class SubagentStopGate(Base):
     """I7: a sub-agent cannot end its turn with pending work and no armed waiter (desktop release owner, 2026-11-05)."""
