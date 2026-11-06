@@ -176,13 +176,60 @@ class ReviewRound1(Base):
         with mock.patch.dict(os.environ, {"AH_NOW": str(NOW + 10 * 365 * 86400)}):
             self.assertNotIn("AH_NOW", ah.server_now.__doc__ or "")
             self.assertEqual(int(ah.parse_ts(ah.server_now())), int(NOW))  # the patched writer clock, not the env
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_CHILD_SESSION": "1"}, clear=False):
-            os.environ.pop("AH_AGENT_ID", None)
+        with mock.patch.dict(os.environ, {"AH_AGENT_ID": "handoffowner"}):  # the owner itself, by its declared id
             with self.assertRaises(ah.AhError) as cm:
                 ah.write(self.home, "task.dispose", {"agent": "handoffowner", "session": SESSION, "kind": "resumed", "at": iso(NOW)},
-                         SESSION, "child-ack-01")
+                         SESSION, "self-ack-01")
             self.assertEqual(cm.exception.code, "forbidden")
-        self.assertEqual(ah.actor_id(), "unknown") if not os.environ.get("AGENT_ID") else None
+        self.assertEqual(ah.actor_id(), "unknown")
+
+    def test_main_shell_environment_can_acknowledge(self):
+        """Round 3 B1: main's own shell carries CLAUDE_CODE_CHILD_SESSION=1 and the _agent AI_AGENT suffix (observed in
+        main's shell); with that exact environment main must be able to resume, and the audit must not claim "main"."""
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_CHILD_SESSION": "1", "AI_AGENT": "claude-code_2-1-318_agent"}):
+            r = ah.write(self.home, "task.dispose", {"agent": "handoffowner", "session": SESSION, "kind": "resumed", "at": iso(NOW)},
+                         SESSION, "main-ack-01")
+        self.assertEqual(r["result"], "applied")
+        audit = [json.loads(x) for x in (ah.store_dir(self.home) / "audit.jsonl").read_text().splitlines()]
+        self.assertEqual(audit[-1]["actor"]["agent_id"], "unknown")  # never a claimed "main"
+
+    def test_pretool_hook_denies_a_sub_agent_acknowledgement_by_payload_identity(self):
+        import dropped_gate
+        cmd = "python3 ~/.claude/hooks/ah.py task dispose --agent a1b2c3d4e5f6a7b8c --kind {} --reason x"
+        for kind in ("resumed", "reassigned", "closed"):
+            out = dropped_gate.cmd_pretool({"tool_name": "Bash", "agent_id": "a1b2c3d4e5f6a7b8c",
+                                            "tool_input": {"command": cmd.format(kind)}})
+            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny", kind)
+        out = dropped_gate.cmd_pretool({"tool_name": "Bash", "agent_id": "a1", "tool_input": {"command": cmd.format("waiting")}})
+        self.assertEqual(out, {})  # a wait is open to everyone
+        out = dropped_gate.cmd_pretool({"tool_name": "Bash", "tool_input": {"command": cmd.format("closed")}})
+        self.assertEqual(out, {})  # main: no agent_id in the payload
+        out = dropped_gate.cmd_pretool({"tool_name": "Bash", "agent_id": "a1", "tool_input": {"command": "ah task list"}})
+        self.assertEqual(out, {})
+        p = subprocess.run([sys.executable, str(HOOKS / "dropped_gate.py"), "pretool"], capture_output=True, text=True, timeout=30,
+                           input=json.dumps({"tool_name": "Bash", "agent_id": "a1", "tool_input": {"command": cmd.format("closed")}}))
+        self.assertIn('"permissionDecision": "deny"', p.stdout)
+
+    def test_a_wait_is_bounded_and_its_ticket_must_exist(self):
+        """Round 3 M-b: `waiting` was the open path with no upper bound and any ticket text."""
+        def wait(until, ref, key):
+            return ah.write(self.home, "task.dispose", {"agent": "handoffowner", "session": SESSION, "kind": "waiting",
+                                                        "at": iso(NOW), "until": iso(until), "ref": ref}, SESSION, key)
+        with mock.patch.object(ah, "_ticket_exists", return_value=True, create=True):
+            with self.assertRaises(ah.AhError):
+                wait(NOW + 30 * 86400, "GoodQA goodqa#14791", "wait-long-01")
+            self.assertEqual(wait(NOW + 6 * 86400, "GoodQA goodqa#14791", "wait-ok-01")["result"], "applied")
+        with mock.patch.object(ah, "_ticket_exists", return_value=False, create=True):
+            with self.assertRaises(ah.AhError):
+                wait(NOW + 3600, "GoodQA goodqa#99999999", "wait-noticket-01")
+        with mock.patch.object(ah, "_ticket_exists", return_value=None, create=True):  # GoodQA unreachable: short waits only
+            with self.assertRaises(ah.AhError):
+                wait(NOW + 2 * 86400, "GoodQA goodqa#14791", "wait-unver-01")
+            self.assertEqual(wait(NOW + 12 * 3600, "GoodQA goodqa#14791", "wait-unver-02")["result"], "applied")
+            with self.assertRaises(ah.AhError):  # a caller cannot clear the flag to get the long cap
+                ah.write(self.home, "task.dispose", {"agent": "handoffowner", "session": SESSION, "kind": "waiting", "at": iso(NOW),
+                                                     "until": iso(NOW + 3 * 86400), "ref": "GoodQA goodqa#14791",
+                                                     "ref_unverified": False}, SESSION, "wait-unver-03")
 
     def test_unknown_deadline_id_is_refused(self):
         with self.assertRaises(ah.AhError) as cm:
@@ -245,6 +292,16 @@ class PruneGuardDepth(unittest.TestCase):
             (deep / "src" / "pkg" / "mod" / "sub").mkdir(parents=True)
             self.git("push", "-q", "origin", "HEAD:refs/heads/wtbranch", cwd=wt, env=env)
             overrun = [f for f in workdir._unpushed_repos(task) if "depth overrun" in f["reason"]]
+            # round 3 M-a: a gitignored nested clone inside a pushed checkout keeps its own unpushed history
+            (deep / ".gitignore").write_text("third_party/\n")
+            nested = deep / "third_party" / "lib"
+            nested.mkdir(parents=True)
+            self.git("init", "-q", cwd=nested, env=env)
+            (nested / "f").write_text("only copy")
+            self.git("add", "f", cwd=nested, env=env)
+            self.git("commit", "-q", "-m", "local only", cwd=nested, env=env)
+            nested_found = [f["repo"] for f in workdir._unpushed_repos(task) if f["reason"] == "unpushed commits"]
+        self.assertIn(str(nested), nested_found)
         self.assertEqual([f for f in overrun if f["repo"].startswith(str(deep))], [])  # nothing inside the checkout
         self.assertEqual([f["repo"] for f in overrun], [str(task / "x" / "y" / "z")])  # the plain deep dir still is
 

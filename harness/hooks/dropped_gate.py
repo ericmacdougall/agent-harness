@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -187,6 +188,25 @@ def cmd_subagent_stop(payload: dict, now: float | None = None) -> dict:
     return {"systemMessage": "dropped-owner gate: " + text + " It is now DROPPED and needs a disposition."}
 
 
+ACK_DISPOSE = re.compile(r"task[\s._-]+dispose\b(?=.*--kind[\s=]+[\"']?(?:resumed|reassigned|closed|legacy)\b)", re.S)
+
+
+def cmd_pretool(payload: dict) -> dict:
+    """PreToolUse(Bash): a sub-agent (the payload carries its agent_id) may not resume, reassign or close an owner;
+    main records those. A wait (`--kind waiting`) stays open to everyone. The identity is the hook's, not the
+    shell's: main's shell carries the same environment as a sub-agent's (review round 3, B1). The text match is
+    advisory against an agent that hides the call; the dispose guard's evidence and burst rules do not rely on it."""
+    if not payload.get("agent_id") or payload.get("tool_name") != "Bash":
+        return {}
+    cmd = str((payload.get("tool_input") or {}).get("command") or "")
+    if not ACK_DISPOSE.search(cmd):
+        return {}
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": "dropped-owner gate (goodqa#14791): a sub-agent cannot "
+                                   "resume, reassign or close an owner, its own or another's; main records that. "
+                                   "Record what you wait on with `ah task dispose --kind waiting`, or write a handoff."}}
+
+
 def main(argv=None) -> int:
     try:
         import safe_input  # noqa: PLC0415
@@ -196,7 +216,8 @@ def main(argv=None) -> int:
     mode = (argv or sys.argv[1:] or ["stop"])[0]
     try:
         payload = payload if isinstance(payload, dict) else {}
-        out = cmd_subagent_stop(payload) if mode == "subagent-stop" else cmd_stop(payload)
+        out = (cmd_subagent_stop(payload) if mode == "subagent-stop" else cmd_pretool(payload) if mode == "pretool"
+               else cmd_stop(payload))
     except Exception as exc:  # noqa: BLE001 - a gate crash must not block the turn silently
         out = {"systemMessage": f"dropped-owner gate failed open ({type(exc).__name__})"}
     if out:
