@@ -747,12 +747,8 @@ def make_analyzer_class(cg):
             refusal. Decided on the resolved value, not the spelling: the word expands variables, no command
             substitution, every resolved alternative is blank, and every variable it reads is known and untainted. An
             unknown name resolves to `$NAME`, and `${K:-x}`, `${K[0]}`, `${!K}` and `${#K}` resolve to their text or a
-            marker, so none of them is blank and none is dropped. Blank means the shell's IFS characters, not Python's
-            whitespace (review F2 of dbb54ee): `K=$'\v'; $K` names a command. With IFS assigned its characters count
-            as blank too; dropping a word the shell keeps only moves the judgment to the next word, which errs towards
-            a refusal, while keeping one the shell drops would hide the command."""
-            blank = ' \t\n' + str(self.ctx.vars.get('IFS') or '')
-            if not word.vars or word.subs or any(a.strip(blank) for a in word.alts):
+            marker, so none of them is blank and none is dropped."""
+            if not word.vars or word.subs or any(a.strip() for a in word.alts):
                 return False
             return all(v in self.ctx.vars and v not in self.ctx.tainted for v in word.vars)
 

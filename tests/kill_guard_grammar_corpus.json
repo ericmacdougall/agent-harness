@@ -6120,88 +6120,74 @@
    "why": "behind a wrapper, a head that expands to nothing is dropped on the inner-words path; a kill verb among the next two words is still refused, as main refuses it"
   },
   {
-   "cmd": "K=$'\\v'; $K grep kill",
-   "expect": "allow",
-   "id": "EIFOK-001",
-   "shape": "EIFOK",
-   "why": "a vertical tab or form feed is not an IFS character, so the shell runs that word as the command name (not found); Python whitespace must not make it an empty head (review F2)"
-  },
-  {
-   "cmd": "K=$'\\f'; $K which pkill",
-   "expect": "allow",
-   "id": "EIFOK-002",
-   "shape": "EIFOK",
-   "why": "a vertical tab or form feed is not an IFS character, so the shell runs that word as the command name (not found); Python whitespace must not make it an empty head (review F2)"
-  },
-  {
-   "cmd": "K=$'\\v'; $K echo kill 4004",
-   "expect": "allow",
-   "id": "EIFOK-003",
-   "shape": "EIFOK",
-   "why": "a vertical tab or form feed is not an IFS character, so the shell runs that word as the command name (not found); Python whitespace must not make it an empty head (review F2)"
-  },
-  {
    "cmd": "IFS=,; K=(); \"${K[@]}\" kill 4004",
    "expect": "block",
    "id": "EIF-001",
    "shape": "EIF",
-   "why": "with IFS assigned, an empty or IFS-only head still vanishes and the kill verb after it runs; its characters count as blank (review F2)"
+   "why": "with IFS assigned, a head that holds nothing still vanishes and the kill verb after it runs; a value made of IFS letters is not dropped, since a quoted or zsh expansion is never split (review F4 of efe22db)"
   },
   {
    "cmd": "K=(); IFS=,; \"${K[@]}\" kill 4004",
    "expect": "block",
    "id": "EIF-002",
    "shape": "EIF",
-   "why": "with IFS assigned, an empty or IFS-only head still vanishes and the kill verb after it runs; its characters count as blank (review F2)"
-  },
-  {
-   "cmd": "IFS=x; K=x; $K kill 4004",
-   "expect": "block",
-   "id": "EIF-003",
-   "shape": "EIF",
-   "why": "with IFS assigned, an empty or IFS-only head still vanishes and the kill verb after it runs; its characters count as blank (review F2)"
+   "why": "with IFS assigned, a head that holds nothing still vanishes and the kill verb after it runs; a value made of IFS letters is not dropped, since a quoted or zsh expansion is never split (review F4 of efe22db)"
   },
   {
    "cmd": "IFS=,; K=; $K pkill -f x",
    "expect": "block",
    "id": "EIF-004",
    "shape": "EIF",
-   "why": "with IFS assigned, an empty or IFS-only head still vanishes and the kill verb after it runs; its characters count as blank (review F2)"
+   "why": "with IFS assigned, a head that holds nothing still vanishes and the kill verb after it runs; a value made of IFS letters is not dropped, since a quoted or zsh expansion is never split (review F4 of efe22db)"
   },
   {
    "cmd": "IFS=,; K=(); \"${K[@]}\" nocache kill 4004",
    "expect": "block",
    "id": "EIF-005",
    "shape": "EIF",
-   "why": "with IFS assigned, an empty or IFS-only head still vanishes and the kill verb after it runs; its characters count as blank (review F2)"
-  },
-  {
-   "cmd": "K=$'\\v'; $K ls",
-   "expect": "allow",
-   "id": "EIFOK-004",
-   "shape": "EIFOK",
-   "why": "a vertical tab or form feed is not an IFS character, so the shell runs that word as the command name (not found); Python whitespace must not make it an empty head (review F2)"
-  },
-  {
-   "cmd": "IFS=,; K=(); \"${K[@]}\" ls",
-   "expect": "allow",
-   "id": "EIFOK-005",
-   "shape": "EIFOK",
-   "why": "a vertical tab or form feed is not an IFS character, so the shell runs that word as the command name (not found); Python whitespace must not make it an empty head (review F2)"
-  },
-  {
-   "cmd": "K=$'\\f'; $K cat notes.txt",
-   "expect": "allow",
-   "id": "EIFOK-006",
-   "shape": "EIFOK",
-   "why": "a vertical tab or form feed is not an IFS character, so the shell runs that word as the command name (not found); Python whitespace must not make it an empty head (review F2)"
+   "why": "with IFS assigned, a head that holds nothing still vanishes and the kill verb after it runs; a value made of IFS letters is not dropped, since a quoted or zsh expansion is never split (review F4 of efe22db)"
   },
   {
    "cmd": "IFS=,; K=(); \"${K[@]}\" echo kill 4004",
    "expect": "block",
    "id": "EIF-006",
    "shape": "EIF",
-   "why": "with IFS assigned, an empty or IFS-only head still vanishes and the kill verb after it runs; its characters count as blank (review F2)"
+   "why": "with IFS assigned, a head that holds nothing still vanishes and the kill verb after it runs; a value made of IFS letters is not dropped, since a quoted or zsh expansion is never split (review F4 of efe22db)"
+  },
+  {
+   "cmd": "IFS=kil; K=kill; \"$K\" 4004",
+   "expect": "block",
+   "id": "EIF-007",
+   "shape": "EIF",
+   "why": "with IFS assigned, a head that holds nothing still vanishes and the kill verb after it runs; a value made of IFS letters is not dropped, since a quoted or zsh expansion is never split (review F4 of efe22db)"
+  },
+  {
+   "cmd": "IFS=kil; K=(kill); \"${K[@]}\" 4004",
+   "expect": "block",
+   "id": "EIF-008",
+   "shape": "EIF",
+   "why": "with IFS assigned, a head that holds nothing still vanishes and the kill verb after it runs; a value made of IFS letters is not dropped, since a quoted or zsh expansion is never split (review F4 of efe22db)"
+  },
+  {
+   "cmd": "IFS=kil; K=kill; $K 4004",
+   "expect": "block",
+   "id": "EIF-009",
+   "shape": "EIF",
+   "why": "with IFS assigned, a head that holds nothing still vanishes and the kill verb after it runs; a value made of IFS letters is not dropped, since a quoted or zsh expansion is never split (review F4 of efe22db)"
+  },
+  {
+   "cmd": "IFS=pkil; K=pkill; \"$K\" node",
+   "expect": "block",
+   "id": "EIF-010",
+   "shape": "EIF",
+   "why": "with IFS assigned, a head that holds nothing still vanishes and the kill verb after it runs; a value made of IFS letters is not dropped, since a quoted or zsh expansion is never split (review F4 of efe22db)"
+  },
+  {
+   "cmd": "IFS=bash; S=bash; echo 'kill 4004' | \"$S\"",
+   "expect": "block",
+   "id": "EIF-011",
+   "shape": "EIF",
+   "why": "with IFS assigned, a head that holds nothing still vanishes and the kill verb after it runs; a value made of IFS letters is not dropped, since a quoted or zsh expansion is never split (review F4 of efe22db)"
   }
  ]
 }
