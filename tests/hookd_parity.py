@@ -181,7 +181,9 @@ def main(argv=None):
     rng = random.Random(args.seed)
     base = Path(tempfile.mkdtemp(prefix='hkp-', dir='/tmp' if os.path.isdir('/tmp') else None))
     os.chmod(base, 0o700)
-    home_a, home_b = scratch_home(base, 'a'), scratch_home(base, 'b')
+    # the same basename under different parents: guards print a directory's basename ("(a)" vs "(b)" made 68
+    # false diffs on t2-dev 2026-11-06), and normalize() only replaces the full HOME path
+    home_a, home_b = scratch_home(base / 'a', 'home'), scratch_home(base / 'b', 'home')
     run_dir = base / 'r'
     server = start_server(home_b, run_dir, base / 'hookd.log')
     diffs, n, served_fallbacks = [], 0, 0
@@ -213,7 +215,8 @@ def main(argv=None):
             shutil.rmtree(base, ignore_errors=True)
         if control_dir:
             shutil.rmtree(control_dir, ignore_errors=True)
-    summary = {'seed': args.seed, 'calls': n, 'diffs': len(diffs), 'server_fallbacks': served_fallbacks,
+    verdict_diffs = sum(1 for d in diffs if d['cold'][0] != d['server'][0] or d['cold'][1] != d['server'][1])
+    summary = {'seed': args.seed, 'calls': n, 'diffs': len(diffs), 'verdict_diffs': verdict_diffs, 'server_fallbacks': served_fallbacks,
                'cold_outcomes': outcomes, 'control': args.control,
                'cold_wall_s': round(t_cold, 2), 'server_wall_s': round(t_warm, 2), 'first_diffs': diffs[:5]}
     if args.report:
