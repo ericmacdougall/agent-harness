@@ -240,6 +240,8 @@ _HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 _WRAPPERS = {"env", "nice", "command", "exec", "time", "nohup", "timeout", "sudo", "stdbuf", "builtin"}
 _SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
 _RUNS_TEXT = re.compile(r"(?:^|[\s;&|(])(?:(?:ba|z|da|k)?sh|fish|python[0-9.]*|eval|source|\.)(?:\s|$)")
+_SHELL_C = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")  # a short-option cluster that carries -c
+_BACKTICK = re.compile(r"`([^`]*)`")
 _KIND_WORD = re.compile(r"\b(?:" + "|".join(ACK_KINDS) + r")\b")
 
 
@@ -291,9 +293,11 @@ def _acks(seg: list, depth: int = 0) -> bool:
                             or (i and seg[i - 1] in _WRAPPERS and (seg[i].startswith("-") or seg[i].isdigit()))
                             or (i and seg[i - 1] in ("-n", "-u") and seg[i].lstrip("-").isdigit())):
         i += 1
-    if i < len(seg) and (seg[i] == "eval" or (os.path.basename(seg[i]) in _SHELLS and "-c" in seg[i + 1:])):
-        rest = seg[i + 1:]
-        code = " ".join(rest[rest.index("-c") + 1:] if "-c" in rest else rest)
+    flag = None
+    if i < len(seg) and os.path.basename(seg[i]) in _SHELLS:  # `bash -c`, and clusters: `bash -lc`, `sh -ec` (24a786c F2)
+        flag = next((j for j in range(i + 1, len(seg)) if _SHELL_C.match(seg[j])), None)
+    if i < len(seg) and (seg[i] == "eval" or flag is not None):
+        code = " ".join(seg[flag + 1:] if flag is not None else seg[i + 1:])
         return acknowledges(code, depth + 1) if depth < 3 else ("dispose" in code and bool(_KIND_WORD.search(code)))
     if i < len(seg) and os.path.basename(seg[i]).startswith("python"):
         rest = seg[i + 1:]
@@ -323,7 +327,10 @@ def acknowledges(cmd: str, depth: int = 0) -> bool:
     an owner."""
     if len(cmd) > PRETOOL_MAX:
         return "dispose" in cmd and bool(_KIND_WORD.search(cmd))
-    segs = _segments(_strip_heredocs(cmd))
+    text = _strip_heredocs(cmd)
+    if depth < 3 and any(acknowledges(m.group(1), depth + 1) for m in _BACKTICK.finditer(text)):
+        return True  # `ah task dispose ...` in backticks runs too (24a786c F2); judged as its own command line
+    segs = _segments(text)
     if segs is None:
         return "dispose" in cmd and bool(_KIND_WORD.search(cmd))
     return any(_acks(s, depth) for s in segs if s)

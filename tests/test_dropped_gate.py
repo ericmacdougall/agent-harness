@@ -279,7 +279,10 @@ class ReassignInheritsTargetWait(Base):
         self.assertEqual(by["doneowner"]["state"], "done")
         self.assertIn("dropowner", self.owners()["undisposed"])
 
-    def test_closed_done_target_covers_by_design(self):
+    def test_closed_done_target_does_not_cover_a_later_reassignment(self):
+        """Was "covers by design" (PR #107). The PR review of 24a786c (F1) showed that a permanent disposition on the
+        target excused any later reassignment with none of the dispose guard's checks; main decided such a reassignment
+        is not covered (goodqa#14791)."""
         self.add_done_target()
         # The dispose guard: `closed` means deployed live and tested, both naming this owner (docs/ah-query-spec.md).
         w = self.home / ".claude" / "wals" / SESSION
@@ -293,7 +296,9 @@ class ReassignInheritsTargetWait(Base):
                                              "reason": "doneowner shipped slice one; health check on production passed"},
                  SESSION, "key-tw-9-0000")
         self.dispose("reassigned", "key-tw-r9-0000", ref="doneowner")
-        self.assertNotIn("dropowner", self.owners()["undisposed"])
+        undisposed = self.owners()["undisposed"]
+        self.assertIn("dropowner", undisposed)
+        self.assertNotIn("doneowner", undisposed)
 
 
 class SubagentStopGate(Base):

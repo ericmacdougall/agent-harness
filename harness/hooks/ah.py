@@ -378,31 +378,34 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         if d.get("kind") == "waiting" and ASK_ID_RE.match(str(d.get("ref") or "")) and asks.get(d["ref"]) != "open":
             d["until"] = min(float(d.get("until") or 0.0), float(d.get("at") or 0.0))  # answered: the wait is over
     # a returned parent with live children is still doing the work through them (main's finding: a4720127 and its 7
-    # reviewers), so it counts as live for a reassignment (dispose guard)
-    live_parents = {r["parent"] for r in rows if r.get("parent")
-                    and r["state"] not in ("DROPPED", "done", "handoff", "returned")}
+    # reviewers), so it counts as live for a reassignment (dispose guard). Only a child with recent activity counts:
+    # a crashed child stays idle-helper or SILENT for ever (PR review of 24a786c, F3)
+    live_parents = {r["parent"] for r in rows if r.get("parent") and r["state"] == "live"}
     by_id = {r["agent_id"]: r for r in rows}
 
     def covered(agent_id, seen=()):
         """A reassignment target holds the work when it is live, or is DROPPED but excused by its own live disposition
-        (a named wait, a fresh resume, closed, or a further reassignment). The chain is cycle-safe and each link
+        (a named wait, a fresh resume, or a further reassignment). The chain is cycle-safe and each link
         keeps its own expiry, so an inherited wait ends when the target's wait ends (goodqa#14791).
-        A `closed` target excuses work reassigned to it, by design: closing is the owner's permanent decision that
-        the work needs no owner. Reassigning to an owner therefore also hands over the right to close it."""
+        A target whose own disposition is permanent (closed, legacy, superseded, wontdo) does not hold reassigned
+        work: that excuse would skip every check the dispose guard makes on the reassigned owner, and one legacy row
+        could clear any number of drops (PR review of 24a786c, F1; main's decision). Close each owner on its own."""
         t = by_id.get(agent_id)
         if t is None or agent_id in seen:
             return False
+        td = disp.get(agent_id)
+        if td and td.get("kind") in GUARDED_KINDS and not t["state"].startswith(("live", "working", "waiting")):
+            return False  # checked first: the row loop below relabels such a target (superseded, unverified-legacy)
         if t["state"] not in ("DROPPED", "done", "handoff", "returned") or agent_id in live_parents:
             return True
         # Any non-live state (DROPPED, done, handoff, returned) is excused only by the target's own live disposition:
         # an owner that returned a result and then went into a named wait still holds the work (main repro
         # 2026-11-06: pet-leads-x reassigned to a done owner waiting on goodqa#14883).
-        td = disp.get(agent_id)
         if td and td.get("kind") == "reassigned":
             return covered(td.get("ref"), seen + (agent_id,))
         if td and td.get("kind") == "resumed" and t["state"] != "DROPPED":
             # `resumed` stays live once any later activity exists; a target that resumed and then finished (done,
-            # handoff, returned) holds no wait, so only a named wait or closed excuses it (PR #107 review F1)
+            # handoff, returned) holds no wait, so only a named wait excuses it (PR #107 review F1)
             return False
         return liveness.disposition_live(td, now, last_activity=parse_ts(t["last_activity"]) or 0.0)
 

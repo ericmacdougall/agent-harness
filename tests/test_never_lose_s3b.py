@@ -414,13 +414,21 @@ class ReviewRound5(Base):
                     "ah task dispose --agent a2 \\\n  --kind resumed",
                     "eval \"ah task dispose --agent a2 --kind closed\"",
                     "bash <<'EOF'\nah task dispose --agent a2 --kind closed\nEOF",
-                    "python3 -c 'import ah; ah.write(h, \"task.dispose\", {\"kind\": \"closed\"}, s)'"):
+                    "python3 -c 'import ah; ah.write(h, \"task.dispose\", {\"kind\": \"closed\"}, s)'",
+                    # PR review of 24a786c, F2: combined shell flags and backticks
+                    "bash -lc 'ah task dispose --agent a2 --kind closed'",
+                    "sh -ec 'ah task dispose --agent a2 --kind wontdo --ref x'",
+                    "/bin/zsh -xc \"ah task dispose --agent a2 --kind superseded\"",
+                    "echo `ah task dispose --agent a2 --kind closed`",
+                    "X=`ah task dispose --agent a2 --kind legacy`; echo $X"):
             self.assertEqual(decide(cmd), "deny", cmd)
         for cmd in ("grep -n 'task dispose --kind closed' docs/ah-query-spec.md",
                     "ah task dispose --agent a2 --kind waiting --ref w0123456789a --until 2027-01-01T00:00:00Z "
                     "--reason 'not --kind closed'",
                     'git commit -m "docs: ah task dispose --kind closed needs a deploy"',
-                    "cat > notes.md <<'EOF'\nah task dispose --agent a2 --kind closed\nEOF\nwc -l notes.md"):
+                    "cat > notes.md <<'EOF'\nah task dispose --agent a2 --kind closed\nEOF\nwc -l notes.md",
+                    "bash -lc 'ah task dispose --agent a2 --kind waiting --ref w0123456789a --until 2027-01-01T00:00:00Z'",
+                    "bash -l ./script.sh closed"):
             self.assertEqual(decide(cmd), "allow", cmd)
         t0 = time.monotonic()
         decide("task dispose " * 70000)

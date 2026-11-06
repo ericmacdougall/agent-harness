@@ -415,6 +415,68 @@ class ReassignedToAReturnedParent(Base):
         self.assertNotIn(a0, doc["undisposed"])  # a live child keeps its returned parent live for the reassignment
 
 
+class S3ReviewFindings(Base):
+    """PR review of 24a786c (Opus high, run 817deffc; goodqa#14791). F1: a reassignment onto a closed, legacy, superseded
+    or wontdo owner was excused for good, with none of the dispose guard's checks, so a loop of reassignments onto one
+    legacy owner cleared every drop. F3: a stale child (idle-helper, SILENT) kept its returned parent live."""
+    N = 19
+
+    def test_f1_reassign_loop_onto_a_legacy_owner_clears_nothing(self):
+        self.epoch(NOW - 1000)
+        self.dispose(agent(0), kind="legacy")
+        for i in range(1, self.N):
+            self.clock = NOW + i * 5  # the loop shape: seconds apart, one target
+            self.dispose(agent(i), kind="reassigned", ref=agent(0))
+        doc = self.owners()
+        self.assertNotIn(agent(0), doc["undisposed"])  # the legacy owner itself stays excused (and listed)
+        self.assertEqual(sorted(doc["undisposed"]), sorted(agent(i) for i in range(1, self.N)))
+
+    def test_f1_superseded_wontdo_and_closed_targets_do_not_cover(self):
+        with mock.patch.object(ah, "_ticket_exists", return_value=True):
+            self.dispose(agent(0), kind="superseded", ref="GoodQA goodqa#14791",
+                         reason="replaced by the S3 slice which owns the same scope")
+            self.dispose(agent(1), kind="wontdo", ref="GoodQA goodqa#14800",
+                         reason="the user dropped the console export feature from the plan")
+        dep = self.deploy(agent(2))
+        lt = self.live(agent(2), "LIVE-A2")
+        self.dispose(agent(2), deployed=dep, live_test=lt, reason=f"{agent(2)} shipped slice two; production health passed")
+        for i, target in ((3, agent(0)), (4, agent(1)), (5, agent(2))):
+            self.clock += 5
+            self.dispose(agent(i), kind="reassigned", ref=target)
+        undisposed = self.owners()["undisposed"]
+        for i in (3, 4, 5):
+            self.assertIn(agent(i), undisposed)
+        for i in (0, 1, 2):
+            self.assertNotIn(agent(i), undisposed)
+
+    def test_f1_neg_reassign_onto_a_live_owner_still_covers(self):
+        jl(self.w / f"agent-{agent(0)}.jsonl", [{"at": iso(NOW - 30), "event": "intent", "note": "working again"}])
+        self.dispose(agent(1), kind="reassigned", ref=agent(0))
+        self.assertNotIn(agent(1), self.owners()["undisposed"])
+
+    def _returned_parent_with_child(self, child_last):
+        a0, parent, child = agent(0), "a4720127aaaabbbbc", "a4720127child0001"
+        jl(self.w / "main.jsonl", [{"at": iso(NOW - 9000), "event": "subagent", "agent_id": parent, "agent_type": "task-owner"},
+                                   {"at": iso(NOW - 2000), "event": "subagent_stop", "agent_id": parent, "agent_type": "task-owner"},
+                                   {"at": iso(NOW - 8000), "event": "subagent", "agent_id": child, "agent_type": "red-team"}])
+        jl(self.w / f"agent-{parent}.jsonl", [{"at": iso(NOW - 2100), "event": "handoff", "note": "returned to main"}])
+        jl(self.w / f"agent-{child}.jsonl", [{"at": iso(child_last), "event": "intent", "note": "reviewing"}])
+        self.dispose(a0, kind="reassigned", ref=parent)
+        with mock.patch.object(ah, "discover_agents", return_value={child: {"type": "red-team", "parent": parent}}):
+            doc = self.owners()
+        return doc, a0, child
+
+    def test_f3_a_stale_child_does_not_keep_its_returned_parent_live(self):
+        doc, a0, child = self._returned_parent_with_child(NOW - 7000)  # crashed, no subagent_stop, quiet for ~2 h
+        state = next(o["state"] for o in doc["owners"] if o["agent_id"] == child)
+        self.assertNotEqual(state, "live")  # the fixture really is a stale child
+        self.assertIn(a0, doc["undisposed"])
+
+    def test_f3_neg_a_live_child_still_keeps_its_parent_live(self):
+        doc, a0, _child = self._returned_parent_with_child(NOW - 20)
+        self.assertNotIn(a0, doc["undisposed"])
+
+
 class InstallMarker(unittest.TestCase):
     def test_marker_is_written_once_with_the_earlier_install_time(self):
         import importlib
