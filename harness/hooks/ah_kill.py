@@ -253,8 +253,10 @@ def session_ancestor(probe, table, pid):
 
 
 def in_own_scope(probe, table, pid, cwd, roots, worktree):
-    """True when pid descends from one of `roots` or its cwd is inside the caller's worktree. The roots are only the
-    ah process itself, so in practice own scope means "cwd inside the caller's worktree"; anything else needs --foreign."""
+    """True when pid descends from one of `roots` or its cwd is in the caller's worktree (same git root, nested
+    worktrees excluded). The roots are only the ah process itself, so in practice own scope means "same worktree as
+    the caller's cwd"; anything else needs --foreign. Known limit: the caller's cwd is caller-chosen, so a stop made
+    after cd into another checkout counts as own; the caller cwd is recorded in the audit row to keep it visible."""
     seen, cur = set(), pid
     for _ in range(64):
         if cur in roots:
@@ -263,7 +265,8 @@ def in_own_scope(probe, table, pid, cwd, roots, worktree):
         if not cur or cur <= 1 or cur in seen:
             break
         seen.add(cur)
-    return bool(worktree and cwd and (cwd == worktree or cwd.startswith(worktree.rstrip("/") + "/")))
+    # Equality of git roots, not a path prefix: a worktree nested inside the caller's checkout is someone else's.
+    return bool(worktree and cwd and probe.git_top(cwd) == worktree)
 
 
 def descendants(table: dict, root: int):
@@ -399,6 +402,9 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
     my_uid = os.getuid()
     caller = {"session": session or None, "agent": agent or None, "ppid_chain_root": own_pid,
               "user": probe.user(my_uid), "via": via}
+    # The caller's own cwd decides "own worktree", and a caller can cd anywhere: record it so a stop made from
+    # another agent's checkout is visible in the audit row and the ops-watch notice instead of silent.
+    caller["cwd"] = _clip(os.getcwd(), 200)
     audit = Audit(home, default_wal(home, session, wal_path), caller)
     protected = protected_ids(probe, own_pid)
     run_id = "k" + uuid.uuid4().hex[:12]

@@ -46,6 +46,10 @@ class FakeProbe:
         return self.cwds.get(pid, "/work/%d" % pid)
 
     def git_top(self, path):
+        if path and path.startswith("/work/nested"):
+            return "/work/nested"  # a linked worktree inside the caller's checkout
+        if path and path.startswith("/work"):
+            return "/work"
         return "/elsewhere" if path and path.startswith("/elsewhere") else None
 
     def session_env(self, pid):
@@ -494,6 +498,18 @@ class NarrowedScope(KillBase):
         probe.cwds = {1104: "/elsewhere/x"}
         self.assertEqual(self.run_kill(probe, [1104])["results"][0]["status"], "exited")
         self.assertEqual(self.notices, [])
+
+    def test_nested_worktree_inside_my_checkout_is_foreign(self):
+        probe = self.foreign(1120, cwd="/work/nested/sub")
+        out = self.run_kill(probe, [1120])
+        self.assertEqual(out["results"][0]["status"], "refused")
+        self.assertIn("--foreign", out["results"][0]["detail"])
+
+    def test_audit_row_records_the_callers_cwd(self):
+        probe = self.foreign(1121, cwd="/work/sub")
+        self.run_kill(probe, [1121])
+        self.assertTrue(any(r.get("caller", {}).get("cwd") for r in self.audit() if r["event"] == "intent"),
+                        self.audit())
 
     def test_other_agents_process_in_the_same_session_is_foreign(self):
         probe = self.base(proc(1105, 4000, cmd="sleep 5"))  # sibling under the same claude session, other worktree
