@@ -385,8 +385,38 @@ def append_ledger(root, pid, start, home=None):
 # above on purpose; it reuses them with a `remote:HOST` root, so an ssh kill can never be proven by a local entry.
 
 REMOTE_HOST_RE = re.compile(r'^(?:[A-Za-z0-9._-]{1,64}@)?[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
-REMOTE_LOG_RE = re.compile(r'^[A-Za-z0-9._/~-]{1,512}$')
+REMOTE_LOG_RE = re.compile(r'^[A-Za-z0-9._/-]{1,512}$')  # no ~: the path is single-quoted on the host
 SSH_RUNNER = subprocess.run  # tests replace it; nothing here is ever run without BatchMode
+PLAIN_SSH_FLAGS = {'-q', '-T', '-n', '-t', '-tt', '-4', '-6'}
+PLAIN_SSH_OPTIONS = {'batchmode', 'connecttimeout', 'loglevel', 'serveraliveinterval', 'serveralivecountmax',
+                     'connectionattempts'}
+
+
+def plain_ssh_hop(texts, host):
+    """True when every ssh option before the host word is one that cannot change where the connection goes.
+    `-o HostName=`, `-J`/ProxyJump, `-F`, `-W`, `-S`, ProxyCommand and anything unknown make the hop non-literal,
+    so a recorded PID on `dev2` can never be killed on another machine (review finding, 2026-11-06)."""
+    i = 0
+    while i < host:
+        t = texts[i]
+        if t in PLAIN_SSH_FLAGS:
+            i += 1
+            continue
+        if t in ('-p', '-l', '-o'):
+            value = texts[i + 1] if i + 1 < host else ''
+            i += 2
+        elif t.startswith(('-p', '-l', '-o')) and len(t) > 2:
+            value, t = t[2:], t[:2]
+            i += 1
+        else:
+            return False
+        if t == '-p' and not re.fullmatch(r'\d{1,5}', value):
+            return False
+        if t == '-l' and not re.fullmatch(r'[A-Za-z0-9._-]{1,64}', value):
+            return False
+        if t == '-o' and value.split('=', 1)[0].strip().lower() not in PLAIN_SSH_OPTIONS:
+            return False
+    return True
 
 
 def remote_root(host):
@@ -1000,7 +1030,8 @@ def make_analyzer_class(cg):
             if host is not None and host + 1 < len(texts) and texts[host + 1] == '--':
                 args = args[:host + 1] + args[host + 2:]  # `mosh host -- cmd`, `ssh host -- cmd`
             self.remote += 1
-            literal = host is not None and not (args[host].dynamic or args[host].subs or args[host].glob)
+            literal = (host is not None and not (args[host].dynamic or args[host].subs or args[host].glob)
+                       and not any(a.dynamic or a.subs or a.glob for a in args[:host]) and plain_ssh_hop(texts, host))
             self.remote_hosts.append(texts[host] if literal else None)
             try:
                 result = super().ssh(args, depth)

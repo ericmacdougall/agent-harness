@@ -768,13 +768,20 @@ class RemoteSpawn(unittest.TestCase):
     def test_spawned_pid_is_killable_only_on_its_host_while_its_start_time_matches(self):
         kg.append_ledger(kg.remote_root('dev2'), 4242, self.START, home=self.home)
         same = lambda host, pid: self.START if (host, pid) == ('dev2', 4242) else None  # noqa: E731
-        for cmd in ('ssh dev2 kill 4242', 'ssh dev2 kill -TERM 4242', "ssh dev2 'kill 4242'", 'ssh -p 22 dev2 -- kill 4242'):
+        for cmd in ('ssh dev2 kill 4242', 'ssh dev2 kill -TERM 4242', "ssh dev2 'kill 4242'", 'ssh -p 22 dev2 -- kill 4242',
+                    'ssh -o BatchMode=yes -o ConnectTimeout=3 dev2 kill 4242', 'ssh -q -l eric -p2222 dev2 kill 4242'):
             with self.subTest(cmd):
                 self.assertEqual(self.decide(cmd, same)[0], 'allow', cmd)
         refused = {'other host': 'ssh t2-dev kill 4242', 'other pid': 'ssh dev2 kill 4243', 'mixed pids': 'ssh dev2 kill 4242 4243',
                    'container': 'docker exec c kill 4242', 'nested hop': 'ssh gw ssh dev2 kill 4242',
                    'broad verb': 'ssh dev2 pkill -f tsc', 'variable host': 'ssh $H kill 4242',
-                   'finder': 'ssh dev2 "kill $(pgrep -f tsc)"', 'local kill': 'kill 4242'}
+                   'finder': 'ssh dev2 "kill $(pgrep -f tsc)"', 'local kill': 'kill 4242',
+                   # routing options send the kill elsewhere while the ledger and probe name dev2 (review HIGH)
+                   'hostname option': 'ssh -o HostName=prod dev2 kill 4242', 'glued hostname': 'ssh -oHostName=prod dev2 kill 4242',
+                   'config file': 'ssh -F evil.cfg dev2 kill 4242', 'jump': 'ssh -J gw dev2 kill 4242',
+                   'proxyjump': 'ssh -o ProxyJump=gw dev2 kill 4242', 'proxycommand': "ssh -o 'ProxyCommand=nc prod 22' dev2 kill 4242",
+                   'stdio forward': 'ssh -W prod:22 dev2 kill 4242', 'control socket': 'ssh -S ctl dev2 kill 4242',
+                   'variable option': 'ssh -o $OPT dev2 kill 4242', 'unknown flag': 'ssh -A dev2 kill 4242'}
         for label, cmd in refused.items():
             with self.subTest(label):
                 self.assertEqual(self.decide(cmd, same)[0], 'block', cmd)
