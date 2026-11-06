@@ -527,6 +527,17 @@ def verified_final(run_id, allow_env_root=False):
     return (directory / 'final.json').read_bytes()  # input-ok: verified by load_ref, bounded by MAX_JSON
 
 
+USER_SOURCE_KINDS = ('user', 'answer', 'queue')  # provenance.parse_source maps all three to kind "user"
+
+
+def user_sourced(source):
+    """True when the ask's source is a real user turn as provenance.py classifies it: user:, plus the queue: (mid-turn
+    queued message) and answer: (AskUserQuestion reply) variants it treats as the same trust class. approve-top
+    refused a queue: grant on 2026-11-06 although the user typed it (main WAL w69761822b47). This is a
+    classification only: wal_note enforces the syntax and resolution of an ask's source when the ask is written."""
+    return bool(re.match(r'^(%s):' % '|'.join(USER_SOURCE_KINDS), str(source or '')))
+
+
 def verify_ask_pair(wal, ask_id, task, allow_env_root=False):
     """A registered ask with a user: source naming the task, resolved by an ask_resolved that refs it.
 
@@ -555,8 +566,8 @@ def verify_ask_pair(wal, ask_id, task, allow_env_root=False):
         raise LedgerError('unclassifiable_evidence', 'no ask/ask_resolved pair for ' + ask_id)
     source = str(ask.get('source') or '')
     note = str(ask.get('note') or '')
-    if not source.startswith('user:') or not re.search(r'\[task:' + re.escape(task) + r'\]', note):
-        raise LedgerError('unclassifiable_evidence', 'ask is not user-sourced or does not name [task:%s]' % task)
+    if not user_sourced(source) or not re.search(r'\[task:' + re.escape(task) + r'\]', note):
+        raise LedgerError('unclassifiable_evidence', 'ask is not user-sourced (user:, answer: or queue:) or does not name [task:%s]' % task)
     resolution = str(resolved.get('note') or '')
     if resolved.get('decision') != 'approved' and not re.match(r'\s*approved\b', resolution, re.I):
         raise LedgerError('unclassifiable_evidence', 'ask_resolved does not record an approval for ' + ask_id)

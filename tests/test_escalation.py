@@ -322,6 +322,22 @@ class TopPermission(LedgerFixture):
         path.write_text('\n'.join(lines) + '\n')
         return path
 
+    def test_top_accepts_queue_and_answer_sources_as_user_turns(self):
+        """A queued mid-turn message (queue:) and an AskUserQuestion reply (answer:) are user turns in provenance.py;
+        approve-top refused a queue: grant on 2026-11-06 (main WAL w69761822b47). ticket:, wal: and inferred: stay out."""
+        sess = '11111111-2222-3333-4444-555555555555'
+        queue = f'queue:{sess}/2026-11-06T22:21:43.735Z#542c3e74128e "lets do a round of harness fixes quickly with fable"'
+        answer = f'answer:{sess}/22222222-3333-4444-5555-666666666666 "yes, use fable"'
+        for label, source in (('queue', queue), ('answer', answer)):
+            with self.subTest(label):
+                status = self.ledger.approve_top('t13', 'wask1', self.wal(source=source))
+                self.assertEqual(status['permission']['source'], source)
+        for label, source in (('ticket', 'ticket:GoodQA goodqa#14927'), ('wal', 'wal:/x/main.jsonl#w123456789ab'),
+                              ('inferred', 'inferred: from ticket:GoodQA goodqa#14927 -- the user probably wants it'),
+                              ('file', 'file:docs/x.md:1@abcdef0 "queue: is fine"'), ('empty', '')):
+            with self.subTest(label), self.assertRaises(esc.LedgerError):
+                self.ledger.approve_top('t13', 'wask1', self.wal(source=source))
+
     def test_top_needs_a_user_sourced_ask_pair_naming_the_task(self):
         for label, wal in {'unresolved': self.wal(resolved=False), 'agent-sourced': self.wal(source='wal:x#y'),
                            'other-task': self.wal(note='permission for [task:other]'),
