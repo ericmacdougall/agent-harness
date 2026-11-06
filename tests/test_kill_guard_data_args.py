@@ -23,6 +23,8 @@ ALLOW = [
     "python3 -c \"title = 'ah kill: audited process stop command'; print(title)\"",
     "python3 -c 'import json; print(json.dumps({\"title\": \"kill-guard false positives\"}))'",
     "python3 -c \"print('the word kill appears here as data')\"",
+    "python3 -c \"import json; t = 'ah kill scope'; print(json.dumps({'title': t, 'n': len([1, 2])}))\"",
+    "python3 -c \"import datetime; print(f'kill-ticket {datetime.date.today()}')\"",
 ]
 BLOCK = [
     CLI + "ah.py kill --pid 1 --reason x",
@@ -61,6 +63,13 @@ BLOCK = [
     "python3 -c 'import os; os.system(\"tmux kill-server\")'",
     "python3 -c 'import os; print(\"kill\")'",
     "python3 -c 'import subprocess; print(\"kill\")'",
+    # review of 679c18b: reaching the OS through sys.modules / exec* / spawn* from a "pure data" program
+    "python3 -c \"import sys; sys.modules['os'].execv('/bin/kill', ['kill','-9','4242'])\"",
+    "python3 -c \"import sys; sys.modules['os'].posix_spawn('/bin/kill', ['kill','-9','4242'], {})\"",
+    "python3 -c \"import json, sys; sys.modules['os'].execvp('pkill', ['pkill','x'])\"",
+    "python3 -c \"import re; print(re.__builtins__['__import__']('os').kill(1, 9))\"",
+    "python3 -c \"import operator; operator.methodcaller('kill', 4242, 9)(__import__('os'))\"",
+    "python3 -c \"print(open('/etc/hosts').read(), 'kill')\"",
     CLI + "ah.py --text kill --pid 4242 --reason x --foreign",
     CLI + "ah.py -- kill --pid 4242",
     CLI + "ah.py --te kill --pid 4242 --reason x",

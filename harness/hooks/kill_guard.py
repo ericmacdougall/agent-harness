@@ -113,16 +113,42 @@ PID_OPT_VALUE = re.compile(r'[0-9]+(?:,[0-9]+)*')
 # Harness CLIs whose arguments are data (a note, a search text), never code. ah.py kill is judged by is_ah_kill.
 AH_SUBCOMMANDS = {'owners', 'user-msg', 'ticket', 'disk', 'task', 'doctor', 'spool', 'write'}
 PY_LITERAL = re.compile(r"""('\'\'[\s\S]*?\'\'\'|"{3}[\s\S]*?"{3}|'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*")""")
-# Inline Python that cannot run text as code or reach the OS: only then are its string literals plain data.
-PY_NOT_PURE = re.compile(r"#|\\|__|\b(?:exec|eval|compile|getattr|setattr|delattr|globals|locals|vars|open|system|popen"
-                         r"|subprocess|spawn|ctypes|importlib|input|breakpoint)\b|\b[fFbBrRuU]{1,2}['\"]")
-PY_SAFE_IMPORTS = {'json', 'sys', 're', 'datetime', 'time', 'textwrap'}
+# Inline Python that only formats data (a closed set of syntax, calls and modules): its string literals are prose.
+PY_SAFE_IMPORTS = {'json', 're', 'datetime', 'time', 'textwrap'}
+PY_SAFE_CALLS = {'print', 'str', 'len', 'dict', 'list', 'sorted', 'int', 'repr', 'tuple', 'set', 'range', 'sum', 'min',
+                 'max', 'bool', 'float', 'enumerate', 'zip'}
+PY_SAFE_NODES = ('Module', 'Expr', 'Assign', 'Name', 'Load', 'Store', 'Constant', 'Call', 'keyword', 'Attribute', 'Dict',
+                 'List', 'Tuple', 'Set', 'Subscript', 'Index', 'Slice', 'BinOp', 'JoinedStr', 'FormattedValue', 'Import',
+                 'ImportFrom', 'alias', 'Add', 'Sub', 'Mult', 'Mod', 'Div')
 
 
-def pure_data_python(body):
-    if PY_NOT_PURE.search(body):
+def pure_data_python(code):
+    """True when the program is built only from print/json-style calls on literals, so it cannot reach the OS. An
+    allowlist over the syntax tree: sys.modules, exec*/spawn*, getattr, dunders and every other module are out."""
+    import ast
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False
-    return all(m.split('.')[0] in PY_SAFE_IMPORTS for m in re.findall(r'\b(?:import|from)\s+([A-Za-z_][\w.]*)', body))
+    for node in ast.walk(tree):
+        kind = type(node).__name__
+        if kind not in PY_SAFE_NODES:
+            return False
+        if isinstance(node, ast.Import):
+            if any(a.name.split('.')[0] not in PY_SAFE_IMPORTS for a in node.names):
+                return False
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or (node.module or '').split('.')[0] not in PY_SAFE_IMPORTS:
+                return False
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith('_'):
+                return False
+        elif isinstance(node, ast.Name):
+            if node.id.startswith('_'):
+                return False
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id not in PY_SAFE_CALLS:
+            return False
+    return True
 
 
 def hook_script_ok(raw, names):
@@ -1151,8 +1177,10 @@ def make_analyzer_class(cg):
                 elif redir.op == '<<<' and redir.target is not None:
                     body += '\n' + redir.target.text
             body = body.replace('kill_guard', '').replace('kill-guard', '')  # the guard's own name
-            if name.startswith('python') and '-c' in texts and pure_data_python(body):
-                body = PY_LITERAL.sub("''", body)  # a program that only formats data: prose in literals is not signalling
+            if name.startswith('python') and '-c' in texts and texts.index('-c') + 1 < len(texts):
+                code = texts[texts.index('-c') + 1]
+                if pure_data_python(code):  # a program that only formats data: prose in literals is not signalling
+                    body = body.replace(code, PY_LITERAL.sub("''", code), 1)
             body = re.sub(r'\b(?:os|process)\.kill\(\s*[\w.]+(?:\(\))?\s*,\s*0\s*\)', '', body)  # liveness probe
             if self.script_kill is not None and self.script_kill.search(body):
                 self.block('script-kill', 'interpreter code signals processes the guard cannot check')

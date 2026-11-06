@@ -405,7 +405,8 @@ class ReviewFixes(KillBase):
         self.addCleanup(lambda: os.environ.__setitem__("HOME", old))
         runner = lambda argv, **kw: subprocess.CompletedProcess(  # noqa: E731
             argv, 0, stdout='{"ok": true, "run": "k1", "results": []}')
-        ak.kill_remote("t2-dev", [5], "why", False, 5, "sess-1", "a", home=self.home, runner=runner)
+        ak.kill_remote("t2-dev", [5], "why", False, 5, "sess-1", "a", home=self.home, runner=runner, foreign=True,
+                       notify=lambda h, e: None)
         text = next((self.home / ".claude").rglob("main.jsonl")).read_text()
         self.assertIn("t2-dev", text)
         self.assertIn("result", text)
@@ -518,6 +519,58 @@ class NarrowedScope(KillBase):
         self.assertEqual(self.notices, [])
 
 
+class ReviewRound3(KillBase):
+    def test_node_wrapped_session_is_refused(self):
+        probe = self.base(proc(2000, 100, cmd="node /opt/homebrew/bin/claude --resume", comm="node"))
+        out = self.run_kill(probe, [2000], foreign=True)
+        self.assertEqual(out["results"][0]["status"], "refused")
+        self.assertEqual(probe.sent, [])
+
+    def test_mcp_under_a_node_wrapped_session_is_refused(self):
+        probe = self.base(proc(2100, 1, cmd="node /opt/homebrew/bin/codex", comm="node"),
+                          proc(2101, 2100, cmd="node /x/mcp-server.js", comm="node"))
+        out = self.run_kill(probe, [2101], foreign=True)
+        self.assertEqual(out["results"][0]["status"], "refused")
+
+    def test_login_and_flagged_shells_are_interactive(self):
+        for cmd in ("zsh -l", "bash -i", "zsh -il", "/bin/bash --login", "zsh"):
+            probe = self.base(proc(2200, 100, cmd=cmd, comm="/bin/" + cmd.split()[0].split("/")[-1]))
+            self.assertEqual(self.run_kill(probe, [2200], foreign=True)["results"][0]["status"], "refused", cmd)
+        probe = self.base(proc(2201, 100, cmd="/bin/bash /w/run.sh", comm="/bin/bash"))
+        self.assertEqual(self.run_kill(probe, [2201])["results"][0]["status"], "exited")
+
+    def test_remote_requires_foreign_and_a_local_notice(self):
+        calls = []
+        runner = lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(  # noqa: E731
+            argv, 0, stdout='{"ok": true, "run": "k1", "results": []}')
+        with self.assertRaises(ak.KillError) as cm:
+            ak.kill_remote("dev2", [5], "r", False, 5, home=self.home, runner=runner)
+        self.assertEqual(cm.exception.code, "foreign_required")
+        self.assertEqual(calls, [])
+        notices = []
+        ak.kill_remote("dev2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True,
+                       notify=lambda h, e: notices.append(e))
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0]["severity"], "high")
+
+        def boom(h, e):
+            raise OSError("ring")
+        calls.clear()
+        with self.assertRaises(ak.KillError) as cm:
+            ak.kill_remote("dev2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True, notify=boom)
+        self.assertEqual(cm.exception.code, "notice_failed")
+        self.assertEqual(calls, [], "no notice, no remote stop")
+
+    def test_remote_validates_reason_and_answer(self):
+        runner = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stdout="[1]")  # noqa: E731
+        with self.assertRaises(ak.KillError):
+            ak.kill_remote("dev2", [5], "  ", False, 5, home=self.home, runner=runner, foreign=True)
+        with self.assertRaises(ak.KillError) as cm:
+            ak.kill_remote("dev2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True,
+                           notify=lambda h, e: None)
+        self.assertEqual(cm.exception.code, "host_unreachable")
+
+
 class Remote(KillBase):
     def test_foreign_flag_is_forwarded(self):
         seen = {}
@@ -525,8 +578,9 @@ class Remote(KillBase):
         def runner(argv, **kw):
             seen["cmd"] = argv[-1]
             return subprocess.CompletedProcess(argv, 0, stdout='{"ok": true, "run": "k1", "results": []}')
-        ak.kill_remote("dev2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True)
+        ak.kill_remote("dev2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True, notify=lambda h, e: None)
         self.assertIn("--foreign", seen["cmd"])
+        self.assertIn("python3 -I ", seen["cmd"])
 
     def test_host_allowlist_and_quoting(self):
         seen = {}
@@ -534,7 +588,8 @@ class Remote(KillBase):
         def runner(argv, **kw):
             seen["argv"] = argv
             return subprocess.CompletedProcess(argv, 0, stdout='{"ok": true, "run": "k1", "results": []}')
-        out = ak.kill_remote("dev2", [5, 6], "it's $(bad); rm", True, 7, "s", "a", home=self.home, runner=runner)
+        out = ak.kill_remote("dev2", [5, 6], "it's $(bad); rm", True, 7, "s", "a", home=self.home, runner=runner,
+                             foreign=True, notify=lambda h, e: None)
         self.assertEqual(out["host"], "dev2")
         cmd = seen["argv"][-1]
         self.assertIn("--pid 5,6", cmd)
@@ -542,7 +597,7 @@ class Remote(KillBase):
         self.assertIn("--tree", cmd)
         self.assertEqual(seen["argv"][-3:-1], ["--", "dev2"])
         with self.assertRaises(ak.KillError):
-            ak.kill_remote("evil;host", [5], "r", False, 5, home=self.home, runner=runner)
+            ak.kill_remote("evil;host", [5], "r", False, 5, home=self.home, runner=runner, foreign=True)
         self.assertTrue(any(r["event"] == "remote" for r in self.audit()))
 
 

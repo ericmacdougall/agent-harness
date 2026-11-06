@@ -183,6 +183,25 @@ def protected_ids(probe, own_pid: int):
     return ids
 
 
+def is_session_process(info) -> bool:
+    """A claude/codex process, however it was launched (a node-wrapped install shows comm=node)."""
+    names = [os.path.basename(info.get("comm") or "").lower()]
+    names += [os.path.basename(w).lower() for w in (info.get("command") or "").split()[:3]]
+    return any(n in SESSION_COMM for n in names)
+
+
+def interactive_shell(info, base) -> bool:
+    if base not in SHELLS:
+        return False
+    comm = info.get("comm") or ""
+    words = (info.get("command") or "").split()[1:]
+    if comm.startswith("-") or not words:
+        return True
+    if any(re.fullmatch(r"-[a-z]*[il][a-z]*", w) for w in words if w.startswith("-") and not w.startswith("--")):
+        return True
+    return not any(not w.startswith("-") for w in words)  # no script or -c program: it reads the terminal
+
+
 def refusal(info, my_uid: int, protected: set, probe=None, table=None):
     """Reason string when this process may never be signalled, else None. No flag reaches this function."""
     pid = info["pid"]
@@ -201,7 +220,9 @@ def refusal(info, my_uid: int, protected: set, probe=None, table=None):
     base = os.path.basename(comm).lower()
     if base in PROTECTED_COMM or os.path.basename(first).lower() in {"sshd", "launchd"}:
         return "protected process (%s)" % base
-    if base in SHELLS and (comm.startswith("-") or len((info.get("command") or "").split()) <= 1):
+    if is_session_process(info):
+        return "claude/codex session process"
+    if interactive_shell(info, base):
         return "interactive shell"
     if PROTECTED_PATH.search(comm) or PROTECTED_PATH.search(info.get("command") or ""):
         return "protected GUI app"
@@ -226,7 +247,7 @@ def session_ancestor(probe, table, pid):
             return None
         seen.add(pid)
         info = probe.info(pid)
-        if info and os.path.basename(info.get("comm") or "").lower() in SESSION_COMM:
+        if info and is_session_process(info):
             return pid
     return None
 
@@ -506,11 +527,19 @@ def _public(rec, result=False):
     return out
 
 
-def kill_remote(host, pids, reason, tree, grace, session="", agent="", home=None, runner=subprocess.run, foreign=False):
+def kill_remote(host, pids, reason, tree, grace, session="", agent="", home=None, runner=subprocess.run, foreign=False, notify=None):
     if host not in HOSTS:
         raise KillError("bad_request", "--host must be one of %s" % ", ".join(HOSTS))
     home = home or Path.home()
-    cmd = "python3 .claude/hooks/ah.py kill --pid %s --reason %s --grace %g --via %s" % (
+    reason = (reason or "").strip()
+    if not reason:
+        raise KillError("reason_required", "--reason is mandatory and must not be empty")
+    if len(reason) > MAX_REASON or not 0 <= grace <= MAX_GRACE:
+        raise KillError("bad_request", "--reason or --grace is out of range")
+    if not foreign:
+        raise KillError("foreign_required", "--host targets are outside this session's tree and worktree; pass --foreign "
+                        "(audited, and main is notified)")
+    cmd = "python3 -I .claude/hooks/ah.py kill --pid %s --reason %s --grace %g --via %s" % (
         ",".join(str(p) for p in pids), shlex.quote(reason), grace, shlex.quote(session or agent or "unknown"))
     if tree:
         cmd += " --tree"
@@ -519,6 +548,15 @@ def kill_remote(host, pids, reason, tree, grace, session="", agent="", home=None
     argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", host, cmd]
     audit = Audit(home, default_wal(home, session), {"session": session or None, "agent": agent or None})
     audit.row({"event": "remote", "host": host, "pids": pids, "reason": reason, "tree": tree})
+    event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "high", "check": "ah-kill",
+             "key": "ah-kill:foreign:remote-" + uuid.uuid4().hex[:10],
+             "message": "ah kill --foreign on %s for pids %s (reason: %s)" % (host, ",".join(str(p) for p in pids), _clip(reason, 120)),
+             "detail": {"host": host, "pids": pids, "caller": {"session": session or None, "agent": agent or None}}}
+    try:
+        (notify or _ops_notice)(home, event)
+    except Exception as error:  # no notice, no remote stop
+        audit.row({"event": "aborted", "host": host, "why": "ops-watch notice failed: %s" % type(error).__name__})
+        raise KillError("notice_failed", "could not raise the ops-watch notice; nothing was signalled", 3)
     audit.wal("ah kill on %s: pids=%s reason=%s" % (host, pids, _clip(reason, 200)))
     try:
         r = runner(argv, capture_output=True, text=True, timeout=grace * 2 + 60)
@@ -526,6 +564,9 @@ def kill_remote(host, pids, reason, tree, grace, session="", agent="", home=None
     except (OSError, subprocess.SubprocessError, ValueError):
         audit.row({"event": "remote_result", "host": host, "status": "unreachable-or-unparsable"})
         raise KillError("host_unreachable", "could not run ah kill on %s" % host, 3)
+    if not isinstance(data, dict):
+        audit.row({"event": "remote_result", "host": host, "status": "unparsable"})
+        raise KillError("host_unreachable", "unexpected answer from %s" % host, 3)
     audit.row({"event": "remote_result", "host": host, "ok": data.get("ok"), "run": data.get("run")})
     data["host"] = host
     audit.wal("ah kill on %s result: ok=%s run=%s" % (host, data.get("ok"), data.get("run")))
