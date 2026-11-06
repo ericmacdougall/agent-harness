@@ -110,6 +110,7 @@ RUN_OPTS = {'-c', '-s', '-i', '-e', '-lc', '-ic', '--command', '-l', '-S'}  # op
 LAUNCHERS = {'tmux', 'screen', 'at', 'batch', 'watch'}
 CLASSIC_VERBS = {'pkill', 'killall', 'killall5', 'skill', 'slay', 'taskkill', 'stop-process', 'spps'}
 PID_OPT_VALUE = re.compile(r'[0-9]+(?:,[0-9]+)*')
+AH_SCRIPT = re.compile(r'(?:~|/Users/(?!Shared/)[A-Za-z0-9_][A-Za-z0-9_.-]*|/home/[A-Za-z0-9_][A-Za-z0-9_.-]*)/\.claude/hooks/ah\.py')
 
 
 # --------------------------------------------------------------------------- policy and small helpers
@@ -966,7 +967,8 @@ def make_analyzer_class(cg):
                 if rest:
                     self.inner_words(args[args.index(rest[0]):], depth, pl, idx)
             elif name in cg.INTERPRETERS or INTERPRETER_NAME.fullmatch(name):
-                self.check_interpreter(name, texts, cmd)
+                if not self.is_ah_kill(name, args, cmd, depth):
+                    self.check_interpreter(name, texts, cmd)
             self.check_spawn(name, args, texts, depth, pl, idx)
             self.check_text_runners(name, args, texts, cmd, depth)
 
@@ -1038,6 +1040,64 @@ def make_analyzer_class(cg):
                 hit = cg.norm_name(first) in verbs
             if hit:
                 self.block('indirect-kill', '`%s` runs a kill verb on targets the guard cannot list' % name)
+
+        def is_ah_kill(self, name, args, cmd, depth):
+            """True only for the literal form `python3 [-I|-B|-u] ~/.claude/hooks/ah.py kill --pid N[,N] --reason R
+            [--tree] [--grace S] [--host H] [--agent A] [--session S]`. ah kill audits every pid and refuses
+            system, other-user, GUI and ancestor processes itself, so the guard only has to prove the form is
+            literal: no variable, substitution, glob, heredoc, `-c`, eval or second script. Anything else
+            returns False and is judged by the ordinary interpreter rules."""
+            if not INTERPRETER_NAME.fullmatch(name) or not name.startswith('python') or self.remote or depth:
+                return False
+            if any(getattr(r, 'body', None) or getattr(r, 'op', '').startswith('<') for r in getattr(cmd, 'redirs', [])):
+                return False
+            if any(a.dynamic or a.subs or a.glob for a in args):
+                return False
+            words = getattr(cmd, 'words', None) or []
+            if not words or words[0].raw is None or words[0].raw != name:
+                return False  # an assignment prefix (PYTHONPATH=x python3 ...) or a quoted head
+            texts = [a.text for a in args]
+            if not texts or texts[0] != '-I':
+                return False  # isolated mode ignores PYTHONPATH and user site, so a planted module cannot run first
+            i = 1
+            while i < len(texts) and texts[i] in ('-B', '-u'):
+                i += 1
+            # the raw word is matched: a quoted '~' is a literal directory, and .text has HOME expanded
+            if i + 1 >= len(texts) or not AH_SCRIPT.fullmatch(args[i].raw or '') or texts[i + 1] != 'kill':
+                return False
+            rest, i, seen = texts[i + 2:], 0, set()
+            while i < len(rest):
+                t = rest[i]
+                key, eq, val = t.partition('=') if t.startswith('--') else (t, '', '')
+                if key == '--tree' and not eq:
+                    seen.add(key)
+                    i += 1
+                    continue
+                if key not in ('--pid', '--reason', '--grace', '--host', '--agent', '--session'):
+                    return False
+                if not eq:
+                    if i + 1 >= len(rest):
+                        return False
+                    val, i = rest[i + 1], i + 1
+                i += 1
+                if key in seen:
+                    return False
+                seen.add(key)
+                if key == '--pid':
+                    if not PID_OPT_VALUE.fullmatch(val) or any(int(p) <= 1 for p in val.split(',')):
+                        return False
+                elif key == '--reason':
+                    if not val.strip():
+                        return False
+                elif key == '--grace':
+                    if not re.fullmatch(r'[0-9]{1,3}(?:\.[0-9]{1,2})?', val):
+                        return False
+                elif key == '--host':
+                    if val not in ('dev2', 't2-dev', 'ah-mac-mini'):
+                        return False
+                elif not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', val):
+                    return False
+            return '--pid' in seen and '--reason' in seen
 
         def check_interpreter(self, name, texts, cmd):
             body = ' '.join(texts)
