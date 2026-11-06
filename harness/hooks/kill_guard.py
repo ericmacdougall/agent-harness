@@ -78,7 +78,7 @@ DEFAULT_POLICY = {
     'windows_verbs': ['taskkill', 'stop-process', 'spps', 'wmic'],
     'service_kill': {'systemctl': ['kill'], 'launchctl': ['kill'], 'tmux': ['kill-server'], 'pm2': ['kill'],
                      'loginctl': ['kill-session', 'kill-user', 'terminate-user', 'terminate-session']},
-    'script_kill_pattern': r'(?i)(?<![a-z])(?:p|f|posix_)?kill(?![a-z])|killpg|terminate\(|send_signal|taskkill|killall|invoke-cimmethod|getprocessbyid',
+    'script_kill_pattern': r'(?i)(?<![a-z])(?:p|f|posix_)?kill(?![a-z])|killpg|terminate\(|send_signal|taskkill|killall|invoke-cimmethod|getprocessbyid|raise_signal|sigqueue|pidfd_send_signal',
     'pid_finders': ['pgrep', 'pidof', 'ps', 'lsof', 'fuser', 'pstree', 'cat', 'awk', 'grep'],
     'ledger_max_lines': 2000,
     'child_timeout_seconds': 10,
@@ -110,6 +110,13 @@ RUN_OPTS = {'-c', '-s', '-i', '-e', '-lc', '-ic', '--command', '-l', '-S'}  # op
 LAUNCHERS = {'tmux', 'screen', 'at', 'batch', 'watch'}
 CLASSIC_VERBS = {'pkill', 'killall', 'killall5', 'skill', 'slay', 'taskkill', 'stop-process', 'spps'}
 PID_OPT_VALUE = re.compile(r'[0-9]+(?:,[0-9]+)*')
+# Harness CLIs whose arguments are data (a note, a search text), never code. ah.py kill is judged by is_ah_kill.
+HARNESS_CLI = re.compile(r'(?:~|/Users/(?!Shared/)[A-Za-z0-9_][A-Za-z0-9_.-]*|/home/[A-Za-z0-9_][A-Za-z0-9_.-]*)'
+                         r'/\.claude/hooks/(?:ah|wal_note|provenance)\.py')
+# Inside a Python string literal, kill counts only where it can run as a command: at the start, after a shell
+# separator, a path slash, or a wrapper word. "ah kill: ..." in a ticket title is data.
+LITERAL_COMMAND_USE = re.compile(r'(?i)(?:^|[;&|(`/\n]|\$\(|\b(?:sudo|xargs|exec|nohup|env|time|then|do|else|-exec)\s+)\s*(?:p|f)?kill')
+PY_LITERAL = re.compile(r"""('\'\'[\s\S]*?\'\'\'|"{3}[\s\S]*?"{3}|'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*")""")
 AH_SCRIPT = re.compile(r'(?:~|/Users/(?!Shared/)[A-Za-z0-9_][A-Za-z0-9_.-]*|/home/[A-Za-z0-9_][A-Za-z0-9_.-]*)/\.claude/hooks/ah\.py')
 
 
@@ -967,7 +974,7 @@ def make_analyzer_class(cg):
                 if rest:
                     self.inner_words(args[args.index(rest[0]):], depth, pl, idx)
             elif name in cg.INTERPRETERS or INTERPRETER_NAME.fullmatch(name):
-                if not self.is_ah_kill(name, args, cmd, depth):
+                if not self.is_ah_kill(name, args, cmd, depth) and not self.is_harness_cli(name, args, cmd, depth):
                     self.check_interpreter(name, texts, cmd)
             self.check_spawn(name, args, texts, depth, pl, idx)
             self.check_text_runners(name, args, texts, cmd, depth)
@@ -1041,6 +1048,24 @@ def make_analyzer_class(cg):
             if hit:
                 self.block('indirect-kill', '`%s` runs a kill verb on targets the guard cannot list' % name)
 
+        def is_harness_cli(self, name, args, cmd, depth):
+            """`python3 [-I|-B|-u] ~/.claude/hooks/{ah,wal_note,provenance}.py ...`: the words after the script are
+            data for that script, so a note or search text that mentions kill is not signalling. `ah.py kill` is
+            excluded (is_ah_kill decides it), and so is any assignment prefix, quoted head or other script."""
+            if not name.startswith('python') or not INTERPRETER_NAME.fullmatch(name) or self.remote or depth:
+                return False
+            words = getattr(cmd, 'words', None) or []
+            if not words or words[0].raw is None or words[0].raw != name:
+                return False
+            i = 0
+            while i < len(args) and args[i].text in ('-I', '-B', '-u'):
+                i += 1
+            if i >= len(args) or not HARNESS_CLI.fullmatch(args[i].raw or ''):
+                return False
+            if args[i].text.endswith('/ah.py') and any(a.text == 'kill' for a in args[i + 1:i + 2]):
+                return False
+            return True
+
         def is_ah_kill(self, name, args, cmd, depth):
             """True only for the literal form `python3 [-I|-B|-u] ~/.claude/hooks/ah.py kill --pid N[,N] --reason R
             [--tree] [--grace S] [--host H] [--agent A] [--session S]`. ah kill audits every pid and refuses
@@ -1106,7 +1131,10 @@ def make_analyzer_class(cg):
                     body += '\n' + redir.body
                 elif redir.op == '<<<' and redir.target is not None:
                     body += '\n' + redir.target.text
-            body = body.replace('kill_guard', '')
+            body = body.replace('kill_guard', '').replace('kill-guard', '')  # the guard's own name
+            if name.startswith('python') and '-c' in texts:
+                # inline Python: a string literal that is plain prose is data; one that can run as a command stays
+                body = PY_LITERAL.sub(lambda m: m.group(0) if LITERAL_COMMAND_USE.search(m.group(0)[1:-1]) else "''", body)
             body = re.sub(r'\b(?:os|process)\.kill\(\s*[\w.]+(?:\(\))?\s*,\s*0\s*\)', '', body)  # liveness probe
             if self.script_kill is not None and self.script_kill.search(body):
                 self.block('script-kill', 'interpreter code signals processes the guard cannot check')
