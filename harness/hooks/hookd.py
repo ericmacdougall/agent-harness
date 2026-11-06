@@ -50,6 +50,8 @@ MAX_HEADER = 1024 * 1024               # env + argv
 MAX_REPLY = 4 * 1024 * 1024
 DEFAULT_MAX_CHILDREN = 16
 DEFAULT_BUDGET = 20.0                  # seconds a served call may run before the parent kills it
+WRITER_TIMEOUT_S = 1.0                 # one WAL append through the writer; then the request appends directly
+MAX_BUDGET = 55.0                      # clamp: the parent hard-kills a request child at 65 s (red-team L5)
 LOG_MAX = 4 * 1024 * 1024
 
 # Scripts the server may run, with the verbs it serves. Anything else is a cold-path fallback.
@@ -560,7 +562,7 @@ def serve_one(pre, conn, counters_fd):
         os.getppid = lambda: client_ppid
         _patch_subprocess(pre)
         _patch_wal(pre)
-        budget = float(header.get('budget') or DEFAULT_BUDGET)
+        budget = min(float(header.get('budget') or DEFAULT_BUDGET), MAX_BUDGET)  # under the parent's 65 s kill
         try:
             status, out, err = _fork_run(pre, os.path.basename(script), argv, stdin_bytes, budget)
         except TimeoutError:
@@ -698,23 +700,30 @@ def _patch_wal(pre):
     if wal_module is None or not hasattr(wal_module, 'append_lines'):
         return
     direct = wal_module.append_lines
+    stuck = []  # set after one writer timeout: the rest of this request appends directly
 
     def append(path, record):
         wal_module.check_path(path)
         line = wal_module.encode(record)
-        try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if not stuck:
             try:
-                sock.settimeout(5.0)
-                sock.connect(writer_path())
-                send_frame(sock, os.fspath(path).encode())
-                send_frame(sock, line)
-                if recv_frame(sock, 256) == b'ok':
-                    return
-            finally:
-                sock.close()
-        except (OSError, EOFError, ValueError, struct.error):
-            pass
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    # Short: a writer that is alive but stuck (stopped, swapped out) must cost one second at most,
+                    # not the hook's whole budget (red-team M2). Residual: a writer that fsyncs after this timeout
+                    # and the direct append below can write the metadata line twice (documented, red-team L3).
+                    sock.settimeout(WRITER_TIMEOUT_S)
+                    sock.connect(writer_path())
+                    send_frame(sock, os.fspath(path).encode())
+                    send_frame(sock, line)
+                    if recv_frame(sock, 256) == b'ok':
+                        return
+                finally:
+                    sock.close()
+            except socket.timeout:
+                stuck.append(True)
+            except (OSError, EOFError, ValueError, struct.error):
+                pass
         direct(path, [line])
 
     wal_module.append = append
