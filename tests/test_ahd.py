@@ -957,3 +957,52 @@ class AlertNoise(Scratch):
         self.assertEqual(sorted(got), ["ask:digest", "ask:ledger:error"])
         self.assertEqual((got["ask:digest"]["severity"], got["ask:digest"]["since"]), ("high", 3))
         self.assertEqual(ahd.ask_digest({}, set(), NOW), {})
+
+    def test_quiet_session_keeps_a_young_ask_and_folds_an_old_one_into_the_digest(self):
+        # review F1: a session waiting on the user stops writing; its fresh ask must keep escalating on its own key
+        quiet = self.home / ".claude" / "wals" / OLD_SESSION
+        quiet.mkdir(parents=True)
+        young = ahd.iso(NOW - 3600)
+        with open(quiet / "main.jsonl", "a") as fh:
+            fh.write(json.dumps({"at": young, "event": "ask", "id": "wyoung000001", "note": "n"}) + "\n")
+        self.wal_ask(quiet / "main.jsonl", "wold00000001")
+        os.utime(quiet / "main.jsonl", (NOW - 3500, NOW - 3500))
+        self.owners([])
+        self.owners([], session=OLD_SESSION)
+        self.policy["ask_current_window_seconds"] = 600
+        d = self.daemon()
+        d.tick()
+        asks = sorted(k for k in d.last["desired"] if k.startswith("ask:"))
+        self.assertEqual(asks, ["ask:digest", "ask:wyoung000001:due"])
+        self.assertIn("wold00000001", d.last["desired"]["ask:digest"]["message"])  # folded, not lost
+
+    def test_current_session_window_edges(self):
+        os.utime(self.main_wal, (NOW - 3600, NOW - 3600))
+        self.assertEqual(ahd.current_sessions([SESSION], self.policy, NOW), {SESSION[:8]})
+        os.utime(self.main_wal, (NOW - 3601, NOW - 3601))
+        self.assertEqual(ahd.current_sessions([SESSION], self.policy, NOW), set())
+        self.assertEqual(ahd.current_sessions(["00000000-0000-4000-8000-000000000000"], self.policy, NOW), set())
+
+    def test_torn_ledger_holds_the_digest_and_report_keeps_unowned(self):
+        # review F2 and F4
+        led = self.home / ".agent-harness" / "work-assignments.json"
+        led.parent.mkdir(parents=True, exist_ok=True)
+        led.write_text(json.dumps({"items": {"WA-1": {
+            "id": "WA-1", "state": "open", "owner": "unassigned", "description": "x",
+            "created": "2027-01-14T07:00:00Z", "state_since": "2027-01-14T07:00:00Z"}}}))
+        self.owners([])
+        old = self.home / ".claude" / "wals" / OLD_SESSION
+        old.mkdir(parents=True)
+        self.wal_ask(old / "main.jsonl", "wold00000002")
+        os.utime(old / "main.jsonl", (NOW - 7200, NOW - 7200))
+        self.owners([], session=OLD_SESSION)
+        d = self.daemon()
+        d.tick()
+        self.assertEqual(d.last["summary"]["unowned"], ["ask:WA-1:unowned"])
+        self.assertIn("ask:digest", self.ring())
+        before = len(self.alert_calls())
+        led.write_text("{torn")
+        self.t = NOW + 4000  # past the refresh rate limit: an unheld digest would be rewritten now
+        d.tick()
+        digest_writes = [a for a in self.alert_calls()[before:] if "ask:digest" in a]
+        self.assertEqual(digest_writes, [])

@@ -441,12 +441,20 @@ def current_sessions(sessions: list, policy: dict, ts: float) -> set:
     return out
 
 
-def ask_digest(flags: dict, current: set, ts: float) -> dict:
-    """Keep individual ask alerts only for WAL asks from a current session (and the ledger error); fold every other
-    ask alert into one ask:digest per host at the highest folded severity, so old or foreign asks cost one row."""
+def ask_digest(flags: dict, current: set, ts: float, policy: dict = None) -> dict:
+    """Keep individual ask alerts for WAL asks from a current session, WAL asks younger than ask_individual_age_seconds
+    (default 3 h, past the last ask_reminders severity step, so P16 escalation still raises per ask), and the ledger
+    error. Fold every other ask alert into one ask:digest per host at the highest folded severity.
+    A folded ask is still open: its own key clears but the digest counts it and lists up to 8 ids; the clear of an
+    ask:<id>:due key therefore means "folded or answered", and `ah`/provenance asks remain the record.
+    Trade-off: once the digest is high, a newly folded ask changes only its count and text, refreshed under the
+    plan_transitions rate limit; it is not a fresh raise."""
+    young = (policy or {}).get("ask_individual_age_seconds", 3 * 3600)
     out, folded = {}, []
     for k, f in flags.items():
-        if k == "ask:ledger:error" or (f.get("detail") or {}).get("session") in current:
+        d = f.get("detail") or {}
+        if k == "ask:ledger:error" or d.get("session") in current or (
+                f.get("kind") == "ask-due" and ts - (f.get("since") or 0) < young):
             out[k] = f
         else:
             folded.append((k, f))
@@ -631,7 +639,7 @@ class Daemon:
         desired.update(liveness_alerts(docs, self.policy))
         ask_flags = dict(ask_alerts(asks, self.policy, ts))
         ask_flags.update(wal_ask_alerts(pending, ts))
-        desired.update(ask_digest(ask_flags, current_sessions(sessions, self.policy, ts), ts))
+        desired.update(ask_digest(ask_flags, current_sessions(sessions, self.policy, ts), ts, self.policy))
         desired.update(ring_wrap_alert(events, ts, self.host))
         desired.update(wal_unsafe_alerts(blocked, ts))
         ring = ring_state(events, SOURCE, self.host)
@@ -646,21 +654,22 @@ class Daemon:
         if bad & {"sessions", "owners"}:
             hold |= {k for k in ring if k.startswith("liveness:") and k not in desired}
         if "asks" in bad or any("error" in a for a in asks):
-            hold |= {k for k in ring if k.startswith("ask:") and k not in desired}
+            # the digest is built from partial data then: hold it too, never lower or rewrite it on missing data
+            hold |= {k for k in ring if k.startswith("ask:") and (k not in desired or k == "ask:digest")}
         plan = plan_transitions(desired, ring, frozenset(hold), now=ts)
         sent = step("alerts", lambda: self.send(plan, deadline)) or 0
         step("spool", lambda: self.call("spool drain", [], deadline))
         summary.update(sessions=len(sessions), owners=sum(len((d or {}).get("owners") or []) for d in docs.values()),
                        asks_open=sum(1 for a in asks if a.get("state") in OPEN_STATES),
                        wal_asks_open=len(pending), desired=len(desired), transitions=len(plan), sent=sent,
-                       unowned=sorted(k for k in desired if k.endswith(":unowned")),
+                       unowned=sorted(k for k in ask_flags if k.endswith(":unowned")),  # before folding
                        dropped=sorted(k for k, f in desired.items() if (f.get("detail") or {}).get("state") == "DROPPED"),
                        silent=sorted(k for k, f in desired.items()
                                      if (f.get("detail") or {}).get("state") in ("SILENT", "SILENT-HIGH")),
                        wall_s=round(mono() - mt, 3))
         if summary["skipped"]:
             log.warning("tick %s over budget; skipped %s", self.tick_no, ",".join(summary["skipped"]))
-        self.last = {"summary": summary, "desired": desired, "wal_asks": pending}
+        self.last = {"summary": summary, "desired": desired, "wal_asks": pending, "ask_flags": ask_flags}
         return summary
 
     def run_checks(self, deadline: float):
@@ -911,7 +920,7 @@ def main(argv=None) -> int:
         out = {"summary": {k: v for k, v in s.items() if k not in ("unowned", "dropped", "silent")},
                "dropped": [d.last["desired"][k]["message"] for k in s["dropped"]],
                "silent": [d.last["desired"][k]["message"] for k in s["silent"]],
-               "unowned": [d.last["desired"][k]["message"] for k in s["unowned"]],
+               "unowned": [d.last["ask_flags"][k]["message"] for k in s["unowned"]],
                "waiting_on_user": [f"{w['id']} ({w['session']}): {w['text']}" for w in d.last["wal_asks"]],
                "would_write": d.dry_writes}
         print(json.dumps(out, indent=1))
