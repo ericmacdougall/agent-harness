@@ -928,7 +928,7 @@ class OwnerRuleTests(LivenessTests):
     def test_outcomes_helpers_and_waits_do_not_drop(self):
         self.owner("ahanded", stop=7200, wal=[(7300, "handoff", "PR_READY")])
         self.owner("aresult", stop=7200, wal=[(7300, "result", "done")])
-        self.owner("awaiting", stop=7200, wal=[(7300, "blocker", "waiting on dev2 suite")])
+        self.owner("awaiting", stop=7200, wal=[(7300, "blocker", "waiting on GoodQA goodqa#14500 dev2 suite")])  # a wait names a ticket, ask or agent (goodqa#14791 H3)
         self.owner("ahelper", typ="red-team", stop=7200, wal=[(7300, "check", "x")])
         self.owner("aunnamed", typ="general-purpose", stop=7200, wal=[(7300, "check", "x")])
         self.assertEqual(self.alerts(), {})

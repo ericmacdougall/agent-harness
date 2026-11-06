@@ -1333,6 +1333,8 @@ def _owner_alerts(home, session, tickets, now):
     out = []
     for row in rows:
         state = row.get("state", "")
+        if row.get("type") == "task-wal":
+            continue  # task-named WALs are alerted by _task_wal_alert with the ring key form liveness:<s8>/<task>
         if not row.get("owner") or not (state in OWNER_ALERT_STATES or state in OWNER_RUNNING_STATES):
             continue
         task = f"agent-{row['agent_id']}"

@@ -351,6 +351,88 @@ def cmd_prompt(payload: dict) -> dict:
                                    "additionalContext": "Provenance reminder: your last message had untraceable asks. " + text}}
 
 
+PRESENCE_MINUTES_DEFAULT = 10
+
+
+def last_human_turn(session: str) -> float:
+    """Epoch of the newest `prompt` event in the session main WAL (the UserPromptSubmit hook writes one per human
+    turn), or 0.0. Reads only the tail, never the prompt text."""
+    import os  # noqa: PLC0415
+    path = Path(os.environ.get("AH_HOME") or Path.home()) / ".claude" / "wals" / session / "main.jsonl"
+    newest = 0.0
+    try:
+        tail = safe_input.read_tail(path, 262144)
+        if True:
+            for raw in tail.splitlines():
+                if b'"prompt"' not in raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("event") == "prompt":
+                    ts = prov.parse_ts(rec.get("at")) if hasattr(prov, "parse_ts") else None
+                    if ts is None:
+                        import datetime as dt  # noqa: PLC0415
+                        try:
+                            ts = dt.datetime.fromisoformat(str(rec.get("at")).replace("Z", "+00:00")).timestamp()
+                        except (TypeError, ValueError):
+                            ts = None
+                    newest = max(newest, ts or 0.0)
+    except OSError:
+        return 0.0
+    return newest
+
+
+def user_present(session: str, now: float | None = None) -> bool:
+    import os, time  # noqa: PLC0415
+    minutes = prov.load_policy().get("ask_presence_minutes", PRESENCE_MINUTES_DEFAULT)
+    override = os.environ.get("AH_USER_PRESENT")  # tests and the console can pin presence
+    if override in ("0", "1"):
+        return override == "1"
+    now = time.time() if now is None else now
+    return now - last_human_turn(session) <= float(minutes) * 60
+
+
+def notify_pending_ask(session: str, ids: list, why: str) -> None:
+    """Ring alert per ask so the console, the prompt context and the digest carry it (P16/P17). Best effort."""
+    try:
+        import ops_watch  # noqa: PLC0415
+        for ask_id in ids or ["none"]:
+            ops_watch.emit({"host": ops_watch.default_host(), "source": "ask-gate", "event": "raise", "severity": "warning",
+                            "key": f"ask:{ask_id}:pending-user", "message": f"ask {ask_id} awaits the user ({why}); owner keeps working",
+                            "detail": {"session": session[:8], "ask": ask_id}})
+    except Exception:  # noqa: BLE001 - the gate decision never depends on the ring
+        pass
+
+
+def presence_block(payload: dict, session: str, ids: list) -> dict:
+    """P17 (goodqa#14791 I17): a modal question is allowed only to the interactive main while the user is present.
+    Otherwise the ask stays registered, the user is notified through the ring, and the caller continues."""
+    import os  # noqa: PLC0415
+    mode = prov.load_policy().get("ask_presence", "enforce")
+    if mode == "off":
+        return {}
+    ask_list = ", ".join(f"[ask:{i}]" for i in ids) or "the registered ask"
+    if payload.get("agent_id") or os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk"):
+        reason = (f"Sub-agents never call AskUserQuestion: route the question to main with SendMessage, citing {ask_list}, "
+                  "record `ah task dispose --agent <you> --kind waiting --ref <ask id> --until <ISO>` if you must wait, "
+                  "and continue every independent step.")
+        notify_pending_ask(session, ids, "asked by a sub-agent")
+    elif not user_present(session):
+        reason = (f"The user is away (no human turn within the presence window): {ask_list} stays registered and the user "
+                  "is notified; do not block on a modal. Continue all independent work, and if an item must wait, record "
+                  "`ah task dispose --agent <owner> --kind waiting --ref <ask id> --until <ISO>`. The answer routes back "
+                  "by ask id (`ah user-msg`).")
+        notify_pending_ask(session, ids, "user away")
+    else:
+        return {}
+    if mode == "enforce":
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": "Ask gate: " + reason}}
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "(warn mode) Ask gate: " + reason}}
+
+
 def cmd_ask_gate(payload: dict) -> dict:
     mode = prov.load_policy().get("ask_user_question", "enforce")
     if mode == "off" or payload.get("tool_name") != "AskUserQuestion":
@@ -367,7 +449,11 @@ def cmd_ask_gate(payload: dict) -> dict:
         outcome = cite(body, session)
         if not outcome["ok"]:
             problems.append(f"question {index}: {outcome['problem']}")
+    ids = [m.group(1) for m in ASK_ID.finditer(json.dumps(questions, ensure_ascii=False))]
     if not problems:
+        away = presence_block(payload, session, ids)
+        if away:
+            return away
         shown = [f"[ask:{m.group(1)}] = {prov.clip((find_ask(session, m.group(1)) or {}).get('note', ''), 100)}"
                  for m in ASK_ID.finditer(json.dumps(questions, ensure_ascii=False))]
         if shown:  # make an id reused for an unrelated question visible to the user

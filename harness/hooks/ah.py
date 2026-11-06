@@ -29,6 +29,9 @@ SECRET_NAMES = re.compile(r"(\.secret$|^\.env(\..*)?$|^member\.key$|^credentials
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 TICKET_RE = re.compile(r"^GoodQA\s+(?:([a-z0-9][a-z0-9-]{0,62})\s*)?#([1-9]\d{0,9})$")
 KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
+ASK_ID_RE = re.compile(r"^w[0-9a-f]{11}$")
+OWNER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+TASK_WAL_WINDOW_S = 48 * 3600  # a task-named WAL untouched this long is history (ahd owner_window_seconds)
 WRAPPER = re.compile(r"^\s*<[A-Za-z][\w-]*[\s>/]")
 MAX_REQUEST = 256 * 1024
 SKIP_DARWIN = ("Library", "Desktop", "Documents", "Downloads", "Pictures", "Movies", "Music", "Applications")
@@ -166,6 +169,7 @@ def newest_session(home: Path):
 
 
 def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
+    own = path.name[len("agent-"):-len(".jsonl")] if path.name.startswith("agent-") else path.name[:-len(".jsonl")]
     cache = index_dir / ("wal-" + hashlib.sha256(str(path).encode()).hexdigest()[:16] + ".json")
     try:
         summary = json.loads(_bounded(cache))
@@ -186,7 +190,8 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
         if not isinstance(rec, dict):
             continue
         at = parse_ts(rec.get("at"))
-        summary["last_at"] = max(summary["last_at"], at)
+        if not rec.get("by") or rec.get("by") == own:  # a record another actor wrote on this owner's behalf is not its activity (review H2)
+            summary["last_at"] = max(summary["last_at"], at)
         summary["events"] += 1
         event, note = rec.get("event"), rec.get("note") if isinstance(rec.get("note"), str) else ""
         if event == "intent":
@@ -287,6 +292,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         info["type"] = info["type"] or meta.get("type")
         info.update({k: meta[k] for k in ("description", "parent", "finished") if k in meta})
     registered = {r["args"].get("owner_agent") for r in _ledger(home) if r.get("op") == "task.register"}
+    pending = pending_stops(home, session)
     named_text = "\n".join(named)
     rows = []
     for agent, info in spawned.items():
@@ -301,9 +307,10 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         is_stopped = agent in stopped and max(last_wal, tmtime) <= stop_at.get(agent, 0.0) + 10
         by_name = info["type"] in liveness.NAMEABLE_TYPES and agent in named_text
         is_owner = agent in registered or info["type"] in liveness.OWNER_TYPES or by_name
+        grace = 0.0 if pending.get(agent, 0.0) >= max(last_wal, tmtime) - 10 else None  # I7: no finishing grace (10 s, as is_stopped)
         verdict = liveness.classify(now, last_wal, tmtime, is_stopped,
                                     summary["outcome"], summary["last_note"], info["type"],
-                                    agent in registered, owner=is_owner)
+                                    agent in registered, owner=is_owner, finish_grace=grace)
         idle = verdict["idle_s"]
         text = " ".join(filter(None, [info.get("description"), summary["first"]]))
         restricted = bool(RESTRICTED.search(text))
@@ -318,11 +325,50 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         if comments and row["ticket"]:
             row["ticket_comment_age_s"] = comments(row["ticket"], now)
         rows.append(row)
+    for f in sorted(wal.glob("*.jsonl")):  # I8: task-named WALs are owners too, with no process behind them
+        name = f.name[:-len(".jsonl")]
+        if name == "main" or name.startswith("agent-") or not OWNER_ID_RE.match(name):
+            continue
+        try:
+            if now - f.stat().st_mtime > TASK_WAL_WINDOW_S:
+                continue  # history, not an owner (same window ahd uses for sessions)
+        except OSError:
+            continue
+        summary = summarize_agent_wal(f, index_dir)
+        verdict = liveness.classify_task_wal(now, summary["last_at"], summary["outcome"], summary["last_note"])
+        idle = verdict["idle_s"]
+        text = summary["first"] or ""
+        restricted = bool(RESTRICTED.search(text))
+        rows.append({"agent_id": name, "type": "task-wal", "task": None if restricted else text, "restricted": restricted,
+                     "parent": None, "owner": True, "registered": name in registered, "flags": ["task-wal"],
+                     "state": verdict["state"], "severity": verdict["severity"],
+                     "last_activity": iso(summary["last_at"]), "idle_s": None if idle == float("inf") else int(idle),
+                     "ticket": summary["tickets"][0] if summary["tickets"] else None, "ticket_comment_age_s": None})
+    disp = dispositions(home, session)
+    live_ids = {r["agent_id"] for r in rows if r["state"] not in ("DROPPED", "done", "handoff", "returned")}
+    for r in rows:
+        d = disp.get(r["agent_id"])
+        last_wal = parse_ts(r["last_activity"]) or 0.0
+        alive = liveness.disposition_live(d, now, last_activity=last_wal,
+                                          replacement_live=bool(d and d.get("ref") in live_ids))
+        r["disposition"] = dict(d, live=alive) if d else None
+        r["decision_required"] = bool(r["owner"] and r["state"] == "DROPPED" and not alive)
+    # a wait on another agent holds only while that agent is live; a wait on a DROPPED, done or unknown agent is a drop
+    states = {r["agent_id"]: r["state"] for r in rows}
+    for r in rows:
+        target = r["state"][len("waiting-on-"):] if r["state"].startswith("waiting-on-") else ""
+        if r["owner"] and target and OWNER_ID_RE.match(target) and not ASK_ID_RE.match(target) and "#" not in target \
+                and target != "main" and states.get(target, "absent") in ("DROPPED", "done", "handoff", "returned", "absent"):
+            d = disp.get(r["agent_id"])
+            if not liveness.disposition_live(d, now, last_activity=parse_ts(r["last_activity"]) or 0.0):
+                r["decision_required"] = True
+                r["flags"] = list(r.get("flags") or []) + [f"wait-target-{states.get(target, 'absent').lower()}"]
     rows.sort(key=lambda r: (r["state"] in ("done", "handoff"), -(r["idle_s"] or 0)))
     counts = {}
     for r in rows:
         counts[r["state"]] = counts.get(r["state"], 0) + 1
-    return {"session": session, "generated": iso(now), "counts": counts, "owners": rows, "source": "direct"}
+    return {"session": session, "generated": iso(now), "counts": counts, "owners": rows, "source": "direct",
+            "undisposed": sorted(r["agent_id"] for r in rows if r["decision_required"])}
 
 
 # ------------------------------------------------------------------ user-msg
@@ -717,6 +763,10 @@ def derive_key(op: str, args: dict, session: str) -> str:
     return "ah:" + hashlib.sha256(canonical([op, args, session]).encode()).hexdigest()[:32]
 
 
+def actor_id() -> str:
+    return os.environ.get("AH_AGENT_ID") or os.environ.get("AGENT_ID") or "main"
+
+
 def actor(session, host=None):
     return {"session": session or "", "agent_id": os.environ.get("AH_AGENT_ID", "main"),
             "host": host or socket.gethostname()}
@@ -751,6 +801,34 @@ def precheck(op: str, args: dict) -> None:
                 (re.fullmatch(r"[0-9a-f]{7,40}", str(e.get("commit", ""))) and e.get("repo")))
             if not ok:
                 raise AhError("evidence", "each evidence item is {really_tested, wal} or {commit, repo}")
+    elif op == "task.dispose":
+        need("agent", "session", "kind", "at")
+        if args["kind"] not in liveness.DISPOSITIONS:
+            raise AhError("bad_request", f"task.dispose: kind must be one of {', '.join(liveness.DISPOSITIONS)}")
+        if not OWNER_ID_RE.match(args["agent"]):
+            raise AhError("bad_request", "task.dispose: agent must be an agent id or a task WAL name")
+        if parse_ts(args["at"]) is None:
+            raise AhError("bad_request", "task.dispose: at must be an ISO timestamp")
+        if args["kind"] == "waiting":
+            if parse_ts(args.get("until") or "") is None:
+                raise AhError("bad_request", "task.dispose waiting: --until <ISO time> is required (when it expires)")
+            ref = args.get("ref") or ""
+            if not (ASK_ID_RE.match(ref) or TICKET_RE.match(ref)):
+                raise AhError("bad_request", "task.dispose waiting: --ref must be an ask id (w + 11 hex) or 'GoodQA <project>#N'; "
+                                             "a wait must name what it waits on")
+        elif args["kind"] == "reassigned":
+            if not OWNER_ID_RE.match(args.get("ref") or ""):
+                raise AhError("bad_request", "task.dispose reassigned: --ref <replacement agent id> is required")
+        elif args["kind"] == "closed":
+            if len((args.get("reason") or "").strip()) < 8:
+                raise AhError("bad_request", "task.dispose closed: --reason (8+ characters) is required")
+            ev = args.get("evidence") or ""
+            if not (TICKET_RE.match(ev) or ASK_ID_RE.match(ev) or re.fullmatch(r"[0-9a-f]{7,40}", ev)):
+                raise AhError("bad_request", "task.dispose closed: --evidence must be a ticket, a WAL id or a commit sha")
+    elif op == "task.pending":
+        need("agent", "session", "at")
+        if not OWNER_ID_RE.match(args["agent"]) or parse_ts(args["at"]) is None:
+            raise AhError("bad_request", "task.pending: agent id and ISO at are required")
     elif op == "ticket.comment":
         need("body")
         if not TICKET_RE.match(args.get("ticket") or ""):
@@ -991,7 +1069,7 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         if not reg:
             raise AhError("unknown_task", f"task {args['task']!r} is not registered (ah task register)", 3)
         r = reg["args"]
-        rec = {"at": now, "event": "status", "id": wid, "note": f"[{args['stage']}] {args['note']}"[:3900]}
+        rec = {"at": now, "event": "status", "id": wid, "by": actor_id(), "note": f"[{args['stage']}] {args['note']}"[:3900]}
         _wal_append(home, _wal_path(home, r["session"], r["owner_agent"]), rec)
         out["wal"] = wid
         comment(args.get("ticket") or r["ticket"], f"Task {args['task']} [{args['stage']}]: {args['note']}")
@@ -1003,12 +1081,82 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         _evidence_ok(home, args["evidence"], allowed, reg)
         r = reg["args"]
         cites = "; ".join(e.get("really_tested") or e["commit"] for e in args["evidence"])
-        rec = {"at": now, "event": "result", "id": wid, "note": f"task {args['task']} done; evidence: {cites}"[:3900]}
+        rec = {"at": now, "event": "result", "id": wid, "by": actor_id(), "note": f"task {args['task']} done; evidence: {cites}"[:3900]}
         _wal_append(home, _wal_path(home, r["session"], r["owner_agent"]), rec)
         out["wal"] = wid
         comment(r["ticket"], rec["note"])
+    elif op == "task.pending":
+        wal = _wal_path(home, args["session"], args["agent"])
+        if wal.is_file():  # the marker is written by the gate, never counted as the owner's activity
+            _wal_append(home, wal, {"at": now, "event": "pending_stop", "id": wid, "by": "dropped_gate",
+                                    "note": "stopped with pending work and no armed waiter (goodqa#14791 I7)"})
+        out["wal"] = wid
     elif op == "ticket.comment":
         comment(args["ticket"], args["body"])
+    elif op == "task.dispose":
+        main_wal = _wal_path(home, args["session"], "main")
+        if not main_wal.is_file():
+            raise AhError("session_unknown", f"no main WAL for session {args['session']!r}", 3)
+        ref = args.get("ref") or ""
+        if args["kind"] == "waiting" and ASK_ID_RE.match(ref) and not _wal_has(main_wal, "ask", ref):
+            raise AhError("bad_request", f"task.dispose waiting: ask {ref} is not in this session's WAL", 3)
+        if args["kind"] == "reassigned" and not (_wal_has(main_wal, "subagent", None, agent=ref)
+                                                or (main_wal.parent / f"{ref}.jsonl").is_file()):
+            raise AhError("bad_request", f"task.dispose reassigned: {ref} is not an agent of this session", 3)
+        ev = args.get("evidence") or ""
+        if args["kind"] == "closed" and ASK_ID_RE.match(ev) and not (_wal_has(main_wal, None, ev) or
+                _wal_has(_wal_path(home, args["session"], args["agent"]), None, ev)):
+            raise AhError("evidence", f"task.dispose closed: WAL id {ev} is not in this session's WALs", 3)
+        rec = {"at": now, "event": "disposition", "id": wid, "agent": args["agent"], "kind": args["kind"],
+               "note": f"owner {args['agent']} {args['kind']}: {args.get('reason') or args.get('ref') or ''}"[:300]}
+        for k in ("until", "ref", "reason", "evidence"):
+            if args.get(k):
+                rec[k] = args[k]
+        _wal_append(home, main_wal, rec)
+        out["wal"] = wid
+    return out
+
+
+def _wal_has(path: Path, event: str, ident, agent=None) -> bool:
+    """True when the session WAL holds an entry of `event` with that id (or that agent_id)."""
+    try:
+        with open(path, "rb") as handle:
+            for raw in handle:
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict) or (event is not None and rec.get("event") != event):
+                    continue
+                if (ident is not None and rec.get("id") == ident) or (agent is not None and rec.get("agent_id") == agent):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def pending_stops(home: Path, session: str) -> dict:
+    """agent id -> epoch of the latest task.pending row (a stop with pending work, I7)."""
+    out = {}
+    for r in _ledger(home):
+        a = r.get("args") or {}
+        if r.get("op") == "task.pending" and a.get("session") == session:
+            out[a["agent"]] = max(out.get(a["agent"], 0.0), parse_ts(a.get("at")) or 0.0)
+    return out
+
+
+def dispositions(home: Path, session: str) -> dict:
+    """agent id -> latest applied disposition row for that session (from the ah ledger, the only writer)."""
+    out = {}
+    for r in _ledger(home):
+        a = r.get("args") or {}
+        if r.get("op") == "task.dispose" and a.get("session") == session:
+            d = {"kind": a.get("kind"), "at": parse_ts(a.get("at")) or 0.0, "ref": a.get("ref"),
+                 "reason": a.get("reason"), "evidence": a.get("evidence"), "seq": r.get("seq")}
+            if a.get("until"):
+                d["until"] = parse_ts(a["until"]) or 0.0
+            if a["agent"] not in out or (d["seq"] or 0) >= (out[a["agent"]].get("seq") or 0):
+                out[a["agent"]] = d
     return out
 
 
@@ -1149,7 +1297,41 @@ def doctor() -> dict:
             checks.append({"check": f"file {name}", "ok": True, "sha256": hashlib.sha256(_bounded(f, 16 << 20)).hexdigest()[:16]})
         except OSError:
             checks.append({"check": f"file {name}", "ok": False})
+    running = ahd_running_check(home_dir())
+    if os.environ.get("AH_EXPECT_AHD", "1") == "0":  # hosts without the daemon (and partial-install tests) only report it
+        running = dict(running, ok=True, expected=False)
+    checks.append(running)
     return {"ok": all(c["ok"] for c in checks), "checks": checks}
+
+
+def ahd_running_check(home: Path, now: float | None = None, max_beat_age: float = 300.0) -> dict:
+    """ahd is the deterministic manager (goodqa#14791): doctor fails while it is not running on this host. Running =
+    its lock is held (a non-blocking flock attempt fails) or its heartbeat is fresher than max_beat_age."""
+    import fcntl  # noqa: PLC0415
+    now = time.time() if now is None else now
+    lock = home / ".agent-harness" / "run" / "ahd.lock"
+    held = False
+    try:
+        fd = os.open(lock, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                held = True
+        finally:
+            os.close(fd)
+    except OSError:
+        held = False
+    beat = home / ".agent-harness" / "state" / "ahd" / "heartbeat.json"
+    beat_age = None
+    try:
+        beat_age = now - beat.stat().st_mtime
+    except OSError:
+        pass
+    ok = held or (beat_age is not None and beat_age <= max_beat_age)
+    return {"check": "ahd running", "ok": ok, "lock_held": held, "heartbeat_age_s": None if beat_age is None else int(beat_age),
+            "fix": None if ok else "python3 ~/.claude/hooks/ahd.py install --apply (or install.py --apply --services)"}
 
 
 def build_parser():
@@ -1159,6 +1341,7 @@ def build_parser():
     o = sub.add_parser("owners")
     o.add_argument("--session")
     o.add_argument("--comments", action="store_true", help="also fetch latest ticket comment age (network)")
+    o.add_argument("--gate", action="store_true", help="exit 1 while any DROPPED owner has no live disposition")
     u = sub.add_parser("user-msg")
     u.add_argument("--session")
     u.add_argument("--text-match", "--search", dest="search", help="words to find in a real human turn")
@@ -1203,7 +1386,14 @@ def build_parser():
     dn.add_argument("--wal")
     dn.add_argument("--commit", action="append", default=[])
     dn.add_argument("--repo")
-    for x in (r, st, dn, cc):
+    dp = ks.add_parser("dispose", help="record the decision for a DROPPED owner: resumed, reassigned, waiting or closed")
+    dp.add_argument("--agent", required=True)
+    dp.add_argument("--kind", required=True, choices=list(liveness.DISPOSITIONS))
+    dp.add_argument("--ref", help="waiting: ask id or ticket; reassigned: replacement agent id")
+    dp.add_argument("--until", help="waiting: ISO time when the wait expires")
+    dp.add_argument("--reason", help="closed: why (8+ characters)")
+    dp.add_argument("--evidence", help="closed: ticket, WAL id or commit sha")
+    for x in (r, st, dn, cc, dp):
         x.add_argument("--session")
         x.add_argument("--key", help="idempotency key (default: derived from the request)")
     sub.add_parser("doctor", help="check the import chain and file hashes of this install")
@@ -1252,6 +1442,12 @@ def run(args, home: Path) -> dict:
                 if getattr(args, opt):
                     a[opt] = getattr(args, opt)
             return write(home, "task.register", a, s, args.key)
+        if args.sub == "dispose":
+            a = {"agent": args.agent, "session": s or "", "kind": args.kind, "at": iso(time.time())}
+            for opt in ("ref", "until", "reason", "evidence"):
+                if getattr(args, opt):
+                    a[opt] = getattr(args, opt)
+            return write(home, "task.dispose", a, s, args.key)
         if args.sub == "status":
             a = {"task": args.task, "stage": args.stage, "note": args.note}
             if args.ticket:
@@ -1292,6 +1488,10 @@ def main(argv=None) -> int:
         sys.stdout.write(json.dumps(data, indent=None if args.cmd == "write" else 2) + "\n")
     if isinstance(data, dict) and data.get("ok") is False:
         return 3
+    if args.cmd == "owners" and getattr(args, "gate", False) and data.get("undisposed"):
+        sys.stdout.write("GATE: undisposed DROPPED owners: " + ", ".join(data["undisposed"]) +
+                         " (record a decision with `ah task dispose --agent <id> --kind resumed|reassigned|waiting|closed ...`)\n")
+        return 1
     return 0
 
 
