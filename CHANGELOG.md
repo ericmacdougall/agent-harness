@@ -7,6 +7,7 @@ group by pull request.
 ## Unreleased
 
 ### Fixed
+- merge gate false positives (goodqa#15122): `git push gh <sha>:refs/heads/<feature>` (a remote named gh) is no longer read as a gh call; read-only gh calls whose words come from a literal variable in the same command pass; the subagent exception-record block matches the real command or code, not free text in notes, commit messages or ticket bodies. New: a `git push` to main or master, `--all`, `--mirror` or a destination built at run time blocks.
 - log-backup bulk lane: on the Mac the bulk tier now runs as its own detached run beside tier 1, on a split of the
   same 2/s write budget, instead of in the few minutes tier 1 left (about 400 files an hour). Bulk chunks are 1000
   files. A pass is listed again when the exclude lists change, and five verified `.lanes` copies (about 230k files)

@@ -802,3 +802,103 @@ class ActiveWorkflows(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FalsePositives15122(Base):
+    """goodqa#15122: false positives seen during the prod move, each with the block that must stay."""
+
+    SUB = {"agent_id": "sub-1", "agent_type": "task-owner"}
+
+    def kinds(self, command):
+        return sorted({m.kind for m in mg.find_merges(expand(command), cwd="/work")})
+
+    def test_ac4_push_of_a_feature_branch_to_a_remote_named_gh_is_not_a_merge(self):
+        cases = ["git push gh {HEAD}:refs/heads/fix/guard-false-positives-15122",
+                 'git push gh "${H}:refs/heads/feat/x"',
+                 "git -C /r push -u gh HEAD:refs/heads/feat",
+                 "git push --force-with-lease gh feat",
+                 "H=abc; git push gh $H:refs/heads/feat",
+                 "git fetch gh main",
+                 "git remote add gh https://github.com/o/r.git",
+                 "git log gh/main --oneline"]
+        for command in cases:
+            with self.subTest(command):
+                self.assertEqual(self.kinds(command), [], command)
+                code, text, gh = self.decide(command, scenario="red_netwatch")
+                self.assertEqual(code, 0, text)
+                self.assertEqual(gh.calls, [])
+
+    def test_neg4_push_to_main_or_master_and_gh_merges_stay_blocked(self):
+        for command in ("git push origin main", "git push gh {HEAD}:refs/heads/main", "git push gh +feat:master",
+                        "git push origin --delete main", "git push origin :main", "git push --mirror gh",
+                        "git push gh --all", 'git push origin "$B"', "git -C /r push origin HEAD:refs/heads/main",
+                        "B=main; git push gh feat:$B"):
+            with self.subTest(command):
+                self.assertEqual(self.kinds(command), ["unverifiable"], command)
+                self.assertEqual(self.decide(command)[0], 2, command)
+        for command in ("git push gh feat && gh pr merge 5 --match-head-commit {HEAD}",
+                        "git submodule foreach gh pr merge 5", "gh pr merge 5"):
+            with self.subTest(command):
+                self.assertTrue({"pr_merge", "unverifiable"} & set(self.kinds(command)), command)
+                self.assertEqual(self.decide(command, scenario="red_netwatch")[0], 2, command)
+
+    def test_ac3_read_only_gh_built_from_literal_variables_is_not_a_merge(self):
+        for command in ("SUB=view; gh pr $SUB 5", "GH=gh; $GH pr view 5 --json headRefOid",
+                        "G=gh; $G api repos/o/r/pulls/5", "S=list; gh pr ${S}"):
+            with self.subTest(command):
+                self.assertEqual(self.kinds(command), [], command)
+                self.assertEqual(self.decide(command, scenario="red_netwatch")[0], 0, command)
+
+    def test_neg3_gh_merge_built_from_variables_stays_blocked(self):
+        for command in ("SUB=merge; gh pr $SUB 5", "GH=gh; $GH pr merge 5", "SUB=$(echo merge); gh pr $SUB 5",
+                        "SUB=view; SUB=merge; gh pr $SUB 5", "if true; then SUB=view; fi; gh pr $SUB 5",
+                        "SUB=view gh pr $SUB 5", "(SUB=view); gh pr $SUB 5", "false && SUB=view; gh pr $SUB 5",
+                        "SUB=view | true; gh pr $SUB 5", "for S in merge; do gh pr $S 5; done",
+                        "SUB=view; eval SUB=merge; gh pr $SUB 5", "SUB=view; unset SUB; gh pr $SUB 5",
+                        "SUB=view; source f; gh pr $SUB 5", "f() { SUB=view; }; f; gh pr $SUB 5",
+                        "GH=echo; $GH 'gh pr merge 5' | sh", "gh pr $SUB 5", "gh pr view 5; SUB=view; X=$SUB"):
+            with self.subTest(command):
+                kinds = self.kinds(command)
+                if command.endswith("X=$SUB"):
+                    self.assertEqual(kinds, [], command)  # control: a read, no gh word from a variable
+                    continue
+                self.assertIn("unverifiable", kinds, command)
+                self.assertEqual(self.decide(command)[0], 2, command)
+
+    def test_ac2_subagent_free_text_about_the_exception_record_is_allowed(self):
+        for command in ("python3 ~/.claude/hooks/wal_note.py --wal /w/a.jsonl --event status "
+                        "--note 'fixed the merge_gate.py waive false positive'",
+                        "git commit -m 'fix(merge_gate): the subagent waive check is structural'",
+                        "gh issue comment 15122 --body 'merge_gate waive block fired on a WAL note'",
+                        "cat > notes.md <<'EOF'\nrun merge_gate.py waive only from main\nEOF",
+                        "grep -n waive harness/hooks/merge_gate.py",
+                        "gh pr create --title t --body \"$(cat <<'EOF'\nmerge_gate.py waive is main-only\nEOF\n)\"",
+                        "python3 -m unittest tests.test_merge_gate -v"):
+            with self.subTest(command):
+                code, text = mg.decide(bash(command, **self.SUB), FakeGh(SCENARIOS["green"]), self.state)
+                self.assertEqual(code, 0, text)
+
+    def test_neg1_subagent_real_exception_record_stays_blocked(self):
+        for command in ("bash -c 'python3 /h/merge_gate.py waive --repo o/r'",
+                        "echo 'import merge_gate; merge_gate.add_waiver(1)' | python3",
+                        "python3 - <<'EOF'\nimport merge_gate\nmerge_gate.add_waiver(1)\nEOF",
+                        "python3 <<'EOF'\nimport merge_gate\nmerge_gate.add_waiver(1)\nEOF",
+                        "eval 'python3 /h/merge_gate.py waive'",
+                        "ssh host python3 /h/merge_gate.py waive --repo o/r",
+                        "ssh host 'python3 /h/merge_gate.py waive --repo o/r'",
+                        "sudo -u eric python3 -c 'import merge_gate; merge_gate.add_waiver(1)'",
+                        "cd /h && ./merge_gate.py waive --repo o/r",
+                        "python3 -m merge_gate waive --repo o/r",
+                        "printf 'import merge_gate\\nmerge_gate.add_waiver(1)\\n' > x.py && python3 x.py",
+                        "cat > x.py <<'EOF'\nimport merge_gate\nmerge_gate.add_waiver(1)\nEOF\npython3 x.py",
+                        "M=merge_gate.py; W=waive; python3 /h/$M $W",
+                        "X=python3; $X /h/merge_gate.py waive",
+                        "echo /h/merge_gate.py waive | xargs python3",
+                        "C='import merge_gate; merge_gate.add_waiver(1)'; python3 -c \"$C\"",
+                        "C='python3 /h/merge_gate.py waive'; bash -c \"$C\"",
+                        "env python3 /h/merge_gate.py waive --repo o/r",
+                        "X=merge_gate; python3 -m $X waive",
+                        "python3 ~/.claude/hooks/merge_gate.py waive --repo o/r --pr 5 --head " + HEAD):
+            with self.subTest(command):
+                code, text = mg.decide(bash(command, **self.SUB), FakeGh(SCENARIOS["green"]), self.state)
+                self.assertEqual(code, 2, text)
