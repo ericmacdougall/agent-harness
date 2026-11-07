@@ -27,6 +27,16 @@ with open(os.environ["FAKE_LOG"], "a") as h:
 if argv and argv[0] == "listremotes":
     print(os.environ.get("FAKE_REMOTES", "lessons-dropbox: dropbox"))
     sys.exit(0)
+if argv and argv[0] == "lsf":  # the bulk checkpoint lists a local source once per pass
+    if os.environ.get("FAKE_DELEGATE"):
+        os.execv(os.environ["FAKE_DELEGATE"], [os.environ["FAKE_DELEGATE"]] + argv)
+    root = argv[-1]
+    for d, _, fs in sorted(os.walk(root)):
+        for f in sorted(fs):
+            full = os.path.join(d, f)
+            st = os.stat(full)
+            print("%%s\t%%d\t%%d" %% (os.path.relpath(full, root), st.st_size, int(st.st_mtime)))
+    sys.exit(0)
 if argv and argv[0] == "copy":
     time.sleep(float(os.environ.get("FAKE_COPY_SLEEP", "0")))
     first = int(os.environ.get("FAKE_FAIL_FIRST", "0"))
@@ -59,6 +69,35 @@ if argv and argv[0] == "copy":
         time.sleep(hang)
     if os.environ.get("FAKE_EXIT_AFTER_NOTE") and note:
         sys.exit(int(os.environ["FAKE_EXIT_AFTER_NOTE"]))
+    ops_match = os.environ.get("FAKE_OPS_MATCH")
+    if ops_match and "--" in argv and argv[argv.index("--") + 1].rstrip("/").endswith(ops_match):
+        import shutil
+        src, dst = argv[argv.index("--") + 1:]
+        if "--files-from-raw" in argv:
+            names = [l for l in open(argv[argv.index("--files-from-raw") + 1]).read().splitlines() if l]
+        else:
+            names = sorted(os.path.relpath(os.path.join(d, f), src) for d, _, fs in os.walk(src) for f in fs)
+        counter = os.environ["FAKE_LOG"] + ".ops"
+        spent = int(open(counter).read()) if os.path.exists(counter) else 0
+        budget = int(os.environ["FAKE_OPS_PER_RUN"])
+        with open(os.environ["FAKE_LOG"] + ".checked", "a") as h:
+            for name in names:
+                if spent >= budget:
+                    open(counter, "w").write(str(spent))
+                    sys.exit(10)
+                spent += 1
+                h.write(name + "\\n")
+                target = os.path.join(dst, name)
+                if os.path.exists(target) and open(target, "rb").read() == open(os.path.join(src, name), "rb").read():
+                    continue
+                if spent >= budget:
+                    open(counter, "w").write(str(spent))
+                    sys.exit(10)
+                spent += 1
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                shutil.copyfile(os.path.join(src, name), target)
+        open(counter, "w").write(str(spent))
+        sys.exit(0)
     real = os.environ.get("FAKE_DELEGATE")
     if real:
         os.execv(real, [real] + argv)
@@ -153,7 +192,8 @@ class Case(unittest.TestCase):
 
 ALLOWED_FLAGS = {"--tpslimit", "--transfers", "--contimeout", "--timeout", "--log-file", "--log-level", "--exclude-from", "--backup-dir", "--ignore-case",
                  "--dropbox-batch-mode", "--dropbox-batch-size", "--checkers", "--retries", "--retries-sleep",
-                 "--low-level-retries", "--min-age", "--checksum", "--max-duration", "--max-size", "--max-transfer"}
+                 "--low-level-retries", "--min-age", "--checksum", "--max-duration", "--max-size", "--max-transfer",
+                 "--files-from-raw", "--no-traverse"}
 
 
 def assert_copy_only(test, calls):
@@ -161,8 +201,11 @@ def assert_copy_only(test, calls):
     --backup-dir sits under the same remote's versions/ tree; nothing that deletes, syncs or moves."""
     for call in calls:
         argv = call["argv"]
-        test.assertIn(argv[0], ("copy", "listremotes"), argv)
+        test.assertIn(argv[0], ("copy", "listremotes", "lsf"), argv)
         if argv[0] == "listremotes":
+            continue
+        if argv[0] == "lsf":  # read-only, and only ever of a local source (an absolute path), never the remote
+            test.assertTrue(argv[-1].startswith("/") and argv[-2] == "--", argv)
             continue
         test.assertIn("--", argv, argv)
         flags = [a for a in argv[: argv.index("--")] if a.startswith("--")]
@@ -324,9 +367,12 @@ class Exclusion(Case):
         for name in ("a.secret", "b.secret"):
             (self.tmp / name).write_text("x")  # the cwd of the run holds files an unquoted glob would expand to
         self.run_script()
-        for argv in self.copies():
+        lists = [c["argv"] for c in self.recorded() if c["argv"][0] == "lsf"]
+        self.assertTrue(lists)
+        for argv in self.copies() + lists:
             self.assertNotIn("--exclude", argv)
-            self.assertIn("--exclude-from", argv)
+            # a bulk chunk copy carries its listing instead: that listing (lsf) had the excludes
+            self.assertTrue("--exclude-from" in argv or "--files-from-raw" in argv, argv)
             for flag in ("-L", "--copy-links", "--links", "-l"):
                 self.assertNotIn(flag, argv)
 
@@ -550,6 +596,81 @@ class Locking(Case):
         self.assertEqual(len(primaries), 1)
 
 
+class BulkResume(Case):
+    """goodqa#15062: the bulk tier never finished on the Mac. Each pass was a fresh copy of the 620k-file work tree,
+    so every pass spent its budget re-checking the same first files. A pass must resume where the last one stopped
+    and must not re-check files an earlier pass already verified."""
+
+    def bulk_runs(self, runs, budget, **extra):
+        settings = dict(FAKE_DELEGATE=REAL_RCLONE or "", FAKE_OPS_MATCH=".agent-harness/work",
+                        FAKE_OPS_PER_RUN=str(budget), LOG_BACKUP_REMOTE=str(self.remote), LOG_BACKUP_ALLOW_LOCAL="1",
+                        LOG_BACKUP_BULK_CHUNK="4")
+        settings.update(extra)
+        done = None
+        for _ in range(runs):
+            ops = Path(str(self.calls) + ".ops")
+            if ops.exists():
+                ops.unlink()
+            done = self.run_script(**settings)
+        return done
+
+    def work_remote(self):
+        return {f for f in self.remote_files() if f.startswith(".agent-harness/work/")}
+
+    def setUp(self):
+        super().setUp()
+        if not REAL_RCLONE:
+            self.skipTest("rclone not installed (the local listing uses it)")
+        self.names = [f".agent-harness/work/t{i // 10}/f{i:02d}.md" for i in range(30)]
+        for i, rel in enumerate(self.names):
+            self.put(rel, b"file %d\n" % i)
+
+    def test_passes_cut_short_by_the_budget_resume_and_finish_the_tree(self):
+        # 12 operations per run: about 6 new files fit in one pass. Ten passes are plenty for 31 files only if each
+        # pass starts where the last one stopped; a pass that re-checks from the top stalls at 12 files.
+        done = self.bulk_runs(10, 12)
+        want = set(self.names) | {".agent-harness/work/t1/notes.md"}
+        self.assertEqual(self.work_remote(), want, done.stderr)
+        self.assertTrue(self.bulk_ok().exists(), "the finished pass writes the bulk marker")
+
+    def test_verified_files_are_not_checked_again_and_only_changes_are_sent(self):
+        self.bulk_runs(10, 12)
+        self.assertTrue(self.bulk_ok().exists())
+        checked = Path(str(self.calls) + ".checked")
+        checked.unlink()
+        self.put(self.names[3], b"changed and longer\n")
+        self.put(".agent-harness/work/t9/new.md", b"new\n")
+        self.bulk_runs(1, 12)
+        self.assertEqual(sorted(checked.read_text().split()),
+                         sorted([self.names[3].split("/", 2)[2], "t9/new.md"]),
+                         "a new pass checks only new and changed files")
+        self.assertEqual((self.remote / "testhost" / self.names[3]).read_bytes(), b"changed and longer\n")
+
+    def test_a_credential_in_the_work_tree_never_reaches_the_remote_through_the_checkpoint(self):
+        self.put(".agent-harness/work/t0/auth.json", b"secret")
+        self.put(".agent-harness/work/t0/.env", b"secret")
+        self.bulk_runs(10, 12)
+        self.assertFalse({f for f in self.work_remote() if f.endswith(("auth.json", ".env"))})
+
+
+    def test_a_crash_while_closing_a_pass_cannot_wedge_later_passes(self):
+        # PR #123 review L1: a crash after `mv listing done` and before `rm pending` left pending with the cursor at
+        # its end and no listing; every later run then said "pass complete" and never listed new files.
+        self.bulk_runs(10, 12)
+        self.assertTrue(self.bulk_ok().exists())
+        st = self.logs / "log-backup.bulk.d" / ".agent-harness_work"
+        self.assertTrue((st / "done").exists(), sorted(p.name for p in st.iterdir()))
+        lines = (st / "done").read_text().splitlines()
+        (st / "pending").write_text("\n".join(lines[:5]) + "\n")
+        (st / "cursor").write_text("5\n")
+        self.assertFalse((st / "listing").exists())
+        self.put(".agent-harness/work/t9/after-crash.md", b"new\n")
+        self.bulk_runs(3, 12)
+        self.assertIn(".agent-harness/work/t9/after-crash.md", self.work_remote(),
+                      (self.logs / "log-backup.log").read_text()[-2000:])
+        self.assertFalse((st / "pending").exists())
+
+
 class Failure(Case):
     def test_failed_source_fails_the_run_and_keeps_last_ok(self):
         self.logs.mkdir(parents=True)
@@ -604,7 +725,12 @@ class Failure(Case):
         self.assertEqual((stage / ".claude/projects/p1/a.jsonl").read_bytes(), ORDINARY[".claude/projects/p1/a.jsonl"])
         for argv in self.copies():
             live = argv[-2].startswith(str(stage))
-            self.assertEqual("--min-age" in argv, not live, argv)
+            self.assertNotIn("--min-age", argv)  # live sources are snapshots; a bulk chunk carries no filter flags
+            self.assertEqual("--files-from-raw" in argv, not live, argv)
+        lists = [c["argv"] for c in self.recorded() if c["argv"][0] == "lsf"]
+        self.assertTrue(lists)
+        for argv in lists:
+            self.assertIn("--min-age", argv)  # static sources skip young files when their pass is listed
 
     def test_snapshot_temp_files_live_outside_every_uploaded_tree(self):
         stage = self.home / ".agent-harness/backup-stage"
@@ -740,8 +866,10 @@ class Failure(Case):
         self.assertEqual(files, {".agent-harness/work/t1/notes.md", f"{base}/state.json", f"{base}/odd[1]/.git"})
         for argv in self.copies():
             if argv[-2].endswith(".agent-harness/work"):
-                self.assertIn("--max-size", argv)
                 self.assertIn("--max-transfer", argv)
+        for c in self.recorded():
+            if c["argv"][0] == "lsf" and c["argv"][-1].endswith(".agent-harness/work"):
+                self.assertIn("--max-size", c["argv"])
 
     def test_budget_exit_codes_leave_a_partial_run_non_fresh_without_retry(self):
         for code in (8, 10):
@@ -755,7 +883,7 @@ class Failure(Case):
             self.assertEqual(len({tuple(c[-2:]) for c in self.copies()}), n_sources)  # one attempt per source, no retry
 
     def test_bulk_only_budget_exit_withholds_only_the_bulk_marker(self):
-        done = self.run_script(FAKE_EXIT="10", FAKE_EXIT_MATCH="--min-age")
+        done = self.run_script(FAKE_EXIT="10", FAKE_EXIT_MATCH="--files-from-raw")
         self.assertNotEqual(done.returncode, 0)
         self.assertTrue(self.last_ok().exists())     # transcripts completed
         self.assertFalse(self.bulk_ok().exists())    # the bulk gap is not hidden
@@ -838,7 +966,8 @@ class Failure(Case):
         self.assertRegex(self.bulk_ok().read_text(), r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\n$")
         for p in (self.last_ok(), self.bulk_ok()):
             os.unlink(p)
-        done = self.run_script(FAKE_FAIL_MATCH="--min-age", LOG_BACKUP_RETRIES="0")  # only bulk sources carry --min-age
+        self.put(".agent-harness/work/t1/more.md", b"more")  # the finished pass sends only new files: give it one
+        done = self.run_script(FAKE_FAIL_MATCH="--files-from-raw", LOG_BACKUP_RETRIES="0")  # only bulk copies
         self.assertNotEqual(done.returncode, 0)
         self.assertTrue(self.last_ok().exists())            # transcripts are safe and say so
         self.assertFalse(self.bulk_ok().exists())           # the gap in the bulk tier is not hidden
@@ -1073,7 +1202,7 @@ class BulkTier(Case):
         return self.logs / "log-backup.bulk-last-try"
 
     def bulk_copies(self):
-        return [c for c in self.copies() if "--min-age" in c]
+        return [c for c in self.copies() if "--files-from-raw" in c]
 
     def test_bulk_tier_with_no_time_left_is_deferred_not_spent(self):
         done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600", LOG_BACKUP_BUDGET_SECONDS="30",
@@ -1093,7 +1222,7 @@ class BulkTier(Case):
         self.assertTrue(self.bulk_ok().exists())
 
     def test_bulk_pass_cut_short_by_the_budget_continues_next_run(self):
-        done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600", FAKE_EXIT="10", FAKE_EXIT_MATCH="--min-age")
+        done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600", FAKE_EXIT="10", FAKE_EXIT_MATCH="--files-from-raw")
         self.assertNotEqual(done.returncode, 0)
         self.assertFalse(self.bulk_ok().exists())
         self.assertFalse(self.bulk_try().exists(), "a pass stopped on the budget is unfinished, not an hourly attempt")
