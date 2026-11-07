@@ -1108,13 +1108,53 @@ class GuardCompositionTests(unittest.TestCase):
             self.skipTest('install_codex not importable here: %s' % error)
         groups = install_codex.merge_hooks({}, Path('/home/u/.codex'))['hooks']['PreToolUse']
         commands = [h['command'] for g in groups for h in g['hooks']]
-        order = ('wal.py', 'commit_policy.py', 'merge_gate.py', 'command_guard_hook.py', 'kill_guard.py')
+        order = ('wal.py', 'commit_policy.py', 'merge_gate.py', 'command_guard_hook.py', 'kill_guard.py', 'heavy_job_guard.py')
         self.assertEqual(len(commands), len(order))
         self.assertEqual([len(g['hooks']) for g in groups], [1] * len(order))  # trust is keyed on group:handler
         for command, name in zip(commands, order):
             self.assertIn(name, command)
         self.assertEqual(sum('kill_guard.py' in c for c in commands), 1)
 
+
+
+class ScriptArgumentTextIsData(WorldCase):
+    """goodqa#14817: words in a script's ARGUMENTS (a note, a JSON body) are data, not interpreter code."""
+    DATA = [
+        "python3 ~/.claude/hooks/wal_note.py --wal ~/w.jsonl --event status --note 'owner will kill nothing; delete later'",
+        "python3 spec_flow.py --note 'os.kill is not called here'",
+        "python3 ./gq.py comment 14817 --json '{\"body\": \"a kill-guard false positive\"}'",
+    ]
+    CODE = [  # inline code and heredoc bodies are still scanned
+        "python3 -c 'import os; os.kill(5, 9)'",
+        "python3 - <<'EOF'\nimport os\nos.kill(5, 9)\nEOF",
+        "python3 -m somemod --note x -c 'os.kill(5,9)'",
+        # review F1: a flag value that looks like a script must not hide the inline code after it
+        "python3 -W x/y -c 'import os; os.kill(4242, 9)'",
+        "python3 -W ignore::a.py -c 'import os; os.kill(4242, 9)'",
+        "perl -I /opt/lib -e 'kill 9, 4242'",
+        "ruby -I /opt/lib -e 'Process.kill(9, 4242)'",
+        "php -d include_path=/x -r 'posix_kill(4242, 9);'",
+        # a script that runs its own arguments as a command
+        "python3 ~/.claude/hooks/run_capped.py --max-rss-gb 1 -- kill -9 4242",
+        "python3 ./runner.py pkill -f node",
+        "python3 ./unlisted_tool.py --note 'will kill the job'",  # not on the named list: scanned in full
+        # delta review: runners that take a command without `--`, absolute-path verbs, shell and -c strings
+        "python3 ~/.claude/hooks/run_capped.py --max-rss-gb 1 /bin/kill -9 4242",
+        "python3 ~/.claude/hooks/run_capped.py --max-rss-gb 1 /usr/bin/pkill -f node",
+        "python3 ~/.claude/hooks/run_capped.py --max-rss-gb 1 sh -c 'kill -9 4242'",
+        "python3 ~/.claude/hooks/run_capped.py --max-rss-gb 1 python3 -c 'import os; os.kill(4242, 9)'",
+        "python3 ~/.claude/tools/watch-tests.py --root . -- killall node",
+    ]
+
+    def test_script_arguments_are_not_code(self):
+        for cmd in self.DATA:
+            with self.subTest(cmd=cmd):
+                self.assertNotEqual(self.decide(cmd)[0], 'block', cmd)
+
+    def test_inline_code_still_blocks(self):
+        for cmd in self.CODE:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.decide(cmd)[0], 'block', cmd)
 
 if __name__ == '__main__':
     unittest.main()

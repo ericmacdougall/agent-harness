@@ -16,10 +16,14 @@ Contract
   logged to the session WAL. Browser, adversarial, media and fan-out work must
   ALSO run under run_capped.py; suites and builds only need the hatch.
 - Rules: browser, adversarial (hostile-input/fuzz scripts, /dev/zero, mkfifo,
-  perl alarm wrappers, scratchpad rt/ scripts), full-suite, build, media, fan-out.
+  perl alarm wrappers, scratchpad rt/ scripts), full-suite, build, install, replay, container, copy, media, fan-out.
   Big jobs are fine on dev2; nothing here caps them. On the Mac, run_capped.py's cap
   PAUSES a runaway and alerts (netwatch kills only as a last resort).
-  Default enforce for browser, full-suite and build (route to dev2); warn for media and
+  Default enforce for browser, full-suite, build, install (pnpm/npm/yarn/bun), replay (replay/synthetic/stress/soak
+  scripts, k6), container (docker/podman run/pull/up/start, colima), copy and fan-out (route to the fleet; GoodQA
+  goodqa#14817). Fan-out is enforced deliberately for xargs -P/parallel and for backgrounded or looped `claude -p`: they
+  need the hatch AND run_capped.py. Not covered (disclosed): pip/uv/bundle installs, codex exec, claude -p inside nested
+  shells; warn for media and
   fan-out; adversarial is advisory ONLY (never denied: breaking things with hostile input
   is the red team's job; the advice is dev2 or run_capped.py group cleanup). Override with
   HARNESS_HEAVY_GUARD=off|warn|enforce or heavy_job_guard.json next to this
@@ -68,7 +72,9 @@ MAX_SEGMENT_WORDS = 8192  # words in one shell command; bounds the quadratic wra
 MAX_NESTED_SECONDS = 0.4  # wall-clock budget per decision for nested scans and uncertain-wrapper probes
 MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 DEFAULT_MODES = {"browser": "enforce", "adversarial": "warn", "full-suite": "enforce",
-                 "build": "enforce", "media": "warn", "fan-out": "warn", "oversize": "enforce", "big-clone": "warn"}
+                 "build": "enforce", "media": "warn", "fan-out": "enforce", "oversize": "enforce", "copy": "enforce",
+                 "install": "enforce", "replay": "enforce", "container": "enforce", "big-clone": "warn",
+                 "dropbox-lane": "enforce"}
 CAPPED_RULES = {"browser", "media", "fan-out"}  # memory hogs: hatch alone is not enough
 NEVER_BLOCK = {"adversarial"}  # red-team/fuzz work is legitimate: advise (dev2, group cleanup), never deny
 WARN_ONLY = {"big-clone"}  # disk advice (goodqa#14927): warn whatever the mode table says, never deny
@@ -88,8 +94,13 @@ RULE_HELP = {
     "build": "a production build is CPU/memory heavy",
     "media": "large media work (ffmpeg/whisper) is CPU/memory heavy",
     "fan-out": "parallel fan-out multiplies memory use",
+    "install": "a package install (pnpm/npm/yarn/bun) writes and unpacks thousands of files",
+    "replay": "a replay, synthetic or load script drives many requests and processes",
+    "container": "docker/podman images and containers use gigabytes of disk and memory",
+    "copy": "a large copy, clone or worktree fills the Mac disk (it sits near full; work/pp407 grew 9 GB/h this way)",
     "oversize": "the guard cannot scan this whole command, so a heavy job could hide in the part it skips; "
                 "write it to a script file and run that (HARNESS_LOCAL_OK does not override this rule)",
+    "dropbox-lane": "uploads to one Dropbox account share its write budget; parallel or unthrottled uploads hit too_many_write_operations and starve the agent log backup (Mac, 2026-11-07: 6 h without a backup)",
     "big-clone": "a full copy of a large repository fills the Mac disk (review and red-team clones reached ~30 GB)",
 }
 
@@ -285,6 +296,618 @@ def positional(args, value_flags=()):
     return out
 
 
+# ---------------------------------------------------------------- large copies (P12 / goodqa#14817)
+# 2026-11-05: work/pp407 grew ~9 GB/h on the Mac from cp, tar, rsync, git clone and worktree review trees (one release
+# clone was 6.7 GB) with the disk at 94%. A copy is classified by ESTIMATED size, never by command name alone:
+# a bounded walk of the local source, `ssh host du` for a remote source, the GitHub repo size for a clone. At or above
+# the threshold (default 1 GiB, HARNESS_COPY_GIB) it is routed to dev2/T2. A source that cannot be measured inside
+# its time bound counts as heavy (unknown = heavy on an interactive host), except a shallow/filtered clone.
+
+GIB = 1024 ** 3
+NET_BUDGET_SECONDS = 5.0  # all ssh/gh/git/rclone/ps lookups of one decision together (the hook timeout is 10 s)
+_NET_DEADLINE = [None]
+
+
+def net_left(want: float) -> float:
+    """Seconds a lookup may take: at most `want`, never past this decision's shared budget (0 = do not start)."""
+    deadline = _NET_DEADLINE[0]
+    if deadline is None:
+        return want
+    left = deadline - time.monotonic()
+    return max(0.0, min(want, left)) if left > 0.2 else 0.0
+
+
+COPY_WALK_SECONDS = 1.0
+COPY_WALK_ENTRIES = 300_000
+REMOTE_SPEC = re.compile(r"^(?:[\w.+-]+@)?(?:\[[0-9a-fA-F:]+\]|[\w.-]+):(?!//)")
+GITHUB_URL = re.compile(r"(?:github\.com[:/])([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
+GH_SLUG = re.compile(r"^([\w.-]+)/([\w.-]+)$")
+SAFE_REMOTE_PATH = re.compile(r"[A-Za-z0-9._/~+@%=,-]{1,1024}")
+COMPRESSED = re.compile(r"\.(?:t?gz|bz2|tbz2?|xz|txz|zst|lz4|lzma|z)$", re.I)
+
+
+def copy_threshold_bytes() -> int:
+    value = 1.0
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
+        if os.path.exists(path):
+            value = float(load_json_file(path).get("copy_gib", value))
+    except Exception:
+        pass
+    env = os.environ.get("HARNESS_COPY_GIB", "")
+    if re.fullmatch(r"[0-9]{1,4}(?:\.[0-9]{1,3})?", env):
+        value = float(env)
+    return int(max(value, 0.001) * GIB)
+
+
+def path_size(path: str, cap: int = None, seconds: float = COPY_WALK_SECONDS):
+    """(bytes on disk, complete). Symlinks are not followed, hard links count once, the walk stops at `cap` bytes
+    (a known lower bound is enough to call a copy heavy) or at the time/entry bound (complete=False).
+    The walk also fits inside the decision's shared budget (net_left), so many copies in one command stay bounded."""
+    seconds = net_left(seconds)
+    if not seconds:
+        return 0, False
+    deadline = time.monotonic() + seconds
+    total, seen, entries, stack = 0, set(), 0, [path]
+    while stack:
+        current = stack.pop()
+        try:
+            st = os.lstat(current)
+        except OSError:
+            continue
+        entries += 1
+        if stat.S_ISDIR(st.st_mode):
+            if entries > COPY_WALK_ENTRIES or time.monotonic() > deadline:
+                return total, False
+            try:
+                with os.scandir(current) as it:
+                    stack.extend(e.path for e in it)
+            except OSError:
+                pass
+            continue
+        if st.st_nlink > 1:
+            if (st.st_dev, st.st_ino) in seen:
+                continue
+            seen.add((st.st_dev, st.st_ino))
+        total += getattr(st, "st_blocks", 0) * 512 or st.st_size
+        if cap is not None and total >= cap:
+            return total, True
+        if entries > COPY_WALK_ENTRIES or time.monotonic() > deadline:
+            return total, False
+    return total, True
+
+
+def measured_hosts():
+    """Hosts the guard may `ssh du` to size a remote source: the fleet (dev2/T2) plus heavy_job_guard.json
+    "measure_hosts". Any other host is not contacted and its source is not counted."""
+    hosts = {"dev2", "t2", "t2-dev"}
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
+        if os.path.exists(path):
+            hosts |= {h for h in load_json_file(path).get("measure_hosts", []) if isinstance(h, str)}
+    except Exception:
+        pass
+    return hosts
+
+
+def remote_path_size(spec: str):
+    """Bytes of host:path via a read-only `ssh host du -sk`, bounded to 4 s; None when it cannot be measured."""
+    import subprocess
+    host, _, remote = spec.partition(":")
+    if not remote or remote.startswith("-") or host.startswith("-") or host.rpartition("@")[2] not in measured_hosts():
+        return None  # a PreToolUse hook runs before the user approves: only ever connect to the user's own fleet
+    if not SAFE_REMOTE_PATH.fullmatch(remote):
+        return None  # ssh hands the words to the remote shell: $(...), ;, quotes or spaces would run there. Unknown = heavy
+    timeout = net_left(4.0)
+    if not timeout:
+        return None
+    try:
+        out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2", "--", host, "du", "-sk", "--", remote],
+                             capture_output=True, text=True, timeout=timeout).stdout
+        first = out.split("\t", 1)[0].strip()
+        return int(first) * 1024 if first.isdigit() else None
+    except Exception:
+        return None
+
+
+def github_repo_bytes(owner: str, repo: str):
+    """GitHub's reported repository size (KiB -> bytes), cached 24 h; None when unknown (offline, no auth)."""
+    import json
+    import subprocess
+    key = f"{owner}/{repo}".lower()
+    cache_path = os.path.join(state_dir(), "repo-size-cache.json")
+    cache = {}
+    try:
+        cache = load_json_file(cache_path, 1024 * 1024)
+        hit = cache.get(key)
+        if isinstance(hit, dict) and time.time() - float(hit.get("at", 0)) < 86400:
+            if hit.get("bytes") is None:
+                if time.time() - float(hit.get("at", 0)) < 600:
+                    return None  # unknown a moment ago: do not spend the budget asking again
+            else:
+                return int(hit["bytes"])
+    except Exception:
+        cache = {}
+    timeout = net_left(2.5)
+    if not timeout:
+        return None
+    try:
+        out = subprocess.run(["gh", "api", f"repos/{owner}/{repo}", "--jq", ".size"], capture_output=True, text=True,
+                             timeout=timeout).stdout.strip()
+        if not out.isdigit():
+            cache[key] = {"bytes": None, "at": time.time()}
+            os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+            tmp = f"{cache_path}.{os.getpid()}.tmp"
+            with open(tmp, "w") as handle:
+                json.dump(dict(list(cache.items())[-500:]), handle)
+            os.replace(tmp, cache_path)
+            return None
+        size = int(out) * 1024
+        cache[key] = {"bytes": size, "at": time.time()}
+        os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+        tmp = f"{cache_path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as handle:
+            json.dump(dict(list(cache.items())[-500:]), handle)
+        os.replace(tmp, cache_path)
+        return size
+    except Exception:
+        return None
+
+
+def tracked_tree_bytes(repo_dir: str):
+    """Sum of blob sizes at HEAD (what `git worktree add` checks out); None if git cannot say within 2 s."""
+    import subprocess
+    try:
+        env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+        timeout = net_left(2.0)
+        if not timeout:
+            return None
+        out = subprocess.run(["git", "-C", repo_dir, "ls-tree", "-r", "-l", "HEAD"], capture_output=True, text=True,
+                             timeout=timeout, env=env).stdout
+        total = 0
+        for line in out.splitlines():
+            meta = line.split("\t", 1)[0].split()
+            if len(meta) == 4 and meta[3].isdigit():
+                total += int(meta[3])
+        return total
+    except Exception:
+        return None
+
+
+def fmt_gib(n: float) -> str:
+    return f"{n / GIB:.1f} GiB" if n >= GIB // 10 else f"{n / 1048576:.1f} MiB"
+
+
+def sum_sources(sources, ctx, thr, remote_ok=False, deref=False, budget_s=2.5):
+    """(bytes, unmeasured_detail) over local and (scp/rsync only) host:path sources, stopping at the threshold.
+
+    The whole sizing is bounded by budget_s so a glob of many matches or several slow remotes cannot stall the hook;
+    running out of time counts as unmeasurable (heavy). A remote host outside the fleet is not contacted (the hook
+    runs before the user approves) and its source is not counted."""
+    import glob as globmod
+    started = time.monotonic()
+    total = 0
+    for src in sources:
+        if time.monotonic() - started > budget_s:
+            return total, f"sizing took longer than {budget_s:g}s"
+        if remote_ok and REMOTE_SPEC.match(src) and not src.startswith(("/", ".", "~")):
+            if src.partition(":")[0].rpartition("@")[2] not in measured_hosts():
+                return total, (f"{src.split(':')[0]}:... is outside the measured fleet (add it to measure_hosts in "
+                               "heavy_job_guard.json to have it sized)")
+            size = remote_path_size(src)
+            if size is None:
+                return total, f"cannot measure {src.split(':')[0]}:... within the time bound"
+            total += size
+        else:
+            path = resolve(os.path.expanduser(src), ctx.cwd)
+            paths = globmod.glob(path)[:500] if any(c in path for c in "*?[") else [path]
+            for one in paths:
+                if time.monotonic() - started > budget_s:
+                    return total, f"sizing took longer than {budget_s:g}s"
+                if deref and os.path.islink(one):
+                    one = os.path.realpath(one)  # cp -L / rsync -L copy what the link points at
+                size, complete = path_size(one, cap=thr - total, seconds=min(COPY_WALK_SECONDS, max(0.1, budget_s - (time.monotonic() - started))))
+                total += size
+                if total >= thr:
+                    return total, None
+                if not complete:
+                    return total, f"{os.path.basename(one) or one} is too large to measure within {COPY_WALK_SECONDS:g}s"
+        if total >= thr:
+            return total, None
+    return total, None
+
+
+def finish_copy(label, total, unknown, thr, extra=""):
+    if total >= thr:
+        return ("copy", f"{label} copies at least {fmt_gib(total)} onto this Mac (limit {fmt_gib(thr)}){extra}")
+    if unknown:
+        return ("copy", f"{label}: {unknown} (unknown size counts as heavy; limit {fmt_gib(thr)})")
+    return None
+
+
+RSYNC_VALUE_FLAGS = ("-e", "--rsh", "-f", "--filter", "--exclude", "--include", "--exclude-from", "--include-from",
+                     "--files-from", "--max-size", "--min-size", "--bwlimit", "--log-file", "--port", "--partial-dir",
+                     "--backup-dir", "--link-dest", "--compare-dest", "--copy-dest", "-B", "--block-size", "-T",
+                     "--temp-dir", "--timeout", "--contimeout", "--chmod", "--usermap", "--groupmap", "--iconv",
+                     "--rsync-path", "--out-format", "--info", "--debug", "--suffix", "--address", "--sockopts",
+                     "--password-file", "--stop-after", "--stop-at", "--compress-level", "--skip-compress")
+SCP_VALUE_FLAGS = ("-P", "-i", "-F", "-l", "-o", "-c", "-J", "-S", "-D")
+CP_VALUE_FLAGS = ("-t", "--target-directory", "-S", "--suffix")
+CLONE_VALUE_FLAGS = ("-b", "--branch", "--depth", "-o", "--origin", "-c", "--config", "--reference",
+                     "--reference-if-able", "--separate-git-dir", "--template", "--filter", "-j", "--jobs",
+                     "-u", "--upload-pack", "--server-option", "--shallow-since", "--shallow-exclude", "--revision",
+                     "--ref-format", "--bundle-uri")
+TAR_ARG_LETTERS = "fCXTIbgL"  # bundled letters that consume the next word, in order of appearance
+TAR_LONG_VALUES = ("--directory", "--exclude", "--files-from", "--exclude-from", "--use-compress-program", "--transform",
+                   "--strip-components", "--newer", "--listed-incremental", "--owner", "--group", "--mode", "--format")
+
+
+def parse_tar(args):
+    """(mode 'x'|'c'|None, archive, [source words]) for old-style (`tar xzf a.tgz`) and dashed forms, flags in any order."""
+    mode, archive, sources, i = None, None, [], 0
+    to_stdout = False
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            sources.extend(args[i:])
+            break
+        if a.startswith("--"):
+            name, eq, val = a.partition("=")
+            if name == "--to-stdout":
+                to_stdout = True
+            if name in ("--extract", "--get"):
+                mode = "x"
+            elif name == "--create":
+                mode = mode or "c"
+            elif name == "--file":
+                archive = val if eq else (args[i] if i < len(args) else None)
+                i += 0 if eq else 1
+            elif name in TAR_LONG_VALUES and not eq:
+                i += 1
+            continue
+        if (a.startswith("-") and len(a) > 1) or (i == 1 and not a.startswith("-") and re.fullmatch(r"[A-Za-z]+", a)):
+            wants = []
+            for ch in a.lstrip("-"):
+                if ch == "O":
+                    to_stdout = True
+                if ch == "x":
+                    mode = "x"
+                elif ch == "c":
+                    mode = mode or "c"
+                if ch in TAR_ARG_LETTERS:
+                    wants.append(ch)
+            for ch in wants:
+                value = args[i] if i < len(args) else None
+                i += 1
+                if ch == "f":
+                    archive = value
+            continue
+        sources.append(a)
+    return mode, archive, sources, to_stdout
+
+
+def classify_copy(low, args, ctx):
+    """Return ("copy", detail) when this command would write an estimated >= threshold onto the Mac, else None."""
+    thr = copy_threshold_bytes()
+    if low in ("cp", "ditto", "scp", "rsync"):
+        if low == "rsync" and any(a == "--dry-run" or re.match(r"^-[A-Za-z]*n[A-Za-z]*$", a) for a in args):
+            return None
+        target = None
+        flagged = [a for a in args if a in ("-t", "--target-directory")]
+        if low == "cp" and flagged and args.index(flagged[0]) + 1 < len(args):
+            target = args[args.index(flagged[0]) + 1]
+        values = {"rsync": RSYNC_VALUE_FLAGS, "scp": SCP_VALUE_FLAGS, "cp": CP_VALUE_FLAGS}.get(low, ())
+        pos = positional(args, values)
+        if target is None and len(pos) < 2:
+            return None
+        sources, dest = (pos, target) if target else (pos[:-1], pos[-1])
+        remote_tool = low in ("scp", "rsync")
+        if dest == "/dev/null" or dest.startswith("rsync://"):
+            return None
+        if remote_tool and REMOTE_SPEC.match(dest) and not dest.startswith(("/", ".", "~")):
+            return None  # the copy lands on another host
+        if os.path.realpath(os.path.expanduser(dest)).startswith("/Volumes/"):
+            return None  # an external or network volume, not the Mac's own disk
+        deref = any(a in ("--copy-links", "--dereference") or re.match(r"^-[A-Za-z]*[LH][A-Za-z]*$", a) for a in args
+                    if a.startswith("-") and a not in values)
+        total, unknown = sum_sources(sources, ctx, thr, remote_ok=remote_tool, deref=deref)
+        return finish_copy(low, total, unknown, thr)
+    if low == "tar" and args:
+        mode, archive, srcs, to_stdout = parse_tar(args)
+        if to_stdout and mode == "x":
+            return None  # extracting to stdout writes nothing to disk
+        if mode is None or archive in (None, "-") or REMOTE_SPEC.match(archive) and not archive.startswith(("/", ".", "~")):
+            return None  # a pipe or a listing: the other end decides (tar czf - . | ssh dev2 'tar x')
+        if mode == "x":
+            size, _complete = path_size(resolve(os.path.expanduser(archive), ctx.cwd))
+            return finish_copy("tar extract", size * (4 if COMPRESSED.search(archive) else 1), None, thr)
+        total, unknown = sum_sources(srcs, ctx, thr)
+        return finish_copy("tar create", total, unknown, thr)
+    if low == "gh":
+        pos = positional(args)
+        if pos[:2] == ["repo", "clone"] and len(pos) > 2:
+            return clone_estimate(pos[2], list(args), ctx, thr, "gh repo clone")
+        return None
+    if low == "git":
+        cwd, i, rest = ctx.cwd, 0, list(args)
+        while i < len(rest) and rest[i].startswith("-"):
+            if rest[i] == "-C" and i + 1 < len(rest):
+                cwd = resolve(os.path.expanduser(rest[i + 1]), cwd)
+                i += 2
+            elif rest[i] in ("-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"):
+                i += 2
+            else:
+                i += 1
+        rest = rest[i:]
+        if not rest:
+            return None
+        if rest[0] == "clone":
+            pos = positional(rest[1:], CLONE_VALUE_FLAGS)
+            if not pos:
+                return None
+            return clone_estimate(pos[0], rest[1:], ctx, thr, "git clone")
+        if rest[0] == "worktree" and rest[1:2] == ["add"]:
+            size = tracked_tree_bytes(cwd)
+            if size is None:
+                return finish_copy("git worktree add", 0, "git could not size the tracked tree in time", thr)
+            return finish_copy("git worktree add", size, None, thr, " (tracked tree at HEAD)")
+    return None
+
+
+# ---------------------------------------------------------------- Dropbox upload lane (P12)
+# Every upload to a Dropbox account draws on the same write budget. On 2026-11-07 a 16-transfer archive upload and a
+# second clone upload ran together for hours; Dropbox answered too_many_write_operations with 300 s pauses and the agent
+# log backup went 6 h without a pass. Agent uploads therefore use one throttled lane: --tpslimit at most LANE_TPS,
+# --transfers at most LANE_TRANSFERS, and only one agent upload to a Dropbox remote at a time. The launchd log backup
+# is not an agent upload (it keeps its own tpslimit 1) and is never counted as the lane holder.
+LANE_TPS = 4
+LANE_TRANSFERS = 4
+RCLONE_UPLOADS = {"copy", "copyto", "sync", "move", "moveto", "bisync", "rcat", "copyurl"}
+# Wrappers that can sit on a Dropbox remote; `rclone config show` would say which, but it prints tokens, so any of
+# these counts as Dropbox (a throttled lane is cheap; an unthrottled upload under a wrapper is the bypass).
+RCLONE_WRAPPERS = {"crypt", "alias", "union", "chunker", "combine", "hasher", "compress"}
+RCLONE_PATH_FLAGS = {"--log-file", "--exclude-from", "--include-from", "--filter-from", "--files-from",
+                     "--files-from-raw", "--config", "--temp-dir", "--cache-dir", "--backup-dir", "--compare-dest",
+                     "--copy-dest"}
+LOG_BACKUP_MARK = "/.agent-harness/logs/log-backup.log"
+_DROPBOX_REMOTES = None
+
+
+def dropbox_remotes():
+    """Names of rclone remotes of type dropbox, from `rclone listremotes --long` (names and types only; the config file
+    itself holds tokens and is never read). On failure, any remote whose name contains "dropbox"."""
+    global _DROPBOX_REMOTES
+    if _DROPBOX_REMOTES is None:
+        import subprocess
+        names = set()
+        try:
+            out = subprocess.run(["rclone", "listremotes", "--long"], capture_output=True, text=True,
+                                 timeout=net_left(2.0) or 0.01, stdin=subprocess.DEVNULL).stdout
+            for line in out.splitlines()[:200]:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].endswith(":") and parts[1].lower() in {"dropbox"} | RCLONE_WRAPPERS:
+                    names.add(parts[0][:-1].lower())
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+        _DROPBOX_REMOTES = names
+    return _DROPBOX_REMOTES
+
+
+def is_dropbox_spec(spec: str) -> bool:
+    """name:path, name,opt=v:path and the :backend:path connection-string form."""
+    spec = spec or ""
+    if spec.startswith(":"):  # :dropbox:path (or :dropbox,opt=v:path) names the backend itself
+        return spec[1:].split(":", 1)[0].split(",", 1)[0].lower() == "dropbox"
+    m = re.match(r"^([A-Za-z0-9_.][A-Za-z0-9_. -]{0,63})(?:,[^:/]*)?:", spec)
+    if not m or "/" in m.group(1):
+        return False
+    name = m.group(1).lower()
+    return name in dropbox_remotes() or "dropbox" in name
+
+
+def rclone_flag(args, name):
+    """Last value of --name (as --name=v or --name v), or None."""
+    value = None
+    for i, a in enumerate(args):
+        if a.startswith(name + "="):
+            value = a.split("=", 1)[1]
+        elif a == name and i + 1 < len(args):
+            value = args[i + 1]
+    return value
+
+
+RCLONE_VALUE_FLAGS = {
+    "--exclude", "--include", "--filter", "--exclude-from", "--include-from", "--filter-from", "--files-from",
+    "--files-from-raw", "--log-file", "--log-level", "--log-format", "--transfers", "--checkers", "--tpslimit",
+    "--tpslimit-burst", "--bwlimit", "--bwlimit-file", "--max-duration", "--max-transfer", "--max-size", "--min-size",
+    "--max-age", "--min-age", "--retries", "--retries-sleep", "--low-level-retries", "--contimeout", "--timeout",
+    "--backup-dir", "--suffix", "--compare-dest", "--copy-dest", "--config", "--cache-dir", "--temp-dir", "--stats",
+    "--stats-log-level", "--order-by", "--max-depth", "--user-agent", "--header", "--header-upload", "--dump",
+    "--buffer-size", "--multi-thread-streams", "--multi-thread-cutoff", "--dropbox-batch-mode",
+    "--dropbox-batch-size", "--dropbox-batch-timeout", "--dropbox-chunk-size", "--cutoff-mode", "--track-renames-strategy",
+    "--password-command", "--rc-addr", "--max-backlog", "--max-stats-groups", "--fs-cache-expire-duration",
+    "--exclude-if-present", "--metadata-set", "--streaming-upload-cutoff"}  # an unknown flag consumes nothing
+
+
+def rclone_positional(args):
+    """Words that are not flags or values of known value flags, in order."""
+    words, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("-"):
+            if "=" not in a and a in RCLONE_VALUE_FLAGS:
+                i += 2
+                continue
+            i += 1
+            continue
+        words.append(a)
+        i += 1
+    return words
+
+
+def rclone_upload_target(args):
+    """(subcommand, Dropbox destination) of an rclone upload, else None."""
+    words = rclone_positional(args)
+    sub = next((w for w in words if w in RCLONE_UPLOADS), None)
+    if sub is None:
+        return None
+    after = words[words.index(sub) + 1:]
+    first_dest = 0 if sub == "rcat" else 1  # rcat reads stdin; everything else has a source first
+    for word in after[first_dest:]:
+        if is_dropbox_spec(word):
+            return sub, word
+    return None
+
+
+def rclone_words(args):
+    """The non-flag words of an rclone command line (subcommand first). Values of path-valued flags are skipped, and so
+    is a word after any other --flag when it looks like a value (30s, 4, NOTICE) rather than a path or remote."""
+    words, skip, after_flag = [], False, False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a.startswith("-"):
+            skip = a in RCLONE_PATH_FLAGS
+            after_flag = a.startswith("--") and "=" not in a
+            continue
+        if after_flag and not re.search(r"[:/]|^[~.]", a):
+            after_flag = False
+            continue
+        after_flag = False
+        words.append(a)
+    return words
+
+
+def rclone_upload_destination(args):
+    """The destination of an rclone upload subcommand (global flags may come before it), else None."""
+    words = rclone_words(args)
+    return words[-1] if len(words) >= 2 and words[0] in RCLONE_UPLOADS else None
+
+
+def lane_holders(ps_text=None):
+    """Live agent rclone uploads to a Dropbox remote, as (pid, command) pairs. The log backup is not a holder."""
+    import subprocess
+    if ps_text is None:
+        try:
+            timeout = net_left(2.0)
+            if not timeout:
+                return []  # out of budget: the throttle check still applies
+            ps_text = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=timeout,
+                                     stdin=subprocess.DEVNULL).stdout
+        except (OSError, subprocess.SubprocessError):
+            return []  # a probe failure must not block uploads; the throttle check still applies
+    holders = []
+    for line in ps_text.splitlines()[:5000]:
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit() or int(parts[0]) == os.getpid():
+            continue
+        try:
+            words = posix_split(parts[1])
+        except ValueError:
+            words = parts[1].split()
+        if not words or base(words[0]).lower() != "rclone" or LOG_BACKUP_MARK in parts[1]:
+            continue
+        if rclone_upload_target(words[1:]):
+            holders.append((int(parts[0]), parts[1][:160]))
+    return holders
+
+
+def dropbox_lane_finding(args, ctx, env=None):
+    """("dropbox-lane", detail) for an agent rclone upload to Dropbox that is unthrottled or would run beside another.
+    `env` holds the command's own VAR=value prefix (RCLONE_TPSLIMIT and friends set rclone's flags too)."""
+    if "--dry-run" in args or "-n" in args:
+        return None
+    target = rclone_upload_target(args)
+    if not target:
+        return None
+    sub, dest = target
+    if ctx is not None:
+        ctx.lane_uploads = getattr(ctx, "lane_uploads", 0) + 1
+    env = env or {}
+    problems = []
+
+    def setting(flag, var):
+        value = rclone_flag(args, flag)
+        return value if value is not None else env.get(var)
+
+    burst = setting("--tpslimit-burst", "RCLONE_TPSLIMIT_BURST")
+    try:
+        burst_value = float(burst) if burst is not None else 1.0
+    except ValueError:
+        burst_value = LANE_TPS + 1.0
+    if burst_value > LANE_TPS:
+        problems.append(f"--tpslimit-burst must be at most {LANE_TPS} (got {burst})")
+    tps = setting("--tpslimit", "RCLONE_TPSLIMIT")
+    try:
+        tps_value = float(tps) if tps is not None else 0.0
+    except ValueError:
+        tps_value = 0.0
+    if not 0 < tps_value <= LANE_TPS:
+        problems.append(f"--tpslimit must be set to at most {LANE_TPS} (got {tps if tps is not None else 'none'})")
+    transfers = setting("--transfers", "RCLONE_TRANSFERS")
+    try:
+        transfers_value = int(transfers) if transfers is not None else 4
+    except ValueError:
+        transfers_value = LANE_TRANSFERS + 1
+    if transfers_value > LANE_TRANSFERS:
+        problems.append(f"--transfers must be at most {LANE_TRANSFERS} (got {transfers})")
+    try:
+        holders = lane_holders()
+    except Exception:  # a process-table parsing bug must not block uploads; the throttle check still applies
+        holders = []
+    if holders:
+        problems.append("the lane is busy: another agent upload to Dropbox is running (pid "
+                        + ", ".join(str(pid) for pid, _ in holders[:3]) + "); wait for it to finish")
+    return ("dropbox-lane", f"rclone {sub} to {dest.split(':', 1)[0]}: " + "; ".join(problems)) if problems else None
+
+
+def clone_is_shallow(flags):
+    """A real --depth N (1..50) given as its own option, not the value of another option (`--template --depth`)."""
+    i, depth = 0, None
+    while i < len(flags):
+        f = flags[i]
+        if f == "--depth":
+            depth = flags[i + 1] if i + 1 < len(flags) else ""
+            i += 2
+            continue
+        if f.startswith("--depth="):
+            depth = f[8:]
+        i += 2 if f in CLONE_VALUE_FLAGS else 1
+    return depth is not None and depth.isdigit() and 0 < int(depth) <= 50  # the last --depth wins, as in git
+
+
+URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/@\s]+@")
+
+
+def scrub_url(text: str) -> str:
+    """Drop user:password@ from URLs (clone URLs often carry tokens)."""
+    return URL_USERINFO.sub(r"\1", text)
+
+
+def clone_estimate(url, flags, ctx, thr, label):
+    shallow = clone_is_shallow(flags) or any(f in ("--filter=blob:none", "--filter=tree:0") for f in flags) or any(
+        f == "--filter" and i + 1 < len(flags) and flags[i + 1] in ("blob:none", "tree:0") for i, f in enumerate(flags))
+    factor = 0.5 if shallow else 2.0
+    local = resolve(os.path.expanduser(url.replace("file://", "")), ctx.cwd)
+    if url.startswith(("/", "./", "../", "~", "file://")) and not os.path.exists(local):
+        return None  # a missing local source: git fails before writing anything
+    if os.path.isdir(local):
+        size, complete = path_size(local, cap=thr)
+        return finish_copy(label, int(size * (0.5 if shallow else 1.0)), None if (complete or shallow) else
+                           "source is too large to measure", thr)
+    match = GITHUB_URL.search(url) or (GH_SLUG.match(url) if label == "gh repo clone" else None)
+    if match:
+        size = github_repo_bytes(match.group(1), match.group(2))
+        if size is not None:
+            return finish_copy(label, int(size * factor), None, thr, f" (repository {fmt_gib(size)} as reported by GitHub)")
+    if shallow:
+        return None  # a shallow or filtered clone is bounded by construction, so an unknown size is allowed
+    return ("copy", f"{label} of {scrub_url(url)[:80]}: size unknown (no GitHub size available, and any other host is not measured; "
+                    f"unknown size counts as heavy; limit {fmt_gib(thr)})")
+
+
 # ---------------------------------------------------------------- classification
 
 REMOTE_CMDS = {"ssh", "scp", "sftp", "rsync", "mosh", "sshpass"}
@@ -337,6 +960,19 @@ PERL_EXEC = re.compile(r"\bexec\b")
 
 LIGHT_XARGS = {"grep", "egrep", "fgrep", "rg", "echo", "cat", "ls", "rm", "mv", "cp", "stat", "wc", "head", "tail",
                "file", "touch", "chmod", "chown", "basename", "dirname", "md5", "md5sum", "shasum", "sha256sum", "test", "true"}
+
+
+def xargs_procs(args) -> int:
+    """xargs -P value (1 when absent; 0 means as many as possible)."""
+    value = "1"
+    for i, a in enumerate(args):
+        if a in ("-P", "--max-procs") and i + 1 < len(args):
+            value = args[i + 1]
+        elif a.startswith("--max-procs="):
+            value = a.split("=", 1)[1]
+        elif re.match(r"^-P[0-9]+$", a):
+            value = a[2:]
+    return int(value) if re.fullmatch(r"[0-9]{1,9}", value) else 0
 
 
 def xargs_inner(args):
@@ -573,16 +1209,24 @@ def is_focused_test(args):
     return any(FILE_TARGET.search(t) for t in positional(args, ("-t", "--testNamePattern", "-c", "--config")))
 
 
+REPLAY_NAME = re.compile(r"(?:^|[:_./-])(?:replay|synthetic|stress|loadtest|load-test|soak)(?:\.(?:[cm]?[jt]s|py|sh))?"
+                         r"(?:[:_-](?:all|full|run|ci|prod|\d+))?$", re.I)
+
+
 def classify_pm(name, args):
     """npm/pnpm/yarn/bun: tests and builds. Returns None, (rule, detail) or ('recurse', argv)."""
-    valued = ("--prefix", "-C", "--filter", "-F", "-w", "--workspace", "--cwd", "--dir")
+    valued = ("--prefix", "-C", "--filter", "-F", "--workspace", "--cwd", "--dir") + (("-w",) if name == "npm" else ())
     pos = positional(args, valued)
     if not pos:
+        if name == "yarn" and not any(a in ("--help", "-h", "--version", "-v") for a in args):
+            return ("install", "yarn (a bare yarn installs)")
         return None
+    if name == "yarn" and pos[0] == "workspace" and len(pos) > 2:
+        pos = pos[2:]  # yarn workspace NAME add ...
     sub, rest = pos[0], pos[1:]
     if sub in ("exec", "dlx", "x") and rest:
         return ("recurse", rest)
-    if sub in ("playwright", "puppeteer", "vitest", "jest", "cypress", "next", "vite"):
+    if sub in ("playwright", "puppeteer", "vitest", "jest", "cypress", "next", "vite", "tsx", "ts-node", "node", "k6"):
         return ("recurse", [sub] + rest)
     if sub in ("run", "run-script") and rest:
         sub, rest = rest[0], rest[1:]
@@ -591,6 +1235,12 @@ def classify_pm(name, args):
         return None if is_focused_test(after) else ("full-suite", f"{name} {sub}")
     if re.match(r"^build(?:[:_-].*)?$", sub) or sub in ("compile", "bundle"):
         return ("build", f"{name} {sub}")
+    if sub in ("install", "i", "ci", "add", "update", "upgrade", "up", "dedupe", "rebuild", "clean-install", "cit",
+               "install-test", "it", "install-ci-test", "isntall") and not any(
+            a in ("--help", "-h", "--version", "--dry-run") for a in args):
+        return ("install", f"{name} {sub}")
+    if REPLAY_NAME.search(sub):
+        return ("replay", f"{name} {sub}")
     return None
 
 
@@ -740,6 +1390,8 @@ def unwrap(low, args, ctx, depth):
             i += 1
             break
         if low in ("env", "sudo", "doas") and ASSIGN.match(token):
+            name, _, value = token.partition("=")
+            ctx.wrapper_env = dict(getattr(ctx, "wrapper_env", {}), **{name: value})
             i += 1
             continue
         if low == "env" and token == "-":  # legacy spelling of -i
@@ -779,6 +1431,28 @@ def classify(argv, ctx, depth=0):
     low = cmd.lower()
     args = argv[1:]
 
+    if low in ("cp", "ditto", "scp", "rsync", "tar", "git", "gh"):
+        try:
+            found = classify_copy(low, args, ctx)
+        except Exception:  # a sizing bug must never block ordinary work: fail open for this rule only
+            found = None
+        if found:
+            return found
+    if low == "rclone":
+        env = dict(getattr(ctx, "exported", {}))
+        env.update(getattr(ctx, "wrapper_env", {}))
+        env.update(dict(a.split("=", 1) for a in _assigns if "=" in a))
+        ctx.wrapper_env = {}
+        lane = dropbox_lane_finding(args, ctx, env)
+        if lane:
+            return lane
+    if low == "claude" and any(a in ("-p", "--print") for a in args):
+        ctx.claude_p = getattr(ctx, "claude_p", 0) + 1
+        ctx.claude_uncapped = getattr(ctx, "claude_uncapped", 0) + (0 if ctx.capped else 1)
+    if low == "corepack" and args:
+        return classify(args, ctx, depth + 1)
+    if low == "k6" and (positional(args) or [""])[0] == "run" and "--help" not in args:
+        return ("replay", "k6 run")
     if low in ("git", "cp", "rsync"):
         finding = big_copy_finding(low, args, ctx)
         if finding:
@@ -883,6 +1557,9 @@ def classify(argv, ctx, depth=0):
                 return ("browser", f"python -m {module}")
             return None
         first = (positional(args) or [""])[0]
+        if (first.endswith(".py") and REPLAY_NAME.search(base(first)) and not re.match(r"test_|.*_test\.py$", base(first))
+                and "--help" not in args and "-h" not in args):
+            return ("replay", f"python {base(first)}")
         if base(first) == "run_capped.py":
             return classify([first] + args[args.index(first) + 1:], ctx, depth + 1)
         if base(first) == "run_probe.py":
@@ -900,7 +1577,10 @@ def classify(argv, ctx, depth=0):
                 code = args[args.index(flag) + 1]
                 if JS_BROWSER_IMPORT.search(code) or re.search(r"require\(\s*['\"](?:playwright|puppeteer)", code):
                     return ("browser", "node -e code that drives a browser")
-        script = next(iter(positional(args)), None)
+        script = next((p for p in positional(args, ("--import", "--require", "-r", "--loader", "--experimental-loader"))
+                       if re.search(r"\.[cm]?[jt]s$", p)), None)
+        if script and REPLAY_NAME.search(base(script)) and "--test" not in args and "--help" not in args and "-h" not in args:
+            return ("replay", f"{low} {base(script)}")
         if script and re.search(r"\.[cm]?[jt]s$", script):
             sources = script_sources(script, ctx)
             if any(ctx.search(HOSTILE, s) for s in sources):
@@ -957,10 +1637,24 @@ def classify(argv, ctx, depth=0):
         if sub == "build" or (low == "webpack" and sub not in ("serve", "watch")):
             return ("build", f"{low} {sub}".strip())
         return None
+    if low in ("colima", "lima", "limactl") and (positional(args) or [""])[0] == "start":
+        return ("container", f"{low} start")
     if low in ("docker", "docker-compose", "podman", "nerdctl"):
-        pos = positional(args, ("--context", "-H", "--host", "-f", "--file", "-p", "--project-name"))
+        if any(a in ("--context", "-c", "-H", "--host") or a.startswith(("--context=", "--host=")) for a in args[:6]) or any(
+                a.startswith("DOCKER_HOST=") and re.match(r"DOCKER_HOST=(?:ssh|tcp)://", a) for a in _assigns):
+            return None  # a remote engine: the work runs off this Mac
+        pos = positional(args, ("--context", "-H", "--host", "-f", "--file", "-p", "--project-name", "--profile", "--env-file",
+                                "--project-directory", "-c", "--log-level"))
+        if pos[:2] == ["machine", "start"]:
+            return ("container", f"{low} machine start")
+        if pos[:1] in (["container"], ["image"]) and len(pos) > 1:
+            pos = pos[1:]
         if "build" in pos[:2] or ("--build" in args and ("up" in pos or low == "docker-compose")):
             return ("build", f"{low} build")
+        if (pos[:1] and pos[0] in ("run", "pull", "buildx", "create", "start", "up")) or (
+                pos[:2] and pos[0] == "compose" and pos[1] in ("up", "run", "pull", "start")) or (
+                low == "docker-compose" and pos[:1] and pos[0] in ("up", "run", "pull", "start")):
+            return ("container", f"{low} {pos[0] if pos[0] != 'compose' else 'compose ' + pos[1]}")
         return None
     if low in PM:
         result = classify_pm(low, args)
@@ -983,6 +1677,9 @@ def classify(argv, ctx, depth=0):
             result = classify(inner, ctx, depth + 1)
             if result:
                 return result  # xargs pytest / xargs npx playwright test
+            if base(inner[0]).lower() == "rclone" and rclone_upload_target(inner[1:]) and xargs_procs(args) != 1:
+                return ("dropbox-lane", "xargs -P runs several rclone uploads to Dropbox at once; the lane is one "
+                        "upload at a time")
         if inner and base(inner[0]) in LIGHT_XARGS:
             return None  # parallel grep/echo/stat is cheap; only fan-out of real work matters
         for i, a in enumerate(args):
@@ -999,6 +1696,28 @@ def classify(argv, ctx, depth=0):
     if low == "parallel":
         return None if ("--version" in args or "--help" in args) else ("fan-out", "GNU parallel")
     return None
+
+
+def has_background(text: str) -> bool:
+    """An unquoted `&` that backgrounds a command (not &&, >&, &>, |&, 2>&1)."""
+    quote, i, n = None, 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch == "\\":
+            i += 1
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "&":
+            prev, nxt = text[i - 1:i], text[i + 1:i + 2]
+            if nxt != "&" and prev not in ("&", ">", "<", "|") and nxt != ">":
+                return True
+        i += 1
+    return False
 
 
 def scan_state(command: str, cwd: str, depth: int = 0, parent=None):
@@ -1025,6 +1744,9 @@ def scan_state(command: str, cwd: str, depth: int = 0, parent=None):
         assigns, rest = split_assignments(argv)
         if argv and argv[0] == "export":
             assigns = [t for t in argv[1:] if ASSIGN.match(t)]
+            ctx.exported = dict(getattr(ctx, "exported", {}),
+                                **{a.split("=", 1)[0]: a.split("=", 1)[1] for a in assigns if a.startswith("RCLONE_")})
+        ctx.wrapper_env = {}
         for a in assigns:
             if a.startswith(HATCH + "="):
                 hatch = a.split("=", 1)[1]
@@ -1034,9 +1756,22 @@ def scan_state(command: str, cwd: str, depth: int = 0, parent=None):
                 ctx.cwd = os.path.normpath(target)
             continue
         ctx.capped = False
+        if rest and rest[0] in ("for", "while", "until"):
+            ctx.loop = True
         result = classify(argv, ctx, depth)
         if result:
             findings.append((result[0], result[1], ctx.capped, segment))
+    if getattr(ctx, "lane_uploads", 0) >= 1 and getattr(ctx, "loop", False) and has_background(text):
+        findings.append(("dropbox-lane", "a backgrounded rclone upload to Dropbox inside a loop runs several uploads "
+                         "at once; the lane is one upload at a time", False, command[:2000]))
+    elif getattr(ctx, "lane_uploads", 0) >= 2 and has_background(text):
+        findings.append(("dropbox-lane", "several backgrounded rclone uploads to Dropbox in one command; the lane is "
+                         "one upload at a time", False, command[:2000]))
+    claude_n = getattr(ctx, "claude_p", 0)
+    if claude_n and has_background(text) and (claude_n >= 2 or getattr(ctx, "loop", False)):
+        # parsed shell keywords and unquoted & only: a quoted prompt that contains "for" or "&" is not a loop
+        findings.append(("fan-out", "claude -p fan-out (several or looped background headless sessions)",
+                         getattr(ctx, "claude_uncapped", 0) == 0, command[:2000]))
     return hatch, findings
 
 
@@ -1082,6 +1817,14 @@ SEVERITY = {"allow": 0, "warn": 1, "deny": 2}
 
 
 def decide(command: str, cwd: str = None, modes=None):
+    """_decide with the shared lookup budget closed afterwards, so later callers in this process are unaffected."""
+    try:
+        return _decide(command, cwd, modes)
+    finally:
+        _NET_DEADLINE[0] = None
+
+
+def _decide(command: str, cwd: str = None, modes=None):
     """Pure decision: dict(action=allow|warn|deny, rule, detail, message, hatch_reason).
 
     Every finding is judged on its own (the hatch and the cap apply per finding) and the most
@@ -1089,6 +1832,7 @@ def decide(command: str, cwd: str = None, modes=None):
     if not command:
         return {"action": "allow"}
     modes = modes or load_modes()
+    _NET_DEADLINE[0] = time.monotonic() + NET_BUDGET_SECONDS
     try:
         hatch, findings = scan_state(command, cwd)
     except (WorkBudgetExceeded, RecursionError):
@@ -1107,7 +1851,7 @@ def decide(command: str, cwd: str = None, modes=None):
             outcome = {"action": "allow", "rule": rule, "detail": detail, "hatch_reason": hatch.strip()}
         else:
             outcome = {"action": "deny" if mode == "enforce" else "warn", "rule": rule, "detail": detail,
-                       "message": deny_message(rule, detail, hatch, capped)}
+                       "message": deny_message(rule, detail, hatch, capped, command, cwd)}
         if SEVERITY[outcome["action"]] > SEVERITY[best["action"]] or (
                 outcome["action"] == "allow" and best["action"] == "allow" and outcome.get("hatch_reason")
                 and not best.get("hatch_reason")):
@@ -1115,7 +1859,91 @@ def decide(command: str, cwd: str = None, modes=None):
     return best
 
 
-def deny_message(rule, detail, hatch, capped):
+def route_host() -> str:
+    """Where refused heavy work should go: HARNESS_ROUTE_HOST or heavy_job_guard.json "route_host" (default dev2;
+    set to t2 when dev2 is retired). Only a plain host name is accepted."""
+    value = os.environ.get("HARNESS_ROUTE_HOST", "")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,60}", value):
+        value = ""
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
+            if os.path.exists(path):
+                candidate = str(load_json_file(path).get("route_host", ""))
+                value = candidate if re.fullmatch(r"[A-Za-z0-9._-]{1,60}", candidate) else ""
+        except Exception:
+            value = ""
+    return value or "t2-dev"
+
+
+def routed(text: str) -> str:
+    return text.replace("ssh dev2 ", f"ssh {route_host()} ")
+
+
+def claude_route_host() -> str:
+    """Host for headless claude/codex work. Default dev2: the claude CLI on t2-dev is not logged in (known gap,
+    goodqa#14817), so `claude -p` must not be routed there. Override: HARNESS_CLAUDE_ROUTE_HOST or
+    heavy_job_guard.json "claude_route_host"; `doctor.py route-auth` flags a host whose claude is not authenticated."""
+    value = os.environ.get("HARNESS_CLAUDE_ROUTE_HOST", "")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,60}", value):
+        value = ""
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
+            if os.path.exists(path):
+                candidate = str(load_json_file(path).get("claude_route_host", ""))
+                value = candidate if re.fullmatch(r"[A-Za-z0-9._-]{1,60}", candidate) else ""
+        except Exception:
+            value = ""
+    return value or "dev2"
+
+
+def ah_run_available() -> bool:
+    return os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ah_run.py"))
+
+
+def exact_route(command, cwd, rule=None):
+    """The same command on the routed host, as it can really run there: the checkout is copied first (Mac paths do not
+    exist on the host), the WHOLE original command is quoted (pipes, newlines and loops survive), nothing is truncated.
+    `ah run --host H` is printed only when ah_run.py is installed (goodqa#14548)."""
+    import shlex
+    claude_work = rule == "fan-out" and bool(re.search(r"\bclaude\b", command or ""))
+    host = claude_route_host() if claude_work else route_host()
+    if not command or not command.strip():
+        return ""
+    folder = os.path.basename((cwd or "").rstrip("/"))
+    folder = folder if re.fullmatch(r"[A-Za-z0-9._-]{1,80}", folder or "") else ""
+    lines = [f"Exact equivalent on {host}:"]
+    if folder:
+        lines.append(f"  1. copy the checkout: rsync -a --exclude node_modules --exclude .git {shlex.quote(cwd.rstrip('/') + '/')} "
+                     f"{host}:~/{folder}/")
+    if len(command) > 3000:
+        lines.append("  2. the command is too long to print: save it to a script file in the checkout, copy it, and run "
+                     f"ssh {host} 'cd ~/{folder or '.'} && bash script.sh'")
+    else:
+        inner = f"cd ~/{folder} && {command}" if folder else command
+        lines.append(f"  {'2. ' if folder else ''}ssh {host} bash -lc {shlex.quote(inner)}")
+    if ah_run_available():
+        lines.append(f"  or: python3 ~/.claude/hooks/ah.py run --host {host} -- {command}")
+    else:
+        lines.append("  (`ah.py run --host HOST -- CMD` replaces steps 1-2 once goodqa#14548 is installed)")
+    if claude_work:
+        lines.append(f"  Note: claude on t2-dev is not logged in (known gap), so headless claude goes to {host} until dev2 retires on 11-09.")
+    return "\n".join(lines)
+
+
+def deny_message(rule, detail, hatch, capped, segment=None, cwd=None):
+    return scrub_url(_deny_message_text(rule, detail, hatch, capped, segment, cwd))  # no URL credentials in a message
+
+
+def _deny_message_text(rule, detail, hatch, capped, segment=None, cwd=None):
+    base_msg = routed(_deny_message(rule, detail, hatch, capped))
+    if rule == "fan-out" and re.search(r"\bclaude\b", (segment or "") + detail):
+        base_msg = base_msg.replace(f"ssh {route_host()} ", f"ssh {claude_route_host()} ")  # claude is not logged in on t2-dev
+    # A Dropbox upload of Mac files cannot move to another host; the lane message already gives the command.
+    extra = exact_route(segment, cwd, rule) if rule not in NEVER_BLOCK and rule != "dropbox-lane" else ""
+    return base_msg + ("\n" + extra if extra else "")
+
+
+def _deny_message(rule, detail, hatch, capped):
     cap = "python3 ~/.claude/hooks/run_capped.py --max-rss-gb <declared peak x1.5> --timeout-s <expected x2> -- <command>"
     if rule in WARN_ONLY:
         return (f"Heavy-job guard [{rule}] advisory (not blocked): {RULE_HELP[rule]} ({detail}). Instead: "
@@ -1126,8 +1954,18 @@ def deny_message(rule, detail, hatch, capped):
         return (f"Heavy-job guard [{rule}] advisory (not blocked): {RULE_HELP[rule]} ({detail}). Hostile-input tests are "
                 f"legitimate. Prefer dev2 (ssh dev2 '<command>'), or on the Mac run under {cap} so stopping the test also "
                 "stops its children and a runaway is paused instead of resetting the machine.")
+    if rule == "dropbox-lane":
+        return (f"Heavy-job guard [dropbox-lane]: {RULE_HELP['dropbox-lane']} ({detail}). Use the one throttled lane: "
+                f"`rclone copy <src> <remote>:<dst> --tpslimit {LANE_TPS} --transfers {LANE_TRANSFERS}`, one upload at a "
+                "time, started after the running one ends (queue them in one script). A single unanticipated upload may "
+                f"use {HATCH}=<reason> (one use per owner per hour, audited).")
+    if rule == "copy":
+        return (f"Heavy-job guard [copy]: {RULE_HELP['copy']} ({detail}). Large copies, clones and review trees belong on "
+                "dev2/T2, not the Mac: run it there (ssh dev2 '<command>', or the T2 host) and fetch only the result; "
+                "clone with --depth 1 or --filter=blob:none, or delete finished trees first. A single unanticipated "
+                f"local step may use {HATCH}=<reason> (one use per owner per hour, audited, refused above 85% disk).")
     head = (f"Heavy-job guard [{rule}]: {RULE_HELP.get(rule, 'heavy work')} ({detail}). "
-            "Large jobs belong on dev2, not the Mac (2026-11-04: an uncapped local process hit ~66 GB and reset the machine).")
+            "Large jobs belong on dev2/T2, not the Mac (2026-11-04: an uncapped local process hit ~66 GB and reset the machine).")
     lines = [head, "Run it there: ssh dev2 '<command>' (sync the checkout first if needed), or"]
     if valid_reason(hatch) and rule in CAPPED_RULES and not capped:
         lines.append(f"{HATCH} is set, but {rule} work on the Mac must ALSO run under the resource cap: {cap}")
@@ -1207,7 +2045,10 @@ def log_hatch_to_wal(payload: dict, decision: dict) -> None:
         reason = decision["hatch_reason"]
         if wal_note.SECRET_PATTERN.search(reason):
             reason = "[redacted]"
-        note = (f"HARNESS_LOCAL_OK used: rule={decision['rule']} ({decision['detail'][:80]}); reason={reason[:300]}")
+        detail = scrub_url(decision["detail"])[:80]
+        if wal_note.SECRET_PATTERN.search(detail):
+            detail = "[redacted]"
+        note = f"HARNESS_LOCAL_OK used: rule={decision['rule']} ({detail}); reason={reason[:300]}"
         record = {"at": datetime.now(timezone.utc).isoformat(), "event": "decision", "note": note}
         root = Path.home() / ".claude" / "wals" / wal.safe_id(session)
         targets = [root / "main.jsonl"]
@@ -1222,6 +2063,184 @@ def log_hatch_to_wal(payload: dict, decision: dict) -> None:
         log_event({"event": "hatch-wal-failed", "error": type(error).__name__})
 
 
+# ---------------------------------------------------------------- hatch limit, disk budget, ring events (P12)
+
+def hatch_limit() -> int:
+    """Escape-hatch uses allowed per owner per hour. Default 1 (NEVER-LOSE P12/I13): the hatch is for one
+    unanticipated local step, and a sequence of copies is exactly the shape that filled the disk."""
+    env = os.environ.get("HARNESS_HATCH_PER_HOUR", "")
+    if re.fullmatch(r"[0-9]{1,4}", env) and int(env) > 0:
+        return int(env)
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
+        if os.path.exists(path):
+            value = int(load_json_file(path).get("hatch_per_hour", 1))
+            if value > 0:
+                return value
+    except Exception:
+        pass
+    return 1
+
+
+def owner_of(payload: dict) -> str:
+    """Stable owner key: the sub-agent id when there is one, else the session id."""
+    for key in ("agent_id", "session_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", value):
+            return value
+    return "unknown"
+
+
+def state_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".agent-harness", "state")
+
+
+def record_hatch_use(owner: str, limit: int, now: float = None):
+    """Atomically count this use. Returns (allowed, uses in the last hour, counting this one when allowed)."""
+    import fcntl
+    import json
+    now = time.time() if now is None else now
+    os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+    path = os.path.join(state_dir(), "heavy-hatch.json")
+    fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            data = load_json_file(path, 1024 * 1024)
+        except Exception:
+            data = {}
+        uses = {k: [min(t, now) for t in v if isinstance(t, (int, float)) and -300 <= now - t < 3600]
+                for k, v in data.items() if isinstance(v, list)}
+        mine = uses.get(owner, [])
+        if len(mine) >= limit:
+            return False, len(mine)
+        mine.append(now)
+        uses[owner] = mine
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as handle:
+            json.dump({k: v for k, v in uses.items() if v}, handle)
+        os.replace(tmp, path)
+        return True, len(mine)
+    finally:
+        os.close(fd)
+
+
+HATCH_DISK_REFUSE_PCT = 85.0
+
+
+def disk_used_pct() -> float:
+    import shutil
+    try:
+        probe = "/System/Volumes/Data" if os.path.isdir("/System/Volumes/Data") else os.path.expanduser("~")
+        usage = shutil.disk_usage(probe)
+        return 100.0 * usage.used / usage.total
+    except Exception:
+        return 0.0
+
+
+def work_owner_key(path):
+    """'session/sub' of the work dir owning `path`, else None."""
+    root = os.path.join(os.path.expanduser("~"), ".agent-harness", "work") + os.sep
+    real = os.path.realpath(path) if path else ""
+    for candidate in (path, real):
+        if candidate and candidate.startswith(root):
+            parts = candidate[len(root):].split(os.sep)
+            if len(parts) >= 2 and parts[0] and parts[1]:
+                return f"{parts[0]}/{parts[1]}"
+    return None
+
+
+def agent_of_key(key: str) -> str:
+    """Same identity ops_watch uses: the sub-agent id of work/<session>/agent-<id>, else '<session8>-<sub>'."""
+    sess, _, sub = key.partition("/")
+    agent = sub[len("agent-"):] if sub.startswith("agent-") and len(sub) > 6 else f"{sess[:8]}-{sub}"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", agent)[:80]
+
+
+def record_epoch(rec) -> float:
+    """When the record was measured: measured_at_epoch, else the ISO measured_at of the agreed contract shape."""
+    try:
+        value = float(rec["measured_at_epoch"])
+        if value == value and abs(value) != float("inf"):
+            return value
+        return 0.0  # NaN or infinity: treat as unmeasured (stale), never as fresh
+    except (KeyError, TypeError, ValueError):
+        pass
+    from datetime import datetime, timezone
+    text = str(rec.get("measured_at", "")).replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text if "T" not in text or len(text) > 16 else text + ":00")
+        return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def over_budget(cwd):
+    """The over-budget record covering cwd, re-measured live so freeing space unblocks at once.
+
+    Source: state/disk-budget/<agent>.json written by ops_watch (agent, budget_bytes, used_bytes, measured_at,
+    over_since; path_key optional). A live walk that cannot finish in time does NOT clear the block: only a
+    complete measurement under budget does."""
+    try:
+        directory = os.path.join(state_dir(), "disk-budget")
+        records = [load_json_file(os.path.join(directory, n), 64 * 1024) for n in os.listdir(directory) if n.endswith(".json")]
+    except Exception:
+        return None
+    key = work_owner_key(cwd)
+    if not key:
+        return None
+    for rec in records:
+        try:
+            if rec.get("over_since") is None:
+                continue
+            if rec.get("path_key") != key and rec.get("agent") != agent_of_key(key):
+                continue
+            age = time.time() - record_epoch(rec)
+            if age > 3 * 3600 or age < -300:
+                continue  # stale, or stamped in the future: a record must never block work for good
+            base = os.path.join(os.path.expanduser("~"), ".agent-harness", "work", key)
+            budget = int(rec["budget_bytes"])
+            size, complete = path_size(base, cap=budget + 1, seconds=1.0)
+            if size > budget or not complete:
+                return dict(rec, path_key=key, used_bytes=max(size, int(rec.get("used_bytes", 0))))
+        except Exception:
+            continue
+    return None
+
+
+def ring_event(key: str, severity: str, message: str, detail: dict) -> None:
+    """One ring event per refusal or hatch use (contract with ahd and the console): never command text or raw paths."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import ops_watch
+        ops_watch.emit({"host": ops_watch.default_host(), "source": "heavy-guard", "event": "raise",
+                        "severity": severity, "check": "heavy-guard", "key": key, "message": message[:300],
+                        "detail": detail})
+    except Exception as error:
+        log_event({"event": "ring-failed", "error": type(error).__name__})
+
+
+def path_digest(path) -> str:
+    import hashlib
+    return hashlib.sha256(str(path).encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def event_class(decision: dict) -> str:
+    detail = decision.get("detail", "")
+    if detail.startswith(("git clone", "gh repo clone")):
+        return "clone"
+    return "tar" if detail.startswith("tar") else "copy"
+
+
+def copy_event_detail(payload: dict, decision: dict, hatch_uses=None) -> dict:
+    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else ""
+    match = re.search(r"at least ([0-9.]+) GiB", decision.get("detail", ""))
+    mib = re.search(r"at least ([0-9.]+) MiB", decision.get("detail", ""))
+    return {"agent": owner_of(payload), "task": work_owner_key(cwd) or "", "host": "mac",
+            "est_bytes": int(float(match.group(1)) * GIB) if match else (int(float(mib.group(1)) * 1048576) if mib else None), "path_digest": path_digest(cwd),
+            "route": route_host(), "hatch_uses_1h": hatch_uses}
+
+
 def run(raw: bytes) -> int:
     import json
     try:
@@ -1230,26 +2249,77 @@ def run(raw: bytes) -> int:
         warn("payload too large, too deeply nested or malformed; failing open")
         log_event({"event": "fail-open", "reason": "payload-shape"})
         return 0
-    if not isinstance(payload, dict) or payload.get("tool_name", "Bash") != "Bash":
+    if not isinstance(payload, dict):
         return 0
-    tool_input = payload.get("tool_input")
-    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    tool = str(payload.get("tool_name") or payload.get("toolName") or "Bash").casefold()
+    tool_input = payload.get("tool_input") or payload.get("toolInput")
+    if not (tool == "bash" or tool.startswith(("shell", "exec", "local_shell"))):
+        return 0  # Codex names its shell tools shell/exec_command/local_shell; Claude Code says Bash
+    command = None
+    if isinstance(tool_input, dict):
+        command = tool_input.get("command") if tool_input.get("command") is not None else tool_input.get("cmd")
+        if isinstance(command, list) and all(isinstance(c, str) for c in command):
+            import shlex
+            command = shlex.join(command)
+        if isinstance(tool_input.get("workdir"), str) and not isinstance(payload.get("cwd"), str):
+            payload = dict(payload, cwd=tool_input["workdir"])
     if not isinstance(command, str):
         return 0
     decision = decide(command, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None)
     action = decision["action"]
+    owner = owner_of(payload)
+    if decision.get("rule") in ("copy", "build") and action != "warn":
+        budget = over_budget(payload.get("cwd"))
+        if budget:  # over its disk budget: new heavy local writes stop, hatch or not, until it frees space or routes
+            gib = lambda n: f"{int(n) / GIB:.1f}"  # noqa: E731
+            sys.stderr.write(routed(f"Heavy-job guard [{decision['rule']}]: owner work dir {budget['path_key']} is over its {gib(budget['budget_bytes'])} GiB "
+                             f"disk budget ({gib(budget['used_bytes'])} GiB used). Free space there (nothing is deleted for you) or "
+                             "run the heavy job on dev2/T2 (ssh dev2 '<command>').\n"))
+            log_event({"event": "deny-over-budget", "rule": decision["rule"]})
+            ring_event(f"heavy:{event_class(decision)}:{owner}", "high", f"{owner} refused a heavy {decision['rule']}: over disk budget",
+                       dict(copy_event_detail(payload, decision), used_bytes=budget["used_bytes"],
+                            budget_bytes=budget["budget_bytes"]))
+            return 2
+    if action == "allow" and decision.get("hatch_reason") and decision.get("rule") not in NEVER_BLOCK:
+        if decision.get("rule") == "copy" and disk_used_pct() >= HATCH_DISK_REFUSE_PCT:
+            sys.stderr.write(routed(f"Heavy-job guard [copy]: the disk is above {HATCH_DISK_REFUSE_PCT:.0f}% used, so {HATCH} does not "
+                             "apply to large copies. Run it on dev2/T2 (ssh dev2 '<command>') or free space first.\n"))
+            log_event({"event": "deny-hatch-disk", "rule": "copy"})
+            ring_event(f"heavy:{event_class(decision)}:{owner}", "high", f"{owner} refused a hatch copy: disk above 85%",
+                       copy_event_detail(payload, decision))
+            return 2
+        if live_heavy_jobs() >= max_heavy_jobs():  # refuse BEFORE spending this owner's hourly use
+            sys.stderr.write(routed(f"Heavy-job guard: {live_heavy_jobs()} heavy jobs are already running on the Mac (limit "
+                             f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on dev2 (ssh dev2 '<command>').\n"))
+            log_event({"event": "deny-concurrency", "rule": decision["rule"]})
+            return 2
+        allowed, uses = record_hatch_use(owner, hatch_limit())
+        if not allowed:
+            sys.stderr.write(routed(f"Heavy-job guard: {HATCH} was already used {uses} time(s) in the last hour by this owner "
+                             f"(limit {hatch_limit()}). More than that is heavy work on the Mac: run it on dev2/T2 "
+                             "(ssh dev2 '<command>') or raise the budget in the run kit.\n"))
+            log_event({"event": "deny-hatch-limit", "rule": decision["rule"]})
+            ring_event(f"heavy:hatch:{owner}", "warning", f"{owner} exceeded the {HATCH} limit ({uses}/h)",
+                       dict(copy_event_detail(payload, decision), hatch_uses_1h=uses))
+            return 2
+        decision["hatch_uses_1h"] = uses
     if (action == "allow" and decision.get("hatch_reason") and decision.get("rule") not in NEVER_BLOCK
             and live_heavy_jobs() >= max_heavy_jobs()):
-        sys.stderr.write(f"Heavy-job guard: {live_heavy_jobs()} heavy jobs are already running on the Mac (limit "
-                         f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on dev2 (ssh dev2 '<command>').\n")
+        sys.stderr.write(routed(f"Heavy-job guard: {live_heavy_jobs()} heavy jobs are already running on the Mac (limit "
+                         f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on dev2 (ssh dev2 '<command>').\n"))
         log_event({"event": "deny-concurrency", "rule": decision["rule"]})
         return 2
     if action == "allow":
         if decision.get("hatch_reason"):
             log_hatch_to_wal(payload, decision)
             log_event({"event": "hatch", "rule": decision["rule"]})
+            ring_event(f"heavy:hatch:{owner}", "warning", f"{owner} used {HATCH} for rule {decision['rule']}",
+                       dict(copy_event_detail(payload, decision, decision.get("hatch_uses_1h")), rule=decision["rule"]))
         return 0
     log_event({"event": action, "rule": decision["rule"]})  # never the command text: it may carry secrets
+    if action == "deny" and decision["rule"] == "copy":
+        ring_event(f"heavy:{event_class(decision)}:{owner}", "warning",
+                   f"{owner} refused a heavy {event_class(decision)} on the Mac", copy_event_detail(payload, decision))
     if action == "warn":
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
                                                  "additionalContext": "WARNING (warn mode) " + decision["message"]}}))
@@ -1263,6 +2333,14 @@ def main() -> int:
         return 0  # dev2 and other hosts are where the heavy work is supposed to run
     if os.environ.get("HARNESS_HEAVY_GUARD") == "off":
         return 0
+    try:
+        import socket
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
+        if os.path.exists(path) and socket.gethostname().split(".")[0].lower() in {
+                str(h).lower() for h in load_json_file(path).get("exempt_hosts", [])}:
+            return 0  # a host listed in heavy_job_guard.json "exempt_hosts" (for example the Mac mini) is a heavy-work host
+    except Exception:
+        pass
     try:
         import safe_input
         try:
