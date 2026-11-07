@@ -577,7 +577,7 @@ class Failure(Case):
         self.run_script()
         argv = self.copies()[0]
         want = {"--transfers": "2", "--tpslimit": "1", "--checkers": "4", "--dropbox-batch-mode": "sync",
-                "--dropbox-batch-size": "100", "--retries": "10", "--retries-sleep": "30s", "--low-level-retries": "20"}
+                "--dropbox-batch-size": "100", "--retries": "3", "--retries-sleep": "30s", "--low-level-retries": "20"}
         for flag, value in want.items():
             self.assertEqual(argv[argv.index(flag) + 1], value, flag)
 
@@ -937,13 +937,16 @@ class Contention(Case):
         self.assertIn("stopped at the run deadline", (self.logs / "log-backup.log").read_text())
 
     def test_jitter_does_not_spend_the_copy_budget(self):
-        # A start delay of up to 1 s with a 21 s budget leaves under 20 s on the old code about half the time, which
-        # skips every source. Eight runs make a pass on the old code a 1-in-256 event.
-        for attempt in range(8):
-            done = self.run_script(LOG_BACKUP_JITTER_SECONDS="1", LOG_BACKUP_BUDGET_SECONDS="21")
+        # The first copy gets the whole budget however long the start delay was. With a delay of 0-2 s the old code
+        # passes only when every one of six delays is 0, a 1-in-729 event.
+        for attempt in range(6):
+            open(self.calls, "w").close()
+            done = self.run_script(LOG_BACKUP_JITTER_SECONDS="2", LOG_BACKUP_BUDGET_SECONDS="300",
+                                   LOG_BACKUP_SLICE_RESERVE_SECONDS="0")
             self.assertEqual(done.returncode, 0, "attempt %d: %s" % (attempt, done.stderr))
-            self.assertTrue(self.last_ok().exists(), attempt)
-            os.unlink(self.last_ok())
+            first = self.copies()[0]
+            seconds = int(first[first.index("--max-duration") + 1].rstrip("s"))
+            self.assertGreaterEqual(seconds, 299, "attempt %d: the start delay spent the budget" % attempt)
 
     def test_a_hung_projects_copy_leaves_time_for_the_later_tier1_sources(self):
         start = time.time()

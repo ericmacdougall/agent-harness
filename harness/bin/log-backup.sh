@@ -268,7 +268,13 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
     # A watchdog stops this script's own copy DEADLINE_GRACE seconds past its share; partial progress is kept.
     "$RCLONE" "${args[@]}" --max-duration "${remaining}s" -- "$p" "$dst" </dev/null &
     copy_pid=$!
-    ( sleep $((remaining + DEADLINE_GRACE)) && kill -TERM "$copy_pid" 2>/dev/null && touch "$LOGDIR/.log-backup.deadline.$copy_pid" ) &
+    # The watchdog ends its own sleep when it is stopped, so no orphan sleep holds the caller's output open; it writes
+    # its marker before signalling, so the copy's exit can never be read before the marker exists.
+    ( trap 'kill "$nap" 2>/dev/null; exit 0' TERM
+      sleep $((remaining + DEADLINE_GRACE)) & nap=$!
+      wait "$nap" || exit 0
+      touch "$LOGDIR/.log-backup.deadline.$copy_pid"
+      kill -TERM "$copy_pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
     dog_pid=$!
     wait "$copy_pid"; rc=$?
     kill "$dog_pid" 2>/dev/null; wait "$dog_pid" 2>/dev/null
