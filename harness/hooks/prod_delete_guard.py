@@ -24,7 +24,9 @@ What counts as a production TARGET (each yields the exact target value a grant m
     prod (attached forms like -hprod-db too), or a positional argument naming prod -> that value
   - PGHOST= / PGDATABASE= / DATABASE_URL= / MYSQL_HOST= assignments in the command, or (when the
     command references or relies on them) the same variables in the hook's environment
-  - ssh <prod-host> running a DB client or wrangler        -> the host
+  - ssh <prod-host> running a DB client or wrangler        -> the host; also a prod -o HostName, or a prod
+    HostName that ~/.ssh/config (or -F file, with Include, Match and %h) could give the alias -> that name.
+    The config is read over-approximately (every block that could apply); /etc/ssh/ssh_config is not read
   - docker exec <prod-container> running a DB client        -> the container
   - mcp__*__d1_database_query / hyperdrive_* (production by construction) -> the database id field
 The SQL is read from the command and, with a DB client in it, from --file / psql -f files (also -1f,
@@ -581,7 +583,111 @@ def _after(words: list, index: int, opts_with_value) -> str:
     return ""
 
 
-def targets_production(command: str, env=None):
+SSH_CONFIG_LIMIT = 64 * 1024
+SSH_CONFIG_FILES = 16
+SSH_CONFIG_DEPTH = 4
+SSH_CONFIG_LINES = 4096
+
+
+def _ssh_route(words: list, index: int):
+    """(alias, [command-line HostName values], -F path or None) for the ssh at words[index]. Bounded like _after."""
+    opts = {"-" + c for c in SSH_OPTS_WITH_VALUE}
+    names, config = [], None
+    i = index + 1
+    while i < len(words) and i - index <= AFTER_SCAN:
+        w = words[i]
+        if w == "--":
+            return (words[i + 1] if i + 1 < len(words) else ""), names, config
+        if not w.startswith("-") or w == "-":
+            return w, names, config
+        value = None
+        if w in ("-o", "-F"):
+            value = words[i + 1] if i + 1 < len(words) else ""
+            i += 2
+        elif w.startswith(("-o", "-F")):
+            value = w[2:]
+            i += 1
+        elif w[:2] in opts and len(w) == 2:
+            i += 2
+            continue
+        else:
+            i += 1
+            continue
+        if w.startswith("-F"):
+            config = value
+            continue
+        m = re.match(r"(?i)\s*hostname\s*(?:=|\s)\s*(\S+)", value or "")
+        if m:
+            names.append(m.group(1))
+    return "", names, config
+
+
+def _ssh_host_matches(alias: str, patterns: list) -> bool:
+    """OpenSSH Host matching: shell * and ?, a matching !pattern excludes the block. Matched both as typed and
+    case-folded, so the guard sees every block ssh could apply (it only adds candidates)."""
+    import fnmatch  # noqa: PLC0415
+    hit = False
+    for pattern in patterns:
+        negated = pattern.startswith("!")
+        value = pattern[1:] if negated else pattern
+        if fnmatch.fnmatchcase(alias, value) or fnmatch.fnmatchcase(alias.casefold(), value.casefold()):
+            if negated:
+                return False
+            hit = True
+    return hit
+
+
+def _ssh_config_hostnames(alias: str, config=None, home=None, cwd=None) -> list:
+    """Every HostName ssh config could give `alias`: from matching Host blocks, every Match block and included
+    files (bounded: SSH_CONFIG_FILES files of SSH_CONFIG_LIMIT bytes, depth SSH_CONFIG_DEPTH). Over-approximate on
+    purpose: the caller only denies when a candidate names prod, so an extra candidate can never allow anything.
+    Unreadable or malformed files give no candidates (the literal alias is still judged). %h and %% are expanded."""
+    import glob  # noqa: PLC0415
+    import safe_input  # noqa: PLC0415
+    sshdir = home_dir(home) / ".ssh"
+    start = os.path.expanduser(config) if config else str(sshdir / "config")
+    if config and not os.path.isabs(start):
+        start = os.path.join(str(cwd or os.getcwd()), start)
+    out, seen = [], set()
+
+    def read(path, depth, active):
+        real = os.path.realpath(path)
+        if real in seen or len(seen) >= SSH_CONFIG_FILES or depth > SSH_CONFIG_DEPTH:
+            return
+        seen.add(real)
+        try:
+            text = safe_input.read_bounded(path, SSH_CONFIG_LIMIT).decode("utf-8", "replace")
+        except (safe_input.InputRejected, OSError, ValueError):
+            return
+        for line in text.splitlines()[:SSH_CONFIG_LINES]:
+            parts = re.split(r"\s*=\s*|\s+", line.split("#", 1)[0].strip(), maxsplit=1)
+            key = parts[0].casefold()
+            args = parts[1].split() if len(parts) > 1 else []
+            if key == "host":
+                active = _ssh_host_matches(alias, [a.strip("\"'") for a in args[:64]])
+            elif key == "match":
+                # host/originalhost criteria are checked; any other criterion (exec, user, all ...) may apply
+                lowered = [a.casefold() for a in args]
+                active = True
+                for crit in ("host", "originalhost"):
+                    if crit in lowered and lowered.index(crit) + 1 < len(args):
+                        active = _ssh_host_matches(alias, args[lowered.index(crit) + 1].split(","))
+                        break
+            elif key == "hostname" and active and args:
+                out.append(args[0].strip("\"'").replace("%h", alias).replace("%%", "%"))
+            elif key == "include" and active:
+                for pattern in args[:16]:
+                    pattern = os.path.expanduser(pattern.strip("\"'"))
+                    if not os.path.isabs(pattern):
+                        pattern = str(sshdir / pattern)
+                    for found in sorted(glob.glob(pattern))[:SSH_CONFIG_FILES]:
+                        read(found, depth + 1, active)
+
+    read(start, 0, True)
+    return out
+
+
+def targets_production(command: str, env=None, home=None, cwd=None):
     """(description, [target groups]) of the production targets this command names, or ("", []).
     Each group is a tuple of alternative names for one target (a connection string's host and its
     database); a grant naming any one of them covers that target."""
@@ -645,10 +751,21 @@ def targets_production(command: str, env=None):
     for i, w in enumerate(words):
         base = w[w.rfind("/") + 1:]
         if base == "ssh":
-            host = _after(words, i, {"-" + c for c in SSH_OPTS_WITH_VALUE})
             rest = " ".join(words[i + 1:])
-            if host and _prod(host) and (DB_CLIENT.search(rest) or "wrangler" in rest):
-                add("ssh to a prod host (%s) running a database client" % host, [host.split("@")[-1]])
+            if DB_CLIENT.search(rest) or "wrangler" in rest:
+                # The destination is the alias, a command-line HostName (first wins in ssh, but every one is
+                # judged) or a HostName the ssh config gives the alias (goodqa#15037).
+                alias, names, config = _ssh_route(words, i)
+                alias = alias.split("@")[-1]
+                if alias and _prod(alias):
+                    add("ssh to a prod host (%s) running a database client" % alias, [alias])
+                if alias and not names:
+                    names = _ssh_config_hostnames(alias, config, home, cwd)
+                for name in names[:16]:
+                    name = name.split("@")[-1]
+                    if _prod(name):
+                        add("ssh to %s, which reaches a prod host (%s), running a database client" % (alias, name),
+                            [name])
         if base == "docker" and i + 1 < len(words) and words[i + 1] == "exec":
             box = _after(words, i + 1, DOCKER_EXEC_OPTS_WITH_VALUE)
             rest = " ".join(words[i + 2:])
@@ -970,7 +1087,7 @@ def evaluate(ev, home=None, now=None, resolver=None, env=None):
         match = destructive_match(sql)
         if not match and not unread:
             return None
-        target, values = targets_production(command, env)
+        target, values = targets_production(command, env, home, ev.get("cwd"))
         tool = str(ev.get("tool_name") or "")
         if not target and TOOL_IS_PRODUCTION_BY_CONSTRUCTION.search(tool):
             ti = ev.get("tool_input") or {}
