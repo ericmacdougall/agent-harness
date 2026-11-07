@@ -865,6 +865,51 @@ class FalsePositives15122(Base):
                 self.assertIn("unverifiable", kinds, command)
                 self.assertEqual(self.decide(command)[0], 2, command)
 
+    def test_redteam_f1_other_bash_reassignments_make_a_variable_unknown(self):
+        # fixture red-team finding 1: these change X after X=view; the resolver must not read X as view.
+        for command in ("X=view; declare -n R=X; R=merge; gh pr $X 5", "X=view; printf -vX merge; gh pr $X 5",
+                        "X=view; trap ': ; X=merge' DEBUG; gh pr $X 5", "X=view; read -aX <<< merge; gh pr $X 5",
+                        "X=view; local -n R=X; R=merge; gh pr $X 5", "X=view; mapfile -tX < f; gh pr $X 5"):
+            with self.subTest(command):
+                self.assertIn("unverifiable", self.kinds(command), command)
+                self.assertEqual(self.decide(command)[0], 2, command)
+
+    def test_redteam_f2_more_pushes_to_main_stay_blocked(self):
+        # fixture red-team finding 2: short refs, git aliases, push config and xargs-supplied refspecs.
+        for command in ("git push origin HEAD:heads/main", "git push origin feat:refs/heads/master",
+                        "git -c alias.p='push origin main' p", "echo main | xargs git push origin",
+                        "git -c remote.origin.push=HEAD:main push origin", "git -c push.default=current push origin"):
+            with self.subTest(command):
+                self.assertEqual(self.kinds(command), ["unverifiable"], command)
+                self.assertEqual(self.decide(command)[0], 2, command)
+        for command in ("git push origin HEAD:refs/heads/feat/main", "git -c core.hooksPath=/dev/null push gh feat"):
+            with self.subTest(command):
+                self.assertEqual(self.kinds(command), [], command)
+
+    def test_redteam_f4_exception_record_through_any_other_program_stays_blocked(self):
+        # fixture red-team finding 4: only known free-text forms are exempt; every other program keeps the text rule.
+        for command in ("awk 'BEGIN{system(\"python3 /h/merge_gate.py waive\")}'",
+                        "gh issue comment 1 --body \"$(python3 /h/merge_gate.py waive)\"",
+                        "git -c alias.w='!python3 /h/merge_gate.py waive' w",
+                        "find . -name x -exec python3 /h/merge_gate.py waive \\;",
+                        "make -f /h/Makefile merge_gate_waive",
+                        "sed -n '1e python3 /h/merge_gate.py waive' f",
+                        "python3 /h/wal_note.py --note 'merge_gate waive'",
+                        "python3 -I ~/.claude/hooks/wal_note.py; python3 /h/merge_gate.py waive",
+                        "> f python3 /h/merge_gate.py waive",
+                        "echo merge_gate waive > f; perl f"):
+            with self.subTest(command):
+                code, text = mg.decide(bash(command, **self.SUB), FakeGh(SCENARIOS["green"]), self.state)
+                self.assertEqual(code, 2, text)
+        for command in ("git -c core.hooksPath=/dev/null commit -q -F msg.txt -m 'merge_gate waive check'",
+                        "grep -n 'waive' harness/hooks/merge_gate.py | head -5",
+                        "N='merge_gate waive note'; python3 ~/.claude/hooks/wal_note.py --note \"$N\"",
+                        "python3 ~/.claude/hooks/ah.py ticket comment 'goodqa#1' --body 'merge_gate waive fixed' 2>&1",
+                        "cd /r && git log --grep 'merge_gate waive' --oneline"):
+            with self.subTest(command):
+                code, text = mg.decide(bash(command, **self.SUB), FakeGh(SCENARIOS["green"]), self.state)
+                self.assertEqual(code, 0, text)
+
     def test_ac2_subagent_free_text_about_the_exception_record_is_allowed(self):
         for command in ("python3 ~/.claude/hooks/wal_note.py --wal /w/a.jsonl --event status "
                         "--note 'fixed the merge_gate.py waive false positive'",
