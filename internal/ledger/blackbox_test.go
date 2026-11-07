@@ -1210,6 +1210,61 @@ func TestInitKeepsHomeAfterPublication(t *testing.T) {
 	}
 }
 
+// A failed init (a crash between the writer ref CAS and projects.json) must leave no writer state in the
+// repository either, for repository and repo-less ledgers, so a retry works (audit2 F-019, goodqa#15000).
+func TestFailedInitCanBeRetried(t *testing.T) {
+	w := newWorld(t)
+	if r := w.run(w.repo, []string{ledger.FailPublishEnv + "=1"}, "tickets", "init", "--slug", "retry-me"); r.code == 0 {
+		t.Fatal("init with the pre-publish fault succeeded")
+	}
+	if _, err := os.Stat(filepath.Join(w.commonDir(), "goodqa", "writer.json")); !os.IsNotExist(err) {
+		t.Fatalf("a failed init left writer.json behind: %v", err)
+	}
+	if refs := w.ownRefs(); len(refs) != 0 {
+		t.Fatalf("a failed init left ledger refs behind: %v", refs)
+	}
+	w.ok(w.repo, nil, "init", "--slug", "retry-me")
+	w.newTicket(w.repo, nil, "works after a retried init")
+
+	rl := filepath.Join(filepath.Dir(w.repo), "rl")
+	w.git(filepath.Dir(w.repo), "init", "-q", rl)
+	if r := w.run(rl, []string{ledger.FailPublishEnv + "=1"}, "tickets", "init", "--no-repo", "--slug", "rl-retry"); r.code == 0 {
+		t.Fatal("repo-less init with the pre-publish fault succeeded")
+	}
+	outside := filepath.Join(filepath.Dir(w.repo), "rl-outside")
+	os.MkdirAll(outside, 0o755)
+	w.ok(outside, nil, "init", "--no-repo", "--slug", "rl-retry")
+	w.newTicket(outside, nil, "repo-less works after a retried init", "--slug", "rl-retry")
+}
+
+// Plan review of the F-019 port: the cleanup runs under the writer lock. A second init that starts while the
+// failed one is still cleaning up must wait, so the cleanup can never remove the writer.json it then writes.
+// The delay hook holds the failed init between its error and its cleanup; releasing the lock before the
+// cleanup (mutant init-cleanup-after-unlock) lets the second init finish first and lose its writer.json.
+func TestFailedInitCleanupCannotRemoveConcurrentInit(t *testing.T) {
+	w := newWorld(t)
+	done := make(chan result, 1)
+	go func() {
+		done <- w.run(w.repo, []string{ledger.FailPublishEnv + "=1", ledger.InitCleanupDelay + "=1500"},
+			"tickets", "init", "--slug", "first")
+	}()
+	time.Sleep(400 * time.Millisecond) // the failed init is now inside its delay
+	second := w.run(w.repo, nil, "tickets", "init", "--slug", "second")
+	writerJSON := filepath.Join(w.commonDir(), "goodqa", "writer.json")
+	after, aerr := os.ReadFile(writerJSON)
+	if first := <-done; first.code == 0 {
+		t.Fatal("init with the pre-publish fault succeeded")
+	}
+	if second.code != 0 {
+		t.Fatalf("the concurrent init failed: %s", second.stderr)
+	}
+	final, ferr := os.ReadFile(writerJSON)
+	if aerr != nil || ferr != nil || !bytes.Equal(after, final) {
+		t.Fatalf("the failed init's cleanup changed the concurrent init's writer.json (%v, %v)", aerr, ferr)
+	}
+	w.newTicket(w.repo, nil, "the surviving ledger works")
+}
+
 // Finding 2 (delta review): a writer is registered before writer.json records it, so a registration that
 // fails leaves nothing behind and the next command mints and registers again.
 func TestFailedRegistrationIsRetried(t *testing.T) {

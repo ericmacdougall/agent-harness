@@ -45,6 +45,7 @@ const (
 	ViewBudgetEnv     = "HARNESS_LEDGER_TEST_VIEW_BUDGET"
 	FailFirstFoldEnv  = "HARNESS_LEDGER_TEST_FAIL_FIRST_FOLD"
 	FailPublishEnv    = "HARNESS_LEDGER_TEST_FAIL_BEFORE_PUBLISH"
+	InitCleanupDelay  = "HARNESS_LEDGER_TEST_INIT_CLEANUP_DELAY_MS"
 	FailViewAfterEnv  = "HARNESS_LEDGER_TEST_FAIL_VIEW_AFTER_COMMIT"
 	DirName           = "goodqa"
 	projectsFile      = "projects.json"
