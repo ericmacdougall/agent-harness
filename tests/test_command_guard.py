@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -287,6 +288,36 @@ class FailureModeTests(Fixture):
         self.assertEqual(self.decide('sh @HOME@/repo/tools/awscreds.sh')[0], 'block')
         written = "printf 'env\\n' > @HOME@/repo/tools/new.sh && bash @HOME@/repo/tools/new.sh"
         self.assertEqual(self.decide(written)[0], 'block')
+
+    def test_probe_memo_keeps_each_probe_function_apart(self):
+        """audit2 F-014 port (goodqa#15002): realpath and _resolve_prefix differ for a path over 4096 characters
+        (a path versus None); the memo must not return one function's answer for the other."""
+        analyzer = cg.Analyzer(cg.Compiled(self.policy, home=str(self.home), cwd=str(self.home / 'repo')),
+                               str(self.home / 'repo'), False, None)
+        long_path = str(self.home) + '/' + 'a' * 5000
+        self.assertIsNone(analyzer._probe('rp', long_path, cg._resolve_prefix))
+        self.assertIsInstance(analyzer._probe('rp', long_path, os.path.realpath), str)
+        self.assertIsNone(analyzer._probe('rp', long_path, cg._resolve_prefix))
+
+    def test_one_decide_resolves_a_path_once_per_reading_and_probe(self):
+        """audit2 F-014 (goodqa#15002): both `>!` readings and every redirect alternative re-probed the same paths
+        (12 realpath calls for one path), so a slow disk could exhaust the 3s budget and change the verdict. Now a
+        path is resolved at most once per reading (restore clears the memo) by each of the three resolving
+        probes (realpath, _resolve_prefix, the guard-file check): at most 6."""
+        calls = []
+        real = os.path.realpath
+
+        def counting(path, *args, **kwargs):
+            calls.append(path)
+            return real(path, *args, **kwargs)
+        command = 'printf x >! ./build/out.txt && cat ./build/out.txt > @HOME@/.agent-harness/logs/a.log'
+        compiled = cg.Compiled(self.policy, home=str(self.home), cwd=str(self.home / 'repo'))
+        with mock.patch.object(cg.os.path, 'realpath', side_effect=counting):
+            verdict, _ = cg.decide(fill(command, self.home), compiled, cwd=str(self.home / 'repo'))
+        self.assertTrue(calls)
+        worst = max(calls.count(p) for p in set(calls))
+        self.assertLessEqual(worst, 6, 'one path resolved %d times' % worst)
+        self.assertIn(verdict, ('allow', 'warn', 'block'))
 
     def test_existing_log_backup_script_gains_no_credential_finding(self):
         """Plan review of the F02 port: keeping credential findings inside existing scripts must not newly flag the

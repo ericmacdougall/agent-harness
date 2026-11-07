@@ -1502,18 +1502,23 @@ class Ctx:
         self.fixed_cwd = None
         self.fork_depth = 0  # readings of `>!` being analysed around the current script (Analyzer._both_readings)
         self.readings_capped = False  # `>!` could not be judged both ways: too deep, no budget, or the readings disagree
+        self.fs_cache = {}  # per-analysis memo of disk probes (lexists/realpath/markers): the command has not run,
+        # so the disk cannot change mid-analysis. Cleared wherever the analysis models a filesystem change
+        # (note_created, a made link) or restores a reading's snapshot, which make earlier answers stale.
 
     def cwd_value(self):
         return self.cwd
 
     # what one reading of a script can change; findings accumulate across readings and the rest is not analysis state
-    NOT_STATE = ('findings', 'budget', 'c', 'marker', 'raw_top', 'ps', 'tail_visible', 'fork_depth', 'readings_capped')
+    NOT_STATE = ('findings', 'budget', 'c', 'marker', 'raw_top', 'ps', 'tail_visible', 'fork_depth', 'readings_capped',
+                 'fs_cache')
 
     def state(self):
         return {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(self).items()
                 if k not in self.NOT_STATE}
 
     def restore(self, saved):
+        self.fs_cache.clear()  # the restored snapshot's model of created paths/links may differ from the probe era
         for k in [k for k in vars(self) if k not in self.NOT_STATE and k not in saved]:
             delattr(self, k)
         for k, v in saved.items():
@@ -1598,6 +1603,26 @@ class Analyzer:
     def __init__(self, compiled, cwd=None, ps=False, marker=None):
         self.ctx = Ctx(compiled, cwd, ps, marker)
         self.c = compiled
+
+    def _probe(self, kind, path, fn):
+        """One disk probe per analysis. The command has not run, so a path's lexists/realpath/marker answer is
+        fixed for the whole analysis; repeat probes (both `>!` readings, every redirect alternative, each path
+        prefix) reuse it. The cache is cleared whenever the analysis models a filesystem change or restores a
+        reading, so a stale answer is impossible (see Ctx.fs_cache). Exceptions are cached and re-raised, so
+        callers keep their current try/except behaviour. The key is the probe function itself, not `kind`:
+        os.path.realpath and _resolve_prefix answer differently (None versus a path or an exception) for the
+        same path, so a shared label would hand one caller the other's answer (audit2 F-014 port, goodqa#15002)."""
+        cache = self.ctx.fs_cache
+        key = (fn, path)
+        if key not in cache:
+            try:
+                cache[key] = (True, fn(path))
+            except (OSError, ValueError, RuntimeError) as exc:
+                cache[key] = (False, exc)
+        ok, value = cache[key]
+        if ok:
+            return value
+        raise value
 
     # ---- entry
     def run(self, text):
@@ -3208,8 +3233,8 @@ class Analyzer:
             return True
         candidates = {path}
         try:
-            if os.path.lexists(path) and len(path) < 1024:
-                candidates.add(os.path.realpath(path))
+            if self._probe('le', path, os.path.lexists) and len(path) < 1024:
+                candidates.add(self._probe('rp', path, os.path.realpath))
         except (OSError, ValueError):
             pass
         for p in candidates:
@@ -3377,14 +3402,14 @@ class Analyzer:
         if best != 'log' and any(rx.search(folded) for rx in c.wal_regexes):
             best = 'log'
         if best is None or best == 'root':
-            real = _resolve_prefix(self._through_links(path))
+            real = self._probe('rp', self._through_links(path), _resolve_prefix)
             if real and real.casefold() != folded:
                 other = classify_segs(c, Compiled._segs(real.casefold()))
                 other = 'log' if other == 'log-name' else other
                 if self.RANK[other] > self.RANK[best]:
                     best = other
         if best == 'root' and not is_dynamic_path(path) and not self._kept(path):
-            real = None if self._foreign_home(path) else _resolve_prefix(self._through_links(path))
+            real = None if self._foreign_home(path) else self._probe('rp', self._through_links(path), _resolve_prefix)
             if real and real.casefold() != folded and not any(ch in path for ch in GLOB_CHARS) \
                     and not getattr(self, '_in_real', False):
                 # an exception must hold where the path really leads: a symlink inside the agent's own worktree
@@ -3515,8 +3540,8 @@ class Analyzer:
         if any(_has_glob(x) and x[:1] in ('.', '?', '[') for x in segs[top_len:]):
             return False  # could match .git, . or .. (and so reach the top or a parent)
         try:
-            here = os.path.realpath(origin)
-            top_real = os.path.realpath(top)
+            here = self._probe('rp', origin, os.path.realpath)
+            top_real = self._probe('rp', top, os.path.realpath)
         except (OSError, ValueError):
             return False
         return here == top_real or here.startswith(top_real.rstrip('/') + '/')
@@ -3536,7 +3561,7 @@ class Analyzer:
         for h in self.c.homes:
             base = Compiled._segs(h) + ['.agent-harness', 'work']
             if len(segs) == len(base) + 2 and segs[:len(base)] == base:
-                return not os.path.isdir(path) and not os.path.islink(path)
+                return not self._probe('id', path, os.path.isdir) and not self._probe('il', path, os.path.islink)
         return False
 
     def _inside_repo(self, path):
@@ -3564,8 +3589,8 @@ class Analyzer:
             if marker.casefold() in self.ctx.created:
                 return None  # made by this same command
             try:
-                if os.path.lexists(marker):
-                    return top if _real_git_marker(marker) else None
+                if self._probe('le', marker, os.path.lexists):
+                    return top if self._probe('gm', marker, _real_git_marker) else None
             except (OSError, ValueError):
                 return None
         return None
@@ -3684,7 +3709,7 @@ class Analyzer:
         if head.startswith('~'):
             return None
         try:
-            real = os.path.realpath(head)
+            real = self._probe('rp', head, os.path.realpath)
         except (OSError, ValueError):
             return None
         return norm_path(real.rstrip('/') + ('/' + rest if rest else ''), ctx)
@@ -3715,7 +3740,7 @@ class Analyzer:
         cls, path, literal = self.target_class(word)
         if cls is None or cls not in tiers:
             return False
-        if need_existing and literal and cls in ('log', 'root') and not _lexists(path) \
+        if need_existing and literal and cls in ('log', 'root') and not self._probe('le', path, _lexists) \
                 and path.casefold() not in ctx.created and not self._foreign_home(path) \
                 and not self.c.is_guard_file(path):
             return False  # creating a new file is not destructive
@@ -3839,7 +3864,7 @@ class Analyzer:
         `.keep` in any directory between it and the work or scratch dir. Also true for another host's
         /home/<user>/.agent-harness tree, where the `.keep` and symlink checks can only see this machine's disk."""
         try:
-            real = os.path.realpath(path)
+            real = self._probe('rp', path, os.path.realpath)
         except (OSError, ValueError):
             return False
         # macOS makes /home itself a symlink, so that prefix alone must not fail the check. A /home/<user> path that
@@ -3858,11 +3883,12 @@ class Analyzer:
             if len(rest) < 2 or '..' in rest or rest[-1].casefold().endswith('.json'):
                 return False
             for k in range(1, len(rest)):
-                if _lexists('/' + '/'.join(raw[:base_len + k]) + '/.keep'):
+                if self._probe('le', '/' + '/'.join(raw[:base_len + k]) + '/.keep', _lexists):
                     return False
         return True
 
     def note_created(self, word, text=None):
+        self.ctx.fs_cache.clear()  # created paths change what the next probes must see
         for alt in word.alts[:32]:
             path = norm_path(alt, self.ctx).casefold()
             self.ctx.created.add(path)
@@ -4048,9 +4074,9 @@ class Analyzer:
     def overwrite_dest(self, what, word):
         """cp/mv/ln/install onto an existing Tier A file (or into a protected dir by glob/variable)."""
         cls, path, literal = self.target_class(word)
-        if cls == 'log' and literal and os.path.isdir(path):
+        if cls == 'log' and literal and self._probe('id', path, os.path.isdir):
             return  # copying into a log directory adds a file; it does not replace one
-        if cls in ('log', 'unknown') or cls == 'ancestor' and literal and not os.path.isdir(path):
+        if cls in ('log', 'unknown') or cls == 'ancestor' and literal and not self._probe('id', path, os.path.isdir):
             self.refuse(what + ' (overwrites)', word, tiers=('log', 'unknown', 'ancestor'), need_existing=True)
         self.note_created(word)
 
