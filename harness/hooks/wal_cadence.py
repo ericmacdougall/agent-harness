@@ -203,7 +203,9 @@ def already_asked(session: str, key: str) -> bool:
     return key in (_load_state(session).get("asked") or {})
 
 
-def remember(session: str, key: str, now: float) -> None:
+def remember(session: str, key: str, now: float) -> bool:
+    """Record an asked key; False when the marker could not be persisted (then the caller must not block,
+    or the same block would repeat on every stop, goodqa#15039)."""
     path = state_file(session)
     try:
         data = _load_state(session)
@@ -217,8 +219,9 @@ def remember(session: str, key: str, now: float) -> None:
         with os.fdopen(fd, "w") as fh:
             json.dump({"asked": asked}, fh)
         os.replace(tmp, path)
+        return True
     except OSError:
-        pass
+        return False
 
 
 def message(found, wal: Path, age) -> str:
@@ -284,7 +287,8 @@ def main() -> int:
         if not result:
             return 0
         key, text, session = result
-        remember(session, key, time.time())
+        if not remember(session, key, time.time()):
+            return 0
     except Exception:  # noqa: BLE001 - a broken nudge must never wedge a session
         return 0
     sys.stderr.write(text + "\n")
