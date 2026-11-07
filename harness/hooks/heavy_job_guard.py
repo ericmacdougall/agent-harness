@@ -1829,7 +1829,7 @@ def decide(command: str, cwd: str = None, modes=None):
     del _WRITE_DIRS[:]
     try:
         decision = _decide(command, cwd, modes)
-        if _WRITE_DIRS:
+        if _WRITE_DIRS and decision.get("rule") in ("copy", "build"):
             decision = dict(decision, write_dirs=list(dict.fromkeys(_WRITE_DIRS)))
         return decision
     finally:
