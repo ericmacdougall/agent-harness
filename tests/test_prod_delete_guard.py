@@ -1341,3 +1341,30 @@ class KimiPrcR2(Case):
             warnings.simplefilter("error")
             self.deny("psql -h prod-db -c $'\\q' -c 'DELETE FROM users'")
 
+    # ---- delta review of 1af50ca: E1 strings executed later or elsewhere, E2 opt-in check cost
+
+    def test_e1_only_a_plain_select_reads_its_strings_as_data(self):
+        for command in (
+                "psql -h prod-db -c \"SELECT cron.schedule(job_name := 'j', schedule := '* * * * *', "
+                "command := 'DELETE FROM users')\"",
+                "psql -h prod-db -c \"UPDATE cron.job SET command = 'DELETE FROM users' WHERE jobid = 1\"",
+                "psql -h prod-db -c \"INSERT INTO cron.job (command, schedule) SELECT 'DELETE FROM users', '* * * * *'\"",
+                "psql -h prod-db -c \"SELECT cron.schedule('j', '* * * * *', q) FROM (SELECT 'DELETE FROM users' AS q) s\"",
+                "psql -h prod-db -c \"WITH s AS (SELECT 'DELETE FROM users' AS q) SELECT cron.schedule('j', '* * * * *', q) FROM s\"",
+                "psql -h prod-db -c \"SELECT cron.schedule('j', '* * * * *', --SELECT\n'DELETE FROM users')\"",
+                "mysql -h prod-db -e 'SELECT my_exec(\"DELETE FROM users\")'"):
+            with self.subTest(command=command):
+                self.deny(command)
+        self.allow("psql -h prod-db -c \"SELECT 'DELETE FROM users' AS example\"")
+        self.allow("psql -h prod-db -c \"SELECT id FROM notes WHERE body = 'DROP TABLE users';\"")
+
+    def test_e2_the_opt_in_check_is_linear(self):
+        def cost(n):
+            value = "SELECT " + "'DELETE FROM a'=" * n + "'x'"
+            t0 = time.perf_counter()
+            pdg._plain_data_strings(value)
+            return time.perf_counter() - t0
+        small, large = cost(1000), cost(4000)
+        self.assertLess(large / max(small, 1e-6), 8.0, (small, large))
+        self.deny("psql -h prod-db -c \"SELECT " + "'DELETE FROM a'=" * 3800 + "'x'; DELETE FROM users\"")
+

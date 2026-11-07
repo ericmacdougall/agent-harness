@@ -724,25 +724,30 @@ STRING_SINKS = re.compile(
     r"|\b(?:QUERY_TO_XML\w*|RUN_COMMAND\w*|PG_BACKGROUND\w*|DBMS_\w+|SP_EXECUTESQL|XP_CMDSHELL)\b")
 
 
-# A literal counts as plain data only right after one of these: a select-list item or a comparison operand. After
-# `(` or `,` it may be an argument to a function that runs it (Citus run_command_on_workers, pg_background_launch,
-# query_to_xml_and_xmlschema, any extension), and no list of such functions is complete (delta review D1).
-DATA_LITERAL_LEAD = re.compile(r"(?is)(?:\bSELECT|\bDISTINCT|=|<>|!=|\bI?LIKE)\s*$")
-SINGLE_LITERAL = re.compile(r"'(?:[^']|'')*'")
+# The masked reading is an allow-list of one shape (delta reviews D1, E1): a single SELECT with no parenthesis
+# (so no function call, subquery or CTE), no DML or DDL word, no INTO, no named-argument `:=`, no variable, and no
+# double quote (MySQL may read it as a string). Only then can a string literal not be run, stored for a scheduler
+# or passed to something that runs it. Checked on the masked text of every reading, so a comment cannot supply a
+# keyword or hide one. One regex search per reading: linear (E2).
 META_OR_SHELL = re.compile(r"[\\`]|^\s*\.", re.M)
+PLAIN_SELECT_BANNED = re.compile(
+    r"(?i)\b(?:INSERT|UPDATE|DELETE|REPLACE|UPSERT|MERGE|SET|COPY|INTO|CALL|DO|EXEC\w*|PREPARE|CREATE|ALTER|"
+    r"DROP|TRUNCATE|GRANT|REVOKE|WITH|RETURNING|LOAD|HANDLER|LISTEN|NOTIFY|VACUUM|ANALY[SZ]E)\b|[()\"`\\:@$;{}\[\]]")
 
 
 def _plain_data_strings(text: str) -> bool:
-    """True when the masked reading may judge `text` (Kimi PR-C F9 opt-in, delta review D1): no psql or mysql
-    meta-command, backtick or sqlite dot-command, no known string-execution sink, every quote closed in every
-    reading, and every single-quoted literal holding destructive text sits where SQL treats it as data."""
-    if META_OR_SHELL.search(text) or STRING_SINKS.search(text):
+    """True when the masked reading may judge `text`: it is one plain SELECT whose strings are only data."""
+    if '"' in text or META_OR_SHELL.search(text) or STRING_SINKS.search(text):
         return False
-    if any(_mask_sql(text, *reading[:5])[1] for reading in SQL_READINGS):
-        return False
-    for m in SINGLE_LITERAL.finditer(text):
-        inner = m.group(0)[1:-1]
-        if (_quick_match(inner) or UPDATE_WORD.search(inner)) and not DATA_LITERAL_LEAD.search(text[:m.start()]):
+    for reading in SQL_READINGS:
+        source = _open_exec_comments(text) if reading[5] else text
+        masked, uncertain = _mask_sql(source, *reading[:5])
+        if uncertain:
+            return False
+        body = masked.strip()
+        while body.endswith(";"):
+            body = body[:-1].rstrip()
+        if not re.match(r"(?i)SELECT\b", body) or PLAIN_SELECT_BANNED.search(body):
             return False
     return True
 
