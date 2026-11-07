@@ -412,19 +412,17 @@ def plain_ssh_hop(texts, host):
         if t in PLAIN_SSH_FLAGS:
             i += 1
             continue
-        if t in ('-p', '-l', '-o'):
+        # -l and -p are refused too: the ledger and the probe name only HOST, so a different user or port could
+        # reach another sshd or account than the one the PID was recorded on (goodqa#15038).
+        if t == '-o':
             value = texts[i + 1] if i + 1 < host else ''
             i += 2
-        elif t.startswith(('-p', '-l', '-o')) and len(t) > 2:
-            value, t = t[2:], t[:2]
+        elif t.startswith('-o') and len(t) > 2:
+            value = t[2:]
             i += 1
         else:
             return False
-        if t == '-p' and not re.fullmatch(r'\d{1,5}', value):
-            return False
-        if t == '-l' and not re.fullmatch(r'[A-Za-z0-9._-]{1,64}', value):
-            return False
-        if t == '-o' and value.split('=', 1)[0].strip().lower() not in PLAIN_SSH_OPTIONS:
+        if value.split('=', 1)[0].strip().lower() not in PLAIN_SSH_OPTIONS:
             return False
     return True
 

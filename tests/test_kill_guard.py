@@ -769,8 +769,8 @@ class RemoteSpawn(unittest.TestCase):
     def test_spawned_pid_is_killable_only_on_its_host_while_its_start_time_matches(self):
         kg.append_ledger(kg.remote_root('dev2'), 4242, self.START, home=self.home)
         same = lambda host, pid: self.START if (host, pid) == ('dev2', 4242) else None  # noqa: E731
-        for cmd in ('ssh dev2 kill 4242', 'ssh dev2 kill -TERM 4242', "ssh dev2 'kill 4242'", 'ssh -p 22 dev2 -- kill 4242',
-                    'ssh -o BatchMode=yes -o ConnectTimeout=3 dev2 kill 4242', 'ssh -q -l eric -p2222 dev2 kill 4242',
+        for cmd in ('ssh dev2 kill 4242', 'ssh dev2 kill -TERM 4242', "ssh dev2 'kill 4242'",
+                    'ssh -o BatchMode=yes -o ConnectTimeout=3 dev2 kill 4242', 'ssh -q dev2 kill 4242',
                     'ssh dev2 -- kill 4242'):
             with self.subTest(cmd):
                 self.assertEqual(self.decide(cmd, same)[0], 'allow', cmd)
@@ -811,6 +811,20 @@ class RemoteSpawn(unittest.TestCase):
                     'X=(-J); ssh "${X[@]}" prod dev2 kill 4242'):
             with self.subTest(cmd):
                 self.assertEqual(self.decide(cmd, same)[0], 'block', cmd)
+
+    def test_remote_login_and_port_options_cannot_diverge_probe_from_kill(self):
+        # The ledger and the probe name only the host, so -l/-p (separate or glued) could kill on another
+        # sshd or account than the one probed (goodqa#15038, Kimi revised R06).
+        kg.append_ledger(kg.remote_root('dev2'), 4242, self.START, home=self.home)
+        same = lambda host, pid: self.START if (host, pid) == ('dev2', 4242) else None  # noqa: E731
+        self.assertEqual(self.decide('ssh dev2 kill 4242', same)[0], 'allow')
+        for cmd in ('ssh -l other -p 2222 dev2 kill 4242', 'ssh -lother dev2 kill 4242',
+                    'ssh -p2222 dev2 kill 4242', 'ssh -p 22 dev2 kill 4242', 'ssh -q -l eric dev2 kill 4242'):
+            with self.subTest(cmd):
+                self.assertEqual(self.decide(cmd, same)[0], 'block', cmd)
+        for texts in (['-p', '2222', 'dev2'], ['-l', 'other', 'dev2'], ['-p2222', 'dev2'], ['-lother', 'dev2']):
+            with self.subTest(texts=texts):
+                self.assertFalse(kg.plain_ssh_hop(texts, len(texts) - 1))
 
     def test_spawn_host_records_the_remote_pid_and_start_time(self):
         calls = []
