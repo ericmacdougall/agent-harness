@@ -805,5 +805,123 @@ class GrantWalCitation(Case):
 
 
 
+class RevisedSql(Case):
+    """goodqa#15036 (Kimi revised R02-R04): top-level WHERE, bounded include closure, Hyperdrive, executable comments."""
+
+    def ev(self, command):
+        return dict(bash(command), cwd=str(self.home))
+
+    def test_update_requires_a_top_level_where(self):
+        hostile = (
+            "UPDATE users SET note='WHERE'",
+            "UPDATE users SET flag=(SELECT true WHERE true)",
+            "UPDATE ONLY users SET admin=true",
+            "UPDATE users AS u SET admin=true",
+            "UPDATE users u SET note='x' -- WHERE id=1",
+            "UPDATE users SET note='unterminated",
+            "UPDATE t1, t2 SET t1.a=1",
+        )
+        for statement in hostile:
+            with self.subTest(statement=statement):
+                self.assertTrue(pdg.destructive_match(statement))
+                command = 'psql -h prod-db -c "%s"' % statement.replace('"', '\\"')
+                self.assertEqual(self.verdict(self.ev(command)), "deny")
+        legitimate = (
+            "UPDATE users SET note='WHERE' WHERE id=4",
+            "UPDATE ONLY users SET admin=true WHERE id=4",
+            "UPDATE users AS u SET admin=true WHERE u.id=4",
+            "UPDATE users SET flag=(SELECT true WHERE true) WHERE id=4",
+            "SELECT * FROM users WHERE id=4 FOR UPDATE",
+        )
+        for statement in legitimate:
+            with self.subTest(statement=statement):
+                self.assertFalse(pdg.destructive_match(statement))
+                self.assertAllowed('psql -h prod-db -c "%s"' % statement)
+
+    def test_nested_include_relative_to_including_file(self):
+        (self.home / "scripts/nested").mkdir(parents=True)
+        (self.home / "scripts/root.sql").write_text("\\ir nested/one.sql\n")
+        (self.home / "scripts/nested/one.sql").write_text("\\ir two.sql\n")
+        (self.home / "scripts/nested/two.sql").write_text("DELETE FROM users;\n")
+        self.assertEqual(self.verdict(self.ev("psql -h prod-db -f scripts/root.sql")), "deny")
+
+    def test_plain_include_stays_relative_to_event_cwd(self):
+        (self.home / "scripts").mkdir()
+        (self.home / "scripts/root.sql").write_text("\\i cwd-only.sql\n")
+        (self.home / "scripts/cwd-only.sql").write_text("SELECT 1;\n")
+        (self.home / "cwd-only.sql").write_text("DROP TABLE users;\n")
+        self.assertEqual(self.verdict(self.ev("psql -h prod-db -f scripts/root.sql")), "deny")
+
+    def test_include_cycle_depth_missing_and_total_byte_limits_fail_closed(self):
+        (self.home / "cycle.sql").write_text("\\ir cycle.sql\nSELECT 1;\n")
+        self.assertEqual(self.verdict(self.ev("psql -h prod-db -f cycle.sql")), "deny")
+        (self.home / "missing-parent.sql").write_text("\\ir absent-child.sql\nSELECT 1;\n")
+        self.assertEqual(self.verdict(self.ev("psql -h prod-db -f missing-parent.sql")), "deny")
+        for index in range(11):
+            body = "\\ir deep-%d.sql\n" % (index + 1) if index < 10 else "SELECT 1;\n"
+            (self.home / ("deep-%d.sql" % index)).write_text(body)
+        self.assertEqual(self.verdict(self.ev("psql -h prod-db -f deep-0.sql")), "deny")
+        (self.home / "wide-root.sql").write_text("\\ir wide-a.sql\n\\ir wide-b.sql\n")
+        for name in ("wide-a.sql", "wide-b.sql"):
+            (self.home / name).write_text("-- " + "x" * 120000 + "\nSELECT 1;\n")
+        self.assertEqual(self.verdict(self.ev("psql -h prod-db -f wide-root.sql")), "deny")
+
+    def test_nested_read_only_include_closure_allows(self):
+        (self.home / "sql").mkdir()
+        (self.home / "sql/root.sql").write_text("\\ir child.sql\n")
+        (self.home / "sql/child.sql").write_text("UPDATE users SET admin=true WHERE id=4;\n")
+        self.assertEqual(self.verdict(self.ev("psql -h prod-db -f %s" % (self.home / "sql/root.sql"))), "allow")
+
+    def test_include_dag_has_hard_read_and_expansion_caps(self):
+        for index in range(8):
+            (self.home / ("dag-%d.sql" % index)).write_text(
+                "".join("\\ir dag-%d.sql\n" % child for child in range(index + 1, 8)) + "SELECT 1;\n")
+        real_read = pdg._read_sql_file
+        calls = []
+        pdg._read_sql_file = lambda path: calls.append(path) or real_read(path)
+        try:
+            unread = []
+            pdg.sql_text_for("psql -h prod-db -f dag-0.sql", str(self.home), unread)
+        finally:
+            pdg._read_sql_file = real_read
+        self.assertLessEqual(len(calls), 8, calls)
+        self.assertTrue(any("expansion" in reason for reason in unread), unread)
+        self.assertEqual(self.verdict(self.ev("psql -h prod-db -f dag-0.sql"), env={}), "deny")
+
+    def test_valid_duplicate_includes_are_memoized_and_allowed(self):
+        (self.home / "root.sql").write_text("\\ir child.sql\n\\ir child.sql\n")
+        (self.home / "child.sql").write_text("SELECT 1;\n")
+        real_read = pdg._read_sql_file
+        calls = []
+        pdg._read_sql_file = lambda path: calls.append(path) or real_read(path)
+        try:
+            unread = []
+            text = pdg.sql_text_for("psql -h prod-db -f root.sql", str(self.home), unread)
+        finally:
+            pdg._read_sql_file = real_read
+        self.assertEqual((len(calls), unread, text.count("SELECT 1;")), (2, [], 2))
+        self.assertEqual(self.verdict(self.ev("psql -h prod-db -f root.sql"), env={}), "allow")
+
+    def test_hyperdrive_query_payload_is_inspected(self):
+        event = {"tool_name": "mcp__cloudflare__hyperdrive_execute",
+                 "tool_input": {"database_id": "prod-hyper", "query": "DELETE FROM users"}}
+        self.assertEqual(self.verdict(event), "deny")
+        event["tool_input"] = {"id": "abc123", "sql": "DELETE FROM users"}
+        self.assertEqual(self.verdict(event), "deny")
+        event["tool_input"] = {"database_id": "prod-hyper", "query": "SELECT * FROM users WHERE id=4"}
+        self.assertEqual(self.verdict(event), "allow")
+        event["tool_input"]["query"] = "  \n"
+        self.assertEqual(self.verdict(event), "allow")
+
+    def test_mysql_executable_comments_and_destructive_drop_forms(self):
+        self.assertDenied("mysql -h prod-db -e '/*!50000 DELETE FROM users */'")
+        self.assertDenied("mysql -h prod-db -e '/*M!100100 DROP TABLE users */'")
+        self.assertAllowed("mysql -h prod-db -e '/*!50000 SELECT 1 */'")
+        self.assertAllowed("mysql -h localhost -e 'DROP VIEW old_object'")
+        for kind in ("VIEW", "FUNCTION", "PROCEDURE", "TRIGGER", "ROLE", "USER"):
+            with self.subTest(kind=kind):
+                self.assertDenied("mysql -h prod-db -e 'DROP %s old_object'" % kind)
+
+
 if __name__ == "__main__":
     unittest.main()

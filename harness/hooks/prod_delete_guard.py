@@ -10,8 +10,11 @@ bypasses a native review found (2026-11-06, native-reviews/hk-wave1-07d89d59.md 
 Hawkeye's hawk_ask grant store with a signed harness grant file.
 
 What counts as destructive (after `/* ... */` comments and shell quote characters are removed, so
-`DEL""ETE` and `DELETE/**/FROM` still match): DELETE FROM, DROP TABLE|DATABASE|INDEX|SCHEMA,
-TRUNCATE, and UPDATE ... SET with no WHERE in the same statement.
+`DEL""ETE` and `DELETE/**/FROM` still match): DELETE FROM,
+DROP TABLE|DATABASE|INDEX|SCHEMA|VIEW|FUNCTION|PROCEDURE|TRIGGER|ROLE|USER, TRUNCATE, and UPDATE ... SET with no
+top-level WHERE in the same statement. A bounded lexer masks quoted text and comments, supports ONLY and an alias,
+and treats an UPDATE ... SET it cannot parse (or an unterminated quote or comment) as unfiltered. MySQL/MariaDB
+executable comments (/*! ... */, /*M! ... */) are judged as SQL (goodqa#15036).
 
 What counts as a production TARGET (each yields the exact target value a grant must name):
   - wrangler d1 execute <db> ... --remote                  -> <db>
@@ -27,10 +30,12 @@ What counts as a production TARGET (each yields the exact target value a grant m
 The SQL is read from the command and, with a DB client in it, from --file / psql -f files (also -1f,
 -Xf, --fi=), `< file`, `$(< file)`, every `cat` argument anywhere in the command (a pipe into ssh, docker
 exec, sudo or env, `$(cat ...)`, backticks), psql
-`\i`/`\ir`/`\include`/`\include_relative`, mysql `source`/`\.`, and sqlite `.read`/`-init`. Relative paths
-resolve against the event's cwd, and ~ is expanded. Files are opened as regular files only (a FIFO or device
-cannot hang the hook). A prod-targeted command is denied when one of its SQL files cannot be judged at hook
-time: missing, not a regular file, unreadable, over 200,000 bytes, more than 8 files, written by the same
+`\i`/`\ir`/`\include`/`\include_relative`, mysql `source`/`\.`, and sqlite `.read`/`-init`. Includes inside those
+files are followed too: \ir/\include_relative resolve against the including file, the others against the event's
+cwd; ~ is expanded. Files are opened as regular files only (a FIFO or device cannot hang the hook). A prod-targeted
+command is denied when its SQL file closure cannot be judged at hook time: a file is missing, not a regular file,
+unreadable, or over 200,000 bytes; the closure has more than 8 files, 200,000 bytes, depth 8, 64 expansions, or a
+cycle; a file is written by the same
 command, or the command has any other step besides a plain pipeline (; && || & newline cd pushd, xargs,
 <( >(, or a $(...)/backtick substitution that is not a cat or `< file` read), which could change the file
 first. A client fed by a pipe from anything but cat/echo/printf is denied the same way unless its own flag
@@ -103,10 +108,16 @@ if str(HERE) not in sys.path:  # python3 -I does not put the script's directory 
 
 # ---- detection ----------------------------------------------------------------------------------
 DESTRUCTIVE = re.compile(
-    r"\b(DELETE\s+FROM|DROP\s+(?:TABLE|DATABASE|INDEX|SCHEMA)|TRUNCATE)\b"
-    r"|\bUPDATE\s+[\w.\"`\[\]]+\s+SET\b(?![^;]*\bWHERE\b)"
+    r"\b(DELETE\s+FROM|DROP\s+(?:TABLE|DATABASE|INDEX|SCHEMA|VIEW|FUNCTION|PROCEDURE|TRIGGER|ROLE|USER)|TRUNCATE)\b"
     r"|\bdropdb\b|\bmysqladmin\b[^\n|;&]{0,512}?\bdrop\b", re.I)
+UPDATE_START = re.compile(
+    r"\bUPDATE\s+(?:ONLY\s+)?[\w.\"`\[\]$]+(?:\s+(?:AS\s+)?(?!SET\b)[\w.\"`\[\]$]+)?\s+SET\b", re.I)
+# An UPDATE ... SET the small parser does not recognise (multi-table, odd quoting) counts as unfiltered. A bare
+# UPDATE with no SET after it in the statement (SELECT ... FOR UPDATE, `apt update`) is not an UPDATE statement.
+UPDATE_UNKNOWN = re.compile(r"\bUPDATE\b(?=[^;]*\bSET\b)", re.I)
+WHERE_WORD = re.compile(r"\bWHERE\b", re.I)
 SQL_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+EXECUTABLE_COMMENT = re.compile(r"/\*(?:!|M!)(?:\d{5,6})?[ \t]*(.*?)\*/", re.S | re.I)
 LINE_COMMENT = re.compile(r"--[^\n]*")
 SHELL_ESCAPE = re.compile(r"\\(?:x20|x09|x0a|040|t|n)", re.I)
 PROD_TOKEN = re.compile(r"(?:^|[\s_.\-/=@\"'])(prod|production)(?:$|[\s_.\-/:?#\"'])", re.I)
@@ -171,6 +182,7 @@ TOOL_COMMAND_FIELDS = (
     (re.compile(r"^Bash$"), ("command",)),
     (re.compile(r"^mcp__hawkeye__run$"), ("payload", "command", "cmd", "script", "shell", "code")),
     (re.compile(r"(?i)d1_database_query$"), ("sql", "query")),
+    (re.compile(r"(?i)^mcp__.*__hyperdrive_"), ("sql", "query", "statement")),
     (re.compile(r"(?i)^mcp__.*__(execute_sql|run_sql|query|sql)$"), ("sql", "query", "statement")),
 )
 TOOL_IS_PRODUCTION_BY_CONSTRUCTION = re.compile(r"(?i)^mcp__.*__(d1_database_query|hyperdrive_.*)$")
@@ -195,13 +207,143 @@ DECLINE = re.compile(r"\b(?:no|nope|nah|not|don'?t|never|keep|kept|cancel|skip|s
 SOURCE_RE = re.compile(r"^(user|answer):([A-Za-z0-9._-]{1,120})/([0-9a-fA-F-]{8,64})$")
 
 
+MASK_LIMIT = 1 << 20  # characters the UPDATE lexer reads; past it an UPDATE ... SET counts as unfiltered
+
+
+def _mask_sql(text: str):
+    """(masked, uncertain): comments blanked and quoted contents replaced by x, positions and newlines kept.
+    `uncertain` is true for an unterminated quote, dollar quote or comment. Linear in len(text)."""
+    out = list(text)
+    uncertain = False
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith("--", i):
+            end = text.find("\n", i + 2)
+            end = n if end < 0 else end
+            for pos in range(i, end):
+                out[pos] = " "
+            i = end
+            continue
+        if text.startswith("/*", i):
+            depth, pos = 1, i + 2
+            while pos < n and depth:
+                if text.startswith("/*", pos):
+                    depth += 1
+                    pos += 2
+                elif text.startswith("*/", pos):
+                    depth -= 1
+                    pos += 2
+                else:
+                    pos += 1
+            for at in range(i, pos):
+                if out[at] != "\n":
+                    out[at] = " "
+            uncertain = uncertain or bool(depth)
+            i = pos
+            continue
+        quote = text[i] if text[i] in ("'", '"', "`") else None
+        closer = quote
+        if quote is None and text[i] == "[":
+            quote, closer = "[", "]"
+        dollar = DOLLAR_QUOTE.match(text, i) if quote is None else None
+        if dollar:
+            marker = dollar.group(0)
+            end = text.find(marker, i + len(marker))
+            if end < 0:
+                uncertain, end = True, n
+            else:
+                end += len(marker)
+            for pos in range(i, end):
+                if out[pos] != "\n":
+                    out[pos] = "x"
+            i = end
+            continue
+        if quote is None:
+            i += 1
+            continue
+        pos, closed = i + 1, False
+        while pos < n:
+            if quote != "[" and text[pos] == "\\" and pos + 1 < n:
+                out[pos] = out[pos + 1] = "x"
+                pos += 2
+                continue
+            if text[pos] == closer:
+                if quote != "[" and pos + 1 < n and text[pos + 1] == closer:
+                    out[pos] = out[pos + 1] = "x"
+                    pos += 2
+                    continue
+                out[pos] = "x"
+                pos += 1
+                closed = True
+                break
+            if out[pos] != "\n":
+                out[pos] = "x"
+            pos += 1
+        out[i] = "x"
+        uncertain = uncertain or not closed
+        i = pos
+    return "".join(out), uncertain
+
+
+DOLLAR_QUOTE = re.compile(r"\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$")
+
+
+def _update_match(text: str):
+    """An UPDATE ... SET with no top-level WHERE in its statement, else None. An UPDATE ... SET the parser cannot
+    prove filtered (unknown target syntax, unbalanced parentheses, an unterminated quote or comment, or text over
+    MASK_LIMIT) is returned as unfiltered (goodqa#15036)."""
+    if len(text) > MASK_LIMIT:
+        return UPDATE_UNKNOWN.search(text)
+    masked, uncertain = _mask_sql(text)
+    for statement in masked.split(";"):
+        update = UPDATE_START.search(statement)
+        if not update:
+            unknown = UPDATE_UNKNOWN.search(statement)
+            if unknown:
+                return unknown
+            continue
+        depth, filtered, malformed = 0, False, uncertain
+        pos = update.end()
+        while pos < len(statement):
+            char = statement[pos]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    malformed = True
+                else:
+                    depth -= 1
+            elif depth == 0 and WHERE_WORD.match(statement, pos):
+                filtered = True
+                pos += 4
+            pos += 1
+        if malformed or depth or not filtered:
+            return update
+    return None
+
+
 def destructive_match(sql: str):
-    """The destructive statement in `sql`, after SQL comments, shell escapes and quote characters are removed. The
-    text is also checked with `--` line comments removed, so a comment cannot split a verb (`DELETE--x\nFROM`)."""
+    """The destructive statement in `sql`, else None. DELETE/DROP/TRUNCATE are matched after SQL comments, shell
+    escapes and quote characters are removed (also with `--` line comments removed, so a comment cannot split a
+    verb: `DELETE--x\nFROM`). MySQL executable comments are SQL, not comments. UPDATE is judged by the lexer above,
+    on the raw text and, for a client command, on its shell words (so shell quoting is not mistaken for SQL quoting)."""
+    expanded = EXECUTABLE_COMMENT.sub(lambda m: " " + m.group(1) + " ", sql)
     text = SHELL_ESCAPE.sub(lambda m: "\n" if m.group(0).lower() in ("\\n", "\\x0a") else " ",
-                            SQL_COMMENT.sub(" ", sql))
+                            SQL_COMMENT.sub(" ", expanded))
     text = text.replace("\\", "").replace('"', "").replace("'", "")
-    return DESTRUCTIVE.search(text) or DESTRUCTIVE.search(LINE_COMMENT.sub(" ", text))
+    quick = DESTRUCTIVE.search(text) or DESTRUCTIVE.search(LINE_COMMENT.sub(" ", text))
+    if quick:
+        return quick
+    if not UPDATE_UNKNOWN.search(expanded):
+        return None
+    candidates = [expanded]
+    if DB_CLIENT.search(expanded) or D1_EXECUTE.search(expanded):
+        candidates.append("\n".join(_words(expanded)))
+    for candidate in candidates:
+        found = _update_match(candidate)
+        if found:
+            return found
+    return None
 
 
 def _resolve_path(raw: str, cwd) -> str:
@@ -238,9 +380,27 @@ def _written_paths(command: str, cwd=None) -> set:
     return out
 
 
+INCLUDE_DEPTH_LIMIT = 8
+INCLUDE_FILE_LIMIT = 8
+INCLUDE_EXPANSION_LIMIT = 64
+INCLUDE_TOTAL_LIMIT = FILE_READ_LIMIT
+SOURCE_INCLUDE = re.compile(r"(?im)^\s*source\s+['\"]?([^\s;'\"]+)")
+RELATIVE_INCLUDE = re.compile(r"\\(?:include_relative|ir)\b", re.I)
+
+
+def _includes(text: str, command=False):
+    """(path, relative-to-including-file) pairs. Only psql's \\ir and \\include_relative resolve against the
+    including file's directory; every other include uses the event cwd."""
+    out = [(m.group(1), bool(RELATIVE_INCLUDE.match(m.group(0)))) for m in CLIENT_INCLUDE.finditer(text)]
+    source = MYSQL_SOURCE if command else SOURCE_INCLUDE
+    out.extend((m.group(1), False) for m in source.finditer(text))
+    return out
+
+
 def sql_text_for(command: str, cwd=None, unread=None) -> str:
-    """The SQL this command will run: the text itself plus --file, psql -f and `< file` contents.
-    Paths that could not be read are appended to `unread` when a list is given."""
+    """The command plus its complete, bounded SQL file closure (--file, psql -f, `< file`, cat inputs and nested
+    includes). Unreadable files, cycles, excess depth/files/bytes/expansions and files the same command writes are
+    appended to `unread` when a list is given, which makes a production command fail closed (goodqa#15036)."""
     paths = [m.group(1) for m in FILE_FLAG.finditer(command)]
     paths += [m.group(1) for m in PSQL_FILE_FLAG.finditer(command)]
     piped = []
@@ -251,32 +411,66 @@ def sql_text_for(command: str, cwd=None, unread=None) -> str:
             paths += [w for w in m.group(1).split() if not w.startswith("-")]
         client = DB_CLIENT.search(command) or D1_EXECUTE.search(command)
         piped.extend("the output of %s" % x for x in _other_substitutions(command[client.start():SHLEX_LIMIT]))
-        paths += [m.group(1) for m in CLIENT_INCLUDE.finditer(command)]
-        paths += [m.group(1) for m in MYSQL_SOURCE.finditer(command)]
         paths += [m.group(1) for m in SQLITE_INIT.finditer(command)]
         paths += _piped_inputs(command, piped)
+        paths += [raw for raw, _relative in _includes(command, command=True)]
+    paths = list(dict.fromkeys(paths))
     if unread is not None:
         unread.extend(piped)
     # File inputs are judged as they are now. Any other step in the same command (a write by any tool, a cd, a
     # download) could change them first, and no list of writers is complete: then they cannot be judged at all.
     if paths and _multi_step(command):
         if unread is not None:
-            unread.extend("%s (the same command has other steps)" % p for p in paths[:8])
+            unread.extend("%s (the same command has other steps)" % p for p in paths[:INCLUDE_FILE_LIMIT])
         return command
     written = _written_paths(command, cwd) if paths else set()
-    text = command
-    for raw in paths[:8]:
-        resolved = _resolve_path(raw, cwd)
-        # a file this same command writes is judged in its old state at hook time, so it cannot be judged at all
-        body = None if os.path.realpath(resolved) in written else _read_sql_file(resolved)
+    budget = {"files": 0, "bytes": 0, "expansions": 0}
+    accounted, active, cache = set(), set(), {}
+
+    def reject(raw, why=""):
+        if unread is not None:
+            unread.append("%s%s" % (raw, " (%s)" % why if why else ""))
+        return ""
+
+    def load(raw, including=None, depth=0):
+        # Every include directive costs one expansion, so a dense DAG of 8 files stops after 64 (not 2**8) visits.
+        if budget["expansions"] >= INCLUDE_EXPANSION_LIMIT:
+            return reject(raw, "include expansion over %d" % INCLUDE_EXPANSION_LIMIT)
+        budget["expansions"] += 1
+        if depth > INCLUDE_DEPTH_LIMIT:
+            return reject(raw, "include depth over %d" % INCLUDE_DEPTH_LIMIT)
+        resolved = _resolve_path(raw, os.path.dirname(including) if including else cwd)
+        real = os.path.realpath(resolved)
+        if real in active:
+            return reject(raw, "include cycle")
+        first = real not in accounted
+        if first and budget["files"] >= INCLUDE_FILE_LIMIT:
+            return reject(raw, "more than %d files in the include closure" % INCLUDE_FILE_LIMIT)
+        if real in written:
+            body = None  # judged in its old state at hook time, so it cannot be judged at all
+        elif real in cache:
+            body = cache[real]
+        else:
+            body = cache[real] = _read_sql_file(resolved)
         if body is None:
-            if unread is not None:
-                unread.append(raw)
-            continue
-        text += "\n" + body
-    if unread is not None and len(paths) > 8:
-        unread.extend(paths[8:])
-    return text
+            return reject(raw)
+        size = len(body.encode("utf-8"))
+        if first:
+            if budget["bytes"] + size > INCLUDE_TOTAL_LIMIT:
+                return reject(raw, "include closure over %d bytes" % INCLUDE_TOTAL_LIMIT)
+            accounted.add(real)
+            budget["files"] += 1
+            budget["bytes"] += size
+        active.add(real)  # only file text is cached; the cycle check follows the active include path
+        try:
+            pieces = [body]
+            for child, relative in _includes(body):
+                pieces.append(load(child, resolved if relative else None, depth + 1))
+            return "\n".join(pieces)
+        finally:
+            active.discard(real)
+
+    return "\n".join([command] + [load(raw) for raw in paths])
 
 
 def _other_substitutions(text: str) -> list:
