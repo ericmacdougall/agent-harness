@@ -923,5 +923,62 @@ class RevisedSql(Case):
                 self.assertDenied("mysql -h prod-db -e 'DROP %s old_object'" % kind)
 
 
+class RevisedSsh(Case):
+    """goodqa#15037 (Kimi revised R05): the effective ssh destination, from -o HostName and ssh config."""
+
+    def ssh_config(self, text, name=".ssh/config"):
+        path = self.home / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def test_command_line_hostname_names_the_destination(self):
+        self.assertDenied("ssh -o HostName=prod-db.example.com bastion psql -c 'DELETE FROM users'")
+        self.assertDenied("ssh -oHostname=prod-db.example.com bastion psql -c 'DELETE FROM users'")
+        self.assertDenied("ssh -o 'HostName prod-db.example.com' bastion psql -c 'DELETE FROM users'")
+        self.assertAllowed("ssh -o HostName=localhost bastion psql -c 'DELETE FROM users'")
+        result = pdg.evaluate(bash("ssh -o HostName=prod-db.example.com bastion psql -c 'DELETE FROM users'"),
+                              home=str(self.home))
+        self.assertIn("prod-db.example.com", result[1])
+
+    def test_config_alias_mapped_to_prod_denies(self):
+        self.ssh_config("Host *\n  User someone\n  IdentityFile ~/.ssh/k\n\n"
+                        "Host db1 db1.internal\n  HostName prod-db.example.com\n  Port 2222\n\n"
+                        "Host dev2\n  HostName 192.0.2.10\n")
+        for cmd in ("ssh db1 psql -c 'DELETE FROM users'", "ssh someone@db1 psql -c 'DELETE FROM users'",
+                    "ssh db1.internal psql -c 'DELETE FROM users'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # unrelated directives and non-prod aliases keep their old verdict (no new over-refusal)
+        self.assertAllowed("ssh dev2 psql -c 'DELETE FROM users'")
+        self.assertAllowed("ssh other psql -c 'DELETE FROM users'")
+        self.assertAllowed("ssh db1 psql -c 'SELECT 1'")
+
+    def test_wildcards_negation_tokens_and_match_blocks(self):
+        self.ssh_config("Host *.db !safe.db\n  HostName %h.prod.example.com\n\n"
+                        "Match host weird\n  HostName prod-weird.example.com\n")
+        self.assertDenied("ssh users.db psql -c 'DELETE FROM users'")
+        self.assertAllowed("ssh safe.db psql -c 'DELETE FROM users'")
+        self.assertDenied("ssh weird psql -c 'DELETE FROM users'")  # Match blocks are candidates
+
+    def test_includes_are_followed_and_bounded(self):
+        self.ssh_config("Include config.d/*\n")
+        self.ssh_config("Host db2\n  HostName prod-db2.example.com\n", ".ssh/config.d/10-db")
+        self.assertDenied("ssh db2 psql -c 'DELETE FROM users'")
+        self.ssh_config("Include config\n")  # a self-include terminates
+        self.assertAllowed("ssh db2 psql -c 'DELETE FROM users'")
+
+    def test_alternate_config_file(self):
+        alt = self.ssh_config("Host db3\n  HostName prod-db3.example.com\n", "alt_config")
+        self.assertDenied("ssh -F %s db3 psql -c 'DELETE FROM users'" % alt)
+        self.assertAllowed("ssh db3 psql -c 'DELETE FROM users'")
+
+    def test_unreadable_config_keeps_the_literal_verdict(self):
+        cfg = self.ssh_config("Host db1\n  HostName prod-db.example.com\n")
+        cfg.write_bytes(b"\xff\xfe" * 10)
+        self.assertAllowed("ssh dev2 psql -c 'DELETE FROM users'")
+        self.assertDenied("ssh prod-db psql -c 'DELETE FROM users'")
+
+
 if __name__ == "__main__":
     unittest.main()
