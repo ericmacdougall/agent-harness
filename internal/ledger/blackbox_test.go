@@ -1226,10 +1226,17 @@ func TestFailedInitCanBeRetried(t *testing.T) {
 	w.ok(w.repo, nil, "init", "--slug", "retry-me")
 	w.newTicket(w.repo, nil, "works after a retried init")
 
+	// Repo-less: each attempt mints its own project, so a failure must not leave that project's HOME ledger
+	// (ledgers/<project>/repo.git) behind (code inspection of the port, M1).
+	ledgers := filepath.Join(w.home, ".agent-harness", "ledgers")
+	before, _ := os.ReadDir(ledgers)
 	rl := filepath.Join(filepath.Dir(w.repo), "rl")
 	w.git(filepath.Dir(w.repo), "init", "-q", rl)
 	if r := w.run(rl, []string{ledger.FailPublishEnv + "=1"}, "tickets", "init", "--no-repo", "--slug", "rl-retry"); r.code == 0 {
 		t.Fatal("repo-less init with the pre-publish fault succeeded")
+	}
+	if after, _ := os.ReadDir(ledgers); len(after) != len(before) {
+		t.Fatalf("a failed repo-less init left its HOME ledger behind: %d entries, was %d", len(after), len(before))
 	}
 	outside := filepath.Join(filepath.Dir(w.repo), "rl-outside")
 	os.MkdirAll(outside, 0o755)

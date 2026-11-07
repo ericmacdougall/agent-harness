@@ -194,7 +194,7 @@ func cmdBind(args []string, env Env) error {
 		}
 		cur := l.ReadBinding()
 		if cur != nil && cur.Damaged {
-			return refusedf("this HOME's binding state is damaged; run unbind and bind again")
+			return refusedf("this HOME's binding state is damaged; run unbind, then bind again with a signed receipt and --goodqa-key to restore the pinned key")
 		}
 		var from []ledger.Frontier
 		base := ""
@@ -294,7 +294,7 @@ func exportImport(p parsed, env Env, l *ledger.Ledger) (string, error) {
 			return "", usagef("--since-bound needs a bound ledger (see `bind`)")
 		}
 		if b.Damaged {
-			return "", refusedf("this HOME's binding state is damaged; run unbind and bind again")
+			return "", refusedf("this HOME's binding state is damaged; run unbind, then bind again with a signed receipt and --goodqa-key to restore the pinned key")
 		}
 		if rel, _ := ledger.Compare(in, b.Frontier); rel == ledger.RelDiverged {
 			return "", refusedf("the binding no longer matches this ledger; export without --since-bound")

@@ -176,14 +176,13 @@ func Init(loc Location, o InitOptions) (*Ledger, error) {
 		// Still under the writer lock: a concurrent init in this repository waits, so its writer.json cannot
 		// be the one removed here, and projects.json is re-read where no one else can publish it.
 		if _, perr := l.Dir.ReadRegular(projectsFile, 64*1024); errors.Is(perr, fs.ErrNotExist) {
-			// Nothing was published, and the project id is new, so nothing else uses its HOME directory:
-			// do not leave it behind.
-			if inRepo {
-				if mdir, merr := MirrorDir(project); merr == nil {
-					os.RemoveAll(filepath.Dir(mdir))
-				}
-			}
+			// Nothing was published, and the project id is new, so nothing else uses its HOME directory
+			// (ledgers/<project>: the mirror of a repository ledger, or the whole repo-less ledger): do not
+			// leave it behind. The repository side is cleaned first.
 			l.removeLeftoverInit()
+			if mdir, merr := MirrorDir(project); merr == nil {
+				os.RemoveAll(filepath.Dir(mdir))
+			}
 		}
 	}
 	lk.Close()
@@ -200,7 +199,7 @@ func Init(loc Location, o InitOptions) (*Ledger, error) {
 // removeLeftoverInit drops what a failed init wrote before projects.json existed: writer.json and the fresh
 // project's writer refs (audit2 F-019, goodqa#15000). Left in place, writer.json maps this checkout's
 // fingerprint to a writer whose registration died with the removed HOME directory, so every retry of init
-// refuses with "not in this account's ledger registry", and a repo-less retry's CAS fails on the stale ref.
+// refuses with "not in this account's ledger registry". (A repo-less ledger's whole root is removed after.)
 // The caller holds the writer lock and has seen no projects.json; the project id was minted by this attempt,
 // so every ref under its namespace is its own.
 func (l *Ledger) removeLeftoverInit() {

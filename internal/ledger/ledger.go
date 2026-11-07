@@ -77,7 +77,7 @@ func CheckTestEnv() error {
 	if writer.TestHooksAllowed {
 		return nil
 	}
-	for _, k := range []string{FakeNowEnv, CrashAfterCASEnv, LockWaitEnv, ViewBudgetEnv, FailFirstFoldEnv, FailPublishEnv, FailViewAfterEnv, writer.FakeMachineIDEnv} {
+	for _, k := range []string{FakeNowEnv, CrashAfterCASEnv, LockWaitEnv, ViewBudgetEnv, FailFirstFoldEnv, FailPublishEnv, FailViewAfterEnv, InitCleanupDelay, writer.FakeMachineIDEnv} {
 		if _, ok := os.LookupEnv(k); ok {
 			return wrap(ErrUsage, "%s is a test-only variable, refused by builds without -tags ledgertest", k)
 		}

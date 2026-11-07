@@ -106,8 +106,9 @@ type Binding struct {
 	Frontier      []Frontier
 	GoodQAKey     string // hex ed25519 public key pinned by the user; empty = receipts are advisory
 	// Damaged: a binding file exists but failed validation. It vouches for nothing (no frontier, no pin),
-	// yet it is not "never bound": bind and --since-bound refuse it until `unbind` removes it, so damage
-	// can never drop a pinned key and let an unsigned receipt through (Kimi audit F10, goodqa#14998).
+	// yet it is not "never bound": bind and --since-bound refuse it until `unbind` removes it, so a damaged
+	// file cannot silently drop a pinned key and let an unsigned receipt through (Kimi audit F10,
+	// goodqa#14998). A deleted sync.json still reads as never bound (tracked in goodqa#14993's follow-up).
 	Damaged bool
 }
 
