@@ -799,6 +799,19 @@ class RemoteSpawn(unittest.TestCase):
         self.assertEqual(self.decide('ssh dev2 kill 4242', lambda h, p: None)[0], 'block')
         self.assertEqual(self.decide('ssh dev2 kill 4242', lambda h, p: self.START)[0], 'allow')  # same, whitespace-normalized
 
+    def test_routing_options_held_in_an_array_stay_refused(self):
+        """Delta review F1 (pr96-merge-51a8d87.md): on main 51a8d87 an array kept `"${O[@]}"` as plain text, so the
+        routing options inside it were invisible to the spawn route and these were allowed, killing on another host."""
+        kg.append_ledger(kg.remote_root('dev2'), 4242, self.START, home=self.home)
+        same = lambda host, pid: self.START if (host, pid) == ('dev2', 4242) else None  # noqa: E731
+        self.assertEqual(self.decide('ssh dev2 kill 4242', same)[0], 'allow')  # the ledgered plain form still works
+        for cmd in ('O=(-o HostName=prod); ssh "${O[@]}" dev2 kill 4242',
+                    'O=(-o BatchMode=yes -o HostName=prod); ssh "${O[@]}" dev2 kill 4242',
+                    'O=(-oBatchMode=yes -oHostName=prod); ssh "${O[@]}" dev2 kill 4242',
+                    'X=(-J); ssh "${X[@]}" prod dev2 kill 4242'):
+            with self.subTest(cmd):
+                self.assertEqual(self.decide(cmd, same)[0], 'block', cmd)
+
     def test_spawn_host_records_the_remote_pid_and_start_time(self):
         calls = []
 
