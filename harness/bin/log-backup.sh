@@ -23,6 +23,7 @@
 #   LOG_BACKUP_DEADLINE_GRACE_SECONDS / LOG_BACKUP_KILL_GRACE_SECONDS  a copy past its share gets SIGTERM after the
 #                           first (default 10) and SIGKILL after the second more (default 10)
 #   LOG_BACKUP_VERSIONS     exactly 0 turns off versions/STAMP (loud warning); anything else keeps them
+#   LOG_BACKUP_BULK_CHUNK   files per checkpointed bulk copy (default 100, 1-99999); see bulk_upload
 # Freshness contract, two tiers with their own markers. log-backup.last-ok (transcripts, WALs, ledgers) is written
 # atomically with the run START time only after every tier-1 source copied cleanly and a primary source
 # (.claude/projects or .codex/sessions) held files. log-backup.bulk-last-ok (archived sessions, narrowed work tree)
@@ -57,6 +58,8 @@ for rate in TPSLIMIT TRANSFERS; do
     echo "log-backup: $rate must be a whole number from 1 to 99" >&2; exit 2
   fi
 done
+BULK_CHUNK=${LOG_BACKUP_BULK_CHUNK:-100}
+printf '%s' "$BULK_CHUNK" | grep -Eq '^[1-9][0-9]{0,4}$' || { echo "log-backup: LOG_BACKUP_BULK_CHUNK must be 1-99999" >&2; exit 2; }
 for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER DEADLINE_GRACE SLICE_RESERVE KILL_GRACE PERIOD; do
   # No leading zeros: bash would read 08 as octal and abort the arithmetic.
   if ! printf '%s' "${!numeric:-0}" | grep -Eq '^(0|[1-9][0-9]{0,4})$'; then
@@ -267,7 +270,11 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
   shift 2
   if [ -d "$p" ]; then dst="$R/$rel"; else dst="$R/$(dirname "$rel")"; fi
   args=(copy --dropbox-batch-mode sync --dropbox-batch-size 100 --tpslimit "$TPSLIMIT" --transfers "$TRANSFERS" --checkers 4
-    --checksum --retries 3 --retries-sleep 30s --low-level-retries 20 --contimeout 60s --timeout 300s --log-file "$LOG" --log-level NOTICE --exclude-from "$EXCLUDES" --ignore-case "$@")
+    --checksum --retries 3 --retries-sleep 30s --low-level-retries 20 --contimeout 60s --timeout 300s --log-file "$LOG" --log-level NOTICE)
+  # A --files-from-raw copy must carry no other filter (rclone refuses the mix): its list was made with the
+  # credential excludes and the source filters (bulk_upload). Every other copy gets the credential excludes here.
+  case " $* " in *" --files-from-raw "*) ;; *) args+=(--exclude-from "$EXCLUDES" --ignore-case) ;; esac
+  args+=("$@")
   if [ "${LOG_BACKUP_VERSIONS:-1}" != 0 ]; then args+=(--backup-dir "$R/versions/$STAMP/$rel"); fi
   local remaining
   # Dropbox can rate-limit (too_many_write_operations): retry the source with a pause before calling it a failure.
@@ -330,6 +337,68 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
   else
     say "copy failed after $attempt attempts: $rel"; rate_limit_note "$log_mark"; ok=1; hard_fail=1
   fi
+}
+
+# Bulk sources are far too large for one run (Mac 2026-11-07: 620k files in the work tree, about 7 minutes of copy
+# time per run). A fresh copy re-checked the same first files every run and never got further (goodqa#15062), so
+# a bulk pass is a generation with a checkpoint under $BULK_STATE/KEY:
+#   pending  the files of this generation still to send (path, size, mtime), listed once when it starts
+#   cursor   how many pending lines are verified; a copy of the next BULK_CHUNK lines that exits 0 advances it
+#   done     the files verified by earlier generations; a new generation lists only new or changed files
+# A run resumes at the cursor. A chunk cut short is sent again whole (rclone skips what already arrived). When the
+# cursor reaches the end, the generation's whole listing becomes the new `done` (dropping deleted files) and the
+# source counts as complete. Every list is made with the same filters as the copy, credential excludes included.
+BULK_STATE="$LOGDIR/log-backup.bulk.d"
+bulk_key() { printf '%s' "$1" | tr '/' '_'; }
+bulk_needs_listing() { # bulk_needs_listing SRC-REL: true when no generation is in progress for SRC-REL
+  local st="$BULK_STATE/$(bulk_key "$1")"
+  [ -s "$st/pending" ] && [ "$(cat "$st/remote" 2>/dev/null)" = "$R" ] && return 1
+  return 0
+}
+bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one checkpointed pass; 0 when finished
+  local rel="$1" st n cur total chunk
+  shift
+  local list_filters=() copy_args=()
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do list_filters+=("$1"); shift; done
+  [ $# -gt 0 ] && shift
+  copy_args=("$@")
+  st="$BULK_STATE/$(bulk_key "$rel")"
+  mkdir -p "$st" && chmod 700 "$BULK_STATE" "$st" || { say "cannot create bulk state for $rel"; ok=1; hard_fail=1; return 1; }
+  # A checkpoint belongs to one destination: another remote or host starts over.
+  if [ "$(cat "$st/remote" 2>/dev/null)" != "$R" ]; then
+    rm -f "$st/pending" "$st/cursor" "$st/done" "$st/listing" && printf '%s\n' "$R" > "$st/remote"
+  fi
+  if [ ! -s "$st/pending" ]; then
+    local filters=(--exclude-from "$EXCLUDES" --ignore-case "${list_filters[@]+"${list_filters[@]}"}")
+    "$RCLONE" lsf -R --files-only --format pst --separator $'\t' "${filters[@]}" -- "$HOME/$rel" \
+      </dev/null > "$st/listing.tmp" 2>> "$LOG"
+    rc=$?
+    if [ $rc -ne 0 ]; then say "listing $rel failed (rclone exit $rc)"; ok=1; hard_fail=1; rm -f "$st/listing.tmp"; return 1; fi
+    # Exactly three fields: a path with a tab or a newline cannot be checkpointed safely and is left to the next
+    # full listing (it is counted, so it is never silently dropped).
+    awk -F'\t' 'NF != 3 {bad++} END {print bad + 0}' "$st/listing.tmp" > "$st/odd"
+    awk -F'\t' 'NF == 3' "$st/listing.tmp" > "$st/listing" && rm -f "$st/listing.tmp"
+    touch "$st/done"
+    awk -F'\t' 'FILENAME == ARGV[1] {seen[$0] = 1; next} !($0 in seen)' "$st/done" "$st/listing" > "$st/pending.tmp" \
+      && mv "$st/pending.tmp" "$st/pending" && echo 0 > "$st/cursor" || { say "cannot build the $rel checkpoint"; ok=1; hard_fail=1; return 1; }
+    [ "$(cat "$st/odd")" = 0 ] || say "$rel: $(cat "$st/odd") paths with a tab or newline are not checkpointed"
+    say "$rel: new pass, $(wc -l < "$st/pending" | tr -d ' ') of $(wc -l < "$st/listing" | tr -d ' ') files new or changed"
+  fi
+  total=$(wc -l < "$st/pending" | tr -d ' ')
+  cur=$(cat "$st/cursor" 2>/dev/null)
+  printf '%s' "$cur" | grep -Eq '^(0|[1-9][0-9]*)$' || cur=0
+  while [ "$cur" -lt "$total" ]; do
+    sed -n "$((cur + 1)),$((cur + BULK_CHUNK))p" "$st/pending" > "$st/chunk"
+    n=$(wc -l < "$st/chunk" | tr -d ' ')
+    cut -f1 "$st/chunk" > "$st/chunk.paths"
+    upload "$HOME/$rel" "$rel" "${copy_args[@]+"${copy_args[@]}"}" --files-from-raw "$st/chunk.paths" --no-traverse
+    [ "$copied" -eq 1 ] || { say "$rel: pass at $cur of $total files; the next run resumes there"; return 1; }
+    cur=$((cur + n))
+    echo "$cur" > "$st/cursor.tmp" && mv "$st/cursor.tmp" "$st/cursor"
+  done
+  mv "$st/listing" "$st/done" && rm -f "$st/pending" "$st/cursor" "$st/chunk" "$st/chunk.paths"
+  say "$rel: pass complete ($total files sent or verified)"
+  return 0
 }
 
 later=0
@@ -403,7 +472,7 @@ for src in "${sources_bulk[@]+"${sources_bulk[@]}"}"; do
   [ -e "$HOME/$src" ] || [ -L "$HOME/$src" ] || continue
   if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; hard_fail=1; continue; fi
   extra=(--min-age 2m)
-  if [ "$src" = .agent-harness/work ] && [ "$(time_left)" -lt $(( MIN_SLICE + scan_need )) ]; then
+  if [ "$src" = .agent-harness/work ] && bulk_needs_listing "$src" && [ "$(time_left)" -lt $(( MIN_SLICE + scan_need )) ]; then
     say "run time budget (${BUDGET_SECONDS}s) used up before $src (its scan needs about ${scan_need}s); the next run continues"
     ok=1; budget_hit=1; continue
   fi
@@ -412,6 +481,7 @@ for src in "${sources_bulk[@]+"${sources_bulk[@]}"}"; do
     # The work tree holds git worktrees, checkouts, screenshots and mutation trees (hundreds of GB). Back up only
     # the small durable state: skip every directory that has a .git entry, media files, and files over the size cap.
     gen="$LOGDIR/log-backup.worktrees.excludes"
+    if bulk_needs_listing "$src"; then
     : > "$gen"
     unsafe=0
     while IFS= read -r -d '' g; do
@@ -424,10 +494,11 @@ for src in "${sources_bulk[@]+"${sources_bulk[@]}"}"; do
     done < <(find "$HOME/$src" -xdev -maxdepth 12 -name .git -prune -print0 2>/dev/null)
     echo $(( $(date +%s) - scan_start )) > "$scan_file"
     say "work: $(wc -l < "$gen" | tr -d ' ') git trees excluded, $unsafe with unsafe names left in (uploaded)"
+    fi
     extra+=(--exclude-from "$WORK_EXCLUDES" --exclude-from "$gen" --max-size "${LOG_BACKUP_WORK_MAX_SIZE:-25M}"
-            --max-transfer "${LOG_BACKUP_WORK_MAX_TRANSFER:-5G}")
+            -- --max-transfer "${LOG_BACKUP_WORK_MAX_TRANSFER:-5G}")
   fi
-  upload "$HOME/$src" "$src" "${extra[@]}"
+  bulk_upload "$src" "${extra[@]}"
 done
 # Tier 2 (bulk: archived sessions and the narrowed work tree) has its own marker.
 bulk_ok=$ok

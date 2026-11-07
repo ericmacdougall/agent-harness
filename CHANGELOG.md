@@ -6,6 +6,11 @@ group by pull request.
 
 ## Unreleased
 
+### Fixed
+- log-backup bulk tier: a pass now resumes from a checkpoint instead of starting over every run. With the 620k-file
+  work tree, each run re-checked the same first files and the pass never finished. Files verified by an earlier pass
+  are not checked again, and only new or changed files are sent (goodqa#15062).
+
 ### Added
 - ops_watch `remote_units`: a read-only ssh check of a timer job on another host (for example t2-blog-drip on
   t2-dev). It alerts when the last run failed, when there has been no success within `max_age_h` (26 h), or when
