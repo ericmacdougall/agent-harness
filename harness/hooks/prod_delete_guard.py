@@ -112,14 +112,15 @@ if str(HERE) not in sys.path:  # python3 -I does not put the script's directory 
 DESTRUCTIVE = re.compile(
     r"\b(DELETE\s+FROM|DROP\s+(?:TABLE|DATABASE|INDEX|SCHEMA|VIEW|FUNCTION|PROCEDURE|TRIGGER|ROLE|USER)|TRUNCATE)\b"
     r"|\bdropdb\b|\bmysqladmin\b[^\n|;&]{0,512}?\bdrop\b", re.I)
-UPDATE_START = re.compile(
-    r"\bUPDATE\s+(?:ONLY\s+)?[\w.\"`\[\]$]+(?:\s+(?:AS\s+)?(?!SET\b)[\w.\"`\[\]$]+)?\s+SET\b", re.I)
-# An UPDATE ... SET the small parser does not recognise (multi-table, odd quoting) counts as unfiltered. A bare
-# UPDATE with no SET after it in the statement (SELECT ... FOR UPDATE, `apt update`) is not an UPDATE statement.
-UPDATE_UNKNOWN = re.compile(r"\bUPDATE\b(?=[^;]*\bSET\b)", re.I)
-WHERE_WORD = re.compile(r"\bWHERE\b", re.I)
-SQL_COMMENT = re.compile(r"/\*.*?\*/", re.S)
-EXECUTABLE_COMMENT = re.compile(r"/\*(?:!|M!)(?:\d{5,6})?[ \t]*(.*?)\*/", re.S | re.I)
+UPDATE_WORD = re.compile(r"\bUPDATE\b", re.I)
+SET_WORD = re.compile(r"\bSET\b", re.I)
+# One linear pass per dialect reading finds these events; see _unfiltered_update.
+UPDATE_EVENTS = re.compile(r"\b(UPDATE|SET|WHERE)\b|[();]", re.I)
+NOT_AN_UPDATE = re.compile(r"\b(?:DO|ON|FOR|KEY)\s*$", re.I)  # ON CONFLICT DO UPDATE, ON UPDATE, FOR UPDATE, KEY UPDATE
+EXEC_HEAD = re.compile(r"(?:!|M!)\d{0,6}", re.I)
+DOLLAR_QUOTE = re.compile(r"\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$")
+HASH_COMMENT = re.compile(r"#[^\n]*")
+
 LINE_COMMENT = re.compile(r"--[^\n]*")
 SHELL_ESCAPE = re.compile(r"\\(?:x20|x09|x0a|040|t|n)", re.I)
 PROD_TOKEN = re.compile(r"(?:^|[\s_.\-/=@\"'])(prod|production)(?:$|[\s_.\-/:?#\"'])", re.I)
@@ -210,143 +211,218 @@ SOURCE_RE = re.compile(r"^(user|answer):([A-Za-z0-9._-]{1,120})/([0-9a-fA-F-]{8,
 
 
 MASK_LIMIT = 1 << 20  # characters the UPDATE lexer reads; past it an UPDATE ... SET counts as unfiltered
+# How each client reads quotes and comments: (backslash escapes, nested /* */, [ ] quotes, # comments, $$ quotes,
+# runs /*! */). An UPDATE is filtered only when EVERY reading finds its WHERE (goodqa#15036 review F1): a reading
+# that ends a string or comment earlier than the real database would otherwise reveal a WHERE it never sees.
+SQL_READINGS = (
+    (False, True, False, False, True, False),   # PostgreSQL
+    (True, True, False, False, True, False),    # PostgreSQL E'' strings
+    (True, False, False, True, False, True),    # MySQL/MariaDB, /*! */ runs
+    (True, False, False, True, False, False),   # MySQL, version-gated /*!NNNNN */ skipped
+    (False, False, False, True, False, True),   # MySQL NO_BACKSLASH_ESCAPES
+    (False, False, True, False, False, False),  # SQLite / D1
+    (False, True, True, False, False, False),   # SQL Server
+)
 
 
-def _mask_sql(text: str):
-    """(masked, uncertain): comments blanked and quoted contents replaced by x, positions and newlines kept.
-    `uncertain` is true for an unterminated quote, dollar quote or comment. Linear in len(text)."""
+def _strip_block_comments(text: str, run_exec: bool) -> str:
+    """/* ... */ (not nested) replaced by a space, in one linear pass; an unterminated /* is left as text. With
+    run_exec, /*! ... */ and /*M! ... */ keep their body, because MySQL runs it."""
+    out, i = [], 0
+    while True:
+        s = text.find("/*", i)
+        e = text.find("*/", s + 2) if s >= 0 else -1
+        if e < 0:
+            break
+        out.append(text[i:s])
+        body = text[s + 2:e]
+        head = EXEC_HEAD.match(body) if run_exec else None
+        out.append(" %s " % body[head.end():] if head else " ")
+        i = e + 2
+    out.append(text[i:])
+    return "".join(out)
+
+
+def _open_exec_comments(text: str) -> str:
+    """/*! body */ -> body, other comments untouched (for a MySQL reading of the lexer). Linear."""
+    out, i = [], 0
+    while True:
+        s = text.find("/*", i)
+        while s >= 0 and not EXEC_HEAD.match(text, s + 2):
+            s = text.find("/*", s + 2)
+        e = text.find("*/", s + 2) if s >= 0 else -1
+        if e < 0:
+            break
+        head = EXEC_HEAD.match(text, s + 2)
+        out.append(text[i:s] + " " + text[head.end():e] + " ")
+        i = e + 2
+    out.append(text[i:])
+    return "".join(out)
+
+
+def _mask_sql(text: str, backslash=True, nested=True, bracket=True, hash_comment=False, dollar=True):
+    """(masked, uncertain): comments blanked and quoted contents replaced by x for one dialect reading, positions
+    and newlines kept. `uncertain` is true for an unterminated quote, dollar quote or comment. Linear in len(text)."""
     out = list(text)
     uncertain = False
     i, n = 0, len(text)
     while i < n:
-        if text.startswith("--", i):
-            end = text.find("\n", i + 2)
+        ch = text[i]
+        if (ch == "-" and text.startswith("--", i)) or (ch == "#" and hash_comment):
+            end = text.find("\n", i + 1)
             end = n if end < 0 else end
             for pos in range(i, end):
                 out[pos] = " "
             i = end
             continue
-        if text.startswith("/*", i):
-            depth, pos = 1, i + 2
-            while pos < n and depth:
-                if text.startswith("/*", pos):
-                    depth += 1
-                    pos += 2
-                elif text.startswith("*/", pos):
-                    depth -= 1
-                    pos += 2
-                else:
-                    pos += 1
+        if ch == "/" and text.startswith("/*", i):
+            if not nested:
+                end = text.find("*/", i + 2)
+                pos = n if end < 0 else end + 2
+                depth = 1 if end < 0 else 0
+            else:
+                depth, pos = 1, i + 2
+                while pos < n and depth:
+                    if text.startswith("/*", pos):
+                        depth += 1
+                        pos += 2
+                    elif text.startswith("*/", pos):
+                        depth -= 1
+                        pos += 2
+                    else:
+                        pos += 1
             for at in range(i, pos):
                 if out[at] != "\n":
                     out[at] = " "
             uncertain = uncertain or bool(depth)
             i = pos
             continue
-        quote = text[i] if text[i] in ("'", '"', "`") else None
-        closer = quote
-        if quote is None and text[i] == "[":
-            quote, closer = "[", "]"
-        dollar = DOLLAR_QUOTE.match(text, i) if quote is None else None
-        if dollar:
-            marker = dollar.group(0)
-            end = text.find(marker, i + len(marker))
-            if end < 0:
-                uncertain, end = True, n
-            else:
-                end += len(marker)
-            for pos in range(i, end):
-                if out[pos] != "\n":
-                    out[pos] = "x"
-            i = end
-            continue
-        if quote is None:
-            i += 1
-            continue
-        pos, closed = i + 1, False
-        while pos < n:
-            if quote != "[" and text[pos] == "\\" and pos + 1 < n:
-                out[pos] = out[pos + 1] = "x"
-                pos += 2
+        if ch == "$" and dollar:
+            m = DOLLAR_QUOTE.match(text, i)
+            if m:
+                marker = m.group(0)
+                end = text.find(marker, i + len(marker))
+                if end < 0:
+                    uncertain, end = True, n
+                else:
+                    end += len(marker)
+                for pos in range(i, end):
+                    if out[pos] != "\n":
+                        out[pos] = "x"
+                i = end
                 continue
-            if text[pos] == closer:
-                if quote != "[" and pos + 1 < n and text[pos + 1] == closer:
+        if ch in ("'", '"', "`") or (ch == "[" and bracket):
+            closer = "]" if ch == "[" else ch
+            pos, closed = i + 1, False
+            while pos < n:
+                if backslash and ch != "[" and text[pos] == "\\" and pos + 1 < n:
                     out[pos] = out[pos + 1] = "x"
                     pos += 2
                     continue
-                out[pos] = "x"
+                if text[pos] == closer:
+                    if ch != "[" and pos + 1 < n and text[pos + 1] == closer:
+                        out[pos] = out[pos + 1] = "x"
+                        pos += 2
+                        continue
+                    out[pos] = "x"
+                    pos += 1
+                    closed = True
+                    break
+                if out[pos] != "\n":
+                    out[pos] = "x"
                 pos += 1
-                closed = True
-                break
-            if out[pos] != "\n":
-                out[pos] = "x"
-            pos += 1
-        out[i] = "x"
-        uncertain = uncertain or not closed
-        i = pos
+            out[i] = "x"
+            uncertain = uncertain or not closed
+            i = pos
+            continue
+        i += 1
     return "".join(out), uncertain
 
 
-DOLLAR_QUOTE = re.compile(r"\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$")
+def _unfiltered_update(masked: str):
+    """The first UPDATE ... SET with no WHERE at its own parenthesis depth in its statement, else None. One linear
+    pass with a scope stack, so a CTE `(UPDATE ... WHERE ...)` is judged inside its parentheses and a WHERE in a
+    subquery never filters the outer UPDATE. ON CONFLICT DO UPDATE, ON UPDATE, FOR UPDATE and KEY UPDATE are not
+    UPDATE statements. Unbalanced parentheses make any UPDATE ... SET in that statement unfiltered."""
+    depth, malformed, scopes, open_scopes = 0, False, [], []
+
+    def verdict():
+        for sc in scopes:
+            if sc[1] and (malformed or depth or not sc[2]):
+                return sc[3]
+        return None
+
+    for m in UPDATE_EVENTS.finditer(masked):
+        tok = m.group(0)
+        if tok == "(":
+            depth += 1
+        elif tok == ")":
+            open_scopes = [sc for sc in open_scopes if sc[0] < depth]
+            depth -= 1
+            if depth < 0:
+                malformed, depth = True, 0
+        elif tok == ";":
+            found = verdict()
+            if found:
+                return found
+            depth, malformed, scopes, open_scopes = 0, False, [], []
+        else:
+            word = tok.upper()
+            if word == "UPDATE":
+                if not NOT_AN_UPDATE.search(masked[max(0, m.start() - 16):m.start()]):
+                    sc = [depth, False, False, m]
+                    scopes.append(sc)
+                    open_scopes.append(sc)
+            else:
+                for sc in open_scopes:
+                    if sc[0] == depth:
+                        sc[1 if word == "SET" else 2] = True
+    return verdict()
 
 
 def _update_match(text: str):
-    """An UPDATE ... SET with no top-level WHERE in its statement, else None. An UPDATE ... SET the parser cannot
-    prove filtered (unknown target syntax, unbalanced parentheses, an unterminated quote or comment, or text over
-    MASK_LIMIT) is returned as unfiltered (goodqa#15036)."""
-    if len(text) > MASK_LIMIT:
-        return UPDATE_UNKNOWN.search(text)
-    masked, uncertain = _mask_sql(text)
-    for statement in masked.split(";"):
-        update = UPDATE_START.search(statement)
-        if not update:
-            unknown = UPDATE_UNKNOWN.search(statement)
-            if unknown:
-                return unknown
-            continue
-        depth, filtered, malformed = 0, False, uncertain
-        pos = update.end()
-        while pos < len(statement):
-            char = statement[pos]
-            if char == "(":
-                depth += 1
-            elif char == ")":
-                if depth == 0:
-                    malformed = True
-                else:
-                    depth -= 1
-            elif depth == 0 and WHERE_WORD.match(statement, pos):
-                filtered = True
-                pos += 4
-            pos += 1
-        if malformed or depth or not filtered:
-            return update
-    return None
-
-
-def destructive_match(sql: str):
-    """The destructive statement in `sql`, else None. DELETE/DROP/TRUNCATE are matched after SQL comments, shell
-    escapes and quote characters are removed (also with `--` line comments removed, so a comment cannot split a
-    verb: `DELETE--x\nFROM`). MySQL executable comments are SQL, not comments. UPDATE is judged by the lexer above,
-    on the raw text and, for a client command, on its shell words (so shell quoting is not mistaken for SQL quoting)."""
-    expanded = EXECUTABLE_COMMENT.sub(lambda m: " " + m.group(1) + " ", sql)
-    text = SHELL_ESCAPE.sub(lambda m: "\n" if m.group(0).lower() in ("\\n", "\\x0a") else " ",
-                            SQL_COMMENT.sub(" ", expanded))
-    text = text.replace("\\", "").replace('"', "").replace("'", "")
-    quick = DESTRUCTIVE.search(text) or DESTRUCTIVE.search(LINE_COMMENT.sub(" ", text))
-    if quick:
-        return quick
-    if not UPDATE_UNKNOWN.search(expanded):
+    """An UPDATE ... SET that some dialect reading of `text` leaves without a top-level WHERE, else None. Text over
+    MASK_LIMIT, or that a reading leaves inside an unterminated quote or comment, counts as unfiltered when it holds
+    UPDATE and SET at all (goodqa#15036)."""
+    first = UPDATE_WORD.search(text)
+    if not first or not SET_WORD.search(text, first.end()):
         return None
-    candidates = [expanded]
-    if DB_CLIENT.search(expanded) or D1_EXECUTE.search(expanded):
-        candidates.append("\n".join(_words(expanded)))
-    for candidate in candidates:
-        found = _update_match(candidate)
+    if len(text) > MASK_LIMIT:
+        return first
+    for backslash, nested, bracket, hash_comment, dollar, run_exec in SQL_READINGS:
+        source = _open_exec_comments(text) if run_exec else text
+        masked, uncertain = _mask_sql(source, backslash, nested, bracket, hash_comment, dollar)
+        if uncertain:
+            return first
+        found = _unfiltered_update(masked)
         if found:
             return found
     return None
 
+
+def destructive_match(sql: str, pieces=None):
+    """The destructive statement in `sql`, else None. DELETE/DROP/TRUNCATE are matched after SQL comments, shell
+    escapes and quote characters are removed (also with `--` or `#` line comments removed, so a comment cannot split a
+    verb: `DELETE--x\nFROM`), once with MySQL executable comments run and once with them dropped. UPDATE is judged by
+    the dialect readings above, on each source separately (`pieces`: the command and each SQL file, so a stray quote
+    in one cannot hide another) and, for a client command, on its shell words."""
+    for run_exec in (True, False):
+        text = SHELL_ESCAPE.sub(lambda m: "\n" if m.group(0).lower() in ("\\n", "\\x0a") else " ",
+                                _strip_block_comments(sql, run_exec))
+        text = text.replace("\\", "").replace('"', "").replace("'", "")
+        quick = (DESTRUCTIVE.search(text) or DESTRUCTIVE.search(LINE_COMMENT.sub(" ", text))
+                 or DESTRUCTIVE.search(HASH_COMMENT.sub(" ", text)))
+        if quick:
+            return quick
+    for piece in (pieces if pieces else [sql]):
+        candidates = [piece]
+        if DB_CLIENT.search(piece) or D1_EXECUTE.search(piece):
+            candidates.append("\n".join(_words(piece)))
+        for candidate in candidates:
+            found = _update_match(candidate)
+            if found:
+                return found
+    return None
 
 def _resolve_path(raw: str, cwd) -> str:
     path = os.path.expanduser(raw.strip("'\""))
@@ -399,7 +475,7 @@ def _includes(text: str, command=False):
     return out
 
 
-def sql_text_for(command: str, cwd=None, unread=None) -> str:
+def sql_text_for(command: str, cwd=None, unread=None, pieces=None) -> str:
     """The command plus its complete, bounded SQL file closure (--file, psql -f, `< file`, cat inputs and nested
     includes). Unreadable files, cycles, excess depth/files/bytes/expansions and files the same command writes are
     appended to `unread` when a list is given, which makes a production command fail closed (goodqa#15036)."""
@@ -426,6 +502,8 @@ def sql_text_for(command: str, cwd=None, unread=None) -> str:
             unread.extend("%s (the same command has other steps)" % p for p in paths[:INCLUDE_FILE_LIMIT])
         return command
     written = _written_paths(command, cwd) if paths else set()
+    if pieces is not None:
+        pieces.append(command)
     budget = {"files": 0, "bytes": 0, "expansions": 0}
     accounted, active, cache = set(), set(), {}
 
@@ -465,10 +543,14 @@ def sql_text_for(command: str, cwd=None, unread=None) -> str:
             budget["bytes"] += size
         active.add(real)  # only file text is cached; the cycle check follows the active include path
         try:
-            pieces = [body]
+            # A file's text is joined once: a repeated include adds nothing new to judge, and joining every
+            # expansion could build megabytes from one 200 KB file (review F2). Its includes are still walked.
+            parts = [body] if first else []
+            if first and pieces is not None:
+                pieces.append(body)
             for child, relative in _includes(body):
-                pieces.append(load(child, resolved if relative else None, depth + 1))
-            return "\n".join(pieces)
+                parts.append(load(child, resolved if relative else None, depth + 1))
+            return "\n".join(p for p in parts if p)
         finally:
             active.discard(real)
 
@@ -587,39 +669,51 @@ SSH_CONFIG_LIMIT = 64 * 1024
 SSH_CONFIG_FILES = 16
 SSH_CONFIG_DEPTH = 4
 SSH_CONFIG_LINES = 4096
+SSH_INCLUDE_ENTRIES = 1024
+HOSTNAME_OPTION = re.compile(r"(?i)\s*hostname\s*(?:=\s*|\s+)(\S+)")
+SSH_OPTION_LETTERS = set(SSH_OPTS_WITH_VALUE)
 
 
 def _ssh_route(words: list, index: int):
-    """(alias, [command-line HostName values], -F path or None) for the ssh at words[index]. Bounded like _after."""
-    opts = {"-" + c for c in SSH_OPTS_WITH_VALUE}
-    names, config = [], None
+    """(alias, [command-line HostName values], [-F paths], certain) for the ssh at words[index]. Options are read
+    letter by letter (-tF cfg, -qoHostName=x) before AND after the destination, as OpenSSH does, up to the remote
+    command; ssh://[user@]host[:port] is parsed. Past AFTER_SCAN words the route is uncertain (goodqa#15037)."""
+    alias, names, configs, seen_host = "", [], [], False
     i = index + 1
-    while i < len(words) and i - index <= AFTER_SCAN:
+    while i < len(words):
+        if i - index > AFTER_SCAN:
+            return alias, names, configs, False
         w = words[i]
         if w == "--":
-            return (words[i + 1] if i + 1 < len(words) else ""), names, config
+            if not seen_host and i + 1 < len(words):
+                alias = words[i + 1]
+            break
         if not w.startswith("-") or w == "-":
-            return w, names, config
-        value = None
-        if w in ("-o", "-F"):
-            value = words[i + 1] if i + 1 < len(words) else ""
-            i += 2
-        elif w.startswith(("-o", "-F")):
-            value = w[2:]
-            i += 1
-        elif w[:2] in opts and len(w) == 2:
-            i += 2
-            continue
-        else:
+            if seen_host:
+                break  # the remote command starts here
+            alias, seen_host = w, True
             i += 1
             continue
-        if w.startswith("-F"):
-            config = value
-            continue
-        m = re.match(r"(?i)\s*hostname\s*(?:=|\s)\s*(\S+)", value or "")
-        if m:
-            names.append(m.group(1))
-    return "", names, config
+        i += 1
+        for j in range(1, len(w)):
+            letter = w[j]
+            if letter in SSH_OPTION_LETTERS:
+                value = w[j + 1:]
+                if not value:
+                    value = words[i] if i < len(words) else ""
+                    i += 1
+                if letter == "o":
+                    m = HOSTNAME_OPTION.match(value)
+                    if m:
+                        names.append(m.group(1))
+                elif letter == "F":
+                    configs.append(value)
+                break
+    if alias.startswith("ssh://"):
+        rest = alias[len("ssh://"):].split("/", 1)[0].split("@")[-1]
+        alias = rest[1:].split("]", 1)[0] if rest.startswith("[") else rest.split(":", 1)[0]
+    alias = alias.split("@")[-1]
+    return alias, [n.replace("%h", alias).replace("%%", "%") for n in names], configs, bool(alias)
 
 
 def _ssh_host_matches(alias: str, patterns: list) -> bool:
@@ -637,29 +731,47 @@ def _ssh_host_matches(alias: str, patterns: list) -> bool:
     return hit
 
 
-def _ssh_config_hostnames(alias: str, config=None, home=None, cwd=None) -> list:
-    """Every HostName ssh config could give `alias`: from matching Host blocks, every Match block and included
-    files (bounded: SSH_CONFIG_FILES files of SSH_CONFIG_LIMIT bytes, depth SSH_CONFIG_DEPTH). Over-approximate on
-    purpose: the caller only denies when a candidate names prod, so an extra candidate can never allow anything.
-    Unreadable or malformed files give no candidates (the literal alias is still judged). %h and %% are expanded."""
-    import glob  # noqa: PLC0415
+def _ssh_config_hostnames(alias: str, configs=(), home=None, cwd=None):
+    """(every HostName ssh config could give `alias`, certain). Candidates come from matching Host blocks, Match
+    host/originalhost blocks, every other Match block and Include files, with %h expanded: over-approximate, so an
+    extra candidate can only add a prod target. The read is bounded (SSH_CONFIG_FILES files of SSH_CONFIG_LIMIT
+    bytes, SSH_CONFIG_LINES lines, depth SSH_CONFIG_DEPTH, Include wildcards only in the last path part). A missing
+    ~/.ssh/config is certain and empty; a missing -F file, an unreadable or oversized file, a reached cap or any
+    error is uncertain, and the caller then denies a destructive command (review F3/F4)."""
+    import fnmatch  # noqa: PLC0415
     import safe_input  # noqa: PLC0415
     sshdir = home_dir(home) / ".ssh"
-    start = os.path.expanduser(config) if config else str(sshdir / "config")
-    if config and not os.path.isabs(start):
-        start = os.path.join(str(cwd or os.getcwd()), start)
-    out, seen = [], set()
+    starts = []
+    for c in configs:
+        path = os.path.expanduser(c)
+        starts.append(path if os.path.isabs(path) else os.path.join(str(cwd or os.getcwd()), path))
+    required = bool(starts)
+    starts = starts or [str(sshdir / "config")]
+    out, seen, state = [], set(), {"files": 0, "certain": True}
 
-    def read(path, depth, active):
+    def read(path, depth, active, must_exist):
+        if depth > SSH_CONFIG_DEPTH or state["files"] >= SSH_CONFIG_FILES:
+            state["certain"] = False
+            return
         real = os.path.realpath(path)
-        if real in seen or len(seen) >= SSH_CONFIG_FILES or depth > SSH_CONFIG_DEPTH:
+        if real in seen:
             return
         seen.add(real)
+        if not os.path.lexists(path):
+            if must_exist:
+                state["certain"] = False
+            return
+        state["files"] += 1
         try:
             text = safe_input.read_bounded(path, SSH_CONFIG_LIMIT).decode("utf-8", "replace")
         except (safe_input.InputRejected, OSError, ValueError):
+            state["certain"] = False
             return
-        for line in text.splitlines()[:SSH_CONFIG_LINES]:
+        lines = text.splitlines()
+        if len(lines) > SSH_CONFIG_LINES:
+            state["certain"] = False
+            return
+        for line in lines:
             parts = re.split(r"\s*=\s*|\s+", line.split("#", 1)[0].strip(), maxsplit=1)
             key = parts[0].casefold()
             args = parts[1].split() if len(parts) > 1 else []
@@ -680,12 +792,26 @@ def _ssh_config_hostnames(alias: str, config=None, home=None, cwd=None) -> list:
                     pattern = os.path.expanduser(pattern.strip("\"'"))
                     if not os.path.isabs(pattern):
                         pattern = str(sshdir / pattern)
-                    for found in sorted(glob.glob(pattern))[:SSH_CONFIG_FILES]:
-                        read(found, depth + 1, active)
+                    head, tail = os.path.split(pattern)
+                    if any(ch in head for ch in "*?["):
+                        state["certain"] = False  # a wildcard directory could walk the whole disk
+                        continue
+                    if not any(ch in tail for ch in "*?["):
+                        read(pattern, depth + 1, active, False)
+                        continue
+                    try:
+                        entries = os.listdir(head)
+                    except OSError:
+                        continue  # ssh ignores an Include that matches nothing
+                    if len(entries) > SSH_INCLUDE_ENTRIES:
+                        state["certain"] = False
+                        continue
+                    for name in sorted(e for e in entries if not e.startswith(".") and fnmatch.fnmatch(e, tail)):
+                        read(os.path.join(head, name), depth + 1, active, False)
 
-    read(start, 0, True)
-    return out
-
+    for start in starts:
+        read(start, 0, True, required)
+    return out, state["certain"]
 
 def targets_production(command: str, env=None, home=None, cwd=None):
     """(description, [target groups]) of the production targets this command names, or ("", []).
@@ -755,17 +881,22 @@ def targets_production(command: str, env=None, home=None, cwd=None):
             if DB_CLIENT.search(rest) or "wrangler" in rest:
                 # The destination is the alias, a command-line HostName (first wins in ssh, but every one is
                 # judged) or a HostName the ssh config gives the alias (goodqa#15037).
-                alias, names, config = _ssh_route(words, i)
-                alias = alias.split("@")[-1]
+                alias, names, configs, certain = _ssh_route(words, i)
                 if alias and _prod(alias):
                     add("ssh to a prod host (%s) running a database client" % alias, [alias])
-                if alias and not names:
-                    names = _ssh_config_hostnames(alias, config, home, cwd)
+                if certain and not names:
+                    try:
+                        names, certain = _ssh_config_hostnames(alias, configs, home, cwd)
+                    except Exception:  # noqa: BLE001 - a reader error must not erase the targets found so far
+                        names, certain = [], False
                 for name in names[:16]:
                     name = name.split("@")[-1]
                     if _prod(name):
                         add("ssh to %s, which reaches a prod host (%s), running a database client" % (alias, name),
                             [name])
+                if not certain:
+                    add("ssh whose destination cannot be established (options, ssh config) running a database "
+                        "client", [])
         if base == "docker" and i + 1 < len(words) and words[i + 1] == "exec":
             box = _after(words, i + 1, DOCKER_EXEC_OPTS_WITH_VALUE)
             rest = " ".join(words[i + 2:])
@@ -1083,8 +1214,9 @@ def evaluate(ev, home=None, now=None, resolver=None, env=None):
         if not command.strip():
             return None
         unread = []
-        sql = sql_text_for(command, ev.get("cwd"), unread)
-        match = destructive_match(sql)
+        pieces = []
+        sql = sql_text_for(command, ev.get("cwd"), unread, pieces)
+        match = destructive_match(sql, pieces)
         if not match and not unread:
             return None
         target, values = targets_production(command, env, home, ev.get("cwd"))

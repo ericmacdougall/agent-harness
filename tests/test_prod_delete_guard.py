@@ -899,7 +899,8 @@ class RevisedSql(Case):
             text = pdg.sql_text_for("psql -h prod-db -f root.sql", str(self.home), unread)
         finally:
             pdg._read_sql_file = real_read
-        self.assertEqual((len(calls), unread, text.count("SELECT 1;")), (2, [], 2))
+        # each distinct file is read and joined once; a repeat include adds nothing new to judge
+        self.assertEqual((len(calls), unread, text.count("SELECT 1;")), (2, [], 1))
         self.assertEqual(self.verdict(self.ev("psql -h prod-db -f root.sql"), env={}), "allow")
 
     def test_hyperdrive_query_payload_is_inspected(self):
@@ -978,6 +979,116 @@ class RevisedSsh(Case):
         cfg.write_bytes(b"\xff\xfe" * 10)
         self.assertAllowed("ssh dev2 psql -c 'DELETE FROM users'")
         self.assertDenied("ssh prod-db psql -c 'DELETE FROM users'")
+
+
+class ReviewRound1(Case):
+    """Native red-team findings on 71c723b (goodqa#15036, goodqa#15037): dialect readings, linear time, ssh routes."""
+
+    def setUp(self):
+        super().setUp()
+        self.work = self.home / "w"
+        self.work.mkdir()
+
+    def ev(self, command):
+        return dict(bash(command), cwd=str(self.work))
+
+    def put(self, name, body):
+        (self.work / name).write_text(body)
+        return self.work / name
+
+    def test_every_dialect_reading_must_find_the_where(self):
+        files = {
+            "nest.sql": "UPDATE users SET a=1 /* /* */ -- */ WHERE id=1\n",
+            "dq.sql": 'UPDATE users SET "a\\" = 1 -- " WHERE id=1\n',
+            "bs.sql": "UPDATE users SET a='x\\' -- ' WHERE id=1\n",
+            "arr.sql": "UPDATE users SET a = ARRAY[']'];\nSELECT ' WHERE true\n",
+            "xc.sql": "UPDATE users SET a=1 /*!99999 WHERE id=1 */\n",
+            "hash.sql": "UPDATE users SET a=1 # WHERE id=1\n",
+            "upd.sql": "UPDATE users SET a=1\n",
+        }
+        for name, body in files.items():
+            self.put(name, body)
+        P, M = "psql -h prod-db.example.com ", "mysql -h prod-db.example.com "
+        D1 = "wrangler d1 execute prod-db --remote "
+        for cmd in (M + '-e "UPDATE users SET a=1 # WHERE id=1"', M + "< hash.sql",
+                    P + "-c \"UPDATE users SET a='x\\' -- ' WHERE id=1\"", P + "-f bs.sql",
+                    D1 + "--command \"UPDATE users SET a='x\\' -- ' WHERE id=1\"", M + "< nest.sql",
+                    D1 + "--file nest.sql", P + "-f dq.sql", P + "-f arr.sql", M + "< xc.sql",
+                    P + '-c "UPDATE users SET a=1 /*! WHERE id=1 */"', P + "-v x=\\' -f upd.sql",
+                    P + "-v 'x=\"' -f upd.sql"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.verdict(self.ev(cmd)), "deny", cmd)
+        for sql in ("UPDATE users SET a='x\\' -- ' WHERE id=1", "UPDATE users SET a=1 /*! WHERE id=1 */"):
+            with self.subTest(sql=sql):
+                ev = {"tool_name": "mcp__cf__d1_database_query", "tool_input": {"database_id": "abc", "sql": sql}}
+                self.assertEqual(self.verdict(ev), "deny")
+
+    def test_upserts_ctes_and_joins_with_a_where_stay_allowed(self):
+        P = 'psql -h prod-db.example.com -c "%s"'
+        for sql in ("INSERT INTO t (id, a) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET a = 2",
+                    "WITH x AS (UPDATE t SET a = 1 WHERE id = 1 RETURNING id) SELECT * FROM x",
+                    "UPDATE t1 JOIN t2 ON t1.id = t2.id SET t1.a = 1 WHERE t2.b = 2",
+                    "UPDATE users SET a=1 WHERE id=1"):
+            with self.subTest(sql=sql):
+                self.assertFalse(pdg.destructive_match(sql), sql)
+                self.assertAllowed(P % sql)
+        ev = {"tool_name": "mcp__cf__d1_database_query",
+              "tool_input": {"database_id": "abc", "sql": "INSERT INTO t VALUES (1) ON CONFLICT (id) DO UPDATE SET a=2"}}
+        self.assertEqual(self.verdict(ev), "allow")
+        for sql in ("WITH x AS (UPDATE t SET a = 1 RETURNING id) SELECT * FROM x WHERE true",
+                    "UPDATE t SET a = 1 RETURNING (SELECT 1 WHERE true)",
+                    "WITH a AS (UPDATE t SET x=1 WHERE id=1), b AS (UPDATE t SET x=2) SELECT 1"):
+            with self.subTest(sql=sql):
+                self.assertTrue(pdg.destructive_match(sql), sql)
+
+    def test_pathological_inputs_stay_linear(self):
+        import time as _time
+        cases = {
+            "update-words.sql": "-- " + "update " * 27000 + ";\nUPDATE users SET a=1;\n",
+            "exec-open.sql": "/*!" * 60000 + "\n",
+            "comment-open.sql": "/*" * 90000 + "\n",
+        }
+        for name, body in cases.items():
+            self.put(name, body)
+            with self.subTest(name=name):
+                start = _time.monotonic()
+                self.verdict(self.ev("psql -h prod-db.example.com -f %s" % name))
+                self.verdict(self.ev("psql -h localhost -f %s" % name))
+                self.assertLess(_time.monotonic() - start, 8.0, name)
+
+    def test_ssh_routes_that_still_reached_prod(self):
+        cfg = self.put("cfg", "Host db1\n  HostName prod-db.example.com\n")
+        self.put("big", "Host *\n  HostName 192.0.2.1\n" + ("#" * 80 + "\n") * 900)
+        self.put("lines", "\n" * 4100 + "Host db1\n  HostName prod-db.example.com\n")
+        inc = self.work / "inc"
+        inc.mkdir()
+        for k in range(16):
+            (inc / ("a%02d" % k)).write_text("Host other%d\n  User x\n" % k)
+        (inc / "z99").write_text("Host db1\n  HostName prod-db.example.com\n")
+        self.put("cfg_inc", "Include %s/*\n" % inc)
+        self.ssh_home("Host db1\n  HostName prod-db.example.com\n")
+        verb = "DEL" + "ETE FROM users"
+        for cmd in ('ssh x1 -o HostName=prod-db.example.com psql -c "%s"',
+                    'ssh -tF %s db1 psql -c "%%s"' % cfg, 'ssh -qoHostName=prod-db.example.com x1 psql -c "%s"',
+                    'ssh -F big x1 psql -c "%s"', 'ssh -F lines db1 psql -c "%s"', 'ssh ssh://db1 psql -c "%s"',
+                    'ssh ssh://someone@db1:22 psql -c "%s"', 'ssh -F cfg_inc db1 psql -c "%s"',
+                    'ssh db1 -F %s psql -c "%%s"' % cfg, 'ssh -F missing.cfg x1 psql -c "%s"',
+                    "ssh " + "-q " * 300 + 'prod-db psql -c "%s"'):
+            with self.subTest(cmd=cmd[:60]):
+                self.assertEqual(self.verdict(self.ev(cmd % verb)), "deny")
+        self.assertEqual(self.verdict(self.ev('ssh dev2 psql -c "%s"' % verb)), "allow")
+        self.assertEqual(self.verdict(self.ev('ssh -t dev2 -o BatchMode=yes psql -c "%s"' % verb)), "allow")
+
+    def test_a_config_reader_error_keeps_the_literal_target(self):
+        self.put("nul.cfg", "Include /tmp/a\x00/*\n")
+        result = pdg.evaluate(self.ev('ssh -F nul.cfg prod-db psql -c "%s"' % ("DEL" + "ETE FROM users")),
+                              home=str(self.home))
+        self.assertEqual(result[0], "deny")
+        self.assertIn("prod-db", result[1])
+
+    def ssh_home(self, text):
+        (self.home / ".ssh").mkdir(exist_ok=True)
+        (self.home / ".ssh/config").write_text(text)
 
 
 if __name__ == "__main__":
