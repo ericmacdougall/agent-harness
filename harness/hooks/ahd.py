@@ -346,6 +346,11 @@ def liveness_alerts(owner_docs: dict, policy: dict) -> dict:
             sev = LIVENESS_SEVERITY.get(r.get("state"))
             if not sev or r.get("owner") is not True:  # ahd only raises rows ah marks as owners
                 continue
+            # same rule as `ah owners` undisposed: a live disposition (named wait, resume, closed, reassignment to a
+            # live owner) excuses the row unless ah still marks it decision_required
+            disp = r.get("disposition")
+            if isinstance(disp, dict) and disp.get("live") is True and r.get("decision_required") is not True:
+                continue
             idle = r.get("idle_s") if isinstance(r.get("idle_s"), int) else None
             if sev == "high" and idle is not None and idle >= crit:
                 sev = "critical"
@@ -404,6 +409,22 @@ def ask_alerts(asks: list, policy: dict, ts: float) -> dict:
     return out
 
 
+def deadline_alerts(owner_docs: dict, ts: float) -> dict:
+    """G3: deadline:<id>:due (warning, within 1 h) and deadline:<id>:missed (high, stop_block) from `ah owners`."""
+    out = {}
+    for session, doc in sorted(owner_docs.items()):
+        for d in (doc or {}).get("deadlines") or []:
+            if not isinstance(d, dict) or d.get("state") not in ("due", "missed"):
+                continue
+            sev = "high" if d["state"] == "missed" else "warning"
+            out[f"deadline:{d['id']}:{d['state']}"] = {
+                "severity": sev, "class": "deadline", "kind": "deadline", "subject": d["id"], "since": int(d.get("due") or ts),
+                "message": f"deadline {d['state']} {d.get('due_iso')} for {d.get('ref')} (owner {d.get('owner')}): {str(d.get('note') or '')[:120]}",
+                "detail": {"session": session[:8], "deadline": d["id"], "ref": d.get("ref"), "owner": d.get("owner"),
+                           "stop_block": d["state"] == "missed"}}
+    return out
+
+
 def wal_ask_alerts(pending: list, ts: float) -> dict:
     """P16 (goodqa#14791 I16): open WAL asks escalate on the bounded schedule in ask_reminders: stage 0 info,
     stage 1 warning, stage 2+ high, so the ring (transitions on severity rise), the prompt context and the digest
@@ -420,6 +441,53 @@ def wal_ask_alerts(pending: list, ts: float) -> dict:
                                      "message": f"ask {a['id']} awaits the user (reminder {stage + 1}): {a.get('text', '')}"[:300],
                                      "detail": {"ask": a["id"], "session": a.get("session"), "stage": stage,
                                                 "stop_block": False}}
+    return out
+
+
+def current_sessions(sessions: list, policy: dict, ts: float) -> set:
+    """8-char ids of main sessions whose WAL moved within ask_current_window_seconds: their asks alert one by one."""
+    window = policy.get("ask_current_window_seconds", 3600)
+    out = set()
+    for s in sessions:
+        try:
+            if ts - os.lstat(home() / ".claude" / "wals" / s / "main.jsonl").st_mtime <= window:
+                out.add(s[:8])
+        except OSError:
+            continue
+    return out
+
+
+def ask_digest(flags: dict, current: set, ts: float, policy: dict = None) -> dict:
+    """Keep individual ask alerts for WAL asks from a current session, WAL asks younger than ask_individual_age_seconds
+    (default 3 h, past the last ask_reminders severity step, so P16 escalation still raises per ask), and the ledger
+    error. Fold every other ask alert into one ask:digest per host at the highest folded severity.
+    A folded ask is still open: its own key clears but the digest counts it and lists up to 8 ids; the clear of an
+    ask:<id>:due key therefore means "folded or answered", and `ah`/provenance asks remain the record.
+    Trade-off: once the digest is high, a newly folded ask changes only its count and text, refreshed under the
+    plan_transitions rate limit; it is not a fresh raise."""
+    young = (policy or {}).get("ask_individual_age_seconds", 3 * 3600)
+    out, folded = {}, []
+    for k, f in flags.items():
+        d = f.get("detail") or {}
+        if k == "ask:ledger:error" or d.get("session") in current or (
+                f.get("kind") == "ask-due" and ts - (f.get("since") or 0) < young):
+            out[k] = f
+        else:
+            folded.append((k, f))
+    if folded:
+        kinds = {}
+        for k, _ in folded:
+            kind = k.rsplit(":", 1)[-1]
+            kinds[kind] = kinds.get(kind, 0) + 1
+        sev = max((f["severity"] for _, f in folded), key=lambda v: SEV.get(v, 0))
+        ids = sorted({str((f.get("detail") or {}).get("ask") or f.get("subject")) for _, f in folded})
+        out["ask:digest"] = {
+            "severity": sev, "class": "ask", "kind": "ask", "subject": "digest",
+            "since": int(min((f.get("since") or ts) for _, f in folded)),
+            "message": (f"{len(ids)} open ask(s) outside the current session ("
+                        + ", ".join(f"{n} {kind}" for kind, n in sorted(kinds.items())) + "): "
+                        + ", ".join(ids[:8]) + (" ..." if len(ids) > 8 else ""))[:300],
+            "detail": {"asks": len(ids), "kinds": kinds, "stop_block": False}}
     return out
 
 
@@ -585,8 +653,10 @@ class Daemon:
         events = read_ring()
         desired = {}
         desired.update(liveness_alerts(docs, self.policy))
-        desired.update(ask_alerts(asks, self.policy, ts))
-        desired.update(wal_ask_alerts(pending, ts))
+        ask_flags = dict(ask_alerts(asks, self.policy, ts))
+        ask_flags.update(wal_ask_alerts(pending, ts))
+        desired.update(ask_digest(ask_flags, current_sessions(sessions, self.policy, ts), ts, self.policy))
+        desired.update(deadline_alerts(docs, ts))
         desired.update(ring_wrap_alert(events, ts, self.host))
         desired.update(wal_unsafe_alerts(blocked, ts))
         ring = ring_state(events, SOURCE, self.host)
@@ -601,21 +671,22 @@ class Daemon:
         if bad & {"sessions", "owners"}:
             hold |= {k for k in ring if k.startswith("liveness:") and k not in desired}
         if "asks" in bad or any("error" in a for a in asks):
-            hold |= {k for k in ring if k.startswith("ask:") and k not in desired}
+            # the digest is built from partial data then: hold it too, never lower or rewrite it on missing data
+            hold |= {k for k in ring if k.startswith("ask:") and (k not in desired or k == "ask:digest")}
         plan = plan_transitions(desired, ring, frozenset(hold), now=ts)
         sent = step("alerts", lambda: self.send(plan, deadline)) or 0
         step("spool", lambda: self.call("spool drain", [], deadline))
         summary.update(sessions=len(sessions), owners=sum(len((d or {}).get("owners") or []) for d in docs.values()),
                        asks_open=sum(1 for a in asks if a.get("state") in OPEN_STATES),
                        wal_asks_open=len(pending), desired=len(desired), transitions=len(plan), sent=sent,
-                       unowned=sorted(k for k in desired if k.endswith(":unowned")),
+                       unowned=sorted(k for k in ask_flags if k.endswith(":unowned")),  # before folding
                        dropped=sorted(k for k, f in desired.items() if (f.get("detail") or {}).get("state") == "DROPPED"),
                        silent=sorted(k for k, f in desired.items()
                                      if (f.get("detail") or {}).get("state") in ("SILENT", "SILENT-HIGH")),
                        wall_s=round(mono() - mt, 3))
         if summary["skipped"]:
             log.warning("tick %s over budget; skipped %s", self.tick_no, ",".join(summary["skipped"]))
-        self.last = {"summary": summary, "desired": desired, "wal_asks": pending}
+        self.last = {"summary": summary, "desired": desired, "wal_asks": pending, "ask_flags": ask_flags}
         return summary
 
     def run_checks(self, deadline: float):
@@ -641,7 +712,7 @@ class Daemon:
     def owner_docs(self, sessions: list, deadline: float) -> dict:
         docs = {}
         for s in sessions:
-            rc, doc = self.call("owners", ["--session", s], deadline)
+            rc, doc = self.call("owners", ["--session", s, "--all"], deadline)  # ahd needs every row, not the recent view
             if rc == 0 and isinstance(doc, dict) and isinstance(doc.get("owners"), list):
                 docs[s] = doc
         return docs
@@ -866,7 +937,7 @@ def main(argv=None) -> int:
         out = {"summary": {k: v for k, v in s.items() if k not in ("unowned", "dropped", "silent")},
                "dropped": [d.last["desired"][k]["message"] for k in s["dropped"]],
                "silent": [d.last["desired"][k]["message"] for k in s["silent"]],
-               "unowned": [d.last["desired"][k]["message"] for k in s["unowned"]],
+               "unowned": [d.last["ask_flags"][k]["message"] for k in s["unowned"]],
                "waiting_on_user": [f"{w['id']} ({w['session']}): {w['text']}" for w in d.last["wal_asks"]],
                "would_write": d.dry_writes}
         print(json.dumps(out, indent=1))

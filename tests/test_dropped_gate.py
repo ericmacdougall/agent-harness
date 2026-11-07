@@ -42,8 +42,13 @@ class Base(unittest.TestCase):
         self.home = Path(self.tmp.name)
         self.addCleanup(self.tmp.cleanup)
         p = mock.patch.dict(os.environ, {"AH_HOME": str(self.home), "HOME": str(self.home)})
+        clock = mock.patch.object(ah, "server_now", side_effect=lambda: iso(NOW))  # the writer clock, pinned in-process only
+        clock.start()
+        self.addCleanup(clock.stop)
         p.start()
         self.addCleanup(p.stop)
+        for k in ("CLAUDE_CODE_CHILD_SESSION", "AH_AGENT_ID", "AGENT_ID"):  # the runner may itself be a sub-agent;
+            os.environ.pop(k, None)  # patch.dict restores them. Tests act as main unless they set an identity.
         w = self.home / ".claude" / "wals" / SESSION
         jl(w / "main.jsonl", [
             {"at": iso(NOW - 9000), "event": "subagent", "agent_id": "dropowner", "agent_type": "task-owner"},
@@ -151,7 +156,13 @@ class GateTests(Base):
     def test_closed_needs_reason_and_evidence_and_is_permanent(self):
         with self.assertRaises(ah.AhError):
             self.dispose("closed", "disp-closed-bad", reason="done enough")
-        self.dispose("closed", "disp-closed-ok", reason="superseded by #14800", evidence="GoodQA goodqa#14800")
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [
+            {"at": iso(NOW - 60), "event": "deploy", "id": "wde000000001", "note": "DEPLOYED app v1.2.0 for dropowner"},
+            {"at": iso(NOW - 30), "event": "check", "id": "wlt000000001",
+             "note": "REALLY_TESTED DG-LIVE-1: dropowner verified live on https://app.example: pass"}])
+        self.dispose("closed", "disp-closed-ok", reason="verified dropowner's v1.2.0 deploy serves and passes live",
+                     deployed="wde000000001", live_test="DG-LIVE-1")
         self.assertEqual(self.stop(now=NOW + 10 * 86400), {})
 
     def test_reassigned_is_live_only_while_the_replacement_is(self):
@@ -178,6 +189,116 @@ class GateTests(Base):
         out = dropped_gate.cmd_stop(payload, now=NOW)
         self.assertNotEqual(out.get("decision"), "block")
         self.assertIn("dropowner", out.get("systemMessage", ""))
+
+
+class ReassignInheritsTargetWait(Base):
+    """goodqa#14791 repeat defect (3x on 2026-11-06): a mission owner that pauses into a named wait is DROPPED to
+    `ah owners`; items reassigned to it flipped back to DROPPED and blocked Stop. A reassignment must inherit the
+    target's live disposition, bounded by that disposition's own expiry."""
+
+    def add_target(self, name="waitowner"):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 9000), "event": "subagent", "agent_id": name, "agent_type": "task-owner"},
+                              {"at": iso(NOW - 200), "event": "subagent_stop", "agent_id": name, "agent_type": "task-owner"}])
+        jl(w / ("agent-%s.jsonl" % name), [{"at": iso(NOW - 4000), "event": "intent", "note": "paused"}])
+
+    def wait(self, agent, key, until, ref="wa5b00000001"):
+        return ah.write(self.home, "task.dispose", {"agent": agent, "session": SESSION, "kind": "waiting", "at": iso(NOW),
+                                                    "until": iso(until), "ref": ref}, SESSION, key)
+
+    def test_reassigned_to_a_target_in_a_live_named_wait_holds(self):
+        self.add_target()
+        self.wait("waitowner", "key-tw-1-0000", NOW + 3600)
+        self.dispose("reassigned", "key-tw-r1-0000", ref="waitowner")
+        by = {r["agent_id"]: r for r in self.owners()["owners"]}
+        self.assertEqual(by["waitowner"]["state"], "DROPPED")  # the target itself is excused only by its wait
+        self.assertEqual(self.owners()["undisposed"], [])
+        self.assertEqual(self.stop(), {})
+
+    def test_inherited_wait_expires_with_the_targets_wait(self):
+        self.add_target()
+        self.wait("waitowner", "key-tw-2-0000", NOW + 3600)
+        self.dispose("reassigned", "key-tw-r2-0000", ref="waitowner")
+        later = NOW + 3601
+        self.assertEqual(self.owners(now=later)["undisposed"], ["dropowner", "waitowner"])
+        self.assertEqual(self.stop(now=later).get("decision"), "block")
+
+    def test_reassigned_to_a_dropped_target_without_a_decision_still_blocks(self):
+        self.add_target()
+        self.dispose("reassigned", "key-tw-r3-0000", ref="waitowner")
+        self.assertIn("dropowner", self.owners()["undisposed"])
+
+    def test_reassignment_cycle_does_not_excuse_either_owner(self):
+        self.add_target()
+        self.dispose("reassigned", "key-tw-r4-0000", ref="waitowner")
+        ah.write(self.home, "task.dispose", {"agent": "waitowner", "session": SESSION, "kind": "reassigned",
+                                             "at": iso(NOW), "ref": "dropowner"}, SESSION, "key-tw-r4b-0000")
+        self.assertEqual(self.owners()["undisposed"], ["dropowner", "waitowner"])
+
+    def test_chain_through_a_reassigned_target_reaches_the_live_wait(self):
+        self.add_target("waitowner")
+        self.add_target("middle")
+        self.wait("waitowner", "key-tw-5-0000", NOW + 3600)
+        ah.write(self.home, "task.dispose", {"agent": "middle", "session": SESSION, "kind": "reassigned",
+                                             "at": iso(NOW), "ref": "waitowner"}, SESSION, "key-tw-r5b-0000")
+        self.dispose("reassigned", "key-tw-r5-0000", ref="middle")
+        self.assertEqual(self.owners()["undisposed"], [])
+
+    def add_done_target(self, name="doneowner"):
+        """A target that stopped after a result note: `ah owners` shows it as done, not DROPPED."""
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 9000), "event": "subagent", "agent_id": name, "agent_type": "task-owner"},
+                              {"at": iso(NOW - 200), "event": "subagent_stop", "agent_id": name, "agent_type": "task-owner"}])
+        jl(w / ("agent-%s.jsonl" % name), [{"at": iso(NOW - 4000), "event": "result", "note": "slice done; waiting on goodqa#14883"}])
+
+    def test_reassigned_to_a_done_target_in_a_live_named_wait_holds(self):
+        """Main's repro 2026-11-06 (pet-leads-x -> a9830089): target state done + live waiting disposition."""
+        self.add_done_target()
+        self.wait("doneowner", "key-tw-6-0000", NOW + 3600, ref="GoodQA goodqa#14883")
+        self.dispose("reassigned", "key-tw-r6-0000", ref="doneowner")
+        by = {r["agent_id"]: r for r in self.owners()["owners"]}
+        self.assertEqual(by["doneowner"]["state"], "done")  # the fixture really has the repro shape
+        self.assertTrue(by["dropowner"]["disposition"]["live"])
+        self.assertNotIn("dropowner", self.owners()["undisposed"])
+
+    def test_reassigned_to_a_done_target_without_a_live_decision_still_blocks(self):
+        self.add_done_target()
+        self.dispose("reassigned", "key-tw-r7-0000", ref="doneowner")
+        self.assertIn("dropowner", self.owners()["undisposed"])
+        self.wait("doneowner", "key-tw-7-0000", NOW + 60, ref="GoodQA goodqa#14883")
+        self.assertIn("dropowner", self.owners(now=NOW + 61)["undisposed"])  # the inherited wait expires with it
+
+    def test_stale_resumed_on_a_done_target_does_not_cover(self):
+        """PR #107 review F1: `resumed` stays live forever once later activity exists; a target that resumed, then
+        finished, holds no wait and must not excuse work reassigned to it."""
+        self.add_done_target()
+        ah.write(self.home, "task.dispose", {"agent": "doneowner", "session": SESSION, "kind": "resumed",
+                                             "at": iso(NOW - 5000)}, SESSION, "key-tw-8-0000")
+        self.dispose("reassigned", "key-tw-r8-0000", ref="doneowner")
+        by = {r["agent_id"]: r for r in self.owners()["owners"]}
+        self.assertEqual(by["doneowner"]["state"], "done")
+        self.assertIn("dropowner", self.owners()["undisposed"])
+
+    def test_closed_done_target_does_not_cover_a_later_reassignment(self):
+        """Was "covers by design" (PR #107). The PR review of 24a786c (F1) showed that a permanent disposition on the
+        target excused any later reassignment with none of the dispose guard's checks; main decided such a reassignment
+        is not covered (goodqa#14791)."""
+        self.add_done_target()
+        # The dispose guard: `closed` means deployed live and tested, both naming this owner (docs/ah-query-spec.md).
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [
+            {"at": iso(NOW - 120), "event": "deploy", "id": "wd00000000a1",
+             "note": "DEPLOYED goodqa-web 1a2b3c4d5e6f to production for doneowner"},
+            {"at": iso(NOW - 60), "event": "check", "id": "wc00000000a2",
+             "note": "REALLY_TESTED LIVE-DONE: doneowner checked live at https://app.goodqa.example/health: pass"}])
+        ah.write(self.home, "task.dispose", {"agent": "doneowner", "session": SESSION, "kind": "closed",
+                                             "at": iso(NOW), "deployed": "wd00000000a1", "live_test": "LIVE-DONE",
+                                             "reason": "doneowner shipped slice one; health check on production passed"},
+                 SESSION, "key-tw-9-0000")
+        self.dispose("reassigned", "key-tw-r9-0000", ref="doneowner")
+        undisposed = self.owners()["undisposed"]
+        self.assertIn("dropowner", undisposed)
+        self.assertNotIn("doneowner", undisposed)
 
 
 class SubagentStopGate(Base):
@@ -341,9 +462,10 @@ class TaskWalOwners(Base):
         self.assertIn(f"liveness:{SESSION[:8]}/agent-auto-9f2c1a", out)
 
     def dispose_task(self, name):
-        return ah.write(self.home, "task.dispose", {"agent": name, "session": SESSION, "kind": "closed", "at": iso(NOW),
-                                                    "reason": "review delivered elsewhere", "evidence": "GoodQA goodqa#14791"},
-                        SESSION, "disp-task-" + name)
+        with mock.patch.object(ah, "_ticket_exists", return_value=True):
+            return ah.write(self.home, "task.dispose", {"agent": name, "session": SESSION, "kind": "superseded", "at": iso(NOW),
+                                                        "reason": f"the {name} review moved to the delta reviewer agent",
+                                                        "ref": "GoodQA goodqa#14791"}, SESSION, "disp-task-" + name)
 
     def test_scan_wrapper_exit_code_follows_the_gate(self):
         """The wrapper runs `ah owners --gate` in a subprocess on the real clock, so this fixture uses real time."""
@@ -361,8 +483,10 @@ class TaskWalOwners(Base):
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         doc = json.loads(p.stdout)
         self.assertEqual([u["agent"] for u in doc["sessions"][0]["undisposed"]], ["realdrop"])
-        ah.write(self.home, "task.dispose", {"agent": "realdrop", "session": sess, "kind": "closed", "at": iso(real),
-                                             "reason": "superseded in test", "evidence": "GoodQA goodqa#14791"}, sess, "disp-realdrop-01")
+        with mock.patch.object(ah, "_ticket_exists", return_value=True):
+            ah.write(self.home, "task.dispose", {"agent": "realdrop", "session": sess, "kind": "wontdo", "at": iso(real),
+                                                 "reason": "the scan fixture owner exists only to exercise the wrapper",
+                                                 "ref": "GoodQA goodqa#14791"}, sess, "disp-realdrop-01")
         p = subprocess.run([sys.executable, "-I", str(scan), "--session", sess, "--text"], capture_output=True, text=True, env=env, timeout=120)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("gate clear", p.stdout)

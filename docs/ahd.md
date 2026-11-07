@@ -15,7 +15,7 @@ The tick has a wall-time budget of 45 s. Each `ah` call gets the remaining budge
 |---|---|---|
 | heartbeat | the deadman input | `ah heartbeat beat --service ahd` |
 | checks | `ops_watch.checks.run_all`, once ops-watch exposes it; until then the ops-watch timer runs (never both) | `ah alert raise\|clear` |
-| owners | `ah owners --session S` for each session whose main WAL moved in the last 48 h; the liveness rule lives in `liveness.py` (ah) | — (read) |
+| owners | `ah owners --session S --all` (every row; the CLI default view hides old terminal rows since 2026-11-06, so ahd and ah.py must be installed together) for each session whose main WAL moved in the last 48 h; the liveness rule lives in `liveness.py` (ah) | — (read) |
 | asks | the v1 ledger `~/.agent-harness/work-assignments.json` (JSON, read-only), and `ask` WAL entries with no `ask_resolved`. The #14465 ledger replaces v1 via `work_assignments.py status --json` once installed | — (read) |
 | alerts | diff the desired ahd alerts against this host's active `source=ahd` entries in the ring (read-only); raise new or escalated alerts, clear resolved ones. More than 10 transitions go in one `ah apply --batch -` | `ah alert raise\|clear` |
 | spool | drain queued writes (GoodQA) | `ah spool drain` |

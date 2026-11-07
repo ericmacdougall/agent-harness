@@ -47,7 +47,7 @@ def main(argv=None) -> int:
     targets = [a.session] if a.session else sessions(home, a.window_hours * 3600)
     report, rc = [], 0
     for s in targets:
-        p = subprocess.run([sys.executable, "-I", str(ah_path()), "owners", "--session", s, "--gate"],
+        p = subprocess.run([sys.executable, "-I", str(ah_path()), "owners", "--session", s, "--gate", "--all"],
                            capture_output=True, text=True, timeout=120)
         head = p.stdout.split("\nGATE:")[0]
         try:

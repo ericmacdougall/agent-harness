@@ -81,7 +81,8 @@ def waiting_on(note: str):
 OWNER_TYPES = ("task-owner",)
 
 
-DISPOSITIONS = ("resumed", "reassigned", "waiting", "closed")
+DISPOSITIONS = ("resumed", "reassigned", "waiting", "closed", "legacy", "superseded", "wontdo")
+CLOSING = ("closed", "superseded", "wontdo")  # end an owner; only "closed" means done (deployed live and tested)
 RESUMED_GRACE_S = 30 * 60  # a "resumed" disposition must be followed by activity within this window
 
 
@@ -91,19 +92,34 @@ def disposition_live(disp: dict | None, now: float, last_activity: float = 0.0, 
     resumed     live only while activity follows it: within RESUMED_GRACE_S of its time, or any activity after it
     reassigned  live while the replacement agent is live (the caller resolves that)
     waiting     live until its `until` time (epoch seconds); it must cite an ask id or a ticket (checked at write)
-    closed      permanent
+    closed      permanent: done, deployed to live and tested (ah checks both records at write)
+    superseded  permanent, not done: the scope moved elsewhere; cites a ticket
+    wontdo      permanent, not done: nobody will do it; cites a ticket
+    legacy      permanent, not done: quiet before the gate was installed and unverified; `ah owners` keeps listing it
     """
     if not isinstance(disp, dict) or disp.get("kind") not in DISPOSITIONS:
         return False
     at = float(disp.get("at") or 0.0)
     kind = disp["kind"]
-    if kind == "closed":
+    if kind in ("closed", "legacy", "superseded", "wontdo"):
         return True
     if kind == "waiting":
         return now < float(disp.get("until") or 0.0)
     if kind == "reassigned":
         return bool(replacement_live)
     return (last_activity > at) or (now - at < RESUMED_GRACE_S)
+
+
+NOTE_WAIT_MAX_S = 24 * 3600  # a "waiting on <x>" WAL note holds at most this long after it was written (round 5,
+# MJ-1). liveness cannot confirm a ticket exists, so every note wait gets the unconfirmed cap; a longer wait is an
+# `ah task dispose --kind waiting`, which checks the ask or ticket and allows up to 7 days.
+
+
+def note_wait(note: str, note_at: float, now: float):
+    """waiting_on(note) while the note is younger than NOTE_WAIT_MAX_S; None once it has expired."""
+    if not note_at or now - note_at >= NOTE_WAIT_MAX_S:
+        return None
+    return waiting_on(note)
 
 
 TASK_ABANDON_S = 6 * 3600  # a task-named WAL (no process behind it) silent this long without a terminal note is DROPPED
@@ -116,7 +132,7 @@ def classify_task_wal(now: float, last_at: float, outcome: str | None, last_note
         return {"state": "done", "idle_s": idle, "severity": "info"}
     if outcome == "handoff":
         return {"state": "handoff", "idle_s": idle, "severity": "info"}
-    wait = waiting_on(last_note)
+    wait = note_wait(last_note, last_at, now)
     if wait:
         return {"state": f"waiting-on-{wait}", "idle_s": idle, "severity": "info"}
     if idle >= TASK_ABANDON_S:
@@ -140,7 +156,7 @@ def classify(now: float, last_wal: float, transcript_mtime: float, stopped: bool
         elif outcome == "handoff":
             state = "handoff"
         else:
-            wait = waiting_on(last_note)
+            wait = note_wait(last_note, last_wal, now)  # the note is the last WAL entry
             if wait:
                 state = f"waiting-on-{wait}"
             else:

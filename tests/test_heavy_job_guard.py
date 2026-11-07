@@ -55,6 +55,78 @@ def decide(command, cwd=None, modes=None):
     return guard.decide(command, cwd, modes or MODES)
 
 
+class BigClone(unittest.TestCase):
+    """goodqa#14927 item 9: full copies of a large repository onto the Mac get a warning (never a denial) that names
+    worktrees, git archive, partial clones and dev2. Pack files are sparse here, so nothing large is written."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.big = self.repo("goodqa", 600 * 2 ** 20)
+        self.small = self.repo("tiny", 2 ** 20)
+        self.work = self.root / "work" / "sess"  # a search root with a clone named after the repo
+        self.work.mkdir(parents=True)
+        os.symlink(self.big, self.work / "goodqa-review")  # symlinks are not followed: only a real directory counts
+        shutil.copytree(self.big, self.work / "GoodQA-rt")  # sparse pack: copies cheaply
+
+    def repo(self, name, pack_size):
+        path = self.root / name
+        (path / ".git" / "objects" / "pack").mkdir(parents=True)
+        with open(path / ".git" / "objects" / "pack" / "pack-1.pack", "wb") as handle:
+            handle.truncate(pack_size)
+        return path
+
+    def judge(self, command, modes=None):
+        # The P12 copy rule (goodqa#14817) sizes GitHub and fleet sources over the network; pin both small so these
+        # tests judge only the big-clone advice, offline. Large remote sources are covered in test_heavy_copy.
+        with unittest.mock.patch.object(guard, "CLONE_SEARCH_ROOTS", (str(self.root / "work"),)), \
+                unittest.mock.patch.object(guard, "github_repo_bytes", lambda owner, repo: 50 * 2 ** 20), \
+                unittest.mock.patch.object(guard, "remote_path_size", lambda spec: 10 * 2 ** 20):
+            return decide(command, cwd=str(self.root), modes=modes)
+
+    def test_big_local_copies_warn_with_the_alternatives(self):
+        for command in (f"git clone {self.big} /tmp/goodqa-copy", f"git clone goodqa copy2", f"cp -R {self.big} /tmp/copy",
+                        f"git clone -b main --origin up {self.big} /tmp/copy5", f"git clone -q {self.big}",
+                        f"git clone --recurse-submodules {self.big} /tmp/copy6",
+                        f"cp -a goodqa/ copy3", f"rsync -a --delete {self.big}/ /tmp/copy4/", "mkdir -p y && cp -r goodqa y/"):
+            with self.subTest(command):
+                result = self.judge(command)
+                self.assertEqual((result["action"], result["rule"]), ("warn", "big-clone"), result)
+                for phrase in ("git worktree add", "git archive HEAD | tar -x", "--filter=blob:none", "dev2"):
+                    self.assertIn(phrase, result["message"])
+                self.assertIn("0.6 GB", result["detail"])
+
+    def test_remote_url_is_judged_by_an_existing_clone_of_that_name(self):
+        result = self.judge("git clone https://github.com/ericmacdougall/GoodQA.git")
+        self.assertEqual((result["action"], result["rule"]), ("warn", "big-clone"), result)
+        self.assertIn(str(self.work / "GoodQA-rt"), result["detail"])
+        self.assertEqual(self.judge("git clone git@github.com:someone/unknown-repo.git").get("action"), "allow")
+
+    def test_small_partial_remote_and_non_recursive_copies_are_allowed(self):
+        for command in (f"git clone {self.small} /tmp/t", f"cp -R {self.small} /tmp/t2", f"cp {self.big}/README.md /tmp/",
+                        f"git clone --filter=blob:none {self.big} /tmp/t3", f"git clone --depth 1 {self.big} /tmp/t4",
+                        f"rsync -a {self.big}/ dev2:/srv/goodqa/", f"rsync -a dev2:/srv/goodqa/ {self.big}/",
+                        f"git -C {self.big} status", f"ls {self.big}", f"git clone {self.root}/nonexistent /tmp/t5"):
+            with self.subTest(command):
+                self.assertEqual(self.judge(command).get("action"), "allow", command)
+
+    def test_big_clone_never_denies_whatever_the_mode_table_says(self):
+        strict = dict(guard.DEFAULT_MODES, **{"big-clone": "enforce"})
+        self.assertEqual(self.judge(f"cp -R {self.big} /tmp/copy", modes=strict)["action"], "warn")
+        off = dict(guard.DEFAULT_MODES, **{"big-clone": "off"})
+        self.assertEqual(self.judge(f"cp -R {self.big} /tmp/copy", modes=off)["action"], "allow")
+
+    def test_pack_bytes_follows_a_worktree_gitdir_pointer(self):
+        wt = self.root / "goodqa-wt"
+        wt.mkdir()
+        (self.big / ".git" / "worktrees" / "goodqa-wt").mkdir(parents=True)
+        (self.big / ".git" / "worktrees" / "goodqa-wt" / "commondir").write_text("../..\n")
+        (wt / ".git").write_text(f"gitdir: {self.big}/.git/worktrees/goodqa-wt\n")
+        self.assertEqual(guard.pack_bytes(str(wt)), 600 * 2 ** 20)
+        self.assertIsNone(guard.pack_bytes(str(self.root / "not-a-repo")))
+
+
 class Classification(unittest.TestCase):
     def test_ac1_io_probe_is_routed_but_never_blocked(self):
         result = decide(IO_COMMAND)
@@ -731,6 +803,15 @@ class BoundValidation(ScratchHome):
         done, ran = self.run_script("run_probe.py", base + ["--max-rss-gb", "1", "--timeout-s", "5"])  # control: valid runs
         self.assertEqual((done.returncode, ran), (0, True), done.stdout + done.stderr)
 
+    def test_invalid_default_rss_fraction_is_refused_before_spawn(self):
+        flags = ["--class", "hang", "--worst-case", "blocks indefinitely", "--timeout-s", "5"]
+        for bad in ("0", "nan", "inf", "-1", "not-a-number", "1e-300", "2"):
+            with self.subTest(value=bad), unittest.mock.patch.dict(os.environ, {"HARNESS_PROBE_RSS_FRACTION": bad}):
+                done, ran = self.run_script("run_probe.py", flags)
+                self.assertEqual(done.returncode, 2, (bad, done.stdout + done.stderr))
+                self.assertIn("REFUSED", done.stderr)
+                self.assertFalse(ran, ("probe ran", bad))
+
 
 class AbsurdBounds(ScratchHome):
     def test_finite_but_absurd_caps_are_refused(self):
@@ -890,8 +971,20 @@ class RunProbe(unittest.TestCase):
             self.assertIn("REFUSED", done.stderr)
             self.assertNotIn("ran", done.stdout)
 
+    # goodqa#14948 (2026-11-06): a test child must never be able to grow without bound. On the Mac the old `ps rss`
+    # measure missed compressed pages, the watchdog never fired, and the unbounded child reached 47 GB (jetsam, 92%
+    # swap). Every growing child here stops on its own at SELF_LIMIT_GB, so a broken watchdog costs at most that.
+    SELF_LIMIT_GB = 1.2
+
+    def skip_without_accurate_measure(self):
+        import run_capped
+        if not run_capped.accurate_memory_measure():
+            self.skipTest("SKIPPED, not passed: no accurate memory measure on this host (macOS phys_footprint unavailable)")
+
     def test_memory_bound_finding_for_dev_zero_style_probe(self):
-        code = "import time\nb=bytearray(1)\nwhile True:\n    b+=bytes(64*1024*1024)\n    time.sleep(0.02)\n"
+        self.skip_without_accurate_measure()
+        code = ("import time\nb=bytearray(1)\nfor _ in range(%d):\n    b+=bytes(64*1024*1024)\n    time.sleep(0.02)\n"
+                % int(self.SELF_LIMIT_GB * 16))
         done, data = self.probe(["--class", "memory", "--worst-case", "reads /dev/zero: unbounded memory growth",
                                  "--max-rss-gb", "0.5", "--timeout-s", "30"], code)
         self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
@@ -901,16 +994,53 @@ class RunProbe(unittest.TestCase):
         self.assertLess(data["observed"]["peak_rss_gb"], 3)
 
     def test_dev_zero_read_ends_as_a_memory_bound_finding(self):
-        """The real 2026-11-04 failure shape: a consumer that slurps /dev/zero with no bound."""
-        code = "f=open('/dev/zero','rb')\nb=bytearray()\nwhile True: b+=f.read(1<<26)\n"
+        """The real 2026-11-04 failure shape: a consumer that slurps /dev/zero. Failing-first on the old measure
+        (macOS): the child self-limits at SELF_LIMIT_GB, the runner saw rss under the bound and reported
+        bound-hit:time or completed; with phys_footprint it is bound-hit:memory near 0.5 GB."""
+        self.skip_without_accurate_measure()
+        code = "f=open('/dev/zero','rb')\nb=bytearray()\nfor _ in range(%d): b+=f.read(1<<26)\n" % int(self.SELF_LIMIT_GB * 16)
         started = time.time()
         done, data = self.probe(["--class", "memory", "--worst-case", "transcript_path=/dev/zero: unbounded memory growth",
-                                 "--max-rss-gb", "1", "--timeout-s", "20"], code)
+                                 "--max-rss-gb", "0.5", "--timeout-s", "20"], code)
         self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
         self.assertEqual(data["outcome"], "bound-hit:memory")
         self.assertLess(time.time() - started, 20)
-        self.assertLess(data["observed"]["peak_rss_gb"], 3)  # stopped near its 1 GB bound, not at 66 GB
+        self.assertLess(data["observed"]["peak_rss_gb"], 3)  # stopped near its 0.5 GB bound, not at 47 GB
+        # Failing-first on main 38edf1f on the Mac (probe-control.py, 2026-11-06): the ps-rss runner reported
+        # bound-hit:memory only after the child had finished growing, peak 1.186 GB on a 0.5 GB bound; with
+        # phys_footprint re-read every 50 ms the peak was 0.548 GB. Under memory pressure the old measure saw no
+        # growth at all (bound-hit:time at 47 GB, JetsamEvent-2026-11-06-164952).
+        self.assertLess(data["observed"]["peak_rss_gb"], 2 * 0.5)
         self.assertEqual(data["survivors"], 0)
+
+    def test_memory_probe_is_refused_without_an_accurate_measure(self):
+        """goodqa#14948: where the tree's memory cannot be measured, a memory probe is refused, never run unbounded."""
+        import run_probe
+        with unittest.mock.patch.object(run_probe.run_capped, "accurate_memory_measure", return_value=False), \
+                self.assertRaises(SystemExit) as stop:
+            run_probe.parse(["--class", "memory", "--worst-case", "reads /dev/zero: unbounded", "--max-rss-gb", "1",
+                             "--timeout-s", "5", "--", "true"])
+        self.assertEqual(stop.exception.code, 2)
+        with unittest.mock.patch.object(run_probe.run_capped, "accurate_memory_measure", return_value=True):
+            args = run_probe.parse(["--class", "memory", "--worst-case", "reads /dev/zero: unbounded", "--max-rss-gb", "1",
+                                    "--timeout-s", "5", "--", "true"])
+        self.assertEqual(args.max_rss_gb, 1)
+
+    @unittest.skipUnless(sys.platform == "darwin", "phys_footprint is a macOS measure")
+    def test_darwin_footprint_counts_a_childs_touched_pages(self):
+        import run_capped
+        self.assertTrue(run_capped.accurate_memory_measure())
+        child = subprocess.Popen([sys.executable, "-c", "import time\nb=bytearray(300<<20)\n"
+                                  "for i in range(0,len(b),4096): b[i]=1\ntime.sleep(4)"])
+        try:
+            time.sleep(1.5)
+            rows = [r for r in run_capped.snapshot() if r[0] == child.pid]
+            self.assertTrue(rows)
+            self.assertGreater(run_capped.footprint_kb(child.pid), 250 << 10)
+            self.assertGreater(run_capped.memory_kb(rows), 250 << 10)
+        finally:
+            child.wait()  # the child exits on its own after 4 s
+        self.assertIsNone(run_capped.footprint_kb(child.pid))
 
     def test_redteam_f6_every_class_gets_a_memory_bound(self):
         code = "b=bytearray(1)\nimport time\nwhile True:\n    b+=bytes(64<<20); time.sleep(0.02)\n"

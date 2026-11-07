@@ -31,6 +31,11 @@ ALLOWED_GIT_ENV = {
     'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_COMMITTER_DATE',
     'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT',
     'GIT_PAGER',
+    # Editors only run for interactive commits, rebases and merges, which the helpers never request (-m, --no-edit,
+    # --ff-only); agent hosts export them routinely (Claude Code sets GIT_EDITOR), and refusing them stranded
+    # deliveries with "Unsupported Git routing environment" (2026-11-06). Routing variables (GIT_DIR, GIT_WORK_TREE,
+    # GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY, GIT_CONFIG*, GIT_CEILING_DIRECTORIES ...) stay refused.
+    'GIT_EDITOR', 'GIT_SEQUENCE_EDITOR',
 }
 INSPECTION_CONFIG = ('-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false',
                      '-c', 'core.trustctime=true', '-c', 'core.checkStat=default',

@@ -537,7 +537,7 @@ class CredentialScriptTests(Base):
                 self.assertEqual(verdict, 'block', '%s: %s' % (delays, message))
 
     def test_a_padded_script_on_disk_cannot_hide_a_later_credential_script(self):
-        """Commands inside a script already on disk are judged only for log deletion, so they must not use up the credential
+        """Commands inside a script already on disk are judged only for log deletion and credential reads, so they must not use up the credential
         check's time either: the credential script after it is still refused."""
         slow = [self.write('x/slow%d.py' % i, b'print("hello")\n') for i in range(5)]
         padded = self.write('x/padded.sh', b'#!/bin/bash\n' + b''.join(b'python3 %s\n' % str(p).encode() for p in slow))

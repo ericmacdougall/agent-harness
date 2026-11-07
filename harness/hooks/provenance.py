@@ -986,7 +986,13 @@ def _resolve(source, ctx, depth, seen, result):
             try:
                 item_kind = parse_source(item)["kind"]
             except Problem as problem:
-                result["problems"].append({"code": problem.code, "message": "input: " + problem.message})
+                # Name the input: the generic "Source must start with ..." text read as if the whole `inferred:`
+                # source were malformed (main WAL w8d5f765ea4c, 2026-11-06).
+                message = ("is free text, not a source: each input after `from` must be user:, answer:, queue:, "
+                           "ticket:, wal: or file:, separated by ` ; `; the rationale goes after ` -- `"
+                           if problem.code == "bad-syntax" and problem.message.startswith("Source must start with")
+                           else problem.message)
+                result["problems"].append({"code": problem.code, "message": f"inferred input `{clip(item, 60)}` {message}"})
                 continue
             if item_kind == "inferred":
                 result["problems"].append({"code": "inferred-nested", "message": "inferred inputs must be user/ticket/file/wal sources"})

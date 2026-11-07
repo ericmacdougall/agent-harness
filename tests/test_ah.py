@@ -156,6 +156,72 @@ class OwnersTests(Base):
         self.assertEqual(by["helperfix"]["state"], "returned")  # helper without a WAL file: not a drop
         self.assertEqual(data["counts"]["DROPPED"], 2)
 
+    def test_cli_owners_accepts_text_after_the_subcommand_and_hides_old_terminal_rows(self):
+        """`ah owners --text` (the form CLAUDE.md and the skill use) was rejected because --text sat only on the
+        parent parser, and the default listing carried hundreds of helpers returned days ago. Default: live, recent
+        and non-terminal rows; --all restores everything; counts and undisposed always cover every row."""
+        self.make()
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 3 * 86400), "event": "subagent", "agent_id": "oldhelper", "agent_type": "fixer"},
+                              {"at": iso(NOW - 3 * 86400 + 60), "event": "subagent_stop", "agent_id": "oldhelper", "agent_type": "fixer"}])
+
+        def cli(*argv):
+            out = io.StringIO()
+            with mock.patch.object(ah.time, "time", return_value=NOW), contextlib.redirect_stdout(out):
+                rc = ah.main(list(argv))
+            return rc, out.getvalue()
+
+        rc, text = cli("owners", "--session", SESSION, "--text")
+        self.assertEqual(rc, 0, text)
+        self.assertNotIn('"owners"', text)  # a human summary, not JSON
+        self.assertIn("aliveowner", text)
+        self.assertIn("dropowner", text)  # DROPPED rows always show
+        self.assertIn("doneowner", text)  # done minutes ago: recent
+        self.assertNotIn("oldhelper", text)  # returned three days ago: hidden by default
+        self.assertIn("hidden", text)
+        rc, text = cli("owners", "--session", SESSION, "--all", "--text")
+        self.assertEqual(rc, 0, text)
+        self.assertIn("oldhelper", text)
+        rc, raw = cli("owners", "--session", SESSION)
+        data = json.loads(raw)
+        self.assertNotIn("oldhelper", {r["agent_id"] for r in data["owners"]})
+        self.assertEqual(data["hidden"], 1)
+        self.assertEqual(data["counts"]["returned"], 3)  # counts still cover every row (helperfix, gpother, oldhelper)
+        self.assertIn("gpowner", data["undisposed"])
+        rc, raw = cli("owners", "--session", SESSION, "--all")
+        self.assertIn("oldhelper", {r["agent_id"] for r in json.loads(raw)["owners"]})
+
+    def test_leftover_waiters_lists_the_retired_agents_live_wait_loops(self):
+        """A retired owner's leftover `until grep` waiters kept waking it (a full 580k-context reread each time,
+        2026-11-06). leftover_waiters lists live wait loops attributed to the agent (its id in the command line) or to
+        the session (CLAUDE_CODE_SESSION_ID in the process environment), never unrelated processes, bounded."""
+        agent = "a1234567890abcdef"
+        rows = [
+            (101, "02:15:03", f"bash -c until grep -q DONE /work/agent-{agent}/run.log; do sleep 60; done"),
+            (102, "00:05:00", "bash -c while pgrep -f '[v]itest run' >/dev/null; do sleep 30; done"),
+            (103, "01:00:00", "bash -c while true; do sleep 1; done"),
+            (104, "03:00:00", "node server.js"),
+            (105, "00:01:00", f"tail -f /work/agent-{agent}/run.log"),
+            (os.getpid(), "00:00:01", f"python3 ah.py task dispose --agent {agent} --kind reassigned until sleep"),
+        ]
+        session_of = {102: SESSION, 103: "other-session"}.get
+        found = ah.leftover_waiters(self.home, agent, SESSION, ps_rows=rows, session_of=session_of)
+        by_pid = {w["pid"]: w for w in found if w["kind"] == "process"}
+        self.assertEqual(sorted(by_pid), [101, 102])
+        self.assertEqual(by_pid[101]["scope"], "agent")
+        self.assertEqual(by_pid[102]["scope"], "session")
+        self.assertEqual(by_pid[101]["elapsed"], "02:15:03")
+        self.assertIn("until grep", by_pid[101]["command"])
+        # ah-run jobs attributed to the agent that have not ended count too
+        ledger = self.home / ".agent-harness" / "reserve" / "ledger"
+        ledger.mkdir(parents=True)
+        (ledger / "run-1.json").write_text(json.dumps({"agent": agent, "argv": ["sleep", "999"], "start": 1}))
+        (ledger / "run-2.json").write_text(json.dumps({"agent": agent, "argv": ["true"], "start": 1, "end": 2}))
+        (ledger / "run-3.json").write_text(json.dumps({"agent": "someoneelse", "argv": ["sleep", "999"], "start": 1}))
+        found = ah.leftover_waiters(self.home, agent, SESSION, ps_rows=[], session_of=lambda pid: None)
+        self.assertEqual([w["run"] for w in found if w["kind"] == "ah-run"], ["run-1"])
+        self.assertEqual(ah.leftover_waiters(self.home, "nobody", "nosession", ps_rows=rows, session_of=lambda pid: None), [])
+
     def test_discovers_agents_missing_from_main_wal(self):
         """Owners that never appear as subagent events in main.jsonl (general-purpose) are found from task WALs and meta files."""
         self.make()
@@ -429,8 +495,11 @@ class WriteTests(GoodQABase):
         self.assertIn("[review] ok so far", self.wal_rows("ownerx")[-1]["note"])
         self.assertEqual(len(FakeGoodQA.state["posted"]), 1)  # WAL and comment in one call
         wal = self.home / ".claude" / "wals" / SESSION / "main.jsonl"
-        jl(wal, [{"at": "2999-01-01T00:00:00Z", "event": "REALLY_TESTED", "id": "wq1", "note": "REALLY_TESTED t1: ran it"}])
-        d = ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"really_tested": "t1", "wal": str(wal)}]}, SESSION, "done-key-001")
+        jl(wal, [{"at": "2999-01-01T00:00:00Z", "event": "deploy", "id": "wde00000000a", "note": "DEPLOYED app v1.0.0 for ownerx"},
+                 {"at": "2999-01-01T00:00:01Z", "event": "REALLY_TESTED", "id": "wq1",
+                  "note": "REALLY_TESTED t1: ran it live on https://app.example"}])
+        d = ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"deployed": "wde00000000a"},
+                                                                         {"really_tested": "t1", "wal": str(wal)}]}, SESSION, "done-key-001")
         self.assertEqual(d["result"], "applied")
         self.assertEqual(self.wal_rows("ownerx")[-1]["event"], "result")
 
@@ -474,6 +543,7 @@ class WriteTests(GoodQABase):
         self.assertEqual(c.exception.code, "evidence")
 
     def test_done_with_real_commit(self):
+        """A real commit alone is merged, not live: done needs a deploy record and a live test (main WAL w07450081c12)."""
         self.reg()
         repo = self.home / "repo"
         repo.mkdir()
@@ -481,7 +551,14 @@ class WriteTests(GoodQABase):
         subprocess.run(["git", "init", "-q", str(repo)], check=True, env=env)
         subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "x"], check=True, env=env)
         sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
-        d = ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"commit": sha, "repo": str(repo)}]}, SESSION, "done-good-01")
+        with self.assertRaises(ah.AhError) as c:
+            ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"commit": sha, "repo": str(repo)}]}, SESSION, "done-good-01")
+        self.assertEqual(c.exception.code, "evidence")
+        wal = self.home / ".claude" / "wals" / SESSION / "main.jsonl"
+        jl(wal, [{"at": "2999-01-01T00:00:00Z", "event": "deploy", "id": "wde00000000b", "note": f"DEPLOYED app {sha[:12]} for ownerx"},
+                 {"at": "2999-01-01T00:00:01Z", "event": "result", "id": "wq2", "note": "REALLY_TESTED t1: live check passed"}])
+        d = ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"commit": sha, "repo": str(repo)}, {"deployed": "wde00000000b"},
+                                                                         {"really_tested": "t1", "wal": str(wal)}]}, SESSION, "done-good-02")
         self.assertEqual(d["result"], "applied")
 
     def test_unknown_task_and_bad_args_and_rejects_audited(self):
@@ -692,13 +769,19 @@ class WriterReview(WriteTests):
             ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"really_tested": "wother", "wal": str(other)}]},
                      SESSION, "ev-other-0001")
         self.assertEqual(c.exception.code, "evidence")
-        jl(wal, [{"at": "2000-01-01T00:00:00Z", "event": "result", "id": "wold", "note": "REALLY_TESTED t1: before the task existed"}])
+        jl(wal, [{"at": "2000-01-01T00:00:00Z", "event": "deploy", "id": "wde00000000d", "note": "DEPLOYED app v0.9.0 for ownerx"},
+                 {"at": "2000-01-01T00:00:01Z", "event": "result", "id": "wold",
+                  "note": "REALLY_TESTED t1: live, but before the task existed"}])
         with self.assertRaises(ah.AhError) as c:  # older than the register row proves nothing for this task
-            ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"really_tested": "t1", "wal": str(wal)}]},
+            ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"deployed": "wde00000000d"},
+                                                                         {"really_tested": "t1", "wal": str(wal)}]},
                      SESSION, "ev-old-00001")
+        self.assertIn("no REALLY_TESTED entry", str(c.exception))  # the registration-order rule, not a missing deploy
         self.assertEqual(c.exception.code, "evidence")
-        jl(wal, [{"at": "2999-01-01T00:00:00Z", "event": "result", "id": "wgood", "note": "REALLY_TESTED t1: ran it, exit 0"}])
-        ok = ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"really_tested": "t1", "wal": str(wal)}]},
+        jl(wal, [{"at": "2999-01-01T00:00:00Z", "event": "deploy", "id": "wde00000000c", "note": "INSTALLED harness v2.0.1 for ownerx"},
+                 {"at": "2999-01-01T00:00:01Z", "event": "result", "id": "wgood", "note": "REALLY_TESTED t1: ran it live, exit 0"}])
+        ok = ah.write(self.home, "task.done", {"task": "t1", "evidence": [{"deployed": "wde00000000c"},
+                                                                          {"really_tested": "t1", "wal": str(wal)}]},
                       SESSION, "ev-good-0001")
         self.assertEqual(ok["result"], "applied")
 
@@ -777,10 +860,17 @@ class WriterReview(WriteTests):
         (self.home / ".claude" / "wals" / SESSION).mkdir(parents=True, exist_ok=True)
         ah.write(self.home, "task.register", {"task": "t9", "owner_agent": "ownerx", "session": SESSION, "ticket": "GoodQA goodqa#77",
                                               "scope": "s", "source": "inferred: ok x", "worktree": str(repo)}, SESSION, "reg-wt-00001")
+        wal = self.home / ".claude" / "wals" / SESSION / "main.jsonl"
+        jl(wal, [{"at": "2999-01-01T00:00:00Z", "event": "deploy", "id": "wde00000000e", "note": "DEPLOYED app v3.0.0 for ownerx"},
+                 {"at": "2999-01-01T00:00:01Z", "event": "result", "id": "wq9", "note": "REALLY_TESTED t9: live probe ok"}])
+        live = [{"deployed": "wde00000000e"}, {"really_tested": "t9", "wal": str(wal)}]
         with self.assertRaises(ah.AhError) as c:  # a real commit, but in some other repository
-            ah.write(self.home, "task.done", {"task": "t9", "evidence": [{"commit": shas[1], "repo": str(other)}]}, SESSION, "done-wt-0001")
+            ah.write(self.home, "task.done", {"task": "t9", "evidence": [{"commit": shas[1], "repo": str(other)}] + live},
+                     SESSION, "done-wt-0001")
         self.assertEqual(c.exception.code, "evidence")
-        ok = ah.write(self.home, "task.done", {"task": "t9", "evidence": [{"commit": shas[0], "repo": str(other)}]}, SESSION, "done-wt-0002")
+        self.assertIn("not in the registered checkout", str(c.exception))
+        ok = ah.write(self.home, "task.done", {"task": "t9", "evidence": [{"commit": shas[0], "repo": str(other)}] + live},
+                      SESSION, "done-wt-0002")
         self.assertEqual(ok["result"], "applied")
 
     def test_m2_reregister_does_not_reassign(self):

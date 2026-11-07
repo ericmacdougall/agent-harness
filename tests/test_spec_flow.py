@@ -299,8 +299,8 @@ class SpecFlowCase(unittest.TestCase):
         self.assertEqual(code, 0, err)
         return spec
 
-    def attached(self):
-        spec = self.reviewed_spec()
+    def attached(self, text=SPEC):
+        spec = self.reviewed_spec(text)
         code, out, err = self.run_cli("attach", str(spec), "--actor", "agent:owner1")
         self.assertEqual(code, 0, err)
         return spec
@@ -657,8 +657,9 @@ class ClickTest(SpecFlowCase):
 
 
 class DoneGate(SpecFlowCase):
-    def complete(self, signer=("main1", "agent"), tester="ct1", commits=True, logs=True):
-        self.attached()
+    def complete(self, signer=("main1", "agent"), tester="ct1", commits=True, logs=True,
+                 url="https://app.goodqa.example", text=SPEC, click=True):
+        self.attached(text)
         self.repo_dir = self.tmp / "deployed"
         self.shas = git_repo(self.repo_dir, "feat: one", "feat: later")
         owner_wal = self.wal_dir / "agent-owner1.jsonl"
@@ -678,6 +679,16 @@ class DoneGate(SpecFlowCase):
             code, _, err = self.run_cli("evidence", "--ticket", "GoodQA harness#168", "--actor", "agent:owner1",
                                         "--ac", "AC-1", *extra)
             self.assertEqual(code, 0, err)
+        if not click:
+            tester = None
+        if tester:
+            DoneGate.click(self, tester, url)  # Hook reuses this fixture unbound
+        if signer:
+            code, _, err = self.run_cli("signoff", "--ticket", "GoodQA harness#168", "--actor", f"agent:{signer[0]}",
+                                        "--by", signer[0], "--kind", signer[1], "--source", "main review of #168")
+            self.assertEqual(code, 0, err)
+
+    def click(self, tester, url):
         self.wal(self.main_wal, {"at": "2026-11-04T05:00:00+00:00", "event": "subagent", "agent_id": tester,
                                  "agent_type": "click-tester"})
         report = self.tmp / "click.md"
@@ -685,14 +696,43 @@ class DoneGate(SpecFlowCase):
         self.wal(self.wal_dir / f"agent-{tester}.jsonl", {"at": "2026-11-04T05:01:00+00:00", "event": "result",
                                                     "note": "CLICK_TEST_REPORT sha256=" + hashlib.sha256(report.read_bytes()).hexdigest()})
         code, _, err = self.run_cli("click-test", "--ticket", "GoodQA harness#168", "--actor", "agent:owner1",
-                                    "--url", "http://127.0.0.1:3000", "--agent-id", tester, "--wal-dir",
+                                    "--url", url, "--agent-id", tester, "--wal-dir",
                                     str(self.wal_dir), "--repo", str(self.repo_dir), "--deployed-commit",
                                     self.shas[0], "--result", "pass", "--report", str(report))
         self.assertEqual(code, 0, err)
-        if signer:
-            code, _, err = self.run_cli("signoff", "--ticket", "GoodQA harness#168", "--actor", f"agent:{signer[0]}",
-                                        "--by", signer[0], "--kind", signer[1], "--source", "main review of #168")
-            self.assertEqual(code, 0, err)
+
+    def test_a_click_test_on_a_local_address_is_not_live(self):
+        """Done means deployed to live and tested (main WAL w07450081c12): a loopback click-test is a preview."""
+        self.complete(url="http://127.0.0.1:3000")
+        result = self.evaluate()
+        self.assertFalse(result["ready"])
+        self.assertTrue(any("not the live deployment" in m for m in result["missing"]), result["missing"])
+
+    def test_not_applicable_click_test_still_needs_a_live_test_of_the_deploy(self):
+        """No UI is no excuse: a not-applicable click-test needs a REALLY_TESTED run of the installed or deployed
+        version on the live target, cited as evidence."""
+        text = SPEC.replace("Click-test: required", "Click-test: not-applicable (a CLI tool with no UI surface)")
+        self.complete(text=text, click=False)
+        result = self.evaluate()
+        self.assertFalse(result["ready"])
+        self.assertTrue(any("live" in m and "not-applicable" in m for m in result["missing"]), result["missing"])
+        owner_wal = self.wal_dir / "agent-owner1.jsonl"
+        self.wal(owner_wal, {"at": "2026-11-04T06:00:00+00:00", "event": "check",
+                             "note": f"REALLY_TESTED RT9: installed v1.2.0 ({self.shas[0][:12]}) on dev2 and ran it live: exit 0"})
+        code, _, err = self.run_cli("evidence", "--ticket", "GoodQA harness#168", "--actor", "agent:owner1",
+                                    "--ac", "AC-1", "--really-tested", "RT9", "--wal", str(owner_wal))
+        self.assertEqual(code, 0, err)
+        result = self.evaluate()
+        self.assertTrue(result["ready"], result["missing"])
+
+    def test_a_live_test_note_that_says_it_was_not_live_does_not_count(self):
+        good = "REALLY_TESTED RT9: installed v1.2.0 on dev2 and ran it live: exit 0"
+        self.assertTrue(sf.live_deploy_test(good))
+        for bad in ("REALLY_TESTED RT9: installed v1.2.0 but not live yet; ran it in CI: exit 0",
+                    "REALLY_TESTED RT9: deployed v1.2.0 to staging https://staging.example.com: exit 0",
+                    "REALLY_TESTED RT9: installed v1.2.0 locally; production check pending: exit 0",
+                    "REALLY_TESTED RT9: released v1.2.0 to pre-prod https://app.example.com: exit 0"):
+            self.assertFalse(sf.live_deploy_test(bad), bad)
 
     def test_commits_and_execution_logs_are_required(self):
         self.complete(commits=False, logs=False)
@@ -1246,8 +1286,12 @@ class Install(unittest.TestCase):
         stops = [h for entry in settings["hooks"]["SubagentStop"] for h in entry["hooks"]]
         # The model ladder (tier_gate.py stop) is a second, separate SubagentStop hook; each must appear once.
         ladder = [h for h in stops if (h.get("args") or [""])[0].endswith("tier_gate.py")]
-        stops = [h for h in stops if h not in ladder]
+        dropped = [h for h in stops if (h.get("args") or [""])[0].endswith("dropped_gate.py")]  # goodqa#14791 I7
+        ported = [h for h in stops if (h.get("args") or [""])[0].endswith(("wal_cadence.py", "worktree_hygiene.py"))]
+        self.assertEqual(len(ported), 2)  # Hawkeye ports, goodqa#14908: one each
+        stops = [h for h in stops if h not in ladder and h not in dropped and h not in ported]
         self.assertEqual(len(ladder), 1)
+        self.assertEqual(len(dropped), 1)
         self.assertEqual(len(pre), 1)
         self.assertEqual((pre[0]["timeout"], pre[0]["onFailure"]), (60, "block"))
         self.assertEqual(len(stops), 1)

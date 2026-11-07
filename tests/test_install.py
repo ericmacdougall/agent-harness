@@ -136,7 +136,7 @@ class InstallerTests(unittest.TestCase):
         first = json.loads((self.claude / "settings.json").read_text())
         self.assertEqual(first["model"], "sonnet")
         self.assertEqual(first["permissions"]["deny"], ["Read(**/.env)"])
-        self.assertEqual(len(first["hooks"]["PreToolUse"]), 10)  # user + command guard + kill guard + WAL + ladder + commit policy + heavy-job guard + agent gate + spec gate + ask gate
+        self.assertEqual(len(first["hooks"]["PreToolUse"]), 12)  # user + command guard + kill guard + WAL + ladder + commit policy + heavy-job guard + agent gate + spec gate + ask gate + dropped-gate pretool + prod-delete guard
         self.assertNotIn("skipDangerousModePermissionPrompt", first)
         self.assertIn("My existing instructions.", (self.claude / "CLAUDE.md").read_text())
         self.assertEqual((self.claude / "CLAUDE.md").read_text().count(START), 1)
@@ -250,7 +250,7 @@ class InstallerTests(unittest.TestCase):
         install(self.home, apply=True)
         self.assertEqual([e for e in self.provenance_entries() if e[0] == "Stop"], [("Stop", None, "stop-lint")])
         stop = json.loads((self.claude / "settings.json").read_text())["hooks"]["Stop"]
-        self.assertEqual([h["timeout"] for g in stop for h in g["hooks"]], [10, 15])  # managed stop-lint replaced the manual one; the dropped-owner gate follows
+        self.assertEqual([h["timeout"] for g in stop for h in g["hooks"]], [10, 15, 30, 20])  # managed stop-lint replaced the manual one; dropped-owner gate, WAL cadence, worktree hygiene follow
 
     def test_foreign_hook_sharing_a_group_and_users_empty_event_list_survive(self):
         script = str(self.claude / "hooks" / "provenance_hooks.py")
@@ -260,7 +260,7 @@ class InstallerTests(unittest.TestCase):
         (self.claude / "settings.json").write_text(json.dumps(mixed))
         install(self.home, apply=True, provenance=False)
         hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
-        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["other-stop", "python3"])  # foreign kept; the gate is not a provenance hook
+        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["other-stop", "python3", "python3", "python3"])  # foreign kept; gate, WAL cadence, worktree hygiene are not provenance hooks
         self.assertTrue(any("dropped_gate.py" in str(h.get("args")) for g in hooks["Stop"] for h in g["hooks"]))
         self.assertEqual(hooks["Notification"], [])  # untouched, not ours
 
@@ -282,7 +282,7 @@ class InstallerTests(unittest.TestCase):
         ))
         install(self.home, apply=True)
         settings = json.loads((self.claude / "settings.json").read_text())
-        self.assertEqual(len(settings["hooks"]["PreToolUse"]), 10)  # + command guard + kill guard + ladder + heavy-job guard + agent gate + spec gate + ask gate
+        self.assertEqual(len(settings["hooks"]["PreToolUse"]), 12)  # + command guard + kill guard + ladder + heavy-job guard + agent gate + spec gate + ask gate + dropped-gate pretool + prod-delete guard
         self.assertEqual(settings["hooks"]["PreToolUse"][0]["hooks"][0]["args"], [])
 
     def test_backups_are_private(self):
@@ -292,6 +292,34 @@ class InstallerTests(unittest.TestCase):
         for folder in (root, *root.iterdir()):
             self.assertEqual(stat.S_IMODE(os.stat(folder).st_mode), 0o700, folder)
         self.assertEqual(stat.S_IMODE((next(root.rglob("settings.json"))).stat().st_mode), 0o600)
+
+    def test_harness_state_directories_are_private(self):
+        # record_gate_epoch creates ~/.agent-harness before any other component:
+        # the parents must not keep the umask-default 0755 that mkdir(parents=True) gives them.
+        install(self.home, apply=True)
+        for rel in (".agent-harness", ".agent-harness/state"):
+            self.assertEqual(stat.S_IMODE((self.home / rel).stat().st_mode), 0o700, rel)
+        self.assertEqual(stat.S_IMODE((self.home / ".agent-harness/state/dropped-gate").stat().st_mode), 0o700)
+
+    def test_malformed_hook_and_permission_shapes_raise_valueerror(self):
+        # A damaged settings.json must be refused with a clear message, like the
+        # existing env shape check, not crash with an AttributeError.
+        cases = (
+            ({"hooks": []}, "hooks must be an object"),
+            ({"hooks": {"PreToolUse": {}}}, "hooks.PreToolUse must be a list"),
+            ({"hooks": {"PreToolUse": ["not-a-group"]}}, "invalid hook group"),
+            ({"hooks": {"PreToolUse": [42]}}, "invalid hook group"),
+            ({"hooks": {"PreToolUse": [{"hooks": {}}]}}, "invalid hook group"),
+            ({"hooks": {"PreToolUse": [{"hooks": ["not-a-hook"]}]}}, "invalid hook group"),
+            ({"permissions": []}, "permissions must be an object"),
+            ({"permissions": {"allow": "Bash(foo)"}}, "permissions.allow must be a list"),
+        )
+        for settings, message in cases:
+            with self.subTest(settings=settings):
+                (self.claude / "settings.json").write_text(json.dumps(settings))
+                with self.assertRaisesRegex(ValueError, message):
+                    install(self.home, apply=True)
+                self.assertFalse((self.claude / "hooks").exists())
 
     def test_refuses_symlinked_destination(self):
         outside = self.home / "outside"
@@ -311,7 +339,7 @@ class InstallerTests(unittest.TestCase):
         install(self.home, apply=True)
         groups = json.loads((self.claude / "settings.json").read_text())["hooks"]["PreToolUse"]
         self.assertEqual(groups[0], {**group, "hooks": [foreign]})
-        self.assertEqual(len(groups), 10)  # foreign + command guard + kill guard + WAL + ladder + commit policy + heavy-job guard + agent gate + spec gate + ask gate
+        self.assertEqual(len(groups), 12)  # foreign + command guard + kill guard + WAL + ladder + commit policy + heavy-job guard + agent gate + spec gate + ask gate + dropped-gate pretool + prod-delete guard
 
     def test_refuses_symlinked_parent_directories_before_writing(self):
         for name in ("agents", "hooks", "tools", "agent-harness-backups", ".claude"):

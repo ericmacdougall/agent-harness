@@ -300,14 +300,101 @@ def format_problems(bad: list) -> str:
             "Build the list from `provenance.py asks --session <id>`.")
 
 
-def cmd_stop_lint(payload: dict) -> dict:
-    mode = prov.load_policy().get("stop_lint", "warn")
-    if mode == "off":
+QUARANTINE_EVENTS = ("scope", "decision")
+QUARANTINE_MAX_BLOCKS = 3
+TOOL_WRITERS = frozenset({"escalation", "ahd", "dropped_gate", "ah-run"})
+
+
+def quarantined_entries(session: str, now: float, older_than_s: float) -> list:
+    """Unsourced scope/decision rows of the session main WAL older than the grace (P11, goodqa#14791)."""
+    import os  # noqa: PLC0415
+    path = Path(os.environ.get("AH_HOME") or Path.home()) / ".claude" / "wals" / session / "main.jsonl"
+    out = []
+    try:
+        tail = safe_input.read_tail(path, 4 << 20)
+    except Exception:  # noqa: BLE001
+        return out
+    recs = []
+    for raw in tail.splitlines():
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            recs.append(rec)
+    recited = {r.get("recites") for r in recs if r.get("recites") and r.get("source") and not r.get("unsourced")}  # only a backed re-cite clears (M2)
+    for rec in recs:
+        if rec.get("event") not in QUARANTINE_EVENTS or not rec.get("unsourced") or rec.get("id") in recited \
+                or rec.get("by") in TOOL_WRITERS:  # the allowlist, not any claim (M1)
+            continue
+        ts = None
+        try:
+            import datetime as dt  # noqa: PLC0415
+            ts = dt.datetime.fromisoformat(str(rec.get("at")).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            pass
+        if ts is not None and now - ts >= older_than_s:
+            out.append({"id": rec.get("id"), "event": rec["event"], "age_s": int(now - ts), "note": prov.clip(str(rec.get("note") or ""), 80)})
+    return out
+
+
+def quarantine_state_path(session: str) -> Path:
+    import os  # noqa: PLC0415
+    return Path(os.environ.get("AH_HOME") or Path.home()) / ".agent-harness" / "state" / "provenance-lint" / f"{session}.json"
+
+
+def quarantine_block(session: str, payload: dict, now: float | None = None) -> dict:
+    """Block the turn end (bounded per signature) while quarantined scope/decision rows are older than the grace."""
+    import os, time  # noqa: PLC0415
+    policy = prov.load_policy()
+    mode = policy.get("quarantine_lint", "enforce")
+    if mode == "off" or os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk") or payload.get("agent_id"):
         return {}
+    now = time.time() if now is None else now
+    rows = quarantined_entries(session, now, float(policy.get("quarantine_minutes", 10)) * 60)
+    if not rows:
+        return {}
+    ids = sorted(str(r["id"]) for r in rows)
+    text = (f"{len(rows)} WAL {'entry' if len(rows) == 1 else 'entries'} without a source for over the grace (goodqa#14791 P11): "
+            + "; ".join(f"{r['event']} {r['id']} ({r['age_s'] // 60}m): {r['note']}" for r in rows[:6])
+            + ". Cite each with `python3 ~/.claude/hooks/ah.py note --source auto --dry-run --wal <this WAL> --id <id>` "
+              "then without --dry-run, or relabel it as your assumption (inferred: ...). Nothing was dropped.")
+    import hashlib  # noqa: PLC0415
+    sig = hashlib.sha256(",".join(ids).encode()).hexdigest()[:16]
+    state_path = quarantine_state_path(session)
+    try:
+        state = safe_input.safe_json_loads(safe_input.read_bounded(state_path, 65536).decode("utf-8", "replace"))
+        state = state if isinstance(state, dict) else {}
+    except Exception:  # noqa: BLE001
+        state = {}
+    count = int((state.get("blocks") or {}).get(sig, 0))
+    if mode != "enforce" or payload.get("stop_hook_active") or count >= QUARANTINE_MAX_BLOCKS:
+        return {"systemMessage": "provenance quarantine: " + text}
+    state.setdefault("blocks", {})[sig] = count + 1
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        os.replace(tmp, state_path)
+    except OSError:
+        pass
+    return {"decision": "block", "reason": "Provenance quarantine: " + text}
+
+
+def cmd_stop_lint(payload: dict) -> dict:
     session = str(payload.get("session_id") or "")
     if not valid_session(session):
         return {}
+    quarantine = quarantine_block(session, payload)  # its own policy key, independent of stop_lint (review minor)
+    if quarantine.get("decision") == "block":
+        return quarantine
+    mode = prov.load_policy().get("stop_lint", "warn")
+    if mode == "off":
+        return quarantine
+    carried = quarantine.get("systemMessage")
     bad = lint_message(last_assistant_text(payload), session)
+    if not bad and carried:
+        return {"systemMessage": carried}
     if not bad:
         try:
             reminder_path(session).unlink()  # a clean message clears an older warn-mode reminder
@@ -325,7 +412,8 @@ def cmd_stop_lint(payload: dict) -> dict:
         path.write_text(text + "\n", encoding="utf-8")
     except OSError:
         pass
-    return {"systemMessage": "provenance warning (stop-lint, warn mode): " + str(len(bad)) + " ask item(s) without a traceable origin"}
+    return {"systemMessage": "provenance warning (stop-lint, warn mode): " + str(len(bad)) + " ask item(s) without a traceable origin"
+            + ((" " + carried) if carried else "")}
 
 
 def cmd_prompt(payload: dict) -> dict:
@@ -371,14 +459,14 @@ def last_human_turn(session: str) -> float:
                 except ValueError:
                     continue
                 if isinstance(rec, dict) and rec.get("event") == "prompt":
-                    ts = prov.parse_ts(rec.get("at")) if hasattr(prov, "parse_ts") else None
-                    if ts is None:
-                        import datetime as dt  # noqa: PLC0415
-                        try:
-                            ts = dt.datetime.fromisoformat(str(rec.get("at")).replace("Z", "+00:00")).timestamp()
-                        except (TypeError, ValueError):
-                            ts = None
-                    newest = max(newest, ts or 0.0)
+                    import datetime as dt  # noqa: PLC0415
+                    try:
+                        ts = dt.datetime.fromisoformat(str(rec.get("at")).replace("Z", "+00:00"))
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=dt.timezone.utc)
+                        newest = max(newest, ts.timestamp())
+                    except (TypeError, ValueError):
+                        pass
     except OSError:
         return 0.0
     return newest
