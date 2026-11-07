@@ -269,14 +269,22 @@ class FailureModeTests(Fixture):
         padding = 'true; ' * 120000
         self.assertEqual(self.decide(padding + 'echo eA== | base64 -d | sh; rm x')[0], 'block')
 
-    def test_existing_script_counts_only_log_deletion(self):
-        """Replay false positives: repo tooling that handles env is allowed; its log deletion still blocks."""
+    def test_existing_script_keeps_log_deletion_and_credential_reads(self):
+        """Replay false positives: repo tooling that handles env or looks up one secret is allowed; its log deletion and
+        its reads of credential material still block (Kimi audit F02, goodqa#14995)."""
         tools = self.home / 'repo/tools'
         tools.mkdir(exist_ok=True)
         (tools / 'envcheck.sh').write_text('#!/bin/sh\nenv | sort\n')
         (tools / 'wipe.sh').write_text('#!/bin/sh\nrm -rf "$HOME/.claude/projects"\n')
+        (tools / 'readkey.sh').write_text('#!/bin/sh\ncat ~/.ssh/id_' + 'rsa\n')
+        (tools / 'awscreds.sh').write_text('#!/bin/sh\ncat "$HOME/.aws/credentials"\n')
+        (tools / 'token.sh').write_text('#!/bin/sh\nGH_TOKEN=$(gh auth token) gh pr list\n')
         self.assertEqual(self.decide('bash @HOME@/repo/tools/envcheck.sh')[0], 'allow')
+        self.assertEqual(self.decide('bash @HOME@/repo/tools/token.sh')[0], 'allow')
         self.assertEqual(self.decide('bash @HOME@/repo/tools/wipe.sh')[0], 'block')
+        self.assertEqual(self.decide('cat ~/.ssh/id_' + 'rsa')[0], 'block')  # inline control
+        self.assertEqual(self.decide('bash @HOME@/repo/tools/readkey.sh')[0], 'block')
+        self.assertEqual(self.decide('sh @HOME@/repo/tools/awscreds.sh')[0], 'block')
         written = "printf 'env\\n' > @HOME@/repo/tools/new.sh && bash @HOME@/repo/tools/new.sh"
         self.assertEqual(self.decide(written)[0], 'block')
 

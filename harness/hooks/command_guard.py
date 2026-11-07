@@ -1577,10 +1577,20 @@ class Ctx:
 MAX_READING_FORKS = 3
 
 
+# SECRET_DUMP rules still enforced inside an existing script on disk (Kimi audit F02, goodqa#14995): these read
+# credential material wholesale, which repository tooling has no routine reason to do. Lookups that tooling does use
+# (env dumps, `gh auth token`, one keychain password, ${!name}, git config listings, obfuscation) stay exempt there.
+SCRIPT_CREDENTIAL_RULES = frozenset((
+    'credential-file', 'credential-stdin', 'credential-script', 'find-exec-credentials', 'keychain-dump',
+    'docker-credential', 'git-credential', 'git-credential-helper', 'goodqa-reveal', 'rclone-dump', 'rclone-authorize',
+))
+
+
 class Analyzer:
     # The credential-script check (goodqa#14518) runs only in its own second pass, credential_findings(), so the analysis
-    # that decides everything else is exactly main's. disk_depth counts scripts on disk being analysed: their own
-    # commands are judged only for log deletion, so the check skips them rather than spend its time there.
+    # that decides everything else is exactly main's. disk_depth counts scripts on disk being analysed: their
+    # commands are judged only for log deletion and credential reads (SCRIPT_CREDENTIAL_RULES), so the
+    # check skips them rather than spend its time there.
     credential_pass = False
     credential_candidate = False
     disk_depth = 0
@@ -2414,9 +2424,11 @@ class Analyzer:
             if not (first.startswith('#!') and re.search(r'\b(?:ba|z|k|da|)sh\b', first)) \
                     and not path.endswith(('.sh', '.bash', '.zsh')):
                 return
-        # An existing script is the repository's own tooling: only its deletions of protected logs count. Its
-        # environment handling and secret lookups are routine there (replay false positives), and what it
-        # prints is not knowable from here. Scripts written earlier in this same command are judged in full.
+        # An existing script is the repository's own tooling: its deletions of protected logs count, and so do
+        # reads of credential material itself (SCRIPT_CREDENTIAL_RULES: a private key, a credentials file, a
+        # keychain or credential-helper dump). Its environment handling and secret lookups are routine there
+        # (replay false positives), and what it prints is not knowable from here. Scripts written earlier in this
+        # same command are judged in full.
         # It also runs as its own process, so its cd, variables and recorded files do not carry into this command.
         before = len(ctx.findings)
         keep = {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(ctx).items()
@@ -2428,7 +2440,8 @@ class Analyzer:
             self.disk_depth -= 1
             for k, v in keep.items():
                 setattr(ctx, k, v)
-            ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE]
+            ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE
+                                     or f.category == SECRET_DUMP and f.rule in SCRIPT_CREDENTIAL_RULES]
 
     def launcher(self, name, args, depth, pl, idx):
         """Commands that run another command given as text or as trailing words. True when handled."""
