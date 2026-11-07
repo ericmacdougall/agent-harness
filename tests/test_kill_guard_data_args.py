@@ -10,7 +10,7 @@ sys.path.insert(0, str(HOOKS))
 import kill_guard as kg  # noqa: E402
 
 CLI = "python3 ~/.claude/hooks/"
-WAL = "/Users/eric/.claude/wals/s1/main.jsonl"
+WAL = "/Users/someone/.claude/wals/s1/main.jsonl"
 HOME = str(Path.home())
 
 ALLOW = [
