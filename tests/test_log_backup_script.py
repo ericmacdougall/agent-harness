@@ -958,19 +958,22 @@ class Contention(Case):
         for attempt in range(8):
             self.assertGreaterEqual(first_share("3"), baseline - 1, "attempt %d: the start delay spent the budget" % attempt)
 
-    def test_a_hung_projects_copy_leaves_time_for_the_later_tier1_sources(self):
+    def test_a_hung_earlier_tree_still_leaves_projects_its_slice(self):
+        # .claude/projects is copied last (goodqa#15044 N2), so the reserve now protects it: a hung WAL copy must stop
+        # at its share and leave projects (and sessions) a slice of their own.
         start = time.time()
         done = self.run_script(LOG_BACKUP_BUDGET_SECONDS="60", LOG_BACKUP_SLICE_RESERVE_SECONDS="10",
                                LOG_BACKUP_DEADLINE_GRACE_SECONDS="2", LOG_BACKUP_KILL_GRACE_SECONDS="1",
-                               FAKE_HANG="300", FAKE_HANG_MATCH=".claude/projects")
+                               FAKE_HANG="300", FAKE_HANG_MATCH=".claude/wals")
         self.assertLess(time.time() - start, 100)
         log = (self.logs / "log-backup.log").read_text()
-        self.assertIn("copy of .claude/projects stopped at the run deadline", log)
-        later = [a for a in self.copies() if any(".claude/wals" in x for x in a)]
-        self.assertTrue(later, "the WALs still get their own slice after a hung projects copy")
-        self.assertNotIn("used up before .claude/wals", log)
-        self.assertIn("sources=", log)
-        self.assertNotEqual(done.returncode, 0)  # projects is partial, so the run is still not fresh
+        self.assertIn("copy of .claude/wals stopped at the run deadline", log)
+        later = [a for a in self.copies() if any(x.endswith(".claude/projects") for x in a)]
+        self.assertTrue(later, "projects still gets its own slice after a hung WAL copy")
+        self.assertNotIn("used up before .claude/projects", log)
+        self.assertNotIn("used up before .codex/sessions", log)
+        self.assertNotEqual(done.returncode, 0)  # the WALs are partial, so the run is still not fresh
+        self.assertFalse(self.last_ok().exists())
 
     def test_a_rate_limited_copy_names_the_cause(self):
         # Two other uploads to this account and one to a remote whose name merely ends the same way: only the two count.
@@ -1014,6 +1017,8 @@ class Contention(Case):
         elapsed = time.time() - start
         log = (self.logs / "log-backup.log").read_text()
         self.assertNotIn("used up before .agent-harness/work-ledger", log)
+        self.assertNotIn("used up before .claude/projects", log)
+        self.assertIn("copy of .claude/projects stopped at the run deadline", log)
         self.assertIn("copy of .agent-harness/work-ledger.spool.jsonl stopped at the run deadline", log)
         self.assertLess(elapsed, 100 + 10, "the run overran its budget")
         self.assertNotEqual(done.returncode, 0)
@@ -1032,6 +1037,13 @@ class Contention(Case):
         live = [a for a in self.copies() if any("/backup-stage/" in x or "backup-stage" in x for x in a)]
         names = [next(x for x in a if "backup-stage" in x) for a in live]
         self.assertTrue(names and names[-1].endswith(".claude/projects"), names)
+        # Small single files first, then the WAL tree, then sessions, then projects.
+        index = {n.split("backup-stage/", 1)[-1]: i for i, n in enumerate(names)}
+        files = [k for k in index if k.endswith((".json", ".jsonl"))]
+        self.assertEqual(len(files), 8, index)
+        self.assertLess(max(index[k] for k in files), index[".claude/wals"], index)
+        self.assertLess(index[".claude/wals"], index[".codex/sessions"], index)
+        self.assertLess(index[".codex/sessions"], index[".claude/projects"], index)
         projects = live[-1]
         seconds = int(projects[projects.index("--max-duration") + 1].rstrip("s"))
         self.assertGreaterEqual(seconds, 600 - 60, "projects did not get the remaining time")
