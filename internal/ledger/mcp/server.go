@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
@@ -80,6 +81,8 @@ type request struct {
 	Params  json.RawMessage `json:"params"`
 }
 
+var errLineTooLong = errors.New("request line too long")
+
 // Serve reads requests from in and writes responses to out until EOF.
 func (s *Server) Serve(in io.Reader, out io.Writer) error {
 	r := bufio.NewReaderSize(in, 64*1024)
@@ -88,15 +91,22 @@ func (s *Server) Serve(in io.Reader, out io.Writer) error {
 		if err == io.EOF {
 			return nil
 		}
-		if err != nil {
-			writeMsg(out, op.Obj{{K: "jsonrpc", V: "2.0"}, {K: "id", V: nil}, {K: "error", V: rpcErr(-32600, "request line too long", "")}})
+		if errors.Is(err, errLineTooLong) {
+			if err := writeMsg(out, op.Obj{{K: "jsonrpc", V: "2.0"}, {K: "id", V: nil}, {K: "error", V: rpcErr(-32600, errLineTooLong.Error(), "")}}); err != nil {
+				return err
+			}
 			continue
+		}
+		if err != nil {
+			return err
 		}
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 		if resp := s.handle(line); resp != nil {
-			writeMsg(out, resp)
+			if err := writeMsg(out, resp); err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -115,7 +125,7 @@ func readLine(r *bufio.Reader) ([]byte, error) {
 					return nil, err
 				}
 			}
-			return nil, fmt.Errorf("line too long")
+			return nil, errLineTooLong
 		}
 		if !isPrefix {
 			return buf, nil
@@ -123,12 +133,16 @@ func readLine(r *bufio.Reader) ([]byte, error) {
 	}
 }
 
-func writeMsg(out io.Writer, v op.Obj) {
+func writeMsg(out io.Writer, v op.Obj) error {
 	b, err := op.Encode(v)
 	if err != nil {
 		b = []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"encoding failed"}}`)
 	}
-	out.Write(append(b, '\n'))
+	n, err := out.Write(append(b, '\n'))
+	if err == nil && n != len(b)+1 {
+		return io.ErrShortWrite
+	}
+	return err
 }
 
 func rpcErr(code int, msg, data string) op.Obj {
