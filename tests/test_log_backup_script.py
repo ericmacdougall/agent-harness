@@ -1018,6 +1018,24 @@ class Contention(Case):
         self.assertLess(elapsed, 100 + 10, "the run overran its budget")
         self.assertNotEqual(done.returncode, 0)
 
+    def test_small_tier1_files_go_first_and_projects_gets_the_rest(self):
+        # goodqa#15044 N2: .claude/projects is the large, always-changing tree. Copied first, it was held to whatever
+        # the ten later sources left it (about 300 s of 780 s), so a backlog withheld last-ok for several runs. Copied
+        # last, the small files finish in seconds and projects gets everything that remains.
+        for rel in (".claude/history.jsonl", ".codex/history.jsonl", ".agent-harness/work-assignments.json",
+                    ".agent-harness/work-ledger.json", ".agent-harness/work-ledger.events.jsonl",
+                    ".agent-harness/work-ledger.archive.jsonl", ".agent-harness/work-ledger.failures.jsonl",
+                    ".agent-harness/work-ledger.spool.jsonl"):
+            self.put(rel, b"x\n")
+        done = self.run_script(LOG_BACKUP_BUDGET_SECONDS="600", LOG_BACKUP_BULK_EVERY_SECONDS="99999")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        live = [a for a in self.copies() if any("/backup-stage/" in x or "backup-stage" in x for x in a)]
+        names = [next(x for x in a if "backup-stage" in x) for a in live]
+        self.assertTrue(names and names[-1].endswith(".claude/projects"), names)
+        projects = live[-1]
+        seconds = int(projects[projects.index("--max-duration") + 1].rstrip("s"))
+        self.assertGreaterEqual(seconds, 600 - 60, "projects did not get the remaining time")
+
     def test_the_run_ends_inside_the_schedule_period_whatever_the_start_delay(self):
         # A long start delay must shrink the copying time rather than push the run past the next scheduled start.
         start = time.time()
