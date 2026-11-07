@@ -516,7 +516,7 @@ DO_DEPTH = 3
 def _runner_exec(words, i):
     """The index of `exec` when words[i] is a container runner running one: `docker exec`, `docker compose exec`,
     `docker container exec`, `kubectl -n ns exec` (review R3). None otherwise."""
-    for j in range(i + 1, min(i + 6, len(words))):
+    for j in range(i + 1, min(i + 64, len(words))):
         if words[j] == "exec" or (words[j] == "run" and words[i] != "kubectl"):
             return j
         if words[j] in SEPARATOR_WORDS:
@@ -591,6 +591,8 @@ def _command_parts(command: str) -> CommandParts:
                 here_remote = here_reparsed = True
             elif base in CONTAINER_RUNNERS and _runner_exec(words, i) is not None:
                 here_remote = True
+            elif base in ("nsenter", "chroot", "systemd-nspawn", "machinectl"):
+                here_remote = True  # another filesystem view: a named file is not the local one
             elif base == "eval":
                 here_reparsed = True
             if base in SQL_ARG_FLAGS or base in CLIENT_NAMES:
@@ -716,15 +718,48 @@ def _judge_text(text: str):
 
 
 STRING_SINKS = re.compile(
-    r"(?is)\b(?:PREPARE|EXECUTE|EXEC|CALL|DO|DBLINK\w*|SYSTEM|QUERY_TO_XML|"
+    r"(?is)\b(?:PREPARE|EXECUTE|EXEC|CALL|DO|DBLINK\w*|SYSTEM|"
     r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE|TRIGGER|RULE|EVENT|AGGREGATE))\b"
-    r"|\bCOPY\b[^;]*\bPROGRAM\b|\\(?:gexec|gset|g|!|set)\b|\\!|(?<![:\w]):['\"]?[A-Za-z_]\w*")
+    r"|\bCOPY\b[^;]*\bPROGRAM\b|\\(?:g\w*|o|w|set|if|elif|echo|qecho|!)|\\!|(?<![:\w]):['\"]?[A-Za-z_]\w*"
+    r"|\b(?:QUERY_TO_XML\w*|RUN_COMMAND\w*|PG_BACKGROUND\w*|DBMS_\w+|SP_EXECUTESQL|XP_CMDSHELL)\b")
+
+
+# A literal counts as plain data only right after one of these: a select-list item or a comparison operand. After
+# `(` or `,` it may be an argument to a function that runs it (Citus run_command_on_workers, pg_background_launch,
+# query_to_xml_and_xmlschema, any extension), and no list of such functions is complete (delta review D1).
+DATA_LITERAL_LEAD = re.compile(r"(?is)(?:\bSELECT|\bDISTINCT|=|<>|!=|\bI?LIKE)\s*$")
+SINGLE_LITERAL = re.compile(r"'(?:[^']|'')*'")
+META_OR_SHELL = re.compile(r"[\\`]|^\s*\.", re.M)
+
+
+def _plain_data_strings(text: str) -> bool:
+    """True when the masked reading may judge `text` (Kimi PR-C F9 opt-in, delta review D1): no psql or mysql
+    meta-command, backtick or sqlite dot-command, no known string-execution sink, every quote closed in every
+    reading, and every single-quoted literal holding destructive text sits where SQL treats it as data."""
+    if META_OR_SHELL.search(text) or STRING_SINKS.search(text):
+        return False
+    if any(_mask_sql(text, *reading[:5])[1] for reading in SQL_READINGS):
+        return False
+    for m in SINGLE_LITERAL.finditer(text):
+        inner = m.group(0)[1:-1]
+        if (_quick_match(inner) or UPDATE_WORD.search(inner)) and not DATA_LITERAL_LEAD.search(text[:m.start()]):
+            return False
+    return True
+
+
+def _judge_arg(text: str):
+    """A -c/-e/--command value: the quote-stripped verdict, unless its strings are plain data, then the masked
+    one (so `SELECT 'DELETE FROM x' AS example` is a string). The masked reading never clears more than that."""
+    stripped = _shell_match(text)
+    if stripped and not _plain_data_strings(text):
+        return stripped
+    return _judge_sql(text)
 
 
 def _judge_sql(text: str):
     """SQL judged with strings masked, unless it can run a string as SQL or shell (review R2): then every quote is
     stripped first, so the string is read as the statement it becomes."""
-    if STRING_SINKS.search(text):
+    if STRING_SINKS.search(text) or META_OR_SHELL.search(text):
         found = _shell_match(text)
         if found:
             return found
@@ -749,7 +784,9 @@ def destructive_match(sql: str, pieces=None):
     sources = pieces if pieces else [sql]
     for index, piece in enumerate(sources):
         if index > 0:
-            found = _judge_sql(piece)
+            # SQL files keep the quote-stripped rule: a file can run its strings in more ways than any list names
+            # (\\o |, \\w |, \\gx |, backticks, .shell, extension functions; delta review D1)
+            found = _shell_match(piece) or _judge_sql(piece)
             if found:
                 return found
             continue
@@ -769,7 +806,7 @@ def destructive_match(sql: str, pieces=None):
         if found:
             return found
         for _client, text, _remote in parts.args:
-            found = _judge_sql(text)
+            found = _judge_arg(text)
             if found:
                 return found
             if any(_mask_sql(text, *reading[:5])[1] for reading in SQL_READINGS):
@@ -782,6 +819,13 @@ def destructive_match(sql: str, pieces=None):
 
 
 def _shell_decoded(command: str) -> list:
+    import warnings  # noqa: PLC0415
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return _shell_decoded_inner(command)
+
+
+def _shell_decoded_inner(command: str) -> list:
     out = []
     if "\\\n" in command:
         out.append(command.replace("\\\n", ""))
@@ -789,7 +833,7 @@ def _shell_decoded(command: str) -> list:
         def decode(m):
             try:
                 return m.group(1).encode("latin-1", "backslashreplace").decode("unicode_escape")
-            except (UnicodeDecodeError, ValueError):
+            except Exception:  # noqa: BLE001 - incl. a DeprecationWarning raised as an error (delta review D3)
                 return m.group(1)
         out.append(ANSI_C.sub(lambda m: decode(m), command))
     return out

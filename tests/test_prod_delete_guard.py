@@ -1299,3 +1299,45 @@ class KimiPrcR2(Case):
             with self.subTest(command=command):
                 self.deny(command)
 
+    # ---- delta review of 61c3962 (agent a84537ae62d582cfc): D1 unlisted string execution, D2 runner scan, D3 decode
+
+    def test_d1_sql_files_are_judged_with_their_strings(self):
+        bodies = {
+            "o.sql": "\\o | psql -h prod-db -c 'DELETE FROM users'\nSELECT 1;\n",
+            "w.sql": "SELECT 1\n\\w | psql -h prod-db -c 'DELETE FROM users'\n",
+            "gx.sql": "SELECT 1 \\gx | psql -h prod-db -c 'DELETE FROM users'\n",
+            "echo.sql": "\\echo `psql -h prod-db -c 'DELETE FROM users'`\n",
+            "if.sql": "\\if `psql -h prod-db -c 'DELETE FROM users'`\n\\endif\n",
+            "citus.sql": "SELECT run_command_on_workers('DELETE FROM users');\n",
+            "bg.sql": "SELECT pg_background_launch('DELETE FROM users');\n",
+            "xml.sql": "SELECT query_to_xml_and_xmlschema('DELETE FROM users RETURNING 1', true, false, '');\n",
+        }
+        for name, body in bodies.items():
+            with self.subTest(name=name):
+                self.put(name, body)
+                self.deny("psql -h prod-db -f " + name)
+        self.put("shell.sqlite", ".shell sqlite3 prod.db 'DELETE FROM users'\n")
+        self.deny("sqlite3 prod.db '.read shell.sqlite'")
+
+    def test_d1_a_command_value_is_masked_only_when_its_string_is_plain_data(self):
+        for command in ("psql -h prod-db -c \"SELECT run_command_on_workers('DELETE FROM users')\"",
+                        "psql -h prod-db -c \"SELECT pg_background_launch('DELETE FROM users')\"",
+                        "psql -h prod-db -c \"SELECT some_new_runner('DELETE FROM users')\"",
+                        "psql -h prod-db -c \"SELECT 1 \\\\gx | psql -c 'DELETE FROM users'\""):
+            with self.subTest(command=command):
+                self.deny(command)
+        self.allow("psql -h prod-db -c \"SELECT 'DELETE FROM users' AS example\"")
+        self.allow("psql -h prod-db -c \"SELECT id FROM notes WHERE body = 'DROP TABLE users'\"")
+
+    def test_d2_runner_options_before_exec_do_not_hide_it(self):
+        self.put("a.sql", "SELECT 1;\n")
+        self.deny("kubectl --context c -n prod -c pg exec pg-0 -- psql -h prod-db -f a.sql")
+        self.deny("nsenter -t 1 -m psql -h prod-db -f a.sql")  # another mount namespace
+        self.deny("chroot /mnt psql -h prod-db -f a.sql")
+
+    def test_d3_a_decode_warning_cannot_allow(self):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            self.deny("psql -h prod-db -c $'\\q' -c 'DELETE FROM users'")
+
