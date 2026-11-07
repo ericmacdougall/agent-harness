@@ -304,11 +304,25 @@ def positional(args, value_flags=()):
 # its time bound counts as heavy (unknown = heavy on an interactive host), except a shallow/filtered clone.
 
 GIB = 1024 ** 3
+NET_BUDGET_SECONDS = 5.0  # all ssh/gh/git/rclone/ps lookups of one decision together (the hook timeout is 10 s)
+_NET_DEADLINE = [None]
+
+
+def net_left(want: float) -> float:
+    """Seconds a lookup may take: at most `want`, never past this decision's shared budget (0 = do not start)."""
+    deadline = _NET_DEADLINE[0]
+    if deadline is None:
+        return want
+    left = deadline - time.monotonic()
+    return max(0.0, min(want, left)) if left > 0.2 else 0.0
+
+
 COPY_WALK_SECONDS = 1.0
 COPY_WALK_ENTRIES = 300_000
 REMOTE_SPEC = re.compile(r"^(?:[\w.+-]+@)?(?:\[[0-9a-fA-F:]+\]|[\w.-]+):(?!//)")
 GITHUB_URL = re.compile(r"(?:github\.com[:/])([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
 GH_SLUG = re.compile(r"^([\w.-]+)/([\w.-]+)$")
+SAFE_REMOTE_PATH = re.compile(r"[A-Za-z0-9._/~+@%=,-]{1,1024}")
 COMPRESSED = re.compile(r"\.(?:t?gz|bz2|tbz2?|xz|txz|zst|lz4|lzma|z)$", re.I)
 
 
@@ -378,9 +392,14 @@ def remote_path_size(spec: str):
     host, _, remote = spec.partition(":")
     if not remote or remote.startswith("-") or host.startswith("-") or host.rpartition("@")[2] not in measured_hosts():
         return None  # a PreToolUse hook runs before the user approves: only ever connect to the user's own fleet
+    if not SAFE_REMOTE_PATH.fullmatch(remote):
+        return None  # ssh hands the words to the remote shell: $(...), ;, quotes or spaces would run there. Unknown = heavy
+    timeout = net_left(4.0)
+    if not timeout:
+        return None
     try:
         out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2", "--", host, "du", "-sk", "--", remote],
-                             capture_output=True, text=True, timeout=4).stdout
+                             capture_output=True, text=True, timeout=timeout).stdout
         first = out.split("\t", 1)[0].strip()
         return int(first) * 1024 if first.isdigit() else None
     except Exception:
@@ -398,13 +417,26 @@ def github_repo_bytes(owner: str, repo: str):
         cache = load_json_file(cache_path, 1024 * 1024)
         hit = cache.get(key)
         if isinstance(hit, dict) and time.time() - float(hit.get("at", 0)) < 86400:
-            return int(hit["bytes"])
+            if hit.get("bytes") is None:
+                if time.time() - float(hit.get("at", 0)) < 600:
+                    return None  # unknown a moment ago: do not spend the budget asking again
+            else:
+                return int(hit["bytes"])
     except Exception:
         cache = {}
+    timeout = net_left(2.5)
+    if not timeout:
+        return None
     try:
         out = subprocess.run(["gh", "api", f"repos/{owner}/{repo}", "--jq", ".size"], capture_output=True, text=True,
-                             timeout=2.5).stdout.strip()
+                             timeout=timeout).stdout.strip()
         if not out.isdigit():
+            cache[key] = {"bytes": None, "at": time.time()}
+            os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+            tmp = f"{cache_path}.{os.getpid()}.tmp"
+            with open(tmp, "w") as handle:
+                json.dump(dict(list(cache.items())[-500:]), handle)
+            os.replace(tmp, cache_path)
             return None
         size = int(out) * 1024
         cache[key] = {"bytes": size, "at": time.time()}
@@ -423,8 +455,11 @@ def tracked_tree_bytes(repo_dir: str):
     import subprocess
     try:
         env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+        timeout = net_left(2.0)
+        if not timeout:
+            return None
         out = subprocess.run(["git", "-C", repo_dir, "ls-tree", "-r", "-l", "HEAD"], capture_output=True, text=True,
-                             timeout=2, env=env).stdout
+                             timeout=timeout, env=env).stdout
         total = 0
         for line in out.splitlines():
             meta = line.split("\t", 1)[0].split()
@@ -453,7 +488,8 @@ def sum_sources(sources, ctx, thr, remote_ok=False, deref=False, budget_s=2.5):
             return total, f"sizing took longer than {budget_s:g}s"
         if remote_ok and REMOTE_SPEC.match(src) and not src.startswith(("/", ".", "~")):
             if src.partition(":")[0].rpartition("@")[2] not in measured_hosts():
-                continue
+                return total, (f"{src.split(':')[0]}:... is outside the measured fleet (add it to measure_hosts in "
+                               "heavy_job_guard.json to have it sized)")
             size = remote_path_size(src)
             if size is None:
                 return total, f"cannot measure {src.split(':')[0]}:... within the time bound"
@@ -623,7 +659,10 @@ def classify_copy(low, args, ctx):
 # is not an agent upload (it keeps its own tpslimit 1) and is never counted as the lane holder.
 LANE_TPS = 4
 LANE_TRANSFERS = 4
-RCLONE_UPLOADS = {"copy", "copyto", "sync", "move", "moveto", "bisync"}
+RCLONE_UPLOADS = {"copy", "copyto", "sync", "move", "moveto", "bisync", "rcat", "copyurl"}
+# Wrappers that can sit on a Dropbox remote; `rclone config show` would say which, but it prints tokens, so any of
+# these counts as Dropbox (a throttled lane is cheap; an unthrottled upload under a wrapper is the bypass).
+RCLONE_WRAPPERS = {"crypt", "alias", "union", "chunker", "combine", "hasher", "compress"}
 RCLONE_PATH_FLAGS = {"--log-file", "--exclude-from", "--include-from", "--filter-from", "--files-from",
                      "--files-from-raw", "--config", "--temp-dir", "--cache-dir", "--backup-dir", "--compare-dest",
                      "--copy-dest"}
@@ -639,11 +678,11 @@ def dropbox_remotes():
         import subprocess
         names = set()
         try:
-            out = subprocess.run(["rclone", "listremotes", "--long"], capture_output=True, text=True, timeout=2,
-                                 stdin=subprocess.DEVNULL).stdout
+            out = subprocess.run(["rclone", "listremotes", "--long"], capture_output=True, text=True,
+                                 timeout=net_left(2.0) or 0.01, stdin=subprocess.DEVNULL).stdout
             for line in out.splitlines()[:200]:
                 parts = line.split()
-                if len(parts) >= 2 and parts[0].endswith(":") and parts[1].lower() == "dropbox":
+                if len(parts) >= 2 and parts[0].endswith(":") and parts[1].lower() in {"dropbox"} | RCLONE_WRAPPERS:
                     names.add(parts[0][:-1].lower())
         except (OSError, subprocess.SubprocessError, ValueError):
             pass
@@ -652,7 +691,11 @@ def dropbox_remotes():
 
 
 def is_dropbox_spec(spec: str) -> bool:
-    m = re.match(r"^([A-Za-z0-9_.][A-Za-z0-9_. -]{0,63}):", spec or "")
+    """name:path, name,opt=v:path and the :backend:path connection-string form."""
+    spec = spec or ""
+    if spec.startswith(":"):  # :dropbox:path (or :dropbox,opt=v:path) names the backend itself
+        return spec[1:].split(":", 1)[0].split(",", 1)[0].lower() == "dropbox"
+    m = re.match(r"^([A-Za-z0-9_.][A-Za-z0-9_. -]{0,63})(?:,[^:/]*)?:", spec)
     if not m or "/" in m.group(1):
         return False
     name = m.group(1).lower()
@@ -668,6 +711,49 @@ def rclone_flag(args, name):
         elif a == name and i + 1 < len(args):
             value = args[i + 1]
     return value
+
+
+RCLONE_VALUE_FLAGS = {
+    "--exclude", "--include", "--filter", "--exclude-from", "--include-from", "--filter-from", "--files-from",
+    "--files-from-raw", "--log-file", "--log-level", "--log-format", "--transfers", "--checkers", "--tpslimit",
+    "--tpslimit-burst", "--bwlimit", "--bwlimit-file", "--max-duration", "--max-transfer", "--max-size", "--min-size",
+    "--max-age", "--min-age", "--retries", "--retries-sleep", "--low-level-retries", "--contimeout", "--timeout",
+    "--backup-dir", "--suffix", "--compare-dest", "--copy-dest", "--config", "--cache-dir", "--temp-dir", "--stats",
+    "--stats-log-level", "--order-by", "--max-depth", "--user-agent", "--header", "--header-upload", "--dump",
+    "--buffer-size", "--multi-thread-streams", "--multi-thread-cutoff", "--dropbox-batch-mode",
+    "--dropbox-batch-size", "--dropbox-batch-timeout", "--dropbox-chunk-size", "--cutoff-mode", "--track-renames-strategy",
+    "--password-command", "--rc-addr", "--max-backlog", "--max-stats-groups", "--fs-cache-expire-duration",
+    "--exclude-if-present", "--metadata-set", "--streaming-upload-cutoff"}  # an unknown flag consumes nothing
+
+
+def rclone_positional(args):
+    """Words that are not flags or values of known value flags, in order."""
+    words, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("-"):
+            if "=" not in a and a in RCLONE_VALUE_FLAGS:
+                i += 2
+                continue
+            i += 1
+            continue
+        words.append(a)
+        i += 1
+    return words
+
+
+def rclone_upload_target(args):
+    """(subcommand, Dropbox destination) of an rclone upload, else None."""
+    words = rclone_positional(args)
+    sub = next((w for w in words if w in RCLONE_UPLOADS), None)
+    if sub is None:
+        return None
+    after = words[words.index(sub) + 1:]
+    first_dest = 0 if sub == "rcat" else 1  # rcat reads stdin; everything else has a source first
+    for word in after[first_dest:]:
+        if is_dropbox_spec(word):
+            return sub, word
+    return None
 
 
 def rclone_words(args):
@@ -716,28 +802,44 @@ def lane_holders(ps_text=None):
             words = parts[1].split()
         if not words or base(words[0]).lower() != "rclone" or LOG_BACKUP_MARK in parts[1]:
             continue
-        if is_dropbox_spec(rclone_upload_destination(words[1:]) or ""):
+        if rclone_upload_target(words[1:]):
             holders.append((int(parts[0]), parts[1][:160]))
     return holders
 
 
-def dropbox_lane_finding(args, ctx):
-    """("dropbox-lane", detail) for an agent rclone upload to Dropbox that is unthrottled or would run beside another."""
+def dropbox_lane_finding(args, ctx, env=None):
+    """("dropbox-lane", detail) for an agent rclone upload to Dropbox that is unthrottled or would run beside another.
+    `env` holds the command's own VAR=value prefix (RCLONE_TPSLIMIT and friends set rclone's flags too)."""
     if "--dry-run" in args or "-n" in args:
         return None
-    dest = rclone_upload_destination(args)
-    if not dest or not is_dropbox_spec(dest):
+    target = rclone_upload_target(args)
+    if not target:
         return None
-    sub = rclone_words(args)[0]
+    sub, dest = target
+    if ctx is not None:
+        ctx.lane_uploads = getattr(ctx, "lane_uploads", 0) + 1
+    env = env or {}
     problems = []
-    tps = rclone_flag(args, "--tpslimit")
+
+    def setting(flag, var):
+        value = rclone_flag(args, flag)
+        return value if value is not None else env.get(var)
+
+    burst = setting("--tpslimit-burst", "RCLONE_TPSLIMIT_BURST")
+    try:
+        burst_value = float(burst) if burst is not None else 1.0
+    except ValueError:
+        burst_value = LANE_TPS + 1.0
+    if burst_value > LANE_TPS:
+        problems.append(f"--tpslimit-burst must be at most {LANE_TPS} (got {burst})")
+    tps = setting("--tpslimit", "RCLONE_TPSLIMIT")
     try:
         tps_value = float(tps) if tps is not None else 0.0
     except ValueError:
         tps_value = 0.0
     if not 0 < tps_value <= LANE_TPS:
         problems.append(f"--tpslimit must be set to at most {LANE_TPS} (got {tps if tps is not None else 'none'})")
-    transfers = rclone_flag(args, "--transfers")
+    transfers = setting("--transfers", "RCLONE_TRANSFERS")
     try:
         transfers_value = int(transfers) if transfers is not None else 4
     except ValueError:
@@ -769,8 +871,17 @@ def clone_is_shallow(flags):
     return depth is not None and depth.isdigit() and 0 < int(depth) <= 50  # the last --depth wins, as in git
 
 
+URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/@\s]+@")
+
+
+def scrub_url(text: str) -> str:
+    """Drop user:password@ from URLs (clone URLs often carry tokens)."""
+    return URL_USERINFO.sub(r"\1", text)
+
+
 def clone_estimate(url, flags, ctx, thr, label):
-    shallow = clone_is_shallow(flags)
+    shallow = clone_is_shallow(flags) or any(f in ("--filter=blob:none", "--filter=tree:0") for f in flags) or any(
+        f == "--filter" and i + 1 < len(flags) and flags[i + 1] in ("blob:none", "tree:0") for i, f in enumerate(flags))
     factor = 0.5 if shallow else 2.0
     local = resolve(os.path.expanduser(url.replace("file://", "")), ctx.cwd)
     if url.startswith(("/", "./", "../", "~", "file://")) and not os.path.exists(local):
@@ -786,7 +897,7 @@ def clone_estimate(url, flags, ctx, thr, label):
             return finish_copy(label, int(size * factor), None, thr, f" (repository {fmt_gib(size)} as reported by GitHub)")
     if shallow:
         return None  # a shallow or filtered clone is bounded by construction, so an unknown size is allowed
-    return ("copy", f"{label} of {url[:80]}: size unknown (no GitHub size available, and any other host is not measured; "
+    return ("copy", f"{label} of {scrub_url(url)[:80]}: size unknown (no GitHub size available, and any other host is not measured; "
                     f"unknown size counts as heavy; limit {fmt_gib(thr)})")
 
 
@@ -1306,7 +1417,7 @@ def classify(argv, ctx, depth=0):
         if found:
             return found
     if low == "rclone":
-        lane = dropbox_lane_finding(args, ctx)
+        lane = dropbox_lane_finding(args, ctx, dict(a.split("=", 1) for a in _assigns if "=" in a))
         if lane:
             return lane
     if low == "claude" and any(a in ("-p", "--print") for a in args):
@@ -1420,7 +1531,8 @@ def classify(argv, ctx, depth=0):
                 return ("browser", f"python -m {module}")
             return None
         first = (positional(args) or [""])[0]
-        if first.endswith(".py") and REPLAY_NAME.search(base(first)) and "--help" not in args and "-h" not in args:
+        if (first.endswith(".py") and REPLAY_NAME.search(base(first)) and not re.match(r"test_|.*_test\.py$", base(first))
+                and "--help" not in args and "-h" not in args):
             return ("replay", f"python {base(first)}")
         if base(first) == "run_capped.py":
             return classify([first] + args[args.index(first) + 1:], ctx, depth + 1)
@@ -1617,6 +1729,9 @@ def scan_state(command: str, cwd: str, depth: int = 0, parent=None):
         result = classify(argv, ctx, depth)
         if result:
             findings.append((result[0], result[1], ctx.capped, segment))
+    if getattr(ctx, "lane_uploads", 0) >= 2 and has_background(text):
+        findings.append(("dropbox-lane", "several backgrounded rclone uploads to Dropbox in one command; the lane is "
+                         "one upload at a time", False, command[:2000]))
     claude_n = getattr(ctx, "claude_p", 0)
     if claude_n and has_background(text) and (claude_n >= 2 or getattr(ctx, "loop", False)):
         # parsed shell keywords and unquoted & only: a quoted prompt that contains "for" or "&" is not a loop
@@ -1674,6 +1789,7 @@ def decide(command: str, cwd: str = None, modes=None):
     if not command:
         return {"action": "allow"}
     modes = modes or load_modes()
+    _NET_DEADLINE[0] = time.monotonic() + NET_BUDGET_SECONDS
     try:
         hatch, findings = scan_state(command, cwd)
     except (WorkBudgetExceeded, RecursionError):
@@ -1772,6 +1888,10 @@ def exact_route(command, cwd, rule=None):
 
 
 def deny_message(rule, detail, hatch, capped, segment=None, cwd=None):
+    return scrub_url(_deny_message_text(rule, detail, hatch, capped, segment, cwd))  # no URL credentials in a message
+
+
+def _deny_message_text(rule, detail, hatch, capped, segment=None, cwd=None):
     base_msg = routed(_deny_message(rule, detail, hatch, capped))
     if rule == "fan-out" and re.search(r"\bclaude\b", (segment or "") + detail):
         base_msg = base_msg.replace(f"ssh {route_host()} ", f"ssh {claude_route_host()} ")  # claude is not logged in on t2-dev
@@ -1882,7 +2002,10 @@ def log_hatch_to_wal(payload: dict, decision: dict) -> None:
         reason = decision["hatch_reason"]
         if wal_note.SECRET_PATTERN.search(reason):
             reason = "[redacted]"
-        note = (f"HARNESS_LOCAL_OK used: rule={decision['rule']} ({decision['detail'][:80]}); reason={reason[:300]}")
+        detail = scrub_url(decision["detail"])[:80]
+        if wal_note.SECRET_PATTERN.search(detail):
+            detail = "[redacted]"
+        note = f"HARNESS_LOCAL_OK used: rule={decision['rule']} ({detail}); reason={reason[:300]}"
         record = {"at": datetime.now(timezone.utc).isoformat(), "event": "decision", "note": note}
         root = Path.home() / ".claude" / "wals" / wal.safe_id(session)
         targets = [root / "main.jsonl"]
