@@ -219,13 +219,17 @@ exec "$FIXTURE_REAL_GIT" "$@"
         hooks = DELIVER.parent
         spec = importlib.util.spec_from_file_location('workflow_fixture_target', DELIVER)
         module = importlib.util.module_from_spec(spec)
+        captured = io.StringIO()
+        # The path patch must cover main() too: deliver imports commit_policy (and friends)
+        # dynamically while running, so it fails when this file is the only one on the path
+        # (it passes in a full discover run only because an earlier test module imported
+        # commit_policy first).
         with mock.patch.object(sys, 'path', [str(hooks), *sys.path]):
             spec.loader.exec_module(module)
-        captured = io.StringIO()
-        with mock.patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(captured):
-            with mock.patch.object(sys, 'argv', [str(DELIVER), *(arguments or self.finish_args())]):
-                with patch_factory(module):
-                    code = module.main()
+            with mock.patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(captured):
+                with mock.patch.object(sys, 'argv', [str(DELIVER), *(arguments or self.finish_args())]):
+                    with patch_factory(module):
+                        code = module.main()
         return code, json.loads(captured.getvalue())
 
     def baseline_args(self, head):
