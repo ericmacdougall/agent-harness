@@ -20,5 +20,10 @@
   {"id": "bash-c-chain", "command": "bash -c \"cmd1; nohup ./suite & echo launched\"", "expect": "success-echo"},
   {"id": "submitted-word", "command": "prep; echo job submitted in background", "expect": "success-echo"},
   {"id": "wait-then-grep", "command": "while kill -0 $PID; do sleep 5; done; grep -c PASS log", "expect": "wait-loop-tail"},
-  {"id": "pipestatus-local", "command": "f() { local out=$(a | b); [ \"${PIPESTATUS[1]}\" = 0 ] || return 1; }", "expect": "pipestatus"}
+  {"id": "pipestatus-local", "command": "f() { local out=$(a | b); [ \"${PIPESTATUS[1]}\" = 0 ] || return 1; }", "expect": "pipestatus"},
+  {"id": "self-match-pgrep-while", "command": "while pgrep -f \"tsc --noEmit\"; do sleep 5; done", "expect": "self-match-pgrep"},
+  {"id": "self-match-pgrep-until-quiet", "command": "until ! pgrep -f 'vitest run' >/dev/null; do sleep 30; done", "expect": "self-match-pgrep"},
+  {"id": "self-match-pgrep-ssh", "command": "ssh dev2 'while pgrep -f \"tsc --noEmit\" >/dev/null; do sleep 30; done; tail -3 tsc.log'", "expect": "self-match-pgrep"},
+  {"id": "self-match-pgrep-flags", "command": "while pgrep -fl 'next build' > /dev/null 2>&1; do sleep 10; done", "expect": "self-match-pgrep"},
+  {"id": "self-match-ps-grep", "command": "while ps aux | grep -q 'vitest run'; do sleep 10; done", "expect": "self-match-pgrep"}
 ]

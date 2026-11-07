@@ -39,6 +39,8 @@ APPLY_OPS = ("alert.raise", "alert.clear")  # the only ops `ah apply --batch` ac
 APPLY_MAX_LINES = 200
 APPLY_MAX_BYTES = 1024 * 1024
 TASK_WAL_WINDOW_S = 48 * 3600  # a task-named WAL untouched this long is history (ahd owner_window_seconds)
+OWNERS_RECENT_S = 6 * 3600  # `ah owners` (CLI) hides terminal rows idle longer than this unless --all (2026-11-06)
+TERMINAL_STATES = frozenset({"done", "handoff", "returned", "idle-helper", "unverified-legacy", "superseded", "wontdo", "legacy"})
 WRAPPER = re.compile(r"^\s*<[A-Za-z][\w-]*[\s>/]")
 MAX_REQUEST = 256 * 1024
 SKIP_DARWIN = ("Library", "Desktop", "Documents", "Downloads", "Pictures", "Movies", "Music", "Applications")
@@ -1300,7 +1302,100 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
                 rec[k] = args[k]
         _wal_append(home, main_wal, rec)
         out["wal"] = wid
+        if args["kind"] in ("reassigned",) + tuple(liveness.CLOSING):  # the owner is retired: its waiters are leftovers
+            try:
+                waiters = leftover_waiters(home, args["agent"], args["session"])
+            except Exception:  # noqa: BLE001 - a process scan failure never blocks a disposition
+                waiters = []
+            if waiters:
+                out["leftover_waiters"] = waiters
+                pids = [str(w["pid"]) for w in waiters if w.get("kind") == "process"]
+                out["warning"] = (f"{len(waiters)} live waiter(s) still attributed to {args['agent']} or its session: "
+                                  + "; ".join(f"pid {w['pid']} ({w['elapsed']}, {w['scope']}) {w['command'][:80]}" if w.get("kind") == "process"
+                                              else f"ah-run {w['run']} {' '.join(w.get('argv') or [])[:80]}" for w in waiters)
+                                  + ". Each wake-up of a retired agent rereads its whole context: stop them "
+                                  + (f"(`ah kill --pid {','.join(pids)} --reason '<why>'`) " if pids else "")
+                                  + "or hand them to the replacement.")
     return out
+
+
+WAIT_LOOP_RE = re.compile(r"\b(?:until|while)\b.{0,400}?\b(?:sleep|pgrep|grep|inotifywait|wait)\b", re.S)
+WAITER_CAP = 20
+WAITER_PROBE_CAP = 50  # environment probes per dispose; each is one bounded `ps eww`
+
+
+def _ps_rows() -> list:
+    """[(pid, elapsed, command)] for this user's processes, bounded; [] when ps is unavailable."""
+    try:
+        r = subprocess.run(["ps", "-u", str(os.getuid()), "-o", "pid=,etime=,command="], capture_output=True, text=True,
+                           timeout=15, env=dict(os.environ, LC_ALL="C", LANG="C"))
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = []
+    for line in r.stdout.splitlines()[:5000]:
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit():
+            rows.append((int(parts[0]), parts[1], parts[2]))
+    return rows
+
+
+def _session_env_of(pid: int):
+    """CLAUDE_CODE_SESSION_ID in a process's environment (ps eww shows it for own processes), else None."""
+    try:
+        r = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=8,
+                           env=dict(os.environ, LC_ALL="C"))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"CLAUDE_CODE_SESSION_ID=([A-Za-z0-9._-]{1,128})", r.stdout)
+    return m.group(1) if m else None
+
+
+def leftover_waiters(home: Path, agent: str, session: str, ps_rows=None, session_of=None) -> list:
+    """Live background waiters a retired owner may have left behind (goodqa#14927): wait loops (until/while with
+    sleep, grep or pgrep) whose command line names the agent (`scope: agent`) or whose environment carries this
+    session's id (`scope: session`), plus ah-run ledger rows attributed to the agent that have not ended. Read-only
+    and bounded; it never signals anything. 2026-11-06: a retired 580k-context agent was woken repeatedly by its own
+    `until grep` waiters, each wake a full context reread."""
+    import redact  # noqa: PLC0415
+    found = []
+    ledger = home / ".agent-harness" / "reserve" / "ledger"
+    try:
+        entries = sorted(os.scandir(ledger), key=lambda e: e.name)[-500:]
+    except OSError:
+        entries = []
+    for entry in entries:
+        if not entry.name.endswith(".json") or not entry.is_file(follow_symlinks=False):
+            continue
+        try:
+            with open(entry.path, "rb") as handle:
+                row = json.loads(handle.read(65536))  # input-ok: one bounded ledger row
+        except (OSError, ValueError):
+            continue
+        if isinstance(row, dict) and row.get("agent") == agent and not row.get("end"):
+            argv = row.get("argv") if isinstance(row.get("argv"), list) else []
+            found.append({"kind": "ah-run", "run": entry.name[:-5], "argv": [redact.redact(str(a))[:60] for a in argv[:8]]})
+    rows = _ps_rows() if ps_rows is None else ps_rows
+    session_of = session_of or _session_env_of
+    me = os.getpid()
+    probes = 0
+    for pid, elapsed, command in rows:
+        if len(found) >= WAITER_CAP:
+            break
+        if pid == me or not isinstance(command, str) or not WAIT_LOOP_RE.search(command):
+            continue
+        if agent and agent in command:
+            scope = "agent"
+        elif session and session in command:
+            scope = "session"
+        elif session and probes < WAITER_PROBE_CAP:
+            probes += 1  # one `ps eww` per unattributed wait loop, capped (review LOW, 2026-11-06)
+            if session_of(pid) != session:
+                continue
+            scope = "session"
+        else:
+            continue
+        found.append({"kind": "process", "pid": pid, "elapsed": elapsed, "scope": scope, "command": redact.redact(command)[:200]})
+    return found
 
 
 def ask_states(main_wal: Path) -> dict:
@@ -1932,9 +2027,23 @@ def fmt_age(s):
     return f"{s // 3600}h{(s % 3600) // 60:02d}m" if s >= 3600 else f"{s // 60}m" if s >= 60 else f"{s}s"
 
 
+def recent_owners(data: dict) -> dict:
+    """The CLI default view: every row that is live, waiting, silent, dropped or needs a decision, plus terminal rows
+    (done, handoff, returned, helpers) that ended within OWNERS_RECENT_S. counts and undisposed still cover every row;
+    `hidden` says how many rows --all would add. Library callers (ops_watch, dropped_gate) use owners() unfiltered."""
+    def keep(r):
+        if r.get("decision_required") or r.get("state") not in TERMINAL_STATES:
+            return True
+        return r.get("idle_s") is not None and r["idle_s"] <= OWNERS_RECENT_S
+    rows = [r for r in data["owners"] if keep(r)]
+    return dict(data, owners=rows, hidden=len(data["owners"]) - len(rows), filter=f"recent<={OWNERS_RECENT_S // 3600}h")
+
+
 def render_text(cmd: str, data: dict) -> str:
     if cmd == "owners":
-        lines = [f"session {data['session']}  " + " ".join(f"{k}={v}" for k, v in sorted(data["counts"].items()))]
+        lines = [f"session {data['session']}  " + " ".join(f"{k}={v}" for k, v in sorted(data["counts"].items()))
+                 + (f"  hidden={data['hidden']} (terminal rows idle over {OWNERS_RECENT_S // 3600} h; --all shows them)"
+                    if data.get("hidden") else "")]
         for r in data["owners"]:
             lines.append(f"{r['state']:<14} idle {fmt_age(r['idle_s']):>7}  {r['agent_id'][:12]:<12} {r['type'] or '-':<12} "
                          f"{(r['ticket'] or '-'):<18} c-age {fmt_age(r['ticket_comment_age_s']):>6}  {(r['task'] or '')[:70]}")
@@ -2022,6 +2131,13 @@ def note_cmd(home: Path, args) -> dict:
     if r.returncode != 0:
         plan["ok"] = False
         plan["stderr"] = r.stderr[-300:]
+        try:  # wal_note refused (rejected source: nothing written); surface its problem instead of a bare stderr tail
+            refusal = json.loads((r.stderr.strip().splitlines() or ["{}"])[-1])
+        except ValueError:
+            refusal = {}
+        if isinstance(refusal, dict) and refusal.get("status") == "REFUSED":
+            plan["refused"] = True
+            plan["problem"] = str(refusal.get("problem") or "")[:300]
     elif isinstance(plan.get("written"), dict) and plan["written"].get("warnings"):
         plan["ok"] = False  # written, but quarantined: the source did not resolve here (M2); say so instead of ok
         plan["quarantined"] = True
@@ -2291,6 +2407,8 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
     o = sub.add_parser("owners")
     o.add_argument("--session")
+    o.add_argument("--text", action="store_true", default=argparse.SUPPRESS, help="human summary (also accepted before the subcommand)")
+    o.add_argument("--all", action="store_true", help=f"every row; the default hides terminal rows idle over {OWNERS_RECENT_S // 3600} h")
     o.add_argument("--comments", action="store_true", help="also fetch latest ticket comment age (network)")
     o.add_argument("--gate", action="store_true", help="exit 1 while any DROPPED owner has no live disposition")
     u = sub.add_parser("user-msg")
@@ -2443,7 +2561,8 @@ def run(args, home: Path) -> dict:
         s = args.session or env_session() or newest_session(home)
         if not s or not SESSION_RE.match(s):
             raise AhError("session_unknown", "no session: pass --session")
-        return owners(home, s, comments=comment_age if args.comments else None)
+        data = owners(home, s, comments=comment_age if args.comments else None)
+        return data if args.all else recent_owners(data)
     if cmd == "asks":
         return asks_view(home, args.session, args.all)
     if cmd == "requirements":

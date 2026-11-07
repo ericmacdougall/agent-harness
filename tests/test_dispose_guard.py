@@ -395,6 +395,28 @@ class Grandfather(Base):
         self.assertEqual(self.owners()["legacy_unverified"], [])
 
 
+class LeftoverWaiters(Base):
+    def test_retiring_dispositions_warn_with_the_agents_live_waiters(self):
+        """`ah task dispose --kind reassigned|closed|superseded|wontdo` lists the retired agent's live background
+        waiters (a warning, never a kill) so main can stop them before they wake a retired agent again (2026-11-06)."""
+        a1, a0 = agent(1), agent(0)
+        rows = [(4242, "05:00:00", f"bash -c until grep -q RESULT /w/agent-{a1}/out.txt; do sleep 120; done")]
+        with mock.patch.object(ah, "_ps_rows", return_value=rows), mock.patch.object(ah, "_session_env_of", return_value=None):
+            out = self.dispose(a1, kind="reassigned", ref=a0)
+            self.assertEqual([w["pid"] for w in out["leftover_waiters"]], [4242])
+            self.assertIn("4242", out["warning"])
+            self.assertIn("ah kill --pid 4242", out["warning"])
+            # a wait disposition keeps the owner, so its waiters are expected: no warning
+            self.assertNotIn("leftover_waiters", self.dispose(agent(2), kind="waiting", ref="GoodQA goodqa#14927",
+                                                                until=iso(self.clock + 3600)))
+        with mock.patch.object(ah, "_ps_rows", return_value=[]):
+            out = self.dispose(agent(3), kind="reassigned", ref=a0)
+            self.assertNotIn("leftover_waiters", out)
+            self.assertNotIn("warning", out)
+        with mock.patch.object(ah, "_ps_rows", side_effect=OSError("ps missing")):  # a scan failure never blocks a dispose
+            self.assertEqual(self.dispose(agent(4), kind="reassigned", ref=a0).get("ok", True), True)
+
+
 class ReassignedToAReturnedParent(Base):
     N = 2
 
