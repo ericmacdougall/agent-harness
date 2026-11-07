@@ -112,6 +112,7 @@ if str(HERE) not in sys.path:  # python3 -I does not put the script's directory 
 DESTRUCTIVE = re.compile(
     r"\b(DELETE\s+FROM|DROP\s+(?:TABLE|DATABASE|INDEX|SCHEMA|VIEW|FUNCTION|PROCEDURE|TRIGGER|ROLE|USER)|TRUNCATE)\b"
     r"|\bdropdb\b|\bmysqladmin\b[^\n|;&]{0,512}?\bdrop\b", re.I)
+UPDATE_SCOPE_LIMIT = 256  # UPDATE keywords judged per statement (each SET/WHERE walks the open ones)
 UPDATE_WORD = re.compile(r"\bUPDATE\b", re.I)
 SET_WORD = re.compile(r"\bSET\b", re.I)
 # One linear pass per dialect reading finds these events; see _unfiltered_update.
@@ -370,6 +371,8 @@ def _unfiltered_update(masked: str):
             word = tok.upper()
             if word == "UPDATE":
                 if not NOT_AN_UPDATE.search(masked[max(0, m.start() - 16):m.start()]):
+                    if len(scopes) >= UPDATE_SCOPE_LIMIT:
+                        return m  # too many UPDATEs in one statement to judge in linear time: unfiltered
                     sc = [depth, False, False, m]
                     scopes.append(sc)
                     open_scopes.append(sc)

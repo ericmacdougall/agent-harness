@@ -1037,7 +1037,8 @@ class ReviewRound1(Case):
         self.assertEqual(self.verdict(ev), "allow")
         for sql in ("WITH x AS (UPDATE t SET a = 1 RETURNING id) SELECT * FROM x WHERE true",
                     "UPDATE t SET a = 1 RETURNING (SELECT 1 WHERE true)",
-                    "WITH a AS (UPDATE t SET x=1 WHERE id=1), b AS (UPDATE t SET x=2) SELECT 1"):
+                    "WITH a AS (UPDATE t SET x=1 WHERE id=1), b AS (UPDATE t SET x=2) SELECT 1",
+                    "UPDATE t SET a=1 WHERE id=1 " * 300):
             with self.subTest(sql=sql):
                 self.assertTrue(pdg.destructive_match(sql), sql)
 
@@ -1047,6 +1048,7 @@ class ReviewRound1(Case):
             "update-words.sql": "-- " + "update " * 27000 + ";\nUPDATE users SET a=1;\n",
             "exec-open.sql": "/*!" * 60000 + "\n",
             "comment-open.sql": "/*" * 90000 + "\n",
+            "many-updates.sql": "UPDATE t SET a=1, " * 10000 + "\n",
         }
         for name, body in cases.items():
             self.put(name, body)
