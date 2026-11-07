@@ -941,17 +941,22 @@ class Contention(Case):
         self.assertIn("stopped at the run deadline", (self.logs / "log-backup.log").read_text())
 
     def test_jitter_does_not_spend_the_copy_budget(self):
-        # The first copy gets the whole budget however long the start delay was. With a delay of 0-2 s the old code
-        # passes only when every one of six delays is 0, a 1-in-729 event.
-        for attempt in range(6):
+        # The first copy's share must not depend on the start delay. A run without delay sets the baseline; with a
+        # delay of 0-3 s the old code keeps the baseline only when the delay is under 2 s, so eight runs pass on the
+        # old code about 1 time in 256.
+        settings = dict(LOG_BACKUP_BUDGET_SECONDS="300", LOG_BACKUP_SLICE_RESERVE_SECONDS="0",
+                        LOG_BACKUP_DEADLINE_GRACE_SECONDS="0", LOG_BACKUP_KILL_GRACE_SECONDS="0")
+
+        def first_share(jitter):
             open(self.calls, "w").close()
-            done = self.run_script(LOG_BACKUP_JITTER_SECONDS="2", LOG_BACKUP_BUDGET_SECONDS="300",
-                                   LOG_BACKUP_SLICE_RESERVE_SECONDS="0", LOG_BACKUP_DEADLINE_GRACE_SECONDS="0",
-                                   LOG_BACKUP_KILL_GRACE_SECONDS="0")
-            self.assertEqual(done.returncode, 0, "attempt %d: %s" % (attempt, done.stderr))
+            done = self.run_script(LOG_BACKUP_JITTER_SECONDS=jitter, **settings)
+            self.assertEqual(done.returncode, 0, done.stderr)
             first = self.copies()[0]
-            seconds = int(first[first.index("--max-duration") + 1].rstrip("s"))
-            self.assertGreaterEqual(seconds, 299, "attempt %d: the start delay spent the budget" % attempt)
+            return int(first[first.index("--max-duration") + 1].rstrip("s"))
+
+        baseline = first_share("0")
+        for attempt in range(8):
+            self.assertGreaterEqual(first_share("3"), baseline - 1, "attempt %d: the start delay spent the budget" % attempt)
 
     def test_a_hung_projects_copy_leaves_time_for_the_later_tier1_sources(self):
         start = time.time()
@@ -969,13 +974,15 @@ class Contention(Case):
 
     def test_a_rate_limited_copy_names_the_cause(self):
         # Two other uploads to this account and one to a remote whose name merely ends the same way: only the two count.
+        # A remote name of its own keeps real uploads running on this host out of the count.
         others = [subprocess.Popen(["/bin/bash", "-c", 'exec -a "rclone copy /x %s" sleep 60' % spec])
-                  for spec in ("lessons-dropbox:a", "lessons-dropbox:b", "old-lessons-dropbox:c")]
+                  for spec in ("lbtest-box:a", "lbtest-box:b", "old-lbtest-box:c")]
         for proc in others:
             self.addCleanup(proc.wait)
             self.addCleanup(proc.kill)
         done = self.run_script(FAKE_RCLONE_LOG_TEXT="ERROR : upload failed: too_many_write_operations",
-                               FAKE_EXIT_AFTER_NOTE="1", LOG_BACKUP_RETRIES="0")
+                               FAKE_EXIT_AFTER_NOTE="1", LOG_BACKUP_RETRIES="0",
+                               LOG_BACKUP_REMOTE="lbtest-box:Backups/agent-logs", FAKE_REMOTES="lbtest-box: dropbox")
         self.assertNotEqual(done.returncode, 0)
         log = (self.logs / "log-backup.log").read_text()
         self.assertIn("Dropbox write rate limit", log)
@@ -1003,7 +1010,7 @@ class Contention(Case):
         start = time.time()
         done = self.run_script(LOG_BACKUP_BUDGET_SECONDS="100", LOG_BACKUP_SLICE_RESERVE_SECONDS="2",
                                LOG_BACKUP_DEADLINE_GRACE_SECONDS="1", LOG_BACKUP_KILL_GRACE_SECONDS="1",
-                               FAKE_HANG="300", FAKE_TERM_DRAIN="300", LOG_BACKUP_BULK_EVERY_SECONDS="999999")
+                               FAKE_HANG="300", FAKE_TERM_DRAIN="300", LOG_BACKUP_BULK_EVERY_SECONDS="99999")
         elapsed = time.time() - start
         log = (self.logs / "log-backup.log").read_text()
         self.assertNotIn("used up before .agent-harness/work-ledger", log)
