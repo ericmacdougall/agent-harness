@@ -1269,15 +1269,21 @@ class KimiPrcR2(Case):
         self.allow("psql -h prod-db -f a.sql")
 
     def test_r4_doubled_quotes_and_escapes_mask_in_linear_time(self):
-        body = "SELECT '" + "''" * 100000 + "';"
-        for reading in pdg.SQL_READINGS:
-            t0 = time.monotonic()
-            pdg._mask_sql(body, *reading[:5])
-            self.assertLess(time.monotonic() - t0, 0.5, reading)
-        body = "SELECT '" + "\\x" * 100000 + "';"
-        t0 = time.monotonic()
-        pdg._mask_sql(body, True, True, True, False, True)
-        self.assertLess(time.monotonic() - t0, 0.5)
+        # Scaling, not wall-clock: 4x the input must cost well under 16x (quadratic) in a backslash reading. The
+        # 2f508e5 lexer searched for the next backslash from every doubled quote, to the end of the text.
+        def cost(n, unit):
+            body = "SELECT '" + unit * n + "';"
+            best = None
+            for _ in range(3):
+                t0 = time.perf_counter()
+                pdg._mask_sql(body, True, True, True, False, True)
+                took = time.perf_counter() - t0
+                best = took if best is None else min(best, took)
+            return best
+        for unit in ("''", "\\x"):
+            with self.subTest(unit=unit):
+                small, large = cost(40000, unit), cost(160000, unit)
+                self.assertLess(large / max(small, 1e-6), 8.0, (unit, small, large))
 
     def test_r5_shell_decoding_and_more_remote_runners(self):
         self.put("a.sql", "SELECT 1;\n")
