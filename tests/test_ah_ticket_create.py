@@ -75,6 +75,23 @@ class Create(Base):
         self.assertEqual(args["description"], "Why: x\nWhat: y\n")
         self.assertRegex(args["operationId"], r"^[0-9a-f-]{36}$")
 
+    def test_retry_finds_its_row_past_eight_mib_of_ledger(self):
+        """goodqa#14999: the lookup has no total budget. A created row after (or before) more than 8 MiB of other
+        rows is still found, so a retry never files a second ticket. A quiet stop at a byte budget would miss it."""
+        ledger = at._ledger(self.home)
+        filler = (json.dumps({"at": 1, "key": "tc-other-%06d" % 0, "status": "pending", "title": "x" * 200}) + "\n")
+        with open(ledger, "w") as f:
+            for i in range(9 * 1024 * 1024 // len(filler) + 10):
+                f.write(filler.replace("%06d" % 0, "%06d" % i))
+        a = self.create(key="owner-task-big")
+        self.assertFalse(a["deduplicated"])
+        with open(ledger, "a") as f:
+            f.write("[1, 2]\n" + "{" * 70000 + "\n" + "not json\n")  # wrong shape, over-long and junk rows are skipped
+        b = self.create(key="owner-task-big")
+        self.assertTrue(b["deduplicated"])
+        self.assertEqual(a["number"], b["number"])
+        self.assertEqual(len(self.adapter.creates()), 1)
+
     def test_same_key_twice_files_one_ticket(self):
         a = self.create(key="owner-task-1")
         b = self.create(key="owner-task-1")
