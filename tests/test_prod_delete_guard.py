@@ -762,6 +762,7 @@ class Round5(Case):
                     "head -c 999 evil.sql | mysql -h prod-db --init-command='SET x=1' -De",
                     "head -c 999 evil.sql | psql -h prod-db -Usvc app", "head -c 999 evil.sql | psql -h prod-db -v x=-f",
                     "head -c 999 evil.sql | psql -h prod-db -v 'x= -c'", "head -c 999 evil.sql | psql -h prod-db -v '<x'",
+                    "head -c 999 evil.sql | psql -h prod-db -v 'x=< ok.sql '",
                     "head -c 999 evil.sql | mariadb -h prod-db -pse app"), "deny")
         self.check(("head -c 99 evil.sql | mysql -h prod-db -Be 'SELECT 1'",
                     "head -c 99 evil.sql | mysql -h prod-db --execute='SELECT 1'",
