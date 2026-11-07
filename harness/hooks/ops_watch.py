@@ -30,6 +30,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -1210,21 +1211,29 @@ def _unix(value):
 
 def check_remote_units(cfg, state, runner, now):
     """Read-only check of a oneshot service and its timer on another host: failed last run, no success within
-    max_age_h (counted from the timer start when the job never ran), a missing unit or a stopped timer. One
-    bounded ssh call per unit (BatchMode, 5 s connect, 20 s total); nothing is started or reset there."""
+    max_age_h, a missing unit or a stopped timer. Staleness counts from the last success seen; with none stored
+    it counts from the timer start only when the service never started, else it waits for a success. A read
+    that fails (unreachable host, odd output) carries the last good read's alerts forward, so run_once neither
+    clears nor re-raises them. One bounded ssh call per unit (BatchMode, 5 s connect, 20 s total); nothing is
+    started or reset there."""
     out = []
     seen = state.setdefault("remote_units", {})
     for entry in cfg.get("remote_units") or []:
         host, unit = str(entry.get("host", "")), str(entry.get("unit", ""))
-        key = f"remote:{host[:40]}:{unit[:60]}"
-        if not REMOTE_HOST.fullmatch(host) or not REMOTE_UNIT.fullmatch(unit):
-            out.append(alert("remote_units", key + ":config", "warning", "remote unit entry has an unsafe host or unit name",
-                             {"host": host[:40], "unit": unit[:60]}))
+        key = f"remote:{host[:64]}:{unit[:100]}"  # the name checks allow 64 and 100: no two entries share a key
+        try:
+            max_age = float(entry.get("max_age_h", 26)) * 3600
+        except (TypeError, ValueError):
+            max_age = float("nan")
+        if (not REMOTE_HOST.fullmatch(host) or not REMOTE_UNIT.fullmatch(unit) or isinstance(entry.get("max_age_h"), bool)
+                or not math.isfinite(max_age) or max_age <= 0):
+            out.append(alert("remote_units", key + ":config", "warning",
+                             "remote unit entry has an unsafe host or unit name or a bad max_age_h",
+                             {"host": host[:64], "unit": unit[:100]}))
             continue
-        max_age = float(entry.get("max_age_h", 26)) * 3600
         scope = "--user " if entry.get("user", True) else ""
         remote = (f"systemctl {scope}show {unit}.service {unit}.timer -p Id,LoadState,ActiveState,Result,"
-                  "ExecMainStatus,ExecMainExitTimestamp,ActiveEnterTimestamp --timestamp=unix --no-pager")
+                  "ExecMainStatus,ExecMainStartTimestamp,ExecMainExitTimestamp,ActiveEnterTimestamp --timestamp=unix --no-pager")
         rec = seen.setdefault(key, {"first_try": now})
         try:
             rc, text = runner(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", host, remote], 20)
@@ -1233,36 +1242,47 @@ def check_remote_units(cfg, state, runner, now):
         blocks = _show_blocks(text) if rc == 0 else {}
         svc, tmr = blocks.get(f"{unit}.service"), blocks.get(f"{unit}.timer")
         if svc is None or tmr is None:
+            out.extend(a for a in rec.get("alerts") or [] if isinstance(a, dict) and a.get("check") == "remote_units"
+                       and str(a.get("key", "")).startswith(key + ":"))
             if now - rec.get("ok_at", rec["first_try"]) > 1800:
                 out.append(alert("remote_units", key + ":unreachable", "warning",
                                  f"cannot read {unit} on {host} for 30+ min", {"host": host, "unit": unit}))
             continue
         rec["ok_at"] = now
-        if svc.get("LoadState") != "loaded":
-            out.append(alert("remote_units", key + ":missing", "high", f"{unit}.service is not installed on {host}",
-                             {"host": host, "unit": unit, "load": svc.get("LoadState", "")[:20]}))
-            continue
-        ended = _unix(svc.get("ExecMainExitTimestamp"))
-        result = svc.get("Result") or ""
-        if svc.get("ActiveState") == "failed" or result not in ("", "success") or (
-                ended and svc.get("ExecMainStatus") not in (None, "", "0")):
-            out.append(alert("remote_units", key + ":failed", "high",
-                             f"{unit} on {host}: last run {result or svc.get('ActiveState')} "
-                             f"(exit {svc.get('ExecMainStatus', '?')})",
-                             {"host": host, "unit": unit, "result": result[:20]}))
-        elif ended:
-            rec["success_at"] = ended
-        if tmr.get("LoadState") != "loaded" or tmr.get("ActiveState") != "active":
-            out.append(alert("remote_units", key + ":timer", "high", f"{unit}.timer on {host} is not active",
-                             {"host": host, "unit": unit, "timer": tmr.get("ActiveState", "")[:20]}))
-        since = rec.get("success_at") or _unix(tmr.get("ActiveEnterTimestamp"))
-        if since is not None and now - since > max_age:
-            hours = (now - since) / 3600
-            what = "last success" if rec.get("success_at") else "timer started with no success since"
-            out.append(alert("remote_units", key + ":stale", "high",
-                             f"{unit} on {host}: {what} {hours:.0f} h ago (limit {max_age / 3600:.0f} h)",
-                             {"host": host, "unit": unit, "age_h": round(hours, 1)}))
+        mark = len(out)
+        _read_unit(out, rec, key, host, unit, svc, tmr, now, max_age)
+        rec["alerts"] = out[mark:]
     return out
+
+
+def _read_unit(out, rec, key, host, unit, svc, tmr, now, max_age):
+    if svc.get("LoadState") != "loaded":
+        out.append(alert("remote_units", key + ":missing", "high", f"{unit}.service is not installed on {host}",
+                         {"host": host, "unit": unit, "load": svc.get("LoadState", "")[:20]}))
+        return
+    ended = _unix(svc.get("ExecMainExitTimestamp"))
+    started = _unix(svc.get("ExecMainStartTimestamp"))
+    result = svc.get("Result") or ""
+    # Result=success already honours SuccessExitStatus; the raw exit status decides only when Result is empty.
+    if svc.get("ActiveState") == "failed" or result not in ("", "success") or (
+            not result and ended and svc.get("ExecMainStatus") not in (None, "", "0")):
+        out.append(alert("remote_units", key + ":failed", "high",
+                         f"{unit} on {host}: last run {result or svc.get('ActiveState')} "
+                         f"(exit {svc.get('ExecMainStatus', '?')})",
+                         {"host": host, "unit": unit, "result": result[:20]}))
+    elif ended:
+        rec["success_at"] = ended
+    if tmr.get("LoadState") != "loaded" or tmr.get("ActiveState") != "active":
+        out.append(alert("remote_units", key + ":timer", "high", f"{unit}.timer on {host} is not active",
+                         {"host": host, "unit": unit, "timer": tmr.get("ActiveState", "")[:20]}))
+    never_ran = started is None and ended is None
+    since = rec.get("success_at") or (_unix(tmr.get("ActiveEnterTimestamp")) if never_ran else None)
+    if since is not None and now - since > max_age:
+        hours = (now - since) / 3600
+        what = "last success" if rec.get("success_at") else "timer started with no success since"
+        out.append(alert("remote_units", key + ":stale", "high",
+                         f"{unit} on {host}: {what} {hours:.0f} h ago (limit {max_age / 3600:.0f} h)",
+                         {"host": host, "unit": unit, "age_h": round(hours, 1)}))
 
 
 # ---------------------------------------------------------------- 8. owner liveness
