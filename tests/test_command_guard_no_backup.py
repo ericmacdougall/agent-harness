@@ -528,7 +528,8 @@ class NativeReviewF2Remote(NoBackupCase):
                 self.assertEqual(cg._remote_host(local), '')
         path = self.clone()
         run('git', 'remote', 'set-url', 'origin', 'git@github.com:example/nb-test.git', cwd=path)
-        self.assertEqual(self.approve(path)['pushed_to']['url_host'], 'github.com')
+        pushed = self.approve(path)['pushed_to']
+        self.assertEqual((pushed['url_host'], pushed['answered']), ('github.com', ['origin@github.com']))
 
     def test_ls_remote_runs_outside_the_repository(self):
         seen = []
@@ -1170,7 +1171,8 @@ class Round4(NoBackupCase):
     def test_rd_symlink_alias_of_projects_blocked(self):
         c = cg.Compiled(self.policy, home=str(self.home))
         p = '%s/.claude/projects' % self.home
-        for cmd in ('ln -s %s /tmp/al' % p, 'ln -sf %s/p /tmp/al2' % p):
+        for cmd in ('ln -s %s /tmp/al' % p, 'ln -sf %s/p /tmp/al2' % p, 'ln --symbolic %s /tmp/al3' % p,
+                    'cp -as %s /tmp/al4' % p, 'cp -s %s/p/x.jsonl /tmp/al5' % p):
             with self.subTest(cmd=cmd):
                 self.assertEqual(cg.decide(cmd, c)[0], 'block')
 

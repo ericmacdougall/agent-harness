@@ -3942,7 +3942,9 @@ class Analyzer:
             if '-d' in texts and texts.index('-d') + 1 < len(args) and ('-o' in texts or '-of' in texts):
                 self.refuse('unzip -o (overwrites files)', args[texts.index('-d') + 1], tiers=('log', 'unknown'))
         elif name in ('cp', 'copy-item', 'cpi', 'copy', 'install', 'ln'):
-            if name == 'ln' and _flag_letters(args) & {'s'} and nd and \
+            symbolic = bool(_flag_letters(args) & {'s'}) or any(a.text in ('--symbolic', '--symbolic-link')
+                                                                  for a in args)
+            if name in ('ln', 'cp') and symbolic and nd and \
                     transcript_write(ctx.c, norm_path(nd[0].text, ctx).casefold()):
                 ctx.add(LOG_DELETE, 'transcript-forgery', 'links to ~/.claude/projects, an alias Bash could write '
                         'transcripts through', 'only Claude Code writes transcripts')
@@ -4876,6 +4878,8 @@ NO_BACKUP_SOURCE_RE = re.compile(r'^answer:([A-Za-z0-9._-]{1,80})/([0-9a-fA-F-]{
 NO_BACKUP_LABEL = re.compile(r'^Delete, no backup(?: \(Recommended\))?$')
 APPROVE_WORDS = NO_BACKUP_LABEL
 # "Delete, no backup" is an approval, so a bare "no" is not a decline word
+# defence in depth only: no answer matching the exact NO_BACKUP_LABEL holds one of these words; keep it so a
+# later label change cannot lean on the label alone
 DECLINE_WORDS = re.compile(r"\b(?:not|don'?t|keep|leave|cancel|nothing|never|later|yet|skip|hold|wait|instead)\b",
                            re.I)
 # an absolute path in question text: ends at whitespace, a quote or bracket, or sentence punctuation
@@ -5077,7 +5081,8 @@ def _check_git_pushed(real, ls_remote=None, hosts=DEFAULT_REMOTE_HOSTS):
                          'allowlisted network remote (%s); run `git fetch --prune`, or push it%s' % (
                              ', '.join('%s@%s' % a for a in answered[:3]),
                              '; %d live refs are not in this clone: fetch first' % missing if missing else ''))
-    return {'remote': answered[0][0], 'url_host': answered[0][1][:60], 'live_refs': len(live)}
+    return {'remote': answered[0][0], 'url_host': answered[0][1][:60], 'live_refs': len(live),
+            'answered': ['%s@%s' % (n[:40], h[:60]) for n, h in answered[:8]]}
 
 
 def _ls_remote(url):
@@ -5318,7 +5323,7 @@ def approve_delete_no_backup(path, user_source, wal, ttl=None, home=None, policy
         problem = _question_names_only(str(turn.get('question') or ''), real)
         if problem:
             raise ValueError('the AskUserQuestion this answer answers %s; ask the user again naming it' % problem)
-        if not APPROVE_WORDS.search(turn.get('text') or '') or DECLINE_WORDS.search(turn.get('text') or ''):
+        if not APPROVE_WORDS.fullmatch(turn.get('text') or '') or DECLINE_WORDS.search(turn.get('text') or ''):
             raise ValueError('the selected answer does not say delete (or it declines): the option must be exactly '
                              '"Delete, no backup" (optionally "(Recommended)"); ask the user again')
         target = _target_kind(real, home=user_home)
