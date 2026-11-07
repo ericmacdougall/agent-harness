@@ -23,13 +23,15 @@
 #   LOG_BACKUP_DEADLINE_GRACE_SECONDS / LOG_BACKUP_KILL_GRACE_SECONDS  a copy past its share gets SIGTERM after the
 #                           first (default 10) and SIGKILL after the second more (default 10)
 #   LOG_BACKUP_VERSIONS     exactly 0 turns off versions/STAMP (loud warning); anything else keeps them
-#   LOG_BACKUP_BULK_CHUNK   files per checkpointed bulk copy (default 1000 in the lane run, 100 otherwise, 1-99999),
+#   LOG_BACKUP_BULK_CHUNK   files per checkpointed bulk copy (default 300 in the lane run, 100 otherwise, 1-99999),
 #                           never more than fit the time left at about 2 rate-limited operations a file
-#   LOG_BACKUP_BULK_LANE    exactly 1 runs the bulk tier as its own detached run (the bulk lane), at the same time as
-#                           the transcripts, so tier 1 can no longer use up the bulk tier's time. The write budget is
-#                           split, never added: tier 1 copies at TPSLIMIT - BULK_TPS and the lane at BULK_TPS, so the
-#                           host stays at TPSLIMIT. TPSLIMIT must be larger than BULK_TPS. The launchd plist sets it.
-#   LOG_BACKUP_BULK_TPS     the lane's share of TPSLIMIT (default 1, 1-99)
+#   LOG_BACKUP_BULK_LANE    exactly 1 runs the bulk tier as its own detached run (the bulk lane), so tier 1 can no
+#                           longer use up the bulk tier's time. The lane yields to tier 1 (goodqa#15147): it never
+#                           copies while a tier-1 run holds the run lock, and a copy in flight when one starts is
+#                           stopped and its chunk sent again later. Tier 1 always copies at the full TPSLIMIT. The
+#                           launchd plist leaves it off (0) until three tier-1 runs in a row finish inside the budget.
+#   LOG_BACKUP_BULK_TPS     the lane's rate (default TPSLIMIT, 1-99, never more than TPSLIMIT)
+#   LOG_BACKUP_LANE_POLL_SECONDS  how often a lane copy checks for a tier-1 run (default 2, 1-60)
 #   LOG_BACKUP_LANE_BUDGET_SECONDS  wall time of one lane run (default 10800); the next scheduled run starts another
 #   LOG_BACKUP_TIER         internal: bulk marks the lane run itself; nothing else may set it
 # Freshness contract, two tiers with their own markers. log-backup.last-ok (transcripts, WALs, ledgers) is written
@@ -63,7 +65,8 @@ DEADLINE_GRACE=${LOG_BACKUP_DEADLINE_GRACE_SECONDS:-10}  # a copy still running 
 KILL_GRACE=${LOG_BACKUP_KILL_GRACE_SECONDS:-10}  # and SIGKILL this long after that (rclone drains batches on TERM)
 PERIOD=${LOG_BACKUP_PERIOD_SECONDS:-900}  # the schedule interval: a run, start delay included, ends before the next one
 LANE=${LOG_BACKUP_BULK_LANE:-0}          # 1: the bulk tier runs as its own detached run beside tier 1 (goodqa#15062)
-BULK_TPS=${LOG_BACKUP_BULK_TPS:-1}       # the lane's share of TPSLIMIT
+BULK_TPS=${LOG_BACKUP_BULK_TPS:-$TPSLIMIT}   # the lane's rate; it never copies beside tier 1, so no split
+LANE_POLL=${LOG_BACKUP_LANE_POLL_SECONDS:-2}
 LANE_BUDGET=${LOG_BACKUP_LANE_BUDGET_SECONDS:-10800}
 TIER=${LOG_BACKUP_TIER:-all}             # all: both tiers in this run; live: tier 1 only; bulk: the lane run
 for rate in TPSLIMIT TRANSFERS BULK_TPS; do
@@ -73,7 +76,7 @@ for rate in TPSLIMIT TRANSFERS BULK_TPS; do
 done
 BULK_CHUNK=${LOG_BACKUP_BULK_CHUNK:-}
 [ -z "$BULK_CHUNK" ] || printf '%s' "$BULK_CHUNK" | grep -Eq '^[1-9][0-9]{0,4}$' || { echo "log-backup: LOG_BACKUP_BULK_CHUNK must be 1-99999" >&2; exit 2; }
-for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER DEADLINE_GRACE SLICE_RESERVE KILL_GRACE PERIOD LANE_BUDGET; do
+for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER DEADLINE_GRACE SLICE_RESERVE KILL_GRACE PERIOD LANE_BUDGET LANE_POLL; do
   # No leading zeros: bash would read 08 as octal and abort the arithmetic.
   if ! printf '%s' "${!numeric:-0}" | grep -Eq '^(0|[1-9][0-9]{0,4})$'; then
     echo "log-backup: $numeric must be a whole number of at most 5 digits without leading zeros" >&2; exit 2
@@ -86,27 +89,22 @@ case "$TIER" in
   *) echo "log-backup: LOG_BACKUP_TIER is internal (only bulk, set by the lane itself)" >&2; exit 2 ;;
 esac
 [ "$LANE_BUDGET" -le 43200 ] || { echo "log-backup: LOG_BACKUP_LANE_BUDGET_SECONDS must be at most 43200 (a lock over a day old is taken over)" >&2; exit 2; }
-LANE_NOTE=
+[ "$LANE_POLL" -ge 1 ] && [ "$LANE_POLL" -le 60 ] || { echo "log-backup: LOG_BACKUP_LANE_POLL_SECONDS must be 1-60" >&2; exit 2; }
+[ "$BULK_TPS" -le "$TPSLIMIT" ] || { echo "log-backup: LOG_BACKUP_BULK_TPS must not be larger than LOG_BACKUP_TPSLIMIT (the host's budget)" >&2; exit 2; }
 if [ "$LANE" = 1 ]; then
-  # Split the host's write budget, never add to it: the lane and tier 1 together stay at TPSLIMIT. A budget too small
-  # to split (TPSLIMIT set back to 1, say) turns the lane off for this run instead of stopping every backup.
-  if [ "$TPSLIMIT" -le "$BULK_TPS" ]; then
-    [ "$TIER" != bulk ] || { echo "log-backup: the lane run needs LOG_BACKUP_TPSLIMIT larger than LOG_BACKUP_BULK_TPS" >&2; exit 2; }
-    LANE=0
-    LANE_NOTE="bulk lane off for this run: LOG_BACKUP_TPSLIMIT ($TPSLIMIT) must be larger than LOG_BACKUP_BULK_TPS ($BULK_TPS) to split; both tiers run here"
-  elif [ "$TIER" = bulk ]; then
-    TPSLIMIT=$BULK_TPS
-  else
-    TIER=live   # tier 1 is split from TPSLIMIT only while a lane run is going (see the lane start below)
-  fi
+  # The lane yields to tier 1 instead of splitting the budget (goodqa#15147): the two never copy at the same time, so
+  # tier 1 keeps the full rate for its 13 minutes and the lane uses the time tier 1 leaves.
+  if [ "$TIER" = bulk ]; then TPSLIMIT=$BULK_TPS; else TIER=live; fi
 fi
-[ -n "$BULK_CHUNK" ] || { if [ "$TIER" = bulk ]; then BULK_CHUNK=1000; else BULK_CHUNK=100; fi; }
+# Lane chunks are small enough that one cut short by a tier-1 run costs little to send again (goodqa#15147).
+[ -n "$BULK_CHUNK" ] || { if [ "$TIER" = bulk ]; then BULK_CHUNK=300; else BULK_CHUNK=100; fi; }
 # The lane run keeps its own run marker, watchdog markers and log prefix, so the two runs never clear each other's.
 TAG= SAY_TAG=
 [ "$TIER" = bulk ] && TAG=.lane SAY_TAG="[lane] "
 LASTRUN="$LOGDIR/log-backup${TAG}.last-run"
 LOG="$LOGDIR/log-backup${TAG}.log"
 LANE_LOCKD="$LOGDIR/log-backup.lane.lock.d"   # held by whichever run uses the bulk checkpoint (lane or all)
+LANE_STATE="$LOGDIR/log-backup.lane.state"    # the lane's "copying PID" or "idle PID" (goodqa#15147)
 # Size limits go to rclone, so they must be plain sizes: digits, an optional K, M or G, and not zero (a zero transfer
 # cap would stop every run immediately and the bulk marker would never be written).
 for sized in LOG_BACKUP_WORK_MAX_SIZE LOG_BACKUP_WORK_MAX_TRANSFER; do
@@ -132,7 +130,6 @@ rotate_log() {
 [ -f "$LOG" ] && rotate_log
 say() { printf '%s %s%s\n' "$(date -u +%FT%TZ)" "$SAY_TAG" "$1" >> "$LOG"; }
 fail() { say "$1"; echo "log-backup: $1" >&2; echo "$STARTED exit=$2" > "$LASTRUN"; exit "$2"; }
-[ -z "$LANE_NOTE" ] || say "$LANE_NOTE"
 
 file_age() { # seconds since modification of $1; BSD stat on Darwin, GNU stat elsewhere
   local m
@@ -220,19 +217,23 @@ WALL_END=$(( RUN_START + BUDGET_SECONDS ))
 # The lane run has its own budget and no schedule slot to fit: the scheduled run that started it keeps that slot.
 [ "$TIER" = bulk ] && WALL_END=$(( RUN_START + LANE_BUDGET ))
 MIN_SLICE=$SLICE_RESERVE; [ "$MIN_SLICE" -ge 1 ] || MIN_SLICE=1
+# Copy time left before a source would be told the budget is used up (the same test upload makes).
+time_left() { echo $(( WALL_END - $(date +%s) - DEADLINE_GRACE - KILL_GRACE )); }
 release_locks() { local d; for d in "$@"; do [ "$(cat "$d/pid" 2>/dev/null)" = "$$" ] && { rm -f "$d/pid"; rmdir "$d" 2>/dev/null; }; done; }
 if [ "$TIER" = bulk ]; then
   if legacy_run_active || ! acquire_lock "$LANE_LOCKD"; then
     say "bulk lane: another run holds the bulk checkpoint; this lane run exits"
     exit 0
   fi
+  echo "idle $$" > "$LANE_STATE.tmp.$$" && mv "$LANE_STATE.tmp.$$" "$LANE_STATE"   # a lane that yields (goodqa#15147)
   echo $$ > "$LOGDIR/log-backup.lane.started"   # the run that started this lane waits for this line
 elif legacy_run_active || ! acquire_lock; then
   say "skipped: another backup run holds the lock (this is not a successful backup)"
   date -u +%FT%TZ > "$LOGDIR/log-backup.last-skip"
   exit 0
 fi
-trap 'release_locks "$LOCKD" "$LANE_LOCKD"' EXIT
+lane_clear_state() { [ "$TIER" = bulk ] && [ "$(cut -d' ' -f2 "$LANE_STATE" 2>/dev/null)" = "$$" ] && rm -f "$LANE_STATE"; return 0; }
+trap 'lane_clear_state; release_locks "$LOCKD" "$LANE_LOCKD"' EXIT
 copy_pid= dog_pid=
 on_term() {
   # rclone commits its pending batch on TERM: wait for it up to KILL_GRACE, then kill it, and only then release the
@@ -337,6 +338,30 @@ rate_limit_note() { # rate_limit_note LOG-OFFSET: name a Dropbox write rate limi
   say "Dropbox write rate limit (too_many_write_operations) during this copy; other rclone uploads running now: $others (see: ps -axo pid,command | grep rclone)"
 }
 
+# The lane yields to tier 1 (goodqa#15147). tier1_active: a live tier-1 run holds the run lock (a lock whose pid is
+# not written yet counts while it is young; a ps refusal counts as live). lane_gate, before every lane copy, says
+# "copying" FIRST and only then looks at the lock; tier 1 takes the lock FIRST and only then reads the state
+# (lane_quiet). Whichever acts second sees the other, so the lane never starts a copy beside a tier-1 run.
+tier1_active() {
+  [ -d "$LOCKD" ] || return 1
+  local holder
+  holder=$(cat "$LOCKD/pid" 2>/dev/null)
+  if [ -z "$holder" ]; then [ "$(file_age "$LOCKD")" -lt 60 ]; return; fi
+  holder_alive "$holder"
+}
+lane_set_state() { echo "$1 $$" > "$LANE_STATE.tmp.$$" && mv "$LANE_STATE.tmp.$$" "$LANE_STATE"; }
+lane_gate() { # 0: clear to copy (state is copying); 1: the lane's time ran out while it waited
+  local said=0
+  while :; do
+    lane_set_state copying
+    tier1_active || return 0
+    lane_set_state idle
+    [ $said -eq 1 ] || { say "a tier-1 run holds the lock; the lane waits for it"; said=1; }
+    [ "$(time_left)" -ge "$MIN_SLICE" ] || return 1
+    sleep "$LANE_POLL" & wait $!
+  done
+}
+
 upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
   local p="$1" rel="$2" dst
   shift 2
@@ -351,12 +376,16 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
   local remaining
   # Dropbox can rate-limit (too_many_write_operations): retry the source with a pause before calling it a failure.
   # A source that still fails makes the whole run non-fresh.
-  attempt=0 copied=0
+  attempt=0 copied=0 yielded=0
   while :; do
+    if [ "$TIER" = bulk ] && ! lane_gate; then
+      say "lane budget (${LANE_BUDGET}s) used up waiting for tier 1 before $rel; the next lane run continues"; ok=1; budget_hit=1; return
+    fi
     # This copy's share: wall time left, less its own stop and kill grace, less what the later tier-1 sources are
     # promised (RESERVE). It is never under MIN_SLICE; when even that does not fit, the source waits for the next run.
     remaining=$(( WALL_END - $(date +%s) - DEADLINE_GRACE - KILL_GRACE ))
     if [ $remaining -lt $MIN_SLICE ]; then
+      [ "$TIER" != bulk ] || lane_set_state idle
       say "run time budget (${BUDGET_SECONDS}s) used up before $rel; the next run continues"; ok=1; budget_hit=1; return
     fi
     remaining=$(( remaining - ${RESERVE:-0} )); [ $remaining -ge $MIN_SLICE ] || remaining=$MIN_SLICE
@@ -382,10 +411,31 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
       wait "$nap" || exit 0
       kill -KILL "$copy_pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
     dog_pid=$!
+    if [ "$TIER" = bulk ]; then
+      # A tier-1 run that starts during this copy gets the budget: stop the copy (TERM, then KILL after KILL_GRACE) and
+      # send its chunk again later. The overlap is at most one poll plus the stop grace (goodqa#15147 NEG-1).
+      while kill -0 "$copy_pid" 2>/dev/null; do
+        if tier1_active; then
+          touch "$LOGDIR/.log-backup${TAG}.yield.$copy_pid"
+          kill -TERM "$copy_pid" 2>/dev/null
+          waited=0
+          while kill -0 "$copy_pid" 2>/dev/null && [ $waited -lt $(( KILL_GRACE * 5 )) ]; do sleep 0.2; waited=$((waited + 1)); done
+          kill -KILL "$copy_pid" 2>/dev/null
+          break
+        fi
+        sleep "$LANE_POLL" & wait $!
+      done
+    fi
     wait "$copy_pid"; rc=$?
     kill "$dog_pid" 2>/dev/null; wait "$dog_pid" 2>/dev/null
     dog_pid=   # reaped: a later signal must not reach a recycled pid
     done_pid=$copy_pid copy_pid=
+    [ "$TIER" != bulk ] || lane_set_state idle
+    if [ -e "$LOGDIR/.log-backup${TAG}.yield.$done_pid" ]; then
+      rm -f "$LOGDIR/.log-backup${TAG}.yield.$done_pid" "$LOGDIR/.log-backup${TAG}.deadline.$done_pid"
+      say "copy of $rel stopped: a tier-1 run started; this chunk is sent again after it"
+      yielded=1; return
+    fi
     if [ -e "$LOGDIR/.log-backup${TAG}.deadline.$done_pid" ]; then
       rm -f "$LOGDIR/.log-backup${TAG}.deadline.$done_pid"
       say "copy of $rel stopped at the run deadline (${remaining}s + ${DEADLINE_GRACE}s grace, killed after ${KILL_GRACE}s more if still running); partial, last-ok withheld"
@@ -399,7 +449,7 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
     attempt=$((attempt + 1))
     [ $attempt -le "${LOG_BACKUP_RETRIES:-2}" ] || break
     say "copy of $rel failed; retry $attempt after ${LOG_BACKUP_RETRY_SLEEP:-30}s (file changed mid-copy or rate limit)"
-    sleep "${LOG_BACKUP_RETRY_SLEEP:-30}"
+    sleep "${LOG_BACKUP_RETRY_SLEEP:-30}" & wait $!
   done
   if [ $copied -eq 1 ]; then
     found=$((found + 1))
@@ -486,6 +536,8 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
     n=$(wc -l < "$st/chunk" | tr -d ' ')
     cut -f1 "$st/chunk" > "$st/chunk.paths"
     upload "$HOME/$rel" "$rel" "${copy_args[@]+"${copy_args[@]}"}" --files-from-raw "$st/chunk.paths" --no-traverse
+    # A chunk stopped for tier 1 never advances the cursor: the same lines are sent again whole (goodqa#15147 NEG-2).
+    [ "$yielded" -eq 0 ] || continue
     [ "$copied" -eq 1 ] || { say "$rel: pass at $cur of $total files; the next run resumes there"; return 1; }
     cur=$((cur + n))
     echo "$cur" > "$st/cursor.tmp" && mv "$st/cursor.tmp" "$st/cursor"
@@ -512,17 +564,32 @@ bulk_due() { # the hourly gap has passed (or a pass stopped on the budget cleare
   a=$(raw_age "$bulk_try")
   [ -z "$a" ] || [ "$a" -lt 0 ] || [ "$a" -ge "$BULK_EVERY" ]
 }
-lane_split() { # tier 1 gives the lane its share while a lane run is going
-  if [ "$TPSLIMIT" -gt "$BULK_TPS" ]; then
-    TPSLIMIT=$(( TPSLIMIT - BULK_TPS ))
-  else
-    say "WARNING: a bulk lane run is going and LOG_BACKUP_TPSLIMIT ($TPSLIMIT) is too small to split; this host runs over its budget until it ends"
-  fi
+lane_yields() { # the live lane run $1 is one that yields to tier 1 (it keeps a state file under its pid)
+  case "$(cat "$LANE_STATE" 2>/dev/null)" in "copying $1"|"idle $1") return 0 ;; esac
+  return 1
+}
+lane_quiet() { # wait, bounded, until the lane run $1 has no copy in flight; it stops one when it sees this run's lock
+  local waited=0 limit=$(( (LANE_POLL + KILL_GRACE + 5) * 5 ))
+  while [ "$(cat "$LANE_STATE" 2>/dev/null)" = "copying $1" ] && holder_alive "$1"; do
+    if [ $waited -ge $limit ]; then
+      say "WARNING: the bulk lane (pid $1) did not pause within $((limit / 5))s; tier 1 copies anyway"
+      return 1
+    fi
+    sleep 0.2; waited=$((waited + 1))
+  done
+  return 0
 }
 lane_pid=$(cat "$LANE_LOCKD/pid" 2>/dev/null)
 if [ "$TIER" != bulk ] && [ -n "$lane_pid" ] && holder_alive "$lane_pid"; then
-  lane_split
-  say "bulk lane still running (pid $lane_pid); tier 1 copies at ${TPSLIMIT}/s"
+  if lane_yields "$lane_pid"; then
+    lane_quiet "$lane_pid" && say "bulk lane running (pid $lane_pid); it pauses while tier 1 copies at ${TPSLIMIT}/s"
+  elif [ "$TPSLIMIT" -gt 1 ]; then
+    # A lane started by the version before goodqa#15147 does not yield: share the budget with it until it ends.
+    TPSLIMIT=$(( TPSLIMIT - 1 ))
+    say "bulk lane still running (pid $lane_pid) and it does not yield; tier 1 copies at ${TPSLIMIT}/s"
+  else
+    say "WARNING: a bulk lane run that does not yield is going and LOG_BACKUP_TPSLIMIT is 1; this host runs over its budget until it ends"
+  fi
 elif [ "$TIER" = live ] && bulk_due; then
   rm -f "$LOGDIR/log-backup.lane.started"
   LOG_BACKUP_TIER=bulk /bin/bash "$SELF_DIR/$(basename "$0")" </dev/null >/dev/null 2>&1 &
@@ -532,8 +599,8 @@ elif [ "$TIER" = live ] && bulk_due; then
     sleep 0.2; waited=$((waited + 1))
   done
   if [ "$(cat "$LOGDIR/log-backup.lane.started" 2>/dev/null)" = "$lane_pid" ]; then
-    lane_split
-    say "bulk lane started (pid $lane_pid); tier 1 copies at ${TPSLIMIT}/s, the lane at ${BULK_TPS}/s"
+    lane_quiet "$lane_pid"
+    say "bulk lane started (pid $lane_pid); it copies at ${BULK_TPS}/s only while no tier-1 run holds the lock"
   else
     say "bulk lane did not start (pid $lane_pid; see log-backup.lane.log); tier 1 copies at ${TPSLIMIT}/s"
   fi
@@ -590,8 +657,6 @@ if [ $bulk_ran -eq 1 ] && [ -e "$bulk_try" ]; then
     say "bulk tier skipped: last attempt ${bulk_age}s ago (every ${BULK_EVERY}s)"
   fi
 fi
-# Copy time left before a source would be told the budget is used up (the same test upload makes).
-time_left() { echo $(( WALL_END - $(date +%s) - DEADLINE_GRACE - KILL_GRACE )); }
 # Mac 2026-11-07: tier 1 used the whole budget, so every hourly bulk attempt copied nothing, failed the run and still
 # spent the hour. With no time left the tier is deferred instead: not an attempt, no failure, the next run tries it.
 if [ $bulk_ran -eq 1 ] && [ ${#sources_bulk[@]} -gt 0 ] && [ "$(time_left)" -lt "$MIN_SLICE" ]; then
@@ -664,6 +729,6 @@ rc=0
 case "$TIER" in
   bulk) echo "$STARTED exit=$rc bulk=$bulk_ok" > "$LASTRUN" ;;
   live) echo "$STARTED exit=$rc transcripts=$transcripts_ok bulk=lane" > "$LASTRUN" ;;
-  *) echo "$STARTED exit=$rc transcripts=$transcripts_ok bulk=$bulk_ok${LANE_NOTE:+ lane=off-unsplittable}" > "$LASTRUN" ;;
+  *) echo "$STARTED exit=$rc transcripts=$transcripts_ok bulk=$bulk_ok" > "$LASTRUN" ;;
 esac
 exit $rc

@@ -1319,7 +1319,8 @@ class BulkLane(Case):
     def tps(self, argv):
         return argv[argv.index("--tpslimit") + 1]
 
-    def test_lane_runs_tier_2_on_its_share_and_tier_1_on_the_rest(self):
+    def test_lane_runs_tier_2_and_tier_1_keeps_the_full_rate(self):
+        # goodqa#15147: the 1/1 split made tier 1 overrun its budget in 2 of 3 live runs; the lane now yields instead.
         done = self.run_script(LOG_BACKUP_BULK_LANE="1", LOG_BACKUP_TPSLIMIT="3", LOG_BACKUP_BULK_TPS="1")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("bulk=lane", (self.logs / "log-backup.last-run").read_text())
@@ -1327,7 +1328,7 @@ class BulkLane(Case):
         bulk = [c for c in self.copies() if "--files-from-raw" in c]
         live = [c for c in self.copies() if "--files-from-raw" not in c]
         self.assertTrue(bulk and live, self.copies())
-        self.assertEqual({self.tps(c) for c in live}, {"2"}, "tier 1 copies at TPSLIMIT - BULK_TPS")
+        self.assertEqual({self.tps(c) for c in live}, {"3"}, "tier 1 copies at the full TPSLIMIT")
         self.assertEqual({self.tps(c) for c in bulk}, {"1"}, "the lane copies at BULK_TPS")
         self.assertTrue(self.last_ok().exists())
         self.assertTrue(self.bulk_ok().exists(), "the lane writes the bulk marker")
@@ -1335,14 +1336,13 @@ class BulkLane(Case):
         self.assertNotIn("[lane] ", (self.logs / "log-backup.log").read_text())
         self.assertIn("bulk lane started", (self.logs / "log-backup.log").read_text())
 
-    def test_an_unsplittable_budget_turns_the_lane_off_and_still_backs_up(self):
-        # PR #124 review F3: TPSLIMIT back to 1 with the plist's lane on stopped every run, transcripts included.
+    def test_a_budget_of_one_still_backs_up_both_tiers_with_the_lane_on(self):
+        # PR #124 review F3: TPSLIMIT back to 1 with the plist's lane on stopped every run, transcripts included. The
+        # lane no longer splits the budget, so a rate of 1 works for both tiers (goodqa#15147).
         done = self.run_script(LOG_BACKUP_BULK_LANE="1", LOG_BACKUP_TPSLIMIT="1")
         self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("exit=0 bulk=0", self.wait_for_lane())
         self.assertTrue(self.last_ok().exists() and self.bulk_ok().exists())
-        self.assertIn("bulk lane off for this run", (self.logs / "log-backup.log").read_text())
-        self.assertIn("lane=off-unsplittable", (self.logs / "log-backup.last-run").read_text())
-        self.assertFalse(self.lane_lock().exists())
         self.assertEqual({self.tps(c) for c in self.copies()}, {"1"})
 
     def test_a_lane_is_not_started_when_the_bulk_tier_is_not_due_and_tier_1_keeps_the_full_rate(self):
@@ -1379,7 +1379,8 @@ class BulkLane(Case):
     def test_lane_settings_that_would_add_to_the_budget_are_refused(self):
         for extra in ({"LOG_BACKUP_BULK_LANE": "yes", "LOG_BACKUP_TPSLIMIT": "2"},
                       {"LOG_BACKUP_BULK_LANE": "1", "LOG_BACKUP_TPSLIMIT": "2", "LOG_BACKUP_LANE_BUDGET_SECONDS": "43201"},
-                      {"LOG_BACKUP_BULK_LANE": "1", "LOG_BACKUP_TIER": "bulk", "LOG_BACKUP_TPSLIMIT": "1"},
+                      {"LOG_BACKUP_BULK_LANE": "1", "LOG_BACKUP_TPSLIMIT": "2", "LOG_BACKUP_BULK_TPS": "3"},
+                      {"LOG_BACKUP_BULK_LANE": "1", "LOG_BACKUP_TPSLIMIT": "2", "LOG_BACKUP_LANE_POLL_SECONDS": "0"},
                       {"LOG_BACKUP_TIER": "bulk", "LOG_BACKUP_TPSLIMIT": "2"},
                       {"LOG_BACKUP_TIER": "live", "LOG_BACKUP_TPSLIMIT": "2"}):
             done = self.run_script(**extra)
@@ -1441,7 +1442,7 @@ class BulkLane(Case):
         self.assertFalse((self.logs / "log-backup.last-run").exists(), "the lane keeps its own run marker")
         self.assertTrue(self.bulk_ok().exists())
 
-    def test_the_lane_sends_a_thousand_files_a_chunk_and_other_runs_a_hundred(self):
+    def test_the_lane_sends_three_hundred_files_a_chunk_and_other_runs_a_hundred(self):
         for i in range(150):
             self.put(f".agent-harness/work/c/f{i:03d}.md", b"x%d\n" % i)
 
@@ -1455,6 +1456,169 @@ class BulkLane(Case):
         done = self.run_script()
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(len(work_chunks()), 2, "a run that shares its 13 minutes keeps 100-file chunks")
+
+
+HOLDER = "trap 'kill $nap; exit 0' TERM\nsleep 90 & nap=$!\nwait $nap\n"
+
+
+class LaneYield(BulkLane):
+    """goodqa#15147: with the 1/1 split tier 1 overran its 13-minute budget in 2 of 3 live runs. The lane yields: no
+    lane copy while a tier-1 run holds log-backup.lock.d, a copy in flight is stopped within one poll plus the stop
+    grace, its chunk is sent again whole, and the cursor never skips a file."""
+
+    FAST = dict(LOG_BACKUP_BULK_LANE="1", LOG_BACKUP_TIER="bulk", LOG_BACKUP_TPSLIMIT="2",
+                LOG_BACKUP_LANE_POLL_SECONDS="1", LOG_BACKUP_DEADLINE_GRACE_SECONDS="1",
+                LOG_BACKUP_KILL_GRACE_SECONDS="2", LOG_BACKUP_SLICE_RESERVE_SECONDS="1")
+
+    def holder(self, lockd, state=None, body=HOLDER):
+        """A live process that passes holder_alive (bash running a file named log-backup.sh) holding `lockd`."""
+        folder = Path(tempfile.mkdtemp(prefix="holder-", dir=self.tmp))
+        script = folder / "log-backup.sh"
+        script.write_text(body)
+        proc = subprocess.Popen(["/bin/bash", str(script)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: proc.poll() is None and (proc.terminate(), proc.wait()))
+        lockd.mkdir(parents=True, exist_ok=True)
+        (lockd / "pid").write_text(str(proc.pid))
+        if state:
+            (self.logs / "log-backup.lane.state").write_text("%s %d\n" % (state, proc.pid))
+        return proc
+
+    def release(self, proc, lockd):
+        proc.terminate()
+        proc.wait(timeout=10)
+        (lockd / "pid").unlink()
+        lockd.rmdir()
+
+    def run_lock(self):
+        return self.logs / "log-backup.lock.d"
+
+    def bulk_copies(self):
+        return [c for c in self.copies() if "--files-from-raw" in c]
+
+    def test_ac1_with_tier_1_active_the_lane_makes_no_copy_requests(self):
+        self.logs.mkdir(parents=True, exist_ok=True)
+        tier1 = self.holder(self.run_lock())
+        start = time.time()
+        done = self.run_script(LOG_BACKUP_LANE_BUDGET_SECONDS="6", **self.FAST)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertGreaterEqual(time.time() - start, 3, "the lane waited instead of copying")
+        self.assertEqual(self.copies(), [], "no lane copy while a tier-1 run holds the lock")
+        log = (self.logs / "log-backup.lane.log").read_text()
+        self.assertIn("a tier-1 run holds the lock; the lane waits for it", log)
+        self.assertIn("used up waiting for tier 1", log)
+        self.assertFalse(self.bulk_ok().exists())
+        self.release(tier1, self.run_lock())
+
+    def test_ac1_the_lane_resumes_when_tier_1_releases_the_lock(self):
+        self.logs.mkdir(parents=True, exist_ok=True)
+        tier1 = self.holder(self.run_lock())
+        proc = subprocess.Popen(["/bin/bash", str(SCRIPT)], env=self.env(LOG_BACKUP_LANE_BUDGET_SECONDS="180",
+                                LOG_BACKUP_RETRY_SLEEP="0", LOG_BACKUP_BULK_EVERY_SECONDS="0", **self.FAST),
+                                cwd=str(self.tmp), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
+        time.sleep(3)
+        self.assertEqual(self.copies(), [], "no lane copy while tier 1 holds the lock")
+        self.release(tier1, self.run_lock())
+        self.assertEqual(proc.wait(timeout=60), 0, (self.logs / "log-backup.lane.log").read_text()[-1500:])
+        self.assertTrue(self.bulk_copies(), "the lane copied once the lock was free")
+        self.assertTrue(self.bulk_ok().exists())
+        self.assertFalse((self.logs / "log-backup.lane.state").exists(), "the lane clears its state on exit")
+
+    def test_ac2_tier_1_keeps_the_full_rate_beside_a_yielding_lane(self):
+        self.logs.mkdir(parents=True, exist_ok=True)
+        self.holder(self.lane_lock(), state="idle")
+        done = self.run_script(LOG_BACKUP_BULK_LANE="1", LOG_BACKUP_TPSLIMIT="2")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual({self.tps(c) for c in self.copies()}, {"2"}, "no split beside a lane that yields")
+        self.assertEqual(self.bulk_copies(), [], "no second bulk writer")
+        self.assertTrue(self.last_ok().exists())
+        self.assertIn("it pauses while tier 1 copies", (self.logs / "log-backup.log").read_text())
+
+    def test_neg1_tier_1_waits_a_bounded_time_for_a_lane_copy_to_stop(self):
+        self.logs.mkdir(parents=True, exist_ok=True)
+        state = self.logs / "log-backup.lane.state"
+        flips = "sleep 1.5\necho \"idle $$\" > %s\n%s" % (str(state), HOLDER)
+        self.holder(self.lane_lock(), state="copying", body=flips)
+        start = time.time()
+        done = self.run_script(LOG_BACKUP_BULK_LANE="1", LOG_BACKUP_TPSLIMIT="2", LOG_BACKUP_LANE_POLL_SECONDS="1",
+                               LOG_BACKUP_KILL_GRACE_SECONDS="1")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertGreaterEqual(time.time() - start, 1.2, "tier 1 waited for the lane's copy to stop")
+        self.assertNotIn("did not pause", (self.logs / "log-backup.log").read_text())
+        self.assertEqual({self.tps(c) for c in self.copies()}, {"2"})
+        # a lane that never pauses costs tier 1 at most poll + kill grace + 5 seconds, then tier 1 copies anyway
+        state.unlink()
+        for p in self.lane_lock().iterdir():
+            p.unlink()
+        self.lane_lock().rmdir()
+        self.holder(self.lane_lock(), state="copying")
+        open(self.calls, "w").close()
+        start = time.time()
+        done = self.run_script(LOG_BACKUP_BULK_LANE="1", LOG_BACKUP_TPSLIMIT="2", LOG_BACKUP_LANE_POLL_SECONDS="1",
+                               LOG_BACKUP_KILL_GRACE_SECONDS="1")
+        elapsed = time.time() - start
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(6 <= elapsed < 20, elapsed)
+        self.assertIn("did not pause within 7s", (self.logs / "log-backup.log").read_text())
+        self.assertTrue(self.last_ok().exists())
+
+    def test_neg2_a_chunk_cut_by_tier_1_is_sent_again_whole_and_no_file_is_skipped(self):
+        names = [".agent-harness/work/y/f%02d.md" % i for i in range(25)]
+        for i, rel in enumerate(names):
+            self.put(rel, b"yield %d\n" % i)
+        record = self.tmp / "chunks.jsonl"
+        term = self.tmp / "term-at"
+        wrapper = self.tmp / "bin" / "cutting-rclone"
+        wrapper.write_text(
+            "#!%(py)s\nimport json, os, signal, sys, time\n"
+            "argv = sys.argv[1:]\n"
+            "if '--files-from-raw' in argv and argv[-1].endswith('.agent-harness/work'):\n"
+            "    names = open(argv[argv.index('--files-from-raw') + 1]).read().split()\n"
+            "    open(%(rec)r, 'a').write(json.dumps(names) + '\\n')\n"
+            "    if not os.path.exists(%(rec)r + '.cut'):\n"
+            "        open(%(rec)r + '.cut', 'w').close()\n"
+            "        signal.signal(signal.SIGTERM, lambda *_: (open(%(term)r, 'w').write(str(time.time())), sys.exit(143)))\n"
+            "        time.sleep(60)\n"
+            "        sys.exit(0)\n"
+            "os.execv(%(fake)r, [%(fake)r] + argv)\n"
+            % {"py": sys.executable, "rec": str(record), "term": str(term), "fake": str(self.fake)})
+        wrapper.chmod(0o755)
+        env = self.env(LOG_BACKUP_RCLONE=str(wrapper), LOG_BACKUP_LANE_BUDGET_SECONDS="90", LOG_BACKUP_BULK_CHUNK="10",
+                       LOG_BACKUP_REMOTE=str(self.remote), LOG_BACKUP_ALLOW_LOCAL="1",
+                       FAKE_OPS_MATCH=".agent-harness/work", FAKE_OPS_PER_RUN="100000",
+                       LOG_BACKUP_RETRY_SLEEP="0", LOG_BACKUP_BULK_EVERY_SECONDS="0", **self.FAST)
+        proc = subprocess.Popen(["/bin/bash", str(SCRIPT)], env=env, cwd=str(self.tmp),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
+        cut_marker = Path(str(record) + ".cut")
+        end = time.time() + 30
+        while time.time() < end and not cut_marker.exists():
+            time.sleep(0.1)
+        self.assertTrue(cut_marker.exists(), "the lane started its first chunk")
+        locked_at = time.time()
+        tier1 = self.holder(self.run_lock())
+        end = time.time() + 15
+        while time.time() < end and not term.exists():
+            time.sleep(0.1)
+        self.assertTrue(term.exists(), "the lane stopped its copy when tier 1 took the lock")
+        # NEG-1: one poll (1 s) plus scheduling slack; the KILL grace only applies if TERM is ignored
+        self.assertLess(float(term.read_text()) - locked_at, 1 + 1.5)
+        cursor = self.logs / "log-backup.bulk.d" / ".agent-harness_work" / "cursor"
+        time.sleep(3)
+        self.assertEqual(len(record.read_text().splitlines()), 1, "no copy request while tier 1 holds the lock")
+        self.assertEqual(cursor.read_text().strip(), "0", "a cut chunk never advances the cursor")
+        self.release(tier1, self.run_lock())
+        self.assertEqual(proc.wait(timeout=60), 0, (self.logs / "log-backup.lane.log").read_text()[-1500:])
+        chunks = [json.loads(line) for line in record.read_text().splitlines()]
+        self.assertEqual(chunks[1], chunks[0], "the cut chunk is sent again whole")
+        sent = [n for c in chunks[1:] for n in c]
+        self.assertEqual(len(sent), len(set(sent)), "after the repeat no file is sent twice")
+        want = set(names) | {".agent-harness/work/t1/notes.md"}
+        got = {f for f in self.remote_files() if f.startswith(".agent-harness/work/")}
+        self.assertEqual(got, want, "no file skipped")
+        self.assertIn("a tier-1 run started; this chunk is sent again after it",
+                      (self.logs / "log-backup.lane.log").read_text())
+        self.assertTrue(self.bulk_ok().exists())
 
 
 class BulkFilters(BulkResume):
