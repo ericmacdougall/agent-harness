@@ -680,14 +680,27 @@ def _write_grants(grants: list, home=None) -> None:
     os.replace(tmp, path)
 
 
-def _record_wal(wal: Path, note: str, source: str) -> bool:
+def _record_wal(wal: Path, note: str, source: str):
+    """True when wal_note.py recorded the decision, else its reason (bounded). Only True counts as recorded."""
     helper = HERE / "wal_note.py"
     try:
         r = subprocess.run([sys.executable, str(helper), "--wal", str(wal), "--event", "decision", "--note", note,
                             "--source", source], capture_output=True, text=True, timeout=30, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return r.returncode == 0
+    except (OSError, subprocess.SubprocessError) as exc:
+        return type(exc).__name__
+    return True if r.returncode == 0 else ((r.stderr or r.stdout).strip()[-300:] or "exit %d" % r.returncode)
+
+
+def wal_source(user_source: str, answer_text: str) -> str:
+    """The provenance source for the grant's WAL decision: the answer id plus a verbatim quoted excerpt of the
+    selected answer (wal_note.py refuses an answer: source without one). The excerpt is the longest run of the
+    answer that has no double quote or `...` (provenance's segment marker), at most 300 characters."""
+    pieces = [x.strip() for chunk in str(answer_text or "").split('"') for x in chunk.split("...")]
+    excerpt = max(pieces, key=len, default="")[:300].strip()
+    if len(excerpt) < 12:
+        raise ValueError("the selected answer is too short to cite in the WAL (12+ characters without quotes): use "
+                         "an option label such as 'Approve DELETE on <target>'")
+    return '%s "%s"' % (user_source, excerpt)
 
 
 def grant(user_source: str, target: str, wal, ttl: int = DEFAULT_TTL, note: str = "", home=None, now=None,
@@ -712,6 +725,7 @@ def grant(user_source: str, target: str, wal, ttl: int = DEFAULT_TTL, note: str 
         raise ValueError("the cited answer does not name %s (or it declines): ask with AskUserQuestion and an option "
                          "label naming the exact target, such as 'Approve DELETE on %s', then cite that answer"
                          % (target, target))
+    cited = wal_source(user_source, turn.get("text"))
     source_ts = _epoch(turn.get("timestamp"))
     if now - source_ts > MAX_SOURCE_AGE or source_ts > now + CLOCK_SLACK:
         raise ValueError("the user source is older than %d hours (or in the future); ask again" % (MAX_SOURCE_AGE // 3600))
@@ -732,9 +746,10 @@ def grant(user_source: str, target: str, wal, ttl: int = DEFAULT_TTL, note: str 
                  "granted_at": int(now), "expires_at": int(now) + int(ttl), "note": (note or "")[:300],
                  "nonce": secrets.token_hex(8)}
         entry["mac"] = _mac(key, entry)
-        if not record(Path(wal), "prod_delete_guard grant: scope=%s target=%s ttl=%ss note=%s" % (
-                GRANT_SCOPE, target, int(ttl), entry["note"]), user_source):
-            raise ValueError("the WAL record failed, so no grant was written")
+        recorded = record(Path(wal), "prod_delete_guard grant: scope=%s target=%s ttl=%ss note=%s" % (
+            GRANT_SCOPE, target, int(ttl), entry["note"]), cited)
+        if recorded is not True:
+            raise ValueError("the WAL record failed, so no grant was written (%s)" % str(recorded)[:300])
         grants.append(entry)
         _write_grants(grants, home)
     finally:
