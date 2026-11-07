@@ -42,7 +42,9 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     # Destructive and config-dump command guard (GoodQA #14471): launcher plus analyser.
                     'command_guard.py', 'command_guard_hook.py', 'redact.py', 'kill_guard.py', 'kill_guard_policy.json', 'merge_gate.py', 'bg_job.py',
                     # Dropped-owner gate on Codex Stop and its reads (goodqa#14791 P18)
-                    'dropped_gate.py', 'ah.py', 'liveness.py')
+                    'dropped_gate.py', 'ah.py', 'liveness.py',
+                    # Heavy-job guard (goodqa#14817): keeps large copies, suites and builds off the Mac for Codex too.
+                    'heavy_job_guard.py', 'resource_limits.json')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 
@@ -84,6 +86,10 @@ def kill_guard_command(codex_home: Path) -> str:
     return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'kill_guard.py')) + ' hook'
 
 
+def heavy_guard_command(codex_home: Path) -> str:
+    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'heavy_job_guard.py'))
+
+
 def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) -> dict:
     if not isinstance(existing, dict):
         raise ValueError('hooks.json must contain an object')
@@ -95,6 +101,7 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
     policy = policy_command(codex_home)
     guard = guard_command(codex_home)
     kill_guard = kill_guard_command(codex_home)
+    heavy_guard = heavy_guard_command(codex_home)
     gate = gate_command(codex_home)
     for event in HOOK_EVENTS:
         lifecycle = event in {'Stop', 'Interrupt'}
@@ -110,7 +117,7 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
             handlers = [handler for handler in group['hooks']
                         if not (isinstance(handler, dict) and handler.get('type') == 'command'
                                 and handler.get('command') in (command, policy, guard,
-                                                               guard_command(codex_home, ''), gate, kill_guard))]
+                                                               guard_command(codex_home, ''), gate, kill_guard, heavy_guard))]
             if lifecycle and len(handlers) != len(group['hooks']) and group != managed:
                 raise ValueError(f'hooks.json has a custom {event} hook invoking the managed command; '
                                  'reconcile that group explicitly before installing')
@@ -131,6 +138,11 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
             # Kill guard after the command guard, so main's trusted positions above it do not move (GoodQA #14590,
             # GoodQA #14506). --no-command-guard leaves out both.
             preserved.append({'hooks': [{'type': 'command', 'command': kill_guard, 'timeout': 30}]})
+        if event == 'PreToolUse':
+            # Heavy-job guard last, so every trusted position above keeps its hash; independent of --no-command-guard.
+            # It fails open on its own errors and denies with exit 2 only for heavy work on the Mac. Codex trust for
+            # this hook needs the user to review it in /hooks; until then Codex skips it (ops-watch codex:trust).
+            preserved.append({'hooks': [{'type': 'command', 'command': heavy_guard, 'timeout': 30}]})
         hooks[event] = preserved
     return result
 

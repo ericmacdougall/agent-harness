@@ -435,7 +435,8 @@
     "Bash"
    ],
    "flavors": [
-    "claude"
+    "claude",
+    "codex"
    ],
    "status": "installed",
    "rules": [

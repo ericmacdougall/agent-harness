@@ -7,6 +7,30 @@ group by pull request.
 ## Unreleased
 
 ### Added
+- Heavy work off the Mac (goodqa#14817, P12). `heavy_job_guard.py` has a `copy` rule: cp, rsync, tar, ditto,
+  `git clone`, `gh repo clone` and `git worktree add` are sized (bounded walk, `ssh du`, GitHub repo size) and
+  refused at 1 GiB (`HARNESS_COPY_GIB`), unknown size counting as heavy. `HARNESS_LOCAL_OK` is limited to one use
+  per owner per hour (`HARNESS_HATCH_PER_HOUR`), audited to the WAL and the alert ring (source `heavy-guard`), and
+  never applies to a large copy above 85% disk. `ops_watch.py` gives each `work/<session>/<sub>` owner a 5 GiB disk
+  budget (kit `disk_budget_gib` up to 20), alerts `disk:owner:<agent>` by name and writes
+  `state/disk-budget/<agent>.json`; an over-budget owner cannot start a heavy copy. Nothing is killed or deleted.
+  `install_codex.py` installs the guard for Codex (trust it in Codex `/hooks`).
+- Heavy families off the Mac (goodqa#14817). `heavy_job_guard.py` now denies package installs (pnpm/npm/yarn/bun),
+  replay/synthetic/stress/soak scripts and `k6 run`, docker/podman run, pull and compose up (remote engines are
+  allowed), and backgrounded or looped `claude -p` (unquoted `&` only; the cap plus `HARNESS_LOCAL_OK` is the
+  escape). `xargs -P` and `parallel` fan-out is enforced too. Each denial prints a runnable route: copy the
+  checkout, then `ssh HOST bash -lc '<whole command>'`. Default host `t2-dev` (`HARNESS_ROUTE_HOST`); headless
+  claude goes to `dev2` (`HARNESS_CLAUDE_ROUTE_HOST`) because claude is not logged in on t2-dev. Not covered:
+  pip/uv/bundle installs, `codex exec`, `claude -p` in nested shells. `exempt_hosts` in `heavy_job_guard.json`
+  switches the guard off on a heavy-work host such as the Mac mini.
+- Dropbox upload lane (goodqa#14817). `heavy_job_guard.py` rule `dropbox-lane` (enforce) refuses an agent
+  `rclone copy|copyto|sync|move|moveto|bisync` to a Dropbox remote (type from `rclone listremotes --long`, never the
+  config file) without `--tpslimit` of at most 4, with more than 4 `--transfers`, or while another agent upload to
+  Dropbox runs. The launchd log backup is never the lane holder. Dry runs, downloads and listings are allowed;
+  `HARNESS_LOCAL_OK` applies. Two parallel unthrottled uploads stalled the log backup for 6 h on 2026-11-07.
+- `command_guard.py`: `rm` of a top-level git clone needs no Dropbox backup when git proves it clean, with nothing
+  untracked, and every local commit reachable from a remote-tracking ref that matches the live remote
+  (`reproducible_clone` policy). Any doubt keeps the existing approve-delete rule.
 - `scripts/leak_scan.py`: scans tracked files (or history with `--history [--range]`) for
   tokens, private keys, real home-directory names, private and shared-address-space (RFC 6598) addresses,
   tailnet names and a local denylist. It never prints a matched value, and exits 2 if

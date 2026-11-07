@@ -1228,16 +1228,19 @@ class InstallTests(unittest.TestCase):
         user = {'hooks': {'PreToolUse': [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': 'my-hook'}]}]}}
         without = self.install_codex.merge_hooks(user, codex, command_guard=False)['hooks']['PreToolUse']
         with_guard = self.install_codex.merge_hooks(user, codex)['hooks']['PreToolUse']
-        self.assertEqual(with_guard[:len(without)], without)
-        self.assertEqual(len(with_guard), len(without) + 2)  # the command guard, then the kill guard (GoodQA #14506)
-        self.assertEqual(with_guard[-2]['hooks'][0]['command'], self.install_codex.guard_command(codex))
-        self.assertEqual(with_guard[-1]['hooks'][0]['command'], self.install_codex.kill_guard_command(codex))
-        self.assertNotIn('matcher', with_guard[-2])
-        self.assertNotIn('matcher', with_guard[-1])
+        self.assertEqual(with_guard[:len(without) - 1], without[:-1])  # without the guards it still ends with the heavy guard
+        # the command guard, the kill guard (GoodQA #14506), then the heavy-job guard (goodqa#14817)
+        self.assertEqual(len(with_guard), len(without) + 2)
+        self.assertEqual(with_guard[-3]['hooks'][0]['command'], self.install_codex.guard_command(codex))
+        self.assertEqual(with_guard[-2]['hooks'][0]['command'], self.install_codex.kill_guard_command(codex))
+        self.assertEqual(with_guard[-1]['hooks'][0]['command'], self.install_codex.heavy_guard_command(codex))
+        for group in with_guard[-3:]:
+            self.assertNotIn('matcher', group)
+        self.assertIn('heavy_job_guard.py', self.install_codex.DELIVERY_HELPERS)
         again = self.install_codex.merge_hooks({'hooks': {'PreToolUse': with_guard}}, codex)['hooks']['PreToolUse']
         self.assertEqual(again, with_guard)  # idempotent: a reinstall keeps every index
         # upgrade from the 220c37e layout (guard first): one guard group, moved back to its place
-        old = [with_guard[-2]] + with_guard[:-2] + with_guard[-1:]
+        old = [with_guard[-3]] + with_guard[:-3] + with_guard[-2:]
         upgraded = self.install_codex.merge_hooks({'hooks': {'PreToolUse': old}}, codex)['hooks']['PreToolUse']
         self.assertEqual(upgraded, with_guard)
 

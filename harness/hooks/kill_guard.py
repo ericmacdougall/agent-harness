@@ -1461,6 +1461,7 @@ def make_analyzer_class(cg):
             return '--pid' in seen and '--reason' in seen
 
         def check_interpreter(self, name, texts, cmd):
+            texts = self.drop_script_arguments(texts)
             body = ' '.join(texts)
             for redir in getattr(cmd, 'redirs', []):
                 if redir.body:
@@ -1479,6 +1480,26 @@ def make_analyzer_class(cg):
                                               '[--host H] [--foreign]` (literal words, with -I; remote hosts via --host, not ssh)')
                 else:
                     self.block('script-kill', 'interpreter code signals processes the guard cannot check')
+
+        DATA_ARG_SCRIPTS = frozenset(('wal_note.py', 'gq.py', 'ah.py', 'spec_flow.py', 'provenance.py', 'commit_policy.py',
+                                      'peer_review.py', 'deliver.py', 'workdir.py', 'escalation.py', 'ops_watch.py',
+                                      'rescue.py', 'ticket_adapters.py', 'report_file.py'))
+
+        def drop_script_arguments(self, texts):
+            """`python3 wal_note.py --note 'will kill nothing'`: the arguments of a NAMED harness tool that records
+            text are data, not code (goodqa#14817). Deliberately an allowlist: any other script (run_capped.py,
+            watch-tests.py, a runner) may run its arguments as a command, and a flag before the script may carry
+            inline code, so everything else keeps being scanned in full. The script must be the first word and the
+            arguments must not carry a `--` separator or a bare signal verb."""
+            if not texts or texts[0].startswith('-'):
+                return texts
+            if os.path.basename(texts[0]) not in self.DATA_ARG_SCRIPTS:
+                return texts
+            rest = texts[1:]
+            if '--' in rest or any(self.script_kill is not None and self.script_kill.fullmatch(w.strip().lower())
+                                   for w in rest):
+                return texts
+            return texts[:1]
 
         def check_netwatch(self, args):
             texts = [a.text for a in args]

@@ -89,6 +89,81 @@ class DiskTests(Base):
         ow.measure_dirs(["/h/a"], state2, r2, now + 3600, 100, 50)
         self.assertNotIn("disk:growth", keys(ow.growth_alerts(state2, [], self.cfg["disk"], now + 3600)))
 
+    def owner_fixture(self, sizes):
+        """work/sess1/agent-AAA and work/sess1/task-b; du reports sizes.get(path, 1) GiB."""
+        work = self.home / ".agent-harness" / "work" / "sess1"
+        (work / "agent-AAA").mkdir(parents=True)
+        (work / "task-b").mkdir(parents=True)
+        runner = FakeRunner({("du",): lambda argv, t, s: (0, f"{int(sizes.get(argv[-1], 1) * 1024 * 1024)}\t{argv[-1]}\n")})
+        return work, runner
+
+    def budget_file(self, name):
+        return self.home / ".agent-harness" / "state" / "disk-budget" / name
+
+    def test_owner_over_budget_alerts_by_name_and_writes_state(self):
+        sizes = {}
+        work, runner = self.owner_fixture(sizes)
+        sizes[str(work / "agent-AAA")] = 9.0
+        alerts = keys(ow.check_disk(self.cfg, {}, runner, 2_000_000.0))
+        a = alerts["disk:owner:AAA"]
+        self.assertEqual(a["severity"], "high")
+        self.assertEqual(a["detail"]["agent"], "AAA")
+        self.assertIn("AAA", a["message"])
+        record = json.loads(self.budget_file("AAA.json").read_text())
+        self.assertEqual((record["agent"], record["path_key"], record["budget_bytes"]), ("AAA", "sess1/agent-AAA", 5 * GIB))
+        self.assertIsNotNone(record["over_since"])
+        self.assertGreater(record["used_bytes"], 8 * GIB)
+        self.assertFalse([k for k in alerts if k.startswith("disk:owner:") and k != "disk:owner:AAA"])  # failing control
+        self.assertTrue((work / "agent-AAA").is_dir())  # nothing is ever deleted
+
+    def test_kit_can_declare_a_bigger_budget_but_not_an_unbounded_one(self):
+        sizes = {}
+        work, runner = self.owner_fixture(sizes)
+        sizes[str(work / "agent-AAA")] = 9.0
+        kit = work / "agent-AAA" / "kit.json"
+        kit.write_text(json.dumps({"disk_budget_gib": 20}))
+        self.assertNotIn("disk:owner:AAA", keys(ow.check_disk(self.cfg, {}, runner, 2_000_000.0)))
+        kit.write_text(json.dumps({"disk_budget_gib": 100000}))
+        sizes[str(work / "agent-AAA")] = 30.0
+        self.assertIn("disk:owner:AAA", keys(ow.check_disk(self.cfg, {}, runner, 2_000_000.0)))  # capped at 20
+
+    def test_back_under_budget_clears_the_flag_and_keeps_the_dir(self):
+        sizes = {}
+        work, runner = self.owner_fixture(sizes)
+        sizes[str(work / "agent-AAA")] = 9.0
+        state = {}
+        ow.check_disk(self.cfg, state, runner, 2_000_000.0)
+        sizes[str(work / "agent-AAA")] = 2.0
+        self.assertNotIn("disk:owner:AAA", keys(ow.check_disk(self.cfg, state, runner, 2_007_200.0)))
+        self.assertIsNone(json.loads(self.budget_file("AAA.json").read_text())["over_since"])
+        self.assertTrue((work / "agent-AAA").is_dir())
+
+    def test_malformed_kit_budget_cannot_break_the_disk_check(self):
+        sizes = {}
+        work, runner = self.owner_fixture(sizes)
+        sizes[str(work / "agent-AAA")] = 9.0
+        for body in ('{"disk_budget_gib": NaN}', '{"disk_budget_gib": Infinity}', '{"disk_budget_gib": "x"}', "[1]", "{"):
+            (work / "agent-AAA" / "kit.json").write_text(body)
+            alerts = keys(ow.check_disk(self.cfg, {}, runner, 2_000_000.0))
+            self.assertIn("disk:owner:AAA", alerts, body)  # default 5 GiB applies
+            self.assertNotIn("ops-watch:check-error:disk", alerts)
+
+    def test_a_measurement_older_than_three_hours_is_not_called_over(self):
+        sizes = {}
+        work, runner = self.owner_fixture(sizes)
+        sizes[str(work / "agent-AAA")] = 9.0
+        state = {}
+        ow.check_disk(self.cfg, state, runner, 2_000_000.0)
+        broken = FakeRunner({("du",): (127, "")})  # the next pass cannot measure: the old number must not be reused
+        alerts = keys(ow.check_disk(self.cfg, state, broken, 2_000_000.0 + 4 * 3600))
+        self.assertNotIn("disk:owner:AAA", alerts)
+
+    def test_unmeasured_owner_is_never_called_over(self):
+        work, _ = self.owner_fixture({})
+        runner = FakeRunner({("du",): (127, "")})
+        alerts = keys(ow.check_disk(self.cfg, {}, runner, 2_000_000.0))
+        self.assertFalse([k for k in alerts if k.startswith("disk:owner:")])
+
     def test_du_timeout_splits_and_flags_unmeasured(self):
         state = {}
         big = self.home / "big"
