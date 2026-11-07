@@ -229,6 +229,130 @@ class UnitsTests(Base):
         self.assertEqual(ow.check_units(self.cfg, {}, self.table("", show, "all good\n"), 0.0), [])
 
 
+class RemoteUnitTests(Base):
+    """goodqa#15070: a oneshot timer job on another host (t2-blog-drip on t2-dev), read over ssh, read-only."""
+    NOW = 1794100000.0
+
+    def setUp(self):
+        super().setUp()
+        self.cfg["remote_units"] = [{"host": "t2-dev", "unit": "t2-blog-drip", "user": True, "max_age_h": 26}]
+
+    def show(self, service, timer="Id=t2-blog-drip.timer\nLoadState=loaded\nActiveState=active\nActiveEnterTimestamp=@1794039431\n", rc=0):
+        text = "Id=t2-blog-drip.service\nLoadState=loaded\n" + service + "\n" + timer
+        return FakeRunner({("ssh",): (rc, text)})
+
+    def check(self, runner, state=None):
+        return keys(ow.check_remote_units(self.cfg, {} if state is None else state, runner, self.NOW))
+
+    def test_a_recent_success_is_silent_and_the_ssh_call_is_read_only_and_bounded(self):
+        runner = self.show("ActiveState=inactive\nResult=success\nExecMainStatus=0\nExecMainExitTimestamp=@%d\n"
+                           % (self.NOW - 3600))
+        self.assertEqual(self.check(runner), {})
+        argv = runner.calls[0]
+        self.assertEqual(argv[:5], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
+        self.assertIn("t2-dev", argv)
+        remote = argv[-1]
+        self.assertTrue(remote.startswith("systemctl --user show t2-blog-drip.service t2-blog-drip.timer "), remote)
+        for word in ("start", "restart", "stop", "enable", "reset-failed", ";", "&", "|", "$", "`"):
+            self.assertNotIn(word, remote.split("show", 1)[1])
+
+    def test_a_failed_run_alerts_high(self):
+        a = self.check(self.show("ActiveState=failed\nResult=exit-code\nExecMainStatus=1\nExecMainExitTimestamp=@%d\n"
+                                 % (self.NOW - 600)))
+        self.assertEqual(a["remote:t2-dev:t2-blog-drip:failed"]["severity"], "high")
+        self.assertIn("exit-code", a["remote:t2-dev:t2-blog-drip:failed"]["message"])
+
+    def test_a_success_older_than_the_limit_alerts_stale(self):
+        a = self.check(self.show("ActiveState=inactive\nResult=success\nExecMainStatus=0\nExecMainExitTimestamp=@%d\n"
+                                 % (self.NOW - 27 * 3600)))
+        self.assertEqual(a["remote:t2-dev:t2-blog-drip:stale"]["severity"], "high")
+        self.assertIn("27", a["remote:t2-dev:t2-blog-drip:stale"]["message"])
+
+    def test_never_run_counts_from_the_timer_start(self):
+        never = "ActiveState=inactive\nResult=success\nExecMainStatus=0\nExecMainExitTimestamp=\n"
+        self.assertEqual(self.check(self.show(never)), {})  # timer started 17 h before NOW
+        old_timer = "Id=t2-blog-drip.timer\nLoadState=loaded\nActiveState=active\nActiveEnterTimestamp=@%d\n" % (
+            self.NOW - 30 * 3600)
+        self.assertIn("remote:t2-dev:t2-blog-drip:stale", self.check(self.show(never, timer=old_timer)))
+
+    def test_a_missing_unit_or_an_inactive_timer_alerts(self):
+        gone = FakeRunner({("ssh",): (0, "Id=t2-blog-drip.service\nLoadState=not-found\nActiveState=inactive\n\n"
+                                          "Id=t2-blog-drip.timer\nLoadState=not-found\nActiveState=inactive\n")})
+        self.assertIn("remote:t2-dev:t2-blog-drip:missing", self.check(gone))
+        stopped = "Id=t2-blog-drip.timer\nLoadState=loaded\nActiveState=inactive\nActiveEnterTimestamp=@1794039431\n"
+        ok = "ActiveState=inactive\nResult=success\nExecMainStatus=0\nExecMainExitTimestamp=@%d\n" % (self.NOW - 60)
+        self.assertIn("remote:t2-dev:t2-blog-drip:timer", self.check(self.show(ok, timer=stopped)))
+
+    def test_unreachable_warns_only_after_a_grace_period(self):
+        state = {}
+        down = FakeRunner({("ssh",): (255, "")})
+        self.assertEqual(ow.check_remote_units(self.cfg, state, down, self.NOW), [])
+        later = keys(ow.check_remote_units(self.cfg, state, down, self.NOW + 3600))
+        self.assertEqual(later["remote:t2-dev:t2-blog-drip:unreachable"]["severity"], "warning")
+
+    def test_unsafe_host_or_unit_names_are_never_sent_to_ssh(self):
+        self.cfg["remote_units"] = [{"host": "-oProxyCommand=x", "unit": "t2-blog-drip"},
+                                    {"host": "t2-dev", "unit": "x; rm -rf ~"}]
+        runner = FakeRunner({("ssh",): (0, "")})
+        a = self.check(runner)
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(len([k for k in a if k.endswith(":config")]), 2)
+
+    def test_the_check_is_registered(self):
+        self.assertIn("remote_units", ow.DEFAULT_CHECKS)
+
+    # PR #122 review (a4ebf03e74ed9ba36)
+    def test_an_unreadable_host_keeps_the_last_alerts_instead_of_clearing_them(self):
+        # R1: failed -> unreachable -> failed -> garbage -> failed must be one raise and no clear.
+        cfg = dict(self.cfg)
+        cfg["sinks"] = {"comment": {"mode": "none"}, "deadman": []}
+        failed = self.show("ActiveState=failed\nResult=exit-code\nExecMainStatus=1\nExecMainStartTimestamp=@%d\n"
+                           "ExecMainExitTimestamp=@%d\n" % (self.NOW - 700, self.NOW - 600))
+        down = FakeRunner({("ssh",): (255, "")})
+        garbage = FakeRunner({("ssh",): (0, "not systemctl output")})
+        only = {"remote_units": ow.check_remote_units}
+        for i, runner in enumerate((failed, down, failed, garbage, failed)):
+            ow.run_once(cfg, self.home, runner=runner, checks=only, now=self.NOW + 60 * i)
+            self.assertIn("remote:t2-dev:t2-blog-drip:failed", {x["key"] for x in ow.active_alerts(self.home)}, i)
+        events = [e for e in ow.read_ring(ow.ring_path(self.home)) if e.get("key") == "remote:t2-dev:t2-blog-drip:failed"]
+        self.assertEqual([e["event"] for e in events], ["raise"])
+
+    def test_a_run_job_with_no_stored_success_is_not_called_stale(self):
+        # R2: fresh state, 30-day-old timer: a failed last run or a run in progress must not also be "stale".
+        old = "Id=t2-blog-drip.timer\nLoadState=loaded\nActiveState=active\nActiveEnterTimestamp=@%d\n" % (
+            self.NOW - 30 * 86400)
+        failed = ("ActiveState=failed\nResult=exit-code\nExecMainStatus=1\nExecMainStartTimestamp=@%d\n"
+                  "ExecMainExitTimestamp=@%d\n" % (self.NOW - 700, self.NOW - 600))
+        a = self.check(self.show(failed, timer=old))
+        self.assertIn("remote:t2-dev:t2-blog-drip:failed", a)
+        self.assertNotIn("remote:t2-dev:t2-blog-drip:stale", a)
+        running = "ActiveState=activating\nResult=success\nExecMainStatus=0\nExecMainStartTimestamp=@%d\nExecMainExitTimestamp=\n" % (
+            self.NOW - 60)
+        self.assertEqual(self.check(self.show(running, timer=old)), {})
+
+    def test_result_success_wins_over_a_nonzero_success_exit_status(self):
+        # R3: SuccessExitStatus=2 gives Result=success with ExecMainStatus=2.
+        ok = ("ActiveState=inactive\nResult=success\nExecMainStatus=2\nExecMainStartTimestamp=@%d\n"
+              "ExecMainExitTimestamp=@%d\n" % (self.NOW - 700, self.NOW - 600))
+        self.assertEqual(self.check(self.show(ok)), {})
+
+    def test_bad_max_age_is_a_config_alert_and_long_names_keep_distinct_keys(self):
+        # R3: a non-numeric, NaN or non-positive max_age_h is refused; keys are not truncated.
+        for bad in ("soon", float("nan"), 0, -1):
+            self.cfg["remote_units"] = [{"host": "t2-dev", "unit": "t2-blog-drip", "max_age_h": bad}]
+            runner = FakeRunner({("ssh",): (0, "")})
+            self.assertIn("remote:t2-dev:t2-blog-drip:config", self.check(runner), bad)
+            self.assertEqual(runner.calls, [])
+        long_a, long_b = "u" * 80 + "a", "u" * 80 + "b"
+        self.cfg["remote_units"] = [{"host": "t2-dev", "unit": long_a}, {"host": "t2-dev", "unit": long_b}]
+        a = self.check(FakeRunner({("ssh",): (0, "")}))
+        self.assertEqual(len(a), 0)  # unreachable is silent in its grace period; the keys are checked below
+        state = {}
+        self.cfg["remote_units"] = [{"host": "t2-dev", "unit": long_a}, {"host": "t2-dev", "unit": long_b}]
+        ow.check_remote_units(self.cfg, state, FakeRunner({("ssh",): (255, "")}), self.NOW)
+        self.assertEqual(len(state["remote_units"]), 2)
+
+
 class CrashTests(Base):
     def write_ips(self, name, proc, signal, namespace, mtime):
         d = self.home / "Library/Logs/DiagnosticReports"
