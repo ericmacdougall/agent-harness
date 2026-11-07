@@ -97,6 +97,8 @@ def defaults(host: str) -> dict:
                      "ticket_budget_s": 90, "gq": "~/.claude/goodqa-p0p1/gq.py",
                      "projects": {"goodqa": "1ae27b6b-f8f2-4e61-ab2d-c9c43fd162c3"}},
         "peers": [],
+        # goodqa#15070: timer jobs on other hosts, read over ssh: [{"host", "unit", "user": bool, "max_age_h"}]
+        "remote_units": [],
         "sinks": {"comment": {"mode": "none"}, "deadman": [], "comment_min_interval_s": 1800},
     }
 
@@ -1180,6 +1182,89 @@ def check_peers(cfg, state, runner, now):
     return out
 
 
+# ---------------------------------------------------------------- 7b. remote timer units (goodqa#15070)
+
+REMOTE_HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,63}")
+REMOTE_UNIT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,99}")
+
+
+def _show_blocks(text):
+    """{Id: {property: value}} from `systemctl show A B` output (one blank-line separated block per unit)."""
+    blocks, current = {}, {}
+    for line in (text or "").splitlines() + [""]:
+        if not line.strip():
+            if current.get("Id"):
+                blocks[current["Id"]] = current
+            current = {}
+            continue
+        key, _, value = line.partition("=")
+        current[key.strip()] = value.strip()
+    return blocks
+
+
+def _unix(value):
+    """Seconds from a `--timestamp=unix` value such as @1794039431, else None (empty means never)."""
+    m = re.fullmatch(r"@(\d{9,11})", value or "")
+    return float(m.group(1)) if m else None
+
+
+def check_remote_units(cfg, state, runner, now):
+    """Read-only check of a oneshot service and its timer on another host: failed last run, no success within
+    max_age_h (counted from the timer start when the job never ran), a missing unit or a stopped timer. One
+    bounded ssh call per unit (BatchMode, 5 s connect, 20 s total); nothing is started or reset there."""
+    out = []
+    seen = state.setdefault("remote_units", {})
+    for entry in cfg.get("remote_units") or []:
+        host, unit = str(entry.get("host", "")), str(entry.get("unit", ""))
+        key = f"remote:{host[:40]}:{unit[:60]}"
+        if not REMOTE_HOST.fullmatch(host) or not REMOTE_UNIT.fullmatch(unit):
+            out.append(alert("remote_units", key + ":config", "warning", "remote unit entry has an unsafe host or unit name",
+                             {"host": host[:40], "unit": unit[:60]}))
+            continue
+        max_age = float(entry.get("max_age_h", 26)) * 3600
+        scope = "--user " if entry.get("user", True) else ""
+        remote = (f"systemctl {scope}show {unit}.service {unit}.timer -p Id,LoadState,ActiveState,Result,"
+                  "ExecMainStatus,ExecMainExitTimestamp,ActiveEnterTimestamp --timestamp=unix --no-pager")
+        rec = seen.setdefault(key, {"first_try": now})
+        try:
+            rc, text = runner(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", host, remote], 20)
+        except (subprocess.TimeoutExpired, OSError):
+            rc, text = 255, ""
+        blocks = _show_blocks(text) if rc == 0 else {}
+        svc, tmr = blocks.get(f"{unit}.service"), blocks.get(f"{unit}.timer")
+        if svc is None or tmr is None:
+            if now - rec.get("ok_at", rec["first_try"]) > 1800:
+                out.append(alert("remote_units", key + ":unreachable", "warning",
+                                 f"cannot read {unit} on {host} for 30+ min", {"host": host, "unit": unit}))
+            continue
+        rec["ok_at"] = now
+        if svc.get("LoadState") != "loaded":
+            out.append(alert("remote_units", key + ":missing", "high", f"{unit}.service is not installed on {host}",
+                             {"host": host, "unit": unit, "load": svc.get("LoadState", "")[:20]}))
+            continue
+        ended = _unix(svc.get("ExecMainExitTimestamp"))
+        result = svc.get("Result") or ""
+        if svc.get("ActiveState") == "failed" or result not in ("", "success") or (
+                ended and svc.get("ExecMainStatus") not in (None, "", "0")):
+            out.append(alert("remote_units", key + ":failed", "high",
+                             f"{unit} on {host}: last run {result or svc.get('ActiveState')} "
+                             f"(exit {svc.get('ExecMainStatus', '?')})",
+                             {"host": host, "unit": unit, "result": result[:20]}))
+        elif ended:
+            rec["success_at"] = ended
+        if tmr.get("LoadState") != "loaded" or tmr.get("ActiveState") != "active":
+            out.append(alert("remote_units", key + ":timer", "high", f"{unit}.timer on {host} is not active",
+                             {"host": host, "unit": unit, "timer": tmr.get("ActiveState", "")[:20]}))
+        since = rec.get("success_at") or _unix(tmr.get("ActiveEnterTimestamp"))
+        if since is not None and now - since > max_age:
+            hours = (now - since) / 3600
+            what = "last success" if rec.get("success_at") else "timer started with no success since"
+            out.append(alert("remote_units", key + ":stale", "high",
+                             f"{unit} on {host}: {what} {hours:.0f} h ago (limit {max_age / 3600:.0f} h)",
+                             {"host": host, "unit": unit, "age_h": round(hours, 1)}))
+    return out
+
+
 # ---------------------------------------------------------------- 8. owner liveness
 
 TERMINAL_EVENTS = ("handoff", "result", "done", "delivered")
@@ -1444,6 +1529,7 @@ DEFAULT_CHECKS = {
     "codex": lambda c, s, r, n: check_codex_trust(c),
     "liveness": lambda c, s, r, n: check_liveness(c, s, r, n) if c["liveness"].get("enabled") else [],
     "peers": check_peers,
+    "remote_units": check_remote_units,
 }
 RUN_CHECK = "_run"    # internal errors; cleared by any completed run
 SINK_CHECK = "_sink"  # delivery failures; cleared when that sink recovers

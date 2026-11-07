@@ -76,6 +76,7 @@ Per-host settings go in `~/.agent-harness/ops-watch.json`. Every key is optional
 {"delivery": ["~/repos/bugtracker-delivery2"],
  "drift": {"repo": "~/repos/agent-harness"},
  "peers": ["dev2", "t2-dev"],
+ "remote_units": [{"host": "t2-dev", "unit": "t2-blog-drip", "user": true, "max_age_h": 26}],
  "sinks": {"comment": {"mode": "gq"},
            "deadman": [["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "t2-dev",
                         "~/.agent-harness/bin/deadman-alert.sh '{SUBJECT}'"]]}}
@@ -91,5 +92,15 @@ tail ~/.agent-harness/logs/ops-watch.err               # macOS; Linux: journalct
 launchctl bootout gui/$(id -u)/com.ericmacdougall.ops-watch   # stop (macOS)
 systemctl --user disable --now ops-watch.timer                # stop (Linux)
 ```
+
+`remote_units` (goodqa#15070) watches a oneshot timer job on another host. The check makes one read-only, bounded call per entry: `ssh -o BatchMode=yes -o ConnectTimeout=5 HOST systemctl [--user] show UNIT.service UNIT.timer`, with 20 s in total. It never starts, stops or resets anything there. It raises these alerts:
+
+- `:failed` (high): the last run failed.
+- `:stale` (high): there has been no success within `max_age_h`. If the job has never run, the age is counted from when the timer started.
+- `:missing` (high): the service is not installed.
+- `:timer` (high): the timer is not active.
+- `:unreachable` (warning): the host cannot be read for 30 min.
+
+Host and unit names must be plain words; any other entry is refused as `:config` and never reaches ssh.
 
 Tests: `python3 -m unittest tests.test_ops_watch`.

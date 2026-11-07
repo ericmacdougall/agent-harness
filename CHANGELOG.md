@@ -7,6 +7,9 @@ group by pull request.
 ## Unreleased
 
 ### Added
+- ops_watch `remote_units`: a read-only ssh check of a timer job on another host (for example t2-blog-drip on
+  t2-dev). It alerts when the last run failed, when there has been no success within `max_age_h` (26 h), or when
+  the unit is missing or its timer is stopped (goodqa#15070).
 - command_guard `approve-delete --archive/--archive-sha256/--archive-listing`: approve a delete from one verified remote tar
   archive (.tar, .tar.gz or .tar.zst) when a file-by-file mirror is too slow; the guard streams and checks the archive
   itself (goodqa#15068).
