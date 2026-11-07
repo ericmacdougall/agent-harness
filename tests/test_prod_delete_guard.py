@@ -1214,8 +1214,10 @@ class KimiPrcR2(Case):
             pdg.DECISION_BUDGET = old
 
     def test_f9_strings_and_comments_are_not_statements(self):
-        self.allow("psql -h prod-db -c \"SELECT 'DELETE FROM users' AS example\"")
-        self.allow("psql -h prod-db -c \"SELECT 'DROP TABLE users' AS example\"")
+        # A destructive verb inside a -c string still denies (fail closed; the F9 opt-in was reverted after three
+        # review rounds found strings that run). Only commented-out or quoted includes in files are ignored.
+        self.deny("psql -h prod-db -c \"SELECT 'DELETE FROM users' AS example\"")
+        self.deny("psql -h prod-db -c \"SELECT 'DROP TABLE users' AS example\"")
         self.put("comment-include.sql", "-- \\i absent.sql\nSELECT 1;\n")
         self.allow("psql -h prod-db -f comment-include.sql")
         self.put("string-include.sql", "SELECT '\\i absent.sql';\n")
@@ -1255,7 +1257,7 @@ class KimiPrcR2(Case):
         self.put("prep.sql", "PREPARE s FROM 'DELETE FROM users'; EXECUTE s;\n")
         self.deny("mysql -h prod-db < prep.sql")
         # a plain string is still a string
-        self.allow("psql -h prod-db -c \"SELECT 'DELETE FROM users' AS example\"")
+        self.deny("psql -h prod-db -c \"SELECT 'DELETE FROM users' AS example\"")
 
     def test_r3_a_file_named_on_the_far_side_of_a_remote_runner_is_unread(self):
         self.put("a.sql", "SELECT 1;\n")
@@ -1326,8 +1328,8 @@ class KimiPrcR2(Case):
                         "psql -h prod-db -c \"SELECT 1 \\\\gx | psql -c 'DELETE FROM users'\""):
             with self.subTest(command=command):
                 self.deny(command)
-        self.allow("psql -h prod-db -c \"SELECT 'DELETE FROM users' AS example\"")
-        self.allow("psql -h prod-db -c \"SELECT id FROM notes WHERE body = 'DROP TABLE users'\"")
+        self.deny("psql -h prod-db -c \"SELECT 'DELETE FROM users' AS example\"")
+        self.deny("psql -h prod-db -c \"SELECT id FROM notes WHERE body = 'DROP TABLE users'\"")
 
     def test_d2_runner_options_before_exec_do_not_hide_it(self):
         self.put("a.sql", "SELECT 1;\n")
@@ -1355,14 +1357,14 @@ class KimiPrcR2(Case):
                 "mysql -h prod-db -e 'SELECT my_exec(\"DELETE FROM users\")'"):
             with self.subTest(command=command):
                 self.deny(command)
-        self.allow("psql -h prod-db -c \"SELECT 'DELETE FROM users' AS example\"")
-        self.allow("psql -h prod-db -c \"SELECT id FROM notes WHERE body = 'DROP TABLE users';\"")
+        self.deny("psql -h prod-db -c \"SELECT 'DELETE FROM users' AS example\"")
+        self.deny("psql -h prod-db -c \"SELECT id FROM notes WHERE body = 'DROP TABLE users';\"")
 
     def test_e2_the_opt_in_check_is_linear(self):
         def cost(n):
             value = "SELECT " + "'DELETE FROM a'=" * n + "'x'"
             t0 = time.perf_counter()
-            pdg._plain_data_strings(value)
+            pdg._judge_arg(value)
             return time.perf_counter() - t0
         small, large = cost(1000), cost(4000)
         self.assertLess(large / max(small, 1e-6), 8.0, (small, large))

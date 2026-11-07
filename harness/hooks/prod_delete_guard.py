@@ -724,41 +724,14 @@ STRING_SINKS = re.compile(
     r"|\b(?:QUERY_TO_XML\w*|RUN_COMMAND\w*|PG_BACKGROUND\w*|DBMS_\w+|SP_EXECUTESQL|XP_CMDSHELL)\b")
 
 
-# The masked reading is an allow-list of one shape (delta reviews D1, E1): a single SELECT with no parenthesis
-# (so no function call, subquery or CTE), no DML or DDL word, no INTO, no named-argument `:=`, no variable, and no
-# double quote (MySQL may read it as a string). Only then can a string literal not be run, stored for a scheduler
-# or passed to something that runs it. Checked on the masked text of every reading, so a comment cannot supply a
-# keyword or hide one. One regex search per reading: linear (E2).
 META_OR_SHELL = re.compile(r"[\\`]|^\s*\.", re.M)
-PLAIN_SELECT_BANNED = re.compile(
-    r"(?i)\b(?:INSERT|UPDATE|DELETE|REPLACE|UPSERT|MERGE|SET|COPY|INTO|CALL|DO|EXEC\w*|PREPARE|CREATE|ALTER|"
-    r"DROP|TRUNCATE|GRANT|REVOKE|WITH|RETURNING|LOAD|HANDLER|LISTEN|NOTIFY|VACUUM|ANALY[SZ]E)\b|[()\"`\\:@$;{}\[\]]")
-
-
-def _plain_data_strings(text: str) -> bool:
-    """True when the masked reading may judge `text`: it is one plain SELECT whose strings are only data."""
-    if '"' in text or META_OR_SHELL.search(text) or STRING_SINKS.search(text):
-        return False
-    for reading in SQL_READINGS:
-        source = _open_exec_comments(text) if reading[5] else text
-        masked, uncertain = _mask_sql(source, *reading[:5])
-        if uncertain:
-            return False
-        body = masked.strip()
-        while body.endswith(";"):
-            body = body[:-1].rstrip()
-        if not re.match(r"(?i)SELECT\b", body) or PLAIN_SELECT_BANNED.search(body):
-            return False
-    return True
 
 
 def _judge_arg(text: str):
-    """A -c/-e/--command value: the quote-stripped verdict, unless its strings are plain data, then the masked
-    one (so `SELECT 'DELETE FROM x' AS example` is a string). The masked reading never clears more than that."""
-    stripped = _shell_match(text)
-    if stripped and not _plain_data_strings(text):
-        return stripped
-    return _judge_sql(text)
+    """A -c/-e/--command value: the quote-stripped verdict, then the masked one. A destructive verb inside a string
+    literal still counts (fail closed). The opt-in that read such strings as data (Kimi PR-C F9) was removed after
+    three review rounds each found strings that run (R2, D1, E1): nothing in the text shows a literal is never run."""
+    return _shell_match(text) or _judge_sql(text)
 
 
 def _judge_sql(text: str):
