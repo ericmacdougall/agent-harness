@@ -112,7 +112,7 @@ def judge_rows(rows, decide_fn):
 
 class GrammarCorpus(WorldCase):
     """The closed kill grammar: every shape that ever got past the guard, plus what must keep working."""
-    SHAPES = {'cc473a3', 'ce11b1e', '1949bbc', 'a9432ef', '4a6982f', 'a03f8ac', 'F6', 'F7', 'F8', 'F9', 'R2', 'R3', 'R3OK', 'R4', 'R5', 'R4OK', 'RR', 'TC', 'AH', 'RROK', 'PKILL', 'OK'}
+    SHAPES = {'WS', 'WV', 'VH', 'WSOK', 'EH', 'EHOK', 'XH', 'cc473a3', 'ce11b1e', '1949bbc', 'a9432ef', '4a6982f', 'a03f8ac', 'F6', 'F7', 'F8', 'F9', 'R2', 'R3', 'R3OK', 'R4', 'R5', 'R4OK', 'RR', 'TC', 'AH', 'RROK', 'PKILL', 'OK', 'ECH', 'ECHOK', 'ENE', 'EHV', 'EHVOK', 'EIF'}
 
     @classmethod
     def setUpClass(cls):
@@ -597,6 +597,7 @@ class Policy(unittest.TestCase):
                     'container': ['self', 'name', 'args', 'words', 'depth', 'pl', 'idx'],
                     'check_tokens': ['self', 'tokens'],
                     'resolve': ['self', 'word'],
+                    'dispatch': ['self', 'words', 'cmd', 'pl', 'idx', 'depth'],
                     'bind_loop_var': ['self', 'words']}
         self.assertEqual(sorted(expected), sorted(kg.OVERRIDDEN))
         for name, params in expected.items():
@@ -797,6 +798,19 @@ class RemoteSpawn(unittest.TestCase):
         self.assertEqual(self.decide('ssh dev2 kill 4242', lambda h, p: 'Fri Nov 7 09:00:00 2026')[0], 'block')
         self.assertEqual(self.decide('ssh dev2 kill 4242', lambda h, p: None)[0], 'block')
         self.assertEqual(self.decide('ssh dev2 kill 4242', lambda h, p: self.START)[0], 'allow')  # same, whitespace-normalized
+
+    def test_routing_options_held_in_an_array_stay_refused(self):
+        """Delta review F1 (pr96-merge-51a8d87.md): on main 51a8d87 an array kept `"${O[@]}"` as plain text, so the
+        routing options inside it were invisible to the spawn route and these were allowed, killing on another host."""
+        kg.append_ledger(kg.remote_root('dev2'), 4242, self.START, home=self.home)
+        same = lambda host, pid: self.START if (host, pid) == ('dev2', 4242) else None  # noqa: E731
+        self.assertEqual(self.decide('ssh dev2 kill 4242', same)[0], 'allow')  # the ledgered plain form still works
+        for cmd in ('O=(-o HostName=prod); ssh "${O[@]}" dev2 kill 4242',
+                    'O=(-o BatchMode=yes -o HostName=prod); ssh "${O[@]}" dev2 kill 4242',
+                    'O=(-oBatchMode=yes -oHostName=prod); ssh "${O[@]}" dev2 kill 4242',
+                    'X=(-J); ssh "${X[@]}" prod dev2 kill 4242'):
+            with self.subTest(cmd):
+                self.assertEqual(self.decide(cmd, same)[0], 'block', cmd)
 
     def test_spawn_host_records_the_remote_pid_and_start_time(self):
         calls = []
