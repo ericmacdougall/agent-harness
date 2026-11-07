@@ -14,7 +14,9 @@ What it blocks, before the command runs, on Claude Code (Bash, PowerShell) and C
     or argv[1], is inside the caller's own git worktree (the toplevel of the tool call's cwd), or it is in the
     per-worktree spawn ledger written by `kill_guard.py spawn -- CMD...`;
   * every kill inside ssh, mosh, docker exec and kubectl exec (ownership cannot be checked locally) except
-    `netwatch orphans --kill --pid N[,N...]`.
+    `netwatch orphans --kill --pid N[,N...]`, and `ssh HOST kill [-SIG] PID...` where every PID was started by
+    `kill_guard.py spawn --host HOST -- CMD...` (recorded with its start time in a per-host ledger) and the host
+    still reports that start time for it (2026-11-06: an agent could not stop its own remote wait loop).
 Allowed: kill -0 on literal targets or one quoted simple variable, kill -l, job specs (%N, %%, %+, %-, %name), process
 listing, and text that merely contains the word. Every kill word must fit the closed grammar below; anything else fails
 closed, including $!, a variable with a known value and a brace list.
@@ -381,6 +383,120 @@ def append_ledger(root, pid, start, home=None):
         os.close(fd)
 
 
+# ---- remote spawn ledger (goodqa#14927): the one route to a remote kill. Separate from the local ledger functions
+# above on purpose; it reuses them with a `remote:HOST` root, so an ssh kill can never be proven by a local entry.
+
+REMOTE_HOST_RE = re.compile(r'^(?:[A-Za-z0-9._-]{1,64}@)?[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
+REMOTE_LOG_RE = re.compile(r'^[A-Za-z0-9._/-]{1,512}$')  # no ~: the path is single-quoted on the host
+SSH_RUNNER = subprocess.run  # tests replace it; nothing here is ever run without BatchMode
+PLAIN_SSH_FLAGS = {'-q', '-T', '-n', '-t', '-tt', '-4', '-6'}
+PLAIN_SSH_OPTIONS = {'batchmode', 'connecttimeout', 'loglevel', 'serveraliveinterval', 'serveralivecountmax',
+                     'connectionattempts'}
+
+
+PLACEHOLDER = re.compile('[-]')  # the parser stands a substitution in for a private-use character
+
+
+def _unliteral(word):
+    """A word whose value is not known from the text: variable, substitution, glob, or a parser placeholder."""
+    return bool(word.dynamic or word.subs or word.glob or PLACEHOLDER.search(word.text or ''))
+
+
+def plain_ssh_hop(texts, host):
+    """True when every ssh option before the host word is one that cannot change where the connection goes.
+    `-o HostName=`, `-J`/ProxyJump, `-F`, `-W`, `-S`, ProxyCommand and anything unknown make the hop non-literal,
+    so a recorded PID on `dev2` can never be killed on another machine (review finding, 2026-11-06)."""
+    i = 0
+    while i < host:
+        t = texts[i]
+        if t in PLAIN_SSH_FLAGS:
+            i += 1
+            continue
+        if t in ('-p', '-l', '-o'):
+            value = texts[i + 1] if i + 1 < host else ''
+            i += 2
+        elif t.startswith(('-p', '-l', '-o')) and len(t) > 2:
+            value, t = t[2:], t[:2]
+            i += 1
+        else:
+            return False
+        if t == '-p' and not re.fullmatch(r'\d{1,5}', value):
+            return False
+        if t == '-l' and not re.fullmatch(r'[A-Za-z0-9._-]{1,64}', value):
+            return False
+        if t == '-o' and value.split('=', 1)[0].strip().lower() not in PLAIN_SSH_OPTIONS:
+            return False
+    return True
+
+
+def remote_root(host):
+    return 'remote:' + host
+
+
+def _remote_start(host, pid):
+    """The start time the host reports for PID now (`ps -o lstart=`), normalized, or None. Bounded: 5 s, BatchMode."""
+    try:
+        done = SSH_RUNNER(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=3', host, 'ps', '-o', 'lstart=', '-p', str(int(pid))],
+                          capture_output=True, text=True, timeout=5, env=CLEAN_ENV)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    text = ' '.join((done.stdout or '').split())
+    return text if done.returncode == 0 and text else None
+
+
+def remote_spawned(host, pid, home=None, probe=None):
+    """(ok, reason): PID on HOST was started by `spawn --host HOST` and still carries the recorded start time."""
+    if not REMOTE_HOST_RE.match(host or ''):
+        return False, 'the ssh host is not a plain host name'
+    recorded = [start for p, start in read_ledger(remote_root(host), home) if p == pid]
+    if not recorded:
+        return False, 'not started by `kill_guard.py spawn --host %s`' % host
+    live = (probe or _remote_start)(host, pid)
+    if live is None:
+        return False, 'the host did not report it (probe failed or it exited)'
+    if live not in recorded:
+        return False, 'its start time differs from the spawn record (pid reused)'
+    return True, ''
+
+
+def spawn_remote_main(host, argv):
+    """`kill_guard.py spawn --host HOST [--log REMOTE_FILE] -- CMD ARGS...`: start CMD detached on HOST over ssh,
+    record (host, pid, start time) in the per-host ledger, print them. Only such a PID is later killable through
+    `ssh HOST kill PID`. The command is passed as single-quoted words, never re-parsed here."""
+    log = '/dev/null'
+    args = list(argv)
+    if args[:1] == ['--log'] and len(args) >= 2:
+        log, args = args[1], args[2:]
+    if args[:1] == ['--']:
+        args = args[1:]
+    if not args or not REMOTE_HOST_RE.match(host) or not REMOTE_LOG_RE.match(log):
+        sys.stderr.write('usage: kill_guard.py spawn --host HOST [--log REMOTE_FILE] -- CMD [ARGS...] '
+                         '(a plain host name; a plain remote path)\n')
+        return 2
+    try:
+        ensure_key()
+    except OSError as error:
+        sys.stderr.write('kill_guard spawn: %s; nothing was started\n' % error)
+        return 2
+    import shlex  # noqa: PLC0415
+    script = ('nohup %s >%s 2>&1 </dev/null & p=$!; printf \'%%s\\n\' "$p"; ps -o lstart= -p "$p"'
+              % (' '.join(shlex.quote(a) for a in args), shlex.quote(log)))
+    try:
+        done = SSH_RUNNER(['ssh', '-o', 'BatchMode=yes', host, script], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        sys.stderr.write('kill_guard spawn: ssh to %s failed (%s); nothing was recorded\n' % (host, type(error).__name__))
+        return 1
+    lines = [line.strip() for line in (done.stdout or '').splitlines() if line.strip()]
+    if done.returncode != 0 or len(lines) < 2 or not lines[0].isdigit():
+        sys.stderr.write('kill_guard spawn: %s did not report a pid and start time (exit %s); nothing was recorded: %s\n'
+                         % (host, done.returncode, one_line(done.stderr or '', 200)))
+        return 1
+    pid, start = int(lines[0]), ' '.join(lines[1].split())
+    append_ledger(remote_root(host), pid, start)
+    print(json.dumps({'host': host, 'pid': pid, 'start': start, 'log': log}))
+    return 0
+
+
 def audit(rule, raw, pids, home=None):
     """Append one redacted line per block: no command text, only its hash. Best effort, never raises."""
     try:
@@ -640,6 +756,7 @@ def make_analyzer_class(cg):
             self.raw = raw
             self.kf = []          # (rule, reason, pids)
             self.remote = 0
+            self.remote_hosts = []  # literal ssh host per open ssh hop (None when the host word is not literal)
             self.xargs = 0
             self.before_paren = {}  # id -> word, holding the word so its id stays unique
             self.fed = {}           # id -> (word, sink stage): its text goes down a pipe, maybe into a shell
@@ -1018,6 +1135,14 @@ def make_analyzer_class(cg):
             if host is not None and host + 1 < len(texts) and texts[host + 1] == '--':
                 args = args[:host + 1] + args[host + 2:]  # `mosh host -- cmd`, `ssh host -- cmd`
             self.remote += 1
+            # OpenSSH keeps reading options after the destination (`ssh dev2 -o HostName=prod kill 4242` reroutes),
+            # so an option word right after the host (anything but `--`) also makes the hop non-literal (review round 2).
+            after = args[host + 1] if host is not None and host + 1 < len(args) else None
+            literal = (host is not None and not _unliteral(args[host]) and not any(_unliteral(a) for a in args[:host])
+                       and plain_ssh_hop(texts, host)
+                       and not (after is not None and (_unliteral(after)  # `$(echo -o)` expands to an option word
+                                                       or (after.text.startswith('-') and after.text != '--'))))
+            self.remote_hosts.append(texts[host] if literal else None)
             try:
                 result = super().ssh(args, depth)
                 host = self._ssh_host_index(texts)
@@ -1026,6 +1151,7 @@ def make_analyzer_class(cg):
                 return result
             finally:
                 self.remote -= 1
+                self.remote_hosts.pop()
 
         def container(self, name, args, words, depth, pl, idx):
             self.remote += 1
@@ -1393,6 +1519,18 @@ def make_analyzer_class(cg):
                 self.block('netwatch-broad', 'netwatch orphans --kill is allowed only as --pid N[,N...] (%s); '
                            '--all, --force and --match need the user' % bad)
 
+        def remote_spawn_ok(self, pids):
+            """`ssh HOST kill [-SIG] PID...` passes only when this is a single literal ssh hop (no container, no
+            nested hop) and every PID is in HOST's spawn ledger with the start time the host still reports."""
+            host = self.remote_hosts[-1] if len(self.remote_hosts) == 1 else None
+            if self.remote != 1 or not host or not pids:
+                return False, 'kill on a remote host or container cannot be checked for ownership'
+            for pid in dict.fromkeys(pids):
+                ok, why = remote_spawned(host, pid, self.own.home)
+                if not ok:
+                    return False, 'pid %d on %s: %s' % (pid, host, why)
+            return True, ''
+
         def check_kill(self, args, pl, idx):
             error, signal, targets = parse_kill_words(args, self.remote)
             if error:
@@ -1430,8 +1568,9 @@ def make_analyzer_class(cg):
             if probe and not problems:
                 return
             if self.remote:
-                self.block('remote-kill', 'kill on a remote host or container cannot be checked for ownership',
-                           pids)
+                ok, reason = self.remote_spawn_ok(pids)
+                if not ok:
+                    self.block('remote-kill', reason, pids)
                 return
             for pid in dict.fromkeys(pids):
                 ok, code, detail = self.own.check(pid)
@@ -1715,12 +1854,14 @@ def spawn_main(argv):
     The guard only believes the ledger for PIDs it started itself: spawn takes a command, never a PID."""
     log = None
     args = list(argv)
+    if args[:1] == ['--host'] and len(args) >= 2:
+        return spawn_remote_main(args[1], args[2:])
     if args[:1] == ['--log'] and len(args) >= 2:
         log, args = args[1], args[2:]
     if args[:1] == ['--']:
         args = args[1:]
     if not args:
-        sys.stderr.write('usage: kill_guard.py spawn [--log FILE] -- CMD [ARGS...]\n')
+        sys.stderr.write('usage: kill_guard.py spawn [--host HOST] [--log FILE] -- CMD [ARGS...]\n')
         return 2
     cwd = os.getcwd()
     root, _nested = find_worktree(cwd)

@@ -712,7 +712,7 @@ class Daemon:
     def owner_docs(self, sessions: list, deadline: float) -> dict:
         docs = {}
         for s in sessions:
-            rc, doc = self.call("owners", ["--session", s], deadline)
+            rc, doc = self.call("owners", ["--session", s, "--all"], deadline)  # ahd needs every row, not the recent view
             if rc == 0 and isinstance(doc, dict) and isinstance(doc.get("owners"), list):
                 docs[s] = doc
         return docs

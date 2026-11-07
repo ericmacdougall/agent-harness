@@ -21,5 +21,11 @@
   {"id": "for-do-echo-done", "command": "for f in a b; do echo done $f; done"},
   {"id": "ssh-clean-chain", "command": "ssh dev2 'cmd1 && nohup ./suite > r.log 2>&1 & echo pid'"},
   {"id": "comment-only-chain-text", "command": "# cmd1; echo started\ncmd1 && cmd2"},
-  {"id": "empty", "command": ""}
+  {"id": "empty", "command": ""},
+  {"id": "bracket-trick-pgrep", "command": "while pgrep -f \"[t]sc --noEmit\"; do sleep 5; done"},
+  {"id": "bracket-trick-ssh", "command": "ssh dev2 'while pgrep -f \"[t]sc --noEmit\" >/dev/null; do sleep 30; done'"},
+  {"id": "pgrep-exact-name", "command": "while pgrep -x tsc >/dev/null; do sleep 5; done"},
+  {"id": "pgrep-name-only", "command": "while pgrep node >/dev/null; do sleep 5; done"},
+  {"id": "ps-grep-v-grep", "command": "while ps aux | grep 'vitest run' | grep -v grep; do sleep 10; done"},
+  {"id": "pid-wait", "command": "while kill -0 $PID 2>/dev/null; do sleep 5; done"}
 ]

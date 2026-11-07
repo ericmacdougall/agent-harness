@@ -156,6 +156,72 @@ class OwnersTests(Base):
         self.assertEqual(by["helperfix"]["state"], "returned")  # helper without a WAL file: not a drop
         self.assertEqual(data["counts"]["DROPPED"], 2)
 
+    def test_cli_owners_accepts_text_after_the_subcommand_and_hides_old_terminal_rows(self):
+        """`ah owners --text` (the form CLAUDE.md and the skill use) was rejected because --text sat only on the
+        parent parser, and the default listing carried hundreds of helpers returned days ago. Default: live, recent
+        and non-terminal rows; --all restores everything; counts and undisposed always cover every row."""
+        self.make()
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 3 * 86400), "event": "subagent", "agent_id": "oldhelper", "agent_type": "fixer"},
+                              {"at": iso(NOW - 3 * 86400 + 60), "event": "subagent_stop", "agent_id": "oldhelper", "agent_type": "fixer"}])
+
+        def cli(*argv):
+            out = io.StringIO()
+            with mock.patch.object(ah.time, "time", return_value=NOW), contextlib.redirect_stdout(out):
+                rc = ah.main(list(argv))
+            return rc, out.getvalue()
+
+        rc, text = cli("owners", "--session", SESSION, "--text")
+        self.assertEqual(rc, 0, text)
+        self.assertNotIn('"owners"', text)  # a human summary, not JSON
+        self.assertIn("aliveowner", text)
+        self.assertIn("dropowner", text)  # DROPPED rows always show
+        self.assertIn("doneowner", text)  # done minutes ago: recent
+        self.assertNotIn("oldhelper", text)  # returned three days ago: hidden by default
+        self.assertIn("hidden", text)
+        rc, text = cli("owners", "--session", SESSION, "--all", "--text")
+        self.assertEqual(rc, 0, text)
+        self.assertIn("oldhelper", text)
+        rc, raw = cli("owners", "--session", SESSION)
+        data = json.loads(raw)
+        self.assertNotIn("oldhelper", {r["agent_id"] for r in data["owners"]})
+        self.assertEqual(data["hidden"], 1)
+        self.assertEqual(data["counts"]["returned"], 3)  # counts still cover every row (helperfix, gpother, oldhelper)
+        self.assertIn("gpowner", data["undisposed"])
+        rc, raw = cli("owners", "--session", SESSION, "--all")
+        self.assertIn("oldhelper", {r["agent_id"] for r in json.loads(raw)["owners"]})
+
+    def test_leftover_waiters_lists_the_retired_agents_live_wait_loops(self):
+        """A retired owner's leftover `until grep` waiters kept waking it (a full 580k-context reread each time,
+        2026-11-06). leftover_waiters lists live wait loops attributed to the agent (its id in the command line) or to
+        the session (CLAUDE_CODE_SESSION_ID in the process environment), never unrelated processes, bounded."""
+        agent = "a1234567890abcdef"
+        rows = [
+            (101, "02:15:03", f"bash -c until grep -q DONE /work/agent-{agent}/run.log; do sleep 60; done"),
+            (102, "00:05:00", "bash -c while pgrep -f '[v]itest run' >/dev/null; do sleep 30; done"),
+            (103, "01:00:00", "bash -c while true; do sleep 1; done"),
+            (104, "03:00:00", "node server.js"),
+            (105, "00:01:00", f"tail -f /work/agent-{agent}/run.log"),
+            (os.getpid(), "00:00:01", f"python3 ah.py task dispose --agent {agent} --kind reassigned until sleep"),
+        ]
+        session_of = {102: SESSION, 103: "other-session"}.get
+        found = ah.leftover_waiters(self.home, agent, SESSION, ps_rows=rows, session_of=session_of)
+        by_pid = {w["pid"]: w for w in found if w["kind"] == "process"}
+        self.assertEqual(sorted(by_pid), [101, 102])
+        self.assertEqual(by_pid[101]["scope"], "agent")
+        self.assertEqual(by_pid[102]["scope"], "session")
+        self.assertEqual(by_pid[101]["elapsed"], "02:15:03")
+        self.assertIn("until grep", by_pid[101]["command"])
+        # ah-run jobs attributed to the agent that have not ended count too
+        ledger = self.home / ".agent-harness" / "reserve" / "ledger"
+        ledger.mkdir(parents=True)
+        (ledger / "run-1.json").write_text(json.dumps({"agent": agent, "argv": ["sleep", "999"], "start": 1}))
+        (ledger / "run-2.json").write_text(json.dumps({"agent": agent, "argv": ["true"], "start": 1, "end": 2}))
+        (ledger / "run-3.json").write_text(json.dumps({"agent": "someoneelse", "argv": ["sleep", "999"], "start": 1}))
+        found = ah.leftover_waiters(self.home, agent, SESSION, ps_rows=[], session_of=lambda pid: None)
+        self.assertEqual([w["run"] for w in found if w["kind"] == "ah-run"], ["run-1"])
+        self.assertEqual(ah.leftover_waiters(self.home, "nobody", "nosession", ps_rows=rows, session_of=lambda pid: None), [])
+
     def test_discovers_agents_missing_from_main_wal(self):
         """Owners that never appear as subagent events in main.jsonl (general-purpose) are found from task WALs and meta files."""
         self.make()
