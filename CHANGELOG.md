@@ -23,6 +23,11 @@ group by pull request.
   claude goes to `dev2` (`HARNESS_CLAUDE_ROUTE_HOST`) because claude is not logged in on t2-dev. Not covered:
   pip/uv/bundle installs, `codex exec`, `claude -p` in nested shells. `exempt_hosts` in `heavy_job_guard.json`
   switches the guard off on a heavy-work host such as the Mac mini.
+- Dropbox upload lane (goodqa#14817). `heavy_job_guard.py` rule `dropbox-lane` (enforce) refuses an agent
+  `rclone copy|copyto|sync|move|moveto|bisync` to a Dropbox remote (type from `rclone listremotes --long`, never the
+  config file) without `--tpslimit` of at most 4, with more than 4 `--transfers`, or while another agent upload to
+  Dropbox runs. The launchd log backup is never the lane holder. Dry runs, downloads and listings are allowed;
+  `HARNESS_LOCAL_OK` applies. Two parallel unthrottled uploads stalled the log backup for 6 h on 2026-11-07.
 - `command_guard.py`: `rm` of a top-level git clone needs no Dropbox backup when git proves it clean, with nothing
   untracked, and every local commit reachable from a remote-tracking ref that matches the live remote
   (`reproducible_clone` policy). Any doubt keeps the existing approve-delete rule.

@@ -73,7 +73,8 @@ MAX_NESTED_SECONDS = 0.4  # wall-clock budget per decision for nested scans and 
 MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 DEFAULT_MODES = {"browser": "enforce", "adversarial": "warn", "full-suite": "enforce",
                  "build": "enforce", "media": "warn", "fan-out": "enforce", "oversize": "enforce", "copy": "enforce",
-                 "install": "enforce", "replay": "enforce", "container": "enforce", "big-clone": "warn"}
+                 "install": "enforce", "replay": "enforce", "container": "enforce", "big-clone": "warn",
+                 "dropbox-lane": "enforce"}
 CAPPED_RULES = {"browser", "media", "fan-out"}  # memory hogs: hatch alone is not enough
 NEVER_BLOCK = {"adversarial"}  # red-team/fuzz work is legitimate: advise (dev2, group cleanup), never deny
 WARN_ONLY = {"big-clone"}  # disk advice (goodqa#14927): warn whatever the mode table says, never deny
@@ -99,6 +100,7 @@ RULE_HELP = {
     "copy": "a large copy, clone or worktree fills the Mac disk (it sits near full; work/pp407 grew 9 GB/h this way)",
     "oversize": "the guard cannot scan this whole command, so a heavy job could hide in the part it skips; "
                 "write it to a script file and run that (HARNESS_LOCAL_OK does not override this rule)",
+    "dropbox-lane": "uploads to one Dropbox account share its write budget; parallel or unthrottled uploads hit too_many_write_operations and starve the agent log backup (Mac, 2026-11-07: 6 h without a backup)",
     "big-clone": "a full copy of a large repository fills the Mac disk (review and red-team clones reached ~30 GB)",
 }
 
@@ -611,6 +613,145 @@ def classify_copy(low, args, ctx):
                 return finish_copy("git worktree add", 0, "git could not size the tracked tree in time", thr)
             return finish_copy("git worktree add", size, None, thr, " (tracked tree at HEAD)")
     return None
+
+
+# ---------------------------------------------------------------- Dropbox upload lane (P12)
+# Every upload to a Dropbox account draws on the same write budget. On 2026-11-07 a 16-transfer archive upload and a
+# second clone upload ran together for hours; Dropbox answered too_many_write_operations with 300 s pauses and the agent
+# log backup went 6 h without a pass. Agent uploads therefore use one throttled lane: --tpslimit at most LANE_TPS,
+# --transfers at most LANE_TRANSFERS, and only one agent upload to a Dropbox remote at a time. The launchd log backup
+# is not an agent upload (it keeps its own tpslimit 1) and is never counted as the lane holder.
+LANE_TPS = 4
+LANE_TRANSFERS = 4
+RCLONE_UPLOADS = {"copy", "copyto", "sync", "move", "moveto", "bisync"}
+RCLONE_PATH_FLAGS = {"--log-file", "--exclude-from", "--include-from", "--filter-from", "--files-from",
+                     "--files-from-raw", "--config", "--temp-dir", "--cache-dir", "--backup-dir", "--compare-dest",
+                     "--copy-dest"}
+LOG_BACKUP_MARK = "/.agent-harness/logs/log-backup.log"
+_DROPBOX_REMOTES = None
+
+
+def dropbox_remotes():
+    """Names of rclone remotes of type dropbox, from `rclone listremotes --long` (names and types only; the config file
+    itself holds tokens and is never read). On failure, any remote whose name contains "dropbox"."""
+    global _DROPBOX_REMOTES
+    if _DROPBOX_REMOTES is None:
+        import subprocess
+        names = set()
+        try:
+            out = subprocess.run(["rclone", "listremotes", "--long"], capture_output=True, text=True, timeout=2,
+                                 stdin=subprocess.DEVNULL).stdout
+            for line in out.splitlines()[:200]:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].endswith(":") and parts[1].lower() == "dropbox":
+                    names.add(parts[0][:-1].lower())
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+        _DROPBOX_REMOTES = names
+    return _DROPBOX_REMOTES
+
+
+def is_dropbox_spec(spec: str) -> bool:
+    m = re.match(r"^([A-Za-z0-9_.][A-Za-z0-9_. -]{0,63}):", spec or "")
+    if not m or "/" in m.group(1):
+        return False
+    name = m.group(1).lower()
+    return name in dropbox_remotes() or "dropbox" in name
+
+
+def rclone_flag(args, name):
+    """Last value of --name (as --name=v or --name v), or None."""
+    value = None
+    for i, a in enumerate(args):
+        if a.startswith(name + "="):
+            value = a.split("=", 1)[1]
+        elif a == name and i + 1 < len(args):
+            value = args[i + 1]
+    return value
+
+
+def rclone_words(args):
+    """The non-flag words of an rclone command line (subcommand first). Values of path-valued flags are skipped, and so
+    is a word after any other --flag when it looks like a value (30s, 4, NOTICE) rather than a path or remote."""
+    words, skip, after_flag = [], False, False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a.startswith("-"):
+            skip = a in RCLONE_PATH_FLAGS
+            after_flag = a.startswith("--") and "=" not in a
+            continue
+        if after_flag and not re.search(r"[:/]|^[~.]", a):
+            after_flag = False
+            continue
+        after_flag = False
+        words.append(a)
+    return words
+
+
+def rclone_upload_destination(args):
+    """The destination of an rclone upload subcommand (global flags may come before it), else None."""
+    words = rclone_words(args)
+    return words[-1] if len(words) >= 2 and words[0] in RCLONE_UPLOADS else None
+
+
+def lane_holders(ps_text=None):
+    """Live agent rclone uploads to a Dropbox remote, as (pid, command) pairs. The log backup is not a holder."""
+    import subprocess
+    if ps_text is None:
+        try:
+            ps_text = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=2,
+                                     stdin=subprocess.DEVNULL).stdout
+        except (OSError, subprocess.SubprocessError):
+            return []  # a probe failure must not block uploads; the throttle check still applies
+    holders = []
+    for line in ps_text.splitlines()[:5000]:
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit() or int(parts[0]) == os.getpid():
+            continue
+        try:
+            words = posix_split(parts[1])
+        except ValueError:
+            words = parts[1].split()
+        if not words or base(words[0]).lower() != "rclone" or LOG_BACKUP_MARK in parts[1]:
+            continue
+        if is_dropbox_spec(rclone_upload_destination(words[1:]) or ""):
+            holders.append((int(parts[0]), parts[1][:160]))
+    return holders
+
+
+def dropbox_lane_finding(args, ctx):
+    """("dropbox-lane", detail) for an agent rclone upload to Dropbox that is unthrottled or would run beside another."""
+    if "--dry-run" in args or "-n" in args:
+        return None
+    dest = rclone_upload_destination(args)
+    if not dest or not is_dropbox_spec(dest):
+        return None
+    sub = rclone_words(args)[0]
+    problems = []
+    tps = rclone_flag(args, "--tpslimit")
+    try:
+        tps_value = float(tps) if tps is not None else 0.0
+    except ValueError:
+        tps_value = 0.0
+    if not 0 < tps_value <= LANE_TPS:
+        problems.append(f"--tpslimit must be set to at most {LANE_TPS} (got {tps if tps is not None else 'none'})")
+    transfers = rclone_flag(args, "--transfers")
+    try:
+        transfers_value = int(transfers) if transfers is not None else 4
+    except ValueError:
+        transfers_value = LANE_TRANSFERS + 1
+    if transfers_value > LANE_TRANSFERS:
+        problems.append(f"--transfers must be at most {LANE_TRANSFERS} (got {transfers})")
+    try:
+        holders = lane_holders()
+    except Exception:  # a process-table parsing bug must not block uploads; the throttle check still applies
+        holders = []
+    if holders:
+        problems.append("the lane is busy: another agent upload to Dropbox is running (pid "
+                        + ", ".join(str(pid) for pid, _ in holders[:3]) + "); wait for it to finish")
+    return ("dropbox-lane", f"rclone {sub} to {dest.split(':', 1)[0]}: " + "; ".join(problems)) if problems else None
 
 
 def clone_is_shallow(flags):
@@ -1164,6 +1305,10 @@ def classify(argv, ctx, depth=0):
             found = None
         if found:
             return found
+    if low == "rclone":
+        lane = dropbox_lane_finding(args, ctx)
+        if lane:
+            return lane
     if low == "claude" and any(a in ("-p", "--print") for a in args):
         ctx.claude_p = getattr(ctx, "claude_p", 0) + 1
         ctx.claude_uncapped = getattr(ctx, "claude_uncapped", 0) + (0 if ctx.capped else 1)
@@ -1630,7 +1775,8 @@ def deny_message(rule, detail, hatch, capped, segment=None, cwd=None):
     base_msg = routed(_deny_message(rule, detail, hatch, capped))
     if rule == "fan-out" and re.search(r"\bclaude\b", (segment or "") + detail):
         base_msg = base_msg.replace(f"ssh {route_host()} ", f"ssh {claude_route_host()} ")  # claude is not logged in on t2-dev
-    extra = exact_route(segment, cwd, rule) if rule not in NEVER_BLOCK else ""
+    # A Dropbox upload of Mac files cannot move to another host; the lane message already gives the command.
+    extra = exact_route(segment, cwd, rule) if rule not in NEVER_BLOCK and rule != "dropbox-lane" else ""
     return base_msg + ("\n" + extra if extra else "")
 
 
@@ -1645,6 +1791,11 @@ def _deny_message(rule, detail, hatch, capped):
         return (f"Heavy-job guard [{rule}] advisory (not blocked): {RULE_HELP[rule]} ({detail}). Hostile-input tests are "
                 f"legitimate. Prefer dev2 (ssh dev2 '<command>'), or on the Mac run under {cap} so stopping the test also "
                 "stops its children and a runaway is paused instead of resetting the machine.")
+    if rule == "dropbox-lane":
+        return (f"Heavy-job guard [dropbox-lane]: {RULE_HELP['dropbox-lane']} ({detail}). Use the one throttled lane: "
+                f"`rclone copy <src> <remote>:<dst> --tpslimit {LANE_TPS} --transfers {LANE_TRANSFERS}`, one upload at a "
+                "time, started after the running one ends (queue them in one script). A single unanticipated upload may "
+                f"use {HATCH}=<reason> (one use per owner per hour, audited).")
     if rule == "copy":
         return (f"Heavy-job guard [copy]: {RULE_HELP['copy']} ({detail}). Large copies, clones and review trees belong on "
                 "dev2/T2, not the Mac: run it there (ssh dev2 '<command>', or the T2 host) and fetch only the result; "
