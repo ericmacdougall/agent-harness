@@ -590,6 +590,32 @@ class RunGates(unittest.TestCase):
                     self.assertEqual(code, 2, (cmd, err))
                     self.assertIn("over its", err, cmd)
 
+    def test_a_heavy_copy_from_an_over_budget_cwd_into_an_under_budget_dir_is_not_budget_refused(self):
+        # goodqa#15067 spec review S1: the incident shape itself. The session cwd is another owner's over-budget dir;
+        # an agent whose own dir is under budget copies into an under-budget dir with the hatch. Judging only the cwd
+        # refused this.
+        cwd, dest, _sizes = self.scp_case()
+        with mock.patch.object(guard, "path_size", fake_size({"/bigsrc": 3 * GIB, cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB})):
+            code, err = self.call(self.HATCH + f"cp -R /bigsrc {dest}/x", cwd=cwd, agent="X", session="sess")
+            self.assertNotIn("over its", err)
+            self.assertEqual(code, 0, err)
+
+    def test_a_main_agent_in_an_over_budget_task_dir_is_charged_for_a_new_sibling(self):
+        # goodqa#15067 spec review S2: without an agent_id the session cwd's owner is the actor, so a main agent in the
+        # over-budget task dir l1-deploy cannot move a heavy write into a brand-new sibling l1-deploy-2.
+        work = Path(self.home.name, ".agent-harness", "work", "sess")
+        cwd = work / "l1-deploy"
+        cwd.mkdir(parents=True)
+        sibling = work / "l1-deploy-2"
+        sibling.mkdir()
+        self.budget_record("sess/l1-deploy")
+        table = {"/bigsrc": 3 * GIB, str(cwd): 9 * GIB, os.path.realpath(cwd): 9 * GIB}
+        with mock.patch.object(guard, "path_size", fake_size(table)):
+            code, err = self.call(self.HATCH + f"cp -R /bigsrc {sibling}/x", cwd=str(cwd), agent=None, session="sess")
+            self.assertEqual(code, 2, err)
+            self.assertIn("over its", err)
+            self.assertIn("l1-deploy", err)
+
     def test_a_download_from_outside_the_fleet_still_counts_as_heavy(self):
         cwd, dest, sizes = self.scp_case()
         with mock.patch.object(guard, "path_size", sizes):
