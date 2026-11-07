@@ -496,6 +496,28 @@ python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal path> --
 - a remote that is not a named remote of type `dropbox` (checked with `rclone listremotes --long`);
 - a remote copy that is missing a file, differs in size or hash, or offers sizes only.
 
+A tree of many small files cannot be mirrored file by file in reasonable time at the account write rate (the pp407 trees ran at about 22 KiB/s). Back it up as one archive instead (goodqa#15068): run `tar -cf - <dir>` from the directory's parent so every member starts with `<dir>/`, optionally compress with `zstd` or gzip, stream it with `rclone rcat`, and upload a `.sha256` file (`<64-hex>  <archive name>`) and a `tar -tvf` listing beside it. Then:
+
+```bash
+python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal dir> --archive dropbox:<dir>.tar.zst \
+  --archive-sha256 dropbox:<dir>.tar.zst.sha256 --archive-listing dropbox:<dir>.tar.listing.txt --wal <WAL path>
+```
+
+The guard trusts none of those files on their own. It streams the archive with `rclone cat`, never to disk, and checks it as follows:
+
+- Its sha256 must equal the `.sha256` file.
+- Every regular file in the archive (path, size and content sha256) must equal the local tree, with nothing missing and nothing extra.
+- The listing's (path, size) set must equal the archive's.
+
+It refuses on any of these:
+
+- a truncated or corrupt stream, or a `zstd` error;
+- a failed download;
+- an absolute member path, a member path containing `..`, or a duplicate member;
+- any of the three remotes not being a named `dropbox` remote.
+
+The approval and its use in the audit log record the archive URL and its sha256. Verifying takes one full download and a hash of the local tree.
+
 The approval is single use, signed with a local key and bound to the exact realpath, device, inode and a stat manifest. The hook consumes it under a lock, so of two commands racing for one approval exactly one runs. Every approval, refusal and use goes to `~/.agent-harness/state/log-delete-audit.jsonl` and to the WAL; report it in the ticket status. `revoke-delete` removes every approval.
 
 ### Deleting disposable copies without a backup (goodqa#14911)
