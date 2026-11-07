@@ -140,6 +140,23 @@ class SharedSecretRedaction(unittest.TestCase):
         cert = 'x\n-----BEGIN CERTIFICATE-----\n' + 'E' * 64 + '\n-----END CERTIFICATE-----\ny'
         self.assertTrue(self.redact.redact(cert) == cert)
 
+    def test_text_after_and_between_pem_blocks_is_kept(self):
+        """Plan review of the F01 port: a block ends at its END line; only an unterminated BEGIN runs to the end."""
+        one = '-----BEG' 'IN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----'
+        two = '-----BEG' 'IN EC PRIVATE KEY-----\nBBBB\n-----END EC PRIVATE KEY-----'
+        out = self.redact.redact('head ' + one + ' middle words ' + two + ' tail words')
+        self.assertEqual(out, 'head [REDACTED:pem] middle words [REDACTED:pem] tail words')
+        self.assertEqual(self.redact.redact('x ' + one + '\ny'), 'x [REDACTED:pem]\ny')
+
+    def test_unterminated_pem_in_structured_data_keeps_the_structure(self):
+        """redact_obj redacts each string, so an unterminated block cannot swallow JSON syntax around it."""
+        header = '-----BEG' 'IN RSA PRIVATE KEY-----'
+        data = {'reason': 'saw ' + header + ' abc', 'rule': 'x', 'nested': [header], 'n': 3}
+        self.assertEqual(self.redact.redact_obj(data),
+                         {'reason': 'saw [REDACTED:pem]', 'rule': 'x', 'nested': ['[REDACTED:pem]'], 'n': 3})
+        with self.assertRaises(ValueError):  # the shape the old call sites used: redact the serialized text
+            json.loads(self.redact.redact(json.dumps(data)))
+
     def test_secret_shapes_inside_a_pem_body_leave_one_redaction(self):
         body = 'F' * 40 + '\nghp_' + 'a' * 36 + '\n' + 'G' * (self.redact.MAX_CHUNK + 10)
         pem = '-----BEG' 'IN EC PRIVATE KEY-----\n' + body + '\n-----END EC PRIVATE KEY-----'

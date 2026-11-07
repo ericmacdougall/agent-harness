@@ -4462,7 +4462,7 @@ def audit(event, fields, home=None, wal=None, strict=False, to_file=True):
                                                              'user_source', 'bytes')})
     try:
         import redact
-        line = redact.redact(json.dumps(record, sort_keys=True))
+        line = json.dumps(redact.redact_obj(record), sort_keys=True)  # values, so a span cannot eat JSON syntax
     except Exception:  # noqa: BLE001
         line = json.dumps({'ts': record['ts'], 'event': event})
     try:
@@ -5671,7 +5671,7 @@ def explain(text, cwd=None, ps=False):
         detail = [{'error': type(error).__name__}]
     verdict, message = decide(text, c, cwd=cwd, ps=ps)
     import redact
-    return {'verdict': verdict, 'message': message, 'findings': json.loads(redact.redact(json.dumps(detail)))}
+    return {'verdict': verdict, 'message': message, 'findings': redact.redact_obj(detail)}
 
 
 def iter_transcript_commands(path, max_bytes=256 << 20):

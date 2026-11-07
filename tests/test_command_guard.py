@@ -289,6 +289,17 @@ class FailureModeTests(Fixture):
         written = "printf 'env\\n' > @HOME@/repo/tools/new.sh && bash @HOME@/repo/tools/new.sh"
         self.assertEqual(self.decide(written)[0], 'block')
 
+    def test_explain_survives_an_unterminated_key_header_in_a_finding(self):
+        """Plan review of the F01 port: explain() redacted serialized JSON, so a finding whose text held a private-key
+        header without its END line made json.loads raise. It now redacts each value."""
+        header = '-----BEG' 'IN RSA PRIVATE KEY-----'
+        finding = cg.Finding(cg.LOG_DELETE, 'log-delete', 'deletes ' + header + ' x', 'none')
+        with mock.patch.object(cg.Analyzer, 'run', return_value=[finding]), \
+                mock.patch.object(cg, 'decide', return_value=('block', 'm')):
+            out = cg.explain('rm x', cwd=str(self.home / 'repo'))
+        self.assertIsInstance(out['findings'], list)
+        self.assertNotIn(header, json.dumps(out))
+
     def test_probe_memo_keeps_each_probe_function_apart(self):
         """audit2 F-014 port (goodqa#15002): realpath and _resolve_prefix differ for a path over 4096 characters
         (a path versus None); the memo must not return one function's answer for the other."""

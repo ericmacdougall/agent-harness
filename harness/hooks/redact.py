@@ -117,5 +117,20 @@ def redact(text):
     return ''.join(out)
 
 
+def redact_obj(value, depth=0):
+    """redact() applied to every string (keys included) inside dicts, lists and tuples, for data that is about
+    to be serialized. A private-key block without its END line is redacted to the end of its string; run over
+    serialized JSON that would also swallow the closing quote and braces, so redact the values, then dump."""
+    if depth > 32:
+        return '[REDACTED:depth]'
+    if isinstance(value, dict):
+        return {redact(k) if isinstance(k, str) else k: redact_obj(v, depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_obj(v, depth + 1) for v in value]
+    if isinstance(value, str):
+        return redact(value)
+    return value
+
+
 def has_secret(text):
     return bool(find(text))
