@@ -276,7 +276,7 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
     # promised (RESERVE). It is never under MIN_SLICE; when even that does not fit, the source waits for the next run.
     remaining=$(( WALL_END - $(date +%s) - DEADLINE_GRACE - KILL_GRACE ))
     if [ $remaining -lt $MIN_SLICE ]; then
-      say "run time budget (${BUDGET_SECONDS}s) used up before $rel; the next run continues"; ok=1; return
+      say "run time budget (${BUDGET_SECONDS}s) used up before $rel; the next run continues"; ok=1; budget_hit=1; return
     fi
     remaining=$(( remaining - ${RESERVE:-0} )); [ $remaining -ge $MIN_SLICE ] || remaining=$MIN_SLICE
     log_mark=$(wc -c < "$LOG" 2>/dev/null | tr -d ' '); log_mark=${log_mark:-0}
@@ -306,12 +306,12 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
     if [ -e "$LOGDIR/.log-backup.deadline.$copy_pid" ]; then
       rm -f "$LOGDIR/.log-backup.deadline.$copy_pid"
       say "copy of $rel stopped at the run deadline (${remaining}s + ${DEADLINE_GRACE}s grace, killed after ${KILL_GRACE}s more if still running); partial, last-ok withheld"
-      rate_limit_note "$log_mark"; ok=1; return
+      rate_limit_note "$log_mark"; ok=1; budget_hit=1; return
     fi
     if [ $rc -eq 0 ]; then copied=1; break; fi
     if [ $rc -eq 8 ] || [ $rc -eq 10 ]; then
       # --max-transfer (8) or --max-duration (10) reached: partial progress is kept, the next run continues.
-      say "budget reached for $rel (rclone exit $rc); partial, last-ok withheld"; rate_limit_note "$log_mark"; ok=1; return
+      say "budget reached for $rel (rclone exit $rc); partial, last-ok withheld"; rate_limit_note "$log_mark"; ok=1; budget_hit=1; return
     fi
     attempt=$((attempt + 1))
     [ $attempt -le "${LOG_BACKUP_RETRIES:-2}" ] || break
@@ -379,12 +379,24 @@ if [ -e "$bulk_try" ]; then
     say "bulk tier skipped: last attempt ${bulk_age}s ago (every ${BULK_EVERY}s)"
   fi
 fi
+# Copy time left before a source would be told the budget is used up (the same test upload makes).
+time_left() { echo $(( WALL_END - $(date +%s) - DEADLINE_GRACE - KILL_GRACE )); }
+# Mac 2026-11-07: tier 1 used the whole budget, so every hourly bulk attempt copied nothing, failed the run and still
+# spent the hour. With no time left the tier is deferred instead: not an attempt, no failure, the next run tries it.
+if [ $bulk_ran -eq 1 ] && [ ${#sources_bulk[@]} -gt 0 ] && [ "$(time_left)" -lt "$MIN_SLICE" ]; then
+  bulk_ran=0 sources_bulk=()
+  say "bulk tier deferred: no run time left after tier 1; the next run with time left tries it"
+fi
 [ $bulk_ran -eq 1 ] && : > "$bulk_try"
-RESERVE=0
+RESERVE=0 budget_hit=0
 for src in "${sources_bulk[@]+"${sources_bulk[@]}"}"; do
   [ -e "$HOME/$src" ] || [ -L "$HOME/$src" ] || continue
   if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; continue; fi
   extra=(--min-age 2m)
+  if [ "$src" = .agent-harness/work ] && [ "$(time_left)" -lt "$MIN_SLICE" ]; then
+    # The git-tree scan below takes minutes on a large work tree: do not start it with no copy time left.
+    say "run time budget (${BUDGET_SECONDS}s) used up before $src; the next run continues"; ok=1; budget_hit=1; continue
+  fi
   if [ "$src" = .agent-harness/work ]; then
     # The work tree holds git worktrees, checkouts, screenshots and mutation trees (hundreds of GB). Back up only
     # the small durable state: skip every directory that has a .git entry, media files, and files over the size cap.
@@ -408,6 +420,11 @@ done
 # Tier 2 (bulk: archived sessions and the narrowed work tree) has its own marker.
 bulk_ok=$ok
 [ $bulk_ran -eq 1 ] && say "bulk exit=$bulk_ok"
+if [ $bulk_ran -eq 1 ] && [ $budget_hit -eq 1 ]; then
+  # A pass cut short by the run budget is not finished: the next run continues it instead of waiting BULK_EVERY.
+  rm -f "$bulk_try"
+  say "bulk tier stopped on the run budget; the next run continues it"
+fi
 if [ $bulk_ok -eq 0 ] && [ $bulk_ran -eq 1 ]; then
   echo "$STARTED" > "$LOGDIR/log-backup.bulk-last-ok.tmp.$$" \
     && mv "$LOGDIR/log-backup.bulk-last-ok.tmp.$$" "$LOGDIR/log-backup.bulk-last-ok"

@@ -1035,5 +1035,57 @@ class Contention(Case):
         self.assertFalse((self.logs / ".log-backup.deadline.stale").exists(), "leftover deadline markers are cleared")
 
 
+class BulkTier(Case):
+    """Mac 2026-11-07 (goodqa#15062): tier 1 used the whole budget, so the hourly bulk attempts at 03:24, 04:47 and
+    06:00 copied nothing, failed the run and still spent the hour; bulk-last-ok never appeared and check stayed 3."""
+
+    def bulk_try(self):
+        return self.logs / "log-backup.bulk-last-try"
+
+    def bulk_copies(self):
+        return [c for c in self.copies() if "--min-age" in c]
+
+    def test_bulk_tier_with_no_time_left_is_deferred_not_spent(self):
+        done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600", LOG_BACKUP_BUDGET_SECONDS="30",
+                               LOG_BACKUP_SLICE_RESERVE_SECONDS="3", LOG_BACKUP_DEADLINE_GRACE_SECONDS="1",
+                               LOG_BACKUP_KILL_GRACE_SECONDS="1", FAKE_HANG="300")
+        self.assertNotEqual(done.returncode, 0)  # tier 1 is partial
+        log = (self.logs / "log-backup.log").read_text()
+        self.assertIn("bulk tier deferred", log)
+        self.assertNotIn("bulk exit=1", log)
+        self.assertNotIn("git trees excluded", log, "the work-tree scan must not start with no time left")
+        self.assertFalse(self.bulk_try().exists(), "a deferred bulk tier must not spend the hourly slot")
+        self.assertIn("bulk=0", (self.logs / "log-backup.last-run").read_text())
+        open(self.calls, "w").close()
+        again = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600")  # the next run has time: bulk runs now
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertTrue(self.bulk_copies(), "the next run with time left attempts the bulk tier")
+        self.assertTrue(self.bulk_ok().exists())
+
+    def test_bulk_pass_cut_short_by_the_budget_continues_next_run(self):
+        done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600", FAKE_EXIT="10", FAKE_EXIT_MATCH="--min-age")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.bulk_ok().exists())
+        self.assertFalse(self.bulk_try().exists(), "a pass stopped on the budget is unfinished, not an hourly attempt")
+        self.assertIn("bulk tier stopped on the run budget", (self.logs / "log-backup.log").read_text())
+        open(self.calls, "w").close()
+        again = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertTrue(self.bulk_copies())
+        self.assertTrue(self.bulk_ok().exists())
+
+    def test_a_failed_bulk_pass_still_waits_for_the_gap(self):
+        # NEG: only a budget stop skips the gate; an ordinary failure keeps the hourly limit on write load.
+        done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600", FAKE_FAIL_MATCH="archived_sessions",
+                               LOG_BACKUP_RETRIES="0")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertTrue(self.bulk_try().exists())
+        open(self.calls, "w").close()
+        again = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(self.bulk_copies(), [])
+        self.assertIn("bulk tier skipped", (self.logs / "log-backup.log").read_text())
+
+
 if __name__ == "__main__":
     unittest.main()
