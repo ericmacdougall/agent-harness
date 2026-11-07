@@ -54,12 +54,20 @@ def record_gate_epoch(home: Path, prior_mtime=None, now=None) -> bool:
     gate's mtime. Never rewritten, so a later install cannot move it (ah also pins the earliest epoch it used)."""
     now = datetime.now(timezone.utc).timestamp() if now is None else now
     at = min(now, prior_mtime) if prior_mtime else now
-    d = home / ".agent-harness" / "state" / "dropped-gate"
+    root = home / ".agent-harness"
+    d = root / "state" / "dropped-gate"
     try:
-        for p in (home / ".agent-harness", home / ".agent-harness" / "state", d):
+        for p in (root, root / "state", d):
             if p.is_symlink():
                 return False
-        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # mkdir(parents=True) would leave the new parents at the umask default (0755);
+        # every other creator of ~/.agent-harness uses the private mode.
+        for parent in (root, root / "state"):
+            try:
+                parent.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+        d.mkdir(mode=0o700, exist_ok=True)
         fd = os.open(d / "installed_at.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except OSError:
         return False
@@ -260,14 +268,21 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
     elif not durable_tmp and env.get(TMPDIR_KEY) == managed_tmp:
         settings["env"] = {key: value for key, value in env.items() if key != TMPDIR_KEY}
     hooks = settings.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ValueError("settings.json hooks must be an object")
     scripts = managed_scripts(claude)
     wanted = managed_hooks(claude, provenance, command_guard, log_backup)
     for event in sorted(set(wanted) | set(managed_hooks(claude, True))):
         managed = wanted.get(event, [])
         entries = hooks.setdefault(event, [])
+        if not isinstance(entries, list):
+            raise ValueError(f"settings.json hooks.{event} must be a list")
         had_entries = bool(entries)
         preserved = []
         for item in entries:
+            if not isinstance(item, dict) or not isinstance(item.get("hooks", []), list) \
+                    or not all(isinstance(hook, dict) for hook in item.get("hooks", [])):
+                raise ValueError(f"settings.json hooks.{event} has an invalid hook group")
             remaining = [
                 hook for hook in item.get("hooks", [])
                 if not (hook.get("type") == "command"
@@ -282,7 +297,12 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
         entries.extend(managed)
         if not entries and had_entries:
             del hooks[event]  # an uninstalled gate leaves no empty event behind; a user's own empty list stays
-    allowed = settings.setdefault("permissions", {}).setdefault("allow", [])
+    permissions = settings.setdefault("permissions", {})
+    if not isinstance(permissions, dict):
+        raise ValueError("settings.json permissions must be an object")
+    allowed = permissions.setdefault("allow", [])
+    if not isinstance(allowed, list):
+        raise ValueError("settings.json permissions.allow must be a list")
     for name in ("wal_note.py", "publish_feature.py", "integrate_local.py", "deliver.py"):
         rule = f"Bash(python3 ~/.claude/hooks/{name} *)"
         if rule not in allowed:
@@ -807,8 +827,6 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
             raise
         if record_gate_epoch(claude.parent, prior_gate):
             changes.append("recorded the dropped-owner gate install time")
-        if services and not apply:
-            changes.extend("would run service: " + " ".join(argv[1:]) for argv in service_commands(claude))
         if apply and services:  # host services last, after every file is in place (goodqa#14791 S1d)
             changes.extend("service: " + c for c in install_services(claude))
         return changes

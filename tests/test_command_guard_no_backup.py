@@ -521,7 +521,7 @@ class NativeReviewF2Remote(NoBackupCase):
     def test_allowlisted_url_forms(self):
         self.assertEqual(cg._remote_host('https://github.com/o/r.git'), 'github.com')
         self.assertEqual(cg._remote_host('git@github.com:o/r.git'), 'github.com')
-        self.assertEqual(cg._remote_host('ssh://t2-dev/home/eric/wt/qac-b-gate'), 't2-dev')
+        self.assertEqual(cg._remote_host('ssh://t2-dev/home/someone/wt/qac-b-gate'), 't2-dev')
         self.assertEqual(cg._remote_host('ssh://git@GitHub.com:22/o/r'), 'github.com')
         for local in ('/srv/r.git', './r', '~/r', 'file:///srv/r.git', '', 'ext::sh -c x'):
             with self.subTest(local=local):

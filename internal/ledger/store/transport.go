@@ -10,13 +10,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/url"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ericmacdougall/agent-harness/internal/gitx"
@@ -238,26 +239,32 @@ func (g *Git) FetchCapped(remote, refspec string, maxBytes int64) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), FetchTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "--git-dir="+g.GitDir, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
-		"--no-recurse-submodules", "--", remote, refspec)
-	cmd.Env = TransportEnvWith(g.Helpers)
-	cmd.WaitDelay = 2 * time.Second
-	var stderr bytes.Buffer
-	cmd.Stderr = &limitedWriter{b: &stderr, max: 32 << 10}
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("git fetch could not run: %w", err)
+	argv := []string{"git", "--git-dir=" + g.GitDir, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+		"--no-recurse-submodules", "--", remote, refspec}
+	stderr := &limitedWriter{max: 32 << 10}
+	type runResult struct {
+		res proc.Result
+		err error
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	done := make(chan runResult, 1)
+	go func() {
+		res, err := proc.RunContext(ctx, argv, proc.Options{
+			Env: TransportEnvWith(g.Helpers), Stdout: io.Discard, Stderr: stderr,
+		})
+		done <- runResult{res: res, err: err}
+	}()
 	tick := time.NewTicker(150 * time.Millisecond)
 	defer tick.Stop()
 	for {
 		select {
-		case err := <-done:
-			if err != nil {
-				if ctx.Err() != nil {
+		case result := <-done:
+			if result.err != nil {
+				if errors.Is(result.err, context.DeadlineExceeded) || errors.Is(result.err, proc.ErrTimeout) {
 					return fmt.Errorf("git fetch timed out after %s", FetchTimeout)
 				}
+				return fmt.Errorf("git fetch could not run: %w", result.err)
+			}
+			if result.res.Code != 0 {
 				return &GitError{Sub: "fetch", Code: 1, Stderr: stderr.String()}
 			}
 			if DirSize(g.GitDir) > maxBytes {
@@ -275,11 +282,14 @@ func (g *Git) FetchCapped(remote, refspec string, maxBytes int64) error {
 }
 
 type limitedWriter struct {
-	b   *bytes.Buffer
+	mu  sync.Mutex
+	b   bytes.Buffer
 	max int
 }
 
 func (w *limitedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if room := w.max - w.b.Len(); room > 0 {
 		if len(p) > room {
 			w.b.Write(p[:room])
@@ -290,46 +300,67 @@ func (w *limitedWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func (w *limitedWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.String()
+}
+
 // ErrOutputTooBig means a transport command produced more output than allowed and was stopped.
 var ErrOutputTooBig = errors.New("the remote's listing exceeded its output cap (output cap); refusing")
 
-// runCapped is runT with a hard cap on stdout: past maxOut bytes the process is killed.
+// runCapped is runT with a hard cap on stdout: past maxOut bytes the whole process group is killed.
 func (g *Git) runCapped(timeout time.Duration, maxOut int, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", append([]string{"--git-dir=" + g.GitDir}, args...)...)
-	cmd.Env = TransportEnvWith(g.Helpers)
-	cmd.WaitDelay = 2 * time.Second
-	var out bytes.Buffer
-	over := false
-	cmd.Stdout = &capWriter{b: &out, max: maxOut, over: &over, cancel: cancel}
-	var stderr bytes.Buffer
-	cmd.Stderr = &limitedWriter{b: &stderr, max: 32 << 10}
-	err := cmd.Run()
-	if over {
+	out := &capWriter{max: maxOut, cancel: cancel}
+	stderr := &limitedWriter{max: 32 << 10}
+	argv := append([]string{"git", "--git-dir=" + g.GitDir}, args...)
+	res, err := proc.RunContext(ctx, argv, proc.Options{
+		Env: TransportEnvWith(g.Helpers), Stdout: out, Stderr: stderr,
+	})
+	if out.Over() {
 		return nil, ErrOutputTooBig
 	}
 	if err != nil {
-		if ctx.Err() != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, proc.ErrTimeout) {
 			return nil, fmt.Errorf("git %s timed out after %s", args[0], timeout)
 		}
+		return out.Bytes(), &GitError{Sub: args[0], Code: 1, Stderr: stderr.String()}
+	}
+	if res.Code != 0 {
 		return out.Bytes(), &GitError{Sub: args[0], Code: 1, Stderr: stderr.String()}
 	}
 	return out.Bytes(), nil
 }
 
 type capWriter struct {
-	b      *bytes.Buffer
+	mu     sync.Mutex
+	b      bytes.Buffer
 	max    int
-	over   *bool
+	over   bool
 	cancel context.CancelFunc
 }
 
 func (w *capWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.b.Len()+len(p) > w.max {
-		*w.over = true
+		w.over = true
 		w.cancel()
 		return len(p), nil
 	}
 	return w.b.Write(p)
+}
+
+func (w *capWriter) Over() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.over
+}
+
+func (w *capWriter) Bytes() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]byte(nil), w.b.Bytes()...)
 }

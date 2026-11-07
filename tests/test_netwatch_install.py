@@ -185,12 +185,61 @@ class NetwatchInstallTests(unittest.TestCase):
         self.assertIn("does not match the pinned binary_sha256", line)
         self.assertFalse((self.home / ".agent-harness" / "bin" / "netwatch").exists())
 
-    def test_old_version_is_upgraded(self):
+    def install_old_binary(self):
         binary = self.home / ".agent-harness" / "bin" / "netwatch"
-        binary.parent.mkdir(parents=True)
+        binary.parent.mkdir(parents=True, exist_ok=True)
         binary.write_bytes(b"v0.0.1")
+        return binary
+
+    def rollback_backups(self):
+        return list((self.home / ".agent-harness" / "bin").glob(".netwatch.rollback-*"))
+
+    def test_old_version_is_upgraded(self):
+        binary = self.install_old_binary()
         self.assertIn(f"installed {VERSION}", self.status())
         self.assertEqual(binary.read_bytes(), VERSION.encode())
+        self.assertEqual(self.rollback_backups(), [])
+
+    def test_wrong_version_upgrade_restores_old_binary(self):
+        binary = self.install_old_binary()
+        data = tar_archive(self.key, [(f"netwatch_{VERSION}_{self.key}/netwatch", b"v1.0.0", "file")])
+        self.pin = self.write_pin(hashlib.sha256(data).hexdigest(), binary=b"v1.0.0")
+        run = FakeRun()
+        line = self.status(run, data=data)
+        self.assertIn("does not report", line)
+        self.assertIn("previous executable restored", line)
+        self.assertEqual(binary.read_bytes(), b"v0.0.1")
+        self.assertEqual(self.rollback_backups(), [])
+        self.assertNotIn(["install"], run.calls)
+
+    def test_service_failure_upgrade_restores_old_binary(self):
+        binary = self.install_old_binary()
+        line = self.status(FakeRun(install_code=1))
+        self.assertIn("service registration failed (boom)", line)
+        self.assertIn("previous executable restored", line)
+        self.assertEqual(binary.read_bytes(), b"v0.0.1")
+        self.assertEqual(self.rollback_backups(), [])
+
+    def test_rollback_failure_retains_old_binary_and_requires_recovery(self):
+        binary = self.install_old_binary()
+        data = tar_archive(self.key, [(f"netwatch_{VERSION}_{self.key}/netwatch", b"v1.0.0", "file")])
+        self.pin = self.write_pin(hashlib.sha256(data).hexdigest(), binary=b"v1.0.0")
+        place_binary = nw.place_binary
+
+        def refuse_old_binary(path, contents):
+            if contents == b"v0.0.1":
+                raise OSError("rollback denied")
+            return place_binary(path, contents)
+
+        with unittest.mock.patch.object(nw, "place_binary", side_effect=refuse_old_binary):
+            line = self.status(data=data)
+        self.assertIn("rollback failed", line)
+        self.assertIn("RECOVERY REQUIRED", line)
+        self.assertEqual(binary.read_bytes(), b"v1.0.0")
+        backups = self.rollback_backups()
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), b"v0.0.1")
+        self.assertIn(str(backups[0]), line)
 
     def test_archive_without_expected_member_or_with_link_is_refused(self):
         real = f"netwatch_{VERSION}_{self.key}/README.md"
@@ -204,6 +253,23 @@ class NetwatchInstallTests(unittest.TestCase):
             self.assertIn("not installed", line)
             self.assertFalse((self.home / ".agent-harness" / "bin" / "netwatch").exists())
             self.assertFalse((self.home.parent / "netwatch").exists())
+
+    def test_pinned_binary_without_execute_bit_is_repaired(self):
+        """audit2 (d18aaae): a pinned binary restored without permissions is made runnable, not re-registered."""
+        self.status()
+        binary = self.home / ".agent-harness" / "bin" / "netwatch"
+        binary.chmod(0o600)  # a restore without permissions
+        run = FakeRun(status_out="service: loaded, state running, pid 42\n")
+        line = self.status(run)
+        self.assertIn("up to date", line)
+        self.assertTrue(os.access(binary, os.X_OK))
+        self.assertNotIn(["install"], run.calls)
+
+    def test_file_sha256_streams_large_files(self):
+        big = self.home / "big"
+        data = os.urandom((1 << 20) + 7)
+        big.write_bytes(data)
+        self.assertEqual(nw.file_sha256(big), hashlib.sha256(data).hexdigest())
 
     def test_binary_reporting_wrong_version_is_not_registered(self):
         data = tar_archive(self.key, [(f"netwatch_{VERSION}_{self.key}/netwatch", b"v1.0.0", "file")])

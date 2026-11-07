@@ -669,7 +669,7 @@ class Round4(Case):
         for command in ("psql -h prod-db -f big.sql", "psql -h prod-db -c $'DELETE--keep\\nFROM users'",
                         "psql -h prod-db -c DELETE\\ FROM\\ users", "psql -h prod-db -c $'DELETE\\x20FROM users'",
                         "dropdb -h prod-db app", "mysqladmin -h prod-db -f drop app",
-                        "psql -h 10.0.0.5 app_production -c 'DELETE FROM users'",
+                        "psql -h 192.0.2.5 app_production -c 'DELETE FROM users'",
                         "sqlite3 -cmd 'DELETE FROM users' /srv/prod.db"):
             with self.subTest(command=command):
                 self.assertEqual(self.verdict(self.ev(command)), "deny")

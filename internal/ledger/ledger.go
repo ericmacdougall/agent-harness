@@ -45,6 +45,7 @@ const (
 	ViewBudgetEnv     = "HARNESS_LEDGER_TEST_VIEW_BUDGET"
 	FailFirstFoldEnv  = "HARNESS_LEDGER_TEST_FAIL_FIRST_FOLD"
 	FailPublishEnv    = "HARNESS_LEDGER_TEST_FAIL_BEFORE_PUBLISH"
+	InitCleanupDelay  = "HARNESS_LEDGER_TEST_INIT_CLEANUP_DELAY_MS"
 	FailViewAfterEnv  = "HARNESS_LEDGER_TEST_FAIL_VIEW_AFTER_COMMIT"
 	DirName           = "goodqa"
 	projectsFile      = "projects.json"
@@ -76,7 +77,7 @@ func CheckTestEnv() error {
 	if writer.TestHooksAllowed {
 		return nil
 	}
-	for _, k := range []string{FakeNowEnv, CrashAfterCASEnv, LockWaitEnv, ViewBudgetEnv, FailFirstFoldEnv, FailPublishEnv, FailViewAfterEnv, writer.FakeMachineIDEnv} {
+	for _, k := range []string{FakeNowEnv, CrashAfterCASEnv, LockWaitEnv, ViewBudgetEnv, FailFirstFoldEnv, FailPublishEnv, FailViewAfterEnv, InitCleanupDelay, writer.FakeMachineIDEnv} {
 		if _, ok := os.LookupEnv(k); ok {
 			return wrap(ErrUsage, "%s is a test-only variable, refused by builds without -tags ledgertest", k)
 		}
@@ -119,7 +120,6 @@ type Ledger struct {
 	warn    []string
 
 	cacheSecret []byte // this HOME's view-cache key; nil until loaded, empty when unavailable
-	reviewing   bool   // WriterReview reads a trusted writer's full ops, not its reviewed prefix
 }
 
 // Warnings collected while opening or writing (printed by the CLI on stderr).
@@ -453,9 +453,19 @@ func (l *Ledger) snapshot() (*snapshot, error) {
 	return &snapshot{tips: refs, bad: bad, classes: classes, key: fold.HandleHash(string(k)), mirror: mirror, fromMirror: fromMirror}, nil
 }
 
+// readMode selects how readAll treats a trusted writer: readNormal folds only its reviewed prefix and holds
+// the rest; readFullReview (WriterReview only) returns every op. The mode is per call, never Ledger state, so
+// a review cannot change what a concurrent normal read folds or caches (Kimi audit F07, goodqa#14996).
+type readMode int
+
+const (
+	readNormal readMode = iota
+	readFullReview
+)
+
 // readAll reads and validates every writer ref of the project. Refs of other projects and malformed names
 // are reported, never read.
-func (l *Ledger) readAll(s *snapshot) (fold.Input, error) {
+func (l *Ledger) readAll(s *snapshot, mode readMode) (fold.Input, error) {
 	in := fold.Input{Project: l.Project, Classes: s.classes}
 	names := make([]string, 0, len(s.tips))
 	for r := range s.tips {
@@ -527,7 +537,7 @@ func (l *Ledger) readAll(s *snapshot) (fold.Input, error) {
 				ops = append(ops, o)
 			}
 		}
-		if dup == "" && in.Class(w) == fold.ClassTrusted && !l.reviewing {
+		if dup == "" && in.Class(w) == fold.ClassTrusted && mode != readFullReview {
 			if n, ok := l.trustPrefix(w, ops); !ok {
 				in.Classes[w] = fold.ClassUnverified // the reviewed prefix changed: not trusted
 			} else if n < len(ops) {
@@ -736,7 +746,7 @@ func (l *Ledger) View() (*fold.View, error) {
 }
 
 func (l *Ledger) rebuild(s *snapshot) (*fold.View, error) {
-	in, err := l.readAll(s)
+	in, err := l.readAll(s, readNormal)
 	if err != nil {
 		return nil, err
 	}
@@ -828,57 +838,117 @@ func scanEnvelope(fields [][2]string) error {
 	return wrap(ErrSecret, "refusing to store secret-shaped text: %s", strings.Join(parts, "; "))
 }
 
-// scanDrafts refuses (or masks) secret-shaped text in every string payload member and the actor label.
+const maxDraftNesting = 32
+
+func scanDraftText(field, text string, redact bool) (string, error) {
+	found := scan.Scan([][2]string{{field, text}})
+	if len(found) == 0 {
+		return text, nil
+	}
+	if !redact {
+		parts := make([]string, len(found))
+		for j, f := range found {
+			parts[j] = f.String()
+		}
+		return "", wrap(ErrSecret, "refusing to store secret-shaped text: %s (rewrite it, or pass --redact-secrets to mask it)", strings.Join(parts, "; "))
+	}
+	masked := scan.Mask(text)
+	if len(scan.Scan([][2]string{{field, masked}})) > 0 {
+		return "", wrap(ErrSecret, "masking left secret-shaped text in %s", field)
+	}
+	return masked, nil
+}
+
+func scanDraftValue(field string, value any, redact bool, depth int) (any, error) {
+	if depth > maxDraftNesting {
+		return nil, wrap(ErrUsage, "payload nesting exceeds %d levels at %s", maxDraftNesting, field)
+	}
+	switch v := value.(type) {
+	case json.RawMessage:
+		parsed, err := op.DecodeStrict(v)
+		if err != nil {
+			return nil, wrap(ErrUsage, "invalid raw JSON at %s", field)
+		}
+		masked, err := scanDraftValue(field, parsed, redact, depth)
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := op.Encode(masked)
+		if err != nil {
+			return nil, wrap(ErrUsage, "invalid raw JSON at %s", field)
+		}
+		return json.RawMessage(encoded), nil
+	case string:
+		return scanDraftText(field, v, redact)
+	case []string:
+		for i := range v {
+			masked, err := scanDraftText(field, v[i], redact)
+			if err != nil {
+				return nil, err
+			}
+			v[i] = masked
+		}
+	case []any:
+		for i := range v {
+			masked, err := scanDraftValue(field, v[i], redact, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			v[i] = masked
+		}
+	case op.Obj:
+		for i := range v {
+			key := field + "." + v[i].K
+			if field == "" {
+				key = v[i].K
+			}
+			masked, err := scanDraftValue(key, v[i].V, redact, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			v[i].V = masked
+		}
+	case []op.Obj:
+		for i := range v {
+			masked, err := scanDraftValue(field, v[i], redact, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			v[i] = masked.(op.Obj)
+		}
+	case map[string]any:
+		keys := make([]string, 0, len(v))
+		for key := range v {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			child := field + "." + key
+			if field == "" {
+				child = key
+			}
+			masked, err := scanDraftValue(child, v[key], redact, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			v[key] = masked
+		}
+	}
+	return value, nil
+}
+
+// scanDrafts refuses (or masks) secret-shaped text in every nested string payload value and actor name.
 func scanDrafts(ds []op.Draft, redact bool) error {
 	for i := range ds {
-		if err := scanEnvelope([][2]string{{"actor_label", ds[i].Actor.Label}}); err != nil {
+		if err := scanEnvelope([][2]string{{"actor_label", ds[i].Actor.Label}, {"actor_human", ds[i].Actor.Human}}); err != nil {
 			return err
 		}
-		var fields [][2]string
-		for _, f := range ds[i].Payload {
-			switch v := f.V.(type) {
-			case string:
-				fields = append(fields, [2]string{f.K, v})
-			case []string:
-				for _, s := range v {
-					fields = append(fields, [2]string{f.K, s})
-				}
-			}
-		}
-		found := scan.Scan(fields)
-		if len(found) == 0 {
-			continue
-		}
-		if !redact {
-			parts := make([]string, len(found))
-			for j, f := range found {
-				parts[j] = f.String()
-			}
-			return wrap(ErrSecret, "refusing to store secret-shaped text: %s (rewrite it, or pass --redact-secrets to mask it)", strings.Join(parts, "; "))
-		}
 		for j, f := range ds[i].Payload {
-			switch v := f.V.(type) {
-			case string:
-				ds[i].Payload[j].V = scan.Mask(v)
-			case []string:
-				for k := range v {
-					v[k] = scan.Mask(v[k])
-				}
+			masked, err := scanDraftValue(f.K, f.V, redact, 0)
+			if err != nil {
+				return err
 			}
-		}
-		for _, f := range ds[i].Payload {
-			var vals []string
-			switch v := f.V.(type) {
-			case string:
-				vals = []string{v}
-			case []string:
-				vals = v
-			}
-			for _, s := range vals {
-				if len(scan.Scan([][2]string{{f.K, s}})) > 0 {
-					return wrap(ErrSecret, "masking left secret-shaped text in %s", f.K)
-				}
-			}
+			ds[i].Payload[j].V = masked
 		}
 	}
 	return nil
@@ -1000,11 +1070,18 @@ func (l *Ledger) mint(drafts []op.Draft, w string, last op.HLC, now int64, witne
 		}
 		payload := append(op.Obj(nil), d.Payload...)
 		if d.Kind == op.KindComment {
+			if len(d.Payload) != 2 || d.Payload[0].K != "comment_id" || d.Payload[1].K != "body" {
+				return nil, wrap(ErrUsage, "ticket.comment draft payload must contain comment_id and body")
+			}
+			body, ok := d.Payload[1].V.(string)
+			if !ok {
+				return nil, wrap(ErrUsage, "ticket.comment draft body must be a string")
+			}
 			cid, err := op.NewID(op.PrefixComment, h.WallMs)
 			if err != nil {
 				return nil, err
 			}
-			payload = op.Comment(cid, d.Payload[1].V.(string))
+			payload = op.Comment(cid, body)
 		}
 		if d.Kind == op.KindProjectCreate {
 			// Root rule: the project id is derived from (equals the ULID of) its project.create op.

@@ -10,7 +10,7 @@ sys.path.insert(0, str(HOOKS))
 import kill_guard as kg  # noqa: E402
 
 CLI = "python3 ~/.claude/hooks/"
-WAL = "/Users/eric/.claude/wals/s1/main.jsonl"
+WAL = "/Users/someone/.claude/wals/s1/main.jsonl"
 HOME = str(Path.home())
 
 ALLOW = [
@@ -87,7 +87,7 @@ BLOCK = [
     CLI + "ah.py --text kill --pid 4242 --reason x --foreign",
     CLI + "ah.py -- kill --pid 4242",
     CLI + "ah.py --te kill --pid 4242 --reason x",
-    "python3 /Users/bob/.claude/hooks/ah.py user-msg --text 'kill 1'",
+    "python3 /Users/someone/.claude/hooks/ah.py user-msg --text 'kill 1'",
     "python3 /home/bob/.claude/hooks/wal_note.py --note 'kill 1'",
 ]
 

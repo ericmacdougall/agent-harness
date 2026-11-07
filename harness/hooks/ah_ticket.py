@@ -50,18 +50,32 @@ def _ledger(home: Path) -> Path:
     return d / "ticket-create.jsonl"
 
 
-def _rows(path: Path):
+MAX_LEDGER_LINE = 64 * 1024  # a row is a key, a status and a short result; anything longer is not ours
+
+
+def _created(path: Path, key: str):
+    """The newest "created" row for key, or None. Streams the ledger with a per-line cap and keeps one row, so a
+    large ledger is never held in memory. There is deliberately no total byte or time budget: the ledger only
+    grows and its newest rows are the ones a retry needs, so stopping early would file a duplicate ticket
+    (goodqa#14999). Rows are prefiltered on the key's bytes before JSON parsing."""
+    import safe_input
+    needle = json.dumps(key).encode()
+    found = None
     try:
-        lines = path.read_text().splitlines()
-    except OSError:
-        return []
-    out = []
-    for line in lines:
-        try:
-            out.append(json.loads(line))
-        except ValueError:
-            continue
-    return out
+        for _, line in safe_input.iter_jsonl_lines(path, max_line=MAX_LEDGER_LINE):
+            if line is None or needle not in line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.get("key") == key and row.get("status") == "created" \
+                    and isinstance(row.get("result"), dict):
+                found = row
+    except (OSError, safe_input.InputRejected):
+        return found  # no ledger yet, not a regular file, or a read error after a match: keep what was found;
+        # GoodQA still dedupes on the operationId
+    return found
 
 
 def _append(path: Path, row: dict) -> None:
@@ -101,7 +115,7 @@ def create(project, title, body_file, type_="task", priority=None, key=None, hom
     lock = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        done = next((r for r in reversed(_rows(path)) if r.get("key") == key and r.get("status") == "created"), None)
+        done = _created(path, key)
         if done:
             return dict(done["result"], deduplicated=True, key=key)
         if adapter is None:

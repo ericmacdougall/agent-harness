@@ -426,7 +426,7 @@ class NarrowedScope(KillBase):
     def test_daemons_and_backup_jobs_are_always_refused_even_with_foreign(self):
         for n, cmd in enumerate(("rclone sync /a b:", "/x/bin/harness-console", "/opt/netwatch/netwatch run",
                                  "python3 /h/hookd.py serve", "python3 /h/ahd.py", "/bin/bash /h/log_backup.sh",
-                                 "/Users/e/.agent-harness/bin/log-backup.sh")):
+                                 "/Users/someone/.agent-harness/bin/log-backup.sh")):
             with self.subTest(cmd=cmd):
                 probe = self.base(proc(1000 + n, 100, cmd=cmd))
                 out = self.run_kill(probe, [1000 + n], foreign=True)

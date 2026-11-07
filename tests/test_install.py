@@ -293,6 +293,34 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(os.stat(folder).st_mode), 0o700, folder)
         self.assertEqual(stat.S_IMODE((next(root.rglob("settings.json"))).stat().st_mode), 0o600)
 
+    def test_harness_state_directories_are_private(self):
+        # record_gate_epoch creates ~/.agent-harness before any other component:
+        # the parents must not keep the umask-default 0755 that mkdir(parents=True) gives them.
+        install(self.home, apply=True)
+        for rel in (".agent-harness", ".agent-harness/state"):
+            self.assertEqual(stat.S_IMODE((self.home / rel).stat().st_mode), 0o700, rel)
+        self.assertEqual(stat.S_IMODE((self.home / ".agent-harness/state/dropped-gate").stat().st_mode), 0o700)
+
+    def test_malformed_hook_and_permission_shapes_raise_valueerror(self):
+        # A damaged settings.json must be refused with a clear message, like the
+        # existing env shape check, not crash with an AttributeError.
+        cases = (
+            ({"hooks": []}, "hooks must be an object"),
+            ({"hooks": {"PreToolUse": {}}}, "hooks.PreToolUse must be a list"),
+            ({"hooks": {"PreToolUse": ["not-a-group"]}}, "invalid hook group"),
+            ({"hooks": {"PreToolUse": [42]}}, "invalid hook group"),
+            ({"hooks": {"PreToolUse": [{"hooks": {}}]}}, "invalid hook group"),
+            ({"hooks": {"PreToolUse": [{"hooks": ["not-a-hook"]}]}}, "invalid hook group"),
+            ({"permissions": []}, "permissions must be an object"),
+            ({"permissions": {"allow": "Bash(foo)"}}, "permissions.allow must be a list"),
+        )
+        for settings, message in cases:
+            with self.subTest(settings=settings):
+                (self.claude / "settings.json").write_text(json.dumps(settings))
+                with self.assertRaisesRegex(ValueError, message):
+                    install(self.home, apply=True)
+                self.assertFalse((self.claude / "hooks").exists())
+
     def test_refuses_symlinked_destination(self):
         outside = self.home / "outside"
         outside.write_text("preserve")

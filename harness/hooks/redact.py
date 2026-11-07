@@ -21,10 +21,12 @@ _KEYS = (r'(?:[a-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|api[_-]?
          r'private[_-]?key|credentials?|client[_-]?secret|refresh[_-]?token|access[_-]?token|id[_-]?token)'
          r'(?:[_-]value)?')
 
+# PEM bodies are unbounded: scan them separately so chunk boundaries and regex body caps cannot expose a tail.
+PEM_BEGIN = re.compile(r'-----BEGIN [A-Z0-9 ]{0,40}(?:PRIVATE KEY|ENCRYPTED PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----')
+PEM_END = re.compile(r'-----END [A-Z0-9 ]{0,40}-----')
+
 # (kind, compiled pattern). Order matters: specific shapes first so the kind label is the most useful one.
 PATTERNS = [
-    ('pem', re.compile(r'-----BEGIN [A-Z0-9 ]{0,40}(?:PRIVATE KEY|ENCRYPTED PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----'
-                       r'(?:[\s\S]{0,16384}?-----END [A-Z0-9 ]{0,40}-----|[\s\S]{0,16384})')),
     ('rclone-token', re.compile(r'(?im)^\s*token\s*=\s*\{[^\n]{0,8192}')),
     ('oauth-json', re.compile(r'(?is)\{[^{}]{0,2048}?[\x22\x27](?:access_token|refresh_token|id_token)[\x22\x27]'
                               r'\s*:[^{}]{0,4096}\}')),
@@ -61,11 +63,25 @@ def _chunks(text):
         start += MAX_CHUNK
 
 
+def _find_pem(text):
+    hits = []
+    cursor = 0
+    while True:
+        begin = PEM_BEGIN.search(text, cursor)
+        if begin is None:
+            return hits
+        end = PEM_END.search(text, begin.end())
+        stop = end.end() if end is not None else len(text)
+        hits.append(('pem', begin.start(), stop))
+        cursor = stop
+
+
 def find(text):
     """[(kind, start, end)] for every secret-shaped span. Values are never returned."""
-    hits = []
-    seen = set()
-    for base, chunk in _chunks(str(text)):
+    text = str(text)
+    hits = _find_pem(text)
+    seen = {(start, end) for _kind, start, end in hits}
+    for base, chunk in _chunks(text):
         for kind, pattern in PATTERNS:
             for match in pattern.finditer(chunk):
                 if '[REDACTED:' in match.group(0):
@@ -99,6 +115,21 @@ def redact(text):
         cursor = end
     out.append(text[cursor:])
     return ''.join(out)
+
+
+def redact_obj(value, depth=0):
+    """redact() applied to every string (keys included) inside dicts, lists and tuples, for data that is about
+    to be serialized. A private-key block without its END line is redacted to the end of its string; run over
+    serialized JSON that would also swallow the closing quote and braces, so redact the values, then dump."""
+    if depth > 32:
+        return '[REDACTED:depth]'
+    if isinstance(value, dict):
+        return {redact(k) if isinstance(k, str) else k: redact_obj(v, depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_obj(v, depth + 1) for v in value]
+    if isinstance(value, str):
+        return redact(value)
+    return value
 
 
 def has_secret(text):

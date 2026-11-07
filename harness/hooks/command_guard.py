@@ -337,11 +337,12 @@ PINNED_ROUTES = (
      r'|set-ttl --name [a-z.]{{1,40}} --ttl [0-9]{{1,5}} --expect-ttl [0-9]{{1,5}}'
      r'|set-content --name [a-z.]{{1,40}} --content [0-9.]{{7,15}} --expect-content [0-9.]{{7,15}})'),
 )
-# Existing scripts are otherwise judged only for log deletion, so a credential read inside one would pass. This refuses
+# Existing scripts keep only log deletion and the credential-read rules (SCRIPT_CREDENTIAL_RULES); other printing rules
+# inside them still pass (goodqa#14993 follow-up). This also refuses
 # scripts whose own text, outside comment lines, names the rclone config or the token secret or dumps the config. Text only.
 # Python prose does not count as a dump: there the command must open a string or be an argument list. It runs as its own
 # pass after main's analysis (credential_findings), so it only ever adds a finding and cannot use main's time. It does
-# not run inside scripts on disk, whose own commands are judged only for log deletion. It does not catch a
+# not run inside scripts on disk, whose own commands keep only log deletion and credential reads. It does not catch a
 # script that builds the name at runtime or calls another script, a name past the read limit, a path the guard cannot
 # resolve, a runner it does not unwrap (`uv run`, `tmux`, `python3 -m cProfile`), a test in a folder named tests, or one of
 # the guard's own files.
@@ -1502,18 +1503,23 @@ class Ctx:
         self.fixed_cwd = None
         self.fork_depth = 0  # readings of `>!` being analysed around the current script (Analyzer._both_readings)
         self.readings_capped = False  # `>!` could not be judged both ways: too deep, no budget, or the readings disagree
+        self.fs_cache = {}  # per-analysis memo of disk probes (lexists/realpath/markers): the command has not run,
+        # so the disk cannot change mid-analysis. Cleared wherever the analysis models a filesystem change
+        # (note_created, a made link) or restores a reading's snapshot, which make earlier answers stale.
 
     def cwd_value(self):
         return self.cwd
 
     # what one reading of a script can change; findings accumulate across readings and the rest is not analysis state
-    NOT_STATE = ('findings', 'budget', 'c', 'marker', 'raw_top', 'ps', 'tail_visible', 'fork_depth', 'readings_capped')
+    NOT_STATE = ('findings', 'budget', 'c', 'marker', 'raw_top', 'ps', 'tail_visible', 'fork_depth', 'readings_capped',
+                 'fs_cache')
 
     def state(self):
         return {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(self).items()
                 if k not in self.NOT_STATE}
 
     def restore(self, saved):
+        self.fs_cache.clear()  # the restored snapshot's model of created paths/links may differ from the probe era
         for k in [k for k in vars(self) if k not in self.NOT_STATE and k not in saved]:
             delattr(self, k)
         for k, v in saved.items():
@@ -1577,10 +1583,20 @@ class Ctx:
 MAX_READING_FORKS = 3
 
 
+# SECRET_DUMP rules still enforced inside an existing script on disk (Kimi audit F02, goodqa#14995): these read
+# credential material wholesale, which repository tooling has no routine reason to do. Lookups that tooling does use
+# (env dumps, `gh auth token`, one keychain password, ${!name}, git config listings, obfuscation) stay exempt there.
+SCRIPT_CREDENTIAL_RULES = frozenset((
+    'credential-file', 'credential-stdin', 'credential-script', 'find-exec-credentials', 'keychain-dump',
+    'docker-credential', 'git-credential', 'git-credential-helper', 'goodqa-reveal', 'rclone-dump', 'rclone-authorize',
+))
+
+
 class Analyzer:
     # The credential-script check (goodqa#14518) runs only in its own second pass, credential_findings(), so the analysis
-    # that decides everything else is exactly main's. disk_depth counts scripts on disk being analysed: their own
-    # commands are judged only for log deletion, so the check skips them rather than spend its time there.
+    # that decides everything else is exactly main's. disk_depth counts scripts on disk being analysed: their
+    # commands are judged only for log deletion and credential reads (SCRIPT_CREDENTIAL_RULES), so the
+    # check skips them rather than spend its time there.
     credential_pass = False
     credential_candidate = False
     disk_depth = 0
@@ -1588,6 +1604,26 @@ class Analyzer:
     def __init__(self, compiled, cwd=None, ps=False, marker=None):
         self.ctx = Ctx(compiled, cwd, ps, marker)
         self.c = compiled
+
+    def _probe(self, kind, path, fn):
+        """One disk probe per analysis. The command has not run, so a path's lexists/realpath/marker answer is
+        fixed for the whole analysis; repeat probes (both `>!` readings, every redirect alternative, each path
+        prefix) reuse it. The cache is cleared whenever the analysis models a filesystem change or restores a
+        reading, so a stale answer is impossible (see Ctx.fs_cache). Exceptions are cached and re-raised, so
+        callers keep their current try/except behaviour. The key is the probe function itself, not `kind`:
+        os.path.realpath and _resolve_prefix answer differently (None versus a path or an exception) for the
+        same path, so a shared label would hand one caller the other's answer (audit2 F-014 port, goodqa#15002)."""
+        cache = self.ctx.fs_cache
+        key = (fn, path)
+        if key not in cache:
+            try:
+                cache[key] = (True, fn(path))
+            except (OSError, ValueError, RuntimeError) as exc:
+                cache[key] = (False, exc)
+        ok, value = cache[key]
+        if ok:
+            return value
+        raise value
 
     # ---- entry
     def run(self, text):
@@ -2414,9 +2450,11 @@ class Analyzer:
             if not (first.startswith('#!') and re.search(r'\b(?:ba|z|k|da|)sh\b', first)) \
                     and not path.endswith(('.sh', '.bash', '.zsh')):
                 return
-        # An existing script is the repository's own tooling: only its deletions of protected logs count. Its
-        # environment handling and secret lookups are routine there (replay false positives), and what it
-        # prints is not knowable from here. Scripts written earlier in this same command are judged in full.
+        # An existing script is the repository's own tooling: its deletions of protected logs count, and so do
+        # reads of credential material itself (SCRIPT_CREDENTIAL_RULES: a private key, a credentials file, a
+        # keychain or credential-helper dump). Its environment handling and secret lookups are routine there
+        # (replay false positives), and what it prints is not knowable from here. Scripts written earlier in this
+        # same command are judged in full.
         # It also runs as its own process, so its cd, variables and recorded files do not carry into this command.
         before = len(ctx.findings)
         keep = {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(ctx).items()
@@ -2428,7 +2466,8 @@ class Analyzer:
             self.disk_depth -= 1
             for k, v in keep.items():
                 setattr(ctx, k, v)
-            ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE]
+            ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE
+                                     or f.category == SECRET_DUMP and f.rule in SCRIPT_CREDENTIAL_RULES]
 
     def launcher(self, name, args, depth, pl, idx):
         """Commands that run another command given as text or as trailing words. True when handled."""
@@ -3195,8 +3234,8 @@ class Analyzer:
             return True
         candidates = {path}
         try:
-            if os.path.lexists(path) and len(path) < 1024:
-                candidates.add(os.path.realpath(path))
+            if self._probe('le', path, os.path.lexists) and len(path) < 1024:
+                candidates.add(self._probe('rp', path, os.path.realpath))
         except (OSError, ValueError):
             pass
         for p in candidates:
@@ -3364,14 +3403,14 @@ class Analyzer:
         if best != 'log' and any(rx.search(folded) for rx in c.wal_regexes):
             best = 'log'
         if best is None or best == 'root':
-            real = _resolve_prefix(self._through_links(path))
+            real = self._probe('rp', self._through_links(path), _resolve_prefix)
             if real and real.casefold() != folded:
                 other = classify_segs(c, Compiled._segs(real.casefold()))
                 other = 'log' if other == 'log-name' else other
                 if self.RANK[other] > self.RANK[best]:
                     best = other
         if best == 'root' and not is_dynamic_path(path) and not self._kept(path):
-            real = None if self._foreign_home(path) else _resolve_prefix(self._through_links(path))
+            real = None if self._foreign_home(path) else self._probe('rp', self._through_links(path), _resolve_prefix)
             if real and real.casefold() != folded and not any(ch in path for ch in GLOB_CHARS) \
                     and not getattr(self, '_in_real', False):
                 # an exception must hold where the path really leads: a symlink inside the agent's own worktree
@@ -3502,8 +3541,8 @@ class Analyzer:
         if any(_has_glob(x) and x[:1] in ('.', '?', '[') for x in segs[top_len:]):
             return False  # could match .git, . or .. (and so reach the top or a parent)
         try:
-            here = os.path.realpath(origin)
-            top_real = os.path.realpath(top)
+            here = self._probe('rp', origin, os.path.realpath)
+            top_real = self._probe('rp', top, os.path.realpath)
         except (OSError, ValueError):
             return False
         return here == top_real or here.startswith(top_real.rstrip('/') + '/')
@@ -3523,7 +3562,7 @@ class Analyzer:
         for h in self.c.homes:
             base = Compiled._segs(h) + ['.agent-harness', 'work']
             if len(segs) == len(base) + 2 and segs[:len(base)] == base:
-                return not os.path.isdir(path) and not os.path.islink(path)
+                return not self._probe('id', path, os.path.isdir) and not self._probe('il', path, os.path.islink)
         return False
 
     def _inside_repo(self, path):
@@ -3551,8 +3590,8 @@ class Analyzer:
             if marker.casefold() in self.ctx.created:
                 return None  # made by this same command
             try:
-                if os.path.lexists(marker):
-                    return top if _real_git_marker(marker) else None
+                if self._probe('le', marker, os.path.lexists):
+                    return top if self._probe('gm', marker, _real_git_marker) else None
             except (OSError, ValueError):
                 return None
         return None
@@ -3671,7 +3710,7 @@ class Analyzer:
         if head.startswith('~'):
             return None
         try:
-            real = os.path.realpath(head)
+            real = self._probe('rp', head, os.path.realpath)
         except (OSError, ValueError):
             return None
         return norm_path(real.rstrip('/') + ('/' + rest if rest else ''), ctx)
@@ -3702,7 +3741,7 @@ class Analyzer:
         cls, path, literal = self.target_class(word)
         if cls is None or cls not in tiers:
             return False
-        if need_existing and literal and cls in ('log', 'root') and not _lexists(path) \
+        if need_existing and literal and cls in ('log', 'root') and not self._probe('le', path, _lexists) \
                 and path.casefold() not in ctx.created and not self._foreign_home(path) \
                 and not self.c.is_guard_file(path):
             return False  # creating a new file is not destructive
@@ -3826,7 +3865,7 @@ class Analyzer:
         `.keep` in any directory between it and the work or scratch dir. Also true for another host's
         /home/<user>/.agent-harness tree, where the `.keep` and symlink checks can only see this machine's disk."""
         try:
-            real = os.path.realpath(path)
+            real = self._probe('rp', path, os.path.realpath)
         except (OSError, ValueError):
             return False
         # macOS makes /home itself a symlink, so that prefix alone must not fail the check. A /home/<user> path that
@@ -3845,11 +3884,12 @@ class Analyzer:
             if len(rest) < 2 or '..' in rest or rest[-1].casefold().endswith('.json'):
                 return False
             for k in range(1, len(rest)):
-                if _lexists('/' + '/'.join(raw[:base_len + k]) + '/.keep'):
+                if self._probe('le', '/' + '/'.join(raw[:base_len + k]) + '/.keep', _lexists):
                     return False
         return True
 
     def note_created(self, word, text=None):
+        self.ctx.fs_cache.clear()  # created paths change what the next probes must see
         for alt in word.alts[:32]:
             path = norm_path(alt, self.ctx).casefold()
             self.ctx.created.add(path)
@@ -4035,9 +4075,9 @@ class Analyzer:
     def overwrite_dest(self, what, word):
         """cp/mv/ln/install onto an existing Tier A file (or into a protected dir by glob/variable)."""
         cls, path, literal = self.target_class(word)
-        if cls == 'log' and literal and os.path.isdir(path):
+        if cls == 'log' and literal and self._probe('id', path, os.path.isdir):
             return  # copying into a log directory adds a file; it does not replace one
-        if cls in ('log', 'unknown') or cls == 'ancestor' and literal and not os.path.isdir(path):
+        if cls in ('log', 'unknown') or cls == 'ancestor' and literal and not self._probe('id', path, os.path.isdir):
             self.refuse(what + ' (overwrites)', word, tiers=('log', 'unknown', 'ancestor'), need_existing=True)
         self.note_created(word)
 
@@ -4423,7 +4463,7 @@ def audit(event, fields, home=None, wal=None, strict=False, to_file=True):
                                                              'user_source', 'bytes')})
     try:
         import redact
-        line = redact.redact(json.dumps(record, sort_keys=True))
+        line = json.dumps(redact.redact_obj(record), sort_keys=True)  # values, so a span cannot eat JSON syntax
     except Exception:  # noqa: BLE001
         line = json.dumps({'ts': record['ts'], 'event': event})
     try:
@@ -5632,7 +5672,7 @@ def explain(text, cwd=None, ps=False):
         detail = [{'error': type(error).__name__}]
     verdict, message = decide(text, c, cwd=cwd, ps=ps)
     import redact
-    return {'verdict': verdict, 'message': message, 'findings': json.loads(redact.redact(json.dumps(detail)))}
+    return {'verdict': verdict, 'message': message, 'findings': redact.redact_obj(detail)}
 
 
 def iter_transcript_commands(path, max_bytes=256 << 20):
