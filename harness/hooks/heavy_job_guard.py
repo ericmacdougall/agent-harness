@@ -707,7 +707,9 @@ RCLONE_WRAPPERS = {"crypt", "alias", "union", "chunker", "combine", "hasher", "c
 RCLONE_PATH_FLAGS = {"--log-file", "--exclude-from", "--include-from", "--filter-from", "--files-from",
                      "--files-from-raw", "--config", "--temp-dir", "--cache-dir", "--backup-dir", "--compare-dest",
                      "--copy-dest"}
-LOG_BACKUP_MARK = "/.agent-harness/logs/log-backup.log"
+# The log backup's own copies (tier 1 and the bulk lane, goodqa#15062) are never the lane holder: they are throttled
+# by the script and must not block agent uploads. Exact log paths only, so a look-alike name is still counted.
+LOG_BACKUP_MARKS = ("/.agent-harness/logs/log-backup.log", "/.agent-harness/logs/log-backup.lane.log")
 _DROPBOX_REMOTES = None
 
 
@@ -844,7 +846,7 @@ def lane_holders(ps_text=None):
             words = posix_split(parts[1])
         except ValueError:
             words = parts[1].split()
-        if not words or base(words[0]).lower() != "rclone" or LOG_BACKUP_MARK in parts[1]:
+        if not words or base(words[0]).lower() != "rclone" or any(m in parts[1] for m in LOG_BACKUP_MARKS):
             continue
         if rclone_upload_target(words[1:]):
             holders.append((int(parts[0]), parts[1][:160]))

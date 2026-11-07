@@ -14,3 +14,11 @@
 *.bin
 *.sqlite
 *.db
+# goodqa#15062: five .lanes copies (about 230k files) in the Mac's work tree. Every file matched commit 9cbdd16 of
+# github.com/ericmacdougall/bugtracker by git blob id (pinned by tag backup-pin/lanes-9cbdd16); their path, size
+# and sha256 are listed in baab765b-d85c-46b4-b7b9-588eb912c770/agent-adad414d36642c614/lanes-exclude-manifest.tsv.gz, which is backed up.
+/baab765b-d85c-46b4-b7b9-588eb912c770/rt1191/bt/.lanes/**
+/baab765b-d85c-46b4-b7b9-588eb912c770/rt1192/repo/.lanes/**
+/baab765b-d85c-46b4-b7b9-588eb912c770/repo-diet/bugtracker-mac/.lanes/**
+/baab765b-d85c-46b4-b7b9-588eb912c770/agent-ab67b166a35308e10/review-clone/.lanes/**
+/baab765b-d85c-46b4-b7b9-588eb912c770/agent-ad693d1f419a19ff9/repo2/.lanes/**

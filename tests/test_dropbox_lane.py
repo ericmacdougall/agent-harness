@@ -19,6 +19,11 @@ BUSY = ("  4242 rclone copy /Users/eric/archive lessons-dropbox:Backups/x --tpsl
         "  4243 rclone copy /Users/eric/.claude/projects lessons-dropbox:Backups/agent-logs/mac/x --tpslimit 1 "
         "--log-file /Users/eric/.agent-harness/logs/log-backup.log\n")
 BACKUP_ONLY = BUSY.splitlines()[1] + "\n"
+LANE_ONLY = ("  4244 rclone copy --tpslimit 1 --log-file /Users/eric/.agent-harness/logs/log-backup.lane.log "
+             "--files-from-raw /Users/eric/.agent-harness/logs/log-backup.bulk.d/x/chunk.paths -- "
+             "/Users/eric/.agent-harness/work lessons-dropbox:Backups/agent-logs/mac/.agent-harness/work\n")
+LOOKALIKE = ("  4245 rclone copy /Users/eric/a lessons-dropbox:Backups/a --tpslimit 4 --transfers 4 "
+             "--log-file /Users/eric/.agent-harness/logs/log-backup.lanes.log\n")
 
 
 class Lane(unittest.TestCase):
@@ -72,6 +77,17 @@ class Lane(unittest.TestCase):
         self.ps = BACKUP_ONLY
         result = self.decide("rclone copy /Users/eric/b lessons-dropbox:Backups/b --tpslimit 4 --transfers 4")
         self.assertEqual(result["action"], "allow", result)
+
+    def test_the_bulk_lane_of_the_log_backup_never_holds_the_lane(self):
+        # PR #124 delta review N1: the lane logs to log-backup.lane.log and blocked every agent upload for hours.
+        self.ps = LANE_ONLY
+        result = self.decide("rclone copy /Users/eric/b lessons-dropbox:Backups/b --tpslimit 4 --transfers 4")
+        self.assertEqual(result["action"], "allow", result)
+
+    def test_a_look_alike_log_name_still_holds_the_lane(self):
+        self.ps = LOOKALIKE
+        result = self.decide("rclone copy /Users/eric/b lessons-dropbox:Backups/b --tpslimit 4 --transfers 4")
+        self.assertNotEqual(result["action"], "allow", result)
 
     def test_the_hatch_allows_one_unanticipated_upload(self):
         result = self.decide("HARNESS_LOCAL_OK=restore-drill rclone copy /Users/eric/a lessons-dropbox:a")
