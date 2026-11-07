@@ -342,7 +342,11 @@ def copy_threshold_bytes() -> int:
 
 def path_size(path: str, cap: int = None, seconds: float = COPY_WALK_SECONDS):
     """(bytes on disk, complete). Symlinks are not followed, hard links count once, the walk stops at `cap` bytes
-    (a known lower bound is enough to call a copy heavy) or at the time/entry bound (complete=False)."""
+    (a known lower bound is enough to call a copy heavy) or at the time/entry bound (complete=False).
+    The walk also fits inside the decision's shared budget (net_left), so many copies in one command stay bounded."""
+    seconds = net_left(seconds)
+    if not seconds:
+        return 0, False
     deadline = time.monotonic() + seconds
     total, seen, entries, stack = 0, set(), 0, [path]
     while stack:
@@ -787,7 +791,10 @@ def lane_holders(ps_text=None):
     import subprocess
     if ps_text is None:
         try:
-            ps_text = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=2,
+            timeout = net_left(2.0)
+            if not timeout:
+                return []  # out of budget: the throttle check still applies
+            ps_text = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=timeout,
                                      stdin=subprocess.DEVNULL).stdout
         except (OSError, subprocess.SubprocessError):
             return []  # a probe failure must not block uploads; the throttle check still applies
@@ -953,6 +960,19 @@ PERL_EXEC = re.compile(r"\bexec\b")
 
 LIGHT_XARGS = {"grep", "egrep", "fgrep", "rg", "echo", "cat", "ls", "rm", "mv", "cp", "stat", "wc", "head", "tail",
                "file", "touch", "chmod", "chown", "basename", "dirname", "md5", "md5sum", "shasum", "sha256sum", "test", "true"}
+
+
+def xargs_procs(args) -> int:
+    """xargs -P value (1 when absent; 0 means as many as possible)."""
+    value = "1"
+    for i, a in enumerate(args):
+        if a in ("-P", "--max-procs") and i + 1 < len(args):
+            value = args[i + 1]
+        elif a.startswith("--max-procs="):
+            value = a.split("=", 1)[1]
+        elif re.match(r"^-P[0-9]+$", a):
+            value = a[2:]
+    return int(value) if re.fullmatch(r"[0-9]{1,9}", value) else 0
 
 
 def xargs_inner(args):
@@ -1370,6 +1390,8 @@ def unwrap(low, args, ctx, depth):
             i += 1
             break
         if low in ("env", "sudo", "doas") and ASSIGN.match(token):
+            name, _, value = token.partition("=")
+            ctx.wrapper_env = dict(getattr(ctx, "wrapper_env", {}), **{name: value})
             i += 1
             continue
         if low == "env" and token == "-":  # legacy spelling of -i
@@ -1417,7 +1439,11 @@ def classify(argv, ctx, depth=0):
         if found:
             return found
     if low == "rclone":
-        lane = dropbox_lane_finding(args, ctx, dict(a.split("=", 1) for a in _assigns if "=" in a))
+        env = dict(getattr(ctx, "exported", {}))
+        env.update(getattr(ctx, "wrapper_env", {}))
+        env.update(dict(a.split("=", 1) for a in _assigns if "=" in a))
+        ctx.wrapper_env = {}
+        lane = dropbox_lane_finding(args, ctx, env)
         if lane:
             return lane
     if low == "claude" and any(a in ("-p", "--print") for a in args):
@@ -1651,6 +1677,9 @@ def classify(argv, ctx, depth=0):
             result = classify(inner, ctx, depth + 1)
             if result:
                 return result  # xargs pytest / xargs npx playwright test
+            if base(inner[0]).lower() == "rclone" and rclone_upload_target(inner[1:]) and xargs_procs(args) != 1:
+                return ("dropbox-lane", "xargs -P runs several rclone uploads to Dropbox at once; the lane is one "
+                        "upload at a time")
         if inner and base(inner[0]) in LIGHT_XARGS:
             return None  # parallel grep/echo/stat is cheap; only fan-out of real work matters
         for i, a in enumerate(args):
@@ -1715,6 +1744,9 @@ def scan_state(command: str, cwd: str, depth: int = 0, parent=None):
         assigns, rest = split_assignments(argv)
         if argv and argv[0] == "export":
             assigns = [t for t in argv[1:] if ASSIGN.match(t)]
+            ctx.exported = dict(getattr(ctx, "exported", {}),
+                                **{a.split("=", 1)[0]: a.split("=", 1)[1] for a in assigns if a.startswith("RCLONE_")})
+        ctx.wrapper_env = {}
         for a in assigns:
             if a.startswith(HATCH + "="):
                 hatch = a.split("=", 1)[1]
@@ -1729,7 +1761,10 @@ def scan_state(command: str, cwd: str, depth: int = 0, parent=None):
         result = classify(argv, ctx, depth)
         if result:
             findings.append((result[0], result[1], ctx.capped, segment))
-    if getattr(ctx, "lane_uploads", 0) >= 2 and has_background(text):
+    if getattr(ctx, "lane_uploads", 0) >= 1 and getattr(ctx, "loop", False) and has_background(text):
+        findings.append(("dropbox-lane", "a backgrounded rclone upload to Dropbox inside a loop runs several uploads "
+                         "at once; the lane is one upload at a time", False, command[:2000]))
+    elif getattr(ctx, "lane_uploads", 0) >= 2 and has_background(text):
         findings.append(("dropbox-lane", "several backgrounded rclone uploads to Dropbox in one command; the lane is "
                          "one upload at a time", False, command[:2000]))
     claude_n = getattr(ctx, "claude_p", 0)
@@ -1782,6 +1817,14 @@ SEVERITY = {"allow": 0, "warn": 1, "deny": 2}
 
 
 def decide(command: str, cwd: str = None, modes=None):
+    """_decide with the shared lookup budget closed afterwards, so later callers in this process are unaffected."""
+    try:
+        return _decide(command, cwd, modes)
+    finally:
+        _NET_DEADLINE[0] = None
+
+
+def _decide(command: str, cwd: str = None, modes=None):
     """Pure decision: dict(action=allow|warn|deny, rule, detail, message, hatch_reason).
 
     Every finding is judged on its own (the hatch and the cap apply per finding) and the most
