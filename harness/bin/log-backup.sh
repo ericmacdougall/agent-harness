@@ -326,7 +326,7 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
       if [ -n "$(find "$HOME/$rel" -type f -print -quit 2>/dev/null)" ]; then primary=$((primary + 1)); fi ;;
     esac
   else
-    say "copy failed after $attempt attempts: $rel"; rate_limit_note "$log_mark"; ok=1
+    say "copy failed after $attempt attempts: $rel"; rate_limit_note "$log_mark"; ok=1; hard_fail=1
   fi
 }
 
@@ -388,16 +388,22 @@ if [ $bulk_ran -eq 1 ] && [ ${#sources_bulk[@]} -gt 0 ] && [ "$(time_left)" -lt 
   say "bulk tier deferred: no run time left after tier 1; the next run with time left tries it"
 fi
 [ $bulk_ran -eq 1 ] && : > "$bulk_try"
-RESERVE=0 budget_hit=0
+RESERVE=0 budget_hit=0 hard_fail=0
+# The git-tree scan of the work tree is not time-bounded (26 s on the Mac, 301 trees, warm cache). It starts only when
+# the last measured scan time plus a copy slice still fits, so a short remainder is not spent scanning every run.
+scan_file="$LOGDIR/log-backup.work-scan-seconds"
+scan_need=$(cat "$scan_file" 2>/dev/null)
+printf '%s' "$scan_need" | grep -Eq '^(0|[1-9][0-9]{0,4})$' || scan_need=60
 for src in "${sources_bulk[@]+"${sources_bulk[@]}"}"; do
   [ -e "$HOME/$src" ] || [ -L "$HOME/$src" ] || continue
-  if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; continue; fi
+  if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; hard_fail=1; continue; fi
   extra=(--min-age 2m)
-  if [ "$src" = .agent-harness/work ] && [ "$(time_left)" -lt "$MIN_SLICE" ]; then
-    # The git-tree scan below takes minutes on a large work tree: do not start it with no copy time left.
-    say "run time budget (${BUDGET_SECONDS}s) used up before $src; the next run continues"; ok=1; budget_hit=1; continue
+  if [ "$src" = .agent-harness/work ] && [ "$(time_left)" -lt $(( MIN_SLICE + scan_need )) ]; then
+    say "run time budget (${BUDGET_SECONDS}s) used up before $src (its scan needs about ${scan_need}s); the next run continues"
+    ok=1; budget_hit=1; continue
   fi
   if [ "$src" = .agent-harness/work ]; then
+    scan_start=$(date +%s)
     # The work tree holds git worktrees, checkouts, screenshots and mutation trees (hundreds of GB). Back up only
     # the small durable state: skip every directory that has a .git entry, media files, and files over the size cap.
     gen="$LOGDIR/log-backup.worktrees.excludes"
@@ -411,6 +417,7 @@ for src in "${sources_bulk[@]+"${sources_bulk[@]}"}"; do
       esac
       printf '%s/**\n' "$rel" >> "$gen"
     done < <(find "$HOME/$src" -xdev -maxdepth 12 -name .git -prune -print0 2>/dev/null)
+    echo $(( $(date +%s) - scan_start )) > "$scan_file"
     say "work: $(wc -l < "$gen" | tr -d ' ') git trees excluded, $unsafe with unsafe names left in (uploaded)"
     extra+=(--exclude-from "$WORK_EXCLUDES" --exclude-from "$gen" --max-size "${LOG_BACKUP_WORK_MAX_SIZE:-25M}"
             --max-transfer "${LOG_BACKUP_WORK_MAX_TRANSFER:-5G}")
@@ -420,8 +427,9 @@ done
 # Tier 2 (bulk: archived sessions and the narrowed work tree) has its own marker.
 bulk_ok=$ok
 [ $bulk_ran -eq 1 ] && say "bulk exit=$bulk_ok"
-if [ $bulk_ran -eq 1 ] && [ $budget_hit -eq 1 ]; then
+if [ $bulk_ran -eq 1 ] && [ $budget_hit -eq 1 ] && [ $hard_fail -eq 0 ]; then
   # A pass cut short by the run budget is not finished: the next run continues it instead of waiting BULK_EVERY.
+  # A pass where any source really failed (a rate limit that outlasted its retries, say) keeps the hourly gap.
   rm -f "$bulk_try"
   say "bulk tier stopped on the run budget; the next run continues it"
 fi
