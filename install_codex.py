@@ -189,7 +189,10 @@ def merge_config(existing: str, wal_dir: Path, *, default_full_access: bool = Fa
 
     starts = comment_marker_indices(CONFIG_START)
     ends = comment_marker_indices(CONFIG_END)
-    managed_profile = original_parsed.get('permissions', {}).get('agent-harness')
+    permissions = original_parsed.get('permissions', {})
+    if not isinstance(permissions, dict):
+        raise ValueError('config.toml permissions must be a table')
+    managed_profile = permissions.get('agent-harness')
     managed_result = None
     if managed_profile is not None:
         if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
@@ -225,6 +228,9 @@ def merge_config(existing: str, wal_dir: Path, *, default_full_access: bool = Fa
     elif starts or ends:
         raise ValueError('config.toml has stray Agent Harness comment markers; resolve manually')
     parsed = tomllib.loads(existing)
+    result_permissions = parsed.get('permissions', {})
+    if not isinstance(result_permissions, dict):
+        raise ValueError('config.toml permissions must be a table')
     if 'sandbox_mode' in parsed or 'sandbox_workspace_write' in parsed:
         raise ValueError('config.toml uses legacy sandbox settings; merge manually')
     if 'profile' in parsed:
@@ -232,7 +238,7 @@ def merge_config(existing: str, wal_dir: Path, *, default_full_access: bool = Fa
     for settings in parsed.get('profiles', {}).values():
         if isinstance(settings, dict) and ('sandbox_mode' in settings or 'sandbox_workspace_write' in settings):
             raise ValueError('config.toml has a profile with legacy sandbox settings; merge manually')
-    if 'agent-harness' in parsed.get('permissions', {}):
+    if 'agent-harness' in result_permissions:
         raise ValueError('config.toml already defines the agent-harness profile outside managed markers')
     result = (managed_result if managed_result is not None else
               existing.rstrip() + '\n\n' + CONFIG_START + '\n' + profile + '\n' + CONFIG_END + '\n')
