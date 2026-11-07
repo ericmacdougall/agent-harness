@@ -26,7 +26,7 @@ sys.path.insert(0, str(HOOKS))
 
 import prod_delete_guard as pdg  # noqa: E402
 
-SID = "sess-pdg"
+SID = "0f4c2b6e-8d1a-4e5b-9c3d-7a2e1f6b5c4d"  # Claude Code session ids are UUIDs (provenance answer: form)
 
 
 def bash(command):
@@ -779,6 +779,29 @@ class Round5(Case):
                 self.assertFalse(pdg.names_target({"text": text}, "prod-db"), text)
         self.assertTrue(pdg.names_target({"text": "Approve DELETE on prod-db"}, "prod-db"))
         self.assertTrue(pdg.names_target({"text": "Approve DELETE on hold-db"}, "hold-db"))  # was an over-refusal
+
+
+class GrantWalCitation(Case):
+    """wal_note.py (goodqa#14927) refuses an answer: source with no verbatim excerpt; the grant cites one."""
+
+    def test_grant_records_a_resolvable_cited_answer_in_the_wal(self):
+        source = self.human_turn('Yes, run the delete on prod-db.example.com "now"')
+        pdg.grant(source, "prod-db.example.com", str(self.wal), home=str(self.home))
+        rows = [json.loads(line) for line in self.wal.read_text().splitlines() if line.strip()]
+        row = [r for r in rows if "prod_delete_guard grant" in str(r.get("note"))][-1]
+        self.assertEqual(row["source"], '%s "Yes, run the delete on prod-db.example.com"' % source)
+        self.assertFalse(row.get("assumption") or row.get("quarantined"), row)
+
+    def test_answer_too_short_to_cite_is_refused_with_a_reason(self):
+        source = self.human_turn("db-x1")
+        with self.assertRaisesRegex(ValueError, "too short to cite"):
+            pdg.grant(source, "db-x1", str(self.wal), home=str(self.home))
+        self.assertFalse(pdg.grants_path(str(self.home)).exists() and pdg.load_grants(str(self.home)))
+
+    def test_wal_refusal_reason_reaches_the_caller(self):
+        source = self.human_turn("Approve DELETE on prod-db")
+        with self.assertRaisesRegex(ValueError, r"no grant was written \(nope\)"):
+            pdg.grant(source, "prod-db", str(self.wal), home=str(self.home), record=lambda *a: "nope")
 
 
 
