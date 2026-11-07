@@ -288,6 +288,18 @@ class FailureModeTests(Fixture):
         written = "printf 'env\\n' > @HOME@/repo/tools/new.sh && bash @HOME@/repo/tools/new.sh"
         self.assertEqual(self.decide(written)[0], 'block')
 
+    def test_existing_log_backup_script_gains_no_credential_finding(self):
+        """Plan review of the F02 port: keeping credential findings inside existing scripts must not newly flag the
+        shipped log-backup.sh (rclone, indirect variables). Its lock-dir removal under the log tree already blocks an
+        agent-run invocation on main (log_delete; launchd runs it), so only the rule is pinned (goodqa#14995)."""
+        tools = self.home / 'repo/tools'
+        tools.mkdir(exist_ok=True)
+        (tools / 'log-backup.sh').write_text((ROOT / 'harness/bin/log-backup.sh').read_text())
+        for cmd in ('bash @HOME@/repo/tools/log-backup.sh', 'sh @HOME@/repo/tools/log-backup.sh'):
+            verdict, message = self.decide(cmd)
+            self.assertNotIn('secret_dump', message, cmd)
+            self.assertTrue(verdict == 'allow' or 'log_delete' in message, (cmd, verdict, message[:120]))
+
     def test_symlink_in_own_worktree_does_not_reach_protected(self):
         """Red-team F3: the own-worktree exception must hold for the path a symlink really leads to."""
         wt = self.home / '.agent-harness/work/S/T/wt'
