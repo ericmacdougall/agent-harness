@@ -11,6 +11,10 @@ group by pull request.
   same 2/s write budget, instead of in the few minutes tier 1 left (about 400 files an hour). Bulk chunks are 1000
   files. A pass is listed again when the exclude lists change, and five verified `.lanes` copies (about 230k files)
   are excluded with a pinned tag and a backed-up manifest (goodqa#15062).
+- log-backup bulk lane review (PR #124): runs that share their 13 minutes keep 100-file chunks and every chunk fits
+  the time left; the rate is split whenever a lane is live; an unsplittable limit turns the lane off instead of
+  stopping every backup; the lane starts only when due and is confirmed; SIGTERM stops a run's own copy; opting out
+  stops the lane; status shows it; the lane has its own log; exclude edits stop a pass at the next chunk.
 - log-backup bulk tier: a pass now resumes from a checkpoint instead of starting over every run. With the 620k-file
   work tree, each run re-checked the same first files and the pass never finished. Files verified by an earlier pass
   are not checked again, and only new or changed files are sent (goodqa#15062).

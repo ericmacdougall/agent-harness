@@ -37,6 +37,8 @@ BULK_OK = "log-backup.bulk-last-ok"
 FIRST_RUN = "log-backup.first-run"
 BULK_MAX_AGE_SECONDS = 6 * 3600
 LOCK_DIR = "log-backup.lock.d"
+LANE_LOCK_DIR = "log-backup.lane.lock.d"   # the bulk lane run (goodqa#15062)
+LANE_LAST_RUN = "log-backup.lane.last-run"
 REMOTE_CANDIDATES = ("lessons-dropbox", "dropbox")
 MAX_STAMP_BYTES = 256
 HASH_BLOCK = 1 << 20
@@ -210,8 +212,8 @@ def cmd_session_start(args) -> int:
     return 0
 
 
-def lock_holder(home: Path) -> str:
-    lock = logs_dir(home) / LOCK_DIR
+def lock_holder(home: Path, name: str = LOCK_DIR) -> str:
+    lock = logs_dir(home) / name
     if not lock.is_dir():
         return "none"
     pid = (read_small(lock / "pid") or "").strip()
@@ -260,6 +262,7 @@ def cmd_status(args) -> int:
     print(f"last run     : {printable(read_small(logs / LAST_RUN) or 'never')}")
     print(f"last skipped : {printable(read_small(logs / LAST_SKIP) or 'never')} (a skipped run is not a backup)")
     print(f"lock         : {lock_holder(args.home)}")
+    print(f"bulk lane    : {lock_holder(args.home, LANE_LOCK_DIR)}; last lane run {printable(read_small(logs / LANE_LAST_RUN) or 'never')}")
     return 0 if result["state"] == "fresh" else 1
 
 

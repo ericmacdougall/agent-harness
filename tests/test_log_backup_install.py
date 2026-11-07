@@ -629,6 +629,30 @@ class OptIn(Case):
         self.assertEqual(runner.calls, [["launchctl", "disable", "gui/501/com.ericmacdougall.log-backup"],
                                         ["launchctl", "bootout", "gui/501/com.ericmacdougall.log-backup"]])
 
+    def test_opting_out_stops_a_bulk_lane_run(self):
+        # PR #124 review F4: launchd abandons the lane with the job's process group, so bootout never reached it.
+        self.apply("Darwin")
+        proc = self.holder()
+        lane = self.home / ".agent-harness/logs/log-backup.lane.lock.d"
+        lane.mkdir(parents=True)
+        (lane / "pid").write_text(str(proc.pid))
+        lbi.save_choice(self.home, False)
+        message = lbi.status(self.home, True, system="Darwin", run=Runner(), uid=501, activate=True)
+        self.assertIn(f"bulk lane run {proc.pid} told to stop", message)
+        self.assertIsNotNone(proc.wait(timeout=10), "the lane run got SIGTERM")
+
+    def test_opting_out_never_signals_a_lane_pid_that_is_not_a_backup_run(self):
+        self.apply("Darwin")
+        other = subprocess.Popen(["/bin/sh", "-c", "sleep 60"])
+        self.addCleanup(lambda: (other.terminate(), other.wait()))
+        lane = self.home / ".agent-harness/logs/log-backup.lane.lock.d"
+        lane.mkdir(parents=True)
+        (lane / "pid").write_text(str(other.pid))
+        lbi.save_choice(self.home, False)
+        message = lbi.status(self.home, True, system="Darwin", run=Runner(), uid=501, activate=True)
+        self.assertNotIn("told to stop", message)
+        self.assertIsNone(other.poll())
+
     def test_disable_is_deferred_while_a_run_is_active(self):
         self.apply("Linux")
         self.lock_held_by(self.holder().pid)

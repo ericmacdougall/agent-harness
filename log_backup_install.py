@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import platform
 import subprocess
 import time
@@ -190,6 +191,23 @@ def backup_run_active(home: Path) -> bool:
     return is_backup_process(pid)
 
 
+def stop_lane(home: Path) -> str:
+    """Opting out must also stop a bulk lane run (goodqa#15062): launchd abandons it with the job's process group, so
+    bootout does not reach it. Only a pid that runs log-backup.sh is signalled; the lane stops its own copy on TERM."""
+    pid_file = home / ".agent-harness" / "logs" / "log-backup.lane.lock.d" / "pid"
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (OSError, ValueError):
+        return ""
+    if pid <= 1 or not is_backup_process(pid):
+        return ""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return ""
+    return f"; bulk lane run {pid} told to stop"
+
+
 def is_backup_process(pid: int) -> bool:
     """The pid runs `<shell> <path>/log-backup.sh`, as the script itself requires of a lock holder."""
     try:
@@ -335,6 +353,7 @@ def status(home: Path, apply: bool, system: str | None = None, run=None, uid: in
             if result == "stopped":
                 write_scheduler_state(home, "disabled")
                 _drop(pending)
+                result += stop_lane(home)
             return f"log backup: disabled by choice, scheduler {result}; files and remote copies stay"
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{os.getpid()}"
         for path, data, mode, _unit in p["files"]:
