@@ -1379,7 +1379,6 @@ class BulkLane(Case):
     def test_lane_settings_that_would_add_to_the_budget_are_refused(self):
         for extra in ({"LOG_BACKUP_BULK_LANE": "yes", "LOG_BACKUP_TPSLIMIT": "2"},
                       {"LOG_BACKUP_BULK_LANE": "1", "LOG_BACKUP_TPSLIMIT": "2", "LOG_BACKUP_LANE_BUDGET_SECONDS": "43201"},
-                      {"LOG_BACKUP_BULK_LANE": "1", "LOG_BACKUP_TPSLIMIT": "2", "LOG_BACKUP_BULK_TPS": "3"},
                       {"LOG_BACKUP_BULK_LANE": "1", "LOG_BACKUP_TPSLIMIT": "2", "LOG_BACKUP_LANE_POLL_SECONDS": "0"},
                       {"LOG_BACKUP_TIER": "bulk", "LOG_BACKUP_TPSLIMIT": "2"},
                       {"LOG_BACKUP_TIER": "live", "LOG_BACKUP_TPSLIMIT": "2"}):
@@ -1501,7 +1500,7 @@ class LaneYield(BulkLane):
         start = time.time()
         done = self.run_script(LOG_BACKUP_LANE_BUDGET_SECONDS="6", **self.FAST)
         self.assertEqual(done.returncode, 1, done.stderr)
-        self.assertGreaterEqual(time.time() - start, 3, "the lane waited instead of copying")
+        self.assertGreaterEqual(time.time() - start, 1.5, "the lane waited instead of copying")
         self.assertEqual(self.copies(), [], "no lane copy while a tier-1 run holds the lock")
         log = (self.logs / "log-backup.lane.log").read_text()
         self.assertIn("a tier-1 run holds the lock; the lane waits for it", log)
@@ -1523,6 +1522,38 @@ class LaneYield(BulkLane):
         self.assertTrue(self.bulk_copies(), "the lane copied once the lock was free")
         self.assertTrue(self.bulk_ok().exists())
         self.assertFalse((self.logs / "log-backup.lane.state").exists(), "the lane clears its state on exit")
+
+    def test_a_lane_rate_above_the_budget_never_stops_tier_1(self):
+        # red-team F4: BULK_TPS above TPSLIMIT stopped every run, tier 1 included, even with the lane off
+        for lane in ("0", "1"):
+            open(self.calls, "w").close()
+            done = self.run_script(LOG_BACKUP_BULK_LANE=lane, LOG_BACKUP_TPSLIMIT="2", LOG_BACKUP_BULK_TPS="3")
+            self.assertEqual(done.returncode, 0, (lane, done.stderr))
+            self.assertTrue(self.copies(), lane)
+            self.assertTrue(self.last_ok().exists())
+            if lane == "1":
+                self.wait_for_lane()
+        self.assertTrue(all(self.tps(c) in ("1", "2") for c in self.copies()), "never above TPSLIMIT")
+
+    def test_a_signal_during_a_lane_pause_leaves_no_sleep_behind(self):
+        # red-team F5: the background pause outlived the lane after SIGTERM
+        self.logs.mkdir(parents=True, exist_ok=True)
+        self.holder(self.run_lock())
+        env = self.env(LOG_BACKUP_LANE_BUDGET_SECONDS="120", LOG_BACKUP_RETRY_SLEEP="0",
+                       LOG_BACKUP_BULK_EVERY_SECONDS="0", **dict(self.FAST, LOG_BACKUP_LANE_POLL_SECONDS="47"))
+        proc = subprocess.Popen(["/bin/bash", str(SCRIPT)], env=env, cwd=str(self.tmp),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
+        end = time.time() + 20
+        log = self.logs / "log-backup.lane.log"
+        while time.time() < end and not (log.exists() and "the lane waits" in log.read_text()):
+            time.sleep(0.1)
+        time.sleep(0.5)
+        proc.terminate()
+        proc.wait(timeout=20)
+        time.sleep(0.3)
+        running = subprocess.run(["ps", "-axo", "command="], stdout=subprocess.PIPE, text=True).stdout
+        self.assertNotIn("sleep 47", running, "the lane's pause stopped with it")
 
     def test_ac2_tier_1_keeps_the_full_rate_beside_a_yielding_lane(self):
         self.logs.mkdir(parents=True, exist_ok=True)

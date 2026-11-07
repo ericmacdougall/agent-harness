@@ -90,7 +90,10 @@ case "$TIER" in
 esac
 [ "$LANE_BUDGET" -le 43200 ] || { echo "log-backup: LOG_BACKUP_LANE_BUDGET_SECONDS must be at most 43200 (a lock over a day old is taken over)" >&2; exit 2; }
 [ "$LANE_POLL" -ge 1 ] && [ "$LANE_POLL" -le 60 ] || { echo "log-backup: LOG_BACKUP_LANE_POLL_SECONDS must be 1-60" >&2; exit 2; }
-[ "$BULK_TPS" -le "$TPSLIMIT" ] || { echo "log-backup: LOG_BACKUP_BULK_TPS must not be larger than LOG_BACKUP_TPSLIMIT (the host's budget)" >&2; exit 2; }
+if [ "$BULK_TPS" -gt "$TPSLIMIT" ]; then   # never above the host's budget; tier 1 must not stop over a lane setting
+  [ "$LANE" != 1 ] || echo "log-backup: LOG_BACKUP_BULK_TPS ($BULK_TPS) is above LOG_BACKUP_TPSLIMIT; the lane uses $TPSLIMIT" >&2
+  BULK_TPS=$TPSLIMIT
+fi
 if [ "$LANE" = 1 ]; then
   # The lane yields to tier 1 instead of splitting the budget (goodqa#15147): the two never copy at the same time, so
   # tier 1 keeps the full rate for its 13 minutes and the lane uses the time tier 1 leaves.
@@ -233,13 +236,15 @@ elif legacy_run_active || ! acquire_lock; then
   exit 0
 fi
 lane_clear_state() { [ "$TIER" = bulk ] && [ "$(cut -d' ' -f2 "$LANE_STATE" 2>/dev/null)" = "$$" ] && rm -f "$LANE_STATE"; return 0; }
-trap 'lane_clear_state; release_locks "$LOCKD" "$LANE_LOCKD"' EXIT
-copy_pid= dog_pid=
+trap 'release_locks "$LOCKD" "$LANE_LOCKD"; lane_clear_state' EXIT
+copy_pid= dog_pid= nap_pid=
+nap() { sleep "$1" & nap_pid=$!; wait "$nap_pid"; nap_pid=; }   # a pause a signal can interrupt (and stop)
 on_term() {
   # rclone commits its pending batch on TERM: wait for it up to KILL_GRACE, then kill it, and only then release the
   # lock, so the next run never starts a copy beside one still committing (PR #124 delta review N2).
   local waited=0
   [ -z "$dog_pid" ] || kill -TERM "$dog_pid" 2>/dev/null
+  [ -z "$nap_pid" ] || kill -TERM "$nap_pid" 2>/dev/null
   if [ -n "$copy_pid" ]; then
     kill -TERM "$copy_pid" 2>/dev/null
     while kill -0 "$copy_pid" 2>/dev/null && [ $waited -lt $(( KILL_GRACE * 5 )) ]; do sleep 0.2; waited=$((waited + 1)); done
@@ -250,7 +255,7 @@ on_term() {
 }
 trap on_term TERM INT
 # A watchdog that outlived a killed run can leave its marker; with the lock held, none of this tier's is current.
-rm -f "$LOGDIR"/.log-backup${TAG}.deadline.* 2>/dev/null
+rm -f "$LOGDIR"/.log-backup${TAG}.deadline.* "$LOGDIR"/.log-backup${TAG}.yield.* 2>/dev/null
 
 command -v "$RCLONE" >/dev/null 2>&1 || fail "rclone not found (set LOG_BACKUP_RCLONE or fix PATH)" 127
 [ -r "$WORK_EXCLUDES" ] || fail "work exclude file missing: $WORK_EXCLUDES" 2
@@ -358,7 +363,7 @@ lane_gate() { # 0: clear to copy (state is copying); 1: the lane's time ran out 
     lane_set_state idle
     [ $said -eq 1 ] || { say "a tier-1 run holds the lock; the lane waits for it"; said=1; }
     [ "$(time_left)" -ge "$MIN_SLICE" ] || return 1
-    sleep "$LANE_POLL" & wait $!
+    nap "$LANE_POLL"
   done
 }
 
@@ -423,7 +428,7 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
           kill -KILL "$copy_pid" 2>/dev/null
           break
         fi
-        sleep "$LANE_POLL" & wait $!
+        nap "$LANE_POLL"
       done
     fi
     wait "$copy_pid"; rc=$?
@@ -449,7 +454,7 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
     attempt=$((attempt + 1))
     [ $attempt -le "${LOG_BACKUP_RETRIES:-2}" ] || break
     say "copy of $rel failed; retry $attempt after ${LOG_BACKUP_RETRY_SLEEP:-30}s (file changed mid-copy or rate limit)"
-    sleep "${LOG_BACKUP_RETRY_SLEEP:-30}" & wait $!
+    nap "${LOG_BACKUP_RETRY_SLEEP:-30}"
   done
   if [ $copied -eq 1 ]; then
     found=$((found + 1))
@@ -581,6 +586,8 @@ lane_quiet() { # wait, bounded, until the lane run $1 has no copy in flight; it 
 }
 lane_pid=$(cat "$LANE_LOCKD/pid" 2>/dev/null)
 if [ "$TIER" != bulk ] && [ -n "$lane_pid" ] && holder_alive "$lane_pid"; then
+  waited=0   # a lane writes its state right after taking its lock: allow it 2 s before calling it a pre-#15147 lane
+  while ! lane_yields "$lane_pid" && [ $waited -lt 10 ] && holder_alive "$lane_pid"; do sleep 0.2; waited=$((waited + 1)); done
   if lane_yields "$lane_pid"; then
     lane_quiet "$lane_pid" && say "bulk lane running (pid $lane_pid); it pauses while tier 1 copies at ${TPSLIMIT}/s"
   elif [ "$TPSLIMIT" -gt 1 ]; then
