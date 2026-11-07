@@ -108,6 +108,48 @@ class HumanWalNoteGuards(unittest.TestCase):
                              list(self.ORDINARY_NOTES))
 
 
+class SharedSecretRedaction(unittest.TestCase):
+    def setUp(self):
+        self.redact = load(ROOT / 'harness' / 'hooks' / 'redact.py', 'shared_secret_redaction')
+
+    def assert_redacted(self, text, expected):
+        # Compare as booleans so a failing regression never prints the synthetic key material.
+        actual = self.redact.redact(text)
+        self.assertTrue(actual == expected)
+        self.assertTrue(self.redact.redact(actual) == actual)
+
+    def test_pem_straddling_a_chunk_boundary_is_fully_redacted(self):
+        begin = '-----BEGIN RSA PRIVATE KEY-----\n'
+        end = '\n-----END RSA PRIVATE KEY-----\n'
+        prefix = 'p' * (self.redact.MAX_CHUNK - 20)
+        body = 'B' * (self.redact.OVERLAP + 128)
+        self.assert_redacted(prefix + begin + body + end + 'suffix',
+                             prefix + '[REDACTED:pem]\nsuffix')
+
+    def test_oversized_terminated_pem_is_fully_redacted(self):
+        prefix, suffix = 'ordinary prefix\n', '\nordinary suffix'
+        pem = '-----BEGIN PRIVATE KEY-----\n' + 'C' * 17000 + '\n-----END PRIVATE KEY-----'
+        self.assert_redacted(prefix + pem + suffix, prefix + '[REDACTED:pem]' + suffix)
+
+    def test_oversized_unterminated_pem_is_fully_redacted(self):
+        prefix = 'ordinary prefix\n'
+        pem = '-----BEGIN OPENSSH PRIVATE KEY-----\n' + 'D' * 17000
+        self.assert_redacted(prefix + pem, prefix + '[REDACTED:pem]')
+
+    def test_certificate_block_is_not_treated_as_a_private_key(self):
+        cert = 'x\n-----BEGIN CERTIFICATE-----\n' + 'E' * 64 + '\n-----END CERTIFICATE-----\ny'
+        self.assertTrue(self.redact.redact(cert) == cert)
+
+    def test_secret_shapes_inside_a_pem_body_leave_one_redaction(self):
+        body = 'F' * 40 + '\nghp_' + 'a' * 36 + '\n' + 'G' * (self.redact.MAX_CHUNK + 10)
+        pem = '-----BEGIN EC PRIVATE KEY-----\n' + body + '\n-----END EC PRIVATE KEY-----'
+        self.assert_redacted('a ' + pem + ' b', 'a [REDACTED:pem] b')
+
+    def test_nonsecret_text_is_byte_for_byte_unchanged(self):
+        ordinary = 'ordinary text, not a credential\n' * (self.redact.MAX_CHUNK // 16)
+        self.assertTrue(self.redact.redact(ordinary) == ordinary)
+
+
 class ProcessTextDecoding(unittest.TestCase):
     def test_malformed_text_is_replaced_but_binary_mode_is_exact(self):
         process = load(PROCESS, 'redaction_process')
