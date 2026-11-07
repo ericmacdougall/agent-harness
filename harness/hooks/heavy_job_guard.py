@@ -590,6 +590,17 @@ def parse_tar(args):
     return mode, archive, sources, to_stdout
 
 
+def tar_directory(args):
+    """The -C / --directory value of a tar command line (the last one wins), else None."""
+    found = None
+    for i, a in enumerate(args):
+        if a in ("-C", "--directory") and i + 1 < len(args):
+            found = args[i + 1]
+        elif a.startswith("--directory="):
+            found = a.split("=", 1)[1]
+    return found
+
+
 def classify_copy(low, args, ctx):
     """Return ("copy", detail) when this command would write an estimated >= threshold onto the Mac, else None."""
     thr = copy_threshold_bytes()
@@ -600,6 +611,11 @@ def classify_copy(low, args, ctx):
         flagged = [a for a in args if a in ("-t", "--target-directory")]
         if low == "cp" and flagged and args.index(flagged[0]) + 1 < len(args):
             target = args[args.index(flagged[0]) + 1]
+        joined = [a for a in args if a.startswith("--target-directory=") or (a.startswith("-t") and len(a) > 2
+                                                                              and not a.startswith("--"))]
+        if low == "cp" and target is None and joined:
+            target = joined[-1].split("=", 1)[1] if joined[-1].startswith("--") else joined[-1][2:]
+            args = [a for a in args if a is not joined[-1]]
         values = {"rsync": RSYNC_VALUE_FLAGS, "scp": SCP_VALUE_FLAGS, "cp": CP_VALUE_FLAGS}.get(low, ())
         pos = positional(args, values)
         if target is None and len(pos) < 2:
@@ -624,6 +640,7 @@ def classify_copy(low, args, ctx):
         if mode is None or archive in (None, "-") or REMOTE_SPEC.match(archive) and not archive.startswith(("/", ".", "~")):
             return None  # a pipe or a listing: the other end decides (tar czf - . | ssh dev2 'tar x')
         if mode == "x":
+            ctx.write_dir = resolve(os.path.expanduser(tar_directory(args) or "."), ctx.cwd)
             size, _complete = path_size(resolve(os.path.expanduser(archive), ctx.cwd))
             return finish_copy("tar extract", size * (4 if COMPRESSED.search(archive) else 1), None, thr)
         total, unknown = sum_sources(srcs, ctx, thr)
@@ -650,8 +667,13 @@ def classify_copy(low, args, ctx):
             pos = positional(rest[1:], CLONE_VALUE_FLAGS)
             if not pos:
                 return None
+            name = pos[1] if len(pos) > 1 else re.sub(r"\.git$", "", pos[0].rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1])
+            ctx.write_dir = resolve(os.path.expanduser(name or "."), cwd)
             return clone_estimate(pos[0], rest[1:], ctx, thr, "git clone")
         if rest[0] == "worktree" and rest[1:2] == ["add"]:
+            wpos = positional(rest[2:], ("-b", "-B", "--reason"))
+            if wpos:
+                ctx.write_dir = resolve(os.path.expanduser(wpos[0]), cwd)
             size = tracked_tree_bytes(cwd)
             if size is None:
                 return finish_copy("git worktree add", 0, "git could not size the tracked tree in time", thr)
@@ -2155,12 +2177,28 @@ def work_owner_key(path):
     """'session/sub' of the work dir owning `path`, else None."""
     root = os.path.join(os.path.expanduser("~"), ".agent-harness", "work") + os.sep
     real = os.path.realpath(path) if path else ""
-    for candidate in (path, real):
+    # goodqa#15067 review F1: `work/sess/./agent-A`, `work/../work/sess/agent-A` must give the same key as the plain path.
+    for candidate in (os.path.normpath(path) if path else "", real):
         if candidate and candidate.startswith(root):
             parts = candidate[len(root):].split(os.sep)
             if len(parts) >= 2 and parts[0] and parts[1]:
                 return f"{parts[0]}/{parts[1]}"
     return None
+
+
+def same_key(a, b) -> bool:
+    """Owner keys name directories: on macOS (case-insensitive by default) AGENT-A and agent-A are one directory."""
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    return a.casefold() == b.casefold() if sys.platform == "darwin" else a == b
+
+
+def actor_dir(payload: dict):
+    """The acting agent's own work dir, work/<session>/agent-<id>, when the payload names both; else None."""
+    session, agent = payload.get("session_id"), payload.get("agent_id")
+    if not all(isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", v) for v in (session, agent)):
+        return None
+    return os.path.join(os.path.expanduser("~"), ".agent-harness", "work", session, "agent-" + agent)
 
 
 def agent_of_key(key: str) -> str:
@@ -2206,12 +2244,14 @@ def over_budget(cwd):
         try:
             if rec.get("over_since") is None:
                 continue
-            if rec.get("path_key") != key and rec.get("agent") != agent_of_key(key):
+            if not (same_key(rec.get("path_key"), key) or same_key(rec.get("agent"), agent_of_key(key))):
                 continue
             age = time.time() - record_epoch(rec)
             if age > 3 * 3600 or age < -300:
                 continue  # stale, or stamped in the future: a record must never block work for good
-            base = os.path.join(os.path.expanduser("~"), ".agent-harness", "work", key)
+            # measure the record's own (canonical) dir: AGENT-A and agent-A are one directory on macOS
+            canonical = rec.get("path_key") if same_key(rec.get("path_key"), key) else key
+            base = os.path.join(os.path.expanduser("~"), ".agent-harness", "work", canonical)
             budget = int(rec["budget_bytes"])
             size, complete = path_size(base, cap=budget + 1, seconds=1.0)
             if size > budget or not complete:
@@ -2285,8 +2325,10 @@ def run(raw: bytes) -> int:
         # goodqa#15067: judge the owner dir each heavy write lands in (a copy's destination, else where it runs after
         # any `cd`), not the session cwd, which may be an unrelated over-budget checkout.
         budget = None
+        fallback = actor_dir(payload) or payload.get("cwd")
         for where in decision.get("write_dirs") or [payload.get("cwd")]:
-            budget = over_budget(where)
+            # Review F2: bytes landing outside ~/.agent-harness/work (~/Downloads, /tmp) are still this owner's.
+            budget = over_budget(where if work_owner_key(where) else fallback)
             if budget:
                 break
         if budget:  # over its disk budget: new heavy local writes stop, hatch or not, until it frees space or routes

@@ -521,6 +521,49 @@ class RunGates(unittest.TestCase):
                 self.assertIn("over its", err, cmd)
                 self.assertIn("copies at least 3.0 GiB", err, cmd)  # the copy rule's own reason is shown too
 
+    HATCH = "HARNESS_LOCAL_OK='one local step' "
+
+    def test_other_spellings_of_the_over_budget_dir_are_still_refused(self):
+        # PR #119 review F1: ./, .. and (on macOS) case must not change the owner key.
+        cwd, _dest, sizes = self.scp_case()
+        work = os.path.dirname(os.path.dirname(cwd))
+        spellings = [f"{work}/sess/./agent-A/x", f"{work}/../work/sess/agent-A/x", f"{work}//sess/agent-A/x"]
+        if sys.platform == "darwin":
+            spellings.append(f"{work}/sess/AGENT-A/x")
+        with mock.patch.object(guard, "path_size", fake_size({"/bigsrc": 3 * GIB, cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB})):
+            for i, target in enumerate(spellings):
+                code, err = self.call(self.HATCH + f"cp -R /bigsrc {target}", cwd=cwd, agent=f"spell{i}")
+                self.assertEqual(code, 2, target)
+                self.assertIn("over its", err, target)
+
+    def test_an_over_budget_agent_writing_outside_the_work_tree_is_refused(self):
+        # PR #119 review F2: ~/decoy has no owner key; the bytes are still the acting agent's.
+        cwd, _dest, _sizes = self.scp_case()
+        decoy = Path(self.home.name, "decoy")
+        decoy.mkdir()
+        with mock.patch.object(guard, "path_size", fake_size({"/bigsrc": 3 * GIB, cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB})):
+            code, err = self.call(self.HATCH + f"cp -R /bigsrc {decoy}/x", cwd=cwd, agent="A", session="sess")
+            self.assertEqual(code, 2, err)
+            self.assertIn("over its", err)
+            # another agent, under budget, may still use its hatch for the same write outside work
+            self.assertEqual(self.call(self.HATCH + f"cp -R /bigsrc {decoy}/y", cwd=str(decoy), agent="B",
+                                       session="sess")[0], 0)
+
+    def test_tar_clone_worktree_and_target_directory_destinations_are_judged(self):
+        # PR #119 review F3: from an under-budget cwd, each of these lands in the over-budget dir.
+        cwd, dest, _sizes = self.scp_case()
+        repo = Path(self.home.name, "bigrepo")
+        repo.mkdir()
+        table = {"/bigsrc": 3 * GIB, str(repo): 3 * GIB, cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB}
+        with mock.patch.object(guard, "path_size", fake_size(table)), \
+                mock.patch.object(guard, "tracked_tree_bytes", lambda path: 3 * GIB):
+            for i, cmd in enumerate([f"tar -xf /bigsrc.tar -C {cwd}", f"tar -x -f /bigsrc.tar --directory={cwd}",
+                                     f"git clone {repo} {cwd}/c", f"git worktree add {cwd}/w",
+                                     f"cp -R --target-directory={cwd}/out /bigsrc"]):
+                code, err = self.call(self.HATCH + cmd, cwd=dest, agent=f"f3-{i}")
+                self.assertEqual(code, 2, (cmd, err))
+                self.assertIn("over its", err, cmd)
+
     def test_a_download_from_outside_the_fleet_still_counts_as_heavy(self):
         cwd, dest, sizes = self.scp_case()
         with mock.patch.object(guard, "path_size", sizes):
