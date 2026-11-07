@@ -1194,6 +1194,21 @@ class TempFiles15122(Fixture):
         return super().expect([{'cmd': r, 'cwd': '@TASK@'} for r in rows], want, ps=ps, label=label)
 
 
+class SafeAlternatives15122(Fixture):
+    """goodqa#15122: the rclone config block suggested `rclone config file`, a form the guard itself blocks. Every
+    command a block message names as the safe alternative must be allowed."""
+
+    def test_rclone_config_block_names_only_allowed_alternatives(self):
+        verdict, message = self.decide('rclone config show dropbox:')
+        self.assertEqual(verdict, 'block')
+        self.assertNotIn('rclone config file (path only)', message)
+        for safe in ('rclone listremotes', 'rclone lsd dropbox:',
+                     'python3 @HOME@/.claude/hooks/command_guard.py doctor'):
+            with self.subTest(safe):
+                self.assertIn(safe.split('@HOME@/.claude/hooks/')[-1], message)
+                self.assertEqual(self.decide(safe)[0], 'allow', safe)
+
+
 class GuardCompositionTests(unittest.TestCase):
     """The command guard and the heavy-job guard (#53) both classify Bash commands. They are separate hook groups
     and decide independently: neither one's allow, hatch or crash policy can override the other's block."""

@@ -3339,7 +3339,9 @@ class Analyzer:
                 ctx.secret_seen += 1
                 ctx.add(SECRET_DUMP, 'rclone-config-dump',
                         'rclone config show/dump/reconnect prints OAuth access and refresh tokens into the transcript',
-                        'rclone listremotes (names), rclone lsd REMOTE: (access check), rclone config file (path only)')
+                        # goodqa#15122: never name a form this guard blocks (rclone config file is blocked above)
+                        'rclone listremotes (names), rclone lsd dropbox: (access check), command_guard.py doctor '
+                        '(where the config lives)')
         if nd[:1] in (['authorize'], ['reveal']) or (nd and nd[0] in ('authorize', 'reveal')):
             ctx.secret_seen += 1
             ctx.add(SECRET_DUMP, 'rclone-authorize', 'rclone authorize/reveal prints tokens or passwords',
