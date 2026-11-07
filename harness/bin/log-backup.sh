@@ -388,7 +388,7 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
   cur=$(cat "$st/cursor" 2>/dev/null)
   printf '%s' "$cur" | grep -Eq '^(0|[1-9][0-9]*)$' || cur=0
   while [ "$cur" -lt "$total" ]; do
-    sed -n "$((cur + 1)),$((cur + BULK_CHUNK))p" "$st/pending" > "$st/chunk"
+    sed -n "$((cur + 1)),$((cur + BULK_CHUNK))p;$((cur + BULK_CHUNK))q" "$st/pending" > "$st/chunk"
     n=$(wc -l < "$st/chunk" | tr -d ' ')
     cut -f1 "$st/chunk" > "$st/chunk.paths"
     upload "$HOME/$rel" "$rel" "${copy_args[@]+"${copy_args[@]}"}" --files-from-raw "$st/chunk.paths" --no-traverse
@@ -396,7 +396,17 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
     cur=$((cur + n))
     echo "$cur" > "$st/cursor.tmp" && mv "$st/cursor.tmp" "$st/cursor"
   done
-  mv "$st/listing" "$st/done" && rm -f "$st/pending" "$st/cursor" "$st/chunk" "$st/chunk.paths"
+  # Close the generation: drop pending first, so a crash or a failed step here can only make the next run list
+  # again (and re-verify against the old `done`), never leave a finished pending that every later run reports as
+  # complete without listing new files (PR #123 review L1).
+  rm -f "$st/pending" "$st/cursor" "$st/chunk" "$st/chunk.paths" || { say "cannot close the $rel checkpoint"; ok=1; hard_fail=1; return 1; }
+  if [ -f "$st/listing" ]; then
+    mv "$st/listing" "$st/done" || { say "cannot record the $rel pass; the next run lists it again"; ok=1; hard_fail=1; return 1; }
+  else
+    say "$rel: the pass listing is missing; the next run lists it again"
+    ok=1
+    return 1
+  fi
   say "$rel: pass complete ($total files sent or verified)"
   return 0
 }

@@ -653,6 +653,24 @@ class BulkResume(Case):
         self.assertFalse({f for f in self.work_remote() if f.endswith(("auth.json", ".env"))})
 
 
+    def test_a_crash_while_closing_a_pass_cannot_wedge_later_passes(self):
+        # PR #123 review L1: a crash after `mv listing done` and before `rm pending` left pending with the cursor at
+        # its end and no listing; every later run then said "pass complete" and never listed new files.
+        self.bulk_runs(10, 12)
+        self.assertTrue(self.bulk_ok().exists())
+        st = self.logs / "log-backup.bulk.d" / ".agent-harness_work"
+        self.assertTrue((st / "done").exists(), sorted(p.name for p in st.iterdir()))
+        lines = (st / "done").read_text().splitlines()
+        (st / "pending").write_text("\n".join(lines[:5]) + "\n")
+        (st / "cursor").write_text("5\n")
+        self.assertFalse((st / "listing").exists())
+        self.put(".agent-harness/work/t9/after-crash.md", b"new\n")
+        self.bulk_runs(3, 12)
+        self.assertIn(".agent-harness/work/t9/after-crash.md", self.work_remote(),
+                      (self.logs / "log-backup.log").read_text()[-2000:])
+        self.assertFalse((st / "pending").exists())
+
+
 class Failure(Case):
     def test_failed_source_fails_the_run_and_keeps_last_ok(self):
         self.logs.mkdir(parents=True)
