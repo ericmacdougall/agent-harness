@@ -797,6 +797,15 @@ class BoundValidation(ScratchHome):
         done, ran = self.run_script("run_probe.py", base + ["--max-rss-gb", "1", "--timeout-s", "5"])  # control: valid runs
         self.assertEqual((done.returncode, ran), (0, True), done.stdout + done.stderr)
 
+    def test_invalid_default_rss_fraction_is_refused_before_spawn(self):
+        flags = ["--class", "hang", "--worst-case", "blocks indefinitely", "--timeout-s", "5"]
+        for bad in ("0", "nan", "inf", "-1", "not-a-number", "1e-300", "2"):
+            with self.subTest(value=bad), unittest.mock.patch.dict(os.environ, {"HARNESS_PROBE_RSS_FRACTION": bad}):
+                done, ran = self.run_script("run_probe.py", flags)
+                self.assertEqual(done.returncode, 2, (bad, done.stdout + done.stderr))
+                self.assertIn("REFUSED", done.stderr)
+                self.assertFalse(ran, ("probe ran", bad))
+
 
 class AbsurdBounds(ScratchHome):
     def test_finite_but_absurd_caps_are_refused(self):

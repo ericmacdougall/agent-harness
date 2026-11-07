@@ -131,8 +131,15 @@ def parse(argv):
         # goodqa#14948: never run a memory probe where the bound cannot be measured (macOS without phys_footprint)
         missing.append("an accurate memory measure on this host (macOS phys_footprint unavailable): run the probe on dev2")
     if not missing and not args.max_rss_gb:
-        fraction = float(os.environ.get("HARNESS_PROBE_RSS_FRACTION", "0.25"))  # env override exists for tests
-        args.max_rss_gb, args.rss_defaulted = round(phys_gb * fraction, 2), True  # every class gets a memory ceiling
+        try:
+            fraction = positive_finite(os.environ.get("HARNESS_PROBE_RSS_FRACTION", "0.25"), 1)  # test override
+            default_rss = round(phys_gb * fraction, 2)
+            if not default_rss:
+                raise argparse.ArgumentTypeError("HARNESS_PROBE_RSS_FRACTION rounds the default RSS bound to zero")
+        except argparse.ArgumentTypeError as error:
+            missing.append(str(error))
+        else:
+            args.max_rss_gb, args.rss_defaulted = default_rss, True  # every class gets a memory ceiling
     if missing:
         parser.exit(2, "run_probe: REFUSED, declaration incomplete. Declare before running: " + "; ".join(missing) + "\n")
     return args
