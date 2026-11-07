@@ -1123,15 +1123,27 @@ class BulkTier(Case):
         # PR #118 review F2/F3: the git-tree scan is not time-bounded. With a recorded scan time that does not fit
         # in what is left, the scan must not start (it would run every 15 minutes and copy nothing).
         self.logs.mkdir(parents=True, exist_ok=True)
-        (self.logs / "log-backup.work-scan-seconds").write_text("5000\n")
-        done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600")
+        # 60 s budget: about 38 s of copy time is left after tier 1, enough for a slice (20 s) but not slice + 30 s scan.
+        (self.logs / "log-backup.work-scan-seconds").write_text("30\n")
+        done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600", LOG_BACKUP_BUDGET_SECONDS="60")
         log = (self.logs / "log-backup.log").read_text()
         self.assertNotIn("git trees excluded", log)
-        self.assertIn("used up before .agent-harness/work (its scan needs about 5000s)", log)
+        self.assertIn("used up before .agent-harness/work (its scan needs about 30s)", log)
         self.assertTrue([c for c in self.bulk_copies() if any("archived_sessions" in x for x in c)])
         self.assertFalse([c for c in self.bulk_copies() if any(x.endswith(".agent-harness/work") for x in c)])
         self.assertNotEqual(done.returncode, 0)
         self.assertFalse(self.bulk_try().exists(), "an unfinished pass continues next run")
+
+    def test_one_slow_scan_does_not_lock_the_work_tree_out(self):
+        # PR #118 review R2-1: a stored 770 s (one slow scan) above the cap of half the budget must not stop a run
+        # with most of its time free from scanning, or the file would never be rewritten.
+        self.logs.mkdir(parents=True, exist_ok=True)
+        (self.logs / "log-backup.work-scan-seconds").write_text("770\n")
+        done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("git trees excluded", (self.logs / "log-backup.log").read_text())
+        self.assertTrue([c for c in self.bulk_copies() if any(x.endswith(".agent-harness/work") for x in c)])
+        self.assertLess(int((self.logs / "log-backup.work-scan-seconds").read_text()), 770)
 
     def test_the_work_scan_time_is_measured(self):
         done = self.run_script()

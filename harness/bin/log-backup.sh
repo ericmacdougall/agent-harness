@@ -396,6 +396,9 @@ RESERVE=0 budget_hit=0 hard_fail=0
 scan_file="$LOGDIR/log-backup.work-scan-seconds"
 scan_need=$(cat "$scan_file" 2>/dev/null)
 printf '%s' "$scan_need" | grep -Eq '^(0|[1-9][0-9]{0,4})$' || scan_need=60
+# One slow scan (cold cache, launchd's low priority) must not lock the work tree out for good: the measurement is only
+# rewritten when a scan runs, so it is capped at half the budget and a run with most of its time free always scans.
+[ "$scan_need" -le $(( BUDGET_SECONDS / 2 )) ] || scan_need=$(( BUDGET_SECONDS / 2 ))
 for src in "${sources_bulk[@]+"${sources_bulk[@]}"}"; do
   [ -e "$HOME/$src" ] || [ -L "$HOME/$src" ] || continue
   if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; hard_fail=1; continue; fi
