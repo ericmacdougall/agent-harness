@@ -23,12 +23,20 @@
 #   LOG_BACKUP_DEADLINE_GRACE_SECONDS / LOG_BACKUP_KILL_GRACE_SECONDS  a copy past its share gets SIGTERM after the
 #                           first (default 10) and SIGKILL after the second more (default 10)
 #   LOG_BACKUP_VERSIONS     exactly 0 turns off versions/STAMP (loud warning); anything else keeps them
-#   LOG_BACKUP_BULK_CHUNK   files per checkpointed bulk copy (default 100, 1-99999); see bulk_upload
+#   LOG_BACKUP_BULK_CHUNK   files per checkpointed bulk copy (default 1000, 1-99999); see bulk_upload
+#   LOG_BACKUP_BULK_LANE    exactly 1 runs the bulk tier as its own detached run (the bulk lane), at the same time as
+#                           the transcripts, so tier 1 can no longer use up the bulk tier's time. The write budget is
+#                           split, never added: tier 1 copies at TPSLIMIT - BULK_TPS and the lane at BULK_TPS, so the
+#                           host stays at TPSLIMIT. TPSLIMIT must be larger than BULK_TPS. The launchd plist sets it.
+#   LOG_BACKUP_BULK_TPS     the lane's share of TPSLIMIT (default 1, 1-99)
+#   LOG_BACKUP_LANE_BUDGET_SECONDS  wall time of one lane run (default 10800); the next scheduled run starts another
+#   LOG_BACKUP_TIER         internal: bulk marks the lane run itself; nothing else may set it
 # Freshness contract, two tiers with their own markers. log-backup.last-ok (transcripts, WALs, ledgers) is written
 # atomically with the run START time only after every tier-1 source copied cleanly and a primary source
 # (.claude/projects or .codex/sessions) held files. log-backup.bulk-last-ok (archived sessions, narrowed work tree)
 # is written only after every tier-2 source copied cleanly. A run skipped because another run holds the lock writes
-# log-backup.last-skip and touches neither marker.
+# log-backup.last-skip and touches neither marker. With the lane on, the lane run writes bulk-last-ok and its own
+# log-backup.lane.last-run; the scheduled run's last-run then reads bulk=lane.
 set -u
 SELF_DIR=$(cd "$(dirname "$0")" && pwd)
 cd / || exit 1
@@ -53,19 +61,39 @@ SLICE_RESERVE=${LOG_BACKUP_SLICE_RESERVE_SECONDS:-20}  # the least copy time eac
 DEADLINE_GRACE=${LOG_BACKUP_DEADLINE_GRACE_SECONDS:-10}  # a copy still running this long past its share gets SIGTERM
 KILL_GRACE=${LOG_BACKUP_KILL_GRACE_SECONDS:-10}  # and SIGKILL this long after that (rclone drains batches on TERM)
 PERIOD=${LOG_BACKUP_PERIOD_SECONDS:-900}  # the schedule interval: a run, start delay included, ends before the next one
-for rate in TPSLIMIT TRANSFERS; do
+LANE=${LOG_BACKUP_BULK_LANE:-0}          # 1: the bulk tier runs as its own detached run beside tier 1 (goodqa#15062)
+BULK_TPS=${LOG_BACKUP_BULK_TPS:-1}       # the lane's share of TPSLIMIT
+LANE_BUDGET=${LOG_BACKUP_LANE_BUDGET_SECONDS:-10800}
+TIER=${LOG_BACKUP_TIER:-all}             # all: both tiers in this run; live: tier 1 only; bulk: the lane run
+for rate in TPSLIMIT TRANSFERS BULK_TPS; do
   if ! printf '%s' "${!rate}" | grep -Eq '^[1-9][0-9]?$'; then
     echo "log-backup: $rate must be a whole number from 1 to 99" >&2; exit 2
   fi
 done
-BULK_CHUNK=${LOG_BACKUP_BULK_CHUNK:-100}
+BULK_CHUNK=${LOG_BACKUP_BULK_CHUNK:-1000}
 printf '%s' "$BULK_CHUNK" | grep -Eq '^[1-9][0-9]{0,4}$' || { echo "log-backup: LOG_BACKUP_BULK_CHUNK must be 1-99999" >&2; exit 2; }
-for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER DEADLINE_GRACE SLICE_RESERVE KILL_GRACE PERIOD; do
+for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER DEADLINE_GRACE SLICE_RESERVE KILL_GRACE PERIOD LANE_BUDGET; do
   # No leading zeros: bash would read 08 as octal and abort the arithmetic.
   if ! printf '%s' "${!numeric:-0}" | grep -Eq '^(0|[1-9][0-9]{0,4})$'; then
     echo "log-backup: $numeric must be a whole number of at most 5 digits without leading zeros" >&2; exit 2
   fi
 done
+case "$LANE" in 0|1) ;; *) echo "log-backup: LOG_BACKUP_BULK_LANE must be 0 or 1" >&2; exit 2 ;; esac
+case "$TIER" in
+  all) ;;
+  bulk) [ "$LANE" = 1 ] || { echo "log-backup: LOG_BACKUP_TIER=bulk is the lane run; it needs LOG_BACKUP_BULK_LANE=1" >&2; exit 2; } ;;
+  *) echo "log-backup: LOG_BACKUP_TIER is internal (only bulk, set by the lane itself)" >&2; exit 2 ;;
+esac
+if [ "$LANE" = 1 ]; then
+  # Split the host's write budget, never add to it: the lane and tier 1 together stay at TPSLIMIT.
+  [ "$TPSLIMIT" -gt "$BULK_TPS" ] || { echo "log-backup: the bulk lane needs LOG_BACKUP_TPSLIMIT larger than LOG_BACKUP_BULK_TPS ($BULK_TPS)" >&2; exit 2; }
+  if [ "$TIER" = bulk ]; then TPSLIMIT=$BULK_TPS; else TIER=live; TPSLIMIT=$(( TPSLIMIT - BULK_TPS )); fi
+fi
+# The lane run keeps its own run marker, watchdog markers and log prefix, so the two runs never clear each other's.
+TAG= SAY_TAG=
+[ "$TIER" = bulk ] && TAG=.lane SAY_TAG="[lane] "
+LASTRUN="$LOGDIR/log-backup${TAG}.last-run"
+LANE_LOCKD="$LOGDIR/log-backup.lane.lock.d"   # held by whichever run uses the bulk checkpoint (lane or all)
 # Size limits go to rclone, so they must be plain sizes: digits, an optional K, M or G, and not zero (a zero transfer
 # cap would stop every run immediately and the bulk marker would never be written).
 for sized in LOG_BACKUP_WORK_MAX_SIZE LOG_BACKUP_WORK_MAX_TRANSFER; do
@@ -89,8 +117,8 @@ rotate_log() {
   if [ -n "$size" ] && [ "$size" -gt 10485760 ]; then mv -f -- "$LOG" "$LOG.1" 2>/dev/null; fi
 }
 [ -f "$LOG" ] && rotate_log
-say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >> "$LOG"; }
-fail() { say "$1"; echo "log-backup: $1" >&2; echo "$STARTED exit=$2" > "$LOGDIR/log-backup.last-run"; exit "$2"; }
+say() { printf '%s %s%s\n' "$(date -u +%FT%TZ)" "$SAY_TAG" "$1" >> "$LOG"; }
+fail() { say "$1"; echo "log-backup: $1" >&2; echo "$STARTED exit=$2" > "$LASTRUN"; exit "$2"; }
 
 file_age() { # seconds since modification of $1; BSD stat on Darwin, GNU stat elsewhere
   local m
@@ -135,11 +163,12 @@ holder_alive() { # pid $1 is running and is a log-backup run (a recycled pid bel
   return 1
 }
 
-acquire_lock() {
-  if mkdir "$LOCKD" 2>/dev/null; then echo $$ > "$LOCKD/pid"; return 0; fi
+acquire_lock() { # acquire_lock [LOCK-DIR]: the run lock by default
+  local lockd=${1:-$LOCKD}
+  if mkdir "$lockd" 2>/dev/null; then echo $$ > "$lockd/pid"; return 0; fi
   local holder age
-  holder=$(cat "$LOCKD/pid" 2>/dev/null)
-  age=$(file_age "$LOCKD")
+  holder=$(cat "$lockd/pid" 2>/dev/null)
+  age=$(file_age "$lockd")
   if [ -n "$holder" ]; then
     holder_alive "$holder" && [ "$age" -lt $STALE_LOCK_SECONDS ] && return 1
   elif [ "$age" -lt $STALE_LOCK_SECONDS ]; then
@@ -149,40 +178,48 @@ acquire_lock() {
   fi
   # Stale. Takeovers are serialized by a second mkdir guard, so two runners cannot both judge the same lock and
   # one of them move the other's fresh lock. A guard left by a crashed takeover expires after 5 minutes.
-  local guard="$LOCKD.takeover"
+  local guard="$lockd.takeover"
   if ! mkdir "$guard" 2>/dev/null; then
     [ "$(file_age "$guard")" -gt 300 ] || return 1
     rmdir "$guard" 2>/dev/null; mkdir "$guard" 2>/dev/null || return 1
   fi
-  if [ -d "$LOCKD" ] && [ "$(cat "$LOCKD/pid" 2>/dev/null)" != "$holder" ]; then
+  if [ -d "$lockd" ] && [ "$(cat "$lockd/pid" 2>/dev/null)" != "$holder" ]; then
     rmdir "$guard" 2>/dev/null  # the lock changed hands while we waited for the guard: it is not stale any more
     return 1
   fi
   say "taking over stale lock (holder=${holder:-none} age=${age}s)"
-  local gone="$LOCKD.stale.$$" got=1
-  if mv "$LOCKD" "$gone" 2>/dev/null; then
+  local gone="$lockd.stale.$$" got=1
+  if mv "$lockd" "$gone" 2>/dev/null; then
     rm -f "$gone/pid"; rmdir "$gone" 2>/dev/null
   fi
-  if mkdir "$LOCKD" 2>/dev/null; then echo $$ > "$LOCKD/pid"; got=0; fi
+  if mkdir "$lockd" 2>/dev/null; then echo $$ > "$lockd/pid"; got=0; fi
   rmdir "$guard" 2>/dev/null
   return $got
 }
 
-[ "$JITTER" -gt 0 ] && sleep $((RANDOM % (JITTER + 1)))
+[ "$JITTER" -gt 0 ] && [ "$TIER" != bulk ] && sleep $((RANDOM % (JITTER + 1)))   # the lane starts after its parent's delay
 RUN_START=$(date +%s)   # the budget is for copying: the start delay must not spend it (2026-11-07)
 # One wall-clock deadline for every copy, its stop and its kill: the budget after the start delay, but never past the
 # next scheduled start (less 30 s to write the markers), so a long delay shrinks the copying time instead.
 WALL_END=$(( RUN_START + BUDGET_SECONDS ))
 [ $(( SCRIPT_START + PERIOD - 30 )) -ge $WALL_END ] || WALL_END=$(( SCRIPT_START + PERIOD - 30 ))
+# The lane run has its own budget and no schedule slot to fit: the scheduled run that started it keeps that slot.
+[ "$TIER" = bulk ] && WALL_END=$(( RUN_START + LANE_BUDGET ))
 MIN_SLICE=$SLICE_RESERVE; [ "$MIN_SLICE" -ge 1 ] || MIN_SLICE=1
-if legacy_run_active || ! acquire_lock; then
+release_locks() { local d; for d in "$@"; do [ "$(cat "$d/pid" 2>/dev/null)" = "$$" ] && { rm -f "$d/pid"; rmdir "$d" 2>/dev/null; }; done; }
+if [ "$TIER" = bulk ]; then
+  if legacy_run_active || ! acquire_lock "$LANE_LOCKD"; then
+    say "bulk lane: another run holds the bulk checkpoint; this lane run exits"
+    exit 0
+  fi
+elif legacy_run_active || ! acquire_lock; then
   say "skipped: another backup run holds the lock (this is not a successful backup)"
   date -u +%FT%TZ > "$LOGDIR/log-backup.last-skip"
   exit 0
 fi
-trap '[ "$(cat "$LOCKD/pid" 2>/dev/null)" = "$$" ] && { rm -f "$LOCKD/pid"; rmdir "$LOCKD" 2>/dev/null; }' EXIT
-# A watchdog that outlived a killed run can leave its marker; with the lock held, none of them is current.
-rm -f "$LOGDIR"/.log-backup.deadline.* 2>/dev/null
+trap 'release_locks "$LOCKD" "$LANE_LOCKD"' EXIT
+# A watchdog that outlived a killed run can leave its marker; with the lock held, none of this tier's is current.
+rm -f "$LOGDIR"/.log-backup${TAG}.deadline.* 2>/dev/null
 
 command -v "$RCLONE" >/dev/null 2>&1 || fail "rclone not found (set LOG_BACKUP_RCLONE or fix PATH)" 127
 [ -r "$WORK_EXCLUDES" ] || fail "work exclude file missing: $WORK_EXCLUDES" 2
@@ -190,6 +227,8 @@ command -v "$RCLONE" >/dev/null 2>&1 || fail "rclone not found (set LOG_BACKUP_R
 for anchor in auth.json rclone.conf member.key '*.secret' '.env'; do
   grep -qxF -- "$anchor" "$EXCLUDES" || fail "exclude file lacks required pattern $anchor (refusing to run)" 2
 done
+# A bulk checkpoint is listed with these filters; when either list changes, the pass in progress is listed again.
+FILTER_ID=$(cat -- "$EXCLUDES" "$WORK_EXCLUDES" | cksum | tr -s ' \t' '-') || fail "cannot read the exclude lists" 2
 case "$HOST" in ''|*[!A-Za-z0-9._-]*|-*|.*) fail "invalid host label" 2 ;; esac
 
 remotes=$("$RCLONE" listremotes --long --ask-password=false </dev/null 2>/dev/null)
@@ -233,6 +272,7 @@ LIVE=(.claude/history.jsonl .codex/history.jsonl .agent-harness/work-assignments
   .agent-harness/work-ledger.events.jsonl .agent-harness/work-ledger.archive.jsonl .agent-harness/work-ledger.failures.jsonl
   .agent-harness/work-ledger.spool.jsonl .claude/wals .codex/sessions .claude/projects)
 DIRECT=(.codex/archived_sessions .agent-harness/work)
+if [ "$TIER" != bulk ]; then   # the stage belongs to tier 1: the lane run must never rebuild or clear it mid-snapshot
 command -v rsync >/dev/null 2>&1 || fail "rsync not found (needed to snapshot live files)" 127
 # The stage must be a private directory of its own: absolute, no `..`, not a symlink, not HOME or any ancestor of a
 # source, and not inside a source (it would nest into itself or be uploaded as data).
@@ -254,6 +294,7 @@ awk '/^[ \t]*(#|$)/ {next} {out=""; for (i = 1; i <= length($0); i++) {c = subst
 # Leftover partial files of a crashed snapshot are never data: start each run with an empty temp directory.
 rm -rf "$STAGE/.rsync-tmp"
 say "stage size $(du -sk "$STAGE" 2>/dev/null | cut -f1) KiB"
+fi
 
 rate_limit_note() { # rate_limit_note LOG-OFFSET: name a Dropbox write rate limit seen since LOG-OFFSET, and count the
   # other rclone uploads to this remote on the host, which share the account's write budget (the cause on 2026-11-07).
@@ -297,14 +338,14 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
     # under versions/ until the next run (no data is lost); this was already possible with --max-duration.
     "$RCLONE" "${args[@]}" --max-duration "${remaining}s" -- "$p" "$dst" </dev/null &
     copy_pid=$!
-    rm -f "$LOGDIR/.log-backup.deadline.$copy_pid"
+    rm -f "$LOGDIR/.log-backup${TAG}.deadline.$copy_pid"
     # The watchdog ends its own sleep when it is stopped, so no orphan sleep holds the caller's output open; it writes
     # its marker before signalling, so the copy's exit can never be read before the marker exists.
     ( nap=
       trap 'kill ${nap:+"$nap"} 2>/dev/null; exit 0' TERM
       sleep $((remaining + DEADLINE_GRACE)) & nap=$!
       wait "$nap" || exit 0
-      touch "$LOGDIR/.log-backup.deadline.$copy_pid"
+      touch "$LOGDIR/.log-backup${TAG}.deadline.$copy_pid"
       kill -TERM "$copy_pid" 2>/dev/null || exit 0
       sleep "$KILL_GRACE" & nap=$!
       wait "$nap" || exit 0
@@ -312,8 +353,8 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
     dog_pid=$!
     wait "$copy_pid"; rc=$?
     kill "$dog_pid" 2>/dev/null; wait "$dog_pid" 2>/dev/null
-    if [ -e "$LOGDIR/.log-backup.deadline.$copy_pid" ]; then
-      rm -f "$LOGDIR/.log-backup.deadline.$copy_pid"
+    if [ -e "$LOGDIR/.log-backup${TAG}.deadline.$copy_pid" ]; then
+      rm -f "$LOGDIR/.log-backup${TAG}.deadline.$copy_pid"
       say "copy of $rel stopped at the run deadline (${remaining}s + ${DEADLINE_GRACE}s grace, killed after ${KILL_GRACE}s more if still running); partial, last-ok withheld"
       rate_limit_note "$log_mark"; ok=1; budget_hit=1; return
     fi
@@ -352,7 +393,7 @@ BULK_STATE="$LOGDIR/log-backup.bulk.d"
 bulk_key() { printf '%s' "$1" | tr '/' '_'; }
 bulk_needs_listing() { # bulk_needs_listing SRC-REL: true when no generation is in progress for SRC-REL
   local st="$BULK_STATE/$(bulk_key "$1")"
-  [ -s "$st/pending" ] && [ "$(cat "$st/remote" 2>/dev/null)" = "$R" ] && return 1
+  [ -s "$st/pending" ] && [ "$(cat "$st/remote" 2>/dev/null)" = "$R" ] && [ "$(cat "$st/filters" 2>/dev/null)" = "$FILTER_ID" ] && return 1
   return 0
 }
 bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one checkpointed pass; 0 when finished
@@ -368,6 +409,12 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
   if [ "$(cat "$st/remote" 2>/dev/null)" != "$R" ]; then
     rm -f "$st/pending" "$st/cursor" "$st/done" "$st/listing" && printf '%s\n' "$R" > "$st/remote"
   fi
+  # A pass listed with other exclude lists would send what they now exclude: list it again (the old `done` stays, so
+  # files already verified are still not sent twice). A checkpoint from before this marker existed counts as changed.
+  if [ -s "$st/pending" ] && [ "$(cat "$st/filters" 2>/dev/null)" != "$FILTER_ID" ]; then
+    say "$rel: the exclude lists changed since this pass was listed; listing it again"
+    rm -f "$st/pending" "$st/cursor" "$st/chunk" "$st/chunk.paths" "$st/listing"
+  fi
   if [ ! -s "$st/pending" ]; then
     local filters=(--exclude-from "$EXCLUDES" --ignore-case "${list_filters[@]+"${list_filters[@]}"}")
     "$RCLONE" lsf -R --files-only --format pst --separator $'\t' "${filters[@]}" -- "$HOME/$rel" \
@@ -381,6 +428,9 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
     touch "$st/done"
     awk -F'\t' 'FILENAME == ARGV[1] {seen[$0] = 1; next} !($0 in seen)' "$st/done" "$st/listing" > "$st/pending.tmp" \
       && mv "$st/pending.tmp" "$st/pending" && echo 0 > "$st/cursor" || { say "cannot build the $rel checkpoint"; ok=1; hard_fail=1; return 1; }
+    # Written last: a crash before this line leaves no matching marker, so the next run lists again.
+    printf '%s\n' "$FILTER_ID" > "$st/filters.tmp" && mv "$st/filters.tmp" "$st/filters" \
+      || { say "cannot record the $rel filters; the next run lists it again"; ok=1; hard_fail=1; return 1; }
     [ "$(cat "$st/odd")" = 0 ] || say "$rel: $(cat "$st/odd") paths with a tab or newline are not checkpointed"
     say "$rel: new pass, $(wc -l < "$st/pending" | tr -d ' ') of $(wc -l < "$st/listing" | tr -d ' ') files new or changed"
   fi
@@ -411,6 +461,18 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
   return 0
 }
 
+if [ "$TIER" = live ]; then
+  # Start the lane once: a lane run still going keeps the bulk checkpoint (its lock decides; this only avoids noise).
+  lane_holder=$(cat "$LANE_LOCKD/pid" 2>/dev/null)
+  if [ -n "$lane_holder" ] && holder_alive "$lane_holder"; then
+    say "bulk lane still running (pid $lane_holder)"
+  else
+    LOG_BACKUP_TIER=bulk nohup /bin/bash "$SELF_DIR/$(basename "$0")" </dev/null >/dev/null 2>&1 &
+    say "bulk lane started (pid $!); tier 1 copies at ${TPSLIMIT}/s, the lane at ${BULK_TPS}/s"
+  fi
+fi
+transcripts_ok=0
+if [ "$TIER" != bulk ]; then
 later=0
 for src in "${LIVE[@]}"; do [ -e "$HOME/$src" ] && later=$((later + 1)); done
 for src in "${LIVE[@]}"; do
@@ -449,11 +511,13 @@ if [ $ok -eq 0 ]; then
   echo "$STARTED sources=$found remote=${R%%:*}" > "$LOGDIR/log-backup.last-ok.tmp.$$" \
     && mv "$LOGDIR/log-backup.last-ok.tmp.$$" "$LOGDIR/log-backup.last-ok"
 fi
+fi   # tier 1
 ok=0
 # Tier 2 runs at most once per BULK_EVERY seconds: its marker allows 6 hours, and transcripts must not wait behind it.
 bulk_ran=1 sources_bulk=("${DIRECT[@]}")
+[ "$TIER" = live ] && bulk_ran=0 sources_bulk=()   # the lane run copies tier 2
 bulk_try="$LOGDIR/log-backup.bulk-last-try"
-if [ -e "$bulk_try" ]; then
+if [ $bulk_ran -eq 1 ] && [ -e "$bulk_try" ]; then
   bulk_age=$(raw_age "$bulk_try")
   if [ -n "$bulk_age" ] && [ "$bulk_age" -ge 0 ] && [ "$bulk_age" -lt "$BULK_EVERY" ]; then
     bulk_ran=0 sources_bulk=()
@@ -467,6 +531,12 @@ time_left() { echo $(( WALL_END - $(date +%s) - DEADLINE_GRACE - KILL_GRACE )); 
 if [ $bulk_ran -eq 1 ] && [ ${#sources_bulk[@]} -gt 0 ] && [ "$(time_left)" -lt "$MIN_SLICE" ]; then
   bulk_ran=0 sources_bulk=()
   say "bulk tier deferred: no run time left after tier 1; the next run with time left tries it"
+fi
+# One writer per bulk checkpoint: a run with the lane off still takes the lane lock, so it never shares the
+# checkpoint with a lane run that is still going (the lane run took it at its start).
+if [ "$TIER" = all ] && [ $bulk_ran -eq 1 ] && ! acquire_lock "$LANE_LOCKD"; then
+  bulk_ran=0 sources_bulk=()
+  say "bulk tier skipped: a bulk lane run holds the bulk checkpoint"
 fi
 [ $bulk_ran -eq 1 ] && : > "$bulk_try"
 RESERVE=0 budget_hit=0 hard_fail=0
@@ -525,5 +595,9 @@ if [ $bulk_ok -eq 0 ] && [ $bulk_ran -eq 1 ]; then
 fi
 rc=0
 { [ $transcripts_ok -eq 0 ] && [ $bulk_ok -eq 0 ]; } || rc=1
-echo "$STARTED exit=$rc transcripts=$transcripts_ok bulk=$bulk_ok" > "$LOGDIR/log-backup.last-run"
+case "$TIER" in
+  bulk) echo "$STARTED exit=$rc bulk=$bulk_ok" > "$LASTRUN" ;;
+  live) echo "$STARTED exit=$rc transcripts=$transcripts_ok bulk=lane" > "$LASTRUN" ;;
+  *) echo "$STARTED exit=$rc transcripts=$transcripts_ok bulk=$bulk_ok" > "$LASTRUN" ;;
+esac
 exit $rc

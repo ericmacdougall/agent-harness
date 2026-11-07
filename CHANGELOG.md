@@ -7,6 +7,10 @@ group by pull request.
 ## Unreleased
 
 ### Fixed
+- log-backup bulk lane: on the Mac the bulk tier now runs as its own detached run beside tier 1, on a split of the
+  same 2/s write budget, instead of in the few minutes tier 1 left (about 400 files an hour). Bulk chunks are 1000
+  files. A pass is listed again when the exclude lists change, and five verified `.lanes` copies (about 230k files)
+  are excluded with a pinned tag and a backed-up manifest (goodqa#15062).
 - log-backup bulk tier: a pass now resumes from a checkpoint instead of starting over every run. With the 620k-file
   work tree, each run re-checked the same first files and the pass never finished. Files verified by an earlier pass
   are not checked again, and only new or changed files are sent (goodqa#15062).

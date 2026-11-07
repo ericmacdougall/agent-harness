@@ -5,8 +5,9 @@
 <key>ProgramArguments</key><array><string>/bin/bash</string><string>@HOME@/.agent-harness/bin/log-backup.sh</string></array>
 <key>StartInterval</key><integer>900</integer>
 <key>RunAtLoad</key><true/>
-<key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string><key>LOG_BACKUP_JITTER_SECONDS</key><string>120</string><key>LOG_BACKUP_TPSLIMIT</key><string>2</string></dict>
+<key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string><key>LOG_BACKUP_JITTER_SECONDS</key><string>120</string><key>LOG_BACKUP_TPSLIMIT</key><string>2</string><key>LOG_BACKUP_BULK_LANE</key><string>1</string></dict>
 <key>StandardOutPath</key><string>@HOME@/.agent-harness/logs/log-backup.out</string>
 <key>StandardErrorPath</key><string>@HOME@/.agent-harness/logs/log-backup.err</string>
+<key>AbandonProcessGroup</key><true/>
 <key>LowPriorityIO</key><true/><key>Nice</key><integer>10</integer>
 </dict></plist>

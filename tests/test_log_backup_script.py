@@ -1293,5 +1293,133 @@ class BulkTier(Case):
         self.assertIn("bulk tier skipped", (self.logs / "log-backup.log").read_text())
 
 
+
+SESSION = "baab765b-d85c-46b4-b7b9-588eb912c770"
+
+
+class BulkLane(Case):
+    """goodqa#15062: tier 1 used about 9 of the 13 minutes of every run, so the bulk tier moved about 400 files an
+    hour (a 65 day backlog). The lane runs tier 2 as its own detached run beside tier 1, on a split of the same
+    write budget, with one writer per bulk checkpoint."""
+
+    def lane_lock(self):
+        return self.logs / "log-backup.lane.lock.d"
+
+    def wait_for_lane(self, timeout=60):
+        end = time.time() + timeout
+        marker = self.logs / "log-backup.lane.last-run"
+        while time.time() < end:
+            if marker.exists() and not self.lane_lock().exists():
+                return marker.read_text()
+            time.sleep(0.2)
+        self.fail("the lane run did not finish: " + (self.logs / "log-backup.log").read_text()[-2000:])
+
+    def tps(self, argv):
+        return argv[argv.index("--tpslimit") + 1]
+
+    def test_lane_runs_tier_2_on_its_share_and_tier_1_on_the_rest(self):
+        done = self.run_script(LOG_BACKUP_BULK_LANE="1", LOG_BACKUP_TPSLIMIT="3", LOG_BACKUP_BULK_TPS="1")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("bulk=lane", (self.logs / "log-backup.last-run").read_text())
+        self.assertIn("exit=0 bulk=0", self.wait_for_lane())
+        bulk = [c for c in self.copies() if "--files-from-raw" in c]
+        live = [c for c in self.copies() if "--files-from-raw" not in c]
+        self.assertTrue(bulk and live, self.copies())
+        self.assertEqual({self.tps(c) for c in live}, {"2"}, "tier 1 copies at TPSLIMIT - BULK_TPS")
+        self.assertEqual({self.tps(c) for c in bulk}, {"1"}, "the lane copies at BULK_TPS")
+        self.assertTrue(self.last_ok().exists())
+        self.assertTrue(self.bulk_ok().exists(), "the lane writes the bulk marker")
+        self.assertIn("[lane] ", (self.logs / "log-backup.log").read_text())
+
+    def test_lane_settings_that_would_add_to_the_budget_are_refused(self):
+        for extra in ({"LOG_BACKUP_BULK_LANE": "1", "LOG_BACKUP_TPSLIMIT": "1"},
+                      {"LOG_BACKUP_BULK_LANE": "1", "LOG_BACKUP_TPSLIMIT": "2", "LOG_BACKUP_BULK_TPS": "2"},
+                      {"LOG_BACKUP_BULK_LANE": "yes", "LOG_BACKUP_TPSLIMIT": "2"},
+                      {"LOG_BACKUP_TIER": "bulk", "LOG_BACKUP_TPSLIMIT": "2"},
+                      {"LOG_BACKUP_TIER": "live", "LOG_BACKUP_TPSLIMIT": "2"}):
+            done = self.run_script(**extra)
+            self.assertEqual(done.returncode, 2, (extra, done.stderr))
+        self.assertEqual(self.copies(), [])
+
+    def test_a_run_with_the_lane_off_never_shares_the_checkpoint_with_a_lane_run(self):
+        holder_dir = self.tmp / "holder"
+        holder_dir.mkdir()
+        holder = holder_dir / "log-backup.sh"
+        holder.write_text("trap 'kill $nap; exit 0' TERM\nsleep 60 & nap=$!\nwait $nap\n")
+        proc = subprocess.Popen(["/bin/bash", str(holder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.terminate)
+        self.lane_lock().mkdir(parents=True)
+        (self.lane_lock() / "pid").write_text(str(proc.pid))
+        done = self.run_script()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual([c for c in self.copies() if "--files-from-raw" in c], [], "no second bulk writer")
+        self.assertIn("bulk tier skipped: a bulk lane run holds the bulk checkpoint",
+                      (self.logs / "log-backup.log").read_text())
+        self.assertEqual((self.lane_lock() / "pid").read_text(), str(proc.pid), "the lane's lock is left alone")
+
+    def test_the_lane_run_never_clears_tier_1_stage_or_watchdog_markers(self):
+        stage_tmp = self.home / ".agent-harness" / "backup-stage" / ".rsync-tmp"
+        stage_tmp.mkdir(parents=True)
+        (stage_tmp / "partial").write_text("tier 1 is mid-snapshot")
+        self.logs.mkdir(parents=True, exist_ok=True)
+        marker = self.logs / ".log-backup.deadline.12345"
+        marker.write_text("")
+        done = self.run_script(LOG_BACKUP_BULK_LANE="1", LOG_BACKUP_TIER="bulk", LOG_BACKUP_TPSLIMIT="2")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue((stage_tmp / "partial").exists(), "the lane must not clear tier 1's snapshot temp files")
+        self.assertTrue(marker.exists(), "the lane must not clear tier 1's watchdog markers")
+        self.assertEqual([c for c in self.copies() if "--files-from-raw" not in c], [], "the lane copies tier 2 only")
+        self.assertFalse((self.logs / "log-backup.last-run").exists(), "the lane keeps its own run marker")
+        self.assertTrue(self.bulk_ok().exists())
+
+    def test_one_default_chunk_holds_a_thousand_files(self):
+        for i in range(150):
+            self.put(f".agent-harness/work/c/f{i:03d}.md", b"x%d\n" % i)
+        done = self.run_script()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        work = [c for c in self.copies() if "--files-from-raw" in c and c[-1].endswith(".agent-harness/work")]
+        self.assertEqual(len(work), 1, "151 files fit one default chunk (the old default, 100, took two)")
+
+
+class BulkFilters(BulkResume):
+    """A pass is listed once. When the exclude lists change mid-pass, the files they now exclude must not be sent
+    from the stale listing (goodqa#15062: the .lanes excludes land while a 620k-file pass is in progress)."""
+
+    test_passes_cut_short_by_the_budget_resume_and_finish_the_tree = None
+    test_verified_files_are_not_checked_again_and_only_changes_are_sent = None
+    test_a_credential_in_the_work_tree_never_reaches_the_remote_through_the_checkpoint = None
+    test_a_crash_while_closing_a_pass_cannot_wedge_later_passes = None
+
+    def test_changed_excludes_relist_the_pass_in_progress(self):
+        excludes = self.tmp / "work-excludes"
+        excludes.write_text((ROOT / "harness/bin/log-backup.work-excludes").read_text())
+        self.bulk_runs(1, 12, LOG_BACKUP_WORK_EXCLUDES=str(excludes))
+        self.assertFalse(self.bulk_ok().exists(), "the first pass is cut short")
+        unsent = [d for d in ("t0", "t1", "t2") if not any(f"/{d}/" in f for f in self.work_remote())]
+        self.assertTrue(unsent, "the first pass must leave a directory unsent: %s" % sorted(self.work_remote()))
+        excludes.write_text(excludes.read_text() + "/%s/**\n" % unsent[0])
+        self.bulk_runs(10, 12, LOG_BACKUP_WORK_EXCLUDES=str(excludes))
+        self.assertTrue(self.bulk_ok().exists())
+        self.assertEqual({f for f in self.work_remote() if f"/{unsent[0]}/" in f}, set(),
+                         "files the new excludes drop are not sent from the old listing")
+        self.assertIn("the exclude lists changed", (self.logs / "log-backup.log").read_text())
+
+    def test_the_lanes_copies_are_excluded_and_test_data_is_kept(self):
+        base = f".agent-harness/work/{SESSION}"
+        dropped = [f"{base}/rt1191/bt/.lanes/a/x.ts", f"{base}/rt1192/repo/.lanes/b.md",
+                   f"{base}/repo-diet/bugtracker-mac/.lanes/c.md",
+                   f"{base}/agent-ab67b166a35308e10/review-clone/.lanes/d.md",
+                   f"{base}/agent-ad693d1f419a19ff9/repo2/.lanes/e.md"]
+        kept = [f"{base}/rt1191/bt/pgdata/base/1", f"{base}/t2-course/lesson.md", f"{base}/rt1191/bt/other/.lanes/f.md",
+                f"{base}/agent-x/.lanes/g.md"]
+        for rel in dropped + kept:
+            self.put(rel, b"data\n")
+        self.bulk_runs(1, 1000)
+        remote = self.work_remote()
+        self.assertEqual(set(dropped) & remote, set())
+        self.assertEqual(set(kept) - remote, set(), "pgdata, t2-course and other .lanes copies stay in the backup")
+
+
 if __name__ == "__main__":
     unittest.main()
