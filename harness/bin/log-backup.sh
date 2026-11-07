@@ -42,12 +42,14 @@ TPSLIMIT=${LOG_BACKUP_TPSLIMIT:-1}       # Dropbox write budget is shared by eve
 TRANSFERS=${LOG_BACKUP_TRANSFERS:-2}     # keep each host's share small (the Mac, dev2 and T2 together stay near 3/s)
 BULK_EVERY=${LOG_BACKUP_BULK_EVERY_SECONDS:-3600}   # the bulk tier (work tree, archives) runs hourly, transcripts every time
 JITTER=${LOG_BACKUP_JITTER_SECONDS:-0}   # random start delay so hosts on the same schedule do not collide
+SLICE_RESERVE=${LOG_BACKUP_SLICE_RESERVE_SECONDS:-40}  # per later tier-1 source, kept out of each copy's share
+DEADLINE_GRACE=${LOG_BACKUP_DEADLINE_GRACE_SECONDS:-30}  # a copy still running this long past its budget is stopped
 for rate in TPSLIMIT TRANSFERS; do
   if ! printf '%s' "${!rate}" | grep -Eq '^[1-9][0-9]?$'; then
     echo "log-backup: $rate must be a whole number from 1 to 99" >&2; exit 2
   fi
 done
-for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER; do
+for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER DEADLINE_GRACE SLICE_RESERVE; do
   # No leading zeros: bash would read 08 as octal and abort the arithmetic.
   if ! printf '%s' "${!numeric:-0}" | grep -Eq '^(0|[1-9][0-9]{0,4})$'; then
     echo "log-backup: $numeric must be a whole number of at most 5 digits without leading zeros" >&2; exit 2
@@ -156,6 +158,7 @@ acquire_lock() {
 }
 
 [ "$JITTER" -gt 0 ] && sleep $((RANDOM % (JITTER + 1)))
+RUN_START=$(date +%s)   # the budget is for copying: the start delay must not spend it (2026-11-07)
 if legacy_run_active || ! acquire_lock; then
   say "skipped: another backup run holds the lock (this is not a successful backup)"
   date -u +%FT%TZ > "$LOGDIR/log-backup.last-skip"
@@ -232,12 +235,21 @@ awk '/^[ \t]*(#|$)/ {next} {out=""; for (i = 1; i <= length($0); i++) {c = subst
 rm -rf "$STAGE/.rsync-tmp"
 say "stage size $(du -sk "$STAGE" 2>/dev/null | cut -f1) KiB"
 
+rate_limit_note() { # rate_limit_note LOG-OFFSET: name a Dropbox write rate limit seen since LOG-OFFSET, and count the
+  # other rclone uploads to this remote on the host, which share the account's write budget (the cause on 2026-11-07).
+  local from=$(( ${1:-0} + 1 )) others
+  tail -c +"$from" "$LOG" 2>/dev/null | grep -Eq 'too_many_write_operations|Too many requests or write operations' || return 0
+  others=$(ps -axo pid=,command= 2>/dev/null | awk -v remote="${BASE%%:*}:" \
+    '$2 ~ /(^|\/)rclone$/ && index($0, remote) && $0 !~ /--log-file/ {n++} END {print n+0}')
+  say "Dropbox write rate limit (too_many_write_operations) during this copy; other rclone uploads running now: $others (see: ps -axo pid,command | grep rclone)"
+}
+
 upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
   local p="$1" rel="$2" dst
   shift 2
   if [ -d "$p" ]; then dst="$R/$rel"; else dst="$R/$(dirname "$rel")"; fi
   args=(copy --dropbox-batch-mode sync --dropbox-batch-size 100 --tpslimit "$TPSLIMIT" --transfers "$TRANSFERS" --checkers 4
-    --checksum --retries 10 --retries-sleep 30s --low-level-retries 20 --contimeout 60s --timeout 300s --log-file "$LOG" --log-level NOTICE --exclude-from "$EXCLUDES" --ignore-case "$@")
+    --checksum --retries 3 --retries-sleep 30s --low-level-retries 20 --contimeout 60s --timeout 300s --log-file "$LOG" --log-level NOTICE --exclude-from "$EXCLUDES" --ignore-case "$@")
   if [ "${LOG_BACKUP_VERSIONS:-1}" != 0 ]; then args+=(--backup-dir "$R/versions/$STAMP/$rel"); fi
   local remaining
   # Dropbox can rate-limit (too_many_write_operations): retry the source with a pause before calling it a failure.
@@ -248,11 +260,27 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
     if [ $remaining -lt 20 ]; then
       say "run time budget (${BUDGET_SECONDS}s) used up before $rel; the next run continues"; ok=1; return
     fi
-    "$RCLONE" "${args[@]}" --max-duration "${remaining}s" -- "$p" "$dst" </dev/null; rc=$?
+    # this copy's slice: what is left, minus the time held back for the tier-1 sources after it (never under 20 s)
+    remaining=$(( remaining - ${RESERVE:-0} )); [ $remaining -ge 20 ] || remaining=20
+    log_mark=$(wc -c < "$LOG" 2>/dev/null | tr -d ' '); log_mark=${log_mark:-0}
+    # rclone's --max-duration does not cut short a Dropbox pacer wait (too_many_write_operations asks for 300 s), so a
+    # rate-limited copy overran the budget and later runs slipped past the 15 minute schedule (Mac, 2026-11-07).
+    # A watchdog stops this script's own copy DEADLINE_GRACE seconds past its share; partial progress is kept.
+    "$RCLONE" "${args[@]}" --max-duration "${remaining}s" -- "$p" "$dst" </dev/null &
+    copy_pid=$!
+    ( sleep $((remaining + DEADLINE_GRACE)) && kill -TERM "$copy_pid" 2>/dev/null && touch "$LOGDIR/.log-backup.deadline.$copy_pid" ) &
+    dog_pid=$!
+    wait "$copy_pid"; rc=$?
+    kill "$dog_pid" 2>/dev/null; wait "$dog_pid" 2>/dev/null
+    if [ -e "$LOGDIR/.log-backup.deadline.$copy_pid" ]; then
+      rm -f "$LOGDIR/.log-backup.deadline.$copy_pid"
+      say "copy of $rel stopped at the run deadline (${remaining}s + ${DEADLINE_GRACE}s grace); partial, last-ok withheld"
+      rate_limit_note "$log_mark"; ok=1; return
+    fi
     if [ $rc -eq 0 ]; then copied=1; break; fi
     if [ $rc -eq 8 ] || [ $rc -eq 10 ]; then
       # --max-transfer (8) or --max-duration (10) reached: partial progress is kept, the next run continues.
-      say "budget reached for $rel (rclone exit $rc); partial, last-ok withheld"; ok=1; return
+      say "budget reached for $rel (rclone exit $rc); partial, last-ok withheld"; rate_limit_note "$log_mark"; ok=1; return
     fi
     attempt=$((attempt + 1))
     [ $attempt -le "${LOG_BACKUP_RETRIES:-2}" ] || break
@@ -267,12 +295,16 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
       if [ -n "$(find "$HOME/$rel" -type f -print -quit 2>/dev/null)" ]; then primary=$((primary + 1)); fi ;;
     esac
   else
-    say "copy failed after $attempt attempts: $rel"; ok=1
+    say "copy failed after $attempt attempts: $rel"; rate_limit_note "$log_mark"; ok=1
   fi
 }
 
+later=0
+for src in "${LIVE[@]}"; do [ -e "$HOME/$src" ] && later=$((later + 1)); done
 for src in "${LIVE[@]}"; do
   [ -e "$HOME/$src" ] || [ -L "$HOME/$src" ] || continue
+  later=$((later - 1)); [ $later -ge 0 ] || later=0
+  RESERVE=$(( later * SLICE_RESERVE ))
   if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; continue; fi
   snap="$STAGE/$src"
   mkdir -p "$(dirname "$snap")" || { say "cannot stage $src"; ok=1; continue; }
@@ -316,6 +348,7 @@ if [ -e "$bulk_try" ]; then
   fi
 fi
 [ $bulk_ran -eq 1 ] && : > "$bulk_try"
+RESERVE=0
 for src in "${sources_bulk[@]+"${sources_bulk[@]}"}"; do
   [ -e "$HOME/$src" ] || [ -L "$HOME/$src" ] || continue
   if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; continue; fi

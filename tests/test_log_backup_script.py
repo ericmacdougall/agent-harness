@@ -45,6 +45,16 @@ if argv and argv[0] == "copy":
     match = os.environ.get("FAKE_FAIL_MATCH")
     if match and any(match in a for a in argv):
         sys.exit(1)
+    note = os.environ.get("FAKE_RCLONE_LOG_TEXT")  # what real rclone writes to its --log-file (e.g. a rate limit)
+    if note and "--log-file" in argv:
+        with open(argv[argv.index("--log-file") + 1], "a") as h:
+            h.write(note + "\\n")
+    hang = float(os.environ.get("FAKE_HANG", "0"))  # a pacer wait that ignores --max-duration
+    hang_match = os.environ.get("FAKE_HANG_MATCH")
+    if hang and (not hang_match or any(hang_match in a for a in argv)):
+        time.sleep(hang)
+    if os.environ.get("FAKE_EXIT_AFTER_NOTE") and note:
+        sys.exit(int(os.environ["FAKE_EXIT_AFTER_NOTE"]))
     real = os.environ.get("FAKE_DELEGATE")
     if real:
         os.execv(real, [real] + argv)
@@ -909,6 +919,52 @@ class Failure(Case):
         for host in ("a b", "-x", "../x", "a/b", "..", ".", ".hidden"):
             done = self.run_script(LOG_BACKUP_HOST=host)
             self.assertEqual(done.returncode, 2, host)
+
+
+class Contention(Case):
+    """Mac 2026-11-07: other uploads to the same Dropbox account used its write budget. Each too_many_write_operations
+    cost a 300 s pacer wait that --max-duration did not cut short, runs overran the 780 s budget and slipped past the
+    900 s schedule, and the log said only "sources=0"."""
+
+    def test_a_copy_that_ignores_max_duration_is_stopped_near_the_budget(self):
+        start = time.time()
+        done = self.run_script(LOG_BACKUP_BUDGET_SECONDS="25", LOG_BACKUP_DEADLINE_GRACE_SECONDS="3",
+                               FAKE_HANG="90", FAKE_RCLONE_LOG_TEXT="x")
+        elapsed = time.time() - start
+        self.assertLess(elapsed, 60, "the run must end near its budget, not after the hung copy")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.last_ok().exists())
+        self.assertIn("stopped at the run deadline", (self.logs / "log-backup.log").read_text())
+
+    def test_jitter_does_not_spend_the_copy_budget(self):
+        # A start delay of up to 1 s with a 21 s budget leaves under 20 s on the old code about half the time, which
+        # skips every source. Eight runs make a pass on the old code a 1-in-256 event.
+        for attempt in range(8):
+            done = self.run_script(LOG_BACKUP_JITTER_SECONDS="1", LOG_BACKUP_BUDGET_SECONDS="21")
+            self.assertEqual(done.returncode, 0, "attempt %d: %s" % (attempt, done.stderr))
+            self.assertTrue(self.last_ok().exists(), attempt)
+            os.unlink(self.last_ok())
+
+    def test_a_hung_projects_copy_leaves_time_for_the_later_tier1_sources(self):
+        start = time.time()
+        done = self.run_script(LOG_BACKUP_BUDGET_SECONDS="60", LOG_BACKUP_SLICE_RESERVE_SECONDS="10",
+                               LOG_BACKUP_DEADLINE_GRACE_SECONDS="2", FAKE_HANG="300", FAKE_HANG_MATCH=".claude/projects")
+        self.assertLess(time.time() - start, 100)
+        log = (self.logs / "log-backup.log").read_text()
+        self.assertIn("copy of .claude/projects stopped at the run deadline", log)
+        later = [a for a in self.copies() if any(".claude/wals" in x for x in a)]
+        self.assertTrue(later, "the WALs still get their own slice after a hung projects copy")
+        self.assertNotIn("used up before .claude/wals", log)
+        self.assertIn("sources=", log)
+        self.assertNotEqual(done.returncode, 0)  # projects is partial, so the run is still not fresh
+
+    def test_a_rate_limited_copy_names_the_cause(self):
+        done = self.run_script(FAKE_RCLONE_LOG_TEXT="ERROR : upload failed: too_many_write_operations",
+                               FAKE_EXIT_AFTER_NOTE="1", LOG_BACKUP_RETRIES="0")
+        self.assertNotEqual(done.returncode, 0)
+        log = (self.logs / "log-backup.log").read_text()
+        self.assertIn("Dropbox write rate limit", log)
+        self.assertRegex(log, r"other rclone uploads running now: \d+")
 
 
 if __name__ == "__main__":
