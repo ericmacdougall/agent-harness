@@ -492,6 +492,42 @@ class RunGates(unittest.TestCase):
         with mock.patch.object(guard, "path_size", fake_size({"/bigsrc": 3 * GIB, cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB})):
             self.assertEqual(self.call("HARNESS_LOCAL_OK='one local step' cp -r /bigsrc ./c2", cwd=cwd, agent="agentD")[0], 2)
 
+    def scp_case(self):
+        """goodqa#15067: the session cwd is an over-budget owner dir; the copy lands in another owner's dir."""
+        cwd = self.work_cwd()
+        self.budget_record("sess/agent-A")
+        dest = Path(self.home.name, ".agent-harness", "work", "sess", "agent-B", "hwq")
+        dest.mkdir(parents=True)
+        sizes = fake_size({cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB})
+        return cwd, str(dest), sizes
+
+    def test_a_small_scp_from_the_mac_mini_is_not_refused_by_the_cwd_budget(self):
+        cwd, dest, sizes = self.scp_case()
+        with mock.patch.object(guard, "path_size", sizes), \
+                mock.patch.object(guard, "remote_path_size", lambda spec: 40 * 1024):
+            code, err = self.call(f"scp -q ah-mac-mini:hwq/launch-1.png {dest}/", cwd=cwd)
+            self.assertEqual(code, 0, err)
+            code, err = self.call(f"scp -q -r ah-mac-mini:hwq {dest}/d", cwd=cwd)
+            self.assertEqual(code, 0, err)
+
+    def test_a_heavy_copy_into_the_over_budget_dir_is_still_refused_with_its_reason(self):
+        # NEG: the budget still applies where the bytes land, by `cd` + relative path or by absolute path.
+        cwd, dest, sizes = self.scp_case()
+        with mock.patch.object(guard, "path_size", sizes), \
+                mock.patch.object(guard, "remote_path_size", lambda spec: 3 * GIB):
+            for cmd in (f"scp -r ah-mac-mini:big {cwd}/big", f"cd {dest} && cd {cwd} && scp -r ah-mac-mini:big ./big"):
+                code, err = self.call(cmd, cwd=dest)
+                self.assertEqual(code, 2, cmd)
+                self.assertIn("over its", err, cmd)
+                self.assertIn("copies at least 3.0 GiB", err, cmd)  # the copy rule's own reason is shown too
+
+    def test_a_download_from_outside_the_fleet_still_counts_as_heavy(self):
+        cwd, dest, sizes = self.scp_case()
+        with mock.patch.object(guard, "path_size", sizes):
+            code, err = self.call(f"scp -q somehost:x.png {dest}/", cwd=cwd)
+        self.assertEqual(code, 2)
+        self.assertIn("outside the measured fleet", err)
+
     def test_over_budget_owner_cannot_start_a_local_build_either(self):
         cwd = self.work_cwd()
         self.budget_record("sess/agent-A")

@@ -306,6 +306,9 @@ def positional(args, value_flags=()):
 GIB = 1024 ** 3
 NET_BUDGET_SECONDS = 5.0  # all ssh/gh/git/rclone/ps lookups of one decision together (the hook timeout is 10 s)
 _NET_DEADLINE = [None]
+# Where this decision's copy and build findings write on the Mac (goodqa#15067): the disk-budget block judges the owner
+# dir the bytes land in, not the session cwd. Reset by decide() for every decision.
+_WRITE_DIRS = []
 
 
 def net_left(want: float) -> float:
@@ -380,7 +383,7 @@ def path_size(path: str, cap: int = None, seconds: float = COPY_WALK_SECONDS):
 def measured_hosts():
     """Hosts the guard may `ssh du` to size a remote source: the fleet (dev2/T2) plus heavy_job_guard.json
     "measure_hosts". Any other host is not contacted and its source is not counted."""
-    hosts = {"dev2", "t2", "t2-dev"}
+    hosts = {"dev2", "t2", "t2-dev", "ah-mac-mini"}  # the user's own unix hosts (fleet.md); Windows hosts have no du
     try:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
         if os.path.exists(path):
@@ -612,6 +615,7 @@ def classify_copy(low, args, ctx):
         deref = any(a in ("--copy-links", "--dereference") or re.match(r"^-[A-Za-z]*[LH][A-Za-z]*$", a) for a in args
                     if a.startswith("-") and a not in values)
         total, unknown = sum_sources(sources, ctx, thr, remote_ok=remote_tool, deref=deref)
+        ctx.write_dir = resolve(os.path.expanduser(dest), ctx.cwd)
         return finish_copy(low, total, unknown, thr)
     if low == "tar" and args:
         mode, archive, srcs, to_stdout = parse_tar(args)
@@ -1758,9 +1762,13 @@ def scan_state(command: str, cwd: str, depth: int = 0, parent=None):
         ctx.capped = False
         if rest and rest[0] in ("for", "while", "until"):
             ctx.loop = True
+        ctx.write_dir = None
         result = classify(argv, ctx, depth)
         if result:
             findings.append((result[0], result[1], ctx.capped, segment))
+            if result[0] in ("copy", "build"):
+                # A copy with a known destination writes there; anything else writes where it runs (cd included).
+                _WRITE_DIRS.append(getattr(ctx, "write_dir", None) or ctx.cwd)
     if getattr(ctx, "lane_uploads", 0) >= 1 and getattr(ctx, "loop", False) and has_background(text):
         findings.append(("dropbox-lane", "a backgrounded rclone upload to Dropbox inside a loop runs several uploads "
                          "at once; the lane is one upload at a time", False, command[:2000]))
@@ -1818,10 +1826,15 @@ SEVERITY = {"allow": 0, "warn": 1, "deny": 2}
 
 def decide(command: str, cwd: str = None, modes=None):
     """_decide with the shared lookup budget closed afterwards, so later callers in this process are unaffected."""
+    del _WRITE_DIRS[:]
     try:
-        return _decide(command, cwd, modes)
+        decision = _decide(command, cwd, modes)
+        if _WRITE_DIRS:
+            decision = dict(decision, write_dirs=list(dict.fromkeys(_WRITE_DIRS)))
+        return decision
     finally:
         _NET_DEADLINE[0] = None
+        del _WRITE_DIRS[:]
 
 
 def _decide(command: str, cwd: str = None, modes=None):
@@ -2269,12 +2282,19 @@ def run(raw: bytes) -> int:
     action = decision["action"]
     owner = owner_of(payload)
     if decision.get("rule") in ("copy", "build") and action != "warn":
-        budget = over_budget(payload.get("cwd"))
+        # goodqa#15067: judge the owner dir each heavy write lands in (a copy's destination, else where it runs after
+        # any `cd`), not the session cwd, which may be an unrelated over-budget checkout.
+        budget = None
+        for where in decision.get("write_dirs") or [payload.get("cwd")]:
+            budget = over_budget(where)
+            if budget:
+                break
         if budget:  # over its disk budget: new heavy local writes stop, hatch or not, until it frees space or routes
             gib = lambda n: f"{int(n) / GIB:.1f}"  # noqa: E731
-            sys.stderr.write(routed(f"Heavy-job guard [{decision['rule']}]: owner work dir {budget['path_key']} is over its {gib(budget['budget_bytes'])} GiB "
-                             f"disk budget ({gib(budget['used_bytes'])} GiB used). Free space there (nothing is deleted for you) or "
-                             "run the heavy job on dev2/T2 (ssh dev2 '<command>').\n"))
+            sys.stderr.write(routed(scrub_url(f"Heavy-job guard [{decision['rule']}]: owner work dir {budget['path_key']} is over its {gib(budget['budget_bytes'])} GiB "
+                             f"disk budget ({gib(budget['used_bytes'])} GiB used), and this {decision['rule']} writes there "
+                             f"({str(decision.get('detail', ''))[:300]}). Free space there (nothing is deleted for you) or "
+                             "run the heavy job on dev2/T2 (ssh dev2 '<command>').\n")))
             log_event({"event": "deny-over-budget", "rule": decision["rule"]})
             ring_event(f"heavy:{event_class(decision)}:{owner}", "high", f"{owner} refused a heavy {decision['rule']}: over disk budget",
                        dict(copy_event_detail(payload, decision), used_bytes=budget["used_bytes"],

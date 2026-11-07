@@ -49,6 +49,10 @@ group by pull request.
 - Test fixtures and docs no longer contain a real private address, username, or home path.
 
 ### Fixed
+- heavy_job_guard: the per-owner disk-budget block now judges the owner dir a copy writes into (its destination,
+  or the cwd after `cd`), not the session cwd, and its message keeps the copy rule's reason. The Mac mini
+  (`ah-mac-mini`) is in the default measured fleet, so a small download from it is sized instead of counted as
+  heavy (goodqa#15067).
 - Removed a real Tailscale-range address and hostname from a test in HEAD (F-008). Git
   history still contains it; it was not rewritten.
 
