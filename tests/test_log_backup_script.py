@@ -1065,5 +1065,104 @@ class Contention(Case):
         self.assertFalse((self.logs / ".log-backup.deadline.stale").exists(), "leftover deadline markers are cleared")
 
 
+class BulkTier(Case):
+    """Mac 2026-11-07 (goodqa#15062): tier 1 used the whole budget, so the hourly bulk attempts at 03:24, 04:47 and
+    06:00 copied nothing, failed the run and still spent the hour; bulk-last-ok never appeared and check stayed 3."""
+
+    def bulk_try(self):
+        return self.logs / "log-backup.bulk-last-try"
+
+    def bulk_copies(self):
+        return [c for c in self.copies() if "--min-age" in c]
+
+    def test_bulk_tier_with_no_time_left_is_deferred_not_spent(self):
+        done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600", LOG_BACKUP_BUDGET_SECONDS="30",
+                               LOG_BACKUP_SLICE_RESERVE_SECONDS="3", LOG_BACKUP_DEADLINE_GRACE_SECONDS="1",
+                               LOG_BACKUP_KILL_GRACE_SECONDS="1", FAKE_HANG="300")
+        self.assertNotEqual(done.returncode, 0)  # tier 1 is partial
+        log = (self.logs / "log-backup.log").read_text()
+        self.assertIn("bulk tier deferred", log)
+        self.assertNotIn("bulk exit=1", log)
+        self.assertNotIn("git trees excluded", log, "the work-tree scan must not start with no time left")
+        self.assertFalse(self.bulk_try().exists(), "a deferred bulk tier must not spend the hourly slot")
+        self.assertIn("bulk=0", (self.logs / "log-backup.last-run").read_text())
+        open(self.calls, "w").close()
+        again = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600")  # the next run has time: bulk runs now
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertTrue(self.bulk_copies(), "the next run with time left attempts the bulk tier")
+        self.assertTrue(self.bulk_ok().exists())
+
+    def test_bulk_pass_cut_short_by_the_budget_continues_next_run(self):
+        done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600", FAKE_EXIT="10", FAKE_EXIT_MATCH="--min-age")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.bulk_ok().exists())
+        self.assertFalse(self.bulk_try().exists(), "a pass stopped on the budget is unfinished, not an hourly attempt")
+        self.assertIn("bulk tier stopped on the run budget", (self.logs / "log-backup.log").read_text())
+        open(self.calls, "w").close()
+        again = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertTrue(self.bulk_copies())
+        self.assertTrue(self.bulk_ok().exists())
+
+    def test_a_real_failure_plus_a_budget_stop_still_waits_for_the_gap(self):
+        # NEG (PR #118 review F1): archived sessions fail for real, the work tree then stops on its transfer cap. The
+        # pass is failed, not just unfinished, so the hourly gap must hold while the account may be rate-limited.
+        done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600", FAKE_FAIL_MATCH="archived_sessions",
+                               LOG_BACKUP_RETRIES="0", FAKE_EXIT="8", FAKE_EXIT_MATCH="--max-transfer")
+        self.assertNotEqual(done.returncode, 0)
+        log = (self.logs / "log-backup.log").read_text()
+        self.assertIn("copy failed after", log)
+        self.assertIn("budget reached for .agent-harness/work", log)
+        self.assertNotIn("bulk tier stopped on the run budget", log)
+        self.assertTrue(self.bulk_try().exists())
+        open(self.calls, "w").close()
+        self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600")
+        self.assertEqual(self.bulk_copies(), [])
+
+    def test_the_work_scan_waits_until_its_measured_time_fits(self):
+        # PR #118 review F2/F3: the git-tree scan is not time-bounded. With a recorded scan time that does not fit
+        # in what is left, the scan must not start (it would run every 15 minutes and copy nothing).
+        self.logs.mkdir(parents=True, exist_ok=True)
+        # 60 s budget: about 38 s of copy time is left after tier 1, enough for a slice (20 s) but not slice + 30 s scan.
+        (self.logs / "log-backup.work-scan-seconds").write_text("30\n")
+        done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600", LOG_BACKUP_BUDGET_SECONDS="60")
+        log = (self.logs / "log-backup.log").read_text()
+        self.assertNotIn("git trees excluded", log)
+        self.assertIn("used up before .agent-harness/work (its scan needs about 30s)", log)
+        self.assertTrue([c for c in self.bulk_copies() if any("archived_sessions" in x for x in c)])
+        self.assertFalse([c for c in self.bulk_copies() if any(x.endswith(".agent-harness/work") for x in c)])
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.bulk_try().exists(), "an unfinished pass continues next run")
+
+    def test_one_slow_scan_does_not_lock_the_work_tree_out(self):
+        # PR #118 review R2-1: a stored 770 s (one slow scan) above the cap of half the budget must not stop a run
+        # with most of its time free from scanning, or the file would never be rewritten.
+        self.logs.mkdir(parents=True, exist_ok=True)
+        (self.logs / "log-backup.work-scan-seconds").write_text("770\n")
+        done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("git trees excluded", (self.logs / "log-backup.log").read_text())
+        self.assertTrue([c for c in self.bulk_copies() if any(x.endswith(".agent-harness/work") for x in c)])
+        self.assertLess(int((self.logs / "log-backup.work-scan-seconds").read_text()), 770)
+
+    def test_the_work_scan_time_is_measured(self):
+        done = self.run_script()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertRegex((self.logs / "log-backup.work-scan-seconds").read_text(), r"^[0-9]+\n$")
+        self.assertIn("git trees excluded", (self.logs / "log-backup.log").read_text())
+
+    def test_a_failed_bulk_pass_still_waits_for_the_gap(self):
+        # NEG: only a budget stop skips the gate; an ordinary failure keeps the hourly limit on write load.
+        done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600", FAKE_FAIL_MATCH="archived_sessions",
+                               LOG_BACKUP_RETRIES="0")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertTrue(self.bulk_try().exists())
+        open(self.calls, "w").close()
+        again = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(self.bulk_copies(), [])
+        self.assertIn("bulk tier skipped", (self.logs / "log-backup.log").read_text())
+
+
 if __name__ == "__main__":
     unittest.main()
