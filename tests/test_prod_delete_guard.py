@@ -1225,3 +1225,71 @@ class KimiPrcR2(Case):
         self.deny("psql -h prod-db -c \"SELECT 'x'; DELETE FROM users\"")
         self.deny("ssh prod-db \"psql -c 'DELETE FROM users'\"")
 
+    # ---- red-team review of 2f508e5 (agent a84537ae62d582cfc): R1 crash, R2 string sinks, R3 remote files, R4 lexer
+
+    def test_r1_whitespace_words_cannot_crash_the_guard_open(self):
+        for command in ("psql -h prod-db.example.com -c 'DELETE FROM users' ' '",
+                        "' ' ; psql -h prod-db -c 'DELETE FROM users'",
+                        'psql -h prod-db -c "DELETE FROM users" "\n"',
+                        '"   " psql -h prod-db -c "DELETE FROM users"',
+                        'bash -c "\' \' ; psql -h prod-db -c \'DELETE FROM users\'"'):
+            with self.subTest(command=command):
+                self.deny(command)
+
+    def test_r2_sql_that_runs_a_string_is_judged_with_its_strings(self):
+        for command in ('mysql -h prod-db -e "PREPARE s FROM \'DELETE FROM users\'; EXECUTE s;"',
+                        'mysql -h prod-db -e "SET @q=\'DELETE FROM users\'; PREPARE s FROM @q; EXECUTE s;"',
+                        'psql -h prod-db -c "CREATE FUNCTION f() RETURNS void AS \'DELETE FROM users\' LANGUAGE sql; SELECT f();"',
+                        'psql -h prod-db -c "CREATE PROCEDURE p() AS \'TRUNCATE users\' LANGUAGE sql; CALL p();"',
+                        'psql -h prod-db -c "SELECT dblink_exec(\'dbname=app\', \'DROP TABLE users\')"',
+                        'psql -h prod-db -c "COPY t FROM PROGRAM \'psql -c DELETE FROM users\'"',
+                        "psql -h prod-db -c '\\! psql -c \"DELETE FROM users\"'",
+                        'mysql -h prod-db -e "system mysql -e \'DELETE FROM users\'"',
+                        "psql -h prod-db -c \"DO 'BEGIN EXECUTE ''DELETE FROM users''; END'\""):
+            with self.subTest(command=command):
+                self.deny(command)
+        self.put("gexec.sql", "SELECT 'DELETE FROM users' \\gexec\n")
+        self.deny("psql -h prod-db -f gexec.sql")
+        self.put("setvar.sql", "\\set q 'DELETE FROM users'\n:q;\n")
+        self.deny("psql -h prod-db -f setvar.sql")
+        self.put("prep.sql", "PREPARE s FROM 'DELETE FROM users'; EXECUTE s;\n")
+        self.deny("mysql -h prod-db < prep.sql")
+        # a plain string is still a string
+        self.allow("psql -h prod-db -c \"SELECT 'DELETE FROM users' AS example\"")
+
+    def test_r3_a_file_named_on_the_far_side_of_a_remote_runner_is_unread(self):
+        self.put("a.sql", "SELECT 1;\n")
+        for command in ("ssh dev2 'cd /srv && psql -h prod-db -f a.sql'",
+                        "ssh dev2 'export X=1; psql -h prod-db -f a.sql'",
+                        "docker compose exec db psql -h prod-db -f a.sql",
+                        "docker container exec db psql -h prod-db -f a.sql",
+                        "kubectl -n prod exec pg-0 -- psql -h prod-db -f a.sql"):
+            with self.subTest(command=command):
+                self.deny(command)
+        self.allow("psql -h prod-db -f a.sql")
+
+    def test_r4_doubled_quotes_and_escapes_mask_in_linear_time(self):
+        body = "SELECT '" + "''" * 100000 + "';"
+        for reading in pdg.SQL_READINGS:
+            t0 = time.monotonic()
+            pdg._mask_sql(body, *reading[:5])
+            self.assertLess(time.monotonic() - t0, 0.5, reading)
+        body = "SELECT '" + "\\x" * 100000 + "';"
+        t0 = time.monotonic()
+        pdg._mask_sql(body, True, True, True, False, True)
+        self.assertLess(time.monotonic() - t0, 0.5)
+
+    def test_r5_shell_decoding_and_more_remote_runners(self):
+        self.put("a.sql", "SELECT 1;\n")
+        self.put("c.sql", "\\CD sub\n\\i a.sql\n")
+        for command in ("lxc exec box -- psql -h prod-db -f a.sql",
+                        "docker run --rm -v /srv:/srv postgres psql -h prod-db -f a.sql",
+                        "mosh dev2 -- psql -h prod-db -f a.sql",
+                        "psql -h prod-db -f c.sql",
+                        'psql -h prod-db -c "DEL\\\nETE FROM users"',
+                        "psql -h prod-db -c DELETE\\ FR\\\nOM\\ users",
+                        "psql -h prod-db -c $'\\x44ELETE FROM users'",
+                        'bash -c "psql -h prod-db -c \\\'DELETE FROM users\\\' \' \'"'):
+            with self.subTest(command=command):
+                self.deny(command)
+

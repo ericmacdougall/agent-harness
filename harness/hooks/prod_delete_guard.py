@@ -373,11 +373,20 @@ def _mask_sql(text: str, backslash=True, nested=True, bracket=True, hash_comment
             continue
         closer = "]" if ch == "[" else ch
         pos, closed = i + 1, False
+        esc = -1  # the next backslash at or after pos, searched again only once pos passes it (review R4)
+        nxt = -1
         while pos < n:
-            nxt = text.find(closer, pos)
+            steps += 1
+            if steps % 4096 == 0:
+                _tick()
+            if nxt < pos:
+                nxt = text.find(closer, pos)
             if backslash and ch != "[":
-                esc = text.find("\\", pos)
-                if 0 <= esc < (nxt if nxt >= 0 else n) and esc + 1 < n:
+                if esc < pos:
+                    esc = text.find("\\", pos)
+                    if esc < 0:
+                        esc = n
+                if esc < (nxt if nxt >= 0 else n) and esc + 1 < n:
                     pos = esc + 2
                     continue
             if nxt < 0:
@@ -481,7 +490,8 @@ SHELL_PROGRAMS = CLIENT_NAMES | {"ssh", "bash", "sh", "zsh", "dash", "ksh", "doc
 SHELL_LEVEL_LIMIT = 4
 SHELL_WORD_LIMIT = 20000
 SEPARATOR_WORDS = {"|", "||", "&&", ";", "&", "|&", ";;"}
-CONTAINER_RUNNERS = {"docker", "podman", "nerdctl", "kubectl"}
+CONTAINER_RUNNERS = {"docker", "podman", "nerdctl", "kubectl", "lxc", "incus"}
+ANSI_C = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
 # A runner that joins its arguments into one string for another shell to parse again (ssh, eval): what the client
 # finally receives is not the local shell word, so no SQL argument there is read as SQL with its quotes kept.
 REPARSING_RUNNERS = {"ssh", "eval"}
@@ -498,9 +508,20 @@ SQL_FILE_FLAGS = {
     "wrangler": (None, "--file", 6),
 }
 SQL_SOURCE_ANY = re.compile(r"(?im)(?:^|;)\s*(?:source|\\\.)\s+['\"]?([^\s;'\"]+)")
-PSQL_CD = re.compile(r"\\cd\b")
+PSQL_CD = re.compile(r"\\cd\b", re.I)
 DO_BODY = re.compile(r"(?is)\bDO\s+(?:LANGUAGE\s+\w+\s+)?(E?)'((?:[^'\\]|''|\\.)*)'")
 DO_DEPTH = 3
+
+
+def _runner_exec(words, i):
+    """The index of `exec` when words[i] is a container runner running one: `docker exec`, `docker compose exec`,
+    `docker container exec`, `kubectl -n ns exec` (review R3). None otherwise."""
+    for j in range(i + 1, min(i + 6, len(words))):
+        if words[j] == "exec" or (words[j] == "run" and words[i] != "kubectl"):
+            return j
+        if words[j] in SEPARATOR_WORDS:
+            return None
+    return None
 
 
 class CommandParts:
@@ -566,9 +587,9 @@ def _command_parts(command: str) -> CommandParts:
                 i += 1
                 continue
             base = w.lstrip("\\").rsplit("/", 1)[-1]
-            if base == "ssh":
+            if base in ("ssh", "mosh"):
                 here_remote = here_reparsed = True
-            elif base in CONTAINER_RUNNERS and i + 1 < len(words) and words[i + 1] == "exec":
+            elif base in CONTAINER_RUNNERS and _runner_exec(words, i) is not None:
                 here_remote = True
             elif base == "eval":
                 here_reparsed = True
@@ -599,9 +620,12 @@ def _command_parts(command: str) -> CommandParts:
                 target = w[1:] or (words[i + 1] if i + 1 < len(words) else "")
                 if target:
                     parts.files.append((target, True))
-            if (level < SHELL_LEVEL_LIMIT and any(c.isspace() for c in w)):
-                head = w.lstrip().split(None, 1)[0].strip("'\"\\")
-                if head.rsplit("/", 1)[-1] in SHELL_PROGRAMS or re.match(r"^[A-Za-z_]\w*=", head):
+            if level < SHELL_LEVEL_LIMIT and w.strip() and any(c.isspace() for c in w):
+                head = w.split(None, 1)[0].strip("'\"\\")
+                # Behind ssh or a container runner every multi-word value can be a command for the far side
+                # (`ssh h 'cd /srv && psql -f a.sql'`), so it is walked whatever it starts with (review R3).
+                if (here_remote or head.rsplit("/", 1)[-1] in SHELL_PROGRAMS
+                        or re.match(r"^[A-Za-z_]\w*=", head)):
                     out.append(walk(w, level + 1, here_remote, here_reparsed))
                     i += 1
                     continue
@@ -609,7 +633,12 @@ def _command_parts(command: str) -> CommandParts:
             i += 1
         return " ".join(out)
 
-    parts.residual = walk(command, 0, False, False)
+    try:
+        parts.residual = walk(command, 0, False, False)
+    except DeadlineExceeded:
+        raise
+    except Exception:  # noqa: BLE001 - a parser error must never become an allow (review R1)
+        parts.certain = False
     if not parts.certain:
         parts.residual = command
     if len(_PARTS_CACHE) > 16:
@@ -686,7 +715,19 @@ def _judge_text(text: str):
     return None
 
 
+STRING_SINKS = re.compile(
+    r"(?is)\b(?:PREPARE|EXECUTE|EXEC|CALL|DO|DBLINK\w*|SYSTEM|QUERY_TO_XML|"
+    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE|TRIGGER|RULE|EVENT|AGGREGATE))\b"
+    r"|\bCOPY\b[^;]*\bPROGRAM\b|\\(?:gexec|gset|g|!|set)\b|\\!|(?<![:\w]):['\"]?[A-Za-z_]\w*")
+
+
 def _judge_sql(text: str):
+    """SQL judged with strings masked, unless it can run a string as SQL or shell (review R2): then every quote is
+    stripped first, so the string is read as the statement it becomes."""
+    if STRING_SINKS.search(text):
+        found = _shell_match(text)
+        if found:
+            return found
     for t in [text] + _do_bodies(text):
         found = _judge_text(t)
         if found:
@@ -712,6 +753,12 @@ def destructive_match(sql: str, pieces=None):
             if found:
                 return found
             continue
+        # What bash removes or decodes before a client sees the text: a backslash-newline continuation and $'..'
+        # escapes (review: present at base too). Each is judged the old way as well; it can only add denies.
+        for variant in _shell_decoded(piece):
+            found = _shell_match(variant)
+            if found:
+                return found
         parts = _command_parts(piece)
         if not parts.certain:
             found = _shell_match(piece)
@@ -725,7 +772,27 @@ def destructive_match(sql: str, pieces=None):
             found = _judge_sql(text)
             if found:
                 return found
+            if any(_mask_sql(text, *reading[:5])[1] for reading in SQL_READINGS):
+                # a value that leaves a quote or comment open was split differently than the guard assumed:
+                # judge the whole command the old way (review: nested_blank_bash)
+                found = _shell_match(piece)
+                if found:
+                    return found
     return None
+
+
+def _shell_decoded(command: str) -> list:
+    out = []
+    if "\\\n" in command:
+        out.append(command.replace("\\\n", ""))
+    if "$'" in command:
+        def decode(m):
+            try:
+                return m.group(1).encode("latin-1", "backslashreplace").decode("unicode_escape")
+            except (UnicodeDecodeError, ValueError):
+                return m.group(1)
+        out.append(ANSI_C.sub(lambda m: decode(m), command))
+    return out
 
 
 def _resolve_path(raw: str, cwd) -> str:
@@ -1293,10 +1360,11 @@ def targets_production(command: str, env=None, home=None, cwd=None):
             if not certain:
                 add("ssh whose destination cannot be established (options, ssh config) running a database "
                     "client", [])
-        if base in CONTAINER_RUNNERS and i + 1 < len(words) and words[i + 1] == "exec":
+        exec_at = _runner_exec(words, i) if base in CONTAINER_RUNNERS else None
+        if exec_at is not None:
             # podman, nerdctl and kubectl exec name the container or pod the same way (kubectl adds -c/-n)
-            box = _after(words, i + 1, DOCKER_EXEC_OPTS_WITH_VALUE | KUBECTL_EXEC_OPTS_WITH_VALUE)
-            if box and _prod(box) and later_client[min(i + 2, len(words))]:
+            box = _after(words, exec_at, DOCKER_EXEC_OPTS_WITH_VALUE | KUBECTL_EXEC_OPTS_WITH_VALUE)
+            if box and _prod(box) and later_client[min(exec_at + 1, len(words))]:
                 add("%s exec into a prod container (%s) running a database client" % (base, box), [box])
     if not why:
         return "", []
