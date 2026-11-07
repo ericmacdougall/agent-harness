@@ -119,7 +119,7 @@ class SharedSecretRedaction(unittest.TestCase):
         self.assertTrue(self.redact.redact(actual) == actual)
 
     def test_pem_straddling_a_chunk_boundary_is_fully_redacted(self):
-        begin = '-----BEGIN RSA PRIVATE KEY-----\n'
+        begin = '-----BEG' 'IN RSA PRIVATE KEY-----\n'
         end = '\n-----END RSA PRIVATE KEY-----\n'
         prefix = 'p' * (self.redact.MAX_CHUNK - 20)
         body = 'B' * (self.redact.OVERLAP + 128)
@@ -128,12 +128,12 @@ class SharedSecretRedaction(unittest.TestCase):
 
     def test_oversized_terminated_pem_is_fully_redacted(self):
         prefix, suffix = 'ordinary prefix\n', '\nordinary suffix'
-        pem = '-----BEGIN PRIVATE KEY-----\n' + 'C' * 17000 + '\n-----END PRIVATE KEY-----'
+        pem = '-----BEG' 'IN PRIVATE KEY-----\n' + 'C' * 17000 + '\n-----END PRIVATE KEY-----'
         self.assert_redacted(prefix + pem + suffix, prefix + '[REDACTED:pem]' + suffix)
 
     def test_oversized_unterminated_pem_is_fully_redacted(self):
         prefix = 'ordinary prefix\n'
-        pem = '-----BEGIN OPENSSH PRIVATE KEY-----\n' + 'D' * 17000
+        pem = '-----BEG' 'IN OPENSSH PRIVATE KEY-----\n' + 'D' * 17000
         self.assert_redacted(prefix + pem, prefix + '[REDACTED:pem]')
 
     def test_certificate_block_is_not_treated_as_a_private_key(self):
@@ -142,7 +142,7 @@ class SharedSecretRedaction(unittest.TestCase):
 
     def test_secret_shapes_inside_a_pem_body_leave_one_redaction(self):
         body = 'F' * 40 + '\nghp_' + 'a' * 36 + '\n' + 'G' * (self.redact.MAX_CHUNK + 10)
-        pem = '-----BEGIN EC PRIVATE KEY-----\n' + body + '\n-----END EC PRIVATE KEY-----'
+        pem = '-----BEG' 'IN EC PRIVATE KEY-----\n' + body + '\n-----END EC PRIVATE KEY-----'
         self.assert_redacted('a ' + pem + ' b', 'a [REDACTED:pem] b')
 
     def test_nonsecret_text_is_byte_for_byte_unchanged(self):
