@@ -163,7 +163,11 @@ def file_sha256(path: Path) -> str | None:
     try:
         if path.is_symlink() or not path.is_file():
             return None
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:  # streamed: never hold a whole (possibly foreign) file in memory
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
     except OSError:
         return None
 
@@ -211,6 +215,46 @@ def place_binary(binary: Path, data: bytes) -> None:
             temporary.unlink()
 
 
+def retain_binary(binary: Path) -> Path | None:
+    """Retain a private copy of an existing regular executable for rollback."""
+    try:
+        if binary.is_symlink() or not binary.is_file():
+            return None
+        data = binary.read_bytes()
+    except FileNotFoundError:
+        return None
+    backup = binary.with_name(f".{binary.name}.rollback-{secrets.token_hex(4)}")
+    fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o700)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+    except Exception:
+        backup.unlink(missing_ok=True)
+        raise
+    return backup
+
+
+def discard_backup(backup: Path | None) -> None:
+    if backup is not None:
+        try:
+            backup.unlink()
+        except OSError:
+            pass
+
+
+def rollback_status(message: str, binary: Path, backup: Path | None) -> str:
+    """Restore an upgraded executable, retaining its backup if that fails."""
+    if backup is None:
+        return message
+    try:
+        place_binary(binary, backup.read_bytes())
+    except Exception as error:  # noqa: BLE001 - report manual recovery without raising
+        return (f"{message}; rollback failed ({error.__class__.__name__}: {error}); "
+                f"RECOVERY REQUIRED: restore the previous executable from {backup} to {binary}")
+    discard_backup(backup)
+    return f"{message}; previous executable restored"
+
+
 # Exact `netwatch status` first lines for a running service, per platform:
 # macOS "loaded, state running, pid 123" (launchd also says "state not
 # running"), Linux "netwatch.service active/running (...)", Windows
@@ -253,9 +297,14 @@ def status(home: Path, apply: bool, enabled: bool = True, *, pin_path: Path = PI
     if not apply:
         service = "and register its per-user service" if register else "(service left alone: non-default home)"
         return f"netwatch: would install {version} ({key}) at {binary} {service}"
+    backup = None
     try:
         current_digest = file_sha256(binary)
         changed = current_digest != asset["binary_sha256"]
+        if not changed and not os.access(binary, os.X_OK):
+            # The pinned binary restored without permissions (a plain copy, an unpacked archive) must run
+            # again instead of failing at the status step on every install (audit2, goodqa#14999).
+            os.chmod(binary, 0o755)  # the mode place_binary creates it with
         if changed:
             # Never run an unverified binary: its own version output is not
             # evidence, so any binary that differs from the pin is replaced.
@@ -268,11 +317,16 @@ def status(home: Path, apply: bool, enabled: bool = True, *, pin_path: Path = PI
             data = extract_binary(archive, version, key)
             if hashlib.sha256(data).hexdigest() != asset["binary_sha256"]:
                 return f"netwatch: not installed (binary in {name} does not match the pinned binary_sha256)"
+            real_dir(binary.parent.parent)
+            real_dir(binary.parent)
+            backup = retain_binary(binary)
             place_binary(binary, data)
             if installed_version(binary, run) != version:
-                return f"netwatch: installed binary at {binary} does not report {version}; service not registered"
+                message = f"netwatch: installed binary at {binary} does not report {version}; service not registered"
+                return rollback_status(message, binary, backup)
         action = f"installed {version}" if changed else f"{version} up to date"
         if not register:
+            discard_backup(backup)
             return f"netwatch: {action} at {binary}; service not registered (non-default home)"
         if not changed:
             # Re-registering would restart the service and drop a custom
@@ -283,8 +337,11 @@ def status(home: Path, apply: bool, enabled: bool = True, *, pin_path: Path = PI
                 return f"netwatch: {action} at {binary}; service running"
         result = run([str(binary), "install"], capture_output=True, text=True, timeout=180)
     except Exception as error:  # noqa: BLE001 - never fail the harness install
-        return f"netwatch: not installed ({error.__class__.__name__}: {error})"
+        message = f"netwatch: not installed ({error.__class__.__name__}: {error})"
+        return rollback_status(message, binary, backup)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip().splitlines()[:1]
-        return f"netwatch: {version} at {binary}; service registration failed ({detail[0] if detail else result.returncode})"
+        message = f"netwatch: {version} at {binary}; service registration failed ({detail[0] if detail else result.returncode})"
+        return rollback_status(message, binary, backup)
+    discard_backup(backup)
     return f"netwatch: {action} at {binary}; per-user service registered"
