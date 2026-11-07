@@ -77,7 +77,7 @@ def seconds(text):
 
 CLASSES = ("memory", "disk", "cpu", "process", "network", "external-write", "sandbox-escape", "hang")
 REQUIRED_BOUND = {"memory": "max_rss_gb", "disk": "max_file_mb", "process": "max_procs"}
-MEM_POLL_S = 0.05        # macOS footprint re-read interval between ps snapshots
+MEM_POLL_S = 0.05        # per-process memory re-read interval between ps snapshots (macOS footprint, Linux statm)
 MEM_POLL_FAST_S = 0.01   # while the tree grew by more than 10% of the bound since the last read
 SANDBOX_NO_NET = "(version 1)(allow default)(deny network*)"
 
@@ -204,12 +204,13 @@ def main(argv=None):
                 if len(live) > 1 or any(r[0] != child.pid for r in live):
                     run_capped.kill_tree(child.pid, pgid)
                 break
-            if sys.platform != "darwin":
+            if not run_capped.live_memory_measure():
                 time.sleep(args.poll_s)
                 continue
-            # macOS: between ps snapshots, re-read phys_footprint of the known members every MEM_POLL_S (one
-            # syscall per process), faster while the tree is growing, so a fast slurp is caught near its bound
-            # instead of one ps interval later (goodqa#14948).
+            # Between ps snapshots (slow on a busy host: `ps -ax` on dev2 with ~100 users takes long enough for a
+            # fast slurp to finish unseen), re-read the known members' memory every MEM_POLL_S (phys_footprint on
+            # macOS, /proc statm on Linux: one cheap read per process), faster while the tree is growing, so the
+            # breach is caught near its bound instead of one ps interval later (goodqa#14948).
             deadline, step, last = time.time() + args.poll_s, MEM_POLL_S, rss_gb
             while time.time() < deadline:
                 time.sleep(step)

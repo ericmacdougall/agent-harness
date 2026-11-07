@@ -124,15 +124,32 @@ def accurate_memory_measure():
     return sys.platform != "darwin" or footprint_kb(os.getpid()) is not None
 
 
+def _statm_rss_kb(pid):
+    """Linux: resident KB of one process from /proc/<pid>/statm (one small read, no ps), or None."""
+    try:
+        with open("/proc/%d/statm" % int(pid), "rb") as handle:
+            fields = handle.read(256).split()  # input-ok: a one-line kernel file
+        return int(fields[1]) * os.sysconf("SC_PAGE_SIZE") // 1024
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def live_memory_measure():
+    """True when memory_kb re-reads the kernel per call (macOS footprint, Linux statm) rather than echoing the ps
+    snapshot, so the runner can sample faster than ps can list a busy host's processes."""
+    return sys.platform == "darwin" or sys.platform.startswith("linux")
+
+
 def memory_kb(rows):
-    """KB the tree really occupies: phys_footprint per process on macOS (falling back to the row's rss for a process
-    that vanished between the snapshot and now), rss elsewhere. Live on macOS: each call re-reads the kernel."""
-    if sys.platform != "darwin":
+    """KB the tree really occupies now: phys_footprint per process on macOS, /proc statm on Linux (both re-read per
+    call; a process that vanished since the snapshot falls back to the snapshot's rss), the snapshot's rss elsewhere."""
+    if not live_memory_measure():
         return sum(r[3] for r in rows)
+    reader = footprint_kb if sys.platform == "darwin" else _statm_rss_kb
     total = 0
     for r in rows:
-        fp = footprint_kb(r[0])
-        total += r[3] if fp is None else fp
+        now = reader(r[0])
+        total += r[3] if now is None else now
     return total
 
 
