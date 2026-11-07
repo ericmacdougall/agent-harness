@@ -72,7 +72,9 @@ STOP_COMMANDS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'echo', 'printf', 'cat', 
                  'cp', 'mv', 'rm', 'mkdir', 'touch', 'chmod', 'chown', 'make', 'cargo', 'go', 'docker', 'kubectl',
                  'python', 'python3', 'node', 'ruby', 'perl', 'sleep', 'true', 'false', 'test', 'wc', 'sort', 'uniq',
                  'tee', 'diff', 'find', 'curl', 'wget', 'pytest', 'ssh', 'scp', 'rsync', 'tar', 'zip', 'unzip', 'date'}
-OVERRIDDEN = ('apply', 'command', 'inner_words', 'script', 'ssh', 'container', 'check_tokens', 'resolve', 'bind_loop_var')
+NAME_FIRST = {'gosu', 'chroot', 'flock', 'sg', 'su', 'runuser'}  # gosu git bash: the first operand is no command
+OVERRIDDEN = ('apply', 'command', 'dispatch', 'inner_words', 'script', 'ssh', 'container', 'check_tokens', 'resolve',
+              'bind_loop_var')
 
 DEFAULT_POLICY = {
     'mode': 'enforce',
@@ -873,7 +875,7 @@ def make_analyzer_class(cg):
                             break
                         if later_kind == 'w':
                             stage.append(later)
-                    if self.reads_program(stage) or (stage and cg.VAR_OPEN in stage[0].text):  # S=sh; ... | $S
+                    if self.reads_program(stage) or any(w.vars for w in stage):  # S=sh; ... | $S: judged once S is known
                         for w in self.feeder_words(tokens, k):
                             self.fed[id(w)] = (w, stage)
 
@@ -910,8 +912,18 @@ def make_analyzer_class(cg):
         def reads_program(self, words):
             """True when this pipeline stage runs its stdin as shell code."""
             words = self._skip_assigns(cg.strip_reserved(words))[1]
+            while words and self.expands_to_nothing(words[0]):  # K=(); ... | "${K[@]}" bash: bash is the command
+                words = words[1:]
             if not words:
                 return False
+            picked = self.picked_elements(words[0])
+            if picked:  # S=(cat bash); ... | "${S[1]}": which element runs depends on the shell, so any of them may
+                return any(self.reads_program([e] + words[1:]) for e in picked)
+            head = words[0].text.strip()
+            if re.search(r'\s', head) and not head.startswith('-') and self.shell_splits(words[0]):  # S="ssh -T dev2"; ... | $S bash
+                split = [v for k, v in cg.Lexer(self.ctx, self.ctx.ps).lex(head) if k == 'w']
+                if [w.text for w in split] != [head]:  # defensive: a word the lexer cannot split must not recurse forever
+                    return self.reads_program(split + words[1:])
             name, args = cg.norm_name(words[0].text), words[1:]
             if name.startswith('g') and name[1:] in GNU_PREFIXED:
                 name = name[1:]
@@ -930,7 +942,16 @@ def make_analyzer_class(cg):
             if name == 'parallel' and all(a.text.startswith('-') for a in args):
                 return True
             if name in WRAPPER_NAMES or name in REMOTE_EXEC or name in REMOTE_WRAPPERS:
+                host = self._ssh_host_index([a.text for a in args]) if name in ('ssh', 'mosh') else None
+                remote = name in REMOTE_EXEC or name in REMOTE_WRAPPERS
                 for i, a in enumerate(args):
+                    if re.search(r'\s', a.text.strip()) and name not in ('xargs', 'parallel'):  # ssh host 'cd /srv && bash -s'
+                        for bang in (True, False):  # the remote shell may be zsh or bash, which read `>! sh` apart
+                            lexed = cg.Lexer(self.ctx, self.ctx.ps, bang_operators=bang).lex(a.text)
+                            if any(self.reads_program(c.words) for pl in cg.parse(lexed) for c in pl.cmds):
+                                return True
+                        if remote:
+                            continue  # a remote command line; a local wrapper's word is one argv word, a path
                     n = cg.norm_name(a.text)
                     if n in cg.SHELLS:
                         if name in ('xargs', 'parallel'):  # the text reaches the shell only when it is the whole -c program
@@ -939,14 +960,75 @@ def make_analyzer_class(cg):
                             return any(re.fullmatch(r'-[a-zA-Z]*c[a-zA-Z]*', args[j].text) and args[j + 1].text.strip() in marks
                                        for j in range(i + 1, len(args) - 1))
                         return self.reads_program(args[i:])
-                    if re.search(r'\s', a.text.strip()) and name not in ('xargs', 'parallel'):  # ssh host 'cd /srv && bash -s'
-                        for bang in (True, False):  # the remote shell may be zsh or bash, which read `>! sh` apart
-                            lexed = cg.Lexer(self.ctx, self.ctx.ps, bang_operators=bang).lex(a.text)
-                            if any(self.reads_program(c.words) for pl in cg.parse(lexed) for c in pl.cmds):
-                                return True
+                    if name in ('xargs', 'parallel') or i == host or self.names_a_value(name, args, i):
+                        continue  # xargs needs the exact `sh -c {}` above, so nothing before it can end the search
+                    if n in REMOTE_EXEC or n in NAME_FIRST:  # timeout 30 ssh dev2 bash, sudo gosu git sh: the inner one has its own rules
+                        return self.reads_program(args[i:])
                     if n in STOP_COMMANDS:
                         return False
             return False
+
+        def expands_to_nothing(self, word):
+            """A word whose expansions all resolve to nothing: `K=(); "${K[@]}"`, `${K[*]}`, zsh `$K[@]`, `K=; $K`, `${K}`,
+            and any concatenation of them (`${K[@]}${K[@]}`, `$K$J`, `"${K[@]}""${J[@]}"`; review N1 of 676c0e2). The
+            shell drops it (or fails on it), so the word after it is the command; judging that word errs only towards a
+            refusal. Decided on the resolved value, not the spelling: the word expands variables, no command
+            substitution, every resolved alternative is blank, and every variable it reads is known and untainted. An
+            unknown name resolves to `$NAME`, and `${K:-x}`, `${K[0]}`, `${!K}` and `${#K}` resolve to their text or a
+            marker, so none of them is blank and none is dropped."""
+            if not word.vars or word.subs or any(a.strip() for a in word.alts):
+                return False
+            return all(v in self.ctx.vars and v not in self.ctx.tainted for v in word.vars)
+
+        def drop_empty_head(self, words):
+            """The words left once leading words that expand to nothing are dropped. When any was dropped, main's
+            dynamic-head verb check still applies to what remains (review N3 of 676c0e2): main read the empty word as a
+            command built at run time and refused when a kill verb was among the next two words, so `K=(); "${K[@]}"
+            nocache kill 4004` (an unlisted wrapper) stays refused rather than judged as `nocache`."""
+            words = list(words)
+            dropped = False
+            while words and self.expands_to_nothing(words[0]):  # P=(sudo); [ root ] && P=(); "${P[@]}" pkill -f node
+                words, dropped = words[1:], True
+            if dropped and any(cg.norm_name(w.text) in (self.broad | self.windows | {'kill'}) for w in words[:2]):
+                self.block('dynamic-head', 'a command name that expands to nothing is followed by a kill verb')
+            return words
+
+        def dispatch(self, words, cmd, pl, idx, depth):
+            words = self.drop_empty_head(words)
+            if not words:
+                return None
+            return super().dispatch(words, cmd, pl, idx, depth)
+
+        @staticmethod
+        def shell_splits(word):
+            """A held value is split into words only when it came from an unquoted variable, or from a quoted `[@]` or `[*]`.
+            A quoted path with a space (`"/opt/my dir/bash"`, `"$B"`) stays one word."""
+            raw = word.raw or ''
+            if not word.vars:
+                return False
+            return not raw.startswith('"') or bool(re.search(r'\[[@*]\]', raw))
+
+        def picked_elements(self, word):
+            """The elements of a known array when this word picks one of them: `"${S[1]}"`, zsh `$S[1]`, `${S[-1]}`."""
+            match = re.fullmatch(r'"?\$\{?([A-Za-z_][A-Za-z0-9_]*)\[([^\]]*)\]\}?"?', word.raw or '')
+            if not match or match.group(2) in ('@', '*'):
+                return None
+            name = match.group(1)
+            if name not in self.ctx.vars or name in self.ctx.tainted:
+                return None
+            return [v for k, v in cg.Lexer(self.ctx, self.ctx.ps).lex(self.ctx.vars[name]) if k == 'w'] or None
+
+        @staticmethod
+        def names_a_value(name, args, i):
+            """This word may be a user or container, not a command: `sudo -u git bash`, `docker run --rm -i node sh`,
+            `kubectl exec node -i -- sh`. An option may take no value, so this can only keep the search going: a word that
+            is both a stop word and an option's neighbour costs a refusal only when a shell's name follows it."""
+            if i == 0 and name in NAME_FIRST:
+                return True
+            prev = args[i - 1].text if i else ''
+            if prev.startswith('-') and prev != '--' and '=' not in prev:
+                return True
+            return prev in ('exec', 'run', 'attach') and (name in REMOTE_EXEC or name in REMOTE_WRAPPERS)
 
         def command(self, cmd, pl, idx, depth):
             self.judge_reread(cmd)
@@ -970,8 +1052,8 @@ def make_analyzer_class(cg):
                 bodies = [r.body or (r.target.text if r.op == '<<<' and r.target is not None else '') for r in cmd.redirs]
             rest = self._skip_assigns(words)[1]
             name = cg.norm_name(rest[0].text) if rest else ''
-            if not fed and (not rest or name in INERT_COMMANDS):
-                return
+            if not fed and (not rest or (name in INERT_COMMANDS and not rest[0].vars)):
+                return  # a held name is only the guard's guess of the value: K=(kill); (K=(echo)); "${K[@]}" 4002(N)
             if self.names_kill(' '.join([p for w in words for p in (w.text, w.raw or '', *w.subs)] + bodies)):
                 self.block(rule, reason)
                 return
@@ -987,12 +1069,26 @@ def make_analyzer_class(cg):
 
         def resolve(self, word):
             # resolve() builds a new Word for any word holding a variable, so a tag has to follow it.
-            out = super().resolve(word)
+            out = super().resolve(self.array_value(word))
             if out is not word and word is not None:
                 if id(word) in self.before_paren:
                     self.before_paren[id(out)] = out
                 if id(word) in self.fed:
                     self.fed[id(out)] = (out, self.fed[id(word)][1])
+            return out
+
+        def array_value(self, word):
+            """`"${S[@]}"` and zsh's `$S[@]` hold the words normalize_assignments gave S; the base keeps them as text. One
+            element (`${S[1]}`) stays unresolved, as before, so a command name picked from an array is judged as unknown."""
+            if word is None or not word.vars:
+                return word
+            use = r'\$\{([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]\}|%s([A-Za-z_][A-Za-z0-9_]*)%s\[[@*]\]' % (cg.VAR_OPEN, cg.VAR_CLOSE)
+            alts = [re.sub(use, lambda m: cg.VAR_OPEN + (m.group(1) or m.group(2)) + cg.VAR_CLOSE, a) for a in word.alts]
+            if alts == word.alts:
+                return word
+            out = cg.Word()
+            out.alts, out.subs, out.vars, out.glob, out.quoted, out.raw = alts, word.subs, word.vars, word.glob, word.quoted, word.raw
+            out.dynamic = word.dynamic
             return out
 
         def bind_loop_var(self, words):
@@ -1003,6 +1099,7 @@ def make_analyzer_class(cg):
                 self.ctx.vars.pop(words[1].text, None)
 
         def inner_words(self, words, depth, pl, idx, via_xargs=False):
+            words = self.drop_empty_head(words)  # K=(); sudo "${K[@]}" find ... -exec ...: find runs
             if via_xargs:
                 self.xargs += 1
             try:
@@ -1065,13 +1162,13 @@ def make_analyzer_class(cg):
 
         def apply(self, name, words, cmd, pl, idx, depth):
             if words[0].vars and name.endswith(']'):
-                name = re.sub(r'\[[^\]]*\]$', '', name)  # zsh subscript on an array head: $K[1], $K[@]
+                name = re.sub(r'\[[^\]]*\]$', '', name)  # zsh subscript on an array head: $K[1]
             if name.startswith('g') and name[1:] in GNU_PREFIXED:
                 return self.apply(name[1:], words, cmd, pl, idx, depth)  # Homebrew coreutils: gtimeout, gxargs ...
             args = words[1:]
-            if name in ('command', 'builtin', 'type', 'which', 'whereis', 'hash') and (
+            if name in ('command', 'builtin', 'type', 'which', 'whereis', 'hash') and not words[0].vars and (
                     name in ('type', 'which', 'whereis', 'hash') or leading_lookup(args)):
-                return None  # asks where a program is; runs nothing
+                return None  # asks where a program is; runs nothing. Not for a held name: K=(env); (K=(which)); "${K[@]}"
             if name in ('export', 'declare', 'local', 'readonly', 'typeset'):
                 for a in args:
                     if '=' in a.text and not a.dynamic and not a.text.startswith('-'):
@@ -1157,7 +1254,7 @@ def make_analyzer_class(cg):
                 self.block('dynamic-head', 'positional parameters run a command and the input mentions kill')
             if head.dynamic:
                 hints = ' '.join(self.ctx.var_hints.values()) + ' ' + ' '.join(head.subs) + ' ' + ' '.join(
-                    self.ctx.vars.get(v, '') for v in head.vars)  # ${K[@]} reads a variable the guard does know
+                    self.ctx.vars.get(v, '') for v in head.vars)  # ${K:-x} reads a variable the guard does know
                 try:
                     hints += ' ' + cg.decode_ansi(hints)
                 except Exception:  # noqa: BLE001
