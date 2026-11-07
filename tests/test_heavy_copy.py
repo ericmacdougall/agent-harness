@@ -147,11 +147,12 @@ class ReviewFindings(unittest.TestCase):
 
     def test_depth_must_be_a_real_small_depth_option(self):
         url = "https://gitlab.com/huge/mono.git"
-        for flags in ("--depth 2147483647", "--shallow-since=1970-01-01", "--filter=blob:none", "--template --depth",
+        for flags in ("--depth 2147483647", "--shallow-since=1970-01-01", "--template --depth",
                       "--separate-git-dir --depth", "--server-option --depth", "--depth 0", "--depth x"):
             with self.subTest(flags=flags):
                 self.assertEqual(decide(f"git clone {flags} {url} m").get("rule"), "copy", flags)
-        for flags in ("--depth 1", "--depth=1", "--depth 50", "-b main --depth 1"):
+        # A blobless clone is bounded like a shallow one (the deny message recommends it; review m1 on 60c0630).
+        for flags in ("--depth 1", "--depth=1", "--depth 50", "-b main --depth 1", "--filter=blob:none"):
             self.assertEqual(decide(f"git clone {flags} {url}")["action"], "allow", flags)
 
     def test_to_stdout_only_counts_as_a_real_extract_option(self):

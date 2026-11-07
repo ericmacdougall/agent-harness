@@ -19,11 +19,16 @@ GIB = 1024 ** 3
 _STATE = tempfile.mkdtemp(prefix="p12-review-state-")
 
 
+_STATE_PATCH = mock.patch.object(guard, "state_dir", lambda: _STATE)
+
+
 def setUpModule():
     # The GitHub size cache lives in the state directory: keep the fake answers out of the real one.
-    patcher = mock.patch.object(guard, "state_dir", lambda: _STATE)
-    patcher.start()
-    unittest.addModuleCleanup(patcher.stop)
+    _STATE_PATCH.start()
+
+
+def tearDownModule():
+    _STATE_PATCH.stop()
 
 
 def decide(command, cwd="/Users/eric"):
