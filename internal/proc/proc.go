@@ -9,6 +9,7 @@ package proc
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -33,12 +34,16 @@ type Result struct {
 	Stdout, Stderr []byte
 }
 
-// Options configure Run. Timeout 0 means no deadline (and, as in Python, no bound on a pipe holder).
+// Options configure Run and RunContext. Timeout 0 means no deadline of its own (and, as in Python, no bound
+// on a pipe holder); RunContext still terminates the group when its context ends. Stdout and Stderr, when
+// set, receive the streams instead of the captured buffers (for example a writer that caps the output and
+// cancels the context); the matching Result field is then empty.
 type Options struct {
-	Dir     string
-	Env     []string
-	Stdin   []byte
-	Timeout time.Duration
+	Dir            string
+	Env            []string
+	Stdin          []byte
+	Timeout        time.Duration
+	Stdout, Stderr io.Writer
 }
 
 // lockedBuffer lets the timeout path snapshot output while a reader goroutine may still be writing.
@@ -60,7 +65,13 @@ func (b *lockedBuffer) Bytes() []byte {
 }
 
 // Run executes argv[0] with argv[1:] (no shell) and captures stdout and stderr.
-func Run(argv []string, o Options) (res Result, err error) {
+func Run(argv []string, o Options) (Result, error) {
+	return RunContext(context.Background(), argv, o)
+}
+
+// RunContext is Run with caller cancellation: when ctx ends, the whole process group is terminated exactly
+// as on a timeout (TERM, grace, KILL, bounded pipe wait) and ctx.Err() is returned (Kimi audit F08).
+func RunContext(ctx context.Context, argv []string, o Options) (res Result, err error) {
 	if len(argv) == 0 {
 		return Result{}, errors.New("proc: empty argv")
 	}
@@ -100,6 +111,9 @@ func Run(argv []string, o Options) (res Result, err error) {
 		cmd.Stdin = inR
 	}
 	newGroup(cmd)
+	if err := ctx.Err(); err != nil {
+		return Result{Code: -1}, err
+	}
 	if err := cmd.Start(); err != nil {
 		return Result{Code: -1}, err
 	}
@@ -110,11 +124,18 @@ func Run(argv []string, o Options) (res Result, err error) {
 		cmd.Stdin.(*os.File).Close()
 	}
 	var stdout, stderr lockedBuffer
+	outTo, errTo := io.Writer(&stdout), io.Writer(&stderr)
+	if o.Stdout != nil {
+		outTo = o.Stdout
+	}
+	if o.Stderr != nil {
+		errTo = o.Stderr
+	}
 	var readers sync.WaitGroup
 	for _, p := range []struct {
 		r *os.File
 		w io.Writer
-	}{{outR, &stdout}, {errR, &stderr}} {
+	}{{outR, outTo}, {errR, errTo}} {
 		readers.Add(1)
 		go func(r *os.File, w io.Writer) {
 			defer readers.Done()
@@ -157,6 +178,9 @@ func Run(argv []string, o Options) (res Result, err error) {
 		case <-timer:
 			terminate(cmd.Process.Pid, exited, leaderDone, &readers)
 			return Result{Code: -1, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, ErrTimeout
+		case <-ctx.Done():
+			terminate(cmd.Process.Pid, exited, leaderDone, &readers)
+			return Result{Code: -1, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, ctx.Err()
 		}
 	}
 	r := Result{Code: cmd.ProcessState.ExitCode(), Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}
@@ -177,11 +201,13 @@ func terminate(pid int, exited <-chan error, leaderDone bool, readers *sync.Wait
 		time.Sleep(50 * time.Millisecond)
 	}
 	signalGroup(pid, sigKill)
-	bound := time.After(PipeGrace)
+	// One deadline for both waits. A single time.After channel fires once: if the leader wait consumed it,
+	// the reader wait below would have no bound left and could block forever on a pipe an escapee holds.
+	bound := time.Now().Add(PipeGrace)
 	if !leaderDone {
 		select {
 		case <-exited:
-		case <-bound:
+		case <-time.After(time.Until(bound)):
 		}
 	}
 	done := make(chan struct{})
@@ -191,6 +217,6 @@ func terminate(pid int, exited <-chan error, leaderDone bool, readers *sync.Wait
 	}()
 	select {
 	case <-done:
-	case <-bound:
+	case <-time.After(time.Until(bound)):
 	}
 }

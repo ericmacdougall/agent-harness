@@ -31,6 +31,11 @@ ALLOWED_GIT_ENV = {
     'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_COMMITTER_DATE',
     'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT',
     'GIT_PAGER',
+    # Editors only run for interactive commits, rebases and merges, which the helpers never request (-m, --no-edit,
+    # --ff-only); agent hosts export them routinely (Claude Code sets GIT_EDITOR), and refusing them stranded
+    # deliveries with "Unsupported Git routing environment" (2026-11-06). Routing variables (GIT_DIR, GIT_WORK_TREE,
+    # GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY, GIT_CONFIG*, GIT_CEILING_DIRECTORIES ...) stay refused.
+    'GIT_EDITOR', 'GIT_SEQUENCE_EDITOR',
 }
 INSPECTION_CONFIG = ('-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false',
                      '-c', 'core.trustctime=true', '-c', 'core.checkStat=default',
@@ -368,6 +373,19 @@ def report(status, message, **extra):
     print(json.dumps({"status": status, "message": message, **extra}))
 
 
+FOCUSED_TEST_FILE = re.compile(r"test_[A-Za-z0-9_]{1,100}\.py")
+
+
+def focused_unittest(options):
+    """`-m unittest discover -s tests -p <one literal test_*.py name>`: one file name, no glob, path or extra argv
+    (discovery matches that name in tests/ and its subpackages).
+
+    A name that matches no file is still safe: run() wraps every `-m unittest discover` check so that an empty or
+    all-skipped discovery fails (Python before 3.12 would otherwise exit zero)."""
+    return (len(options) == 7 and options[:6] == ["-m", "unittest", "discover", "-s", "tests", "-p"]
+            and FOCUSED_TEST_FILE.fullmatch(options[6]) is not None)
+
+
 def approved_check(argv):
     if not argv:
         return False
@@ -387,7 +405,7 @@ def approved_check(argv):
             ["-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v"],
             ["-m", "pytest"],
             ["-m", "pytest", "-q"],
-        )
+        ) or focused_unittest(argv[1:])
     if argv in (["pytest"], ["pytest", "-q"]):
         return True
     return False

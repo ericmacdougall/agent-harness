@@ -15,7 +15,8 @@ Policy decisions (docs/operations.md, "Merge gate"):
   * the required set is the union of branch protection (base branch), rulesets and `gh pr checks --required`, and it
     must be known. When `gh pr checks --required` is the only readable source the PR must also report
     mergeStateStatus CLEAN or HAS_HOOKS, because that source only lists checks that already reported.
-  * zero reported checks block unless the repository has no workflows at all.
+  * zero reported checks block unless no ACTIVE workflow can run on the head (GitHub CI switched off): workflow files
+    are read at the PR base and the verified head, new files at the head are classified too, unknown means capable.
   * the merge command must carry the verified full head SHA (--match-head-commit, REST sha, GraphQL expectedHeadOid),
     so GitHub itself refuses a head that moved after the check.
   * waiver: `waive` records repo, PR, head, ticket, reason and approver; it is single use, expires in 24 hours and is
@@ -29,6 +30,7 @@ Stdlib only, Python 3.9.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -39,6 +41,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -732,6 +735,204 @@ def _pr_required(client, slug, number):
         return "error", None
 
 
+INERT_TRIGGERS = {"workflow_dispatch", "schedule", "release", "workflow_call", "repository_dispatch"}
+_ON_KEY = re.compile(r"^(?:on|\"on\"|'on')\s*:(.*)$")
+_TOP_KEY = re.compile(r"^[A-Za-z_][\w-]*\s*:")
+_TRIGGER_LINE = re.compile(r"^([A-Za-z_]+)\s*:\s*$")
+_SUB_KEY = re.compile(r"^([A-Za-z_][\w-]*)\s*:")
+
+
+def _real_value(value):
+    """True for a one-line scalar or flow list that holds at least one non-empty, non-null item."""
+    v = value.strip()
+    if v.startswith("[") and v.endswith("]"):
+        items = [i.strip().strip("'\"").strip() for i in v[1:-1].split(",")]
+        return bool(items) and all(i and _real_value(i) for i in items)
+    if v[:1] in "{[!&*|>?" or not v:
+        return False
+    v = v.strip("'\"").strip()
+    return bool(v) and v.lower() not in ("null", "~")
+
+
+def _trigger_names(text):
+    """Return {trigger: set(sub-keys)} from a workflow's top-level `on:`, or None unless every line was understood.
+
+    Deliberately strict: any construct this small reader does not know (documents, anchors, aliases, tabs, quoted or
+    complex keys, multi-line flow values, a second `on:`) yields None, which callers treat as able to run on a PR head.
+    """
+    if "\t" in text or re.search(r"(?m)^(?:---|\.\.\.)", text) or re.search(r"(?m)(?:^|\s)[&*][\w-]+|<<\s*:", text):
+        return None
+    lines = [re.sub(r"\s+#.*$", "", ln.rstrip()) for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+    for ln in lines:  # every top-level line must be a plain `key:`; flow maps, `? key`, `}` and quoted keys are unknown
+        if ln.strip() and not ln[0].isspace() and not _TOP_KEY.match(ln) and not _ON_KEY.match(ln):
+            return None
+    significant = [ln for ln in lines if ln.strip()]
+    if not significant or significant[0][0].isspace():  # an indented root could hide a column-0 decoy inside a scalar
+        return None
+    if any(re.match(r"^\s+(?:on|\"on\"|'on')\s*:", ln) for ln in lines):  # a second, nested or indented `on`
+        return None
+    if re.search(r"(?i)pull_request|merge_group|workflow_run", re.sub(r"(?m)^\s*#.*$", "", text)) and \
+            not re.search(r"(?m)^\s+(?:pull_request|merge_group|workflow_run)\w*\s*:", text):
+        return None  # a PR trigger word that is not a plain key (quoted, escaped, in a flow value): unknown
+    for ln in significant:  # a top-level value that opens a quote or flow collection may span lines: unknown
+        if not ln[0].isspace() and re.search(r"[:]\s*(?:[\"'{\[](?![^\"'}\]]*[\"'}\]]\s*$)|[|>])", ln) and not _ON_KEY.match(ln):
+            return None
+    starts = [i for i, ln in enumerate(lines) if _ON_KEY.match(ln)]
+    if len(starts) != 1:
+        return None
+    i = starts[0]
+    rest = _ON_KEY.match(lines[i]).group(1).strip()
+    if rest:  # on: push   |   on: [push, pull_request]   (one line only)
+        if re.fullmatch(r"[A-Za-z_]+", rest):
+            return {rest: set()}
+        if re.fullmatch(r"\[\s*[A-Za-z_]+(?:\s*,\s*[A-Za-z_]+)*\s*\]", rest):
+            return {n: set() for n in re.findall(r"[A-Za-z_]+", rest)}
+        return None
+    found, current, base, sub, pending = {}, None, None, None, None
+    for ln in lines[i + 1:]:
+        if not ln.strip():
+            continue
+        indent = len(ln) - len(ln.lstrip())
+        body = ln.strip()
+        if indent == 0:
+            if not _TOP_KEY.match(body):
+                return None
+            break
+        base = indent if base is None else base
+        if indent < base:
+            return None
+        if indent == base:
+            m = _TRIGGER_LINE.match(body)
+            if not m:
+                return None
+            current, sub, pending = m.group(1), None, None
+            found[current] = set()
+        elif current is None:
+            return None
+        else:
+            sub = indent if sub is None else sub
+            if indent == sub:
+                m = _SUB_KEY.match(body)
+                if m:
+                    value = body[m.end():].strip()
+                    if value and not _real_value(value):
+                        return None  # `tags: null`, `[ ]`, `''`, `!!null ''` and friends: unknown
+                    found[current].add(m.group(1) if value else m.group(1) + ":empty")
+                    pending = None if value else (current, m.group(1))
+                elif body.startswith("- "):
+                    found[current].add("-")  # a list directly under the trigger
+                else:
+                    return None
+            elif indent < sub:
+                return None
+            elif pending:  # block value under `key:`: only `- item` lines with real scalars make it non-empty
+                if not (body.startswith("- ") and _real_value(body[2:].strip())):
+                    return None
+                found[pending[0]].discard(pending[1] + ":empty")
+                found[pending[0]].add(pending[1])
+            elif not (body.startswith("- ") or body.startswith("[") or body.startswith("]")):
+                pass
+    return found or None
+
+
+def _can_run_on_pr_head(triggers):
+    """True when any trigger could create a check run on a pull request head (unknown means yes: fail closed)."""
+    if triggers is None:
+        return True
+    for name, keys in triggers.items():
+        if name in INERT_TRIGGERS:
+            continue
+        if name == "push" and keys == {"tags"}:
+            continue  # runs only for tag pushes, never for a pull request head
+        return True
+    return False
+
+
+INACTIVE_STATES = {"disabled_manually", "disabled_inactivity", "disabled_fork"}
+DELETED_STATE = "deleted"  # the file may have been restored since: classified wherever it exists
+
+
+def _is_404(err, out):
+    """gh prints `(HTTP 404)` on stderr for a real not-found; a bare 404 inside other text (ids, 5xx bodies) is not."""
+    text = (err or "") + " " + (out or "")
+    if re.search(r"(?i)no commit found|ref(erence)? .*not found|unknown revision", text):
+        return False  # an unresolvable ref is not an absent file: the file may exist at that ref
+    return bool(re.search(r"\(HTTP 404\)", err or "")) or bool(re.search(r'"status"\s*:\s*"404"', out or ""))
+
+
+def _get_file(client, slug, path, ref):
+    """Text of a workflow file at a ref; None when the file does not exist there (404); GateError otherwise."""
+    rc, out, err = client.raw(["api", f"repos/{slug}/contents/{path}?ref={urllib.parse.quote(ref, safe='')}"])
+    if rc != 0:
+        if _is_404(err, out):
+            return None
+        raise GateError("gh failed reading a workflow file: " + clean(err or out, 100))
+    try:
+        data = safe_input.safe_json_loads(out, max_depth=40, max_bytes=MAX_GH_OUTPUT)
+        return base64.b64decode(data["content"]).decode("utf-8")
+    except (KeyError, TypeError, ValueError):
+        raise GateError("a workflow file is unreadable")
+
+
+def _workflow_dir(client, slug, ref):
+    """Paths of workflow files at a ref; a missing directory is an empty list, any other failure is unreadable."""
+    rc, out, err = client.raw(["api", f"repos/{slug}/contents/.github/workflows?ref={urllib.parse.quote(ref, safe='')}"])
+    if rc != 0:
+        if _is_404(err, out):
+            return []
+        raise GateError("gh failed reading the workflow directory: " + clean(err or out, 100))
+    try:
+        listing = safe_input.safe_json_loads(out, max_depth=40, max_bytes=MAX_GH_OUTPUT)
+    except ValueError:
+        raise GateError("the workflow directory is unreadable")
+    if not isinstance(listing, list):
+        raise GateError("the workflow directory is unreadable")
+    return [str(i.get("path") or "") for i in listing if isinstance(i, dict) and re.search(r"\.ya?ml$", str(i.get("name") or ""), re.I)]
+
+
+def _ci_capable_workflows(client, slug, head, base):
+    """Reasons to block when a workflow may report on this head. Raises GateError when it cannot tell.
+
+    A PR can edit the workflow that decides whether its own CI runs, so every active workflow is read at the PR base
+    AND the verified head and counts as inert only if both versions are; files that exist only at the head (added by
+    the PR, not yet listed by the API) are classified too."""
+    wf = client.json(["api", f"repos/{slug}/actions/workflows?per_page=100"], "workflows")
+    total, listed = int(wf.get("total_count", -1)), wf.get("workflows")
+    if not isinstance(listed, list) or total < 0 or total > len(listed):
+        raise GateError("the workflow list is incomplete")
+    paths, inactive, deleted = [], set(), set()
+    for item in listed:
+        if not isinstance(item, dict) or item.get("state") not in INACTIVE_STATES | {"active", DELETED_STATE}:
+            raise GateError("the workflow list holds an entry with an unknown state")
+        path = str(item.get("path") or "")
+        if item["state"] in INACTIVE_STATES:
+            inactive.add(path)
+        else:
+            (deleted if item["state"] == DELETED_STATE else set()).add(path)
+            paths.append(path)
+    for ref in (head, base):  # added by the PR, or only on a non-default base: not in the API list until it runs
+        for path in _workflow_dir(client, slug, ref):
+            if path not in inactive and path not in paths:
+                paths.append(path)
+    reasons = []
+    for path in paths:
+        if not re.match(r"^\.github/workflows/[\w./-]+$", path) or ".." in path:
+            reasons.append("a workflow has an unreadable path")
+            continue
+        texts = [(label, _get_file(client, slug, path, ref)) for ref, label in ((base, "base"), (head, "head"))]
+        if all(t is None for _, t in texts):
+            if path in deleted:
+                continue  # a deleted workflow whose file is still gone at both refs
+            reasons.append("a workflow file listed by GitHub could not be found at the base or the head")
+            continue
+        for label, text in texts:
+            if text is not None and _can_run_on_pr_head(_trigger_names(text)):
+                reasons.append("no checks have reported yet but workflow " + clean(path, 60)
+                               + " can run (at the PR " + label + ")")
+                break
+    return reasons
+
+
 def evaluate_pr(client, slug, number, target=None):
     """Return (info, reasons) where info has slug, number, head and reasons list the (waivable) check problems."""
     ref = [str(number)] if number else ([target] if target else [])
@@ -799,17 +1000,19 @@ def evaluate_pr(client, slug, number, target=None):
             reasons.append(f"required check '{clean(name)}' has not reported on this head")
         elif name in apps and not any(e["src"] == "api" and e["app"] in apps[name] and e["v"] == "ok" for e in mine):
             reasons.append(f"required check '{clean(name)}' has no success from the required app")
+    no_ci = False
     if not entries and known and not required:
+        # Zero reports: fine only when no ACTIVE workflow could have run on this head (GitHub CI switched off).
         try:
-            wf = client.json(["api", f"repos/{slug}/actions/workflows?per_page=1"], "workflows")
-            if int(wf.get("total_count", 1)) > 0:
-                reasons.append("no checks have reported yet but the repository has workflows")
+            found = _ci_capable_workflows(client, slug, head, base)
+            reasons.extend(found)
+            no_ci = not found
         except (GateError, ValueError, TypeError, AttributeError):
             reasons.append("no checks reported and the workflow list could not be read")
     again = client.json(["pr", "view", str(number), "-R", slug, "--json", "headRefOid"], "the pull request head")
     if str((again or {}).get("headRefOid") or "").lower() != head:
         raise GateError("the pull request head moved while the checks were read")
-    return {"slug": slug, "number": number, "head": head}, reasons
+    return {"slug": slug, "number": number, "head": head, "no_ci": no_ci}, reasons
 
 
 def _resolve_graphql(client, node_ids):
@@ -839,7 +1042,7 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
         if merge.kind == "graphql":
             slug, number = _resolve_graphql(client, merge.node_ids)
         details, soft = evaluate_pr(client, slug, number, merge.target)
-        info.update(repo=details["slug"], pr=details["number"], head=details["head"])
+        info.update(repo=details["slug"], pr=details["number"], head=details["head"], no_ci=details.get("no_ci"))
         if merge.kind != "check":
             if merge.head_unknown or not merge.head_vals:
                 hard.append(f"the merge must carry the verified head: add {merge.binding.replace('<full head sha>', details['head'])}")
@@ -1138,7 +1341,7 @@ def decide(payload, runner, state_dir, now=None):
         outcome = "waived" if info.get("waiver") else ("allow" if allowed else "block")
         _audit(state_dir, {"ts": now, "outcome": outcome, "repo": info.get("repo"), "pr": info.get("pr"),
                            "head": info.get("head"), "kind": merge.kind, "command_sha256": command_hash,
-                           "waiver": info.get("waiver"), "session": clean(payload.get("session_id") or "", 40)})
+                           "waiver": info.get("waiver"), "no_ci": info.get("no_ci"), "session": clean(payload.get("session_id") or "", 40)})
         if not allowed:
             blocks.append(text)
     if blocks:

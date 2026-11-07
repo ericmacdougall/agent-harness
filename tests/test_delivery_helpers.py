@@ -2305,6 +2305,49 @@ class DeliveryHelpers(unittest.TestCase):
         parents = cmd('git', 'rev-list', '--parents', '-n', '1', 'HEAD', cwd=self.repo).stdout.split()
         self.assertEqual(parents[1:], [self.base, self.feature_head])
 
+    def focused_args(self, pattern, *extra):
+        args = self.integrate_args(*extra)
+        args[args.index('--check') + 1] = 'python3 -m unittest discover -s tests -p ' + pattern
+        return args
+
+    def test_focused_check_by_literal_file_integrates(self):
+        self.add_feature_test()
+        (self.feature / 'tests' / 'test_other_failing.py').write_text(
+            'import unittest\nclass Other(unittest.TestCase):\n    def test_no(self):\n        self.fail("not selected")\n')
+        cmd('git', 'add', 'tests', cwd=self.feature)
+        cmd('git', 'commit', '-qm', 'unselected failing file', cwd=self.feature)
+        self.feature_head = cmd('git', 'rev-parse', 'HEAD', cwd=self.feature).stdout.strip()
+        result = subprocess.run(self.focused_args('test_check.py', '--timeout', '10'), text=True, capture_output=True,
+                                env=isolated_env(), timeout=20)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']), (0, 'INTEGRATED'), result.stdout + result.stderr)
+
+    def test_focused_check_that_fails_blocks_and_restores(self):
+        self.add_feature_test('import unittest\nclass Check(unittest.TestCase):\n    def test_no(self):\n        self.fail("intentional")\n')
+        result = subprocess.run(self.focused_args('test_check.py'), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status'], data.get('phase')), (3, 'BLOCKED_LOCAL', 'check'), result.stdout)
+        self.assert_restored()
+
+    def test_focused_check_matching_no_file_cannot_integrate(self):
+        self.add_feature_test()
+        result = subprocess.run(self.focused_args('test_missing.py'), text=True, capture_output=True,
+                                env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        data = json.loads(result.stdout)
+        self.assertEqual((result.returncode, data['status'], data.get('phase'), data.get('merge_aborted')),
+                         (3, 'BLOCKED_LOCAL', 'check', True), result.stdout + result.stderr)
+        self.assert_restored()
+
+    def test_focused_check_with_glob_or_path_is_refused_before_merge(self):
+        self.add_feature_test()
+        for pattern in ("'test_*.py'", 'tests/test_check.py', '../test_check.py'):
+            with self.subTest(pattern=pattern):
+                result = subprocess.run(self.focused_args(pattern), text=True, capture_output=True,
+                                        env=isolated_env(), timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+                data = json.loads(result.stdout)
+                self.assertEqual((result.returncode, data['status']), (2, 'BLOCKED_POLICY'), result.stdout)
+                self.assert_restored()
+
     def test_empty_unittest_discovery_cannot_merge_on_old_python(self):
         self.add_feature_test('import unittest\n')
         result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
@@ -2893,6 +2936,40 @@ class DeliveryHelpers(unittest.TestCase):
                 self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
                                  (2, 'BLOCKED_POLICY'), result.stdout + result.stderr)
                 self.assertFalse(marker.exists(), 'Git started before environment refusal')
+
+    def test_git_editor_environment_is_not_routing(self):
+        """GIT_EDITOR and GIT_SEQUENCE_EDITOR (exported by agent hosts; never consulted by the non-interactive
+        helpers) must not trip "Unsupported Git routing environment" (2026-11-06), while routing variables still do.
+        deliver.py shares the allowlist, so both helpers change together."""
+        import importlib.util as ilu
+        spec = ilu.spec_from_file_location('deliver_under_test', INTEGRATE.parent / 'deliver.py')
+        module = ilu.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        self.assertTrue({'GIT_EDITOR', 'GIT_SEQUENCE_EDITOR'} <= module.ALLOWED_GIT_ENV)
+        self.assertFalse({'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_CONFIG_COUNT',
+                          'GIT_CEILING_DIRECTORIES', 'GIT_ALTERNATE_OBJECT_DIRECTORIES'} & module.ALLOWED_GIT_ENV)
+        bin_dir = self.root / 'bin'
+        bin_dir.mkdir()
+        marker = self.root / 'git-started'
+        wrapper = bin_dir / 'git'
+        wrapper.write_text(f'#!{sys.executable}\nfrom pathlib import Path\n'
+                           f'Path({str(marker)!r}).touch()\n')
+        wrapper.chmod(0o700)
+        for name, value in (('GIT_EDITOR', 'true'), ('GIT_SEQUENCE_EDITOR', ':')):
+            with self.subTest(name=name):
+                marker.unlink(missing_ok=True)
+                env = isolated_env()
+                env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
+                env[name] = value
+                result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                        env=env, timeout=10)
+                report = json.loads(result.stdout)
+                # The helper goes on to its other preflights (python version, repo state), which may refuse on this
+                # host for their own reasons; the one thing that must not happen is the routing refusal.
+                self.assertNotIn('routing', report.get('message', ''), result.stdout + result.stderr)
+                self.assertNotEqual((result.returncode, report.get('status'), report.get('message')),
+                                    (2, 'BLOCKED_POLICY', 'Unsupported Git routing environment'))
 
     def test_index_scanner_rejects_malformed_budget_and_timeout_without_paths(self):
         spec = importlib.util.spec_from_file_location('integration_index_scanner', INTEGRATE)

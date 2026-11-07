@@ -483,7 +483,11 @@ def make_snapshot(repo: Path, snapshot: Path, head: str, *, base: str | None = N
             raise OSError('reviewed tree contains gitlinks or unsupported entries')
     clashes = diagnostics.path_collisions([e.split('\t', 1)[-1] for e in tree.split('\0') if e])
     if clashes and diagnostics.fs_is_case_insensitive(snapshot.parent):
-        raise OSError('reviewed paths differ only by case or Unicode form on a case-insensitive filesystem')
+        raise OSError('reviewed paths differ only by case or Unicode form on a case-insensitive filesystem: '
+                      + ', '.join(sorted(str(c) for c in clashes)[:5])[:300]
+                      + '. This Mac clone cannot hold both files, so the clean-worktree check cannot pass here; run the '
+                      'review from a case-sensitive worktree (a Linux checkout such as dev2, or a case-sensitive APFS '
+                      'volume), or rename one path in a commit first')
     slow_git(snapshot, 'checkout', '--quiet', '--detach', head)
     if repo_state(snapshot, snapshot=True) != (head, ''):
         raise OSError('snapshot does not match reviewed commit')
@@ -1104,6 +1108,8 @@ def main() -> int:
     try:
         policy = tiers.load_policy()
     except tiers.TierError as error:
+        target.close()
+        evidence.close()
         print(f'Review refused: tier table error: {error}', file=sys.stderr)
         return 2
     author_rung = args.author_rung
@@ -1112,11 +1118,32 @@ def main() -> int:
             author_rung = ladder.Ledger(policy=policy).status(args.task)['rung']
         except (ladder.LedgerError, tiers.TierError):
             author_rung = None
-    available = {'openai': shutil.which('codex') is not None, 'claude': shutil.which('claude') is not None}
+    # Availability uses the launch's own trust-checked discovery, so a CLI found only at a policy location counts
+    # and a binary inside the reviewed repo does not.
+    try:
+        found = {name: diagnostics.discover_executable(name, policy=review_policy(),
+                                                       roots=diagnostics.untrusted_roots(repo=repo))
+                 for name in diagnostics.PROVIDERS}
+    except OSError as error:  # for example a deleted working directory
+        target.close()
+        evidence.close()
+        print(diagnostics.render(diagnostics.classify_isolation_error(error), stage=args.stage, head=before[0]),
+              file=sys.stderr)
+        return 2
+    available = {'openai': bool(found['codex']['path']), 'claude': bool(found['claude']['path'])}
     selection = tiers.reviewer_for(policy, author_rung, args.author_harness, available)
     if selection['harness'] is None:
+        target.close()
+        evidence.close()
+        if selection['rung'] is None:  # the tier table gives this author rung no reviewer; no CLI is at fault
+            print('Review refused: author rung %s is review-only and needs no reviewer' % author_rung, file=sys.stderr)
+            return 2
         print('Review refused: no review harness is available for rung %s (codex and claude both unavailable)'
               % selection['rung'], file=sys.stderr)
+        # One diagnostic per provider: their causes and next steps can differ. Nothing was reserved, so no run record.
+        for name in diagnostics.PROVIDERS:
+            print(diagnostics.render(diagnostics.provider_attempt(name, found[name], None, '', '', {}),
+                                     stage=args.stage, head=before[0]), file=sys.stderr)
         return 2
     permission = None
     if policy['rungs'][selection['rung']]['needs_user_permission']:
@@ -1127,6 +1154,8 @@ def main() -> int:
             except (ladder.LedgerError, tiers.TierError):
                 permission = None
         if not isinstance(permission, dict) or not permission.get('ask_id'):
+            target.close()
+            evidence.close()
             print('Review refused: reviewer rung %s needs user permission recorded for the task by approve-top '
                   '(--task with a ledger permission); --author-rung alone is not a record' % selection['rung'], file=sys.stderr)
             return 2

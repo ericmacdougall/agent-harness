@@ -1,0 +1,64 @@
+# Credential-named files never leave the machine (rclone filter syntax, one pattern per line).
+# Kept as a file, not shell arguments, so no pattern is ever glob-expanded by a shell.
+# Residual risk: secrets pasted INTO transcripts or WALs cannot be found by name; encryption at rest is the control.
+*.secret
+.env
+.env.*
+.credentials*
+credentials*
+member.key
+*.key
+*.pem
+*.p12
+*.pfx
+*.kdbx
+*.token
+auth.json
+rclone.conf
+id_rsa*
+id_ed25519*
+id_ecdsa*
+.netrc
+.npmrc
+.git-credentials
+kit.json
+goodqa-hive/**
+# Quarantined deletions (the goodqa trash folder) are not logs and can be many GB.
+.goodqa-trash
+.goodqa-trash/**
+# More credential stores (names are matched case-insensitively: the script passes --ignore-case).
+key
+token
+pem
+p12
+netrc
+_netrc
+.pgpass
+.pypirc
+*.jks
+*.gpg
+*.tfvars
+secrets.json
+service-account*.json
+id_dsa*
+.docker/config.json
+cookies.sqlite
+.git/config
+# VM dumps (vzdump images, e.g. under ~/vm-backups) are huge and must never ride the 15-minute log set.
+*.vma
+*.vma.zst
+work-ledger.key
+# VM and disk images
+*.qcow2
+*.iso
+# Dependency, build and cache trees inside worktrees under .agent-harness/work are rebuildable.
+node_modules/**
+.next/**
+dist/**
+build/**
+target/**
+.venv/**
+venv/**
+__pycache__/**
+.gradle/**
+.cache/**

@@ -3,9 +3,7 @@
   "enforcement": "enforce",
   "enforce_after": "2026-11-04T06:30:00+00:00",
   "remote_tickets_required": true,
-  "backstop_repos": [
-    "github\\.com[:/]ericmacdougall/"
-  ],
+  "backstop_repos": [],
   "subject": {
     "max_length": 72,
     "types": [
@@ -186,8 +184,6 @@
       "ref_pattern": "\\bGoodQA\\s+(?:(?P<project>[a-z0-9][a-z0-9-]{0,62})\\s*)?#(?P<number>[1-9]\\d{0,9})\\b",
       "endpoint": "https://goodqa.app/v1/mcp",
       "key_file": "~/.claude/goodqa-hive/member.key",
-      "key_secret": {"name": "goodqa-api-key-framebright", "project": "goodqa-28dd3"},
-      "org_id": "a19d343e-f162-4a05-849d-4565e90e4b3f",
       "default_project": "goodqa",
       "timeout_seconds": 15,
       "total_deadline_seconds": 90,
@@ -195,12 +191,19 @@
       "clock_skew_seconds": 120,
       "max_comment_pages": 5,
       "on_delivered_status": null,
-      "repos": [
-        "github\\.com[:/]ericmacdougall/"
-      ],
+      "repos": [],
       "on_deployed_status": null,
-      "unreachable_projects": ["solve", "ai-course", "harness"],
-      "unreachable_reason": "the GoodQA member key reaches the FrameBright org only; Eric-org projects cannot be verified until durable cross-org access lands (empty unreachable_projects then)"
+      "unreachable_projects": [],
+      "unreachable_reason": ""
+    },
+    "ledger": {
+      "adapter": "ledger",
+      "ref_pattern": "\\bLedger\\s+(?P<project>[a-z0-9][a-z0-9-]{0,62})#(?P<id>[0-9a-f]{8,64})\\b",
+      "allowed_repos": [],
+      "binary": "harness",
+      "min_version": "0.1.0",
+      "timeout_seconds": 5,
+      "note": "Local ledger refs count only in repos no ticket system tracks (any remote url/pushurl checked) and, for repos with no remote, only when the absolute top-level path fully matches an allowed_repos regex. They never satisfy a tracked repo's ticket rule."
     }
   },
   "waivers": {

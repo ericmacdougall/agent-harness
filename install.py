@@ -27,13 +27,17 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "review_diagnostics.py", "review_policy.json", "merge_gate.py",
          "heavy_job_guard.py", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py", "ops_watch.py", "resource_limits.json",
          "domain_gates.py", "domain_checklists.json",
-         "command_guard.py", "command_guard_hook.py", "redact.py",
-         "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "liveness.py",
+         "command_guard.py", "command_guard_hook.py", "redact.py", "kill_guard.py", "kill_guard_policy.json",
+         "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "ah_kill.py", "ah_ticket.py", "liveness.py",
          "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
-         "ahd.py", "ahd_peek.py", "ahd_policy.json")
+         "ahd.py", "ahd_peek.py", "ahd_policy.json",
+         "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py", "bg_job.py", "bg_lint.py",
+         "dropped_gate.py", "ask_reminders.py",  # dropped-owner gate and ask reminders (goodqa#14791)
+         "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py")  # Hawkeye ports (goodqa#14908)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
+SKILLS = ("check-dropped-workstreams/SKILL.md", "check-dropped-workstreams/scan.py")  # thin wrappers over ah
 TMPDIR_KEY = "CLAUDE_CODE_TMPDIR"
 INSTALL_STATE = "install-state.json"
 MAX_SOCKET_PATH = 100  # macOS sun_path is 104 bytes; Claude Code puts sockets in <root>/cc-socks/
@@ -45,15 +49,48 @@ class DirectoryPublicationError(OSError):
     """An exclusive directory publish could not be completed safely."""
 
 
+def record_gate_epoch(home: Path, prior_mtime=None, now=None) -> bool:
+    """Write ~/.agent-harness/state/dropped-gate/installed_at.json once: the earlier of now and an already-installed
+    gate's mtime. Never rewritten, so a later install cannot move it (ah also pins the earliest epoch it used)."""
+    now = datetime.now(timezone.utc).timestamp() if now is None else now
+    at = min(now, prior_mtime) if prior_mtime else now
+    root = home / ".agent-harness"
+    d = root / "state" / "dropped-gate"
+    try:
+        for p in (root, root / "state", d):
+            if p.is_symlink():
+                return False
+        # mkdir(parents=True) would leave the new parents at the umask default (0755);
+        # every other creator of ~/.agent-harness uses the private mode.
+        for parent in (root, root / "state"):
+            try:
+                parent.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+        d.mkdir(mode=0o700, exist_ok=True)
+        fd = os.open(d / "installed_at.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        return False
+    try:
+        stamp = datetime.fromtimestamp(at, timezone.utc).isoformat()
+        os.write(fd, (json.dumps({"at": stamp, "by": "install.py"}) + "\n").encode())
+    finally:
+        os.close(fd)
+    return True
+
+
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
-                         "command_guard_hook.py", "tier_gate.py", "merge_gate.py")}
+                         "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
+                         "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
 # SubagentStart/Stop WAL record, so no liveness check could see them stop (goodqa#14613, the Solve drop).
 SUBAGENT_MATCHER = ".*"
+# Must equal prod_delete_guard.MATCHER (tests/test_prod_delete_guard.py pins it): every tool path the guard judges.
+PROD_DELETE_MATCHER = r"Bash|mcp__hawkeye__run|.*d1_database_query|mcp__.*__(execute_sql|run_sql|query|sql)|mcp__.*__hyperdrive_.*"
 GOODQA_STATUS_TOOLS = (r"^mcp__.*[Gg][Oo][Oo][Dd][Qq][Aa].*__(close_issue_done|close_issue_wont_fix|update_issue|"
                        r"bulk_update_issues|archive_issue|reassign_issue|call_api)$")
 
@@ -90,7 +127,15 @@ def command_guard_group(claude: Path) -> dict:
         "timeout": 30, "onFailure": "block"}]}
 
 
-def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = True) -> dict[str, list[dict]]:
+def kill_guard_group(claude: Path) -> dict:
+    """Broad-kill and unowned-PID kill guard (GoodQA #14506). Its launcher fails closed on its own."""
+    return {"matcher": "Bash|PowerShell", "hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "kill_guard.py"), "hook"],
+        "timeout": 30, "onFailure": "block"}]}
+
+
+def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = True,
+                  log_backup: bool = True) -> dict[str, list[dict]]:
     script = str(claude / "hooks" / "wal.py")
     policy = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "commit_policy.py"), "hook"],
               "timeout": 60, "onFailure": "block"}  # gh pr create checks GitHub and GoodQA
@@ -102,6 +147,9 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     heavy_guard = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "heavy_job_guard.py")],
                    "timeout": 10}
     agent_gate = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "agent_gate.py")], "timeout": 10}
+    # Production-delete gate (goodqa#14908): fails open before a match and denies from inside after one, so no onFailure.
+    prod_delete = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "prod_delete_guard.py")],
+                   "timeout": 30}
 
     def command(event: str, fail_closed: bool = False) -> dict:
         hook = {"type": "command", "command": "python3", "args": [script, event], "timeout": 10}
@@ -142,11 +190,15 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
         }, {
             # Commit message policy: validates git commit / gh pr merge --squash before they run.
             "matcher": "Bash",
-            "hooks": [policy],
+            "hooks": [policy, {"type": "command", "command": "python3",  # advisory bg_lint: warns, never blocks
+                               "args": [str(claude / "hooks" / "bg_lint.py")], "timeout": 5}],
         }, {
             # Route heavy Mac work (browsers, full suites, builds) to dev2; advisory for hostile probes.
             "matcher": "Bash",
             "hooks": [heavy_guard],
+        }, {
+            "matcher": PROD_DELETE_MATCHER,
+            "hooks": [prod_delete],
         }, {
             "matcher": "Agent|Task|Workflow",
             "hooks": [agent_gate],
@@ -157,9 +209,42 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     }
     if command_guard:
         managed["PreToolUse"].insert(0, command_guard_group(claude))
+        managed["PreToolUse"].insert(1, kill_guard_group(claude))
+    if log_backup:
+        # Visible alert when the scheduled log backup has not succeeded for an hour; fails open. Only registered
+        # where the backup is opted in (--log-backup, or already installed), so a host without it gets no alert.
+        managed["SessionStart"].append({"hooks": [{
+            "type": "command", "command": "python3", "args": [str(claude / "hooks" / "log_backup.py"), "session-start"],
+            "timeout": 10}]})
     if provenance:
         for event, groups in provenance_hook_groups(claude).items():
             managed.setdefault(event, []).extend(groups)
+    # Dropped-owner gate (goodqa#14791, docs/ah-query-spec.md): blocks the main agent's turn end while a DROPPED
+    # owner has no recorded disposition; bounded per problem signature; fails open on its own errors.
+    managed.setdefault("Stop", []).append({"hooks": [{"type": "command", "command": "python3",
+                                                       "args": [str(claude / "hooks" / "dropped_gate.py")], "timeout": 15}]})
+    managed.setdefault("SubagentStop", []).append({"matcher": SUBAGENT_MATCHER, "hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "dropped_gate.py"), "subagent-stop"],
+        "timeout": 15}]})
+    # WAL cadence (rule W04, goodqa#14908): one bounded nudge when a big uncommitted diff has no recent WAL note.
+    # Fails open on its own errors, so no onFailure.
+    cadence = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "wal_cadence.py")], "timeout": 30}
+    managed.setdefault("Stop", []).append({"hooks": [cadence]})
+    managed.setdefault("SubagentStop", []).append({"matcher": SUBAGENT_MATCHER, "hooks": [dict(cadence)]})
+    # Worktree hygiene (rule S18, goodqa#14908): no turn ends with uncommitted work in a worktree it touched.
+    # Own budget at most 15 s; fails open on its own errors, so no onFailure.
+    hygiene = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "worktree_hygiene.py")],
+               "timeout": 20}
+    managed.setdefault("Stop", []).append({"hooks": [hygiene]})
+    managed.setdefault("SubagentStop", []).append({"matcher": SUBAGENT_MATCHER, "hooks": [dict(hygiene)]})
+    # The caller's identity for acknowledgements comes from the hook payload (review round 3, B1).
+    managed.setdefault("PreToolUse", []).append({"matcher": "Bash", "hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "dropped_gate.py"), "pretool"],
+        "timeout": 5}]})
+    # Local-ledger reminder (docs/ledger.md): rate limited and dismissible; fails open, so no onFailure.
+    reminder = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "ledger_reminder.py")], "timeout": 3}
+    for event in ("SessionStart", "UserPromptSubmit"):
+        managed.setdefault(event, []).append({"hooks": [reminder]})
     return managed
 
 
@@ -169,7 +254,7 @@ def durable_scratch(claude: Path) -> Path:
 
 
 def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, provenance: bool = True,
-                    command_guard: bool = True) -> dict:
+                    command_guard: bool = True, log_backup: bool = True) -> dict:
     settings = json.loads(json.dumps(current))
     env = settings.get("env", {})
     if not isinstance(env, dict):
@@ -183,14 +268,21 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
     elif not durable_tmp and env.get(TMPDIR_KEY) == managed_tmp:
         settings["env"] = {key: value for key, value in env.items() if key != TMPDIR_KEY}
     hooks = settings.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ValueError("settings.json hooks must be an object")
     scripts = managed_scripts(claude)
-    wanted = managed_hooks(claude, provenance, command_guard)
+    wanted = managed_hooks(claude, provenance, command_guard, log_backup)
     for event in sorted(set(wanted) | set(managed_hooks(claude, True))):
         managed = wanted.get(event, [])
         entries = hooks.setdefault(event, [])
+        if not isinstance(entries, list):
+            raise ValueError(f"settings.json hooks.{event} must be a list")
         had_entries = bool(entries)
         preserved = []
         for item in entries:
+            if not isinstance(item, dict) or not isinstance(item.get("hooks", []), list) \
+                    or not all(isinstance(hook, dict) for hook in item.get("hooks", [])):
+                raise ValueError(f"settings.json hooks.{event} has an invalid hook group")
             remaining = [
                 hook for hook in item.get("hooks", [])
                 if not (hook.get("type") == "command"
@@ -205,7 +297,12 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
         entries.extend(managed)
         if not entries and had_entries:
             del hooks[event]  # an uninstalled gate leaves no empty event behind; a user's own empty list stays
-    allowed = settings.setdefault("permissions", {}).setdefault("allow", [])
+    permissions = settings.setdefault("permissions", {})
+    if not isinstance(permissions, dict):
+        raise ValueError("settings.json permissions must be an object")
+    allowed = permissions.setdefault("allow", [])
+    if not isinstance(allowed, list):
+        raise ValueError("settings.json permissions.allow must be a list")
     for name in ("wal_note.py", "publish_feature.py", "integrate_local.py", "deliver.py"):
         rule = f"Bash(python3 ~/.claude/hooks/{name} *)"
         if rule not in allowed:
@@ -588,12 +685,45 @@ def read_regular(path: Path, *, pinned_parent=None, retain_fd=None):
         return None
 
 
+def service_commands(claude: Path) -> list[list[str]]:
+    """Host services the harness runs: ahd, the deterministic monitor and scheduler (goodqa#14791). Each is
+    registered through its own unit installer after the files are in place; detector-only until S2 lands."""
+    return [[sys.executable, str(claude / "hooks" / "ahd.py"), "install", "--apply"]]
+
+
+class ServiceError(RuntimeError):
+    """A host service failed to register; the files are already installed and stay installed."""
+
+
+def install_services(claude: Path, runner=None) -> list[str]:
+    import subprocess  # noqa: PLC0415
+
+    runner = runner or (lambda argv: subprocess.run(argv, stdin=subprocess.DEVNULL, check=False, timeout=120,
+                                                   capture_output=True, text=True))
+    done = []
+    for argv in service_commands(claude):
+        label = " ".join(argv[1:])
+        try:
+            result = runner(argv)
+        except subprocess.TimeoutExpired as error:
+            raise ServiceError(f"service registration timed out after {error.timeout}s: {label}; files are installed, "
+                               "re-run `install.py --apply --services` or that command by hand") from error
+        rc = getattr(result, "returncode", 0)
+        if rc:
+            tail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "")[-300:]
+            raise ServiceError(f"service registration failed (exit {rc}): {label}; files are installed; {tail.strip()}")
+        done.append(label)
+    return done
+
+
 def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool = True,
-            command_guard: bool = True) -> list[str]:
+            command_guard: bool = True, log_backup=None, services: bool = False) -> list[str]:
     claude = home.expanduser().resolve() / ".claude"
+    if log_backup is None:
+        log_backup = log_backup_alert(home, None)
     files = [
         *((ROOT / "harness" / folder / name, claude / folder / name)
-          for folder, names in (("agents", AGENTS), ("hooks", HOOKS), ("tools", TOOLS))
+          for folder, names in (("agents", AGENTS), ("hooks", HOOKS), ("tools", TOOLS), ("skills", SKILLS))
           for name in names),
     ]
     managed = [destination for _, destination in files] + [claude / "CLAUDE.md", claude / "settings.json"]
@@ -608,7 +738,7 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
     pins = DirectoryPins()
     try:
         for directory in (claude.parent, claude, claude / 'agents', claude / 'hooks',
-                          claude / 'tools', backup_root):
+                          claude / 'tools', claude / 'skills', claude / 'skills' / 'check-dropped-workstreams', backup_root):
             pins.capture(directory)
         instructions_path = claude / "CLAUDE.md"
         existing_instructions = read_regular(instructions_path, pinned_parent=pins.fd(claude),
@@ -621,21 +751,26 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
         current_settings = json.loads(existing_settings[0].decode()) if existing_settings else {}
         if not isinstance(current_settings, dict):
             raise ValueError("settings.json must contain an object")
-        settings = merged_settings(current_settings, claude, durable_tmp, provenance, command_guard)
+        settings = merged_settings(current_settings, claude, durable_tmp, provenance, command_guard, log_backup)
         # Read every payload before any managed write (also validate it in preview).
         payloads = [(destination, source.read_bytes()) for source, destination in files]
         payloads += [(instructions_path, instructions.encode()),
                      (settings_path, (json.dumps(settings, indent=2) + "\n").encode())]
         changes = [str(path) for path in managed]
         if not apply:
+            if services:  # preview: name the service commands a real --apply --services run would execute
+                changes.extend("would run service: " + " ".join(argv[1:]) for argv in service_commands(claude))
             return changes
+        for note in migrate_local_profiles(claude):
+            print(f"  {note}")
         originals = {path: read_regular(path, pinned_parent=pins.fd(path.parent),
                                         retain_fd=pins.file_fds)
                      for path in managed}
         if originals[instructions_path] != existing_instructions or originals[settings_path] != existing_settings:
             raise OSError('User settings or instructions changed during installation preflight; retry')
         # Exclusive creation rejects a real directory that appears after snapshot.
-        for directory in (claude, claude / 'agents', claude / 'hooks', claude / 'tools', backup_root):
+        for directory in (claude, claude / 'agents', claude / 'hooks', claude / 'tools',
+                          claude / 'skills', claude / 'skills' / 'check-dropped-workstreams', backup_root):
             pins.create(directory)
         os.fchmod(pins.fd(backup_root), 0o700)  # backups can include env values
         pins.verify(backup_root)
@@ -647,10 +782,17 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
         for path in managed:
             if originals[path] is not None:
                 saved = backups / path.relative_to(claude)
-                if saved.parent != backups:
-                    pins.create(saved.parent)
+                if saved.parent != backups:  # create each level under the backup root (skills/<name>/ is two deep)
+                    rel = saved.parent.relative_to(backups)
+                    for i in range(1, len(rel.parts) + 1):
+                        pins.create(backups.joinpath(*rel.parts[:i]))
                 atomic_write(saved, originals[path][0], pinned_parent=pins.fd(saved.parent),
                              expected_target=None)
+        gate_file = claude / "hooks" / "dropped_gate.py"
+        try:  # the earlier of now and the gate already installed here: the epoch legacy is measured against
+            prior_gate = os.lstat(gate_file).st_mtime if gate_file.is_file() and not gate_file.is_symlink() else None
+        except OSError:
+            prior_gate = None
         installed = {}
         payload_by_path = dict(payloads)
         try:
@@ -683,6 +825,10 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
                 raise RuntimeError(f"Installation failed; rollback incomplete for {', '.join(failures)}; "
                                    f"restore from {backups}") from error
             raise
+        if record_gate_epoch(claude.parent, prior_gate):
+            changes.append("recorded the dropped-owner gate install time")
+        if apply and services:  # host services last, after every file is in place (goodqa#14791 S1d)
+            changes.extend("service: " + c for c in install_services(claude))
         return changes
     finally:
         pins.close()
@@ -807,6 +953,60 @@ def netwatch_status(home: Path, apply: bool, flag) -> str:
         return f"netwatch: skipped ({error.__class__.__name__}: {error})"
 
 
+def migrate_local_profiles(claude: Path, policy_dir: Path | None = None) -> list[str]:
+    """Before the shipped policies are overwritten, copy their personal values into new untracked 0600 profiles.
+    Never overwrites an existing profile. Without this an upgrade would silently turn ticket enforcement off."""
+    notes = []
+    hooks = policy_dir if policy_dir is not None else claude / "hooks"  # Codex keeps its policies in ~/.codex/agent-harness
+    def keep(name, build):
+        old, target = hooks / name, hooks / name.replace(".json", ".local.json")
+        if target.exists() or target.is_symlink() or not old.is_file():
+            return
+        try:
+            data = build(json.loads(old.read_text(encoding="utf-8")))
+        except (OSError, ValueError, AttributeError):
+            return
+        if data:
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+            notes.append(f"migrated personal values from {name} to {target.name} (mode 0600)")
+    def commit(policy):
+        out = {}
+        if policy.get("backstop_repos"):
+            out["backstop_repos"] = policy["backstop_repos"]
+        keys = ("repos", "org_id", "key_file", "key_secret", "default_project", "projects", "unreachable_projects", "unreachable_reason")
+        systems = {n: {k: v for k, v in e.items() if k in keys and v not in ([], {}, "", None)}
+                   for n, e in (policy.get("ticket_systems") or {}).items() if isinstance(e, dict)}
+        for e in systems.values():  # the loader accepts only these route keys; an old extra key would break commits
+            if isinstance(e.get("projects"), dict):
+                e["projects"] = {s: {k: v for k, v in r.items() if k in ("project_id", "org_id", "key_file")}
+                                 for s, r in e["projects"].items() if isinstance(r, dict)}
+        systems = {n: e for n, e in systems.items() if e.get("repos") or e.get("org_id")}
+        if systems:
+            out["ticket_systems"] = systems
+        return out
+    def spec(policy):
+        out = {k: policy[k] for k in ("projects", "enforced_projects") if policy.get(k)}
+        if isinstance(out.get("projects"), dict):
+            out["projects"] = {s: {k: v for k, v in r.items() if k in ("project_id", "org_id", "key_file")}
+                               for s, r in out["projects"].items() if isinstance(r, dict)}
+        return out
+    keep("commit_policy.json", commit)
+    keep("spec_policy.json", spec)
+    return notes
+
+
+def local_profile_status(home: Path, policy_dir: Path | None = None) -> str:
+    """The shipped policy is generic, so a host without commit_policy.local.json has ticket enforcement off."""
+    hooks = policy_dir if policy_dir is not None else home.expanduser() / ".claude" / "hooks"
+    missing = [name for name in ("commit_policy.local.json", "spec_policy.local.json") if not (hooks / name).is_file()]
+    if not missing:
+        return f"policy profiles: commit_policy.local.json and spec_policy.local.json present in {hooks}"
+    return ("policy profiles: MISSING " + ", ".join(missing) + " -- ticket enforcement, the git backstop and spec "
+            "project routing match nothing until you copy each .example beside the installed hooks and fill it in")
+
+
 def command_guard_status(enabled: bool, runner=None) -> str:
     """Claude Code before 2.1.295 ignores onFailure, so fail-closed then rests on the launcher alone."""
     if not enabled:
@@ -827,9 +1027,42 @@ def command_guard_status(enabled: bool, runner=None) -> str:
     return "command guard: registered with onFailure block"
 
 
+def log_backup_enabled(home: Path, flag) -> bool:
+    """--log-backup/--no-log-backup, else the remembered choice, else on only where the component is installed."""
+    try:
+        import log_backup_install
+        return log_backup_install.choice(home, flag)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def log_backup_alert(home: Path, flag) -> bool:
+    """The SessionStart alert stays registered wherever the component is installed, even after --no-log-backup: a
+    backup that was switched off on purpose is still a host whose logs are not being backed up, and the alert says so."""
+    try:
+        import log_backup_install
+        return log_backup_install.choice(home, flag) or log_backup_install.component_installed(home.expanduser().resolve())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def log_backup_status(home: Path, apply: bool, flag=None) -> str:
+    """Scheduled log backup (script, excludes, launchd or systemd units); never fails the harness install."""
+    try:
+        import log_backup_install
+        enabled = log_backup_install.choice(home, flag)
+        if apply and flag is not None:
+            log_backup_install.save_choice(home.expanduser().resolve(), flag)
+        return log_backup_install.status(home, apply, enabled=enabled)
+    except Exception as error:  # noqa: BLE001
+        return f"log backup: skipped ({error.__class__.__name__}: {error})"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="write changes; otherwise only preview paths")
+    parser.add_argument("--services", action="store_true",
+                        help="also register the host services (the ahd launchd/systemd job) after the files are installed")
     parser.add_argument("--home", type=Path, default=Path.home(), help=argparse.SUPPRESS)
     choice = parser.add_mutually_exclusive_group()
     choice.add_argument("--no-durable-tmp", dest="durable_tmp", action="store_false", default=None,
@@ -847,6 +1080,13 @@ def main() -> None:
     parser.add_argument("--no-command-guard", dest="command_guard", action="store_false",
                         help="do not register the destructive/config-dump command guard and remove an earlier "
                              "registration (rollback); the files stay installed; not remembered")
+    backup = parser.add_mutually_exclusive_group()
+    backup.add_argument("--log-backup", dest="log_backup", action="store_true", default=None,
+                        help="install the scheduled Dropbox log backup (script, units, SessionStart alert) and "
+                             "remember the choice; plaintext uploads until encryption lands (GoodQA #14522)")
+    backup.add_argument("--no-log-backup", dest="log_backup", action="store_false",
+                        help="remember not to install it; where installed, stop its scheduler job (files and "
+                             "remote copies stay; see docs/operations.md, Agent log backup, for rollback)")
     args = parser.parse_args()
     durable_tmp = durable_tmp_choice(args.home, args.durable_tmp)
     if args.apply and args.durable_tmp is not None:
@@ -859,7 +1099,8 @@ def main() -> None:
                            "real directory, not a symlink\n")
     try:
         changes = install(args.home, args.apply, durable_tmp=durable_tmp, provenance=args.provenance,
-                          command_guard=args.command_guard)
+                          command_guard=args.command_guard, log_backup=log_backup_alert(args.home, args.log_backup),
+                          services=args.services)
     except DirectoryPublicationError as error:
         parser.exit(1, f'Install failed: {error}\n')
     action = "Installed" if args.apply else "Would install"
@@ -869,7 +1110,9 @@ def main() -> None:
     print(f"  {install_git_backstop(args.home, args.apply)}")
     print(f"  {scratch_status(args.home, args.apply, durable_tmp)}")
     print(f"  {netwatch_status(args.home, args.apply, args.netwatch)}")
+    print(f"  {local_profile_status(args.home)}")
     print(f"  {command_guard_status(args.command_guard)}")
+    print(f"  {log_backup_status(args.home, args.apply, args.log_backup)}")
     if not args.apply:
         print("Run with --apply to install. Existing files will be backed up.")
 

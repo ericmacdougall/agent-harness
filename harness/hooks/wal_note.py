@@ -16,6 +16,22 @@ EVENTS = {'intent', 'scope', 'decision', 'risk', 'check', 'commit', 'blocker', '
           'requirement', 'ask', 'ask_resolved'}
 # Events whose origin must be traceable (provenance.py). The mode per event is in provenance_policy.json.
 SOURCED = ('requirement', 'ask', 'blocker', 'scope', 'decision')
+TOOL_WRITERS = frozenset({'escalation', 'ahd', 'dropped_gate', 'ah-run'})  # rows these tools write on an agent's behalf (goodqa#14791)
+# provenance.py problem codes that mean the caller wrote a source that can never resolve: refused outright, nothing
+# written (goodqa#14927). Transient or environmental codes (scan-timeout, transcript-malformed, wal-missing,
+# file-unreadable, internal ...) keep the warn-mode quarantine path so a busy host does not drop a note.
+CALLER_ERROR_CODES = frozenset({
+    'bad-syntax', 'unknown-kind', 'no-source', 'excerpt-missing', 'excerpt-short', 'excerpt-not-found',
+    'inferred-no-inputs', 'inferred-no-rationale', 'inferred-nested', 'inferred-ungrounded', 'file-path', 'file-line',
+    'wal-bad-path', 'wal-entry-not-found', 'wal-unsourced', 'user-session-invalid', 'not-user-authored',
+    'message-not-found', 'ticket-missing', 'transcript-missing', 'item-not-found', 'cycle', 'too-deep',
+    'too-many-sources', 'ambiguous'})
+
+
+def caller_error(problem) -> bool:
+    """True when a provenance_check problem is a rejection whose code is the caller's own error (see CALLER_ERROR_CODES)."""
+    match = re.match(r'source rejected \(([a-z-]+)\)', problem or '')
+    return bool(match) and match.group(1) in CALLER_ERROR_CODES
 SECRET_PATTERN = re.compile(
     r'(?i)(?:\bgh[pousr]_[A-Za-z0-9_]+|\bgithub_pat_[A-Za-z0-9_]+|'
     r'\bsk-[A-Za-z0-9-]{12,}|\bAKIA[A-Z0-9]{12}|'
@@ -58,6 +74,28 @@ def provenance_check(event, source):
         return 'enforce' if event in ('requirement', 'ask') else 'warn', f'provenance check failed ({type(error).__name__})', False
 
 
+def open_ask_exists(path, ref: str) -> bool:
+    """True when `ref` is an `ask` entry of this WAL with no later `ask_resolved` naming it (bounded tail read)."""
+    try:
+        import safe_input  # noqa: PLC0415
+        tail = safe_input.read_tail(path, 4 << 20)
+    except Exception:  # noqa: BLE001 - a WAL that cannot be read cannot hold an open ask
+        return False
+    seen, resolved = False, False
+    for raw in tail.splitlines():
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if rec.get('event') == 'ask' and rec.get('id') == ref:
+            seen, resolved = True, False
+        elif rec.get('event') == 'ask_resolved' and rec.get('ref') == ref:
+            resolved = True
+    return seen and not resolved
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--wal', type=Path, required=True)
@@ -66,6 +104,8 @@ def main():
     parser.add_argument('--source', help='origin: user:<session>/<uuid> "excerpt" | ticket: | wal: | file: | inferred: (see provenance.py)')
     parser.add_argument('--reason', help='why this is asked of the user (required for ask)')
     parser.add_argument('--ref', help='id of the ask being closed (ask_resolved)')
+    parser.add_argument('--by', help='tool that writes this row on an agent\'s behalf (never quarantined; cites its state in the note)')
+    parser.add_argument('--recites', help='id of an unsourced entry of this WAL that this sourced row re-cites (clears its quarantine)')
     args = parser.parse_args()
     root = Path.home() / '.claude' / 'wals'
     path = args.wal.absolute()
@@ -91,9 +131,38 @@ def main():
     if args.event == 'ask_resolved':
         if not args.ref or not re.fullmatch(r'[A-Za-z0-9_-]{4,40}', args.ref):
             parser.error('ask_resolved needs --ref <ask id>')
+        # G5 (goodqa#14791): a resolution names an open ask of this WAL and carries the source of the answer
+        if not open_ask_exists(path, args.ref):
+            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': f'no open ask {args.ref} in this WAL',
+                              'hint': 'ask_resolved --ref must name an ask entry of this WAL that is not already resolved'}),
+                  file=sys.stderr)
+            return 2
+        if not args.source or not args.source.strip():
+            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved needs --source',
+                              'hint': 'cite the answer: user:<session>/<uuid> "words", answer:<id> or queue:<id> (ah user-msg)'}),
+                  file=sys.stderr)
+            return 2
+        if not re.match(r'^(user:|answer:|queue:|ticket:)', args.source.strip()):
+            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved source must be the answer: user:, answer:, queue: or ticket:',
+                              'hint': 'an ask cannot be closed on an inferred: or file: source'}), file=sys.stderr)
+            return 2
+        mode, problem, assumption = provenance_check('ask', args.source)  # the answer is sourced like an ask (M1)
+        if problem:
+            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': problem[:300],
+                              'hint': 'the resolution source must resolve: user:, answer:, queue: or ticket:'}), file=sys.stderr)
+            return 2
         record['ref'] = args.ref
+        record['source'] = args.source.strip()[:2000]
+        if assumption:
+            record['assumption'] = True
     if args.event in SOURCED:
         mode, problem, assumption = provenance_check(args.event, args.source)
+        if problem and args.source and caller_error(problem):
+            # A source that was given but can never resolve is a caller error, whatever the mode: writing it
+            # anyway (quarantined) only moved the failure to the stop hook (main WAL w842c8dfc127, 2026-11-06).
+            print(json.dumps({'status': 'REFUSED', 'event': args.event, 'problem': problem[:300],
+                              'hint': 'nothing was written; fix the --source (see provenance.py) and retry'}), file=sys.stderr)
+            return 2
         if problem:
             if mode == 'enforce':
                 print(json.dumps({'status': 'REFUSED', 'event': args.event, 'problem': problem[:300],
@@ -102,10 +171,20 @@ def main():
             if mode == 'warn':
                 warnings.append(problem[:300])
                 record['provenance'] = 'missing' if not args.source else 'unverified'
+                if not args.source or 'rejected' in problem or 'failed' in problem:  # missing, rejected or unresolvable: quarantined (P11)
+                    record['unsourced'] = True  # an unverifiable ticket (tracker unreachable) is not a quarantine case
         if args.source:
             record['source'] = args.source.strip()[:2000]
             if assumption:
                 record['assumption'] = True
+    if args.by:
+        if args.by.strip() not in TOOL_WRITERS:
+            parser.error(f'--by must be one of {sorted(TOOL_WRITERS)}: tool-written rows are an allowlist, not a claim')
+        record['by'] = args.by.strip()
+    if args.recites:
+        if not re.fullmatch(r'w[0-9a-f]{11}', args.recites) or not args.source:
+            parser.error('--recites needs an entry id (w + 11 hex) and a --source on this row')
+        record['recites'] = args.recites
     append(path, record)
     for warning in warnings:
         print('wal_note: provenance warning: ' + warning, file=sys.stderr)

@@ -28,6 +28,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import safe_input
 import ticket_adapters as ta
 
 HERE = Path(__file__).resolve().parent
@@ -67,9 +68,35 @@ class SpecError(Exception):
 
 # --------------------------------------------------------------------------- configuration
 
+SPEC_LOCAL_KEYS = ("projects", "enforced_projects")
+
+
 def load_spec_policy(path: Path = POLICY_FILE) -> dict:
+    """The shipped policy is generic. Personal values (your GoodQA projects, which projects are enforced)
+    live in the untracked spec_policy.local.json beside it, which may set only SPEC_LOCAL_KEYS. A profile
+    that exists but cannot be read fails closed (ValueError)."""
     with open(path, encoding="utf-8") as handle:
         policy = json.load(handle)
+    local = Path(path).with_name("spec_policy.local.json")
+    if os.path.lexists(local) and not local.is_file():
+        raise ValueError(f"{local} exists but is not a readable regular file")
+    if local.is_file():
+        try:
+            overlay = safe_input.safe_json_loads(safe_input.read_bounded(local, 1 << 20))
+        except (OSError, ValueError, safe_input.InputRejected) as error:
+            raise ValueError(f"{local} is not a readable JSON object: {error}") from error
+        if not isinstance(overlay, dict):
+            raise ValueError(f"{local} is not a JSON object")
+        forbidden = sorted(k for k in overlay if k not in SPEC_LOCAL_KEYS and not k.startswith("_"))
+        if forbidden:
+            raise ValueError(f"{local} may only set {list(SPEC_LOCAL_KEYS)}, not {forbidden}")
+        routes = overlay.get("projects") or {}
+        if not isinstance(routes, dict) or not isinstance(overlay.get("enforced_projects", []), list):
+            raise ValueError(f"{local}: projects must be an object and enforced_projects a list")
+        for slug, route in routes.items():
+            if not isinstance(route, dict) or set(route) - {"project_id", "org_id", "key_file"}:
+                raise ValueError(f"{local}: project route {slug!r} may only set project_id, org_id, key_file")
+        policy = {**policy, **{k: v for k, v in overlay.items() if k in SPEC_LOCAL_KEYS}}
     if not isinstance(policy, dict) or policy.get("schema") != 1:
         raise ValueError(f"{path} is not a schema 1 spec policy")
     for key in ("mode", "plan_ticket_gate"):
@@ -555,6 +582,24 @@ def wal_entries(path: Path):
     return entries
 
 
+LOCAL_URL_RE = re.compile(r"^\s*(?:https?://)?(?:localhost|127\.|0\.0\.0\.0|\[::1\])", re.I)
+LIVE_TARGET_RE = re.compile(r"\b(live|production|prod)\b|https?://(?!(?:localhost|127\.|0\.0\.0\.0|\[::1\]))", re.I)
+DEPLOY_WORD_RE = re.compile(r"\b(deployed|installed|released)\b", re.I)
+NOT_LIVE_WORDS_RE = re.compile(  # twin of ah.NOT_LIVE_WORDS_RE: a note that says it was not live proves nothing live
+    r"\b(?:not|never|isn't|wasn't|aren't|weren't)\s+(?:(?:yet|on|in|to|the|deployed|released)\s+)*(?:live|prod|production)\b"
+    r"|\b(?:staging|pre-?prod(?:uction)?|locally|local[- ]only|dry[- ]run)\b", re.I)
+SHA_OR_VERSION_RE = re.compile(r"\b[0-9a-f]{7,40}\b|\bv?\d+\.\d+(?:\.\d+)?\b")
+
+
+def live_deploy_test(note) -> bool:
+    """A REALLY_TESTED note that proves done for work without a UI: it names what was deployed or installed (a sha or
+    version) and a live target, and no loopback address (main WAL w07450081c12)."""
+    note = str(note or "")
+    return bool(DEPLOY_WORD_RE.search(note) and SHA_OR_VERSION_RE.search(note) and LIVE_TARGET_RE.search(note)
+                and not re.search(r"https?://(?:localhost|127\.|0\.0\.0\.0|\[::1\])", note, re.I)
+                and not NOT_LIVE_WORDS_RE.search(note))
+
+
 def really_tested(entries: list, ident: str):
     """The REALLY_TESTED note for `ident`, newer than any PENDING_REAL_TEST for it."""
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,40}", ident or ""):
@@ -906,6 +951,9 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
         elif not (latest.get("deployed_commit") or {}).get("sha"):
             missing.append("click-test: the passing record names no deployed commit; rerun click-test with "
                            "--deployed-commit <sha> after deploy")
+        elif LOCAL_URL_RE.match(str(latest.get("url") or "")):
+            missing.append(f"click-test: it ran on {safe(latest.get('url'), 80)}, which is not the live deployment; done "
+                           "means deployed to live and tested, so click-test the live URL")
         elif uncovered := sorted({c.get("sha") for r in evidence if r.get("spec_core_sha") == core
                                   for c in r.get("commits") or [] if c.get("sha")}
                                  - set(latest.get("covers_commits") or [])):
@@ -926,6 +974,12 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
                              f"{safe(tester.get('last_activity_at'))}")
     else:
         notes.append(f"click-test not applicable: {safe(click.get('reason'), 160)}")
+        live = [r for r in evidence if r.get("spec_core_sha") == core and live_deploy_test((r.get("really_tested") or {}).get("note"))]
+        if not live:
+            missing.append("live test: the click-test is not-applicable, but done still means deployed to live and tested. "
+                           f"Fix: spec_flow.py evidence --ticket '{label}' --ac <AC> --really-tested <id> --wal <WAL>, where "
+                           "the REALLY_TESTED note names what was deployed or installed (its sha or version) and the live "
+                           "target it ran on")
     # sign-off
     human_required = spec.get("signoff") == "human" or "human sign-off" in str(issue.get("description") or "").lower()
     signoffs = [r for r in records if r["kind"] == "signoff" and r.get("spec_core_sha") == core]

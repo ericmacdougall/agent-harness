@@ -40,6 +40,9 @@
           <button class="quiet-button" id="quit-console" title="Stop the console and its owned sessions" data-testid="quit-console">
             Quit console
           </button>
+          <button class="quiet-button" id="asks-button" title="Asks, owners and requirements" data-testid="asks-button">
+            Asks
+          </button>
           <button class="icon-button" id="settings-button" aria-label="Settings" title="Settings" data-testid="settings-button">
             ⚙
           </button>
@@ -506,6 +509,23 @@
       <textarea id="input-detail-text" rows="10" readonly spellcheck="false"></textarea>
       <button type="button" class="quiet-button" id="input-detail-select">Select text to copy</button>
       <ul id="input-detail-files"></ul>
+    </dialog>
+    <dialog id="asks-dialog" aria-labelledby="asks-title" class="dialog asks-dialog">
+      <div class="dialog-heading">
+        <div>
+          <div class="eyebrow">
+            LIVE FROM THE LEDGER, READ-ONLY
+          </div>
+          <h2 id="asks-title">
+            Asks, owners and requirements
+          </h2>
+        </div>
+        <button class="icon-button" data-close aria-label="Close asks view">
+          ×
+        </button>
+      </div>
+      <div id="asks-content">
+      </div>
     </dialog>
     <dialog id="settings-dialog" aria-labelledby="settings-title" class="dialog settings-dialog">
       <div class="dialog-heading">

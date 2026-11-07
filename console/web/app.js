@@ -1,8 +1,11 @@
 import { openSettings } from './settings.js';
+import { openAsksView } from './asks.js';
 import { composerAction as resolveComposerAction, submissionMatches } from './composer.js';
 import { renderAgentControlNotice } from './agent-control.js';
 import { initReviewMap } from './review-map.js';
+import { createLedgerTracker, ledgerDirs, renderLedgerIcon } from './ledger-icon.js';
 
+let ledgerTracker = null; // created once the page is up (see below); renderers tolerate null
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const state = {
@@ -120,6 +123,7 @@ async function loadState() {
       $('#chat-input').value = state.drafts.get(state.active) || '';
     }
     render();
+    trackLedger();
     if (state.active !== previousSessionID) loadRepository().catch(repoError);
   } finally {
     loading = false;
@@ -202,7 +206,8 @@ function renderTabs() {
       state.drafts.delete(item.id); state.attachments.delete(item.id); state.pendingRequests.delete(item.id);
       await loadState();
     }));
-    wrapper.append(button, close);
+    const ledgerIcon = ledgerTracker ? renderLedgerIcon(el, ledgerTracker.get(item.cwd)) : null;
+    if (ledgerIcon) { wrapper.classList.add('has-ledger'); wrapper.append(button, ledgerIcon, close); } else wrapper.append(button, close);
     $('#session-tabs').append(wrapper);
   }
 }
@@ -787,6 +792,7 @@ async function loadRepository(fetchRemote = false) {
     state.repository = result;
     $('#repo-error').hidden = true;
     renderRepository();
+    trackLedger();
   } finally {
     repositoryRequests.delete(key);
   }
@@ -803,6 +809,8 @@ function renderRepository() {
   if (state.stopped) return;
   const repo = state.repository;
   $('#repo-summary').textContent = repo?.root ? `${repo.branch || 'Detached HEAD'}${repo.dirty ? ' · uncommitted changes' : ''}` : 'No repository selected';
+  const summaryIcon = ledgerTracker && repo?.root ? renderLedgerIcon(el, ledgerTracker.get(repo.root)) : null;
+  if (summaryIcon) $('#repo-summary').append(' ', summaryIcon);
   $('#repository-list').replaceChildren();
   const rows = [...(repo?.[state.repoView] || [])].sort((a, b) => Number(!!b.current) - Number(!!a.current) || Number(!!a.prunable) - Number(!!b.prunable));
   if (!rows.length) $('#repository-list').append(el('p', 'sidebar-empty', 'Repository state appears for the selected directory.'));
@@ -1249,6 +1257,7 @@ $('#quit-console').addEventListener('click', () => confirmAction({
     for (const node of $$('button, input, select, textarea')) node.disabled = true;
   },
 }));
+$('#asks-button').addEventListener('click', () => openAsksView({ api, el }));
 $('#settings-button').addEventListener('click', () => openSettings({ api, notify, el, refresh: loadState, filePicker, cwd: () => session()?.cwd || state.snapshot.defaultCwd || '' }));
 for (const button of $$('.segmented-control button')) {
   button.addEventListener('click', () => {
@@ -1258,6 +1267,8 @@ for (const button of $$('.segmented-control button')) {
   });
 }
 const reviewMap = initReviewMap({ api, notify, el, session, $ });
+ledgerTracker = createLedgerTracker({ api, onChange: () => { renderTabs(); renderRepository(); } });
+function trackLedger() { ledgerTracker?.track(ledgerDirs(state.sessions, state.repository?.root)); }
 for (const button of $$('[data-close]')) button.addEventListener('click', () => button.closest('dialog').close());
 for (const dialog of $$('dialog')) {
   dialog.addEventListener('click', event => {

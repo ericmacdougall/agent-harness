@@ -219,13 +219,17 @@ exec "$FIXTURE_REAL_GIT" "$@"
         hooks = DELIVER.parent
         spec = importlib.util.spec_from_file_location('workflow_fixture_target', DELIVER)
         module = importlib.util.module_from_spec(spec)
+        captured = io.StringIO()
+        # The path patch must cover main() too: deliver imports commit_policy (and friends)
+        # dynamically while running, so it fails when this file is the only one on the path
+        # (it passes in a full discover run only because an earlier test module imported
+        # commit_policy first).
         with mock.patch.object(sys, 'path', [str(hooks), *sys.path]):
             spec.loader.exec_module(module)
-        captured = io.StringIO()
-        with mock.patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(captured):
-            with mock.patch.object(sys, 'argv', [str(DELIVER), *(arguments or self.finish_args())]):
-                with patch_factory(module):
-                    code = module.main()
+            with mock.patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(captured):
+                with mock.patch.object(sys, 'argv', [str(DELIVER), *(arguments or self.finish_args())]):
+                    with patch_factory(module):
+                        code = module.main()
         return code, json.loads(captured.getvalue())
 
     def baseline_args(self, head):
@@ -495,6 +499,31 @@ exec "$FIXTURE_REAL_GIT" "$@"
                 self.assertEqual(json.loads(state.read_text()), record)
         state.write_bytes(before)
         self.assertEqual(command('git', 'rev-parse', 'HEAD', cwd=self.original, env=self.env).stdout.strip(), self.base)
+
+    def test_focused_baseline_check_must_run_a_test(self):
+        # GoodQA #14729: the focused form reaches finish --resolve-baseline; a pattern that runs no test must not resolve.
+        self.configure_github()
+        result, data = self.invoke(*self.prepare_args())
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.merge_remote()
+        code, _ = self.direct_finish(lambda module: mock.patch.object(module.OriginalScope, 'reserve_external',
+                                                                      side_effect=OSError('fixture reserve fault')))
+        self.assertEqual(code, 3)
+        state = Path(data['state'])
+        before = state.read_bytes()
+
+        def focused(pattern):
+            args = self.baseline_args(self.base)
+            args[args.index('--check') + 1] = 'python3 -m unittest discover -s tests -p ' + pattern
+            return args
+        empty, error = self.invoke(*focused('test_missing.py'))
+        self.assertEqual((empty.returncode, error['status']), (3, 'RECOVERY_REQUIRED'), empty.stdout)
+        self.assertEqual(state.read_bytes(), before)
+        globbed, error = self.invoke(*focused("'test_*.py'"))
+        self.assertEqual((globbed.returncode, error['status']), (2, 'BLOCKED_POLICY'), globbed.stdout)
+        self.assertEqual(state.read_bytes(), before)
+        passed, outcome = self.invoke(*focused('test_format.py'))
+        self.assertEqual((passed.returncode, outcome['status']), (0, 'RESOLVED_BASELINE'), passed.stdout)
 
     def test_baseline_negative_checks_and_transition_crashes_preserve_no_delivery(self):
         self.configure_github()

@@ -318,7 +318,7 @@
   "source": "OWNER-BRIEF-COMMON.md; ~/.claude/CLAUDE.md deliver",
   "rule": "Push feature branches (plain push, never force); nothing unique stays on one machine; Dropbox backups copy-only.",
   "enforcement": "HELPER-CHECKED",
-  "live_evidence": "dev2 has hawkeye-worktree-hygiene Stop hook (dev2 only); Mac none.",
+  "live_evidence": "worktree_hygiene.py (vendored dev2 hawkeye-worktree-hygiene, goodqa#14908) blocks a stop once per state on uncommitted work or commits on a detached HEAD, and reports unpushed named-branch commits, merged and duplicate worktrees.",
   "checkable": "YES",
   "checkable_reason": "git status/branch --no-merged vs remote is deterministic.",
   "proposed_event": "Stop and SubagentStop",
@@ -328,8 +328,12 @@
   "priority": "P1",
   "owner_overlap": "new; port dev2 hawkeye-worktree-hygiene",
   "matrix_rows": "",
-  "mechanisms": [],
-  "planned_batch": "B4"
+  "mechanisms": [
+   "worktree_hygiene:stop",
+   "worktree_hygiene:subagent-stop"
+  ],
+  "planned_batch": "B4",
+  "partial_reason": "unpushed commits on a named branch are reported, not blocked, unless block_unpushed is set (harness publication goes through deliver.py); the report is a systemMessage, which reaches the user, not the agent; Dropbox copy-only backups are not checked by this hook"
  },
  {
   "id": "S19",
@@ -498,6 +502,50 @@
   "planned_batch": "B4"
  },
  {
+  "id": "S27",
+  "source": "ticket:GoodQA goodqa#14506 (matrix X05, G08); docs/rules/kill-guard.json",
+  "rule": "No agent kills a process it cannot prove it owns: no pkill, killall, fuser -k, taskkill, Stop-Process or pgrep-fed kill, and no plain kill of another owner's PID.",
+  "enforcement": "HOOK-ENFORCED",
+  "live_evidence": "kill_guard.py (GoodQA #14506) blocks these on Claude Code and Codex; install.py and install_codex.py register it. On Codex it runs only once its hook is trusted.",
+  "checkable": "YES",
+  "checkable_reason": "Kill verbs and targets are parseable, and ownership is checked from process cwd, argv and a spawn ledger.",
+  "proposed_event": "PreToolUse Bash (+Codex PreToolUse)",
+  "proposed_check": "Parse the command, judge kill words with a closed grammar, and block any target not proven to be the caller's.",
+  "on_failure": "block",
+  "failing_first_test": "tests/kill_guard_grammar_corpus.json judged by decide(): R4, R5, RR, TC and AH hold rows that fail at d1a0fd5, while OK, R3OK, R4OK, RROK and PKILL pin what must keep working; tests/live_kill_canary.py on dev2 with its own sleepers.",
+  "priority": "P0",
+  "owner_overlap": "feat/kill-guard-14506; open routes are in docs/operations.md Kill guard Known limits, starting from goodqa#14654 and goodqa#14712",
+  "matrix_rows": "X05,G08",
+  "mechanisms": [
+   "kill_guard:hook"
+  ],
+  "mode": {
+   "file": "kill_guard_policy.json",
+   "key": "mode"
+  },
+  "partial_reason": "text and value routes in docs/operations.md Kill guard Known limits are not closed, and the threat model is careless agents, not one that edits its hooks"
+ },
+ {
+  "id": "S28",
+  "source": "Hawkeye clients/claude-code/CLAUDE-rules.md (2026-09-12 live D1 delete)",
+  "rule": "Destructive SQL against a production database needs a recorded, user-sourced approval first.",
+  "enforcement": "HOOK-ENFORCED",
+  "live_evidence": "Hawkeye hawkeye-prod-delete-guard.py on dev2 only; prod_delete_guard.py ports it (goodqa#14908).",
+  "checkable": "YES",
+  "checkable_reason": "A destructive verb plus an identifiable prod target (D1 --remote, connection string, DB client host/db flag, D1/hyperdrive MCP tool).",
+  "proposed_event": "PreToolUse Bash and DB MCP tools",
+  "proposed_check": "Deny unless a live, HMAC-signed grant in ~/.agent-harness/state/prod-delete-grants.json names each exact production target the command reaches, funded by an AskUserQuestion answer whose selected option names that target, and whose source still resolves from the pinned ~/.claude.",
+  "on_failure": "deny after a match (including an unreadable, unsigned or corrupt grant store, and an unreadable SQL file); allow before one",
+  "failing_first_test": "psql --host=prod-db... TRUNCATE denied with no grant; allowed with a live grant for that host; localhost DROP allowed.",
+  "priority": "P1",
+  "owner_overlap": "Hawkeye port goodqa#14908",
+  "matrix_rows": "",
+  "partial_reason": "a grant needs a human turn of at most 1 h that names the exact target, which shows the human saw the name, not that they approved this delete; SQL built at run time, unnamed default targets, PGSERVICE, MySQL multi-table DELETE, mongosh and redis-cli deletes are not detected; a connection-string grant on a generic database name covers it on every prod host; a same-user process or the Write/Edit tools can read or plant the key and sign a grant",
+  "mechanisms": [
+   "prod_delete_guard:hook"
+  ]
+ },
+ {
   "id": "W01",
   "source": "~/.claude/CLAUDE.md Orchestrate",
   "rule": "Scope brief in WAL before assigning (fields); inspect owner ledger before spawning; route related work to existing owner.",
@@ -557,7 +605,7 @@
   "source": "~/.claude/CLAUDE.md Write-ahead log",
   "rule": "Append a human-readable WAL intent before editing and a result after the check.",
   "enforcement": "ADVISORY",
-  "live_evidence": "wal.py pretool logs metadata (not semantic); dev2 hawkeye-wal-cadence Stop hook (dev2 only).",
+  "live_evidence": "wal.py pretool logs metadata (not semantic); wal_cadence.py (port of dev2 hawkeye-wal-cadence, goodqa#14908) nudges once per diff at Stop (linked-worktree cwd) and SubagentStop (the agent's own worktrees only; trees elsewhere are not nudged).",
   "checkable": "YES",
   "checkable_reason": "Presence of intent/result entries by event type is deterministic.",
   "proposed_event": "Stop + SubagentStop",
@@ -567,8 +615,12 @@
   "priority": "P2",
   "owner_overlap": "port hawkeye-wal-cadence",
   "matrix_rows": "",
-  "mechanisms": [],
-  "planned_batch": "B4"
+  "mechanisms": [
+   "wal_cadence:stop",
+   "wal_cadence:subagent-stop"
+  ],
+  "planned_batch": "B4",
+  "partial_reason": "nudges only for 40+ uncommitted source lines with no human WAL note in 20 minutes, once per diff; it does not check intent-before-edit ordering"
  },
  {
   "id": "W05",

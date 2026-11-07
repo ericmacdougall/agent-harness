@@ -17,6 +17,20 @@
    ]
   },
   {
+   "id": "log_backup:session-start",
+   "script": "log_backup.py",
+   "arg": "session-start",
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "pending",
+   "owner": "log backup (GoodQA #14471)",
+   "rules": [],
+   "known_gap": "opt-in: wired only where the log backup is installed (install.py --log-backup), so doctor reports it NOT-ENFORCED elsewhere"
+  },
+  {
    "id": "wal:prompt",
    "script": "wal.py",
    "arg": "prompt",
@@ -398,17 +412,19 @@
   {
    "id": "kill_guard:hook",
    "script": "kill_guard.py",
-   "arg": null,
+   "arg": "hook",
    "event": "PreToolUse",
    "tools": [
     "Bash"
    ],
    "flavors": [
-    "claude"
+    "claude",
+    "codex"
    ],
-   "status": "pending",
-   "owner": "feat/kill-guard-14506",
-   "rules": []
+   "status": "installed",
+   "rules": [
+    "S27"
+   ]
   },
   {
    "id": "heavy_job_guard:hook",
@@ -424,6 +440,47 @@
    "status": "installed",
    "rules": [
     "S20"
+   ]
+  },
+  {
+   "id": "prod_delete_guard:hook",
+   "script": "prod_delete_guard.py",
+   "arg": null,
+   "event": "PreToolUse",
+   "tools": [
+    "Bash",
+    "mcp__hawkeye__run",
+    "mcp__cloudflare__d1_database_query",
+    "mcp__pg__execute_sql"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S28"
+   ],
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+       "command": "ls"
+      }
+     },
+     "expect": "allow"
+    },
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+       "command": "psql --host=prod-db.example.invalid -c 'TRUNCATE sessions'"
+      }
+     },
+     "expect": "deny"
+    }
    ]
   },
   {
@@ -457,6 +514,165 @@
    "status": "installed",
    "rules": [
     "S19"
+   ]
+  },
+  {
+   "id": "ledger-reminder:SessionStart",
+   "script": "ledger_reminder.py",
+   "arg": null,
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "ledger-reminder:UserPromptSubmit",
+   "script": "ledger_reminder.py",
+   "arg": null,
+   "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "bg_lint:pretool",
+   "script": "bg_lint.py",
+   "arg": null,
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "dropped-gate:stop",
+   "script": "dropped_gate.py",
+   "arg": null,
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S23"
+   ]
+  },
+  {
+   "id": "dropped-gate:pretool",
+   "script": "dropped_gate.py",
+   "arg": "pretool",
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S23"
+   ]
+  },
+  {
+   "id": "dropped-gate:subagent-stop",
+   "script": "dropped_gate.py",
+   "arg": "subagent-stop",
+   "event": "SubagentStop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S23"
+   ]
+  },
+  {
+   "id": "wal_cadence:stop",
+   "script": "wal_cadence.py",
+   "arg": null,
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "W04"
+   ],
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "Stop",
+      "session_id": "doctor-canary",
+      "cwd": "/"
+     },
+     "expect": "allow"
+    }
+   ]
+  },
+  {
+   "id": "wal_cadence:subagent-stop",
+   "script": "wal_cadence.py",
+   "arg": null,
+   "event": "SubagentStop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "W04"
+   ]
+  },
+  {
+   "id": "worktree_hygiene:stop",
+   "script": "worktree_hygiene.py",
+   "arg": null,
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S18"
+   ],
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "Stop",
+      "session_id": "doctor-canary",
+      "cwd": "/",
+      "transcript_path": "/nonexistent/doctor-canary.jsonl"
+     },
+     "expect": "allow"
+    }
+   ]
+  },
+  {
+   "id": "worktree_hygiene:subagent-stop",
+   "script": "worktree_hygiene.py",
+   "arg": null,
+   "event": "SubagentStop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S18"
    ]
   }
  ]

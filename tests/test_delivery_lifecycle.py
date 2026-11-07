@@ -25,11 +25,11 @@ class DeliveryLifecycle(unittest.TestCase):
         fixtures.command('git', 'commit', '-qm', 'next feature', cwd=self.feature, env=self.env)
         self.feature_head = self.head(self.feature)
 
-    def resolve(self, key, *, expected=None, env=None):
+    def resolve(self, key, *, expected=None, env=None, check=None):
         result = fixtures.command(sys.executable, str(fixtures.INTEGRATE),
                                   '--repo', str(self.original), '--original-branch', 'main',
                                   '--expected-head', expected or self.head(self.original),
-                                  '--resolve-journal', key, '--check', fixtures.CHECK,
+                                  '--resolve-journal', key, '--check', check or fixtures.CHECK,
                                   env=self.env if env is None else env, check=False)
         return result, json.loads(result.stdout) if result.stdout else {}
 
@@ -84,6 +84,23 @@ class DeliveryLifecycle(unittest.TestCase):
         self.commit_feature('corrected\n', test='import unittest\nclass Check(unittest.TestCase):\n def test_ok(self): self.assertEqual(2+2,4)\n')
         fixed, fixed_data = self.invoke()
         self.assertEqual((fixed.returncode, fixed_data['status']), (0, 'INTEGRATED'), fixed.stdout)
+
+    def test_resolve_journal_accepts_focused_check_only_when_it_runs_a_test(self):
+        # GoodQA #14729: the focused form reaches --resolve-journal; a pattern that runs no test must not resolve.
+        self.commit_feature('feature\n', test='import unittest\nclass Check(unittest.TestCase):\n def test_fail(self): self.fail("control")\n')
+        failed, data = self.invoke()
+        self.assertEqual(failed.returncode, 3, failed.stdout)
+        journal = Path(data['journal'])
+        key = json.loads(journal.read_text())['key']
+        focused = 'python3 -m unittest discover -s tests -p '
+        empty, outcome = self.resolve(key, check=focused + 'test_missing.py')
+        self.assertEqual((empty.returncode, outcome.get('status')), (3, 'RECOVERY_REQUIRED'), empty.stdout + empty.stderr)
+        self.assertNotEqual(json.loads(journal.read_text())['phase'], 'resolved')
+        globbed, outcome = self.resolve(key, check=focused + "'test_*.py'")
+        self.assertEqual((globbed.returncode, outcome.get('status')), (2, 'BLOCKED_POLICY'), globbed.stdout)
+        self.assertNotEqual(json.loads(journal.read_text())['phase'], 'resolved')
+        passed, outcome = self.resolve(key, check=focused + 'test_ok.py')
+        self.assertEqual((passed.returncode, outcome.get('status')), (0, 'RESOLVED'), passed.stdout + passed.stderr)
 
     def test_resolver_rejects_wrong_head_and_wrong_scope_without_retiring(self):
         self.commit_feature('feature\n', test='import unittest\nclass Check(unittest.TestCase):\n def test_fail(self): self.fail("control")\n')

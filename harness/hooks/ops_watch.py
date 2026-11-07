@@ -1245,6 +1245,8 @@ def _owner_alerts(home, session, tickets, now):
     out = []
     for row in rows:
         state = row.get("state", "")
+        if row.get("type") == "task-wal":
+            continue  # task-named WALs are alerted by _task_wal_alert with the ring key form liveness:<s8>/<task>
         if not row.get("owner") or not (state in OWNER_ALERT_STATES or state in OWNER_RUNNING_STATES):
             continue
         task = f"agent-{row['agent_id']}"
@@ -1557,12 +1559,17 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
     state = load_state(home)
     active = state.setdefault("active", {})
     rc = 0
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import liveness  # noqa: PLC0415 - installed beside this file; the one rule shared with ahd
     # A lost or corrupt state must not strand raises: this host's active ops-watch keys in the ring count as
     # previously raised, so they are cleared once their condition is gone.
     for (h, src, key), e in latest_by_key(read_ring(ring)).items():
         if h == host and src == SOURCE and e.get("event") == "raise" and key not in active:
             active[key] = {"severity": e.get("severity", "warning"), "message": e.get("message", ""),
                            "detail": {}, "check": e.get("check") or RUN_CHECK, "since": now}
+        if h == host and src == SOURCE and e.get("event") == "raise" and "written" not in active[key]:
+            # the ring, not the state file, says what readers currently see (also covers older state files)
+            active[key].update(written=e.get("message", ""), refreshed_at=parse_ts(e.get("at")) or now)
     current, ok = {}, {RUN_CHECK}
     for name, fn in (checks if checks is not None else DEFAULT_CHECKS).items():
         try:
@@ -1585,11 +1592,18 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
             active[key] = dict(prev, detail=a["detail"])
             continue
         down.pop(key, None)
+        written, written_at = (prev or {}).get("written"), (prev or {}).get("refreshed_at", 0)
         if prev is None or new_sev != old_sev:
             # new, escalated, or a confirmed downgrade: one transition (a downgrade replaces the stale text)
             events.append(_transition(host, "raise", key, a))
+            written, written_at = a["message"], now
+        elif liveness.alert_text_stale(written if written is not None else prev.get("message", ""), a["message"],
+                                       written_at, now):
+            # same alert, new text: the ring entry is what agents read. Not a new alert, so no digest or mail.
+            events.append(_transition(host, "raise", key, a, {"updated": True}))
+            written, written_at = a["message"], now
         active[key] = {"severity": a["severity"], "message": a["message"], "detail": a["detail"], "check": a["check"],
-                       "since": (prev or {}).get("since", now)}
+                       "since": (prev or {}).get("since", now), "written": written, "refreshed_at": written_at}
     for key in sorted(set(active) - set(current)):
         prev = active[key]
         if prev.get("check") in ok:  # a check that errored this run keeps its alerts; sink alerts clear below
@@ -1606,9 +1620,11 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
             except (OSError, ValueError) as exc:
                 rc = 2
                 print(f"ops-watch: alert ring write failed ({type(exc).__name__}): {e['key']}", file=sys.stderr)
-        state["pending_comment"] = ((state.get("pending_comment") or []) + [compact(e) for e in evs])[-500:]
+                active.get(e["key"], {}).pop("written", None)  # not written: next run reads what the ring really says
+        news = [e for e in evs if not (e.get("detail") or {}).get("updated")]  # a text refresh alerts nobody
+        state["pending_comment"] = ((state.get("pending_comment") or []) + [compact(e) for e in news])[-500:]
         sent = state.setdefault("deadman_sent", {})
-        for e in evs:  # critical raises, at most one deadman mail per key per 6 h (flapping thresholds)
+        for e in news:  # critical raises, at most one deadman mail per key per 6 h (flapping thresholds)
             if (cfg["sinks"].get("deadman") and e["event"] == "raise" and e["severity"] == "critical"
                     and now - sent.get(e["key"], 0) > 6 * 3600):  # no deadman configured: nothing to queue
                 state.setdefault("pending_deadman", []).append(compact(e))
