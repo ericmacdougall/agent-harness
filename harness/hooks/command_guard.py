@@ -5132,13 +5132,14 @@ class ArchiveVerifier(Verifier):
             source, mode = raw, 'r|'
         else:
             raise ValueError('the archive must be .tar, .tar.gz/.tgz or .tar.zst')
-        found = {}
+        found, self.names = {}, set()
         try:
             with tarfile.open(fileobj=source, mode=mode) as tar:
                 for info in tar:
                     name = _safe_member(info.name)
                     if name is None:
                         raise ValueError('the archive holds an unsafe member name')
+                    self.names.add(name)
                     if not info.isreg():
                         continue
                     if name in found:
@@ -5199,6 +5200,15 @@ class ArchiveVerifier(Verifier):
             return VerifyResult(False, error='archive sha256 does not match its .sha256 file')
         prefix = os.path.basename(os.path.realpath(local_root).rstrip('/'))
         local = {'%s/%s' % (prefix, rel): (size, sha) for rel, size, sha in manifest}
+        # macOS bsdtar stores extended attributes as AppleDouble companions `<dir>/._<name>` beside each member; its own
+        # `tar -tvf` merges them back and does not list them. Such a companion is metadata, not a file of the tree,
+        # when it is not a local file and its sibling is in the archive; drop it from both comparisons.
+        names = getattr(self, 'names', set(found))
+        for n in [n for n in found if n not in local and posixpath.basename(n).startswith('._')]:
+            sibling = posixpath.join(posixpath.dirname(n), posixpath.basename(n)[2:])
+            if sibling in names:
+                del found[n]
+                listed.pop(n, None)
         missing = sorted(set(local) - set(found))
         extra = sorted(set(found) - set(local))
         differs = sorted(n for n in set(local) & set(found) if local[n] != found[n])

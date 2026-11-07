@@ -128,6 +128,18 @@ class ArchiveApproval(Fixture):
         self.put(build_tar(self.name, FILES, extra={'../escape': b'x'}), listing_for(self.name, FILES))
         self.refused('unsafe')
 
+    def test_macos_appledouble_companions_are_metadata_not_files(self):
+        # Live batchD-wt (2026-11-07): bsdtar wrote 16,150 `._name` xattr companions that its own -tvf does not list.
+        apple = {'._b.txt': b'\x00\x05\x16\x07xattr', 'sub/._a.jsonl': b'\x00\x05\x16\x07xattr'}
+        archive = build_tar(self.name, FILES, extra=apple)
+        self.put(archive, listing_for(self.name, FILES))
+        self.assertEqual(self.approve()['files'], len(FILES))
+
+    def test_a_dot_underscore_file_without_a_sibling_is_still_an_extra_file(self):
+        archive = build_tar(self.name, FILES, extra={'._orphan': b'data'})
+        self.put(archive, listing_for(self.name, dict(FILES, **{'._orphan': b'data'})))
+        self.refused('extra')
+
     def test_a_missing_sha_file_or_listing_is_refused(self):
         del self.store.objects[SHA]
         self.refused('sha256')
