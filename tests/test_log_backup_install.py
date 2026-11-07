@@ -102,6 +102,25 @@ class Darwin(Case):
         self.assertIn("scheduler untouched", message)
         self.assertEqual((self.home / SCRIPT).read_bytes(), (ROOT / "harness/bin/log-backup.sh").read_bytes())
 
+    def test_f8_a_lane_enabled_by_hand_survives_a_reinstall(self):
+        # goodqa#15147 F8: the shipped plist has the lane off; an apply must not silently reset a hand-enabled lane.
+        self.apply("Darwin")
+        path = self.home / PLIST
+        off = "<key>LOG_BACKUP_BULK_LANE</key><string>0</string>"
+        on = "<key>LOG_BACKUP_BULK_LANE</key><string>1</string>"
+        self.assertIn(off, path.read_text())
+        path.write_text(path.read_text().replace(off, on))
+        (self.home / SCRIPT).write_text("older script\n")
+        message, runner = self.apply("Darwin")
+        self.assertIn(on, path.read_text(), "the hand-enabled lane is kept")
+        self.assertEqual(runner.calls, [], "keeping the lane setting is not a unit change")
+        self.assertIn("keeps the bulk lane on", message)
+
+    def test_f8_a_plist_without_the_lane_on_gets_the_shipped_lane_off(self):
+        self.seed(PLIST, "<plist><key>LOG_BACKUP_BULK_LANE</key><string>yes</string></plist>\n")
+        self.apply("Darwin")
+        self.assertIn("<key>LOG_BACKUP_BULK_LANE</key><string>0</string>", (self.home / PLIST).read_text())
+
     def test_preview_writes_nothing(self):
         message = lbi.status(self.home, False, system="Darwin", enabled=True)
         self.assertIn("would install", message)

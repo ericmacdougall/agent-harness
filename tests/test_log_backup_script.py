@@ -1523,6 +1523,19 @@ class LaneYield(BulkLane):
         self.assertTrue(self.bulk_ok().exists())
         self.assertFalse((self.logs / "log-backup.lane.state").exists(), "the lane clears its state on exit")
 
+    def test_f7_a_lock_without_a_pid_file_stops_the_lane_as_long_as_it_stops_tier_1(self):
+        # acquire_lock treats a pid-less lock as held for STALE_LOCK_SECONDS; the lane must not copy beside it after 60 s.
+        lockd = self.run_lock()
+        lockd.mkdir(parents=True)
+        when = time.time() - 600
+        os.utime(lockd, (when, when))
+        done = self.run_script(LOG_BACKUP_LANE_BUDGET_SECONDS="5", **self.FAST)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertEqual(self.copies(), [], "no lane copy beside a pid-less lock tier 1 still treats as held")
+        self.assertIn("a tier-1 run holds the lock; the lane waits for it",
+                      (self.logs / "log-backup.lane.log").read_text())
+        lockd.rmdir()
+
     def test_a_lane_rate_above_the_budget_never_stops_tier_1(self):
         # red-team F4: BULK_TPS above TPSLIMIT stopped every run, tier 1 included, even with the lane off
         for lane in ("0", "1"):

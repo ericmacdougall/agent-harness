@@ -344,14 +344,15 @@ rate_limit_note() { # rate_limit_note LOG-OFFSET: name a Dropbox write rate limi
 }
 
 # The lane yields to tier 1 (goodqa#15147). tier1_active: a live tier-1 run holds the run lock (a lock whose pid is
-# not written yet counts while it is young; a ps refusal counts as live). lane_gate, before every lane copy, says
+# not written yet counts until it is stale, as in acquire_lock; a ps refusal counts as live). lane_gate, before every lane copy, says
 # "copying" FIRST and only then looks at the lock; tier 1 takes the lock FIRST and only then reads the state
 # (lane_quiet). Whichever acts second sees the other, so the lane never starts a copy beside a tier-1 run.
 tier1_active() {
   [ -d "$LOCKD" ] || return 1
   local holder
   holder=$(cat "$LOCKD/pid" 2>/dev/null)
-  if [ -z "$holder" ]; then [ "$(file_age "$LOCKD")" -lt 60 ]; return; fi
+  # A pid-less lock counts as long as acquire_lock treats it as held (red-team F7): never copy beside it.
+  if [ -z "$holder" ]; then [ "$(file_age "$LOCKD")" -lt $STALE_LOCK_SECONDS ]; return; fi
   holder_alive "$holder"
 }
 lane_set_state() { echo "$1 $$" > "$LANE_STATE.tmp.$$" && mv "$LANE_STATE.tmp.$$" "$LANE_STATE"; }
