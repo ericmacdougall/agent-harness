@@ -140,6 +140,31 @@ class ArchiveApproval(Fixture):
         self.put(archive, listing_for(self.name, dict(FILES, **{'._orphan': b'data'})))
         self.refused('extra')
 
+    def test_a_failed_upload_left_empty_files_is_refused(self):
+        # pp407 review-full first try: no archive stored, .sha256 of empty input, 0-byte listing.
+        del self.store.objects[ARCHIVE]
+        self.store.objects[SHA] = ('%s  T.tar.gz\n' % hashlib.sha256(b'').hexdigest()).encode()
+        self.store.objects[LISTING] = b''
+        self.refused('empty input')
+        self.store.objects[ARCHIVE] = b''
+        self.refused('empty input')
+
+    def test_an_empty_listing_is_refused(self):
+        # a failed listing step leaves a 0-byte or directory-only listing behind
+        self.put(build_tar(self.name, FILES), b'')
+        self.refused('no regular files')
+        self.put(build_tar(self.name, FILES), listing_for(self.name, {}))
+        self.refused('no regular files')
+
+    def test_an_archive_with_no_regular_members_is_refused(self):
+        # approve_delete refuses an empty local tree first; the verifier must refuse on its own as well
+        self.put(build_tar(self.name, {}), b'-rw-r--r--  0 eric   staff       0 Nov  7 07:03 x/ignored\n')
+        verifier = cg.ArchiveVerifier(SHA, LISTING, opener=self.store.open, types=self.store.remote_types)
+        result = verifier.verify(str(self.target), [], ARCHIVE)
+        self.assertFalse(result.ok)
+        self.assertIn('no regular files', result.error)
+        self.assertIsNone(getattr(verifier, 'verified_sha256', None))
+
     def test_a_missing_sha_file_or_listing_is_refused(self):
         del self.store.objects[SHA]
         self.refused('sha256')

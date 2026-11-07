@@ -5080,6 +5080,9 @@ class ArchiveVerifier(Verifier):
         named = (m.group(2) or '').strip()
         if named and named != posixpath.basename(archive.split(':', 1)[1]):
             raise ValueError('the archive sha256 file names %r, not this archive' % named[:80])
+        if m.group(1).lower() == hashlib.sha256(b'').hexdigest():
+            # a failed upload run can leave the digest of empty input behind (pp407 review-full, 2026-11-07)
+            raise ValueError('the archive sha256 file holds the sha256 of empty input')
         return m.group(1).lower()
 
     def listing(self):
@@ -5095,6 +5098,9 @@ class ArchiveVerifier(Verifier):
             if name in found:
                 raise ValueError('the archive listing names one file twice')
             found[name] = int(m.group(1))
+        if not found:
+            # a failed listing step leaves a 0-byte or directory-only listing (pp407 review-full, 2026-11-07)
+            raise ValueError('the archive listing names no regular files')
         return found
 
     def members(self, archive):
@@ -5198,6 +5204,8 @@ class ArchiveVerifier(Verifier):
             return VerifyResult(False, error=str(error)[:200])
         if actual != expected:
             return VerifyResult(False, error='archive sha256 does not match its .sha256 file')
+        if not found:
+            return VerifyResult(False, error='the archive holds no regular files')
         prefix = os.path.basename(os.path.realpath(local_root).rstrip('/'))
         local = {'%s/%s' % (prefix, rel): (size, sha) for rel, size, sha in manifest}
         # macOS bsdtar stores extended attributes as AppleDouble companions `<dir>/._<name>` beside each member; its own
