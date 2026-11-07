@@ -119,7 +119,6 @@ type Ledger struct {
 	warn    []string
 
 	cacheSecret []byte // this HOME's view-cache key; nil until loaded, empty when unavailable
-	reviewing   bool   // WriterReview reads a trusted writer's full ops, not its reviewed prefix
 }
 
 // Warnings collected while opening or writing (printed by the CLI on stderr).
@@ -453,9 +452,19 @@ func (l *Ledger) snapshot() (*snapshot, error) {
 	return &snapshot{tips: refs, bad: bad, classes: classes, key: fold.HandleHash(string(k)), mirror: mirror, fromMirror: fromMirror}, nil
 }
 
+// readMode selects how readAll treats a trusted writer: readNormal folds only its reviewed prefix and holds
+// the rest; readFullReview (WriterReview only) returns every op. The mode is per call, never Ledger state, so
+// a review cannot change what a concurrent normal read folds or caches (Kimi audit F07, goodqa#14996).
+type readMode int
+
+const (
+	readNormal readMode = iota
+	readFullReview
+)
+
 // readAll reads and validates every writer ref of the project. Refs of other projects and malformed names
 // are reported, never read.
-func (l *Ledger) readAll(s *snapshot) (fold.Input, error) {
+func (l *Ledger) readAll(s *snapshot, mode readMode) (fold.Input, error) {
 	in := fold.Input{Project: l.Project, Classes: s.classes}
 	names := make([]string, 0, len(s.tips))
 	for r := range s.tips {
@@ -527,7 +536,7 @@ func (l *Ledger) readAll(s *snapshot) (fold.Input, error) {
 				ops = append(ops, o)
 			}
 		}
-		if dup == "" && in.Class(w) == fold.ClassTrusted && !l.reviewing {
+		if dup == "" && in.Class(w) == fold.ClassTrusted && mode != readFullReview {
 			if n, ok := l.trustPrefix(w, ops); !ok {
 				in.Classes[w] = fold.ClassUnverified // the reviewed prefix changed: not trusted
 			} else if n < len(ops) {
@@ -736,7 +745,7 @@ func (l *Ledger) View() (*fold.View, error) {
 }
 
 func (l *Ledger) rebuild(s *snapshot) (*fold.View, error) {
-	in, err := l.readAll(s)
+	in, err := l.readAll(s, readNormal)
 	if err != nil {
 		return nil, err
 	}

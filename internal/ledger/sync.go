@@ -44,7 +44,7 @@ func (l *Ledger) Snapshot() (fold.Input, error) {
 	if err != nil {
 		return fold.Input{}, err
 	}
-	return l.readAll(s)
+	return l.readAll(s, readNormal)
 }
 
 // FoldedFrontier lists the frontier of every folded (self or trusted), unrejected, non-empty writer,
@@ -328,9 +328,13 @@ func (l *Ledger) Locked(fn func() error) error {
 // WriterReview returns a writer's ops as read now (full, even for a trusted writer), their review digest
 // and the writer's class.
 func (l *Ledger) WriterReview(w string) (ops []*op.Op, digest, class string, err error) {
-	l.reviewing = true
-	defer func() { l.reviewing = false }()
-	in, err := l.Snapshot()
+	s, err := l.snapshot()
+	if err != nil {
+		return nil, "", "", err
+	}
+	// A full review read is explicit and per call: it never changes a concurrent normal read and never
+	// populates the normal view cache with unreviewed ops.
+	in, err := l.readAll(s, readFullReview)
 	if err != nil {
 		return nil, "", "", err
 	}
