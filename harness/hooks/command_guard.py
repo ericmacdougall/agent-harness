@@ -7,6 +7,8 @@
     command_guard.py doctor                        check the installed guard and run its self-test probes
     command_guard.py replay TRANSCRIPT.jsonl...    decision counts over real transcripts (never prints commands)
     command_guard.py approve-delete --path P --remote R --wal W [--backup-verified-sha256 D] [--ttl S]
+    command_guard.py approve-delete --path P --archive R:x.tar.zst --archive-sha256 R:x.tar.zst.sha256 \
+        --archive-listing R:x.listing --wal W [--ttl S]
     command_guard.py approve-delete --path P --no-backup --user-source answer:S/U --wal W [--ttl S]
                                                    user-approved, no backup: clean pushed git tree or detached image
     command_guard.py revoke-delete                 remove every delete approval
@@ -4655,7 +4657,7 @@ def sole_delete(command, paths):
 
 
 APPROVAL_ENV_RE = re.compile(r'(?:^|[\s;&|(`])(?:(?:export\s+|declare\s+-x\s+|typeset\s+-x\s+)?'
-                             r'(?:HOME|CLAUDE_CONFIG_DIR|ZDOTDIR|PATH|GIT_\w+|LD_\w+|DYLD_\w+|PYTHON\w*)\s*=|'
+                             r'(?:HOME|CLAUDE_CONFIG_DIR|ZDOTDIR|PATH|GIT_\w+|LD_\w+|DYLD_\w+|PYTHON\w*|RCLONE_\w+)\s*=|'
                              r'(?:/usr)?(?:/bin/)?env(?:\s|$)|'
                              r'unset\s+[^;&|]*\b(?:HOME|CLAUDE_CONFIG_DIR|PATH)\b)')
 
@@ -4690,6 +4692,7 @@ def format_block(f, more=0, warn=False):
 # approve-delete, to the WAL named with --wal. The agent itself may approve after a verified Dropbox backup: the
 # safeguard is the verified copy, the single use and the audit trail, not a human prompt.
 
+ARCHIVE_KIND = 'archive'  # an approval backed by one verified remote tar archive (goodqa#15068)
 MARKER_NAME, KEY_NAME, AUDIT_NAME, LOCK_NAME = 'log-delete-ok.json', 'log-delete.key', 'log-delete-audit.jsonl', \
     'log-delete.lock'
 
@@ -4725,7 +4728,8 @@ def audit(event, fields, home=None, wal=None, strict=False, to_file=True):
     record = {'ts': round(time.time(), 3), 'event': event}
     record.update({k: v for k, v in fields.items() if k in ('path', 'remote', 'manifest_sha256', 'files', 'reason',
                                                              'expires_at', 'nonce', 'rule', 'kind', 'target',
-                                                             'user_source', 'bytes')})
+                                                             'user_source', 'bytes', 'archive', 'archive_sha256',
+                                                             'archive_listing')})
     try:
         import redact
         line = json.dumps(redact.redact_obj(record), sort_keys=True)  # values, so a span cannot eat JSON syntax
@@ -4800,6 +4804,7 @@ class Approvals:
         self.now = time.time() if now is None else now
         self.entries, self.key = load_marker(home)
         self.used = {}
+        self.used_archive = {}  # path -> archive URL, for the delete receipt (goodqa#15068)
         self.no_backup = set()  # real paths covered by a no-backup entry: decide() then requires a sole delete
 
     def __call__(self, path):
@@ -4841,6 +4846,8 @@ class Approvals:
             if entry.get('kind') == NO_BACKUP_KIND:
                 self.no_backup.add(real)
             self.used[real] = entry.get('nonce')
+            if entry.get('archive'):
+                self.used_archive[real] = entry.get('archive')
             return True
         return False
 
@@ -4879,7 +4886,10 @@ class Approvals:
             finally:
                 os.close(fd)
         for path, nonce in self.used.items():
-            audit('consumed', {'path': path, 'nonce': nonce}, home=self.home)
+            fields = {'path': path, 'nonce': nonce}
+            if self.used_archive.get(path):
+                fields.update(archive=self.used_archive[path], kind=ARCHIVE_KIND)
+            audit('consumed', fields, home=self.home)
         return True
 
 
@@ -4982,6 +4992,343 @@ class RcloneVerifier(Verifier):
         return VerifyResult(not missing and not mismatched and checked > 0, checked, missing[:20], mismatched[:20])
 
 
+_SHA_LINE = re.compile(r'^([0-9a-fA-F]{64})(?:\s+\*?(\S.*))?$')
+# bsdtar / GNU tar `tar -tvf` regular-file line: mode, links or owner/group, size, date, path.
+_TVF_BSD = re.compile(r'^-[rwxsStT-]{9}[@+.]?\s+\d+\s+\S+\s+\S+\s+(\d+)\s+\w{3}\s+\d{1,2}\s+(?:\d{1,2}:\d{2}|\d{4})\s(.+)$')
+_TVF_GNU = re.compile(r'^-[rwxsStT-]{9}[@+.]?\s+\S+/\S+\s+(\d+)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s(.+)$')
+
+
+def _safe_member(name):
+    """The member path with any leading './' removed, or None when it is absolute, climbs out, or holds NUL/CR/LF."""
+    if not name or '\x00' in name or '\n' in name or '\r' in name or name.startswith('/'):
+        return None
+    while name.startswith('./'):
+        name = name[2:]
+    parts = name.rstrip('/').split('/')
+    if not name or any(p in ('..', '') for p in parts):
+        return None
+    return name.rstrip('/')
+
+
+class _HashingReader:
+    """A read-only wrapper that feeds every byte read through sha256 and counts it, refusing past `limit`."""
+
+    def __init__(self, raw, limit):
+        self.raw, self.limit, self.sha, self.count = raw, limit, hashlib.sha256(), 0
+
+    def read(self, n=-1):
+        data = self.raw.read(n if n is not None and n >= 0 else 1 << 20)
+        self.count += len(data)
+        if self.count > self.limit:
+            raise ValueError('archive is larger than the approval limit')
+        self.sha.update(data)
+        return data
+
+    def drain(self):
+        while self.read(1 << 20):
+            pass
+
+
+class _GunzipReader:
+    """Decompresses every member of a concatenated gzip stream, as gzip -dc and bsdtar do (red-team F3: Python's
+    tarfile r|gz stops after the first member, so a second member was hashed but never compared)."""
+
+    def __init__(self, raw):
+        import zlib
+        self.raw, self.zlib, self.pending = raw, zlib, b''
+        self.inflater, self.done = zlib.decompressobj(31), False
+
+    def read(self, n=-1):
+        n = n if n is not None and n > 0 else 1 << 20
+        while len(self.pending) < n and not self.done:
+            if self.inflater.eof:
+                rest = self.inflater.unused_data
+                if not rest:
+                    rest = self.raw.read(1 << 16)
+                    if not rest:
+                        self.done = True
+                        break
+                if not rest.startswith(b'\x1f'):
+                    raise ValueError('the archive has bytes after its gzip stream that are not another gzip member')
+                self.inflater = self.zlib.decompressobj(31)
+                self.pending += self.inflater.decompress(rest, 1 << 20)
+                continue
+            chunk = self.inflater.unconsumed_tail or self.raw.read(1 << 16)
+            if not chunk:
+                raise ValueError('the archive is truncated or corrupt (the gzip stream ends early)')
+            self.pending += self.inflater.decompress(chunk, 1 << 20)
+        data, self.pending = self.pending[:n], self.pending[n:]
+        return data
+
+
+class _InflateLimit:
+    """Counts the decompressed tar bytes and refuses past `limit` (red-team F4: a decompression bomb)."""
+
+    def __init__(self, source, limit):
+        self.source, self.limit, self.count = source, limit, 0
+
+    def read(self, n=-1):
+        data = self.source.read(n if n is not None and n >= 0 else 1 << 20)
+        self.count += len(data)
+        if self.count > self.limit:
+            raise ValueError('the archive inflates far beyond the size of the local tree')
+        return data
+
+
+def _pinned_tool(name):
+    """An absolute path for a decompressor from the usual install dirs, before any PATH lookup (red-team F7)."""
+    for folder in ('/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'):
+        candidate = os.path.join(folder, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return __import__('shutil').which(name) or name
+
+
+APPLEDOUBLE_MAGIC = b'\x00\x05\x16\x07'
+
+
+class ArchiveVerifier(Verifier):
+    """Verifies that one remote tar archive (plain, .gz or .zst) holds exactly the local tree (goodqa#15068).
+
+    Nothing is trusted from the uploader except as something to compare: the guard streams the archive itself (never
+    extracting it, never writing it to disk), computes its sha256 and requires it to equal the .sha256 file, and
+    requires the archive's regular-file members (path, size, content sha256) to equal the local tree, prefixed by the
+    tree's own directory name, and the listing's (path, size) set to equal the same members. Unsafe or duplicate
+    member names, a truncated or corrupt stream, a failed download or a decompressor error refuse."""
+
+    def __init__(self, sha256_remote, listing_remote, rclone='rclone', zstd=None, opener=None, types=None,
+                 timeout=3600, limit=64 << 30):
+        self.sha256_remote, self.listing_remote = sha256_remote, listing_remote
+        self.rclone, self.timeout, self.limit = rclone, timeout, limit
+        self.zstd = zstd or _pinned_tool('zstd')
+        self.inflate_slack = 256 << 20  # tar headers, padding and AppleDouble companions on top of 2x the tree
+        self.max_members = None  # set by verify() from the local manifest
+        self.opener = opener or self._open
+        self._types = types or RcloneVerifier(rclone=rclone).remote_types
+
+    def remote_types(self):
+        return self._types()
+
+    def _open(self, remote):
+        """(binary stream, wait() -> exit code) of `rclone cat REMOTE`; rclone output is parsed, never printed."""
+        proc = subprocess.Popen([self.rclone, 'cat', '--', remote], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+        def wait():
+            try:
+                return proc.wait(timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                return -1
+        return proc.stdout, wait
+
+    def _small(self, remote, limit, label):
+        stream, wait = self.opener(remote)
+        data = stream.read(limit + 1)  # a pipe read returns short only at end of stream
+        if len(data) > limit:
+            try:  # red-team F5: stop here; draining an endless stream would hang approve-delete
+                stream.close()
+            except OSError:
+                pass
+            wait()
+            raise ValueError('the %s is larger than %d bytes' % (label, limit))
+        if wait() != 0:
+            raise ValueError('could not download the %s (%s)' % (label, remote[:120]))
+        return data
+
+    def expected_sha256(self, archive):
+        text = self._small(self.sha256_remote, 4096, 'archive sha256 file').decode('utf-8', 'replace').strip()
+        m = _SHA_LINE.match(text.splitlines()[0].strip() if text else '')
+        if not m:
+            raise ValueError('the archive sha256 file does not start with a 64-hex sha256')
+        named = (m.group(2) or '').strip()
+        if named and named != posixpath.basename(archive.split(':', 1)[1]):
+            raise ValueError('the archive sha256 file names %r, not this archive' % named[:80])
+        if m.group(1).lower() == hashlib.sha256(b'').hexdigest():
+            # a failed upload run can leave the digest of empty input behind (pp407 review-full, 2026-11-07)
+            raise ValueError('the archive sha256 file holds the sha256 of empty input')
+        return m.group(1).lower()
+
+    def listing(self):
+        """{member path: size} of the regular files in a `tar -tvf` listing (bsdtar or GNU style)."""
+        found = {}
+        for line in self._small(self.listing_remote, 256 << 20, 'archive listing').decode('utf-8', 'replace').splitlines():
+            if not line.startswith('-'):
+                continue  # directories, links and blank lines
+            m = _TVF_BSD.match(line) or _TVF_GNU.match(line)
+            name = _safe_member(m.group(2)) if m else None
+            if not name:
+                raise ValueError('the archive listing has a regular-file line it cannot read')
+            if name in found:
+                raise ValueError('the archive listing names one file twice')
+            found[name] = int(m.group(1))
+        if not found:
+            # a failed listing step leaves a 0-byte or directory-only listing (pp407 review-full, 2026-11-07)
+            raise ValueError('the archive listing names no regular files')
+        return found
+
+    def members(self, archive):
+        """({member path: (size, sha256)}, archive sha256) read from the streamed archive."""
+        import tarfile
+        import threading
+        stream, wait = self.opener(archive)
+        raw = _HashingReader(stream, self.limit)
+        lower = archive.lower()
+        zstd_proc, pump_error = None, []
+        if lower.endswith(('.tar.zst', '.tzst')):
+            zstd_proc = subprocess.Popen([self.zstd, '-dc', '-q'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL)
+
+            def pump():
+                try:
+                    while True:
+                        block = raw.read(1 << 20)
+                        if not block:
+                            break
+                        zstd_proc.stdin.write(block)
+                except (OSError, ValueError) as error:
+                    pump_error.append(error)
+                finally:
+                    try:
+                        zstd_proc.stdin.close()
+                    except OSError:
+                        pass
+            thread = threading.Thread(target=pump, daemon=True)
+            thread.start()
+            source = zstd_proc.stdout
+        elif lower.endswith(('.tar.gz', '.tgz')):
+            source = _GunzipReader(raw)
+        elif lower.endswith('.tar'):
+            source = raw
+        else:
+            stream.close()
+            wait()
+            raise ValueError('the archive must be .tar, .tar.gz/.tgz or .tar.zst')
+        source = _InflateLimit(source, self.inflate_limit)
+        found, self.names, self.appledouble, seen = {}, set(), set(), set()
+        deadline = time.monotonic() + self.timeout
+        try:
+            with tarfile.open(fileobj=source, mode='r|') as tar:
+                for count, info in enumerate(tar, 1):
+                    tar.members = []  # red-team F4: stream mode would otherwise keep every header in memory
+                    if self.max_members is not None and count > self.max_members:
+                        raise ValueError('the archive has far more members than the local tree has files')
+                    if time.monotonic() > deadline:
+                        raise ValueError('reading the archive took longer than %d seconds' % self.timeout)
+                    name = _safe_member(info.name)
+                    if name is None:
+                        raise ValueError('the archive holds an unsafe member name')
+                    # red-team F2: a later member of ANY type with the same name (or one that is the same file on a
+                    # case-insensitive or normalising disk) replaces the verified file on restore.
+                    folded = unicodedata.normalize('NFC', name).casefold()
+                    if folded in seen:
+                        raise ValueError('the archive names one path twice (%s)' % name[:120])
+                    seen.add(folded)
+                    self.names.add(name)
+                    if info.isdir():
+                        continue
+                    if not info.isreg():
+                        raise ValueError('the archive holds a link or special member (%s); only regular files and '
+                                         'directories can be compared' % name[:120])
+                    member = tar.extractfile(info)
+                    h, size, head = hashlib.sha256(), 0, b''
+                    while True:
+                        block = member.read(1 << 20)
+                        if not block:
+                            break
+                        if size < 4:
+                            head = (head + block)[:4]
+                        size += len(block)
+                        h.update(block)
+                    if size != info.size:
+                        raise ValueError('the archive is truncated inside a member')
+                    if head == APPLEDOUBLE_MAGIC:
+                        self.appledouble.add(name)
+                    found[name] = (size, h.hexdigest())
+                # red-team F3: nothing but zero padding may follow the end-of-archive block.
+                while True:
+                    rest = tar.fileobj.read(1 << 20)
+                    if not rest:
+                        break
+                    if rest.strip(b'\0'):
+                        raise ValueError('the archive has data after the end of the tar')
+            if zstd_proc is not None:
+                thread.join(self.timeout)
+            raw.drain()
+        except (tarfile.TarError, EOFError, OSError, zlib_error(), ValueError) as error:
+            # Stop the decompressor and the download: a refused archive must leave no child process behind.
+            if zstd_proc is not None:
+                zstd_proc.terminate()
+                zstd_proc.wait(timeout=30)
+            try:
+                stream.close()
+            except OSError:
+                pass
+            wait()
+            if isinstance(error, ValueError):
+                raise
+            raise ValueError('the archive is truncated or corrupt (%s)' % type(error).__name__)
+        finally:
+            if zstd_proc is not None:
+                try:
+                    zstd_proc.stdout.close()
+                except OSError:
+                    pass
+        if pump_error:
+            raise ValueError(str(pump_error[0])[:120] if isinstance(pump_error[0], ValueError) else
+                             'the archive download failed')
+        if zstd_proc is not None and zstd_proc.wait(timeout=self.timeout) != 0:
+            raise ValueError('the archive is truncated or corrupt (zstd failed)')
+        if wait() != 0:
+            raise ValueError('could not download the archive (%s)' % archive[:120])
+        return found, raw.sha.hexdigest()
+
+    def verify(self, local_root, manifest, remote):
+        if self.max_members is None:
+            self.max_members = 4 * len(manifest) + 1000  # files, their AppleDouble companions and directories
+        self.inflate_limit = 2 * sum(size for _rel, size, _sha in manifest) + self.inflate_slack
+        try:
+            expected = self.expected_sha256(remote)
+            listed = self.listing()
+            found, actual = self.members(remote)
+        except ValueError as error:
+            return VerifyResult(False, error=str(error)[:200])
+        if actual != expected:
+            return VerifyResult(False, error='archive sha256 does not match its .sha256 file')
+        if not found:
+            return VerifyResult(False, error='the archive holds no regular files')
+        prefix = os.path.basename(os.path.realpath(local_root).rstrip('/'))
+        local = {'%s/%s' % (prefix, rel): (size, sha) for rel, size, sha in manifest}
+        # macOS bsdtar stores extended attributes as AppleDouble companions `<dir>/._<name>` beside each member; its own
+        # `tar -tvf` merges them back and does not list them. Such a companion is metadata, not a file of the tree,
+        # when it is not a local file, starts with the AppleDouble magic 00 05 16 07, and its sibling (a file or a
+        # directory, both of which get companions) is in the archive; drop it from both comparisons.
+        names = getattr(self, 'names', set(found))
+        apple = getattr(self, 'appledouble', set())
+        for n in [n for n in found if n not in local and n in apple and posixpath.basename(n).startswith('._')]:
+            sibling = posixpath.join(posixpath.dirname(n), posixpath.basename(n)[2:])
+            if sibling in names:
+                del found[n]
+                listed.pop(n, None)
+        missing = sorted(set(local) - set(found))
+        extra = sorted(set(found) - set(local))
+        differs = sorted(n for n in set(local) & set(found) if local[n] != found[n])
+        if missing or extra:
+            return VerifyResult(False, len(found), missing[:20], extra[:20],
+                                error='archive members differ from the local tree (%d local files missing, %d extra)'
+                                      % (len(missing), len(extra)))
+        if differs:
+            return VerifyResult(False, len(found), [], differs[:20], error='archive content differs from the local files')
+        if listed != {n: s for n, (s, _h) in found.items()}:
+            return VerifyResult(False, len(found), error='archive listing does not match the archive members')
+        self.verified_sha256 = actual
+        return VerifyResult(bool(found), len(found))
+
+
+def zlib_error():
+    import zlib
+    return zlib.error
+
+
 def tree_manifest(path, limits):
     """[(relative path, size, sha256)] for a file or directory, bounded; raises ValueError over budget."""
     path = os.path.realpath(path)
@@ -5054,6 +5401,17 @@ def _check_remote(remote, policy, verifier):
         raise ValueError('remote %r has backend type %r; approvals need one of %s' % (name[:40], kind[:20], allowed))
 
 
+def _first_symlink(path):
+    """Relative path of the first symlink under `path` (or `path` itself), else None."""
+    if os.path.islink(path):
+        return '.'
+    for root, dirs, names in os.walk(path):
+        for name in sorted(dirs + names):
+            if os.path.islink(os.path.join(root, name)):
+                return os.path.relpath(os.path.join(root, name), path)
+    return None
+
+
 def _recent_change(path, seconds, now, limits):
     deadline = time.monotonic() + max(10.0, float(limits['max_walk_seconds']) * 10)
     for root, dirs, names in os.walk(path):
@@ -5072,7 +5430,7 @@ def _recent_change(path, seconds, now, limits):
 
 
 def approve_delete(path, remote, verifier=None, pinned_digest=None, ttl=None, home=None, policy=None, now=None,
-                   wal=None):
+                   wal=None, archive=None):
     """Verify the backup, then write a signed single-use approval for `path`. Returns the entry.
 
     Raises ValueError on refusal (and audits the refusal)."""
@@ -5097,6 +5455,21 @@ def approve_delete(path, remote, verifier=None, pinned_digest=None, ttl=None, ho
             raise ValueError('something under the path changed in the last %d seconds (a live log?); wait, back it '
                              'up again and retry' % recent)
         _check_remote(remote, policy, verifier)
+        if archive is not None:
+            # goodqa#15068: `remote` is one tar archive; its .sha256 and listing must be named remotes of an allowed
+            # backend too, and the verifier is the archive verifier, never the per-file mirror one.
+            for extra in archive:
+                _check_remote(extra, policy, verifier)
+            if not isinstance(verifier, ArchiveVerifier):
+                verifier = ArchiveVerifier(archive[0], archive[1])
+        # PR #120 red-team F1: the delete-time stat check must describe the tree the backup was compared with, so it
+        # is taken before hashing and must be unchanged after the (possibly hour-long) verification.
+        stat_before = stat_manifest(real, limits, deadline=time.monotonic() + 60)
+        if archive is not None:
+            link = _first_symlink(real)
+            if link:
+                raise ValueError('the tree holds a symlink (%s), which the archive comparison does not cover; '
+                                 'refused' % link[:120])
         manifest = tree_manifest(real, limits)
         if not manifest:
             raise ValueError('nothing to approve: the path holds no files')
@@ -5110,6 +5483,10 @@ def approve_delete(path, remote, verifier=None, pinned_digest=None, ttl=None, ho
             raise ValueError('backup is not verified: checked=%d missing=%d mismatched=%d %s' % (
                 result.checked, len(result.missing), len(result.mismatched), (result.error or '')[:120]))
         stat_digest = stat_manifest(real, limits, deadline=time.monotonic() + 60)
+        if stat_digest != stat_before:
+            raise ValueError('the tree changed while its backup was being verified; back it up again and retry')
+        if recent > 0 and _recent_change(real, recent, time.time(), limits):
+            raise ValueError('something under the path changed while its backup was being verified; retry')
         identity = list(_identity(real))
     except ValueError as error:
         audit('refused', {'path': real, 'remote': remote, 'reason': str(error)[:200]}, home=home, wal=wal)
@@ -5117,6 +5494,9 @@ def approve_delete(path, remote, verifier=None, pinned_digest=None, ttl=None, ho
     entry = {'path': real, 'identity': identity, 'files': len(manifest), 'manifest_sha256': digest,
              'stat_sha256': stat_digest, 'remote': remote, 'verified_at': now, 'expires_at': now + ttl,
              'nonce': _secrets.token_hex(8)}
+    if archive is not None:
+        entry.update({'kind': ARCHIVE_KIND, 'archive': remote, 'archive_sha256': verifier.verified_sha256,
+                      'archive_listing': archive[1], 'archive_sha256_file': archive[0]})
     _store_entry(entry, real, now, home)
     audit('approved', entry, home=home, wal=wal)
     return entry
@@ -6031,6 +6411,10 @@ def main(argv=None):
     appr = sub.add_parser('approve-delete')
     appr.add_argument('--path', required=True)
     appr.add_argument('--remote', help='named rclone remote mirroring --path, e.g. dropbox:backups/x')
+    appr.add_argument('--archive', help='named rclone remote of ONE tar archive (.tar, .tar.gz or .tar.zst) of --path, '
+                                        'whose members start with the directory name of --path (goodqa#15068)')
+    appr.add_argument('--archive-sha256', dest='archive_sha256', help='remote .sha256 file of --archive')
+    appr.add_argument('--archive-listing', dest='archive_listing', help='remote `tar -tvf` listing of --archive')
     appr.add_argument('--no-backup', action='store_true',
                       help='user-approved deletion without a backup: a clean, pushed git working tree or a detached '
                            'disk image under ~/.agent-harness/work only; needs --user-source (goodqa#14911)')
@@ -6066,6 +6450,11 @@ def main(argv=None):
     if args.cmd == 'replay':
         print(json.dumps(replay(args.paths), indent=1))
         return 0
+    if args.cmd == 'approve-delete' and (args.no_backup or args.user_source) and \
+            (args.archive or args.archive_sha256 or args.archive_listing):
+        print('approve-delete refused: --no-backup and --archive are different approvals; give one of them',
+              file=sys.stderr)
+        return 2
     if args.cmd == 'approve-delete' and (args.no_backup or args.user_source):
         if not (args.no_backup and args.user_source) or args.remote or args.digest:
             print('approve-delete refused: --no-backup needs --user-source and takes no --remote or '
@@ -6078,6 +6467,22 @@ def main(argv=None):
             return 2
         print(json.dumps({'status': 'APPROVED', 'kind': NO_BACKUP_KIND, 'target': entry['target'],
                           'path': entry['path'], 'expires_at': entry['expires_at']}))
+        return 0
+    if args.cmd == 'approve-delete' and (args.archive or args.archive_sha256 or args.archive_listing):
+        if not (args.archive and args.archive_sha256 and args.archive_listing) or args.remote:
+            print('approve-delete refused: --archive needs --archive-sha256 and --archive-listing and takes no '
+                  '--remote', file=sys.stderr)
+            return 2
+        try:
+            entry = approve_delete(args.path, args.archive, pinned_digest=args.digest, ttl=args.ttl, wal=args.wal,
+                                   archive=(args.archive_sha256, args.archive_listing))
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            print('approve-delete refused: %s' % error, file=sys.stderr)
+            return 2
+        print(json.dumps({'status': 'APPROVED', 'kind': ARCHIVE_KIND, 'path': entry['path'],
+                          'expires_at': entry['expires_at'], 'manifest_sha256': entry['manifest_sha256'],
+                          'files': entry['files'], 'archive': entry['archive'],
+                          'archive_sha256': entry['archive_sha256']}))
         return 0
     if args.cmd == 'approve-delete':
         if not args.remote:

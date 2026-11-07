@@ -7,6 +7,9 @@ group by pull request.
 ## Unreleased
 
 ### Added
+- command_guard `approve-delete --archive/--archive-sha256/--archive-listing`: approve a delete from one verified remote tar
+  archive (.tar, .tar.gz or .tar.zst) when a file-by-file mirror is too slow; the guard streams and checks the archive
+  itself (goodqa#15068).
 - Heavy work off the Mac (goodqa#14817, P12). `heavy_job_guard.py` has a `copy` rule: cp, rsync, tar, ditto,
   `git clone`, `gh repo clone` and `git worktree add` are sized (bounded walk, `ssh du`, GitHub repo size) and
   refused at 1 GiB (`HARNESS_COPY_GIB`), unknown size counting as heavy. `HARNESS_LOCAL_OK` is limited to one use
