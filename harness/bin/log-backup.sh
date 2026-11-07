@@ -224,9 +224,11 @@ ok=0 found=0 primary=0
 STAGE=${LOG_BACKUP_STAGE:-$HOME/.agent-harness/backup-stage}
 # Live sources (transcripts and WALs grow while uploaded, so Dropbox's hash check would fail) are snapshotted into a
 # local stage first and uploaded from there. Static sources upload in place, skipping files younger than 2 minutes.
-LIVE=(.claude/projects .claude/wals .claude/history.jsonl .codex/sessions .codex/history.jsonl
-  .agent-harness/work-assignments.json .agent-harness/work-ledger.json .agent-harness/work-ledger.events.jsonl
-  .agent-harness/work-ledger.archive.jsonl .agent-harness/work-ledger.failures.jsonl .agent-harness/work-ledger.spool.jsonl)
+# Smallest first, .claude/projects last (goodqa#15044 N2): the single files and the WAL tree finish in seconds, and
+# the large, always-changing transcript tree then gets all the time that is left instead of a fixed early share.
+LIVE=(.claude/history.jsonl .codex/history.jsonl .agent-harness/work-assignments.json .agent-harness/work-ledger.json
+  .agent-harness/work-ledger.events.jsonl .agent-harness/work-ledger.archive.jsonl .agent-harness/work-ledger.failures.jsonl
+  .agent-harness/work-ledger.spool.jsonl .claude/wals .codex/sessions .claude/projects)
 DIRECT=(.codex/archived_sessions .agent-harness/work)
 command -v rsync >/dev/null 2>&1 || fail "rsync not found (needed to snapshot live files)" 127
 # The stage must be a private directory of its own: absolute, no `..`, not a symlink, not HOME or any ancestor of a
