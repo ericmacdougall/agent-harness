@@ -25,14 +25,18 @@ What counts as a production TARGET (each yields the exact target value a grant m
   - docker exec <prod-container> running a DB client        -> the container
   - mcp__*__d1_database_query / hyperdrive_* (production by construction) -> the database id field
 The SQL is read from the command and, with a DB client in it, from --file / psql -f files (also -1f,
--Xf, --fi=), `< file`, `$(< file)`, `$(cat file)` inside -c/-e or a here-string, `cat file | client`, psql
+-Xf, --fi=), `< file`, `$(< file)`, every `cat` argument anywhere in the command (a pipe into ssh, docker
+exec, sudo or env, `$(cat ...)`, backticks), psql
 `\i`/`\ir`/`\include`/`\include_relative`, mysql `source`/`\.`, and sqlite `.read`/`-init`. Relative paths
 resolve against the event's cwd, and ~ is expanded. Files are opened as regular files only (a FIFO or device
 cannot hang the hook). A prod-targeted command is denied when one of its SQL files cannot be judged at hook
 time: missing, not a regular file, unreadable, over 200,000 bytes, more than 8 files, written by the same
-command, or the command has any other step besides a pipeline (; && || & newline cd pushd), which could
-change the file first. A client fed by a pipe from anything but cat/echo/printf, with no -c/-e/-f of its
-own, is denied the same way. Commands over 64 KiB are split on whitespace; every prod-looking word after a
+command, or the command has any other step besides a plain pipeline (; && || & newline cd pushd, xargs,
+<( >(, or a $(...)/backtick substitution that is not a cat or `< file` read), which could change the file
+first. A client fed by a pipe from anything but cat/echo/printf is denied the same way unless its own flag
+replaces stdin (psql -c/-f, mysql -e, mongosh --eval/--file) or a `<` redirect does; so is a $(...) or
+backtick substitution after the client that is not a cat or `< file` read. Because every cat counts, a
+read-only prod command that also cats a file it writes or a missing file is denied (split the command). Commands over 64 KiB are split on whitespace; every prod-looking word after a
 client is then a target. Scans are bounded (512 characters, 256 words after a client, 64 clients), and a
 command too long to judge its database is denied when it carries a destructive statement.
 Prose that merely mentions these words does not count; a heredoc that runs psql against a prod host
@@ -54,7 +58,8 @@ Grants
 - --user-source must be an answer:<session>/<uuid> id (an AskUserQuestion answer; ah user-msg finds
   it) that provenance.py resolves, from the pinned ~/.claude, at most 1 hour old. The user's own selected
   answer must name the target as a whole name ("Approve DELETE on <target>") and must not decline (no,
-  not, keep, cancel, ...). The agent's question text never counts; typed user: turns are refused.
+  nope, not, keep, reject, untouched, ... outside the target name). The agent's question text never
+  counts; typed user: turns are refused.
 - --target must equal, case-folded, one of the target values the guard extracts from the command
   (for example `prod-db.example.com`, or `app_production`). It is never a substring match. SQL
   words, client names, bare prod/production and names starting with "-" are refused as targets. A
@@ -120,11 +125,23 @@ CLIENT_NAMES = {"psql", "pg_dump", "pg_restore", "dropdb", "createdb", "mysql", 
 PSQL_FILE_FLAG = re.compile(r"\bpsql\b[^\n|;&]{0,512}?(?<![\w-])(?:-[A-Za-z0-9]*f|--fil?e?(?==))[=\s]*([^\s;|&]+)")
 SQLITE_INIT = re.compile(r"\bsqlite3\b[^\n|;&]{0,512}?\s-init\s+([^\s;|&]+)")
 REDIRECT_IN = re.compile(r"(?<![<\d])<\s*(?![<(])([^\s;|&<>]+)")
-# cat counts as SQL input only inside a client's -c/-e or a here-string; a cat that pipes into a client is
-# handled by the pipe check (N1: other cat calls are not SQL input)
-SUBST_CAT = re.compile(r"(?:-[ce]|--command|--execute|<<<)\s*[\"']?\$\(\s*cat\s+([^\s)]+)")
-PIPE_CLIENT = re.compile(r"^\s*(?:\w+=\S*\s+)*(?:\S*/)?(psql|mysql|mariadb|sqlite3|mongosh|mongo|redis-cli)\b", re.I)
-SCRIPT_FLAG = re.compile(r"(?<![\w-])(?:-[ce]|--command|--execute|-f|--file|-cmd|-init|--eval)\b|(?<![<\d])<\s*\S")
+# Every `cat` argument in a command that has a DB client is SQL input, wherever the cat sits: piped into ssh,
+# docker exec, sudo or env, inside $(...) or backticks, after --command=. This is ca56501's rule; r4 (N1) read cat
+# in only two positions and let `cat f.sql | ssh prod-db psql` through (r4 review H1). The cost is N1: a read-only
+# prod query that also cats a file it writes, or a missing file, is denied (disclosed).
+CAT_ARGS = re.compile(r"(?:^|[\s;&|(`\"'=])cat\s+((?:[^\s|;&<>()`\"']+[ \t]*)+)")
+# a substitution whose command is not `cat` or `< file`: its output (or side effects) cannot be judged
+OTHER_SUBST = re.compile(r"\$\((?!\()\s*([^\s)]*)|`\s*([^`\s]*)[^`]*`")
+# the flags that make each client take its SQL from an argument or file instead of stdin (r4 review H2);
+# a client not listed here (sqlite3, redis-cli, pg_restore, ...) reads a piped stdin whatever its flags
+STDIN_REPLACED = {
+    "psql": re.compile(r"(?<![\w-])(?:-[A-Za-z0-9]*[cf]|--command|--file)(?![\w-])"),
+    "mysql": re.compile(r"(?<![\w-])(?:-[A-Za-z0-9]*e|--execute)(?![\w-])"),
+    "mariadb": re.compile(r"(?<![\w-])(?:-[A-Za-z0-9]*e|--execute)(?![\w-])"),
+    "mongosh": re.compile(r"(?<![\w-])(?:--eval|--file|-f)(?![\w-])"),
+    "mongo": re.compile(r"(?<![\w-])(?:--eval)(?![\w-])"),
+}
+STDIN_REDIRECT = re.compile(r"(?<![<\d])<\s*[^\s<(]")
 SUBST_IN = re.compile(r"\$\(\s*<\s*([^\s)]+)\s*\)")
 # psql \i \ir \include \include_relative, mysql \. and source, sqlite .read; a quoted argument is accepted
 CLIENT_INCLUDE = re.compile(r"(?:\\(?:include_relative|include|ir|i|\.)|(?<![\w$])\.read)\s+['\"]?([^\s;'\"]+)")
@@ -170,7 +187,8 @@ CLOCK_SLACK = 60
 MIN_TARGET = 3
 MAX_GRANTS = 64
 GRANTS_MAX_BYTES = 256 * 1024
-DECLINE = re.compile(r"\b(?:no|not|don'?t|never|keep|cancel|skip|stop|leave|hold|wait|later|instead)\b", re.I)
+DECLINE = re.compile(r"\b(?:no|nope|nah|not|don'?t|never|keep|kept|cancel|skip|stop|leave|hold|wait|later|instead|"
+                     r"abort|reject|deny|denied|untouched|preserved?|spare|only\s+after)\b", re.I)
 SOURCE_RE = re.compile(r"^(user|answer):([A-Za-z0-9._-]{1,120})/([0-9a-fA-F-]{8,64})$")
 
 
@@ -226,7 +244,10 @@ def sql_text_for(command: str, cwd=None, unread=None) -> str:
     if DB_CLIENT.search(command) or D1_EXECUTE.search(command):
         paths += [m.group(1) for m in REDIRECT_IN.finditer(command)]
         paths += [m.group(1) for m in SUBST_IN.finditer(command)]
-        paths += [m.group(1) for m in SUBST_CAT.finditer(command)]
+        for m in CAT_ARGS.finditer(command):
+            paths += [w for w in m.group(1).split() if not w.startswith("-")]
+        client = DB_CLIENT.search(command) or D1_EXECUTE.search(command)
+        piped.extend("the output of %s" % x for x in _other_substitutions(command[client.start():SHLEX_LIMIT]))
         paths += [m.group(1) for m in CLIENT_INCLUDE.finditer(command)]
         paths += [m.group(1) for m in MYSQL_SOURCE.finditer(command)]
         paths += [m.group(1) for m in SQLITE_INIT.finditer(command)]
@@ -255,23 +276,44 @@ def sql_text_for(command: str, cwd=None, unread=None) -> str:
     return text
 
 
+def _other_substitutions(text: str) -> list:
+    """$(...) and `...` whose command is not cat and not a `< file` read (both of those are judged as input)."""
+    out = []
+    for m in OTHER_SUBST.finditer(text):
+        word = m.group(1) if m.group(1) is not None else (m.group(2) or "")
+        if word.rsplit("/", 1)[-1] != "cat" and not word.startswith("<"):
+            out.append(m.group(0)[:40])
+            if len(out) >= 8:
+                break
+    return out
+
+
 def _multi_step(command: str) -> bool:
-    """True when the command has more than one step besides a pipeline: ; && || & or a newline outside quotes,
-    or a cd/pushd."""
-    bare = re.sub(r"'[^']*'|\"[^\"]*\"", " ", command[:SHLEX_LIMIT])
-    bare = re.sub(r"\d?[<>]&\d?-?", " ", bare)
-    return bool(re.search(r"[;&\n]|(?:^|\s)(?:cd|pushd)(?:\s|$)", bare)) or len(command) > SHLEX_LIMIT
+    """True when the command has more than one step besides a plain pipeline: ; && || & or a newline outside
+    quotes, a cd/pushd, xargs (it runs after the producer exits), process substitution, or a command substitution
+    that is not a cat or `< file` read (it runs before the client, r4 review H3)."""
+    head = command[:SHLEX_LIMIT]
+    bare = re.sub(r"'[^']*'|\"[^\"]*\"", " ", head)
+    bare = re.sub(r"\d?[<>]&\d?-?|&>>?", " ", bare)
+    return (bool(re.search(r"[;&\n]|(?:^|\s)(?:cd|pushd|xargs)(?:\s|$)|[<>]\(", bare))
+            or bool(_other_substitutions(head)) or len(command) > SHLEX_LIMIT)
 
 
 def _piped_inputs(command: str, unjudged: list) -> list:
-    """Files fed by `cat file | client`. A client fed by any other producer (head, sed, curl, a script) with no
-    -c/-e/-f of its own reads SQL the guard cannot see, so that stdin is listed in `unjudged`; echo and printf
-    text is in the command itself."""
+    """Files fed by `cat file | ... client`, the client anywhere in the next segment (ssh, docker exec, sudo, env).
+    A client fed by any other producer (head, sed, curl, a script) reads SQL the guard cannot see unless its own
+    flags or a `<` redirect replace stdin, so that stdin is listed in `unjudged`; echo and printf text is in the
+    command itself."""
     paths = []
     segments = re.split(r"(?<!\|)\|(?!\|)", command[:SHLEX_LIMIT])
     for i in range(1, min(len(segments), 64)):
         seg = segments[i]
-        if not PIPE_CLIENT.match(seg) or SCRIPT_FLAG.search(seg):
+        client = DB_CLIENT.search(seg)
+        if not client:
+            continue
+        rest = seg[client.end():]
+        replaced = STDIN_REPLACED.get(client.group(1).casefold())
+        if (replaced and replaced.search(rest)) or STDIN_REDIRECT.search(rest):
             continue
         bare = re.sub(r"'[^']*'|\"[^\"]*\"", " Q ", segments[i - 1])  # quoted text is data, not a separator
         producer = re.split(r"[;&\n]", bare)[-1].split()
@@ -540,10 +582,12 @@ def resolve_user_source(source: str, home=None) -> dict:
 def names_target(turn: dict, target: str) -> bool:
     """The user's own selected answer names the exact target as a whole name (not inside a host, port or path),
     and does not decline. The agent's question text never counts: it is not the user's words."""
-    said = str(turn.get("text") or "")
-    if DECLINE.search(said):
+    said = str(turn.get("text") or "").replace("\u2019", "'").replace("\u2018", "'").casefold()
+    whole = r"(?<![\w.:/@-])%s(?![\w-]|[.:/@]\w)" % re.escape(target.casefold())
+    if not re.search(whole, said):
         return False
-    return bool(re.search(r"(?<![\w.:/@-])%s(?![\w-]|[.:/@]\w)" % re.escape(target.casefold()), said.casefold()))
+    # decline words count outside the target name only, so a target such as hold-db can still be granted
+    return not DECLINE.search(re.sub(whole, " ", said))
 
 
 def _epoch(ts) -> float:

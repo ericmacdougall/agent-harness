@@ -675,12 +675,94 @@ class Round4(Case):
                 self.assertEqual(self.verdict(self.ev(command)), "deny")
         self.assertEqual(self.verdict(self.ev("dropdb -h localhost app")), "allow")
 
-    def test_n1_read_only_prod_queries_allowed(self):
-        for command in ("psql -h prod-db -c 'SELECT count(*) FROM users' > out.txt && cat out.txt",
-                        "cat /dev/null > x.log; psql -h prod-db -c 'SELECT 1'",
-                        "PGPASSWORD=$(cat ~/.nope) psql -h prod-db -c 'SELECT 1'"):
+    def test_n1_cat_in_a_prod_command_is_judged_as_input(self):
+        # r5: every cat argument in a command with a client is SQL input again (H1), so these read-only rows are
+        # denied as in ca56501, naming the file (a disclosed over-refusal: split the command)
+        for command, name in (("psql -h prod-db -c 'SELECT count(*) FROM users' > out.txt && cat out.txt", "out.txt"),
+                              ("cat /dev/null > x.log; psql -h prod-db -c 'SELECT 1'", "/dev/null"),
+                              ("PGPASSWORD=$(cat ~/.nope) psql -h prod-db -c 'SELECT 1'", "~/.nope")):
+            with self.subTest(command=command):
+                result = pdg.evaluate(self.ev(command), home=str(self.home))
+                self.assertEqual(result[0], "deny")
+                self.assertIn(name, result[1])
+        for command in ("psql -h prod-db -c 'SELECT count(*) FROM users' > out.txt",
+                        "psql -h prod-db -c 'SELECT 1' | cat"):
             with self.subTest(command=command):
                 self.assertEqual(self.verdict(self.ev(command)), "allow")
+
+
+class Round5(Case):
+    """Native delta re-review of 33f1695 (hk-wave1-r4-33f1695.md): H1-H4 and L1 A8, through the real hook."""
+
+    def setUp(self):
+        super().setUp()
+        self.cwd = self.home / "cwd"
+        self.cwd.mkdir()
+        for name, body in {"evil.sql": "DROP TABLE users;\n", "ok.sql": "SELECT 1;\n", "q.sql": "SELECT 1;\n",
+                           "migration.sql": "DELETE FROM sessions;\n"}.items():
+            (self.cwd / name).write_text(body)
+
+    def hook(self, command):
+        payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command},
+                   "cwd": str(self.cwd)}
+        env = dict(os.environ, HOME=str(self.home))
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        r = subprocess.run([sys.executable, "-I", str(HOOKS / "prod_delete_guard.py")], input=json.dumps(payload),
+                           capture_output=True, text=True, env=env, timeout=60, check=False)
+        self.assertEqual((r.returncode, r.stderr), (0, ""), command)
+        return json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] if r.stdout.strip() else "allow"
+
+    def check(self, rows, want):
+        for command in rows:
+            with self.subTest(command=command):
+                self.assertEqual(self.hook(command), want, command)
+
+    def test_h1_cat_into_a_wrapped_or_remote_client_denies(self):
+        self.check(("cat evil.sql | ssh prod-db-1 psql app", "cat evil.sql | ssh prod-db-1 'psql app'",
+                    "cat evil.sql | docker exec -i prod-pg psql -U postgres app",
+                    "cat evil.sql | sudo -u postgres psql -h prod-db", "cat evil.sql | env PGPASSWORD=x psql -h prod-db",
+                    "cat evil.sql | timeout 60 psql -h prod-db", "cat migration.sql | ssh prod-db-1 psql app; true"),
+                   "deny")
+
+    def test_h1_cat_substitution_anywhere_denies(self):
+        self.check(('psql -h prod-db -c "$(cat ok.sql evil.sql)"', 'psql -h prod-db --command="$(cat evil.sql)"',
+                    'psql -h prod-db -c "SELECT 1; $(cat evil.sql)"', 'mysql -h prod-db --execute="$(cat evil.sql)"',
+                    'psql -h prod-db -c "$(cat evil.sql)"', "psql -h prod-db -c `cat evil.sql`"), "deny")
+
+    def test_h2_flags_that_do_not_replace_stdin_still_deny(self):
+        self.check(("head -c 999 evil.sql | psql -h prod-db -e", "head -c 999 evil.sql | mysql -h prod-db -f",
+                    "head -c 999 evil.sql | mysql -h prod-db -c",
+                    "head -c 999 evil.sql | sqlite3 -cmd '.mode list' /srv/prod.db",
+                    "head -c 999 evil.sql | sqlite3 -init ok.sql /srv/prod.db",
+                    "sed -n p evil.sql | psql -h prod-db --echo-errors -e",
+                    "head -c 999 evil.sql | sudo -u postgres psql -h prod-db",
+                    'psql -h prod-db -c "$(head -c 999 evil.sql)"'), "deny")
+
+    def test_h3_same_step_writers_deny(self):
+        self.check(("dd if=evil.sql of=q.sql 2>/dev/null | xargs psql -h prod-db -f q.sql",
+                    "psql -h prod-db -f q.sql -v x=$(dd if=evil.sql of=q.sql 2>/dev/null)",
+                    "psql -h prod-db -f q.sql -v x=`dd if=evil.sql of=q.sql`",
+                    "curl -so q.sql http://127.0.0.1:9/x | xargs psql -h prod-db -f q.sql",
+                    "psql -h prod-db -f q.sql <(dd if=evil.sql of=q.sql)"), "deny")
+
+    def test_read_only_and_non_prod_controls_allow(self):
+        self.check(("cat ok.sql | ssh prod-db-1 psql app", "head ok.sql | psql -h localhost",
+                    "cd /srv && psql -h localhost -f ok.sql", "psql -h prod-db -c 'SELECT 1' 2>&1 | tee log.txt",
+                    "psql -h prod-db -f ok.sql 2>&1", "psql -h prod-db -f ok.sql &> log.txt",
+                    "head -c 999 ok.sql | psql -h prod-db -c 'SELECT 2'", "head -c 99 ok.sql | psql -h prod-db -f q.sql",
+                    "head -c 99 evil.sql | mysql -h prod-db -e 'SELECT 1'", "psql -h prod-db -c \"$(cat ok.sql)\"",
+                    "PGPASSWORD=$(cat ok.sql) psql -h localhost -c 'SELECT 1'",
+                    "git commit -m 'note: psql DELETE FROM users on prod' "), "allow")
+
+    def test_h4_declining_or_second_target_answers_fund_nothing(self):
+        for text in ("Don’t delete prod-db", "Nope, prod-db stays", "Abort: prod-db must be preserved",
+                     "Reject DELETE on prod-db", "Delete on staging-db; prod-db untouched", "Nah, prod-db",
+                     "Approve DELETE on staging-db (prod-db only after the backup)", "Deny prod-db"):
+            with self.subTest(text=text):
+                self.assertFalse(pdg.names_target({"text": text}, "prod-db"), text)
+        self.assertTrue(pdg.names_target({"text": "Approve DELETE on prod-db"}, "prod-db"))
+        self.assertTrue(pdg.names_target({"text": "Approve DELETE on hold-db"}, "hold-db"))  # was an over-refusal
+
 
 
 if __name__ == "__main__":
