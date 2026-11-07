@@ -337,11 +337,12 @@ PINNED_ROUTES = (
      r'|set-ttl --name [a-z.]{{1,40}} --ttl [0-9]{{1,5}} --expect-ttl [0-9]{{1,5}}'
      r'|set-content --name [a-z.]{{1,40}} --content [0-9.]{{7,15}} --expect-content [0-9.]{{7,15}})'),
 )
-# Existing scripts are otherwise judged only for log deletion, so a credential read inside one would pass. This refuses
+# Existing scripts keep only log deletion and the credential-read rules (SCRIPT_CREDENTIAL_RULES); other printing rules
+# inside them still pass (goodqa#14993 follow-up). This also refuses
 # scripts whose own text, outside comment lines, names the rclone config or the token secret or dumps the config. Text only.
 # Python prose does not count as a dump: there the command must open a string or be an argument list. It runs as its own
 # pass after main's analysis (credential_findings), so it only ever adds a finding and cannot use main's time. It does
-# not run inside scripts on disk, whose own commands are judged only for log deletion. It does not catch a
+# not run inside scripts on disk, whose own commands keep only log deletion and credential reads. It does not catch a
 # script that builds the name at runtime or calls another script, a name past the read limit, a path the guard cannot
 # resolve, a runner it does not unwrap (`uv run`, `tmux`, `python3 -m cProfile`), a test in a folder named tests, or one of
 # the guard's own files.
