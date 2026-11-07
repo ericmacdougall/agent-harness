@@ -546,8 +546,11 @@ TAR_LONG_VALUES = ("--directory", "--exclude", "--files-from", "--exclude-from",
 
 
 def parse_tar(args):
-    """(mode 'x'|'c'|None, archive, [source words]) for old-style (`tar xzf a.tgz`) and dashed forms, flags in any order."""
+    """(mode 'x'|'c'|None, archive, [source words], to_stdout, -C directory or None) for old-style (`tar xzf a.tgz`)
+    and dashed forms, flags in any order. A dashed cluster follows getopt: a value letter takes the rest of the word
+    (`-C/dir`, `-xf/a.tar`), else the next word; old-style letters each take the next word."""
     mode, archive, sources, i = None, None, [], 0
+    directory = None
     to_stdout = False
     while i < len(args):
         a = args[i]
@@ -566,12 +569,15 @@ def parse_tar(args):
             elif name == "--file":
                 archive = val if eq else (args[i] if i < len(args) else None)
                 i += 0 if eq else 1
+            elif name == "--directory":
+                directory = val if eq else (args[i] if i < len(args) else None)
+                i += 0 if eq else 1
             elif name in TAR_LONG_VALUES and not eq:
                 i += 1
             continue
         if (a.startswith("-") and len(a) > 1) or (i == 1 and not a.startswith("-") and re.fullmatch(r"[A-Za-z]+", a)):
-            wants = []
-            for ch in a.lstrip("-"):
+            wants, dashed, letters = [], a.startswith("-"), a.lstrip("-")
+            for pos, ch in enumerate(letters):
                 if ch == "O":
                     to_stdout = True
                 if ch == "x":
@@ -579,26 +585,23 @@ def parse_tar(args):
                 elif ch == "c":
                     mode = mode or "c"
                 if ch in TAR_ARG_LETTERS:
-                    wants.append(ch)
-            for ch in wants:
-                value = args[i] if i < len(args) else None
-                i += 1
+                    if dashed and letters[pos + 1:]:
+                        wants.append((ch, letters[pos + 1:]))  # PR #119 review G2: `-C/path` as one word
+                        break
+                    wants.append((ch, None))
+                    if dashed:
+                        break
+            for ch, value in wants:
+                if value is None:
+                    value = args[i] if i < len(args) else None
+                    i += 1
                 if ch == "f":
                     archive = value
+                elif ch == "C":
+                    directory = value
             continue
         sources.append(a)
-    return mode, archive, sources, to_stdout
-
-
-def tar_directory(args):
-    """The -C / --directory value of a tar command line (the last one wins), else None."""
-    found = None
-    for i, a in enumerate(args):
-        if a in ("-C", "--directory") and i + 1 < len(args):
-            found = args[i + 1]
-        elif a.startswith("--directory="):
-            found = a.split("=", 1)[1]
-    return found
+    return mode, archive, sources, to_stdout, directory
 
 
 def classify_copy(low, args, ctx):
@@ -616,6 +619,14 @@ def classify_copy(low, args, ctx):
         if low == "cp" and target is None and joined:
             target = joined[-1].split("=", 1)[1] if joined[-1].startswith("--") else joined[-1][2:]
             args = [a for a in args if a is not joined[-1]]
+        # Review G2: GNU short-flag clusters `-rt DIR` / `-rtDIR` (flags before t take no value; -S does).
+        cluster = next((i for i, a in enumerate(args) if re.fullmatch(r"-[a-zA-RT-Z]+t.*", a)), None)
+        if low == "cp" and target is None and cluster is not None:
+            value = args[cluster].split("t", 1)[1]
+            if value or cluster + 1 < len(args):
+                target = value or args[cluster + 1]
+                rest = args[cluster].split("t", 1)[0]
+                args = args[:cluster] + ([rest] if rest != "-" else []) + args[cluster + (1 if value else 2):]
         values = {"rsync": RSYNC_VALUE_FLAGS, "scp": SCP_VALUE_FLAGS, "cp": CP_VALUE_FLAGS}.get(low, ())
         pos = positional(args, values)
         if target is None and len(pos) < 2:
@@ -634,13 +645,13 @@ def classify_copy(low, args, ctx):
         ctx.write_dir = resolve(os.path.expanduser(dest), ctx.cwd)
         return finish_copy(low, total, unknown, thr)
     if low == "tar" and args:
-        mode, archive, srcs, to_stdout = parse_tar(args)
+        mode, archive, srcs, to_stdout, directory = parse_tar(args)
         if to_stdout and mode == "x":
             return None  # extracting to stdout writes nothing to disk
         if mode is None or archive in (None, "-") or REMOTE_SPEC.match(archive) and not archive.startswith(("/", ".", "~")):
             return None  # a pipe or a listing: the other end decides (tar czf - . | ssh dev2 'tar x')
         if mode == "x":
-            ctx.write_dir = resolve(os.path.expanduser(tar_directory(args) or "."), ctx.cwd)
+            ctx.write_dir = resolve(os.path.expanduser(directory or "."), ctx.cwd)
             size, _complete = path_size(resolve(os.path.expanduser(archive), ctx.cwd))
             return finish_copy("tar extract", size * (4 if COMPRESSED.search(archive) else 1), None, thr)
         total, unknown = sum_sources(srcs, ctx, thr)
@@ -2179,7 +2190,8 @@ def work_owner_key(path):
     real = os.path.realpath(path) if path else ""
     # goodqa#15067 review F1: `work/sess/./agent-A`, `work/../work/sess/agent-A` must give the same key as the plain path.
     for candidate in (os.path.normpath(path) if path else "", real):
-        if candidate and candidate.startswith(root):
+        # Review G2: on macOS ~/.AGENT-HARNESS/work is the same directory as ~/.agent-harness/work.
+        if candidate and same_key(candidate[:len(root)], root):
             parts = candidate[len(root):].split(os.sep)
             if len(parts) >= 2 and parts[0] and parts[1]:
                 return f"{parts[0]}/{parts[1]}"
@@ -2325,10 +2337,13 @@ def run(raw: bytes) -> int:
         # goodqa#15067: judge the owner dir each heavy write lands in (a copy's destination, else where it runs after
         # any `cd`), not the session cwd, which may be an unrelated over-budget checkout.
         budget = None
-        fallback = actor_dir(payload) or payload.get("cwd")
-        for where in decision.get("write_dirs") or [payload.get("cwd")]:
-            # Review F2: bytes landing outside ~/.agent-harness/work (~/Downloads, /tmp) are still this owner's.
-            budget = over_budget(where if work_owner_key(where) else fallback)
+        actor = actor_dir(payload)
+        fallback = actor or payload.get("cwd")
+        # Review F2: bytes landing outside ~/.agent-harness/work (~/Downloads, /tmp) are still this owner's.
+        # Review G1: an over-budget agent is charged too when it writes into another or a brand-new work dir.
+        targets = [where if work_owner_key(where) else fallback for where in decision.get("write_dirs") or [payload.get("cwd")]]
+        for where in targets + ([actor] if actor else []):
+            budget = over_budget(where)
             if budget:
                 break
         if budget:  # over its disk budget: new heavy local writes stop, hatch or not, until it frees space or routes

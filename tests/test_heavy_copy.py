@@ -564,6 +564,32 @@ class RunGates(unittest.TestCase):
                 self.assertEqual(code, 2, (cmd, err))
                 self.assertIn("over its", err, cmd)
 
+    def test_an_over_budget_agent_writing_into_a_new_or_other_work_dir_is_refused(self):
+        # PR #119 review G1: the acting agent's own over-budget dir is charged whatever work dir it writes into.
+        cwd, dest, _sizes = self.scp_case()
+        sibling = Path(self.home.name, ".agent-harness", "work", "sess", "agent-A-tmp")
+        sibling.mkdir(parents=True)
+        with mock.patch.object(guard, "path_size", fake_size({"/bigsrc": 3 * GIB, cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB})):
+            for target in (f"{sibling}/x", f"{dest}/x"):
+                code, err = self.call(self.HATCH + f"cp -R /bigsrc {target}", cwd=cwd, agent="A", session="sess")
+                self.assertEqual(code, 2, (target, err))
+                self.assertIn("over its", err, target)
+
+    def test_joined_tar_dir_clustered_cp_target_and_root_case_are_judged(self):
+        # PR #119 review G2: other spellings of a destination inside the over-budget dir.
+        cwd, dest, _sizes = self.scp_case()
+        upper = cwd.replace(os.sep + ".agent-harness" + os.sep, os.sep + ".AGENT-HARNESS" + os.sep)
+        self.assertNotEqual(upper, cwd)
+        cmds = [f"tar -xf /bigsrc.tar -C{cwd}", f"cp -rt {cwd}/out /bigsrc", f"cp -R /bigsrc {upper}/x"]
+        if sys.platform != "darwin":
+            cmds.pop()  # the root spelling is one directory only on a case-insensitive disk
+        with mock.patch.object(guard, "path_size", fake_size({"/bigsrc": 3 * GIB, cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB})):
+            for i, cmd in enumerate(cmds):
+                with self.subTest(cmd=cmd):
+                    code, err = self.call(self.HATCH + cmd, cwd=dest, agent=f"g2-{i}")
+                    self.assertEqual(code, 2, (cmd, err))
+                    self.assertIn("over its", err, cmd)
+
     def test_a_download_from_outside_the_fleet_still_counts_as_heavy(self):
         cwd, dest, sizes = self.scp_case()
         with mock.patch.object(guard, "path_size", sizes):
