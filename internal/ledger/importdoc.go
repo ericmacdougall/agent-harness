@@ -123,7 +123,11 @@ func BuildImport(in fold.Input, from, to []Frontier, baseDigest string, redact b
 	var rng []*op.Op
 	touched := map[string]bool{}
 	for _, r := range cut.Refs {
-		rng = append(rng, r.Ops[fromOps[r.Writer]:]...)
+		n := fromOps[r.Writer]
+		if n < 0 || n > len(r.Ops) {
+			return nil, fmt.Errorf("base frontier for %s is outside the target frontier", r.Writer)
+		}
+		rng = append(rng, r.Ops[n:]...)
 	}
 	fold.SortOps(rng)
 	for _, o := range rng {

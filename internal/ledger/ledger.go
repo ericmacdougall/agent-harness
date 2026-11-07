@@ -1009,11 +1009,18 @@ func (l *Ledger) mint(drafts []op.Draft, w string, last op.HLC, now int64, witne
 		}
 		payload := append(op.Obj(nil), d.Payload...)
 		if d.Kind == op.KindComment {
+			if len(d.Payload) != 2 || d.Payload[0].K != "comment_id" || d.Payload[1].K != "body" {
+				return nil, wrap(ErrUsage, "ticket.comment draft payload must contain comment_id and body")
+			}
+			body, ok := d.Payload[1].V.(string)
+			if !ok {
+				return nil, wrap(ErrUsage, "ticket.comment draft body must be a string")
+			}
 			cid, err := op.NewID(op.PrefixComment, h.WallMs)
 			if err != nil {
 				return nil, err
 			}
-			payload = op.Comment(cid, d.Payload[1].V.(string))
+			payload = op.Comment(cid, body)
 		}
 		if d.Kind == op.KindProjectCreate {
 			// Root rule: the project id is derived from (equals the ULID of) its project.create op.

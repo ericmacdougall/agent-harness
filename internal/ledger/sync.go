@@ -105,6 +105,10 @@ type Binding struct {
 	BoundMs       int64
 	Frontier      []Frontier
 	GoodQAKey     string // hex ed25519 public key pinned by the user; empty = receipts are advisory
+	// Damaged: a binding file exists but failed validation. It vouches for nothing (no frontier, no pin),
+	// yet it is not "never bound": bind and --since-bound refuse it until `unbind` removes it, so damage
+	// can never drop a pinned key and let an unsigned receipt through (Kimi audit F10, goodqa#14998).
+	Damaged bool
 }
 
 type frontierJSON struct {
@@ -144,24 +148,56 @@ func (l *Ledger) homeDir(create bool) (*safefs.Dir, error) {
 	return d, nil
 }
 
-// ReadBinding returns this HOME's binding, or nil when the ledger was never bound here. A malformed or
-// foreign file is treated as no binding: it can only make the state less synced, never more.
+// maxPersistedOps bounds op counts read back from HOME state: far above any real writer, far below overflow.
+const maxPersistedOps = 1 << 30
+
+func validDigest(s string) bool {
+	if len(s) != sha256.Size*2 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if (s[i] < '0' || s[i] > '9') && (s[i] < 'a' || s[i] > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// ReadBinding returns this HOME's binding, or nil when the ledger was never bound here (no binding file).
+// A file that exists but cannot be read, parsed or validated (strict JSON, version, ledger, digest, each
+// frontier entry: writer and op ids, count, clock, no duplicate writer) returns a Binding with Damaged set
+// and nothing else, never nil: damage must not look like "never bound". The pinned key is not validated
+// here; Bind parses it at the authentication boundary and refuses there.
 func (l *Ledger) ReadBinding() *Binding {
 	d, err := l.homeDir(false)
 	if err != nil {
-		return nil
+		if IsNotExist(err) {
+			return nil
+		}
+		return &Binding{Damaged: true}
 	}
 	defer d.Close()
 	b, err := d.ReadRegular(syncFile, stateMax)
 	if err != nil {
-		return nil
+		if IsNotExist(err) {
+			return nil
+		}
+		return &Binding{Damaged: true}
 	}
 	var j bindingJSON
-	if json.Unmarshal(b, &j) != nil || j.V != 1 || j.Ledger != l.Project {
-		return nil
+	if _, derr := op.DecodeStrict(b); derr != nil || json.Unmarshal(b, &j) != nil || j.V != 1 ||
+		j.Ledger != l.Project || !validDigest(j.ExportDigest) || len(j.Frontier) > 4096 {
+		return &Binding{Damaged: true}
 	}
 	out := &Binding{GoodQAProject: j.GoodQAProject, ImportID: j.ImportID, ExportDigest: j.ExportDigest, BoundMs: j.BoundMs, GoodQAKey: j.GoodQAKey}
+	seen := map[string]bool{}
 	for _, f := range j.Frontier {
+		if seen[f.Writer] || !op.ValidID(f.Writer, op.PrefixWriter) || !op.ValidID(f.LastOp, op.PrefixOp) ||
+			f.Ops < 1 || f.Ops > maxPersistedOps || f.WallMs < 0 || f.Ctr < 0 ||
+			op.ULIDTime(f.LastOp[len(op.PrefixOp):]) != f.WallMs {
+			return &Binding{Damaged: true}
+		}
+		seen[f.Writer] = true
 		out.Frontier = append(out.Frontier, Frontier{f.Writer, f.Ops, f.WallMs, f.Ctr, f.LastOp})
 	}
 	return out
@@ -250,13 +286,15 @@ func (l *Ledger) ReadTrust() *Trust {
 		return t
 	}
 	var j trustJSON
-	if json.Unmarshal(b, &j) != nil || j.V != 1 || j.Ledger != l.Project {
+	if _, derr := op.DecodeStrict(b); derr != nil || json.Unmarshal(b, &j) != nil || j.V != 1 || j.Ledger != l.Project {
 		return t
 	}
 	for w, e := range j.Trusted {
-		ops, _ := e["ops"].(float64)
-		dg, _ := e["digest"].(string)
-		if op.ValidID(w, op.PrefixWriter) && ops >= 1 && len(dg) == 64 {
+		// Only a whole, in-range count and a lowercase hex digest are trust; anything else trusts nobody.
+		ops, isNum := e["ops"].(float64)
+		dg, isStr := e["digest"].(string)
+		if op.ValidID(w, op.PrefixWriter) && isNum && ops >= 1 && ops <= maxPersistedOps && ops == float64(int(ops)) &&
+			isStr && validDigest(dg) {
 			t.Trusted[w] = TrustEntry{Ops: int(ops), Digest: dg}
 		}
 	}

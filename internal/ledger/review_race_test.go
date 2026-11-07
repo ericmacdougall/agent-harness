@@ -114,3 +114,14 @@ func TestWriterReviewConcurrentDoesNotReleaseHeldOps(t *testing.T) {
 		t.Fatal("normal view cache is not fresh")
 	}
 }
+
+func TestBuildImportRejectsNegativeBaseIndex(t *testing.T) {
+	project, writer, ops := buildOps(t, 1)
+	in := inputOf(project, writer, ops)
+	to := ledger.FoldedFrontier(in)
+	from := append([]ledger.Frontier(nil), to...)
+	from[0].Ops = -1
+	if _, err := ledger.BuildImport(in, from, to, "", false); err == nil {
+		t.Fatal("negative base frontier accepted")
+	}
+}
