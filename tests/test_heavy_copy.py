@@ -492,6 +492,111 @@ class RunGates(unittest.TestCase):
         with mock.patch.object(guard, "path_size", fake_size({"/bigsrc": 3 * GIB, cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB})):
             self.assertEqual(self.call("HARNESS_LOCAL_OK='one local step' cp -r /bigsrc ./c2", cwd=cwd, agent="agentD")[0], 2)
 
+    def scp_case(self):
+        """goodqa#15067: the session cwd is an over-budget owner dir; the copy lands in another owner's dir."""
+        cwd = self.work_cwd()
+        self.budget_record("sess/agent-A")
+        dest = Path(self.home.name, ".agent-harness", "work", "sess", "agent-B", "hwq")
+        dest.mkdir(parents=True)
+        sizes = fake_size({cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB})
+        return cwd, str(dest), sizes
+
+    def test_a_small_scp_from_the_mac_mini_is_not_refused_by_the_cwd_budget(self):
+        cwd, dest, sizes = self.scp_case()
+        with mock.patch.object(guard, "path_size", sizes), \
+                mock.patch.object(guard, "remote_path_size", lambda spec: 40 * 1024):
+            code, err = self.call(f"scp -q ah-mac-mini:hwq/launch-1.png {dest}/", cwd=cwd)
+            self.assertEqual(code, 0, err)
+            code, err = self.call(f"scp -q -r ah-mac-mini:hwq {dest}/d", cwd=cwd)
+            self.assertEqual(code, 0, err)
+
+    def test_a_heavy_copy_into_the_over_budget_dir_is_still_refused_with_its_reason(self):
+        # NEG: the budget still applies where the bytes land, by `cd` + relative path or by absolute path.
+        cwd, dest, sizes = self.scp_case()
+        with mock.patch.object(guard, "path_size", sizes), \
+                mock.patch.object(guard, "remote_path_size", lambda spec: 3 * GIB):
+            for cmd in (f"scp -r ah-mac-mini:big {cwd}/big", f"cd {dest} && cd {cwd} && scp -r ah-mac-mini:big ./big"):
+                code, err = self.call(cmd, cwd=dest)
+                self.assertEqual(code, 2, cmd)
+                self.assertIn("over its", err, cmd)
+                self.assertIn("copies at least 3.0 GiB", err, cmd)  # the copy rule's own reason is shown too
+
+    HATCH = "HARNESS_LOCAL_OK='one local step' "
+
+    def test_other_spellings_of_the_over_budget_dir_are_still_refused(self):
+        # PR #119 review F1: ./, .. and (on macOS) case must not change the owner key.
+        cwd, _dest, sizes = self.scp_case()
+        work = os.path.dirname(os.path.dirname(cwd))
+        spellings = [f"{work}/sess/./agent-A/x", f"{work}/../work/sess/agent-A/x", f"{work}//sess/agent-A/x"]
+        if sys.platform == "darwin":
+            spellings.append(f"{work}/sess/AGENT-A/x")
+        with mock.patch.object(guard, "path_size", fake_size({"/bigsrc": 3 * GIB, cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB})):
+            for i, target in enumerate(spellings):
+                code, err = self.call(self.HATCH + f"cp -R /bigsrc {target}", cwd=cwd, agent=f"spell{i}")
+                self.assertEqual(code, 2, target)
+                self.assertIn("over its", err, target)
+
+    def test_an_over_budget_agent_writing_outside_the_work_tree_is_refused(self):
+        # PR #119 review F2: ~/decoy has no owner key; the bytes are still the acting agent's.
+        cwd, _dest, _sizes = self.scp_case()
+        decoy = Path(self.home.name, "decoy")
+        decoy.mkdir()
+        with mock.patch.object(guard, "path_size", fake_size({"/bigsrc": 3 * GIB, cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB})):
+            code, err = self.call(self.HATCH + f"cp -R /bigsrc {decoy}/x", cwd=cwd, agent="A", session="sess")
+            self.assertEqual(code, 2, err)
+            self.assertIn("over its", err)
+            # another agent, under budget, may still use its hatch for the same write outside work
+            self.assertEqual(self.call(self.HATCH + f"cp -R /bigsrc {decoy}/y", cwd=str(decoy), agent="B",
+                                       session="sess")[0], 0)
+
+    def test_tar_clone_worktree_and_target_directory_destinations_are_judged(self):
+        # PR #119 review F3: from an under-budget cwd, each of these lands in the over-budget dir.
+        cwd, dest, _sizes = self.scp_case()
+        repo = Path(self.home.name, "bigrepo")
+        repo.mkdir()
+        table = {"/bigsrc": 3 * GIB, str(repo): 3 * GIB, cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB}
+        with mock.patch.object(guard, "path_size", fake_size(table)), \
+                mock.patch.object(guard, "tracked_tree_bytes", lambda path: 3 * GIB):
+            for i, cmd in enumerate([f"tar -xf /bigsrc.tar -C {cwd}", f"tar -x -f /bigsrc.tar --directory={cwd}",
+                                     f"git clone {repo} {cwd}/c", f"git worktree add {cwd}/w",
+                                     f"cp -R --target-directory={cwd}/out /bigsrc"]):
+                code, err = self.call(self.HATCH + cmd, cwd=dest, agent=f"f3-{i}")
+                self.assertEqual(code, 2, (cmd, err))
+                self.assertIn("over its", err, cmd)
+
+    def test_an_over_budget_agent_writing_into_a_new_or_other_work_dir_is_refused(self):
+        # PR #119 review G1: the acting agent's own over-budget dir is charged whatever work dir it writes into.
+        cwd, dest, _sizes = self.scp_case()
+        sibling = Path(self.home.name, ".agent-harness", "work", "sess", "agent-A-tmp")
+        sibling.mkdir(parents=True)
+        with mock.patch.object(guard, "path_size", fake_size({"/bigsrc": 3 * GIB, cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB})):
+            for target in (f"{sibling}/x", f"{dest}/x"):
+                code, err = self.call(self.HATCH + f"cp -R /bigsrc {target}", cwd=cwd, agent="A", session="sess")
+                self.assertEqual(code, 2, (target, err))
+                self.assertIn("over its", err, target)
+
+    def test_joined_tar_dir_clustered_cp_target_and_root_case_are_judged(self):
+        # PR #119 review G2: other spellings of a destination inside the over-budget dir.
+        cwd, dest, _sizes = self.scp_case()
+        upper = cwd.replace(os.sep + ".agent-harness" + os.sep, os.sep + ".AGENT-HARNESS" + os.sep)
+        self.assertNotEqual(upper, cwd)
+        cmds = [f"tar -xf /bigsrc.tar -C{cwd}", f"cp -rt {cwd}/out /bigsrc", f"cp -R /bigsrc {upper}/x"]
+        if sys.platform != "darwin":
+            cmds.pop()  # the root spelling is one directory only on a case-insensitive disk
+        with mock.patch.object(guard, "path_size", fake_size({"/bigsrc": 3 * GIB, cwd: 9 * GIB, os.path.realpath(cwd): 9 * GIB})):
+            for i, cmd in enumerate(cmds):
+                with self.subTest(cmd=cmd):
+                    code, err = self.call(self.HATCH + cmd, cwd=dest, agent=f"g2-{i}")
+                    self.assertEqual(code, 2, (cmd, err))
+                    self.assertIn("over its", err, cmd)
+
+    def test_a_download_from_outside_the_fleet_still_counts_as_heavy(self):
+        cwd, dest, sizes = self.scp_case()
+        with mock.patch.object(guard, "path_size", sizes):
+            code, err = self.call(f"scp -q somehost:x.png {dest}/", cwd=cwd)
+        self.assertEqual(code, 2)
+        self.assertIn("outside the measured fleet", err)
+
     def test_over_budget_owner_cannot_start_a_local_build_either(self):
         cwd = self.work_cwd()
         self.budget_record("sess/agent-A")

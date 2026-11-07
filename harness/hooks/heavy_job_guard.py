@@ -306,6 +306,9 @@ def positional(args, value_flags=()):
 GIB = 1024 ** 3
 NET_BUDGET_SECONDS = 5.0  # all ssh/gh/git/rclone/ps lookups of one decision together (the hook timeout is 10 s)
 _NET_DEADLINE = [None]
+# Where this decision's copy and build findings write on the Mac (goodqa#15067): the disk-budget block judges the owner
+# dir the bytes land in, not the session cwd. Reset by decide() for every decision.
+_WRITE_DIRS = []
 
 
 def net_left(want: float) -> float:
@@ -380,7 +383,7 @@ def path_size(path: str, cap: int = None, seconds: float = COPY_WALK_SECONDS):
 def measured_hosts():
     """Hosts the guard may `ssh du` to size a remote source: the fleet (dev2/T2) plus heavy_job_guard.json
     "measure_hosts". Any other host is not contacted and its source is not counted."""
-    hosts = {"dev2", "t2", "t2-dev"}
+    hosts = {"dev2", "t2", "t2-dev", "ah-mac-mini"}  # the user's own unix hosts (fleet.md); Windows hosts have no du
     try:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
         if os.path.exists(path):
@@ -543,8 +546,11 @@ TAR_LONG_VALUES = ("--directory", "--exclude", "--files-from", "--exclude-from",
 
 
 def parse_tar(args):
-    """(mode 'x'|'c'|None, archive, [source words]) for old-style (`tar xzf a.tgz`) and dashed forms, flags in any order."""
+    """(mode 'x'|'c'|None, archive, [source words], to_stdout, -C directory or None) for old-style (`tar xzf a.tgz`)
+    and dashed forms, flags in any order. A dashed cluster follows getopt: a value letter takes the rest of the word
+    (`-C/dir`, `-xf/a.tar`), else the next word; old-style letters each take the next word."""
     mode, archive, sources, i = None, None, [], 0
+    directory = None
     to_stdout = False
     while i < len(args):
         a = args[i]
@@ -563,12 +569,15 @@ def parse_tar(args):
             elif name == "--file":
                 archive = val if eq else (args[i] if i < len(args) else None)
                 i += 0 if eq else 1
+            elif name == "--directory":
+                directory = val if eq else (args[i] if i < len(args) else None)
+                i += 0 if eq else 1
             elif name in TAR_LONG_VALUES and not eq:
                 i += 1
             continue
         if (a.startswith("-") and len(a) > 1) or (i == 1 and not a.startswith("-") and re.fullmatch(r"[A-Za-z]+", a)):
-            wants = []
-            for ch in a.lstrip("-"):
+            wants, dashed, letters = [], a.startswith("-"), a.lstrip("-")
+            for pos, ch in enumerate(letters):
                 if ch == "O":
                     to_stdout = True
                 if ch == "x":
@@ -576,15 +585,23 @@ def parse_tar(args):
                 elif ch == "c":
                     mode = mode or "c"
                 if ch in TAR_ARG_LETTERS:
-                    wants.append(ch)
-            for ch in wants:
-                value = args[i] if i < len(args) else None
-                i += 1
+                    if dashed and letters[pos + 1:]:
+                        wants.append((ch, letters[pos + 1:]))  # PR #119 review G2: `-C/path` as one word
+                        break
+                    wants.append((ch, None))
+                    if dashed:
+                        break
+            for ch, value in wants:
+                if value is None:
+                    value = args[i] if i < len(args) else None
+                    i += 1
                 if ch == "f":
                     archive = value
+                elif ch == "C":
+                    directory = value
             continue
         sources.append(a)
-    return mode, archive, sources, to_stdout
+    return mode, archive, sources, to_stdout, directory
 
 
 def classify_copy(low, args, ctx):
@@ -597,6 +614,19 @@ def classify_copy(low, args, ctx):
         flagged = [a for a in args if a in ("-t", "--target-directory")]
         if low == "cp" and flagged and args.index(flagged[0]) + 1 < len(args):
             target = args[args.index(flagged[0]) + 1]
+        joined = [a for a in args if a.startswith("--target-directory=") or (a.startswith("-t") and len(a) > 2
+                                                                              and not a.startswith("--"))]
+        if low == "cp" and target is None and joined:
+            target = joined[-1].split("=", 1)[1] if joined[-1].startswith("--") else joined[-1][2:]
+            args = [a for a in args if a is not joined[-1]]
+        # Review G2: GNU short-flag clusters `-rt DIR` / `-rtDIR` (flags before t take no value; -S does).
+        cluster = next((i for i, a in enumerate(args) if re.fullmatch(r"-[a-zA-RT-Z]+t.*", a)), None)
+        if low == "cp" and target is None and cluster is not None:
+            value = args[cluster].split("t", 1)[1]
+            if value or cluster + 1 < len(args):
+                target = value or args[cluster + 1]
+                rest = args[cluster].split("t", 1)[0]
+                args = args[:cluster] + ([rest] if rest != "-" else []) + args[cluster + (1 if value else 2):]
         values = {"rsync": RSYNC_VALUE_FLAGS, "scp": SCP_VALUE_FLAGS, "cp": CP_VALUE_FLAGS}.get(low, ())
         pos = positional(args, values)
         if target is None and len(pos) < 2:
@@ -612,14 +642,16 @@ def classify_copy(low, args, ctx):
         deref = any(a in ("--copy-links", "--dereference") or re.match(r"^-[A-Za-z]*[LH][A-Za-z]*$", a) for a in args
                     if a.startswith("-") and a not in values)
         total, unknown = sum_sources(sources, ctx, thr, remote_ok=remote_tool, deref=deref)
+        ctx.write_dir = resolve(os.path.expanduser(dest), ctx.cwd)
         return finish_copy(low, total, unknown, thr)
     if low == "tar" and args:
-        mode, archive, srcs, to_stdout = parse_tar(args)
+        mode, archive, srcs, to_stdout, directory = parse_tar(args)
         if to_stdout and mode == "x":
             return None  # extracting to stdout writes nothing to disk
         if mode is None or archive in (None, "-") or REMOTE_SPEC.match(archive) and not archive.startswith(("/", ".", "~")):
             return None  # a pipe or a listing: the other end decides (tar czf - . | ssh dev2 'tar x')
         if mode == "x":
+            ctx.write_dir = resolve(os.path.expanduser(directory or "."), ctx.cwd)
             size, _complete = path_size(resolve(os.path.expanduser(archive), ctx.cwd))
             return finish_copy("tar extract", size * (4 if COMPRESSED.search(archive) else 1), None, thr)
         total, unknown = sum_sources(srcs, ctx, thr)
@@ -646,8 +678,13 @@ def classify_copy(low, args, ctx):
             pos = positional(rest[1:], CLONE_VALUE_FLAGS)
             if not pos:
                 return None
+            name = pos[1] if len(pos) > 1 else re.sub(r"\.git$", "", pos[0].rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1])
+            ctx.write_dir = resolve(os.path.expanduser(name or "."), cwd)
             return clone_estimate(pos[0], rest[1:], ctx, thr, "git clone")
         if rest[0] == "worktree" and rest[1:2] == ["add"]:
+            wpos = positional(rest[2:], ("-b", "-B", "--reason"))
+            if wpos:
+                ctx.write_dir = resolve(os.path.expanduser(wpos[0]), cwd)
             size = tracked_tree_bytes(cwd)
             if size is None:
                 return finish_copy("git worktree add", 0, "git could not size the tracked tree in time", thr)
@@ -1758,9 +1795,13 @@ def scan_state(command: str, cwd: str, depth: int = 0, parent=None):
         ctx.capped = False
         if rest and rest[0] in ("for", "while", "until"):
             ctx.loop = True
+        ctx.write_dir = None
         result = classify(argv, ctx, depth)
         if result:
             findings.append((result[0], result[1], ctx.capped, segment))
+            if result[0] in ("copy", "build"):
+                # A copy with a known destination writes there; anything else writes where it runs (cd included).
+                _WRITE_DIRS.append(getattr(ctx, "write_dir", None) or ctx.cwd)
     if getattr(ctx, "lane_uploads", 0) >= 1 and getattr(ctx, "loop", False) and has_background(text):
         findings.append(("dropbox-lane", "a backgrounded rclone upload to Dropbox inside a loop runs several uploads "
                          "at once; the lane is one upload at a time", False, command[:2000]))
@@ -1818,10 +1859,15 @@ SEVERITY = {"allow": 0, "warn": 1, "deny": 2}
 
 def decide(command: str, cwd: str = None, modes=None):
     """_decide with the shared lookup budget closed afterwards, so later callers in this process are unaffected."""
+    del _WRITE_DIRS[:]
     try:
-        return _decide(command, cwd, modes)
+        decision = _decide(command, cwd, modes)
+        if _WRITE_DIRS and decision.get("rule") in ("copy", "build"):
+            decision = dict(decision, write_dirs=list(dict.fromkeys(_WRITE_DIRS)))
+        return decision
     finally:
         _NET_DEADLINE[0] = None
+        del _WRITE_DIRS[:]
 
 
 def _decide(command: str, cwd: str = None, modes=None):
@@ -2142,12 +2188,29 @@ def work_owner_key(path):
     """'session/sub' of the work dir owning `path`, else None."""
     root = os.path.join(os.path.expanduser("~"), ".agent-harness", "work") + os.sep
     real = os.path.realpath(path) if path else ""
-    for candidate in (path, real):
-        if candidate and candidate.startswith(root):
+    # goodqa#15067 review F1: `work/sess/./agent-A`, `work/../work/sess/agent-A` must give the same key as the plain path.
+    for candidate in (os.path.normpath(path) if path else "", real):
+        # Review G2: on macOS ~/.AGENT-HARNESS/work is the same directory as ~/.agent-harness/work.
+        if candidate and same_key(candidate[:len(root)], root):
             parts = candidate[len(root):].split(os.sep)
             if len(parts) >= 2 and parts[0] and parts[1]:
                 return f"{parts[0]}/{parts[1]}"
     return None
+
+
+def same_key(a, b) -> bool:
+    """Owner keys name directories: on macOS (case-insensitive by default) AGENT-A and agent-A are one directory."""
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    return a.casefold() == b.casefold() if sys.platform == "darwin" else a == b
+
+
+def actor_dir(payload: dict):
+    """The acting agent's own work dir, work/<session>/agent-<id>, when the payload names both; else None."""
+    session, agent = payload.get("session_id"), payload.get("agent_id")
+    if not all(isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", v) for v in (session, agent)):
+        return None
+    return os.path.join(os.path.expanduser("~"), ".agent-harness", "work", session, "agent-" + agent)
 
 
 def agent_of_key(key: str) -> str:
@@ -2193,12 +2256,14 @@ def over_budget(cwd):
         try:
             if rec.get("over_since") is None:
                 continue
-            if rec.get("path_key") != key and rec.get("agent") != agent_of_key(key):
+            if not (same_key(rec.get("path_key"), key) or same_key(rec.get("agent"), agent_of_key(key))):
                 continue
             age = time.time() - record_epoch(rec)
             if age > 3 * 3600 or age < -300:
                 continue  # stale, or stamped in the future: a record must never block work for good
-            base = os.path.join(os.path.expanduser("~"), ".agent-harness", "work", key)
+            # measure the record's own (canonical) dir: AGENT-A and agent-A are one directory on macOS
+            canonical = rec.get("path_key") if same_key(rec.get("path_key"), key) else key
+            base = os.path.join(os.path.expanduser("~"), ".agent-harness", "work", canonical)
             budget = int(rec["budget_bytes"])
             size, complete = path_size(base, cap=budget + 1, seconds=1.0)
             if size > budget or not complete:
@@ -2269,12 +2334,24 @@ def run(raw: bytes) -> int:
     action = decision["action"]
     owner = owner_of(payload)
     if decision.get("rule") in ("copy", "build") and action != "warn":
-        budget = over_budget(payload.get("cwd"))
+        # goodqa#15067: judge the owner dir each heavy write lands in (a copy's destination, else where it runs after
+        # any `cd`), not the session cwd, which may be an unrelated over-budget checkout.
+        budget = None
+        actor = actor_dir(payload)
+        fallback = actor or payload.get("cwd")
+        # Review F2: bytes landing outside ~/.agent-harness/work (~/Downloads, /tmp) are still this owner's.
+        # Review G1: an over-budget agent is charged too when it writes into another or a brand-new work dir.
+        targets = [where if work_owner_key(where) else fallback for where in decision.get("write_dirs") or [payload.get("cwd")]]
+        for where in targets + ([actor] if actor else []):
+            budget = over_budget(where)
+            if budget:
+                break
         if budget:  # over its disk budget: new heavy local writes stop, hatch or not, until it frees space or routes
             gib = lambda n: f"{int(n) / GIB:.1f}"  # noqa: E731
-            sys.stderr.write(routed(f"Heavy-job guard [{decision['rule']}]: owner work dir {budget['path_key']} is over its {gib(budget['budget_bytes'])} GiB "
-                             f"disk budget ({gib(budget['used_bytes'])} GiB used). Free space there (nothing is deleted for you) or "
-                             "run the heavy job on dev2/T2 (ssh dev2 '<command>').\n"))
+            sys.stderr.write(routed(scrub_url(f"Heavy-job guard [{decision['rule']}]: owner work dir {budget['path_key']} is over its {gib(budget['budget_bytes'])} GiB "
+                             f"disk budget ({gib(budget['used_bytes'])} GiB used), and this {decision['rule']} writes there "
+                             f"({str(decision.get('detail', ''))[:300]}). Free space there (nothing is deleted for you) or "
+                             "run the heavy job on dev2/T2 (ssh dev2 '<command>').\n")))
             log_event({"event": "deny-over-budget", "rule": decision["rule"]})
             ring_event(f"heavy:{event_class(decision)}:{owner}", "high", f"{owner} refused a heavy {decision['rule']}: over disk budget",
                        dict(copy_event_detail(payload, decision), used_bytes=budget["used_bytes"],
