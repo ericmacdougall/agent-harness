@@ -92,6 +92,23 @@ class Create(Base):
         self.assertEqual(a["number"], b["number"])
         self.assertEqual(len(self.adapter.creates()), 1)
 
+    def test_read_error_after_a_match_keeps_the_match(self):
+        """Code inspection (N12): an OSError mid-read must not discard a created row already found."""
+        from unittest import mock
+        import safe_input
+        a = self.create(key="owner-task-err")
+        real = safe_input.iter_jsonl_lines
+
+        def failing(path, **kwargs):
+            for item in real(path, **kwargs):
+                yield item
+            raise OSError("read failed")
+        with mock.patch.object(safe_input, "iter_jsonl_lines", side_effect=failing):
+            b = self.create(key="owner-task-err")
+        self.assertTrue(b["deduplicated"])
+        self.assertEqual(len(self.adapter.creates()), 1)
+        self.assertEqual(a["number"], b["number"])
+
     def test_same_key_twice_files_one_ticket(self):
         a = self.create(key="owner-task-1")
         b = self.create(key="owner-task-1")

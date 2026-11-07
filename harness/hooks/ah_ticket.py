@@ -73,7 +73,8 @@ def _created(path: Path, key: str):
                     and isinstance(row.get("result"), dict):
                 found = row
     except (OSError, safe_input.InputRejected):
-        return None  # no ledger yet (or not a regular file): GoodQA still dedupes on the operationId
+        return found  # no ledger yet, not a regular file, or a read error after a match: keep what was found;
+        # GoodQA still dedupes on the operationId
     return found
 
 
