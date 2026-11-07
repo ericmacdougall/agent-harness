@@ -1536,6 +1536,20 @@ class LaneYield(BulkLane):
                       (self.logs / "log-backup.lane.log").read_text())
         lockd.rmdir()
 
+    def test_n4_a_lane_that_ends_during_the_check_does_not_split_tier_1(self):
+        # re-review N4: a lane that exits inside tier 1's 2 s state check was treated as a pre-#15147 lane.
+        self.logs.mkdir(parents=True, exist_ok=True)
+        self.holder(self.lane_lock(), body="sleep 1.2\n")
+        done = self.run_script(LOG_BACKUP_TPSLIMIT="2", LOG_BACKUP_BULK_EVERY_SECONDS="3600", **{
+            k: v for k, v in self.FAST.items() if k not in ("LOG_BACKUP_TIER", "LOG_BACKUP_TPSLIMIT")})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        log = (self.logs / "log-backup.log").read_text()
+        self.assertNotIn("does not yield", log)
+        self.assertIn("ended while tier 1 checked it", log)
+        self.assertEqual({self.tps(c) for c in self.copies() if "--files-from-raw" not in c}, {"2"})
+        if "bulk lane started" in log:
+            self.wait_for_lane()
+
     def test_a_lane_rate_above_the_budget_never_stops_tier_1(self):
         # red-team F4: BULK_TPS above TPSLIMIT stopped every run, tier 1 included, even with the lane off
         for lane in ("0", "1"):

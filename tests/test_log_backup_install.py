@@ -102,24 +102,63 @@ class Darwin(Case):
         self.assertIn("scheduler untouched", message)
         self.assertEqual((self.home / SCRIPT).read_bytes(), (ROOT / "harness/bin/log-backup.sh").read_bytes())
 
-    def test_f8_a_lane_enabled_by_hand_survives_a_reinstall(self):
-        # goodqa#15147 F8: the shipped plist has the lane off; an apply must not silently reset a hand-enabled lane.
+    LANE_OFF = "<key>LOG_BACKUP_BULK_LANE</key><string>0</string>"
+    LANE_ON = "<key>LOG_BACKUP_BULK_LANE</key><string>1</string>"
+    RELOAD = [["launchctl", "enable", "gui/501/com.ericmacdougall.log-backup"],
+              ["launchctl", "bootout", "gui/501/com.ericmacdougall.log-backup"]]
+
+    def lane_in_plist(self):
+        import plistlib
+        return plistlib.loads((self.home / PLIST).read_bytes())["EnvironmentVariables"]["LOG_BACKUP_BULK_LANE"]
+
+    def test_f8_a_lane_enabled_by_hand_survives_a_reinstall_and_is_loaded(self):
+        # goodqa#15147 F8 + re-review N1: the shipped plist has the lane off; an apply keeps a hand-enabled lane and
+        # reloads launchd so the loaded job matches the file.
         self.apply("Darwin")
         path = self.home / PLIST
-        off = "<key>LOG_BACKUP_BULK_LANE</key><string>0</string>"
-        on = "<key>LOG_BACKUP_BULK_LANE</key><string>1</string>"
-        self.assertIn(off, path.read_text())
-        path.write_text(path.read_text().replace(off, on))
-        (self.home / SCRIPT).write_text("older script\n")
+        self.assertIn(self.LANE_OFF, path.read_text())
+        path.write_text(path.read_text().replace(self.LANE_OFF, self.LANE_ON))
         message, runner = self.apply("Darwin")
-        self.assertIn(on, path.read_text(), "the hand-enabled lane is kept")
-        self.assertEqual(runner.calls, [], "keeping the lane setting is not a unit change")
+        self.assertEqual(self.lane_in_plist(), "1", "the hand-enabled lane is kept")
+        self.assertEqual(runner.calls[:2], self.RELOAD, "launchd reloads the job with the lane on")
         self.assertIn("keeps the bulk lane on", message)
+        message, runner = self.apply("Darwin")
+        self.assertEqual(runner.calls, [], "a second apply changes nothing")
+
+    def test_n1_turning_the_lane_off_in_the_installed_plist_reloads_launchd(self):
+        self.apply("Darwin")
+        path = self.home / PLIST
+        path.write_text(path.read_text().replace(self.LANE_OFF, self.LANE_ON))
+        self.apply("Darwin")
+        path.write_text(path.read_text().replace(self.LANE_ON, self.LANE_OFF))
+        message, runner = self.apply("Darwin")
+        self.assertEqual(self.lane_in_plist(), "0")
+        self.assertEqual(runner.calls[:2], self.RELOAD, "launchd drops the lane: the loaded job matches the file")
+        self.assertNotIn("keeps the bulk lane on", message)
+
+    def test_n2_a_lane_enabled_with_plutil_formatting_or_binary_is_kept(self):
+        import plistlib
+        self.apply("Darwin")
+        path = self.home / PLIST
+        data = plistlib.loads(path.read_bytes())
+        data["EnvironmentVariables"]["LOG_BACKUP_BULK_LANE"] = "1"
+        for fmt in (plistlib.FMT_XML, plistlib.FMT_BINARY):
+            with self.subTest(fmt):
+                path.write_bytes(plistlib.dumps(data, fmt=fmt))
+                self.apply("Darwin")
+                self.assertEqual(self.lane_in_plist(), "1")
+
+    def test_n3_an_on_line_inside_a_comment_does_not_turn_the_lane_on(self):
+        self.apply("Darwin")
+        path = self.home / PLIST
+        path.write_text(path.read_text().replace("</dict></plist>", "<!-- %s --></dict></plist>" % self.LANE_ON))
+        self.apply("Darwin")
+        self.assertEqual(self.lane_in_plist(), "0")
 
     def test_f8_a_plist_without_the_lane_on_gets_the_shipped_lane_off(self):
         self.seed(PLIST, "<plist><key>LOG_BACKUP_BULK_LANE</key><string>yes</string></plist>\n")
         self.apply("Darwin")
-        self.assertIn("<key>LOG_BACKUP_BULK_LANE</key><string>0</string>", (self.home / PLIST).read_text())
+        self.assertIn(self.LANE_OFF, (self.home / PLIST).read_text())
 
     def test_preview_writes_nothing(self):
         message = lbi.status(self.home, False, system="Darwin", enabled=True)

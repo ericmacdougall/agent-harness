@@ -589,6 +589,12 @@ lane_pid=$(cat "$LANE_LOCKD/pid" 2>/dev/null)
 if [ "$TIER" != bulk ] && [ -n "$lane_pid" ] && holder_alive "$lane_pid"; then
   waited=0   # a lane writes its state right after taking its lock: allow it 2 s before calling it a pre-#15147 lane
   while ! lane_yields "$lane_pid" && [ $waited -lt 10 ] && holder_alive "$lane_pid"; do sleep 0.2; waited=$((waited + 1)); done
+  if ! lane_yields "$lane_pid" && ! holder_alive "$lane_pid"; then
+    say "bulk lane (pid $lane_pid) ended while tier 1 checked it"   # re-review N4: not a lane that does not yield
+    lane_pid=
+  fi
+fi
+if [ "$TIER" != bulk ] && [ -n "$lane_pid" ] && holder_alive "$lane_pid"; then
   if lane_yields "$lane_pid"; then
     lane_quiet "$lane_pid" && say "bulk lane running (pid $lane_pid); it pauses while tier 1 copies at ${TPSLIMIT}/s"
   elif [ "$TPSLIMIT" -gt 1 ]; then
