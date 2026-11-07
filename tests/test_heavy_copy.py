@@ -613,8 +613,11 @@ class RunGates(unittest.TestCase):
         with mock.patch.object(guard, "path_size", fake_size(table)):
             code, err = self.call(self.HATCH + f"cp -R /bigsrc {sibling}/x", cwd=str(cwd), agent=None, session="sess")
             self.assertEqual(code, 2, err)
-            self.assertIn("over its", err)
-            self.assertIn("l1-deploy", err)
+            self.assertIn("work dir sess/l1-deploy is over its", err)
+            # spec review R1: an agent_id the guard cannot map to a dir falls back to the cwd owner as well
+            code, err = self.call(self.HATCH + f"cp -R /bigsrc {sibling}/y", cwd=str(cwd), agent="A:bad", session="sess")
+            self.assertEqual(code, 2, err)
+            self.assertIn("work dir sess/l1-deploy is over its", err)
 
     def test_a_download_from_outside_the_fleet_still_counts_as_heavy(self):
         cwd, dest, sizes = self.scp_case()

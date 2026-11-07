@@ -2338,9 +2338,10 @@ def run(raw: bytes) -> int:
         # any `cd`), not the session cwd, which may be an unrelated over-budget checkout.
         budget = None
         actor = actor_dir(payload)
-        if actor is None and not payload.get("agent_id") and work_owner_key(payload.get("cwd")):
-            # Spec review S2 (goodqa#15067): a main agent has no agent_id, so the work dir it runs in is its own and
-            # is charged like a sub-agent's dir: it cannot move a heavy write into a new sibling dir.
+        if actor is None and work_owner_key(payload.get("cwd")):
+            # Spec review S2/R1 (goodqa#15067): a main agent has no agent_id (and a malformed one maps to no dir), so
+            # the work dir it runs in is its own and is charged like a sub-agent's dir: it cannot move a heavy write
+            # into a new sibling dir.
             actor = payload.get("cwd")
         fallback = actor or payload.get("cwd")
         # Review F2: bytes landing outside ~/.agent-harness/work (~/Downloads, /tmp) are still this owner's.
