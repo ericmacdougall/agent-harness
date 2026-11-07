@@ -42,6 +42,7 @@ import os
 import posixpath
 import re
 import secrets as _secrets
+import shlex
 import stat
 import signal
 import subprocess
@@ -986,6 +987,83 @@ class Lexer:
         return i
 
 
+MKTEMP_FLAGS = {'-d', '-q', '-u', '--directory', '--quiet', '--dry-run'}
+# commands that only read, write through, or remove their operands; a temp path handed to anything else (mv, cp,
+# rsync, tar, an interpreter, a function) could be replaced by a symlink, so it keeps the normal rules
+TEMP_SAFE_COMMANDS = {'rm', 'cat', 'echo', 'printf', 'cut', 'grep', 'egrep', 'fgrep', 'sed', 'awk', 'sort', 'uniq',
+                      'head', 'tail', 'wc', 'tr', 'diff', 'cmp', 'jq', 'base64', 'ssh-keyscan', 'ssh-keygen', 'openssl',
+                      'curl', 'wget', 'chmod', 'test', '[', '[[', 'stat', 'ls', 'file', 'xxd', 'od', 'shasum',
+                      'sha256sum', 'md5', 'md5sum', 'touch', 'mkdir', 'tee', 'rmdir'}
+
+
+def mktemp_directory(text, cwd):
+    """The directories a plain `mktemp [-dqu] [-t prefix] [-p dir] [template]` may create its file in, or None when
+    the hook cannot tell (any other word, option or expansion). TMPDIR is the command's, which the hook does not see:
+    $TMPDIR / ${TMPDIR:-x} and the default are tried with the hook's TMPDIR (or /tmp) and with CLAUDE_CODE_TMPDIR,
+    and the caller requires every candidate to be safe. goodqa#15122 AC-1."""
+    candidates = [os.environ.get('TMPDIR') or '/tmp']
+    if os.environ.get('CLAUDE_CODE_TMPDIR'):
+        candidates.append(os.environ['CLAUDE_CODE_TMPDIR'])
+    out = []
+    for env_tmp in candidates:
+        base = _mktemp_base(text, cwd, env_tmp)
+        if base is None:
+            return None
+        out.append(base)
+    return tuple(dict.fromkeys(out))
+
+
+def _mktemp_base(text, cwd, env_tmp):
+    t = re.sub(r'\$\{TMPDIR(?::?-[^}$`]*)?\}|\$TMPDIR(?!\w)', lambda _m: env_tmp.rstrip('/') or '/', text.strip())
+    if re.search(r'[$`\\(){};&|<>*?\[\]~!#\n]', t):
+        return None
+    try:
+        args = shlex.split(t)
+    except ValueError:
+        return None
+    if not args or args[0] not in ('mktemp', '/usr/bin/mktemp', '/bin/mktemp'):
+        return None
+    tdir, template, t_flag, i = None, None, False, 1
+    while i < len(args):
+        a = args[i]
+        if a in MKTEMP_FLAGS or re.fullmatch(r'-[dqu]+', a):
+            pass
+        elif a == '-t':
+            t_flag = True
+            if i + 1 < len(args) and not args[i + 1].startswith('-'):
+                if template is not None or '/' in args[i + 1]:
+                    return None
+                template = args[i + 1]
+                i += 1
+        elif a in ('-p', '--tmpdir') and i + 1 < len(args):
+            tdir = args[i + 1]
+            i += 1
+        elif a.startswith('--tmpdir='):
+            tdir = a.split('=', 1)[1]
+        elif a.startswith('-') or template is not None:
+            return None
+        else:
+            template = a
+        i += 1
+    if tdir is not None:
+        if template and '/' in template:
+            return None
+        base = tdir
+    elif template and '/' in template:
+        base = os.path.dirname(template)
+    elif template and not t_flag:
+        base = cwd  # a bare template is made in the working directory
+    else:
+        base = env_tmp
+    if not base:
+        return None
+    if not base.startswith('/'):
+        if not cwd:
+            return None
+        base = os.path.join(cwd, base)
+    return os.path.normpath(base)
+
+
 def _strip_case_patterns(tokens):
     """`case X in a|b) cmd;; *) cmd;; esac`: drop the pattern lists so `a|b` is not a pipeline and `*` is not a
     command whose name is a glob. The bodies stay as ordinary commands."""
@@ -1714,6 +1792,9 @@ class Ctx:
         self.cwd_unknown = False
         self.cwd_protected_unknown = False  # cd to an unresolved path whose text names a protected location
         self.var_hints = {}  # raw text of dynamic assignments, for variables the guard cannot resolve
+        self.temp_vars = {}  # NAME=$(mktemp ...): name -> (its var_hints text, directories mktemp may create in)
+        self.seen_texts = []  # every script text analysed (top command, -c strings, script files): goodqa#15122
+        self.temp_tainted = set()  # temp variables passed to a command that could replace the file (goodqa#15122)
         self.created = set()  # case-folded paths written earlier in this command (count as existing)
         self.links = {}  # symlinks created earlier in this command: link path -> target path
         self.written = {}  # case-folded path -> text written to it earlier in this command (echo/printf/heredoc)
@@ -1741,7 +1822,7 @@ class Ctx:
 
     # what one reading of a script can change; findings accumulate across readings and the rest is not analysis state
     NOT_STATE = ('findings', 'budget', 'c', 'marker', 'raw_top', 'ps', 'tail_visible', 'fork_depth', 'readings_capped',
-                 'fs_cache')
+                 'fs_cache', 'seen_texts')
 
     def state(self):
         return {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(self).items()
@@ -1879,6 +1960,8 @@ class Analyzer:
             ctx.ps = ps
         if tail_visible is not None:
             ctx.tail_visible = tail_visible
+        if isinstance(text, str) and len(ctx.seen_texts) < 256:
+            ctx.seen_texts.append(text[:200000])
         try:
             lexer = Lexer(ctx, ctx.ps)
             tokens = lexer.lex(text)
@@ -2133,6 +2216,7 @@ class Analyzer:
         words = [self.resolve(w) for w in strip_reserved(cmd.words)]
         head_nonexec = bool(words) and not words[0].quoted and words[0].text in NONEXEC_HEADS
         assigns, rest = self._skip_assigns(words)
+        self._note_temp_uses(assigns, rest)
         # redirections apply to every command, including the bare `> file` truncation
         self.redirects(cmd, pl, idx, bool(rest), depth)
         if head_nonexec:
@@ -2200,6 +2284,7 @@ class Analyzer:
                 r = self.RANK['log']
             if r > rank:
                 chosen, rank = item, r
+        self.ctx.temp_vars.pop(name, None)
         if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
             if any(item.dynamic or item.glob or item.subs for item in items):
                 if not hasattr(self.ctx, 'flow_vars'):
@@ -2226,6 +2311,7 @@ class Analyzer:
             tainted = ctx.secret_seen > before or any(ctx.c.secret_name(v.lstrip('!')) or v in ctx.tainted for v in a.vars)
             if tainted:
                 ctx.tainted.add(name)
+            ctx.temp_vars.pop(name, None)
             if not a.dynamic and not tainted:
                 ctx.vars[name] = value
                 ctx.tainted.discard(name)
@@ -2234,6 +2320,10 @@ class Analyzer:
                 ctx.vars.pop(name, None)
                 ctx.var_hints[name] = (value + ' ' + ' '.join(a.subs) + ' ' + ' '.join(
                     ctx.var_hints.get(v, '') for v in a.vars))[:4096]
+                if value == SUB_MARK and len(a.subs) == 1 and not a.vars and not tainted:
+                    made = mktemp_directory(a.subs[0], None if ctx.cwd_unknown else ctx.cwd)
+                    if made is not None:
+                        ctx.temp_vars[name] = (ctx.var_hints[name], made)
 
     # ---- redirections and heredocs
     def redirects(self, cmd, pl, idx, has_command, depth):
@@ -3944,6 +4034,58 @@ class Analyzer:
             return None
         return norm_path(real.rstrip('/') + ('/' + rest if rest else ''), ctx)
 
+    TEMP_WORD = re.compile(r'^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))(/[^/$*?\[\]{}`~\\]+)?$')
+    TEMP_SYMLINKS = re.compile(r'(?<![\w.$-])(?:ln|symlink|symlinkSync|link)(?![\w.-])|os\.link|\bmklink\b')
+
+    def _own_temp_file(self, word):
+        """goodqa#15122 AC-1: `"$T"` (or `"$T/name"`) where this command set T=$(mktemp ...) exactly once and mktemp
+        creates in a directory outside protected logs (TMPDIR may be relocated under the harness). NEG-2: not when T
+        is reassigned, read, exported or looped over, passed to a command outside TEMP_SAFE_COMMANDS (mv, cp, an
+        interpreter: it could become a symlink), the command makes a symlink or sets TMPDIR, the name climbs with
+        `..`, or the directory resolves into protected logs; those keep the normal rules."""
+        ctx = self.ctx
+        if word.subs or word.glob or len(word.vars) != 1:
+            return False
+        alts = getattr(word, 'alts', None) or [word.text]
+        if len(alts) != 1:
+            return False
+        m = self.TEMP_WORD.match(alts[0])
+        if not m:
+            return False
+        name, suffix = m.group(1) or m.group(2), m.group(3) or ''
+        entry = ctx.temp_vars.get(name)
+        if not entry or name in ctx.vars or name in ctx.temp_tainted or ctx.var_hints.get(name) != entry[0] \
+                or suffix in ('/.', '/..'):
+            return False
+        texts = ctx.seen_texts or [getattr(ctx, 'raw_top', '') or '']
+        # the name as a shell word (assigned, read, exported, looped over, unset), not `$T` and not a path part `/T/`
+        bare = re.compile(r'(?:^|(?<=[\s;&|(`"\']))' + re.escape(name) + r'(?=[\s;&|)`"\'=+\[}]|$)', re.M)
+        made = re.compile(r'(?:^|(?<=[\s;&|(`"\']))' + re.escape(name) + r'=(?:"?\$\(|`)\s*(?:/usr/bin/|/bin/)?mktemp'
+                          r'(?![\w-])', re.M)
+        for text in texts:
+            if self.TEMP_SYMLINKS.search(text) or re.search(r'(?<![\w${])TMPDIR(?!\w)', text):
+                return False
+            found = bare.findall(text)
+            if len(found) > 1 or (found and not made.search(text)):
+                return False
+        for directory in entry[1]:
+            for candidate in (directory, self._probe('rp', directory, os.path.realpath)):
+                probe = norm_path(candidate.rstrip('/') + '/tmp.XXXXXXXXXX' + suffix, ctx)
+                if self._path_class(probe) == 'log':
+                    return False
+        return True
+
+    def _note_temp_uses(self, assigns, rest):
+        """A temp variable handed to anything but a plain reader, writer or rm loses the AC-1 exemption."""
+        ctx = self.ctx
+        if not ctx.temp_vars:
+            return
+        safe = bool(rest) and not rest[0].dynamic and norm_name(rest[0].text) in TEMP_SAFE_COMMANDS
+        for w in list(assigns) + ([] if safe else list(rest)):
+            for v in w.vars:
+                if v.lstrip('!') in ctx.temp_vars:
+                    ctx.temp_tainted.add(v.lstrip('!'))
+
     def _dynamic_suffix_protected(self, path):
         """`$X/projects`, `$DIR/.claude`, `$(..)/wals`: an unresolved prefix followed by a protected tail."""
         folded = path.casefold()
@@ -3967,6 +4109,8 @@ class Analyzer:
     def refuse(self, what, word, tiers=('log', 'root', 'ancestor', 'unknown'), need_existing=False, instead=None):
         """Add a log_delete finding when `word` resolves into one of `tiers`. Returns True when it did."""
         ctx = self.ctx
+        if self._own_temp_file(word):
+            return False
         cls, path, literal = self.target_class(word)
         if cls is None or cls not in tiers:
             return False
