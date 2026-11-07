@@ -755,6 +755,21 @@ class Round5(Case):
                     "PGPASSWORD=$(cat ok.sql) psql -h localhost -c 'SELECT 1'",
                     "git commit -m 'note: psql DELETE FROM users on prod' "), "allow")
 
+    def test_h5_attached_option_values_do_not_replace_stdin(self):
+        (self.cwd / "dump.sql.gz").write_bytes(b"\x1f\x8b")
+        self.check(("zcat dump.sql.gz | mysql -h prod-db -uroot -pchangeme app",
+                    "gunzip -c dump.sql.gz | mysql -h prod-db -Dstore", "head -c 999 evil.sql | mysql -h prod-db -pe app",
+                    "head -c 999 evil.sql | mysql -h prod-db --init-command='SET x=1' -De",
+                    "head -c 999 evil.sql | psql -h prod-db -Usvc app", "head -c 999 evil.sql | psql -h prod-db -v x=-f",
+                    "head -c 999 evil.sql | psql -h prod-db -v 'x= -c'", "head -c 999 evil.sql | psql -h prod-db -v '<x'",
+                    "head -c 999 evil.sql | mariadb -h prod-db -pse app"), "deny")
+        self.check(("head -c 99 evil.sql | mysql -h prod-db -Be 'SELECT 1'",
+                    "head -c 99 evil.sql | mysql -h prod-db --execute='SELECT 1'",
+                    "head -c 99 evil.sql | psql -h prod-db -Xc 'SELECT 1'",
+                    "head -c 99 evil.sql | psql -h prod-db --command='SELECT 1'",
+                    "head -c 99 evil.sql | psql -h prod-db -U svc -c 'SELECT 1'",
+                    "head -c 99 evil.sql | psql -h prod-db app < ok.sql"), "allow")
+
     def test_h4_declining_or_second_target_answers_fund_nothing(self):
         for text in ("Don’t delete prod-db", "Nope, prod-db stays", "Abort: prod-db must be preserved",
                      "Reject DELETE on prod-db", "Delete on staging-db; prod-db untouched", "Nah, prod-db",

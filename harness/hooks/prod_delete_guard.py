@@ -134,12 +134,15 @@ CAT_ARGS = re.compile(r"(?:^|[\s;&|(`\"'=])cat\s+((?:[^\s|;&<>()`\"']+[ \t]*)+)"
 OTHER_SUBST = re.compile(r"\$\((?!\()\s*([^\s)]*)|`\s*([^`\s]*)[^`]*`")
 # the flags that make each client take its SQL from an argument or file instead of stdin (r4 review H2);
 # a client not listed here (sqlite3, redis-cli, pg_restore, ...) reads a piped stdin whatever its flags
+# Judged on shell words, each as a whole: a short cluster may hold only that client's boolean letters before the
+# flag, so an attached value (mysql -pchangeme, -Dstore, -pe; psql -Usvc) or text inside a value (-v x=-f) never
+# counts (r5 review H5).
 STDIN_REPLACED = {
-    "psql": re.compile(r"(?<![\w-])(?:-[A-Za-z0-9]*[cf]|--command|--file)(?![\w-])"),
-    "mysql": re.compile(r"(?<![\w-])(?:-[A-Za-z0-9]*e|--execute)(?![\w-])"),
-    "mariadb": re.compile(r"(?<![\w-])(?:-[A-Za-z0-9]*e|--execute)(?![\w-])"),
-    "mongosh": re.compile(r"(?<![\w-])(?:--eval|--file|-f)(?![\w-])"),
-    "mongo": re.compile(r"(?<![\w-])(?:--eval)(?![\w-])"),
+    "psql": (re.compile(r"-[aAbeEnqsSxX1lw]*[cf]"), ("--command", "--file")),
+    "mysql": (re.compile(r"-[BNnrstvVwXq]*e"), ("--execute",)),
+    "mariadb": (re.compile(r"-[BNnrstvVwXq]*e"), ("--execute",)),
+    "mongosh": (re.compile(r"-f"), ("--eval", "--file")),
+    "mongo": (None, ("--eval",)),
 }
 STDIN_REDIRECT = re.compile(r"(?<![<\d])<\s*[^\s<(]")
 SUBST_IN = re.compile(r"\$\(\s*<\s*([^\s)]+)\s*\)")
@@ -299,6 +302,15 @@ def _multi_step(command: str) -> bool:
             or bool(_other_substitutions(head)) or len(command) > SHLEX_LIMIT)
 
 
+def _stdin_replaced(client: str, rest: str) -> bool:
+    """True when one of the client's own shell words makes it take SQL from an argument or file, not stdin."""
+    short, longs = STDIN_REPLACED.get(client, (None, ()))
+    for w in _words(rest)[:AFTER_SCAN]:
+        if (short is not None and short.fullmatch(w)) or w in longs or w.split("=", 1)[0] in longs and "=" in w:
+            return True
+    return False
+
+
 def _piped_inputs(command: str, unjudged: list) -> list:
     """Files fed by `cat file | ... client`, the client anywhere in the next segment (ssh, docker exec, sudo, env).
     A client fed by any other producer (head, sed, curl, a script) reads SQL the guard cannot see unless its own
@@ -312,8 +324,8 @@ def _piped_inputs(command: str, unjudged: list) -> list:
         if not client:
             continue
         rest = seg[client.end():]
-        replaced = STDIN_REPLACED.get(client.group(1).casefold())
-        if (replaced and replaced.search(rest)) or STDIN_REDIRECT.search(rest):
+        if _stdin_replaced(client.group(1).casefold(), rest) or \
+                STDIN_REDIRECT.search(re.sub(r"'[^']*'|\"[^\"]*\"", " Q ", rest)):
             continue
         bare = re.sub(r"'[^']*'|\"[^\"]*\"", " Q ", segments[i - 1])  # quoted text is data, not a separator
         producer = re.split(r"[;&\n]", bare)[-1].split()
