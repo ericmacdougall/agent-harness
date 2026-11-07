@@ -25,7 +25,11 @@ dir); bounds are polled, so memory and process counts overshoot by one poll inte
 (setsid) escapees are only accounted for on Linux, where the runner is a subreaper; the report says so.
 Every probe also gets a default RSS ceiling of 25% of physical memory when it declares none.
 
-Enforced: group+descendant RSS, wall clock, process count, RLIMIT_FSIZE plus the size
+Memory is measured as phys_footprint on macOS (compressed and swapped pages included; `ps rss` excludes them and
+let a /dev/zero slurp reach 47 GB under a 1 GB bound on 2026-11-06, goodqa#14948), re-read every 50 ms between
+ps snapshots (10 ms while growing); a --class memory probe is refused where no accurate measure exists.
+
+Enforced: group+descendant memory, wall clock, process count, RLIMIT_FSIZE plus the size
 of the sandbox directory, RLIMIT_CORE=0. The probe gets a private HOME/TMPDIR (removed
 afterwards). Network is denied unless --net (macOS sandbox-exec; elsewhere the report
 says "not enforced"). Exit codes: 0 completed inside its bounds (child rc in the
@@ -73,6 +77,8 @@ def seconds(text):
 
 CLASSES = ("memory", "disk", "cpu", "process", "network", "external-write", "sandbox-escape", "hang")
 REQUIRED_BOUND = {"memory": "max_rss_gb", "disk": "max_file_mb", "process": "max_procs"}
+MEM_POLL_S = 0.05        # macOS footprint re-read interval between ps snapshots
+MEM_POLL_FAST_S = 0.01   # while the tree grew by more than 10% of the bound since the last read
 SANDBOX_NO_NET = "(version 1)(allow default)(deny network*)"
 
 
@@ -121,6 +127,9 @@ def parse(argv):
         missing.append("-- <command>")
     if args.max_rss_gb > phys_gb:
         missing.append(f"--max-rss-gb must not exceed physical memory ({phys_gb:.0f} GB)")
+    if args.klass == "memory" and not run_capped.accurate_memory_measure():
+        # goodqa#14948: never run a memory probe where the bound cannot be measured (macOS without phys_footprint)
+        missing.append("an accurate memory measure on this host (macOS phys_footprint unavailable): run the probe on dev2")
     if not missing and not args.max_rss_gb:
         fraction = float(os.environ.get("HARNESS_PROBE_RSS_FRACTION", "0.25"))  # env override exists for tests
         args.max_rss_gb, args.rss_defaulted = round(phys_gb * fraction, 2), True  # every class gets a memory ceiling
@@ -176,7 +185,7 @@ def main(argv=None):
                 live = run_capped.members(child.pid, pgid)
             except (subprocess.SubprocessError, OSError):
                 live = []
-            rss_gb = sum(r[3] for r in live) / 1048576
+            rss_gb = run_capped.memory_kb(live) / 1048576  # phys_footprint on macOS (goodqa#14948)
             peak_rss, peak_procs = max(peak_rss, rss_gb), max(peak_procs, len(live))
             elapsed = time.time() - started
             if args.max_rss_gb and rss_gb > args.max_rss_gb:
@@ -195,7 +204,24 @@ def main(argv=None):
                 if len(live) > 1 or any(r[0] != child.pid for r in live):
                     run_capped.kill_tree(child.pid, pgid)
                 break
-            time.sleep(args.poll_s)
+            if sys.platform != "darwin":
+                time.sleep(args.poll_s)
+                continue
+            # macOS: between ps snapshots, re-read phys_footprint of the known members every MEM_POLL_S (one
+            # syscall per process), faster while the tree is growing, so a fast slurp is caught near its bound
+            # instead of one ps interval later (goodqa#14948).
+            deadline, step, last = time.time() + args.poll_s, MEM_POLL_S, rss_gb
+            while time.time() < deadline:
+                time.sleep(step)
+                gb = run_capped.memory_kb(live) / 1048576
+                peak_rss = max(peak_rss, gb)
+                if args.max_rss_gb and gb > args.max_rss_gb:
+                    finding = ("memory", f"memory bound hit: {gb:.2f} GB > {args.max_rss_gb:g} GB")
+                    break
+                step = MEM_POLL_FAST_S if gb - last > 0.1 * args.max_rss_gb else MEM_POLL_S
+                last = gb
+            if finding:
+                break
         if finding:
             run_capped.kill_tree(child.pid, pgid)
             try:

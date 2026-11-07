@@ -83,6 +83,59 @@ def snapshot():
     return rows
 
 
+# ---- memory measure (goodqa#14948). On macOS `ps rss` excludes compressed and swapped pages, so a /dev/zero slurp
+# under a 1 GB bound reached 47 GB and jetsam reset the machine (2026-11-06). phys_footprint (proc_pid_rusage,
+# RUSAGE_INFO_V2) counts them; it is what the kernel's own memory limits use. RLIMIT_AS/DATA are not enforced there.
+
+_LIBPROC = None
+RUSAGE_INFO_V2 = 2
+
+
+def _libproc():
+    global _LIBPROC
+    if _LIBPROC is None:
+        try:
+            import ctypes
+            lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            lib.proc_pid_rusage.restype = ctypes.c_int
+            _LIBPROC = lib
+        except (OSError, AttributeError, ImportError):
+            _LIBPROC = False
+    return _LIBPROC
+
+
+def footprint_kb(pid):
+    """phys_footprint of one process in KB on macOS (ri_phys_footprint of rusage_info_v2), or None when it cannot be
+    read (not macOS, libproc missing, process gone or not ours)."""
+    if sys.platform != "darwin":
+        return None
+    lib = _libproc()
+    if not lib:
+        return None
+    import ctypes
+    buf = (ctypes.c_uint64 * 20)()  # ri_uuid[16] (two u64) + 18 u64 fields; ri_phys_footprint is the 8th field
+    if lib.proc_pid_rusage(ctypes.c_int(int(pid)), ctypes.c_int(RUSAGE_INFO_V2), ctypes.byref(buf)) != 0:
+        return None
+    return int(buf[2 + 7]) // 1024
+
+
+def accurate_memory_measure():
+    """True when the tree's memory can be measured honestly on this host (Linux rss, or macOS phys_footprint)."""
+    return sys.platform != "darwin" or footprint_kb(os.getpid()) is not None
+
+
+def memory_kb(rows):
+    """KB the tree really occupies: phys_footprint per process on macOS (falling back to the row's rss for a process
+    that vanished between the snapshot and now), rss elsewhere. Live on macOS: each call re-reads the kernel."""
+    if sys.platform != "darwin":
+        return sum(r[3] for r in rows)
+    total = 0
+    for r in rows:
+        fp = footprint_kb(r[0])
+        total += r[3] if fp is None else fp
+    return total
+
+
 EXTRA_ROOTS = set()  # the runner itself once it is a subreaper: orphans reparent to it
 EXCLUDE = set()      # runner-owned helpers (guardian) that must never be counted or signalled
 
@@ -283,7 +336,7 @@ def main(argv=None):
             if live and all(r[4].startswith("T") for r in live):
                 stopped_total += now - last_tick  # paused by netwatch (SIGSTOP) or by us
             last_tick = now
-            rss_kb = sum(r[3] for r in live)
+            rss_kb = memory_kb(live)  # phys_footprint on macOS (goodqa#14948), rss elsewhere
             breach = None
             if rss_kb > cap_kb:
                 breach = (f"RSS {rss_kb / 1048576:.2f} GB exceeded the {args.max_rss_gb:g} GB cap", 137, "rss")
