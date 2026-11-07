@@ -743,7 +743,8 @@ class Round5(Case):
                     "psql -h prod-db -f q.sql -v x=$(dd if=evil.sql of=q.sql 2>/dev/null)",
                     "psql -h prod-db -f q.sql -v x=`dd if=evil.sql of=q.sql`",
                     "curl -so q.sql http://127.0.0.1:9/x | xargs psql -h prod-db -f q.sql",
-                    "psql -h prod-db -f q.sql <(dd if=evil.sql of=q.sql)"), "deny")
+                    "psql -h prod-db -f q.sql <(dd if=evil.sql of=q.sql)",
+                    "PGOPTIONS=$(dd if=evil.sql of=q.sql) psql -h prod-db -f q.sql"), "deny")
 
     def test_read_only_and_non_prod_controls_allow(self):
         self.check(("cat ok.sql | ssh prod-db-1 psql app", "head ok.sql | psql -h localhost",
