@@ -33,6 +33,28 @@ def build_tar(root_name, files, mode='w:gz', extra=None):
     return buf.getvalue()
 
 
+def build_members(root_name, files, specials, mode='w:gz'):
+    """A tar of `files` followed by `specials`: (relative name, tarfile type, linkname or data)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode=mode) as tar:
+        for rel, data in files.items():
+            info = tarfile.TarInfo('%s/%s' % (root_name, rel))
+            info.size, info.mtime = len(data), 1700000000
+            tar.addfile(info, io.BytesIO(data))
+        for rel, kind, value in specials:
+            info = tarfile.TarInfo('%s/%s' % (root_name, rel))
+            info.type, info.mtime = kind, 1700000000
+            if kind in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+                info.linkname = value
+                tar.addfile(info)
+            elif kind == tarfile.REGTYPE:
+                info.size = len(value)
+                tar.addfile(info, io.BytesIO(value))
+            else:
+                tar.addfile(info)
+    return buf.getvalue()
+
+
 def listing_for(root_name, files):
     """bsdtar `tar -tvf` style lines, as the pp407 archive script writes them."""
     lines = ['drwxr-xr-x  0 eric   staff       0 Nov  7 07:03 %s/' % root_name]
@@ -101,7 +123,7 @@ class ArchiveApproval(Fixture):
         whole = self.store.objects[ARCHIVE]
         cut = whole[: len(whole) // 2]
         self.put(cut, listing_for(self.name, FILES))  # its .sha256 matches the cut bytes: only the tar can tell
-        self.refused('archive')
+        self.refused('truncated')
 
     def test_a_listing_missing_one_file_is_refused(self):
         short = dict(FILES)
@@ -165,6 +187,103 @@ class ArchiveApproval(Fixture):
         self.assertIn('no regular files', result.error)
         self.assertIsNone(getattr(verifier, 'verified_sha256', None))
 
+    # PR #120 red-team (2026-11-07). Each case below was approved on b0dba6e.
+    def test_a_file_changed_while_the_archive_streams_is_refused(self):
+        # F1: the delete-time stat check must cover the state the archive was compared with.
+        target, plain_open = self.target, self.store.open
+
+        def open_and_append(remote):
+            if remote == ARCHIVE:
+                with open(target / 'b.txt', 'ab') as handle:
+                    handle.write(b'appended while verifying\n')
+            return plain_open(remote)
+        self.store.open = open_and_append
+        self.refused('changed')
+
+    def test_a_second_member_with_the_same_name_is_refused(self):
+        # F2: a later link, directory or case-variant member replaces the verified file on restore.
+        for specials in ([('b.txt', tarfile.SYMTYPE, 'sub/a.jsonl')],
+                         [('b.txt', tarfile.LNKTYPE, '%s/sub/a.jsonl' % self.name)],
+                         [('b.txt', tarfile.DIRTYPE, None)],
+                         [('B.TXT', tarfile.SYMTYPE, 'sub/a.jsonl')],
+                         [('b.txt', tarfile.REGTYPE, b'bee\n')]):
+            with self.subTest(specials=specials):
+                self.put(build_members(self.name, FILES, specials), listing_for(self.name, FILES))
+                self.refused('twice')
+
+    def test_link_and_special_members_are_refused(self):
+        # F2/F6: the comparison covers regular files only, so a link member is never trusted.
+        for specials in ([('extra-link', tarfile.SYMTYPE, 'b.txt')],
+                         [('extra-hard', tarfile.LNKTYPE, '%s/b.txt' % self.name)],
+                         [('fifo', tarfile.FIFOTYPE, None)]):
+            with self.subTest(specials=specials):
+                self.put(build_members(self.name, FILES, specials), listing_for(self.name, FILES))
+                self.refused('link or special')
+
+    def test_a_local_symlink_is_refused(self):
+        # F6: a symlink in the tree would be deleted but is not part of the compared regular-file set.
+        os.symlink('b.txt', str(self.target / 'alias'))
+        past = time.time() - 3600
+        os.utime(str(self.target / 'alias'), (past, past), follow_symlinks=False)
+        os.utime(str(self.target), (past, past))
+        self.refused('symlink')
+
+    def test_a_second_gzip_member_is_read_like_bsdtar_reads_it(self):
+        # F3: Python r|gz stops after the first gzip member; bsdtar restores the second one too.
+        import gzip
+        plain = build_tar(self.name, FILES, mode='w')
+        body = plain.rstrip(b'\0')
+        body += b'\0' * (-len(body) % 512)
+        evil = build_members(self.name, {}, [('b.txt', tarfile.REGTYPE, b'EVIL')], mode='w')
+        self.put(gzip.compress(body) + gzip.compress(evil), listing_for(self.name, FILES))
+        self.refused('twice')
+
+    def test_data_after_the_end_of_the_tar_is_refused(self):
+        import gzip
+        plain = build_tar(self.name, FILES, mode='w')
+        self.put(gzip.compress(plain + b'trailing payload'.ljust(512, b'\0')), listing_for(self.name, FILES))
+        self.refused('after the end')
+
+    def test_an_archive_with_far_more_members_than_the_tree_is_refused(self):
+        # F4: stream parsing keeps state per member; a header flood must stop early, not exhaust memory.
+        specials = [('d%05d' % i, tarfile.DIRTYPE, None) for i in range(3000)]
+        self.put(build_members(self.name, FILES, specials), listing_for(self.name, FILES))
+        self.refused('more members')
+
+    def test_an_archive_that_inflates_far_beyond_the_tree_is_refused(self):
+        specials = [('big.pad', tarfile.REGTYPE, b'\0' * (2 << 20))]
+        self.put(build_members(self.name, FILES, specials), listing_for(self.name, FILES))
+        verifier = cg.ArchiveVerifier(SHA, LISTING, opener=self.store.open, types=self.store.remote_types)
+        verifier.inflate_slack = 1 << 20
+        result = verifier.verify(str(self.target), cg.tree_manifest(str(self.target), self.policy['marker']), ARCHIVE)
+        self.assertFalse(result.ok)
+        self.assertIn('inflates', result.error)
+
+    def test_an_endless_sha_file_stops_at_its_limit(self):
+        # F5: the small files are read up to their limit, never drained without end.
+        class Endless(io.RawIOBase):
+            reads = 0
+
+            def readable(self):
+                return True
+
+            def readinto(self, buf):
+                Endless.reads += 1
+                if Endless.reads > 10000:
+                    raise AssertionError('drained an endless stream')
+                buf[:len(buf)] = b'a' * len(buf)
+                return len(buf)
+        plain_open = self.store.open
+        self.store.open = lambda remote: ((io.BufferedReader(Endless()), lambda: 0) if remote == SHA
+                                          else plain_open(remote))
+        self.refused('larger than')
+
+    def test_appledouble_companions_need_the_appledouble_magic(self):
+        # F10: a `._name` member is dropped as metadata only when it really is an AppleDouble file.
+        archive = build_tar(self.name, FILES, extra={'._b.txt': b'not appledouble'})
+        self.put(archive, listing_for(self.name, FILES))
+        self.refused('extra')
+
     def test_a_missing_sha_file_or_listing_is_refused(self):
         del self.store.objects[SHA]
         self.refused('sha256')
@@ -203,6 +322,24 @@ class ArchiveCli(Fixture):
                             str(self.home / 'w.jsonl')])
         self.assertEqual(code, 2)
         self.assertIn('--archive-sha256', err.getvalue())
+
+    def test_rclone_environment_overrides_are_refused(self):
+        # F7: RCLONE_CONFIG or another RCLONE_* setting could point the verifier at a different store.
+        verb = 'approve' + '-delete'
+        for prefix in ('RCLONE_CONFIG=/x/rclone.conf', 'export RCLONE_CONFIG_DROPBOX_TYPE=local;'):
+            self.assertTrue(cg.approval_env_override('%s python3 command_guard.py %s --path /p' % (prefix, verb)), prefix)
+
+    def test_no_backup_and_archive_together_are_refused(self):
+        # F9: the archive flags must not be silently ignored by the no-backup path.
+        import contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = cg.main(['approve-delete', '--path', str(self.home / 'x'), '--no-backup', '--user-source',
+                            'answer:s/u', '--archive', ARCHIVE, '--archive-sha256', SHA, '--archive-listing', LISTING,
+                            '--wal', str(self.home / 'w.jsonl')])
+        self.assertEqual(code, 2)
+        self.assertIn('--no-backup', err.getvalue())
+        self.assertIn('--archive', err.getvalue())
 
 
 if __name__ == '__main__':

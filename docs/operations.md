@@ -503,18 +503,20 @@ python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal dir> --a
   --archive-sha256 dropbox:<dir>.tar.zst.sha256 --archive-listing dropbox:<dir>.tar.listing.txt --wal <WAL path>
 ```
 
-The guard trusts none of those files on their own. It streams the archive with `rclone cat`, never to disk, and checks it as follows:
-
-- Its sha256 must equal the `.sha256` file.
-- Every regular file in the archive (path, size and content sha256) must equal the local tree, with nothing missing and nothing extra.
-- The listing's (path, size) set must equal the archive's.
+The guard streams the archive with `rclone cat`, never to disk. The proof is the member comparison: every regular file in the archive (path, size and content sha256) must equal the local tree, with nothing missing and nothing extra. The `.sha256` file and the listing are written by the same uploader, so they are consistency checks that catch a broken upload run, not extra safeguards: the archive's sha256 must equal the `.sha256` file (which must not hold the digest of empty input), and the listing's (path, size) set must equal the archive's.
 
 It refuses on any of these:
 
-- a truncated or corrupt stream, or a `zstd` error;
-- a failed download;
-- an absolute member path, a member path containing `..`, or a duplicate member;
+- a truncated or corrupt stream, or a `zstd` error; every gzip member is read, as `gzip -dc` and bsdtar read them, and anything but zero padding after the end of the tar refuses;
+- a failed download, or a `.sha256` file or listing larger than its limit;
+- an absolute member path, a member path containing `..`, or a path named twice by members of any type (compared after Unicode NFC and case folding);
+- a symlink, hardlink or special member, or a symlink in the local tree (only regular files and directories are compared);
+- more than 4 members per local file plus 1000, decompressed data larger than twice the tree plus 256 MiB, or a read longer than the timeout;
+- a local file that changed between hashing and the end of verification;
+- `--no-backup` given with the archive flags;
 - any of the three remotes not being a named `dropbox` remote.
+
+macOS bsdtar stores extended attributes as AppleDouble `._name` companions that its own `tar -tvf` does not list. Such a member is ignored when it is not a local file, starts with the AppleDouble magic `00 05 16 07`, and its sibling is in the archive.
 
 The approval and its use in the audit log record the archive URL and its sha256. Verifying takes one full download and a hash of the local tree.
 
