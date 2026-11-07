@@ -17,6 +17,9 @@
 | `watch-tests.py` | Polling test runner for source edits. |
 | `commit_policy.py`, `commit_policy.json`, `ticket_adapters.py` | Commit message policy: PreToolUse hook, git `commit-msg` backstop, range and GitHub checks, GoodQA ticket verification and delivery comments, waivers. |
 | `domain_gates.py`, `domain_checklists.json` | Blockchain domain gates: detect blockchain work from repo signals and supply a risk checklist, test scaffolds and follow-up prompts to specs and review prompts. |
+| `worktree_hygiene.py` | Stop/SubagentStop gate (rule S18): no turn ends with uncommitted work in a worktree it touched; reports unpushed, merged and duplicate worktrees (vendored from Hawkeye). |
+| `wal_cadence.py` | Stop/SubagentStop nudge (rule W04): one bounded block when a big uncommitted diff has no recent human-readable WAL entry (ported from Hawkeye). |
+| `prod_delete_guard.py` | PreToolUse gate on destructive SQL against production databases, lifted only by a user-sourced, target-bound grant (ported from Hawkeye). |
 | `spec_flow.py`, `spec_policy.json`, `spec_template.md` | Spec-driven tickets: spec documents, spec reviews, per-criterion evidence, click-test records, sign-off and the done gate (CLI, plan-review ticket gate, PreToolUse hook on GoodQA status changes). |
 
 No background process is installed. Claude Code runs hooks, and the main agent invokes the other helpers when appropriate. The installer refuses symlinked managed files and directories, including its backup directory, before reading settings or writing files. Reinstallation preserves unrelated hooks even when they share an entry with a managed hook. The installer rejects non-regular managed files (including FIFOs) and files occupying managed directory paths. It reads all source payloads before writing, then backs up the captured original bytes in private files before replacing managed files. It keeps original directory and managed-file inodes open through installation and rollback. A missing directory is created under a random staging name, opened and checked while empty, then published under its final name; the installer does not infer that a newly opened final name is the directory it created. Each file write compares the captured parent and file identity; a replacement is refused before mutation. The published file inode is recorded before the directory `fsync`, so a later write error can still roll back that file. A descriptor for each published managed file remains open through rollback so its inode number cannot be recycled while the guard relies on it. Reads, replacements, and rollback traverse parents without following symlinks, and each replacement rechecks the visible parent after publication. A parent that moves during installation produces an error rather than a success report. On a caught write failure it attempts to restore the original bytes and permission bits of existing files and remove newly installed files. Restoration continues after an individual failure; an incomplete rollback reports affected paths and the backup directory. Backups and newly created empty directories remain. This is per-file atomic replacement with best-effort rollback, not a crash-safe transaction: power loss, process termination, or a second failure during recovery can still require manual restoration. In an eight-process disposable contention test, some installers may refuse an intervening directory creation and succeed on retry; the final installation remains coherent. Concurrent settings editors can still race over read-modify-write settings, so do not run them together.
@@ -616,6 +619,160 @@ The guard therefore does not close the incident class. It closes the kill words 
 | `kill_guard.py explain FILE [--cwd D]` | Show the decision for a command stored in a file. Runs nothing. |
 
 Install with `install.py --apply` and `install_codex.py --apply`; both register the kill guard together with the command guard, and `--no-command-guard` removes both registrations. Tests: `python3 -m unittest tests.test_kill_guard` (decides text only, signals nothing, safe anywhere). The live canary test, `tests/live_kill_canary.py`, starts its own sleepers and a canary, and runs only on dev2: `env -i HOME=$(mktemp -d) PATH=/usr/bin:/bin KILL_GUARD_LIVE=1 python3 tests/live_kill_canary.py`. Rules registry entry: `docs/rules/kill-guard.json`.
+
+## Production-delete guard
+
+`prod_delete_guard.py` is a PreToolUse hook. It refuses destructive SQL aimed at a production database unless a recorded, user-sourced grant covers it. It is a port of Hawkeye's `hawkeye-prod-delete-guard.py`, which ran on dev2 only (goodqa#14908, rule S28). The detection starts from Hawkeye's rules and closes the bypasses a native review found on 2026-11-06. The grant store is the harness's own, and it is signed.
+
+### What it matches
+
+A call matches only when it carries a destructive statement together with an identifiable production target. The destructive statements are `DELETE FROM`, `DROP TABLE|DATABASE|INDEX|SCHEMA`, `TRUNCATE`, `UPDATE ... SET` with no `WHERE` in the same statement, `dropdb` and `mysqladmin ... drop`. They are matched after `/* */` comments, backslashes (with `\x20`, `\t` and `\n` escapes read as whitespace) and shell quote characters are removed, and again with `--` line comments removed, so `DEL""ETE`, `DELETE/**/FROM`, `DELETE\ FROM` and `DELETE--x` + newline + `FROM` still match.
+
+Each production target yields the exact name a grant must give:
+
+| Target | Grant names |
+|---|---|
+| `wrangler d1 execute <db> ... --remote` (value-taking flags such as `--env production`, `-c <config>`, `--persist-to`, `--command` and `--file` are skipped with their values) | `<db>` |
+| a connection string (`postgres://`, `mysql://`, `mongodb://`, `redis://`, and similar) naming `prod` or `production` as a name segment | its host when the host names prod; otherwise its host or its database (either covers it) |
+| a database client (`psql`, `mysql`, `mongosh`, `sqlite3`, and others) whose `-h`, `--host`, `-d`, `--dbname`, `--database` or `--db` value names one (attached forms such as `-hprod-db` included), or whose positional database argument names one | that value |
+| `PGHOST=`, `PGDATABASE=`, `DATABASE_URL=` or `MYSQL_HOST=` in the command, or the same variable in the hook's environment when the command references it or relies on it (no `-h` for `PGHOST`, no `-d` for `PGDATABASE`) | the host, or the connection string's host or database |
+| `ssh <prod-host>` running a database client or `wrangler` | the host |
+| `docker exec <prod-container>` running a database client | the container |
+| a tool that is production by construction: `mcp__*__d1_database_query` or `mcp__*__hyperdrive_*` | its `database_id` (or similar) field; with no such field the call is denied, because no grant can name it |
+
+The guard also reads the SQL in these inputs, up to 200,000 bytes each and only as regular files (a FIFO cannot hang it):
+- `--file`, and `psql -f` including grouped short flags (`-1f`, `-Xf`) and `--fi=`/`--fil=` prefixes;
+- `< file` and `$(< file)`;
+- every `cat` argument anywhere in a command that has a client: `cat file | client`, the same through `ssh`, `docker exec`, `sudo`, `env` or `timeout`, `$(cat a b)` and backticks, after `-c`, `--command=` or anywhere else;
+- psql `\i`, `\ir`, `\include` and `\include_relative`, mysql `source` and `\.`, sqlite `.read` and `-init`, with or without quotes around the file.
+
+A client fed through a pipe by anything other than `cat`, `echo` or `printf` (for example `head`, `sed` or `curl`) reads SQL the guard cannot see, unless its own flag replaces stdin (psql `-c`/`-f`/`--command`/`--file`, mysql or mariadb `-e`/`--execute`, mongosh `--eval`/`--file`) or a `<` redirect does. The flag must be its own shell word, or a short cluster of that client's boolean letters (`-Xc`, `-Be`); an attached option value such as mysql `-pchangeme` or `-Dstore`, psql `-Usvc`, or a value such as `-v x=-f` does not count. Flags such as psql `-e` (echo), mysql `-f` (force) and sqlite3 `-cmd`/`-init` do not. A `$(...)` or backtick substitution after the client that is not a `cat` or `< file` read is unjudgeable in the same way. This includes harmless substitutions: `psql -h prod-db -c "SELECT '$(date)'"` is denied, and no grant can lift it; compute the value in an earlier command. A prod-targeted command is denied when it has such a pipe or substitution, or when one of its SQL files cannot be judged at hook time: the file is missing, is not a regular file, is unreadable or is larger than 200,000 bytes. It is also denied when the command has any other step besides a plain pipeline (`;`, `&&`, `||`, `&`, a newline, `cd`, `pushd`, `xargs`, `<(...)`, `>(...)`, or a substitution that is not a `cat` or `< file` read): another step could write or swap the file first, and no list of writers is complete. `&>` and `2>&1` are redirects, not steps. Because every `cat` counts as input, a read-only prod command that also cats a file it writes (`psql ... > out.txt && cat out.txt`) or a missing file is denied; split it into two commands. Write the file in an earlier command, then run it. Relative paths resolve against the event's cwd, and `~` is expanded.
+
+Commands over 64 KiB are split on whitespace instead of shlex. Every word naming prod after a client then counts as a target. Every client scan is bounded (at most 512 characters per scan, 256 words after a client and 64 clients), and a command too long to judge its database is denied when it carries a destructive statement. Adversarial 100 KB shapes decide in under 1 s on the Mac.
+
+Out of scope, disclosed:
+- SQL built at run time (`base64 -d | psql`, a variable holding the statement, a script run by name);
+- a default host that is not in the hook's environment, and `PGSERVICE`;
+- deletes that are not SQL (API calls, removing a data directory);
+- statements the destructive list does not cover: MySQL multi-table `DELETE t FROM t`, mongosh `deleteMany` or `drop`, and redis-cli `FLUSHALL`, `FLUSHDB` or `DEL`;
+- database MCP tools such as `mcp__*__execute_sql` whose text does not name prod;
+- a libpq conninfo string (`psql "host=prod-db dbname=app"`), long-option prefixes for the host (`--hos=prod-db`), unlisted clients (`usql`, inline Python drivers), and other `$'...'` escapes than `\x20`, `\t` and `\n`;
+- a statement past the first 200,000 bytes of a command's own text is still read, but a file over that size is denied rather than read in part.
+
+It judges `Bash` commands, the fields of `mcp__hawkeye__run`, and the `sql`, `query` and `statement` fields of database MCP tools.
+
+Prose that only mentions these words is ignored. A heredoc that also names a client and a prod host still matches, because shell text cannot be proven inert; Hawkeye accepted this limitation after three review rounds. A grant lifts it.
+
+### Fail direction
+
+- Before a match, any error allows.
+- After a match, any error denies. That includes a grant file that cannot be read or parsed, a missing or short key, and an unsigned or tampered grant.
+- If there is no grant file, there is no grant, and the call is denied.
+- The guard only allows or denies; it never returns `ask`.
+
+Register the hook without `onFailure`.
+
+### Granting
+
+When the user approves a production delete through AskUserQuestion, record the approval:
+
+```
+python3 ~/.claude/hooks/prod_delete_guard.py grant --user-source answer:<session>/<uuid> \
+    --target <host-or-db literal> --wal <session WAL> [--ttl 900] [--note TEXT]
+python3 ~/.claude/hooks/prod_delete_guard.py list
+```
+
+- `--user-source` must be an `answer:` id: an AskUserQuestion answer. A typed `user:` turn is refused, because "do NOT touch prod-db" cannot be told apart from an approval. `ah user-msg` finds the id.
+- `provenance.py` must resolve the source to a real answer at most 1 hour old when the grant is made. At check time the bound is on `granted - source`, so a grant made near the end of that hour works for its TTL after it.
+- The user's own selected answer must name the target as a whole name: ask with an option label such as "Approve DELETE on <target>", then cite the answer. The agent's question text never counts. An answer that names the target inside a host, port or path (`prod-db.example.com:5432`, `/srv/prod-db/x`) does not name `prod-db`, and an answer with a decline word outside the target name funds nothing: no, nope, nah, not, don't (either apostrophe), never, keep, kept, cancel, skip, stop, leave, hold, wait, later, instead, abort, reject, deny, denied, untouched, preserve(d), spare or "only after". The list is a deny-list: an agent-written label that mentions a second target without such a word ("Delete on staging-db, then prod-db") still names prod-db, so write one target per option.
+- The source is resolved from the pinned `~/.claude` of the guard's home. `CLAUDE_CONFIG_DIR` is ignored.
+- `--target` must equal, case-folded, a target name the guard extracts from the command. It is never a substring match. SQL keywords, client names, bare `prod` and `production`, names starting with `-`, and names with spaces, quotes or wildcards are refused. A command with several production targets needs a grant for each. A connection string to a prod host is covered only by a grant naming that host; a database-only grant (`app`) covers a connection string only when its host does not name prod.
+- The TTL defaults to 900 seconds and cannot exceed 3600. A grant can be reused until it expires.
+- The grant is written to the WAL first, through `wal_note.py`. Then it is stored, HMAC-signed, in `~/.agent-harness/state/prod-delete-grants.json` (mode 0600). The key is `~/.agent-harness/state/prod-delete.key` (32 random bytes, mode 0600, created on first use). Writes run under a lock, and expired or unsigned grants are pruned on each write.
+- Each check verifies the signature, the scope, the expiry, the TTL bound and the source-age bound again, and resolves the grant's source again. A grant whose turn no longer resolves, or whose timestamp has changed, stops working.
+- `command_guard` refuses shell writes to the grant file and the key, as it does for the log-delete marker.
+
+Residuals, disclosed:
+- Provenance proves that the cited answer is a real AskUserQuestion answer, and the guard checks that the selected answer names the target and does not decline. It cannot prove what the user believed the option meant; the WAL record and the exact-target binding keep that claim narrow and auditable.
+- The key is used only when it is a regular file with mode 0600, owned by the caller, with one link, and it is opened without following a symlink. The store is replaced through an `O_EXCL|O_NOFOLLOW` temp file.
+- A same-user process, or the Write and Edit tools (command_guard judges Bash only), can read or plant the key and so sign a grant. That skips only the WAL record, because the `grant` command is itself agent-runnable. The key protects the audit trail against hand-edited JSON, not against an agent that sets out to forge one.
+
+### Commands and rollout
+
+- `install.py --apply` copies the hook and registers it with the matcher `Bash|mcp__hawkeye__run|.*d1_database_query|mcp__.*__(execute_sql|run_sql|query|sql)|mcp__.*__hyperdrive_.*`.
+- `doctor.py` runs two canaries: an allow for `ls`, and a deny for a `psql --host=prod-db... TRUNCATE`.
+- Tests: `python3 -m unittest tests.test_prod_delete_guard`. They judge text only and never run SQL.
+- Rollback: revert the commit and reinstall.
+
+## WAL cadence
+
+`wal_cadence.py` is a Stop and SubagentStop hook for rule W04. It nudges once when real work has piled up without a human-readable WAL entry. It is a port of Hawkeye's `hawkeye-wal-cadence.py`, which ran on dev2 only (goodqa#14908).
+
+The hook blocks the stop once (exit 2) when all of these hold:
+
+- The agent's worktree has at least 40 uncommitted source lines, tracked or untracked. Changes under `docs/`, `plans/`, `devstate/` and `audit/`, and `README.md` and `CONTRIBUTING.md`, do not count.
+- That agent's WAL has no `wal_note.py` entry with a note from the last 20 minutes. Hook metadata rows do not count.
+
+Which worktree and which WAL it checks depends on the event:
+
+| Event | Worktree checked | WAL checked |
+|---|---|---|
+| `Stop` | the cwd, only when it is a linked worktree (the primary checkout belongs to the user) | `main.jsonl` |
+| `SubagentStop` | only worktrees directly under `~/.agent-harness/work/<session>/agent-<id>/`, never the cwd (a subagent's cwd is often main's checkout or another owner's tree). An owner working in a tree elsewhere is not nudged. | `agent-<id>.jsonl` |
+
+The nudge names the files and gives the exact `wal_note.py` command.
+
+The nudge is bounded:
+
+- It fires once per agent per distinct diff fingerprint. The state is kept in `~/.agent-harness/state/wal-cadence/<session>.json`.
+- It never fires on a repeated stop (`stop_hook_active`).
+- `HARNESS_WAL_CADENCE=off` turns it off.
+- Every internal error fails open, so the hook is registered without `onFailure`.
+
+Hawkeye's knowledge-net replication is not ported.
+
+Tests: `python3 -m unittest tests.test_wal_cadence`. They use temporary git repositories and linked worktrees only.
+
+## Worktree hygiene
+
+`worktree_hygiene.py` is a Stop and SubagentStop hook for rule S18. It stops a turn from ending while a worktree the agent created or worked in holds work that exists only on this disk. It is vendored from Hawkeye's `hawkeye-worktree-hygiene.py` (ericmacdougall/hawkeye 831ea85), which ran on dev2 only (goodqa#14908). Hawkeye's transcript reader, shell lexer, ownership hand-off, time budget and fail-open rules are unchanged.
+
+### How it works
+
+1. It reads the agent's transcript and collects the linked worktrees that the agent created (`git worktree add`) or worked in. Working in a tree means an `Edit` or `Write` under it, or a mutating `git -C <tree>` or `cd <tree> && git ...` command. Only worktrees of repos under the repos dirs count. Those default to `~/repos` and `~/.agent-harness/work`.
+2. It skips any worktree that another transcript touched more recently, because that owner answers for it.
+3. It blocks once per distinct state (exit 2) when a remaining worktree has uncommitted changes, or has commits on a detached HEAD that no local branch or tag holds (git gc can drop those once the tree moves). A detached review or rescue tree at a branch's commit is only reported. The message lists the paths and the commit commands, with the message checked by `commit_policy.py check-message`, and for a detached HEAD the `git switch -c` that names the work.
+4. Without blocking, it reports:
+   - committed work on a named branch that is on no remote branch (`UNPUSHED`), to be published through `deliver.py prepare` or `publish_feature.py` once reviewed;
+   - merged worktrees that are still on disk;
+   - duplicate worktrees;
+   - leftover detached worktrees.
+
+   Each report comes with its cleanup commands.
+
+Unpushed commits are reported, not blocked, because harness owners commit locally and publication goes through the identity-checked delivery helpers. To get Hawkeye's original behaviour, where unpushed commits also block, set `{"block_unpushed": true}` in `~/.agent-harness/state/worktree-hygiene.json`, or set `HARNESS_WORKTREE_HYGIENE_BLOCK_UNPUSHED=1`.
+
+### Settings
+
+| Setting | Effect |
+|---|---|
+| `HARNESS_WORKTREE_HYGIENE_REPOS_DIRS` (path list) | Overrides the repos dirs. |
+| `{"repos_dirs": [...]}` in the same config file | Overrides the repos dirs. |
+| `HARNESS_WORKTREE_HYGIENE_BUDGET_S` | Sets the time budget: 12 s by default, 15 s at most. |
+| `HARNESS_WORKTREE_GATE=off` | Disables the hook. |
+
+Hawkeye's `HAWKEYE_*` names for these settings are still accepted.
+
+### Guarantees
+
+- It never blocks on a repeated stop.
+- It fails open on any error or timeout.
+- It only reads: `GIT_OPTIONAL_LOCKS=0`, no fsmonitor, and no fetch, commit or remove.
+- Its state is kept in `~/.agent-harness/state/worktree-hygiene/` and pruned after 14 days.
+
+### Tests
+
+Run `python3 -m unittest tests.test_worktree_hygiene`. This runs Hawkeye's 108-check scenario suite (`tests/worktree_hygiene_scenarios.py`) and the harness-default cases. Both use temporary homes, bare origins and real worktrees.
 
 ## Spec-driven tickets
 

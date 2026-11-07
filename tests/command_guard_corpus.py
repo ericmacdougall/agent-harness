@@ -380,6 +380,11 @@ LOG_POSITIVE = [
     'echo x > ~/.agent-harness/state/log-delete-ok.json',
     'cp /tmp/m ~/.agent-harness/state/log-delete-ok.json',
     'rm ~/.agent-harness/state/log-delete-audit.jsonl',
+    # goodqa#14908 native review F1: the prod-delete grant store and its key are protected state
+    'printf x > ~/.agent-harness/state/prod-delete-grants.json',
+    'cp /tmp/g ~/.agent-harness/state/prod-delete-grants.json',
+    'echo k > ~/.agent-harness/state/prod-delete.key',
+    'python3 -c "open(\'/home/x/.agent-harness/state/prod-delete-grants.json\',\'w\').write(\'{}\')"',
     'cd ~/.claude && find . -name "*.jsonl" -delete',
     'for d in ~/.claude/projects/*; do rm -rf "$d"; done',
     'ls ~/.claude/projects | xargs rm -rf',

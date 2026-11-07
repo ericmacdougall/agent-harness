@@ -97,7 +97,10 @@ DEFAULT_POLICY = {
     'rclone_allow_redacted': False,
     # Temp trees where the anywhere-on-disk WAL names (wals/, main.jsonl) are test data, not real WALs.
     'temp_roots': ['/tmp', '/private/tmp', '/var/tmp', '/var/folders', '/private/var/folders'],
-    'state_files': ['{home}/.agent-harness/state/log-delete-ok.json', '{home}/.agent-harness/state/log-delete.key'],
+    'state_files': ['{home}/.agent-harness/state/log-delete-ok.json', '{home}/.agent-harness/state/log-delete.key',
+                    # goodqa#14908: prod_delete_guard's signed grant store and its key; only `grant` writes them
+                    '{home}/.agent-harness/state/prod-delete-grants.json',
+                    '{home}/.agent-harness/state/prod-delete.key'],
     'credential_path_regexes': [
         r'(^|/)\.config/rclone/rclone\.conf$', r'(^|/)rclone\.conf$',
         r'(^|/)\.aws/credentials$', r'(^|/)\.aws/sso/cache/[^/]+$',
