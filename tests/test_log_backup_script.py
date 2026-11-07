@@ -1355,6 +1355,27 @@ class BulkLane(Case):
         self.assertEqual({self.tps(c) for c in self.copies()}, {"2"})
         self.assertEqual([c for c in self.copies() if "--files-from-raw" in c], [])
 
+    def test_a_lane_stopped_by_sigterm_exits_only_after_its_copy_has_stopped(self):
+        # PR #124 delta review N2: the lane released its lock while its copy was still committing a batch, and the
+        # next lane started a second copy beside it.
+        env = self.env(LOG_BACKUP_BULK_LANE="1", LOG_BACKUP_TIER="bulk", LOG_BACKUP_TPSLIMIT="2",
+                       LOG_BACKUP_RETRY_SLEEP="0", LOG_BACKUP_BULK_EVERY_SECONDS="0", LOG_BACKUP_KILL_GRACE_SECONDS="5",
+                       FAKE_HANG="30", FAKE_TERM_DRAIN="1.5")
+        proc = subprocess.Popen(["/bin/bash", str(SCRIPT)], env=env, cwd=str(self.tmp),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
+        end = time.time() + 20
+        while time.time() < end and not [c for c in self.copies() if "--files-from-raw" in c]:
+            time.sleep(0.1)
+        self.assertTrue(self.copies(), "the lane started a copy")
+        time.sleep(0.5)
+        proc.terminate()
+        proc.wait(timeout=20)
+        running = subprocess.run(["ps", "-axo", "command="], stdout=subprocess.PIPE, text=True).stdout
+        self.assertFalse(str(self.fake) in running, "the lane exited while its copy was still running")
+        self.assertFalse(self.lane_lock().exists())
+        self.assertIn("this run's copy was stopped first", (self.logs / "log-backup.lane.log").read_text())
+
     def test_lane_settings_that_would_add_to_the_budget_are_refused(self):
         for extra in ({"LOG_BACKUP_BULK_LANE": "yes", "LOG_BACKUP_TPSLIMIT": "2"},
                       {"LOG_BACKUP_BULK_LANE": "1", "LOG_BACKUP_TPSLIMIT": "2", "LOG_BACKUP_LANE_BUDGET_SECONDS": "43201"},

@@ -235,9 +235,16 @@ fi
 trap 'release_locks "$LOCKD" "$LANE_LOCKD"' EXIT
 copy_pid= dog_pid=
 on_term() {
-  [ -z "$copy_pid" ] || kill -TERM "$copy_pid" 2>/dev/null
+  # rclone commits its pending batch on TERM: wait for it up to KILL_GRACE, then kill it, and only then release the
+  # lock, so the next run never starts a copy beside one still committing (PR #124 delta review N2).
+  local waited=0
   [ -z "$dog_pid" ] || kill -TERM "$dog_pid" 2>/dev/null
-  say "stopped by a signal; this run's copy was told to stop"
+  if [ -n "$copy_pid" ]; then
+    kill -TERM "$copy_pid" 2>/dev/null
+    while kill -0 "$copy_pid" 2>/dev/null && [ $waited -lt $(( KILL_GRACE * 5 )) ]; do sleep 0.2; waited=$((waited + 1)); done
+    kill -KILL "$copy_pid" 2>/dev/null
+  fi
+  say "stopped by a signal; this run's copy was stopped first"
   exit 143
 }
 trap on_term TERM INT
