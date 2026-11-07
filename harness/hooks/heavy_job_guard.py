@@ -34,6 +34,11 @@ Contract
   prints the recipe (GNU make still executes recipe lines that invoke $(MAKE) under -n; accepted for a careless agent).
   These are also seen through xcrun, script, and `bash ./gradlew ...` / `sh mvnw ...` script launches.
   Wrapper chains deeper than MAX_WRAPPER_DEPTH (12) are denied as "too deep to analyse", even when they end in `ls`.
+- big-clone (goodqa#14927, 2026-11-06): warn only, never denied, no hatch needed. `git clone`, `cp -R/-r/-a` or a
+  local `rsync` of a repository whose pack files exceed 500 MB (measured at a local source, or at an existing clone
+  of the same name under ~/.agent-harness/work or ~ for a URL) names `git worktree add`, `git archive HEAD | tar -x`,
+  `git clone --filter=blob:none` and dev2/t2-dev. Partial clones (--filter, --depth, --reference, --shared) and a
+  remote rsync side are not flagged. Review and red-team clones of GoodQA (4.4 to 9.4 GB each) had filled ~30 GB.
 
 Threat model: a CARELESS agent, not a hostile one. Wrapper and shell syntax (env/sudo/su/watch/nohup chains, ANSI-C
 quotes, eval) is parsed conservatively, with an unparseable form scanned word by word and denied on any heavy
@@ -63,9 +68,16 @@ MAX_SEGMENT_WORDS = 8192  # words in one shell command; bounds the quadratic wra
 MAX_NESTED_SECONDS = 0.4  # wall-clock budget per decision for nested scans and uncertain-wrapper probes
 MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 DEFAULT_MODES = {"browser": "enforce", "adversarial": "warn", "full-suite": "enforce",
-                 "build": "enforce", "media": "warn", "fan-out": "warn", "oversize": "enforce"}
+                 "build": "enforce", "media": "warn", "fan-out": "warn", "oversize": "enforce", "big-clone": "warn"}
 CAPPED_RULES = {"browser", "media", "fan-out"}  # memory hogs: hatch alone is not enough
 NEVER_BLOCK = {"adversarial"}  # red-team/fuzz work is legitimate: advise (dev2, group cleanup), never deny
+WARN_ONLY = {"big-clone"}  # disk advice (goodqa#14927): warn whatever the mode table says, never deny
+BIG_PACK_BYTES = 500 * 1024 * 1024  # a repository whose packs exceed this is a big copy on the Mac
+MAX_PACK_ENTRIES = 20000
+CLONE_SEARCH_ROOTS = ("~/.agent-harness/work", "~")  # where an existing clone of the same name is looked for
+MAX_SEARCH_ENTRIES = 6000
+CLONE_VALUE_OPTIONS = {"-b", "--branch", "-o", "--origin", "-u", "--upload-pack", "--template", "-c", "--config",
+                       "--separate-git-dir", "-j", "--jobs", "--server-option", "--bundle-uri"}  # bare --recurse-submodules takes no value
 HATCH = "HARNESS_LOCAL_OK"
 LOG_PATH = os.path.join(os.path.expanduser("~"), ".agent-harness", "logs", "heavy-job-guard.jsonl")
 
@@ -78,6 +90,7 @@ RULE_HELP = {
     "fan-out": "parallel fan-out multiplies memory use",
     "oversize": "the guard cannot scan this whole command, so a heavy job could hide in the part it skips; "
                 "write it to a script file and run that (HARNESS_LOCAL_OK does not override this rule)",
+    "big-clone": "a full copy of a large repository fills the Mac disk (review and red-team clones reached ~30 GB)",
 }
 
 
@@ -374,6 +387,138 @@ def resolve(path: str, cwd: str) -> str:
     return path if os.path.isabs(path) else os.path.join(cwd, path)
 
 
+# ---------------------------------------------------------------- big-clone (goodqa#14927): disk advice, warn only
+
+def pack_bytes(repo: str):
+    """Bytes of pack files of a repository checkout (a worktree's .git file is followed to its common dir; a bare
+    repo is accepted), or None when the path is not a repository. Bounded: one directory listing."""
+    repo = repo.rstrip("/") or "/"
+    git = os.path.join(repo, ".git")
+    pack_dir = None
+    if os.path.isdir(git):
+        pack_dir = os.path.join(git, "objects", "pack")
+    elif os.path.isfile(git):
+        try:
+            with open(git, "rb") as handle:
+                head = handle.read(4096).decode("utf-8", "replace").strip()  # input-ok: a one-line gitdir pointer
+        except OSError:
+            head = ""
+        match = re.match(r"gitdir:\s*(.+)$", head)
+        if match:
+            gitdir = resolve(match.group(1).strip(), repo)
+            common = gitdir
+            try:
+                with open(os.path.join(gitdir, "commondir"), "rb") as handle:
+                    common = resolve(handle.read(4096).decode("utf-8", "replace").strip(), gitdir)  # input-ok: one path
+            except OSError:
+                pass
+            pack_dir = os.path.join(common, "objects", "pack")
+    elif os.path.isdir(os.path.join(repo, "objects", "pack")):
+        pack_dir = os.path.join(repo, "objects", "pack")
+    if pack_dir is None:
+        return None
+    total = 0
+    try:
+        with os.scandir(pack_dir) as entries:
+            for count, entry in enumerate(entries):
+                if count >= MAX_PACK_ENTRIES:
+                    break
+                try:
+                    total += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    pass
+    except OSError:
+        return 0 if os.path.isdir(os.path.dirname(pack_dir)) else None
+    return total
+
+
+def repo_name(source: str) -> str:
+    name = source.rstrip("/")
+    name = name[:-4] if name.endswith(".git") else name
+    return re.split(r"[/:]", name)[-1].lower()
+
+
+def find_existing_clone(name: str, roots=None):
+    """(path, pack bytes) of the largest local checkout whose directory is named like the repo (name, name-*, name_*),
+    looked for one and two levels under the search roots, skipping hidden dirs and Library. Bounded by entries."""
+    best, seen = (None, 0), 0
+    if not name:
+        return best
+    for root in roots or CLONE_SEARCH_ROOTS:
+        root = os.path.expanduser(root)
+        try:
+            level1 = [e.path for e in os.scandir(root) if e.is_dir(follow_symlinks=False)
+                      and not e.name.startswith(".") and e.name != "Library"]
+        except OSError:
+            continue
+        for first in level1:
+            candidates = [first]
+            try:
+                candidates += [e.path for e in os.scandir(first) if e.is_dir(follow_symlinks=False) and not e.name.startswith(".")]
+            except OSError:
+                pass
+            for candidate in candidates:
+                seen += 1
+                if seen > MAX_SEARCH_ENTRIES:
+                    return best
+                base_name = os.path.basename(candidate).lower()
+                if base_name == name or base_name.startswith((name + "-", name + "_")):
+                    size = pack_bytes(candidate)
+                    if size and size > best[1]:
+                        best = (candidate, size)
+    return best
+
+
+def big_copy_finding(low, args, ctx):
+    """("big-clone", detail) when `git clone`, `cp -R/-r/-a` or a local `rsync` would copy a repository whose packs
+    exceed BIG_PACK_BYTES onto this machine: measured at a local source, or at an existing clone of the same name
+    for a URL. None otherwise, including partial clones (--filter, --depth, --reference, --shared) and remote rsync."""
+    operands = [a for a in args if not a.startswith("-")]
+    if low == "git":
+        if args[:1] != ["clone"]:
+            return None
+        if any(a.startswith(("--filter", "--depth", "--reference", "--shared", "--shallow")) or a == "-s" for a in args):
+            return None
+        operands, skip = [], False  # value-taking clone options (-b main, --origin up ...) are not operands (review LOW)
+        for a in args[1:]:
+            if skip:
+                skip = False
+            elif a in CLONE_VALUE_OPTIONS:
+                skip = True
+            elif not a.startswith("-"):
+                operands.append(a)
+        if not operands:
+            return None
+        src = operands[0]
+    elif low == "cp":
+        flags = "".join(a[1:] for a in args if a.startswith("-") and not a.startswith("--"))
+        if not (set("Rra") & set(flags) or "--recursive" in args) or len(operands) < 2:
+            return None
+        src = operands[0]
+    elif low == "rsync":
+        if len(operands) < 2 or any(":" in o.split("/", 1)[0] for o in operands) or any(a.startswith("rsync://") for a in operands):
+            return None  # a remote side: the copy is off-box or off-box bound
+        src = operands[0]
+    else:
+        return None
+    remote_src = re.match(r"^[a-z][a-z0-9+.-]*://|^[^/]+@[^/]+:|^[^/:]+:", src)
+    if remote_src:
+        path, size = find_existing_clone(repo_name(src))
+        if not path:
+            return None
+        where = f"the existing clone {path} has that much"
+    else:
+        path = resolve(src, ctx.cwd)
+        size = pack_bytes(path) if os.path.isdir(path) else None
+        if size is None:
+            return None
+        where = "measured at the source"
+    if size < BIG_PACK_BYTES:
+        return None
+    return ("big-clone", f"`{low} {' '.join(args)[:80]}` copies a repository with about {size / 2 ** 30:.1f} GB of packs "
+                         f"({where}); prefer `git worktree add <dir> <branch>` from {path}")
+
+
 def read_script(path: str, cwd: str):
     try:
         full = resolve(path, cwd)
@@ -634,6 +779,10 @@ def classify(argv, ctx, depth=0):
     low = cmd.lower()
     args = argv[1:]
 
+    if low in ("git", "cp", "rsync"):
+        finding = big_copy_finding(low, args, ctx)
+        if finding:
+            return finding
     if low in REMOTE_CMDS:
         return None  # already off-box
     if cmd == "run_capped.py":
@@ -952,7 +1101,9 @@ def decide(command: str, cwd: str = None, modes=None):
         mode = modes.get(rule, "enforce")
         if mode == "off" or (rule in NEVER_BLOCK and capped):
             continue
-        if valid_reason(hatch) and rule != "oversize" and (capped or rule not in CAPPED_RULES):
+        if rule in WARN_ONLY:  # advice only, whatever the mode table says (never deny, no hatch needed)
+            outcome = {"action": "warn", "rule": rule, "detail": detail, "message": deny_message(rule, detail, hatch, capped)}
+        elif valid_reason(hatch) and rule != "oversize" and (capped or rule not in CAPPED_RULES):
             outcome = {"action": "allow", "rule": rule, "detail": detail, "hatch_reason": hatch.strip()}
         else:
             outcome = {"action": "deny" if mode == "enforce" else "warn", "rule": rule, "detail": detail,
@@ -966,6 +1117,11 @@ def decide(command: str, cwd: str = None, modes=None):
 
 def deny_message(rule, detail, hatch, capped):
     cap = "python3 ~/.claude/hooks/run_capped.py --max-rss-gb <declared peak x1.5> --timeout-s <expected x2> -- <command>"
+    if rule in WARN_ONLY:
+        return (f"Heavy-job guard [{rule}] advisory (not blocked): {RULE_HELP[rule]} ({detail}). Instead: "
+                "`git worktree add <dir> <branch>` from an existing clone shares its objects; "
+                "`git archive HEAD | tar -x -C <dir>` gives a read-only review copy without history; "
+                "`git clone --filter=blob:none` (or --depth 1) when a clone is unavoidable; or do the work on dev2/t2-dev.")
     if rule in NEVER_BLOCK:
         return (f"Heavy-job guard [{rule}] advisory (not blocked): {RULE_HELP[rule]} ({detail}). Hostile-input tests are "
                 f"legitimate. Prefer dev2 (ssh dev2 '<command>'), or on the Mac run under {cap} so stopping the test also "

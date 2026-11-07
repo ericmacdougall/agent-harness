@@ -38,6 +38,10 @@ func (l *Ledger) SyncState(in fold.Input, tracked bool) SyncReport {
 		}
 		return r
 	}
+	if b.Damaged {
+		r.State = StateDiverged // the binding no longer describes this ledger: unbind, then bind again
+		return r
+	}
 	r.GoodQAProject = b.GoodQAProject
 	r.Authenticated = b.GoodQAKey != ""
 	rel, extra := Compare(in, b.Frontier)

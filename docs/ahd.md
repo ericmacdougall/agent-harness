@@ -15,7 +15,7 @@ The tick has a wall-time budget of 45 s. Each `ah` call gets the remaining budge
 |---|---|---|
 | heartbeat | the deadman input | `ah heartbeat beat --service ahd` |
 | checks | `ops_watch.checks.run_all`, once ops-watch exposes it; until then the ops-watch timer runs (never both) | `ah alert raise\|clear` |
-| owners | `ah owners --session S` for each session whose main WAL moved in the last 48 h; the liveness rule lives in `liveness.py` (ah) | — (read) |
+| owners | `ah owners --session S --all` (every row; the CLI default view hides old terminal rows since 2026-11-06, so ahd and ah.py must be installed together) for each session whose main WAL moved in the last 48 h; the liveness rule lives in `liveness.py` (ah) | — (read) |
 | asks | the v1 ledger `~/.agent-harness/work-assignments.json` (JSON, read-only), and `ask` WAL entries with no `ask_resolved`. The #14465 ledger replaces v1 via `work_assignments.py status --json` once installed | — (read) |
 | alerts | diff the desired ahd alerts against this host's active `source=ahd` entries in the ring (read-only); raise new or escalated alerts, clear resolved ones. More than 10 transitions go in one `ah apply --batch -` | `ah alert raise\|clear` |
 | spool | drain queued writes (GoodQA) | `ah spool drain` |
@@ -26,6 +26,8 @@ Alert keys:
 - `ask:<id>:unowned`: warning; high when the request is under 24 h old and has been unowned for 2 h.
 - `ask:<id>:stale` and `ask:<id>:no-evidence`: warning.
 - `wal:unsafe:<session8>`: high; see Unsafe WALs below.
+
+An active alert whose text no longer matches, or whose severity has fallen, is raised again with `detail.updated`. Changed words and lower severity wait at least 5 minutes since the last write; number-only changes wait an hour. Rises are immediate. ahd keeps no state, so every raise carries hashes of its raw text (`detail.text_sha`, `detail.text_shape`) and the rule in `liveness.ring_text_stale` compares those, because the ring's own text may be redacted or cut. A slot that overflowed has lost them and refreshes at most hourly, even when its text never changes: up to 24 rows a day for that key. The marks add about 62 bytes to each row, so a 300-character message with roughly 46 or more non-ASCII characters overflows its slot and loses its `detail`. A severity that flaps every tick costs up to 20 rows an hour, where ops-watch, which holds a downgrade for two runs, writes about none. A refresh posts no ticket comment. Only rows that `ah owners` marks as owners raise anything, so helpers never alert.
 
 If ahd cannot read a session's owners, it does not clear that session's liveness alerts. A missing `ah` verb is skipped for 10 min and logged once.
 

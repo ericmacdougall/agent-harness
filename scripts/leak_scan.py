@@ -11,13 +11,17 @@ read from $AGENT_HARNESS_LEAK_DENYLIST or ~/.agent-harness/leak-denylist.txt, an
 can supply it from a repository secret. Matched text is never printed, only
 file:line and the rule name, so a log cannot itself leak the value.
 
-Exit 0 clean, 1 findings, 2 nothing was scanned or a usage/IO/denylist error (never a silent pass).
+Exit 0 clean, 1 findings, 2 nothing was scanned, a usage/IO/denylist error, or (tree mode) a tracked file
+that could not be scanned: binary, over the size cap, or not a regular file when read (never a silent pass).
+--history diffs binary blobs as text (git log -a); a skip it still counts does not fail the run, since the
+tree scan gates what is committed now.
 Allowlisted fixture paths skip the token rules only; network and personal-string rules always apply.
 Placeholder names (someone, you, runner, user, example.invalid ...) are allowed.
 """
 from __future__ import annotations
 
 import argparse
+import stat
 import hashlib
 import os
 import re
@@ -122,6 +126,27 @@ def load_allow(repo: Path) -> list[str]:
     return patterns
 
 
+def read_capped(path: Path):
+    """The file's bytes, or None when it is not a regular file or is over MAX_BYTES. Opens once, checks the
+    opened file with fstat and reads at most MAX_BYTES + 1, so an oversized or growing file is never buffered
+    whole (audit2 F-018, goodqa#14999). O_NONBLOCK keeps a FIFO swapped in after the is_file check from hanging."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_BYTES:
+            return None
+        chunks, total = [], 0
+        while total <= MAX_BYTES:
+            chunk = os.read(fd, MAX_BYTES + 1 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        return None if total > MAX_BYTES else b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
 def scan_tree(repo: Path, denylist):
     """Returns (findings, scanned, skipped). Skipped files (binary, over the size cap) are counted, not hidden."""
     findings, scanned, skipped = [], 0, 0
@@ -138,8 +163,11 @@ def scan_tree(repo: Path, denylist):
             continue
         if not path.is_file():
             continue
-        raw = path.read_bytes()
-        if b"\0" in raw[:MAX_BYTES] or len(raw) > MAX_BYTES:
+        try:
+            raw = read_capped(path)
+        except OSError as error:
+            raise ScanError(f"{label(name, denylist)}: cannot read ({error.strerror or error.__class__.__name__})")
+        if raw is None or b"\0" in raw:
             skipped += 1
             continue
         scanned += 1
@@ -215,7 +243,13 @@ def main(argv=None) -> int:
         print(f"LEAK {where} rule={rule}")
     print(f"leak_scan: {'history commits' if args.history else 'files'} scanned={scanned} "
           f"denylist_rules={len(denylist)} skipped={skipped} findings={len(set(findings))}")
-    return 1 if findings else 0
+    if findings:
+        return 1
+    if skipped and not args.history:
+        print("leak_scan: incomplete scan: skipped tracked files need a separate review; refusing to report a pass",
+              file=sys.stderr)
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

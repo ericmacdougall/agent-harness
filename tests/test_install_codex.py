@@ -181,6 +181,14 @@ class CodexInstallerTests(unittest.TestCase):
         self.assertEqual(parsed['default_permissions'], ':danger-full-access')
         self.assertEqual(parsed['approval_policy'], 'never')
 
+    def test_permissions_scalar_is_refused_cleanly(self):
+        # permissions = "..." is malformed for Codex too; refuse it like the other
+        # config problems instead of crashing on str.get.
+        for text in ('permissions = "oops"\n',
+                     'permissions = "x agent-harness y"\n'):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, 'permissions must be a table'):
+                merge_config(text, Path('/tmp/example'))
+
     def test_rejected_apply_leaves_synthetic_config_unchanged(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary).resolve()

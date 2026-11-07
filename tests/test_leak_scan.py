@@ -221,14 +221,52 @@ class ReviewFindings(unittest.TestCase):
             self.assertIn("link:symlink", out)
             self.assertIn("path:", out)
 
-    def test_skipped_files_are_reported_not_hidden(self):
+    def test_skipped_files_make_the_scan_incomplete_not_clean(self):
+        """Kimi audit F04 (goodqa#14999): a tracked file the tree scan could not read is not a pass."""
         with tempfile.TemporaryDirectory() as tmp:
             repo, _ = make_git(tmp, {"a.txt": "ok\n"})
             (repo / "b.bin").write_bytes(b"\0\1\2")
             subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
             code, out = scan_repo(repo, tmp)
-            self.assertEqual(code, 0, out)
+            self.assertEqual(code, 2, out)
             self.assertIn("skipped=1", out)
+            self.assertIn("incomplete", out)
+            (repo / "c.txt").write_text(FAKE_GH + "\n")  # findings still report as findings (exit 1)
+            subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+            self.assertEqual(scan_repo(repo, tmp)[0], 1)
+
+    def test_history_binary_diff_is_counted_but_not_fatal(self):
+        """History mode is unchanged: a committed binary blob is diffed as text (-a) and does not fail the run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _ = make_git(tmp, {"a.txt": "ok\n"})
+            (repo / "b.bin").write_bytes(b"\0\1\2")
+            subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+            subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                            "commit", "-qm", "bin"], check=True)
+            code, out = scan_repo(repo, tmp, "--history")
+            self.assertEqual(code, 0, out)  # git log -a diffs the blob as text, so nothing is skipped or failed
+
+    def test_tree_read_is_bounded_before_buffering(self):
+        """audit2 F-018 (goodqa#14999): an oversized file is refused from fstat and never read whole."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("leak_scan_mod", SCAN)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as tmp:
+            big = Path(tmp) / "big.txt"
+            big.write_bytes(b"a" * 5000)
+            small = Path(tmp) / "small.txt"
+            small.write_bytes(b"b" * 50)
+            real_read, asked = os.read, []
+
+            def counting_read(fd, n):
+                asked.append(n)
+                return real_read(fd, n)
+            with mock.patch.object(mod, "MAX_BYTES", 100), mock.patch.object(Path, "read_bytes", side_effect=AssertionError("unbounded read_bytes")), mock.patch.object(mod.os, "read", side_effect=counting_read):
+                self.assertIsNone(mod.read_capped(big))
+                self.assertEqual(asked, [], "an oversized file was read at all")
+                self.assertEqual(mod.read_capped(small), b"b" * 50)
+                self.assertTrue(asked and max(asked) <= 101, asked)
 
     def test_not_a_git_repo_is_exit_2_not_findings(self):
         with tempfile.TemporaryDirectory() as tmp:

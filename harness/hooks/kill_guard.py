@@ -14,7 +14,9 @@ What it blocks, before the command runs, on Claude Code (Bash, PowerShell) and C
     or argv[1], is inside the caller's own git worktree (the toplevel of the tool call's cwd), or it is in the
     per-worktree spawn ledger written by `kill_guard.py spawn -- CMD...`;
   * every kill inside ssh, mosh, docker exec and kubectl exec (ownership cannot be checked locally) except
-    `netwatch orphans --kill --pid N[,N...]`.
+    `netwatch orphans --kill --pid N[,N...]`, and `ssh HOST kill [-SIG] PID...` where every PID was started by
+    `kill_guard.py spawn --host HOST -- CMD...` (recorded with its start time in a per-host ledger) and the host
+    still reports that start time for it (2026-11-06: an agent could not stop its own remote wait loop).
 Allowed: kill -0 on literal targets or one quoted simple variable, kill -l, job specs (%N, %%, %+, %-, %name), process
 listing, and text that merely contains the word. Every kill word must fit the closed grammar below; anything else fails
 closed, including $!, a variable with a known value and a brace list.
@@ -70,7 +72,9 @@ STOP_COMMANDS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'echo', 'printf', 'cat', 
                  'cp', 'mv', 'rm', 'mkdir', 'touch', 'chmod', 'chown', 'make', 'cargo', 'go', 'docker', 'kubectl',
                  'python', 'python3', 'node', 'ruby', 'perl', 'sleep', 'true', 'false', 'test', 'wc', 'sort', 'uniq',
                  'tee', 'diff', 'find', 'curl', 'wget', 'pytest', 'ssh', 'scp', 'rsync', 'tar', 'zip', 'unzip', 'date'}
-OVERRIDDEN = ('apply', 'command', 'inner_words', 'script', 'ssh', 'container', 'check_tokens', 'resolve', 'bind_loop_var')
+NAME_FIRST = {'gosu', 'chroot', 'flock', 'sg', 'su', 'runuser'}  # gosu git bash: the first operand is no command
+OVERRIDDEN = ('apply', 'command', 'dispatch', 'inner_words', 'script', 'ssh', 'container', 'check_tokens', 'resolve',
+              'bind_loop_var')
 
 DEFAULT_POLICY = {
     'mode': 'enforce',
@@ -78,7 +82,7 @@ DEFAULT_POLICY = {
     'windows_verbs': ['taskkill', 'stop-process', 'spps', 'wmic'],
     'service_kill': {'systemctl': ['kill'], 'launchctl': ['kill'], 'tmux': ['kill-server'], 'pm2': ['kill'],
                      'loginctl': ['kill-session', 'kill-user', 'terminate-user', 'terminate-session']},
-    'script_kill_pattern': r'(?i)(?<![a-z])(?:p|f|posix_)?kill(?![a-z])|killpg|terminate\(|send_signal|taskkill|killall|invoke-cimmethod|getprocessbyid',
+    'script_kill_pattern': r'(?i)(?<![a-z])(?:p|f|posix_)?kill(?![a-z])|killpg|terminate\(|send_signal|taskkill|killall|invoke-cimmethod|getprocessbyid|raise_signal|sigqueue|pidfd_send_signal',
     'pid_finders': ['pgrep', 'pidof', 'ps', 'lsof', 'fuser', 'pstree', 'cat', 'awk', 'grep'],
     'ledger_max_lines': 2000,
     'child_timeout_seconds': 10,
@@ -110,6 +114,117 @@ RUN_OPTS = {'-c', '-s', '-i', '-e', '-lc', '-ic', '--command', '-l', '-S'}  # op
 LAUNCHERS = {'tmux', 'screen', 'at', 'batch', 'watch'}
 CLASSIC_VERBS = {'pkill', 'killall', 'killall5', 'skill', 'slay', 'taskkill', 'stop-process', 'spps'}
 PID_OPT_VALUE = re.compile(r'[0-9]+(?:,[0-9]+)*')
+# Harness CLIs whose arguments are data (a note, a search text), never code. ah.py kill is judged by is_ah_kill.
+AH_SUBCOMMANDS = {'owners', 'user-msg', 'ticket', 'disk', 'task', 'doctor', 'spool', 'write'}
+PY_LITERAL = re.compile(r"""('\'\'[\s\S]*?\'\'\'|"{3}[\s\S]*?"{3}|'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*")""")
+# Inline Python that only formats data (a closed set of syntax, calls and modules): its string literals are prose.
+PY_SAFE_IMPORTS = {'json', 're', 'datetime', 'time', 'textwrap'}
+PY_SAFE_CALLS = {'print', 'str', 'len', 'dict', 'list', 'sorted', 'int', 'repr', 'tuple', 'set', 'range', 'sum', 'min',
+                 'max', 'bool', 'float', 'enumerate', 'zip'}
+PY_SAFE_NODES = ('Module', 'Expr', 'Assign', 'Name', 'Load', 'Store', 'Constant', 'Call', 'keyword', 'Attribute', 'Dict',
+                 'List', 'Tuple', 'Set', 'Subscript', 'Index', 'Slice', 'BinOp', 'JoinedStr', 'FormattedValue', 'Import',
+                 'ImportFrom', 'alias', 'Add', 'Sub', 'Mult', 'Mod', 'Div')
+# Module members a data-only program may reach, as full dotted paths. Every other attribute of a module (re.enum,
+# json.decoder, textwrap.re ...) is a route to sys/os, so a chain must be a prefix of one of these or equal to it.
+PY_SAFE_MEMBERS = {'json.dumps', 'json.loads', 'json.load', 're.sub', 're.match', 're.search', 're.findall', 're.split',
+                   're.compile', 're.escape', 're.I', 're.IGNORECASE', 'datetime.datetime.now', 'datetime.datetime.utcnow',
+                   'datetime.datetime.fromisoformat', 'datetime.datetime.strptime', 'datetime.timedelta',
+                   'datetime.date.today', 'datetime.timezone.utc', 'time.time', 'time.strftime', 'time.gmtime',
+                   'time.localtime', 'textwrap.dedent', 'textwrap.indent', 'textwrap.fill', 'textwrap.shorten'}
+PY_SAFE_PREFIXES = {'.'.join(m.split('.')[:i]) for m in PY_SAFE_MEMBERS for i in range(1, len(m.split('.')) + 1)}
+# Methods of plain values (str, list, dict, dates, match objects). None of them returns a module or a function.
+PY_SAFE_METHODS = {'join', 'get', 'items', 'keys', 'values', 'upper', 'lower', 'strip', 'lstrip', 'rstrip', 'split',
+                   'splitlines', 'replace', 'startswith', 'endswith', 'append', 'extend', 'isoformat', 'strftime',
+                   'group', 'groups', 'title', 'count', 'index', 'find', 'ljust', 'rjust', 'center', 'zfill'}
+
+
+def _dotted(node, aliases):
+    """Real dotted path of a Name/Attribute chain rooted at an imported module, else None."""
+    import ast
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name) and node.id in aliases:
+        return '.'.join([aliases[node.id]] + parts[::-1])
+    return None
+
+
+def pure_data_python(code):
+    """True when the program is built only from print/json-style calls on literals, so it cannot reach the OS. An
+    allowlist over the syntax tree: sys.modules, exec*/spawn*, getattr, dunders, every other module and every module
+    member outside PY_SAFE_MEMBERS (re.enum.sys...) are out."""
+    import ast
+    import builtins
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    aliases = {}  # local name -> real dotted path of an imported module or member
+    for node in ast.walk(tree):
+        kind = type(node).__name__
+        if kind not in PY_SAFE_NODES:
+            return False
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name not in PY_SAFE_IMPORTS:  # `import os.path` or `import a.b` is never needed here
+                    return False
+                aliases[a.asname or a.name] = a.name
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or node.module not in PY_SAFE_IMPORTS:
+                return False
+            for a in node.names:
+                path = node.module + '.' + a.name
+                if path not in PY_SAFE_PREFIXES:
+                    return False
+                aliases[a.asname or a.name] = path
+    # A builtin or module is only ever safe as the thing being called or the head of a vetted attribute chain. In
+    # value position (key=eval, print = eval, repl=exec) a data program could hand code to a pure helper.
+    called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    heads = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Attribute):
+            h = n.value
+            while isinstance(h, ast.Attribute):
+                h = h.value
+            heads.add(id(h))
+    stored = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            if node.id.startswith('_'):
+                return False
+            if isinstance(node.ctx, ast.Store):
+                if node.id in aliases or hasattr(builtins, node.id):
+                    return False  # rebinding print/eval/an imported name could hide a different object
+            elif node.id in aliases:
+                if id(node) not in called and id(node) not in heads:
+                    return False
+            elif node.id in stored:
+                pass  # the program's own variable, only ever bound to vetted expressions
+            elif node.id in PY_SAFE_CALLS:
+                if id(node) not in called:
+                    return False
+            else:
+                return False  # any other builtin or unknown name (eval, exec, open, getattr, vars ...)
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith('_'):
+                return False
+            path = _dotted(node, aliases)
+            if path is not None:
+                if path not in PY_SAFE_PREFIXES:
+                    return False
+            elif node.attr not in PY_SAFE_METHODS:
+                return False
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id not in PY_SAFE_CALLS \
+                and node.func.id not in aliases:
+            return False
+    return True
+
+
+def hook_script_ok(raw, names):
+    """The raw word names ~/.claude/hooks/<name>.py or the same path under the caller's real HOME, nothing else."""
+    home = re.escape(str(Path.home()))
+    return bool(re.fullmatch(r'(?:~|%s)/\.claude/hooks/(?:%s)\.py' % (home, '|'.join(names)), raw or ''))
 
 
 # --------------------------------------------------------------------------- policy and small helpers
@@ -266,6 +381,120 @@ def append_ledger(root, pid, start, home=None):
         os.write(fd, (json.dumps(entry, sort_keys=True) + '\n').encode('utf-8'))
     finally:
         os.close(fd)
+
+
+# ---- remote spawn ledger (goodqa#14927): the one route to a remote kill. Separate from the local ledger functions
+# above on purpose; it reuses them with a `remote:HOST` root, so an ssh kill can never be proven by a local entry.
+
+REMOTE_HOST_RE = re.compile(r'^(?:[A-Za-z0-9._-]{1,64}@)?[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
+REMOTE_LOG_RE = re.compile(r'^[A-Za-z0-9._/-]{1,512}$')  # no ~: the path is single-quoted on the host
+SSH_RUNNER = subprocess.run  # tests replace it; nothing here is ever run without BatchMode
+PLAIN_SSH_FLAGS = {'-q', '-T', '-n', '-t', '-tt', '-4', '-6'}
+PLAIN_SSH_OPTIONS = {'batchmode', 'connecttimeout', 'loglevel', 'serveraliveinterval', 'serveralivecountmax',
+                     'connectionattempts'}
+
+
+PLACEHOLDER = re.compile('[-]')  # the parser stands a substitution in for a private-use character
+
+
+def _unliteral(word):
+    """A word whose value is not known from the text: variable, substitution, glob, or a parser placeholder."""
+    return bool(word.dynamic or word.subs or word.glob or PLACEHOLDER.search(word.text or ''))
+
+
+def plain_ssh_hop(texts, host):
+    """True when every ssh option before the host word is one that cannot change where the connection goes.
+    `-o HostName=`, `-J`/ProxyJump, `-F`, `-W`, `-S`, ProxyCommand and anything unknown make the hop non-literal,
+    so a recorded PID on `dev2` can never be killed on another machine (review finding, 2026-11-06)."""
+    i = 0
+    while i < host:
+        t = texts[i]
+        if t in PLAIN_SSH_FLAGS:
+            i += 1
+            continue
+        if t in ('-p', '-l', '-o'):
+            value = texts[i + 1] if i + 1 < host else ''
+            i += 2
+        elif t.startswith(('-p', '-l', '-o')) and len(t) > 2:
+            value, t = t[2:], t[:2]
+            i += 1
+        else:
+            return False
+        if t == '-p' and not re.fullmatch(r'\d{1,5}', value):
+            return False
+        if t == '-l' and not re.fullmatch(r'[A-Za-z0-9._-]{1,64}', value):
+            return False
+        if t == '-o' and value.split('=', 1)[0].strip().lower() not in PLAIN_SSH_OPTIONS:
+            return False
+    return True
+
+
+def remote_root(host):
+    return 'remote:' + host
+
+
+def _remote_start(host, pid):
+    """The start time the host reports for PID now (`ps -o lstart=`), normalized, or None. Bounded: 5 s, BatchMode."""
+    try:
+        done = SSH_RUNNER(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=3', host, 'ps', '-o', 'lstart=', '-p', str(int(pid))],
+                          capture_output=True, text=True, timeout=5, env=CLEAN_ENV)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    text = ' '.join((done.stdout or '').split())
+    return text if done.returncode == 0 and text else None
+
+
+def remote_spawned(host, pid, home=None, probe=None):
+    """(ok, reason): PID on HOST was started by `spawn --host HOST` and still carries the recorded start time."""
+    if not REMOTE_HOST_RE.match(host or ''):
+        return False, 'the ssh host is not a plain host name'
+    recorded = [start for p, start in read_ledger(remote_root(host), home) if p == pid]
+    if not recorded:
+        return False, 'not started by `kill_guard.py spawn --host %s`' % host
+    live = (probe or _remote_start)(host, pid)
+    if live is None:
+        return False, 'the host did not report it (probe failed or it exited)'
+    if live not in recorded:
+        return False, 'its start time differs from the spawn record (pid reused)'
+    return True, ''
+
+
+def spawn_remote_main(host, argv):
+    """`kill_guard.py spawn --host HOST [--log REMOTE_FILE] -- CMD ARGS...`: start CMD detached on HOST over ssh,
+    record (host, pid, start time) in the per-host ledger, print them. Only such a PID is later killable through
+    `ssh HOST kill PID`. The command is passed as single-quoted words, never re-parsed here."""
+    log = '/dev/null'
+    args = list(argv)
+    if args[:1] == ['--log'] and len(args) >= 2:
+        log, args = args[1], args[2:]
+    if args[:1] == ['--']:
+        args = args[1:]
+    if not args or not REMOTE_HOST_RE.match(host) or not REMOTE_LOG_RE.match(log):
+        sys.stderr.write('usage: kill_guard.py spawn --host HOST [--log REMOTE_FILE] -- CMD [ARGS...] '
+                         '(a plain host name; a plain remote path)\n')
+        return 2
+    try:
+        ensure_key()
+    except OSError as error:
+        sys.stderr.write('kill_guard spawn: %s; nothing was started\n' % error)
+        return 2
+    import shlex  # noqa: PLC0415
+    script = ('nohup %s >%s 2>&1 </dev/null & p=$!; printf \'%%s\\n\' "$p"; ps -o lstart= -p "$p"'
+              % (' '.join(shlex.quote(a) for a in args), shlex.quote(log)))
+    try:
+        done = SSH_RUNNER(['ssh', '-o', 'BatchMode=yes', host, script], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        sys.stderr.write('kill_guard spawn: ssh to %s failed (%s); nothing was recorded\n' % (host, type(error).__name__))
+        return 1
+    lines = [line.strip() for line in (done.stdout or '').splitlines() if line.strip()]
+    if done.returncode != 0 or len(lines) < 2 or not lines[0].isdigit():
+        sys.stderr.write('kill_guard spawn: %s did not report a pid and start time (exit %s); nothing was recorded: %s\n'
+                         % (host, done.returncode, one_line(done.stderr or '', 200)))
+        return 1
+    pid, start = int(lines[0]), ' '.join(lines[1].split())
+    append_ledger(remote_root(host), pid, start)
+    print(json.dumps({'host': host, 'pid': pid, 'start': start, 'log': log}))
+    return 0
 
 
 def audit(rule, raw, pids, home=None):
@@ -527,6 +756,7 @@ def make_analyzer_class(cg):
             self.raw = raw
             self.kf = []          # (rule, reason, pids)
             self.remote = 0
+            self.remote_hosts = []  # literal ssh host per open ssh hop (None when the host word is not literal)
             self.xargs = 0
             self.before_paren = {}  # id -> word, holding the word so its id stays unique
             self.fed = {}           # id -> (word, sink stage): its text goes down a pipe, maybe into a shell
@@ -645,7 +875,7 @@ def make_analyzer_class(cg):
                             break
                         if later_kind == 'w':
                             stage.append(later)
-                    if self.reads_program(stage) or (stage and cg.VAR_OPEN in stage[0].text):  # S=sh; ... | $S
+                    if self.reads_program(stage) or any(w.vars for w in stage):  # S=sh; ... | $S: judged once S is known
                         for w in self.feeder_words(tokens, k):
                             self.fed[id(w)] = (w, stage)
 
@@ -682,8 +912,18 @@ def make_analyzer_class(cg):
         def reads_program(self, words):
             """True when this pipeline stage runs its stdin as shell code."""
             words = self._skip_assigns(cg.strip_reserved(words))[1]
+            while words and self.expands_to_nothing(words[0]):  # K=(); ... | "${K[@]}" bash: bash is the command
+                words = words[1:]
             if not words:
                 return False
+            picked = self.picked_elements(words[0])
+            if picked:  # S=(cat bash); ... | "${S[1]}": which element runs depends on the shell, so any of them may
+                return any(self.reads_program([e] + words[1:]) for e in picked)
+            head = words[0].text.strip()
+            if re.search(r'\s', head) and not head.startswith('-') and self.shell_splits(words[0]):  # S="ssh -T dev2"; ... | $S bash
+                split = [v for k, v in cg.Lexer(self.ctx, self.ctx.ps).lex(head) if k == 'w']
+                if [w.text for w in split] != [head]:  # defensive: a word the lexer cannot split must not recurse forever
+                    return self.reads_program(split + words[1:])
             name, args = cg.norm_name(words[0].text), words[1:]
             if name.startswith('g') and name[1:] in GNU_PREFIXED:
                 name = name[1:]
@@ -702,7 +942,16 @@ def make_analyzer_class(cg):
             if name == 'parallel' and all(a.text.startswith('-') for a in args):
                 return True
             if name in WRAPPER_NAMES or name in REMOTE_EXEC or name in REMOTE_WRAPPERS:
+                host = self._ssh_host_index([a.text for a in args]) if name in ('ssh', 'mosh') else None
+                remote = name in REMOTE_EXEC or name in REMOTE_WRAPPERS
                 for i, a in enumerate(args):
+                    if re.search(r'\s', a.text.strip()) and name not in ('xargs', 'parallel'):  # ssh host 'cd /srv && bash -s'
+                        for bang in (True, False):  # the remote shell may be zsh or bash, which read `>! sh` apart
+                            lexed = cg.Lexer(self.ctx, self.ctx.ps, bang_operators=bang).lex(a.text)
+                            if any(self.reads_program(c.words) for pl in cg.parse(lexed) for c in pl.cmds):
+                                return True
+                        if remote:
+                            continue  # a remote command line; a local wrapper's word is one argv word, a path
                     n = cg.norm_name(a.text)
                     if n in cg.SHELLS:
                         if name in ('xargs', 'parallel'):  # the text reaches the shell only when it is the whole -c program
@@ -711,14 +960,75 @@ def make_analyzer_class(cg):
                             return any(re.fullmatch(r'-[a-zA-Z]*c[a-zA-Z]*', args[j].text) and args[j + 1].text.strip() in marks
                                        for j in range(i + 1, len(args) - 1))
                         return self.reads_program(args[i:])
-                    if re.search(r'\s', a.text.strip()) and name not in ('xargs', 'parallel'):  # ssh host 'cd /srv && bash -s'
-                        for bang in (True, False):  # the remote shell may be zsh or bash, which read `>! sh` apart
-                            lexed = cg.Lexer(self.ctx, self.ctx.ps, bang_operators=bang).lex(a.text)
-                            if any(self.reads_program(c.words) for pl in cg.parse(lexed) for c in pl.cmds):
-                                return True
+                    if name in ('xargs', 'parallel') or i == host or self.names_a_value(name, args, i):
+                        continue  # xargs needs the exact `sh -c {}` above, so nothing before it can end the search
+                    if n in REMOTE_EXEC or n in NAME_FIRST:  # timeout 30 ssh dev2 bash, sudo gosu git sh: the inner one has its own rules
+                        return self.reads_program(args[i:])
                     if n in STOP_COMMANDS:
                         return False
             return False
+
+        def expands_to_nothing(self, word):
+            """A word whose expansions all resolve to nothing: `K=(); "${K[@]}"`, `${K[*]}`, zsh `$K[@]`, `K=; $K`, `${K}`,
+            and any concatenation of them (`${K[@]}${K[@]}`, `$K$J`, `"${K[@]}""${J[@]}"`; review N1 of 676c0e2). The
+            shell drops it (or fails on it), so the word after it is the command; judging that word errs only towards a
+            refusal. Decided on the resolved value, not the spelling: the word expands variables, no command
+            substitution, every resolved alternative is blank, and every variable it reads is known and untainted. An
+            unknown name resolves to `$NAME`, and `${K:-x}`, `${K[0]}`, `${!K}` and `${#K}` resolve to their text or a
+            marker, so none of them is blank and none is dropped."""
+            if not word.vars or word.subs or any(a.strip() for a in word.alts):
+                return False
+            return all(v in self.ctx.vars and v not in self.ctx.tainted for v in word.vars)
+
+        def drop_empty_head(self, words):
+            """The words left once leading words that expand to nothing are dropped. When any was dropped, main's
+            dynamic-head verb check still applies to what remains (review N3 of 676c0e2): main read the empty word as a
+            command built at run time and refused when a kill verb was among the next two words, so `K=(); "${K[@]}"
+            nocache kill 4004` (an unlisted wrapper) stays refused rather than judged as `nocache`."""
+            words = list(words)
+            dropped = False
+            while words and self.expands_to_nothing(words[0]):  # P=(sudo); [ root ] && P=(); "${P[@]}" pkill -f node
+                words, dropped = words[1:], True
+            if dropped and any(cg.norm_name(w.text) in (self.broad | self.windows | {'kill'}) for w in words[:2]):
+                self.block('dynamic-head', 'a command name that expands to nothing is followed by a kill verb')
+            return words
+
+        def dispatch(self, words, cmd, pl, idx, depth):
+            words = self.drop_empty_head(words)
+            if not words:
+                return None
+            return super().dispatch(words, cmd, pl, idx, depth)
+
+        @staticmethod
+        def shell_splits(word):
+            """A held value is split into words only when it came from an unquoted variable, or from a quoted `[@]` or `[*]`.
+            A quoted path with a space (`"/opt/my dir/bash"`, `"$B"`) stays one word."""
+            raw = word.raw or ''
+            if not word.vars:
+                return False
+            return not raw.startswith('"') or bool(re.search(r'\[[@*]\]', raw))
+
+        def picked_elements(self, word):
+            """The elements of a known array when this word picks one of them: `"${S[1]}"`, zsh `$S[1]`, `${S[-1]}`."""
+            match = re.fullmatch(r'"?\$\{?([A-Za-z_][A-Za-z0-9_]*)\[([^\]]*)\]\}?"?', word.raw or '')
+            if not match or match.group(2) in ('@', '*'):
+                return None
+            name = match.group(1)
+            if name not in self.ctx.vars or name in self.ctx.tainted:
+                return None
+            return [v for k, v in cg.Lexer(self.ctx, self.ctx.ps).lex(self.ctx.vars[name]) if k == 'w'] or None
+
+        @staticmethod
+        def names_a_value(name, args, i):
+            """This word may be a user or container, not a command: `sudo -u git bash`, `docker run --rm -i node sh`,
+            `kubectl exec node -i -- sh`. An option may take no value, so this can only keep the search going: a word that
+            is both a stop word and an option's neighbour costs a refusal only when a shell's name follows it."""
+            if i == 0 and name in NAME_FIRST:
+                return True
+            prev = args[i - 1].text if i else ''
+            if prev.startswith('-') and prev != '--' and '=' not in prev:
+                return True
+            return prev in ('exec', 'run', 'attach') and (name in REMOTE_EXEC or name in REMOTE_WRAPPERS)
 
         def command(self, cmd, pl, idx, depth):
             self.judge_reread(cmd)
@@ -742,8 +1052,8 @@ def make_analyzer_class(cg):
                 bodies = [r.body or (r.target.text if r.op == '<<<' and r.target is not None else '') for r in cmd.redirs]
             rest = self._skip_assigns(words)[1]
             name = cg.norm_name(rest[0].text) if rest else ''
-            if not fed and (not rest or name in INERT_COMMANDS):
-                return
+            if not fed and (not rest or (name in INERT_COMMANDS and not rest[0].vars)):
+                return  # a held name is only the guard's guess of the value: K=(kill); (K=(echo)); "${K[@]}" 4002(N)
             if self.names_kill(' '.join([p for w in words for p in (w.text, w.raw or '', *w.subs)] + bodies)):
                 self.block(rule, reason)
                 return
@@ -759,12 +1069,26 @@ def make_analyzer_class(cg):
 
         def resolve(self, word):
             # resolve() builds a new Word for any word holding a variable, so a tag has to follow it.
-            out = super().resolve(word)
+            out = super().resolve(self.array_value(word))
             if out is not word and word is not None:
                 if id(word) in self.before_paren:
                     self.before_paren[id(out)] = out
                 if id(word) in self.fed:
                     self.fed[id(out)] = (out, self.fed[id(word)][1])
+            return out
+
+        def array_value(self, word):
+            """`"${S[@]}"` and zsh's `$S[@]` hold the words normalize_assignments gave S; the base keeps them as text. One
+            element (`${S[1]}`) stays unresolved, as before, so a command name picked from an array is judged as unknown."""
+            if word is None or not word.vars:
+                return word
+            use = r'\$\{([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]\}|%s([A-Za-z_][A-Za-z0-9_]*)%s\[[@*]\]' % (cg.VAR_OPEN, cg.VAR_CLOSE)
+            alts = [re.sub(use, lambda m: cg.VAR_OPEN + (m.group(1) or m.group(2)) + cg.VAR_CLOSE, a) for a in word.alts]
+            if alts == word.alts:
+                return word
+            out = cg.Word()
+            out.alts, out.subs, out.vars, out.glob, out.quoted, out.raw = alts, word.subs, word.vars, word.glob, word.quoted, word.raw
+            out.dynamic = word.dynamic
             return out
 
         def bind_loop_var(self, words):
@@ -775,6 +1099,7 @@ def make_analyzer_class(cg):
                 self.ctx.vars.pop(words[1].text, None)
 
         def inner_words(self, words, depth, pl, idx, via_xargs=False):
+            words = self.drop_empty_head(words)  # K=(); sudo "${K[@]}" find ... -exec ...: find runs
             if via_xargs:
                 self.xargs += 1
             try:
@@ -810,6 +1135,14 @@ def make_analyzer_class(cg):
             if host is not None and host + 1 < len(texts) and texts[host + 1] == '--':
                 args = args[:host + 1] + args[host + 2:]  # `mosh host -- cmd`, `ssh host -- cmd`
             self.remote += 1
+            # OpenSSH keeps reading options after the destination (`ssh dev2 -o HostName=prod kill 4242` reroutes),
+            # so an option word right after the host (anything but `--`) also makes the hop non-literal (review round 2).
+            after = args[host + 1] if host is not None and host + 1 < len(args) else None
+            literal = (host is not None and not _unliteral(args[host]) and not any(_unliteral(a) for a in args[:host])
+                       and plain_ssh_hop(texts, host)
+                       and not (after is not None and (_unliteral(after)  # `$(echo -o)` expands to an option word
+                                                       or (after.text.startswith('-') and after.text != '--'))))
+            self.remote_hosts.append(texts[host] if literal else None)
             try:
                 result = super().ssh(args, depth)
                 host = self._ssh_host_index(texts)
@@ -818,6 +1151,7 @@ def make_analyzer_class(cg):
                 return result
             finally:
                 self.remote -= 1
+                self.remote_hosts.pop()
 
         def container(self, name, args, words, depth, pl, idx):
             self.remote += 1
@@ -828,13 +1162,13 @@ def make_analyzer_class(cg):
 
         def apply(self, name, words, cmd, pl, idx, depth):
             if words[0].vars and name.endswith(']'):
-                name = re.sub(r'\[[^\]]*\]$', '', name)  # zsh subscript on an array head: $K[1], $K[@]
+                name = re.sub(r'\[[^\]]*\]$', '', name)  # zsh subscript on an array head: $K[1]
             if name.startswith('g') and name[1:] in GNU_PREFIXED:
                 return self.apply(name[1:], words, cmd, pl, idx, depth)  # Homebrew coreutils: gtimeout, gxargs ...
             args = words[1:]
-            if name in ('command', 'builtin', 'type', 'which', 'whereis', 'hash') and (
+            if name in ('command', 'builtin', 'type', 'which', 'whereis', 'hash') and not words[0].vars and (
                     name in ('type', 'which', 'whereis', 'hash') or leading_lookup(args)):
-                return None  # asks where a program is; runs nothing
+                return None  # asks where a program is; runs nothing. Not for a held name: K=(env); (K=(which)); "${K[@]}"
             if name in ('export', 'declare', 'local', 'readonly', 'typeset'):
                 for a in args:
                     if '=' in a.text and not a.dynamic and not a.text.startswith('-'):
@@ -888,8 +1222,11 @@ def make_analyzer_class(cg):
                 if w.text.startswith(('--split-string=', '-S')) and len(w.text) > 2 and name == 'env':
                     self.script(w.text.split('=', 1)[1] if '=' in w.text else w.text[2:], depth + 1)
                 prev = args[i - 1].text if i else ''
-                value_of_other_option = prev.startswith('-') and prev not in RUN_OPTS and name not in LAUNCHERS \
-                    and not re.fullmatch(r'-[A-Za-z]*c', prev)
+                # `--command` runs a command only for su and runuser; `wrangler d1 execute --command "SELECT count(*)"`
+                # takes SQL. A value that mentions a kill verb is still re-read as a command line.
+                sql_like = prev == '--command' and name not in ('su', 'runuser') and not KILLISH.search(w.text)
+                value_of_other_option = prev.startswith('-') and (prev not in RUN_OPTS or sql_like) \
+                    and name not in LAUNCHERS and not re.fullmatch(r'-[A-Za-z]*c', prev)
                 if (' ' in w.text.strip() or ';' in w.text) and not w.text.startswith('-') \
                         and name not in ('xargs', 'parallel') and not value_of_other_option:
                     if remote:
@@ -917,7 +1254,7 @@ def make_analyzer_class(cg):
                 self.block('dynamic-head', 'positional parameters run a command and the input mentions kill')
             if head.dynamic:
                 hints = ' '.join(self.ctx.var_hints.values()) + ' ' + ' '.join(head.subs) + ' ' + ' '.join(
-                    self.ctx.vars.get(v, '') for v in head.vars)  # ${K[@]} reads a variable the guard does know
+                    self.ctx.vars.get(v, '') for v in head.vars)  # ${K:-x} reads a variable the guard does know
                 try:
                     hints += ' ' + cg.decode_ansi(hints)
                 except Exception:  # noqa: BLE001
@@ -966,7 +1303,8 @@ def make_analyzer_class(cg):
                 if rest:
                     self.inner_words(args[args.index(rest[0]):], depth, pl, idx)
             elif name in cg.INTERPRETERS or INTERPRETER_NAME.fullmatch(name):
-                self.check_interpreter(name, texts, cmd)
+                if not self.is_ah_kill(name, args, cmd, depth) and not self.is_harness_cli(name, args, cmd, depth):
+                    self.check_interpreter(name, texts, cmd)
             self.check_spawn(name, args, texts, depth, pl, idx)
             self.check_text_runners(name, args, texts, cmd, depth)
 
@@ -1039,6 +1377,89 @@ def make_analyzer_class(cg):
             if hit:
                 self.block('indirect-kill', '`%s` runs a kill verb on targets the guard cannot list' % name)
 
+        def is_harness_cli(self, name, args, cmd, depth):
+            """`python3 [-I|-B|-u] ~/.claude/hooks/{ah,wal_note,provenance}.py ...`: the words after the script are
+            data for that script, so a note or search text that mentions kill is not signalling. `ah.py kill` is
+            excluded (is_ah_kill decides it), and so is any assignment prefix, quoted head or other script."""
+            if not name.startswith('python') or not INTERPRETER_NAME.fullmatch(name) or self.remote or depth:
+                return False
+            words = getattr(cmd, 'words', None) or []
+            if not words or words[0].raw is None or words[0].raw != name:
+                return False
+            i = 0
+            while i < len(args) and args[i].text in ('-I', '-B', '-u'):
+                i += 1
+            if i >= len(args) or not hook_script_ok(args[i].raw, ('ah', 'wal_note', 'provenance')):
+                return False
+            if args[i].text.endswith('/ah.py'):
+                # only a known non-kill subcommand (optionally after the top-level --text) makes the rest data
+                rest = [a.text for a in args[i + 1:]]
+                if rest[:1] == ['--text']:
+                    rest = rest[1:]
+                if not rest or rest[0] not in AH_SUBCOMMANDS:
+                    return False
+            return True
+
+        def is_ah_kill(self, name, args, cmd, depth):
+            """True only for the literal form `python3 [-I|-B|-u] ~/.claude/hooks/ah.py kill --pid N[,N] --reason R
+            [--tree] [--grace S] [--host H] [--agent A] [--session S]`. ah kill audits every pid and refuses
+            system, other-user, GUI and ancestor processes itself, so the guard only has to prove the form is
+            literal: no variable, substitution, glob, heredoc, `-c`, eval or second script. Anything else
+            returns False and is judged by the ordinary interpreter rules."""
+            if not INTERPRETER_NAME.fullmatch(name) or not name.startswith('python') or self.remote or depth:
+                return False
+            if any(getattr(r, 'body', None) or getattr(r, 'op', '').startswith('<') for r in getattr(cmd, 'redirs', [])):
+                return False
+            if any(a.dynamic or a.subs or a.glob for a in args):
+                return False
+            words = getattr(cmd, 'words', None) or []
+            if not words or words[0].raw is None or words[0].raw != name:
+                return False  # an assignment prefix (PYTHONPATH=x python3 ...) or a quoted head
+            texts = [a.text for a in args]
+            if not texts or texts[0] != '-I':
+                return False  # isolated mode ignores PYTHONPATH and user site, so a planted module cannot run first
+            i = 1
+            while i < len(texts) and texts[i] in ('-B', '-u'):
+                i += 1
+            # the raw word is matched: a quoted '~' is a literal directory, and .text has HOME expanded
+            if i + 1 >= len(texts) or not hook_script_ok(args[i].raw, ('ah',)) or texts[i + 1] != 'kill':
+                return False
+            if texts[i + 2:] in (['--help'], ['-h']):
+                return True  # usage text only: ah.py prints it and exits before any process is touched
+            rest, i, seen = texts[i + 2:], 0, set()
+            while i < len(rest):
+                t = rest[i]
+                key, eq, val = t.partition('=') if t.startswith('--') else (t, '', '')
+                if key in ('--tree', '--foreign') and not eq:
+                    seen.add(key)
+                    i += 1
+                    continue
+                if key not in ('--pid', '--reason', '--grace', '--host', '--agent', '--session'):
+                    return False
+                if not eq:
+                    if i + 1 >= len(rest):
+                        return False
+                    val, i = rest[i + 1], i + 1
+                i += 1
+                if key in seen:
+                    return False
+                seen.add(key)
+                if key == '--pid':
+                    if not PID_OPT_VALUE.fullmatch(val) or any(int(p) <= 1 for p in val.split(',')):
+                        return False
+                elif key == '--reason':
+                    if not val.strip():
+                        return False
+                elif key == '--grace':
+                    if not re.fullmatch(r'[0-9]{1,3}(?:\.[0-9]{1,2})?', val):
+                        return False
+                elif key == '--host':
+                    if val not in ('dev2', 't2-dev', 'ah-mac-mini'):
+                        return False
+                elif not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', val):
+                    return False
+            return '--pid' in seen and '--reason' in seen
+
         def check_interpreter(self, name, texts, cmd):
             body = ' '.join(texts)
             for redir in getattr(cmd, 'redirs', []):
@@ -1046,10 +1467,18 @@ def make_analyzer_class(cg):
                     body += '\n' + redir.body
                 elif redir.op == '<<<' and redir.target is not None:
                     body += '\n' + redir.target.text
-            body = body.replace('kill_guard', '')
+            body = body.replace('kill_guard', '').replace('kill-guard', '')  # the guard's own name
+            if name.startswith('python') and '-c' in texts and texts.index('-c') + 1 < len(texts):
+                code = texts[texts.index('-c') + 1]
+                if pure_data_python(code):  # a program that only formats data: prose in literals is not signalling
+                    body = body.replace(code, PY_LITERAL.sub("''", code), 1)
             body = re.sub(r'\b(?:os|process)\.kill\(\s*[\w.]+(?:\(\))?\s*,\s*0\s*\)', '', body)  # liveness probe
             if self.script_kill is not None and self.script_kill.search(body):
-                self.block('script-kill', 'interpreter code signals processes the guard cannot check')
+                if 'ah.py' in body and ' kill' in body:
+                    self.block('script-kill', 'the audited stop is `python3 -I ~/.claude/hooks/ah.py kill --pid N --reason R '
+                                              '[--host H] [--foreign]` (literal words, with -I; remote hosts via --host, not ssh)')
+                else:
+                    self.block('script-kill', 'interpreter code signals processes the guard cannot check')
 
         def check_netwatch(self, args):
             texts = [a.text for a in args]
@@ -1090,6 +1519,18 @@ def make_analyzer_class(cg):
                 self.block('netwatch-broad', 'netwatch orphans --kill is allowed only as --pid N[,N...] (%s); '
                            '--all, --force and --match need the user' % bad)
 
+        def remote_spawn_ok(self, pids):
+            """`ssh HOST kill [-SIG] PID...` passes only when this is a single literal ssh hop (no container, no
+            nested hop) and every PID is in HOST's spawn ledger with the start time the host still reports."""
+            host = self.remote_hosts[-1] if len(self.remote_hosts) == 1 else None
+            if self.remote != 1 or not host or not pids:
+                return False, 'kill on a remote host or container cannot be checked for ownership'
+            for pid in dict.fromkeys(pids):
+                ok, why = remote_spawned(host, pid, self.own.home)
+                if not ok:
+                    return False, 'pid %d on %s: %s' % (pid, host, why)
+            return True, ''
+
         def check_kill(self, args, pl, idx):
             error, signal, targets = parse_kill_words(args, self.remote)
             if error:
@@ -1127,8 +1568,9 @@ def make_analyzer_class(cg):
             if probe and not problems:
                 return
             if self.remote:
-                self.block('remote-kill', 'kill on a remote host or container cannot be checked for ownership',
-                           pids)
+                ok, reason = self.remote_spawn_ok(pids)
+                if not ok:
+                    self.block('remote-kill', reason, pids)
                 return
             for pid in dict.fromkeys(pids):
                 ok, code, detail = self.own.check(pid)
@@ -1259,8 +1701,10 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
         return 'allow', '', '', ()
     rule, reason, pids = findings[0]
     message = block_message(rule, reason)
-    if len(findings) > 1:
-        message = one_line(message + ' (%d more)' % (len(findings) - 1), 520)
+    if len(findings) > 1:  # name every finding, so the blocked command can be fixed in one pass
+        also = '; '.join('[%s] %s' % (r, one_line(t, 160)) for r, t, _p in findings[1:9])
+        more = ' (+%d more)' % (len(findings) - 9) if len(findings) > 9 else ''
+        message = one_line(message + ' Also found: ' + also + more, 1600)
     if policy['mode'] == 'warn':
         return 'warn', rule, message.replace('BLOCKED', 'WARNING'), pids
     audit(rule, raw, pids, home)
@@ -1410,12 +1854,14 @@ def spawn_main(argv):
     The guard only believes the ledger for PIDs it started itself: spawn takes a command, never a PID."""
     log = None
     args = list(argv)
+    if args[:1] == ['--host'] and len(args) >= 2:
+        return spawn_remote_main(args[1], args[2:])
     if args[:1] == ['--log'] and len(args) >= 2:
         log, args = args[1], args[2:]
     if args[:1] == ['--']:
         args = args[1:]
     if not args:
-        sys.stderr.write('usage: kill_guard.py spawn [--log FILE] -- CMD [ARGS...]\n')
+        sys.stderr.write('usage: kill_guard.py spawn [--host HOST] [--log FILE] -- CMD [ARGS...]\n')
         return 2
     cwd = os.getcwd()
     root, _nested = find_worktree(cwd)

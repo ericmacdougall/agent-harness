@@ -645,6 +645,12 @@ class GitBackstop(Fixture):
     def test_missing_script_never_breaks_commits(self):
         copy = self.root / "hooks-copy"
         shutil.copytree(HOOKS, copy)
+        # AGENT_HARNESS_POLICY_LOCAL is inert for a script outside a source checkout
+        # (_override_allowed), so give the copy the same profile as the production local
+        # overlay beside the script: the backstop must be able to block before its
+        # script goes missing, or the missing-script half proves nothing.
+        shutil.copy(Path(__file__).resolve().parent / "data" / "policy_profile_fixture.json",
+                    copy / cp.LOCAL_PROFILE_NAME)
         git("config", "--global", "hook.agent-harness-commit-policy.event", "commit-msg", cwd=self.repo, env=self.env)
         git("config", "--global", "hook.agent-harness-commit-policy.command",
             cp.git_hook_command(copy / "commit_policy.py"), cwd=self.repo, env=self.env)

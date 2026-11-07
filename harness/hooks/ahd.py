@@ -41,6 +41,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import ahd_peek as peek  # noqa: E402
+import liveness  # noqa: E402
 
 SOURCE = "ahd"
 OPEN_STATES = ("open", "assigned", "in_progress", "blocked")
@@ -108,6 +109,7 @@ def load_policy(path=None) -> dict:
     return pol
 
 
+MESSAGE_MAX = 400  # characters of an alert message handed to `ah alert raise`
 OUTPUT_CAP = 32 << 20  # bytes accepted from one child; a child past it is killed, never buffered
 
 
@@ -344,6 +346,11 @@ def liveness_alerts(owner_docs: dict, policy: dict) -> dict:
             sev = LIVENESS_SEVERITY.get(r.get("state"))
             if not sev or r.get("owner") is not True:  # ahd only raises rows ah marks as owners
                 continue
+            # same rule as `ah owners` undisposed: a live disposition (named wait, resume, closed, reassignment to a
+            # live owner) excuses the row unless ah still marks it decision_required
+            disp = r.get("disposition")
+            if isinstance(disp, dict) and disp.get("live") is True and r.get("decision_required") is not True:
+                continue
             idle = r.get("idle_s") if isinstance(r.get("idle_s"), int) else None
             if sev == "high" and idle is not None and idle >= crit:
                 sev = "critical"
@@ -353,7 +360,7 @@ def liveness_alerts(owner_docs: dict, policy: dict) -> dict:
                 what = ""
             ticket = r.get("ticket") if isinstance(r.get("ticket"), str) else None
             since = parse_ts(r.get("last_activity")) or 0
-            if not re.match(r"^a[0-9a-f]{6,32}$", r["agent_id"]):
+            if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", r["agent_id"]):  # agents, auto-<hash> owners and task WALs
                 continue
             typ = r.get("type") if isinstance(r.get("type"), str) else "?"
             if peek.value_excluded([typ, ticket], policy):
@@ -402,6 +409,88 @@ def ask_alerts(asks: list, policy: dict, ts: float) -> dict:
     return out
 
 
+def deadline_alerts(owner_docs: dict, ts: float) -> dict:
+    """G3: deadline:<id>:due (warning, within 1 h) and deadline:<id>:missed (high, stop_block) from `ah owners`."""
+    out = {}
+    for session, doc in sorted(owner_docs.items()):
+        for d in (doc or {}).get("deadlines") or []:
+            if not isinstance(d, dict) or d.get("state") not in ("due", "missed"):
+                continue
+            sev = "high" if d["state"] == "missed" else "warning"
+            out[f"deadline:{d['id']}:{d['state']}"] = {
+                "severity": sev, "class": "deadline", "kind": "deadline", "subject": d["id"], "since": int(d.get("due") or ts),
+                "message": f"deadline {d['state']} {d.get('due_iso')} for {d.get('ref')} (owner {d.get('owner')}): {str(d.get('note') or '')[:120]}",
+                "detail": {"session": session[:8], "deadline": d["id"], "ref": d.get("ref"), "owner": d.get("owner"),
+                           "stop_block": d["state"] == "missed"}}
+    return out
+
+
+def wal_ask_alerts(pending: list, ts: float) -> dict:
+    """P16 (goodqa#14791 I16): open WAL asks escalate on the bounded schedule in ask_reminders: stage 0 info,
+    stage 1 warning, stage 2+ high, so the ring (transitions on severity rise), the prompt context and the digest
+    re-surface them without a loop; a resolved ask is not in `pending`, so its alert clears."""
+    import ask_reminders  # noqa: PLC0415 - installed beside ahd
+    out = {}
+    for a in pending:
+        opened = a.get("at") or 0.0
+        stage = ask_reminders.stage_at(float(opened), ts) if opened else None
+        if stage is None:
+            continue
+        sev = "info" if stage == 0 else "warning" if stage == 1 else "high"
+        out[f"ask:{a['id']}:due"] = {"severity": sev, "class": "ask", "kind": "ask-due", "subject": a["id"], "since": int(opened),
+                                     "message": f"ask {a['id']} awaits the user (reminder {stage + 1}): {a.get('text', '')}"[:300],
+                                     "detail": {"ask": a["id"], "session": a.get("session"), "stage": stage,
+                                                "stop_block": False}}
+    return out
+
+
+def current_sessions(sessions: list, policy: dict, ts: float) -> set:
+    """8-char ids of main sessions whose WAL moved within ask_current_window_seconds: their asks alert one by one."""
+    window = policy.get("ask_current_window_seconds", 3600)
+    out = set()
+    for s in sessions:
+        try:
+            if ts - os.lstat(home() / ".claude" / "wals" / s / "main.jsonl").st_mtime <= window:
+                out.add(s[:8])
+        except OSError:
+            continue
+    return out
+
+
+def ask_digest(flags: dict, current: set, ts: float, policy: dict = None) -> dict:
+    """Keep individual ask alerts for WAL asks from a current session, WAL asks younger than ask_individual_age_seconds
+    (default 3 h, past the last ask_reminders severity step, so P16 escalation still raises per ask), and the ledger
+    error. Fold every other ask alert into one ask:digest per host at the highest folded severity.
+    A folded ask is still open: its own key clears but the digest counts it and lists up to 8 ids; the clear of an
+    ask:<id>:due key therefore means "folded or answered", and `ah`/provenance asks remain the record.
+    Trade-off: once the digest is high, a newly folded ask changes only its count and text, refreshed under the
+    plan_transitions rate limit; it is not a fresh raise."""
+    young = (policy or {}).get("ask_individual_age_seconds", 3 * 3600)
+    out, folded = {}, []
+    for k, f in flags.items():
+        d = f.get("detail") or {}
+        if k == "ask:ledger:error" or d.get("session") in current or (
+                f.get("kind") == "ask-due" and ts - (f.get("since") or 0) < young):
+            out[k] = f
+        else:
+            folded.append((k, f))
+    if folded:
+        kinds = {}
+        for k, _ in folded:
+            kind = k.rsplit(":", 1)[-1]
+            kinds[kind] = kinds.get(kind, 0) + 1
+        sev = max((f["severity"] for _, f in folded), key=lambda v: SEV.get(v, 0))
+        ids = sorted({str((f.get("detail") or {}).get("ask") or f.get("subject")) for _, f in folded})
+        out["ask:digest"] = {
+            "severity": sev, "class": "ask", "kind": "ask", "subject": "digest",
+            "since": int(min((f.get("since") or ts) for _, f in folded)),
+            "message": (f"{len(ids)} open ask(s) outside the current session ("
+                        + ", ".join(f"{n} {kind}" for kind, n in sorted(kinds.items())) + "): "
+                        + ", ".join(ids[:8]) + (" ..." if len(ids) > 8 else ""))[:300],
+            "detail": {"asks": len(ids), "kinds": kinds, "stop_block": False}}
+    return out
+
+
 def ring_wrap_alert(events: list, ts: float, hostname: str) -> dict:
     """The ring holds 1024 transitions. Full and its oldest entry under an hour old means it wraps more than once
     an hour, so raises can vanish before anyone reads them (review item 7)."""
@@ -415,8 +504,10 @@ def ring_wrap_alert(events: list, ts: float, hostname: str) -> dict:
                           "message": f"alert ring on {hostname} wraps more than once an hour", "detail": {}}}
 
 
-def plan_transitions(desired: dict, ring: dict, hold=frozenset()) -> list:
-    """Deterministic diff: [(op, key, flag, ring_event)]. Keys in `hold` get no transition at all this tick."""
+def plan_transitions(desired: dict, ring: dict, hold=frozenset(), now=None) -> list:
+    """Deterministic diff: [(op, key, flag, ring_event)]. Keys in `hold` get no transition at all this tick.
+    `now` also refreshes an active alert whose ring text no longer matches, or lowers its severity, marked
+    detail.updated and rate limited by liveness. A rise is never delayed. Every raise carries the text's marks."""
     ops = []
     for k in sorted(desired):
         if k in hold:
@@ -424,8 +515,16 @@ def plan_transitions(desired: dict, ring: dict, hold=frozenset()) -> list:
         f = desired[k]
         cur = ring.get(k)
         active = cur is not None and cur.get("event") == "raise"
-        if not active or SEV.get(f["severity"], 0) > SEV.get(cur.get("severity"), 0):
-            ops.append(("raise", k, f, cur))
+        marks = liveness.alert_marks(f.get("message"))
+        new_sev, old_sev = SEV.get(f["severity"], 0), SEV.get(cur.get("severity"), 0) if active else 0
+        if not active or new_sev > old_sev:
+            ops.append(("raise", k, dict(f, detail={**(f.get("detail") or {}), **marks}), cur))
+        elif now is not None:
+            at = parse_ts(cur.get("at")) or 0
+            lower = new_sev < old_sev and now - at >= liveness.ALERT_REFRESH_MIN_S
+            if lower or (new_sev == old_sev and liveness.ring_text_stale(cur.get("detail"), cur.get("message"),
+                                                                         f.get("message"), at, now)):
+                ops.append(("raise", k, dict(f, detail={**(f.get("detail") or {}), **marks, "updated": True}), cur))
     for k in sorted(ring):
         if k in hold:
             continue
@@ -554,7 +653,10 @@ class Daemon:
         events = read_ring()
         desired = {}
         desired.update(liveness_alerts(docs, self.policy))
-        desired.update(ask_alerts(asks, self.policy, ts))
+        ask_flags = dict(ask_alerts(asks, self.policy, ts))
+        ask_flags.update(wal_ask_alerts(pending, ts))
+        desired.update(ask_digest(ask_flags, current_sessions(sessions, self.policy, ts), ts, self.policy))
+        desired.update(deadline_alerts(docs, ts))
         desired.update(ring_wrap_alert(events, ts, self.host))
         desired.update(wal_unsafe_alerts(blocked, ts))
         ring = ring_state(events, SOURCE, self.host)
@@ -569,21 +671,22 @@ class Daemon:
         if bad & {"sessions", "owners"}:
             hold |= {k for k in ring if k.startswith("liveness:") and k not in desired}
         if "asks" in bad or any("error" in a for a in asks):
-            hold |= {k for k in ring if k.startswith("ask:") and k not in desired}
-        plan = plan_transitions(desired, ring, frozenset(hold))
+            # the digest is built from partial data then: hold it too, never lower or rewrite it on missing data
+            hold |= {k for k in ring if k.startswith("ask:") and (k not in desired or k == "ask:digest")}
+        plan = plan_transitions(desired, ring, frozenset(hold), now=ts)
         sent = step("alerts", lambda: self.send(plan, deadline)) or 0
         step("spool", lambda: self.call("spool drain", [], deadline))
         summary.update(sessions=len(sessions), owners=sum(len((d or {}).get("owners") or []) for d in docs.values()),
                        asks_open=sum(1 for a in asks if a.get("state") in OPEN_STATES),
                        wal_asks_open=len(pending), desired=len(desired), transitions=len(plan), sent=sent,
-                       unowned=sorted(k for k in desired if k.endswith(":unowned")),
+                       unowned=sorted(k for k in ask_flags if k.endswith(":unowned")),  # before folding
                        dropped=sorted(k for k, f in desired.items() if (f.get("detail") or {}).get("state") == "DROPPED"),
                        silent=sorted(k for k, f in desired.items()
                                      if (f.get("detail") or {}).get("state") in ("SILENT", "SILENT-HIGH")),
                        wall_s=round(mono() - mt, 3))
         if summary["skipped"]:
             log.warning("tick %s over budget; skipped %s", self.tick_no, ",".join(summary["skipped"]))
-        self.last = {"summary": summary, "desired": desired, "wal_asks": pending}
+        self.last = {"summary": summary, "desired": desired, "wal_asks": pending, "ask_flags": ask_flags}
         return summary
 
     def run_checks(self, deadline: float):
@@ -609,7 +712,7 @@ class Daemon:
     def owner_docs(self, sessions: list, deadline: float) -> dict:
         docs = {}
         for s in sessions:
-            rc, doc = self.call("owners", ["--session", s], deadline)
+            rc, doc = self.call("owners", ["--session", s, "--all"], deadline)  # ahd needs every row, not the recent view
             if rc == 0 and isinstance(doc, dict) and isinstance(doc.get("owners"), list):
                 docs[s] = doc
         return docs
@@ -619,13 +722,17 @@ class Daemon:
             since = parse_ts((cur or {}).get("at")) or (cur or {}).get("seq", 0)
             kind = key.split(":", 1)[0]
             return write_key(self.host, kind, key.split(":", 1)[-1], "clear" + extra, since)
+        if (flag.get("detail") or {}).get("updated"):  # one ring write per distinct text, not one per alert
+            extra = "-u" + hashlib.sha256(str(flag.get("message", "")).encode()).hexdigest()[:8] + extra
+        if cur and cur.get("event") == "raise":  # text or severity can return to an earlier value: the row it replaces
+            extra = f"-s{cur.get('seq', 0)}" + extra  # tells those writes apart, and a retry repeats the same key
         return write_key(self.host, flag.get("kind") or key.split(":", 1)[0], flag.get("subject") or key,
                          f"raise-{flag['severity']}{extra}", flag.get("since", 0))
 
     def alert_args(self, op: str, key, flag, source, cur=None, extra: str = "") -> list:
         args = ["--alert-key", str(key), "--source", source, "--key", self.key_for(op, key, flag or {}, cur, extra)]
         if op == "raise":
-            args += ["--severity", flag["severity"], "--message", str(flag.get("message", ""))[:400]]
+            args += ["--severity", flag["severity"], "--message", str(flag.get("message", ""))[:MESSAGE_MAX]]
             detail = dict(flag.get("detail") or {})
             if extra:
                 detail["reasserted"] = True
@@ -666,6 +773,8 @@ class Daemon:
     def ticket_comment(self, key: str, flag: dict, deadline: float) -> None:
         """High/critical owner alerts also go to the task's own ticket, through ah, from the Mac only."""
         ticket = (flag.get("detail") or {}).get("ticket")
+        if (flag.get("detail") or {}).get("updated"):
+            return
         if not ticket or flag.get("class") != "liveness" or flag["severity"] not in ("high", "critical") \
                 or not self.posts_goodqa():
             return
@@ -758,6 +867,11 @@ def install(apply: bool) -> int:
         print(f"{'write' if apply else 'would write'} {p}")
         if apply:
             p.parent.mkdir(parents=True, exist_ok=True)
+            if p.exists():  # never overwrite a unit without a copy to roll back to
+                import shutil  # noqa: PLC0415
+                backup = p.with_name(p.name + ".bak-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+                shutil.copy2(p, backup)  # a unit file is small; copy2 keeps the daemon's read bound rule intact
+                print(f"backup {backup}")
             tmp = p.with_name(p.name + ".tmp")
             tmp.write_text(body)
             os.replace(tmp, p)
@@ -773,6 +887,27 @@ def install(apply: bool) -> int:
     return 0
 
 
+def uninstall(apply: bool) -> int:
+    """Stop the service and remove its unit; backups (.bak-*) stay."""
+    files = unit_files(Path(__file__).resolve())
+    if sys.platform == "darwin":
+        cmds = [["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"]]
+    else:
+        cmds = [["systemctl", "--user", "disable", "--now", "ahd.service"], ["systemctl", "--user", "daemon-reload"]]
+    for c in cmds:
+        print(("run " if apply else "would run ") + " ".join(c))
+        if apply:
+            subprocess.run(c, stdin=subprocess.DEVNULL, check=False)
+    for p in files:
+        print(f"{'remove' if apply else 'would remove'} {p}")
+        if apply:
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+    return 0
+
+
 # ---------------------------------------------------------------- CLI
 
 def main(argv=None) -> int:
@@ -783,9 +918,13 @@ def main(argv=None) -> int:
     sp.add_parser("report", help="one tick, then print the unowned / dropped / silent lists")
     i = sp.add_parser("install")
     i.add_argument("--apply", action="store_true")
+    un = sp.add_parser("uninstall", help="stop the service and remove its unit (backups stay)")
+    un.add_argument("--apply", action="store_true")
     a = ap.parse_args(argv)
     if a.cmd == "install":
         return install(a.apply)
+    if a.cmd == "uninstall":
+        return uninstall(a.apply)
     if a.cmd is None and not a.once:
         ap.print_help()
         return 2
@@ -798,7 +937,7 @@ def main(argv=None) -> int:
         out = {"summary": {k: v for k, v in s.items() if k not in ("unowned", "dropped", "silent")},
                "dropped": [d.last["desired"][k]["message"] for k in s["dropped"]],
                "silent": [d.last["desired"][k]["message"] for k in s["silent"]],
-               "unowned": [d.last["desired"][k]["message"] for k in s["unowned"]],
+               "unowned": [d.last["ask_flags"][k]["message"] for k in s["unowned"]],
                "waiting_on_user": [f"{w['id']} ({w['session']}): {w['text']}" for w in d.last["wal_asks"]],
                "would_write": d.dry_writes}
         print(json.dumps(out, indent=1))

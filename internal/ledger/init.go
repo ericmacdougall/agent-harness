@@ -7,12 +7,15 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ericmacdougall/agent-harness/internal/ledger/fold"
 	"github.com/ericmacdougall/agent-harness/internal/ledger/op"
 	"github.com/ericmacdougall/agent-harness/internal/ledger/store"
 	"github.com/ericmacdougall/agent-harness/internal/ledger/writer"
+	"github.com/ericmacdougall/agent-harness/internal/proc"
 	"github.com/ericmacdougall/agent-harness/internal/pycompat"
 	"github.com/ericmacdougall/agent-harness/internal/safefs"
 )
@@ -164,15 +167,26 @@ func Init(loc Location, o InitOptions) (*Ledger, error) {
 		}
 	}
 	err = l.initLocked(rootID, now, o)
-	lk.Close()
 	if err != nil {
-		if _, perr := l.Dir.ReadRegular(projectsFile, 64*1024); inRepo && errors.Is(perr, fs.ErrNotExist) {
-			// Nothing was published, and the project id is new, so nothing else uses its HOME directory:
-			// do not leave it behind.
+		if v := os.Getenv(InitCleanupDelay); v != "" && writer.TestHooksAllowed {
+			if ms, cerr := strconv.Atoi(v); cerr == nil && ms > 0 {
+				time.Sleep(time.Duration(ms) * time.Millisecond)
+			}
+		}
+		// Still under the writer lock: a concurrent init in this repository waits, so its writer.json cannot
+		// be the one removed here, and projects.json is re-read where no one else can publish it.
+		if _, perr := l.Dir.ReadRegular(projectsFile, 64*1024); errors.Is(perr, fs.ErrNotExist) {
+			// Nothing was published, and the project id is new, so nothing else uses its HOME directory
+			// (ledgers/<project>: the mirror of a repository ledger, or the whole repo-less ledger): do not
+			// leave it behind. The repository side is cleaned first.
+			l.removeLeftoverInit()
 			if mdir, merr := MirrorDir(project); merr == nil {
 				os.RemoveAll(filepath.Dir(mdir))
 			}
 		}
+	}
+	lk.Close()
+	if err != nil {
 		l.Close()
 		return nil, err
 	}
@@ -180,6 +194,28 @@ func Init(loc Location, o InitOptions) (*Ledger, error) {
 		l.warn = append(l.warn, "ledger registry entry could not be written: "+err.Error())
 	}
 	return l, nil
+}
+
+// removeLeftoverInit drops what a failed init wrote before projects.json existed: writer.json and the fresh
+// project's writer refs (audit2 F-019, goodqa#15000). Left in place, writer.json maps this checkout's
+// fingerprint to a writer whose registration died with the removed HOME directory, so every retry of init
+// refuses with "not in this account's ledger registry". (A repo-less ledger's whole root is removed after.)
+// The caller holds the writer lock and has seen no projects.json; the project id was minted by this attempt,
+// so every ref under its namespace is its own.
+func (l *Ledger) removeLeftoverInit() {
+	_ = l.Dir.Remove(writer.FileName)
+	refs, _, err := l.Git.Refs()
+	if err != nil {
+		return
+	}
+	prefix := store.RefPrefix + l.Project + "/"
+	for name := range refs {
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		_, _ = proc.Run([]string{"git", "--git-dir=" + l.Root, "update-ref", "-d", name},
+			proc.Options{Env: store.Env(), Timeout: store.LocalTimeout})
+	}
 }
 
 func (l *Ledger) initLocked(rootID string, now int64, o InitOptions) error {

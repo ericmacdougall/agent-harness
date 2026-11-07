@@ -1,0 +1,14 @@
+{
+  "_doc": "Entry for the future rules registry (matrix G08). Keys: id, rule, mechanism, test (Class.method inside tests/test_bg_job.py), test_file, source, enforcement. Same shape as docs/rules/merge-gate.json.",
+  "rules": [
+    {
+      "id": "bg-launch",
+      "rule": "A background launch is reported as started only after bg_job.py launch prints STARTED (PID alive, log exists and grew within the deadline). Chains put && before a success echo, never ; or &. A wait returns the job's real exit status from bg_job.py wait; the last command of a loop, a garbage-collected systemd unit's Result, or a PIPESTATUS read after X=$(a | b) is never evidence.",
+      "mechanism": "Helper harness/hooks/bg_job.py (launch, wait, status; fails closed) plus advisory PreToolUse lint harness/hooks/bg_lint.py (warn only, names bg_job.py; flags success echo after ; or &, wait loops ending in ls/cat/tail, PIPESTATUS after command substitution, and wait loops polling pgrep -f or ps | grep with a pattern that matches the loop's own shell, which never exit). The helper is opt-in, so an agent that does not call it is only warned.",
+      "enforcement": "ALERT-ONLY",
+      "test": "LintCorpora.test_positive_corpus",
+      "test_file": "tests/test_bg_job.py",
+      "source": "ticket:GoodQA goodqa#14513 (matrix Z12), ticket:GoodQA goodqa#14472 (matrix Z11); incident: 'cmd1; nohup suite & echo started' after cmd1 failed, 1.5 h lost, coordinator relay 2026-11-04"
+    }
+  ]
+}

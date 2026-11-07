@@ -8,6 +8,7 @@ KG_HOOKS_DIR points the suite at another directory (for example one without kill
 """
 
 import ast
+import contextlib
 import json
 import os
 import re
@@ -17,6 +18,7 @@ import sys
 import tempfile
 import time
 import unittest
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -110,7 +112,7 @@ def judge_rows(rows, decide_fn):
 
 class GrammarCorpus(WorldCase):
     """The closed kill grammar: every shape that ever got past the guard, plus what must keep working."""
-    SHAPES = {'cc473a3', 'ce11b1e', '1949bbc', 'a9432ef', '4a6982f', 'a03f8ac', 'F6', 'F7', 'F8', 'F9', 'R2', 'R3', 'R3OK', 'R4', 'R5', 'R4OK', 'RR', 'TC', 'AH', 'RROK', 'PKILL', 'OK'}
+    SHAPES = {'WS', 'WV', 'VH', 'WSOK', 'EH', 'EHOK', 'XH', 'cc473a3', 'ce11b1e', '1949bbc', 'a9432ef', '4a6982f', 'a03f8ac', 'F6', 'F7', 'F8', 'F9', 'R2', 'R3', 'R3OK', 'R4', 'R5', 'R4OK', 'RR', 'TC', 'AH', 'RROK', 'PKILL', 'OK', 'ECH', 'ECHOK', 'ENE', 'EHV', 'EHVOK', 'EIF'}
 
     @classmethod
     def setUpClass(cls):
@@ -595,6 +597,7 @@ class Policy(unittest.TestCase):
                     'container': ['self', 'name', 'args', 'words', 'depth', 'pl', 'idx'],
                     'check_tokens': ['self', 'tokens'],
                     'resolve': ['self', 'word'],
+                    'dispatch': ['self', 'words', 'cmd', 'pl', 'idx', 'depth'],
                     'bind_loop_var': ['self', 'words']}
         self.assertEqual(sorted(expected), sorted(kg.OVERRIDDEN))
         for name, params in expected.items():
@@ -740,6 +743,105 @@ class Spawn(unittest.TestCase):
 
     def test_numeric_command_is_not_a_pid_argument(self):
         self.assertEqual(kg.spawn_main([]), 2)
+
+
+class RemoteSpawn(unittest.TestCase):
+    """goodqa#14927: `spawn --host H -- CMD` records (host, pid, start) and only that PID becomes killable through
+    `ssh H kill PID`; every other remote kill stays refused. No ssh runs here (SSH_RUNNER is faked)."""
+
+    START = 'Thu Nov 6 10:00:00 2026'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = os.path.realpath(self.tmp.name)
+        kg.ensure_key(self.home)
+
+    def decide(self, cmd, probe=None):
+        with mock.patch.object(kg, '_remote_start', probe or (lambda host, pid: None)):
+            return kg.decide(cmd, cwd=self.home, home=self.home, policy=POLICY)
+
+    def test_remote_kill_is_refused_without_a_spawn_record(self):
+        verdict, rule, message, pids = self.decide('ssh dev2 kill 4242')
+        self.assertEqual((verdict, rule), ('block', 'remote-kill'))
+        self.assertIn('spawn --host dev2', message)
+
+    def test_spawned_pid_is_killable_only_on_its_host_while_its_start_time_matches(self):
+        kg.append_ledger(kg.remote_root('dev2'), 4242, self.START, home=self.home)
+        same = lambda host, pid: self.START if (host, pid) == ('dev2', 4242) else None  # noqa: E731
+        for cmd in ('ssh dev2 kill 4242', 'ssh dev2 kill -TERM 4242', "ssh dev2 'kill 4242'", 'ssh -p 22 dev2 -- kill 4242',
+                    'ssh -o BatchMode=yes -o ConnectTimeout=3 dev2 kill 4242', 'ssh -q -l eric -p2222 dev2 kill 4242',
+                    'ssh dev2 -- kill 4242'):
+            with self.subTest(cmd):
+                self.assertEqual(self.decide(cmd, same)[0], 'allow', cmd)
+        refused = {'other host': 'ssh t2-dev kill 4242', 'other pid': 'ssh dev2 kill 4243', 'mixed pids': 'ssh dev2 kill 4242 4243',
+                   'container': 'docker exec c kill 4242', 'nested hop': 'ssh gw ssh dev2 kill 4242',
+                   'broad verb': 'ssh dev2 pkill -f tsc', 'variable host': 'ssh $H kill 4242',
+                   'finder': 'ssh dev2 "kill $(pgrep -f tsc)"', 'local kill': 'kill 4242',
+                   # routing options send the kill elsewhere while the ledger and probe name dev2 (review HIGH)
+                   'hostname option': 'ssh -o HostName=prod dev2 kill 4242', 'glued hostname': 'ssh -oHostName=prod dev2 kill 4242',
+                   'config file': 'ssh -F evil.cfg dev2 kill 4242', 'jump': 'ssh -J gw dev2 kill 4242',
+                   'proxyjump': 'ssh -o ProxyJump=gw dev2 kill 4242', 'proxycommand': "ssh -o 'ProxyCommand=nc prod 22' dev2 kill 4242",
+                   'stdio forward': 'ssh -W prod:22 dev2 kill 4242', 'control socket': 'ssh -S ctl dev2 kill 4242',
+                   'variable option': 'ssh -o $OPT dev2 kill 4242', 'unknown flag': 'ssh -A dev2 kill 4242',
+                   # OpenSSH parses options after the destination too (review round 2)
+                   'option after host': 'ssh dev2 -o HostName=prod kill 4242', 'config after host': 'ssh dev2 -F evil.cfg kill 4242',
+                   'jump after host': 'ssh dev2 -J gw kill 4242', 'socket after host': 'ssh dev2 -S ctl kill 4242',
+                   'variable after host': 'ssh dev2 $OPT HostName=prod kill 4242'}
+        # Known pre-existing gap, not this route's: an unquoted `$(...)` word inside an ssh command makes the base
+        # analyzer drop the remote kill entirely (`ssh dev2 $(echo x) kill 4242` is 'allow' on main too); tracked on
+        # GoodQA goodqa#14927 as a base-analyzer finding.
+        for label, cmd in refused.items():
+            with self.subTest(label):
+                self.assertEqual(self.decide(cmd, same)[0], 'block', cmd)
+        # pid reuse or a dead process: the host must still report the recorded start time
+        self.assertEqual(self.decide('ssh dev2 kill 4242', lambda h, p: 'Fri Nov 7 09:00:00 2026')[0], 'block')
+        self.assertEqual(self.decide('ssh dev2 kill 4242', lambda h, p: None)[0], 'block')
+        self.assertEqual(self.decide('ssh dev2 kill 4242', lambda h, p: self.START)[0], 'allow')  # same, whitespace-normalized
+
+    def test_routing_options_held_in_an_array_stay_refused(self):
+        """Delta review F1 (pr96-merge-51a8d87.md): on main 51a8d87 an array kept `"${O[@]}"` as plain text, so the
+        routing options inside it were invisible to the spawn route and these were allowed, killing on another host."""
+        kg.append_ledger(kg.remote_root('dev2'), 4242, self.START, home=self.home)
+        same = lambda host, pid: self.START if (host, pid) == ('dev2', 4242) else None  # noqa: E731
+        self.assertEqual(self.decide('ssh dev2 kill 4242', same)[0], 'allow')  # the ledgered plain form still works
+        for cmd in ('O=(-o HostName=prod); ssh "${O[@]}" dev2 kill 4242',
+                    'O=(-o BatchMode=yes -o HostName=prod); ssh "${O[@]}" dev2 kill 4242',
+                    'O=(-oBatchMode=yes -oHostName=prod); ssh "${O[@]}" dev2 kill 4242',
+                    'X=(-J); ssh "${X[@]}" prod dev2 kill 4242'):
+            with self.subTest(cmd):
+                self.assertEqual(self.decide(cmd, same)[0], 'block', cmd)
+
+    def test_spawn_host_records_the_remote_pid_and_start_time(self):
+        calls = []
+
+        def runner(argv, **kw):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout='4242\nThu Nov  6 10:00:00 2026\n', stderr='')
+
+        with mock.patch.object(kg, 'SSH_RUNNER', runner), mock.patch.object(kg.Path, 'home', return_value=Path(self.home)), \
+                mock.patch.dict(os.environ, {'HOME': self.home}):
+            out = StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(kg.spawn_main(['--host', 'dev2', '--log', '/tmp/tsc.log', '--', 'sh', '-c', 'tsc --noEmit; echo $? > done']), 0)
+        record = json.loads(out.getvalue())
+        self.assertEqual((record['host'], record['pid'], record['start']), ('dev2', 4242, self.START))
+        self.assertEqual(calls[0][:3], ['ssh', '-o', 'BatchMode=yes'])
+        self.assertIn("nohup sh -c 'tsc --noEmit; echo $? > done' >/tmp/tsc.log", calls[0][-1])
+        self.assertEqual(kg.read_ledger(kg.remote_root('dev2'), self.home), [(4242, self.START)])
+        self.assertEqual(kg.read_ledger(kg.remote_root('t2-dev'), self.home), [])
+
+    def test_spawn_host_records_nothing_when_the_host_reports_no_pid(self):
+        def failing(argv, **kw):
+            return subprocess.CompletedProcess(argv, 255, stdout='', stderr='Permission denied')
+
+        with mock.patch.object(kg, 'SSH_RUNNER', failing), mock.patch.object(kg.Path, 'home', return_value=Path(self.home)), \
+                mock.patch.dict(os.environ, {'HOME': self.home}), contextlib.redirect_stderr(StringIO()):
+            self.assertEqual(kg.spawn_main(['--host', 'dev2', '--', 'sleep', '5']), 1)
+            self.assertEqual(kg.spawn_main(['--host', 'dev2;id', '--', 'sleep', '5']), 2)
+            self.assertEqual(kg.spawn_main(['--host', '-oProxyCommand=x', '--', 'sleep', '5']), 2)
+            self.assertEqual(kg.spawn_main(['--host', 'dev2']), 2)
+        self.assertEqual(kg.read_ledger(kg.remote_root('dev2'), self.home), [])
 
 
 class RedTeamRound(WorldCase):

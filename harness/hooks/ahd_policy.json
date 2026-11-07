@@ -1,5 +1,7 @@
 {
   "schema": 1,
+  "mode": "detector",
+  "restart": {"enabled": false, "note": "automatic restart (NEVER-LOSE.md S2) stays off until its blind re-review passes"},
   "tick_seconds": 60,
   "active_seconds": 600,
   "registered_owners": [],

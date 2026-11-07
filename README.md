@@ -48,6 +48,8 @@ With trusted hooks, Stop can request one automatic continuation per session when
 | Review | Claude helper calls Codex Sol when available, with a Claude Opus fallback | Native subagents use the reviewer role; rescue is available for repeated blockers |
 | Delivery | Installed two-phase `deliver.py`, guarded Git helpers, and test watcher | The same delivery helpers and watcher installed under `~/.codex/agent-harness`; no Claude installation required |
 
+Background jobs: `bg_job.py launch|wait|status` reports STARTED only on proof and returns a job's real exit status, and an advisory `bg_lint.py` hook warns on `; echo started`, wait loops ending in `ls`, and `PIPESTATUS` after `$(...)` (see docs/operations.md).
+
 Both editions send small, reversible fixes through a fast path. Substantive work gets an owner per related scope, a separate worktree, semantic WAL notes, relevant failure-first tests, independent review, and live UI/API checks when applicable. Hook records omit prompt text and tool arguments; the main agent still has to inspect evidence. Publication failures do not prevent verified local delivery. Claude's detailed policy is in [HARNESS.md](HARNESS.md), with roles in [harness/agents](harness/agents) and helpers in [harness/hooks](harness/hooks). Codex's workflow is in its [skill](codex/skills/agent-harness/SKILL.md).
 
 ## Claude Code install details

@@ -483,7 +483,11 @@ def make_snapshot(repo: Path, snapshot: Path, head: str, *, base: str | None = N
             raise OSError('reviewed tree contains gitlinks or unsupported entries')
     clashes = diagnostics.path_collisions([e.split('\t', 1)[-1] for e in tree.split('\0') if e])
     if clashes and diagnostics.fs_is_case_insensitive(snapshot.parent):
-        raise OSError('reviewed paths differ only by case or Unicode form on a case-insensitive filesystem')
+        raise OSError('reviewed paths differ only by case or Unicode form on a case-insensitive filesystem: '
+                      + ', '.join(sorted(str(c) for c in clashes)[:5])[:300]
+                      + '. This Mac clone cannot hold both files, so the clean-worktree check cannot pass here; run the '
+                      'review from a case-sensitive worktree (a Linux checkout such as dev2, or a case-sensitive APFS '
+                      'volume), or rename one path in a commit first')
     slow_git(snapshot, 'checkout', '--quiet', '--detach', head)
     if repo_state(snapshot, snapshot=True) != (head, ''):
         raise OSError('snapshot does not match reviewed commit')

@@ -147,12 +147,20 @@ class PolicyTests(unittest.TestCase):
         self.root = Path(self.temp.name)
 
     def test_shipped_policy_lists_the_ticket_locations(self):
-        policy = rd.load_policy()
+        # load_policy() honors AGENT_HARNESS_REVIEW_POLICY; this test is about the shipped file, so drop the override (GoodQA #14556)
+        with patch.dict(os.environ):
+            os.environ.pop(rd.POLICY_ENV, None)
+            policy = rd.load_policy()
         codex = policy['known_install_locations']['codex']
         self.assertIn('/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex', codex)
         self.assertIn('/usr/bin/codex', codex)
         raw = json.loads((HOOKS / 'review_policy.json').read_text())
         self.assertIn('/usr/bin/codex', raw['known_install_locations']['codex'])
+
+    def test_shipped_policy_test_ignores_a_caller_policy_override(self):
+        private = private_file(self.root / 'empty.json', json.dumps({'known_install_locations': {'codex': [], 'claude': []}}), 0o600)
+        with patch.dict(os.environ, {rd.POLICY_ENV: str(private)}):
+            self.test_shipped_policy_lists_the_ticket_locations()
 
     def test_world_or_group_writable_override_is_ignored(self):
         warnings = []
