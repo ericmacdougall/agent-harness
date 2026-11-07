@@ -394,14 +394,24 @@ def _git_push_to_default(seg, start, assigns, appended=False):
     return False
 
 
-FREE_TEXT_COMMANDS = (DATA_COMMANDS - {"less", "more"}) | {"cd", "true", "test", "[", "pwd", "date"}
+# rg --pre, ack --pager, less/more and pytest can run programs; they are not free text here.
+FREE_TEXT_COMMANDS = (DATA_COMMANDS - {"less", "more", "pytest", "py.test", "rg", "ag", "ack"}) | \
+    {"cd", "true", "test", "[", "pwd", "date"}
 KEYWORDS = {"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}"}
 REDIRECTS = {"<", ">", ">>", "<<", "<<-", "<<<", ">&", "&>", ">|", "<&", "<>"}
 SPLITTERS = {";", "&&", "||", "|", "|&", "&", "(", ")", ";;"}
-GH_TEXT = {"issue", "pr", "api", "search", "run", "repo", "release", "label"}
+GH_TEXT = {"issue", "pr", "api", "search"}
 SAFE_GIT_CONFIG = {"core.hookspath=/dev/null"}
-HOOK_SCRIPT = re.compile(r"^(?:~|\$HOME|\$\{HOME\}|%s)/\.claude/hooks/(?:wal_note|ah|commit_policy|provenance|spec_flow)"
-                         r"\.py$" % re.escape(str(Path.home())))
+GIT_TEXT = {"commit", "log", "show", "diff", "status", "add", "grep", "rev-parse", "branch", "tag"}
+# git options that run a program, open an editor or pager, or write a file
+GIT_RISKY = re.compile(r"^(?:-O|--open-files-in-pager|--output|--ext-diff|--textconv|-e$|--edit|--exec|--upload-pack|"
+                       r"--receive-pack|--template|-x$)")
+HOOK_SCRIPT = re.compile(r"^(?:~|%s)/\.claude/hooks/(?:wal_note|ah|commit_policy|provenance|spec_flow)\.py$"
+                         % re.escape(str(Path.home())))
+# assignments that change which program runs or what it loads
+ENV_RISKY = re.compile(r"^(?:HOME|PATH|ENV|BASH_ENV|IFS|CDPATH|PYTHON\w*|LD_\w+|DYLD_\w+|GIT_\w+|GH_\w+|PAGER|EDITOR|"
+                       r"VISUAL|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|XDG_CONFIG_HOME)\+?=")
+WRITE_REDIRECTS = {">", ">>", ">|", "&>", "<>"}
 
 
 def _waiver_text(text):
@@ -409,16 +419,26 @@ def _waiver_text(text):
     return "merge_gate" in plain.lower() and bool(WAIVE_ANY.search(plain))
 
 
-def _simple_commands(tokens):
-    """Split on separators that start a new command; drop each redirection operator with its target word."""
+def _simple_commands(tokens, writes=None):
+    """Split on separators that start a new command; drop each redirection operator with its target word. A redirect
+    whose target is a separator (process substitution) yields an unknown command; `writes` collects file targets."""
     out, cur, i = [], [], 0
     while i < len(tokens):
         t = tokens[i]
         if t in SPLITTERS:
             out.append(cur)
             cur = []
-        elif t in REDIRECTS or re.match(r"^\d+$", t) and i + 1 < len(tokens) and tokens[i + 1] in REDIRECTS:
-            i += 1 if t in REDIRECTS else 0
+        elif t in REDIRECTS:
+            target = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if target in SPLITTERS or not target:
+                out.append(["<process-substitution>"])
+            elif writes is not None and (t in WRITE_REDIRECTS or (t == ">&" and not target.isdigit())):
+                writes.append(target)
+            i += 1
+        elif re.match(r"^\d+$", t) and i + 1 < len(tokens) and tokens[i + 1] in REDIRECTS:
+            pass
+        elif re.match(r"^[;&|()<>]+$", t):
+            out.append(["<operator %s>" % t])  # an operator run the splitter does not know (>( or <( substitution)
         else:
             cur.append(t)
         i += 1
@@ -434,6 +454,8 @@ def _free_text(words):
     if i == len(words):
         return True  # assignments only (their values are checked for substitutions by the caller)
     word, rest = words[i], words[i + 1:]
+    if word == "printf" and any(t.startswith("-v") for t in rest):
+        return False  # printf -v assigns a variable (HOME, PATH)
     if "/" not in word and word in FREE_TEXT_COMMANDS:
         return True
     if word == "gh":
@@ -450,10 +472,8 @@ def _free_text(words):
                 k += 2
             else:
                 return False
-        return k < len(rest) and rest[k] in GIT_PLAIN | {"grep"}
+        return k < len(rest) and rest[k] in GIT_TEXT and not any(GIT_RISKY.match(t) for t in rest[k + 1:])
     if word in ("python3", "python"):
-        if rest[:2] in (["-m", "unittest"], ["-m", "pytest"]):
-            return True
         return bool(rest) and bool(HOOK_SCRIPT.match(rest[0]))
     return False
 
@@ -471,7 +491,7 @@ def _substitutions(token):
 def _waiver_attempt(command, _depth=0):
     """True when the command can run merge_gate's exception record. A subagent command that names merge_gate and an
     exception word is allowed only when every simple command in it is a known free-text form (print, search, git
-    commit/log, a gh issue/pr body, the harness's own note and ticket helpers, a unittest run) and every $( )
+    commit/log, a gh issue/pr body, the harness's own note and ticket helpers) and every $( )
     substitution inside it is free text too. Anything else keeps the old text rule (goodqa#15122 AC-2, NEG-1;
     fixture red-team F4: a deny-list of code runners missed awk, sed, find -exec, make and git aliases)."""
     if not _waiver_text(command):
@@ -484,7 +504,14 @@ def _waiver_attempt(command, _depth=0):
     tokens = _strip_heredocs(tokens)
     if any(t == "$" for t in tokens):
         return True  # an unquoted $( ) substitution
-    for words in _simple_commands(tokens):
+    if any(ENV_RISKY.match(t) for t in tokens):
+        return True  # HOME, PATH, PYTHONPATH and the like change which code a free-text form runs
+    writes = []
+    commands = _simple_commands(tokens, writes)
+    runs_code = any(_command_word(w) in ("git", "python3", "python") for w in commands)
+    if runs_code and (writes or any(_command_word(w) == "tee" for w in commands)):
+        return True  # a file written next to a git or python run could be the hook or script that runs
+    for words in commands:
         if not _free_text(words):
             return True
         for t in words:

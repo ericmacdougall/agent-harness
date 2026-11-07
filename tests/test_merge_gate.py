@@ -910,6 +910,30 @@ class FalsePositives15122(Base):
                 code, text = mg.decide(bash(command, **self.SUB), FakeGh(SCENARIOS["green"]), self.state)
                 self.assertEqual(code, 0, text)
 
+    def test_redteam_f4_allow_list_forms_that_can_run_code_stay_blocked(self):
+        # re-review leads on 3823c5e: options, environment and file writes that turn a free-text form into code.
+        hook = "~/.claude/hooks/wal_note.py --note 'merge_gate waive'"
+        for command in ("rg --pre /h/x merge_gate_waive f", "git log --output=/h/x --grep 'merge_gate waive'",
+                        "git grep -O/h/x 'merge_gate waive'", "git push --receive-pack=/h/x origin feat # merge_gate waive",
+                        "gh run view 1 # merge_gate waive", "gh repo clone o/r # merge_gate waive",
+                        "python3 -m pytest -p evil -k 'merge_gate waive'",
+                        "python3 -m unittest x # merge_gate waive",
+                        "HOME=/x python3 " + hook, "PATH=/x python3 " + hook, "PYTHONPATH=/x python3 " + hook,
+                        "printf -v HOME /x; python3 " + hook, "python3 $HOME/.claude/hooks/wal_note.py --note 'merge_gate waive'",
+                        "echo merge_gate waive >(python3 /h/x)",
+                        "echo merge_gate waive > .git/hooks/pre-commit; git commit -m x",
+                        "echo x | tee " + hook.split(" ")[0] + "; python3 " + hook,
+                        "cd ~/.claude/hooks && cat > wal_note.py <<'EOF'\nx\nEOF\npython3 " + hook):
+            with self.subTest(command):
+                code, text = mg.decide(bash(command, **self.SUB), FakeGh(SCENARIOS["green"]), self.state)
+                self.assertEqual(code, 2, text)
+        for command in ("cat > notes.md <<'EOF'\nmerge_gate waive notes\nEOF",
+                        "python3 ~/.claude/hooks/ah.py ticket comment 'goodqa#1' --body 'merge_gate waive' 2>&1 | tail -3",
+                        "git log -p --grep 'merge_gate waive' | head"):
+            with self.subTest(command):
+                code, text = mg.decide(bash(command, **self.SUB), FakeGh(SCENARIOS["green"]), self.state)
+                self.assertEqual(code, 0, text)
+
     def test_ac2_subagent_free_text_about_the_exception_record_is_allowed(self):
         for command in ("python3 ~/.claude/hooks/wal_note.py --wal /w/a.jsonl --event status "
                         "--note 'fixed the merge_gate.py waive false positive'",
