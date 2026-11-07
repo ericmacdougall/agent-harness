@@ -49,6 +49,10 @@ if argv and argv[0] == "copy":
     if note and "--log-file" in argv:
         with open(argv[argv.index("--log-file") + 1], "a") as h:
             h.write(note + "\\n")
+    drain = float(os.environ.get("FAKE_TERM_DRAIN", "0"))  # rclone's exit handlers commit a batch on SIGTERM
+    if drain:
+        import signal
+        signal.signal(signal.SIGTERM, lambda *_: (time.sleep(drain), sys.exit(143)))
     hang = float(os.environ.get("FAKE_HANG", "0"))  # a pacer wait that ignores --max-duration
     hang_match = os.environ.get("FAKE_HANG_MATCH")
     if hang and (not hang_match or any(hang_match in a for a in argv)):
@@ -928,8 +932,8 @@ class Contention(Case):
 
     def test_a_copy_that_ignores_max_duration_is_stopped_near_the_budget(self):
         start = time.time()
-        done = self.run_script(LOG_BACKUP_BUDGET_SECONDS="25", LOG_BACKUP_DEADLINE_GRACE_SECONDS="3",
-                               FAKE_HANG="90", FAKE_RCLONE_LOG_TEXT="x")
+        done = self.run_script(LOG_BACKUP_BUDGET_SECONDS="40", LOG_BACKUP_DEADLINE_GRACE_SECONDS="3",
+                               LOG_BACKUP_KILL_GRACE_SECONDS="2", FAKE_HANG="90", FAKE_RCLONE_LOG_TEXT="x")
         elapsed = time.time() - start
         self.assertLess(elapsed, 60, "the run must end near its budget, not after the hung copy")
         self.assertNotEqual(done.returncode, 0)
@@ -942,7 +946,8 @@ class Contention(Case):
         for attempt in range(6):
             open(self.calls, "w").close()
             done = self.run_script(LOG_BACKUP_JITTER_SECONDS="2", LOG_BACKUP_BUDGET_SECONDS="300",
-                                   LOG_BACKUP_SLICE_RESERVE_SECONDS="0")
+                                   LOG_BACKUP_SLICE_RESERVE_SECONDS="0", LOG_BACKUP_DEADLINE_GRACE_SECONDS="0",
+                                   LOG_BACKUP_KILL_GRACE_SECONDS="0")
             self.assertEqual(done.returncode, 0, "attempt %d: %s" % (attempt, done.stderr))
             first = self.copies()[0]
             seconds = int(first[first.index("--max-duration") + 1].rstrip("s"))
@@ -951,7 +956,8 @@ class Contention(Case):
     def test_a_hung_projects_copy_leaves_time_for_the_later_tier1_sources(self):
         start = time.time()
         done = self.run_script(LOG_BACKUP_BUDGET_SECONDS="60", LOG_BACKUP_SLICE_RESERVE_SECONDS="10",
-                               LOG_BACKUP_DEADLINE_GRACE_SECONDS="2", FAKE_HANG="300", FAKE_HANG_MATCH=".claude/projects")
+                               LOG_BACKUP_DEADLINE_GRACE_SECONDS="2", LOG_BACKUP_KILL_GRACE_SECONDS="1",
+                               FAKE_HANG="300", FAKE_HANG_MATCH=".claude/projects")
         self.assertLess(time.time() - start, 100)
         log = (self.logs / "log-backup.log").read_text()
         self.assertIn("copy of .claude/projects stopped at the run deadline", log)
@@ -962,12 +968,64 @@ class Contention(Case):
         self.assertNotEqual(done.returncode, 0)  # projects is partial, so the run is still not fresh
 
     def test_a_rate_limited_copy_names_the_cause(self):
+        # Two other uploads to this account and one to a remote whose name merely ends the same way: only the two count.
+        others = [subprocess.Popen(["/bin/bash", "-c", 'exec -a "rclone copy /x %s" sleep 60' % spec])
+                  for spec in ("lessons-dropbox:a", "lessons-dropbox:b", "old-lessons-dropbox:c")]
+        for proc in others:
+            self.addCleanup(proc.wait)
+            self.addCleanup(proc.kill)
         done = self.run_script(FAKE_RCLONE_LOG_TEXT="ERROR : upload failed: too_many_write_operations",
                                FAKE_EXIT_AFTER_NOTE="1", LOG_BACKUP_RETRIES="0")
         self.assertNotEqual(done.returncode, 0)
         log = (self.logs / "log-backup.log").read_text()
         self.assertIn("Dropbox write rate limit", log)
-        self.assertRegex(log, r"other rclone uploads running now: \d+")
+        self.assertIn("other rclone uploads running now: 2 ", log)
+
+    def test_a_copy_that_drains_after_the_stop_signal_is_killed(self):
+        # rclone commits its pending Dropbox batch on SIGTERM with no time limit; under rate limiting that is minutes.
+        start = time.time()
+        done = self.run_script(LOG_BACKUP_BUDGET_SECONDS="40", LOG_BACKUP_DEADLINE_GRACE_SECONDS="2",
+                               LOG_BACKUP_KILL_GRACE_SECONDS="3", FAKE_HANG="300", FAKE_TERM_DRAIN="200",
+                               FAKE_HANG_MATCH=".claude/projects")
+        self.assertLess(time.time() - start, 75, "a copy that ignores SIGTERM must be killed, not waited for")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.last_ok().exists())
+        self.assertIn("copy of .claude/projects stopped at the run deadline", (self.logs / "log-backup.log").read_text())
+
+    def test_every_tier1_source_gets_a_slice_and_the_run_ends_in_its_budget(self):
+        # All 11 tier-1 sources present and every copy hung: each still gets its own slice, and the whole run (stop and
+        # kill grace included) ends inside the budget, so the next scheduled run is never pushed back.
+        for rel in (".claude/history.jsonl", ".codex/history.jsonl", ".agent-harness/work-assignments.json",
+                    ".agent-harness/work-ledger.json", ".agent-harness/work-ledger.events.jsonl",
+                    ".agent-harness/work-ledger.archive.jsonl", ".agent-harness/work-ledger.failures.jsonl",
+                    ".agent-harness/work-ledger.spool.jsonl"):
+            self.put(rel, b"x\n")
+        start = time.time()
+        done = self.run_script(LOG_BACKUP_BUDGET_SECONDS="100", LOG_BACKUP_SLICE_RESERVE_SECONDS="2",
+                               LOG_BACKUP_DEADLINE_GRACE_SECONDS="1", LOG_BACKUP_KILL_GRACE_SECONDS="1",
+                               FAKE_HANG="300", FAKE_TERM_DRAIN="300", LOG_BACKUP_BULK_EVERY_SECONDS="999999")
+        elapsed = time.time() - start
+        log = (self.logs / "log-backup.log").read_text()
+        self.assertNotIn("used up before .agent-harness/work-ledger", log)
+        self.assertIn("copy of .agent-harness/work-ledger.spool.jsonl stopped at the run deadline", log)
+        self.assertLess(elapsed, 100 + 10, "the run overran its budget")
+        self.assertNotEqual(done.returncode, 0)
+
+    def test_the_run_ends_inside_the_schedule_period_whatever_the_start_delay(self):
+        # A long start delay must shrink the copying time rather than push the run past the next scheduled start.
+        start = time.time()
+        self.run_script(LOG_BACKUP_JITTER_SECONDS="0", LOG_BACKUP_BUDGET_SECONDS="300", LOG_BACKUP_PERIOD_SECONDS="70",
+                        LOG_BACKUP_DEADLINE_GRACE_SECONDS="1", LOG_BACKUP_KILL_GRACE_SECONDS="1",
+                        LOG_BACKUP_SLICE_RESERVE_SECONDS="2", FAKE_HANG="300", FAKE_TERM_DRAIN="300")
+        self.assertLess(time.time() - start, 70, "the run outlived its schedule period")
+
+    def test_a_stale_deadline_marker_does_not_mark_a_clean_copy_as_stopped(self):
+        # A watchdog that outlived a killed run leaves its marker; a later copy with that pid must not read it.
+        self.logs.mkdir(parents=True, exist_ok=True)
+        (self.logs / ".log-backup.deadline.stale").write_text("")
+        done = self.run_script()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse((self.logs / ".log-backup.deadline.stale").exists(), "leftover deadline markers are cleared")
 
 
 if __name__ == "__main__":
