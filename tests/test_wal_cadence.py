@@ -90,6 +90,18 @@ class StopInWorktree(Case):
         self.work(lines=60)
         self.assertNudged(self.hook())  # a new diff earns one new nudge
 
+    def test_unwritable_state_never_blocks_and_success_still_suppresses_duplicates(self):
+        # goodqa#15039 (Kimi revised R07): an unrecorded block would repeat on every stop
+        self.work()
+        state_dir = self.home / ".agent-harness/state/wal-cadence"
+        state_dir.parent.mkdir(parents=True, exist_ok=True)
+        state_dir.write_text("not a directory")  # a reliable OSError even when tests run as root
+        self.assertQuiet(self.hook())
+        self.assertQuiet(self.hook())
+        state_dir.unlink()
+        self.assertNudged(self.hook())
+        self.assertQuiet(self.hook())  # durable state still bounds the nudge to once per diff
+
     def test_tracked_change_counts(self):
         (self.wt / "app.py").write_text("".join("y%d = 0\n" % i for i in range(45)))
         self.assertNudged(self.hook(), "app.py")
