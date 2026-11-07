@@ -837,57 +837,117 @@ func scanEnvelope(fields [][2]string) error {
 	return wrap(ErrSecret, "refusing to store secret-shaped text: %s", strings.Join(parts, "; "))
 }
 
-// scanDrafts refuses (or masks) secret-shaped text in every string payload member and the actor label.
+const maxDraftNesting = 32
+
+func scanDraftText(field, text string, redact bool) (string, error) {
+	found := scan.Scan([][2]string{{field, text}})
+	if len(found) == 0 {
+		return text, nil
+	}
+	if !redact {
+		parts := make([]string, len(found))
+		for j, f := range found {
+			parts[j] = f.String()
+		}
+		return "", wrap(ErrSecret, "refusing to store secret-shaped text: %s (rewrite it, or pass --redact-secrets to mask it)", strings.Join(parts, "; "))
+	}
+	masked := scan.Mask(text)
+	if len(scan.Scan([][2]string{{field, masked}})) > 0 {
+		return "", wrap(ErrSecret, "masking left secret-shaped text in %s", field)
+	}
+	return masked, nil
+}
+
+func scanDraftValue(field string, value any, redact bool, depth int) (any, error) {
+	if depth > maxDraftNesting {
+		return nil, wrap(ErrUsage, "payload nesting exceeds %d levels at %s", maxDraftNesting, field)
+	}
+	switch v := value.(type) {
+	case json.RawMessage:
+		parsed, err := op.DecodeStrict(v)
+		if err != nil {
+			return nil, wrap(ErrUsage, "invalid raw JSON at %s", field)
+		}
+		masked, err := scanDraftValue(field, parsed, redact, depth)
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := op.Encode(masked)
+		if err != nil {
+			return nil, wrap(ErrUsage, "invalid raw JSON at %s", field)
+		}
+		return json.RawMessage(encoded), nil
+	case string:
+		return scanDraftText(field, v, redact)
+	case []string:
+		for i := range v {
+			masked, err := scanDraftText(field, v[i], redact)
+			if err != nil {
+				return nil, err
+			}
+			v[i] = masked
+		}
+	case []any:
+		for i := range v {
+			masked, err := scanDraftValue(field, v[i], redact, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			v[i] = masked
+		}
+	case op.Obj:
+		for i := range v {
+			key := field + "." + v[i].K
+			if field == "" {
+				key = v[i].K
+			}
+			masked, err := scanDraftValue(key, v[i].V, redact, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			v[i].V = masked
+		}
+	case []op.Obj:
+		for i := range v {
+			masked, err := scanDraftValue(field, v[i], redact, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			v[i] = masked.(op.Obj)
+		}
+	case map[string]any:
+		keys := make([]string, 0, len(v))
+		for key := range v {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			child := field + "." + key
+			if field == "" {
+				child = key
+			}
+			masked, err := scanDraftValue(child, v[key], redact, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			v[key] = masked
+		}
+	}
+	return value, nil
+}
+
+// scanDrafts refuses (or masks) secret-shaped text in every nested string payload value and actor name.
 func scanDrafts(ds []op.Draft, redact bool) error {
 	for i := range ds {
-		if err := scanEnvelope([][2]string{{"actor_label", ds[i].Actor.Label}}); err != nil {
+		if err := scanEnvelope([][2]string{{"actor_label", ds[i].Actor.Label}, {"actor_human", ds[i].Actor.Human}}); err != nil {
 			return err
 		}
-		var fields [][2]string
-		for _, f := range ds[i].Payload {
-			switch v := f.V.(type) {
-			case string:
-				fields = append(fields, [2]string{f.K, v})
-			case []string:
-				for _, s := range v {
-					fields = append(fields, [2]string{f.K, s})
-				}
-			}
-		}
-		found := scan.Scan(fields)
-		if len(found) == 0 {
-			continue
-		}
-		if !redact {
-			parts := make([]string, len(found))
-			for j, f := range found {
-				parts[j] = f.String()
-			}
-			return wrap(ErrSecret, "refusing to store secret-shaped text: %s (rewrite it, or pass --redact-secrets to mask it)", strings.Join(parts, "; "))
-		}
 		for j, f := range ds[i].Payload {
-			switch v := f.V.(type) {
-			case string:
-				ds[i].Payload[j].V = scan.Mask(v)
-			case []string:
-				for k := range v {
-					v[k] = scan.Mask(v[k])
-				}
+			masked, err := scanDraftValue(f.K, f.V, redact, 0)
+			if err != nil {
+				return err
 			}
-		}
-		for _, f := range ds[i].Payload {
-			var vals []string
-			switch v := f.V.(type) {
-			case string:
-				vals = []string{v}
-			case []string:
-				vals = v
-			}
-			for _, s := range vals {
-				if len(scan.Scan([][2]string{{f.K, s}})) > 0 {
-					return wrap(ErrSecret, "masking left secret-shaped text in %s", f.K)
-				}
-			}
+			ds[i].Payload[j].V = masked
 		}
 	}
 	return nil
