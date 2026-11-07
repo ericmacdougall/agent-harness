@@ -390,6 +390,7 @@ REMOTE_HOST_RE = re.compile(r'^(?:[A-Za-z0-9._-]{1,64}@)?[A-Za-z0-9][A-Za-z0-9._
 REMOTE_LOG_RE = re.compile(r'^[A-Za-z0-9._/-]{1,512}$')  # no ~: the path is single-quoted on the host
 SSH_RUNNER = subprocess.run  # tests replace it; nothing here is ever run without BatchMode
 PLAIN_SSH_FLAGS = {'-q', '-T', '-n', '-t', '-tt', '-4', '-6'}
+PLAIN_SSH_BUNDLE = re.compile(r'-[qTnt46]+')
 PLAIN_SSH_OPTIONS = {'batchmode', 'connecttimeout', 'loglevel', 'serveraliveinterval', 'serveralivecountmax',
                      'connectionattempts'}
 
@@ -409,7 +410,9 @@ def plain_ssh_hop(texts, host):
     i = 0
     while i < host:
         t = texts[i]
-        if t in PLAIN_SSH_FLAGS:
+        # bundled boolean flags (-qT, -tt, -qn) are plain when every letter is; one routing letter in a bundle
+        # (-qp 22, -qJ gw) still makes the hop non-literal (Kimi PR-C review F10)
+        if t in PLAIN_SSH_FLAGS or PLAIN_SSH_BUNDLE.fullmatch(t):
             i += 1
             continue
         # -l and -p are refused too: the ledger and the probe name only HOST, so a different user or port could
@@ -422,7 +425,8 @@ def plain_ssh_hop(texts, host):
             i += 1
         else:
             return False
-        if value.split('=', 1)[0].strip().lower() not in PLAIN_SSH_OPTIONS:
+        # OpenSSH reads `Key=value` and `Key value` alike
+        if re.split(r'\s*=\s*|\s+', value.strip(), maxsplit=1)[0].lower() not in PLAIN_SSH_OPTIONS:
             return False
     return True
 

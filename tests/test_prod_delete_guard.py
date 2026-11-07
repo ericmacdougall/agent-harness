@@ -1095,3 +1095,133 @@ class ReviewRound1(Case):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KimiPrcR2(Case):
+    """Kimi 3.1 Pro BLOCK of PR-C at 1aa61b3 (goodqa#14993): one test per reproduction in kimi-prc/report.md."""
+
+    def setUp(self):
+        super().setUp()
+        self.work = self.home / "w"
+        self.work.mkdir()
+
+    def ev(self, command):
+        return dict(bash(command), cwd=str(self.work))
+
+    def put(self, name, body):
+        path = self.work / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+        return path
+
+    def deny(self, command):
+        self.assertEqual(self.verdict(self.ev(command)), "deny", command)
+
+    def allow(self, command):
+        self.assertEqual(self.verdict(self.ev(command)), "allow", command)
+
+    def ssh_config(self, text, name=".ssh/config"):
+        path = self.home / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def test_f1_nested_block_comments_do_not_hide_destructive_sql(self):
+        self.deny("psql -h prod-db -c 'DELETE /* outer /* inner */ tail */ FROM users'")
+        self.deny("psql -h prod-db -c 'DROP /* outer /* inner */ tail */ TABLE users'")
+        self.deny("psql -h prod-db -c 'UPDATE /* a /* b */ c */ users SET admin=true'")
+
+    def test_f2_single_quoted_do_body_is_judged(self):
+        self.deny('psql -h prod-db -c "DO \'BEGIN UPDATE users SET admin=true; END\';"')
+        self.deny('psql -h prod-db -c "DO LANGUAGE plpgsql \'BEGIN UPDATE users SET admin=true; END\';"')
+        self.deny('psql -h prod-db -c "DO E\'BEGIN UPDATE users SET admin=true; END\';"')
+        self.allow('psql -h prod-db -c "DO \'BEGIN UPDATE users SET admin=true WHERE id=4; END\';"')
+
+    def test_f3_equivalent_file_input_spellings_are_read(self):
+        self.put("evil.sql", "DELETE FROM users;\n")
+        self.deny("psql -h prod-db -c \"$(cat 'evil.sql')\"")
+        self.deny('psql -h prod-db -c "$(/bin/cat evil.sql)"')
+        self.deny('psql -h prod-db -c "$(\\cat evil.sql)"')
+        self.deny("psql -h prod-db --fi''le evil.sql")
+        self.deny('psql -h prod-db "--file" evil.sql')
+        self.deny("mysql -h prod-db -e 'SELECT 1;\nsource evil.sql'")
+        self.deny("mysql -h prod-db -e 'SELECT 1; SOURCE evil.sql'")
+        self.put("ok.sql", "SELECT 1;\n")
+        self.allow("psql -h prod-db -c \"$(cat 'ok.sql')\"")
+        self.allow("psql -h prod-db --fi''le ok.sql")
+
+    def test_f4_a_remote_or_container_file_cannot_be_judged_from_a_local_one(self):
+        self.put("remote.sql", "SELECT 1;\n")
+        self.deny('ssh prod-db "psql -f remote.sql"')
+        self.deny("ssh prod-db psql -f remote.sql")
+        self.deny("docker exec -i prod-pg psql -f remote.sql")
+        self.deny("kubectl exec prod-pg -- psql -f remote.sql")
+        self.deny("podman exec -i prod-pg psql -f remote.sql")
+        self.deny("ssh prod-db 'psql < remote.sql'")
+        self.deny("ssh prod-db \"mysql -e 'source remote.sql'\"")
+        # a local file fed to the remote client through the local shell is judged as before
+        self.allow("cat remote.sql | ssh prod-db psql")
+        self.allow("ssh prod-db psql < remote.sql")
+
+    def test_f4_psql_cd_in_a_file_cannot_redirect_its_includes(self):
+        self.put("root-cd.sql", "\\cd sub\n\\i payload.sql\n")
+        self.put("payload.sql", "SELECT 1;\n")
+        self.put("sub/payload.sql", "DELETE FROM users;\n")
+        self.deny("psql -h prod-db -f root-cd.sql")
+        self.deny("psql -h prod-db -c '\\cd sub' -c '\\i payload.sql'")
+
+    def test_f5_ssh_options_with_values_are_not_the_host(self):
+        self.deny("ssh -B lo prod-db psql -c 'DELETE FROM users'")
+        self.deny("ssh -P tag prod-db psql -c 'DELETE FROM users'")
+        # an option letter the guard does not know makes the destination uncertain
+        self.deny("ssh -Z lo prod-db psql -c 'DELETE FROM users'")
+        self.allow("ssh -B lo dev2 psql -c 'SELECT 1'")
+
+    def test_f6_proxy_command_and_proxy_jump_fail_closed(self):
+        self.deny("ssh -o ProxyCommand='nc prod-db.example.com 22' dev psql -c 'DELETE FROM users'")
+        self.deny("ssh -o 'ProxyCommand nc prod-db.example.com 22' dev psql -c 'DELETE FROM users'")
+        self.deny("ssh -o ProxyJump=jump dev psql -c 'DELETE FROM users'")
+        self.deny("ssh -J jump dev psql -c 'DELETE FROM users'")
+        self.ssh_config("Host dev\n  ProxyCommand nc prod-db.example.com 22\n")
+        self.deny("ssh dev psql -c 'DELETE FROM users'")
+        self.ssh_config("Host dev\n  HostName 192.0.2.5\n  ProxyJump bastion\n")
+        self.deny("ssh dev psql -c 'DELETE FROM users'")
+        self.deny("ssh -o HostName=192.0.2.5 dev psql -c 'DELETE FROM users'")  # config still read
+        self.allow("ssh dev psql -c 'SELECT 1'")
+
+    def test_f7_a_quoted_include_path_is_followed(self):
+        self.ssh_config('Include "conf.d/prod route"\n')
+        self.ssh_config("Host db\n  HostName prod-db.example.com\n", ".ssh/conf.d/prod route")
+        self.deny("ssh db psql -c 'DELETE FROM users'")
+
+    def test_f8_long_ssh_chains_and_update_floods_decide_quickly(self):
+        cases = ("ssh " * 10000 + "psql -h prod-db.example.com -c 'DELETE FROM users'",
+                 "psql -h prod-db -c '" + "UPDATE t SET a=1 WHERE id=1; " * 26000 + "UPDATE t SET a=1'",
+                 "psql -h prod-db -c '" + "UPDATE t SET a=1 WHERE id=1 " * 28000 + "'")
+        for command in cases:
+            with self.subTest(size=len(command)):
+                t0 = time.monotonic()
+                self.assertEqual(self.verdict(self.ev(command)), "deny")
+                self.assertLess(time.monotonic() - t0, 5.0)
+
+    def test_f8_the_decision_deadline_fails_closed(self):
+        old = pdg.DECISION_BUDGET
+        pdg.DECISION_BUDGET = 0.0
+        try:
+            self.deny("psql -h prod-db -c 'SELECT 1'")
+            self.allow("ls -la")  # nothing database-like: past the deadline it still allows
+        finally:
+            pdg.DECISION_BUDGET = old
+
+    def test_f9_strings_and_comments_are_not_statements(self):
+        self.allow("psql -h prod-db -c \"SELECT 'DELETE FROM users' AS example\"")
+        self.allow("psql -h prod-db -c \"SELECT 'DROP TABLE users' AS example\"")
+        self.put("comment-include.sql", "-- \\i absent.sql\nSELECT 1;\n")
+        self.allow("psql -h prod-db -f comment-include.sql")
+        self.put("string-include.sql", "SELECT '\\i absent.sql';\n")
+        self.allow("psql -h prod-db -f string-include.sql")
+        # shell quoting still cannot split a verb, and a real statement next to a string still denies
+        self.deny('psql -h prod-db -c "DEL""ETE FROM users"')
+        self.deny("psql -h prod-db -c \"SELECT 'x'; DELETE FROM users\"")
+        self.deny("ssh prod-db \"psql -c 'DELETE FROM users'\"")
+

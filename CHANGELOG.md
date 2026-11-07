@@ -25,6 +25,12 @@ group by pull request.
 - Test fixtures and docs no longer contain a real private address, username, or home path.
 
 ### Fixed
+- `prod_delete_guard.py` (Kimi PR-C review, goodqa#14993): nested `/* */` comments, single-quoted `DO`
+  bodies, `--fi''le`, `$(cat 'f')`, `/bin/cat`, a multiline mysql `source`, files read on an ssh host or in a
+  container, psql `\cd`, `ssh -B`/`-P`, unknown ssh options, ProxyCommand/ProxyJump (command line or config) and
+  quoted config `Include` paths no longer get past it. `SELECT 'DELETE FROM x'` and a commented-out include are no
+  longer denied. Quadratic ssh and UPDATE paths are linear, and a 5 s decision budget fails closed for database
+  commands. `kill_guard.py` accepts bundled `ssh -qT` and `-o 'BatchMode yes'` for a recorded remote kill.
 - Removed a real Tailscale-range address and hostname from a test in HEAD (F-008). Git
   history still contains it; it was not rewritten.
 

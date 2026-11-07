@@ -761,6 +761,20 @@ class RemoteSpawn(unittest.TestCase):
         with mock.patch.object(kg, '_remote_start', probe or (lambda host, pid: None)):
             return kg.decide(cmd, cwd=self.home, home=self.home, policy=POLICY)
 
+    def test_kimi_prc_f10_bundled_flags_and_spaced_options_are_plain(self):
+        # Kimi PR-C review F10 (goodqa#14993): OpenSSH accepts bundled -qT and `-o 'BatchMode yes'`.
+        kg.append_ledger(kg.remote_root('dev2'), 4242, self.START, home=self.home)
+        same = lambda host, pid: self.START if (host, pid) == ('dev2', 4242) else None  # noqa: E731
+        for cmd in ('ssh -qT dev2 kill 4242', "ssh -o 'BatchMode yes' dev2 kill 4242", 'ssh -tt dev2 kill 4242',
+                    "ssh -o 'ConnectTimeout 3' -qn dev2 kill 4242"):
+            with self.subTest(cmd):
+                self.assertEqual(self.decide(cmd, same)[0], 'allow', cmd)
+        for cmd in ('ssh -qp 2222 dev2 kill 4242', 'ssh -qJ gw dev2 kill 4242', 'ssh -qF cfg dev2 kill 4242',
+                    "ssh -o 'HostName prod' dev2 kill 4242", "ssh -o 'ProxyCommand nc prod 22' dev2 kill 4242",
+                    'ssh -ql root dev2 kill 4242'):
+            with self.subTest(cmd):
+                self.assertEqual(self.decide(cmd, same)[0], 'block', cmd)
+
     def test_remote_kill_is_refused_without_a_spawn_record(self):
         verdict, rule, message, pids = self.decide('ssh dev2 kill 4242')
         self.assertEqual((verdict, rule), ('block', 'remote-kill'))
