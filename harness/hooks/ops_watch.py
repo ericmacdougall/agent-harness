@@ -1434,6 +1434,7 @@ def _owner_alerts(home, session, tickets, now):
     that return their result to the parent are not owners. Task text never leaves here, only ids and tickets."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import ah  # noqa: PLC0415 - absent on hosts without WALs, which return before reaching this
+    import liveness  # noqa: PLC0415
     try:
         rows = ah.owners(home, session, now=now)["owners"]
     except ah.AhError:
@@ -1445,6 +1446,8 @@ def _owner_alerts(home, session, tickets, now):
             continue  # task-named WALs are alerted by _task_wal_alert with the ring key form liveness:<s8>/<task>
         if not row.get("owner") or not (state in OWNER_ALERT_STATES or state in OWNER_RUNNING_STATES):
             continue
+        if state in OWNER_ALERT_STATES and liveness.row_disposed(row):
+            continue  # main disposed of this owner: its liveness alert clears (goodqa#15322)
         task = f"agent-{row['agent_id']}"
         ref = _ticket_ref(row.get("ticket"))
         quiet = tickets.quiet_h(ref)
