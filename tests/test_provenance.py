@@ -304,7 +304,9 @@ class OtherKinds(Env):
         self.assertTrue(good["ok"] and not good["assumption"] and good["origin"] == "user", good)
         tainted = provenance.resolve(f"wal:{main}#winfer0001")
         self.assertTrue(tainted["ok"] and tainted["assumption"])
-        self.reject(f"wal:{main}#wlegacy001", "wal-unsourced")
+        legacy = provenance.resolve(f"wal:{main}#wlegacy001")  # B3.9: an assumption now, never a requirement
+        self.assertTrue(legacy["ok"] and legacy["assumption"] and legacy["weak"] and not legacy["backed"], legacy)
+        self.assertEqual([p["code"] for p in legacy["problems"]], ["wal-unsourced"])
         self.reject(f"wal:{main}#wloop00001", "cycle")
         self.reject(f"wal:{main}#wmissing01", "wal-entry-not-found")
         self.reject("wal:/etc/passwd#wgood00001", "wal-bad-path")
