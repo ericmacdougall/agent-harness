@@ -124,7 +124,10 @@ class CorpusTests(Fixture):
         self.expect(corpus.NEG15_WORK_BLOCK, 'block', label='NEG15_WORK_BLOCK')
 
     def test_work_tree_allows(self):
-        self.expect(corpus.NEG15_WORK_ALLOW, 'allow', label='NEG15_WORK_ALLOW')
+        # This lightweight fixture is not a real registered worktree. The corpus pins routing of the one safe
+        # command shape; test_command_guard_worktree_remove.py proves the verifier against real repositories.
+        with mock.patch.object(cg, 'linked_worktree_remove_refusal', return_value=None):
+            self.expect(corpus.NEG15_WORK_ALLOW, 'allow', label='NEG15_WORK_ALLOW')
 
     def test_heredoc_with_destructive_text_is_never_silent(self):
         # warn, never block: writing or printing the text is not a deletion, but it must not pass silently

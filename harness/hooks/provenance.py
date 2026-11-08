@@ -49,7 +49,7 @@ ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,40}$")
 SESSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
-LABELS = {"user": "USER", "ticket": "TICKET", "file": "FILE"}
+LABELS = {"user": "USER", "pasted": "PASTED", "ticket": "TICKET", "file": "FILE"}
 
 
 class Problem(Exception):
@@ -180,35 +180,58 @@ _WRAPPER = re.compile(r"^\s*<([A-Za-z][\w:-]*)\b[^>]*>.*</\1\s*>\s*$", re.S)
 SENTINEL = "\ufffc"  # replaces a removed block so an excerpt cannot span text on both sides of it
 
 
-def strip_blocks(text: str) -> str:
-    """Remove every non-user-authored block; an unclosed opener removes the rest of the text.
-    Linear: one pass over the tags with a stack (the earlier nested-regex form was quadratic on many openers)."""
+def strip_blocks(text: str, pasted: bool = False) -> str:
+    """The typed text with every non-user block (pasted_content included) replaced by SENTINEL.
+
+    With pasted=True, return instead only the bodies of closed pasted_content blocks, joined by SENTINEL, for
+    the `pasted:` source kind. Pasted text is not the user's own words (#134 red-team P7): a pasted agent
+    report can say anything, including "user approved". A pasted body is opaque, so wrapper-like text inside
+    it does not open or close other blocks. Any unclosed wrapper still removes the rest of the turn. Linear:
+    one pass with a stack.
+    """
     if len(text) > MAX_TEXT:
         text = text[:MAX_TEXT] + SENTINEL  # bound the work on absurdly long turns
-    stack, spans = [], []  # open tags awaiting a close; closed top-level (start, end) blocks
+    stack, spans = [], []  # (name, start, body-start); closed (start, end, body-start, body-end, name)
     by_name = {}  # tag name -> indexes into `stack`, so a close finds its opener in O(1)
     for tag in _TAG_TOKEN.finditer(text):
+        # Inside pasted_content every tag except its own closer is literal pasted text. Inside any other
+        # removed block normal nesting still applies, and the outer block eventually discards it all.
+        if stack and stack[-1][0] == "pasted_content" and not (tag.group(1) or "").lower() == "pasted_content":
+            continue
         if tag.group(2):
+            if stack and stack[-1][0] == "pasted_content":
+                continue  # a nested pasted opener is literal too; the first closer ends the outer wrapper
             name = tag.group(2).lower()
             by_name.setdefault(name, []).append(len(stack))
-            stack.append((name, tag.start()))
+            stack.append((name, tag.start(), tag.end()))
             continue
         name = tag.group(1).lower()
         positions = by_name.get(name)
         if not positions:
             continue  # a close with no opener is plain text
         index = positions[-1]
-        start = stack[index][1]
+        _, start, body_start = stack[index]
         del stack[index:]  # openers inside this block go with it
         for other in by_name.values():
             while other and other[-1] >= index:
                 other.pop()
         while spans and spans[-1][0] >= start:
             spans.pop()
-        spans.append((start, tag.end()))
+        spans.append((start, tag.end(), body_start, tag.start(), name))
     cut = stack[0][1] if stack else None  # an unclosed opener hides everything after it
+    if pasted:
+        bodies = []
+        for start, end, body_start, body_end, name in spans:
+            if cut is not None and start >= cut:
+                break
+            if name == "pasted_content":
+                body = text[body_start:body_end]
+                opener_end = body.find(">")  # once per closed, disjoint span: preserves linear scanning
+                if opener_end >= 0:
+                    bodies.append(body[opener_end + 1:])
+        return SENTINEL.join(bodies)
     out, pos = [], 0
-    for start, end in spans:
+    for start, end, body_start, body_end, name in spans:
         if cut is not None and start >= cut:
             break
         out.append(text[pos:start])
@@ -296,7 +319,7 @@ def parse_source(text: str) -> dict:
         raise Problem("bad-syntax", "Source longer than 4000 characters")
     match = re.match(r"(?is)^([A-Za-z]+)\s*:\s*(.*)$", value)
     if not match:
-        raise Problem("bad-syntax", "Source must start with user:, answer:, queue:, ticket:, wal:, file: or inferred:")
+        raise Problem("bad-syntax", "Source must start with user:, answer:, queue:, pasted:, ticket:, wal:, file: or inferred:")
     kind, rest = match.group(1).lower(), match.group(2).strip()
     if kind == "user":
         found = re.match(r"^([0-9a-fA-F-]{36})/([0-9a-fA-F-]{36})\s*(.*)$", rest, re.S)
@@ -306,6 +329,14 @@ def parse_source(text: str) -> dict:
         if excerpt is None:
             raise Problem("excerpt-missing", "a user: source needs a verbatim quoted excerpt of the user's words")
         return {"kind": "user", "session": found.group(1).lower(), "uuid": found.group(2).lower(), "excerpt": excerpt}
+    if kind == "pasted":
+        found = re.match(r"^([0-9a-fA-F-]{36})/([0-9a-fA-F-]{36})\s*(.*)$", rest, re.S)
+        if not found or not UUID_RE.match(found.group(2)) or not UUID_RE.match(found.group(1)):
+            raise Problem("bad-syntax", "pasted: needs <session-id>/<message-uuid> then a quoted excerpt")
+        excerpt = parse_excerpt(found.group(3))
+        if excerpt is None:
+            raise Problem("excerpt-missing", "a pasted: source needs a verbatim quoted excerpt of the pasted text")
+        return {"kind": "pasted", "session": found.group(1).lower(), "uuid": found.group(2).lower(), "excerpt": excerpt}
     if kind in ("answer", "queue"):
         # Same trust class as user:, different record kind (see ah user-msg and docs/provenance.md).
         if kind == "answer":
@@ -496,8 +527,9 @@ def load_lines(path: Path, needle: bytes, key: str, value: str):
     return "malformed" if saw_bad else None
 
 
-def user_authorship(record: dict):
-    """(text, None) for a human-authored turn, else (None, reason)."""
+def user_authorship(record: dict, pasted: bool = False):
+    """(text, None) for a human-authored turn, else (None, reason). With pasted=True the text is only what the
+    human pasted (closed <pasted_content> bodies), never what they typed."""
     if record.get("type") != "user":
         return None, f"entry type is {clip(record.get('type'), 20)}, not a user turn"
     if record.get("isSidechain"):
@@ -513,17 +545,18 @@ def user_authorship(record: dict):
     message = record.get("message")
     content = message.get("content") if isinstance(message, dict) else None
     if isinstance(content, str):
-        return strip_blocks(content), None
+        return strip_blocks(content, pasted), None
     if isinstance(content, list):
         pieces = []
         for block in content:
             if not isinstance(block, dict) or block.get("type") not in ("text", "image"):
                 return None, "turn carries non-text blocks (tool results)"
             if block.get("type") == "text" and isinstance(block.get("text"), str):
-                if _WRAPPER.match(block["text"]):
-                    continue  # a block that is one wrapper element was injected by the harness or an extension
-                pieces.append(strip_blocks(block["text"]))
-        return "\n".join(pieces), None
+                wrapper = _WRAPPER.match(block["text"])
+                if wrapper and not (pasted and wrapper.group(1).lower() == "pasted_content"):
+                    continue  # one whole wrapper element: injected by the harness or an extension, or pasted
+                pieces.append(strip_blocks(block["text"], pasted))
+        return (SENTINEL if pasted else "\n").join(pieces), None
     return None, "turn has no readable text"
 
 
@@ -616,6 +649,22 @@ def user_turn(session: str, uid: str, home=None) -> dict:
     return {"text": text, "timestamp": record.get("timestamp"), "uuid": uid, "session": session}
 
 
+def pasted_turn(session: str, uid: str, home=None) -> dict:
+    """The pasted text of a human-authored turn, or Problem. Proves the human supplied it, not that it is true."""
+    path = find_transcript(session, home)
+    record = load_record(path, "uuid", uid)
+    if record == "malformed":
+        raise Problem("transcript-malformed", "only malformed or oversized lines mention that uuid")
+    if record is None:
+        raise Problem("message-not-found", f"no message {uid[:8]}... in session {clip(session, 40)}")
+    text, reason = user_authorship(record, pasted=True)
+    if text is None:
+        raise Problem("not-user-authored", reason)
+    if not text.replace(SENTINEL, "").strip():
+        raise Problem("no-pasted-content", "that turn has no closed <pasted_content> block")
+    return {"text": text, "timestamp": record.get("timestamp"), "uuid": uid, "session": session}
+
+
 def askuser_bound(path: Path, use_id) -> set:
     """{use_id} when the transcript holds a main-conversation AskUserQuestion tool_use with that id, else empty."""
     ids = set()
@@ -678,7 +727,9 @@ def queue_turn(session: str, ident, home=None) -> dict:
             continue
         text = queue_user_text(record)
         if text is not None and record.get("timestamp") == stamp and hashlib.sha256(text.encode()).hexdigest()[:12] == sha:
-            return {"text": text, "timestamp": stamp, "uuid": f"{stamp}#{sha}", "session": session}
+            # B6 (step-1 red-team): like a human turn, pasted and injected blocks are not the user's words. The id
+            # still hashes the raw content, so `ah user-msg` ids stay stable.
+            return {"text": strip_blocks(text), "timestamp": stamp, "uuid": f"{stamp}#{sha}", "session": session}
     raise Problem("message-not-found", f"no queued user message {stamp}#{sha} in session {clip(session, 40)}")
 
 
@@ -784,6 +835,9 @@ def weak_problem(result: dict):
     not. A citation that is also backed by a verified user, wal or file source (an `inferred:` item with such an
     input) is not refused: the unverified part only warns."""
     if result.get("ok") and result.get("weak") and not result.get("backed"):
+        if "pasted-not-user" in (result.get("weak_reasons") or []):
+            return ("the only cite is text the user pasted (`pasted:`), which proves they supplied it, not that they "
+                    "asked for it or that it is true: cite the user's own typed words (`user:`) or a ticket")
         return ("the only cite is an unverified ticket or file line (ticket not confirmed, outage or not; file line "
                 "without an excerpt): add a `user:` or `wal:` source, which can be checked locally, or have main run "
                 "`provenance.py cache-ticket` after checking the ticket")
@@ -925,6 +979,18 @@ def _resolve(source, ctx, depth, seen, result):
         node["excerpt"] = parsed["excerpt"]
         result["chain"].append(node)
         result["origin"], result["ok"], result["backed"] = "user", True, True
+    elif kind == "pasted":
+        turn = pasted_turn(parsed["session"], parsed["uuid"], home)
+        reason = excerpt_in(turn["text"], parsed["excerpt"])
+        if reason:
+            raise Problem("excerpt-not-found", reason.replace("in that turn", "in that turn's pasted text"))
+        node = {"kind": "pasted", "session": parsed["session"], "uuid": parsed["uuid"],
+                "timestamp": turn["timestamp"], "status": "verified-pasted", "excerpt": parsed["excerpt"]}
+        if ctx.get("want_text"):
+            node["text"] = turn["text"]
+        result["chain"].append(node)
+        # Not the user's own words: never backs a requirement or ask, never grounds an inferred: source.
+        result["origin"], result["ok"], result["weak"], result["weak_reasons"] = "pasted", True, True, ["pasted-not-user"]
     elif kind == "ticket":
         key = f"{parsed['project']}#{parsed['number']}"
         cached = ticket_cache(home).get(key)
@@ -988,7 +1054,7 @@ def _resolve(source, ctx, depth, seen, result):
             except Problem as problem:
                 # Name the input: the generic "Source must start with ..." text read as if the whole `inferred:`
                 # source were malformed (main WAL w8d5f765ea4c, 2026-11-06).
-                message = ("is free text, not a source: each input after `from` must be user:, answer:, queue:, "
+                message = ("is free text, not a source: each input after `from` must be user:, answer:, queue:, pasted:, "
                            "ticket:, wal: or file:, separated by ` ; `; the rationale goes after ` -- `"
                            if problem.code == "bad-syntax" and problem.message.startswith("Source must start with")
                            else problem.message)
@@ -1032,6 +1098,10 @@ def render(result: dict, indent: str = "  ") -> list:
             if node.get("text") is not None:
                 lines.append(f"{indent}  message:")
                 lines.extend(f"{indent}    | {line}" for line in node["text"].replace(SENTINEL, "[non-user block removed]").split("\n"))
+        elif kind == "pasted":
+            lines.append(f"{indent}  PASTED (not the user's words) in turn {node['uuid']} in session {node['session']} "
+                         f"at {node.get('timestamp')}")
+            lines.append(f"{indent}  excerpt: \"{clip(node['excerpt'], 200)}\"")
         elif kind == "wal":
             lines.append(f"{indent}  wal {node['ref']} ({node.get('event')}, {node.get('at')}): {node.get('note')}")
         elif kind == "ticket":
@@ -1043,7 +1113,7 @@ def render(result: dict, indent: str = "  ") -> list:
         elif kind == "inferred":
             lines.append(f"{indent}  ASSUMPTION (not a user requirement): {node['rationale']}")
     if result.get("ok") and result.get("weak"):
-        lines.append(f"{indent}  note: UNVERIFIED citation (offline ticket or file line without an excerpt)")
+        lines.append(f"{indent}  note: UNVERIFIED citation (pasted text, offline ticket or file line without an excerpt)")
     for sub in result["inputs"]:
         lines.append(f"{indent}  input:")
         lines.extend(render(sub, indent + "    "))
@@ -1252,7 +1322,7 @@ def render_asks(session: str, home=None, ctx=None) -> tuple:
                         lines.append(f"      assumed because: {node['rationale']}")
 
     block("ASKS (each traces to a real source)", traced, "*")
-    block("UNVERIFIED CITATIONS (offline ticket or repo-file origin; check before relying, never a user requirement)", unverified, "~")
+    block("UNVERIFIED CITATIONS (pasted text, offline ticket or repo-file origin; check before relying, never a user requirement)", unverified, "~")
     block("ASSUMPTIONS TO CONFIRM (agent inference, not a user requirement)", assumptions, "?")
     block("BLOCKED: untraceable, do NOT present these to the user until a source is added", blocked, "!")
     return "\n".join(lines), {"traced": len(traced), "unverified": len(unverified), "assumptions": len(assumptions), "blocked": len(blocked), "closed": closed}
@@ -1273,9 +1343,13 @@ def find_user(session: str, text: str, home=None, limit: int = 5) -> list:
             record = loads_line(line)
         except ValueError:
             continue
-        body, _ = user_authorship(record) if isinstance(record, dict) else (None, None)
-        if body and excerpt_in(body, text) is None:
-            found.append({"uuid": record.get("uuid"), "timestamp": record.get("timestamp"), "preview": clip(body.strip(), 100)})
+        if not isinstance(record, dict):
+            continue
+        for kind, pasted in (("user", False), ("pasted", True)):
+            body, _ = user_authorship(record, pasted=pasted)
+            if body and excerpt_in(body, text) is None:
+                found.append({"uuid": record.get("uuid"), "timestamp": record.get("timestamp"), "kind": kind,
+                              "preview": clip(body.replace(SENTINEL, " ").strip(), 100)})
     return found[-limit:]
 
 

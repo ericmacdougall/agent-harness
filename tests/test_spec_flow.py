@@ -88,6 +88,21 @@ def report_text(packet_sha, verdict="ACCEPT", reviewer="Blind Claude Opus fallba
             f"PLAN_RESULT: {verdict}\n\nFindings follow.\n")
 
 
+def kimi_signoff_text(packet_sha, verdict="ACCEPT"):
+    return ("# Kimi independent spec-plan signoff\n\n"
+            f"Artifact: {sf.SPEC_PLAN_ARTIFACT}\n"
+            "Reviewer: kimi-code/k3.1-pro-highspeed (Kimi subscription, kimi-code CLI)\n"
+            "Reviewed-Model: kimi-code/k3.1-pro-highspeed\n"
+            "Stage: plan\n"
+            "Reviewed-At: 2026-11-07T12:00:00+00:00\n"
+            f"Reviewed packet SHA-256: {packet_sha}\n"
+            "Packet-Binding: exact-spec-core-sha256\n"
+            "Freshness: current-packet-only\n"
+            "Review-Input: exact packet text only (no repository snapshot, no tools)\n"
+            "Advisory: no; constrained spec-plan signoff only\n\n---\n\n"
+            f"PLAN_RESULT: {verdict}\n\nFindings follow.\n")
+
+
 _OFFLINE = None
 _STUBS = []
 
@@ -382,6 +397,45 @@ class Reviews(SpecFlowCase):
         header, verdict, _ = sf.parse_review_report(report)
         self.assertEqual((header["Stage"], verdict), ("plan", "BLOCK"))
 
+    def test_dedicated_kimi_spec_plan_signoff_is_accepted_with_identity_and_binding(self):
+        spec = self.write_spec()
+        report = self.tmp / "kimi-plan.md"
+        report.write_text(kimi_signoff_text(sf.core_sha(SPEC)))
+        code, _, err = self.run_cli("review", str(spec), "--role", "adversarial", "--report", str(report))
+        self.assertEqual(code, 0, err)
+        [entry] = sf.load_reviews(spec)
+        self.assertEqual(entry["artifact"], sf.SPEC_PLAN_ARTIFACT)
+        self.assertEqual(entry["model"], "kimi-code/k3.1-pro-highspeed")
+        self.assertEqual(entry["core_sha"], sf.core_sha(SPEC))
+        self.assertEqual(entry["reviewed_at"], "2026-11-07T12:00:00+00:00")
+
+    def test_invalid_kimi_spec_plan_artifacts_and_legacy_advisory_are_rejected(self):
+        spec = self.write_spec()
+        good = kimi_signoff_text(sf.core_sha(SPEC))
+        mutations = {
+            "legacy advisory": good.replace("Advisory: no; constrained spec-plan signoff only", "Advisory: yes; not a signoff"),
+            "unknown artifact": good.replace(sf.SPEC_PLAN_ARTIFACT, "KIMI_ADVISORY"),
+            "bad binding": good.replace("exact-spec-core-sha256", "latest-spec"),
+            "bad freshness": good.replace("current-packet-only", "review-once-always-fresh"),
+            "missing timestamp": good.replace("Reviewed-At: 2026-11-07T12:00:00+00:00\n", ""),
+            "wrong stage": good.replace("Stage: plan", "Stage: code"),
+            "wrong model": good.replace("Reviewed-Model: kimi-code/k3.1-pro-highspeed", "Reviewed-Model: other/model"),
+            "missing verdict": good.replace("PLAN_RESULT: ACCEPT", "KIMI_ADVISORY: ACCEPT"),
+            "wrong packet": good.replace(sf.core_sha(SPEC), "0" * 64),
+        }
+        for name, text in mutations.items():
+            with self.subTest(name):
+                report = self.tmp / (name.replace(" ", "-") + ".md")
+                report.write_text(text)
+                code, _, err = self.run_cli("review", str(spec), "--role", "adversarial", "--report", str(report))
+                self.assertNotEqual(code, 0, (name, err))
+        legacy = self.tmp / "legacy-advisory.md"
+        legacy.write_text("Reviewer: kimi-code/x\nStage: plan\nReviewed packet SHA-256: " + sf.core_sha(SPEC)
+                          + "\nAdvisory: yes; not a signoff\n\nPLAN_RESULT: ACCEPT\n")
+        code, _, err = self.run_cli("review", str(spec), "--role", "adversarial", "--report", str(legacy))
+        self.assertNotEqual(code, 0)
+        self.assertIn("advisory", err)
+
     def test_same_model_twice_and_author_as_reviewer_are_refused(self):
         spec = self.write_spec()
         for role in sf.ROLES:
@@ -434,6 +488,111 @@ class Reviews(SpecFlowCase):
         report.write_text(report_text(sf.core_sha(SPEC), "BLOCK"))
         self.run_cli("review", str(spec), "--role", "adversarial", "--report", str(report))
         self.assertEqual(self.run_cli("attach", str(spec), "--actor", "agent:owner1")[0], 2)
+
+    def single_review_spec(self, basis="small", reason="one isolated validator branch with focused tests"):
+        text = SPEC.replace("Sign-off: main", f"Sign-off: main\nReview-policy: single-adversarial ({basis}: {reason})")
+        spec = self.write_spec(text)
+        report = self.tmp / "single-adversarial.md"
+        report.write_text(report_text(sf.core_sha(text)))
+        code, _, err = self.run_cli("review", str(spec), "--role", "adversarial", "--report", str(report))
+        self.assertEqual(code, 0, err)
+        return spec, text
+
+    def test_explicit_small_spec_needs_one_adversarial_review_and_serializes_policy(self):
+        spec, _ = self.single_review_spec()
+        code, _, err = self.run_cli("attach", str(spec), "--actor", "agent:owner1")
+        self.assertEqual(code, 0, err)
+        comment = self.fake.comments[ISSUE][0]
+        record = json.loads(sf.RECORD_BLOCK.search(comment["body"]).group(1))
+        self.assertEqual(record["review_policy"]["mode"], "single-adversarial")
+        self.assertEqual(record["review_policy"]["basis"], "small")
+        self.assertEqual([row["role"] for row in record["reviews"]], ["adversarial"])
+        result = self.evaluate()
+        self.assertFalse(any("spec review" in item for item in result["missing"]), result["missing"])
+        self.assertTrue(any("single adversarial review" in item for item in result["self_attested"]))
+
+    def test_feature_flag_metadata_is_explicit_and_auditable(self):
+        text = SPEC.replace("Sign-off: main", "Sign-off: main\nReview-policy: single-adversarial "
+                            "(feature-flag: harness-single-review flag, default off with focused rollback tests)")
+        self.assertEqual(sf.lint(text, self.config), [])
+        policy, problem = sf.review_policy_from_header(sf.parse_spec(text)["header"]["Review-policy"])
+        self.assertIsNone(problem)
+        self.assertEqual(sf.required_review_roles(policy), ("adversarial",))
+
+    def test_single_review_is_refused_for_auth_security_data_or_migration(self):
+        # #134 red-team P5: the author cannot declare a security change small
+        for reason, extra in (("small: rewrites the session-token auth check", ""),
+                              ("small: a two-line fix to the copy", "\n- Adds a column to the users table migration"),
+                              ("small: a two-line fix to the copy", "\n- Deletes old customer data nightly")):
+            with self.subTest(reason=reason, extra=extra):
+                text = SPEC.replace("Sign-off: main", "Sign-off: main\nReview-policy: single-adversarial (%s)" % reason)
+                text = text.replace("## Risks\n", "## Risks\n" + extra.strip() + "\n", 1) if extra else text
+                problems = sf.lint(text, self.config)
+                self.assertTrue(any("single-adversarial is refused" in p for p in problems), problems)
+
+    def test_domain_regex_catches_other_wordings_and_spares_harness_words(self):
+        # step-1 red-team B5
+        for phrase in ("switch to OAuth", "rework the sign-in flow", "verify the JWT", "upgrade the DB column types",
+                       "truncate the orders table", "drop the CSRF check", "loosen the ACL", "unauthenticated reads"):
+            with self.subTest(phrase=phrase):
+                self.assertIsNotNone(sf.TWO_REVIEW_DOMAINS.search(phrase))
+        for phrase in ("rename the session WAL helper", "print the author name", "the main session id helper",
+                       "authors list in the README"):
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(sf.TWO_REVIEW_DOMAINS.search(phrase))
+        for phrase in ("the session token check", "auth middleware", "authorization header", "authn flow"):
+            with self.subTest(phrase=phrase):
+                self.assertIsNotNone(sf.TWO_REVIEW_DOMAINS.search(phrase))
+
+    def test_standard_policy_on_a_security_spec_is_fine(self):
+        text = SPEC.replace("Sign-off: main", "Sign-off: main\nReview-policy: standard")
+        text = text.replace("## Risks\n", "## Risks\n- touches the auth token check\n", 1)
+        self.assertFalse(any("single-adversarial is refused" in p for p in sf.lint(text, self.config)))
+
+    def test_missing_old_or_ambiguous_policy_defaults_to_two_reviews(self):
+        for value in (None, "single-adversarial", "single-adversarial (small: short)",
+                      "single-adversarial (unknown: a sufficiently long explanation)"):
+            with self.subTest(value=value):
+                policy, problem = sf.review_policy_from_header(value)
+                self.assertEqual(sf.required_review_roles(policy), sf.ROLES)
+                if value is not None:
+                    self.assertIsNotNone(problem)
+        for record in (None, {"schema": 0, "mode": "single-adversarial"},
+                       {"schema": 1, "mode": "single-adversarial", "basis": "small", "reason": "long enough", "extra": 1}):
+            self.assertEqual(sf.required_review_roles(record), sf.ROLES)
+        spec = self.write_spec()
+        report = self.tmp / "only-adversarial.md"
+        report.write_text(report_text(sf.core_sha(SPEC)))
+        self.run_cli("review", str(spec), "--role", "adversarial", "--report", str(report))
+        code, _, err = self.run_cli("attach", str(spec), "--actor", "agent:owner1")
+        self.assertEqual(code, 2)
+        self.assertIn("no acceptance review", err)
+
+    def test_remote_done_ignores_single_review_when_policy_metadata_is_old(self):
+        spec, _ = self.single_review_spec()
+        self.assertEqual(self.run_cli("attach", str(spec), "--actor", "agent:owner1")[0], 0)
+        comment = self.fake.comments[ISSUE][0]
+        record = json.loads(sf.RECORD_BLOCK.search(comment["body"]).group(1))
+        record["review_policy"] = {"schema": 0, "mode": "single-adversarial"}
+        comment["body"] = sf.record_body("legacy review metadata", record)
+        result = self.evaluate()
+        self.assertTrue(any(item.startswith("acceptance spec review") for item in result["missing"]), result["missing"])
+
+    def test_single_review_still_rejects_author_block_and_stale_packet(self):
+        entries = [{"role": "adversarial", "verdict": "ACCEPT", "core_sha": "c", "key": "agent:owner1"}]
+        problems = sf.review_problems(entries, "c", "agent:owner1", ("adversarial",))
+        self.assertTrue(any("spec author" in item for item in problems), problems)
+        spec, text = self.single_review_spec()
+        report = self.tmp / "single-block.md"
+        report.write_text(report_text(sf.core_sha(text), "BLOCK"))
+        self.run_cli("review", str(spec), "--role", "adversarial", "--report", str(report))
+        code, _, err = self.run_cli("attach", str(spec), "--actor", "agent:owner1")
+        self.assertEqual(code, 2)
+        self.assertIn("adversarial review is BLOCK", err)
+        spec.write_text(spec.read_text().replace("cannot mark", "can never mark"))
+        code, _, err = self.run_cli("attach", str(spec), "--actor", "agent:owner1")
+        self.assertEqual(code, 2)
+        self.assertIn("stale", err)
 
 
 class Attach(SpecFlowCase):

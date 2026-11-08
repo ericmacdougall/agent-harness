@@ -405,6 +405,33 @@ class PreToolUseHook(Fixture):
         self.assertEqual(dynamic.returncode, 2)
         self.assertIn("cannot be checked", dynamic.stderr)
 
+    def test_inline_stdin_heredoc_runs_full_policy_in_same_invocation(self):
+        command = "git add -A && git commit -F - <<'EOF'\n" + GOOD + "\nEOF"
+        allowed = self.run_cli("hook", stdin=self.payload(command))
+        self.assertEqual((allowed.returncode, allowed.stderr), (0, ""))
+
+        missing_testing = GOOD.replace("Testing: `python3 -m unittest tests.test_commit_policy` -> 42 passed\n", "")
+        blocked = self.run_cli("hook", stdin=self.payload("git commit -F - <<'EOF'\n" + missing_testing + "\nEOF"))
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("Testing: section missing", blocked.stderr)
+
+        missing_ticket = GOOD.replace("GoodQA #14151", "none (no tracked ticket for this change)")
+        blocked = self.run_cli("hook", stdin=self.payload("git commit -F - <<'EOF'\n" + missing_ticket + "\nEOF"))
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("must reference a ticket", blocked.stderr)
+
+    def test_inline_stdin_heredoc_still_fails_closed(self):
+        dynamic = self.run_cli("hook", stdin=self.payload("git commit -F - <<EOF\n" + GOOD + "\n$HOME\nEOF"))
+        self.assertEqual(dynamic.returncode, 2)
+        self.assertIn("cannot be checked", dynamic.stderr)
+        malformed = self.run_cli("hook", stdin=self.payload("git commit -F - <<'EOF'\n" + GOOD))
+        self.assertEqual(malformed.returncode, 2)
+        self.assertIn("unterminated heredoc", malformed.stderr)
+        (self.repo / "msg.txt").write_text(GOOD)
+        race = self.run_cli("hook", stdin=self.payload("printf x > msg.txt && git commit -F msg.txt"))
+        self.assertEqual(race.returncode, 2)
+        self.assertIn("same command", race.stderr)
+
     def test_codex_payload_shapes(self):
         base = {"session_id": "codex-1", "cwd": str(self.repo), "hook_event_name": "PreToolUse", "model": "m",
                 "permission_mode": "default", "tool_name": "Bash", "tool_use_id": "c1",
@@ -476,11 +503,13 @@ class GitHubRoute(Fixture):
         bin_dir.mkdir(exist_ok=True)
         script = bin_dir / "gh"
         calls = self.root / "gh-calls.txt"
-        script.write_text("#!" + sys.executable + "\nimport sys\nargs=sys.argv[1:]\n"
-                          f"open({str(calls)!r}, 'a').write(' '.join(args) + '\\n')\n"
-                          "if '--jq' in args: print('main')\n"
-                          f"elif 'compare/' in args[1]: print(open({str(state)!r}).read())\n"
-                          "else: sys.exit(1)\n")
+        body = ("import sys\nargs=sys.argv[1:]\n"
+                f"open({str(calls)!r}, 'a').write(' '.join(args) + '\\n')\n"
+                "if '--jq' in args: print('main')\n"
+                f"elif 'compare/' in args[1]: print(open({str(state)!r}).read())\n"
+                "else: sys.exit(1)\n")
+        # Quote managed Python paths containing spaces; a direct macOS shebang cannot represent them.
+        script.write_text("#!/bin/sh\nexec %s -c %s \"$@\"\n" % (shlex.quote(sys.executable), shlex.quote(body)))
         script.chmod(0o755)
         return {"PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}
 
@@ -1051,6 +1080,64 @@ sys.exit(cp.entry(["hook"]))
         self.assertEqual(result.returncode, 2)
         self.assertIn(b"not JSON", result.stderr)
 
+
+
+class AuthorTrailerHarness(unittest.TestCase):
+    """goodqa#15253 #134 red-team B1: the author trailer is review evidence, so it must name the committing harness."""
+    BODY = ("fix(x): change a thing\n\nWhy: a reason that is long enough.\n\nWhat: the change.\n\n"
+            "Testing: `python3 -m unittest tests.test_x` 3 OK\n\nRefs: GoodQA #1234\n\n")
+
+    def problems(self, harness, trailer):
+        old = cp.HARNESS_OVERRIDE
+        cp.HARNESS_OVERRIDE = harness
+        try:
+            return [p for p in cp.validate(self.BODY + trailer + "\n", policy=cp.load_policy())
+                    if "harness" in p]
+        finally:
+            cp.HARNESS_OVERRIDE = old
+
+    def test_a_trailer_naming_the_other_harness_is_refused(self):
+        self.assertTrue(self.problems("claude", "Co-Authored-By: Codex <noreply@openai.com>"))
+        self.assertTrue(self.problems("claude", "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n"
+                                                "Co-Authored-By: GPT-5 Codex <noreply@openai.com>"))
+        self.assertTrue(self.problems("openai", "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"))
+
+    def test_the_own_harness_or_an_uninstalled_checkout_is_fine(self):
+        self.assertFalse(self.problems("claude", "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"))
+        self.assertFalse(self.problems("openai", "Co-Authored-By: GPT-5 Codex <noreply@openai.com>"))
+        self.assertFalse(self.problems("", "Co-Authored-By: Codex <noreply@openai.com>"))
+
+    def test_harness_comes_from_the_committing_process(self):
+        # delta red-team D-F1
+        self.assertEqual(cp.commit_harness({"CLAUDECODE": "1"}), "claude")
+        self.assertEqual(cp.commit_harness({"CODEX_THREAD_ID": "t1"}), "openai")
+        self.assertIsNone(cp.commit_harness({"CLAUDECODE": "1", "CODEX_SANDBOX": "seatbelt"}))
+        self.assertIsNone(cp.commit_harness({"AI_AGENT": "1"}))
+        self.assertIsNone(cp.commit_harness({}))
+
+    def test_both_installed_copies_accept_the_committing_harness_trailer(self):
+        # delta red-team D-F1: the ~/.claude and ~/.codex hooks both run on every commit; neither may refuse the
+        # trailer of the harness actually committing, and both refuse the other one
+        import shutil
+        import tempfile
+        with tempfile.TemporaryDirectory() as home:
+            copies = [Path(home) / ".claude" / "hooks", Path(home) / ".codex" / "agent-harness"]
+            for dest in copies:
+                shutil.copytree(HOOKS, dest, ignore=shutil.ignore_patterns("__pycache__"))
+            msg = Path(home) / "msg.txt"
+            base = {"HOME": home, "PATH": "/usr/bin:/bin"}
+            cases = (({"CLAUDECODE": "1"}, "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>", False),
+                     ({"CODEX_THREAD_ID": "t1"}, "Co-Authored-By: GPT-5 Codex <noreply@openai.com>", False),
+                     ({"CLAUDECODE": "1"}, "Co-Authored-By: GPT-5 Codex <noreply@openai.com>", True),
+                     ({"CODEX_THREAD_ID": "t1"}, "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>", True))
+            for marker, trailer, refused in cases:
+                msg.write_text(self.BODY + trailer + "\n")
+                for dest in copies:
+                    with self.subTest(copy=dest.parent.name, marker=marker, trailer=trailer):
+                        out = subprocess.run([sys.executable, "-I", str(dest / "commit_policy.py"), "check-message",
+                                              "--file", str(msg)], capture_output=True, text=True, timeout=60,
+                                             env=dict(base, **marker))
+                        self.assertEqual("this commit is made from the" in out.stdout, refused, out.stdout[-400:])
 
 if __name__ == "__main__":
     unittest.main()

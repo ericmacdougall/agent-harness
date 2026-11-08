@@ -102,7 +102,10 @@ WRAPPER_WORDS = {"env", "command", "sudo", "time", "nohup", "nice", "exec", "bui
 MERGE_HINT = re.compile(r"\bgh\b|merge|pulls|graphql|api\.github", re.I)
 DYNAMIC_WORD = re.compile(r"^(?:\$|\$\w+|\$\{[^}]*\}\w*)$")  # a command word that is only a variable or substitution
 GH_HINT = re.compile(r"\bgh\b|merge|curl|wget|\bhttps?\b|python|node|perl|ruby|ssh|eval|graphql|pulls|api\.github", re.I)
-STATE_NAMES = re.compile(r"merge-gate[-/](?:waivers|audit|approvals)", re.I)
+STATE_NAMES = re.compile(r"merge-gate[-/](?:waivers|audit|approvals)|main-stamps", re.I)
+# #134 red-team P2: the peer_review run that mints a merge authorization (pr stage with a GitHub binding)
+# any option order (B2): `peer_review.py --github-repo o/r --pr 5 pr ...` binds as well
+PEER_REVIEW_AUTH = re.compile(r"peer_review(?:\.py)?\b[^\n;&|]*\s--(?:github-repo|pr)\b")
 STATE_GLOB = re.compile(r"merge-gate-[wa*?\[]", re.I)  # subagents: globs and split spellings of the state files
 WAIVE_CMD = re.compile(r"merge_gate(?:\.py)?['\"]?\s+(?:--\S+\s+\S+\s+)*waive\b")
 WAIVE_ANY = re.compile(r"waive|add_waiver|consume_waiver|put_stamp|take_stamp", re.I)
@@ -1382,6 +1385,9 @@ def evaluate_pr(client, slug, number, target=None):
                            "already reported, and mergeStateStatus is " + clean(pr.get("mergeStateStatus") or "missing")
                            + " (needs CLEAN or HAS_HOOKS)")
     entries = _entries(pr, runs, statuses, head, reasons)
+    # #134 red-team P1/B1: a review authorization never covers a check that failed, is still pending or queued, or
+    # has not reported. A PR merged seconds after its push has had no CI at all.
+    unsettled = sorted({clean(e["name"]) for e in entries if e["v"] == "bad"})
     for e in entries:
         name = clean(e["name"])
         if e["v"] == "bad":
@@ -1392,6 +1398,7 @@ def evaluate_pr(client, slug, number, target=None):
         mine = [e for e in entries if e["name"] == name]
         if not mine:
             reasons.append(f"required check '{clean(name)}' has not reported on this head")
+            unsettled.append(clean(name))
         elif name in apps and not any(e["src"] == "api" and e["app"] in apps[name] and e["v"] == "ok" for e in mine):
             reasons.append(f"required check '{clean(name)}' has no success from the required app")
     no_ci = False
@@ -1401,12 +1408,15 @@ def evaluate_pr(client, slug, number, target=None):
             found = _ci_capable_workflows(client, slug, head, base)
             reasons.extend(found)
             no_ci = not found
+            if found:
+                unsettled.append("(no checks reported)")
         except (GateError, ValueError, TypeError, AttributeError):
             reasons.append("no checks reported and the workflow list could not be read")
+            unsettled.append("(no checks reported)")
     again = client.json(["pr", "view", str(number), "-R", slug, "--json", "headRefOid"], "the pull request head")
     if str((again or {}).get("headRefOid") or "").lower() != head:
         raise GateError("the pull request head moved while the checks were read")
-    return {"slug": slug, "number": number, "head": head, "no_ci": no_ci}, reasons
+    return {"slug": slug, "number": number, "head": head, "no_ci": no_ci, "unsettled": unsettled}, reasons
 
 
 def _resolve_graphql(client, node_ids):
@@ -1436,7 +1446,8 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
         if merge.kind == "graphql":
             slug, number = _resolve_graphql(client, merge.node_ids)
         details, soft = evaluate_pr(client, slug, number, merge.target)
-        info.update(repo=details["slug"], pr=details["number"], head=details["head"], no_ci=details.get("no_ci"))
+        info.update(repo=details["slug"], pr=details["number"], head=details["head"], no_ci=details.get("no_ci"),
+                    unsettled=details.get("unsettled") or [])
         if merge.kind != "check":
             if merge.head_unknown or not merge.head_vals:
                 hard.append(f"the merge must carry the verified head: add {merge.binding.replace('<full head sha>', details['head'])}")
@@ -1447,7 +1458,8 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
     if not hard and not soft:
         return True, "", info
     if not hard and info["head"]:
-        wid = consume_waiver(state_dir, info["repo"], info["pr"], info["head"], command_hash, now=now)
+        wid = consume_waiver(state_dir, info["repo"], info["pr"], info["head"], command_hash, now=now,
+                             review_ok=not info.get("unsettled"))
         if wid:
             info["waiver"] = wid
             return True, "", info
@@ -1540,9 +1552,11 @@ def _append_waiver_record(state_dir, record):
     return record
 
 
-def _active(records, repo, pr, head, now):
+def _active(records, repo, pr, head, now, review_ok=True):
     used = {r.get("waiver") for r in records if r.get("event") == "consume"}
     for r in records:
+        if not review_ok and r.get("approval_source") == "settled-review":
+            continue  # #134 red-team P1/B1: a review authorization never passes a failing, pending or missing check
         if (r.get("event") == "waive" and r.get("id") not in used and str(r.get("repo", "")).lower() == repo.lower()
                 and r.get("pr") == pr and r.get("head") == head and now < float(r.get("ts", 0)) + WAIVER_TTL_SECONDS):
             return r
@@ -1578,7 +1592,67 @@ def add_waiver(state_dir, repo, pr, head, ticket, reason, approved_by, source="a
     return record
 
 
-def consume_waiver(state_dir, repo, pr, head, command_hash, now=None):
+def add_review_waiver(state_dir, reference, *, store=None, now=None):
+    """Authorize only a loaded, settled, independent pure PR PASS FINAL.
+
+    All merge binding and reviewer identity comes from validated evidence; callers
+    cannot supply hashes or override them. Deterministic replay stays idempotent.
+    """
+    import usage_guard
+
+    store = store or usage_guard.UsageStore()
+    evidence = store.inspect(reference)
+    review = evidence.get('review')
+    if not isinstance(review, dict):
+        raise ValueError('merge authorization needs typed PR review FINAL evidence')
+    usage_guard.validate_review_metadata(review, result=evidence.get('result'))
+    usage = evidence.get('usage') if isinstance(evidence.get('usage'), dict) else {}
+    reviewer = review.get('reviewer', '')
+    reviewer_harness = review.get('reviewer_harness')
+    expected_prefix = {'openai': 'Codex ', 'claude': 'Claude '}.get(reviewer_harness)
+    if (evidence.get('review_finalization') != 'SETTLED'
+            or evidence.get('execution') != 'COMPLETED' or evidence.get('result') != 'CHECK_OK'
+            or evidence.get('reason') != 'NONE'
+            or evidence.get('invocation', {}).get('purpose') != 'peer-review-pr'
+            or review.get('stage') != 'PR' or review.get('verdict') != 'ACCEPT'
+            or review.get('findings') != [] or review.get('ticketed')
+            or not all(key in review for key in ('repo', 'pr', 'head', 'report_sha256'))
+            or evidence.get('subject', {}).get('head') != review['head']
+            or review.get('author_harness') not in {'claude', 'openai'}
+            or reviewer_harness not in {'claude', 'openai'}
+            or reviewer_harness == review['author_harness']
+            or not expected_prefix or not reviewer.startswith(expected_prefix)
+            or type(usage.get('provider_launches')) is not int or usage['provider_launches'] < 1):
+        raise ValueError('FINAL is not settled independent pure PR PASS evidence')
+    repo, pr, head = review['repo'], review['pr'], review['head']
+    report_sha256, final_sha256 = review['report_sha256'], reference['sha256']
+    state_dir = Path(state_dir)
+    wid = "mgw-review-" + hashlib.sha256(
+        f"{repo.lower()}|{pr}|{head}|{report_sha256}|{final_sha256}".encode("utf-8")).hexdigest()[:24]
+    lock = _lock(state_dir)
+    try:
+        records = _read_waivers(state_dir)
+        existing = next((row for row in records if row.get("event") == "waive" and row.get("id") == wid), None)
+        if existing is not None:
+            expected = (repo.lower(), pr, head, report_sha256, final_sha256)
+            actual = (existing.get("repo"), existing.get("pr"), existing.get("head"),
+                      existing.get("report_sha256"), existing.get("final_sha256"))
+            if actual != expected:
+                raise Corrupt("review waiver id does not match its evidence")
+            return existing
+        record = _append_waiver_record(state_dir, {
+            "event": "waive", "id": wid, "ts": now if now is not None else time.time(),
+            "repo": repo.lower(), "pr": pr, "head": head,
+            "ticket": "peer-review:" + report_sha256,
+            "reason": "Settled independent PR PASS bound to report and FINAL bytes",
+            "approved_by": "main:peer-review", "approval_source": "settled-review",
+            "reviewer": reviewer, "report_sha256": report_sha256, "final_sha256": final_sha256})
+    finally:
+        _unlock(lock)
+    return record
+
+
+def consume_waiver(state_dir, repo, pr, head, command_hash, now=None, review_ok=True):
     state_dir = Path(state_dir)
     try:
         lock = _lock(state_dir)
@@ -1586,7 +1660,7 @@ def consume_waiver(state_dir, repo, pr, head, command_hash, now=None):
         return None
     try:
         records = _read_waivers(state_dir)
-        waiver = _active(records, repo, pr, head, now or time.time())
+        waiver = _active(records, repo, pr, head, now or time.time(), review_ok)
         if not waiver:
             return None
         _append_waiver_record(state_dir, {"event": "consume", "waiver": waiver["id"], "ts": now or time.time(),
@@ -1717,10 +1791,15 @@ def decide(payload, runner, state_dir, now=None):
     plain = re.sub(r"[\"'\\$]", "", command)  # w''aive, $M and escaped spellings
     if STATE_NAMES.search(command) or STATE_NAMES.search(plain):
         return 2, "merge-gate: the waiver, audit and approval files are written only by merge_gate.py itself."
+    if subagent and PEER_REVIEW_AUTH.search(plain):
+        return 2, ("merge-gate: a subagent cannot run the PR review that mints a merge authorization (--github-repo/"
+                   "--pr); run it without the GitHub binding, or ask the main agent.")
     if subagent and (STATE_GLOB.search(plain) or _waiver_attempt(command)):
         return 2, "merge-gate: only the main agent may record a waiver; ask the main agent."
     if WAIVE_CMD.search(command) and not subagent:
         _stamp_waive(command, payload, state_dir, now)
+    if PEER_REVIEW_AUTH.search(plain):
+        _stamp_review(command, payload, now)
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
     merges = find_merges(command, cwd=cwd)
     if not merges:
@@ -1751,6 +1830,45 @@ def _stamp_waive(command, payload, state_dir, now):
         session = clean(payload.get("session_id") or "unknown", 40)
         put_stamp(state_dir, stamp_key(values["--repo"], int(values["--pr"]), values["--head"], values["--ticket"]),
                   "main:session-" + re.sub(r"[^A-Za-z0-9_.-]", "", session) + "(hook)", now)
+
+
+def _stamp_review(command, payload, now):
+    """B2: the peer_review run that may mint a merge authorization gets a one-shot stamp, only from proven main."""
+    import caller_identity  # noqa: PLC0415
+    if not caller_identity.is_main(payload) or not _plain_peer_review(command):
+        return
+    tokens, _ = tokenize(command)
+    values = {}
+    for index, token in enumerate(tokens):
+        for name in ("--github-repo", "--pr"):
+            if token == name and index + 1 < len(tokens):
+                values[name] = tokens[index + 1]
+            elif token.startswith(name + "="):
+                values[name] = token.split("=", 1)[1]
+    if values.get("--github-repo") and str(values.get("--pr", "")).isdigit():
+        caller_identity.put_stamp("review-auth", [values["--github-repo"], int(values["--pr"])],
+                                  session=str(payload.get("session_id") or ""), now=now)
+
+
+_SHELL_SYNTAX = re.compile(r"[\n;&|`<>]|\$\(")
+_PYTHON = re.compile(r"python3?(?:\.\d+)?")
+
+
+def _plain_peer_review(command):
+    """Delta red-team D-F6: only a single plain `python3 [-I] .../peer_review.py ...` command mints the stamp, not an
+    echo, a heredoc, a comment or a compound command that merely mentions its options."""
+    if _SHELL_SYNTAX.search(command):
+        return False
+    try:
+        argv = shlex.split(command, comments=False)
+    except ValueError:
+        return False
+    if not argv or not _PYTHON.fullmatch(os.path.basename(argv[0])):
+        return False
+    rest = argv[1:]
+    while rest and rest[0] in ("-I", "-u", "-B", "-E", "-s"):
+        rest = rest[1:]
+    return bool(rest) and os.path.basename(rest[0]) == "peer_review.py"
 
 
 def _deadline_seconds():

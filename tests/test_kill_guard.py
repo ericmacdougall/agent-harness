@@ -351,6 +351,69 @@ class Ownership(WorldCase):
                            runner=lambda *a, **k: None, policy=POLICY)
         self.assertEqual(own.check(4001)[1], 'no-worktree')
 
+    def test_main_can_stop_own_git_grep_and_server_but_not_foreign_or_dynamic_pids(self):
+        world = json.loads(json.dumps(WORLD))
+        world['pids'].update({
+            '4101': {'uid': 1000, 'comm': 'git', 'cwd': '/w/own/sub', 'argv': ['git', 'grep', 'needle'], 'start': 'g1'},
+            '4102': {'uid': 1000, 'comm': 'server', 'cwd': '/tmp',
+                     'argv': ['/w/own/bin/server', '--port', '8080'], 'start': 'g2'},
+            '4103': {'uid': 1000, 'comm': 'netwatch', 'cwd': '/w/own', 'argv': ['netwatch', 'daemon'], 'start': 'g3'},
+        })
+        for pid in (4101, 4102):
+            for command in ('kill %d' % pid, 'netwatch orphans --kill --pid %d' % pid):
+                with self.subTest(command=command):
+                    self.assertEqual(self.decide(command, world=world)[0], 'allow')
+        for command in ('kill 4004', 'kill 3901', 'kill 4009', 'kill 4008', 'kill $PID',
+                        'kill 4101 4004', 'netwatch orphans --kill --pid 4004',
+                        'netwatch orphans --kill --pid 4101,4004', 'netwatch orphans --kill --pid 4103',
+                        'netwatch orphans --kill --pid $PID'):
+            with self.subTest(command=command):
+                self.assertEqual(self.decide(command, world=world)[0], 'block')
+        self.assertEqual(self.decide('netwatch orphans --kill --pid 4103', world=world)[1], 'not-yours')
+
+    def test_main_in_home_can_use_netwatch_after_basic_checks(self):
+        # #134 made every netwatch kill need a worktree; main runs from HOME, which is never a worktree
+        world = json.loads(json.dumps(WORLD))
+        world['pids'].update({
+            '4201': {'uid': 1000, 'comm': 'node', 'cwd': '/tmp/elsewhere', 'argv': ['node', 'dev.js'], 'start': 'n1'},
+            '4202': {'uid': 1000, 'comm': 'zsh', 'cwd': '/tmp', 'argv': ['-zsh'], 'start': 'n2'},
+        })
+
+        def decide(cmd, main):
+            own = kg.Ownership(world['home'], home=world['home'], probe=FakeProbe(world),
+                               runner=lambda *a, **k: None, policy=POLICY)
+            return kg.decide(cmd, cwd=world['home'], ownership=own, policy=POLICY, home=self.home, main=main)
+
+        self.assertEqual(decide('netwatch orphans --kill --pid 4201', True)[0], 'allow')
+        self.assertEqual(decide('netwatch orphans --kill --pid 4201', False)[:2], ('block', 'not-yours'))  # sub-agent
+        self.assertEqual(decide('kill 4201', True)[0], 'block')  # only the netwatch route
+        for command in ('netwatch orphans --kill --pid 4008', 'netwatch orphans --kill --pid 4009',
+                        'netwatch orphans --kill --pid 4202', 'netwatch orphans --kill --pid %d' % os.getpid(),
+                        'netwatch orphans --kill --pid 4201,4008', 'netwatch orphans --kill --all',
+                        'netwatch orphans --kill --pid 9999'):
+            with self.subTest(command=command):
+                self.assertEqual(decide(command, True)[0], 'block')
+
+    def test_hook_payload_without_agent_id_is_main(self):
+        seen = []
+        real = kg.decide
+
+        def spy(command, **kw):
+            seen.append(kw.get('main'))
+            return 'allow', '', '', ()
+        sid = '11111111-2222-3333-4444-555555555555'
+        transcript = Path(self.home) / '.claude' / 'projects' / '-x' / (sid + '.jsonl')
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text('{}\n')
+        base = {'tool_name': 'Bash', 'tool_input': {'command': 'netwatch orphans'}, 'cwd': '/'}
+        with mock.patch.object(kg, 'decide', spy):
+            for payload in (dict(base, session_id=sid, transcript_path=str(transcript)),
+                            dict(base, session_id=sid, transcript_path=str(transcript), agent_id='sub'),
+                            base):  # #134 red-team B7: no agent_id is not main (every Codex payload)
+                kg.analyze_main(json.dumps(payload).encode())
+        self.assertEqual(seen, [True, False, False])
+        self.assertIs(kg.decide, real)
+
     def test_malformed_pids(self):
         for cmd in ('kill 001', 'kill １２３', 'kill 4194305', 'kill +4001', 'kill 0x4001', 'kill 4001abc', 'kill -- -4001'):
             self.assertEqual(self.decide(cmd)[0], 'block', cmd)
@@ -765,6 +828,19 @@ class RemoteSpawn(unittest.TestCase):
         verdict, rule, message, pids = self.decide('ssh dev2 kill 4242')
         self.assertEqual((verdict, rule), ('block', 'remote-kill'))
         self.assertIn('spawn --host dev2', message)
+
+    def test_netwatch_remote_unledgered_pids_need_foreign_route_or_remote_ledger(self):
+        verdict, rule, message, _pids = self.decide('ssh dev2 netwatch orphans --kill --pid 4242')
+        self.assertEqual((verdict, rule), ('block', 'remote-kill'))
+        self.assertIn('--foreign', message)
+        kg.append_ledger(kg.remote_root('dev2'), 4242, self.START, home=self.home)
+        same = lambda host, pid: self.START if (host, pid) == ('dev2', 4242) else None  # noqa: E731
+        self.assertEqual(self.decide('ssh dev2 netwatch orphans --kill --pid 4242', same)[0], 'allow')
+        for command in ('ssh dev2 netwatch orphans --kill --pid 4243',
+                        'ssh dev2 netwatch orphans --kill --pid 4242,4243',
+                        'ssh t2-dev netwatch orphans --kill --pid 4242'):
+            with self.subTest(command=command):
+                self.assertEqual(self.decide(command, same)[0], 'block')
 
     def test_spawned_pid_is_killable_only_on_its_host_while_its_start_time_matches(self):
         kg.append_ledger(kg.remote_root('dev2'), 4242, self.START, home=self.home)

@@ -119,6 +119,88 @@ class GateTests(Base):
         self.assertFalse(by["aliveowner"]["decision_required"])
         self.assertEqual(self.owners()["undisposed"], ["dropowner"])
 
+    def test_unacknowledged_owner_handoff_alerts_only_after_one_hour(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "agent-dropowner.jsonl", [{"at": iso(NOW), "event": "handoff", "note": "to main: result ready"}])
+        jl(w / "main.jsonl", [{"at": iso(NOW), "event": "subagent_stop", "agent_id": "dropowner",
+                              "agent_type": "task-owner"}])
+        self.assertNotIn("dropowner", self.owners()["undisposed"])
+        before = {r["agent_id"]: r for r in self.owners(now=NOW + ah.HANDOFF_ACK_S - 1)["owners"]}
+        self.assertNotIn("handoff-unacked", before["dropowner"]["flags"])
+        after = {r["agent_id"]: r for r in self.owners(now=NOW + ah.HANDOFF_ACK_S + 1)["owners"]}
+        self.assertIn("handoff-unacked", after["dropowner"]["flags"])
+        self.assertTrue(after["dropowner"]["decision_required"])
+
+    def test_live_waiting_disposition_acknowledges_handoff_until_it_expires(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "agent-dropowner.jsonl", [
+            {"at": iso(NOW - ah.HANDOFF_ACK_S - 1), "event": "handoff", "note": "to main: blocked on an ask"}])
+        before = {r["agent_id"]: r for r in self.owners()["owners"]}
+        self.assertIn("handoff-unacked", before["dropowner"]["flags"])
+        import caller_identity
+        caller_identity.put_stamp("ack-handoff", ["dropowner"], home=self.home)  # what main's hook writes
+        self.dispose("waiting", "disp-handoff-wait", until=iso(NOW + 3600), ref="wa5b00000001", ack_handoff=True)
+        waiting = {r["agent_id"]: r for r in self.owners()["owners"]}
+        self.assertNotIn("handoff-unacked", waiting["dropowner"]["flags"])
+        self.assertFalse(waiting["dropowner"]["decision_required"])
+        expired = {r["agent_id"]: r for r in self.owners(now=NOW + 3601)["owners"]}
+        self.assertIn("handoff-unacked", expired["dropowner"]["flags"])
+        self.assertTrue(expired["dropowner"]["decision_required"])
+
+    def test_a_wait_without_ack_handoff_does_not_acknowledge(self):
+        # #134 red-team P4: the owner records its own wait; the unacknowledged handoff must stay visible
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "agent-dropowner.jsonl", [
+            {"at": iso(NOW - ah.HANDOFF_ACK_S - 1), "event": "handoff", "note": "to main: done-ish"}])
+        with mock.patch.dict(os.environ, {"AH_AGENT_ID": "dropowner"}):
+            self.dispose("waiting", "self-wait", until=iso(NOW + 3 * 86400), ref="wa5b00000001")
+        later = {r["agent_id"]: r for r in self.owners(now=NOW + 3600)["owners"]}
+        self.assertIn("handoff-unacked", later["dropowner"]["flags"])
+        self.assertTrue(later["dropowner"]["decision_required"])
+
+    def test_the_owner_cannot_ack_its_own_handoff(self):
+        with mock.patch.dict(os.environ, {"AH_AGENT_ID": "dropowner"}):
+            with self.assertRaises(ah.AhError) as caught:
+                self.dispose("waiting", "self-ack", until=iso(NOW + 3600), ref="wa5b00000001", ack_handoff=True)
+        self.assertEqual(caught.exception.code, "forbidden")
+
+    def test_ack_handoff_without_mains_stamp_is_refused(self):
+        # #134 red-team B4: AH_AGENT_ID is never set, so a copied script or Codex owner could ack itself
+        with self.assertRaises(ah.AhError) as caught:
+            self.dispose("waiting", "nostamp-ack", until=iso(NOW + 3600), ref="wa5b00000005", ack_handoff=True)
+        self.assertEqual(caught.exception.code, "forbidden")
+        self.assertIn("only the main agent", str(caught.exception))
+
+    def test_only_proven_main_is_stamped_and_codex_payloads_are_denied(self):
+        import caller_identity
+        sid = "11111111-2222-3333-4444-555555555555"
+        transcript = self.home / ".claude" / "projects" / "-x" / (sid + ".jsonl")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text("{}\n")
+        cmd = ("python3 ~/.claude/hooks/ah.py task dispose --agent owner-7 --kind waiting --ack-handoff --ref "
+               "wa5b00000006 --until 2026-11-09T00:00:00Z")
+        codex = {"tool_name": "Bash", "tool_input": {"command": cmd}, "session_id": sid}
+        out = dropped_gate.cmd_pretool(codex)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(caller_identity.take_stamp("ack-handoff", ["owner-7"], home=self.home))
+        main = dict(codex, transcript_path=str(transcript))
+        self.assertEqual(dropped_gate.cmd_pretool(main), {})
+        self.assertIsNotNone(caller_identity.take_stamp("ack-handoff", ["owner-7"], home=self.home))
+
+    def test_ack_handoff_needs_kind_waiting(self):
+        with self.assertRaises(ah.AhError):
+            self.dispose("resumed", "bad-ack", ack_handoff=True)
+
+    def test_subagent_cannot_run_an_acknowledging_wait(self):
+        for cmd in ("python3 ~/.claude/hooks/ah.py task dispose --agent x --kind waiting --ack-handoff --ref "
+                    "wa5b00000004 --until 2026-11-09T00:00:00Z",
+                    "ah task dispose --agent x --kind waiting --ack-hand --ref wa5b00000004 --until X"):
+            out = dropped_gate.cmd_pretool({"agent_id": "sub", "tool_name": "Bash", "tool_input": {"command": cmd}})
+            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny", cmd)
+        plain = "ah task dispose --agent x --kind waiting --ref wa5b00000004 --until X"
+        self.assertEqual(dropped_gate.cmd_pretool({"agent_id": "sub", "tool_name": "Bash",
+                                                   "tool_input": {"command": plain}}), {})
+
     def test_gate_exit_code_never_prints_zero_dropped(self):
         buf = io.StringIO()
         with redirect_stdout(buf), mock.patch.object(ah.time, "time", return_value=NOW):
@@ -344,6 +426,40 @@ class SubagentStopGate(Base):
         jl(w / "agent-waitowner.jsonl", [{"at": iso(NOW - 30), "event": "blocker", "note": "waiting on wa5b00000001"}])
         self.assertEqual(self.sstop("doneowner"), {})
         self.assertEqual(self.sstop("waitowner"), {})
+
+    def test_immediate_handoff_and_result_have_no_pending_work_but_an_intent_does(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        for event in ("handoff", "result"):
+            agent = "immediate-" + event
+            jl(w / ("agent-%s.jsonl" % agent), [
+                {"at": iso(NOW - 20), "event": "intent", "note": "finishing the slice"},
+                {"at": iso(NOW), "event": event, "note": "returned to main"},
+                {"at": iso(NOW), "event": "pretool", "tool": "Bash"},
+            ])
+            with self.subTest(event=event):
+                self.assertIsNone(dropped_gate.pending_work(self.home, SESSION, agent))
+                self.assertEqual(self.sstop(agent), {})
+        jl(w / "agent-immediate-intent.jsonl", [{"at": iso(NOW), "event": "intent", "note": "still running"}])
+        self.assertIsNotNone(dropped_gate.pending_work(self.home, SESSION, "immediate-intent"))
+
+    def test_the_block_message_names_only_commands_that_exist(self):
+        # goodqa#15253: the message told agents to "arm a waiter with `ah job wait`", and ah has no job command
+        import re as _re
+        import shlex as _shlex
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "agent-msgowner.jsonl", [{"at": iso(NOW - 60), "event": "intent", "note": "running the suite"}])
+        with mock.patch.object(dropped_gate, "armed_waiter", return_value=False):
+            text = self.sstop("msgowner").get("reason") or ""
+        self.assertIn("ah task dispose", text)
+        self.assertNotIn("ah job", text)
+        commands = [c for c in _re.findall(r"`([^`]+)`", text) if c.startswith("ah ")]
+        self.assertTrue(commands, text)
+        fill = {"<ask id or GoodQA ticket>": "wa5b00000001", "<ISO>": "2026-11-09T00:00:00Z"}
+        for command in commands:
+            for hole, value in fill.items():
+                command = command.replace(hole, value)
+            with self.subTest(command=command):
+                ah.build_parser().parse_args(_shlex.split(command)[1:])  # SystemExit (a failure) if it does not parse
 
     def test_armed_waiter_does_not_block(self):
         w = self.home / ".claude" / "wals" / SESSION

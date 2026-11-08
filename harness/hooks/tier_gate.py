@@ -142,7 +142,12 @@ def decide_spawn(data, policy, ledger, *, session_id=None):
             facts['downgrade_reason'] = reason.group(1)
             return 'allow', 'below rung %s with recorded reason' % target_rung, None, facts
         return 'deny', 'task %s is at rung %s; %s %s is below it (add [rung-below:<reason>] to go lower)' % (task, target_rung, requested['model'], requested['effort']), None, facts
-    # Above the computed rung: not earned, downgrade deterministically.
+    # Above the computed rung: writers are downgraded deterministically, but an explicit reviewer request must not
+    # silently become a weaker review. Name both rungs so the caller can retry at the effective target deliberately.
+    if is_reviewer:
+        return 'deny', ('reviewer request %s %s is rung %s, above the effective target rung %s; explicit above-target '
+                        'reviewer model/effort is denied, not downgraded' % (
+                            requested['model'], requested['effort'], req_rung, target_rung)), None, facts
     updated = {**tool_input, 'model': target['model'], 'effort': target['effort']}
     return 'allow', 'requested %s %s is above rung %s; downgraded' % (requested['model'], requested['effort'], target_rung), updated, facts
 

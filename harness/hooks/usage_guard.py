@@ -1095,6 +1095,75 @@ class UsageStore:
                              'AVAILABILITY_ACK', actor=actor, reason=reason, evidence=evidence)
 
 
+TICKETED_CATEGORIES = {'correctness', 'reliability', 'performance', 'maintainability', 'testing', 'documentation', 'ux'}
+REVIEW_METADATA_KEYS = {'stage', 'verdict', 'findings', 'report_sha256', 'head', 'repo', 'pr', 'ticketed',
+                        'reviewer', 'reviewer_harness', 'author_harness'}
+REVIEWER_IDENTITY_KEYS = {'reviewer', 'reviewer_harness', 'author_harness'}
+TICKETED_RECORD_KEYS = {'state', 'finding', 'category', 'ticket', 'head', 'report_sha256'}
+
+
+def validate_review_metadata(review, *, result):
+    """Validate optional PR identity and ticketed records without changing legacy receipts."""
+    if (not isinstance(review, dict) or set(review) - REVIEW_METADATA_KEYS
+            or not {'stage', 'verdict', 'findings'} <= set(review)
+            or review['stage'] not in STAGES
+            or review['verdict'] not in {'ACCEPT', 'BLOCK', 'ACCEPT_WITH_TICKETS'}
+            or not isinstance(review['findings'], list) or len(review['findings']) > 128):
+        raise GuardError('INVALID_OUTPUT', 'Review metadata is malformed')
+    for finding in review['findings']:
+        safe_label(finding)
+    for key in ('report_sha256', 'head'):
+        if key in review and (not isinstance(review[key], str)
+                              or not re.fullmatch(r'[0-9a-f]{64}' if key == 'report_sha256'
+                                                  else r'[0-9a-f]{40}|[0-9a-f]{64}', review[key])):
+            raise GuardError('INVALID_OUTPUT', 'Review report or head binding is malformed')
+    if ('repo' in review) != ('pr' in review):
+        raise GuardError('INVALID_OUTPUT', 'Review repository and PR must be bound together')
+    if 'repo' in review:
+        if (review['stage'] != 'PR' or not isinstance(review['repo'], str)
+                or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', review['repo'])
+                or type(review['pr']) is not int or review['pr'] <= 0):
+            raise GuardError('INVALID_OUTPUT', 'Review repository or PR binding is malformed')
+    identity = REVIEWER_IDENTITY_KEYS & set(review)
+    if identity:
+        if (identity != REVIEWER_IDENTITY_KEYS or review['stage'] != 'PR'
+                or not isinstance(review.get('reviewer'), str)
+                or not 3 <= len(review['reviewer']) <= 160
+                or review.get('reviewer_harness') not in {'claude', 'openai', 'unknown'}
+                or review.get('author_harness') not in {'claude', 'openai', 'unknown'}):
+            raise GuardError('INVALID_OUTPUT', 'Review author and actual reviewer identity are malformed')
+        safe_text(review['reviewer'], maximum=160)
+    ticketed = review.get('ticketed', [])
+    if not isinstance(ticketed, list) or len(ticketed) > 128:
+        raise GuardError('INVALID_OUTPUT', 'Ticketed review records are malformed')
+    if ticketed and (review['stage'] != 'PR' or review['verdict'] != 'ACCEPT_WITH_TICKETS'
+                     or not review.get('head') or not review.get('report_sha256')):
+        raise GuardError('INVALID_OUTPUT', 'Ticketed review records need a PR report and head binding')
+    if review['verdict'] == 'ACCEPT_WITH_TICKETS' and not ticketed:
+        raise GuardError('INVALID_OUTPUT', 'PASS-with-tickets needs ticketed finding records')
+    recorded = []
+    for record in ticketed:
+        if (not isinstance(record, dict) or set(record) != TICKETED_RECORD_KEYS
+                or record.get('state') != 'ticketed' or record.get('category') not in TICKETED_CATEGORIES
+                or record.get('head') != review.get('head')
+                or record.get('report_sha256') != review.get('report_sha256')):
+            raise GuardError('INVALID_OUTPUT', 'Ticketed finding record is malformed or not bound to this report')
+        safe_label(record.get('finding'))
+        safe_text(record.get('ticket'), maximum=100)
+        if not re.fullmatch(r'GoodQA [a-z0-9][a-z0-9-]{0,62}#[1-9]\d{0,9}', record['ticket']):
+            raise GuardError('INVALID_OUTPUT', 'Ticketed finding has a malformed ticket')
+        recorded.append(record['finding'])
+    if ((ticketed or review['verdict'] == 'ACCEPT_WITH_TICKETS')
+            and (len(set(recorded)) != len(recorded) or set(recorded) != set(review['findings']))):
+        raise GuardError('INVALID_OUTPUT', 'Every accepted finding must have exactly one ticketed record')
+    if result == 'CHECK_OK' and not (
+            review['verdict'] == 'ACCEPT' and not review['findings']
+            or review['verdict'] == 'ACCEPT_WITH_TICKETS' and ticketed):
+        raise GuardError('INVALID_OUTPUT', 'Blocked review findings cannot be successful evidence')
+    if review['verdict'] != 'BLOCK' and result != 'CHECK_OK':
+        raise GuardError('INVALID_OUTPUT', 'Accepted review evidence requires a successful result')
+
+
 class Run:
     def __init__(self, store, subject, start, reference):
         self.store, self.subject, self.start, self.start_ref = store, subject, start, reference
@@ -1120,13 +1189,7 @@ class Run:
         if self.start['command_kind'] in {'focused', 'full'} and result == 'CHECK_OK' and (type(count) is not int or count < 1):
             result, reason = 'NO_RESULT', 'INVALID_OUTPUT'
         if review is not None:
-            if (not isinstance(review, dict) or set(review) != {'stage', 'verdict', 'findings'}
-                    or review['stage'] not in STAGES or review['verdict'] not in {'ACCEPT', 'BLOCK'}
-                    or not isinstance(review['findings'], list) or len(review['findings']) > 128):
-                raise GuardError('INVALID_OUTPUT', 'Review metadata is malformed')
-            for finding in review['findings']: safe_label(finding)
-            if result == 'CHECK_OK' and (review['verdict'] != 'ACCEPT' or review['findings']):
-                raise GuardError('INVALID_OUTPUT', 'Blocked review findings cannot be successful evidence')
+            validate_review_metadata(review, result=result)
         value = {'schema': SCHEMA, 'kind': 'final', 'run_id': self.run_id, 'evidence': 'EXECUTED',
                  'subject': dict(self.subject), 'invocation': self.start['invocation'],
                  'started_at': self.start['started_at'], 'ended_at': datetime.now(timezone.utc).isoformat(),

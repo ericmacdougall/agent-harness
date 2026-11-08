@@ -9673,7 +9673,7 @@
    ]
   },
   {
-   "cmd": "netwatch orphans --kill --pid 4242",
+   "cmd": "netwatch orphans --kill --pid 4001",
    "expect": "allow",
    "id": "N-nw-pid",
    "tags": [
@@ -9681,7 +9681,7 @@
    ]
   },
   {
-   "cmd": "netwatch orphans --kill --pid 4242,4243",
+   "cmd": "netwatch orphans --kill --pid 4001,4002",
    "expect": "allow",
    "id": "N-nw-pids",
    "tags": [
@@ -9689,7 +9689,7 @@
    ]
   },
   {
-   "cmd": "netwatch orphans --kill --pid=4242",
+   "cmd": "netwatch orphans --kill --pid=4001",
    "expect": "allow",
    "id": "N-nw-pid-eq",
    "tags": [
@@ -9697,7 +9697,7 @@
    ]
   },
   {
-   "cmd": "~/.agent-harness/bin/netwatch orphans --kill --pid 4242",
+   "cmd": "~/.agent-harness/bin/netwatch orphans --kill --pid 4001",
    "expect": "allow",
    "id": "N-nw-path",
    "tags": [
@@ -9705,7 +9705,7 @@
    ]
   },
   {
-   "cmd": "netwatch orphans --json --kill --pid 4242",
+   "cmd": "netwatch orphans --json --kill --pid 4001",
    "expect": "allow",
    "id": "N-nw-json",
    "tags": [
@@ -9713,7 +9713,7 @@
    ]
   },
   {
-   "cmd": "netwatch orphans -kill -pid 4242",
+   "cmd": "netwatch orphans -kill -pid 4001",
    "expect": "allow",
    "id": "N-nw-single-dash",
    "tags": [
@@ -9722,7 +9722,7 @@
   },
   {
    "cmd": "ssh host netwatch orphans --kill --pid 4242",
-   "expect": "allow",
+   "expect": "block",
    "id": "N-ssh-nw-pid",
    "tags": [
     "netwatch",
@@ -9731,7 +9731,7 @@
   },
   {
    "cmd": "ssh host ~/.agent-harness/bin/netwatch orphans --kill --pid 4242,4243",
-   "expect": "allow",
+   "expect": "block",
    "id": "N-ssh-nw-path",
    "tags": [
     "netwatch",
@@ -10315,7 +10315,7 @@
    ]
   },
   {
-   "cmd": "netwatch orphans --kill --pid 4242",
+   "cmd": "netwatch orphans --kill --pid 4001",
    "expect": "allow",
    "id": "N-rt22-nw-orphans-kill-pid",
    "tags": [

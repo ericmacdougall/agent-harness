@@ -432,7 +432,12 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         if r["owner"] and r["state"] == "handoff":
             handed = parse_ts(r["last_activity"]) or 0.0
             d = disp.get(r["agent_id"])
-            acked = bool(d and d.get("kind") in ("resumed", "reassigned") + GUARDED_KINDS and float(d.get("at") or 0) >= handed - 10)
+            kind = d.get("kind") if d else None
+            # #134 red-team P4: only main's wait acknowledges, marked --ack-handoff (an owner cannot set it)
+            acknowledged = kind in ("resumed", "reassigned") + GUARDED_KINDS or (
+                kind == "waiting" and d.get("ack_handoff") is True
+                and liveness.disposition_live(d, now, last_activity=handed))
+            acked = bool(acknowledged and float(d.get("at") or 0) >= handed - 10)
             if not acked and now - handed >= HANDOFF_ACK_S:
                 r["decision_required"] = True
                 r["flags"] = list(r.get("flags") or []) + ["handoff-unacked"]
@@ -553,7 +558,7 @@ def index_transcript(home: Path, session: str) -> dict:
             if content is not None:
                 digest = hashlib.sha256(content.encode()).hexdigest()[:12]
                 idx["msgs"].append(_msg("queued", f"queue:{session}/{rec.get('timestamp')}#{digest}",
-                                        rec.get("timestamp"), content, prov.QUEUE_TRUST, off))
+                                        rec.get("timestamp"), prov.strip_blocks(content), prov.QUEUE_TRUST, off))
     idx["askq"] = sorted(askq)
     atomic_json(cache, idx)
     return idx
@@ -594,8 +599,9 @@ def verify_rows(path: Path, rows: list) -> list:
                 text, _ = prov.user_authorship(rec)
                 good = text is not None and rec.get("uuid") == m["id"].split("/", 1)[1]
             elif m["kind"] == "queued":
-                text = prov.queue_user_text(rec)
-                good = text is not None and m["id"].endswith("#" + hashlib.sha256(text.encode()).hexdigest()[:12])
+                raw = prov.queue_user_text(rec)
+                good = raw is not None and m["id"].endswith("#" + hashlib.sha256(raw.encode()).hexdigest()[:12])
+                text = prov.strip_blocks(raw) if raw is not None else None
             else:
                 text = _answer_values_cache(rec, path)
                 good = text is not None and rec.get("uuid") == m["id"].split("/", 1)[1]
@@ -618,6 +624,35 @@ def _answer_values_cache(rec, path: Path):
 def _msg(kind, ident, ts, text, trust, off=None):
     return {"id": ident, "kind": kind, "timestamp": ts, "trust": trust, "text": text[:8000], "chars": len(text),
             "off": off}
+
+
+def _message_source(row):
+    """A verified citation and its shell-quoted --source argument, ready to paste into wal_note.
+
+    The transcript index has already established authorship. Reuse the provenance parser and excerpt
+    matcher rather than maintaining a second, subtly different source grammar. Very short or unusual
+    messages may need a human-chosen excerpt; never emit a citation that did not verify.
+    """
+    import provenance  # noqa: PLC0415
+    import shlex  # noqa: PLC0415
+
+    ident = row["id"].replace("uuid:", "user:", 1)
+    normalized = re.sub(r"\s+", " ", row["text"]).strip()
+    chunks = [normalized] + [part.strip() for part in normalized.split("...")]
+    for chunk in chunks:
+        for size in (120, 80, 60, 40, 24, 12):  # no more than the existing preview exposes
+            excerpt = chunk[:size].strip()
+            if len(excerpt) < provenance.EXCERPT_MIN:
+                continue
+            source = f'{ident} "{excerpt.replace(chr(34), chr(92) + chr(34))}"'
+            try:
+                parsed = provenance.parse_source(source)
+                if parsed["excerpt"] != excerpt or provenance.excerpt_in(row["text"], parsed["excerpt"]):
+                    continue
+            except provenance.Problem:
+                continue
+            return {"source": source, "source_arg": "--source " + shlex.quote(source)}
+    return {"source_error": "no automatically verified excerpt; use --full and quote exact user text"}
 
 
 def user_msgs(home: Path, session: str, text=None, recent=None, full=False, limit=20) -> dict:
@@ -653,6 +688,7 @@ def user_msgs(home: Path, session: str, text=None, recent=None, full=False, limi
     out = out[-limit:]
     for r in out:
         r["preview"] = re.sub(r"\s+", " ", r["text"]).strip()[:120]
+        r.update(_message_source(r))
         if not full:
             del r["text"]
     return {"session": session, "matches": out, "source": "direct"}
@@ -952,6 +988,8 @@ def precheck(op: str, args: dict) -> None:
             raise AhError("bad_request", "task.dispose: agent must be an agent id or a task WAL name")
         if parse_ts(args["at"]) is None:
             raise AhError("bad_request", "task.dispose: at must be an ISO timestamp")
+        if args.get("ack_handoff") not in (None, True) or (args.get("ack_handoff") and args["kind"] != "waiting"):
+            raise AhError("bad_request", "task.dispose: --ack-handoff goes with --kind waiting only")
         if args["kind"] == "waiting":
             if parse_ts(args.get("until") or "") is None:
                 raise AhError("bad_request", "task.dispose waiting: --until <ISO time> is required (when it expires)")
@@ -1616,7 +1654,7 @@ def dispositions(home: Path, session: str, ledger=None) -> dict:
         if r.get("op") == "task.dispose" and a.get("session") == session:
             d = {"kind": a.get("kind"), "at": parse_ts(a.get("at")) or 0.0, "ref": a.get("ref"),
                  "reason": a.get("reason"), "evidence": a.get("evidence"), "seq": r.get("seq")}
-            for k in ("deployed", "live_test", "gate_epoch"):
+            for k in ("deployed", "live_test", "gate_epoch", "ack_handoff"):
                 if a.get(k):
                     d[k] = a[k]
             if a.get("until"):
@@ -2065,7 +2103,15 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
     tag = {"kind": args.get("kind"), "agent": args.get("agent")} if op == "task.dispose" else {}
     guarded = op == "task.dispose" and args.get("kind") in GUARDED_KINDS
     try:
-        if op == "task.dispose" and args.get("kind") in ("resumed", "reassigned") + GUARDED_KINDS \
+        if op == "task.dispose" and args.get("ack_handoff"):
+            import caller_identity  # noqa: PLC0415
+            # #134 red-team B4: AH_AGENT_ID is not set by any launcher, so the self-ack check below cannot be the
+            # control. A main payload's hook stamps this agent; anything else (a sub-agent, Codex, a script) has none.
+            if caller_identity.take_stamp("ack-handoff", [args.get("agent")], home=home) is None:
+                raise AhError("forbidden", "task.dispose --ack-handoff: only the main agent acknowledges a handoff (its "
+                                           "hook stamps the call); none was found for " + str(args.get("agent")), 3)
+        if op == "task.dispose" and (args.get("kind") in ("resumed", "reassigned") + GUARDED_KINDS
+                                     or args.get("ack_handoff")) \
                 and actor_id() == args.get("agent"):  # first, so an owner's self-ack is named as such
             raise AhError("forbidden", f"task.dispose {args['kind']}: an owner cannot acknowledge itself; main records it "
                                        "(waiting is allowed)", 3)
@@ -2198,7 +2244,11 @@ def render_text(cmd: str, data: dict) -> str:
                          f"{(r['ticket'] or '-'):<18} c-age {fmt_age(r['ticket_comment_age_s']):>6}  {(r['task'] or '')[:70]}")
         return "\n".join(lines)
     if cmd == "user-msg":
-        return "\n".join(f"{m['id']}  [{m['kind']}] {m['timestamp']}  {m['preview']}" for m in data["matches"]) or "no match"
+        lines = []
+        for m in data["matches"]:
+            lines.append(f"{m['id']}  [{m['kind']}] {m['timestamp']}  {m['preview']}")
+            lines.append("  " + (m.get("source_arg") or "source unavailable: " + m.get("source_error", "choose an exact excerpt")))
+        return "\n".join(lines) or "no match"
     if cmd == "disk":
         lines = [f"{data['host']} ({data.get('os', '?')}) capacity volume: {data.get('capacity_volume')}"]
         for v in data["volumes"]:
@@ -2618,6 +2668,8 @@ def build_parser():
     dp.add_argument("--kind", required=True, choices=list(liveness.DISPOSITIONS))
     dp.add_argument("--ref", help="waiting: ask id or ticket; reassigned: replacement agent id")
     dp.add_argument("--until", help="waiting: ISO time when the wait expires")
+    dp.add_argument("--ack-handoff", dest="ack_handoff", action="store_true",
+                    help="waiting: main acknowledges this owner's handoff while the wait is live (main only)")
     dp.add_argument("--reason", help="closed, superseded, wontdo: what you verified about this owner (40+ characters)")
     dp.add_argument("--deployed", help="closed: WAL id of the deploy, release or install record naming this owner")
     dp.add_argument("--live-test", dest="live_test", help="closed: REALLY_TESTED id run against the live target")
@@ -2752,7 +2804,7 @@ def run(args, home: Path) -> dict:
             return write(home, "task.register", a, s, args.key)
         if args.sub == "dispose":
             a = {"agent": args.agent, "session": s or "", "kind": args.kind, "at": iso(time.time())}
-            for opt in ("ref", "until", "reason", "evidence", "deployed", "live_test"):
+            for opt in ("ref", "until", "reason", "evidence", "deployed", "live_test", "ack_handoff"):
                 if getattr(args, opt):
                     a[opt] = getattr(args, opt)
             return write(home, "task.dispose", a, s, args.key)

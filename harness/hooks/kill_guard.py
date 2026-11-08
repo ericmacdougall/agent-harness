@@ -13,6 +13,9 @@ What it blocks, before the command runs, on Claude Code (Bash, PowerShell) and C
   * a plain `kill PID` unless every target is a literal PID that is provably the caller's own: its cwd, or argv[0]
     or argv[1], is inside the caller's own git worktree (the toplevel of the tool call's cwd), or it is in the
     per-worktree spawn ledger written by `kill_guard.py spawn -- CMD...`;
+  * `netwatch orphans --kill --pid N[,N...]` unless every PID passes the same ownership proof, except that the main
+    agent (proven by caller_identity.is_main) outside any git worktree, such as main in HOME, needs only the basic checks
+    (not init, not its own ancestor, same uid, not a protected process or interactive shell);
   * every kill inside ssh, mosh, docker exec and kubectl exec (ownership cannot be checked locally) except
     `netwatch orphans --kill --pid N[,N...]`, and `ssh HOST kill [-SIG] PID...` where every PID was started by
     `kill_guard.py spawn --host HOST -- CMD...` (recorded with its start time in a per-host ledger) and the host
@@ -693,12 +696,15 @@ class Ownership:
         norm = os.path.normpath(path)
         return under(norm, root) and not any(under(norm, n) for n in nested)
 
-    def check(self, pid):
-        if pid not in self._memo:
-            self._memo[pid] = self._check(pid)
-        return self._memo[pid]
+    def check(self, pid, main_netwatch=False):
+        """main_netwatch: the main agent's `netwatch orphans --kill --pid` outside any worktree, where the basic
+        checks are the whole proof (no worktree can own the PID, and netwatch only signals listed orphans)."""
+        key = (pid, bool(main_netwatch))
+        if key not in self._memo:
+            self._memo[key] = self._check(pid, main_netwatch)
+        return self._memo[key]
 
-    def _check(self, pid):
+    def _check(self, pid, main_netwatch=False):
         if pid <= 1:
             return False, 'protected', 'pid %d is init or invalid' % pid
         if pid in self.ancestors():
@@ -719,6 +725,8 @@ class Ownership:
             if len(shell_argv) <= 1 or shell_argv[0].startswith('-'):
                 return False, 'protected', 'pid %d is an interactive shell' % pid
         root, nested = self.tree()
+        if not root and main_netwatch:
+            return True, 'main-netwatch', 'main agent outside a worktree; basic checks passed'
         if not root:
             return False, 'no-worktree', 'pid %d is not provably yours: this call is not in a git worktree' % pid
         if self._ledger is None:
@@ -749,8 +757,9 @@ def _import_base():
 
 def make_analyzer_class(cg):
     class KillAnalyzer(cg.Analyzer):
-        def __init__(self, compiled, cwd, ps, ownership, policy, raw):
+        def __init__(self, compiled, cwd, ps, ownership, policy, raw, main=False):
             super().__init__(compiled, cwd=cwd, ps=ps)
+            self.main = bool(main)  # caller_identity.is_main proved main; only the netwatch route uses it
             self.own = ownership
             self.policy = policy
             self.raw = raw
@@ -1510,7 +1519,7 @@ def make_analyzer_class(cg):
             low = [t.lower() for t in rest]
             if not any(t in ('-kill', '--kill') or t.startswith(('-kill=', '--kill=')) for t in low + [b.lower() for b in before]):
                 return  # listing only
-            bad, has_pid, i = None, False, 0
+            bad, has_pid, i, pids = None, False, 0, []
             if any(a.dynamic or a.subs for a in args):
                 bad = 'a dynamic argument'
             elif any(t.startswith('-') for t in before):
@@ -1523,11 +1532,16 @@ def make_analyzer_class(cg):
                     value = rest[i + 1] if i + 1 < len(rest) else ''
                     if not PID_OPT_VALUE.fullmatch(value):
                         bad = '--pid needs digits'
+                    else:
+                        pids.extend(int(p) for p in value.split(','))
                     has_pid = True
                     i += 2
                 elif t.startswith(('-pid=', '--pid=')):
-                    if not PID_OPT_VALUE.fullmatch(rest[i].split('=', 1)[1]):
+                    value = rest[i].split('=', 1)[1]
+                    if not PID_OPT_VALUE.fullmatch(value):
                         bad = '--pid needs digits'
+                    else:
+                        pids.extend(int(p) for p in value.split(','))
                     has_pid = True
                     i += 1
                 else:
@@ -1539,6 +1553,17 @@ def make_analyzer_class(cg):
             if bad:
                 self.block('netwatch-broad', 'netwatch orphans --kill is allowed only as --pid N[,N...] (%s); '
                            '--all, --force and --match need the user' % bad)
+                return
+            if self.remote:
+                ok, reason = self.remote_spawn_ok(pids)
+                if not ok:
+                    self.block('remote-kill', reason + '; an unledgered remote PID needs the audited --foreign route', pids)
+                return
+            for pid in dict.fromkeys(pids):
+                ok, _code, detail = self.own.check(pid, main_netwatch=self.main)
+                if not ok:
+                    self.block('not-yours', detail, [pid])
+                    break
 
         def remote_spawn_ok(self, pids):
             """`ssh HOST kill [-SIG] PID...` passes only when this is a single literal ssh hop (no container, no
@@ -1674,8 +1699,9 @@ def parse_kill_words(args, remote=False):
     return None, signal, list(args[rest:])
 
 
-def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=None, home=None):
-    """Return (verdict, rule, message, pids): verdict is 'allow', 'warn' or 'block'. Never raises."""
+def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=None, home=None, main=False):
+    """Return (verdict, rule, message, pids): verdict is 'allow', 'warn' or 'block'. Never raises.
+    main: the caller is proven to be the main agent (caller_identity.is_main). Default False, the stricter reading."""
     policy = policy or load_policy()
     if policy['mode'] == 'off':
         return 'allow', '', '', ()
@@ -1690,7 +1716,7 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
             raise cg.Blocked('command is larger than the analysis limit')
         effective = cwd or compiled.cwd
         own = ownership or Ownership(effective, home=home, policy=policy)
-        analyzer = make_analyzer_class(cg)(compiled, effective, ps, own, policy, raw)
+        analyzer = make_analyzer_class(cg)(compiled, effective, ps, own, policy, raw, main=main)
         findings = analyzer.run_kill_scan(command)
         if not findings:
             for base in analyzer.ctx.findings:
@@ -1798,7 +1824,9 @@ def analyze_main(data=None):
                 return 0
             command = text  # a tool the launcher treats as a shell tool (a command/cmd/script key): judge its text
         cwd = cg.payload_cwd(payload)
-        verdict, _rule, message, _pids = decide(command, cwd=cwd, ps=ps, policy=policy)
+        import caller_identity  # noqa: PLC0415 - positive main proof, not the absence of agent_id (B7)
+        main = caller_identity.is_main(payload)
+        verdict, _rule, message, _pids = decide(command, cwd=cwd, ps=ps, policy=policy, main=main)
         return emit(verdict, message)
     except TimeoutError:
         if fallback_blocks(raw):

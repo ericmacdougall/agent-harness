@@ -64,6 +64,7 @@ def message(undisposed: list, rows: dict) -> str:
             lines.append(f"  - {agent} handed off {age} ago and nobody acknowledged it: main (not the owner) records\n"
                          f"      ah task dispose --agent {agent} --kind resumed      (someone picked it up)\n"
                          f"      ah task dispose --agent {agent} --kind reassigned --ref <new agent id>\n"
+                         f"      ah task dispose --agent {agent} --kind waiting --ack-handoff --ref <ask id or GoodQA ticket> --until <ISO>\n"
                          f"      ah task dispose --agent {agent} --kind closed --reason <what you verified> --deployed <deploy WAL id> "
                      f"--live-test <live REALLY_TESTED id>\n"
                      f"      ah task dispose --agent {agent} --kind superseded|wontdo --ref <GoodQA ticket> --reason <why>")
@@ -218,7 +219,8 @@ def cmd_subagent_stop(payload: dict, now: float | None = None) -> dict:
     seen = state.setdefault("subagent_blocks", {})
     text = (f"Sub-agent {agent} is ending its turn with pending work ({why}) and no armed waiter (goodqa#14791 I7). "
             f"Before stopping: write a handoff or result WAL entry, or name the wait with `ah task dispose --agent {agent} "
-            f"--kind waiting --ref <ask id or GoodQA ticket> --until <ISO>`, or arm a waiter with `ah job wait`.")
+            f"--kind waiting --ref <ask id or GoodQA ticket> --until <ISO>`. Waiting on a background command: watch "
+            f"it with the Monitor tool and record that wait with the same dispose command.")
     if not payload.get("stop_hook_active") and not seen.get(agent):
         seen[agent] = (now or time.time())
         save_state(session, state)
@@ -242,7 +244,7 @@ _SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
 _RUNS_TEXT = re.compile(r"(?:^|[\s;&|(])(?:(?:ba|z|da|k)?sh|fish|python[0-9.]*|eval|source|\.)(?:\s|$)")
 _SHELL_C = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")  # a short-option cluster that carries -c
 _BACKTICK = re.compile(r"`([^`]*)`")
-_KIND_WORD = re.compile(r"\b(?:" + "|".join(ACK_KINDS) + r")\b")
+_KIND_WORD = re.compile(r"\b(?:" + "|".join(ACK_KINDS) + r")\b|ack[-_]handoff")
 
 
 def _strip_heredocs(cmd: str) -> str:
@@ -315,6 +317,8 @@ def _acks(seg: list, depth: int = 0) -> bool:
         return False
     for j, tok in enumerate(rest):
         name, eq, val = tok.partition("=")
+        if len(name) >= 5 and "--ack-handoff".startswith(name) and name.startswith("--a"):
+            return True  # #134 red-team P4: a wait that acknowledges a handoff is main's
         if len(name) >= 3 and "--kind".startswith(name) and name.startswith("--"):
             value = val if eq else (rest[j + 1] if j + 1 < len(rest) else "")
             if value in ACK_KINDS or "$" in value or "`" in value:  # an expansion cannot be judged: deny
@@ -336,16 +340,38 @@ def acknowledges(cmd: str, depth: int = 0) -> bool:
     return any(_acks(s, depth) for s in segs if s)
 
 
+def _stamp_ack(cmd: str, payload: dict) -> None:
+    """One stamp per `--agent ID` of a main command that mentions --ack-handoff (#134 red-team B4)."""
+    if "ack-handoff" not in cmd and "ack_handoff" not in cmd:
+        return
+    import caller_identity  # noqa: PLC0415
+    import shlex  # noqa: PLC0415
+    try:
+        words = shlex.split(cmd, comments=False)
+    except ValueError:
+        return
+    for index, word in enumerate(words):
+        agent = words[index + 1] if word == "--agent" and index + 1 < len(words) else (
+            word.split("=", 1)[1] if word.startswith("--agent=") else None)
+        if agent and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", agent):
+            caller_identity.put_stamp("ack-handoff", [agent], session=str(payload.get("session_id") or ""))
+
+
 def cmd_pretool(payload: dict) -> dict:
     """PreToolUse(Bash): a sub-agent (the payload carries its agent_id) may not resume, reassign or close an owner;
-    main records those. A wait (`--kind waiting`) stays open to everyone. The identity is the hook's, not the
+    main records those. A wait (`--kind waiting`) stays open to everyone, but not one that acknowledges a handoff
+    (`--ack-handoff`). The identity is the hook's, not the
     shell's: main's shell carries the same environment as a sub-agent's (review round 3, B1). The text match is
     advisory against an agent that hides the call; the dispose guard's evidence and burst rules do not rely on it."""
-    if not payload.get("agent_id") or payload.get("tool_name") != "Bash":
+    if payload.get("tool_name") != "Bash":
         return {}
     tool_input = payload.get("tool_input")
     cmd = str((tool_input if isinstance(tool_input, dict) else {}).get("command") or "")
-    if not acknowledges(cmd):
+    import caller_identity  # noqa: PLC0415
+    if caller_identity.is_main(payload):
+        _stamp_ack(cmd, payload)  # B4: `ah task dispose --ack-handoff` needs this stamp
+        return {}
+    if not acknowledges(cmd):  # anything not proven main: sub-agents, Codex payloads, a payload with no transcript
         return {}
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                    "permissionDecisionReason": "dropped-owner gate (goodqa#14791): a sub-agent cannot "
