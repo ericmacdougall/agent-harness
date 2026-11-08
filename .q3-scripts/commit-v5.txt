@@ -1,0 +1,29 @@
+fix(automations): keep deferred run reports in finish order
+
+Why:
+S3a spec v5 (goodqa#15200): rows deferred together share next_at, so the
+batch could post a later run before an earlier one. Mutant M31 (caps
+counted by finish hour) survived every test, so the posting-hour cap that
+main confirmed (D1) was unproven. Two tests also turned red once the wall
+clock passed their fixed NOW: rows inserted without next_at took the DB
+default now() and were never due.
+
+What:
+- Rank due rows by (next_at, run finished_at, run id).
+- Collapsed line copy: "they are not reported here".
+- Test: a barrier forces two handlers of one row to overlap; one posts,
+  the other returns busy, one audit row.
+- Test: six posts at 09:50 fill that hour; a run finished at 09:55 and
+  first handled at 10:02 is reported (kills M31).
+- Tests pin nextAt to NOW on direct row inserts (wall-clock independent).
+- WORKFLOW-DRAFTS: ordering and posting-hour cap wording.
+
+Testing:
+t2-dev through pgpool:
+`pnpm --filter @bugtracker/api exec vitest run test/qac-run-reports-s3a.test.ts`
+result 42 passed (42). Before the nextAt pin: 2 failed | 40 passed. Mutant M31
+(hourStart(run.finishedAt)) applied: 1 failed | 41 passed, the new test.
+
+Refs: GoodQA goodqa#15200, GoodQA goodqa#14903
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
