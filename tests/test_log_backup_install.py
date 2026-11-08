@@ -758,6 +758,15 @@ class UnitContents(unittest.TestCase):
         self.assertIn("Type=oneshot", service)
         self.assertIn("ExecStart=/bin/bash %h/.agent-harness/bin/log-backup.sh", service)
 
+    def test_a_stuck_oneshot_run_cannot_block_the_timer(self):
+        # goodqa#15218: dev2's oneshot unit stayed active for two days, and OnUnitActiveSec never re-armed. The service
+        # needs a hard start timeout (RuntimeMaxSec does nothing for oneshot) above the longest healthy run (one 900 s
+        # period plus grace) and below two periods, so the next run is at most one slot late.
+        service = (ROOT / "harness/schedulers/log-backup.service").read_text().splitlines()
+        timeouts = [line for line in service if line.startswith("TimeoutStartSec=")]
+        self.assertEqual(timeouts, ["TimeoutStartSec=20min"])
+        self.assertFalse([line for line in service if line.startswith(("RuntimeMaxSec=", "TimeoutSec="))])
+
     def test_launchd_template_interval_label_and_program(self):
         import plistlib
         text = (ROOT / "harness/schedulers/com.ericmacdougall.log-backup.plist").read_text().replace("@HOME@", "/h")

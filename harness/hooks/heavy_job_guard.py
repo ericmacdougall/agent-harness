@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 import stat
 import time
 import sys
@@ -698,8 +699,56 @@ def classify_copy(low, args, ctx):
 # log backup went 6 h without a pass. Agent uploads therefore use one throttled lane: --tpslimit at most LANE_TPS,
 # --transfers at most LANE_TRANSFERS, and only one agent upload to a Dropbox remote at a time. The launchd log backup
 # is not an agent upload (it keeps its own tpslimit 1) and is never counted as the lane holder.
-LANE_TPS = 4
+LANE_TPS_BUILTIN = 4
 LANE_TRANSFERS = 4
+BUDGET_FILE = Path(__file__).resolve().parent / "dropbox_budget.conf"
+
+
+BUDGET_MAX_BYTES = 65536
+_BUDGET_SKIP = re.compile(r"[ \t]*(#.*)?")
+_BUDGET_LINE = re.compile(r"([A-Za-z0-9._-]+)[ \t]+([1-9][0-9]?)[ \t]*")
+
+
+def budget_shares(path: Path = BUDGET_FILE) -> dict[str, int] | None:
+    """The shared Dropbox write budget (goodqa#15218): {name: ops per second}, or None when the file is missing or
+    invalid. The line rule is the one log-backup.sh applies (keep the two in step): CRLF accepted; a line is blank, a
+    comment, or `name value` (name [A-Za-z0-9._-]+, value 1-99); names unique; at most 64 KiB; shares <= account.
+    The read never follows a symlink, never blocks on a FIFO and never reads more than 64 KiB (it runs on every hook)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = os.read(fd, BUDGET_MAX_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > BUDGET_MAX_BYTES:
+        return None
+    shares: dict[str, int] = {}
+    for line in data.decode("latin-1").split("\n"):
+        line = line[:-1] if line.endswith("\r") else line
+        if _BUDGET_SKIP.fullmatch(line):
+            continue
+        match = _BUDGET_LINE.fullmatch(line)
+        if not match or match.group(1) in shares:
+            return None
+        shares[match.group(1)] = int(match.group(2))
+    if "account" not in shares or sum(v for k, v in shares.items() if k != "account") > shares["account"]:
+        return None
+    return shares
+
+
+def lane_tps(path: Path = BUDGET_FILE) -> int:
+    """The agent upload lane's --tpslimit ceiling: the budget's agent-bulk share, never above the built-in 4."""
+    share = (budget_shares(path) or {}).get("agent-bulk")
+    return min(share, LANE_TPS_BUILTIN) if share else LANE_TPS_BUILTIN
+
+
+LANE_TPS = lane_tps()
 RCLONE_UPLOADS = {"copy", "copyto", "sync", "move", "moveto", "bisync", "rcat", "copyurl"}
 # Wrappers that can sit on a Dropbox remote; `rclone config show` would say which, but it prints tokens, so any of
 # these counts as Dropbox (a throttled lane is cheap; an unthrottled upload under a wrapper is the bypass).

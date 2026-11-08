@@ -29,6 +29,7 @@ LOOKALIKE = ("  4245 rclone copy /Users/eric/a lessons-dropbox:Backups/a --tpsli
 class Lane(unittest.TestCase):
     def setUp(self):
         for patcher in (mock.patch.object(guard, "_DROPBOX_REMOTES", {"lessons-dropbox", "box2"}),
+                        mock.patch.object(guard, "LANE_TPS", 4),   # the built-in ceiling; the budget share is tested apart
                         mock.patch.object(guard, "path_size", lambda p, cap=None, seconds=1.0: (10, True))):
             patcher.start()
             self.addCleanup(patcher.stop)

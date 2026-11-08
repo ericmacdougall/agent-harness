@@ -56,6 +56,8 @@ if argv and argv[0] == "copy":
     if match and any(match in a for a in argv):
         sys.exit(1)
     note = os.environ.get("FAKE_RCLONE_LOG_TEXT")  # what real rclone writes to its --log-file (e.g. a rate limit)
+    if os.environ.get("FAKE_NOTE_MATCH") and not any(os.environ["FAKE_NOTE_MATCH"] in a for a in argv):
+        note = None
     if note and "--log-file" in argv:
         with open(argv[argv.index("--log-file") + 1], "a") as h:
             h.write(note + "\\n")
@@ -1121,6 +1123,111 @@ class Contention(Case):
         log = (self.logs / "log-backup.log").read_text()
         self.assertIn("Dropbox write rate limit", log)
         self.assertIn("other rclone uploads running now: 2 ", log)
+
+    def test_a_failed_rate_limited_copy_stops_the_run(self):
+        # goodqa#15218 AC-2: after one copy fails on the rate limit, the run makes no further copies (they would spend
+        # the account's write budget again), leaves the throttled marker and withholds last-ok.
+        done = self.run_script(FAKE_RCLONE_LOG_TEXT="ERROR : upload failed: too_many_write_operations",
+                               FAKE_EXIT_AFTER_NOTE="1", LOG_BACKUP_RETRIES="0")
+        self.assertNotEqual(done.returncode, 0)
+        sent = [c[-1].split("/testhost/", 1)[1] for c in self.copies()]
+        # The first copy failed throttled: nothing else is sent but the transcripts (main's ruling: never starve them).
+        self.assertEqual(sent, [".claude", ".codex/sessions", ".claude/projects"])
+        log = (self.logs / "log-backup.log").read_text()
+        self.assertIn("skipped ", log)
+        self.assertIn("run stopped early on the Dropbox write rate limit", log)
+        marker = (self.logs / "log-backup.throttled").read_text()
+        self.assertRegex(marker, r"^20\d\d-\d\d-\d\dT\d\d:\d\d:\d\dZ stopped at \S+ others=\d+$")
+        self.assertFalse(self.last_ok().exists())
+
+    def test_the_throttle_stop_never_starves_the_transcripts(self):
+        # Main's ruling on goodqa#15218: a WAL copy that fails on the rate limit stops the bulk copies, but the
+        # transcripts (.codex/sessions and .claude/projects, copied after it) still get their own copy.
+        done = self.run_script(FAKE_RCLONE_LOG_TEXT="ERROR : upload failed: too_many_write_operations",
+                               FAKE_NOTE_MATCH=".claude/wals", FAKE_EXIT_AFTER_NOTE="1", LOG_BACKUP_RETRIES="0")
+        self.assertNotEqual(done.returncode, 0)
+        sent = [c[-1].split("/testhost/", 1)[1] for c in self.copies()]
+        self.assertIn(".claude/projects", sent)
+        self.assertIn(".codex/sessions", sent)
+        self.assertLess(sent.index(".claude/wals"), sent.index(".claude/projects"))
+        self.assertFalse([s for s in sent if s.startswith((".agent-harness/work", ".codex/archived_sessions"))], sent)
+        self.assertIn("skipped .codex/archived_sessions", (self.logs / "log-backup.log").read_text())
+        self.assertFalse(self.last_ok().exists())
+
+    def test_a_throttle_at_the_deadline_or_the_rclone_budget_also_stops_the_run(self):
+        # Review test gaps: the deadline path and rclone exit 10 (--max-duration) with a rate limit in the log.
+        cases = (dict(FAKE_EXIT_AFTER_NOTE="10"),
+                 dict(FAKE_HANG="90", FAKE_HANG_MATCH=".claude/wals", LOG_BACKUP_BUDGET_SECONDS="40",
+                      LOG_BACKUP_DEADLINE_GRACE_SECONDS="2", LOG_BACKUP_KILL_GRACE_SECONDS="1",
+                      LOG_BACKUP_SLICE_RESERVE_SECONDS="5"))
+        for extra in cases:
+            open(self.calls, "w").close()
+            for name in ("log-backup.throttled", "log-backup.log"):
+                if (self.logs / name).exists():
+                    (self.logs / name).unlink()
+            done = self.run_script(FAKE_RCLONE_LOG_TEXT="ERROR : upload failed: too_many_write_operations",
+                                   FAKE_NOTE_MATCH=".claude/wals", LOG_BACKUP_RETRIES="0", **extra)
+            self.assertNotEqual(done.returncode, 0, extra)
+            self.assertIn("stopped at .claude/wals", (self.logs / "log-backup.throttled").read_text(), extra)
+            sent = [c[-1].split("/testhost/", 1)[1] for c in self.copies()]
+            self.assertIn(".claude/projects", sent, extra)
+            self.assertFalse([s for s in sent if s.startswith(".agent-harness/work")], extra)
+            self.assertFalse(self.last_ok().exists())
+
+    def test_the_budget_file_caps_this_hosts_rate(self):
+        budget = self.tmp / "budget.conf"
+
+        def rate(text, **env):
+            budget.write_text(text)
+            open(self.calls, "w").close()
+            done = self.run_script(LOG_BACKUP_BUDGET_FILE=str(budget), **env)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return {c[c.index("--tpslimit") + 1] for c in self.copies()}
+
+        good = "# shares\naccount 8\nlog-backup.testhost 1\nlog-backup.other 1\nagent-bulk 4\nreserve 1\n"  # 7 of 8
+        self.assertEqual(rate(good, LOG_BACKUP_TPSLIMIT="3"), {"1"})       # the share lowers a higher setting
+        self.assertEqual(rate(good.replace("testhost 1", "testhost 2")), {"2"})  # and sets the rate when none is set
+        self.assertEqual(rate(good.replace("testhost 1", "testhost 5"), LOG_BACKUP_TPSLIMIT="2"), {"2"})  # never raises
+        for broken in (good.replace("reserve 1", "reserve 3"),           # shares above the total (9 of 8)
+                       good.replace("account 8\n", ""),                   # no total
+                       good + "log-backup.testhost 1\n",                  # repeated name
+                       good.replace("testhost 1", "testhost 1.5"),        # not a whole number
+                       good.replace("testhost 1", "testhost 0"),
+                       good.replace("log-backup.testhost 1\n", "")):      # no share for this host
+            self.assertEqual(rate(broken, LOG_BACKUP_TPSLIMIT="3"), {"3"}, broken)  # today's value stays
+        # Review m4: one line rule in both readers. CRLF is accepted; a no-break space, a trailing comment or a
+        # symlinked file makes the script keep today's value.
+        self.assertEqual(rate(good.replace("\n", "\r\n"), LOG_BACKUP_TPSLIMIT="3"), {"1"})
+        for odd in (good.replace("testhost 1", "testhost\u00a01"), good.replace("testhost 1", "testhost 1 # one")):
+            self.assertEqual(rate(odd, LOG_BACKUP_TPSLIMIT="3"), {"3"}, repr(odd))
+        real = self.tmp / "real.conf"
+        real.write_text(good)
+        budget.unlink()
+        budget.symlink_to(real)
+        open(self.calls, "w").close()
+        self.assertEqual(self.run_script(LOG_BACKUP_BUDGET_FILE=str(budget), LOG_BACKUP_TPSLIMIT="3").returncode, 0)
+        self.assertEqual({c[c.index("--tpslimit") + 1] for c in self.copies()}, {"3"})
+        budget.unlink()
+        open(self.calls, "w").close()
+        self.assertEqual(self.run_script(LOG_BACKUP_BUDGET_FILE=str(budget)).returncode, 0)
+        self.assertEqual({c[c.index("--tpslimit") + 1] for c in self.copies()}, {"1"})  # missing file: default 1
+
+    def test_a_rate_limit_retried_to_success_does_not_stop_the_run(self):
+        # NEG-1: rclone logs the rate limit but its own retries succeed: every source is copied, last-ok is written and
+        # no throttled marker appears.
+        self.assertEqual(self.run_script().returncode, 0)  # the first run also finishes the bulk passes
+        open(self.calls, "w").close()
+        healthy = self.run_script()
+        self.assertEqual(healthy.returncode, 0, healthy.stderr)
+        expected = len(self.copies())
+        self.assertGreater(expected, 1)
+        open(self.calls, "w").close()
+        self.last_ok().unlink()
+        done = self.run_script(FAKE_RCLONE_LOG_TEXT="ERROR : Attempt 1/3 failed: too_many_write_operations")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(len(self.copies()), expected)
+        self.assertTrue(self.last_ok().exists())
+        self.assertFalse((self.logs / "log-backup.throttled").exists())
 
     def test_a_copy_that_drains_after_the_stop_signal_is_killed(self):
         # rclone commits its pending Dropbox batch on SIGTERM with no time limit; under rate limiting that is minutes.
