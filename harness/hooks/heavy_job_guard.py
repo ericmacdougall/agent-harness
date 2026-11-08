@@ -11,7 +11,8 @@ Contract
 - stdin: Claude Code PreToolUse payload. Deny = exit 2 + message on stderr.
 - Fails OPEN: malformed input, deep JSON, any internal error -> exit 0 and a
   logged warning. Register it WITHOUT onFailure=block.
-- Only acts on macOS (dev2 is Linux); HARNESS_HEAVY_GUARD_FORCE=1 overrides for tests.
+- Acts fully on macOS. On other hosts (dev2, t2-dev are Linux) only the dropbox-lane rule applies, and only to
+  commands that mention rclone (goodqa#15246); HARNESS_HEAVY_GUARD_FORCE=1 applies every rule for tests.
 - Escape hatch: prefix the command with HARNESS_LOCAL_OK=<reason>; the reason is
   logged to the session WAL. Browser, adversarial, media and fan-out work must
   ALSO run under run_capped.py; suites and builds only need the hatch.
@@ -2368,12 +2369,22 @@ def copy_event_detail(payload: dict, decision: dict, hatch_uses=None) -> dict:
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else ""
     match = re.search(r"at least ([0-9.]+) GiB", decision.get("detail", ""))
     mib = re.search(r"at least ([0-9.]+) MiB", decision.get("detail", ""))
-    return {"agent": owner_of(payload), "task": work_owner_key(cwd) or "", "host": "mac",
+    return {"agent": owner_of(payload), "task": work_owner_key(cwd) or "", "host": host_label(),
             "est_bytes": int(float(match.group(1)) * GIB) if match else (int(float(mib.group(1)) * 1048576) if mib else None), "path_digest": path_digest(cwd),
             "route": route_host(), "hatch_uses_1h": hatch_uses}
 
 
-def run(raw: bytes, modes=None) -> int:
+def host_label() -> str:
+    """"mac" on the Mac (the label existing alerts use), else this host's short name."""
+    if sys.platform == "darwin":
+        return "mac"
+    import socket
+    return (socket.gethostname().split(".")[0].lower() or "unknown")[:40]
+
+
+def run(raw: bytes, modes=None, lane_only=False) -> int:
+    """lane_only (off the Mac): only rclone commands are analysed, and the Mac's heavy-job count and hourly hatch
+    limit are not applied, because they guard the Mac's own capacity (review M1, M3 on goodqa#15246)."""
     import json
     try:
         payload = parse_payload(raw)
@@ -2397,6 +2408,8 @@ def run(raw: bytes, modes=None) -> int:
             payload = dict(payload, cwd=tool_input["workdir"])
     if not isinstance(command, str):
         return 0
+    if lane_only and "rclone" not in command.casefold():
+        return 0  # off the Mac nothing but the lane rule applies: skip the sizing lookups (ssh du, GitHub API, walks)
     decision = decide(command, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None, modes)
     action = decision["action"]
     owner = owner_of(payload)
@@ -2436,12 +2449,12 @@ def run(raw: bytes, modes=None) -> int:
             ring_event(f"heavy:{event_class(decision)}:{owner}", "high", f"{owner} refused a hatch copy: disk above 85%",
                        copy_event_detail(payload, decision))
             return 2
-        if live_heavy_jobs() >= max_heavy_jobs():  # refuse BEFORE spending this owner's hourly use
+        if not lane_only and live_heavy_jobs() >= max_heavy_jobs():  # refuse BEFORE spending this owner's hourly use
             sys.stderr.write(routed(f"Heavy-job guard: {live_heavy_jobs()} heavy jobs are already running on the Mac (limit "
                              f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on dev2 (ssh dev2 '<command>').\n"))
             log_event({"event": "deny-concurrency", "rule": decision["rule"]})
             return 2
-        allowed, uses = record_hatch_use(owner, hatch_limit())
+        allowed, uses = (True, None) if lane_only else record_hatch_use(owner, hatch_limit())
         if not allowed:
             sys.stderr.write(routed(f"Heavy-job guard: {HATCH} was already used {uses} time(s) in the last hour by this owner "
                              f"(limit {hatch_limit()}). More than that is heavy work on the Mac: run it on dev2/T2 "
@@ -2452,7 +2465,7 @@ def run(raw: bytes, modes=None) -> int:
             return 2
         decision["hatch_uses_1h"] = uses
     if (action == "allow" and decision.get("hatch_reason") and decision.get("rule") not in NEVER_BLOCK
-            and live_heavy_jobs() >= max_heavy_jobs()):
+            and not lane_only and live_heavy_jobs() >= max_heavy_jobs()):
         sys.stderr.write(routed(f"Heavy-job guard: {live_heavy_jobs()} heavy jobs are already running on the Mac (limit "
                          f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on dev2 (ssh dev2 '<command>').\n"))
         log_event({"event": "deny-concurrency", "rule": decision["rule"]})
@@ -2497,7 +2510,7 @@ def main() -> int:
             warn(f"stdin rejected ({rejected.code}); failing open")
             log_event({"event": "fail-open", "reason": rejected.code})
             return 0
-        return run(raw, hook_modes())
+        return run(raw, hook_modes(), lane_only=off_the_mac())
     except Exception as error:  # fail open: a guard bug must never block every Bash call
         warn(f"internal error {type(error).__name__}; failing open")
         log_event({"event": "fail-open", "reason": type(error).__name__})

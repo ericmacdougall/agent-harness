@@ -262,9 +262,31 @@ class Classification(unittest.TestCase):
         for heavy in ("pytest", "npm run build", "npx playwright test", "xargs -P 9 python3 x"):
             self.assertEqual(run_main("linux", payload(heavy)), 0, heavy)   # every other rule stays Mac-only
             self.assertEqual(run_main("darwin", payload(heavy)), 2, heavy)  # (control: denied on the Mac)
-        with unittest.mock.patch.object(guard, "record_hatch_use", side_effect=AssertionError("hatch counted off the Mac")), \
-                unittest.mock.patch.object(guard, "live_heavy_jobs", side_effect=AssertionError("Mac job count off the Mac")):
-            self.assertEqual(run_main("linux", payload("HARNESS_LOCAL_OK=reasonxx npm run build")), 0)
+        # Review M1/M2: a hatched lane upload off the Mac must not meet the Mac's job count or hourly hatch limit.
+        # The calls are recorded (main() fails open on an exception, so a raising patch could never fail the test),
+        # and the Mac control proves the same command does reach both.
+        hatched = payload("HARNESS_LOCAL_OK=one-off-manifest rclone copy /tmp/x dropbox:Backups/x --tpslimit 9 --transfers 2")
+        for platform, expect_calls in (("linux", 0), ("darwin", 1)):
+            calls = []
+            with unittest.mock.patch.object(guard, "record_hatch_use", lambda *a: calls.append("hatch") or (True, 1)), \
+                    unittest.mock.patch.object(guard, "live_heavy_jobs", lambda: calls.append("jobs") or 5), \
+                    unittest.mock.patch.object(guard, "log_hatch_to_wal", lambda *a: None), \
+                    unittest.mock.patch.object(guard, "ring_event", lambda *a, **k: None):
+                code = run_main(platform, hatched)
+            if expect_calls:
+                self.assertEqual((code, calls), (2, ["jobs", "jobs"]), platform)  # 5 live jobs: refused on the Mac
+            else:
+                self.assertEqual((code, calls), (0, []), platform)
+        # Review M3: off the Mac a command without rclone is never analysed (no sizing lookups at all).
+        with unittest.mock.patch.object(guard, "decide", side_effect=lambda *a: calls.append("decide")):
+            calls = []
+            self.assertEqual(run_main("linux", payload("git clone https://github.com/a/b && cp -R a b")), 0)
+            self.assertEqual(calls, [])
+        with unittest.mock.patch("socket.gethostname", return_value="T2-Dev.lan"), \
+                unittest.mock.patch.object(sys, "platform", "linux"):
+            self.assertEqual(guard.host_label(), "t2-dev")
+        with unittest.mock.patch.object(sys, "platform", "darwin"):
+            self.assertEqual(guard.host_label(), "mac")
         self.assertEqual(run_main("linux", fast, HARNESS_HEAVY_GUARD="off"), 0)  # the off switch still turns it off
         self.assertEqual(run_main("darwin", fast), 2)          # NEG-1: the Mac is unchanged
 
