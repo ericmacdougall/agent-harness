@@ -779,6 +779,13 @@ class WindowsHost(unittest.TestCase):
                 self.assertEqual(len(remote.calls), 1)
                 self.assertEqual(remote.stopped, [])
 
+    def test_login_user_is_the_owner_of_the_checking_shell_not_env(self):
+        # live finding on ah-spectre: $env:USERDOMAIN is WORKGROUP, GetOwner says the machine name
+        for script in (ak._WIN_READ, ak._WIN_STOP):
+            self.assertNotIn("$env:USERDOMAIN", script)
+            self.assertIn('-Filter "ProcessId=$PID") -MethodName GetOwner', script)
+        self.assertIn("-ne $me", ak._WIN_STOP)
+
     def test_dF5_noise_after_the_stop_answer_is_ignored(self):
         remote = FakeWindowsRemote({4242: self.PS}, noise="WARNING: profile output\n#< CLIXML\n")
         out = self.run_kill(remote)

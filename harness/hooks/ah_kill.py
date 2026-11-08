@@ -32,7 +32,9 @@ HOSTS = ("dev2", "t2-dev", "ah-mac-mini")
 WINDOWS_HOSTS = ("ah-spectre",)
 # Delta red-team D-F4: a Windows stop is an allowlist, not a deny list. It may stop only an orphaned shell (its parent
 # is gone, or the parent pid now belongs to a newer process) that the ssh login user owns and that is not part of the
-# ssh session running the check. That is exactly the orphaned PowerShell children it exists for. Anything else
+# ssh session running the check. That is exactly the orphaned PowerShell children it exists for. "The login user" is
+# GetOwner of the checking shell itself: on the Spectre $env:USERDOMAIN is WORKGROUP while GetOwner says the machine
+# name (found live, goodqa#15275). Anything else
 # (claude, codex, node, adb, sshd-session, WSL, Defender, ...) is refused.
 WINDOWS_ALLOWED = {"powershell", "pwsh", "cmd"}
 WIN_SENTINEL = "AHK1 "  # D-F5: the answer is the last line with this prefix; profile or CLIXML noise is ignored
@@ -788,7 +790,8 @@ def _powershell(host, script):
 
 
 _WIN_READ = r"""$ErrorActionPreference='Stop'
-$me = "$env:USERDOMAIN\$env:USERNAME"
+$mo = Invoke-CimMethod -InputObject (Get-CimInstance Win32_Process -Filter "ProcessId=$PID") -MethodName GetOwner
+$me = if ($mo.ReturnValue -eq 0) { "$($mo.Domain)\$($mo.User)" } else { '?' }
 $chain = @(); $q = $PID
 for ($k = 0; $k -lt 16 -and $q; $k++) { $chain += [int]$q; $x = Get-CimInstance Win32_Process -Filter "ProcessId=$q"; if (-not $x) { break }; $q = [int]$x.ParentProcessId }
 $p = Get-CimInstance Win32_Process -Filter 'ProcessId=%d'
@@ -802,7 +805,8 @@ $orphan = (-not $parent) -or ($parent.CreationDate -gt $p.CreationDate)
 # The stop re-reads the process in the same remote script and re-checks its creation time and owner, so a reused pid
 # or a process of another user is not stopped. Stop-Process -Force is immediate on Windows; there is no grace period.
 _WIN_STOP = r"""$ErrorActionPreference='Stop'
-$me = "$env:USERDOMAIN\$env:USERNAME"
+$mo = Invoke-CimMethod -InputObject (Get-CimInstance Win32_Process -Filter "ProcessId=$PID") -MethodName GetOwner
+$me = if ($mo.ReturnValue -eq 0) { "$($mo.Domain)\$($mo.User)" } else { '?' }
 $p = Get-CimInstance Win32_Process -Filter 'ProcessId=%d'
 if (-not $p) { 'AHK1 {"status":"gone"}'; exit }
 if ($p.CreationDate.ToUniversalTime().ToString('o') -ne '%s') { 'AHK1 {"status":"changed"}'; exit }
