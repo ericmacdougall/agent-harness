@@ -813,6 +813,34 @@ class BoundValidation(ScratchHome):
                 self.assertFalse(ran, ("probe ran", bad))
 
 
+class DropboxBudget(unittest.TestCase):
+    """goodqa#15218: agent uploads read their lane ceiling from the shared budget file, never above the built-in 4."""
+
+    def write(self, text):
+        d = Path(tempfile.mkdtemp(prefix="budget-"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / "b.conf").write_text(text)
+        return d / "b.conf"
+
+    def test_the_shipped_file_is_valid_and_sets_the_ruled_shares(self):
+        shares = guard.budget_shares(HOOKS / "dropbox_budget.conf")
+        self.assertEqual(shares, {"account": 8, "log-backup.Mac-2": 2, "log-backup.t2-dev": 1, "agent-bulk": 4,
+                                  "reserve": 1})
+        self.assertIn("ASSUMPTION", (HOOKS / "dropbox_budget.conf").read_text())
+        self.assertEqual(guard.LANE_TPS, 4)
+        import install
+        self.assertIn("dropbox_budget.conf", install.HOOKS)
+
+    def test_lane_ceiling_follows_the_share_and_falls_back(self):
+        base = "account 8\nagent-bulk %s\nreserve 1\n"
+        self.assertEqual(guard.lane_tps(self.write(base % 2)), 2)
+        self.assertEqual(guard.lane_tps(self.write(base % 7)), 4)          # never above the built-in ceiling
+        for broken in ("account 8\nagent-bulk 9\n", "agent-bulk 2\n", "account 8\nagent-bulk two\n",
+                       "account 8\nagent-bulk 2\nagent-bulk 1\n", ""):
+            self.assertEqual(guard.lane_tps(self.write(broken)), 4, broken)
+        self.assertEqual(guard.lane_tps(Path("/nonexistent/b.conf")), 4)
+
+
 class AbsurdBounds(ScratchHome):
     def test_finite_but_absurd_caps_are_refused(self):
         for script, flags in (("run_capped.py", ["--max-rss-gb", "1e300"]), ("run_capped.py", ["--max-rss-gb", "1025"]),

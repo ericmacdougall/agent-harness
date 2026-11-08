@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 import stat
 import time
 import sys
@@ -698,8 +699,40 @@ def classify_copy(low, args, ctx):
 # log backup went 6 h without a pass. Agent uploads therefore use one throttled lane: --tpslimit at most LANE_TPS,
 # --transfers at most LANE_TRANSFERS, and only one agent upload to a Dropbox remote at a time. The launchd log backup
 # is not an agent upload (it keeps its own tpslimit 1) and is never counted as the lane holder.
-LANE_TPS = 4
+LANE_TPS_BUILTIN = 4
 LANE_TRANSFERS = 4
+BUDGET_FILE = Path(__file__).resolve().parent / "dropbox_budget.conf"
+
+
+def budget_shares(path: Path = BUDGET_FILE) -> dict[str, int] | None:
+    """The shared Dropbox write budget (goodqa#15218): {name: ops per second}, or None when the file is missing or
+    invalid (a malformed line, a value outside 1-99, a repeated name, no `account`, or shares above the total)."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        lines = path.read_text(encoding="utf-8").splitlines()[:200]
+    except (OSError, UnicodeDecodeError):
+        return None
+    shares: dict[str, int] = {}
+    for line in lines:
+        words = line.split()
+        if not words or words[0].startswith("#"):
+            continue
+        if len(words) != 2 or not re.fullmatch(r"[1-9][0-9]?", words[1]) or words[0] in shares:
+            return None
+        shares[words[0]] = int(words[1])
+    if "account" not in shares or sum(v for k, v in shares.items() if k != "account") > shares["account"]:
+        return None
+    return shares
+
+
+def lane_tps(path: Path = BUDGET_FILE) -> int:
+    """The agent upload lane's --tpslimit ceiling: the budget's agent-bulk share, never above the built-in 4."""
+    share = (budget_shares(path) or {}).get("agent-bulk")
+    return min(share, LANE_TPS_BUILTIN) if share else LANE_TPS_BUILTIN
+
+
+LANE_TPS = lane_tps()
 RCLONE_UPLOADS = {"copy", "copyto", "sync", "move", "moveto", "bisync", "rcat", "copyurl"}
 # Wrappers that can sit on a Dropbox remote; `rclone config show` would say which, but it prints tokens, so any of
 # these counts as Dropbox (a throttled lane is cheap; an unthrottled upload under a wrapper is the bypass).

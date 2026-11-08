@@ -74,6 +74,23 @@ for rate in TPSLIMIT TRANSFERS BULK_TPS; do
     echo "log-backup: $rate must be a whole number from 1 to 99" >&2; exit 2
   fi
 done
+# One write budget for the whole Dropbox account (goodqa#15218): this host's share in the budget file caps TPSLIMIT.
+# A missing or invalid file, or one without a share for this host, leaves today's value (LOG_BACKUP_TPSLIMIT or 1).
+BUDGET_FILE=${LOG_BACKUP_BUDGET_FILE:-$HOME/.claude/hooks/dropbox_budget.conf}
+budget_share=
+if [ -f "$BUDGET_FILE" ] && [ ! -L "$BUDGET_FILE" ]; then
+  budget_share=$(awk -v want="log-backup.$HOST" '
+    /^[ \t]*(#|$)/ {next}
+    NF != 2 || $2 !~ /^[1-9][0-9]?$/ || ($1 in v) {bad = 1; next}
+    {v[$1] = $2 + 0; if ($1 != "account") sum += $2}
+    END {if (bad || !("account" in v) || sum > v["account"] || !(want in v)) exit 1; print v[want]}' "$BUDGET_FILE") \
+    || budget_share=
+  [ -n "$budget_share" ] || echo "log-backup: no valid share for log-backup.$HOST in $BUDGET_FILE; using LOG_BACKUP_TPSLIMIT ($TPSLIMIT)" >&2
+fi
+if [ -n "$budget_share" ]; then
+  if [ -z "${LOG_BACKUP_TPSLIMIT:-}" ] || [ "$budget_share" -lt "$TPSLIMIT" ]; then TPSLIMIT=$budget_share; fi
+  [ -n "${LOG_BACKUP_BULK_TPS:-}" ] || BULK_TPS=$TPSLIMIT
+fi
 BULK_CHUNK=${LOG_BACKUP_BULK_CHUNK:-}
 [ -z "$BULK_CHUNK" ] || printf '%s' "$BULK_CHUNK" | grep -Eq '^[1-9][0-9]{0,4}$' || { echo "log-backup: LOG_BACKUP_BULK_CHUNK must be 1-99999" >&2; exit 2; }
 for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER DEADLINE_GRACE SLICE_RESERVE KILL_GRACE PERIOD LANE_BUDGET LANE_POLL; do
@@ -387,10 +404,14 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
   # Dropbox can rate-limit (too_many_write_operations): retry the source with a pause before calling it a failure.
   # A source that still fails makes the whole run non-fresh.
   attempt=0 copied=0 yielded=0
-  if [ "$throttled" = 1 ]; then
-    say "skipped $rel: an earlier copy in this run failed on the Dropbox write rate limit; the next run sends it"
-    ok=1; budget_hit=1; return
-  fi
+  # The transcripts themselves (the primary sources, copied last so the reserve protects them) still get their own
+  # copy: stopping them too would let a throttled WAL or ledger copy starve the transcript backup run after run.
+  case "$rel" in .claude/projects|.codex/sessions) ;; *)
+    if [ "$throttled" = 1 ]; then
+      say "skipped $rel: an earlier copy in this run failed on the Dropbox write rate limit; the next run sends it"
+      ok=1; budget_hit=1; return
+    fi ;;
+  esac
   while :; do
     if [ "$TIER" = bulk ] && ! lane_gate; then
       say "lane budget (${LANE_BUDGET}s) used up waiting for tier 1 before $rel; the next lane run continues"; ok=1; budget_hit=1; return
