@@ -1319,3 +1319,51 @@ class DocumentedCommands(unittest.TestCase):
             words = shlex.split(line.replace("[", " ").replace("]", " "))[2:]
             with self.subTest(line=line):
                 parser.parse_args(words)
+
+
+class SingleReviewTier(SpecFlowCase):
+    """goodqa#15253 item 5: a small or flag-gated spec needs one (adversarial) review instead of two."""
+    SMALL = SPEC.replace("Sign-off: main\n", "Sign-off: main\nReview-tier: single (small)\n")
+    FLAG = SPEC.replace("Sign-off: main\n", "Sign-off: main\nReview-tier: single (flag-gated: DONE_GATE_V2)\n").replace(
+        "- In: the done gate.", "- In: the done gate, behind DONE_GATE_V2 (default off).")
+
+    def adversarial_only(self, text):
+        spec = self.write_spec(text)
+        report = self.tmp / "adv-report.md"
+        report.write_text(report_text(sf.core_sha(text)))
+        self.assertEqual(self.run_cli("review", str(spec), "--role", "adversarial", "--report", str(report))[0], 0)
+        return spec
+
+    def test_small_and_flag_gated_specs_attach_with_one_review(self):
+        for text in (self.SMALL, self.FLAG):
+            with self.subTest(text=text[:200]):
+                self.assertEqual(sf.review_tier(sf.parse_spec(text)), ("single", []))
+                spec = self.adversarial_only(text)
+                code, _, err = self.run_cli("attach", str(spec), "--actor", "agent:owner1")
+                self.assertEqual(code, 0, err)
+                result = self.evaluate()
+                self.assertFalse(any("acceptance spec review" in m for m in result["missing"]), result["missing"])
+                self.fake.comments[ISSUE].clear()
+
+    def test_default_spec_still_needs_both_reviews(self):
+        spec = self.adversarial_only(SPEC)
+        self.assertEqual(self.run_cli("attach", str(spec), "--actor", "agent:owner1")[0], 2)
+
+    def test_the_single_review_must_be_the_adversarial_one(self):
+        entries = [{"role": "acceptance", "verdict": "ACCEPT", "core_sha": "c", "key": "human:eric"}]
+        self.assertTrue(sf.review_problems(entries, "c", "agent:owner1", tier="single"))
+        entries = [{"role": "adversarial", "verdict": "ACCEPT", "core_sha": "c", "key": "human:eric"}]
+        self.assertEqual(sf.review_problems(entries, "c", "agent:owner1", tier="single"), [])
+        self.assertTrue(sf.review_problems(entries, "c", "human:eric", tier="single"))  # author as reviewer
+
+    def test_claims_that_do_not_hold_are_lint_errors(self):
+        three = self.SMALL.replace("## Negative cases", "- AC-3: a third result. Verify by: tests.\n"
+                                   "  Source: ticket:GoodQA harness#14398\n\n## Negative cases")
+        unnamed = self.FLAG.replace("behind DONE_GATE_V2 (default off)", "always on")
+        for text, word in ((three, "small"), (unnamed, "DONE_GATE_V2"),
+                           (SPEC.replace("Sign-off: main\n", "Sign-off: main\nReview-tier: single\n"), "Review-tier")):
+            with self.subTest(word=word):
+                tier, problems = sf.review_tier(sf.parse_spec(text))
+                self.assertEqual(tier, "dual")
+                self.assertTrue(any(word in p for p in problems), problems)
+                self.assertTrue(any(word in p for p in sf.lint(text)), sf.lint(text))

@@ -208,7 +208,7 @@ def parse_spec(text: str) -> dict:
         if current is None:
             if line.startswith("# ") and title is None:
                 title = line[2:].strip()
-            field = re.match(r"^(Ticket|Author|Click-test|Sign-off):\s*(.*)$", line)
+            field = re.match(r"^(Ticket|Author|Click-test|Sign-off|Review-tier):\s*(.*)$", line)
             if field:
                 header[field.group(1)] = field.group(2).strip()
         else:
@@ -229,6 +229,34 @@ def parse_spec(text: str) -> dict:
             stray.append(line)
     return {"title": title, "header": header, "sections": sections, "criteria": criteria,
             "negatives": negatives, "stray": stray, "core": core}
+
+
+SMALL_SPEC_MAX_AC = 2
+TIER_SINGLE = re.compile(r"^single \((?:(small)|flag-gated: ([A-Za-z][A-Za-z0-9_.-]{2,63}))\)$")
+
+
+def review_tier(spec: dict) -> tuple:
+    """("single" | "dual", problems) from the optional `Review-tier:` header (goodqa#15253 item 5).
+    single (small): at most SMALL_SPEC_MAX_AC acceptance criteria. single (flag-gated: NAME): the Scope section names
+    the flag. Both are the author's claim: the flag is not checked in code, which is the safety given up. A claim
+    that does not hold is a lint problem and the spec stays dual."""
+    value = spec["header"].get("Review-tier")
+    if value is None or value == "dual":
+        return "dual", []
+    match = TIER_SINGLE.match(value)
+    if not match:
+        return "dual", ["Review-tier must be `dual`, `single (small)` or `single (flag-gated: <FLAG_NAME>)`"]
+    if match.group(1) and len(spec["criteria"]) > SMALL_SPEC_MAX_AC:
+        return "dual", [f"Review-tier single (small) allows at most {SMALL_SPEC_MAX_AC} acceptance criteria"]
+    if match.group(2) and not re.search(r"(?<![\w.-])" + re.escape(match.group(2)) + r"(?![\w.-])",
+                                        "\n".join(spec["sections"].get("Scope", []))):
+        return "dual", [f"Review-tier single (flag-gated: {match.group(2)}): the Scope section must name {match.group(2)}"]
+    return "single", []
+
+
+def required_roles(tier: str) -> tuple:
+    """The review roles a spec of this tier needs: one adversarial review, or both."""
+    return ("adversarial",) if tier == "single" else ROLES
 
 
 PLACEHOLDER = re.compile(r"<[^<>\n]{2,80}>")
@@ -255,6 +283,7 @@ def lint(text: str, config: dict | None = None, check_provenance: bool = True, s
         problems.append("Click-test must be `required` or `not-applicable (<reason, 10+ chars>)`")
     if header.get("Sign-off", "main") not in ("main", "human"):
         problems.append("Sign-off must be `main` or `human`")
+    problems += review_tier(spec)[1]
     for name in ("Outcome", "Scope", "Acceptance criteria", "Negative cases", "Risks"):
         body = "\n".join(spec["sections"].get(name, [])).strip()
         if name not in spec["sections"]:
@@ -403,10 +432,10 @@ def current_reviews(entries: list, core: str) -> dict:
     return latest
 
 
-def review_problems(entries: list, core: str, author_key: str | None) -> list:
+def review_problems(entries: list, core: str, author_key: str | None, tier: str = "dual") -> list:
     problems = []
     latest = current_reviews(entries, core)
-    for role in ROLES:
+    for role in required_roles(tier):
         entry = latest.get(role)
         if not entry:
             stale = any(item.get("role") == role for item in entries)
@@ -892,7 +921,10 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
     author = spec.get("author")
     reviews = {entry.get("role"): entry for entry in spec.get("reviews") or [] if isinstance(entry, dict)}
     review_keys, valid_roles = set(), 0
-    for role in ROLES:
+    tier = "single" if spec.get("review_tier") == "single" else "dual"
+    if tier == "single":
+        attested.append("the spec claims Review-tier single: one adversarial review (author-declared)")
+    for role in required_roles(tier):
         entry = reviews.get(role)
         if not entry or entry.get("verdict") != "ACCEPT" or entry.get("core_sha") != core:
             missing.append(f"{role} spec review: no ACCEPT bound to spec core {str(core)[:12]}. Fix: "
@@ -1480,7 +1512,8 @@ def cmd_attach(args, spec_policy):
     problems += domain_problems  # only fails in enforce mode
     for warning in domain_warnings:
         print(f"spec-flow: warning: {warning}", file=sys.stderr)
-    problems += review_problems(entries, core, author)
+    tier = review_tier(spec)[0]
+    problems += review_problems(entries, core, author, tier)
     if problems:
         raise SpecError("spec not attached:\n" + "\n".join("  - " + p for p in problems))
     session = Session(spec["header"]["Ticket"], spec_policy)
@@ -1488,7 +1521,7 @@ def cmd_attach(args, spec_policy):
     latest = current_reviews(entries, core)
     files = [("spec", spec_path.name, "text/markdown", read_spec_bytes(spec_path)),
              ("reviews", reviews_path(spec_path).name, "text/plain", read_spec_bytes(reviews_path(spec_path)))]
-    for role in ROLES:
+    for role in required_roles(tier):
         report = latest[role].get("report")
         if report:
             data = read_regular(Path(report["path"]), 1_000_000)
@@ -1502,9 +1535,10 @@ def cmd_attach(args, spec_policy):
               "spec_file_sha": sha256_bytes(read_spec_bytes(spec_path)),
               "ac": [ident for ident, _ in spec["criteria"]], "neg": [ident for ident, _, _ in spec["negatives"]],
               "click_test": {"required": not reason, "reason": reason.group(1) if reason else None},
-              "signoff": spec["header"].get("Sign-off", "main"),
+              "signoff": spec["header"].get("Sign-off", "main"), "review_tier": tier,
               "reviews": [{k: latest[role].get(k) for k in ("role", "kind", "identity", "model", "verdict",
-                                                             "core_sha", "key", "source")} for role in ROLES]}
+                                                             "core_sha", "key", "source")}
+                          for role in required_roles(tier)]}
     record["key"] = content_key("spec", record["spec_file_sha"])
     reviewers = "; ".join(f"{e['role']}: {e['identity']} ({e['kind']}) {e['verdict']}" for e in record["reviews"])
     summary = (f"**Spec attached** for {session.ticket.label}: {len(record['ac'])} acceptance criteria "
