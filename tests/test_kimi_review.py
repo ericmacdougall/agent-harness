@@ -574,9 +574,16 @@ class KimiReviewTests(unittest.TestCase):
         variant = self.home / '.CLAUDE' / 'Projects' / 'p' / 'm.md'
         variant.parent.mkdir(parents=True, exist_ok=True)
         variant.write_text('prose\n')
+        saved = os.environ.get('HOME')
         os.environ['HOME'] = str(self.home)
-        with self.assertRaises(module.Refused):
-            module.check_path(variant)
+        try:
+            with self.assertRaises(module.Refused):
+                module.check_path(variant)
+        finally:
+            if saved is None:
+                os.environ.pop('HOME', None)
+            else:
+                os.environ['HOME'] = saved
 
     def test_inode_check_works_without_the_tree_check(self):
         module = load_module()
