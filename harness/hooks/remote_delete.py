@@ -84,6 +84,12 @@ def wording_refusal(turn, host):
     if not approve or cg.DECLINE_WORDS.search(text):
         return ("the selected answer is not a plain approval of every named path (for example \"Yes, remove all 11\")"
                 "; ask the user again")
+    if cg.DECLINE_WORDS.search(question):
+        return ("the question also says to keep or not remove something (%r); ask one question that lists only the "
+                "paths to remove" % cg.DECLINE_WORDS.search(question).group(0))
+    if named_count(question) > 1 and not approve.group(1):
+        return ("the question names %d paths, so the answer must state that count (for example \"Yes, remove all "
+                "%d\")" % (named_count(question), named_count(question)))
     if approve.group(1) and int(approve.group(1)) != named_count(question):
         return "the answer approves %s paths but the question names %d" % (approve.group(1), named_count(question))
     if not re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(host), question, re.I):

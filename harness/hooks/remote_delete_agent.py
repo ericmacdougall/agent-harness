@@ -14,13 +14,14 @@ it with the archive, so the delete follows the comparison within seconds, not af
 Archive checks:
 - the Dropbox tar.gz streams to the sha256 recorded in its .sha256 file, and the same stream is read as a tar;
 - the archive equals the tree: the same set of entries under <name>/, and every regular file has the same size and
-  mtime (seconds), every symlink the same target; the listing has one line per member;
+  mtime (seconds) and sha256, every symlink the same target; the listing has one line per member;
 - when HEAD has commits no remote has, the bundle downloads, `git bundle verify` passes against the tree's
   repository, and its heads include HEAD.
 
 Tree rules: a real directory at least two levels below home, outside harness and credential folders, on one
-filesystem (no mount point inside), and, when it is a git tree, a clean LINKED worktree (a checkout with its own
-.git directory is refused: its branches would go with it). A worktree is removed with `git worktree remove --force`
+filesystem (no mount point inside), and, when it is a git tree, a clean LINKED worktree without submodules (a
+checkout with its own .git directory is refused: its branches would go with it; submodule repositories live in the
+worktree's git dir and would go too). A worktree is removed with `git worktree remove --force`
 from its repository (branches stay), then `git worktree prune`; any other directory with shutil.rmtree.
 Every run appends to ~/.agent-harness/state/remote-delete-audit.jsonl on this host. Stdlib only.
 """
@@ -90,6 +91,9 @@ def git_state(path):
     if os.path.islink(marker) or not os.path.isfile(marker):
         raise ValueError("a checkout with its own .git directory is not removed by this route (its branches and "
                          "stash would go with it); only linked worktrees")
+    _, gitdir = git(path, "rev-parse", "--path-format=absolute", "--git-dir")
+    if os.path.lexists(os.path.join(path, ".gitmodules")) or os.path.lexists(os.path.join(gitdir.strip(), "modules")):
+        raise ValueError("the worktree has submodules, whose unpushed commits worktree remove would delete")
     code, status = git(path, "status", "--porcelain=v1", "--untracked-files=all")
     if code != 0:
         raise ValueError("git status failed")
@@ -118,11 +122,19 @@ def walk_tree(path):
             elif stat.S_ISDIR(info.st_mode):
                 entries[rel] = ("d", 0, 0, "")
             elif stat.S_ISREG(info.st_mode):
-                entries[rel] = ("f", info.st_size, int(info.st_mtime), "")
+                with open(full, "rb") as handle:
+                    entries[rel] = ("f", info.st_size, int(info.st_mtime), file_digest(handle))
             else:
                 entries[rel] = ("o", 0, 0, "")
     entries[os.path.basename(path)] = ("d", 0, 0, "")
     return entries
+
+
+def file_digest(handle):
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: handle.read(1 << 20), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 class HashingReader:
@@ -163,7 +175,7 @@ def read_archive(name, archive, sha_file, listing_file):
                     elif m.isdir():
                         members[rel] = ("d", 0, 0, "")
                     elif m.isfile():
-                        members[rel] = ("f", m.size, int(m.mtime), "")
+                        members[rel] = ("f", m.size, int(m.mtime), file_digest(tar.extractfile(m)))
                     elif m.islnk():
                         members[rel] = ("h", 0, 0, os.path.normpath(m.linkname))
                     else:
@@ -190,10 +202,10 @@ def compare(tree, members):
             return "the tree has %s, which the archive does not" % rel[:160]
         if saved[0] == "h":  # a hard link in the tar: the tree holds a regular file of the linked member's size
             target = members.get(saved[3])
-            if have[0] != "f" or not target or target[0] != "f" or target[1] != have[1]:
+            if have[0] != "f" or not target or target[0] != "f" or target[1] != have[1] or target[3] != have[3]:
                 return "%s differs from the archive" % rel[:160]
             continue
-        if have[0] != saved[0] or (have[0] == "f" and have[1:3] != saved[1:3]) or (have[0] == "l" and have[3] != saved[3]):
+        if have[0] != saved[0] or (have[0] == "f" and have[1:4] != saved[1:4]) or (have[0] == "l" and have[3] != saved[3]):
             return "%s differs from the archive" % rel[:160]
     return ""
 
