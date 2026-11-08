@@ -401,12 +401,17 @@ class Ownership(WorldCase):
         def spy(command, **kw):
             seen.append(kw.get('main'))
             return 'allow', '', '', ()
+        sid = '11111111-2222-3333-4444-555555555555'
+        transcript = Path(self.home) / '.claude' / 'projects' / '-x' / (sid + '.jsonl')
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text('{}\n')
+        base = {'tool_name': 'Bash', 'tool_input': {'command': 'netwatch orphans'}, 'cwd': '/'}
         with mock.patch.object(kg, 'decide', spy):
-            for payload in ({'tool_name': 'Bash', 'tool_input': {'command': 'netwatch orphans'}, 'cwd': '/'},
-                            {'tool_name': 'Bash', 'tool_input': {'command': 'netwatch orphans'}, 'cwd': '/',
-                             'agent_id': 'sub'}):
+            for payload in (dict(base, session_id=sid, transcript_path=str(transcript)),
+                            dict(base, session_id=sid, transcript_path=str(transcript), agent_id='sub'),
+                            base):  # #134 red-team B7: no agent_id is not main (every Codex payload)
                 kg.analyze_main(json.dumps(payload).encode())
-        self.assertEqual(seen, [True, False])
+        self.assertEqual(seen, [True, False, False])
         self.assertIs(kg.decide, real)
 
     def test_malformed_pids(self):

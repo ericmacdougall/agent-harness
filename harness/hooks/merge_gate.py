@@ -102,9 +102,10 @@ WRAPPER_WORDS = {"env", "command", "sudo", "time", "nohup", "nice", "exec", "bui
 MERGE_HINT = re.compile(r"\bgh\b|merge|pulls|graphql|api\.github", re.I)
 DYNAMIC_WORD = re.compile(r"^(?:\$|\$\w+|\$\{[^}]*\}\w*)$")  # a command word that is only a variable or substitution
 GH_HINT = re.compile(r"\bgh\b|merge|curl|wget|\bhttps?\b|python|node|perl|ruby|ssh|eval|graphql|pulls|api\.github", re.I)
-STATE_NAMES = re.compile(r"merge-gate[-/](?:waivers|audit|approvals)", re.I)
+STATE_NAMES = re.compile(r"merge-gate[-/](?:waivers|audit|approvals)|main-stamps", re.I)
 # #134 red-team P2: the peer_review run that mints a merge authorization (pr stage with a GitHub binding)
-PEER_REVIEW_AUTH = re.compile(r"peer_review(?:\.py)?['\"]?\s+pr\b[^\n;&|]*--(?:github-repo|pr)\b")
+# any option order (B2): `peer_review.py --github-repo o/r --pr 5 pr ...` binds as well
+PEER_REVIEW_AUTH = re.compile(r"peer_review(?:\.py)?\b[^\n;&|]*\s--(?:github-repo|pr)\b")
 STATE_GLOB = re.compile(r"merge-gate-[wa*?\[]", re.I)  # subagents: globs and split spellings of the state files
 WAIVE_CMD = re.compile(r"merge_gate(?:\.py)?['\"]?\s+(?:--\S+\s+\S+\s+)*waive\b")
 WAIVE_ANY = re.compile(r"waive|add_waiver|consume_waiver|put_stamp|take_stamp", re.I)
@@ -1797,6 +1798,8 @@ def decide(payload, runner, state_dir, now=None):
         return 2, "merge-gate: only the main agent may record a waiver; ask the main agent."
     if WAIVE_CMD.search(command) and not subagent:
         _stamp_waive(command, payload, state_dir, now)
+    if PEER_REVIEW_AUTH.search(plain):
+        _stamp_review(command, payload, now)
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
     merges = find_merges(command, cwd=cwd)
     if not merges:
@@ -1827,6 +1830,24 @@ def _stamp_waive(command, payload, state_dir, now):
         session = clean(payload.get("session_id") or "unknown", 40)
         put_stamp(state_dir, stamp_key(values["--repo"], int(values["--pr"]), values["--head"], values["--ticket"]),
                   "main:session-" + re.sub(r"[^A-Za-z0-9_.-]", "", session) + "(hook)", now)
+
+
+def _stamp_review(command, payload, now):
+    """B2: the peer_review run that may mint a merge authorization gets a one-shot stamp, only from proven main."""
+    import caller_identity  # noqa: PLC0415
+    if not caller_identity.is_main(payload):
+        return
+    tokens, _ = tokenize(command)
+    values = {}
+    for index, token in enumerate(tokens):
+        for name in ("--github-repo", "--pr"):
+            if token == name and index + 1 < len(tokens):
+                values[name] = tokens[index + 1]
+            elif token.startswith(name + "="):
+                values[name] = token.split("=", 1)[1]
+    if values.get("--github-repo") and str(values.get("--pr", "")).isdigit():
+        caller_identity.put_stamp("review-auth", [values["--github-repo"], int(values["--pr"])],
+                                  session=str(payload.get("session_id") or ""), now=now)
 
 
 def _deadline_seconds():

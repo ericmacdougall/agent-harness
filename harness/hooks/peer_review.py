@@ -973,7 +973,8 @@ def pr_base(repo, base):
 
 def review_merge_eligible(args, binding, report, selection):
     """Only a pure PR PASS with a known different-harness reviewer may auto-authorize."""
-    return bool(args.stage == 'pr' and binding and args.author_harness in {'claude', 'openai'}
+    return bool(args.stage == 'pr' and binding and getattr(args, 'main_stamp', None)
+                and args.author_harness in {'claude', 'openai'}
                 and selection.get('harness') in {'claude', 'openai'}
                 and selection['harness'] != args.author_harness
                 and re.match(r'^VERDICT: PASS(?:\s|$)', report.strip())
@@ -1222,7 +1223,7 @@ def plan_resource_gate(content):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("stage", choices=("plan", "code-inspection", "pr"))
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--packet", type=Path, required=True,
@@ -1318,6 +1319,7 @@ def main() -> int:
         evidence.close()
         parser.error('repo HEAD differs from --expected-head')
     binding = None
+    args.main_stamp = None
     if args.github_repo is not None:
         try:
             binding = verify_pr_binding(args.github_repo, args.pr, before[0])
@@ -1325,6 +1327,12 @@ def main() -> int:
             target.close()
             evidence.close()
             parser.error(str(error))
+        # #134 red-team B2: only a run the main agent's hook saw may mint a merge authorization
+        import caller_identity
+        args.main_stamp = caller_identity.take_stamp('review-auth', [args.github_repo, args.pr])
+        if args.main_stamp is None:
+            print('Note: no main-agent stamp for this --github-repo/--pr run (run it from the main agent); this '
+                  'review cannot authorize a merge.', file=sys.stderr)
     if before[1]:
         target.close()
         evidence.close()

@@ -2102,6 +2102,13 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
     tag = {"kind": args.get("kind"), "agent": args.get("agent")} if op == "task.dispose" else {}
     guarded = op == "task.dispose" and args.get("kind") in GUARDED_KINDS
     try:
+        if op == "task.dispose" and args.get("ack_handoff"):
+            import caller_identity  # noqa: PLC0415
+            # #134 red-team B4: AH_AGENT_ID is not set by any launcher, so the self-ack check below cannot be the
+            # control. A main payload's hook stamps this agent; anything else (a sub-agent, Codex, a script) has none.
+            if caller_identity.take_stamp("ack-handoff", [args.get("agent")], home=home) is None:
+                raise AhError("forbidden", "task.dispose --ack-handoff: only the main agent acknowledges a handoff (its "
+                                           "hook stamps the call); none was found for " + str(args.get("agent")), 3)
         if op == "task.dispose" and (args.get("kind") in ("resumed", "reassigned") + GUARDED_KINDS
                                      or args.get("ack_handoff")) \
                 and actor_id() == args.get("agent"):  # first, so an owner's self-ack is named as such

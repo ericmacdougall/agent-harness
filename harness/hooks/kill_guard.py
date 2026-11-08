@@ -14,7 +14,7 @@ What it blocks, before the command runs, on Claude Code (Bash, PowerShell) and C
     or argv[1], is inside the caller's own git worktree (the toplevel of the tool call's cwd), or it is in the
     per-worktree spawn ledger written by `kill_guard.py spawn -- CMD...`;
   * `netwatch orphans --kill --pid N[,N...]` unless every PID passes the same ownership proof, except that the main
-    agent (a payload with no agent_id) outside any git worktree, such as main in HOME, needs only the basic checks
+    agent (proven by caller_identity.is_main) outside any git worktree, such as main in HOME, needs only the basic checks
     (not init, not its own ancestor, same uid, not a protected process or interactive shell);
   * every kill inside ssh, mosh, docker exec and kubectl exec (ownership cannot be checked locally) except
     `netwatch orphans --kill --pid N[,N...]`, and `ssh HOST kill [-SIG] PID...` where every PID was started by
@@ -759,7 +759,7 @@ def make_analyzer_class(cg):
     class KillAnalyzer(cg.Analyzer):
         def __init__(self, compiled, cwd, ps, ownership, policy, raw, main=False):
             super().__init__(compiled, cwd=cwd, ps=ps)
-            self.main = bool(main)  # the payload had no agent_id; only the netwatch route uses it
+            self.main = bool(main)  # caller_identity.is_main proved main; only the netwatch route uses it
             self.own = ownership
             self.policy = policy
             self.raw = raw
@@ -1701,7 +1701,7 @@ def parse_kill_words(args, remote=False):
 
 def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=None, home=None, main=False):
     """Return (verdict, rule, message, pids): verdict is 'allow', 'warn' or 'block'. Never raises.
-    main: the caller is the main agent (the hook payload has no agent_id). Default False, the stricter reading."""
+    main: the caller is proven to be the main agent (caller_identity.is_main). Default False, the stricter reading."""
     policy = policy or load_policy()
     if policy['mode'] == 'off':
         return 'allow', '', '', ()
@@ -1824,7 +1824,8 @@ def analyze_main(data=None):
                 return 0
             command = text  # a tool the launcher treats as a shell tool (a command/cmd/script key): judge its text
         cwd = cg.payload_cwd(payload)
-        main = isinstance(payload, dict) and not payload.get('agent_id')
+        import caller_identity  # noqa: PLC0415 - positive main proof, not the absence of agent_id (B7)
+        main = caller_identity.is_main(payload)
         verdict, _rule, message, _pids = decide(command, cwd=cwd, ps=ps, policy=policy, main=main)
         return emit(verdict, message)
     except TimeoutError:

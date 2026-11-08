@@ -339,17 +339,38 @@ def acknowledges(cmd: str, depth: int = 0) -> bool:
     return any(_acks(s, depth) for s in segs if s)
 
 
+def _stamp_ack(cmd: str, payload: dict) -> None:
+    """One stamp per `--agent ID` of a main command that mentions --ack-handoff (#134 red-team B4)."""
+    if "ack-handoff" not in cmd and "ack_handoff" not in cmd:
+        return
+    import caller_identity  # noqa: PLC0415
+    import shlex  # noqa: PLC0415
+    try:
+        words = shlex.split(cmd, comments=False)
+    except ValueError:
+        return
+    for index, word in enumerate(words):
+        agent = words[index + 1] if word == "--agent" and index + 1 < len(words) else (
+            word.split("=", 1)[1] if word.startswith("--agent=") else None)
+        if agent and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", agent):
+            caller_identity.put_stamp("ack-handoff", [agent], session=str(payload.get("session_id") or ""))
+
+
 def cmd_pretool(payload: dict) -> dict:
     """PreToolUse(Bash): a sub-agent (the payload carries its agent_id) may not resume, reassign or close an owner;
     main records those. A wait (`--kind waiting`) stays open to everyone, but not one that acknowledges a handoff
     (`--ack-handoff`). The identity is the hook's, not the
     shell's: main's shell carries the same environment as a sub-agent's (review round 3, B1). The text match is
     advisory against an agent that hides the call; the dispose guard's evidence and burst rules do not rely on it."""
-    if not payload.get("agent_id") or payload.get("tool_name") != "Bash":
+    if payload.get("tool_name") != "Bash":
         return {}
     tool_input = payload.get("tool_input")
     cmd = str((tool_input if isinstance(tool_input, dict) else {}).get("command") or "")
-    if not acknowledges(cmd):
+    import caller_identity  # noqa: PLC0415
+    if caller_identity.is_main(payload):
+        _stamp_ack(cmd, payload)  # B4: `ah task dispose --ack-handoff` needs this stamp
+        return {}
+    if not acknowledges(cmd):  # anything not proven main: sub-agents, Codex payloads, a payload with no transcript
         return {}
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                    "permissionDecisionReason": "dropped-owner gate (goodqa#14791): a sub-agent cannot "

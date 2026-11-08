@@ -137,6 +137,8 @@ class GateTests(Base):
             {"at": iso(NOW - ah.HANDOFF_ACK_S - 1), "event": "handoff", "note": "to main: blocked on an ask"}])
         before = {r["agent_id"]: r for r in self.owners()["owners"]}
         self.assertIn("handoff-unacked", before["dropowner"]["flags"])
+        import caller_identity
+        caller_identity.put_stamp("ack-handoff", ["dropowner"], home=self.home)  # what main's hook writes
         self.dispose("waiting", "disp-handoff-wait", until=iso(NOW + 3600), ref="wa5b00000001", ack_handoff=True)
         waiting = {r["agent_id"]: r for r in self.owners()["owners"]}
         self.assertNotIn("handoff-unacked", waiting["dropowner"]["flags"])
@@ -161,6 +163,29 @@ class GateTests(Base):
             with self.assertRaises(ah.AhError) as caught:
                 self.dispose("waiting", "self-ack", until=iso(NOW + 3600), ref="wa5b00000001", ack_handoff=True)
         self.assertEqual(caught.exception.code, "forbidden")
+
+    def test_ack_handoff_without_mains_stamp_is_refused(self):
+        # #134 red-team B4: AH_AGENT_ID is never set, so a copied script or Codex owner could ack itself
+        with self.assertRaises(ah.AhError) as caught:
+            self.dispose("waiting", "nostamp-ack", until=iso(NOW + 3600), ref="wa5b00000005", ack_handoff=True)
+        self.assertEqual(caught.exception.code, "forbidden")
+        self.assertIn("only the main agent", str(caught.exception))
+
+    def test_only_proven_main_is_stamped_and_codex_payloads_are_denied(self):
+        import caller_identity
+        sid = "11111111-2222-3333-4444-555555555555"
+        transcript = self.home / ".claude" / "projects" / "-x" / (sid + ".jsonl")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text("{}\n")
+        cmd = ("python3 ~/.claude/hooks/ah.py task dispose --agent owner-7 --kind waiting --ack-handoff --ref "
+               "wa5b00000006 --until 2026-11-09T00:00:00Z")
+        codex = {"tool_name": "Bash", "tool_input": {"command": cmd}, "session_id": sid}
+        out = dropped_gate.cmd_pretool(codex)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(caller_identity.take_stamp("ack-handoff", ["owner-7"], home=self.home))
+        main = dict(codex, transcript_path=str(transcript))
+        self.assertEqual(dropped_gate.cmd_pretool(main), {})
+        self.assertIsNotNone(caller_identity.take_stamp("ack-handoff", ["owner-7"], home=self.home))
 
     def test_ack_handoff_needs_kind_waiting(self):
         with self.assertRaises(ah.AhError):

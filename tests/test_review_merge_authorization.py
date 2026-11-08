@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -61,10 +62,12 @@ class BindingTests(unittest.TestCase):
             review.verify_pr_binding("o/r", 5, HEAD, runner=FakePr(rc=1))
 
     def test_only_pure_cross_harness_pr_pass_is_eligible(self):
-        args = SimpleNamespace(stage="pr", author_harness="claude")
+        args = SimpleNamespace(stage="pr", author_harness="claude", main_stamp={"purpose": "review-auth"})
         binding = {"repo": "o/r", "pr": 5}
         selection = {"harness": "openai"}
         self.assertTrue(review.review_merge_eligible(args, binding, "VERDICT: PASS\nReviewed", selection))
+        unstamped = SimpleNamespace(stage="pr", author_harness="claude", main_stamp=None)  # #134 red-team B2
+        self.assertFalse(review.review_merge_eligible(unstamped, binding, "VERDICT: PASS\nReviewed", selection))
         negatives = (
             ("pr", "claude", binding, "VERDICT: BLOCK\nF1: defect", selection),
             ("pr", "claude", binding, "VERDICT: PASS-WITH-TICKETS\nF1: ticketed", selection),
@@ -77,7 +80,7 @@ class BindingTests(unittest.TestCase):
         )
         for stage, author, bound, report, selected in negatives:
             with self.subTest(stage=stage, author=author, bound=bound, report=report, selected=selected):
-                local = SimpleNamespace(stage=stage, author_harness=author)
+                local = SimpleNamespace(stage=stage, author_harness=author, main_stamp={"purpose": "review-auth"})
                 self.assertFalse(review.review_merge_eligible(local, bound, report, selected))
 
 
@@ -237,6 +240,8 @@ class EndToEndTests(unittest.TestCase):
         path.chmod(0o700)
 
     def test_review_pass_then_merge_without_separate_waive(self):
+        import caller_identity
+        caller_identity.put_stamp("review-auth", ["o/r", 5], home=self.root)  # what main's hook writes
         output = self.root / "review.md"
         env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
                    AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"),
@@ -274,6 +279,21 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(code, 2, text)
         finally:
             fixture.HEAD = original_head
+
+    def test_unstamped_review_mints_nothing(self):
+        # #134 red-team B2: a run no main hook saw (copied script, script file, sub-agent) gets no stamp
+        output = self.root / "unstamped.md"
+        env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
+                   AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"),
+                   AGENT_HARNESS_REVIEW_POLICY=str(ROOT / "harness" / "hooks" / "review_policy.json"))
+        result = subprocess.run([
+            sys.executable, str(HOOKS / "peer_review.py"), "pr", "--repo", str(self.repo),
+            "--packet", str(self.packet), "--output", str(output), "--expected-head", self.head,
+            "--github-repo", "o/r", "--pr", "5", "--author-harness", "claude"],
+            text=True, capture_output=True, env=env, timeout=45)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("Merge authorization:", result.stdout)
+        self.assertIn("no main-agent stamp", result.stderr)
 
     def test_same_harness_fallback_does_not_inherit_primary_eligibility(self):
         self.fake("codex", "import sys\nsys.stdin.read()\n"
@@ -336,6 +356,30 @@ class SubagentAuthorization(unittest.TestCase):
                 code, text = mg.decide(payload, fixture.FakeGh(fixture.SCENARIOS["red_netwatch"]), Path(d))
                 self.assertEqual(code, 2, cmd)
                 self.assertIn("subagent cannot run the PR review", text)
+
+    def test_options_before_the_stage_are_matched_too(self):
+        # #134 red-team B2
+        with tempfile.TemporaryDirectory() as d:
+            for cmd in ("python3 /x/.claude/hooks/peer_review.py --github-repo o/r --pr 5 pr --repo /w",
+                        "python3 /x/.claude/hooks/peer_review.py --pr=5 --github-repo=o/r pr --repo /w"):
+                payload = dict(fixture.bash(cmd), agent_id="sub1")
+                code, _ = mg.decide(payload, fixture.FakeGh(fixture.SCENARIOS["red_netwatch"]), Path(d))
+                self.assertEqual(code, 2, cmd)
+
+    def test_only_a_proven_main_payload_gets_the_review_stamp(self):
+        import caller_identity
+        sid = "11111111-2222-3333-4444-555555555555"
+        with tempfile.TemporaryDirectory() as home:
+            transcript = Path(home) / ".claude" / "projects" / "-x" / (sid + ".jsonl")
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text("{}\n")
+            cmd = "python3 ~/.claude/hooks/peer_review.py pr --repo /w --github-repo o/r --pr 5 --packet /p"
+            with mock.patch.dict(os.environ, {"HOME": home}):
+                mg.decide(fixture.bash(cmd), fixture.FakeGh(fixture.SCENARIOS["green"]), Path(home) / "s")
+                self.assertIsNone(caller_identity.take_stamp("review-auth", ["o/r", 5], home=home))  # no proof
+                main = dict(fixture.bash(cmd), session_id=sid, transcript_path=str(transcript))
+                mg.decide(main, fixture.FakeGh(fixture.SCENARIOS["green"]), Path(home) / "s")
+                self.assertIsNotNone(caller_identity.take_stamp("review-auth", ["o/r", 5], home=home))
 
     def test_main_and_unbound_subagent_reviews_still_run(self):
         with tempfile.TemporaryDirectory() as d:
