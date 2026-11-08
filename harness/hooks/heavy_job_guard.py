@@ -77,6 +77,9 @@ DEFAULT_MODES = {"browser": "enforce", "adversarial": "warn", "full-suite": "enf
                  "install": "enforce", "replay": "enforce", "container": "enforce", "big-clone": "warn",
                  "dropbox-lane": "enforce"}
 CAPPED_RULES = {"browser", "media", "fan-out"}  # memory hogs: hatch alone is not enough
+# goodqa#15246: every host's agent uploads share one Dropbox account's write budget, so this rule holds everywhere.
+# The other rules guard the Mac's own capacity and stay Mac-only (heavy work is meant to run on the Linux hosts).
+EVERY_HOST_RULES = {"dropbox-lane"}
 NEVER_BLOCK = {"adversarial"}  # red-team/fuzz work is legitimate: advise (dev2, group cleanup), never deny
 WARN_ONLY = {"big-clone"}  # disk advice (goodqa#14927): warn whatever the mode table says, never deny
 BIG_PACK_BYTES = 500 * 1024 * 1024  # a repository whose packs exceed this is a big copy on the Mac
@@ -1905,6 +1908,19 @@ def load_modes():
     return modes
 
 
+def hook_modes():
+    """The modes the hook applies on this host: everything on the Mac, only EVERY_HOST_RULES elsewhere."""
+    modes = load_modes()
+    if off_the_mac():
+        modes = {rule: (mode if rule in EVERY_HOST_RULES else "off") for rule, mode in modes.items()}
+    return modes
+
+
+def off_the_mac() -> bool:
+    """True on Linux and other hosts, unless HARNESS_HEAVY_GUARD_FORCE=1 asks for the Mac's full rule set."""
+    return sys.platform != "darwin" and os.environ.get("HARNESS_HEAVY_GUARD_FORCE") != "1"
+
+
 SEVERITY = {"allow": 0, "warn": 1, "deny": 2}
 
 
@@ -2357,7 +2373,7 @@ def copy_event_detail(payload: dict, decision: dict, hatch_uses=None) -> dict:
             "route": route_host(), "hatch_uses_1h": hatch_uses}
 
 
-def run(raw: bytes) -> int:
+def run(raw: bytes, modes=None) -> int:
     import json
     try:
         payload = parse_payload(raw)
@@ -2381,7 +2397,7 @@ def run(raw: bytes) -> int:
             payload = dict(payload, cwd=tool_input["workdir"])
     if not isinstance(command, str):
         return 0
-    decision = decide(command, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None)
+    decision = decide(command, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None, modes)
     action = decision["action"]
     owner = owner_of(payload)
     if decision.get("rule") in ("copy", "build") and action != "warn":
@@ -2461,8 +2477,8 @@ def run(raw: bytes) -> int:
 
 
 def main() -> int:
-    if sys.platform != "darwin" and os.environ.get("HARNESS_HEAVY_GUARD_FORCE") != "1":
-        return 0  # dev2 and other hosts are where the heavy work is supposed to run
+    # Off the Mac only EVERY_HOST_RULES apply (hook_modes turns the rest off): heavy work is meant to run there, but its
+    # Dropbox uploads still share the account's write budget (goodqa#15246).
     if os.environ.get("HARNESS_HEAVY_GUARD") == "off":
         return 0
     try:
@@ -2481,7 +2497,7 @@ def main() -> int:
             warn(f"stdin rejected ({rejected.code}); failing open")
             log_event({"event": "fail-open", "reason": rejected.code})
             return 0
-        return run(raw)
+        return run(raw, hook_modes())
     except Exception as error:  # fail open: a guard bug must never block every Bash call
         warn(f"internal error {type(error).__name__}; failing open")
         log_event({"event": "fail-open", "reason": type(error).__name__})
