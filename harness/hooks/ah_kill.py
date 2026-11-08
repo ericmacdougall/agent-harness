@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import pwd
@@ -269,6 +270,73 @@ def in_own_scope(probe, table, pid, cwd, roots, worktree):
     return bool(worktree and cwd and probe.git_top(cwd) == worktree)
 
 
+SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+
+
+def session_work_dir(home, session):
+    """The real path of ~/.agent-harness/work/<session>, or a KillError when the session id is unusable."""
+    if not session or not SESSION_ID.fullmatch(session) or session in (".", ".."):
+        raise KillError("bad_request", "--session-scope needs this session's id (--session or CLAUDE_CODE_SESSION_ID)")
+    return os.path.realpath(os.path.join(str(home), ".agent-harness", "work", session))
+
+
+def _inside(path, root):
+    if not path or not root or "\x00" in path:
+        return False
+    real = os.path.realpath(os.path.normpath(path))
+    return real == root or real.startswith(root.rstrip("/") + "/")
+
+
+def _kill_guard():
+    import importlib.util  # noqa: PLC0415
+    spec = importlib.util.spec_from_file_location("kill_guard", str(Path(__file__).resolve().with_name("kill_guard.py")))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+MAX_LEDGERS = 500
+
+
+def session_spawns(home, root, kg=None):
+    """{(pid, start)} that `kill_guard.py spawn` recorded for a worktree inside the session work dir `root`.
+
+    Exact ownership (goodqa#15253): only HMAC-valid local ledger entries count, read from the ledger file named for
+    their own root. A cwd or a path in argv never does. Real paths, so work/sess-10 or ../sess-2 never match."""
+    kg = kg or _kill_guard()
+    key = kg.read_key(str(home))
+    if not key:
+        return set()
+    found = set()
+    for path in sorted(kg.state_dir(str(home)).glob("ledger-*.jsonl"))[:MAX_LEDGERS]:
+        data = kg._read_secure_file(path, 1 << 20, tail=True)
+        for line in (data or b"").decode("utf-8", "replace").splitlines()[-2000:]:
+            try:
+                entry = json.loads(line)
+                pid, start, ts = int(entry["pid"]), str(entry["start"]), int(entry["ts"])
+                entry_root, mac = str(entry["root"]), str(entry["mac"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if entry_root.startswith("remote:") or os.path.realpath(entry_root) != entry_root:
+                continue
+            if not _inside(entry_root, root) or kg.ledger_path(entry_root, str(home)) != path:
+                continue
+            if hmac.compare_digest(mac, kg.ledger_mac(key, entry_root, pid, start, ts)):
+                found.add((pid, start))
+    return found
+
+
+def spawn_start(probe, pid):
+    """The process start time in the spawn ledger's format (kill_guard.Probe.start), or None."""
+    getter = getattr(probe, "spawn_start", None)
+    if getter is not None:
+        return getter(pid)
+    try:
+        return _kill_guard().Probe().start(pid)
+    except Exception:  # noqa: BLE001 - an unreadable start time proves nothing
+        return None
+
+
 def descendants(table: dict, root: int):
     """Depth-first, deepest last in discovery order; returned reversed so children come before parents."""
     kids = {}
@@ -355,6 +423,10 @@ def snapshot(probe, pid, my_uid, protected, root=None, role="target", scope=None
         rec["status"], rec["detail"] = "refused", why
     elif info["stat"].startswith("Z"):
         rec["status"], rec["detail"] = "gone", "already a zombie"
+    elif scope and scope.get("session_spawns") and not in_own_scope(
+            probe, table, pid, rec["cwd"], scope["roots"], scope["worktree"]) and (
+            pid, spawn_start(probe, pid)) in scope["session_spawns"]:
+        rec["scope"] = "session-spawn"  # spawned by a worktree in main's session work dir: audited, no notice
     elif scope and not in_own_scope(probe, table, pid, rec["cwd"], scope["roots"], scope["worktree"]):
         rec["scope"] = "foreign"
         if not scope["foreign"]:
@@ -388,7 +460,7 @@ def alive(probe, rec) -> bool:
 
 def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=None, sleep=time.sleep,
                clock=time.monotonic, session="", agent="", wal_path=None, via=None, own_pid=None, foreign=False,
-               worktree="auto", notify=None):
+               worktree="auto", notify=None, session_scope=False):
     reason = (reason or "").strip()
     if not reason:
         raise KillError("reason_required", "--reason is mandatory and must not be empty")
@@ -397,6 +469,7 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
     if not 0 <= grace <= MAX_GRACE:
         raise KillError("bad_request", "--grace must be 0..%d seconds" % int(MAX_GRACE))
     home = home or Path.home()
+    session_dir = session_work_dir(home, session) if session_scope else None
     probe = probe or Probe()
     own_pid = own_pid or os.getpid()
     my_uid = os.getuid()
@@ -414,7 +487,8 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
     roots = {own_pid}
     if worktree == "auto":
         worktree = probe.git_top(os.getcwd())
-    scope = {"table": table, "roots": roots, "worktree": worktree, "foreign": foreign}
+    scope = {"table": table, "roots": roots, "worktree": worktree, "foreign": foreign,
+             "session_spawns": session_spawns(home, session_dir) if session_dir else set()}
     plan, seen = [], set()
     for root in pids:
         batch = []

@@ -759,7 +759,7 @@ def make_analyzer_class(cg):
     class KillAnalyzer(cg.Analyzer):
         def __init__(self, compiled, cwd, ps, ownership, policy, raw, main=False):
             super().__init__(compiled, cwd=cwd, ps=ps)
-            self.main = bool(main)  # caller_identity.is_main proved main; only the netwatch route uses it
+            self.main = bool(main)  # caller_identity.is_main proved main: netwatch route and ah --session-scope
             self.own = ownership
             self.policy = policy
             self.raw = raw
@@ -1439,7 +1439,9 @@ def make_analyzer_class(cg):
             while i < len(rest):
                 t = rest[i]
                 key, eq, val = t.partition('=') if t.startswith('--') else (t, '', '')
-                if key in ('--tree', '--foreign') and not eq:
+                if key == '--session-scope' and not eq and not self.main:
+                    return False  # main only: a subagent's payload carries agent_id (goodqa#15253)
+                if key in ('--tree', '--foreign', '--session-scope') and not eq:
                     seen.add(key)
                     i += 1
                     continue

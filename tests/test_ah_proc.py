@@ -699,5 +699,102 @@ class GuardRule(unittest.TestCase):
         self.assertEqual(self.verdict(self.A + "--pid 4242 --reason x; kill 99"), "block")
 
 
+class SessionScope(KillBase):
+    """goodqa#15253 item 4: main stops what its own owners spawned, without --foreign (no high notice).
+
+    Exact ownership only: the pid and start time must be in an authenticated `kill_guard.py spawn` ledger entry for
+    a worktree inside ~/.agent-harness/work/<session>/. A cwd or a path in argv never counts."""
+    foreign = NarrowedScope.foreign
+    START = "Thu Nov  5 17:00:00 2026"
+
+    def sess(self, *parts):
+        return os.path.join(os.path.realpath(str(self.home)), ".agent-harness", "work", "sess-1", *parts)
+
+    def spawned(self, pid, root=None, start=None):
+        kg.append_ledger(root or self.sess("agent-y", "tree"), pid, start or self.START, home=str(self.home))
+
+    def probe_for(self, pid, cwd="/elsewhere/repo", cmd="/usr/bin/sleep 300", live_start=None):
+        probe = self.base(proc(pid, 1, cmd=cmd))
+        probe.cwds = {pid: cwd}
+        probe.spawn_start = lambda q, _s=live_start or self.START: _s if q == pid else None
+        return probe
+
+    def test_a_process_spawned_in_the_session_needs_no_foreign(self):
+        self.spawned(1201)
+        self.assertEqual(self.run_kill(self.probe_for(1201), [1201])["results"][0]["status"], "refused")  # flag needed
+        out = self.run_kill(self.probe_for(1201), [1201], session_scope=True)
+        self.assertEqual(out["results"][0]["status"], "exited")
+        self.assertEqual(self.notices, [])
+        intents = [r for r in self.audit() if r.get("event") == "intent" and r.get("pid") == 1201]
+        self.assertEqual(intents[0].get("scope"), "session-spawn")
+
+    def test_cwd_or_argv_in_the_session_dir_is_not_ownership(self):
+        # #133 accepted these; review round 1 and main's ruling: never by a shared directory or argv text
+        for pid, cwd, cmd in ((1202, self.sess("agent-y", "tree"), "/usr/bin/sleep 300"),
+                              (1203, "/elsewhere/repo", "/usr/bin/python3 " + self.sess("agent-y", "run.py"))):
+            out = self.run_kill(self.probe_for(pid, cwd=cwd, cmd=cmd), [pid], session_scope=True)
+            self.assertEqual(out["results"][0]["status"], "refused", (cwd, cmd))
+        self.assertEqual(self.notices, [])
+
+    def test_reused_pid_other_session_and_lookalike_roots_stay_foreign(self):
+        other = os.path.join(os.path.realpath(str(self.home)), ".agent-harness", "work", "sess-2", "t")
+        self.spawned(1210, start="Wed Nov  4 09:00:00 2026")                 # recorded start differs: pid reused
+        self.spawned(1211, root=other)                                        # another session's worktree
+        self.spawned(1212, root=self.sess() + "0/t")                          # work/sess-10: a prefix, not inside
+        self.spawned(1213, root=self.sess("..", "sess-2", "t"))              # dot segments out of the session dir
+        self.spawned(1214, root="remote:dev2")                                # a remote ledger root
+        for pid in (1210, 1211, 1212, 1213, 1214, 1215):                      # 1215: never recorded
+            out = self.run_kill(self.probe_for(pid), [pid], session_scope=True)
+            self.assertEqual(out["results"][0]["status"], "refused", pid)
+        self.assertEqual(self.notices, [])
+
+    def test_a_forged_ledger_line_is_ignored(self):
+        root = self.sess("agent-y", "tree")
+        self.spawned(1299)  # creates the key and the ledger file
+        path = kg.ledger_path(root, str(self.home))
+        with open(path, "a") as handle:
+            handle.write(json.dumps({"pid": 1220, "start": self.START, "ts": 1, "root": root, "mac": "0" * 64}) + "\n")
+        out = self.run_kill(self.probe_for(1220), [1220], session_scope=True)
+        self.assertEqual(out["results"][0]["status"], "refused")
+
+    def test_protected_processes_are_still_refused(self):
+        self.spawned(1230)
+        probe = self.probe_for(1230, cmd="/usr/sbin/cron -f")
+        probe.procs[1230]["comm"] = "/usr/sbin/cron"
+        self.assertEqual(self.run_kill(probe, [1230], session_scope=True)["results"][0]["status"], "refused")
+
+    def test_a_session_id_is_required(self):
+        probe = self.foreign(1240, cwd=self.sess("x"))
+        with self.assertRaises(ak.KillError):
+            ak.kill_local([1240], "why", home=self.home, probe=probe, sleep=self.clock.sleep, clock=self.clock.now,
+                          session="", agent="", own_pid=OWN, worktree="/work", session_scope=True,
+                          notify=lambda h, e: None)
+        self.assertEqual(probe.sent, [])
+
+
+class SessionScopeGuard(unittest.TestCase):
+    """kill_guard admits --session-scope only from main (no agent_id in the hook payload)."""
+    A = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason stuck --session-scope"
+
+    def verdict(self, cmd, subagent):
+        with tempfile.TemporaryDirectory() as tmp:
+            return kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp, main=not subagent)[0]
+
+    def test_main_may_pass_the_flag(self):
+        self.assertEqual(self.verdict(self.A, subagent=False), "allow")
+
+    def test_a_subagent_may_not(self):
+        self.assertEqual(self.verdict(self.A, subagent=True), "block")
+        self.assertEqual(self.verdict(self.A.replace(" --session-scope", ""), subagent=True), "allow")
+
+    def test_hook_reads_agent_id_from_the_payload(self):
+        with tempfile.TemporaryDirectory() as home:
+            for extra, code in (({}, 0), ({"agent_id": "a1"}, 2)):
+                body = json.dumps(dict({"tool_name": "Bash", "tool_input": {"command": self.A}, "cwd": home}, **extra))
+                done = subprocess.run([sys.executable, "-I", str(Path(kg.__file__)), "hook"], input=body.encode(),
+                                      capture_output=True, timeout=60, env={"HOME": home, "PATH": "/usr/bin:/bin"})
+                self.assertEqual(done.returncode, code, (extra, done.stderr[-300:]))
+
+
 if __name__ == "__main__":
     unittest.main()
