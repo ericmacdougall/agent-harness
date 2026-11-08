@@ -467,6 +467,8 @@ def parse_review_report(path: Path):
         index += 1
     body = [line for line in lines[index:] if line.strip()]
     verdict = re.match(r"^PLAN_RESULT: (ACCEPT|BLOCK)\b", body[0].strip()) if body else None
+    if re.match(r"(?i)^yes\b", header.get("Advisory", "")):  # an advisory (for example Kimi) opinion is never a review verdict
+        verdict = None
     return header, (verdict.group(1) if verdict else None), sha256_bytes(data.encode("utf-8", "surrogateescape"))
 
 

@@ -723,6 +723,37 @@ class ReviewFailure(OSError):
         self.outcome, self.source = outcome, source
 
 
+KIMI_LIMITS = ("\n\nTransport limit: this reviewer has no repository or tool access. Judge only the packet text above and "
+               "say plainly what the packet does not let you verify.")
+KIMI_VERDICT = re.compile(r'^KIMI_ADVISORY: (ACCEPT|BLOCK)\b')
+
+
+class AdvisoryOnly(Exception):
+    """Kimi answered. Its packet-only opinion is advisory: no pass marker, no exit 0, no ladder record."""
+    def __init__(self, text, source, failure):
+        super().__init__('advisory opinion from ' + source)
+        self.text, self.source, self.failure = text, source, failure
+
+
+def kimi_attempt(prompt, packet_path, timeout):
+    """One tool-less Kimi (subscription CLI) call, shaped like a provider launch: (code, stdout, stderr, launched)."""
+    try:
+        import kimi_review as kimi
+    except ImportError:
+        return 127, '', 'HARNESS_PROVIDER_UNAVAILABLE', 0
+    try:
+        if packet_path is not None:
+            kimi.check_path(packet_path)  # the packet's own path is gated like any other egress path
+        result = kimi.review_text(prompt + KIMI_LIMITS, label='review prompt', timeout=max(1, int(timeout)))
+    except kimi.QuotaExhausted as error:
+        return 1, '', 'Error: ACCOUNT_QUOTA_EXCEEDED', int(error.launched)
+    except kimi.LoginRequired as error:
+        return 1, '', 'Error: AUTHENTICATION_REQUIRED', int(error.launched)
+    except kimi.KimiError as error:  # egress refusal, cap, timeout: no result and no fallback after this
+        return 1, '', diagnostics.sanitize(error), int(error.launched)
+    return 0, result['text'], '', 1
+
+
 def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, content: str, options=None):
     options = options or {}
     verdict = ("Begin exactly VERDICT: PASS or VERDICT: BLOCK." if stage == 'pr' else
@@ -757,6 +788,9 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
     claude_entry = ('claude', 'Claude %s %s (rung %s)' % (claude_model, effort, rung), options.get('fallback_pool', 'default'))
     # The tier table picks the primary; the other harness at the same rung is the one authorized fallback.
     order = (codex_entry, claude_entry) if selection['harness'] == 'openai' else (claude_entry, codex_entry)
+    if options.get('secondary') == 'kimi':
+        # The one authorized independent fallback is Kimi (subscription CLI) instead of the other harness.
+        order = (order[0], ('kimi', 'Kimi kimi-code/k3.1-pro-highspeed (subscription CLI)', 'kimi'))
     primary = order[0][0]
     for provider, source, pool in order:
         remaining = deadline - time.monotonic()
@@ -766,37 +800,47 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         leased = False
         resolution, code, stdout, stderr = None, None, '', ''
         try:
-            # Resolve before the lease, so a lease refusal is reported with its own reason, not as a missing CLI.
-            roots = diagnostics.untrusted_roots(repo=options.get('repo'), snapshot=snapshot)
-            _CHILD_PATH_ROOTS[:] = sorted(set(_CHILD_PATH_ROOTS) | set(roots))
-            resolution = (options.get('resolutions') or {}).get(provider) or diagnostics.discover_executable(
-                provider, policy=review_policy(), roots=roots)
-            if store is not None:
-                store.acquire_pool(provider, pool, run_record.run_id)
-                leased = True
-            if not resolution['path']:
-                outcome = normalize_provider(provider, 127, '', 'HARNESS_PROVIDER_UNAVAILABLE')
+            if provider == 'kimi':
+                resolution = {'path': 'kimi_review.py'}
+                code, stdout, stderr, launched = kimi_attempt(
+                    prompt.replace(verdict, 'Begin exactly KIMI_ADVISORY: ACCEPT or KIMI_ADVISORY: BLOCK.'),
+                    options.get('packet_path'), timeout)
+                options['launches'] += launched  # a refused call never started the CLI, so it is not a launch
+                if code == 0 and KIMI_VERDICT.match(stdout.strip()):
+                    raise AdvisoryOnly(stdout.strip(), source, failure)
+                outcome = (provider_failure({}) if code == 0 else normalize_provider('kimi', code, stdout, stderr, '', stage))
             else:
-                with tempfile.TemporaryDirectory() as temp:
-                    last = Path(temp) / 'last.txt'
-                    if provider == 'codex':
-                        cmd = [resolution['path'], 'exec', '--ephemeral', '--json', '--model', codex_model,
-                               '-c', 'model_reasoning_effort=' + effort, '--sandbox', 'read-only',
-                               '--cd', str(snapshot), '--output-last-message', str(last), '-']
-                    else:
-                        cmd = [resolution['path'], '--print', '--safe-mode', '--restricted', '--model', claude_model,
-                               '--effort', effort, '--max-budget-usd', str(selection.get('review_budget_usd') or 5),
-                               '--no-session-persistence', '--output-format', 'json', '--system-prompt', REVIEW_SYSTEM, '-']
-                    timeout = min(timeout, deadline - time.monotonic())
-                    if timeout <= 0:
-                        outcome = {**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}
-                    else:
-                        options['launches'] += 1
-                        # The child is recorded for the usage guard's liveness rule when a run record exists.
-                        code, stdout, stderr = run(cmd, prompt, snapshot, timeout,
-                                                   **({'on_spawn': run_record.note_child} if run_record else {}))
-                        last_message = last.read_text(errors='replace') if last.exists() else ''
-                        outcome = normalize_provider(provider, code, stdout, stderr, last_message, stage)
+                # Resolve before the lease, so a lease refusal is reported with its own reason, not as a missing CLI.
+                roots = diagnostics.untrusted_roots(repo=options.get('repo'), snapshot=snapshot)
+                _CHILD_PATH_ROOTS[:] = sorted(set(_CHILD_PATH_ROOTS) | set(roots))
+                resolution = (options.get('resolutions') or {}).get(provider) or diagnostics.discover_executable(
+                    provider, policy=review_policy(), roots=roots)
+                if store is not None:
+                    store.acquire_pool(provider, pool, run_record.run_id)
+                    leased = True
+                if not resolution['path']:
+                    outcome = normalize_provider(provider, 127, '', 'HARNESS_PROVIDER_UNAVAILABLE')
+                else:
+                    with tempfile.TemporaryDirectory() as temp:
+                        last = Path(temp) / 'last.txt'
+                        if provider == 'codex':
+                            cmd = [resolution['path'], 'exec', '--ephemeral', '--json', '--model', codex_model,
+                                   '-c', 'model_reasoning_effort=' + effort, '--sandbox', 'read-only',
+                                   '--cd', str(snapshot), '--output-last-message', str(last), '-']
+                        else:
+                            cmd = [resolution['path'], '--print', '--safe-mode', '--restricted', '--model', claude_model,
+                                   '--effort', effort, '--max-budget-usd', str(selection.get('review_budget_usd') or 5),
+                                   '--no-session-persistence', '--output-format', 'json', '--system-prompt', REVIEW_SYSTEM, '-']
+                        timeout = min(timeout, deadline - time.monotonic())
+                        if timeout <= 0:
+                            outcome = {**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}
+                        else:
+                            options['launches'] += 1
+                            # The child is recorded for the usage guard's liveness rule when a run record exists.
+                            code, stdout, stderr = run(cmd, prompt, snapshot, timeout,
+                                                       **({'on_spawn': run_record.note_child} if run_record else {}))
+                            last_message = last.read_text(errors='replace') if last.exists() else ''
+                            outcome = normalize_provider(provider, code, stdout, stderr, last_message, stage)
         except GuardError as error:
             outcome = {**provider_failure({}), 'reason': error.reason,
                        'fallback_allowed': error.reason in {'QUOTA', 'AUTH'}}
@@ -979,6 +1023,9 @@ def main() -> int:
     parser.add_argument('--repeat-reason', help='Spend at most one additional declared attempt with a reason')
     parser.add_argument('--pool', default='default', help='Opaque Codex auth-pool alias; never a credential')
     parser.add_argument('--fallback-pool', default='default', help='Opaque independent Claude auth-pool alias')
+    parser.add_argument('--secondary', choices=('default', 'kimi'), default='default',
+                        help="Authorized independent fallback: 'default' is the other harness; 'kimi' is the user's "
+                             "Kimi subscription via kimi_review.py (tool-less, egress-gated, packet text only)")
     parser.add_argument('--owner', default='peer-review', help='Safe owner identifier for execution receipts')
     parser.add_argument('--base', help='PR base for the commit-policy range check (default origin/HEAD or origin/main)')
     parser.add_argument('--task', help='Ladder task key: the author rung comes from its ledger and the receipt is recorded there')
@@ -1159,7 +1206,7 @@ def main() -> int:
             print('Review refused: reviewer rung %s needs user permission recorded for the task by approve-top '
                   '(--task with a ledger permission); --author-rung alone is not a record' % selection['rung'], file=sys.stderr)
             return 2
-    options = {'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
+    options = {'packet_path': packet, 'secondary': args.secondary, 'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
                'selection': selection, 'author_rung': author_rung, 'permission': permission,
                'codex_model': policy['rungs'][selection['rung']]['models']['openai'],
                'claude_model': policy['rungs'][selection['rung']]['models']['claude']}
@@ -1184,7 +1231,7 @@ def main() -> int:
             invocation = invocation_identity(subject, purpose='peer-review-' + args.stage,
                 argv=['peer_review', args.stage, options['codex_model'], options['claude_model'], selection['effort'],
                       selection['rung'], selection['harness'], args.pool, args.fallback_pool,
-                      '--snapshot-base', base or 'none',
+                      '--snapshot-base', base or 'none', '--secondary', args.secondary,
                       # The effective review policy (shipped or override) changes discovery and quota classification.
                       '--review-policy', hashlib.sha256(json.dumps(review_policy(), sort_keys=True).encode()).hexdigest()],
                 cwd=repo,
@@ -1225,6 +1272,34 @@ def main() -> int:
         target.close()
         evidence.close()
         return 2
+    except AdvisoryOnly as advisory:
+        # An independent-provider opinion on packet text only: written to the report path with honest headers,
+        # recorded in the receipt as ADVISORY, never a pass marker, never exit 0, never a ladder record.
+        try:
+            if repo_state(repo) != before:
+                raise OSError('repository HEAD or worktree changed during review')
+            evidence.verify()
+            body = re.sub(r'(?i)\b(?:VERDICT|[A-Z_]*_RESULT)\s*:\s*(?:PASS|ACCEPT|BLOCK)\b', '[verdict marker omitted]', advisory.text)
+            target.write_text(f"Reviewer: {advisory.source}\nStage: {args.stage}\nReviewed HEAD: {before[0]}\n"
+                              f"Reviewed packet SHA-256: {evidence.sha256}\n"
+                              f"Author-Rung: {author_rung or 'unknown'}\nReviewer-Rung: n/a\n"
+                              f"Reviewer-Selection: independent-provider opinion; not selected from the rung table\n"
+                              f"Review input: packet text only (no snapshot, no tools)\n"
+                              f"Advisory: yes; NOT a signoff and carries no pass marker\n"
+                              f"Worktree status: {'clean' if not before[1] else 'dirty'}\n"
+                              f"Fallback reason: {advisory.failure}\n\n{body}\n", before_publish=evidence.verify)
+            target.verify_current()
+            run_record.finish(execution='COMPLETED', result='NO_RESULT', reason='ADVISORY', exit_code=4,
+                              usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', [])})
+        except (OSError, subprocess.TimeoutExpired, GuardError) as error:
+            print(f'Advisory publication failed: {diagnostics.sanitize(error)}; nothing published.', file=sys.stderr)
+            target.close()
+            evidence.close()
+            return 2
+        target.close()
+        evidence.close()
+        print(f"{advisory.source}: ADVISORY ONLY, not a signoff | {output}", flush=True)
+        return 4
     except BaseException:
         if run_record is not None:
             try:
