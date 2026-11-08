@@ -269,6 +269,31 @@ def in_own_scope(probe, table, pid, cwd, roots, worktree):
     return bool(worktree and cwd and probe.git_top(cwd) == worktree)
 
 
+SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+
+
+def session_work_dir(home, session):
+    """The real path of ~/.agent-harness/work/<session>, or a KillError when the session id is unusable."""
+    if not session or not SESSION_ID.fullmatch(session) or session in (".", ".."):
+        raise KillError("bad_request", "--session-scope needs this session's id (--session or CLAUDE_CODE_SESSION_ID)")
+    return os.path.realpath(os.path.join(str(home), ".agent-harness", "work", session))
+
+
+def _inside(path, root):
+    if not path or not root or "\x00" in path:
+        return False
+    real = os.path.realpath(os.path.normpath(path))
+    return real == root or real.startswith(root.rstrip("/") + "/")
+
+
+def in_session_dir(cwd, command, root):
+    """True when the cwd, or an absolute path word of the command line, is inside the session work dir `root`
+    (goodqa#15253). Real paths with dot segments resolved, so work/sess-10 or work/sess-1/../sess-2 never match."""
+    if _inside(cwd, root):
+        return True
+    return any(word.startswith("/") and _inside(word, root) for word in str(command or "").split())
+
+
 def descendants(table: dict, root: int):
     """Depth-first, deepest last in discovery order; returned reversed so children come before parents."""
     kids = {}
@@ -355,6 +380,10 @@ def snapshot(probe, pid, my_uid, protected, root=None, role="target", scope=None
         rec["status"], rec["detail"] = "refused", why
     elif info["stat"].startswith("Z"):
         rec["status"], rec["detail"] = "gone", "already a zombie"
+    elif scope and scope.get("session_dir") and not in_own_scope(
+            probe, table, pid, rec["cwd"], scope["roots"], scope["worktree"]) and in_session_dir(
+            rec["cwd"], info["command"], scope["session_dir"]):
+        rec["scope"] = "session-dir"  # main's own session work dir: audited, no --foreign and no high notice
     elif scope and not in_own_scope(probe, table, pid, rec["cwd"], scope["roots"], scope["worktree"]):
         rec["scope"] = "foreign"
         if not scope["foreign"]:
@@ -388,7 +417,7 @@ def alive(probe, rec) -> bool:
 
 def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=None, sleep=time.sleep,
                clock=time.monotonic, session="", agent="", wal_path=None, via=None, own_pid=None, foreign=False,
-               worktree="auto", notify=None):
+               worktree="auto", notify=None, session_scope=False):
     reason = (reason or "").strip()
     if not reason:
         raise KillError("reason_required", "--reason is mandatory and must not be empty")
@@ -397,6 +426,7 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
     if not 0 <= grace <= MAX_GRACE:
         raise KillError("bad_request", "--grace must be 0..%d seconds" % int(MAX_GRACE))
     home = home or Path.home()
+    session_dir = session_work_dir(home, session) if session_scope else None
     probe = probe or Probe()
     own_pid = own_pid or os.getpid()
     my_uid = os.getuid()
@@ -414,7 +444,7 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
     roots = {own_pid}
     if worktree == "auto":
         worktree = probe.git_top(os.getcwd())
-    scope = {"table": table, "roots": roots, "worktree": worktree, "foreign": foreign}
+    scope = {"table": table, "roots": roots, "worktree": worktree, "foreign": foreign, "session_dir": session_dir}
     plan, seen = [], set()
     for root in pids:
         batch = []

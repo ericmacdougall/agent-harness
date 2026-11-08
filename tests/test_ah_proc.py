@@ -699,5 +699,81 @@ class GuardRule(unittest.TestCase):
         self.assertEqual(self.verdict(self.A + "--pid 4242 --reason x; kill 99"), "block")
 
 
+class SessionScope(KillBase):
+    """goodqa#15253 item 4: main stops processes of its own session work dir without --foreign (no high notice)."""
+    foreign = NarrowedScope.foreign
+
+    def sess(self, *parts):
+        return os.path.join(os.path.realpath(str(self.home)), ".agent-harness", "work", "sess-1", *parts)
+
+    def test_cwd_inside_the_session_work_dir_needs_no_foreign(self):
+        probe = self.foreign(1200, cwd=self.sess("agent-y", "tree"))
+        self.assertEqual(self.run_kill(probe, [1200])["results"][0]["status"], "refused")  # control: flag needed
+        probe = self.foreign(1201, cwd=self.sess("agent-y", "tree"))
+        out = self.run_kill(probe, [1201], session_scope=True)
+        self.assertEqual(out["results"][0]["status"], "exited")
+        self.assertEqual(self.notices, [])
+        intents = [r for r in self.audit() if r.get("event") == "intent" and r.get("pid") == 1201]
+        self.assertEqual(intents[0].get("scope"), "session-dir")
+
+    def test_command_path_inside_the_session_work_dir(self):
+        p = proc(1202, 1, cmd="/usr/bin/python3 " + self.sess("agent-y", "run.py") + " --x")
+        probe = self.base(p)
+        probe.cwds = {1202: "/elsewhere/repo"}
+        self.assertEqual(self.run_kill(probe, [1202], session_scope=True)["results"][0]["status"], "exited")
+
+    def test_lookalike_and_other_session_paths_stay_foreign(self):
+        other = os.path.join(os.path.realpath(str(self.home)), ".agent-harness", "work", "sess-2")
+        for n, (cwd, cmd) in enumerate((
+                (self.sess() + "0/x", "/usr/bin/sleep 300"),             # work/sess-10: a prefix, not inside
+                (other + "/x", "/usr/bin/sleep 300"),                     # another session
+                (self.sess("..", "sess-2", "x"), "/usr/bin/sleep 300"),   # dot segments out of the session dir
+                ("/elsewhere/repo", "grep -r foo " + other))):            # another session in argv
+            p = proc(1210 + n, 1, cmd=cmd)
+            probe = self.base(p)
+            probe.cwds = {1210 + n: cwd}
+            out = self.run_kill(probe, [1210 + n], session_scope=True)
+            self.assertEqual(out["results"][0]["status"], "refused", (cwd, cmd))
+        self.assertEqual(self.notices, [])
+
+    def test_protected_processes_are_still_refused(self):
+        p = proc(1220, 1, cmd="/usr/sbin/cron -f " + self.sess("x"))
+        probe = self.base(p)
+        probe.cwds = {1220: self.sess("x")}
+        self.assertEqual(self.run_kill(probe, [1220], session_scope=True)["results"][0]["status"], "refused")
+
+    def test_a_session_id_is_required(self):
+        probe = self.foreign(1230, cwd=self.sess("x"))
+        with self.assertRaises(ak.KillError):
+            ak.kill_local([1230], "why", home=self.home, probe=probe, sleep=self.clock.sleep, clock=self.clock.now,
+                          session="", agent="", own_pid=OWN, worktree="/work", session_scope=True,
+                          notify=lambda h, e: None)
+        self.assertEqual(probe.sent, [])
+
+
+class SessionScopeGuard(unittest.TestCase):
+    """kill_guard admits --session-scope only from main (no agent_id in the hook payload)."""
+    A = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason stuck --session-scope"
+
+    def verdict(self, cmd, subagent):
+        with tempfile.TemporaryDirectory() as tmp:
+            return kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp, subagent=subagent)[0]
+
+    def test_main_may_pass_the_flag(self):
+        self.assertEqual(self.verdict(self.A, subagent=False), "allow")
+
+    def test_a_subagent_may_not(self):
+        self.assertEqual(self.verdict(self.A, subagent=True), "block")
+        self.assertEqual(self.verdict(self.A.replace(" --session-scope", ""), subagent=True), "allow")
+
+    def test_hook_reads_agent_id_from_the_payload(self):
+        with tempfile.TemporaryDirectory() as home:
+            for extra, code in (({}, 0), ({"agent_id": "a1"}, 2)):
+                body = json.dumps(dict({"tool_name": "Bash", "tool_input": {"command": self.A}, "cwd": home}, **extra))
+                done = subprocess.run([sys.executable, "-I", str(Path(kg.__file__)), "hook"], input=body.encode(),
+                                      capture_output=True, timeout=60, env={"HOME": home, "PATH": "/usr/bin:/bin"})
+                self.assertEqual(done.returncode, code, (extra, done.stderr[-300:]))
+
+
 if __name__ == "__main__":
     unittest.main()

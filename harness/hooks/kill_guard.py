@@ -749,8 +749,9 @@ def _import_base():
 
 def make_analyzer_class(cg):
     class KillAnalyzer(cg.Analyzer):
-        def __init__(self, compiled, cwd, ps, ownership, policy, raw):
+        def __init__(self, compiled, cwd, ps, ownership, policy, raw, subagent=False):
             super().__init__(compiled, cwd=cwd, ps=ps)
+            self.subagent = subagent
             self.own = ownership
             self.policy = policy
             self.raw = raw
@@ -1430,7 +1431,9 @@ def make_analyzer_class(cg):
             while i < len(rest):
                 t = rest[i]
                 key, eq, val = t.partition('=') if t.startswith('--') else (t, '', '')
-                if key in ('--tree', '--foreign') and not eq:
+                if key == '--session-scope' and not eq and self.subagent:
+                    return False  # main only: a subagent's payload carries agent_id (goodqa#15253)
+                if key in ('--tree', '--foreign', '--session-scope') and not eq:
                     seen.add(key)
                     i += 1
                     continue
@@ -1674,7 +1677,7 @@ def parse_kill_words(args, remote=False):
     return None, signal, list(args[rest:])
 
 
-def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=None, home=None):
+def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=None, home=None, subagent=False):
     """Return (verdict, rule, message, pids): verdict is 'allow', 'warn' or 'block'. Never raises."""
     policy = policy or load_policy()
     if policy['mode'] == 'off':
@@ -1690,7 +1693,7 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
             raise cg.Blocked('command is larger than the analysis limit')
         effective = cwd or compiled.cwd
         own = ownership or Ownership(effective, home=home, policy=policy)
-        analyzer = make_analyzer_class(cg)(compiled, effective, ps, own, policy, raw)
+        analyzer = make_analyzer_class(cg)(compiled, effective, ps, own, policy, raw, subagent=subagent)
         findings = analyzer.run_kill_scan(command)
         if not findings:
             for base in analyzer.ctx.findings:
@@ -1798,7 +1801,8 @@ def analyze_main(data=None):
                 return 0
             command = text  # a tool the launcher treats as a shell tool (a command/cmd/script key): judge its text
         cwd = cg.payload_cwd(payload)
-        verdict, _rule, message, _pids = decide(command, cwd=cwd, ps=ps, policy=policy)
+        verdict, _rule, message, _pids = decide(command, cwd=cwd, ps=ps, policy=policy,
+                                                subagent=bool(payload.get('agent_id')))
         return emit(verdict, message)
     except TimeoutError:
         if fallback_blocks(raw):
