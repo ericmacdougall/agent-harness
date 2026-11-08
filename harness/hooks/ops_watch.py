@@ -98,6 +98,9 @@ def defaults(host: str) -> dict:
                      "ticket_budget_s": 90, "gq": "~/.claude/goodqa-p0p1/gq.py",
                      "projects": {"goodqa": "1ae27b6b-f8f2-4e61-ab2d-c9c43fd162c3"}},
         "peers": [],
+        # goodqa#15234: point events (a refused copy, a foreign process stop) describe something that happened, not a
+        # condition that can stop being true, so nothing ever cleared them. They expire after ttl_h without a repeat.
+        "point_events": {"prefixes": ["heavy:", "ah-" + "kill:"], "ttl_h": 6},
         # goodqa#15070: timer jobs on other hosts, read over ssh: [{"host", "unit", "user": bool, "max_age_h"}]
         "remote_units": [],
         "sinks": {"comment": {"mode": "none"}, "deadman": [], "comment_min_interval_s": 1800},
@@ -1743,6 +1746,28 @@ def _transition(host, kind, key, a, extra=None) -> dict:
             "check": a.get("check")}
 
 
+def expire_point_events(cfg: dict, latest: dict, active: dict, now: float) -> list:
+    """Clear events for point-event keys (cfg point_events.prefixes) not repeated for ttl_h; any source.
+
+    The key leaves `active` too: run_once reasserts every active key whose latest ring event is not a raise."""
+    pe = cfg.get("point_events") or {}
+    prefixes, ttl = tuple(pe.get("prefixes") or ()), float(pe.get("ttl_h", 6)) * 3600
+    if not prefixes or ttl <= 0:
+        return []
+    out = []
+    for (h, src, key), e in sorted(latest.items(), key=lambda kv: str(kv[0])):
+        if h != cfg["host"] or e.get("event") != "raise" or not str(key).startswith(prefixes):
+            continue
+        ts = parse_ts(e.get("at"))
+        if ts is None or now - ts < ttl:
+            continue
+        active.pop(key, None)
+        out.append({"host": h, "source": src, "event": "clear", "severity": e.get("severity", "info"), "key": key,
+                    "message": f"expired after {pe.get('ttl_h', 6)}h without a repeat: {e.get('message', '')}",
+                    "detail": {"updated": True}, "check": e.get("check")})  # "updated": expiry is not digest news
+    return out
+
+
 def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now: float | None = None,
              deadline_s: float = 420) -> int:
     t0 = time.monotonic()
@@ -1829,6 +1854,7 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
             rc = 2
             print(f"ops-watch: state write failed ({type(exc).__name__})", file=sys.stderr)
 
+    events += expire_point_events(cfg, latest_by_key(read_ring(ring)), active, now)
     persist(events)  # durable before any slow sink: a crash or timeout below cannot re-raise these
     latest = latest_by_key(read_ring(ring))
     reassert = [_transition(host, "raise", k, a, {"reasserted": True}) for k, a in sorted(active.items())
