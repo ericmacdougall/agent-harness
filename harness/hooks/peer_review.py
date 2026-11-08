@@ -1279,7 +1279,7 @@ def main() -> int:
             if repo_state(repo) != before:
                 raise OSError('repository HEAD or worktree changed during review')
             evidence.verify()
-            body = re.sub(r'VERDICT:\s*PASS\b', '[PR signoff marker omitted]', advisory.text)
+            body = re.sub(r'(?i)\b(?:VERDICT|[A-Z_]*_RESULT)\s*:\s*(?:PASS|ACCEPT|BLOCK)\b', '[verdict marker omitted]', advisory.text)
             target.write_text(f"Reviewer: {advisory.source}\nStage: {args.stage}\nReviewed HEAD: {before[0]}\n"
                               f"Reviewed packet SHA-256: {evidence.sha256}\n"
                               f"Author-Rung: {author_rung or 'unknown'}\nReviewer-Rung: n/a\n"

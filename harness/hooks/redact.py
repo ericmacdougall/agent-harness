@@ -46,7 +46,7 @@ PATTERNS = [
     ('npm', re.compile(r'\bnpm_[A-Za-z0-9]{30,}')),
     ('jwt', re.compile(r'\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{0,512}')),
     ('bearer', re.compile(r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}')),
-    ('url-userinfo', re.compile(r'(?i)\b[a-z][a-z0-9+.-]*://[^\s/?#@]{1,256}@[^\s/?#]{1,256}')),
+    ('url-userinfo', re.compile(r'(?i)\b[a-z][a-z0-9+.-]{0,30}://[^\s/?#@]{1,256}@[^\s/?#]{1,256}')),
     ('named-credential', re.compile(r'(?i)\b' + _KEYS + r'[\x22\x27]?\s*[:=]\s*[\x22\x27]?[^\s\x22\x27,;}]{3,512}')),
     ('named-credential', re.compile(r'\b[a-z][a-z0-9]*(?:Secret|Token|Password|ApiKey|AccessKey|PrivateKey|Credentials?)'
                                     r'[\x22\x27]?\s*[:=]\s*[\x22\x27]?[^\s\x22\x27,;}]{3,512}')),

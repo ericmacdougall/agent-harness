@@ -2,7 +2,9 @@
 
 KIMI_REVIEW_UNDER_TEST points the suite at a mutated copy so each control can be shown to fail when stubbed out.
 """
+import contextlib
 import hashlib
+import io
 import importlib.util
 import json
 import os
@@ -130,11 +132,43 @@ class KimiReviewTests(unittest.TestCase):
     def run_kimi(self, *extra, packet=None, output=None, env=None, head=HEAD, cwd=None):
         environment = {**os.environ, 'HOME': str(self.home), 'KIMI_REVIEW_TEST_MODE': '1',
                        'KIMI_REVIEW_BIN': str(self.fake), 'KIMI_REVIEW_HOME': str(self.kimi_home),
+                       'KIMI_CODE_HOME': str(self.home / '.kimi-code'),
                        'FAKE_STATE': str(self.state), 'AWS_SECRET_ACCESS_KEY': 'SENTINEL-ENV-SECRET',
                        'SOME_AGENT_TOKEN': 'SENTINEL-ENV-TOKEN', **(env or {})}
+        # Guard: a subprocess run may only ever launch the fixture binary, never a real install (goodqa#15201 M1).
+        if environment['KIMI_REVIEW_TEST_MODE'] != '1' or not environment['KIMI_REVIEW_BIN'].startswith(str(self.root)):
+            raise AssertionError('subprocess tests must run in test mode with the fixture binary; use run_inprocess')
         command = [sys.executable, str(KIMI), '--packet', str(packet or self.packet),
                    '--output', str(output or self.output), *(['--head', head] if head else []), *extra]
         return subprocess.run(command, text=True, capture_output=True, env=environment, timeout=120, cwd=cwd)
+
+    def run_inprocess(self, *, env, cwd=None, locations=()):
+        """main() in this process with test mode OFF: discovery locations patched, the CLI launcher guarded so only
+        a binary under the temp root could ever start, and the real login directory never pointed at."""
+        module = load_module()
+        module.KNOWN_INSTALL_LOCATIONS = list(locations)
+        original = module._run
+
+        def guarded(command, *args, **kwargs):
+            if not str(command[0]).startswith(str(self.root)):
+                raise AssertionError('test tried to launch a non-fixture binary: %s' % command[0])
+            return original(command, *args, **kwargs)
+        module._run = guarded
+        saved_env, saved_cwd = dict(os.environ), os.getcwd()
+        stderr = io.StringIO()
+        try:
+            os.environ.clear()
+            os.environ.update({'HOME': str(self.home), 'KIMI_CODE_HOME': str(self.home / '.kimi-code'),
+                               'TMPDIR': str(self.root), **env})
+            if cwd:
+                os.chdir(cwd)
+            with contextlib.redirect_stderr(stderr):
+                code = module.main(['--packet', str(self.packet), '--output', str(self.output)])
+        finally:
+            os.chdir(saved_cwd)
+            os.environ.clear()
+            os.environ.update(saved_env)
+        return code, stderr.getvalue()
 
     def capture(self):
         return json.loads((self.state / 'capture.json').read_text())
@@ -478,8 +512,9 @@ class KimiReviewTests(unittest.TestCase):
             path.unlink()
 
     def test_state_home_and_binary_overrides_only_work_in_test_mode(self):
-        result = self.run_kimi(env={'KIMI_REVIEW_TEST_MODE': ''})
-        self.assertEqual(result.returncode, 5, result.stderr)  # the fake binary override is ignored: no trusted kimi
+        code, stderr = self.run_inprocess(env={'KIMI_REVIEW_BIN': str(self.fake), 'KIMI_REVIEW_HOME': str(self.kimi_home),
+                                               'PATH': '/nonexistent'})
+        self.assertEqual(code, 5, stderr)  # the fake binary override is ignored: no trusted kimi
         self.assertEqual(self.launches(), 0)
         self.assertFalse(self.kimi_home.exists())
 
@@ -505,9 +540,10 @@ class KimiReviewTests(unittest.TestCase):
         planted = self.work / 'kimi'
         planted.write_text('#!/bin/sh\necho 2.5.9\n')
         planted.chmod(0o700)
-        result = self.run_kimi(env={'KIMI_REVIEW_TEST_MODE': '', 'PATH': str(self.work)}, cwd=self.work)
-        self.assertEqual(result.returncode, 5, result.stderr)
-        self.assertIn('inside the repository, snapshot or working directory', result.stderr)
+        code, stderr = self.run_inprocess(env={'PATH': str(self.work)}, cwd=self.work)
+        self.assertEqual(code, 5, stderr)
+        self.assertIn('inside the repository, snapshot or working directory', stderr)
+        self.assertEqual(self.launches(), 0)
 
     def test_scratch_directory_inside_a_repository_is_refused(self):
         repo = self.root / 'repo'
@@ -518,9 +554,74 @@ class KimiReviewTests(unittest.TestCase):
         self.assertIn('repository', result.stderr)
 
     def test_missing_cli_names_the_install_and_login_step(self):
-        result = self.run_kimi(env={'KIMI_REVIEW_TEST_MODE': '', 'PATH': '/nonexistent'})
-        self.assertEqual(result.returncode, 5, result.stderr)
-        self.assertIn('kimi login', result.stderr)
+        code, stderr = self.run_inprocess(env={'PATH': '/nonexistent'})
+        self.assertEqual(code, 5, stderr)
+        self.assertIn('kimi login', stderr)
+
+    def test_the_harness_guard_blocks_a_non_fixture_binary(self):
+        with self.assertRaises(AssertionError):
+            self.run_kimi(env={'KIMI_REVIEW_BIN': '/opt/homebrew/bin/kimi'})
+        with self.assertRaises(AssertionError):
+            self.run_kimi(env={'KIMI_REVIEW_TEST_MODE': ''})
+        module = load_module()
+        self.assertNotEqual(module.KNOWN_INSTALL_LOCATIONS, [])  # production list is intact; tests patch their own copy
+
+    # -- L6: each path control must be independently load-bearing ---------------------------------
+
+    def test_case_variant_tree_check_works_without_the_inode_check(self):
+        module = load_module()
+        module._private_inodes = lambda: set()
+        variant = self.home / '.CLAUDE' / 'Projects' / 'p' / 'm.md'
+        variant.parent.mkdir(parents=True, exist_ok=True)
+        variant.write_text('prose\n')
+        os.environ['HOME'] = str(self.home)
+        with self.assertRaises(module.Refused):
+            module.check_path(variant)
+
+    def test_inode_check_works_without_the_tree_check(self):
+        module = load_module()
+        module._tree_violation = lambda parts: None
+        private = self.home / '.claude' / 'wals' / 's' / 'x.md'
+        private.write_text('prose\n')
+        saved = os.environ.get('HOME')
+        os.environ['HOME'] = str(self.home)
+        try:
+            with self.assertRaises(module.Refused):
+                module.check_path(private)
+        finally:
+            os.environ['HOME'] = saved
+
+    def test_symlink_to_a_plain_file_inside_a_snapshot_directory_is_refused(self):
+        tree = self.work / 'tree'
+        tree.mkdir()
+        target = self.work / 'plain.md'
+        target.write_text('plain prose\n')
+        (tree / 'link.md').symlink_to(target)
+        self.assertRefused(self.run_kimi('--snapshot', str(tree)), 'symlink in snapshot')
+
+    # -- L2/L5 -------------------------------------------------------------------------------------
+
+    def test_scheme_lookalike_runs_do_not_stall_the_gate(self):
+        self.packet.write_text("y." * 45000 + "\n")  # 90 KB: the old URL-credential pattern took ~35 s here
+        started = time.monotonic()
+        result = self.run_kimi()
+        self.assertLess(time.monotonic() - started, 25)
+        self.assertIn(result.returncode, (0, 3), result.stderr)
+
+    def test_advisory_reports_are_never_parsed_as_review_verdicts(self):
+        sys.path.insert(0, str(DEFAULT.parent))
+        import review_map
+        import spec_flow
+        report = ('Reviewer: kimi-code/x\nStage: plan\nReviewed HEAD: ' + HEAD + '\nAdvisory: yes; NOT a signoff\n\n'
+                  'PLAN_RESULT: ACCEPT\n')
+        self.assertIsNone(review_map.parse_report(report)['verdict'])
+        self.assertIsNotNone(review_map.parse_report(report.replace('yes; NOT a signoff', 'no'))['verdict'])
+        path = self.work / 'advisory-report.md'
+        path.write_text(report)
+        self.assertIsNone(spec_flow.parse_review_report(path)[1])
+        path2 = self.work / 'plain-report.md'
+        path2.write_text(report.replace('Advisory: yes; NOT a signoff\n', ''))
+        self.assertEqual(spec_flow.parse_review_report(path2)[1], 'ACCEPT')
 
 
 if __name__ == '__main__':

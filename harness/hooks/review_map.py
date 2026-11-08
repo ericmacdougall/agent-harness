@@ -415,10 +415,10 @@ SEVERITY = re.compile(r"\b(critical|high|medium|low|blocker|must[- ]fix|nit)\b",
 def parse_report(text: str) -> dict:
     header = {}
     for line in text.split("\n")[:12]:
-        match = re.match(r"^(Reviewer|Stage|Reviewed HEAD|Reviewed packet SHA-256):\s*(.+)$", line)
+        match = re.match(r"^(Reviewer|Stage|Reviewed HEAD|Reviewed packet SHA-256|Advisory):\s*(.+)$", line)
         if match:
             header[match.group(1)] = match.group(2).strip()
-    verdict = REPORT_VERDICT.search(text)
+    verdict = None if re.match(r"(?i)^yes\b", header.get("Advisory", "")) else REPORT_VERDICT.search(text)  # advisory is not a verdict
     findings = []
     for line in text.split("\n"):
         match = NUMBERED.match(line)

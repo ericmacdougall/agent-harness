@@ -125,6 +125,8 @@ PRIVATE_RELATIVE = (
     '.config/gcloud', '.ssh', '.gnupg', '.aws', '.azure', '.kube', '.docker', '.kimi-code', '.kimi', '.kimi-cu',
     '.kimi-work', '.kimi-webbridge', '.agent-harness/kimi', '.agent-harness/state', '.agent-harness/backups',
     '.agent-harness/leak-denylist.txt', '.agent-harness/private-evidence', '.agent-harness/codex-wals',
+    '.agent-harness/scratch', '.agent-harness/backup-stage', '.agent-harness/private', '.agent-harness/private-receipts',
+    '.agent-harness/log-backup-choice.json', '.agent-harness/task-output-backup.json',
     'Library/Keychains')
 
 
@@ -296,9 +298,11 @@ def scan_text(text, label, *, lockfile=False, deadline=None):
         import redact  # shared high-recall shape list
     except ImportError:
         raise Refused('redact.py is missing; the egress gate cannot run (failing closed)') from None
-    for kind, start, _end in redact.find(text):
-        raise Refused('egress refused: %s line %d: secret shape (%s)' % (label, _line_of(text, start), kind))
-    deadline.check()
+    step = 64 * 1024  # redact.find per chunk with overlap, so the time limit is enforced between chunks
+    for base in range(0, max(len(text), 1), step):
+        for kind, start, _end in redact.find(text[base:base + step + 4096]):
+            raise Refused('egress refused: %s line %d: secret shape (%s)' % (label, _line_of(text, base + start), kind))
+        deadline.check()
     for pattern, rule in TRANSCRIPT_SHAPES + TOPIC_PATTERNS:
         match = pattern.search(text)
         if match:
