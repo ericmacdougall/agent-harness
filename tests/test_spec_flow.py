@@ -530,6 +530,20 @@ class Reviews(SpecFlowCase):
                 problems = sf.lint(text, self.config)
                 self.assertTrue(any("single-adversarial is refused" in p for p in problems), problems)
 
+    def test_domain_regex_catches_other_wordings_and_spares_harness_words(self):
+        # step-1 red-team B5
+        for phrase in ("switch to OAuth", "rework the sign-in flow", "verify the JWT", "upgrade the DB column types",
+                       "truncate the orders table", "drop the CSRF check", "loosen the ACL", "unauthenticated reads"):
+            with self.subTest(phrase=phrase):
+                self.assertIsNotNone(sf.TWO_REVIEW_DOMAINS.search(phrase))
+        for phrase in ("rename the session WAL helper", "print the author name", "the main session id helper",
+                       "authors list in the README"):
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(sf.TWO_REVIEW_DOMAINS.search(phrase))
+        for phrase in ("the session token check", "auth middleware", "authorization header", "authn flow"):
+            with self.subTest(phrase=phrase):
+                self.assertIsNotNone(sf.TWO_REVIEW_DOMAINS.search(phrase))
+
     def test_standard_policy_on_a_security_spec_is_fine(self):
         text = SPEC.replace("Sign-off: main", "Sign-off: main\nReview-policy: standard")
         text = text.replace("## Risks\n", "## Risks\n- touches the auth token check\n", 1)

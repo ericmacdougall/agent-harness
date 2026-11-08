@@ -240,8 +240,12 @@ def standard_review_policy() -> dict:
 
 # #134 red-team P5: a spec whose text touches these keeps both reviews, whatever its Review-policy says
 TWO_REVIEW_DOMAINS = re.compile(
-    r"\bauth|log ?in\b|password|credential|\btokens?\b|secret|\bsessions?\b|permission|privilege|secur|encrypt|"
-    r"privacy|\bpii\b|\bdata\b|database|\bschema|delet|backup|restore|migrat", re.I)
+    # B5 (step-1 red-team): "author" and a harness "session" are not auth; OAuth, sign-in, JWT, DB, truncate, CSRF
+    # and ACL are
+    r"\bauth(?:n|z|entic|ori[sz]|\b)|unauth|oauth|sign[- ]?in|log[- ]?in\b|password|credential|\btokens?\b|"
+    r"\bjwt\b|secret|session (?:token|cookie|key|fixation|hijack)|permission|privilege|\bacl\b|csrf|xss|"
+    r"secur|encrypt|privacy|\bpii\b|\bdata\b|database|\bdb\b|\bschema|delet|truncat|\bdrop (?:the )?\w+ "
+    r"(?:table|column)|backup|restore|migrat", re.I)
 
 
 def single_review_domain_problem(text: str):
