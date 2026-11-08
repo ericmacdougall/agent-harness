@@ -206,7 +206,8 @@ class Status(Base):
             code = lb.main(["--home", str(self.home), "status", "--json"])
         data = json.loads(out.getvalue())
         self.assertEqual(code, 0)
-        self.assertEqual(set(data), {"schema", "transcripts", "bulk", "last_run", "last_skip", "lock", "ok"})
+        self.assertEqual(set(data), {"schema", "transcripts", "bulk", "last_run", "last_skip", "last_throttled", "lock",
+                                     "ok"})
         self.assertEqual(data["schema"], 1)
         self.assertEqual(data["transcripts"]["marker"], "log-backup.last-ok")
         self.assertEqual(data["transcripts"]["max_age_seconds"], 3600)
@@ -219,6 +220,27 @@ class Status(Base):
             code = lb.main(["--home", str(self.home), "status", "--json"])
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(out.getvalue())["transcripts"]["state"], "stale")
+
+    def test_a_throttled_run_is_named_in_status_and_the_alert(self):
+        # goodqa#15218 AC-2: the alert explains a stale backup whose last run stopped on the Dropbox rate limit, and
+        # stops naming it once a later run succeeded.
+        self.last_ok(stamp(time.time() - 7200) + " sources=6\n")
+        (self.logs / "log-backup.throttled").write_text(stamp(time.time() - 600) + " stopped at .claude/projects others=1\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(lb.main(["--home", str(self.home), "check"]), 1)
+            lb.main(["--home", str(self.home), "status"])
+            lb.main(["--home", str(self.home), "status", "--json"])
+        text = out.getvalue()
+        self.assertIn("stopped early on the Dropbox write rate limit", text.splitlines()[0])
+        self.assertIn("throttled    : 20", text)
+        self.assertIn("stopped at .claude/projects", json.loads(text.splitlines()[-1])["last_throttled"])
+        self.last_ok(stamp(time.time() - 4000) + " sources=6\n")  # a success after the throttled run
+        (self.logs / "log-backup.throttled").write_text(stamp(time.time() - 5000) + " stopped at x others=0\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            lb.main(["--home", str(self.home), "check"])
+        self.assertNotIn("rate limit", out.getvalue())
 
     def test_malformed_pid_values_do_not_crash_status_or_check(self):
         self.last_ok(stamp(time.time()))

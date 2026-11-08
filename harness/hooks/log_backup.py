@@ -33,6 +33,7 @@ FUTURE_TOLERANCE_SECONDS = 300
 LAST_OK = "log-backup.last-ok"
 LAST_SKIP = "log-backup.last-skip"
 LAST_RUN = "log-backup.last-run"
+THROTTLED = "log-backup.throttled"   # a run that stopped early on the Dropbox rate limit (goodqa#15218)
 BULK_OK = "log-backup.bulk-last-ok"
 FIRST_RUN = "log-backup.first-run"
 BULK_MAX_AGE_SECONDS = 6 * 3600
@@ -173,6 +174,19 @@ def run_note(home: Path) -> str:
     return f" A backup run has held the lock for {human_age(since)} and has not finished."
 
 
+def throttle_note(home: Path) -> str:
+    """Name a run that stopped early on the Dropbox write rate limit since the last success: it explains a stale backup."""
+    text = read_small(logs_dir(home) / THROTTLED)
+    when = parse_stamp(text)
+    if when is None:
+        return ""
+    last_ok = parse_stamp(read_small(logs_dir(home) / LAST_OK))
+    if last_ok is not None and last_ok > when:
+        return ""
+    return (f" The run of {printable(text.split()[0])} stopped early on the Dropbox write rate limit "
+            f"({THROTTLED}); other uploads to the same account share its write budget.")
+
+
 def cmd_check(args) -> int:
     """0 transcripts and bulk fresh, 1 transcripts stale, 2 transcripts missing or invalid, 3 transcripts fresh
     but the bulk tier stale, missing or invalid."""
@@ -181,7 +195,7 @@ def cmd_check(args) -> int:
     if args.json:
         print(json.dumps({**result, "bulk": bulk["state"]}))
     elif result["state"] != "fresh":
-        print(choice_note(args.home, alert_text(result, args.max_age)) + run_note(args.home))
+        print(choice_note(args.home, alert_text(result, args.max_age)) + run_note(args.home) + throttle_note(args.home))
     elif bulk["state"] in ("stale", "missing", "invalid"):
         print(choice_note(args.home, bulk_alert_text(bulk)) + run_note(args.home))
     else:
@@ -201,7 +215,7 @@ def cmd_session_start(args) -> int:
         bulk = bulk_classify(args.home)
         text = ""
         if result["state"] != "fresh":
-            text = choice_note(args.home, alert_text(result, args.max_age)) + run_note(args.home)
+            text = choice_note(args.home, alert_text(result, args.max_age)) + run_note(args.home) + throttle_note(args.home)
         elif bulk["state"] in ("stale", "missing", "invalid"):
             text = choice_note(args.home, bulk_alert_text(bulk)) + run_note(args.home)
         if text:
@@ -245,6 +259,7 @@ def status_json(home: Path, max_age: int = MAX_AGE_SECONDS) -> dict:
             "bulk": tier(bulk, BULK_OK, BULK_MAX_AGE_SECONDS),
             "last_run": printable(read_small(logs / LAST_RUN) or ""),
             "last_skip": printable(read_small(logs / LAST_SKIP) or ""),
+            "last_throttled": printable(read_small(logs / THROTTLED) or ""),
             "lock": lock_holder(home),
             "ok": transcripts["state"] == "fresh" and bulk["state"] in ("fresh", "pending")}
 
@@ -261,6 +276,7 @@ def cmd_status(args) -> int:
     print(f"bulk success : {printable(read_small(logs / BULK_OK) or 'never')} (age {human_age(bulk['age'])}, {bulk['state']}; limit {BULK_MAX_AGE_SECONDS // 3600} h)")
     print(f"last run     : {printable(read_small(logs / LAST_RUN) or 'never')}")
     print(f"last skipped : {printable(read_small(logs / LAST_SKIP) or 'never')} (a skipped run is not a backup)")
+    print(f"throttled    : {printable(read_small(logs / THROTTLED) or 'never')} (a run that stopped early on the Dropbox rate limit)")
     print(f"lock         : {lock_holder(args.home)}")
     print(f"bulk lane    : {lock_holder(args.home, LANE_LOCK_DIR)}; last lane run {printable(read_small(logs / LANE_LAST_RUN) or 'never')}")
     return 0 if result["state"] == "fresh" else 1

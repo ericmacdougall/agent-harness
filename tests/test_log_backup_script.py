@@ -1122,6 +1122,37 @@ class Contention(Case):
         self.assertIn("Dropbox write rate limit", log)
         self.assertIn("other rclone uploads running now: 2 ", log)
 
+    def test_a_failed_rate_limited_copy_stops_the_run(self):
+        # goodqa#15218 AC-2: after one copy fails on the rate limit, the run makes no further copies (they would spend
+        # the account's write budget again), leaves the throttled marker and withholds last-ok.
+        done = self.run_script(FAKE_RCLONE_LOG_TEXT="ERROR : upload failed: too_many_write_operations",
+                               FAKE_EXIT_AFTER_NOTE="1", LOG_BACKUP_RETRIES="0")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(len(self.copies()), 1, [c[-1] for c in self.copies()])
+        log = (self.logs / "log-backup.log").read_text()
+        self.assertIn("skipped ", log)
+        self.assertIn("run stopped early on the Dropbox write rate limit", log)
+        marker = (self.logs / "log-backup.throttled").read_text()
+        self.assertRegex(marker, r"^20\d\d-\d\d-\d\dT\d\d:\d\d:\d\dZ stopped at \S+ others=\d+$")
+        self.assertFalse(self.last_ok().exists())
+
+    def test_a_rate_limit_retried_to_success_does_not_stop_the_run(self):
+        # NEG-1: rclone logs the rate limit but its own retries succeed: every source is copied, last-ok is written and
+        # no throttled marker appears.
+        self.assertEqual(self.run_script().returncode, 0)  # the first run also finishes the bulk passes
+        open(self.calls, "w").close()
+        healthy = self.run_script()
+        self.assertEqual(healthy.returncode, 0, healthy.stderr)
+        expected = len(self.copies())
+        self.assertGreater(expected, 1)
+        open(self.calls, "w").close()
+        self.last_ok().unlink()
+        done = self.run_script(FAKE_RCLONE_LOG_TEXT="ERROR : Attempt 1/3 failed: too_many_write_operations")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(len(self.copies()), expected)
+        self.assertTrue(self.last_ok().exists())
+        self.assertFalse((self.logs / "log-backup.throttled").exists())
+
     def test_a_copy_that_drains_after_the_stop_signal_is_killed(self):
         # rclone commits its pending Dropbox batch on SIGTERM with no time limit; under rate limiting that is minutes.
         start = time.time()

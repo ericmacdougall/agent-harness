@@ -299,7 +299,7 @@ esac
 R="$BASE/$HOST"
 [ "${LOG_BACKUP_VERSIONS:-1}" != 0 ] || say "WARNING: versions disabled; a truncated local file would overwrite its remote copy"
 
-ok=0 found=0 primary=0
+ok=0 found=0 primary=0 throttled=0 throttle_src=
 STAGE=${LOG_BACKUP_STAGE:-$HOME/.agent-harness/backup-stage}
 # Live sources (transcripts and WALs grow while uploaded, so Dropbox's hash check would fail) are snapshotted into a
 # local stage first and uploaded from there. Static sources upload in place, skipping files younger than 2 minutes.
@@ -341,6 +341,10 @@ rate_limit_note() { # rate_limit_note LOG-OFFSET: name a Dropbox write rate limi
   others=$(ps -axo pid=,command= 2>/dev/null | awk -v remote="${BASE%%:*}:" -v own="$LOG" \
     '$2 ~ /(^|\/)rclone$/ && !index($0, own) {for (i = 3; i <= NF; i++) if (index($i, remote) == 1) {n++; break}} END {print n+0}')
   say "Dropbox write rate limit (too_many_write_operations) during this copy; other rclone uploads running now: $others (see: ps -axo pid,command | grep rclone)"
+  # Every caller is a copy that failed or was cut short (goodqa#15218): more copies in this run would only spend the
+  # account's write budget again (dev2 2026-11-05: one throttled copy ran for two days). The run stops copying here;
+  # a rate limit that rclone retried to success is never reported through this function, so it stops nothing.
+  [ "$throttled" = 1 ] || { throttled=1 throttle_src="$rel others=$others"; }
 }
 
 # The lane yields to tier 1 (goodqa#15147). tier1_active: a live tier-1 run holds the run lock (a lock whose pid is
@@ -383,6 +387,10 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
   # Dropbox can rate-limit (too_many_write_operations): retry the source with a pause before calling it a failure.
   # A source that still fails makes the whole run non-fresh.
   attempt=0 copied=0 yielded=0
+  if [ "$throttled" = 1 ]; then
+    say "skipped $rel: an earlier copy in this run failed on the Dropbox write rate limit; the next run sends it"
+    ok=1; budget_hit=1; return
+  fi
   while :; do
     if [ "$TIER" = bulk ] && ! lane_gate; then
       say "lane budget (${LANE_BUDGET}s) used up waiting for tier 1 before $rel; the next lane run continues"; ok=1; budget_hit=1; return
@@ -737,6 +745,12 @@ fi
 if [ $bulk_ok -eq 0 ] && [ $bulk_ran -eq 1 ]; then
   echo "$STARTED" > "$LOGDIR/log-backup.bulk-last-ok.tmp.$$" \
     && mv "$LOGDIR/log-backup.bulk-last-ok.tmp.$$" "$LOGDIR/log-backup.bulk-last-ok"
+fi
+if [ "$throttled" = 1 ]; then
+  # Read by log_backup.py status and the backup alert: the run ended early on the rate limit, not on a hang.
+  echo "$STARTED stopped at $throttle_src" > "$LOGDIR/log-backup${TAG}.throttled.tmp.$$" \
+    && mv "$LOGDIR/log-backup${TAG}.throttled.tmp.$$" "$LOGDIR/log-backup${TAG}.throttled"
+  say "run stopped early on the Dropbox write rate limit (log-backup${TAG}.throttled); the next scheduled run continues"
 fi
 rc=0
 { [ $transcripts_ok -eq 0 ] && [ $bulk_ok -eq 0 ]; } || rc=1

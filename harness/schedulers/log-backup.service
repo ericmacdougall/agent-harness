@@ -5,3 +5,7 @@ Type=oneshot
 Nice=10
 IOSchedulingClass=idle
 ExecStart=/bin/bash %h/.agent-harness/bin/log-backup.sh
+# goodqa#15218: a oneshot run that never ends keeps the timer from re-arming (OnUnitActiveSec waits for the unit),
+# so the host stops backing up without an alert (dev2, 2026-11-05..07). RuntimeMaxSec has no effect on oneshot
+# units; TimeoutStartSec does. A run ends inside its 15 minute period plus grace, so 20 min never stops a healthy one.
+TimeoutStartSec=20min
