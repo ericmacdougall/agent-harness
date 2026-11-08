@@ -254,6 +254,14 @@ class KimiReviewTests(unittest.TestCase):
         self.assertEqual(env['KIMI_LOOP_MAX_ATTEMPTS_PER_STEP'], '1')
         self.assertEqual(self.capture()['cwd_entries'], [])
 
+    def test_child_path_includes_the_standard_node_install_dirs_even_with_a_restricted_parent_path(self):
+        # goodqa#15201: with PATH=/usr/bin:/bin the kimi launcher could not find node and the version probe failed
+        self.assertEqual(self.run_kimi(env={'PATH': '/usr/bin:/bin:' + os.path.dirname(sys.executable)}).returncode, 0)
+        entries = self.capture()['env']['PATH'].split(os.pathsep)
+        self.assertIn('/opt/homebrew/bin', entries)
+        self.assertIn('/usr/local/bin', entries)
+        self.assertEqual(entries[0], str(self.fake.parent))  # the kimi binary's own directory still comes first
+
     def test_scratch_config_carries_only_the_model_and_login_pointers(self):
         self.assertEqual(self.run_kimi().returncode, 0)
         capture = self.capture()
