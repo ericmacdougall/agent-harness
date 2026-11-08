@@ -176,18 +176,25 @@ _TAGS = "|".join(re.escape(tag) for tag in NOT_USER_TAGS)
 # Fail closed: an opener is just `<tag`, whatever follows (nested angle brackets, long attributes); a closer must
 # be exactly `</tag>` (spaces before `>` allowed). Looser closers or stricter openers would let hidden text through.
 _TAG_TOKEN = re.compile(r"</(" + _TAGS + r")\s*>|<(" + _TAGS + r")\b", re.I)
+# goodqa#15253 item 2: the same scan without pasted_content, whose own tag tokens are then replaced by the sentinel,
+# so an excerpt cannot run from typed text into a paste. Every other block inside a paste is still removed.
+_TAGS_KEEP_PASTED = "|".join(re.escape(tag) for tag in NOT_USER_TAGS if tag != "pasted_content")
+_TAG_TOKEN_KEEP_PASTED = re.compile(r"</(" + _TAGS_KEEP_PASTED + r")\s*>|<(" + _TAGS_KEEP_PASTED + r")\b", re.I)
+_PASTED_TAG = re.compile(r"</pasted_content\s*>|<pasted_content\b[^>]*>", re.I)
+PASTED_TRUST = "text the user pasted into a human turn: the user chose to send it, but it may not be their own words"
 _WRAPPER = re.compile(r"^\s*<([A-Za-z][\w:-]*)\b[^>]*>.*</\1\s*>\s*$", re.S)
 SENTINEL = "\ufffc"  # replaces a removed block so an excerpt cannot span text on both sides of it
 
 
-def strip_blocks(text: str) -> str:
+def strip_blocks(text: str, keep_pasted: bool = False) -> str:
     """Remove every non-user-authored block; an unclosed opener removes the rest of the text.
-    Linear: one pass over the tags with a stack (the earlier nested-regex form was quadratic on many openers)."""
+    Linear: one pass over the tags with a stack (the earlier nested-regex form was quadratic on many openers).
+    keep_pasted keeps the content of <pasted_content> blocks (their tags become sentinels)."""
     if len(text) > MAX_TEXT:
         text = text[:MAX_TEXT] + SENTINEL  # bound the work on absurdly long turns
     stack, spans = [], []  # open tags awaiting a close; closed top-level (start, end) blocks
     by_name = {}  # tag name -> indexes into `stack`, so a close finds its opener in O(1)
-    for tag in _TAG_TOKEN.finditer(text):
+    for tag in (_TAG_TOKEN_KEEP_PASTED if keep_pasted else _TAG_TOKEN).finditer(text):
         if tag.group(2):
             name = tag.group(2).lower()
             by_name.setdefault(name, []).append(len(stack))
@@ -219,7 +226,8 @@ def strip_blocks(text: str) -> str:
         out.append(SENTINEL)
     else:
         out.append(text[pos:])
-    return "".join(out)
+    joined = "".join(out)
+    return _PASTED_TAG.sub(SENTINEL, joined) if keep_pasted else joined
 
 
 # --------------------------------------------------------------------------- parsing
@@ -496,8 +504,8 @@ def load_lines(path: Path, needle: bytes, key: str, value: str):
     return "malformed" if saw_bad else None
 
 
-def user_authorship(record: dict):
-    """(text, None) for a human-authored turn, else (None, reason)."""
+def user_authorship(record: dict, keep_pasted: bool = False):
+    """(text, None) for a human-authored turn, else (None, reason). keep_pasted: include pasted blocks."""
     if record.get("type") != "user":
         return None, f"entry type is {clip(record.get('type'), 20)}, not a user turn"
     if record.get("isSidechain"):
@@ -513,7 +521,7 @@ def user_authorship(record: dict):
     message = record.get("message")
     content = message.get("content") if isinstance(message, dict) else None
     if isinstance(content, str):
-        return strip_blocks(content), None
+        return strip_blocks(content, keep_pasted), None
     if isinstance(content, list):
         pieces = []
         for block in content:
@@ -522,7 +530,7 @@ def user_authorship(record: dict):
             if block.get("type") == "text" and isinstance(block.get("text"), str):
                 if _WRAPPER.match(block["text"]):
                     continue  # a block that is one wrapper element was injected by the harness or an extension
-                pieces.append(strip_blocks(block["text"]))
+                pieces.append(strip_blocks(block["text"], keep_pasted))
         return "\n".join(pieces), None
     return None, "turn has no readable text"
 
@@ -613,7 +621,8 @@ def user_turn(session: str, uid: str, home=None) -> dict:
     text, reason = user_authorship(record)
     if text is None:
         raise Problem("not-user-authored", reason)
-    return {"text": text, "timestamp": record.get("timestamp"), "uuid": uid, "session": session}
+    return {"text": text, "timestamp": record.get("timestamp"), "uuid": uid, "session": session,
+            "with_pasted": user_authorship(record, keep_pasted=True)[0]}
 
 
 def askuser_bound(path: Path, use_id) -> set:
@@ -913,10 +922,15 @@ def _resolve(source, ctx, depth, seen, result):
         else:
             turn = user_turn(parsed["session"], parsed["uuid"], home)
         reason = excerpt_in(turn["text"], parsed["excerpt"])
+        pasted = False
+        if reason and turn.get("with_pasted") and excerpt_in(turn["with_pasted"], parsed["excerpt"]) is None:
+            reason, pasted = None, True  # goodqa#15253 item 2: inside text the user pasted
         if reason:
             raise Problem("excerpt-not-found", reason)
         node = {"kind": "user", "session": parsed["session"], "uuid": parsed["uuid"],
                 "timestamp": turn["timestamp"], "status": "verified"}
+        if pasted:
+            node["pasted"], node["trust"] = True, PASTED_TRUST
         if variant != "user":
             node["variant"] = variant
             node["trust"] = ANSWER_TRUST if variant == "answer" else QUEUE_TRUST
@@ -1276,6 +1290,11 @@ def find_user(session: str, text: str, home=None, limit: int = 5) -> list:
         body, _ = user_authorship(record) if isinstance(record, dict) else (None, None)
         if body and excerpt_in(body, text) is None:
             found.append({"uuid": record.get("uuid"), "timestamp": record.get("timestamp"), "preview": clip(body.strip(), 100)})
+        elif body is not None:
+            pasted, _ = user_authorship(record, keep_pasted=True)
+            if pasted and excerpt_in(pasted, text) is None:
+                found.append({"uuid": record.get("uuid"), "timestamp": record.get("timestamp"),
+                              "preview": clip(pasted.strip(), 100), "pasted": True})
     return found[-limit:]
 
 
