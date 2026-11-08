@@ -519,6 +519,22 @@ class Reviews(SpecFlowCase):
         self.assertIsNone(problem)
         self.assertEqual(sf.required_review_roles(policy), ("adversarial",))
 
+    def test_single_review_is_refused_for_auth_security_data_or_migration(self):
+        # #134 red-team P5: the author cannot declare a security change small
+        for reason, extra in (("small: rewrites the session-token auth check", ""),
+                              ("small: a two-line fix to the copy", "\n- Adds a column to the users table migration"),
+                              ("small: a two-line fix to the copy", "\n- Deletes old customer data nightly")):
+            with self.subTest(reason=reason, extra=extra):
+                text = SPEC.replace("Sign-off: main", "Sign-off: main\nReview-policy: single-adversarial (%s)" % reason)
+                text = text.replace("## Risks\n", "## Risks\n" + extra.strip() + "\n", 1) if extra else text
+                problems = sf.lint(text, self.config)
+                self.assertTrue(any("single-adversarial is refused" in p for p in problems), problems)
+
+    def test_standard_policy_on_a_security_spec_is_fine(self):
+        text = SPEC.replace("Sign-off: main", "Sign-off: main\nReview-policy: standard")
+        text = text.replace("## Risks\n", "## Risks\n- touches the auth token check\n", 1)
+        self.assertFalse(any("single-adversarial is refused" in p for p in sf.lint(text, self.config)))
+
     def test_missing_old_or_ambiguous_policy_defaults_to_two_reviews(self):
         for value in (None, "single-adversarial", "single-adversarial (small: short)",
                       "single-adversarial (unknown: a sufficiently long explanation)"):

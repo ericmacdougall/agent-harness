@@ -238,6 +238,28 @@ def standard_review_policy() -> dict:
     return {"schema": REVIEW_POLICY_SCHEMA, "mode": "standard", "basis": None, "reason": None}
 
 
+# #134 red-team P5: a spec whose text touches these keeps both reviews, whatever its Review-policy says
+TWO_REVIEW_DOMAINS = re.compile(
+    r"\bauth|log ?in\b|password|credential|\btokens?\b|secret|\bsessions?\b|permission|privilege|secur|encrypt|"
+    r"privacy|\bpii\b|\bdata\b|database|\bschema|delet|backup|restore|migrat", re.I)
+
+
+def single_review_domain_problem(text: str):
+    """The lint problem for a single-review spec that touches auth/security/data/migration, else None."""
+    spec = parse_spec(text)
+    policy, _ = review_policy_from_header(spec["header"].get("Review-policy"))
+    if policy.get("mode") != "single-adversarial":
+        return None
+    body = "\n".join([str(spec["header"].get("Review-policy") or "")] + [
+        "\n".join(spec["sections"].get(name, [])) for name in
+        ("Outcome", "Scope", "Acceptance criteria", "Negative cases", "Risks")])
+    hit = TWO_REVIEW_DOMAINS.search(body)
+    if hit:
+        return ("Review-policy single-adversarial is refused: the spec touches auth, security, data or migration "
+                "(%r); keep `standard` (two reviews)" % hit.group(0))
+    return None
+
+
 def review_policy_from_header(value) -> tuple:
     """(canonical policy, lint problem). Missing metadata deliberately means the ordinary two reviews."""
     if value is None:
@@ -296,6 +318,9 @@ def lint(text: str, config: dict | None = None, check_provenance: bool = True, s
     _, review_policy_problem = review_policy_from_header(header.get("Review-policy"))
     if review_policy_problem:
         problems.append(review_policy_problem)
+    domain_problem = single_review_domain_problem(text)
+    if domain_problem:
+        problems.append(domain_problem)
     for name in ("Outcome", "Scope", "Acceptance criteria", "Negative cases", "Risks"):
         body = "\n".join(spec["sections"].get(name, [])).strip()
         if name not in spec["sections"]:
