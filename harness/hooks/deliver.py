@@ -1168,6 +1168,22 @@ def _ticket_updates(flow, stage, head, pr_url):
             **({"retry": retry} if pending else {})}
 
 
+def scan_gate(args, source, head):
+    """Opt-in pinned Trivy scan of the reviewed HEAD (goodqa#15295); any result but a clean scan refuses."""
+    import trivy_gate  # noqa: PLC0415  (sibling hook, only needed when --scan is given)
+    code, lines = trivy_gate.scan(source, rev=head, binary=args.trivy, sha256=args.trivy_sha256,
+                                  image=args.trivy_image, timeout=args.scan_timeout)
+    for line in lines:
+        print(line, file=sys.stderr)
+    if code == 1:
+        raise DeliveryError("BLOCKED_POLICY", "Trivy found unaccepted HIGH/CRITICAL findings in the reviewed HEAD",
+                            code=2, reason="SCAN_FINDINGS", scan=lines[-1],
+                            hint="fix them, or accept one with an expiring entry in " + trivy_gate.IGNORE_PATH)
+    if code:
+        raise DeliveryError("BLOCKED_POLICY", "Trivy scan could not complete; this is not a pass", code=2,
+                            reason="SCAN_UNAVAILABLE", scan=lines[-1])
+
+
 def prepare(args):
     if getattr(args, "reconcile_only", False):
         return reconcile(args)
@@ -1184,6 +1200,8 @@ def prepare(args):
         if mode == "warn":
             override = record_target_override_in_wal(args, bypassed)
     source, branch, head, baseline, kit = source_inputs(args)
+    if getattr(args, "scan", None) == "trivy":
+        scan_gate(args, source, head)
     local_only = getattr(args, "local_only", False)
     title, body = "", b""
     if not local_only:
@@ -1856,6 +1874,14 @@ def parse_args():
     prep.add_argument("--wal", type=Path, default=None,
                       help="Session WAL (~/.claude/wals/<session>/<name>.jsonl) that records a --target-policy warn run")
     prep.add_argument("--new-generation", action="store_true", help="Supersede only a settled generation")
+    prep.add_argument("--scan", choices=("trivy",), default=None,
+                      help="Opt-in pinned Trivy vuln and misconfig scan of the reviewed HEAD before anything is published")
+    prep.add_argument("--trivy", help="trivy binary for --scan trivy (default: trivy on PATH)")
+    prep.add_argument("--trivy-sha256", default=os.environ.get("AGENT_HARNESS_TRIVY_SHA256"),
+                      help="SHA-256 the trivy binary must match; it is copied and the copy is run")
+    prep.add_argument("--trivy-image", default=os.environ.get("AGENT_HARNESS_TRIVY_IMAGE"),
+                      help="run trivy in docker from this digest-pinned image (name@sha256:...) instead of a binary")
+    prep.add_argument("--scan-timeout", type=int, default=900, help="Seconds allowed for the scan (default 900)")
     end = sub.choices["finish"]
     finish_mode = end.add_mutually_exclusive_group(required=True)
     finish_mode.add_argument("--mode", choices=("remote", "local"))
