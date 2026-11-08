@@ -1906,37 +1906,79 @@ def written_code_destroys_root(code, home):
 
 
 _RE_PATTERN_FUNCS = frozenset(('search', 'match', 'fullmatch', 'findall', 'finditer', 'sub', 'subn', 'split', 'compile'))
+_PROTECTED_WORDS = ('.claude', '.codex', '.agent-harness', 'wals', 'transcripts', 'sessions', 'projects', 'history',
+                    'archived_sessions', 'codex-wals')
+# F1 (PR 146 delta red-team): a script may drop the log-delete finding for a regex pattern only when everything it calls
+# is on this read-only list. Anything else (a delete, a write, subprocess, getattr, exec, eval, an unknown function) keeps
+# the finding, so a spelling nobody listed fails toward block.
+_SAFE_NAME_CALLS = frozenset((
+    'open', 'print', 'len', 'str', 'int', 'float', 'bool', 'list', 'dict', 'set', 'tuple', 'frozenset', 'sorted', 'enumerate',
+    'range', 'min', 'max', 'sum', 'any', 'all', 'zip', 'map', 'filter', 'isinstance', 'repr', 'reversed', 'abs', 'round',
+    'next', 'iter', 'Counter', 'defaultdict', 'Path'))
+_SAFE_ATTR_CALLS = frozenset((
+    'search', 'match', 'fullmatch', 'findall', 'finditer', 'sub', 'subn', 'split', 'compile', 'escape',
+    'read', 'readline', 'readlines', 'get', 'items', 'keys', 'values', 'append', 'add', 'extend', 'update', 'format', 'join',
+    'strip', 'lstrip', 'rstrip', 'rsplit', 'splitlines', 'startswith', 'endswith', 'lower', 'upper', 'find', 'rfind',
+    'index', 'count', 'group', 'groups', 'groupdict', 'start', 'end', 'span', 'loads', 'dumps', 'load', 'isoformat',
+    'sort', 'copy', 'setdefault', 'pop', 'close', 'exists', 'isfile', 'isdir', 'basename', 'dirname', 'getsize', 'getmtime',
+    'expanduser', 'glob', 'iterdir', 'stat', 'is_file', 'is_dir', 'read_text', 'read_bytes', 'most_common', 'encode', 'decode',
+    'timestamp', 'fromisoformat', 'strftime', 'time', 'now', 'Path'))
+
+
+def _literal_mode_is_read(call):
+    mode = call.args[1] if len(call.args) > 1 else next((k.value for k in call.keywords if k.arg == 'mode'), None)
+    if mode is None:
+        return True
+    import ast
+    return isinstance(mode, ast.Constant) and isinstance(mode.value, str) and mode.value in ('r', 'rb', 'rt', 'br', 'tr')
+
+
+def read_only_pattern_script(code):
+    """True when `code` parses and every call in it is a read-only operation on the list above, with no local `re`,
+    no use of a compiled pattern's text (`.pattern`, `.flags`), no write-mode open and no dynamic dispatch."""
+    try:
+        import ast
+        tree = ast.parse(code)
+    except Exception:  # noqa: BLE001
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in ('pattern', 'flags', 'groupindex', 're', '__dict__', '__class__'):
+            return False
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.Global, ast.Nonlocal)):
+            return False
+        if isinstance(node, ast.Name) and node.id == 're' and isinstance(node.ctx, (ast.Store, ast.Del)):
+            return False
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.asname == 're' or (alias.name.split('.')[0] == 're' and alias.asname not in (None, 're')):
+                    return False
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                if func.id not in _SAFE_NAME_CALLS or (func.id == 'open' and not _literal_mode_is_read(node)):
+                    return False
+            elif isinstance(func, ast.Attribute):
+                if func.attr not in _SAFE_ATTR_CALLS:
+                    return False
+                if func.attr == 'open':  # unreachable by the list, kept for clarity
+                    return False
+            else:
+                return False
+    return True
 
 
 def blank_regex_patterns(code):
-    """Python source with the pattern literal of each `re.<fn>(PATTERN, ...)` call emptied. A regex pattern cannot run
-    anything, so a destroyer word inside one (`re.search(r'delete|rewrite', line)`) is not a deletion. Only that first
-    argument is blanked; strings handed to os.system, subprocess, getattr or any other call stay visible to the scan.
-    Source that does not parse is returned unchanged."""
+    """Python source with the pattern literal of each `re.<fn>(PATTERN, ...)` call emptied, except a literal that names a
+    protected location (a WAL, log or transcript path is never blanked). A regex pattern cannot run anything, so a
+    destroyer word inside one (`re.search(r'delete|rewrite', line)`) is not a deletion. Source that does not parse is
+    returned unchanged."""
     try:
         import ast
         tree = ast.parse(code)
     except Exception:  # noqa: BLE001 - not Python (or too deep): the caller scans the text as before
         return code
-    for node in ast.walk(tree):
-        # `re.compile('rm').pattern` hands the string back, and a local `re` (class, assignment, `import x as re`) is not
-        # the module: in either case a pattern literal can reach a call, so nothing is blanked (red-team C1)
-        if isinstance(node, ast.Attribute) and node.attr in ('pattern', 'flags', 'groupindex'):
-            return code
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == 're':
-            return code
-        if isinstance(node, ast.Name) and node.id == 're' and isinstance(node.ctx, (ast.Store, ast.Del)):
-            return code
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in node.names:
-                bound = alias.asname or alias.name.split('.')[0]
-                if bound == 're' and not (isinstance(node, ast.Import) and alias.name == 're'):
-                    return code
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ('exec', 'eval', 'compile', '__import__'):
-            return code
-    lines = code.splitlines(keepends=True)
     starts, pos = [], 0
-    for ln in lines:
+    for ln in code.splitlines(keepends=True):
         starts.append(pos)
         pos += len(ln.encode('utf-8'))
     raw = code.encode('utf-8')
@@ -1946,6 +1988,9 @@ def blank_regex_patterns(code):
                 and isinstance(node.func.value, ast.Name) and node.func.value.id == 're' and node.args
                 and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, (str, bytes))):
             a = node.args[0]
+            text = a.value if isinstance(a.value, str) else a.value.decode('utf-8', 'replace')
+            if any(word in text.casefold() for word in _PROTECTED_WORDS):
+                continue
             spans.append((starts[a.lineno - 1] + a.col_offset, starts[a.end_lineno - 1] + a.end_col_offset))
     for b, e in sorted(spans, reverse=True):
         raw = raw[:b] + b"''" + raw[e:]
@@ -2853,7 +2898,7 @@ class Analyzer:
             self.find(args, depth, pl, idx)
             return
         if name == 'git':
-            self.git(args, words)
+            self.git(args, words, cmd.words)
         if name == 'rclone':
             self.rclone(args, pl, idx)
         elif name == 'security':
@@ -3493,33 +3538,66 @@ class Analyzer:
     OWNED_CHANGES = frozenset(('checkout', 'switch', 'reset', 'pull', 'merge', 'rebase', 'clean', 'stash', 'restore',
                                'cherry-pick', 'revert', 'commit', 'am', 'apply', 'rm', 'mv', 'add', 'update-ref',
                                'symbolic-ref', 'read-tree', 'checkout-index', 'branch', 'tag', 'gc', 'prune', 'bisect',
-                               'sparse-checkout', 'submodule', 'update-index', 'filter-branch'))
+                               'sparse-checkout', 'submodule', 'update-index', 'filter-branch', 'push', 'remote', 'config',
+                               'notes', 'worktree', 'replace', 'reflog', 'fast-import', 'init', 'clone', 'lfs'))
+    # with `-c alias.X=...` any subcommand outside this list may expand to a change
+    OWNED_READ_SUBS = frozenset(('status', 'log', 'diff', 'show', 'ls-files', 'ls-tree', 'rev-parse', 'rev-list', 'describe',
+                                 'blame', 'grep', 'cat-file', 'shortlog', 'show-ref', 'for-each-ref', 'merge-base', 'fetch',
+                                 'version', 'help', 'check-ignore', 'name-rev', 'diff-tree', 'diff-index', 'count-objects'))
 
-    def owned_checkout(self, sub, rest, cwd_word):
+    def owned_checkout(self, sub, rest, cwd_word, locations=(), alias=False):
         """goodqa#15307: an agent's git command may not change a checkout a timer or service builds from. Owned means a
         `.harness-owned` marker in the directory or a parent (first line `owner: ...`, optional `branch: NAME`, default
         main), or a policy owned_checkouts suffix (for a checkout on another host the marker cannot be read from here).
-        Reads, fetch and linked worktrees stay allowed, and so does `git checkout|switch <declared branch>`, which only
-        restores the state the owner expects."""
+        Reads, plain fetch and `git checkout|switch <declared branch>` stay allowed. `locations` are further places the
+        command acts on: --work-tree, --git-dir (either spelling) and GIT_DIR / GIT_WORK_TREE."""
         ctx = self.ctx
+        if not self._owned_change(sub, rest, alias):
+            return
         where = ctx.cwd
         for word in (cwd_word if isinstance(cwd_word, list) else [cwd_word] if cwd_word is not None else []):
             where = norm_path(word.text, ctx, where)  # git -C a -C b: each is relative to the one before
-        if sub == 'fetch' and '--update-head-ok' in rest:
-            sub = 'fetch --update-head-ok'
-        elif sub not in self.OWNED_CHANGES:
+        places = [where]
+        for text in locations:
+            path = norm_path(text, ctx, where)
+            places.append(path[:-len('/.git')] if path.endswith('/.git') else path)
+        for place in places:
+            if not place or '$' in place:
+                continue
+            owner, branch = self.owned_dir(place)
+            if owner is None:
+                continue
+            if sub in ('checkout', 'switch') and rest == [branch] and len(places) == 1:
+                return
+            ctx.add(LOG_DELETE, 'owned-checkout',
+                    'git %s changes %s, a checkout owned by %s that a timer or service builds from' % (sub, place, owner),
+                    'work in your own git worktree (git worktree add) or export (git archive); to restore the owner\'s state '
+                    'use git checkout %s alone' % branch)
             return
-        if not where or '$' in where:
-            return
-        owner, branch = self.owned_dir(where)
-        if owner is None:
-            return
-        if sub in ('checkout', 'switch') and rest == [branch]:
-            return
-        ctx.add(LOG_DELETE, 'owned-checkout',
-                'git %s changes %s, a checkout owned by %s that a timer or service builds from' % (sub, where, owner),
-                'work in your own git worktree (git worktree add) or export (git archive); to restore the owner\'s state '
-                'use git checkout %s alone' % branch)
+
+    def _owned_change(self, sub, rest, alias):
+        if alias and sub not in self.OWNED_READ_SUBS and sub not in self.OWNED_CHANGES:
+            return True  # an alias.* from -c may expand to anything
+        if sub == 'fetch':
+            return '--update-head-ok' in rest or any(':' in t and not t.startswith('-') for t in rest)
+        if sub not in self.OWNED_CHANGES:
+            return False
+        if sub == 'remote':
+            return bool(rest) and rest[0] not in ('-v', '--verbose', 'show', 'get-url')
+        if sub == 'config':
+            return not any(t in ('--get', '--get-all', '--get-regexp', '--list', '-l', '--show-origin', '--get-urlmatch')
+                           for t in rest)
+        if sub == 'notes':
+            return not rest or rest[0] not in ('show', 'list')
+        if sub == 'worktree':
+            return bool(rest) and rest[0] in ('remove', 'move', 'prune', 'lock', 'unlock', 'repair')
+        if sub in ('reflog',):
+            return bool(rest) and rest[0] in ('expire', 'delete')
+        if sub in ('branch', 'tag'):
+            return any(t in ('-d', '-D', '-f', '-m', '-M', '-c', '-C', '--delete', '--force', '--move', '--copy', '-u',
+                             '--set-upstream-to', '--unset-upstream', '--edit-description') for t in rest) \
+                or any(not t.startswith('-') for t in rest)
+        return True
 
     def owned_dir(self, path):
         """(owner, branch) when path is inside an owned checkout, else (None, None)."""
@@ -3550,12 +3628,14 @@ class Analyzer:
             cur = parent
         return None, None
 
-    def git(self, args, words):
+    def git(self, args, words, cmd_words=None):
         ctx = self.ctx
         texts = [a.text for a in args]
         i = 0
         cwd_word = None
         cwd_words = []
+        locations = []
+        alias = False
         while i < len(texts):
             t = texts[i]
             if t in ('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env'):
@@ -3563,14 +3643,28 @@ class Analyzer:
                     cwd_word = args[i + 1]
                     if t == '-C':
                         cwd_words.append(args[i + 1])
+                if t in ('--git-dir', '--work-tree') and i + 1 < len(args):
+                    locations.append(args[i + 1].text)
+                if t == '-c' and i + 1 < len(args) and args[i + 1].text.casefold().startswith('alias.'):
+                    alias = True
                 i += 2
+            elif t.startswith(('--git-dir=', '--work-tree=')):
+                locations.append(t.split('=', 1)[1])
+                i += 1
             elif t.startswith('-'):
                 i += 1
             else:
                 break
+        for assign in (cmd_words or ()):  # GIT_DIR=... GIT_WORK_TREE=... git ...
+            m = re.match(r'(GIT_DIR|GIT_WORK_TREE)=(.+)$', assign.text if hasattr(assign, 'text') else str(assign))
+            if m:
+                locations.append(m.group(2))
+        for name in ('GIT_DIR', 'GIT_WORK_TREE'):
+            if isinstance(self.ctx.vars.get(name), str):
+                locations.append(self.ctx.vars[name])
         sub = texts[i] if i < len(texts) else ''
         rest = texts[i + 1:]
-        self.owned_checkout(sub, rest, cwd_words)
+        self.owned_checkout(sub, rest, cwd_words, locations, alias)
         if sub == 'clean':
             self.git_clean(args[i + 1:], rest, cwd_word)
         if sub == 'worktree' and rest[:1] == ['remove'] and self._removable_linked_worktree(args[i + 1:]):
@@ -3974,7 +4068,7 @@ class Analyzer:
     def code(self, code, depth):
         ctx = self.ctx
         # destroyer words inside a regex pattern are data: the log-delete text rule reads the code without them
-        blanked = blank_regex_patterns(code)
+        blanked = blank_regex_patterns(code) if read_only_pattern_script(code) else code
         for f in fallback_scan(code, ctx.c):
             if f.category == LOG_DELETE and blanked != code and not any(
                     g.rule == f.rule and g.category == LOG_DELETE for g in fallback_scan(blanked, ctx.c)):

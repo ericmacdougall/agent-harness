@@ -917,7 +917,8 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
         name_match = re.fullmatch(r"\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})", first)
         before_sep = segments[index - 1][2] if index else ""
         wrote_file = any(t.startswith(">") or t == "tee" or os.path.basename(t) == "tee" for t in tokens[:a])
-        if name_match and word != "eval" and before_sep not in ("|", "|&") and not wrote_file:
+        merge_anywhere = bool(RAW_MERGE.search(_normalize_code(" ".join(tokens))))  # F2: any merge text keeps the whole rule
+        if name_match and word != "eval" and before_sep not in ("|", "|&") and not wrote_file and not merge_anywhere:
             var = name_match.group(1) or name_match.group(2)
             if not re.search(r"(?<![$\w{])" + re.escape(var) + r"(?!\w)", full_command.replace("${" + var + "}", " ")
                              .replace("$" + var, " ")):

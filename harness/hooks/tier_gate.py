@@ -586,6 +586,17 @@ def _owners_with_deadline(home, session_id, seconds):
         signal.signal(signal.SIGALRM, previous)
 
 
+def _slot_freed(row):
+    """F4: a silent owner frees its slot only for an ending disposition (closed, superseded, wontdo, or reassigned) that
+    `ah` does not still mark decision_required. `live: true` alone never frees it: a resumed owner inside its grace and a
+    waiting owner are still owners."""
+    disp = row.get('disposition')
+    if not isinstance(disp, dict) or row.get('decision_required') is True:
+        return False
+    kind = disp.get('kind')
+    return kind in ('closed', 'superseded', 'wontdo') or (kind == 'reassigned' and disp.get('live') is True)
+
+
 def live_owner_ids(session_id, policy):
     """Agent ids of the session's live owners: from `ah owners` (WAL activity, so a long-running owner never drops out
     of the count) when the session has a main WAL, else from the SubagentStart live map filtered by owner type."""
@@ -597,7 +608,7 @@ def live_owner_ids(session_id, policy):
                       and str(r.get('state') or '').startswith(RUNNING_STATES)
                       # a silent owner that main disposed of (reassigned, closed, ...) frees its slot; an owner that is
                       # live, working or quiet always counts, whatever its disposition (red-team C3)
-                      and (str(r.get('state') or '').startswith(('live', 'working', 'quiet')) or not liveness.row_disposed(r)))
+                      and (str(r.get('state') or '').startswith(('live', 'working', 'quiet')) or not _slot_freed(r)))
     except (Exception, _Deadline):  # noqa: BLE001,B036 - no main WAL yet, a partial install or a scan past its deadline: the live map decides
         pass
     try:
