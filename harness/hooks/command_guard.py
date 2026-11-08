@@ -1498,6 +1498,12 @@ def linked_worktree_remove_refusal(path, cwd, policy=None):
     This deliberately does not call reproducible_clone_refusal(): a linked worktree has a .git file, shares its
     common refs with the other worktrees, and must not inherit the full-clone requirement that no worktrees exist.
     Only the checkout being removed is judged; unrelated branches and other worktrees stay out of the decision.
+
+    Known window (#134 red-team P6): this runs in the PreToolUse hook, before the command. A file that appears
+    after this check and before `git worktree remove` runs is not seen here. Git itself refuses a worktree with
+    modified or untracked files, but it removes ignored files (for example a fresh `.env`) without `--force`.
+    The guard cannot close that window. Callers must not remove a worktree that another process may still be
+    writing to: stop its servers and agents first.
     """
     cfg = dict(DEFAULT_POLICY['reproducible_clone'], **((policy or {}).get('reproducible_clone') or {}))
     if not cfg.get('enabled'):
