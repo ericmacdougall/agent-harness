@@ -1448,6 +1448,11 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
         details, soft = evaluate_pr(client, slug, number, merge.target)
         info.update(repo=details["slug"], pr=details["number"], head=details["head"], no_ci=details.get("no_ci"),
                     unsettled=details.get("unsettled") or [])
+        if details.get("no_ci"):
+            # goodqa#15282 (amends goodqa#14669 AC-1): with GitHub CI switched off nothing was checked, so the merge
+            # needs positive evidence instead: an exact-head waiver, or the one a bound PR review authorization writes
+            soft.append("GitHub CI is switched off for this repository, so no check ran on this head; the merge needs "
+                        "an exact-head waiver or a PR review authorization (peer_review.py pr --github-repo --pr)")
         if merge.kind != "check":
             if merge.head_unknown or not merge.head_vals:
                 hard.append(f"the merge must carry the verified head: add {merge.binding.replace('<full head sha>', details['head'])}")
