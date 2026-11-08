@@ -34,6 +34,10 @@ root = os.environ["FAKE_DROPBOX"]
 def local(remote):
     return os.path.join(root, remote.split(":", 1)[1])
 if op == "cat":
+    during = os.environ.get("FAKE_WRITE_DURING_DOWNLOAD")
+    if during and rest[0].endswith(".tar.gz"):  # a writer that runs while the archive downloads
+        with open(during, "w") as f:
+            f.write("late\n")
     try:
         with open(local(rest[0]), "rb") as f:
             shutil.copyfileobj(f, sys.stdout.buffer)
@@ -71,6 +75,7 @@ class RemoteCase(unittest.TestCase):
         self.between = None  # run between the remote check and the remote delete
         self._old_home = os.environ.get('HOME')
         os.environ['HOME'] = str(self.home)  # wal_note.py only appends to WALs under this home
+        os.environ['COPYFILE_DISABLE'] = '1'  # macOS tar: no ._ AppleDouble members (GNU tar on the hosts has none)
 
     def tearDown(self):
         if self._old_home is None:
@@ -186,7 +191,7 @@ class Refused(RemoteCase):
         tree = self.plain_tree('alpha')
         self.archive('alpha')
         self.turn['text'] = "No, keep them for now"
-        self.refused(tree, 'does not say yes/remove/delete')
+        self.refused(tree, 'not a plain approval')
         self.assertEqual(self.calls, [], 'nothing runs remotely before the wording checks pass')
 
     def test_free_text_answer(self):
@@ -201,7 +206,7 @@ class Refused(RemoteCase):
 
     def test_question_without_backup_wording(self):
         tree = self.plain_tree('alpha')
-        self.turn['question'] = 'Remove ~/wt/alpha from t2-dev?'
+        self.turn.update(question='Remove ~/wt/alpha from t2-dev?', text='Remove it')
         self.refused(tree, 'backed up')
 
     def test_question_naming_another_path(self):
@@ -255,7 +260,8 @@ class Refused(RemoteCase):
         def swap():
             os.rename(str(tree), str(tree) + '.old')
             tree.mkdir()
-            (tree / 'notes.txt').write_text('hello\n')
+            import shutil
+            shutil.copy2(str(tree) + '.old/notes.txt', str(tree / 'notes.txt'))  # same content and mtime
         self.between = swap
         self.refused(tree, 'identity changed')
         self.assertEqual(self.mac_audit()[-1]['event'], 'remote-failed')
@@ -263,8 +269,70 @@ class Refused(RemoteCase):
     def test_protected_location(self):
         tree = self.rhome / '.claude/projects'
         tree.mkdir(parents=True)
-        self.turn['question'] = QUESTION + ' Also ~/.claude/projects'
+        self.turn.update(question=QUESTION + ' Also ~/.claude/projects', text='Yes, remove them')
         self.refused(tree, 'protected')
+
+    def test_credential_location(self):
+        tree = self.rhome / '.aws/sso'
+        tree.mkdir(parents=True)
+        self.turn.update(question=QUESTION + ' Also ~/.aws/sso', text='Yes, remove them')
+        self.refused(tree, 'protected')
+
+    # red-team F1: the archive must be the tree, not just any archive of that name
+    def test_archive_of_a_different_tree(self):
+        tree = self.plain_tree('alpha')
+        self.archive('alpha')
+        (tree / 'later.txt').write_text('written after the archive\n')
+        self.refused(tree, 'the tree has alpha/later.txt, which the archive does not')
+
+    def test_archive_with_a_changed_file(self):
+        tree = self.plain_tree('alpha')
+        self.archive('alpha')
+        (tree / 'notes.txt').write_text('hello, and more\n')
+        self.refused(tree, 'alpha/notes.txt differs from the archive')
+
+    def test_archive_missing_a_deleted_file_is_fine_only_when_equal(self):
+        tree = self.plain_tree('alpha')
+        (tree / 'gone.txt').write_text('x\n')
+        self.archive('alpha')
+        (tree / 'gone.txt').unlink()
+        self.refused(tree, 'the archive has alpha/gone.txt, which the tree does not')
+
+    # red-team F3: a file written while the archive downloads is seen, because the tree is compared after it
+    def test_write_during_the_download(self):
+        tree = self.plain_tree('alpha')
+        self.archive('alpha')
+        os.environ['FAKE_WRITE_DURING_DOWNLOAD'] = str(tree / 'late.txt')
+        self.addCleanup(os.environ.pop, 'FAKE_WRITE_DURING_DOWNLOAD', None)
+        self.refused(tree, 'the tree has alpha/late.txt')
+
+    # red-team F2: a checkout with its own .git directory takes its branches with it
+    def test_main_checkout_is_refused(self):
+        tree = self.rhome / 'wt' / 'alpha'
+        run('git', 'init', '-q', str(tree))
+        (tree / 'a').write_text('a\n')
+        run('git', '-C', str(tree), 'add', 'a')
+        run('git', '-C', str(tree), 'commit', '-q', '-m', 'a')
+        run('git', '-C', str(tree), 'branch', 'side')
+        self.archive('alpha')
+        self.refused(tree, 'own .git directory')
+
+    # red-team F4: the answer must approve every named path, and approves no more than the question names
+    def test_partial_answers(self):
+        tree = self.plain_tree('alpha')
+        self.archive('alpha')
+        for text in ('Delete only alpha', 'Remove all except beta', 'Yes, remove alpha', 'Delete 1 of them'):
+            self.turn['text'] = text
+            self.refused(tree, 'question names' if text == 'Delete 1 of them' else 'not a plain approval')
+
+    def test_cap_is_the_number_of_named_paths(self):
+        self.turn.update(question=QUESTION.replace(', ~/wt/beta', ''), text='Yes, remove it')
+        first = self.plain_tree('alpha')
+        self.archive('alpha')
+        self.delete(first)
+        again = self.plain_tree('alpha')
+        self.archive('alpha')
+        self.refused(again, 'already approved 1')
 
 
 if __name__ == '__main__':
