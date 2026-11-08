@@ -318,26 +318,33 @@ def resolve_approval(ask_id, session, home, now=None, prov=None):
             "text": str(node.get("text") or ""), "at": node.get("timestamp")}
 
 
+# Delta red-team D-F3: a program name ("claude") or a bare number ("the 2025 runs") is not an approval, and a
+# negation ("do not touch pid 4242") is not one either. The approving text must list the exact pid after "pid" or
+# "pids", and must not contain a negation anywhere.
+_PID_LIST = re.compile(r"\bpids?\b[\s:#=]*((?:\d+(?:\s*(?:,|and|&|/|\+)\s*|\s+))*\d+)(?![\d])", re.I)
+_NEGATION = re.compile(r"\b(?:not|never|no|don'?t|dont|leave|keep|except|spare|without)\b|n['\u2019]t\b", re.I)
+
+
+def approved_pids(text):
+    """The pids an approving human text explicitly lists ("pid 4242", "pids 10968, 28579 and 39962")."""
+    out = set()
+    for found in _PID_LIST.finditer(text or ""):
+        out.update(int(n) for n in re.findall(r"\d+", found.group(1)))
+    return out
+
+
 def _named(text, pid, root, info):
-    """True when the approving human text names this process: its pid, its --tree root's pid, or its program name."""
-    low = text.lower()
-    for number in {pid, root} - {None}:
-        if re.search(r"(?<![0-9])%d(?![0-9])" % number, low):
-            return True
-    first = (info.get("command") or "").split(" ")[0]
-    names = {re.sub(r"\.(py|sh|js)$", "", os.path.basename(w).lower()) for w in (info.get("comm") or "", first)}
-    for word in (info.get("command") or "").split()[1:4]:
-        name = re.sub(r"\.(py|sh|js)$", "", os.path.basename(word).lower())
-        if name in DAEMON_NAMES or name.startswith(DAEMON_PREFIXES):
-            names.add(name)
-    return any(len(n) >= 4 and re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(n), low) for n in names)
+    """True when the approving human text lists this pid, or its --tree root's pid, and negates nothing."""
+    if _NEGATION.search(text or ""):
+        return False
+    return bool(approved_pids(text) & ({pid, root} - {None}))
 
 
 def approval_problem(probe, info, pid, root, scope):
     """None when the verified approval in scope covers this process, else the reason it does not."""
     approval = scope["approval"]
     if not _named(approval["text"], pid, root, info):
-        return "the approving answer does not name pid %d or its program" % pid
+        return "the approving answer does not list pid %d (\"pid %d\") or it contains a negation" % (pid, pid)
     started = _epoch_lstart(info.get("start"))
     if started is None:
         return "its start time cannot be read"

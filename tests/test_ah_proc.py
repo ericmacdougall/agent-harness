@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
@@ -777,7 +778,7 @@ class ApprovedBy(KillBase):
     `ah kill` refused both with no path the user could authorize. --approved-by is that path, and it is bounded."""
     STALE = "Wed Nov  4 10:00:00 2026"   # before the session process 3000 (Thu Nov  5 17:00) and days old
     NOW = time.mktime(time.strptime("Sat Nov  7 12:00:00 2026", "%a %b %d %H:%M:%S %Y"))
-    TEXT = "please stop the stale harness-console 6101 and its codex child 6102, they have been idle for days"
+    TEXT = "please stop the stale harness-console pid 6101 and its codex child pid 6102, idle for days"
 
     def approval(self, text=None):
         return lambda ask, session, home: {"ask": ask, "source": "answer:x", "uuid": "u", "at": "t",
@@ -815,6 +816,12 @@ class ApprovedBy(KillBase):
     def test_each_bound_refuses(self):
         cases = {
             "not named": dict(text="please stop the stale processes"),
+            # delta red-team D-F3: a program name, a negation or a bare number collision is not an approval
+            "program name only": dict(text="yes, stop the stale codex processes"),
+            "negation": dict(text="do not stop codex pid 6201"),
+            "negation contraction": dict(text="pid 6201 is mine, don't stop it"),
+            "bare number": dict(text="the 6201 runs can go"),
+            "longer number": dict(text="stop pid 62011"),
             "too young": dict(start="Sat Nov  7 06:00:00 2026"),
             "after the session started": dict(start="Fri Nov  6 09:00:00 2026"),
             "running": dict(stat_="R"),
@@ -828,7 +835,7 @@ class ApprovedBy(KillBase):
                                        start=case.get("start", self.STALE), stat_=case.get("stat_", "S")))
                 probe.cwds = {6201: "/elsewhere/b"}
                 probe.cpu = lambda pid, c=case.get("cpu", 0.0): c
-                text = case.get("text", "stop codex 6201 please, it is stale")
+                text = case.get("text", "stop codex pid 6201 please, it is stale")
                 out = self.approved(probe, [6201], text=text)
                 self.assertEqual(out["results"][0]["status"], "refused")
                 self.assertIn("--approved-by", out["results"][0]["detail"])
@@ -836,7 +843,7 @@ class ApprovedBy(KillBase):
                 self.assertEqual(self.notices, [])
 
     def test_other_refusals_are_never_lifted(self):
-        text = "stop 6301 6302 6303 6304 6305 6306 rclone netwatch hookd sshd zsh"
+        text = "stop pids 6301 6302 6303 6304 6305 6306 rclone netwatch hookd sshd zsh"
         for pid, kw in ((6301, dict(cmd="rclone sync /a b:", comm="rclone")),
                         (6302, dict(cmd="/opt/netwatch/netwatch run", comm="netwatch")),
                         (6303, dict(cmd="python3 /h/hookd.py serve", comm="python3")),
@@ -851,7 +858,7 @@ class ApprovedBy(KillBase):
                 self.assertEqual(out["results"][0]["status"], "refused")
                 self.assertEqual(probe.sent, [])
         probe = self.stale()
-        out = self.approved(probe, [3000], text="stop 3000 claude")  # the caller's own session process
+        out = self.approved(probe, [3000], text="stop pid 3000 claude")  # the caller's own session process
         self.assertEqual(out["results"][0]["status"], "refused")
 
     def test_no_notice_means_no_signal(self):
@@ -947,6 +954,45 @@ class ApprovedByGuard(unittest.TestCase):
         self.assertEqual(self.verdict(self.A, True), "allow")
         self.assertEqual(self.verdict(self.A, False), "block")
         self.assertEqual(self.verdict(self.A.replace("wa1b2c3d4e5f", "'x y'"), True), "block")
+
+
+class ApprovedPids(unittest.TestCase):
+    """delta red-team D-F3: only an explicit pid list approves."""
+
+    def test_lists(self):
+        self.assertEqual(ak.approved_pids("stop pids 10968, 28579 and 39962 please"), {10968, 28579, 39962})
+        self.assertEqual(ak.approved_pids("pid: 4242"), {4242})
+        self.assertEqual(ak.approved_pids("the 2025 runs and claude can go"), set())
+
+
+class SessionBinding(unittest.TestCase):
+    """delta red-team D-F2: --session-scope and --approved-by use the caller's own session only."""
+    SID = "11111111-2222-3333-4444-555555555555"
+
+    def verdict(self, cmd, session):
+        with tempfile.TemporaryDirectory() as tmp:
+            return kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp, main=True, session=session)[0]
+
+    def test_guard_binds_the_session(self):
+        for flag in ("--session-scope", "--approved-by wa1b2c3d4e5f"):
+            base = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason stale " + flag
+            with self.subTest(flag=flag):
+                self.assertEqual(self.verdict(base, self.SID), "allow")
+                self.assertEqual(self.verdict(base + " --session " + self.SID, self.SID), "allow")
+                self.assertEqual(self.verdict(base + " --session other-session-0001", self.SID), "block")
+        plain = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason stale --session other-session-0001"
+        self.assertEqual(self.verdict(plain, self.SID), "allow")  # an ordinary own-tree stop is unchanged
+
+    def test_ah_refuses_another_session(self):
+        import ah
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": self.SID}):
+            for extra in (["--session-scope"], ["--approved-by", "wa1b2c3d4e5f"]):
+                with self.subTest(extra=extra):
+                    args = ah.build_parser().parse_args(["kill", "--pid", "4242", "--reason", "stale",
+                                                         "--session", "other-session-0001"] + extra)
+                    with self.assertRaises(ah.AhError) as caught:
+                        ah.run(args, Path(home))
+                    self.assertIn("this session only", str(caught.exception))
 
 
 class SessionScopeGuard(unittest.TestCase):
