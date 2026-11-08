@@ -1778,20 +1778,115 @@ def cmd_signoff(args, spec_policy):
     return EXIT_OK
 
 
-def cmd_done(args, spec_policy, apply=False):
-    session = Session(args.ticket, spec_policy)
-    records, ignored, index = session.records()
-    issue = session.adapter.issue(session.ticket.id) or {}
-    issue["_label"] = session.ticket.label
-    result = evaluate(records, index, issue, ignored)
-    if args.json:
-        print(json.dumps(dict(result, ticket=session.ticket.label), indent=1))
+def default_branch(repo: Path):
+    """(ref, error): origin/HEAD when set, else the first of origin/main, origin/master, main, master that exists."""
+    def git_out(*a):
+        done = subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True, timeout=30,
+                              env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GIT_CONFIG_NOSYSTEM": "1",
+                                   "GIT_OPTIONAL_LOCKS": "0"})
+        return done.returncode, done.stdout.strip()
+    code, head = git_out("symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    candidates = ([head] if code == 0 and head else []) + ["origin/main", "origin/master", "main", "master"]
+    for name in candidates:
+        if git_out("rev-parse", "--verify", "--quiet", f"{name}^{{commit}}")[0] == 0:
+            return name, None
+    return None, f"no default branch (origin/HEAD, origin/main, origin/master, main, master) found in {repo}"
+
+
+def legacy_evaluate(args) -> dict:
+    """Spec-less READY check for tickets that predate the spec flow: the merge is on the default branch, a deploy
+    entry and a REALLY_TESTED entry exist in the given main WAL. Names every missing item exactly."""
+    missing = []
+    notes = []
+    sha = (args.merge or "").strip()
+    ref = re.search(r"([A-Za-z0-9_-]+)#(\d+)\s*$", args.ticket or "")
+    project, number = (ref.group(1), ref.group(2)) if ref else (None, None)
+    if not ref:
+        missing.append(f"--ticket {args.ticket} is not a <project>#<n> reference")
+    sha7 = sha[:7]
+    if not args.repo:
+        missing.append("--repo <checkout> was not given")
+    if not sha:
+        missing.append("--merge <sha> was not given")
+    elif not re.fullmatch(r"[0-9a-fA-F]{7,40}", sha):
+        missing.append(f"merge sha {sha[:60]} is not a 7-40 character hex commit id")
+    elif args.repo:
+        repo = Path(os.path.expanduser(args.repo))
+        branch, problem = default_branch(repo) if repo.is_dir() else (None, f"repo {args.repo} is not a directory")
+        if problem:
+            missing.append(problem)
+        else:
+            def git_code(*a):
+                return subprocess.run(["git", "-C", str(repo), *a], capture_output=True, timeout=30).returncode
+            if git_code("rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}") != 0:
+                missing.append(f"merge sha {sha} is not a commit in {repo}")
+            elif git_code("merge-base", "--is-ancestor", sha, branch) != 0:
+                missing.append(f"merge sha {sha} is not on {branch}")
+            else:
+                notes.append(f"merge sha {sha[:12]} is an ancestor of {branch}")
+                body = subprocess.run(["git", "-C", str(repo), "log", "-1", "--format=%B", sha], capture_output=True,
+                                      text=True, timeout=30).stdout
+                if ref and not re.search(rf"(?i)(?<![\w-])(?:{re.escape(project)}|goodqa)#{number}(?!\d)", body):
+                    missing.append(f"merge sha {sha} does not cite {args.ticket}")
+    entries = None
+    if not args.wal:
+        missing.append("--wal <main WAL path> was not given")
     else:
-        print(format_result(session.ticket.label, result))
+        entries = wal_entries(checked_wal(Path(args.wal)))
+        if not entries:
+            missing.append(f"WAL {args.wal} has no readable entries")
+    for flag, ident, label in (("--deploy", args.deploy, "deploy"), ("--really-tested", args.really_tested, "REALLY_TESTED")):
+        if not ident:
+            missing.append(f"{flag} <wal-id> was not given")
+        elif entries:
+            entry = next((e for e in entries if e.get("id") == ident), None)
+            note = str((entry or {}).get("note") or "")
+            if entry is None:
+                missing.append(f"{label} WAL entry {ident} was not found in {args.wal}")
+            elif label == "deploy" and not (re.search(r"live|deploy", note, re.I) and not NOT_LIVE_WORDS_RE.search(note)):
+                missing.append(f"deploy WAL entry {ident} does not mention LIVE or DEPLOYED (or says it was not live)")
+            elif label == "REALLY_TESTED" and not note.startswith("REALLY_TESTED"):
+                missing.append(f"REALLY_TESTED WAL entry {ident} does not start with REALLY_TESTED")
+            elif ref and not (re.search(rf"(?<![\w.])#?{number}(?![\w.])", note) or (sha7 and sha7.lower() in note.lower())):
+                kind = "deploy entry" if label == "deploy" else "REALLY_TESTED entry"
+                missing.append(f"{kind} {ident} names neither {number} nor {sha7}")
+            else:
+                notes.append(f"{label} WAL entry {ident}: {note[:100]}")
+    # Review F4: this is an evidence report, never a closer. It does not read the ticket's spec records, accepts a
+    # local default branch when no origin/* exists, and cannot tell who wrote the two WAL entries.
+    notes.append("report only: `done --legacy` never closes a ticket; close it through the spec gate or by a person "
+                 "after reading this evidence")
+    return {"ready": not missing, "missing": missing, "self_attested": [], "notes": notes, "report_only": True}
+
+
+def cmd_done(args, spec_policy, apply=False):
+    legacy = getattr(args, "legacy", False)
+    if legacy and apply:
+        print("REFUSED: `done --legacy` is an evidence report only and has no --apply (review F4: it does not check "
+              "the ticket's spec records, a remote default branch or who wrote the WAL entries). Run it without "
+              "--apply, then close the ticket through the spec gate or have a person close it.")
+        return EXIT_MISSING
+    if legacy:
+        session = None
+        label = args.ticket
+        result = legacy_evaluate(args)
+    else:
+        session = Session(args.ticket, spec_policy)
+        records, ignored, index = session.records()
+        issue = session.adapter.issue(session.ticket.id) or {}
+        issue["_label"] = session.ticket.label
+        result = evaluate(records, index, issue, ignored)
+        label = session.ticket.label
+    if args.json:
+        print(json.dumps(dict(result, ticket=label), indent=1))
+    else:
+        print(format_result(label, result))
     if not result["ready"]:
         return EXIT_MISSING
     if not apply:
         return EXIT_OK
+    if session is None:
+        session = Session(args.ticket, spec_policy)
     if getattr(session.ticket, "closed", False):
         if session.ticket.status == "done":  # a retry after a lost response: the transition already happened
             print(json.dumps({"status": "ALREADY_DONE", "ticket": session.ticket.label}))
@@ -1896,6 +1991,14 @@ def build_parser() -> argparse.ArgumentParser:
         item.add_argument("--json", action="store_true")
         if name == "done":
             item.add_argument("--apply", action="store_true", help="request status done when READY")
+            item.add_argument("--legacy", action="store_true",
+                              help="evidence report (never --apply) for tickets that predate the spec flow: needs --repo, --merge, "
+                                   "--deploy, --really-tested and --wal; READY when the merge is on the default branch and both WAL entries exist")
+            item.add_argument("--repo", help="--legacy: checkout holding the merge")
+            item.add_argument("--merge", help="--legacy: merge commit sha that must be on the default branch")
+            item.add_argument("--deploy", help="--legacy: id of the WAL entry recording the live deploy")
+            item.add_argument("--really-tested", dest="really_tested", help="--legacy: id of the REALLY_TESTED WAL entry")
+            item.add_argument("--wal", help="--legacy: main session WAL path")
     doctor = sub.add_parser("doctor", help="check that the routed key can work in a project")
     doctor.add_argument("--project", required=True)
     return parser

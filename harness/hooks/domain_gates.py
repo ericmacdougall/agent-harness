@@ -120,9 +120,45 @@ def _read_small(root: Path, rel: str, limit: int, budget=None, limited=None):
         os.close(fd)
 
 
+# General-purpose domains are detected from file names only. A domain needs at least two matching source paths, or one
+# path under a directory named for the domain, so a lone README-release.md or src/lib/token.ts does not trigger it.
+GENERAL_WORDS = {
+    "auth": ("auth", "login", "signin", "session", "password", "oauth", "sso", "token"),
+    "delete": ("delete", "remove", "purge", "prune", "cleanup", "gc"),
+    "money": ("payment", "payout", "billing", "invoice", "stripe", "checkout", "refund", "ledger"),
+    "devices": ("device", "adb", "enroll", "remote", "pairing", "fleet"),
+    "release": ("release", "publish", "deploy", "rollback", "installer", "updater", "update-feed"),
+}
+GENERAL_DIRS = {"auth": {"auth"}, "delete": {"delete"}, "money": {"money", "payments", "billing"},
+                "devices": {"devices"}, "release": {"release", "releases"}}
+DOC_SUFFIXES = (".md", ".txt", ".rst", ".adoc")
+
+
+def _general_hits(paths):
+    """{domain: [paths]} for file-name signals; docs are ignored and words match on name-part boundaries."""
+    hits = {}
+    for path in paths:
+        if path.lower().endswith(DOC_SUFFIXES) or _skipped(path):
+            continue
+        spaced = "-" + re.sub(r"[^a-z0-9]+", "-", re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", path).lower()) + "-"
+        parts = {c.lower() for c in path.split("/")[:-1]}
+        for domain, words in GENERAL_WORDS.items():
+            if any(f"-{w}-" in spaced or f"-{w}s-" in spaced for w in words) or parts & GENERAL_DIRS[domain]:
+                hits.setdefault(domain, []).append(path)
+    return hits
+
+
+def _general_signals(paths, found, tag):
+    for domain, matched in _general_hits(paths).items():
+        under_dir = [p for p in matched if {c.lower() for c in p.split("/")[:-1]} & GENERAL_DIRS[domain]]
+        if len(matched) >= 2 or under_dir:
+            found.add(domain, "medium", f"{tag}{len(matched)} {domain} path(s), e.g. {_base(matched[0])}")
+
+
 SIGNAL_PATHSPECS = ("*.sol", "*foundry.toml", "*hardhat.config.*", "*Anchor.toml", "*package.json", "*Cargo.toml",
                     "*go.mod", "*pyproject.toml", "*requirements*.txt", "*.proto",
-                    ":(icase)*ledger*", ":(icase)*journal*", ":(icase)*posting*", ":(icase)*balance*")
+                    ":(icase)*ledger*", ":(icase)*journal*", ":(icase)*posting*", ":(icase)*balance*",
+                    *(f":(icase)*{w}*" for words in GENERAL_WORDS.values() for w in words))
 SKIP_COMPONENTS = {"node_modules", "vendor", "third_party", "testdata", "fixtures", ".git"}
 
 
@@ -238,6 +274,8 @@ def detect_full(repo, changed_paths=None, max_files=None):
     files = _tracked_files(root, max_files, strict=True, limited=limited)
     ok = files is not None
     files = files or []
+    _general_signals(files, found, "")
+    _general_signals([p for p in list(changed_paths or [])[:max_files] if isinstance(p, str) and "\0" not in p], found, "diff: ")
     rejected = []
     budget, manifests, protos, nats_in, ledger_in = [0], 0, 0, [], []
     for path in files:

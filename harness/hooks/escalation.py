@@ -440,17 +440,26 @@ class Ledger:
         self._notify(task, 'reset', record, notify)
         return ladder_status(fresh, self.policy)
 
-    def approve_top(self, task, ask_id, wal):
-        """Record user permission for the top writing rung after verifying the ask pair in the WAL."""
+    def approve_top(self, task, ask_id, wal, session=None):
+        """Record user permission for the top writing rung on this one task, after verifying the ask pair in the
+        WAL AND re-reading the cited user turn: its own words must ask for the top rung (review F2: a hand-written
+        ask pair citing an unrelated human turn used to pass). There is no session-wide grant (review F1; main:
+        grants are per task only), so `session` is accepted for compatibility and ignored."""
         proof = verify_ask_pair(Path(wal), ask_id, task, allow_env_root=self._non_default_root())
+        caps = self.policy.get('caps', {})
+        assent = verify_top_source(proof['source'], allow_env_root=self._non_default_root(),
+                                   max_age_seconds=int(caps.get('top_assent_max_age_seconds', TOP_ASSENT_MAX_AGE)))
+        permission = {'ask_id': ask_id, 'wal': str(wal), 'at': now(), 'source': proof['source'], 'task': task,
+                      'assent': assent['sentence'][:300], 'assent_at': assent['timestamp']}
         fd = self._lock(task)
         try:
             state, _ = self._read(task)
-            state['permission'] = {'ask_id': ask_id, 'wal': str(wal), 'at': now(), 'source': proof['source']}
+            state['permission'] = permission
             self._write(task, state)
-            return ladder_status(state, self.policy)
+            status = ladder_status(state, self.policy)
         finally:
             os.close(fd)
+        return status
 
     def status(self, task):
         return ladder_status(self.load(task), self.policy)
@@ -562,16 +571,127 @@ def verify_ask_pair(wal, ask_id, task, allow_env_root=False):
             ask = entry
         if entry.get('event') == 'ask_resolved' and entry.get('ref') == ask_id:
             resolved = entry
-    if ask is None or resolved is None:
-        raise LedgerError('unclassifiable_evidence', 'no ask/ask_resolved pair for ' + ask_id)
+    fix = ' Fix: ' + approve_fix(task, wal)
+    if ask is None:
+        raise LedgerError('unclassifiable_evidence', 'no ask entry %s in %s.%s' % (ask_id, resolved_wal.name, fix))
+    if resolved is None:
+        raise LedgerError('unclassifiable_evidence', 'ask %s has no ask_resolved entry yet.%s' % (ask_id, fix))
     source = str(ask.get('source') or '')
     note = str(ask.get('note') or '')
-    if not user_sourced(source) or not re.search(r'\[task:' + re.escape(task) + r'\]', note):
-        raise LedgerError('unclassifiable_evidence', 'ask is not user-sourced (user:, answer: or queue:) or does not name [task:%s]' % task)
-    resolution = str(resolved.get('note') or '')
-    if resolved.get('decision') != 'approved' and not re.match(r'\s*approved\b', resolution, re.I):
-        raise LedgerError('unclassifiable_evidence', 'ask_resolved does not record an approval for ' + ask_id)
+    if not user_sourced(source):
+        raise LedgerError('unclassifiable_evidence', 'ask %s is not user-sourced (its source must be user:, answer: or queue:, '
+                          'a real human turn).%s' % (ask_id, fix))
+    if not re.search(r'\[task:' + re.escape(task) + r'\]', note):
+        raise LedgerError('unclassifiable_evidence', 'ask %s does not carry [task:%s] in its note.%s' % (ask_id, task, fix))
+    # No magic words (scenario B24): the resolution carries an explicit decision field, written by ah approve-top
+    # or wal_note --decision. Free-text notes are never parsed for "approved".
+    if resolved.get('decision') != 'approved':
+        raise LedgerError('unclassifiable_evidence', 'ask_resolved for %s has no decision=approved field (free text is not '
+                          'read).%s' % (ask_id, fix))
     return {'source': source, 'ask': ask_id}
+
+
+# ---------------------------------------------------------------- top-rung assent (review F1/F2)
+
+TOP_ASSENT_MAX_AGE = 12 * 3600
+TOP_TERMS = re.compile(r"\b(?:fable|astra|top[ -](?:writing[ -])?(?:rung|model|tier))\b", re.I)
+TOP_REQUEST = re.compile(r"\b(?:use|using|run|pass|give|switch|let|allow|approve[ds]?|try|go (?:ahead )?with|"
+                         r"escalate|enable|bring in|put|ok to|okay to|you may|go ahead)\b", re.I)
+TOP_NEGATION = re.compile(r"\b(?:not|no|never|don'?t|do not|doesn'?t|won'?t|stop|disabled?|disabling|off|without|"
+                          r"instead|avoid|cancel|revoke[ds]?|nope|refuse[ds]?|wait|later|unless|if)\b|n't\b", re.I)
+_SENTENCES = re.compile(r"(?<=[.!?;])\s+|\n+")
+TOP_RETRACT = re.compile(r"\b(?:never ?mind|scratch that|forget (?:it|that)|hold (?:on|off)|belay)\b", re.I)
+
+
+def top_assent(text):
+    """The sentence of the user's own words that asks for the top rung, else None.
+
+    Review F1: a mention is assent only when the same sentence holds request language (use, pass, switch, let,
+    approve ...), no negation or condition anywhere in it (not, never, off, disabled, stop, without, instead,
+    unless, if, later), and is not a question. "keep fable disabled", "fable? absolutely not", "why did fable cost
+    so much" and "use opus, fable is off" are all refusals or unrelated.
+
+    Delta review D1: the latest word decides. Only the LAST sentence that names the top rung can be assent, it
+    must pass those rules itself, and any later sentence that negates or retracts ("no, stop", "never mind",
+    "scratch that") voids it. An earlier request never survives a later refusal."""
+    sentences = [part.strip() for part in _SENTENCES.split(text or '') if part.strip()]
+    mentions = [index for index, sentence in enumerate(sentences) if TOP_TERMS.search(sentence)]
+    if not mentions:
+        return None
+    candidate = sentences[mentions[-1]]
+    if '?' in candidate or not TOP_REQUEST.search(candidate) or TOP_NEGATION.search(candidate):
+        return None
+    for later in sentences[mentions[-1] + 1:]:
+        if TOP_NEGATION.search(later) or TOP_RETRACT.search(later):
+            return None
+    return candidate
+
+
+def _turn_for(parsed, home):
+    import provenance as prov  # noqa: PLC0415
+    variant = parsed.get('variant')
+    if variant == 'answer':
+        return prov.answer_turn(parsed['session'], parsed['ident'], home)
+    if variant == 'queue':
+        return prov.queue_turn(parsed['session'], parsed['ident'], home)
+    return prov.user_turn(parsed['session'], parsed['uuid'], home)
+
+
+def verify_top_source(source, allow_env_root=False, max_age_seconds=TOP_ASSENT_MAX_AGE, now_ts=None):
+    """Re-read the user turn a top-rung ask cites and prove it asks for the top rung (review F2).
+
+    The transcript is read from the installed Claude home, never from an environment override, unless the ledger
+    itself is a non-default test ledger. The cited excerpt must lie inside the assenting sentence (so the WAL
+    source shows the words that granted it), and the turn must be younger than max_age_seconds."""
+    import provenance as prov  # noqa: PLC0415
+    fix = ' Nothing was recorded; cite the user message that asks for it (ah user-msg --text-match fable).'
+    try:
+        parsed = prov.parse_source(source)
+    except prov.Problem as error:
+        raise LedgerError('no_assent', 'the ask source does not parse (%s).%s' % (error, fix)) from None
+    if parsed.get('kind') != 'user':
+        raise LedgerError('no_assent', 'top-rung permission needs a user:, answer: or queue: source.' + fix)
+    home = None if allow_env_root else installed_home() / '.claude'
+    try:
+        turn = _turn_for(parsed, home)
+    except prov.Problem as error:
+        raise LedgerError('no_assent', 'the cited user turn could not be read (%s).%s' % (error, fix)) from None
+    sentence = top_assent(turn.get('text') or '')
+    if sentence is None:
+        raise LedgerError('no_assent', 'the cited user turn does not ask for the top rung in a plain sentence '
+                                       '(a mention must sit with request words such as use, pass or switch, with no '
+                                       'negation, condition or question in that sentence).' + fix)
+    if prov.excerpt_in(sentence, parsed.get('excerpt') or ''):
+        raise LedgerError('no_assent', 'the cited excerpt is not part of the sentence that asks for the top rung; '
+                                       'cite that sentence: "%s".%s' % (sentence[:160], fix))
+    try:
+        stamp = datetime.fromisoformat(str(turn.get('timestamp') or '').replace('Z', '+00:00'))
+        age = (now_ts if now_ts is not None else datetime.now(timezone.utc).timestamp()) - stamp.timestamp()
+    except ValueError:
+        raise LedgerError('no_assent', 'the cited user turn has no readable timestamp.' + fix) from None
+    if age > max_age_seconds:
+        raise LedgerError('no_assent', 'the cited user turn is %d h old; top-rung permission needs words from the '
+                                       'last %d h.%s' % (age // 3600, max_age_seconds // 3600, fix))
+    return {'sentence': sentence, 'timestamp': turn.get('timestamp'), 'session': parsed['session']}
+
+
+def approve_fix(task, wal=None):
+    """The exact command that records a top-rung permission in one step (scenario B24)."""
+    hooks = Path(__file__).resolve().parent
+    return ('python3 %s approve-top --task %s --user-msg <id from `python3 %s user-msg --recent 3`> --wal %s'
+            % (hooks / 'ah.py', task or '<task>', hooks / 'ah.py', wal or '<main WAL>'))
+
+
+def session_key(session):
+    return re.sub(r'[^A-Za-z0-9_.-]', '_', str(session or ''))[:80]
+
+
+def session_from_wal(wal):
+    """The session id is the WAL's directory name (~/.claude/wals/<session>/main.jsonl)."""
+    try:
+        return Path(wal).resolve().parent.name
+    except OSError:
+        return None
 
 
 def main(argv=None):
@@ -588,7 +708,9 @@ def main(argv=None):
     spend = sub.add_parser('spend'); spend.add_argument('--task', required=True); spend.add_argument('--usd', required=True, type=float)
     reset = sub.add_parser('reset'); reset.add_argument('--task', required=True); reset.add_argument('--code', required=True, choices=sorted(RESET_CODES))
     reset.add_argument('--detail', required=True); reset.add_argument('--notify-wal')
-    top = sub.add_parser('approve-top'); top.add_argument('--task', required=True); top.add_argument('--ask', required=True); top.add_argument('--wal', required=True)
+    top = sub.add_parser('approve-top', help='record the user permission for the top writing rung; prefer `ah.py approve-top --user-msg`, which writes the ask pair for you')
+    top.add_argument('--task', required=True); top.add_argument('--ask', required=True); top.add_argument('--wal', required=True)
+    top.add_argument('--session', help='session the grant also covers (default: the WAL directory name)')
     status = sub.add_parser('status'); status.add_argument('--task', required=True)
     sub.add_parser('digest')
     gate = sub.add_parser('gate-digest'); gate.add_argument('--limit', type=int, default=200)
@@ -616,7 +738,7 @@ def main(argv=None):
         elif args.action == 'reset':
             value = ledger.reset(args.task, args.code, args.detail, notify=args.notify_wal)
         elif args.action == 'approve-top':
-            value = ledger.approve_top(args.task, args.ask, args.wal)
+            value = ledger.approve_top(args.task, args.ask, args.wal, session=args.session)
         elif args.action == 'status':
             value = ledger.status(args.task)
         elif args.action == 'gate-digest':

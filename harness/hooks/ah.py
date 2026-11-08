@@ -17,6 +17,7 @@ import os
 import platform
 import re
 import socket
+import shlex
 import subprocess
 import sys
 import time
@@ -2243,6 +2244,8 @@ def render_text(cmd: str, data: dict) -> str:
             lines.append(f"{r['state']:<14} idle {fmt_age(r['idle_s']):>7}  {r['agent_id'][:12]:<12} {r['type'] or '-':<12} "
                          f"{(r['ticket'] or '-'):<18} c-age {fmt_age(r['ticket_comment_age_s']):>6}  {(r['task'] or '')[:70]}")
         return "\n".join(lines)
+    if cmd == "status":
+        return status_text(data)
     if cmd == "user-msg":
         lines = []
         for m in data["matches"]:
@@ -2286,6 +2289,253 @@ def nearest_source(wal: Path, before_id: str | None = None) -> dict | None:
             return {"id": rec["id"], "event": rec["event"], "source": f"wal:{wal}#{rec['id']}",
                     "note80": str(rec.get("note") or "")[:80], "assumption": bool(rec.get("assumption"))}
     return None
+
+
+# ------------------------------------------------------------------ status (evidence report, scenario B2.5)
+
+_RT = re.compile(r"^\s*REALLY_TESTED\s+([A-Za-z0-9._-]+)\s*:?")
+_PT = re.compile(r"^\s*PENDING_REAL_TEST\s+([A-Za-z0-9._-]+)\s*:?")
+_LIVE = re.compile(r"\b(?:LIVE|DEPLOYED|deployed to|is live|went live|live on|rolled out)\b")
+_NOT_LIVE = re.compile(r"\b(?:not (?:yet )?live|not deployed|merged[, ]+not live|unmerged|staging only)\b", re.I)
+_CLAIM = re.compile(r"\b(?:done|shipped|completed?|finished|merged|delivered)\b", re.I)
+_TARGET = re.compile(r"\b(?:target|narrow(?:ed|ing)?|instead of|scope(?:d)? down|reduced to|lowered|bar (?:is|to))\b", re.I)
+# A #ticket, or a hex sha holding at least one letter a-f: an all-digit version code or date is not evidence (F7)
+_TOKEN = re.compile(r"#\d{2,9}\b|\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b")
+
+
+def parse_since(text: str) -> float:
+    """`12h`, `90m`, `2d`, `45s` -> seconds."""
+    m = re.fullmatch(r"\s*(\d+)\s*([smhd])\s*", str(text or ""))
+    if not m:
+        raise AhError("bad_request", "status: --since takes <n>m|h|d (for example 12h)", 2)
+    return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def _tokens(note: str) -> set:
+    return {t.lower() for t in _TOKEN.findall(note or "")}
+
+
+def status_report(home: Path, session: str, since_s: float, now: float | None = None) -> dict:
+    """What the WALs prove, by class. Narrative is never promoted: VERIFIED needs a REALLY_TESTED entry, LIVE needs a
+    deploy/live note, DONE_LIVE needs both to share a ticket or sha token; a note that only says "done" is CLAIMED.
+    Targets changed without a user source are TARGET_MISMATCH; other unsourced decisions are ASSUMPTION."""
+    now = time.time() if now is None else now
+    cutoff = now - since_s
+    sd = session_dir(home, session)
+    if not (sd / "main.jsonl").is_file():
+        raise AhError("session_unknown", f"no main WAL for session {session!r}")
+    rows, unread = [], []
+    for path in sorted(sd.glob("*.jsonl")):
+        agent = "main" if path.name == "main.jsonl" else path.stem[len("agent-"):] if path.stem.startswith("agent-") else path.stem
+        try:
+            text = _bounded(path).decode("utf-8", "replace")
+        except OSError as e:  # F9: an evidence report names what it did not read (over 64 MB, not a regular file)
+            unread.append({"wal": path.name, "agent": agent, "reason": str(e) or type(e).__name__})
+            continue
+        for raw in text.splitlines():
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict) or not rec.get("event"):
+                continue
+            at = parse_ts(rec.get("at"))
+            if at < cutoff:
+                continue
+            rows.append((agent, at, rec))
+    rows.sort(key=lambda r: r[1])
+    verified, pending, live, claimed, blockers, commits, asks, resolved, assumptions, decisions = {}, {}, [], [], [], [], {}, set(), [], []
+
+    def item(agent, at, rec, extra=None):
+        out = {"agent": agent, "at": iso(at), "id": rec.get("id"), "event": rec.get("event"),
+               "note": re.sub(r"\s+", " ", str(rec.get("note") or ""))[:240]}
+        if extra:
+            out.update(extra)
+        return out
+
+    for agent, at, rec in rows:
+        note = str(rec.get("note") or "")
+        ev = rec.get("event")
+        m = _RT.match(note)
+        if m:
+            verified[m.group(1)] = item(agent, at, rec, {"check": m.group(1)})
+            continue
+        m = _PT.match(note)
+        if m:
+            pending.setdefault(m.group(1), item(agent, at, rec, {"check": m.group(1)}))
+            continue
+        if ev == "commit":
+            commits.append(item(agent, at, rec))
+        elif ev == "blocker":
+            blockers.append(item(agent, at, rec))
+        elif ev == "ask":
+            asks[rec.get("id")] = item(agent, at, rec, {"reason": str(rec.get("reason") or "")[:200]})
+        elif ev == "ask_resolved":
+            resolved.add(rec.get("ref"))
+        if ev in ("decision", "scope", "requirement"):
+            source = str(rec.get("source") or "")
+            unsourced = bool(rec.get("assumption")) or bool(rec.get("unsourced")) or not source or source.startswith("inferred")
+            if unsourced:
+                label = "TARGET_MISMATCH" if _TARGET.search(note) else "ASSUMPTION"
+                assumptions.append(item(agent, at, rec, {"label": label, "source": source[:160] or "(none)"}))
+            else:
+                decisions.append(item(agent, at, rec, {"source": source[:160]}))
+        if ev in ("status", "result", "handoff", "check", "commit", "decision"):
+            if _LIVE.search(note) and not _NOT_LIVE.search(note):
+                live.append(item(agent, at, rec))
+            elif ev in ("status", "result", "handoff") and _CLAIM.search(note):
+                claimed.append(item(agent, at, rec))
+    verified_tokens = set()
+    for v in verified.values():
+        verified_tokens |= _tokens(v["note"])
+    mismatch_tokens = set()
+    for a in assumptions:
+        if a["label"] == "TARGET_MISMATCH":
+            mismatch_tokens |= _tokens(a["note"])
+    for entry in live:
+        shared = _tokens(entry["note"]) & verified_tokens
+        entry["label"] = "DONE_LIVE" if shared else "LIVE_UNTESTED"
+        entry["shared_evidence"] = sorted(shared)
+        if _tokens(entry["note"]) & mismatch_tokens:
+            # 50bca42: a stream whose target was moved without the user never reads as done against that target
+            entry["label"] = "LIVE_TARGET_MISMATCH"
+    try:
+        data = owners(home, session, now=now)
+        owners_summary = {"counts": data.get("counts"), "undisposed": data.get("undisposed"),
+                          "live": sorted(r["agent_id"] for r in data.get("owners") or []
+                                         if r.get("owner") and str(r.get("state")).startswith(("live", "working")))}
+    except Exception:  # noqa: BLE001 - the evidence report must not fail on the owner view
+        owners_summary = {"error": "owners view unavailable"}
+    return {"session": session, "since_s": since_s, "generated": iso(now), "entries": len(rows),
+            "verified": sorted(verified.values(), key=lambda e: e["at"]),
+            "pending": sorted((v for k, v in pending.items() if k not in verified), key=lambda e: e["at"]),
+            "live": live, "claimed": claimed, "blockers": blockers, "commits": commits,
+            "asks_open": [a for k, a in asks.items() if k not in resolved],
+            "assumptions": assumptions, "decisions": decisions, "owners": owners_summary, "unread": unread,
+            "rule": "edit this report; never write a status list from memory (nov-7-issues-2 B2.5)"}
+
+
+def status_text(data: dict) -> str:
+    def block(title, rows, line):
+        out = [f"## {title} ({len(rows)})"]
+        out += [line(r) for r in rows] or ["  (none)"]
+        return out
+    lines = [f"# Evidence status for {data['session'][:12]} over the last {int(data['since_s'] // 3600)}h ({data['entries']} WAL entries)"]
+    lines += block("VERIFIED (REALLY_TESTED)", data["verified"], lambda r: f"  {r['check']:<24} {r['agent'][:12]:<12} {r['note'][:110]}")
+    lines += block("LIVE", data["live"], lambda r: f"  {r['label']:<14} {r['agent'][:12]:<12} {r['note'][:110]}")
+    lines += block("PENDING checks (declared, not yet REALLY_TESTED)", data["pending"], lambda r: f"  {r['check']:<24} {r['agent'][:12]:<12} {r['note'][:100]}")
+    lines += block("CLAIMED only (narrative, no evidence entry)", data["claimed"], lambda r: f"  {r['agent'][:12]:<12} {r['note'][:120]}")
+    lines += block("BLOCKED", data["blockers"], lambda r: f"  {r['agent'][:12]:<12} {r['note'][:120]}")
+    lines += block("ASKS open", data["asks_open"], lambda r: f"  [ask:{r['id']}] {r['note'][:100]}")
+    lines += block("ASSUMPTIONS and TARGET_MISMATCH (no user source)", data["assumptions"], lambda r: f"  {r['label']:<16} {r['agent'][:12]:<12} {r['note'][:100]}")
+    lines += block("COMMITS", data["commits"], lambda r: f"  {r['agent'][:12]:<12} {r['note'][:120]}")
+    lines += block("UNREAD WALs", data.get("unread") or [], lambda r: f"  {r['wal']:<40} {r['reason'][:80]}")
+    o = data.get("owners") or {}
+    if "counts" in o:
+        lines.append(f"## OWNERS live {len(o.get('live') or [])}: {', '.join(a[:12] for a in o.get('live') or [])}; "
+                     f"undisposed: {', '.join(o.get('undisposed') or []) or 'none'}")
+    else:
+        lines.append("## OWNERS " + str(o.get("error", "")))
+    lines.append("(" + data["rule"] + ")")
+    return "\n".join(lines)
+
+
+def _assent_excerpt(sentence: str, assent, limit: int):
+    """The quotable part of the assenting sentence: split at anything credential-like (a pasted token must never be
+    copied into a WAL source and its backups) and keep the first piece that still asks for the top rung."""
+    text = re.sub(r"\s+", " ", sentence).strip()
+    try:
+        import redact  # noqa: PLC0415
+        text = redact.redact(text)
+    except Exception:  # noqa: BLE001 - without the redactor, long opaque tokens are still dropped below
+        pass
+    pieces = re.split(r"(?i)\[redacted[^\]]*\]|\S*redacted\S*|\S{24,}", text)
+    for piece in pieces:
+        piece = piece.strip(" ,;:")[:limit].strip()
+        if '"' not in piece and assent(piece):
+            return piece
+    return None
+
+
+def approve_top_cmd(home: Path, args) -> dict:
+    """One command for the top-rung permission of ONE task (scenario B24, review F1): find the user's message, prove
+    its own words ask for the top rung, write the sourced ask and its approved resolution, then record the permission
+    on the task. There is no session-wide grant. Every refusal names the fix and writes nothing."""
+    import escalation  # noqa: PLC0415
+    import provenance  # noqa: PLC0415
+    me = Path(__file__).resolve()
+    wal = Path(args.wal).expanduser()
+    session = args.session or wal.resolve().parent.name
+    task = args.task
+    if not escalation.SAFE_KEY.fullmatch(task):
+        raise AhError("bad_request", "approve-top: --task must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}", 2)
+    if not wal.is_file():
+        raise AhError("bad_request", f"approve-top: no WAL at {wal}; pass the main session WAL (~/.claude/wals/<session>/main.jsonl)", 2)
+    wanted = str(args.user_msg or "").strip()
+    lookup = f"python3 {me} user-msg --session {session} --text-match fable"
+    try:
+        rows = user_msgs(home, session, recent=200, full=True)["matches"]
+    except AhError as e:
+        raise AhError(e.code, f"approve-top: cannot read the session transcript ({e}); run `{lookup}`", 2)
+    index = next((i for i, m in enumerate(rows) if m["id"] == wanted), None)
+    if index is None:
+        raise AhError("user_msg_not_found", f"approve-top: {wanted or '(empty)'} is not a human turn, answer or queued message of session "
+                                            f"{session}. Fix: run `{lookup}` and pass the printed id (uuid:, answer: or queue:). "
+                                            "Agent messages, tool results and wakeup prompts are never accepted.", 2)
+    match = rows[index]
+    # Review F1: authorship is not consent, and a mention is not a request. The sentence must ask for the top rung
+    # with no negation, condition or question in it ("keep fable disabled" and "fable? no" are refusals).
+    sentence = escalation.top_assent(match.get("text") or "")
+    if sentence is None:
+        raise AhError("no_assent", "approve-top: the cited message does not ask for the top rung in a plain sentence: it needs "
+                                   "fable, astra or the top rung together with request words (use, pass, switch, let, approve) and "
+                                   f"no negation, condition or question in that sentence. Nothing was written. Fix: `{lookup}`.", 2)
+    later = [m for m in rows[index + 1:] if escalation.TOP_TERMS.search(m.get("text") or "")]
+    if later:
+        raise AhError("no_assent", f"approve-top: the user mentioned the top rung again later ({later[-1]['id']}); the latest words "
+                                   "decide, so cite that message if it asks for it. Nothing was written.", 2)
+    ident = match["id"].replace("uuid:", "user:", 1)
+    excerpt = _assent_excerpt(sentence, escalation.top_assent, provenance.EXCERPT_MAX)
+    if excerpt is None:
+        raise AhError("no_assent", "approve-top: the assenting sentence holds credential-like text, so it cannot be cited; ask the "
+                                   "user to repeat the request without it. Nothing was written.", 2)
+    source = f'{ident} "{excerpt}"'
+    try:
+        parsed = provenance.parse_source(source)
+        problem = provenance.excerpt_in(match.get("text") or "", parsed["excerpt"])
+    except provenance.Problem as e:
+        problem = str(e)
+    if problem:
+        raise AhError("no_assent", f"approve-top: the assenting sentence cannot be cited verbatim ({problem}); ask the user to "
+                                   "say it in one plain sentence. Nothing was written.", 2)
+    wal_note = me.parent / "wal_note.py"
+    base = [sys.executable, str(wal_note), "--wal", str(wal), "--source", source]
+    ask = subprocess.run(base + ["--event", "ask", "--reason", "the model ladder needs the user's recorded permission before the top writing rung is used",
+                                 "--note", f"[task:{task}] top writing rung (Fable/Astra) for this task only, asked by the user: {excerpt[:160]}"],
+                         capture_output=True, text=True, timeout=60)
+    ask_id = _wal_note_id(ask, "ask")
+    resolved = subprocess.run(base + ["--event", "ask_resolved", "--ref", ask_id, "--decision", "approved",
+                                      "--note", f"[task:{task}] approved for this task only, in the user's own words"],
+                              capture_output=True, text=True, timeout=60)
+    _wal_note_id(resolved, "ask_resolved")
+    ledger = escalation.Ledger()
+    try:
+        status = ledger.approve_top(task, ask_id, str(wal))
+    except escalation.LedgerError as e:
+        raise AhError(e.code, f"approve-top: {e.message}", 2)
+    return {"ok": True, "task": task, "session": session, "ask": ask_id, "source": source, "ladder": status,
+            "next": f"spawn with [task:{task}] in the Agent description; the permission covers this task only"}
+
+
+def _wal_note_id(completed, event: str) -> str:
+    try:
+        out = json.loads(completed.stdout.strip().splitlines()[-1]) if completed.stdout.strip() else {}
+    except ValueError:
+        out = {}
+    if completed.returncode != 0 or out.get("status") != "WROTE":
+        detail = (completed.stderr or completed.stdout or "").strip()[-400:]
+        raise AhError("wal_note_refused", f"approve-top: wal_note refused the {event} entry: {detail}", 2)
+    return out["id"]
 
 
 def note_cmd(home: Path, args) -> dict:
@@ -2697,6 +2947,15 @@ def build_parser():
     for x in (da, dd):
         x.add_argument("--session")
         x.add_argument("--key")
+    stt = sub.add_parser("status", help="evidence-only status report from the session WALs: VERIFIED, LIVE, PENDING, CLAIMED, ASSUMPTIONS")
+    stt.add_argument("--session")
+    stt.add_argument("--since", default="12h", help="window: <n>m|h|d (default 12h)")
+    ap = sub.add_parser("approve-top", help="record the user's permission for the top writing rung for one task: "
+                                            "verifies the user's own words ask for it, writes the ask pair, records the task grant")
+    ap.add_argument("--task", required=True, help="the [task:<key>] the spawn will carry")
+    ap.add_argument("--user-msg", required=True, help="an id printed by `ah user-msg` (uuid:, answer: or queue:)")
+    ap.add_argument("--wal", required=True, help="the main session WAL (~/.claude/wals/<session>/main.jsonl)")
+    ap.add_argument("--session", help="override the session id (default: the WAL directory name)")
     nt = sub.add_parser("note", help="write a WAL note through wal_note.py; --source auto picks the nearest sourced ancestor")
     nt.add_argument("--wal", required=True)
     nt.add_argument("--event", default="decision")
@@ -2836,6 +3095,13 @@ def run(args, home: Path) -> dict:
         return write(home, "deadline.done", {"session": s or "", "id": args.id, "note": args.note or ""}, s, args.key)
     if cmd == "note":
         return note_cmd(home, args)
+    if cmd == "status":
+        s = session_of(args, home)
+        if not s:
+            raise AhError("session_unknown", "no session: pass --session or set CLAUDE_CODE_SESSION_ID")
+        return status_report(home, s, parse_since(args.since))
+    if cmd == "approve-top":
+        return approve_top_cmd(home, args)
     if cmd == "doctor":
         return doctor()
     if cmd == "spool":

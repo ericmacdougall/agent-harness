@@ -27,6 +27,10 @@ No background process is installed. Claude Code runs hooks, and the main agent i
 
 Before replacing a managed file, both installers also compare its current bytes and permission mode with the original snapshot. If either differs, they refuse the write and leave that path untouched. Rollback acts only on files this run published and refuses to replace or remove one whose published bytes or mode were edited in place. The backup contains the preflight snapshot, not a later external edit. A noncooperating editor can still write in the narrow interval between the final comparison and atomic replacement; filesystem rename has no portable compare-and-swap guard for file contents. Coordinate installers and editors if that race matters.
 
+## Installer scan (installer_scan.py)
+
+`installer_scan.py <dir-or-file> [--json]` statically scans third-party shell and Python installers (`*.sh`, `*.py`, `install*`, `setup*`, `Makefile`) before anyone runs them. It never executes or imports the target and reads each file with a 2 MB cap (larger files are listed as skipped). Findings carry a category and `file:line`: `mcp` (agent CLI `mcp add`, `[mcp_servers.`, `mcpServers`), `agent-rules` (CLAUDE.md, AGENTS.md, settings files, config.toml, permission grants), `launchd` (launchctl, LaunchAgents, systemctl, crontab, schtasks), `shell-rc` (rc files, `PATH=`), `network-exec` (`curl | sh`, wget, pip/npm -g/brew install), `credentials` (keychain, keyring, `~/.ssh`, `~/.aws`, `~/.kimi-code`) and `privileged` (sudo, setuid, writes under `/usr/local`, `/etc`, `/Library`). Exit 0 means at least one file was scanned with no findings and nothing was left unscanned. Exit 1 means findings, a skipped file (oversize or unreadable), an executable-looking file the scan does not parse (`.js`, `.mjs`, `package.json`, `.plist`, `.ps1`, `.rb`, an executable or `#!` file, listed as skipped), no file scanned, or the 5,000-file limit reached. Exit 2 means bad usage. The rule is scan, then read. A clean scan is not a safety proof: it is regex matching on source text, so obfuscated or generated commands are missed. Review the installer anyway; the scan only makes the known side effects (for example the GoodQA MCP registration in the secure-login installer) visible first.
+
 ## Kimi independent review
 
 `kimi_review.py` lets an agent get an advisory independent opinion from Kimi through the user's Kimi subscription, replacing the manual paste of a packet into the Kimi app. It wraps the official Kimi Code CLI (`npm i -g @moonshot-ai/kimi-code`, then `kimi login`, a device-code flow); there is no API key and no HTTP in the harness. Install the CLI on the user's Mac only: the login is a subscription session, so a shared Linux host would expose it to every agent there. The script never reads, copies or prints the stored credential (the CLI keeps it under `~/.kimi-code/`).
@@ -149,10 +153,23 @@ python3 ~/.claude/hooks/escalation.py record --task TASK --run-id RUN_ID --kind 
 python3 ~/.claude/hooks/escalation.py claim-fix --task TASK --head FULL_SHA
 python3 ~/.claude/hooks/escalation.py status --task TASK
 python3 ~/.claude/hooks/escalation.py digest
+python3 ~/.claude/hooks/ah.py approve-top --task TASK --user-msg USER_MSG_ID --wal ~/.claude/wals/SESSION_ID/main.jsonl
 python3 ~/.claude/hooks/escalation.py approve-top --task TASK --ask ASK_ID --wal ~/.claude/wals/SESSION_ID/main.jsonl
 ```
 
-`approve-top` records the user's permission for the top writing rung only when the WAL holds an `ask` with a user-turn source (`user:`, or the `queue:` and `answer:` variants provenance treats the same way; since 2026-11-06) naming the task and an `ask_resolved` that references it. A state file that is missing, corrupt or locked resets the task to the lowest rung with a durable reset record (reason code, prior state hash, preserved copy) and a notification in `notifications.jsonl`; a corrupt file can never raise a rung. Every escalation or reset also appends a decision entry to the WAL named by `AGENT_HARNESS_MAIN_WAL`. Ladder limits (8 failing review launches, 3 automatic climbs, $60 per task, each counted launch spending the rung's review budget until helpers report real cost) block further writer spawns until a human signs off; `escalation.py gate-digest` lists what the hook refused or would have refused. On its own errors (an unreadable table, a symlinked or unwritable state directory) the hook denies spawns and `claude`/`codex`/`rescue.py`/`peer_review.py` launch lines only and never blocks plain shell use. `python3 ~/.claude/hooks/model_tiers.py mode` shows the installed mode and `mode --set warn` is the one-command rollback after the enforce flip (the rewrite reformats the table: sorted keys, indent 1). The Bash check reads literal tokens: `$c` and `--model $M` variable indirection, `xargs` and data-driven forms are not parsed (a `claude --model $M` line is denied as an off-table model under enforce: spell the model out), and a heredoc body mentioning a launch is split like text, so under enforce write such text to a file instead of a heredoc.
+`ah approve-top` is the one-command form (goodqa#15253 step 3). It takes an id from `ah user-msg --text-match fable`, checks that the user's own words ask for the top rung, writes the ask pair with `decision=approved`, and records the permission for that one task. There is no session-wide grant: a spawn needs `[task:TASK]` in its description. Both forms record the permission only when four things hold:
+- The WAL holds an `ask` with a user-turn source (`user:`, or the `queue:` and `answer:` variants that provenance treats the same way) naming the task, and an `ask_resolved` with `decision=approved` that references it.
+- The cited turn, re-read from the installed transcripts, has a sentence that names fable, astra or the top rung together with request words (use, pass, switch, let, approve). That sentence has no negation, condition or question.
+- The cited excerpt is part of that sentence.
+- The turn is less than 12 hours old (`caps.top_assent_max_age_seconds`).
+
+`ah approve-top` also refuses if the user mentioned the top rung again later; the latest words decide. "Keep fable disabled", "fable? no" and a hand-written pair that cites an unrelated message are all refused (review F1 and F2). A state file that is missing, corrupt or locked resets the task to the lowest rung with a durable reset record (reason code, prior state hash, preserved copy) and a notification in `notifications.jsonl`; a corrupt file can never raise a rung. Every escalation or reset also appends a decision entry to the WAL named by `AGENT_HARNESS_MAIN_WAL`. Ladder limits (8 failing review launches, 3 automatic climbs, $60 per task, each counted launch spending the rung's review budget until helpers report real cost) block further writer spawns until a human signs off; `escalation.py gate-digest` lists what the hook refused or would have refused. On its own errors (an unreadable table, a symlinked or unwritable state directory) the hook denies spawns and `claude`/`codex`/`rescue.py`/`peer_review.py` launch lines only and never blocks plain shell use. `python3 ~/.claude/hooks/model_tiers.py mode` shows the installed mode and `mode --set warn` is the one-command rollback after the enforce flip (the rewrite reformats the table: sorted keys, indent 1). The Bash check reads literal tokens: `$c` and `--model $M` variable indirection, `xargs` and data-driven forms are not parsed (a `claude --model $M` line is denied as an off-table model under enforce: spell the model out), and a heredoc body mentioning a launch is split like text, so under enforce write such text to a file instead of a heredoc.
+
+**Owner cap.** `caps.session_owner_agents`, 4 by default, is the user's limit on active owners; `caps.session_live_agents` is 12. Two rules decide what counts:
+- **Which agents.** Every spawn type that is not in `caps.helper_types` counts as an owner. The helper types are red-team, click-tester, reviewer, fixer, Explore, Plan, claude-code-guide and statusline-setup. So general-purpose, claude and fork agents, an unknown type and an invented type all count (review F3 and 50bca42).
+- **Which states.** The count comes from `ah owners` on the session WALs, and every running state counts: live, quiet and SILENT. Only a stopped owner frees its slot. When the session has no main WAL yet, the SubagentStart live map is used instead.
+
+A refusal lists the live owner ids. The cap ships in warn mode with the rest of the ladder, so a spawn over the cap gets a "would deny" note but still runs.
 
 `tier_gate.py` is the PreToolUse hook for Agent, Task, Workflow and Bash. Bash lines launching `claude`, `codex`, `rescue.py` or `peer_review.py` are checked segment by segment (the line is split on unquoted `;`, `&&`, `||`, `|`, `&` and newlines; any denied segment denies the line; a review line at a permission rung needs the installed ledger's permission). A spawn names its task with `[task:KEY]` in the prompt or description; without it the hook generates a key and resets to the lowest rung. The requested model and effort must match the task's rung: above it is downgraded through `updatedInput`, below it needs a `[rung-below:REASON]` token, review-only rungs never write, reviewer spawns (red-team, click-tester, reviewer) sit one rung above, and the top writing rung needs the recorded permission. `mode` in `model_tiers.json` is `warn` (the hook only adds context and logs what enforce would do to `~/.agent-harness/escalation/gate.jsonl`) or `enforce`; an unreadable table denies. SubagentStart and SubagentStop keep a per-session live-agent count under `caps.session_live_agents` (default 40).
 
@@ -1016,7 +1033,7 @@ GoodQA's own independent-acceptance rule for done transitions still applies.
 
 When a repo shows blockchain work, the spec flow and the reviewers get a data-driven checklist. All text lives in `domain_checklists.json`; `domain_gates.py` only detects and renders.
 
-- **Detection** reads file names from a capped `git ls-files` (signal paths only, up to 20,000; vendored `node_modules`, `vendor`, `third_party`, fixtures and top-level `lib/` are skipped) and at most 200 manifests of at most 256 KiB each (4 MiB total). It never follows symlinks and never runs repo code. JSON deeper than 100 levels is rejected before parsing (`domain_gates.safe_json_loads`; deep nesting can abort CPython 3.9), which counts as a failed scan. Hitting any scan cap (file list, manifest count or size, read budget, proto count) is also reported as a failure, and enforce mode fails closed on either (a skipped symlinked or unreadable manifest counts as well; a proto cap counts only when NATS is present without a ledger signal). If spec_policy.json cannot be loaded, `peer_review` warns loudly that enforce refusals are off (fail-closed is a follow-up). In enforce mode a very large repo (or one with oversized or deeply nested manifests) needs `allow_truncated` before reviews can run: `lint`, `attach` and `peer_review` behave the same: each refuses whenever a signal-hiding limit was hit (truncation or a too-deep manifest), even if some other domain was detected, and says how to proceed. With `allow_truncated`, or in warn mode, the review continues and an incomplete-scan notice goes into the reviewer prompt and the new spec block. `allow_truncated`, `mode` and `disabled` come only from the installed spec_policy.json; the repo file, environment and CLI cannot set them, and an attempt is reported as an ignored warning. A monorepo that legitimately exceeds the caps can set `"allow_truncated": true` under `domain_gates` in `spec_policy.json`, which downgrades truncation and too-deep manifests to a visible warning. Signals: `.sol`, `foundry.toml`, `hardhat.config.*` and ethers/viem/web3 (`evm`); `Anchor.toml`, `anchor-lang`, `solana-program` (`solana`); `frame-support`, `sp-runtime`, `polkadot-sdk` (`substrate`); `xrpl`, `xrpl-py`, `ripple-lib` (`xrpl`); a `.proto` file plus a NATS dependency plus a ledger, journal, posting or balance signal in a path or proto file (`ledger-messaging`). Untracked (not yet added) files count; paths changed by a diff count too. Review prompts are built from the committed snapshot, and a diff that touches the opt-out file, or an unknown base, ignores that file.
+- **Detection** reads file names from a capped `git ls-files` (signal paths only, up to 20,000; vendored `node_modules`, `vendor`, `third_party`, fixtures and top-level `lib/` are skipped) and at most 200 manifests of at most 256 KiB each (4 MiB total). It never follows symlinks and never runs repo code. JSON deeper than 100 levels is rejected before parsing (`domain_gates.safe_json_loads`; deep nesting can abort CPython 3.9), which counts as a failed scan. Hitting any scan cap (file list, manifest count or size, read budget, proto count) is also reported as a failure, and enforce mode fails closed on either (a skipped symlinked or unreadable manifest counts as well; a proto cap counts only when NATS is present without a ledger signal). If spec_policy.json cannot be loaded, `peer_review` warns loudly that enforce refusals are off (fail-closed is a follow-up). In enforce mode a very large repo (or one with oversized or deeply nested manifests) needs `allow_truncated` before reviews can run: `lint`, `attach` and `peer_review` behave the same: each refuses whenever a signal-hiding limit was hit (truncation or a too-deep manifest), even if some other domain was detected, and says how to proceed. With `allow_truncated`, or in warn mode, the review continues and an incomplete-scan notice goes into the reviewer prompt and the new spec block. `allow_truncated`, `mode` and `disabled` come only from the installed spec_policy.json; the repo file, environment and CLI cannot set them, and an attempt is reported as an ignored warning. A monorepo that legitimately exceeds the caps can set `"allow_truncated": true` under `domain_gates` in `spec_policy.json`, which downgrades truncation and too-deep manifests to a visible warning. Signals: `.sol`, `foundry.toml`, `hardhat.config.*` and ethers/viem/web3 (`evm`); `Anchor.toml`, `anchor-lang`, `solana-program` (`solana`); `frame-support`, `sp-runtime`, `polkadot-sdk` (`substrate`); `xrpl`, `xrpl-py`, `ripple-lib` (`xrpl`); a `.proto` file plus a NATS dependency plus a ledger, journal, posting or balance signal in a path or proto file (`ledger-messaging`). Untracked (not yet added) files count; paths changed by a diff count too. General-purpose domains `auth`, `delete`, `money`, `devices` and `release` are detected from file names only (words such as login/session/token, purge/prune/cleanup, stripe/refund/ledger, adb/enroll/pairing, deploy/rollback/updater): a domain needs at least two matching non-doc paths, or one path under a directory named for the domain, so a lone `README-release.md` does not trigger. Their checklists carry the foreseeable review findings (pre-account hijack, lookalike identifiers, device binding, verified backup before delete, idempotency keys, derived release floors, transport proof) into every new spec. Review prompts are built from the committed snapshot, and a diff that touches the opt-out file, or an unknown base, ignores that file.
 - **Checklist items** per domain: reentrancy, access control, precision, replay and chain id, nonce and idempotency, finality and reorgs, key custody, gas and DoS, upgradeability, oracle trust. Each has a NEG-case sentence and a `Verify by` hint, plus scaffolds (anvil fork, forge invariant, Echidna, `anchor test`, standalone rippled, `try-runtime`, NATS JetStream) and prompts for the review map (`domain_gates.suggested_prompts(domains)`).
 - **`spec_flow.py new --repo R`** appends a `## Domain checklist` block (with a `Domains:` line) when something is detected; nothing changes otherwise. **`spec_flow.py lint --repo R`** warns, without failing, for each item that no `## Negative cases` bullet names and that has no line `Domain-gate: <item-id> waived (<reason, 10+ chars>)`. Set `"domain_gates": {"mode": "enforce"}` in `spec_policy.json` to make `lint` and `attach` (`--repo R`) fail, and in enforce mode `peer_review` refuses to review when the reviewer checklist cannot be built (broken data, truncated scan). NEG matching counts only `- NEG-n (AC-n):` bullets in `## Negative cases` and chain-specific keywords (placeholders, code fences and generic words do not count); waivers need a 10+ character reason of at least three words, one item per line; NEG text inside code fences or HTML comments does not count. `packet` and `done` are unchanged. When `--repo` is not a git checkout lint says so instead of passing silently, and an opt-out in a repo with detected blockchain work is reported as a warning.
 - **`peer_review.py`** adds a bounded checklist (9,000 bytes) to the reviewer prompt for plan, code-inspection and PR stages. It is not part of the packet, so the packet hash and byte budget are unchanged; the report notes the section's SHA-256.
@@ -1032,6 +1049,10 @@ When a repo shows blockchain work, the spec flow and the reviewers get a data-dr
 - **Before enforcing any project:** resolve the remaining items in GoodQA work-tracker-automatic#35672 (per-project plan ticket gate, a policy for tickets opened before enforcement, bulk timing with several routed keys). `doctor` reports the permissions GoodQA lists for the key; it does not try a write. Re-run it after any key or membership change.
 - **Enforcing on `harness`:** once #35672 is resolved, add `{"key_file": ...}` to its route, run `doctor --project harness`, then set `"enforced_projects": ["harness"]` and `"mode": "enforce"`.
 - **Rollback:** set the modes to `off`, or delete the `spec_flow.py hook` handler from `~/.claude/settings.json`.
+
+### Legacy done (no spec)
+
+Tickets that predate the spec flow cannot satisfy `spec_flow.py done`. `spec_flow.py done --ticket <ref> --legacy --repo <checkout> --merge <sha> --deploy <wal-id> --really-tested <wal-id> --wal <main WAL>` replaces the spec evaluation with three bound checks, and never touches the non-legacy path. READY needs: the merge sha is an ancestor of the default branch (origin/HEAD, else origin/main, origin/master, main, master) and its commit message cites the ticket; the `--deploy` WAL entry exists, mentions LIVE or deploy (and does not say it was not live) and names the ticket number or the first 7 characters of the sha; the `--really-tested` entry exists, starts with `REALLY_TESTED` and names the ticket number or sha7. Each failure is listed by name (for example `merge sha abc is not on main`). It is an evidence report only: it makes no tracker call, and `--apply` is refused, because it does not read the ticket's spec records, accepts a local default branch when no `origin/*` exists, and cannot tell who wrote the two WAL entries (review F4). Close the ticket through the spec gate, or a person closes it after reading the report.
 
 ## Merge gate
 
@@ -1204,3 +1225,73 @@ Behaviour changes from the hand-installed script: lock takeover by rename (and o
 The policy is intentionally risk-scaled. The small fix path skips worktrees and review loops. A normal code task gets only relevant tests and documents. The agents must not infer that the presence of a test or a reviewer PASS proves quality. Independent checks, reviewer availability, UI tool access and remote permissions vary by environment; handoffs must say exactly what ran and what did not.
 
 Claude Code settings can change between versions. The hook structure follows the [Claude Code hooks reference](https://code.claude.com/docs/en/hooks), and worktree agents follow the [subagent](https://code.claude.com/docs/en/sub-agents) and [worktree](https://code.claude.com/docs/en/worktrees) guides. Check these references when upgrading Claude Code.
+
+## Redesign designs (Nov 8, task harness-redesign-nov8)
+
+These were specified on the redesign branch. Items marked landed are on main; the rest are not implemented yet, each with the reason. PR #133 was closed unmerged after its items landed in #136-#139. Scenario ids refer to
+`~/Downloads/nov-7-issues-2.md` section B and the proposal in the task work dir.
+
+### One-command merge (B3.8)
+
+`ah merge --pr N [--repo owner/name]` replaces the three-command ritual (`merge_gate.py waive`, `gh pr ready`,
+`gh pr merge --match-head-commit`). It fetches the PR head, requires a fresh exact-head `peer_review.py pr` ACCEPT
+receipt (PR #133 item 1 makes that receipt the waiver), marks the PR ready, merges with `--match-head-commit`, and
+writes one gate record. A stale or missing receipt refuses with the exact command to produce one. Not implemented. Since #141 (goodqa#15282) a merge in a repository with CI switched off needs that exact-head waiver or a bound PR review.
+
+### Portable approvals (B3.12)
+
+An approval recorded on one host (for example `approve-delete` on the Mac) is a record, not a bearer token: it
+names the session, the approving host, the exact canonical path list, the pre-delete tree hash, an expiry (24 h) and a
+one-use nonce, and it is signed with a key the agent cannot invoke (the user's SSH agent or Secure Enclave key). The
+remote guard verifies the signature against the main host's public key, consumes the nonce atomically, and refuses a
+record whose path list or tree hash differs from what it sees. Not implemented; #139 added the remote delete route this builds on.
+
+### Audited Windows stop route (B3.10)
+
+Landed in #138 (goodqa#15275) over ssh rather than a GoodQA route: `ah kill --host ah-spectre --pid N` reads the process (owner, creation time, orphan state), and the main-only stop re-checks the creation time and owner before it acts. It was verified live on a self-made orphan.
+
+### Owner session scope (B3.10)
+
+Landed in #137: a stop is bound to the caller's session, and a foreign stop needs an exact approved pid list. Not implemented: for owners, ownership recorded at launch
+(pid, start time, owner id, worktree) and a stop is allowed only on an exact owner match; a shared ancestor directory
+or an argv mention is never ownership (external review, round 1).
+
+### Relay authorization (B4.19)
+
+`ah task authorize --agent <recipient> --note <what>` writes a main-WAL entry whose id is the relay token. A task
+relayed by another owner carries `auth:<id>`; the recipient runs `ah task verify-auth <id> --agent <self>` and proceeds
+only when the entry exists in the main WAL, names it, and is newer than its own spawn.
+
+### Agent-filed ticket throttle (B4.23, goodqa#15256)
+
+`ah ticket create` dedupes by a normalized fingerprint (project, component, root-cause words) rather than by title
+hash, applies a fleet-wide daily budget per filer class (runner briefs, key filers, liveness), batches related
+findings into one ticket, and keeps an audited lane that is never throttled for security, data-loss and P0 reports.
+
+### command_guard log-delete classification (B3.11)
+
+The `log_delete` category keeps every protected path (Claude and Codex transcripts and WALs, harness audit logs,
+usage receipts, deploy evidence). What changes is the operation test: a command that only creates or appends a new
+file under `~/.agent-harness/work/<session>/` is never a log delete, and a repository's own `install.sh` moving its
+own hook file inside its checkout is not a log rewrite. Deletion, truncation, move and write-through-link on a
+protected path stay blocked. The blocks observed on 2026-11-07/08 (transcript, eight `log_delete` refusals) fall in two
+classes: a path the guard cannot resolve (`$T` from `mktemp`, `$C`, `.pc.$$.$1.$2`) is treated as protected, and the
+whole `~/.agent-harness` tree counts as a protected harness directory (`gitrelay.git`, review worktrees `wt-*`). The
+rule change: an unresolvable variable blocks only when the same command also names a protected root or a log glob; a
+directory under `~/.agent-harness/work/<session>/` that is a clean, pushed worktree or a scratch dir is not a log.
+`tests/test_command_guard_workdir_write.py` holds these rows as a regression guard: they pass on main and fail if a row blocks again. The scratchpad delete case is goodqa#15280.
+
+### Missing scenarios from the external review (B25-B29)
+
+- B25 quota: when a provider returns the weekly limit, owners checkpoint (WAL handoff with the exact resume point)
+  before retrying, and main admits no new owner until the pool is back; a per-session spend budget sits beside the
+  owner cap.
+- B26 disks and alerts: a disk-free preflight (`ah disk`) before builds and clones; per-task resource TTLs with a
+  cleanup receipt in the WAL; alert dedupe and expiry with a protected dead-man lane.
+- B27 environment identity: a signed environment registry (`prod`, `staging`, aliases such as
+  `platform.framebright.ai` = prod) that destructive operations and test harnesses assert against; a test may never
+  name a production target.
+- B28 credential hygiene: the GoodQA user token pasted on 11-06 and the account-wide Cloudflare token on the mini
+  are rotated and narrowed before agent login authority widens; transcript backups get secret scanning.
+- B29 ref regrowth: auto-delete-on-merge everywhere, TTL ownership for `claude/*` and `codex/*` branches, backup-ref
+  expiry, and replay tests for the ten known repo-guard bypasses (#128).

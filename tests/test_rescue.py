@@ -912,9 +912,13 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         wals = self.root / 'wals'; (wals / 's1').mkdir(parents=True)
         os.environ['AGENT_HARNESS_WALS_DIR'] = str(wals); self.addCleanup(lambda: os.environ.pop('AGENT_HARNESS_WALS_DIR', None))
         wal = wals / 's1' / 'main.jsonl'
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import top_assent_fixture as fx
+        fx.use_claude_home(self, self.root / 'claude')
+        src = fx.user_turn(self.root / 'claude', 'yes, use fable for rescue-t')
         wal.write_text(json.dumps({'id': 'w1', 'event': 'ask', 'note': 'permission for [task:rescue-t] top rung',
-                                   'source': 'user:s/u "yes, use fable for rescue-t"'}) + '\n'
-                       + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1', 'note': 'approved by the user'}) + '\n')
+                                   'source': src}) + '\n'
+                       + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1', 'note': 'yes', 'decision': 'approved'}) + '\n')
         ladder.Ledger(state, tiers.load_policy()).approve_top('rescue-t', 'w1', wal)
         capture = self.root / 'astra-prompt.txt'
         command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),

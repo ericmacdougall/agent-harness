@@ -104,6 +104,8 @@ def main():
     parser.add_argument('--source', help='origin: user:<session>/<uuid> "excerpt" | ticket: | wal: | file: | inferred: (see provenance.py)')
     parser.add_argument('--reason', help='why this is asked of the user (required for ask)')
     parser.add_argument('--ref', help='id of the ask being closed (ask_resolved)')
+    parser.add_argument('--decision', choices=('approved', 'declined'),
+                        help='ask_resolved only: the explicit outcome (escalation.py reads this field, never the note text)')
     parser.add_argument('--by', help='tool that writes this row on an agent\'s behalf (never quarantined; cites its state in the note)')
     parser.add_argument('--recites', help='id of an unsourced entry of this WAL that this sourced row re-cites (clears its quarantine)')
     args = parser.parse_args()
@@ -142,7 +144,7 @@ def main():
                               'hint': 'cite the answer: user:<session>/<uuid> "words", answer:<id> or queue:<id> (ah user-msg)'}),
                   file=sys.stderr)
             return 2
-        if not re.match(r'^(user:|answer:|queue:|ticket:)', args.source.strip()):
+        if not re.match(r'^(user:|uuid:|answer:|queue:|ticket:)', args.source.strip()):
             print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved source must be the answer: user:, answer:, queue: or ticket:',
                               'hint': 'an ask cannot be closed on an inferred: or file: source'}), file=sys.stderr)
             return 2
@@ -153,8 +155,12 @@ def main():
             return 2
         record['ref'] = args.ref
         record['source'] = args.source.strip()[:2000]
+        if args.decision:
+            record['decision'] = args.decision
         if assumption:
             record['assumption'] = True
+    elif args.decision:
+        parser.error('--decision applies to ask_resolved only')
     if args.event in SOURCED:
         mode, problem, assumption = provenance_check(args.event, args.source)
         if problem and args.source and caller_error(problem):
