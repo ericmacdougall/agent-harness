@@ -76,6 +76,38 @@ class SiblingAsk(unittest.TestCase):
         (self.wals / 'agent-link.jsonl').symlink_to(other_main)
         self.assertEqual(self.resolve('wsym12345678').returncode, 2)
 
+    def test_m2_fifo_and_unbounded_files_refuse_instead_of_hanging(self):
+        import time
+        os.mkfifo(str(self.wals / 'agent-zfifo.jsonl'))
+        started = time.monotonic()
+        done = subprocess.run([sys.executable, str(HOOKS / 'wal_note.py'), '--wal', str(self.wals / 'main.jsonl'), '--event', 'ask_resolved',
+                               '--ref', 'wabc123456789', '--note', 'x', '--source', 'user:%s/%s "yes go ahead with the change"' % (SID, ANSWER_UUID)],
+                              capture_output=True, text=True, timeout=20,
+                              env=dict(os.environ, HOME=str(self.home), HARNESS_PROVENANCE_OFFLINE='1'))
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        os.unlink(self.wals / 'agent-zfifo.jsonl')
+        # an oversized sibling with no newline is refused rather than read whole
+        big = self.wals / 'agent-zbig.jsonl'
+        with open(big, 'wb') as handle:
+            handle.truncate(1200 << 20)  # sparse: no disk used, larger than the scan cap
+        started = time.monotonic()
+        done = subprocess.run([sys.executable, str(HOOKS / 'wal_note.py'), '--wal', str(self.wals / 'main.jsonl'), '--event', 'ask_resolved',
+                               '--ref', 'wabc123456789', '--note', 'x', '--source', 'user:%s/%s "yes go ahead with the change"' % (SID, ANSWER_UUID)],
+                              capture_output=True, text=True, timeout=30,
+                              env=dict(os.environ, HOME=str(self.home), HARNESS_PROVENANCE_OFFLINE='1'))
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        os.unlink(big)
+        # a single line longer than the line cap that mentions the ask could hold its resolution: refuse, never skip it
+        with open(self.wals / 'agent-zline.jsonl', 'wb') as handle:
+            handle.write(b'{"event":"ask_resolved","ref":"wabc123456789","pad":"' + b'x' * (9 << 20) + b'"}\n')
+        done = subprocess.run([sys.executable, str(HOOKS / 'wal_note.py'), '--wal', str(self.wals / 'main.jsonl'), '--event', 'ask_resolved',
+                               '--ref', 'wabc123456789', '--note', 'x', '--source', 'user:%s/%s "yes go ahead with the change"' % (SID, ANSWER_UUID)],
+                              capture_output=True, text=True, timeout=30,
+                              env=dict(os.environ, HOME=str(self.home), HARNESS_PROVENANCE_OFFLINE='1'))
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

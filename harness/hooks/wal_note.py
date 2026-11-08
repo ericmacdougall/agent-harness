@@ -114,13 +114,17 @@ def sibling_ask_wal(path, ref: str):
     needle = ref.encode()
     for other in wals:  # a resolution anywhere in the session closes it (provenance ledger rule)
         try:
-            with open(other, 'rb') as handle:  # red-team F2: the whole file, not a 4 MiB tail
-                for raw in handle:
-                    if needle in raw and b'"ask_resolved"' in raw:
-                        rec = json.loads(raw)
-                        if isinstance(rec, dict) and rec.get('event') == 'ask_resolved' and rec.get('ref') == ref:
-                            return None
-        except Exception:  # noqa: BLE001 - unreadable: do not guess that it is open
+            import provenance  # noqa: PLC0415
+            # red-team F2 and M2: the whole file (not a 4 MiB tail), through the bounded reader that opens regular files
+            # only (a FIFO cannot hang it), caps the size and the scan time, and reports an oversized line as None
+            for raw in provenance._lines_containing(other, needle):
+                if raw is None:
+                    return None  # a line too long to read could hold the resolution: do not guess that it is open
+                if b'"ask_resolved"' in raw:
+                    rec = json.loads(raw)
+                    if isinstance(rec, dict) and rec.get('event') == 'ask_resolved' and rec.get('ref') == ref:
+                        return None
+        except Exception:  # noqa: BLE001 - unreadable, too large or not a regular file: do not guess that it is open
             return None
     return holders[0].stem
 
