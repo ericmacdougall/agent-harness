@@ -3572,6 +3572,8 @@ class Analyzer:
                             ctx.add(SECRET_DUMP, 'find-exec-credentials',
                                     'find -exec prints files from a credential directory',
                                     'list names only: find DIR -name PATTERN -print')
+            if bname == 'git':  # goodqa#15346: find -exec git worktree remove {} + was never looked at
+                self.git(body[1:], body, body)
             if bname in WRAPPERS_SIMPLE | SHELLS:
                 cmd = Cmd()
                 cmd.words = list(body)
@@ -3715,6 +3717,16 @@ class Analyzer:
             self.git_clean(args[i + 1:], rest, cwd_word)
         if sub == 'worktree' and rest[:1] == ['remove'] and self._removable_linked_worktree(args[i + 1:]):
             return  # the only exemption: one literal, clean, published, registered linked-worktree top
+        if sub == 'worktree' and rest[:1] == ['remove']:
+            targets = _nondash(args[i + 2:])
+            # goodqa#15346: a remove reached through xargs, find -exec, parallel or a wrapper has its target on stdin or
+            # in a placeholder, so no refusal below could judge it. Only the lone verified literal form returns above.
+            if not targets or any('{}' in w.text or w.text in (':::', '::::') or '{' in w.text and '}' in w.text
+                                  for w in targets):
+                ctx.add(LOG_DELETE, 'linked-worktree-remove',
+                        'git worktree remove without a literal target on its command line (xargs, find -exec, parallel '
+                        'or a placeholder) cannot be verified',
+                        'use the standalone literal non-forced form after cleaning and publishing the worktree')
         if sub == 'worktree' and rest[:1] in (['remove'], ['prune']):
             for w in _nondash(args[i + 2:]):
                 refused = self.refuse('git worktree remove', w)

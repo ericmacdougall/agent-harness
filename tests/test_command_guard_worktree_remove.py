@@ -276,3 +276,37 @@ class WorktreeRemoveMerged(WorktreeRemoveCase):
         git(self.linked, 'add', 'kept.txt'); git(self.linked, 'commit', '-q', '-m', 'on branch')
         git(self.linked, 'checkout', '-q', '--detach', 'main')
         self.assertIsNone(self.refusal())
+
+
+class WorktreeRemoveIndirect(WorktreeRemoveCase):
+    """goodqa#15346: `git worktree remove` reached through xargs, find -exec, parallel or a wrapper has no literal target on
+    the command line, and used to skip every refusal (--force included). Only the single verified literal form passes."""
+
+    def forms(self):
+        path = str(self.linked)
+        lst = self.home / 'list.txt'
+        lst.write_text(path + '\n')
+        return (
+            'echo %s | xargs git worktree remove --force' % path,
+            'echo %s | xargs git worktree remove' % path,
+            'xargs git worktree remove --force < %s' % lst,
+            'xargs git worktree remove < %s' % lst,
+            'cat %s | xargs -I{} git worktree remove --force {}' % lst,
+            'find %s -maxdepth 0 -exec git worktree remove --force {} +' % path,
+            'find %s -maxdepth 0 -exec git worktree remove {} \;' % path,
+            'find %s -maxdepth 0 -exec git worktree remove --force {} \;' % self.base,
+            'echo %s | parallel git worktree remove --force' % path,
+            'parallel git worktree remove --force ::: %s' % path,
+            'echo %s | env xargs git worktree remove --force' % path,
+            "sh -c 'echo %s | xargs git worktree remove --force'" % path,
+            "bash -c 'xargs git worktree remove --force < %s'" % lst,
+            'env git worktree remove --force %s' % path,
+            "sh -c 'git worktree remove --force %s'" % path,
+            'git worktree remove --force %s' % path,
+            'echo %s | xargs git -C %s worktree remove --force' % (path, self.primary),
+        )
+
+    def test_indirect_forms_block_and_the_lone_literal_form_still_passes(self):
+        passed = [c for c in self.forms() if self.decide(c)[0] != 'block']
+        self.assertEqual(passed, [], 'an indirect worktree remove slipped through')
+        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'allow')
