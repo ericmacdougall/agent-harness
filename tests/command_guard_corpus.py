@@ -436,7 +436,6 @@ NEG15_WORK_BLOCK = [
     {'cmd': 'rm -rf out/.*', 'cwd': '@WT@'},
     {'cmd': 'rm -f out/results.jsonl', 'cwd': '@WT@'},
     {'cmd': 'rm -f out/*.jsonl', 'cwd': '@WT@'},
-    {'cmd': 'git worktree remove @WT@', 'cwd': '@HOME@/repo'},
     {'cmd': 'git clean -fdx ../..', 'cwd': '@WT@'},
     {'cmd': 'rm -rf @WT@/build', 'cwd': '@HOME@/repo'},
     {'cmd': 'rm -rf @WT@/build', 'cwd': None},
@@ -543,6 +542,9 @@ NEG15_WORK_BLOCK = [
     {'cmd': 'find ~/.claude -name "*.pyc" -delete', 'cwd': '@WT@'},
 ]
 NEG15_WORK_ALLOW = [
+    # The only worktree-remove exemption; its real clean/published repository checks live in
+    # test_command_guard_worktree_remove.py. Every forced, dynamic, compound or unverified shape stays in BLOCK.
+    {'cmd': 'git worktree remove @WT@', 'cwd': '@HOME@/repo'},
     # fresh hold-out false positive at 91e8752 (GoodQA #14471, final round)
     {'cmd': 'rm -rf build/*', 'cwd': '@WT@'},
     # find below the worktree top is judged by its start directory (the a81e511 rule)

@@ -8,6 +8,7 @@ import io
 import importlib.util
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -81,7 +82,9 @@ print(json.dumps({'role': 'meta', 'type': 'system.version', 'version': 'fake'}))
 if mode == 'toolcall':
     print(json.dumps({'role': 'assistant', 'tool_calls': [{'type': 'function', 'id': 't1', 'function': {'name': 'Bash', 'arguments': '{}'}}]}))
     print(json.dumps({'role': 'tool', 'tool_call_id': 't1', 'content': 'ran'}))
-print(json.dumps({'role': 'assistant', 'content': 'KIMI_ADVISORY: BLOCK\\nF1: fixture finding.'}))
+content = ('PLAN_RESULT: BLOCK\\nF1: fixture finding.' if 'Begin exactly PLAN_RESULT:' in agent
+           else 'KIMI_ADVISORY: BLOCK\\nF1: fixture finding.')
+print(json.dumps({'role': 'assistant', 'content': content}))
 print(json.dumps({'role': 'meta', 'type': 'session.resume_hint', 'session_id': 'session_fake-123', 'content': 'x'}))
 '''
 
@@ -112,7 +115,11 @@ class KimiReviewTests(unittest.TestCase):
         self.state.mkdir()
         self.fake = self.root / 'fakebin' / 'kimi'
         self.fake.parent.mkdir()
-        self.fake.write_text('#!%s\n%s' % (sys.executable, FAKE))
+        # A managed Python path may contain spaces, which a macOS shebang cannot represent. Quote it in a
+        # /bin/sh wrapper instead; env removes SHLVL, which this shell re-adds while executing its child.
+        # The child still runs only this local fixture, never a real provider.
+        self.fake.write_text('#!/bin/sh\nunset PWD SHLVL\nexec /usr/bin/env -u SHLVL %s -c %s "$@"\n' % (
+            shlex.quote(sys.executable), shlex.quote(FAKE)))
         self.fake.chmod(0o700)
         self.work = self.root / 'work'
         self.work.mkdir()
@@ -197,6 +204,27 @@ class KimiReviewTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.output.stat().st_mode), 0o600)
         self.assertEqual(self.launches(), 1)
         self.assertEqual(self.ledger_calls(), 1)
+
+    def test_spec_plan_mode_writes_distinct_bound_signoff_artifact(self):
+        result = self.run_kimi('--mode', 'spec-plan')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self.output.read_text()
+        sha = hashlib.sha256(self.packet.read_bytes()).hexdigest()
+        for line in ('Artifact: KIMI_SPEC_PLAN_SIGNOFF_V1', 'Stage: plan',
+                     'Reviewed-Model: ' + MODEL, 'Reviewed packet SHA-256: ' + sha,
+                     'Packet-Binding: exact-spec-core-sha256', 'Freshness: current-packet-only',
+                     'Advisory: no; constrained spec-plan signoff only', 'PLAN_RESULT: BLOCK'):
+            self.assertIn(line + '\n', report)
+        self.assertRegex(report, r'Reviewed-At: .+\+00:00\n')
+        self.assertNotIn('KIMI_ADVISORY:', report)
+        self.assertIn('Begin exactly PLAN_RESULT: ACCEPT or PLAN_RESULT: BLOCK.', self.capture()['agent'])
+
+    def test_spec_plan_mode_refuses_snapshots_before_launch(self):
+        result = self.run_kimi('--mode', 'spec-plan', '--snapshot', str(self.packet))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('exactly one packet', result.stderr)
+        self.assertEqual(self.launches(), 0)
+        self.assertFalse(self.output.exists())
 
     def test_default_command_is_k31_pro_fast_and_never_requests_swarm(self):
         self.assertEqual(self.run_kimi().returncode, 0)

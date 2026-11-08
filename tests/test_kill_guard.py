@@ -351,6 +351,26 @@ class Ownership(WorldCase):
                            runner=lambda *a, **k: None, policy=POLICY)
         self.assertEqual(own.check(4001)[1], 'no-worktree')
 
+    def test_main_can_stop_own_git_grep_and_server_but_not_foreign_or_dynamic_pids(self):
+        world = json.loads(json.dumps(WORLD))
+        world['pids'].update({
+            '4101': {'uid': 1000, 'comm': 'git', 'cwd': '/w/own/sub', 'argv': ['git', 'grep', 'needle'], 'start': 'g1'},
+            '4102': {'uid': 1000, 'comm': 'server', 'cwd': '/tmp',
+                     'argv': ['/w/own/bin/server', '--port', '8080'], 'start': 'g2'},
+            '4103': {'uid': 1000, 'comm': 'netwatch', 'cwd': '/w/own', 'argv': ['netwatch', 'daemon'], 'start': 'g3'},
+        })
+        for pid in (4101, 4102):
+            for command in ('kill %d' % pid, 'netwatch orphans --kill --pid %d' % pid):
+                with self.subTest(command=command):
+                    self.assertEqual(self.decide(command, world=world)[0], 'allow')
+        for command in ('kill 4004', 'kill 3901', 'kill 4009', 'kill 4008', 'kill $PID',
+                        'kill 4101 4004', 'netwatch orphans --kill --pid 4004',
+                        'netwatch orphans --kill --pid 4101,4004', 'netwatch orphans --kill --pid 4103',
+                        'netwatch orphans --kill --pid $PID'):
+            with self.subTest(command=command):
+                self.assertEqual(self.decide(command, world=world)[0], 'block')
+        self.assertEqual(self.decide('netwatch orphans --kill --pid 4103', world=world)[1], 'not-yours')
+
     def test_malformed_pids(self):
         for cmd in ('kill 001', 'kill １２３', 'kill 4194305', 'kill +4001', 'kill 0x4001', 'kill 4001abc', 'kill -- -4001'):
             self.assertEqual(self.decide(cmd)[0], 'block', cmd)
@@ -765,6 +785,19 @@ class RemoteSpawn(unittest.TestCase):
         verdict, rule, message, pids = self.decide('ssh dev2 kill 4242')
         self.assertEqual((verdict, rule), ('block', 'remote-kill'))
         self.assertIn('spawn --host dev2', message)
+
+    def test_netwatch_remote_unledgered_pids_need_foreign_route_or_remote_ledger(self):
+        verdict, rule, message, _pids = self.decide('ssh dev2 netwatch orphans --kill --pid 4242')
+        self.assertEqual((verdict, rule), ('block', 'remote-kill'))
+        self.assertIn('--foreign', message)
+        kg.append_ledger(kg.remote_root('dev2'), 4242, self.START, home=self.home)
+        same = lambda host, pid: self.START if (host, pid) == ('dev2', 4242) else None  # noqa: E731
+        self.assertEqual(self.decide('ssh dev2 netwatch orphans --kill --pid 4242', same)[0], 'allow')
+        for command in ('ssh dev2 netwatch orphans --kill --pid 4243',
+                        'ssh dev2 netwatch orphans --kill --pid 4242,4243',
+                        'ssh t2-dev netwatch orphans --kill --pid 4242'):
+            with self.subTest(command=command):
+                self.assertEqual(self.decide(command, same)[0], 'block')
 
     def test_spawned_pid_is_killable_only_on_its_host_while_its_start_time_matches(self):
         kg.append_ledger(kg.remote_root('dev2'), 4242, self.START, home=self.home)

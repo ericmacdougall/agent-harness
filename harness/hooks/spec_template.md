@@ -4,6 +4,7 @@ Ticket: GoodQA {project}#{number}
 Author: {author}
 Click-test: required
 Sign-off: {signoff}
+Review-policy: standard
 
 ## Outcome
 

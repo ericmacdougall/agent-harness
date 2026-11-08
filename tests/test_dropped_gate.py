@@ -119,6 +119,32 @@ class GateTests(Base):
         self.assertFalse(by["aliveowner"]["decision_required"])
         self.assertEqual(self.owners()["undisposed"], ["dropowner"])
 
+    def test_unacknowledged_owner_handoff_alerts_only_after_one_hour(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "agent-dropowner.jsonl", [{"at": iso(NOW), "event": "handoff", "note": "to main: result ready"}])
+        jl(w / "main.jsonl", [{"at": iso(NOW), "event": "subagent_stop", "agent_id": "dropowner",
+                              "agent_type": "task-owner"}])
+        self.assertNotIn("dropowner", self.owners()["undisposed"])
+        before = {r["agent_id"]: r for r in self.owners(now=NOW + ah.HANDOFF_ACK_S - 1)["owners"]}
+        self.assertNotIn("handoff-unacked", before["dropowner"]["flags"])
+        after = {r["agent_id"]: r for r in self.owners(now=NOW + ah.HANDOFF_ACK_S + 1)["owners"]}
+        self.assertIn("handoff-unacked", after["dropowner"]["flags"])
+        self.assertTrue(after["dropowner"]["decision_required"])
+
+    def test_live_waiting_disposition_acknowledges_handoff_until_it_expires(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "agent-dropowner.jsonl", [
+            {"at": iso(NOW - ah.HANDOFF_ACK_S - 1), "event": "handoff", "note": "to main: blocked on an ask"}])
+        before = {r["agent_id"]: r for r in self.owners()["owners"]}
+        self.assertIn("handoff-unacked", before["dropowner"]["flags"])
+        self.dispose("waiting", "disp-handoff-wait", until=iso(NOW + 3600), ref="wa5b00000001")
+        waiting = {r["agent_id"]: r for r in self.owners()["owners"]}
+        self.assertNotIn("handoff-unacked", waiting["dropowner"]["flags"])
+        self.assertFalse(waiting["dropowner"]["decision_required"])
+        expired = {r["agent_id"]: r for r in self.owners(now=NOW + 3601)["owners"]}
+        self.assertIn("handoff-unacked", expired["dropowner"]["flags"])
+        self.assertTrue(expired["dropowner"]["decision_required"])
+
     def test_gate_exit_code_never_prints_zero_dropped(self):
         buf = io.StringIO()
         with redirect_stdout(buf), mock.patch.object(ah.time, "time", return_value=NOW):
@@ -344,6 +370,21 @@ class SubagentStopGate(Base):
         jl(w / "agent-waitowner.jsonl", [{"at": iso(NOW - 30), "event": "blocker", "note": "waiting on wa5b00000001"}])
         self.assertEqual(self.sstop("doneowner"), {})
         self.assertEqual(self.sstop("waitowner"), {})
+
+    def test_immediate_handoff_and_result_have_no_pending_work_but_an_intent_does(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        for event in ("handoff", "result"):
+            agent = "immediate-" + event
+            jl(w / ("agent-%s.jsonl" % agent), [
+                {"at": iso(NOW - 20), "event": "intent", "note": "finishing the slice"},
+                {"at": iso(NOW), "event": event, "note": "returned to main"},
+                {"at": iso(NOW), "event": "pretool", "tool": "Bash"},
+            ])
+            with self.subTest(event=event):
+                self.assertIsNone(dropped_gate.pending_work(self.home, SESSION, agent))
+                self.assertEqual(self.sstop(agent), {})
+        jl(w / "agent-immediate-intent.jsonl", [{"at": iso(NOW), "event": "intent", "note": "still running"}])
+        self.assertIsNotNone(dropped_gate.pending_work(self.home, SESSION, "immediate-intent"))
 
     def test_armed_waiter_does_not_block(self):
         w = self.home / ".claude" / "wals" / SESSION

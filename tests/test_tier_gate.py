@@ -78,6 +78,24 @@ class SpawnDecisions(GateFixture):
         decision, reason, updated, facts = self.spawn('review it [task:k3]', model='opus', effort='max', subagent_type='red-team')
         self.assertEqual(decision, 'allow'); self.assertEqual(facts['reviewer_rung'], 'R4')
 
+    def test_reviewer_above_target_is_denied_while_omitted_matching_and_writer_rules_stay(self):
+        decision, reason, updated, facts = self.spawn('review [task:k-reviewer]', model='opus', effort='high',
+                                                       subagent_type='reviewer')
+        self.assertEqual((decision, updated), ('deny', None))
+        self.assertEqual((facts['requested']['rung'], facts['reviewer_rung']), ('R2', 'R1'))
+        self.assertIn('effective target rung R1', reason)
+        self.assertIn('not downgraded', reason)
+        decision, reason, updated, facts = self.spawn('review [task:k-reviewer]', subagent_type='reviewer')
+        self.assertEqual(decision, 'allow')
+        self.assertEqual((updated['model'], updated['effort']), ('opus', 'medium'))
+        decision, reason, updated, facts = self.spawn('review [task:k-reviewer]', model='opus', effort='medium',
+                                                       subagent_type='reviewer')
+        self.assertEqual((decision, updated), ('allow', None))
+        # The same above-target writer request keeps its deterministic downgrade.
+        decision, reason, updated, facts = self.spawn('write [task:k-reviewer]', model='opus', effort='high')
+        self.assertEqual(decision, 'allow')
+        self.assertEqual((updated['model'], updated['effort']), ('sonnet', 'medium'))
+
     def test_opus_xhigh_is_reachable_and_the_fourth_climb_asks_the_user(self):
         # Six FAILs on one finding: R0 -> R1 -> R2 -> R3, all automatic; an opus xhigh writer is allowed.
         for _ in range(3): self.escalate('k12')
@@ -397,6 +415,18 @@ class ModesAndCap(GateFixture):
         self.assertEqual(enforce['permissionDecision'], 'deny')
         log = [json.loads(l) for l in (self.root / 'gate.jsonl').read_text().splitlines()]
         self.assertEqual([entry['mode'] for entry in log], ['warn', 'enforce'])
+
+    def test_reviewer_above_target_warn_mode_still_only_adds_context(self):
+        data = {'tool_name': 'Agent', 'tool_input': {'prompt': 'review [task:k-reviewer-mode]', 'model': 'opus',
+                                                     'effort': 'high', 'subagent_type': 'reviewer'}, 'session_id': 's'}
+        warn = self.run_hook(data, 'warn')
+        self.assertNotIn('permissionDecision', warn)
+        self.assertNotIn('updatedInput', warn)
+        self.assertIn('would deny', warn['additionalContext'])
+        self.assertIn('effective target rung R1', warn['additionalContext'])
+        enforce = self.run_hook(data, 'enforce')
+        self.assertEqual(enforce['permissionDecision'], 'deny')
+        self.assertNotIn('updatedInput', enforce)
 
     def test_unusable_state_dir_never_blocks_plain_shell_use(self):
         # onFailure: block means the hook must always answer: a symlinked or unwritable state dir is not a lockout.

@@ -1510,7 +1510,7 @@ def make_analyzer_class(cg):
             low = [t.lower() for t in rest]
             if not any(t in ('-kill', '--kill') or t.startswith(('-kill=', '--kill=')) for t in low + [b.lower() for b in before]):
                 return  # listing only
-            bad, has_pid, i = None, False, 0
+            bad, has_pid, i, pids = None, False, 0, []
             if any(a.dynamic or a.subs for a in args):
                 bad = 'a dynamic argument'
             elif any(t.startswith('-') for t in before):
@@ -1523,11 +1523,16 @@ def make_analyzer_class(cg):
                     value = rest[i + 1] if i + 1 < len(rest) else ''
                     if not PID_OPT_VALUE.fullmatch(value):
                         bad = '--pid needs digits'
+                    else:
+                        pids.extend(int(p) for p in value.split(','))
                     has_pid = True
                     i += 2
                 elif t.startswith(('-pid=', '--pid=')):
-                    if not PID_OPT_VALUE.fullmatch(rest[i].split('=', 1)[1]):
+                    value = rest[i].split('=', 1)[1]
+                    if not PID_OPT_VALUE.fullmatch(value):
                         bad = '--pid needs digits'
+                    else:
+                        pids.extend(int(p) for p in value.split(','))
                     has_pid = True
                     i += 1
                 else:
@@ -1539,6 +1544,17 @@ def make_analyzer_class(cg):
             if bad:
                 self.block('netwatch-broad', 'netwatch orphans --kill is allowed only as --pid N[,N...] (%s); '
                            '--all, --force and --match need the user' % bad)
+                return
+            if self.remote:
+                ok, reason = self.remote_spawn_ok(pids)
+                if not ok:
+                    self.block('remote-kill', reason + '; an unledgered remote PID needs the audited --foreign route', pids)
+                return
+            for pid in dict.fromkeys(pids):
+                ok, _code, detail = self.own.check(pid)
+                if not ok:
+                    self.block('not-yours', detail, [pid])
+                    break
 
         def remote_spawn_ok(self, pids):
             """`ssh HOST kill [-SIG] PID...` passes only when this is a single literal ssh hop (no container, no
