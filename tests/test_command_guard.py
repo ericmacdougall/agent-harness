@@ -1123,6 +1123,76 @@ class OverwriteExistingTests(Fixture):
         self.assertEqual(self.decide('echo x > @HOME@/.claude/many/nomatch-*', cwd='@TASK@')[0], 'allow')
 
 
+class Scratchpad15280(Fixture):
+    """goodqa#15280: deleting a test directory inside a session scratchpad is allowed however the scratch root is
+    spelled (literal, ~, $HOME, $TMPDIR, $CLAUDE_CODE_TMPDIR); NEG: task-output logs, WALs, transcripts and the scratch
+    root itself stay blocked through the same spellings, and so do globs, `..` climbs and unknown variables."""
+
+    PAD = 'claude-501/-Users-x/s1/scratchpad'
+
+    def env(self, **values):
+        patch = mock.patch.dict(os.environ, values)
+        patch.start()
+        self.addCleanup(patch.stop)
+        for name in ('TMPDIR', 'CLAUDE_CODE_TMPDIR'):
+            if name not in values:
+                os.environ.pop(name, None)
+
+    def setUp(self):
+        self.scratch = self.home / '.agent-harness/scratch'
+        (self.scratch / self.PAD / 'rftest').mkdir(parents=True, exist_ok=True)
+        (self.scratch / 'claude-501/-Users-x/s1/tasks').mkdir(parents=True, exist_ok=True)
+        (self.scratch / 'claude-501/-Users-x/s1/tasks/b1.output').write_text('log')
+
+    def rows(self, template):
+        return [template.replace('@PAD@', self.PAD)]
+
+    ALLOWED = ['rm -rf @HOME@/.agent-harness/scratch/@PAD@/rftest',
+               'rm -rf ~/.agent-harness/scratch/@PAD@/rftest',
+               'T=@HOME@/.agent-harness/scratch/@PAD@/rftest; rm -rf "$T"',
+               'rm -rf "$TMPDIR/@PAD@/rftest"',
+               'rm -rf ${TMPDIR}/@PAD@/rftest',
+               'rm -rf "$CLAUDE_CODE_TMPDIR/@PAD@/rftest"',
+               'rm -rf "${CLAUDE_CODE_TMPDIR}/@PAD@/rftest"']
+
+    BLOCKED = ['rm -f "$TMPDIR/claude-501/-Users-x/s1/tasks/b1.output"',
+               'rm -rf "$TMPDIR/@PAD@/../tasks"',
+               'rm -rf "$TMPDIR"',
+               'rm -rf "$TMPDIR"/*',
+               'rm -rf "$TMPDIR/@PAD@/"*',
+               'rm -f "$CLAUDE_CODE_TMPDIR/claude-501/-Users-x/s1/tasks/b1.output"',
+               'rm -rf "$CLAUDE_CODE_TMPDIR"',
+               'rm -f @HOME@/.agent-harness/scratch/claude-501/-Users-x/s1/tasks/b1.output',
+               'rm -rf @HOME@/.agent-harness/scratch/@PAD@/../tasks',
+               'rm -rf @HOME@/.agent-harness/scratch/@PAD@/*',
+               'rm -rf "$TMPDIR/@PAD@/$X"/../../tasks',
+               'rm -f @HOME@/.claude/wals/s/main.jsonl',
+               'rm -f @HOME@/.claude/projects/p/a.jsonl']
+
+    def expect_all(self, rows, want, label):
+        self.expect([r.replace('@PAD@', self.PAD) for r in rows], want, label=label)
+
+    def test_ac1_scratchpad_test_dir_is_deletable_with_the_hook_tmpdir_relocated(self):
+        self.env(TMPDIR=str(self.scratch))
+        self.expect_all(self.ALLOWED, 'allow', 'AC-1 relocated TMPDIR')
+
+    def test_ac1_scratchpad_test_dir_is_deletable_when_the_hook_sees_no_tmpdir(self):
+        # Claude Code exports TMPDIR to the Bash shell but the hook may not see it; the harness scratch is a candidate.
+        self.env()
+        self.expect_all(self.ALLOWED, 'allow', 'AC-1 no hook TMPDIR')
+
+    def test_neg_task_output_logs_wals_and_scratch_root_stay_blocked(self):
+        for values in ({'TMPDIR': str(self.scratch)}, {}, {'TMPDIR': '/tmp', 'CLAUDE_CODE_TMPDIR': str(self.scratch)}):
+            with self.subTest(env=values):
+                self.env(**values)
+                self.expect_all(self.BLOCKED, 'block', 'NEG %s' % values)
+
+    def test_neg_a_tmpdir_assigned_in_the_command_is_used_instead(self):
+        self.env(TMPDIR=str(self.scratch))
+        self.expect(['TMPDIR=@HOME@/.claude/wals; rm -rf "$TMPDIR/x"',
+                     'export TMPDIR=@HOME@/.claude/wals; rm -rf "$TMPDIR/x"'], 'block', label='NEG assigned TMPDIR')
+
+
 class TempFiles15122(Fixture):
     """goodqa#15122 AC-1: a command may remove or overwrite the file mktemp made for it earlier in the same command, also
     when TMPDIR is relocated under the harness; NEG-2: real WAL and transcript deletes stay blocked, including through a
