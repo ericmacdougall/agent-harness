@@ -735,6 +735,9 @@ def _gh_merge(args, in_xargs, ctx, cwd):
         last = endpoint.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
         if re.search(r"[$`]", last) or (re.search(r"[$`]", endpoint) and last == "merge"):
             return [Merge("unverifiable", reason="the gh api endpoint is built at run time and the method writes")]
+        ref_write = _ref_write(endpoint, method, fields, names, repo_ok)
+        if ref_write:
+            return ref_write
         m = re.match(r"^repos/([^/]+)/([^/]+)/pulls/(\d+)/merge/?(?:\?.*)?$", endpoint)
         if m:
             slug = None if "{" in m.group(1) or "{" in m.group(2) else m.group(1) + "/" + m.group(2)
@@ -744,6 +747,39 @@ def _gh_merge(args, in_xargs, ctx, cwd):
         if re.match(r"^repos/[^/]+/[^/]+/merges/?$", endpoint):
             return [Merge("unverifiable", reason="the branch merge endpoint has no pull request to check")]
     return []
+
+
+REF_WRITE = re.compile(r"^repos/([^/]+)/([^/]+)/git/(refs|tags)(?:/(.*))?$")
+
+
+def _ref_write(endpoint, method, fields, names, repo_ok):
+    """gh api POST/PATCH/PUT on git/refs or git/tags that creates or moves a TAG (goodqa#14909).
+
+    Why: on 2026-11-07 a tag backup-pin/lanes-9cbdd16 was created through the REST refs API and pulled the whole
+    pre-rewrite history (46,823 commits, +2.3 GB) back into every fresh clone. A client-side pre-push hook never sees
+    the REST API. Rule: the tag's sha must be a literal full sha that is an ancestor of origin/main of the repository
+    in the working directory. Deletes are never blocked. Branch refs are out of scope (feature branches are routine)."""
+    m = REF_WRITE.match(endpoint.split("?")[0].rstrip("/"))
+    if not m or method not in ("POST", "PATCH", "PUT"):
+        return []
+    slug = None if "{" in m.group(1) or "{" in m.group(2) else m.group(1) + "/" + m.group(2)
+    kind, tail = m.group(3), m.group(4) or ""
+    refs = [f.split("=", 1)[1] for f in fields if f.startswith("ref=")]
+    shas = [f.split("=", 1)[1].lower() for f in fields if f.startswith(("sha=", "object="))]
+    if kind == "tags":  # annotated tag object: always a tag
+        is_tag = True
+    elif tail:
+        is_tag = tail.startswith("tags/") or tail.startswith("refs/tags/") or re.search(r"[$`]", tail) is not None
+    else:
+        is_tag = any(r.startswith("refs/tags/") or re.search(r"[$`]", r) for r in refs)
+        if not refs and "--input" in names:
+            is_tag = True  # body hidden: cannot prove it is a branch
+    if not is_tag:
+        return []
+    if "--input" in names or not shas or len(shas) != 1 or not SHA.match(shas[0]):
+        return [Merge("ref_write", slug=slug, repo_ok=repo_ok,
+                      reason="a tag write through the GitHub refs API must carry one literal full sha (-f sha=<40 hex>) so it can be checked")]
+    return [Merge("ref_write", slug=slug, head_vals=shas, repo_ok=repo_ok)]
 
 
 def _graphql_merge(flags, rest, fields, cwd, ctx_command=None):
@@ -1421,6 +1457,36 @@ def _resolve_graphql(client, node_ids):
     return m.group(1) + "/" + m.group(2), int(m.group(3))
 
 
+def _git_out(cwd, *args):
+    try:
+        done = subprocess.run(["git", *args], cwd=cwd or None, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def allow_ref_write(sha, slug, cwd):
+    if not cwd or not os.path.isdir(cwd):
+        return False, "cannot check the tag target: the working directory is unknown; run from a checkout of the repository"
+    if _git_out(cwd, "rev-parse", "--git-dir") is None:
+        return False, "cannot check the tag target: the working directory is not a git checkout"
+    if slug:
+        remotes = _git_out(cwd, "remote", "-v") or ""
+        if slug.lower() not in remotes.lower():
+            return False, f"the working directory is not a checkout of {slug}; run from one so the target can be checked"
+    if _git_out(cwd, "cat-file", "-e", sha + "^{commit}") is None:
+        return False, f"{sha[:12]} is not a commit in this checkout; fetch it first so it can be checked"
+    for base in ("refs/remotes/origin/main", "refs/heads/main"):
+        if _git_out(cwd, "rev-parse", "--verify", "-q", base) is None:
+            continue
+        done = subprocess.run(["git", "merge-base", "--is-ancestor", sha, base], cwd=cwd, capture_output=True, timeout=20)
+        if done.returncode == 0:
+            return True, ""
+        return False, (f"{sha[:12]} is not an ancestor of {base.rsplit('/', 1)[-1]}: a tag there can pin history that is not in "
+                       "main (the 2026-11 repo-size incident). Merge the work into main first, or keep the pin outside the repo (bundle)")
+    return False, "cannot check the tag target: no origin/main or main in this checkout"
+
+
 def evaluate_merge(merge, client, state_dir, now, command_hash):
     """Return (allowed, text, audit_info). Never raises GateError."""
     info = {"repo": None, "pr": None, "head": None}
@@ -1429,6 +1495,15 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
     try:
         if merge.kind == "unverifiable":
             raise GateError(merge.reason or "the merge cannot be tied to one pull request")
+        if merge.kind == "ref_write":
+            if merge.reason:
+                raise GateError(merge.reason)
+            if not merge.repo_ok:
+                raise GateError("the repository cannot be determined (a cd, ssh, GH_REPO or GH_HOST changes it): run the tag write from the checkout")
+            ok, why = allow_ref_write(merge.head_vals[0], merge.slug, client.cwd)
+            if not ok:
+                raise GateError(why)
+            return True, "", info
         if not merge.repo_ok:
             raise GateError("the repository cannot be determined (a cd, ssh, GH_REPO or GH_HOST changes it): pass "
                             "-R owner/repo or a full PR URL")
