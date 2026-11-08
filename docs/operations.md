@@ -1226,6 +1226,15 @@ Coexistence with the hand-installed script: it keeps its own lock directories (`
 
 Behaviour changes from the hand-installed script: lock takeover by rename (and only for a dead or non-log-backup holder or a lock over 24 h old), skip marker, primary-source rule, anchored excludes check, remote type check and pin, extended excludes, retries, rclone timeouts, `RCLONE_*` environment stripped except `RCLONE_CONFIG`.
 
+## Spawning owners from a directory that is not a git repository
+
+The `task-owner` agent type runs in an isolated git worktree, so a session whose cwd is not a repository fails with
+"Cannot create agent worktree: not in a git repository and no WorktreeCreate hooks are configured" (goodqa#15320).
+Workaround: from such a cwd, spawn `general-purpose` owners and tell each to create its own worktree under the session
+work directory (`git -C <repo> worktree add -b <branch> ~/.agent-harness/work/<session>/<task>/wt <base>`). A
+`WorktreeCreate` hook is deliberately not installed: it replaces Claude's worktree logic for every worktree, including
+owners already working in real repositories, and Claude never auto-removes the worktrees such a hook makes for subagents.
+
 ## Design limits
 
 The policy is intentionally risk-scaled. The small fix path skips worktrees and review loops. A normal code task gets only relevant tests and documents. The agents must not infer that the presence of a test or a reviewer PASS proves quality. Independent checks, reviewer availability, UI tool access and remote permissions vary by environment; handoffs must say exactly what ran and what did not.
