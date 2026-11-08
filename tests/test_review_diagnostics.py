@@ -949,7 +949,7 @@ class RedTeamRound1Tests(unittest.TestCase):
         self.assertNotIn(diag['code'], ('EXEC_NOT_FOUND', 'EXEC_UNTRUSTED'))
         source = (HOOKS / 'peer_review.py').read_text()
         lease = source.index('store.acquire_pool(provider, pool, run_record.run_id)')
-        lookup = source.index('diagnostics.discover_executable(\n                provider')
+        lookup = source.index('diagnostics.discover_executable(\n                    provider')
         self.assertLess(lookup, lease, 'the executable must be resolved before the pool lease can raise')
 
     # W7: invisible format characters are stripped and the WAL placeholder is shell-safe.

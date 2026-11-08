@@ -723,6 +723,27 @@ class ReviewFailure(OSError):
         self.outcome, self.source = outcome, source
 
 
+KIMI_LIMITS = ("\n\nTransport limit: this reviewer has no repository or tool access. Judge only the packet text above and "
+               "say plainly what the packet does not let you verify.")
+
+
+def kimi_attempt(prompt):
+    """One tool-less Kimi (subscription CLI) call, shaped like a provider launch: (code, stdout, stderr)."""
+    try:
+        import kimi_review as kimi
+    except ImportError:
+        return 127, '', 'HARNESS_PROVIDER_UNAVAILABLE'
+    try:
+        result = kimi.review_text(prompt + KIMI_LIMITS, label='review prompt')
+    except kimi.QuotaExhausted:
+        return 1, '', 'Error: ACCOUNT_QUOTA_EXCEEDED'
+    except kimi.LoginRequired:
+        return 1, '', 'Error: AUTHENTICATION_REQUIRED'
+    except kimi.KimiError as error:  # egress refusal, cap, timeout: no result and no fallback after this
+        return 1, '', diagnostics.sanitize(error)
+    return 0, result['text'], ''
+
+
 def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, content: str, options=None):
     options = options or {}
     verdict = ("Begin exactly VERDICT: PASS or VERDICT: BLOCK." if stage == 'pr' else
@@ -757,6 +778,9 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
     claude_entry = ('claude', 'Claude %s %s (rung %s)' % (claude_model, effort, rung), options.get('fallback_pool', 'default'))
     # The tier table picks the primary; the other harness at the same rung is the one authorized fallback.
     order = (codex_entry, claude_entry) if selection['harness'] == 'openai' else (claude_entry, codex_entry)
+    if options.get('secondary') == 'kimi':
+        # The one authorized independent fallback is Kimi (subscription CLI) instead of the other harness.
+        order = (order[0], ('kimi', 'Kimi kimi-code/k3.1-pro (subscription CLI)', 'kimi'))
     primary = order[0][0]
     for provider, source, pool in order:
         remaining = deadline - time.monotonic()
@@ -766,37 +790,43 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         leased = False
         resolution, code, stdout, stderr = None, None, '', ''
         try:
-            # Resolve before the lease, so a lease refusal is reported with its own reason, not as a missing CLI.
-            roots = diagnostics.untrusted_roots(repo=options.get('repo'), snapshot=snapshot)
-            _CHILD_PATH_ROOTS[:] = sorted(set(_CHILD_PATH_ROOTS) | set(roots))
-            resolution = (options.get('resolutions') or {}).get(provider) or diagnostics.discover_executable(
-                provider, policy=review_policy(), roots=roots)
-            if store is not None:
-                store.acquire_pool(provider, pool, run_record.run_id)
-                leased = True
-            if not resolution['path']:
-                outcome = normalize_provider(provider, 127, '', 'HARNESS_PROVIDER_UNAVAILABLE')
+            if provider == 'kimi':
+                resolution = {'path': 'kimi_review.py'}
+                options['launches'] += 1
+                code, stdout, stderr = kimi_attempt(prompt)
+                outcome = normalize_provider('kimi', code, stdout, stderr, '', stage)
             else:
-                with tempfile.TemporaryDirectory() as temp:
-                    last = Path(temp) / 'last.txt'
-                    if provider == 'codex':
-                        cmd = [resolution['path'], 'exec', '--ephemeral', '--json', '--model', codex_model,
-                               '-c', 'model_reasoning_effort=' + effort, '--sandbox', 'read-only',
-                               '--cd', str(snapshot), '--output-last-message', str(last), '-']
-                    else:
-                        cmd = [resolution['path'], '--print', '--safe-mode', '--restricted', '--model', claude_model,
-                               '--effort', effort, '--max-budget-usd', str(selection.get('review_budget_usd') or 5),
-                               '--no-session-persistence', '--output-format', 'json', '--system-prompt', REVIEW_SYSTEM, '-']
-                    timeout = min(timeout, deadline - time.monotonic())
-                    if timeout <= 0:
-                        outcome = {**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}
-                    else:
-                        options['launches'] += 1
-                        # The child is recorded for the usage guard's liveness rule when a run record exists.
-                        code, stdout, stderr = run(cmd, prompt, snapshot, timeout,
-                                                   **({'on_spawn': run_record.note_child} if run_record else {}))
-                        last_message = last.read_text(errors='replace') if last.exists() else ''
-                        outcome = normalize_provider(provider, code, stdout, stderr, last_message, stage)
+                # Resolve before the lease, so a lease refusal is reported with its own reason, not as a missing CLI.
+                roots = diagnostics.untrusted_roots(repo=options.get('repo'), snapshot=snapshot)
+                _CHILD_PATH_ROOTS[:] = sorted(set(_CHILD_PATH_ROOTS) | set(roots))
+                resolution = (options.get('resolutions') or {}).get(provider) or diagnostics.discover_executable(
+                    provider, policy=review_policy(), roots=roots)
+                if store is not None:
+                    store.acquire_pool(provider, pool, run_record.run_id)
+                    leased = True
+                if not resolution['path']:
+                    outcome = normalize_provider(provider, 127, '', 'HARNESS_PROVIDER_UNAVAILABLE')
+                else:
+                    with tempfile.TemporaryDirectory() as temp:
+                        last = Path(temp) / 'last.txt'
+                        if provider == 'codex':
+                            cmd = [resolution['path'], 'exec', '--ephemeral', '--json', '--model', codex_model,
+                                   '-c', 'model_reasoning_effort=' + effort, '--sandbox', 'read-only',
+                                   '--cd', str(snapshot), '--output-last-message', str(last), '-']
+                        else:
+                            cmd = [resolution['path'], '--print', '--safe-mode', '--restricted', '--model', claude_model,
+                                   '--effort', effort, '--max-budget-usd', str(selection.get('review_budget_usd') or 5),
+                                   '--no-session-persistence', '--output-format', 'json', '--system-prompt', REVIEW_SYSTEM, '-']
+                        timeout = min(timeout, deadline - time.monotonic())
+                        if timeout <= 0:
+                            outcome = {**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}
+                        else:
+                            options['launches'] += 1
+                            # The child is recorded for the usage guard's liveness rule when a run record exists.
+                            code, stdout, stderr = run(cmd, prompt, snapshot, timeout,
+                                                       **({'on_spawn': run_record.note_child} if run_record else {}))
+                            last_message = last.read_text(errors='replace') if last.exists() else ''
+                            outcome = normalize_provider(provider, code, stdout, stderr, last_message, stage)
         except GuardError as error:
             outcome = {**provider_failure({}), 'reason': error.reason,
                        'fallback_allowed': error.reason in {'QUOTA', 'AUTH'}}
@@ -979,6 +1009,9 @@ def main() -> int:
     parser.add_argument('--repeat-reason', help='Spend at most one additional declared attempt with a reason')
     parser.add_argument('--pool', default='default', help='Opaque Codex auth-pool alias; never a credential')
     parser.add_argument('--fallback-pool', default='default', help='Opaque independent Claude auth-pool alias')
+    parser.add_argument('--secondary', choices=('default', 'kimi'), default='default',
+                        help="Authorized independent fallback: 'default' is the other harness; 'kimi' is the user's "
+                             "Kimi subscription via kimi_review.py (tool-less, egress-gated, packet text only)")
     parser.add_argument('--owner', default='peer-review', help='Safe owner identifier for execution receipts')
     parser.add_argument('--base', help='PR base for the commit-policy range check (default origin/HEAD or origin/main)')
     parser.add_argument('--task', help='Ladder task key: the author rung comes from its ledger and the receipt is recorded there')
@@ -1159,7 +1192,7 @@ def main() -> int:
             print('Review refused: reviewer rung %s needs user permission recorded for the task by approve-top '
                   '(--task with a ledger permission); --author-rung alone is not a record' % selection['rung'], file=sys.stderr)
             return 2
-    options = {'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
+    options = {'secondary': args.secondary, 'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
                'selection': selection, 'author_rung': author_rung, 'permission': permission,
                'codex_model': policy['rungs'][selection['rung']]['models']['openai'],
                'claude_model': policy['rungs'][selection['rung']]['models']['claude']}
@@ -1184,7 +1217,7 @@ def main() -> int:
             invocation = invocation_identity(subject, purpose='peer-review-' + args.stage,
                 argv=['peer_review', args.stage, options['codex_model'], options['claude_model'], selection['effort'],
                       selection['rung'], selection['harness'], args.pool, args.fallback_pool,
-                      '--snapshot-base', base or 'none',
+                      '--snapshot-base', base or 'none', '--secondary', args.secondary,
                       # The effective review policy (shipped or override) changes discovery and quota classification.
                       '--review-policy', hashlib.sha256(json.dumps(review_policy(), sort_keys=True).encode()).hexdigest()],
                 cwd=repo,

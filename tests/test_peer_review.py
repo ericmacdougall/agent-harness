@@ -824,6 +824,66 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         self.assertEqual(self.output.read_text(), 'VERDICT: PASS\nstale')
         self.assertFalse(capture.exists())
 
+    # -- Kimi as the authorized independent fallback (goodqa#15201) -------------------------------------
+
+    def kimi_env(self, mode='ok'):
+        """A fake `kimi` CLI that logs launches and answers with a stage verdict; never the real subscription."""
+        binary = self.root / 'kimibin' / 'kimi'
+        binary.parent.mkdir(exist_ok=True)
+        binary.write_text(f'''#!{sys.executable}
+import json, os, sys
+from pathlib import Path
+with open(os.environ['PROVIDER_LAUNCH_LOG'], 'a') as stream: stream.write('kimi\\n')
+prompt = next(a for a in sys.argv if a.startswith('--prompt='))
+if os.environ.get('FAKE_KIMI_MODE') == 'quota':
+    sys.stderr.write('rate limit: plan quota exhausted\\n'); sys.exit(1)
+print(json.dumps({{'role': 'assistant', 'content': 'VERDICT: PASS\\nKimi reviewed the packet.'}}))
+''')
+        binary.chmod(0o700)
+        return {'KIMI_REVIEW_BIN': str(binary), 'KIMI_REVIEW_HOME': str(self.root / 'kimi-home'),
+                'FAKE_KIMI_MODE': mode, 'HOME': str(self.root)}
+
+    QUOTA = json.dumps({'type': 'turn.failed', 'error': {'code': 'insufficient_quota'}})
+
+    def test_secondary_kimi_replaces_the_other_harness_as_the_one_fallback(self):
+        launches = self.root / 'launches'
+        result = self.invoke(extra=['--secondary', 'kimi'], env={
+            'PROVIDER_LAUNCH_LOG': str(launches), 'CODEX_EVENTS': self.QUOTA, **self.kimi_env()})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(launches.read_text().splitlines(), ['codex', 'kimi'])  # claude is never launched
+        report = self.output.read_text()
+        self.assertIn('Kimi', report)
+        self.assertIn('Kimi reviewed the packet.', report)
+
+    def test_secondary_kimi_is_not_called_when_the_primary_answers(self):
+        launches = self.root / 'launches'
+        result = self.invoke(extra=['--secondary', 'kimi'], env={'PROVIDER_LAUNCH_LOG': str(launches), **self.kimi_env()})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(launches.read_text().splitlines(), ['codex'])
+
+    def test_default_fallback_is_unchanged_without_the_flag(self):
+        launches = self.root / 'launches'
+        result = self.invoke(env={'PROVIDER_LAUNCH_LOG': str(launches), 'CODEX_EVENTS': self.QUOTA, **self.kimi_env()})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(launches.read_text().splitlines(), ['codex', 'claude'])
+
+    def test_kimi_quota_ends_the_review_with_no_loop_and_no_signoff(self):
+        launches = self.root / 'launches'
+        result = self.invoke(extra=['--secondary', 'kimi'], env={
+            'PROVIDER_LAUNCH_LOG': str(launches), 'CODEX_EVENTS': self.QUOTA, **self.kimi_env('quota')})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(launches.read_text().splitlines(), ['codex', 'kimi'])
+        self.assertFalse(self.output.exists())
+
+    def test_egress_gate_blocks_the_kimi_fallback_before_launch(self):
+        launches = self.root / 'launches'
+        self.packet.write_text('Scope mentions the yates deployment.\n')
+        result = self.invoke(extra=['--secondary', 'kimi'], env={
+            'PROVIDER_LAUNCH_LOG': str(launches), 'CODEX_EVENTS': self.QUOTA, **self.kimi_env()})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(launches.read_text().splitlines(), ['codex'])  # kimi refused by the gate, never launched
+        self.assertFalse(self.output.exists())
+
     def test_both_reviewers_failing_leave_fresh_path_absent(self):
         result = self.invoke(env={'CODEX_EXIT': '7', 'CLAUDE_EXIT': '8'})
         self.assertEqual(result.returncode, 2)
