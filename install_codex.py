@@ -44,7 +44,7 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     # Dropped-owner gate on Codex Stop and its reads (goodqa#14791 P18)
                     'dropped_gate.py', 'ah.py', 'liveness.py',
                     # Heavy-job guard (goodqa#14817): keeps large copies, suites and builds off the Mac for Codex too.
-                    'heavy_job_guard.py', 'resource_limits.json')
+                    'heavy_job_guard.py', 'dropbox_budget.conf', 'resource_limits.json')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 

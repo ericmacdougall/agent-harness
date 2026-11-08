@@ -2383,8 +2383,8 @@ def host_label() -> str:
 
 
 def run(raw: bytes, modes=None, lane_only=False) -> int:
-    """lane_only (off the Mac): only rclone commands are analysed, and the Mac's heavy-job count and hourly hatch
-    limit are not applied, because they guard the Mac's own capacity (review M1, M3 on goodqa#15246)."""
+    """lane_only (off the Mac): only rclone commands are analysed, and the Mac's heavy-job count is not applied,
+    because it guards the Mac's own capacity (review M1, M3 on goodqa#15246). The hourly hatch limit still applies."""
     import json
     try:
         payload = parse_payload(raw)
@@ -2454,11 +2454,15 @@ def run(raw: bytes, modes=None, lane_only=False) -> int:
                              f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on dev2 (ssh dev2 '<command>').\n"))
             log_event({"event": "deny-concurrency", "rule": decision["rule"]})
             return 2
-        allowed, uses = (True, None) if lane_only else record_hatch_use(owner, hatch_limit())
+        # The hourly count applies on every host: off the Mac it is the only brake on hatching around the shared
+        # Dropbox write budget (PR #132 delta N1).
+        allowed, uses = record_hatch_use(owner, hatch_limit())
         if not allowed:
+            where = ("More than that is heavy work on the Mac: run it on dev2/T2 (ssh dev2 '<command>') or raise the "
+                     "budget in the run kit." if not lane_only else
+                     "Wait for the hour to pass, or use the one throttled lane without the hatch.")
             sys.stderr.write(routed(f"Heavy-job guard: {HATCH} was already used {uses} time(s) in the last hour by this owner "
-                             f"(limit {hatch_limit()}). More than that is heavy work on the Mac: run it on dev2/T2 "
-                             "(ssh dev2 '<command>') or raise the budget in the run kit.\n"))
+                             f"(limit {hatch_limit()}). {where}\n"))
             log_event({"event": "deny-hatch-limit", "rule": decision["rule"]})
             ring_event(f"heavy:hatch:{owner}", "warning", f"{owner} exceeded the {HATCH} limit ({uses}/h)",
                        dict(copy_event_detail(payload, decision), hatch_uses_1h=uses))

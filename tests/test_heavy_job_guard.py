@@ -276,7 +276,15 @@ class Classification(unittest.TestCase):
             if expect_calls:
                 self.assertEqual((code, calls), (2, ["jobs", "jobs"]), platform)  # 5 live jobs: refused on the Mac
             else:
-                self.assertEqual((code, calls), (0, []), platform)
+                self.assertEqual((code, calls), (0, ["hatch"]), platform)  # delta N1: the hourly count still holds
+        # delta N1: a second same-owner hatch inside the hour is refused off the Mac too (real counter, scratch HOME)
+        home = tempfile.mkdtemp()
+        with unittest.mock.patch.dict(os.environ, {"HOME": home}), \
+                unittest.mock.patch.object(guard, "hatch_limit", lambda: 1), \
+                unittest.mock.patch.object(guard, "log_hatch_to_wal", lambda *a: None), \
+                unittest.mock.patch.object(guard, "ring_event", lambda *a, **k: None):
+            self.assertEqual(run_main("linux", hatched), 0)
+            self.assertEqual(run_main("linux", hatched), 2)
         # Review M3: off the Mac a command without rclone is never analysed (no sizing lookups at all).
         with unittest.mock.patch.object(guard, "decide", side_effect=lambda *a: calls.append("decide")):
             calls = []
