@@ -546,8 +546,8 @@ def _literal_args(args):
 
 
 def _unquoted_expansion(text):
-    """True when the raw command has a $ or glob character outside quotes: its expansion is split into words that the
-    hook cannot see (delta review N1)."""
+    """True when the raw command has a $, glob or brace character outside quotes: its expansion is split into words
+    that the hook cannot see (delta review N1; main's closure check: {--output=/f,--oneline} is brace expansion)."""
     state, i = None, 0
     while i < len(text):
         c = text[i]
@@ -557,7 +557,7 @@ def _unquoted_expansion(text):
         if state is None:
             if c in "'\"":
                 state = c
-            elif c in "$*?[":
+            elif c in "$*?[{}":
                 return True
         elif c == state:
             state = None

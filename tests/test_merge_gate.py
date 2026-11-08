@@ -979,6 +979,21 @@ class FalsePositives15122(Base):
                 code, text = mg.decide(bash(command, **self.SUB), FakeGh(SCENARIOS["green"]), self.state)
                 self.assertEqual(code, 0, text)
 
+    def test_main_closure_brace_expansion_next_to_git_stays_blocked(self):
+        # main's closure check of 684b5b4: bash expands {a,b} into separate words, so an option can hide in a brace.
+        for command in ('git log {--output=/tmp/x,--oneline} --grep "merge_gate.py waive"',
+                        "git grep -n {-O/p,-e} 'merge_gate waive'", "gh pr view {5,--web} # merge_gate waive",
+                        "git log {--outp..--oneline} --grep 'merge_gate waive'"):
+            with self.subTest(command):
+                code, text = mg.decide(bash(command, **self.SUB), FakeGh(SCENARIOS["green"]), self.state)
+                self.assertEqual(code, 2, text)
+        # a tilde expands to a home path, never to an option
+        for command in ("git -c core.hooksPath=/dev/null add ~/notes.md # merge_gate waive",
+                        "git log --grep 'merge_gate waive' -- ~/r", "git log --format='{x}' --grep 'merge_gate waive'"):
+            with self.subTest(command):
+                code, text = mg.decide(bash(command, **self.SUB), FakeGh(SCENARIOS["green"]), self.state)
+                self.assertEqual(code, 0, text)
+
     def test_ac2_subagent_free_text_about_the_exception_record_is_allowed(self):
         for command in ("python3 ~/.claude/hooks/wal_note.py --wal /w/a.jsonl --event status "
                         "--note 'fixed the merge_gate.py waive false positive'",
