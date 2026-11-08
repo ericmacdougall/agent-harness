@@ -1120,6 +1120,95 @@ class OverwriteExistingTests(Fixture):
         self.assertEqual(self.decide('echo x > @HOME@/.claude/many/nomatch-*', cwd='@TASK@')[0], 'allow')
 
 
+class TempFiles15122(Fixture):
+    """goodqa#15122 AC-1: a command may remove or overwrite the file mktemp made for it earlier in the same command, also
+    when TMPDIR is relocated under the harness; NEG-2: real WAL and transcript deletes stay blocked, including through a
+    variable, a reassigned temp variable, a symlink made in the command, or a TMPDIR that points at protected logs."""
+
+    def env(self, tmpdir):
+        patch = mock.patch.dict(os.environ, {'TMPDIR': tmpdir})
+        patch.start()
+        self.addCleanup(patch.stop)
+        os.environ.pop('CLAUDE_CODE_TMPDIR', None)
+
+    def setUp(self):
+        self.relocated = self.home / '.agent-harness/scratch/c/u/s/tmp'
+        self.relocated.mkdir(parents=True, exist_ok=True)
+        self.env(str(self.relocated))
+
+    ALLOWED = ['T=$(mktemp); echo x > "$T"; rm -f "$T"',
+               'T=$(mktemp); ssh-keyscan h > "$T"; rm -f "$T"',
+               'T="$(mktemp -t hk)"; cat "$T"; rm "$T"',
+               'D=$(mktemp -d); touch "$D/a"; rm -rf "$D"',
+               'P=$(mktemp "$TMPDIR/pc.XXXXXX"); openssl s_client -connect h:443 > "$P" 2>&1; rm -f "$P"',
+               'T=$(mktemp -d -t hk.XXXXXX); echo k > "${T}/keys"; rm -rf "${T}"']
+
+    BLOCKED = ['rm -f @HOME@/.claude/wals/s/main.jsonl',
+               'W=@HOME@/.claude/wals/s/main.jsonl; rm -f "$W"',
+               'T=$(mktemp); T=@HOME@/.claude/wals/s/main.jsonl; rm -f "$T"',
+               'T=$(mktemp); [ -n x ] && T=@HOME@/.claude/wals/s/main.jsonl; rm -f "$T"',
+               'T=$(mktemp); eval "T=@HOME@/.claude/wals/s/main.jsonl"; rm -f "$T"',
+               'T=$(mktemp); read T; rm -f "$T"',
+               'T=$(mktemp); ln -sfn @HOME@/.claude/wals/s "$T"; rm -rf "$T"/',
+               'T=$(mktemp -d); ln -s @HOME@/.claude/wals "$T/w"; rm -rf "$T/w/"',
+               'T=$(mktemp); rm -rf "$T/../../.."',
+               'T=$(mktemp -p @HOME@/.claude/wals); rm -f "$T"',
+               'T=$(mktemp @HOME@/.claude/projects/p/XXXXXX); rm -f "$T"',
+               'T=$(mktemp); rm -f "$T" @HOME@/.claude/projects/p/a.jsonl',
+               'T=$(mktemp); rm -f "$T"*',
+               'export TMPDIR=@HOME@/.claude/wals; T=$(mktemp); rm -f "$T"',
+               'T=$(mktemp $X); rm -f "$T"',
+               'T=$(mktemp)/x; rm -f "$T"',
+               'T=$(mktemp); python3 mk.py "$T"; rm -rf "$T"',
+               'T=$(mktemp); mv x "$T"; echo y > "$T"; rm -f "$T"',
+               'T=$(mktemp); export T; rm -f "$T"',
+               'T=$(mktemp -d); rm -rf "$T/a/b"',
+               'T=$(mktemp -d); /bin/ln -s @HOME@/.claude/wals "$T/w"; rm -rf "$T/w"']
+
+    def test_ac1_own_mktemp_file_with_relocated_tmpdir_is_allowed(self):
+        self.expect(self.ALLOWED, 'allow', label='AC-1 mktemp')
+
+    def test_ac1_script_removing_its_own_mktemp_file_is_allowed(self):
+        script = self.home / '.agent-harness/work/S/T/hostkeys.sh'
+        script.write_text('#!/bin/bash\nset -eu\nT=$(mktemp)\nssh-keyscan h > "$T"\ncut -d" " -f2- "$T"\nrm -f "$T"\n')
+        self.expect(['bash @TASK@/hostkeys.sh'], 'allow', label='AC-1 script')
+
+    def test_neg2_wal_and_transcript_deletes_stay_blocked(self):
+        self.expect(self.BLOCKED, 'block', label='NEG-2')
+
+    def test_neg2_tmpdir_that_points_at_protected_logs_blocks(self):
+        self.env(str(self.home / '.claude/wals'))
+        self.expect(['T=$(mktemp); rm -f "$T"'], 'block', label='NEG-2 TMPDIR in wals')
+        link = self.home / '.agent-harness/work/S/T/tmplink'
+        if not link.is_symlink():
+            link.symlink_to(self.home / '.claude/wals')
+        self.env(str(link))
+        self.expect(['T=$(mktemp); rm -f "$T"'], 'block', label='NEG-2 TMPDIR symlink to wals')
+        self.env(str(self.relocated))
+        os.environ['CLAUDE_CODE_TMPDIR'] = str(self.home / '.claude/projects')
+        self.expect(['T=$(mktemp); rm -f "$T"'], 'block', label='NEG-2 CLAUDE_CODE_TMPDIR in transcripts')
+        os.environ.pop('CLAUDE_CODE_TMPDIR', None)
+        self.expect(["bash -c 'T=$(mktemp); echo x > \"$T\"; rm -f \"$T\"'"], 'allow', label='AC-1 bash -c')
+
+    def expect(self, rows, want, ps=False, label=''):
+        return super().expect([{'cmd': r, 'cwd': '@TASK@'} for r in rows], want, ps=ps, label=label)
+
+
+class SafeAlternatives15122(Fixture):
+    """goodqa#15122: the rclone config block suggested `rclone config file`, a form the guard itself blocks. Every
+    command a block message names as the safe alternative must be allowed."""
+
+    def test_rclone_config_block_names_only_allowed_alternatives(self):
+        verdict, message = self.decide('rclone config show dropbox:')
+        self.assertEqual(verdict, 'block')
+        self.assertNotIn('rclone config file (path only)', message)
+        for safe in ('rclone listremotes', 'rclone lsd dropbox:',
+                     'python3 @HOME@/.claude/hooks/command_guard.py doctor'):
+            with self.subTest(safe):
+                self.assertIn(safe.split('@HOME@/.claude/hooks/')[-1], message)
+                self.assertEqual(self.decide(safe)[0], 'allow', safe)
+
+
 class GuardCompositionTests(unittest.TestCase):
     """The command guard and the heavy-job guard (#53) both classify Bash commands. They are separate hook groups
     and decide independently: neither one's allow, hatch or crash policy can override the other's block."""

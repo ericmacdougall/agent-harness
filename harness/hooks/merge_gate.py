@@ -262,6 +262,367 @@ def _strip_heredocs(tokens):
     return out
 
 
+LITERAL_ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=([^$`\s;&|()<>{}'\"\\]*)$")
+ANY_ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\+?=")
+VAR_TOKEN = re.compile(r"^\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})$")
+OPENERS, CLOSERS = {"if", "while", "until", "for", "select", "case", "{", "("}, {"fi", "done", "esac", "}", ")"}
+REASSIGNERS = {"for", "select"}
+# Builtins that can assign a name, often through a glued flag (printf -vX, read -aX, declare -n R=X) or a deferred
+# string (trap): any of them makes every name unknown, like eval and source (goodqa#15122 fixture red-team F1).
+OPAQUE_ASSIGNERS = {"eval", "source", ".", "read", "mapfile", "readarray", "declare", "typeset", "local", "let",
+                    "getopts", "printf", "unset", "export", "readonly", "trap", "coproc", "wait"}
+
+
+def _literal_assignments(tokens):
+    """{name: [(token index, value)]} for a NAME=literal that is a statement of its own at top level (start of the
+    command or after ';', never inside a group, loop, branch, function, pipeline or && / || list). A name assigned any
+    other way (substitution, prefix assignment, read, loop variable, unset) maps to None. eval, source or a dot
+    command, or any other builtin that can assign (OPAQUE_ASSIGNERS), anywhere make every name unknown. goodqa#15122
+    AC-3."""
+    out = {}
+    if any(os.path.basename(t) in OPAQUE_ASSIGNERS for t in tokens):
+        return out
+    depth = 0
+    for i, t in enumerate(tokens):
+        if t in OPENERS:
+            depth += 1
+        elif t in CLOSERS:
+            depth -= 1
+        m = ANY_ASSIGN.match(t)
+        if m:
+            name = m.group(1)
+            lit = LITERAL_ASSIGN.match(t)
+            k = i - 1
+            while k >= 0 and tokens[k] not in SEPARATORS and ANY_ASSIGN.match(tokens[k]):
+                k -= 1
+            j = i + 1
+            while j < len(tokens) and tokens[j] not in SEPARATORS and ANY_ASSIGN.match(tokens[j]):
+                j += 1
+            before = tokens[k] if k >= 0 else ";"
+            after = tokens[j] if j < len(tokens) else ";"
+            standalone = lit and depth == 0 and before == ";" and after == ";" and "=" not in t[len(name) + 1:]
+            if standalone and out.get(name, []) is not None:
+                out.setdefault(name, []).append((i, lit.group(2)))
+            else:
+                out[name] = None
+        elif os.path.basename(t) in REASSIGNERS:
+            for x in tokens[i + 1:i + 16]:
+                if x in SEPARATORS:
+                    break
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", x):
+                    out[x] = None
+    return out
+
+
+def _resolve(token, index, assigns):
+    """The literal value of a whole-token $NAME / ${NAME} assigned exactly once, before `index`, by a top-level
+    statement of the same command; None when it cannot be known."""
+    m = VAR_TOKEN.match(token)
+    if not m or not assigns:
+        return None
+    entries = assigns.get(m.group(1) or m.group(2))
+    if not entries or len(entries) != 1 or entries[0][0] >= index:
+        return None
+    return entries[0][1]
+
+
+GIT_VALUE_GLOBALS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"}
+# git subcommands that never run another program from their arguments: a token named gh there is a remote, branch
+# or path (goodqa#15122 AC-4). Others (submodule foreach, bisect run, rebase --exec, alias) keep the gh scan.
+GIT_PLAIN = {"push", "fetch", "pull", "remote", "ls-remote", "clone", "branch", "checkout", "switch", "log", "show",
+             "diff", "status", "tag", "rev-parse", "rev-list", "merge-base", "add", "commit", "restore", "worktree"}
+
+
+def _git_subcommand(seg):
+    """(index, name) of the git subcommand in a segment whose command word is git, else (None, None)."""
+    i = next((j for j, t in enumerate(seg) if os.path.basename(t) == "git"), None)
+    if i is None:
+        return None, None
+    i += 1
+    while i < len(seg):
+        if seg[i] in GIT_VALUE_GLOBALS:
+            i += 2
+        elif seg[i].startswith("-"):
+            i += 1
+        else:
+            return i, seg[i]
+    return None, None
+
+
+PUSH_VALUE_FLAGS = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
+DEFAULT_BRANCHES = {"main", "master"}
+
+
+PUSH_CONFIG = re.compile(r"^(?:alias\.|remote\.[^=]*\.push(?:=|$)|push\.|branch\.[^=]*\.(?:merge|remote|pushremote)(?:=|$))",
+                         re.I)
+
+
+def _git_push_to_default(seg, start, assigns, appended=False):
+    """True for a `git push` that names main or master as a destination, pushes every branch, or names a destination
+    the hook cannot read: that is a merge without a pull request (goodqa#15122 NEG-4). A push to any other named
+    branch is not a merge (AC-4). `seg` starts at the git token, `start` is its index in the full token list."""
+    for j, t in enumerate(seg[:-1]):
+        if t == "--config-env" or (t == "-c" and PUSH_CONFIG.match(seg[j + 1].lstrip("'\""))):
+            return True  # a git alias or push setting given on the command line can push anywhere (red-team F2)
+    k, sub = _git_subcommand(seg)
+    if sub != "push":
+        return False
+    if appended:
+        return True  # xargs / parallel append the refspecs at run time
+    pos, deleting, k = [], False, k + 1
+    while k < len(seg):
+        t = seg[k]
+        if t in ("--all", "--mirror", "--branches"):
+            return True
+        if t in ("-d", "--delete"):
+            deleting = True
+        elif t in PUSH_VALUE_FLAGS:
+            k += 1
+        elif t.startswith("--repo="):
+            pass
+        elif not t.startswith("-"):
+            pos.append(_resolve(t, start + k, assigns) or t)
+        k += 1
+    for spec in pos[1:]:
+        dest = spec.rsplit(":", 1)[-1] if ":" in spec else spec
+        dest = dest.lstrip("+")
+        for prefix in ("refs/", "heads/"):
+            if dest.startswith(prefix):
+                dest = dest[len(prefix):]  # git also reads heads/main as refs/heads/main (red-team F2)
+        if re.search(r"[$`*?\[]", dest) or dest in DEFAULT_BRANCHES or (deleting and spec.lstrip("+") in DEFAULT_BRANCHES):
+            return True
+    return False
+
+
+# rg --pre, ack --pager, less/more and pytest can run programs; they are not free text here.
+FREE_TEXT_COMMANDS = (DATA_COMMANDS - {"less", "more", "pytest", "py.test", "rg", "ag", "ack"}) | \
+    {"cd", "true", "test", "[", "pwd", "date"}
+KEYWORDS = {"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}"}
+REDIRECTS = {"<", ">", ">>", "<<", "<<-", "<<<", ">&", "&>", ">|", "<&", "<>"}
+SPLITTERS = {";", "&&", "||", "|", "|&", "&", "(", ")", ";;"}
+# gh subcommands whose verbs only read or post text; --web/-w (a browser) is refused separately
+GH_TEXT = {"issue": {"comment", "create", "view", "list", "edit", "close", "reopen"},
+           "pr": {"comment", "create", "view", "list", "edit", "checks", "diff", "review", "close", "ready"},
+           "api": None, "search": None}
+SAFE_GIT_CONFIG = {"core.hookspath=/dev/null"}
+SAFE_GIT_GLOBALS = {"--no-pager", "-P"}
+# subcommands that can run hooks (githooks(5): commit hooks, post-index-change, reference-transaction): free text only
+# with core.hooksPath=/dev/null (Opus-xhigh delta review N2)
+GIT_HOOKED = {"commit", "add", "status", "branch", "tag"}
+# options whose next word is taken as text, even when it starts with '-' (a quoted "$( )" body is safe there)
+TEXT_VALUE_FLAGS = {"--body", "-b", "--title", "-t", "--message", "-m", "--note", "--subject"}
+_LOG_LONG = {"--no-ext-diff", "--no-textconv", "--oneline", "--stat", "--name-only", "--name-status", "--format", "--pretty", "--grep", "--author",
+             "--since", "--until", "--all", "--graph", "--decorate", "--reverse", "--first-parent", "--max-count",
+             "--follow", "--date", "--merges", "--no-merges", "--patch", "--abbrev-commit", "--no-color", "--numstat",
+             "--shortstat", "--invert-grep", "--all-match", "--fixed-strings", "--regexp-ignore-case"}
+# Per git subcommand: (exact long options, short flags without a value, short flags that take the rest as value).
+# Anything else (abbreviated or unknown long options, other short flags) is not free text: git accepts unambiguous
+# abbreviations and joined short flags, so a deny-list cannot be complete (goodqa#15122 Opus-high review F1/F2).
+GIT_OPTIONS = {
+    "commit": ({"--message", "--file", "--quiet", "--signoff", "--allow-empty", "--no-edit"}, "aqsv", "mF"),
+    "log": (_LOG_LONG, "pqs", "nSG"),
+    "show": (_LOG_LONG, "pqs", "nSG"),
+    "diff": ({"--stat", "--name-only", "--name-status", "--cached", "--staged", "--numstat", "--shortstat",
+              "--no-color", "--word-diff", "--unified", "--exit-code", "--quiet", "--check", "--no-ext-diff",
+              "--no-textconv"}, "pqsuwRb", "U"),
+    "status": ({"--short", "--branch", "--porcelain", "--untracked-files", "--ignored"}, "sbz", "u"),
+    "add": ({"--all", "--update", "--verbose", "--dry-run", "--intent-to-add"}, "Anuv", ""),
+    "grep": ({"--line-number", "--ignore-case", "--files-with-matches", "--count", "--word-regexp",
+              "--extended-regexp", "--fixed-strings", "--cached", "--untracked", "--no-index", "--heading", "--break",
+              "--quiet", "--invert-match", "--all-match", "--max-depth", "--line-regexp"}, "nilcwEFhHIvqx", "e"),
+    "rev-parse": ({"--abbrev-ref", "--show-toplevel", "--verify", "--short", "--git-dir", "--is-inside-work-tree",
+                   "--symbolic-full-name"}, "q", ""),
+    "branch": ({"--list", "--contains", "--merged", "--no-merged", "--all", "--remotes", "--show-current", "--sort",
+                "--format", "--verbose"}, "alrv", ""),
+    "tag": ({"--list", "--contains", "--points-at", "--sort", "--format"}, "l", "n"),
+}
+
+
+def _git_args_ok(sub, args):
+    """Every option of a git subcommand is on its allow-list; positional words (paths, revisions, patterns) are text."""
+    longs, flags, valued = GIT_OPTIONS[sub]
+    for t in args:
+        if t == "--":
+            return True  # the rest are paths
+        if t.startswith("--"):
+            if t.split("=", 1)[0] not in longs:
+                return False
+        elif t.startswith("-") and len(t) > 1:
+            for j, c in enumerate(t[1:]):
+                if c in valued:
+                    break  # the rest of the word is the value
+                if c not in flags:
+                    return False
+    return True
+HOOK_SCRIPT = re.compile(r"^(?:~|%s)/\.claude/hooks/(?:wal_note|ah|commit_policy|provenance|spec_flow)\.py$"
+                         % re.escape(str(Path.home())))
+# assignments that change which program runs or what it loads
+ENV_RISKY = re.compile(r"^(?:HOME|PATH|ENV|BASH_ENV|IFS|CDPATH|PYTHON\w*|LD_\w+|DYLD_\w+|GIT_\w+|GH_\w+|PAGER|EDITOR|"
+                       r"VISUAL|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|XDG_CONFIG_HOME)\+?=")
+WRITE_REDIRECTS = {">", ">>", ">|", "&>", "<>"}
+
+
+def _waiver_text(text):
+    plain = re.sub(r"[\"'\\$]", "", text)
+    return "merge_gate" in plain.lower() and bool(WAIVE_ANY.search(plain))
+
+
+def _simple_commands(tokens, writes=None):
+    """Split on separators that start a new command; drop each redirection operator with its target word. A redirect
+    whose target is a separator (process substitution) yields an unknown command; `writes` collects file targets."""
+    out, cur, i = [], [], 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t in SPLITTERS:
+            out.append(cur)
+            cur = []
+        elif t in REDIRECTS:
+            target = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if target in SPLITTERS or not target:
+                out.append(["<process-substitution>"])
+            elif writes is not None and (t in WRITE_REDIRECTS or (t == ">&" and not target.isdigit())):
+                writes.append(target)
+            i += 1
+        elif re.match(r"^\d+$", t) and i + 1 < len(tokens) and tokens[i + 1] in REDIRECTS:
+            pass
+        elif re.match(r"^[;&|()<>]+$", t):
+            out.append(["<operator %s>" % t])  # an operator run the splitter does not know (>( or <( substitution)
+        else:
+            cur.append(t)
+        i += 1
+    out.append(cur)
+    return [c for c in out if c]
+
+
+def _free_text(words):
+    """True when a simple command can only print, search or record text: it runs no code given in its arguments."""
+    i = 0
+    while i < len(words) and (words[i] in KEYWORDS or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[i])):
+        i += 1
+    if i == len(words):
+        return True  # assignments only (their values are checked for substitutions by the caller)
+    word, rest = words[i], words[i + 1:]
+    if word == "printf" and any(t.startswith("-v") for t in rest):
+        return False  # printf -v assigns a variable (HOME, PATH)
+    if "/" not in word and word in FREE_TEXT_COMMANDS:
+        return True
+    if word in ("git", "gh") and not _literal_args(rest):
+        return False  # a word the shell builds at run time can become an option (delta review N1)
+    if word == "gh":
+        if any(t.startswith("--web") or (t.startswith("-") and not t.startswith("--") and "w" in t) for t in rest):
+            return False  # opens a browser (also joined short flags such as -cw, delta review N3)
+        plain = [t for t in rest if not t.startswith("-")]
+        if not plain or plain[0] not in GH_TEXT:
+            return False
+        verbs = GH_TEXT[plain[0]]
+        return verbs is None or (len(plain) > 1 and plain[1] in verbs)
+    if word == "git":
+        k, hooks_off = 0, False
+        while k < len(rest) and rest[k].startswith("-"):
+            if rest[k] == "-c" and k + 1 < len(rest) and rest[k + 1].lower() in SAFE_GIT_CONFIG:
+                hooks_off, k = True, k + 2
+            elif rest[k] in SAFE_GIT_GLOBALS:
+                k += 1
+            else:
+                return False  # other -c settings and -C (another repository's config) are not free text
+        if k >= len(rest) or rest[k] not in GIT_OPTIONS:
+            return False
+        if rest[k] in GIT_HOOKED and not hooks_off:
+            return False  # hooks are programs; these subcommands are free text only with core.hooksPath=/dev/null
+        return _git_args_ok(rest[k], rest[k + 1:])
+    if word in ("python3", "python"):
+        return bool(rest) and bool(HOOK_SCRIPT.match(rest[0]))
+    return False
+
+
+def _literal_args(args):
+    """No argument word of git or gh may be built at run time: a word starting with '$' (a variable or substitution
+    that can expand to an option) is allowed only as the value of a text option such as --body; the caller refuses
+    unquoted $ and globs in the raw command."""
+    for j, t in enumerate(args):
+        if t.startswith("$") and not (j and args[j - 1] in TEXT_VALUE_FLAGS and t.startswith("$(")):
+            return False
+    return True
+
+
+def _unquoted_expansion(text):
+    """True when the raw command has a $, glob or brace character outside quotes: its expansion is split into words
+    that the hook cannot see (delta review N1; main's closure check: {--output=/f,--oneline} is brace expansion)."""
+    state, i = None, 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\" and state != "'":
+            i += 2
+            continue
+        if state is None:
+            if c in "'\"":
+                state = c
+            elif c in "$*?[{}":
+                return True
+        elif c == state:
+            state = None
+        i += 1
+    return False
+
+
+def _substitutions(token):
+    """The text of each $( ) or backtick substitution inside one token (tokenize turns backticks into $( )."""
+    out, start = [], token.find("$(")
+    while start != -1:
+        end = token.rfind(")")
+        out.append(token[start + 2:end if end > start else len(token)])
+        start = token.find("$(", end if end > start else len(token))
+    return out
+
+
+def _waiver_attempt(command, _depth=0):
+    """True when the command can run merge_gate's exception record. A subagent command that names merge_gate and an
+    exception word is allowed only when every simple command in it is a known free-text form (print, search, git
+    commit/log, a gh issue/pr body, the harness's own note and ticket helpers) and every $( )
+    substitution inside it is free text too. Anything else keeps the old text rule (goodqa#15122 AC-2, NEG-1;
+    fixture red-team F4: a deny-list of code runners missed awk, sed, find -exec, make and git aliases)."""
+    if not _waiver_text(command):
+        return False
+    if _depth > MAX_DEPTH:
+        return True
+    tokens, crude = tokenize(command.replace("\\\n", ""))
+    if crude or len(tokens) > MAX_TOKENS:
+        return True
+    tokens = _strip_heredocs(tokens)
+    if any(t == "$" for t in tokens):
+        return True  # an unquoted $( ) substitution
+    if any(ENV_RISKY.match(t) for t in tokens):
+        return True  # HOME, PATH, PYTHONPATH and the like change which code a free-text form runs
+    writes = []
+    commands = _simple_commands(tokens, writes)
+    # any git or python word, also after if/while/then (review F1: _command_word does not skip keywords)
+    runs_code = any(os.path.basename(t) in ("git", "python3", "python") for w in commands for t in w)
+    if any(os.path.basename(t) in ("git", "gh") for w in commands for t in w) and \
+            _unquoted_expansion(_strip_comments(command)):
+        return True  # unquoted $ or glob next to git or gh: run-time words can become options (delta review N1)
+    if runs_code and (writes or any(os.path.basename(t) == "tee" for w in commands for t in w)):
+        return True  # a file written next to a git or python run could be the hook or script that runs
+    for words in commands:
+        if not _free_text(words):
+            return True
+        for t in words:
+            if any(_waiver_attempt(inner, _depth + 1) or not _plain_text(inner, _depth + 1) for inner in _substitutions(t)):
+                return True
+    return False
+
+
+def _plain_text(text, depth):
+    """A substitution body that is itself only free-text commands (even when it does not name merge_gate)."""
+    if depth > MAX_DEPTH:
+        return False
+    tokens, crude = tokenize(text.replace("\\\n", ""))
+    if crude or any(t == "$" for t in tokens):
+        return False
+    tokens = _strip_heredocs(tokens)
+    return all(_free_text(w) and all(_plain_text(i, depth + 1) for t in w for i in _substitutions(t))
+               for w in _simple_commands(tokens))
+
+
 def _read_small(path, cwd):
     if not cwd:
         raise GateError("no working directory to resolve a query file")
@@ -318,6 +679,16 @@ def _gh_merge(args, in_xargs, ctx, cwd):
         return []
     words = pos[:2] if pos[0] == "pr" else pos[:1]
     if any(not re.match(r"^[a-z][a-z0-9_-]*$", p) for p in words):
+        # goodqa#15122 AC-3: a subcommand word assigned once from a literal in the same command is read as that word.
+        # A merge reached that way stays unverifiable (NEG-3): only reads are let through.
+        assigns, start = ctx.get("assigns"), ctx.get("args_index", 0)
+        resolved = [(_resolve(t, start + j, assigns) or t) for j, t in enumerate(args)]
+        if resolved != list(args):
+            rpos, _ = _parse_gh_args(resolved)
+            rwords = rpos[:2] if rpos and rpos[0] == "pr" else rpos[:1]
+            if rpos and all(re.match(r"^[a-z][a-z0-9_-]*$", p) for p in rwords) and \
+                    not _gh_merge(resolved, in_xargs, dict(ctx, assigns=None), cwd):
+                return []
         return [Merge("unverifiable", reason="gh subcommand is built at runtime")]
     names = {n for n, _ in flags}
     repo_ok = ctx["implicit_ok"]
@@ -456,6 +827,7 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
     tokens = _strip_heredocs(tokens)
     n = len(tokens)
     base = [os.path.basename(t) for t in tokens]
+    assigns = _literal_assignments(tokens)
     if any(b in ("cd", "pushd", "popd", "chdir", "ssh", "docker", "podman", "kubectl", "su", "tmux", "-C", "--chdir")
            for b in base) or any(t.startswith(("GH_REPO=", "GH_HOST=", "--chdir=")) for t in tokens):
         ctx["implicit_ok"] = False
@@ -480,8 +852,12 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
                     not re.search(r"\s", tokens[i]):
                 found.append(Merge("unverifiable", reason="a gh command glued together at run time"))
                 handled = True
+            if name in ("gh", "gh.exe") and words[index] == "git" and "git" in base[a:i] and \
+                    _git_subcommand(seg)[1] in GIT_PLAIN and _git_subcommand(seg)[0] < i - a and \
+                    not any("alias." in t or t.startswith("!") for t in seg):
+                continue  # `git push gh ...`: a remote, branch or path named gh (goodqa#15122 AC-4)
             if name in ("gh", "gh.exe"):
-                found.extend(_gh_merge(tokens[i + 1:b], seen_xargs, ctx, cwd))
+                found.extend(_gh_merge(tokens[i + 1:b], seen_xargs, dict(ctx, assigns=assigns, args_index=i + 1), cwd))
                 handled = True
             elif name in SHELLS:
                 rest = tokens[i + 1:b]
@@ -510,9 +886,27 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
         if handled:
             continue
         word = words[index]
+        g = next((j for j in range(a, b) if base[j] == "git"), None)
+        if g is not None and word in ("git", "xargs", "parallel"):
+            if _git_push_to_default(tokens[g:b], g, assigns, appended=word != "git"):
+                raw.append(Merge("unverifiable", reason="a git push to main or master (or to every branch, or to a "
+                                                        "branch built at run time) merges without a pull request; "
+                                                        "push a named feature branch and merge the reviewed PR"))
+                continue
         first = next((t for t in seg if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t)
                       and os.path.basename(t) not in WRAPPER_WORDS and not t.startswith("-")), "")
         full_command = " ".join(tokens)
+        if DYNAMIC_WORD.match(first) and sep not in ("|", "|&"):
+            # goodqa#15122 AC-3: a command word assigned once from a literal earlier in the same command is read as
+            # that word; a merge it reaches stays unverifiable (NEG-3), anything else is judged as the plain command.
+            at = a + seg.index(first)
+            value = _resolve(first, at, assigns)
+            if value is not None and value:
+                text = " ".join(shlex.quote(_resolve(t, at + j, assigns) or t) for j, t in enumerate(tokens[at:b]))
+                if find_merges(text, cwd, _depth + 1, ctx):
+                    raw.append(Merge("unverifiable", reason="the command word is built at run time and the command "
+                                                            "mentions gh or a merge"))
+                continue
         if MERGE_HINT.search(full_command) and (DYNAMIC_WORD.match(first) or (
                 word == "eval" and any("$" in t for t in seg[1:]))):
             raw.append(Merge("unverifiable", reason="the command word is built at run time and the command mentions "
@@ -1323,11 +1717,9 @@ def decide(payload, runner, state_dir, now=None):
     plain = re.sub(r"[\"'\\$]", "", command)  # w''aive, $M and escaped spellings
     if STATE_NAMES.search(command) or STATE_NAMES.search(plain):
         return 2, "merge-gate: the waiver, audit and approval files are written only by merge_gate.py itself."
-    if subagent and (STATE_GLOB.search(plain) or ("merge_gate" in plain.lower() and WAIVE_ANY.search(plain))):
+    if subagent and (STATE_GLOB.search(plain) or _waiver_attempt(command)):
         return 2, "merge-gate: only the main agent may record a waiver; ask the main agent."
-    if WAIVE_CMD.search(command):
-        if subagent:
-            return 2, "merge-gate: only the main agent may record a waiver; ask the main agent."
+    if WAIVE_CMD.search(command) and not subagent:
         _stamp_waive(command, payload, state_dir, now)
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
     merges = find_merges(command, cwd=cwd)
