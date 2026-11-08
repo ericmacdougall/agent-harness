@@ -54,6 +54,28 @@ class SiblingAsk(unittest.TestCase):
         self.assertEqual(self.resolve('wfff123456789').returncode, 2)
         self.assertEqual(self.resolve('wdef123456789').returncode, 2)
 
+    def test_red_team_owner_cannot_close_main_or_other_owner_asks(self):
+        self.ask('wmain1234567', self.wals / 'main.jsonl')
+        self.ask('wother123456', self.wals / 'agent-bbb.jsonl')
+        for wal, ref in (('agent-aaa.jsonl', 'wmain1234567'), ('agent-aaa.jsonl', 'wother123456')):
+            done = subprocess.run([sys.executable, str(HOOKS / 'wal_note.py'), '--wal', str(self.wals / wal), '--event', 'ask_resolved',
+                                   '--ref', ref, '--note', 'x', '--source', 'user:%s/%s "yes go ahead with the change"' % (SID, ANSWER_UUID)],
+                                  capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home), HARNESS_PROVENANCE_OFFLINE='1'))
+            self.assertEqual(done.returncode, 2, (wal, ref, done.stdout))
+
+    def test_red_team_second_resolution_is_refused_after_the_wal_grows_past_4_mib(self):
+        self.assertEqual(self.resolve('wabc123456789').returncode, 0)
+        with open(self.wals / 'main.jsonl', 'a') as handle:
+            handle.write(('{"event":"status","note":"%s"}\n' % ('x' * 1000)) * 4500)
+        self.assertGreater((self.wals / 'main.jsonl').stat().st_size, 4 << 20)
+        self.assertEqual(self.resolve('wabc123456789').returncode, 2)
+
+    def test_red_team_symlinked_sibling_wal_does_not_reach_another_session(self):
+        other_main = self.home / '.claude/wals' / OTHER / 'main.jsonl'
+        self.ask('wsym12345678', other_main)
+        (self.wals / 'agent-link.jsonl').symlink_to(other_main)
+        self.assertEqual(self.resolve('wsym12345678').returncode, 2)
+
 
 if __name__ == '__main__':
     unittest.main()

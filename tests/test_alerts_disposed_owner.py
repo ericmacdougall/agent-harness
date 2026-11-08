@@ -47,5 +47,14 @@ class DisposedOwners(unittest.TestCase):
         self.assertEqual(sorted(a['detail']['agent'] for a in got), STILL)
 
 
+class PointEventConfig(unittest.TestCase):
+    def test_red_team_bad_point_event_config_clears_nothing_and_does_not_raise(self):
+        old = {('h', 'ops-watch', 'liveness:abc/agent-x'): {'event': 'raise', 'at': '2026-11-01T00:00:00+00:00', 'seq': 1}}
+        now = time.time()
+        for pe in ({'prefixes': 'liveness:', 'ttl_h': 6}, {'prefixes': [''], 'ttl_h': 6}, {'prefixes': ['heavy:'], 'ttl_h': 'six'},
+                    {'prefixes': ['l'], 'ttl_h': 6}, {'prefixes': None}):
+            self.assertEqual(ow.expire_point_events({'host': 'h', 'point_events': pe}, old, {}, now), [], pe)
+
+
 if __name__ == '__main__':
     unittest.main()

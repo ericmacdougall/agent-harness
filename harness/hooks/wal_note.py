@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import re
 import sys
 import uuid
@@ -100,22 +101,25 @@ def sibling_ask_wal(path, ref: str):
     """goodqa#15319: the stem of the one other WAL of this session (an owner's agent-*.jsonl) that holds `ref` as an ask
     nobody has resolved, in any WAL of the session; else None. Main may then resolve an owner's ask by citing the answer."""
     folder = path.parent
-    holders = []
-    for other in sorted(folder.glob('*.jsonl')):
-        if other == path:
-            continue
-        if open_ask_exists(other, ref):
-            holders.append(other)
+    if path.name != 'main.jsonl':  # red-team F1: only main resolves an owner's ask, never an owner another WAL's ask
+        return None
+    real_folder = os.path.realpath(folder)
+    wals = [w for w in sorted(folder.glob('*.jsonl'))
+            if w.name == 'main.jsonl' or w.name.startswith('agent-')]
+    # red-team F4: a symlinked WAL could point into another session
+    wals = [w for w in wals if not w.is_symlink() and os.path.dirname(os.path.realpath(w)) == real_folder]
+    holders = [w for w in wals if w != path and w.name.startswith('agent-') and open_ask_exists(w, ref)]
     if len(holders) != 1:
         return None
-    for other in sorted(folder.glob('*.jsonl')):  # a resolution anywhere in the session closes it (provenance ledger rule)
+    needle = ref.encode()
+    for other in wals:  # a resolution anywhere in the session closes it (provenance ledger rule)
         try:
-            import safe_input  # noqa: PLC0415
-            for raw in safe_input.read_tail(other, 4 << 20).splitlines():
-                if ref.encode() in raw and b'"ask_resolved"' in raw:
-                    rec = json.loads(raw)
-                    if isinstance(rec, dict) and rec.get('event') == 'ask_resolved' and rec.get('ref') == ref:
-                        return None
+            with open(other, 'rb') as handle:  # red-team F2: the whole file, not a 4 MiB tail
+                for raw in handle:
+                    if needle in raw and b'"ask_resolved"' in raw:
+                        rec = json.loads(raw)
+                        if isinstance(rec, dict) and rec.get('event') == 'ask_resolved' and rec.get('ref') == ref:
+                            return None
         except Exception:  # noqa: BLE001 - unreadable: do not guess that it is open
             return None
     return holders[0].stem

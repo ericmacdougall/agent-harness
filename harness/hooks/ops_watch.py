@@ -1760,7 +1760,15 @@ def expire_point_events(cfg: dict, latest: dict, active: dict, now: float, ring:
 
     The key leaves `active` too: run_once reasserts every active key whose latest ring event is not a raise."""
     pe = cfg.get("point_events") or {}
-    prefixes, ttl = tuple(pe.get("prefixes") or ()), float(pe.get("ttl_h", 6)) * 3600
+    raw_prefixes = pe.get("prefixes") if isinstance(pe, dict) else None
+    # a string would become a tuple of characters, an empty prefix matches every key, a bad ttl would abort the run
+    if not isinstance(raw_prefixes, (list, tuple)) or not all(isinstance(p, str) and len(p) >= 2 for p in raw_prefixes):
+        return []
+    try:
+        ttl = float(pe.get("ttl_h", 6)) * 3600
+    except (TypeError, ValueError):
+        return []
+    prefixes = tuple(raw_prefixes)
     if not prefixes or ttl <= 0:
         return []
     out = []
