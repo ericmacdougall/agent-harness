@@ -219,7 +219,8 @@ def cmd_subagent_stop(payload: dict, now: float | None = None) -> dict:
     seen = state.setdefault("subagent_blocks", {})
     text = (f"Sub-agent {agent} is ending its turn with pending work ({why}) and no armed waiter (goodqa#14791 I7). "
             f"Before stopping: write a handoff or result WAL entry, or name the wait with `ah task dispose --agent {agent} "
-            f"--kind waiting --ref <ask id or GoodQA ticket> --until <ISO>`, or arm a waiter with `ah job wait`.")
+            f"--kind waiting --ref <ask id or GoodQA ticket> --until <ISO>`. Waiting on a background command: watch "
+            f"it with the Monitor tool and record that wait with the same dispose command.")
     if not payload.get("stop_hook_active") and not seen.get(agent):
         seen[agent] = (now or time.time())
         save_state(session, state)

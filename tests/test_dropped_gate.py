@@ -442,6 +442,25 @@ class SubagentStopGate(Base):
         jl(w / "agent-immediate-intent.jsonl", [{"at": iso(NOW), "event": "intent", "note": "still running"}])
         self.assertIsNotNone(dropped_gate.pending_work(self.home, SESSION, "immediate-intent"))
 
+    def test_the_block_message_names_only_commands_that_exist(self):
+        # goodqa#15253: the message told agents to "arm a waiter with `ah job wait`", and ah has no job command
+        import re as _re
+        import shlex as _shlex
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "agent-msgowner.jsonl", [{"at": iso(NOW - 60), "event": "intent", "note": "running the suite"}])
+        with mock.patch.object(dropped_gate, "armed_waiter", return_value=False):
+            text = self.sstop("msgowner").get("reason") or ""
+        self.assertIn("ah task dispose", text)
+        self.assertNotIn("ah job", text)
+        commands = [c for c in _re.findall(r"`([^`]+)`", text) if c.startswith("ah ")]
+        self.assertTrue(commands, text)
+        fill = {"<ask id or GoodQA ticket>": "wa5b00000001", "<ISO>": "2026-11-09T00:00:00Z"}
+        for command in commands:
+            for hole, value in fill.items():
+                command = command.replace(hole, value)
+            with self.subTest(command=command):
+                ah.build_parser().parse_args(_shlex.split(command)[1:])  # SystemExit (a failure) if it does not parse
+
     def test_armed_waiter_does_not_block(self):
         w = self.home / ".claude" / "wals" / SESSION
         jl(w / "agent-jobowner.jsonl", [{"at": iso(NOW - 30), "event": "intent", "note": "suite started under ah-run"}])
