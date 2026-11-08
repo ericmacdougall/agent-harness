@@ -156,6 +156,45 @@ class TicketedFindingTests(unittest.TestCase):
                                            result="CHECK_FAILED")
 
 
+class OwnTicketAndUnticketable(unittest.TestCase):
+    """#134 red-team P3."""
+
+    def test_a_data_loss_finding_labelled_reliability_is_not_ticketed(self):
+        for text in ("migration drops the users table on rollback (data loss)", "token leaks into the log",
+                     "the auth check can be skipped", "deletes the user's worktree"):
+            with self.subTest(text=text):
+                report = "VERDICT: BLOCK\nF1: " + text + "\n" + declaration(category="reliability")
+                out, records, errors = resolve(report)
+                self.assertTrue(out.startswith("VERDICT: BLOCK"), out)
+                self.assertEqual(records, [])
+                self.assertIn("cannot be ticketed", " ".join(errors))
+
+    def test_the_branchs_own_work_ticket_is_refused(self):
+        own = {("goodqa", "goodqa", 42)}
+        out, records, errors = review.resolve_ticketed_findings(
+            "pr", "VERDICT: BLOCK\nF1: minor naming issue\n" + declaration(), head=HEAD, related=RELATED,
+            verifier=open_ticket, own=own)
+        self.assertTrue(out.startswith("VERDICT: BLOCK"), out)
+        self.assertIn("own work ticket", " ".join(errors))
+
+    def test_commit_refs_are_own_and_follow_up_lines_are_related(self):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            for args in (["config", "user.email", "x@example.invalid"], ["config", "user.name", "x"],
+                         ["commit", "-q", "--allow-empty", "-m", "base"]):
+                subprocess.run(["git", "-C", str(repo)] + args, check=True)
+            base = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m",
+                            "fix: x\n\nRefs: GoodQA goodqa#7\nFollow-up: GoodQA goodqa#7\nFollow-up: GoodQA goodqa#8"],
+                           check=True)
+            related, own = review.related_ticket_refs(repo, base)
+        self.assertEqual(own, {("goodqa", "goodqa", 7)})
+        self.assertEqual(related, {("goodqa", "goodqa", 8)})
+
+
 class TicketedMainIntegrationTests(unittest.TestCase):
     def setUp(self):
         import subprocess
@@ -175,7 +214,8 @@ class TicketedMainIntegrationTests(unittest.TestCase):
         self.base = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
         (self.repo / "app.txt").write_text("changed\n")
         subprocess.run(["git", "-C", str(self.repo), "add", "app.txt"], check=True)
-        subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "change\n\nGoodQA goodqa#42"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-qm",
+                        "change\n\nRefs: GoodQA goodqa#41\nFollow-up: GoodQA goodqa#42"], check=True)
         self.head = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
         self.packet = self.root / "packet.md"
         self.packet.write_text("Scope and evidence.\nReviewed HEAD " + self.head +

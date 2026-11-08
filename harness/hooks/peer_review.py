@@ -980,13 +980,26 @@ def review_merge_eligible(args, binding, report, selection):
                 and finding_ids(report) == ['UNSPECIFIED'] and 'TICKETED:' not in report)
 
 
+FOLLOW_UP_LINE = re.compile(r'^follow-up:[ \t]*(.+)$', re.I | re.M)
+REFS_LINE = re.compile(r'^refs:[ \t]*(.+)$', re.I | re.M)
+# #134 red-team P3: these findings are never ticketed away, whatever category the reviewer gives them
+UNTICKETABLE = re.compile(
+    r'data[- ]?loss|los(?:e|es|ing|t) (?:\w+ )?(?:data|rows|records|files|commits|work)|\bdrops? (?:the |a )?\w+ '
+    r'(?:table|column|database)|\bdelet|\bwip(?:e|es|ed)\b|corrupt|secur|\bauth|credential|password|secret|'
+    r'\btoken|privacy|\bpii\b|leak|inject|privilege|permission|bypass|migrat|rollback|roll back', re.I)
+
+
 def related_ticket_refs(repo, base):
-    """Tickets named by reviewed commits, not by the reviewer or an arbitrary tracker lookup."""
+    """(follow-up tickets, own tickets) named by the reviewed commits, never by the reviewer or a tracker lookup.
+    Own tickets are those a commit cites in `Refs:`; a follow-up is cited in a `Follow-up:` line and is not own."""
     if not base:
-        return set()
+        return set(), set()
     import commit_policy
+    policy = commit_policy.load_policy()
     messages = git(repo, 'log', '--max-count=500', '--format=%B', base + '..HEAD')
-    return set(commit_policy.ticket_refs(messages, commit_policy.load_policy()))
+    own = set(commit_policy.ticket_refs('\n'.join(REFS_LINE.findall(messages)), policy))
+    follow = set(commit_policy.ticket_refs('\n'.join(FOLLOW_UP_LINE.findall(messages)), policy))
+    return follow - own, own
 
 
 def default_ticket_verifier(ref):
@@ -1039,7 +1052,7 @@ def parse_ticketed_report(report):
         if declared != finding:
             errors.append(finding + ': declaration names a different finding')
             break
-        parsed[finding] = (category.lower(), project.lower(), int(number))
+        parsed[finding] = (category.lower(), project.lower(), int(number), finding_match[2])
         findings.append(finding)
         index += 1
     if len(findings) > 128:
@@ -1047,7 +1060,7 @@ def parse_ticketed_report(report):
     return parsed, findings, errors
 
 
-def resolve_ticketed_findings(stage, report, *, head, related, verifier=None):
+def resolve_ticketed_findings(stage, report, *, head, related, verifier=None, own=()):
     """Return (report, ticketed records, errors); any error preserves the original BLOCK."""
     lines = report.strip().splitlines()
     declarations = [line for line in lines if line.lstrip().startswith('TICKETED:')]
@@ -1066,9 +1079,15 @@ def resolve_ticketed_findings(stage, report, *, head, related, verifier=None):
     verifier = verifier or default_ticket_verifier
     records = []
     for finding in findings:
-        category, project, number = parsed[finding]
+        category, project, number, text = parsed[finding]
         ref = ('goodqa', project, number)
         ticket_label = f'GoodQA {project}#{number}'
+        if UNTICKETABLE.search(text):
+            errors.append(f'{finding}: a data-loss, security, auth or migration finding cannot be ticketed')
+            continue
+        if ref in own:
+            errors.append(f'{finding}: {ticket_label} is this branch\'s own work ticket (Refs:); file a follow-up')
+            continue
         if category not in __import__('usage_guard').TICKETED_CATEGORIES:
             errors.append(f'{finding}: category {category} cannot be ticketed')
             continue
@@ -1479,11 +1498,11 @@ def main() -> int:
             if 'TICKETED:' in report:
                 related_error = None
                 try:
-                    related = related_ticket_refs(repo, base)
+                    related, own = related_ticket_refs(repo, base)
                 except (ImportError, OSError, ValueError) as error:
-                    related, related_error = set(), error
+                    related, own, related_error = set(), set(), error
                 report, ticketed, ticket_errors = resolve_ticketed_findings(
-                    args.stage, report, head=before[0], related=related)
+                    args.stage, report, head=before[0], related=related, own=own)
                 if related_error is not None:
                     ticket_errors.append('reviewed commit tickets could not be inspected ('
                                          + type(related_error).__name__ + ')')
