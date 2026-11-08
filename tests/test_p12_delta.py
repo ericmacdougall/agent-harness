@@ -24,6 +24,7 @@ def decide(command, cwd="/Users/eric"):
 class Lane(unittest.TestCase):
     def setUp(self):
         for patcher in (mock.patch.object(guard, "_DROPBOX_REMOTES", {"box"}),
+                        mock.patch.object(guard, "LANE_TPS", 4),   # the built-in ceiling; the budget share is tested apart
                         mock.patch.object(guard, "lane_holders", lambda ps_text=None: [])):
             patcher.start()
             self.addCleanup(patcher.stop)
