@@ -392,3 +392,55 @@ class WorktreeRemoveDashC(WorktreeRemoveCase):
         if upper.exists():  # case-insensitive volume (macOS default): the spelling differs, the directory is the same
             self.assertEqual(self.decide(ok, cwd=upper / 'node_modules' / 'a' / 'b')[0], 'block')
         self.assertEqual(self.decide(ok, cwd=deep)[0], 'block')
+
+
+class WorktreeRemoveIndirectRound2(WorktreeRemoveCase):
+    """goodqa#15346 delta review M1-M4 (BLOCK on 546a1d1): an option flood, a quoted parallel command, a built or hidden
+    alias, and aliases defined outside -c must not turn a protected worktree remove into an allow."""
+
+    def forms(self):
+        path = str(self.linked)
+        rep = ' '.join(['-R 1'] * 12)
+        return (
+            # M1: the command sits past any fixed word bound
+            'xargs %s git worktree remove --force < /dev/null' % rep,
+            'parallel %s git worktree remove --force ::: %s' % (' '.join(['-j 4'] * 13), path),
+            'ls -d %s | xargs -o -t -p -r -x -0 -E X -L 1 %s git worktree remove --force' % (path, ' '.join(['-R 1'] * 9)),
+            # M2: parallel with the command as one quoted word, or as the data when no command is given
+            "parallel -j 4 'git worktree remove --force {}' ::: %s" % path,
+            "parallel --jobs 4 'rm -rf {}' ::: %s" % path,
+            'parallel -j 4 "git worktree remove --force %s" ::: x' % path,
+            "parallel ::: 'git worktree remove --force %s'" % path,
+            # M3: built subcommand or non-literal alias, target on stdin or in a placeholder
+            'echo %s | xargs git $(echo worktree) remove --force' % path,
+            'echo %s | xargs git "$W" remove --force' % path,
+            'find %s -maxdepth 0 -exec git $(echo worktree) remove --force {} +' % path,
+            'echo %s | xargs git -c alias.wt=worktree wt remove --force' % path,
+            'echo %s | xargs git -c alias.wr="$A" wr' % path,
+            "echo %s | xargs git -c 'alias.wr=!f(){ git \"worktree\" \"re\"\"move\" --force \"$@\"; }; f' wr" % path,
+            # M4: aliases defined without -c
+            "W='worktree remove --force' git --config-env=alias.wr=W wr %s" % path,
+            "W='worktree remove --force' git --config-env alias.wr=W wr %s" % path,
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0='worktree remove --force' git wr %s" % path,
+            "export GIT_CONFIG_KEY_0=alias.wr; git wr %s" % path,
+            "git config alias.wr 'worktree remove --force'",
+            "git config --global alias.wr 'worktree remove --force'",
+            'git -c include.path=/tmp/x wr %s' % path,
+        )
+
+    def test_round2_forms_block(self):
+        passed = [c for c in self.forms() if self.decide(c)[0] != 'block']
+        self.assertEqual(passed, [], 'a round-2 bypass slipped through')
+
+    def test_round2_harmless_forms_stay_allowed(self):
+        lst = self.home / 'list.txt'
+        lst.write_text(str(self.linked) + '\n')
+        for c in ("git -c alias.st=status st", "git -c alias.lg='log --oneline' lg", 'git worktree list',
+                  'xargs git worktree list < %s' % lst, "parallel -j 4 'git -C {} status' ::: %s" % self.primary,
+                  'parallel -j 4 git status ::: %s' % self.linked, "parallel ::: 'echo hello'",
+                  'xargs ls < %s' % lst, 'find %s -maxdepth 0 -exec echo {} +' % self.linked,
+                  'git config user.name x', 'git "$cmd" status'):
+            self.assertEqual(self.decide(c)[0], 'allow', c)
+
+    def test_lone_literal_form_still_passes(self):
+        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'allow')

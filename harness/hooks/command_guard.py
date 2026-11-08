@@ -1814,6 +1814,18 @@ def _nondash(args):
     return out
 
 
+def _git_config_hides_subcommand(word, from_env=False, text=None):
+    """goodqa#15346 red-team M3/M4: a `-c`/`--config-env` setting that can make a plain-looking subcommand run
+    `git worktree remove`: an alias whose value names worktree, is built at run time, is a shell alias, or is read
+    from the environment; or an include that can define one. A plain alias to another subcommand is not one."""
+    low = (text if text is not None else word.text).casefold()
+    if low.startswith(('include.', 'includeif.')):
+        return True
+    if not low.startswith('alias.'):
+        return False
+    return bool(from_env or word.dynamic or word.subs or 'worktree' in low or '!' in low)
+
+
 def _is_subseq(required, tokens):
     it = iter(tokens)
     return all(any(r == t for t in it) for r in required)
@@ -2945,6 +2957,9 @@ class Analyzer:
             return
         if name == 'git-worktree':  # red-team M3: the separate program is the same command
             self.git([_literal_word('worktree')] + list(args), words, cmd.words)
+        if name in ('export', 'declare', 'typeset', 'readonly', 'local') and any(
+                re.match(r'GIT_CONFIG_(?:KEY_\d+|PARAMETERS)=.*(?:alias\.|include)', t, re.I) for t in texts):
+            ctx.git_config_alias_env = True  # goodqa#15346 M4: a later `git wr` may run an alias read from the environment
         if name == 'git':
             self.git(args, words, cmd.words)
         if name == 'rclone':
@@ -3275,9 +3290,25 @@ class Analyzer:
         --max-args 1, --arg-file F, -j 4, -a F). A table of them is always incomplete, so every later word that names a
         command that can delete is also analysed as the start of a command (bounded). Over-blocking an odd argument that
         merely spells such a name is accepted: fail toward block."""
-        for j in range(min(len(args), 24)):
-            if posixpath.basename(args[j].text) in self.INDIRECT_COMMANDS and not args[j].text.startswith('-'):
+        # red-team M1: every argument is scanned, however many options come first (a fixed bound let a repeated option push
+        # the command out of range). The shared budget (ctx.budget.tick) still bounds the work.
+        stops = [k for k, a in enumerate(args) if a.text in (':::', '::::')]
+        data = [a.text for a in args[stops[0] + 1:] if not a.text.startswith(':::')][:50] if stops else []
+        for j in range(len(args)):
+            text = args[j].text
+            if text.startswith('-'):
+                continue
+            if '{}' in text and data and re.search(r'\s', text.strip()) \
+                    and posixpath.basename(text.split(None, 1)[0]) in self.INDIRECT_COMMANDS:
+                for item in data:  # the placeholder stands for each argument: judge the command that really runs
+                    self.script(text.replace('{}', _quote_for_rebuild(item)), depth + 1)
+                continue
+            if posixpath.basename(text) in self.INDIRECT_COMMANDS:
                 self.inner_words(args[j:], depth, pl, idx, via_xargs=True)
+            elif re.search(r'\s', text.strip()) and posixpath.basename(text.split(None, 1)[0]) in self.INDIRECT_COMMANDS:
+                # red-team M2: parallel runs a quoted word, or an argument after ::: when no command is given, as a
+                # shell command line (`parallel -j 4 'git worktree remove --force {}' ::: DIR`)
+                self.script(text, depth + 1)
 
     def inner_words(self, words, depth, pl, idx, via_xargs=False):
         if not words:
@@ -3709,13 +3740,16 @@ class Analyzer:
                         cwd_words.append(args[i + 1])
                 if t in ('--git-dir', '--work-tree') and i + 1 < len(args):
                     locations.append(args[i + 1].text)
-                if t == '-c' and i + 1 < len(args) and args[i + 1].text.casefold().startswith('alias.'):
-                    alias = True
-                    if re.search(r'worktree[\s\x00]+remove|worktree[\s\x00]+move', args[i + 1].text.casefold()):
-                        alias_removes = True
+                if t in ('-c', '--config-env') and i + 1 < len(args):
+                    alias = alias or args[i + 1].text.casefold().startswith('alias.')
+                    alias_removes = alias_removes or _git_config_hides_subcommand(args[i + 1], t == '--config-env')
                 i += 2
             elif t.startswith(('--git-dir=', '--work-tree=')):
                 locations.append(t.split('=', 1)[1])
+                i += 1
+            elif t.startswith('--config-env='):  # red-team M4: --config-env=alias.wr=VAR reads the alias from the environment
+                alias = alias or t.split('=', 1)[1].casefold().startswith('alias.')
+                alias_removes = alias_removes or _git_config_hides_subcommand(args[i], True, t.split('=', 1)[1])
                 i += 1
             elif t.startswith('-'):
                 i += 1
@@ -3728,8 +3762,30 @@ class Analyzer:
         for name in ('GIT_DIR', 'GIT_WORK_TREE'):
             if isinstance(self.ctx.vars.get(name), str):
                 locations.append(self.ctx.vars[name])
+        # red-team M4: GIT_CONFIG_KEY_n=alias.x (GIT_CONFIG_COUNT) defines an alias from the environment, also after export
+        env_pairs = [(assign.text if hasattr(assign, 'text') else str(assign)) for assign in (cmd_words or ())]
+        env_pairs += ['%s=%s' % (k, v) for k, v in self.ctx.vars.items() if isinstance(v, str)]
+        if getattr(ctx, 'git_config_alias_env', False) or any(
+                re.match(r'GIT_CONFIG_(?:KEY_\d+|PARAMETERS)=.*(?:alias\.|include)', e, re.I) for e in env_pairs):
+            alias = True
+            alias_removes = True
         sub = texts[i] if i < len(texts) else ''
         rest = texts[i + 1:]
+        if sub == 'worktree':
+            alias_removes = False  # the real subcommand is judged directly below
+        built_sub = i < len(args) and (args[i].dynamic or bool(args[i].subs))
+        built_worktree_sub = sub == 'worktree' and len(args) > i + 1 and (args[i + 1].dynamic or bool(args[i + 1].subs))
+        if built_worktree_sub or (built_sub and any(
+                t.casefold() in ('remove', 'rm', 'move', 'mv') or '{}' in t or t in (':::', '::::') for t in rest)):
+            # red-team M3: git $(echo worktree) remove ... / git "$W" remove ... with the target on stdin or in a placeholder
+            ctx.add(LOG_DELETE, 'linked-worktree-remove',
+                    'a git subcommand built at run time next to remove or move cannot be verified',
+                    'write git worktree remove literally, as the standalone non-forced form')
+        if sub == 'config' and any(t.casefold().startswith('alias.') for t in rest) and any(
+                'worktree' in a.text.casefold() or '!' in a.text or a.dynamic or a.subs for a in args[i + 1:]):
+            ctx.add(LOG_DELETE, 'linked-worktree-remove',
+                    'git config defines an alias that can run worktree remove, which cannot be verified later',
+                    'do not define such an alias; use the standalone literal non-forced form')
         self.owned_checkout(sub, rest, cwd_words, locations, alias)
         if sub == 'clean':
             self.git_clean(args[i + 1:], rest, cwd_word)
