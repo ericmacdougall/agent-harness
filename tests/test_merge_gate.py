@@ -666,6 +666,53 @@ class ActiveWorkflows(Base):
         self.assertEqual(self.merge(self.scenario([]), waived=True)[0], 0)
         self.assertEqual(self.merge(self.scenario([]))[0], 2)  # consumed
 
+    def test_ci_off_outside_reports_are_not_ci(self):
+        # red-team H3: an outside commit status, an app check or a lone skipped run is not CI. With no workflow that
+        # can run, the merge still needs exact-head evidence; anyone with push access can post a status.
+        reports = {"status-success": [{"t": "status", "context": "ok", "state": "SUCCESS"}],
+                   "app-run-success": [{"t": "run", "name": "ext", "status": "COMPLETED", "conclusion": "SUCCESS",
+                                        "app_id": 999}],
+                   "skipped-run": [{"t": "run", "name": "ext", "status": "COMPLETED", "conclusion": "SKIPPED"}]}
+        for label, checks in reports.items():
+            for command in (self.CMD, "gh pr merge 5 --auto --match-head-commit {HEAD}",
+                            "gh pr merge 5 --admin --squash --match-head-commit {HEAD}"):
+                with self.subTest(label, command=command):
+                    code, text, _ = self.merge(self.scenario([], checks=checks), command=command)
+                    self.assertEqual(code, 2, text)
+                    self.assertIn("GitHub CI is switched off", text)
+            with self.subTest(label, evidence=True):
+                self.assertEqual(self.merge(self.scenario([], checks=checks), waived=True)[0], 0)
+
+    def test_ci_on_needs_one_success_when_nothing_is_required(self):
+        ci = [{"name": "CI", "state": "active", "content": "on:\n  pull_request:\n"}]
+        skipped = [{"t": "run", "name": "test", "status": "COMPLETED", "conclusion": "SKIPPED"}]
+        code, text, _ = self.merge(self.scenario(ci, checks=skipped))
+        self.assertEqual(code, 2, text)  # red-team H3: only skipped runs is not a pass
+        green = [{"t": "run", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+        code, text, _ = self.merge(self.scenario(ci, checks=green))
+        self.assertEqual(code, 0, text)  # normal CI: no evidence needed
+        code, text, _ = self.merge(self.scenario(ci, checks=green, timeout="workflows"))
+        self.assertEqual(code, 2, text)  # the workflow list must be readable (fail closed)
+
+    def test_check_command_never_spends_the_evidence(self):
+        # red-team M1: `merge_gate.py check` used to consume the single-use evidence and print green
+        import io
+        mg.add_waiver(self.state, "o/r", 5, HEAD, "GoodQA #15282", "reviewed by main; CI is off here",
+                      approved_by="main:agent-1")
+        out = io.StringIO()
+        rc = mg.main(["check", "--state-dir", str(self.state), "--repo", "o/r", "--pr", "5"],
+                     runner=FakeGh(self.scenario([])), stdout=out, stderr=io.StringIO())
+        self.assertEqual(rc, 2, out.getvalue())
+        self.assertNotIn("all checks green", out.getvalue())
+        self.assertEqual(self.merge(self.scenario([]))[0], 0)  # still available for the real merge
+        self.assertEqual(self.merge(self.scenario([]))[0], 2)  # then spent
+
+    def test_a_head_with_a_trailing_newline_is_rejected(self):
+        # red-team L1: the head check is a full match
+        with self.assertRaises(Exception):
+            mg.add_waiver(self.state, "o/r", 5, HEAD + "\n", "GoodQA #15282", "trailing newline",
+                          approved_by="main:agent-1")
+
     def test_real_agent_harness_shape_is_allowed(self):
         files = [{"name": "CI", "state": "disabled_manually", "content": "on: [push, pull_request]\n"},
                  {"name": "Console", "state": "disabled_manually", "content": "on:\n  pull_request:\n"},

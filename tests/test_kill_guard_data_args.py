@@ -97,6 +97,19 @@ BLOCK = [
     "python3 /tmp/merge_gate.py waive --reason 'kill 1'",
     "python3 ~/.claude/hooks/../../tmp/ah.py user-msg --text 'kill 1'",
     "python3 ~/x/.claude/hooks/ah.py user-msg --text 'kill 1'",
+    # red-team of 55ce595 H1: a quoted or escaped tilde is a literal ./~ directory, not the install root
+    "python3 '~/.claude/hooks/ah.py' user-msg --text 'kill 4242'",
+    "python3 \"~/.claude/hooks/ah.py\" user-msg --text 'kill 4242'",
+    "python3 \\~/.claude/hooks/ah.py user-msg --text 'kill 4242'",
+    "python3 '~/.codex/agent-harness/wal_note.py' --note 'kill 4242'",
+    # H2: HOME changed earlier in the same command line, so the shell runs a copy under the new HOME
+    "HOME=/tmp/x; python3 ~/.claude/hooks/ah.py user-msg --text 'kill 4242'",
+    "export HOME=/tmp/x; python3 ~/.claude/hooks/ah.py user-msg --text 'kill 4242'",
+    "export HOME=/tmp/x\npython3 ~/.claude/hooks/ah.py user-msg --text 'kill 4242'",
+    "cd /tmp && HOME=$PWD; python3 ~/.claude/hooks/ah.py user-msg --text 'kill 4242'",
+    "declare HOME=/tmp/x; python3 ~/.claude/hooks/wal_note.py --note 'kill 4242'",
+    "read HOME < f; python3 ~/.claude/hooks/wal_note.py --note 'kill 4242'",
+    "HOME=/tmp/x; python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason x",
 ]
 
 
