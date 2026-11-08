@@ -1902,6 +1902,37 @@ def written_code_destroys_root(code, home):
     return any(root.search(line) and ROOT_DELETE_VERB.search(line) for line in map(_scan_text, code.splitlines()))
 
 
+_RE_PATTERN_FUNCS = frozenset(('search', 'match', 'fullmatch', 'findall', 'finditer', 'sub', 'subn', 'split', 'compile'))
+
+
+def blank_regex_patterns(code):
+    """Python source with the pattern literal of each `re.<fn>(PATTERN, ...)` call emptied. A regex pattern cannot run
+    anything, so a destroyer word inside one (`re.search(r'delete|rewrite', line)`) is not a deletion. Only that first
+    argument is blanked; strings handed to os.system, subprocess, getattr or any other call stay visible to the scan.
+    Source that does not parse is returned unchanged."""
+    try:
+        import ast
+        tree = ast.parse(code)
+    except Exception:  # noqa: BLE001 - not Python (or too deep): the caller scans the text as before
+        return code
+    lines = code.splitlines(keepends=True)
+    starts, pos = [], 0
+    for ln in lines:
+        starts.append(pos)
+        pos += len(ln.encode('utf-8'))
+    raw = code.encode('utf-8')
+    spans = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _RE_PATTERN_FUNCS
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == 're' and node.args
+                and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, (str, bytes))):
+            a = node.args[0]
+            spans.append((starts[a.lineno - 1] + a.col_offset, starts[a.end_lineno - 1] + a.end_col_offset))
+    for b, e in sorted(spans, reverse=True):
+        raw = raw[:b] + b"''" + raw[e:]
+    return raw.decode('utf-8', 'replace')
+
+
 def fallback_scan(text, ctx):
     """Raw-text rules for unresolved indirection, interpreter code, oversized input and internal errors."""
     findings = []
@@ -3859,7 +3890,12 @@ class Analyzer:
 
     def code(self, code, depth):
         ctx = self.ctx
+        # destroyer words inside a regex pattern are data: the log-delete text rule reads the code without them
+        blanked = blank_regex_patterns(code)
         for f in fallback_scan(code, ctx.c):
+            if f.category == LOG_DELETE and blanked != code and not any(
+                    g.rule == f.rule and g.category == LOG_DELETE for g in fallback_scan(blanked, ctx.c)):
+                continue
             ctx.findings.append(f)
         low = code.casefold()
         if re.search(r'print\s*\(\s*(?:dict\s*\(\s*)?os\.environ\s*\)|json\.dumps\s*\(\s*(?:dict\s*\(\s*)?os\.environ(?![.\[\w])|'
