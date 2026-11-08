@@ -13,6 +13,7 @@ tier table and the ledger; no model judgement.
 from __future__ import annotations
 
 import json
+import threading
 import os
 from pathlib import Path
 import re
@@ -540,7 +541,7 @@ HELPER_TYPES_DEFAULT = ['red-team', 'click-tester', 'reviewer', 'fixer', 'Explor
                         'statusline-setup']
 # Running states of `ah owners` (liveness.py). Review F3: an owner that waits quietly on a long command, or has gone
 # SILENT, still holds its slot; only a stopped owner (done, handoff, waiting-on-x, returned, DROPPED) frees it.
-RUNNING_STATES = ('live', 'working', 'quiet', 'idle-helper', 'SILENT')
+RUNNING_STATES = ('live', 'working', 'quiet', 'SILENT')  # SILENT also covers SILENT-HIGH (prefix)
 
 
 def owner_types(policy):
@@ -558,16 +559,43 @@ def counts_as_owner(agent_type, policy, flagged=False):
     return bool(flagged) or agent_type in owner_types(policy) or agent_type not in helper_types(policy)
 
 
+OWNER_COUNT_DEADLINE_S = 4.0  # the hook has a 10 s timeout and fails closed; the owner scan must never use it all
+
+
+class _Deadline(Exception):
+    pass
+
+
+def _owners_with_deadline(home, session_id, seconds):
+    """ah.owners(), abandoned after `seconds` (main thread only, SIGALRM). A timeout raises _Deadline so the caller can
+    use the SubagentStart live map instead of letting the whole hook time out (which blocks every spawn)."""
+    import signal  # noqa: PLC0415
+    import ah  # noqa: PLC0415
+    if not hasattr(signal, 'setitimer') or threading.current_thread() is not threading.main_thread():
+        return ah.owners(home, session_id)
+
+    def expired(_signum, _frame):
+        raise _Deadline()
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        return ah.owners(home, session_id)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def live_owner_ids(session_id, policy):
     """Agent ids of the session's live owners: from `ah owners` (WAL activity, so a long-running owner never drops out
     of the count) when the session has a main WAL, else from the SubagentStart live map filtered by owner type."""
     try:
-        import ah  # noqa: PLC0415
-        data = ah.owners(Path(os.environ.get('AH_HOME') or esc.installed_home()), str(session_id))
+        data = _owners_with_deadline(Path(os.environ.get('AH_HOME') or esc.installed_home()), str(session_id),
+                                     OWNER_COUNT_DEADLINE_S)
         return sorted(r['agent_id'] for r in data.get('owners') or []
                       if counts_as_owner(r.get('type'), policy, r.get('owner'))
-                      and str(r.get('state') or '').startswith(RUNNING_STATES))
-    except Exception:  # noqa: BLE001 - no main WAL yet (a fresh session) or a partial install: the live map decides
+                      and str(r.get('state') or '').startswith(RUNNING_STATES)
+                      and not r.get('disposition'))  # a disposed owner (ah task dispose) frees its slot
+    except (Exception, _Deadline):  # noqa: BLE001 - no main WAL yet, a partial install or a scan past its deadline: the live map decides
         pass
     try:
         live = _expire_live(_read_live(live_path(session_id)))
