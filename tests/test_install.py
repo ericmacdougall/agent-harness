@@ -133,6 +133,9 @@ class InstallerTests(unittest.TestCase):
         for name in ('git_safety.py', 'integrate_local.py', 'report_file.py', 'peer_review.py', 'rescue.py'):
             self.assertEqual((self.claude / 'hooks' / name).read_bytes(),
                              (ROOT / 'harness/hooks' / name).read_bytes())
+        kimi = self.claude / 'hooks' / 'kimi_review.py'  # goodqa#15201 N2: installed, identical, private mode
+        self.assertEqual(kimi.read_bytes(), (ROOT / 'harness/hooks/kimi_review.py').read_bytes())
+        self.assertEqual(stat.S_IMODE(kimi.stat().st_mode), 0o600)
         first = json.loads((self.claude / "settings.json").read_text())
         self.assertEqual(first["model"], "sonnet")
         self.assertEqual(first["permissions"]["deny"], ["Read(**/.env)"])

@@ -627,7 +627,7 @@ def _child_env(scratch, kimi_home, binary):
     node = shutil.which('node')
     if node:
         dirs.append(os.path.dirname(node))
-    dirs += ['/usr/bin', '/bin']
+    dirs += ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin']  # standard node install dirs, whatever the caller's PATH
     extra = {name: os.environ[name] for name in os.environ if name.startswith('FAKE_')} if _test_mode() else {}  # test doubles only
     return {**extra, 'HOME': str(root), 'XDG_CONFIG_HOME': str(root / '.config'), 'XDG_DATA_HOME': str(root / '.local/share'),
             'XDG_CACHE_HOME': str(root / '.cache'), 'TMPDIR': str(root / 'tmp'),
