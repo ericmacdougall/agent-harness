@@ -12,6 +12,8 @@ from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / 'harness/hooks'
 sys.path.insert(0, str(HOOKS))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import top_assent_fixture as fx  # noqa: E402  (review F2: approve_top re-reads the user turn)
 import escalation as esc
 import model_tiers as tiers
 import tier_gate as gate
@@ -121,8 +123,10 @@ class SpawnDecisions(GateFixture):
         wals = Path(self.temp.name) / 'wals'; (wals / 's1').mkdir(parents=True)
         os.environ['AGENT_HARNESS_WALS_DIR'] = str(wals); self.addCleanup(lambda: os.environ.pop('AGENT_HARNESS_WALS_DIR', None))
         wal = wals / 's1' / 'main.jsonl'
-        wal.write_text(json.dumps({'id': 'w1', 'event': 'ask', 'note': 'fable for [task:k4]', 'source': 'user:s/u "yes use fable for k4"'}) + '\n'
-                       + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1', 'note': 'approved by the user'}) + '\n')
+        fx.use_claude_home(self, Path(self.temp.name) / 'claude')
+        src = fx.user_turn(Path(self.temp.name) / 'claude', 'yes use fable for k4')
+        wal.write_text(json.dumps({'id': 'w1', 'event': 'ask', 'note': 'fable for [task:k4]', 'source': src}) + '\n'
+                       + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1', 'note': 'yes', 'decision': 'approved'}) + '\n')
         self.ledger.approve_top('k4', 'w1', wal)
         decision, reason, updated, facts = self.spawn('do it [task:k4]', model='fable')
         self.assertEqual(decision, 'allow')
@@ -442,9 +446,10 @@ class ModesAndCap(GateFixture):
         self.assertIn('ladder state unusable', out.get('additionalContext', '') + out.get('permissionDecisionReason', ''))
 
     def test_live_agent_cap_counts_starts_and_stops(self):
-        for n in range(gate.LIVE_CAP_DEFAULT):
-            gate.live_update('s2', 'agent-%d' % n, start=True)
-        self.assertEqual(gate.live_count('s2'), gate.LIVE_CAP_DEFAULT)
+        cap = int(self.policy['caps']['session_live_agents'])
+        for n in range(cap):
+            gate.live_update('s2', 'agent-%d' % n, start=True, agent_type='fixer')  # helpers: the owner cap stays out of this test
+        self.assertEqual(gate.live_count('s2'), cap)
         data = {'tool_name': 'Agent', 'tool_input': {'prompt': 'x [task:k11]', 'model': 'sonnet'}, 'session_id': 's2'}
         self.assertEqual(self.run_hook(data, 'enforce')['permissionDecision'], 'deny')
         gate.live_update('s2', 'agent-0', start=False)

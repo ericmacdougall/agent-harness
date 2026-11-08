@@ -12,6 +12,8 @@ from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / 'harness/hooks'
 sys.path.insert(0, str(HOOKS))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import top_assent_fixture as fx  # noqa: E402  (review F2: approve_top re-reads the user turn)
 import escalation as esc
 import model_tiers as tiers
 
@@ -276,7 +278,7 @@ class EnvRoots(LedgerFixture):
         wals = Path(self.temp.name) / 'wals'; (wals / 's').mkdir(parents=True)
         wal = wals / 's' / 'main.jsonl'
         wal.write_text(json.dumps({'id': 'w1', 'event': 'ask', 'note': 'top for [task:k]', 'source': 'user:s/u "yes"'}) + '\n'
-                       + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1', 'note': 'approved'}) + '\n')
+                       + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1', 'note': 'approved', 'decision': 'approved'}) + '\n')
         os.environ['AGENT_HARNESS_WALS_DIR'] = str(wals); self.addCleanup(lambda: os.environ.pop('AGENT_HARNESS_WALS_DIR', None))
         self.assertEqual(esc.verify_ask_pair(wal, 'w1', 'k', allow_env_root=True)['source'][:5], 'user:')
         with self.assertRaises(esc.LedgerError):
@@ -295,7 +297,7 @@ class EnvRoots(LedgerFixture):
             fake = Path(self.temp.name) / '.claude' / 'wals' / 's'; fake.mkdir(parents=True)
             wal = fake / 'main.jsonl'
             wal.write_text(json.dumps({'id': 'w1', 'event': 'ask', 'note': 'top for [task:k]', 'source': 'user:s/u "yes"'}) + '\n'
-                           + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1', 'note': 'approved'}) + '\n')
+                           + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1', 'note': 'approved', 'decision': 'approved'}) + '\n')
             with self.assertRaises(esc.LedgerError):
                 esc.verify_ask_pair(wal, 'w1', 'k')
 
@@ -310,15 +312,22 @@ class EnvRoots(LedgerFixture):
 
 
 class TopPermission(LedgerFixture):
-    def wal(self, *, source='user:s/u "please use fable on t13"', note='permission for [task:t13] top rung', resolved=True,
-            resolution='approved: user said yes'):
+    def wal(self, *, source=None, note='permission for [task:t13] top rung', resolved=True,
+            resolution='approved: user said yes', decision='approved'):
         # Permission is read only from a session main WAL under the wals root (never a caller-chosen file).
         wals = Path(self.temp.name) / 'wals'; (wals / 'session-1').mkdir(parents=True, exist_ok=True)
         os.environ['AGENT_HARNESS_WALS_DIR'] = str(wals); self.addCleanup(lambda: os.environ.pop('AGENT_HARNESS_WALS_DIR', None))
         path = wals / 'session-1' / 'main.jsonl'
+        if source is None:
+            claude = Path(self.temp.name) / 'claude'
+            fx.use_claude_home(self, claude)
+            source = fx.user_turn(claude, 'please use fable on t13')
         lines = [json.dumps({'id': 'wask1', 'event': 'ask', 'note': note, 'source': source})]
         if resolved:
-            lines.append(json.dumps({'id': 'wres1', 'event': 'ask_resolved', 'ref': 'wask1', 'note': resolution}))
+            row = {'id': 'wres1', 'event': 'ask_resolved', 'ref': 'wask1', 'note': resolution}
+            if decision:
+                row['decision'] = decision  # B24: the explicit field, never the note text
+            lines.append(json.dumps(row))
         path.write_text('\n'.join(lines) + '\n')
         return path
 
@@ -330,8 +339,12 @@ class TopPermission(LedgerFixture):
         answer = f'answer:{sess}/22222222-3333-4444-5555-666666666666 "yes, use fable"'
         for label, source in (('queue', queue), ('answer', answer)):
             with self.subTest(label):
-                status = self.ledger.approve_top('t13', 'wask1', self.wal(source=source))
-                self.assertEqual(status['permission']['source'], source)
+                # The ask pair accepts them as user turns; approve_top then re-reads that turn (review F2), and these
+                # transcripts do not exist here, so the grant is refused with the reason.
+                self.assertEqual(esc.verify_ask_pair(self.wal(source=source), 'wask1', 't13', allow_env_root=True)['source'], source)
+                with self.assertRaises(esc.LedgerError) as caught:
+                    self.ledger.approve_top('t13', 'wask1', self.wal(source=source))
+                self.assertEqual(caught.exception.code, 'no_assent')
         for label, source in (('ticket', 'ticket:GoodQA goodqa#14927'), ('wal', 'wal:/x/main.jsonl#w123456789ab'),
                               ('inferred', 'inferred: from ticket:GoodQA goodqa#14927 -- the user probably wants it'),
                               ('file', 'file:docs/x.md:1@abcdef0 "queue: is fine"'), ('empty', '')):
@@ -342,8 +355,9 @@ class TopPermission(LedgerFixture):
         for label, wal in {'unresolved': self.wal(resolved=False), 'agent-sourced': self.wal(source='wal:x#y'),
                            'other-task': self.wal(note='permission for [task:other]'),
                            'substring-task': self.wal(note='permission for [task:t13x]'),
-                           'declined': self.wal(resolution='user said NO, do not use fable'),
-                           'no-decision': self.wal(resolution='discussed')}.items():
+                           'declined': self.wal(resolution='user said NO', decision='declined'),
+                           'magic-word-only': self.wal(resolution='approved by the user', decision=None),
+                           'no-decision': self.wal(resolution='discussed', decision=None)}.items():
             with self.subTest(label), self.assertRaises(esc.LedgerError):
                 self.ledger.approve_top('t13', 'wask1', wal)
         self.assertIsNone(self.ledger.status('t13')['permission'])

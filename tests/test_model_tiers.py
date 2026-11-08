@@ -31,7 +31,7 @@ class TableShape(unittest.TestCase):
         self.assertEqual(self.policy['unknown_author_reviewer_rung'], 'R1')  # user decision Q1
         # Three automatic climbs (R0 -> R1 -> R2 -> R3); the fourth needs the user (cost numbers are assumptions).
         self.assertEqual(self.policy['ladder_limits'], {'max_review_launches': 8, 'max_rung_climbs': 3, 'max_total_review_usd': 60})
-        self.assertEqual(self.policy['mode'], 'warn')
+        self.assertEqual(self.policy['mode'], 'warn')  # main, goodqa#15253 step 3: the owner cap and ladder ship in warn mode
 
     def test_next_writing_rung_skips_review_only_rungs_and_stops_at_top(self):
         self.assertEqual(tiers.next_writing_rung(self.policy, 'R0'), 'R1')
@@ -169,7 +169,7 @@ class ModeSwitch(unittest.TestCase):
             shutil.copy(tiers.DEFAULT_PATH, table); os.chmod(table, 0o600)
             cli = [sys.executable, str(tiers.DEFAULT_PATH.parent / 'model_tiers.py'), '--policy', str(table), 'mode']
             shown = json.loads(subprocess.run(cli, capture_output=True, text=True, timeout=30).stdout)
-            self.assertEqual((shown['mode'], shown['changed']), ('warn', False))
+            self.assertEqual((shown['mode'], shown['changed']), ('warn', False))  # shipped mode (B24)
             flipped = json.loads(subprocess.run(cli + ['--set', 'enforce'], capture_output=True, text=True, timeout=30).stdout)
             self.assertEqual((flipped['previous'], flipped['mode'], flipped['changed']), ('warn', 'enforce', True))
             self.assertEqual(tiers.load_policy(table)['mode'], 'enforce')

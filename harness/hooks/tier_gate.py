@@ -28,7 +28,7 @@ SPAWN_TOOLS = {'Agent', 'Task', 'Workflow'}
 REVIEWER_TYPES = {'red-team', 'click-tester', 'reviewer'}
 DOWNGRADE = re.compile(r'\[rung-below:([^\]]{3,200})\]')
 REVIEW_MARK = re.compile(r'\[review:[^\]]+\]')
-LIVE_CAP_DEFAULT = 40
+LIVE_CAP_DEFAULT = 12
 
 
 def hook_result(decision, reason=None, updated=None, context=None):
@@ -113,10 +113,20 @@ def decide_spawn(data, policy, ledger, *, session_id=None):
     requested = requested_spec(tool_input, policy)
     facts['requested'] = requested
     blocked = status['blocked_by'] if status else []
+
+    def permitted(rung):
+        """Only the task's own recorded permission. Review F1 and main's rule: there is no session-wide grant, so
+        an untagged spawn never inherits a permission the user gave for another task."""
+        return bool((status or {}).get('permission'))
+
+    def permission_denied(rung):
+        return ('rung %s needs the user permission for task %s. Fix: %s (then add [task:%s] to the Agent description)'
+                % (rung, task, esc.approve_fix(task), task))
+
     # The user's own stop comes first: a computed rung that needs permission is reported as such even
     # when the launch or spend ceilings are reached at the same time.
-    if policy['rungs'][target_rung]['needs_user_permission'] and not (status or {}).get('permission'):
-        return 'deny', 'task %s reached rung %s, which needs the user permission recorded by escalation.py approve-top' % (task, target_rung), None, facts
+    if policy['rungs'][target_rung]['needs_user_permission'] and not permitted(target_rung):
+        return 'deny', permission_denied(target_rung), None, facts
     # R12: a fork keeps its parent's model, which the hook cannot see or rewrite; it is never a rung escape.
     if subagent_type == 'fork' and policy['rungs'][target_rung]['writable'] and target_rung != policy['lowest_rung']:
         return 'deny', 'fork inherits the parent model, which the ladder cannot verify for task %s at rung %s; spawn a typed agent' % (task, target_rung), None, facts
@@ -130,9 +140,13 @@ def decide_spawn(data, policy, ledger, *, session_id=None):
     if not is_reviewer and not req_entry['writable']:
         return 'deny', 'rung %s (%s %s) is review-only; writing spawns use %s' % (req_rung, requested['model'], requested['effort'], target_rung), None, facts
     if req_entry['needs_user_permission'] or policy['rungs'][target_rung]['needs_user_permission']:
-        permission = (status or {}).get('permission')
-        if not permission:
-            return 'deny', 'rung %s needs the user permission recorded by escalation.py approve-top for task %s' % (max(req_rung, target_rung), task), None, facts
+        needed = max(req_rung, target_rung)
+        if not permitted(needed):
+            return 'deny', permission_denied(needed), None, facts
+        if req_entry['needs_user_permission'] and req_rung != target_rung and req_entry['writable']:
+            # A granted top-rung request is honoured as asked (the grant is the user's word), not downgraded to
+            # the computed rung: on 2026-11-08 the ladder said "would deny" to the very spawn the user had just approved.
+            return 'allow', 'rung %s granted by the user for task %s' % (req_rung, task), None, facts
     if req_rung == target_rung:
         return 'allow', 'rung %s matches' % target_rung, None, facts
     order = tiers.rung_order(policy)
@@ -346,7 +360,7 @@ def decide_bash(data, policy, ledger, depth=0, env_model=None):
         if assignment:
             env_model = _unquote(assignment.group(1))
         if LAUNCH.search(segment):
-            results.append(_decide_launch(segment, policy, ledger, env_model=env_model))
+            results.append(_decide_launch(segment, policy, ledger, env_model=env_model, session_id=data.get('session_id')))
         if depth < MAX_NESTING:
             items = nested_items(segment)
             if number and seps[number] == '|' and reads_stdin_as_script(segment):
@@ -355,7 +369,7 @@ def decide_bash(data, policy, ledger, depth=0, env_model=None):
                 except ValueError: producer = []
                 items += [(word, True) for word in producer[1:] if LAUNCH.search(word)]
             for inner, inherits in items:
-                results.append(decide_bash({'tool_input': {'command': inner}}, policy, ledger, depth + 1,
+                results.append(decide_bash({'tool_input': {'command': inner}, 'session_id': data.get('session_id')}, policy, ledger, depth + 1,
                                            env_model=env_model if inherits else None))
     if not results:
         return 'allow', None, None, {'segments': 0}
@@ -366,7 +380,7 @@ def decide_bash(data, policy, ledger, depth=0, env_model=None):
     return 'allow', ('; '.join(reasons) or None), None, dict(results[0][3], segments=len(results))
 
 
-def _decide_launch(command, policy, ledger, env_model=None):
+def _decide_launch(command, policy, ledger, env_model=None, session_id=None):
     """One launch segment: same rule as a spawn, reported as context or deny."""
     try:
         words = shlex.split(command)
@@ -434,9 +448,10 @@ def _decide_launch(command, policy, ledger, env_model=None):
             status = ledger.status(task)
         except (esc.LedgerError, tiers.TierError) as error:
             facts['ladder_error'] = getattr(error, 'code', 'error')
-    # Permission and review-only checks come first: no task means no recorded permission.
+    # Permission and review-only checks come first: no task means no recorded permission (no session grant).
     if entry['needs_user_permission'] and not (status or {}).get('permission'):
-        return 'deny', 'launch at %s needs recorded user permission for task %s' % (requested['rung'], task or '(none)'), None, facts
+        return 'deny', 'launch at %s needs the user permission for task %s. Fix: %s' % (
+            requested['rung'], task or '(none)', esc.approve_fix(task)), None, facts
     if not entry['writable'] and 'rescue.py' in basenames:
         return 'deny', 'rescue at %s is review-only' % requested['rung'], None, facts
     if task is None:
@@ -452,7 +467,8 @@ def _decide_launch(command, policy, ledger, env_model=None):
     if status.get('needs_user_permission') and not status.get('permission') and 'rescue.py' not in basenames:
         # The task has climbed to a permission rung: like the spawn path, nothing launches for it below
         # that rung either until approve-top records the user's answer.
-        return 'deny', 'task %s is computed at %s: approve-top permission is needed before any launch' % (task, status['rung']), None, facts
+        return 'deny', 'task %s is computed at %s, which needs the user permission before any launch. Fix: %s' % (
+            task, status['rung'], esc.approve_fix(task)), None, facts
     order = tiers.rung_order(policy)
     if order.index(requested['rung']) > order.index(status['rung']) and 'rescue.py' not in basenames:
         return 'deny', 'launch at %s is above task %s rung %s' % (requested['rung'], task, status['rung']), None, facts
@@ -472,7 +488,7 @@ def _read_live(path):
     return json.loads(safe_input.read_bounded(path, 262144).decode('utf-8'))
 
 
-def live_update(session_id, agent_id, *, start):
+def live_update(session_id, agent_id, *, start, agent_type=None):
     import fcntl
     path = live_path(session_id)
     lock = os.open(path.with_suffix('.lock'), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -486,7 +502,7 @@ def live_update(session_id, agent_id, *, start):
         key = str(agent_id or 'unknown')
         live = _expire_live(live)
         if start:
-            live[key] = esc.now()
+            live[key] = {'at': esc.now(), 'type': str(agent_type or '')}
         else:
             live.pop(key, None)
         tmp = path.with_suffix('.tmp')
@@ -502,9 +518,10 @@ def _expire_live(live, ttl=None):
     ttl = ttl if ttl is not None else int(tiers.load_policy().get('caps', {}).get('live_ttl_seconds', 1800))
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=ttl)
     kept = {}
-    for key, at in live.items():
+    for key, value in live.items():
+        at = value.get('at') if isinstance(value, dict) else value  # older maps stored the bare timestamp
         try:
-            if datetime.fromisoformat(str(at)) >= cutoff: kept[key] = at
+            if datetime.fromisoformat(str(at)) >= cutoff: kept[key] = value
         except ValueError:
             continue
     return kept
@@ -517,6 +534,64 @@ def live_count(session_id):
         return len(_expire_live(live)) if isinstance(live, dict) else 0
     except (OSError, ValueError, safe_input.InputRejected):
         return 0
+
+
+HELPER_TYPES_DEFAULT = ['red-team', 'click-tester', 'reviewer', 'fixer', 'Explore', 'Plan', 'claude-code-guide',
+                        'statusline-setup']
+# Running states of `ah owners` (liveness.py). Review F3: an owner that waits quietly on a long command, or has gone
+# SILENT, still holds its slot; only a stopped owner (done, handoff, waiting-on-x, returned, DROPPED) frees it.
+RUNNING_STATES = ('live', 'working', 'quiet', 'idle-helper', 'SILENT')
+
+
+def owner_types(policy):
+    return set(policy.get('caps', {}).get('owner_types') or ['task-owner', 'general-purpose', 'claude', 'fork', ''])
+
+
+def helper_types(policy):
+    return set(policy.get('caps', {}).get('helper_types') or HELPER_TYPES_DEFAULT)
+
+
+def counts_as_owner(agent_type, policy, flagged=False):
+    """Only a known helper type is exempt (50bca42: an unknown or invented label is an owner). Review F3: the type
+    decides, not only the `owner` flag of `ah owners`, which marks task-owner agents alone."""
+    agent_type = str(agent_type or '')
+    return bool(flagged) or agent_type in owner_types(policy) or agent_type not in helper_types(policy)
+
+
+def live_owner_ids(session_id, policy):
+    """Agent ids of the session's live owners: from `ah owners` (WAL activity, so a long-running owner never drops out
+    of the count) when the session has a main WAL, else from the SubagentStart live map filtered by owner type."""
+    try:
+        import ah  # noqa: PLC0415
+        data = ah.owners(Path(os.environ.get('AH_HOME') or esc.installed_home()), str(session_id))
+        return sorted(r['agent_id'] for r in data.get('owners') or []
+                      if counts_as_owner(r.get('type'), policy, r.get('owner'))
+                      and str(r.get('state') or '').startswith(RUNNING_STATES))
+    except Exception:  # noqa: BLE001 - no main WAL yet (a fresh session) or a partial install: the live map decides
+        pass
+    try:
+        live = _expire_live(_read_live(live_path(session_id)))
+    except (OSError, ValueError, safe_input.InputRejected):
+        return []
+    return sorted(key for key, value in live.items()
+                  if counts_as_owner(value.get('type', '') if isinstance(value, dict) else '', policy))
+
+
+def owner_cap_decision(session_id, tool_input, policy):
+    """Deny an owner-type spawn once the session's live owners reach caps.session_owner_agents (scenario B3.17:
+    memory says at most 4 active owners; 12 ran). Helpers (reviewers, click-testers, fixers, Explore, Plan) are
+    not owners and pass. Returns (reason, owner_ids) or (None, owner_ids)."""
+    cap = policy.get('caps', {}).get('session_owner_agents')
+    sub_type = str((tool_input or {}).get('subagent_type') or '')
+    if not cap or not counts_as_owner(sub_type, policy):
+        return None, []
+    owners = live_owner_ids(session_id, policy)
+    if len(owners) < int(cap):
+        return None, owners
+    return ('owner cap %d reached for this session: live owners %s. Fix: finish or hand off one of them (python3 %s owners), '
+            'route this work to the owner that already holds its stream, or spawn a helper type (red-team, click-tester, '
+            'fixer, Explore), which does not count' % (int(cap), ', '.join(o[:12] for o in owners),
+                                                      Path(__file__).resolve().parent / 'ah.py')), owners
 
 
 def main(argv=None):
@@ -571,7 +646,7 @@ def _main(action, data, tool, command, applies):
             print(json.dumps(hook_result('deny', 'tier table error: %s' % error)))
         return 0
     if action in ('start', 'stop'):
-        count = live_update(session_id, data.get('agent_id'), start=(action == 'start'))
+        count = live_update(session_id, data.get('agent_id'), start=(action == 'start'), agent_type=data.get('agent_type'))
         cap = int(policy.get('caps', {}).get('session_live_agents', LIVE_CAP_DEFAULT))
         if action == 'start' and count > cap:
             print(json.dumps({'hookSpecificOutput': {'hookEventName': 'SubagentStart',
@@ -579,8 +654,12 @@ def _main(action, data, tool, command, applies):
         return 0
     if tool in SPAWN_TOOLS:
         cap = int(policy.get('caps', {}).get('session_live_agents', LIVE_CAP_DEFAULT))
+        tool_input = data.get('tool_input') if isinstance(data.get('tool_input'), dict) else {}
+        cap_reason, owners = owner_cap_decision(session_id, tool_input, policy)
         if live_count(session_id) >= cap:
             decision, reason, updated, facts = 'deny', 'live agents at the cap %d for this session' % cap, None, {}
+        elif cap_reason:
+            decision, reason, updated, facts = 'deny', cap_reason, None, {'owner_cap': owners}
         else:
             decision, reason, updated, facts = decide_spawn(data, policy, ledger, session_id=session_id)
     elif tool == 'Bash':
@@ -599,9 +678,11 @@ def _main(action, data, tool, command, applies):
     if decision == 'allow' and updated is None:
         return 0  # nothing to change; the decision and its reason are in gate.jsonl
     if mode == 'warn':
-        # Warn mode only speaks: no permissionDecision (which would skip the prompt) and no updatedInput.
-        text = 'ladder (warn mode): would %s: %s' % (decision, reason or 'apply updatedInput %s' % json.dumps(updated or {}, sort_keys=True)[:200])
-        print(json.dumps(hook_result('context', context=text)))
+        # Warn mode only speaks, and only about a refusal: the "would apply updatedInput" chatter for an allowed
+        # spawn was ceremony with no effect (scenario B24: enforce it or say nothing).
+        if decision != 'deny':
+            return 0
+        print(json.dumps(hook_result('context', context='ladder (warn mode): would deny: %s' % reason)))
         return 0
     print(json.dumps(hook_result(decision, reason, updated)))
     return 0

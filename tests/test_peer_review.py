@@ -1544,8 +1544,12 @@ else:
         self.assertFalse(self.argv_file.exists()); self.assertFalse((self.ladder / 'selections').exists())
         wals = self.root / 'wals'; (wals / 's').mkdir(parents=True)
         wal = wals / 's' / 'main.jsonl'
-        wal.write_text(json.dumps({'id': 'w9', 'event': 'ask', 'note': 'fable review for [task:lad-5]', 'source': 'user:s/u "yes"'}) + '\n'
-                       + json.dumps({'id': 'w10', 'event': 'ask_resolved', 'ref': 'w9', 'note': 'approved'}) + '\n')
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import top_assent_fixture as fx
+        fx.use_claude_home(self, self.root / 'claude')
+        src = fx.user_turn(self.root / 'claude', 'yes, use fable to review lad-5')
+        wal.write_text(json.dumps({'id': 'w9', 'event': 'ask', 'note': 'fable review for [task:lad-5]', 'source': src}) + '\n'
+                       + json.dumps({'id': 'w10', 'event': 'ask_resolved', 'ref': 'w9', 'note': 'yes', 'decision': 'approved'}) + '\n')
         os.environ['AGENT_HARNESS_WALS_DIR'] = str(wals); self.addCleanup(lambda: os.environ.pop('AGENT_HARNESS_WALS_DIR', None))
         ladder.Ledger(self.ladder, tiers.load_policy()).approve_top('lad-5', 'w9', wal)
         allowed = self.run_review('--task', 'lad-5', '--author-rung', 'R5', '--author-harness', 'claude')

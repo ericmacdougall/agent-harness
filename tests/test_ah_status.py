@@ -57,6 +57,9 @@ class StatusReport(unittest.TestCase):
             {'at': iso(NOW - 2500), 'event': 'status', 'note': 'blog worker ae83610c is live on transition2.ai'},
             {'at': iso(NOW - 2400), 'event': 'status', 'note': 'course PR #43 merged, not live'},
             {'at': iso(NOW - 2000), 'event': 'blocker', 'note': 'GoodQA MCP returns 403 for the smoke key'},
+            {'at': iso(NOW - 1900), 'event': 'decision', 'id': 'wdec4', 'note': 'lead target for #15158 lowered to 50 verified leads', 'source': 'inferred: from file:x -- judgement'},
+            {'at': iso(NOW - 1800), 'event': 'check', 'note': 'REALLY_TESTED LEADS-50: 52 browser-found leads in the CRM for #15158'},
+            {'at': iso(NOW - 1700), 'event': 'status', 'note': 'lead gen #15158 is live on the mini with 52 leads'},
         ])
 
     def report(self, since='12h'):
@@ -64,11 +67,12 @@ class StatusReport(unittest.TestCase):
 
     def test_classes_come_from_evidence_not_narrative(self):
         r = self.report()
-        self.assertEqual([v['check'] for v in r['verified']], ['PP-615'])
+        self.assertEqual([v['check'] for v in r['verified']], ['PP-615', 'LEADS-50'])
         self.assertEqual([p['check'] for p in r['pending']], ['LESSONS-LIVE'])  # PP-615 was verified, so it left pending
         live = {e['note'].split()[0]: e['label'] for e in r['live']}
         self.assertEqual(live['ParentProof'], 'DONE_LIVE')  # shares sha a67ab74f with the REALLY_TESTED
         self.assertEqual(live['blog'], 'LIVE_UNTESTED')
+        self.assertEqual(live['lead'], 'LIVE_TARGET_MISMATCH')  # round 2: tested and live, but against a narrowed target
         self.assertNotIn('course PR #43 merged, not live', [e['note'] for e in r['live']])
         claimed = [c['note'] for c in r['claimed']]
         self.assertTrue(any('Kimi reviewer done' in c for c in claimed))  # narrative "done" never becomes VERIFIED or LIVE
@@ -76,20 +80,20 @@ class StatusReport(unittest.TestCase):
         self.assertEqual([b['note'][:12] for b in r['blockers']], ['GoodQA MCP r'])
         self.assertEqual([a['id'] for a in r['asks_open']], ['wask1'])
         labels = {a['id']: a['label'] for a in r['assumptions']}
-        self.assertEqual(labels, {'wdec1': 'TARGET_MISMATCH', 'wdec3': 'ASSUMPTION'})
+        self.assertEqual(labels, {'wdec1': 'TARGET_MISMATCH', 'wdec3': 'ASSUMPTION', 'wdec4': 'TARGET_MISMATCH'})
         self.assertEqual([d['id'] for d in r['decisions']], ['wdec2'])
         self.assertNotIn('wold', [e['id'] for e in r['live']])  # outside the window
         self.assertEqual(len(r['commits']), 1)
 
     def test_text_rendering_and_window_parsing(self):
         text = ah.status_text(self.report())
-        for heading in ('VERIFIED (REALLY_TESTED) (1)', 'LIVE (2)', 'PENDING checks', 'CLAIMED only', 'ASKS open (1)', 'TARGET_MISMATCH'):
+        for heading in ('VERIFIED (REALLY_TESTED) (2)', 'LIVE (3)', 'PENDING checks', 'CLAIMED only', 'ASKS open (1)', 'TARGET_MISMATCH'):
             self.assertIn(heading, text)
         self.assertIn('never write a status list from memory', text)
         self.assertEqual(ah.parse_since('90m'), 5400); self.assertEqual(ah.parse_since('2d'), 172800)
         with self.assertRaises(ah.AhError):
             ah.parse_since('soon')
-        self.assertEqual(len(self.report('2d')['live']), 3)  # the 30 h old LIVE note is inside a 2-day window
+        self.assertEqual(len(self.report('2d')['live']), 4)  # the 30 h old LIVE note is inside a 2-day window
 
     def test_an_all_digit_token_never_links_live_to_a_test(self):
         # Review F7: a version code or date shared by a unit test and a LIVE note is not evidence that the live thing
