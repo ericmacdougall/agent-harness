@@ -1376,6 +1376,73 @@ def _nested_repo(directory, limit=250000, deep=False, seconds=1.5):
     return False
 
 
+def disposable_worktree_refusal(path, policy=None):
+    """None when `path` is a linked worktree that `git worktree remove` (without --force) can drop without losing a
+    commit: clean, nothing untracked, no hidden tracked file, and HEAD contained in an origin branch whose tip the
+    remote reports right now (goodqa#15253). Ignored files are NOT checked: they are lost with the worktree, which is
+    the safety this exemption gives up. Any error, timeout or surprise is a refusal."""
+    cfg = dict(DEFAULT_POLICY['reproducible_clone'], **((policy or {}).get('reproducible_clone') or {}))
+    if not cfg.get('enabled'):
+        return 'the exemption is switched off'
+    started = time.monotonic()
+    total = float(cfg['total_seconds'])
+
+    def left():
+        remaining = total - (time.monotonic() - started)
+        if remaining <= 0.2:
+            raise TimeoutError('time budget')
+        return remaining
+    try:
+        if not path or '\x00' in path or not os.path.isabs(path):
+            return 'not a literal absolute path'
+        path = path.rstrip('/') or '/'
+        if os.path.normpath(path) != path or os.path.realpath(path) != path:
+            return 'the path contains a symlink, dot segment or alias'
+        if os.path.islink(path) or not os.path.isdir(path):
+            return 'not a plain directory'
+        marker = os.path.join(path, '.git')
+        if os.path.islink(marker) or not os.path.isfile(marker) or not _real_git_marker(marker):
+            return 'not a linked worktree (.git is not a gitdir file)'
+        if os.path.lexists(os.path.join(path, '.gitmodules')):
+            return 'it has submodules'
+        common = _git_out(path, ['rev-parse', '--path-format=absolute', '--git-common-dir'], min(left(), 2.0)).strip()
+        if not common or not os.path.isdir(common) or os.path.getsize(os.path.join(common, 'config')) > 256 * 1024:
+            return 'the repository behind the worktree cannot be checked'
+        bad = _config_refusal(_git_out(path, ['config', '--local', '-z', '--list'], min(left(), 2.0)))
+        if bad:
+            return bad
+        for entry in _git_out(path, ['ls-files', '-v', '-z'], min(left(), 3.0)).split('\x00'):
+            if entry and entry[0] != 'H':
+                return 'a tracked file is marked assume-unchanged, skip-worktree or otherwise hidden from git status'
+        status = _git_out(path, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--no-renames'],
+                          min(left(), 3.0))
+        if status.strip('\x00'):
+            return 'the working tree is not clean (modified, staged or untracked files)'
+        head = _git_out(path, ['rev-parse', '--verify', 'HEAD'], min(left(), 2.0)).strip()
+        urls = _git_out(path, ['remote', 'get-url', '--all', 'origin'], min(left(), 2.0)).split()
+        if not urls or any(_remote_host(u) not in cfg['remote_hosts'] for u in urls):
+            return 'origin is not on a known hosting service, so it is no proof the commit is pushed'
+        containing = {}
+        for line in _git_out(path, ['for-each-ref', '--contains', head, '--format=%(refname)%09%(objectname)',
+                                    'refs/remotes/origin/'], min(left(), 3.0)).splitlines():
+            name, _, sha = line.partition('\t')
+            branch = name[len('refs/remotes/origin/'):]
+            if branch and branch != 'HEAD':
+                containing[branch] = sha
+        if not containing:
+            return 'HEAD is not on any origin branch (unpushed commits would become unreachable)'
+        live = REMOTE_LS(urls[0], path, min(left(), float(cfg['remote_seconds'])))
+        if not live:
+            return 'the remote did not answer (cannot prove the commit is pushed)'
+        if not any(live.get('refs/heads/' + b) == sha for b, sha in containing.items()):
+            return 'no origin branch holding HEAD matches the remote now; run `git fetch` first'
+        return None
+    except (OSError, ValueError, TimeoutError, UnicodeError) as error:
+        return 'could not verify the worktree (%s)' % type(error).__name__
+    except Exception as error:  # noqa: BLE001 - subprocess timeouts and anything else are a refusal, never a crash
+        return 'could not verify the worktree (%s)' % type(error).__name__
+
+
 def reproducible_clone_refusal(path, policy=None, now=None):
     """None when `path` is provably a reproducible clone, else the reason it is not."""
     cfg = dict(DEFAULT_POLICY['reproducible_clone'], **((policy or {}).get('reproducible_clone') or {}))
@@ -3286,7 +3353,11 @@ class Analyzer:
         if sub == 'clean':
             self.git_clean(args[i + 1:], rest, cwd_word)
         if sub == 'worktree' and rest[:1] in (['remove'], ['prune']):
+            forced = any(t in ('-f', '--force') or (t.startswith('-') and not t.startswith('--') and 'f' in t)
+                         for t in rest[1:])
             for w in _nondash(args[i + 2:]):
+                if rest[:1] == ['remove'] and not forced and self._disposable_worktree(w):
+                    continue
                 self.refuse('git worktree remove', w)
         if sub == 'init' and rest:
             for w in _nondash(args[i + 1:])[-1:]:
@@ -4171,6 +4242,24 @@ class Analyzer:
         self.ctx.clone_reasons = getattr(self.ctx, 'clone_reasons', {})
         self.ctx.clone_reasons[path] = reason
         return False
+
+    def _disposable_worktree(self, word):
+        """`git worktree remove` of a clean linked worktree whose HEAD is on a live origin branch (goodqa#15253).
+        Time spent in git and the network is credited back to the analysis budget, as for reproducible clones."""
+        cls, path, literal = self.target_class(word)
+        if not literal or cls != 'root' or self._foreign_home(path):
+            return False
+        cache = self.ctx.__dict__.setdefault('worktree_cache', {})
+        if path in cache:
+            return cache[path]
+        cache[path] = False
+        started = time.monotonic()
+        try:
+            reason = disposable_worktree_refusal(path, self.c.policy)
+        finally:
+            self.ctx.budget.deadline += time.monotonic() - started
+        cache[path] = reason is None
+        return cache[path]
 
     def _foreign_home(self, path):
         """A /home/x or /Users/x path that is not one of this machine's homes (an ssh or container target)."""
