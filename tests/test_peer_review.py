@@ -63,6 +63,12 @@ def setUpModule():  # tests never call the ticket tracker; restored in tearDownM
     _OFFLINE.start()
 
 
+def fresh_pool_state():
+    """A trusted QUOTA result marks the pool's subscription blocked; that must not leak into the next test."""
+    for entry in Path(_POOL_DIR).iterdir():
+        shutil.rmtree(entry, ignore_errors=True) if entry.is_dir() else entry.unlink()
+
+
 def tearDownModule():
     _OFFLINE.stop()
     shutil.rmtree(_POOL_DIR, ignore_errors=True)
@@ -70,6 +76,7 @@ def tearDownModule():
 
 class PeerReviewTests(unittest.TestCase):
     def setUp(self):
+        fresh_pool_state()
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -1253,6 +1260,9 @@ print(json.dumps({{'role': 'assistant', 'content': 'KIMI_ADVISORY: ACCEPT\\nVERD
 
 
 class ProviderEnvelopeTests(unittest.TestCase):
+    def setUp(self):
+        fresh_pool_state()
+
     @classmethod
     def setUpClass(cls):
         spec = importlib.util.spec_from_file_location('peer_envelope_unit', REVIEW)
@@ -1493,6 +1503,7 @@ class LadderSelectionTests(unittest.TestCase):
     evidence = staticmethod(PeerReviewTests.evidence)
 
     def setUp(self):
+        fresh_pool_state()
         PeerReviewTests.setUp(self)
         self.ladder = self.root / 'ladder'; self.ladder.mkdir(mode=0o700)
         self.argv_file = self.root / 'argv.json'
