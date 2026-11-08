@@ -348,8 +348,7 @@ def liveness_alerts(owner_docs: dict, policy: dict) -> dict:
                 continue
             # same rule as `ah owners` undisposed: a live disposition (named wait, resume, closed, reassignment to a
             # live owner) excuses the row unless ah still marks it decision_required
-            disp = r.get("disposition")
-            if isinstance(disp, dict) and disp.get("live") is True and r.get("decision_required") is not True:
+            if liveness.row_disposed(r):
                 continue
             idle = r.get("idle_s") if isinstance(r.get("idle_s"), int) else None
             if sev == "high" and idle is not None and idle >= crit:

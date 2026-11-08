@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import re
 import sys
 import uuid
@@ -96,6 +97,38 @@ def open_ask_exists(path, ref: str) -> bool:
     return seen and not resolved
 
 
+def sibling_ask_wal(path, ref: str):
+    """goodqa#15319: the stem of the one other WAL of this session (an owner's agent-*.jsonl) that holds `ref` as an ask
+    nobody has resolved, in any WAL of the session; else None. Main may then resolve an owner's ask by citing the answer."""
+    folder = path.parent
+    if path.name != 'main.jsonl':  # red-team F1: only main resolves an owner's ask, never an owner another WAL's ask
+        return None
+    real_folder = os.path.realpath(folder)
+    wals = [w for w in sorted(folder.glob('*.jsonl'))
+            if w.name == 'main.jsonl' or w.name.startswith('agent-')]
+    # red-team F4: a symlinked WAL could point into another session
+    wals = [w for w in wals if not w.is_symlink() and os.path.dirname(os.path.realpath(w)) == real_folder]
+    holders = [w for w in wals if w != path and w.name.startswith('agent-') and open_ask_exists(w, ref)]
+    if len(holders) != 1:
+        return None
+    needle = ref.encode()
+    for other in wals:  # a resolution anywhere in the session closes it (provenance ledger rule)
+        try:
+            import provenance  # noqa: PLC0415
+            # red-team F2 and M2: the whole file (not a 4 MiB tail), through the bounded reader that opens regular files
+            # only (a FIFO cannot hang it), caps the size and the scan time, and reports an oversized line as None
+            for raw in provenance._lines_containing(other, needle):
+                if raw is None:
+                    return None  # a line too long to read could hold the resolution: do not guess that it is open
+                if b'"ask_resolved"' in raw:
+                    rec = json.loads(raw)
+                    if isinstance(rec, dict) and rec.get('event') == 'ask_resolved' and rec.get('ref') == ref:
+                        return None
+        except Exception:  # noqa: BLE001 - unreadable, too large or not a regular file: do not guess that it is open
+            return None
+    return holders[0].stem
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--wal', type=Path, required=True)
@@ -134,7 +167,10 @@ def main():
         if not args.ref or not re.fullmatch(r'[A-Za-z0-9_-]{4,40}', args.ref):
             parser.error('ask_resolved needs --ref <ask id>')
         # G5 (goodqa#14791): a resolution names an open ask of this WAL and carries the source of the answer
+        ask_wal = None
         if not open_ask_exists(path, args.ref):
+            ask_wal = sibling_ask_wal(path, args.ref)
+        if not open_ask_exists(path, args.ref) and ask_wal is None:
             print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': f'no open ask {args.ref} in this WAL',
                               'hint': 'ask_resolved --ref must name an ask entry of this WAL that is not already resolved'}),
                   file=sys.stderr)
@@ -154,6 +190,8 @@ def main():
                               'hint': 'the resolution source must resolve: user:, answer:, queue: or ticket:'}), file=sys.stderr)
             return 2
         record['ref'] = args.ref
+        if ask_wal:
+            record['ask_wal'] = ask_wal
         record['source'] = args.source.strip()[:2000]
         if args.decision:
             record['decision'] = args.decision

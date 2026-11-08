@@ -98,6 +98,9 @@ def defaults(host: str) -> dict:
                      "ticket_budget_s": 90, "gq": "~/.claude/goodqa-p0p1/gq.py",
                      "projects": {"goodqa": "1ae27b6b-f8f2-4e61-ab2d-c9c43fd162c3"}},
         "peers": [],
+        # goodqa#15234: point events (a refused copy, a foreign process stop) describe something that happened, not a
+        # condition that can stop being true, so nothing ever cleared them. They expire after ttl_h without a repeat.
+        "point_events": {"prefixes": ["heavy:", "ah-" + "kill:"], "ttl_h": 6},
         # goodqa#15070: timer jobs on other hosts, read over ssh: [{"host", "unit", "user": bool, "max_age_h"}]
         "remote_units": [],
         "sinks": {"comment": {"mode": "none"}, "deadman": [], "comment_min_interval_s": 1800},
@@ -1431,6 +1434,7 @@ def _owner_alerts(home, session, tickets, now):
     that return their result to the parent are not owners. Task text never leaves here, only ids and tickets."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import ah  # noqa: PLC0415 - absent on hosts without WALs, which return before reaching this
+    import liveness  # noqa: PLC0415
     try:
         rows = ah.owners(home, session, now=now)["owners"]
     except ah.AhError:
@@ -1442,6 +1446,8 @@ def _owner_alerts(home, session, tickets, now):
             continue  # task-named WALs are alerted by _task_wal_alert with the ring key form liveness:<s8>/<task>
         if not row.get("owner") or not (state in OWNER_ALERT_STATES or state in OWNER_RUNNING_STATES):
             continue
+        if state in OWNER_ALERT_STATES and liveness.row_disposed(row):
+            continue  # main disposed of this owner: its liveness alert clears (goodqa#15322)
         task = f"agent-{row['agent_id']}"
         ref = _ticket_ref(row.get("ticket"))
         quiet = tickets.quiet_h(ref)
@@ -1743,6 +1749,46 @@ def _transition(host, kind, key, a, extra=None) -> dict:
             "check": a.get("check")}
 
 
+def expire_point_events(cfg: dict, latest: dict, active: dict, now: float, ring: Path | None = None) -> list:
+    """Clear events for point-event keys (cfg point_events.prefixes) not repeated for ttl_h; any source.
+
+    Only for families that are events and nothing else (nothing re-derives the key every run): a check-produced key
+    would flap every ttl_h. A timestamp more than an hour in the future counts as expired, so clock skew cannot pin an
+    alert. When `ring` is given, the ring is read again just before the clears are returned and a key whose latest
+    event changed since the snapshot (a repeat from another process) is left alone; the remaining window is the gap
+    between that read and the emit.
+
+    The key leaves `active` too: run_once reasserts every active key whose latest ring event is not a raise."""
+    pe = cfg.get("point_events") or {}
+    raw_prefixes = pe.get("prefixes") if isinstance(pe, dict) else None
+    # a string would become a tuple of characters, an empty prefix matches every key, a bad ttl would abort the run
+    if not isinstance(raw_prefixes, (list, tuple)) or not all(isinstance(p, str) and len(p) >= 2 for p in raw_prefixes):
+        return []
+    try:
+        ttl = float(pe.get("ttl_h", 6)) * 3600
+    except (TypeError, ValueError):
+        return []
+    prefixes = tuple(raw_prefixes)
+    if not prefixes or ttl <= 0:
+        return []
+    out = []
+    for (h, src, key), e in sorted(latest.items(), key=lambda kv: str(kv[0])):
+        if h != cfg["host"] or e.get("event") != "raise" or not str(key).startswith(prefixes):
+            continue
+        ts = parse_ts(e.get("at"))
+        if ts is None or (ts <= now + 3600 and now - ts < ttl):
+            continue
+        if ring is not None:
+            fresh = latest_by_key(read_ring(ring)).get((h, src, key)) or {}
+            if fresh.get("seq") != e.get("seq"):
+                continue
+        active.pop(key, None)
+        out.append({"host": h, "source": src, "event": "clear", "severity": e.get("severity", "info"), "key": key,
+                    "message": f"expired after {pe.get('ttl_h', 6)}h without a repeat: {e.get('message', '')}",
+                    "detail": {"updated": True}, "check": e.get("check")})  # "updated": expiry is not digest news
+    return out
+
+
 def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now: float | None = None,
              deadline_s: float = 420) -> int:
     t0 = time.monotonic()
@@ -1829,6 +1875,7 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
             rc = 2
             print(f"ops-watch: state write failed ({type(exc).__name__})", file=sys.stderr)
 
+    events += expire_point_events(cfg, latest_by_key(read_ring(ring)), active, now, ring)
     persist(events)  # durable before any slow sink: a crash or timeout below cannot re-raise these
     latest = latest_by_key(read_ring(ring))
     reassert = [_transition(host, "raise", k, a, {"reasserted": True}) for k, a in sorted(active.items())
