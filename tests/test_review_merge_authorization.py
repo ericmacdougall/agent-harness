@@ -129,21 +129,28 @@ class AuthorizationTests(unittest.TestCase):
         command = command or "gh pr merge 5 --match-head-commit " + HEAD
         return mg.decide(fixture.bash(command), gh, self.state)
 
-    def test_pass_authorization_allows_a_pending_check_without_waive_command(self):
+    def test_pass_authorization_covers_unreadable_protection_without_waive_command(self):
         waiver = self.authorize()
         self.assertEqual((waiver["repo"], waiver["pr"], waiver["head"], waiver["report_sha256"]),
                          ("o/r", 5, HEAD, REPORT_SHA))
-        code, text = self.decide("pending_run")
+        self.assertEqual(mg.decide(fixture.bash("gh pr merge 5 --match-head-commit " + HEAD),
+                                   fixture.FakeGh(fixture.SCENARIOS["green_protection_unreadable"]),
+                                   self.root / "none")[0], 2, "control: blocked without the authorization")
+        code, text = self.decide("green_protection_unreadable")
         self.assertEqual(code, 0, text)
-        code, text = self.decide("pending_run")
+        code, text = self.decide("green_protection_unreadable")
         self.assertEqual(code, 2, "the same PASS authorization must not replay: " + text)
 
-    def test_pass_authorization_never_passes_a_check_that_concluded_in_failure(self):
-        # #134 red-team P1: the review covers missing or pending CI, not CI that ran and failed
+    def test_pass_authorization_never_passes_failing_pending_or_missing_checks(self):
+        # #134 red-team P1 and B1: a review covers soft reasons, never CI that failed, has not finished or never ran
         self.authorize()
-        code, text = self.decide("red_netwatch")
-        self.assertEqual(code, 2, text)
-        self.assertEqual(self.decide("pending_run")[0], 0, "the refused merge must not have used the authorization")
+        for scenario in ("red_netwatch", "pending_run", "queued_run", "status_pending", "required_missing",
+                         "zero_unprotected_workflows"):
+            with self.subTest(scenario=scenario):
+                code, text = self.decide(scenario)
+                self.assertEqual(code, 2, text)
+        self.assertEqual(self.decide("green_protection_unreadable")[0], 0,
+                         "the refused merges must not have used the authorization")
 
     def test_wrong_head_repo_pr_and_reviewer_binding_are_refused(self):
         with self.assertRaises(ValueError):
@@ -165,8 +172,8 @@ class AuthorizationTests(unittest.TestCase):
         self.assertEqual(first["id"], second["id"])
         records = mg._read_waivers(self.state)
         self.assertEqual(sum(row.get("event") == "waive" for row in records), 1)
-        self.assertEqual(self.decide("pending_run")[0], 0)
-        self.assertEqual(self.decide("pending_run")[0], 2)
+        self.assertEqual(self.decide("green_protection_unreadable")[0], 0)
+        self.assertEqual(self.decide("green_protection_unreadable")[0], 2)
 
     def test_arbitrary_hashes_cannot_forge_review_approval(self):
         with self.assertRaises(TypeError):
@@ -260,10 +267,10 @@ class EndToEndTests(unittest.TestCase):
         fixture.HEAD = self.head
         try:
             code, text = mg.decide(fixture.bash("gh pr merge 5 --match-head-commit " + self.head),
-                                   fixture.FakeGh(fixture.SCENARIOS["pending_run"]), state)
+                                   fixture.FakeGh(fixture.SCENARIOS["green_protection_unreadable"]), state)
             self.assertEqual(code, 0, text)
             code, text = mg.decide(fixture.bash("gh pr merge 5 --match-head-commit " + self.head),
-                                   fixture.FakeGh(fixture.SCENARIOS["pending_run"]), state)
+                                   fixture.FakeGh(fixture.SCENARIOS["green_protection_unreadable"]), state)
             self.assertEqual(code, 2, text)
         finally:
             fixture.HEAD = original_head

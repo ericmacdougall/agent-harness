@@ -1081,5 +1081,31 @@ sys.exit(cp.entry(["hook"]))
         self.assertIn(b"not JSON", result.stderr)
 
 
+
+class AuthorTrailerHarness(unittest.TestCase):
+    """goodqa#15253 #134 red-team B1: the author trailer is review evidence, so it must name the committing harness."""
+    BODY = ("fix(x): change a thing\n\nWhy: a reason that is long enough.\n\nWhat: the change.\n\n"
+            "Testing: `python3 -m unittest tests.test_x` 3 OK\n\nRefs: GoodQA #1234\n\n")
+
+    def problems(self, harness, trailer):
+        old = cp.INSTALL_HARNESS
+        cp.INSTALL_HARNESS = harness
+        try:
+            return [p for p in cp.validate(self.BODY + trailer + "\n", policy=cp.load_policy())
+                    if "harness" in p]
+        finally:
+            cp.INSTALL_HARNESS = old
+
+    def test_a_trailer_naming_the_other_harness_is_refused(self):
+        self.assertTrue(self.problems("claude", "Co-Authored-By: Codex <noreply@openai.com>"))
+        self.assertTrue(self.problems("claude", "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n"
+                                                "Co-Authored-By: GPT-5 Codex <noreply@openai.com>"))
+        self.assertTrue(self.problems("openai", "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"))
+
+    def test_the_own_harness_or_an_uninstalled_checkout_is_fine(self):
+        self.assertFalse(self.problems("claude", "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"))
+        self.assertFalse(self.problems("openai", "Co-Authored-By: GPT-5 Codex <noreply@openai.com>"))
+        self.assertFalse(self.problems("", "Co-Authored-By: Codex <noreply@openai.com>"))
+
 if __name__ == "__main__":
     unittest.main()

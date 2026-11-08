@@ -351,6 +351,31 @@ def ledger_checker(policy: dict, context, as_of_ms: int):
     return check
 
 
+# goodqa#15253 B1: which harness a commit is made from, by where this file is installed. The Claude install lives in
+# ~/.claude/hooks and the Codex install in ~/.codex/agent-harness; a repository checkout returns None (not enforced).
+INSTALL_HARNESS = None  # tests set 'claude' or 'openai'
+
+
+def install_harness():
+    if INSTALL_HARNESS is not None:
+        return INSTALL_HARNESS or None
+    if HERE.parent.name == ".codex":
+        return "openai"
+    if HERE.parent.name == ".claude" and HERE.name == "hooks":
+        return "claude"
+    return None
+
+
+def trailer_harness(line: str):
+    """'claude', 'openai' or None for one Co-Authored-By line (same rule as peer_review.trailer_harness)."""
+    low = line.split(":", 1)[-1].lower()
+    if "anthropic.com" in low or re.search(r"\bclaude\b", low):
+        return "claude"
+    if "openai.com" in low or re.search(r"\b(?:codex|gpt-?[0-9a-z.]*|openai)\b", low):
+        return "openai"
+    return None
+
+
 def validate(message: str, *, policy: dict, previous: str | None = None, is_merge: bool = False,
              allow_autosquash: bool = False, strip_comments: bool = False,
              tickets_required: bool = True, ledger=None) -> list:
@@ -496,6 +521,12 @@ def validate(message: str, *, policy: dict, previous: str | None = None, is_merg
                                 "e.g. 'Authorized-by: Eric, GoodQA #14151'")
     if misplaced:
         problems.append("trailers: move Co-Authored-By/Signed-off-by lines to a final paragraph after a blank line")
+    harness = install_harness()
+    if harness:
+        named = {trailer_harness(line) for line in trailers if re.match(r"(?i)\s*co-authored-by\s*:", line)} - {None}
+        if named - {harness}:
+            problems.append("trailers: Co-Authored-By names %s, but this commit is made from the %s harness; the "
+                            "author trailer is review evidence (goodqa#15253)" % (", ".join(sorted(named - {harness})), harness))
     if previous is not None and normalize(previous) == text:
         problems.append("message: identical to the previous commit; describe this change specifically")
     return problems
