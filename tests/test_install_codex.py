@@ -689,3 +689,12 @@ class CodexWalTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class CodexCopiesTheDropboxBudget(unittest.TestCase):
+    def test_budget_file_ships_next_to_the_codex_heavy_guard(self):
+        # PR #132 review L2: the Codex guard reads dropbox_budget.conf from its own directory; without it the lane
+        # limit falls back to 4 instead of the agent-bulk share.
+        import install_codex
+        self.assertIn('heavy_job_guard.py', install_codex.DELIVERY_HELPERS)
+        self.assertIn('dropbox_budget.conf', install_codex.DELIVERY_HELPERS)

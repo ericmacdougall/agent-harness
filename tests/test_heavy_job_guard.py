@@ -233,9 +233,70 @@ class Classification(unittest.TestCase):
                     unittest.mock.patch.object(safe_input, "read_stdin_bounded", return_value=data), \
                     unittest.mock.patch.object(guard, "log_event"), unittest.mock.patch.object(sys, "stderr", io.StringIO()):
                 return guard.main()
-        self.assertEqual(run_main("linux", payload), 0)   # dev2/Linux: nothing is ever denied
+        self.assertEqual(run_main("linux", payload), 0)   # dev2/Linux: no heavy-work rule applies (goodqa#15246)
         self.assertEqual(run_main("darwin", payload), 2)  # the same command on the Mac is denied
         self.assertEqual(run_main("darwin", ssh), 0)      # ...but not when it is sent to dev2
+
+    def test_off_the_mac_only_the_dropbox_lane_rule_is_enforced(self):
+        # goodqa#15246: t2-dev is the main lane; its agent uploads share the account's write budget, so the lane rule
+        # applies on every host while the other heavy-job rules stay Mac-only.
+        import io
+        import safe_input
+
+        def payload(command):
+            return json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "session_id": "s"}).encode()
+
+        def run_main(platform, data, **env):
+            with unittest.mock.patch.object(sys, "platform", platform), \
+                    unittest.mock.patch.dict(os.environ, dict({"HARNESS_HEAVY_GUARD_FORCE": "", "HARNESS_HEAVY_GUARD": ""}, **env)), \
+                    unittest.mock.patch.object(guard, "_DROPBOX_REMOTES", {"dropbox"}), \
+                    unittest.mock.patch.object(guard, "lane_holders", lambda ps_text=None: []), \
+                    unittest.mock.patch.object(guard, "LANE_TPS", 2), \
+                    unittest.mock.patch.object(safe_input, "read_stdin_bounded", return_value=data), \
+                    unittest.mock.patch.object(guard, "log_event"), unittest.mock.patch.object(sys, "stderr", io.StringIO()):
+                return guard.main()
+        fast = payload("rclone copy /tmp/x dropbox:Backups/x --tpslimit 4 --transfers 2")
+        ok = payload("rclone copy /tmp/x dropbox:Backups/x --tpslimit 2 --transfers 2")
+        self.assertEqual(run_main("linux", fast), 2)          # the lane rule now holds off the Mac
+        self.assertEqual(run_main("linux", ok), 0)
+        for heavy in ("pytest", "npm run build", "npx playwright test", "xargs -P 9 python3 x"):
+            self.assertEqual(run_main("linux", payload(heavy)), 0, heavy)   # every other rule stays Mac-only
+            self.assertEqual(run_main("darwin", payload(heavy)), 2, heavy)  # (control: denied on the Mac)
+        # Review M1/M2: a hatched lane upload off the Mac must not meet the Mac's job count or hourly hatch limit.
+        # The calls are recorded (main() fails open on an exception, so a raising patch could never fail the test),
+        # and the Mac control proves the same command does reach both.
+        hatched = payload("HARNESS_LOCAL_OK=one-off-manifest rclone copy /tmp/x dropbox:Backups/x --tpslimit 9 --transfers 2")
+        for platform, expect_calls in (("linux", 0), ("darwin", 1)):
+            calls = []
+            with unittest.mock.patch.object(guard, "record_hatch_use", lambda *a: calls.append("hatch") or (True, 1)), \
+                    unittest.mock.patch.object(guard, "live_heavy_jobs", lambda: calls.append("jobs") or 5), \
+                    unittest.mock.patch.object(guard, "log_hatch_to_wal", lambda *a: None), \
+                    unittest.mock.patch.object(guard, "ring_event", lambda *a, **k: None):
+                code = run_main(platform, hatched)
+            if expect_calls:
+                self.assertEqual((code, calls), (2, ["jobs", "jobs"]), platform)  # 5 live jobs: refused on the Mac
+            else:
+                self.assertEqual((code, calls), (0, ["hatch"]), platform)  # delta N1: the hourly count still holds
+        # delta N1: a second same-owner hatch inside the hour is refused off the Mac too (real counter, scratch HOME)
+        home = tempfile.mkdtemp()
+        with unittest.mock.patch.dict(os.environ, {"HOME": home}), \
+                unittest.mock.patch.object(guard, "hatch_limit", lambda: 1), \
+                unittest.mock.patch.object(guard, "log_hatch_to_wal", lambda *a: None), \
+                unittest.mock.patch.object(guard, "ring_event", lambda *a, **k: None):
+            self.assertEqual(run_main("linux", hatched), 0)
+            self.assertEqual(run_main("linux", hatched), 2)
+        # Review M3: off the Mac a command without rclone is never analysed (no sizing lookups at all).
+        with unittest.mock.patch.object(guard, "decide", side_effect=lambda *a: calls.append("decide")):
+            calls = []
+            self.assertEqual(run_main("linux", payload("git clone https://github.com/a/b && cp -R a b")), 0)
+            self.assertEqual(calls, [])
+        with unittest.mock.patch("socket.gethostname", return_value="T2-Dev.lan"), \
+                unittest.mock.patch.object(sys, "platform", "linux"):
+            self.assertEqual(guard.host_label(), "t2-dev")
+        with unittest.mock.patch.object(sys, "platform", "darwin"):
+            self.assertEqual(guard.host_label(), "mac")
+        self.assertEqual(run_main("linux", fast, HARNESS_HEAVY_GUARD="off"), 0)  # the off switch still turns it off
+        self.assertEqual(run_main("darwin", fast), 2)          # NEG-1: the Mac is unchanged
 
     def test_redteam_f1_most_severe_finding_wins(self):
         self.assertEqual(decide("ffmpeg -i a b; npx playwright test")["action"], "deny")

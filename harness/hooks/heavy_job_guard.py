@@ -11,7 +11,8 @@ Contract
 - stdin: Claude Code PreToolUse payload. Deny = exit 2 + message on stderr.
 - Fails OPEN: malformed input, deep JSON, any internal error -> exit 0 and a
   logged warning. Register it WITHOUT onFailure=block.
-- Only acts on macOS (dev2 is Linux); HARNESS_HEAVY_GUARD_FORCE=1 overrides for tests.
+- Acts fully on macOS. On other hosts (dev2, t2-dev are Linux) only the dropbox-lane rule applies, and only to
+  commands that mention rclone (goodqa#15246); HARNESS_HEAVY_GUARD_FORCE=1 applies every rule for tests.
 - Escape hatch: prefix the command with HARNESS_LOCAL_OK=<reason>; the reason is
   logged to the session WAL. Browser, adversarial, media and fan-out work must
   ALSO run under run_capped.py; suites and builds only need the hatch.
@@ -77,6 +78,9 @@ DEFAULT_MODES = {"browser": "enforce", "adversarial": "warn", "full-suite": "enf
                  "install": "enforce", "replay": "enforce", "container": "enforce", "big-clone": "warn",
                  "dropbox-lane": "enforce"}
 CAPPED_RULES = {"browser", "media", "fan-out"}  # memory hogs: hatch alone is not enough
+# goodqa#15246: every host's agent uploads share one Dropbox account's write budget, so this rule holds everywhere.
+# The other rules guard the Mac's own capacity and stay Mac-only (heavy work is meant to run on the Linux hosts).
+EVERY_HOST_RULES = {"dropbox-lane"}
 NEVER_BLOCK = {"adversarial"}  # red-team/fuzz work is legitimate: advise (dev2, group cleanup), never deny
 WARN_ONLY = {"big-clone"}  # disk advice (goodqa#14927): warn whatever the mode table says, never deny
 BIG_PACK_BYTES = 500 * 1024 * 1024  # a repository whose packs exceed this is a big copy on the Mac
@@ -1905,6 +1909,19 @@ def load_modes():
     return modes
 
 
+def hook_modes():
+    """The modes the hook applies on this host: everything on the Mac, only EVERY_HOST_RULES elsewhere."""
+    modes = load_modes()
+    if off_the_mac():
+        modes = {rule: (mode if rule in EVERY_HOST_RULES else "off") for rule, mode in modes.items()}
+    return modes
+
+
+def off_the_mac() -> bool:
+    """True on Linux and other hosts, unless HARNESS_HEAVY_GUARD_FORCE=1 asks for the Mac's full rule set."""
+    return sys.platform != "darwin" and os.environ.get("HARNESS_HEAVY_GUARD_FORCE") != "1"
+
+
 SEVERITY = {"allow": 0, "warn": 1, "deny": 2}
 
 
@@ -2352,12 +2369,22 @@ def copy_event_detail(payload: dict, decision: dict, hatch_uses=None) -> dict:
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else ""
     match = re.search(r"at least ([0-9.]+) GiB", decision.get("detail", ""))
     mib = re.search(r"at least ([0-9.]+) MiB", decision.get("detail", ""))
-    return {"agent": owner_of(payload), "task": work_owner_key(cwd) or "", "host": "mac",
+    return {"agent": owner_of(payload), "task": work_owner_key(cwd) or "", "host": host_label(),
             "est_bytes": int(float(match.group(1)) * GIB) if match else (int(float(mib.group(1)) * 1048576) if mib else None), "path_digest": path_digest(cwd),
             "route": route_host(), "hatch_uses_1h": hatch_uses}
 
 
-def run(raw: bytes) -> int:
+def host_label() -> str:
+    """"mac" on the Mac (the label existing alerts use), else this host's short name."""
+    if sys.platform == "darwin":
+        return "mac"
+    import socket
+    return (socket.gethostname().split(".")[0].lower() or "unknown")[:40]
+
+
+def run(raw: bytes, modes=None, lane_only=False) -> int:
+    """lane_only (off the Mac): only rclone commands are analysed, and the Mac's heavy-job count is not applied,
+    because it guards the Mac's own capacity (review M1, M3 on goodqa#15246). The hourly hatch limit still applies."""
     import json
     try:
         payload = parse_payload(raw)
@@ -2381,7 +2408,9 @@ def run(raw: bytes) -> int:
             payload = dict(payload, cwd=tool_input["workdir"])
     if not isinstance(command, str):
         return 0
-    decision = decide(command, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None)
+    if lane_only and "rclone" not in command.casefold():
+        return 0  # off the Mac nothing but the lane rule applies: skip the sizing lookups (ssh du, GitHub API, walks)
+    decision = decide(command, payload.get("cwd") if isinstance(payload.get("cwd"), str) else None, modes)
     action = decision["action"]
     owner = owner_of(payload)
     if decision.get("rule") in ("copy", "build") and action != "warn":
@@ -2420,23 +2449,27 @@ def run(raw: bytes) -> int:
             ring_event(f"heavy:{event_class(decision)}:{owner}", "high", f"{owner} refused a hatch copy: disk above 85%",
                        copy_event_detail(payload, decision))
             return 2
-        if live_heavy_jobs() >= max_heavy_jobs():  # refuse BEFORE spending this owner's hourly use
+        if not lane_only and live_heavy_jobs() >= max_heavy_jobs():  # refuse BEFORE spending this owner's hourly use
             sys.stderr.write(routed(f"Heavy-job guard: {live_heavy_jobs()} heavy jobs are already running on the Mac (limit "
                              f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on dev2 (ssh dev2 '<command>').\n"))
             log_event({"event": "deny-concurrency", "rule": decision["rule"]})
             return 2
+        # The hourly count applies on every host: off the Mac it is the only brake on hatching around the shared
+        # Dropbox write budget (PR #132 delta N1).
         allowed, uses = record_hatch_use(owner, hatch_limit())
         if not allowed:
+            where = ("More than that is heavy work on the Mac: run it on dev2/T2 (ssh dev2 '<command>') or raise the "
+                     "budget in the run kit." if not lane_only else
+                     "Wait for the hour to pass, or use the one throttled lane without the hatch.")
             sys.stderr.write(routed(f"Heavy-job guard: {HATCH} was already used {uses} time(s) in the last hour by this owner "
-                             f"(limit {hatch_limit()}). More than that is heavy work on the Mac: run it on dev2/T2 "
-                             "(ssh dev2 '<command>') or raise the budget in the run kit.\n"))
+                             f"(limit {hatch_limit()}). {where}\n"))
             log_event({"event": "deny-hatch-limit", "rule": decision["rule"]})
             ring_event(f"heavy:hatch:{owner}", "warning", f"{owner} exceeded the {HATCH} limit ({uses}/h)",
                        dict(copy_event_detail(payload, decision), hatch_uses_1h=uses))
             return 2
         decision["hatch_uses_1h"] = uses
     if (action == "allow" and decision.get("hatch_reason") and decision.get("rule") not in NEVER_BLOCK
-            and live_heavy_jobs() >= max_heavy_jobs()):
+            and not lane_only and live_heavy_jobs() >= max_heavy_jobs()):
         sys.stderr.write(routed(f"Heavy-job guard: {live_heavy_jobs()} heavy jobs are already running on the Mac (limit "
                          f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on dev2 (ssh dev2 '<command>').\n"))
         log_event({"event": "deny-concurrency", "rule": decision["rule"]})
@@ -2461,8 +2494,8 @@ def run(raw: bytes) -> int:
 
 
 def main() -> int:
-    if sys.platform != "darwin" and os.environ.get("HARNESS_HEAVY_GUARD_FORCE") != "1":
-        return 0  # dev2 and other hosts are where the heavy work is supposed to run
+    # Off the Mac only EVERY_HOST_RULES apply (hook_modes turns the rest off): heavy work is meant to run there, but its
+    # Dropbox uploads still share the account's write budget (goodqa#15246).
     if os.environ.get("HARNESS_HEAVY_GUARD") == "off":
         return 0
     try:
@@ -2481,7 +2514,7 @@ def main() -> int:
             warn(f"stdin rejected ({rejected.code}); failing open")
             log_event({"event": "fail-open", "reason": rejected.code})
             return 0
-        return run(raw)
+        return run(raw, hook_modes(), lane_only=off_the_mac())
     except Exception as error:  # fail open: a guard bug must never block every Bash call
         warn(f"internal error {type(error).__name__}; failing open")
         log_event({"event": "fail-open", "reason": type(error).__name__})
