@@ -147,6 +147,18 @@ class Assent(unittest.TestCase):
                 self.assertIsNotNone(esc.top_assent(words))
         self.assertEqual(esc.top_assent('the blog is done. Use fable for the rescue! thanks'), 'Use fable for the rescue!')
 
+    def test_review_d1_a_later_retraction_wins(self):
+        # Delta review D1: the latest word decides; an earlier request never survives a later retraction.
+        for words in ('use fable. actually no, stop.', 'Use Fable. Never mind, do not use fable',
+                      'Use fable for the rescue. Scratch that.', 'use astra. no.', 'Use fable. Use opus instead of fable.'):
+            with self.subTest(words=words):
+                self.assertIsNone(esc.top_assent(words))
+
+    def test_review_d1_a_later_reaffirmation_grants(self):
+        self.assertEqual(esc.top_assent('No. Actually, use fable for the rescue.'), 'Actually, use fable for the rescue.')
+        self.assertEqual(esc.top_assent('do not use fable yet. ok, now use fable for the rescue.'),
+                         'ok, now use fable for the rescue.')
+
 
 class TaskOnlyGrant(Fixture):
     def grant(self, task='t2'):

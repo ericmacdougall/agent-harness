@@ -600,6 +600,7 @@ TOP_REQUEST = re.compile(r"\b(?:use|using|run|pass|give|switch|let|allow|approve
 TOP_NEGATION = re.compile(r"\b(?:not|no|never|don'?t|do not|doesn'?t|won'?t|stop|disabled?|disabling|off|without|"
                           r"instead|avoid|cancel|revoke[ds]?|nope|refuse[ds]?|wait|later|unless|if)\b|n't\b", re.I)
 _SENTENCES = re.compile(r"(?<=[.!?;])\s+|\n+")
+TOP_RETRACT = re.compile(r"\b(?:never ?mind|scratch that|forget (?:it|that)|hold (?:on|off)|belay)\b", re.I)
 
 
 def top_assent(text):
@@ -608,14 +609,22 @@ def top_assent(text):
     Review F1: a mention is assent only when the same sentence holds request language (use, pass, switch, let,
     approve ...), no negation or condition anywhere in it (not, never, off, disabled, stop, without, instead,
     unless, if, later), and is not a question. "keep fable disabled", "fable? absolutely not", "why did fable cost
-    so much" and "use opus, fable is off" are all refusals or unrelated."""
-    for sentence in _SENTENCES.split(text or ''):
-        candidate = sentence.strip()
-        if not candidate or '?' in candidate:
-            continue
-        if TOP_TERMS.search(candidate) and TOP_REQUEST.search(candidate) and not TOP_NEGATION.search(candidate):
-            return candidate
-    return None
+    so much" and "use opus, fable is off" are all refusals or unrelated.
+
+    Delta review D1: the latest word decides. Only the LAST sentence that names the top rung can be assent, it
+    must pass those rules itself, and any later sentence that negates or retracts ("no, stop", "never mind",
+    "scratch that") voids it. An earlier request never survives a later refusal."""
+    sentences = [part.strip() for part in _SENTENCES.split(text or '') if part.strip()]
+    mentions = [index for index, sentence in enumerate(sentences) if TOP_TERMS.search(sentence)]
+    if not mentions:
+        return None
+    candidate = sentences[mentions[-1]]
+    if '?' in candidate or not TOP_REQUEST.search(candidate) or TOP_NEGATION.search(candidate):
+        return None
+    for later in sentences[mentions[-1] + 1:]:
+        if TOP_NEGATION.search(later) or TOP_RETRACT.search(later):
+            return None
+    return candidate
 
 
 def _turn_for(parsed, home):
