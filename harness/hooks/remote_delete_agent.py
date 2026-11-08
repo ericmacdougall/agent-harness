@@ -5,30 +5,40 @@ Remote half of `remote_delete.py` (goodqa#15251). It runs ON the target host, se
 host's guard. It never trusts anything it is told except the literal arguments: it re-checks the path and the
 Dropbox archive itself.
 
-  check  PATH ARCHIVE SHA256_FILE LISTING_FILE [BUNDLE]      -> one JSON line: identity, git state, verified archive
+  check  PATH ARCHIVE SHA256_FILE LISTING_FILE [BUNDLE]          -> one JSON line: identity, git state, archive
   delete PATH ARCHIVE SHA256_FILE LISTING_FILE IDENTITY [BUNDLE] -> re-check, then remove the tree; one JSON line
 
+Order (both modes): read the tree's git state, verify the archive (a long download), THEN walk the tree and compare
+it with the archive, so the delete follows the comparison within seconds, not after the download.
+
 Archive checks:
-- the Dropbox tar.gz streams to the sha256 recorded in its .sha256 file;
-- every member of the archive (read from the same stream) is inside the tree, and the listing has as many lines;
-- when the tree has commits no remote has, the bundle downloads, `git bundle verify` passes against the tree's
+- the Dropbox tar.gz streams to the sha256 recorded in its .sha256 file, and the same stream is read as a tar;
+- the archive equals the tree: the same set of entries under <name>/, and every regular file has the same size and
+  mtime (seconds), every symlink the same target; the listing has one line per member;
+- when HEAD has commits no remote has, the bundle downloads, `git bundle verify` passes against the tree's
   repository, and its heads include HEAD.
 
-A git worktree is removed with `git worktree remove --force`, then `git worktree prune`; any other directory is
-removed with shutil.rmtree. Every run appends to ~/.agent-harness/state/remote-delete-audit.jsonl on this host.
-Stdlib only.
+Tree rules: a real directory at least two levels below home, outside harness and credential folders, on one
+filesystem (no mount point inside), and, when it is a git tree, a clean LINKED worktree (a checkout with its own
+.git directory is refused: its branches would go with it). A worktree is removed with `git worktree remove --force`
+from its repository (branches stay), then `git worktree prune`; any other directory with shutil.rmtree.
+Every run appends to ~/.agent-harness/state/remote-delete-audit.jsonl on this host. Stdlib only.
 """
 import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 
 RCLONE = os.environ.get("REMOTE_DELETE_RCLONE", "rclone")  # tests point this at a fake
-TPS = "2"  # the agent-bulk share of the Dropbox write budget (reads, but keep within it)
+TPS = "2"  # the agent-bulk share of the Dropbox budget
+PROTECTED = (".claude", ".codex", ".agent-harness", ".ssh", ".config", ".gnupg", ".aws", ".kube", ".docker",
+             ".local", "Dropbox", ".dropbox", ".cache")
 
 
 def out(**fields):
@@ -58,7 +68,7 @@ def identity(path):
     return "%d:%d" % (info.st_dev, info.st_ino)
 
 
-def tree_state(path):
+def check_path(path):
     home = os.path.realpath(os.path.expanduser("~"))
     if not os.path.isabs(path) or os.path.normpath(path) != path or os.path.realpath(path) != path:
         raise ValueError("not a literal real absolute path")
@@ -66,30 +76,71 @@ def tree_state(path):
         raise ValueError("not a plain directory")
     if not path.startswith(home + "/") or path.count("/") - home.count("/") < 2:
         raise ValueError("only a directory at least two levels below the home directory")
-    for protected in (".claude", ".codex", ".agent-harness", ".ssh", ".config"):
-        if path == os.path.join(home, protected) or path.startswith(os.path.join(home, protected) + "/"):
+    for protected in PROTECTED:
+        if path.startswith(os.path.join(home, protected) + "/"):
             raise ValueError("a protected harness or credential location")
-    state = {"identity": identity(path), "home": home, "git": None}
+    return home
+
+
+def git_state(path):
+    """None for a non-git directory; refuses a checkout with its own .git directory and an unclean tree."""
     marker = os.path.join(path, ".git")
-    if os.path.lexists(marker):
-        code, status = git(path, "status", "--porcelain=v1", "--untracked-files=all")
-        if code != 0:
-            raise ValueError("git status failed")
-        code, head = git(path, "rev-parse", "HEAD")
-        _, common = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
-        _, local_only = git(path, "rev-list", "-n1", "HEAD", "--not", "--remotes")
-        state["git"] = {"clean": status.strip() == "", "head": head.strip(), "common": common.strip(),
-                        "linked": os.path.isfile(marker), "local_only": bool(local_only.strip())}
-    return state
+    if not os.path.lexists(marker):
+        return None
+    if os.path.islink(marker) or not os.path.isfile(marker):
+        raise ValueError("a checkout with its own .git directory is not removed by this route (its branches and "
+                         "stash would go with it); only linked worktrees")
+    code, status = git(path, "status", "--porcelain=v1", "--untracked-files=all")
+    if code != 0:
+        raise ValueError("git status failed")
+    if status.strip():
+        raise ValueError("the git tree has uncommitted or untracked changes")
+    _, head = git(path, "rev-parse", "HEAD")
+    _, common = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    _, local_only = git(path, "rev-list", "-n1", "HEAD", "--not", "--remotes")
+    return {"head": head.strip(), "common": common.strip(), "local_only": bool(local_only.strip())}
+
+
+def walk_tree(path):
+    """{relative name: (kind, size, mtime, target)} relative to the parent directory, without following links.
+    Refuses a mount point inside the tree."""
+    parent, root_dev = os.path.dirname(path), os.lstat(path).st_dev
+    entries = {}
+    for top, dirs, files in os.walk(path, followlinks=False):
+        for name in dirs + files:
+            full = os.path.join(top, name)
+            info = os.lstat(full)
+            if info.st_dev != root_dev:
+                raise ValueError("a mount point is inside the tree (%s)" % os.path.relpath(full, parent)[:120])
+            rel = os.path.relpath(full, parent)
+            if stat.S_ISLNK(info.st_mode):
+                entries[rel] = ("l", 0, 0, os.readlink(full))
+            elif stat.S_ISDIR(info.st_mode):
+                entries[rel] = ("d", 0, 0, "")
+            elif stat.S_ISREG(info.st_mode):
+                entries[rel] = ("f", info.st_size, int(info.st_mtime), "")
+            else:
+                entries[rel] = ("o", 0, 0, "")
+    entries[os.path.basename(path)] = ("d", 0, 0, "")
+    return entries
+
+
+class HashingReader:
+    def __init__(self, raw):
+        self.raw, self.digest = raw, hashlib.sha256()
+
+    def read(self, size=-1):
+        chunk = self.raw.read(size)
+        self.digest.update(chunk)
+        return chunk
 
 
 def rclone(*args, timeout=1800):
     return subprocess.run([RCLONE, "--tpslimit", TPS, *args], capture_output=True, timeout=timeout)
 
 
-def verify_archive(path, archive, sha_file, listing_file, bundle, state):
-    name = os.path.basename(path)
-    for remote in (archive, sha_file, listing_file) + ((bundle,) if bundle else ()):
+def read_archive(name, archive, sha_file, listing_file):
+    for remote in (archive, sha_file, listing_file):
         if ":" not in remote or remote.startswith("-"):
             raise ValueError("archive locations must be rclone remote paths")
     if not archive.endswith("/" + name + ".tar.gz"):
@@ -98,51 +149,68 @@ def verify_archive(path, archive, sha_file, listing_file, bundle, state):
     want = recorded.stdout.decode("utf-8", "replace").split()[:1]
     if recorded.returncode != 0 or not want or len(want[0]) != 64:
         raise ValueError("the .sha256 file could not be read")
-    # one download: the stream feeds the sha256 and `tar -tz`, so the member names come from the archive itself
-    digest = hashlib.sha256()
-    with tempfile.TemporaryFile() as names:
-        with subprocess.Popen([RCLONE, "--tpslimit", TPS, "cat", "--", archive], stdout=subprocess.PIPE) as stream, \
-                subprocess.Popen(["tar", "-tzf", "-"], stdin=subprocess.PIPE, stdout=names,
-                                 stderr=subprocess.DEVNULL) as lister:
-            try:
-                for chunk in iter(lambda: stream.stdout.read(1 << 20), b""):
-                    digest.update(chunk)
-                    lister.stdin.write(chunk)
-            except BrokenPipeError:
-                pass
-            finally:
-                try:
-                    lister.stdin.close()
-                except BrokenPipeError:
-                    pass
-        if stream.returncode != 0 or digest.hexdigest() != want[0]:
-            raise ValueError("the Dropbox archive does not match its sha256")
-        if lister.returncode != 0:
-            raise ValueError("the Dropbox archive is not a readable tar.gz")
-        names.seek(0)
-        members = [m.rstrip("/") for m in names.read().decode("utf-8", "replace").splitlines() if m.strip()]
-    if not members or any(m != name and not m.startswith(name + "/") for m in members):
-        raise ValueError("the archive holds members outside %s/" % name)
+    members = {}
+    with subprocess.Popen([RCLONE, "--tpslimit", TPS, "cat", "--", archive], stdout=subprocess.PIPE) as stream:
+        reader = HashingReader(stream.stdout)
+        try:
+            with tarfile.open(fileobj=reader, mode="r|gz") as tar:
+                for m in tar:
+                    rel = os.path.normpath(m.name)
+                    if rel != name and not rel.startswith(name + "/"):
+                        raise ValueError("the archive holds members outside %s/" % name)
+                    if m.issym():
+                        members[rel] = ("l", 0, 0, m.linkname)
+                    elif m.isdir():
+                        members[rel] = ("d", 0, 0, "")
+                    elif m.isfile():
+                        members[rel] = ("f", m.size, int(m.mtime), "")
+                    elif m.islnk():
+                        members[rel] = ("h", 0, 0, os.path.normpath(m.linkname))
+                    else:
+                        members[rel] = ("o", 0, 0, "")
+        except (tarfile.TarError, EOFError, OSError) as error:
+            raise ValueError("the Dropbox archive is not a readable tar.gz (%s)" % type(error).__name__)
+        for chunk in iter(lambda: reader.read(1 << 20), b""):  # the tar end padding, so the hash covers the file
+            pass
+    if stream.returncode != 0 or reader.digest.hexdigest() != want[0]:
+        raise ValueError("the Dropbox archive does not match its sha256")
     listing = rclone("cat", "--", listing_file, timeout=600)
     if listing.returncode != 0 or len([x for x in listing.stdout.splitlines() if x.strip()]) != len(members):
         raise ValueError("the archive listing is missing or does not match the archive")
-    result = {"sha256": want[0], "members": len(members), "bundle": False}
-    git_state = state.get("git")
-    if git_state and git_state["local_only"]:
-        if not bundle:
-            raise ValueError("the tree has commits no remote has, so a verified bundle is required")
-        with tempfile.TemporaryDirectory(prefix="rdel-") as scratch:
-            local = os.path.join(scratch, name + ".bundle")
-            if rclone("copyto", "--", bundle, local).returncode != 0:
-                raise ValueError("the bundle could not be downloaded")
-            if subprocess.run(["git", "--git-dir", git_state["common"], "bundle", "verify", local],
-                              capture_output=True).returncode != 0:
-                raise ValueError("git bundle verify failed")
-            heads = subprocess.run(["git", "bundle", "list-heads", local], capture_output=True, text=True).stdout
-            if not any(line.split()[:1] == [git_state["head"]] for line in heads.splitlines()):
-                raise ValueError("the bundle does not hold HEAD")
-        result["bundle"] = True
-    return result
+    return {"sha256": want[0], "members": members}
+
+
+def compare(tree, members):
+    """'' when the archive holds exactly the tree, else the first difference."""
+    for rel in sorted(set(tree) | set(members)):
+        have, saved = tree.get(rel), members.get(rel)
+        if have is None:
+            return "the archive has %s, which the tree does not" % rel[:160]
+        if saved is None:
+            return "the tree has %s, which the archive does not" % rel[:160]
+        if saved[0] == "h":  # a hard link in the tar: the tree holds a regular file of the linked member's size
+            target = members.get(saved[3])
+            if have[0] != "f" or not target or target[0] != "f" or target[1] != have[1]:
+                return "%s differs from the archive" % rel[:160]
+            continue
+        if have[0] != saved[0] or (have[0] == "f" and have[1:3] != saved[1:3]) or (have[0] == "l" and have[3] != saved[3]):
+            return "%s differs from the archive" % rel[:160]
+    return ""
+
+
+def verify_bundle(name, bundle, state):
+    if not bundle or ":" not in bundle or bundle.startswith("-"):
+        raise ValueError("HEAD has commits no remote has, so a verified bundle is required")
+    with tempfile.TemporaryDirectory(prefix="rdel-") as scratch:
+        local = os.path.join(scratch, name + ".bundle")
+        if rclone("copyto", "--", bundle, local).returncode != 0:
+            raise ValueError("the bundle could not be downloaded")
+        if subprocess.run(["git", "--git-dir", state["common"], "bundle", "verify", local],
+                          capture_output=True).returncode != 0:
+            raise ValueError("git bundle verify failed")
+        heads = subprocess.run(["git", "bundle", "list-heads", local], capture_output=True, text=True).stdout
+        if not any(line.split()[:1] == [state["head"]] for line in heads.splitlines()):
+            raise ValueError("the bundle does not hold HEAD")
 
 
 def main(argv):
@@ -151,29 +219,38 @@ def main(argv):
     mode, path, archive, sha_file, listing_file = argv[:5]
     expected = argv[5] if mode == "delete" and len(argv) > 5 else None
     bundle = (argv[6] if mode == "delete" else argv[5]) if len(argv) > (6 if mode == "delete" else 5) else None
+    name = os.path.basename(path)
     try:
-        state = tree_state(path)
-        if state["git"] and not state["git"]["clean"]:
-            raise ValueError("the git tree has uncommitted or untracked changes")
-        verified = verify_archive(path, archive, sha_file, listing_file, bundle, state)
+        home = check_path(path)
+        before = git_state(path)
+        saved = read_archive(name, archive, sha_file, listing_file)  # the long part, before the tree is compared
+        if before and before["local_only"]:
+            verify_bundle(name, bundle, before)
+        # the tree, now: unchanged git state, the same files as the archive, the same directory
+        check_path(path)
+        state = git_state(path)
+        if state != before:
+            raise ValueError("the git state changed during the archive check")
+        problem = compare(walk_tree(path), saved["members"])
+        if problem:
+            raise ValueError("the archive does not match the tree: " + problem)
+        summary = {"sha256": saved["sha256"], "members": len(saved["members"]), "bundle": bool(state and state["local_only"])}
         if mode == "check":
-            audit({"event": "remote-check", "path": path, "identity": state["identity"], "archive": archive})
-            return out(ok=True, path=path, home=state["home"], identity=state["identity"], git=state["git"],
-                       archive=verified)
-        if not expected or state["identity"] != expected:
+            audit({"event": "remote-check", "path": path, "identity": identity(path), "archive": archive})
+            return out(ok=True, path=path, home=home, identity=identity(path), git=state, archive=summary)
+        if not expected or identity(path) != expected:
             raise ValueError("the path identity changed since the check")
-        git_state = state["git"]
-        if git_state and git_state["linked"]:
-            parent = os.path.dirname(git_state["common"].rstrip("/"))
-            code, _ = git(parent, "worktree", "remove", "--force", path, timeout=600)
+        if state:
+            repo = os.path.dirname(state["common"].rstrip("/"))  # a bare repository's worktree fails closed here
+            code, _ = git(repo, "worktree", "remove", "--force", path, timeout=600)
             if code != 0:
                 raise ValueError("git worktree remove failed")
-            git(parent, "worktree", "prune")
+            git(repo, "worktree", "prune")
         else:
             shutil.rmtree(path)
         gone = not os.path.lexists(path)
         audit({"event": "remote-delete", "path": path, "identity": expected, "archive": archive, "gone": gone})
-        return out(ok=gone, path=path, deleted=gone, archive=verified)
+        return out(ok=gone, path=path, deleted=gone, archive=summary)
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         audit({"event": "remote-refused", "path": path, "reason": str(error)[:200]})
         return out(ok=False, path=path, error=str(error)[:300])

@@ -43,7 +43,10 @@ ARCHIVE_KIND = "archive-remote"
 DEFAULT_CAP = 16
 # the selected option must say yes/remove/delete; "Delete, no backup" also matches, and is fine here because the
 # remote side still requires the verified archive
-APPROVE_ARCHIVE = re.compile(r"^(?:yes,? )?(?:remove|delete)\b", re.I)
+# the whole option must approve every named path: "Yes, remove all 11 (Recommended)", "Delete them", "Remove it".
+# "Delete only X", "Remove all except Y" and the like do not match.
+APPROVE_ARCHIVE = re.compile(r"^(?:yes,? )?(?:remove|delete)(?: (?:it|them|both|all|these|all of them))?"
+                             r"(?: (\d{1,2}))?(?: of them)?(?: \(recommended\))?\.?$", re.I)
 BACKED_UP = re.compile(r"\bbacked up\b|\bbackups?\b", re.I)
 TILDE_PATH_RE = re.compile(r'(?<![\w.~-])~/[^\s"\'`,;:()<>\[\]{}?!*|]+')
 REMOTE_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}:[A-Za-z0-9 ._/-]{1,400}$")
@@ -58,6 +61,13 @@ def _cap(policy):
     return int((policy.get("marker") or {}).get("archive_remote_max_paths_per_source", DEFAULT_CAP))
 
 
+def named_count(question):
+    """How many distinct paths (absolute or ~/) the question names."""
+    named = {p.rstrip(".").rstrip("/") for p in cg.QUESTION_PATH_RE.findall(question or "")}
+    named |= {p.rstrip(".").rstrip("/") for p in TILDE_PATH_RE.findall(question or "")}
+    return len(named)
+
+
 def question_names(question, path, remote_home):
     """True when the question names `path` as a whole path, absolute or as ~/ under remote_home."""
     named = {p.rstrip(".").rstrip("/") for p in cg.QUESTION_PATH_RE.findall(question or "")}
@@ -70,8 +80,12 @@ def wording_refusal(turn, host):
     text, question = str(turn.get("text") or ""), str(turn.get("question") or "")
     if turn.get("predefined") is not True:
         return 'the answer is free text ("Other"), not a predefined option; ask the user again'
-    if not APPROVE_ARCHIVE.match(text) or cg.DECLINE_WORDS.search(text):
-        return "the selected answer does not say yes/remove/delete (or it declines); ask the user again"
+    approve = APPROVE_ARCHIVE.match(text.strip())
+    if not approve or cg.DECLINE_WORDS.search(text):
+        return ("the selected answer is not a plain approval of every named path (for example \"Yes, remove all 11\")"
+                "; ask the user again")
+    if approve.group(1) and int(approve.group(1)) != named_count(question):
+        return "the answer approves %s paths but the question names %d" % (approve.group(1), named_count(question))
     if not re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(host), question, re.I):
         return "the question does not name the host %s; ask the user again naming it" % host
     if not BACKED_UP.search(question):
@@ -161,7 +175,7 @@ def remote_delete(host, path, archive_dir, user_source, wal, home=None, now=None
         problem = wal_refusal(wal, turn, user_home) or wording_refusal(turn, host)
         if problem:
             raise Refused(problem)
-        cap = _cap(policy)
+        cap = min(_cap(policy), named_count(turn.get("question")))
         if uses_of_source(canonical, home) >= cap:
             raise Refused("this answer already approved %d archive-backed deletions; ask the user again" % cap)
         files = [archive, archive + ".sha256", archive + ".listing", archive[:-len(".tar.gz")] + ".bundle"]
