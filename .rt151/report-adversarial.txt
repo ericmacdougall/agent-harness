@@ -1,0 +1,141 @@
+goodqa#15346 PR 151 adversarial review. Head 28c9a0f, base f71d211. Verdict: BLOCK.
+Agent: agent-ad33ebd391da329e6. Read-only: no branch edit, no push, no real removal.
+
+$P   = fixture linked worktree under .agent-harness (WorktreeRemoveCase.linked)
+$OUT = fixture linked worktree outside every protected root, like ~/wt/x on t2-dev
+Verdicts come from decide(). "real" was observed on git 2.54 or GNU parallel 20261022 with stand-ins (--dry-run, echo, worktree list).
+NEW = base f71d211 blocked it, head allows it.
+
+MATERIAL BYPASSES
+M1  NEW  parallel --trim lr git worktree remove --force ::: $P
+    Verdict allow. Real: --trim is =s, so `rm -rf X` is the job (dry-run). PAR_LONG_FLAGS has trim, line 1911. The guard judges a command called lr.
+M2  NEW  parallel git worktree remove --force ::: ::: $P    also: parallel rm -rf ::: $P :::    parallel --arg-sep @@ rm -rf @@ @@ $P
+    Verdict allow. Real: an empty source supplies '' (`rm -rf '' X`). Line 2101 returns no lines at all. Only an all-empty run really runs nothing.
+M3  NEW  git -c alias.bisect--helper='worktree remove --force' bisect--helper $P    also: echo $P | xargs git -c ... ; rebase--interactive ; env--helper
+    Verdict allow. Real: the alias runs on 2.54 (worktree list stand-in). GIT_BUILTINS, line 1822, is a union of releases.
+    On 2.43 (dev2, t2-dev) these listed names are not built-ins: backfill bisect--helper diff-pairs env--helper history last-modified rebase--interactive refs replay repo submodule.
+    The union is the wrong direction: only an intersection can say "never an alias".
+M4  NEW  git -c alias.wr=status -c alias.wr.command='worktree remove --force' wr $P    also the GIT_CONFIG_COUNT and --config-env=alias.wr.command=V forms
+    Verdict allow. Real: last one wins across both forms (git-config man page, observed). _git_line_alias, line 4055, knows only alias.NAME.
+M5  NEW  git -c alias.wr=status -c "$(echo alias.wr)=worktree remove --force" wr $P    also: K=$(echo alias.wr); ... -c "$K=..." ; --config-env="$K=V"
+    Verdict allow. Real: the later key wins. The reversed scan at line 4060 skips a key it cannot read.
+M6  NEW  no-argument forms where the line itself hides the target:
+    git -c "alias.wr=$(cat f)" wr
+    V='worktree remove --force $P' git --config-env=alias.wr=V wr
+    GIT_CONFIG_PARAMETERS="'alias.wr=worktree remove --force $P'" git wr
+    git -c include.path=$H/evil wr
+    git -c alias.a1=a2 ... -c alias.a9=a10 -c alias.a10='worktree remove --force $P' a1    (chain past alias_depth 8, line 4183)
+    Verdict allow. Real: each defines and runs the alias. An alias the line defines with an unknown value is not "no target".
+M7  NEW  git wr $P GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0=status    also: echo $P | xargs git wr GIT_CONFIG_COUNT=1 ...
+    Verdict allow. Real: those words are arguments, so an alias from a config file runs with them (observed). Line 4064 reads every word, not only leading assignments.
+    NEW  GIT_CONFIG_COUNT=1; GIT_CONFIG_KEY_0=alias.wr; GIT_CONFIG_VALUE_0=status; git wr $P    Line 4063 reads unexported variables.
+M8  NEW  parallel -q sh -c {} ::: 'git worktree remove --force $P'
+    Verdict allow. Real: sh -c 'git worktree remove --force X'. Line 2063 quotes the word, then the fill puts a quoted value inside it, so the guard reads sh -c git with the rest as $0...
+M9  NEW  parallel 'echo {1}; rm -rf {-1}' ::: x ::: $P    Real: rm -rf X. Pattern at line 2068 has no negative positions.
+    parallel 'rm -rf {//}' ::: $H/x/    Real: rm -rf $H (File::Basename::dirname ignores the trailing slash). Line 1936 gives $H/x.
+    parallel --parens ,,,, 'rm -rf ,,s:^:$B/:,,' ::: linked    Real: perl runs. Line 2065 only knows {=.
+M10      parallel rm -rf ::: $'a\n'$P    parallel -d , rm -rf ::: a,$P    parallel --colsep , rm -rf ::: a,$P    parallel -C ' ' rm -rf ::: 'a $P'
+    Verdict allow, base allow. Real: arguments are split (dry-run). The plan treats each as one word.
+M11 NEW  options that run code, all allow; marker fired for real on each:
+    --limit 'CMD'    --filter 'system(q(CMD))'    --tagstring '{= system(q(CMD)) =}'    --results '{= system(q(CMD)) =}'    --compress --compress-program 'CMD'    --ssh 'CMD;:' -S x    -S 'CMD;: x'
+    Base caught these through indirect_scan, which the launcher no longer calls.
+    base also allow: parallel --wd $B rm -rf linked ::: x (real: the job runs in that directory).
+M12      PARALLEL='git worktree remove --force' parallel ::: $P    allow, base allow. Real: unshift @ARGV, @ARGV_profile, @ARGV_env, src/parallel line 4046.
+    NEW  PARALLEL='-I XX' parallel 'echo {1}; rm -rf XX' ::: $P
+    NEW  R=$(echo XX); parallel -I "$R" 'echo {1}; rm -rf XX' ::: $P    option values are not checked for expansion.
+M13 NEW  budget, through the real command_guard_hook.py:
+    parallel 'rm -f {1} {2} {3} {4} {5} {6}' ::: a b c d ::: a b c d ::: a b c d ::: a b c d ::: a b c d ::: a b c d ; git worktree remove --force $OUT
+    237 bytes. rc=0 warn "analysis exceeded its time budget". 3 of 3 through hook_main, 1 of 1 through the hook. Base rc=2.
+    parallel echo {} x 5000 ::: 4095 values ; git worktree remove --force $OUT
+    40 KB. rc=0 "analyser timed out; the command looked harmless and was allowed". Base rc=0 warn, so the fail-open is older; the cheap trigger is new.
+    parallel 'rm -f {}' ::: 4095 values ; git worktree remove --force $OUT    rc=2 once, rc=0 twice: the verdict depends on load.
+    parallel_plan and _par_fill never tick the budget. decide() with no alarm hit my 1 GB bound on a 176 KB command.
+    Only paths that miss PROTECTED_TEXT fail open, and the suite fixture lives under .agent-harness, so no test can see this. It contradicts "no silent item cap".
+
+MATERIAL, IN THE TICKET'S SCOPE AND STILL OPEN, BASE ALSO ALLOWS
+M14 echo "worktree remove --force $P" | xargs git    echo "remove --force $P" | xargs git worktree    echo remove | xargs -I{} git worktree {} --force $P
+    find $P -name remove -exec git worktree {} --force $P \;    echo $P | xargs git "$S"
+    Verdict allow. Real: the first three shapes ran with a worktree list stand-in; the find and "$S" forms were not run. fed_input is only read for non-built-ins, line 4181.
+M15 find $P -maxdepth 0 -exec parallel git worktree remove --force ::: {} +    find $P -exec sem rm -rf {} +    -execdir, nice parallel forms too
+    Verdict allow. Line 3932 only dispatches git, wrappers and shells.
+M16 git config --global foo.wr 'worktree remove --force $P' ; git config --rename-section --global foo alias ; git wr
+    Verdict allow. Real: the section moves with an option in between (observed). Line 4090 looks at two words only; the last commit's test uses one order.
+
+MATERIAL, OLDER THAN THIS PR, FILE AS TICKETS UNLESS MAIN WANTS THEM NOW
+M17 git --shallow-file status worktree remove --force $P    allow. Real: --shallow-file eats status. Line 4161.
+M18 built-ins that run commands: git -c r.repo=$PR for-each-repo --config=r.repo worktree remove --force $P    git rebase --exec '...' HEAD    git bisect run ...    git ls-remote --upload-pack='...;:' .    git -c core.fsmonitor='...' status
+    Verdict allow. Real: for-each-repo, upload-pack and fsmonitor ran stand-ins. rebase --exec with HEAD had no commit to replay and printed no marker, so that one rests on its documentation; bisect run was not run.
+    NEW variant: git config --global alias.x "rebase --exec 'git worktree remove --force $P' HEAD"; the value check only sees whole words.
+M19 state leak: git -c alias.x='!cd /tmp' x ; rm -rf linked (cwd $B) allow, NEW. parallel 'cd /tmp' ::: x ; rm -rf linked and sh -c 'cd /tmp' ; rm -rf linked allow at base too. script() keeps the nested cd.
+M20 printf '[alias]\n\twr = worktree remove --force $P\n' > $H/evil ; GIT_CONFIG_GLOBAL=$H/evil git wr    allow, base allow. Same for >> .git/config and ~/.gitconfig.
+    The design allows a no-argument unknown subcommand, so an alias holding its own target is invisible. Main should decide this residual explicitly. A config-location override next to an unknown subcommand is cheap to refuse.
+
+MATERIAL FALSE REFUSALS, ALL NEW, ALL SHOWN AS log_delete
+F1  parallel convert {} {.}.png ::: *.jpg    parallel 'mv {} {.}.bak' ::: *.txt    parallel 'cp {} out/{/}' ::: src/*    parallel 'echo {/}' ::: "$F"
+    The textbook use of parallel. _par_fill line 2150: a raw value with any transform fails.
+F2  sem --wait    parallel --version    parallel --number-of-cores    parallel --number-of-threads    parallel --help
+    Lines 2075, 2079. Real: --wait, --version and both counts returned at once without running input; --help was not run.
+    Also refused and not judged here: --citation, --record-env. parallel --will-cite alone is rightly refused, since it reads commands from stdin.
+F3  parallel -a urls.txt curl -sO    parallel curl -sO :::: urls.txt    parallel --pipepart -a big.txt --block 10M wc -l    parallel --colsep , 'echo {1} {2}' ::: a,b    parallel -N2 echo {1} {2} ::: a b c d
+    A file source could be judged like stdin instead of refused (line 2050).
+F4  git co "$BRANCH"    git ci -m "msg $N"    git ci -m "$(cat msg)"    git lfs fetch origin "$BRANCH"    git subtree pull --prefix=vendor origin "$BRANCH"    git send-email "$F"    git mergetool "$F"    git ls-files | xargs git lfs track    find . -name '*.bin' -exec git lfs track {} +    git st . (cwd a linked worktree)
+    An "expansion" as unseen target goes beyond the stated design.
+    An external git-X is run before any alias (observed), so PATH lookup could clear lfs, subtree, mergetool and send-email when no PATH or GIT_EXEC_PATH is set on the line.
+
+MINOR
+- PATH=$H/bin:$PATH git -c alias.wr=status wr $P and GIT_EXEC_PATH=... allow, NEW. Real: external git-wr beats the -c alias. Needs a script on disk first.
+- git wr -f$P allow. A glued short option hides the path.
+- parallel 'git wr $OUT{#}' ::: a b allow with $OUT2 present. Real: {#} and {%} are 1 then 2; the guard assumes 1.
+- Real parallel names absent from the table refuse: --jl --nn --dryrun --ll --latest-line and about 130 more. The real table has aliases for most.
+- The kept-quote reading is not applied in sem or stdin mode. Harmless today, since real parallel drops the quotes there too.
+- Hypothesis, not run: niceload rm -rf $P, env_parallel and parset allow. Not on the goodqa#15447 list.
+- Observation: rm -rf $OUT is allowed at base and head, so outside harness roots a linked worktree is only gated on the git path.
+
+CHECKED AND CLEAN
+Option-parse model: bundling, require_order, abbreviation, -- and case handling agree with src/parallel except the table entries above.
+_git_split_cmdline quoting and backslashes; built-in beats alias; -c beats GIT_CONFIG_COUNT; last -c wins; plain alias folds case; subsection alias is case-sensitive.
+Shell alias forms ($1, "$@", #, functions, sh -c, leading space) all block.
+Possible alias with relative -C chains, trailing slash, .., ~, $HOME, --path=, --, cd first: all block.
+xargs through nice, nohup, stdbuf, timeout, sudo, command, sh -c, -0, -a, /usr/bin/git: all block. while read, for, $(cat) block.
+Parallel through command, nice, timeout, sudo, env, absolute path, quoting, $(which), nested parallel: block.
+-a -, :::: -, /dev/stdin, <(...), {=, --rpl, --plus, --header, --profile: refused. -I, -i, --replace, --er, --dnr, --bnr, :::+, --link: rebuilt correctly.
+Required allows hold: git -c alias.wl='worktree list' wl, git -c alias.st=status st, plain aliases to built-ins.
+Fuzz: 53,109 random git and parallel strings, 0 internal errors. Internal-error risk is the alarm path in M13, not a parser crash.
+Dropped after checking real behaviour: git config set alias.x --comment=y (git errors); legacy git config alias.x --comment=y V (stores --comment=y); core.pager (no tty); parallel 'rm -rf X' ::: (runs nothing); parallel 'git {}' ::: 'worktree remove ...' (quoted as one word); sem -j2 sh -c 'rm -rf X' (quotes lost).
+
+INTERMITTENT FAILURE
+Not reproduced: four concurrent copies of the module, 84 tests each, all OK.
+One candidate from reading, unverified: test_every_line_is_rebuilt_past_the_old_caps asserts allow on 200 rm lines, and M13 shows the verdict flips to warn when the 3 s budget runs out under load. Logging the failing test name would settle it.
+
+TEST GAPS
+Fixture paths all contain .agent-harness, so raw_sensitive hides every fail-open. Add a repo outside protected roots.
+parallel_plan expectations are hand-written and the suite never compares them with real parallel, which is not installed locally or on dev2.
+
+PROBES (all through run_probe.py)
+- cpu, 1 GB, 170 s: decide() on a_git.tsv at head and base. Completed.
+- cpu, 1 GB, 560 s: decide() on b_par.tsv. An earlier 280 s copy hit my own 150 s per-side script limit and was rerun. Completed.
+- cpu, 1 GB, 560 s: decide() on c_false.tsv. Completed.
+- cpu, 1 GB, 280 s: decide() on d_more.tsv. Completed.
+- cpu, 1 GB, 230 s: decide() on e_more.tsv. Completed.
+- cpu, 1 GB, 200 s: .r3/runprobes.py replay. Completed, 18 rows differ: all explained by the round-3 ALLOW list, goodqa#15447 or older behaviour.
+- cpu, 1 GB, 80 s: fuzz.py 60 s. Completed, 0 errors.
+- external-write, 1 GB, 60 and 30 s: real_git.py, real_git2.py, stand-ins in a sandbox repo. Completed.
+- external-write, 1 GB, 150 and 90 s, 200 procs: real_parallel.py, real_parallel2.py, --dry-run plus marker runs in sandbox TMPDIR. Completed.
+- memory, 1 GB, 60 s each: dos.py cases, decide() and hook_main(). plan-amplify under decide(): BOUND HIT, memory 1.00 GB, recorded as M13. All others completed.
+- memory, 1 GB, 60 s each: dos2.sh repeats. Completed.
+- memory, 2 GB, 120 s, and cpu, 2 GB, 120 s: wrapper_probe.py on the real hook, head and base. Completed.
+- cpu, 2 GB, 280 s, 400 procs: flaky.sh. Completed, 4 of 4 OK.
+
+NOT EXAMINED
+Guard running on Linux: all probes ran on the Mac with git 2.54.
+Alias precedence on 2.43: merge_gate refused ssh t2-dev 'git -c alias.history=version history' as a push to main (false positive, no push in it) and I did not retry. The 2.43 point rests on t2-dev's --list-cmds=builtins plus the precedence observed on 2.54.
+GNU parallel other than 20261022. Older releases may lack --filter. ~/.parallel/config and /etc/parallel/config: read by real parallel, not probed.
+Other guard rules, the other three test modules, owned_checkout interplay. No ASVS mapping: a local shell guard, not a web or API change.
+
+PROPORTIONATE FIX DIRECTION
+Fail closed in the parallel branch first: tick the budget in _par_fill, cap lines times template size, and turn a stop inside it into a parallel-unverifiable finding.
+Replace the option table with an allowlist of options known not to change lines or run code, generated and checked against src/parallel; refuse PARALLEL= and any unknown option value.
+Make GIT_BUILTINS the intersection of supported releases.
+In _git_line_alias: leading assignments and exported variables only, return None on any unreadable key or value and on any alias.NAME.* key, and refuse when the depth limit is hit.
+Refuse a fed_input git with no literal subcommand or verb. Dispatch parallel, sem and xargs from find -exec.
+Then clear F1 and F2, which are small.

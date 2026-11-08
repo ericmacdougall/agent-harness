@@ -1,0 +1,58 @@
+# alias chain past the depth limit, target inside the value
+block	git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 -c alias.a9=a10 -c alias.a10='worktree remove --force {P}' a1
+block	git -c alias.a1=a2 -c alias.a2=a3 -c alias.a3=a4 -c alias.a4=a5 -c alias.a5=a6 -c alias.a6=a7 -c alias.a7=a8 -c alias.a8=a9 -c alias.a9=a10 -c alias.a10='worktree remove --force' a1 {P}
+block	git -c alias.w=worktree w remove --force {P}
+block	git -c alias.w=worktree w remove {P}
+block	git -c alias.m='worktree move' m {P} /x
+block	echo "{P} /x" | xargs git worktree move
+# parens with a target only perl builds
+block	parallel --parens ,,,, 'rm -rf ,,s:^:{B}/:,,' ::: linked
+block	parallel --parens ,,,, 'git wr ,,s:^:{B}/:,,' ::: linked
+block	parallel --parens ,,,, 'rm -rf ,,$_="{P}",,' ::: a
+# a worktree outside protected roots
+@cwd=OP
+allow	rm -rf {WT}/out-not-there
+?	rm -rf {OUT}
+block	git worktree remove --force {OUT}
+block	git wr {OUT}
+block	parallel 'git wr {WT}/out{#}' ::: a b
+block	parallel --trim lr git worktree remove --force ::: {OUT}
+block	parallel git worktree remove --force ::: ::: {OUT}
+block	parallel git wr ::: ::: {OUT}
+block	parallel 'echo {1}; git wr {-1}' ::: a ::: {OUT}
+block	git -c alias.bisect--helper='worktree remove --force' bisect--helper {OUT}
+block	git -c alias.wr=status -c alias.wr.command='worktree remove --force' wr {OUT}
+block	echo "worktree remove --force {OUT}" | xargs git
+block	git -c r.repo={OP} for-each-repo --config=r.repo worktree remove --force {OUT}
+block	git --shallow-file status worktree remove --force {OUT}
+block+nl	parallel git wr ::: 'a\n{OUT}'
+block	parallel --colsep , git wr ::: a,{OUT}
+block	parallel -d , git wr ::: a,{OUT}
+block	parallel --wd {WT} git wr out ::: x
+block	PARALLEL='git worktree remove --force' parallel ::: {OUT}
+@cwd=PR
+# -q rebuild
+block	parallel -q sh -c {} ::: 'rm -rf {P}'
+block	parallel -q sh -c {} ::: 'git worktree remove --force {P}'
+block	parallel -q sh -c 'git worktree remove --force {}' ::: {P}
+block	parallel -q sh -c 'cd {}; rm -rf .' ::: {P}
+block	parallel -q git -c alias.x='worktree remove --force' x {} ::: {P}
+block	parallel -q eval {} ::: 'rm -rf {P}'
+# sources the rebuilder may read wrongly
+block	parallel rm -rf ::: a :::+ {P} :::
+block	parallel rm -rf ::: :::+ {P}
+block	parallel rm -rf ::: "" ::: {P}
+block	parallel rm -rf :::: /dev/null ::: {P}
+block	parallel 'rm -rf {2}' ::: ::: {P}
+block	parallel 'rm -rf {}' ::: {P} :::
+block	parallel --arg-sep @@ rm -rf @@ @@ {P}
+# the replay of round-3 forms under a stdin source
+block	echo {P} | parallel --trim lr rm -rf
+block	echo {P} | parallel --trim lr git worktree remove --force
+block	parallel --trim lr git wr ::: {P}
+block	parallel -j4 --trim lr sh -c 'rm -rf {}' ::: {P}
+# what real parallel would do with a word that looks like an option value
+block	parallel --tmpdir /tmp --trim lr rm -rf ::: {P}
+block	parallel --trim=lr --trim lr rm -rf ::: {P}
+block	sem --trim lr rm -rf {P}
+block	sem --trim lr git worktree remove --force {P}

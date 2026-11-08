@@ -1,0 +1,8 @@
+test(command-guard): keep red-team probes for PR 151 round 3
+
+Why: the adversarial review of 28c9a0f returned BLOCK, and its reproducers and report must survive this worktree. This branch is local evidence only and is not for merge.
+What: add .rt151 with the report, decide() case files, real git and GNU parallel semantic checks, budget probes and the fuzz. No guard or suite file changes.
+Testing: python3 ~/.claude/hooks/run_probe.py with each declared bound, as listed under PROBES in .rt151/report-adversarial.txt -> all completed except plan-amplify under decide(), which hit its declared 1 GB bound and is recorded as finding M13. The focused module passed in four concurrent runs, 84 tests each.
+Refs: GoodQA #15346
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

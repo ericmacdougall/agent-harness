@@ -1,0 +1,157 @@
+# ordinary parallel use
+allow	parallel convert {} {.}.png ::: *.jpg
+allow	parallel 'ffmpeg -i {} {.}.mp4' ::: *.mov
+allow	parallel 'mv {} {.}.bak' ::: *.txt
+allow	parallel 'cp {} out/{/}' ::: src/*
+allow	parallel gzip ::: *.log
+allow	parallel 'gzip {}' ::: *.log
+allow	parallel -j4 'wc -l {}' ::: "$F"
+allow	parallel 'echo {/}' ::: "$F"
+allow	parallel 'echo {.}' ::: $(ls)
+allow	sem --wait
+allow	sem --wait --id x
+allow	sem -j4 --id x ./build.sh
+allow	parallel --version
+allow	parallel --help
+allow	parallel --number-of-cores
+allow	parallel --number-of-threads
+allow	parallel --citation
+allow	parallel --will-cite
+allow	parallel --record-env
+allow	parallel --plus 'echo {..}' ::: a.b.c
+allow	parallel --header : 'echo {a}' ::: a 1 2
+allow	parallel --rpl '{..} s:\.[^.]+$::;s:\.[^.]+$::;' 'echo {..}' ::: a.b.c
+allow	parallel -a urls.txt curl -sO
+allow	parallel curl -sO :::: urls.txt
+allow	parallel --colsep , 'echo {1} {2}' :::: data.csv
+allow	parallel --colsep , 'echo {1} {2}' ::: a,b
+allow	parallel --colsep , echo ::: a,b
+allow	cat urls | parallel curl -sO
+allow	cat urls | parallel -j8 'curl -s {} -o {/}'
+allow	ls *.gz | parallel gunzip
+allow	ls | parallel rm -f
+allow	find . -name '*.tmp' | parallel rm -f
+allow	seq 10 | parallel -j4 echo
+allow	parallel echo ::: {1..5}
+allow	parallel echo ::: $(seq 5)
+allow	parallel -j0 ./job.sh ::: a b
+allow	parallel --jl log.txt echo ::: a
+allow	parallel --joblog log.txt echo ::: a
+allow	parallel --nn echo ::: a
+allow	parallel --dryrun echo ::: a
+allow	parallel --dry-run echo ::: a
+allow	parallel --ll echo ::: a
+allow	parallel --latest-line echo ::: a
+allow	parallel --halt now,fail=1 echo ::: a
+allow	parallel --retries 3 --timeout 60 echo ::: a
+allow	parallel -j+0 echo ::: a
+allow	parallel -j50% echo ::: a
+allow	parallel --tag echo ::: a
+allow	parallel --lb echo ::: a
+allow	parallel --eta echo ::: a
+allow	parallel --bar echo ::: a
+allow	parallel --pipe --block 10M wc -l
+allow	parallel --pipe -N100 wc -l
+allow	parallel --pipepart -a big.txt --block 10M wc -l
+allow	parallel --link echo {1} {2} ::: a b ::: c d
+allow	parallel echo {1} {2} ::: a b :::+ c d
+allow	parallel --results out/ echo ::: a
+allow	parallel --shuf echo ::: a
+allow	parallel --memfree 1G echo ::: a
+allow	parallel --load 80% echo ::: a
+allow	parallel -N2 echo {1} {2} ::: a b c d
+allow	parallel -n2 echo ::: a b c d
+allow	parallel --max-args 2 echo ::: a b
+allow	parallel -X echo ::: a b
+allow	parallel -m echo ::: a b
+allow	parallel -k echo ::: a
+allow	parallel --keep-order echo ::: a
+allow	parallel -u echo ::: a
+allow	parallel --group echo ::: a
+allow	parallel -v echo ::: a
+allow	parallel -t echo ::: a
+allow	parallel -0 echo ::: a
+allow	parallel -q echo '{}' ::: a
+allow	parallel --env X echo ::: a
+allow	parallel --tmpdir /tmp/x echo ::: a
+allow	parallel --wd . echo ::: a
+allow	parallel -S host echo ::: a
+allow	parallel --nonall -S host uptime
+allow	parallel --onall -S a,b uptime ::: x
+allow	parallel --sshloginfile hosts echo ::: a
+allow	parallel --shellquote ::: a
+allow	parallel 'sh -c "echo {}"' ::: a
+allow	parallel 'rm -f {}' ::: a.tmp b.tmp
+allow	parallel rm -f {} ::: "$F"
+allow	parallel 'cd {} && npm test' ::: pkgs/*
+allow	parallel 'cd {} && git status' ::: pkgs/*
+allow	parallel 'git -C {} pull' ::: repo1 repo2
+allow	parallel 'git -C {} fetch' ::: {PR}
+allow	parallel -j4 'git -C {} log -1' ::: {P}
+allow	parallel --gnu echo ::: a
+allow	parallel --ungroup echo ::: a
+# ordinary non-built-in git use
+allow	git co main
+allow	git co "$BRANCH"
+allow	git lg "$FILE"
+allow	git ci -m "$(cat msg)"
+allow	git ci -m "msg $N"
+allow	git lfs pull
+allow	git lfs track "*.psd"
+allow	git lfs ls-files "$p"
+allow	git lfs fetch origin "$BRANCH"
+allow	git lfs fetch origin "$(git rev-parse HEAD)"
+allow	git subtree pull --prefix=vendor origin "$BRANCH"
+allow	git filter-repo --path "$F"
+allow	git send-email "$F"
+allow	git mergetool "$F"
+allow	git gui
+allow	git svn rebase
+allow	git ls-files -z | xargs -0 git lfs pointer --file
+allow	git ls-files | xargs git lfs track
+allow	find . -name '*.bin' -exec git lfs track {} +
+allow	git lg a.txt
+allow	git lfs track a.bin
+allow	git help worktree
+allow	git --version
+allow	git --help
+allow	git version
+allow	git
+allow	git -C {PR} wl
+allow	git gc --auto
+allow	git stash list
+allow	git request-pull v1 origin
+allow	git p4 sync
+allow	git annex add "$f"
+allow	git absorb --base "$B"
+allow	git town sync
+allow	git worktree list
+allow	git -c alias.wl='worktree list' wl
+allow	git -c alias.st=status st
+allow	git -c alias.st=status st --short
+allow	git -c alias.st=status -C {P} st
+allow	git -c alias.co=checkout co "$BRANCH"
+allow	git -c alias.lg='log --oneline' lg "$FILE"
+allow	git -c alias.st=status st | xargs echo
+allow	git lfs ls-files -n | xargs echo
+allow	git config --global alias.co checkout
+allow	git config --global alias.lg "log --graph --oneline"
+allow	git config --global alias.up '!git fetch && git rebase'
+allow	git config --global alias.last 'log -1 HEAD'
+allow	git config user.email a@example.invalid
+allow	git config --rename-section foo bar
+allow	git diff-highlight
+allow	echo a | xargs git status
+allow	git for-each-ref refs/heads
+@cwd=P
+allow	git st .
+allow	git lg .
+allow	git lg -- .
+allow	git lfs ls-files .
+allow	git lfs track a.bin
+allow	git lg a.txt
+allow	git lfs ls-files {P}/a.txt
+allow	git lg {P}/a.txt
+allow	git status .
+allow	git lfs pull
+@cwd=PR

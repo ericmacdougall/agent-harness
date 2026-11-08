@@ -1,0 +1,157 @@
+# A. built-in list entries that are not built-ins on this git (2.54) or on older hosts
+block	git -c alias.bisect--helper='worktree remove --force' bisect--helper {P}
+block	git -c alias.rebase--interactive='worktree remove --force' rebase--interactive {P}
+block	git -c alias.env--helper='worktree remove --force' env--helper {P}
+block	echo {P} | xargs git -c alias.bisect--helper='worktree remove --force' bisect--helper
+block	git bisect--helper {P}
+block	git -c alias.history='worktree remove --force' history {P}
+block	git -c alias.repo='worktree remove --force' repo {P}
+block	git -c alias.backfill='worktree remove --force' backfill {P}
+block	git -c alias.last-modified='worktree remove --force' last-modified {P}
+# B. alias.NAME.command, the 2.54 subsection form: last value in config order wins across both forms
+block	git -c alias.wr=status -c alias.wr.command='worktree remove --force' wr {P}
+block	git -c alias.wr.command='worktree remove --force' wr {P}
+block	git -c alias.wr=status --config-env=alias.wr.command=V wr {P}
+allow	git -c alias.wr.command='worktree remove --force' -c alias.wr=status wr {P}
+block	GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0=status GIT_CONFIG_KEY_1=alias.wr.command GIT_CONFIG_VALUE_1='worktree remove --force' git wr {P}
+block	git config --global alias.wr.command 'worktree remove --force'
+# C. a key built at run time after a settled value; values the guard cannot read
+block	K=$(echo alias.wr); git -c alias.wr=status -c "$K=worktree remove --force" wr {P}
+block	git -c alias.wr=status -c "$(echo alias.wr)=worktree remove --force" wr {P}
+block	git -c alias.wr=status -c "alias.$(echo wr)=worktree remove --force" wr {P}
+block	git -c alias.wr=status --config-env="$K=V" wr {P}
+block	git -c "alias.wr=$(cat {L})" wr
+block	V=$(cat {L}); git -c "alias.wr=$V" wr
+block	V='worktree remove --force {P}' git --config-env=alias.wr=V wr
+block	git -c include.path={H}/evil wr
+block	GIT_CONFIG_PARAMETERS="'alias.wr=worktree remove --force {P}'" git wr
+block	GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0="$(cat {L})" git wr
+block	GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0='worktree remove --force {P}' git wr
+block	GIT_CONFIG_GLOBAL={H}/evil git wr
+block	printf '[alias]\n\twr = worktree remove --force {P}\n' > {H}/evil ; GIT_CONFIG_GLOBAL={H}/evil git wr
+block	printf '[alias]\n\twr = worktree remove --force {P}\n' >> {PR}/.git/config ; git wr
+block	printf '[alias]\n\twr = worktree remove --force {P}\n' >> {H}/.gitconfig ; git wr
+# D. git config forms that write an alias past the value check
+block	git config --global foo.wr 'worktree remove --force {P}' ; git config --rename-section --global foo alias ; git wr
+block	git config --rename-section --global foo alias
+block	git config rename-section --global foo alias
+block	git config --global --rename-section foo alias
+block	git config --global alias.wr --comment=x 'worktree remove --force'
+block	git config set --comment=x alias.wr 'worktree remove --force'
+block	git config set alias.wr --comment=x 'worktree remove --force'
+block	git config set --append alias.wr 'worktree remove --force'
+block	git config --file {H}/c --add alias.wr 'worktree remove --force'
+block	git config --global alias.x '-c alias.y=worktree y remove --force {P}'
+block	git config --global alias.x '-c alias.y=worktree y remove --force {P}' ; git x
+block	git config --global alias.x 'for-each-repo --config=r.repo worktree remove --force {P}'
+block	git config --global alias.x "rebase --exec 'git worktree remove --force {P}' HEAD"
+block	git config --global alias.x "-c core.pager='git worktree remove --force {P}' -p log"
+allow	git config --global alias.wl 'worktree list --porcelain'
+# E. line-settled values that real git would not see (unexported, subshell, conditional)
+block	GIT_CONFIG_COUNT=1; GIT_CONFIG_KEY_0=alias.wr; GIT_CONFIG_VALUE_0=status; git wr {P}
+block	if false; then export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0=status; fi; git wr {P}
+block	(export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0=status); git wr {P}
+block	export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0=status; env -u GIT_CONFIG_COUNT git wr {P}
+block	export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0=status; unset GIT_CONFIG_COUNT; git wr {P}
+block	GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0=status env GIT_CONFIG_VALUE_0='worktree remove --force' git wr {P}
+block	GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0=status true; git wr {P}
+block	PATH={H}/bin:$PATH git -c alias.wr=status wr {P}
+block	GIT_EXEC_PATH={H}/bin git -c alias.wr=status wr {P}
+# F. built-ins that run commands or other subcommands
+block	git -c r.repo={PR} for-each-repo --config=r.repo worktree remove --force {P}
+block	git for-each-repo --config=r.repo worktree remove --force {P}
+block	git bisect run git worktree remove --force {P}
+block	git rebase --exec 'git worktree remove --force {P}' HEAD
+block	git rebase -x 'git worktree remove --force {P}' HEAD
+block	git submodule foreach 'git worktree remove --force {P}'
+block	git ls-remote --upload-pack='git worktree remove --force {P};:' .
+block	git fetch --upload-pack='git worktree remove --force {P};:' .
+block	git -c core.pager='git worktree remove --force {P}' -p log
+block	git -c core.fsmonitor='git worktree remove --force {P}' status
+block	git -c core.sshCommand='git worktree remove --force {P}' fetch
+block	git -c core.editor='git worktree remove --force {P}' commit
+block	git -c diff.external='git worktree remove --force {P}' diff
+block	git grep -O'git worktree remove --force {P}' foo
+block	git difftool -y -x 'git worktree remove --force {P}'
+block	GIT_PAGER='git worktree remove --force {P}' git -p log
+block	GIT_EDITOR='git worktree remove --force {P}' git commit
+block	GIT_SSH_COMMAND='git worktree remove --force {P}' git fetch
+block	GIT_EXTERNAL_DIFF='git worktree remove --force {P}' git diff
+# G. git's own global options
+block	git --shallow-file status worktree remove --force {P}
+block	git --shallow-file x worktree remove --force {P}
+block	git --shallow-file status worktree remove --force linked
+block	git --list-cmds=main worktree remove --force {P}
+block	git --no-pager --no-replace-objects worktree remove --force {P}
+# H. relative forms of a possible alias
+block	git -C {B} -C linked wr .
+block	git -C {B}/linked wr .
+block	git -C {B} wr linked
+block	git -C {B} -C linked wr ../linked
+block	cd {B}; git wr linked
+block	cd {P}; git wr .
+block	git wr {P}/
+block	git wr {P}/.
+block	git wr {P}/../linked
+block	git wr ~/.agent-harness/work/S/T/linked
+block	git wr $HOME/.agent-harness/work/S/T/linked
+block	git wr -f{P}
+block	git wr -- {P}
+block	git wr --force={P}
+block	git wr {P}/.git
+block	git -C "$X" wr {P}
+block	git -C '' wr linked
+@cwd=OP
+block	git wr {OUT}
+block	git wr ../out
+block	cd ../out; git wr .
+block	ln -s {OUT} {H}/l; git wr {H}/l
+block	git wr -f{OUT}
+@cwd=PR
+# I. indirect shapes with possible aliases
+block	echo {P} | xargs -0 git wr
+block	echo {P} | xargs "git" wr
+block	echo {P} | xargs /usr/bin/git wr
+block	echo {P} | xargs -- git wr
+block	echo {P} | xargs command git wr
+block	echo {P} | xargs nice -n 5 git wr
+block	echo {P} | xargs nohup git wr
+block	echo {P} | xargs stdbuf -o0 git wr
+block	echo {P} | xargs timeout 5 git wr
+block	echo {P} | xargs sudo -u root git wr
+block	echo {P} | xargs -a git git wr
+block	echo {P} | xargs sh -c 'git wr "$@"' _
+block	echo {P} | xargs sh -c 'git wr "$0"'
+block	find {P} -maxdepth 0 -exec nice git wr {} +
+block	find {P} -maxdepth 0 -exec sh -c 'git wr "$1"' _ {} \;
+block	while read p; do git wr "$p"; done < {L}
+block	for p in {P}; do git wr "$p"; done
+block	git wr $(cat {L})
+block	xargs -a {L} git wr
+# J. arguments moved into xargs input for built-ins
+block	echo "worktree remove --force {P}" | xargs git
+block	echo "remove --force {P}" | xargs git worktree
+block	echo remove | xargs -I% git worktree % --force {P}
+block	echo remove | xargs -I{} git worktree {} --force {P}
+block	echo worktree | xargs -I% git % remove --force {P}
+block	find {P} -name remove -exec git worktree {} --force {P} \;
+block	xargs git < {L}
+block	echo "-C {B} worktree remove --force linked" | xargs git
+# K. shell alias values
+block	git -c alias.x='!git worktree remove --force "$1" #' x {P}
+block	git -c alias.x='!f() { git worktree remove --force "$1"; }; f' x {P}
+block	git -c alias.x='!git worktree remove --force' x {P}
+block	git -c alias.x='!sh -c "git worktree remove --force \"\$0\""' x {P}
+block	git -c alias.x='!rm -rf "$1" #' x {P}
+block	git -c alias.x='!cd {B}; rm -rf linked #' x
+block	git -c alias.x='! git wr' x {P}
+block	git -c alias.x=' !git worktree remove --force {P}' x
+# L. state leaking from a judged nested line into the rest of the command
+@cwd=B
+block	parallel 'cd /tmp' ::: x ; rm -rf linked
+block	git -c alias.x='!cd /tmp' x ; rm -rf linked
+block	sh -c 'cd /tmp' ; rm -rf linked
+block	rm -rf linked
+@cwd=PR
+block	parallel 'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0=status' ::: a ; git wr {P}
+block	git -c alias.x='!export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0=status' x ; git wr {P}

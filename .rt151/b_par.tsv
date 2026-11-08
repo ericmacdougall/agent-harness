@@ -1,0 +1,149 @@
+# environment and profile input to parallel
+block	PARALLEL='rm -rf' parallel ::: {P}
+block	PARALLEL='git worktree remove --force' parallel ::: {P}
+block	export PARALLEL='rm -rf'; parallel ::: {P}
+block	PARALLEL='-I XX' parallel 'echo {1}; rm -rf XX' ::: {P}
+block	PARALLEL='--parens ,,,,' parallel 'rm -rf ,,s/x//,,' ::: {P}x
+# option table
+block	parallel --trim lr rm -rf ::: {P}
+block	parallel --trim lr git worktree remove --force ::: {P}
+block	parallel --tri lr rm -rf ::: {P}
+block	parallel --trim=lr rm -rf ::: {P}
+# replacement syntax outside the rebuilder
+block	parallel --parens ,,,, 'rm -rf ,,s/x//,,' ::: {P}x
+block	parallel --parens ,,,, 'git worktree remove --force ,,s/x//,,' ::: {P}x
+block	parallel 'echo {1}; rm -rf {-1}' ::: x ::: {P}
+block	parallel 'rm -rf {-1}' ::: {P}
+block	parallel 'git worktree remove --force {-1}; echo {1}' ::: a ::: {P}
+block	parallel --rpl '{x} $_="{P}"' rm -rf {x} ::: a
+block	parallel --rp '{x} $_="{P}"' rm -rf {x} ::: a
+block	parallel 'rm -rf {= s/x// =}' ::: {P}x
+block	parallel '{= $_="rm -rf {P}" =}' ::: a
+# ::: arguments that real parallel splits
+block+nl	parallel rm -rf ::: 'a\n{P}'
+block+nl	parallel git worktree remove --force ::: 'a\n{P}'
+block	parallel -d , rm -rf ::: a,{P}
+block	parallel --colsep , rm -rf ::: a,{P}
+block	parallel -C , 'rm -rf {}' ::: a,{P}
+block	parallel -C ' ' rm -rf ::: 'a {P}'
+block	parallel -C ' ' git worktree remove --force ::: 'a {P}'
+# directory and command options
+block	parallel --wd {B} rm -rf linked ::: x
+block	parallel --wd {B} 'rm -rf linked' ::: x
+block	parallel --workdir {P} 'rm -rf .' ::: x
+block	parallel --limit 'git worktree remove --force {P}' echo ::: a
+block	parallel --filter 'system(q(git worktree remove --force {P}))' echo ::: a
+block	parallel --tagstring '{= system(q(git worktree remove --force {P})) =}' echo ::: a
+block	parallel --results '{= system(q(git worktree remove --force {P})) =}' echo ::: a
+block	parallel --compress --compress-program 'git worktree remove --force {P}' echo ::: a
+block	parallel --ssh 'git worktree remove --force {P};:' -S x echo ::: a
+block	parallel -S 'git worktree remove --force {P};: x' echo ::: a
+# transforms
+block	parallel 'rm -rf {//}' ::: {P}/x/
+block	parallel 'rm -rf {//}' ::: {H}/x/
+block	parallel 'rm -rf {.}' ::: {P}.x
+block	parallel 'rm -rf {B}/linked{#}' ::: a b
+block	parallel 'rm -rf {B}/linked{%}' ::: a b
+block	parallel -j2 'git worktree remove --force {B}/linked{#}' ::: a b
+block	parallel --seqreplace XX 'rm -rf {B}/linkedXX' ::: a b
+block	parallel 'git -C {PR} worktree remove --force linked{#}' ::: a b
+# parallel reached with arguments from elsewhere
+block	echo {P} | xargs parallel rm -rf :::
+block	echo {P} | xargs parallel git worktree remove --force :::
+block	echo {P} | xargs -I% parallel rm -rf ::: %
+block	find {P} -maxdepth 0 -exec parallel rm -rf ::: {} +
+block	find {P} -maxdepth 0 -exec parallel git worktree remove --force ::: {} +
+block	parallel rm -rf ::: ::: {P}
+block	parallel rm -rf ::: {P} :::
+block	parallel 'rm -rf {P}' :::
+block	parallel 'git worktree remove --force {P}' :::
+block	parallel -N0 'git worktree remove --force {P}' :::
+block	parallel 'rm -rf {P}' ::: ::: a
+# names and wrappers of parallel itself
+block	env_parallel rm -rf ::: {P}
+block	env_parallel 'git worktree remove --force {}' ::: {P}
+block	parset x rm -rf ::: {P}
+block	niceload rm -rf {P}
+block	command parallel rm -rf ::: {P}
+block	nice parallel rm -rf ::: {P}
+block	timeout 5 parallel git worktree remove --force ::: {P}
+block	/usr/local/bin/parallel rm -rf ::: {P}
+block	sudo parallel rm -rf ::: {P}
+block	env X=1 parallel rm -rf ::: {P}
+block	\parallel rm -rf ::: {P}
+block	p'aral'lel rm -rf ::: {P}
+block	sh -c 'parallel rm -rf ::: {P}'
+block	$(which parallel) rm -rf ::: {P}
+block	parallel 'parallel rm -rf ::: {}' ::: {P}
+block	parallel parallel rm -rf ::: ::: {P}
+# -q and dynamic option values
+block	parallel -q rm -rf {} ::: {P}
+block	parallel -q sh -c 'rm -rf {}' ::: {P}
+block	parallel -q sh -c 'git worktree remove --force {}' ::: {P}
+block	R=$(echo XX); parallel -I "$R" 'echo {1}; rm -rf XX' ::: {P}
+block	parallel -I "$R" 'echo {1}; git worktree remove --force XX' ::: {P}
+block	parallel --parens "$R" 'rm -rf ,,s/x//,,' ::: {P}x
+block	parallel --arg-sep "$S" rm -rf ::: {P}
+block	parallel -J myprofile rm -f ::: x
+block	parallel --profile myprofile rm -f ::: x
+# files and stdin
+block	echo {P} | parallel -a - rm -rf
+block	echo {P} | parallel -a /dev/stdin rm -rf
+block	echo {P} | parallel rm -rf :::: -
+block	echo {P} | parallel rm -rf :::: /dev/stdin
+block	parallel 'rm -rf {}' :::: <(echo {P})
+block	echo {P} | parallel rm -rf
+block	echo {P} | parallel 'rm -rf {}'
+block	echo {B} | parallel 'rm -rf {}/linked'
+block	echo {P} | parallel 'cd {} && rm -rf .'
+block	echo {P} | parallel 'cd {} && git wr'
+block	echo {P} | parallel 'rm -rf {//}'
+block	echo {P} | parallel -I% 'rm -rf %'
+block	echo {P} | parallel git worktree remove --force
+block	echo {P} | parallel git wr
+block	echo {P} | parallel -j2 -k git wr --force
+block	echo {P} | parallel --pipe 'xargs git worktree remove --force'
+block	echo {P} | parallel --pipe xargs rm -rf
+block	echo {P} | sem xargs rm -rf
+block	echo {P} | parallel --pipe xargs git wr
+# sem
+block	sem 'rm -rf {P}'
+block	sem --id x --fg rm -rf {P}
+block	sem "cd {B}; git worktree remove --force linked"
+block	sem -j2 sh -c 'rm -rf {P}'
+block	sem -j2 sh -c 'git wr {P}'
+# grouping and linking
+block	parallel --xargs rm -rf ::: a {P}
+block	parallel -X rm -rf {} ::: a {P}
+block	parallel -m rm -rf ::: a {P}
+block	parallel --link rm -rf {1} {2} ::: a ::: {P}
+block	parallel 'rm -rf {1}/{2}' ::: {B} ::: linked
+block	parallel 'rm -rf {1}{2}' ::: {P} ::: ''
+block	parallel -I% rm -rf %/linked ::: {B}
+block	parallel -I % 'echo {}; rm -rf %' ::: {P}
+block	parallel --dnr @@ --bnr ++ 'rm -rf @@/++' ::: {P}
+block	parallel --er XX 'rm -rf XX' ::: {P}.y
+block	parallel --replace=% 'rm -rf %' ::: {P}
+block	parallel -iX 'rm -rf X' ::: {P}
+block	parallel --arg-file-sep @@ rm -rf @@ {L}
+block	parallel --argsep @@ rm -rf @@ {P}
+# line content
+block	parallel "rm -rf '{}'" ::: {P}
+block	parallel 'rm -rf $(echo {})' ::: {P}
+block	parallel 'x={}; rm -rf "$x"' ::: {P}
+block	parallel 'cd {}; rm -rf ./' ::: {P}
+block	parallel 'cd {}; git wr .' ::: {P}
+block	parallel 'cd {} && git worktree remove --force .' ::: {P}
+block	parallel 'cd {B} && rm -rf {}' ::: linked
+block	parallel 'git -C {} worktree remove --force linked' ::: {B}
+block	parallel git -C {} wr linked ::: {B}
+block	parallel "git -c alias.x='worktree remove --force' x {}" ::: {P}
+block	parallel "git -c alias.wr=status -c alias.wr.command='worktree remove --force' wr {}" ::: {P}
+block	parallel eval ::: 'rm -rf {P}'
+block	parallel sh -c ::: 'rm -rf {P}'
+block	parallel bash -c {} ::: 'rm -rf {P}'
+block	parallel 'eval {}' ::: 'rm -rf {P}'
+block	parallel -q sh -c {} ::: 'rm -rf {P}'
+block	parallel 'git {}' ::: 'worktree remove --force {P}'
+block	parallel 'git worktree {}' ::: 'remove --force {P}'
+block	parallel git worktree remove {} ::: {P}

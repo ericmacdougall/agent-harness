@@ -1,0 +1,32 @@
+# GIT_CONFIG_* words after the subcommand are plain arguments, not environment
+block	git wr {P} GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0=status
+block	git wr GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0=status {P}
+block	echo {P} | xargs git wr GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0=status
+block	git wr {P} GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0='!true'
+# a subcommand built at run time with its target on input
+block	echo {P} | xargs git "$S"
+block	echo {P} | xargs git $(echo wr)
+block	echo {P} | xargs git "$S" --force
+block	find {P} -maxdepth 0 -exec git "$S" {} +
+block	parallel git "$S" ::: {P}
+# earlier-round rows that block now: are they new?
+allow	find {B} -name '*.py' | xargs grep -n rm
+allow	find {B} -name '*.py' | xargs grep -ln 'mv '
+allow	ls {B} | xargs -I{} echo rm {}
+allow	git worktree "$(echo list)"
+allow	echo x | xargs -R 1 echo env
+allow	git config --list --show-origin --name-only
+# find -exec parallel and sem
+block	find {P} -maxdepth 0 -exec sem rm -rf {} +
+block	find {P} -maxdepth 0 -execdir parallel rm -rf ::: {} +
+block	find {P} -maxdepth 0 -exec nice parallel rm -rf ::: {} +
+block	find {P} -maxdepth 0 -exec sh -c 'parallel rm -rf ::: "$1"' _ {} \;
+# a shell-alias value that hides the target
+block	git -c alias.x='!git wr "$@"' x {P}
+block	git -c alias.x='!cd {B} && git wr linked' x
+block	echo {P} | git -c alias.x='!xargs git worktree remove --force' x
+block	git -c alias.x='!xargs git wr' x < {L}
+# real git reads -c key with its case; the guard folds it
+block	git -c ALIAS.WR='worktree remove --force' WR {P}
+block	git -c alias.WR=status -c alias.wr.command='worktree remove --force' wr {P}
+allow	git -c alias.WR.command='worktree list' wr
