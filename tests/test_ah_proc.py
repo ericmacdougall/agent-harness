@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
@@ -697,6 +698,331 @@ class GuardRule(unittest.TestCase):
     def test_chained_commands_are_each_judged(self):
         self.assertEqual(self.verdict(self.A + "--pid 4242 --reason x && pkill -f vite"), "block")
         self.assertEqual(self.verdict(self.A + "--pid 4242 --reason x; kill 99"), "block")
+
+
+class SessionScope(KillBase):
+    """goodqa#15253 item 4: main stops what its own owners spawned, without --foreign (no high notice).
+
+    Exact ownership only: the pid and start time must be in an authenticated `kill_guard.py spawn` ledger entry for
+    a worktree inside ~/.agent-harness/work/<session>/. A cwd or a path in argv never counts."""
+    foreign = NarrowedScope.foreign
+    START = "Thu Nov  5 17:00:00 2026"
+
+    def sess(self, *parts):
+        return os.path.join(os.path.realpath(str(self.home)), ".agent-harness", "work", "sess-1", *parts)
+
+    def spawned(self, pid, root=None, start=None):
+        kg.append_ledger(root or self.sess("agent-y", "tree"), pid, start or self.START, home=str(self.home))
+
+    def probe_for(self, pid, cwd="/elsewhere/repo", cmd="/usr/bin/sleep 300", live_start=None):
+        probe = self.base(proc(pid, 1, cmd=cmd))
+        probe.cwds = {pid: cwd}
+        probe.spawn_start = lambda q, _s=live_start or self.START: _s if q == pid else None
+        return probe
+
+    def test_a_process_spawned_in_the_session_needs_no_foreign(self):
+        self.spawned(1201)
+        self.assertEqual(self.run_kill(self.probe_for(1201), [1201])["results"][0]["status"], "refused")  # flag needed
+        out = self.run_kill(self.probe_for(1201), [1201], session_scope=True)
+        self.assertEqual(out["results"][0]["status"], "exited")
+        self.assertEqual(self.notices, [])
+        intents = [r for r in self.audit() if r.get("event") == "intent" and r.get("pid") == 1201]
+        self.assertEqual(intents[0].get("scope"), "session-spawn")
+
+    def test_cwd_or_argv_in_the_session_dir_is_not_ownership(self):
+        # #133 accepted these; review round 1 and main's ruling: never by a shared directory or argv text
+        for pid, cwd, cmd in ((1202, self.sess("agent-y", "tree"), "/usr/bin/sleep 300"),
+                              (1203, "/elsewhere/repo", "/usr/bin/python3 " + self.sess("agent-y", "run.py"))):
+            out = self.run_kill(self.probe_for(pid, cwd=cwd, cmd=cmd), [pid], session_scope=True)
+            self.assertEqual(out["results"][0]["status"], "refused", (cwd, cmd))
+        self.assertEqual(self.notices, [])
+
+    def test_reused_pid_other_session_and_lookalike_roots_stay_foreign(self):
+        other = os.path.join(os.path.realpath(str(self.home)), ".agent-harness", "work", "sess-2", "t")
+        self.spawned(1210, start="Wed Nov  4 09:00:00 2026")                 # recorded start differs: pid reused
+        self.spawned(1211, root=other)                                        # another session's worktree
+        self.spawned(1212, root=self.sess() + "0/t")                          # work/sess-10: a prefix, not inside
+        self.spawned(1213, root=self.sess("..", "sess-2", "t"))              # dot segments out of the session dir
+        self.spawned(1214, root="remote:dev2")                                # a remote ledger root
+        for pid in (1210, 1211, 1212, 1213, 1214, 1215):                      # 1215: never recorded
+            out = self.run_kill(self.probe_for(pid), [pid], session_scope=True)
+            self.assertEqual(out["results"][0]["status"], "refused", pid)
+        self.assertEqual(self.notices, [])
+
+    def test_a_forged_ledger_line_is_ignored(self):
+        root = self.sess("agent-y", "tree")
+        self.spawned(1299)  # creates the key and the ledger file
+        path = kg.ledger_path(root, str(self.home))
+        with open(path, "a") as handle:
+            handle.write(json.dumps({"pid": 1220, "start": self.START, "ts": 1, "root": root, "mac": "0" * 64}) + "\n")
+        out = self.run_kill(self.probe_for(1220), [1220], session_scope=True)
+        self.assertEqual(out["results"][0]["status"], "refused")
+
+    def test_protected_processes_are_still_refused(self):
+        self.spawned(1230)
+        probe = self.probe_for(1230, cmd="/usr/sbin/cron -f")
+        probe.procs[1230]["comm"] = "/usr/sbin/cron"
+        self.assertEqual(self.run_kill(probe, [1230], session_scope=True)["results"][0]["status"], "refused")
+
+    def test_a_session_id_is_required(self):
+        probe = self.foreign(1240, cwd=self.sess("x"))
+        with self.assertRaises(ak.KillError):
+            ak.kill_local([1240], "why", home=self.home, probe=probe, sleep=self.clock.sleep, clock=self.clock.now,
+                          session="", agent="", own_pid=OWN, worktree="/work", session_scope=True,
+                          notify=lambda h, e: None)
+        self.assertEqual(probe.sent, [])
+
+
+class ApprovedBy(KillBase):
+    """goodqa#15253 (11-07): the user asked main to stop a harness-console from 11-04 and its codex app-server child;
+    `ah kill` refused both with no path the user could authorize. --approved-by is that path, and it is bounded."""
+    STALE = "Wed Nov  4 10:00:00 2026"   # before the session process 3000 (Thu Nov  5 17:00) and days old
+    NOW = time.mktime(time.strptime("Sat Nov  7 12:00:00 2026", "%a %b %d %H:%M:%S %Y"))
+    TEXT = "please stop the stale harness-console pid 6101 and its codex child pid 6102, idle for days"
+
+    def approval(self, text=None):
+        return lambda ask, session, home: {"ask": ask, "source": "answer:x", "uuid": "u", "at": "t",
+                                           "text": self.TEXT if text is None else text}
+
+    def stale(self, *extra, cpu=0.0):
+        probe = self.base(proc(6101, 1, cmd="/Users/me/.agent-harness/bin/harness-console --port 0",
+                               comm="harness-console", start=self.STALE),
+                          proc(6102, 6101, cmd="/opt/codex/bin/codex app-server", comm="codex", start=self.STALE),
+                          *extra)
+        probe.cwds = {6101: "/elsewhere/a", 6102: "/elsewhere/a"}
+        probe.cpu = lambda pid: cpu
+        return probe
+
+    def approved(self, probe, pids, text=None, **kw):
+        return self.run_kill(probe, pids, approved_by="wa1b2c3d4e5f", approval_resolver=self.approval(text),
+                             now=self.NOW, **kw)
+
+    def test_control_without_approval_both_are_refused(self):
+        out = self.run_kill(self.stale(), [6101, 6102], foreign=True)
+        self.assertEqual([r["status"] for r in out["results"]], ["refused", "refused"])
+
+    def test_a_named_stale_idle_console_and_codex_child_stop_with_a_notice(self):
+        probe = self.stale()
+        out = self.approved(probe, [6101], tree=True)
+        self.assertEqual(sorted((r["pid"], r["status"]) for r in out["results"]), [(6101, "exited"), (6102, "exited")])
+        self.assertEqual(len(self.notices), 1)
+        self.assertTrue(self.notices[0]["key"].startswith("ah-kill:approved:"))
+        self.assertEqual(self.notices[0]["severity"], "high")
+        self.assertEqual(self.notices[0]["detail"]["ask"], "wa1b2c3d4e5f")
+        intents = {r["pid"]: r for r in self.audit() if r.get("event") == "intent"}
+        self.assertEqual({intents[6101]["scope"], intents[6102]["scope"]}, {"approved"})
+        self.assertEqual(intents[6102]["lifted"], "protected process (codex)")
+
+    def test_each_bound_refuses(self):
+        cases = {
+            "not named": dict(text="please stop the stale processes"),
+            # delta red-team D-F3: a program name, a negation or a bare number collision is not an approval
+            "program name only": dict(text="yes, stop the stale codex processes"),
+            "negation": dict(text="do not stop codex pid 6201"),
+            "negation contraction": dict(text="pid 6201 is mine, don't stop it"),
+            "bare number": dict(text="the 6201 runs can go"),
+            "longer number": dict(text="stop pid 62011"),
+            "too young": dict(start="Sat Nov  7 06:00:00 2026"),
+            "after the session started": dict(start="Fri Nov  6 09:00:00 2026"),
+            "running": dict(stat_="R"),
+            "using cpu": dict(cpu=3.5),
+            "cpu unknown": dict(cpu=None),
+        }
+        for name, case in cases.items():
+            with self.subTest(name=name):
+                self.notices.clear()
+                probe = self.base(proc(6201, 1, cmd="/opt/codex/bin/codex app-server", comm="codex",
+                                       start=case.get("start", self.STALE), stat_=case.get("stat_", "S")))
+                probe.cwds = {6201: "/elsewhere/b"}
+                probe.cpu = lambda pid, c=case.get("cpu", 0.0): c
+                text = case.get("text", "stop codex pid 6201 please, it is stale")
+                out = self.approved(probe, [6201], text=text)
+                self.assertEqual(out["results"][0]["status"], "refused")
+                self.assertIn("--approved-by", out["results"][0]["detail"])
+                self.assertEqual(probe.sent, [])
+                self.assertEqual(self.notices, [])
+
+    def test_other_refusals_are_never_lifted(self):
+        text = "stop pids 6301 6302 6303 6304 6305 6306 rclone netwatch hookd sshd zsh"
+        for pid, kw in ((6301, dict(cmd="rclone sync /a b:", comm="rclone")),
+                        (6302, dict(cmd="/opt/netwatch/netwatch run", comm="netwatch")),
+                        (6303, dict(cmd="python3 /h/hookd.py serve", comm="python3")),
+                        (6304, dict(cmd="/usr/sbin/sshd -D", comm="sshd")),
+                        (6305, dict(cmd="/opt/codex/bin/codex", comm="codex", uid=ME + 1)),
+                        (6306, dict(cmd="/System/Library/x", comm="/System/Library/x"))):
+            with self.subTest(pid=pid):
+                probe = self.base(proc(pid, 1, start=self.STALE, **kw))
+                probe.cwds = {pid: "/elsewhere/c"}
+                probe.cpu = lambda q: 0.0
+                out = self.approved(probe, [pid], text=text)
+                self.assertEqual(out["results"][0]["status"], "refused")
+                self.assertEqual(probe.sent, [])
+        probe = self.stale()
+        out = self.approved(probe, [3000], text="stop pid 3000 claude")  # the caller's own session process
+        self.assertEqual(out["results"][0]["status"], "refused")
+
+    def test_no_notice_means_no_signal(self):
+        probe = self.stale()
+
+        def broken(home, event):
+            raise OSError("ops-watch down")
+        with self.assertRaises(ak.KillError):
+            self.approved(probe, [6101], notify=broken)
+        self.assertEqual(probe.sent, [])
+
+
+class ApprovalResolution(unittest.TestCase):
+    """resolve_approval reads the real asks ledger and transcript through provenance."""
+    SID = "11111111-2222-3333-4444-555555555555"
+    UID = "00000000-0000-0000-0000-0000000000a1"
+    ASK = "wa1b2c3d4e5f"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+
+    def world(self, text="please stop the stale harness-console 6101 now", at="2026-11-07T10:00:00Z",
+              source=None, resolved=True, origin="human"):
+        projects = self.home / ".claude" / "projects" / "-x"
+        projects.mkdir(parents=True)
+        record = {"type": "user", "uuid": self.UID, "timestamp": at, "sessionId": self.SID,
+                  "origin": {"kind": origin}, "message": {"role": "user", "content": text}}
+        (projects / (self.SID + ".jsonl")).write_text(json.dumps(record, separators=(",", ":")) + "\n")
+        wals = self.home / ".claude" / "wals" / self.SID
+        wals.mkdir(parents=True)
+        rows = [{"at": "2026-11-07T09:59:00Z", "event": "ask", "id": self.ASK, "note": "stop 6101?", "reason": "user asked"}]
+        if resolved:
+            rows.append({"at": "2026-11-07T10:01:00Z", "event": "ask_resolved", "ref": self.ASK, "id": "wffffffffff1",
+                         "source": source or 'user:%s/%s "stop the stale harness-console 6101"' % (self.SID, self.UID)})
+        (wals / "main.jsonl").write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows))
+
+    NOW = 1794045600.0 + 7200  # 2026-11-07T12:00:00Z
+
+    def resolve(self, ask=None, session=None):
+        return ak.resolve_approval(ask or self.ASK, session or self.SID, self.home, now=self.NOW)
+
+    def test_a_user_resolved_ask_verifies_and_carries_the_human_text(self):
+        self.world()
+        got = self.resolve()
+        self.assertIn("harness-console 6101", got["text"])
+        self.assertEqual(got["ask"], self.ASK)
+
+    def test_unverified_or_stale_approvals_are_refused(self):
+        bad = {
+            "unresolved": (dict(resolved=False), "no ask_resolved"),
+            "stale": (dict(at="2026-11-05T10:00:00Z"), "older than"),
+            "not human": (dict(origin="peer"), "verified human turn"),
+            "pasted": (dict(text="look <pasted_content>stop the stale harness-console 6101</pasted_content>",
+                            source='pasted:%s/%s "stop the stale harness-console 6101"' % (SID_, UID_)),
+                       "verified human turn"),
+            "excerpt not in turn": (dict(text="hello there, nothing to stop today"), "verified human turn"),
+        }
+        for name, (kw, why) in bad.items():
+            with self.subTest(name=name):
+                self.tearDown_world()
+                self.world(**kw)
+                with self.assertRaises(ak.KillError) as caught:
+                    self.resolve()
+                self.assertIn(why, str(caught.exception))
+        self.tearDown_world()
+        self.world()
+        for ask, session, why in (("wzzzzzzzzzzz", None, "no ask"),
+                                  (None, "99999999-2222-3333-4444-555555555555", "no ask"),
+                                  ("bad id!", None, "needs the id")):
+            with self.subTest(ask=ask, session=session):
+                with self.assertRaises(ak.KillError) as caught:
+                    self.resolve(ask, session)
+                self.assertIn(why, str(caught.exception))
+
+    def tearDown_world(self):
+        import shutil
+        shutil.rmtree(self.home / ".claude", ignore_errors=True)
+
+
+SID_, UID_ = ApprovalResolution.SID, ApprovalResolution.UID
+
+
+class ApprovedByGuard(unittest.TestCase):
+    A = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason stale --approved-by wa1b2c3d4e5f"
+
+    def verdict(self, cmd, main):
+        with tempfile.TemporaryDirectory() as tmp:
+            return kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp, main=main)[0]
+
+    def test_main_only_and_a_plain_id(self):
+        self.assertEqual(self.verdict(self.A, True), "allow")
+        self.assertEqual(self.verdict(self.A, False), "block")
+        self.assertEqual(self.verdict(self.A.replace("wa1b2c3d4e5f", "'x y'"), True), "block")
+
+
+class ApprovedPids(unittest.TestCase):
+    """delta red-team D-F3: only an explicit pid list approves."""
+
+    def test_lists(self):
+        self.assertEqual(ak.approved_pids("stop pids 10968, 28579 and 39962 please"), {10968, 28579, 39962})
+        self.assertEqual(ak.approved_pids("pid: 4242"), {4242})
+        self.assertEqual(ak.approved_pids("the 2025 runs and claude can go"), set())
+
+
+class SessionBinding(unittest.TestCase):
+    """delta red-team D-F2: --session-scope and --approved-by use the caller's own session only."""
+    SID = "11111111-2222-3333-4444-555555555555"
+
+    def verdict(self, cmd, session):
+        with tempfile.TemporaryDirectory() as tmp:
+            return kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp, main=True, session=session)[0]
+
+    def test_guard_binds_the_session(self):
+        for flag in ("--session-scope", "--approved-by wa1b2c3d4e5f"):
+            base = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason stale " + flag
+            with self.subTest(flag=flag):
+                self.assertEqual(self.verdict(base, self.SID), "allow")
+                self.assertEqual(self.verdict(base + " --session " + self.SID, self.SID), "allow")
+                self.assertEqual(self.verdict(base + " --session other-session-0001", self.SID), "block")
+        plain = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason stale --session other-session-0001"
+        self.assertEqual(self.verdict(plain, self.SID), "allow")  # an ordinary own-tree stop is unchanged
+
+    def test_ah_refuses_another_session(self):
+        import ah
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": self.SID}):
+            for extra in (["--session-scope"], ["--approved-by", "wa1b2c3d4e5f"]):
+                with self.subTest(extra=extra):
+                    args = ah.build_parser().parse_args(["kill", "--pid", "4242", "--reason", "stale",
+                                                         "--session", "other-session-0001"] + extra)
+                    with self.assertRaises(ah.AhError) as caught:
+                        ah.run(args, Path(home))
+                    self.assertIn("this session only", str(caught.exception))
+
+
+class SessionScopeGuard(unittest.TestCase):
+    """kill_guard admits --session-scope only from main (caller_identity.is_main on the hook payload)."""
+    A = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason stuck --session-scope"
+
+    def verdict(self, cmd, subagent):
+        with tempfile.TemporaryDirectory() as tmp:
+            return kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp, main=not subagent)[0]
+
+    def test_main_may_pass_the_flag(self):
+        self.assertEqual(self.verdict(self.A, subagent=False), "allow")
+
+    def test_a_subagent_may_not(self):
+        self.assertEqual(self.verdict(self.A, subagent=True), "block")
+        self.assertEqual(self.verdict(self.A.replace(" --session-scope", ""), subagent=True), "allow")
+
+    def test_hook_reads_agent_id_from_the_payload(self):
+        # after step 1 (B7) main is proven by caller_identity.is_main: a session id and its own transcript file
+        sid = "11111111-2222-3333-4444-555555555555"
+        with tempfile.TemporaryDirectory() as home:
+            transcript = Path(home) / ".claude" / "projects" / "-x" / (sid + ".jsonl")
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text("{}\n")
+            proof = {"session_id": sid, "transcript_path": str(transcript)}
+            for extra, code in ((proof, 0), (dict(proof, agent_id="a1"), 2), ({}, 2)):
+                body = json.dumps(dict({"tool_name": "Bash", "tool_input": {"command": self.A}, "cwd": home}, **extra))
+                done = subprocess.run([sys.executable, "-I", str(Path(kg.__file__)), "hook"], input=body.encode(),
+                                      capture_output=True, timeout=60, env={"HOME": home, "PATH": "/usr/bin:/bin"})
+                self.assertEqual(done.returncode, code, (extra, done.stderr[-300:]))
 
 
 if __name__ == "__main__":

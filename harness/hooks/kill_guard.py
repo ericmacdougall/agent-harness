@@ -757,9 +757,10 @@ def _import_base():
 
 def make_analyzer_class(cg):
     class KillAnalyzer(cg.Analyzer):
-        def __init__(self, compiled, cwd, ps, ownership, policy, raw, main=False):
+        def __init__(self, compiled, cwd, ps, ownership, policy, raw, main=False, session=None):
             super().__init__(compiled, cwd=cwd, ps=ps)
-            self.main = bool(main)  # caller_identity.is_main proved main; only the netwatch route uses it
+            self.main = bool(main)  # caller_identity.is_main proved main: netwatch route and ah --session-scope
+            self.session = session or ""  # the payload's session_id (D-F2: --session must match it for those flags)
             self.own = ownership
             self.policy = policy
             self.raw = raw
@@ -1435,15 +1436,19 @@ def make_analyzer_class(cg):
                 return False
             if texts[i + 2:] in (['--help'], ['-h']):
                 return True  # usage text only: ah.py prints it and exits before any process is touched
-            rest, i, seen = texts[i + 2:], 0, set()
+            rest, i, seen, given_session = texts[i + 2:], 0, set(), None
             while i < len(rest):
                 t = rest[i]
                 key, eq, val = t.partition('=') if t.startswith('--') else (t, '', '')
-                if key in ('--tree', '--foreign') and not eq:
+                if key == '--session-scope' and not eq and not self.main:
+                    return False  # main only: a subagent's payload carries agent_id (goodqa#15253)
+                if key in ('--tree', '--foreign', '--session-scope') and not eq:
                     seen.add(key)
                     i += 1
                     continue
-                if key not in ('--pid', '--reason', '--grace', '--host', '--agent', '--session'):
+                if key == '--approved-by' and not self.main:
+                    return False  # main only: a subagent cannot spend the user's approval (goodqa#15253)
+                if key not in ('--pid', '--reason', '--grace', '--host', '--agent', '--session', '--approved-by'):
                     return False
                 if not eq:
                     if i + 1 >= len(rest):
@@ -1465,8 +1470,16 @@ def make_analyzer_class(cg):
                 elif key == '--host':
                     if val not in ('dev2', 't2-dev', 'ah-mac-mini'):
                         return False
+                elif key == '--approved-by':
+                    if not re.fullmatch(r'[A-Za-z0-9_-]{4,40}', val):
+                        return False
                 elif not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', val):
                     return False
+                if key == '--session':
+                    given_session = val
+            if ({'--session-scope', '--approved-by'} & seen) and given_session is not None \
+                    and given_session != self.session:
+                return False  # delta red-team D-F2: main may not use another session's spawns or asks
             return '--pid' in seen and '--reason' in seen
 
         def check_interpreter(self, name, texts, cmd):
@@ -1699,7 +1712,8 @@ def parse_kill_words(args, remote=False):
     return None, signal, list(args[rest:])
 
 
-def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=None, home=None, main=False):
+def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=None, home=None, main=False,
+           session=None):
     """Return (verdict, rule, message, pids): verdict is 'allow', 'warn' or 'block'. Never raises.
     main: the caller is proven to be the main agent (caller_identity.is_main). Default False, the stricter reading."""
     policy = policy or load_policy()
@@ -1716,7 +1730,7 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
             raise cg.Blocked('command is larger than the analysis limit')
         effective = cwd or compiled.cwd
         own = ownership or Ownership(effective, home=home, policy=policy)
-        analyzer = make_analyzer_class(cg)(compiled, effective, ps, own, policy, raw, main=main)
+        analyzer = make_analyzer_class(cg)(compiled, effective, ps, own, policy, raw, main=main, session=session)
         findings = analyzer.run_kill_scan(command)
         if not findings:
             for base in analyzer.ctx.findings:
@@ -1826,7 +1840,8 @@ def analyze_main(data=None):
         cwd = cg.payload_cwd(payload)
         import caller_identity  # noqa: PLC0415 - positive main proof, not the absence of agent_id (B7)
         main = caller_identity.is_main(payload)
-        verdict, _rule, message, _pids = decide(command, cwd=cwd, ps=ps, policy=policy, main=main)
+        session = str(payload.get("session_id") or "") if main else ""
+        verdict, _rule, message, _pids = decide(command, cwd=cwd, ps=ps, policy=policy, main=main, session=session)
         return emit(verdict, message)
     except TimeoutError:
         if fallback_blocks(raw):

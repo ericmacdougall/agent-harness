@@ -2738,6 +2738,14 @@ def build_parser():
     kp.add_argument("--host", help="run on dev2, t2-dev or ah-mac-mini over ssh")
     kp.add_argument("--foreign", action="store_true",
                     help="allow a process outside your worktree and process tree (audited; raises a high ops-watch notice)")
+    kp.add_argument("--session-scope", action="store_true",
+                    help="main only (kill_guard enforces it): also treat as own a process that `kill_guard.py spawn` "
+                         "recorded (pid and start time) for a worktree in this session's ~/.agent-harness/work/<session>/ "
+                         "(audited, no --foreign)")
+    kp.add_argument("--approved-by", metavar="ASK_ID",
+                    help="main only, local only: id of a resolved ask whose answer is a real human turn at most 24 h old "
+                         "listing the exact pid (\"pid N\", no negation), in this session only; lifts the harness-console and claude/codex refusals for processes "
+                         "idle (sleeping, 0%% CPU) and started over 24 h ago and before this session (audited, high notice)")
     kp.add_argument("--session")
     kp.add_argument("--agent", help="calling agent id for the audit row")
     kp.add_argument("--wal", help="caller WAL path (default: this session's main WAL)")
@@ -2859,12 +2867,25 @@ def run(args, home: Path) -> dict:
         try:
             pids = ah_kill.parse_pids(args.pid)
             agent = args.agent or os.environ.get("AH_AGENT_ID", "")
+            if args.host and args.session_scope:
+                raise ah_kill.KillError("bad_request", "--session-scope is local only; a --host stop needs --foreign")
+            if args.host and args.approved_by:
+                raise ah_kill.KillError("bad_request", "--approved-by is local only")
+            session = args.session or env_session()
+            if args.session_scope or args.approved_by:
+                # delta red-team D-F2: these read this session's spawn ledger and asks, never another session's
+                own = env_session()
+                if not own or (args.session and args.session != own):
+                    raise ah_kill.KillError("bad_request", "--session-scope and --approved-by use this session only; "
+                                            "drop --session or pass this session's id")
+                session = own
             if args.host:
                 return ah_kill.kill_remote(args.host, pids, (args.reason or "").strip(), args.tree, args.grace,
                                            args.session or env_session(), agent, home, foreign=args.foreign)
             return ah_kill.kill_local(pids, args.reason, args.tree, args.grace, home,
-                                      session=args.session or env_session(), agent=agent, wal_path=args.wal,
-                                      via=args.via, foreign=args.foreign)
+                                      session=session, agent=agent, wal_path=args.wal,
+                                      via=args.via, foreign=args.foreign, session_scope=args.session_scope,
+                                      approved_by=args.approved_by)
         except ah_kill.KillError as e:
             raise AhError(e.code, str(e), e.exit_code)
     raise AhError("unknown_command", cmd)
