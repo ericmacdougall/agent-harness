@@ -304,9 +304,40 @@ class WorktreeRemoveIndirect(WorktreeRemoveCase):
             "sh -c 'git worktree remove --force %s'" % path,
             'git worktree remove --force %s' % path,
             'echo %s | xargs git -C %s worktree remove --force' % (path, self.primary),
+            # red-team H1/H2: options with a separate value hide the command from a table-driven parser
+            'xargs -J %% git worktree remove --force %% < %s' % lst,
+            'xargs -R 1 -I {} git worktree remove --force {} < %s' % lst,
+            'xargs -S 255 -I {} git worktree remove --force {} < %s' % lst,
+            'xargs --max-args 1 git worktree remove --force < %s' % lst,
+            'xargs --arg-file %s git worktree remove --force' % lst,
+            'xargs --delimiter X git worktree remove --force < %s' % lst,
+            'xargs --max-procs 4 git worktree remove --force < %s' % lst,
+            'echo %s | parallel -j 4 git worktree remove --force' % path,
+            'parallel -j 4 git worktree remove --force ::: %s' % path,
+            'parallel -a %s git worktree remove --force' % lst,
+            'parallel --arg-file %s git worktree remove --force' % lst,
+            'parallel --jobs 4 rm -rf %s' % path,
+            # red-team M1-M5
+            'git --attr-source HEAD worktree remove --force %s' % path,
+            "git -c alias.wr='worktree remove' wr --force %s" % path,
+            "git -c 'alias.wr=!git worktree remove --force' wr %s" % path,
+            '/usr/libexec/git-core/git-worktree remove --force %s' % path,
+            'git-worktree remove --force %s' % path,
+            'git $(echo worktree) remove --force %s' % path,
+            'git worktree $(echo remove) --force %s' % path,
+            'git "$W" remove --force %s' % path,
+            'git worktree move %s %s/moved' % (path, self.home),
         )
 
     def test_indirect_forms_block_and_the_lone_literal_form_still_passes(self):
         passed = [c for c in self.forms() if self.decide(c)[0] != 'block']
         self.assertEqual(passed, [], 'an indirect worktree remove slipped through')
         self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'allow')
+
+    def test_harmless_indirect_git_stays_allowed(self):
+        lst = self.home / 'list.txt'
+        lst.write_text(str(self.linked) + '\n')
+        for c in ('xargs git worktree list < %s' % lst, 'find %s -maxdepth 0 -exec git status {} +' % self.linked,
+                  'xargs -J %% git -C %% status < %s' % lst, 'git worktree add %s/new' % self.home,
+                  'parallel -j 4 git status ::: %s' % self.linked):
+            self.assertEqual(self.decide(c)[0], 'allow', c)

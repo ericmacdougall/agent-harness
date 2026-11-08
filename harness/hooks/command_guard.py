@@ -2943,6 +2943,8 @@ class Analyzer:
         if name == 'find':
             self.find(args, depth, pl, idx)
             return
+        if name == 'git-worktree':  # red-team M3: the separate program is the same command
+            self.git([_literal_word('worktree')] + list(args), words, cmd.words)
         if name == 'git':
             self.git(args, words, cmd.words)
         if name == 'rclone':
@@ -3131,6 +3133,7 @@ class Analyzer:
                 self.inner_words(args[k:], depth, pl, idx)
             return True
         if name == 'parallel':
+            self.indirect_scan(args, depth, pl, idx)
             if ':::' in texts:
                 cut = texts.index(':::')
                 head = [t for t in texts[:cut] if not t.startswith('-')]
@@ -3224,8 +3227,7 @@ class Analyzer:
                 i += 2 if texts[i] in ('-n', '-I', '-P', '-d', '-L', '-a', '-E', '-s', '-i', '-l') else 1
             if i < len(args):
                 self.inner_words(args[i:], depth, pl, idx, via_xargs=True)
-            else:
-                pass
+            self.indirect_scan(args, depth, pl, idx)
             return
         elif name in ('watch',):
             pass
@@ -3264,6 +3266,18 @@ class Analyzer:
                              'xargs deletes paths given on its input, and that input names a protected harness location',
                              'delete only paths inside your own task worktree, named directly')
                 return
+
+    INDIRECT_COMMANDS = frozenset(('git', 'rm', 'rmdir', 'unlink', 'mv', 'shred', 'truncate', 'find', 'rsync', 'sh', 'bash',
+                                   'zsh', 'dash', 'ksh', 'env', 'sudo', 'ssh', 'xargs', 'parallel', 'eval', 'git-worktree'))
+
+    def indirect_scan(self, args, depth, pl, idx):
+        """goodqa#15346 red-team H1/H2: xargs and parallel take many options with a separate value (-J % -R 1 -S 255,
+        --max-args 1, --arg-file F, -j 4, -a F). A table of them is always incomplete, so every later word that names a
+        command that can delete is also analysed as the start of a command (bounded). Over-blocking an odd argument that
+        merely spells such a name is accepted: fail toward block."""
+        for j in range(min(len(args), 24)):
+            if posixpath.basename(args[j].text) in self.INDIRECT_COMMANDS and not args[j].text.startswith('-'):
+                self.inner_words(args[j:], depth, pl, idx, via_xargs=True)
 
     def inner_words(self, words, depth, pl, idx, via_xargs=False):
         if not words:
@@ -3684,9 +3698,11 @@ class Analyzer:
         cwd_words = []
         locations = []
         alias = False
+        alias_removes = False
         while i < len(texts):
             t = texts[i]
-            if t in ('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env'):
+            if t in ('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env',
+                     '--attr-source'):
                 if t in ('-C', '--work-tree') and i + 1 < len(args):
                     cwd_word = args[i + 1]
                     if t == '-C':
@@ -3695,6 +3711,8 @@ class Analyzer:
                     locations.append(args[i + 1].text)
                 if t == '-c' and i + 1 < len(args) and args[i + 1].text.casefold().startswith('alias.'):
                     alias = True
+                    if re.search(r'worktree[\s\x00]+remove|worktree[\s\x00]+move', args[i + 1].text.casefold()):
+                        alias_removes = True
                 i += 2
             elif t.startswith(('--git-dir=', '--work-tree=')):
                 locations.append(t.split('=', 1)[1])
@@ -3727,9 +3745,19 @@ class Analyzer:
                         'git worktree remove without a literal target on its command line (xargs, find -exec, parallel '
                         'or a placeholder) cannot be verified',
                         'use the standalone literal non-forced form after cleaning and publishing the worktree')
-        if sub == 'worktree' and rest[:1] in (['remove'], ['prune']):
+        # red-team M2/M4: an alias to worktree remove, or a subcommand built at run time, acts on its literal targets
+        if (alias_removes or (i < len(args) and (args[i].dynamic or args[i].subs))
+                or (sub == 'worktree' and len(args) > i + 1 and (args[i + 1].dynamic or args[i + 1].subs))
+                or (alias and sub not in self.OWNED_READ_SUBS and sub not in self.OWNED_CHANGES)):
+            for w in _nondash(args[i + 1:]):
+                self.refuse('git worktree remove (alias or built subcommand)', w)
+            if alias_removes:
+                ctx.add(LOG_DELETE, 'linked-worktree-remove',
+                        'a git alias that runs worktree remove or move cannot be verified',
+                        'use the standalone literal non-forced form after cleaning and publishing the worktree')
+        if sub == 'worktree' and rest[:1] in (['remove'], ['prune'], ['move']):
             for w in _nondash(args[i + 2:]):
-                refused = self.refuse('git worktree remove', w)
+                refused = self.refuse('git worktree ' + rest[0], w)
                 if rest[:1] == ['remove'] and not refused:
                     ctx.add(LOG_DELETE, 'linked-worktree-remove',
                             'git worktree remove is allowed only for one verified clean, published, registered linked '
