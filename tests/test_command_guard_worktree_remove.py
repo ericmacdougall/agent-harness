@@ -276,3 +276,30 @@ class WorktreeRemoveMerged(WorktreeRemoveCase):
         git(self.linked, 'add', 'kept.txt'); git(self.linked, 'commit', '-q', '-m', 'on branch')
         git(self.linked, 'checkout', '-q', '--detach', 'main')
         self.assertIsNone(self.refusal())
+
+
+class WorktreeRemoveDashC(WorktreeRemoveCase):
+    """A subagent's shell resets to $HOME on every call, so the only way to name the registry repository is one literal
+    -C. Every other -C shape, and every refusal the plain form has, must still block."""
+
+    def test_literal_dash_c_repo_is_allowed_and_keeps_every_refusal(self):
+        plain = self.home / 'plain'; plain.mkdir()
+        ok = 'git -C %s worktree remove %s' % (self.primary, self.linked)
+        self.assertEqual(self.decide(ok, cwd=plain)[0], 'allow')
+        self.assertEqual(self.decide('git -C %s worktree remove -- %s' % (self.primary, self.linked), cwd=plain)[0], 'allow')
+        blocked = (
+            'git -C %s worktree remove %s' % (self.primary, self.linked) + ' --force',
+            'git -C ../primary worktree remove %s' % self.linked,
+            'git -C %s -C %s worktree remove %s' % (self.primary, self.primary, self.linked),
+            'git -C $HOME worktree remove %s' % self.linked,
+            'git -C "%s" worktree remove %s' % (self.primary, self.linked),
+            'git -C %s worktree remove %s; true' % (self.primary, self.linked),
+            'git -C %s worktree remove %s %s' % (self.primary, self.linked, self.primary),
+            'git -C %s worktree remove %s' % (self.linked, self.linked),          # cannot remove the current worktree
+            'git -C %s/nonexistent worktree remove %s' % (self.primary, self.linked),
+            'git -C %s worktree remove %s' % (self.primary, self.primary),        # the primary is not removable
+        )
+        passed = [c for c in blocked if self.decide(c, cwd=plain)[0] != 'block']
+        self.assertEqual(passed, [], 'a -C shape slipped through')
+        (self.linked / 'a.txt').write_text('changed\n')
+        self.assertEqual(self.decide(ok, cwd=plain)[0], 'block')

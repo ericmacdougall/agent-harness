@@ -3713,7 +3713,7 @@ class Analyzer:
         self.owned_checkout(sub, rest, cwd_words, locations, alias)
         if sub == 'clean':
             self.git_clean(args[i + 1:], rest, cwd_word)
-        if sub == 'worktree' and rest[:1] == ['remove'] and self._removable_linked_worktree(args[i + 1:]):
+        if sub == 'worktree' and rest[:1] == ['remove'] and self._removable_linked_worktree(args[i + 1:], cwd_words):
             return  # the only exemption: one literal, clean, published, registered linked-worktree top
         if sub == 'worktree' and rest[:1] in (['remove'], ['prune']):
             for w in _nondash(args[i + 2:]):
@@ -4586,26 +4586,39 @@ class Analyzer:
         raw = getattr(self.ctx, 'raw_top', '') or ''
         return bool(self.LONE_RM.match(raw)) and not re.search(r'[\x00-\x08\x0b-\x1f\x7f]', raw.strip())
 
+    _LITERAL = r'[^ \t\x00-\x1f\x7f;&|<>`$()\\"\'*?\[\]{}~#!]+'
+    # `git [-C /abs/repo] worktree remove [--] /abs/worktree`: a caller whose working directory is not a repository (a
+    # subagent's shell resets to $HOME on every call) names the registry repository with one literal -C
     LONE_WORKTREE_REMOVE = re.compile(
-        r'^[ \t]*git[ \t]+worktree[ \t]+remove[ \t]+(?:--[ \t]+)?'
-        r'([^ \t\x00-\x1f\x7f;&|<>`$()\\"\'*?\[\]{}~#!]+)[ \t]*$')
+        r'^[ \t]*git[ \t]+(?:-C[ \t]+(' + _LITERAL + r')[ \t]+)?worktree[ \t]+remove[ \t]+(?:--[ \t]+)?'
+        r'(' + _LITERAL + r')[ \t]*$')
 
-    def _removable_linked_worktree(self, args):
-        """A standalone `git worktree remove /literal/top`; every other shape keeps the ordinary refusal."""
+    def _removable_linked_worktree(self, args, cwd_words=()):
+        """A standalone `git [-C /literal/repo] worktree remove /literal/top`; every other shape keeps the ordinary
+        refusal."""
         if len(args) not in (2, 3) or args[0].text != 'remove' or (len(args) == 3 and args[1].text != '--'):
             return False
         word = args[-1]
         if word.dynamic or word.subs or word.glob:
             return False
         match = self.LONE_WORKTREE_REMOVE.fullmatch(getattr(self.ctx, 'raw_top', '') or '')
-        if not match or match.group(1) != word.text:
+        if not match or match.group(2) != word.text:
             return False
+        calling = self.ctx.cwd
+        if match.group(1) is not None or cwd_words:
+            repo_word = cwd_words[0] if len(cwd_words) == 1 else None
+            if repo_word is None or repo_word.dynamic or repo_word.subs or repo_word.glob \
+                    or repo_word.text != match.group(1):
+                return False
+            calling = repo_word.text
+            if not os.path.isabs(calling) or os.path.realpath(calling) != calling or self._foreign_home(calling):
+                return False
         cls, path, literal = self.target_class(word)
         if cls != 'root' or not literal or path != word.text or self._foreign_home(path):
             return False
         started = time.monotonic()
         try:
-            reason = linked_worktree_remove_refusal(path, self.ctx.cwd, self.c.policy)
+            reason = linked_worktree_remove_refusal(path, calling, self.c.policy)
         finally:
             self.ctx.budget.deadline += time.monotonic() - started
         return reason is None
