@@ -34,7 +34,7 @@ from pathlib import Path
 
 import safe_input
 
-DEFAULT_MODEL = 'kimi-code/k3.1-pro'
+DEFAULT_MODEL = 'kimi-code/k3.1-pro-highspeed'  # K3.1 Pro fast mode is this alias; the CLI has no separate fast flag
 MODEL_PATTERN = re.compile(r'kimi-code/[a-z0-9][a-z0-9._-]{0,63}')
 PAYLOAD_LIMIT = 1_500_000
 ARGV_LIMIT = 600_000  # the prompt travels in argv; macOS ARG_MAX is 1 MiB including the environment

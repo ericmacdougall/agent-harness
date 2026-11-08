@@ -26,7 +26,7 @@ prompt = next(a for a in argv if a.startswith('--prompt='))[len('--prompt='):]
 agent = Path(argv[argv.index('--agent-file') + 1]).read_text()
 (state / 'capture.json').write_text(json.dumps({
     'prompt': prompt, 'model': argv[argv.index('--model') + 1], 'agent': agent, 'cwd_entries': os.listdir(os.getcwd()),
-    'format': argv[argv.index('--output-format') + 1], 'env_has_key': any('KEY' in k and 'OPENROUTER' in k for k in os.environ)}))
+    'format': argv[argv.index('--output-format') + 1], 'argv_flags': [a for a in argv if not a.startswith('--prompt=')], 'env_has_key': any('KEY' in k and 'OPENROUTER' in k for k in os.environ)}))
 mode = os.environ.get('FAKE_MODE', 'ok')
 if mode == 'quota':
     sys.stderr.write('Error: 429 rate limit: your plan quota is exhausted\\n'); sys.exit(1)
@@ -85,7 +85,7 @@ class KimiReviewTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         report = self.output.read_text()
         sha = hashlib.sha256(self.packet.read_bytes()).hexdigest()
-        for line in ('Reviewed-Model: kimi-code/k3.1-pro', 'Reviewed-Packet-SHA256: ' + sha, 'Reviewed-HEAD: ' + HEAD,
+        for line in ('Reviewed-Model: kimi-code/k3.1-pro-highspeed', 'Reviewed-Packet-SHA256: ' + sha, 'Reviewed-HEAD: ' + HEAD,
                      'Request-Id: session_fake-123', 'Egress-Emails-Redacted: 0'):
             self.assertIn(line + '\n', report)
         for prefix in ('Tokens-In-Estimate: ', 'Tokens-Out-Estimate: ', 'Cost-USD: 0 (subscription'):
@@ -95,10 +95,21 @@ class KimiReviewTests(unittest.TestCase):
         capture = json.loads((self.state / 'capture.json').read_text())
         self.assertIn('tools: []', capture['agent'])           # every tool disabled
         self.assertEqual(capture['cwd_entries'], [])            # runs in an empty directory
-        self.assertEqual(capture['model'], 'kimi-code/k3.1-pro')
+        self.assertEqual(capture['model'], 'kimi-code/k3.1-pro-highspeed')  # K3.1 Pro fast mode
+        self.assertEqual(capture['argv_flags'].count('--model'), 1)
         self.assertEqual(capture['format'], 'stream-json')
         self.assertIn('Scope: review the handler change.', capture['prompt'])
         self.assertEqual(self.launches(), 1)
+
+    def test_default_command_is_k31_pro_fast_and_never_requests_swarm(self):
+        # Fast mode is the highspeed alias. Swarm cannot be enabled headlessly (the docs allow only the user to turn
+        # swarm mode on, and `kimi -p` has no swarm flag), so the command must not ask for it or grant AgentSwarm.
+        self.assertEqual(self.run_kimi().returncode, 0)
+        capture = json.loads((self.state / 'capture.json').read_text())
+        self.assertEqual(capture['model'], 'kimi-code/k3.1-pro-highspeed')
+        self.assertNotIn('swarm', ' '.join(capture['argv_flags']).lower())
+        self.assertNotIn('/swarm', capture['prompt'])
+        self.assertNotIn('AgentSwarm', capture['agent'])
 
     def test_model_is_limited_to_kimi_code_aliases(self):
         result = self.run_kimi('--model', 'moonshotai/kimi-k3.1-pro')

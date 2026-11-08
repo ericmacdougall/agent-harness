@@ -780,7 +780,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
     order = (codex_entry, claude_entry) if selection['harness'] == 'openai' else (claude_entry, codex_entry)
     if options.get('secondary') == 'kimi':
         # The one authorized independent fallback is Kimi (subscription CLI) instead of the other harness.
-        order = (order[0], ('kimi', 'Kimi kimi-code/k3.1-pro (subscription CLI)', 'kimi'))
+        order = (order[0], ('kimi', 'Kimi kimi-code/k3.1-pro-highspeed (subscription CLI)', 'kimi'))
     primary = order[0][0]
     for provider, source, pool in order:
         remaining = deadline - time.monotonic()
