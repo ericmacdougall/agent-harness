@@ -195,3 +195,62 @@ class WorktreeRemoveCase(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class WorktreeRemoveMerged(WorktreeRemoveCase):
+    """goodqa#15334: the normal state after a merge and branch cleanup is a clean worktree whose HEAD is an ancestor of the
+    remote default branch while its own remote branch is gone. That is published. Dirty, unmerged or unverifiable
+    worktrees keep their refusals."""
+
+    def advance_main(self):
+        """origin/main moves on by one commit (objects present locally), and the worktree's own remote branch is deleted."""
+        (self.primary / 'b.txt').write_text('two\n')
+        git(self.primary, 'add', 'b.txt')
+        git(self.primary, 'commit', '-q', '-m', 'two')
+        new = git(self.primary, 'rev-parse', 'HEAD')
+        git(self.primary, 'update-ref', 'refs/remotes/origin/main', new)
+        self.live['refs/heads/main'] = new
+        self.live.pop('refs/heads/linked', None)
+        return new
+
+    def test_head_merged_into_live_default_with_remote_branch_deleted_is_allowed(self):
+        self.advance_main()
+        self.assertIsNone(self.refusal())
+        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'allow')
+
+    def test_control_unmerged_dirty_and_unverifiable_stay_refused(self):
+        self.advance_main()
+        # an unpublished commit in the worktree: not an ancestor of live main
+        (self.linked / 'local.txt').write_text('local\n')
+        git(self.linked, 'add', 'local.txt'); git(self.linked, 'commit', '-q', '-m', 'local only')
+        self.assertIsNotNone(self.refusal())
+        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
+        git(self.linked, 'reset', '-q', '--hard', 'HEAD~1')
+        self.assertIsNone(self.refusal())
+        # dirty
+        (self.linked / 'a.txt').write_text('changed\n')
+        self.assertIn('not clean', self.refusal())
+        git(self.linked, 'checkout', '-q', 'a.txt')
+        # live default sha unknown locally (cannot prove ancestry)
+        self.live['refs/heads/main'] = 'f' * 40
+        self.assertIsNotNone(self.refusal())
+        # remote did not answer
+        self.live['refs/heads/main'] = git(self.primary, 'rev-parse', 'HEAD')
+        with mock.patch.object(cg, 'REMOTE_LS', lambda url, repo, timeout: None):
+            self.assertIn('did not answer', self.refusal())
+
+    def test_ancestry_of_a_stale_remote_tracking_ref_only_passes_when_merged(self):
+        new = self.advance_main()
+        # a tracking ref for a deleted remote branch that holds an UNMERGED commit stays refused
+        git(self.primary, 'checkout', '-q', '-b', 'side', 'main~1')
+        (self.primary / 'c.txt').write_text('side\n')
+        git(self.primary, 'add', 'c.txt'); git(self.primary, 'commit', '-q', '-m', 'side')
+        git(self.primary, 'update-ref', 'refs/remotes/origin/side', git(self.primary, 'rev-parse', 'HEAD'))
+        git(self.primary, 'checkout', '-q', 'main')
+        self.assertIn('stale', self.refusal())
+
+    def test_calling_directory_outside_any_repository_is_not_an_error(self):
+        # the read-only check returned "could not verify (ValueError)" when cwd was a plain directory such as $HOME
+        plain = self.home / 'plain'; plain.mkdir()
+        self.assertIsNone(self.refusal(cwd=plain))
+        self.assertEqual(self.decide('git worktree remove %s' % self.linked, cwd=plain)[0], 'allow')

@@ -1546,7 +1546,10 @@ def linked_worktree_remove_refusal(path, cwd, policy=None):
             return 'the path is not the exact top of its registered linked worktree'
         if os.path.dirname(git_dir) != os.path.join(common, 'worktrees'):
             return 'the .git file points outside the common worktree registry'
-        current = os.path.realpath(_git_out(cwd, ['rev-parse', '--show-toplevel'], min(left(), 2.0)).strip())
+        try:
+            current = os.path.realpath(_git_out(cwd, ['rev-parse', '--show-toplevel'], min(left(), 2.0)).strip())
+        except ValueError:
+            current = None  # the calling directory is not inside any repository (for example $HOME): it is not `path`
         if current == path:
             return 'the current worktree cannot remove itself'
         listing = _git_out(path, ['worktree', 'list', '--porcelain'], min(left(), 2.0))
@@ -1624,15 +1627,41 @@ def linked_worktree_remove_refusal(path, cwd, policy=None):
             if not live:
                 return 'the remote did not answer (cannot prove the exact HEAD is published)'
             live_all[remote] = live
+        # goodqa#15334: after a merge and branch cleanup the commit is published through the remote's default branch even
+        # though no live branch points at it. The live default sha is the tip the remote reports now; a commit counts as
+        # published when it is an ancestor of that tip, which needs the tip's objects locally (else it is not proven).
+        defaults = []
+        for remote, live in live_all.items():
+            names = []
+            try:
+                target = _git_out(path, ['symbolic-ref', '-q', 'refs/remotes/%s/HEAD' % remote], min(left(), 2.0)).strip()
+                if target.startswith('refs/remotes/%s/' % remote):
+                    names.append(target[len('refs/remotes/%s/' % remote):])
+            except ValueError:
+                pass
+            names += ['main', 'master']
+            for name in names:
+                if re.fullmatch(r'[\w./-]{1,100}', name) and live.get('refs/heads/' + name):
+                    defaults.append(live['refs/heads/' + name])
+                    break
+
+        def merged(sha):
+            for tip in defaults:
+                try:
+                    _git_out(path, ['merge-base', '--is-ancestor', sha, tip], min(left(), 2.0))
+                    return True
+                except ValueError:
+                    continue
+            return False
         for name, sha in refs.items():
             if not name.startswith('refs/remotes/'):
                 continue
             remote, _, branch = name[len('refs/remotes/'):].partition('/')
             if not branch or branch == 'HEAD' or remote not in live_all:
                 continue
-            if live_all[remote].get('refs/heads/' + branch) != sha:
+            if live_all[remote].get('refs/heads/' + branch) != sha and not merged(sha):
                 return 'a remote-tracking ref is stale or names a moved/deleted remote branch; fetch --prune first'
-        if not any(head in live.values() for live in live_all.values()):
+        if not any(head in live.values() for live in live_all.values()) and not merged(head):
             return 'the exact HEAD is not present on a live allowlisted remote (unpublished or detached-unpublished)'
         return None
     except Exception as error:  # noqa: BLE001 - every surprise keeps the ordinary refusal
