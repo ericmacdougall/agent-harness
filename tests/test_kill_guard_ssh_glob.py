@@ -43,6 +43,12 @@ BLOCK = [
     "ssh h '/usr/bin/p*ll x'",
     "ssh h 'ls tools/x/*; pkill x'",  # a glob argument does not hide a later kill
     "ssh h /usr/bin/pk* x",
+    # red-team F1: only a SPACE head is re-parsed word by word; tab/newline heads must keep the glob expansion
+    "parallel ::: $'echo\\tnode\\t|\\txargs\\t/usr/bin/killal?'",
+    "parallel ::: $'echo\\t-f\\tnode\\t|\\txargs\\t/usr/bin/pki?l'",
+    "parallel ::: $'ls\\t|\\txargs\\t/bin/k*l'",
+    "parallel -j1 ::: $'true\\t;\\t/usr/bin/pk*'",
+    "parallel --shell ::: $'ls\\t|\\txargs\\t/bin/k*l'",
 ]
 
 
@@ -86,6 +92,22 @@ class SshGlob(unittest.TestCase):
             self.assertEqual(hook_rc("ssh t2-dev 'ls tools/x/*'", tmp), 'block')  # re-broken
             self.assertEqual(hook_rc("ssh h 'pkill -f x'", tmp), 'block')
             self.assertEqual(hook_rc("ssh t2-dev 'ls tools/x/*'", HOOKS), 'allow')  # real tree fixed
+
+
+    def test_mutant_that_widens_to_any_whitespace_is_caught(self):
+        """The first version of the fix used any whitespace; the tab/newline block rows must catch that."""
+        src = (HOOKS / 'kill_guard.py').read_text(encoding='utf-8')
+        marker = "SSH_GLOB_LINE_FIX and ' ' in text"
+        self.assertIn(marker, src, 'fix marker missing')
+        with tempfile.TemporaryDirectory() as tmp:
+            for pattern in ('*.py', '*.json'):
+                for f in HOOKS.glob(pattern):
+                    shutil.copy(f, tmp)
+            (Path(tmp) / 'kill_guard.py').write_text(src.replace(marker, "SSH_GLOB_LINE_FIX and re.search(r'\\s', text)"),
+                                                     encoding='utf-8')
+            self.assertEqual(hook_rc("ssh t2-dev 'ls tools/x/*'", tmp), 'allow')  # AC-1 still fine in the mutant
+            self.assertEqual(hook_rc(BLOCK[-3], tmp), 'allow')  # the real-kill row slips through: the mutant is detectable
+            self.assertEqual(hook_rc(BLOCK[-3], HOOKS), 'block')
 
 
 if __name__ == '__main__':

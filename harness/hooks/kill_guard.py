@@ -1009,9 +1009,11 @@ def make_analyzer_class(cg):
             """goodqa#15365: a head word holding whitespace is a whole command line (an ssh remote string), not a name; it
             is re-read word by word elsewhere, where a glob in command position still expands against the known names.
             norm_name() keeps only the text after its last '/', so `ls tools/x/*` read as the name `*` and matched every verb."""
-            if SSH_GLOB_LINE_FIX and re.search(r'\s', head.text or '') and not head.vars and not head.subs:
-                text = head.text.strip()
-                return [cg.norm_name(text)] if text else []
+            text = (head.text or '').strip()
+            # The same predicate as apply(), which re-parses exactly such a head (a space, not a leading '-'). A tab or
+            # newline head is NOT re-parsed there, so it keeps the glob expansion (red-team F1: parallel ::: $'ls\t|\txargs\t/bin/k*l').
+            if SSH_GLOB_LINE_FIX and ' ' in text and not text.startswith('-') and not head.vars and not head.subs:
+                return [cg.norm_name(text)]
             return super().names_for(head)
 
         def dispatch(self, words, cmd, pl, idx, depth):
