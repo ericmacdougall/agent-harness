@@ -950,7 +950,7 @@ class ApprovedByGuard(unittest.TestCase):
 
 
 class SessionScopeGuard(unittest.TestCase):
-    """kill_guard admits --session-scope only from main (no agent_id in the hook payload)."""
+    """kill_guard admits --session-scope only from main (caller_identity.is_main on the hook payload)."""
     A = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason stuck --session-scope"
 
     def verdict(self, cmd, subagent):
@@ -965,8 +965,14 @@ class SessionScopeGuard(unittest.TestCase):
         self.assertEqual(self.verdict(self.A.replace(" --session-scope", ""), subagent=True), "allow")
 
     def test_hook_reads_agent_id_from_the_payload(self):
+        # after step 1 (B7) main is proven by caller_identity.is_main: a session id and its own transcript file
+        sid = "11111111-2222-3333-4444-555555555555"
         with tempfile.TemporaryDirectory() as home:
-            for extra, code in (({}, 0), ({"agent_id": "a1"}, 2)):
+            transcript = Path(home) / ".claude" / "projects" / "-x" / (sid + ".jsonl")
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text("{}\n")
+            proof = {"session_id": sid, "transcript_path": str(transcript)}
+            for extra, code in ((proof, 0), (dict(proof, agent_id="a1"), 2), ({}, 2)):
                 body = json.dumps(dict({"tool_name": "Bash", "tool_input": {"command": self.A}, "cwd": home}, **extra))
                 done = subprocess.run([sys.executable, "-I", str(Path(kg.__file__)), "hook"], input=body.encode(),
                                       capture_output=True, timeout=60, env={"HOME": home, "PATH": "/usr/bin:/bin"})
