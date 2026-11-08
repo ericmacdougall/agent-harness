@@ -381,6 +381,29 @@ class SubagentAuthorization(unittest.TestCase):
                 mg.decide(main, fixture.FakeGh(fixture.SCENARIOS["green"]), Path(home) / "s")
                 self.assertIsNotNone(caller_identity.take_stamp("review-auth", ["o/r", 5], home=home))
 
+    def test_text_that_only_mentions_the_options_mints_no_stamp(self):
+        # delta red-team D-F6
+        import caller_identity
+        sid = "11111111-2222-3333-4444-555555555555"
+        with tempfile.TemporaryDirectory() as home:
+            transcript = Path(home) / ".claude" / "projects" / "-x" / (sid + ".jsonl")
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text("{}\n")
+            for cmd in ("echo peer_review.py pr --github-repo o/r --pr 5",
+                        "cat <<'EOF'\npython3 ~/.claude/hooks/peer_review.py pr --github-repo o/r --pr 5\nEOF",
+                        "true; python3 ~/.claude/hooks/peer_review.py pr --github-repo o/r --pr 5",
+                        "python3 ~/.claude/hooks/peer_review.py pr --github-repo o/r --pr 5 | tee /tmp/x",
+                        "git log # peer_review --github-repo o/r --pr 5"):
+                with self.subTest(cmd=cmd), mock.patch.dict(os.environ, {"HOME": home}):
+                    main = dict(fixture.bash(cmd), session_id=sid, transcript_path=str(transcript))
+                    mg.decide(main, fixture.FakeGh(fixture.SCENARIOS["green"]), Path(home) / "s")
+                    self.assertIsNone(caller_identity.take_stamp("review-auth", ["o/r", 5], home=home))
+            cmd = "python3 -I /x/.claude/hooks/peer_review.py pr --repo /w --github-repo o/r --pr 5 --packet /p"
+            with mock.patch.dict(os.environ, {"HOME": home}):
+                main = dict(fixture.bash(cmd), session_id=sid, transcript_path=str(transcript))
+                mg.decide(main, fixture.FakeGh(fixture.SCENARIOS["green"]), Path(home) / "s")
+                self.assertIsNotNone(caller_identity.take_stamp("review-auth", ["o/r", 5], home=home))
+
     def test_main_and_unbound_subagent_reviews_still_run(self):
         with tempfile.TemporaryDirectory() as d:
             bound = ("python3 /x/.claude/hooks/peer_review.py pr --repo /w --packet /p --output /o "

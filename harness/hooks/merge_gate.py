@@ -1835,7 +1835,7 @@ def _stamp_waive(command, payload, state_dir, now):
 def _stamp_review(command, payload, now):
     """B2: the peer_review run that may mint a merge authorization gets a one-shot stamp, only from proven main."""
     import caller_identity  # noqa: PLC0415
-    if not caller_identity.is_main(payload):
+    if not caller_identity.is_main(payload) or not _plain_peer_review(command):
         return
     tokens, _ = tokenize(command)
     values = {}
@@ -1848,6 +1848,27 @@ def _stamp_review(command, payload, now):
     if values.get("--github-repo") and str(values.get("--pr", "")).isdigit():
         caller_identity.put_stamp("review-auth", [values["--github-repo"], int(values["--pr"])],
                                   session=str(payload.get("session_id") or ""), now=now)
+
+
+_SHELL_SYNTAX = re.compile(r"[\n;&|`<>]|\$\(")
+_PYTHON = re.compile(r"python3?(?:\.\d+)?")
+
+
+def _plain_peer_review(command):
+    """Delta red-team D-F6: only a single plain `python3 [-I] .../peer_review.py ...` command mints the stamp, not an
+    echo, a heredoc, a comment or a compound command that merely mentions its options."""
+    if _SHELL_SYNTAX.search(command):
+        return False
+    try:
+        argv = shlex.split(command, comments=False)
+    except ValueError:
+        return False
+    if not argv or not _PYTHON.fullmatch(os.path.basename(argv[0])):
+        return False
+    rest = argv[1:]
+    while rest and rest[0] in ("-I", "-u", "-B", "-E", "-s"):
+        rest = rest[1:]
+    return bool(rest) and os.path.basename(rest[0]) == "peer_review.py"
 
 
 def _deadline_seconds():
