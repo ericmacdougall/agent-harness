@@ -11,4 +11,4 @@ for o in E:
     c['noise' if o['noise'] else ('parent-open' if p in byid else ('parent-closed' if p else 'no-parent'))] += 1
 print(c)
 print(collections.Counter(o['proj'] for o in E).most_common())
-json.dump(E, open('/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/ticket-cleanup/elig4.json', 'w'))
+json.dump(E, open('/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/ticket-cleanup/elig5.json', 'w'))

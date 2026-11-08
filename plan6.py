@@ -4,8 +4,8 @@ T = '/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/ticket
 sys.path.insert(0, T)
 import gq
 CREATE = '--create' in sys.argv
-E = json.load(open(T + 'elig4.json'))
-O = {o['id']: o for o in json.load(open(T + 'classes4.json'))}
+E = json.load(open(T + 'elig5.json'))
+O = {o['id']: o for o in json.load(open(T + 'classes5.json'))}
 projects = {p['slug']: p for p in json.load(open(T + 'projects.json'))}
 done = set()
 for l in open(T + 'done5.jsonl'):
@@ -71,7 +71,7 @@ def call(t, a):
 
 out = []
 for (proj, key), lst in clusters.items():
-    if key == 'other' or len(lst) < 5:
+    if key == 'other' or len(lst) < 5 or (' ' not in key and not key.startswith('[')):
         continue
     org, slug = proj.split('/')
     P = projects[slug]
@@ -88,6 +88,10 @@ for (proj, key), lst in clusters.items():
             continue
         out.append({'kind': 'cluster', 'umbrella': {'id': iss['id'], 'number': iss['number'], 'slug': slug}, 'note': '',
                     'children': [{'id': o['id'], 'n': o['n'], 'status': o['status'], 'rev': o['rev'], 'title': o['title'], 'proj': o['proj']} for o in chunk]})
+nz = [o for o in E if o['id'] not in done and (o['noise'] or o['proj'].endswith('qac-acceptance-disposable'))]
+if nz:
+    out.insert(0, {'kind': 'noise', 'umbrella': None, 'note': 'bot/test noise (deadman, liveness, runner slugs, disposable acceptance-test project), no human comment.',
+                   'children': [{'id': o['id'], 'n': o['n'], 'status': o['status'], 'rev': o['rev'], 'title': o['title'], 'proj': o['proj']} for o in nz]})
 with open(T + 'plan6.jsonl', 'w') as f:
     for g in out:
         f.write(json.dumps(g) + '\n')

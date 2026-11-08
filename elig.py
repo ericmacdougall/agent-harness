@@ -1,6 +1,6 @@
 import json, collections
 T = '/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/ticket-cleanup/'
-O = json.load(open(T + 'classes4.json'))
+O = json.load(open(T + 'classes5.json'))
 MARK = {'plan-20261023', 'runner-brief', 'bug-triaged', 'brief-held', 'brief-ready', 'brief-published', 'needs-brief', 'cleanup', 'needs-recovery', 'runner-active',
         'needs-postship-flow', 'ux-review', 'epic', 'coordinator-assigned', 'autopilot-successor', 'fleet-liveness', 'cleanup-2026-11', 'breadth', 'phase', 'component',
         'fixing', 'datasuite', 'datasuite-parity', 'datasuite-m1', 'optin-datasuite-20261023', 'hawkeye-parity', 'parity-20261022', 'capability-gap', 'eric-ask-gap',
