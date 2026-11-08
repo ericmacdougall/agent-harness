@@ -21,6 +21,7 @@ import shlex
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import liveness  # noqa: E402
 import escalation as esc  # noqa: E402
 import model_tiers as tiers  # noqa: E402
 import safe_input  # noqa: E402
@@ -562,7 +563,7 @@ def counts_as_owner(agent_type, policy, flagged=False):
 OWNER_COUNT_DEADLINE_S = 4.0  # the hook has a 10 s timeout and fails closed; the owner scan must never use it all
 
 
-class _Deadline(Exception):
+class _Deadline(BaseException):  # not Exception: no `except Exception` inside the scan may swallow it
     pass
 
 
@@ -594,8 +595,10 @@ def live_owner_ids(session_id, policy):
         return sorted(r['agent_id'] for r in data.get('owners') or []
                       if counts_as_owner(r.get('type'), policy, r.get('owner'))
                       and str(r.get('state') or '').startswith(RUNNING_STATES)
-                      and not r.get('disposition'))  # a disposed owner (ah task dispose) frees its slot
-    except (Exception, _Deadline):  # noqa: BLE001 - no main WAL yet, a partial install or a scan past its deadline: the live map decides
+                      # a silent owner that main disposed of (reassigned, closed, ...) frees its slot; an owner that is
+                      # live, working or quiet always counts, whatever its disposition (red-team C3)
+                      and (str(r.get('state') or '').startswith(('live', 'working', 'quiet')) or not liveness.row_disposed(r)))
+    except (Exception, _Deadline):  # noqa: BLE001,B036 - no main WAL yet, a partial install or a scan past its deadline: the live map decides
         pass
     try:
         live = _expire_live(_read_live(live_path(session_id)))

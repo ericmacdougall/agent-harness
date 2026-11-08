@@ -62,6 +62,19 @@ class OwnerCount(unittest.TestCase):
         with mock.patch.object(ah, 'owners', return_value=rows):
             self.assertEqual(gate.live_owner_ids(SID, self.policy), ['x' * 32])
 
+    def test_running_owners_count_whatever_their_disposition(self):
+        # red-team C3: `ah owners` gives a disposition dict to resumed and reassigned owners that are still running
+        rows = {'owners': [
+            {'agent_id': 'p' * 32, 'type': 'task-owner', 'owner': True, 'state': 'live', 'disposition': {'kind': 'resumed', 'live': True}},
+            {'agent_id': 'q' * 32, 'type': 'task-owner', 'owner': True, 'state': 'working', 'disposition': {'kind': 'reassigned', 'live': False}},
+            {'agent_id': 'r' * 32, 'type': 'task-owner', 'owner': True, 'state': 'SILENT', 'disposition': {'kind': 'waiting', 'live': False}},
+            {'agent_id': 's' * 32, 'type': 'task-owner', 'owner': True, 'state': 'SILENT', 'disposition': {'kind': 'closed', 'live': True}}]}
+        with mock.patch.object(ah, 'owners', return_value=rows):
+            self.assertEqual(gate.live_owner_ids(SID, self.policy), ['p' * 32, 'q' * 32, 'r' * 32])
+
+    def test_deadline_is_not_swallowed_by_a_broad_except(self):
+        self.assertTrue(issubclass(gate._Deadline, BaseException) and not issubclass(gate._Deadline, Exception))
+
     def test_scan_past_its_deadline_falls_back_instead_of_hanging(self):
         def slow(*_a, **_k):
             time.sleep(5)

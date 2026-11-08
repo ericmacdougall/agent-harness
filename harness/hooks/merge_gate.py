@@ -915,7 +915,9 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
         # assigned, read into, looped over or exported here, or any other dynamic word, keeps the whole-command rule.
         hint_scope = full_command
         name_match = re.fullmatch(r"\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})", first)
-        if name_match and word != "eval":
+        before_sep = segments[index - 1][2] if index else ""
+        wrote_file = any(t.startswith(">") or t == "tee" or os.path.basename(t) == "tee" for t in tokens[:a])
+        if name_match and word != "eval" and before_sep not in ("|", "|&") and not wrote_file:
             var = name_match.group(1) or name_match.group(2)
             if not re.search(r"(?<![$\w{])" + re.escape(var) + r"(?!\w)", full_command.replace("${" + var + "}", " ")
                              .replace("$" + var, " ")):

@@ -28,6 +28,10 @@ STILL_UNVERIFIABLE = (
     "for C in 'gh pr merge 5'; do $C; done",
     "$RELAY run; gh pr merge 5",
     "eval \"$RELAY\" pr merge 5",
+    # red-team C2: text for the shell arrives by pipe or file, not in the variable's own segment
+    'echo "gh pr merge 1" | $SHELL',
+    'printf "gh pr merge 1" | $X',
+    'echo "gh pr merge 1" > s.sh; $X s.sh',
     "$RELAY gh pr merge 5",
 )
 

@@ -28,6 +28,13 @@ REFUSED = (
     'cd {d} && git rebase origin/main',
     'cd {d}/sub && git checkout other-branch',
     "ssh t2-dev 'cd {d} && git fetch origin && git checkout -q --detach origin/main'",
+    # red-team C6
+    'git -C {d} -C sub reset --hard',
+    'cd {u} && git -C {d} bisect start',
+    'git -C {d} sparse-checkout set x',
+    'git -C {d} submodule update --init',
+    'git -C {d} update-index --assume-unchanged a',
+    'git -C {d} fetch --update-head-ok origin +main:main',
 )
 ALLOWED = (
     'cd {d} && git status',

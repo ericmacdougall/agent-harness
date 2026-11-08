@@ -1918,6 +1918,22 @@ def blank_regex_patterns(code):
         tree = ast.parse(code)
     except Exception:  # noqa: BLE001 - not Python (or too deep): the caller scans the text as before
         return code
+    for node in ast.walk(tree):
+        # `re.compile('rm').pattern` hands the string back, and a local `re` (class, assignment, `import x as re`) is not
+        # the module: in either case a pattern literal can reach a call, so nothing is blanked (red-team C1)
+        if isinstance(node, ast.Attribute) and node.attr in ('pattern', 'flags', 'groupindex'):
+            return code
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == 're':
+            return code
+        if isinstance(node, ast.Name) and node.id == 're' and isinstance(node.ctx, (ast.Store, ast.Del)):
+            return code
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound = alias.asname or alias.name.split('.')[0]
+                if bound == 're' and not (isinstance(node, ast.Import) and alias.name == 're'):
+                    return code
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ('exec', 'eval', 'compile', '__import__'):
+            return code
     lines = code.splitlines(keepends=True)
     starts, pos = [], 0
     for ln in lines:
@@ -3476,7 +3492,8 @@ class Analyzer:
     # ---- git
     OWNED_CHANGES = frozenset(('checkout', 'switch', 'reset', 'pull', 'merge', 'rebase', 'clean', 'stash', 'restore',
                                'cherry-pick', 'revert', 'commit', 'am', 'apply', 'rm', 'mv', 'add', 'update-ref',
-                               'symbolic-ref', 'read-tree', 'checkout-index', 'branch', 'tag', 'gc', 'prune'))
+                               'symbolic-ref', 'read-tree', 'checkout-index', 'branch', 'tag', 'gc', 'prune', 'bisect',
+                               'sparse-checkout', 'submodule', 'update-index', 'filter-branch'))
 
     def owned_checkout(self, sub, rest, cwd_word):
         """goodqa#15307: an agent's git command may not change a checkout a timer or service builds from. Owned means a
@@ -3484,10 +3501,14 @@ class Analyzer:
         main), or a policy owned_checkouts suffix (for a checkout on another host the marker cannot be read from here).
         Reads, fetch and linked worktrees stay allowed, and so does `git checkout|switch <declared branch>`, which only
         restores the state the owner expects."""
-        if sub not in self.OWNED_CHANGES:
-            return
         ctx = self.ctx
-        where = norm_path(cwd_word.text, ctx, ctx.cwd) if cwd_word is not None else ctx.cwd
+        where = ctx.cwd
+        for word in (cwd_word if isinstance(cwd_word, list) else [cwd_word] if cwd_word is not None else []):
+            where = norm_path(word.text, ctx, where)  # git -C a -C b: each is relative to the one before
+        if sub == 'fetch' and '--update-head-ok' in rest:
+            sub = 'fetch --update-head-ok'
+        elif sub not in self.OWNED_CHANGES:
+            return
         if not where or '$' in where:
             return
         owner, branch = self.owned_dir(where)
@@ -3534,11 +3555,14 @@ class Analyzer:
         texts = [a.text for a in args]
         i = 0
         cwd_word = None
+        cwd_words = []
         while i < len(texts):
             t = texts[i]
             if t in ('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env'):
                 if t in ('-C', '--work-tree') and i + 1 < len(args):
                     cwd_word = args[i + 1]
+                    if t == '-C':
+                        cwd_words.append(args[i + 1])
                 i += 2
             elif t.startswith('-'):
                 i += 1
@@ -3546,7 +3570,7 @@ class Analyzer:
                 break
         sub = texts[i] if i < len(texts) else ''
         rest = texts[i + 1:]
-        self.owned_checkout(sub, rest, cwd_word)
+        self.owned_checkout(sub, rest, cwd_words)
         if sub == 'clean':
             self.git_clean(args[i + 1:], rest, cwd_word)
         if sub == 'worktree' and rest[:1] == ['remove'] and self._removable_linked_worktree(args[i + 1:]):

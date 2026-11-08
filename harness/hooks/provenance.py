@@ -627,7 +627,7 @@ def excerpt_in(text: str, excerpt: str):
     if not segments or len(segments) > EXCERPT_SEGMENTS:
         return f"excerpt needs 1 to {EXCERPT_SEGMENTS} quoted segments"
     # goodqa#15318: a whole turn shorter than the minimum ("now", "yes") is quoted in full; a fragment of a longer turn is not
-    whole_short = len(segments) == 1 and segments[0] == norm(text).strip() and bool(segments[0])
+    whole_short = len(segments) == 1 and segments[0] == norm(text).strip() and any(ch.isalnum() for ch in segments[0])
     if (not whole_short and any(len(seg) < EXCERPT_MIN for seg in segments)) or sum(len(seg) for seg in segments) > EXCERPT_MAX:
         return f"each excerpt segment needs {EXCERPT_MIN}+ characters and the total at most {EXCERPT_MAX}"
     haystack, pos = norm(text), 0

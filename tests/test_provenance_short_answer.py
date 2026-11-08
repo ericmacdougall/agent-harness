@@ -46,6 +46,8 @@ class ShortAnswers(unittest.TestCase):
         for src in ('user:%s/%s "now"' % (SID, LONG), 'user:%s/%s "do it"' % (SID, LONG)):
             r = provenance.resolve(src)
             self.assertFalse(r["ok"], r)
+        for fluff in ('?', '.', '!!'):  # red-team C5: punctuation proves nothing about an ask
+            self.assertFalse(provenance.excerpt_in(fluff, fluff) is None, fluff)
         # a short wrong word never matches a short turn either
         self.assertFalse(provenance.resolve('user:%s/%s "yes"' % (SID, SHORT))["ok"])
 

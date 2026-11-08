@@ -52,6 +52,14 @@ class ReadWal(unittest.TestCase):
             "import os\ngetattr(os, 'remove')('%s')" % WAL,
             "import os\nos.system('rm %s')" % WAL,
             "import re,os\nre.search(os.remove('%s'), 'x')" % WAL,
+            # red-team C1: a pattern literal that flows back out as a string, or a local `re`
+            "import re,os\ngetattr(os, re.compile('remove').pattern)('%s')" % WAL,
+            "import re,subprocess\nsubprocess.run([re.compile('rm').pattern, '%s'])" % WAL,
+            "import re,os\nos.remove(re.compile('%s').pattern)" % WAL,
+            "import re,shutil\nshutil.rmtree(re.compile('~/.claude/wals/s').pattern)",
+            "import re\nopen(re.compile('%s').pattern, 'w')" % WAL,
+            "import os\nclass re:\n    sub = staticmethod(lambda p, *a: os.remove(p))\nre.sub('%s', '')" % WAL,
+            "import re\nexec(re.compile('import os; os.remove(\"%s\")').pattern)" % WAL,
         )
         passed = [r for r in rows if 'block' not in (self.decide(heredoc(r)), self.decide('python3 -c %s' % cg.shlex.quote(r)))]
         self.assertEqual(passed, [], 'real log destruction no longer blocks')
