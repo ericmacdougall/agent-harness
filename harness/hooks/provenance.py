@@ -319,8 +319,10 @@ def parse_source(text: str) -> dict:
         raise Problem("bad-syntax", "Source longer than 4000 characters")
     match = re.match(r"(?is)^([A-Za-z]+)\s*:\s*(.*)$", value)
     if not match:
-        raise Problem("bad-syntax", "Source must start with user:, answer:, queue:, pasted:, ticket:, wal:, file: or inferred:")
+        raise Problem("bad-syntax", "Source must start with user:, answer:, queue:, pasted:, ticket:, wal:, file: or inferred: "
+                                    "(uuid:, as `ah user-msg` prints it, is accepted as user:)")
     kind, rest = match.group(1).lower(), match.group(2).strip()
+    kind = {"uuid": "user"}.get(kind, kind)  # B3.9: `ah user-msg` prints uuid: ids; they are the same record
     if kind == "user":
         found = re.match(r"^([0-9a-fA-F-]{36})/([0-9a-fA-F-]{36})\s*(.*)$", rest, re.S)
         if not found or not UUID_RE.match(found.group(2)) or not UUID_RE.match(found.group(1)):
@@ -536,6 +538,8 @@ def user_authorship(record: dict, pasted: bool = False):
         return None, "turn belongs to a sub-agent conversation"
     if record.get("isMeta") or record.get("isCompactSummary") or record.get("isVisibleInTranscriptOnly"):
         return None, "turn is meta, a compaction summary or injected (not typed by the user)"
+    if record.get("wakeupSource") or record.get("scheduledTaskId") or record.get("promptSource") == "system":
+        return None, "turn is a scheduled wakeup or system prompt, not typed by the user"  # B3.9: never a human turn
     if "toolUseResult" in record or record.get("sourceToolAssistantUUID"):
         return None, "turn is a tool result"
     origin = record.get("origin")
@@ -1036,8 +1040,16 @@ def _resolve(source, ctx, depth, seen, result):
         result["chain"].append(node)
         upstream = record.get("source")
         if not upstream:
+            # B3.9: an unsourced (legacy or grandfathered) entry no longer refuses the whole citation; it resolves as an
+            # assumption, labelled so, which cannot ground a user requirement, a permission or a completion claim.
             node["status"] = "legacy-unsourced"
-            raise Problem("wal-unsourced", "that WAL entry has no Source (legacy or grandfathered entry); it cannot ground a claim")
+            result["assumption"] = True
+            result["weak"] = True
+            result["weak_reasons"] = list(result.get("weak_reasons") or []) + ["wal entry has no Source: assumption only"]
+            result["problems"].append({"code": "wal-unsourced", "message": "that WAL entry has no Source (legacy or grandfathered); "
+                                                                           "cited as an assumption, not as a requirement"})
+            result["origin"], result["ok"], result["backed"] = "wal", True, False
+            return
         sub = resolve(upstream, ctx, depth + 1, seen + (marker,))
         result["chain"].extend(sub["chain"])
         result["inputs"] = sub["inputs"]

@@ -142,7 +142,7 @@ def main():
                               'hint': 'cite the answer: user:<session>/<uuid> "words", answer:<id> or queue:<id> (ah user-msg)'}),
                   file=sys.stderr)
             return 2
-        if not re.match(r'^(user:|answer:|queue:|ticket:)', args.source.strip()):
+        if not re.match(r'^(user:|uuid:|answer:|queue:|ticket:)', args.source.strip()):
             print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved source must be the answer: user:, answer:, queue: or ticket:',
                               'hint': 'an ask cannot be closed on an inferred: or file: source'}), file=sys.stderr)
             return 2
