@@ -446,6 +446,58 @@ class WorktreeRemoveIndirectRound2(WorktreeRemoveCase):
         self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'allow')
 
 
+class WorktreeRemoveParallelRebuildEdges(WorktreeRemoveCase):
+    """goodqa#15346 round 3 self-probes: forms past the fixed list, found while building the rebuild."""
+
+    def test_edges_block(self):
+        p, h = str(self.linked), str(self.home)
+        for c in ("git -c alias.wr='worktree remove' wr %s" % p,   # an expansion never earns the lone-literal exemption
+                  "git -c alias.st=status -c alias.st='worktree remove --force' st %s" % p,  # the last -c wins
+                  'git -c alias.a=b -c alias.b="worktree remove --force" a %s' % p,  # a chain
+                  'git -C %s wr linked' % self.base,                 # relative to -C
+                  'git wr --path=%s' % p,
+                  "git config --global alias.wr '--git-dir=x worktree remove --force'",
+                  'parallel ::: "$UNKNOWN"',                         # parallel re-parses: the value may be a command line
+                  'parallel "$UNKNOWN" ::: %s' % p,
+                  "parallel 'rm -rf {= s/x// =}' ::: %sx" % h,
+                  'parallel --arg-sep @@ git worktree remove --force @@ %s' % p,
+                  'parallel --bogus-opt git status ::: a',           # an unknown option: the template start is unknown
+                  'parallel --jo 4 git status ::: a',                # ambiguous abbreviation (--jobs, --joblog)
+                  'parallel -kj4 git worktree remove --force ::: %s' % p,
+                  'parallel rm -rf {2} ::: a ::: %s' % h,
+                  'parallel --dnr @@ "rm -rf @@" ::: %s/x' % h,
+                  "parallel --colsep , 'rm -rf {1}' ::: %s,x" % h,
+                  "parallel -N2 'rm -rf {2}' ::: a %s" % h,
+                  "echo %s | parallel 'git wr {}'" % p,
+                  'echo %s | parallel' % p,
+                  'parallel --semaphore git worktree remove --force %s' % p,
+                  'sem --id x git wr %s' % p,
+                  'parallel echo ::: %s' % ' '.join('x%d' % n for n in range(cg.PAR_LINE_LIMIT + 1))):
+            self.assertEqual(self.decide(c)[0], 'block', c[:120])
+
+    def test_every_line_is_rebuilt_past_the_old_caps(self):
+        # the protected path sits past the old 32 and 50 item caps; the same list without it stays allowed
+        many = ' '.join('x%d' % n for n in range(200))
+        self.assertEqual(self.decide("parallel 'rm -rf {}' ::: %s %s" % (many, self.home))[0], 'block')
+        self.assertEqual(self.decide("parallel 'rm -rf {}' ::: %s" % many)[0], 'allow')
+
+    def test_plan_builds_the_cartesian_product_and_placeholders(self):
+        words = lambda *t: [cg._literal_word(x) for x in t]
+        lines, mode, error = cg.parallel_plan(words('echo', '{2}', '{1}', ':::', 'a', 'b', ':::', 'c', 'd'))
+        self.assertIsNone(error)
+        self.assertEqual(mode, 'args')
+        self.assertEqual(lines, ["echo 'c' 'a'", "echo 'd' 'a'", "echo 'c' 'b'", "echo 'd' 'b'"])
+        self.assertEqual(cg.parallel_plan(words('e', '{.}', '{/}', '{//}', '{/.}', ':::', '/d/f.x'))[0],
+                         ["e '/d/f' 'f.x' '/d' 'f'"])
+        self.assertEqual(cg.parallel_plan(words(':::', 'make a', 'make b'))[0], ['make a', 'make b'])
+        self.assertEqual(cg.parallel_plan(words('echo', ':::', 'a b'))[0], ["echo 'a b'"])
+
+    def test_edges_stay_allowed(self):
+        for c in ('parallel -j 4 echo ::: a b c', 'parallel --bar -k echo ::: a', 'parallel -I @@ echo @@ ::: ok',
+                  'git co main', 'git -C %s st' % self.linked, 'git lg src/*.py', "git config alias.wl 'worktree list'"):
+            self.assertEqual(self.decide(c)[0], 'allow', c)
+
+
 class WorktreeRemoveIndirectRound3(WorktreeRemoveCase):
     """goodqa#15346 round-2 delta review (BLOCK on c70e378). Git ignores an alias that shadows a built-in, so any
     subcommand outside a static built-in list is treated as a possible alias: it may not act on a protected path or on

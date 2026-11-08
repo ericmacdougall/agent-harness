@@ -37,6 +37,7 @@ import argparse
 import fnmatch
 import hashlib
 import hmac
+import itertools
 import json
 import os
 import posixpath
@@ -1814,16 +1815,339 @@ def _nondash(args):
     return out
 
 
-def _git_config_hides_subcommand(word, from_env=False, text=None):
-    """goodqa#15346 red-team M3/M4: a `-c`/`--config-env` setting that can make a plain-looking subcommand run
-    `git worktree remove`: an alias whose value names worktree, is built at run time, is a shell alias, or is read
-    from the environment; or an include that can define one. A plain alias to another subcommand is not one."""
-    low = (text if text is not None else word.text).casefold()
-    if low.startswith(('include.', 'includeif.')):
+# goodqa#15346 round 3: git runs a built-in before it looks for an alias, so a name on this list is never an alias,
+# whatever any config says. Every other subcommand may be an alias defined anywhere (global, system or include files,
+# GIT_CONFIG_* or a config written earlier), so it is judged as a command that could do anything to its arguments.
+# Static on purpose: `git --list-cmds=builtins` of 2.54 plus built-ins of older releases and `submodule`.
+GIT_BUILTINS = frozenset((
+    'add', 'am', 'annotate', 'apply', 'archive', 'backfill', 'bisect', 'bisect--helper', 'blame', 'branch', 'bugreport',
+    'bundle', 'cat-file', 'check-attr', 'check-ignore', 'check-mailmap', 'check-ref-format', 'checkout',
+    'checkout--worker', 'checkout-index', 'cherry', 'cherry-pick', 'clean', 'clone', 'column', 'commit', 'commit-graph',
+    'commit-tree', 'config', 'count-objects', 'credential', 'credential-cache', 'credential-cache--daemon',
+    'credential-store', 'describe', 'diagnose', 'diff', 'diff-files', 'diff-index', 'diff-pairs', 'diff-tree', 'difftool',
+    'env--helper', 'fast-export', 'fast-import', 'fetch', 'fetch-pack', 'fmt-merge-msg', 'for-each-ref', 'for-each-repo',
+    'format-patch', 'fsck', 'fsck-objects', 'fsmonitor--daemon', 'gc', 'get-tar-commit-id', 'grep', 'hash-object', 'help',
+    'history', 'hook', 'index-pack', 'init', 'init-db', 'interpret-trailers', 'last-modified', 'log', 'ls-files',
+    'ls-remote', 'ls-tree', 'mailinfo', 'mailsplit', 'maintenance', 'merge', 'merge-base', 'merge-file', 'merge-index',
+    'merge-ours', 'merge-recursive', 'merge-recursive-ours', 'merge-recursive-theirs', 'merge-subtree', 'merge-tree',
+    'mktag', 'mktree', 'multi-pack-index', 'mv', 'name-rev', 'notes', 'pack-objects', 'pack-redundant', 'pack-refs',
+    'patch-id', 'pickaxe', 'prune', 'prune-packed', 'pull', 'push', 'range-diff', 'read-tree', 'rebase',
+    'rebase--interactive', 'receive-pack', 'reflog', 'refs', 'remote', 'remote-ext', 'remote-fd', 'repack', 'replace',
+    'replay', 'repo', 'rerere', 'reset', 'restore', 'rev-list', 'rev-parse', 'revert', 'rm', 'send-pack', 'shortlog',
+    'show', 'show-branch', 'show-index', 'show-ref', 'sparse-checkout', 'stage', 'stash', 'status', 'stripspace',
+    'submodule', 'submodule--helper', 'switch', 'symbolic-ref', 'tag', 'unpack-file', 'unpack-objects', 'update-index',
+    'update-ref', 'update-server-info', 'upload-archive', 'upload-archive--writer', 'upload-pack', 'var', 'verify-commit',
+    'verify-pack', 'verify-tag', 'version', 'whatchanged', 'worktree', 'write-tree'))
+
+
+def _git_split_cmdline(text):
+    """git's split_cmdline(), which splits a non-shell alias value: single and double quotes group and are removed,
+    a backslash outside single quotes takes the next character literally. None for an unclosed quote or a trailing
+    backslash (git refuses those aliases too, but the guard cannot tell what was meant)."""
+    out, cur, quoted, have, i = [], [], None, False, 0
+    while i < len(text):
+        c = text[i]
+        i += 1
+        if quoted is None and c.isspace():
+            if have:
+                out.append(''.join(cur))
+                cur, have = [], False
+        elif quoted is None and c in '\'"':
+            quoted, have = c, True
+        elif c == quoted:
+            quoted = None
+        else:
+            if c == '\\' and quoted != "'":
+                if i >= len(text):
+                    return None
+                c = text[i]
+                i += 1
+            cur.append(c)
+            have = True
+    if quoted is not None:
+        return None
+    if have:
+        out.append(''.join(cur))
+    return out
+
+
+def _git_alias_value_risky(value):
+    """A git config alias value that can run worktree remove or move, or anything at all: a shell alias (!), a value
+    split_cmdline cannot split, or one whose words name worktree for anything but `worktree list`."""
+    if value.lstrip().startswith('!'):
         return True
-    if not low.startswith('alias.'):
-        return False
-    return bool(from_env or word.dynamic or word.subs or 'worktree' in low or '!' in low)
+    words = _git_split_cmdline(value)
+    if words is None:
+        return True
+    low = [w.casefold() for w in words]
+    for k, w in enumerate(low):
+        if w == 'worktree' and low[k + 1:k + 2] != ['list']:
+            return True
+        if posixpath.basename(w) == 'git-worktree':
+            return True  # a shell-less value cannot run it, but say so rather than guess
+    return False
+
+
+# GNU parallel option table (Getopt::Long with bundling and require_order: options stop at the first other word,
+# long options may be abbreviated to a unique prefix). An option outside this table makes the line unrebuildable.
+PAR_SHORT_VALUED = frozenset('aCdEIjLnNPsS')
+PAR_SHORT_OPTIONAL = frozenset('eilD')  # value only when attached (-i@@); a separate word is ambiguous -> refuse
+PAR_SHORT_FLAGS = frozenset('0kqrtpuvXmgxVh')
+PAR_LONG_VALUED = frozenset((
+    'arg-file', 'arg-file-sep', 'arg-sep', 'basefile', 'bf', 'block', 'block-size', 'blocktimeout', 'bt', 'colsep',
+    'compress-program', 'decompress-program', 'ctagstring', 'delimiter', 'delay', 'env', 'extensionreplace', 'er',
+    'basenamereplace', 'bnr', 'dirnamereplace', 'dnr', 'basenameextensionreplace', 'bner', 'seqreplace', 'slotreplace',
+    'halt', 'halt-on-error', 'header', 'joblog', 'jobs', 'max-procs', 'limit', 'load', 'max-args', 'max-chars',
+    'max-replace-args', 'memfree', 'memsuspend', 'nice', 'process-slot-var', 'results', 'res', 'retries', 'return',
+    'rpl', 'sshdelay', 'sshlogin', 'sshloginfile', 'slf', 'semaphorename', 'id', 'semaphoretimeout', 'st', 'tagstring',
+    'template', 'termseq', 'timeout', 'tmpdir', 'transferfile', 'tf', 'wd', 'workdir', 'ssh', 'sqlmaster', 'sqlworker',
+    'sqlandworker', 'shard', 'bin', 'group-by', 'filter', 'recstart', 'recend', 'trc', 'cpus', 'parens', 'tee-filter'))
+PAR_LONG_OPTIONAL = frozenset(('replace', 'eof', 'max-lines', 'debug', 'shebang-wrap'))
+PAR_LONG_FLAGS = frozenset((
+    'null', 'keep-order', 'quote', 'no-run-if-empty', 'verbose', 'interactive', 'ungroup', 'xargs', 'dry-run', 'progress',
+    'eta', 'bar', 'line-buffer', 'lb', 'linebuffer', 'group', 'files', 'files0', 'csv', 'plus', 'no-notice', 'will-cite',
+    'citation', 'bibtex', 'semaphore', 'fg', 'bg', 'wait', 'onall', 'nonall', 'shellquote', 'skip-first-line', 'tty',
+    'open-tty', 'silent', 'show-limits', 'tag', 'tee', 'pipe', 'pipepart', 'cat', 'fifo', 'regexp', 'round-robin',
+    'resume', 'resume-failed', 'retry-failed', 'cleanup', 'transfer', 'trim', 'tmux', 'tmuxpane', 'compress',
+    'number-of-cpus', 'number-of-cores', 'number-of-threads', 'number-of-sockets', 'use-cpus-instead-of-cores',
+    'use-cores-instead-of-threads', 'use-sockets-instead-of-threads', 'nonotice', 'gnu', 'version', 'help', 'link',
+    'keep-order', 'shuf', 'sql', 'filter-hosts', 'hostgroups', 'mark-jobs', 'unsafe', 'ctag', 'color', 'colour-failed',
+    'color-failed', 'record-env', 'linebuffered'))
+PAR_LINE_LIMIT = 4096  # more rebuilt lines than this is refused (said so), never cut to a sample
+
+
+def _par_long(name):
+    """Resolve a (possibly abbreviated) GNU parallel long option to (full name, kind) or (None, None)."""
+    for table, kind in ((PAR_LONG_VALUED, 'v'), (PAR_LONG_OPTIONAL, 'o'), (PAR_LONG_FLAGS, 'f')):
+        if name in table:
+            return name, kind
+    hits = [(n, k) for table, k in ((PAR_LONG_VALUED, 'v'), (PAR_LONG_OPTIONAL, 'o'), (PAR_LONG_FLAGS, 'f'))
+            for n in table if n.startswith(name)]
+    return hits[0] if len({n for n, _ in hits}) == 1 else (None, None)
+
+
+def _par_transform(value, kind):
+    if kind in ('', None):
+        return value
+    if kind == '.':
+        return re.sub(r'\.[^/.]*$', '', value)
+    if kind == '/':
+        return re.sub(r'^.*/', '', value)
+    if kind == '//':
+        if '/' not in value:
+            return '.'
+        return re.sub(r'/[^/]*$', '', value) or '/'
+    if kind == '/.':
+        return re.sub(r'\.[^/.]*$', '', re.sub(r'^.*/', '', value))
+    return '1'  # {#} job number, {%} slot number
+
+
+def parallel_plan(words, semaphore=False):
+    """goodqa#15346 round 3: rebuild the command lines GNU parallel (or sem) would run from its words.
+
+    Returns (lines, mode, error). `lines` are shell command lines; mode 'stdin' means the arguments come from standard
+    input, so each line carries a literal {} where they go. `error` (lines None) says why the lines cannot be rebuilt;
+    the caller refuses. Sources are combined as a full cartesian product (:::+ is linked in parallel, a subset of the
+    product, so the product over-approximates it); every combination is rebuilt, up to PAR_LINE_LIMIT, then refused."""
+    texts = [w.text for w in words]
+    opts = {}
+    repl = {'{}': '', '{.}': '.', '{/}': '/', '{//}': '//', '{/.}': '/.', '{#}': '#', '{%}': '%'}
+    custom = {'I': '', 'i': '', 'replace': '', 'extensionreplace': '.', 'er': '.', 'basenamereplace': '/', 'bnr': '/',
+              'dirnamereplace': '//', 'dnr': '//', 'basenameextensionreplace': '/.', 'bner': '/.', 'seqreplace': '#',
+              'slotreplace': '%'}
+    i = 0
+
+    def set_opt(name, value):
+        opts.setdefault(name, []).append(value)
+
+    while i < len(words):
+        t = texts[i]
+        if t == '--':
+            i += 1
+            break
+        if not t.startswith('-') or t == '-':
+            break
+        w = words[i]
+        if w.dynamic or w.subs:
+            return None, None, 'a parallel option is built at run time'
+        if t.startswith('--'):
+            name, _, value = t[2:].partition('=')
+            full, kind = _par_long(name)
+            if full is None:
+                return None, None, 'parallel option %s is not one the guard knows' % t[:40]
+            if kind == 'v' and '=' not in t:
+                if i + 1 >= len(words):
+                    return None, None, 'parallel option %s has no value' % t[:40]
+                value = texts[i + 1]
+                i += 1
+            elif kind == 'o' and '=' not in t:
+                if i + 1 < len(words) and not texts[i + 1].startswith('-'):
+                    return None, None, 'parallel option %s may take the next word as its value' % t[:40]
+                value = None
+            set_opt(full, value)
+            i += 1
+            continue
+        k = 1
+        while k < len(t):
+            ch = t[k]
+            if ch in PAR_SHORT_FLAGS:
+                set_opt(ch, None)
+                k += 1
+            elif ch in PAR_SHORT_VALUED:
+                if k + 1 < len(t):
+                    set_opt(ch, t[k + 1:])
+                elif i + 1 < len(words):
+                    i += 1
+                    set_opt(ch, texts[i])
+                else:
+                    return None, None, 'parallel option -%s has no value' % ch
+                break
+            elif ch in PAR_SHORT_OPTIONAL:
+                if k + 1 < len(t):
+                    set_opt(ch, t[k + 1:])
+                elif i + 1 < len(words) and not texts[i + 1].startswith('-'):
+                    return None, None, 'parallel option -%s may take the next word as its value' % ch
+                else:
+                    set_opt(ch, None)
+                break
+            else:
+                return None, None, 'parallel option -%s is not one the guard knows' % ch
+        i += 1
+    for bad in ('plus', 'rpl', 'header', 'shebang-wrap', 'template', 'sqlmaster', 'sqlworker', 'sqlandworker'):
+        if bad in opts:
+            return None, None, 'parallel --%s changes how lines are built' % bad
+    for name, kind in custom.items():
+        for value in opts.get(name, ()):
+            if not value:
+                continue  # -i / --replace without a value keep {}
+            repl = {k: v for k, v in repl.items() if v != kind}
+            repl[value] = kind
+    sep = (opts.get('arg-sep') or [':::'])[-1]
+    fsep = (opts.get('arg-file-sep') or ['::::'])[-1]
+    if not sep or not fsep:
+        return None, None, 'parallel has an empty argument separator'
+    seps = {sep: False, sep + '+': False, fsep: True, fsep + '+': True}
+    template = []
+    while i < len(words) and texts[i] not in seps:
+        template.append(words[i])
+        i += 1
+    sources, files = [], []
+    for f in opts.get('a', []) + opts.get('arg-file', []):
+        files.append(f)
+    while i < len(words):
+        is_file = seps[texts[i]]
+        i += 1
+        group = []
+        while i < len(words) and texts[i] not in seps:
+            group.append(words[i])
+            i += 1
+        if is_file:
+            files.extend(w.text for w in group)
+        else:
+            sources.append(group)
+    stdin_files = [f for f in files if f == '-']
+    if len(stdin_files) != len(files):
+        return None, None, 'parallel reads its arguments from a file, so the lines it runs cannot be rebuilt'
+    quote_words = 'q' in opts or 'quote' in opts
+    parts = []
+    for w in template:
+        if len(w.alts) > 1 or w.overflow is not None:
+            return None, None, 'a parallel command word has several expansions'
+        if w.dynamic or w.subs:  # parallel re-parses the joined words, so an unknown value could be a whole command line
+            return None, None, 'a parallel command word is built at run time'
+        if w.glob:
+            if w.raw is None:
+                return None, None, 'a parallel command word is built at run time'
+            parts.append(w.raw)
+        else:
+            parts.append(_quote_for_rebuild(w.text) if quote_words else w.text)
+    command = ' '.join(parts)
+    if '{=' in command:
+        return None, None, 'parallel {= perl expression =} replacement cannot be rebuilt'
+    tokens = sorted(repl, key=len, reverse=True)
+    pattern = re.compile('|'.join([re.escape(t) for t in tokens] + [r'\{(\d+)(//|/\.|/|\.)?\}']))
+    numbered = bool(re.search(r'\{\d+(?://|/\.|/|\.)?\}', command))
+    if numbered and any(o in opts for o in ('C', 'colsep', 'n', 'N', 'max-args', 'max-replace-args', 'm', 'X', 'L',
+                                           'max-lines', 'l', 'xargs')):
+        return None, None, 'parallel numbered replacements with column or grouping options cannot be rebuilt'
+    if not sources and (semaphore or 'semaphore' in opts or 'pipe' in opts or 'pipepart' in opts) and not files:
+        if not command.strip():
+            return None, None, 'sem without a command'
+        return [command], 'none', None
+    if not sources:  # standard input (or -a -): judged like xargs, with {} where the arguments go
+        if not command.strip():
+            return None, None, 'parallel runs the lines of its input as commands, which cannot be rebuilt'
+        line, hit = _par_fill(command, pattern, repl, None)
+        if line is None:
+            return None, None, 'a parallel replacement cannot be rebuilt'
+        return [line if hit else command + " '{}'"], 'stdin', None
+    if files:
+        return None, None, 'parallel mixes ::: arguments with standard input, which cannot be rebuilt'
+    columns = []
+    total = 1
+    for group in sources:
+        values = []
+        for w in group:
+            alts = w.all_alts()
+            if alts is None:
+                return None, None, 'a parallel argument expands to too many words'
+            if w.dynamic or w.subs or w.glob:
+                if w.raw is None or not command.strip():  # with no command the argument IS the command line
+                    return None, None, 'a parallel argument is built at run time'
+                values.append((w.raw, True))
+            else:
+                values.extend((a, False) for a in alts)
+        if not values:
+            return [], 'args', None  # an empty source runs nothing
+        columns.append(values)
+        total *= len(values)
+        if total > PAR_LINE_LIMIT:
+            return None, None, 'parallel would run more than %d command lines; split the job' % PAR_LINE_LIMIT
+    lines = []
+    for combo in itertools.product(*columns):
+        if not command.strip():  # no command: the arguments are the command line itself, unquoted
+            lines.append(' '.join(v for v, _ in combo))
+            continue
+        line, hit = _par_fill(command, pattern, repl, combo)
+        if line is None:
+            return None, None, 'a parallel replacement cannot be rebuilt'
+        lines.append(line if hit else command + ' ' + ' '.join(v if raw else _quote_for_rebuild(v) for v, raw in combo))
+    return lines, 'args', None
+
+
+def _par_fill(command, pattern, repl, combo):
+    """Substitute replacement strings in one parallel command. combo None: standard input, each becomes a literal {}.
+    Returns (line, any replacement found), or (None, False) when a replacement cannot be rebuilt."""
+    hit = False
+    failed = False
+
+    def one(m):
+        nonlocal hit, failed
+        hit = True
+        if combo is None:
+            return "'{}'"
+        if m.group(0) in repl:
+            kind, picked = repl[m.group(0)], list(combo)
+        else:
+            n = int(m.group(1))
+            if n < 1 or n > len(combo):
+                failed = True
+                return ''
+            kind, picked = m.group(2) or '', [combo[n - 1]]
+        if kind in ('#', '%'):
+            return '1'
+        out = []
+        for value, raw in picked:
+            if raw:
+                if kind:
+                    failed = True
+                out.append(value)
+            else:
+                out.append(_quote_for_rebuild(_par_transform(value, kind)))
+        return ' '.join(out)
+
+    line = pattern.sub(one, command)
+    return (None, False) if failed else (line, hit)
 
 
 def _is_subseq(required, tokens):
@@ -2207,6 +2531,7 @@ class Analyzer:
     credential_pass = False
     credential_candidate = False
     disk_depth = 0
+    fed_input = 0  # > 0 while judging a command whose further arguments come from stdin (xargs, parallel without :::)
 
     def __init__(self, compiled, cwd=None, ps=False, marker=None):
         self.ctx = Ctx(compiled, cwd, ps, marker)
@@ -2899,7 +3224,7 @@ class Analyzer:
         if '/' in name or '/' in words[0].text:
             # ./run.sh or /path/to/script: analyse the script text when it is a shell script
             self.script_file(words[0], depth, require_shell=True)
-        if name in ('flock', 'unshare', 'parallel', 'tmux', 'screen', 'osascript', 'at', 'batch', 'script'):
+        if name in ('flock', 'unshare', 'parallel', 'sem', 'tmux', 'screen', 'osascript', 'at', 'batch', 'script'):
             if self.launcher(name, args, depth, pl, idx):
                 return
         if name == 'busybox' and args and not args[0].text.startswith('-') \
@@ -2956,12 +3281,12 @@ class Analyzer:
             self.find(args, depth, pl, idx)
             return
         if name == 'git-worktree':  # red-team M3: the separate program is the same command
-            self.git([_literal_word('worktree')] + list(args), words, cmd.words)
+            self.git([_literal_word('worktree')] + list(args), words, cmd.words, depth)
         if name in ('export', 'declare', 'typeset', 'readonly', 'local') and any(
                 re.match(r'GIT_CONFIG_(?:KEY_\d+|PARAMETERS)=.*(?:alias\.|include)', t, re.I) for t in texts):
             ctx.git_config_alias_env = True  # goodqa#15346 M4: a later `git wr` may run an alias read from the environment
         if name == 'git':
-            self.git(args, words, cmd.words)
+            self.git(args, words, cmd.words, depth)
         if name == 'rclone':
             self.rclone(args, pl, idx)
         elif name == 'security':
@@ -3147,20 +3472,21 @@ class Analyzer:
             if name == 'unshare' and k < len(args):
                 self.inner_words(args[k:], depth, pl, idx)
             return True
-        if name == 'parallel':
-            self.indirect_scan(args, depth, pl, idx)
-            if ':::' in texts:
-                cut = texts.index(':::')
-                head = [t for t in texts[:cut] if not t.startswith('-')]
-                for item in texts[cut + 1:][:32]:
-                    self.script(' '.join(head).replace('{}', _quote_for_rebuild(item)) + ' ' +
-                                _quote_for_rebuild(item), depth + 1, tail_visible=True)
-            else:
-                k = 0
-                while k < len(texts) and texts[k].startswith('-'):
-                    k += 1
-                if k < len(args):
-                    self.inner_words(args[k:], depth, pl, idx)
+        if name in ('parallel', 'sem'):
+            # goodqa#15346 round 3: judge every command line parallel would run, rebuilt the way GNU parallel builds
+            # it; a line that cannot be rebuilt is refused rather than guessed at
+            lines, mode, error = parallel_plan(list(args), semaphore=name == 'sem')
+            if error:
+                self.ctx.add(LOG_DELETE, 'parallel-unverifiable', 'the command lines %s would run cannot be rebuilt: %s'
+                             % (name, error), 'pass literal arguments with ::: and a plain command, or run the commands '
+                             'one by one')
+                return True
+            for line in lines:
+                self.fed_input += mode == 'stdin'
+                try:
+                    self.script(line, depth + 1, tail_visible=True)
+                finally:
+                    self.fed_input -= mode == 'stdin'
             return True
         if name in ('tmux', 'screen'):
             if 'send-keys' in texts or 'send' in texts or 'stuff' in texts:
@@ -3283,7 +3609,8 @@ class Analyzer:
                 return
 
     INDIRECT_COMMANDS = frozenset(('git', 'rm', 'rmdir', 'unlink', 'mv', 'shred', 'truncate', 'find', 'rsync', 'sh', 'bash',
-                                   'zsh', 'dash', 'ksh', 'env', 'sudo', 'ssh', 'xargs', 'parallel', 'eval', 'git-worktree'))
+                                   'zsh', 'dash', 'ksh', 'env', 'sudo', 'ssh', 'xargs', 'parallel', 'sem', 'eval',
+                                   'git-worktree'))
 
     def indirect_scan(self, args, depth, pl, idx):
         """goodqa#15346 red-team H1/H2: xargs and parallel take many options with a separate value (-J % -R 1 -S 255,
@@ -3292,16 +3619,9 @@ class Analyzer:
         merely spells such a name is accepted: fail toward block."""
         # red-team M1: every argument is scanned, however many options come first (a fixed bound let a repeated option push
         # the command out of range). The shared budget (ctx.budget.tick) still bounds the work.
-        stops = [k for k, a in enumerate(args) if a.text in (':::', '::::')]
-        data = [a.text for a in args[stops[0] + 1:] if not a.text.startswith(':::')][:50] if stops else []
         for j in range(len(args)):
             text = args[j].text
             if text.startswith('-'):
-                continue
-            if '{}' in text and data and re.search(r'\s', text.strip()) \
-                    and posixpath.basename(text.split(None, 1)[0]) in self.INDIRECT_COMMANDS:
-                for item in data:  # the placeholder stands for each argument: judge the command that really runs
-                    self.script(text.replace('{}', _quote_for_rebuild(item)), depth + 1)
                 continue
             if posixpath.basename(text) in self.INDIRECT_COMMANDS:
                 self.inner_words(args[j:], depth, pl, idx, via_xargs=True)
@@ -3315,10 +3635,12 @@ class Analyzer:
             return
         cmd = Cmd()
         cmd.words = list(words)
-        for name in self.names_for(words[0]):
-            self.apply(name, words, cmd, pl, idx, depth + 1)
-        if via_xargs and norm_name(words[0].text) in PRINT_FILE_CMDS:
-            pass
+        self.fed_input += bool(via_xargs)
+        try:
+            for name in self.names_for(words[0]):
+                self.apply(name, words, cmd, pl, idx, depth + 1)
+        finally:
+            self.fed_input -= bool(via_xargs)
 
     PKG_RUNNERS = {'npx': 0, 'bunx': 0, 'pnpx': 0, 'uvx': 0, 'pnpm': ('dlx', 'exec'), 'yarn': ('dlx', 'exec'),
                    'bun': ('x',), 'npm': ('exec', 'x'), 'pipx': ('run',)}
@@ -3721,7 +4043,80 @@ class Analyzer:
             cur = parent
         return None, None
 
-    def git(self, args, words, cmd_words=None):
+    def _git_line_alias(self, name, defs, cmd_words):
+        """The value of alias `name` when this command line settles it, else None. `defs` are the -c and --config-env
+        settings in order (key, value; None for a value not known here). -c is read after GIT_CONFIG_COUNT, so it wins;
+        the environment form counts only when every GIT_CONFIG_* variable in play has a known literal value."""
+        key = 'alias.' + name.casefold()
+        for k, value in reversed(defs):
+            if k.casefold() == key:
+                return value
+        env = {k: v for k, v in self.ctx.vars.items() if isinstance(v, str)}
+        for assign in (cmd_words or ()):
+            text = assign.text if hasattr(assign, 'text') else str(assign)
+            m = re.match(r'(GIT_CONFIG_\w+)=(.*)$', text, re.S)
+            if m:
+                if getattr(assign, 'dynamic', False) or getattr(assign, 'subs', None):
+                    return None
+                env[m.group(1)] = m.group(2)
+        unknown = set(self.ctx.var_hints) | set(self.ctx.tainted)
+        if any(n.startswith('GIT_CONFIG_') for n in unknown) or 'GIT_CONFIG_PARAMETERS' in env:
+            return None
+        if not re.fullmatch(r'\d{1,3}', env.get('GIT_CONFIG_COUNT', '')):
+            return None
+        for n in reversed(range(int(env['GIT_CONFIG_COUNT']))):
+            if 'GIT_CONFIG_KEY_%d' % n not in env or 'GIT_CONFIG_VALUE_%d' % n not in env:
+                return None
+            if env['GIT_CONFIG_KEY_%d' % n].casefold() == key:
+                return env['GIT_CONFIG_VALUE_%d' % n]
+        return None
+
+    @staticmethod
+    def _git_config_defines_risky_alias(args):
+        """`git config [--global] alias.X VALUE` (or `git config set ...`) with a value that can run worktree remove, or
+        --rename-section into alias, which turns existing keys into aliases."""
+        for k, a in enumerate(args):
+            low = a.text.casefold()
+            if low == '--rename-section' and any(
+                    b.dynamic or b.subs or b.text.casefold().split('.')[0] == 'alias' for b in args[k + 1:k + 3]):
+                return True
+            if low.startswith('alias.'):
+                if a.dynamic or a.subs:
+                    return True
+                value = args[k + 1] if k + 1 < len(args) else None  # a value may itself start with -- (--git-dir=x ...)
+                if value is not None and (value.dynamic or value.subs or _git_alias_value_risky(value.text)):
+                    return True
+        return False
+
+    def _git_possible_alias(self, sub, args, where):
+        """goodqa#15346 round 3: `sub` is not a built-in and this line does not say what it is, so it may be an alias to
+        anything. Refuse it when it could act on a protected path: an argument that names one, or a target this guard
+        cannot see (stdin, xargs, a placeholder, an expansion). With no such argument it stays allowed (`git st`)."""
+        ctx = self.ctx
+        unseen = self.fed_input > 0
+        for w in args:
+            if w.dynamic or w.subs or '{}' in w.text:
+                unseen = True
+        if unseen:
+            ctx.add(LOG_DELETE, 'linked-worktree-remove',
+                    'git %s may be an alias, and its target comes from stdin, xargs, a placeholder or an expansion, so '
+                    'it cannot be verified' % sub[:40],
+                    'name the built-in subcommand; for a removal use the standalone literal git worktree remove')
+            return
+        named = list(_nondash(args))  # --opt=PATH names a path too: a shell alias can do anything with it
+        named += [_literal_word(w.text.split('=', 1)[1]) for w in args if w.text.startswith('-') and '=' in w.text]
+        for w in named:
+            if self.refuse('git %s (possible alias)' % sub[:40], w):
+                continue
+            for alt in w.all_alts() or [w.text]:
+                path = norm_path(alt, ctx, where)
+                if path and '$' not in path and os.path.isfile(os.path.join(path, '.git')):
+                    ctx.add(LOG_DELETE, 'linked-worktree-remove',
+                            'git %s may be an alias, and %s is a linked worktree' % (sub[:40], alt[:120]),
+                            'name the built-in subcommand; for a removal use the standalone literal git worktree remove')
+                    break
+
+    def git(self, args, words, cmd_words=None, depth=1, alias_depth=0):
         ctx = self.ctx
         texts = [a.text for a in args]
         i = 0
@@ -3729,10 +4124,10 @@ class Analyzer:
         cwd_words = []
         locations = []
         alias = False
-        alias_removes = False
+        defs = []
         while i < len(texts):
             t = texts[i]
-            if t in ('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env',
+            if t in ('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env',
                      '--attr-source'):
                 if t in ('-C', '--work-tree') and i + 1 < len(args):
                     cwd_word = args[i + 1]
@@ -3741,17 +4136,20 @@ class Analyzer:
                 if t in ('--git-dir', '--work-tree') and i + 1 < len(args):
                     locations.append(args[i + 1].text)
                 if t in ('-c', '--config-env') and i + 1 < len(args):
-                    alias = alias or args[i + 1].text.casefold().startswith('alias.')
-                    alias_removes = alias_removes or _git_config_hides_subcommand(args[i + 1], t == '--config-env')
+                    key, _, value = args[i + 1].text.partition('=')
+                    alias = alias or key.casefold().startswith('alias.')
+                    known = t == '-c' and not (args[i + 1].dynamic or args[i + 1].subs)
+                    defs.append((key, value if known else None))
                 i += 2
             elif t.startswith(('--git-dir=', '--work-tree=')):
                 locations.append(t.split('=', 1)[1])
                 i += 1
             elif t.startswith('--config-env='):  # red-team M4: --config-env=alias.wr=VAR reads the alias from the environment
-                alias = alias or t.split('=', 1)[1].casefold().startswith('alias.')
-                alias_removes = alias_removes or _git_config_hides_subcommand(args[i], True, t.split('=', 1)[1])
+                key = t.split('=', 1)[1].partition('=')[0]
+                alias = alias or key.casefold().startswith('alias.')
+                defs.append((key, None))
                 i += 1
-            elif t.startswith('-'):
+            elif t.startswith('-'):  # includes bare --exec-path, which takes no value
                 i += 1
             else:
                 break
@@ -3768,12 +4166,33 @@ class Analyzer:
         if getattr(ctx, 'git_config_alias_env', False) or any(
                 re.match(r'GIT_CONFIG_(?:KEY_\d+|PARAMETERS)=.*(?:alias\.|include)', e, re.I) for e in env_pairs):
             alias = True
-            alias_removes = True
         sub = texts[i] if i < len(texts) else ''
         rest = texts[i + 1:]
-        if sub == 'worktree':
-            alias_removes = False  # the real subcommand is judged directly below
         built_sub = i < len(args) and (args[i].dynamic or bool(args[i].subs))
+        if sub and not built_sub and sub not in GIT_BUILTINS:
+            # goodqa#15346 round 3: a built-in is never an alias, so only a name outside the list reaches here
+            value = self._git_line_alias(sub, defs, cmd_words) if alias_depth < 8 else None
+            if value is None:
+                self._git_possible_alias(sub, args[i + 1:], norm_path(cwd_words[-1].text, ctx, ctx.cwd) if cwd_words
+                                         else ctx.cwd)
+            elif value.lstrip().startswith('!'):  # git runs: sh -c '<value> "$@"' with the arguments appended
+                if self.fed_input > 0 or any(a.dynamic or a.subs or '{}' in a.text for a in args[i + 1:]):
+                    ctx.add(LOG_DELETE, 'linked-worktree-remove',
+                            'a shell git alias with its target on stdin, xargs or a placeholder cannot be verified',
+                            'run the commands directly, with literal arguments')
+                else:
+                    self.script(' '.join([value.lstrip()[1:]] + [_quote_for_rebuild(a.text) for a in args[i + 1:]]),
+                                depth + 1, tail_visible=True)
+            else:
+                split = _git_split_cmdline(value)
+                if not split:
+                    ctx.add(LOG_DELETE, 'linked-worktree-remove', 'a git alias value cannot be split the way git does',
+                            'run the built-in subcommand directly')
+                else:  # judge the expansion: the words of the value replace the subcommand
+                    self.git(list(args[:i]) + [_literal_word(w) for w in split] + list(args[i + 1:]), words, cmd_words,
+                             depth, alias_depth + 1)
+            self.owned_checkout(sub, rest, cwd_words, locations, alias)
+            return
         built_worktree_sub = sub == 'worktree' and len(args) > i + 1 and (args[i + 1].dynamic or bool(args[i + 1].subs))
         if built_worktree_sub or (built_sub and any(
                 t.casefold() in ('remove', 'rm', 'move', 'mv') or '{}' in t or t in (':::', '::::') for t in rest)):
@@ -3781,8 +4200,7 @@ class Analyzer:
             ctx.add(LOG_DELETE, 'linked-worktree-remove',
                     'a git subcommand built at run time next to remove or move cannot be verified',
                     'write git worktree remove literally, as the standalone non-forced form')
-        if sub == 'config' and any(t.casefold().startswith('alias.') for t in rest) and any(
-                'worktree' in a.text.casefold() or '!' in a.text or a.dynamic or a.subs for a in args[i + 1:]):
+        if sub == 'config' and self._git_config_defines_risky_alias(args[i + 1:]):
             ctx.add(LOG_DELETE, 'linked-worktree-remove',
                     'git config defines an alias that can run worktree remove, which cannot be verified later',
                     'do not define such an alias; use the standalone literal non-forced form')
@@ -3801,16 +4219,11 @@ class Analyzer:
                         'git worktree remove without a literal target on its command line (xargs, find -exec, parallel '
                         'or a placeholder) cannot be verified',
                         'use the standalone literal non-forced form after cleaning and publishing the worktree')
-        # red-team M2/M4: an alias to worktree remove, or a subcommand built at run time, acts on its literal targets
-        if (alias_removes or (i < len(args) and (args[i].dynamic or args[i].subs))
-                or (sub == 'worktree' and len(args) > i + 1 and (args[i + 1].dynamic or args[i + 1].subs))
-                or (alias and sub not in self.OWNED_READ_SUBS and sub not in self.OWNED_CHANGES)):
+        # red-team M2: a subcommand built at run time acts on its literal targets
+        if ((i < len(args) and (args[i].dynamic or args[i].subs))
+                or (sub == 'worktree' and len(args) > i + 1 and (args[i + 1].dynamic or args[i + 1].subs))):
             for w in _nondash(args[i + 1:]):
-                self.refuse('git worktree remove (alias or built subcommand)', w)
-            if alias_removes:
-                ctx.add(LOG_DELETE, 'linked-worktree-remove',
-                        'a git alias that runs worktree remove or move cannot be verified',
-                        'use the standalone literal non-forced form after cleaning and publishing the worktree')
+                self.refuse('git worktree remove (built subcommand)', w)
         if sub == 'worktree' and rest[:1] in (['remove'], ['prune'], ['move']):
             for w in _nondash(args[i + 2:]):
                 refused = self.refuse('git worktree ' + rest[0], w)
