@@ -4,7 +4,7 @@ set -u
 SHA=${1:?full sha}; R=$HOME/release-evidence/${2:?evidence dir name}; S12=${SHA:0:12}
 W=$HOME/repos/bt-release-smoke-$S12
 [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "NOT_A_FULL_SHA"; exit 2; }
-mkdir -p "$R" "$HOME/sc" "$HOME/ipc"
+mkdir -p "$R" "$HOME/sc" "$HOME/ipc"; chmod 700 "$HOME/ipc" "$HOME/sc"
 cd "$HOME/repos/bugtracker" || exit 2
 git fetch -q origin
 [ -d "$W" ] || git worktree add -q --detach "$W" "$SHA" || exit 2
