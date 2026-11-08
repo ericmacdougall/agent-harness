@@ -400,12 +400,53 @@ FREE_TEXT_COMMANDS = (DATA_COMMANDS - {"less", "more", "pytest", "py.test", "rg"
 KEYWORDS = {"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}"}
 REDIRECTS = {"<", ">", ">>", "<<", "<<-", "<<<", ">&", "&>", ">|", "<&", "<>"}
 SPLITTERS = {";", "&&", "||", "|", "|&", "&", "(", ")", ";;"}
-GH_TEXT = {"issue", "pr", "api", "search"}
+# gh subcommands whose verbs only read or post text; --web/-w (a browser) is refused separately
+GH_TEXT = {"issue": {"comment", "create", "view", "list", "edit", "close", "reopen"},
+           "pr": {"comment", "create", "view", "list", "edit", "checks", "diff", "review", "close", "ready"},
+           "api": None, "search": None}
 SAFE_GIT_CONFIG = {"core.hookspath=/dev/null"}
-GIT_TEXT = {"commit", "log", "show", "diff", "status", "add", "grep", "rev-parse", "branch", "tag"}
-# git options that run a program, open an editor or pager, or write a file
-GIT_RISKY = re.compile(r"^(?:-O|--open-files-in-pager|--output|--ext-diff|--textconv|-e$|--edit|--exec|--upload-pack|"
-                       r"--receive-pack|--template|-x$)")
+_LOG_LONG = {"--oneline", "--stat", "--name-only", "--name-status", "--format", "--pretty", "--grep", "--author",
+             "--since", "--until", "--all", "--graph", "--decorate", "--reverse", "--first-parent", "--max-count",
+             "--follow", "--date", "--merges", "--no-merges", "--patch", "--abbrev-commit", "--no-color", "--numstat",
+             "--shortstat", "--invert-grep", "--all-match", "--fixed-strings", "--regexp-ignore-case"}
+# Per git subcommand: (exact long options, short flags without a value, short flags that take the rest as value).
+# Anything else (abbreviated or unknown long options, other short flags) is not free text: git accepts unambiguous
+# abbreviations and joined short flags, so a deny-list cannot be complete (goodqa#15122 Opus-high review F1/F2).
+GIT_OPTIONS = {
+    "commit": ({"--message", "--file", "--quiet", "--signoff", "--allow-empty", "--no-edit"}, "aqsv", "mF"),
+    "log": (_LOG_LONG, "pqs", "nSG"),
+    "show": (_LOG_LONG, "pqs", "nSG"),
+    "diff": ({"--stat", "--name-only", "--name-status", "--cached", "--staged", "--numstat", "--shortstat",
+              "--no-color", "--word-diff", "--unified", "--exit-code", "--quiet", "--check"}, "pqsuwRb", "U"),
+    "status": ({"--short", "--branch", "--porcelain", "--untracked-files", "--ignored"}, "sbz", "u"),
+    "add": ({"--all", "--update", "--verbose", "--dry-run", "--intent-to-add"}, "Anuv", ""),
+    "grep": ({"--line-number", "--ignore-case", "--files-with-matches", "--count", "--word-regexp",
+              "--extended-regexp", "--fixed-strings", "--cached", "--untracked", "--no-index", "--heading", "--break",
+              "--quiet", "--invert-match", "--all-match", "--max-depth", "--line-regexp"}, "nilcwEFhHIvqx", "e"),
+    "rev-parse": ({"--abbrev-ref", "--show-toplevel", "--verify", "--short", "--git-dir", "--is-inside-work-tree",
+                   "--symbolic-full-name"}, "q", ""),
+    "branch": ({"--list", "--contains", "--merged", "--no-merged", "--all", "--remotes", "--show-current", "--sort",
+                "--format", "--verbose"}, "alrv", ""),
+    "tag": ({"--list", "--contains", "--points-at", "--sort", "--format"}, "l", "n"),
+}
+
+
+def _git_args_ok(sub, args):
+    """Every option of a git subcommand is on its allow-list; positional words (paths, revisions, patterns) are text."""
+    longs, flags, valued = GIT_OPTIONS[sub]
+    for t in args:
+        if t == "--":
+            return True  # the rest are paths
+        if t.startswith("--"):
+            if t.split("=", 1)[0] not in longs:
+                return False
+        elif t.startswith("-") and len(t) > 1:
+            for j, c in enumerate(t[1:]):
+                if c in valued:
+                    break  # the rest of the word is the value
+                if c not in flags:
+                    return False
+    return True
 HOOK_SCRIPT = re.compile(r"^(?:~|%s)/\.claude/hooks/(?:wal_note|ah|commit_policy|provenance|spec_flow)\.py$"
                          % re.escape(str(Path.home())))
 # assignments that change which program runs or what it loads
@@ -459,20 +500,25 @@ def _free_text(words):
     if "/" not in word and word in FREE_TEXT_COMMANDS:
         return True
     if word == "gh":
-        sub = next((t for t in rest if not t.startswith("-")), "")
-        return sub in GH_TEXT
+        if any(t in ("--web", "-w") or t.startswith("--web=") for t in rest):
+            return False  # opens a browser
+        plain = [t for t in rest if not t.startswith("-")]
+        if not plain or plain[0] not in GH_TEXT:
+            return False
+        verbs = GH_TEXT[plain[0]]
+        return verbs is None or (len(plain) > 1 and plain[1] in verbs)
     if word == "git":
-        k = 0
+        k, hooks_off = 0, False
         while k < len(rest) and rest[k].startswith("-"):
-            if rest[k] == "-c":
-                if k + 1 >= len(rest) or rest[k + 1].lower() not in SAFE_GIT_CONFIG:
-                    return False
-                k += 2
-            elif rest[k] == "-C":
-                k += 2
+            if rest[k] == "-c" and k + 1 < len(rest) and rest[k + 1].lower() in SAFE_GIT_CONFIG:
+                hooks_off, k = True, k + 2
             else:
-                return False
-        return k < len(rest) and rest[k] in GIT_TEXT and not any(GIT_RISKY.match(t) for t in rest[k + 1:])
+                return False  # other -c settings and -C (another repository's config) are not free text
+        if k >= len(rest) or rest[k] not in GIT_OPTIONS:
+            return False
+        if rest[k] == "commit" and not hooks_off:
+            return False  # commit hooks are programs; a commit is free text only with core.hooksPath=/dev/null
+        return _git_args_ok(rest[k], rest[k + 1:])
     if word in ("python3", "python"):
         return bool(rest) and bool(HOOK_SCRIPT.match(rest[0]))
     return False
@@ -508,8 +554,9 @@ def _waiver_attempt(command, _depth=0):
         return True  # HOME, PATH, PYTHONPATH and the like change which code a free-text form runs
     writes = []
     commands = _simple_commands(tokens, writes)
-    runs_code = any(_command_word(w) in ("git", "python3", "python") for w in commands)
-    if runs_code and (writes or any(_command_word(w) == "tee" for w in commands)):
+    # any git or python word, also after if/while/then (review F1: _command_word does not skip keywords)
+    runs_code = any(os.path.basename(t) in ("git", "python3", "python") for w in commands for t in w)
+    if runs_code and (writes or any(os.path.basename(t) == "tee" for w in commands for t in w)):
         return True  # a file written next to a git or python run could be the hook or script that runs
     for words in commands:
         if not _free_text(words):

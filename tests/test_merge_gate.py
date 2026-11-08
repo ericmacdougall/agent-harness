@@ -934,10 +934,33 @@ class FalsePositives15122(Base):
                 code, text = mg.decide(bash(command, **self.SUB), FakeGh(SCENARIOS["green"]), self.state)
                 self.assertEqual(code, 0, text)
 
+    def test_review_gfp5_git_options_outside_the_per_subcommand_list_stay_blocked(self):
+        # Opus-high review of 6305aee F1/F2/F3: keyword-prefixed git, abbreviated or joined long/short options, -C,
+        # commits with hooks on, gh --web and checkout.
+        for command in ("echo merge_gate waive > .git/hooks/pre-commit; if git commit -m x; then true; fi",
+                        "echo merge_gate waive | tee f; while git status; do break; done",
+                        "git grep --open-files /p 'merge_gate waive'", "git grep -nO/p 'merge_gate waive'",
+                        "git log --ext --grep 'merge_gate waive'", "git log --outp=/f --grep 'merge_gate waive'",
+                        "git -C /r log --grep 'merge_gate waive'",
+                        "git commit -m 'merge_gate waive note'", "git commit --no-verify -m 'merge_gate waive note'",
+                        "git tag -s v1 -m 'merge_gate waive'", "git add -p # merge_gate waive",
+                        "gh pr view 5 --web # merge_gate waive", "gh pr checkout 5 # merge_gate waive",
+                        "gh issue view 5 -w # merge_gate waive"):
+            with self.subTest(command):
+                code, text = mg.decide(bash(command, **self.SUB), FakeGh(SCENARIOS["green"]), self.state)
+                self.assertEqual(code, 2, text)
+        for command in ("git grep -n -e 'merge_gate waive' -- harness", "git grep -nix 'merge_gate waive'",
+                        "git log -n5 --oneline --grep 'merge_gate waive'",
+                        "git -c core.hooksPath=/dev/null commit -q -F msg.txt  # merge_gate waive",
+                        "git diff --stat HEAD~1 -- 'merge_gate waive'", "gh pr comment 5 --body 'merge_gate waive'"):
+            with self.subTest(command):
+                code, text = mg.decide(bash(command, **self.SUB), FakeGh(SCENARIOS["green"]), self.state)
+                self.assertEqual(code, 0, text)
+
     def test_ac2_subagent_free_text_about_the_exception_record_is_allowed(self):
         for command in ("python3 ~/.claude/hooks/wal_note.py --wal /w/a.jsonl --event status "
                         "--note 'fixed the merge_gate.py waive false positive'",
-                        "git commit -m 'fix(merge_gate): the subagent waive check is structural'",
+                        "git -c core.hooksPath=/dev/null commit -m 'fix(merge_gate): the subagent waive check is structural'",
                         "gh issue comment 15122 --body 'merge_gate waive block fired on a WAL note'",
                         "cat > notes.md <<'EOF'\nrun merge_gate.py waive only from main\nEOF",
                         "grep -n waive harness/hooks/merge_gate.py",
