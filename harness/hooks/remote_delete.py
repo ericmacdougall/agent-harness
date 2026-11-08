@@ -49,6 +49,9 @@ APPROVE_ARCHIVE = re.compile(r"^(?:yes,? )?(?:remove|delete)(?: (?:it|them|both|
                              r"(?: (\d{1,2}))?(?: of them)?(?: \(recommended\))?\.?$", re.I)
 BACKED_UP = re.compile(r"\bbacked up\b|\bbackups?\b", re.I)
 TILDE_PATH_RE = re.compile(r'(?<![\w.~-])~/[^\s"\'`,;:()<>\[\]{}?!*|]+')
+# R1: exclusion words a question can use besides DECLINE_WORDS ("spare ~/wt/a", "all except ~/wt/b"). "only" is
+# left out on purpose: it is common in explanatory text ("the check only lets me ...").
+QUESTION_EXCLUDE = re.compile(r"\b(?:spare|except|excluding|exclude|apart from|other than|save for|but not)\b", re.I)
 REMOTE_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}:[A-Za-z0-9 ._/-]{1,400}$")
 AGENT = HERE / "remote_delete_agent.py"
 
@@ -84,9 +87,10 @@ def wording_refusal(turn, host):
     if not approve or cg.DECLINE_WORDS.search(text):
         return ("the selected answer is not a plain approval of every named path (for example \"Yes, remove all 11\")"
                 "; ask the user again")
-    if cg.DECLINE_WORDS.search(question):
+    excluded = cg.DECLINE_WORDS.search(question) or QUESTION_EXCLUDE.search(question)
+    if excluded:
         return ("the question also says to keep or not remove something (%r); ask one question that lists only the "
-                "paths to remove" % cg.DECLINE_WORDS.search(question).group(0))
+                "paths to remove" % excluded.group(0))
     if named_count(question) > 1 and not approve.group(1):
         return ("the question names %d paths, so the answer must state that count (for example \"Yes, remove all "
                 "%d\")" % (named_count(question), named_count(question)))

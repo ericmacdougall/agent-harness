@@ -337,6 +337,14 @@ class Refused(RemoteCase):
         self.refused(old, 'keep or not remove')
         self.refused(keep, 'keep or not remove')
 
+    def test_question_that_spares_a_path(self):
+        tree = self.plain_tree('old')
+        self.archive('old')
+        for question in ("t2-dev: both are backed up. Spare ~/wt/active; remove ~/wt/old?",
+                         "t2-dev: all backed up. Remove ~/wt/old and ~/wt/x, except ~/wt/active?"):
+            self.turn.update(question=question, text='Yes, remove all %d' % rd.named_count(question))
+            self.refused(tree, 'keep or not remove')
+
     def test_multi_path_answer_must_state_the_count(self):
         tree = self.plain_tree('alpha')
         self.archive('alpha')

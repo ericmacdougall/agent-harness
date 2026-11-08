@@ -91,7 +91,9 @@ def git_state(path):
     if os.path.islink(marker) or not os.path.isfile(marker):
         raise ValueError("a checkout with its own .git directory is not removed by this route (its branches and "
                          "stash would go with it); only linked worktrees")
-    _, gitdir = git(path, "rev-parse", "--path-format=absolute", "--git-dir")
+    code, gitdir = git(path, "rev-parse", "--path-format=absolute", "--git-dir")
+    if code != 0 or not os.path.isabs(gitdir.strip()):  # R2: no git dir, no submodule check: refuse
+        raise ValueError("git rev-parse --git-dir failed")
     if os.path.lexists(os.path.join(path, ".gitmodules")) or os.path.lexists(os.path.join(gitdir.strip(), "modules")):
         raise ValueError("the worktree has submodules, whose unpushed commits worktree remove would delete")
     code, status = git(path, "status", "--porcelain=v1", "--untracked-files=all")
