@@ -269,13 +269,13 @@ class Refused(RemoteCase):
     def test_protected_location(self):
         tree = self.rhome / '.claude/projects'
         tree.mkdir(parents=True)
-        self.turn.update(question=QUESTION + ' Also ~/.claude/projects', text='Yes, remove them')
+        self.turn.update(question=QUESTION + ' Also ~/.claude/projects', text='Yes, remove all 3')
         self.refused(tree, 'protected')
 
     def test_credential_location(self):
         tree = self.rhome / '.aws/sso'
         tree.mkdir(parents=True)
-        self.turn.update(question=QUESTION + ' Also ~/.aws/sso', text='Yes, remove them')
+        self.turn.update(question=QUESTION + ' Also ~/.aws/sso', text='Yes, remove all 3')
         self.refused(tree, 'protected')
 
     # red-team F1: the archive must be the tree, not just any archive of that name
@@ -305,6 +305,43 @@ class Refused(RemoteCase):
         os.environ['FAKE_WRITE_DURING_DOWNLOAD'] = str(tree / 'late.txt')
         self.addCleanup(os.environ.pop, 'FAKE_WRITE_DURING_DOWNLOAD', None)
         self.refused(tree, 'the tree has alpha/late.txt')
+
+    # red-team F18: contents count, not only size and mtime
+    def test_same_size_edit_with_mtime_restored(self):
+        tree = self.plain_tree('alpha')
+        self.archive('alpha')
+        info = os.stat(tree / 'notes.txt')
+        (tree / 'notes.txt').write_text('HELLO\n')
+        os.utime(tree / 'notes.txt', ns=(info.st_atime_ns, info.st_mtime_ns))
+        self.refused(tree, 'alpha/notes.txt differs from the archive')
+
+    # red-team F16: a submodule's repository lives in the worktree's git dir and goes with worktree remove
+    def test_worktree_with_a_submodule(self):
+        sub = self.rhome / 'repos/sub'
+        run('git', 'init', '-q', str(sub))
+        (sub / 's').write_text('s\n')
+        run('git', '-C', str(sub), 'add', 's')
+        run('git', '-C', str(sub), 'commit', '-q', '-m', 's')
+        tree, _ = self.git_tree('alpha', unpushed=False)
+        run('git', '-c', 'protocol.file.allow=always', '-C', str(tree), 'submodule', 'add', '-q', str(sub), 'sub')
+        run('git', '-C', str(tree), 'commit', '-q', '-m', 'add sub')
+        self.archive('alpha', bundle_of=tree)
+        self.refused(tree, 'submodules')
+
+    # red-team F17: a question that also says keep, and a multi-path answer without its count
+    def test_question_that_also_says_keep(self):
+        keep, old = self.plain_tree('active'), self.plain_tree('old')
+        self.archive('old')
+        self.turn.update(question="Keep ~/wt/active (an owner is in it). t2-dev: ~/wt/old is backed up. Remove ~/wt/old?",
+                         text='Yes, remove all 2')
+        self.refused(old, 'keep or not remove')
+        self.refused(keep, 'keep or not remove')
+
+    def test_multi_path_answer_must_state_the_count(self):
+        tree = self.plain_tree('alpha')
+        self.archive('alpha')
+        self.turn['text'] = 'Yes, remove them'
+        self.refused(tree, 'must state that count')
 
     # red-team F2: a checkout with its own .git directory takes its branches with it
     def test_main_checkout_is_refused(self):
