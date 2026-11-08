@@ -1578,6 +1578,66 @@ def add_waiver(state_dir, repo, pr, head, ticket, reason, approved_by, source="a
     return record
 
 
+def add_review_waiver(state_dir, reference, *, store=None, now=None):
+    """Authorize only a loaded, settled, independent pure PR PASS FINAL.
+
+    All merge binding and reviewer identity comes from validated evidence; callers
+    cannot supply hashes or override them. Deterministic replay stays idempotent.
+    """
+    import usage_guard
+
+    store = store or usage_guard.UsageStore()
+    evidence = store.inspect(reference)
+    review = evidence.get('review')
+    if not isinstance(review, dict):
+        raise ValueError('merge authorization needs typed PR review FINAL evidence')
+    usage_guard.validate_review_metadata(review, result=evidence.get('result'))
+    usage = evidence.get('usage') if isinstance(evidence.get('usage'), dict) else {}
+    reviewer = review.get('reviewer', '')
+    reviewer_harness = review.get('reviewer_harness')
+    expected_prefix = {'openai': 'Codex ', 'claude': 'Claude '}.get(reviewer_harness)
+    if (evidence.get('review_finalization') != 'SETTLED'
+            or evidence.get('execution') != 'COMPLETED' or evidence.get('result') != 'CHECK_OK'
+            or evidence.get('reason') != 'NONE'
+            or evidence.get('invocation', {}).get('purpose') != 'peer-review-pr'
+            or review.get('stage') != 'PR' or review.get('verdict') != 'ACCEPT'
+            or review.get('findings') != [] or review.get('ticketed')
+            or not all(key in review for key in ('repo', 'pr', 'head', 'report_sha256'))
+            or evidence.get('subject', {}).get('head') != review['head']
+            or review.get('author_harness') not in {'claude', 'openai'}
+            or reviewer_harness not in {'claude', 'openai'}
+            or reviewer_harness == review['author_harness']
+            or not expected_prefix or not reviewer.startswith(expected_prefix)
+            or type(usage.get('provider_launches')) is not int or usage['provider_launches'] < 1):
+        raise ValueError('FINAL is not settled independent pure PR PASS evidence')
+    repo, pr, head = review['repo'], review['pr'], review['head']
+    report_sha256, final_sha256 = review['report_sha256'], reference['sha256']
+    state_dir = Path(state_dir)
+    wid = "mgw-review-" + hashlib.sha256(
+        f"{repo.lower()}|{pr}|{head}|{report_sha256}|{final_sha256}".encode("utf-8")).hexdigest()[:24]
+    lock = _lock(state_dir)
+    try:
+        records = _read_waivers(state_dir)
+        existing = next((row for row in records if row.get("event") == "waive" and row.get("id") == wid), None)
+        if existing is not None:
+            expected = (repo.lower(), pr, head, report_sha256, final_sha256)
+            actual = (existing.get("repo"), existing.get("pr"), existing.get("head"),
+                      existing.get("report_sha256"), existing.get("final_sha256"))
+            if actual != expected:
+                raise Corrupt("review waiver id does not match its evidence")
+            return existing
+        record = _append_waiver_record(state_dir, {
+            "event": "waive", "id": wid, "ts": now if now is not None else time.time(),
+            "repo": repo.lower(), "pr": pr, "head": head,
+            "ticket": "peer-review:" + report_sha256,
+            "reason": "Settled independent PR PASS bound to report and FINAL bytes",
+            "approved_by": "main:peer-review", "approval_source": "settled-review",
+            "reviewer": reviewer, "report_sha256": report_sha256, "final_sha256": final_sha256})
+    finally:
+        _unlock(lock)
+    return record
+
+
 def consume_waiver(state_dir, repo, pr, head, command_hash, now=None):
     state_dir = Path(state_dir)
     try:

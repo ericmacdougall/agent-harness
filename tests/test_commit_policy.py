@@ -405,6 +405,33 @@ class PreToolUseHook(Fixture):
         self.assertEqual(dynamic.returncode, 2)
         self.assertIn("cannot be checked", dynamic.stderr)
 
+    def test_inline_stdin_heredoc_runs_full_policy_in_same_invocation(self):
+        command = "git add -A && git commit -F - <<'EOF'\n" + GOOD + "\nEOF"
+        allowed = self.run_cli("hook", stdin=self.payload(command))
+        self.assertEqual((allowed.returncode, allowed.stderr), (0, ""))
+
+        missing_testing = GOOD.replace("Testing: `python3 -m unittest tests.test_commit_policy` -> 42 passed\n", "")
+        blocked = self.run_cli("hook", stdin=self.payload("git commit -F - <<'EOF'\n" + missing_testing + "\nEOF"))
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("Testing: section missing", blocked.stderr)
+
+        missing_ticket = GOOD.replace("GoodQA #14151", "none (no tracked ticket for this change)")
+        blocked = self.run_cli("hook", stdin=self.payload("git commit -F - <<'EOF'\n" + missing_ticket + "\nEOF"))
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("must reference a ticket", blocked.stderr)
+
+    def test_inline_stdin_heredoc_still_fails_closed(self):
+        dynamic = self.run_cli("hook", stdin=self.payload("git commit -F - <<EOF\n" + GOOD + "\n$HOME\nEOF"))
+        self.assertEqual(dynamic.returncode, 2)
+        self.assertIn("cannot be checked", dynamic.stderr)
+        malformed = self.run_cli("hook", stdin=self.payload("git commit -F - <<'EOF'\n" + GOOD))
+        self.assertEqual(malformed.returncode, 2)
+        self.assertIn("unterminated heredoc", malformed.stderr)
+        (self.repo / "msg.txt").write_text(GOOD)
+        race = self.run_cli("hook", stdin=self.payload("printf x > msg.txt && git commit -F msg.txt"))
+        self.assertEqual(race.returncode, 2)
+        self.assertIn("same command", race.stderr)
+
     def test_codex_payload_shapes(self):
         base = {"session_id": "codex-1", "cwd": str(self.repo), "hook_event_name": "PreToolUse", "model": "m",
                 "permission_mode": "default", "tool_name": "Bash", "tool_use_id": "c1",
@@ -476,11 +503,13 @@ class GitHubRoute(Fixture):
         bin_dir.mkdir(exist_ok=True)
         script = bin_dir / "gh"
         calls = self.root / "gh-calls.txt"
-        script.write_text("#!" + sys.executable + "\nimport sys\nargs=sys.argv[1:]\n"
-                          f"open({str(calls)!r}, 'a').write(' '.join(args) + '\\n')\n"
-                          "if '--jq' in args: print('main')\n"
-                          f"elif 'compare/' in args[1]: print(open({str(state)!r}).read())\n"
-                          "else: sys.exit(1)\n")
+        body = ("import sys\nargs=sys.argv[1:]\n"
+                f"open({str(calls)!r}, 'a').write(' '.join(args) + '\\n')\n"
+                "if '--jq' in args: print('main')\n"
+                f"elif 'compare/' in args[1]: print(open({str(state)!r}).read())\n"
+                "else: sys.exit(1)\n")
+        # Quote managed Python paths containing spaces; a direct macOS shebang cannot represent them.
+        script.write_text("#!/bin/sh\nexec %s -c %s \"$@\"\n" % (shlex.quote(sys.executable), shlex.quote(body)))
         script.chmod(0o755)
         return {"PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}
 

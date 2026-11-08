@@ -64,6 +64,7 @@ def message(undisposed: list, rows: dict) -> str:
             lines.append(f"  - {agent} handed off {age} ago and nobody acknowledged it: main (not the owner) records\n"
                          f"      ah task dispose --agent {agent} --kind resumed      (someone picked it up)\n"
                          f"      ah task dispose --agent {agent} --kind reassigned --ref <new agent id>\n"
+                         f"      ah task dispose --agent {agent} --kind waiting --ref <ask id or GoodQA ticket> --until <ISO>\n"
                          f"      ah task dispose --agent {agent} --kind closed --reason <what you verified> --deployed <deploy WAL id> "
                      f"--live-test <live REALLY_TESTED id>\n"
                      f"      ah task dispose --agent {agent} --kind superseded|wontdo --ref <GoodQA ticket> --reason <why>")

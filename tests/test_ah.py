@@ -339,11 +339,14 @@ class UserMsgTests(Base):
     def test_ids_round_trip_through_provenance(self):
         import provenance
         self.make()
-        for m in ah.user_msgs(self.home, SESSION, recent=50, full=True)["matches"]:
-            words = " ".join(m["text"].split()[:4])
-            source = f'{m["id"].replace("uuid:", "user:", 1)} "{words}"'
+        data = ah.user_msgs(self.home, SESSION, recent=50, full=True)
+        rendered = ah.render_text("user-msg", data)
+        for m in data["matches"]:
+            source = m["source"]
             res = provenance.resolve(source)
             self.assertTrue(res["ok"], (source, res["problems"]))
+            self.assertEqual(m["source_arg"], "--source " + __import__("shlex").quote(source))
+            self.assertIn(m["source_arg"], rendered)
 
     def test_text_search_and_stable_ids(self):
         self.make()

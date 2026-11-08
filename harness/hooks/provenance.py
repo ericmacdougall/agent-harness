@@ -181,38 +181,53 @@ SENTINEL = "\ufffc"  # replaces a removed block so an excerpt cannot span text o
 
 
 def strip_blocks(text: str) -> str:
-    """Remove every non-user-authored block; an unclosed opener removes the rest of the text.
-    Linear: one pass over the tags with a stack (the earlier nested-regex form was quadratic on many openers)."""
+    """Keep typed text and human-supplied pasted_content; remove every injected/non-user block.
+
+    A pasted wrapper is transparent only after its closing tag is seen. Its body is opaque, so wrapper-like
+    text in a pasted report is evidence of what the user supplied, not a live harness directive. Any unclosed
+    wrapper still removes the rest of the turn. Linear: one pass with a stack.
+    """
     if len(text) > MAX_TEXT:
         text = text[:MAX_TEXT] + SENTINEL  # bound the work on absurdly long turns
-    stack, spans = [], []  # open tags awaiting a close; closed top-level (start, end) blocks
+    stack, spans = [], []  # (name, start, body-start); closed (start, end, body-start, body-end, name)
     by_name = {}  # tag name -> indexes into `stack`, so a close finds its opener in O(1)
     for tag in _TAG_TOKEN.finditer(text):
+        # Inside pasted_content every tag except its own closer is literal pasted text. Inside any other
+        # removed block normal nesting still applies, and the outer block eventually discards it all.
+        if stack and stack[-1][0] == "pasted_content" and not (tag.group(1) or "").lower() == "pasted_content":
+            continue
         if tag.group(2):
+            if stack and stack[-1][0] == "pasted_content":
+                continue  # a nested pasted opener is literal too; the first closer ends the outer wrapper
             name = tag.group(2).lower()
             by_name.setdefault(name, []).append(len(stack))
-            stack.append((name, tag.start()))
+            stack.append((name, tag.start(), tag.end()))
             continue
         name = tag.group(1).lower()
         positions = by_name.get(name)
         if not positions:
             continue  # a close with no opener is plain text
         index = positions[-1]
-        start = stack[index][1]
+        _, start, body_start = stack[index]
         del stack[index:]  # openers inside this block go with it
         for other in by_name.values():
             while other and other[-1] >= index:
                 other.pop()
         while spans and spans[-1][0] >= start:
             spans.pop()
-        spans.append((start, tag.end()))
+        spans.append((start, tag.end(), body_start, tag.start(), name))
     cut = stack[0][1] if stack else None  # an unclosed opener hides everything after it
     out, pos = [], 0
-    for start, end in spans:
+    for start, end, body_start, body_end, name in spans:
         if cut is not None and start >= cut:
             break
         out.append(text[pos:start])
-        out.append(SENTINEL)
+        if name == "pasted_content":
+            body = text[body_start:body_end]
+            opener_end = body.find(">")  # once per closed, disjoint span: preserves linear scanning
+            out.append(body[opener_end + 1:] if opener_end >= 0 else SENTINEL)
+        else:
+            out.append(SENTINEL)
         pos = end
     if cut is not None:
         out.append(text[pos:cut])
@@ -520,8 +535,9 @@ def user_authorship(record: dict):
             if not isinstance(block, dict) or block.get("type") not in ("text", "image"):
                 return None, "turn carries non-text blocks (tool results)"
             if block.get("type") == "text" and isinstance(block.get("text"), str):
-                if _WRAPPER.match(block["text"]):
-                    continue  # a block that is one wrapper element was injected by the harness or an extension
+                wrapper = _WRAPPER.match(block["text"])
+                if wrapper and wrapper.group(1).lower() != "pasted_content":
+                    continue  # a block that is one injected wrapper was added by the harness or an extension
                 pieces.append(strip_blocks(block["text"]))
         return "\n".join(pieces), None
     return None, "turn has no readable text"

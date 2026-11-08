@@ -39,6 +39,9 @@ RECORD_BLOCK = re.compile(r"```" + RECORD_FENCE + r"\n(.*?)\n```", re.S)
 NAMESPACE = uuid.UUID("8f2a4f2e-3c1b-4b7e-9d55-6a1f0c2b7e10")
 KINDS = ("spec", "evidence", "click_test", "signoff")
 ROLES = ("adversarial", "acceptance")
+REVIEW_POLICY_SCHEMA = 1
+SINGLE_REVIEW_BASES = ("small", "feature-flag")
+SPEC_PLAN_ARTIFACT = "KIMI_SPEC_PLAN_SIGNOFF_V1"
 # Every agent type is logged by SubagentStart (goodqa#14613); only these may record a spec review.
 REVIEWER_AGENT_TYPES = ("task-owner", "click-tester", "fixer", "red-team")
 OPEN_STATUSES = {"triage", "backlog", "todo", "in_progress", "in_review", "on_dev", "verified_on_dev",
@@ -208,7 +211,7 @@ def parse_spec(text: str) -> dict:
         if current is None:
             if line.startswith("# ") and title is None:
                 title = line[2:].strip()
-            field = re.match(r"^(Ticket|Author|Click-test|Sign-off):\s*(.*)$", line)
+            field = re.match(r"^(Ticket|Author|Click-test|Sign-off|Review-policy):\s*(.*)$", line)
             if field:
                 header[field.group(1)] = field.group(2).strip()
         else:
@@ -229,6 +232,41 @@ def parse_spec(text: str) -> dict:
             stray.append(line)
     return {"title": title, "header": header, "sections": sections, "criteria": criteria,
             "negatives": negatives, "stray": stray, "core": core}
+
+
+def standard_review_policy() -> dict:
+    return {"schema": REVIEW_POLICY_SCHEMA, "mode": "standard", "basis": None, "reason": None}
+
+
+def review_policy_from_header(value) -> tuple:
+    """(canonical policy, lint problem). Missing metadata deliberately means the ordinary two reviews."""
+    if value is None:
+        return standard_review_policy(), None
+    if value == "standard":
+        return standard_review_policy(), None
+    match = re.fullmatch(r"single-adversarial \((small|feature-flag): ([^<>]+)\)", str(value or "").strip())
+    reason = match.group(2).strip() if match else ""
+    if match and len(reason) >= 10:
+        return {"schema": REVIEW_POLICY_SCHEMA, "mode": "single-adversarial",
+                "basis": match.group(1), "reason": reason}, None
+    return standard_review_policy(), (
+        "Review-policy must be `standard` or `single-adversarial (small: <auditable reason, 10+ chars>)` / "
+        "`single-adversarial (feature-flag: <flag and rollout evidence, 10+ chars>)`; missing or ambiguous "
+        "metadata always requires both reviews")
+
+
+def required_review_roles(policy) -> tuple:
+    """One central fail-safe role calculation for local attach and remote done evaluation.
+
+    Only the canonical, versioned single-review record produced from an explicit spec header qualifies. Legacy,
+    malformed, ambiguous or future-shaped records all fall back to the ordinary two independent reviews.
+    """
+    if (isinstance(policy, dict) and policy.get("schema") == REVIEW_POLICY_SCHEMA
+            and policy.get("mode") == "single-adversarial" and policy.get("basis") in SINGLE_REVIEW_BASES
+            and isinstance(policy.get("reason"), str) and len(policy["reason"].strip()) >= 10
+            and set(policy) == {"schema", "mode", "basis", "reason"}):
+        return ("adversarial",)
+    return ROLES
 
 
 PLACEHOLDER = re.compile(r"<[^<>\n]{2,80}>")
@@ -255,6 +293,9 @@ def lint(text: str, config: dict | None = None, check_provenance: bool = True, s
         problems.append("Click-test must be `required` or `not-applicable (<reason, 10+ chars>)`")
     if header.get("Sign-off", "main") not in ("main", "human"):
         problems.append("Sign-off must be `main` or `human`")
+    _, review_policy_problem = review_policy_from_header(header.get("Review-policy"))
+    if review_policy_problem:
+        problems.append(review_policy_problem)
     for name in ("Outcome", "Scope", "Acceptance criteria", "Negative cases", "Risks"):
         body = "\n".join(spec["sections"].get(name, [])).strip()
         if name not in spec["sections"]:
@@ -403,10 +444,10 @@ def current_reviews(entries: list, core: str) -> dict:
     return latest
 
 
-def review_problems(entries: list, core: str, author_key: str | None) -> list:
+def review_problems(entries: list, core: str, author_key: str | None, required_roles=ROLES) -> list:
     problems = []
     latest = current_reviews(entries, core)
-    for role in ROLES:
+    for role in required_roles:
         entry = latest.get(role)
         if not entry:
             stale = any(item.get("role") == role for item in entries)
@@ -414,7 +455,7 @@ def review_problems(entries: list, core: str, author_key: str | None) -> list:
                             "changed after review)" if stale else ""))
         elif entry.get("verdict") != "ACCEPT":
             problems.append(f"{role} review is {entry.get('verdict')}: fix the spec and get a new review")
-    keys = {role: latest[role].get("key") for role in ROLES if role in latest}
+    keys = {role: latest[role].get("key") for role in required_roles if role in latest}
     if len(keys) == 2 and keys["adversarial"] == keys["acceptance"]:
         problems.append("both reviews come from the same reviewer/model; get the other role from a different model, "
                         "a native red-team agent, or a human")
@@ -460,16 +501,48 @@ def parse_review_report(path: Path):
     header, body = {}, []
     lines = data.split("\n")
     index = 0
+    if lines and lines[0].startswith("# "):
+        index = 1
+        while index < len(lines) and not lines[index].strip():
+            index += 1
     while index < len(lines) and lines[index].strip():
         field = re.match(r"^([A-Za-z][A-Za-z0-9 -]*):\s*(.*)$", lines[index])
         if field:
             header[field.group(1)] = field.group(2).strip()
         index += 1
-    body = [line for line in lines[index:] if line.strip()]
+    body = [line for line in lines[index:] if line.strip() and line.strip() != "---"]
     verdict = re.match(r"^PLAN_RESULT: (ACCEPT|BLOCK)\b", body[0].strip()) if body else None
     if re.match(r"(?i)^yes\b", header.get("Advisory", "")):  # an advisory (for example Kimi) opinion is never a review verdict
         verdict = None
     return header, (verdict.group(1) if verdict else None), sha256_bytes(data.encode("utf-8", "surrogateescape"))
+
+
+def spec_plan_signoff_problem(header: dict, verdict: str | None):
+    """Strict shape for the dedicated Kimi spec-plan artifact; legacy advisory reports never enter this path."""
+    if header.get("Artifact") != SPEC_PLAN_ARTIFACT:
+        return f"Artifact must be {SPEC_PLAN_ARTIFACT}"
+    expected = {
+        "Stage": "plan",
+        "Packet-Binding": "exact-spec-core-sha256",
+        "Freshness": "current-packet-only",
+        "Review-Input": "exact packet text only (no repository snapshot, no tools)",
+        "Advisory": "no; constrained spec-plan signoff only",
+    }
+    for field, value in expected.items():
+        if header.get(field) != value:
+            return f"spec-plan signoff has missing or invalid {field}"
+    reviewer, model = header.get("Reviewer") or "", header.get("Reviewed-Model") or ""
+    if not reviewer or not re.fullmatch(r"kimi-code/[a-z0-9][a-z0-9._-]{0,63}", model) or model not in reviewer:
+        return "spec-plan signoff needs bound reviewer identity and Reviewed-Model"
+    try:
+        reviewed_at = datetime.fromisoformat((header.get("Reviewed-At") or "").replace("Z", "+00:00"))
+        if reviewed_at.tzinfo is None:
+            raise ValueError("timezone missing")
+    except ValueError:
+        return "spec-plan signoff needs an ISO 8601 Reviewed-At with timezone"
+    if verdict not in ("ACCEPT", "BLOCK"):
+        return "spec-plan signoff has no PLAN_RESULT verdict"
+    return None
 
 
 # --------------------------------------------------------------------------- files, WALs and git
@@ -654,9 +727,10 @@ def record_body(summary: str, record: dict) -> str:
 
 
 _FIELD_TYPES = {"attachments": list, "commits": list, "ac": list, "reviews": list, "tester": dict,
-                "deployed_commit": dict, "covers_commits": list, "click_test": dict, "really_tested": dict}
+                "deployed_commit": dict, "covers_commits": list, "click_test": dict, "really_tested": dict,
+                "review_policy": dict}
 _NESTED_STRINGS = {"id", "role", "sha256", "name", "key", "verdict", "core_sha", "kind", "sha", "identity",
-                   "at", "text", "id_hint"}
+                   "at", "text", "id_hint", "mode", "basis", "reason", "artifact", "reviewed_at"}
 _STRING_FIELDS = ("key", "actor", "author", "spec_core_sha", "spec_file_sha", "by", "signer_kind", "result", "url",
                   "pass_source", "signoff", "note")
 
@@ -675,7 +749,7 @@ def record_shape_problem(record: dict):
             return f"field {name} holds an entry that is not a {inner.__name__}"
     # Nested objects hold only scalars, and the fields the gate keys on are strings.
     nested = [(name, item) for name in ("attachments", "commits", "reviews") for item in record.get(name) or []]
-    nested += [(name, record[name]) for name in ("tester", "deployed_commit", "click_test", "really_tested")
+    nested += [(name, record[name]) for name in ("tester", "deployed_commit", "click_test", "really_tested", "review_policy")
                if isinstance(record.get(name), dict)]
     for name, item in nested:
         for field, value in item.items():
@@ -890,9 +964,16 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
     attested.append("spec core sha, criteria and review verdicts are read from the spec record; the attached spec "
                     "file is checked by sha256 but the core is not re-derived from it")
     author = spec.get("author")
+    review_policy = spec.get("review_policy")
+    required_roles = required_review_roles(review_policy)
+    if required_roles == ("adversarial",):
+        attested.append(f"single adversarial review authorized by attached {safe(review_policy.get('basis'))} metadata: "
+                        f"{safe(review_policy.get('reason'), 300)!r}; the rationale is recorded, not independently verified")
+    elif review_policy is not None and review_policy.get("mode") != "standard":
+        notes.append("review policy metadata is missing, old or ambiguous; ordinary two-review requirement applies")
     reviews = {entry.get("role"): entry for entry in spec.get("reviews") or [] if isinstance(entry, dict)}
     review_keys, valid_roles = set(), 0
-    for role in ROLES:
+    for role in required_roles:
         entry = reviews.get(role)
         if not entry or entry.get("verdict") != "ACCEPT" or entry.get("core_sha") != core:
             missing.append(f"{role} spec review: no ACCEPT bound to spec core {str(core)[:12]}. Fix: "
@@ -1419,17 +1500,31 @@ def cmd_review(args, spec_policy):
     now = datetime.now(timezone.utc).isoformat()
     if args.report:
         header, verdict, report_sha = parse_review_report(Path(args.report))
-        if header.get("Stage") != "plan":
-            raise SpecError("the review report is not a peer_review.py plan report", EXIT_USAGE)
-        if verdict is None:
-            raise SpecError("the review report has no PLAN_RESULT verdict", EXIT_USAGE)
+        is_spec_plan = "Artifact" in header
+        if is_spec_plan:
+            problem = spec_plan_signoff_problem(header, verdict)
+            if problem:
+                raise SpecError(problem, EXIT_USAGE)
+        else:
+            if header.get("Stage") != "plan":
+                raise SpecError("the review report is not a peer_review.py plan report", EXIT_USAGE)
+            if verdict is None:
+                raise SpecError("the review report has no PLAN_RESULT verdict (legacy advisory reports are not signoff)",
+                                EXIT_USAGE)
         if header.get("Reviewed packet SHA-256") != core:
             raise SpecError("the report reviewed a different packet; run spec_flow.py packet spec.md --out <path> "
                             "and review exactly that file")
-        model = header.get("Reviewer") or "unknown"
-        entry = {"kind": "helper", "identity": model, "model": model, "verdict": verdict,
-                 "source": f"peer_review plan report {Path(args.report).name}",
-                 "report": {"path": str(Path(args.report).absolute()), "sha256": report_sha}}
+        if is_spec_plan:
+            identity, model = header["Reviewer"], header["Reviewed-Model"]
+            entry = {"kind": "helper", "identity": identity, "model": model, "verdict": verdict,
+                     "source": f"{SPEC_PLAN_ARTIFACT} exact-packet report {Path(args.report).name}",
+                     "artifact": SPEC_PLAN_ARTIFACT, "reviewed_at": header["Reviewed-At"],
+                     "report": {"path": str(Path(args.report).absolute()), "sha256": report_sha}}
+        else:
+            model = header.get("Reviewer") or "unknown"
+            entry = {"kind": "helper", "identity": model, "model": model, "verdict": verdict,
+                     "source": f"peer_review plan report {Path(args.report).name}",
+                     "report": {"path": str(Path(args.report).absolute()), "sha256": report_sha}}
     elif args.agent:
         if not args.wal or not args.verdict or not args.report_file:
             raise SpecError("--agent needs --wal <main WAL>, --verdict and --report-file", EXIT_USAGE)
@@ -1476,11 +1571,13 @@ def cmd_attach(args, spec_policy):
     problems = lint(text, config)
     core = core_sha(text)
     author = parse_author(spec["header"].get("Author", ""))
+    review_policy, _ = review_policy_from_header(spec["header"].get("Review-policy"))
+    required_roles = required_review_roles(review_policy)
     domain_warnings, domain_problems = domain_lint(text, getattr(args, "repo", None) or ".", spec_policy)
     problems += domain_problems  # only fails in enforce mode
     for warning in domain_warnings:
         print(f"spec-flow: warning: {warning}", file=sys.stderr)
-    problems += review_problems(entries, core, author)
+    problems += review_problems(entries, core, author, required_roles)
     if problems:
         raise SpecError("spec not attached:\n" + "\n".join("  - " + p for p in problems))
     session = Session(spec["header"]["Ticket"], spec_policy)
@@ -1488,7 +1585,7 @@ def cmd_attach(args, spec_policy):
     latest = current_reviews(entries, core)
     files = [("spec", spec_path.name, "text/markdown", read_spec_bytes(spec_path)),
              ("reviews", reviews_path(spec_path).name, "text/plain", read_spec_bytes(reviews_path(spec_path)))]
-    for role in ROLES:
+    for role in required_roles:
         report = latest[role].get("report")
         if report:
             data = read_regular(Path(report["path"]), 1_000_000)
@@ -1502,13 +1599,16 @@ def cmd_attach(args, spec_policy):
               "spec_file_sha": sha256_bytes(read_spec_bytes(spec_path)),
               "ac": [ident for ident, _ in spec["criteria"]], "neg": [ident for ident, _, _ in spec["negatives"]],
               "click_test": {"required": not reason, "reason": reason.group(1) if reason else None},
-              "signoff": spec["header"].get("Sign-off", "main"),
+              "signoff": spec["header"].get("Sign-off", "main"), "review_policy": review_policy,
               "reviews": [{k: latest[role].get(k) for k in ("role", "kind", "identity", "model", "verdict",
-                                                             "core_sha", "key", "source")} for role in ROLES]}
+                                                             "core_sha", "key", "source", "artifact", "reviewed_at")}
+                          for role in required_roles]}
     record["key"] = content_key("spec", record["spec_file_sha"])
     reviewers = "; ".join(f"{e['role']}: {e['identity']} ({e['kind']}) {e['verdict']}" for e in record["reviews"])
     summary = (f"**Spec attached** for {session.ticket.label}: {len(record['ac'])} acceptance criteria "
-               f"({', '.join(record['ac'])}), core sha256 `{core[:16]}`.\nReviewers: {reviewers}.")
+               f"({', '.join(record['ac'])}), core sha256 `{core[:16]}`.\nReview policy: {review_policy['mode']}"
+               + (f" ({review_policy['basis']}: {review_policy['reason']})" if review_policy["basis"] else "")
+               + f".\nReviewers: {reviewers}.")
     session.post("spec", summary, record, files, records)
     return EXIT_OK
 
@@ -1670,7 +1770,7 @@ def cmd_done(args, spec_policy, apply=False):
         print(f"{session.ticket.label} is already closed ({session.ticket.status}); nothing to apply")
         return EXIT_MISSING
     note = (f"Spec gate READY (spec core {result['spec_core_sha'][:16]}): every acceptance criterion has "
-            "evidence, both spec reviews accepted, click-test and sign-off recorded on this ticket.")
+            "evidence, all required spec reviews accepted, click-test and sign-off recorded on this ticket.")
     ok, detail = session.adapter.close_done(session.ticket.id, note)
     if not ok:
         print(f"TRACKER_REFUSED: GoodQA did not mark {session.ticket.label} done ({detail}); the ticket is unchanged. "

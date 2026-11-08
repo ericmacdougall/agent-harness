@@ -432,7 +432,10 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         if r["owner"] and r["state"] == "handoff":
             handed = parse_ts(r["last_activity"]) or 0.0
             d = disp.get(r["agent_id"])
-            acked = bool(d and d.get("kind") in ("resumed", "reassigned") + GUARDED_KINDS and float(d.get("at") or 0) >= handed - 10)
+            kind = d.get("kind") if d else None
+            acknowledged = kind in ("resumed", "reassigned") + GUARDED_KINDS or (
+                kind == "waiting" and liveness.disposition_live(d, now, last_activity=handed))
+            acked = bool(acknowledged and float(d.get("at") or 0) >= handed - 10)
             if not acked and now - handed >= HANDOFF_ACK_S:
                 r["decision_required"] = True
                 r["flags"] = list(r.get("flags") or []) + ["handoff-unacked"]
@@ -620,6 +623,35 @@ def _msg(kind, ident, ts, text, trust, off=None):
             "off": off}
 
 
+def _message_source(row):
+    """A verified citation and its shell-quoted --source argument, ready to paste into wal_note.
+
+    The transcript index has already established authorship. Reuse the provenance parser and excerpt
+    matcher rather than maintaining a second, subtly different source grammar. Very short or unusual
+    messages may need a human-chosen excerpt; never emit a citation that did not verify.
+    """
+    import provenance  # noqa: PLC0415
+    import shlex  # noqa: PLC0415
+
+    ident = row["id"].replace("uuid:", "user:", 1)
+    normalized = re.sub(r"\s+", " ", row["text"]).strip()
+    chunks = [normalized] + [part.strip() for part in normalized.split("...")]
+    for chunk in chunks:
+        for size in (120, 80, 60, 40, 24, 12):  # no more than the existing preview exposes
+            excerpt = chunk[:size].strip()
+            if len(excerpt) < provenance.EXCERPT_MIN:
+                continue
+            source = f'{ident} "{excerpt.replace(chr(34), chr(92) + chr(34))}"'
+            try:
+                parsed = provenance.parse_source(source)
+                if parsed["excerpt"] != excerpt or provenance.excerpt_in(row["text"], parsed["excerpt"]):
+                    continue
+            except provenance.Problem:
+                continue
+            return {"source": source, "source_arg": "--source " + shlex.quote(source)}
+    return {"source_error": "no automatically verified excerpt; use --full and quote exact user text"}
+
+
 def user_msgs(home: Path, session: str, text=None, recent=None, full=False, limit=20) -> dict:
     idx = index_transcript(home, session)
     msgs = verify_rows(find_transcript(home, session), idx["msgs"])
@@ -653,6 +685,7 @@ def user_msgs(home: Path, session: str, text=None, recent=None, full=False, limi
     out = out[-limit:]
     for r in out:
         r["preview"] = re.sub(r"\s+", " ", r["text"]).strip()[:120]
+        r.update(_message_source(r))
         if not full:
             del r["text"]
     return {"session": session, "matches": out, "source": "direct"}
@@ -2198,7 +2231,11 @@ def render_text(cmd: str, data: dict) -> str:
                          f"{(r['ticket'] or '-'):<18} c-age {fmt_age(r['ticket_comment_age_s']):>6}  {(r['task'] or '')[:70]}")
         return "\n".join(lines)
     if cmd == "user-msg":
-        return "\n".join(f"{m['id']}  [{m['kind']}] {m['timestamp']}  {m['preview']}" for m in data["matches"]) or "no match"
+        lines = []
+        for m in data["matches"]:
+            lines.append(f"{m['id']}  [{m['kind']}] {m['timestamp']}  {m['preview']}")
+            lines.append("  " + (m.get("source_arg") or "source unavailable: " + m.get("source_error", "choose an exact excerpt")))
+        return "\n".join(lines) or "no match"
     if cmd == "disk":
         lines = [f"{data['host']} ({data.get('os', '?')}) capacity volume: {data.get('capacity_volume')}"]
         for v in data["volumes"]:

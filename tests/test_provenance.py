@@ -123,13 +123,39 @@ class UserSources(Env):
         self.reject(self.user(TASK, "OpenRouter key required for provider"), "not-user-authored")
         self.reject(self.user(TOOL, "tool output requires the key"), "not-user-authored")
         self.reject(self.user(COMPACT, "the user demanded a key"), "not-user-authored")
-        # a human turn that embeds a system-reminder / pasted block: only the typed words count
+        # A human turn's injected reminder is not user text; text the human pasted is user-supplied evidence.
         self.reject(self.user(REMIND, "secret hidden requirement text"), "excerpt-not-found")
-        self.reject(self.user(PASTE, "pasted log line demanding"), "excerpt-not-found")
         self.assertTrue(provenance.resolve(self.user(REMIND, "plain typed words"))["ok"])
+
+    def test_pasted_content_is_citable_but_its_claims_are_not_verified(self):
+        excerpt = "pasted log line demanding the OpenRouter key"
+        result = provenance.resolve(self.user(PASTE, excerpt))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["origin"], "user")
+        self.assertTrue(provenance.resolve(self.user(PASTE, "typed pasted log line"))["ok"])  # mixed typed + pasted
+        self.assertEqual([row["uuid"] for row in provenance.find_user(SID, excerpt)], [PASTE])
+
+    def test_whole_pasted_wrapper_in_list_form_is_citable(self):
+        ident = str(uuid.UUID(int=80))
+        record = turn(ident, "", origin={"kind": "human"})
+        record["message"]["content"] = [{"type": "text", "text": (
+            "<pasted_content>Kimi patch report: three tests passed and the packet is ready</pasted_content>")}]
+        self.write_transcript([record])
+        excerpt = "Kimi patch report: three tests passed"
+        self.assertTrue(provenance.resolve(self.user(ident, excerpt))["ok"])
+        self.assertEqual([row["uuid"] for row in provenance.find_user(SID, excerpt)], [ident])
+
+    def test_pasted_fabrication_and_unclosed_wrapper_are_rejected(self):
+        self.reject(self.user(PASTE, "pasted log line demanding a different key"), "excerpt-not-found")
+        ident = str(uuid.UUID(int=81))
+        self.write_transcript([turn(ident, "typed <pasted_content>unclosed pasted requirement text", origin={"kind": "human"})])
+        self.reject(self.user(ident, "unclosed pasted requirement"), "excerpt-not-found")
 
     def test_excerpt_cannot_span_a_removed_block(self):
         self.reject(self.user(REMIND, "plain typed words end"), "excerpt-not-found")
+        self.write_transcript([turn(PASTE, "before <pasted_content>pasted words inside the report</pasted_content> "
+                                      "<system-reminder>injected words</system-reminder> after", origin={"kind": "human"})])
+        self.reject(self.user(PASTE, "pasted words inside the report ... after"), "excerpt-not-found")
 
     def test_neg2_fabricated_uuid_or_excerpt(self):  # NEG-2
         self.reject(self.user(str(uuid.UUID(int=99)), QUOTE), "message-not-found")

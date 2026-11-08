@@ -131,8 +131,9 @@ def verdict_match(stage, report):
     prefix = {'pr': r'VERDICT: (PASS|BLOCK)', 'plan': r'PLAN_RESULT: (ACCEPT|BLOCK)',
               'code-inspection': r'CODE_INSPECTION_RESULT: (ACCEPT|BLOCK)'}
     if stage is None:
-        return re.match(r'^(?:VERDICT: (PASS|BLOCK)|(?:PLAN|CODE_INSPECTION)_RESULT: (ACCEPT|BLOCK))\b', report.strip())
-    return re.match('^' + prefix[stage] + r'\b', report.strip()) if stage in prefix else None
+        return re.match(r'^(?:VERDICT: (PASS|BLOCK)|(?:PLAN|CODE_INSPECTION)_RESULT: (ACCEPT|BLOCK))(?=\s|$)',
+                        report.strip())
+    return re.match('^' + prefix[stage] + r'(?=\s|$)', report.strip()) if stage in prefix else None
 
 
 def normalize_provider(provider, code, stdout, stderr='', last_message='', requested_stage=None):
@@ -854,6 +855,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                                account_cooldown=outcome['account_cooldown'], reset_at=outcome['reset_at'])
         if outcome['result'] != 'NO_RESULT':
             options['outcome'] = outcome
+            options['reviewer_harness'] = {'codex': 'openai', 'claude': 'claude'}.get(provider, 'unknown')
             return source, stage_report(stage, outcome['report']), failure
         if provider != primary or not outcome['fallback_allowed']:
             raise ReviewFailure(outcome, source)
@@ -898,6 +900,159 @@ def finding_ids(report):
     values = re.findall(r'(?m)^\s*(?:#{1,6}\s+|[-*]\s+)?(?:Finding\s+)?'
                         r'((?:F|R)[0-9]+(?:[-_.][A-Za-z0-9]+)*)\b', report)
     return sorted(set(values))[:128] or ['UNSPECIFIED']
+
+
+def verify_pr_binding(repository, number, head, *, runner=None):
+    """Resolve an opt-in PR binding through GitHub; never trust report text for this identity."""
+    if (not isinstance(repository, str)
+            or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository)
+            or type(number) is not int or number <= 0
+            or not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', head)):
+        raise OSError('PR binding needs owner/repo, a positive PR number and the full lowercase reviewed HEAD')
+    import merge_gate
+    client = merge_gate.Client(runner or merge_gate.SubprocessGh(), time.monotonic() + 12)
+    try:
+        value = client.json(['pr', 'view', str(number), '-R', repository, '--json',
+                             'number,url,headRefOid,state'], 'the reviewed pull request')
+    except merge_gate.GateError as error:
+        raise OSError('could not verify the reviewed PR binding: ' + str(error)) from None
+    if not isinstance(value, dict):
+        raise OSError('reviewed PR binding is unreadable')
+    match = re.match(r'^https://github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)$', str(value.get('url') or ''))
+    if (not match or match.group(1) + '/' + match.group(2) != repository.lower()
+            or int(match.group(3)) != number or type(value.get('number')) is not int
+            or value['number'] != number or value.get('headRefOid') != head
+            or str(value.get('state') or '').upper() != 'OPEN'):
+        raise OSError('reviewed PR differs from the requested repository, number, HEAD or open state')
+    return {'repo': repository.lower(), 'pr': number}
+
+
+def review_merge_eligible(args, binding, report, selection):
+    """Only a pure PR PASS with a known different-harness reviewer may auto-authorize."""
+    return bool(args.stage == 'pr' and binding and args.author_harness in {'claude', 'openai'}
+                and selection.get('harness') in {'claude', 'openai'}
+                and selection['harness'] != args.author_harness
+                and re.match(r'^VERDICT: PASS(?:\s|$)', report.strip())
+                and finding_ids(report) == ['UNSPECIFIED'] and 'TICKETED:' not in report)
+
+
+def related_ticket_refs(repo, base):
+    """Tickets named by reviewed commits, not by the reviewer or an arbitrary tracker lookup."""
+    if not base:
+        return set()
+    import commit_policy
+    messages = git(repo, 'log', '--max-count=500', '--format=%B', base + '..HEAD')
+    return set(commit_policy.ticket_refs(messages, commit_policy.load_policy()))
+
+
+def default_ticket_verifier(ref):
+    """Isolated live GoodQA seam; tests replace this function with a fake adapter."""
+    system, project, number = ref
+    if system != 'goodqa':
+        raise OSError('only GoodQA tickets can record ticketed findings')
+    import commit_policy
+    import ticket_adapters
+    config = commit_policy.load_policy()['ticket_systems'][system]
+    adapter = ticket_adapters.adapter_for(config)
+    return adapter.lookup(project, number)
+
+
+TICKETED_LINE = re.compile(
+    r'TICKETED: ((?:F|R)[0-9]+(?:[-_.][A-Za-z0-9]+)*) \| category: ([a-z][a-z0-9-]{0,39})'
+    r' \| ticket: GoodQA ([a-z0-9][a-z0-9-]{0,62})#([1-9]\d{0,9})', re.I)
+TICKETED_FINDING_LINE = re.compile(
+    r'(?:#{1,6}\s+|[-*]\s+)?(?:Finding\s+)?((?:F|R)[0-9]+(?:[-_.][A-Za-z0-9]+)*):[ \t]+(\S(?:.*\S)?)')
+
+
+def parse_ticketed_report(report):
+    """Strict mode: every nonblank body line belongs to one finding/declaration pair."""
+    parsed, findings, errors = {}, [], []
+    lines = report.strip().splitlines()[1:]
+    index = 0
+    while index < len(lines):
+        if not lines[index].strip():
+            index += 1
+            continue
+        finding_match = TICKETED_FINDING_LINE.fullmatch(lines[index].strip())
+        if not finding_match:
+            errors.append('unparsed finding text in ticketed report: ' + lines[index].strip()[:120])
+            break
+        finding = finding_match[1]
+        if finding in parsed:
+            errors.append('duplicate finding block for ' + finding)
+            break
+        index += 1
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+        if index >= len(lines) or not lines[index].lstrip().startswith('TICKETED:'):
+            errors.append(finding + ': finding block needs exactly one TICKETED declaration')
+            break
+        declaration = TICKETED_LINE.fullmatch(lines[index].strip())
+        if not declaration:
+            errors.append('malformed TICKETED declaration')
+            break
+        declared, category, project, number = declaration.groups()
+        if declared != finding:
+            errors.append(finding + ': declaration names a different finding')
+            break
+        parsed[finding] = (category.lower(), project.lower(), int(number))
+        findings.append(finding)
+        index += 1
+    if len(findings) > 128:
+        errors.append('too many ticketed finding blocks')
+    return parsed, findings, errors
+
+
+def resolve_ticketed_findings(stage, report, *, head, related, verifier=None):
+    """Return (report, ticketed records, errors); any error preserves the original BLOCK."""
+    lines = report.strip().splitlines()
+    declarations = [line for line in lines if line.lstrip().startswith('TICKETED:')]
+    if not declarations:
+        return report, [], []
+    if stage != 'pr' or not re.match(r'^VERDICT: BLOCK\b', report.strip()) or len(declarations) > 128:
+        # A reviewer cannot turn a declaration into an unconditional acceptance;
+        # every stage fails closed to its own BLOCK marker.
+        marker = {'pr': 'VERDICT', 'plan': 'PLAN_RESULT', 'code-inspection': 'CODE_INSPECTION_RESULT'}.get(stage)
+        blocked = (re.sub(r'^' + marker + r': (?:PASS|ACCEPT|BLOCK)\b', marker + ': BLOCK',
+                          report.strip(), count=1) if marker else report)
+        return blocked, [], ['ticketed declarations require a PR BLOCK with at most 128 findings']
+    parsed, findings, errors = parse_ticketed_report(report)
+    if errors:
+        return report, [], errors
+    verifier = verifier or default_ticket_verifier
+    records = []
+    for finding in findings:
+        category, project, number = parsed[finding]
+        ref = ('goodqa', project, number)
+        ticket_label = f'GoodQA {project}#{number}'
+        if category not in __import__('usage_guard').TICKETED_CATEGORIES:
+            errors.append(f'{finding}: category {category} cannot be ticketed')
+            continue
+        if ref not in related:
+            errors.append(f'{finding}: {ticket_label} is not referenced by the reviewed commits')
+            continue
+        try:
+            ticket = verifier(ref)
+            status = str(getattr(ticket, 'status', '') or '').lower().replace('-', '_')
+            if ticket is None:
+                errors.append(f'{finding}: {ticket_label} does not exist')
+            elif (str(getattr(ticket, 'project', '')).lower() != project
+                  or getattr(ticket, 'number', None) != number or not status):
+                errors.append(f'{finding}: tracker answered for a different or malformed ticket')
+            elif (getattr(ticket, 'closed', False) is not False
+                  or status not in {'open', 'backlog', 'triage', 'todo', 'in_progress', 'in_review'}):
+                errors.append(f'{finding}: {ticket_label} is not verified open (status {status or "unknown"})')
+        except Exception as error:  # adapter failures fail closed and never become PASS-with-tickets
+            errors.append(f'{finding}: {ticket_label} could not be verified ({type(error).__name__})')
+            continue
+        if not errors:
+            records.append({'state': 'ticketed', 'finding': finding, 'category': category,
+                            'ticket': ticket_label, 'head': head})
+    if errors:
+        return report, [], errors
+    first = 'VERDICT: PASS-WITH-TICKETS'
+    transformed = first + report.strip()[len('VERDICT: BLOCK'):]
+    return transformed, records, []
 
 
 def commit_policy_gate(repo, base):
@@ -1032,7 +1187,13 @@ def main() -> int:
     parser.add_argument('--author-rung', help='Author rung override (R0..R6); unknown gets the configured unknown-author reviewer')
     parser.add_argument('--author-harness', choices=('claude', 'openai', 'unknown'), default='unknown',
                         help='Harness that wrote the change; the other harness reviews when available')
+    parser.add_argument('--github-repo', help='Exact owner/repo binding for an optional reviewed GitHub PR')
+    parser.add_argument('--pr', type=int, help='Exact pull request number; requires --github-repo')
     args = parser.parse_args()
+    if (args.github_repo is None) != (args.pr is None):
+        parser.error('--github-repo and --pr must be supplied together')
+    if args.github_repo is not None and args.stage != 'pr':
+        parser.error('--github-repo and --pr are only valid for PR review')
     if not 1 <= args.packet_budget_bytes <= PACKET_LIMIT:
         parser.error('--packet-budget-bytes must be between 1 and 150000')
     if not 1 <= args.timeout <= 720:
@@ -1093,6 +1254,14 @@ def main() -> int:
         target.close()
         evidence.close()
         parser.error('repo HEAD differs from --expected-head')
+    binding = None
+    if args.github_repo is not None:
+        try:
+            binding = verify_pr_binding(args.github_repo, args.pr, before[0])
+        except OSError as error:
+            target.close()
+            evidence.close()
+            parser.error(str(error))
     if before[1]:
         target.close()
         evidence.close()
@@ -1249,6 +1418,24 @@ def main() -> int:
             source, report, failure = review_snapshot(snapshot, before[0], args.stage,
                                                        stage_rules, evidence.content, options)
             report = stage_report(args.stage, report)
+            ticketed = []
+            if 'TICKETED:' in report:
+                related_error = None
+                try:
+                    related = related_ticket_refs(repo, base)
+                except (ImportError, OSError, ValueError) as error:
+                    related, related_error = set(), error
+                report, ticketed, ticket_errors = resolve_ticketed_findings(
+                    args.stage, report, head=before[0], related=related)
+                if related_error is not None:
+                    ticket_errors.append('reviewed commit tickets could not be inspected ('
+                                         + type(related_error).__name__ + ')')
+                    # A missing relationship proof can never produce a ticketed PASS.
+                    if re.match(r'^VERDICT: PASS-WITH-TICKETS\b', report):
+                        report = re.sub(r'^VERDICT: PASS-WITH-TICKETS\b', 'VERDICT: BLOCK', report, count=1)
+                        ticketed = []
+                for message in ticket_errors:
+                    print('Ticketed finding refused: ' + message, file=sys.stderr)
             if repo_state(snapshot, snapshot=True) != (before[0], ''):
                 raise OSError('snapshot changed during review')
         # Cleanup must succeed before any report is published.
@@ -1323,7 +1510,10 @@ def main() -> int:
         if after != before:
             raise OSError('repository HEAD or worktree changed during review')
         evidence.verify()
+        binding_headers = (f"Reviewed repository: {binding['repo']}\nReviewed PR: {binding['pr']}\n"
+                           if binding else '')
         target.write_text(f"Reviewer: {source}\nStage: {args.stage}\nReviewed HEAD: {before[0]}\n"
+                          f"{binding_headers}"
                           f"Reviewed packet SHA-256: {evidence.sha256}\n"
                           f"Author-Rung: {author_rung or 'unknown'}{' (author unknown: lowest writer rung reviewer)' if selection['author_unknown'] else ''}\n"
                           f"Reviewer-Rung: {selection['rung']}\nReviewer-Selection: {selection['harness']} {selection['model']} "
@@ -1335,11 +1525,25 @@ def main() -> int:
                           before_publish=evidence.verify)
         target.verify_current()
         evidence.verify()
+        report_sha256 = target.expected_digest.hex()
+        ticketed_success = bool(re.match(r'^VERDICT: PASS-WITH-TICKETS(?:\s|$)', report.lstrip()))
         passed = bool(re.match(r'^(?:VERDICT: PASS|(?:PLAN|CODE_INSPECTION)_RESULT: ACCEPT)\b', report.lstrip()))
+        review_metadata = {
+            'stage': args.stage.upper().replace('-', '_'),
+            'verdict': 'ACCEPT_WITH_TICKETS' if ticketed_success else 'ACCEPT' if passed else 'BLOCK',
+            'findings': finding_ids(report) if ticketed_success or not passed else []}
+        if args.stage == 'pr':
+            review_metadata.update(head=before[0], report_sha256=report_sha256,
+                                   reviewer=source,
+                                   reviewer_harness=options.get('reviewer_harness', 'unknown'),
+                                   author_harness=args.author_harness)
+            if binding:
+                review_metadata.update(binding)
+        if ticketed_success:
+            review_metadata['ticketed'] = [dict(record, report_sha256=report_sha256) for record in ticketed]
         reference = run_record.finish(execution='COMPLETED', result='CHECK_OK' if passed else 'CHECK_FAILED',
             reason='NONE' if passed else 'CODE_FINDINGS', exit_code=0,
-            review={'stage': args.stage.upper().replace('-', '_'), 'verdict': 'ACCEPT' if passed else 'BLOCK',
-                    'findings': [] if passed else finding_ids(report)},
+            review=review_metadata,
             usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
                    'executables': diagnostics.executable_record(options.get('resolutions', {}))})
         finalized = True
@@ -1357,6 +1561,8 @@ def main() -> int:
         print(f"{source}: {report.splitlines()[0].strip()} | {output}\n"
               'Usage receipt: ' + json.dumps(reference, sort_keys=True), flush=True)
         announced = True
+        actual_selection = dict(selection, harness=options.get('reviewer_harness', 'unknown'))
+        authorize_review = review_merge_eligible(args, binding, report, actual_selection)
     except (OSError, subprocess.TimeoutExpired, GuardError) as error:
         if run_record is not None and not finalized:
             try:
@@ -1379,6 +1585,18 @@ def main() -> int:
                     store.invalidate_review(reference, reason='Review publication did not complete')
                 except (OSError, GuardError):
                     print('Review settlement could not be invalidated; reconciliation is required.', file=sys.stderr)
+    if announced and authorize_review:
+        import merge_gate
+        try:
+            # The PR may have moved or closed while the provider ran; only a
+            # still-current exact binding can receive the one-shot waiver.
+            verify_pr_binding(binding['repo'], binding['pr'], before[0])
+            waiver = merge_gate.add_review_waiver(
+                merge_gate.default_state_dir(), reference, store=store)
+            print('Merge authorization: ' + waiver['id'], flush=True)
+        except (OSError, ValueError, merge_gate.Corrupt, GuardError) as error:
+            print('Warning: review passed, but merge authorization could not be created: '
+                  + diagnostics.sanitize(error), file=sys.stderr)
     return 0 if re.match(r'^(?:VERDICT: PASS|(?:PLAN|CODE_INSPECTION)_RESULT: ACCEPT)\b', report.lstrip()) else 3
 
 
