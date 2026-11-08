@@ -23,6 +23,7 @@ flag, the remembered choice wins; with none, the component is kept up to date on
 from __future__ import annotations
 
 import json
+import plistlib
 import os
 import signal
 import platform
@@ -50,6 +51,7 @@ def real_home() -> Path:
 
 CHOICE_FILE = "log-backup-choice.json"
 STATE_FILE = "log-backup.scheduler"      # what the installer last SUCCEEDED in doing to the scheduler: enabled | disabled
+LANE_LOADED_FILE = "log-backup.lane-loaded"  # the bulk lane value launchd last loaded (goodqa#15147 re-review N1)
 PENDING_FILE = "log-backup.reload-pending"   # an enable/disable that was deferred, failed or raised and must be retried
 
 
@@ -114,6 +116,37 @@ def save_choice(home: Path, enabled: bool) -> None:
     write_atomic(directory / CHOICE_FILE, (json.dumps({"schema": 1, "enabled": enabled}) + "\n").encode(), 0o600)
 
 
+LANE_OFF = "<key>LOG_BACKUP_BULK_LANE</key><string>0</string>"   # as written in the shipped template
+LANE_ON = "<key>LOG_BACKUP_BULK_LANE</key><string>1</string>"
+LANE_NOTE = "; keeps the bulk lane on (switched on by hand in the installed plist)"
+
+
+def lane_value(data: bytes):
+    """LOG_BACKUP_BULK_LANE of a plist (XML in any layout, or binary), else None. Comments are not values."""
+    try:
+        value = plistlib.loads(data).get("EnvironmentVariables", {}).get("LOG_BACKUP_BULK_LANE")
+    except Exception:  # plistlib raises several types (InvalidFileException, ExpatError, ValueError) on bad input
+        return None
+    return value if isinstance(value, str) else None
+
+
+def lane_kept_on(dest: Path) -> bool:
+    """goodqa#15147 F8: the plist ships with the bulk lane off; a lane switched on by hand in the installed plist
+    stays on across an apply instead of being reset silently (re-review N2/N3: read as a plist, not as text)."""
+    try:
+        return not dest.is_symlink() and lane_value(dest.read_bytes()) == "1"
+    except OSError:
+        return False
+
+
+def read_lane_loaded(home: Path):
+    try:
+        path = logs_dir(home) / LANE_LOADED_FILE
+        return None if path.is_symlink() else path.read_text().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def desired_files(home: Path, system: str) -> list[tuple[Path, bytes, int, bool]]:
     """[(destination, bytes, mode, is_unit)] for this platform."""
     bin_dir = home / ".agent-harness" / "bin"
@@ -123,7 +156,10 @@ def desired_files(home: Path, system: str) -> list[tuple[Path, bytes, int, bool]
     sched = ROOT / "harness" / "schedulers"
     if system == "Darwin":
         plist = (sched / f"{LABEL}.plist").read_text().replace("@HOME@", escape(str(home)))
-        out.append((home / "Library" / "LaunchAgents" / f"{LABEL}.plist", plist.encode(), 0o644, True))
+        dest = home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+        if lane_kept_on(dest):
+            plist = plist.replace(LANE_OFF, LANE_ON)
+        out.append((dest, plist.encode(), 0o644, True))
     else:
         unit_dir = home / ".config" / "systemd" / "user"
         for name in ("log-backup.service", "log-backup.timer"):
@@ -298,8 +334,13 @@ def plan(home: Path, system: str, enabled: bool, activate: bool) -> dict:
         if not path.exists() or path.read_bytes() != data:
             changed.append(path)
             units_changed = units_changed or is_unit
-    reason = "files" if units_changed else ("pending" if pending else "state" if state != "enabled" else None)
-    out = {"files": files, "changed": changed, "state": state, "reason": reason}
+    lane = next((lane_value(data) for path, data, _m, unit in files if unit and path.suffix == ".plist"), None)
+    # N1: launchd reads the job only when loaded, so a lane value that differs from the one last loaded needs a reload
+    lane_changed = system == "Darwin" and lane is not None and read_lane_loaded(home) != lane
+    reason = "files" if units_changed else ("lane" if lane_changed else "pending" if pending else
+                                            "state" if state != "enabled" else None)
+    out = {"files": files, "changed": changed, "state": state, "reason": reason, "lane": lane,
+           "lane_kept": system == "Darwin" and lane_kept_on(home / "Library" / "LaunchAgents" / f"{LABEL}.plist")}
     if reason and activate:
         out["action"] = "enable"
     elif reason:
@@ -317,7 +358,8 @@ def describe_preview(p: dict) -> str:
         return f"log backup: disabled by choice; would stop the scheduler job ({why}; files stay)"
     names = ", ".join(x.name for x in p["changed"]) or "no file changes"
     if p["action"] == "enable":
-        why = {"files": "a unit file changed", "pending": "a retry is pending",
+        why = {"files": "a unit file changed", "lane": "the bulk lane setting differs from the loaded job",
+               "pending": "a retry is pending",
                "state": f"recorded scheduler state is {p['state'] or 'unknown'}"}[p["reason"]]
         return f"log backup: would install {names}; would (re)load and enable the scheduler ({why})"
     if p["action"] == "install-only":
@@ -337,8 +379,9 @@ def status(home: Path, apply: bool, system: str | None = None, run=None, uid: in
         if activate is None:
             activate = home == real_home()
         p = plan(home, system, enabled, activate)
+        note = LANE_NOTE if p.get("lane_kept") else ""
         if not apply:
-            return describe_preview(p)
+            return describe_preview(p) + note
         pending = logs_dir(home) / PENDING_FILE
         uid = os.getuid() if uid is None else uid
         runner = run or default_runner
@@ -363,19 +406,21 @@ def status(home: Path, apply: bool, system: str | None = None, run=None, uid: in
                 write_atomic(path.with_name(f"{path.name}.bak-{stamp}"), path.read_bytes(), 0o600)
             write_atomic(path, data, mode)
         if p["action"] == "none":
-            return "log backup: up to date (no scheduler reload)"
+            return "log backup: up to date (no scheduler reload)" + note
         if p["action"] == "install-only":
-            return "log backup: files written; scheduler not loaded (non-default --home)" if p["reason"] else \
-                "log backup: script updated (scheduler untouched)"
+            return ("log backup: files written; scheduler not loaded (non-default --home)" if p["reason"] else
+                "log backup: script updated (scheduler untouched)") + note
         if backup_run_active(home):
             write_marker(pending, "reload deferred")
-            return "log backup: units written; scheduler reload deferred while a backup runs; re-run install to finish it"
+            return "log backup: units written; scheduler reload deferred while a backup runs; re-run install to finish it" + note
         write_marker(pending, "reload started")  # stays if the reload fails or raises; the next install finishes it
         result = reload_scheduler(system, home, uid, runner)
         if result in ("loaded", "enabled"):
             write_scheduler_state(home, "enabled")
+            if p.get("lane") is not None:
+                write_atomic(logs_dir(home) / LANE_LOADED_FILE, (p["lane"] + "\n").encode(), 0o600)
             _drop(pending)
-        return f"log backup: installed, scheduler {result}"
+        return f"log backup: installed, scheduler {result}" + note
     except (InstallRefused, OSError, subprocess.SubprocessError) as error:
         return f"log backup: skipped ({error.__class__.__name__}: {error})"
 

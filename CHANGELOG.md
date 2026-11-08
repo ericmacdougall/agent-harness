@@ -7,6 +7,7 @@ group by pull request.
 ## Unreleased
 
 ### Fixed
+- log-backup bulk lane yields to tier 1 (goodqa#15147): the lane no longer splits the write budget. While a tier-1 run holds the run lock it makes no copy requests; a copy in flight stops within one poll plus the stop grace and its 300-file chunk is sent again whole, the cursor unchanged. Tier 1 always copies at the full rate. The plist ships the lane off until three tier-1 runs in a row finish inside the budget.
 - log-backup bulk lane: on the Mac the bulk tier now runs as its own detached run beside tier 1, on a split of the
   same 2/s write budget, instead of in the few minutes tier 1 left (about 400 files an hour). Bulk chunks are 1000
   files. A pass is listed again when the exclude lists change, and five verified `.lanes` copies (about 230k files)
