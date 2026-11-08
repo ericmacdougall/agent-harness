@@ -46,7 +46,9 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     # Heavy-job guard (goodqa#14817): keeps large copies, suites and builds off the Mac for Codex too.
                     'heavy_job_guard.py', 'dropbox_budget.conf', 'resource_limits.json',
                     # deliver.py prepare --scan trivy imports it (goodqa#15295)
-                    'trivy_gate.py')
+                    'trivy_gate.py',
+                    # AGENTS.md tells Codex to scan third-party installers first (goodqa#15253 step 4)
+                    'installer_scan.py')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 
