@@ -29,16 +29,9 @@ if log:
     with open(log, 'a') as h:
         h.write(json.dumps({'argv': args, 'env': dict(os.environ), 'cwd_home': os.environ.get('CODEX_HOME')}) + '\n')
 home = os.environ.get('CODEX_HOME')
-if args[:2] == ['login', '--with-api-key']:
-    key = sys.stdin.read().strip()
-    os.makedirs(home, exist_ok=True)
-    with open(os.path.join(home, 'auth.json'), 'w') as h:
-        h.write(key)
-    sys.exit(0)
 prompt = sys.stdin.read()
-key = ''
-if home and os.path.exists(os.path.join(home, 'auth.json')):
-    key = open(os.path.join(home, 'auth.json')).read()
+key = os.environ.get('CODEX_API_KEY', '')
+if key:
     if os.environ.get('FAKE_MODE_DIR_CHECK'):
         mode = os.stat(home).st_mode & 0o777
         open(os.environ['FAKE_MODE_DIR_CHECK'], 'w').write(oct(mode))
@@ -57,12 +50,21 @@ else:
         print(json.dumps({'type': 'error', 'message': 'You have hit your usage limit. Try again at Nov 9th, 7:37 PM.'}))
         sys.exit(1)
 if os.environ.get('FAKE_ECHO_KEY'):
+    import base64
     print('leak: ' + key)
+    print('b64: ' + base64.b64encode(key.encode()).decode() + ' rev: ' + key[::-1] + ' hex: ' + key.encode().hex())
     sys.stderr.write('leak-err: ' + key + '\n')
 if os.environ.get('FAKE_SLEEP_MARK'):
     open(os.environ['FAKE_SLEEP_MARK'], 'w').write('started')
 if os.environ.get('FAKE_SLEEP'):
     time.sleep(float(os.environ['FAKE_SLEEP']))
+if os.environ.get('FAKE_STDERR_401'):
+    sys.stderr.write('request failed: 401 unauthorized billing rate limit\n')
+    print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'did work'}}))
+    sys.exit(1)
+if os.environ.get('FAKE_NO_JSON'):
+    print('plain text answer')
+    sys.exit(0)
 if os.environ.get('FAKE_CRASH'):
     sys.exit(1)
 usage = {'input_tokens': 1000, 'cached_input_tokens': 0, 'output_tokens': int(os.environ.get('FAKE_OUT', '100'))}
@@ -143,8 +145,12 @@ class KeyHandling(Base):
         result = self.run_review(FAKE_ECHO_KEY='1', FAKE_MODE_DIR_CHECK=str(self.t / 'mode.txt'))
         self.assertEqual(result.returncode, 0, result.stderr)
         key_part = 'SECRETTAIL'
-        self.assertGreater(len(self.codex_calls()), 1)  # login + exec
-        for blob in (result.stdout, result.stderr, json.dumps(self.codex_calls()),
+        self.assertEqual(len(self.codex_calls()), 1)  # a single exec: no login step and no key file
+        for call in self.codex_calls():
+            self.assertNotIn(key_part, json.dumps(call['argv']))
+            holders = [name for name, value in call['env'].items() if key_part in value]
+            self.assertEqual(holders, ['CODEX_API_KEY'])  # only the one child env var, nothing else
+        for blob in (result.stdout, result.stderr,
                      (self.t / 'state' / 'ledger.jsonl').read_text(),
                      (self.t / 'state' / 'state.json').read_text() if (self.t / 'state' / 'state.json').exists() else ''):
             self.assertNotIn(key_part, blob)
@@ -337,6 +343,85 @@ class Crash(Base):
         self.assertEqual([r['type'] for r in rows], ['reserve', 'settle'])
         self.assertEqual(rows[1]['status'], 'terminated_unknown_usage')
         self.assertEqual(list((self.t / 'state' / 'homes').glob('codex-pool-home-*')), [])
+
+
+class Hardening(Base):
+    def test_encoded_key_forms_are_scrubbed(self):
+        result = self.run_review(FAKE_ECHO_KEY='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('SECRETTAIL', result.stdout)
+        self.assertNotIn('LIATTERCES', result.stdout)  # reversed tail
+        self.assertNotIn('U0VDUkVUVEFJT', result.stdout)  # base64 of the tail
+        self.assertNotIn('534543524554544149', result.stdout)  # hex of the tail
+        self.assertNotIn('xxxxxxxxxxxxxxxxxxxxxxxx', result.stdout)
+
+    def test_success_without_json_is_never_retried_or_free(self):
+        result = self.pool('run', '--purpose', 'review', '--model', 'gpt-6.1-terra', '--keys-only', '--', 'exec', '-',
+                           FAKE_NO_JSON='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.gcloud_calls()), 1)
+        rows = self.ledger()
+        self.assertEqual(rows[-1]['usd'], rows[0]['usd'])
+        self.assertEqual(rows[-1]['status'], 'ok_no_usage')
+
+    def test_stderr_prose_after_work_is_not_a_key_failure(self):
+        result = self.run_review(FAKE_STDERR_401='1')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(self.gcloud_calls()), 1)  # no retry on other keys
+        self.assertFalse((self.t / 'state' / 'state.json').exists())  # no key was marked unhealthy
+        rows = self.ledger()
+        self.assertEqual(rows[-1]['usd'], rows[0]['usd'])
+
+    def test_dangerous_passthrough_is_refused(self):
+        for bad in (['exec', '--sandbox', 'danger-full-access', '-'], ['exec', '--dangerously-bypass-approvals-and-sandbox'],
+                    ['exec', '--add-dir', '/'], ['exec', '-c', 'sandbox_workspace_write.network_access=true'],
+                    ['exec', '-c', 'model_reasoning_effort=xhigh'], ['exec', '-c', 'review_model=gpt-6-astra'],
+                    ['exec', 'review'], ['exec', '--full-auto'], ['exec', '-c', 'shell_environment_policy.inherit=all']):
+            result = self.pool('run', '--purpose', 'review', '--model', 'gpt-6.1-terra', '--keys-only', '--', *bad)
+            self.assertEqual(result.returncode, 3, (bad, result.stderr))
+        self.assertEqual(self.codex_calls(), [])
+
+    def test_refusal_prints_prose_usage_limit_record_for_json_callers(self):
+        self.policy['caps_usd']['total_day'] = 1.0
+        result = self.run_review()
+        self.assertEqual(result.returncode, 3)
+        record = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(record['type'], 'error')
+        self.assertNotIn('code', record)  # unstructured: callers may fall back but no account cooldown is placed
+        self.assertIn('usage limit', record['message'])
+
+    def test_group_writable_codex_binary_is_not_given_a_key(self):
+        os.chmod(self.codex, 0o775)
+        result = self.run_review()
+        self.assertEqual(result.returncode, 4)
+        self.assertEqual(self.gcloud_calls(), [])
+
+    def test_termination_during_subscription_run_reaps_the_child(self):
+        mark = self.t / 'submark'
+        (self.t / 'sub' / 'auth.json').write_text('{}')
+        env = self.env(FAKE_SLEEP='30', FAKE_SLEEP_MARK=str(mark), CODEX_HOME=str(self.t / 'sub'))
+        proc = subprocess.Popen([sys.executable, '-I', str(SCRIPT), 'run', '--purpose', 'review', '--model', 'gpt-6.1-terra',
+                                 '--', 'exec', '--json', '-'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, env=env)
+        proc.stdin.write('x')
+        proc.stdin.close()
+        for _ in range(100):
+            if mark.exists():
+                break
+            time.sleep(0.1)
+        self.assertTrue(mark.exists())
+        proc.send_signal(signal.SIGTERM)
+        self.assertEqual(proc.wait(timeout=20), 143)
+        time.sleep(0.3)
+        left = subprocess.run(['pgrep', '-f', 'FAKE_SLEEP_MARKER_NONE|' + str(self.codex)], capture_output=True, text=True)
+        self.assertEqual(left.stdout.strip(), '')
+
+    def test_probe_network_error_keeps_failure_mark(self):
+        (self.t / 'state' / 'state.json').write_text(json.dumps(
+            {'schema': 1, 'subscription': {}, 'keys': {'aaa': {'health': {'result': '401', 'at': 'x'}}}}))
+        self.pool('probe', '--alias', 'aaa', CODEX_POOL_API_BASE='http://127.0.0.1:9')
+        state = json.loads((self.t / 'state' / 'state.json').read_text())
+        self.assertEqual(state['keys']['aaa']['health']['result'], '401')
 
 
 class FakeApi(http.server.BaseHTTPRequestHandler):

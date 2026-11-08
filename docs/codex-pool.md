@@ -30,11 +30,23 @@ are refused.
 
 ## Key handling
 
-The key is read inside the process (`gcloud` directly, else `ssh <ssh_host> gcloud ...`), written only to the
-stdin of `codex login --with-api-key` in a fresh mode-0700 `CODEX_HOME` under `~/.agent-harness/codex-pool/homes`,
-and the directory is deleted afterwards (also on SIGTERM). Child stdout/stderr are scrubbed for the key and any
-`sk-` token. Caller arguments after `--` must start with `exec` and may not set the model, profile, provider or base
-URL.
+The key is read inside the process (`gcloud` directly, else `ssh <ssh_host> gcloud ...`) and handed to the single
+`codex exec` child as `CODEX_API_KEY` (verified live: commands the model runs see no `CODEX_API_KEY`, because
+Codex strips `*KEY*` variables and the pool also excludes it explicitly). No key file is written; `CODEX_HOME` is a
+fresh empty mode-0700 directory under `~/.agent-harness/codex-pool/homes`, deleted afterwards (also on SIGTERM).
+Child stdout/stderr are scrubbed for the key, its base64/hex/reversed forms and any `sk-` token. The codex
+executable must be a regular file owned by you or root and not group/world-writable. Caller arguments after `--`
+must start with `exec` (no subcommands) and may not set the model, effort, profile, provider, base URL, sandbox
+escalation (`danger-full-access`, `--add-dir`, `--full-auto`, bypass flags), network, MCP or shell-environment config.
+
+Failure handling: a key is marked unhealthy and the next key tried only when a structured JSON error record
+(`--json`) arrives before any model work. Anything else (stderr prose, failure after work, timeout, no `--json`)
+keeps the full reserve in the ledger and is not retried. A refused or unusable pool prints a prose "usage limit
+reached" error record so `peer_review.py` may use its one independent fallback without placing a cooldown.
+
+Known limits: caps are per host (the Mac and t2-dev keep separate ledgers) and are enforced at reservation, not
+mid-run; set a hard monthly limit on each OpenAI project as the real backstop. `CODEX_POOL_STATE_DIR` and
+`CODEX_POOL_POLICY` can redirect the ledger and policy, so the caps guard budget, not a hostile local user.
 
 ## Commands
 

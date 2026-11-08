@@ -3,13 +3,14 @@
 
 Order of preference for every run: the ChatGPT subscription login first, then API keys from
 Secret Manager (least spent today first), each bounded by the caps in codex_pool_policy.json.
-Keys are fetched inside this process, fed to `codex login --with-api-key` on stdin in a fresh
-mode-0700 CODEX_HOME that is deleted after the run, and never appear in argv, the environment
-of any other process, logs, the ledger or output (child output is scrubbed).
+Keys are fetched inside this process and handed to the one `codex exec` child as CODEX_API_KEY (no key
+file; a fresh empty mode-0700 CODEX_HOME is deleted after the run). They never appear in argv, any other
+process's environment, logs, the ledger or output (child output is scrubbed).
 
 Commands: status | probe | run | enable | disable | subscription-block | install
 """
 import argparse
+import base64
 import contextlib
 import fcntl
 import json
@@ -17,6 +18,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -39,9 +41,12 @@ MAX_CAPTURE = 32 << 20
 MAX_STDIN = 8 << 20
 EXIT_REFUSED, EXIT_POOL = 3, 4
 # Config keys that could redirect an API key to another host or swap the model/account.
-FORBIDDEN_CONFIG = re.compile(r'^(model\b|model_provider|openai|chatgpt|auth|cli_auth|forced_|env_key|base_url|'
-                              r'experimental_bearer|preferred_auth|profile)', re.I)
-FORBIDDEN_FLAGS = {'-m', '--model', '--oss', '--local-provider', '-p', '--profile'}
+FORBIDDEN_CONFIG = re.compile(r'^(model|review_model|openai|chatgpt|auth|cli_auth|forced_|env_key|base_url|'
+                              r'experimental_bearer|preferred_auth|profile|sandbox|approval|shell_environment_policy|'
+                              r'features|mcp_servers|projects|notify|hooks|network|tools|permissions|default_permissions)', re.I)
+FORBIDDEN_FLAGS = {'-m', '--model', '--oss', '--local-provider', '-p', '--profile', '--add-dir', '--dangerously-bypass-approvals-and-sandbox',
+                   '--yolo', '--full-auto', '--approve-for-me', '--enable', '--disable', '--ignore-user-config', '--ignore-rules'}
+ALLOWED_SANDBOX = {'read-only', 'workspace-write'}
 
 
 class PoolError(Exception):
@@ -253,9 +258,19 @@ def fetch_key(policy, alias):
     return key
 
 
+def key_variants(key):
+    raw = key.encode()
+    forms = {raw, raw[::-1], raw.hex().encode(), raw.hex().upper().encode(), base64.b64encode(raw),
+             base64.urlsafe_b64encode(raw), base64.b64encode(raw).rstrip(b'='), base64.urlsafe_b64encode(raw).rstrip(b'=')}
+    for shift in (1, 2):  # base64 of the key at the other two alignments
+        forms.add(base64.b64encode(b'x' * shift + raw)[4:].rstrip(b'='))
+    return [form for form in forms if len(form) >= 16]
+
+
 def scrub(data, key=None):
     if key:
-        data = data.replace(key.encode(), b'[REDACTED]')
+        for form in key_variants(key):
+            data = data.replace(form, b'[REDACTED]')
     return KEY_LIKE.sub(b'[REDACTED]', data)
 
 
@@ -271,7 +286,7 @@ def sweep_stale_homes(base, max_age=3600):
 # ---------------------------------------------------------------- failure classification
 def parse_events(stdout):
     """(usage dict summed over turn.completed, completed bool, error text from error records)."""
-    usage, completed, errors = {}, False, []
+    usage, completed, errors, worked = {}, False, [], False
     for line in stdout.decode('utf-8', 'replace').splitlines():
         line = line.strip()
         if not line.startswith('{'):
@@ -283,6 +298,8 @@ def parse_events(stdout):
         if not isinstance(record, dict):
             continue
         kind = record.get('type')
+        if isinstance(kind, str) and kind.startswith('item.'):
+            worked = True
         if kind == 'turn.completed' and isinstance(record.get('usage'), dict):
             completed = True
             for name, value in record['usage'].items():
@@ -291,7 +308,7 @@ def parse_events(stdout):
         elif kind in ('error', 'turn.failed'):
             error = record.get('error')
             errors.append(str(record.get('message') or (error.get('message') if isinstance(error, dict) else error) or '')[:2000])
-    return usage, completed, ' '.join(errors)
+    return usage, completed, ' '.join(errors), worked
 
 
 def classify_failure(text):
@@ -356,6 +373,10 @@ def codex_binary(explicit=None):
                   '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex']
     for candidate in candidates:
         if candidate and os.access(candidate, os.X_OK):
+            # The key goes to this program, so it must be a regular file nobody else can rewrite.
+            info = os.stat(candidate)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid not in (os.getuid(), 0) or info.st_mode & 0o022:
+                raise PoolError('codex executable %s is not owner-only writable; refusing to hand it a key' % candidate)
             return candidate
     raise PoolError('no codex executable found on this host')
 
@@ -364,6 +385,8 @@ def validate_passthrough(args):
     """Only `codex exec ...` may be launched, and it may not redirect the key, swap the model or pick another profile."""
     if not args or args[0] != 'exec':
         raise PoolError('arguments after -- must start with `exec`', EXIT_REFUSED)
+    if len(args) > 1 and not args[1].startswith('-'):
+        raise PoolError('exec subcommands (review, resume, ...) are not allowed through the pool', EXIT_REFUSED)
     i = 1
     while i < len(args):
         token = args[i]
@@ -371,6 +394,10 @@ def validate_passthrough(args):
             i += 1
             continue
         flag = token.split('=', 1)[0]
+        if flag in ('-s', '--sandbox'):
+            value = token.split('=', 1)[1] if '=' in token else (args[i + 1] if i + 1 < len(args) else '')
+            if value not in ALLOWED_SANDBOX:
+                raise PoolError('sandbox %s is not allowed through the pool' % (value or '(none)'), EXIT_REFUSED)
         if flag in FORBIDDEN_FLAGS or re.match(r'^-[mp]\S', token):
             raise PoolError('%s is set by codex-pool, not by the caller' % flag, EXIT_REFUSED)
         config = None
@@ -501,20 +528,21 @@ def run_command(args):
         raise PoolError('REFUSED: %s needs an escalation.py approve-top record for --task' % model, EXIT_REFUSED)
     if not re.match(r'^(low|medium|high|xhigh|max)$', effort or ''):
         raise PoolError('unknown effort', EXIT_REFUSED)
-    sweep_stale_homes(store.root / 'homes')
+    sweep_stale_homes(store.root / 'homes', 2 * policy['max_run_seconds'])
     stdin_bytes = b'' if sys.stdin is None or sys.stdin.isatty() else sys.stdin.buffer.read(MAX_STDIN + 1)
     if len(stdin_bytes) > MAX_STDIN:
         raise PoolError('prompt larger than 8 MiB', EXIT_REFUSED)
     codex = codex_binary(args.codex_bin)
-    command = [codex, 'exec', '--model', model, '-c', 'model_reasoning_effort=' + effort, *passthrough]
+    command = [codex, 'exec', '--model', model, '-c', 'model_reasoning_effort=' + effort,
+               '-c', 'shell_environment_policy.exclude=["CODEX_API_KEY"]', *passthrough]
     max_seconds = min(policy['max_run_seconds'], args.max_seconds or policy['max_run_seconds'])
 
     # 1. Subscription first, unless it is known to be blocked or this is a keys-only / Daybreak run.
     if policy['subscription']['first'] and not args.keys_only and not daybreak and subscription_available() \
             and not subscription_blocked(store):
         code, out, err, timed_out = run_child(command, base_env(), stdin_bytes, max_seconds)
-        usage, completed, errors = parse_events(out)
-        failure = None if completed or code == 0 else classify_failure(errors + ' ' + err.decode('utf-8', 'replace')[-2000:])
+        usage, completed, errors, worked = parse_events(out)
+        failure = None if completed or worked or code == 0 else classify_failure(errors + ' ' + err.decode('utf-8', 'replace')[-2000:])
         with store.lock():
             store.append({'type': 'settle', 'run': uuid.uuid4().hex, 'alias': 'subscription', 'source': 'subscription',
                           'purpose': purpose, 'model': model, 'effort': effort, 'usd': 0, 'status': failure or ('ok' if code == 0 else 'failed'),
@@ -563,28 +591,27 @@ def run_with_key(store, policy, run_id, alias, reserve, price, purpose, model, e
         finally:
             os.umask(old)
         os.chmod(home, 0o700)
-        env = {**base_env(), 'CODEX_HOME': home}
-        login = [command[0], 'login', '--with-api-key']
-        lcode, _, _, _ = run_child(login, env, (key + '\n').encode(), 60, key)
-        if lcode != 0:
-            status, usd, retry = 'login_failed', 0.0, True
-            err = b'codex-pool: codex login with the pooled key failed\n'
+        # The key rides in the child's environment only (CODEX_API_KEY), never in a file; codex's default
+        # shell_environment_policy also strips *KEY* variables from tools the model runs.
+        env = {**base_env(), 'CODEX_HOME': home, 'CODEX_API_KEY': key}
+        code, out, err, timed_out = run_child(command, env, stdin_bytes, max_seconds, key)
+        usage, completed, errors, worked = parse_events(out)
+        json_mode = '--json' in command
+        # Only a structured error record before any model work counts as a key-level failure; stderr prose and
+        # failures after work are never trusted to mean "free" (the reserve is kept instead).
+        failure = None if completed or worked or timed_out or not json_mode else classify_failure(errors)
+        if completed:
+            usd = cost_of(price, usage)
+            status = 'ok' if code == 0 else 'failed_after_usage'
+            if usd > reserve:
+                status += '_over_reserve'
+        elif failure in ('401', 'insufficient_quota', 'rate-limited', 'codex-restricted'):
+            usd, status, retry = 0.0, failure, True
+            mark_health(store, alias, failure, policy['rate_limit_cooldown_minutes'] if failure == 'rate-limited' else 0,
+                        detail=errors)
         else:
-            code, out, err, timed_out = run_child(command, env, stdin_bytes, max_seconds, key)
-            usage, completed, errors = parse_events(out)
-            failure = None if completed else classify_failure(errors + ' ' + err.decode('utf-8', 'replace')[-2000:])
-            if completed:
-                usd = cost_of(price, usage)
-                status = 'ok' if code == 0 else 'failed_after_usage'
-                if usd > reserve:
-                    status += '_over_reserve'
-            elif failure in ('401', 'insufficient_quota', 'rate-limited', 'codex-restricted'):
-                usd, status, retry = 0.0, failure, True
-                mark_health(store, alias, failure, policy['rate_limit_cooldown_minutes'] if failure == 'rate-limited' else 0,
-                            detail=errors or err.decode('utf-8', 'replace')[-300:])
-            else:
-                # No usage report and no classified failure: keep the full reserve, never assume it was free.
-                status = 'timeout_unknown_usage' if timed_out else ('ok_no_usage' if code == 0 else 'failed_unknown_usage')
+            # No usage report and no classified pre-work failure: keep the full reserve, never assume it was free.
+            status = 'timeout_unknown_usage' if timed_out else ('ok_no_usage' if code == 0 else 'failed_unknown_usage')
     except PoolError as error:
         status, usd, retry = 'fetch_failed', 0.0, True
         err = ('codex-pool: %s\n' % error).encode()
@@ -656,8 +683,12 @@ def probe_alias(store, policy, alias):
             state = store.state()
             record = state['keys'].setdefault(alias, {})
             record['probe'] = {'at': iso(utcnow()), 'result': result, 'http': status, 'daybreak': daybreak, 'relevant': relevant}
-            if (record.get('health') or {}).get('result') != 'codex-restricted' or result != 'ok':
-                record['health'] = {'result': result, 'at': iso(utcnow())}  # API-ok never clears a Codex restriction
+            previous = (record.get('health') or {}).get('result')
+            # A network error / 429 never clears a failure mark, and API-ok never clears a Codex restriction.
+            if result in ('401', 'insufficient_quota', 'ok') and not (previous == 'codex-restricted' and result == 'ok'):
+                record['health'] = {'result': result, 'at': iso(utcnow())}
+            elif result == 'rate-limited' and previous in (None, 'ok', 'rate-limited'):
+                record['health'] = {'result': result, 'at': iso(utcnow())}
             store.save_state(state)
             store.append({'type': 'probe', 'run': uuid.uuid4().hex, 'alias': alias, 'usd': round(cost, 6), 'status': result,
                           'model': policy['probe_model']})
@@ -799,6 +830,9 @@ def main(argv=None):
     if args.command == 'run':
         if args.codex_args and args.codex_args[0] == '--':
             args.codex_args = args.codex_args[1:]
+    if args.command == 'run':
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, lambda signum, frame: (_ for _ in ()).throw(Terminated()))  # then run_child's finally reaps the child
     try:
         if args.command == 'status':
             return status_command(args)
@@ -811,8 +845,15 @@ def main(argv=None):
         if args.command == 'subscription-block':
             return block_command(args)
         return install_command(args)
+    except Terminated:
+        print('codex-pool: terminated', file=sys.stderr)
+        return 143
     except PoolError as error:
         print('codex-pool: %s' % error, file=sys.stderr)
+        if args.command == 'run' and '--json' in args.codex_args and re.match(r'(REFUSED|no usable key)', str(error)):
+            # Budget/health refusal presented as an unstructured usage-limit record: callers (peer_review) may use
+            # their one independent fallback, and it can never place an account-pool cooldown.
+            print(json.dumps({'type': 'error', 'message': 'usage limit reached: codex-pool did not launch (%s)' % str(error)[:200]}))
         return error.code
 
 
