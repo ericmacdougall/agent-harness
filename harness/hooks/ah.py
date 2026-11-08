@@ -433,8 +433,10 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             handed = parse_ts(r["last_activity"]) or 0.0
             d = disp.get(r["agent_id"])
             kind = d.get("kind") if d else None
+            # #134 red-team P4: only main's wait acknowledges, marked --ack-handoff (an owner cannot set it)
             acknowledged = kind in ("resumed", "reassigned") + GUARDED_KINDS or (
-                kind == "waiting" and liveness.disposition_live(d, now, last_activity=handed))
+                kind == "waiting" and d.get("ack_handoff") is True
+                and liveness.disposition_live(d, now, last_activity=handed))
             acked = bool(acknowledged and float(d.get("at") or 0) >= handed - 10)
             if not acked and now - handed >= HANDOFF_ACK_S:
                 r["decision_required"] = True
@@ -985,6 +987,8 @@ def precheck(op: str, args: dict) -> None:
             raise AhError("bad_request", "task.dispose: agent must be an agent id or a task WAL name")
         if parse_ts(args["at"]) is None:
             raise AhError("bad_request", "task.dispose: at must be an ISO timestamp")
+        if args.get("ack_handoff") not in (None, True) or (args.get("ack_handoff") and args["kind"] != "waiting"):
+            raise AhError("bad_request", "task.dispose: --ack-handoff goes with --kind waiting only")
         if args["kind"] == "waiting":
             if parse_ts(args.get("until") or "") is None:
                 raise AhError("bad_request", "task.dispose waiting: --until <ISO time> is required (when it expires)")
@@ -1649,7 +1653,7 @@ def dispositions(home: Path, session: str, ledger=None) -> dict:
         if r.get("op") == "task.dispose" and a.get("session") == session:
             d = {"kind": a.get("kind"), "at": parse_ts(a.get("at")) or 0.0, "ref": a.get("ref"),
                  "reason": a.get("reason"), "evidence": a.get("evidence"), "seq": r.get("seq")}
-            for k in ("deployed", "live_test", "gate_epoch"):
+            for k in ("deployed", "live_test", "gate_epoch", "ack_handoff"):
                 if a.get(k):
                     d[k] = a[k]
             if a.get("until"):
@@ -2098,7 +2102,8 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
     tag = {"kind": args.get("kind"), "agent": args.get("agent")} if op == "task.dispose" else {}
     guarded = op == "task.dispose" and args.get("kind") in GUARDED_KINDS
     try:
-        if op == "task.dispose" and args.get("kind") in ("resumed", "reassigned") + GUARDED_KINDS \
+        if op == "task.dispose" and (args.get("kind") in ("resumed", "reassigned") + GUARDED_KINDS
+                                     or args.get("ack_handoff")) \
                 and actor_id() == args.get("agent"):  # first, so an owner's self-ack is named as such
             raise AhError("forbidden", f"task.dispose {args['kind']}: an owner cannot acknowledge itself; main records it "
                                        "(waiting is allowed)", 3)
@@ -2655,6 +2660,8 @@ def build_parser():
     dp.add_argument("--kind", required=True, choices=list(liveness.DISPOSITIONS))
     dp.add_argument("--ref", help="waiting: ask id or ticket; reassigned: replacement agent id")
     dp.add_argument("--until", help="waiting: ISO time when the wait expires")
+    dp.add_argument("--ack-handoff", dest="ack_handoff", action="store_true",
+                    help="waiting: main acknowledges this owner's handoff while the wait is live (main only)")
     dp.add_argument("--reason", help="closed, superseded, wontdo: what you verified about this owner (40+ characters)")
     dp.add_argument("--deployed", help="closed: WAL id of the deploy, release or install record naming this owner")
     dp.add_argument("--live-test", dest="live_test", help="closed: REALLY_TESTED id run against the live target")
@@ -2789,7 +2796,7 @@ def run(args, home: Path) -> dict:
             return write(home, "task.register", a, s, args.key)
         if args.sub == "dispose":
             a = {"agent": args.agent, "session": s or "", "kind": args.kind, "at": iso(time.time())}
-            for opt in ("ref", "until", "reason", "evidence", "deployed", "live_test"):
+            for opt in ("ref", "until", "reason", "evidence", "deployed", "live_test", "ack_handoff"):
                 if getattr(args, opt):
                     a[opt] = getattr(args, opt)
             return write(home, "task.dispose", a, s, args.key)

@@ -137,13 +137,44 @@ class GateTests(Base):
             {"at": iso(NOW - ah.HANDOFF_ACK_S - 1), "event": "handoff", "note": "to main: blocked on an ask"}])
         before = {r["agent_id"]: r for r in self.owners()["owners"]}
         self.assertIn("handoff-unacked", before["dropowner"]["flags"])
-        self.dispose("waiting", "disp-handoff-wait", until=iso(NOW + 3600), ref="wa5b00000001")
+        self.dispose("waiting", "disp-handoff-wait", until=iso(NOW + 3600), ref="wa5b00000001", ack_handoff=True)
         waiting = {r["agent_id"]: r for r in self.owners()["owners"]}
         self.assertNotIn("handoff-unacked", waiting["dropowner"]["flags"])
         self.assertFalse(waiting["dropowner"]["decision_required"])
         expired = {r["agent_id"]: r for r in self.owners(now=NOW + 3601)["owners"]}
         self.assertIn("handoff-unacked", expired["dropowner"]["flags"])
         self.assertTrue(expired["dropowner"]["decision_required"])
+
+    def test_a_wait_without_ack_handoff_does_not_acknowledge(self):
+        # #134 red-team P4: the owner records its own wait; the unacknowledged handoff must stay visible
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "agent-dropowner.jsonl", [
+            {"at": iso(NOW - ah.HANDOFF_ACK_S - 1), "event": "handoff", "note": "to main: done-ish"}])
+        with mock.patch.dict(os.environ, {"AH_AGENT_ID": "dropowner"}):
+            self.dispose("waiting", "self-wait", until=iso(NOW + 3 * 86400), ref="wa5b00000001")
+        later = {r["agent_id"]: r for r in self.owners(now=NOW + 3600)["owners"]}
+        self.assertIn("handoff-unacked", later["dropowner"]["flags"])
+        self.assertTrue(later["dropowner"]["decision_required"])
+
+    def test_the_owner_cannot_ack_its_own_handoff(self):
+        with mock.patch.dict(os.environ, {"AH_AGENT_ID": "dropowner"}):
+            with self.assertRaises(ah.AhError) as caught:
+                self.dispose("waiting", "self-ack", until=iso(NOW + 3600), ref="wa5b00000001", ack_handoff=True)
+        self.assertEqual(caught.exception.code, "forbidden")
+
+    def test_ack_handoff_needs_kind_waiting(self):
+        with self.assertRaises(ah.AhError):
+            self.dispose("resumed", "bad-ack", ack_handoff=True)
+
+    def test_subagent_cannot_run_an_acknowledging_wait(self):
+        for cmd in ("python3 ~/.claude/hooks/ah.py task dispose --agent x --kind waiting --ack-handoff --ref "
+                    "wa5b00000004 --until 2026-11-09T00:00:00Z",
+                    "ah task dispose --agent x --kind waiting --ack-hand --ref wa5b00000004 --until X"):
+            out = dropped_gate.cmd_pretool({"agent_id": "sub", "tool_name": "Bash", "tool_input": {"command": cmd}})
+            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny", cmd)
+        plain = "ah task dispose --agent x --kind waiting --ref wa5b00000004 --until X"
+        self.assertEqual(dropped_gate.cmd_pretool({"agent_id": "sub", "tool_name": "Bash",
+                                                   "tool_input": {"command": plain}}), {})
 
     def test_gate_exit_code_never_prints_zero_dropped(self):
         buf = io.StringIO()
