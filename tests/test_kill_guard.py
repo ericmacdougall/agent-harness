@@ -661,7 +661,8 @@ class Policy(unittest.TestCase):
                     'check_tokens': ['self', 'tokens'],
                     'resolve': ['self', 'word'],
                     'dispatch': ['self', 'words', 'cmd', 'pl', 'idx', 'depth'],
-                    'bind_loop_var': ['self', 'words']}
+                    'bind_loop_var': ['self', 'words'],
+                    'names_for': ['self', 'head']}
         self.assertEqual(sorted(expected), sorted(kg.OVERRIDDEN))
         for name, params in expected.items():
             self.assertEqual(list(inspect.signature(getattr(cg.Analyzer, name)).parameters), params, name)
