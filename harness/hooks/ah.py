@@ -2735,7 +2735,8 @@ def build_parser():
     kp.add_argument("--reason", required=True, help="why (mandatory, logged)")
     kp.add_argument("--tree", action="store_true", help="signal children first")
     kp.add_argument("--grace", type=float, default=10.0, help="seconds between SIGTERM and SIGKILL (default 10)")
-    kp.add_argument("--host", help="run on dev2, t2-dev or ah-mac-mini over ssh")
+    kp.add_argument("--host", help="run on dev2, t2-dev or ah-mac-mini over ssh; ah-spectre (Windows) takes one pid, "
+                    "no --tree, and stops it with Stop-Process")
     kp.add_argument("--foreign", action="store_true",
                     help="allow a process outside your worktree and process tree (audited; raises a high ops-watch notice)")
     kp.add_argument("--session-scope", action="store_true",
