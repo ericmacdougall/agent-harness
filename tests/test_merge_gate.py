@@ -882,7 +882,7 @@ class FalsePositives15122(Base):
             with self.subTest(command):
                 self.assertEqual(self.kinds(command), ["unverifiable"], command)
                 self.assertEqual(self.decide(command)[0], 2, command)
-        for command in ("git push origin HEAD:refs/heads/feat/main", "git -c core.hooksPath=/dev/null push gh feat"):
+        for command in ("git push origin HEAD:refs/heads/feat/main", "git push gh feat"):
             with self.subTest(command):
                 self.assertEqual(self.kinds(command), [], command)
 

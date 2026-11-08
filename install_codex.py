@@ -40,7 +40,7 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'commit_policy.local.json.example', 'spec_policy.local.json.example',
                     'model_tiers.py', 'model_tiers.json', 'escalation.py', 'tier_gate.py',
                     # Destructive and config-dump command guard (GoodQA #14471): launcher plus analyser.
-                    'command_guard.py', 'command_guard_hook.py', 'redact.py', 'kill_guard.py', 'kill_guard_policy.json', 'merge_gate.py', 'bg_job.py',
+                    'command_guard.py', 'command_guard_hook.py', 'redact.py', 'kill_guard.py', 'kill_guard_policy.json', 'merge_gate.py', 'pre-rewrite-shas.txt.gz', 'bg_job.py',
                     # Dropped-owner gate on Codex Stop and its reads (goodqa#14791 P18)
                     'dropped_gate.py', 'ah.py', 'liveness.py',
                     # Heavy-job guard (goodqa#14817): keeps large copies, suites and builds off the Mac for Codex too.
