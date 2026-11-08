@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Remote half of `remote_delete.py` (goodqa#15251). It runs ON the target host, sent over ssh on stdin by the main
+"""LOWER-LEVEL TOOL: never run this directly; only remote_delete.py sends it, after the approval checks.
+
+Remote half of `remote_delete.py` (goodqa#15251). It runs ON the target host, sent over ssh on stdin by the main
 host's guard. It never trusts anything it is told except the literal arguments: it re-checks the path and the
 Dropbox archive itself.
 

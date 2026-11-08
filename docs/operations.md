@@ -591,6 +591,28 @@ Residuals, disclosed:
 - An allowlisted host constrains the host, not the repository path: `t2-dev` accepts any path, including a disposable worktree that may be cleaned up later. Prefer a GitHub remote as the proof.
 - The backup route does not have the sole-segment rule; there the backup was verified first.
 
+### Removing an archive-backed tree on another host
+
+Use this when a tree on another host (`dev2`, `t2-dev`, `ah-mac-mini`) has a verified Dropbox tar.gz, and a bundle if it has unpushed commits. That host's own guard has no user transcript, so it refuses relayed approvals. This route checks the approval on the Mac and then deletes over ssh, the way `ah kill --host` does (goodqa#15251):
+
+```
+python3 ~/.claude/hooks/remote_delete.py --host t2-dev --path /home/eric/wt/<name> \
+    --archive-dir dropbox:<dir holding <name>.tar.gz, .tar.gz.sha256, .tar.gz.listing, .bundle> \
+    --user-source answer:<session>/<uuid> --wal <that session's WAL>
+```
+
+- **The answer:** a predefined option at most 24 h old that says yes, remove or delete, with no decline word. The session's WAL must hold a hook entry older than the answer.
+- **The question:** it must name the host, say the trees are backed up, and name the path, either absolute or as `~/...` under the remote home. One question may name several paths. An answer approves at most `archive_remote_max_paths_per_source` (16) deletions, counted from the audit log.
+- **On the remote host:** the tree is checked twice, before and at delete time. It must be:
+  - a plain directory at least two levels below home, outside the harness and credential folders;
+  - a clean git tree, when it is one;
+  - matched by an archive that streams to its recorded sha256 and holds only the tree's own files;
+  - covered by a bundle that verifies and holds HEAD, when it has unpushed commits;
+  - the same directory (dev:inode) at the delete as at the check.
+- **The delete:** a worktree is removed with `git worktree remove --force` plus prune, and its branch stays. Any other tree is removed as a directory. Both hosts write an audit line.
+
+`remote_delete_agent.py` is the lower-level remote half that this route sends over ssh. Never run it directly: run by hand, it skips every approval check above and keeps only the remote archive checks.
+
 ### Commands
 
 | Command | Purpose |
