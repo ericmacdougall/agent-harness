@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stub: records args; never contacts network. STUB_MODE=garbage writes a bad object to --file.
+echo "STUB npx $*" >> "$STUB_LOG"
+if [ "$STUB_MODE" = "garbage" ]; then
+  while [ $# -gt 0 ]; do if [ "$1" = "--file" ]; then echo garbage > "$2"; fi; shift; done
+fi
+if [ "$STUB_MODE" = "fail" ]; then exit 1; fi
+exit 0
