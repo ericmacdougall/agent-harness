@@ -279,7 +279,9 @@ def merge_config(existing: str, wal_dir: Path, *, default_full_access: bool = Fa
     return result
 
 
-def install(home: Path, apply: bool, *, default_full_access: bool = False, command_guard: bool = True) -> list[str]:
+def install(home: Path, apply: bool, *, default_full_access: bool = False, command_guard: bool = True,
+            hooks_only: bool = False) -> list[str]:
+    """hooks_only: install the harness files only; AGENTS.md, hooks.json and config.toml are never read or written."""
     home = home.expanduser().resolve()
     codex_home = home / '.codex'
     skill_dir = codex_home / 'skills' / 'agent-harness'
@@ -297,7 +299,8 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False, comma
     instructions_path = codex_home / 'AGENTS.md'
     hooks_path = codex_home / 'hooks.json'
     config_path = codex_home / 'config.toml'
-    managed = [destination for _, destination in files] + [instructions_path, hooks_path, config_path]
+    user_files = [] if hooks_only else [instructions_path, hooks_path, config_path]
+    managed = [destination for _, destination in files] + user_files
     directories = [home, codex_home, codex_home / 'agents', codex_home / 'skills', skill_dir,
                    skill_dir / 'references', harness_dir, backup_root, wal_parent, wal_dir]
     if any(path.is_symlink() for path in [*managed, *directories]):
@@ -312,16 +315,17 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False, comma
             pins.capture(directory)
         originals = {path: read_regular(path, pinned_parent=pins.fd(path.parent),
                                         retain_fd=pins.file_fds) for path in managed}
-        existing_instructions = originals[instructions_path][0].decode() if originals[instructions_path] else ''
-        existing_hooks = json.loads(originals[hooks_path][0].decode()) if originals[hooks_path] else {}
-        existing_config = originals[config_path][0].decode() if originals[config_path] else ''
-        instructions = merge_marked(existing_instructions, (SOURCE / 'AGENTS.md').read_text())
-        hooks = merge_hooks(existing_hooks, codex_home, command_guard)
-        config = merge_config(existing_config, wal_dir, default_full_access=default_full_access)
         payloads = [(destination, source.read_bytes()) for source, destination in files]
-        payloads += [(instructions_path, instructions.encode()),
-                     (hooks_path, (json.dumps(hooks, indent=2) + '\n').encode()),
-                     (config_path, config.encode())]
+        if not hooks_only:
+            existing_instructions = originals[instructions_path][0].decode() if originals[instructions_path] else ''
+            existing_hooks = json.loads(originals[hooks_path][0].decode()) if originals[hooks_path] else {}
+            existing_config = originals[config_path][0].decode() if originals[config_path] else ''
+            instructions = merge_marked(existing_instructions, (SOURCE / 'AGENTS.md').read_text())
+            hooks = merge_hooks(existing_hooks, codex_home, command_guard)
+            config = merge_config(existing_config, wal_dir, default_full_access=default_full_access)
+            payloads += [(instructions_path, instructions.encode()),
+                         (hooks_path, (json.dumps(hooks, indent=2) + '\n').encode()),
+                         (config_path, config.encode())]
         changes = [str(path) for path in managed]
         if not apply:
             return changes
@@ -394,6 +398,9 @@ def main() -> None:
     parser.add_argument('--default-full-access', action='store_true',
                         help='Explicitly select built-in Full Access and no approval prompts for new sessions')
     parser.add_argument('--home', type=Path, default=Path.home())
+    parser.add_argument('--hooks-only', action='store_true',
+                        help='install the harness files and the commit-msg backstop only; never read or write '
+                             'AGENTS.md, hooks.json or config.toml, and skip netwatch (per-file backups are kept)')
     netwatch = parser.add_mutually_exclusive_group()
     netwatch.add_argument('--no-netwatch', dest='netwatch', action='store_false', default=None,
                           help='do not install or upgrade the netwatch monitor (remembered)')
@@ -404,8 +411,10 @@ def main() -> None:
                              'the files stay installed; not remembered')
     args = parser.parse_args()
     try:
+        if args.hooks_only and args.default_full_access:
+            raise ValueError('--hooks-only cannot be combined with --default-full-access')
         changes = install(args.home, args.apply, default_full_access=args.default_full_access,
-                          command_guard=args.command_guard)
+                          command_guard=args.command_guard, hooks_only=args.hooks_only)
     except (ValueError, RuntimeError) as error:
         parser.exit(2, f'error: {error}\n')
     print(('Installed' if args.apply else 'Would install') + f' Codex Agent Harness in {args.home / ".codex"}')
@@ -414,6 +423,9 @@ def main() -> None:
     for path in changes:
         print(f'  {path}')
     print(f'  {install_git_backstop(args.home, args.apply)}')
+    if args.hooks_only:
+        print('  AGENTS.md, hooks.json and config.toml: not touched (--hooks-only)')
+        return
     print(f'  {netwatch_status(args.home, args.apply, args.netwatch)}')
     print(f'  {local_profile_status(args.home, args.home / ".codex" / "agent-harness")}')
     if args.apply:

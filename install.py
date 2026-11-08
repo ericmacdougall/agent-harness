@@ -719,7 +719,9 @@ def install_services(claude: Path, runner=None) -> list[str]:
 
 
 def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool = True,
-            command_guard: bool = True, log_backup=None, services: bool = False) -> list[str]:
+            command_guard: bool = True, log_backup=None, services: bool = False, hooks_only: bool = False) -> list[str]:
+    """hooks_only: install the hook, agent, tool and skill files only; CLAUDE.md and settings.json are never read or
+    written (their review happens separately). The per-file backups are kept."""
     claude = home.expanduser().resolve() / ".claude"
     if log_backup is None:
         log_backup = log_backup_alert(home, None)
@@ -728,7 +730,8 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
           for folder, names in (("agents", AGENTS), ("hooks", HOOKS), ("tools", TOOLS), ("skills", SKILLS))
           for name in names),
     ]
-    managed = [destination for _, destination in files] + [claude / "CLAUDE.md", claude / "settings.json"]
+    user_files = [] if hooks_only else [claude / "CLAUDE.md", claude / "settings.json"]
+    managed = [destination for _, destination in files] + user_files
     directories = {claude, claude / "agent-harness-backups", *(path.parent for path in managed)}
     if any(path.is_symlink() for path in [*managed, *directories]):
         raise ValueError("Refusing a symlinked destination or directory; inspect the user directory first")
@@ -743,21 +746,23 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
                           claude / 'tools', claude / 'skills', claude / 'skills' / 'check-dropped-workstreams', backup_root):
             pins.capture(directory)
         instructions_path = claude / "CLAUDE.md"
-        existing_instructions = read_regular(instructions_path, pinned_parent=pins.fd(claude),
-                                             retain_fd=pins.file_fds)
-        current_text = existing_instructions[0].decode() if existing_instructions else ""
-        instructions = merged_instructions(current_text, (ROOT / "HARNESS.md").read_text())
         settings_path = claude / "settings.json"
-        existing_settings = read_regular(settings_path, pinned_parent=pins.fd(claude),
-                                         retain_fd=pins.file_fds)
-        current_settings = json.loads(existing_settings[0].decode()) if existing_settings else {}
-        if not isinstance(current_settings, dict):
-            raise ValueError("settings.json must contain an object")
-        settings = merged_settings(current_settings, claude, durable_tmp, provenance, command_guard, log_backup)
         # Read every payload before any managed write (also validate it in preview).
         payloads = [(destination, source.read_bytes()) for source, destination in files]
-        payloads += [(instructions_path, instructions.encode()),
-                     (settings_path, (json.dumps(settings, indent=2) + "\n").encode())]
+        existing_instructions = existing_settings = None
+        if not hooks_only:
+            existing_instructions = read_regular(instructions_path, pinned_parent=pins.fd(claude),
+                                                 retain_fd=pins.file_fds)
+            current_text = existing_instructions[0].decode() if existing_instructions else ""
+            instructions = merged_instructions(current_text, (ROOT / "HARNESS.md").read_text())
+            existing_settings = read_regular(settings_path, pinned_parent=pins.fd(claude),
+                                             retain_fd=pins.file_fds)
+            current_settings = json.loads(existing_settings[0].decode()) if existing_settings else {}
+            if not isinstance(current_settings, dict):
+                raise ValueError("settings.json must contain an object")
+            settings = merged_settings(current_settings, claude, durable_tmp, provenance, command_guard, log_backup)
+            payloads += [(instructions_path, instructions.encode()),
+                         (settings_path, (json.dumps(settings, indent=2) + "\n").encode())]
         changes = [str(path) for path in managed]
         if not apply:
             if services:  # preview: name the service commands a real --apply --services run would execute
@@ -768,7 +773,8 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
         originals = {path: read_regular(path, pinned_parent=pins.fd(path.parent),
                                         retain_fd=pins.file_fds)
                      for path in managed}
-        if originals[instructions_path] != existing_instructions or originals[settings_path] != existing_settings:
+        if not hooks_only and (originals[instructions_path] != existing_instructions
+                               or originals[settings_path] != existing_settings):
             raise OSError('User settings or instructions changed during installation preflight; retry')
         # Exclusive creation rejects a real directory that appears after snapshot.
         for directory in (claude, claude / 'agents', claude / 'hooks', claude / 'tools',
@@ -1066,6 +1072,10 @@ def main() -> None:
     parser.add_argument("--services", action="store_true",
                         help="also register the host services (the ahd launchd/systemd job) after the files are installed")
     parser.add_argument("--home", type=Path, default=Path.home(), help=argparse.SUPPRESS)
+    parser.add_argument("--hooks-only", action="store_true",
+                        help="install the hook, agent, tool and skill files and the commit-msg backstop only; never "
+                             "read or write CLAUDE.md or settings.json, and skip the scratch, netwatch and log-backup "
+                             "steps (per-file backups are kept)")
     choice = parser.add_mutually_exclusive_group()
     choice.add_argument("--no-durable-tmp", dest="durable_tmp", action="store_false", default=None,
                         help=f"stop setting {TMPDIR_KEY} (remembered); remove it if it is the harness value")
@@ -1099,17 +1109,24 @@ def main() -> None:
             parser.exit(1, f"Install failed: could not save the durable-tmp choice under "
                            f"{args.home / '.agent-harness'} ({error.__class__.__name__}); it must be a "
                            "real directory, not a symlink\n")
+    if args.hooks_only and args.services:
+        parser.exit(2, "--hooks-only cannot be combined with --services\n")
     try:
         changes = install(args.home, args.apply, durable_tmp=durable_tmp, provenance=args.provenance,
                           command_guard=args.command_guard, log_backup=log_backup_alert(args.home, args.log_backup),
-                          services=args.services)
+                          services=args.services, hooks_only=args.hooks_only)
     except DirectoryPublicationError as error:
         parser.exit(1, f'Install failed: {error}\n')
     action = "Installed" if args.apply else "Would install"
-    print(f"{action} Agent Harness in {args.home.expanduser() / '.claude'}")
+    print(f"{action} Agent Harness in {args.home.expanduser() / '.claude'}" + (" (hooks only)" if args.hooks_only else ""))
     for path in changes:
         print(f"  {path}")
     print(f"  {install_git_backstop(args.home, args.apply)}")
+    if args.hooks_only:
+        print("  CLAUDE.md and settings.json: not touched (--hooks-only)")
+        if not args.apply:
+            print("Run with --apply to install. Existing files will be backed up.")
+        return
     print(f"  {scratch_status(args.home, args.apply, durable_tmp)}")
     print(f"  {netwatch_status(args.home, args.apply, args.netwatch)}")
     print(f"  {local_profile_status(args.home)}")
