@@ -444,3 +444,105 @@ class WorktreeRemoveIndirectRound2(WorktreeRemoveCase):
 
     def test_lone_literal_form_still_passes(self):
         self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'allow')
+
+
+class WorktreeRemoveIndirectRound3(WorktreeRemoveCase):
+    """goodqa#15346 round-2 delta review (BLOCK on c70e378). Git ignores an alias that shadows a built-in, so any
+    subcommand outside a static built-in list is treated as a possible alias: it may not act on a protected path or on
+    input from stdin, xargs or a placeholder. parallel and sem lines are rebuilt the way GNU parallel builds them
+    (word join, cartesian product of the ::: sources, placeholder substitution) and each line is judged as a script."""
+
+    def env(self):
+        lst = self.home / 'list.txt'
+        lst.write_text(str(self.linked) + '\n')
+        return dict(P=str(self.linked), L=str(lst), PR=str(self.primary), H=str(self.home), B=str(self.base),
+                    MANY=' '.join('x%d' % n for n in range(60)))
+
+    BLOCK = (
+        # parallel: several ::: sources, numbered placeholders, no command given, quoted sh -c, data lines
+        'parallel ::: git ::: worktree ::: remove ::: --force ::: {P}',
+        'parallel git ::: worktree ::: remove ::: {P}',
+        'parallel git worktree {{1}} --force {{2}} ::: remove ::: {P}',
+        "parallel 'git worktree {{1}} --force {{2}}' ::: remove ::: {P}",
+        'parallel sh -c "\'git worktree remove --force {{}}\'" ::: {P}',
+        "parallel ::: 'cd {B}; git worktree remove --force linked'",
+        "parallel ::: 'X=1 git worktree remove --force {P}'",
+        "parallel 'rm -rf {{}}' ::: {MANY} {H}",
+        "parallel -j 4 'rm -rf {{}}' ::: {MANY} {P}",
+        "parallel 'rm -rf {{.}}' ::: {H}.x",
+        "parallel -I @@ 'rm -rf @@' ::: {H}",
+        "parallel 'rm -rf {{//}}' ::: {H}/x",
+        "parallel -a {L} 'rm -rf {{}}'",
+        "parallel 'rm -rf {{}}' :::: {L}",
+        "parallel 'git wr --force {{}}' ::: {P}",
+        # sem is GNU parallel --semaphore
+        'sem git worktree remove --force {P}',
+        # a subcommand that is not a built-in may be an alias defined anywhere
+        'git wr {P}',
+        'echo {P} | xargs git wr',
+        'echo {P} | xargs git wr --force',
+        'echo {P} | xargs -n 1 git wr',
+        'find {P} -maxdepth 0 -exec git wr --force {{}} +',
+        'git --exec-path worktree remove --force {P}',
+        'git -c core.alias=x wr {P}',
+        'GIT_CONFIG_GLOBAL={H}/evil git wr {P}',
+        'echo {P} | GIT_CONFIG_GLOBAL={H}/evil xargs git wr',
+        'export GIT_CONFIG_GLOBAL={H}/evil ; echo {P} | xargs git wr',
+        'GIT_CONFIG_SYSTEM={H}/evil git wr {P}',
+        'HOME={H}/fake git wr {P}',
+        'XDG_CONFIG_HOME={H}/x git wr {P}',
+        "env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0='worktree remove --force' git wr {P}",
+        "echo {P} | env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0='worktree remove --force' "
+        "xargs git wr",
+        "printf -v GIT_CONFIG_KEY_0 alias.wr ; export GIT_CONFIG_KEY_0 GIT_CONFIG_COUNT=1 "
+        "GIT_CONFIG_VALUE_0='worktree remove --force' ; echo {P} | xargs git wr",
+        "git config --global foo.wr 'worktree remove --force' ; git config --global --rename-section foo alias ; "
+        "git wr {P}",
+        "printf '[alias]\\n\\twr = worktree remove --force\\n' > {H}/evil ; GIT_CONFIG_GLOBAL={H}/evil git wr {P}",
+        # alias values whose quotes git strips (split_cmdline)
+        "echo {P} | xargs git -c 'alias.wr=\"work\"\"tree\" remove --force' wr",
+        "echo {P} | xargs git -c 'alias.wr=\"work\"\"tree\" \"re\"\"move\"' wr --force",
+        "git config --global alias.wr '\"work\"\"tree\" remove --force'",
+        "git config --global alias.wr 'work\\tree remove --force'",
+        "git config --global alias.wr \"'work'tree remove --force\"",
+        "git config --global alias.wr '\"work\"\"tree\" remove --force' ; git wr {P}",
+    )
+
+    ALLOW = (
+        # an alias provably defined on this command line to a harmless built-in
+        "git -c alias.wl='worktree list' wl",
+        "git -c alias.lg='log --oneline' lg {P}",
+        'git -c alias.st=status st',
+        'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.st GIT_CONFIG_VALUE_0=status git st',
+        'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.st GIT_CONFIG_VALUE_0=status; git log -1',
+        'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.st GIT_CONFIG_VALUE_0=status; git -C {P} status',
+        # a built-in is never an alias, whatever config says
+        'git -c alias.status=x status',
+        'git st',
+        'echo a | xargs git log -1 --',
+        'git config --global include.path ~/.gitconfig.local',
+        "git config --global alias.lg 'log --oneline --graph'",
+        # parallel lines that rebuild to harmless commands
+        "parallel 'rm -rf {{}}' ::: {MANY}",
+        "parallel -j 4 'git -C {{}} status' ::: {PR} {P}",
+        'parallel -j 4 git -C {{}} log -1 ::: {PR} {P}',
+        "parallel echo ::: 'rm -rf x'",
+        "parallel 'echo {{}}' ::: 'rm -rf x'",
+        "parallel ::: 'make test' 'make lint'",
+        "parallel 'cd {{}} && git status' ::: {PR} {P}",
+        'parallel -j 4 git status ::: {P}',
+        'sem echo done',
+    )
+
+    def test_round3_reproducers_block(self):
+        env = self.env()
+        passed = [c for c in self.BLOCK if self.decide(c.format(**env))[0] != 'block']
+        self.assertEqual(passed, [], 'a round-3 reproducer slipped through')
+
+    def test_round3_harmless_forms_stay_allowed(self):
+        env = self.env()
+        blocked = [c for c in self.ALLOW if self.decide(c.format(**env))[0] != 'allow']
+        self.assertEqual(blocked, [], 'a harmless form is blocked')
+
+    def test_lone_literal_form_still_passes(self):
+        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'allow')
