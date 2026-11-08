@@ -94,13 +94,13 @@ class Store:
     @contextlib.contextmanager
     def lock(self, timeout=60):
         fd = os.open(self.root / 'pool.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        deadline = time.monotonic() + timeout
+        deadline = time.time() + timeout  # wall clock: callers' tests may freeze monotonic
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
-                if time.monotonic() > deadline:
+                if time.time() > deadline:
                     os.close(fd)
                     raise PoolError('ledger lock busy')
                 time.sleep(0.02)
