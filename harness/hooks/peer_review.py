@@ -987,7 +987,11 @@ REFS_LINE = re.compile(r'^refs:[ \t]*(.+)$', re.I | re.M)
 UNTICKETABLE = re.compile(
     r'data[- ]?loss|los(?:e|es|ing|t) (?:\w+ )?(?:data|rows|records|files|commits|work)|\bdrops? (?:the |a )?\w+ '
     r'(?:table|column|database)|\bdelet|\bwip(?:e|es|ed)\b|corrupt|secur|\bauth|credential|password|secret|'
-    r'\btoken|privacy|\bpii\b|leak|inject|privilege|permission|bypass|migrat|rollback|roll back', re.I)
+    r'\btoken|privacy|\bpii\b|leak|inject|privilege|permission|bypass|migrat|rollback|roll back|'
+    # B3 (step-1 red-team): wordings the first list missed
+    r'unauth|oauth|authn|authz|\bxss\b|cross[- ]site|csrf|ssrf|\bidor\b|\brce\b|remote code|\bsql\b|'
+    r'truncat|\beras(?:e|es|ed|ing|ure)\b|\bpurg|rm -rf|\btenant|exfiltrat|sandbox escape|\bacl\b|\bjwt\b|'
+    r'sign[- ]?in|log[- ]?in\b|session (?:token|cookie|id|fixation|hijack)', re.I)
 
 
 def related_ticket_refs(repo, base):

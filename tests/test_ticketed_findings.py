@@ -169,6 +169,24 @@ class OwnTicketAndUnticketable(unittest.TestCase):
                 self.assertEqual(records, [])
                 self.assertIn("cannot be ticketed", " ".join(errors))
 
+    def test_the_red_teams_missed_wordings_are_not_ticketed(self):
+        # step-1 red-team B3: each of these was ticketed as reliability
+        for text in ("unauthenticated callers can read every tenant's invoices", "OAuth callback skips state check",
+                     "stored XSS in the profile page", "rm -rf of the archive dir erases the only copy",
+                     "TRUNCATE on deploy empties the orders table", "IDOR: any user id can be fetched",
+                     "SSRF via the webhook URL", "the sign-in form accepts an expired JWT"):
+            with self.subTest(text=text):
+                report = "VERDICT: BLOCK\nF1: " + text + "\n" + declaration(category="reliability")
+                out, records, errors = resolve(report)
+                self.assertTrue(out.startswith("VERDICT: BLOCK"), out)
+                self.assertIn("cannot be ticketed", " ".join(errors))
+
+    def test_an_ordinary_finding_is_still_ticketable(self):
+        report = "VERDICT: BLOCK\nF1: the retry helper's name hides that it sleeps\n" + declaration(category="maintainability")
+        out, records, errors = resolve(report)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(records), 1)
+
     def test_the_branchs_own_work_ticket_is_refused(self):
         own = {("goodqa", "goodqa", 42)}
         out, records, errors = review.resolve_ticketed_findings(
