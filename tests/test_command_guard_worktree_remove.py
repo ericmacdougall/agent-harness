@@ -341,3 +341,54 @@ class WorktreeRemoveIndirect(WorktreeRemoveCase):
                   'xargs -J %% git -C %% status < %s' % lst, 'git worktree add %s/new' % self.home,
                   'parallel -j 4 git status ::: %s' % self.linked):
             self.assertEqual(self.decide(c)[0], 'allow', c)
+
+class WorktreeRemoveDashC(WorktreeRemoveCase):
+    """A subagent's shell resets to $HOME on every call, so the only way to name the registry repository is one literal
+    -C. Every other -C shape, and every refusal the plain form has, must still block."""
+
+    def test_literal_dash_c_repo_is_allowed_and_keeps_every_refusal(self):
+        plain = self.home / 'plain'; plain.mkdir()
+        ok = 'git -C %s worktree remove %s' % (self.primary, self.linked)
+        self.assertEqual(self.decide(ok, cwd=plain)[0], 'allow')
+        self.assertEqual(self.decide('git -C %s worktree remove -- %s' % (self.primary, self.linked), cwd=plain)[0], 'allow')
+        blocked = (
+            'git -C %s worktree remove %s' % (self.primary, self.linked) + ' --force',
+            'git -C ../primary worktree remove %s' % self.linked,
+            'git -C %s -C %s worktree remove %s' % (self.primary, self.primary, self.linked),
+            'git -C $HOME worktree remove %s' % self.linked,
+            'git -C "%s" worktree remove %s' % (self.primary, self.linked),
+            'git -C %s worktree remove %s; true' % (self.primary, self.linked),
+            'git -C %s worktree remove %s %s' % (self.primary, self.linked, self.primary),
+            'git -C %s worktree remove %s' % (self.linked, self.linked),          # cannot remove the current worktree
+            'git -C %s/nonexistent worktree remove %s' % (self.primary, self.linked),
+            'git -C %s worktree remove %s' % (self.primary, self.primary),        # the primary is not removable
+        )
+        passed = [c for c in blocked if self.decide(c, cwd=plain)[0] != 'block']
+        self.assertEqual(passed, [], 'a -C shape slipped through')
+        (self.linked / 'a.txt').write_text('changed\n')
+        self.assertEqual(self.decide(ok, cwd=plain)[0], 'block')
+
+    def test_red_team_shell_inside_the_target_and_unrelated_repo_block(self):
+        ok = 'git -C %s worktree remove %s' % (self.primary, self.linked)
+        sub = self.linked / 'sub'; sub.mkdir()
+        for cwd in (self.linked, sub):  # F1: the plain form refuses a shell inside the target; so must -C
+            self.assertEqual(self.decide(ok, cwd=cwd)[0], 'block', cwd)
+        other = self.home / 'other'; other.mkdir()
+        git(other, 'init', '-q', '-b', 'main')
+        git(other, 'remote', 'add', 'origin', URL)
+        self.assertEqual(self.decide('git -C %s worktree remove %s' % (other, self.linked), cwd=self.home)[0], 'block')  # F2
+        self.assertEqual(self.decide(ok, cwd=self.home)[0], 'allow')
+
+    def test_delta_n1_n3_shell_in_a_scan_blind_subdir_alias_or_the_git_dir_blocks(self):
+        # an upper-cased spelling of the target is another path string but the same directory on a case-folding volume
+        ok = 'git -C %s worktree remove %s' % (self.primary, self.linked)
+        gitdir = Path(git(self.linked, 'rev-parse', '--absolute-git-dir'))
+        self.assertEqual(self.decide(ok, cwd=gitdir)[0], 'block')                 # N3: the admin folder is deleted too
+        self.assertEqual(self.decide('git -C %s worktree remove %s' % (gitdir, self.linked), cwd=self.home)[0], 'block')
+        deep = self.linked / 'node_modules' / 'a' / 'b'
+        deep.mkdir(parents=True)
+        (self.primary / '.git/info/exclude').write_text('node_modules/\n')
+        upper = Path(str(self.linked).replace('/linked', '/LINKED'))
+        if upper.exists():  # case-insensitive volume (macOS default): the spelling differs, the directory is the same
+            self.assertEqual(self.decide(ok, cwd=upper / 'node_modules' / 'a' / 'b')[0], 'block')
+        self.assertEqual(self.decide(ok, cwd=deep)[0], 'block')

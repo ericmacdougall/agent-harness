@@ -3733,7 +3733,7 @@ class Analyzer:
         self.owned_checkout(sub, rest, cwd_words, locations, alias)
         if sub == 'clean':
             self.git_clean(args[i + 1:], rest, cwd_word)
-        if sub == 'worktree' and rest[:1] == ['remove'] and self._removable_linked_worktree(args[i + 1:]):
+        if sub == 'worktree' and rest[:1] == ['remove'] and self._removable_linked_worktree(args[i + 1:], cwd_words):
             return  # the only exemption: one literal, clean, published, registered linked-worktree top
         if sub == 'worktree' and rest[:1] == ['remove']:
             targets = _nondash(args[i + 2:])
@@ -4626,29 +4626,81 @@ class Analyzer:
         raw = getattr(self.ctx, 'raw_top', '') or ''
         return bool(self.LONE_RM.match(raw)) and not re.search(r'[\x00-\x08\x0b-\x1f\x7f]', raw.strip())
 
+    _LITERAL = r'[^ \t\x00-\x1f\x7f;&|<>`$()\\"\'*?\[\]{}~#!]+'
+    # `git [-C /abs/repo] worktree remove [--] /abs/worktree`: a caller whose working directory is not a repository (a
+    # subagent's shell resets to $HOME on every call) names the registry repository with one literal -C
     LONE_WORKTREE_REMOVE = re.compile(
-        r'^[ \t]*git[ \t]+worktree[ \t]+remove[ \t]+(?:--[ \t]+)?'
-        r'([^ \t\x00-\x1f\x7f;&|<>`$()\\"\'*?\[\]{}~#!]+)[ \t]*$')
+        r'^[ \t]*git[ \t]+(?:-C[ \t]+(' + _LITERAL + r')[ \t]+)?worktree[ \t]+remove[ \t]+(?:--[ \t]+)?'
+        r'(' + _LITERAL + r')[ \t]*$')
 
-    def _removable_linked_worktree(self, args):
-        """A standalone `git worktree remove /literal/top`; every other shape keeps the ordinary refusal."""
+    def _removable_linked_worktree(self, args, cwd_words=()):
+        """A standalone `git [-C /literal/repo] worktree remove /literal/top`; every other shape keeps the ordinary
+        refusal."""
         if len(args) not in (2, 3) or args[0].text != 'remove' or (len(args) == 3 and args[1].text != '--'):
             return False
         word = args[-1]
         if word.dynamic or word.subs or word.glob:
             return False
         match = self.LONE_WORKTREE_REMOVE.fullmatch(getattr(self.ctx, 'raw_top', '') or '')
-        if not match or match.group(1) != word.text:
+        if not match or match.group(2) != word.text:
             return False
+        calling = self.ctx.cwd
+        if match.group(1) is not None or cwd_words:
+            repo_word = cwd_words[0] if len(cwd_words) == 1 else None
+            if repo_word is None or repo_word.dynamic or repo_word.subs or repo_word.glob \
+                    or repo_word.text != match.group(1):
+                return False
+            calling = repo_word.text
+            if not os.path.isabs(calling) or os.path.realpath(calling) != calling or self._foreign_home(calling):
+                return False
         cls, path, literal = self.target_class(word)
         if cls != 'root' or not literal or path != word.text or self._foreign_home(path):
             return False
         started = time.monotonic()
         try:
-            reason = linked_worktree_remove_refusal(path, self.ctx.cwd, self.c.policy)
+            reason = linked_worktree_remove_refusal(path, calling, self.c.policy)
+            if reason is None and calling != self.ctx.cwd:
+                reason = self._dash_c_refusal(path, calling)
         finally:
             self.ctx.budget.deadline += time.monotonic() - started
         return reason is None
+
+    def _dash_c_refusal(self, path, repo):
+        """With a -C the verification ran from the -C directory. Red-team F1: the shell may itself stand inside the
+        target (the plain form refuses that), and F2: the -C repository must be the target's own registry."""
+        try:
+            here = os.path.realpath(_git_out(self.ctx.cwd, ['rev-parse', '--show-toplevel'], 2.0).strip())
+        except (ValueError, OSError, TimeoutError):
+            here = None  # the calling directory is not inside any repository
+        except Exception:  # noqa: BLE001 - any surprise keeps the refusal
+            return 'could not check the calling directory'
+        if here == path or os.path.realpath(self.ctx.cwd).startswith(path + os.sep) or os.path.realpath(self.ctx.cwd) == path:
+            return 'the current worktree cannot remove itself'
+        # delta red-team N1 and N3: strings do not fold case or firmlinks, so compare files. Neither the shell's directory
+        # nor the -C directory may be the target, inside it, or inside the git directory that the removal also deletes.
+        try:
+            gitdir = os.path.realpath(_git_out(path, ['rev-parse', '--absolute-git-dir'], 2.0).strip())
+            targets = [os.stat(path), os.stat(gitdir)]
+            for start in (self.ctx.cwd, repo):
+                node = os.path.realpath(start)
+                for _ in range(200):
+                    st = os.stat(node)
+                    if any(os.path.samestat(st, target) for target in targets):
+                        return 'the calling directory is inside the worktree or its git directory'
+                    parent = os.path.dirname(node)
+                    if parent == node:
+                        break
+                    node = parent
+        except Exception:  # noqa: BLE001 - an unreadable ancestor or git directory keeps the refusal
+            return 'could not compare the calling directory with the worktree'
+        try:
+            theirs = os.path.realpath(_git_out(repo, ['rev-parse', '--path-format=absolute', '--git-common-dir'], 2.0).strip())
+            ours = os.path.realpath(_git_out(path, ['rev-parse', '--path-format=absolute', '--git-common-dir'], 2.0).strip())
+        except Exception:  # noqa: BLE001
+            return 'could not compare the -C repository with the worktree registry'
+        if theirs != ours:
+            return 'the -C repository is not the worktree registry'
+        return None
 
     def _clone_hint(self, path):
         reason = getattr(self.ctx, 'clone_reasons', {}).get(path)
