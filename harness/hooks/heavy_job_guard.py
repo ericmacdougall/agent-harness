@@ -704,23 +704,39 @@ LANE_TRANSFERS = 4
 BUDGET_FILE = Path(__file__).resolve().parent / "dropbox_budget.conf"
 
 
+BUDGET_MAX_BYTES = 65536
+_BUDGET_SKIP = re.compile(r"[ \t]*(#.*)?")
+_BUDGET_LINE = re.compile(r"([A-Za-z0-9._-]+)[ \t]+([1-9][0-9]?)[ \t]*")
+
+
 def budget_shares(path: Path = BUDGET_FILE) -> dict[str, int] | None:
     """The shared Dropbox write budget (goodqa#15218): {name: ops per second}, or None when the file is missing or
-    invalid (a malformed line, a value outside 1-99, a repeated name, no `account`, or shares above the total)."""
+    invalid. The line rule is the one log-backup.sh applies (keep the two in step): CRLF accepted; a line is blank, a
+    comment, or `name value` (name [A-Za-z0-9._-]+, value 1-99); names unique; at most 64 KiB; shares <= account.
+    The read never follows a symlink, never blocks on a FIFO and never reads more than 64 KiB (it runs on every hook)."""
     try:
-        if path.is_symlink() or not path.is_file():
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
             return None
-        lines = path.read_text(encoding="utf-8").splitlines()[:200]
-    except (OSError, UnicodeDecodeError):
+        data = os.read(fd, BUDGET_MAX_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > BUDGET_MAX_BYTES:
         return None
     shares: dict[str, int] = {}
-    for line in lines:
-        words = line.split()
-        if not words or words[0].startswith("#"):
+    for line in data.decode("latin-1").split("\n"):
+        line = line[:-1] if line.endswith("\r") else line
+        if _BUDGET_SKIP.fullmatch(line):
             continue
-        if len(words) != 2 or not re.fullmatch(r"[1-9][0-9]?", words[1]) or words[0] in shares:
+        match = _BUDGET_LINE.fullmatch(line)
+        if not match or match.group(1) in shares:
             return None
-        shares[words[0]] = int(words[1])
+        shares[match.group(1)] = int(match.group(2))
     if "account" not in shares or sum(v for k, v in shares.items() if k != "account") > shares["account"]:
         return None
     return shares

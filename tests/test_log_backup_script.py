@@ -1154,6 +1154,26 @@ class Contention(Case):
         self.assertIn("skipped .codex/archived_sessions", (self.logs / "log-backup.log").read_text())
         self.assertFalse(self.last_ok().exists())
 
+    def test_a_throttle_at_the_deadline_or_the_rclone_budget_also_stops_the_run(self):
+        # Review test gaps: the deadline path and rclone exit 10 (--max-duration) with a rate limit in the log.
+        cases = (dict(FAKE_EXIT_AFTER_NOTE="10"),
+                 dict(FAKE_HANG="90", FAKE_HANG_MATCH=".claude/wals", LOG_BACKUP_BUDGET_SECONDS="40",
+                      LOG_BACKUP_DEADLINE_GRACE_SECONDS="2", LOG_BACKUP_KILL_GRACE_SECONDS="1",
+                      LOG_BACKUP_SLICE_RESERVE_SECONDS="5"))
+        for extra in cases:
+            open(self.calls, "w").close()
+            for name in ("log-backup.throttled", "log-backup.log"):
+                if (self.logs / name).exists():
+                    (self.logs / name).unlink()
+            done = self.run_script(FAKE_RCLONE_LOG_TEXT="ERROR : upload failed: too_many_write_operations",
+                                   FAKE_NOTE_MATCH=".claude/wals", LOG_BACKUP_RETRIES="0", **extra)
+            self.assertNotEqual(done.returncode, 0, extra)
+            self.assertIn("stopped at .claude/wals", (self.logs / "log-backup.throttled").read_text(), extra)
+            sent = [c[-1].split("/testhost/", 1)[1] for c in self.copies()]
+            self.assertIn(".claude/projects", sent, extra)
+            self.assertFalse([s for s in sent if s.startswith(".agent-harness/work")], extra)
+            self.assertFalse(self.last_ok().exists())
+
     def test_the_budget_file_caps_this_hosts_rate(self):
         budget = self.tmp / "budget.conf"
 
@@ -1175,6 +1195,18 @@ class Contention(Case):
                        good.replace("testhost 1", "testhost 0"),
                        good.replace("log-backup.testhost 1\n", "")):      # no share for this host
             self.assertEqual(rate(broken, LOG_BACKUP_TPSLIMIT="3"), {"3"}, broken)  # today's value stays
+        # Review m4: one line rule in both readers. CRLF is accepted; a no-break space, a trailing comment or a
+        # symlinked file makes the script keep today's value.
+        self.assertEqual(rate(good.replace("\n", "\r\n"), LOG_BACKUP_TPSLIMIT="3"), {"1"})
+        for odd in (good.replace("testhost 1", "testhost\u00a01"), good.replace("testhost 1", "testhost 1 # one")):
+            self.assertEqual(rate(odd, LOG_BACKUP_TPSLIMIT="3"), {"3"}, repr(odd))
+        real = self.tmp / "real.conf"
+        real.write_text(good)
+        budget.unlink()
+        budget.symlink_to(real)
+        open(self.calls, "w").close()
+        self.assertEqual(self.run_script(LOG_BACKUP_BUDGET_FILE=str(budget), LOG_BACKUP_TPSLIMIT="3").returncode, 0)
+        self.assertEqual({c[c.index("--tpslimit") + 1] for c in self.copies()}, {"3"})
         budget.unlink()
         open(self.calls, "w").close()
         self.assertEqual(self.run_script(LOG_BACKUP_BUDGET_FILE=str(budget)).returncode, 0)

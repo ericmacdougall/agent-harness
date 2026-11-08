@@ -824,10 +824,11 @@ class DropboxBudget(unittest.TestCase):
 
     def test_the_shipped_file_is_valid_and_sets_the_ruled_shares(self):
         shares = guard.budget_shares(HOOKS / "dropbox_budget.conf")
-        self.assertEqual(shares, {"account": 8, "log-backup.Mac-2": 2, "log-backup.t2-dev": 1, "agent-bulk": 4,
+        # Main's ruling after PR 129 review MAJOR-1: the total sits below the observed onset (about 7/s).
+        self.assertEqual(shares, {"account": 6, "log-backup.Mac-2": 2, "log-backup.t2-dev": 1, "agent-bulk": 2,
                                   "reserve": 1})
         self.assertIn("ASSUMPTION", (HOOKS / "dropbox_budget.conf").read_text())
-        self.assertEqual(guard.LANE_TPS, 4)
+        self.assertEqual(guard.LANE_TPS, 2)   # the shipped share, below the built-in 4, so this proves the file is read
         import install
         self.assertIn("dropbox_budget.conf", install.HOOKS)
 
@@ -839,6 +840,28 @@ class DropboxBudget(unittest.TestCase):
                        "account 8\nagent-bulk 2\nagent-bulk 1\n", ""):
             self.assertEqual(guard.lane_tps(self.write(broken)), 4, broken)
         self.assertEqual(guard.lane_tps(Path("/nonexistent/b.conf")), 4)
+
+    def test_one_line_rule_shared_with_log_backup(self):
+        # Review m4: CRLF line ends are accepted by both readers; anything else odd makes both fall back.
+        self.assertEqual(guard.lane_tps(self.write("account 8\r\nagent-bulk 2\r\nreserve 1\r\n")), 2)
+        for odd in ("account 8\nagent-bulk\u00a02\n", "account 8\nagent-bulk 2 # two\n", " account 8\nagent-bulk 2\n",
+                    "account 8\nagent-bulk 2\x0bx 1\n"):
+            self.assertEqual(guard.lane_tps(self.write(odd)), 4, repr(odd))
+
+    def test_the_budget_read_is_bounded_and_never_follows_a_link_or_fifo(self):
+        # Review m3: at most 64 KiB is read (a bigger file is invalid), and a symlink or FIFO is refused without
+        # blocking the hook.
+        big = self.write("account 8\nagent-bulk 2\n" + "# pad\n" * 20000)
+        self.assertGreater(big.stat().st_size, 65536)
+        self.assertEqual(guard.lane_tps(big), 4)
+        link = big.parent / "link.conf"
+        link.symlink_to(self.write("account 8\nagent-bulk 2\n"))
+        self.assertEqual(guard.lane_tps(link), 4)
+        fifo = big.parent / "fifo.conf"
+        os.mkfifo(fifo)
+        start = time.time()
+        self.assertEqual(guard.lane_tps(fifo), 4)
+        self.assertLess(time.time() - start, 2)
 
 
 class AbsurdBounds(ScratchHome):

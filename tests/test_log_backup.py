@@ -241,6 +241,15 @@ class Status(Base):
         with contextlib.redirect_stdout(out):
             lb.main(["--home", str(self.home), "check"])
         self.assertNotIn("rate limit", out.getvalue())
+        # Review m1: a run whose tier 1 succeeded writes last-ok with the same stamp as its throttled marker (the bulk
+        # tier was throttled). A later stale backup must not be blamed on that throttle.
+        same = stamp(time.time() - 4000)
+        self.last_ok(same + " sources=6\n")
+        (self.logs / "log-backup.throttled").write_text(same + " stopped at .agent-harness/work others=0\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(lb.main(["--home", str(self.home), "check"]), 1)
+        self.assertNotIn("rate limit", out.getvalue())
 
     def test_malformed_pid_values_do_not_crash_status_or_check(self):
         self.last_ok(stamp(time.time()))

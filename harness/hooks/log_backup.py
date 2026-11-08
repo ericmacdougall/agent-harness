@@ -181,7 +181,9 @@ def throttle_note(home: Path) -> str:
     if when is None:
         return ""
     last_ok = parse_stamp(read_small(logs_dir(home) / LAST_OK))
-    if last_ok is not None and last_ok > when:
+    # A run whose tier 1 succeeded but whose bulk tier was throttled writes both with the same stamp (review m1):
+    # that throttle did not cost the transcripts, so it must not explain a later stale backup.
+    if last_ok is not None and last_ok >= when:
         return ""
     return (f" The run of {printable(text.split()[0])} stopped early on the Dropbox write rate limit "
             f"({THROTTLED}); other uploads to the same account share its write budget.")

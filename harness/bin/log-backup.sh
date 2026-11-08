@@ -30,6 +30,8 @@
 #                           copies while a tier-1 run holds the run lock, and a copy in flight when one starts is
 #                           stopped and its chunk sent again later. Tier 1 always copies at the full TPSLIMIT. The
 #                           launchd plist leaves it off (0) until three tier-1 runs in a row finish inside the budget.
+#   LOG_BACKUP_BUDGET_FILE  the shared Dropbox budget (default ~/.claude/hooks/dropbox_budget.conf, goodqa#15218):
+#                           its log-backup.<host> share is the rate when LOG_BACKUP_TPSLIMIT is unset, else a ceiling
 #   LOG_BACKUP_BULK_TPS     the lane's rate (default TPSLIMIT, 1-99, never more than TPSLIMIT)
 #   LOG_BACKUP_LANE_POLL_SECONDS  how often a lane copy checks for a tier-1 run (default 2, 1-60)
 #   LOG_BACKUP_LANE_BUDGET_SECONDS  wall time of one lane run (default 10800); the next scheduled run starts another
@@ -77,11 +79,13 @@ done
 # One write budget for the whole Dropbox account (goodqa#15218): this host's share in the budget file caps TPSLIMIT.
 # A missing or invalid file, or one without a share for this host, leaves today's value (LOG_BACKUP_TPSLIMIT or 1).
 BUDGET_FILE=${LOG_BACKUP_BUDGET_FILE:-$HOME/.claude/hooks/dropbox_budget.conf}
+# The line rule is the one heavy_job_guard.budget_shares applies (keep the two in step).
 budget_share=
-if [ -f "$BUDGET_FILE" ] && [ ! -L "$BUDGET_FILE" ]; then
-  budget_share=$(awk -v want="log-backup.$HOST" '
-    /^[ \t]*(#|$)/ {next}
-    NF != 2 || $2 !~ /^[1-9][0-9]?$/ || ($1 in v) {bad = 1; next}
+if [ ! -L "$BUDGET_FILE" ] && [ -f "$BUDGET_FILE" ] && [ "$(wc -c < "$BUDGET_FILE" 2>/dev/null)" -le 65536 ]; then
+  budget_share=$(LC_ALL=C awk -v want="log-backup.$HOST" '
+    {sub(/\r$/, "")}
+    /^[ \t]*(#.*)?$/ {next}
+    $0 !~ /^[A-Za-z0-9._-]+[ \t]+[1-9][0-9]?[ \t]*$/ || ($1 in v) {bad = 1; next}
     {v[$1] = $2 + 0; if ($1 != "account") sum += $2}
     END {if (bad || !("account" in v) || sum > v["account"] || !(want in v)) exit 1; print v[want]}' "$BUDGET_FILE") \
     || budget_share=
