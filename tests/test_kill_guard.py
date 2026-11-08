@@ -371,6 +371,44 @@ class Ownership(WorldCase):
                 self.assertEqual(self.decide(command, world=world)[0], 'block')
         self.assertEqual(self.decide('netwatch orphans --kill --pid 4103', world=world)[1], 'not-yours')
 
+    def test_main_in_home_can_use_netwatch_after_basic_checks(self):
+        # #134 made every netwatch kill need a worktree; main runs from HOME, which is never a worktree
+        world = json.loads(json.dumps(WORLD))
+        world['pids'].update({
+            '4201': {'uid': 1000, 'comm': 'node', 'cwd': '/tmp/elsewhere', 'argv': ['node', 'dev.js'], 'start': 'n1'},
+            '4202': {'uid': 1000, 'comm': 'zsh', 'cwd': '/tmp', 'argv': ['-zsh'], 'start': 'n2'},
+        })
+
+        def decide(cmd, main):
+            own = kg.Ownership(world['home'], home=world['home'], probe=FakeProbe(world),
+                               runner=lambda *a, **k: None, policy=POLICY)
+            return kg.decide(cmd, cwd=world['home'], ownership=own, policy=POLICY, home=self.home, main=main)
+
+        self.assertEqual(decide('netwatch orphans --kill --pid 4201', True)[0], 'allow')
+        self.assertEqual(decide('netwatch orphans --kill --pid 4201', False)[:2], ('block', 'not-yours'))  # sub-agent
+        self.assertEqual(decide('kill 4201', True)[0], 'block')  # only the netwatch route
+        for command in ('netwatch orphans --kill --pid 4008', 'netwatch orphans --kill --pid 4009',
+                        'netwatch orphans --kill --pid 4202', 'netwatch orphans --kill --pid %d' % os.getpid(),
+                        'netwatch orphans --kill --pid 4201,4008', 'netwatch orphans --kill --all',
+                        'netwatch orphans --kill --pid 9999'):
+            with self.subTest(command=command):
+                self.assertEqual(decide(command, True)[0], 'block')
+
+    def test_hook_payload_without_agent_id_is_main(self):
+        seen = []
+        real = kg.decide
+
+        def spy(command, **kw):
+            seen.append(kw.get('main'))
+            return 'allow', '', '', ()
+        with mock.patch.object(kg, 'decide', spy):
+            for payload in ({'tool_name': 'Bash', 'tool_input': {'command': 'netwatch orphans'}, 'cwd': '/'},
+                            {'tool_name': 'Bash', 'tool_input': {'command': 'netwatch orphans'}, 'cwd': '/',
+                             'agent_id': 'sub'}):
+                kg.analyze_main(json.dumps(payload).encode())
+        self.assertEqual(seen, [True, False])
+        self.assertIs(kg.decide, real)
+
     def test_malformed_pids(self):
         for cmd in ('kill 001', 'kill １２３', 'kill 4194305', 'kill +4001', 'kill 0x4001', 'kill 4001abc', 'kill -- -4001'):
             self.assertEqual(self.decide(cmd)[0], 'block', cmd)
