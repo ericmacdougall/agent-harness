@@ -226,7 +226,7 @@ class WorktreeRemoveMerged(WorktreeRemoveCase):
         self.assertIsNotNone(self.refusal())
         self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
         git(self.linked, 'reset', '-q', '--hard', 'HEAD~1')
-        self.assertIsNone(self.refusal())
+        self.assertIn('reflog', self.refusal())  # the abandoned commit now lives only in this worktree's reflog
         # dirty
         (self.linked / 'a.txt').write_text('changed\n')
         self.assertIn('not clean', self.refusal())
@@ -254,3 +254,25 @@ class WorktreeRemoveMerged(WorktreeRemoveCase):
         plain = self.home / 'plain'; plain.mkdir()
         self.assertIsNone(self.refusal(cwd=plain))
         self.assertEqual(self.decide('git worktree remove %s' % self.linked, cwd=plain)[0], 'allow')
+
+    def test_commit_reachable_only_from_the_worktree_reflog_or_private_refs_blocks(self):
+        # red-team F1: a detached commit made and then abandoned lives only in this worktree's admin directory
+        self.advance_main()
+        git(self.linked, 'checkout', '-q', '--detach')
+        (self.linked / 'wip.txt').write_text('wip\n')
+        git(self.linked, 'add', 'wip.txt'); git(self.linked, 'commit', '-q', '-m', 'WIP detached')
+        git(self.linked, 'checkout', '-q', '--detach', 'main')
+        self.assertIn('reflog', self.refusal())
+        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
+
+    def test_private_worktree_ref_blocks_and_branch_kept_commits_do_not(self):
+        self.advance_main()
+        git(self.linked, 'update-ref', 'refs/worktree/keep', git(self.linked, 'rev-parse', 'HEAD'))
+        self.assertIn('private refs', self.refusal())
+        git(self.linked, 'update-ref', '-d', 'refs/worktree/keep')
+        self.assertIsNone(self.refusal())
+        # a commit that only a shared branch keeps survives the removal, so it does not block
+        (self.linked / 'kept.txt').write_text('kept\n')
+        git(self.linked, 'add', 'kept.txt'); git(self.linked, 'commit', '-q', '-m', 'on branch')
+        git(self.linked, 'checkout', '-q', '--detach', 'main')
+        self.assertIsNone(self.refusal())

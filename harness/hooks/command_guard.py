@@ -1663,6 +1663,23 @@ def linked_worktree_remove_refusal(path, cwd, policy=None):
                 return 'a remote-tracking ref is stale or names a moved/deleted remote branch; fetch --prune first'
         if not any(head in live.values() for live in live_all.values()) and not merged(head):
             return 'the exact HEAD is not present on a live allowlisted remote (unpublished or detached-unpublished)'
+        # Removing the worktree deletes its own admin directory: the HEAD reflog and refs/worktree, refs/bisect and
+        # refs/rewritten live there. A commit reachable only from those would be lost (red-team F1), so it must be
+        # published, or kept by a shared branch, tag or remote-tracking ref.
+        if _git_out(path, ['for-each-ref', '--count=1', 'refs/worktree', 'refs/bisect', 'refs/rewritten'],
+                    min(left(), 2.0)).strip():
+            return 'the worktree holds private refs (refs/worktree, refs/bisect or refs/rewritten)'
+        entries = [e for e in _git_out(path, ['reflog', 'show', '--format=%H', 'HEAD'], min(left(), 3.0)).split() if e]
+        if len(entries) > 300:
+            return 'the worktree HEAD reflog is too long to check'
+        live_shas = {sha for live in live_all.values() for sha in live.values()}
+        for sha in dict.fromkeys(entries):
+            if not re.fullmatch(r'[0-9a-f]{40,64}', sha) or sha in live_shas or merged(sha):
+                continue
+            if _git_out(path, ['for-each-ref', '--count=1', '--contains', sha, 'refs/heads', 'refs/tags', 'refs/remotes'],
+                        min(left(), 3.0)).strip():
+                continue
+            return 'a commit only this worktree HEAD reflog reaches would be lost with the worktree'
         return None
     except Exception as error:  # noqa: BLE001 - every surprise keeps the ordinary refusal
         return 'could not verify (%s)' % type(error).__name__
