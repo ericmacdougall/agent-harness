@@ -106,6 +106,9 @@ DEFAULT_POLICY = {
                     # goodqa#14908: prod_delete_guard's signed grant store and its key; only `grant` writes them
                     '{home}/.agent-harness/state/prod-delete-grants.json',
                     '{home}/.agent-harness/state/prod-delete.key'],
+    # path suffixes (/-separated, case-folded) of checkouts a timer or service builds from; a directory holding a
+    # `.harness-owned` file is owned too. goodqa#15307
+    'owned_checkouts': [],
     'credential_path_regexes': [
         r'(^|/)\.config/rclone/rclone\.conf$', r'(^|/)rclone\.conf$',
         r'(^|/)\.aws/credentials$', r'(^|/)\.aws/sso/cache/[^/]+$',
@@ -161,7 +164,7 @@ ALWAYS_ENFORCED = (SECRET_DUMP, LOG_DELETE)
 ADDITIVE_LISTS = ('protected_log_roots', 'protected_segment_names', 'protected_file_names', 'protected_file_suffixes',
                   'protected_roots', 'keep_names', 'keep_suffixes', 'keep_segments', 'generic_homes', 'ancestor_roots',
                   'state_files', 'credential_path_regexes', 'credential_dirs', 'credential_samples',
-                  'rclone_blocked_config', 'guard_files')
+                  'rclone_blocked_config', 'guard_files', 'owned_checkouts')
 
 
 def _merge(base, override):
@@ -3471,6 +3474,61 @@ class Analyzer:
             self.subs(r, depth, visible=False)
 
     # ---- git
+    OWNED_CHANGES = frozenset(('checkout', 'switch', 'reset', 'pull', 'merge', 'rebase', 'clean', 'stash', 'restore',
+                               'cherry-pick', 'revert', 'commit', 'am', 'apply', 'rm', 'mv', 'add', 'update-ref',
+                               'symbolic-ref', 'read-tree', 'checkout-index', 'branch', 'tag', 'gc', 'prune'))
+
+    def owned_checkout(self, sub, rest, cwd_word):
+        """goodqa#15307: an agent's git command may not change a checkout a timer or service builds from. Owned means a
+        `.harness-owned` marker in the directory or a parent (first line `owner: ...`, optional `branch: NAME`, default
+        main), or a policy owned_checkouts suffix (for a checkout on another host the marker cannot be read from here).
+        Reads, fetch and linked worktrees stay allowed, and so does `git checkout|switch <declared branch>`, which only
+        restores the state the owner expects."""
+        if sub not in self.OWNED_CHANGES:
+            return
+        ctx = self.ctx
+        where = norm_path(cwd_word.text, ctx, ctx.cwd) if cwd_word is not None else ctx.cwd
+        if not where or '$' in where:
+            return
+        owner, branch = self.owned_dir(where)
+        if owner is None:
+            return
+        if sub in ('checkout', 'switch') and rest == [branch]:
+            return
+        ctx.add(LOG_DELETE, 'owned-checkout',
+                'git %s changes %s, a checkout owned by %s that a timer or service builds from' % (sub, where, owner),
+                'work in your own git worktree (git worktree add) or export (git archive); to restore the owner\'s state '
+                'use git checkout %s alone' % branch)
+
+    def owned_dir(self, path):
+        """(owner, branch) when path is inside an owned checkout, else (None, None)."""
+        folded = path.replace('\\', '/').rstrip('/').casefold()
+        for suffix in self.ctx.c.policy.get('owned_checkouts', []):
+            suf = suffix.replace('\\', '/').strip('/').casefold()
+            if suf and (folded.endswith('/' + suf) or ('/' + suf + '/') in folded + '/'):
+                return 'policy:' + suffix, 'main'
+        cur = path
+        for _ in range(64):
+            marker = os.path.join(cur, '.harness-owned')
+            try:
+                if os.path.isfile(marker):
+                    owner, branch = 'a harness-owned marker', 'main'
+                    with open(marker, encoding='utf-8', errors='replace') as handle:
+                        for line in handle.read(4096).splitlines():
+                            key, _, value = line.partition(':')
+                            if key.strip() == 'owner' and value.strip():
+                                owner = value.strip()[:80]
+                            elif key.strip() == 'branch' and value.strip():
+                                branch = value.strip()[:80]
+                    return owner, branch
+            except OSError:
+                pass
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        return None, None
+
     def git(self, args, words):
         ctx = self.ctx
         texts = [a.text for a in args]
@@ -3488,6 +3546,7 @@ class Analyzer:
                 break
         sub = texts[i] if i < len(texts) else ''
         rest = texts[i + 1:]
+        self.owned_checkout(sub, rest, cwd_word)
         if sub == 'clean':
             self.git_clean(args[i + 1:], rest, cwd_word)
         if sub == 'worktree' and rest[:1] == ['remove'] and self._removable_linked_worktree(args[i + 1:]):
