@@ -81,6 +81,8 @@ OVERRIDDEN = ('apply', 'command', 'dispatch', 'inner_words', 'script', 'ssh', 'c
 
 SSH_GLOB_LINE_FIX = True  # goodqa#15365; tests/test_kill_guard_ssh_glob.py flips it in a copy to prove the tests catch a regression
 
+LOOKUP_HEAD_FIX = True  # goodqa#15377; tests/test_kill_guard_lookup_head.py flips it in a copy to prove the tests catch a regression
+
 DEFAULT_POLICY = {
     'mode': 'enforce',
     'broad_verbs': ['pkill', 'killall', 'killall5', 'skill', 'slay', 'fkill', 'kill-port', 'killport'],
@@ -1189,7 +1191,10 @@ def make_analyzer_class(cg):
             if name.startswith('g') and name[1:] in GNU_PREFIXED:
                 return self.apply(name[1:], words, cmd, pl, idx, depth)  # Homebrew coreutils: gtimeout, gxargs ...
             args = words[1:]
-            if name in ('command', 'builtin', 'type', 'which', 'whereis', 'hash') and not words[0].vars and (
+            # goodqa#15377: a head that is a whole command line (it holds a space) is re-parsed below; its last path segment
+            # (`... ; ls /x/which`) is not a lookup command, so the early return must not apply to it.
+            whole_line = LOOKUP_HEAD_FIX and ' ' in words[0].text.strip() and not words[0].text.strip().startswith('-')
+            if name in ('command', 'builtin', 'type', 'which', 'whereis', 'hash') and not words[0].vars and not whole_line and (
                     name in ('type', 'which', 'whereis', 'hash') or leading_lookup(args)):
                 return None  # asks where a program is; runs nothing. Not for a held name: K=(env); (K=(which)); "${K[@]}"
             if name in ('export', 'declare', 'local', 'readonly', 'typeset'):
