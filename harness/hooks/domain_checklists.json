@@ -2,7 +2,9 @@
   "schema": 1,
   "sources": [
     "https://scs.owasp.org/sctop10 (OWASP Smart Contract Top 10 2026, checked 2026-11-04)",
-    "https://getfoundry.sh/forge/invariant-testing (checked 2026-11-04)"
+    "https://getfoundry.sh/forge/invariant-testing (checked 2026-11-04)",
+    "https://owasp.org/www-project-top-ten/ (OWASP Top 10, authentication and access control, reference, not fetched by the author)",
+    "https://stripe.com/docs/api/idempotent_requests (idempotency keys, reference, not fetched by the author)"
   ],
   "items": {
     "reentrancy": {
@@ -136,6 +138,360 @@
       ],
       "neg": "{subject} must reject stale, zero, out-of-range or manipulated external data (price, rate, message) for {surface}, including single-block flash-loan manipulation, and must fail safe when the source is unavailable.",
       "verify": "Mock oracle returning stale/zero/extreme values and a fork test that manipulates a pool within one transaction."
+    },
+    "pre-account-hijack": {
+      "title": "Pre-account hijack",
+      "keywords": [
+        "pre-account",
+        "hijack",
+        "unverified email",
+        "pre-hijack"
+      ],
+      "neg": "{subject} must not let an attacker pre-register or pre-link an identifier (email, phone, social login) before the real owner signs up and then take over the account; test a pre-created unverified account against {surface} and assert the later verified owner gets a fresh account or the squatter session and credentials are revoked.",
+      "verify": "Test: attacker registers victim email unverified, victim signs up via SSO or magic link, assert the attacker password and sessions no longer work. Verify that unverified identifiers never merge into verified accounts."
+    },
+    "lookalike-identifier": {
+      "title": "Lookalike email and username identifiers",
+      "keywords": [
+        "homoglyph",
+        "lookalike",
+        "unicode",
+        "normalization",
+        "confusable"
+      ],
+      "neg": "{subject} must treat Unicode homoglyph, case, plus-address and normalization variants of an email or username as distinct or as the same by one explicit rule; test confusable identifiers (Cyrillic a, fullwidth, trailing dot, NFC vs NFD) against {surface} and assert no impersonation, duplicate account or collision bypass.",
+      "verify": "Table-driven test of confusable and normalization pairs for registration, login, invite and password reset; assert one canonicalization function is used on every path and that lookups and uniqueness constraints agree."
+    },
+    "request-device-binding": {
+      "title": "Approval bound to the requesting device",
+      "keywords": [
+        "device binding",
+        "bound to the requesting",
+        "device-bound",
+        "requesting device",
+        "approval binding"
+      ],
+      "neg": "{subject} must bind every approval, magic link or login code to the device and session that requested it; test approving a request from a second device or another account on {surface} and assert it cannot complete the first device login.",
+      "verify": "Two-client test: device A requests, device B holds the link or code; assert B cannot mint a session for A and A cannot complete without its own binding secret (PKCE-style verifier or device code)."
+    },
+    "link-expiry-single-use": {
+      "title": "Link expiry and single use",
+      "keywords": [
+        "single use",
+        "single-use",
+        "expiry",
+        "expired",
+        "reuse",
+        "one-time"
+      ],
+      "neg": "{subject} must make every emailed link, code and token expire and work once; test replaying a consumed token, using an expired one and requesting a new one on {surface}, and assert the old token is invalid, consumption is atomic under concurrent use, and tokens are stored hashed.",
+      "verify": "Replay and concurrent-redeem tests with a controlled clock; assert one success among N parallel redeems, expiry at the boundary, and invalidation of earlier tokens when a new one is issued."
+    },
+    "session-fixation": {
+      "title": "Session fixation and rotation",
+      "keywords": [
+        "session fixation",
+        "fixation",
+        "rotation",
+        "rotate session",
+        "session id"
+      ],
+      "neg": "{subject} must issue a new session identifier at login, privilege change and password change, and revoke other sessions where the spec says so; test a pre-set session id carried through {surface} and assert it is not accepted after authentication.",
+      "verify": "Test: set a session cookie before login, authenticate, assert the identifier changed and the old one is rejected; assert logout and password change invalidate server-side state, not only the cookie."
+    },
+    "rate-limit-enumeration": {
+      "title": "Rate limiting and account enumeration",
+      "keywords": [
+        "rate limit",
+        "enumeration",
+        "lockout",
+        "brute force",
+        "throttle"
+      ],
+      "neg": "{subject} must not reveal whether an account exists through response text, status code or timing, and must throttle guessing; test known and unknown identifiers against {surface} and assert identical responses and a per-identifier and per-source limit that an attacker cannot reset or use to lock out the owner.",
+      "verify": "Compare response body, status and latency distributions for existing vs absent accounts; send a burst and assert 429 behavior, that the limit key cannot be rotated by header spoofing, and that lockout is not a denial of service on the owner."
+    },
+    "store-billing-exposure": {
+      "title": "Account state that changes billing or entitlement",
+      "keywords": [
+        "billing",
+        "entitlement",
+        "subscription",
+        "plan change",
+        "store"
+      ],
+      "neg": "{subject} must not let an account merge, link, deletion, recovery or role change alter billing, subscription or entitlement without the paying owner; test each account-state transition on {surface} and assert purchases, plans and store receipts stay with the verified owner.",
+      "verify": "Matrix test of account transitions (merge, link, delete, recover, transfer) against entitlement and billing state; assert no free upgrade, no loss of a paid plan and an audit entry for each change."
+    },
+    "backup-before-delete": {
+      "title": "Verified backup before delete",
+      "keywords": [
+        "backup",
+        "verified copy",
+        "restore",
+        "checksum"
+      ],
+      "neg": "{subject} must not remove data until a verified copy exists elsewhere; test {surface} with a failed or truncated backup and assert the delete is refused, and that the copy was read back and checksummed, not just written.",
+      "verify": "Test: corrupt or truncate the backup and assert refusal; restore from the backup into a scratch location and compare checksums or counts before the delete runs."
+    },
+    "unpushed-work-detection": {
+      "title": "Unpushed and uncommitted work detection",
+      "keywords": [
+        "unpushed",
+        "uncommitted",
+        "dirty",
+        "untracked",
+        "stash"
+      ],
+      "neg": "{subject} must detect unpushed commits, uncommitted and untracked files, stashes and unmerged branches before removing a checkout, worktree or branch; test {surface} with each kind of local-only work and assert nothing is deleted without an explicit override.",
+      "verify": "Fixture repo per case (dirty file, untracked file, unpushed commit, stash, unmerged branch); assert refusal and that the message names the at-risk item."
+    },
+    "dry-run-diff": {
+      "title": "Dry run with an exact diff",
+      "keywords": [
+        "dry run",
+        "dry-run",
+        "preview",
+        "diff of"
+      ],
+      "neg": "{subject} must show exactly what {surface} will remove before it acts, and the deletion must act on that same list; test that an item added after the preview is not deleted.",
+      "verify": "Run the dry run, mutate the target set, then run apply with the previewed list and assert only previewed items change and the rest is reported as skipped."
+    },
+    "scope-pinning": {
+      "title": "Scope pinning to an exact path list",
+      "keywords": [
+        "scope pin",
+        "pinned",
+        "exact path",
+        "glob",
+        "allowlist"
+      ],
+      "neg": "{subject} must delete only an exact, resolved list of paths approved up front, never a glob or filter re-resolved at execution time; test symlinks, path traversal, a path replaced by a link and a pattern that now matches more on {surface}.",
+      "verify": "Test with symlink-to-outside, ../ traversal, case-fold collisions and a directory swapped after approval; assert realpath is checked inside the pinned root and the count matches the approved list."
+    },
+    "cross-host-approval-portability": {
+      "title": "Approval does not travel across hosts",
+      "keywords": [
+        "cross-host",
+        "approval",
+        "other host",
+        "portable approval"
+      ],
+      "neg": "{subject} must not let an approval given for one host, path or environment authorize deletion on another; test replaying an approval recorded for host A against host B and for a production target on {surface}, and assert it is refused.",
+      "verify": "Test: approval token bound to host id, target path and expiry; replay on another host and after expiry and assert refusal with a message naming the mismatch."
+    },
+    "idempotent-retry": {
+      "title": "Idempotent and resumable delete",
+      "keywords": [
+        "idempotent",
+        "retry",
+        "resume",
+        "partial failure",
+        "rerun"
+      ],
+      "neg": "{subject} must be safe to rerun after a crash or timeout; test killing {surface} midway and rerunning, and assert no double effects, no deletion of items that were re-created in between, and an accurate report of what remains.",
+      "verify": "Fault-injection test that kills after each step; rerun and compare final state to a clean run; assert re-created items are not removed and the journal shows completed vs pending."
+    },
+    "idempotency-key": {
+      "title": "Idempotency key on money movement",
+      "keywords": [
+        "idempotency key",
+        "idempotency",
+        "idempotent",
+        "dedupe"
+      ],
+      "neg": "{subject} must attach a stable idempotency key to every charge, payout and transfer, kept across retries and restarts; test a lost response and retry on {surface} and assert exactly one movement and a conflict error for the same key with a different payload.",
+      "verify": "Test: send the same request twice and with a changed amount under one key; assert one ledger entry, the second returns the first result, and the key survives a process restart."
+    },
+    "double-submit": {
+      "title": "Double submit and concurrent requests",
+      "keywords": [
+        "double submit",
+        "double-click",
+        "concurrent",
+        "race"
+      ],
+      "neg": "{subject} must not move money twice on a double click, two tabs or concurrent requests; test parallel submissions on {surface} and assert one effect, a disabled control while pending, and correct state after a delayed response.",
+      "verify": "Parallel request test (N identical submits) plus a UI test of double click and edit-while-pending; assert one transaction and consistent balance."
+    },
+    "currency-precision": {
+      "title": "Currency and decimal precision",
+      "keywords": [
+        "currency",
+        "decimal",
+        "rounding",
+        "minor unit",
+        "precision"
+      ],
+      "neg": "{subject} must hold amounts as integer minor units or exact decimals with an explicit currency and rounding rule; test fractional cents, zero-decimal and three-decimal currencies, overflow and mixed currencies on {surface}, and assert no float arithmetic and no silent rounding.",
+      "verify": "Property test over amounts and splits asserting the parts sum to the whole; boundary tests for JPY, KWD, very large values and negative amounts; static check that no float type touches amounts."
+    },
+    "refund-reversal-path": {
+      "title": "Refund and reversal path",
+      "keywords": [
+        "refund",
+        "reversal",
+        "chargeback",
+        "void",
+        "credit note"
+      ],
+      "neg": "{subject} must provide a tested reversal for every money movement, bounded by the original amount; test partial, repeated and post-settlement refunds and a chargeback on {surface}, and assert totals never exceed what was captured and entitlements follow.",
+      "verify": "Test partial refund twice, refund above the original, refund after a payout and a dispute; assert the ledger balances and the customer-visible state matches."
+    },
+    "ledger-reconciliation": {
+      "title": "Ledger reconciliation with the processor",
+      "keywords": [
+        "reconcile",
+        "reconciliation",
+        "ledger",
+        "settlement",
+        "discrepancy"
+      ],
+      "neg": "{subject} must reconcile its ledger against the processor or bank records and surface a discrepancy; test a missing webhook, a duplicated webhook and an out-of-order event on {surface}, and assert the ledger converges and an alert names the gap.",
+      "verify": "Replay a processor export against the ledger with injected drift; assert every mismatch is reported, webhooks are verified and idempotent, and the daily total equals the processor total."
+    },
+    "authorization-vs-capture": {
+      "title": "Authorization versus capture",
+      "keywords": [
+        "authorization",
+        "authorisation",
+        "capture",
+        "hold",
+        "pre-auth"
+      ],
+      "neg": "{subject} must distinguish an authorization from a capture and release uncaptured holds; test an expired authorization, a capture above the authorized amount and a cancelled order on {surface}, and assert funds are never granted before capture and holds are released.",
+      "verify": "State-machine test across authorize, capture, void and expiry; assert no entitlement before capture and that the processor state and local state agree after each transition."
+    },
+    "device-identity-binding": {
+      "title": "Device identity binding",
+      "keywords": [
+        "device identity",
+        "device id",
+        "attestation",
+        "enrollment",
+        "bound to the device"
+      ],
+      "neg": "{subject} must bind credentials and grants to a device identity that cannot be copied or spoofed by replaying an identifier; test a cloned identifier, a re-imaged device and a second device with the same name on {surface} and assert they are rejected or re-enrolled explicitly.",
+      "verify": "Test: reuse another device id and token from a second client, reset the device and re-enroll; assert the old credential is revoked and the audit log names both devices."
+    },
+    "unattended-recovery": {
+      "title": "Unattended recovery",
+      "keywords": [
+        "unattended",
+        "headless",
+        "recovery",
+        "no one at the machine",
+        "person-at-machine"
+      ],
+      "neg": "{subject} must recover without a person at the machine unless the spec says a person is required; test a reboot, a lost session and a stuck prompt on {surface} with nobody present, and assert it returns to a working state or raises a remote-visible alert.",
+      "verify": "Reboot and kill the agent on an idle headless host; assert automatic recovery within the stated bound, or a remote alert, with no dialog that needs a local click."
+    },
+    "grant-durability": {
+      "title": "Grant durability",
+      "keywords": [
+        "grant",
+        "always allow",
+        "expire",
+        "expiry",
+        "durable"
+      ],
+      "neg": "{subject} must not let approvals or grants expire or re-prompt silently; test the grant after a restart, an update and the passage of time on {surface}, and assert it still holds or the loss is visible and recoverable.",
+      "verify": "Restart, update and advance the clock past any TTL; assert the grant persists, or that expiry is explicit in the spec, logged and alerted."
+    },
+    "remote-exec-audit": {
+      "title": "Remote execution audit",
+      "keywords": [
+        "remote exec",
+        "remote command",
+        "audit",
+        "command log",
+        "shell"
+      ],
+      "neg": "{subject} must record who ran what, on which device and when, for every remote command on {surface}, with secrets redacted; test a command, a failed command and a rejected command and assert each yields an audit entry that cannot be altered by the target.",
+      "verify": "Run allowed, denied and failing commands; assert complete append-only audit records with actor, device, command digest and result, and that secrets do not appear."
+    },
+    "factory-reset-guard": {
+      "title": "Factory reset and wipe guard",
+      "keywords": [
+        "factory reset",
+        "wipe",
+        "reset",
+        "destructive device"
+      ],
+      "neg": "{subject} must not factory reset, wipe or unenroll a device without a bound, fresh, explicit approval for that device; test a replayed approval, a wrong-device id and a bulk request on {surface} and assert refusal and an audit entry.",
+      "verify": "Test with a stale approval, an approval for another device and a fleet-wide call; assert nothing is wiped and the refusal names the mismatch."
+    },
+    "derived-gate-floor-with-ratchet": {
+      "title": "Derived gate floor with ratchet",
+      "keywords": [
+        "floor",
+        "ratchet",
+        "test count",
+        "baseline",
+        "hard-coded"
+      ],
+      "neg": "{subject} must derive any minimum (test count, coverage, size) from the previous release and only let it rise; test {surface} by deleting tests and by adding tests, and assert the gate fails on a drop and the floor ratchets up, with no hard-coded number in the gate.",
+      "verify": "Delete a test and assert the gate fails against the derived floor; add tests and assert the stored floor rises; grep the gate source for literal counts."
+    },
+    "artifact-inventory-mirrored": {
+      "title": "Artifact inventory mirrored at build time",
+      "keywords": [
+        "artifact inventory",
+        "mirror",
+        "dropbox",
+        "signed artifact",
+        "second host"
+      ],
+      "neg": "{subject} must store every signed artifact on at least two hosts or Dropbox at build time, listed in an inventory; test {surface} with one host unavailable and assert the build fails or flags it when an artifact exists on only one host.",
+      "verify": "At build end, compare the inventory with each location by checksum; remove one copy and assert the check fails naming the artifact that exists on only one host."
+    },
+    "self-update-e2e": {
+      "title": "Self-update from the previous version",
+      "keywords": [
+        "self-update",
+        "self update",
+        "auto-update",
+        "update from",
+        "n-1"
+      ],
+      "neg": "{subject} must prove an update from version N-1 to N on an idle headless host; test the real updater on {surface} and assert the new version runs, state is preserved and a failed update leaves the old version working.",
+      "verify": "Install N-1 on an idle headless host, publish N to the feed, observe the update through logs and version output, then repeat with a corrupt payload and assert rollback to N-1."
+    },
+    "transport-proof": {
+      "title": "Prove the transport you will use",
+      "keywords": [
+        "transport",
+        "mcp",
+        "rest",
+        "error body",
+        "smoke"
+      ],
+      "neg": "{subject} must be exercised over the exact transport the integration will use (for example MCP, not only REST) with real credentials, and error bodies must be captured; test {surface} and assert a 403 or error over that transport is recorded verbatim in the evidence.",
+      "verify": "Smoke test through the production transport and auth path, saving status and body for success and for forced failures; assert the evidence contains response bodies, not only status codes."
+    },
+    "rollback-not-blocked": {
+      "title": "Rollback is never blocked",
+      "keywords": [
+        "rollback",
+        "roll back",
+        "preflight",
+        "emergency",
+        "revert release"
+      ],
+      "neg": "{subject} must never block an emergency rollback with a preflight, lock or gate; test a rollback on {surface} while a gate is failing and while another release is in flight, and assert it proceeds with an audit note.",
+      "verify": "Force every preflight check to fail and run the rollback path; assert it still completes, restores the previous artifact and records who and why."
+    },
+    "staging-exists": {
+      "title": "Staging rehearsal exists",
+      "keywords": [
+        "staging",
+        "rehearsal",
+        "canary",
+        "preproduction",
+        "pre-production"
+      ],
+      "neg": "{subject} must be rehearsed in a staging environment that matches production for {surface} before release; assert the release record names the staging run, its commit and result, and that a missing staging target fails the release.",
+      "verify": "Run the release against staging and capture the deployed commit and smoke result; assert the production step refuses when no matching staging evidence exists."
     }
   },
   "domains": {
@@ -494,6 +850,71 @@
         "Prove that every journal balances and that redelivery cannot post twice, with a crash between commit and ack.",
         "Check protobuf schema evolution rules and subject-level authorization.",
         "Review amount types end to end for float or overflow."
+      ]
+    },
+    "auth": {
+      "title": "Authentication, sessions and account identity",
+      "subject": "the authentication flow",
+      "surface": "each sign-up, login, recovery, invite and session path",
+      "items": [
+        "pre-account-hijack",
+        "lookalike-identifier",
+        "request-device-binding",
+        "link-expiry-single-use",
+        "session-fixation",
+        "rate-limit-enumeration",
+        "store-billing-exposure"
+      ]
+    },
+    "delete": {
+      "title": "Destructive deletes and cleanup",
+      "subject": "the delete or cleanup operation",
+      "surface": "each path, record or checkout it can remove",
+      "items": [
+        "backup-before-delete",
+        "unpushed-work-detection",
+        "dry-run-diff",
+        "scope-pinning",
+        "cross-host-approval-portability",
+        "idempotent-retry"
+      ]
+    },
+    "money": {
+      "title": "Payments, billing and ledgers",
+      "subject": "the money flow",
+      "surface": "each charge, payout, refund and balance change",
+      "items": [
+        "idempotency-key",
+        "double-submit",
+        "currency-precision",
+        "refund-reversal-path",
+        "ledger-reconciliation",
+        "authorization-vs-capture"
+      ]
+    },
+    "devices": {
+      "title": "Devices, enrollment and remote control",
+      "subject": "the device or fleet feature",
+      "surface": "each enrolled device, grant and remote command",
+      "items": [
+        "device-identity-binding",
+        "unattended-recovery",
+        "grant-durability",
+        "remote-exec-audit",
+        "factory-reset-guard"
+      ]
+    },
+    "release": {
+      "title": "Release, deploy and update pipeline",
+      "subject": "the release process",
+      "surface": "each gate, signed artifact, feed and rollback step",
+      "items": [
+        "derived-gate-floor-with-ratchet",
+        "artifact-inventory-mirrored",
+        "self-update-e2e",
+        "transport-proof",
+        "rollback-not-blocked",
+        "staging-exists"
       ]
     }
   },
