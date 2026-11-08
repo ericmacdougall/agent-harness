@@ -81,9 +81,11 @@ class RefWrite(unittest.TestCase):
 
     def setUp(self):
         os.environ["MERGE_GATE_OLD_SHAS"] = self.oldlist
+        mg.ALLOW_INSTEADOF = True  # the fixtures reach their "GitHub" through insteadOf; test_n1 turns the refusal back on
 
     def tearDown(self):
         os.environ.pop("MERGE_GATE_OLD_SHAS", None)
+        mg.ALLOW_INSTEADOF = False
 
     def run_cmd(self, command, cwd=None):
         payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": cwd or self.repo}
@@ -167,8 +169,9 @@ class RefWrite(unittest.TestCase):
         self.blocked("gh api graphql -f query='%s'" % (q % self.off_main))
 
     def test_h3_api_commit_with_old_parent_blocked(self):
-        self.blocked("gh api -X POST repos/o/r/git/commits -f message=m -f tree=%s -f 'parents[]=%s'" % ("a" * 40, self.off_main))
-        self.ok("gh api -X POST repos/o/r/git/commits -f message=m -f tree=%s -f 'parents[]=%s'" % ("a" * 40, self.on_main))
+        tree = git(self.repo, "rev-parse", self.on_main + "^{tree}")
+        self.blocked("gh api -X POST repos/o/r/git/commits -f message=m -f tree=%s -f 'parents[]=%s'" % (tree, self.off_main))
+        self.ok("gh api -X POST repos/o/r/git/commits -f message=m -f tree=%s -f 'parents[]=%s'" % (tree, self.on_main))
 
     def test_h3_annotated_tag_object_blocked(self):
         self.blocked(self.api("POST", "repos/o/r/git/tags", "tag=v2", "message=m", "object=" + self.off_main, "type=commit"))
@@ -242,6 +245,96 @@ class RefWrite(unittest.TestCase):
     def test_missing_sha_list_fails_closed(self):
         os.environ["MERGE_GATE_OLD_SHAS"] = os.path.join(self.tmp.name, "absent.gz")
         self.blocked(self.api("POST", "repos/o/r/git/refs", "ref=refs/heads/x", "sha=" + self.on_main), needle="sha list")
+
+    # --- delta red-team (round 2) --------------------------------------------------------------------------------------
+    def test_h2_forged_local_origin_main_with_no_tracking_update(self):
+        # without remote.origin.fetch the fetch cannot repair refs/remotes/origin/main, so a mutant that trusts it survives
+        # every other test; the real code uses FETCH_HEAD
+        git(self.repo, "config", "--unset-all", "remote.origin.fetch")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.off_main)
+        try:
+            self.blocked(self.api("POST", "repos/o/r/git/refs", "ref=refs/tags/backup-pin/x", "sha=" + self.off_main), needle="shares no history")
+        finally:
+            git(self.repo, "config", "--add", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+            git(self.repo, "update-ref", "refs/remotes/origin/main", self.on_main)
+
+    def test_n1_insteadof_redirect_refuses(self):
+        mg.ALLOW_INSTEADOF = False
+        self.blocked(self.api("POST", "repos/o/r/git/refs", "ref=refs/tags/v1", "sha=" + self.on_main), needle="insteadOf")
+
+    def test_n2_repositories_alias(self):
+        self.blocked("gh api -X POST repositories/123456/git/refs -f ref=refs/tags/b -f sha=" + self.off_main)
+        self.ok("gh api -X POST repositories/123456/git/refs -f ref=refs/tags/b -f sha=" + self.on_main)
+        self.blocked("gh api -X POST repositories/123456/releases -f tag_name=b -f target_commitish=" + self.off_main)
+        self.blocked("gh api -X PUT repositories/123456/contents/.lanes/x/e.zip -f message=m -f content=QUJD")
+        self.blocked("gh api -X POST /repositories/123456/git/refs -f ref=refs/tags/b -f sha=" + self.off_main)
+
+    GQL = 'mutation { createRef(input:{repositoryId:"R_x", name:"refs/tags/b", oid:%s}) { ref { name } } }'
+
+    def test_n3_block_string_and_decoy_comment(self):
+        quoted = self.GQL % ('"""%s"""' % self.off_main)
+        self.blocked("gh api graphql -f query='%s # oid:\"%s\"'" % (quoted, self.on_main))
+        self.blocked("gh api graphql -f query='%s'" % quoted)
+        decoy = self.GQL % ('"%s"' % self.off_main)
+        self.blocked("gh api graphql -f query='%s # oid:\"%s\"'" % (decoy, self.on_main))
+
+    def test_n4_unicode_escape_in_aliased_mutation(self):
+        q = ('mutation { a: createRef(input:{repositoryId:"R_x", name:"refs/tags/a", oid:"%s"}) { clientMutationId } '
+             'b: createRef(input:{repositoryId:"R_x", name:"refs/tags/b", oid:"\\u0030%s"}) { clientMutationId } }') % (self.on_main, self.off_main[1:])
+        self.blocked("gh api graphql -f query='%s'" % q)
+
+    def test_n4_plain_aliases_each_judged(self):
+        q = ('mutation { a: createRef(input:{repositoryId:"R_x", name:"refs/tags/a", oid:"%s"}) { clientMutationId } '
+             'b: createRef(input:{repositoryId:"R_x", name:"refs/tags/b", oid:"%s"}) { clientMutationId } }')
+        self.blocked("gh api graphql -f query='%s'" % (q % (self.on_main, self.off_main)))
+        self.ok("gh api graphql -f query='%s'" % (q % (self.on_main, self.feature)))
+
+    def test_n4_call_without_oid_blocked(self):
+        self.blocked("gh api graphql -f query='mutation { createRef(input:{repositoryId:\"R_x\", name:\"refs/tags/b\"}) { clientMutationId } }'")
+
+    def test_n5_create_commit_on_branch_evidence_path(self):
+        q = ('mutation { createCommitOnBranch(input:{branch:{repositoryNameWithOwner:"o/r", branchName:"feat"}, message:{headline:"m"}, '
+             'expectedHeadOid:"%s", fileChanges:{additions:[{path:"%s", contents:"QUJD"}]}}) { commit { oid } } }')
+        self.blocked("gh api graphql -f query='%s'" % (q % (self.on_main, ".lanes/x/big.zip")))
+        self.blocked("gh api graphql -f query='%s'" % (q % (self.on_main, "Plans/Evidence/y/e.log")))
+        self.ok("gh api graphql -f query='%s'" % (q % (self.on_main, "docs/readme.md")))
+        self.blocked("gh api graphql -f query='mutation($c: Base64String!) { createCommitOnBranch(input:{fileChanges:{additions:[{path:\"d.bin\", contents:$c}]}}) { commit { oid } } }' -F c=@%s" % self.bigfile)
+
+    def test_n6_api_commit_must_reuse_a_tree_of_main(self):
+        old_tree = git(self.repo, "rev-parse", self.off_main + "^{tree}")
+        main_tree = git(self.repo, "rev-parse", self.on_main + "^{tree}")
+        cmd = "gh api -X POST repos/o/r/git/commits -f message=m -f tree=%s -f 'parents[]=%s'"
+        self.blocked(cmd % (old_tree, self.on_main), needle="not in main")
+        self.blocked(cmd % ("a" * 40, self.on_main))
+        self.blocked("gh api -X POST repos/o/r/git/commits -f message=m -f 'parents[]=%s'" % self.on_main)
+        self.ok(cmd % (main_tree, self.on_main))
+
+    def test_n6_git_trees_route_blocked(self):
+        self.blocked("gh api -X POST repos/o/r/git/trees -f base_tree=%s" % self.on_main)
+
+    def test_b5_config_writes_and_exports(self):
+        for cmd in ("git config core.hooksPath /tmp/none && git push origin feat", "git config --global core.hooksPath /tmp/none",
+                    "git config include.path /tmp/evil.cfg", "git config --add includeIf.gitdir:/x.path /tmp/e.cfg",
+                    "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null; git push origin feat",
+                    "declare -x GIT_CONFIG_COUNT=1; git push origin feat", "GIT_DIR=/other/.git git push origin feat"):
+            self.blocked(cmd)
+        for cmd in ("git config --get core.hooksPath", "git config user.name 'T'", "git config --unset core.hooksPath",
+                    "git config --list"):
+            self.ok(cmd)
+
+    def test_n12_git_dir_and_work_tree_on_push(self):
+        self.blocked("git --git-dir=/other/.git push origin feat")
+        self.blocked("git --git-dir /other/.git push origin feat")
+        self.blocked("git --work-tree=/other push origin feat")
+        self.ok("git -C /some/worktree push origin feat")
+
+    def test_f1_wal_note_quoting_a_command_is_not_that_command(self):
+        home = str(Path.home())
+        note = "probe gh api -X POST repos/o/r/git/refs with -f sha=%s and gh release create b --target %s" % (self.off_main, self.off_main)
+        self.ok("python3 %s/.claude/hooks/wal_note.py --wal /x --event risk --note '%s'" % (home, note))
+        self.ok("python3 ~/.claude/hooks/wal_note.py --wal /x --event risk --note '%s'" % note)
+        self.blocked("python3 %s/.claude/hooks/wal_note.py --note \"$(gh api -X POST repos/o/r/git/refs -f ref=refs/tags/b -f sha=%s)\"" % (home, self.off_main))
+        self.blocked("python3 /tmp/other.py '%s'" % ("gh api -X POST repos/o/r/git/refs -f ref=refs/tags/b -f sha=" + self.off_main))
 
     def test_cases_not_vacuous(self):
         self.assertNotEqual(self.on_main, self.off_main)

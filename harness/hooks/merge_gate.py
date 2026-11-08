@@ -133,6 +133,7 @@ class Merge:
         self.head_vals = kw.get("head_vals", [])
         self.head_unknown = kw.get("head_unknown", False)
         self.node_ids = kw.get("node_ids", [])
+        self.trees = kw.get("trees", [])
         self.auto = kw.get("auto", False)
         self.repo_ok = kw.get("repo_ok", True)
         self.reason = kw.get("reason", "")
@@ -140,7 +141,7 @@ class Merge:
 
     def key(self):
         return (self.kind, self.slug, self.number, self.target, tuple(self.head_vals), self.head_unknown,
-                tuple(self.node_ids), self.auto, self.repo_ok, self.reason)
+                tuple(self.node_ids), self.auto, self.repo_ok, self.reason, tuple(self.trees))
 
 
 def clean(text, limit=80):
@@ -370,7 +371,24 @@ def _git_push_skips_hooks(seg):
     for t in seg:
         if t.lower().lstrip("'\"").startswith(("--config-env=core.hookspath", "-ccore.hookspath")):
             return True
+    if any(t.split("=", 1)[0] in ("--git-dir", "--work-tree") for t in seg[:k]):
+        return True  # another clone may have no pre-push guard (N12)
     return any(len(t) >= 6 and "--no-verify".startswith(t.split("=", 1)[0]) for t in seg[k + 1:] if t.startswith("--no-"))
+
+
+HOOK_CONFIG_KEY = re.compile(r"^(?:core\.hookspath|include\.|includeif\.)", re.I)
+CONFIG_READ_FLAGS = {"--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l", "--unset", "--unset-all", "--remove-section"}
+
+
+def _git_config_writes_hooks(seg):
+    """`git config core.hooksPath|include.path|includeIf.* <value>`: a persistent way to skip the pre-push guard (N7/N13)."""
+    k, sub = _git_subcommand(seg)
+    if sub != "config":
+        return False
+    args = seg[k + 1:]
+    if any(a in CONFIG_READ_FLAGS for a in args):
+        return False
+    return any(HOOK_CONFIG_KEY.match(a.lstrip("'\"")) for a in args if not a.startswith("-"))
 
 
 def _git_push_to_default(seg, start, assigns, appended=False):
@@ -768,7 +786,7 @@ def _gh_merge(args, in_xargs, ctx, cwd):
     return []
 
 
-REF_ROUTES = re.compile(r"^repos/([^/]+)/([^/]+)/(git/refs|git/tags|git/commits|git/blobs|releases|contents)(?:/(.*))?$")
+REF_ROUTES = re.compile(r"^repos/([^/]+)/([^/]+)/(git/refs|git/tags|git/commits|git/trees|git/blobs|releases|contents)(?:/(.*))?$")
 EVIDENCE_PATH = re.compile(r"(^|/)(\.lanes|plans/evidence)(/|$)", re.I)
 REF_MUTATION = re.compile(r"\bcreateRef\b|\bupdateRef\b|\bupdateRefs\b", re.I)
 BIG_BYTES = 7 * 1024 * 1024
@@ -806,7 +824,8 @@ def _ref_write(endpoint, method, fields, names, repo_ok, cwd=None):
     mutation must carry a literal full sha that shares history with a freshly fetched main and reaches no pre-rewrite
     commit. Values read from files, variables, --input bodies and percent-encoded paths are unknown, so they block.
     Deletes and reads are never blocked. Other clients (curl, SDK, MCP tools, the browser) are only closable server-side."""
-    ep = urllib.parse.unquote(endpoint.split("?")[0]).rstrip("/")
+    ep = urllib.parse.unquote(endpoint.split("?")[0]).strip("/")
+    ep = re.sub(r"^repositories/\d+/", "repos/{owner}/{repo}/", ep)  # the numeric alias serves the same resource (N2)
     m = REF_ROUTES.match(ep)
     if not m or method not in MUTABLE_METHODS:
         return []
@@ -817,8 +836,8 @@ def _ref_write(endpoint, method, fields, names, repo_ok, cwd=None):
     def block(why):
         return [Merge("ref_write", slug=slug, repo_ok=repo_ok, reason=why)]
 
-    def judge(values):
-        return [Merge("ref_write", slug=slug, repo_ok=repo_ok, head_vals=values)]
+    def judge(values, trees=()):
+        return [Merge("ref_write", slug=slug, repo_ok=repo_ok, head_vals=values, trees=list(trees))]
 
     hint = "; use git push (the pre-push guard checks it) or a literal full sha"
     if route in ("git/refs", "git/tags", "git/commits", "releases"):
@@ -838,7 +857,12 @@ def _ref_write(endpoint, method, fields, names, repo_ok, cwd=None):
         parents = kv.get("parents[]", []) + kv.get("parents", [])
         if any(_unknown(v) or not SHA.match(v.lower()) for v in parents):
             return block("an API commit must list literal full parent shas" + hint)
-        return judge([v.lower() for v in parents]) if parents else []
+        trees = kv.get("tree", [])
+        if len(trees) != 1 or _unknown(trees[0]) or not SHA.match(trees[0].lower()):
+            return block("an API commit must name one literal full tree sha that already exists in main" + hint)
+        return judge([v.lower() for v in parents], [trees[0].lower()])
+    if route == "git/trees":
+        return block("trees built through the API can reuse pre-rewrite or evidence blobs; build the commit locally and git push it")
     if route == "releases":
         if tail and not tail.isdigit():
             return []
@@ -864,20 +888,37 @@ def _ref_write(endpoint, method, fields, names, repo_ok, cwd=None):
     return []
 
 
+GQL_MUTATIONS = re.compile(r"\b(createRef|updateRef|updateRefs|createCommitOnBranch)\b", re.I)
+GQL_UNPARSEABLE = re.compile(r'"""|\\|#|\$')  # block strings, escapes, comments and variables hide the real oid or path
+GQL_EVIDENCE = re.compile(r"(?:^|[\"'/])(?:\.lanes|plans/evidence)/", re.I)
+
+
 def _graphql_ref_write(text, values, repo_ok):
-    """GraphQL createRef / updateRef / updateRefs (goodqa#14909): every oid must be a literal full sha."""
-    if not REF_MUTATION.search(text):
+    """GraphQL createRef / updateRef / updateRefs / createCommitOnBranch (goodqa#14909). Anything this small parser cannot read
+    completely is refused: block strings, escapes, comments and variables each hid an oid from the first version (N3/N4).
+    Every oid / afterOid argument must be a plain "<40 hex>" literal and each createRef/updateRef call needs one."""
+    found = {m.lower() for m in GQL_MUTATIONS.findall(text)}
+    if not found:
         return []
-    shas = [h.lower() for h in re.findall(r"\b(?:oid|afterOid)\s*:\s*\"([0-9a-fA-F]{40})\"", text)]
-    for key in ("oid", "afterOid"):
-        for v in values.get(key, []):
-            if _unknown(v) or not SHA.match(v.lower()):
-                return [Merge("ref_write", repo_ok=repo_ok, reason="a GraphQL ref mutation must carry literal full oid values")]
-            shas.append(v.lower())
-    variables = re.search(r"\b(?:oid|afterOid)\s*:\s*\$", text)
-    if variables or not shas:
-        return [Merge("ref_write", repo_ok=repo_ok, reason="a GraphQL ref mutation must carry literal full oid values in the query")]
-    return [Merge("ref_write", repo_ok=repo_ok, head_vals=sorted(set(shas)))]
+
+    def block(why):
+        return [Merge("ref_write", repo_ok=repo_ok, reason=why)]
+
+    if GQL_UNPARSEABLE.search(text):
+        return block("a GraphQL ref or commit mutation must be plain text with literal values (no variables, comments, block strings or escapes); use git push")
+    if "createcommitonbranch" in found:
+        if GQL_EVIDENCE.search(text):
+            return block("evidence archives must not be committed through GraphQL (.lanes/ and plans/evidence/)")
+        if len(text) > BIG_BYTES:
+            return block("the GraphQL commit is over 7 MiB; commit large files with git push after the size guard")
+    if not found & {"createref", "updateref", "updaterefs"}:
+        return []
+    literals = [h.lower() for h in re.findall(r"\b(?:oid|afterOid)\s*:\s*\"([0-9a-fA-F]{40})\"", text)]
+    keyed = re.findall(r"\b(?:oid|afterOid)\s*:", text)
+    calls = len(re.findall(r"\b(?:createRef|updateRef)\b", text))
+    if len(keyed) != len(literals) or not literals or len(literals) < calls:
+        return block("every GraphQL ref mutation argument oid/afterOid must be a literal full sha")
+    return [Merge("ref_write", repo_ok=repo_ok, head_vals=sorted(set(literals)))]
 
 
 def _release_target(pos, flags, repo_ok, cwd=None):
@@ -969,6 +1010,15 @@ def _normalize_code(code):
     return re.sub(r"[\"'`\\,\[\]]", " ", code)
 
 
+WAL_NOTE_SCRIPT = re.compile(r"^(?:~|%s)/\.claude/hooks/wal_note\.py$" % re.escape(str(Path.home())))
+
+
+def _is_note_tool(args):
+    """python3 ~/.claude/hooks/wal_note.py ...: free text only when no argument can run something (substitutions)."""
+    first = next((t for t in args if not t.startswith("-")), "")
+    return bool(WAL_NOTE_SCRIPT.match(first)) and not any("$(" in t or "`" in t or "${" in t for t in args)
+
+
 def find_merges(command, cwd=None, _depth=0, _ctx=None):
     ctx = dict(_ctx or {"implicit_ok": True, "http": False})
     ctx.setdefault("command", command)
@@ -1029,6 +1079,8 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
                     if re.search(r"\s", t):
                         found.extend(find_merges(t, cwd, _depth + 1, sub_ctx))
                         handled = True
+            elif INTERPRETERS.match(name) and name.startswith("python") and _is_note_tool(tokens[i + 1:b]):
+                handled = True  # wal_note.py only appends text; a quoted command in --note is not a command (F1)
             elif INTERPRETERS.match(name):
                 http_tokens.extend(tokens[a:b])
                 for t in tokens[i + 1:b]:
@@ -1043,7 +1095,11 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
         word = words[index]
         g = next((j for j in range(a, b) if base[j] == "git"), None)
         if g is not None and word in ("git", "xargs", "parallel"):
-            if _git_push_skips_hooks(tokens[g:b]) or any(re.match(r"^GIT_CONFIG\w*=", t) for t in tokens[a:g]) and \
+            if _git_config_writes_hooks(tokens[g:b]):
+                raw.append(Merge("unverifiable", reason="git config core.hooksPath / include.path / includeIf.* would skip the pre-push "
+                                                        "repo-size guard (goodqa#14909); not allowed for agents"))
+                continue
+            if _git_push_skips_hooks(tokens[g:b]) or any(re.match(r"^(?:GIT_CONFIG\w*|GIT_DIR|GIT_WORK_TREE)=", t) for t in tokens) and \
                     _git_subcommand(tokens[g:b])[1] == "push":
                 raw.append(Merge("unverifiable", reason="a git push that skips the pre-push hooks (--no-verify, core.hooksPath, "
                                                         "GIT_CONFIG_*) is refused: the repo-size guard runs there (goodqa#14909)"))
@@ -1594,17 +1650,25 @@ def _git_out(cwd, *args):
     return done.stdout.strip() if done.returncode == 0 else None
 
 
-def _github_remotes(cwd):
-    """{remote name: 'owner/repo'} parsed exactly from the github.com urls of the checkout (no substring match)."""
-    out = _git_out(cwd, "config", "--get-regexp", r"^remote\..*\.url$") or ""  # raw urls: `remote -v` shows insteadOf rewrites
+ALLOW_INSTEADOF = False  # tests only (a Python attribute, not reachable from a command)
+_GH_URL = re.compile(r"^(?:https?://(?:[^/@]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
+
+
+def _remote_info(cwd):
+    """{remote name: ('owner/repo', raw url)} from the raw config urls (`remote -v` shows insteadOf rewrites)."""
+    out = _git_out(cwd, "config", "--get-regexp", r"^remote\..*\.url$") or ""
     found = {}
     for line in out.splitlines():
         key, _, url = line.partition(" ")
         name = key[len("remote."):-len(".url")]
-        m = re.match(r"^(?:https?://(?:[^/@]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)([\w.-]+)/([\w.-]+?)(?:\.git)?/?$", url.strip())
+        m = _GH_URL.match(url.strip())
         if m:
-            found.setdefault(name, (m.group(1) + "/" + m.group(2)).lower())
+            found.setdefault(name, ((m.group(1) + "/" + m.group(2)).lower(), url.strip()))
     return found
+
+
+def _github_remotes(cwd):
+    return {n: v[0] for n, v in _remote_info(cwd).items()}
 
 
 def _old_prefixes():
@@ -1617,31 +1681,45 @@ def _old_prefixes():
         return None
 
 
-def allow_ref_write(sha, slug, cwd):
-    """(ok, why). The target must share history with the CURRENT main of the remote (freshly fetched, never a local
-    remote-tracking ref: a stale or forged origin/main hid the incident) and reach no pre-rewrite commit."""
+def _fresh_main(slug, cwd):
+    """(main sha, None) fetched fresh from the remote, or (None, why). Never a local remote-tracking ref."""
     if not cwd or not os.path.isdir(cwd):
-        return False, "cannot check the target: the working directory is unknown; run from a checkout of the repository"
+        return None, "cannot check the target: the working directory is unknown; run from a checkout of the repository"
     if _git_out(cwd, "rev-parse", "--git-dir") is None:
-        return False, "cannot check the target: the working directory is not a git checkout"
-    remotes = _github_remotes(cwd)
+        return None, "cannot check the target: the working directory is not a git checkout"
+    info = _remote_info(cwd)
     if slug:
-        names = [n for n, s in remotes.items() if s == slug.lower()]
+        names = [n for n, v in info.items() if v[0] == slug.lower()]
         if not names:
-            return False, f"the working directory is not a checkout of {slug}; run from one so the target can be checked"
+            return None, f"the working directory is not a checkout of {slug}; run from one so the target can be checked"
     else:
-        names = [n for n in remotes if n == "origin"] or list(remotes)[:1]
+        names = [n for n in info if n == "origin"] or list(info)[:1]
         if not names:
-            return False, "cannot check the target: the checkout has no github.com remote"
+            return None, "cannot check the target: the checkout has no github.com remote"
+    if not ALLOW_INSTEADOF:
+        rules = _git_out(cwd, "config", "--get-regexp", r"^url\..*\.(insteadof|pushinsteadof)$") or ""
+        for line in rules.splitlines():
+            prefix = line.partition(" ")[2].strip()
+            if prefix and info[names[0]][1].startswith(prefix):
+                return None, "a url.<base>.insteadOf rule rewrites the GitHub remote, so the fetched main cannot be trusted; remove the rule"
     if _git_out(cwd, "fetch", "--quiet", "--no-tags", names[0], "main") is None:
-        return False, f"cannot fetch main of {names[0]} (network or auth): the target cannot be verified, so it is refused"
+        return None, f"cannot fetch main of {names[0]} (network or auth): the target cannot be verified, so it is refused"
     main = _git_out(cwd, "rev-parse", "--verify", "-q", "FETCH_HEAD^{commit}")
     if not main:
-        return False, "cannot read the fetched main"
+        return None, "cannot read the fetched main"
     anc = subprocess.run(["git", "merge-base", "--is-ancestor", OLD_MAIN, main], cwd=cwd, capture_output=True,
                          timeout=FETCH_TIMEOUT, env=dict(os.environ, GIT_NO_REPLACE_OBJECTS="1"))
     if anc.returncode == 0:
-        return False, "the fetched main still contains the pre-rewrite history; refusing every ref write"
+        return None, "the fetched main still contains the pre-rewrite history; refusing every ref write"
+    return main, None
+
+
+def allow_ref_write(sha, slug, cwd):
+    """(ok, why). The target must share history with the CURRENT main of the remote (freshly fetched) and reach no
+    pre-rewrite commit."""
+    main, why = _fresh_main(slug, cwd)
+    if why:
+        return False, why
     if _git_out(cwd, "cat-file", "-e", sha + "^{commit}") is None:
         return False, f"{sha[:12]} is not a commit in this checkout; fetch it first so it can be checked"
     if _git_out(cwd, "merge-base", sha, main) is None:
@@ -1656,6 +1734,24 @@ def allow_ref_write(sha, slug, cwd):
     hit = next((c for c in listed.split() if c[:12] in old), None)
     if hit:
         return False, f"{sha[:12]} reaches the pre-rewrite commit {hit[:12]}; do not put old history back under a ref"
+    return True, ""
+
+
+def allow_tree(tree, slug, cwd):
+    """(ok, why). A tree named by an API commit must already exist in the history of the fresh main (N6: GitHub still
+    serves pre-rewrite objects, so an old tree under a new commit would bring the old blobs back)."""
+    main, why = _fresh_main(slug, cwd)
+    if why:
+        return False, why
+    env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")
+    try:
+        done = subprocess.run(["git", "rev-list", "--objects", main], cwd=cwd, capture_output=True, text=True, timeout=FETCH_TIMEOUT, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return False, "git rev-list --objects failed; the tree cannot be verified"
+    if done.returncode != 0:
+        return False, "git rev-list --objects failed; the tree cannot be verified"
+    if not any(line.startswith(tree) for line in done.stdout.splitlines()):
+        return False, f"tree {tree[:12]} is not in main's history: an API commit may only reuse trees main already has; build the commit locally and git push it"
     return True, ""
 
 
@@ -1674,6 +1770,10 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
                 raise GateError("the repository cannot be determined (a cd, ssh, GH_REPO or GH_HOST changes it): run the ref write from the checkout")
             for target in merge.head_vals:
                 ok, why = allow_ref_write(target, merge.slug, client.cwd)
+                if not ok:
+                    raise GateError(why)
+            for tree in merge.trees:
+                ok, why = allow_tree(tree, merge.slug, client.cwd)
                 if not ok:
                     raise GateError(why)
             return True, "", info
