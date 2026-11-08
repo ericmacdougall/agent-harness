@@ -824,65 +824,115 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
         self.assertEqual(self.output.read_text(), 'VERDICT: PASS\nstale')
         self.assertFalse(capture.exists())
 
-    # -- Kimi as the authorized independent fallback (goodqa#15201) -------------------------------------
+    # -- Kimi as an advisory independent-provider opinion (goodqa#15201) --------------------------------
 
-    def kimi_env(self, mode='ok'):
-        """A fake `kimi` CLI that logs launches and answers with a stage verdict; never the real subscription."""
+    def kimi_env(self, launches, mode='ok'):
+        """A fake `kimi` CLI that logs launches and answers with an advisory line; never the real subscription."""
         binary = self.root / 'kimibin' / 'kimi'
         binary.parent.mkdir(exist_ok=True)
         binary.write_text(f'''#!{sys.executable}
 import json, os, sys
-from pathlib import Path
-with open(os.environ['PROVIDER_LAUNCH_LOG'], 'a') as stream: stream.write('kimi\\n')
-prompt = next(a for a in sys.argv if a.startswith('--prompt='))
+if sys.argv[1:] == ['--version']:
+    print('2.5.9'); sys.exit(0)
+with open(os.environ['FAKE_KIMI_LOG'], 'a') as stream: stream.write('kimi\\n')
 if os.environ.get('FAKE_KIMI_MODE') == 'quota':
     sys.stderr.write('rate limit: plan quota exhausted\\n'); sys.exit(1)
-print(json.dumps({{'role': 'assistant', 'content': 'VERDICT: PASS\\nKimi reviewed the packet.'}}))
+print(json.dumps({{'role': 'assistant', 'content': 'KIMI_ADVISORY: ACCEPT\\nVERDICT: PASS\\nKimi reviewed the packet.'}}))
 ''')
         binary.chmod(0o700)
-        return {'KIMI_REVIEW_BIN': str(binary), 'KIMI_REVIEW_HOME': str(self.root / 'kimi-home'),
-                'FAKE_KIMI_MODE': mode, 'HOME': str(self.root)}
+        home = self.root / '.kimi-code'
+        home.mkdir(exist_ok=True)
+        (home / 'config.toml').write_text('[providers."managed:kimi-code"]\ntype = "kimi"\n\n'
+                                          '[providers."managed:kimi-code".oauth]\nkey = "oauth/x"\n\n'
+                                          '[models."kimi-code/k3.1-pro-highspeed"]\nmodel = "m"\n')
+        return {'KIMI_REVIEW_TEST_MODE': '1', 'KIMI_REVIEW_BIN': str(binary), 'KIMI_REVIEW_HOME': str(self.root / 'kimi-home'),
+                'FAKE_KIMI_MODE': mode, 'FAKE_KIMI_LOG': str(launches), 'HOME': str(self.root)}
 
     QUOTA = json.dumps({'type': 'turn.failed', 'error': {'code': 'insufficient_quota'}})
 
-    def test_secondary_kimi_replaces_the_other_harness_as_the_one_fallback(self):
+    def kimi_review(self, mode='ok', packet_text=None, extra=(), env=None):
         launches = self.root / 'launches'
-        result = self.invoke(extra=['--secondary', 'kimi'], env={
-            'PROVIDER_LAUNCH_LOG': str(launches), 'CODEX_EVENTS': self.QUOTA, **self.kimi_env()})
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(launches.read_text().splitlines(), ['codex', 'kimi'])  # claude is never launched
+        if packet_text is not None:
+            self.packet.write_text(packet_text)
+        result = self.invoke(extra=['--secondary', 'kimi', *extra], env={
+            'PROVIDER_LAUNCH_LOG': str(launches), 'CODEX_EVENTS': self.QUOTA, **self.kimi_env(launches, mode), **(env or {})})
+        return result, (launches.read_text().splitlines() if launches.exists() else [])
+
+    def test_kimi_answer_is_advisory_never_a_signoff(self):
+        result, launched = self.kimi_review()
+        self.assertEqual(launched, ['codex', 'kimi'])  # claude is never launched
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)  # not 0 (pass) and not 3 (block)
         report = self.output.read_text()
-        self.assertIn('Kimi', report)
-        self.assertIn('Kimi reviewed the packet.', report)
+        for line in ('Reviewer-Rung: n/a\n', 'Review input: packet text only (no snapshot, no tools)\n',
+                     'Advisory: yes; NOT a signoff and carries no pass marker\n', 'KIMI_ADVISORY: ACCEPT'):
+            self.assertIn(line, report)
+        self.assertNotIn('isolated committed snapshot', report)
+        self.assertNotIn('Reviewer-Selection: openai', report)
+        # Kimi even wrote a pass line in its text: the marker must be neutralised
+        self.assertNotRegex(report, r'(?m)^VERDICT: PASS')
+        self.assertIn('[PR signoff marker omitted]', report)
+        self.assertIn('ADVISORY ONLY', result.stdout)
+        self.assertNotIn('Usage receipt', result.stdout)
+
+    def test_kimi_advisory_is_not_recorded_in_the_task_ladder_as_a_review(self):
+        ladder_dir = self.root / 'ladder'
+        ladder_dir.mkdir(mode=0o700)
+        env = {'AGENT_HARNESS_ESCALATION_DIR': str(ladder_dir)}
+        # control: a normal primary answer under the same task does reach the ladder
+        control = self.invoke(extra=['--task', 'lad-k', '--author-rung', 'R2', '--author-harness', 'claude'], env=env)
+        self.assertIn('Ladder:', control.stderr)
+        self.output.unlink()
+        result, _ = self.kimi_review(extra=['--task', 'lad-k', '--author-rung', 'R2', '--author-harness', 'claude'], env=env)
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertNotIn('Ladder:', result.stderr)
 
     def test_secondary_kimi_is_not_called_when_the_primary_answers(self):
         launches = self.root / 'launches'
-        result = self.invoke(extra=['--secondary', 'kimi'], env={'PROVIDER_LAUNCH_LOG': str(launches), **self.kimi_env()})
+        result = self.invoke(extra=['--secondary', 'kimi'], env={
+            'PROVIDER_LAUNCH_LOG': str(launches), **self.kimi_env(launches)})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(launches.read_text().splitlines(), ['codex'])
 
     def test_default_fallback_is_unchanged_without_the_flag(self):
         launches = self.root / 'launches'
-        result = self.invoke(env={'PROVIDER_LAUNCH_LOG': str(launches), 'CODEX_EVENTS': self.QUOTA, **self.kimi_env()})
+        result = self.invoke(env={'PROVIDER_LAUNCH_LOG': str(launches), 'CODEX_EVENTS': self.QUOTA,
+                                  **self.kimi_env(launches)})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(launches.read_text().splitlines(), ['codex', 'claude'])
 
     def test_kimi_quota_ends_the_review_with_no_loop_and_no_signoff(self):
-        launches = self.root / 'launches'
-        result = self.invoke(extra=['--secondary', 'kimi'], env={
-            'PROVIDER_LAUNCH_LOG': str(launches), 'CODEX_EVENTS': self.QUOTA, **self.kimi_env('quota')})
+        result, launched = self.kimi_review('quota')
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual(launches.read_text().splitlines(), ['codex', 'kimi'])
+        self.assertEqual(launched, ['codex', 'kimi'])
         self.assertFalse(self.output.exists())
 
     def test_egress_gate_blocks_the_kimi_fallback_before_launch(self):
-        launches = self.root / 'launches'
-        self.packet.write_text('Scope mentions the yates deployment.\n')
-        result = self.invoke(extra=['--secondary', 'kimi'], env={
-            'PROVIDER_LAUNCH_LOG': str(launches), 'CODEX_EVENTS': self.QUOTA, **self.kimi_env()})
+        result, launched = self.kimi_review(packet_text='Scope mentions the yates deployment.\n')
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual(launches.read_text().splitlines(), ['codex'])  # kimi refused by the gate, never launched
+        self.assertEqual(launched, ['codex'])  # kimi refused by the gate, never launched
         self.assertFalse(self.output.exists())
+
+    def test_the_packet_path_is_gated_like_its_content(self):
+        private = self.root / '.claude' / 'projects' / 'p'
+        private.mkdir(parents=True)
+        packet = private / 'notes.md'
+        head = subprocess.run(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'], check=True, capture_output=True,
+                              text=True).stdout.strip()
+        packet.write_text('Scope and evidence for a disposable review.' + self.evidence(head))
+        launches = self.root / 'launches'
+        result = self.invoke(packet=packet, extra=['--secondary', 'kimi'], env={
+            'PROVIDER_LAUNCH_LOG': str(launches), 'CODEX_EVENTS': self.QUOTA, **self.kimi_env(launches)})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(launches.read_text().splitlines(), ['codex'])
+        self.assertFalse(self.output.exists())
+
+    def test_a_refused_kimi_call_is_not_counted_as_a_launch(self):
+        result, _ = self.kimi_review(packet_text='Scope mentions the yates deployment.\n')
+        self.assertEqual(result.returncode, 2)
+        receipts = list((self.root / 'usage-state').rglob('final.json'))
+        self.assertTrue(receipts)
+        launch_counts = [json.loads(path.read_text()).get('usage', {}).get('provider_launches') for path in receipts]
+        self.assertEqual(launch_counts, [1])  # the codex launch only
 
     def test_both_reviewers_failing_leave_fresh_path_absent(self):
         result = self.invoke(env={'CODEX_EXIT': '7', 'CLAUDE_EXIT': '8'})

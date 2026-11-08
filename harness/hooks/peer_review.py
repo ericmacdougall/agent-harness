@@ -725,23 +725,33 @@ class ReviewFailure(OSError):
 
 KIMI_LIMITS = ("\n\nTransport limit: this reviewer has no repository or tool access. Judge only the packet text above and "
                "say plainly what the packet does not let you verify.")
+KIMI_VERDICT = re.compile(r'^KIMI_ADVISORY: (ACCEPT|BLOCK)\b')
 
 
-def kimi_attempt(prompt):
-    """One tool-less Kimi (subscription CLI) call, shaped like a provider launch: (code, stdout, stderr)."""
+class AdvisoryOnly(Exception):
+    """Kimi answered. Its packet-only opinion is advisory: no pass marker, no exit 0, no ladder record."""
+    def __init__(self, text, source, failure):
+        super().__init__('advisory opinion from ' + source)
+        self.text, self.source, self.failure = text, source, failure
+
+
+def kimi_attempt(prompt, packet_path, timeout):
+    """One tool-less Kimi (subscription CLI) call, shaped like a provider launch: (code, stdout, stderr, launched)."""
     try:
         import kimi_review as kimi
     except ImportError:
-        return 127, '', 'HARNESS_PROVIDER_UNAVAILABLE'
+        return 127, '', 'HARNESS_PROVIDER_UNAVAILABLE', 0
     try:
-        result = kimi.review_text(prompt + KIMI_LIMITS, label='review prompt')
-    except kimi.QuotaExhausted:
-        return 1, '', 'Error: ACCOUNT_QUOTA_EXCEEDED'
-    except kimi.LoginRequired:
-        return 1, '', 'Error: AUTHENTICATION_REQUIRED'
+        if packet_path is not None:
+            kimi.check_path(packet_path)  # the packet's own path is gated like any other egress path
+        result = kimi.review_text(prompt + KIMI_LIMITS, label='review prompt', timeout=max(1, int(timeout)))
+    except kimi.QuotaExhausted as error:
+        return 1, '', 'Error: ACCOUNT_QUOTA_EXCEEDED', int(error.launched)
+    except kimi.LoginRequired as error:
+        return 1, '', 'Error: AUTHENTICATION_REQUIRED', int(error.launched)
     except kimi.KimiError as error:  # egress refusal, cap, timeout: no result and no fallback after this
-        return 1, '', diagnostics.sanitize(error)
-    return 0, result['text'], ''
+        return 1, '', diagnostics.sanitize(error), int(error.launched)
+    return 0, result['text'], '', 1
 
 
 def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, content: str, options=None):
@@ -792,9 +802,13 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         try:
             if provider == 'kimi':
                 resolution = {'path': 'kimi_review.py'}
-                options['launches'] += 1
-                code, stdout, stderr = kimi_attempt(prompt)
-                outcome = normalize_provider('kimi', code, stdout, stderr, '', stage)
+                code, stdout, stderr, launched = kimi_attempt(
+                    prompt.replace(verdict, 'Begin exactly KIMI_ADVISORY: ACCEPT or KIMI_ADVISORY: BLOCK.'),
+                    options.get('packet_path'), timeout)
+                options['launches'] += launched  # a refused call never started the CLI, so it is not a launch
+                if code == 0 and KIMI_VERDICT.match(stdout.strip()):
+                    raise AdvisoryOnly(stdout.strip(), source, failure)
+                outcome = (provider_failure({}) if code == 0 else normalize_provider('kimi', code, stdout, stderr, '', stage))
             else:
                 # Resolve before the lease, so a lease refusal is reported with its own reason, not as a missing CLI.
                 roots = diagnostics.untrusted_roots(repo=options.get('repo'), snapshot=snapshot)
@@ -1192,7 +1206,7 @@ def main() -> int:
             print('Review refused: reviewer rung %s needs user permission recorded for the task by approve-top '
                   '(--task with a ledger permission); --author-rung alone is not a record' % selection['rung'], file=sys.stderr)
             return 2
-    options = {'secondary': args.secondary, 'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
+    options = {'packet_path': packet, 'secondary': args.secondary, 'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
                'selection': selection, 'author_rung': author_rung, 'permission': permission,
                'codex_model': policy['rungs'][selection['rung']]['models']['openai'],
                'claude_model': policy['rungs'][selection['rung']]['models']['claude']}
@@ -1258,6 +1272,34 @@ def main() -> int:
         target.close()
         evidence.close()
         return 2
+    except AdvisoryOnly as advisory:
+        # An independent-provider opinion on packet text only: written to the report path with honest headers,
+        # recorded in the receipt as ADVISORY, never a pass marker, never exit 0, never a ladder record.
+        try:
+            if repo_state(repo) != before:
+                raise OSError('repository HEAD or worktree changed during review')
+            evidence.verify()
+            body = re.sub(r'VERDICT:\s*PASS\b', '[PR signoff marker omitted]', advisory.text)
+            target.write_text(f"Reviewer: {advisory.source}\nStage: {args.stage}\nReviewed HEAD: {before[0]}\n"
+                              f"Reviewed packet SHA-256: {evidence.sha256}\n"
+                              f"Author-Rung: {author_rung or 'unknown'}\nReviewer-Rung: n/a\n"
+                              f"Reviewer-Selection: independent-provider opinion; not selected from the rung table\n"
+                              f"Review input: packet text only (no snapshot, no tools)\n"
+                              f"Advisory: yes; NOT a signoff and carries no pass marker\n"
+                              f"Worktree status: {'clean' if not before[1] else 'dirty'}\n"
+                              f"Fallback reason: {advisory.failure}\n\n{body}\n", before_publish=evidence.verify)
+            target.verify_current()
+            run_record.finish(execution='COMPLETED', result='NO_RESULT', reason='ADVISORY', exit_code=4,
+                              usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', [])})
+        except (OSError, subprocess.TimeoutExpired, GuardError) as error:
+            print(f'Advisory publication failed: {diagnostics.sanitize(error)}; nothing published.', file=sys.stderr)
+            target.close()
+            evidence.close()
+            return 2
+        target.close()
+        evidence.close()
+        print(f"{advisory.source}: ADVISORY ONLY, not a signoff | {output}", flush=True)
+        return 4
     except BaseException:
         if run_record is not None:
             try:
