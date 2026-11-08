@@ -634,7 +634,9 @@ class Wiring(unittest.TestCase):
 
 
 class ActiveWorkflows(Base):
-    """GoodQA #14669: with GitHub CI switched off (no ACTIVE workflow that can run on a PR head) zero checks pass."""
+    """GoodQA #14669, amended by goodqa#15282: with GitHub CI switched off (no ACTIVE workflow that can run on a PR
+    head) zero checks are not a failure, but nothing was checked either, so the merge needs an exact-head waiver (or
+    the one a bound PR review authorization writes) and is refused without one."""
 
     CMD = "gh pr merge 5 --match-head-commit {HEAD}"
     RELEASE = "name: Release\non:\n  push:\n    tags: [\"v*\"]\npermissions:\n  contents: read\n"
@@ -642,25 +644,92 @@ class ActiveWorkflows(Base):
     def scenario(self, files, **extra):
         return dict({"checks": [], "protection": "none", "workflow_files": files}, **extra)
 
-    def merge(self, sc, command=None):
+    def merge(self, sc, command=None, waived=False):
+        if waived:
+            mg.add_waiver(self.state, "o/r", 5, HEAD, "GoodQA #15282", "reviewed by main; CI is off here",
+                          approved_by="main:agent-1")
         gh = FakeGh(sc)
         code, text = mg.decide(bash(expand(command or self.CMD)), gh, self.state)
         return code, text, gh
+
+    def test_ci_off_merge_without_a_waiver_is_refused(self):
+        # goodqa#15282: PR 137 merged in ericmacdougall/agent-harness with no waiver because CI is off
+        code, text, _ = self.merge(self.scenario([]))
+        self.assertEqual(code, 2, text)
+        self.assertIn("GitHub CI is switched off", text)
+        self.assertIn("waive --repo o/r --pr 5 --head " + HEAD, text)
+
+    def test_ci_off_waiver_is_exact_head_and_single_use(self):
+        mg.add_waiver(self.state, "o/r", 5, "b" * 40, "GoodQA #15282", "a waiver for another head",
+                      approved_by="main:agent-1")
+        self.assertEqual(self.merge(self.scenario([]))[0], 2)  # NEG-1: another head does not count
+        self.assertEqual(self.merge(self.scenario([]), waived=True)[0], 0)
+        self.assertEqual(self.merge(self.scenario([]))[0], 2)  # consumed
+
+    def test_ci_off_outside_reports_are_not_ci(self):
+        # red-team H3: an outside commit status, an app check or a lone skipped run is not CI. With no workflow that
+        # can run, the merge still needs exact-head evidence; anyone with push access can post a status.
+        reports = {"status-success": [{"t": "status", "context": "ok", "state": "SUCCESS"}],
+                   "app-run-success": [{"t": "run", "name": "ext", "status": "COMPLETED", "conclusion": "SUCCESS",
+                                        "app_id": 999}],
+                   "skipped-run": [{"t": "run", "name": "ext", "status": "COMPLETED", "conclusion": "SKIPPED"}]}
+        for label, checks in reports.items():
+            for command in (self.CMD, "gh pr merge 5 --auto --match-head-commit {HEAD}",
+                            "gh pr merge 5 --admin --squash --match-head-commit {HEAD}"):
+                with self.subTest(label, command=command):
+                    code, text, _ = self.merge(self.scenario([], checks=checks), command=command)
+                    self.assertEqual(code, 2, text)
+                    self.assertIn("GitHub CI is switched off", text)
+            with self.subTest(label, evidence=True):
+                self.assertEqual(self.merge(self.scenario([], checks=checks), waived=True)[0], 0)
+
+    def test_ci_on_needs_one_success_when_nothing_is_required(self):
+        ci = [{"name": "CI", "state": "active", "content": "on:\n  pull_request:\n"}]
+        skipped = [{"t": "run", "name": "test", "status": "COMPLETED", "conclusion": "SKIPPED"}]
+        code, text, _ = self.merge(self.scenario(ci, checks=skipped))
+        self.assertEqual(code, 2, text)  # red-team H3: only skipped runs is not a pass
+        green = [{"t": "run", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+        code, text, _ = self.merge(self.scenario(ci, checks=green))
+        self.assertEqual(code, 0, text)  # normal CI: no evidence needed
+        code, text, _ = self.merge(self.scenario(ci, checks=green, timeout="workflows"))
+        self.assertEqual(code, 2, text)  # the workflow list must be readable (fail closed)
+
+    def test_check_command_never_spends_the_evidence(self):
+        # red-team M1: `merge_gate.py check` used to consume the single-use evidence and print green
+        import io
+        mg.add_waiver(self.state, "o/r", 5, HEAD, "GoodQA #15282", "reviewed by main; CI is off here",
+                      approved_by="main:agent-1")
+        out = io.StringIO()
+        rc = mg.main(["check", "--state-dir", str(self.state), "--repo", "o/r", "--pr", "5"],
+                     runner=FakeGh(self.scenario([])), stdout=out, stderr=io.StringIO())
+        self.assertEqual(rc, 2, out.getvalue())
+        self.assertNotIn("all checks green", out.getvalue())
+        self.assertEqual(self.merge(self.scenario([]))[0], 0)  # still available for the real merge
+        self.assertEqual(self.merge(self.scenario([]))[0], 2)  # then spent
+
+    def test_a_head_with_a_trailing_newline_is_rejected(self):
+        # red-team L1: the head check is a full match
+        with self.assertRaises(Exception):
+            mg.add_waiver(self.state, "o/r", 5, HEAD + "\n", "GoodQA #15282", "trailing newline",
+                          approved_by="main:agent-1")
 
     def test_real_agent_harness_shape_is_allowed(self):
         files = [{"name": "CI", "state": "disabled_manually", "content": "on: [push, pull_request]\n"},
                  {"name": "Console", "state": "disabled_manually", "content": "on:\n  pull_request:\n"},
                  {"name": "Release harness binary", "file": "release", "state": "active", "content": self.RELEASE}]
         code, text, gh = self.merge(self.scenario(files))
+        self.assertEqual(code, 2, text)  # goodqa#15282: no waiver, no merge
+        code, text, gh = self.merge(self.scenario(files), waived=True)
         self.assertEqual(code, 0, text)
         self.assertIn(HEAD, gh.content_refs)  # files are read at the verified head (and the base)
 
     def test_all_disabled_and_no_workflows_allowed(self):
         for state in ("disabled_manually", "disabled_inactivity", "disabled_fork"):
             with self.subTest(state):
-                code, text, _ = self.merge(self.scenario([{"name": "CI", "state": state, "content": "on: pull_request\n"}]))
+                code, text, _ = self.merge(self.scenario([{"name": "CI", "state": state, "content": "on: pull_request\n"}]),
+                                           waived=True)
                 self.assertEqual(code, 0, text)
-        self.assertEqual(self.merge(self.scenario([]))[0], 0)
+        self.assertEqual(self.merge(self.scenario([]), waived=True)[0], 0)
 
     def test_active_workflow_that_can_run_on_a_pr_head_blocks(self):
         triggers = {
@@ -707,7 +776,8 @@ class ActiveWorkflows(Base):
                               "inline-list": "on: [workflow_dispatch, schedule]\n",
                               "tags-block-list": "on:\n  push:\n    tags:\n      - 'v*'\n"}.items():
             with self.subTest(name):
-                code, text, _ = self.merge(self.scenario([{"name": "W", "state": "active", "content": content}]))
+                code, text, _ = self.merge(self.scenario([{"name": "W", "state": "active", "content": content}]),
+                                           waived=True)
                 self.assertEqual(code, 0, text)
 
     def test_one_capable_workflow_among_inert_ones_blocks(self):
@@ -750,7 +820,7 @@ class ActiveWorkflows(Base):
         pr_target = {"name": "T", "state": "active", "content": "on: workflow_dispatch\n", "base_content": "on:\n  pull_request_target:\n"}
         self.assertEqual(self.merge(self.scenario([pr_target]))[0], 2)
         both_inert = {"name": "R", "state": "active", "content": self.RELEASE, "base_content": self.RELEASE}
-        self.assertEqual(self.merge(self.scenario([both_inert]))[0], 0)
+        self.assertEqual(self.merge(self.scenario([both_inert]), waived=True)[0], 0)
 
     def test_workflow_added_by_the_pr_is_classified(self):
         added = {"name": "New", "file": "ci2", "state": "active", "head_only": True, "content": "on:\n  pull_request:\n"}
@@ -759,12 +829,13 @@ class ActiveWorkflows(Base):
         self.assertEqual(code, 2, text)
         self.assertIn("ci2.yml", text)
         added_inert = dict(added, content="on: workflow_dispatch\n")
-        self.assertEqual(self.merge(self.scenario([inert, added_inert]))[0], 0)
+        self.assertEqual(self.merge(self.scenario([inert, added_inert]), waived=True)[0], 0)
 
     def test_audit_marks_allows_that_rest_on_no_ci(self):
-        self.assertEqual(self.merge(self.scenario([]))[0], 0)
+        self.assertEqual(self.merge(self.scenario([]), waived=True)[0], 0)
         last = json.loads((self.state / mg.AUDIT_FILE).read_text().splitlines()[-1])
         self.assertTrue(last["no_ci"])
+        self.assertTrue(last.get("waiver"))
         self.assertEqual(self.merge(dict(SCENARIOS["green"], workflow_files=[]))[0], 0)
         self.assertFalse(json.loads((self.state / mg.AUDIT_FILE).read_text().splitlines()[-1])["no_ci"])
 
@@ -778,7 +849,7 @@ class ActiveWorkflows(Base):
         # `deleted` only records that the file was gone: if it exists at either ref it is classified
         restored = {"name": "x", "state": "deleted", "content": "on: pull_request\n"}
         self.assertEqual(self.merge(self.scenario([restored]))[0], 2)
-        self.assertEqual(self.merge(self.scenario([dict(restored, gone=True)]))[0], 0)
+        self.assertEqual(self.merge(self.scenario([dict(restored, gone=True)]), waived=True)[0], 0)
 
     def test_error_text_containing_404_is_not_a_missing_file(self):
         inert = [{"name": "Release", "file": "release", "state": "active", "content": self.RELEASE}]

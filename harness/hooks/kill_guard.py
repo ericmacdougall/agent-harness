@@ -1314,7 +1314,7 @@ def make_analyzer_class(cg):
                     self.inner_words(args[args.index(rest[0]):], depth, pl, idx)
             elif name in cg.INTERPRETERS or INTERPRETER_NAME.fullmatch(name):
                 if not self.is_ah_kill(name, args, cmd, depth) and not self.is_harness_cli(name, args, cmd, depth):
-                    self.check_interpreter(name, texts, cmd)
+                    self.check_interpreter(name, texts, cmd, args)
             self.check_spawn(name, args, texts, depth, pl, idx)
             self.check_text_runners(name, args, texts, cmd, depth)
 
@@ -1387,6 +1387,13 @@ def make_analyzer_class(cg):
             if hit:
                 self.block('indirect-kill', '`%s` runs a kill verb on targets the guard cannot list' % name)
 
+        def home_moved(self):
+            """goodqa#15276 red-team H2: `HOME=/tmp/x; python3 ~/.claude/hooks/ah.py` runs /tmp/x/.claude/hooks/ah.py,
+            because the shell expands `~` from the HOME it has at that point. Any HOME word in the command that is not
+            a plain $HOME or ${HOME} read (an assignment, export, declare, read or unset) means `~` may not be the
+            caller's install root, so no install-root exemption applies."""
+            return bool(re.search(r'(?<![$\w{])HOME\b', self.raw or ''))
+
         def is_harness_cli(self, name, args, cmd, depth):
             """`python3 [-I|-B|-u] ~/.claude/hooks/{ah,wal_note,provenance}.py ...`: the words after the script are
             data for that script, so a note or search text that mentions kill is not signalling. `ah.py kill` is
@@ -1399,7 +1406,7 @@ def make_analyzer_class(cg):
             i = 0
             while i < len(args) and args[i].text in ('-I', '-B', '-u'):
                 i += 1
-            if i >= len(args) or not hook_script_ok(args[i].raw, ('ah', 'wal_note', 'provenance')):
+            if i >= len(args) or not hook_script_ok(args[i].raw, ('ah', 'wal_note', 'provenance')) or self.home_moved():
                 return False
             if args[i].text.endswith('/ah.py'):
                 # only a known non-kill subcommand (optionally after the top-level --text) makes the rest data
@@ -1432,7 +1439,8 @@ def make_analyzer_class(cg):
             while i < len(texts) and texts[i] in ('-B', '-u'):
                 i += 1
             # the raw word is matched: a quoted '~' is a literal directory, and .text has HOME expanded
-            if i + 1 >= len(texts) or not hook_script_ok(args[i].raw, ('ah',)) or texts[i + 1] != 'kill':
+            if i + 1 >= len(texts) or not hook_script_ok(args[i].raw, ('ah',)) or texts[i + 1] != 'kill' \
+                    or self.home_moved():
                 return False
             if texts[i + 2:] in (['--help'], ['-h']):
                 return True  # usage text only: ah.py prints it and exits before any process is touched
@@ -1484,8 +1492,8 @@ def make_analyzer_class(cg):
                 return False  # delta red-team D-F2: main may not use another session's spawns or asks
             return '--pid' in seen and '--reason' in seen
 
-        def check_interpreter(self, name, texts, cmd):
-            texts = self.drop_script_arguments(texts)
+        def check_interpreter(self, name, texts, cmd, args=None):
+            texts = self.drop_script_arguments(texts, args)
             body = ' '.join(texts)
             for redir in getattr(cmd, 'redirs', []):
                 if redir.body:
@@ -1507,9 +1515,11 @@ def make_analyzer_class(cg):
 
         DATA_ARG_SCRIPTS = frozenset(('wal_note.py', 'gq.py', 'ah.py', 'spec_flow.py', 'provenance.py', 'commit_policy.py',
                                       'peer_review.py', 'deliver.py', 'workdir.py', 'escalation.py', 'ops_watch.py',
-                                      'rescue.py', 'ticket_adapters.py', 'report_file.py'))
+                                      'rescue.py', 'ticket_adapters.py', 'report_file.py', 'merge_gate.py'))
+        # goodqa#15276: only the caller's own installed copies, never ./ah.py, /tmp/ah.py or another user's home
+        DATA_ARG_DIRS = ('~/.claude/hooks/', '~/.codex/agent-harness/')
 
-        def drop_script_arguments(self, texts):
+        def drop_script_arguments(self, texts, args=None):
             """`python3 wal_note.py --note 'will kill nothing'`: the arguments of a NAMED harness tool that records
             text are data, not code (goodqa#14817). Deliberately an allowlist: any other script (run_capped.py,
             watch-tests.py, a runner) may run its arguments as a command, and a flag before the script may carry
@@ -1517,7 +1527,16 @@ def make_analyzer_class(cg):
             arguments must not carry a `--` separator or a bare signal verb."""
             if not texts or texts[0].startswith('-'):
                 return texts
-            if os.path.basename(texts[0]) not in self.DATA_ARG_SCRIPTS:
+            name = os.path.basename(texts[0])
+            if name not in self.DATA_ARG_SCRIPTS:
+                return texts
+            # goodqa#15276 red-team H1: decide on the RAW word, as hook_script_ok does. A quoted or escaped '~' is a
+            # literal ./~ directory, while .text has HOME expanded, so a text match let a planted copy through.
+            raw = getattr(args[0], 'raw', None) if args else None
+            home = re.escape(os.path.expanduser('~').rstrip('/'))
+            if not re.fullmatch(r'(?:~|%s)/(?:\.claude/hooks|\.codex/agent-harness)/%s' % (home, re.escape(name)), raw or ''):
+                return texts
+            if self.home_moved():
                 return texts
             rest = texts[1:]
             if '--' in rest or any(self.script_kill is not None and self.script_kill.fullmatch(w.strip().lower())

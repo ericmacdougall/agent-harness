@@ -1197,7 +1197,7 @@ class ScriptArgumentTextIsData(WorldCase):
     """goodqa#14817: words in a script's ARGUMENTS (a note, a JSON body) are data, not interpreter code."""
     DATA = [
         "python3 ~/.claude/hooks/wal_note.py --wal ~/w.jsonl --event status --note 'owner will kill nothing; delete later'",
-        "python3 spec_flow.py --note 'os.kill is not called here'",
+        "python3 ~/.claude/hooks/spec_flow.py --note 'os.kill is not called here'",
         "python3 ./gq.py comment 14817 --json '{\"body\": \"a kill-guard false positive\"}'",
     ]
     CODE = [  # inline code and heredoc bodies are still scanned
@@ -1214,6 +1214,8 @@ class ScriptArgumentTextIsData(WorldCase):
         "python3 ~/.claude/hooks/run_capped.py --max-rss-gb 1 -- kill -9 4242",
         "python3 ./runner.py pkill -f node",
         "python3 ./unlisted_tool.py --note 'will kill the job'",  # not on the named list: scanned in full
+        # goodqa#15276: a cwd-relative copy of a named helper is any file; only the caller's installed copies are data
+        "python3 spec_flow.py --note 'os.kill is not called here'",
         # delta review: runners that take a command without `--`, absolute-path verbs, shell and -c strings
         "python3 ~/.claude/hooks/run_capped.py --max-rss-gb 1 /bin/kill -9 4242",
         "python3 ~/.claude/hooks/run_capped.py --max-rss-gb 1 /usr/bin/pkill -f node",

@@ -1341,7 +1341,7 @@ def evaluate_pr(client, slug, number, target=None):
     if not isinstance(pr, dict):
         raise GateError("the pull request data is unreadable")
     head = str(pr.get("headRefOid") or "").lower()
-    if not SHA.match(head):
+    if not SHA.fullmatch(head):
         raise GateError("the pull request head SHA is missing")
     m = re.match(r"^https://[^/]+/([\w.-]+)/([\w.-]+)/pull/(\d+)", str(pr.get("url") or ""))
     if not m:
@@ -1402,17 +1402,23 @@ def evaluate_pr(client, slug, number, target=None):
         elif name in apps and not any(e["src"] == "api" and e["app"] in apps[name] and e["v"] == "ok" for e in mine):
             reasons.append(f"required check '{clean(name)}' has no success from the required app")
     no_ci = False
-    if not entries and known and not required:
-        # Zero reports: fine only when no ACTIVE workflow could have run on this head (GitHub CI switched off).
+    if known and not required:
+        # Nothing is required, so the workflows decide. goodqa#15282 red-team H3: a report from outside the repo's
+        # workflows (a commit status anyone with push can post, an external app, a lone skipped run) is not CI, so the
+        # workflows are classified even when something reported, and a head with no success counts as unchecked.
+        succeeded = any(e["v"] == "ok" for e in entries)
         try:
             found = _ci_capable_workflows(client, slug, head, base)
-            reasons.extend(found)
-            no_ci = not found
-            if found:
-                unsettled.append("(no checks reported)")
         except (GateError, ValueError, TypeError, AttributeError):
-            reasons.append("no checks reported and the workflow list could not be read")
-            unsettled.append("(no checks reported)")
+            found = None
+        if found is None:
+            reasons.append("no required checks and the workflow list could not be read")
+            unsettled.append("(workflows unreadable)")
+        elif not found:
+            no_ci = True  # no workflow could run: evaluate_merge asks for exact-head evidence
+        elif not succeeded:
+            reasons.extend(found)
+            unsettled.append("(no checks reported)" if not entries else "(no check succeeded)")
     again = client.json(["pr", "view", str(number), "-R", slug, "--json", "headRefOid"], "the pull request head")
     if str((again or {}).get("headRefOid") or "").lower() != head:
         raise GateError("the pull request head moved while the checks were read")
@@ -1448,6 +1454,11 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
         details, soft = evaluate_pr(client, slug, number, merge.target)
         info.update(repo=details["slug"], pr=details["number"], head=details["head"], no_ci=details.get("no_ci"),
                     unsettled=details.get("unsettled") or [])
+        if details.get("no_ci"):
+            # goodqa#15282 (amends goodqa#14669 AC-1): with GitHub CI switched off nothing was checked, so the merge
+            # needs positive evidence instead: an exact-head waiver, or the one a bound PR review authorization writes
+            soft.append("GitHub CI is switched off for this repository, so no check ran on this head; the merge needs "
+                        "an exact-head waiver or a PR review authorization (peer_review.py pr --github-repo --pr)")
         if merge.kind != "check":
             if merge.head_unknown or not merge.head_vals:
                 hard.append(f"the merge must carry the verified head: add {merge.binding.replace('<full head sha>', details['head'])}")
@@ -1457,7 +1468,8 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
         hard.append(str(error))
     if not hard and not soft:
         return True, "", info
-    if not hard and info["head"]:
+    # red-team M1: `merge_gate.py check` is a read-only query; it must never spend the single-use evidence
+    if not hard and info["head"] and merge.kind != "check":
         wid = consume_waiver(state_dir, info["repo"], info["pr"], info["head"], command_hash, now=now,
                              review_ok=not info.get("unsettled"))
         if wid:
@@ -1573,7 +1585,7 @@ def add_waiver(state_dir, repo, pr, head, ticket, reason, approved_by, source="a
         raise ValueError("repo must be owner/name")
     if not isinstance(pr, int) or pr <= 0:
         raise ValueError("pr must be a positive integer")
-    if not re.match(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$", str(head)):
+    if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", str(head)):  # red-team L1: no trailing newline
         raise ValueError("head must be the full lowercase SHA")
     if not re.match(r"^GoodQA (?:[\w-]+)?#\d+$", str(ticket)):
         raise ValueError("ticket must look like 'GoodQA #123' or 'GoodQA project#123'")

@@ -219,7 +219,7 @@
     {"id": "green-graphql", "command": "gh api graphql -f query={SQ}mutation { mergePullRequest(input:{pullRequestId:\"PR_kwDOabc\", expectedHeadOid:\"{HEAD}\"}) { clientMutationId } }{SQ}", "scenario": "green", "expect": "allow"},
     {"id": "green-rules-only", "command": "gh pr merge 5 --match-head-commit {HEAD}", "scenario": "green_rules_only", "expect": "allow"},
     {"id": "green-skipped-not-required", "command": "gh pr merge 5 --match-head-commit {HEAD}", "scenario": "skipped_not_required", "expect": "allow"},
-    {"id": "zero-unprotected", "command": "gh pr merge 5 --match-head-commit {HEAD}", "scenario": "zero_unprotected", "expect": "allow"},
+    {"id": "zero-unprotected", "command": "gh pr merge 5 --match-head-commit {HEAD}", "scenario": "zero_unprotected", "expect": "block"},
     {"id": "near-disable-auto-allowed", "command": "gh pr merge --disable-auto 5", "scenario": "red_netwatch", "expect": "allow"},
     {"id": "rt-backslash-newline-red", "command": "gh pr \\\nmerge 5 -R o/r --match-head-commit {HEAD}", "scenario": "red_netwatch", "expect": "block", "text": "staticcheck"},
     {"id": "rt-var-then-run-green", "command": "CMD={SQ}gh pr merge 5 -R o/r --match-head-commit {HEAD}{SQ}; $CMD", "scenario": "green", "expect": "block", "nowaiver": true},
