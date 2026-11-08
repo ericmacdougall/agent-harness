@@ -351,19 +351,24 @@ def ledger_checker(policy: dict, context, as_of_ms: int):
     return check
 
 
-# goodqa#15253 B1: which harness a commit is made from, by where this file is installed. The Claude install lives in
-# ~/.claude/hooks and the Codex install in ~/.codex/agent-harness; a repository checkout returns None (not enforced).
-INSTALL_HARNESS = None  # tests set 'claude' or 'openai'
+# goodqa#15253 B1: which harness a commit is made from. Delta red-team D-F1: not where this file is installed,
+# because both the ~/.claude and the ~/.codex commit-msg hooks run on every commit, so an install-path rule made each
+# copy refuse the other harness's trailer. The committing process's own markers decide; with neither or both, or
+# only the ambiguous AI_AGENT, the check does not apply.
+HARNESS_OVERRIDE = None  # tests set 'claude', 'openai' or '' (unknown)
+CLAUDE_MARKERS = ("CLAUDECODE",)
+CODEX_MARKERS = ("CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "CODEX_SANDBOX")
 
 
-def install_harness():
-    if INSTALL_HARNESS is not None:
-        return INSTALL_HARNESS or None
-    if HERE.parent.name == ".codex":
-        return "openai"
-    if HERE.parent.name == ".claude" and HERE.name == "hooks":
-        return "claude"
-    return None
+def commit_harness(env=None):
+    if HARNESS_OVERRIDE is not None:
+        return HARNESS_OVERRIDE or None
+    env = os.environ if env is None else env
+    claude = any(env.get(name) for name in CLAUDE_MARKERS)
+    codex = any(env.get(name) for name in CODEX_MARKERS)
+    if claude == codex:
+        return None
+    return "claude" if claude else "openai"
 
 
 def trailer_harness(line: str):
@@ -521,7 +526,7 @@ def validate(message: str, *, policy: dict, previous: str | None = None, is_merg
                                 "e.g. 'Authorized-by: Eric, GoodQA #14151'")
     if misplaced:
         problems.append("trailers: move Co-Authored-By/Signed-off-by lines to a final paragraph after a blank line")
-    harness = install_harness()
+    harness = commit_harness()
     if harness:
         named = {trailer_harness(line) for line in trailers if re.match(r"(?i)\s*co-authored-by\s*:", line)} - {None}
         if named - {harness}:

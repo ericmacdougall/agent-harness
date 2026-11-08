@@ -1088,13 +1088,13 @@ class AuthorTrailerHarness(unittest.TestCase):
             "Testing: `python3 -m unittest tests.test_x` 3 OK\n\nRefs: GoodQA #1234\n\n")
 
     def problems(self, harness, trailer):
-        old = cp.INSTALL_HARNESS
-        cp.INSTALL_HARNESS = harness
+        old = cp.HARNESS_OVERRIDE
+        cp.HARNESS_OVERRIDE = harness
         try:
             return [p for p in cp.validate(self.BODY + trailer + "\n", policy=cp.load_policy())
                     if "harness" in p]
         finally:
-            cp.INSTALL_HARNESS = old
+            cp.HARNESS_OVERRIDE = old
 
     def test_a_trailer_naming_the_other_harness_is_refused(self):
         self.assertTrue(self.problems("claude", "Co-Authored-By: Codex <noreply@openai.com>"))
@@ -1106,6 +1106,38 @@ class AuthorTrailerHarness(unittest.TestCase):
         self.assertFalse(self.problems("claude", "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"))
         self.assertFalse(self.problems("openai", "Co-Authored-By: GPT-5 Codex <noreply@openai.com>"))
         self.assertFalse(self.problems("", "Co-Authored-By: Codex <noreply@openai.com>"))
+
+    def test_harness_comes_from_the_committing_process(self):
+        # delta red-team D-F1
+        self.assertEqual(cp.commit_harness({"CLAUDECODE": "1"}), "claude")
+        self.assertEqual(cp.commit_harness({"CODEX_THREAD_ID": "t1"}), "openai")
+        self.assertIsNone(cp.commit_harness({"CLAUDECODE": "1", "CODEX_SANDBOX": "seatbelt"}))
+        self.assertIsNone(cp.commit_harness({"AI_AGENT": "1"}))
+        self.assertIsNone(cp.commit_harness({}))
+
+    def test_both_installed_copies_accept_the_committing_harness_trailer(self):
+        # delta red-team D-F1: the ~/.claude and ~/.codex hooks both run on every commit; neither may refuse the
+        # trailer of the harness actually committing, and both refuse the other one
+        import shutil
+        import tempfile
+        with tempfile.TemporaryDirectory() as home:
+            copies = [Path(home) / ".claude" / "hooks", Path(home) / ".codex" / "agent-harness"]
+            for dest in copies:
+                shutil.copytree(HOOKS, dest, ignore=shutil.ignore_patterns("__pycache__"))
+            msg = Path(home) / "msg.txt"
+            base = {"HOME": home, "PATH": "/usr/bin:/bin"}
+            cases = (({"CLAUDECODE": "1"}, "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>", False),
+                     ({"CODEX_THREAD_ID": "t1"}, "Co-Authored-By: GPT-5 Codex <noreply@openai.com>", False),
+                     ({"CLAUDECODE": "1"}, "Co-Authored-By: GPT-5 Codex <noreply@openai.com>", True),
+                     ({"CODEX_THREAD_ID": "t1"}, "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>", True))
+            for marker, trailer, refused in cases:
+                msg.write_text(self.BODY + trailer + "\n")
+                for dest in copies:
+                    with self.subTest(copy=dest.parent.name, marker=marker, trailer=trailer):
+                        out = subprocess.run([sys.executable, "-I", str(dest / "commit_policy.py"), "check-message",
+                                              "--file", str(msg)], capture_output=True, text=True, timeout=60,
+                                             env=dict(base, **marker))
+                        self.assertEqual("this commit is made from the" in out.stdout, refused, out.stdout[-400:])
 
 if __name__ == "__main__":
     unittest.main()
