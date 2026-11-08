@@ -1037,6 +1037,10 @@ When a repo shows blockchain work, the spec flow and the reviewers get a data-dr
 - **Enforcing on `harness`:** once #35672 is resolved, add `{"key_file": ...}` to its route, run `doctor --project harness`, then set `"enforced_projects": ["harness"]` and `"mode": "enforce"`.
 - **Rollback:** set the modes to `off`, or delete the `spec_flow.py hook` handler from `~/.claude/settings.json`.
 
+### Legacy done (no spec)
+
+Tickets that predate the spec flow cannot satisfy `spec_flow.py done`. `spec_flow.py done --ticket <ref> --legacy --repo <checkout> --merge <sha> --deploy <wal-id> --really-tested <wal-id> --wal <main WAL>` replaces the spec evaluation with three bound checks, and never touches the non-legacy path. READY needs: the merge sha is an ancestor of the default branch (origin/HEAD, else origin/main, origin/master, main, master) and its commit message cites the ticket; the `--deploy` WAL entry exists, mentions LIVE or deploy (and does not say it was not live) and names the ticket number or the first 7 characters of the sha; the `--really-tested` entry exists, starts with `REALLY_TESTED` and names the ticket number or sha7. Each failure is listed by name (for example `merge sha abc is not on main`). It is an evidence report only: it makes no tracker call, and `--apply` is refused, because it does not read the ticket's spec records, accepts a local default branch when no `origin/*` exists, and cannot tell who wrote the two WAL entries (review F4). Close the ticket through the spec gate, or a person closes it after reading the report.
+
 ## Merge gate
 
 Why: an owner merged netwatch PR #1 while its CI was red (staticcheck and Windows vet failing). `harness/hooks/merge_gate.py` is a PreToolUse hook (Claude Code: Bash and the write tools, `onFailure: block`; Codex: PreToolUse, command ends in `|| exit 2`) that blocks a PR merge unless every required and every reported check run and commit status on the exact head SHA concluded success. GoodQA #14502, matrix D11. The rule is in `docs/rules/merge-gate.json` for the rules registry.
