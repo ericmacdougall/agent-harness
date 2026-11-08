@@ -558,7 +558,7 @@ def index_transcript(home: Path, session: str) -> dict:
             if content is not None:
                 digest = hashlib.sha256(content.encode()).hexdigest()[:12]
                 idx["msgs"].append(_msg("queued", f"queue:{session}/{rec.get('timestamp')}#{digest}",
-                                        rec.get("timestamp"), content, prov.QUEUE_TRUST, off))
+                                        rec.get("timestamp"), prov.strip_blocks(content), prov.QUEUE_TRUST, off))
     idx["askq"] = sorted(askq)
     atomic_json(cache, idx)
     return idx
@@ -599,8 +599,9 @@ def verify_rows(path: Path, rows: list) -> list:
                 text, _ = prov.user_authorship(rec)
                 good = text is not None and rec.get("uuid") == m["id"].split("/", 1)[1]
             elif m["kind"] == "queued":
-                text = prov.queue_user_text(rec)
-                good = text is not None and m["id"].endswith("#" + hashlib.sha256(text.encode()).hexdigest()[:12])
+                raw = prov.queue_user_text(rec)
+                good = raw is not None and m["id"].endswith("#" + hashlib.sha256(raw.encode()).hexdigest()[:12])
+                text = prov.strip_blocks(raw) if raw is not None else None
             else:
                 text = _answer_values_cache(rec, path)
                 good = text is not None and rec.get("uuid") == m["id"].split("/", 1)[1]

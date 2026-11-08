@@ -727,7 +727,9 @@ def queue_turn(session: str, ident, home=None) -> dict:
             continue
         text = queue_user_text(record)
         if text is not None and record.get("timestamp") == stamp and hashlib.sha256(text.encode()).hexdigest()[:12] == sha:
-            return {"text": text, "timestamp": stamp, "uuid": f"{stamp}#{sha}", "session": session}
+            # B6 (step-1 red-team): like a human turn, pasted and injected blocks are not the user's words. The id
+            # still hashes the raw content, so `ah user-msg` ids stay stable.
+            return {"text": strip_blocks(text), "timestamp": stamp, "uuid": f"{stamp}#{sha}", "session": session}
     raise Problem("message-not-found", f"no queued user message {stamp}#{sha} in session {clip(session, 40)}")
 
 
