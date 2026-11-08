@@ -103,6 +103,10 @@ MERGE_HINT = re.compile(r"\bgh\b|merge|pulls|graphql|api\.github", re.I)
 DYNAMIC_WORD = re.compile(r"^(?:\$|\$\w+|\$\{[^}]*\}\w*)$")  # a command word that is only a variable or substitution
 GH_HINT = re.compile(r"\bgh\b|merge|curl|wget|\bhttps?\b|python|node|perl|ruby|ssh|eval|graphql|pulls|api\.github", re.I)
 STATE_NAMES = re.compile(r"merge-gate[-/](?:waivers|audit|approvals)", re.I)
+# #134 red-team P2: the peer_review run that mints a merge authorization (pr stage with a GitHub binding)
+PEER_REVIEW_AUTH = re.compile(r"peer_review(?:\.py)?['\"]?\s+pr\b[^\n;&|]*--(?:github-repo|pr)\b")
+# a check that ran and did not pass; a review authorization never covers one (pending and missing checks it may)
+CONCLUDED_FAILURE = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE", "ERROR"}
 STATE_GLOB = re.compile(r"merge-gate-[wa*?\[]", re.I)  # subagents: globs and split spellings of the state files
 WAIVE_CMD = re.compile(r"merge_gate(?:\.py)?['\"]?\s+(?:--\S+\s+\S+\s+)*waive\b")
 WAIVE_ANY = re.compile(r"waive|add_waiver|consume_waiver|put_stamp|take_stamp", re.I)
@@ -1382,6 +1386,7 @@ def evaluate_pr(client, slug, number, target=None):
                            "already reported, and mergeStateStatus is " + clean(pr.get("mergeStateStatus") or "missing")
                            + " (needs CLEAN or HAS_HOOKS)")
     entries = _entries(pr, runs, statuses, head, reasons)
+    failed = sorted({clean(e["name"]) for e in entries if e["v"] == "bad" and str(e["d"]).upper() in CONCLUDED_FAILURE})
     for e in entries:
         name = clean(e["name"])
         if e["v"] == "bad":
@@ -1406,7 +1411,7 @@ def evaluate_pr(client, slug, number, target=None):
     again = client.json(["pr", "view", str(number), "-R", slug, "--json", "headRefOid"], "the pull request head")
     if str((again or {}).get("headRefOid") or "").lower() != head:
         raise GateError("the pull request head moved while the checks were read")
-    return {"slug": slug, "number": number, "head": head, "no_ci": no_ci}, reasons
+    return {"slug": slug, "number": number, "head": head, "no_ci": no_ci, "failed": failed}, reasons
 
 
 def _resolve_graphql(client, node_ids):
@@ -1436,7 +1441,8 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
         if merge.kind == "graphql":
             slug, number = _resolve_graphql(client, merge.node_ids)
         details, soft = evaluate_pr(client, slug, number, merge.target)
-        info.update(repo=details["slug"], pr=details["number"], head=details["head"], no_ci=details.get("no_ci"))
+        info.update(repo=details["slug"], pr=details["number"], head=details["head"], no_ci=details.get("no_ci"),
+                    failed=details.get("failed") or [])
         if merge.kind != "check":
             if merge.head_unknown or not merge.head_vals:
                 hard.append(f"the merge must carry the verified head: add {merge.binding.replace('<full head sha>', details['head'])}")
@@ -1447,7 +1453,8 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
     if not hard and not soft:
         return True, "", info
     if not hard and info["head"]:
-        wid = consume_waiver(state_dir, info["repo"], info["pr"], info["head"], command_hash, now=now)
+        wid = consume_waiver(state_dir, info["repo"], info["pr"], info["head"], command_hash, now=now,
+                             review_ok=not info.get("failed"))
         if wid:
             info["waiver"] = wid
             return True, "", info
@@ -1540,9 +1547,11 @@ def _append_waiver_record(state_dir, record):
     return record
 
 
-def _active(records, repo, pr, head, now):
+def _active(records, repo, pr, head, now, review_ok=True):
     used = {r.get("waiver") for r in records if r.get("event") == "consume"}
     for r in records:
+        if not review_ok and r.get("approval_source") == "settled-review":
+            continue  # #134 red-team P1: a review authorization never passes a check that concluded in failure
         if (r.get("event") == "waive" and r.get("id") not in used and str(r.get("repo", "")).lower() == repo.lower()
                 and r.get("pr") == pr and r.get("head") == head and now < float(r.get("ts", 0)) + WAIVER_TTL_SECONDS):
             return r
@@ -1638,7 +1647,7 @@ def add_review_waiver(state_dir, reference, *, store=None, now=None):
     return record
 
 
-def consume_waiver(state_dir, repo, pr, head, command_hash, now=None):
+def consume_waiver(state_dir, repo, pr, head, command_hash, now=None, review_ok=True):
     state_dir = Path(state_dir)
     try:
         lock = _lock(state_dir)
@@ -1646,7 +1655,7 @@ def consume_waiver(state_dir, repo, pr, head, command_hash, now=None):
         return None
     try:
         records = _read_waivers(state_dir)
-        waiver = _active(records, repo, pr, head, now or time.time())
+        waiver = _active(records, repo, pr, head, now or time.time(), review_ok)
         if not waiver:
             return None
         _append_waiver_record(state_dir, {"event": "consume", "waiver": waiver["id"], "ts": now or time.time(),
@@ -1777,6 +1786,9 @@ def decide(payload, runner, state_dir, now=None):
     plain = re.sub(r"[\"'\\$]", "", command)  # w''aive, $M and escaped spellings
     if STATE_NAMES.search(command) or STATE_NAMES.search(plain):
         return 2, "merge-gate: the waiver, audit and approval files are written only by merge_gate.py itself."
+    if subagent and PEER_REVIEW_AUTH.search(plain):
+        return 2, ("merge-gate: a subagent cannot run the PR review that mints a merge authorization (--github-repo/"
+                   "--pr); run it without the GitHub binding, or ask the main agent.")
     if subagent and (STATE_GLOB.search(plain) or _waiver_attempt(command)):
         return 2, "merge-gate: only the main agent may record a waiver; ask the main agent."
     if WAIVE_CMD.search(command) and not subagent:

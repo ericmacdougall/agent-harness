@@ -927,6 +927,50 @@ def verify_pr_binding(repository, number, head, *, runner=None):
     return {'repo': repository.lower(), 'pr': number}
 
 
+AUTHOR_TRAILER = re.compile(r'^co-authored-by:\s*(.+)$', re.I | re.M)
+
+
+def trailer_harness(trailer):
+    """'claude', 'openai' or None for one Co-Authored-By value."""
+    low = trailer.lower()
+    if 'anthropic.com' in low or re.search(r'\bclaude\b', low):
+        return 'claude'
+    if 'openai.com' in low or re.search(r'\b(?:codex|gpt-?[0-9a-z.]*|openai)\b', low):
+        return 'openai'
+    return None
+
+
+def commit_author_harness(repo, base):
+    """The author harness the reviewed commits prove: every commit in base..HEAD (all of HEAD's history when no
+    base is known, at most 500) carries Co-Authored-By trailers naming exactly one harness, the same one. Anything
+    else, including a commit with no trailer, is 'unknown' (goodqa#15253, #134 red-team P1)."""
+    try:
+        text = git(repo, 'log', '--max-count=500', '--format=%B%x00', (base + '..HEAD') if base else 'HEAD')
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 'unknown'
+    found = set()
+    commits = [body for body in text.split('\0') if body.strip()]
+    if not commits:
+        return 'unknown'
+    for body in commits:
+        names = {trailer_harness(t) for t in AUTHOR_TRAILER.findall(body)}
+        if len(names) != 1 or None in names:
+            return 'unknown'
+        found |= names
+    return found.pop() if len(found) == 1 else 'unknown'
+
+
+def pr_base(repo, base):
+    if base:
+        return base
+    for candidate in ('refs/remotes/origin/HEAD', 'refs/remotes/origin/main', 'refs/remotes/origin/master'):
+        done = subprocess.run(['git', '-C', str(repo), 'rev-parse', '-q', '--verify', candidate + '^{commit}'],
+                              capture_output=True, text=True)
+        if done.returncode == 0 and done.stdout.strip():
+            return candidate
+    return None
+
+
 def review_merge_eligible(args, binding, report, selection):
     """Only a pure PR PASS with a known different-harness reviewer may auto-authorize."""
     return bool(args.stage == 'pr' and binding and args.author_harness in {'claude', 'openai'}
@@ -1307,6 +1351,19 @@ def main() -> int:
             evidence.close()
             print('PR review not started: fix the commit policy findings above first.', file=sys.stderr)
             return code
+        # #134 red-team P1: --author-harness is a claim; the commits are the evidence. A contradiction refuses the
+        # review, and commits that prove nothing make the author 'unknown', which can never authorize a merge.
+        evidenced = commit_author_harness(repo, pr_base(repo, args.base))
+        if args.author_harness != 'unknown' and evidenced != 'unknown' and evidenced != args.author_harness:
+            target.close()
+            evidence.close()
+            print('PR review refused: --author-harness %s, but the reviewed commits are co-authored by %s'
+                  % (args.author_harness, evidenced), file=sys.stderr)
+            return 2
+        if evidenced != args.author_harness:
+            print('Note: the reviewed commits do not prove the author harness (%s); this review cannot authorize '
+                  'a merge.' % evidenced, file=sys.stderr)
+        args.author_harness = evidenced
     stage_rules = (
         "Planning gate: judge the proposed design, acceptance criteria, edge cases, test strategy, "
         "and rollout/rollback plan. You may read repository context. Do not BLOCK solely for an "

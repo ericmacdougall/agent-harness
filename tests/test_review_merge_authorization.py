@@ -129,17 +129,21 @@ class AuthorizationTests(unittest.TestCase):
         command = command or "gh pr merge 5 --match-head-commit " + HEAD
         return mg.decide(fixture.bash(command), gh, self.state)
 
-    def test_pass_authorization_allows_soft_red_and_pending_without_waive_command(self):
-        for scenario in ("red_netwatch", "pending_run"):
-            with self.subTest(scenario=scenario):
-                self.state = self.root / scenario
-                waiver = self.authorize()
-                self.assertEqual((waiver["repo"], waiver["pr"], waiver["head"], waiver["report_sha256"]),
-                                 ("o/r", 5, HEAD, REPORT_SHA))
-                code, text = self.decide(scenario)
-                self.assertEqual(code, 0, text)
-                code, text = self.decide(scenario)
-                self.assertEqual(code, 2, "the same PASS authorization must not replay: " + text)
+    def test_pass_authorization_allows_a_pending_check_without_waive_command(self):
+        waiver = self.authorize()
+        self.assertEqual((waiver["repo"], waiver["pr"], waiver["head"], waiver["report_sha256"]),
+                         ("o/r", 5, HEAD, REPORT_SHA))
+        code, text = self.decide("pending_run")
+        self.assertEqual(code, 0, text)
+        code, text = self.decide("pending_run")
+        self.assertEqual(code, 2, "the same PASS authorization must not replay: " + text)
+
+    def test_pass_authorization_never_passes_a_check_that_concluded_in_failure(self):
+        # #134 red-team P1: the review covers missing or pending CI, not CI that ran and failed
+        self.authorize()
+        code, text = self.decide("red_netwatch")
+        self.assertEqual(code, 2, text)
+        self.assertEqual(self.decide("pending_run")[0], 0, "the refused merge must not have used the authorization")
 
     def test_wrong_head_repo_pr_and_reviewer_binding_are_refused(self):
         with self.assertRaises(ValueError):
@@ -161,8 +165,8 @@ class AuthorizationTests(unittest.TestCase):
         self.assertEqual(first["id"], second["id"])
         records = mg._read_waivers(self.state)
         self.assertEqual(sum(row.get("event") == "waive" for row in records), 1)
-        self.assertEqual(self.decide()[0], 0)
-        self.assertEqual(self.decide()[0], 2)
+        self.assertEqual(self.decide("pending_run")[0], 0)
+        self.assertEqual(self.decide("pending_run")[0], 2)
 
     def test_arbitrary_hashes_cannot_forge_review_approval(self):
         with self.assertRaises(TypeError):
@@ -203,6 +207,10 @@ class EndToEndTests(unittest.TestCase):
         (self.repo / "app.txt").write_text("baseline\n")
         subprocess.run(["git", "-C", str(self.repo), "add", "app.txt"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "baseline"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
+        (self.repo / "app.txt").write_text("change\n")
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-qam", "feat: change\n\nRefs: none (fixture)\n\n"
+                        "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"], check=True)
         self.head = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
         self.packet = self.root / "packet.md"
         self.packet.write_text("Scope and evidence.\nReviewed HEAD " + self.head +
@@ -252,10 +260,10 @@ class EndToEndTests(unittest.TestCase):
         fixture.HEAD = self.head
         try:
             code, text = mg.decide(fixture.bash("gh pr merge 5 --match-head-commit " + self.head),
-                                   fixture.FakeGh(fixture.SCENARIOS["red_netwatch"]), state)
+                                   fixture.FakeGh(fixture.SCENARIOS["pending_run"]), state)
             self.assertEqual(code, 0, text)
             code, text = mg.decide(fixture.bash("gh pr merge 5 --match-head-commit " + self.head),
-                                   fixture.FakeGh(fixture.SCENARIOS["red_netwatch"]), state)
+                                   fixture.FakeGh(fixture.SCENARIOS["pending_run"]), state)
             self.assertEqual(code, 2, text)
         finally:
             fixture.HEAD = original_head
@@ -276,6 +284,61 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("Reviewer: Claude", output.read_text())
         self.assertNotIn("Merge authorization:", result.stdout)
         self.assertFalse((self.root / ".agent-harness" / "state").exists())
+
+
+    def run_review(self, *extra):
+        output = self.root / "probe-review.md"
+        env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
+                   AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"),
+                   AGENT_HARNESS_REVIEW_POLICY=str(ROOT / "harness" / "hooks" / "review_policy.json"))
+        return subprocess.run([
+            sys.executable, str(HOOKS / "peer_review.py"), "pr", "--repo", str(self.repo),
+            "--packet", str(self.packet), "--output", str(output), "--expected-head", self.head,
+            "--github-repo", "o/r", "--pr", "5", *extra], text=True, capture_output=True, env=env, timeout=45)
+
+    def test_declared_author_harness_that_contradicts_the_commits_is_refused(self):
+        # #134 red-team P1: a Claude-authored change declared as openai would get a Claude reviewer
+        self.fake("claude", "import sys\nsys.exit(99)\n")
+        result = self.run_review("--author-harness", "openai")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("co-authored by claude", result.stderr)
+        self.assertNotIn("Merge authorization:", result.stdout)
+
+    def test_commits_without_author_evidence_cannot_authorize(self):
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "--allow-empty", "-m",
+                        "chore: no trailer\n\nRefs: none (fixture)"], check=True)
+        self.head = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
+        self.packet.write_text("Scope and evidence.\nReviewed HEAD " + self.head +
+                               "\n$ python3 -m unittest discover tests\nRan 1 test in 0.1s\nOK\nexit 0\n")
+        value = {"number": 5, "url": "https://github.com/o/r/pull/5", "headRefOid": self.head, "state": "OPEN"}
+        self.fake("gh", "import json\nprint(json.dumps(" + repr(value) + "))\n")
+        result = self.run_review("--author-harness", "claude")
+        self.assertNotIn("Merge authorization:", result.stdout, result.stdout + result.stderr)
+        self.assertIn("do not prove the author harness", result.stderr)
+
+
+class SubagentAuthorization(unittest.TestCase):
+    """#134 red-team P2: a subagent cannot mint a merge authorization."""
+
+    def test_subagent_pr_review_with_a_github_binding_is_blocked(self):
+        with tempfile.TemporaryDirectory() as d:
+            for cmd in ("python3 /x/.claude/hooks/peer_review.py pr --repo /w --packet /p --output /o "
+                        "--expected-head " + "a" * 40 + " --github-repo o/r --pr 5",
+                        "python3 ~/.claude/hooks/peer_review.py pr --repo /w --pr 5 --packet /p --output /o"):
+                payload = dict(fixture.bash(cmd), agent_id="sub1")
+                code, text = mg.decide(payload, fixture.FakeGh(fixture.SCENARIOS["red_netwatch"]), Path(d))
+                self.assertEqual(code, 2, cmd)
+                self.assertIn("subagent cannot run the PR review", text)
+
+    def test_main_and_unbound_subagent_reviews_still_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            bound = ("python3 /x/.claude/hooks/peer_review.py pr --repo /w --packet /p --output /o "
+                     "--expected-head " + "a" * 40 + " --github-repo o/r --pr 5")
+            self.assertEqual(mg.decide(fixture.bash(bound), fixture.FakeGh(fixture.SCENARIOS["red_netwatch"]),
+                                       Path(d))[0], 0)
+            unbound = dict(fixture.bash("python3 /x/.claude/hooks/peer_review.py pr --repo /w --packet /p "
+                                        "--output /o --expected-head " + "a" * 40), agent_id="sub1")
+            self.assertEqual(mg.decide(unbound, fixture.FakeGh(fixture.SCENARIOS["red_netwatch"]), Path(d))[0], 0)
 
 
 if __name__ == "__main__":
