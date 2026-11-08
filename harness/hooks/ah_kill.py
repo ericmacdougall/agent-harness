@@ -149,6 +149,14 @@ class Probe:
         m = SESSION_ENV.search(out)
         return m.group(1) if m else None
 
+    def cpu(self, pid: int):
+        """Current %CPU as a float, or None."""
+        out = self._ps("%cpu", pid=pid).strip()
+        try:
+            return float(out.split()[0]) if out else None
+        except ValueError:
+            return None
+
     def table(self):
         """{pid: ppid} for every process."""
         rows = {}
@@ -203,8 +211,9 @@ def interactive_shell(info, base) -> bool:
     return not any(not w.startswith("-") for w in words)  # no script or -c program: it reads the terminal
 
 
-def refusal(info, my_uid: int, protected: set, probe=None, table=None):
-    """Reason string when this process may never be signalled, else None. No flag reaches this function."""
+def refusal(info, my_uid: int, protected: set, probe=None, table=None, skip_approvable=False):
+    """Reason string when this process may never be signalled, else None. No flag reaches this function, except
+    skip_approvable: with a verified --approved-by, the APPROVABLE reasons are skipped and every other one applies."""
     pid = info["pid"]
     if pid <= 1:
         return "pid 1 and below are never signalled"
@@ -219,9 +228,11 @@ def refusal(info, my_uid: int, protected: set, probe=None, table=None):
     if SYSTEM_PATH.match(comm) or SYSTEM_PATH.match(first) or SYSTEM_PATH.match(info.get("command") or ""):
         return "system process (/System or /usr/libexec)"
     base = os.path.basename(comm).lower()
-    if base in PROTECTED_COMM or os.path.basename(first).lower() in {"sshd", "launchd"}:
+    if os.path.basename(first).lower() in {"sshd", "launchd"}:
         return "protected process (%s)" % base
-    if is_session_process(info):
+    if base in PROTECTED_COMM and not (skip_approvable and base in APPROVABLE_COMM):
+        return "protected process (%s)" % base
+    if is_session_process(info) and not skip_approvable:
         return "claude/codex session process"
     if interactive_shell(info, base):
         return "interactive shell"
@@ -230,12 +241,119 @@ def refusal(info, my_uid: int, protected: set, probe=None, table=None):
     words = [comm] + (info.get("command") or "").split()[:8]
     for w in words:
         name = re.sub(r"\.(py|sh)$", "", os.path.basename(w).lower())
-        if name in DAEMON_NAMES or name.startswith(DAEMON_PREFIXES):
+        if (name in DAEMON_NAMES or name.startswith(DAEMON_PREFIXES)) and not (
+                skip_approvable and name.startswith("harness-console")):
             return "harness daemon or backup job (%s)" % name
     if probe is not None and table is not None and MCP_WORD.search(info.get("command") or ""):
         owner = session_ancestor(probe, table, pid)
         if owner is not None:  # stopping one breaks that session's tools, mine included
             return "MCP server of a live claude/codex session (pid %d)" % owner
+    return None
+
+
+# ---- --approved-by (goodqa#15253): a stop of a stale protected process that the user approved
+
+APPROVABLE_COMM = {"claude", "codex"}
+# Only the harness console daemon: backups (rclone, log_backup), netwatch, hookd and ahd stay unstoppable here.
+APPROVABLE = re.compile(r"^(?:harness daemon or backup job \(harness-console[\w.-]*\)$|claude/codex session process$|"
+                        r"protected process \((?:claude|codex)\)$)")
+APPROVAL_MAX_AGE_S = 24 * 3600
+APPROVED_IDLE_S = 24 * 3600
+ASK_ID = re.compile(r"[A-Za-z0-9_-]{4,40}")
+
+
+def _provenance():
+    import importlib.util  # noqa: PLC0415
+    spec = importlib.util.spec_from_file_location("provenance", str(Path(__file__).resolve().with_name("provenance.py")))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _epoch_iso(value):
+    try:
+        return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _epoch_lstart(value):
+    try:
+        return time.mktime(time.strptime(" ".join(str(value).split()), "%a %b %d %H:%M:%S %Y"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def resolve_approval(ask_id, session, home, now=None, prov=None):
+    """The verified approval {ask, source, uuid, text, at} or KillError. The ask must be one of this session's, resolved
+    by a source that provenance traces to a real human turn at most APPROVAL_MAX_AGE_S old."""
+    if not ask_id or not ASK_ID.fullmatch(ask_id):
+        raise KillError("bad_request", "--approved-by needs the id of a resolved ask (wal_note --event ask)")
+    if not session or not SESSION_ID.fullmatch(session):
+        raise KillError("bad_request", "--approved-by needs this session's id (--session or CLAUDE_CODE_SESSION_ID)")
+    prov = prov or _provenance()
+    claude = Path(home) / ".claude"
+    try:
+        entries = prov.ledger(session, claude)
+    except Exception as error:  # noqa: BLE001
+        raise KillError("approval_invalid", "the asks ledger could not be read (%s)" % type(error).__name__)
+    ask = next((r for r in entries if r.get("id") == ask_id), None)
+    if ask is None:
+        raise KillError("approval_invalid", "no ask %s in this session's WALs" % ask_id)
+    closed = ask.get("_closed") or {}
+    if not closed.get("source"):
+        raise KillError("approval_invalid", "ask %s has no ask_resolved entry citing the user's answer" % ask_id)
+    result = prov.resolve(closed["source"], {"home": claude, "want_text": True})
+    node = next((n for n in result.get("chain", []) if n.get("kind") == "user"), None)
+    if not result.get("ok") or result.get("origin") != "user" or result.get("assumption") or result.get("weak") \
+            or node is None:
+        raise KillError("approval_invalid", "ask %s was not resolved by a verified human turn (user:, answer: or "
+                        "queue:); a ticket, pasted text or inference cannot approve a stop" % ask_id)
+    at = _epoch_iso(node.get("timestamp"))
+    now = time.time() if now is None else now
+    if at is None or not 0 <= now - at <= APPROVAL_MAX_AGE_S:
+        raise KillError("approval_invalid", "the approving human turn is missing a time or older than %d h"
+                        % (APPROVAL_MAX_AGE_S // 3600))
+    return {"ask": ask_id, "source": _clip(closed["source"], 200), "uuid": node.get("uuid"),
+            "text": str(node.get("text") or ""), "at": node.get("timestamp")}
+
+
+def _named(text, pid, root, info):
+    """True when the approving human text names this process: its pid, its --tree root's pid, or its program name."""
+    low = text.lower()
+    for number in {pid, root} - {None}:
+        if re.search(r"(?<![0-9])%d(?![0-9])" % number, low):
+            return True
+    first = (info.get("command") or "").split(" ")[0]
+    names = {re.sub(r"\.(py|sh|js)$", "", os.path.basename(w).lower()) for w in (info.get("comm") or "", first)}
+    for word in (info.get("command") or "").split()[1:4]:
+        name = re.sub(r"\.(py|sh|js)$", "", os.path.basename(word).lower())
+        if name in DAEMON_NAMES or name.startswith(DAEMON_PREFIXES):
+            names.add(name)
+    return any(len(n) >= 4 and re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(n), low) for n in names)
+
+
+def approval_problem(probe, info, pid, root, scope):
+    """None when the verified approval in scope covers this process, else the reason it does not."""
+    approval = scope["approval"]
+    if not _named(approval["text"], pid, root, info):
+        return "the approving answer does not name pid %d or its program" % pid
+    started = _epoch_lstart(info.get("start"))
+    if started is None:
+        return "its start time cannot be read"
+    if scope["now"] - started < APPROVED_IDLE_S:
+        return "it started less than %d h ago" % (APPROVED_IDLE_S // 3600)
+    if scope.get("session_start") is None or started >= scope["session_start"]:
+        return "it did not start before the current session"
+    if not (info.get("stat") or "").startswith(("S", "I")):
+        return "it is not sleeping"
+    cpu = getattr(probe, "cpu", None)
+    try:
+        used = cpu(pid) if cpu else None
+    except Exception:  # noqa: BLE001
+        used = None
+    if used is None or used > 0.0:
+        return "it is using CPU or its CPU use cannot be read"
     return None
 
 
@@ -419,6 +537,18 @@ def snapshot(probe, pid, my_uid, protected, root=None, role="target", scope=None
            "id": fingerprint(info), "_info": info}
     table = scope["table"] if scope else None
     why = refusal(info, my_uid, protected, probe if scope else None, table)
+    approval = scope.get("approval") if scope else None
+    if approval and not info["stat"].startswith("Z") and (
+            (why and APPROVABLE.match(why)) or (not why and not in_own_scope(
+                probe, table, pid, rec["cwd"], scope["roots"], scope["worktree"]))):
+        rest = refusal(info, my_uid, protected, probe, table, skip_approvable=True)
+        bound = rest or approval_problem(probe, info, pid, root, scope)
+        if bound is None:
+            rec["scope"], rec["approved"], rec["approved_by"] = "approved", True, approval["ask"]
+            rec["lifted"] = why  # the refusal the user's approval lifted (None: it was only outside the caller's tree)
+            return rec
+        if why:
+            why = "%s; --approved-by %s does not cover it: %s" % (why, approval["ask"], bound)
     if why:
         rec["status"], rec["detail"] = "refused", why
     elif info["stat"].startswith("Z"):
@@ -460,7 +590,8 @@ def alive(probe, rec) -> bool:
 
 def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=None, sleep=time.sleep,
                clock=time.monotonic, session="", agent="", wal_path=None, via=None, own_pid=None, foreign=False,
-               worktree="auto", notify=None, session_scope=False):
+               worktree="auto", notify=None, session_scope=False, approved_by=None, approval_resolver=None,
+               now=None):
     reason = (reason or "").strip()
     if not reason:
         raise KillError("reason_required", "--reason is mandatory and must not be empty")
@@ -489,6 +620,12 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
         worktree = probe.git_top(os.getcwd())
     scope = {"table": table, "roots": roots, "worktree": worktree, "foreign": foreign,
              "session_spawns": session_spawns(home, session_dir) if session_dir else set()}
+    if approved_by:
+        scope["approval"] = (approval_resolver or resolve_approval)(approved_by, session, home)
+        scope["now"] = time.time() if now is None else now
+        owner = session_ancestor(probe, table, own_pid)
+        owner_info = probe.info(owner) if owner else None
+        scope["session_start"] = _epoch_lstart(owner_info["start"]) if owner_info else None
     plan, seen = [], set()
     for root in pids:
         batch = []
@@ -509,6 +646,22 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
     for rec in plan:
         audit.row({"event": "intent" if rec in live else "refused", "run": run_id, "reason": reason,
                    "tree": tree, "grace": grace, **_public(rec)})
+    approved_live = [r for r in live if r.get("approved")]
+    if approved_live:
+        approval = scope["approval"]
+        event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "high", "check": "ah-kill",
+                 "key": "ah-kill:approved:" + run_id,
+                 "message": "ah kill --approved-by %s stopped/will stop %d user-approved stale process(es): %s (reason: %s)" % (
+                     approval["ask"], len(approved_live), ", ".join(str(r["pid"]) for r in approved_live), _clip(reason, 120)),
+                 "detail": {"run": run_id, "caller": caller, "reason": _clip(reason, 200), "ask": approval["ask"],
+                            "source": approval["source"], "targets": [
+                                {"pid": r["pid"], "cmd": _clip(r["cmd"], 120), "cwd": r["cwd"], "start": r.get("start"),
+                                 "lifted": r.get("lifted")} for r in approved_live]}}
+        try:
+            (notify or _ops_notice)(home, event)
+        except Exception as error:  # an approved stop without its notice is not allowed
+            audit.row({"event": "aborted", "run": run_id, "why": "ops-watch notice failed: %s" % type(error).__name__})
+            raise KillError("notice_failed", "could not raise the ops-watch notice for an approved stop; nothing was signalled", 3)
     foreign_live = [r for r in live if r.get("foreign")]
     if foreign_live:
         event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "high", "check": "ah-kill",

@@ -1445,7 +1445,9 @@ def make_analyzer_class(cg):
                     seen.add(key)
                     i += 1
                     continue
-                if key not in ('--pid', '--reason', '--grace', '--host', '--agent', '--session'):
+                if key == '--approved-by' and not self.main:
+                    return False  # main only: a subagent cannot spend the user's approval (goodqa#15253)
+                if key not in ('--pid', '--reason', '--grace', '--host', '--agent', '--session', '--approved-by'):
                     return False
                 if not eq:
                     if i + 1 >= len(rest):
@@ -1466,6 +1468,9 @@ def make_analyzer_class(cg):
                         return False
                 elif key == '--host':
                     if val not in ('dev2', 't2-dev', 'ah-mac-mini'):
+                        return False
+                elif key == '--approved-by':
+                    if not re.fullmatch(r'[A-Za-z0-9_-]{4,40}', val):
                         return False
                 elif not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', val):
                     return False

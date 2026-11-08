@@ -772,6 +772,183 @@ class SessionScope(KillBase):
         self.assertEqual(probe.sent, [])
 
 
+class ApprovedBy(KillBase):
+    """goodqa#15253 (11-07): the user asked main to stop a harness-console from 11-04 and its codex app-server child;
+    `ah kill` refused both with no path the user could authorize. --approved-by is that path, and it is bounded."""
+    STALE = "Wed Nov  4 10:00:00 2026"   # before the session process 3000 (Thu Nov  5 17:00) and days old
+    NOW = time.mktime(time.strptime("Sat Nov  7 12:00:00 2026", "%a %b %d %H:%M:%S %Y"))
+    TEXT = "please stop the stale harness-console 6101 and its codex child 6102, they have been idle for days"
+
+    def approval(self, text=None):
+        return lambda ask, session, home: {"ask": ask, "source": "answer:x", "uuid": "u", "at": "t",
+                                           "text": self.TEXT if text is None else text}
+
+    def stale(self, *extra, cpu=0.0):
+        probe = self.base(proc(6101, 1, cmd="/Users/me/.agent-harness/bin/harness-console --port 0",
+                               comm="harness-console", start=self.STALE),
+                          proc(6102, 6101, cmd="/opt/codex/bin/codex app-server", comm="codex", start=self.STALE),
+                          *extra)
+        probe.cwds = {6101: "/elsewhere/a", 6102: "/elsewhere/a"}
+        probe.cpu = lambda pid: cpu
+        return probe
+
+    def approved(self, probe, pids, text=None, **kw):
+        return self.run_kill(probe, pids, approved_by="wa1b2c3d4e5f", approval_resolver=self.approval(text),
+                             now=self.NOW, **kw)
+
+    def test_control_without_approval_both_are_refused(self):
+        out = self.run_kill(self.stale(), [6101, 6102], foreign=True)
+        self.assertEqual([r["status"] for r in out["results"]], ["refused", "refused"])
+
+    def test_a_named_stale_idle_console_and_codex_child_stop_with_a_notice(self):
+        probe = self.stale()
+        out = self.approved(probe, [6101], tree=True)
+        self.assertEqual(sorted((r["pid"], r["status"]) for r in out["results"]), [(6101, "exited"), (6102, "exited")])
+        self.assertEqual(len(self.notices), 1)
+        self.assertTrue(self.notices[0]["key"].startswith("ah-kill:approved:"))
+        self.assertEqual(self.notices[0]["severity"], "high")
+        self.assertEqual(self.notices[0]["detail"]["ask"], "wa1b2c3d4e5f")
+        intents = {r["pid"]: r for r in self.audit() if r.get("event") == "intent"}
+        self.assertEqual({intents[6101]["scope"], intents[6102]["scope"]}, {"approved"})
+        self.assertEqual(intents[6102]["lifted"], "protected process (codex)")
+
+    def test_each_bound_refuses(self):
+        cases = {
+            "not named": dict(text="please stop the stale processes"),
+            "too young": dict(start="Sat Nov  7 06:00:00 2026"),
+            "after the session started": dict(start="Fri Nov  6 09:00:00 2026"),
+            "running": dict(stat_="R"),
+            "using cpu": dict(cpu=3.5),
+            "cpu unknown": dict(cpu=None),
+        }
+        for name, case in cases.items():
+            with self.subTest(name=name):
+                self.notices.clear()
+                probe = self.base(proc(6201, 1, cmd="/opt/codex/bin/codex app-server", comm="codex",
+                                       start=case.get("start", self.STALE), stat_=case.get("stat_", "S")))
+                probe.cwds = {6201: "/elsewhere/b"}
+                probe.cpu = lambda pid, c=case.get("cpu", 0.0): c
+                text = case.get("text", "stop codex 6201 please, it is stale")
+                out = self.approved(probe, [6201], text=text)
+                self.assertEqual(out["results"][0]["status"], "refused")
+                self.assertIn("--approved-by", out["results"][0]["detail"])
+                self.assertEqual(probe.sent, [])
+                self.assertEqual(self.notices, [])
+
+    def test_other_refusals_are_never_lifted(self):
+        text = "stop 6301 6302 6303 6304 6305 6306 rclone netwatch hookd sshd zsh"
+        for pid, kw in ((6301, dict(cmd="rclone sync /a b:", comm="rclone")),
+                        (6302, dict(cmd="/opt/netwatch/netwatch run", comm="netwatch")),
+                        (6303, dict(cmd="python3 /h/hookd.py serve", comm="python3")),
+                        (6304, dict(cmd="/usr/sbin/sshd -D", comm="sshd")),
+                        (6305, dict(cmd="/opt/codex/bin/codex", comm="codex", uid=ME + 1)),
+                        (6306, dict(cmd="/System/Library/x", comm="/System/Library/x"))):
+            with self.subTest(pid=pid):
+                probe = self.base(proc(pid, 1, start=self.STALE, **kw))
+                probe.cwds = {pid: "/elsewhere/c"}
+                probe.cpu = lambda q: 0.0
+                out = self.approved(probe, [pid], text=text)
+                self.assertEqual(out["results"][0]["status"], "refused")
+                self.assertEqual(probe.sent, [])
+        probe = self.stale()
+        out = self.approved(probe, [3000], text="stop 3000 claude")  # the caller's own session process
+        self.assertEqual(out["results"][0]["status"], "refused")
+
+    def test_no_notice_means_no_signal(self):
+        probe = self.stale()
+
+        def broken(home, event):
+            raise OSError("ops-watch down")
+        with self.assertRaises(ak.KillError):
+            self.approved(probe, [6101], notify=broken)
+        self.assertEqual(probe.sent, [])
+
+
+class ApprovalResolution(unittest.TestCase):
+    """resolve_approval reads the real asks ledger and transcript through provenance."""
+    SID = "11111111-2222-3333-4444-555555555555"
+    UID = "00000000-0000-0000-0000-0000000000a1"
+    ASK = "wa1b2c3d4e5f"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+
+    def world(self, text="please stop the stale harness-console 6101 now", at="2026-11-07T10:00:00Z",
+              source=None, resolved=True, origin="human"):
+        projects = self.home / ".claude" / "projects" / "-x"
+        projects.mkdir(parents=True)
+        record = {"type": "user", "uuid": self.UID, "timestamp": at, "sessionId": self.SID,
+                  "origin": {"kind": origin}, "message": {"role": "user", "content": text}}
+        (projects / (self.SID + ".jsonl")).write_text(json.dumps(record, separators=(",", ":")) + "\n")
+        wals = self.home / ".claude" / "wals" / self.SID
+        wals.mkdir(parents=True)
+        rows = [{"at": "2026-11-07T09:59:00Z", "event": "ask", "id": self.ASK, "note": "stop 6101?", "reason": "user asked"}]
+        if resolved:
+            rows.append({"at": "2026-11-07T10:01:00Z", "event": "ask_resolved", "ref": self.ASK, "id": "wffffffffff1",
+                         "source": source or 'user:%s/%s "stop the stale harness-console 6101"' % (self.SID, self.UID)})
+        (wals / "main.jsonl").write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows))
+
+    NOW = 1794045600.0 + 7200  # 2026-11-07T12:00:00Z
+
+    def resolve(self, ask=None, session=None):
+        return ak.resolve_approval(ask or self.ASK, session or self.SID, self.home, now=self.NOW)
+
+    def test_a_user_resolved_ask_verifies_and_carries_the_human_text(self):
+        self.world()
+        got = self.resolve()
+        self.assertIn("harness-console 6101", got["text"])
+        self.assertEqual(got["ask"], self.ASK)
+
+    def test_unverified_or_stale_approvals_are_refused(self):
+        bad = {
+            "unresolved": (dict(resolved=False), "no ask_resolved"),
+            "stale": (dict(at="2026-11-05T10:00:00Z"), "older than"),
+            "not human": (dict(origin="peer"), "verified human turn"),
+            "pasted": (dict(text="look <pasted_content>stop the stale harness-console 6101</pasted_content>",
+                            source='pasted:%s/%s "stop the stale harness-console 6101"' % (SID_, UID_)),
+                       "verified human turn"),
+            "excerpt not in turn": (dict(text="hello there, nothing to stop today"), "verified human turn"),
+        }
+        for name, (kw, why) in bad.items():
+            with self.subTest(name=name):
+                self.tearDown_world()
+                self.world(**kw)
+                with self.assertRaises(ak.KillError) as caught:
+                    self.resolve()
+                self.assertIn(why, str(caught.exception))
+        self.tearDown_world()
+        self.world()
+        for ask, session, why in (("wzzzzzzzzzzz", None, "no ask"),
+                                  (None, "99999999-2222-3333-4444-555555555555", "no ask"),
+                                  ("bad id!", None, "needs the id")):
+            with self.subTest(ask=ask, session=session):
+                with self.assertRaises(ak.KillError) as caught:
+                    self.resolve(ask, session)
+                self.assertIn(why, str(caught.exception))
+
+    def tearDown_world(self):
+        import shutil
+        shutil.rmtree(self.home / ".claude", ignore_errors=True)
+
+
+SID_, UID_ = ApprovalResolution.SID, ApprovalResolution.UID
+
+
+class ApprovedByGuard(unittest.TestCase):
+    A = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason stale --approved-by wa1b2c3d4e5f"
+
+    def verdict(self, cmd, main):
+        with tempfile.TemporaryDirectory() as tmp:
+            return kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp, main=main)[0]
+
+    def test_main_only_and_a_plain_id(self):
+        self.assertEqual(self.verdict(self.A, True), "allow")
+        self.assertEqual(self.verdict(self.A, False), "block")
+        self.assertEqual(self.verdict(self.A.replace("wa1b2c3d4e5f", "'x y'"), True), "block")
+
+
 class SessionScopeGuard(unittest.TestCase):
     """kill_guard admits --session-scope only from main (no agent_id in the hook payload)."""
     A = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason stuck --session-scope"

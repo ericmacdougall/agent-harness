@@ -2742,6 +2742,10 @@ def build_parser():
                     help="main only (kill_guard enforces it): also treat as own a process that `kill_guard.py spawn` "
                          "recorded (pid and start time) for a worktree in this session's ~/.agent-harness/work/<session>/ "
                          "(audited, no --foreign)")
+    kp.add_argument("--approved-by", metavar="ASK_ID",
+                    help="main only, local only: id of a resolved ask whose answer is a real human turn at most 24 h old "
+                         "naming the pid or program; lifts the harness-console and claude/codex refusals for processes "
+                         "idle (sleeping, 0%% CPU) and started over 24 h ago and before this session (audited, high notice)")
     kp.add_argument("--session")
     kp.add_argument("--agent", help="calling agent id for the audit row")
     kp.add_argument("--wal", help="caller WAL path (default: this session's main WAL)")
@@ -2865,12 +2869,15 @@ def run(args, home: Path) -> dict:
             agent = args.agent or os.environ.get("AH_AGENT_ID", "")
             if args.host and args.session_scope:
                 raise ah_kill.KillError("bad_request", "--session-scope is local only; a --host stop needs --foreign")
+            if args.host and args.approved_by:
+                raise ah_kill.KillError("bad_request", "--approved-by is local only")
             if args.host:
                 return ah_kill.kill_remote(args.host, pids, (args.reason or "").strip(), args.tree, args.grace,
                                            args.session or env_session(), agent, home, foreign=args.foreign)
             return ah_kill.kill_local(pids, args.reason, args.tree, args.grace, home,
                                       session=args.session or env_session(), agent=agent, wal_path=args.wal,
-                                      via=args.via, foreign=args.foreign, session_scope=args.session_scope)
+                                      via=args.via, foreign=args.foreign, session_scope=args.session_scope,
+                                      approved_by=args.approved_by)
         except ah_kill.KillError as e:
             raise AhError(e.code, str(e), e.exit_code)
     raise AhError("unknown_command", cmd)
