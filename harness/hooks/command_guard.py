@@ -2319,6 +2319,36 @@ class Analyzer:
             return any(norm_name(a.text) in ('kill', 'pkill') for a in words[1:])
         return False
 
+    TEMP_ROOT_VARS = ('TMPDIR', 'CLAUDE_CODE_TMPDIR')
+
+    def _temp_root_candidates(self, name):
+        """Values the shell's $TMPDIR or $CLAUDE_CODE_TMPDIR may hold. The hook does not see the command's
+        environment, and the harness install relocates the Claude Code temp root to ~/.agent-harness/scratch, so every
+        plausible value is tried and the strongest protection among them decides (goodqa#15280)."""
+        values = [os.environ.get(name) or '', os.environ.get('CLAUDE_CODE_TMPDIR') or '',
+                  self.ctx.home.rstrip('/') + '/.agent-harness/scratch']
+        if name == 'TMPDIR':
+            values.append('/tmp')
+        return [v for v in dict.fromkeys(values) if v.startswith('/')]
+
+    def _temp_root_alts(self, alts):
+        """Expand an unassigned $TMPDIR or $CLAUDE_CODE_TMPDIR marker into one alternative per candidate value, so a
+        scratchpad path spelled through them is judged like its literal form: allowed inside a session scratchpad,
+        refused on task-output logs or the scratch root. Assigned names are left to resolve(). Past 32 alternatives
+        nothing is expanded, so the markers stay unresolved (judged as unknown) instead of a candidate being dropped."""
+        ctx = self.ctx
+        out = []
+        for alt in alts:
+            todo = [alt]
+            for name in self.TEMP_ROOT_VARS:
+                marker = VAR_OPEN + name + VAR_CLOSE
+                if marker not in alt or (name in ctx.vars and name not in ctx.tainted) or name in ctx.tainted:
+                    continue
+                todo = [t.replace(marker, ''.join(Q.get(ch, ch) for ch in v.rstrip('/')))
+                        for t in todo for v in self._temp_root_candidates(name)]
+            out.extend(todo)
+        return alts if len(out) > 32 else out
+
     def resolve(self, word):
         """Expand $NAME markers with the values assigned so far; unknown or tainted names stay as $NAME."""
         if word is None or not any(VAR_OPEN in a for a in word.alts):
@@ -2335,7 +2365,7 @@ class Analyzer:
             return '$' + name
 
         out = Word()
-        out.alts = [VAR_MARKER.sub(sub, a) for a in word.alts]
+        out.alts = [VAR_MARKER.sub(sub, a) for a in self._temp_root_alts(word.alts)]
         out.subs, out.vars, out.glob, out.quoted = word.subs, word.vars, word.glob, word.quoted
         out.dynamic = word.dynamic or unresolved
         out.raw = word.raw
