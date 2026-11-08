@@ -30,9 +30,12 @@ HOSTS = ("dev2", "t2-dev", "ah-mac-mini")
 # over ssh with PowerShell. Windows OpenSSH does not end a session's processes when the client disconnects, so
 # orphaned remote PowerShell children need this audited path.
 WINDOWS_HOSTS = ("ah-spectre",)
-WINDOWS_PROTECTED = {"system", "idle", "smss", "csrss", "wininit", "winlogon", "services", "lsass", "lsaiso", "svchost",
-                     "sshd", "ssh-agent", "explorer", "dwm", "fontdrvhost", "registry", "memory compression",
-                     "msmpeng", "spoolsv", "tailscaled", "tailscale-ipn", "conhost"}
+# Delta red-team D-F4: a Windows stop is an allowlist, not a deny list. It may stop only an orphaned shell (its parent
+# is gone, or the parent pid now belongs to a newer process) that the ssh login user owns and that is not part of the
+# ssh session running the check. That is exactly the orphaned PowerShell children it exists for. Anything else
+# (claude, codex, node, adb, sshd-session, WSL, Defender, ...) is refused.
+WINDOWS_ALLOWED = {"powershell", "pwsh", "cmd"}
+WIN_SENTINEL = "AHK1 "  # D-F5: the answer is the last line with this prefix; profile or CLIXML noise is ignored
 _ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?(?:Z|[+-]\d{2}:\d{2})")
 MAX_PIDS = 64
 MAX_TREE = 256
@@ -784,25 +787,36 @@ def _powershell(host, script):
             "powershell -NoProfile -NonInteractive -EncodedCommand " + encoded]
 
 
-_WIN_READ = ("$ErrorActionPreference='Stop'; $p = Get-CimInstance Win32_Process -Filter 'ProcessId=%d'; "
-             "if (-not $p) { '{\"found\":false}' } else { [pscustomobject]@{found=$true; pid=[int]$p.ProcessId; "
-             "ppid=[int]$p.ParentProcessId; name=[string]$p.Name; "
-             "created=$p.CreationDate.ToUniversalTime().ToString('o'); cmd=[string]$p.CommandLine} "
-             "| ConvertTo-Json -Compress }")
-# The stop re-reads the process in the same remote script and compares its creation time, so a reused pid is not
-# stopped. Stop-Process -Force is immediate on Windows; there is no grace period to honour.
-_WIN_STOP = ("$ErrorActionPreference='Stop'; $p = Get-CimInstance Win32_Process -Filter 'ProcessId=%d'; "
-             "if (-not $p) { '{\"status\":\"gone\"}' } "
-             "elseif ($p.CreationDate.ToUniversalTime().ToString('o') -ne '%s') { '{\"status\":\"changed\"}' } "
-             "else { try { Stop-Process -Id %d -Force -ErrorAction Stop; '{\"status\":\"stopped\"}' } "
-             "catch { '{\"status\":\"refused\"}' } }")
+_WIN_READ = r"""$ErrorActionPreference='Stop'
+$me = "$env:USERDOMAIN\$env:USERNAME"
+$chain = @(); $q = $PID
+for ($k = 0; $k -lt 16 -and $q; $k++) { $chain += [int]$q; $x = Get-CimInstance Win32_Process -Filter "ProcessId=$q"; if (-not $x) { break }; $q = [int]$x.ParentProcessId }
+$p = Get-CimInstance Win32_Process -Filter 'ProcessId=%d'
+if (-not $p) { 'AHK1 {"found":false}'; exit }
+$o = Invoke-CimMethod -InputObject $p -MethodName GetOwner
+$owner = if ($o.ReturnValue -eq 0) { "$($o.Domain)\$($o.User)" } else { '' }
+$parent = Get-CimInstance Win32_Process -Filter ('ProcessId=' + [int]$p.ParentProcessId)
+$orphan = (-not $parent) -or ($parent.CreationDate -gt $p.CreationDate)
+'AHK1 ' + ([pscustomobject]@{found=$true; pid=[int]$p.ProcessId; ppid=[int]$p.ParentProcessId; name=[string]$p.Name; created=$p.CreationDate.ToUniversalTime().ToString('o'); cmd=[string]$p.CommandLine; owner=$owner; mine=(($owner -ne '') -and ($owner -eq $me)); self=($chain -contains [int]$p.ProcessId); orphan=[bool]$orphan} | ConvertTo-Json -Compress)
+"""
+# The stop re-reads the process in the same remote script and re-checks its creation time and owner, so a reused pid
+# or a process of another user is not stopped. Stop-Process -Force is immediate on Windows; there is no grace period.
+_WIN_STOP = r"""$ErrorActionPreference='Stop'
+$me = "$env:USERDOMAIN\$env:USERNAME"
+$p = Get-CimInstance Win32_Process -Filter 'ProcessId=%d'
+if (-not $p) { 'AHK1 {"status":"gone"}'; exit }
+if ($p.CreationDate.ToUniversalTime().ToString('o') -ne '%s') { 'AHK1 {"status":"changed"}'; exit }
+$o = Invoke-CimMethod -InputObject $p -MethodName GetOwner
+if ($o.ReturnValue -ne 0 -or "$($o.Domain)\$($o.User)" -ne $me) { 'AHK1 {"status":"changed"}'; exit }
+try { Stop-Process -Id %d -Force -ErrorAction Stop; 'AHK1 {"status":"stopped"}' } catch { 'AHK1 {"status":"refused"}' }
+"""
 
 
 def _win_call(runner, host, script, timeout):
     try:
         r = runner(_powershell(host, script), capture_output=True, text=True, timeout=timeout)
-        lines = [line for line in (r.stdout or "").splitlines() if line.strip()]
-        data = json.loads(lines[-1]) if lines else None
+        lines = [line.strip() for line in (r.stdout or "").splitlines() if line.strip().startswith(WIN_SENTINEL)]
+        data = json.loads(lines[-1][len(WIN_SENTINEL):]) if lines else None
     except (OSError, subprocess.SubprocessError, ValueError):
         data = None
     return data if isinstance(data, dict) else None
@@ -810,8 +824,8 @@ def _win_call(runner, host, script, timeout):
 
 def kill_remote_windows(host, pids, reason, tree, grace, session="", agent="", home=None, runner=subprocess.run,
                         foreign=False, notify=None):
-    """Stop one pid on a Windows OpenSSH host with the same guards as the POSIX path: --foreign audit and ops-watch
-    notice, one pid per call, the command line recorded before the stop, protected processes refused."""
+    """Stop one orphaned shell on a Windows OpenSSH host: main only (kill_guard), --foreign audit and ops-watch notice,
+    one pid per call, owner and identity recorded before the stop and rechecked in the stop script."""
     home = home or Path.home()
     reason = (reason or "").strip()
     if not reason:
@@ -841,15 +855,27 @@ def kill_remote_windows(host, pids, reason, tree, grace, session="", agent="", h
     elif ident.get("pid") != pid or not isinstance(ident.get("created"), str) or not _ISO.fullmatch(ident["created"]):
         audit.row({"event": "remote_result", "host": host, "run": run_id, "status": "unparsable"})
         raise KillError("host_unreachable", "unexpected answer from %s" % host, 3)
+    elif not all(isinstance(ident.get(k), bool) for k in ("mine", "self", "orphan")):
+        audit.row({"event": "remote_result", "host": host, "run": run_id, "status": "unparsable"})
+        raise KillError("host_unreachable", "unexpected answer from %s" % host, 3)
     else:
         name = str(ident.get("name") or "")
         rec.update(name=_clip(name, 80), ppid=ident.get("ppid"), created=ident["created"],
-                   cmd=_clip(str(ident.get("cmd") or ""), MAX_CMD))
+                   cmd=_clip(str(ident.get("cmd") or ""), MAX_CMD), owner=_clip(str(ident.get("owner") or ""), 80),
+                   orphan=ident["orphan"])
         audit.row({"event": "identity", "run": run_id, "host": host, "pid": pid, "ppid": rec["ppid"],
-                   "name": rec["name"], "created": rec["created"], "cmd": rec["cmd"]})
+                   "name": rec["name"], "created": rec["created"], "cmd": rec["cmd"], "owner": rec["owner"],
+                   "orphan": rec["orphan"]})
         base = name.lower()[:-4] if name.lower().endswith(".exe") else name.lower()
-        if base in WINDOWS_PROTECTED:
-            rec.update(status="refused", detail="protected Windows process (%s)" % base)
+        if base not in WINDOWS_ALLOWED:
+            rec.update(status="refused", detail="only an orphaned %s is stopped on a Windows host, not %s" % (
+                "/".join(sorted(WINDOWS_ALLOWED)), base or "an unnamed process"))
+        elif not ident["mine"]:
+            rec.update(status="refused", detail="owned by another user (%s)" % (rec["owner"] or "unknown"))
+        elif ident["self"]:
+            rec.update(status="refused", detail="part of the ssh session running this check")
+        elif not ident["orphan"]:
+            rec.update(status="refused", detail="its parent pid %s is still running; stop the parent first" % rec["ppid"])
     if "status" not in rec:
         event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "high", "check": "ah-kill",
                  "key": "ah-kill:foreign:remote-" + uuid.uuid4().hex[:10],

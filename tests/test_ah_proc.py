@@ -625,8 +625,9 @@ class FakeWindowsRemote:
     answer is computed from the creation time embedded in the real stop script, so a reused pid is detected only
     if the script carries the identity read earlier."""
 
-    def __init__(self, table, reuse_after_read=None):
+    def __init__(self, table, reuse_after_read=None, noise=""):
         self.table, self.reuse, self.calls, self.stopped = dict(table), reuse_after_read, [], []
+        self.noise = noise
 
     def __call__(self, argv, **kw):
         import base64
@@ -641,7 +642,7 @@ class FakeWindowsRemote:
             out = {"found": False} if proc is None else dict(proc, found=True, pid=pid)
             if self.reuse and proc is not None:
                 self.table[pid] = dict(proc, created=self.reuse)  # the pid is reused before the stop
-            return subprocess.CompletedProcess(argv, 0, stdout="#< CLIXML\n" + json.dumps(out) + "\n")
+            return subprocess.CompletedProcess(argv, 0, stdout="#< CLIXML\nAHK1 " + json.dumps(out) + "\n")
         self.script = script
         assert "Stop-Process -Id %d -Force" % pid in script
         expected = re.search(r"-ne '([^']+)'", script).group(1)
@@ -652,13 +653,14 @@ class FakeWindowsRemote:
         else:
             status = "stopped"
             self.stopped.append(pid)
-        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"status": status}) + "\n")
+        return subprocess.CompletedProcess(argv, 0, stdout="AHK1 " + json.dumps({"status": status}) + "\n" + self.noise)
 
 
 class WindowsHost(unittest.TestCase):
     """goodqa#15275: ah kill --host ah-spectre stops one process with Stop-Process over ssh, with the same guards."""
     PS = {"ppid": 900, "name": "powershell.exe", "created": "2026-11-07T21:14:03.1234567Z",
-          "cmd": "powershell.exe -NoProfile -File C:\\pp\\pp-lab.ps1 receipt"}
+          "cmd": "powershell.exe -NoProfile -File C:\\pp\\pp-lab.ps1 receipt", "owner": "SPECTRE\\lab",
+          "mine": True, "self": False, "orphan": True}
 
     def setUp(self):
         self.home = Path(tempfile.mkdtemp())
@@ -722,7 +724,9 @@ class WindowsHost(unittest.TestCase):
             self.run_kill(remote, foreign=False)
         self.assertEqual(caught.exception.code, "foreign_required")
         self.assertEqual(remote.calls, [])
-        for name in ("lsass.exe", "sshd.exe", "svchost.exe", "explorer.EXE"):
+        for name in ("lsass.exe", "sshd.exe", "svchost.exe", "explorer.EXE", "claude.exe", "codex.exe", "node.exe",
+                     "adb.exe", "sshd-session.exe", "vmmem", "vmmemWSL", "wslservice.exe", "vmcompute.exe",
+                     "WmiPrvSE.exe", "LogonUI.exe", "sihost.exe", "MpDefenderCoreService.exe", ""):
             with self.subTest(name=name):
                 remote = FakeWindowsRemote({4242: dict(self.PS, name=name)})
                 out = self.run_kill(remote)
@@ -749,12 +753,37 @@ class WindowsHost(unittest.TestCase):
         self.assertEqual(out["results"][0]["status"], "gone")
         self.assertEqual(len(remote.calls), 1)
 
-    def test_guard_admits_the_windows_host(self):
+    def test_guard_admits_the_windows_host_for_main_only(self):
+        # delta red-team D-F4: a subagent may not reach the Windows stop
         cmd = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason orphaned --host ah-spectre --foreign"
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp)[0], "allow")
+            self.assertEqual(kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp, main=True)[0], "allow")
+            self.assertEqual(kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp, main=False)[0], "block")
             self.assertEqual(kg.decide(cmd.replace("ah-spectre", "ah-spectre2"), cwd=tmp, policy=kg.load_policy(),
-                                       home=tmp)[0], "block")
+                                       home=tmp, main=True)[0], "block")
+            self.assertEqual(kg.decide(cmd.replace("ah-spectre", "dev2"), cwd=tmp, policy=kg.load_policy(),
+                                       home=tmp, main=False)[0], "allow")  # POSIX hosts unchanged
+
+    def test_dF4_only_an_owned_orphan_outside_the_session_is_stopped(self):
+        for name, change in (("another user", dict(mine=False, owner="NT AUTHORITY\\SYSTEM")),
+                             ("own ssh session", {"self": True}),
+                             ("live parent", dict(orphan=False)),
+                             ("missing owner field", dict(mine=None))):
+            with self.subTest(name=name):
+                remote = FakeWindowsRemote({4242: dict(self.PS, **change)})
+                try:
+                    out = self.run_kill(remote)
+                    self.assertEqual(out["results"][0]["status"], "refused")
+                except ak.KillError as error:
+                    self.assertEqual(error.code, "host_unreachable")  # a malformed answer fails closed
+                self.assertEqual(len(remote.calls), 1)
+                self.assertEqual(remote.stopped, [])
+
+    def test_dF5_noise_after_the_stop_answer_is_ignored(self):
+        remote = FakeWindowsRemote({4242: self.PS}, noise="WARNING: profile output\n#< CLIXML\n")
+        out = self.run_kill(remote)
+        self.assertEqual(out["results"][0]["status"], "stopped")
+        self.assertTrue(out["ok"])
 
 
 class GuardRule(unittest.TestCase):

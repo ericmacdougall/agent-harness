@@ -1470,6 +1470,8 @@ def make_analyzer_class(cg):
                 elif key == '--host':
                     if val not in ('dev2', 't2-dev', 'ah-mac-mini', 'ah-spectre'):  # ah-spectre: goodqa#15275
                         return False
+                    if val == 'ah-spectre' and not self.main:
+                        return False  # delta red-team D-F4: the Windows stop is main only
                 elif key == '--approved-by':
                     if not re.fullmatch(r'[A-Za-z0-9_-]{4,40}', val):
                         return False
