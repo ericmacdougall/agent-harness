@@ -1204,3 +1204,73 @@ Behaviour changes from the hand-installed script: lock takeover by rename (and o
 The policy is intentionally risk-scaled. The small fix path skips worktrees and review loops. A normal code task gets only relevant tests and documents. The agents must not infer that the presence of a test or a reviewer PASS proves quality. Independent checks, reviewer availability, UI tool access and remote permissions vary by environment; handoffs must say exactly what ran and what did not.
 
 Claude Code settings can change between versions. The hook structure follows the [Claude Code hooks reference](https://code.claude.com/docs/en/hooks), and worktree agents follow the [subagent](https://code.claude.com/docs/en/sub-agents) and [worktree](https://code.claude.com/docs/en/worktrees) guides. Check these references when upgrading Claude Code.
+
+## Redesign designs (Nov 8, task harness-redesign-nov8)
+
+These were specified on the redesign branch. Items marked landed are on main; the rest are not implemented yet, each with the reason. PR #133 was closed unmerged after its items landed in #136-#139. Scenario ids refer to
+`~/Downloads/nov-7-issues-2.md` section B and the proposal in the task work dir.
+
+### One-command merge (B3.8)
+
+`ah merge --pr N [--repo owner/name]` replaces the three-command ritual (`merge_gate.py waive`, `gh pr ready`,
+`gh pr merge --match-head-commit`). It fetches the PR head, requires a fresh exact-head `peer_review.py pr` ACCEPT
+receipt (PR #133 item 1 makes that receipt the waiver), marks the PR ready, merges with `--match-head-commit`, and
+writes one gate record. A stale or missing receipt refuses with the exact command to produce one. Not implemented. Since #141 (goodqa#15282) a merge in a repository with CI switched off needs that exact-head waiver or a bound PR review.
+
+### Portable approvals (B3.12)
+
+An approval recorded on one host (for example `approve-delete` on the Mac) is a record, not a bearer token: it
+names the session, the approving host, the exact canonical path list, the pre-delete tree hash, an expiry (24 h) and a
+one-use nonce, and it is signed with a key the agent cannot invoke (the user's SSH agent or Secure Enclave key). The
+remote guard verifies the signature against the main host's public key, consumes the nonce atomically, and refuses a
+record whose path list or tree hash differs from what it sees. Not implemented; #139 added the remote delete route this builds on.
+
+### Audited Windows stop route (B3.10)
+
+Landed in #138 (goodqa#15275) over ssh rather than a GoodQA route: `ah kill --host ah-spectre --pid N` reads the process (owner, creation time, orphan state), and the main-only stop re-checks the creation time and owner before it acts. It was verified live on a self-made orphan.
+
+### Owner session scope (B3.10)
+
+Landed in #137: a stop is bound to the caller's session, and a foreign stop needs an exact approved pid list. Not implemented: for owners, ownership recorded at launch
+(pid, start time, owner id, worktree) and a stop is allowed only on an exact owner match; a shared ancestor directory
+or an argv mention is never ownership (external review, round 1).
+
+### Relay authorization (B4.19)
+
+`ah task authorize --agent <recipient> --note <what>` writes a main-WAL entry whose id is the relay token. A task
+relayed by another owner carries `auth:<id>`; the recipient runs `ah task verify-auth <id> --agent <self>` and proceeds
+only when the entry exists in the main WAL, names it, and is newer than its own spawn.
+
+### Agent-filed ticket throttle (B4.23, goodqa#15256)
+
+`ah ticket create` dedupes by a normalized fingerprint (project, component, root-cause words) rather than by title
+hash, applies a fleet-wide daily budget per filer class (runner briefs, key filers, liveness), batches related
+findings into one ticket, and keeps an audited lane that is never throttled for security, data-loss and P0 reports.
+
+### command_guard log-delete classification (B3.11)
+
+The `log_delete` category keeps every protected path (Claude and Codex transcripts and WALs, harness audit logs,
+usage receipts, deploy evidence). What changes is the operation test: a command that only creates or appends a new
+file under `~/.agent-harness/work/<session>/` is never a log delete, and a repository's own `install.sh` moving its
+own hook file inside its checkout is not a log rewrite. Deletion, truncation, move and write-through-link on a
+protected path stay blocked. The blocks observed on 2026-11-07/08 (transcript, eight `log_delete` refusals) fall in two
+classes: a path the guard cannot resolve (`$T` from `mktemp`, `$C`, `.pc.$$.$1.$2`) is treated as protected, and the
+whole `~/.agent-harness` tree counts as a protected harness directory (`gitrelay.git`, review worktrees `wt-*`). The
+rule change: an unresolvable variable blocks only when the same command also names a protected root or a log glob; a
+directory under `~/.agent-harness/work/<session>/` that is a clean, pushed worktree or a scratch dir is not a log.
+`tests/test_command_guard_workdir_write.py` holds these rows as a regression guard: they pass on main and fail if a row blocks again. The scratchpad delete case is goodqa#15280.
+
+### Missing scenarios from the external review (B25-B29)
+
+- B25 quota: when a provider returns the weekly limit, owners checkpoint (WAL handoff with the exact resume point)
+  before retrying, and main admits no new owner until the pool is back; a per-session spend budget sits beside the
+  owner cap.
+- B26 disks and alerts: a disk-free preflight (`ah disk`) before builds and clones; per-task resource TTLs with a
+  cleanup receipt in the WAL; alert dedupe and expiry with a protected dead-man lane.
+- B27 environment identity: a signed environment registry (`prod`, `staging`, aliases such as
+  `platform.framebright.ai` = prod) that destructive operations and test harnesses assert against; a test may never
+  name a production target.
+- B28 credential hygiene: the GoodQA user token pasted on 11-06 and the account-wide Cloudflare token on the mini
+  are rotated and narrowed before agent login authority widens; transcript backups get secret scanning.
+- B29 ref regrowth: auto-delete-on-merge everywhere, TTL ownership for `claude/*` and `codex/*` branches, backup-ref
+  expiry, and replay tests for the ten known repo-guard bypasses (#128).
