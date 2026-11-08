@@ -653,6 +653,13 @@ def _message_source(row):
             except provenance.Problem:
                 continue
             return {"source": source, "source_arg": "--source " + shlex.quote(source)}
+    if normalized and len(normalized) < provenance.EXCERPT_MIN:  # a whole short turn ("now") is quoted in full
+        source = f'{ident} "{normalized.replace(chr(34), chr(92) + chr(34))}"'
+        try:
+            if provenance.parse_source(source)["excerpt"] == normalized and not provenance.excerpt_in(row["text"], normalized):
+                return {"source": source, "source_arg": "--source " + shlex.quote(source)}
+        except provenance.Problem:
+            pass
     return {"source_error": "no automatically verified excerpt; use --full and quote exact user text"}
 
 

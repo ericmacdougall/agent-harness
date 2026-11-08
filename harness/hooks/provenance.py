@@ -626,7 +626,9 @@ def excerpt_in(text: str, excerpt: str):
     segments = [seg for seg in segments if seg]
     if not segments or len(segments) > EXCERPT_SEGMENTS:
         return f"excerpt needs 1 to {EXCERPT_SEGMENTS} quoted segments"
-    if any(len(seg) < EXCERPT_MIN for seg in segments) or sum(len(seg) for seg in segments) > EXCERPT_MAX:
+    # goodqa#15318: a whole turn shorter than the minimum ("now", "yes") is quoted in full; a fragment of a longer turn is not
+    whole_short = len(segments) == 1 and segments[0] == norm(text).strip() and bool(segments[0])
+    if (not whole_short and any(len(seg) < EXCERPT_MIN for seg in segments)) or sum(len(seg) for seg in segments) > EXCERPT_MAX:
         return f"each excerpt segment needs {EXCERPT_MIN}+ characters and the total at most {EXCERPT_MAX}"
     haystack, pos = norm(text), 0
     for segment in segments:
@@ -1345,8 +1347,9 @@ def render_asks(session: str, home=None, ctx=None) -> tuple:
 def find_user(session: str, text: str, home=None, limit: int = 5) -> list:
     path = find_transcript(session, home)
     wanted = norm(text)
-    if len(wanted) < EXCERPT_MIN:
-        raise Problem("excerpt-short", f"search text needs {EXCERPT_MIN}+ characters")
+    if not wanted:
+        raise Problem("excerpt-short", "search text is empty")
+    # under EXCERPT_MIN characters only a whole short turn matches (excerpt_in), so a fragment cannot be searched for
     found = []
     for line in _lines_containing(path, b'"kind":"human"'):
         if line is None:
