@@ -81,6 +81,21 @@ class PointEventTests(Base):
         self.run_once()
         self.assertEqual(self.active_keys(), {"heavy:copy:x"})
 
+    def test_future_dated_event_expires_when_over_an_hour_ahead(self):
+        self.raise_at("heavy:copy:f1", -3)  # stamped 3 h in the future
+        self.raise_at("heavy:copy:f2", -0.5)  # 30 min ahead: ordinary skew, stays
+        self.run_once()
+        self.assertEqual(self.active_keys(), {"heavy:copy:f2"})
+
+    def test_repeat_between_snapshot_and_clear_is_not_cleared(self):
+        self.raise_at("heavy:copy:r1", 7)
+        ring = ow.ring_path(self.home)
+        snapshot = ow.latest_by_key(ow.read_ring(ring))
+        self.raise_at("heavy:copy:r1", 0)  # another process repeats the refusal after the snapshot
+        out = ow.expire_point_events(self.cfg, snapshot, {}, NOW, ring)
+        self.assertEqual(out, [])
+        self.assertEqual(self.active_keys(), {"heavy:copy:r1"})
+
     def test_disabled_by_empty_prefixes_or_zero_ttl(self):
         self.raise_at("heavy:copy:o4", 99)
         for pe in ({"prefixes": [], "ttl_h": 6}, {"prefixes": ["heavy:"], "ttl_h": 0}):

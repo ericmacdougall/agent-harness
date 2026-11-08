@@ -1746,8 +1746,14 @@ def _transition(host, kind, key, a, extra=None) -> dict:
             "check": a.get("check")}
 
 
-def expire_point_events(cfg: dict, latest: dict, active: dict, now: float) -> list:
+def expire_point_events(cfg: dict, latest: dict, active: dict, now: float, ring: Path | None = None) -> list:
     """Clear events for point-event keys (cfg point_events.prefixes) not repeated for ttl_h; any source.
+
+    Only for families that are events and nothing else (nothing re-derives the key every run): a check-produced key
+    would flap every ttl_h. A timestamp more than an hour in the future counts as expired, so clock skew cannot pin an
+    alert. When `ring` is given, the ring is read again just before the clears are returned and a key whose latest
+    event changed since the snapshot (a repeat from another process) is left alone; the remaining window is the gap
+    between that read and the emit.
 
     The key leaves `active` too: run_once reasserts every active key whose latest ring event is not a raise."""
     pe = cfg.get("point_events") or {}
@@ -1759,8 +1765,12 @@ def expire_point_events(cfg: dict, latest: dict, active: dict, now: float) -> li
         if h != cfg["host"] or e.get("event") != "raise" or not str(key).startswith(prefixes):
             continue
         ts = parse_ts(e.get("at"))
-        if ts is None or now - ts < ttl:
+        if ts is None or (ts <= now + 3600 and now - ts < ttl):
             continue
+        if ring is not None:
+            fresh = latest_by_key(read_ring(ring)).get((h, src, key)) or {}
+            if fresh.get("seq") != e.get("seq"):
+                continue
         active.pop(key, None)
         out.append({"host": h, "source": src, "event": "clear", "severity": e.get("severity", "info"), "key": key,
                     "message": f"expired after {pe.get('ttl_h', 6)}h without a repeat: {e.get('message', '')}",
@@ -1854,7 +1864,7 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
             rc = 2
             print(f"ops-watch: state write failed ({type(exc).__name__})", file=sys.stderr)
 
-    events += expire_point_events(cfg, latest_by_key(read_ring(ring)), active, now)
+    events += expire_point_events(cfg, latest_by_key(read_ring(ring)), active, now, ring)
     persist(events)  # durable before any slow sink: a crash or timeout below cannot re-raise these
     latest = latest_by_key(read_ring(ring))
     reassert = [_transition(host, "raise", k, a, {"reasserted": True}) for k, a in sorted(active.items())
