@@ -500,6 +500,168 @@ class WorktreeRemoveParallelRebuildEdges(WorktreeRemoveCase):
             self.assertEqual(self.decide(c)[0], 'allow', c)
 
 
+class WorktreeRemoveRound3RedTeam(WorktreeRemoveCase):
+    """goodqa#15346 red-team BLOCK on 28c9a0f. OUT is a linked worktree outside every protected root: raw_sensitive cannot
+    rescue a fail-open there, so a budget stop must still end in a block."""
+
+    def setUp(self):
+        super().setUp()
+        self.out = self.home / 'wt' / 'x'
+        git(self.primary, 'worktree', 'add', '-q', '-b', 'x', str(self.out))
+
+    def env(self):
+        return dict(P=str(self.linked), OUT=str(self.out), H=str(self.home), B=str(self.base), PR=str(self.primary))
+
+    BLOCK = (
+        # M1 M2 option table and empty sources
+        'parallel --trim lr git worktree remove --force ::: {P}',
+        'parallel git worktree remove --force ::: ::: {P}',
+        'parallel rm -rf ::: {H} :::',
+        'parallel --arg-sep @@ rm -rf @@ @@ {H}',
+        # M3 names that are not built-ins on every supported git
+        "git -c alias.bisect--helper='worktree remove --force' bisect--helper {P}",
+        "git -c alias.rebase--interactive='worktree remove --force' rebase--interactive {P}",
+        "git -c alias.history='worktree remove --force' history {P}",
+        # M4 M5 a later key the scan cannot read, or the alias.NAME.command spelling
+        "git -c alias.wr=status -c alias.wr.command='worktree remove --force' wr {P}",
+        "git -c alias.wr=status --config-env=alias.wr.command=V wr {P}",
+        'git -c alias.wr=status -c "$(echo alias.wr)=worktree remove --force" wr {P}',
+        'K=$(echo alias.wr); git -c alias.wr=status -c "$K=worktree remove --force" wr {P}',
+        # M6 the line defines the alias but hides what it does
+        'git -c "alias.wr=$(cat f)" wr',
+        "V='worktree remove --force {P}' git --config-env=alias.wr=V wr",
+        "GIT_CONFIG_PARAMETERS=\"'alias.wr=worktree remove --force {P}'\" git wr",
+        'git -c include.path={H}/evil wr',
+        'git ' + ' '.join('-c alias.a%d=a%d' % (n, n + 1) for n in range(1, 10))
+        + " -c 'alias.a10=worktree remove --force {P}' a1",
+        # M7 only leading assignments reach git
+        'git wr {P} GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0=status',
+        'echo {P} | xargs git wr GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0=status',
+        'GIT_CONFIG_COUNT=1; GIT_CONFIG_KEY_0=alias.wr; GIT_CONFIG_VALUE_0=status; git wr {P}',
+        # M8 -q with the placeholder as a whole word
+        "parallel -q sh -c {{}} ::: 'git worktree remove --force {P}'",
+        # M9 negative positions, trailing slash, other parens
+        "parallel 'echo {{1}}; rm -rf {{-1}}' ::: x ::: {H}",
+        "parallel 'rm -rf {{//}}' ::: {H}/x/",
+        "parallel --parens ,,,, 'rm -rf ,,s:^:{B}/:,,' ::: linked",
+        # M10 arguments that parallel splits
+        "parallel rm -rf ::: $'a\\n'{H}",
+        'parallel -d , rm -rf ::: a,{H}',
+        'parallel --colsep , rm -rf ::: a,{H}',
+        "parallel -C ' ' rm -rf ::: 'a {H}'",
+        # M11 options that run code or move the job
+        "parallel --limit 'rm -rf {H}' echo ::: a",
+        "parallel --filter 'system(q(rm -rf {H}))' echo ::: a",
+        "parallel --tagstring '{{= system(q(rm -rf {H})) =}}' echo ::: a",
+        "parallel --results '{{= system(q(rm -rf {H})) =}}' echo ::: a",
+        "parallel --compress --compress-program 'rm -rf {H}' echo ::: a",
+        "parallel --ssh 'rm -rf {H};:' -S x echo ::: a",
+        "parallel -S 'rm -rf {H};: x' echo ::: a",
+        'parallel --wd {B} rm -rf linked ::: x',
+        # M12 configuration from the environment, and option values built at run time
+        "PARALLEL='git worktree remove --force' parallel ::: {P}",
+        "PARALLEL='-I XX' parallel 'echo {{1}}; rm -rf XX' ::: {H}",
+        "export PARALLEL='-I XX'; parallel 'echo {{1}}; rm -rf XX' ::: {H}",
+        'R=$(echo XX); parallel -I "$R" \'echo {{1}}; rm -rf XX\' ::: {H}',
+        # M13 a budget stop inside the rebuild is a refusal, outside every protected path too
+        "parallel 'rm -f {{1}} {{2}} {{3}} {{4}} {{5}} {{6}}' ::: a b c d ::: a b c d ::: a b c d ::: a b c d ::: a b c d "
+        "::: a b c d ; git worktree remove --force {OUT}",
+        # M14 xargs or a placeholder supplies the subcommand or the verb
+        'echo "worktree remove --force {P}" | xargs git',
+        'echo "remove --force {P}" | xargs git worktree',
+        'echo remove | xargs -I{{}} git worktree {{}} --force {P}',
+        'find {P} -name remove -exec git worktree {{}} --force {P} \\;',
+        'echo {P} | xargs git "$S"',
+        # M15 parallel and sem under find -exec
+        'find {P} -maxdepth 0 -exec parallel git worktree remove --force ::: {{}} +',
+        'find {P} -exec sem rm -rf {{}} +',
+        'find {P} -execdir sem rm -rf {{}} +',
+        'find {P} -exec nice parallel rm -rf ::: {{}} +',
+        # M16 M17
+        'git config --rename-section --global foo alias',
+        'git --shallow-file status worktree remove --force {P}',
+        # M19 a cd inside an alias or a parallel job stays there
+        "git -c 'alias.x=!cd /tmp' x ; rm -rf linked",
+        "parallel 'cd /tmp' ::: x ; rm -rf linked",
+        # minor, cheap: a config location or PATH set next to an unknown subcommand, a glued short option
+        'GIT_CONFIG_GLOBAL={H}/evil git wr',
+        'HOME={H}/fake git wr',
+        'PATH={H}/bin:$PATH git -c alias.wr=status wr {P}',
+        'GIT_EXEC_PATH={H}/bin git -c alias.wr=status wr {P}',
+        'git wr -f{P}',
+    )
+
+    ALLOW = (
+        # F1 the textbook use of parallel: a transform of a glob or an unknown value
+        'parallel convert {{}} {{.}}.png ::: *.jpg',
+        "parallel 'mv {{}} {{.}}.bak' ::: *.txt",
+        "parallel 'cp {{}} out/{{/}}' ::: src/*",
+        "parallel 'echo {{/}}' ::: \"$F\"",
+        # F2 information options run nothing
+        'sem --wait',
+        'parallel --version',
+        'parallel --number-of-cores',
+        'parallel --number-of-threads',
+        'parallel --help',
+        # still rebuilt
+        'parallel -j4 -k echo ::: a b',
+        "parallel -q echo 'a b' ::: c",
+        'parallel rm -rf ::: :::',
+    )
+
+    def test_red_team_forms_block(self):
+        env = self.env()
+        passed = [c for c in self.BLOCK if self.decide(c.format(**env), cwd=self.base if 'rm -rf linked' in c else None)[0]
+                  != 'block']
+        self.assertEqual(passed, [], 'a red-team form slipped through')
+
+    def test_red_team_false_refusals_are_cleared(self):
+        env = self.env()
+        blocked = [c for c in self.ALLOW if self.decide(c.format(**env))[0] != 'allow']
+        self.assertEqual(blocked, [], 'a harmless form is blocked')
+
+    def test_cwd_is_kept_for_a_later_command_that_is_harmless(self):
+        self.assertEqual(self.decide("parallel 'cd /tmp' ::: x ; ls")[0], 'allow')
+
+    def test_plan_semantics(self):
+        words = lambda *t: [cg._literal_word(x) for x in t]
+        self.assertEqual(cg.parallel_plan(words('rm', ':::', ':::', 'b'))[0], ["rm '' 'b'"])
+        self.assertEqual(cg.parallel_plan(words('rm', ':::', ':::'))[0], [])
+        self.assertEqual(cg.parallel_plan(words('e', '{-1}', ':::', 'a', ':::', 'b'))[0], ["e 'b'"])
+        self.assertEqual(cg.parallel_plan(words('e', '{//}', ':::', '/h/x/'))[0], ["e '/h'"])
+        self.assertEqual(cg.parallel_plan(words('rm', ':::', 'a\nb'))[0], ["rm 'a'", "rm 'b'"])
+        self.assertEqual(cg.parallel_plan(words('-q', 'sh', '-c', '{}', ':::', 'a b'))[0], ["'sh' '-c' 'a b'"])
+        self.assertEqual(cg.parallel_plan(words('--version'))[0], [])
+        self.assertIsNotNone(cg.parallel_plan(words('--trim', 'lr', 'rm', ':::', 'a'))[2])
+
+    def test_a_budget_stop_inside_the_rebuild_is_a_refusal(self):
+        # below the line limit, so only the budget stops it; nothing here names a protected path, so raw text cannot help.
+        # The limit is past what lexing the command costs, so the stop lands inside the launcher.
+        plain = self.home / 'plain'
+        plain.mkdir()
+        items = ' '.join('x%d' % n for n in range(900))
+        command = "parallel 'rm -f {}' ::: %s" % items
+        self.assertEqual(self.decide(command, cwd=plain)[0], 'allow')  # fine with the normal budget
+        self.policy = dict(self.policy, limits=dict(self.policy['limits'], max_nodes=16000))
+        verdict = self.decide(command, cwd=plain)
+        self.assertEqual(verdict[0], 'block')
+        self.assertIn('parallel-unverifiable', str(verdict))
+
+    def test_a_word_after_the_command_is_data_not_the_fed_command(self):
+        for c in ("find . -name '*.py' | xargs grep -n git", "echo x | xargs printf '%s\\n' git", 'xargs -n 1 grep git < f'):
+            self.assertEqual(self.decide(c, cwd=self.home)[0], 'allow', c)
+        for c in ('echo "worktree remove --force x" | xargs -R 1 git', 'echo x | xargs -n 1 git'):
+            self.assertEqual(self.decide(c, cwd=self.home)[0], 'block', c)
+
+    def test_a_named_external_on_path_is_not_an_alias(self):
+        with mock.patch.object(cg.shutil, 'which', lambda name: '/x/git-lfs' if name == 'git-lfs' else None):
+            self.assertEqual(self.decide('git ls-files | xargs git lfs track')[0], 'allow')
+            self.assertEqual(self.decide('git wr %s' % self.linked)[0], 'block')
+            self.assertEqual(self.decide('PATH=/x git lfs track %s' % self.linked)[0], 'block')
+        with mock.patch.object(cg.shutil, 'which', lambda name: None):
+            self.assertEqual(self.decide('git ls-files | xargs git lfs track')[0], 'block')
+
+
 class WorktreeRemoveIndirectRound3(WorktreeRemoveCase):
     """goodqa#15346 round-2 delta review (BLOCK on c70e378). Git ignores an alias that shadows a built-in, so any
     subcommand outside a static built-in list is treated as a possible alias: it may not act on a protected path or on
