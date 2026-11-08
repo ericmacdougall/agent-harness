@@ -5,6 +5,7 @@
 | Component | Role |
 | --- | --- |
 | `HARNESS.md` | User-wide workflow instructions installed as a marked block in `CLAUDE.md`. |
+| `docs/harness-reference.md` | The detailed rule and mechanics reference behind `HARNESS.md`; not installed. |
 | `harness/agents/*.md` | Task owner, click tester, fixer and red-team roles. |
 | `wal.py`, `wal_note.py` | Private metadata and human-readable WAL entries. |
 | `peer_review.py`, `report_file.py` | Read-only plan/code-inspection/PR review with bounded provider fallback and inode-checked private reports. |

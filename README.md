@@ -1,5 +1,11 @@
 # Agent Harness for Claude Code and Codex
 
+Agent Harness is a risk-scaled engineering workflow for people who let Claude Code or Codex change real repositories. It targets individual developers and small teams who run several agent sessions at once and want the work to be scoped, recoverable, reviewed and delivered without trusting the agent's own summary of what it did.
+
+The problem it addresses is that agents skip steps quietly: a "fixed" claim with no failing control, a commit nobody can trace to a ticket, a review of a different commit than the one merged, a cleanup command that deletes logs. The harness installs instructions, roles and Python hooks that make those steps explicit and checkable. A small fix goes straight through a fast path. Substantive work gets a scope brief, an owner in its own git worktree, a private write-ahead log (WAL) of intent and results, commits that must follow a fixed message format and name a ticket, independent plan/code/PR review bound to the exact HEAD, a merge gate that requires green checks on that head, and a two-phase delivery helper that pushes only the feature branch and fast-forwards your original checkout after an authorized merge.
+
+What is different: the checks are hooks and helpers with tests, not only prompt text; review and delivery receipts name the commit they cover; destructive shell commands against logs, state and processes are refused; and one workflow covers both Claude Code and Codex. It is not a daemon, a sandbox, or a guarantee that an agent follows every step (see [Evidence and limits](#evidence-and-limits)). Architecture: [docs/architecture.md](docs/architecture.md). Status: [Status and roadmap](#status-and-roadmap).
+
 Agent Harness installs user-wide guidance for scoped software work, recoverable commits, independent review, testing, and local delivery. Both editions use instructions and small Python helpers; neither is a daemon, CI service, or guarantee that an agent follows every step.
 
 ## Quick start
@@ -50,7 +56,7 @@ With trusted hooks, Stop can request one automatic continuation per session when
 
 Background jobs: `bg_job.py launch|wait|status` reports STARTED only on proof and returns a job's real exit status, and an advisory `bg_lint.py` hook warns on `; echo started`, wait loops ending in `ls`, and `PIPESTATUS` after `$(...)` (see docs/operations.md).
 
-Both editions send small, reversible fixes through a fast path. Substantive work gets an owner per related scope, a separate worktree, semantic WAL notes, relevant failure-first tests, independent review, and live UI/API checks when applicable. Hook records omit prompt text and tool arguments; the main agent still has to inspect evidence. Publication failures do not prevent verified local delivery. Claude's detailed policy is in [HARNESS.md](HARNESS.md), with roles in [harness/agents](harness/agents) and helpers in [harness/hooks](harness/hooks). Codex's workflow is in its [skill](codex/skills/agent-harness/SKILL.md).
+Both editions send small, reversible fixes through a fast path. Substantive work gets an owner per related scope, a separate worktree, semantic WAL notes, relevant failure-first tests, independent review, and live UI/API checks when applicable. Hook records omit prompt text and tool arguments; the main agent still has to inspect evidence. Publication failures do not prevent verified local delivery. Claude's installed rules are in [HARNESS.md](HARNESS.md), with the detailed reference in [docs/harness-reference.md](docs/harness-reference.md), with roles in [harness/agents](harness/agents) and helpers in [harness/hooks](harness/hooks). Codex's workflow is in its [skill](codex/skills/agent-harness/SKILL.md).
 
 ## Claude Code install details
 
@@ -115,11 +121,32 @@ The helpers are not a sandbox for repository code, tests, hooks or merge drivers
 
 This repository contains no account credentials, session logs, app fixtures, or machine-specific settings. The MIT license covers this harness; model and CLI products retain their own terms.
 
+## Status and roadmap
+
+Verified against this repository on 2026-11-08 (main at `2eca3c5`). "Shipped" means the code and tests are on `main`; it does not mean a tagged release exists. There are no tags or GitHub releases yet.
+
+**Shipped on main**
+- Claude Code and Codex installers (preview by default, `--apply` to write), roles, WAL hooks, commit-policy hook, `peer_review.py`, `deliver.py`/`integrate_local.py`, `merge_gate.py`, `command_guard.py`, `kill_guard.py`, `heavy_job_guard.py`, `spec_flow.py`, `provenance.py`, `usage_guard.py`, `ah.py`, `ops_watch.py`, `ahd.py`: sources in [harness/hooks](harness/hooks), tests in [tests](tests) (about 120 test and corpus files).
+- `harness tickets`, a local ticket ledger in hidden git refs, with a `ledger-mcp` server (Go: `cmd/harness`, `internal/ledger`; [docs/ledger.md](docs/ledger.md)).
+- Optional log backup and netwatch installs, and the Harness TUI plugin ([docs/tui-plugin.md](docs/tui-plugin.md)).
+
+**In progress**
+- Console durable event-log rebuild (`GoodQA #35692`). The console on `main` is an unreleased baseline with three tests skipped by name until the rebuild lands ([console/README.md](console/README.md)).
+- Log-backup bulk lane and heavy-work guards (`goodqa#15062`, `goodqa#15147`, `goodqa#14817`; see the Unreleased section of [CHANGELOG.md](CHANGELOG.md)).
+
+**Planned (not shipped)**
+- Porting the remaining Python hooks to the Go `harness` binary. Today `harness` implements only `tickets`, `ledger-mcp` and `version`; every other hook subcommand refuses with "not ported to Go yet" ([cmd/harness/main.go](cmd/harness/main.go)).
+- A tagged, attested release of the `harness` binary: [release.yml](.github/workflows/release.yml) exists but has never run on a tag.
+- GoodQA server-side import of the local ledger. It is a proposal only ([docs/ledger-goodqa-import-api.md](docs/ledger-goodqa-import-api.md)).
+- Native Windows qualification of the console and helpers (not claimed).
+
+**CI state.** Workflows in `.github/workflows` define the Python, Go and console suites. The latest completed successful runs on `main` that were checked were on 2026-11-04 (commit `e1d78ab`); later runs there were cancelled and none ran for the current head, so treat the local pre-push gate below and the test commands in [docs/architecture.md](docs/architecture.md#build-and-test) as the source of truth until CI is confirmed on a new head.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs should include a reproducible failure, the affected agent edition and version, and evidence that a fix works without breaking the fast path or local delivery.
 
-## Local gates (no CI)
+## Local gates
 
 Run before pushing, from a clean tree: `python3 scripts/leak_gate.py --range origin/main..HEAD`.
 It runs `scripts/leak_scan.py` on the tree and the pushed commits, and gitleaks
