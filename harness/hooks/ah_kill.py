@@ -26,6 +26,14 @@ import uuid
 from pathlib import Path
 
 HOSTS = ("dev2", "t2-dev", "ah-mac-mini")
+# Windows OpenSSH hosts (goodqa#15275): ah.py is not installed there, so ah kill reads and stops the process itself
+# over ssh with PowerShell. Windows OpenSSH does not end a session's processes when the client disconnects, so
+# orphaned remote PowerShell children need this audited path.
+WINDOWS_HOSTS = ("ah-spectre",)
+WINDOWS_PROTECTED = {"system", "idle", "smss", "csrss", "wininit", "winlogon", "services", "lsass", "lsaiso", "svchost",
+                     "sshd", "ssh-agent", "explorer", "dwm", "fontdrvhost", "registry", "memory compression",
+                     "msmpeng", "spoolsv", "tailscaled", "tailscale-ipn", "conhost"}
+_ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?(?:Z|[+-]\d{2}:\d{2})")
 MAX_PIDS = 64
 MAX_TREE = 256
 MAX_CMD = 300
@@ -760,9 +768,113 @@ def _public(rec, result=False):
     return out
 
 
+def _powershell(host, script):
+    """ssh argv that runs SCRIPT in Windows PowerShell. -EncodedCommand (base64 UTF-16LE) avoids every layer of quoting
+    between this argv, the remote default shell and PowerShell."""
+    import base64  # noqa: PLC0415
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", host,
+            "powershell -NoProfile -NonInteractive -EncodedCommand " + encoded]
+
+
+_WIN_READ = ("$ErrorActionPreference='Stop'; $p = Get-CimInstance Win32_Process -Filter 'ProcessId=%d'; "
+             "if (-not $p) { '{\"found\":false}' } else { [pscustomobject]@{found=$true; pid=[int]$p.ProcessId; "
+             "ppid=[int]$p.ParentProcessId; name=[string]$p.Name; "
+             "created=$p.CreationDate.ToUniversalTime().ToString('o'); cmd=[string]$p.CommandLine} "
+             "| ConvertTo-Json -Compress }")
+# The stop re-reads the process in the same remote script and compares its creation time, so a reused pid is not
+# stopped. Stop-Process -Force is immediate on Windows; there is no grace period to honour.
+_WIN_STOP = ("$ErrorActionPreference='Stop'; $p = Get-CimInstance Win32_Process -Filter 'ProcessId=%d'; "
+             "if (-not $p) { '{\"status\":\"gone\"}' } "
+             "elseif ($p.CreationDate.ToUniversalTime().ToString('o') -ne '%s') { '{\"status\":\"changed\"}' } "
+             "else { try { Stop-Process -Id %d -Force -ErrorAction Stop; '{\"status\":\"stopped\"}' } "
+             "catch { '{\"status\":\"refused\"}' } }")
+
+
+def _win_call(runner, host, script, timeout):
+    try:
+        r = runner(_powershell(host, script), capture_output=True, text=True, timeout=timeout)
+        lines = [line for line in (r.stdout or "").splitlines() if line.strip()]
+        data = json.loads(lines[-1]) if lines else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        data = None
+    return data if isinstance(data, dict) else None
+
+
+def kill_remote_windows(host, pids, reason, tree, grace, session="", agent="", home=None, runner=subprocess.run,
+                        foreign=False, notify=None):
+    """Stop one pid on a Windows OpenSSH host with the same guards as the POSIX path: --foreign audit and ops-watch
+    notice, one pid per call, the command line recorded before the stop, protected processes refused."""
+    home = home or Path.home()
+    reason = (reason or "").strip()
+    if not reason:
+        raise KillError("reason_required", "--reason is mandatory and must not be empty")
+    if len(reason) > MAX_REASON or not 0 <= grace <= MAX_GRACE:
+        raise KillError("bad_request", "--reason or --grace is out of range")
+    if len(pids) != 1 or not isinstance(pids[0], int) or isinstance(pids[0], bool):
+        raise KillError("bad_request", "a Windows --host stop takes exactly one pid per call")
+    pid = pids[0]
+    if pid <= 4:
+        raise KillError("bad_request", "pid %d is a Windows system process" % pid)
+    if tree:
+        raise KillError("bad_request", "--tree is not supported on a Windows --host; stop each pid by itself")
+    if not foreign:
+        raise KillError("foreign_required", "--host targets are outside this session's tree and worktree; pass --foreign "
+                        "(audited, and main is notified)")
+    audit = Audit(home, default_wal(home, session), {"session": session or None, "agent": agent or None})
+    run_id = "kw-" + uuid.uuid4().hex[:10]
+    audit.row({"event": "remote", "host": host, "pids": [pid], "reason": reason, "tree": False, "run": run_id})
+    ident = _win_call(runner, host, _WIN_READ % pid, 60)
+    if ident is None:
+        audit.row({"event": "remote_result", "host": host, "run": run_id, "status": "unreachable-or-unparsable"})
+        raise KillError("host_unreachable", "could not read pid %d on %s" % (pid, host), 3)
+    rec = {"pid": pid, "host": host}
+    if ident.get("found") is False:
+        rec.update(status="gone", detail="no such process")
+    elif ident.get("pid") != pid or not isinstance(ident.get("created"), str) or not _ISO.fullmatch(ident["created"]):
+        audit.row({"event": "remote_result", "host": host, "run": run_id, "status": "unparsable"})
+        raise KillError("host_unreachable", "unexpected answer from %s" % host, 3)
+    else:
+        name = str(ident.get("name") or "")
+        rec.update(name=_clip(name, 80), ppid=ident.get("ppid"), created=ident["created"],
+                   cmd=_clip(str(ident.get("cmd") or ""), MAX_CMD))
+        audit.row({"event": "identity", "run": run_id, "host": host, "pid": pid, "ppid": rec["ppid"],
+                   "name": rec["name"], "created": rec["created"], "cmd": rec["cmd"]})
+        base = name.lower()[:-4] if name.lower().endswith(".exe") else name.lower()
+        if base in WINDOWS_PROTECTED:
+            rec.update(status="refused", detail="protected Windows process (%s)" % base)
+    if "status" not in rec:
+        event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "high", "check": "ah-kill",
+                 "key": "ah-kill:foreign:remote-" + uuid.uuid4().hex[:10],
+                 "message": "ah kill --foreign on %s for pid %d %s (reason: %s)" % (
+                     host, pid, _clip(rec["cmd"] or rec["name"], 80), _clip(reason, 120)),
+                 "detail": {"host": host, "pids": [pid], "caller": {"session": session or None, "agent": agent or None}}}
+        try:
+            (notify or _ops_notice)(home, event)
+        except Exception as error:  # no notice, no remote stop
+            audit.row({"event": "aborted", "host": host, "run": run_id,
+                       "why": "ops-watch notice failed: %s" % type(error).__name__})
+            raise KillError("notice_failed", "could not raise the ops-watch notice; nothing was signalled", 3)
+        audit.wal("ah kill on %s: pid=%d reason=%s cmd=%s" % (host, pid, _clip(reason, 200), _clip(rec["cmd"], 120)))
+        done = _win_call(runner, host, _WIN_STOP % (pid, rec["created"], pid), 60)
+        status = done.get("status") if done else None
+        if status not in ("stopped", "gone", "changed", "refused"):
+            rec.update(status="unknown", detail="no parsable answer to the stop; check the host")
+        else:
+            rec["status"] = status
+            rec["detail"] = {"stopped": "Stop-Process -Force", "gone": "exited before the stop",
+                             "changed": "pid now belongs to a different process; not stopped",
+                             "refused": "Stop-Process was denied"}[status]
+    audit.row({"event": "remote_result", "host": host, "run": run_id, "pid": pid, "status": rec["status"]})
+    audit.wal("ah kill on %s result: pid=%d status=%s" % (host, pid, rec["status"]))
+    return {"ok": rec["status"] in ("stopped", "gone"), "run": run_id, "host": host, "results": [rec]}
+
+
 def kill_remote(host, pids, reason, tree, grace, session="", agent="", home=None, runner=subprocess.run, foreign=False, notify=None):
+    if host in WINDOWS_HOSTS:
+        return kill_remote_windows(host, pids, reason, tree, grace, session, agent, home, runner, foreign, notify)
     if host not in HOSTS:
-        raise KillError("bad_request", "--host must be one of %s" % ", ".join(HOSTS))
+        raise KillError("bad_request", "--host must be one of %s" % ", ".join(HOSTS + WINDOWS_HOSTS))
     home = home or Path.home()
     reason = (reason or "").strip()
     if not reason:

@@ -1,5 +1,7 @@
 """ah kill (harness/hooks/ah_kill.py) and its kill_guard allow rule: refusals, pid reuse, audit rows, grace, tree."""
 import json
+import re
+import shutil
 import os
 import signal
 import stat
@@ -615,6 +617,143 @@ class Remote(KillBase):
         with self.assertRaises(ak.KillError):
             ak.kill_remote("evil;host", [5], "r", False, 5, home=self.home, runner=runner, foreign=True)
         self.assertTrue(any(r["event"] == "remote" for r in self.audit()))
+
+
+class FakeWindowsRemote:
+    """A Windows OpenSSH host: decodes the -EncodedCommand PowerShell and answers from a process table. The stop
+    answer is computed from the creation time embedded in the real stop script, so a reused pid is detected only
+    if the script carries the identity read earlier."""
+
+    def __init__(self, table, reuse_after_read=None):
+        self.table, self.reuse, self.calls, self.stopped = dict(table), reuse_after_read, [], []
+
+    def __call__(self, argv, **kw):
+        import base64
+        self.calls.append(argv)
+        assert argv[:6] == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--"], argv
+        words = argv[-1].split()
+        assert words[:4] == ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand"], words
+        script = base64.b64decode(words[4]).decode("utf-16-le")
+        pid = int(re.search(r"ProcessId=(\d+)", script).group(1))
+        proc = self.table.get(pid)
+        if "Stop-Process" not in script:
+            out = {"found": False} if proc is None else dict(proc, found=True, pid=pid)
+            if self.reuse and proc is not None:
+                self.table[pid] = dict(proc, created=self.reuse)  # the pid is reused before the stop
+            return subprocess.CompletedProcess(argv, 0, stdout="#< CLIXML\n" + json.dumps(out) + "\n")
+        self.script = script
+        assert "Stop-Process -Id %d -Force" % pid in script
+        expected = re.search(r"-ne '([^']+)'", script).group(1)
+        if proc is None:
+            status = "gone"
+        elif proc["created"] != expected:
+            status = "changed"
+        else:
+            status = "stopped"
+            self.stopped.append(pid)
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"status": status}) + "\n")
+
+
+class WindowsHost(unittest.TestCase):
+    """goodqa#15275: ah kill --host ah-spectre stops one process with Stop-Process over ssh, with the same guards."""
+    PS = {"ppid": 900, "name": "powershell.exe", "created": "2026-11-07T21:14:03.1234567Z",
+          "cmd": "powershell.exe -NoProfile -File C:\\pp\\pp-lab.ps1 receipt"}
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.notices = []
+
+    def run_kill(self, remote, pids=(4242,), foreign=True, tree=False):
+        return ak.kill_remote("ah-spectre", list(pids), "orphaned after TaskStop", tree, 5, "sess-1", "a1",
+                              home=self.home, runner=remote, foreign=foreign,
+                              notify=lambda h, e: self.notices.append(e))
+
+    def audit(self):
+        rows = []
+        for f in self.home.rglob("*.jsonl"):
+            for line in f.read_text().splitlines():
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    pass
+        return rows
+
+    def test_stops_one_owned_pid_and_records_its_command_line(self):
+        remote = FakeWindowsRemote({4242: self.PS})
+        out = self.run_kill(remote)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(remote.stopped, [4242])
+        self.assertEqual(len(remote.calls), 2)
+        self.assertEqual(remote.calls[0][6], "ah-spectre")
+        self.assertIn("'2026-11-07T21:14:03.1234567Z'", remote.script)
+        ident = [r for r in self.audit() if r.get("event") == "identity"]
+        self.assertEqual(len(ident), 1, self.audit())
+        self.assertEqual((ident[0]["host"], ident[0]["pid"], ident[0]["created"]),
+                         ("ah-spectre", 4242, "2026-11-07T21:14:03.1234567Z"))
+        self.assertIn("pp-lab.ps1 receipt", ident[0]["cmd"])
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("ah-spectre", self.notices[0]["message"])
+
+    def test_neg1_a_reused_pid_is_not_stopped(self):
+        remote = FakeWindowsRemote({4242: self.PS}, reuse_after_read="2026-11-08T01:00:00.0000000Z")
+        out = self.run_kill(remote)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["results"][0]["status"], "changed")
+        self.assertEqual(remote.stopped, [])
+
+    def test_neg2_pid_shape_is_checked_before_ssh(self):
+        for pids in ((1, 2), (4,), (0,), ()):
+            with self.subTest(pids=pids):
+                remote = FakeWindowsRemote({})
+                with self.assertRaises(ak.KillError) as caught:
+                    self.run_kill(remote, pids)
+                self.assertEqual(caught.exception.code, "bad_request")
+                self.assertEqual(remote.calls, [])
+        remote = FakeWindowsRemote({})
+        with self.assertRaises(ak.KillError):
+            self.run_kill(remote, tree=True)
+        self.assertEqual(remote.calls, [])
+
+    def test_neg3_foreign_is_required_and_protected_names_are_refused(self):
+        remote = FakeWindowsRemote({4242: self.PS})
+        with self.assertRaises(ak.KillError) as caught:
+            self.run_kill(remote, foreign=False)
+        self.assertEqual(caught.exception.code, "foreign_required")
+        self.assertEqual(remote.calls, [])
+        for name in ("lsass.exe", "sshd.exe", "svchost.exe", "explorer.EXE"):
+            with self.subTest(name=name):
+                remote = FakeWindowsRemote({4242: dict(self.PS, name=name)})
+                out = self.run_kill(remote)
+                self.assertEqual(out["results"][0]["status"], "refused")
+                self.assertEqual(len(remote.calls), 1)  # read only, no stop script sent
+                self.assertEqual(remote.stopped, [])
+
+    def test_unreachable_or_garbage_answers_stop_nothing(self):
+        def down(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, 60)
+
+        def garbage(argv, **kw):
+            return subprocess.CompletedProcess(argv, 0, stdout='{"found": true, "pid": 4242, "created": "x; rm"}')
+        for runner in (down, garbage):
+            with self.subTest(runner=runner.__name__):
+                with self.assertRaises(ak.KillError) as caught:
+                    self.run_kill(runner)
+                self.assertEqual(caught.exception.code, "host_unreachable")
+        self.assertEqual(self.notices, [])
+
+    def test_gone_process_is_reported_without_a_stop(self):
+        remote = FakeWindowsRemote({})
+        out = self.run_kill(remote)
+        self.assertEqual(out["results"][0]["status"], "gone")
+        self.assertEqual(len(remote.calls), 1)
+
+    def test_guard_admits_the_windows_host(self):
+        cmd = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason orphaned --host ah-spectre --foreign"
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp)[0], "allow")
+            self.assertEqual(kg.decide(cmd.replace("ah-spectre", "ah-spectre2"), cwd=tmp, policy=kg.load_policy(),
+                                       home=tmp)[0], "block")
 
 
 class GuardRule(unittest.TestCase):

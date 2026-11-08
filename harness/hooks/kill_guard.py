@@ -1467,7 +1467,7 @@ def make_analyzer_class(cg):
                     if not re.fullmatch(r'[0-9]{1,3}(?:\.[0-9]{1,2})?', val):
                         return False
                 elif key == '--host':
-                    if val not in ('dev2', 't2-dev', 'ah-mac-mini'):
+                    if val not in ('dev2', 't2-dev', 'ah-mac-mini', 'ah-spectre'):  # ah-spectre: goodqa#15275
                         return False
                 elif key == '--approved-by':
                     if not re.fullmatch(r'[A-Za-z0-9_-]{4,40}', val):
