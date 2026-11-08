@@ -303,3 +303,14 @@ class WorktreeRemoveDashC(WorktreeRemoveCase):
         self.assertEqual(passed, [], 'a -C shape slipped through')
         (self.linked / 'a.txt').write_text('changed\n')
         self.assertEqual(self.decide(ok, cwd=plain)[0], 'block')
+
+    def test_red_team_shell_inside_the_target_and_unrelated_repo_block(self):
+        ok = 'git -C %s worktree remove %s' % (self.primary, self.linked)
+        sub = self.linked / 'sub'; sub.mkdir()
+        for cwd in (self.linked, sub):  # F1: the plain form refuses a shell inside the target; so must -C
+            self.assertEqual(self.decide(ok, cwd=cwd)[0], 'block', cwd)
+        other = self.home / 'other'; other.mkdir()
+        git(other, 'init', '-q', '-b', 'main')
+        git(other, 'remote', 'add', 'origin', URL)
+        self.assertEqual(self.decide('git -C %s worktree remove %s' % (other, self.linked), cwd=self.home)[0], 'block')  # F2
+        self.assertEqual(self.decide(ok, cwd=self.home)[0], 'allow')

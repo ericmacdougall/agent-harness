@@ -4619,9 +4619,31 @@ class Analyzer:
         started = time.monotonic()
         try:
             reason = linked_worktree_remove_refusal(path, calling, self.c.policy)
+            if reason is None and calling != self.ctx.cwd:
+                reason = self._dash_c_refusal(path, calling)
         finally:
             self.ctx.budget.deadline += time.monotonic() - started
         return reason is None
+
+    def _dash_c_refusal(self, path, repo):
+        """With a -C the verification ran from the -C directory. Red-team F1: the shell may itself stand inside the
+        target (the plain form refuses that), and F2: the -C repository must be the target's own registry."""
+        try:
+            here = os.path.realpath(_git_out(self.ctx.cwd, ['rev-parse', '--show-toplevel'], 2.0).strip())
+        except (ValueError, OSError, TimeoutError):
+            here = None  # the calling directory is not inside any repository
+        except Exception:  # noqa: BLE001 - any surprise keeps the refusal
+            return 'could not check the calling directory'
+        if here == path or os.path.realpath(self.ctx.cwd).startswith(path + os.sep) or os.path.realpath(self.ctx.cwd) == path:
+            return 'the current worktree cannot remove itself'
+        try:
+            theirs = os.path.realpath(_git_out(repo, ['rev-parse', '--path-format=absolute', '--git-common-dir'], 2.0).strip())
+            ours = os.path.realpath(_git_out(path, ['rev-parse', '--path-format=absolute', '--git-common-dir'], 2.0).strip())
+        except Exception:  # noqa: BLE001
+            return 'could not compare the -C repository with the worktree registry'
+        if theirs != ours:
+            return 'the -C repository is not the worktree registry'
+        return None
 
     def _clone_hint(self, path):
         reason = getattr(self.ctx, 'clone_reasons', {}).get(path)
