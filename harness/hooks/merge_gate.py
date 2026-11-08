@@ -910,7 +910,20 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
                     raw.append(Merge("unverifiable", reason="the command word is built at run time and the command "
                                                             "mentions gh or a merge"))
                 continue
-        if MERGE_HINT.search(full_command) and (DYNAMIC_WORD.match(first) or (
+        # goodqa#15317: a command word that is a variable this command never binds (an environment value such as a relay
+        # path) cannot carry text from another segment, so only its own segment can name a merge. A variable that is
+        # assigned, read into, looped over or exported here, or any other dynamic word, keeps the whole-command rule.
+        hint_scope = full_command
+        name_match = re.fullmatch(r"\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})", first)
+        before_sep = segments[index - 1][2] if index else ""
+        wrote_file = any(t.startswith(">") or t == "tee" or os.path.basename(t) == "tee" for t in tokens[:a])
+        merge_anywhere = bool(RAW_MERGE.search(_normalize_code(" ".join(tokens))))  # F2: any merge text keeps the whole rule
+        if name_match and word != "eval" and before_sep not in ("|", "|&") and not wrote_file and not merge_anywhere:
+            var = name_match.group(1) or name_match.group(2)
+            if not re.search(r"(?<![$\w{])" + re.escape(var) + r"(?!\w)", full_command.replace("${" + var + "}", " ")
+                             .replace("$" + var, " ")):
+                hint_scope = " ".join(tokens[a:b])
+        if MERGE_HINT.search(hint_scope) and (DYNAMIC_WORD.match(first) or (
                 word == "eval" and any("$" in t for t in seg[1:]))):
             raw.append(Merge("unverifiable", reason="the command word is built at run time and the command mentions "
                                                     "gh or a merge"))

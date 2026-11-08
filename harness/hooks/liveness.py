@@ -110,6 +110,19 @@ def disposition_live(disp: dict | None, now: float, last_activity: float = 0.0, 
     return (last_activity > at) or (now - at < RESUMED_GRACE_S)
 
 
+ENDING_DISPOSITIONS = frozenset(("reassigned", "closed", "superseded", "wontdo", "legacy"))
+
+
+def row_disposed(row: dict) -> bool:
+    """goodqa#15322: an `ah owners` row whose owner main already disposed of (the work moved, ended or was written off)
+    raises no liveness alert, whether or not the replacement is live right now. A time-boxed wait or resume only excuses
+    the row while it is live (disposition.live), and a row `ah` still marks decision_required always alerts."""
+    disp = row.get("disposition")
+    if not isinstance(disp, dict) or row.get("decision_required") is True:
+        return False
+    return disp.get("kind") in ENDING_DISPOSITIONS or disp.get("live") is True
+
+
 NOTE_WAIT_MAX_S = 24 * 3600  # a "waiting on <x>" WAL note holds at most this long after it was written (round 5,
 # MJ-1). liveness cannot confirm a ticket exists, so every note wait gets the unconfirmed cap; a longer wait is an
 # `ah task dispose --kind waiting`, which checks the ask or ticket and allows up to 7 days.
