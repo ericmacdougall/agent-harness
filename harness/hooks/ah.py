@@ -238,18 +238,25 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
     return summary
 
 
-def transcript_mtime(home: Path, session: str, agent: str) -> float:
-    base = home / ".claude" / "projects"
-    best = 0.0
+def subagent_dirs(home: Path, session: str) -> list:
+    """Every project's subagents directory for the session, listed once (owners() asks for each of 1,000+ agents)."""
+    out = []
     try:
-        for proj in os.scandir(base):
-            cand = Path(proj.path) / session / "subagents" / f"agent-{agent}.jsonl"
-            try:
-                best = max(best, cand.stat().st_mtime)
-            except OSError:
-                pass
+        with os.scandir(home / ".claude" / "projects") as projects:
+            for proj in projects:
+                out.append(os.path.join(proj.path, session, "subagents"))
     except OSError:
         pass
+    return out
+
+
+def transcript_mtime(home: Path, session: str, agent: str, dirs: list | None = None) -> float:
+    best = 0.0
+    for directory in (dirs if dirs is not None else subagent_dirs(home, session)):
+        try:
+            best = max(best, os.stat(os.path.join(directory, f"agent-{agent}.jsonl")).st_mtime)
+        except OSError:
+            pass
     return best
 
 
@@ -323,6 +330,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     led = _ledger(home)  # one read per call
     registered = {r["args"].get("owner_agent") for r in led if r.get("op") == "task.register"}
     pending = pending_stops(home, session, led)
+    sub_dirs = subagent_dirs(home, session)
     named_text = "\n".join(named)
     rows = []
     for agent, info in spawned.items():
@@ -330,7 +338,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         summary = summarize_agent_wal(path, index_dir) if path.is_file() else {
             "first": None, "last_at": 0.0, "outcome": None, "last_note": "", "tickets": []}
         last_wal = max(summary["last_at"], 0.0) or info["at"]
-        tmtime = transcript_mtime(home, session, agent)
+        tmtime = transcript_mtime(home, session, agent, sub_dirs)
         if info.get("finished") and agent not in stopped:  # transcript meta says it ended; hook never saw the stop
             stopped.add(agent)
             stop_at[agent] = max(tmtime, last_wal)
@@ -653,6 +661,13 @@ def _message_source(row):
             except provenance.Problem:
                 continue
             return {"source": source, "source_arg": "--source " + shlex.quote(source)}
+    if normalized and len(normalized) < provenance.EXCERPT_MIN:  # a whole short turn ("now") is quoted in full
+        source = f'{ident} "{normalized.replace(chr(34), chr(92) + chr(34))}"'
+        try:
+            if provenance.parse_source(source)["excerpt"] == normalized and not provenance.excerpt_in(row["text"], normalized):
+                return {"source": source, "source_arg": "--source " + shlex.quote(source)}
+        except provenance.Problem:
+            pass
     return {"source_error": "no automatically verified excerpt; use --full and quote exact user text"}
 
 
