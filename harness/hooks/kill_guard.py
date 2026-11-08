@@ -77,7 +77,9 @@ STOP_COMMANDS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'echo', 'printf', 'cat', 
                  'tee', 'diff', 'find', 'curl', 'wget', 'pytest', 'ssh', 'scp', 'rsync', 'tar', 'zip', 'unzip', 'date'}
 NAME_FIRST = {'gosu', 'chroot', 'flock', 'sg', 'su', 'runuser'}  # gosu git bash: the first operand is no command
 OVERRIDDEN = ('apply', 'command', 'dispatch', 'inner_words', 'script', 'ssh', 'container', 'check_tokens', 'resolve',
-              'bind_loop_var')
+              'bind_loop_var', 'names_for')
+
+SSH_GLOB_LINE_FIX = True  # goodqa#15365; tests/test_kill_guard_ssh_glob.py flips it in a copy to prove the tests catch a regression
 
 DEFAULT_POLICY = {
     'mode': 'enforce',
@@ -1002,6 +1004,15 @@ def make_analyzer_class(cg):
             if dropped and any(cg.norm_name(w.text) in (self.broad | self.windows | {'kill'}) for w in words[:2]):
                 self.block('dynamic-head', 'a command name that expands to nothing is followed by a kill verb')
             return words
+
+        def names_for(self, head):
+            """goodqa#15365: a head word holding whitespace is a whole command line (an ssh remote string), not a name; it
+            is re-read word by word elsewhere, where a glob in command position still expands against the known names.
+            norm_name() keeps only the text after its last '/', so `ls tools/x/*` read as the name `*` and matched every verb."""
+            if SSH_GLOB_LINE_FIX and re.search(r'\s', head.text or '') and not head.vars and not head.subs:
+                text = head.text.strip()
+                return [cg.norm_name(text)] if text else []
+            return super().names_for(head)
 
         def dispatch(self, words, cmd, pl, idx, depth):
             words = self.drop_empty_head(words)
