@@ -55,12 +55,17 @@ def system_path():
 
 def setUpModule():  # tests never call the ticket tracker; restored in tearDownModule so it cannot leak into other modules
     global _OFFLINE
-    _OFFLINE = __import__("unittest.mock", fromlist=["patch"]).patch.dict(os.environ, {"HARNESS_PROVENANCE_OFFLINE": "1"})
+    global _POOL_DIR
+    _POOL_DIR = tempfile.mkdtemp(prefix="pr-pool-state-")
+    # A real quota-blocked mark in the machine's codex-pool must not reroute these fake-codex tests.
+    _OFFLINE = __import__("unittest.mock", fromlist=["patch"]).patch.dict(
+        os.environ, {"HARNESS_PROVENANCE_OFFLINE": "1", "CODEX_POOL_STATE_DIR": _POOL_DIR})
     _OFFLINE.start()
 
 
 def tearDownModule():
     _OFFLINE.stop()
+    shutil.rmtree(_POOL_DIR, ignore_errors=True)
 
 
 class PeerReviewTests(unittest.TestCase):

@@ -799,6 +799,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         timeout = min(720, options.get('timeout', 720), remaining)
         leased = False
         resolution, code, stdout, stderr = None, None, '', ''
+        via_pool = False
         try:
             if provider == 'kimi':
                 resolution = {'path': 'kimi_review.py'}
@@ -827,6 +828,10 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                             cmd = [resolution['path'], 'exec', '--ephemeral', '--json', '--model', codex_model,
                                    '-c', 'model_reasoning_effort=' + effort, '--sandbox', 'read-only',
                                    '--cd', str(snapshot), '--output-last-message', str(last), '-']
+                            # While the ChatGPT subscription is recorded as quota-blocked, this same single Codex
+                            # launch goes through codex-pool (API keys under budget caps); it is not an extra launch.
+                            cmd = pool_launch(cmd, resolution['path'], codex_model, effort, options.get('task'))
+                            via_pool = _via_pool(cmd)
                         else:
                             cmd = [resolution['path'], '--print', '--safe-mode', '--restricted', '--model', claude_model,
                                    '--effort', effort, '--max-budget-usd', str(selection.get('review_budget_usd') or 5),
@@ -846,6 +851,8 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                        'fallback_allowed': error.reason in {'QUOTA', 'AUTH'}}
         options.setdefault('attempts', []).append(
             diagnostics.provider_attempt(provider, resolution, code, stdout, stderr, outcome))
+        if provider == 'codex' and not via_pool and outcome.get('reason') == 'QUOTA' and outcome.get('account_cooldown'):
+            note_subscription_quota(outcome.get('reset_at'))
         if outcome.get('usage') is not None:
             options['usage'].append({'provider': provider, 'reported': outcome['usage']})
         if leased and outcome['reason'] not in {'TIMEOUT', 'UNKNOWN'}:
@@ -859,6 +866,57 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
             raise ReviewFailure(outcome, source)
         failure = 'Primary reviewer unavailable (' + outcome['reason'] + '); used authorized independent fallback.'
     raise OSError('no valid reviewer result')
+
+
+def _pool_module():
+    """codex_pool next to this file, or None when it is not installed (the launch then stays direct)."""
+    try:
+        import codex_pool
+        return codex_pool
+    except ImportError:
+        return None
+
+
+def _via_pool(cmd):
+    return len(cmd) > 3 and cmd[2].endswith('codex_pool.py')
+
+
+def pool_launch(cmd, codex_path, model, effort, task):
+    """Swap a direct `codex exec` launch for codex-pool only while the subscription is recorded as blocked."""
+    pool = _pool_module()
+    try:
+        if pool is None or not pool.subscription_blocked():
+            return cmd
+    except Exception:  # unreadable pool state means: keep the direct launch
+        return cmd
+    keep, skip = [], 0
+    for index, token in enumerate(cmd[2:], 2):  # drop the --model / effort pair; codex-pool sets both itself
+        if skip:
+            skip -= 1
+        elif token == '--model':
+            skip = 1
+        elif token == '-c' and cmd[index + 1].startswith('model_reasoning_effort='):
+            skip = 1
+        else:
+            keep.append(token)
+    return [sys.executable, '-I', str(Path(pool.__file__).resolve()), 'run', '--purpose', 'review', '--keys-only',
+            '--codex-bin', codex_path, '--model', model, '--effort', effort,
+            *(['--task', task] if task else []), '--', 'exec', *keep]
+
+
+def note_subscription_quota(reset_at):
+    """Record a trusted subscription quota failure so later launches use the key pool."""
+    pool = _pool_module()
+    if pool is None:
+        return
+    try:
+        until = None
+        if isinstance(reset_at, str):
+            from datetime import datetime
+            until = pool.iso(datetime.fromisoformat(reset_at.replace('Z', '+00:00')))
+        pool.mark_subscription_blocked(until)
+    except Exception:  # pool bookkeeping must never change a review outcome
+        pass
 
 
 def provider_toolchains(resolutions):
@@ -1207,7 +1265,7 @@ def main() -> int:
                   '(--task with a ledger permission); --author-rung alone is not a record' % selection['rung'], file=sys.stderr)
             return 2
     options = {'packet_path': packet, 'secondary': args.secondary, 'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
-               'selection': selection, 'author_rung': author_rung, 'permission': permission,
+               'selection': selection, 'author_rung': author_rung, 'permission': permission, 'task': args.task,
                'codex_model': policy['rungs'][selection['rung']]['models']['openai'],
                'claude_model': policy['rungs'][selection['rung']]['models']['claude']}
     try:

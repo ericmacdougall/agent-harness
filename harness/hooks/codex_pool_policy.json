@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "note": "Budget and rotation policy for codex_pool.py. Caps confirmed by the user 2026-11-08 (WAL wa7703ef35c7). Prices are ESTIMATES in USD per million tokens (OpenAI exposes no balance API); keep them at or above list price so the ledger over-counts rather than under-counts.",
+  "project": "goodqa-28dd3",
+  "secret_prefix": "openai-codex-key-",
+  "ssh_host": "t2-dev",
+  "api_base": "https://api.openai.com",
+  "keys": [
+    {"alias": "goodqa-org", "enabled": true, "note": "v1 was 401; user replaced it 2026-11-08 (v2 healthy). Always read latest."},
+    {"alias": "eric87-personal", "enabled": true},
+    {"alias": "softcorp-personal", "enabled": true},
+    {"alias": "t2-org", "enabled": true},
+    {"alias": "t2consulting-personal", "enabled": true}
+  ],
+  "caps_usd": {"per_run": 5, "per_key_day": 15, "total_day": 40, "total_month": 300},
+  "subscription": {"first": true, "default_block_minutes": 60},
+  "max_key_attempts": 3,
+  "rate_limit_cooldown_minutes": 10,
+  "max_run_seconds": 3600,
+  "probe_model": "gpt-6.1-terra",
+  "daybreak_models": ["gpt-daybreak-blue-latest", "gpt-daybreak-red-latest", "gpt-5.6-cyber"],
+  "daybreak_purposes": ["redteam"],
+  "purposes": ["build", "review", "redteam"],
+  "prices": {
+    "families": {
+      "terra": {"in": 2.0, "cached": 0.2, "out": 10.0, "reserve_usd": 1.5},
+      "sol": {"in": 5.0, "cached": 0.5, "out": 30.0, "reserve_usd": 5.0},
+      "astra": {"in": 15.0, "cached": 1.5, "out": 90.0, "reserve_usd": 5.0}
+    },
+    "models": {
+      "gpt-5.3-codex": {"in": 1.75, "cached": 0.175, "out": 14.0, "reserve_usd": 3.0},
+      "gpt-daybreak-blue-latest": {"in": 15.0, "cached": 1.5, "out": 90.0, "reserve_usd": 5.0},
+      "gpt-daybreak-red-latest": {"in": 15.0, "cached": 1.5, "out": 90.0, "reserve_usd": 5.0},
+      "gpt-5.6-cyber": {"in": 15.0, "cached": 1.5, "out": 90.0, "reserve_usd": 5.0}
+    }
+  }
+}

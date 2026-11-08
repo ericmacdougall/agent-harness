@@ -251,8 +251,22 @@ def model_label(harness, spec):
     return "%s %s %s (rung %s)" % ("Codex" if harness == "openai" else "Claude", spec["model"], spec["effort"], spec["rung"])
 
 
-def launch_command(harness, spec, repo, last):
+def pool_blocked():
+    try:
+        import codex_pool
+        return codex_pool.subscription_blocked()
+    except Exception:  # missing or unreadable pool state keeps the direct launch
+        return False
+
+
+def launch_command(harness, spec, repo, last, task=None):
     if harness == "openai":
+        if pool_blocked():
+            # Subscription is recorded as quota-blocked: same single launch, through codex-pool's budgeted API keys.
+            return [sys.executable, "-I", str(Path(__file__).resolve().parent / "codex_pool.py"), "run", "--purpose", "build",
+                    "--keys-only", "--model", spec["model"], "--effort", spec["effort"], *(["--task", task] if task else []),
+                    "--", "exec", "--ephemeral", "--json", "--sandbox", "workspace-write", "--cd", str(repo),
+                    "--output-last-message", str(last), "-"]
         return ["codex", "exec", "--ephemeral", "--model", spec["model"], "-c", "model_reasoning_effort=" + spec["effort"],
                 "--sandbox", "workspace-write", "--cd", str(repo), "--output-last-message", str(last), "-"]
     return ["claude", "--safe-mode", "--print", "--model", spec["model"], "--effort", spec["effort"],
@@ -337,7 +351,7 @@ def main() -> int:
     if astra_available:
         with tempfile.TemporaryDirectory() as temp:
             last = Path(temp) / "last.txt"
-            cmd = launch_command(primary_harness, primary_spec, repo, last)
+            cmd = launch_command(primary_harness, primary_spec, repo, last, args.task)
             code, stdout, stderr = run(cmd, prompt, repo)
             try:
                 model_handoff = read_handoff(last)
@@ -372,7 +386,7 @@ def main() -> int:
                     source = model_label(other, fallback_spec) + " fallback"
                     with tempfile.TemporaryDirectory() as temp:
                         last = Path(temp) / "last.txt"
-                        cmd = launch_command(other, fallback_spec, repo, last)
+                        cmd = launch_command(other, fallback_spec, repo, last, args.task)
                         code, stdout, stderr = run(cmd, prompt, repo)
                         try:
                             model_handoff = read_handoff(last)

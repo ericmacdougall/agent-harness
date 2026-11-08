@@ -29,7 +29,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "domain_gates.py", "domain_checklists.json",
          "command_guard.py", "command_guard_hook.py", "redact.py", "kill_guard.py", "kill_guard_policy.json",
          "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "ah_kill.py", "ah_ticket.py", "liveness.py",
-         "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
+         "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py", "codex_pool.py", "codex_pool_policy.json",
          "ahd.py", "ahd_peek.py", "ahd_policy.json",
          "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py", "bg_job.py", "bg_lint.py",
          "dropped_gate.py", "ask_reminders.py",  # dropped-owner gate and ask reminders (goodqa#14791)

@@ -15,6 +15,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import hermetic  # noqa: E402
 
 hermetic.install()
+# A real quota-blocked mark in the machine's codex-pool must not reroute these fake-codex tests.
+os.environ['CODEX_POOL_STATE_DIR'] = tempfile.mkdtemp(prefix='rescue-pool-state-')
+atexit.register(shutil.rmtree, os.environ['CODEX_POOL_STATE_DIR'], True)
 
 RESCUE = Path(__file__).resolve().parents[1] / 'harness/hooks/rescue.py'
 # Outer test watchdogs, not product deadlines. Validation runs several Git reads.
