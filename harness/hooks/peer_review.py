@@ -893,11 +893,42 @@ def provider_toolchains(resolutions):
     return specifications
 
 
+def review_record(args, passed, report):
+    """The receipt's review dict; ticketed findings ride along on a BLOCK only (goodqa#15253 item 6)."""
+    findings = [] if passed else finding_ids(report)
+    record = {'stage': args.stage.upper().replace('-', '_'), 'verdict': 'ACCEPT' if passed else 'BLOCK',
+              'findings': findings}
+    ticketed = getattr(args, 'ticketed', None)
+    if ticketed and not passed:
+        try:
+            record['ticketed'] = ticketed_labels(ticketed, findings)
+        except ValueError as error:
+            print(f'Ticketed findings ignored: {error}', file=sys.stderr)
+    return record
+
+
 def finding_ids(report):
     """Preserve explicit finding headings; legacy unlabelled BLOCK stays unknown."""
     values = re.findall(r'(?m)^\s*(?:#{1,6}\s+|[-*]\s+)?(?:Finding\s+)?'
                         r'((?:F|R)[0-9]+(?:[-_.][A-Za-z0-9]+)*)\b', report)
     return sorted(set(values))[:128] or ['UNSPECIFIED']
+
+
+TICKETED_ARG = re.compile(r'((?:F|R)[0-9]+(?:[-_.][A-Za-z0-9]+)*)=(?:GoodQA )?([A-Za-z0-9][A-Za-z0-9_-]{0,39})#([0-9]{1,9})\Z')
+
+
+def ticketed_labels(values, findings):
+    """`F3=GoodQA goodqa#123` arguments -> receipt labels `F3:goodqa:123` (goodqa#15253 item 6). Each id must be a
+    finding of this report. Raises ValueError otherwise. The ticket itself is the author's claim, not looked up."""
+    labels = []
+    for value in values or ():
+        match = TICKETED_ARG.fullmatch(str(value).strip())
+        if not match:
+            raise ValueError('--ticketed must look like F3=GoodQA goodqa#123')
+        if match.group(1) not in findings:
+            raise ValueError('--ticketed names %s, which is not a finding of this review' % match.group(1))
+        labels.append('%s:%s:%s' % match.groups())
+    return labels
 
 
 def commit_policy_gate(repo, base):
@@ -1028,6 +1059,9 @@ def main() -> int:
                              "Kimi subscription via kimi_review.py (tool-less, egress-gated, packet text only)")
     parser.add_argument('--owner', default='peer-review', help='Safe owner identifier for execution receipts')
     parser.add_argument('--base', help='PR base for the commit-policy range check (default origin/HEAD or origin/main)')
+    parser.add_argument('--ticketed', action='append', default=[],
+                        help='F3=GoodQA goodqa#123: a finding already filed as a ticket; it does not count toward the '
+                             'escalation cap (the review still blocks). Repeatable')
     parser.add_argument('--task', help='Ladder task key: the author rung comes from its ledger and the receipt is recorded there')
     parser.add_argument('--author-rung', help='Author rung override (R0..R6); unknown gets the configured unknown-author reviewer')
     parser.add_argument('--author-harness', choices=('claude', 'openai', 'unknown'), default='unknown',
@@ -1338,8 +1372,7 @@ def main() -> int:
         passed = bool(re.match(r'^(?:VERDICT: PASS|(?:PLAN|CODE_INSPECTION)_RESULT: ACCEPT)\b', report.lstrip()))
         reference = run_record.finish(execution='COMPLETED', result='CHECK_OK' if passed else 'CHECK_FAILED',
             reason='NONE' if passed else 'CODE_FINDINGS', exit_code=0,
-            review={'stage': args.stage.upper().replace('-', '_'), 'verdict': 'ACCEPT' if passed else 'BLOCK',
-                    'findings': [] if passed else finding_ids(report)},
+            review=review_record(args, passed, report),
             usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
                    'executables': diagnostics.executable_record(options.get('resolutions', {}))})
         finalized = True

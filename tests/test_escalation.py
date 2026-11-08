@@ -80,7 +80,7 @@ class ClassifierTable(LedgerFixture):
         mutants = {
             'infra counts': ("if reason in NOT_COUNTED_REASONS or", "if False and reason in NOT_COUNTED_REASONS or"),
             'zero launch counts': ("launches == 0):", "launches == -1):"),
-            'block without findings counts': ("verdict') == 'BLOCK' and named_findings(review.get('findings')):", "verdict') == 'BLOCK':"),
+            'block without findings counts': ("verdict') == 'BLOCK' and named_findings(findings):", "verdict') == 'BLOCK':"),
             'unexecuted counts': ("if receipt.get('kind') != 'final' or receipt.get('evidence') != 'EXECUTED':", "if receipt.get('kind') != 'final':"),
             'float launches count': ("if kind == 'review' and (type(launches) is not int or launches == 0):", "if kind == 'review' and launches == 0:"),
             'uncertain execution counts': ("or receipt.get('execution') in ('NOT_STARTED', 'INTERRUPTED', 'UNKNOWN'):", "or False:"),

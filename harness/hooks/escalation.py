@@ -144,8 +144,16 @@ def classify(receipt, *, kind, claimed_heads=()):
             review = receipt.get('review')
             if not isinstance(review, dict):
                 return 'NOT_COUNTED', 'no review verdict in receipt', None
-            if review.get('verdict') == 'BLOCK' and named_findings(review.get('findings')):
-                return 'FAIL', 'material review finding', fingerprint(review['findings'])
+            findings = review.get('findings')
+            ticketed = {str(t).split(':', 1)[0] for t in review.get('ticketed') or () if isinstance(t, str)}
+            if ticketed and isinstance(findings, list):
+                # goodqa#15253 item 6: findings the author filed as tickets do not count toward the cap
+                findings = [f for f in findings if (f.get('id') if isinstance(f, dict) else str(f).split(':', 1)[0])
+                            not in ticketed]
+                if review.get('verdict') == 'BLOCK' and not named_findings(findings):
+                    return 'NOT_COUNTED', 'every named finding is ticketed', None
+            if review.get('verdict') == 'BLOCK' and named_findings(findings):
+                return 'FAIL', 'material review finding', fingerprint(findings)
             if review.get('verdict') == 'ACCEPT':
                 return 'PASS', 'review accepted', None
             return 'NOT_COUNTED', 'blocked without named findings', None

@@ -57,6 +57,7 @@ ENVIRONMENT_KEYS = {'CI', 'LANG', 'LC_ALL', 'TZ', 'PYTHONHASHSEED', 'NODE_ENV'}
 HEX = re.compile(r'[0-9a-f]{64}\Z')
 RUN_ID = re.compile(r'[0-9a-f]{32}\Z')
 LABEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}\Z')
+TICKETED = re.compile(r'(?:F|R)[0-9]+(?:[-_.][A-Za-z0-9]+)*:[A-Za-z0-9][A-Za-z0-9_-]{0,39}:[0-9]{1,9}\Z')
 SECRET = re.compile(r'(?:ghp_|github_pat_|sk-ant-)[A-Za-z0-9_-]{16,}|-----BEGIN .*PRIVATE KEY-----|'
                     r'(?i:api[_-]?key|password|access[_-]?token|authorization)\s*[:=]\s*\S+')
 
@@ -1120,11 +1121,17 @@ class Run:
         if self.start['command_kind'] in {'focused', 'full'} and result == 'CHECK_OK' and (type(count) is not int or count < 1):
             result, reason = 'NO_RESULT', 'INVALID_OUTPUT'
         if review is not None:
-            if (not isinstance(review, dict) or set(review) != {'stage', 'verdict', 'findings'}
+            if (not isinstance(review, dict) or set(review) - {'ticketed'} != {'stage', 'verdict', 'findings'}
                     or review['stage'] not in STAGES or review['verdict'] not in {'ACCEPT', 'BLOCK'}
                     or not isinstance(review['findings'], list) or len(review['findings']) > 128):
                 raise GuardError('INVALID_OUTPUT', 'Review metadata is malformed')
             for finding in review['findings']: safe_label(finding)
+            if 'ticketed' in review:  # goodqa#15253: "<finding>:<project>:<number>" for findings filed as tickets
+                ticketed = review['ticketed']
+                if (review['verdict'] != 'BLOCK' or not isinstance(ticketed, list) or len(ticketed) > 128
+                        or any(not isinstance(t, str) or not TICKETED.fullmatch(t)
+                               or t.split(':', 1)[0] not in review['findings'] for t in ticketed)):
+                    raise GuardError('INVALID_OUTPUT', 'Ticketed findings are malformed')
             if result == 'CHECK_OK' and (review['verdict'] != 'ACCEPT' or review['findings']):
                 raise GuardError('INVALID_OUTPUT', 'Blocked review findings cannot be successful evidence')
         value = {'schema': SCHEMA, 'kind': 'final', 'run_id': self.run_id, 'evidence': 'EXECUTED',
