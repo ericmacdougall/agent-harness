@@ -1421,7 +1421,77 @@ def _resolve_graphql(client, node_ids):
     return m.group(1) + "/" + m.group(2), int(m.group(3))
 
 
-def evaluate_merge(merge, client, state_dir, now, command_hash):
+RECEIPT_SCAN_MAX = 4000  # newest usage runs looked at for a PR review receipt
+
+
+def find_pr_receipt(head, now, used=()):
+    """run_id of a settled peer_review PR ACCEPT (no findings, CHECK_OK) whose subject head is `head` and whose
+    FINAL ended within WAIVER_TTL_SECONDS, not in `used`; else None (goodqa#15253 item 1). Every receipt is read
+    through usage_guard's digest-checked load_ref; any error means no receipt."""
+    try:
+        import usage_guard
+        from datetime import datetime
+        store = usage_guard.UsageStore()
+        runs = store.root / "runs"
+        names = sorted((e for e in os.scandir(runs) if e.is_dir(follow_symlinks=False)
+                        and usage_guard.RUN_ID.fullmatch(e.name)), key=lambda e: e.stat().st_mtime, reverse=True)
+    except Exception:  # noqa: BLE001 - no store, an unsafe store or an import failure: no receipt route
+        return None
+    for entry in names[:RECEIPT_SCAN_MAX]:
+        if entry.name in used:
+            continue
+        try:
+            settled = Path(entry.path) / "settled.json"
+            if not settled.is_file() or settled.is_symlink() or settled.stat().st_size > 64 * 1024:
+                continue
+            reference = json.loads(settled.read_text(encoding="utf-8")).get("reference")
+            if not isinstance(reference, dict) or reference.get("run_id") != entry.name:
+                continue
+            final = store.load_ref(reference)
+            review = final.get("review") or {}
+            if (store._review_finalization(reference) != "SETTLED" or final.get("result") != "CHECK_OK"
+                    or review.get("stage") != "PR" or review.get("verdict") != "ACCEPT" or review.get("findings") != []
+                    or (final.get("subject") or {}).get("head") != head):
+                continue
+            ended = datetime.fromisoformat(str(final.get("ended_at"))).timestamp()
+            if not (now - WAIVER_TTL_SECONDS <= ended <= now + 300):
+                continue
+            return entry.name
+        except Exception:  # noqa: BLE001 - one unreadable run is skipped, never trusted
+            continue
+    return None
+
+
+def consume_receipt(state_dir, repo, pr, head, command_hash, now, subagent):
+    """Single-use waiver from a PR review receipt (main agent only): recorded in the hash-chained waiver log as a
+    waive plus consume pair, so a receipt run_id never waives twice. Returns the waiver id or None."""
+    if subagent:
+        return None
+    state_dir = Path(state_dir)
+    try:
+        lock = _lock(state_dir)
+    except (Corrupt, OSError):
+        return None
+    try:
+        records = _read_waivers(state_dir)
+        used = {r.get("receipt") for r in records if r.get("event") == "waive" and r.get("receipt")}
+        run_id = find_pr_receipt(head, now, used)
+        if not run_id:
+            return None
+        record = _append_waiver_record(state_dir, {
+            "event": "waive", "id": "mgw-" + uuid.uuid4().hex[:12], "ts": now, "repo": repo.lower(), "pr": pr,
+            "head": head, "ticket": "receipt", "reason": "peer_review PR ACCEPT receipt " + run_id,
+            "approved_by": "main:peer-review-receipt", "approval_source": "receipt", "receipt": run_id})
+        _append_waiver_record(state_dir, {"event": "consume", "waiver": record["id"], "ts": now,
+                                          "command_sha256": command_hash})
+        return record["id"]
+    except (Corrupt, OSError):
+        return None
+    finally:
+        _unlock(lock)
+
+
+def evaluate_merge(merge, client, state_dir, now, command_hash, subagent=False):
     """Return (allowed, text, audit_info). Never raises GateError."""
     info = {"repo": None, "pr": None, "head": None}
     hard, soft = [], []  # hard reasons cannot be waived
@@ -1447,7 +1517,8 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
     if not hard and not soft:
         return True, "", info
     if not hard and info["head"]:
-        wid = consume_waiver(state_dir, info["repo"], info["pr"], info["head"], command_hash, now=now)
+        wid = consume_waiver(state_dir, info["repo"], info["pr"], info["head"], command_hash, now=now) or \
+            consume_receipt(state_dir, info["repo"], info["pr"], info["head"], command_hash, now, subagent)
         if wid:
             info["waiver"] = wid
             return True, "", info
@@ -1729,7 +1800,7 @@ def decide(payload, runner, state_dir, now=None):
     client = Client(runner, time.monotonic() + _deadline_seconds() - 2, cwd)
     blocks = []
     for merge in merges:
-        allowed, text, info = evaluate_merge(merge, client, state_dir, now, command_hash)
+        allowed, text, info = evaluate_merge(merge, client, state_dir, now, command_hash, subagent=subagent)
         outcome = "waived" if info.get("waiver") else ("allow" if allowed else "block")
         _audit(state_dir, {"ts": now, "outcome": outcome, "repo": info.get("repo"), "pr": info.get("pr"),
                            "head": info.get("head"), "kind": merge.kind, "command_sha256": command_hash,
