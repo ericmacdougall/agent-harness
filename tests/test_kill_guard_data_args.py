@@ -25,6 +25,10 @@ ALLOW = [
     "python3 -c \"print('the word kill appears here as data')\"",
     "python3 -c \"import json; t = 'ah kill scope'; print(json.dumps({'title': t, 'n': len([1, 2])}))\"",
     "python3 -c \"import datetime; print(f'kill-ticket {datetime.date.today()}')\"",
+    # goodqa#15282: the reason of a recorded merge exception is data
+    CLI + "merge_gate.py waive --repo o/r --pr 5 --head " + "a" * 40 + " --ticket 'GoodQA #1' --reason 'the stale run was killed'",
+    "python3 ~/.codex/agent-harness/wal_note.py --note 'kill-guard note from codex'",
+    "python3 " + HOME + "/.codex/agent-harness/wal_note.py --note 'kill-guard note'",
 ]
 BLOCK = [
     CLI + "ah.py kill --pid 1 --reason x",
@@ -89,6 +93,10 @@ BLOCK = [
     CLI + "ah.py --te kill --pid 4242 --reason x",
     "python3 /Users/someone/.claude/hooks/ah.py user-msg --text 'kill 1'",
     "python3 /home/bob/.claude/hooks/wal_note.py --note 'kill 1'",
+    # goodqa#15276: a copy outside the caller's own install dirs keeps the full scan
+    "python3 /tmp/merge_gate.py waive --reason 'kill 1'",
+    "python3 ~/.claude/hooks/../../tmp/ah.py user-msg --text 'kill 1'",
+    "python3 ~/x/.claude/hooks/ah.py user-msg --text 'kill 1'",
 ]
 
 

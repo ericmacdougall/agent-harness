@@ -1507,7 +1507,9 @@ def make_analyzer_class(cg):
 
         DATA_ARG_SCRIPTS = frozenset(('wal_note.py', 'gq.py', 'ah.py', 'spec_flow.py', 'provenance.py', 'commit_policy.py',
                                       'peer_review.py', 'deliver.py', 'workdir.py', 'escalation.py', 'ops_watch.py',
-                                      'rescue.py', 'ticket_adapters.py', 'report_file.py'))
+                                      'rescue.py', 'ticket_adapters.py', 'report_file.py', 'merge_gate.py'))
+        # goodqa#15276: only the caller's own installed copies, never ./ah.py, /tmp/ah.py or another user's home
+        DATA_ARG_DIRS = ('~/.claude/hooks/', '~/.codex/agent-harness/')
 
         def drop_script_arguments(self, texts):
             """`python3 wal_note.py --note 'will kill nothing'`: the arguments of a NAMED harness tool that records
@@ -1517,7 +1519,12 @@ def make_analyzer_class(cg):
             arguments must not carry a `--` separator or a bare signal verb."""
             if not texts or texts[0].startswith('-'):
                 return texts
-            if os.path.basename(texts[0]) not in self.DATA_ARG_SCRIPTS:
+            name = os.path.basename(texts[0])
+            if name not in self.DATA_ARG_SCRIPTS:
+                return texts
+            home = os.path.expanduser('~').rstrip('/')
+            folder = texts[0][:len(texts[0]) - len(name)]
+            if folder not in self.DATA_ARG_DIRS and folder not in tuple(home + d[1:] for d in self.DATA_ARG_DIRS):
                 return texts
             rest = texts[1:]
             if '--' in rest or any(self.script_kill is not None and self.script_kill.fullmatch(w.strip().lower())
