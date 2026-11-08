@@ -957,6 +957,28 @@ class FalsePositives15122(Base):
                 code, text = mg.decide(bash(command, **self.SUB), FakeGh(SCENARIOS["green"]), self.state)
                 self.assertEqual(code, 0, text)
 
+    def test_review_gfp6_run_time_words_and_hooks_stay_blocked(self):
+        # Opus-xhigh delta review of 72417e1: N1 a variable, substitution or glob word can become a git/gh option at
+        # run time; N2 add/status/branch/tag run hooks; N3 gh joins short flags.
+        for command in ("git log $X --grep 'merge_gate waive'", 'git log "$X" --grep \'merge_gate waive\'',
+                        "git grep -n 'merge_gate waive' -*", "git grep -n 'merge_gate waive' ?O*",
+                        "X='merge_gate waive'; git log --grep \"$X\" $Y",
+                        "gh pr view 5 $W # merge_gate waive", "gh pr view 5 -cw # merge_gate waive",
+                        "gh pr comment 5 --body x $(echo y) # merge_gate waive",
+                        "git add f # merge_gate waive", "git status # merge_gate waive",
+                        "git branch feat # merge_gate waive", "git tag v1 # merge_gate waive"):
+            with self.subTest(command):
+                code, text = mg.decide(bash(command, **self.SUB), FakeGh(SCENARIOS["green"]), self.state)
+                self.assertEqual(code, 2, text)
+        for command in ("git -c core.hooksPath=/dev/null add f # merge_gate waive",
+                        "git -c core.hooksPath=/dev/null status --short # merge_gate waive",
+                        "git --no-pager log --grep 'merge_gate waive'", "git -P log --no-textconv --grep 'merge_gate waive'",
+                        "git diff --no-ext-diff -- 'merge_gate waive'",
+                        "gh pr comment 5 --body \"$(cat <<'EOF'\nmerge_gate waive is main-only\nEOF\n)\""):
+            with self.subTest(command):
+                code, text = mg.decide(bash(command, **self.SUB), FakeGh(SCENARIOS["green"]), self.state)
+                self.assertEqual(code, 0, text)
+
     def test_ac2_subagent_free_text_about_the_exception_record_is_allowed(self):
         for command in ("python3 ~/.claude/hooks/wal_note.py --wal /w/a.jsonl --event status "
                         "--note 'fixed the merge_gate.py waive false positive'",

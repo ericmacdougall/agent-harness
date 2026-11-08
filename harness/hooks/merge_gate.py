@@ -405,7 +405,13 @@ GH_TEXT = {"issue": {"comment", "create", "view", "list", "edit", "close", "reop
            "pr": {"comment", "create", "view", "list", "edit", "checks", "diff", "review", "close", "ready"},
            "api": None, "search": None}
 SAFE_GIT_CONFIG = {"core.hookspath=/dev/null"}
-_LOG_LONG = {"--oneline", "--stat", "--name-only", "--name-status", "--format", "--pretty", "--grep", "--author",
+SAFE_GIT_GLOBALS = {"--no-pager", "-P"}
+# subcommands that can run hooks (githooks(5): commit hooks, post-index-change, reference-transaction): free text only
+# with core.hooksPath=/dev/null (Opus-xhigh delta review N2)
+GIT_HOOKED = {"commit", "add", "status", "branch", "tag"}
+# options whose next word is taken as text, even when it starts with '-' (a quoted "$( )" body is safe there)
+TEXT_VALUE_FLAGS = {"--body", "-b", "--title", "-t", "--message", "-m", "--note", "--subject"}
+_LOG_LONG = {"--no-ext-diff", "--no-textconv", "--oneline", "--stat", "--name-only", "--name-status", "--format", "--pretty", "--grep", "--author",
              "--since", "--until", "--all", "--graph", "--decorate", "--reverse", "--first-parent", "--max-count",
              "--follow", "--date", "--merges", "--no-merges", "--patch", "--abbrev-commit", "--no-color", "--numstat",
              "--shortstat", "--invert-grep", "--all-match", "--fixed-strings", "--regexp-ignore-case"}
@@ -417,7 +423,8 @@ GIT_OPTIONS = {
     "log": (_LOG_LONG, "pqs", "nSG"),
     "show": (_LOG_LONG, "pqs", "nSG"),
     "diff": ({"--stat", "--name-only", "--name-status", "--cached", "--staged", "--numstat", "--shortstat",
-              "--no-color", "--word-diff", "--unified", "--exit-code", "--quiet", "--check"}, "pqsuwRb", "U"),
+              "--no-color", "--word-diff", "--unified", "--exit-code", "--quiet", "--check", "--no-ext-diff",
+              "--no-textconv"}, "pqsuwRb", "U"),
     "status": ({"--short", "--branch", "--porcelain", "--untracked-files", "--ignored"}, "sbz", "u"),
     "add": ({"--all", "--update", "--verbose", "--dry-run", "--intent-to-add"}, "Anuv", ""),
     "grep": ({"--line-number", "--ignore-case", "--files-with-matches", "--count", "--word-regexp",
@@ -499,9 +506,11 @@ def _free_text(words):
         return False  # printf -v assigns a variable (HOME, PATH)
     if "/" not in word and word in FREE_TEXT_COMMANDS:
         return True
+    if word in ("git", "gh") and not _literal_args(rest):
+        return False  # a word the shell builds at run time can become an option (delta review N1)
     if word == "gh":
-        if any(t in ("--web", "-w") or t.startswith("--web=") for t in rest):
-            return False  # opens a browser
+        if any(t.startswith("--web") or (t.startswith("-") and not t.startswith("--") and "w" in t) for t in rest):
+            return False  # opens a browser (also joined short flags such as -cw, delta review N3)
         plain = [t for t in rest if not t.startswith("-")]
         if not plain or plain[0] not in GH_TEXT:
             return False
@@ -512,15 +521,47 @@ def _free_text(words):
         while k < len(rest) and rest[k].startswith("-"):
             if rest[k] == "-c" and k + 1 < len(rest) and rest[k + 1].lower() in SAFE_GIT_CONFIG:
                 hooks_off, k = True, k + 2
+            elif rest[k] in SAFE_GIT_GLOBALS:
+                k += 1
             else:
                 return False  # other -c settings and -C (another repository's config) are not free text
         if k >= len(rest) or rest[k] not in GIT_OPTIONS:
             return False
-        if rest[k] == "commit" and not hooks_off:
-            return False  # commit hooks are programs; a commit is free text only with core.hooksPath=/dev/null
+        if rest[k] in GIT_HOOKED and not hooks_off:
+            return False  # hooks are programs; these subcommands are free text only with core.hooksPath=/dev/null
         return _git_args_ok(rest[k], rest[k + 1:])
     if word in ("python3", "python"):
         return bool(rest) and bool(HOOK_SCRIPT.match(rest[0]))
+    return False
+
+
+def _literal_args(args):
+    """No argument word of git or gh may be built at run time: a word starting with '$' (a variable or substitution
+    that can expand to an option) is allowed only as the value of a text option such as --body; the caller refuses
+    unquoted $ and globs in the raw command."""
+    for j, t in enumerate(args):
+        if t.startswith("$") and not (j and args[j - 1] in TEXT_VALUE_FLAGS and t.startswith("$(")):
+            return False
+    return True
+
+
+def _unquoted_expansion(text):
+    """True when the raw command has a $ or glob character outside quotes: its expansion is split into words that the
+    hook cannot see (delta review N1)."""
+    state, i = None, 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\" and state != "'":
+            i += 2
+            continue
+        if state is None:
+            if c in "'\"":
+                state = c
+            elif c in "$*?[":
+                return True
+        elif c == state:
+            state = None
+        i += 1
     return False
 
 
@@ -556,6 +597,9 @@ def _waiver_attempt(command, _depth=0):
     commands = _simple_commands(tokens, writes)
     # any git or python word, also after if/while/then (review F1: _command_word does not skip keywords)
     runs_code = any(os.path.basename(t) in ("git", "python3", "python") for w in commands for t in w)
+    if any(os.path.basename(t) in ("git", "gh") for w in commands for t in w) and \
+            _unquoted_expansion(_strip_comments(command)):
+        return True  # unquoted $ or glob next to git or gh: run-time words can become options (delta review N1)
     if runs_code and (writes or any(os.path.basename(t) == "tee" for w in commands for t in w)):
         return True  # a file written next to a git or python run could be the hook or script that runs
     for words in commands:
