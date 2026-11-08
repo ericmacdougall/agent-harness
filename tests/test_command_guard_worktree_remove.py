@@ -314,3 +314,17 @@ class WorktreeRemoveDashC(WorktreeRemoveCase):
         git(other, 'remote', 'add', 'origin', URL)
         self.assertEqual(self.decide('git -C %s worktree remove %s' % (other, self.linked), cwd=self.home)[0], 'block')  # F2
         self.assertEqual(self.decide(ok, cwd=self.home)[0], 'allow')
+
+    def test_delta_n1_n3_shell_in_a_scan_blind_subdir_alias_or_the_git_dir_blocks(self):
+        # an upper-cased spelling of the target is another path string but the same directory on a case-folding volume
+        ok = 'git -C %s worktree remove %s' % (self.primary, self.linked)
+        gitdir = Path(git(self.linked, 'rev-parse', '--absolute-git-dir'))
+        self.assertEqual(self.decide(ok, cwd=gitdir)[0], 'block')                 # N3: the admin folder is deleted too
+        self.assertEqual(self.decide('git -C %s worktree remove %s' % (gitdir, self.linked), cwd=self.home)[0], 'block')
+        deep = self.linked / 'node_modules' / 'a' / 'b'
+        deep.mkdir(parents=True)
+        (self.primary / '.git/info/exclude').write_text('node_modules/\n')
+        upper = Path(str(self.linked).replace('/linked', '/LINKED'))
+        if upper.exists():  # case-insensitive volume (macOS default): the spelling differs, the directory is the same
+            self.assertEqual(self.decide(ok, cwd=upper / 'node_modules' / 'a' / 'b')[0], 'block')
+        self.assertEqual(self.decide(ok, cwd=deep)[0], 'block')

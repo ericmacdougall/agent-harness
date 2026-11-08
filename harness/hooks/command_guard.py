@@ -4636,6 +4636,23 @@ class Analyzer:
             return 'could not check the calling directory'
         if here == path or os.path.realpath(self.ctx.cwd).startswith(path + os.sep) or os.path.realpath(self.ctx.cwd) == path:
             return 'the current worktree cannot remove itself'
+        # delta red-team N1 and N3: strings do not fold case or firmlinks, so compare files. Neither the shell's directory
+        # nor the -C directory may be the target, inside it, or inside the git directory that the removal also deletes.
+        try:
+            gitdir = os.path.realpath(_git_out(path, ['rev-parse', '--absolute-git-dir'], 2.0).strip())
+            targets = [os.stat(path), os.stat(gitdir)]
+            for start in (self.ctx.cwd, repo):
+                node = os.path.realpath(start)
+                for _ in range(200):
+                    st = os.stat(node)
+                    if any(os.path.samestat(st, target) for target in targets):
+                        return 'the calling directory is inside the worktree or its git directory'
+                    parent = os.path.dirname(node)
+                    if parent == node:
+                        break
+                    node = parent
+        except Exception:  # noqa: BLE001 - an unreadable ancestor or git directory keeps the refusal
+            return 'could not compare the calling directory with the worktree'
         try:
             theirs = os.path.realpath(_git_out(repo, ['rev-parse', '--path-format=absolute', '--git-common-dir'], 2.0).strip())
             ours = os.path.realpath(_git_out(path, ['rev-parse', '--path-format=absolute', '--git-common-dir'], 2.0).strip())
