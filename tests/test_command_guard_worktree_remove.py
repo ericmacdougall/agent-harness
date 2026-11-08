@@ -472,6 +472,8 @@ class WorktreeRemoveParallelRebuildEdges(WorktreeRemoveCase):
                   'echo %s | parallel' % p,
                   'parallel --semaphore git worktree remove --force %s' % p,
                   'sem --id x git wr %s' % p,
+                  "parallel -j 4 sh -c 'git worktree remove --force {}' ::: %s" % p,  # the reading that keeps the quotes
+                  'git config rename-section foo alias',
                   'parallel echo ::: %s' % ' '.join('x%d' % n for n in range(cg.PAR_LINE_LIMIT + 1))):
             self.assertEqual(self.decide(c)[0], 'block', c[:120])
 

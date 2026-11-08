@@ -2112,6 +2112,15 @@ def parallel_plan(words, semaphore=False):
         if line is None:
             return None, None, 'a parallel replacement cannot be rebuilt'
         lines.append(line if hit else command + ' ' + ' '.join(v if raw else _quote_for_rebuild(v) for v, raw in combo))
+    if command.strip() and not quote_words and len(template) > 1 and any(re.search(r'\s', w.text) for w in template):
+        # Without -q parallel loses the quotes around a word (`sh -c 'a b'` runs `sh -c a b`). Judge the reading that keeps
+        # them as well, so that a difference between parallel versions or a misread option cannot hide the command.
+        kept = ' '.join(w.raw if (w.glob and w.raw is not None) else _quote_for_rebuild(w.text) for w in template)
+        for combo in itertools.product(*columns):
+            line, hit = _par_fill(kept, pattern, repl, combo)
+            if line is None:
+                return None, None, 'a parallel replacement cannot be rebuilt'
+            lines.append(line if hit else kept + ' ' + ' '.join(v if raw else _quote_for_rebuild(v) for v, raw in combo))
     return lines, 'args', None
 
 
@@ -4077,7 +4086,7 @@ class Analyzer:
         --rename-section into alias, which turns existing keys into aliases."""
         for k, a in enumerate(args):
             low = a.text.casefold()
-            if low == '--rename-section' and any(
+            if low in ('--rename-section', 'rename-section') and any(
                     b.dynamic or b.subs or b.text.casefold().split('.')[0] == 'alias' for b in args[k + 1:k + 3]):
                 return True
             if low.startswith('alias.'):
