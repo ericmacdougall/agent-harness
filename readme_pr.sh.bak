@@ -1,0 +1,22 @@
+#!/bin/bash
+# README guard for F4: deploy only through npm run deploy. Branch docs/deploy-via-npm-only from main, pushed normally (no force).
+set -eu
+cd /Users/eric/.agent-harness/scratch/claude-501/-Users-eric/baab765b-d85c-46b4-b7b9-588eb912c770/scratchpad/n2/t2c
+git fetch -q origin main --depth 1
+git checkout -q -B docs/deploy-via-npm-only origin/main
+python3 -I - <<'EOF'
+r = open('README.md').read().rstrip('\n')
+r += """
+
+## Deploying
+
+Deploy only with `npm run deploy` (full sequence: `npm ci && npm run media:pull && npm run build && npm run deploy`). It refuses a build whose `dist/` does not contain the verified media (goodqa#15484).
+
+Do not run `npx wrangler deploy` (or any Workers Builds / CI deploy command) directly: it skips that gate and can ship a site with no audio or video. If a CI or Workers Builds deploy command is ever configured for this worker, it must be `npm run deploy`.
+"""
+open('README.md', 'w').write(r + '\n')
+EOF
+git add README.md
+git commit -q -m "docs(deploy): deploy only through npm run deploy" -m "Why: a direct wrangler deploy skips the media gate (F4 on goodqa#15484) and can ship a site with no media." -m "What: README states that deploys go through npm run deploy and that any CI or Workers Builds deploy command must be npm run deploy." -m "Testing: not run: documentation only." -m "Refs: GoodQA #15484"
+git push -q origin docs/deploy-via-npm-only 2>&1 | tail -1
+echo "README_HEAD $(git rev-parse HEAD)"
