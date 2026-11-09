@@ -1,0 +1,8 @@
+test(videos): add the mobile layout check, failing on the current build
+
+Why: The video curriculum is hard to use on a phone: the lesson list sits 226 items down the page, the player scrolls away, links are 20 px tall and a long title overflows sideways. The check is written first so the defects are proven before the fix.
+What: Add test/mobile/mobile_check.py (Playwright, four phone viewports plus a long-title variant and a desktop keyboard walk) with the desktop focus-order baseline taken from the unfixed page, and a README with the run recipe.
+Testing: python test/mobile/mobile_check.py against a local wrangler preview of the staged build on t2-dev: 43 passed, 32 failed, exit 1 (the failing control).
+Refs: GoodQA goodqa#15486
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

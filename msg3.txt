@@ -1,0 +1,8 @@
+chore(scratch): keep goodqa#15486 preview helpers and PR text
+
+Why: Stop-hook hygiene requires the owner worktree to be clean; these are the helper scripts and drafted texts used for the private mobile-UI work, whose code lives in the separate private-lessons-host repo (PR #7).
+What: Add sync.sh (push the working copy to the t2-dev preview), previewproxy.py (loopback proxy for click-testing the synthetic-auth preview) and the commit and PR message drafts.
+Testing: not run: helper scripts were exercised during the work (sync.sh and previewproxy.py served the preview used by mobile_check.py).
+Refs: none (chore: scratch helpers, no product code)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

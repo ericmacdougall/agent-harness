@@ -1,0 +1,8 @@
+fix(videos): lesson drawer, sticky player bar and phone-safe layout
+
+Why: On phones the lesson list was buried below the whole lesson, the player scrolled out of sight, links and chapter rows were under 44 px, and a long title caused 5000 px of horizontal scroll.
+What: On phone-sized screens (width up to 780 px, or short landscape) the lesson list becomes a bottom-sheet dialog opened from a bar that stays at the top with Lessons, Previous and Next; filters collapse behind a summary; the video dock is sticky in portrait; the page scrolls as one; controls are at least 44 px; long text wraps; safe-area insets are used (viewport-fit=cover). Opening the drawer locks and inerts the page, Escape or Close returns focus, the list keeps its scroll position, and choosing a lesson scrolls to the player. Desktop markup order, styles and focus order are unchanged. No new external resources. Add a static guard test with a seeded failing control.
+Testing: `python test/mobile/mobile_check.py` on the t2-dev preview -> 186 passed, 0 failed (was 43 passed, 32 failed); `npm test` -> 139 passed; `python3 -m unittest discover -s test -p '*_test.py'` -> 57 OK.
+Refs: GoodQA #15486
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
