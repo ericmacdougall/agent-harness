@@ -182,7 +182,7 @@ describe('K2 idempotent AI thread create', () => {
     const key = randomUUID();
     const t = await post(owner.headers, org.id, { message: 'Thread A' });
     const conversationId = (t.json() as { conversation: { id: string } }).conversation.id;
-    const sent = await ctx.app.inject({ method: 'POST', url: `/v1/conversations/${conversationId}/messages`, headers: owner.headers,
+    const sent = await ctx.app.inject({ method: 'POST', url: `/v1/chat/conversations/${conversationId}/messages`, headers: owner.headers,
       payload: { body: 'Ordinary send', clientMsgId: key } });
     expect(sent.statusCode, sent.body).toBeLessThan(300);
     const before = await counts();

@@ -20,6 +20,9 @@ systemd-run --user --collect --no-block --unit="$U" --service-type=oneshot --wor
   -p TimeoutStartSec=60min -p KillMode=control-group -p UMask=0077 \
   -E HOME="$HOME" -E PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" -E RW_LANE_ROOT="$H" \
   -E RW_SHIP_SMOKE="$J" -E DEPLOY_TARGET=selfhost -E SELFHOST_APP=ubuntu@107.181.240.13 -E SELFHOST_DIR=/opt/goodqa/infra/selfhost/app \
-  /usr/bin/python3 -I -B "$H/bin/rw" exec-main-push-env --keyed "$RW" "$KEY" \
-  -- /usr/bin/bash "$RW" "$R" "$S" "$D" 2>&1 | tail -1
+  /usr/bin/sg docker -c "$(printf '%q ' /usr/bin/python3 -I -B "$H/bin/rw" exec-main-push-env --keyed "$RW" "$KEY" \
+  -- /usr/bin/bash "$RW" "$R" "$S" "$D")" 2>&1 | tail -1
+# The systemd user manager on t2-dev started (Nov 5) before eric joined the docker group, so user units lack it and
+# the promote build boundary cannot reach /var/run/docker.sock. sg applies eric's existing docker membership to this
+# one unit; it grants nothing new (dev2 units had the group directly).
 echo "unit=$U  watch: journalctl --user -u $U -f"
