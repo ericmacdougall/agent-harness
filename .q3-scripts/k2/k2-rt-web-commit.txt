@@ -1,0 +1,27 @@
+fix(web): K2 stopped notice is a live region; close aborts by ref
+
+Why: the K2 red-team (goodqa#14903) found the stopped notice mounted
+together with its text (screen readers often skip that), Dismiss dropped
+focus to the page, and a close in the same batch as the submit skipped the
+abort because it read isPending from render state.
+
+What: the role=status region is always mounted (sr-only when empty) and
+gets the text on a stop; Dismiss returns focus to New thread. closeDialog
+aborts when abortRef holds a call (set synchronously on submit). NEG-8 test
+now also asserts the list invalidation.
+
+Testing: `pnpm --filter @bugtracker/web exec vitest run src/components/messaging/new-ai-thread-idempotency.test.tsx`
+on t2-dev -> before this fix 2 failed, 14 passed (RT-3, RT-4); after 16
+passed. Same command over the K2 file plus new-ai-thread-dialog,
+ai-thread-panel, qac-sidebar-progress-ack, conversation-list,
+persistent-ai-panel, persistent-ai-layout, ai-chat-reopen, messaging-dock,
+messaging-dock-toggle-crossorg, persistent-chat-shell,
+persistent-chat-public -> 12 files, 325 passed, 1 skipped.
+`python3 ~/wt/aab3-k2-web-variants.py` -> VARIANTS_RESULT
+WEBTSC_RESULT
+
+Refs: GoodQA #14903
+
+Risk: web only; rollback is a revert of this commit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

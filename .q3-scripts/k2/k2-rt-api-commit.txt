@@ -23,8 +23,12 @@ guards exist); after 20 passed.
 `python3 ~/wt/aab3-k2-variants.py` -> exit 0, 6 of 6 broken variants caught
 (lookup before lock, raw-body hash, no replayed guard, no unique mapping,
 no floor check, no first-message check).
-NEIGHBOURS_RESULT
-TSC_RESULT
+Neighbours commander-thread-lifecycle, commander-threads,
+qac-ai-thread-invite-link, commander-threads-off-dm-admission -> 4 files,
+92 passed.
+`node --max-old-space-size=12000 ./node_modules/typescript/bin/tsc --noEmit`
+in apps/api -> exit 2, the same 2 base errors in untouched files, 0 in
+changed files.
 
 Refs: GoodQA #14903
 

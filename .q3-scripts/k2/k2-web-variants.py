@@ -43,6 +43,8 @@ VARIANTS = [
     abortRef.current = null;
     callRef.current += 1;
   }, [orgId]);''', '  useEffect(() => () => abortRef.current?.abort(), []);'), 'changing org'),
+    ('close-decides-by-isPending', edit('  const closeDialog = () => {\n    if (abortRef.current) {', '  const closeDialog = () => {\n    if (create.isPending) {'), 'K2-RT-4'),
+    ('dismiss-drops-focus', edit('                setStopped(false);\n                newThreadRef.current?.focus();\n', '                setStopped(false);\n'), 'K2-RT-3'),
 ]
 
 
