@@ -3935,6 +3935,14 @@ class LiveAlertReopen(unittest.TestCase):
         self.assertEqual(fx.duplicate_survivor.call_count, 2)
         self.assertEqual(len(self.notes(fx)), 2)
 
+    def test_N1_RisenSeverityDoesNotDefeatTheLookupGate(self):
+        fx, state, f = self.dup_case()
+        state['alerts']['test']['severity'] = 'low'          # finding severity is higher: `escalate` would stay true
+        for dt in (0, 120, 240, 360):
+            L.act([f], state, CFG, fx, True, T0 + dt)
+        self.assertEqual(fx.duplicate_survivor.call_count, 1)
+        self.assertEqual(fx.ticket_patch.call_count, 0)
+
     def test_F2_RecurrenceAfterClearNotesCanonicalInsteadOfReopeningTheDuplicate(self):
         fx, state, f = self.dup_case()
         state['alerts']['test'].update(cleared=T0 - 100)

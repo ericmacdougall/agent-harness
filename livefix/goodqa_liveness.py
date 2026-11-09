@@ -2466,7 +2466,8 @@ def act(findings, st, cfg, fx, apply, now, sample=None, left=None, reconcile=Tru
                         rec['alert'] = 'would note on %s (duplicate %s)' % (survivor, a['ref'])
                     else:
                         # Gate the NEXT lookup: without this the alert stays due and costs ~6 calls on every 2-minute pass.
-                        a.update(status_synced=now, commented=now, comment_digest=material_digest(f))
+                        # severity too: a stored severity below the finding's keeps `escalate` (and so `due`) true on every pass
+                        a.update(status_synced=now, commented=now, comment_digest=material_digest(f), severity=finding_severity(f))
                         if now - float(a.get('dup_noted') or 0) < DUP_NOTE_SECONDS:
                             rec['alert'] = 'duplicate %s of %s (noted recently)' % (a['ref'], survivor)
                         elif alert_room() < write_reserve:
