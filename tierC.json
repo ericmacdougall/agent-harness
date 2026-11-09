@@ -1,0 +1,1752 @@
+{
+ "6cca26cd-9999-4fdd-9ec8-22d3dd430d10": {
+  "slug": "goodqa",
+  "n": 15277,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done9.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-adad414d36642c614"
+  ]
+ },
+ "12430e86-a28b-4f67-ba13-854630734611": {
+  "slug": "goodqa",
+  "n": 15189,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done9.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "a4e94fb2-b22f-4af8-9abf-147cff29b68c": {
+  "slug": "goodqa",
+  "n": 15237,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done9.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a6daa5536cba3f9e7"
+  ]
+ },
+ "ae76aa76-f6da-4b89-9166-cb47dae68de1": {
+  "slug": "goodqa",
+  "n": 15150,
+  "proj": "framebright/goodqa",
+  "to": "done",
+  "ledger": "done8.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "c8564fe2-eaff-40f9-b1f8-5684d5388d30": {
+  "slug": "goodqa",
+  "n": 14888,
+  "proj": "framebright/goodqa",
+  "to": "done",
+  "ledger": "done8.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "701681fe-8aff-4c8b-a4e0-d287e4f375bb": {
+  "slug": "goodqa",
+  "n": 14716,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done9.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "a7db660e-384f-4c1d-a18e-c87e7f4d4c44": {
+  "slug": "goodqa",
+  "n": 14715,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done9.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "991e5fda-2a08-4a53-9ada-75e62b6b390a": {
+  "slug": "goodqa",
+  "n": 14459,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done9.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "2a3ef458-f93c-403f-898d-068854d0d3f3": {
+  "slug": "parent-proof",
+  "n": 579,
+  "proj": "framebright/parent-proof",
+  "to": "wont_fix",
+  "ledger": "done9.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "3f2fad4b-2174-47ef-b4cb-3d7b0c9e2019": {
+  "slug": "parent-proof",
+  "n": 553,
+  "proj": "framebright/parent-proof",
+  "to": "wont_fix",
+  "ledger": "done9.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a4ea0e3098d9568e1"
+  ]
+ },
+ "df512f42-0604-44dc-8044-f67cce611c5f": {
+  "slug": "parent-proof",
+  "n": 487,
+  "proj": "framebright/parent-proof",
+  "to": "wont_fix",
+  "ledger": "done9.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "96823c42-e70a-4c71-b007-4fff7cb9b42d": {
+  "slug": "goodqa",
+  "n": 15490,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-ae5111e19faa4456d"
+  ]
+ },
+ "92911933-4849-4345-a772-bfd38793c56e": {
+  "slug": "goodqa",
+  "n": 15484,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "b31bc37a-1332-4495-82bf-e9c7d4f369bf": {
+  "slug": "goodqa",
+  "n": 15339,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a190201e5c716313c"
+  ]
+ },
+ "ec04945b-9246-4aa2-8daa-44bb9ac22459": {
+  "slug": "goodqa",
+  "n": 15293,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "ad0d2bc7-5f7c-4ed1-915e-8a550012433b": {
+  "slug": "goodqa",
+  "n": 15292,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "85891bba-ec6a-4144-83b5-6b9626c1ae83": {
+  "slug": "goodqa",
+  "n": 1643,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "b76e640f-09b6-4345-a83d-9b5877c2e085": {
+  "slug": "goodqa",
+  "n": 15263,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a4ea0e3098d9568e1"
+  ]
+ },
+ "59385984-8cbf-477b-861c-2bbba3cb1873": {
+  "slug": "goodqa",
+  "n": 15256,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a1f79b2406829b199"
+  ]
+ },
+ "cad35ecc-4c8e-457d-876d-a73c1c41d8c3": {
+  "slug": "goodqa",
+  "n": 15245,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "cf5ccf46-560a-4b08-8428-f9c4aaf9acef": {
+  "slug": "goodqa",
+  "n": 15206,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "a7ad4903-3273-43d2-b5f1-32c7136eede3": {
+  "slug": "goodqa",
+  "n": 15198,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-ac2499e5da48c25d1"
+  ]
+ },
+ "798e67f0-d0c1-4107-aec7-a790284df038": {
+  "slug": "goodqa",
+  "n": 15105,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "a8915103-2144-4689-ab7a-6c5ead96081d": {
+  "slug": "goodqa",
+  "n": 15063,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "56309b43-3986-4e02-8d20-e4b00831906b": {
+  "slug": "goodqa",
+  "n": 15053,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "73537c83-1366-4e38-83ce-f9878d54ece8": {
+  "slug": "goodqa",
+  "n": 15041,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "41b07401-1510-4d58-a968-c16be5cd6897": {
+  "slug": "goodqa",
+  "n": 14982,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "c5fa0e8d-0717-4866-9fa1-649a573b17f6": {
+  "slug": "goodqa",
+  "n": 14919,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "97821500-ef7f-407f-a9b1-900e510faf86": {
+  "slug": "goodqa",
+  "n": 14831,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "edca2c3a-b14f-4213-8936-e3126bf39c8b": {
+  "slug": "goodqa",
+  "n": 14787,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "31f95d8e-aca6-4390-8cce-dac6407b2eae": {
+  "slug": "goodqa",
+  "n": 14727,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "d141fef8-630a-44e3-bfdb-83edc60fc95d": {
+  "slug": "goodqa",
+  "n": 15238,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a6daa5536cba3f9e7"
+  ]
+ },
+ "50a8a37a-59a6-4b2b-8982-edb41f676615": {
+  "slug": "goodqa",
+  "n": 393,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "62ac10fd-0aed-4f61-8176-acab87ad2343": {
+  "slug": "goodqa",
+  "n": 15360,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-ae5ae6df650ee663d"
+  ]
+ },
+ "b4a51da2-a1e9-49e9-988f-b010aa92a4b8": {
+  "slug": "goodqa",
+  "n": 15358,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-ae5ae6df650ee663d"
+  ]
+ },
+ "d0612941-51a7-4a86-8782-d77ea3541a04": {
+  "slug": "goodqa",
+  "n": 15338,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a190201e5c716313c"
+  ]
+ },
+ "723131b6-a30d-4a10-9609-d2720acfeb13": {
+  "slug": "goodqa",
+  "n": 15328,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a190201e5c716313c"
+  ]
+ },
+ "7a9d7fed-2c0e-4ec9-89e4-9bccbae536fd": {
+  "slug": "goodqa",
+  "n": 15243,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-ae5ae6df650ee663d"
+  ]
+ },
+ "52dc3be8-c001-40a7-b71c-ac84ff5c8556": {
+  "slug": "goodqa",
+  "n": 15239,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "1eb55b06-edb5-4b70-b782-dbd91e641ee4": {
+  "slug": "goodqa",
+  "n": 15222,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-ae5ae6df650ee663d"
+  ]
+ },
+ "3f45fb2d-36eb-4dc9-868f-b90a3b47019f": {
+  "slug": "goodqa",
+  "n": 15213,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-ae5ae6df650ee663d"
+  ]
+ },
+ "bd8e7332-f70d-43e5-99c0-5c855708117b": {
+  "slug": "goodqa",
+  "n": 15179,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-ae5ae6df650ee663d"
+  ]
+ },
+ "6e78972d-81d6-452c-a9b1-64e492c78c39": {
+  "slug": "goodqa",
+  "n": 15090,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-ae5ae6df650ee663d"
+  ]
+ },
+ "a9bb38f1-a968-4737-bd79-2330424a770e": {
+  "slug": "goodqa",
+  "n": 15089,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-ae5ae6df650ee663d"
+  ]
+ },
+ "a4aa5eb8-c81b-4012-a99e-f13d45230a31": {
+  "slug": "goodqa",
+  "n": 14889,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "a8091549-40ae-4bd8-bd96-3ec96153fc06": {
+  "slug": "goodqa",
+  "n": 14770,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "a4a4f07b-afa4-466b-879a-baf2db16fff8": {
+  "slug": "goodqa",
+  "n": 14643,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-af794b88fa237d998"
+  ]
+ },
+ "3ce01873-55af-49f0-846d-1a2b70aa879e": {
+  "slug": "goodqa",
+  "n": 14603,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "b4144d7f-fe6f-4b0d-abf2-1e7084f67102": {
+  "slug": "goodqa",
+  "n": 14596,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "17832a9d-003b-431c-8fc7-355e67d8e4e5": {
+  "slug": "goodqa",
+  "n": 14588,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "149fa09c-6ff0-4b50-8480-45b3f3413f32": {
+  "slug": "goodqa",
+  "n": 14587,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "3fe8a3f8-32e5-410e-bef4-1804ccfe1140": {
+  "slug": "goodqa",
+  "n": 15186,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "54345f2b-62e9-452f-a508-cbad12503136": {
+  "slug": "goodqa",
+  "n": 5118,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "71a10468-17e8-4aae-af89-8cd58ae0ee77": {
+  "slug": "goodqa",
+  "n": 14819,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "9302afb7-8d68-4aa0-8fe1-c42ae0befaf8": {
+  "slug": "goodqa",
+  "n": 14562,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "0eb2ff0d-6aa7-4483-a75e-3c61aa586889": {
+  "slug": "goodqa",
+  "n": 14952,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "303b6f9f-ba4a-496a-a311-36eb1422bb64": {
+  "slug": "goodqa",
+  "n": 15199,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-ac2499e5da48c25d1"
+  ]
+ },
+ "55f4e7f3-6264-4c48-8741-1b4cdccf1bd2": {
+  "slug": "parent-proof",
+  "n": 574,
+  "proj": "framebright/parent-proof",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "874135f4-1cff-4b0b-aa2d-31229eddec80": {
+  "slug": "parent-proof",
+  "n": 584,
+  "proj": "framebright/parent-proof",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "907df494-f032-4b40-a6f8-a96fe7345162": {
+  "slug": "parent-proof",
+  "n": 564,
+  "proj": "framebright/parent-proof",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "10b1a74d-0764-452a-92ca-c9fc714c3c30": {
+  "slug": "parent-proof",
+  "n": 612,
+  "proj": "framebright/parent-proof",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a2074d2ee99a4d35a"
+  ]
+ },
+ "c087418e-0427-4bad-a2a8-aef3f6c587ed": {
+  "slug": "parent-proof",
+  "n": 583,
+  "proj": "framebright/parent-proof",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "8d6c0537-6336-4a2b-9154-fd02f139ffae": {
+  "slug": "parent-proof",
+  "n": 601,
+  "proj": "framebright/parent-proof",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a4ea0e3098d9568e1,o:baab765b/agent-a820a93849c365616"
+  ]
+ },
+ "8e48b54b-9f90-4892-8e21-b3a743afe297": {
+  "slug": "goodqa",
+  "n": 15510,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-ae5111e19faa4456d"
+  ]
+ },
+ "a52694a6-7915-4bdb-a56c-40b5a00e09de": {
+  "slug": "goodqa",
+  "n": 15554,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done13.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-ae5111e19faa4456d"
+  ]
+ },
+ "69d35376-814a-4516-a4bd-faec0654762c": {
+  "slug": "harness",
+  "n": 153,
+  "proj": "eric/harness",
+  "to": "wont_fix",
+  "ledger": "done4.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "a4cfeabb-c357-4f07-aa88-d5444dd58db1": {
+  "slug": "harness",
+  "n": 129,
+  "proj": "eric/harness",
+  "to": "wont_fix",
+  "ledger": "done4.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "1d119cfb-0d14-4e6d-8575-42c7a28a0115": {
+  "slug": "parent-proof",
+  "n": 658,
+  "proj": "framebright/parent-proof",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a1a19164ed8810a48"
+  ]
+ },
+ "7359bf06-3748-4d48-8a16-862c2cec25c1": {
+  "slug": "parent-proof",
+  "n": 605,
+  "proj": "framebright/parent-proof",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a4ea0e3098d9568e1"
+  ]
+ },
+ "6e4b6066-780e-4479-9290-08b8461ffe4b": {
+  "slug": "parent-proof",
+  "n": 585,
+  "proj": "framebright/parent-proof",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "d09997cc-fbd3-4006-9089-60fa5517c3b5": {
+  "slug": "parent-proof",
+  "n": 538,
+  "proj": "framebright/parent-proof",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "098020a5-5acb-482d-9856-2a1881b5d2ba": {
+  "slug": "parent-proof",
+  "n": 536,
+  "proj": "framebright/parent-proof",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "aaf6490e-f2cb-4447-9b81-e952774cfcc9": {
+  "slug": "parent-proof",
+  "n": 490,
+  "proj": "framebright/parent-proof",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "7daf2f51-9465-4fb5-ac31-feb1b413bcfe": {
+  "slug": "parent-proof",
+  "n": 431,
+  "proj": "framebright/parent-proof",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "253411e7-da09-49ca-a076-857e0af5330d": {
+  "slug": "parent-proof",
+  "n": 419,
+  "proj": "framebright/parent-proof",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "c53f7713-f239-4abc-9f77-9e1f3b44f740": {
+  "slug": "parent-proof",
+  "n": 489,
+  "proj": "framebright/parent-proof",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "d7a992fa-45b0-4b7f-8a17-7cc3f101a733": {
+  "slug": "parent-proof",
+  "n": 442,
+  "proj": "framebright/parent-proof",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "3e3f9a47-4e2d-40c5-8286-1f36c9e19129": {
+  "slug": "parent-proof",
+  "n": 495,
+  "proj": "framebright/parent-proof",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "df01eef5-f3e0-4ea4-a761-d1ad35f98064": {
+  "slug": "parent-proof",
+  "n": 404,
+  "proj": "framebright/parent-proof",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "0bcfeb3f-3460-48ec-b3aa-a1a4c107fc79": {
+  "slug": "parent-proof",
+  "n": 610,
+  "proj": "framebright/parent-proof",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a2074d2ee99a4d35a"
+  ]
+ },
+ "151dbb38-0abb-4871-8e69-ef9d0cca0c5e": {
+  "slug": "parent-proof",
+  "n": 479,
+  "proj": "framebright/parent-proof",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a4ea0e3098d9568e1,o:baab765b/main"
+  ]
+ },
+ "143d3599-545a-4226-a234-8de336cab5aa": {
+  "slug": "parent-proof",
+  "n": 375,
+  "proj": "framebright/parent-proof",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "cd3c8eae-24f3-4eaf-b579-01ea533d665b": {
+  "slug": "parent-proof",
+  "n": 312,
+  "proj": "framebright/parent-proof",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "660a4c52-9393-44cb-9b74-c337bbcdca1e": {
+  "slug": "parent-proof",
+  "n": 427,
+  "proj": "framebright/parent-proof",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "a530a90f-90a5-4e63-8d1b-b3d6d70cdb1a": {
+  "slug": "work-tracker-automatic",
+  "n": 35833,
+  "proj": "framebright/work-tracker-automatic",
+  "to": "duplicate",
+  "ledger": "done15.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "d59de1f6-fb77-4d11-8a45-f378cf0c05d6": {
+  "slug": "goodqa",
+  "n": 15434,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-ac5bd182f97951e4b,o:baab765b/main"
+  ]
+ },
+ "4ca363ab-e326-47d8-9a0d-dd8ce6e6e9d8": {
+  "slug": "goodqa",
+  "n": 14932,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "4a4a0cfe-c5d2-44ea-9cae-aa485f88394e": {
+  "slug": "goodqa",
+  "n": 14477,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "0e5a70ce-1009-4aee-a11d-9826a4fff66c": {
+  "slug": "goodqa",
+  "n": 14976,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "a36d4ab1-3992-453c-8e45-0f0550e8e9b1": {
+  "slug": "goodqa",
+  "n": 14219,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "db2fe7d2-7b8e-4003-944f-403dd4b92496": {
+  "slug": "goodqa",
+  "n": 14847,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "e0a1dde4-5163-470a-8ee9-680e95a4c80c": {
+  "slug": "goodqa",
+  "n": 14552,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "1019134f-f070-4ad4-81f1-fab7d460b60a": {
+  "slug": "goodqa",
+  "n": 14543,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "bd9e3744-4a76-45f1-a63f-b0b957d39d71": {
+  "slug": "goodqa",
+  "n": 14474,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-af794b88fa237d998"
+  ]
+ },
+ "ea1f29c5-59a1-4980-95d0-c373c9154498": {
+  "slug": "goodqa",
+  "n": 15395,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-ae5111e19faa4456d,o:baab765b/main"
+  ]
+ },
+ "859ea11d-6f83-4ead-b6e7-1d0e765519e6": {
+  "slug": "goodqa",
+  "n": 14582,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "c3dad4cc-3c83-4af6-88cd-d36e5c9df058": {
+  "slug": "goodqa",
+  "n": 15021,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-aa87c03d7059f7437"
+  ]
+ },
+ "6c8c11da-8053-473a-ada0-8230edc5929e": {
+  "slug": "goodqa",
+  "n": 14933,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "fae1cb99-7d64-4689-9f88-272e351c0017": {
+  "slug": "goodqa",
+  "n": 14550,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "0dda5694-8390-450f-bd41-1f2ef8bb2f7e": {
+  "slug": "goodqa",
+  "n": 14478,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "067a5add-c221-4e2b-b079-fad89aa98351": {
+  "slug": "goodqa",
+  "n": 15272,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a1f79b2406829b199"
+  ]
+ },
+ "fb14c849-ce02-4003-a0fa-d749cc993dfe": {
+  "slug": "goodqa",
+  "n": 15176,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-af794b88fa237d998"
+  ]
+ },
+ "6b82fbdf-64f1-408c-830e-361f566ce3e2": {
+  "slug": "goodqa",
+  "n": 15175,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-af794b88fa237d998"
+  ]
+ },
+ "c7e4cc2c-0ec4-4a3e-a3cd-35580f86b577": {
+  "slug": "goodqa",
+  "n": 15149,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "04b6a190-590f-4967-87b1-cfe1d731cbb9": {
+  "slug": "goodqa",
+  "n": 15118,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "b9b1d6d0-cbaa-4bef-bb79-42d9a44967df": {
+  "slug": "goodqa",
+  "n": 15076,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a26cf320273795e32"
+  ]
+ },
+ "b4320bf0-d738-4b9c-b5db-5c8c9964c021": {
+  "slug": "goodqa",
+  "n": 15044,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-adad414d36642c614,o:baab765b/main"
+  ]
+ },
+ "0716aee0-b63f-4051-a1aa-764dca8395d9": {
+  "slug": "goodqa",
+  "n": 15036,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "2f40cb44-22e0-40a5-83e5-4c5c04efe801": {
+  "slug": "goodqa",
+  "n": 15012,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "0d855f3a-f2d5-424f-8d46-e51dafe2dc98": {
+  "slug": "goodqa",
+  "n": 15009,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "752b29dc-1692-4f57-af53-d952d39c0d96": {
+  "slug": "goodqa",
+  "n": 15008,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "3dd798c7-8546-4aff-a2dc-c25baa8528fd": {
+  "slug": "goodqa",
+  "n": 14990,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "978e48de-e21f-4385-a78d-e800adf3d56d": {
+  "slug": "goodqa",
+  "n": 14989,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "56300d1f-fcac-44ad-8946-09db16e4ca08": {
+  "slug": "goodqa",
+  "n": 14985,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "1643f929-43b8-4129-bec2-ba80411cf6c7": {
+  "slug": "goodqa",
+  "n": 14981,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "fff70361-fb09-4c73-a08d-5d0f5ac967a3": {
+  "slug": "goodqa",
+  "n": 14980,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "5ff9a030-534f-42ad-a82d-559a1795049d": {
+  "slug": "goodqa",
+  "n": 14975,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "63733980-e837-4925-9550-dd7ec5615cc4": {
+  "slug": "goodqa",
+  "n": 14949,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "af08ad5f-47a5-4896-8869-d992283c61ca": {
+  "slug": "goodqa",
+  "n": 14917,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "2136b49e-d71e-471f-a86d-2e40b7ec5940": {
+  "slug": "goodqa",
+  "n": 14883,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "fbef917c-2d7d-495f-a629-485ac473054c": {
+  "slug": "goodqa",
+  "n": 14882,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "37ceda93-993b-4709-ba0d-ad989edfccc2": {
+  "slug": "goodqa",
+  "n": 14864,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "16735dc0-4498-4143-9ce0-3f1f65926c08": {
+  "slug": "goodqa",
+  "n": 14851,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "6bb915d8-9ddb-4ade-b8e8-89ea8111b460": {
+  "slug": "goodqa",
+  "n": 14849,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "027573bb-b226-46be-9d8e-6f457e616a49": {
+  "slug": "goodqa",
+  "n": 14828,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "e88ab4d2-a343-498a-a374-110619bf954d": {
+  "slug": "goodqa",
+  "n": 14805,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "8480a709-402c-4611-abf6-313cb2e19f94": {
+  "slug": "goodqa",
+  "n": 14789,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "3ef525ae-bca4-4063-8526-bd924ef81986": {
+  "slug": "goodqa",
+  "n": 14698,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "46640d8c-dac1-4b3e-ae46-2a1d85723896": {
+  "slug": "goodqa",
+  "n": 14653,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "33c59bff-f64d-4fe8-8266-b0140c0ce540": {
+  "slug": "goodqa",
+  "n": 14641,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "f65e4ce5-12ef-48b3-b80b-b615a53de838": {
+  "slug": "goodqa",
+  "n": 14617,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "ee25b82b-e44b-4efb-8908-75b707915004": {
+  "slug": "goodqa",
+  "n": 14598,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "f4e4f43f-7519-4ad0-ac66-6fca77bbc83a": {
+  "slug": "goodqa",
+  "n": 14590,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "ae7aeca0-cf84-4281-ae2c-bcf70085f4cc": {
+  "slug": "goodqa",
+  "n": 14556,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "271acc31-8f62-47e7-9720-cc2fce060aae": {
+  "slug": "goodqa",
+  "n": 14555,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "42c435ab-b0c4-4b45-ab85-cf0d84fd17d6": {
+  "slug": "goodqa",
+  "n": 14553,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "191f7214-264f-4e67-bf9f-10482454cba6": {
+  "slug": "goodqa",
+  "n": 14476,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "515db7b1-7bb7-4096-9b51-6f8f15667a81": {
+  "slug": "goodqa",
+  "n": 14471,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a427593281955b454,o:baab765b/main"
+  ]
+ },
+ "6a1d9f73-1dcb-487d-ae40-4dfca76fd4db": {
+  "slug": "goodqa",
+  "n": 14464,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "44a56782-1aff-4162-85e7-a298733c3fcd": {
+  "slug": "goodqa",
+  "n": 14455,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "d7cf970b-25ff-44d3-8ca1-d1739e5e4774": {
+  "slug": "goodqa",
+  "n": 14396,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "39d7e142-60fa-409a-b9e1-591b6c96cfff": {
+  "slug": "goodqa",
+  "n": 14391,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "3a9cfd16-b642-40fd-bff0-dd1f1b1c0b28": {
+  "slug": "goodqa",
+  "n": 14920,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "12f1ce69-b299-441e-9fed-42e15ccd9a52": {
+  "slug": "goodqa",
+  "n": 14901,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "53296b85-cfd4-44f4-8236-c5791a7a4c64": {
+  "slug": "goodqa",
+  "n": 14607,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "8a7f7602-2c68-4b86-94ab-ae420304a8fe": {
+  "slug": "goodqa",
+  "n": 13978,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "da5f9d44-3a73-4d05-bf31-114df5abf614": {
+  "slug": "goodqa",
+  "n": 2843,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "297931be-2cd1-4bda-8554-5ac62ef7f593": {
+  "slug": "goodqa",
+  "n": 15166,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "1639de04-9871-48bf-a350-d761172c117e": {
+  "slug": "goodqa",
+  "n": 14927,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "516e7018-f330-46d5-ab43-098bb7540537": {
+  "slug": "goodqa",
+  "n": 14848,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "5d4e9460-524b-4fcf-b130-4adf5415c5f2": {
+  "slug": "goodqa",
+  "n": 14817,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "c0050d8d-8aa5-47f7-a755-f797713ad0fa": {
+  "slug": "goodqa",
+  "n": 14804,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "1b40b05d-7fe0-48b5-99cf-f5a7e59f81d5": {
+  "slug": "goodqa",
+  "n": 14762,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "d7d41c38-7e3e-48f3-ad1a-9406bf7c409d": {
+  "slug": "goodqa",
+  "n": 14730,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "c593de4a-b506-4eba-ad3f-3995e2cc7e01": {
+  "slug": "goodqa",
+  "n": 14729,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "350217a5-0f97-482c-9e54-55c604c40418": {
+  "slug": "goodqa",
+  "n": 14686,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "7044b79e-a603-4324-b77e-4ff6452fa77e": {
+  "slug": "goodqa",
+  "n": 14657,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "2c420b9e-61fe-4d32-a955-b522408cd9ab": {
+  "slug": "goodqa",
+  "n": 14604,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "ed2c2694-8470-4266-b6ce-10b1d289634d": {
+  "slug": "goodqa",
+  "n": 14538,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "9fc15e35-1341-4c71-bea5-57839cc23a4a": {
+  "slug": "goodqa",
+  "n": 14502,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "ac8cbbba-9f67-4ed2-afed-11f19ff2215b": {
+  "slug": "goodqa",
+  "n": 14487,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "4b2ddbfa-f36a-497a-bec9-502997ca5c91": {
+  "slug": "goodqa",
+  "n": 14457,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "80349ce0-2486-42a4-89d3-11a80434bcc3": {
+  "slug": "goodqa",
+  "n": 15191,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "3a54a192-9a18-4b96-88da-2e53790324f7": {
+  "slug": "goodqa",
+  "n": 14905,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "dc2b1d23-9d1f-4813-aad7-f711e380cf92": {
+  "slug": "goodqa",
+  "n": 13915,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "5a183b40-c185-4f92-9549-c4d2fc4a41ea": {
+  "slug": "goodqa",
+  "n": 14493,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "42a1b77f-09b2-4a32-b670-d3bdb9283161": {
+  "slug": "goodqa",
+  "n": 15190,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "07bf66f6-676e-4527-91bb-08b0ca42d315": {
+  "slug": "goodqa",
+  "n": 14921,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "60d7ecbe-5c5d-453a-94aa-e00a96c79efe": {
+  "slug": "goodqa",
+  "n": 14899,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "e4958d6e-7a82-4aa7-a047-526291534ff8": {
+  "slug": "goodqa",
+  "n": 14490,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "678090ca-10f9-41a2-82d8-22082e8fc8cf": {
+  "slug": "goodqa",
+  "n": 7828,
+  "proj": "framebright/goodqa",
+  "to": "duplicate",
+  "ledger": "done14.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-a1f79b2406829b199"
+  ]
+ },
+ "475db701-0f52-4a68-a2e1-19d3ef4dc541": {
+  "slug": "goodqa",
+  "n": 14542,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done5.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "6621ee6a-d226-4432-86d1-56bb0bc6e623": {
+  "slug": "goodqa",
+  "n": 14469,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done5.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "3279d182-dd37-4657-9956-5cdd57a9ce76": {
+  "slug": "goodqa",
+  "n": 14465,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done5.jsonl",
+  "why": [
+   "WALother:o:baab765b/main"
+  ]
+ },
+ "3dfd67f5-6aff-467f-acd4-9456fcd13fe4": {
+  "slug": "goodqa",
+  "n": 15447,
+  "proj": "framebright/goodqa",
+  "to": "wont_fix",
+  "ledger": "done5.jsonl",
+  "why": [
+   "WALother:o:baab765b/agent-ab2b69656bcc02524"
+  ]
+ }
+}
