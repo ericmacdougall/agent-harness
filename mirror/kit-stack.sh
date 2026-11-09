@@ -25,7 +25,11 @@ API_PID=$!
 for i in $(seq 1 90); do curl -fsS "http://127.0.0.1:$API_PORT/v1/version" > "$KIT/run/version.json" 2>/dev/null && break; sleep 2; done
 grep -q "$RELEASE_SOURCE_SHA" "$KIT/run/version.json" || { echo "API did not report the candidate sha"; exit 1; }
 cd "$TREE/apps/web" && API_PROXY_TARGET="http://127.0.0.1:$API_PORT" NEXT_PUBLIC_API_URL='' NEXT_TELEMETRY_DISABLED=1 NODE_OPTIONS=--max-old-space-size=8192 pnpm exec next build > "$KIT/run/web-build.log" 2>&1 || { echo "web build failed, see $KIT/run/web-build.log"; exit 1; }
-API_PROXY_TARGET="http://127.0.0.1:$API_PORT" NEXT_PUBLIC_API_URL='' setsid pnpm exec next start --port "$WEB_PORT" > "$KIT/run/web.log" 2>&1 &
+# next.config.ts sets output standalone: `next start` answers 404 for every path (click-test finding F-1), so run the standalone server,
+# bound to loopback only, with the static assets and public files linked in.
+SA="$TREE/apps/web/.next/standalone/apps/web"
+mkdir -p "$SA/.next"; ln -sfn "$TREE/apps/web/.next/static" "$SA/.next/static"; [ -d "$TREE/apps/web/public" ] && ln -sfn "$TREE/apps/web/public" "$SA/public"
+cd "$SA" && API_PROXY_TARGET="http://127.0.0.1:$API_PORT" NEXT_PUBLIC_API_URL='' HOSTNAME=127.0.0.1 PORT="$WEB_PORT" setsid node server.js > "$KIT/run/web.log" 2>&1 &
 WEB_PID=$!
 for i in $(seq 1 60); do curl -fsS -o /dev/null "http://127.0.0.1:$WEB_PORT/login" 2>/dev/null && break; sleep 2; done
 cp "$KIT/seed.ts" "$TREE/apps/api/.click-seed.ts"
