@@ -599,14 +599,22 @@ TOP_REQUEST = re.compile(r"\b(?:use|using|run|pass|give|switch|let|allow|approve
                          r"escalate|enable|bring in|put|ok to|okay to|you may|go ahead)\b", re.I)
 TOP_NEGATION = re.compile(r"\b(?:not|no|never|don'?t|do not|doesn'?t|won'?t|stop|disabled?|disabling|off|without|"
                           r"instead|avoid|cancel|revoke[ds]?|nope|refuse[ds]?|wait|later|unless|if)\b|n't\b", re.I)
-# GoodQA #15565: plain asks such as "have codex astra do the layout" and "i just want astra on the first round" are
-# assent. These verbs are common in refusals and idle talk, so they count only when the model name follows within a
-# span of at most two words (the negation, condition and question checks still apply to the whole sentence).
-TOP_REQUEST_NEAR = re.compile(r"\b(?:have|want|wants|get|run)(?:\s+[\w'/-]+){0,2}?\s+(?:fable|astra|top[ -](?:writing[ -])?(?:rung|model|tier))\b",
-                              re.I)
-# "fable/opus can take over ..." (refused on 2026-11-09): the model name comes first, then `can` and an action verb.
-TOP_CAN = re.compile(r"\b(?:fable|astra|top[ -](?:writing[ -])?(?:rung|model|tier))(?:\s*[/,]\s*[\w-]+|\s+(?:and|or)\s+[\w-]+)?"
-                     r"\s+can\s+(?:take(?:\s+over)?|do|handle|run|lead|start|own|work\s+on|review|write|build)\b", re.I)
+# GoodQA #15565: plain asks such as "have codex astra do the layout", "i just want astra on the first round" and
+# "fable/opus can take over ..." are assent. have/want/get/run/can are common in idle talk ("I have astra open in a
+# tab", "fable can write about it"), so these forms are strict: the sentence must START with the request (optional
+# filler such as "ok," or "i just"), the model name follows within two words, and an action word must follow it.
+# They also refuse the extra words below (inflected stops, concessions, cost talk) that the older phrases never saw.
+_MODEL = r"(?:fable|astra|top[ -](?:writing[ -])?(?:rung|model|tier))"
+_FILLER = r"^(?:(?:ok|okay|yes|yeah|yep|so|and|then|also|please|just|now)[,\s]+)*"
+TOP_REQUEST_NEAR = re.compile(
+    _FILLER + r"(?:i\s+(?:just\s+|really\s+|also\s+)*)?(?:have|want|get|run)(?:\s+[\w'/-]+){0,2}?\s+" + _MODEL + r"(?:/[\w-]+)?"
+    r"(?=\s+(?:on|to|do|handle|take|lead|start|own|work|design|build|write|for|first|this|that|it|all|every|each|the)\b)", re.I)
+TOP_CAN = re.compile(
+    _FILLER + r"(?:(?:opus|sonnet|codex|haiku)(?:\s*[/,]\s*|\s+(?:and|or)\s+))*" + _MODEL +
+    r"(?:\s*[/,]\s*[\w-]+|\s+(?:and|or)\s+[\w-]+)?\s+can\s+(?:take\s+over|take|lead|handle|start|own|do\s+(?:the|this|it|that))\b", re.I)
+TOP_NEGATION_NEW = re.compile(r"\b(?:stopp(?:ed|ing)|kill\w*|cancell?\w*|remov\w*|ban(?:ned|s)?|paus\w*|gone|rid|shut\w*|hold|"
+                              r"uninstall\w*|down|out|drop\w*|skip\w*|but|only|after|once|when|while|since|because|although|"
+                              r"though|until|before|know|why|how|about|bill\w*|cost\w*|credits?)\b", re.I)
 _SENTENCES = re.compile(r"(?<=[.!?;])\s+|\n+")
 TOP_RETRACT = re.compile(r"\b(?:never ?mind|scratch that|forget (?:it|that)|hold (?:on|off)|belay)\b", re.I)
 
@@ -627,8 +635,9 @@ def top_assent(text):
     if not mentions:
         return None
     candidate = sentences[mentions[-1]]
-    if '?' in candidate or not (TOP_REQUEST.search(candidate) or TOP_REQUEST_NEAR.search(candidate) or TOP_CAN.search(candidate)) \
-            or TOP_NEGATION.search(candidate):
+    plain = TOP_REQUEST.search(candidate)
+    strict = (TOP_REQUEST_NEAR.search(candidate) or TOP_CAN.search(candidate)) and not TOP_NEGATION_NEW.search(candidate)
+    if '?' in candidate or not (plain or strict) or TOP_NEGATION.search(candidate):
         return None
     for later in sentences[mentions[-1] + 1:]:
         if TOP_NEGATION.search(later) or TOP_RETRACT.search(later):

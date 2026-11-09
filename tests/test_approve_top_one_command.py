@@ -171,6 +171,26 @@ class Assent(unittest.TestCase):
             with self.subTest(words=words):
                 self.assertIsNone(esc.top_assent(words))
 
+    def test_red_team_idle_statements_are_not_assent(self):
+        # red-team a5fc13ab and acceptance review abe6da04 (GoodQA #15565): statements, not requests
+        for words in ('I have astra open in a tab', 'I have the astra bill here', 'I have astra credits left', 'you want astra',
+                      'I get fable bills', 'we want astra costs down', 'i want astra killed', 'i want astra banned',
+                      'i want astra paused', 'i want fable gone', 'i want astra to be stopped', 'get rid of astra',
+                      'I know fable can do the layout', 'fable can do it but only after ten', 'astra can review the invoice',
+                      'fable can write about it', 'have fable skip it', 'i want astra audited', 'i have seen astra break layouts',
+                      'we have used fable before', 'i get astra confused with fable', 'you have astra in the list',
+                      'i want astra and fable compared in the report', 'i want astra on hold',
+                      # the user's own 2026-11-09 sentence is conditional, so it stays refused (TARGET_MISMATCH, see the spec)
+                      'fable/opus can take over design work too if astras had a couple passes'):
+            with self.subTest(words=words):
+                self.assertIsNone(esc.top_assent(words))
+
+    def test_request_must_start_the_sentence_and_an_action_word_must_follow_the_model(self):
+        for words in ('ok, i just want astra on the first round of ui', 'Please have codex astra do the initial layout/design',
+                      'then get astra to do the rescue', 'opus/fable can take over the rescue'):
+            with self.subTest(words=words):
+                self.assertIsNotNone(esc.top_assent(words))
+
     def test_review_d1_a_later_retraction_wins(self):
         # Delta review D1: the latest word decides; an earlier request never survives a later retraction.
         for words in ('use fable. actually no, stop.', 'Use Fable. Never mind, do not use fable',
