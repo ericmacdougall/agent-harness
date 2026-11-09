@@ -44,7 +44,7 @@ function treeHash(files = mediaFiles()) {
 }
 // GNU tar -tv: "-rw-r--r-- 0/0 12345 1970-01-01 00:00 path"; returns [{type, size, name}]
 function listPart(file) {
-  return run("tar", ["-tvf", file], { capture: true }).split("\n").filter(Boolean).map((l) => {
+  return run("tar", ["--quoting-style=literal", "-tvf", file], { capture: true }).split("\n").filter(Boolean).map((l) => {
     const m = /^(\S)\S+\s+\S+\s+(\d+)\s+\S+\s+\S+\s+(.*)$/.exec(l);
     if (!m) throw new Error(`unparseable tar listing line: ${l}`);
     return { type: m[1], size: Number(m[2]), name: m[3] };
@@ -53,7 +53,7 @@ function listPart(file) {
 function checkMembers(entries, key) {
   for (const e of entries) {
     if (e.type !== "-") throw new Error(`${key}: member ${e.name} is not a regular file`);
-    if (e.name.startsWith("/") || e.name.split("/").includes("..") || !manifest.prefixes.some((p) => e.name.startsWith(p))) throw new Error(`${key}: member ${e.name} is outside the media prefixes`);
+    if (e.name.startsWith("/") || e.name.split("/").includes("..") || !manifest.prefixes.some((p) => e.name.startsWith(p.replace(/\/?$/, "/")))) throw new Error(`${key}: member ${e.name} is outside the media prefixes`);
   }
 }
 
@@ -99,6 +99,7 @@ function verify() {
   console.log(`media ok: ${files.length} files, tree ${manifest.totals.tree_sha256.slice(0, 12)}`);
 }
 async function push() {
+  mkdirSync(cacheDir, { recursive: true });
   const known = new Map();
   for (const part of manifest.parts) {
     const file = path.join(cacheDir, path.basename(part.key));
