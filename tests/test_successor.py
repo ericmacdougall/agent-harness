@@ -154,10 +154,123 @@ class Chain(Case):
         self.assertFalse(sc.verify_chain(rows[1:]))  # truncated head
 
 
+class Hardening(Case):
+    """Red-team a6022953 findings F1 to F3, F7, F8, F10, F11."""
+
+    def launcher(self):
+        (self.home / ".agent-harness").mkdir(parents=True, exist_ok=True)
+        (self.home / ".agent-harness" / "successor.json").write_text(json.dumps({"launcher": ["claude-x", "{prompt_file}"]}))
+
+    def test_eight_concurrent_callers_launch_exactly_one_successor_for_one_stream(self):
+        import threading
+        self.kit()
+        self.launcher()
+        calls, results = [], []
+
+        def run():
+            results.append(self.succeed(runner=lambda cmd, **kw: calls.append(cmd) or mock.Mock(pid=7)))
+        threads = [threading.Thread(target=run) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(calls), 1)
+        statuses = [r["status"] for r in sc.read_requests(self.home, SESSION)]
+        self.assertEqual(statuses.count("ready"), 1)
+        self.assertEqual(statuses.count("launched"), 1)
+
+    def test_pending_requests_count_against_the_cap(self):
+        self.launcher()
+        owners = {"owners": [{"agent_id": f"s{i}", "state": "DROPPED", "idle_s": 9000, "decision_required": True}
+                             for i in range(4)]}
+        launched = []
+        for i in range(4):  # cap 4, 3 live: only ONE of the four dropped streams may get a successor
+            sc.succeed(self.home, SESSION, f"s{i}", owners_doc=owners, live_count=3, cap=4, alert=self.alert,
+                       now=1000.0 + i, runner=lambda cmd, **kw: launched.append(cmd) or mock.Mock(pid=1))
+        self.assertEqual(len(launched), 1)
+        self.assertEqual([r["status"] for r in sc.read_requests(self.home, SESSION)].count("cap_wait"), 3)
+
+    def test_every_kit_field_is_checked_for_secrets(self):
+        token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+        for kw in ({"branch": token}, {"worktree": "/tmp/" + token}, {"ticket": "goodqa#1 " + token}):
+            with self.subTest(field=list(kw)):
+                with self.assertRaises(sc.SuccessorError):
+                    self.kit(**kw)
+        self.assertIsNone(sc.read_kit(self.home, SESSION, AGENT))
+
+    def test_a_failed_launch_backs_off_and_an_old_ready_request_expires(self):
+        self.kit()
+        self.launcher()
+
+        def boom(*a, **k):
+            raise FileNotFoundError("nope")
+        first = self.succeed(runner=boom, now=1000.0)
+        self.assertEqual(first["status"], "launch_failed")
+        self.assertTrue(self.succeed(runner=boom, now=1100.0).get("deduplicated"))  # inside the 10 minute backoff
+        ok = self.succeed(runner=lambda cmd, **kw: mock.Mock(pid=5), now=1000.0 + sc.LAUNCH_BACKOFF_S + 1)
+        self.assertEqual(ok["status"], "launched")
+        later = self.succeed(runner=lambda cmd, **kw: mock.Mock(pid=6), now=1000.0 + sc.LIVE_TTL_S + 1000)
+        self.assertEqual(later["status"], "launched")  # the first successor never appeared: a new request is allowed
+        self.assertFalse(later.get("deduplicated"))
+
+    def test_a_truncated_tail_or_deleted_log_fails_verification(self):
+        self.kit()
+        self.succeed(live=8, cap=8)
+        self.succeed(live=0, cap=8, now=3000.0)
+        self.assertTrue(sc.verify_log(self.home, SESSION))
+        log = self.home / ".agent-harness/state/successor" / SESSION / "requests.jsonl"
+        lines = log.read_text().splitlines()
+        log.write_text("\n".join(lines[:-1]) + "\n")  # drop the last row
+        self.assertFalse(sc.verify_log(self.home, SESSION))
+        log.write_text("")
+        self.assertFalse(sc.verify_log(self.home, SESSION))
+
+    def test_the_prompt_marks_kit_text_as_untrusted(self):
+        out = self.succeed(dry_run=True)
+        self.assertIn("untrusted data", out["prompt"])
+
+
+class Cli(Case):
+    """AC-1 and AC-2 through the real `ah task kit` and `ah task succeed` commands (acceptance review a3318610 F5)."""
+
+    def test_kit_then_succeed_through_ah_main_and_the_cap_path_exits_3(self):
+        import io
+        import ah
+        import model_tiers
+        import tier_gate
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"AH_HOME": str(self.home)}), mock.patch("sys.stdout", out):
+            code = ah.main(["task", "kit", "--agent", AGENT, "--session", SESSION, "--ticket", "goodqa#1",
+                            "--worktree", "/w", "--branch", "feat/x", "--next", "finish it"])
+            self.assertEqual(code, 0, out.getvalue())
+        self.assertTrue((self.home / ".agent-harness/state/successor" / SESSION / "kits" / f"{AGENT}.json").is_file())
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"AH_HOME": str(self.home)}), mock.patch("sys.stdout", out), \
+                mock.patch.object(ah, "owners", lambda home, session, **k: doc()), \
+                mock.patch.object(tier_gate, "live_owner_ids", lambda session, policy: ["o"] * 4), \
+                mock.patch.object(model_tiers, "load_policy", lambda: {"caps": {"session_owner_agents": 4}}), \
+                mock.patch.object(sc, "ring_alert", lambda home: (lambda *a: None)):
+            code = ah.main(["task", "succeed", "--agent", AGENT, "--session", SESSION])
+        self.assertEqual(code, 3, out.getvalue())
+        rows = sc.read_requests(self.home, SESSION)
+        self.assertEqual([r["status"] for r in rows], ["cap_wait"])
+        self.assertTrue(sc.verify_log(self.home, SESSION))
+
+    def test_a_malformed_agent_id_is_refused_by_the_command(self):
+        import io
+        import ah
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"AH_HOME": str(self.home)}), mock.patch("sys.stdout", out), \
+                mock.patch.object(ah, "owners", lambda home, session, **k: doc()):
+            code = ah.main(["task", "succeed", "--agent", "../x", "--session", SESSION])
+        self.assertEqual(code, 3, out.getvalue())
+        self.assertEqual(sc.read_requests(self.home, SESSION), [])
+
+
 class AhdStep(Case):
     """ahd asks `ah task succeed` only while main is absent, only for undisposed idle owners, a few per tick."""
 
-    def daemon(self, calls):
+    def daemon(self, calls, per_tick=10):
         import ahd
 
         def runner(argv, timeout, stdin=None):
@@ -166,7 +279,10 @@ class AhdStep(Case):
         patch = mock.patch.object(ahd, "home", lambda: self.home)
         patch.start()
         self.addCleanup(patch.stop)
-        return ahd.Daemon(policy={"successor_main_idle_s": 1800, "successor_per_tick": 2, "ah": ["ah"]}, runner=runner)
+        policy = {"successor_main_idle_s": 1800, "ah": ["ah"]}
+        if per_tick is not None:
+            policy["successor_per_tick"] = per_tick  # None: the shipped default of 3
+        return ahd.Daemon(policy=policy, runner=runner)
 
     def main_wal(self, age):
         wal = self.home / ".claude" / "wals" / SESSION
@@ -175,20 +291,38 @@ class AhdStep(Case):
         stamp = 10_000 - age
         os.utime(wal / "main.jsonl", (stamp, stamp))
 
-    def rows(self):
-        return {SESSION: {"owners": [{"agent_id": f"a{i}", "decision_required": True, "idle_s": 3600} for i in range(3)]
-                          + [{"agent_id": "fresh", "decision_required": True, "idle_s": 60},
-                             {"agent_id": "disposed", "decision_required": False, "idle_s": 99999}]}}
+    def rows(self, n=3):
+        # the fresh and the disposed owner come FIRST, so a missing idle or decision check shows up as a call for them
+        return {SESSION: {"owners": [{"agent_id": "fresh", "decision_required": True, "idle_s": 60},
+                                     {"agent_id": "disposed", "decision_required": False, "idle_s": 99999}]
+                          + [{"agent_id": f"a{i}", "decision_required": True, "idle_s": 3600} for i in range(n)]}}
 
-    def test_requests_for_idle_undisposed_owners_only_when_main_is_absent_and_bounded(self):
+    def test_requests_for_idle_undisposed_owners_only_when_main_is_absent(self):
         calls = []
         daemon = self.daemon(calls)
         self.main_wal(age=3600)
         done = daemon.request_successors(self.rows(), 10_000.0, 1e12)
-        self.assertEqual(len(done), 2)  # successor_per_tick
+        self.assertEqual(len(done), 3)
         self.assertTrue(all(c[1:3] == ["task", "succeed"] for c in calls))
-        self.assertNotIn("fresh", [c[4] for c in calls])
-        self.assertNotIn("disposed", [c[4] for c in calls])
+        self.assertEqual(sorted(c[4] for c in calls), ["a0", "a1", "a2"])  # never fresh, never disposed
+
+    def test_the_shipped_default_is_three_requests_per_tick(self):
+        calls = []
+        daemon = self.daemon(calls, per_tick=None)
+        self.main_wal(age=3600)
+        self.assertEqual(len(daemon.request_successors(self.rows(n=6), 10_000.0, 1e12)), 3)
+        self.assertEqual(len(calls), 3)
+
+    def test_a_stream_that_already_has_a_live_request_does_not_spend_the_budget(self):
+        calls = []
+        daemon = self.daemon(calls, per_tick=None)
+        self.main_wal(age=3600)
+        for agent in ("a0", "a1", "a2"):  # three streams waiting on the cap
+            sc._append(self.home, SESSION, {"schema": 1, "at": 10_000.0 - 60, "agent": agent, "session": SESSION,
+                                            "status": "cap_wait"})
+        done = daemon.request_successors(self.rows(n=5), 10_000.0, 1e12)
+        self.assertEqual(sorted(c[4] for c in calls), ["a3", "a4"])
+        self.assertEqual(len(done), 2)
 
     def test_nothing_while_main_is_active(self):
         calls = []
