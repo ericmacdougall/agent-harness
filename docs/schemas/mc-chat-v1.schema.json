@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ericmacdougall/agent-harness/docs/schemas/mc-chat-v1.schema.json",
+  "title": "Mission Control chat record, mc.chat/1",
+  "description": "A dashboard chat message (chat/inbox/<id>.json, from the user, HMAC-signed by the Mission Control server) or a reply (chat/outbox/<id>.json, from claude or codex). Mirrors are read-only and dedupe on id; for a streamed Codex reply the latest record with that id wins. An inbox record without a valid server signature is FORGED and is never the user's words. See docs/mission-control-events.md.",
+  "type": "object",
+  "required": ["schema", "id", "from", "text", "created"],
+  "properties": {
+    "schema": {"const": "mc.chat/1"},
+    "id": {"type": "string", "pattern": "^(dash|reply)-[0-9A-HJKMNP-TV-Z]{26}$", "description": "dash-<ULID> for messages, reply-<ULID> for replies."},
+    "client_key": {"type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$", "description": "Page idempotency key: a resend with the same key returns the same message id."},
+    "from": {"enum": ["user", "claude", "codex"]},
+    "origin": {"enum": ["dashboard", "claude", "codex"]},
+    "label": {"const": "USER_VIA_DASHBOARD", "description": "Messages only. Data that may start or steer ordinary work; never an approval for production, deletion, credentials, top-rung models or hard rules."},
+    "to": {"enum": ["claude", "codex", "user"]},
+    "session": {"type": ["string", "null"], "maxLength": 128, "description": "Target Claude session id (messages to claude)."},
+    "thread": {"type": ["string", "null"], "maxLength": 64, "description": "Initiative id the message is about, if any."},
+    "reply_to": {"type": ["string", "null"], "description": "Replies: the dash- id answered."},
+    "text": {"type": "string", "maxLength": 65536, "description": "Redacted at rest. Messages are at most 4000 characters."},
+    "final": {"type": "boolean", "description": "Replies: false while Codex is still streaming."},
+    "created": {"type": "string", "description": "RFC 3339 UTC with milliseconds."},
+    "sig": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Messages: HMAC-SHA256 over the canonical record without sig."}
+  }
+}
