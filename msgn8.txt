@@ -1,0 +1,8 @@
+chore(scratch): keep the final validation runner and message
+
+Why: The owner worktree must stay clean; the runner produced the failing-first and final logs for the private phone-navigation PR #9.
+What: Add run_final.sh (new check vs a clean 720afec archive, then the final archive suites) and the commit message draft.
+Testing: not run: scratch script, its logs are the evidence.
+Refs: none (chore: scratch helper, no product code)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

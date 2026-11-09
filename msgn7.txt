@@ -1,0 +1,8 @@
+fix(videos): keep Prev/Next focus, wider filter name, filter-off notice
+
+Why: Delta review of PR #9 found that choosing a lesson with Previous or Next moved focus to the title (keyboard, switch and screen-reader users lost their place), that the filter name was squeezed to 12-76 px on narrow phones, and that the "progress filter off" notice sat in the part of the bar that is cut off.
+What: Focus moves to the title only for a choice from the list or sheet, never while Previous or Next has focus. Previous and Next are compact arrow buttons (still 48 px wide, with full accessible names) so the filter name keeps room. The notice now reads "filter off" inside the count, which is never cut off. The check adds 320 and 360 px viewports with a minimum visible filter-name width, Enter on Next and Previous keeping focus, and an aborted /api/progress request asserting the visible text; static guards cover the same rules.
+Testing: `python test/mobile/mobile_check.py` on the t2-dev staged preview -> 640 passed, 0 failed (the new checks fail on 720afec); `npm test` -> 147 passed.
+Refs: GoodQA #15486
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
