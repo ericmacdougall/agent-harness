@@ -142,6 +142,25 @@ test("deploy gate refuses when media is damaged after a verified build", () => {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("deploy gate checks sizes and names in dist, not only the file count", () => {
+  const dir = makeRepo();
+  try {
+    putMedia(dir);
+    build(dir);
+    const a = path.join(dir, "dist", "client", "audio", "a.mp3");
+    writeFileSync(a, "x");                                         // same count, wrong size
+    let g = run(dir, "gate");
+    assert.equal(g.status, 1, g.stdout + g.stderr);
+    assert.match(g.stderr, /does not contain the media/);
+    writeFileSync(a, FILES["public/audio/a.mp3"]);                 // restore
+    assert.equal(run(dir, "gate").status, 0);
+    cpSync(a, path.join(dir, "dist", "client", "audio", "renamed.mp3")); // same size, wrong name: a.mp3 now missing
+    rmSync(a);
+    g = run(dir, "gate");
+    assert.equal(g.status, 1, g.stdout + g.stderr);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("deploy gate refuses a dist built against a different manifest", () => {
   const dir = makeRepo();
   try {
