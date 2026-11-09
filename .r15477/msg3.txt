@@ -1,0 +1,8 @@
+chore(desktop): merge the 1309 fail-closed revocation into the 1310 branch
+
+Why: PR 1310 builds on PR 1309; the final delta fix (856d91e9) must be in the 1310 branch so both heads carry the same revocation behaviour.
+What: merges origin/fix/goodqa-15477-regrant-keeps-tabs at 856d91e9 into fix/goodqa-15479-navigation-errors. The 3-way merge of host.ts and host.test.ts was automatic and keeps both appended describe blocks (1310 open-shot tests and the 1309 revocation tests).
+Testing: `cd apps/desktop && pnpm run build && xvfb-run -a npx vitest run src/agent-browser/revocation-capture.test.ts src/agent-browser/reload-post.test.ts src/agent-browser/navigation-errors.test.ts`, `npx vitest run src/agent-browser src/ctl` and `npx tsc --noEmit`: results in the follow-up handoff (run after this merge commit, before push).
+Refs: GoodQA #15479, GoodQA #15477
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
