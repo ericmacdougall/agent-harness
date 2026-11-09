@@ -8,6 +8,10 @@
 set -eu
 K=$HOME/wt/aab3-repro; mkdir -p "$K"; chmod 700 "$K"
 WT=${2:-$HOME/wt/q3-main-tsc}
+# Web binds to WEB_HOST only (default loopback). t2-dev has a public IP and no firewall: use its tailnet address,
+# never 0.0.0.0. The API always stays on 127.0.0.1; the web server proxies to it.
+WEB_HOST=${WEB_HOST:-127.0.0.1}
+case "$WEB_HOST" in 127.0.0.1|100.*) ;; *) echo "REFUSED: WEB_HOST must be loopback or a tailnet 100.x address"; exit 2;; esac
 case "$1" in
 up)
   [ -s "$K/lease.pid" ] && kill -0 "$(cat "$K/lease.pid")" 2>/dev/null && { echo "already up"; exit 0; }
@@ -21,13 +25,13 @@ up)
   (cd "$WT" && pnpm --filter @bugtracker/db migrate > "$K/migrate.log" 2>&1) || { echo MIGRATE_FAILED; tail -5 "$K/migrate.log"; exit 4; }
   umask 077; head -c 32 /dev/urandom | base64 | tr -d '=+/\n' > "$K/.jwt"
   ( cd "$WT/apps/api" && PORT=4300 HOST=127.0.0.1 NODE_ENV=development JWT_SECRET="$(cat "$K/.jwt")" \
-    WEB_ORIGIN=http://127.0.0.1:3300 OAUTH_REDIRECT_BASE=http://127.0.0.1:4300 EMAIL_DRIVER=console STORAGE_DRIVER=disk \
+    WEB_ORIGIN=http://$WEB_HOST:3300 OAUTH_REDIRECT_BASE=http://127.0.0.1:4300 EMAIL_DRIVER=console STORAGE_DRIVER=disk \
     FEDERATION_KEYRING="s1:$(head -c 32 /dev/urandom | base64)" DATABASE_URL="$DATABASE_URL" \
     nohup ./node_modules/.bin/tsx src/server.ts > "$K/api.log" 2>&1 < /dev/null & echo $! > "$K/api.pid" )
   ( cd "$WT/apps/web" && API_PROXY_TARGET=http://127.0.0.1:4300 NEXT_PUBLIC_API_URL= \
-    nohup node node_modules/next/dist/bin/next dev --webpack --port 3300 --hostname 127.0.0.1 > "$K/web.log" 2>&1 < /dev/null & echo $! > "$K/web.pid" )
+    nohup node node_modules/next/dist/bin/next dev --webpack --port 3300 --hostname "$WEB_HOST" > "$K/web.log" 2>&1 < /dev/null & echo $! > "$K/web.pid" )
   for i in $(seq 1 120); do curl -fsS http://127.0.0.1:4300/v1/version >/dev/null 2>&1 && break; sleep 2; done
-  curl -fsS http://127.0.0.1:4300/v1/version && echo && echo "UP worktree=$WT api=:4300 web=:3300"
+  curl -fsS http://127.0.0.1:4300/v1/version && echo && echo "UP worktree=$WT api=127.0.0.1:4300 web=http://$WEB_HOST:3300"
   ;;
 seed)
   export DATABASE_URL="$(cat "$K/.dburl")"; API=http://127.0.0.1:4300/v1; cd "$K"
