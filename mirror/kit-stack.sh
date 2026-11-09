@@ -3,13 +3,13 @@
 # Starts the API (tsx, production entrypoint, console email, disk storage) and the web (next build + start) of the checkout in
 # $TREE, seeds disposable data, prints a JSON summary (ids and file paths, never a secret value), then waits until stopped.
 set -u
-TREE="${TREE:?TREE}"; KIT="${KIT:-$HOME/g15561-click}"; API_PORT="${API_PORT:-43561}"; WEB_PORT="${WEB_PORT:-43562}"
+TREE="${TREE:?TREE}"; KIT="${KIT:-$HOME/g15561-click}"; API_PORT="${API_PORT:-43561}"; WEB_PORT="${WEB_PORT:-43562}"; WEB_HOST="${WEB_HOST:-127.0.0.1}"
 mkdir -p "$KIT/run" "$KIT/secrets"; chmod 700 "$KIT/secrets"
 : "${DATABASE_URL:?DATABASE_URL must come from the pool lease}"
 export NODE_ENV=production DEPLOY_ENV=dev PORT="$API_PORT"
 JWT_SECRET="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"; export JWT_SECRET
 CRON_TOKEN="$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"; export CRON_TOKEN
-export WEB_ORIGIN="http://127.0.0.1:$WEB_PORT" OAUTH_REDIRECT_BASE="http://127.0.0.1:$WEB_PORT" API_PUBLIC_URL="http://127.0.0.1:$API_PORT"
+export WEB_ORIGIN="http://$WEB_HOST:$WEB_PORT" OAUTH_REDIRECT_BASE="http://$WEB_HOST:$WEB_PORT" API_PUBLIC_URL="http://127.0.0.1:$API_PORT"
 export STORAGE_DRIVER=disk UPLOAD_DIR="$KIT/run/uploads" EMAIL_DRIVER=console TASK_298_ATTACHMENT_FINAL_GATE_ENABLED=true
 RELEASE_SOURCE_SHA="$(git -C "$TREE" rev-parse HEAD)"; export RELEASE_SOURCE_SHA RELEASE_DEPLOYMENT_ID=click-kit-15561
 cleanup() {
@@ -29,9 +29,9 @@ cd "$TREE/apps/web" && API_PROXY_TARGET="http://127.0.0.1:$API_PORT" NEXT_PUBLIC
 # bound to loopback only, with the static assets and public files linked in.
 SA="$TREE/apps/web/.next/standalone/apps/web"
 mkdir -p "$SA/.next"; ln -sfn "$TREE/apps/web/.next/static" "$SA/.next/static"; [ -d "$TREE/apps/web/public" ] && ln -sfn "$TREE/apps/web/public" "$SA/public"
-cd "$SA" && API_PROXY_TARGET="http://127.0.0.1:$API_PORT" NEXT_PUBLIC_API_URL='' HOSTNAME=127.0.0.1 PORT="$WEB_PORT" setsid node server.js > "$KIT/run/web.log" 2>&1 &
+cd "$SA" && API_PROXY_TARGET="http://127.0.0.1:$API_PORT" NEXT_PUBLIC_API_URL='' HOSTNAME="$WEB_HOST" PORT="$WEB_PORT" setsid node server.js > "$KIT/run/web.log" 2>&1 &
 WEB_PID=$!
-for i in $(seq 1 60); do curl -fsS -o /dev/null "http://127.0.0.1:$WEB_PORT/login" 2>/dev/null && break; sleep 2; done
+for i in $(seq 1 60); do curl -fsS -o /dev/null "http://$WEB_HOST:$WEB_PORT/login" 2>/dev/null && break; sleep 2; done
 cp "$KIT/seed.ts" "$TREE/apps/api/.click-seed.ts"
 cd "$TREE/apps/api" && API_URL="http://127.0.0.1:$API_PORT" SECRETS_DIR="$KIT/secrets" ./node_modules/.bin/tsx .click-seed.ts > "$KIT/run/summary.json" 2> "$KIT/run/seed.err" || { echo "seed failed, see $KIT/run/seed.err"; exit 1; }
 echo "READY api=http://127.0.0.1:$API_PORT web=http://127.0.0.1:$WEB_PORT sha=$RELEASE_SOURCE_SHA summary=$KIT/run/summary.json"
