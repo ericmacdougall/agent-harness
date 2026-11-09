@@ -1,0 +1,97 @@
+import { getState, subscribe, sendMessage, retryMessage, setResponder, setSession, messageSession } from './store.js';
+import { el, button } from './ui.js';
+
+export function mountChat() {
+  const log = document.getElementById('chat-log'), form = document.getElementById('chat-form');
+  const input = document.getElementById('chat-input'), send = document.getElementById('chat-send');
+  const counter = document.getElementById('chat-counter'), notice = document.getElementById('chat-notice');
+  const announcer = document.getElementById('chat-announcer');
+  const parts = new Map(), previousStatuses = new Map();
+  let forceScroll = true, initial = true;
+  const announce = text => { announcer.textContent = text; };
+  function composer(state) {
+    const online = state.connection === 'live';
+    input.disabled = !online;
+    send.disabled = !online || !input.value.trim() || input.value.length > 4000;
+    input.setAttribute('aria-describedby', online ? 'composer-hint chat-counter' : 'chat-notice chat-counter');
+    counter.textContent = `${input.value.length.toLocaleString()} / 4000`;
+    counter.classList.toggle('at-limit', input.value.length >= 4000);
+    notice.hidden = online;
+    notice.textContent = online ? '' : state.connection === 'offline' ? 'Connection offline. Your draft is saved here; sending resumes when live.' : 'Reconnecting to the stream. Sending is paused; your draft is kept.';
+  }
+  function statusText(message, state) {
+    const elapsed = Math.max(0, Math.floor((state.now - new Date(message.ts).getTime()) / 1000));
+    if (message.status === 'queued') return `Waiting for main to pick this up · ${elapsed} s · ${messageSession(message.id)}`;
+    if (message.status === 'sending') return 'Sending…';
+    if (message.status === 'failed') return message.from === 'user' ? 'Delivery failed · message kept' : 'Reply interrupted · retry your message';
+    if (message.status === 'answering') return message.from === 'user' ? `${message.to === 'codex' ? 'Codex is answering' : 'Main is answering'}…` : 'Streaming response…';
+    if (message.status === 'delivered') return 'Delivered · waiting for a reply';
+    return message.from === 'user' ? `Answered by ${message.to === 'claude' ? 'Claude' : 'Codex'}` : '';
+  }
+  function render(state) {
+    const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+    const wanted = new Set(state.messages.map(message => message.id));
+    for (const [id, part] of parts) if (!wanted.has(id)) { part.row.remove(); parts.delete(id); previousStatuses.delete(id); }
+    state.messages.forEach(message => {
+      let part = parts.get(message.id);
+      if (!part) {
+        const row = el('article', `chat-message ${message.from}`);
+        const header = el('div', 'message-header');
+        const label = message.from === 'user' ? 'you · via dashboard' : message.from === 'claude' ? '✳ Claude · main' : message.from === 'codex' ? '◇ Codex' : 'system';
+        const time = el('time', '', new Date(message.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }));
+        time.dateTime = message.ts;
+        header.append(el('span', `message-author ${message.from}`, label), time);
+        const text = el('div', 'message-text'), status = el('div', 'message-status');
+        const statusLabel = el('span');
+        const retry = button('retry-button', 'Retry ↗', () => retryMessage(message.id));
+        retry.setAttribute('aria-label', `Retry message to ${message.to}: ${message.text.slice(0, 80)}`);
+        status.append(statusLabel, retry); row.append(header, text, status); log.append(row);
+        part = { row, text, status, statusLabel, retry, time };
+        parts.set(message.id, part);
+      }
+      const visibleText = message.text + (message.status === 'answering' && message.from !== 'user' ? ' ▍' : '');
+      if (part.text.textContent !== visibleText) part.text.textContent = visibleText;
+      part.time.dateTime = message.ts;
+      part.time.textContent = new Date(message.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+      part.statusLabel.textContent = statusText(message, state);
+      part.status.className = `message-status ${message.status}`;
+      part.status.hidden = !part.statusLabel.textContent;
+      part.retry.hidden = message.status !== 'failed' || message.from !== 'user';
+      part.retry.disabled = state.connection !== 'live';
+      const previous = previousStatuses.get(message.id);
+      if (!initial && previous !== message.status) {
+        if (message.status === 'answered' && message.from !== 'user') announce(`${message.from} replied: ${message.text}`);
+        else if (message.from === 'user' && ['failed','queued','delivered'].includes(message.status)) announce(statusText(message, state));
+      }
+      previousStatuses.set(message.id, message.status);
+    });
+    initial = false;
+    if (nearBottom || forceScroll) { log.scrollTop = log.scrollHeight; forceScroll = false; }
+    document.getElementById('responder-claude').setAttribute('aria-pressed', String(state.responder === 'claude'));
+    document.getElementById('responder-codex').setAttribute('aria-pressed', String(state.responder === 'codex'));
+    document.getElementById('session-label').hidden = state.responder !== 'claude';
+    const waiting = state.messages.some(message => ['sending','queued','answering'].includes(message.status));
+    document.getElementById('chat-presence').textContent = state.connection !== 'live' ? state.connection.toUpperCase() : waiting ? 'IN PROGRESS' : 'READY';
+    composer(state);
+  }
+  input.addEventListener('input', () => composer(getState()));
+  input.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); form.requestSubmit(); }
+  });
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    forceScroll = true;
+    if (sendMessage(input.value)) { input.value = ''; composer(getState()); input.focus(); }
+  });
+  document.getElementById('responder-claude').addEventListener('click', () => setResponder('claude'));
+  document.getElementById('responder-codex').addEventListener('click', () => setResponder('codex'));
+  document.getElementById('chat-session').addEventListener('change', event => setSession(event.target.value));
+  render(getState());
+  subscribe((state, reason) => {
+    if (['chat','routing','connection','seed'].includes(reason)) render(state);
+    if (reason === 'tick') state.messages.forEach(message => {
+      if (message.status === 'queued') parts.get(message.id).statusLabel.textContent = statusText(message, state);
+    });
+    if (reason === 'tab' && state.tab === 'chat') log.scrollTop = log.scrollHeight;
+  });
+}
