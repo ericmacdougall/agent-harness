@@ -12,26 +12,60 @@ WT=${2:-$HOME/wt/q3-main-tsc}
 # never 0.0.0.0. The API always stays on 127.0.0.1; the web server proxies to it.
 WEB_HOST=${WEB_HOST:-127.0.0.1}
 case "$WEB_HOST" in 127.0.0.1|100.*) ;; *) echo "REFUSED: WEB_HOST must be loopback or a tailnet 100.x address"; exit 2;; esac
-case "$1" in
-up)
-  [ -s "$K/lease.pid" ] && kill -0 "$(cat "$K/lease.pid")" 2>/dev/null && { echo "already up"; exit 0; }
-  # Hold a pgpool lease for 4h with a sleeper; the leased URL lands in $K/.dburl (0600).
-  nohup python3 ~/repos/harness/lanes/pgpool.py run --mode server --job aab3-repro --lane qacq3 --ttl 14400 -- \
-    bash -c 'umask 077; echo "$DATABASE_URL" > '"$K"'/.dburl; exec sleep 14000' > "$K/lease.log" 2>&1 < /dev/null &
-  echo $! > "$K/lease.pid"
-  for i in $(seq 1 60); do [ -s "$K/.dburl" ] && break; sleep 1; done
-  [ -s "$K/.dburl" ] || { echo "LEASE_FAILED"; tail -3 "$K/lease.log"; exit 3; }
-  export DATABASE_URL="$(cat "$K/.dburl")"
-  (cd "$WT" && pnpm --filter @bugtracker/db migrate > "$K/migrate.log" 2>&1) || { echo MIGRATE_FAILED; tail -5 "$K/migrate.log"; exit 4; }
-  umask 077; head -c 32 /dev/urandom | base64 | tr -d '=+/\n' > "$K/.jwt"
+# PUBLIC_ORIGIN: the origin the browser uses (e.g. a tailnet-only `tailscale serve` https URL). Only https://*.ts.net or
+# the plain WEB_HOST origin; never a Funnel (public) port.
+PUBLIC_ORIGIN=${PUBLIC_ORIGIN:-http://$WEB_HOST:3300}
+case "$PUBLIC_ORIGIN" in "http://$WEB_HOST:3300"|https://*.ts.net|https://*.ts.net:*) ;; *) echo "REFUSED: PUBLIC_ORIGIN"; exit 2;; esac
+start_app() {
   ( cd "$WT/apps/api" && PORT=4300 HOST=127.0.0.1 NODE_ENV=development JWT_SECRET="$(cat "$K/.jwt")" \
-    WEB_ORIGIN=http://$WEB_HOST:3300 OAUTH_REDIRECT_BASE=http://127.0.0.1:4300 EMAIL_DRIVER=console STORAGE_DRIVER=disk \
+    WEB_ORIGIN="$PUBLIC_ORIGIN" OAUTH_REDIRECT_BASE=http://127.0.0.1:4300 EMAIL_DRIVER=console STORAGE_DRIVER=disk \
     FEDERATION_KEYRING="s1:$(head -c 32 /dev/urandom | base64)" DATABASE_URL="$DATABASE_URL" \
     nohup ./node_modules/.bin/tsx src/server.ts > "$K/api.log" 2>&1 < /dev/null & echo $! > "$K/api.pid" )
   ( cd "$WT/apps/web" && API_PROXY_TARGET=http://127.0.0.1:4300 NEXT_PUBLIC_API_URL= \
     nohup node node_modules/next/dist/bin/next dev --webpack --port 3300 --hostname "$WEB_HOST" > "$K/web.log" 2>&1 < /dev/null & echo $! > "$K/web.pid" )
   for i in $(seq 1 120); do curl -fsS http://127.0.0.1:4300/v1/version >/dev/null 2>&1 && break; sleep 2; done
-  curl -fsS http://127.0.0.1:4300/v1/version && echo && echo "UP worktree=$WT api=127.0.0.1:4300 web=http://$WEB_HOST:3300"
+  curl -fsS http://127.0.0.1:4300/v1/version && echo && echo "UP worktree=$WT api=127.0.0.1:4300 web=$PUBLIC_ORIGIN (binds $WEB_HOST:3300)"
+}
+case "$1" in
+up)
+  [ -s "$K/api.pid" ] && kill -0 "$(cat "$K/api.pid")" 2>/dev/null && { echo "already up"; exit 0; }
+  if [ -s "$K/lease.pid" ] && kill -0 "$(cat "$K/lease.pid")" 2>/dev/null && [ -s "$K/.dburl" ]; then
+    echo "reusing the live lease"
+  else
+    # Hold a pgpool lease for 4h with a sleeper; the leased URL lands in $K/.dburl (0600). A leftover URL from an
+    # earlier lease must go first, or the wait below reads it before the new lease writes its own.
+    rm -f "$K/.dburl"
+    nohup python3 ~/repos/harness/lanes/pgpool.py run --mode server --job aab3-repro --lane qacq3 --ttl 14400 -- \
+      bash -c 'umask 077; echo "$DATABASE_URL" > '"$K"'/.dburl; exec sleep 14000' > "$K/lease.log" 2>&1 < /dev/null &
+    echo $! > "$K/lease.pid"
+    for i in $(seq 1 60); do [ -s "$K/.dburl" ] && break; sleep 1; done
+    [ -s "$K/.dburl" ] || { echo "LEASE_FAILED"; tail -3 "$K/lease.log"; exit 3; }
+  fi
+  export DATABASE_URL="$(cat "$K/.dburl")"
+  # pgpool leases a server, not a database: create the named database once (vitest's global setup does this for tests).
+  python3 -I - "$DATABASE_URL" <<'PY' > "$K/createdb.log" 2>&1 || { echo CREATEDB_FAILED; tail -3 "$K/createdb.log"; exit 4; }
+import subprocess, sys, urllib.parse
+u = urllib.parse.urlsplit(sys.argv[1]); name = u.path.lstrip('/')
+assert name.replace('_', '').isalnum(), 'unexpected database name'
+admin = urllib.parse.urlunsplit(u._replace(path='/postgres'))
+have = subprocess.run(['psql', admin, '-XAtc', f"select 1 from pg_database where datname = '{name}'"], capture_output=True, text=True, check=True).stdout.strip()
+if have != '1':
+    subprocess.run(['psql', admin, '-Xqc', f'create database "{name}"'], check=True)
+print('database ready:', name)
+PY
+  (cd "$WT" && pnpm --filter @bugtracker/db migrate > "$K/migrate.log" 2>&1) || { echo MIGRATE_FAILED; tail -5 "$K/migrate.log"; exit 4; }
+  umask 077; [ -s "$K/.jwt" ] || head -c 32 /dev/urandom | base64 | tr -d '=+/\n' > "$K/.jwt"
+  start_app
+  ;;
+app)
+  # Restart only api and web (keeps the lease, database and seeded accounts), e.g. to change PUBLIC_ORIGIN.
+  export DATABASE_URL="$(cat "$K/.dburl")"
+  AH=$(command -v ah || ls ~/.claude/hooks/ah.py 2>/dev/null || true)
+  for p in web api; do
+    [ -s "$K/$p.pid" ] || continue
+    if python3 "$AH" kill --pid "$(cat "$K/$p.pid")" --reason "restart my own kimi repro $p"; then rm -f "$K/$p.pid"; else echo "KILL_FAILED $p"; exit 5; fi
+  done
+  sleep 3; start_app
   ;;
 seed)
   export DATABASE_URL="$(cat "$K/.dburl")"; API=http://127.0.0.1:4300/v1; cd "$K"

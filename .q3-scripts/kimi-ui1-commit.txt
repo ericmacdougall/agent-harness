@@ -1,0 +1,29 @@
+fix(web): explain blocked thread start and upload refusals
+
+Why: Kimi QAC findings qac-001 and web-qac-attach-001, both confirmed in
+code. The New AI thread dialog disabled Start thread on an empty message
+with no reason, and the composer replaced every client-side upload refusal
+(too large, empty, unsupported type) with "Could not upload that file", so
+people could not tell what to change.
+
+What:
+- uploads.ts: client refusals throw UploadRejectedError; new
+  uploadFailureMessage() returns its reason or an ApiError message, else the
+  generic fallback (network and unknown errors stay generic).
+- message-composer.tsx: toast uses uploadFailureMessage().
+- new-ai-thread-dialog.tsx: an empty message shows "Write a message to start
+  the thread." and the disabled button points at it via aria-describedby.
+- Tests: message-composer-upload-reason.test.tsx (oversize paste shows the
+  size limit and sends no request; a TypeError keeps the generic text) and an
+  empty-message hint case in new-ai-thread-dialog.test.tsx.
+
+Testing: on t2-dev in apps/web,
+`npx vitest run src/components/messaging/message-composer-upload-reason.test.tsx src/components/messaging/new-ai-thread-dialog.test.tsx`
+new tests on the old code: 2 failed | 5 passed; with the fix: 7 passed.
+Neighbour suites (composer secure, paste, delivery, upload-session-recovery,
+thread-panel) 101 passed. `npx tsc --noEmit -p .` shows the same 3 errors as
+base 7b738654, none in changed files.
+
+Refs: GoodQA #14903
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
