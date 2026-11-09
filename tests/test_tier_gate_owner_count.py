@@ -72,6 +72,30 @@ class OwnerCount(unittest.TestCase):
         with mock.patch.object(ah, 'owners', return_value=rows):
             self.assertEqual(gate.live_owner_ids(SID, self.policy), ['p' * 32, 'q' * 32, 'r' * 32])
 
+    def test_disposed_silent_owners_free_their_slots_as_the_alerts_do(self):
+        # GoodQA #15565: af265a5 (reassigned, successor not live) and a0680533 (live named wait) held slots while SILENT-HIGH.
+        silent = lambda ch, disp, state='SILENT-HIGH': {'agent_id': ch * 32, 'type': 'task-owner', 'owner': True,  # noqa: E731
+                                                       'state': state, 'disposition': disp}
+        rows = {'owners': [silent('a', {'kind': 'reassigned', 'live': False}), silent('b', {'kind': 'waiting', 'live': True}),
+                           silent('c', {'kind': 'superseded', 'live': True}), silent('d', {'kind': 'wontdo', 'live': True}),
+                           silent('e', {'kind': 'waiting', 'live': False}), silent('f', {'kind': 'resumed', 'live': True}),
+                           silent('g', None), silent('h', {'kind': 'reassigned', 'live': False}, state='live')]}
+        rows['owners'][6]['decision_required'] = False
+        with mock.patch.object(ah, 'owners', return_value=rows):
+            self.assertEqual(gate.live_owner_ids(SID, self.policy), ['e' * 32, 'f' * 32, 'g' * 32, 'h' * 32])
+        rows['owners'][0]['decision_required'] = True  # ah still wants a decision: the slot stays held
+        with mock.patch.object(ah, 'owners', return_value=rows):
+            self.assertIn('a' * 32, gate.live_owner_ids(SID, self.policy))
+
+    def test_quiet_general_purpose_owner_counts_but_a_stale_or_unknown_idle_helper_does_not(self):
+        rows = {'owners': [
+            {'agent_id': 'p' * 32, 'type': 'general-purpose', 'owner': False, 'state': 'idle-helper', 'idle_s': 1500, 'disposition': None},
+            {'agent_id': 'q' * 32, 'type': 'general-purpose', 'owner': False, 'state': 'idle-helper', 'idle_s': 2 * 3600, 'disposition': None},
+            {'agent_id': 'r' * 32, 'type': 'red-team', 'owner': False, 'state': 'idle-helper', 'idle_s': 100, 'disposition': None},
+            {'agent_id': 's' * 32, 'type': 'general-purpose', 'owner': False, 'state': 'idle-helper', 'disposition': None}]}
+        with mock.patch.object(ah, 'owners', return_value=rows):
+            self.assertEqual(gate.live_owner_ids(SID, self.policy), ['p' * 32])
+
     def test_deadline_is_not_swallowed_by_a_broad_except(self):
         self.assertTrue(issubclass(gate._Deadline, BaseException) and not issubclass(gate._Deadline, Exception))
 
