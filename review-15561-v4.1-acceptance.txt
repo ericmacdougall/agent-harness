@@ -1,0 +1,30 @@
+DELTA ACCEPTANCE REVIEW goodqa#15561 spec v4.1 (diff spec-v4-to-v4.1.diff; author-stated core 5ff58988...e17d, not recomputed). Reviewer a9ce4d3ea8faf7427. Read-only; no probes.
+VERDICT: BLOCK on two small wording defects (R1, R2). Everything else in the delta is testable and consistent. A one-pass fix should ACCEPT.
+
+REQUIRED
+ R1 The token_mint correction is incomplete: F4 still states the claim the amendment says is wrong.
+   Prerequisites (new): "while the platform switch `userTokens.sessionActions` is off, its default, a token CAN mint a legacy child"
+   F4 (unchanged, line 31): "a user-token actor can never mint (policy rule `token_mint`)"
+   Same spec, opposite statements on a security fact. Also D11 "Not changed: ... the non-delegable minting rule" and NEG-8 ("`POST /v1/me/user-tokens` ... stay refused") are about the bound session and stay true, but F4 must be reworded to "a token cannot mint by bearer once userTokens.sessionActions is on; a bound session can never mint; while it is off a bearer token can mint a legacy child" (whichever the code says; I did not read code), and say which of the two the new `created_via = session, no parent` check is guarding against.
+ R2 The fallback in the live-proof prerequisites names a control that does not exist on the #1319 build.
+   "otherwise the owner mints a fresh "Desktop app: view CRM" token"
+   The presets are S5 (AC-11); #1319 is S0+S1a+S1b. A tester or owner on that build cannot find that preset. Say "a fresh token with exactly desktop_signin + read + crm (the "Desktop app: view CRM" preset once S5 has shipped; the three checkboxes by hand before)". F4 confirms the checkboxes exist today.
+
+NON-BLOCKING (fix with R1/R2)
+ N1 AC-12: "the click-test records ... the token's abilities, `created_via` and `created_by_token_id` (metadata only)". The click-tester cannot read these from the UI or the DB; the prerequisites make an operator read them. Say "an operator reads and the evidence records them", and that the operator is not the author, so the evidence stays independent.
+ N2 Q9 rollback: "if an operator reads the mini's bound token as `created_via = operator` ... registered as an ask before the deploy; #1319 is rolled back ... if that re-sign-in is not done". Testable only if the operator read happens BEFORE the deploy and the rollback has a deadline; state both, and give the ask a Source (ticket:) per the ask rules. Note the fallback "today an Everything token" is the over-privileged token D6 argues against; it is disclosed, so fine, but record it as a known limitation until the `machines` checkbox is approved.
+ N3 Unstated side effect of the live proof: signing the production mini in with a CRM-only token (no `machines`) removes its machine and remote-session routes for the duration, and the Ask-me-first mint approval (`approval: 'desktop_signin'`) is another human step. Add "restore the previous sign-in after the proof" and the approval to the prerequisites.
+ N4 Carried from my last report, still open in v4.1: C1 (AC-1 lists `entitlements` and `members` as `delegated` entries, but D4 delegates only routes under `/v1/orgs/:p/crm/**` and F6(c) says those are not delegated), C4 (NEG-39, AC-17, AC-18 in no slice), C6 host line. C2 (Q9 "deviation open") and C3 (ZERO_WRITE_READ_ROUTES now defined at line 110) are fixed.
+
+ADDENDUM (added prerequisite line, core ad6171ec..., re-read in the file)
+ "The AC-12 sign-in (a token without `machines`) removes the mini's machine and remote-session routes ... the live proof therefore runs as a separate desktop sign-in that is not the mini's working session, or re-signing the mini in with its working token afterwards is a registered human step (it joins ask wc27c825f054)."
+ Resolves N3: testable (a separate sign-in or a recorded restore step) and consistent with D6, NEG-20 and the Q9 step. Minor: an ask id with no Source cited here; confirm wc27c825f054 has one (N2). R1 and R2 are NOT fixed in the current file: F4 line 31 still reads "a user-token actor can never mint (policy rule `token_mint`)" and line 154 still reads "the owner mints a fresh "Desktop app: view CRM" token". Verdict unchanged: BLOCK until those two lines are edited.
+
+CHECKED OK
+ - Source line: one Q7 sentence; user's words only on contact detail; timeline qualified as main's decision (comment 59a46886-...). Consistent with AC-14/15/16, NEG-36..38, Q7 line and S1e.
+ - AC-3: "A token without `read` cannot start a session (AC-9; `write` is not required to start one, D6)" matches AC-9, D6 and NEG-13; the write-missing case can now be made at mint, the read case by PATCH. Consistent.
+ - The "exactly desktop_signin + read + crm, created_via = session, no parent" criterion agrees with D2's allowed kinds (a legacy child is `user_token` per the decisions block), and the rationale ("An operator or Everything token would pass the oracle without proving the least-privilege path") is sound and observable via metadata.
+ - Q9 consequence now agrees with NEG-39 and the decisions block.
+
+NOT VERIFIED: code (whether a token can mint a legacy child when sessionActions is off; field names created_via and created_by_token_id); core sha; the reviews table.
+PROBES: none.
