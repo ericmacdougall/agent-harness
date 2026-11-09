@@ -87,7 +87,7 @@ declare module 'fastify' {
       machineGrantIds?: string[];
     };
     /** goodqa#15561: set while a desktop session bound to a user token is the carrier (both doors); the ledger rows say so. */
-    userTokenDoor?: { via: 'desktop_session'; sessionId: string; door: 'host' | 'delegated' };
+    userTokenDoor?: { via: 'desktop_session'; sessionId: string; door: 'host' | 'delegated' | 'none' };
     /**
      * goodqa#15561 D9: the token facts of a bound session on the HOST door, where `req.auth` keeps the real session id.
      * Read only by the credential-minting machine routes (modules/machines/enroll/routes.ts `enrollActor`), so a machine
@@ -193,7 +193,9 @@ export interface UserTokenGateDeps {
  * (`user_token_non_delegable`) so the app can say "not available in a desktop session started from a token"; any other route
  * is `desktop_token_session_scope`. Either way it is ledgered as `refused`.
  */
-export function boundRouteClassRefusal(req: FastifyRequest, token: UserTokenRow, routePattern: string | undefined, routeKey: string, deps: UserTokenGateDeps): AppError {
+export function boundRouteClassRefusal(req: FastifyRequest, reply: FastifyReply, token: UserTokenRow, routePattern: string | undefined, routeKey: string, deps: UserTokenGateDeps): AppError {
+  // RT15561-3: the token's rate applies to a refused request too (the ledger write below is the load it sheds).
+  enforceTokenRate(req, reply, token, routePattern, Date.now());
   if (routePattern && desktopExplainedSurface(routeKey)) {
     const policy = userTokenRoutePolicy(req.method, routePattern, deps.isApiKeyReachableRoute(req.method, routePattern));
     if (policy.nonDelegable) return refusal(req, token, routePattern, new AppError(403, 'user_token_non_delegable', policy.nonDelegable.reason, { rule: policy.nonDelegable.code }));
@@ -201,6 +203,20 @@ export function boundRouteClassRefusal(req: FastifyRequest, token: UserTokenRow,
     if (policy.signedInPersonOnly) return refusal(req, token, routePattern, new AppError(403, 'user_token_non_delegable', USER_TOKEN_SIGNED_IN_PERSON_RULE.reason, { rule: USER_TOKEN_SIGNED_IN_PERSON_RULE.code }));
   }
   return refusal(req, token, routePattern, new AppError(403, 'desktop_token_session_scope', 'This desktop session was started from a user token and can only do what the desktop app needs.'));
+}
+
+/**
+ * The per-token request rate (429). Deliberately NOT written to the ledger: a token over its rate would otherwise turn every
+ * refused request into a database write, which is the load the limit exists to shed. One log line (ids only) instead.
+ */
+function enforceTokenRate(req: FastifyRequest, reply: FastifyReply, token: UserTokenRow, routePattern: string | undefined, now: number): void {
+  const rate = rateAllowed(token.id, now);
+  if (rate.ok) return;
+  reply.header('retry-after', String(rate.retryAfterSeconds));
+  req.log.warn({ userTokenId: token.id, route: routePattern }, 'user token rate limited');
+  throw new AppError(429, 'user_token_rate_limited', 'This user token is sending too many requests. Slow down.', {
+    retryAfterSeconds: rate.retryAfterSeconds,
+  });
 }
 
 /** The ledger detail that names a desktop-session carrier; empty for a bearer call (its rows are unchanged). */
@@ -372,16 +388,7 @@ export async function applyUserTokenRoutePolicy(
   const routePattern = req.routeOptions?.url;
   if (!routePattern) throw refusal(req, token, routePattern, Errors.forbidden('This route is not available to user tokens'));
 
-  const rate = rateAllowed(token.id, now);
-  if (!rate.ok) {
-    reply.header('retry-after', String(rate.retryAfterSeconds));
-    // Deliberately NOT written to the ledger: a token over its rate would otherwise turn every refused request into a
-    // database write, which is the load the limit exists to shed. One log line (ids only) instead.
-    req.log.warn({ userTokenId: token.id, route: routePattern }, 'user token rate limited');
-    throw new AppError(429, 'user_token_rate_limited', 'This user token is sending too many requests. Slow down.', {
-      retryAfterSeconds: rate.retryAfterSeconds,
-    });
-  }
+  enforceTokenRate(req, reply, token, routePattern, now);
 
   // Review round 2, finding 2: the org's API-access switches first, as for a key (their 404 reveals nothing the
   // refusals below would). The org is the one the route names.
@@ -410,7 +417,7 @@ export async function applyUserTokenRoutePolicy(
     // A desktop session never reaches a session action (its grant is an explicit human grant to a token, not to a screen).
     if (candidate) throw refusal(req, token, routePattern, new AppError(403, 'user_token_non_delegable', 'A desktop session cannot perform session actions.', { rule: 'session_action' }));
     // Host door: the same gate, with the three named waivers (lib/desktop-token-session.ts applyHostDoorWaivers).
-    if (bound.door === 'host') applyHostDoorWaivers(req.method, bound.routeKey, policy);
+    if (bound.door === 'host') applyHostDoorWaivers(req.method, bound.routeKey, policy, expandUserTokenAbilities(token.abilities));
   }
   // Outreach authoring/start (lib/commander-turn-routes.ts): the few person-only routes a Commander TURN GRANT -- and
   // only that credential -- may reach. Everything below still applies (abilities, org list, tiered action card).

@@ -227,6 +227,14 @@ export const HOST_BASE_READ_ROUTES: ReadonlySet<string> = new Set([
 ]);
 export const HOST_APPROVAL_WAIVED_ROUTES: ReadonlySet<string> = new Set(['POST /v1/me/machine-enrollments', 'POST /v1/me/machine-enrollments/:p/cancel']);
 
+/**
+ * RT15561-1: the waivers below exist for the desktop app signed in with a token that holds the host set it always needed
+ * (before D6 a session could not start without all three). A token holding only some of them, now able to start a session
+ * (D6 needs just `desktop_signin` and `read`), gets the plain bearer policy on the host routes: no waiver, so the machines
+ * non-delegable rule and the session-only rule refuse it exactly as they refuse the token by bearer.
+ */
+export const HOST_WAIVER_ABILITIES = ['machines', 'write', 'tokens.create_other_keys'] as const;
+
 interface HostPolicyShape {
   nonDelegable: { code: string } | null;
   signedInPersonOnly: boolean;
@@ -235,9 +243,10 @@ interface HostPolicyShape {
   approvalAlways: boolean;
 }
 /** Mutates `policy` (a fresh object per request) for the host door. Returns which waivers fired, for the ledger and the tests. */
-export function applyHostDoorWaivers(method: string, routeKey: string, policy: HostPolicyShape): Array<'W1' | 'W2' | 'W3'> {
+export function applyHostDoorWaivers(method: string, routeKey: string, policy: HostPolicyShape, held: ReadonlySet<string>): Array<'W1' | 'W2' | 'W3'> {
   const key = `${methodOf(method)} ${routeKey}`;
   const fired: Array<'W1' | 'W2' | 'W3'> = [];
+  if (!HOST_WAIVER_ABILITIES.every((a) => held.has(a))) return fired;
   if (policy.nonDelegable?.code === 'machines') { policy.nonDelegable = null; fired.push('W1'); }
   if (policy.signedInPersonOnly) { policy.signedInPersonOnly = false; fired.push('W2'); }
   if (!HOST_BASE_READ_ROUTES.has(key) && !policy.abilities.includes('machines')) policy.abilities = [...policy.abilities, 'machines'].sort();
