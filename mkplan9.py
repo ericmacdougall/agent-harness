@@ -69,11 +69,11 @@ for a, lst in big.items():
     lst.sort(key=lambda x: -x[0]['n'])
     for part in range(0, len(lst), 150):
         chunk = lst[part:part + 150]
-        title = 'Merged, awaiting live proof: %s [%s]%s' % (a, proj, '' if len(lst) <= 150 else ' part %d' % (part // 150 + 1))
+        title = 'Merged, awaiting live proof: %s [%s] (batch 2)%s' % (a, proj, '' if len(lst) <= 150 else ' part %d' % (part // 150 + 1))
         lines = ['%d tickets whose fix has a merged PR but no deploy or live record yet (goodqa#14977 under-300 push, %s). They are NOT done. Each child keeps its state in this list and can be reopened from the cleanup snapshot.' % (len(chunk), time.strftime('%Y-%m-%d', time.gmtime())), '']
         for o, k in chunk:
             lines.append('- #%d [%s] %s | merged: %s | live proof: none recorded%s' % (o['n'], o['status'], o['title'][:110], ', '.join(sorted(set(J['merged'][k]))[:3]), ' | REALLY_TESTED: ' + str(sorted(set(J['rt'][k]))[0]) if k in J['rt'] else ''))
-        r = gq.call('create_issue', dict(orgId=P['orgId'], projectId=P['id'], title=title, description='\n'.join(lines)[:49000], type='epic', labels=['umbrella', 'cleanup-2026-11d', 'keep-open', 'awaiting-live-proof'], operationId=str(uuid.uuid5(uuid.NAMESPACE_URL, 'umb9|%s|%s|%d' % (proj, a, part)))))
+        r = gq.call('create_issue', dict(orgId=P['orgId'], projectId=P['id'], title=title, description='\n'.join(lines)[:49000], type='epic', labels=['umbrella', 'cleanup-2026-11d', 'keep-open', 'awaiting-live-proof'], operationId=str(uuid.uuid5(uuid.NAMESPACE_URL, 'umb9b|%s|%s|%d' % (proj, a, part)))))
         iss = r.get('issue') if isinstance(r, dict) else None
         if not iss:
             print('UMBRELLA FAIL', a, str(r)[:150]); continue
