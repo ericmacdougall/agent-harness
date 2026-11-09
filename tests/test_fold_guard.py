@@ -235,7 +235,13 @@ class FoldCase(unittest.TestCase):
                  ("close #14518", "close #14518 if the umbrella is ready"), ("#14518", "should we close #14518?"),
                  ("#14518", "the blog needs #14518 for the audit"),  # names the ticket, says nothing about folding
                  ("close #14519", "close #14519"), ("dropped", "check-dropped-workstreams"),
-                 ("close #14518", "something else entirely")]  # excerpt not inside the turn
+                 ("close #14518", "something else entirely"),  # excerpt not inside the turn
+                 # red-team a5fc13ab, third round: deferrals, later retractions, another project's ticket
+                 ("close #14518", "close #14518 once the umbrella exists"), ("close #14518", "close #14518 after the tests pass"),
+                 ("close #14518", "wait on this, close #14518 later"), ("close #14518", "pause: close #14518 when I say"),
+                 ("close #14518", "close everything but #14518, close #14518"),
+                 ("Close #14518.", "Close #14518. Actually keep it open."), ("Close #14518.", "Close #14518. Never mind."),
+                 ("close harness-other#14518", "close harness-other#14518")]  # another project's ticket with the same number
         for excerpt, turn in cases:
             note = "x\nFold-Override: queue:%s/2026-11-09T22:39:59.349Z#0f7f79687b56 \"%s\"" % (uuid.uuid4(), excerpt)
             with self.subTest(excerpt=excerpt, turn=turn), mock.patch("provenance.resolve", lambda s, *a, **k: good), \

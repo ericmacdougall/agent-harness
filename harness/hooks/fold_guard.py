@@ -33,7 +33,9 @@ OVERRIDE = re.compile(r"(?im)^[ \t]*Fold-Override:[ \t]*(.+?)[ \t\r]*$")
 UNCHECKED = re.compile(r"(?m)^[ \t]*(?:[-*+]|\d{1,3}[.)])[ \t]+\[ {1,2}\][ \t]+(.+?)[ \t\r]*$")
 FOLD_WORDS = re.compile(r"\b(?:fold(?:ed|ing)?|clos(?:e|ed|ing)|won'?t[ -]?fix|duplicate|drop(?:ped)?|abandon\w*|cancel\w*|"
                         r"supersed\w*|no longer (?:needed|wanted)|not needed)\b", re.I)
-FOLD_NEGATION = re.compile(r"\b(?:not|never|don'?t|do not|keep|stop|unless|if|without|leave|reopen|no)\b|n't\b", re.I)
+FOLD_NEGATION = re.compile(r"\b(?:not|never|don'?t|do not|keep|stop|unless|if|without|leave|reopen|no|once|after|before|when|"
+                           r"while|until|later|wait|pause|hold|defer|but|only|except|pending|tomorrow|soon)\b|n't\b", re.I)
+FOLD_RETRACT = re.compile(r"\b(?:never ?mind|scratch that|actually|hold on|belay|forget (?:it|that)|on second thought)\b", re.I)
 PRIORITY_RANK ={"immediate": 4, "urgent": 3, "high": 2, "medium": 1, "low": 0, "none": 0}
 PENDING_NOTE = re.compile(r"(?m)^[ \t]*PENDING_REAL_TEST[ \t]+([A-Za-z0-9][A-Za-z0-9._-]{0,40})[ \t]*:")
 TESTED_NOTE = re.compile(r"(?m)^[ \t]*REALLY_TESTED[ \t]+([A-Za-z0-9][A-Za-z0-9._-]{0,40})[ \t]*:")
@@ -190,7 +192,7 @@ def check_carry(note: str, items: list, source_number: int, source_project: str,
     return True, ""
 
 
-def check_override(note: str, resolver=None, number=None, turn_text=None) -> tuple:
+def check_override(note: str, resolver=None, number=None, turn_text=None, slug="") -> tuple:
     found = OVERRIDE.search(note or "")
     if not found:
         return False, "no `Fold-Override: <Source>` line in the note"
@@ -218,15 +220,20 @@ def check_override(note: str, resolver=None, number=None, turn_text=None) -> tup
     except Exception as error:  # noqa: BLE001
         return False, f"the user's cited turn could not be read to judge the whole sentence ({type(error).__name__})"
     excerpt = norm(" ".join(quoted))
-    sentences = [s for s in re.split(r"(?<=[.!?;])\s+|\n+", text or "") if excerpt and excerpt in norm(s)]
-    if not sentences:
+    every = [s for s in re.split(r"(?<=[.!?;])\s+|\n+", text or "") if s.strip()]
+    holding = [i for i, s in enumerate(every) if excerpt and excerpt in norm(s)]
+    if not holding:
         return False, "the cited excerpt is not inside one sentence of the user's turn"
-    for sentence in sentences:
-        if not (re.search(r"#%d(?!\d)" % int(number), sentence) and FOLD_WORDS.search(sentence)):
+    for i in holding:
+        sentence = every[i]
+        if not (_names_ticket(sentence, number, slug) and FOLD_WORDS.search(sentence)):
             return False, ("the user's sentence holding the excerpt must name this ticket (#%s) and say to fold, close, "
                            "drop or supersede it" % number)
         if FOLD_NEGATION.search(sentence) or "?" in sentence:
-            return False, "the user's sentence holding the excerpt refuses, conditions or questions the fold"
+            return False, "the user's sentence holding the excerpt refuses, defers, conditions or questions the fold"
+    for later in every[max(holding) + 1:]:  # the latest word decides: a later retraction voids the instruction
+        if FOLD_NEGATION.search(later) or FOLD_RETRACT.search(later):
+            return False, "a later sentence of the user's turn refuses, defers or retracts the fold"
     return True, ""
 
 
@@ -249,7 +256,7 @@ def assess(issue: dict, comments: list, note: str, adapter, spec_view=None, extr
                           if CARRY.search(note or "") else (False, None))
     if carried:
         return {"unmet": items, "allowed": True, "problems": []}
-    overridden, why_over = check_override(note, resolver, number) if OVERRIDE.search(note or "") else (False, None)
+    overridden, why_over = check_override(note, resolver, number, slug=project) if OVERRIDE.search(note or "") else (False, None)
     if overridden:
         return {"unmet": items, "allowed": True, "problems": []}
     problems = [p for p in (why_carry, why_over) if p]
