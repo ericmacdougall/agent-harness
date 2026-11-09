@@ -439,6 +439,24 @@ class ClockAndDisk(Scratch):
         self.assertEqual(rc, 0)
         self.assertEqual(ticks, 6)
 
+    def test_uncompilable_checks_new_hooks_modules_too_not_only_changed_baseline_files(self):
+        """Red-team delta (c): a changed baseline file that starts importing a NEW module with a syntax error passed the
+        check and ahd exited 75 into an import failure, a launchd restart loop that takes the monitor down."""
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            (root / "ahd.py").write_text("x = 1\n")
+            base = ahd.file_signature([str(root / "ahd.py")])
+            (root / "ahd.py").write_text("import brand_new\n")          # changed, compiles
+            (root / "brand_new.py").write_text("def broken(:\n")         # new, not in the baseline, does not compile
+            (root / "notes.txt").write_text("not python")
+            sig = ahd.file_signature([str(root / "ahd.py")])
+            self.assertEqual(ahd.uncompilable(base, sig, root=root), "brand_new.py: SyntaxError")
+            (root / "brand_new.py").write_text("y = 2\n")
+            self.assertIsNone(ahd.uncompilable(base, sig, root=root))
+
+    def test_uncompilable_on_the_real_hooks_directory_is_clean(self):
+        self.assertIsNone(ahd.uncompilable(ahd.code_signature(), ahd.code_signature()))
+
     def test_uncompilable_reports_a_real_syntax_error_and_accepts_good_code(self):
         with tempfile.TemporaryDirectory() as t:
             f = Path(t) / "m.py"

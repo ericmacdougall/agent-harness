@@ -113,17 +113,28 @@ def code_changed(baseline: dict, now_sig: dict) -> bool:
     return any(now_sig.get(k) != v for k, v in baseline.items())
 
 
-def uncompilable(baseline: dict, now_sig: dict):
-    """The first changed baseline file that does not compile, as 'name: error', else None. A restart onto a syntax error
-    would be a crash loop (launchd restarts it every 10 s), so the daemon stays on the code it has."""
-    for k, v in baseline.items():
-        if now_sig.get(k) != v:
-            try:
-                with open(k, "rb") as fh:
-                    source = fh.read(8 << 20)  # bounded: a hooks module is far smaller than this
-                compile(source, k, "exec")
-            except (OSError, SyntaxError, ValueError) as error:
-                return "%s: %s" % (Path(k).name, type(error).__name__)
+def uncompilable(baseline: dict, now_sig: dict, root=None):
+    """The first file that does not compile, as 'name: error', else None. Checked: every changed baseline file AND every
+    *.py in the hooks directory, because changed code may import a module that is new (not in the baseline). A restart
+    onto a syntax error would be a crash loop (launchd restarts it every 10 s) that takes the monitor itself down, so
+    the daemon stays on the code it has."""
+    root = Path(root) if root is not None else HERE
+    paths = [k for k, v in baseline.items() if now_sig.get(k) != v]
+    try:
+        paths += sorted(str(p) for p in root.glob("*.py"))[:400]
+    except OSError:
+        pass
+    seen = set()
+    for k in paths:
+        if k in seen:
+            continue
+        seen.add(k)
+        try:
+            with open(k, "rb") as fh:
+                source = fh.read(8 << 20)  # bounded: a hooks module is far smaller than this
+            compile(source, k, "exec")
+        except (OSError, SyntaxError, ValueError) as error:
+            return "%s: %s" % (Path(k).name, type(error).__name__)
     return None
 
 
