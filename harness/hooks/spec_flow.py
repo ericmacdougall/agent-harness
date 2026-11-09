@@ -102,7 +102,9 @@ def load_spec_policy(path: Path = POLICY_FILE) -> dict:
         policy = {**policy, **{k: v for k, v in overlay.items() if k in SPEC_LOCAL_KEYS}}
     if not isinstance(policy, dict) or policy.get("schema") != 1:
         raise ValueError(f"{path} is not a schema 1 spec policy")
-    for key in ("mode", "plan_ticket_gate"):
+    for key in ("mode", "plan_ticket_gate", "fold_guard"):
+        if key == "fold_guard" and key not in policy:
+            policy[key] = "enforce"
         if policy.get(key) not in ("off", "warn", "enforce"):
             raise ValueError(f"{path}: {key} must be off, warn or enforce")
     if not isinstance(policy.get("projects", {}), dict) or not isinstance(policy.get("enforced_projects", []), list):
@@ -977,6 +979,21 @@ def tester_key(tester: dict) -> str:
     return identity_key(kind, safe_id(identity) if kind == "agent" else identity) if kind else ""
 
 
+def unmet_acs(records: list, index: dict):
+    """AC ids of the newest verified spec with no evidence on its current core; None when no verified spec exists
+    (fold_guard reads the description's checklist then)."""
+    specs, _ = verified(records, index, "spec")
+    if not specs:
+        return None
+    spec = specs[-1]
+    core = spec.get("spec_core_sha")
+    evidence, _ = verified(records, index, "evidence")
+    return [ac for ac in spec.get("ac") or []
+            if not [r for r in evidence if r.get("spec_core_sha") == core and ac in (r.get("ac") or [])
+                    and (r.get("really_tested") or any(a.get("role") == "log" for a in r.get("attachments") or [])
+                         or (r.get("commits") and r.get("note")))]]
+
+
 def evaluate(records: list, index: dict, issue: dict, ignored=()):
     """Return {"ready", "missing", "self_attested", "notes"} for one ticket."""
     missing, attested, notes = [], [], list(ignored)
@@ -1318,7 +1335,95 @@ def resolve_issue(issue_id: str, config: dict, spec_policy: dict, deadline: floa
     return None, None
 
 
+FOLD_STATUSES = REASON_STATUSES  # statuses that end a ticket without doing the work
+
+
+def fold_targets(tool: str, tool_input: dict) -> list:
+    """[(issue_id, what, note)] for every write that would fold, wont_fix or archive a ticket. Independent of
+    classify(): a well-reasoned wont_fix is "open" there, and is exactly what the fold guard must still check."""
+    tool_input = tool_input if isinstance(tool_input, dict) else {}
+    out = []
+    if tool == "close_issue_wont_fix":
+        out.append((tool_input.get("issueId"), "wont_fix", str(tool_input.get("note") or "")))
+    elif tool == "update_issue":
+        patch = tool_input.get("patch") if isinstance(tool_input.get("patch"), dict) else {}
+        status = _one_status(tool_input, patch)
+        if status in FOLD_STATUSES:
+            out.append((tool_input.get("issueId"), status, str(tool_input.get("note") or patch.get("note") or "")))
+    elif tool == "bulk_update_issues":
+        for item in tool_input.get("items") if isinstance(tool_input.get("items"), list) else []:
+            if isinstance(item, dict) and _one_status(item, item.get("patch")) in FOLD_STATUSES:
+                out.append((item.get("issueId"), _item_status(item), str(item.get("note") or "")))
+    elif tool == "archive_issue":
+        out.append((tool_input.get("issueId"), "archive", str(tool_input.get("reason") or "")))
+    elif tool == "call_api":
+        method = str(tool_input.get("method") or "GET").upper()
+        raw = tool_input.get("body")
+        body = raw if isinstance(raw, dict) else {}
+        patch = body.get("patch") if isinstance(body.get("patch"), dict) else {}
+        found = re.search(UUID, str(tool_input.get("path") or ""))
+        if method != "GET" and found and _one_status(body, patch) in FOLD_STATUSES:
+            out.append((found.group(0).lower(), _one_status(body, patch), str(body.get("note") or "")))
+        for item in body.get("items") if isinstance(body.get("items"), list) else []:
+            if method != "GET" and isinstance(item, dict) and _one_status(item, item.get("patch")) in FOLD_STATUSES:
+                out.append((item.get("issueId"), _item_status(item), str(item.get("note") or "")))
+    return out
+
+
+def fold_check(targets: list, config: dict, spec_policy: dict, deadline: float, home=None, resolver=None) -> list:
+    """Blocking messages for the fold targets whose ticket still carries unfinished work. Fails closed: an id the
+    guard cannot read, or a tracker outage, blocks (a folded P0 cannot be undone by a retry)."""
+    import fold_guard
+    problems = []
+    max_bytes = int(spec_policy.get("max_record_bytes", 65536))
+    routes = spec_policy.get("projects") or {}
+    for issue_id, what, note in targets:
+        if not isinstance(issue_id, str) or not re.fullmatch(UUID, issue_id):
+            problems.append(f"fold guard: {what} needs a uuid issueId (got {str(issue_id)[:40]!r}); it cannot check the ticket")
+            continue
+        adapter, issue = resolve_issue(issue_id, config, spec_policy, deadline)
+        if issue is None:
+            problems.append(f"fold guard: issue {issue_id[:8]} cannot be read with any routed key, so {what} cannot be checked")
+            continue
+        if issue.get("closedAt") or issue.get("status") in SPEC_STATUSES | REASON_STATUSES:
+            continue  # already closed or archived-after-close: nothing left to drop
+        project_id = str(issue.get("projectId") or "").lower()
+        issue["_project_slug"] = next((n for n, r in routes.items() if str(r.get("project_id") or "").lower() == project_id), "")
+        comments = adapter.all_comments(issue_id)
+        records, _ = ticket_records(comments, max_bytes)
+        index = {row.get("id"): row for row in adapter.attachments(issue_id)}
+        result = fold_guard.assess(issue, comments, note, adapter, spec_view=unmet_acs(records, index),
+                                   extra_pending=fold_guard.wal_pending(issue.get("number") or 0, home), resolver=resolver)
+        if not result["allowed"]:
+            problems.append(fold_guard.format_block(f"issue #{issue.get('number')} ({issue_id[:8]})", what, result))
+    return problems
+
+
 def run_hook(payload: dict, spec_policy: dict, config_loader=None) -> tuple:
+    code, text = _run_spec_hook(payload, spec_policy, config_loader)
+    fold_mode = spec_policy.get("fold_guard", "enforce")
+    name = str(payload.get("tool_name") or "")
+    match = TOOL_PATTERN.match(name)
+    if not match or fold_mode == "off" or code == 2:
+        return code, text
+    targets = fold_targets(match.group(1).lower(), payload.get("tool_input") or {})
+    if not targets:
+        return code, text
+    try:
+        _, _, config = (config_loader or ticket_config)(spec_policy)
+        deadline = time.monotonic() + float(spec_policy.get("hook_deadline_seconds", 40))
+        problems = fold_check(targets, config, spec_policy, deadline)
+    except Exception as error:  # fail closed: an unchecked fold cannot be undone by a retry
+        problems = [f"fold guard: could not check what this close would drop ({type(error).__name__}: {str(error)[:160]}); retry"]
+    if not problems:
+        return code, text
+    body = "Fold guard (GoodQA #15565):\n" + "\n".join(problems)
+    if fold_mode == "enforce":
+        return 2, "Blocked by the Agent Harness fold guard:\n" + body + (("\n" + text) if text else "")
+    return 0, "fold-guard (warn mode, not blocking):\n" + body + (("\n" + text) if text else "")
+
+
+def _run_spec_hook(payload: dict, spec_policy: dict, config_loader=None) -> tuple:
     name = str(payload.get("tool_name") or "")
     match = TOOL_PATTERN.match(name)
     mode = spec_policy.get("mode", "warn")
