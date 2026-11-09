@@ -19,6 +19,9 @@ SUB = [
     ('Lane mirrors and lane liveness', r'\[lane\]|^lane |lane .*stuck|lane-|liveness|deadman|auto-decider|queue launcher|orphan'),
     ('Fleet hosts, failover and infrastructure', r'fleet|host|dev2|t2-dev|t2\b|proxmox|failover|hot-swap|disk|backup|vm\b|docker|daemon|ssh|netwatch|ops-watch|drain'),
     ('Runner briefs and round tickets', r'-r\d+-|-sol-|-opus-|-astra|runner|brief|round|successor|rescue|pairing|hive|gorunner'),
+    ('Hooks, guards, gates and policy', r'hook|guard|gate|policy|merge|review|peer|commit|ban|block|refus|permission|rule|allowlist|denylist'),
+    ('Tests, evidence, specs and quality', r'test|evidence|spec|acceptance|coverage|mutant|flak|baseline|assert|verify|proof|click'),
+    ('Sessions, WAL, logs, tasks and ledger', r'wal|log|session|ledger|task|transcript|receipt|ticket|status|stale|digest|alert|monitor|queue|state'),
 ]
 SUBS = [(n, re.compile(p, re.I)) for n, p in SUB] + [('Runner, harness policy and misc', re.compile('.'))]
 buckets = collections.defaultdict(list)
