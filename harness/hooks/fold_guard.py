@@ -190,7 +190,7 @@ def check_carry(note: str, items: list, source_number: int, source_project: str,
     return True, ""
 
 
-def check_override(note: str, resolver=None, number=None) -> tuple:
+def check_override(note: str, resolver=None, number=None, turn_text=None) -> tuple:
     found = OVERRIDE.search(note or "")
     if not found:
         return False, "no `Fold-Override: <Source>` line in the note"
@@ -211,7 +211,31 @@ def check_override(note: str, resolver=None, number=None) -> tuple:
     if not isinstance(result, dict) or not result.get("ok") or kind not in SOURCE_KINDS or result.get("weak"):
         return False, ("Fold-Override must cite the user's own words (user:, answer: or queue:) that resolve; "
                        "an agent message or an unresolved source is not a disposition")
+    # The agent picks the quoted excerpt, so judge the user's WHOLE sentence that holds it (review R1): it must name this
+    # ticket, hold a fold word, and hold no refusal or condition. Unreadable turn text fails closed.
+    try:
+        text = (turn_text or _turn_text)(found.group(1))
+    except Exception as error:  # noqa: BLE001
+        return False, f"the user's cited turn could not be read to judge the whole sentence ({type(error).__name__})"
+    excerpt = norm(" ".join(quoted))
+    sentences = [s for s in re.split(r"(?<=[.!?;])\s+|\n+", text or "") if excerpt and excerpt in norm(s)]
+    if not sentences:
+        return False, "the cited excerpt is not inside one sentence of the user's turn"
+    for sentence in sentences:
+        if not (re.search(r"#%d(?!\d)" % int(number), sentence) and FOLD_WORDS.search(sentence)):
+            return False, ("the user's sentence holding the excerpt must name this ticket (#%s) and say to fold, close, "
+                           "drop or supersede it" % number)
+        if FOLD_NEGATION.search(sentence) or "?" in sentence:
+            return False, "the user's sentence holding the excerpt refuses, conditions or questions the fold"
     return True, ""
+
+
+def _turn_text(source: str) -> str:
+    """The text of the user turn a user:/answer:/queue: source cites, from the installed Claude home."""
+    import escalation
+    import provenance
+    parsed = provenance.parse_source(source)
+    return str(escalation._turn_for(parsed, escalation.installed_home() / ".claude").get("text") or "")
 
 
 def assess(issue: dict, comments: list, note: str, adapter, spec_view=None, extra_pending=(),

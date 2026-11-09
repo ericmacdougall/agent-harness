@@ -208,29 +208,49 @@ class FoldCase(unittest.TestCase):
         with mock.patch("provenance.resolve", lambda s, *a, **k: agent):
             self.assertEqual(self.wont_fix(note)[0], 2)  # a wal: source is the agent's own note
         good = {"ok": True, "kind": "user", "weak": False}
-        with mock.patch("provenance.resolve", lambda s, *a, **k: good):
+        said = "Please drop #14518, it is replaced by the umbrella."
+        with mock.patch("provenance.resolve", lambda s, *a, **k: good), \
+                mock.patch.object(fold_guard, "_turn_text", lambda s: said):
             self.assertEqual(self.wont_fix(note), (0, ""))
 
     def test_override_must_be_about_this_ticket_or_folding(self):
         self.src["priority"] = "immediate"
         good = {"ok": True, "kind": "user", "weak": False}
         unrelated = "x\nFold-Override: answer:%s/%s \"Allow it (Recommended) Yes, send the link\"" % (uuid.uuid4(), uuid.uuid4())
-        about = "x\nFold-Override: user:%s/%s \"close 14518, it is replaced by the umbrella #14518\"" % (uuid.uuid4(), uuid.uuid4())
-        with mock.patch("provenance.resolve", lambda s, *a, **k: good):
+        about = "x\nFold-Override: user:%s/%s \"close #14518, it is replaced by the umbrella\"" % (uuid.uuid4(), uuid.uuid4())
+        with mock.patch("provenance.resolve", lambda s, *a, **k: good), \
+                mock.patch.object(fold_guard, "_turn_text", lambda s: "Allow it (Recommended) Yes, send the link"):
             code, text = self.wont_fix(unrelated)
             self.assertEqual(code, 2, text)
             self.assertIn("do not name this ticket", text)
+        with mock.patch("provenance.resolve", lambda s, *a, **k: good), \
+                mock.patch.object(fold_guard, "_turn_text", lambda s: "Yes. close #14518, it is replaced by the umbrella. Thanks"):
             self.assertEqual(self.wont_fix(about), (0, ""))
 
-    def test_override_words_cannot_be_an_unrelated_or_refusing_message(self):
-        # review R1: a real queue command containing a fold word passed; a refusal of the fold must not count
+    def test_override_judges_the_users_whole_sentence_not_the_agents_excerpt(self):
+        # review R1 (twice): the agent picks the quoted excerpt, so it can cut "#14518" out of a refusal
         self.src["priority"] = "immediate"
         good = {"ok": True, "kind": "queue", "weak": False}
-        for words in ("check-dropped-workstreams", "dropped", "do not close #14518", "keep #14518 open, never drop it",
-                      "close #14518 if the umbrella is ready", "close #14519"):
-            note = "x\nFold-Override: queue:%s/2026-11-09T22:39:59.349Z#0f7f79687b56 \"%s\"" % (uuid.uuid4(), words)
-            with self.subTest(words=words), mock.patch("provenance.resolve", lambda s, *a, **k: good):
+        cases = [("#14518", "Do not close #14518 yet."), ("#14518", "keep #14518 open, never drop it"),
+                 ("close #14518", "close #14518 if the umbrella is ready"), ("#14518", "should we close #14518?"),
+                 ("#14518", "the blog needs #14518 for the audit"),  # names the ticket, says nothing about folding
+                 ("close #14519", "close #14519"), ("dropped", "check-dropped-workstreams"),
+                 ("close #14518", "something else entirely")]  # excerpt not inside the turn
+        for excerpt, turn in cases:
+            note = "x\nFold-Override: queue:%s/2026-11-09T22:39:59.349Z#0f7f79687b56 \"%s\"" % (uuid.uuid4(), excerpt)
+            with self.subTest(excerpt=excerpt, turn=turn), mock.patch("provenance.resolve", lambda s, *a, **k: good), \
+                    mock.patch.object(fold_guard, "_turn_text", lambda s, t=turn: t):
                 self.assertEqual(self.wont_fix(note)[0], 2)
+
+    def test_an_unreadable_turn_fails_closed(self):
+        self.src["priority"] = "immediate"
+        good = {"ok": True, "kind": "user", "weak": False}
+        note = "x\nFold-Override: user:%s/%s \"close #14518\"" % (uuid.uuid4(), uuid.uuid4())
+        with mock.patch("provenance.resolve", lambda s, *a, **k: good), \
+                mock.patch.object(fold_guard, "_turn_text", mock.Mock(side_effect=OSError("gone"))):
+            code, text = self.wont_fix(note)
+        self.assertEqual(code, 2, text)
+        self.assertIn("could not be read", text)
 
     # ---- hostile shapes: nothing is skipped quietly
 
