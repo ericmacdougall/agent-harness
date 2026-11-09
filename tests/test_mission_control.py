@@ -735,6 +735,30 @@ class Security(ServerHarness):
 
 
 class Budget(ServerHarness):
+    def test_connection_cap_is_the_spec_value(self):
+        self.assertEqual(mcs.MAX_CONNECTIONS, 32)  # AC-9: at most 32 concurrent connections
+
+    def test_full_house_of_authenticated_connections_refuses_without_deadlock(self):
+        held = []
+        self.addCleanup(lambda: [s.close() for pair in held for s in pair])
+        with self.server.conn_lock:
+            for n in range(mcs.MAX_CONNECTIONS):
+                pair = socket.socketpair()
+                held.append(pair)
+                self.server.live[pair[0]] = [float(n), True]  # every slot authenticated: nothing to evict
+        extra = socket.socketpair()
+        held.append(extra)
+        worker = threading.Thread(target=self.server.process_request, args=(extra[0], ("127.0.0.1", 1)), daemon=True)
+        worker.start()
+        worker.join(3)
+        self.assertFalse(worker.is_alive(), "process_request deadlocked on its own connection lock")
+        self.assertNotIn(extra[0], self.server.live)
+        extra[1].settimeout(2)
+        self.assertEqual(extra[1].recv(1), b"", "the refused connection is closed")
+        acquired = self.server.conn_lock.acquire(timeout=2)
+        self.assertTrue(acquired, "the lock is free again")
+        self.server.conn_lock.release()
+
     def test_idle_unauthenticated_sockets_do_not_lock_out_the_user(self):
         idle = []
         self.addCleanup(lambda: [s.close() for s in idle])
@@ -742,7 +766,7 @@ class Budget(ServerHarness):
             sock = socket.create_connection(("127.0.0.1", self.port), timeout=2)
             idle.append(sock)
         time.sleep(0.3)
-        self.assertLessEqual(len(self.server.live), mcs.MAX_CONNECTIONS, "connections stay bounded")
+        self.assertLessEqual(len(self.server.live), 32, "connections stay bounded (AC-9)")
         started = time.time()
         cookie, _ = self.login()
         resp, _ = self.request("GET", "/", {"Cookie": cookie, "Sec-Fetch-Site": "none"})

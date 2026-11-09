@@ -58,7 +58,7 @@ Two kinds of WAL line are not work items:
 
 Two limits keep the server light:
 
-- It holds at most 48 connections and 8 live streams, and keeps a replay ring of 500 redacted events.
+- It holds at most 32 connections (an idle connection that has not signed in is evicted first) and 8 live streams, and keeps a replay ring of 500 redacted events.
 - Events are limited to 20 per second, and quiet events get half of that budget.
 
 The server stays under 100 MB RSS.

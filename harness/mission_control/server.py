@@ -63,7 +63,7 @@ LABEL = "com.agent-harness.mission-control"
 LAUNCH_TTL_S = 60
 SESSION_TTL_S = 12 * 3600
 MAX_SESSIONS = 16
-MAX_CONNECTIONS = 48
+MAX_CONNECTIONS = 32  # AC-9
 MAX_BODY = 16 * 1024
 IO_TIMEOUT_S = 10
 SSE_HEARTBEAT_S = 15
@@ -505,20 +505,27 @@ class Server(ThreadingHTTPServer):
                 self.live[sock][1] = True
 
     def process_request(self, request, client_address):
+        # Decide under conn_lock, act on sockets after releasing it: shutdown_request takes the same
+        # (non-reentrant) lock, so calling it while holding the lock deadlocked the accept loop for good.
+        victim, refuse = None, False
         with self.conn_lock:
             if len(self.live) >= MAX_CONNECTIONS:
-                victims = sorted((v[0], s) for s, v in self.live.items() if not v[1])
-                if victims:  # evict the oldest unauthenticated connection, never an authenticated one
-                    _, victim = victims[0]
+                idle = [s for s, v in self.live.items() if not v[1]]
+                if idle:  # evict the oldest unauthenticated connection, never an authenticated one
+                    victim = min(idle, key=lambda s: self.live[s][0])
                     self.live.pop(victim, None)
-                    try:
-                        victim.shutdown(socket.SHUT_RDWR)
-                    except OSError:
-                        pass
                 else:
-                    self.shutdown_request(request)
-                    return
-            self.live[request] = [time.monotonic(), False]
+                    refuse = True
+            if not refuse:
+                self.live[request] = [time.monotonic(), False]
+        if victim is not None:
+            try:
+                victim.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        if refuse:
+            self.shutdown_request(request)
+            return
         request.settimeout(IO_TIMEOUT_S)
         super().process_request(request, client_address)
 
