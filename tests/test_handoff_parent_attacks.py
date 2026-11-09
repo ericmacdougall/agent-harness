@@ -18,11 +18,12 @@ class Attacks(Base):
     def _rows(self, now):
         return {r["agent_id"]: r for r in self.owners(now=now)["owners"]}
 
-    def _child_handoff(self, parent, at):
+    def _child_handoff(self, parent, at, depth=None):
         w = self.home / ".claude" / "wals" / SESSION
         jl(w / "agent-dropowner.jsonl", [{"at": iso(at), "event": "handoff", "note": "to my parent: result ready"}])
         jl(w / "main.jsonl", [{"at": iso(at), "event": "subagent_stop", "agent_id": "dropowner", "agent_type": "task-owner"}])
-        self._meta("dropowner", agentType="task-owner", parentAgentId=parent, finished=True)
+        extra = {} if depth is None else {"spawnDepth": depth}
+        self._meta("dropowner", agentType="task-owner", parentAgentId=parent, finished=True, **extra)
 
     def test_A_finished_parent_with_a_live_sibling_takes_a_later_handoff(self):
         """Parent finished (done) BEFORE the child handed off; a live sibling keeps it in live_parents."""
@@ -35,7 +36,7 @@ class Attacks(Base):
         self._meta("a1111111", agentType="task-owner", finished=True)
         self._meta("sib", agentType="red-team", parentAgentId="a1111111")
         jl(w / "agent-sib.jsonl", [{"at": iso(later - 20), "event": "intent", "note": "still reviewing"}])
-        self._child_handoff("a1111111", NOW)  # handed off 50 min after the parent already returned
+        self._child_handoff("a1111111", NOW, depth=2)  # handed off 50 min after the parent already returned
         by = self._rows(later)
         self.assertIn("handoff-unacked", by["dropowner"]["flags"])  # expected safe behaviour
 
@@ -48,7 +49,7 @@ class Attacks(Base):
                               {"at": iso(NOW - 400), "event": "subagent_stop", "agent_id": "helperpar",
                                "agent_type": "general-purpose"}])
         jl(w / "agent-helperpar.jsonl", [{"at": iso(NOW - 400), "event": "status", "note": "waiting on a2222222"}])
-        self._child_handoff("helperpar", NOW)
+        self._child_handoff("helperpar", NOW, depth=2)
         by = self._rows(later)
         self.assertIn("handoff-unacked", by["dropowner"]["flags"])
 
