@@ -203,14 +203,14 @@ export type DesktopDoor = 'host' | 'delegated';
 /**
  * Polling reads the desktop app and its web shell issue on a timer (unread counts, notification list, remote-session availability,
  * the machine and org lists, the update check). For a bound session they take the same observation policy as the listed
- * zero-write reads: no ledger row (allowed or refused) and no last-use update, so a desktop left open does not write about 15
- * rows a minute per window for nothing. Bearer calls are unchanged. Real work (CRM reads and writes, enrollment, consent) is
- * always ledgered. goodqa#15561 ledger-load measurement.
+ * zero-write reads: no ledger row and no last-use update for a request that is ALLOWED, so a desktop left open does not write
+ * about 15 rows a minute per window for nothing. A REFUSED poll is still ledgered (the trail of a stolen session probing). Bearer
+ * calls are unchanged. Real work (CRM reads and writes, enrollment, consent) is always ledgered. The chat unread polls join this
+ * list when Messages is delegated (S1c). goodqa#15561 ledger-load measurement.
  */
 export const DESKTOP_POLL_ROUTES: ReadonlySet<string> = new Set([
   'GET /v1/me', 'GET /v1/orgs', 'GET /v1/notifications', 'GET /v1/notifications/unread-count', 'GET /v1/desktop/update-status',
   'GET /v1/me/machines', 'GET /v1/orgs/:p/machines', 'GET /v1/orgs/:p/machines/remote-sessions/availability',
-  'GET /v1/chat/unread-count', 'GET /v1/orgs/:p/chat/unread-count', 'GET /v1/chat/active',
 ]);
 export function isDesktopPollRoute(method: string, routePattern: string | undefined): boolean {
   return !!routePattern && DESKTOP_POLL_ROUTES.has(`${methodOf(method)} ${desktopRouteKey(routePattern)}`);

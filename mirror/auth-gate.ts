@@ -233,8 +233,9 @@ export function doorDetail(req: FastifyRequest): Record<string, unknown> {
 }
 
 export function refusal(req: FastifyRequest, token: UserTokenRow, routePattern: string | undefined, err: AppError): AppError {
-  // Observation refusals share the successful-request policy; other reads retain their denial audit.
-  if (ledgerQuiet(req, routePattern)) return err;
+  // Observation refusals share the successful-request policy; other reads retain their denial audit. A refused desktop poll is
+  // still written: it is the only trail of a stolen session probing.
+  if (isZeroWriteRead(req.method, routePattern)) return err;
   const client = normalizeClientTrace({ ip: requestClientIp(req), userAgent: req.headers['user-agent'] });
   req.server.trackBackgroundWork(recordUserTokenEvent(
     req.server.db,

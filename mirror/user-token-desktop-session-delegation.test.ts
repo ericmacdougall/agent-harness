@@ -243,12 +243,18 @@ describe('NEG-19: the platform kill switch and the token kinds', () => {
     expect((await inj('GET', '/v1/me', session.headers)).statusCode).toBe(401);
     await ctx.db.execute(sql`update platform_settings set value = 'true'::jsonb where key = 'userTokens.enabled'`);
 
-    for (const kind of ['oauth', 'operator', 'pairing']) {
+    for (const kind of ['oauth', 'pairing']) {
       const t = await bound(CRM_SESSION);
       await ctx.db.execute(sql`update user_tokens set created_via = ${kind} where id = ${t.token.id}::uuid`);
       const res = await inj('GET', crmUrl('/contacts'), t.session.headers);
       expect(res.statusCode, kind).toBe(401);
+      const ended = await ctx.db.select().from(sessions).where(and(eq(sessions.userId, w.owner.user.id), like(sessions.loginMethod, `user_token_desktop:${t.token.id}:%`)));
+      expect(ended.every((r) => r.revokedAt && r.revokedReason === 'user_token_ended'), kind).toBe(true);
     }
+    // the operator script mints an all-ability orchestrator token; a session bound to it is admitted (it can do what the token can)
+    const op = await bound(CRM_SESSION);
+    await ctx.db.execute(sql`update user_tokens set created_via = 'operator' where id = ${op.token.id}::uuid`);
+    expect((await inj('GET', crmUrl('/contacts'), op.session.headers)).statusCode).toBe(200);
     expect(token.id).toBeTruthy();
   });
 });
@@ -356,9 +362,13 @@ describe('AC-9 / NEG-13 / NEG-20 (D6, pulled forward: narrowing a token is untes
     const ok = await mint(w.owner, CRM_SESSION);
     expect((await inj('POST', '/v1/me/desktop-session', ok.headers, { client: 'desktop-ctl' })).statusCode).toBe(200);
     const noRead = await mint(w.owner, ['desktop_signin', 'crm']);
-    expect((await inj('POST', '/v1/me/desktop-session', noRead.headers, { client: 'desktop-ctl' })).statusCode).toBeGreaterThanOrEqual(400);
+    const r_noRead = await inj('POST', '/v1/me/desktop-session', noRead.headers, { client: 'desktop-ctl' });
+    expect(r_noRead.statusCode, r_noRead.body).toBe(403);
+    expect(codeOf(r_noRead)).toBe('user_token_ability_missing');
     const noSignin = await mint(w.owner, ['read', 'crm']);
-    expect((await inj('POST', '/v1/me/desktop-session', noSignin.headers, { client: 'desktop-ctl' })).statusCode).toBeGreaterThanOrEqual(400);
+    const r_noSignin = await inj('POST', '/v1/me/desktop-session', noSignin.headers, { client: 'desktop-ctl' });
+    expect(r_noSignin.statusCode, r_noSignin.body).toBe(403);
+    expect(codeOf(r_noSignin)).toBe('user_token_ability_missing');
   });
 
   it('a CRM-only session cannot enroll a machine or read the machines catalog; /v1/me, /v1/orgs and notification reads still work', async () => {
@@ -506,5 +516,10 @@ describe('ledger load (goodqa#15561): a desktop left open does not write a row p
     await inj('GET', crmUrl('/contacts'), session.headers);
     await new Promise((r) => setTimeout(r, 400));
     expect(await count()).toBe(rows0 + 2);
+    // a REFUSED poll is the trail of a stolen session: it is written
+    await ctx.db.update(userTokens).set({ abilities: ['desktop_signin', 'crm'] }).where(eq(userTokens.id, token.id));
+    expect((await inj('GET', '/v1/me', session.headers)).statusCode).toBe(403);
+    await new Promise((r) => setTimeout(r, 400));
+    expect(await count()).toBe(rows0 + 3);
   });
 });

@@ -19,11 +19,15 @@ export type BoundEndReason = 'malformed' | 'not_found' | 'rotated' | 'kind' | 'r
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * Token kinds that may be the bound token: a token the owner minted signed in (`session`) or, legacy, through a parent
- * token (`user_token`). `oauth` (an MCP grant), `commander_turn` (a server-created per-turn credential) and `operator` /
- * `pairing` (never produced for a token that can hold `desktop_signin`) are refused (goodqa#15561 Q9).
+ * Token kinds that may be the bound token: a token the owner minted signed in (`session`), legacy through a parent token
+ * (`user_token`), or by the operator script (`operator`: the orchestrator token, every ability, no expiry; a session bound to
+ * it can do nothing its owner-held token cannot do by bearer). `oauth` (an MCP grant, whose abilities cannot include
+ * `desktop_signin`), `commander_turn` (a server-created per-turn credential) and `pairing` are refused (goodqa#15561 Q9).
+ * `operator` is admitted because the operator script mints it with `desktop_signin` and the live desktop may be bound to one:
+ * refusing it would end that session on deploy. Defense in depth only, the token gate is the boundary (a legacy child minted
+ * by a parent token is `user_token` whatever the root).
  */
-export const BOUND_ALLOWED_CREATED_VIA: ReadonlySet<string> = new Set(['session', 'user_token']);
+export const BOUND_ALLOWED_CREATED_VIA: ReadonlySet<string> = new Set(['session', 'user_token', 'operator']);
 
 export async function loadBoundUserToken(db: DbOrTx, userId: string, tokenId: string, fingerprint: string, now = new Date()): Promise<BoundTokenLoad> {
   if (!UUID.test(tokenId) || !/^[0-9a-f]{16}$/.test(fingerprint)) return { ok: false, reason: 'malformed' };
