@@ -108,6 +108,25 @@ def code_signature() -> dict:
     return file_signature(paths)
 
 
+def code_changed(baseline: dict, now_sig: dict) -> bool:
+    """A file of the baseline changed or vanished. A module imported after the baseline (a lazy import) is not a change."""
+    return any(now_sig.get(k) != v for k, v in baseline.items())
+
+
+def uncompilable(baseline: dict, now_sig: dict):
+    """The first changed baseline file that does not compile, as 'name: error', else None. A restart onto a syntax error
+    would be a crash loop (launchd restarts it every 10 s), so the daemon stays on the code it has."""
+    for k, v in baseline.items():
+        if now_sig.get(k) != v:
+            try:
+                with open(k, "rb") as fh:
+                    source = fh.read(8 << 20)  # bounded: a hooks module is far smaller than this
+                compile(source, k, "exec")
+            except (OSError, SyntaxError, ValueError) as error:
+                return "%s: %s" % (Path(k).name, type(error).__name__)
+    return None
+
+
 def home() -> Path:
     return peek.home()
 
@@ -820,7 +839,9 @@ class Daemon:
                          name="ahd-memory-guard", daemon=True).start()
         period = float(self.policy.get("tick_seconds", 60))
         log.info("ahd started pid %s host %s", os.getpid(), self.host)
-        started_code = code_signature()
+        baseline = None   # taken after the first tick: modules imported lazily inside a tick are part of the baseline
+        pending = None    # a changed signature must hold for two consecutive ticks (a half-finished install is not stable)
+        blocked = None    # a changed signature whose files do not compile: keep running the old code until it changes again
         while not self.stop.is_set():
             t0 = mono()
             try:
@@ -829,10 +850,25 @@ class Daemon:
                     "sessions", "owners", "asks_open", "desired", "transitions", "sent", "wall_s")}))
             except Exception as exc:  # never crash-loop
                 log.error("tick failed: %s", type(exc).__name__)
-            if code_signature() != started_code:
-                self.release()
-                log.info("ahd: its source changed since start; exiting %s so the service manager starts the new code", EXIT_RELOAD)
-                return EXIT_RELOAD
+            sig = code_signature()
+            if baseline is None:
+                baseline = sig
+            elif code_changed(baseline, sig):
+                if sig == blocked:
+                    pass
+                elif sig != pending:
+                    pending = sig
+                else:
+                    bad = uncompilable(baseline, sig)
+                    if bad:
+                        blocked = sig
+                        log.error("ahd: changed source does not compile (%s); keeping the running code", bad)
+                    else:
+                        self.release()
+                        log.info("ahd: its source changed since start; exiting %s so the service manager starts the new code", EXIT_RELOAD)
+                        return EXIT_RELOAD
+            else:
+                pending = blocked = None
             self.stop.wait(max(1.0, period - (mono() - t0)))
         self.release()
         log.info("ahd stopped")

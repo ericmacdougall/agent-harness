@@ -498,6 +498,23 @@ class NarrowedScope(KillBase):
         with mock.patch.object(ak, "session_ancestor", lambda *a, **k: 77):
             self.run_kill(probe, [1104], foreign=True, reason="stop my own preview server")
         self.assertEqual(self.notices[0]["severity"], "info", self.notices[0])
+        self.assertEqual(self.notices[0]["key"], "ah-kill:foreign:sess-1:own")
+
+    def test_a_later_info_stop_never_overwrites_an_active_high_alert(self):
+        """Red-team finding 3: a high and an info row shared one key, so the later info row hid the high one."""
+        self.run_kill(self.foreign(1105), [1105], foreign=True, reason="runaway pytest of another owner")
+        probe = self.foreign(1106)
+        probe.session_env = lambda pid: "sess-1"
+        with mock.patch.object(ak, "session_ancestor", lambda *a, **k: 77):
+            self.run_kill(probe, [1106], foreign=True, reason="stop my own preview server")
+        high, info = self.notices[0], self.notices[1]
+        self.assertEqual((high["severity"], info["severity"]), ("high", "info"))
+        self.assertNotEqual(high["key"], info["key"])
+
+    def test_who_does_not_collide_agents_without_a_session(self):
+        self.assertNotEqual(ak._who("", "agent-a0680533ff30cf6d4"), ak._who("", "agent-a1a19164ed8810a48"))
+        self.assertEqual(ak._who("sess-1", "agent-x"), "sess-1")
+        self.assertEqual(ak._who("", ""), "nosession")
 
     def test_failed_notice_means_no_signal(self):
         probe = self.foreign(1102)

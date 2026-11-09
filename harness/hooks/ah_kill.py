@@ -86,7 +86,7 @@ def _clip(text: str, limit: int = MAX_CMD) -> str:
 def _who(session, agent) -> str:
     """The caller part of an aggregated ops-watch alert key: one row per caller session (else agent), not one per run.
     Characters outside the ring key alphabet are dropped."""
-    raw = str(session or agent or "nosession")[:8]
+    raw = str(session)[:12] if session else (str(agent)[:40] if agent else "nosession")
     return re.sub(r"[^A-Za-z0-9._-]", "", raw) or "nosession"
 
 
@@ -696,7 +696,7 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
         # aggregated row per caller session either way, so 40 stops are one alert, not 40.
         own_session = bool(session) and all(r.get("owner_session") == session for r in foreign_live)
         event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "info" if own_session else "high",
-                 "check": "ah-kill", "key": "ah-kill:foreign:" + _who(session, agent),
+                 "check": "ah-kill", "key": "ah-kill:foreign:" + _who(session, agent) + (":own" if own_session else ""),
                  "message": "ah kill --foreign stopped/will stop %d process(es) outside the caller's tree: %s (reason: %s)" % (
                      len(foreign_live), ", ".join(str(r["pid"]) for r in foreign_live), _clip(reason, 120)),
                  "detail": {"run": run_id, "caller": caller, "reason": _clip(reason, 200), "targets": [
