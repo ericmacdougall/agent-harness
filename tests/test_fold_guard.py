@@ -241,6 +241,9 @@ class FoldCase(unittest.TestCase):
                  ("close #14518", "wait on this, close #14518 later"), ("close #14518", "pause: close #14518 when I say"),
                  ("close #14518", "close everything but #14518, close #14518"),
                  ("Close #14518.", "Close #14518. Actually keep it open."), ("Close #14518.", "Close #14518. Never mind."),
+                 ("close #14518", "close #14518 next week"), ("close #14518", "we should eventually close #14518"),
+                 ("close #14518", "I might close #14518 as a duplicate"),
+                 ("close #14518", "close #14518. Let me think about it first."),
                  ("close harness-other#14518", "close harness-other#14518")]  # another project's ticket with the same number
         for excerpt, turn in cases:
             note = "x\nFold-Override: queue:%s/2026-11-09T22:39:59.349Z#0f7f79687b56 \"%s\"" % (uuid.uuid4(), excerpt)

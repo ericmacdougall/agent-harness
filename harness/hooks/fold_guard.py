@@ -34,7 +34,7 @@ UNCHECKED = re.compile(r"(?m)^[ \t]*(?:[-*+]|\d{1,3}[.)])[ \t]+\[ {1,2}\][ \t]+(
 FOLD_WORDS = re.compile(r"\b(?:fold(?:ed|ing)?|clos(?:e|ed|ing)|won'?t[ -]?fix|duplicate|drop(?:ped)?|abandon\w*|cancel\w*|"
                         r"supersed\w*|no longer (?:needed|wanted)|not needed)\b", re.I)
 FOLD_NEGATION = re.compile(r"\b(?:not|never|don'?t|do not|keep|stop|unless|if|without|leave|reopen|no|once|after|before|when|"
-                           r"while|until|later|wait|pause|hold|defer|but|only|except|pending|tomorrow|soon)\b|n't\b", re.I)
+                           r"while|until|later|wait|pause|hold|defer|but|only|except|pending|tomorrow|soon|might|maybe|should|eventually|next|think|unsure|consider\w*|hmm|perhaps)\b|n't\b", re.I)
 FOLD_RETRACT = re.compile(r"\b(?:never ?mind|scratch that|actually|hold on|belay|forget (?:it|that)|on second thought)\b", re.I)
 PRIORITY_RANK ={"immediate": 4, "urgent": 3, "high": 2, "medium": 1, "low": 0, "none": 0}
 PENDING_NOTE = re.compile(r"(?m)^[ \t]*PENDING_REAL_TEST[ \t]+([A-Za-z0-9][A-Za-z0-9._-]{0,40})[ \t]*:")
@@ -153,7 +153,8 @@ def unmet_items(issue: dict, comments: list, spec_view=None, extra_pending=()) -
             items.append({"kind": "pending", "id": ident, "text": f"PENDING_REAL_TEST {ident} is still open"})
     if str(issue.get("priority") or "").lower() in HIGH:
         items.append({"kind": "priority", "id": "priority",
-                      "text": f"priority is {issue.get('priority')} and there is no DONE_LIVE evidence"})
+                      "text": f"priority is {issue.get('priority')}: a P0 or P1 is carried to an equal-priority umbrella or "
+                              "folded only on the user's own words"})
     return items
 
 
