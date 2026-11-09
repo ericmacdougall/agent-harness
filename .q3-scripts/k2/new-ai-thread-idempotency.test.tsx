@@ -86,7 +86,7 @@ it.each(Object.keys(closers) as (keyof typeof closers)[])('AC-5: %s closes a pen
 });
 
 it('NEG-8: a late success after cancel opens nothing and shows no error, but the list learns the thread', async () => {
-  const { qc, onCreated } = setup();
+  const { qc, onCreated, invalidate } = setup();
   open();
   type('Plan my week');
   submit();
@@ -99,6 +99,7 @@ it('NEG-8: a late success after cancel opens nothing and shows no error, but the
   expect(screen.queryByRole('alert')).toBeNull();
   const cached = qc.getQueryData<{ pages: { threads: { id: string }[] }[] }>(['messaging', 'ai-threads', 'org', 'me']);
   expect(cached!.pages[0]!.threads.map((row) => row.id)).toEqual(['late']);
+  expect(invalidate).toHaveBeenCalledWith(expect.objectContaining({ queryKey: ['messaging', 'ai-threads', 'org'] }));
 });
 
 it('AC-6: the request id follows the draft: same text reuses it, a new text or scope rotates it, success clears both', async () => {
@@ -279,4 +280,36 @@ it('changing org while a create is pending abandons it: no callback runs for the
   await waitFor(() => expect(textarea().disabled).toBe(false));
   expect(textarea().value).toBe('');
   expect(onCreated).not.toHaveBeenCalled();
+});
+
+it('K2-RT-4: a close in the same batch as the submit still aborts and tells the user', async () => {
+  setup();
+  open();
+  type('Same tick');
+  act(() => {
+    submit();
+    closers['the Cancel button']();
+  });
+  await waitFor(() => expect(calls).toHaveLength(1));
+  expect(calls[0]!.signal!.aborted).toBe(true);
+  expect(screen.getByTestId('ai-thread-stopped-notice').textContent).toContain(STOPPED);
+});
+
+it('K2-RT-3: the status region exists before the notice, and Dismiss returns focus to New thread', async () => {
+  setup();
+  const region = screen.getByTestId('ai-thread-stopped-notice');
+  expect(region.getAttribute('role')).toBe('status');
+  expect(region.textContent).toBe('');
+  open();
+  type('Plan');
+  submit();
+  await waitFor(() => expect(calls).toHaveLength(1));
+  act(() => closers['the Cancel button']());
+  await waitFor(() => expect(screen.getByTestId('ai-thread-stopped-notice')).toBe(region));
+  expect(region.textContent).toContain(STOPPED);
+  const dismiss = screen.getByRole('button', { name: 'Dismiss' });
+  dismiss.focus();
+  fireEvent.click(dismiss);
+  expect(region.textContent).toBe('');
+  expect(document.activeElement).toBe(newThreadButton());
 });

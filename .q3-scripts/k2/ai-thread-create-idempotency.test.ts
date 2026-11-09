@@ -2,9 +2,10 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { and, eq, sql } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
 import { aiThreads, chatConversationMembers, chatConversations, chatMessages, commanderSettings, organizations, orgMembers, platformSettings, qacTurns } from '@bugtracker/db';
-import { createOrg, createTestApp, resetDb, signupUser, type TestContext } from './helpers';
+import { createOrg, createTestApp, resetDb, signupUser, waitForBlockedLockWaiters, type TestContext } from './helpers';
 import { canonicalCommander } from './commander-fixture';
 import { createAiThread, updateAiThread } from '../src/modules/messaging/ai-thread-lifecycle';
+import { messageRequestHash } from '../src/modules/messaging/messages';
 
 /**
  * goodqa#14903 K2 (Kimi create-hang): POST /v1/orgs/:orgId/ai-threads with an optional clientRequestId is idempotent.
@@ -275,5 +276,90 @@ describe('K2 idempotent AI thread create', () => {
     expect(retry.statusCode).toBe(plain.statusCode);
     expect(retry.json().error.code).toBe(plain.json().error.code);
     void owner;
+  });
+  it('NEG-15 (K2-RT-1): a retry after the owner history floor rose above the first message is a conflict that shows nothing', async () => {
+    const { owner, org } = await world();
+    const key = randomUUID();
+    const a = await post(owner.headers, org.id, { message: 'Hidden first', clientRequestId: key });
+    const id = (a.json() as { conversation: { id: string } }).conversation.id;
+    await ctx.db.update(chatConversationMembers).set({ historyFromSeq: 1000 })
+      .where(and(eq(chatConversationMembers.conversationId, id), eq(chatConversationMembers.userId, owner.user.id)));
+    const res = await post(owner.headers, org.id, { message: 'Hidden first', clientRequestId: key });
+    expect(res.statusCode, res.body).toBe(409);
+    expect(res.json().error.code).toBe('client_request_conflict');
+    expect(res.body).not.toContain('Hidden first');
+    expect(res.body).not.toContain(id);
+  });
+
+  it('K2-RT-6: a key a later message of an own thread reused is a conflict, not a replay of that thread', async () => {
+    const { owner, org } = await world();
+    const thread = await post(owner.headers, org.id, { message: 'Start' });
+    const id = (thread.json() as { conversation: { id: string } }).conversation.id;
+    const key = randomUUID();
+    const later = await ctx.app.inject({ method: 'POST', url: `/v1/chat/conversations/${id}/messages`, headers: owner.headers, payload: { body: 'Later', clientMsgId: key } });
+    expect(later.statusCode, later.body).toBeLessThan(300);
+    const res = await post(owner.headers, org.id, { message: 'Later', clientRequestId: key });
+    expect(res.statusCode, res.body).toBe(409);
+    expect(res.json().error.code).toBe('client_request_conflict');
+  });
+
+  it('NEG-14 race (K2-RT-2): a send that takes the key after the lookup never lends its message to the new thread', async () => {
+    const { owner, org } = await world();
+    const other = await createAiThread(ctx.db, owner.user.id, org.id, { message: 'Same' });
+    const otherMessageId = other.message!.id;
+    const key = randomUUID();
+    const hash = messageRequestHash({ body: 'Same', urgency: 'normal', mentions: [], attachmentIds: [], linkedIssueIds: [], linkedMeetingIds: [] });
+    // Inside the create transaction, after its lookup (the conversation insert comes later), the other message takes
+    // the key with a matching hash: exactly what a concurrent ordinary send committing at that moment looks like to
+    // appendMessage's own lookup. Values are a uuid and a hex digest made here, not input.
+    expect(key).toMatch(/^[0-9a-f-]{36}$/);
+    expect(String(hash)).toMatch(/^[0-9a-f]+$/);
+    await ctx.db.execute(sql.raw(`create or replace function k2_race_take_key() returns trigger language plpgsql as $f$ begin
+      update chat_messages set client_msg_id = '${key}', client_request_hash = '${hash}' where id = '${otherMessageId}'; return new; end $f$`));
+    await ctx.db.execute(sql.raw('create trigger k2_race_take_key after insert on chat_conversations for each row execute function k2_race_take_key()'));
+    try {
+      const before = await counts();
+      const res = await post(owner.headers, org.id, { message: 'Same', clientRequestId: key });
+      expect(res.statusCode, res.body).toBe(409);
+      expect(res.json().error.code).toBe('client_request_conflict');
+      expect(await counts()).toEqual(before);
+    } finally {
+      await ctx.db.execute(sql.raw('drop trigger if exists k2_race_take_key on chat_conversations'));
+      await ctx.db.execute(sql.raw('drop function if exists k2_race_take_key()'));
+    }
+  });
+
+  it('NEG-14 race (K2-RT-2): a send holding the key uncommitted makes the create a conflict, not a 500', async () => {
+    const { owner, org } = await world();
+    const other = await createAiThread(ctx.db, owner.user.id, org.id, { message: 'Other' });
+    const key = randomUUID();
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    let held!: () => void;
+    const holding = new Promise<void>(r => { held = r; });
+    const holder = ctx.db.transaction(async (tx) => {
+      // client_msg_id and client_request_hash are set together (chat_messages_client_msg_hash_pairing_check).
+      const otherHash = messageRequestHash({ body: 'Other', urgency: 'normal', mentions: [], attachmentIds: [], linkedIssueIds: [], linkedMeetingIds: [] });
+      await tx.update(chatMessages).set({ clientMsgId: key, clientRequestHash: otherHash }).where(eq(chatMessages.id, other.message!.id));
+      held();
+      await gate;
+    });
+    await holding;
+    const before = await counts();
+    const pending = post(owner.headers, org.id, { message: 'Fresh', clientRequestId: key });
+    // The create's lookups cannot see the uncommitted key, so it inserts and waits on the unique index.
+    await waitForBlockedLockWaiters(ctx.db, 1);
+    release();
+    await holder;
+    const res = await pending;
+    expect(res.statusCode, res.body).toBe(409);
+    expect(res.json().error.code).toBe('client_request_conflict');
+    expect(await counts()).toEqual(before);
+  });
+
+  it('K2-RT-5: a non-finite lock timeout option is refused before any SQL', async () => {
+    const { owner, org } = await world();
+    await expect(createAiThread(ctx.db, owner.user.id, org.id, { message: 'x', clientRequestId: randomUUID() }, { lockTimeoutMs: Number.NaN }))
+      .rejects.toThrow('lockTimeoutMs must be a finite number');
   });
 });

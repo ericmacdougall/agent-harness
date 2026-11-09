@@ -19,7 +19,7 @@ LOOKUP = (
     "        .where(and(eq(chatMessages.authorId, userId), eq(chatMessages.clientMsgId, key))).limit(1);\n"
     "      if (prior) return replayOrConflict(tx, userId, orgId, input, prior);\n"
 )
-LOCK_SET = "    if (key !== undefined) await tx.execute(sql.raw(`set local lock_timeout = '${lockTimeoutMs}ms'`));\n"
+LOCK_SET = "    let priorLockTimeout: string | undefined;\n"
 
 
 def v1(s: str) -> str:
@@ -37,16 +37,34 @@ def v2(s: str) -> str:
     return s.replace(old, "  const prepared = { body: message }; void prepareConversationCredentialBody; void conversationId; void db;\n")
 
 
-VARIANTS = [('lookup-before-lock', v1, 'AC-3'), ('hash-raw-body', v2, 'NEG-13')]
+def drop(old: str, new: str = ''):
+    def fn(s: str) -> str:
+        assert s.count(old) == 1, old[:60]
+        return s.replace(old, new)
+    return fn
+
+
+VARIANTS = [
+    ('lookup-before-lock', v1, 'AC-3'),
+    ('hash-raw-body', v2, 'NEG-13'),
+    ('no-replayed-guard', drop("    if (key !== undefined && sent?.replayed) throw conflict();\n"), 'send that takes the key'),
+    ('no-unique-mapping', drop("    if (key !== undefined && isUniqueViolation(error, 'chat_messages_client_msg_uq')) throw conflict();\n"), 'holding the key uncommitted'),
+    ('no-floor-check', drop("    await assertMessageHistoryReadable(tx, conversation.id, prior.seq, userId);\n"), 'history floor'),
+    ('no-first-message-check', drop("  if (prior.seq === null || Number(first?.seq) !== Number(prior.seq)) throw conflict();\n"), 'K2-RT-6'),
+]
 
 
 def main() -> int:
     orig = open(F, 'rb').read()
+    if len(orig) < 1000:
+        sys.exit(f'refusing: {F} is only {len(orig)} bytes, not a real original')
     digest = hashlib.sha256(orig).hexdigest()
     rc_all = 0
     for name, fn, test in VARIANTS:
-        open(F, 'w').write(fn(orig.decode()))
+        # Build the variant first: open(F, 'w') truncates, so it must never run before fn can fail.
+        variant = fn(orig.decode())
         try:
+            open(F, 'w').write(variant)
             log = f'{LOG}.{name}.log'
             with open(log, 'w') as out:
                 rc = subprocess.run(

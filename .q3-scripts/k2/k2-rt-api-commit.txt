@@ -1,0 +1,33 @@
+fix(messaging): K2 replay honours the history floor and the first message
+
+Why: the K2 red-team (goodqa#14903) found that a retry with the same
+clientRequestId replayed the first message even after the owner's history
+floor had risen above it (spec NEG-15 wants 409), that a later message
+which reused the key could be replayed as the thread's first message, that
+the lock timeout was set by string and reset to the server default rather
+than the prior value, and that no test reached the NEG-14 race guards.
+
+What: replayOrConflict now requires the matched message to be the
+conversation's first message and readable under the caller's history floor
+(assertMessageHistoryReadable); otherwise 409 client_request_conflict. The
+lock timeout uses set_config with a bound value and restores the value in
+effect before; a non-finite lockTimeoutMs option is refused. New tests: the
+floor case, a later message reusing the key, both NEG-14 races (a trigger
+that takes the key after the lookup; an uncommitted insert holding it) and
+the non-finite option.
+
+Testing: `pnpm --filter @bugtracker/api exec vitest run test/ai-thread-create-idempotency.test.ts`
+on a pgpool lease on t2-dev -> before this fix 3 failed, 17 passed (floor,
+later message, non-finite option; the two race tests pass because the
+guards exist); after 20 passed.
+`python3 ~/wt/aab3-k2-variants.py` -> exit 0, 6 of 6 broken variants caught
+(lookup before lock, raw-body hash, no replayed guard, no unique mapping,
+no floor check, no first-message check).
+NEIGHBOURS_RESULT
+TSC_RESULT
+
+Refs: GoodQA #14903
+
+Risk: API only, additive to cacc75fc; rollback is a revert of this commit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
