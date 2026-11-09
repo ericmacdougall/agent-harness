@@ -180,6 +180,8 @@ class Assent(unittest.TestCase):
                       'fable can write about it', 'have fable skip it', 'i want astra audited', 'i have seen astra break layouts',
                       'we have used fable before', 'i get astra confused with fable', 'you have astra in the list',
                       'i want astra and fable compared in the report', 'i want astra on hold',
+                      'have fable do nothing', 'have fable do none of it', 'i want fable to be faster',
+                      'get fable to the top of the list',  # acceptance review a9e06f96 A1
                       # the user's own 2026-11-09 sentence is conditional, so it stays refused (TARGET_MISMATCH, see the spec)
                       'fable/opus can take over design work too if astras had a couple passes'):
             with self.subTest(words=words):

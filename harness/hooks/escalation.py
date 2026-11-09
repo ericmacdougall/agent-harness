@@ -608,13 +608,15 @@ _MODEL = r"(?:fable|astra|top[ -](?:writing[ -])?(?:rung|model|tier))"
 _FILLER = r"^(?:(?:ok|okay|yes|yeah|yep|so|and|then|also|please|just|now)[,\s]+)*"
 TOP_REQUEST_NEAR = re.compile(
     _FILLER + r"(?:i\s+(?:just\s+|really\s+|also\s+)*)?(?:have|want|get|run)(?:\s+[\w'/-]+){0,2}?\s+" + _MODEL + r"(?:/[\w-]+)?"
-    r"(?=\s+(?:on|to|do|handle|take|lead|start|own|work|design|build|write|for|first|this|that|it|all|every|each|the)\b)", re.I)
+    r"(?=\s+(?:on|to\s+(?:do|handle|take|lead|start|own|work|design|build|write)|do|handle|take|lead|start|own|work|design|"
+    r"build|write|for|first|this|that|it|all|every|each|the)\b)", re.I)
 TOP_CAN = re.compile(
     _FILLER + r"(?:(?:opus|sonnet|codex|haiku)(?:\s*[/,]\s*|\s+(?:and|or)\s+))*" + _MODEL +
     r"(?:\s*[/,]\s*[\w-]+|\s+(?:and|or)\s+[\w-]+)?\s+can\s+(?:take\s+over|take|lead|handle|start|own|do\s+(?:the|this|it|that))\b", re.I)
 TOP_NEGATION_NEW = re.compile(r"\b(?:stopp(?:ed|ing)|kill\w*|cancell?\w*|remov\w*|ban(?:ned|s)?|paus\w*|gone|rid|shut\w*|hold|"
                               r"uninstall\w*|down|out|drop\w*|skip\w*|but|only|after|once|when|while|since|because|although|"
-                              r"though|until|before|know|why|how|about|bill\w*|cost\w*|credits?)\b", re.I)
+                              r"though|until|before|know|why|how|about|bill\w*|cost\w*|credits?|nothing|none|neither|nor|"
+                              r"faster|slower|better|worse|list)\b", re.I)
 _SENTENCES = re.compile(r"(?<=[.!?;])\s+|\n+")
 TOP_RETRACT = re.compile(r"\b(?:never ?mind|scratch that|forget (?:it|that)|hold (?:on|off)|belay)\b", re.I)
 
