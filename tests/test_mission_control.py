@@ -342,6 +342,18 @@ class OwnersPoll(Tmp):
         self.assertEqual(change[-1]["summary"], "aaef3bc7aaaa DROPPED → live")
 
 
+class LaunchAgent(unittest.TestCase):
+    def test_plist_is_well_formed_with_xml_characters_in_paths(self):
+        import plistlib
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"MC_HOME": str(Path(tmp) / "a&b<c>")}):
+            data = plistlib.loads(mcs.plist_text(47615, "/usr/bin/python3").encode())
+        self.assertEqual(data["Label"], "com.agent-harness.mission-control")
+        self.assertEqual(data["ProgramArguments"][1:], [str(mcs.HERE / "server.py"), "serve", "--port", "47615"])
+        self.assertTrue(data["EnvironmentVariables"]["MC_HOME"].endswith("a&b<c>"))
+        self.assertTrue(data["KeepAlive"])
+        self.assertTrue(data["StandardErrorPath"].endswith("a&b<c>/log/launchd.err.log"))
+
+
 class Schema(unittest.TestCase):
     def test_made_events_validate_and_bad_ones_do_not(self):
         good = ev.make("push", "github", "x", eid="github:1", subject={"repo": "a/b"})

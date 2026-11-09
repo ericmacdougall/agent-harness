@@ -675,6 +675,30 @@
    "rules": [
     "S18"
    ]
+  },
+  {
+   "id": "mc_inbox:stop",
+   "script": "mc_inbox.py",
+   "arg": "hook",
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "mc_inbox:prompt",
+   "script": "mc_inbox.py",
+   "arg": "hook",
+   "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
   }
  ]
 }

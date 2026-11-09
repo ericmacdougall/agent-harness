@@ -548,24 +548,23 @@ def launch_url(port: int) -> str:
 
 
 def plist_text(port: int, python: str) -> str:
+    """The LaunchAgent, built with plistlib so a path with XML characters cannot change its structure."""
+    import plistlib
     root = mc_chat.home()
     path = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:" + str(Path.home() / ".local" / "bin")
-    args = "".join(f"<string>{a}</string>" for a in (python, str(HERE / "server.py"), "serve", "--port", str(port)))
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>{LABEL}</string>
-<key>ProgramArguments</key><array>{args}</array>
-<key>EnvironmentVariables</key><dict><key>PATH</key><string>{path}</string></dict>
-<key>RunAtLoad</key><true/>
-<key>KeepAlive</key><true/>
-<key>ThrottleInterval</key><integer>15</integer>
-<key>ProcessType</key><string>Background</string>
-<key>LowPriorityIO</key><true/>
-<key>StandardOutPath</key><string>{root}/log/launchd.out.log</string>
-<key>StandardErrorPath</key><string>{root}/log/launchd.err.log</string>
-</dict></plist>
-"""
+    data = {
+        "Label": LABEL,
+        "ProgramArguments": [python, str(HERE / "server.py"), "serve", "--port", str(int(port))],
+        "EnvironmentVariables": {"PATH": path, "MC_HOME": str(root)},
+        "RunAtLoad": True,
+        "KeepAlive": True,  # restarts after a crash; a taken port fails loudly in the log every ThrottleInterval
+        "ThrottleInterval": 15,
+        "ProcessType": "Background",
+        "LowPriorityIO": True,
+        "StandardOutPath": str(root / "log" / "launchd.out.log"),
+        "StandardErrorPath": str(root / "log" / "launchd.err.log"),
+    }
+    return plistlib.dumps(data).decode("utf-8")
 
 
 def plist_path() -> Path:
@@ -584,9 +583,14 @@ def cmd_install(args) -> int:
     target.parent.mkdir(parents=True, exist_ok=True)
     mc_chat.atomic_write(target, text.encode("utf-8"))
     os.chmod(target, 0o644)
-    subprocess.run(["launchctl", "bootout", f"{domain}/{LABEL}"], capture_output=True)
-    done = subprocess.run(["launchctl", "bootstrap", domain, str(target)], capture_output=True, text=True)
-    if done.returncode != 0:
+    subprocess.run(["launchctl", "bootout", f"{domain}/{LABEL}"], capture_output=True, timeout=30)
+    for attempt in range(4):  # bootstrap right after bootout can fail with EIO while the old job is still exiting
+        done = subprocess.run(["launchctl", "bootstrap", domain, str(target)], capture_output=True, text=True,
+                              timeout=30)
+        if done.returncode == 0:
+            break
+        time.sleep(1 + attempt)
+    else:
         print(f"launchctl bootstrap failed: {done.stderr.strip()[:300]}", file=sys.stderr)
         return 1
     print(f"installed {LABEL}: start/stop with `launchctl kickstart -k {domain}/{LABEL}` / "
@@ -599,7 +603,7 @@ def cmd_uninstall(args) -> int:
     if not args.apply:
         print(f"would run launchctl bootout {domain}/{LABEL} and remove {plist_path()}")
         return 0
-    subprocess.run(["launchctl", "bootout", f"{domain}/{LABEL}"], capture_output=True)
+    subprocess.run(["launchctl", "bootout", f"{domain}/{LABEL}"], capture_output=True, timeout=30)
     try:
         plist_path().unlink()
     except OSError:
