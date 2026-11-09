@@ -16,6 +16,16 @@ PATTERNS = [
     ('main/coordinator decision note', r'^Decision \(made by main/coordinator'),
     ('red-team round note', r'^Red-team (round|delta)'),
     ('lane stuck auto-decider notice', r'^Lane \S+ is stuck: the auto-decider'),
+    ('cleanup stamp (this program)', r'^cleanup-2026-11'),
+    ('restore note (this program)', r'^goodqa#\d+ restore'),
+    ('lifecycle bot', r'^\*\*Ticket lifecycle:'),
+    ('status report block', r'^\*\*Status \(|^\*\*Status\b|^Status \('),
+    ('bot html-marker comment', r'^<!-- (inventory-bot|bugfix-fleet|gorunner-status|bucket\d-bugfix|stagec-land|bug-triage)'),
+    ('inventory bot', r'^\[inventory-bot\]'),
+    ('ahd notice', r'^ahd:'),
+    ('spec evidence record', r'^\*\*Evidence\*\* for AC-'),
+    ('autopilot note', r'^\*\*goodqa autopilot\*\*'),
+    ('owner checkpoint or pickup post', r'^(Checkpoint|CHECKPOINT|Test-hygiene checkpoint|Fable checkpoint|Pickup:|Commits on branch|Branch [\w/.-]+ pushed|PR-[A-C] |Live on |Fix in progress on branch|[A-Z]\d+ committed|Delivering |Round \d+ review|Also red on main|dev-decom \(|Orphan-ticket sweep|Knowledge-net PR|\*\*Prod move runbook|Merged to main \(|Test-hygiene follow-ups|Checkpoint \d)'),
     ('routing note', r'^Routing \((coordinator|GoodQA Desk)'),
 ]
 CP = [(n, re.compile(p)) for n, p in PATTERNS]
