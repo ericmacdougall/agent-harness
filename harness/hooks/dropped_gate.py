@@ -191,7 +191,8 @@ def cap_waits(session: str, undisposed: list, now: float | None = None) -> bool:
         import tier_gate  # noqa: PLC0415
         policy = model_tiers.load_policy()
         cap = int((policy.get("caps") or {}).get("session_owner_agents") or 0)
-        return cap > 0 and len(tier_gate.live_owner_ids(session, policy)) >= cap
+        # the same count succeed uses: live owners plus other streams whose ready or launched successor is not live yet
+        return cap > 0 and len(tier_gate.live_owner_ids(session, policy)) + len(successor.pending_agents(rows, stamp)) >= cap
     except Exception:  # noqa: BLE001 - no successor module or an unreadable log: the valve stays shut
         return False
 

@@ -340,6 +340,22 @@ class GateTests(Base):
         self.cap_row("dropowner2")
         self.assertNotEqual(self.stop_with_cap().get("decision"), "block")
 
+    def test_the_gate_counts_pending_successors_the_way_succeed_does(self):
+        # acceptance review N2: 3 live owners plus 1 ready successor of another stream is a full cap of 4 for both
+        self.cap_row("dropowner")
+        self.cap_row("another", status="ready", at=NOW - 60)
+        self.assertNotEqual(self.stop_with_cap(live=3, cap=4).get("decision"), "block")
+        self.assertEqual(self.stop_with_cap(live=2, cap=4).get("decision"), "block")
+
+    def test_a_refreshed_cap_wait_reopens_the_valve_after_the_old_one_aged_out(self):
+        # acceptance review N1: the valve closes at 30 minutes, and succeed writes a fresh row once the wait is 10 minutes old
+        import successor
+        self.cap_row("dropowner", at=NOW - 2400)
+        self.assertEqual(self.stop_with_cap().get("decision"), "block")
+        self.cap_row("dropowner", at=NOW - 60)  # what succeed appends on its next call
+        self.assertNotEqual(self.stop_with_cap().get("decision"), "block")
+        self.assertEqual(successor.open_request(successor.read_requests(self.home, SESSION), "dropowner", NOW)["at"], NOW - 60)
+
     def test_a_freed_slot_closes_the_valve(self):
         # acceptance review F1: a cap_wait must not excuse the Stop once a slot is free
         self.cap_row("dropowner")
