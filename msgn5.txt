@@ -1,0 +1,8 @@
+fix(videos): red-team fixes for the phone bar and sheet
+
+Why: Red-team review of PR #9 found the bar cut off the lesson count for long filter names, the bar stayed reachable by keyboard behind the open sheet, the browse list was marked as a dialog, the title was hidden under the sticky player right after choosing a lesson, and the bar showed a count for a progress filter that was not yet applied.
+What: Only the filter name is shortened in the bar; the count and arrow always show. The bar is inert while the sheet is open, and the dialog role, modal flag and popup semantics apply only to the open sheet. After choosing a lesson the page starts just under the bar and focus moves to the title. While progress loads the bar says "loading" instead of a count, and says "progress filter off" if it fails. The bar gets a descriptive accessible name. The video frame is 16:9 from the start so scroll anchoring no longer moves the view when the poster loads.
+Testing: `python test/mobile/mobile_check.py` on the t2-dev staged 238-lesson preview -> 401 passed, 0 failed; `npm test` -> 146 passed.
+Refs: GoodQA #15486
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

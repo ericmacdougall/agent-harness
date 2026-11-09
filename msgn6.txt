@@ -1,0 +1,8 @@
+chore(scratch): keep the red-team fix commit message draft
+
+Why: The owner worktree must stay clean; this is the message draft for the red-team fixes on the private phone-navigation PR #9.
+What: Add msgn5.txt, the commit message used for the pushed fix commit.
+Testing: not run: text file, checked with commit_policy.py check-message.
+Refs: none (chore: scratch draft, no product code)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
