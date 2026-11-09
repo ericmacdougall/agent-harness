@@ -1,0 +1,30 @@
+ADVERSARIAL DELTA REVIEW: goodqa#15561 spec v4 (core 61d1740f) -> v4.1 (core 5ff58988), the 42-line diff only
+Reviewer: agent-a0e0378fdb6d0d338. Read-only. No tests or probes run.
+VERDICT: ACCEPT. M1, M2, L1, L2 and L3 are closed, and nothing is weakened. One new low finding is raised by the M2 fix.
+
+M1 closed:
+  "while the platform switch `userTokens.sessionActions` is off, its default, a token CAN mint a legacy child, so the live token's `created_via` and `created_by_token_id` are read from metadata and the proof requires `created_via = session` with no parent"
+  This matches user-token-policy.ts:663 and service.ts:582.
+
+M2 closed:
+  "the production live proof may reuse an existing token only if an operator reads its metadata and it is EXACTLY the abilities `desktop_signin` + `read` + `crm`, `created_via = session`, no parent ... otherwise the owner mints a fresh "Desktop app: view CRM" token."
+  AC-12 adds: "records ... the token's abilities, `created_via` and `created_by_token_id` (metadata only)".
+  An operator or Everything token can no longer satisfy the oracle.
+
+L1 closed:
+  "A token without `read` cannot start a session (AC-9; `write` is not required to start one, D6)".
+
+L2 closed:
+  "Registered human step and rollback criterion (Q9): ... registered as an ask before the deploy; #1319 is rolled back rather than leaving the mini without remote routes if that re-sign-in is not done."
+
+L3 closed:
+  one Q7 sentence. "contact detail becomes reachable ...; the contact TIMELINE stays behind its existing session-action control ... by main's decision (comment 59a46886...)".
+  The provenance is split correctly: the user's answer covers opening contact detail, and main's comment covers keeping the timeline control.
+
+N1 [LOW, new, raised by the M2 fix; live-procedure availability]
+  M2 now requires the mini to run the AC-12 proof signed in with a token that is exactly desktop_signin + read + crm, with no `machines`. Under D6 and NEG-20, a session from that token is refused the machine and remote-session host routes (user_token_ability_missing). While the mini is signed in for the proof, it therefore loses its machine and remote-control routes, whatever kind the previous token was.
+  The L2 step covers only the operator-bound case. It does not cover the proof session itself.
+  Fix: one line in the prerequisites. Either run the CRM-view proof as a separate desktop sign-in that is not the mini's working session, or register the re-sign-in with the mini's working token after the proof as a human step (the same ask, wc27c825f054). The mini must not be left on the CRM-view token if remote access depends on it.
+  This does not block the spec. It must be settled before the live proof runs.
+
+Not verified: production metadata of the mini's token, and whether ask wc27c825f054 exists. I did not trace it with provenance.py.
