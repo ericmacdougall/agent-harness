@@ -715,6 +715,8 @@ class Daemon:
         step("checks", lambda: self.run_checks(deadline))
         sessions, blocked = step("sessions", lambda: scan_sessions(self.policy, ts)) or ([], {})
         docs = step("owners", lambda: self.owner_docs(sessions, deadline)) or {}
+        succ = step("successors", lambda: self.request_successors(docs, ts, deadline)) or []
+        summary["successors"] = succ
         asks = step("asks", lambda: v1_asks(self.policy)) or []
         pending = step("wal_asks", lambda: wal_asks(self.policy, sessions)) or []
         events = read_ring()
@@ -783,6 +785,29 @@ class Daemon:
             if rc == 0 and isinstance(doc, dict) and isinstance(doc.get("owners"), list):
                 docs[s] = doc
         return docs
+
+    def request_successors(self, docs: dict, ts: float, deadline: float) -> list:
+        """GoodQA #15565 (never-drop 16.2): while main is absent (its WAL idle for successor_main_idle_s), ask `ah task
+        succeed` for a successor for each owner `ah owners` marks decision_required and idle that long. The verb is
+        idempotent per agent, cap-safe (a full cap records a wait and alerts main, never exceeds) and never launches
+        unless ~/.agent-harness/successor.json names a launcher. At most successor_per_tick calls per tick."""
+        limit = float(self.policy.get("successor_main_idle_s", 1800))
+        budget = int(self.policy.get("successor_per_tick", 3))
+        done = []
+        for session, doc in docs.items():
+            try:
+                idle = ts - os.stat(home() / ".claude" / "wals" / session / "main.jsonl").st_mtime
+            except OSError:
+                continue
+            if idle < limit:
+                continue
+            for row in doc.get("owners") or []:
+                if len(done) >= budget:
+                    return done
+                if row.get("decision_required") is True and (row.get("idle_s") or 0) >= limit:
+                    rc, _ = self.call("task succeed", ["--agent", str(row.get("agent_id")), "--session", session], deadline)
+                    done.append((session[:8], str(row.get("agent_id"))[:12], rc))
+        return done
 
     def key_for(self, op: str, key: str, flag, cur, extra: str = "") -> str:
         if op == "clear":
