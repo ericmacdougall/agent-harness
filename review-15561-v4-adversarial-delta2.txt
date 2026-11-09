@@ -1,0 +1,43 @@
+ADVERSARIAL DELTA REVIEW 2: goodqa#15561 spec, core 8caea8fe -> 61d1740f (text delta only)
+Reviewer: agent-a0e0378fdb6d0d338. Code read-only on t2-dev /home/eric/wt-15561 @ 5669940a.
+VERDICT: ACCEPT. No security requirement is weakened. Two medium text fixes are due before the live proof (AC-12) runs.
+
+Checked and supported by the code
+- NEG-39: an operator-bound session gets no host waivers. desktop-token-session.ts:266-268 returns before any waiver for createdVia 'operator', and the test "RT15561 delta F1" is at delegation.test.ts:544.
+- Q9: BOUND_ALLOWED_CREATED_VIA = {session, user_token, operator} (bound-session.ts:30).
+- D4 entitlements and members: delegated with ['read'] (desktop-token-session.ts:178-179). The members policy rules apply only to WRITE methods (user-token-policy.ts:205-210), so a GET by bearer needs only read. Parity holds, and the abilities pin covers it.
+- NEG-4 "never crm_api_disabled" for a non-member org: plugins/auth.ts:6322 returns crm_api_disabled only when `member`.
+- Poll throttle (D9, AC-8, NEG-12): a first poll, a new address or user agent, any non-2xx and any refusal are all written. The per-process map errs toward writing more rows, and the rate check runs before route-class ledgering. Nothing is weakened against the previous ACCEPT.
+- AC-12 split into AC-12, AC-17 and AC-18: the refusal-copy and Messages proofs move to the slices that build them (S4, S1c). None is dropped. The API-level NEG-1 and NEG-25 stay in S1b/AC-1.
+- D2, D5 and AC-6: the S1e amendment is limited to exactly GET .../crm/contacts/:p/timeline. This is consistent with AC-15 and NEG-36.
+- AC-15 and NEG-36..38: re-sourced to main's comment 59a46886. Correct, since the user's answer did not decide the timeline control.
+
+M1 [MEDIUM, a claim the code does not support] Live-proof prerequisites, line 1:
+  "(no agent mints, no token can mint: rule `token_mint`)"
+  The token_mint non-delegable rule applies only while userTokens.sessionActions is ON (user-token-policy.ts:663: `(sessionActionsOn || rule.code !== 'token_mint')`). mintUserToken refuses a token actor only when sessionActionsEnabled (service.ts:582). The switch defaults OFF (DARK-FEATURES.md:206), and in that state a token with tokens.create_user_tokens can mint a legacy child (created_via 'user_token').
+  The spec's own Q9 finding says the same: "a legacy child minted by a parent token is `user_token` whatever its root, while `userTokens.sessionActions` is off".
+  Fix: "no agent mints; a token can mint a legacy child while userTokens.sessionActions is off, so the live proof records the token's created_via and created_by_token_id (non-secret metadata) and requires created_via = session with no parent."
+
+M2 [MEDIUM, the live-proof oracle can be met vacuously] Live-proof prerequisites, line 2:
+  "the production live proof reuses an existing token the owner supplies as a token file on the mini"
+  AC-12 requires "a user-minted CRM-view token". An "existing token" may be the operator/orchestrator token with every ability, or an "Everything" token. A proof run with such a token says nothing about the least-privilege path (D6, AC-9), which is the point of the CRM-view preset.
+  Fix: the reused token must have exactly the abilities desktop_signin, read and crm (the D11a "Desktop app: view CRM" preset) and created_via = session. The click-tester records both from token metadata, never from the secret. Otherwise the owner mints a fresh preset token.
+
+L1 [LOW, factual error in AC-3]
+  "A token without `read` or `write` cannot start a session (AC-9)"
+  AC-9 and D6 require desktop_signin + read only (desktop-token-session.ts:50; policy line 351 `abilities: ['desktop_signin', 'read']`). A token without write CAN start a session. Fix: "without `read` cannot start a session; the missing-read case is made by a PATCH after the session starts, and the missing-write case needs no PATCH".
+
+L2 [LOW, availability consequence not routed] Q9:
+  "if the live desktop is bound to an operator token, its machine and remote-session routes need a re-sign-in with a non-operator token after deploy"
+  A non-operator token that holds `machines` can be minted in the UI only as "Everything", because the machines checkbox is hidden (D6, UserTokensManager.tsx:225-227). So the deploy may cut the live mini's remote control until the owner mints such a token with step-up. Register this as a named human step (ask) and a rollback criterion before deploy. Do not leave it as a consequence line only.
+
+L3 [LOW, contradictory sentence] Decisions block, Source line:
+  "Q7 is DECIDED BY THE USER for contact detail and the timeline in principle; the timeline stays behind its existing control ... Q7 is DECIDED BY THE USER, Source: ... contact detail and timeline become reachable from token-started desktop sessions, and by crm-ability tokens and agents."
+  The second sentence repeats the first and restates the unqualified timeline opening that AC-15 overrides. Delete the duplicate, or qualify it with "(timeline: under AC-15)".
+
+Auth negative cases: the new statements are covered. NEG-39 is built in S1b with a test. NEG-4's not_found parity, the poll cases and NEG-36..38 are pinned. No untested auth negative was introduced.
+
+Not verified
+- Production data: the mini's token created_via and abilities, the org's crm.api.enabled override.
+- S1e, S1c and S4 code (not written).
+- Whether the poll-throttle code at 5669940a matches every listed case. I read the spec claims and the NEG-39 code only; I did not run the tests. No probes were run, so there are no run_probe.py declarations.
