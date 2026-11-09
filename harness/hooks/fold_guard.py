@@ -28,9 +28,12 @@ import re
 import time
 from pathlib import Path
 
-CARRY = re.compile(r"(?im)^[ \t]*Carried-to:[ \t]*(?:GoodQA[ \t]+)?([a-z0-9][a-z0-9-]{0,62})#(\d{1,9})[ \t]*$")
-OVERRIDE = re.compile(r"(?im)^[ \t]*Fold-Override:[ \t]*(.+?)[ \t]*$")
-UNCHECKED = re.compile(r"(?m)^[ \t]*[-*][ \t]+\[ \][ \t]+(.+?)[ \t]*$")
+CARRY = re.compile(r"(?im)^[ \t]*Carried-to:[ \t]*(?:GoodQA[ \t]+)?([a-z0-9][a-z0-9-]{0,62})#(\d{1,9})[ \t\r]*$")
+OVERRIDE = re.compile(r"(?im)^[ \t]*Fold-Override:[ \t]*(.+?)[ \t\r]*$")
+UNCHECKED = re.compile(r"(?m)^[ \t]*(?:[-*+]|\d{1,3}[.)])[ \t]+\[ {1,2}\][ \t]+(.+?)[ \t\r]*$")
+FOLD_WORDS = re.compile(r"\b(?:fold(?:ed|ing)?|clos(?:e|ed|ing)|won'?t[ -]?fix|duplicate|drop(?:ped)?|abandon\w*|cancel\w*|"
+                        r"supersed\w*|no longer (?:needed|wanted)|not needed)\b", re.I)
+PRIORITY_RANK = {"immediate": 4, "urgent": 3, "high": 2, "medium": 1, "low": 0, "none": 0}
 PENDING_NOTE = re.compile(r"(?m)^[ \t]*PENDING_REAL_TEST[ \t]+([A-Za-z0-9][A-Za-z0-9._-]{0,40})[ \t]*:")
 TESTED_NOTE = re.compile(r"(?m)^[ \t]*REALLY_TESTED[ \t]+([A-Za-z0-9][A-Za-z0-9._-]{0,40})[ \t]*:")
 HIGH = {"immediate", "urgent"}
@@ -43,6 +46,12 @@ WAL_WINDOW_DAYS = 30
 
 def norm(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+
+def has_token(text: str, token: str) -> bool:
+    """token occurs in text as a whole token: AC-1 is not found inside AC-10 or foo-ac-1x."""
+    token = norm(token)
+    return bool(token) and re.search(r"(?<![a-z0-9._-])" + re.escape(token) + r"(?![a-z0-9_-])", text) is not None
 
 
 def _bodies(issue: dict, comments: list):
@@ -60,47 +69,52 @@ def pending_in_text(bodies) -> list:
     return [p for p in pending if p not in tested]
 
 
-def wal_pending(number: int, home: Path | None = None, now: float | None = None) -> list:
-    """Open PENDING_REAL_TEST ids that name #number in this user's WALs (last 30 days): a pending id is open when
-    no REALLY_TESTED with the same id exists in the same session. Unreadable or oversized WALs are skipped (a
-    comment-borne PENDING still blocks, and the skip is not a pass for the ticket's other findings)."""
+def tested_in_text(bodies) -> set:
+    found = set()
+    for body in bodies:
+        found |= set(TESTED_NOTE.findall(body))
+    return found
+
+
+def wal_pending_index(targets: dict, home: Path | None = None, now: float | None = None, deadline: float | None = None) -> tuple:
+    """({number: [open PENDING_REAL_TEST ids]}, complete) for targets {number: project slug}, from ONE scan of this
+    user's WALs (last 30 days, so a bulk close does not rescan per ticket). A pending id names a ticket when its note has
+    #number with no project or the ticket's own project (bugtracker#14518 is not goodqa#14518); it is open when no
+    REALLY_TESTED with the same id exists in any WAL. `complete` is False when the scan hit `deadline` (monotonic
+    seconds): the caller must block, not treat the missing part as clean. Unreadable or oversized WALs are skipped."""
     home = home or Path.home()
     root = home / ".claude" / "wals"
     now = time.time() if now is None else now
-    token = re.compile(r"#%d(?!\d)" % int(number))
-    found = []
+    pending, tested, complete = {}, set(), True
     try:
-        sessions = [p for p in root.iterdir() if p.is_dir()]
+        files = [f for session in root.iterdir() if session.is_dir() for f in session.glob("*.jsonl")]
     except OSError:
-        return found
-    for session in sessions:
-        pending, tested = {}, set()
+        return {n: [] for n in targets}, True
+    for path in files:
+        if deadline is not None and time.monotonic() > deadline:
+            complete = False
+            break
         try:
-            files = list(session.glob("*.jsonl"))
+            if now - path.stat().st_mtime > WAL_WINDOW_DAYS * 86400 or path.stat().st_size > MAX_WAL_BYTES:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        for path in files:
-            try:
-                if now - path.stat().st_mtime > WAL_WINDOW_DAYS * 86400 or path.stat().st_size > MAX_WAL_BYTES:
-                    continue
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+        for raw in text.splitlines():
+            if "REAL" not in raw:
                 continue
-            for raw in text.splitlines():
-                if "REAL" not in raw:
-                    continue
-                try:
-                    row = json.loads(raw)
-                except ValueError:
-                    continue
-                note = str(row.get("note") or "") if isinstance(row, dict) else ""
-                for ident in TESTED_NOTE.findall(note):
-                    tested.add(ident)
-                for ident in PENDING_NOTE.findall(note):
-                    if token.search(note):
-                        pending[ident] = True
-        found += [i for i in pending if i not in tested and i not in found]
-    return found
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                continue
+            note = str(row.get("note") or "") if isinstance(row, dict) else ""
+            tested |= set(TESTED_NOTE.findall(note))
+            for ident in PENDING_NOTE.findall(note):
+                for number, slug in targets.items():
+                    for found in re.finditer(r"(?:\b([A-Za-z0-9][A-Za-z0-9-]*))?#%d(?!\d)" % int(number), note):
+                        if not found.group(1) or not slug or found.group(1).lower() == str(slug).lower():
+                            pending.setdefault(number, {})[ident] = True
+    return {n: [i for i in pending.get(n, {}) if i not in tested] for n in targets}, complete
 
 
 def unmet_items(issue: dict, comments: list, spec_view=None, extra_pending=()) -> list:
@@ -128,7 +142,8 @@ def unmet_items(issue: dict, comments: list, spec_view=None, extra_pending=()) -
     return items
 
 
-def check_carry(note: str, items: list, source_number: int, source_project: str, adapter, source_id=None) -> tuple:
+def check_carry(note: str, items: list, source_number: int, source_project: str, adapter, source_id=None,
+                priority=None) -> tuple:
     """(ok, problem). The named target must be a different, still-open ticket that names this ticket and every
     unfinished item id, so the work is visible where it will be tracked."""
     found = CARRY.search(note or "")
@@ -151,17 +166,25 @@ def check_carry(note: str, items: list, source_number: int, source_project: str,
     ref = f"#{source_number}"
     if not re.search(re.escape(ref) + r"(?!\d)", text):
         return False, f"Carried-to {slug}#{number} does not mention {ref}"
-    lost = [i for i in items if i["kind"] != "priority" and norm(i["id"]) not in text]
+    if any(i["kind"] == "priority" for i in items) and \
+            PRIORITY_RANK.get(str(target.get("priority") or "none").lower(), 0) < PRIORITY_RANK.get(str(priority or "").lower(), 0):
+        return False, (f"Carried-to {slug}#{number} has priority {target.get('priority') or 'none'}, lower than this "
+                       f"ticket's {priority}: a P0 or P1 cannot be carried to a lower-priority ticket")
+    lost = [i for i in items if i["kind"] != "priority" and not has_token(text, i["id"])]
     if lost:
         return False, (f"Carried-to {slug}#{number} does not list these unfinished items: "
                        + ", ".join(i["id"] for i in lost[:8]))
     return True, ""
 
 
-def check_override(note: str, resolver=None) -> tuple:
+def check_override(note: str, resolver=None, number=None) -> tuple:
     found = OVERRIDE.search(note or "")
     if not found:
         return False, "no `Fold-Override: <Source>` line in the note"
+    cited = found.group(1)
+    if not (FOLD_WORDS.search(cited) or (number and re.search(r"#%d(?!\d)" % int(number), cited))):
+        return False, ("the words cited in Fold-Override do not mention this ticket (#%s) or folding, closing, dropping or "
+                       "superseding it: cite the user's sentence about this work, not any message of theirs" % number)
     if resolver is None:
         import provenance
         resolver = provenance.resolve
@@ -180,10 +203,11 @@ def assess(issue: dict, comments: list, note: str, adapter, spec_view=None, extr
     if not items:
         return {"unmet": [], "allowed": True, "problems": []}
     number, project = issue.get("number"), str(issue.get("_project_slug") or "")
-    carried, why_carry = check_carry(note, items, number, project, adapter, issue.get("id")) if CARRY.search(note or "") else (False, None)
+    carried, why_carry = (check_carry(note, items, number, project, adapter, issue.get("id"), issue.get("priority"))
+                          if CARRY.search(note or "") else (False, None))
     if carried:
         return {"unmet": items, "allowed": True, "problems": []}
-    overridden, why_over = check_override(note, resolver) if OVERRIDE.search(note or "") else (False, None)
+    overridden, why_over = check_override(note, resolver, number) if OVERRIDE.search(note or "") else (False, None)
     if overridden:
         return {"unmet": items, "allowed": True, "problems": []}
     problems = [p for p in (why_carry, why_over) if p]

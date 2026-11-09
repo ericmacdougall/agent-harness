@@ -145,9 +145,32 @@ class FoldCase(unittest.TestCase):
 
     def test_carry_into_umbrella_that_lists_the_ticket_and_items_is_allowed(self):
         self.src["priority"] = "immediate"
+        self.umb["priority"] = "immediate"
         self.src["description"] = "- [ ] dial back the P0 call\n"
         self.comment(UMB, "Carried from #14518: dial back the p0 call")
         self.assertEqual(self.wont_fix(self.carried()), (0, ""))
+
+    def test_a_p0_cannot_be_carried_to_a_lower_priority_umbrella(self):
+        self.src["priority"] = "immediate"
+        self.comment(UMB, "Carried from #14518")
+        for low in ("medium", None, "urgent"):
+            self.umb["priority"] = low
+            code, text = self.wont_fix(self.carried())
+            self.assertEqual(code, 2, (low, text))
+            self.assertIn("lower than this ticket", text)
+        self.umb["priority"] = "immediate"
+        self.assertEqual(self.wont_fix(self.carried()), (0, ""))
+
+    def test_item_ids_match_as_whole_tokens_and_crlf_notes_work(self):
+        self.src["priority"] = "medium"
+        self.src["description"] = "- [ ] AC-1\n1. [ ] AC-2\n- [  ] AC-3\n"
+        self.comment(UMB, "carried from #14518: AC-10 and AC-20 and AC-30")
+        code, text = self.wont_fix(self.carried())
+        self.assertEqual(code, 2, text)
+        self.assertIn("does not list these unfinished items", text)
+        self.comment(UMB, "carried from #14518: AC-1, AC-2, AC-3.")
+        note = self.carried().replace("\n", "\r\n")
+        self.assertEqual(self.wont_fix(note), (0, ""))
 
     def test_carry_target_that_omits_an_item_or_the_ticket_is_refused(self):
         self.src["description"] = "- [ ] dial back the P0 call\n"
@@ -187,6 +210,99 @@ class FoldCase(unittest.TestCase):
         good = {"ok": True, "kind": "user", "weak": False}
         with mock.patch("provenance.resolve", lambda s, *a, **k: good):
             self.assertEqual(self.wont_fix(note), (0, ""))
+
+    def test_override_must_be_about_this_ticket_or_folding(self):
+        self.src["priority"] = "immediate"
+        good = {"ok": True, "kind": "user", "weak": False}
+        unrelated = "x\nFold-Override: answer:%s/%s \"Allow it (Recommended) Yes, send the link\"" % (uuid.uuid4(), uuid.uuid4())
+        about = "x\nFold-Override: user:%s/%s \"close 14518, it is replaced by the umbrella #14518\"" % (uuid.uuid4(), uuid.uuid4())
+        with mock.patch("provenance.resolve", lambda s, *a, **k: good):
+            code, text = self.wont_fix(unrelated)
+            self.assertEqual(code, 2, text)
+            self.assertIn("do not mention this ticket", text)
+            self.assertEqual(self.wont_fix(about), (0, ""))
+
+    # ---- hostile shapes: nothing is skipped quietly
+
+    def test_odd_status_shapes_are_checked_not_skipped(self):
+        self.src["priority"] = "urgent"
+        cases = [("update_issue", {"issueId": SRC, "patch": {"status": ["duplicate"]}}),
+                 ("update_issue", {"issueId": SRC, "patch": {"status": "Duplicate "}}),
+                 ("update_issue", {"issueId": SRC, "patch": {"status": None}}),
+                 ("update_issue", {"issueId": SRC, "patch": {"status": "done", "resolution": "duplicate"}}),
+                 ("update_issue", {"issueId": SRC, "patch": {"archived": True}}),
+                 ("call_api", {"method": "PATCH", "path": f"/v1/issues/{SRC}", "body": '{"status": "duplicate"}'}),
+                 ("call_api", {"method": "POST", "path": f"/v1/issues/{SRC}/archive", "body": {}}),
+                 ("call_api", {"method": "DELETE", "path": f"/v1/issues/{SRC}"}),
+                 ("call_api", {"method": "PATCH", "path": f"/v1/projects/{PROJECT}/issues/{SRC}", "body": {"status": "wont_fix"}}),
+                 ("bulk_update_issues", {"items": [{"issueId": SRC, "status": "Wont_Fix"}]})]
+        for tool, tool_input in cases:
+            with self.subTest(tool=tool, input=str(tool_input)[:70]):
+                code, text = self.hook(tool, tool_input)
+                self.assertEqual(code, 2, text)
+        self.src["priority"] = "medium"
+        self.assertEqual(self.hook("update_issue", {"issueId": SRC, "patch": {"status": ["duplicate"]}}), (0, ""))
+
+    def test_a_payload_the_guard_cannot_read_fails_closed(self):
+        with mock.patch.object(sf, "fold_targets", mock.Mock(side_effect=TypeError("boom"))):
+            code, text = self.wont_fix()
+        self.assertEqual(code, 2, text)
+        self.assertIn("could not read this call", text)
+
+    def test_a_bulk_close_over_the_limit_is_refused_whole(self):
+        items = [{"issueId": str(uuid.uuid4()), "status": "duplicate", "note": "n" * 30} for _ in range(51)]
+        code, text = self.hook("bulk_update_issues", {"items": items})
+        self.assertEqual(code, 2, text)
+        self.assertIn("smaller batches", text)
+
+    def test_wal_scan_is_shared_and_a_late_scan_blocks(self):
+        wal = self.home / ".claude" / "wals" / "s1"
+        wal.mkdir(parents=True)
+        (wal / "main.jsonl").write_text(json.dumps({"note": "PENDING_REAL_TEST p1: x on #14518"}) + "\n")
+        index, complete = fold_guard.wal_pending_index({14518: "harness"}, self.home, deadline=time.monotonic() - 1)
+        self.assertFalse(complete)
+        index, complete = fold_guard.wal_pending_index({14518: "harness"}, self.home, deadline=time.monotonic() + 60)
+        self.assertTrue(complete)
+        self.assertEqual(index, {14518: ["p1"]})
+        with mock.patch.object(fold_guard, "wal_pending_index", lambda *a, **k: ({14518: []}, False)):
+            code, text = self.wont_fix()
+        self.assertEqual(code, 2, text)
+        self.assertIn("did not finish", text)
+
+    # ---- pending ids: cleared anywhere, matched by project
+
+    def test_a_comment_or_another_session_clears_a_wal_pending_and_another_project_does_not_count(self):
+        w1 = self.home / ".claude" / "wals" / "s1"
+        w2 = self.home / ".claude" / "wals" / "s2"
+        w1.mkdir(parents=True)
+        w2.mkdir(parents=True)
+        (w1 / "main.jsonl").write_text(json.dumps({"note": "PENDING_REAL_TEST p1: x on #14518"}) + "\n"
+                                       + json.dumps({"note": "PENDING_REAL_TEST p2: y on bugtracker#14518"}) + "\n")
+        code, text = self.wont_fix()
+        self.assertEqual(code, 2, text)
+        self.assertIn("p1", text)
+        self.assertNotIn("p2", text)  # bugtracker#14518 is another project's ticket
+        self.comment(SRC, "REALLY_TESTED p1: ran live, ok, commit abc1234")
+        self.assertEqual(self.wont_fix(), (0, ""))  # a comment clears the WAL pending
+        self.comments[SRC].clear()
+        (w2 / "main.jsonl").write_text(json.dumps({"note": "REALLY_TESTED p1: live ok"}) + "\n")
+        self.assertEqual(self.wont_fix(), (0, ""))  # so does another session's WAL
+
+    def test_unmet_acs_come_from_the_verified_spec_and_evidence(self):
+        core = "c" * 64
+        spec = {"ac": ["AC-1", "AC-2"], "spec_core_sha": core}
+        proof = {"spec_core_sha": core, "ac": ["AC-1"], "really_tested": {"id": "RT1"}}
+        stale = {"spec_core_sha": "d" * 64, "ac": ["AC-2"], "really_tested": {"id": "RT2"}}
+
+        def fake(records, index, kind):
+            return ([spec], []) if kind == "spec" else ([proof, stale], [])
+        with mock.patch.object(sf, "verified", fake):
+            self.assertEqual(sf.unmet_acs([], {}), ["AC-2"])
+        with mock.patch.object(sf, "verified", lambda r, i, k: ([], [])):
+            self.assertIsNone(sf.unmet_acs([], {}))
+        done = {"spec_core_sha": core, "ac": ["AC-2"], "commits": ["abc"], "note": "tested"}
+        with mock.patch.object(sf, "verified", lambda r, i, k: ([spec], []) if k == "spec" else ([proof, done], [])):
+            self.assertEqual(sf.unmet_acs([], {}), [])
 
     # ---- AC5: modes and fail-closed behavior
 

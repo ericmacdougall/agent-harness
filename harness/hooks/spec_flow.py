@@ -1347,27 +1347,64 @@ def fold_targets(tool: str, tool_input: dict) -> list:
         out.append((tool_input.get("issueId"), "wont_fix", str(tool_input.get("note") or "")))
     elif tool == "update_issue":
         patch = tool_input.get("patch") if isinstance(tool_input.get("patch"), dict) else {}
-        status = _one_status(tool_input, patch)
-        if status in FOLD_STATUSES:
-            out.append((tool_input.get("issueId"), status, str(tool_input.get("note") or patch.get("note") or "")))
+        what = _fold_what(_one_status(tool_input, patch), patch)
+        if what:
+            out.append((tool_input.get("issueId"), what, str(tool_input.get("note") or patch.get("note") or "")))
     elif tool == "bulk_update_issues":
         for item in tool_input.get("items") if isinstance(tool_input.get("items"), list) else []:
-            if isinstance(item, dict) and _one_status(item, item.get("patch")) in FOLD_STATUSES:
-                out.append((item.get("issueId"), _item_status(item), str(item.get("note") or "")))
+            patch = item.get("patch") if isinstance(item, dict) and isinstance(item.get("patch"), dict) else {}
+            what = _fold_what(_one_status(item, patch), patch) if isinstance(item, dict) else None
+            if what:
+                out.append((item.get("issueId"), what, str(item.get("note") or "")))
     elif tool == "archive_issue":
         out.append((tool_input.get("issueId"), "archive", str(tool_input.get("reason") or "")))
     elif tool == "call_api":
         method = str(tool_input.get("method") or "GET").upper()
         raw = tool_input.get("body")
+        if isinstance(raw, str):  # a JSON string body: read it the way the server would
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                raw = None
         body = raw if isinstance(raw, dict) else {}
         patch = body.get("patch") if isinstance(body.get("patch"), dict) else {}
-        found = re.search(UUID, str(tool_input.get("path") or ""))
-        if method != "GET" and found and _one_status(body, patch) in FOLD_STATUSES:
-            out.append((found.group(0).lower(), _one_status(body, patch), str(body.get("note") or "")))
-        for item in body.get("items") if isinstance(body.get("items"), list) else []:
-            if method != "GET" and isinstance(item, dict) and _one_status(item, item.get("patch")) in FOLD_STATUSES:
-                out.append((item.get("issueId"), _item_status(item), str(item.get("note") or "")))
+        path = str(tool_input.get("path") or "")
+        found = re.search(r"/issues/(" + UUID + r")", path) or re.search(UUID, path)
+        issue_id = (found.group(1) if found and found.lastindex else found.group(0)).lower() if found else None
+        if method != "GET" and issue_id:
+            what = _fold_what(_one_status(body, patch), body, patch)
+            if not what and method == "DELETE":
+                what = "delete"
+            if not what and re.search(r"/(archive|close|resolve|cancel)/?$", path.lower().split("?")[0]):
+                what = "close route " + path.lower().rsplit("/", 1)[-1]
+            if what:
+                out.append((issue_id, what, str(body.get("note") or "")))
+        for item in body.get("items") if method != "GET" and isinstance(body.get("items"), list) else []:
+            patch = item.get("patch") if isinstance(item, dict) and isinstance(item.get("patch"), dict) else {}
+            what = _fold_what(_one_status(item, patch), item, patch) if isinstance(item, dict) else None
+            if what:
+                out.append((item.get("issueId"), what, str(item.get("note") or "")))
     return out
+
+
+def _fold_what(status, *sources):
+    """Why a write folds a ticket, or None. Status text is compared stripped and lowercased; a status that is not a
+    string (a list, a number) or is the "<null>"/"<conflicting statuses>" markers is checked too, never skipped. A
+    resolution of duplicate or wont_fix and an archived flag count the same as the status."""
+    if status is not None:
+        if not isinstance(status, str) or status.startswith("<"):
+            return "unreadable status"
+        if status.strip().lower() in FOLD_STATUSES:
+            return status.strip().lower()
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        resolution = source.get("resolution")
+        if isinstance(resolution, str) and resolution.strip().lower() in FOLD_STATUSES:
+            return resolution.strip().lower()
+        if source.get("archived") is True or source.get("archivedAt"):
+            return "archive"
+    return None
 
 
 def fold_check(targets: list, config: dict, spec_policy: dict, deadline: float, home=None, resolver=None) -> list:
@@ -1377,36 +1414,65 @@ def fold_check(targets: list, config: dict, spec_policy: dict, deadline: float, 
     problems = []
     max_bytes = int(spec_policy.get("max_record_bytes", 65536))
     routes = spec_policy.get("projects") or {}
+    cap = int(spec_policy.get("fold_max_targets", 50))
+    if len(targets) > cap:
+        return [f"fold guard: {len(targets)} tickets in one close call (limit {cap}); close them in smaller batches so each "
+                "one can be checked within the hook's time limit"]
+    resolved = []
+    for issue_id, what, note in targets:  # read every ticket first, so the WALs are scanned once for all of them
+        if isinstance(issue_id, str) and re.fullmatch(UUID, issue_id):
+            adapter, issue = resolve_issue(issue_id, config, spec_policy, deadline)
+            if issue is not None and not (issue.get("closedAt") or issue.get("status") in SPEC_STATUSES | REASON_STATUSES):
+                project_id = str(issue.get("projectId") or "").lower()
+                issue["_project_slug"] = next((n for n, r in routes.items()
+                                               if str(r.get("project_id") or "").lower() == project_id), "")
+                resolved.append((issue_id, what, note, adapter, issue))
+    pending, complete = fold_guard.wal_pending_index(
+        {i[4].get("number") or 0: i[4]["_project_slug"] for i in resolved}, home, deadline=deadline)
+    if not complete:
+        problems.append("fold guard: the WAL scan for open PENDING_REAL_TEST did not finish within the hook's time limit, "
+                        "so a close cannot be cleared; retry")
     for issue_id, what, note in targets:
         if not isinstance(issue_id, str) or not re.fullmatch(UUID, issue_id):
             problems.append(f"fold guard: {what} needs a uuid issueId (got {str(issue_id)[:40]!r}); it cannot check the ticket")
             continue
-        adapter, issue = resolve_issue(issue_id, config, spec_policy, deadline)
-        if issue is None:
-            problems.append(f"fold guard: issue {issue_id[:8]} cannot be read with any routed key, so {what} cannot be checked")
-            continue
-        if issue.get("closedAt") or issue.get("status") in SPEC_STATUSES | REASON_STATUSES:
-            continue  # already closed or archived-after-close: nothing left to drop
-        project_id = str(issue.get("projectId") or "").lower()
-        issue["_project_slug"] = next((n for n, r in routes.items() if str(r.get("project_id") or "").lower() == project_id), "")
+        hit = next((r for r in resolved if r[0] == issue_id and r[1] == what and r[2] == note), None)
+        if hit is None:
+            adapter, issue = resolve_issue(issue_id, config, spec_policy, deadline)
+            if issue is None:
+                problems.append(f"fold guard: issue {issue_id[:8]} cannot be read with any routed key, so {what} cannot be checked")
+            continue  # otherwise already closed or archived-after-close: nothing left to drop
+        _, _, _, adapter, issue = hit
         comments = adapter.all_comments(issue_id)
         records, _ = ticket_records(comments, max_bytes)
         index = {row.get("id"): row for row in adapter.attachments(issue_id)}
+        tested = fold_guard.tested_in_text(fold_guard._bodies(issue, comments))
         result = fold_guard.assess(issue, comments, note, adapter, spec_view=unmet_acs(records, index),
-                                   extra_pending=fold_guard.wal_pending(issue.get("number") or 0, home), resolver=resolver)
+                                   extra_pending=[p for p in pending.get(issue.get("number") or 0, []) if p not in tested],
+                                   resolver=resolver)
         if not result["allowed"]:
             problems.append(fold_guard.format_block(f"issue #{issue.get('number')} ({issue_id[:8]})", what, result))
     return problems
 
 
 def run_hook(payload: dict, spec_policy: dict, config_loader=None) -> tuple:
-    code, text = _run_spec_hook(payload, spec_policy, config_loader)
+    try:
+        code, text = _run_spec_hook(payload, spec_policy, config_loader)
+    except Exception as error:  # the fold guard still runs; the spec gate's own failure policy is kept
+        enforce = spec_policy.get("mode") == "enforce" and enforced_ids(spec_policy)
+        code, text = (2 if enforce else 0), f"spec-flow hook error ({type(error).__name__}); {'blocking' if enforce else 'allowing'}"
     fold_mode = spec_policy.get("fold_guard", "enforce")
     name = str(payload.get("tool_name") or "")
     match = TOOL_PATTERN.match(name)
     if not match or fold_mode == "off" or code == 2:
         return code, text
-    targets = fold_targets(match.group(1).lower(), payload.get("tool_input") or {})
+    try:
+        targets = fold_targets(match.group(1).lower(), payload.get("tool_input") or {})
+    except Exception as error:  # a malformed payload must not slip past the guard
+        targets = []
+        text = (text + "\n" if text else "") + f"fold guard: could not read this call ({type(error).__name__})"
+        if fold_mode == "enforce":
+            return 2, "Blocked by the Agent Harness fold guard:\n" + text
     if not targets:
         return code, text
     try:
