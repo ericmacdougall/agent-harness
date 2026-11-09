@@ -1,0 +1,261 @@
+{
+ "keep": {
+  "15397": [
+   "named by coordinator",
+   "open PR ericmacdougall/bugtracker/pull/1303",
+   "open PR ericmacdougall/bugtracker/pull/1303",
+   "open PR ericmacdougall/bugtracker/pull/1301",
+   "open PR ericmacdougall/bugtracker/pull/1301"
+  ],
+  "15398": [
+   "named by coordinator"
+  ],
+  "14791": [
+   "named by coordinator"
+  ],
+  "15560": [
+   "named by coordinator"
+  ],
+  "15561": [
+   "named by coordinator",
+   "live owner ab3d0525e"
+  ],
+  "15434": [
+   "named by coordinator"
+  ],
+  "15563": [
+   "named by coordinator"
+  ],
+  "15372": [
+   "named by coordinator"
+  ],
+  "15564": [
+   "named by coordinator"
+  ],
+  "14798": [
+   "named by coordinator"
+  ],
+  "15565": [
+   "named by coordinator"
+  ],
+  "15510": [
+   "named by coordinator"
+  ],
+  "15382": [
+   "named by coordinator"
+  ],
+  "15545": [
+   "named by coordinator"
+  ],
+  "15158": [
+   "live owner a6d28999c"
+  ],
+  "15371": [
+   "live owner a89bf3907"
+  ],
+  "15488": [
+   "live owner ab8a7d1bf"
+  ],
+  "15559": [
+   "live owner aa7f25e39"
+  ],
+  "15550": [
+   "open PR ericmacdougall/private-lessons-host/pull/12",
+   "open PR ericmacdougall/private-lessons-host/pull/12"
+  ],
+  "15446": [
+   "open PR ericmacdougall/private-lessons-authoring/pull/3",
+   "open PR ericmacdougall/private-lessons-authoring/pull/3"
+  ],
+  "15476": [
+   "open PR ericmacdougall/Android-security/pull/764"
+  ],
+  "15373": [
+   "open PR ericmacdougall/agent-fabric/pull/23"
+  ],
+  "15355": [
+   "open PR ericmacdougall/agent-harness/pull/151"
+  ],
+  "15346": [
+   "open PR ericmacdougall/agent-harness/pull/151"
+  ],
+  "14753": [
+   "open PR ericmacdougall/bugtracker-harness/pull/53"
+  ],
+  "14710": [
+   "open PR ericmacdougall/bugtracker-harness/pull/52"
+  ],
+  "14155": [
+   "open PR ericmacdougall/bugtracker-harness/pull/49",
+   "open PR ericmacdougall/bugtracker-harness/pull/49"
+  ],
+  "14394": [
+   "open PR ericmacdougall/solver/pull/9"
+  ],
+  "14351": [
+   "open PR ericmacdougall/bugtracker-harness/pull/43",
+   "open PR ericmacdougall/bugtracker-harness/pull/43"
+  ],
+  "14310": [
+   "open PR ericmacdougall/bugtracker-harness/pull/41"
+  ],
+  "14216": [
+   "open PR ericmacdougall/goodqa-land-scratch-20261104/pull/5",
+   "open PR ericmacdougall/goodqa-land-scratch-20261104/pull/5"
+  ],
+  "13241": [
+   "open PR ericmacdougall/Android-security/pull/655"
+  ],
+  "13431": [
+   "open PR ericmacdougall/Android-security/pull/655"
+  ],
+  "10728": [
+   "open PR ericmacdougall/optinrouter/pull/48"
+  ],
+  "10701": [
+   "open PR ericmacdougall/poopyduck/pull/26"
+  ],
+  "10935": [
+   "open PR ericmacdougall/poopyduck/pull/26"
+  ]
+ },
+ "back": [
+  "a787e724-8641-4c36-a9ef-e7c4a210db1d",
+  "72db636d-bf98-467f-931d-9c3b969fb290",
+  "e66c70a1-80c9-4232-aa96-17cc51672870",
+  "cbbae043-e6dc-4dce-846c-8ce108f3a2e5",
+  "01f77aec-4814-4e93-996b-a3d5214d57a5",
+  "ac158489-9219-41da-b497-2f20a2124970",
+  "d1e67ce0-93a6-4a6b-a65c-9a7422e80b3f",
+  "fa4cf54f-914f-4a22-81b7-114f0334cec2",
+  "878891a4-884c-4c69-bd92-ae52d2372632",
+  "27e20a71-9b75-4cb9-bffc-407ec3edaf20",
+  "7a5a5bf9-5515-4844-838c-f3348473df35",
+  "e603b19e-cb1c-4518-8f59-9cb3f8d46e56",
+  "bd0973a3-0d58-4b8d-babc-e5f7899fac7a",
+  "6799123e-146a-469d-9171-9690a27842cb",
+  "80bb94c6-22ab-4398-8907-3aa690717651",
+  "fb3bcf55-42de-415e-a79b-6804390c3484",
+  "1361847f-758f-422d-95fa-5c87cdf82e32",
+  "8150a028-dd69-441a-b650-436505d962d5",
+  "b2e0de22-586a-42e0-a3c1-416075534fef",
+  "bd37122d-c515-41b6-a8f6-b6eef8125c6b",
+  "252f89d7-cadd-48f5-ace9-480d2326bc59",
+  "861b09c7-cea1-4d8c-96f9-46242f652dbe",
+  "f1a5b16a-6b81-4f86-9266-12d6eb0c508c",
+  "f0e362e3-1ee4-406a-a998-5fed5a79afe4",
+  "6d1fe01c-1a37-45ca-a6d2-f693f77502be",
+  "22b60078-5d82-4bc9-82ff-75b4aa94d3dc",
+  "88811f78-1b37-4fa1-b755-5c3e4cd16695"
+ ],
+ "backn": [
+  [
+   8445,
+   "framebright/goodqa"
+  ],
+  [
+   14214,
+   "framebright/goodqa"
+  ],
+  [
+   14518,
+   "framebright/goodqa"
+  ],
+  [
+   14548,
+   "framebright/goodqa"
+  ],
+  [
+   14565,
+   "framebright/goodqa"
+  ],
+  [
+   14591,
+   "framebright/goodqa"
+  ],
+  [
+   14592,
+   "framebright/goodqa"
+  ],
+  [
+   14615,
+   "framebright/goodqa"
+  ],
+  [
+   14669,
+   "framebright/goodqa"
+  ],
+  [
+   14712,
+   "framebright/goodqa"
+  ],
+  [
+   14859,
+   "framebright/goodqa"
+  ],
+  [
+   14890,
+   "framebright/goodqa"
+  ],
+  [
+   14891,
+   "framebright/goodqa"
+  ],
+  [
+   14898,
+   "framebright/goodqa"
+  ],
+  [
+   14902,
+   "framebright/goodqa"
+  ],
+  [
+   14903,
+   "framebright/goodqa"
+  ],
+  [
+   14908,
+   "framebright/goodqa"
+  ],
+  [
+   14909,
+   "framebright/goodqa"
+  ],
+  [
+   14911,
+   "framebright/goodqa"
+  ],
+  [
+   14926,
+   "framebright/goodqa"
+  ],
+  [
+   14934,
+   "framebright/goodqa"
+  ],
+  [
+   14977,
+   "framebright/goodqa"
+  ],
+  [
+   14983,
+   "framebright/goodqa"
+  ],
+  [
+   14984,
+   "framebright/goodqa"
+  ],
+  [
+   14988,
+   "framebright/goodqa"
+  ],
+  [
+   14992,
+   "framebright/goodqa"
+  ],
+  [
+   15026,
+   "framebright/goodqa"
+  ]
+ ]
+}
