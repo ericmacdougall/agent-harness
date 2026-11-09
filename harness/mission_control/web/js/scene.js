@@ -83,11 +83,15 @@ export async function mountScene() {
     model.forEach(addLabel);
   }
   function positionStatic() {
+    const rect = stage.getBoundingClientRect();
+    const width = rect.width || 600, height = rect.height || 260;
     for (const { label, node } of labelNodes.values()) {
       const [x, , z] = node.pos;
-      label.style.left = `${Math.max(8, Math.min(92, 50 + x / 4.8 * 44))}%`;
-      label.style.top = `${Math.max(10, Math.min(90, 50 + z / 4.8 * 40))}%`;
+      const half = label.offsetWidth / 2 + 6, halfHeight = label.offsetHeight / 2 + 6;
+      label.style.left = `${Math.max(half, Math.min(width - half, width * (.5 + x / 4.8 * .44)))}px`;
+      label.style.top = `${Math.max(halfHeight, Math.min(height - halfHeight, height * (.5 + z / 4.8 * .42)))}px`;
     }
+    if (window.innerWidth >= 768) cull();
   }
   function fallback(reason = 'STATIC VIEW') {
     available = false;
@@ -112,6 +116,7 @@ export async function mountScene() {
   function stop() { cancelAnimationFrame(frame); frame = 0; lastTime = 0; }
   function size() {
     stageRect = stage.getBoundingClientRect();
+    if (!available) { positionStatic(); return; }
     if (!renderer || !camera || stageRect.width < 1 || stageRect.height < 1) return;
     const width = window.innerWidth, height = window.innerHeight;
     const ratio = Math.min(devicePixelRatio || 1, width < 768 ? 1 : 1.5);
