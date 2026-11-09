@@ -1,0 +1,61 @@
+ACCEPTANCE REVIEW goodqa#15561 spec v4 (core sha 8caea8fe...6911). Reviewer a9ce4d3ea8faf7427. Read-only; no probes run (spec review, no code or hostile-input probes applicable).
+VERDICT: BLOCK (spec edits only; no design objection to D1-D11)
+
+B1 AC-12 cannot be recorded on the #1319 build as scoped.
+ AC-12: "a token without `crm` shows the new refusal, and the Messages page loads the sidebar and one conversation and sends and reads a message with a `read`+`write` token"
+ AC-12: "clicking a person shows the honest 'not available in a desktop session started from a token' copy"
+ Slice plan: "S1c (API, Messages entries)" and "S4 (web, honest refusal)" are both to come; #1319 = S0+S1a+S1b. Without S4 the page still shows the role copy (F2); without S1c Messages stays desktop_token_session_scope. A click-tester following AC-12 literally must fail it. Fix: split AC-12 into 12a (CRM list count, owner-web equality, crm.api.enabled record; needs S1b only), 12b (refusal and not-available copy; needs S4), 12c (Messages; needs S1c), each naming the build it applies to.
+
+B2 Click-test precondition is unspecified and collides with hard rules.
+ AC-12 needs three "user-minted" tokens (CRM-view, no-crm, read+write) and the owner's signed-in web session screenshot. Minting needs a signed-in human plus a fresh step-up (F4, spendStepUp); a user-token actor can never mint (token_mint); agents may not type production passwords. The spec does not say who mints, how the tester signs in as owner, or how the tester "records" crm.api.enabled (the UI cannot show an entitlement override; "or an operator reads it" lives only in the decisions block, not in AC-12). Same for AC-16: with userTokens.sessionActions default OFF the tester sees only the timeline refusal unless a production platform switch is flipped; the spec does not say whether the tester should. Fix: add a "Live-proof prerequisites" paragraph naming the mint path, any human step (registered ask), and what AC-16 expects with the switch OFF.
+
+B3 D2 contradicts AC-15 (and D5, AC-6).
+ D2: "the extracted gate's commander-grant, continuation and session-action branches are asserted unreachable for `via='desktop_session'`"
+ D5: "session-action grants) stays refused to a bound session"
+ AC-15: "a bound desktop session reaches the timeline only when its token holds the grant ... which needs one deliberate change to the bound door's session-action refusal for this one route"
+ AC-6: delegated route admitted only if `policy.nonDelegable === null && !policy.signedInPersonOnly`.
+ The D2 assertion fails the moment S1e lands. Fix: D2/D5/AC-6 say "until S1e; S1e amends this for exactly GET .../contacts/:id/timeline" and name the amended assertion.
+
+B4 Source misattribution.
+ AC-15 Source is answer:baab765b.../c75dac6b... "Open it now", yet the same line says the user "did not say the org owner's opt-in goes away"; keeping the control is main's recommended option, not the user's words. NEG-36 (matrix), NEG-37 (agent reads owner's personal entries; copy says so) and NEG-38 (embedded-timeline emptying, Gmail withholding) are agent-derived requirements also cited as "answer:". Fix: AC-15 and NEG-36..38 cite "ticket: main decision (recommended option)" or "inferred:"; keep "answer:" on AC-14, AC-16, NEG-31..35.
+ Also the decisions block states Q7 as user-decided "contact detail and timeline become reachable ... by crm-ability tokens" with no timeline qualifier, though the timeline stays refused by default (switch OFF). User-visible claim not marked pending. Add "timeline behind existing control, main's recommendation, user ask pending" to that line.
+
+M1 Stale text inside v4.
+ - Decisions: "specified below (AC-14, NEG-31..NEG-35)" but NEG-31..NEG-38 exist.
+ - Decisions: "The S1b/S1c split ... remains pending the owner's confirmation" while S1b is built.
+ - Decisions: "Q7 partly: EXPORT stays refused...; contact detail and timeline follow the S0 finding" reads as hold; superseded.
+ - Q9: decisions say "for main to confirm" and the Q9 entry says "Main confirms or flips it after reading the mini's token kind", versus the brief (decided: admit operator, no host waivers). No Source recorded for that decision. "No host waivers (W1-W3)" for operator appears only in the decisions block: D3 does not state it and no AC/NEG tests it (NEG-19 asserts only "operator is admitted ... and asserted to work"). Consequence unstated: if the mini's token is operator-kind, dropping W1/W2 removes its machine and remote-session routes on deploy, the same harm used to justify admitting operator. Fix: add NEG-39 (operator-bound session refused W1-W3 routes exactly as bearer) and state the consequence.
+ - Q8: decisions say "wording is the owner's call"; D11 says "need main's wording approval"; S5 says "still to be approved". Pick one approver.
+ - F-series order F1..F4,F6,F7,F5 (cosmetic).
+
+M2 Polling ledger exception. Core rule is consistent across D9, AC-8, NEG-12, NEG-33 (2xx only, same session+address+UA, five minutes; refused poll always written; NEG-33 routes are not poll routes). Gaps:
+ - NEG-12: "a refused request on a zero-write observation route follows the same observation policy as the bearer path" adds a second, undefined exception absent from D9 and AC-8.
+ - AC-8 states the exception but its Verify by ("allowed, refused and approval-required requests") has no poll cases; only NEG-12 does. Add: first poll written, repeat in window quiet, new address, new UA, non-2xx, window expiry (fake clock).
+ - "measured: about 8 to 10 polls a minute ... 12k rows a day" has no Source.
+ - Where the "already wrote" state lives (memory vs DB, multi-instance) is unspecified; the test cannot be written without it.
+ - D9 ledgers refusals at route class before the rate bucket (D3 order): a looping or stolen session may write unbounded refused rows. HYPOTHESIS; check bucket placement or add a cap.
+
+M3 Slice sequencing leaves security ACs unverified at #1319 (S0+S1a+S1b).
+ NEG-4, NEG-7, AC-5 (org boundary on the new CRM door) are S1d; AC-6, NEG-8 (non-delegable under delegated prefix), NEG-20, NEG-22, NEG-30 (waiver pin) are S3. D3 says W2 is "pinned by test" but the pin is S3. S1b ships W1-W3, D6 and the delegated door. Move NEG-4 and the NEG-8/NEG-30 pins into S1b, or state #1319 may not deploy until S1d and S3 are green.
+
+M4 Verify-by weaknesses (a wrong implementation could pass).
+ - AC-1 iterates "the S0 inventory's 'CRM list page' set": the inventory is not in the spec or named as a committed file; a shortened set passes. Name the file and assert its size against the page hooks.
+ - AC-6 clause "no host or delegated route has a handler that requires a session-only proof (step-up, recent auth)" is not observable by an inventory snapshot. Give a mechanism or drop it.
+ - AC-11 uses UserTokensManager.test.tsx to select presets and check boxes, but AC-10 says the web vitest config is environment node, no jsdom. Say how a dialog interaction is tested.
+ - AC-3 "403 for a token without them": a token lacking read cannot mint a session (AC-9), so the case needs a PATCH after mint; say so.
+ - NEG-10 "also when served by a freshly started app instance (no cache exists)" is tautological. NEG-17 "Commander-only outbound approvals neither triggered nor bypassed" has no observable. NEG-31 "subject to AC-15" does not say which code wins on the timeline route for a no-crm token with the switch off (NEG-36 says non_delegable first).
+ - User-visible claims with no AC or slice: D9 attribution "stated in the token page copy"; NEG-37 "the token page and refusal copy say so"; AC-14 "AC-16 and the copy say so" (Gmail withheld); D10 names a "Desktop CRM preset" while D11 names "Desktop app: view CRM". D10's quoted strings (ability, not-available, crm_api_disabled copy) are not in Q8's approval list.
+
+M5 Possible information oracle (HYPOTHESIS). D10: the delegated door returns distinct crm_api_disabled where bearer returns 404. If the entitlement check runs before membership RBAC, a session can tell orgs with crm.api.enabled=false from others for orgs it is not a member of. NEG-4 says only "refused by the handler". Add: non-member org on the delegated door returns the same code and body as a non-existent org and as bearer.
+
+L1 Resource budget "Host: dev2 (the t2-dev host, T2 after Nov 9)" conflates two hosts, and today is Nov 9 (dev2 shutdown date in the user's memory). Confirm the host exists. Reviews table has one adversarial row (a0e0378, "Bound to: current"); I cannot verify it reviewed v4 rather than v3 (AC-14..16 are new). The auth domain needs two reviews from different agents or models; this report would be the second.
+
+CHECKED OK
+ - Every NEG-1..38 names an existing AC (AC-1..15); AC-1..16 and NEG-1..38 contiguous; each NEG Source has a valid kind (ticket:, inferred:, answer:), citation format matches.
+ - S1e slice, AC-14..16, NEG-31..38, Q7, D4 and D10 agree: detail opens to crm+read user tokens (not org API keys); timeline stays behind session:crm_timeline + userTokens.sessionActions + org opt-in; export and other session-only routes stay refused.
+ - NEG-33 correctly says the two routes are not poll routes.
+
+NOT VERIFIED
+ - Code (not read): quoted symbols, line numbers, SESSION_ONLY_ROUTES membership, the 1,415 count, live entitlement value, the mini's token kind, #1319 head contents, "S1b built".
+ - Spec core sha recomputation and lint (taken from the brief). Resource-budget numbers. v3 text beyond the diff (diff read through line 80 of 168 only).
+PROBES: none declared or run (document review).
