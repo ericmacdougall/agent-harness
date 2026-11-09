@@ -119,6 +119,8 @@ class CodexResponder:
         self.recent = [t for t in self.recent if now - t < 60]
         if len(self.recent) >= self.RATE_PER_MIN:
             return  # waits its turn; stays queued
+        if not mc_chat.claim(record["id"], root=self.root):
+            return  # another reader took it first; never answered twice
         self.recent.append(now)
         self.answer(record)
 
@@ -136,7 +138,6 @@ class CodexResponder:
 
     def answer(self, record: dict) -> None:
         self.busy = True
-        mc_chat.set_state(record["id"], "delivered", root=self.root)
         self.hub.snapshot("chat_state", {"id": record["id"], "status": "answering"})
         self.cwd.mkdir(mode=0o700, parents=True, exist_ok=True)
         reply_id = "reply-" + mc_chat.ulid()

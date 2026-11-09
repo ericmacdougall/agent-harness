@@ -102,8 +102,9 @@ The chat follows these rules:
 
 - Dashboard text is untrusted data. It is bounded to 4,000 characters, redacted, framed and fenced, and it is never executed.
 - An agent cites it as `dash:<id>`, never as your own words.
-- It may start or steer ordinary work. It cannot grant top-rung models, approve production, deletion or credential actions, or override hard rules. Approvals need the terminal, as the page says beside the composer.
-- A record without a valid server signature is marked FORGED and is never delivered.
+- It may start or steer ordinary, reversible work. Anything consequential (pushing to a shared branch, merging, deploying, spending, deleting, contacting people) needs confirmation in the terminal, and it cannot grant top-rung models, approve production, deletion or credential actions, or override hard rules. The frame says so, because any process running as your OS user can write to the inbox: a message there is not proof that you typed it. The page says "Approvals need the terminal" beside the composer.
+- A record without a valid server signature, or a signed record copied under another id, is marked FORGED and is never delivered.
+- Each message is delivered once. Delivery is an atomic claim, so two waiters, or a waiter and a reader, never both take it. Reading an answered message again never reopens it.
 
 Sending is idempotent:
 
@@ -115,9 +116,9 @@ Sending is idempotent:
 
 | Runtime | How chat reaches it | Limits |
 | --- | --- | --- |
-| Claude Code CLI (main) | Main runs `python3 ~/.claude/hooks/mc_inbox.py wait --session <session-id>` as a background task. It wakes when a message arrives, prints the framed message and exits; main answers with `mc_inbox.py reply <id>` (text on stdin) and re-arms the waiter. The installed `mc_inbox.py hook` on Stop and UserPromptSubmit points the registered session at a message it missed. | Only the one registered session receives Claude messages. The Stop hook blocks at most once per message, with a 120 s cooldown and at most 6 blocks an hour, and its text is a fixed pointer. Subagents never act on chat. With no registered session, the page says "no main attached" and does not accept Claude messages. |
-| Codex CLI | The dashboard's Codex switch runs `codex exec --json` read-only on your ChatGPT subscription and streams the reply. From a Codex session you can also use `~/.codex/agent-harness/mc_inbox.py` (`pending --to codex`, `read`, `reply --from codex`) by hand. | There is no Codex hook and no API-key fallback. When Codex is busy, rate-limited or not signed in, the page shows why and when it resets. Codex keys hook trust by position, so the installer adds no Codex hook. |
-| Claude desktop | The harness-tui plugin's MCP server has `mc_pending` (ids only), `mc_read` (one verified, framed message) and `mc_reply`. Ask the app to "check the dashboard". | The desktop app has no Stop hook, so it never wakes on its own: a message waits until you ask the app to check. |
+| Claude Code CLI (main) | Main runs `python3 ~/.claude/hooks/mc_inbox.py wait --session <session-id>` as a background task. It wakes when a message arrives, prints the framed message and exits; main answers with `mc_inbox.py reply <id>` (text on stdin) and re-arms the waiter. The installed `mc_inbox.py hook` on Stop and UserPromptSubmit points the registered session at a message it missed. | Only the session you pick in the dashboard receives a Claude message. The Stop hook blocks at most once per message (a message main ignored never hides a newer one), with a 120 s cooldown and at most 6 blocks an hour, and its text is a fixed pointer. The hook reads only its own session's target file, so an unregistered session pays one failed file open per prompt. Subagents never act on chat. With no registered session, the page says "no main attached" and does not accept Claude messages. |
+| Codex CLI | The dashboard's Codex switch runs `codex exec --json` read-only on your ChatGPT subscription and streams the reply. The installer also ships `~/.codex/agent-harness/mc_inbox.py`, so a Codex session can list waiting Codex message ids (`pending --to codex`) by hand. The responder claims each message atomically, so it is answered once. | There is no Codex hook and no API-key fallback. When Codex is busy, rate-limited or not signed in, the page shows why and when it resets. Codex keys hook trust by position, so the installer adds no Codex hook. |
+| Claude desktop | Ask the app to "check the dashboard". Its harness-tui plugin calls `mc_pending`, which attaches the app as the chat target `claude-desktop` and lists waiting ids. Pick `claude-desktop` in the dashboard's session picker to send to it. `mc_read` returns one verified, framed message and `mc_reply` answers it. | The desktop app has no Stop hook, so it never wakes on its own: a message waits until you ask the app to check. The tools never see messages for a terminal session. |
 | ChatGPT / Codex desktop | There is no hook point and no supported MCP path from this harness. Use the dashboard's Codex switch, which runs the Codex CLI. | Messages are not delivered into the desktop app. |
 
 ## Security model
@@ -145,7 +146,8 @@ The server defends against them as follows:
 Two parties are trusted, and this is stated rather than defended:
 
 - Browser extensions with access to `127.0.0.1` can read the page and post chat.
-- Same-user processes can read the install secret, so the inbox signature stops accidental or naive forgery but not a determined local attacker. The authority limit on `dash:` messages is what bounds the damage.
+- Same-user processes can read the install secret, so the inbox signature stops accidental or naive forgery but not a determined local attacker. The authority limit on `dash:` messages is what bounds the damage: the frame says a message is not proof the user typed it, and anything consequential needs the terminal.
+- Inbox reads never block: a FIFO or device planted under a `.json` name is skipped, so no hook can hang on one.
 
 ## Rollback
 

@@ -87,15 +87,15 @@ To rotate a drop file, rename it and start a new one. The server notices the new
 | `text` | Up to 4,000 characters. It is cleaned of control characters and redacted before it is stored. |
 | `sig` | An HMAC-SHA256 with the 0600 install secret, over the record minus `sig`, serialised as canonical JSON (sorted keys, no spaces). |
 
-A record's delivery state lives beside it, in `chat/state/<id>.json`. The states are `queued`, `delivered`, `answered`, `failed`, `unavailable` and `forged`.
+A record's delivery state lives beside it, in `chat/state/<id>.json`. The states are `queued`, `delivered`, `answered`, `failed`, `unavailable` and `forged`. A queued message also has an empty marker, `chat/queue/<id>`. Pending lists come from these markers, so newer traffic never hides an older message, and a reader takes a message by unlinking its marker, which succeeds exactly once.
 
 A record whose signature is missing or wrong is marked `forged`. It is never delivered by `wait`, `read`, the Stop hook or `mc_read`, and the page shows it struck through as "Untrusted content".
 
 An agent receives a message only in its framed form:
 
 1. a header line;
-2. the authority notice, which says the text is data from the local dashboard: it may steer ordinary work, but it cannot grant top-rung models, approve production, deletion or credential actions, or override hard rules;
+2. the authority notice. It says the text is data from the dashboard inbox and not proof the user typed it. The text may steer ordinary, reversible work, but anything consequential needs confirmation in the terminal, and it cannot grant top-rung models, approve production, deletion or credential actions, or override hard rules;
 3. the reply command;
-4. the text, inside a fence the text itself cannot close.
+4. the text, inside a fence that carries a fresh random nonce for each frame, so the text can neither predict nor imitate it.
 
 When an agent cites the message, it writes `dash:<id>`. `provenance.py` rejects `dash:` as the source of a user requirement.

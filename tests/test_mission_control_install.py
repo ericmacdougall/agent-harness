@@ -155,9 +155,13 @@ class MissionDesktopTools(unittest.TestCase):
         sys.path.insert(0, str(hooks))
         self.launcher = importlib.import_module("launcher")
         self.chat = importlib.import_module("mc_chat")
-        self.chat.register_target("sess-1", os.getpid())
+        self.chat.register_target("sess-1", os.getpid())  # a terminal main session
+        [attach] = self.call(self.tool(9, "mc_pending", {}))  # the desktop app attaches as claude-desktop
+        self.assertEqual(attach["result"]["structuredContent"]["session"], "claude-desktop")
         self.record, _ = self.chat.new_message("claude", "please summarise goodqa#15585", client_key="k" + "a" * 20,
-                                               session="sess-1")
+                                               session="claude-desktop")
+        self.terminal, _ = self.chat.new_message("claude", "for the terminal main only", client_key="k" + "b" * 20,
+                                                 session="sess-1")
 
     def call(self, *requests):
         import io
@@ -188,6 +192,25 @@ class MissionDesktopTools(unittest.TestCase):
         self.assertEqual(again["result"]["structuredContent"]["pending"], [], "a delivered message is no longer pending")
         replies = [r for r in self.chat.outbox() if r.get("reply_to") == self.record["id"]]
         self.assertEqual([r["text"] for r in replies], ["Summary: on track."])
+        self.assertEqual([r["id"] for r in self.chat.pending("claude", "sess-1")], [self.terminal["id"]])
+
+    def test_mission_tools_never_touch_another_sessions_message(self):  # red-team F2
+        read, reply, listed = self.call(
+            self.tool(1, "mc_read", {"id": self.terminal["id"]}),
+            self.tool(2, "mc_reply", {"id": self.terminal["id"], "text": "hijack"}),
+            self.tool(3, "mc_pending", {}))
+        self.assertEqual(read["result"]["structuredContent"]["status"], "NOT_YOURS")
+        self.assertNotIn("terminal main only", json.dumps(read))
+        self.assertEqual(reply["result"]["structuredContent"]["status"], "NOT_YOURS")
+        self.assertNotIn(self.terminal["id"], json.dumps(listed))
+        self.assertEqual(self.chat.state(self.terminal["id"])["status"], "queued", "still waiting for its session")
+        self.assertEqual([r["id"] for r in self.chat.pending("claude", "sess-1")], [self.terminal["id"]])
+
+    def test_mission_tools_refuse_old_arguments(self):
+        to, sender = self.call(self.tool(1, "mc_pending", {"to": "codex"}),
+                               self.tool(2, "mc_reply", {"id": self.record["id"], "text": "x", "sender": "codex"}))
+        self.assertIn("error", to)
+        self.assertIn("error", sender)
 
     def test_mission_tools_refuse_forged_records_and_malformed_ids(self):
         path = self.chat.chat_dir() / "inbox" / (self.record["id"] + ".json")

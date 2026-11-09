@@ -169,13 +169,18 @@ The same MCP server also offers three tools for answering
 have no Stop hook, so the app never wakes on its own. Ask it to "check the
 dashboard", and it uses these tools:
 
-- `mc_pending` lists the ids of waiting dashboard messages, with no text.
-- `mc_read` returns one message, only if its server signature verifies, in
-  the framed and fenced form with the authority notice.
+- `mc_pending` attaches the app as its own chat target, `claude-desktop`. You
+  can then pick that target in the dashboard's session picker. The tool also
+  lists the ids of messages waiting for it, with no text.
+- `mc_read` returns one message addressed to `claude-desktop`, only if its
+  server signature verifies, in the framed and fenced form with the
+  authority notice.
 - `mc_reply` posts the answer, which appears in the dashboard.
 
-A forged record is refused and marked forged. If Mission Control is not
-installed, every tool returns `NOT_INSTALLED`. The tools read and write only
+The tools never list, read or answer a message addressed to a terminal
+session (they answer `NOT_YOURS` and leave it untouched). A forged or renamed
+record is refused. If Mission Control is not installed, every tool returns
+`NOT_INSTALLED`. The tools read and write only
 `~/.agent-harness/mission-control/chat/`.
 
 ## Launch outcomes and terminal use

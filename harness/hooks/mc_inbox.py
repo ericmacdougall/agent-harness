@@ -38,7 +38,9 @@ def _session(value: str) -> str:
 
 
 def deliver(record: dict) -> str:
-    mc_chat.set_state(record["id"], "delivered")
+    """The framed message. Its state moves from queued to delivered only through the atomic claim, so a reread
+    never reopens an answered message and two readers never both take a queued one."""
+    mc_chat.claim(record["id"])
     return mc_chat.frame(record)
 
 
@@ -52,12 +54,12 @@ def cmd_wait(args) -> int:
             if now - last_beat >= HEARTBEAT_S:
                 mc_chat.register_target(session, os.getpid(), waiting=True)
                 last_beat = now
-            found = mc_chat.pending("claude", session)
+            found = [r for r in mc_chat.pending("claude", session) if mc_chat.claim(r["id"])]  # one waiter wins each
             if found:
                 mc_chat.register_target(session, os.getpid(), waiting=False)
                 print(f"{len(found)} Mission Control message(s) for this session. Answer each with "
                       f"`python3 ~/.claude/hooks/mc_inbox.py reply ID` and re-arm the waiter afterwards.\n")
-                print("\n\n".join(deliver(r) for r in found))
+                print("\n\n".join(mc_chat.frame(r) for r in found))
                 return 0
             if deadline is not None and now >= deadline:
                 mc_chat.register_target(session, os.getpid(), waiting=False)
@@ -70,13 +72,13 @@ def cmd_wait(args) -> int:
 
 
 def cmd_read(args) -> int:
-    record = mc_chat.get(args.id)
-    if not isinstance(record, dict):
+    if not isinstance(mc_chat.get(args.id), dict):
         print("mc_inbox: no message with that id", file=sys.stderr)
         return 2
-    key = mc_chat.secret(create=False)
-    if not mc_chat.verified(record, key):
-        mc_chat.set_state(args.id, "forged", reason="missing or invalid server signature")
+    record = mc_chat.load(args.id)  # signature verified and the stored id equals the requested id
+    if record is None:
+        if mc_chat.ID_RE.match(args.id) and mc_chat.state(args.id).get("status") != "answered":
+            mc_chat.set_state(args.id, "forged", reason="missing or invalid server signature")
         print("mc_inbox: FORGED: that record was not written by the Mission Control server; not delivered",
               file=sys.stderr)
         return 2
@@ -125,7 +127,7 @@ def hook_output(event: dict) -> dict | None:
                f"`mc_inbox.py reply ID`, then re-arm `mc_inbox.py wait --session {session}` in the background.")
     if name == "UserPromptSubmit":
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": pointer}}
-    if mc_chat.stop_block_allowed(session, queued[0]["id"]):
+    if mc_chat.stop_block_allowed(session, [r["id"] for r in queued]):
         return {"decision": "block", "reason": pointer}
     return None
 
