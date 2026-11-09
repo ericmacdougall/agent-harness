@@ -589,10 +589,10 @@ def _owners_with_deadline(home, session_id, seconds):
 def _slot_freed(row):
     """A silent owner frees its slot when main disposed of it the way the liveness alerts already accept
     (liveness.row_disposed, goodqa#15322): the work was reassigned, closed, superseded or written off, or a named wait is
-    still live. Reassigned counts whether or not the replacement is live right now (that is its own alert), and a wait
-    counts only while live. A `resumed` owner is working, so it keeps its slot, and `ah` still marking
-    decision_required keeps it too. GoodQA #15565: af265a5 (reassigned, successor returned) and a0680533 (live wait)
-    were SILENT-HIGH and disposed, yet held two of the four slots."""
+    still live (a reassignment or wait counts only while its holder is live, never-drop 16.1). A `resumed` owner is working, so it keeps its slot, and `ah` still marking
+    decision_required keeps it too. GoodQA #15565: a0680533 (live wait) was SILENT-HIGH and disposed, yet held one of
+    the four slots. With never-drop 16.1, a reassignment frees a slot only while its successor is live (af265a5's
+    had returned, so that owner is ownerless and decision_required, not disposed)."""
     disp = row.get('disposition')
     if not isinstance(disp, dict) or disp.get('kind') == 'resumed':
         return False
