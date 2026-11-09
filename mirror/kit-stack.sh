@@ -35,7 +35,8 @@ rm -rf "$KIT/web"; mkdir -p "$KIT/web"; cp -r "$TREE/apps/web/.next/standalone/.
 mkdir -p "$KIT/web/apps/web/.next"; rm -rf "$KIT/web/apps/web/.next/static"; cp -r "$TREE/apps/web/.next/static" "$KIT/web/apps/web/.next/static"
 [ -d "$TREE/apps/web/public" ] && [ ! -e "$KIT/web/apps/web/public" ] && cp -r "$TREE/apps/web/public" "$KIT/web/apps/web/public"
 SA="$KIT/web/apps/web"
-cd "$SA" &&API_PROXY_TARGET="http://127.0.0.1:$API_PORT" NEXT_PUBLIC_API_URL='' HOSTNAME="$WEB_HOST" PORT="$WEB_PORT" setsid node server.js > "$KIT/run/web.log" 2>&1 &
+# Clean environment on purpose: with the API's exported variables (NODE_ENV, DEPLOY_ENV, WEB_ORIGIN, ...) the web answered 404 on every path.
+cd "$SA" && env -i PATH="$PATH" HOME="$HOME" API_PROXY_TARGET="http://127.0.0.1:$API_PORT" NEXT_PUBLIC_API_URL='' HOSTNAME="$WEB_HOST" PORT="$WEB_PORT" setsid node server.js > "$KIT/run/web.log" 2>&1 &
 WEB_PID=$!
 for i in $(seq 1 60); do curl -fsS -o /dev/null "http://$WEB_HOST:$WEB_PORT/login" 2>/dev/null && break; sleep 2; done
 cp "$KIT/seed.ts" "$TREE/apps/api/.click-seed.ts"
