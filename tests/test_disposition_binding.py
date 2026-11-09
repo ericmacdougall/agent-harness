@@ -72,6 +72,17 @@ class Binding(unittest.TestCase):
             self.assertFalse(self.bound({"kind": kind, "ref": "rt0000000001"}, me, [helper]), kind)
         self.assertFalse(self.bound({"kind": "waiting", "ref": "goodqa#14553"}, me, [helper]))
 
+    def test_a_live_agent_that_is_not_an_owner_and_holds_another_ticket_is_not_a_holder(self):
+        # red-team a5fc13ab R3: a reviewer spawned as general-purpose is live but is not an owner (ah owners flags none)
+        me = row("dropped", "DROPPED", 9e4, ticket="goodqa#14553")
+        stranger = dict(row("stranger00001", ticket="goodqa#999"), type="general-purpose", owner=False)
+        same = dict(row("samestream0001", ticket="goodqa#14553"), type="general-purpose", owner=False)
+        for kind in ("resumed", "reassigned", "waiting"):
+            self.assertFalse(self.bound({"kind": kind, "ref": "stranger00001"}, me, [stranger]), kind)
+            self.assertTrue(self.bound({"kind": kind, "ref": "samestream0001"}, me, [same]), kind + " same ticket")
+        flagged = dict(row("flagged000001"), decision_required=True)
+        self.assertFalse(self.bound({"kind": "reassigned", "ref": "flagged000001"}, me, [flagged]))
+
     def test_ticket_waits_match_project_and_number(self):
         me = row("dropped", "DROPPED", 9e4)
         holder = row("holder0000000", ticket="GoodQA goodqa#665")

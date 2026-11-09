@@ -118,9 +118,15 @@ LIVE_BIND_S = 10 * 60  # a successor counts as live when `ah owners` saw it acti
 BINDING_KINDS = ("resumed", "reassigned", "waiting")
 
 
-def holds_work(row) -> bool:
-    """A live successor: running and active within LIVE_BIND_S (never a stopped, SILENT, DROPPED or unknown agent)."""
-    if not isinstance(row, dict) or str(row.get("type") or "") in NON_HOLDER_TYPES:
+def holds_work(row, stream_ticket=None) -> bool:
+    """A live successor: running and active within LIVE_BIND_S (never a stopped, SILENT, DROPPED or unknown agent).
+
+    It must also be an OWNER (`ah owners` flags task-owners, registered agents and agents main named in a WAL note), or
+    hold the same ticket as the stream it is excused for: a reviewer spawned as general-purpose is live but owns nothing
+    (red-team a5fc13ab R3). A row `ah` still marks decision_required holds nothing either."""
+    if not isinstance(row, dict) or str(row.get("type") or "") in NON_HOLDER_TYPES or row.get("decision_required") is True:
+        return False
+    if not (row.get("owner") is True or (stream_ticket and same_ticket(stream_ticket, row.get("ticket")))):
         return False
     state = str(row.get("state") or "")
     idle = row.get("idle_s")
@@ -183,18 +189,18 @@ def disposition_bound(disp: dict, row: dict, by_id: dict, rows: list, asks: dict
         return True
     if kind == "resumed":
         target = resolve_agent(ref, by_id) if ref else row
-        return holds_work(target)
+        return holds_work(target, row.get("ticket"))
     if kind == "reassigned":
         target = resolve_agent(ref, by_id)
         if target is None or target is row:
             return False
-        return holds_work(target) or bool(covered and covered(target["agent_id"]))
+        return holds_work(target, row.get("ticket")) or bool(covered and covered(target["agent_id"]))
     if re.fullmatch(r"w[0-9a-f]{11}", ref):
         return asks.get(ref) == "open"
     target = resolve_agent(ref, by_id)
     if target is not None:
-        return target is not row and holds_work(target)
-    return bool(ticket_number(ref)) and any(r is not row and r.get("owner") and holds_work(r)
+        return target is not row and holds_work(target, row.get("ticket"))
+    return bool(ticket_number(ref)) and any(r is not row and r.get("owner") and holds_work(r, row.get("ticket"))
                                             and same_ticket(ref, r.get("ticket")) for r in rows)
 
 
