@@ -243,7 +243,9 @@ class GateTests(Base):
         self.assertIn("ah task dispose", out["reason"])
 
     def test_resumed_clears_then_expires_without_activity(self):
-        self.dispose("resumed", "disp-resumed-0001")
+        with self.assertRaises(ah.AhError):  # GoodQA #15565: a resume names the agent that took the work
+            self.dispose("resumed", "disp-resumed-noref")
+        self.dispose("resumed", "disp-resumed-0001", ref="aliveowner")
         self.assertEqual(self.stop(), {})
         self.assertEqual(self.owners()["undisposed"], [])
         later = NOW + liveness.RESUMED_GRACE_S + 60  # no activity followed the "resumed": it re-blocks
@@ -272,7 +274,7 @@ class GateTests(Base):
              "note": "REALLY_TESTED DG-LIVE-1: dropowner verified live on https://app.example: pass"}])
         self.dispose("closed", "disp-closed-ok", reason="verified dropowner's v1.2.0 deploy serves and passes live",
                      deployed="wde000000001", live_test="DG-LIVE-1")
-        self.assertEqual(self.stop(now=NOW + 10 * 86400), {})
+        self.assertNotIn("dropowner", self.owners(now=NOW + 10 * 86400)["undisposed"])
 
     def test_reassigned_is_live_only_while_the_replacement_is(self):
         self.dispose("reassigned", "disp-reassign-ok", ref="aliveowner")
@@ -329,7 +331,7 @@ class ReassignInheritsTargetWait(Base):
         self.wait("waitowner", "key-tw-2-0000", NOW + 3600)
         self.dispose("reassigned", "key-tw-r2-0000", ref="waitowner")
         later = NOW + 3601
-        self.assertEqual(self.owners(now=later)["undisposed"], ["dropowner", "waitowner"])
+        self.assertEqual(self.owners(now=later)["undisposed"], ["aliveowner", "dropowner", "waitowner"])  # aliveowner: SILENT-HIGH by then
         self.assertEqual(self.stop(now=later).get("decision"), "block")
 
     def test_reassigned_to_a_dropped_target_without_a_decision_still_blocks(self):
@@ -363,7 +365,7 @@ class ReassignInheritsTargetWait(Base):
     def test_reassigned_to_a_done_target_in_a_live_named_wait_holds(self):
         """Main's repro 2026-11-06 (pet-leads-x -> a9830089): target state done + live waiting disposition."""
         self.add_done_target()
-        self.wait("doneowner", "key-tw-6-0000", NOW + 3600, ref="GoodQA goodqa#14883")
+        self.wait("doneowner", "key-tw-6-0000", NOW + 3600, ref="wa5b00000001")  # an open ask binds; an ownerless ticket does not
         self.dispose("reassigned", "key-tw-r6-0000", ref="doneowner")
         by = {r["agent_id"]: r for r in self.owners()["owners"]}
         self.assertEqual(by["doneowner"]["state"], "done")  # the fixture really has the repro shape
@@ -382,7 +384,7 @@ class ReassignInheritsTargetWait(Base):
         finished, holds no wait and must not excuse work reassigned to it."""
         self.add_done_target()
         ah.write(self.home, "task.dispose", {"agent": "doneowner", "session": SESSION, "kind": "resumed",
-                                             "at": iso(NOW - 5000)}, SESSION, "key-tw-8-0000")
+                                             "at": iso(NOW - 5000), "ref": "doneowner"}, SESSION, "key-tw-8-0000")
         self.dispose("reassigned", "key-tw-r8-0000", ref="doneowner")
         by = {r["agent_id"]: r for r in self.owners()["owners"]}
         self.assertEqual(by["doneowner"]["state"], "done")
@@ -574,9 +576,9 @@ class TaskWalOwners(Base):
         self.assertEqual(by["fable-review"]["type"], "task-wal")
         self.assertEqual(by["finished-task"]["state"], "done")
         self.assertEqual(by["quiet-task"]["state"], "SILENT-HIGH")
-        self.assertEqual(data["undisposed"], ["dropowner", "fable-review"])
+        self.assertEqual(data["undisposed"], ["dropowner", "fable-review", "quiet-task"])  # SILENT-HIGH needs a decision too
         self.dispose_task("fable-review")
-        self.assertEqual(self.owners()["undisposed"], ["dropowner"])
+        self.assertEqual(self.owners()["undisposed"], ["dropowner", "quiet-task"])
 
     def test_waiting_on_a_dropped_agent_needs_a_decision(self):
         """Part 3 #7: `waiting on <agent id>` must not park an owner once that agent is itself DROPPED."""

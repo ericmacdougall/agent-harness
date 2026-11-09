@@ -412,18 +412,17 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         td = disp.get(agent_id)
         if td and td.get("kind") in GUARDED_KINDS and not t["state"].startswith(("live", "working", "waiting")):
             return False  # checked first: the row loop below relabels such a target (superseded, unverified-legacy)
-        if t["state"] not in ("DROPPED", "done", "handoff", "returned") or agent_id in live_parents:
+        if liveness.holds_work(t) or agent_id in live_parents:  # GoodQA #15565: live means active in the last 10 min
             return True
-        # Any non-live state (DROPPED, done, handoff, returned) is excused only by the target's own live disposition:
-        # an owner that returned a result and then went into a named wait still holds the work (main repro
-        # 2026-11-06: pet-leads-x reassigned to a done owner waiting on goodqa#14883).
+        # Any other state (SILENT, DROPPED, done, handoff, returned, waiting) is excused only by the target's own bound
+        # disposition: an owner that returned a result and then went into a named wait on a live holder still holds
+        # the work (main repro 2026-11-06: pet-leads-x moved to a done owner waiting on goodqa#14883).
         if td and td.get("kind") == "reassigned":
             return covered(td.get("ref"), seen + (agent_id,))
-        if td and td.get("kind") == "resumed" and t["state"] != "DROPPED":
-            # `resumed` stays live once any later activity exists; a target that resumed and then finished (done,
-            # handoff, returned) holds no wait, so only a named wait excuses it (PR #107 review F1)
-            return False
-        return liveness.disposition_live(td, now, last_activity=parse_ts(t["last_activity"]) or 0.0)
+        if td and td.get("kind") == "waiting":
+            return (liveness.disposition_live(td, now, last_activity=parse_ts(t["last_activity"]) or 0.0)
+                    and liveness.disposition_bound(td, t, by_id, rows, asks))
+        return False
 
     for r in rows:
         d = disp.get(r["agent_id"])
@@ -431,8 +430,11 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         alive = liveness.disposition_live(d, now, last_activity=last_wal,
                                           replacement_live=bool(d and d.get("kind") == "reassigned"
                                                                 and covered(d.get("ref"), (r["agent_id"],))))
+        if alive and d and d.get("kind") in liveness.BINDING_KINDS:
+            # GoodQA #15565 (never-drop 16.1): a claim that someone holds the work counts only while the named holder is live
+            alive = liveness.disposition_bound(d, r, by_id, rows, asks, lambda ref: covered(ref, (r["agent_id"],)))
         r["disposition"] = dict(d, live=alive) if d else None
-        r["decision_required"] = bool(r["owner"] and r["state"] == "DROPPED" and not alive)
+        r["decision_required"] = bool(r["owner"] and r["state"] in ("DROPPED", "SILENT-HIGH") and not alive)
         if d and d.get("kind") in ("legacy", "superseded", "wontdo") and r["state"] not in ("done", "handoff", "returned") \
                 and not r["state"].startswith(("live", "working", "waiting")):
             label = "unverified-legacy" if d["kind"] == "legacy" else d["kind"]
@@ -1482,6 +1484,11 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
             state = ask_states(main_wal).get(ref)
             raise AhError("bad_request", f"task.dispose waiting: ask {ref} " + ("is already answered (ask_resolved)"
                           if state == "resolved" else "is not in this session's WAL"), 3)
+        if args["kind"] == "resumed" and not (ref and (_wal_has(main_wal, "subagent", None, agent=ref)
+                                                       or (main_wal.parent / f"{ref}.jsonl").is_file())):
+            # GoodQA #15565 (never-drop 16.1): a resume is a claim that an agent holds the work, so it names that agent
+            raise AhError("bad_request", "task.dispose resumed: --ref must name the agent of this session that took the "
+                                         "work back (the resumed or re-spawned owner); it counts only while that agent is live", 3)
         if args["kind"] == "reassigned" and not (_wal_has(main_wal, "subagent", None, agent=ref)
                                                 or (main_wal.parent / f"{ref}.jsonl").is_file()):
             raise AhError("bad_request", f"task.dispose reassigned: {ref} is not an agent of this session", 3)

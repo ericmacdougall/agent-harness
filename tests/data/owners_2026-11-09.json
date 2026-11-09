@@ -1,0 +1,184 @@
+{
+ "note": "ah owners rows of the main session on 2026-11-09 (GoodQA #15565 replay fixture); task text and reasons omitted",
+ "owners": [
+  {
+   "agent_id": "a2ee995ed05e0eaeb",
+   "type": "general-purpose",
+   "owner": true,
+   "state": "DROPPED",
+   "idle_s": 371671,
+   "ticket": "GoodQA goodqa#14591",
+   "disposition": {
+    "kind": "closed",
+    "ref": null,
+    "at": 1793923919.0
+   }
+  },
+  {
+   "agent_id": "aa80476b7e50e1e32",
+   "type": "general-purpose",
+   "owner": true,
+   "state": "DROPPED",
+   "idle_s": 370668,
+   "ticket": null,
+   "disposition": {
+    "kind": "waiting",
+    "ref": "GoodQA goodqa#14553",
+    "until": 1794787200.0,
+    "at": 1794194407.0
+   }
+  },
+  {
+   "agent_id": "ad465bd1651a77466",
+   "type": "general-purpose",
+   "owner": true,
+   "state": "DROPPED",
+   "idle_s": 351477,
+   "ticket": null,
+   "disposition": {
+    "kind": "waiting",
+    "ref": "GoodQA goodqa#14471",
+    "until": 1794787200.0,
+    "at": 1794194409.0
+   }
+  },
+  {
+   "agent_id": "a0680533ff30cf6d4",
+   "type": "general-purpose",
+   "owner": true,
+   "state": "SILENT-HIGH",
+   "idle_s": 336091,
+   "ticket": null,
+   "disposition": {
+    "kind": "waiting",
+    "ref": "GoodQA goodqa#15476",
+    "until": 1794290400.0,
+    "at": 1794261570.0
+   }
+  },
+  {
+   "agent_id": "af265a5bc68279e94",
+   "type": "task-owner",
+   "owner": true,
+   "state": "SILENT-HIGH",
+   "idle_s": 188370,
+   "ticket": "goodqa#15100",
+   "disposition": {
+    "kind": "reassigned",
+    "ref": "a303821a3fe5e6ca8",
+    "at": 1794261570.0
+   }
+  },
+  {
+   "agent_id": "af794b88fa237d998",
+   "type": "general-purpose",
+   "owner": true,
+   "state": "DROPPED",
+   "idle_s": 167432,
+   "ticket": "GoodQA goodqa#14474",
+   "disposition": {
+    "kind": "resumed",
+    "ref": null,
+    "at": 1794070162.0
+   }
+  },
+  {
+   "agent_id": "adad414d36642c614",
+   "type": "general-purpose",
+   "owner": true,
+   "state": "DROPPED",
+   "idle_s": 103919,
+   "ticket": "goodqa#14859",
+   "disposition": {
+    "kind": "resumed",
+    "ref": "w419ad26dd2f",
+    "at": 1794158094.0
+   }
+  },
+  {
+   "agent_id": "acb1f901fac1ebb03",
+   "type": "task-owner",
+   "owner": true,
+   "state": "DROPPED",
+   "idle_s": 69267,
+   "ticket": null,
+   "disposition": {
+    "kind": "resumed",
+    "ref": null,
+    "at": 1794194412.0
+   }
+  },
+  {
+   "agent_id": "ae5111e19faa4456d",
+   "type": "task-owner",
+   "owner": true,
+   "state": "DROPPED",
+   "idle_s": 19755,
+   "ticket": "GoodQA goodqa#15395",
+   "disposition": {
+    "kind": "resumed",
+    "ref": null,
+    "at": 1794236794.0
+   }
+  },
+  {
+   "agent_id": "a3d46a6d6d9a766a6",
+   "type": "task-owner",
+   "owner": true,
+   "state": "DROPPED",
+   "idle_s": 16125,
+   "ticket": null,
+   "disposition": {
+    "kind": "waiting",
+    "ref": "GoodQA goodqa#15568",
+    "until": 1794679200.0,
+    "at": 1794249557.0
+   }
+  },
+  {
+   "agent_id": "a303821a3fe5e6ca8",
+   "type": "general-purpose",
+   "owner": false,
+   "state": "returned",
+   "idle_s": 3258,
+   "ticket": null,
+   "disposition": null
+  },
+  {
+   "agent_id": "ad2d873e528ccd05f",
+   "type": "task-owner",
+   "owner": true,
+   "state": "SILENT",
+   "idle_s": 1966,
+   "ticket": "goodqa#15585",
+   "disposition": {
+    "kind": "reassigned",
+    "ref": "ac46242e006be6e45",
+    "at": 1794261917.0
+   }
+  },
+  {
+   "agent_id": "ac46242e006be6e45",
+   "type": "task-owner",
+   "owner": true,
+   "state": "live",
+   "idle_s": 0,
+   "ticket": "goodqa#15585",
+   "disposition": null
+  },
+  {
+   "agent_id": "a1a19164ed8810a48",
+   "type": "general-purpose",
+   "owner": false,
+   "state": "done",
+   "idle_s": 20936,
+   "ticket": "goodqa#14791",
+   "disposition": {
+    "kind": "waiting",
+    "ref": "GoodQA parent-proof#665",
+    "until": 1794186000.0,
+    "at": 1794170170.0
+   }
+  }
+ ]
+}

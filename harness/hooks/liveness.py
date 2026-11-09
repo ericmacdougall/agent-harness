@@ -110,7 +110,70 @@ def disposition_live(disp: dict | None, now: float, last_activity: float = 0.0, 
     return (last_activity > at) or (now - at < RESUMED_GRACE_S)
 
 
-ENDING_DISPOSITIONS = frozenset(("reassigned", "closed", "superseded", "wontdo", "legacy"))
+# GoodQA #15565 (never-drop 16.1): `reassigned` is no longer an ending disposition. A disposition is a CLAIM that someone
+# holds the work, so resumed/reassigned/waiting excuse a row only while the thing they name is bound and live
+# (disposition_bound). All 10 DROPPED/SILENT-HIGH rows on 2026-11-09 were "disposed" and ownerless.
+ENDING_DISPOSITIONS = frozenset(("closed", "superseded", "wontdo", "legacy"))
+LIVE_BIND_S = 10 * 60  # a successor counts as live when `ah owners` saw it active within this window
+BINDING_KINDS = ("resumed", "reassigned", "waiting")
+
+
+def holds_work(row) -> bool:
+    """A live successor: running and active within LIVE_BIND_S (never a stopped, SILENT, DROPPED or unknown agent)."""
+    if not isinstance(row, dict):
+        return False
+    state = str(row.get("state") or "")
+    idle = row.get("idle_s")
+    if state.startswith(("live", "working")):
+        return True
+    return state in ("quiet", "idle-helper") and isinstance(idle, (int, float)) and idle <= LIVE_BIND_S
+
+
+def ticket_number(ref) -> str:
+    found = re.search(r"#(\d{1,10})\b", str(ref or ""))
+    return found.group(1) if found else ""
+
+
+def resolve_agent(ref, by_id: dict):
+    """The row an agent ref names: the full id, or a unique prefix of at least 8 characters."""
+    ref = str(ref or "")
+    if ref in by_id:
+        return by_id[ref]
+    if len(ref) >= 8:
+        hits = [row for key, row in by_id.items() if key.startswith(ref)]
+        if len(hits) == 1:
+            return hits[0]
+    return None
+
+
+def disposition_bound(disp: dict, row: dict, by_id: dict, rows: list, asks: dict, covered=None) -> bool:
+    """Whether the thing a resumed/reassigned/waiting disposition names holds the work right now.
+
+    resumed     --ref must be a live agent (the re-spawned or resumed owner); no ref binds only a row that is itself live
+    reassigned  --ref must be a live agent, or one whose own disposition is bound (`covered`, chain-safe, from ah)
+    waiting     --ref is an ask id still open in this session, a live agent, or a ticket that a LIVE owner (not this row)
+                holds. A named wait on an ownerless ticket is the drop it was meant to prevent.
+    Time limits (waiting --until, resumed grace) stay in disposition_live; this adds the binding."""
+    kind = disp.get("kind") if isinstance(disp, dict) else None
+    ref = str(disp.get("ref") or "") if isinstance(disp, dict) else ""
+    if kind not in BINDING_KINDS:
+        return True
+    if kind == "resumed":
+        target = resolve_agent(ref, by_id) if ref else row
+        return holds_work(target)
+    if kind == "reassigned":
+        target = resolve_agent(ref, by_id)
+        if target is None or target is row:
+            return False
+        return holds_work(target) or bool(covered and covered(target["agent_id"]))
+    if re.fullmatch(r"w[0-9a-f]{11}", ref):
+        return asks.get(ref) == "open"
+    target = resolve_agent(ref, by_id)
+    if target is not None:
+        return target is not row and holds_work(target)
+    number = ticket_number(ref)
+    return bool(number) and any(r is not row and r.get("owner") and holds_work(r) and ticket_number(r.get("ticket")) == number
+                                for r in rows)
 
 
 def row_disposed(row: dict) -> bool:

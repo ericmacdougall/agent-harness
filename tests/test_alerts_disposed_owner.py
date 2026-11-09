@@ -1,5 +1,5 @@
 """goodqa#15322 (defect 8): critical/high liveness alerts stayed up for owners that main had already disposed (reassigned,
-closed, superseded, wontdo, legacy). A disposed owner raises no liveness alert; an undisposed one, an expired wait and a
+closed, superseded, wontdo, legacy; a reassignment only while its successor is live). A disposed owner raises no liveness alert; an undisposed one, an expired wait and a
 disposition that is only a time-boxed resume still do. Rows are shapes of real `ah owners` output."""
 
 import os
@@ -25,10 +25,11 @@ def row(agent, kind=None, live=False, state='SILENT-HIGH', decision=False):
             'ticket': None, 'task': 't'}
 
 
-ROWS = [row('a1000001', 'reassigned'), row('a2000002', 'closed'), row('a3000003', 'superseded'), row('a4000004', 'wontdo'),
+ROWS = [row('a1000001', 'reassigned'), row('aa00000a', 'reassigned', live=True), row('a2000002', 'closed'), row('a3000003', 'superseded'), row('a4000004', 'wontdo'),
         row('a5000005', 'legacy'), row('a6000006', None), row('a7000007', 'waiting'), row('a8000008', 'resumed'),
         row('a9000009', 'reassigned', state='DROPPED', decision=True)]
-STILL = ['a6000006', 'a7000007', 'a8000008', 'a9000009']
+# GoodQA #15565: a hand-off whose successor is not live (live False) no longer excuses the row
+STILL = ['a1000001', 'a6000006', 'a7000007', 'a8000008', 'a9000009']
 
 
 class NoTickets:
