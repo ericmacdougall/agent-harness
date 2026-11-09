@@ -12,7 +12,8 @@ async function ownerAccess() {
   const j = await r.json();
   return j.tokens.accessToken;
 }
-const target = (path) => `http://${HOST}:${WEB}${path}`;
+// A RELATIVE redirect: the helper and the web share one https origin (the helper is mounted under /__ct by tailscale serve).
+const target = (path) => path;
 http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, `http://${HOST}`);

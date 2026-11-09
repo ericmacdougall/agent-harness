@@ -9,7 +9,10 @@ mkdir -p "$KIT/run" "$KIT/secrets"; chmod 700 "$KIT/secrets"
 export NODE_ENV=production DEPLOY_ENV=dev PORT="$API_PORT"
 JWT_SECRET="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"; export JWT_SECRET
 CRON_TOKEN="$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"; export CRON_TOKEN
-export WEB_ORIGIN="http://$WEB_HOST:$WEB_PORT" OAUTH_REDIRECT_BASE="http://$WEB_HOST:$WEB_PORT" API_PUBLIC_URL="http://127.0.0.1:$API_PORT"
+# PUBLIC_ORIGIN: the origin a browser uses (for example https://<host>.ts.net:10000 through tailscale serve, tailnet only). The desktop agent
+# browser accepts only https origins (ctl: bad_origins), so a plain http stack cannot be allowed.
+PUBLIC_ORIGIN="${PUBLIC_ORIGIN:-http://$WEB_HOST:$WEB_PORT}"
+export WEB_ORIGIN="$PUBLIC_ORIGIN" OAUTH_REDIRECT_BASE="$PUBLIC_ORIGIN" API_PUBLIC_URL="http://127.0.0.1:$API_PORT"
 export STORAGE_DRIVER=disk UPLOAD_DIR="$KIT/run/uploads" EMAIL_DRIVER=console TASK_298_ATTACHMENT_FINAL_GATE_ENABLED=true
 RELEASE_SOURCE_SHA="$(git -C "$TREE" rev-parse HEAD)"; export RELEASE_SOURCE_SHA RELEASE_DEPLOYMENT_ID=click-kit-15561
 cleanup() {
@@ -27,9 +30,12 @@ grep -q "$RELEASE_SOURCE_SHA" "$KIT/run/version.json" || { echo "API did not rep
 cd "$TREE/apps/web" && API_PROXY_TARGET="http://127.0.0.1:$API_PORT" NEXT_PUBLIC_API_URL='' NEXT_TELEMETRY_DISABLED=1 NODE_OPTIONS=--max-old-space-size=8192 pnpm exec next build > "$KIT/run/web-build.log" 2>&1 || { echo "web build failed, see $KIT/run/web-build.log"; exit 1; }
 # next.config.ts sets output standalone: `next start` answers 404 for every path (click-test finding F-1), so run the standalone server,
 # bound to loopback only, with the static assets and public files linked in.
-SA="$TREE/apps/web/.next/standalone/apps/web"
-mkdir -p "$SA/.next"; ln -sfn "$TREE/apps/web/.next/static" "$SA/.next/static"; [ -d "$TREE/apps/web/public" ] && ln -sfn "$TREE/apps/web/public" "$SA/public"
-cd "$SA" && API_PROXY_TARGET="http://127.0.0.1:$API_PORT" NEXT_PUBLIC_API_URL='' HOSTNAME="$WEB_HOST" PORT="$WEB_PORT" setsid node server.js > "$KIT/run/web.log" 2>&1 &
+# Run it from a COPY outside the checkout (run in-tree the standalone server answered 404 on every path, run from a copy it works).
+rm -rf "$KIT/web"; mkdir -p "$KIT/web"; cp -r "$TREE/apps/web/.next/standalone/." "$KIT/web/"
+mkdir -p "$KIT/web/apps/web/.next"; rm -rf "$KIT/web/apps/web/.next/static"; cp -r "$TREE/apps/web/.next/static" "$KIT/web/apps/web/.next/static"
+[ -d "$TREE/apps/web/public" ] && [ ! -e "$KIT/web/apps/web/public" ] && cp -r "$TREE/apps/web/public" "$KIT/web/apps/web/public"
+SA="$KIT/web/apps/web"
+cd "$SA" &&API_PROXY_TARGET="http://127.0.0.1:$API_PORT" NEXT_PUBLIC_API_URL='' HOSTNAME="$WEB_HOST" PORT="$WEB_PORT" setsid node server.js > "$KIT/run/web.log" 2>&1 &
 WEB_PID=$!
 for i in $(seq 1 60); do curl -fsS -o /dev/null "http://$WEB_HOST:$WEB_PORT/login" 2>/dev/null && break; sleep 2; done
 cp "$KIT/seed.ts" "$TREE/apps/api/.click-seed.ts"
