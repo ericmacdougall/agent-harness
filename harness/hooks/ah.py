@@ -447,6 +447,17 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                 kind == "waiting" and d.get("ack_handoff") is True
                 and liveness.disposition_live(d, now, last_activity=handed))
             acked = bool(acknowledged and float(d.get("at") or 0) >= handed - 10)
+            # A helper spawned by another owner hands its result back to that parent, which takes it by design. The
+            # handoff is taken while the parent still holds the work (live, or excused by its own live disposition,
+            # the same test a reassignment target must pass); a dropped parent leaves the handoff unacked.
+            parent = r.get("parent")
+            pstate = by_id[parent]["state"] if parent in by_id else ""
+            parent_holds = bool(parent and parent != r["agent_id"] and pstate) and (
+                pstate.startswith(("live", "working", "waiting"))  # a SILENT parent may be gone: it does not take it
+                or (pstate in ("DROPPED", "done", "handoff", "returned") and covered(parent, (r["agent_id"],))))
+            if not acked and parent_holds:
+                acked = True
+                r["flags"] = list(r.get("flags") or []) + ["handoff-to-parent"]
             if not acked and now - handed >= HANDOFF_ACK_S:
                 r["decision_required"] = True
                 r["flags"] = list(r.get("flags") or []) + ["handoff-unacked"]

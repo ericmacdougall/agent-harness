@@ -131,6 +131,33 @@ class GateTests(Base):
         self.assertIn("handoff-unacked", after["dropowner"]["flags"])
         self.assertTrue(after["dropowner"]["decision_required"])
 
+    def _helper_of(self, parent, parent_last):
+        """dropowner becomes a helper spawned by `parent`, handing off at NOW; `parent` was last active at parent_last."""
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "agent-dropowner.jsonl", [{"at": iso(NOW), "event": "handoff", "note": "to my parent: result ready"}])
+        jl(w / "main.jsonl", [{"at": iso(NOW), "event": "subagent_stop", "agent_id": "dropowner",
+                              "agent_type": "task-owner"}])
+        jl(w / f"agent-{parent}.jsonl", [{"at": iso(parent_last), "event": "intent", "note": "still working"}])
+        meta = self.home / ".claude" / "projects" / "proj" / SESSION / "subagents" / "agent-dropowner.meta.json"
+        meta.parent.mkdir(parents=True, exist_ok=True)
+        meta.write_text(json.dumps({"agentType": "task-owner", "parentAgentId": parent, "finished": True}))
+
+    def test_handoff_to_a_live_parent_is_acknowledged(self):
+        later = NOW + ah.HANDOFF_ACK_S + 1
+        self._helper_of("aliveowner", parent_last=later - 30)
+        by = {r["agent_id"]: r for r in self.owners(now=later)["owners"]}
+        self.assertNotIn("handoff-unacked", by["dropowner"]["flags"])
+        self.assertIn("handoff-to-parent", by["dropowner"]["flags"])
+        self.assertFalse(by["dropowner"]["decision_required"])
+
+    def test_handoff_to_a_dropped_parent_still_needs_a_decision(self):
+        later = NOW + ah.HANDOFF_ACK_S + 1
+        self._helper_of("aliveowner", parent_last=NOW - 40000)  # parent long silent: it no longer holds the work
+        by = {r["agent_id"]: r for r in self.owners(now=later)["owners"]}
+        self.assertNotEqual(by["aliveowner"]["state"], "live")
+        self.assertIn("handoff-unacked", by["dropowner"]["flags"])
+        self.assertTrue(by["dropowner"]["decision_required"])
+
     def test_live_waiting_disposition_acknowledges_handoff_until_it_expires(self):
         w = self.home / ".claude" / "wals" / SESSION
         jl(w / "agent-dropowner.jsonl", [
