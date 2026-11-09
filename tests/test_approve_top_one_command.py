@@ -147,6 +147,21 @@ class Assent(unittest.TestCase):
                 self.assertIsNotNone(esc.top_assent(words))
         self.assertEqual(esc.top_assent('the blog is done. Use fable for the rescue! thanks'), 'Use fable for the rescue!')
 
+    def test_have_want_get_run_with_the_model_name_are_assent(self):
+        # GoodQA #15565: the user's plain words that were refused as no_assent on 2026-11-09.
+        for words in ('have codex astra do the initial layout/design', 'i just want astra on the first round of ui',
+                      'get astra on the rescue', 'run astra for the layout', 'I want fable on this one'):
+            with self.subTest(words=words):
+                self.assertIsNotNone(esc.top_assent(words))
+
+    def test_have_want_get_keep_negation_condition_question_and_adjacency_checks(self):
+        for words in ('i do not want astra on this', "don't have astra do it", 'want astra if the rescue fails?',
+                      'i want astra later', 'should we have astra do it?', 'have astra disabled', 'get astra off the list',
+                      'i want the blog fixed and astra is slow', 'have a nice day, thanks for astra',
+                      'i want astra. no, never mind.', 'have the rescue finish before fable is mentioned in a long clause here'):
+            with self.subTest(words=words):
+                self.assertIsNone(esc.top_assent(words))
+
     def test_review_d1_a_later_retraction_wins(self):
         # Delta review D1: the latest word decides; an earlier request never survives a later retraction.
         for words in ('use fable. actually no, stop.', 'Use Fable. Never mind, do not use fable',
