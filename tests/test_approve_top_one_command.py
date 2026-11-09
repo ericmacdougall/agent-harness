@@ -154,6 +154,15 @@ class Assent(unittest.TestCase):
             with self.subTest(words=words):
                 self.assertIsNotNone(esc.top_assent(words))
 
+    def test_model_name_then_can_is_assent_unless_negated_or_a_question(self):
+        for words in ('fable/opus can take over the rescue', 'astra can handle the layout', 'fable and opus can do this'):
+            with self.subTest(words=words):
+                self.assertIsNotNone(esc.top_assent(words))
+        for words in ("fable can't take over", 'can fable take over?', 'fable can take over if opus fails',
+                      'fable can be expensive', 'astra can take over. no, stop.', 'fable can not do it'):
+            with self.subTest(words=words):
+                self.assertIsNone(esc.top_assent(words))
+
     def test_have_want_get_keep_negation_condition_question_and_adjacency_checks(self):
         for words in ('i do not want astra on this', "don't have astra do it", 'want astra if the rescue fails?',
                       'i want astra later', 'should we have astra do it?', 'have astra disabled', 'get astra off the list',

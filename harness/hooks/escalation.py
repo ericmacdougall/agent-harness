@@ -604,6 +604,9 @@ TOP_NEGATION = re.compile(r"\b(?:not|no|never|don'?t|do not|doesn'?t|won'?t|stop
 # span of at most two words (the negation, condition and question checks still apply to the whole sentence).
 TOP_REQUEST_NEAR = re.compile(r"\b(?:have|want|wants|get|run)(?:\s+[\w'/-]+){0,2}?\s+(?:fable|astra|top[ -](?:writing[ -])?(?:rung|model|tier))\b",
                               re.I)
+# "fable/opus can take over ..." (refused on 2026-11-09): the model name comes first, then `can` and an action verb.
+TOP_CAN = re.compile(r"\b(?:fable|astra|top[ -](?:writing[ -])?(?:rung|model|tier))(?:\s*[/,]\s*[\w-]+|\s+(?:and|or)\s+[\w-]+)?"
+                     r"\s+can\s+(?:take(?:\s+over)?|do|handle|run|lead|start|own|work\s+on|review|write|build)\b", re.I)
 _SENTENCES = re.compile(r"(?<=[.!?;])\s+|\n+")
 TOP_RETRACT = re.compile(r"\b(?:never ?mind|scratch that|forget (?:it|that)|hold (?:on|off)|belay)\b", re.I)
 
@@ -624,7 +627,7 @@ def top_assent(text):
     if not mentions:
         return None
     candidate = sentences[mentions[-1]]
-    if '?' in candidate or not (TOP_REQUEST.search(candidate) or TOP_REQUEST_NEAR.search(candidate)) \
+    if '?' in candidate or not (TOP_REQUEST.search(candidate) or TOP_REQUEST_NEAR.search(candidate) or TOP_CAN.search(candidate)) \
             or TOP_NEGATION.search(candidate):
         return None
     for later in sentences[mentions[-1] + 1:]:
