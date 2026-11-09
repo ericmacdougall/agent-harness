@@ -1,0 +1,8 @@
+chore(scratch): add preview start script and red-team fix message
+
+Why: The click-tester needs a one-command start for the disposable preview, and the worktree must stay clean.
+What: Add preview-start.sh (fresh synthetic password, wrangler 8791, loopback proxy 8792) and the commit message draft.
+Testing: not run: the same steps were run by hand during the work.
+Refs: none (chore: scratch helper)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

@@ -1,0 +1,8 @@
+fix(videos): red-team fixes for Prev/Next, short windows, focus
+
+Why: Red-team review of PR #7 found that tapping Next after the current lesson was hidden by a progress filter (for example just marked watched under Unwatched) jumped back to the first visible lesson; a short desktop window also got the phone layout; and resizing to desktop with the sheet open dropped focus to the body.
+What: Previous and Next now go to the nearest visible lesson after or before the current one in catalog order when the current lesson is filtered out. The short-landscape clause of the phone query now requires a coarse pointer (CSS and MOBILE_QUERY). Leaving the phone layout with the sheet open focuses the search box. Add checks for all three.
+Testing: `python test/mobile/mobile_check.py` on the t2-dev preview -> 189 passed, 0 failed (the Next check failed against the previous build: landed on "Designing checkout..." instead of the following lesson); `npm test` -> 139 passed; `python3 -m unittest discover -s test -p '*_test.py'` -> 57 OK.
+Refs: GoodQA #15486
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
