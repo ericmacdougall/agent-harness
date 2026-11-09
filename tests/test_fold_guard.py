@@ -198,7 +198,7 @@ class FoldCase(unittest.TestCase):
 
     def test_override_needs_a_resolving_user_source(self):
         self.src["priority"] = "immediate"
-        note = "dropped on purpose\nFold-Override: user:%s/%s \"drop it\"" % (uuid.uuid4(), uuid.uuid4())
+        note = "dropped on purpose\nFold-Override: user:%s/%s \"drop #14518\"" % (uuid.uuid4(), uuid.uuid4())
         bad = {"ok": False, "kind": "user", "problems": [{"code": "not-found"}]}
         with mock.patch("provenance.resolve", lambda s, *a, **k: bad):
             code, text = self.wont_fix(note)
@@ -219,8 +219,18 @@ class FoldCase(unittest.TestCase):
         with mock.patch("provenance.resolve", lambda s, *a, **k: good):
             code, text = self.wont_fix(unrelated)
             self.assertEqual(code, 2, text)
-            self.assertIn("do not mention this ticket", text)
+            self.assertIn("do not name this ticket", text)
             self.assertEqual(self.wont_fix(about), (0, ""))
+
+    def test_override_words_cannot_be_an_unrelated_or_refusing_message(self):
+        # review R1: a real queue command containing a fold word passed; a refusal of the fold must not count
+        self.src["priority"] = "immediate"
+        good = {"ok": True, "kind": "queue", "weak": False}
+        for words in ("check-dropped-workstreams", "dropped", "do not close #14518", "keep #14518 open, never drop it",
+                      "close #14518 if the umbrella is ready", "close #14519"):
+            note = "x\nFold-Override: queue:%s/2026-11-09T22:39:59.349Z#0f7f79687b56 \"%s\"" % (uuid.uuid4(), words)
+            with self.subTest(words=words), mock.patch("provenance.resolve", lambda s, *a, **k: good):
+                self.assertEqual(self.wont_fix(note)[0], 2)
 
     # ---- hostile shapes: nothing is skipped quietly
 
@@ -285,8 +295,11 @@ class FoldCase(unittest.TestCase):
         self.comment(SRC, "REALLY_TESTED p1: ran live, ok, commit abc1234")
         self.assertEqual(self.wont_fix(), (0, ""))  # a comment clears the WAL pending
         self.comments[SRC].clear()
-        (w2 / "main.jsonl").write_text(json.dumps({"note": "REALLY_TESTED p1: live ok"}) + "\n")
-        self.assertEqual(self.wont_fix(), (0, ""))  # so does another session's WAL
+        (w2 / "main.jsonl").write_text(json.dumps({"note": "REALLY_TESTED p1: unrelated check on goodqa#7"}) + "\n")
+        code, text = self.wont_fix()  # a bare id in another session about another ticket proves nothing (review R2)
+        self.assertEqual(code, 2, text)
+        (w2 / "main.jsonl").write_text(json.dumps({"note": "REALLY_TESTED p1: live ok for #14518"}) + "\n")
+        self.assertEqual(self.wont_fix(), (0, ""))  # one that names this ticket does, in any session
 
     def test_unmet_acs_come_from_the_verified_spec_and_evidence(self):
         core = "c" * 64

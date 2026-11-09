@@ -33,7 +33,8 @@ OVERRIDE = re.compile(r"(?im)^[ \t]*Fold-Override:[ \t]*(.+?)[ \t\r]*$")
 UNCHECKED = re.compile(r"(?m)^[ \t]*(?:[-*+]|\d{1,3}[.)])[ \t]+\[ {1,2}\][ \t]+(.+?)[ \t\r]*$")
 FOLD_WORDS = re.compile(r"\b(?:fold(?:ed|ing)?|clos(?:e|ed|ing)|won'?t[ -]?fix|duplicate|drop(?:ped)?|abandon\w*|cancel\w*|"
                         r"supersed\w*|no longer (?:needed|wanted)|not needed)\b", re.I)
-PRIORITY_RANK = {"immediate": 4, "urgent": 3, "high": 2, "medium": 1, "low": 0, "none": 0}
+FOLD_NEGATION = re.compile(r"\b(?:not|never|don'?t|do not|keep|stop|unless|if|without|leave|reopen|no)\b|n't\b", re.I)
+PRIORITY_RANK ={"immediate": 4, "urgent": 3, "high": 2, "medium": 1, "low": 0, "none": 0}
 PENDING_NOTE = re.compile(r"(?m)^[ \t]*PENDING_REAL_TEST[ \t]+([A-Za-z0-9][A-Za-z0-9._-]{0,40})[ \t]*:")
 TESTED_NOTE = re.compile(r"(?m)^[ \t]*REALLY_TESTED[ \t]+([A-Za-z0-9][A-Za-z0-9._-]{0,40})[ \t]*:")
 HIGH = {"immediate", "urgent"}
@@ -85,7 +86,7 @@ def wal_pending_index(targets: dict, home: Path | None = None, now: float | None
     home = home or Path.home()
     root = home / ".claude" / "wals"
     now = time.time() if now is None else now
-    pending, tested, complete = {}, set(), True
+    pending, tested, complete = {}, [], True
     try:
         files = [f for session in root.iterdir() if session.is_dir() for f in session.glob("*.jsonl")]
     except OSError:
@@ -108,13 +109,25 @@ def wal_pending_index(targets: dict, home: Path | None = None, now: float | None
             except ValueError:
                 continue
             note = str(row.get("note") or "") if isinstance(row, dict) else ""
-            tested |= set(TESTED_NOTE.findall(note))
+            for ident in TESTED_NOTE.findall(note):
+                tested.append((path.parent.name, ident, note))
             for ident in PENDING_NOTE.findall(note):
                 for number, slug in targets.items():
-                    for found in re.finditer(r"(?:\b([A-Za-z0-9][A-Za-z0-9-]*))?#%d(?!\d)" % int(number), note):
-                        if not found.group(1) or not slug or found.group(1).lower() == str(slug).lower():
-                            pending.setdefault(number, {})[ident] = True
-    return {n: [i for i in pending.get(n, {}) if i not in tested] for n in targets}, complete
+                    if _names_ticket(note, number, slug):
+                        pending.setdefault(number, {})[ident] = path.parent.name
+    # a pending id is closed by a REALLY_TESTED with the same id in the SAME session, or one that names this ticket
+    # (short ids such as T1 are reused across tickets, so a bare id elsewhere proves nothing)
+    return {n: [i for i, session in pending.get(n, {}).items()
+                if not any(t[1] == i and (t[0] == session or _names_ticket(t[2], n, targets[n])) for t in tested)]
+            for n in targets}, complete
+
+
+def _names_ticket(note: str, number, slug) -> bool:
+    """note has #number bare or with this ticket's own project (bugtracker#14518 is not goodqa#14518)."""
+    for found in re.finditer(r"(?:\b([A-Za-z0-9][A-Za-z0-9-]*))?#%d(?!\d)" % int(number), note):
+        if not found.group(1) or not slug or found.group(1).lower() == str(slug).lower():
+            return True
+    return False
 
 
 def unmet_items(issue: dict, comments: list, spec_view=None, extra_pending=()) -> list:
@@ -181,10 +194,15 @@ def check_override(note: str, resolver=None, number=None) -> tuple:
     found = OVERRIDE.search(note or "")
     if not found:
         return False, "no `Fold-Override: <Source>` line in the note"
-    cited = found.group(1)
-    if not (FOLD_WORDS.search(cited) or (number and re.search(r"#%d(?!\d)" % int(number), cited))):
-        return False, ("the words cited in Fold-Override do not mention this ticket (#%s) or folding, closing, dropping or "
-                       "superseding it: cite the user's sentence about this work, not any message of theirs" % number)
+    quoted = re.findall(r'"([^"]*)"', found.group(1))
+    cited = " ".join(quoted) if quoted else found.group(1)  # the user's words, not the session and message ids
+    # The cited words must name THIS ticket (a fold word alone matched an unrelated slash command in review) and must not
+    # refuse the fold: "do not close #14518" is the opposite of a disposition.
+    if not (number and re.search(r"#%d(?!\d)" % int(number), cited)):
+        return False, ("the words cited in Fold-Override do not name this ticket (#%s): cite the user's own sentence "
+                       "about this ticket, not any message of theirs" % number)
+    if FOLD_NEGATION.search(cited):
+        return False, "the words cited in Fold-Override refuse or condition the fold (not, never, keep, if, unless)"
     if resolver is None:
         import provenance
         resolver = provenance.resolve
