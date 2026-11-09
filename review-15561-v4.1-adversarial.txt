@@ -1,30 +1,25 @@
-ADVERSARIAL DELTA REVIEW: goodqa#15561 spec v4 (core 61d1740f) -> v4.1 (core 5ff58988), the 42-line diff only
-Reviewer: agent-a0e0378fdb6d0d338. Read-only. No tests or probes run.
-VERDICT: ACCEPT. M1, M2, L1, L2 and L3 are closed, and nothing is weakened. One new low finding is raised by the M2 fix.
+ADVERSARIAL DELTA REVIEW: goodqa#15561 spec v4.1 (core 66d6580d, after wording changes; previous review covered core 5ff58988)
+Reviewer: agent-a0e0378fdb6d0d338. Read-only. Code at t2-dev /home/eric/wt-15561 @ 5669940a. No tests or probes run.
+VERDICT: ACCEPT. Nothing is weakened. N1 from the previous pass is closed. One low precision note on F4.
 
-M1 closed:
-  "while the platform switch `userTokens.sessionActions` is off, its default, a token CAN mint a legacy child, so the live token's `created_via` and `created_by_token_id` are read from metadata and the proof requires `created_via = session` with no parent"
-  This matches user-token-policy.ts:663 and service.ts:582.
+Earlier findings, all still closed: M1, M2, L1, L2, L3.
 
-M2 closed:
-  "the production live proof may reuse an existing token only if an operator reads its metadata and it is EXACTLY the abilities `desktop_signin` + `read` + `crm`, `created_via = session`, no parent ... otherwise the owner mints a fresh "Desktop app: view CRM" token."
-  AC-12 adds: "records ... the token's abilities, `created_via` and `created_by_token_id` (metadata only)".
-  An operator or Everything token can no longer satisfy the oracle.
+N1 closed:
+  "the live proof therefore runs as a separate desktop sign-in that is not the mini's working session, or re-signing the mini in with its working token afterwards is a registered human step (it joins ask wc27c825f054), and the mini's previous sign-in is restored after the proof; the Ask-me-first mint approval (`approval: 'desktop_signin'`) is a further human step."
 
-L1 closed:
-  "A token without `read` cannot start a session (AC-9; `write` is not required to start one, D6)".
+New wording, checked:
+- Fallback token: "exactly `desktop_signin` + `read` + `crm` (the "Desktop app: view CRM" preset once S5 has shipped; the three checkboxes by hand before, they exist today)". Correct: only platform.admin and machines are conditional checkboxes (F4).
+- AC-12: the metadata is "read by an operator who is not the author ... so the evidence ... stays independent". This strengthens independence.
+- Q9 step: "The operator read of the metadata happens BEFORE the deploy; the re-sign-in must be done within the same release window, otherwise #1319 is rolled back". There is a deadline and a rollback criterion, and the over-privileged replacement token is disclosed as a known limitation. Acceptable.
+- F6(c): "(`/v1/orgs/:p/entitlements`, `/v1/orgs/:p/members`) which the S0 inventory decided to delegate as read-only page-support entries (D4)". This matches desktop-token-session.ts:178-179 (['read']), and a GET of members needs only read by bearer (the members rules in user-token-policy.ts:205-210 are WRITE-only).
 
-L2 closed:
-  "Registered human step and rollback criterion (Q9): ... registered as an ask before the deploy; #1319 is rolled back rather than leaving the mini without remote routes if that re-sign-in is not done."
+F4 against the code:
+  "a bearer token cannot mint once the platform switch `userTokens.sessionActions` is on; while that switch is off (its default) a bearer token can still mint a legacy child (`created_via = user_token`)"
+  This matches. user-token-policy.ts:656 sets legacyMint = !sessionActionsOn for POST /v1/me/user-tokens, and :663 applies the token_mint rule only when sessionActionsOn. service.ts:582 refuses a user_token actor only when sessionActionsEnabled. The child gets createdVia = actor.kind = 'user_token' (service.ts:641).
 
-L3 closed:
-  one Q7 sentence. "contact detail becomes reachable ...; the contact TIMELINE stays behind its existing session-action control ... by main's decision (comment 59a46886...)".
-  The provenance is split correctly: the user's answer covers opening contact detail, and main's comment covers keeping the timeline control.
+P1 [LOW, precision; not blocking]
+  "a bound desktop session can never mint (policy rule `token_mint`)"
+  The effect is true, but the mechanism named is right only while the switch is on. With the switch off, the token_mint rule is not applied (:663), and a bound session is refused POST /v1/me/user-tokens at route class instead: the route is in neither ALLOWED nor DESKTOP_DELEGATED_SURFACES, so the answer is desktop_token_session_scope. The service-level check also does not fire, because the bound session never reaches the handler.
+  Suggested wording: "a bound desktop session can never mint (the mint route is on neither door, so it is refused at route class; with the switch on the `token_mint` rule also refuses it)". NEG-8 already pins the refusal.
 
-N1 [LOW, new, raised by the M2 fix; live-procedure availability]
-  M2 now requires the mini to run the AC-12 proof signed in with a token that is exactly desktop_signin + read + crm, with no `machines`. Under D6 and NEG-20, a session from that token is refused the machine and remote-session host routes (user_token_ability_missing). While the mini is signed in for the proof, it therefore loses its machine and remote-control routes, whatever kind the previous token was.
-  The L2 step covers only the operator-bound case. It does not cover the proof session itself.
-  Fix: one line in the prerequisites. Either run the CRM-view proof as a separate desktop sign-in that is not the mini's working session, or register the re-sign-in with the mini's working token after the proof as a human step (the same ask, wc27c825f054). The mini must not be left on the CRM-view token if remote access depends on it.
-  This does not block the spec. It must be settled before the live proof runs.
-
-Not verified: production metadata of the mini's token, and whether ask wc27c825f054 exists. I did not trace it with provenance.py.
+Not verified: production metadata, whether ask wc27c825f054 exists (not traced), and the S1e, S1c, S4 and S5 code (not written).
