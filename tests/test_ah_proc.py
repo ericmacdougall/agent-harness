@@ -483,6 +483,22 @@ class NarrowedScope(KillBase):
         self.assertIn("1101", ev["message"])
         self.assertEqual([r["event"] for r in self.audit()][:2], ["intent", "signal"])
 
+    def test_repeated_foreign_stops_by_one_session_share_one_aggregated_alert_key(self):
+        """Fleet round item 3: every stop raised its own high alert (unique key per run), 40 of them at once."""
+        for pid in (1101, 1103):
+            self.run_kill(self.foreign(pid), [pid], foreign=True, reason="runaway pytest of another owner")
+        self.assertEqual(len(self.notices), 2)
+        self.assertEqual(self.notices[0]["key"], self.notices[1]["key"])
+        self.assertEqual(self.notices[0]["key"], "ah-kill:foreign:sess-1")
+        self.assertEqual(self.notices[1]["severity"], "high", "a stop of another owner's process stays visible")
+
+    def test_foreign_stop_of_the_callers_own_session_processes_is_info(self):
+        probe = self.foreign(1104)
+        probe.session_env = lambda pid: "sess-1"
+        with mock.patch.object(ak, "session_ancestor", lambda *a, **k: 77):
+            self.run_kill(probe, [1104], foreign=True, reason="stop my own preview server")
+        self.assertEqual(self.notices[0]["severity"], "info", self.notices[0])
+
     def test_failed_notice_means_no_signal(self):
         probe = self.foreign(1102)
 
@@ -571,6 +587,11 @@ class ReviewRound3(KillBase):
                        notify=lambda h, e: notices.append(e))
         self.assertEqual(len(notices), 1)
         self.assertEqual(notices[0]["severity"], "high")
+        for pid in (6, 7):
+            ak.kill_remote("dev2", [pid], "r", False, 5, home=self.home, runner=runner, foreign=True,
+                           notify=lambda h, e: notices.append(e), session="sess-1")
+        self.assertEqual(notices[-1]["key"], notices[-2]["key"], "remote stops by one session on one host share one alert")
+        self.assertEqual(notices[-1]["key"], "ah-kill:foreign:remote-dev2-sess-1")
 
         def boom(h, e):
             raise OSError("ring")
@@ -981,8 +1002,8 @@ class ApprovedBy(KillBase):
         out = self.approved(probe, [6101], tree=True)
         self.assertEqual(sorted((r["pid"], r["status"]) for r in out["results"]), [(6101, "exited"), (6102, "exited")])
         self.assertEqual(len(self.notices), 1)
-        self.assertTrue(self.notices[0]["key"].startswith("ah-kill:approved:"))
-        self.assertEqual(self.notices[0]["severity"], "high")
+        self.assertEqual(self.notices[0]["key"], "ah-kill:approved:sess-1")
+        self.assertEqual(self.notices[0]["severity"], "info", "a user-approved stop is a record, not a page (fleet round item 3)")
         self.assertEqual(self.notices[0]["detail"]["ask"], "wa1b2c3d4e5f")
         intents = {r["pid"]: r for r in self.audit() if r.get("event") == "intent"}
         self.assertEqual({intents[6101]["scope"], intents[6102]["scope"]}, {"approved"})
