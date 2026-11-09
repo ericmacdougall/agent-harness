@@ -15,6 +15,7 @@ PATTERNS = [
     ('deploy record note', r'^Deployed to prod:'),
     ('main/coordinator decision note', r'^Decision \(made by main/coordinator'),
     ('red-team round note', r'^Red-team (round|delta)'),
+    ('lane stuck auto-decider notice', r'^Lane \S+ is stuck: the auto-decider'),
     ('routing note', r'^Routing \((coordinator|GoodQA Desk)'),
 ]
 CP = [(n, re.compile(p)) for n, p in PATTERNS]
