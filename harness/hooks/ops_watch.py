@@ -91,6 +91,9 @@ def defaults(host: str) -> dict:
                       "no_heavy_jobs": darwin},
         "delivery": [],
         "drift": {"repo": None, "ref": "origin/main", "claude_dir": "~/.claude"},
+        # goodqa#15565: merged-not-deployed per registered service, and PENDING_REAL_TEST left open
+        "deploys": {"enabled": True, "services": [], "merged_after_h": 2, "pending_after_h": 6, "lookback_h": 72,
+                    "wal_root": "~/.claude/wals"},
         "codex_dir": "~/.codex",
         # thresholds shared with ahd's liveness.py (DESIGN.md section 5): SILENT 30 min warning, 60 min high
         "liveness": {"enabled": True, "wal_root": "~/.claude/wals", "silent_min": 30, "silent_high_min": 60,
@@ -1558,6 +1561,94 @@ def check_liveness(cfg, state, runner, now):
 
 # ---------------------------------------------------------------- run
 
+PENDING_NOTE_RE = re.compile(r"^\s*PENDING_REAL_TEST\s+([A-Za-z0-9][A-Za-z0-9._-]{0,40})\s*:")
+TESTED_NOTE_RE = re.compile(r"^\s*REALLY_TESTED\s+([A-Za-z0-9][A-Za-z0-9._-]{0,40})\s*:")
+MAX_DEPLOY_WAL_BYTES = 32 << 20
+
+
+def check_deploys(cfg, state, runner, now):
+    """GoodQA #15565 (never-drop slice 3): a fix that merged but never deployed, and a PENDING_REAL_TEST that never closed.
+
+    services: each {name, repo, ref (default origin/main), deployed_file}. deployed_file is JSON {"sha": ...} written by
+    the deploy tool. When the ref moved past that sha and the OLDEST undeployed commit is older than merged_after_h, one
+    warning per service lists how many commits wait. A service with no readable deploy record is reported too (the drift
+    cannot be judged). Pending: every PENDING_REAL_TEST older than pending_after_h with no REALLY_TESTED of the same id in
+    the same session is listed, one alert per session."""
+    d = cfg.get("deploys") or {}
+    home = home_of(cfg)
+    out = []
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+    merged_after = float(d.get("merged_after_h", 2)) * 3600
+    for svc in d.get("services") or []:
+        name = str(svc.get("name") or "")
+        repo = expand(home, svc.get("repo") or "")
+        if not name or not repo or not os.path.isdir(repo):
+            continue
+        ref = str(svc.get("ref") or "origin/main")
+        key = f"deploy-drift:{name}"
+        try:
+            deployed = json.loads(Path(expand(home, svc.get("deployed_file") or "")).read_text(encoding="utf-8")).get("sha")
+        except (OSError, ValueError, AttributeError):
+            deployed = None
+        if not isinstance(deployed, str) or not re.fullmatch(r"[0-9a-f]{7,40}", deployed):
+            out.append(alert("deploys", key, "warning", f"{name}: no readable deploy record, so merged-not-deployed cannot be judged",
+                             {"service": name}))
+            continue
+        rc, head = runner(["git", "-C", repo, "rev-parse", ref], 30, env=env)
+        if rc != 0:
+            continue
+        head = head.strip()
+        if head.startswith(deployed) or deployed.startswith(head):
+            continue
+        rc, times = runner(["git", "-C", repo, "log", "--format=%ct", f"{deployed}..{ref}"], 30, env=env)
+        stamps = sorted(int(x) for x in times.split() if x.isdigit()) if rc == 0 else []
+        if not stamps:
+            out.append(alert("deploys", key, "warning", f"{name}: deployed {deployed[:8]} is not an ancestor of {ref} {head[:8]}",
+                             {"service": name}))
+        elif now - stamps[0] >= merged_after:
+            out.append(alert("deploys", key, "warning",
+                             f"{name}: {len(stamps)} merged commit(s) not deployed, oldest {int((now - stamps[0]) // 3600)}h old "
+                             f"(deployed {deployed[:8]}, {ref} {head[:8]})", {"service": name, "commits": len(stamps)}))
+    pending_after = float(d.get("pending_after_h", 6)) * 3600
+    look = float(d.get("lookback_h", 72)) * 3600
+    root = Path(expand(home, d.get("wal_root") or "~/.claude/wals"))
+    try:
+        sessions = [p for p in root.iterdir() if p.is_dir()]
+    except OSError:
+        sessions = []
+    for session in sessions:
+        pending, tested = {}, set()
+        for path in session.glob("*.jsonl"):
+            try:
+                st = path.stat()
+                if now - st.st_mtime > look or st.st_size > MAX_DEPLOY_WAL_BYTES:
+                    continue
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for raw in text.splitlines():
+                if "REAL" not in raw:
+                    continue
+                try:
+                    row = json.loads(raw)
+                except ValueError:
+                    continue
+                note = str(row.get("note") or "") if isinstance(row, dict) else ""
+                at = parse_ts(row.get("at")) if isinstance(row, dict) else None
+                m = TESTED_NOTE_RE.match(note)
+                if m:
+                    tested.add(m.group(1))
+                m = PENDING_NOTE_RE.match(note)
+                if m and at is not None:
+                    pending[m.group(1)] = min(at, pending.get(m.group(1), at))
+        old = sorted(i for i, at in pending.items() if i not in tested and now - at >= pending_after)
+        if old:
+            out.append(alert("deploys", f"pending-open:{session.name[:8]}", "warning",
+                             f"{len(old)} PENDING_REAL_TEST open for {int(pending_after // 3600)}h or more with no REALLY_TESTED "
+                             f"(session {session.name[:8]}): {', '.join(old[:6])}", {"session": session.name[:8], "ids": old[:20]}))
+    return out
+
+
 DEFAULT_CHECKS = {
     "disk": check_disk,
     "units": lambda c, s, r, n: check_units(c, s, r, n) if c["units"].get("enabled") and shutil.which("systemctl") else [],
@@ -1570,6 +1661,7 @@ DEFAULT_CHECKS = {
     "liveness": lambda c, s, r, n: check_liveness(c, s, r, n) if c["liveness"].get("enabled") else [],
     "peers": check_peers,
     "remote_units": check_remote_units,
+    "deploys": lambda c, s, r, n: check_deploys(c, s, r, n) if (c.get("deploys") or {}).get("enabled", True) else [],
 }
 RUN_CHECK = "_run"    # internal errors; cleared by any completed run
 SINK_CHECK = "_sink"  # delivery failures; cleared when that sink recovers
