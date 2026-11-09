@@ -786,6 +786,14 @@ class Daemon:
                 docs[s] = doc
         return docs
 
+    def _has_request(self, session: str, agent: str, ts: float) -> bool:
+        """A live successor request (ready, launched, cap_wait, launch backoff) already exists for this stream."""
+        try:
+            import successor  # noqa: PLC0415
+            return successor.open_request(successor.read_requests(home(), session), agent, ts) is not None
+        except Exception:  # noqa: BLE001 - unreadable log: ask `ah`, which dedupes by itself
+            return False
+
     def request_successors(self, docs: dict, ts: float, deadline: float) -> list:
         """GoodQA #15565 (never-drop 16.2): while main is absent (its WAL idle for successor_main_idle_s), ask `ah task
         succeed` for a successor for each owner `ah owners` marks decision_required and idle that long. The verb is
@@ -804,7 +812,8 @@ class Daemon:
             for row in doc.get("owners") or []:
                 if len(done) >= budget:
                     return done
-                if row.get("decision_required") is True and (row.get("idle_s") or 0) >= limit:
+                if row.get("decision_required") is True and (row.get("idle_s") or 0) >= limit \
+                        and not self._has_request(session, str(row.get("agent_id")), ts):  # a waiting stream must not eat the budget
                     rc, _ = self.call("task succeed", ["--agent", str(row.get("agent_id")), "--session", session], deadline)
                     done.append((session[:8], str(row.get("agent_id"))[:12], rc))
         return done
