@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { and, eq, sql } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
-import { aiThreads, chatConversationMembers, chatConversations, chatMessages, commanderSettings, platformSettings, qacTurns } from '@bugtracker/db';
+import { aiThreads, chatConversationMembers, chatConversations, chatMessages, commanderSettings, organizations, orgMembers, platformSettings, qacTurns } from '@bugtracker/db';
 import { createOrg, createTestApp, resetDb, signupUser, type TestContext } from './helpers';
 import { canonicalCommander } from './commander-fixture';
 import { createAiThread, updateAiThread } from '../src/modules/messaging/ai-thread-lifecycle';
@@ -110,12 +110,13 @@ describe('K2 idempotent AI thread create', () => {
     const { owner, org } = await world();
     const key = randomUUID();
     expect((await post(owner.headers, org.id, { message: 'One', clientRequestId: key })).statusCode).toBe(201);
+    // The project is created before the snapshot: creating a project adds its own conversation.
+    const project = await ctx.app.inject({ method: 'POST', url: `/v1/orgs/${org.id}/projects`, headers: owner.headers, payload: { name: 'P', key: 'KTWO' } });
+    const projectId = (project.json() as { project: { id: string } }).project.id;
     const before = await counts();
     const other = await post(owner.headers, org.id, { message: 'Two', clientRequestId: key });
     expect(other.statusCode, other.body).toBe(409);
     expect(other.json().error.code).toBe('client_request_conflict');
-    const project = await ctx.app.inject({ method: 'POST', url: `/v1/orgs/${org.id}/projects`, headers: owner.headers, payload: { name: 'P', key: 'KTWO' } });
-    const projectId = (project.json() as { project: { id: string } }).project.id;
     const scoped = await post(owner.headers, org.id, { message: 'One', clientRequestId: key, projectId });
     expect(scoped.statusCode, scoped.body).toBe(409);
     expect(await counts()).toEqual(before);
@@ -241,5 +242,38 @@ describe('K2 idempotent AI thread create', () => {
     release2();
     await rowHolder;
     await expect(slow).resolves.toMatchObject({ replayed: false });
+  });
+  it('NEG-13: a message with a credential-shaped string, sent twice with one key, replays (the hash is over the redacted body)', async () => {
+    const { owner, org } = await world();
+    await ctx.db.update(organizations).set({ entitlementOverrides: { 'chat.credentialGuard': true } }).where(eq(organizations.id, org.id));
+    await ctx.db.insert(platformSettings).values({ key: 'chat.credentialGuard', value: true, valueType: 'boolean', updatedBy: owner.user.id, reason: 'goodqa#14903 K2 fixture' })
+      .onConflictDoUpdate({ target: platformSettings.key, set: { value: true } });
+    const key = randomUUID();
+    const message = 'Use token ghp_0123456789abcdefghijklmnop for the deploy';
+    const first = await post(owner.headers, org.id, { message, clientRequestId: key });
+    expect(first.statusCode, first.body).toBe(201);
+    const [stored] = await ctx.db.select({ body: chatMessages.body }).from(chatMessages).where(eq(chatMessages.clientMsgId, key));
+    expect(stored!.body).not.toContain('ghp_0123456789abcdefghijklmnop');
+    const before = await counts();
+    const again = await post(owner.headers, org.id, { message, clientRequestId: key });
+    expect(again.statusCode, again.body).toBe(200);
+    expect(again.json().replayed).toBe(true);
+    expect((again.json() as { conversation: { id: string } }).conversation.id).toBe((first.json() as { conversation: { id: string } }).conversation.id);
+    expect(await counts()).toEqual(before);
+  });
+
+  it('NEG-7: a caller removed from the org is refused as without a key, never replayed', async () => {
+    const { owner, org } = await world();
+    const member = await signupUser(ctx.app, { name: 'Member' });
+    await ctx.db.insert(orgMembers).values({ orgId: org.id, userId: member.user.id });
+    const key = randomUUID();
+    expect((await post(member.headers, org.id, { message: 'Mine', clientRequestId: key })).statusCode).toBe(201);
+    await ctx.db.delete(orgMembers).where(and(eq(orgMembers.orgId, org.id), eq(orgMembers.userId, member.user.id)));
+    const plain = await post(member.headers, org.id, { message: 'Mine' });
+    const retry = await post(member.headers, org.id, { message: 'Mine', clientRequestId: key });
+    expect([200, 201, 409]).not.toContain(retry.statusCode);
+    expect(retry.statusCode).toBe(plain.statusCode);
+    expect(retry.json().error.code).toBe(plain.json().error.code);
+    void owner;
   });
 });

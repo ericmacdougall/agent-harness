@@ -1,0 +1,36 @@
+feat(messaging): idempotent AI thread create with clientRequestId
+
+Why: Kimi QAC found that a slow or lost create response leaves the user
+waiting, and a resend makes a second thread (goodqa#14903 K2, Option B).
+The create must be safe to retry and must not hang behind a stuck original.
+
+What: POST /v1/orgs/:orgId/ai-threads takes an optional clientRequestId
+(uuid), stored as the first message's client_msg_id. Under the per-user
+advisory lock the key is looked up directly; the same request (own general
+AI thread in the org, same project, same credential-redacted body hash,
+conversation still accessible) replays with 200 and replayed: true and
+writes nothing. Anything else with that key is 409 client_request_conflict
+and reveals nothing about the other row. With a key, the lock wait is
+bounded (5 s, lock_timeout reset right after) and a timeout is 409
+create_in_progress. A key needs a message and cannot carry a title. No key
+keeps today's behaviour.
+
+Testing: `pnpm --filter @bugtracker/api exec vitest run test/ai-thread-create-idempotency.test.ts`
+on a pgpool lease on t2-dev -> before the change 12 failed, 1 passed
+(NEG-10, the no-key path); after 15 passed (NEG-13 credential body and
+NEG-7 access lost added since). Controlled broken variants: lookup before
+the lock -> AC-3 failed; hash over the raw body -> NEG-13 failed.
+Neighbours commander-thread-lifecycle, commander-threads,
+qac-ai-thread-invite-link, commander-threads-off-dm-admission -> 105 passed
+(with the K2 file at 13 tests).
+`node --max-old-space-size=12000 ./node_modules/typescript/bin/tsc --noEmit`
+in apps/api -> exit 2, 2 errors, both in files this change does not touch
+(test/mxworld-email-code-e2e.test.ts known #15113; desktop-token-session.ts
+143 is a base defect at 7b738654); 0 in changed files.
+
+Refs: GoodQA #14903
+
+Risk: API only; clients without the key are unchanged. Rollback is a
+revert of this commit (no migration).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

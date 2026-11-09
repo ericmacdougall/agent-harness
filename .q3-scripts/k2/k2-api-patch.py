@@ -14,8 +14,6 @@ def sub(path, old, new, count=1):
 
 
 L = 'apps/api/src/modules/messaging/ai-thread-lifecycle.ts'
-sub(L, "import { and, eq, gte, sql } from 'drizzle-orm';",
-    "import { and, eq, gte, isNull, sql } from 'drizzle-orm';")
 sub(L, "  aiThreads,\n  chatConversations,\n  chatConversationMembers,",
     "  aiThreads,\n  chatConversations,\n  chatConversationMembers,\n  chatMessages,")
 sub(L, "import { Errors } from '../../lib/errors';",
@@ -122,7 +120,7 @@ sub(L, "          clientMsgId: null,\n          attachmentIds: [],\n          li
     "    .limit(1);\n"
     "  if (!thread) throw conflict();\n"
     "  const [conversation] = await tx.select().from(chatConversations)\n"
-    "    .where(and(eq(chatConversations.id, prior.conversationId), isNull(chatConversations.deletedAt))).limit(1);\n"
+    "    .where(eq(chatConversations.id, prior.conversationId)).limit(1);\n"
     "  if (!conversation || (conversation.projectId ?? null) !== (input.projectId ?? null)) throw conflict();\n"
     "  if (prior.clientRequestHash !== (await createRequestHash(tx, conversation.id, input.message!))) throw conflict();\n"
     "  try {\n"

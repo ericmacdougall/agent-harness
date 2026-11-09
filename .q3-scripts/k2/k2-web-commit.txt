@@ -1,0 +1,40 @@
+feat(web): New thread dialog can always close; resend replays
+
+Why: Kimi QAC found the New thread dialog stuck while a create was pending
+(Cancel, Escape and the overlay all disabled) and a resend after a lost
+response made a second thread (goodqa#14903 K2, Option B). Needs the API
+change cacc75fc live first: the create body schema is strict.
+
+What: the draft, its clientRequestId, the create and its AbortController
+move to AiThreadPanel (new useNewThreadDraft). Every close path works while
+pending, aborts the request without showing a failure, keeps the draft,
+refreshes the thread list, returns focus to New thread and shows a
+dismissible status line. The id is reused while the trimmed message and
+scope are unchanged and rotated otherwise; a conflict rotates it with fixed
+copy, create_in_progress keeps it; success or a replay clears the draft.
+An untouched draft follows the panel project; sending pins the scope.
+Changing org abandons a pending create. A late answer after a close opens
+nothing. Double submit in one tick sends one request.
+
+Testing: `pnpm --filter @bugtracker/web exec vitest run src/components/messaging/new-ai-thread-idempotency.test.tsx`
+on t2-dev -> against the old UI 13 failed, 1 passed (the replay case,
+already correct); after 14 passed. Controlled broken variants each caught
+by their test: no abort on close (AC-5, 3 failed), fresh id every send
+(AC-6), conflict keeps id (NEG-17), scope not pinned, org change keeps the
+call. Same command over new-ai-thread-dialog, ai-thread-panel,
+qac-sidebar-progress-ack with the K2 file -> 42 passed;
+persistent-ai-panel, persistent-ai-layout, ai-chat-reopen, messaging-dock,
+messaging-dock-toggle-crossorg, persistent-chat-shell,
+persistent-chat-public -> passed; conversation-list -> 95 passed after
+adding the create hook to its mock.
+`node --max-old-space-size=12000 ./node_modules/typescript/bin/tsc --noEmit`
+in apps/web -> exit 2, 3 errors, all in test files this change does not
+touch (security-section-apple-only, unpublished-guides, security-txt); 0 in
+changed files.
+
+Refs: GoodQA #14903
+
+Risk: web only; ship after the API commit is live. Rollback is a revert of
+this commit; the API keeps working for clients without the key.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
