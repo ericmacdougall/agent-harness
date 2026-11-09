@@ -369,7 +369,8 @@ describe('AC-9 / NEG-13 / NEG-20 (D6, pulled forward: narrowing a token is untes
     expect(codeOf(enroll)).toBe('user_token_ability_missing');
     const catalog = await inj('GET', '/v1/me/remote-control/catalog', session.headers);
     expect(catalog.statusCode, catalog.body).toBe(403);
-    expect(codeOf(catalog)).toBe('user_token_ability_missing');
+    // no waiver without the host set (RT15561-1): the plain bearer answer, a route no token reaches
+    expect(codeOf(catalog)).toBe('user_token_non_delegable');
   });
 });
 
