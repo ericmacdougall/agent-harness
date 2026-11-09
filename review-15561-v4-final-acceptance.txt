@@ -1,0 +1,7 @@
+ACCEPTANCE SPEC REVIEW, goodqa#15561, spec v4 delta (auth domain). Reviewer: agent a21164a6600b681bf (general-purpose, sonnet), a different model and agent from the adversarial reviewer.
+Passes: (1) BLOCK on the first v4 (Q7 and the S1b/S1c split not marked as pending user choices, D6 ownership vs slice plan, AC-12 oracle, stale F6(a), NEG-25 split, Q6 same release); (2) ACCEPT with two minor leftovers; (3) BLOCK (AC-12 vs S1e live proof, stale not-available statements, Reviews section); (4) final confirm pass on spec core 5b18c74c...:
+
+"Verdict: ACCEPT. L1, L2 and L3 and the NEG-31/32 'both routes' wording are fixed ... Numbering: all 38 NEG lines are present, ascending to NEG-38. NEG-36 pins signed_in_person for the switch-off case. NEG-38 and AC-14: both are testable ... Remaining minor items (non-blocking): M1 NEG-35 'both routes'. M2 AC-14's Verify by lists NEG-31..NEG-35 and NEG-37 but not NEG-38, and AC-15 lists only NEG-36."
+
+Both minor items were applied afterwards (spec core 8caea8feb3745c7c81e3e376985bc5c9e9100649d06dd818c2244c80b1976911); no other change.
+Not verified by the reviewer: code claims behind AC-14/AC-15, core sha recomputation, that the opt-in removal ask is registered (it is: wal ask w3ae4b550669).

@@ -1,0 +1,13 @@
+ADVERSARIAL SPEC REVIEW, goodqa#15561, spec v4 delta (auth domain). Reviewer: agent a0e0378fdb6d0d338 (red-team, opus).
+Passes: (1) BLOCK on the first v4 (Q9 claim wrong: operator tokens ARE minted by the operator script; polling exception contradicted AC-8/NEG-12; stale gating text); (2) ACCEPT after revision with two low text fixes; (3) BLOCK scoped to slice S1e only (timeline already a session action behind the org owner opt-in; personal entries); (4) BLOCK scoped to S1e (contact detail embeds the timeline; NEG-36 pinned the wrong switch-off code); (5) confirm pass, final verdict on spec core 5b18c74c...:
+
+"ACCEPT for the goodqa#15561 spec ... All the fixes from my last pass are in:
+- B1: for a token or desktop session, AC-14 now returns contact detail with the embedded timeline and its cursor empty, plus a flag saying why, unless the timeline's existing control (AC-15) allows it. It also names the open follow-up count and the reported issues as disclosed, and says Gmail mailbox entries stay withheld. NEG-38 tests that.
+- M1: NEG-36 now expects signed_in_person with the platform switch off and session_actions_disabled with the switch on but no org opt-in, matching the code.
+- L1: AC-16 tells the click-tester the withheld Gmail entries are not a bug.
+- L2: the Q7 line lists AC-14 to AC-16 and NEG-31 to NEG-38.
+- The Reviews section states no verdict.
+One finding remains (low, not blocking): NEG-38 is missing from AC-14's Verify by and from the S1e slice line."
+
+That last low finding was applied afterwards (spec core 8caea8feb3745c7c81e3e376985bc5c9e9100649d06dd818c2244c80b1976911 adds NEG-38 to AC-14's Verify by and to the S1e slice line, and NEG-35 wording); no other change.
+Not verified by the reviewer: S1e code (not written), production data, core sha recomputation.
