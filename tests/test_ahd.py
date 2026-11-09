@@ -484,8 +484,18 @@ class ClockAndDisk(Scratch):
     def test_uncompilable_catches_non_syntax_compile_failures_instead_of_crashing_ahd(self):
         with tempfile.TemporaryDirectory() as t:
             root = Path(t)
-            (root / "deep.py").write_text("x = " + "(" * 500 + "1" + ")" * 500 + "\n")  # too deeply nested to compile
-            self.assertIsNotNone(ahd.uncompilable({}, {}, root=root))
+            (root / "deep.py").write_text("x = 1\n")
+            for exc in (RecursionError, MemoryError):
+                with mock.patch.object(ahd, "compile", side_effect=exc, create=True):
+                    self.assertEqual(ahd.uncompilable({}, {}, root=root), "deep.py: " + exc.__name__)
+            unreadable = root / "locked.py"
+            unreadable.write_text("y = 2\n")
+            os.chmod(unreadable, 0)
+            try:
+                if os.getuid() != 0:
+                    self.assertEqual(ahd.uncompilable({}, {}, root=root), "locked.py: PermissionError")
+            finally:
+                os.chmod(unreadable, 0o600)
 
     def test_uncompilable_on_the_real_hooks_directory_is_clean(self):
         self.assertIsNone(ahd.uncompilable(ahd.code_signature(), ahd.code_signature()))
