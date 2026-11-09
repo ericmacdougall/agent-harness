@@ -2081,22 +2081,35 @@ class Effects:
                 return 'work-tracker-automatic#%s' % copy['number']
         return None
 
-    def duplicate_survivor(self, ref):
-        """-> 'slug#N' of the first OPEN canonical ticket that `ref` is a `duplicates` link to, else None (no link, every
-        target closed, or any read failure: the caller then falls back to reopening the alert)."""
-        try:
-            fx, issue = self.ticket_writer(ref)
-            links = fx.api.get('/issues/%s/links' % issue['id'])
-            for endpoint in links.get('duplicates') or []:
-                target = endpoint.get('issue') or endpoint
-                sv = fx.issue(target['id'])
-                if sv.get('status') in CLOSED_ALERT_STATUSES or sv.get('archivedAt'):
-                    continue
-                project = fx.api.get('/projects/%s' % sv['projectId'])
-                project = project.get('project', project)
-                return '%s#%s' % (project.get('slug'), sv['number'])
-        except Exception:  # noqa: BLE001 - never blocks the reopen fallback
-            return None
+    def duplicate_survivor(self, ref, hops=3):
+        """-> 'slug#N' of the first OPEN canonical ticket that `ref` is a `duplicates` link to, following a canonical ticket
+        that is itself closed as a duplicate up to `hops` links (a visited set breaks a cycle). -> None only when every read
+        succeeded and no open ticket was found (the caller then reopens the alert). RAISES on any read failure: the caller
+        defers instead of reopening a ticket a person closed on purpose (red-team F3)."""
+        fx, issue = self.ticket_writer(ref)
+        seen = {issue['id']}
+        frontier = [issue['id']]
+        for _ in range(hops):
+            nxt = []
+            for iid in frontier:
+                links = fx.api.get('/issues/%s/links' % iid)
+                for endpoint in links.get('duplicates') or []:
+                    target = endpoint.get('issue') or endpoint
+                    if target['id'] in seen:
+                        continue
+                    seen.add(target['id'])
+                    sv = fx.issue(target['id'])
+                    if sv.get('archivedAt'):
+                        continue
+                    if sv.get('status') not in CLOSED_ALERT_STATUSES:
+                        project = fx.api.get('/projects/%s' % sv['projectId'])
+                        project = project.get('project', project)
+                        return '%s#%s' % (project.get('slug'), sv['number'])
+                    if sv.get('status') == 'duplicate':
+                        nxt.append(target['id'])
+            frontier = nxt
+            if not frontier:
+                break
         return None
 
     def undo_copy(self, ref, copy):
@@ -2440,18 +2453,29 @@ def act(findings, st, cfg, fx, apply, now, sample=None, left=None, reconcile=Tru
                 # A person closed this alert as a duplicate of a live canonical ticket: follow it. Do NOT reopen the alert;
                 # append one line to the open canonical ticket, at most once an hour per alert. No open canonical ticket
                 # (closed, unreadable or no `duplicates` link) -> fall through to the reopen below.
-                survivor = fx.duplicate_survivor(a['ref'])
+                try:
+                    survivor = fx.duplicate_survivor(a['ref'])
+                except Exception:                        # noqa: BLE001 - a failed lookup defers: never reopens a human close
+                    if apply:
+                        a['status_synced'] = now - status_every + DUP_RETRY_SECONDS      # retry in ~10 min, not every pass
+                    rec['alert'] = 'open %s (duplicate lookup failed; retrying later)' % a['ref']
+                    report.append(rec)
+                    continue
                 if survivor:
                     if not apply:
                         rec['alert'] = 'would note on %s (duplicate %s)' % (survivor, a['ref'])
-                    elif now - float(a.get('dup_noted') or 0) < DUP_NOTE_SECONDS:
-                        rec['alert'] = 'duplicate %s of %s (noted recently)' % (a['ref'], survivor)
-                    elif alert_room() < write_reserve:
-                        rec['alert'] = 'duplicate %s of %s (note deferred: alert budget reserve)' % (a['ref'], survivor)
                     else:
-                        fx.comment(survivor, dup_note_line(f, a['ref'], now))
-                        a['dup_noted'] = now
-                        rec['alert'] = 'noted on %s (duplicate %s)' % (survivor, a['ref'])
+                        # Gate the NEXT lookup: without this the alert stays due and costs ~6 calls on every 2-minute pass.
+                        a.update(status_synced=now, commented=now, comment_digest=material_digest(f))
+                        if now - float(a.get('dup_noted') or 0) < DUP_NOTE_SECONDS:
+                            rec['alert'] = 'duplicate %s of %s (noted recently)' % (a['ref'], survivor)
+                        elif alert_room() < write_reserve:
+                            rec['alert'] = 'duplicate %s of %s (note deferred: alert budget reserve)' % (a['ref'], survivor)
+                        else:
+                            rc, _note = fx.comment(survivor, dup_note_line(f, a['ref'], now))
+                            if rc == 0:
+                                a['dup_noted'] = now
+                            rec['alert'] = 'noted on %s (duplicate %s)' % (survivor, a['ref'])
                     report.append(rec)
                     continue
             if status in CLOSED_ALERT_STATUSES and now - float(a.get('reopened') or 0) >= 3600:
@@ -2472,6 +2496,25 @@ def act(findings, st, cfg, fx, apply, now, sample=None, left=None, reconcile=Tru
         if apply:
             if recur:
                 # A recurrence within alert_reopen_days of the recovery reopens the SAME ticket (one comment), never a new one.
+                # Unless a person closed it as a duplicate of an open canonical ticket: then note there and track it again.
+                try:
+                    dsv = fx.duplicate_survivor(a['ref']) if fx.ticket_status(a['ref']) == 'duplicate' else None
+                except Exception:                          # noqa: BLE001 - defer, never reopen a human close on a failed read
+                    rec['alert'] = 'recurrence of %s: duplicate lookup failed; retrying next pass' % a['ref']
+                    report.append(rec)
+                    continue
+                if dsv:
+                    for k in ('absent_since', 'recovery_commented', 'close_reason'):
+                        a.pop(k, None)
+                    a.update(cleared=None, recurrences=int(a.get('recurrences') or 0) + 1, severity=finding_severity(f))
+                    observe(a, f, now)
+                    rc, _note = fx.comment(dsv, dup_note_line(f, a['ref'], now))
+                    a.update(commented=now, comment_digest=digest, status_synced=now)
+                    if rc == 0:
+                        a['dup_noted'] = now
+                    rec['alert'] = 'recurred; noted on %s (duplicate %s)' % (dsv, a['ref'])
+                    report.append(rec)
+                    continue
                 try:
                     fx.ticket_patch(a['ref'], 'triage')
                 except Exception:                          # noqa: BLE001 - a failed reopen retries next pass, never wedges
@@ -2993,12 +3036,15 @@ def human(rep):
 
 CLOSED_ALERT_STATUSES = frozenset(('done', 'wont_fix', 'duplicate', 'cancelled', 'on_production'))
 DUP_NOTE_SECONDS = 3600
+DUP_RETRY_SECONDS = 600
 
 
 def dup_note_line(f, ref, now):
     """The ONE line appended to a canonical ticket for an alert closed as its duplicate: finding, alert id, time."""
-    return 'Fleet liveness: `%s` (%s) still holds at %s; alert %s is closed as a duplicate of this ticket.' % (
-        f['cls'], C.cap(str(f.get('title') or ''), 120).replace('\n', ' '), iso(now), ref)
+    title = re.sub(r'[\r\n`@]+', ' ', C.cap(str(f.get('title') or ''), 120))
+    cls = re.sub(r'[\r\n`@]+', ' ', C.cap(str(f['cls']), 120))
+    return defang_markers('Fleet liveness: `%s` (%s) still holds at %s; alert %s is closed as a duplicate of this ticket.' % (
+        cls, title, iso(now), ref))
 
 
 def reopen_closed(cfg, fx, apply=False, limit=25, state=None, now=None):
@@ -3018,8 +3064,12 @@ def reopen_closed(cfg, fx, apply=False, limit=25, state=None, now=None):
         status = fx.ticket_status(a['ref'])
         if status not in CLOSED_ALERT_STATUSES:
             continue
-        if status == 'duplicate' and fx.duplicate_survivor(a['ref']):
-            continue                      # followed to its open canonical ticket, not reopened
+        if status == 'duplicate':
+            try:
+                if fx.duplicate_survivor(a['ref']):
+                    continue              # followed to its open canonical ticket, not reopened
+            except Exception:             # noqa: BLE001 - an unreadable canonical ticket never reopens a human close
+                continue
         rows.append(dict(ref=a['ref'], cls=cls, status=status, copy=fx.moved_copy(a['ref'])))
     repaired = []
     if apply:

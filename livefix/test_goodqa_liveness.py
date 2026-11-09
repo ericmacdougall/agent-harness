@@ -3925,6 +3925,107 @@ class LiveAlertReopen(unittest.TestCase):
         self.assertEqual(self.notes(fx), [])
         self.assertEqual(fx.duplicate_survivor.call_count, 0)
 
+    def test_F1_FollowedDuplicateIsLookedUpOncePerSyncWindowNotEveryPass(self):
+        fx, state, f = self.dup_case()
+        for dt in (0, 120, 240, 3599):
+            L.act([f], state, CFG, fx, True, T0 + dt)
+        self.assertEqual(fx.duplicate_survivor.call_count, 1, 'the lookup costs ~6 calls: once per alert_status_minutes')
+        self.assertEqual(fx.ticket_patch.call_count, 0)
+        L.act([f], state, CFG, fx, True, T0 + 3601)
+        self.assertEqual(fx.duplicate_survivor.call_count, 2)
+        self.assertEqual(len(self.notes(fx)), 2)
+
+    def test_F2_RecurrenceAfterClearNotesCanonicalInsteadOfReopeningTheDuplicate(self):
+        fx, state, f = self.dup_case()
+        state['alerts']['test'].update(cleared=T0 - 100)
+        out = L.act([f], state, CFG, fx, True, T0)
+        self.assertEqual(fx.ticket_patch.call_count, 0, 'a recurring finding must not reopen a duplicate-closed alert')
+        self.assertEqual(len(self.notes(fx)), 1)
+        self.assertIsNone(state['alerts']['test']['cleared'], 'the alert is tracked again')
+        self.assertIn('noted on goodqa#15558', out[0]['alert'])
+
+    def test_F2_RecurrenceWithoutACanonicalTicketStillReopens(self):
+        fx, state, f = self.dup_case(survivor=None)
+        state['alerts']['test'].update(cleared=T0 - 100)
+        L.act([f], state, CFG, fx, True, T0)
+        self.assertEqual(fx.calls[0], ('patch', 'goodqa#11932', 'triage'))
+
+    def test_F3_FailedLookupDefersAndNeverReopens(self):
+        fx, state, f = self.dup_case()
+        fx.duplicate_survivor.side_effect = RuntimeError('503')
+        out = L.act([f], state, CFG, fx, True, T0)
+        self.assertEqual(fx.ticket_patch.call_count, 0)
+        self.assertEqual(self.notes(fx), [])
+        self.assertIn('lookup failed', out[0]['alert'])
+        L.act([f], state, CFG, fx, True, T0 + 120)
+        self.assertEqual(fx.duplicate_survivor.call_count, 1, 'retry is deferred ~10 min, not every pass')
+        fx.duplicate_survivor.side_effect = None
+        fx.duplicate_survivor.return_value = 'goodqa#15558'
+        L.act([f], state, CFG, fx, True, T0 + 700)
+        self.assertEqual(len(self.notes(fx)), 1)
+        # a recurrence on a failed lookup defers as well
+        fx2, state2, f2 = self.dup_case()
+        state2['alerts']['test'].update(cleared=T0 - 100)
+        fx2.duplicate_survivor.side_effect = RuntimeError('503')
+        L.act([f2], state2, CFG, fx2, True, T0)
+        self.assertEqual(fx2.ticket_patch.call_count, 0)
+
+    def test_F6_FailedNoteCommentIsNotLatchedForAnHour(self):
+        fx, state, f = self.dup_case()
+        fx.comment = lambda ref, body: (1, 'boom')
+        L.act([f], state, CFG, fx, True, T0)
+        self.assertNotIn('dup_noted', state['alerts']['test'])
+
+    def test_F6_NoteLineIsDefangedAndSingleLine(self):
+        line = L.dup_note_line(dict(cls='x`@evil', title='a\nb `c` @bob ' + 'z' * 500), 'goodqa#1', T0)
+        self.assertNotIn('\n', line)
+        self.assertNotIn('@bob', line)
+        self.assertLess(len(line), 450)
+
+    def _api_fx(self, links, issues, projects=None):
+        """The REAL Effects.duplicate_survivor against a fake API: links[id] -> duplicates endpoints; issues[id] -> issue."""
+        class Api:
+            def get(self_, path):
+                if path.startswith('/issues/') and path.endswith('/links'):
+                    iid = path.split('/')[2]
+                    if links.get(iid) is RuntimeError:
+                        raise RuntimeError('503')
+                    return {'duplicates': [{'issue': {'id': t}} for t in links.get(iid, [])]}
+                if path.startswith('/projects/'):
+                    return {'project': {'slug': 'goodqa'}}
+                raise AssertionError(path)
+
+        class W:
+            api = Api()
+
+            def issue(self_, iid):
+                return issues[iid]
+
+        eff = L.Effects.__new__(L.Effects)
+        eff.ticket_writer = lambda ref: (W(), {'id': 'A'})
+        return eff
+
+    def test_F4_RealSurvivorLookupParsesLinksFollowsChainsAndBreaksCycles(self):
+        iss = lambda n, status, **k: dict(id=n, number=1, status=status, projectId='p', **k)
+        eff = self._api_fx({'A': ['B']}, {'B': iss('B', 'triage')})
+        self.assertEqual(eff.duplicate_survivor('goodqa#1'), 'goodqa#1')
+        # chain: A -> B (duplicate) -> C (open)
+        eff = self._api_fx({'A': ['B'], 'B': ['C']}, {'B': iss('B', 'duplicate'), 'C': iss('C', 'in_progress')})
+        self.assertEqual(eff.duplicate_survivor('goodqa#1'), 'goodqa#1')
+        # canonical closed done / archived -> None (reopen fallback)
+        eff = self._api_fx({'A': ['B']}, {'B': iss('B', 'done')})
+        self.assertIsNone(eff.duplicate_survivor('goodqa#1'))
+        eff = self._api_fx({'A': ['B']}, {'B': iss('B', 'triage', archivedAt='2026-11-09')})
+        self.assertIsNone(eff.duplicate_survivor('goodqa#1'))
+        # cycle A -> B -> A, nothing open
+        eff = self._api_fx({'A': ['B'], 'B': ['A']}, {'B': iss('B', 'duplicate'), 'A': iss('A', 'duplicate')})
+        self.assertIsNone(eff.duplicate_survivor('goodqa#1'))
+        # no link at all
+        self.assertIsNone(self._api_fx({}, {}).duplicate_survivor('goodqa#1'))
+        # a read failure RAISES (the caller defers)
+        with self.assertRaises(RuntimeError):
+            self._api_fx({'A': RuntimeError}, {}).duplicate_survivor('goodqa#1')
+
     def test_RepairCommandSkipsDuplicatesWithAnOpenCanonicalTicket(self):
         from unittest.mock import Mock
         for survivor, expect in (('goodqa#15558', []), (None, ['goodqa#11932'])):
