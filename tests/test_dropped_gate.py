@@ -356,6 +356,16 @@ class GateTests(Base):
         self.assertNotEqual(self.stop_with_cap().get("decision"), "block")
         self.assertEqual(successor.open_request(successor.read_requests(self.home, SESSION), "dropowner", NOW)["at"], NOW - 60)
 
+    def test_the_refresh_threshold_stays_below_the_gate_limit(self):
+        import successor
+        self.assertLess(successor.CAP_REFRESH_S, dropped_gate.CAP_WAIT_MAX_AGE_S)  # acceptance review a3318610 M1
+
+    def test_succeed_refuses_a_malformed_agent_id(self):
+        import successor
+        for bad in ("../x", "", "a b", "x" * 80):
+            with self.assertRaises(successor.SuccessorError, msg=bad):  # acceptance review F6
+                successor.succeed(self.home, SESSION, bad, owners_doc={"owners": []}, live_count=0, cap=4)
+
     def test_a_freed_slot_closes_the_valve(self):
         # acceptance review F1: a cap_wait must not excuse the Stop once a slot is free
         self.cap_row("dropowner")
