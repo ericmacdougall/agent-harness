@@ -1,0 +1,9 @@
+fix(liveness): follow a duplicate-closed alert to its canonical ticket
+
+Why: goodqa_liveness reopened every alert a person closed as a duplicate, about hourly while the finding held, so combining alert tickets into one live ticket regrew the open count (68 alerts reopened 2026-11-08/09).
+What: when an alert is closed as duplicate and its `duplicates` link points to an open ticket, the bot appends one line (finding, alert id, time) to that ticket at most once an hour per alert and does not reopen the alert; no link, a closed canonical ticket or a read failure falls back to the old reopen. done, wont_fix and cancelled closes still reopen. reopen-closed skips followed duplicates.
+Testing: `python3 -m unittest test_goodqa_liveness.LiveAlertReopen` 3 failed and 1 errored on the old code, 12 ok on the new; full liveness modules 343 run, the same 18 pre-existing failures as the unmodified base (336 run).
+Refs: GoodQA #15558
+Risk: a duplicate with an open canonical ticket no longer reopens, so a finding is visible only as a line on the canonical ticket until it is closed or unlinked.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
