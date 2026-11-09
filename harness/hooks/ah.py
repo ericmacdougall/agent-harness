@@ -289,7 +289,8 @@ def discover_agents(home: Path, session: str, wal: Path) -> dict:
                                 if e.stat().st_size <= 65536:
                                     meta = json.loads(_bounded(Path(e.path), 65536))
                                     info.update(type=meta.get("agentType"), description=meta.get("description"),
-                                                parent=meta.get("parentAgentId"), finished=bool(meta.get("finished")))
+                                                parent=meta.get("parentAgentId"), finished=bool(meta.get("finished")),
+                                                depth=meta.get("spawnDepth"))
                             except (OSError, ValueError):
                                 pass
                 except OSError:
@@ -326,7 +327,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     for agent, meta in discover_agents(home, session, wal).items():
         info = spawned.setdefault(agent, {"type": None, "at": 0.0})
         info["type"] = info["type"] or meta.get("type")
-        info.update({k: meta[k] for k in ("description", "parent", "finished") if k in meta})
+        info.update({k: meta[k] for k in ("description", "parent", "finished", "depth") if k in meta})
     led = _ledger(home)  # one read per call
     registered = {r["args"].get("owner_agent") for r in led if r.get("op") == "task.register"}
     pending = pending_stops(home, session, led)
@@ -353,7 +354,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         text = " ".join(filter(None, [info.get("description"), summary["first"]]))
         restricted = bool(RESTRICTED.search(text))
         row = {"agent_id": agent, "type": info["type"], "task": None if restricted else (summary["first"] or info.get("description")),
-               "restricted": restricted, "parent": info.get("parent"),
+               "restricted": restricted, "parent": info.get("parent"), "spawn_depth": info.get("depth"),
                "owner": bool(is_owner), "registered": agent in registered,
                "flags": (["unregistered-owner"] if is_owner and agent not in registered else []),
                "state": verdict["state"], "severity": verdict["severity"],
@@ -447,15 +448,16 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                 kind == "waiting" and d.get("ack_handoff") is True
                 and liveness.disposition_live(d, now, last_activity=handed))
             acked = bool(acknowledged and float(d.get("at") or 0) >= handed - 10)
-            # A helper spawned by another owner hands its result back to that parent, which takes it by design. The
-            # handoff is taken while the parent still holds the work (live, or excused by its own live disposition,
-            # the same test a reassignment target must pass); a dropped parent leaves the handoff unacked.
+            # A helper spawned by another agent hands its result back to that parent, which takes it by design. The
+            # claim is honoured only when it is believable and the parent is plainly receiving: the child is a nested
+            # spawn (meta spawnDepth >= 2; main's own spawns are depth 1 and never carry a parent), the parent is
+            # live now (not done, returned, waiting or merely covered by a live child: red-team F1/F2 on 05849d35)
+            # and the parent was active at or after the handoff, so it was running when the result arrived.
             parent = r.get("parent")
-            pstate = by_id[parent]["state"] if parent in by_id else ""
-            parent_holds = bool(parent and parent != r["agent_id"] and pstate) and (
-                pstate.startswith(("live", "working", "waiting"))  # a SILENT parent may be gone: it does not take it
-                or (pstate in ("DROPPED", "done", "handoff", "returned") and covered(parent, (r["agent_id"],))))
-            if not acked and parent_holds:
+            prow = by_id.get(parent) if parent and parent != r["agent_id"] else None
+            depth = r.get("spawn_depth")
+            if not acked and prow is not None and isinstance(depth, int) and depth >= 2 and prow["state"] == "live" \
+                    and (parse_ts(prow["last_activity"]) or 0.0) >= handed:
                 acked = True
                 r["flags"] = list(r.get("flags") or []) + ["handoff-to-parent"]
             if not acked and now - handed >= HANDOFF_ACK_S:

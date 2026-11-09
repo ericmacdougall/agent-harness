@@ -140,7 +140,7 @@ class GateTests(Base):
         jl(w / f"agent-{parent}.jsonl", [{"at": iso(parent_last), "event": "intent", "note": "still working"}])
         meta = self.home / ".claude" / "projects" / "proj" / SESSION / "subagents" / "agent-dropowner.meta.json"
         meta.parent.mkdir(parents=True, exist_ok=True)
-        meta.write_text(json.dumps({"agentType": "task-owner", "parentAgentId": parent, "finished": True}))
+        meta.write_text(json.dumps({"agentType": "task-owner", "parentAgentId": parent, "finished": True, "spawnDepth": 2}))
 
     def test_handoff_to_a_live_parent_is_acknowledged(self):
         later = NOW + ah.HANDOFF_ACK_S + 1
