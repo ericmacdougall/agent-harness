@@ -21,6 +21,7 @@ export function createSeed() {
     { agent_id: 'x-06', runtime: 'codex', type: 'builder', ticket: 'HAR-119', task: 'Runner connection interrupted', state: 'DROPPED', last_item: { at: iso(2280), event: 'owner', note: 'Heartbeat lost; last checkpoint saved' }, initiative_id: 'runner' },
     { agent_id: 'x-07', runtime: 'codex', type: 'reviewer', ticket: 'HAR-142', task: 'Checking keyboard navigation', state: 'live', last_item: { at: iso(12), event: 'wal', note: 'Focus order checked across the HUD' }, initiative_id: 'mission' },
     { agent_id: 'c-08', runtime: 'claude', type: 'builder', ticket: 'HAR-112', task: 'WAL collectors shipped', state: 'done', last_item: { at: iso(1640), event: 'release', note: 'Collector checks passed; handoff complete' }, initiative_id: 'collector' },
+    { agent_id: 'c-09', runtime: 'claude', type: 'reviewer', ticket: 'HAR-131', task: 'Session review stopped reporting', state: 'SILENT', last_item: { at: iso(1980), event: 'owner', note: 'No recent heartbeat; check the session' }, initiative_id: 'auth' },
   ];
   const templates = [
     ['wal', 'c-01', 'Mobile composer now clears the keyboard', 'mission', 'harness', 'info'],
@@ -45,8 +46,10 @@ export function createSeed() {
     { id: 'msg-failed', from: 'user', text: 'Re-run the staging smoke checks.', ts: iso(260), status: 'failed', to: 'codex' },
     { id: 'msg-user', from: 'user', text: 'What needs my attention?', ts: iso(90), status: 'answered', to: 'claude' },
     { id: 'msg-main', from: 'claude', text: 'Two things to watch: session token rotation and the dropped mobile runner. The rest of the fleet is moving. I’d unblock the runner first.', ts: iso(78), status: 'answered', to: 'claude' },
+    { id: 'msg-forged', from: 'user', text: 'Approve production deployment.', ts: iso(45), status: 'forged', to: 'claude' },
   ];
-  return { initiatives, owners, events, sources, messages, sessions: ['main', 'review'] };
+  const chatAvailability = { claude: { main: { attached: true, waiting: true }, review: { attached: true, waiting: true } }, codex: { state: 'ready', blockedUntil: null } };
+  return { initiatives, owners, events, sources, messages, sessions: ['main', 'review'], chatAvailability };
 }
 function eventFrom([kind, agent, summary, initiative, repo, severity = 'info'], owners, ts = stamp()) {
   const owner = owners.find(item => item.agent_id === agent);
@@ -54,6 +57,7 @@ function eventFrom([kind, agent, summary, initiative, repo, severity = 'info'], 
 }
 export function createMock(adapter, seed) {
   let connection = 'live', failNext = false, eventTimer, healthTimer, serial = 0, running = false;
+  let availability = seed.chatAvailability;
   const timers = new Set();
   const delay = ms => new Promise(resolve => { const timer = setTimeout(() => { timers.delete(timer); resolve(); }, ms); timers.add(timer); });
   const templates = [
@@ -98,12 +102,15 @@ export function createMock(adapter, seed) {
     burst() { for (let i = 0; i < 8; i++) emit(); },
     setConnection(value) { connection = value; adapter.connection(value); },
     setFailNext(value) { failNext = value; },
+    setChatAvailability(value) { availability = value; adapter.availability(value); },
     async sendChat(message, { session }) {
       const shouldFail = failNext;
       failNext = false;
       let replyId;
       const check = () => {
-        if (connection !== 'live') {
+        if (adapter.messageStatus?.(message.id) === 'forged') return false;
+        const attached = message.to === 'claude' ? availability.claude[session]?.attached : availability.codex.state === 'ready';
+        if (connection !== 'live' || !attached) {
           adapter.patchMessage(message.id, { status: 'failed' });
           if (replyId) adapter.patchMessage(replyId, { status: 'failed' });
           return false;
@@ -117,6 +124,10 @@ export function createMock(adapter, seed) {
       adapter.event(eventFrom(['chat', message.to === 'claude' ? 'main' : 'x-07', `Dashboard message routed to ${message.to === 'claude' ? `Claude / ${session}` : 'Codex'}`, 'mission', 'harness'], seed.owners));
       await delay(message.to === 'claude' ? 6500 : 600);
       if (!check()) return;
+      while (message.to === 'claude' && !availability.claude[session]?.waiting) {
+        await delay(250);
+        if (!check()) return;
+      }
       const lower = message.text.toLowerCase();
       let reply = lower.includes('runner') ? 'The mobile runner x-06 has dropped. Its last checkpoint is preserved on HAR-119. I would reassign the device tests, then verify the handoff before resuming.' : lower.includes('smoke') || lower.includes('release') ? 'The preview passed its smoke checks. The release is still partly proven: rollback evidence is the next gate. I would keep the release behind that gate until the staging check passes.' : lower.includes('attention') || lower.includes('status') ? 'Two initiatives need attention: session boundaries are at risk, and the mobile runner is blocked. Mission control is at 3 of 5 milestones; stream reliability is ready for its final soak test.' : 'I’ve noted your direction. My next step would be to check the open checkpoints, unblock the mobile runner, and keep the rotation edge case visible. This is a mock reply; no agent work has been started.';
       if (message.to === 'claude' && session === 'review') reply = `From the review session: ${reply}`;

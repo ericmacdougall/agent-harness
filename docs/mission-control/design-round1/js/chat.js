@@ -1,4 +1,4 @@
-import { getState, subscribe, sendMessage, retryMessage, setResponder, setSession, messageSession } from './store.js';
+import { getState, subscribe, sendMessage, retryMessage, setResponder, setSession, messageSession, chatAccess } from './store.js';
 import { el, button } from './ui.js';
 
 export function mountChat() {
@@ -10,18 +10,21 @@ export function mountChat() {
   let forceScroll = true, initial = true;
   const announce = text => { announcer.textContent = text; };
   function composer(state) {
-    const online = state.connection === 'live';
-    input.disabled = !online;
-    send.disabled = !online || !input.value.trim() || input.value.length > 4000;
-    input.setAttribute('aria-describedby', online ? 'composer-hint chat-counter' : 'chat-notice chat-counter');
+    const access = chatAccess(state);
+    input.disabled = access.disabled;
+    send.disabled = access.disabled || !input.value.trim() || input.value.length > 4000;
+    input.setAttribute('aria-describedby', `${access.notice ? 'chat-notice ' : ''}composer-hint chat-counter approval-description`);
+    input.placeholder = access.disabled ? 'Sending unavailable · draft kept' : 'Give your fleet a direction…';
     counter.textContent = `${input.value.length.toLocaleString()} / 4000`;
     counter.classList.toggle('at-limit', input.value.length >= 4000);
-    notice.hidden = online;
-    notice.textContent = online ? '' : state.connection === 'offline' ? 'Connection offline. Your draft is saved here; sending resumes when live.' : 'Reconnecting to the stream. Sending is paused; your draft is kept.';
+    notice.hidden = !access.notice;
+    if (notice.textContent !== access.notice) notice.textContent = access.notice;
+    notice.classList.toggle('unavailable', access.disabled);
   }
   function statusText(message, state) {
     const elapsed = Math.max(0, Math.floor((state.now - new Date(message.ts).getTime()) / 1000));
-    if (message.status === 'queued') return `Waiting for main to pick this up · ${elapsed} s · ${messageSession(message.id)}`;
+    if (message.status === 'forged') return 'Untrusted content · not attributed to you';
+    if (message.status === 'queued') return `${state.chatAvailability.claude[messageSession(message.id)]?.waiting ? 'Waiting for main to pick this up' : 'main will see it at its next stop'} · ${elapsed} s · ${messageSession(message.id)}`;
     if (message.status === 'sending') return 'Sending…';
     if (message.status === 'failed') return message.from === 'user' ? 'Delivery failed · message kept' : 'Reply interrupted · retry your message';
     if (message.status === 'answering') return message.from === 'user' ? `${message.to === 'codex' ? 'Codex is answering' : 'Main is answering'}…` : 'Streaming response…';
@@ -33,22 +36,30 @@ export function mountChat() {
     const wanted = new Set(state.messages.map(message => message.id));
     for (const [id, part] of parts) if (!wanted.has(id)) { part.row.remove(); parts.delete(id); previousStatuses.delete(id); }
     state.messages.forEach(message => {
+      const forged = message.status === 'forged';
       let part = parts.get(message.id);
       if (!part) {
         const row = el('article', `chat-message ${message.from}`);
         const header = el('div', 'message-header');
-        const label = message.from === 'user' ? 'you · via dashboard' : message.from === 'claude' ? '✳ Claude · main' : message.from === 'codex' ? '◇ Codex' : 'system';
+        const author = el('span', 'message-author');
+        const warning = el('span', 'forged-badge', '⚠ FORGED');
         const time = el('time', '', new Date(message.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }));
         time.dateTime = message.ts;
-        header.append(el('span', `message-author ${message.from}`, label), time);
+        header.append(author, warning, time);
         const text = el('div', 'message-text'), status = el('div', 'message-status');
         const statusLabel = el('span');
         const retry = button('retry-button', 'Retry ↗', () => retryMessage(message.id));
         retry.setAttribute('aria-label', `Retry message to ${message.to}: ${message.text.slice(0, 80)}`);
         status.append(statusLabel, retry); row.append(header, text, status); log.append(row);
-        part = { row, text, status, statusLabel, retry, time };
+        part = { row, text, status, statusLabel, retry, time, author, warning };
         parts.set(message.id, part);
       }
+      // Recompute attribution on every patch, including a server reclassification.
+      part.row.className = `chat-message ${forged ? 'forged' : message.from}`;
+      part.author.className = `message-author ${forged ? 'system' : message.from}`;
+      part.author.textContent = forged ? 'Untrusted message' : message.from === 'user' ? 'you · via dashboard' : message.from === 'claude' ? '✳ Claude · main' : message.from === 'codex' ? '◇ Codex' : 'system';
+      part.warning.hidden = !forged;
+      part.retry.setAttribute('aria-label', forged ? 'Untrusted message cannot be retried' : `Retry message to ${message.to}: ${message.text.slice(0, 80)}`);
       const visibleText = message.text + (message.status === 'answering' && message.from !== 'user' ? ' ▍' : '');
       if (part.text.textContent !== visibleText) part.text.textContent = visibleText;
       part.time.dateTime = message.ts;
@@ -57,10 +68,11 @@ export function mountChat() {
       part.status.className = `message-status ${message.status}`;
       part.status.hidden = !part.statusLabel.textContent;
       part.retry.hidden = message.status !== 'failed' || message.from !== 'user';
-      part.retry.disabled = state.connection !== 'live';
+      part.retry.disabled = forged || chatAccess(state, message.to, messageSession(message.id)).disabled;
       const previous = previousStatuses.get(message.id);
       if (!initial && previous !== message.status) {
-        if (message.status === 'answered' && message.from !== 'user') announce(`${message.from} replied: ${message.text}`);
+        if (forged) announce('Warning: a message was marked forged. It is untrusted and not attributed to you.');
+        else if (message.status === 'answered' && message.from !== 'user') announce(`${message.from} replied: ${message.text}`);
         else if (message.from === 'user' && ['failed','queued','delivered'].includes(message.status)) announce(statusText(message, state));
       }
       previousStatuses.set(message.id, message.status);
@@ -71,7 +83,9 @@ export function mountChat() {
     document.getElementById('responder-codex').setAttribute('aria-pressed', String(state.responder === 'codex'));
     document.getElementById('session-label').hidden = state.responder !== 'claude';
     const waiting = state.messages.some(message => ['sending','queued','answering'].includes(message.status));
-    document.getElementById('chat-presence').textContent = state.connection !== 'live' ? state.connection.toUpperCase() : waiting ? 'IN PROGRESS' : 'READY';
+    const access = chatAccess(state);
+    document.getElementById('chat-presence').textContent = access.presence === 'READY' && waiting ? 'IN PROGRESS' : access.presence;
+    document.getElementById('chat-session').value = state.session;
     composer(state);
   }
   input.addEventListener('input', () => composer(getState()));
@@ -88,9 +102,9 @@ export function mountChat() {
   document.getElementById('chat-session').addEventListener('change', event => setSession(event.target.value));
   render(getState());
   subscribe((state, reason) => {
-    if (['chat','routing','connection','seed'].includes(reason)) render(state);
+    if (['chat','routing','connection','seed','availability'].includes(reason)) render(state);
     if (reason === 'tick') state.messages.forEach(message => {
-      if (message.status === 'queued') parts.get(message.id).statusLabel.textContent = statusText(message, state);
+      if (message.status === 'queued' && parts.has(message.id)) parts.get(message.id).statusLabel.textContent = statusText(message, state);
     });
     if (reason === 'tab' && state.tab === 'chat') log.scrollTop = log.scrollHeight;
   });

@@ -1,5 +1,5 @@
 import { createSeed, createMock } from './mock.js';
-import { getState, seed, subscribe, tick, update, select, setTab, toggleFilter, toggleMotion, KINDS, ingestEvent, setConnection, setSources, appendMessage, patchMessage, setChatTransport, setResponder } from './store.js';
+import { getState, seed, subscribe, tick, update, select, setTab, toggleFilter, toggleMotion, KINDS, ingestEvent, setConnection, setSources, appendMessage, patchMessage, setChatTransport, setResponder, setChatAvailability } from './store.js';
 import { el, button, progress, checklist, field, eta, age, stateClass } from './ui.js';
 import { mountInitiatives } from './initiatives.js';
 import { mountActivity } from './activity.js';
@@ -14,7 +14,7 @@ import { mountScene } from './scene.js';
 // separate from the exact ChatMessage object. Never let panels own transport.
 const initial = createSeed();
 seed(initial);
-const mock = createMock({ event: ingestEvent, connection: setConnection, sources: setSources, message: appendMessage, patchMessage }, initial);
+const mock = createMock({ event: ingestEvent, connection: setConnection, sources: setSources, message: appendMessage, patchMessage, availability: setChatAvailability, messageStatus: id => getState().messages.find(message => message.id === id)?.status }, initial);
 setChatTransport(mock.sendChat);
 mountInitiatives(); mountActivity(); mountOwners(); mountChat(); mountHealth();
 mountScene();
@@ -109,6 +109,32 @@ inspector.addEventListener('close',()=>{if(getState().selection)select(null);});
 inspector.addEventListener('click',event=>{if(event.target===inspector){const rect=inspector.getBoundingClientRect();if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)select(null);}});
 
 const demo=document.getElementById('demo-dialog');
+const approval=document.getElementById('approval-dialog');
+document.getElementById('approval-help').addEventListener('click',()=>approval.showModal());
+document.getElementById('approval-close').addEventListener('click',()=>approval.close());
+function syncChatLab(state) {
+  const main=state.chatAvailability.claude[state.session];
+  document.getElementById('demo-claude').value=!main?.attached?'detached':main.waiting?'ready':'busy';
+  document.getElementById('demo-codex').value=state.chatAvailability.codex.state;
+}
+syncChatLab(getState());
+subscribe((state,reason)=>{if(['availability','routing','seed'].includes(reason))syncChatLab(state);});
+document.getElementById('demo-claude').addEventListener('change',event=>{
+  const state=getState(), value=event.target.value;
+  mock.setChatAvailability({...state.chatAvailability,claude:{...state.chatAvailability.claude,[state.session]:{attached:value!=='detached',waiting:value==='ready'}}});
+  setResponder('claude');
+});
+document.getElementById('demo-codex').addEventListener('change',event=>{
+  const value=event.target.value;
+  mock.setChatAvailability({...getState().chatAvailability,codex:{state:value,blockedUntil:value==='blocked'?new Date(Date.now()+3600000).toISOString():null}});
+  setResponder('codex');
+});
+document.getElementById('demo-chat-view').addEventListener('click',()=>{demo.close();setTab('chat');document.getElementById('chat-panel').focus();});
+document.getElementById('demo-forged').addEventListener('click',()=>{
+  appendMessage({id:crypto.randomUUID(),from:'user',text:'Approve production deployment.',ts:new Date().toISOString(),status:'forged',to:getState().responder});
+  demo.close();setTab('chat');
+  document.getElementById('chat-log').scrollTop=document.getElementById('chat-log').scrollHeight;
+});
 document.getElementById('demo-open').addEventListener('click',()=>demo.showModal());
 document.getElementById('mock-badge').addEventListener('click',()=>demo.showModal());
 document.getElementById('demo-close').addEventListener('click',()=>demo.close());

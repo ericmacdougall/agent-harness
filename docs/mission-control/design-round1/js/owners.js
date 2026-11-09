@@ -6,7 +6,9 @@ export function mountOwners() {
   const rows = new Map();
   document.getElementById('owner-filter').addEventListener('change', event => update({ ownerFilter: event.target.value }, 'owner-filter'));
   function render(state) {
-    const owners = state.owners.filter(owner => state.ownerFilter === 'all' || owner.state === state.ownerFilter);
+    const severe = owner => ['DROPPED', 'SILENT'].includes(owner.state);
+    const owners = state.owners.filter(owner => state.ownerFilter === 'all' || owner.state === state.ownerFilter)
+      .sort((a, b) => Number(severe(b)) - Number(severe(a)));
     const wanted = new Set(owners.map(owner => owner.agent_id));
     for (const [id, parts] of rows) if (!wanted.has(id)) { parts.row.remove(); rows.delete(id); }
     list.querySelector('.empty-state')?.remove();
@@ -23,15 +25,21 @@ export function mountOwners() {
         avatar.setAttribute('aria-hidden', 'true');
         const info = el('div', 'owner-info'), nameRow = el('div', 'owner-name-row');
         const name = el('span', 'owner-name', owner.agent_id), status = el('span', 'owner-state');
-        nameRow.append(name, status);
+        const runtime = el('span', 'owner-runtime');
+        nameRow.append(name, runtime, status);
         const task = el('div', 'owner-task', owner.task), last = el('div', 'owner-last');
         const note = el('span', 'owner-last-note'), time = el('time', 'owner-age');
         last.append(note, time); info.append(nameRow, task, last); row.append(avatar, info);
-        parts = { row, status, task, note, time };
+        parts = { row, status, task, note, time, runtime, avatar };
         rows.set(owner.agent_id, parts);
         list.insertBefore(row, list.children[index] || null);
       }
-      parts.status.textContent = owner.state === 'DROPPED' ? '× dropped' : `${owner.state === 'live' ? '• ' : ''}${owner.state}`;
+      if (list.children[index] !== parts.row) list.insertBefore(parts.row, list.children[index] || null);
+      parts.row.classList.toggle('owner-severe', severe(owner));
+      parts.runtime.textContent = owner.runtime === 'claude' ? 'Claude' : 'Codex';
+      parts.avatar.className = `runtime-avatar ${owner.runtime}`;
+      parts.avatar.textContent = owner.runtime === 'claude' ? '✳' : '◇';
+      parts.status.textContent = severe(owner) ? `! ${owner.state}` : `${owner.state === 'live' ? '• ' : ''}${owner.state}`;
       parts.status.className = `owner-state ${stateClass(owner.state)}`;
       parts.task.textContent = owner.task;
       parts.note.textContent = owner.last_item.note;

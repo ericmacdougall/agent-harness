@@ -25,7 +25,9 @@ export function mountInitiatives() {
       line.append(progress(item), el('span', `progress-pct${item.pct === null ? ' unknown' : ''}`, item.pct === null ? 'checking' : `${item.pct}%`));
       const next = el('p', 'initiative-next');
       next.append(el('strong', '', 'Next  '), document.createTextNode(item.next_step));
-      card.append(top, title, ownerLine, line, checklist(item, expanded.has(item.id)), next, el('p', 'eta', eta(item.next_eta, item.estimate_by, 'Next ETA')));
+      const estimates = el('div', 'initiative-estimates');
+      estimates.append(el('p', 'eta', eta(item.next_eta, item.estimate_by, 'Next')), el('p', 'eta', eta(item.full_eta, item.estimate_by, 'Done')));
+      card.append(top, title, ownerLine, line, checklist(item, expanded.has(item.id)), next, estimates);
       if (['At risk', 'Blocked'].includes(item.state)) card.append(el('p', 'initiative-note', item.state === 'Blocked' ? '↳ Runner needs reassignment' : '↳ Coordinator decision needed'));
       fragment.append(card);
     });

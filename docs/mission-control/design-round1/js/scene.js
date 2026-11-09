@@ -1,5 +1,5 @@
 import { getState, subscribe, select, highlight, KINDS } from './store.js';
-import { button } from './ui.js';
+import { button, el } from './ui.js';
 
 // One canvas, one animation clock. HTML buttons mirror every meaningful node.
 export async function mountScene() {
@@ -9,19 +9,22 @@ export async function mountScene() {
   const mode = document.getElementById('scene-mode');
   const state = getState(), nodes = new Map(), labelNodes = new Map();
   const names = ['Mission control','Event stream','Sessions','Release path','Tickets','Mobile runner','WAL collectors'];
-  const positions = [[0,.2,0],[-2.65,.25,-1.2],[2.65,.15,-1.4],[2.7,.05,1.35],[-2.8,-.05,1.4],[-.15,.1,-2.5],[.4,-.15,2.6]];
+  const positions = [[0,.45,0],[-2.65,.65,-1.5],[2.65,.1,-1.8],[2.7,-.3,1.55],[-2.8,.05,1.6],[-.15,.5,-3],[.4,-.35,2.8]];
   const staticPositions = [[50,50],[26,28],[74,28],[77,73],[24,73],[47,12],[52,89]];
   let THREE, renderer, camera, world;
   let available = false, visible = true, frame = 0, lastFrame = -Infinity, elapsed = 0, lastTime = 0;
   let yaw = 0, targetYaw = 0, tilt = 0, targetTilt = 0, dragging = false, pointerStart = null;
   let stageRect, pulses = [], forcePoster = state.fallback, flashTimers = new Map();
   let renderWidth = 0, renderHeight = 0, renderRatio = 0;
+  const layers = [], currents = [], packets = [];
+  let hoverX = 0, hoverY = 0, parallaxX = 0, parallaxY = 0;
   function addLabel(id, name, kind, index, extraClass = '') {
     const label = button(`node-label ${extraClass}`, name, event => {
       if (pointerStart?.moved) return;
       event.stopPropagation();
       select(kind, id);
     });
+    label.replaceChildren(el('span', 'node-full', name), el('span', 'node-short', kind === 'initiative' ? (index === 0 ? 'Mission' : name.split(' ')[0]) : name));
     label.dataset.nodeId = id;
     label.setAttribute('aria-label', `Open ${kind} ${name}`);
     label.addEventListener('pointerenter', () => highlight(id));
@@ -39,7 +42,7 @@ export async function mountScene() {
     for (const { label, kind, index } of labelNodes.values()) {
       let x, y;
       if (kind === 'initiative') [x,y] = staticPositions[index];
-      else if (kind === 'owner') { const a = index / 8 * Math.PI * 2; x = 50 + Math.cos(a) * 36; y = 50 + Math.sin(a) * 34; }
+      else if (kind === 'owner') { const a = index / state.owners.length * Math.PI * 2; x = 50 + Math.cos(a) * 36; y = 50 + Math.sin(a) * 34; }
       else { const a = index / 3 * Math.PI * 2 + .5; x = 50 + Math.cos(a) * 45; y = 50 + Math.sin(a) * 43; }
       label.style.left = `${x}%`; label.style.top = `${y}%`;
     }
@@ -53,11 +56,13 @@ export async function mountScene() {
     stop();
   }
   function staticFlash(id) {
-    const item = labelNodes.get(id) || labelNodes.get('mission');
+    // The phone's single core label is also its static event cue.
+    const item = labelNodes.get(window.innerWidth < 768 ? 'mission' : id) || labelNodes.get('mission');
     if (!item) return;
-    clearTimeout(flashTimers.get(id));
+    const key = item.label.dataset.nodeId;
+    clearTimeout(flashTimers.get(key));
     item.label.classList.add('static-flash');
-    flashTimers.set(id, setTimeout(() => { item.label.classList.remove('static-flash'); flashTimers.delete(id); }, 650));
+    flashTimers.set(key, setTimeout(() => { item.label.classList.remove('static-flash'); flashTimers.delete(key); }, 650));
   }
   positionStatic();
   function start() {
@@ -78,6 +83,7 @@ export async function mountScene() {
     }
     // The canvas covers the viewport; the camera's optical centre follows the HUD gap.
     camera.setViewOffset(stageRect.width, stageRect.height, -stageRect.left, -stageRect.top, width, height);
+    camera.fov = width < 768 ? 26 : 30;
     camera.updateProjectionMatrix();
     start();
   }
@@ -89,9 +95,26 @@ export async function mountScene() {
   function arc(radius, start = 0, length = Math.PI * 2, y = 0, segments = 100) {
     return Array.from({ length: segments + 1 }, (_, i) => { const a = start + i / segments * length; return new THREE.Vector3(Math.cos(a) * radius, y, Math.sin(a) * radius); });
   }
+  function glow(color, radius = .55, opacity = .6) {
+    // A procedural billboard: soft falloff, no bitmap, postprocessing or extra clock.
+    const material = new THREE.ShaderMaterial({
+      uniforms: { tint: { value: new THREE.Color(color) }, strength: { value: opacity } },
+      vertexShader: 'varying vec2 vUv; varying float vDepth; void main(){vUv=uv; vec4 p=modelViewMatrix*vec4(0.,0.,0.,1.); vDepth=-p.z; p.xy+=position.xy; gl_Position=projectionMatrix*p;}',
+      fragmentShader: 'uniform vec3 tint; uniform float strength; varying vec2 vUv; varying float vDepth; void main(){float r=length(vUv-.5)*2.; float a=pow(max(0.,1.-r),3.)*strength*(1.-smoothstep(8.,18.,vDepth)); gl_FragColor=vec4(tint,a);}',
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    });
+    return new THREE.Mesh(new THREE.PlaneGeometry(radius*2,radius*2),material);
+  }
+  function spark(color, radius = .07) {
+    const group = new THREE.Group();
+    group.add(new THREE.Mesh(new THREE.SphereGeometry(radius,8,8),new THREE.MeshBasicMaterial({color,transparent:true,opacity:.95,depthWrite:false})));
+    group.add(glow(color,radius*5,.85));
+    return group;
+  }
   function build() {
     world = new THREE.Group();
     const scene = new THREE.Scene(); scene.add(world);
+    scene.fog = new THREE.Fog('#000000',8,18);
     scene.add(new THREE.AmbientLight('#b4c6ab', 2));
     const key = new THREE.DirectionalLight('#edffd4', 5); key.position.set(2,5,4); scene.add(key);
     const rim = new THREE.PointLight('#d8eaff', 35, 15); rim.position.set(-4,3,-2); scene.add(rim);
@@ -99,27 +122,34 @@ export async function mountScene() {
     // Nested silver orbits, offset just enough to suggest depth.
     [3.55,4.3,4.8].forEach((radius, i) => {
       const orbit = line(arc(radius), i === 1 ? '#d2dfb8' : '#a1b2a3', i === 1 ? .24 : .13);
-      orbit.rotation.x = (i-1) * .16; orbit.rotation.z = (i-1) * .11;
+      orbit.rotation.x = (i-1) * .22; orbit.rotation.z = (i-1) * .16;
+      orbit.position.y = (i-1)*.32;
     });
-    const current = new THREE.CatmullRomCurve3([new THREE.Vector3(-5,-.1,1),new THREE.Vector3(-2.9,.18,-.1),new THREE.Vector3(0,.2,0),new THREE.Vector3(2.6,.3,.6),new THREE.Vector3(5,.05,-1)]);
-    line(current.getPoints(180), '#eaff9e', .55);
-    line(current.getPoints(180).map(p => p.clone().add(new THREE.Vector3(0,-.08,.07))), '#eaff9e', .16);
-    const stars = [];
-    for (let i=0;i<125;i++) { const n = i*2.39996; const r = 1.3 + (i%23)/23*5.5; stars.push(Math.cos(n)*r, Math.sin(i*7.7)*1.5-.5, Math.sin(n)*r); }
-    const starGeometry = new THREE.BufferGeometry(); starGeometry.setAttribute('position', new THREE.Float32BufferAttribute(stars,3));
-    world.add(new THREE.Points(starGeometry, new THREE.PointsMaterial({ color:'#b5c29d',size:.018,transparent:true,opacity:.4 })));
+    const current = new THREE.CatmullRomCurve3([new THREE.Vector3(-5,-.4,2),new THREE.Vector3(...positions[1]),new THREE.Vector3(...positions[0]),new THREE.Vector3(...positions[3]),new THREE.Vector3(5,.2,-2)]);
+    currents.push(current);
+    line(current.getPoints(180), '#eaff9e', .72);
+    line(current.getPoints(180).map(p => p.clone().add(new THREE.Vector3(0,-.06,.08))), '#eaff9e', .18);
+    [-1.8,1.1].forEach((height, layerIndex) => {
+      const stars=[];
+      for(let i=0;i<65;i++){const a=i*2.39996,r=1.5+(i%23)/23*5.3;stars.push(Math.cos(a)*r,height+Math.sin(i*7.7)*.6,Math.sin(a)*r);}
+      const geometry=new THREE.BufferGeometry();geometry.setAttribute('position',new THREE.Float32BufferAttribute(stars,3));
+      const layer=new THREE.Points(geometry,new THREE.PointsMaterial({color:'#b5c29d',size:layerIndex?.025:.016,transparent:true,opacity:layerIndex?.4:.22,depthWrite:false}));
+      world.add(layer);layers.push(layer);
+    });
     state.initiatives.forEach((item, i) => {
       const position = new THREE.Vector3(...positions[i]);
       const core = new THREE.Group(); core.position.copy(position); world.add(core);
       const radius = i === 0 ? .27 : .15;
       const material = new THREE.MeshPhysicalMaterial({color:i === 0 ? '#eaff9e' : '#d5e4bc',metalness:.8,roughness:.24,clearcoat:1,emissive:'#a1c750',emissiveIntensity:i === 0 ? .16 : .06});
       const sphere = new THREE.Mesh(new THREE.IcosahedronGeometry(radius,2),material); core.add(sphere);
+      core.add(glow('#eaff9e',i===0?.85:.55,i===0?.8:.5));
       const cage = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.IcosahedronGeometry(radius*1.3,0)),new THREE.LineBasicMaterial({color:'#eaff9e',transparent:true,opacity:.35})); core.add(cage);
       const ring = new THREE.Line(new THREE.BufferGeometry().setFromPoints(arc(radius*2.4)),new THREE.LineBasicMaterial({color:'#66764c',transparent:true,opacity:.4})); core.add(ring);
       if (item.pct !== null) { const fill = new THREE.Line(new THREE.BufferGeometry().setFromPoints(arc(radius*2.4,0,item.pct/100*Math.PI*2,.015)),new THREE.LineBasicMaterial({color:'#eaff9e',transparent:true,opacity:.9})); core.add(fill); }
       if (i > 0) {
         const curve = new THREE.QuadraticBezierCurve3(position,new THREE.Vector3(position.x*.5,.6,position.z*.2),new THREE.Vector3(...positions[0]));
         line(curve.getPoints(70),'#b4c88c',.28);
+        currents.push(curve);
       }
       nodes.set(item.id,{core,position,sphere,kind:'initiative'});
     });
@@ -127,7 +157,7 @@ export async function mountScene() {
       const parent = nodes.get(owner.initiative_id), a = i*1.7;
       const position = parent.position.clone().add(new THREE.Vector3(Math.cos(a)*.85,.35,Math.sin(a)*.75));
       const core = new THREE.Group(); core.position.copy(position); world.add(core);
-      const sphere = new THREE.Mesh(new THREE.OctahedronGeometry(.055),new THREE.MeshBasicMaterial({color:owner.state === 'DROPPED' ? '#f1a6a6' : '#cad9dc'})); core.add(sphere);
+      const sphere = new THREE.Mesh(new THREE.OctahedronGeometry(.055),new THREE.MeshBasicMaterial({color:['DROPPED','SILENT'].includes(owner.state) ? '#f1a6a6' : '#cad9dc'})); core.add(sphere);
       line([parent.position,position],'#b5cad6',.24);
       nodes.set(owner.agent_id,{core,position,sphere,kind:'owner',parent:owner.initiative_id});
     });
@@ -137,27 +167,41 @@ export async function mountScene() {
       const sphere = new THREE.Mesh(new THREE.BoxGeometry(.09,.09,.09),new THREE.MeshBasicMaterial({color:'#97a6ad'})); core.add(sphere);
       nodes.set(repo,{core,position,sphere,kind:'repo'});
     });
+    currents.forEach((curve,i)=>{
+      const count=i===0?5:1;
+      for(let n=0;n<count;n++){
+        const mesh=spark('#eaff9e',i===0?.045:.032);
+        world.add(mesh);packets.push({mesh,curve,phase:n/count+i*.13,speed:i===0?.065:.1});
+      }
+    });
   }
   const pointCache = { value: null };
   function projectLabels() {
     if (!camera || !stageRect) return;
     const v = pointCache.value ||= new THREE.Vector3();
     for (const [id, {label,kind}] of labelNodes) {
+      if (window.innerWidth < 768 && id !== 'mission') continue;
       const node = nodes.get(id); if (!node) continue;
       node.core.getWorldPosition(v); v.project(camera);
       const x = (v.x*.5+.5)*window.innerWidth-stageRect.left;
       const y = (-v.y*.5+.5)*window.innerHeight-stageRect.top + (kind === 'owner' ? 0 : kind === 'repo' ? 17 : 22);
-      const half = label.offsetWidth/2+2;
+      const half = label.offsetWidth/2+6, halfHeight = label.offsetHeight/2+6;
       label.style.left = `${Math.max(half,Math.min(stageRect.width-half,x))}px`;
-      label.style.top = `${Math.max(23,Math.min(stageRect.height-20,y))}px`;
+      label.style.top = `${Math.max(halfHeight,Math.min(stageRect.height-halfHeight,y))}px`;
     }
   }
   function renderOnce() {
     if (!available || forcePoster || !visible || document.hidden) return;
-    try { renderer.render(renderer.scene,camera); if (available && !forcePoster) projectLabels(); }
+    try {
+      // Keep the short phone band self-contained, even during drag and parallax.
+      renderer.setScissorTest(false); renderer.clear();
+      renderer.setScissor(stageRect.left,window.innerHeight-stageRect.bottom,stageRect.width,stageRect.height);
+      renderer.setScissorTest(true); renderer.render(renderer.scene,camera);
+      if (available && !forcePoster) projectLabels();
+    }
     catch { fallback('RENDER FALLBACK'); }
   }
-  function disposePulse(pulse) { world.remove(pulse.mesh);pulse.mesh.geometry.dispose();pulse.mesh.material.dispose(); }
+  function disposePulse(pulse) { world.remove(pulse.mesh);pulse.mesh.traverse(object=>{object.geometry?.dispose();object.material?.dispose();}); }
   function draw(time) {
     frame = 0;
     if (!available || forcePoster || !visible || document.hidden) return;
@@ -169,8 +213,13 @@ export async function mountScene() {
       lastTime = time; lastFrame = time;
       if (moving) elapsed += dt;
       yaw += (targetYaw-yaw)*.08; tilt += (targetTilt-tilt)*.08;
-      world.rotation.y = yaw + (moving ? Math.sin(elapsed*.09)*.09 : 0);
-      world.rotation.x = tilt;
+      parallaxX = moving ? parallaxX+(hoverX-parallaxX)*.07 : 0;
+      parallaxY = moving ? parallaxY+(hoverY-parallaxY)*.07 : 0;
+      world.rotation.y = yaw + (moving ? Math.sin(elapsed*.09)*.09+parallaxX*.055 : 0);
+      world.rotation.x = -.12+tilt+parallaxY*.025;
+      world.rotation.z = -.065;
+      layers.forEach((layer,i)=>{layer.rotation.y=moving?Math.sin(elapsed*.035+i)*.045+parallaxX*(i?-.035:.04):0;layer.position.x=parallaxX*(i?.12:-.15);});
+      packets.forEach(packet=>{packet.mesh.visible=moving;packet.mesh.position.copy(packet.curve.getPoint((packet.phase+elapsed*packet.speed)%1));});
       for (const [id,node] of nodes) {
         const lit = getState().highlight === id || getState().selection?.id === id;
         node.sphere.scale.setScalar(lit ? 1.35 : 1);
@@ -178,11 +227,12 @@ export async function mountScene() {
       }
       for (let i=pulses.length-1;i>=0;i--) {
         const pulse = pulses[i]; pulse.age += dt;
+        pulse.mesh.visible = pulse.age >= 0;
+        if(pulse.age<0)continue;
         const t = pulse.age/pulse.duration;
         if (t>=1 || !moving) { disposePulse(pulse);pulses.splice(i,1);continue; }
         if (pulse.kind === 'wave') { pulse.mesh.scale.setScalar(.3+t*4);pulse.mesh.material.opacity=(1-t)*.7; }
-        else if (pulse.kind === 'ring') { const a=pulse.angle+t*Math.PI*.8;pulse.mesh.position.set(Math.cos(a)*4.3,.05,Math.sin(a)*4.3);pulse.mesh.material.opacity=1-t*.6; }
-        else { pulse.mesh.position.lerpVectors(pulse.from,pulse.to,t);pulse.mesh.position.y+=Math.sin(t*Math.PI)*.5; }
+        else pulse.mesh.position.copy(pulse.curve.getPoint(t));
       }
       renderOnce();
     }
@@ -194,14 +244,20 @@ export async function mountScene() {
     staticFlash(id);
     if (!available || forcePoster || !getState().motion || document.hidden || !visible) return;
     const from=nodes.get(id)?.position.clone()||new THREE.Vector3();
-    const to=nodes.get(event.subject.initiative)?.position.clone()||new THREE.Vector3();
-    const wave=['deploy','release','ticket','owner','system'].includes(event.kind);
-    const mesh=new THREE.Mesh(wave?new THREE.RingGeometry(.23,.25,64):new THREE.SphereGeometry(event.kind==='chat'?.075:.05,8,8),new THREE.MeshBasicMaterial({color:KINDS[event.kind].color,transparent:true,opacity:.9,side:THREE.DoubleSide,depthWrite:false}));
-    mesh.position.copy(wave?to:from);if(wave)mesh.rotation.x=-Math.PI/2;
-    world.add(mesh);
-    if(event.kind==='chat'){from.copy(nodes.get('harness').position);to.copy(nodes.get(event.actor.agent)?.position||nodes.get('mission').position);}
-    pulses.push({mesh,kind:wave?'wave':event.kind==='push'?'ring':'travel',from,to,age:0,duration:wave?1.5:1.15,angle:Math.atan2(from.z,from.x)});
-    if(pulses.length>32)disposePulse(pulses.shift());
+    const to=nodes.get(event.subject.initiative)?.position.clone()||nodes.get('mission').position.clone();
+    if(['chat','push','system'].includes(event.kind))from.copy(nodes.get(event.subject.repo)?.position||nodes.get('harness').position);
+    if(from.distanceTo(to)<.1)from.copy(nodes.get('harness').position);
+    let curve;
+    if(event.kind==='push'){
+      const angle=Math.atan2(from.z,from.x);
+      curve=new THREE.CatmullRomCurve3([from,...arc(4.3,angle,.9,0,16),to]);
+    }else curve=new THREE.QuadraticBezierCurve3(from,from.clone().lerp(to,.5).add(new THREE.Vector3(0,.7,0)),to);
+    const mesh=spark(KINDS[event.kind].color,.095);mesh.position.copy(from);world.add(mesh);
+    pulses.push({mesh,kind:'travel',curve,age:0,duration:1.45});
+    const wave=new THREE.Mesh(new THREE.RingGeometry(.2,.225,48),new THREE.MeshBasicMaterial({color:KINDS[event.kind].color,transparent:true,opacity:.7,side:THREE.DoubleSide,depthWrite:false}));
+    wave.position.copy(to);wave.rotation.x=-Math.PI/2;wave.visible=false;world.add(wave);
+    pulses.push({mesh:wave,kind:'wave',age:-1.45,duration:.9});
+    while(pulses.length>32)disposePulse(pulses.shift());
     start();
   }
   // Controls remain functional even if the renderer never initializes.
@@ -223,12 +279,13 @@ export async function mountScene() {
     }
     if(reason==='tab')requestAnimationFrame(()=>{size();start();});
   });
-  document.getElementById('scene-reset').addEventListener('click',()=>{targetYaw=0;targetTilt=0;if(!getState().motion){yaw=0;tilt=0;}start();});
+  document.getElementById('scene-reset').addEventListener('click',()=>{targetYaw=0;targetTilt=0;hoverX=hoverY=0;if(!getState().motion){yaw=0;tilt=0;}start();});
   stage.addEventListener('pointerdown',event=>{
     if(event.target.closest('button'))return;
     dragging=true;pointerStart={x:event.clientX,y:event.clientY,yaw:targetYaw,tilt:targetTilt,moved:false};stage.setPointerCapture(event.pointerId);
   });
   stage.addEventListener('pointermove',event=>{
+    if(event.pointerType==='mouse'&&stageRect){hoverX=(event.clientX-stageRect.left)/stageRect.width*2-1;hoverY=(event.clientY-stageRect.top)/stageRect.height*2-1;}
     if(!dragging||!pointerStart||!available)return;
     const dx=event.clientX-pointerStart.x,dy=event.clientY-pointerStart.y;
     pointerStart.moved=Math.abs(dx)+Math.abs(dy)>5;
@@ -237,6 +294,7 @@ export async function mountScene() {
     if(!getState().motion){yaw=targetYaw;tilt=targetTilt;}
     start();
   });
+  stage.addEventListener('pointerleave',()=>{hoverX=hoverY=0;});
   const release=()=>{dragging=false;pointerStart=null;};stage.addEventListener('pointerup',release);stage.addEventListener('pointercancel',release);
   const observer=new IntersectionObserver(entries=>{visible=entries[0].isIntersecting;if(visible){size();start();}else stop();});observer.observe(stage);
   new ResizeObserver(size).observe(stage);
@@ -250,7 +308,7 @@ export async function mountScene() {
     renderer.setClearColor(0x000000,0);
     renderer.debug.onShaderError=()=>fallback('SHADER FALLBACK');
     document.getElementById('scene-layer').append(renderer.domElement);
-    camera=new THREE.PerspectiveCamera(30,1,.1,80);camera.position.set(.2,5.8,8.2);camera.lookAt(0,0,0);
+    camera=new THREE.PerspectiveCamera(30,1,.1,80);camera.position.set(.3,5.7,9);camera.lookAt(0,0,0);
     // The shared rAF timestamp is the only scene clock (no per-object timers).
     build();available=true;
     renderer.domElement.addEventListener('webglcontextlost',event=>{event.preventDefault();fallback('CONTEXT LOST · STATIC');});
