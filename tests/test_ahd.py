@@ -351,6 +351,115 @@ class ClockAndDisk(Scratch):
         d.tick()
         self.assertEqual(len([e for e in self.ring().values() if e["event"] == "raise"]), 1)
 
+    def test_ring_rows_under_an_old_hostname_are_this_daemons_and_get_cleared(self):
+        """Fleet round items 1 and 2: rows ahd raised while the Mac was called Mac-2 or Erics-MacBook-Air were invisible to
+        a daemon running under another name, so they never cleared and the same ask alerted twice."""
+        events = [{"seq": 1, "source": "ahd", "host": "Erics-MacBook-Air", "key": "ask:w1:due", "event": "raise"},
+                  {"seq": 2, "source": "ahd", "host": "Mac-2", "key": "ask:w1:due", "event": "raise"},
+                  {"seq": 3, "source": "ahd", "host": "Mac-2", "key": "liveness:s/agent-a1", "event": "raise"},
+                  {"seq": 4, "source": "ops-watch", "host": "Mac-2", "key": "disk:v", "event": "raise"}]
+        st = ahd.ring_state(events, "ahd", "mac")
+        self.assertEqual(sorted(st), ["ask:w1:due", "liveness:s/agent-a1"])
+        self.assertEqual(st["ask:w1:due"]["seq"], 2, "latest row wins")
+        plan = ahd.plan_transitions({}, st, frozenset(), now=NOW)
+        self.assertEqual(sorted(k for op, k, f, c in plan if op == "clear"), ["ask:w1:due", "liveness:s/agent-a1"])
+
+    def test_host_label_is_stable_across_hostname_changes(self):
+        with mock.patch.object(ahd.socket, "gethostname", return_value="Erics-MacBook-Air.local"):
+            a = ahd.host()
+        with mock.patch.object(ahd.socket, "gethostname", return_value="Mac-2.lan"):
+            b = ahd.host()
+        self.assertEqual(a, b)
+
+    def _serve(self, sigs, ticks_max=10, compile_result=False):
+        """Run serve_forever with a scripted code_signature sequence (the last value repeats); returns (rc, ticks)."""
+        d = self.daemon()
+        d.policy["tick_seconds"] = 0
+        n = {"i": 0}
+
+        def tick():
+            n["i"] += 1
+            if n["i"] >= ticks_max:
+                d.stop.set()
+            return {"tick": n["i"], **{k: 0 for k in ("sessions", "owners", "asks_open", "desired", "transitions", "sent", "wall_s")}}
+
+        seq = list(sigs)
+
+        def sig():
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+
+        patches = [mock.patch.object(d, "tick", tick), mock.patch.object(d.stop, "wait", lambda t: None),
+                   mock.patch.object(ahd.signal, "signal"), mock.patch.object(ahd, "code_signature", sig)]
+        # the scripted signatures name files that do not exist; compile_result stands in for the syntax check
+        patches.append(mock.patch.object(ahd, "uncompilable", lambda *a: None if compile_result is False else compile_result))
+        for pt in patches:
+            pt.start()
+            self.addCleanup(pt.stop)
+        return d.serve_forever(), n["i"]
+
+    def test_serve_loop_exits_for_a_restart_when_its_code_changed(self):
+        """Fleet round item 1: a daemon that keeps running old modules after the hooks were reinstalled kept raising a
+        liveness alert the new code skips (goodqa#15322 fix installed 11-08 23:20, ahd started 11-08 01:24). It must
+        notice its own source changed and exit non-zero so launchd (KeepAlive SuccessfulExit=false) starts the new code.
+        The baseline is taken after the first tick, and the change must hold for two consecutive ticks."""
+        old, new = {"ahd.py": (1, 10)}, {"ahd.py": (2, 11)}
+        rc, ticks = self._serve([old, old, new, new])
+        self.assertEqual(rc, ahd.EXIT_RELOAD)
+        self.assertNotEqual(ahd.EXIT_RELOAD, 0)
+        self.assertEqual(ticks, 4, "baseline after tick 1, change seen on tick 3, still changed on tick 4, then exit")
+
+    def test_a_change_that_does_not_hold_for_two_ticks_is_a_half_finished_install(self):
+        old, new = {"ahd.py": (1, 10)}, {"ahd.py": (2, 11)}
+        rc, ticks = self._serve([old, new, old], ticks_max=5)
+        self.assertEqual(rc, 0)
+        self.assertEqual(ticks, 5)
+
+    def test_a_module_imported_lazily_during_a_tick_is_not_a_change(self):
+        """Red-team finding 1: ask_reminders is imported inside the first tick, so the signature gained a key and the daemon
+        exited 75 on every start, restarting every 10 s."""
+        base = {"ahd.py": (1, 10)}
+        grown = {"ahd.py": (1, 10), "ask_reminders.py": (3, 5)}
+        self.assertFalse(ahd.code_changed(base, grown))
+        rc, ticks = self._serve([base, grown], ticks_max=4)
+        self.assertEqual(rc, 0)
+        self.assertEqual(ticks, 4)
+
+    def test_real_signature_is_stable_across_a_real_tick(self):
+        d = self.daemon()
+        before = ahd.code_signature()
+        d.tick()
+        after = ahd.code_signature()
+        self.assertFalse(ahd.code_changed(after, ahd.code_signature()))
+        self.assertFalse(ahd.code_changed(before, after), "a lazy import during a tick must not look like a change")
+
+    def test_changed_code_that_does_not_compile_keeps_the_running_daemon(self):
+        """Red-team finding 2: exiting onto a syntax error is a launchd crash loop; stay on the old code."""
+        old, new = {"ahd.py": (1, 10)}, {"ahd.py": (2, 11)}
+        rc, ticks = self._serve([old, old, new, new, new], ticks_max=6, compile_result="ahd.py: SyntaxError")
+        self.assertEqual(rc, 0)
+        self.assertEqual(ticks, 6)
+
+    def test_uncompilable_reports_a_real_syntax_error_and_accepts_good_code(self):
+        with tempfile.TemporaryDirectory() as t:
+            f = Path(t) / "m.py"
+            f.write_text("x = 1\n")
+            base = ahd.file_signature([str(f)])
+            f.write_text("def broken(:\n")
+            self.assertEqual(ahd.uncompilable(base, ahd.file_signature([str(f)])), "m.py: SyntaxError")
+            f.write_text("x = 2\n")
+            self.assertIsNone(ahd.uncompilable(base, ahd.file_signature([str(f)])))
+
+    def test_code_signature_changes_when_a_loaded_module_file_changes(self):
+        sig = ahd.code_signature()
+        self.assertTrue(any(k.endswith("ahd.py") for k in sig), sorted(sig)[:5])
+        self.assertTrue(any(k.endswith("liveness.py") for k in sig))
+        with tempfile.TemporaryDirectory() as t:
+            f = Path(t) / "m.py"
+            f.write_text("x = 1\n")
+            a = ahd.file_signature([str(f)])
+            f.write_text("x = 22\n")
+            self.assertNotEqual(a, ahd.file_signature([str(f)]))
+
     def test_serve_loop_survives_a_failing_tick(self):
         d = self.daemon()
         d.policy["tick_seconds"] = 0

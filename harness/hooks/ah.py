@@ -1467,7 +1467,7 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         import ops_watch  # noqa: PLC0415
         kind = op.split(".", 1)[1]
         out["ring_seq"] = ops_watch.emit({
-            "host": socket.gethostname().split(".")[0], "source": args["source"], "event": kind,
+            "host": ops_watch.default_host(), "source": args["source"], "event": kind,
             "severity": args.get("severity") or "info", "key": args["alert_key"], "check": args["source"],
             "message": args.get("message") or "cleared", "detail": args.get("detail") or {}}, home=home)
     elif op == "task.dispose":
@@ -1748,7 +1748,8 @@ WAL_SCAN_MAX = 64 * 1024 * 1024  # bytes of a session's WALs searched for one ev
 
 def ring_host() -> str:
     """The host name ahd uses for its ring rows (ahd.host()); one definition so ring_state matches."""
-    return socket.gethostname().split(".")[0]
+    import ops_watch  # noqa: PLC0415
+    return ops_watch.default_host()
 
 
 def _ring_alert(home: Path, key: str, severity: str, message: str, detail: dict) -> None:

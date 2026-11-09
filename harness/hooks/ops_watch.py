@@ -268,16 +268,30 @@ def emit(event: dict, path: Path | None = None, home: Path | None = None) -> int
         os.close(lock)
 
 
+LOCAL_RING_SOURCES = frozenset(("ahd", "ah"))  # written by this machine's own daemons and CLI, under whatever hostname it had
+
+
+def ring_host(e: dict) -> str:
+    """The host a ring row belongs to. The ring is a local file, and ahd and ah stamped rows with
+    socket.gethostname(), which flips between names on one Mac (Mac-2.lan, Erics-MacBook-Air.local). Their rows are all
+    this machine's, so they share one identity; otherwise one ask raised two alerts and a row written under an old name
+    could never be cleared (fleet round items 1 and 2)."""
+    return default_host() if e.get("source") in LOCAL_RING_SOURCES else e.get("host")
+
+
 def latest_by_key(events: list) -> dict:
     latest = {}
-    for e in events:
-        latest[(e.get("host"), e.get("source"), e.get("key"))] = e
+    for e in sorted(events, key=lambda x: x.get("seq") or 0):
+        latest[(ring_host(e), e.get("source"), e.get("key"))] = e
     return latest
 
 
 def active_alerts(home: Path) -> list:
     """Active = the latest event per (host, source, key) is a raise. Highest severity first."""
-    act = [e for e in latest_by_key(read_ring(ring_path(home))).values() if e.get("event") == "raise"]
+    act = []
+    for (host, _src, _key), e in latest_by_key(read_ring(ring_path(home))).items():
+        if e.get("event") == "raise":
+            act.append(e if e.get("host") == host else dict(e, host=host))
     return sorted(act, key=lambda e: (-SEVERITIES.get(e.get("severity"), 0), e.get("key", "")))
 
 
@@ -1693,7 +1707,7 @@ def digest(pending: list) -> list:
     rather than a replay of every flap."""
     last = {}
     for e in pending:
-        last[(e.get("host"), e.get("key"))] = e
+        last[(ring_host(e), e.get("key"))] = e
     return sorted(last.values(), key=lambda e: e.get("seq") or 0)
 
 

@@ -83,6 +83,13 @@ def _clip(text: str, limit: int = MAX_CMD) -> str:
     return text if len(text) <= limit else text[:limit] + "...[+%d]" % (len(text) - limit)
 
 
+def _who(session, agent) -> str:
+    """The caller part of an aggregated ops-watch alert key: one row per caller session (else agent), not one per run.
+    Characters outside the ring key alphabet are dropped."""
+    raw = str(session)[:12] if session else (str(agent)[:40] if agent else "nosession")
+    return re.sub(r"[^A-Za-z0-9._-]", "", raw) or "nosession"
+
+
 def _now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -669,8 +676,9 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
     approved_live = [r for r in live if r.get("approved")]
     if approved_live:
         approval = scope["approval"]
-        event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "high", "check": "ah-kill",
-                 "key": "ah-kill:approved:" + run_id,
+        # A verified user approval is a record, not a page: info, one aggregated row per caller session (fleet round item 3).
+        event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "info", "check": "ah-kill",
+                 "key": "ah-kill:approved:" + _who(session, agent),
                  "message": "ah kill --approved-by %s stopped/will stop %d user-approved stale process(es): %s (reason: %s)" % (
                      approval["ask"], len(approved_live), ", ".join(str(r["pid"]) for r in approved_live), _clip(reason, 120)),
                  "detail": {"run": run_id, "caller": caller, "reason": _clip(reason, 200), "ask": approval["ask"],
@@ -684,8 +692,11 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
             raise KillError("notice_failed", "could not raise the ops-watch notice for an approved stop; nothing was signalled", 3)
     foreign_live = [r for r in live if r.get("foreign")]
     if foreign_live:
-        event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "high", "check": "ah-kill",
-                 "key": "ah-kill:foreign:" + run_id,
+        # Stopping the caller's OWN session's processes outside its tree is info; another owner's stays high. One
+        # aggregated row per caller session either way, so 40 stops are one alert, not 40.
+        own_session = bool(session) and all(r.get("owner_session") == session for r in foreign_live)
+        event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "info" if own_session else "high",
+                 "check": "ah-kill", "key": "ah-kill:foreign:" + _who(session, agent) + (":own" if own_session else ""),
                  "message": "ah kill --foreign stopped/will stop %d process(es) outside the caller's tree: %s (reason: %s)" % (
                      len(foreign_live), ", ".join(str(r["pid"]) for r in foreign_live), _clip(reason, 120)),
                  "detail": {"run": run_id, "caller": caller, "reason": _clip(reason, 200), "targets": [
@@ -882,7 +893,7 @@ def kill_remote_windows(host, pids, reason, tree, grace, session="", agent="", h
             rec.update(status="refused", detail="its parent pid %s is still running; stop the parent first" % rec["ppid"])
     if "status" not in rec:
         event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "high", "check": "ah-kill",
-                 "key": "ah-kill:foreign:remote-" + uuid.uuid4().hex[:10],
+                 "key": "ah-kill:foreign:remote-%s-%s" % (host, _who(session, agent)),
                  "message": "ah kill --foreign on %s for pid %d %s (reason: %s)" % (
                      host, pid, _clip(rec["cmd"] or rec["name"], 80), _clip(reason, 120)),
                  "detail": {"host": host, "pids": [pid], "caller": {"session": session or None, "agent": agent or None}}}
@@ -931,7 +942,7 @@ def kill_remote(host, pids, reason, tree, grace, session="", agent="", home=None
     audit = Audit(home, default_wal(home, session), {"session": session or None, "agent": agent or None})
     audit.row({"event": "remote", "host": host, "pids": pids, "reason": reason, "tree": tree})
     event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "high", "check": "ah-kill",
-             "key": "ah-kill:foreign:remote-" + uuid.uuid4().hex[:10],
+             "key": "ah-kill:foreign:remote-%s-%s" % (host, _who(session, agent)),
              "message": "ah kill --foreign on %s for pids %s (reason: %s)" % (host, ",".join(str(p) for p in pids), _clip(reason, 120)),
              "detail": {"host": host, "pids": pids, "caller": {"session": session or None, "agent": agent or None}}}
     try:
