@@ -360,6 +360,73 @@ class WaitFailsClosed(Base):
             stranger.wait()
 
 
+class WaitFile(Base):
+    """GoodQA #15565: a waiter must name the producer of its file, give up, and alert (one waited 12 h for nothing)."""
+
+    def wait_file(self, target, producer, timeout="20", *extra):
+        env = dict(os.environ, HOME=str(self.tmp))  # the ring alert lands in a throwaway home
+        return subprocess.run([sys.executable, str(BG_JOB), "wait-file", "--file", str(target), "--producer", producer,
+                               "--timeout", timeout, "--poll", "0.1", "--dir", str(self.jobs), *extra],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=60, env=env)
+
+    def alerts(self):
+        ring = self.tmp / ".agent-harness" / "state" / "alerts.jsonl"
+        return ring.read_bytes() if ring.exists() else b""
+
+    def test_a_producer_and_a_finite_timeout_are_required(self):
+        target = self.tmp / "out.txt"
+        for args in ((["wait-file", "--file", str(target), "--timeout", "5"]),
+                     (["wait-file", "--file", str(target), "--producer", "someone", "--timeout", "5"]),
+                     (["wait-file", "--file", str(target), "--producer", "pid:abc", "--timeout", "5"]),
+                     (["wait-file", "--file", str(target), "--producer", "pid:%d" % os.getpid()]),
+                     (["wait-file", "--file", str(target), "--producer", "pid:%d" % os.getpid(), "--timeout", "999999"])):
+            res = run_bg(*args)
+            self.assertNotEqual(res.returncode, 0, args)
+            self.assertNotIn("FILE_READY", res.stdout)
+
+    def test_a_producer_that_wrote_the_file_is_ready(self):
+        target = self.tmp / "out.txt"
+        script = self.script("producer.sh", "echo up; sleep 0.6; echo data > %s; sleep 5\n" % target)
+        self.assertEqual(self.launch("prod1", self.tmp / "p1.log", 5, "sh", script).returncode, 0)
+        res = self.wait_file(target, "job:prod1")
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("FILE_READY", res.stdout)
+
+    def test_a_producer_that_exits_without_the_file_ends_the_wait_and_alerts(self):
+        target = self.tmp / "never.txt"
+        script = self.script("quitter.sh", "echo working; sleep 0.8\n")
+        self.assertEqual(self.launch("quit1", self.tmp / "q1.log", 5, "sh", script).returncode, 0)
+        started = time.time()
+        res = self.wait_file(target, "job:quit1", timeout="60")
+        self.assertEqual(res.returncode, 4, res.stdout)
+        self.assertIn("PRODUCER_GONE", res.stdout)
+        self.assertLess(time.time() - started, 30)  # nowhere near the 60 s timeout
+        self.assertIn(b"bgwait:never.txt:producer-gone", self.alerts())
+
+    def test_a_live_producer_that_never_writes_times_out_and_alerts(self):
+        target = self.tmp / "slow.txt"
+        script = self.script("sleeper.sh", "echo up; sleep 60\n")
+        self.assertEqual(self.launch("slow1", self.tmp / "s1.log", 5, "sh", script).returncode, 0)
+        res = self.wait_file(target, "job:slow1", timeout="2")
+        self.assertEqual(res.returncode, 3, res.stdout)
+        self.assertIn("TIMEOUT", res.stdout)
+        self.assertIn(b"bgwait:slow.txt:timeout", self.alerts())
+
+    def test_a_dead_pid_or_unknown_job_is_not_a_producer(self):
+        target = self.tmp / "x.txt"
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        res = self.wait_file(target, "pid:%d" % dead.pid, timeout="30")
+        self.assertEqual(res.returncode, 4, res.stdout)
+        res = self.wait_file(target, "job:nosuchjob", timeout="30")
+        self.assertEqual(res.returncode, 4, res.stdout)
+
+    def test_an_existing_file_is_ready_at_once_even_when_the_producer_is_gone(self):
+        target = self.tmp / "done.txt"
+        target.write_text("x")
+        self.assertEqual(self.wait_file(target, "pid:1999999", timeout="5").returncode, 0)
+
+
 class LintCorpora(unittest.TestCase):
     def test_positive_corpus(self):
         import bg_lint

@@ -27,5 +27,10 @@
   {"id": "pgrep-exact-name", "command": "while pgrep -x tsc >/dev/null; do sleep 5; done"},
   {"id": "pgrep-name-only", "command": "while pgrep node >/dev/null; do sleep 5; done"},
   {"id": "ps-grep-v-grep", "command": "while ps aux | grep 'vitest run' | grep -v grep; do sleep 10; done"},
-  {"id": "pid-wait", "command": "while kill -0 $PID 2>/dev/null; do sleep 5; done"}
+  {"id": "pid-wait", "command": "while kill -0 $PID 2>/dev/null; do sleep 5; done"},
+  {"id": "file-wait-timeout", "command": "timeout 600 bash -c 'until [ -f out.txt ]; do sleep 5; done'"},
+  {"id": "file-wait-counter", "command": "i=0; until [ -f out.txt ] || [ $i -ge 120 ]; do sleep 5; i=$((i+1)); done"},
+  {"id": "file-wait-seconds", "command": "until [ -f out.txt ] || [ $SECONDS -gt 600 ]; do sleep 5; done"},
+  {"id": "file-wait-for-bounded", "command": "for i in $(seq 1 120); do [ -f out.txt ] && break; sleep 5; done"},
+  {"id": "file-check-no-wait", "command": "if [ -f out.txt ]; then cat out.txt; fi"}
 ]
