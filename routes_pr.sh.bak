@@ -1,0 +1,34 @@
+#!/bin/bash
+# wrangler.cloudflare.jsonc: drop the route block (its deploy-time zone-routes pre-check needs a scope the deploy token lacks) and keep workers.dev and preview URLs off. Branch from main, normal push.
+set -eu
+exec > /Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/agent-ab8a7d1bf54ed3c9a/routes_pr.log 2>&1
+set -x
+cd /Users/eric/.agent-harness/scratch/claude-501/-Users-eric/baab765b-d85c-46b4-b7b9-588eb912c770/scratchpad/n2/t2c
+git fetch --depth 1 origin main:refs/remotes/origin/main
+git checkout -q -B fix/wrangler-no-zone-route origin/main
+python3 -I - <<'EOF'
+p = 'wrangler.cloudflare.jsonc'
+s = open(p).read()
+old = '  "routes": [{ "pattern": "learnai.ericmacdougall.com", "custom_domain": true }]\n'
+assert old in s
+new = '''  // The custom domain learnai.ericmacdougall.com is already attached to this worker in the Cloudflare account and keeps serving.
+  // It is deliberately not declared here: any `routes` entry makes `wrangler deploy` list the zone's worker routes first, which needs a zone scope
+  // the deploy token does not have (the deploy exited 1 at that step). With no routes, workers.dev and preview URLs must be switched off explicitly.
+  "workers_dev": false,
+  "preview_urls": false
+'''
+s = s.replace(',\n' + old, ',\n' + new)
+if old in s:
+    s = s.replace(old, new)
+open(p, 'w').write(s)
+EOF
+tail -8 wrangler.cloudflare.jsonc
+python3 -I -c "
+import re,json
+s=open('wrangler.cloudflare.jsonc').read()
+s=re.sub(r'^\s*//.*\$','',s,flags=re.M)
+json.loads(s); print('valid json after stripping comments')"
+git add wrangler.cloudflare.jsonc
+git commit -q -m "fix(deploy): drop the route block that needs a zone scope" -m "Why: npm run deploy exited 1 at the zone workers-routes check because the deploy token has no zone scope; the custom domain is already attached and serving." -m "What: remove routes from wrangler.cloudflare.jsonc and set workers_dev and preview_urls to false so no extra public URL appears; the attached domain is untouched." -m "Testing: not run: configuration; verified by rerunning npm run deploy and the live checks after merge." -m "Refs: GoodQA #15484"
+git push -q origin fix/wrangler-no-zone-route 2>&1 | tail -1
+echo "ROUTES_HEAD $(git rev-parse HEAD)"
