@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="theme-color" content="#000000">
+  <title>Mission Control</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body data-tab="overview">
+  <a class="skip-link" href="#initiatives-panel">Skip to initiatives</a>
+  <div id="scene-layer" aria-hidden="true"></div>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="./" aria-label="Harness mission control home">
+        <svg class="brand-mark" viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M5 7v18M12 3v26M20 3v26M27 7v18M5 16h22" stroke="currentColor" stroke-width="2"/><path d="m5 7 7-4h8l7 4M5 25l7 4h8l7-4" stroke="currentColor" stroke-width="1.2"/></svg>
+        <span>harness<span class="brand-divider">/</span><span class="brand-product">mission control</span></span>
+      </a>
+      <div class="topbar-tools">
+        <span id="connection" class="connection connecting" role="status"><i></i><span>Connecting</span></span>
+        <time id="live-clock" class="mono">00:00:00</time><span class="clock-zone">LOCAL</span>
+        <button id="motion-toggle" class="quiet-button motion-control" aria-pressed="true"><svg class="motion-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7.5" stroke-dasharray="2.2 2.6"/><circle cx="12" cy="12" r="2"/></svg><span id="motion-label">Motion on</span></button>
+      </div>
+    </header>
+
+    <div class="workspace-bar">
+      <div><div class="eyebrow">LOCAL WORKSPACE <span class="slash">/</span> <span id="workspace-host">LOCAL</span></div><h1>Your fleet, in focus<span class="accent">.</span></h1></div>
+      <div class="fleet-metrics" aria-label="Fleet summary">
+        <div><strong id="metric-live">—</strong><span><i class="status-dot"></i>live owners</span></div>
+        <div><strong id="metric-initiatives">—</strong><span>initiatives</span></div>
+        <div><strong id="metric-attention">—</strong><span>need attention</span></div>
+      </div>
+    </div>
+
+    <nav class="filter-bar" aria-label="Filter activity by event kind">
+      <span class="filter-label">SIGNAL FILTER</span><div id="event-filters" class="filter-chips"></div>
+      <span class="filter-hint">Every signal has a shape.</span>
+    </nav>
+
+    <main class="dashboard">
+      <section id="initiatives-panel" class="panel initiatives-panel" tabindex="-1" aria-labelledby="initiatives-heading">
+        <header class="panel-heading"><h2 id="initiatives-heading"><span class="section-index">01</span> Initiatives <span id="initiative-count" class="count-badge"></span></h2><span class="micro-label">THE BIG PICTURE</span></header>
+        <div id="initiatives-list" class="panel-scroll initiatives-list"></div>
+        <div class="panel-foot"><span class="status-dot"></span> Read from initiatives.json · estimates name their estimator</div>
+      </section>
+
+      <section id="topology-panel" class="topology-panel" aria-labelledby="topology-heading">
+        <div class="topology-heading"><div><span class="eyebrow">LIVE TOPOLOGY</span><h2 id="topology-heading">One connected current.</h2></div><span class="scene-mode" id="scene-mode"><i></i> SPATIAL VIEW</span></div>
+        <div id="scene-stage" class="scene-stage">
+          <svg id="scene-poster" class="scene-poster" viewBox="0 0 640 320" role="img" aria-label="Static constellation: initiative cores linked to owners and repositories">
+            <defs><radialGradient id="poster-glow"><stop stop-color="#eaff9e" stop-opacity=".14"/><stop offset="1" stop-color="#eaff9e" stop-opacity="0"/></radialGradient></defs>
+            <ellipse cx="320" cy="164" rx="255" ry="125" fill="url(#poster-glow)"/>
+            <g fill="none" stroke="#566044" stroke-width=".8"><ellipse cx="320" cy="164" rx="264" ry="102" transform="rotate(-13 320 164)"/><ellipse cx="320" cy="164" rx="229" ry="72" transform="rotate(15 320 164)"/><ellipse cx="320" cy="164" rx="185" ry="118" transform="rotate(-24 320 164)"/><path d="M81 163Q184 70 320 164T567 183M190 97Q320 164 451 91M194 239Q320 164 455 231M279 61Q320 164 371 262"/></g>
+            <g fill="#eaff9e" stroke="#eaff9e"><circle cx="320" cy="164" r="8"/><circle cx="190" cy="97" r="5"/><circle cx="451" cy="91" r="5"/><circle cx="194" cy="239" r="5"/><circle cx="455" cy="231" r="5"/><circle cx="279" cy="61" r="4"/><circle cx="371" cy="262" r="4"/></g>
+            <g fill="#c9d3d0"><circle cx="81" cy="163" r="3"/><circle cx="567" cy="183" r="3"/><circle cx="147" cy="192" r="3"/><circle cx="496" cy="145" r="3"/><circle cx="352" cy="99" r="3"/><circle cx="245" cy="197" r="3"/></g>
+          </svg>
+          <div id="scene-labels" class="scene-labels" aria-label="Explore constellation nodes"></div>
+          <div class="scene-coordinates mono" aria-hidden="true">SYS.01 <span>↗ 49.28° N</span></div>
+        </div>
+        <div class="scene-caption"><span><i class="status-dot"></i><span id="scene-status">Owners linked. Signals flowing.</span></span><button id="scene-reset" class="text-button">Reset view <span aria-hidden="true">↺</span></button></div>
+      </section>
+
+      <section id="activity-panel" class="panel activity-panel" tabindex="-1" aria-labelledby="activity-heading">
+        <header class="panel-heading"><h2 id="activity-heading"><span class="section-index">02</span> Activity <span class="live-mini">LIVE</span></h2><span class="activity-tools"><button id="activity-quiet" class="quiet-button" aria-pressed="false">Show tool activity</button><button id="activity-pause" class="quiet-button" aria-pressed="false"><span aria-hidden="true">Ⅱ</span> Pause feed</button></span></header>
+        <div id="activity-buffer" class="activity-buffer" hidden><button id="activity-resume" class="text-button"></button></div>
+        <div id="activity-list" class="panel-scroll activity-list" aria-label="Recent events"></div>
+        <div class="panel-foot"><span id="activity-summary">Listening for signals</span><span class="mono">mc.event/1</span></div>
+      </section>
+
+      <section id="owners-panel" class="panel owners-panel" tabindex="-1" aria-labelledby="owners-heading">
+        <header class="panel-heading"><h2 id="owners-heading"><span class="section-index">03</span> Owners <span id="owner-count" class="count-badge"></span></h2><label class="sr-only" for="owner-filter">Filter owners by state</label><select id="owner-filter" class="compact-select"><option value="all">All owners</option><option value="live">Live</option><option value="DROPPED">Dropped</option><option value="SILENT">Silent</option><option value="finishing">Finishing</option><option value="codex">Codex</option><option value="returned">Returned</option><option value="done">Done</option></select></header>
+        <div id="owners-list" class="panel-scroll owners-list"></div>
+        <div class="owner-legend"><span><i class="status-dot"></i>&lt; 5 m</span><span><i class="status-dot warm"></i>&lt; 30 m</span><span><i class="status-dot stale"></i>30 m +</span><span>since last activity</span></div>
+      </section>
+
+      <section id="chat-panel" class="panel chat-panel" tabindex="-1" aria-labelledby="chat-heading">
+        <header class="panel-heading"><h2 id="chat-heading"><span class="section-index">04</span> Command channel</h2><span id="chat-presence" class="micro-label accent">READY</span></header>
+        <div class="chat-routing"><div class="responder-switch" role="group" aria-label="Chat responder"><button id="responder-claude" aria-pressed="true"><span class="runtime-symbol" aria-hidden="true">✳</span> Claude <span class="responder-main">main</span></button><button id="responder-codex" aria-pressed="false"><span class="runtime-symbol" aria-hidden="true">◇</span> Codex</button></div><label id="session-label" class="session-label"><span class="sr-only">Claude target session</span><select id="chat-session"><option value="">no main attached</option></select></label></div>
+        <div id="chat-log" class="chat-log" role="log" aria-label="Conversation" aria-live="off" tabindex="0"></div>
+        <div id="chat-notice" class="chat-notice" role="status" hidden></div>
+        <form id="chat-form" class="chat-composer">
+          <label class="sr-only" for="chat-input">Message your coordinating agent</label>
+          <textarea id="chat-input" rows="1" maxlength="4000" placeholder="Give your fleet a direction…" aria-describedby="composer-hint chat-counter"></textarea>
+          <div class="composer-bottom"><span class="approval-notice"><button id="approval-help" type="button" aria-haspopup="dialog" aria-controls="approval-dialog" aria-describedby="approval-description" title="Dashboard messages can steer ordinary work but cannot approve production, deletion, credential actions or top-rung models.">Approvals need the terminal <svg class="info-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.5"/><path d="M8 7.2v4M8 4.6v.2"/></svg></button><span id="approval-description" class="sr-only">Dashboard messages can steer ordinary work but cannot approve production, deletion, credential actions or top-rung models.</span></span><span id="composer-hint">↵ send <span>· Shift + ↵ new line</span></span><span id="chat-counter" class="mono">0 / 4000</span><button id="chat-send" type="submit" aria-label="Send message" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg></button></div>
+        </form>
+      </section>
+    </main>
+
+    <footer id="health-panel" class="health-strip" aria-label="Source health"><div class="health-title"><span class="status-dot"></span><span>SOURCE HEALTH</span></div><div id="health-list" class="health-list"></div><span class="local-badge" title="Served on 127.0.0.1 only; read-only">LOCAL · READ-ONLY</span></footer>
+    <nav class="bottom-tabs" aria-label="Dashboard views"><button data-tab="overview" aria-current="page"><span aria-hidden="true">◈</span>Overview</button><button data-tab="activity"><span aria-hidden="true">≋</span>Activity</button><button data-tab="owners"><span aria-hidden="true">⠿</span>Owners</button><button data-tab="chat"><span aria-hidden="true">▱</span>Chat</button></nav>
+  </div>
+
+  <dialog id="approval-dialog" aria-labelledby="approval-title" aria-describedby="approval-copy"><div class="dialog-top"><h2 id="approval-title">Approvals need the terminal</h2><button class="icon-button" id="approval-close" aria-label="Close approval explanation">×</button></div><p id="approval-copy" class="approval-copy">Dashboard messages reach your agents labelled as dashboard text. They can start or steer ordinary work, but they cannot approve production, deletion, credential or account actions, or top-rung models, and they never override a hard rule. Give those approvals in the terminal attached to your agent.</p></dialog>
+  <dialog id="inspector" class="inspector"><div class="dialog-top"><span class="eyebrow" id="inspector-type">DETAIL</span><button class="icon-button" id="inspector-close" aria-label="Close details">×</button></div><div id="inspector-content"></div></dialog>
+  <div id="page-error" class="page-error" role="alert" hidden></div>
+  <div id="activity-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+  <div id="chat-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+  <noscript><div class="noscript">Mission Control needs JavaScript to show your fleet.</div></noscript>
+  <script type="module" src="./js/main.js"></script>
+</body>
+</html>

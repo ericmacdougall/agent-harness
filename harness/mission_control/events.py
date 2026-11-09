@@ -51,7 +51,8 @@ def _word(value) -> str:
 
 
 def make(kind: str, source: str, summary, *, eid: str, ts: float | None = None, actor: dict | None = None,
-         subject: dict | None = None, severity: str = "info", count: int = 1, historic: bool = False) -> dict:
+         subject: dict | None = None, severity: str = "info", count: int = 1, historic: bool = False,
+         quiet: bool = False) -> dict:
     actor = actor or {}
     subject = subject or {}
     event = {
@@ -65,6 +66,8 @@ def make(kind: str, source: str, summary, *, eid: str, ts: float | None = None, 
     }
     if historic:
         event["historic"] = True
+    if quiet:
+        event["quiet"] = True  # activity (tool calls, lifecycle): pulses and ages, not a feed row by default
     return event
 
 
@@ -138,7 +141,7 @@ class Hub:
         self.max_clients = max_clients
         self.max_rate = max_rate
         self.window = [time.monotonic(), 0]
-        self.suppressed = 0
+        self.suppressed = self.suppressed_quiet = 0
         self.snapshots: dict[str, object] = {}
 
     def frame(self, seq: int, name: str, data) -> bytes:
@@ -155,12 +158,19 @@ class Hub:
             now = time.monotonic()
             if now - self.window[0] >= 1.0:
                 if self.suppressed:
+                    loud = self.suppressed - self.suppressed_quiet
                     self._emit_locked(make("system", "mission-control", f"{self.suppressed} more events in a burst",
-                                           eid=f"burst:{int(now * 1000)}", count=self.suppressed, severity="info"))
-                    self.suppressed = 0
+                                           eid=f"burst:{int(now * 1000)}", count=self.suppressed, severity="info",
+                                           quiet=loud == 0))
+                    self.suppressed = self.suppressed_quiet = 0
                 self.window = [now, 0]
-            if self.window[1] >= self.max_rate:
-                self.suppressed += max(1, int(event.get("count", 1)))
+            # Quiet activity (tool calls, lifecycle) gets half the budget so it never crowds out work items.
+            limit = self.max_rate // 2 if event.get("quiet") else self.max_rate
+            if self.window[1] >= limit:
+                weight = max(1, int(event.get("count", 1)))
+                self.suppressed += weight
+                if event.get("quiet"):
+                    self.suppressed_quiet += weight
                 return False
             self.window[1] += 1
             self._emit_locked(event)

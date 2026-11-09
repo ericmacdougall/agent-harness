@@ -14,6 +14,8 @@ import events as ev
 from safeio import Refused, TICKET_RE
 
 TOOL_EVENTS = ("pretool", "posttool", "PreToolUse", "PostToolUse")
+LIFECYCLE_EVENTS = ("subagent", "subagent_stop", "SubagentStart", "SubagentStop", "prompt", "UserPromptSubmit", "session",
+                    "SessionStart", "stop", "Stop", "compact", "PreCompact")
 DEPLOY_RE = re.compile(r"\bDEPLOYED\b|\bdeployed to (?:live|prod)|\blive deploy\b|\bdeploy(?:ed)? (?:live|to production)\b",
                        re.I)
 TERMINAL = ("done", "handoff", "returned", "idle-helper", "unverified-legacy", "superseded", "wontdo", "legacy")
@@ -158,16 +160,27 @@ class WalTailer(Collector):
                 lines = handle.read(16384).split(b"\n")
         except (OSError, Refused):
             return
+        newest = None
         for raw in reversed(lines):
             entry = _json(raw)
-            if entry and entry.get("event") not in TOOL_EVENTS:
+            if not entry:
+                continue
+            newest = newest or entry
+            if _meaningful(entry):
                 self._remember(tail, entry)
-                return
+                break
+        if newest:
+            self._remember(tail, newest, meaningful=False)
 
-    def _remember(self, tail: _Tail, entry: dict) -> None:
+    def _remember(self, tail: _Tail, entry: dict, meaningful: bool = True) -> None:
+        """Keep the newest meaningful work item, and separately the time of any activity (tool calls included)."""
         key = (tail.runtime, tail.session, tail.agent)
-        self.last_items[key] = {"at": str(entry.get("at", ""))[:40], "event": str(entry.get("event", ""))[:40],
-                                "note": ev.short(_note(entry), 200)}
+        at = str(entry.get("at", ""))[:40]
+        item = dict(self.last_items.get(key) or {"at": "", "event": "", "note": ""})
+        if meaningful:
+            item.update({"at": at, "event": str(entry.get("event", ""))[:40], "note": ev.short(_note(entry), 200)})
+        item["active_at"] = max(at, item.get("active_at") or "", item.get("at") or "")
+        self.last_items[key] = item
         if len(self.last_items) > 6000:
             for old in list(self.last_items)[:1000]:
                 self.last_items.pop(old, None)
@@ -217,8 +230,9 @@ class WalTailer(Collector):
             if kind in TOOL_EVENTS:
                 tools += 1
                 last_tool = entry
+                self._remember(tail, entry, meaningful=False)
                 continue
-            self._remember(tail, entry)
+            self._remember(tail, entry, meaningful=_meaningful(entry))
             if sent >= budget:
                 skipped += 1
                 continue
@@ -226,9 +240,10 @@ class WalTailer(Collector):
         if tools:
             if sent < budget:
                 tool = str((last_tool or {}).get("tool", "tool"))[:40]
-                self.hub.publish(ev.make("wal", f"{tail.runtime}-wal", f"{tools} tool call(s), last {tool}",
+                self.hub.publish(ev.make("wal", f"{tail.runtime}-wal",
+                                         f"{tools} tool call{'s' if tools > 1 else ''} · last {tool}",
                                          eid=f"wal:{tail.session}:{tail.agent}:{tail.offset}:t", count=tools,
-                                         actor=self._actor(tail)))
+                                         actor=self._actor(tail), quiet=True))
                 sent += 1
             else:
                 skipped += tools
@@ -241,10 +256,12 @@ class WalTailer(Collector):
         note = _note(entry)
         actor = self._actor(tail)
         subject = {"ticket": _ticket_in(note)}
-        self.hub.publish(ev.make("wal", f"{tail.runtime}-wal", f"{kind}: {note}" if note else kind,
+        meaningful = _meaningful(entry)
+        summary = f"{kind}: {note}" if meaningful else _lifecycle_summary(entry, kind, note)
+        self.hub.publish(ev.make("wal", f"{tail.runtime}-wal", summary,
                                  eid=f"wal:{tail.session}:{tail.agent}:{tail.offset}:{str(entry.get('id', ''))[:20]}",
-                                 actor=actor, subject=subject,
-                                 severity="warn" if kind in ("blocker", "risk") else "info"))
+                                 actor=actor, subject=subject, quiet=not meaningful,
+                                 severity="warn" if kind in ("blocker", "risk", "incident") else "info"))
         if DEPLOY_RE.search(note) or kind in ("deploy", "deployed"):
             self.hub.publish(ev.make("deploy", f"{tail.runtime}-wal", note or kind, actor=actor, subject=subject,
                                      eid=f"deploy:{tail.session}:{tail.agent}:{tail.offset}"))
@@ -261,6 +278,26 @@ def _json(raw: bytes):
     except (json.JSONDecodeError, ValueError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _meaningful(entry: dict) -> bool:
+    """A work item worth a feed row: a WAL note the agent wrote, not a hook's lifecycle or tool record."""
+    kind = str(entry.get("event", ""))
+    if kind in TOOL_EVENTS or kind in LIFECYCLE_EVENTS:
+        return False
+    return bool(isinstance(entry.get("note"), str) and entry["note"].strip())
+
+
+def _lifecycle_summary(entry: dict, kind: str, note: str) -> str:
+    agent = re.sub(r"[^A-Za-z0-9_-]", "", str(entry.get("agent_id") or ""))[:8]
+    role = re.sub(r"[^A-Za-z0-9_ -]", "", str(entry.get("agent_type") or ""))[:30]
+    if kind in ("subagent", "SubagentStart"):
+        return f"started {role or 'agent'} {agent}".strip()
+    if kind in ("subagent_stop", "SubagentStop"):
+        return f"{role or 'agent'} {agent} stopped".strip()
+    if kind in ("prompt", "UserPromptSubmit"):
+        return "new prompt"
+    return f"{kind}: {note}" if note else kind
 
 
 def _note(entry: dict) -> str:

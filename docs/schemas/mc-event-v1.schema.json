@@ -30,6 +30,7 @@
     "count": {"type": "integer", "minimum": 1, "maximum": 1000000000, "default": 1,
               "description": "How many underlying activities this event stands for (bursts are summarised)."},
     "tenant": {"type": "string", "maxLength": 64},
-    "historic": {"type": "boolean", "description": "Backfill from a first read: shown in history, never pulsed."}
+    "historic": {"type": "boolean", "description": "Backfill from a first read: shown in history, never pulsed."},
+    "quiet": {"type": "boolean", "description": "Activity without a work item (tool calls, prompts, subagent start/stop): pulses the scene and refreshes ages, but is not a feed row unless the viewer asks for tool activity."}
   }
 }

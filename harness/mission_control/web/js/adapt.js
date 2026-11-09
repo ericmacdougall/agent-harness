@@ -1,0 +1,131 @@
+// Pure mapping from the Mission Control server's JSON (GoodQA #15585) to the view model the panels render.
+// No DOM, no network: tested with `node --test harness/mission_control/web/tests/`.
+// Every string stays a string; panels render with textContent only.
+
+const str = (value, max = 4000) => (typeof value === 'string' ? value : value == null ? '' : String(value)).slice(0, max);
+const isoFromEpoch = seconds => (typeof seconds === 'number' && Number.isFinite(seconds) ? new Date(seconds * 1000).toISOString() : null);
+const validIso = value => (typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : null);
+
+export const SEVERE = state => /^(DROPPED|SILENT)/.test(str(state));
+export const shortId = id => str(id).slice(0, 8);
+
+export function initiative(row) {
+  const item = {
+    id: str(row.id, 64) || 'row', initiative: str(row.initiative, 200) || 'Untitled', state: str(row.state, 60) || 'Unknown',
+    milestones_done: Number.isFinite(row.milestones_done) ? row.milestones_done : null,
+    milestones_total: Number.isFinite(row.milestones_total) ? row.milestones_total : null,
+    pct: Number.isFinite(row.pct) ? Math.max(0, Math.min(100, row.pct)) : null,
+    owner: str(row.owner, 80), ticket: str(row.ticket, 60), milestones: str(row.milestones, 4000),
+    milestone_items: Array.isArray(row.milestone_items) ? row.milestone_items.map(m => ({ done: !!m.done, text: str(m.text, 200).replace(/^(Done:|Not yet:)\s*/i, '') })) : [],
+    next_step: str(row.next_step, 600), next_eta: str(row.next_eta, 80) || null, full_eta: str(row.full_eta, 80) || null,
+    estimate_by: str(row.estimate_by, 80) || 'main', note: str(row.note, 600), updated: str(row.updated, 60), error: str(row.error, 300),
+  };
+  if (item.pct === null) item.milestones_done = item.milestones_total = null;
+  return item;
+}
+
+export function initiatives(snapshot) {
+  const items = Array.isArray(snapshot?.items) ? snapshot.items.filter(x => x && typeof x === 'object').map(initiative) : [];
+  return { items, stale: !!snapshot?.stale, error: str(snapshot?.error, 300) };
+}
+
+// An initiative's free-text owner ("a095f32d (waiting)", "none live", "main") links to an owner row by id prefix.
+export function ownerKey(text) {
+  const match = /^([0-9a-f]{7,17})\b/i.exec(str(text).trim());
+  return match ? match[1].toLowerCase() : null;
+}
+
+export function owners(rows, items = []) {
+  if (!Array.isArray(rows)) return [];
+  return rows.filter(r => r && typeof r === 'object' && r.agent_id).map(r => {
+    const id = str(r.agent_id, 40);
+    const linked = items.find(i => (ownerKey(i.owner) && id.toLowerCase().startsWith(ownerKey(i.owner))) || (r.ticket && i.ticket === r.ticket));
+    const last = r.last_item && typeof r.last_item === 'object' ? r.last_item : null;
+    const at = validIso(last?.at) || null;
+    const active = [validIso(last?.active_at), at, validIso(r.last_activity)].filter(Boolean).sort().pop() || null;
+    return {
+      agent_id: id, name: r.runtime === 'codex' ? `codex ${shortId(id)}` : shortId(id), runtime: r.runtime === 'codex' ? 'codex' : 'claude',
+      type: str(r.type, 40), task: str(r.task, 200) || (r.runtime === 'codex' ? 'Codex session' : 'Owner'), ticket: str(r.ticket, 60),
+      state: str(r.state, 24) || 'unknown', severe: SEVERE(r.state),
+      last_item: { at, active, event: str(last?.event, 40), note: str(last?.note, 200) || 'No work item recorded yet' },
+      initiative_id: linked ? linked.id : null,
+    };
+  });
+}
+
+const SOURCE_NAMES = { wals: 'Claude + Codex WALs', initiatives: 'Initiatives file', owners: 'Owners', github: 'GitHub', goodqa: 'GoodQA tickets',
+  't2-dev': 't2-dev', 'file-drop': 'Event drops', codex: 'Codex chat', chat: 'Chat store' };
+export function sources(rows) {
+  if (!Array.isArray(rows)) return [];
+  return rows.filter(r => r && r.name).map(r => ({
+    id: str(r.name, 40), name: SOURCE_NAMES[r.name] || str(r.name, 40), state: ['ok', 'error', 'off', 'stale'].includes(r.status) ? r.status : 'error',
+    checked: isoFromEpoch(r.checked) || new Date(0).toISOString(), note: str(r.detail, 200) || (r.status === 'ok' ? 'Reading normally.' : ''),
+  }));
+}
+
+export function event(raw) {
+  if (!raw || raw.schema !== 'mc.event/1' || typeof raw.id !== 'string') return null;
+  const actor = raw.actor && typeof raw.actor === 'object' ? raw.actor : {};
+  const subject = raw.subject && typeof raw.subject === 'object' ? raw.subject : {};
+  return {
+    schema: 'mc.event/1', id: str(raw.id, 200), ts: validIso(raw.ts) || new Date().toISOString(), kind: str(raw.kind, 20),
+    source: str(raw.source, 40), severity: ['info', 'warn', 'high'].includes(raw.severity) ? raw.severity : 'info',
+    summary: str(raw.summary, 280), count: Number.isInteger(raw.count) && raw.count > 0 ? raw.count : 1, historic: raw.historic === true, quiet: raw.quiet === true,
+    actor: { runtime: str(actor.runtime, 40), session: str(actor.session, 160), agent: str(actor.agent, 160) },
+    subject: { repo: str(subject.repo, 160), branch: str(subject.branch, 160), ticket: str(subject.ticket, 160), initiative: str(subject.initiative, 160) },
+  };
+}
+
+// Codex availability reasons come from the server: "subscription BLOCKED until 2026-11-10T02:37:00Z", "not logged in with ChatGPT".
+export function codex(raw) {
+  const reason = str(raw?.reason, 300);
+  if (raw?.available) return { state: raw.busy ? 'busy' : 'ready', blockedUntil: null, reason };
+  const until = /until (\d{4}-\d\d-\d\dT[\d:.]+Z)/.exec(reason);
+  if (/blocked/i.test(reason)) return { state: 'blocked', blockedUntil: until ? until[1] : null, reason };
+  return { state: 'unavailable', blockedUntil: null, reason: reason || 'Codex is not available' };
+}
+
+export function sessions(targets, mainSession) {
+  const list = Array.isArray(targets) ? targets.filter(t => t && typeof t.session === 'string') : [];
+  return list.map(t => ({ id: t.session, label: `${t.session === mainSession ? 'main' : 'session'} · ${shortId(t.session)}`, waiting: !!t.waiting }))
+    .sort((a, b) => Number(b.id === mainSession) - Number(a.id === mainSession));
+}
+
+const USER_STATUS = { queued: 'queued', delivered: 'delivered', answered: 'answered', failed: 'failed', forged: 'forged', unavailable: 'failed', answering: 'answering' };
+
+// Server records plus this page's pending sends (keyed by client_key) -> one ordered message list.
+export function messages(chat, pending = []) {
+  const out = [];
+  const keys = new Set();
+  const replies = Array.isArray(chat?.replies) ? chat.replies : [];
+  const replying = new Map();
+  for (const reply of replies) if (reply && reply.reply_to) replying.set(reply.reply_to, reply);
+  for (const m of Array.isArray(chat?.messages) ? chat.messages : []) {
+    if (!m || typeof m.id !== 'string') continue;
+    if (m.client_key) keys.add(m.client_key);
+    let status = USER_STATUS[m.status] || 'queued';
+    const partial = replying.get(m.id);
+    if (partial && !partial.final && status !== 'answered' && status !== 'failed') status = 'answering';
+    out.push({ id: m.id, from: 'user', to: m.to === 'codex' ? 'codex' : 'claude', session: str(m.session, 128), text: str(m.text), ts: validIso(m.ts) || new Date().toISOString(),
+      status: m.status === 'forged' || m.label === 'FORGED' ? 'forged' : status, reason: str(m.reason, 300), client_key: str(m.client_key, 64) });
+  }
+  for (const r of replies) {
+    if (!r || typeof r.id !== 'string' || !['claude', 'codex'].includes(r.from)) continue;
+    out.push({ id: r.id, from: r.from, to: r.from, reply_to: str(r.reply_to, 40), text: str(r.text, 65536), ts: validIso(r.ts) || new Date().toISOString(),
+      status: r.final ? 'answered' : 'answering' });
+  }
+  for (const p of pending) if (!keys.has(p.client_key)) out.push(p);
+  return out.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts) || (a.from === 'user' ? -1 : 1)).slice(-80);
+}
+
+export function newClientKey(random = () => Math.random()) {
+  const bytes = globalThis.crypto?.getRandomValues ? globalThis.crypto.getRandomValues(new Uint8Array(16)) : Uint8Array.from({ length: 16 }, () => Math.floor(random() * 256));
+  return 'k' + Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Up to three repositories with recent pushes or releases become scene nodes.
+export function repos(events, limit = 3) {
+  const counts = new Map();
+  for (const e of events) if (e.subject.repo && ['push', 'release', 'deploy'].includes(e.kind)) counts.set(e.subject.repo, (counts.get(e.subject.repo) || 0) + 1);
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit).map(([repo]) => repo);
+}

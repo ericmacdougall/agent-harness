@@ -196,6 +196,24 @@ class WalTail(Tmp):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["count"], 40)
 
+    def test_tool_and_lifecycle_lines_are_quiet_and_keep_the_last_work_item(self):
+        path = self.wals / "sess1" / "agent-q.jsonl"
+        path.write_text("")
+        self.tailer.run(time.time())
+        self.append(path, {"at": "2026-11-09T22:00:00Z", "event": "intent", "note": "wire the SSE stream"})
+        self.tailer.run(time.time())
+        self.append(path, {"at": "2026-11-09T22:05:00Z", "event": "pretool", "tool": "Bash"},
+                    {"at": "2026-11-09T22:06:00Z", "event": "subagent", "agent_id": "a22e3925b2329ce4d",
+                     "agent_type": "red-team"})
+        self.tailer.run(time.time())
+        last = self.tailer.last_for("claude", "sess1", "q")
+        self.assertEqual(last["note"], "wire the SSE stream", "tool calls never replace the last work item")
+        self.assertEqual(last["active_at"], "2026-11-09T22:06:00Z")
+        events = self.hub.recent()
+        self.assertFalse(events[0].get("quiet"))
+        self.assertEqual([e.get("quiet") for e in events[1:]], [True, True])
+        self.assertIn("started red-team a22e3925", [e["summary"] for e in events])
+
     def test_symlinked_wal_is_not_followed(self):
         secret = self.base / "secret.txt"
         secret.write_text(json.dumps({"event": "intent", "note": "SECRET CONTENT"}) + "\n")
@@ -675,6 +693,7 @@ class Budget(ServerHarness):
             sock = socket.create_connection(("127.0.0.1", self.port), timeout=2)
             idle.append(sock)
         time.sleep(0.3)
+        self.assertLessEqual(len(self.server.live), mcs.MAX_CONNECTIONS, "connections stay bounded")
         started = time.time()
         cookie, _ = self.login()
         resp, _ = self.request("GET", "/", {"Cookie": cookie, "Sec-Fetch-Site": "none"})
@@ -697,6 +716,16 @@ class Budget(ServerHarness):
         hub.window[0] -= 2
         hub.publish(ev.make("wal", "x", "later", eid="w:later"))
         self.assertTrue(any(e["kind"] == "system" and e["count"] == 480 for e in hub.recent()))
+
+    def test_quiet_floods_never_starve_work_items(self):
+        hub = ev.Hub(max_rate=20)
+        quiet = sum(hub.publish(ev.make("wal", "x", "tool", eid=f"q:{n}", quiet=True)) for n in range(100))
+        loud = sum(hub.publish(ev.make("wal", "x", "intent: real work", eid=f"l:{n}")) for n in range(10))
+        self.assertEqual((quiet, loud), (10, 10), "quiet activity takes at most half the budget")
+        hub.window[0] -= 2
+        hub.publish(ev.make("wal", "x", "later", eid="w:later2"))
+        burst = [e for e in hub.recent() if e["kind"] == "system"][-1]
+        self.assertTrue(burst.get("quiet"), "a burst of only tool activity is summarised quietly")
 
     def test_slow_sse_client_is_dropped_not_buffered(self):
         client = ev.Client(maxlen=5)

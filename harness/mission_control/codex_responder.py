@@ -58,10 +58,11 @@ class StreamRedactor:
 class CodexResponder:
     TIMEOUT_S = 300
     RATE_PER_MIN = 6
-    AVAIL_TTL_S = 60
+    AVAIL_TTL_S = 120
 
-    def __init__(self, hub, health, runner, codex_bin: str | None, root: Path):
+    def __init__(self, hub, health, runner, codex_bin: str | None, root: Path, disabled: str = ""):
         self.hub, self.health, self.runner = hub, health, runner
+        self.disabled = disabled
         self.codex = codex_bin
         self.root = root
         self.cwd = root / "codex" / "cwd"
@@ -83,6 +84,8 @@ class CodexResponder:
         return self.available
 
     def _check(self) -> tuple[bool, str]:
+        if self.disabled:
+            return False, self.disabled
         if not self.codex or not os.access(self.codex, os.X_OK):
             return False, "codex CLI not found"
         code, out = self.runner.run("codex-login-status", timeout=20)
@@ -103,10 +106,10 @@ class CodexResponder:
                 self.health.error("codex", f"{type(exc).__name__}: {str(exc)[:160]}")
 
     def step(self) -> None:
+        ok, reason = self.availability()  # cached for AVAIL_TTL_S, so the dock always shows a current reason
         queued = mc_chat.pending("codex", root=self.root)
         if not queued:
             return
-        ok, reason = self.availability()
         record = queued[0]
         if not ok:
             mc_chat.set_state(record["id"], "unavailable", reason=reason, root=self.root)

@@ -184,7 +184,7 @@ def codex_binary() -> str | None:
 
 class App:
     def __init__(self, *, port: int, root: Path, initiatives: str | None, remote: bool, fabric_bin: str | None,
-                 runner: Runner | None = None, wal_roots=None, start_threads: bool = True):
+                 runner: Runner | None = None, wal_roots=None, start_threads: bool = True, codex: bool = True):
         self.port, self.root = port, root
         mc_chat.ensure_dirs(root)
         (root / "sources").mkdir(mode=0o700, exist_ok=True)
@@ -212,7 +212,8 @@ class App:
         self.drop = col.FileDrop(self.hub, self.health, self.reader, root / "sources")
         self.collectors = [self.tailer, self.initiatives, self.drop, self.owners, self.github, self.tickets,
                            self.remote]
-        self.codex = CodexResponder(self.hub, self.health, self.runner, codex_binary(), root)
+        self.codex = CodexResponder(self.hub, self.health, self.runner, codex_binary(), root,
+                                    disabled="" if codex else "Codex chat is turned off for this instance")
         self.chat_sig = None
         self.stop = threading.Event()
         self.threads: list[threading.Thread] = []
@@ -262,6 +263,7 @@ class App:
         messages = []
         for record in mc_chat.inbox(self.root, limit=60):
             messages.append({"id": record.get("id"), "from": "user", "to": record.get("to"),
+                             "client_key": record.get("client_key") if record.get("verified") else "",
                              "session": record.get("session"), "thread": record.get("thread"),
                              "text": str(record.get("text", ""))[:mc_chat.MAX_TEXT], "ts": record.get("created"),
                              "status": "forged" if not record.get("verified") else record.get("state"),
@@ -273,7 +275,7 @@ class App:
                                         "reply_to": reply.get("reply_to"), "text": str(reply.get("text", ""))[:65536],
                                         "ts": reply.get("created"), "final": bool(reply.get("final"))}
         return {"messages": messages, "replies": list(replies.values())[-60:],
-                "targets": mc_chat.targets(self.root),
+                "targets": mc_chat.targets(self.root), "main_session": self.owners.session,
                 "codex": {"available": self.codex.available[0], "reason": self.codex.available[1],
                           "busy": self.codex.busy}}
 
@@ -626,7 +628,7 @@ def cmd_serve(args) -> int:
     initiatives = args.initiatives or default_initiatives()
     try:
         app = App(port=args.port, root=root, initiatives=initiatives, remote=not args.no_remote,
-                  fabric_bin=args.fabric_bin, start_threads=False)
+                  fabric_bin=args.fabric_bin, start_threads=False, codex=not args.no_codex)
         server = Server(app, Path(args.web or (HERE / "web")), log)
     except OSError as exc:
         log.error("cannot bind 127.0.0.1:%s: %s", args.port, exc)
@@ -652,6 +654,7 @@ def main(argv=None) -> int:
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--initiatives")
     p.add_argument("--no-remote", action="store_true")
+    p.add_argument("--no-codex", action="store_true", help="never run codex exec (disposable or test instances)")
     p.add_argument("--fabric-bin")
     p.add_argument("--web")
     for name in ("url", "open", "status"):
