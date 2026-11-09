@@ -391,7 +391,8 @@ class ClockAndDisk(Scratch):
         patches = [mock.patch.object(d, "tick", tick), mock.patch.object(d.stop, "wait", lambda t: None),
                    mock.patch.object(ahd.signal, "signal"), mock.patch.object(ahd, "code_signature", sig)]
         # the scripted signatures name files that do not exist; compile_result stands in for the syntax check
-        patches.append(mock.patch.object(ahd, "uncompilable", lambda *a: None if compile_result is False else compile_result))
+        check = compile_result if callable(compile_result) else (lambda *a: None if compile_result is False else compile_result)
+        patches.append(mock.patch.object(ahd, "uncompilable", check))
         for pt in patches:
             pt.start()
             self.addCleanup(pt.stop)
@@ -438,6 +439,66 @@ class ClockAndDisk(Scratch):
         rc, ticks = self._serve([old, old, new, new, new], ticks_max=6, compile_result="ahd.py: SyntaxError")
         self.assertEqual(rc, 0)
         self.assertEqual(ticks, 6)
+
+    def test_uncompilable_checks_new_hooks_modules_too_not_only_changed_baseline_files(self):
+        """Red-team delta (c): a changed baseline file that starts importing a NEW module with a syntax error passed the
+        check and ahd exited 75 into an import failure, a launchd restart loop that takes the monitor down."""
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            (root / "ahd.py").write_text("x = 1\n")
+            base = ahd.file_signature([str(root / "ahd.py")])
+            (root / "ahd.py").write_text("import brand_new\n")          # changed, compiles
+            (root / "brand_new.py").write_text("def broken(:\n")         # new, not in the baseline, does not compile
+            (root / "notes.txt").write_text("not python")
+            sig = ahd.file_signature([str(root / "ahd.py")])
+            self.assertEqual(ahd.uncompilable(base, sig, root=root), "brand_new.py: SyntaxError")
+            (root / "brand_new.py").write_text("y = 2\n")
+            self.assertIsNone(ahd.uncompilable(base, sig, root=root))
+
+    def test_blocked_reload_recovers_when_the_stray_file_is_removed_without_the_signature_changing(self):
+        """Red-team M1: the offender is usually a stray *.py that is not in the signature, so removing it left sig == blocked
+        and uncompilable() was never re-run; ahd stayed on its old code until a baseline file was touched again."""
+        old, new = {"ahd.py": (1, 10)}, {"ahd.py": (2, 11)}
+        answers = iter(["stray.py: SyntaxError", "stray.py: SyntaxError", None])
+        calls = []
+
+        def check(*a):
+            calls.append(1)
+            return next(answers)
+
+        rc, ticks = self._serve([old, old, new, new, new, new, new], ticks_max=9, compile_result=check)
+        self.assertEqual(rc, ahd.EXIT_RELOAD)
+        self.assertEqual(len(calls), 3, "rechecked every tick while blocked, reloaded once it compiled")
+
+    def test_uncompilable_ignores_hooks_dir_extras_that_are_not_regular_files_but_fails_on_syntax(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            (root / "ahd.py").write_text("x = 1\n")
+            base = ahd.file_signature([str(root / "ahd.py")])
+            (root / "d.py").mkdir()                                   # a directory named like a module
+            os.symlink(str(root / "missing"), str(root / "ln.py"))   # dangling symlink
+            self.assertIsNone(ahd.uncompilable(base, base, root=root))
+            (root / "bad.py").write_text("def broken(:\n")
+            self.assertEqual(ahd.uncompilable(base, base, root=root), "bad.py: SyntaxError")
+
+    def test_uncompilable_catches_non_syntax_compile_failures_instead_of_crashing_ahd(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            (root / "deep.py").write_text("x = 1\n")
+            for exc in (RecursionError, MemoryError):
+                with mock.patch.object(ahd, "compile", side_effect=exc, create=True):
+                    self.assertEqual(ahd.uncompilable({}, {}, root=root), "deep.py: " + exc.__name__)
+            unreadable = root / "locked.py"
+            unreadable.write_text("y = 2\n")
+            os.chmod(unreadable, 0)
+            try:
+                if os.getuid() != 0:
+                    self.assertEqual(ahd.uncompilable({}, {}, root=root), "locked.py: PermissionError")
+            finally:
+                os.chmod(unreadable, 0o600)
+
+    def test_uncompilable_on_the_real_hooks_directory_is_clean(self):
+        self.assertIsNone(ahd.uncompilable(ahd.code_signature(), ahd.code_signature()))
 
     def test_uncompilable_reports_a_real_syntax_error_and_accepts_good_code(self):
         with tempfile.TemporaryDirectory() as t:

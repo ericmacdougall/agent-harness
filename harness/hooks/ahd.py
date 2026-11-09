@@ -113,17 +113,34 @@ def code_changed(baseline: dict, now_sig: dict) -> bool:
     return any(now_sig.get(k) != v for k, v in baseline.items())
 
 
-def uncompilable(baseline: dict, now_sig: dict):
-    """The first changed baseline file that does not compile, as 'name: error', else None. A restart onto a syntax error
-    would be a crash loop (launchd restarts it every 10 s), so the daemon stays on the code it has."""
-    for k, v in baseline.items():
-        if now_sig.get(k) != v:
-            try:
-                with open(k, "rb") as fh:
-                    source = fh.read(8 << 20)  # bounded: a hooks module is far smaller than this
-                compile(source, k, "exec")
-            except (OSError, SyntaxError, ValueError) as error:
-                return "%s: %s" % (Path(k).name, type(error).__name__)
+def uncompilable(baseline: dict, now_sig: dict, root=None):
+    """The first file that does not compile, as 'name: error', else None. Checked: every changed baseline file AND every
+    *.py in the hooks directory, because changed code may import a module that is new (not in the baseline). A restart
+    onto a syntax error would be a crash loop (launchd restarts it every 10 s) that takes the monitor itself down, so
+    the daemon stays on the code it has."""
+    root = Path(root) if root is not None else HERE
+    changed = [k for k, v in baseline.items() if now_sig.get(k) != v]
+    extras = []
+    try:
+        extras = sorted(str(p) for p in root.glob("*.py"))[:400]
+    except OSError:
+        pass
+    seen = set()
+    for k in changed + extras:
+        if k in seen:
+            continue
+        seen.add(k)
+        if k not in changed and not os.path.isfile(k):
+            continue  # extras only: a directory named x.py, a dangling symlink or a file an atomic install just renamed away
+        try:
+            with open(k, "rb") as fh:
+                source = fh.read(8 << 20)  # bounded: a hooks module is far smaller than this
+            compile(source, k, "exec")
+        except FileNotFoundError:
+            if k in changed:
+                return "%s: FileNotFoundError" % Path(k).name
+        except Exception as error:  # noqa: BLE001 - SyntaxError, ValueError, RecursionError, MemoryError, unreadable: all block
+            return "%s: %s" % (Path(k).name, type(error).__name__)
     return None
 
 
@@ -841,7 +858,8 @@ class Daemon:
         log.info("ahd started pid %s host %s", os.getpid(), self.host)
         baseline = None   # taken after the first tick: modules imported lazily inside a tick are part of the baseline
         pending = None    # a changed signature must hold for two consecutive ticks (a half-finished install is not stable)
-        blocked = None    # a changed signature whose files do not compile: keep running the old code until it changes again
+        blocked = None    # a changed signature whose files do not compile: keep running the old code, rechecked every tick
+        blocked_why = None
         while not self.stop.is_set():
             t0 = mono()
             try:
@@ -854,21 +872,22 @@ class Daemon:
             if baseline is None:
                 baseline = sig
             elif code_changed(baseline, sig):
-                if sig == blocked:
-                    pass
-                elif sig != pending:
-                    pending = sig
+                if sig != pending and sig != blocked:
+                    pending = sig  # a change must hold for a second tick before anything acts on it
                 else:
+                    # Blocked or pending: (re)check every tick. The offender is often a stray file that is not in the
+                    # signature, so removing it changes nothing there; only a fresh check notices (red-team M1).
                     bad = uncompilable(baseline, sig)
                     if bad:
-                        blocked = sig
-                        log.error("ahd: changed source does not compile (%s); keeping the running code", bad)
+                        if sig != blocked or bad != blocked_why:
+                            log.error("ahd: changed source does not compile (%s); keeping the running code", bad)
+                        blocked, blocked_why = sig, bad
                     else:
                         self.release()
                         log.info("ahd: its source changed since start; exiting %s so the service manager starts the new code", EXIT_RELOAD)
                         return EXIT_RELOAD
             else:
-                pending = blocked = None
+                pending = blocked = blocked_why = None
             self.stop.wait(max(1.0, period - (mono() - t0)))
         self.release()
         log.info("ahd stopped")
