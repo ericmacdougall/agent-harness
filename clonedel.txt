@@ -1,0 +1,3 @@
+/home/eric/rt561
+/home/eric/repos/hawk-cmp-t2/head
+/home/eric/repos/hawk-cmp-t2/base
