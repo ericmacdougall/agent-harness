@@ -392,7 +392,10 @@ def mc_tool(name: str, arguments: dict) -> dict:
         raise InvalidReference('Unsupported tool')
     if not isinstance(chat.get(message_id), dict):
         return {'status': 'NOT_FOUND'}
-    record = chat.load(message_id)
+    try:
+        record = chat.load(message_id)
+    except chat.ChatError as error:
+        return {'status': 'REFUSED', 'code': error.code}
     if record is None:
         if chat.state(message_id).get('status') != 'answered':
             chat.set_state(message_id, 'forged', reason='missing or invalid server signature')

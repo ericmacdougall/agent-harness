@@ -2,6 +2,8 @@
 import io
 import json
 import os
+import stat
+import threading
 import subprocess
 import sys
 import tempfile
@@ -152,11 +154,12 @@ class Delivery(Base):
         self.attach()
         env = {**os.environ, "MC_HOME": str(self.root)}
         argv = [sys.executable, str(HOOKS / "mc_inbox.py"), "wait", "--session", SID, "--timeout", "6"]
-        procs = [subprocess.Popen(argv, stdout=subprocess.PIPE, text=True, env=env) for _ in range(2)]
-        time.sleep(1.5)
-        self.send(text="only once please")
-        outs = [p.communicate(timeout=15)[0] for p in procs]
-        self.assertEqual(sum("only once please" in o for o in outs), 1, outs)
+        for n in range(4):  # unlink-as-claim double-delivered in about half of single rounds on APFS
+            procs = [subprocess.Popen(argv, stdout=subprocess.PIPE, text=True, env=env) for _ in range(3)]
+            time.sleep(1.0)
+            self.send(text=f"only once please {n}", key=f"key-race-{n:04d}")
+            outs = [p.communicate(timeout=15)[0] for p in procs]
+            self.assertEqual(sum(f"only once please {n}" in o for o in outs), 1, outs)
 
     def test_an_old_queued_message_stays_pending_behind_newer_traffic(self):  # red-team F6
         self.attach()
@@ -171,6 +174,53 @@ class Delivery(Base):
         import shutil
         shutil.rmtree(self.root / "chat" / "queue")
         self.assertEqual(mc_chat.pending("claude", SID), [], "without markers the message is invisible")
+        mc_chat.ensure_dirs()
+        self.assertEqual([r["id"] for r in mc_chat.pending("claude", SID)], [record["id"]])
+
+    def test_a_fifo_at_a_queue_marker_never_hangs_set_state(self):  # delta N1
+        self.attach()
+        msg_id = "dash-" + mc_chat.ulid()
+        os.mkfifo(self.root / "chat" / "queue" / msg_id)
+        done = []
+        worker = threading.Thread(target=lambda: done.append(mc_chat.set_state(msg_id, "queued")), daemon=True)
+        worker.start()
+        worker.join(5)
+        self.assertEqual(len(done), 1, "set_state blocked on a FIFO marker")
+        self.assertTrue(stat.S_ISREG(os.lstat(self.root / "chat" / "queue" / msg_id).st_mode))
+
+    def test_a_stale_marker_never_redelivers_answered_work(self):  # delta N2
+        self.attach()
+        record, _ = self.send()
+        self.assertTrue(mc_chat.claim(record["id"]))
+        mc_chat.write_reply(record["id"], "claude", "answer one")
+        stale = self.root / "chat" / "queue" / record["id"]
+        stale.touch()  # as a crash between the state write and the unlink would leave it
+        self.assertFalse(mc_chat.claim(record["id"]))
+        stale.touch()
+        self.assertEqual(mc_chat.pending("claude", SID), [])
+        self.assertFalse(stale.exists(), "the stale marker is dropped")
+        self.assertEqual(mc_chat.state(record["id"])["status"], "answered")
+        with self.assertRaises(mc_chat.ChatError):
+            mc_chat.write_reply(record["id"], "claude", "answer two")
+
+    def test_a_missing_secret_never_marks_messages_forged(self):  # delta N3
+        self.attach()
+        record, _ = self.send()
+        saved = (self.root / "secret").read_bytes()
+        os.unlink(self.root / "secret")
+        self.assertEqual(mc_chat.pending("claude", SID), [])
+        self.assertEqual(self.hook("Stop"), None)
+        (self.root / "secret").write_bytes(saved)
+        os.chmod(self.root / "secret", 0o600)
+        self.assertEqual(mc_chat.state(record["id"])["status"], "queued")
+        self.assertEqual([r["id"] for r in mc_chat.pending("claude", SID)], [record["id"]])
+
+    def test_an_interrupted_migration_resumes(self):  # delta note
+        self.attach()
+        record, _ = self.send()
+        import shutil
+        shutil.rmtree(self.root / "chat" / "queue")
+        (self.root / "chat" / "queue").mkdir(mode=0o700)  # killed after mkdir, before indexing
         mc_chat.ensure_dirs()
         self.assertEqual([r["id"] for r in mc_chat.pending("claude", SID)], [record["id"]])
 

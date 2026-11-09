@@ -75,7 +75,11 @@ def cmd_read(args) -> int:
     if not isinstance(mc_chat.get(args.id), dict):
         print("mc_inbox: no message with that id", file=sys.stderr)
         return 2
-    record = mc_chat.load(args.id)  # signature verified and the stored id equals the requested id
+    try:
+        record = mc_chat.load(args.id)  # signature verified and the stored id equals the requested id
+    except mc_chat.ChatError as exc:
+        print(f"mc_inbox: refused ({exc.code}): {exc}", file=sys.stderr)
+        return 2
     if record is None:
         if mc_chat.ID_RE.match(args.id) and mc_chat.state(args.id).get("status") != "answered":
             mc_chat.set_state(args.id, "forged", reason="missing or invalid server signature")

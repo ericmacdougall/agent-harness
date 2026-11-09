@@ -71,23 +71,40 @@ def chat_dir(root: Path | None = None) -> Path:
 
 def ensure_dirs(root: Path | None = None) -> Path:
     root = root or home()
-    migrate = (root / "chat" / "state").is_dir() and not (root / "chat" / "queue").exists()
-    for sub in ("", "chat", "chat/inbox", "chat/outbox", "chat/state", "chat/queue", "chat/keys", "chat/targets",
-                "chat/blocks"):
+    for sub in ("", "chat", "chat/inbox", "chat/outbox", "chat/state", "chat/queue", "chat/claims", "chat/keys",
+                "chat/targets", "chat/blocks"):
         path = root / sub if sub else root
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         if path.is_symlink():
             raise ChatError("unsafe-path", f"{path} is a symlink")
         os.chmod(path, 0o700)
-    if migrate:  # a store from before the queue markers: index its queued messages once, so none is lost
+    indexed = root / "chat" / "queue" / ".indexed"
+    if not os.path.lexists(indexed):
+        # A store from before the queue markers: index its queued messages, then write the sentinel. A run killed
+        # part way leaves no sentinel, so the next call indexes again (marking is idempotent).
         for name in os.listdir(root / "chat" / "state"):
             msg_id = name[:-5]
             if name.endswith(".json") and ID_RE.match(msg_id):
                 value = read_json(root / "chat" / "state" / name)
                 if isinstance(value, dict) and value.get("status") == "queued":
-                    os.close(os.open(root / "chat" / "queue" / msg_id,
-                                     os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600))
+                    _mark(root / "chat" / "queue" / msg_id)
+        _mark(indexed)
     return root
+
+
+def _mark(path: Path) -> None:
+    """Create an empty regular marker file. O_EXCL never opens an existing FIFO, device or symlink, so this cannot
+    block; a non-regular file squatting the name is removed and replaced."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    for _ in range(2):
+        try:
+            os.close(os.open(path, flags, 0o600))
+            return
+        except FileExistsError:
+            if stat.S_ISREG(os.lstat(path).st_mode):
+                return
+            os.unlink(path)
+    raise ChatError("unsafe-path", f"{path.name} keeps reappearing as a non-regular file")
 
 
 def atomic_write(path: Path, data: bytes) -> None:
@@ -274,8 +291,12 @@ def set_state(msg_id: str, status: str, *, reason: str = "", root: Path | None =
     write_json(chat_dir(root) / "state" / (msg_id + ".json"), value)
     marker = chat_dir(root) / "queue" / msg_id
     if status == "queued":
+        try:
+            os.unlink(chat_dir(root) / "claims" / msg_id)  # a re-queued message can be claimed again
+        except FileNotFoundError:
+            pass
         os.makedirs(marker.parent, mode=0o700, exist_ok=True)
-        os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600))
+        _mark(marker)
     else:
         try:
             os.unlink(marker)
@@ -285,29 +306,37 @@ def set_state(msg_id: str, status: str, *, reason: str = "", root: Path | None =
 
 
 def claim(msg_id: str, root: Path | None = None) -> bool:
-    """Atomically take a queued message for delivery: exactly one caller wins, because unlink succeeds once."""
+    """Atomically take a queued message for delivery: exactly one caller wins.
+
+    The claim is an O_CREAT|O_EXCL create of chat/claims/<id>. Concurrent unlinks of one path are not exclusive
+    on APFS (both callers can see success), so the queue marker is only an index, never the lock."""
     if not ID_RE.match(str(msg_id)):
         return False
     root = root or home()
-    try:
-        os.unlink(chat_dir(root) / "queue" / msg_id)
-    except FileNotFoundError:
+    if not os.path.isfile(chat_dir(root) / "queue" / msg_id):
         return False
+    folder = chat_dir(root) / "claims"
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    try:
+        os.close(os.open(folder / msg_id, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                         | getattr(os, "O_NONBLOCK", 0), 0o600))
+    except FileExistsError:
+        return False
+    if state(msg_id, root).get("status") != "queued":
+        return False  # a stale marker (crash between state write and unlink): never reopen settled work
     set_state(msg_id, "delivered", root=root)
     return True
 
 
 def load(msg_id: str, root: Path | None = None):
     """A stored inbox record whose own id equals the requested id and whose signature verifies, else None.
-    A renamed copy of a signed record carries the wrong id and is refused."""
+    A renamed copy of a signed record carries the wrong id and is refused. With no readable install secret it
+    raises ChatError("no-secret") rather than returning None, so a missing secret is never mistaken for forgery."""
     root = root or home()
     record = get(msg_id, root)
     if not isinstance(record, dict) or record.get("id") != msg_id:
         return None
-    try:
-        key = secret(root, create=False)
-    except ChatError:
-        return None
+    key = secret(root, create=False)
     return record if verified(record, key) else None
 
 
@@ -342,11 +371,23 @@ def pending(to: str, session: str | None = None, root: Path | None = None) -> li
     root = root or home()
     try:
         names = sorted(n for n in os.listdir(chat_dir(root) / "queue") if ID_RE.match(n))[:QUEUE_SCAN_MAX]
-    except OSError:
-        return []
+        secret(root, create=False)
+    except (OSError, ChatError):
+        return []  # no queue yet, or no readable secret: deliver nothing and mark nothing
     out = []
     for msg_id in names:
-        record = load(msg_id, root)
+        status = state(msg_id, root).get("status")
+        if status != "queued":
+            if status in STATUSES:  # a stale marker for settled work: drop it, never redeliver
+                try:
+                    os.unlink(chat_dir(root) / "queue" / msg_id)
+                except FileNotFoundError:
+                    pass
+            continue
+        try:
+            record = load(msg_id, root)
+        except ChatError:
+            return out
         if record is None:
             set_state(msg_id, "forged", reason="missing or invalid server signature", root=root)
             continue

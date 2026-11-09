@@ -87,7 +87,7 @@ To rotate a drop file, rename it and start a new one. The server notices the new
 | `text` | Up to 4,000 characters. It is cleaned of control characters and redacted before it is stored. |
 | `sig` | An HMAC-SHA256 with the 0600 install secret, over the record minus `sig`, serialised as canonical JSON (sorted keys, no spaces). |
 
-A record's delivery state lives beside it, in `chat/state/<id>.json`. The states are `queued`, `delivered`, `answered`, `failed`, `unavailable` and `forged`. A queued message also has an empty marker, `chat/queue/<id>`. Pending lists come from these markers, so newer traffic never hides an older message, and a reader takes a message by unlinking its marker, which succeeds exactly once.
+A record's delivery state lives beside it, in `chat/state/<id>.json`. The states are `queued`, `delivered`, `answered`, `failed`, `unavailable` and `forged`. A queued message also has an empty marker, `chat/queue/<id>`. Pending lists come from these markers, so newer traffic never hides an older message; a marker whose state is no longer `queued` is dropped, never redelivered. A reader takes a message by creating `chat/claims/<id>` with `O_CREAT|O_EXCL`, which succeeds for exactly one reader. (Concurrent unlinks of one path are not exclusive on APFS, so the marker is never the lock.) If the install secret cannot be read, nothing is delivered and nothing is marked forged.
 
 A record whose signature is missing or wrong is marked `forged`. It is never delivered by `wait`, `read`, the Stop hook or `mc_read`, and the page shows it struck through as "Untrusted content".
 
