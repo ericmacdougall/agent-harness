@@ -3,6 +3,8 @@
 // media-manifest.json lists deterministic tar parts (key, sha256, size) and totals.tree_sha256, a hash of every media path and size.
 //   node scripts/media-sync.mjs pull    download missing parts into .media-cache/, verify sha256, check members, extract into the repo
 //   node scripts/media-sync.mjs verify  fail unless the media tree on disk matches the manifest exactly (paths and sizes), and git tracks none of it
+//   node scripts/media-sync.mjs mark    postbuild: stamp whether the build verified media into dist/.media-marker.json
+//   node scripts/media-sync.mjs gate    deploy gate: refuse a dist/ whose build did not verify media (never honors MEDIA_SKIP)
 //   node scripts/media-sync.mjs push    add NEW media paths as a new part, upload it, append it to the manifest (changing an existing file is refused)
 //   node scripts/media-sync.mjs tree    print the tree hash of the media on disk (use after packing to fill totals.tree_sha256)
 // R2 access goes through the logged-in wrangler (account from wrangler.cloudflare.jsonc). GNU tar is required (Linux; on macOS use gtar).
@@ -81,9 +83,7 @@ async function pull() {
   }
   if (!only) verify();
 }
-function verify() {
-  const skip = process.env.MEDIA_SKIP === "1";
-  if (skip && (process.env.CI || process.env.WORKERS_CI)) { console.error("MEDIA_SKIP is refused in CI."); process.exit(1); }
+function evaluate() {
   const files = mediaFiles();
   const problems = [];
   const tracked = existsSync(path.join(root, ".git")) ? run("git", ["ls-files", "--", ...manifest.prefixes], { capture: true }).split("\n").filter(Boolean) : [];
@@ -91,12 +91,45 @@ function verify() {
   if (files.length !== manifest.totals.files) problems.push(`${files.length} files on disk, manifest has ${manifest.totals.files}`);
   else if (manifest.totals.tree_sha256 && treeHash(files) !== manifest.totals.tree_sha256) problems.push("media paths or sizes differ from the manifest (tree hash mismatch)");
   if (!manifest.totals.tree_sha256) problems.push("manifest has no totals.tree_sha256");
+  return { files, problems };
+}
+const statePath = path.join(root, ".media-build-state.json");
+function verify() {
+  const skip = process.env.MEDIA_SKIP === "1";
+  if (skip && (process.env.CI || process.env.WORKERS_CI)) { console.error("MEDIA_SKIP is refused in CI."); process.exit(1); }
+  const { files, problems } = evaluate();
+  // The build step records whether the media check REALLY passed, so a later deploy can tell a skipped build from a verified one.
+  writeFileSync(statePath, JSON.stringify({ ok: problems.length === 0, skipped: skip && problems.length > 0, tree: manifest.totals.tree_sha256 || null, at: new Date().toISOString() }) + "\n");
   if (problems.length) {
-    if (skip) { console.warn("MEDIA_SKIP=1: media check skipped. Do NOT deploy this build.\n  " + problems.join("\n  ")); return; }
+    if (skip) { console.warn("MEDIA_SKIP=1: media check skipped. This build must NOT be deployed: the deploy gate will refuse it.\n  " + problems.join("\n  ")); return; }
     console.error(`MEDIA INCOMPLETE OR WRONG:\n  ${problems.join("\n  ")}\nRun: npm run media:pull`);
     process.exit(1);
   }
   console.log(`media ok: ${files.length} files, tree ${manifest.totals.tree_sha256.slice(0, 12)}`);
+}
+// postbuild: stamp the prebuild result into the build output.
+function mark() {
+  const dist = path.join(root, "dist");
+  if (!existsSync(dist)) { console.error("mark: dist/ does not exist; run the build first."); process.exit(1); }
+  const state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : null;
+  const ok = !!state && state.ok === true && state.tree === manifest.totals.tree_sha256;
+  writeFileSync(path.join(dist, ".media-marker.json"), JSON.stringify({ ok, tree: state?.tree || null, skipped: !!state?.skipped, builtAt: new Date().toISOString() }) + "\n");
+  console.log(ok ? "media marker written: build verified media" : "media marker written: build did NOT verify media (deploy will be refused)");
+}
+// deploy gate: never honors MEDIA_SKIP; needs an ok marker in dist/ from a build that verified the media, plus a still-valid media tree.
+function gate() {
+  const why = [];
+  const markerPath = path.join(root, "dist", ".media-marker.json");
+  if (!existsSync(markerPath)) why.push("dist/.media-marker.json is missing: the build did not run the media check (or dist/ is not from `npm run build`)");
+  else {
+    const m = JSON.parse(readFileSync(markerPath, "utf8"));
+    if (m.ok !== true) why.push(`the build in dist/ did not verify media${m.skipped ? " (it was built with MEDIA_SKIP=1)" : ""}`);
+    if (m.tree !== manifest.totals.tree_sha256) why.push("dist/ was built against a different media manifest");
+  }
+  const { problems } = evaluate();
+  why.push(...problems);
+  if (why.length) { console.error(`DEPLOY REFUSED:\n  ${why.join("\n  ")}\nRebuild with: npm run media:pull && npm run build`); process.exit(1); }
+  console.log("deploy gate ok: dist/ was built with verified media");
 }
 async function push() {
   mkdirSync(cacheDir, { recursive: true });
@@ -134,6 +167,8 @@ async function push() {
 const cmd = process.argv[2];
 if (cmd === "pull") await pull();
 else if (cmd === "verify") verify();
+else if (cmd === "mark") mark();
+else if (cmd === "gate") gate();
 else if (cmd === "push") await push();
 else if (cmd === "tree") console.log(treeHash());
-else { console.error("usage: media-sync.mjs pull|verify|push|tree"); process.exit(2); }
+else { console.error("usage: media-sync.mjs pull|verify|mark|gate|push|tree"); process.exit(2); }
