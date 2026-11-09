@@ -1,0 +1,202 @@
+{
+ "poopyduck#26": {
+  "tickets": [
+   10701,
+   10935
+  ],
+  "state": "OPEN",
+  "draft": false,
+  "review": "",
+  "lastCommit": "2026-10-27",
+  "ageDays": 13,
+  "updated": "2026-10-27",
+  "branch": "codex/native-store-publish-20261027",
+  "base": "main",
+  "liveOwnerHolds": [],
+  "title": "Verify native iOS rotation and continuation for store releas"
+ },
+ "Android-security#655": {
+  "tickets": [
+   13241,
+   13431
+  ],
+  "state": "OPEN",
+  "draft": true,
+  "review": "",
+  "lastCommit": "2026-10-30",
+  "ageDays": 9,
+  "updated": "2026-11-08",
+  "branch": "claude/pp-store-record-20261030",
+  "base": "main",
+  "liveOwnerHolds": [],
+  "title": "store record: describe FrameBright 1.0.9 and close the real "
+ },
+ "bugtracker-harness#49": {
+  "tickets": [
+   14155
+  ],
+  "state": "OPEN",
+  "draft": true,
+  "review": "",
+  "lastCommit": "2026-11-05",
+  "ageDays": 4,
+  "updated": "2026-11-05",
+  "branch": "simple/brief-discord-postship-r3-20261105",
+  "base": "main",
+  "liveOwnerHolds": [],
+  "title": "feat(goodqa-discord): postship click test for Discord hold"
+ },
+ "goodqa-land-scratch-20261104#5": {
+  "tickets": [
+   14216
+  ],
+  "state": "OPEN",
+  "draft": false,
+  "review": "",
+  "lastCommit": "2026-11-04",
+  "ageDays": 5,
+  "updated": "2026-11-04",
+  "branch": "goodqa-land/9caa92444f08fcd9",
+  "base": "main",
+  "liveOwnerHolds": [],
+  "title": "goodqa land bugtracker: 9caa92444f08 (1 commit(s)); goodqa#1"
+ },
+ "bugtracker-harness#41": {
+  "tickets": [
+   14310
+  ],
+  "state": "OPEN",
+  "draft": true,
+  "review": "",
+  "lastCommit": "2026-11-04",
+  "ageDays": 5,
+  "updated": "2026-11-04",
+  "branch": "fix/watchdog-dev2-policy-20261104",
+  "base": "main",
+  "liveOwnerHolds": [],
+  "title": "fix(watchdog): make the committed policy correct for dev2"
+ },
+ "bugtracker-harness#43": {
+  "tickets": [
+   14351
+  ],
+  "state": "OPEN",
+  "draft": true,
+  "review": "",
+  "lastCommit": "2026-11-04",
+  "ageDays": 5,
+  "updated": "2026-11-04",
+  "branch": "fix/box-state-budget-20261104",
+  "base": "main",
+  "liveOwnerHolds": [],
+  "title": "fix(box-state): codex logs to Dropbox, per-host budget"
+ },
+ "solver#9": {
+  "tickets": [
+   14394
+  ],
+  "state": "OPEN",
+  "draft": true,
+  "review": "",
+  "lastCommit": "2026-11-04",
+  "ageDays": 5,
+  "updated": "2026-11-04",
+  "branch": "feat/solve-denoise-smarter",
+  "base": "main",
+  "liveOwnerHolds": [],
+  "title": "feat(live): curate possible-question chips and useful points"
+ },
+ "bugtracker-harness#52": {
+  "tickets": [
+   14710
+  ],
+  "state": "OPEN",
+  "draft": false,
+  "review": "",
+  "lastCommit": "2026-11-05",
+  "ageDays": 4,
+  "updated": "2026-11-05",
+  "branch": "fix/dm-cursor-14710",
+  "base": "main",
+  "liveOwnerHolds": [],
+  "title": "fix(gq): survive an empty dm-cursor.json in check-dms"
+ },
+ "bugtracker-harness#53": {
+  "tickets": [
+   14753
+  ],
+  "state": "OPEN",
+  "draft": false,
+  "review": "",
+  "lastCommit": "2026-11-05",
+  "ageDays": 3,
+  "updated": "2026-11-05",
+  "branch": "fix/lifecycle-empty-id-14753",
+  "base": "main",
+  "liveOwnerHolds": [],
+  "title": "fix(coordinator): refuse empty ids, bound client errors"
+ },
+ "agent-harness#151": {
+  "tickets": [
+   15346,
+   15355
+  ],
+  "state": "OPEN",
+  "draft": true,
+  "review": "",
+  "lastCommit": "2026-11-08",
+  "ageDays": 0,
+  "updated": "2026-11-08",
+  "branch": "fix/worktree-remove-indirect",
+  "base": "main",
+  "liveOwnerHolds": [
+   "a6d28999c"
+  ],
+  "title": "fix(command-guard): refuse indirect git worktree remove"
+ },
+ "agent-fabric#23": {
+  "tickets": [
+   15373
+  ],
+  "state": "OPEN",
+  "draft": true,
+  "review": "",
+  "lastCommit": "2026-11-08",
+  "ageDays": 0,
+  "updated": "2026-11-08",
+  "branch": "feat/15373-f6-codex-adapter",
+  "base": "main",
+  "liveOwnerHolds": [],
+  "title": "feat(harness): add Codex app-server adapter"
+ },
+ "Android-security#764": {
+  "tickets": [
+   15476
+  ],
+  "state": "OPEN",
+  "draft": true,
+  "review": "",
+  "lastCommit": "2026-11-09",
+  "ageDays": 0,
+  "updated": "2026-11-09",
+  "branch": "compliance/capture-notice-20261108",
+  "base": "main",
+  "liveOwnerHolds": [],
+  "title": "fix(privacy): lock the capture notice on in the UK"
+ },
+ "private-lessons-authoring#3": {
+  "tickets": [
+   15446
+  ],
+  "state": "OPEN",
+  "draft": false,
+  "review": "",
+  "lastCommit": "2026-11-09",
+  "ageDays": 0,
+  "updated": "2026-11-09",
+  "branch": "feature/ak-series",
+  "base": "main",
+  "liveOwnerHolds": [],
+  "title": "feat(lessons): ak01-ak13 agent infrastructure series sources"
+ }
+}
