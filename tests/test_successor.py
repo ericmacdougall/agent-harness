@@ -213,6 +213,26 @@ class Hardening(Case):
         self.assertEqual(later["status"], "launched")  # the first successor never appeared: a new request is allowed
         self.assertFalse(later.get("deduplicated"))
 
+    def test_a_stale_cap_wait_is_refreshed_while_the_cap_stays_full(self):
+        # acceptance review a3318610 N1: the Stop gate trusts only a recent wait, so succeed must be able to renew it
+        self.kit()
+        first = self.succeed(live=8, cap=8, now=1000.0)
+        young = self.succeed(live=8, cap=8, now=1000.0 + sc.CAP_REFRESH_S - 5)
+        self.assertTrue(young.get("deduplicated"))
+        later = self.succeed(live=8, cap=8, now=1000.0 + sc.CAP_REFRESH_S + 5)
+        self.assertFalse(later.get("deduplicated"))
+        self.assertEqual(later["status"], "cap_wait")
+        self.assertGreater(later["at"], first["at"])
+        rows = sc.read_requests(self.home, SESSION)
+        self.assertEqual([r["status"] for r in rows], ["cap_wait", "cap_wait"])
+        self.assertEqual(sc.open_request(rows, AGENT, later["at"])["at"], later["at"])  # still one live request
+
+    def test_pending_agents_is_the_shared_cap_count(self):
+        rows = [{"agent": "a", "status": "ready", "at": 1000.0}, {"agent": "b", "status": "launched", "at": 1000.0},
+                {"agent": "c", "status": "cap_wait", "at": 1000.0}, {"agent": "d", "status": "ready", "at": -30000.0}]
+        self.assertEqual(sc.pending_agents(rows, 2000.0), {"a", "b"})  # d expired, c is a wait
+        self.assertEqual(sc.pending_agents(rows, 2000.0, exclude="a"), {"b"})
+
     def test_a_truncated_tail_or_deleted_log_fails_verification(self):
         self.kit()
         self.succeed(live=8, cap=8)

@@ -49,6 +49,7 @@ EVIDENCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,40}$")
 MAX_TEXT = 600
 LIVE_STATUSES = ("ready", "launched", "cap_wait")
 CAP_ALERT_REPEAT_S = 30 * 60
+CAP_REFRESH_S = 10 * 60  # a cap_wait this old is rewritten while the cap stays full (must be under the gate's 30 min limit)
 LIVE_TTL_S = 6 * 3600       # a ready or launched request holds its stream and a cap slot this long
 LAUNCH_BACKOFF_S = 10 * 60  # after a failed launch, wait before a new request for the same stream
 
@@ -233,6 +234,17 @@ def open_request(rows: list, agent: str, now: float | None = None):
     return None
 
 
+def pending_agents(rows: list, now: float, exclude: str | None = None) -> set:
+    """Streams with a ready or launched request still inside its TTL: their successor may not show in `ah owners` yet, so
+    they count against the owner cap. One helper, used by succeed and by the Stop gate, so both judge the cap alike."""
+    found = set()
+    for agent in {r.get("agent") for r in rows}:
+        request = open_request(rows, agent, now)
+        if agent != exclude and request and request.get("status") in ("ready", "launched"):
+            found.add(agent)
+    return found
+
+
 # --------------------------------------------------------------------------- succeed
 
 def prompt_text(kit: dict, row: dict) -> str:
@@ -282,13 +294,15 @@ def succeed(home: Path, session: str, agent: str, *, owners_doc: dict, live_coun
         existing = open_request(rows, agent, now)
         # live_count is a snapshot of `ah owners`, which does not show a launched successor until it writes its log, so
         # requests already ready or launched for OTHER streams count against the cap too
-        others = {r.get("agent") for r in rows if r.get("agent") != agent and open_request(rows, r.get("agent"), now)
-                  and open_request(rows, r.get("agent"), now).get("status") in ("ready", "launched")}
-        effective = live_count + len(others)
-        if existing and not (existing.get("status") == "cap_wait" and effective < cap):
+        effective = live_count + len(pending_agents(rows, now, exclude=agent))
+        stale_wait = (existing and existing.get("status") == "cap_wait" and effective >= cap
+                      and now - float(existing.get("at") or 0) >= CAP_REFRESH_S)
+        if existing and not stale_wait and not (existing.get("status") == "cap_wait" and effective < cap):
             if existing.get("status") == "cap_wait" and now - float(existing.get("at") or 0) >= CAP_ALERT_REPEAT_S and alert:
-                alert("raise", agent, existing)  # still waiting: refresh the alert, never a second request
+                alert("raise", agent, existing)
             return dict(existing, deduplicated=True)
+        # a cap_wait older than CAP_REFRESH_S while the cap is still full is refreshed with a new row (still one live
+        # request per stream): the Stop gate only trusts a recent wait, and succeed is the command it tells main to run
         body = {"schema": SCHEMA, "at": now, "agent": agent, "session": session, "ticket": kit.get("ticket") or "",
                 "kit": "written" if not kit.get("derived") else "derived", "live_owners": effective, "cap": cap}
         if effective >= cap:
