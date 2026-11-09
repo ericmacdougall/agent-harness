@@ -1,0 +1,7 @@
+import sys, uuid
+sys.path.insert(0, '/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/ticket-cleanup')
+import gq
+b = """Final repo sizes (owner ab8a7d1b, 2026-11-09 15:00Z, GitHub API `size`): t2-course 416,407 KB (was 5,755,192 KB before the rewrite and unchanged right after it; the flat reading was counter lag). bugtracker 887,921 KB (was 1,008,074 KB). Both are under 1,000,000,000 bytes (976,562 KiB). A fresh t2-course clone is a 28 MiB pack.
+No GitHub Support request was sent: main and the user agreed it is not needed, because dereferencing PRs 1-48 (which would clear the remaining hidden refs/pull/* objects) would hide their diffs, a cost nobody asked for. The t2-course-only draft stays on file unsent.
+Self-serve search, docs read 2026-11-09 (no last-updated date shown on the pages): https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository (refs/pull/* are read-only to force pushes; removing cached views and PR refs and a server garbage collection need GitHub Support; Support can dereference PRs while preserving bodies and comments) and https://docs.github.com/en/repositories/working-with-files/managing-large-files/about-large-files-on-github (ideally under 1 GB, under 5 GB strongly recommended; no self-serve garbage collection). Recreating the repo was not considered because it would lose PR history."""
+print(str(gq.call('comment_on_issue', {'issueId': '861b09c7-cea1-4d8c-96f9-46242f652dbe', 'body': b, 'operationId': str(uuid.uuid4())}))[:30])
