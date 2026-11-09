@@ -2474,6 +2474,10 @@ def act(findings, st, cfg, fx, apply, now, sample=None, left=None, reconcile=Tru
                         rec['alert'] = 'followed duplicate %s of %s' % (a['ref'], survivor)
                     report.append(rec)
                     continue
+            if apply:
+                # not followed this pass (reopened by a person, no open canonical ticket, or re-linked): never leave it
+                # counted under a canonical ticket, or the closing note would claim an alert that is failing has cleared
+                unregister_dup_member(st, f['cls'])
             if status in CLOSED_ALERT_STATUSES and now - float(a.get('reopened') or 0) >= 3600:
                 if not apply:
                     rec['alert'] = 'would reopen %s' % a['ref']
@@ -2703,7 +2707,7 @@ def act(findings, st, cfg, fx, apply, now, sample=None, left=None, reconcile=Tru
                 verb = 'recovery noted, close pending on ' + str(a['ref'])
             report.append(dict(cls=cls, title='recovered', alert=verb))
     if apply:
-        flush_dup_notes(st, fx, now, lambda: alert_room() >= write_reserve)
+        flush_dup_notes(st, fx, now, lambda: alert_room() >= write_reserve, fresh=max(DUP_FRESH_SECONDS, 2.5 * status_every))
     try:                              # clear the clamp so later direct ticket calls (reopen_closed) are not throttled
         fx._alert_deadline = None
     except (AttributeError, TypeError):
@@ -3045,6 +3049,7 @@ def _clean(text, n):
 
 def register_dup_member(st, survivor, f, a, now):
     """Record that alert `a` (closed as a duplicate of `survivor`) is still failing. State only; no ticket I/O."""
+    unregister_dup_member(st, f['cls'])                                # one survivor per alert: a re-link moves it
     st.setdefault('dup_members', {}).setdefault(survivor, {})[f['cls']] = dict(
         ref=a['ref'], title=_clean(f.get('title'), 100), since=float(a.get('opened') or now), seen=now)
 
@@ -3058,30 +3063,42 @@ def dup_note_body(survivor, rows, now):
     return defang_markers('\n'.join(lines))
 
 
-def flush_dup_notes(st, fx, now, room_ok):
+def unregister_dup_member(st, cls):
+    """The alert `cls` is no longer followed (reopened, no open canonical ticket, or re-linked): drop it everywhere."""
+    for mem in (st.get('dup_members') or {}).values():
+        mem.pop(cls, None)
+
+
+def flush_dup_notes(st, fx, now, room_ok, fresh=DUP_FRESH_SECONDS):
     """ONE aggregate note per canonical ticket per hour, listing the followed duplicate alerts still failing (id, finding,
     since). Skipped when the member set is unchanged since the last note, and when a note was posted within the hour. When
-    every member has cleared, one closing note says so. A failed comment is retried next pass."""
+    no alert is followed there any more (cleared, or reopened), one closing note says so. A failed comment, closing note
+    included, is retried next pass. `fresh`: a member not re-observed for that long is dropped (alerts are re-checked hourly)."""
     import hashlib
     members = st.get('dup_members') or {}
     agg = st.setdefault('dup_agg', {})
     for survivor in list(members):
-        mem = {c: m for c, m in members[survivor].items() if now - float(m['seen']) < DUP_FRESH_SECONDS}
+        mem = {c: m for c, m in members[survivor].items() if now - float(m['seen']) < fresh}
         members[survivor] = mem
         g = agg.setdefault(survivor, {})
-        rows = sorted(mem.items(), key=lambda kv: kv[1]['since'])
-        digest = hashlib.sha256('\n'.join('%s|%s' % (m['ref'], c) for c, m in rows).encode()).hexdigest()[:16] if rows else 'empty'
+        rows = sorted(mem.items(), key=lambda kv: (kv[1]['since'], kv[0]))      # deterministic: re-registration reorders the dict
+        digest =hashlib.sha256('\n'.join('%s|%s' % (m['ref'], c) for c, m in rows).encode()).hexdigest()[:16] if rows else 'empty'
         if digest == g.get('digest') or (digest == 'empty' and not g.get('digest')):
+            if not rows:
+                members.pop(survivor, None)                        # nothing to say and nothing to remember
             continue
         if now - float(g.get('at') or 0) < DUP_NOTE_SECONDS or not room_ok():
             continue
         body = dup_note_body(survivor, rows, now) if rows else \
-            'Fleet liveness: no duplicate alert of this ticket is failing any more (checked %s).' % iso(now)
+            'Fleet liveness: no duplicate alert of this ticket is followed here any more (cleared or reopened; checked %s).' % iso(now)
         rc, _note = fx.comment(survivor, body)
         if rc == 0:
             g.update(at=now, digest=digest)
-        if not rows:
-            members.pop(survivor, None)
+            if not rows:
+                members.pop(survivor, None)
+    for survivor in list(agg):                                     # bounded state: forget a long-quiet canonical ticket
+        if survivor not in members and now - float(agg[survivor].get('at') or 0) > 7 * 86400:
+            agg.pop(survivor, None)
 
 
 def reopen_closed(cfg, fx, apply=False, limit=25, state=None, now=None):

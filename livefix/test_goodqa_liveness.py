@@ -3937,6 +3937,61 @@ class LiveAlertReopen(unittest.TestCase):
         L.act([], state, CFG, fx, True, T0 + 30000)
         self.assertEqual(len(self.notes(fx)), 2, 'the closing note is posted once')
 
+    def test_R1_FailedClosingNoteIsRetried(self):
+        fx, state, fs = self.many_case(1)
+        L.act(fs, state, CFG, fx, True, T0)
+        ok_comment = fx.comment
+        fx.comment = lambda ref, body: (1, 'boom')
+        L.act([], state, CFG, fx, True, T0 + 13000)                      # aged out: the closing note fails
+        self.assertIn('goodqa#15558', state['dup_members'], 'a failed closing note must stay queued')
+        fx.comment = ok_comment
+        L.act([], state, CFG, fx, True, T0 + 13200)
+        closing = [c for c in fx.calls if c[0] == 'comment' and c[1] == 'goodqa#15558']
+        self.assertEqual(len(closing), 2)
+        self.assertNotIn('goodqa#15558', state['dup_members'])
+
+    def test_R2_AlertReopenedByAPersonLeavesTheMemberListNotAFalseClear(self):
+        from unittest.mock import Mock
+        fx, state, fs = self.many_case(2)
+        L.act(fs, state, CFG, fx, True, T0)
+        self.assertEqual(len(state['dup_members']['goodqa#15558']), 2)
+        fx.ticket_status = Mock(side_effect=lambda ref: 'triage' if ref == 'goodqa#12000' else 'duplicate')
+        state['alerts'][fs[0]['cls']]['status_synced'] = 0               # due again
+        L.act(fs, state, CFG, fx, True, T0 + 3700)
+        self.assertEqual(list(state['dup_members']['goodqa#15558']), [fs[1]['cls']], 'the reopened alert is no longer counted as followed')
+
+    def test_R2_ReLinkedAlertMovesToTheNewCanonicalTicket(self):
+        fx, state, fs = self.many_case(1)
+        L.act(fs, state, CFG, fx, True, T0)
+        fx.duplicate_survivor.return_value = 'goodqa#15600'
+        state['alerts'][fs[0]['cls']]['status_synced'] = 0
+        L.act(fs, state, CFG, fx, True, T0 + 3700)
+        self.assertNotIn(fs[0]['cls'], state['dup_members'].get('goodqa#15558', {}))
+        self.assertIn(fs[0]['cls'], state['dup_members']['goodqa#15600'])
+
+    def test_R2_NoOpenCanonicalTicketUnregistersAndReopens(self):
+        fx, state, fs = self.many_case(1)
+        L.act(fs, state, CFG, fx, True, T0)
+        fx.duplicate_survivor.return_value = None                         # the canonical ticket was closed
+        state['alerts'][fs[0]['cls']]['status_synced'] = 0
+        L.act(fs, state, CFG, fx, True, T0 + 3700)
+        self.assertNotIn(fs[0]['cls'], state['dup_members'].get('goodqa#15558', {}))
+        self.assertIn(('patch', 'goodqa#12000', 'triage'), fx.calls)
+
+    def test_R3_FreshnessWindowIsAParameterSoALongSyncIntervalDoesNotFlap(self):
+        fx, state, fs = self.many_case(1)
+        L.act(fs, state, CFG, fx, True, T0)
+        n = len(self.notes(fx))
+        L.flush_dup_notes(state, fx, T0 + 20000, lambda: True, fresh=40000)
+        self.assertEqual(len(self.notes(fx)), n, 'still a member inside a longer window: no false closing note')
+
+    def test_R4_QuietCanonicalStateIsForgotten(self):
+        fx, state, fs = self.many_case(1)
+        L.act(fs, state, CFG, fx, True, T0)
+        L.act([], state, CFG, fx, True, T0 + 13000)                       # closing note posted, members gone
+        L.flush_dup_notes(state, fx, T0 + 13000 + 8 * 86400, lambda: True)
+        self.assertNotIn('goodqa#15558', state['dup_agg'])
+
     def test_DuplicateNoteBodyIsCappedAndDefanged(self):
         rows = [('c%d`@x' % i, dict(ref='goodqa#%d' % i, title='t\n`@bob`' + 'z' * 300, since=T0, seen=T0)) for i in range(150)]
         body = L.dup_note_body('goodqa#1', rows, T0)
