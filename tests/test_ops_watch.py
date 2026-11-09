@@ -391,6 +391,34 @@ class CrashTests(Base):
         self.assertEqual(a["crashes"]["severity"], "warning")
 
 
+class RingHostLabelTests(Base):
+    """Fleet round item 2: ahd and ah wrote ring rows under socket.gethostname(), which flips between names on one Mac
+    (Mac-2.lan, Erics-MacBook-Air.local), so one ask raised two alerts (reminder 7 on one, 6 on the other) and a row
+    written under the old name could never be cleared. The ring is local: rows from ahd and ah are one host."""
+
+    def put(self, host, event, key="ask:w0be7fc1bb92:due", source="ahd", sev="high"):
+        return ow.emit({"host": host, "source": source, "event": event, "severity": sev, "key": key, "check": source,
+                        "message": "ask awaits the user", "detail": {}}, home=self.home)
+
+    def test_one_ask_under_two_host_names_is_one_active_alert(self):
+        self.put("Mac-2", "raise")
+        self.put("Erics-MacBook-Air", "raise")
+        act = [e for e in ow.active_alerts(self.home) if e["key"] == "ask:w0be7fc1bb92:due"]
+        self.assertEqual(len(act), 1, [(e["host"], e["key"]) for e in act])
+        self.assertEqual(act[0]["host"], ow.default_host())
+
+    def test_a_clear_under_the_current_name_clears_a_raise_written_under_an_old_name(self):
+        self.put("Mac-2", "raise", key="liveness:baab765b/agent-a0680533ff30cf6d4", sev="critical")
+        self.put(ow.default_host(), "clear", key="liveness:baab765b/agent-a0680533ff30cf6d4", sev="info")
+        self.assertEqual([e for e in ow.active_alerts(self.home) if e["key"].startswith("liveness:")], [])
+
+    def test_other_sources_keep_their_own_host_identity(self):
+        self.put("t2-dev", "raise", key="disk:volume:/home/eric", source="ops-watch", sev="critical")
+        self.put("mac", "raise", key="disk:volume:/home/eric", source="ops-watch", sev="critical")
+        act = [e for e in ow.active_alerts(self.home) if e["key"] == "disk:volume:/home/eric"]
+        self.assertEqual(sorted(e["host"] for e in act), ["mac", "t2-dev"])
+
+
 class ProcessTests(Base):
     def test_orphans_runaway_and_counts(self):
         orphans = {"orphans": [{"pid": i, "ppid": 1, "age_s": 100, "cpu": 0, "rss_mb": 9, "name": "node",

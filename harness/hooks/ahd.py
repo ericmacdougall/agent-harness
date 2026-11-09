@@ -81,12 +81,42 @@ def parse_ts(text):
         return None
 
 
+EXIT_RELOAD = 75  # EX_TEMPFAIL: non-zero so launchd (KeepAlive SuccessfulExit=false) and systemd (Restart=on-failure) start the new code
+
+
+def file_signature(paths) -> dict:
+    """path -> (mtime_ns, size) for each readable file; an unreadable one is simply absent."""
+    sig = {}
+    for p in paths:
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        sig[str(p)] = (st.st_mtime_ns, st.st_size)
+    return sig
+
+
+def code_signature() -> dict:
+    """The source files of every module this process imported from the hooks directory. A daemon that keeps running
+    modules loaded before the hooks were reinstalled keeps acting on the old rules (fleet round item 1: ahd kept a
+    liveness alert raised that the installed row_disposed fix skips), so the loop compares this each tick."""
+    paths = []
+    for m in list(sys.modules.values()):
+        f = getattr(m, "__file__", None)
+        if f and Path(f).resolve().parent == HERE:
+            paths.append(Path(f).resolve())
+    return file_signature(paths)
+
+
 def home() -> Path:
     return peek.home()
 
 
 def host() -> str:
-    return socket.gethostname().split(".")[0]
+    """One stable label for this machine's ring rows (ops_watch.default_host: "mac" on macOS). socket.gethostname() flips
+    between names on one Mac, which duplicated every ask alert and left rows under old names uncleared (fleet round 2)."""
+    import ops_watch  # noqa: PLC0415
+    return ops_watch.default_host()
 
 
 def load_policy(path=None) -> dict:
@@ -217,10 +247,12 @@ def read_ring(path=None) -> list:
 
 
 def ring_state(events: list, src: str, hostname: str) -> dict:
-    """key -> latest event for this host and source (active when its event is 'raise')."""
+    """key -> latest event for this host and source (active when its event is 'raise'). The ring is this machine's own
+    file and ahd's rows are all its own, whatever hostname the Mac had when it wrote them, so a row under an old name
+    counts (and is cleared when no longer desired)."""
     latest = {}
-    for ev in events:
-        if ev.get("source") == src and ev.get("host") == hostname and isinstance(ev.get("key"), str):
+    for ev in sorted(events, key=lambda e: e.get("seq") or 0):
+        if ev.get("source") == src and isinstance(ev.get("key"), str) and (src == SOURCE or ev.get("host") == hostname):
             latest[ev["key"]] = ev
     return latest
 
@@ -788,6 +820,7 @@ class Daemon:
                          name="ahd-memory-guard", daemon=True).start()
         period = float(self.policy.get("tick_seconds", 60))
         log.info("ahd started pid %s host %s", os.getpid(), self.host)
+        started_code = code_signature()
         while not self.stop.is_set():
             t0 = mono()
             try:
@@ -796,6 +829,10 @@ class Daemon:
                     "sessions", "owners", "asks_open", "desired", "transitions", "sent", "wall_s")}))
             except Exception as exc:  # never crash-loop
                 log.error("tick failed: %s", type(exc).__name__)
+            if code_signature() != started_code:
+                self.release()
+                log.info("ahd: its source changed since start; exiting %s so the service manager starts the new code", EXIT_RELOAD)
+                return EXIT_RELOAD
             self.stop.wait(max(1.0, period - (mono() - t0)))
         self.release()
         log.info("ahd stopped")
