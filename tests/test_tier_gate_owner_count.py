@@ -73,10 +73,11 @@ class OwnerCount(unittest.TestCase):
             self.assertEqual(gate.live_owner_ids(SID, self.policy), ['p' * 32, 'q' * 32, 'r' * 32])
 
     def test_disposed_silent_owners_free_their_slots_as_the_alerts_do(self):
-        # GoodQA #15565: af265a5 (reassigned, successor not live) and a0680533 (live named wait) held slots while SILENT-HIGH.
+        # GoodQA #15565: a0680533 (live named wait) held a slot while SILENT-HIGH. A reassignment frees it only while the
+        # successor is live (never-drop 16.1): af265a5's successor had returned, so that stream is ownerless, not disposed.
         silent = lambda ch, disp, state='SILENT-HIGH': {'agent_id': ch * 32, 'type': 'task-owner', 'owner': True,  # noqa: E731
                                                        'state': state, 'disposition': disp}
-        rows = {'owners': [silent('a', {'kind': 'reassigned', 'live': False}), silent('b', {'kind': 'waiting', 'live': True}),
+        rows = {'owners': [silent('a', {'kind': 'reassigned', 'live': True}), silent('b', {'kind': 'waiting', 'live': True}),
                            silent('c', {'kind': 'superseded', 'live': True}), silent('d', {'kind': 'wontdo', 'live': True}),
                            silent('e', {'kind': 'waiting', 'live': False}), silent('f', {'kind': 'resumed', 'live': True}),
                            silent('g', None), silent('h', {'kind': 'reassigned', 'live': False}, state='live')]}
