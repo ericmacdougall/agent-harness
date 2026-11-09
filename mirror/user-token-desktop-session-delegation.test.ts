@@ -12,7 +12,7 @@ import { and, eq, isNull, like, sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { machineEnrollments, organizations, sessions, userTokenApprovals, userTokenEvents, userTokens } from '@bugtracker/db';
 import { resetUserTokenLimitersForTests, setUserTokenRateLimitForTests } from '../src/modules/user-tokens/auth-gate';
-import { createTestApp, enableUserTokensForTests, resetDb, type TestContext } from './helpers';
+import { createOrg, createTestApp, enableUserTokensForTests, resetDb, type TestContext } from './helpers';
 import { PARITY_ROUTES, answerOf, fill, setupParityWorld } from './user-token-parity-fixtures';
 import { addMember } from './webhook-test-kit';
 import { legacyChildFixture } from './user-token-session-fixtures';
@@ -495,31 +495,67 @@ describe('red-team RT15561-3: the token rate limit also covers refused requests'
   });
 });
 
-describe('ledger load (goodqa#15561): a desktop left open does not write a row per poll', () => {
-  it('polling reads of a bound session leave no ledger row and no last-use write; the same read by bearer, and real CRM work, still do', async () => {
+describe('ledger load (goodqa#15561): a desktop left open writes about one row per window, not one per poll', () => {
+  it('30 polls from one session, address and user agent write at most one row; a new user agent, a failing poll and the same read by bearer each write; a refused poll is written', async () => {
     const { token, session } = await bound(['desktop_signin', 'read', 'crm']);
     const count = async () => (await ctx.db.select().from(userTokenEvents).where(eq(userTokenEvents.tokenId, token.id))).length;
-    await new Promise((r) => setTimeout(r, 300));
+    const settle = () => new Promise((r) => setTimeout(r, 400));
+    await settle();
     const rows0 = await count();
-    const [use0] = await ctx.db.select().from(userTokens).where(eq(userTokens.id, token.id));
     for (let i = 0; i < 6; i++) {
       for (const u of ['/v1/me', '/v1/orgs', '/v1/notifications/unread-count', '/v1/notifications', '/v1/desktop/update-status']) {
         expect((await inj('GET', u, session.headers)).statusCode, u).toBe(200);
       }
     }
-    await new Promise((r) => setTimeout(r, 400));
-    expect(await count()).toBe(rows0);
-    const [use1] = await ctx.db.select().from(userTokens).where(eq(userTokens.id, token.id));
-    expect(use1!.useCount).toBe(use0!.useCount);
-    // not quiet: a bearer call of the same read, and a CRM read through the session
+    await settle();
+    expect(await count()).toBeLessThanOrEqual(rows0 + 1);
+    const rows1 = await count();
+    // a stolen session: same polls from a new user agent are written (and the last-use trace names it)
+    expect((await inj('GET', '/v1/me', { ...session.headers, 'user-agent': 'stolen-session/1.0' })).statusCode).toBe(200);
+    await settle();
+    expect(await count()).toBe(rows1 + 1);
+    const [row] = await ctx.db.select().from(userTokens).where(eq(userTokens.id, token.id));
+    expect(row!.lastUsedUserAgent).toBe('stolen-session/1.0');
+    // not quiet: the same read by bearer, and real CRM work
     await inj('GET', '/v1/me', token.headers);
-    await inj('GET', crmUrl('/contacts'), session.headers);
-    await new Promise((r) => setTimeout(r, 400));
-    expect(await count()).toBe(rows0 + 2);
+    await inj('GET', crmUrl('/contacts'), { ...session.headers, 'user-agent': 'stolen-session/1.0' });
+    await settle();
+    expect(await count()).toBe(rows1 + 3);
     // a REFUSED poll is the trail of a stolen session: it is written
     await ctx.db.update(userTokens).set({ abilities: ['desktop_signin', 'crm'] }).where(eq(userTokens.id, token.id));
-    expect((await inj('GET', '/v1/me', session.headers)).statusCode).toBe(403);
+    expect((await inj('GET', '/v1/me', { ...session.headers, 'user-agent': 'stolen-session/1.0' })).statusCode).toBe(403);
+    await settle();
+    expect(await count()).toBe(rows1 + 4);
+  });
+
+  it('a polling read that fails in its handler is written even inside the quiet window', async () => {
+    const { token, session } = await bound(['desktop_signin', 'read']);
+    const count = async () => (await ctx.db.select().from(userTokenEvents).where(eq(userTokenEvents.tokenId, token.id))).length;
+    expect((await inj('GET', '/v1/me', session.headers)).statusCode).toBe(200); // opens the quiet window
     await new Promise((r) => setTimeout(r, 400));
-    expect(await count()).toBe(rows0 + 3);
+    const before = await count();
+    const missing = await inj('GET', '/v1/notifications?cursor=not-a-valid-cursor', session.headers);
+    expect(missing.statusCode, missing.body).toBeGreaterThanOrEqual(400);
+    await new Promise((r) => setTimeout(r, 400));
+    expect(await count()).toBeGreaterThan(before);
+  });
+});
+
+describe('RT15561 delta F1: an operator-bound session gets no host waivers', () => {
+  it('the operator token is admitted for CRM and the base reads but is refused by the session what it is refused by bearer on the machine routes', async () => {
+    const { token, session } = await bound(['all']);
+    await ctx.db.execute(sql`update user_tokens set created_via = 'operator' where id = ${token.id}::uuid`);
+    expect((await inj('GET', crmUrl('/contacts'), session.headers)).statusCode).toBe(200);
+    expect((await inj('GET', '/v1/me', session.headers)).statusCode).toBe(200);
+    for (const u of ['/v1/me/remote-control/catalog', `/v1/orgs/${w.org.id}/machines/remote-sessions`, `/v1/orgs/${w.org.id}/machines`]) {
+      const direct = await inj('GET', u, token.headers);
+      const viaSession = await inj('GET', u, session.headers);
+      expect(direct.statusCode, `bearer ${u}`).toBe(403);
+      expect(viaSession.statusCode, `session ${u} ${viaSession.body}`).toBe(403);
+    }
+    // enrollment is not under the machines rule, so the answer is whatever bearer gets; the point is no waiver widens it
+    const viaBearer = await inj('POST', '/v1/me/machine-enrollments', token.headers, { orgIds: [w.org.id], preset: 'resting' });
+    const enroll = await inj('POST', '/v1/me/machine-enrollments', session.headers, { orgIds: [w.org.id], preset: 'resting' });
+    expect(enroll.statusCode, enroll.body).toBe(viaBearer.statusCode);
   });
 });

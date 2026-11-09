@@ -85,6 +85,8 @@ declare module 'fastify' {
       approvalId: string | null;
       /** Elevated machines grants this request used (modules/machines/token-grants.ts), recorded on the ledger row. */
       machineGrantIds?: string[];
+      /** A desktop poll the gate decided to leave unwritten (a same session, IP and user agent already wrote within the window); the response hook still writes it when it is not 2xx. */
+      pollQuiet?: boolean;
     };
     /** goodqa#15561: set while a desktop session bound to a user token is the carrier (both doors); the ledger rows say so. */
     userTokenDoor?: { via: 'desktop_session'; sessionId: string; door: 'host' | 'delegated' | 'none' };
@@ -220,11 +222,25 @@ function enforceTokenRate(req: FastifyRequest, reply: FastifyReply, token: UserT
 }
 
 /**
- * True when this request leaves no ledger row and no last-use write: the listed zero-write observation reads (any credential)
- * and, for a bound desktop session only, its polling reads (DESKTOP_POLL_ROUTES).
+ * Desktop polling is THROTTLED, not suppressed (RT15561 delta F2): a poll on DESKTOP_POLL_ROUTES stays unwritten only while the
+ * same session already wrote within the window from the same address and user agent, and only when it answers 2xx. A first
+ * poll, a poll from a new address or user agent (a stolen session), or a poll that fails writes the row and the last-use update.
  */
-export function ledgerQuiet(req: FastifyRequest, routePattern: string | undefined): boolean {
-  return isZeroWriteRead(req.method, routePattern) || (!!req.userTokenDoor && isDesktopPollRoute(req.method, routePattern));
+export const DESKTOP_POLL_QUIET_WINDOW_MS = 5 * 60_000;
+const pollSeen = new Map<string, { ip: string; ua: string; at: number }>();
+function pollQuietNow(sessionId: string, client: { ip?: string | null; userAgent?: string | null }, now: number): boolean {
+  const ip = client.ip ?? '';
+  const ua = client.userAgent ?? '';
+  const seen = pollSeen.get(sessionId);
+  if (seen && seen.ip === ip && seen.ua === ua && now - seen.at < DESKTOP_POLL_QUIET_WINDOW_MS) return true;
+  pollSeen.delete(sessionId);
+  pollSeen.set(sessionId, { ip, ua, at: now });
+  while (pollSeen.size > FAILURE_TABLE_MAX) {
+    const oldest = pollSeen.keys().next().value;
+    if (oldest === undefined) break;
+    pollSeen.delete(oldest);
+  }
+  return false;
 }
 
 /** The ledger detail that names a desktop-session carrier; empty for a bearer call (its rows are unchanged). */
@@ -426,7 +442,7 @@ export async function applyUserTokenRoutePolicy(
     // A desktop session never reaches a session action (its grant is an explicit human grant to a token, not to a screen).
     if (candidate) throw refusal(req, token, routePattern, new AppError(403, 'user_token_non_delegable', 'A desktop session cannot perform session actions.', { rule: 'session_action' }));
     // Host door: the same gate, with the three named waivers (lib/desktop-token-session.ts applyHostDoorWaivers).
-    if (bound.door === 'host') applyHostDoorWaivers(req.method, bound.routeKey, policy, expandUserTokenAbilities(token.abilities));
+    if (bound.door === 'host') applyHostDoorWaivers(req.method, bound.routeKey, policy, expandUserTokenAbilities(token.abilities), token.createdVia);
   }
   // Outreach authoring/start (lib/commander-turn-routes.ts): the few person-only routes a Commander TURN GRANT -- and
   // only that credential -- may reach. Everything below still applies (abilities, org list, tiered action card).
@@ -688,8 +704,9 @@ export async function applyUserTokenRoutePolicy(
   }
   setRequestActor(bound?.door === 'host' ? { userId: user.id } : { userId: user.id, userTokenId: token.id });
   const client = normalizeClientTrace({ ip: requestClientIp(req), userAgent: req.headers['user-agent'] });
-  if (!ledgerQuiet(req, routePattern)) {
+  const pollQuiet = !!bound && isDesktopPollRoute(req.method, routePattern) && pollQuietNow(bound.sessionId, client, now);
+  if (!isZeroWriteRead(req.method, routePattern) && !pollQuiet) {
     req.server.trackBackgroundWork(recordUserTokenUse(req.server.db, token.id, { ...client, inProcess: isInProcessDispatch(req.headers) }, req.log));
   }
-  req.userTokenLedger = { tokenId: token.id, userId: user.id, approvalId: sessionAction ? null : approvalId };
+  req.userTokenLedger = { tokenId: token.id, userId: user.id, approvalId: sessionAction ? null : approvalId, ...(pollQuiet ? { pollQuiet } : {}) };
 }

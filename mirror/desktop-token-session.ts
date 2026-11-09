@@ -259,10 +259,13 @@ interface HostPolicyShape {
   approvalAlways: boolean;
 }
 /** Mutates `policy` (a fresh object per request) for the host door. Returns which waivers fired, for the ledger and the tests. */
-export function applyHostDoorWaivers(method: string, routeKey: string, policy: HostPolicyShape, held: ReadonlySet<string>): Array<'W1' | 'W2' | 'W3'> {
+export function applyHostDoorWaivers(method: string, routeKey: string, policy: HostPolicyShape, held: ReadonlySet<string>, createdVia: string): Array<'W1' | 'W2' | 'W3'> {
   const key = `${methodOf(method)} ${routeKey}`;
   const fired: Array<'W1' | 'W2' | 'W3'> = [];
   if (!HOST_WAIVER_ABILITIES.every((a) => held.has(a))) return fired;
+  // The operator token is the non-expiring, agent-held orchestrator token: admitted as a bound token for the base reads and the
+  // delegated CRM door, but never given the machine waivers (it is refused those by bearer; RT15561 delta F1).
+  if (createdVia === 'operator') return fired;
   if (policy.nonDelegable?.code === 'machines') { policy.nonDelegable = null; fired.push('W1'); }
   if (policy.signedInPersonOnly) { policy.signedInPersonOnly = false; fired.push('W2'); }
   if (!HOST_BASE_READ_ROUTES.has(key) && !policy.abilities.includes('machines')) policy.abilities = [...policy.abilities, 'machines'].sort();
