@@ -12,6 +12,9 @@ PATTERNS = [
     ('dead-man alert', r'^(DEADMAN:|\[deadman\]|pp-prod-smoke dead-man)'),
     ('dev-decom status note', r'^Status \d{4}-\d{2}-\d{2} [\d:]+Z \(dev-decom'),
     ('PR/branch/commit checkpoint', r'^(PR #\d+|PR-\w+ status|Owner checkpoint|Fixer checkpoint|Publishing: branch|Branch fix/|branch fix/|Commit [0-9a-f]+|Ship SHA|Main merging PR|Fix-forward pushed|Owner \d+\. The R|R\d+-\d+ fix:|Review round|Q\d+ (plan|S\d+) checkpoint|S[A-Z0-9]+ checkpoint|QAC-A:|fleet/goodqa units)'),
+    ('deploy record note', r'^Deployed to prod:'),
+    ('main/coordinator decision note', r'^Decision \(made by main/coordinator'),
+    ('red-team round note', r'^Red-team (round|delta)'),
     ('routing note', r'^Routing \((coordinator|GoodQA Desk)'),
 ]
 CP = [(n, re.compile(p)) for n, p in PATTERNS]
