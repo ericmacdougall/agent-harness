@@ -941,6 +941,35 @@ def install_git_backstop(home: Path, apply: bool) -> str:
     return git_hook_status(home, GIT_HOOK_KEY, home / ".claude" / "hooks" / "commit_policy.py", apply=apply)
 
 
+def timeout_shim_status(home: Path, apply: bool, path_dirs=None) -> str:
+    """GoodQA #15565: agents write `timeout N cmd`, and macOS ships no coreutils `timeout` ("timeout: command not found",
+    seen under `ah status`). Place harness/bin/timeout in ~/.local/bin only when no timeout/gtimeout is on PATH and
+    ~/.local/bin is on PATH; never replace an existing command or a file we did not place."""
+    import shutil
+    home = home.expanduser().resolve()
+    dirs = [d for d in (path_dirs if path_dirs is not None else os.environ.get("PATH", "").split(os.pathsep)) if d]
+    target = home / ".local" / "bin" / "timeout"
+    source = ROOT / "harness" / "bin" / "timeout"
+    shim = source.read_bytes()
+    if target.is_file() and not target.is_symlink():
+        if target.read_bytes() == shim:
+            return f"timeout shim: current at {target}"
+        if b"GoodQA #15565" not in target.read_bytes():
+            return f"timeout shim: skipped ({target} exists and is not ours)"
+    elif shutil.which("timeout", path=os.pathsep.join(dirs)) or shutil.which("gtimeout", path=os.pathsep.join(dirs)):
+        return "timeout shim: not needed (timeout or gtimeout is on PATH)"
+    if str(target.parent) not in {str(Path(d).expanduser().resolve()) for d in dirs}:
+        return f"timeout shim: skipped ({target.parent} is not on PATH)"
+    if not apply:
+        return f"timeout shim: would place {target}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(".timeout.tmp")
+    tmp.write_bytes(shim)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, target)
+    return f"timeout shim: placed {target}"
+
+
 def netwatch_status(home: Path, apply: bool, flag) -> str:
     """Optional monitor; never fails the harness install.
 
@@ -1123,6 +1152,7 @@ def main() -> None:
     for path in changes:
         print(f"  {path}")
     print(f"  {install_git_backstop(args.home, args.apply)}")
+    print(f"  {timeout_shim_status(args.home, args.apply)}")
     if args.hooks_only:
         print("  CLAUDE.md and settings.json: not touched (--hooks-only)")
         if not args.apply:
