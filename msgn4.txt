@@ -1,0 +1,8 @@
+chore(scratch): keep the landscape scroll debug probe
+
+Why: The owner worktree must stay clean; this probe located the scroll-anchoring jump after choosing a lesson in landscape (private phone-navigation fix, PR #9).
+What: Add dbg_land.py, a throwaway Playwright probe that logs scrollY over time after tapping a lesson.
+Testing: not run: diagnostic script, its output identified the cause and was re-run after the fix.
+Refs: none (chore: scratch helper, no product code)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
