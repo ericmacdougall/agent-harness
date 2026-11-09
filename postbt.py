@@ -1,0 +1,5 @@
+import sys, uuid
+sys.path.insert(0, '/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/ticket-cleanup')
+import gq
+b = """bugtracker branch count (owner ab8a7d1b, 2026-11-09 15:55Z): 10, one above the under-10 target (target 9 or fewer including main). The two ruleset-canary branches were deleted in a 7-second window on ruleset 26509157 (restored and verified field by field, readback match). The tenth branch is the compliance owner's compliance/oauth-sender-identity-20261109, temporary: it merges within hours (goodqa#15545) and is deleted on merge, which brings bugtracker to 9. Nothing is deleted meanwhile. Re-check after that merge. The other branches: claude/qac-kimi-create-web, claude/qac-q3-s3-reports, claude/qac-q3-s3-ship, claude/qac-q3-s3-ship2, feat/goodqa-15397-batch (PR 1303), feat/goodqa-15397-testid-lint (PR 1301), full-delegate-token, release/desktop-0.2.52, main."""
+print(str(gq.call('comment_on_issue', {'issueId': '861b09c7-cea1-4d8c-96f9-46242f652dbe', 'body': b, 'operationId': str(uuid.uuid4())}))[:30])
