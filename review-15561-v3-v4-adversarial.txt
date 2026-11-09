@@ -1,0 +1,57 @@
+ADVERSARIAL DELTA SPEC REVIEW: goodqa#15561 spec v3 -> v4 (auth domain)
+Reviewer: agent-a0e0378fdb6d0d338. Scope: only the v3->v4 diff; code read-only on t2-dev /home/eric/wt-15561 @ bbae6857.
+VERDICT: BLOCK (one material finding, a small fix to the spec, plus one code check)
+
+Verified as stated
+- crm.api.enabled is DEFAULT ON (entitlements.ts:743 in FULL_ACCESS; the batch4 comment at :726).
+- Contact detail and timeline are in SESSION_ONLY_ROUTES (auth.ts:4641, :4644, in the block that says "authenticated human workflow with no API-key consumer"). Holding them is the safe direction and matches D5 and AC-6.
+- The bound door allows only created_via session/user_token (bound-session.ts BOUND_ALLOWED_CREATED_VIA). The test at delegation.test.ts:246 covers oauth, operator and pairing.
+- pairing and oauth go through assertOAuthGrant (OAUTH_ABILITIES has no desktop_signin).
+- GET /v1/orgs filters through userTokenAllowsOrg (orgs/routes.ts:402).
+- D6 is pulled forward with tests (delegation.test.ts:354, AC-9/NEG-13/NEG-20). Q6 depends on NEG-29, which is in S1b in the same release.
+- Q7 (export refused) and Q8 (Messages read, send only with write) match AC-3 and D4.
+- Moving NEG-28 and Q9 is a reorder only. S1b now names NEG-21 and the API half of NEG-25, which adds coverage.
+
+F1 [MATERIAL, confirmed]: the Q9 finding states a false code claim, and main's acceptance rests on it.
+  The v4 text says: "operator is not produced by any code path (operator tokens are written as session)" and "(nothing that can start a session today is refused)".
+  Evidence: apps/api/scripts/operator-mint-user-token.ts:157 calls mintUserToken with actor {kind:'operator'}. service.ts:641 then writes createdVia = actor.kind = 'operator'. The script mints "with every ability, no expiry" (its header; it is the orchestrator's token), so the token holds desktop_signin through 'all'. The v4 claim only holds for qa-commander-directives/operator-tokens.ts, which writes 'session'.
+  Effect: POST /v1/me/desktop-session (routes.ts ~157-186) has no created_via check. An operator token therefore still MINTS a session, and the bound door then answers 401 and revokes it on the first request (reason 'kind'). There are three problems:
+  (a) If the mini's live desktop is bound to an operator-minted token, the deploy kills it. AC-12 then fails, or someone is tempted to "fix" it by admitting operator. The statement "the mini's token is session or user_token" was inferred from code. Nobody observed it.
+  (b) Mint and door disagree, and no test covers the mint path for operator.
+  (c) Main accepted Q9 on a false premise.
+  Fix:
+  - Correct the S0 Q9 text.
+  - Read created_via of the token bound to the mini's current session. This is non-secret metadata (select created_via from user_tokens where id = <bound id>).
+  - Re-present Q9 to main if that value is 'operator'.
+  - Add the same BOUND_ALLOWED_CREATED_VIA check to the mint route, and name that mint case in NEG-19 with an exact code (today NEG-19 names only oauth and commander_turn).
+
+F2 [MEDIUM, acceptance oracle weakened]: in AC-12 and the outcome, "1,415 people" became "the saved view's current count (1,415 at 2026-11-09)".
+  That fixes a stale number but removes the oracle. A desktop list that is mis-scoped (wrong org, a projectIds narrowing applied wrongly, a truncated page) shows "a count" and still passes.
+  Fix: the click-tester records the count the owner's signed-in web session shows for view 757da781 at the same time, and the desktop count must equal it. Both screenshots go in the evidence.
+
+F3 [LOW, internal contradiction]: the F6(a) line was edited in v4 but still says crm.api.enabled is "default off", which contradicts the new decision block and the code. The comment at plugins/auth.ts:1037 is stale too. Fix the spec text; NEG-24 stays valid for an explicit override of false.
+
+F4 [LOW, design text vs NEG and code]: D3(1) says a route outside both tables is refused "403 desktop_token_session_scope". NEG-25, now pinned in S1b, expects user_token_non_delegable, and the code does this deliberately (auth-gate.ts:193-205 maps a route-class refusal to non_delegable when the policy is nonDelegable or signedInPersonOnly). Update D3 so a later "fix to the spec" cannot regress the honest copy. The code's choice leaks no more than a bearer call does.
+
+F5 [LOW, stale gating]: Q2 is now decided yes and D6 is pulled into S1b. Yet D6, D11a, AC-9 ("applies only if Q2..."), Q2 ("GATES S2"), S2 ("only if Q2 is yes: D6 in desktopBindingState") and S5 still read as open or conditional. Rewrite them as decided so no verifier treats AC-9 or NEG-13 as optional.
+
+F6 [HYPOTHESIS, not exploited]: refusing 'operator' is not a boundary while userTokens.sessionActions is off (the default, DARK-FEATURES.md:206).
+  The token_mint non-delegable rule is skipped when session actions are off (user-token-policy.ts:663). An operator token with tokens.create_user_tokens can therefore mint a child with created_via 'user_token' that carries desktop_signin, and the bound door admits that child. The comment "the bound token is a human-minted token" (auth-gate.ts:358) does not hold for legacy children.
+  Not exploitable beyond the parent's own power, because a child never exceeds its parent. But the Q9 rationale should be chain-root based, or should say plainly that it is defense in depth only.
+  Related pre-existing text (outside the delta): F4 says "a user-token actor can never mint", which is only true while session actions are on.
+
+OUTSIDE THE DELTA (flagged because it contradicts D9, AC-8 and NEG-12; uncommitted in the worktree, not yet in HEAD)
+- DESKTOP_POLL_ROUTES (desktop-token-session.ts ~203-216) plus ledgerQuiet (auth-gate.ts:226) drop the ledger row and the last-use update for 11 bound-session reads, "allowed or refused". The list includes the delegated chat unread-count routes and org-scoped machine reads.
+- D9 says every bound request, including refusals, is ledgered "so a stolen session probing ... leaves a trail". AC-8 says "every delegated request". NEG-12 only allows the bearer zero-write policy.
+- Either amend the spec (v5, with review) or keep refused poll requests ledgered and limit the exemption to allowed host-door polls.
+
+Auth negative-case coverage of the changed items
+- The operator token at mint is not covered (F1).
+- The NEG-13 test uses toBeGreaterThanOrEqual(400) for the no-read and no-signin mints. Any 4xx passes, so a wrong refusal reason would pass too. Pin the code.
+- The Q9 kind loop (delegation.test.ts:246) asserts 401 but not that the session row is revoked with user_token_ended.
+
+Not verified
+- Production data: crm.api.enabled override and the created_via of the mini's bound token.
+- Whether the operator script was actually used for any token holding desktop_signin in production.
+- The full v4 body outside the diff, beyond the cross-references above.
+- Web helper/S4 code. No tests were run. No hostile-input probes were run; none were needed for a spec delta, so no run_probe.py declarations.

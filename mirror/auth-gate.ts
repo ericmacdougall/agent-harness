@@ -21,7 +21,7 @@ import {
   USER_TOKEN_SHAPE,
   expandUserTokenAbilities,
 } from '@bugtracker/shared';
-import { applyHostDoorWaivers, desktopExplainedSurface } from '../../lib/desktop-token-session';
+import { applyHostDoorWaivers, desktopExplainedSurface, isDesktopPollRoute } from '../../lib/desktop-token-session';
 import { requestClientIp } from '../../lib/client-ip';
 import { AppError, Errors } from '../../lib/errors';
 import { isInProcessDispatch } from '../../lib/in-process-dispatch';
@@ -219,6 +219,14 @@ function enforceTokenRate(req: FastifyRequest, reply: FastifyReply, token: UserT
   });
 }
 
+/**
+ * True when this request leaves no ledger row and no last-use write: the listed zero-write observation reads (any credential)
+ * and, for a bound desktop session only, its polling reads (DESKTOP_POLL_ROUTES).
+ */
+export function ledgerQuiet(req: FastifyRequest, routePattern: string | undefined): boolean {
+  return isZeroWriteRead(req.method, routePattern) || (!!req.userTokenDoor && isDesktopPollRoute(req.method, routePattern));
+}
+
 /** The ledger detail that names a desktop-session carrier; empty for a bearer call (its rows are unchanged). */
 export function doorDetail(req: FastifyRequest): Record<string, unknown> {
   return req.userTokenDoor ? { via: req.userTokenDoor.via, sessionId: req.userTokenDoor.sessionId } : {};
@@ -226,7 +234,7 @@ export function doorDetail(req: FastifyRequest): Record<string, unknown> {
 
 export function refusal(req: FastifyRequest, token: UserTokenRow, routePattern: string | undefined, err: AppError): AppError {
   // Observation refusals share the successful-request policy; other reads retain their denial audit.
-  if (isZeroWriteRead(req.method, routePattern)) return err;
+  if (ledgerQuiet(req, routePattern)) return err;
   const client = normalizeClientTrace({ ip: requestClientIp(req), userAgent: req.headers['user-agent'] });
   req.server.trackBackgroundWork(recordUserTokenEvent(
     req.server.db,
@@ -679,7 +687,7 @@ export async function applyUserTokenRoutePolicy(
   }
   setRequestActor(bound?.door === 'host' ? { userId: user.id } : { userId: user.id, userTokenId: token.id });
   const client = normalizeClientTrace({ ip: requestClientIp(req), userAgent: req.headers['user-agent'] });
-  if (!isZeroWriteRead(req.method, routePattern)) {
+  if (!ledgerQuiet(req, routePattern)) {
     req.server.trackBackgroundWork(recordUserTokenUse(req.server.db, token.id, { ...client, inProcess: isInProcessDispatch(req.headers) }, req.log));
   }
   req.userTokenLedger = { tokenId: token.id, userId: user.id, approvalId: sessionAction ? null : approvalId };

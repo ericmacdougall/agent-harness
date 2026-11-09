@@ -200,6 +200,22 @@ const DELEGATED: ReadonlyMap<string, DesktopDelegatedSurface> = new Map(DESKTOP_
 
 export type DesktopDoor = 'host' | 'delegated';
 
+/**
+ * Polling reads the desktop app and its web shell issue on a timer (unread counts, notification list, remote-session availability,
+ * the machine and org lists, the update check). For a bound session they take the same observation policy as the listed
+ * zero-write reads: no ledger row (allowed or refused) and no last-use update, so a desktop left open does not write about 15
+ * rows a minute per window for nothing. Bearer calls are unchanged. Real work (CRM reads and writes, enrollment, consent) is
+ * always ledgered. goodqa#15561 ledger-load measurement.
+ */
+export const DESKTOP_POLL_ROUTES: ReadonlySet<string> = new Set([
+  'GET /v1/me', 'GET /v1/orgs', 'GET /v1/notifications', 'GET /v1/notifications/unread-count', 'GET /v1/desktop/update-status',
+  'GET /v1/me/machines', 'GET /v1/orgs/:p/machines', 'GET /v1/orgs/:p/machines/remote-sessions/availability',
+  'GET /v1/chat/unread-count', 'GET /v1/orgs/:p/chat/unread-count', 'GET /v1/chat/active',
+]);
+export function isDesktopPollRoute(method: string, routePattern: string | undefined): boolean {
+  return !!routePattern && DESKTOP_POLL_ROUTES.has(`${methodOf(method)} ${desktopRouteKey(routePattern)}`);
+}
+
 /** Surfaces the app has pages for: their routes outside the table are explained by the token policy's own refusal where one exists (see boundRouteClassRefusal). */
 const EXPLAINED_SURFACES: readonly RegExp[] = [/^\/v1\/orgs\/:p\/crm(\/|$)/];
 export function desktopExplainedSurface(routeKey: string): boolean { return EXPLAINED_SURFACES.some((re) => re.test(routeKey)); }
