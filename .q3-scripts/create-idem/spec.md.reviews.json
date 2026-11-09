@@ -1,0 +1,53 @@
+{
+ "v": 1,
+ "reviews": [
+  {
+   "kind": "agent",
+   "identity": "a4e5a7bee7a5c4fc1",
+   "model": "red-team",
+   "verdict": "ACCEPT",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-aab3ea104374c7694/.q3-scripts/create-idem/review-adversarial.md",
+    "sha256": "d070ba182b8c7d12a65debb5a7b639c5caf0bae80ebf1d8dfd975dde972ba55d"
+   },
+   "role": "adversarial",
+   "core_sha": "d06ee21b65b3f8ed1dd6fe3377f3cdbc851ba2a63f30e7ebc6063175db8e2041",
+   "at": "2026-11-09T04:01:15.453684+00:00",
+   "key": "agent:a4e5a7bee7a5c4fc1"
+  },
+  {
+   "kind": "agent",
+   "identity": "a4e5a7bee7a5c4fc1",
+   "model": "red-team",
+   "verdict": "ACCEPT",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-aab3ea104374c7694/.q3-scripts/create-idem/review-adversarial.md",
+    "sha256": "c8bed23913ee10d2bcc777e3cdfd5ae615d96a49dcf75dd36e054ee5563020e4"
+   },
+   "role": "adversarial",
+   "core_sha": "2e6c17c6319885fd5e2a5f48073467506ebebd47d6cd3e4cb29096ba9bf75eb3",
+   "at": "2026-11-09T04:03:50.058567+00:00",
+   "key": "agent:a4e5a7bee7a5c4fc1"
+  },
+  {
+   "kind": "agent",
+   "identity": "a0a51de3ad5e5794c",
+   "model": "red-team",
+   "verdict": "ACCEPT",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-aab3ea104374c7694/.q3-scripts/create-idem/review-acceptance.md",
+    "sha256": "caf2197fdd35fb83b70892913ffb910766a7fb647f67affadcaf6ec700d424aa"
+   },
+   "role": "acceptance",
+   "core_sha": "2e6c17c6319885fd5e2a5f48073467506ebebd47d6cd3e4cb29096ba9bf75eb3",
+   "at": "2026-11-09T04:03:50.152779+00:00",
+   "key": "agent:a0a51de3ad5e5794c"
+  }
+ ]
+}
