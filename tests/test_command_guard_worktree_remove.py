@@ -647,6 +647,18 @@ class WorktreeRemoveRound3RedTeam(WorktreeRemoveCase):
         self.assertEqual(verdict[0], 'block')
         self.assertIn('parallel-unverifiable', str(verdict))
 
+    def test_accepted_refusals_name_the_way_through(self):
+        # main's ruling on PR 151: the refusals kept on purpose must tell the agent what to run instead
+        cases = (('parallel -a urls.txt curl -sO', ':::'),
+                 ('parallel curl -sO :::: urls.txt', ':::'),
+                 ('parallel --jo 4 echo ::: a', 'spell the option in full'),
+                 ('git co "$BRANCH"', 'git checkout'),
+                 ('parallel echo ::: %s' % ' '.join('x%d' % n for n in range(cg.PAR_LINE_LIMIT + 1)), 'split the job'))
+        for command, hint in cases:
+            verdict = self.decide(command, cwd=self.home)
+            self.assertEqual(verdict[0], 'block', command[:40])
+            self.assertIn(hint, str(verdict), command[:40])
+
     def test_a_word_after_the_command_is_data_not_the_fed_command(self):
         for c in ("find . -name '*.py' | xargs grep -n git", "echo x | xargs printf '%s\\n' git", 'xargs -n 1 grep git < f'):
             self.assertEqual(self.decide(c, cwd=self.home)[0], 'allow', c)

@@ -2137,6 +2137,24 @@ def parallel_plan(words, semaphore=False, budget=None):
     return lines, 'args', None
 
 
+def _parallel_alternative(error):
+    """The safe way through for each reason parallel_plan refuses (main's ruling on PR 151: no refusal leaves an agent
+    stuck). Each one names a form the guard can rebuild."""
+    if 'from a file' in error or 'standard input' in error:
+        return ('put the arguments on the command line: parallel CMD {} ::: ARG1 ARG2 ... (split a long list into several '
+                'runs of at most %d)' % PAR_LINE_LIMIT)
+    if 'not one the guard can rebuild' in error:
+        return ('spell the option in full and use one of the common ones (-j N, -k, -q, -I STR, --bar, --dry-run, --tag, '
+                '--joblog FILE), or run the commands one by one')
+    if 'built at run time' in error:
+        return 'write the command and its options literally; put changing values in the ::: arguments'
+    if 'more than' in error:
+        return 'split the job into several parallel runs of at most %d lines each' % PAR_LINE_LIMIT
+    if 'sem without' in error or 'input as commands' in error:
+        return 'give parallel a command: parallel CMD ::: ARG1 ARG2 ..., or run the commands one by one'
+    return 'use plain {} replacements and ::: arguments, or run the commands one by one'
+
+
 def _par_args(combo):
     return ' '.join(v if raw else _quote_for_rebuild(v) for v, raw in combo)
 
@@ -3536,7 +3554,7 @@ class Analyzer:
                 lines, mode, error = parallel_plan(list(args), semaphore=name == 'sem', budget=ctx.budget)
                 if error:
                     ctx.add(LOG_DELETE, 'parallel-unverifiable', 'the command lines %s would run cannot be rebuilt: %s'
-                            % (name, error), alternative)
+                            % (name, error), _parallel_alternative(error))
                     return True
                 self.fed_input += mode == 'stdin'
                 try:
@@ -4197,7 +4215,11 @@ class Analyzer:
     def _git_possible_alias(self, sub, args, where):
         """goodqa#15346 round 3: `sub` is not a built-in and this line does not say what it is, so it may be an alias to
         anything. Refuse it when it could act on a protected path: an argument that names one, or a target this guard
-        cannot see (stdin, xargs, a placeholder, an expansion). With no such argument it stays allowed (`git st`)."""
+        cannot see (stdin, xargs, a placeholder, an expansion). With no such argument it stays allowed (`git st`).
+
+        Accepted residual (M20, main's ruling on PR 151, goodqa#15472): an alias that carries its own target, written
+        straight into a config file (`printf '[alias] wr = worktree remove --force P' >> ~/.gitconfig`) and then run with
+        no arguments (`git wr`), is not seen here. Defining one through git config, -c or GIT_CONFIG_* is refused."""
         ctx = self.ctx
         unseen = self.fed_input > 0
         for w in args:
@@ -4207,7 +4229,8 @@ class Analyzer:
             ctx.add(LOG_DELETE, 'linked-worktree-remove',
                     'git %s may be an alias, and its target comes from stdin, xargs, a placeholder or an expansion, so '
                     'it cannot be verified' % sub[:40],
-                    'name the built-in subcommand; for a removal use the standalone literal git worktree remove')
+                    'write the built-in subcommand instead of the alias (git checkout "$B", not git co "$B"); for a '
+                    'removal use the standalone literal git worktree remove PATH')
             return
         named = list(_nondash(args))  # --opt=PATH names a path too: a shell alias can do anything with it
         named += [_literal_word(w.text.split('=', 1)[1]) for w in args if w.text.startswith('-') and '=' in w.text]
