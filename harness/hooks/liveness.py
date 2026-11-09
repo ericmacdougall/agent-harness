@@ -120,18 +120,40 @@ BINDING_KINDS = ("resumed", "reassigned", "waiting")
 
 def holds_work(row) -> bool:
     """A live successor: running and active within LIVE_BIND_S (never a stopped, SILENT, DROPPED or unknown agent)."""
-    if not isinstance(row, dict):
+    if not isinstance(row, dict) or str(row.get("type") or "") in NON_HOLDER_TYPES:
         return False
     state = str(row.get("state") or "")
     idle = row.get("idle_s")
     if state.startswith(("live", "working")):
         return True
+    if state.startswith("waiting-on-"):
+        return True  # parked in a named wait: `ah owners` already demotes a wait on a closed ask or a dead agent to DROPPED
     return state in ("quiet", "idle-helper") and isinstance(idle, (int, float)) and idle <= LIVE_BIND_S
 
 
+# Reviewers and other helpers are live agents but never hold a stream: naming one as a successor or wait target is a
+# claim about the wrong agent (red-team a5fc13ab D2).
+NON_HOLDER_TYPES = ("red-team", "click-tester", "reviewer", "fixer", "Explore", "Plan", "claude-code-guide",
+                    "statusline-setup")
+_TICKET = re.compile(r"(?:\b([A-Za-z0-9][A-Za-z0-9-]*))?#(\d{1,10})\b")
+
+
+def ticket_key(ref) -> tuple:
+    """(project slug or "", number) of the first ticket reference in ref: "GoodQA goodqa#15476" -> ("goodqa", "15476")."""
+    found = _TICKET.search(str(ref or ""))
+    if not found:
+        return ("", "")
+    return ((found.group(1) or "").lower(), found.group(2))
+
+
+def same_ticket(a, b) -> bool:
+    """Same number, and the same project when both name one (parent-proof#665 is not goodqa#665)."""
+    (sa, na), (sb, nb) = ticket_key(a), ticket_key(b)
+    return bool(na) and na == nb and (not sa or not sb or sa == sb)
+
+
 def ticket_number(ref) -> str:
-    found = re.search(r"#(\d{1,10})\b", str(ref or ""))
-    return found.group(1) if found else ""
+    return ticket_key(ref)[1]
 
 
 def resolve_agent(ref, by_id: dict):
@@ -149,6 +171,7 @@ def resolve_agent(ref, by_id: dict):
 def disposition_bound(disp: dict, row: dict, by_id: dict, rows: list, asks: dict, covered=None) -> bool:
     """Whether the thing a resumed/reassigned/waiting disposition names holds the work right now.
 
+    A helper type (reviewer, red-team, click-tester, ...) never holds a stream; a ticket wait matches project and number.
     resumed     --ref must be a live agent (the re-spawned or resumed owner); no ref binds only a row that is itself live
     reassigned  --ref must be a live agent, or one whose own disposition is bound (`covered`, chain-safe, from ah)
     waiting     --ref is an ask id still open in this session, a live agent, or a ticket that a LIVE owner (not this row)
@@ -171,9 +194,8 @@ def disposition_bound(disp: dict, row: dict, by_id: dict, rows: list, asks: dict
     target = resolve_agent(ref, by_id)
     if target is not None:
         return target is not row and holds_work(target)
-    number = ticket_number(ref)
-    return bool(number) and any(r is not row and r.get("owner") and holds_work(r) and ticket_number(r.get("ticket")) == number
-                                for r in rows)
+    return bool(ticket_number(ref)) and any(r is not row and r.get("owner") and holds_work(r)
+                                            and same_ticket(ref, r.get("ticket")) for r in rows)
 
 
 def row_disposed(row: dict) -> bool:

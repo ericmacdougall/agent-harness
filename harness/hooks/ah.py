@@ -446,9 +446,13 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             d = disp.get(r["agent_id"])
             kind = d.get("kind") if d else None
             # #134 red-team P4: only main's wait acknowledges, marked --ack-handoff (an owner cannot set it)
-            acknowledged = kind in ("resumed", "reassigned") + GUARDED_KINDS or (
+            # GoodQA #15565 (red-team D1): resumed and reassigned acknowledge only while their named holder is live
+            acknowledged = (kind in ("resumed", "reassigned")
+                            and liveness.disposition_bound(d, r, by_id, rows, asks, lambda ref, me=r["agent_id"]: covered(ref, (me,)))
+                            ) or kind in GUARDED_KINDS or (
                 kind == "waiting" and d.get("ack_handoff") is True
-                and liveness.disposition_live(d, now, last_activity=handed))
+                and liveness.disposition_live(d, now, last_activity=handed)
+                and liveness.disposition_bound(d, r, by_id, rows, asks))
             acked = bool(acknowledged and float(d.get("at") or 0) >= handed - 10)
             # A helper spawned by another agent hands its result back to that parent, which takes it by design. The
             # claim is honoured only when it is believable and the parent is plainly receiving: the child is a nested
@@ -1484,7 +1488,7 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
             state = ask_states(main_wal).get(ref)
             raise AhError("bad_request", f"task.dispose waiting: ask {ref} " + ("is already answered (ask_resolved)"
                           if state == "resolved" else "is not in this session's WAL"), 3)
-        if args["kind"] == "resumed" and not (ref and (_wal_has(main_wal, "subagent", None, agent=ref)
+        if args["kind"] == "resumed" and not (ref and ref != "main" and OWNER_ID_RE.match(ref) and (_wal_has(main_wal, "subagent", None, agent=ref)
                                                        or (main_wal.parent / f"{ref}.jsonl").is_file())):
             # GoodQA #15565 (never-drop 16.1): a resume is a claim that an agent holds the work, so it names that agent
             raise AhError("bad_request", "task.dispose resumed: --ref must name the agent of this session that took the "

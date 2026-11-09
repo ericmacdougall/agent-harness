@@ -412,6 +412,56 @@ class ReassignInheritsTargetWait(Base):
         self.assertNotIn("doneowner", undisposed)
 
 
+class BindingEndToEnd(Base):
+    """GoodQA #15565 (never-drop 16.1), through `ah owners` and `ah task dispose`, not just liveness.disposition_bound."""
+
+    def add_returned(self, name="retowner", kind="task-owner"):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 9000), "event": "subagent", "agent_id": name, "agent_type": kind},
+                              {"at": iso(NOW - 200), "event": "subagent_stop", "agent_id": name, "agent_type": kind}])
+        jl(w / ("agent-%s.jsonl" % name), [{"at": iso(NOW - 4000), "event": "intent", "note": "was working"}])
+
+    def test_reassigning_to_a_returned_agent_leaves_the_owner_undisposed_and_a_live_one_excuses_it(self):
+        self.add_returned()
+        self.dispose("reassigned", "e2e-r1-000000", ref="retowner")
+        self.assertIn("dropowner", self.owners()["undisposed"])
+        self.dispose("reassigned", "e2e-r2-000000", ref="aliveowner")
+        self.assertNotIn("dropowner", self.owners()["undisposed"])
+
+    def test_a_live_helper_is_not_a_holder_and_main_is_not_an_agent_ref(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 900), "event": "subagent", "agent_id": "reviewer01", "agent_type": "red-team"}])
+        jl(w / "agent-reviewer01.jsonl", [{"at": iso(NOW - 20), "event": "intent", "note": "reviewing"}])
+        self.dispose("reassigned", "e2e-h1-000000", ref="reviewer01")
+        self.assertIn("dropowner", self.owners()["undisposed"])
+        for ref in ("main", "../x", ""):
+            with self.assertRaises(ah.AhError, msg=ref):
+                self.dispose("resumed", "e2e-m-" + str(len(ref)) + "00000", ref=ref)
+
+    def test_a_handoff_is_acknowledged_only_by_a_live_holder(self):
+        self.add_returned()
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "agent-dropowner.jsonl", [{"at": iso(NOW), "event": "handoff", "note": "to main: result ready"}])
+        jl(w / "main.jsonl", [{"at": iso(NOW), "event": "subagent_stop", "agent_id": "dropowner", "agent_type": "task-owner"}])
+        later = NOW + ah.HANDOFF_ACK_S + 60
+        self.dispose("resumed", "e2e-ack-dead00", now=NOW + 5, ref="retowner")  # a returned agent holds nothing
+        by = {r["agent_id"]: r for r in self.owners(now=later)["owners"]}
+        self.assertIn("handoff-unacked", by["dropowner"]["flags"])
+        jl(w / "agent-aliveowner.jsonl", [{"at": iso(later - 10), "event": "intent", "note": "alive"}])
+        self.dispose("resumed", "e2e-ack-live00", now=NOW + 6, ref="aliveowner")
+        by = {r["agent_id"]: r for r in self.owners(now=later)["owners"]}
+        self.assertNotIn("handoff-unacked", by["dropowner"]["flags"])
+
+    def test_silent_high_owner_needs_a_bound_disposition(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 9000), "event": "subagent", "agent_id": "quietone", "agent_type": "task-owner"}])
+        jl(w / "agent-quietone.jsonl", [{"at": iso(NOW - 5400), "event": "intent", "note": "quiet for 90 minutes"}])
+        by = {r["agent_id"]: r for r in self.owners()["owners"]}
+        self.assertEqual(by["quietone"]["state"], "SILENT-HIGH")
+        self.assertTrue(by["quietone"]["decision_required"])
+        self.assertIn("quietone", self.owners()["undisposed"])
+
+
 class SubagentStopGate(Base):
     """I7: a sub-agent cannot end its turn with pending work and no armed waiter (desktop release owner, 2026-11-05)."""
 

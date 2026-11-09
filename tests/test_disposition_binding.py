@@ -29,7 +29,7 @@ class Binding(unittest.TestCase):
         self.assertTrue(liveness.holds_work(row("a")))
         self.assertTrue(liveness.holds_work(row("a", "quiet", 599)))
         self.assertFalse(liveness.holds_work(row("a", "quiet", 601)))
-        for state in ("SILENT", "SILENT-HIGH", "DROPPED", "done", "returned", "handoff", "waiting-on-x"):
+        for state in ("SILENT", "SILENT-HIGH", "DROPPED", "done", "returned", "handoff"):
             self.assertFalse(liveness.holds_work(row("a", state, 5)), state)
         self.assertFalse(liveness.holds_work(None))
 
@@ -63,6 +63,28 @@ class Binding(unittest.TestCase):
         self.assertFalse(self.bound({"kind": "waiting", "ref": "goodqa#14553"}, me, [stale]), "holder not live")
         self.assertFalse(self.bound({"kind": "waiting", "ref": "goodqa#14553"}, me, [row("h", ticket="goodqa#9999")]))
         self.assertTrue(self.bound({"kind": "waiting", "ref": "holder0000000"}, me, [holder]))
+
+    def test_a_reviewer_or_other_helper_never_holds_a_stream(self):
+        # red-team a5fc13ab D2: a live red-team agent is not a successor
+        me = row("dropped", "DROPPED", 9e4, ticket="goodqa#14553")
+        helper = dict(row("rt0000000001"), type="red-team", ticket="goodqa#14553")
+        for kind in ("resumed", "reassigned", "waiting"):
+            self.assertFalse(self.bound({"kind": kind, "ref": "rt0000000001"}, me, [helper]), kind)
+        self.assertFalse(self.bound({"kind": "waiting", "ref": "goodqa#14553"}, me, [helper]))
+
+    def test_ticket_waits_match_project_and_number(self):
+        me = row("dropped", "DROPPED", 9e4)
+        holder = row("holder0000000", ticket="GoodQA goodqa#665")
+        self.assertTrue(self.bound({"kind": "waiting", "ref": "GoodQA goodqa#665"}, me, [holder]))
+        self.assertFalse(self.bound({"kind": "waiting", "ref": "GoodQA parent-proof#665"}, me, [holder]))
+        self.assertTrue(self.bound({"kind": "waiting", "ref": "GoodQA #665"}, me, [holder]), "no project named: number only")
+        self.assertEqual(liveness.ticket_key("see #5 and goodqa#123"), ("", "5"))
+
+    def test_a_successor_parked_in_a_named_wait_still_holds_the_work(self):
+        # acceptance review abe6da04 D2: `ah owners` already demotes a wait on a closed ask to DROPPED
+        me = row("dropped", "DROPPED", 9e4)
+        parked = row("parked0000000", "waiting-on-wa5b00000001", 4000)
+        self.assertTrue(self.bound({"kind": "reassigned", "ref": "parked0000000"}, me, [parked]))
 
     def test_a_row_cannot_hold_its_own_ticket_wait(self):
         me = row("me0000000000", "live", 5, ticket="goodqa#1")
