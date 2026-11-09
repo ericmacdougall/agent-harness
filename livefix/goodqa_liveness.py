@@ -2463,20 +2463,15 @@ def act(findings, st, cfg, fx, apply, now, sample=None, left=None, reconcile=Tru
                     continue
                 if survivor:
                     if not apply:
-                        rec['alert'] = 'would note on %s (duplicate %s)' % (survivor, a['ref'])
+                        rec['alert'] = 'would follow duplicate %s of %s' % (a['ref'], survivor)
                     else:
                         # Gate the NEXT lookup: without this the alert stays due and costs ~6 calls on every 2-minute pass.
                         # severity too: a stored severity below the finding's keeps `escalate` (and so `due`) true on every pass
                         a.update(status_synced=now, commented=now, comment_digest=material_digest(f), severity=finding_severity(f))
-                        if now - float(a.get('dup_noted') or 0) < DUP_NOTE_SECONDS:
-                            rec['alert'] = 'duplicate %s of %s (noted recently)' % (a['ref'], survivor)
-                        elif alert_room() < write_reserve:
-                            rec['alert'] = 'duplicate %s of %s (note deferred: alert budget reserve)' % (a['ref'], survivor)
-                        else:
-                            rc, _note = fx.comment(survivor, dup_note_line(f, a['ref'], now))
-                            if rc == 0:
-                                a['dup_noted'] = now
-                            rec['alert'] = 'noted on %s (duplicate %s)' % (survivor, a['ref'])
+                        # No per-alert comment: the alert joins the canonical ticket's member list, and ONE aggregate note
+                        # per canonical ticket per hour (flush_dup_notes, end of act) lists every member still failing.
+                        register_dup_member(st, survivor, f, a, now)
+                        rec['alert'] = 'followed duplicate %s of %s' % (a['ref'], survivor)
                     report.append(rec)
                     continue
             if status in CLOSED_ALERT_STATUSES and now - float(a.get('reopened') or 0) >= 3600:
@@ -2509,11 +2504,9 @@ def act(findings, st, cfg, fx, apply, now, sample=None, left=None, reconcile=Tru
                         a.pop(k, None)
                     a.update(cleared=None, recurrences=int(a.get('recurrences') or 0) + 1, severity=finding_severity(f))
                     observe(a, f, now)
-                    rc, _note = fx.comment(dsv, dup_note_line(f, a['ref'], now))
+                    register_dup_member(st, dsv, f, a, now)
                     a.update(commented=now, comment_digest=digest, status_synced=now)
-                    if rc == 0:
-                        a['dup_noted'] = now
-                    rec['alert'] = 'recurred; noted on %s (duplicate %s)' % (dsv, a['ref'])
+                    rec['alert'] = 'recurred; followed duplicate %s of %s' % (a['ref'], dsv)
                     report.append(rec)
                     continue
                 try:
@@ -2709,6 +2702,8 @@ def act(findings, st, cfg, fx, apply, now, sample=None, left=None, reconcile=Tru
             else:
                 verb = 'recovery noted, close pending on ' + str(a['ref'])
             report.append(dict(cls=cls, title='recovered', alert=verb))
+    if apply:
+        flush_dup_notes(st, fx, now, lambda: alert_room() >= write_reserve)
     try:                              # clear the clamp so later direct ticket calls (reopen_closed) are not throttled
         fx._alert_deadline = None
     except (AttributeError, TypeError):
@@ -3040,12 +3035,53 @@ DUP_NOTE_SECONDS = 3600
 DUP_RETRY_SECONDS = 600
 
 
-def dup_note_line(f, ref, now):
-    """The ONE line appended to a canonical ticket for an alert closed as its duplicate: finding, alert id, time."""
-    title = re.sub(r'[\r\n`@]+', ' ', C.cap(str(f.get('title') or ''), 120))
-    cls = re.sub(r'[\r\n`@]+', ' ', C.cap(str(f['cls']), 120))
-    return defang_markers('Fleet liveness: `%s` (%s) still holds at %s; alert %s is closed as a duplicate of this ticket.' % (
-        cls, title, iso(now), ref))
+DUP_FRESH_SECONDS = 9000          # a member not re-observed for 2.5 h (the alert is re-checked hourly) has cleared
+DUP_MAX_ROWS = 100
+
+
+def _clean(text, n):
+    return re.sub(r'[\r\n`@]+', ' ', C.cap(str(text or ''), n))
+
+
+def register_dup_member(st, survivor, f, a, now):
+    """Record that alert `a` (closed as a duplicate of `survivor`) is still failing. State only; no ticket I/O."""
+    st.setdefault('dup_members', {}).setdefault(survivor, {})[f['cls']] = dict(
+        ref=a['ref'], title=_clean(f.get('title'), 100), since=float(a.get('opened') or now), seen=now)
+
+
+def dup_note_body(survivor, rows, now):
+    lines = ['Fleet liveness: %d duplicate alert(s) of this ticket still failing at %s:' % (len(rows), iso(now))]
+    for cls, m in rows[:DUP_MAX_ROWS]:
+        lines.append('- %s `%s` %s, since %s' % (m['ref'], _clean(cls, 100), _clean(m['title'], 100), iso(m['since'])[:10]))
+    if len(rows) > DUP_MAX_ROWS:
+        lines.append('- and %d more' % (len(rows) - DUP_MAX_ROWS))
+    return defang_markers('\n'.join(lines))
+
+
+def flush_dup_notes(st, fx, now, room_ok):
+    """ONE aggregate note per canonical ticket per hour, listing the followed duplicate alerts still failing (id, finding,
+    since). Skipped when the member set is unchanged since the last note, and when a note was posted within the hour. When
+    every member has cleared, one closing note says so. A failed comment is retried next pass."""
+    import hashlib
+    members = st.get('dup_members') or {}
+    agg = st.setdefault('dup_agg', {})
+    for survivor in list(members):
+        mem = {c: m for c, m in members[survivor].items() if now - float(m['seen']) < DUP_FRESH_SECONDS}
+        members[survivor] = mem
+        g = agg.setdefault(survivor, {})
+        rows = sorted(mem.items(), key=lambda kv: kv[1]['since'])
+        digest = hashlib.sha256('\n'.join('%s|%s' % (m['ref'], c) for c, m in rows).encode()).hexdigest()[:16] if rows else 'empty'
+        if digest == g.get('digest') or (digest == 'empty' and not g.get('digest')):
+            continue
+        if now - float(g.get('at') or 0) < DUP_NOTE_SECONDS or not room_ok():
+            continue
+        body = dup_note_body(survivor, rows, now) if rows else \
+            'Fleet liveness: no duplicate alert of this ticket is failing any more (checked %s).' % iso(now)
+        rc, _note = fx.comment(survivor, body)
+        if rc == 0:
+            g.update(at=now, digest=digest)
+        if not rows:
+            members.pop(survivor, None)
 
 
 def reopen_closed(cfg, fx, apply=False, limit=25, state=None, now=None):

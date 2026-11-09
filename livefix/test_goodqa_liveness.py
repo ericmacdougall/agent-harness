@@ -3872,36 +3872,84 @@ class LiveAlertReopen(unittest.TestCase):
     def notes(self, fx, survivor='goodqa#15558'):
         return [c for c in fx.calls if c[0] == 'comment' and c[1] == survivor]
 
-    def test_DuplicateOfOpenTicketNotesCanonicalOncePerHourAndNeverReopens(self):
+    def test_DuplicateOfOpenTicketNeverReopensAndNotesOnceThenStaysQuietWhileUnchanged(self):
         fx, state, f = self.dup_case()
         out = L.act([f], state, CFG, fx, True, T0)
         self.assertEqual(fx.ticket_patch.call_count, 0, 'a duplicate-closed alert must not be reopened')
         self.assertEqual(len(self.notes(fx)), 1)
-        line = fx.calls[-1]
-        self.assertEqual(line[0], 'comment')
-        self.assertEqual(state['alerts']['test']['dup_noted'], T0)
-        self.assertEqual(out[0]['alert'], 'noted on goodqa#15558 (duplicate goodqa#11932)')
-        for dt in (120, 1800, 3599):
+        self.assertEqual(out[0]['alert'], 'followed duplicate goodqa#11932 of goodqa#15558')
+        for dt in (120, 1800, 3601, 7300, 20000):
             L.act([f], state, CFG, fx, True, T0 + dt)
-        self.assertEqual(len(self.notes(fx)), 1, 'at most one update per hour per alert')
-        L.act([f], state, CFG, fx, True, T0 + 3601)
-        self.assertEqual(len(self.notes(fx)), 2)
+        self.assertEqual(len(self.notes(fx)), 1, 'unchanged member set: no further note')
         self.assertEqual(fx.ticket_patch.call_count, 0)
         self.assertFalse([c for c in fx.calls if c[0] == 'comment' and c[1] == 'goodqa#11932'], 'nothing posted on the closed alert')
 
-    def test_DuplicateNoteCarriesFindingAlertIdAndTime(self):
-        line = L.dup_note_line(dict(cls='unit-failing:dev:x.service', title='x.service failed on dev'), 'goodqa#11932', T0)
-        self.assertIn('unit-failing:dev:x.service', line)
-        self.assertIn('goodqa#11932', line)
-        self.assertIn(L.iso(T0), line)
-        self.assertNotIn('\n', line)
+    def many_case(self, n, survivor='goodqa#15558'):
+        from unittest.mock import Mock
+        fx = Fx()
+        fx.ticket_status = Mock(return_value='duplicate')
+        fx.ticket_patch = Mock(side_effect=lambda ref, status: fx.calls.append(('patch', ref, status)))
+        fx.moved_copy = Mock(return_value=None)
+        fx.undo_copy = Mock()
+        fx.duplicate_survivor = Mock(return_value=survivor)
+        state = st()
+        fs = []
+        for i in range(n):
+            cls = 'unit-failing:dev:u%d.service' % i
+            state['alerts'][cls] = dict(ref='goodqa#%d' % (12000 + i), opened=T0 - 90000, commented=T0 - 4000)
+            fs.append(dict(cls=cls, title='u%d.service failed on dev' % i, lines=['failure'], remedies=[]))
+        return fx, state, fs
+
+    def test_F5_ManyAlertsInOneHourProduceExactlyOneAggregateNote(self):
+        fx, state, fs = self.many_case(30)
+        L.act(fs, state, CFG, fx, True, T0)
+        notes = [c for c in fx.calls if c[0] == 'comment']
+        self.assertEqual(len(notes), 1, 'one aggregate note per canonical ticket, not one per alert')
+        self.assertEqual(notes[0][1], 'goodqa#15558')
+        full = L.dup_note_body('goodqa#15558', sorted(state['dup_members']['goodqa#15558'].items(), key=lambda kv: kv[1]['since']), T0)
+        for i in range(30):
+            self.assertIn('goodqa#%d' % (12000 + i), full)
+            self.assertIn('u%d.service' % i, full)
+        self.assertIn('since', full)
+        for dt in (120, 600, 3000):
+            L.act(fs, state, CFG, fx, True, T0 + dt)
+        self.assertEqual(len([c for c in fx.calls if c[0] == 'comment']), 1)
+        self.assertEqual(fx.ticket_patch.call_count, 0)
+
+    def test_F5_ChangedMembershipNotesAtMostOncePerHour(self):
+        fx, state, fs = self.many_case(3)
+        L.act(fs[:2], state, CFG, fx, True, T0)
+        self.assertEqual(len(self.notes(fx)), 1)
+        state['alerts'][fs[2]['cls']]['status_synced'] = 0
+        L.act(fs, state, CFG, fx, True, T0 + 600)            # a third alert joins inside the hour: held back
+        self.assertEqual(len(self.notes(fx)), 1)
+        L.act(fs, state, CFG, fx, True, T0 + 3601)           # the hour passed and the set changed: one more note
+        self.assertEqual(len(self.notes(fx)), 2)
+        L.act(fs, state, CFG, fx, True, T0 + 7300)
+        self.assertEqual(len(self.notes(fx)), 2, 'unchanged again: quiet')
+
+    def test_F5_AllMembersClearedPostsOneClosingNote(self):
+        fx, state, fs = self.many_case(2)
+        L.act(fs, state, CFG, fx, True, T0)
+        self.assertEqual(len(self.notes(fx)), 1)
+        L.act([], state, CFG, fx, True, T0 + 9000 + 3601)    # nothing observed for 2.5 h+: members aged out
+        self.assertEqual(len(self.notes(fx)), 2)
+        L.act([], state, CFG, fx, True, T0 + 30000)
+        self.assertEqual(len(self.notes(fx)), 2, 'the closing note is posted once')
+
+    def test_DuplicateNoteBodyIsCappedAndDefanged(self):
+        rows = [('c%d`@x' % i, dict(ref='goodqa#%d' % i, title='t\n`@bob`' + 'z' * 300, since=T0, seen=T0)) for i in range(150)]
+        body = L.dup_note_body('goodqa#1', rows, T0)
+        self.assertNotIn('@bob', body)
+        self.assertIn('and 50 more', body)
+        self.assertLess(len(body), 30000)
 
     def test_DuplicateDryRunWritesNothing(self):
         fx, state, f = self.dup_case()
         out = L.act([f], state, CFG, fx, False, T0)
-        self.assertEqual(out[0]['alert'], 'would note on goodqa#15558 (duplicate goodqa#11932)')
+        self.assertEqual(out[0]['alert'], 'would follow duplicate goodqa#11932 of goodqa#15558')
         self.assertEqual([c for c in fx.calls if c[0] in ('comment', 'patch')], [])
-        self.assertNotIn('dup_noted', state['alerts']['test'])
+        self.assertNotIn('dup_members', state)
 
     def test_DuplicateOfClosedOrUnlinkedTicketFallsBackToReopen(self):
         fx, state, f = self.dup_case(survivor=None)          # canonical closed, unreadable or no `duplicates` link
@@ -3933,7 +3981,7 @@ class LiveAlertReopen(unittest.TestCase):
         self.assertEqual(fx.ticket_patch.call_count, 0)
         L.act([f], state, CFG, fx, True, T0 + 3601)
         self.assertEqual(fx.duplicate_survivor.call_count, 2)
-        self.assertEqual(len(self.notes(fx)), 2)
+        self.assertEqual(len(self.notes(fx)), 1, 'unchanged member set: still one aggregate note')
 
     def test_N1_RisenSeverityDoesNotDefeatTheLookupGate(self):
         fx, state, f = self.dup_case()
@@ -3950,7 +3998,7 @@ class LiveAlertReopen(unittest.TestCase):
         self.assertEqual(fx.ticket_patch.call_count, 0, 'a recurring finding must not reopen a duplicate-closed alert')
         self.assertEqual(len(self.notes(fx)), 1)
         self.assertIsNone(state['alerts']['test']['cleared'], 'the alert is tracked again')
-        self.assertIn('noted on goodqa#15558', out[0]['alert'])
+        self.assertIn('followed duplicate goodqa#11932 of goodqa#15558', out[0]['alert'])
 
     def test_F2_RecurrenceWithoutACanonicalTicketStillReopens(self):
         fx, state, f = self.dup_case(survivor=None)
@@ -3978,17 +4026,14 @@ class LiveAlertReopen(unittest.TestCase):
         L.act([f2], state2, CFG, fx2, True, T0)
         self.assertEqual(fx2.ticket_patch.call_count, 0)
 
-    def test_F6_FailedNoteCommentIsNotLatchedForAnHour(self):
+    def test_F6_FailedNoteCommentIsRetriedNextPass(self):
         fx, state, f = self.dup_case()
         fx.comment = lambda ref, body: (1, 'boom')
         L.act([f], state, CFG, fx, True, T0)
-        self.assertNotIn('dup_noted', state['alerts']['test'])
-
-    def test_F6_NoteLineIsDefangedAndSingleLine(self):
-        line = L.dup_note_line(dict(cls='x`@evil', title='a\nb `c` @bob ' + 'z' * 500), 'goodqa#1', T0)
-        self.assertNotIn('\n', line)
-        self.assertNotIn('@bob', line)
-        self.assertLess(len(line), 450)
+        self.assertFalse(state['dup_agg']['goodqa#15558'].get('digest'), 'a failed note is not latched')
+        fx.comment = lambda ref, body: (fx.calls.append(('comment', ref, body[:40])), (0, ''))[1]
+        L.act([f], state, CFG, fx, True, T0 + 120)
+        self.assertEqual(len(self.notes(fx)), 1)
 
     def _api_fx(self, links, issues, projects=None):
         """The REAL Effects.duplicate_survivor against a fake API: links[id] -> duplicates endpoints; issues[id] -> issue."""
