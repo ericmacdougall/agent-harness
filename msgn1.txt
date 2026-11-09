@@ -1,0 +1,8 @@
+test(videos): check phone bar filter, count and list (failing now)
+
+Why: On phones the bottom sheet hides the active filter and the lesson list (user report on GoodQA #15486): the bar only says Lessons, the filter chips sit in a collapsed details, and a player shows before any lesson is chosen. The check is written first so the gap is proven before the fix.
+What: Rework test/mobile/mobile_check.py for browse mode (inline list, no player), the bar label and count, filter and search state in the bar, N of M while playing, a chips-first sheet with the current lesson highlighted, and Previous/Next inside the filter. The desktop check no longer needs a stored baseline (it compares Tab order with page order), so desktop_baseline.json is removed; it was stale against the 238-lesson catalog.
+Testing: `python test/mobile/mobile_check.py` against the staged 238-lesson build of main ef8382e on t2-dev -> 41 passed, 32 failed, exit 1 (the failing control).
+Refs: GoodQA #15486
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

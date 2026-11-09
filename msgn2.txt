@@ -1,0 +1,8 @@
+fix(videos): show filter, count and list on phones
+
+Why: On phones the bottom sheet hid the active filter and the lesson list, so a reader could not tell which list they were choosing from (user report on GoodQA #15486).
+What: The top bar button now always reads "<filter> · <N> lessons" (plus progress and search state) and, while a lesson is open, "<n> of <N> · <title>" counted inside the filtered list. With no lesson in the URL the filter chips and the list show inline under the bar and no player is shown; choosing a lesson opens the player. The sheet opens with the filter chips first (one swipeable row per group, active chip scrolled into view), the search row, and the current lesson highlighted and scrolled into view. The collapsed Filters details is gone. Previous and Next, 44 px targets, safe-area insets, single page scroll and the desktop layout are unchanged; no new external resources.
+Testing: `python test/mobile/mobile_check.py` on the t2-dev staged 238-lesson preview -> 343 passed, 0 failed (was 41 passed, 32 failed on main ef8382e); `npm test` -> 145 passed; `python3 -m unittest discover -s test -p '*_test.py'` -> 63 OK.
+Refs: GoodQA #15486
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

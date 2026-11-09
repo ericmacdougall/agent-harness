@@ -1,0 +1,8 @@
+chore(scratch): keep nav-fix preview helpers and commit drafts
+
+Why: The owner worktree must stay clean; these are the helper scripts and message drafts for the private phone-navigation fix, whose code lives in the separate private-lessons-host repo (PR #9).
+What: Add sync-nav.sh (push the working copy to the t2-dev preview tree), shots_flow.py (before and after screenshots of bar, sheet and playing) and the commit message drafts.
+Testing: not run: the helpers were exercised while producing the PR evidence.
+Refs: none (chore: scratch helpers, no product code)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
