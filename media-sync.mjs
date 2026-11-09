@@ -44,6 +44,27 @@ function treeHash(files = mediaFiles()) {
   for (const f of files) h.update(`${f}\t${statSync(path.join(root, f)).size}\n`);
   return h.digest("hex");
 }
+function treeHashOf(entries) {
+  const h = createHash("sha256");
+  for (const [n, size] of [...entries].sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0))) h.update(`${n}\t${size}\n`);
+  return h.digest("hex");
+}
+// vinext copies public/<x> to dist/client/<x>; power-user/public is a separate worker and is not part of this build output.
+const publicPrefixes = () => manifest.prefixes.filter((p) => p.startsWith("public/"));
+function sourcePublicEntries() {
+  return mediaFiles().filter((f) => f.startsWith("public/")).map((f) => [f, statSync(path.join(root, f)).size]);
+}
+function distPublicEntries() {
+  const out = [];
+  for (const p of publicPrefixes()) {
+    const rel = p.slice("public/".length);
+    for (const f of walk(path.join(root, "dist", "client", rel))) {
+      const name = path.relative(path.join(root, "dist", "client"), f).split(path.sep).join("/");
+      out.push(["public/" + name, statSync(f).size]);
+    }
+  }
+  return out;
+}
 // GNU tar -tv: "-rw-r--r-- 0/0 12345 1970-01-01 00:00 path"; returns [{type, size, name}]
 function listPart(file) {
   return run("tar", ["--quoting-style=literal", "-tvf", file], { capture: true }).split("\n").filter(Boolean).map((l) => {
@@ -97,6 +118,7 @@ const statePath = path.join(root, ".media-build-state.json");
 function verify() {
   const skip = process.env.MEDIA_SKIP === "1";
   if (skip && (process.env.CI || process.env.WORKERS_CI)) { console.error("MEDIA_SKIP is refused in CI."); process.exit(1); }
+  rmSync(path.join(root, "dist", ".media-marker.json"), { force: true }); // a new build must earn its own marker
   const { files, problems } = evaluate();
   // The build step records whether the media check REALLY passed, so a later deploy can tell a skipped build from a verified one.
   writeFileSync(statePath, JSON.stringify({ ok: problems.length === 0, skipped: skip && problems.length > 0, tree: manifest.totals.tree_sha256 || null, at: new Date().toISOString() }) + "\n");
@@ -112,8 +134,9 @@ function mark() {
   const dist = path.join(root, "dist");
   if (!existsSync(dist)) { console.error("mark: dist/ does not exist; run the build first."); process.exit(1); }
   const state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : null;
-  const ok = !!state && state.ok === true && state.tree === manifest.totals.tree_sha256;
-  writeFileSync(path.join(dist, ".media-marker.json"), JSON.stringify({ ok, tree: state?.tree || null, skipped: !!state?.skipped, builtAt: new Date().toISOString() }) + "\n");
+  const distOk = treeHashOf(distPublicEntries()) === treeHashOf(sourcePublicEntries());
+  const ok = !!state && state.ok === true && state.tree === manifest.totals.tree_sha256 && distOk;
+  writeFileSync(path.join(dist, ".media-marker.json"), JSON.stringify({ ok, tree: state?.tree || null, skipped: !!state?.skipped, distOk, builtAt: new Date().toISOString() }) + "\n");
   console.log(ok ? "media marker written: build verified media" : "media marker written: build did NOT verify media (deploy will be refused)");
 }
 // deploy gate: never honors MEDIA_SKIP; needs an ok marker in dist/ from a build that verified the media, plus a still-valid media tree.
@@ -122,12 +145,16 @@ function gate() {
   const markerPath = path.join(root, "dist", ".media-marker.json");
   if (!existsSync(markerPath)) why.push("dist/.media-marker.json is missing: the build did not run the media check (or dist/ is not from `npm run build`)");
   else {
-    const m = JSON.parse(readFileSync(markerPath, "utf8"));
+    let m = {};
+    try { m = JSON.parse(readFileSync(markerPath, "utf8")); } catch { why.push("dist/.media-marker.json is not valid JSON"); }
     if (m.ok !== true) why.push(`the build in dist/ did not verify media${m.skipped ? " (it was built with MEDIA_SKIP=1)" : ""}`);
     if (m.tree !== manifest.totals.tree_sha256) why.push("dist/ was built against a different media manifest");
   }
   const { problems } = evaluate();
   why.push(...problems);
+  const dist = distPublicEntries();
+  const src = sourcePublicEntries();
+  if (treeHashOf(dist) !== treeHashOf(src)) why.push(`dist/client holds ${dist.length} public media files but the verified source tree has ${src.length} (or their paths or sizes differ): this build output does not contain the media`);
   if (why.length) { console.error(`DEPLOY REFUSED:\n  ${why.join("\n  ")}\nRebuild with: npm run media:pull && npm run build`); process.exit(1); }
   console.log("deploy gate ok: dist/ was built with verified media");
 }

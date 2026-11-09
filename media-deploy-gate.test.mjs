@@ -1,5 +1,6 @@
 // Deploy gate for course media (N2, goodqa#15484). Run: node --test tests/media-deploy-gate.test.mjs
 // Scenario that used to ship a site with no media: build with MEDIA_SKIP=1, then restore media, then deploy without rebuilding.
+// The stand-in build copies public/ to dist/client like vinext does, so the tests can tell a dist with media from one without.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -33,7 +34,15 @@ function run(dir, cmd, env = {}) {
   if (!("MEDIA_SKIP" in env)) delete e.MEDIA_SKIP;
   return spawnSync("node", [path.join(dir, "scripts", "media-sync.mjs"), cmd], { cwd: dir, env: e, encoding: "utf8" });
 }
-const build = (dir, env) => { const v = run(dir, "verify", env); mkdirSync(path.join(dir, "dist"), { recursive: true }); const m = run(dir, "mark", env); return { v, m }; };
+// stand-in for `npm run build`: prebuild (verify), the build itself (public/ -> dist/client), postbuild (mark)
+function build(dir, env = {}) {
+  const v = run(dir, "verify", env);
+  rmSync(path.join(dir, "dist"), { recursive: true, force: true });
+  mkdirSync(path.join(dir, "dist", "client"), { recursive: true });
+  if (existsSync(path.join(dir, "public"))) cpSync(path.join(dir, "public"), path.join(dir, "dist", "client"), { recursive: true });
+  const m = run(dir, "mark", env);
+  return { v, m };
+}
 
 test("a MEDIA_SKIP build followed by media:pull is refused by the deploy gate", () => {
   const dir = makeRepo();
@@ -44,7 +53,45 @@ test("a MEDIA_SKIP build followed by media:pull is refused by the deploy gate", 
     assert.equal(run(dir, "verify").status, 0, "REGRESSION GUARD: verify alone passes here, so it cannot be the deploy gate");
     const g = run(dir, "gate", { MEDIA_SKIP: "1" });
     assert.equal(g.status, 1, g.stdout + g.stderr);
-    assert.match(g.stderr, /did not verify media|MEDIA_SKIP/);
+    assert.match(g.stderr, /did not verify media|MEDIA_SKIP|does not contain the media/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("F1: media:pull finishing between the build and postbuild cannot produce an ok marker on an empty dist", () => {
+  const dir = makeRepo();
+  try {
+    run(dir, "verify", { MEDIA_SKIP: "1" });                      // prebuild of a skip build: state = skipped
+    rmSync(path.join(dir, "dist"), { recursive: true, force: true });
+    mkdirSync(path.join(dir, "dist", "client"), { recursive: true }); // build output without media
+    putMedia(dir);
+    assert.equal(run(dir, "verify").status, 0);                    // media:pull's final verify rewrites the state to ok
+    run(dir, "mark");                                              // postbuild now sees ok state
+    const g = run(dir, "gate");
+    assert.equal(g.status, 1, g.stdout + g.stderr);
+    assert.match(g.stderr, /does not contain the media/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("F2: a stale ok marker does not let a later media-less dist through", () => {
+  const dir = makeRepo();
+  try {
+    putMedia(dir);
+    build(dir);                                                    // good build, ok marker
+    rmSync(path.join(dir, "dist", "client", "audio"), { recursive: true, force: true }); // dist rebuilt without media, postbuild never ran
+    const g = run(dir, "gate");
+    assert.equal(g.status, 1, g.stdout + g.stderr);
+    assert.match(g.stderr, /does not contain the media/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a new verify removes an old marker (a build must earn its own)", () => {
+  const dir = makeRepo();
+  try {
+    putMedia(dir);
+    build(dir);
+    assert.ok(existsSync(path.join(dir, "dist", ".media-marker.json")));
+    run(dir, "verify");
+    assert.ok(!existsSync(path.join(dir, "dist", ".media-marker.json")));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -52,7 +99,7 @@ test("a build with verified media passes the deploy gate", () => {
   const dir = makeRepo();
   try {
     putMedia(dir);
-    const { v, m } = build(dir, {});
+    const { v, m } = build(dir);
     assert.equal(v.status, 0); assert.equal(m.status, 0);
     const g = run(dir, "gate");
     assert.equal(g.status, 0, g.stdout + g.stderr);
@@ -63,10 +110,23 @@ test("deploy gate refuses when dist has no marker", () => {
   const dir = makeRepo();
   try {
     putMedia(dir);
-    mkdirSync(path.join(dir, "dist"));
+    mkdirSync(path.join(dir, "dist", "client"), { recursive: true });
     const g = run(dir, "gate");
     assert.equal(g.status, 1);
     assert.match(g.stderr, /media-marker.json is missing/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("deploy gate refuses a malformed marker with a clean message", () => {
+  const dir = makeRepo();
+  try {
+    putMedia(dir);
+    build(dir);
+    writeFileSync(path.join(dir, "dist", ".media-marker.json"), "{not json");
+    const g = run(dir, "gate");
+    assert.equal(g.status, 1);
+    assert.match(g.stderr, /not valid JSON/);
+    assert.doesNotMatch(g.stderr, /SyntaxError/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -74,7 +134,7 @@ test("deploy gate refuses when media is damaged after a verified build", () => {
   const dir = makeRepo();
   try {
     putMedia(dir);
-    build(dir, {});
+    build(dir);
     writeFileSync(path.join(dir, "public/audio/a.mp3"), ""); // truncated
     const g = run(dir, "gate");
     assert.equal(g.status, 1);
@@ -86,7 +146,7 @@ test("deploy gate refuses a dist built against a different manifest", () => {
   const dir = makeRepo();
   try {
     putMedia(dir);
-    build(dir, {});
+    build(dir);
     const mp = path.join(dir, "dist", ".media-marker.json");
     const m = JSON.parse(readFileSync(mp, "utf8")); m.tree = "0".repeat(64);
     writeFileSync(mp, JSON.stringify(m));
