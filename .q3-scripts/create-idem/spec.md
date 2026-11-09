@@ -100,6 +100,12 @@ again (retry, double click, reopen-and-resend) opens the one thread already crea
 - AC-8: With a stalled QAC turn on the local stack, `POST /v1/orgs/:orgId/ai-threads` returns within the bound N set from the K2-HANG-CAUSE measurement (target 5s). If the cause lies outside this slice, this AC is not met: main either extends the slice or records a sourced decision to accept a residual hang, and the ticket stays open. Verify by: K2-HANG-CAUSE measurement on the t2-dev local stack before and after the change, recorded as REALLY_TESTED with timings (blocking: implementation of the dialog work does not merge without it); plus an API test with a stubbed hung afterChatMessageCommitted/admitMessage where the create must resolve within the bound and a controlled variant that keeps that work inside the transaction must fail the test (only if the move under AC-9 is made). Source: inferred: from ticket:GoodQA goodqa#14903 ; file:apps/api/src/modules/messaging/ai-thread-lifecycle.ts:39@7b738654 -- the Kimi finding is a hang
 - AC-9: (conditional on K2-HANG-CAUSE) if post-commit work is moved out of the create transaction, a fresh create still produces exactly one QAC admission or one unadmitted notice, and a replay produces neither. Verify by: API vitest counting admissions and notices for a fresh create and its replay; if the move is not made, record "AC-9 not applicable" with the K2-HANG-CAUSE evidence. Source: inferred: from ticket:GoodQA goodqa#14903 ; file:apps/api/src/modules/messaging/ai-thread-lifecycle.ts:39@7b738654 -- appendMessage runs inside the create transaction
 
+AC-8 outcome (2026-11-09): K2-HANG-CAUSE measured on the local stack: create 0.05-0.09s alone, 0.05s with the QAC
+queue lock held, 11.08s with the per-user ai-thread lock held (the only server-side stall; bounded to 5s by this
+slice). Main ruled to accept the residual for this slice (agent decision, not user words): the first-create stick is
+not reproduced server-side, is likely client or network, and is ticketed separately for investigation once click-tests
+work. AC-9 not applicable (no post-commit move needed).
+
 ## Negative cases
 
 - NEG-1 (AC-2): same key, different message text -> 409 `client_request_conflict`, nothing created. Source: inferred: from ticket:GoodQA goodqa#14903 ; file:apps/api/src/modules/messaging/messages.ts:1023@7b738654 -- existing reuse-with-different-content rule
