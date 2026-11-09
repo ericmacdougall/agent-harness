@@ -27,7 +27,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 MAX_STOP_BLOCKS = 25  # hard backstop per problem signature, see the module docstring
-CAP_WAIT_MAX_AGE_S = 24 * 3600  # a cap_wait older than this no longer excuses a Stop
+TOTAL_STOP_BLOCKS = 100  # per-session backstop across every signature (a changing undisposed set gets a new counter each time)
+CAP_WAIT_MAX_AGE_S = 30 * 60  # a cap_wait older than this no longer excuses a Stop
 
 
 def state_path(session: str) -> Path:
@@ -43,7 +44,8 @@ def load_state(session: str) -> dict:
         return {}
 
 
-def save_state(session: str, state: dict) -> None:
+def save_state(session: str, state: dict) -> bool:
+    """True when the counter file was written. A False return means the backstop cannot count (read-only or full home)."""
     path = state_path(session)
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -52,8 +54,9 @@ def save_state(session: str, state: dict) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(state, fh)
         os.replace(tmp, path)
+        return True
     except OSError:
-        pass  # the gate still decides; only the bound counter is lost
+        return False
 
 
 def message(undisposed: list, rows: dict) -> str:
@@ -151,14 +154,19 @@ def cmd_stop(payload: dict, now: float | None = None) -> dict:
         return {"systemMessage": f"dropped-owner gate: {len(undisposed)} owner(s) undisposed, each with a successor request "
                                  "waiting on the owner cap (alert raised to main): " + ", ".join(undisposed)
                                  + ". Free a slot, then run `ah task succeed` for each, or dispose them."}
-    if count >= MAX_STOP_BLOCKS:  # valve 2: the hard backstop
-        ring_alert(session, undisposed, count)
-        return {"systemMessage": f"dropped-owner gate: yielded after {count} blocks with {len(undisposed)} owner(s) still "
-                                 "undisposed (high alert raised): " + ", ".join(undisposed) + ". " + text}
+    total = int(state.get("total_blocks") or 0)
+    if count >= MAX_STOP_BLOCKS or total >= TOTAL_STOP_BLOCKS:  # valve 2: the hard backstops (per signature, per session)
+        ring_alert(session, undisposed, max(count, total))
+        return {"systemMessage": f"dropped-owner gate: yielded after {max(count, total)} blocks with {len(undisposed)} "
+                                 "owner(s) still undisposed (high alert raised): " + ", ".join(undisposed) + ". " + text}
     state.setdefault("blocks", {})[sig] = count + 1
+    state["total_blocks"] = total + 1
     state["last"] = now or time.time()
-    save_state(session, state)
-    ask = (f"\nOr ask for a successor: `python3 {HERE / 'ah.py'} task succeed --agent <id> --session {session}` "
+    if not save_state(session, state):  # the counter cannot persist, so the backstop could never fire: fail open, loudly
+        ring_alert(session, undisposed, count)
+        return {"systemMessage": "dropped-owner gate: its counter file cannot be written (read-only or full home), so the "
+                                 "backstop cannot count; yielding with a high alert. " + ", ".join(undisposed) + ". " + text}
+    ask =(f"\nOr ask for a successor: `python3 {HERE / 'ah.py'} task succeed --agent <id> --session {session}` "
            "(cap-safe: a full owner cap records a wait, which lets this turn end).")
     return {"decision": "block", "reason": text + ask}
 
@@ -170,13 +178,20 @@ def cap_waits(session: str, undisposed: list, now: float | None = None) -> bool:
     try:
         import successor  # noqa: PLC0415
         home = Path(os.environ.get("AH_HOME") or Path.home())
+        if not successor.verify_log(home, session):  # a forged, edited or truncated log excuses nothing (red-team F4)
+            return False
         rows = successor.read_requests(home, session)
         stamp = now or time.time()
         for agent in undisposed:
-            request = successor.open_request(rows, agent)
+            request = successor.open_request(rows, agent, stamp)
             if not request or request.get("status") != "cap_wait" or stamp - float(request.get("at") or 0) > CAP_WAIT_MAX_AGE_S:
                 return False
-        return True
+        # the cap must STILL be full now: a slot that freed since the wait was recorded means a successor can be asked for
+        import model_tiers  # noqa: PLC0415
+        import tier_gate  # noqa: PLC0415
+        policy = model_tiers.load_policy()
+        cap = int((policy.get("caps") or {}).get("session_owner_agents") or 0)
+        return cap > 0 and len(tier_gate.live_owner_ids(session, policy)) >= cap
     except Exception:  # noqa: BLE001 - no successor module or an unreadable log: the valve stays shut
         return False
 
