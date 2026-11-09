@@ -44,7 +44,7 @@ function shell(state, reason) {
   document.getElementById('metric-initiatives').textContent = String(state.initiatives.length).padStart(2, '0');
   const attention = document.getElementById('metric-attention');
   attention.textContent = String(severeOwners + riskyInitiatives).padStart(2, '0');
-  attention.parentElement.title = `${riskyInitiatives} initiatives at risk or blocked · ${severeOwners} owners dropped or silent`;
+  attention.parentElement.title = `${riskyInitiatives} initiatives at risk or blocked · ${severeOwners} owners dropped or silent with no recorded hold`;
   document.getElementById('workspace-host').textContent = (state.host || 'local').toUpperCase();
   filters.querySelectorAll('button').forEach(chip => chip.setAttribute('aria-pressed', String(chip.dataset.kind === 'all' ? state.filters.length === Object.keys(KINDS).length : state.filters.includes(chip.dataset.kind))));
   document.body.classList.toggle('motion-off', !state.motion);
@@ -94,6 +94,9 @@ function renderInspector(state) {
       field('Last work item', owner.last_item.note), field('Work item kind', owner.last_item.event || '—'),
       field('Work item written', owner.last_item.at ? `${age(owner.last_item.at, state.now)} · ${new Date(owner.last_item.at).toLocaleString()}` : '—'),
       field('Last active', owner.last_item.active ? `${age(owner.last_item.active, state.now)} · ${new Date(owner.last_item.active).toLocaleString()}` : '—'));
+    if (owner.disposition) fields.append(field('Recorded disposition', [owner.disposition.kind, owner.disposition.reason || owner.disposition.ref,
+      owner.disposition.until ? `until ${new Date(owner.disposition.until).toLocaleString()}` : '', owner.disposition.live ? 'in force' : 'expired'].filter(Boolean).join(' · ')));
+    if (owner.waitNote) fields.append(field('Agent says', owner.waitNote));
     content.append(fields);
     if (owner.initiative_id) content.append(button('detail-action', 'Open linked initiative ↗', () => select('initiative', owner.initiative_id)));
   } else if (kind === 'event') {

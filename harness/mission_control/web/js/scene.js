@@ -26,7 +26,7 @@ function layout(state) {
     nodes.push({ id: item.id, kind: 'initiative', name: item.initiative, short: shortName(item.initiative), item,
       pos: [Math.cos(a) * r, (i % 2 ? .35 : -.15) + Math.sin(i * 1.3) * .12, Math.sin(a) * r * .82] });
   });
-  const shown = state.owners.filter(o => o.state === 'live' || o.severe).slice(0, MAX_OWNERS);
+  const shown = state.owners.filter(o => o.state === 'live' || o.severe || o.held).slice(0, MAX_OWNERS);
   shown.forEach((owner, i) => {
     const parent = nodes.find(node => node.id === owner.initiative_id) || nodes[0];
     const a = i * 1.7;

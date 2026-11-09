@@ -40,6 +40,25 @@ test('owners link to initiatives by id prefix or ticket and flag DROPPED/SILENT'
   assert.equal(rows[2].last_item.active, null);
 });
 
+test('a DROPPED owner keeps its ah state but a disposition in force or its own waiting note holds it', () => {
+  const [held] = adapt.owners([{ agent_id: 'aaef3bc78b40', state: 'DROPPED', disposition: { kind: 'waiting', reason: 'waiting on its own background work', live: true, until: '2026-11-10T00:00:00Z', evidence: 'x' } }]);
+  assert.equal(held.state, 'DROPPED');
+  assert.equal(held.severe, false);
+  assert.equal(held.held, true);
+  assert.equal(held.disposition.kind, 'waiting');
+  assert.equal('evidence' in held.disposition, false);
+  const [noted] = adapt.owners([{ agent_id: 'abc1234', state: 'SILENT', last_item: { note: 'monitor wait for bbae6857 regression run' } }]);
+  assert.equal(noted.held, true);
+  assert.match(noted.waitNote, /monitor wait/);
+  const [expired] = adapt.owners([{ agent_id: 'abc1235', state: 'DROPPED', disposition: { kind: 'waiting', live: false } }]);
+  assert.equal(expired.severe, true, 'an expired disposition does not hold the alarm');
+  const [bogus] = adapt.owners([{ agent_id: 'abc1236', state: 'DROPPED', disposition: { kind: 'all-clear', live: true } }]);
+  assert.equal(bogus.severe, true, 'an unknown disposition kind is ignored');
+  const [live] = adapt.owners([{ agent_id: 'abc1237', state: 'live', last_item: { note: 'waiting on CI' } }]);
+  assert.equal(live.held, false);
+  assert.equal(live.waitNote, '');
+});
+
 test('owner activity age uses the newest of work item, tool activity and registry time', () => {
   const [row] = adapt.owners([{ agent_id: 'a1', state: 'live', last_activity: '2026-11-09T22:01:00Z',
     last_item: { at: '2026-11-09T22:00:00Z', active_at: '2026-11-09T22:09:00Z', event: 'intent', note: 'wire SSE' } }]);

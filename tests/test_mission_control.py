@@ -204,14 +204,16 @@ class WalTail(Tmp):
         self.tailer.run(time.time())
         self.append(path, {"at": "2026-11-09T22:05:00Z", "event": "pretool", "tool": "Bash"},
                     {"at": "2026-11-09T22:06:00Z", "event": "subagent", "agent_id": "a22e3925b2329ce4d",
-                     "agent_type": "red-team"})
+                     "agent_type": "red-team"},
+                    {"at": "2026-11-09T22:07:00Z", "event": "pending_stop", "by": "dropped_gate",
+                     "note": "stopped with pending work and no armed waiter"})
         self.tailer.run(time.time())
         last = self.tailer.last_for("claude", "sess1", "q")
-        self.assertEqual(last["note"], "wire the SSE stream", "tool calls never replace the last work item")
-        self.assertEqual(last["active_at"], "2026-11-09T22:06:00Z")
+        self.assertEqual(last["note"], "wire the SSE stream", "tool calls and gate notes never replace the work item")
+        self.assertEqual(last["active_at"], "2026-11-09T22:07:00Z")
         events = self.hub.recent()
         self.assertFalse(events[0].get("quiet"))
-        self.assertEqual([e.get("quiet") for e in events[1:]], [True, True])
+        self.assertEqual([e.get("quiet") for e in events[1:]], [True, True, True])
         self.assertIn("started red-team a22e3925", [e["summary"] for e in events])
 
     def test_symlinked_wal_is_not_followed(self):
@@ -303,6 +305,41 @@ class TicketPoll(Tmp):
     def test_at_most_twelve_tickets(self):
         poll = col.Tickets(self.hub, self.health, FakeRunner(), lambda: [f"goodqa#{n}" for n in range(1, 40)])
         self.assertEqual(len(poll.tracked()), 12)
+
+
+class OwnersPoll(Tmp):
+    def rows(self, state="DROPPED"):
+        return {"session": "sess1", "owners": [
+            {"agent_id": "aaef3bc7aaaa", "state": state, "task": "build tokens", "ticket": "goodqa#15561", "idle_s": 600,
+             "disposition": {"kind": "waiting", "ref": "GoodQA goodqa#15561", "reason": "waiting on its own background work",
+                             "until": 1794787200.0, "live": True, "evidence": "secret-ish " + GH_TOKEN}},
+            {"agent_id": "abbbbbbb", "state": "returned", "idle_s": 7 * 3600},
+            {"agent_id": "acccccc; rm", "state": "live", "idle_s": 5},
+            {"agent_id": "acccccc", "state": "live", "idle_s": 5},
+        ]}
+
+    def test_rows_keep_state_and_disposition_and_drop_old_terminal_helpers(self):
+        data = self.rows()
+        runner = FakeRunner({"ah-owners": lambda: (0, json.dumps(data))})
+        wals = self.base / "w"
+        (wals / "sess1").mkdir(parents=True)
+        (wals / "sess1" / "agent-aaef3bc7aaaa.jsonl").write_text(json.dumps({"at": "t", "event": "intent", "note": "polling CI"}) + "\n")
+        tailer = col.WalTailer(self.hub, self.health, safeio.Reader([wals]), [(wals, "claude")])
+        tailer.run(time.time())
+        owners = col.Owners(self.hub, self.health, runner, tailer)
+        owners.run(time.time())
+        ids = [r["agent_id"] for r in owners.rows]
+        self.assertEqual(ids, ["acccccc", "aaef3bc7aaaa"], "old terminal rows and malformed ids are dropped")
+        row = owners.rows[1]
+        self.assertEqual(row["state"], "DROPPED", "the page shows what ah owners says")
+        self.assertEqual(row["disposition"]["kind"], "waiting")
+        self.assertIn("own background work", row["disposition"]["reason"])
+        self.assertNotIn("evidence", row["disposition"])
+        self.assertEqual(row["last_item"]["note"], "polling CI")
+        data["owners"][0]["state"] = "live"
+        owners.run(time.time() + 61)
+        change = [e for e in self.hub.recent() if e["kind"] == "owner"]
+        self.assertEqual(change[-1]["summary"], "aaef3bc7aaaa DROPPED → live")
 
 
 class Schema(unittest.TestCase):

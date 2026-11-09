@@ -15,7 +15,7 @@ from safeio import Refused, TICKET_RE
 
 TOOL_EVENTS = ("pretool", "posttool", "PreToolUse", "PostToolUse")
 LIFECYCLE_EVENTS = ("subagent", "subagent_stop", "SubagentStart", "SubagentStop", "prompt", "UserPromptSubmit", "session",
-                    "SessionStart", "stop", "Stop", "compact", "PreCompact")
+                    "SessionStart", "stop", "Stop", "compact", "PreCompact", "pending_stop")
 DEPLOY_RE = re.compile(r"\bDEPLOYED\b|\bdeployed to (?:live|prod)|\blive deploy\b|\bdeploy(?:ed)? (?:live|to production)\b",
                        re.I)
 TERMINAL = ("done", "handoff", "returned", "idle-helper", "unverified-legacy", "superseded", "wontdo", "legacy")
@@ -280,8 +280,20 @@ def _json(raw: bytes):
     return value if isinstance(value, dict) else None
 
 
+def _disposition(value) -> dict | None:
+    """The recorded decision for a DROPPED/SILENT owner (waiting, resumed, closed, reassigned), shown beside the state."""
+    if not isinstance(value, dict) or not isinstance(value.get("kind"), str):
+        return None
+    until = value.get("until") if isinstance(value.get("until"), (int, float)) else None
+    return {"kind": re.sub(r"[^a-z_-]", "", value["kind"].lower())[:20],
+            "ref": ev.short(str(value.get("ref") or ""), 60), "reason": ev.short(str(value.get("reason") or ""), 200),
+            "until": ev.iso(until) if until else None, "live": value.get("live") is True}
+
+
 def _meaningful(entry: dict) -> bool:
-    """A work item worth a feed row: a WAL note the agent wrote, not a hook's lifecycle or tool record."""
+    """A work item worth a feed row: a WAL note the agent wrote, not a hook's lifecycle, gate or tool record."""
+    if entry.get("by"):  # written by a gate (dropped_gate pending_stop), not by the agent itself
+        return False
     kind = str(entry.get("event", ""))
     if kind in TOOL_EVENTS or kind in LIFECYCLE_EVENTS:
         return False
@@ -297,6 +309,8 @@ def _lifecycle_summary(entry: dict, kind: str, note: str) -> str:
         return f"{role or 'agent'} {agent} stopped".strip()
     if kind in ("prompt", "UserPromptSubmit"):
         return "new prompt"
+    if kind == "pending_stop":
+        return "stop gate: pending work, no armed waiter"
     return f"{kind}: {note}" if note else kind
 
 
@@ -432,15 +446,16 @@ class Owners(Collector):
             idle = row.get("idle_s") if isinstance(row.get("idle_s"), (int, float)) else None
             if state in TERMINAL and (idle is None or idle > 6 * 3600):
                 continue
-            agent = re.sub(r"[^A-Za-z0-9_-]", "", str(row.get("agent_id") or ""))[:40]
-            if not agent:
-                continue
+            agent = str(row.get("agent_id") or "")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", agent):
+                continue  # a malformed id is dropped, never rewritten into a different-looking one
             ticket = str(row.get("ticket") or "")
             item = {"agent_id": agent, "runtime": "claude", "type": str(row.get("type") or "")[:40],
                     "task": ev.short(row.get("task") or "", 160), "ticket": ticket if TICKET_RE.match(ticket) else "",
                     "state": state[:24], "severity": str(row.get("severity") or "info")[:8],
                     "last_activity": str(row.get("last_activity") or "")[:40], "idle_s": idle,
-                    "last_item": self.tailer.last_for("claude", self.session, agent) if self.tailer else None}
+                    "last_item": self.tailer.last_for("claude", self.session, agent) if self.tailer else None,
+                    "disposition": _disposition(row.get("disposition"))}
             rows.append(item)
             previous = self.states.get(agent)
             if previous and previous != state:

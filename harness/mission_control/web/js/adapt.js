@@ -35,6 +35,19 @@ export function ownerKey(text) {
   return match ? match[1].toLowerCase() : null;
 }
 
+const DISPOSITION_KINDS = ['waiting', 'resumed', 'reassigned', 'closed', 'legacy', 'superseded', 'wontdo'];
+const WAIT_NOTE = /\b(?:waiting (?:on|for)|monitor wait|own background (?:work|job|task|run)s?|background (?:job|task|run|work) (?:running|in flight|pending))\b/i;
+// ah owners decides the state; the page never rewrites it. A DROPPED/SILENT owner with a recorded disposition that is still
+// in force, or whose own last note says it is waiting, is shown as held: the label stays, the red alarm does not.
+export function ownerHold(r, last) {
+  const d = r && r.disposition && typeof r.disposition === 'object' && DISPOSITION_KINDS.includes(r.disposition.kind) ? r.disposition : null;
+  const disposition = d ? { kind: d.kind, ref: str(d.ref, 60), reason: str(d.reason, 200), until: validIso(d.until) || null, live: d.live === true } : null;
+  const note = str(last?.note, 200);
+  const waitNote = SEVERE(r?.state) && WAIT_NOTE.test(note) ? note : '';
+  const held = SEVERE(r?.state) && (Boolean(disposition?.live) || Boolean(waitNote));
+  return { severe: SEVERE(r?.state) && !held, held, disposition, waitNote };
+}
+
 export function owners(rows, items = []) {
   if (!Array.isArray(rows)) return [];
   return rows.filter(r => r && typeof r === 'object' && r.agent_id).map(r => {
@@ -46,7 +59,7 @@ export function owners(rows, items = []) {
     return {
       agent_id: id, name: r.runtime === 'codex' ? `codex ${shortId(id)}` : shortId(id), runtime: r.runtime === 'codex' ? 'codex' : 'claude',
       type: str(r.type, 40), task: str(r.task, 200) || (r.runtime === 'codex' ? 'Codex session' : 'Owner'), ticket: str(r.ticket, 60),
-      state: str(r.state, 24) || 'unknown', severe: SEVERE(r.state),
+      state: str(r.state, 24) || 'unknown', ...ownerHold(r, last),
       last_item: { at, active, event: str(last?.event, 40), note: str(last?.note, 200) || 'No work item recorded yet' },
       initiative_id: linked ? linked.id : null,
     };

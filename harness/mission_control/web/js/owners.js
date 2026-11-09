@@ -1,6 +1,18 @@
 import { getState, subscribe, select, update, highlight } from './store.js';
 import { el, button, age, freshness, stateClass } from './ui.js';
 
+const ACTIVE = /^(live|working|finishing|waiting-on-)/;
+
+// What the owner itself or a recorded disposition says, beside the ah owners state (never instead of it).
+export function holdLine(owner) {
+  if (!owner.held) return '';
+  if (owner.disposition?.live) {
+    const why = owner.disposition.reason || owner.disposition.ref;
+    return `Recorded ${owner.disposition.kind}${why ? `: ${why}` : ''}`;
+  }
+  return owner.waitNote ? `Agent says: ${owner.waitNote}` : '';
+}
+
 export function mountOwners() {
   const list = document.getElementById('owners-list');
   const rows = new Map();
@@ -8,7 +20,10 @@ export function mountOwners() {
   function render(state) {
     const severe = owner => owner.severe;
     const rank = owner => owner.severe ? 0 : owner.state === 'live' ? 1 : owner.runtime === 'codex' ? 3 : 2;
-    const owners = state.owners.filter(owner => state.ownerFilter === 'all' || owner.state.startsWith(state.ownerFilter) || (state.ownerFilter === 'codex' && owner.runtime === 'codex'))
+    const active = owner => owner.severe || owner.held || ACTIVE.test(owner.state);
+    const matches = owner => state.ownerFilter === 'all' || (state.ownerFilter === 'active' ? active(owner)
+      : owner.state.startsWith(state.ownerFilter) || (state.ownerFilter === 'codex' && owner.runtime === 'codex'));
+    const owners = state.owners.filter(matches)
       .sort((a, b) => rank(a) - rank(b) || Date.parse(b.last_item.active || 0) - Date.parse(a.last_item.active || 0)).slice(0, 80);
     const wanted = new Set(owners.map(owner => owner.agent_id));
     for (const [id, parts] of rows) if (!wanted.has(id)) { parts.row.remove(); rows.delete(id); }
@@ -30,28 +45,35 @@ export function mountOwners() {
         nameRow.append(name, runtime, status);
         const task = el('div', 'owner-task', owner.task), last = el('div', 'owner-last');
         const note = el('span', 'owner-last-note'), time = el('time', 'owner-age');
-        last.append(note, time); info.append(nameRow, task, last); row.append(avatar, info);
-        parts = { row, status, task, note, time, runtime, avatar };
+        const hold = el('div', 'owner-hold');
+        last.append(note, time); info.append(nameRow, task, hold, last); row.append(avatar, info);
+        parts = { row, status, task, note, time, runtime, avatar, hold };
         rows.set(owner.agent_id, parts);
         list.insertBefore(row, list.children[index] || null);
       }
       if (list.children[index] !== parts.row) list.insertBefore(parts.row, list.children[index] || null);
       parts.row.classList.toggle('owner-severe', severe(owner));
+      parts.row.classList.toggle('owner-held', owner.held);
+      const holdText = holdLine(owner);
+      parts.hold.textContent = holdText;
+      parts.hold.hidden = !holdText;
       parts.runtime.textContent = owner.runtime === 'claude' ? 'Claude' : 'Codex';
       parts.avatar.className = `runtime-avatar ${owner.runtime}`;
       parts.avatar.textContent = owner.runtime === 'claude' ? '✳' : '◇';
-      parts.status.textContent = severe(owner) ? `! ${owner.state}` : `${owner.state === 'live' ? '• ' : ''}${owner.state}`;
-      parts.status.className = `owner-state ${stateClass(owner.state)}`;
+      parts.status.textContent = severe(owner) ? `! ${owner.state}` : owner.held ? `${owner.state} · ${owner.disposition?.live ? owner.disposition.kind : 'waiting'}` : `${owner.state === 'live' ? '• ' : ''}${owner.state}`;
+      parts.status.className = `owner-state ${owner.held ? 'held' : stateClass(owner.state)}`;
       parts.task.textContent = owner.task;
       parts.note.textContent = owner.last_item.note;
       parts.time.dateTime = owner.last_item.active || '';
       parts.time.title = owner.last_item.at ? `Work item written ${new Date(owner.last_item.at).toLocaleString()}` : 'No work item yet';
       parts.time.textContent = age(owner.last_item.active, state.now);
       parts.time.className = `owner-age ${freshness(owner.last_item.active, state.now)}`;
-      parts.row.setAttribute('aria-label', `${owner.name}, ${owner.runtime}, ${owner.state}. ${owner.task}. Last work item: ${owner.last_item.note}. Last active ${age(owner.last_item.active, state.now)}. Open details.`);
+      parts.row.setAttribute('aria-label', `${owner.name}, ${owner.runtime}, ${owner.state}. ${owner.task}. ${holdText ? `${holdText}. ` : ''}Last work item: ${owner.last_item.note}. Last active ${age(owner.last_item.active, state.now)}. Open details.`);
     });
     if (!owners.length) list.append(el('p', 'empty-state', state.owners.length ? 'No owners in this state.' : 'Waiting for the owner list…'));
-    document.getElementById('owner-count').textContent = String(state.owners.length).padStart(2, '0');
+    const count = document.getElementById('owner-count');
+    count.textContent = String(owners.length).padStart(2, '0');
+    count.title = `${owners.length} shown of ${state.owners.length} owners`;
   }
   render(getState());
   subscribe((state, reason) => {
