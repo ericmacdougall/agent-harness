@@ -48,11 +48,21 @@ class FakeProbe:
     """Process facts from a dict. Never touches a real process."""
 
     def __init__(self, procs):
-        self.procs = {os.getpid(): proc(HOOK_SH, 'self', comm='python3', argv=['python3', 'kill_guard.py']),
-                      HOOK_SH: proc(CLAUDE, 'hs', comm='sh', argv=['sh', '-c', 'x']),
+        # As measured live: a hook is a direct child of claude with fd 1 and fd 2 on two socketpairs claude holds;
+        # every tool shell (HOOK_SH here stands for one) holds one more socketpair to claude.
+        self.procs = {os.getpid(): proc(CLAUDE, 'self', comm='python3', argv=['python3', 'kill_guard.py']),
+                      HOOK_SH: proc(CLAUDE, 'hs', comm='zsh', argv=['/bin/zsh', '-c', 'x'], fds=[TASKFILE + '.mine']),
                       CLAUDE: proc(1, 'cl', comm='claude', argv=['claude'])}
         self.procs.update(procs)
         self.start_reads = {}
+        self.stdio = {os.getpid(): {1: ('0xa1', '0xb1'), 2: ('0xa2', '0xb2')}}
+        self.sockets = {CLAUDE: {'0xb1': '0xa1', '0xb2': '0xa2', '0xd11': '0xc11'}, HOOK_SH: {'0xc11': '0xd11'}}
+
+    def stdio_sockets(self, pid):
+        return dict(self.stdio.get(pid, {}))
+
+    def unix_sockets(self, pid):
+        return dict(self.sockets.get(pid, {}))
 
     def _get(self, pid, key):
         entry = self.procs.get(pid)
@@ -153,6 +163,12 @@ class GroupLedger(Base):
         del world[RCLONE]
         kg.append_ledger(self.root, SHELL, 'S-start', home=self.home, kind='group')
         self.assertEqual(self.own(FakeProbe(world)).check(ORPHAN)[:2], (True, 'ledger-group'))
+
+    def test_live_root_with_unreadable_start_owns_nothing(self):
+        # S still runs (its uid is readable) but its start time cannot be read: not proof that S is gone
+        probe = FakeProbe(rclone_world(start=None))
+        kg.append_ledger(self.root, SHELL, 'S-start', home=self.home, kind='group')
+        self.assertFalse(self.own(probe).check(ORPHAN)[0])
 
     def test_other_worktree_is_refused(self):
         probe = FakeProbe(rclone_world())
@@ -292,13 +308,45 @@ class RecordBg(Base):
         self.assertNothing(self.record(FakeProbe(rclone_world(sid=CLAUDE))), 'unproven')
 
     def test_run_by_hand_from_a_tool_call_records_nothing(self):
-        # an agent running `kill_guard.py record-bg` itself, possibly with another agent's task id: its own shell
-        # (between this process and the session process) writes to a tasks/*.output file
-        for holder in (HOOK_SH, os.getpid()):
-            with self.subTest(holder=holder):
-                probe = FakeProbe(rclone_world())
-                probe.procs[holder]['fds'] = ['/s/claude-501/proj/sess/tasks/mine.output']
-                self.assertNothing(self.record(probe), 'from-tool-call')
+        # red-team F1: an agent running record-bg itself, naming another agent's task id
+        probe = FakeProbe(rclone_world())
+        probe.procs[os.getpid()]['ppid'] = HOOK_SH          # plain: a child of its tool shell
+        probe.stdio[os.getpid()] = {}
+        self.assertNothing(self.record(probe), 'not-hook')
+
+    def test_redirected_tool_shell_records_nothing(self):
+        # `exec >/dev/null 2>&1; python3 kill_guard.py record-bg`: no fd on a tasks file any more, still a child of
+        # the tool shell
+        probe = FakeProbe(rclone_world())
+        probe.procs[os.getpid()]['ppid'] = HOOK_SH
+        probe.procs[HOOK_SH]['fds'] = ['/dev/null']
+        self.assertNothing(self.record(probe), 'not-hook')
+
+    def test_exec_in_place_of_the_tool_shell_records_nothing(self):
+        # `exec python3 kill_guard.py record-bg >/dev/null 2>&1 <payload`: a direct child of claude, output on files
+        probe = FakeProbe(rclone_world())
+        probe.stdio[os.getpid()] = {}
+        self.assertNothing(self.record(probe), 'not-hook')
+        # `exec 1>&11 2>&11` first: both fds are the tool shell's one socketpair to claude
+        probe.stdio[os.getpid()] = {1: ('0xc11', '0xd11'), 2: ('0xc11', '0xd11')}
+        self.assertNothing(self.record(probe), 'not-hook')
+        # one claude socket and one socket of its own making
+        probe.stdio[os.getpid()] = {1: ('0xc11', '0xd11'), 2: ('0xe1', '0xe2')}
+        self.assertNothing(self.record(probe), 'not-hook')
+
+    def test_sockets_paired_with_another_process_record_nothing(self):
+        probe = FakeProbe(rclone_world())
+        probe.sockets[CLAUDE] = {'0xb1': '0xa1'}
+        probe.sockets[4242] = {'0xb2': '0xa2'}
+        self.assertNothing(self.record(probe), 'not-hook')
+        probe = FakeProbe(rclone_world())
+        probe.sockets[CLAUDE] = {'0xb1': '0xa1', '0xb2': '/tmp/listening.sock'}  # not the pair's other end
+        self.assertNothing(self.record(probe), 'not-hook')
+
+    def test_no_socket_data_records_nothing(self):
+        probe = FakeProbe(rclone_world())
+        probe.stdio, probe.sockets = {}, {}  # Linux today, or lsof unreadable
+        self.assertNothing(self.record(probe), 'not-hook')
 
     def test_shell_of_another_user(self):
         self.assertNothing(self.record(FakeProbe(rclone_world(uid=ME + 1))), 'no-shell')

@@ -276,12 +276,16 @@ def _launch_locked(args, argv, directory):
                "--nonce", nonce, "--"] + argv
     proc = subprocess.Popen(wrapper, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             start_new_session=True, close_fds=True)
-    record_in_kill_ledger(proc.pid)
     try:
         atomic_write_json(os.path.join(directory, args.name + ".json"),
                           {"name": args.name, "pid": proc.pid, "nonce": nonce, "start": time.time(), "log": log,
                            "status": status, "argv_sha256": argv_hash(argv), "argv": argv, "deadline": args.deadline})
-        return supervise(args, proc, nonce, log, status, argv, before)
+        code = supervise(args, proc, nonce, log, status, argv, before)
+        if code == EXIT_OK:
+            # after the evidence window, so a slow git lookup never sits between start and proof; the wrapper is
+            # still our unreaped child, so its pid cannot have been reused yet
+            record_in_kill_ledger(proc.pid)
+        return code
     except BaseException as exc:  # never leave a started job without a record or an owner
         proc.poll()
         stop_group(proc.pid, nonce, own=True)

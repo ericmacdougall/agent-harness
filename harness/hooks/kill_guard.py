@@ -733,6 +733,32 @@ class Probe:
                 table[pid] = (ppid, pgid, uid)
         return table
 
+    def _unix_fds(self, pid, fds=None):
+        """[(fd, own address, peer address or '')] for the unix sockets of pid (macOS lsof); [] on Linux or error."""
+        if self.proc:
+            return []
+        argv = ['lsof', '-n', '-P', '-a', '-p', str(int(pid))] + (['-d', fds] if fds else []) + ['-F', 'ftdn']
+        out = _run(argv, timeout=5.0, any_status=True)
+        rows, cur = [], {}
+        for line in (out or '').splitlines():
+            tag, value = line[:1], line[1:]
+            if tag == 'f':
+                cur = {'f': value}
+            elif tag in ('t', 'd'):
+                cur[tag] = value
+            elif tag == 'n' and cur.get('t') == 'unix' and cur.get('d', '').startswith('0x'):
+                peer = value[2:] if value.startswith('->0x') else ''
+                rows.append((cur['f'], cur['d'], peer))
+        return rows
+
+    def stdio_sockets(self, pid):
+        """{1: (own, peer), 2: (own, peer)} for whichever of fd 1 and fd 2 are unix sockets."""
+        return {int(f): (own, peer) for f, own, peer in self._unix_fds(pid, '1,2') if f in ('1', '2')}
+
+    def unix_sockets(self, pid):
+        """{own address: peer address} for every unix socket pid holds."""
+        return {own: peer for _f, own, peer in self._unix_fds(pid)}
+
     def fd_paths(self, pids):
         """{pid: {path of fd 1, path of fd 2}} for the given pids (missing pids are left out)."""
         pids = [int(p) for p in pids][:256]
@@ -2094,14 +2120,16 @@ TASK_ID = re.compile(r'[A-Za-z0-9_-]{1,64}')
 RECORD_MAX_STDIN = 1 << 20
 
 
-def _hook_ancestors(probe):
-    chain, pid = [], os.getpid()
-    for _ in range(64):
-        pid = probe.ppid(pid)
-        if pid is None or pid <= 1 or pid in chain:
-            break
-        chain.append(pid)
-    return chain
+def stdio_bound_to(probe, pid, parent):
+    """True when fd 1 and fd 2 of pid are two DIFFERENT unix sockets, each paired with a socket that `parent` holds and
+    whose own peer is that fd (an unnamed pair, not a connection accepted on a named listening socket). Unknown or
+    unreadable facts are False. Linux is not supported yet (no peer data without sock_diag), so it is False there."""
+    mine = probe.stdio_sockets(pid) or {}
+    one, two = mine.get(1), mine.get(2)
+    if not one or not two or one[0] == two[0]:
+        return False
+    held = probe.unix_sockets(parent) or {}
+    return all(peer and held.get(peer) == own for own, peer in (one, two))
 
 
 def record_bg(payload, home=None, probe=None, runner=None):
@@ -2111,7 +2139,9 @@ def record_bg(payload, home=None, probe=None, runner=None):
     Claude Code gives a PostToolUse hook no pid, only tool_response.backgroundTaskId, and runs the call in a shell S
     that it starts as a session and process-group leader with stdout and stderr on .../tasks/<id>.output. S is
     recorded only when ALL of these hold, read from the live process table:
-      * S is a direct child of one of this hook's own ancestors (the session process that ran the tool call);
+      * this recorder is a hook Claude Code started: a direct child of the session process whose fd 1 and fd 2 are
+        two distinct unix sockets paired with sockets that the session process holds (stdio_bound_to);
+      * S is a direct child of that same session process;
       * S leads its own process group and session (so nothing outside S can join its group) and is the caller's uid;
       * fd 1 or 2 of S is a file named exactly <backgroundTaskId>.output in a directory named tasks;
       * exactly one process qualifies, and S's start time is the same before and after the checks.
@@ -2130,32 +2160,29 @@ def record_bg(payload, home=None, probe=None, runner=None):
     if not root:
         return None, 'no-worktree'
     probe = probe or Probe()
-    ancestors = _hook_ancestors(probe)
     me = os.getpid()
+    parent = probe.ppid(me)
+    # Bind the recorder to Claude Code itself (red-team F1). Measured on macOS 2026-11-09: Claude Code starts each hook
+    # as a direct child of the session process, in a new session of its own, with fd 1 and fd 2 on two distinct unix
+    # socketpairs whose other ends the session process holds. A tool shell is also a direct child, but its fd 1/2 are
+    # the tasks file and it holds only ONE socketpair to the session process (fd 11), so a process born inside a tool
+    # call, even one that execs this recorder in place of the tool shell after `exec 1>&11 2>&11`, fails here.
+    if parent is None or parent <= 1 or not stdio_bound_to(probe, me, parent):
+        return None, 'not-hook'
     candidates = [pid for pid, (ppid, pgid, uid) in probe.table().items()
-                  if ppid in ancestors and pgid == pid and uid == os.getuid() and pid != me and pid not in ancestors]
-    def task_file(path, name=None):
-        return isinstance(path, str) and os.path.basename(os.path.dirname(path)) == 'tasks' and (
-            os.path.basename(path) == name if name else path.endswith('.output'))
-
+                  if ppid == parent and pgid == pid and uid == os.getuid() and pid != me]
     wanted = task + '.output'
-    matches = [pid for pid, paths in probe.fd_paths(candidates).items()
-               if pid in candidates and any(task_file(p, wanted) for p in paths)]
+    matches = [pid for pid, paths in probe.fd_paths(candidates).items() if pid in candidates and any(
+        isinstance(p, str) and os.path.basename(p) == wanted and os.path.basename(os.path.dirname(p)) == 'tasks'
+        for p in paths)]
     if not matches:
         return None, 'no-shell'
     if len(matches) > 1:
         return None, 'ambiguous'
     shell = matches[0]
-    # Claude Code runs this hook with its output on a pipe. If this process or an ancestor below the session process
-    # writes to a tasks/*.output file, it was started from inside a Bash tool call (an agent running record-bg by
-    # hand, possibly naming another agent's task id): record nothing.
-    parent = probe.ppid(shell)
-    below = [me] + (ancestors[:ancestors.index(parent)] if parent in ancestors else ancestors)
-    if any(task_file(p) for paths in probe.fd_paths(below).values() for p in paths):
-        return None, 'from-tool-call'
     first = probe.start(shell)
     if first is None or probe.sid(shell) != shell or probe.pgid(shell) != shell or probe.uid(shell) != os.getuid() \
-            or probe.ppid(shell) not in ancestors or probe.start(shell) != first:
+            or probe.ppid(shell) != parent or probe.start(shell) != first:
         return None, 'unproven'
     append_ledger(root, shell, first, home, kind='group')
     return shell, 'recorded'
