@@ -765,7 +765,10 @@ def wal_entry(path: Path, entry: str):
     if entry.startswith("L") and entry[1:].isdigit():
         number = int(entry[1:])
         try:
-            for index, line in safe_input.iter_jsonl_lines(path, MAX_LINE, max_seconds=SCAN_SECONDS):
+            # the same bounds as the id form (load_record): line size, total bytes, scan time, and the file's own folder
+            # as the root, so a swap to a symlink or a non-regular file after resolve_wal_path is still refused
+            for index, line in safe_input.iter_jsonl_lines(path, MAX_LINE, max_total_bytes=MAX_SCAN_BYTES,
+                                                           max_seconds=SCAN_SECONDS, allowed_roots=[str(path.parent)]):
                 if index == number:
                     return "malformed" if line is None else loads_line(line)
                 if index > number:

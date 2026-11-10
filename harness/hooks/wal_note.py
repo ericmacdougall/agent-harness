@@ -17,7 +17,7 @@ EVENTS = {'intent', 'scope', 'decision', 'risk', 'check', 'commit', 'blocker', '
           'requirement', 'ask', 'ask_resolved'}
 # Events whose origin must be traceable (provenance.py). The mode per event is in provenance_policy.json.
 SOURCED = ('requirement', 'ask', 'blocker', 'scope', 'decision')
-TOOL_WRITERS = frozenset({'escalation', 'ahd', 'dropped_gate', 'ah-run'})  # rows these tools write on an agent's behalf (goodqa#14791)
+TOOL_WRITERS = frozenset({'escalation', 'ahd', 'dropped_gate', 'ah-run', 'ask-sweep'})  # rows these tools write on an agent's behalf (goodqa#14791)
 # provenance.py problem codes that mean the caller wrote a source that can never resolve: refused outright, nothing
 # written (goodqa#14927). Transient or environmental codes (scan-timeout, transcript-malformed, wal-missing,
 # file-unreadable, internal ...) keep the warn-mode quarantine path so a busy host does not drop a note.
@@ -73,6 +73,36 @@ def provenance_check(event, source):
         return mode, None, result['assumption']
     except Exception as error:
         return 'enforce' if event in ('requirement', 'ask') else 'warn', f'provenance check failed ({type(error).__name__})', False
+
+
+def outcome_evidence_problem(source, ref):
+    """Why `source` cannot back an --outcome close, else None (GoodQA #15565 red-team F3): the ask's own entry is not
+    evidence about it, and a source that traces back to a human turn is an answer, which closes an ask the normal way."""
+    source = (source or '').strip()
+    if re.search(r'#' + re.escape(ref) + r'\s*$', source):
+        return 'the evidence is the ask itself'
+    if re.match(r'(?i)^wal\s*:', source):
+        # Codex final gate F1/F2: read the cited entry exactly as provenance will (relative and ~ paths beneath
+        # ~/.claude/wals, regular files inside that root only, bounded line size, total bytes and scan time), so no
+        # spelling of the path names the ask's own entry unnoticed and no FIFO or huge file can stall the check.
+        try:
+            import provenance  # noqa: PLC0415
+            parsed = provenance.parse_source(source)
+            record = provenance.wal_entry(provenance.resolve_wal_path(parsed['path']), parsed['entry'])
+        except Exception as error:  # noqa: BLE001 - unparseable, outside the root, missing, not a regular file, too large
+            return f"the wal: evidence cannot be read ({getattr(error, 'code', type(error).__name__)})"
+        if not isinstance(record, dict):
+            return 'the wal: evidence cannot be read (entry missing, malformed, oversized or beyond the scan budget)'
+        if record.get('id') == ref:
+            return 'the evidence is the ask itself (by line number)' if parsed['entry'].startswith('L') else 'the evidence is the ask itself'
+    try:
+        import provenance
+        result = provenance.resolve(source)
+        if result.get('ok') and result.get('origin') == 'user':
+            return 'the evidence traces to a human turn: close the ask with that answer (answer:/user:), not as obsolete'
+    except Exception:  # noqa: BLE001 - provenance_check reports an unresolvable source
+        return None
+    return None
 
 
 def open_ask_exists(path, ref: str) -> bool:
@@ -139,6 +169,9 @@ def main():
     parser.add_argument('--ref', help='id of the ask being closed (ask_resolved)')
     parser.add_argument('--decision', choices=('approved', 'declined'),
                         help='ask_resolved only: the explicit outcome (escalation.py reads this field, never the note text)')
+    parser.add_argument('--outcome', choices=('obsolete', 'not_user'),
+                        help='ask_resolved only: close an ask nobody can answer any more (obsolete) or that was never the user\'s to answer '
+                             '(not_user) on wal:/file:/ticket: evidence; never an approval (no decision field), so it cannot authorize anything')
     parser.add_argument('--by', help='tool that writes this row on an agent\'s behalf (never quarantined; cites its state in the note)')
     parser.add_argument('--recites', help='id of an unsourced entry of this WAL that this sourced row re-cites (clears its quarantine)')
     args = parser.parse_args()
@@ -180,10 +213,25 @@ def main():
                               'hint': 'cite the answer: user:<session>/<uuid> "words", answer:<id> or queue:<id> (ah user-msg)'}),
                   file=sys.stderr)
             return 2
-        if not re.match(r'^(user:|uuid:|answer:|queue:|ticket:)', args.source.strip()):
+        if args.outcome:
+            if args.decision:
+                parser.error('--outcome closes an ask without an approval: do not combine it with --decision')
+            if not re.match(r'^(wal:|file:|ticket:)', args.source.strip()):
+                print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': '--outcome needs wal:, file: or ticket: evidence',
+                                  'hint': 'cite the entry or commit that shows the ask is obsolete or not the user\'s; inferred: is not evidence'}),
+                      file=sys.stderr)
+                return 2
+        elif not re.match(r'^(user:|uuid:|answer:|queue:|ticket:)', args.source.strip()):
             print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved source must be the answer: user:, answer:, queue: or ticket:',
-                              'hint': 'an ask cannot be closed on an inferred: or file: source'}), file=sys.stderr)
+                              'hint': 'an ask cannot be closed on an inferred: or file: source; use --outcome obsolete|not_user with wal:/file: evidence'}), file=sys.stderr)
             return 2
+        if args.outcome:
+            evidence = outcome_evidence_problem(args.source, args.ref)
+            if evidence:
+                print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': evidence,
+                                  'hint': 'cite a different entry that shows the ask is obsolete; a user answer closes it the normal way'}),
+                      file=sys.stderr)
+                return 2
         mode, problem, assumption = provenance_check('ask', args.source)  # the answer is sourced like an ask (M1)
         if problem:
             print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': problem[:300],
@@ -195,10 +243,13 @@ def main():
         record['source'] = args.source.strip()[:2000]
         if args.decision:
             record['decision'] = args.decision
+        if args.outcome:
+            record['outcome'] = args.outcome
+            record['closed_by'] = 'agent'  # an audit mark: no user words back this close
         if assumption:
             record['assumption'] = True
-    elif args.decision:
-        parser.error('--decision applies to ask_resolved only')
+    elif args.decision or args.outcome:
+        parser.error('--decision and --outcome apply to ask_resolved only')
     if args.event in SOURCED:
         mode, problem, assumption = provenance_check(args.event, args.source)
         if problem and args.source and caller_error(problem):
@@ -225,6 +276,10 @@ def main():
         if args.by.strip() not in TOOL_WRITERS:
             parser.error(f'--by must be one of {sorted(TOOL_WRITERS)}: tool-written rows are an allowlist, not a claim')
         record['by'] = args.by.strip()
+        if args.event == 'ask_resolved' and args.decision:
+            parser.error('a tool close (--by) is bookkeeping and cannot carry --decision: only a person approves')
+        if args.event == 'ask_resolved':
+            record.setdefault('closed_by', record['by'])  # a tool close is bookkeeping, not a user approval
     if args.recites:
         if not re.fullmatch(r'w[0-9a-f]{11}', args.recites) or not args.source:
             parser.error('--recites needs an entry id (w + 11 hex) and a --source on this row')

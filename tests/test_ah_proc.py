@@ -1096,7 +1096,7 @@ class ApprovalResolution(unittest.TestCase):
         self.home = Path(self.tmp.name)
 
     def world(self, text="please stop the stale harness-console 6101 now", at="2026-11-07T10:00:00Z",
-              source=None, resolved=True, origin="human"):
+              source=None, resolved=True, origin="human", extra=None):
         projects = self.home / ".claude" / "projects" / "-x"
         projects.mkdir(parents=True)
         record = {"type": "user", "uuid": self.UID, "timestamp": at, "sessionId": self.SID,
@@ -1107,7 +1107,8 @@ class ApprovalResolution(unittest.TestCase):
         rows = [{"at": "2026-11-07T09:59:00Z", "event": "ask", "id": self.ASK, "note": "stop 6101?", "reason": "user asked"}]
         if resolved:
             rows.append({"at": "2026-11-07T10:01:00Z", "event": "ask_resolved", "ref": self.ASK, "id": "wffffffffff1",
-                         "source": source or 'user:%s/%s "stop the stale harness-console 6101"' % (self.SID, self.UID)})
+                         "source": source or 'user:%s/%s "stop the stale harness-console 6101"' % (self.SID, self.UID),
+                         **(extra or {})})
         (wals / "main.jsonl").write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows))
 
     NOW = 1794045600.0 + 7200  # 2026-11-07T12:00:00Z
@@ -1147,6 +1148,18 @@ class ApprovalResolution(unittest.TestCase):
                 with self.assertRaises(ak.KillError) as caught:
                     self.resolve(ask, session)
                 self.assertIn(why, str(caught.exception))
+
+    def test_an_agent_close_is_never_an_approval_goodqa_15565(self):
+        for extra in ({"outcome": "obsolete"}, {"outcome": "not_user"}, {"closed_by": "ask-sweep"}, {"closed_by": "agent"}):
+            with self.subTest(extra=extra):
+                self.tearDown_world()
+                self.world(extra=extra)  # the cited source is a real human turn; the close itself is still bookkeeping
+                with self.assertRaises(ak.KillError) as caught:
+                    self.resolve()
+                self.assertIn("closed by an agent", str(caught.exception))
+        self.tearDown_world()
+        self.world()
+        self.assertEqual(self.resolve()["ask"], self.ASK)  # an ordinary user close still approves
 
     def tearDown_world(self):
         import shutil

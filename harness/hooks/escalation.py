@@ -585,6 +585,8 @@ def verify_ask_pair(wal, ask_id, task, allow_env_root=False):
         raise LedgerError('unclassifiable_evidence', 'ask %s does not carry [task:%s] in its note.%s' % (ask_id, task, fix))
     # No magic words (scenario B24): the resolution carries an explicit decision field, written by ah approve-top
     # or wal_note --decision. Free-text notes are never parsed for "approved".
+    if resolved.get('closed_by') or resolved.get('outcome'):
+        raise LedgerError('unclassifiable_evidence', 'ask %s was closed by a tool or as obsolete, not approved by the user.%s' % (ask_id, fix))
     if resolved.get('decision') != 'approved':
         raise LedgerError('unclassifiable_evidence', 'ask_resolved for %s has no decision=approved field (free text is not '
                           'read).%s' % (ask_id, fix))
