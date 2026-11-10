@@ -571,7 +571,7 @@ class RedTeamTests(GitDirCase):
         cls.nul = h / 'lists/nul.txt'
         cls.nul.write_bytes(b'%s/junk/a\x00%s/.git\x00' % (str(h).encode(), str(cls.repo).encode()))
         cls.spaced = h / 'lists/spaced.txt'
-        cls.spaced.write_text('%s/junk/a %s/.git\n' % (h, cls.repo))
+        cls.spaced.write_text('%s/.git %s/junk/a\n' % (cls.repo, h))
         cls.long = h / 'lists/long.txt'
         cls.long.write_text(''.join('%s/junk/f%02d\n' % (h, k) for k in range(20)))
         cls.fifo = h / 'lists/fifo'
@@ -592,6 +592,9 @@ class RedTeamTests(GitDirCase):
         self.blocks(['for p in $(cat @SWEEP@); do rm -rf "$p"; done', 'for p in `cat @SWEEP@`; do rm -rf "$p"; done',
                      'L=$(cat @SWEEP@); rm -rf $L', 'L="$(< @SWEEP@)"; rm -rf $L',
                      'for p in @REPO@/.git; do rm -rf "$p"; done', 'D=$(echo @REPO@/.git); rm -rf "$D"'])
+
+    def test_variable_hint_naming_git(self):  # M31
+        self.blocks(['D="$(pwd)/.git"; rm -rf "$D"', 'D="${UNSET_BASE}/.git"; rm -rf $D'])
 
     def test_grouped_and_subshell_producers(self):
         self.blocks(['{ cat @SWEEP@; } | xargs rm -rf', '(cat @SWEEP@; cat @OK@) | xargs rm -rf',
