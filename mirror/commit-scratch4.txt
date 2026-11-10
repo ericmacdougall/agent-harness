@@ -1,0 +1,10 @@
+chore(scratch): S1e-a post-deploy watch script
+
+Why: the 30-minute post-deploy watch for goodqa#15561 S1e-a runs from a
+script in the scratch worktree; committing keeps it recoverable.
+What: watch-s1e.sh checks version, home and login every five minutes.
+Testing: not run: scratch script only, it is running as the background
+watch against the live build 26d95f46ada7.
+Refs: GoodQA #15561
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

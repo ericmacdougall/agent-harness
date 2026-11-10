@@ -1,0 +1,15 @@
+#!/bin/sh
+# 30-minute post-deploy watch for goodqa#15561 S1e-a (26d95f4): every 5 minutes check version, home and login. Writes watch-s1e.log.
+SHA=26d95f46ada7cc03e2b7906858878b6fe2b7be81
+LOG="$(dirname "$0")/watch-s1e.log"
+i=0
+while [ $i -le 6 ]; do
+  v=$(curl -s -m 15 https://goodqa.app/v1/version | python3 -c "import sys,json;print(json.load(sys.stdin).get('sourceSha',''))" 2>/dev/null)
+  h=$(curl -s -m 15 -o /dev/null -w '%{http_code}' https://goodqa.app/)
+  l=$(curl -s -m 15 -o /dev/null -w '%{http_code}' https://goodqa.app/login)
+  ok=BAD; [ "$v" = "$SHA" ] && [ "$h" = 200 ] && [ "$l" = 200 ] && ok=OK
+  echo "$(date -u +%H:%M:%SZ) check=$i sha_match=$([ "$v" = "$SHA" ] && echo yes || echo no) home=$h login=$l $ok" >> "$LOG"
+  i=$((i+1))
+  [ $i -le 6 ] && sleep 300
+done
+echo WATCH_DONE >> "$LOG"
