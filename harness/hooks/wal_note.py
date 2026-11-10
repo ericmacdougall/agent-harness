@@ -81,17 +81,20 @@ def outcome_evidence_problem(source, ref):
     source = (source or '').strip()
     if re.search(r'#' + re.escape(ref) + r'\s*$', source):
         return 'the evidence is the ask itself'
-    line = re.match(r'^wal:(.+)#L(\d{1,9})\s*$', source)
-    if line:  # the line-number form can name the ask's own entry too
+    if re.match(r'(?i)^wal\s*:', source):
+        # Codex final gate F1/F2: read the cited entry exactly as provenance will (relative and ~ paths beneath
+        # ~/.claude/wals, regular files inside that root only, bounded line size, total bytes and scan time), so no
+        # spelling of the path names the ask's own entry unnoticed and no FIFO or huge file can stall the check.
         try:
-            with open(line.group(1), 'rb') as handle:
-                for number, raw in enumerate(handle, 1):
-                    if number == int(line.group(2)):
-                        if json.loads(raw).get('id') == ref:
-                            return 'the evidence is the ask itself (by line number)'
-                        break
-        except (OSError, ValueError, AttributeError):
-            pass
+            import provenance  # noqa: PLC0415
+            parsed = provenance.parse_source(source)
+            record = provenance.wal_entry(provenance.resolve_wal_path(parsed['path']), parsed['entry'])
+        except Exception as error:  # noqa: BLE001 - unparseable, outside the root, missing, not a regular file, too large
+            return f"the wal: evidence cannot be read ({getattr(error, 'code', type(error).__name__)})"
+        if not isinstance(record, dict):
+            return 'the wal: evidence cannot be read (entry missing, malformed, oversized or beyond the scan budget)'
+        if record.get('id') == ref:
+            return 'the evidence is the ask itself (by line number)' if parsed['entry'].startswith('L') else 'the evidence is the ask itself'
     try:
         import provenance
         result = provenance.resolve(source)

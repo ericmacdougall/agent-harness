@@ -27,13 +27,15 @@ class OutcomeClose(unittest.TestCase):
         self.wal = self.home / ".claude" / "wals" / "sess-1" / "main.jsonl"
         self.wal.parent.mkdir(parents=True)
         self.wal.write_text(json.dumps({"event": "ask", "id": "wask00000001", "note": "May main kill pid 9?", "source": USER,
-                                        "reason": "needs the user", "at": "2026-11-01T00:00:00+00:00"}) + "\n")
+                                        "reason": "needs the user", "at": "2026-11-01T00:00:00+00:00"}) + "\n"
+                            + json.dumps({"event": "decision", "id": "w0123456789a", "note": "the plan changed; the ask is moot",
+                                          "at": "2026-11-01T00:01:00+00:00"}) + "\n")
 
     def run_note(self, *extra):
         argv = ["wal_note.py", "--wal", str(self.wal), "--event", "ask_resolved", "--ref", "wask00000001",
                 "--note", "closing"] + list(extra)
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.dict(os.environ, {"HOME": str(self.home)}), mock.patch("sys.argv", argv), \
+        with mock.patch.dict(os.environ, {"HOME": str(self.home), "CLAUDE_CONFIG_DIR": ""}), mock.patch("sys.argv", argv), \
                 mock.patch("provenance.resolve", lambda *a, **k: dict(OK)), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
@@ -46,7 +48,7 @@ class OutcomeClose(unittest.TestCase):
         return [json.loads(x) for x in self.wal.read_text().splitlines()]
 
     def test_obsolete_close_on_wal_evidence_writes_an_audited_row_with_no_approval(self):
-        code, err = self.run_note("--outcome", "obsolete", "--source", "wal:/x/main.jsonl#w0123456789a")
+        code, err = self.run_note("--outcome", "obsolete", "--source", "wal:sess-1/main.jsonl#w0123456789a")
         self.assertIn(code, (0, None), err)
         row = self.rows()[-1]
         self.assertEqual((row["event"], row["ref"], row["outcome"], row["closed_by"]), ("ask_resolved", "wask00000001", "obsolete", "agent"))
@@ -62,27 +64,27 @@ class OutcomeClose(unittest.TestCase):
             with self.subTest(source=source[:20]):
                 code, err = self.run_note("--outcome", "obsolete", "--source", source)
                 self.assertEqual(code, 2, err)
-        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(len(self.rows()), 2)
         code, _ = self.run_note("--outcome", "obsolete")
         self.assertEqual(code, 2)
 
     def test_outcome_cannot_be_combined_with_an_approval(self):
-        code, _ = self.run_note("--outcome", "obsolete", "--decision", "approved", "--source", "wal:/x/main.jsonl#w0123456789a")
+        code, _ = self.run_note("--outcome", "obsolete", "--decision", "approved", "--source", "wal:sess-1/main.jsonl#w0123456789a")
         self.assertEqual(code, 2)
-        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(len(self.rows()), 2)
 
     def test_without_outcome_a_wal_source_is_still_refused(self):
-        code, err = self.run_note("--source", "wal:/x/main.jsonl#w0123456789a")
+        code, err = self.run_note("--source", "wal:sess-1/main.jsonl#w0123456789a")
         self.assertEqual(code, 2)
         self.assertIn("--outcome", err)
 
     def test_evidence_that_is_the_ask_itself_or_traces_to_a_human_turn_is_refused(self):
-        code, err = self.run_note("--outcome", "obsolete", "--source", "wal:/x/main.jsonl#wask00000001")
+        code, err = self.run_note("--outcome", "obsolete", "--source", "wal:sess-1/main.jsonl#wask00000001")
         self.assertEqual(code, 2)
         self.assertIn("the ask itself", err)
         human = dict(OK, origin="user")
         argv = ["wal_note.py", "--wal", str(self.wal), "--event", "ask_resolved", "--ref", "wask00000001", "--note", "closing",
-                "--outcome", "obsolete", "--source", "wal:/x/main.jsonl#w0123456789a"]
+                "--outcome", "obsolete", "--source", "wal:sess-1/main.jsonl#w0123456789a"]
         err = io.StringIO()
         with mock.patch.dict(os.environ, {"HOME": str(self.home)}), mock.patch("sys.argv", argv), \
                 mock.patch("provenance.resolve", lambda *a, **k: dict(human)), \
@@ -90,7 +92,7 @@ class OutcomeClose(unittest.TestCase):
             code = wal_note.main()
         self.assertEqual(code, 2)
         self.assertIn("human turn", err.getvalue())
-        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(len(self.rows()), 2)
 
     def test_evidence_must_really_resolve_unmocked(self):
         argv = ["wal_note.py", "--wal", str(self.wal), "--event", "ask_resolved", "--ref", "wask00000001", "--note", "closing",
@@ -99,7 +101,7 @@ class OutcomeClose(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             code = wal_note.main()
         self.assertEqual(code, 2)  # a source that does not resolve closes nothing
-        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(len(self.rows()), 2)
 
     def test_a_tool_close_is_marked_and_never_an_approval_row(self):
         code, err = self.run_note("--by", "ask-sweep", "--source", USER)
@@ -113,10 +115,69 @@ class OutcomeClose(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("the ask itself", err)
 
+    def test_the_ask_itself_is_refused_whichever_way_the_path_is_written(self):
+        # Codex final gate F1: provenance resolves relative and ~ paths beneath ~/.claude/wals, so the self-entry check must
+        # canonicalize the same way; a raw open of the relative path failed and let the ask's own entry close it
+        for source in ("wal:sess-1/main.jsonl#L1", "wal:~/.claude/wals/sess-1/main.jsonl#L1", "wal:%s#L1" % self.wal,
+                       "wal:sess-1/../sess-1/main.jsonl#L1", "wal:sess-1/main.jsonl#wask00000001"):
+            with self.subTest(source=source):
+                code, err = self.run_note("--outcome", "obsolete", "--source", source)
+                self.assertEqual(code, 2, err)
+                self.assertIn("the ask itself", err)
+        self.assertEqual(len(self.rows()), 2)
+        code, err = self.run_note("--outcome", "obsolete", "--source", "wal:sess-1/main.jsonl#L2")
+        self.assertIn(code, (0, None), err)  # a different entry of the same WAL is still usable evidence
+
+    def test_evidence_outside_the_wals_root_is_refused(self):
+        outside = self.home / "elsewhere" / "main.jsonl"
+        outside.parent.mkdir()
+        outside.write_text(json.dumps({"event": "decision", "id": "wfeedfeed001", "note": "x"}) + "\n")
+        link = self.wal.parent / "link.jsonl"
+        link.symlink_to(outside)
+        for source in ("wal:%s#L1" % outside, "wal:sess-1/link.jsonl#L1", "wal:sess-1/../../../elsewhere/main.jsonl#L1"):
+            with self.subTest(source=source):
+                code, err = self.run_note("--outcome", "obsolete", "--source", source)
+                self.assertEqual(code, 2, err)
+                self.assertIn("cannot be read", err)
+        self.assertEqual(len(self.rows()), 2)
+
+    def test_oversized_evidence_is_refused(self):
+        big = self.wal.parent / "big.jsonl"
+        big.write_text(json.dumps({"event": "decision", "id": "wbig00000001", "note": "y" * 400}) + "\n"
+                       + "".join(json.dumps({"event": "decision", "id": "w%011d" % n, "note": "z"}) + "\n" for n in range(60)))
+        with mock.patch("provenance.MAX_LINE", 128):
+            code, err = self.run_note("--outcome", "obsolete", "--source", "wal:sess-1/big.jsonl#L1")
+        self.assertEqual(code, 2, err)  # a line over the cap is never parsed
+        self.assertIn("cannot be read", err)
+        with mock.patch("provenance.MAX_SCAN_BYTES", 1024):
+            for source in ("wal:sess-1/big.jsonl#L55", "wal:sess-1/big.jsonl#w00000000055"):
+                with self.subTest(source=source):
+                    code, err = self.run_note("--outcome", "obsolete", "--source", source)
+                    self.assertEqual(code, 2, err)  # past the total byte budget: unread, so refused
+                    self.assertIn("cannot be read", err)
+        self.assertEqual(len(self.rows()), 2)
+
+    def test_a_fifo_as_evidence_is_refused_without_hanging(self):
+        import subprocess
+        fifo = self.wal.parent / "pipe.jsonl"
+        os.mkfifo(fifo)
+        env = dict(os.environ, HOME=str(self.home))
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        argv = [sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wal), "--event", "ask_resolved",
+                "--ref", "wask00000001", "--note", "closing", "--outcome", "obsolete"]
+        for source in ("wal:sess-1/pipe.jsonl#L1", "wal:%s#L1" % fifo):
+            with self.subTest(source=source):
+                try:  # the timeout is the guard: the old precheck's plain open() blocked here until a writer appeared
+                    done = subprocess.run(argv + ["--source", source], env=env, capture_output=True, text=True, timeout=20)
+                except subprocess.TimeoutExpired:
+                    self.fail("the outcome precheck blocked on a FIFO")
+                self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertEqual(len(self.rows()), 2)
+
     def test_a_tool_close_cannot_carry_a_decision(self):
         code, _ = self.run_note("--by", "ask-sweep", "--decision", "approved", "--source", USER)
         self.assertEqual(code, 2)
-        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(len(self.rows()), 2)
 
     def test_a_tool_or_obsolete_close_never_satisfies_the_top_rung_pair_check(self):
         import escalation
@@ -133,8 +194,8 @@ class OutcomeClose(unittest.TestCase):
             self.assertIn("closed by a tool", str(caught.exception))
 
     def test_a_resolved_ask_is_not_open_again_and_the_row_is_not_an_approval_for_the_kill_gate(self):
-        self.run_note("--outcome", "obsolete", "--source", "wal:/x/main.jsonl#w0123456789a")
-        code, _ = self.run_note("--outcome", "obsolete", "--source", "wal:/x/main.jsonl#w0123456789a")
+        self.run_note("--outcome", "obsolete", "--source", "wal:sess-1/main.jsonl#w0123456789a")
+        code, _ = self.run_note("--outcome", "obsolete", "--source", "wal:sess-1/main.jsonl#w0123456789a")
         self.assertEqual(code, 2)  # already resolved
         import ask_reminders
         self.assertEqual(ask_reminders.open_asks(self.wal, lambda v: 0.0), [])
