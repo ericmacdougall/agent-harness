@@ -790,5 +790,26 @@ class CodexOwnerInstallTests(unittest.TestCase):
     def test_trust_report_survives_malformed_hooks_json(self):
         import install_codex
         self.codex_home.mkdir()
-        (self.codex_home / 'hooks.json').write_text('{bad')
-        self.assertIn('could not check', install_codex.codex_trust_report(self.codex_home)[0])
+        for bad in ('{bad', '[' * 200000 + ']' * 200000, '{"hooks": {"Stop": "not-a-list"}}'):
+            with self.subTest(bad=bad[:20]):
+                (self.codex_home / 'hooks.json').write_text(bad)
+                self.assertIn('could not check', install_codex.codex_trust_report(self.codex_home)[0])
+
+    def test_trust_report_warns_when_no_hooks_are_installed(self):
+        import install_codex
+        self.codex_home.mkdir()
+        for empty in ('{"hooks": []}', '{"hooks": {}}', '{"hooks": {"Stop": []}}', '{}'):
+            with self.subTest(empty=empty):
+                (self.codex_home / 'hooks.json').write_text(empty)
+                self.assertEqual(install_codex.codex_trust_report(self.codex_home),
+                                 ['WARNING codex:trust: no hooks.json hooks installed; Codex runs no harness guards'])
+
+    def test_installer_and_supervisor_share_the_codex_home_rule(self):
+        import install_codex
+        other = self.home / 'custom-codex'
+        with patch.dict(os.environ, {'HOME': str(self.home), 'CODEX_HOME': str(other)}):
+            self.assertEqual(install_codex.codex_home_for(self.home), other)
+            self.assertEqual(install_codex.codex_home_for(self.home / 'elsewhere'), self.home / 'elsewhere' / '.codex')
+            install(self.home, apply=True, hooks_only=True)
+        self.assertTrue((other / 'agent-harness' / 'codex_owner.py').is_file())
+        self.assertFalse((self.home / '.codex').exists())
