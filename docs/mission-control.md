@@ -142,7 +142,7 @@ The server defends against them as follows:
   - Every request has its Host checked against an exact allowlist, which defends against DNS rebinding.
   - Data reads and the event stream need `Sec-Fetch-Site: same-origin` or an exact Origin.
   - Writes need the exact Origin and the per-session CSRF header.
-- **Responses**: no CORS. A strict CSP (`default-src 'self'`, `frame-ancestors 'none'`), plus `nosniff`, `no-referrer` and `no-store`. The page renders data only with `textContent`, and never loads a link or image that comes from data.
+- **Responses**: no CORS. A strict CSP (`default-src 'self'`, `frame-ancestors 'none'`), plus `nosniff`, `no-referrer` and `no-store`. Only the query-free public local login forms use `same-origin` referrer policy so their same-origin POSTs retain the exact Origin. The page renders data only with `textContent`, and never loads a link or image that comes from data.
 - **Secrets**: every event and chat text passes the harness redaction. Keychain, auth and credential files are never read.
 - **Read-only**: nothing is written to repos, tickets or hosts. The ssh probe is one fixed read-only command.
 

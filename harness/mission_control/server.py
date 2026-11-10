@@ -757,7 +757,11 @@ class Handler(BaseHTTPRequestHandler):
                      '<form method="post" action="/auth/browser/claim">'
                      '<input type="hidden" name="request_id" value="' + rid + '">'
                      '<button>Continue</button></form>')
-        extra = None if cookie is None else {"Set-Cookie": cookie}
+        # Native form POSTs from no-referrer documents serialize Origin as null.
+        # These query-free public pages retain Origin only for their same-origin forms.
+        extra = {"Referrer-Policy": "same-origin"}
+        if cookie is not None:
+            extra["Set-Cookie"] = cookie
         return self.send_secure(status, page.encode("utf-8"), "text/html; charset=utf-8", extra)
 
     def browser_post(self):

@@ -152,6 +152,36 @@ class BrowserHTTP(fixtures.ServerHarness):
         self.assertFalse(nonce.encode() in body, "binding nonce leaked to page")
         return rid, cookie
 
+    def test_only_public_form_documents_keep_same_origin_referrer_policy(self):
+        def policy(response, expected):
+            self.assertEqual([value for key, value in response.getheaders()
+                              if key.lower() == "referrer-policy"], [expected])
+
+        page, _ = self.request("GET", "/auth/browser", {"Sec-Fetch-Site": "none"})
+        self.assertEqual(page.status, 200)
+        policy(page, "same-origin")
+        self.assertIn("form-action 'self'", page.getheader("Content-Security-Policy"))
+        start, _ = self.form("/auth/browser/request", {"action": "begin"})
+        self.assertEqual(start.status, 201)
+        policy(start, "same-origin")
+        rid = next(iter(self.app.auth.pending_browsers))
+        cookie = start.getheader("Set-Cookie").split(";")[0]
+        pending, _ = self.form("/auth/browser/claim", {"request_id": rid}, cookie)
+        self.assertEqual(pending.status, 202)
+        policy(pending, "same-origin")
+        rejected, _ = self.form("/auth/browser/request", {"action": "begin"}, Origin="null")
+        self.assertEqual(rejected.status, 403)
+        policy(rejected, "no-referrer")
+        for path in ("/", "/auth/browser?unexpected=1", "/launch?c=invalid", "/api/state"):
+            response, _ = self.request("GET", path, {"Sec-Fetch-Site": "none"})
+            policy(response, "no-referrer")
+        issued = int(mcs.time.time())
+        approved, _ = self.request("POST", "/auth/browser/approve", {"Content-Type": "application/json"},
+            json.dumps({"request_id": rid, "issued": issued,
+                        "mac": mcs.browser_approval_mac(fixtures.mc_chat.secret(), rid, self.port, issued)}))
+        self.assertEqual(approved.status, 200)
+        policy(approved, "no-referrer")
+
     def test_actual_http_cookie_jar_approval_and_private_session_delivery(self):
         page, body = self.request("GET", "/auth/browser", {"Sec-Fetch-Site": "none"})
         self.assertEqual(page.status, 200)
@@ -168,6 +198,7 @@ class BrowserHTTP(fixtures.ServerHarness):
         self.assertEqual(wrong.status, 403)
         good, body = self.form("/auth/browser/claim", {"request_id": rid}, cookie)
         self.assertEqual(good.status, 303)
+        self.assertEqual(good.getheader("Referrer-Policy"), "no-referrer")
         sid_cookie = good.getheader("Set-Cookie").split(";")[0]
         self.assertTrue(sid_cookie.startswith("mc_sid="))
         self.assertFalse(sid_cookie.partition("=")[2].encode() in body)
