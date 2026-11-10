@@ -382,6 +382,8 @@ export async function mountScene() {
   document.addEventListener('visibilitychange', () => { if (document.hidden) stop(); else { size(); start(); } });
   rebuild(getState());
   try {
+    // #gl=off forces the static view (a view preference, like #tab=), so the no-WebGL path can be tested anywhere.
+    if (new URLSearchParams(location.hash.slice(1)).get('gl') === 'off') throw new Error('gl=off');
     THREE = await import('../vendor/three.module.min.js');
     renderer = new THREE.WebGLRenderer({ alpha: true, antialias: window.innerWidth >= 768, powerPreference: 'low-power' });
     renderer.setClearColor(0x000000, 0);

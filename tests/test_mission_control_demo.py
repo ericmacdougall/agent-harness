@@ -192,6 +192,94 @@ class Http(Base):
         self.assertGreaterEqual(time.time() - start, 1.0)
 
 
+    def test_junk_launch_codes_never_block_a_genuine_one(self):
+        # NEG-23: behind a Funnel every client is 127.0.0.1; a scanner must not lock the tester out.
+        for n in range(25):
+            self.assertEqual(self.request("GET", f"/launch?c=junk{n}.AAAA", {"Sec-Fetch-Site": "none"})[0].status,
+                             401)
+        cookie, state = self.login()
+        self.assertTrue(cookie.startswith("mc_sid="))
+
+    def test_funnel_cookie_is_secure_and_loopback_cookie_works_over_http(self):
+        resp, _ = self.request("GET", "/launch?c=" + mcs.mint_code(mc_chat.secret()), {"Sec-Fetch-Site": "none"})
+        self.assertIn("; Secure", resp.getheader("Set-Cookie"))
+        resp, _ = self.request("GET", "/launch?c=" + mcs.mint_code(mc_chat.secret()), {"Sec-Fetch-Site": "none"},
+                               host=f"127.0.0.1:{self.port}")
+        self.assertEqual(resp.status, 303)
+        self.assertNotIn("Secure", resp.getheader("Set-Cookie"))
+
+    def test_healthz_names_the_build_but_no_paths_or_hostname(self):
+        resp, data = self.request("GET", "/healthz")
+        value = json.loads(data)
+        self.assertEqual(resp.status, 200)
+        self.assertTrue(value["demo"])
+        self.assertRegex(value["build"]["digest"], r"^[0-9a-f]{16}$")
+        self.assertIn(value["build"]["hooks"], ("checkout", "installed"))
+        self.assertNotIn(str(Path.home()), data.decode())
+        self.assertNotIn(socket.gethostname().split(".")[0], data.decode())
+        _cookie, state = self.login()
+        self.assertEqual(state["host"], "demo")
+
+
+class DemoHome(Base):
+    """NEG-21 and NEG-22: demo writes stay inside a claimed disposable home."""
+
+    def test_unmarked_non_empty_home_is_refused(self):
+        self.root.mkdir(parents=True)
+        (self.root / "notes.txt").write_text("someone else's directory\n")
+        with self.assertRaises(demo.DemoError):
+            demo.prepare_home(self.root)
+        self.assertFalse((self.root / demo.MARKER).exists())
+
+    def test_symlinked_working_directory_is_refused(self):
+        outside = self.base / "real-sources"
+        outside.mkdir()
+        demo.prepare_home(self.root)
+        (self.root / "sources").symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(demo.DemoError):
+            demo.prepare_home(self.root)
+        with self.assertRaises(demo.DemoError):
+            mcs.build_app(demo_args(free_port()))
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_fixture_writes_never_follow_a_planted_file_symlink(self):
+        demo.prepare_home(self.root)
+        mcs.build_app(demo_args(free_port()))
+        victim = self.base / "victim.json"
+        victim.write_text("untouched\n")
+        target = self.root / "demo" / "initiatives.json"
+        target.unlink()
+        target.symlink_to(victim)
+        with self.assertRaises(OSError):
+            demo.seed(self.root)
+        self.assertEqual(victim.read_text(), "untouched\n")
+
+    def test_serve_refuses_an_unmarked_home_before_writing_anything(self):
+        self.root.mkdir(parents=True)
+        (self.root / "keep").write_text("x")
+        proc = subprocess.run([sys.executable, str(SERVER), "serve", "--demo", "--port", str(free_port())],
+                              capture_output=True, text=True, timeout=30, env={**os.environ, "MC_HOME": str(self.root)})
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["keep"])
+
+    def test_url_demo_host_needs_a_demo_home_and_never_mints_a_secret(self):
+        fake_home = self.base / "home"
+        fake_home.mkdir()
+        env = {k: v for k, v in os.environ.items() if k != "MC_HOME"}
+        env["HOME"] = str(fake_home)
+        argv = [sys.executable, str(SERVER), "url", "--port", "47699", "--demo-host", "box.tail1234.ts.net"]
+        unset = subprocess.run(argv, capture_output=True, text=True, timeout=30, env=env)
+        self.assertEqual(unset.returncode, 2, unset.stdout)
+        self.assertNotIn("launch?c=", unset.stdout)
+        real = subprocess.run(argv, capture_output=True, text=True, timeout=30,
+                              env={**env, "MC_HOME": str(fake_home / ".agent-harness" / "mission-control")})
+        self.assertEqual(real.returncode, 2, real.stdout)
+        fresh = subprocess.run(argv, capture_output=True, text=True, timeout=30,
+                               env={**env, "MC_HOME": str(self.root)})
+        self.assertEqual(fresh.returncode, 2, fresh.stdout)
+        self.assertEqual([p for p in fake_home.rglob("secret")] + [p for p in self.base.rglob("secret")], [])
+
+
 class EchoAndActivity(Base):
     def test_echo_replies_after_the_delay_and_only_once(self):
         mc_chat.ensure_dirs()

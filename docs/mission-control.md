@@ -163,14 +163,23 @@ MC_HOME=<disposable dir> python3 ~/.agent-harness/mission-control/app/server.py 
 MC_HOME=<same dir> python3 ~/.agent-harness/mission-control/app/server.py url --port 47699   # another 60 s code
 ```
 
-It refuses to start if `MC_HOME` is unset, or is the real `~/.agent-harness/mission-control` (or inside or above it). It prints a launch link to the terminal only; codes are never logged.
+It refuses to start (exit 2) in these cases, before anything is written:
+- `MC_HOME` is unset, or is the real `~/.agent-harness/mission-control` (or inside or above it);
+- `MC_HOME` is a non-empty directory without the `.mc-demo-home` marker that demo mode writes into an empty home;
+- its `demo`, `sources`, `log` or `chat` folder is a symlink or lies outside it.
+
+Fixture files are written without following symlinks. It prints a launch link to the terminal; codes are never written to a file. `url --demo-host` works only for an existing demo home; it never creates a secret and never uses the real install's.
+
+To tie a test run to a commit, run the checkout's own `harness/mission_control/server.py` with `MC_HOOKS=<checkout>/harness/hooks`. The startup banner and `/healthz` then report `build`, which holds the commit, a digest of the served files, and `hooks: checkout` or `installed`. It contains no paths and no host name, because `/healthz` needs no session. In demo mode, `/api/state` shows the host as `demo`.
+
+The page's `#gl=off` view flag forces the static (no-WebGL) view, so the fallback can be checked in any browser.
 
 Two knobs exercise the slow-network cases:
 
 - `MC_DEMO_CHAT_DELAY_MS=3000` holds each chat accept for 3 s.
 - `MC_DEMO_DROP_FIRST=1` stores the first message and then drops its response, so the page's same-key retry can be checked.
 
-`--demo-host NAME.ts.net` (only with `--demo`) also accepts that exact Tailscale Funnel host, with the Origin `https://NAME.ts.net`. The server still binds 127.0.0.1. Any other name is refused, and the LaunchAgent never passes `--demo`. Opening a Funnel exposes the page publicly, so only do it for a short, approved window, and close it afterwards.
+`--demo-host NAME.ts.net` (only with `--demo`) also accepts that exact Tailscale Funnel host, with the Origin `https://NAME.ts.net`. The server still binds 127.0.0.1. Any other name is refused, and the LaunchAgent never passes `--demo`. On that host the session cookie is marked `Secure`. There is no launch-failure lockout: the 128-bit MAC cannot be guessed, and behind a Funnel all clients share 127.0.0.1, so a shared lockout would let one client block another's genuine code. Opening a Funnel exposes the page publicly, so only do it for a short, approved window, and close it afterwards.
 
 ## Rollback
 

@@ -15,6 +15,7 @@ Chat lands only in the disposable MC_HOME; nothing ever reaches an agent.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -59,6 +60,93 @@ def check_demo_home(env_home: str | None) -> Path:
     if home == real_root or home == real_home or real_home in home.parents or home in real_home.parents:
         raise DemoError(f"refusing --demo with the real Mission Control home ({home})")
     return home
+
+
+MARKER = ".mc-demo-home"
+DEMO_SUBDIRS = ("demo", "sources", "log", "chat")
+
+
+def prepare_home(root: Path) -> Path:
+    """Claim root as a demo home before anything is written to it.
+
+    It is refused when it is non-empty without our marker (an unrelated directory) or when a working subdirectory is
+    a symlink or resolves outside it, so fixture writes cannot land in the real Mission Control home."""
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    marker = root / MARKER
+    if marker.is_symlink() or not marker.is_file():
+        if marker.is_symlink() or any(root.iterdir()):
+            raise DemoError(f"refusing --demo: {root} is not empty and is not a demo home")
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        os.close(fd)
+    real = root.resolve()
+    for name in DEMO_SUBDIRS:
+        sub = root / name
+        if sub.is_symlink() or (sub.exists() and real not in sub.resolve().parents):
+            raise DemoError(f"refusing --demo: {sub} is a symlink or lies outside the demo home")
+    return root
+
+
+def _write(path: Path, text: str, append: bool = False) -> None:
+    """Write without following a symlink at the final component (fixture files only)."""
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "a" if append else "w") as handle:
+        handle.write(text)
+
+
+def _checkout_commit(start: Path) -> str | None:
+    """HEAD of the checkout holding start, read from the repository files (demo mode starts no processes)."""
+    sha = re.compile(r"[0-9a-f]{40}")
+    for top in (start, *start.parents):
+        dot = top / ".git"
+        if not dot.exists():
+            continue
+        try:
+            gitdir = dot
+            if dot.is_file():
+                pointer = dot.read_text().strip()
+                if not pointer.startswith("gitdir: "):
+                    return None
+                gitdir = (top / pointer[len("gitdir: "):]).resolve()
+            common = gitdir
+            if (gitdir / "commondir").is_file():
+                common = (gitdir / (gitdir / "commondir").read_text().strip()).resolve()
+            head = (gitdir / "HEAD").read_text().strip()
+            if sha.fullmatch(head):
+                return head
+            ref = head[5:] if head.startswith("ref: ") else ""
+            for base in (gitdir, common):
+                if ref and (base / ref).is_file():
+                    value = (base / ref).read_text().strip()
+                    return value if sha.fullmatch(value) else None
+            packed = common / "packed-refs"
+            if ref and packed.is_file():
+                for line in packed.read_text().splitlines():
+                    value, _, name = line.partition(" ")
+                    if name == ref and sha.fullmatch(value):
+                        return value
+        except (OSError, ValueError):
+            return None
+        return None
+    return None
+
+
+def build_identity(app_dir: Path, hooks_dir: Path) -> dict:
+    """What code this demo instance serves: the commit (when run from a checkout) and a digest of the files.
+
+    No paths: /healthz is reachable without a session behind a Funnel, and paths carry the user name."""
+    digest = hashlib.sha256()
+    files = sorted(p for p in app_dir.rglob("*") if p.is_file() and p.suffix in (".py", ".js", ".css", ".html")
+                   and "__pycache__" not in p.parts and "vendor" not in p.parts)
+    files += [hooks_dir / "mc_chat.py", hooks_dir / "redact.py"]
+    for path in files:
+        try:
+            digest.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
+        except OSError:
+            digest.update(path.name.encode() + b"\0missing\0")
+    commit = _checkout_commit(app_dir)
+    hooks_from = "checkout" if hooks_dir.resolve() == (app_dir.parent / "hooks").resolve() else "installed"
+    return {"commit": commit, "digest": digest.hexdigest()[:16], "hooks": hooks_from}
 
 
 def _iso(ts: float) -> str:
@@ -150,10 +238,10 @@ def seed(root: Path) -> dict:
     for agent, _state, _task, ticket, idle, _disposition, note in OWNERS:
         event, _, text = note.partition(": ")
         line = {"at": _iso(now - idle), "event": event, "note": text, "ticket": ticket}
-        (wals / f"agent-{agent}.jsonl").write_text(json.dumps(line) + "\n")
-    (wals / "main.jsonl").write_text(json.dumps({"at": _iso(now - 60), "event": "status",
-                                                 "note": "demo main: 3 owners live"}) + "\n")
-    (base / "initiatives.json").write_text(json.dumps({"initiatives": INITIATIVES}, indent=1))
+        _write(wals / f"agent-{agent}.jsonl", json.dumps(line) + "\n")
+    _write(wals / "main.jsonl", json.dumps({"at": _iso(now - 60), "event": "status",
+                                            "note": "demo main: 3 owners live"}) + "\n")
+    _write(base / "initiatives.json", json.dumps({"initiatives": INITIATIVES}, indent=1))
     return {"wal_roots": [(base / "wals", "claude")], "initiatives": str(base / "initiatives.json")}
 
 
@@ -174,13 +262,11 @@ class DemoLoop:
         self.n += 1
         line = {"schema": "mc.event/1", "id": f"demo:{int(now)}:{self.n}", "ts": _iso(now), "kind": kind,
                 "summary": summary, "subject": subject}
-        with open(self.root / "sources" / "demo.jsonl", "a") as handle:
-            handle.write(json.dumps(line) + "\n")
+        _write(self.root / "sources" / "demo.jsonl", json.dumps(line) + "\n", append=True)
         if self.n % 3 == 0:
             agent = OWNERS[self.n % 3][0]
             wal = self.root / "demo" / "wals" / DEMO_SESSION / f"agent-{agent}.jsonl"
-            with open(wal, "a") as handle:
-                handle.write(json.dumps({"at": _iso(now), "event": "check", "note": summary}) + "\n")
+            _write(wal, json.dumps({"at": _iso(now), "event": "check", "note": summary}) + "\n", append=True)
 
     def echo(self, now: float) -> None:
         for session in (DEMO_SESSION, DESKTOP_SESSION):

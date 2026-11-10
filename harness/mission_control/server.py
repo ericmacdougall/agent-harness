@@ -99,7 +99,6 @@ class Auth:
         self.lock = threading.Lock()
         self.used: dict[bytes, float] = {}
         self.sessions: dict[str, dict] = {}
-        self.failures: list[float] = []
         self.hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
         self.origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
 
@@ -110,18 +109,18 @@ class Auth:
         self.origins.add(f"https://{host}")
 
     def redeem(self, code: str, now: float | None = None) -> str | None:
-        """A fresh session id for a valid, unexpired, unused launch code; else None (rate limited)."""
-        now = time.time() if now is None else now
-        with self.lock:
-            self.failures = [t for t in self.failures if now - t < 60]
-            if len(self.failures) >= 10:
-                return None
-            sid = self._redeem_locked(code, now)
-            if sid is None:
-                self.failures.append(now)
-            return sid
+        """A fresh session id for a valid, unexpired, unused launch code; else None.
 
-    def _redeem_locked(self, code, now):
+        There is deliberately no failure lockout: the 128-bit MAC cannot be guessed, and behind a Funnel every client
+        shares 127.0.0.1, so a shared lockout would only let one client's junk block another's genuine code."""
+        now = time.time() if now is None else now
+        payload = self._signed_payload(code)
+        if payload is None:
+            return None
+        with self.lock:
+            return self._redeem_locked(payload, now)
+
+    def _signed_payload(self, code):
         try:
             left, right = str(code).split(".", 1)
             payload, mac = _unb64(left), _unb64(right)
@@ -130,8 +129,9 @@ class Auth:
         if len(payload) != 24 or len(mac) != 16:
             return None
         expected = hmac.new(self.key_loader(), b"mc-launch|" + payload, hashlib.sha256).digest()[:16]
-        if not hmac.compare_digest(expected, mac):
-            return None
+        return payload if hmac.compare_digest(expected, mac) else None
+
+    def _redeem_locked(self, payload, now):
         minted = int.from_bytes(payload[:8], "big")
         if not -5 <= now - minted <= LAUNCH_TTL_S:
             return None
@@ -195,6 +195,7 @@ class App:
                  demo: bool = False):
         self.port, self.root = port, root
         self.demo = demo
+        self.build = demo_mode.build_identity(HERE, HOOKS) if demo else None
         self.demo_delay_s = 0.0
         self.demo_drop_first = False
         if demo:
@@ -299,7 +300,7 @@ class App:
                           "busy": self.codex.busy}}
 
     def state(self) -> dict:
-        return {"version": VERSION, "started": ev.iso(self.started), "host": ev.HOST,
+        return {"version": VERSION, "started": ev.iso(self.started), "host": "demo" if self.demo else ev.HOST,
                 "initiatives": self.initiatives.snapshot(), "owners": self.owners.rows,
                 "health": self.health.snapshot(), "events": self.hub.recent(limit=200),
                 "chat": self.chat_snapshot(), "limits": {"chat_max": mc_chat.MAX_TEXT}}
@@ -392,7 +393,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.deny(403, "host")
         url = urlsplit(self.path)
         if url.path == "/healthz":
-            return self.send_json(200, {"ok": True, "version": VERSION})
+            value = {"ok": True, "version": VERSION}
+            if self.app.demo:
+                value.update(demo=True, build=self.app.build)
+            return self.send_json(200, value)
         if url.path == "/launch":
             return self.launch(url)
         document = url.path in ("/", "/index.html")
@@ -456,6 +460,8 @@ class Handler(BaseHTTPRequestHandler):
         if not sid:
             return self.deny(401, "launch-code")
         cookie = f"mc_sid={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_S}"
+        if not (self.headers.get("Host") or "").startswith(("127.0.0.1:", "localhost:")):
+            cookie += "; Secure"  # the demo Funnel host is served over https
         return self.send_secure(303, b"", "text/plain", {"Location": "/", "Set-Cookie": cookie})
 
     def static(self, path: str):
@@ -666,6 +672,7 @@ def build_app(args) -> App:
     remote probes, Codex, Fabric and real WALs are all off."""
     if args.demo:
         root = demo_mode.check_demo_home(os.environ.get("MC_HOME"))
+        demo_mode.prepare_home(root)
         mc_chat.ensure_dirs(root)
         fixture = demo_mode.seed(root)
         app = App(port=args.port, root=root, initiatives=fixture["initiatives"], remote=False, fabric_bin=None,
@@ -682,9 +689,9 @@ def build_app(args) -> App:
 def cmd_serve(args) -> int:
     try:
         args.demo_host = demo_mode.check_demo_host(args.demo_host, args.demo)
-        if args.demo:
-            demo_mode.check_demo_home(os.environ.get("MC_HOME"))
-    except demo_mode.DemoError as exc:
+        if args.demo:  # claim the home before the logger (or anything else) writes into it
+            demo_mode.prepare_home(demo_mode.check_demo_home(os.environ.get("MC_HOME")))
+    except (demo_mode.DemoError, OSError) as exc:
         print(f"mission-control: {exc}", file=sys.stderr)
         return 2
     root = mc_chat.home()
@@ -704,6 +711,7 @@ def cmd_serve(args) -> int:
     if args.demo:
         # A fresh launch code goes to this local terminal only: it is never logged or served.
         print("DEMO MODE: fixture data only; chat reaches no agent.", flush=True)
+        print(f"build: {json.dumps(app.build, sort_keys=True)}", flush=True)
         print(f"launch (60 s, single use): {launch_url(args.port, args.demo_host)}", flush=True)
         print(f"more codes: MC_HOME=<this home> server.py url --port {args.port}"
               + (f" --demo-host {args.demo_host}" if args.demo_host else ""), flush=True)
@@ -746,8 +754,12 @@ def main(argv=None) -> int:
         return cmd_serve(args)
     if args.cmd == "url":
         try:
-            host = demo_mode.check_demo_host(args.demo_host, True) if args.demo_host else None
-        except demo_mode.DemoError as exc:
+            host = None
+            if args.demo_host:
+                host = demo_mode.check_demo_host(args.demo_host, True)
+                demo_mode.check_demo_home(os.environ.get("MC_HOME"))
+                mc_chat.secret(create=False)  # an existing demo instance only: never mint a new secret here
+        except (demo_mode.DemoError, mc_chat.ChatError) as exc:
             print(f"mission-control: {exc}", file=sys.stderr)
             return 2
         print(launch_url(args.port, host))
