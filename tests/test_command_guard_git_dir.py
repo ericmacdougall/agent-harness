@@ -731,5 +731,96 @@ class CloneApprovalTests(CloneDeleteCase):
         self.assertEqual(self.decide('rm -rf %s' % target.parent, marker=approvals)[0], 'block')
 
 
+class CloneWalkOmissionTests(CloneDeleteCase):
+    """PR 175 receipt r9 F1: a subtree the repository walk did not enumerate (past the depth backstop, below a generated
+    directory, unreadable, past a bound) makes the walk incomplete, and an incomplete walk refuses the delete unless an
+    approve-delete marker covers the exact path. Generated directories are walked, with their own entry budget."""
+
+    Verifier = CloneApprovalTests.Verifier
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        h = cls.home
+        cls.deep = h / 'archive'  # an unpushed ordinary clone seven levels below the deleted directory
+        cls.commit(cls.clone(cls.deep / '1/2/3/4/5/6/deeprepo'), 'deep local')
+        cls.deep_ok = h / 'archive-ok'  # the same depth, every commit pushed
+        cls.clone(cls.deep_ok / '1/2/3/4/5/6/deepok')
+        cls.gen_build = h / 'genarch'  # an unpushed clone beneath a directory named build
+        cls.commit(cls.clone(cls.gen_build / 'build/package/buildrepo'), 'build local')
+        cls.gen_nm = h / 'nmarch'  # and beneath node_modules
+        cls.commit(cls.clone(cls.gen_nm / 'node_modules/pkg/nmrepo'), 'nm local')
+        cls.artefacts = h / 'artefacts'  # generated output, deeper than the old depth limit, with no repository
+        (cls.artefacts / 'build/a/b/c/d/e/f/g').mkdir(parents=True)
+        (cls.artefacts / 'build/a/b/c/d/e/f/g/x.o').write_text('o\n')
+        (cls.artefacts / 'node_modules/p/node_modules/q/lib').mkdir(parents=True)
+        cls.locked = h / 'locked'  # a plain directory with an unreadable subdirectory
+        (cls.locked / 'secret').mkdir(parents=True)
+        (cls.locked / 'readme.txt').write_text('x\n')
+        os.chmod(str(cls.locked / 'secret'), 0)
+        for path in cls.clones:
+            run('git', 'fetch', '-q', str(cls.remote), '+refs/heads/*:refs/remotes/origin/*', cwd=str(path))
+        past = time.time() - 3600
+        for top in (cls.deep, cls.gen_build, cls.gen_nm):
+            for root, dirs, files in os.walk(str(top), topdown=False):
+                for name in dirs + files:
+                    os.utime(os.path.join(root, name), (past, past), follow_symlinks=False)
+            os.utime(str(top), (past, past))
+
+    @classmethod
+    def tearDownClass(cls):
+        os.chmod(str(cls.locked / 'secret'), 0o700)
+        super().tearDownClass()
+
+    def approve(self, path):
+        cg.approve_delete(str(path), 'dropbox:backups/x', verifier=self.Verifier(), home=str(self.home),
+                          policy=self.policy)
+        return cg.Approvals(home=str(self.home), compiled=cg.Compiled(self.policy, home=str(self.home)))
+
+    def test_unpushed_clone_beyond_the_old_depth_limit_blocks(self):
+        self.expect(['rm -rf %s' % self.deep, 'rm -rf %s/1' % self.deep], 'block', rule='git-clone-delete')
+
+    def test_unpushed_clone_beneath_a_generated_directory_blocks(self):
+        self.expect(['rm -rf %s' % self.gen_build, 'rm -rf %s/build' % self.gen_build, 'rm -rf %s' % self.gen_nm,
+                     'rm -rf %s/node_modules' % self.gen_nm], 'block', rule='git-clone-delete')
+
+    def test_unreadable_subdirectory_blocks_as_unverifiable(self):
+        if os.geteuid() == 0:
+            self.skipTest('root reads every directory')
+        self.expect(['rm -rf %s' % self.locked], 'block', rule='git-clone-delete-unverifiable')
+
+    def test_exact_approval_lets_each_omitted_case_go(self):
+        for top in (self.deep, self.gen_build, self.gen_nm):
+            approvals = self.approve(top)
+            self.assertEqual(self.decide('rm -rf %s' % top, marker=approvals)[0], 'allow', top)
+            # exact path only: a directory inside it is still walked and still refused
+            self.assertEqual(self.decide('rm -rf %s/1' % self.deep, marker=approvals)[0], 'block')
+        exact = str(self.locked)
+        self.assertEqual(self.decide('rm -rf %s' % exact, marker=lambda p: p == exact)[0], 'allow')
+        if os.geteuid() != 0:
+            self.assertEqual(self.decide('rm -rf %s' % self.home, marker=lambda p: p == exact)[0], 'block')
+
+    def test_depth_backstop_makes_the_walk_incomplete(self):
+        self.assertEqual(self.decide('rm -rf %s' % self.deep_ok)[0], 'allow')
+        with mock.patch.object(cg, 'CLONE_WALK_MAX_DEPTH', 3):
+            self.expect(['rm -rf %s' % self.deep_ok, 'rm -rf %s' % self.artefacts], 'block',
+                        rule='git-clone-delete-unverifiable')
+        top = self.plain.parent.parent  # plain/a/b: subdirectories at depths 1 and 2, none deeper
+        with mock.patch.object(cg, 'CLONE_WALK_MAX_DEPTH', 2):
+            self.expect(['rm -rf %s' % top], 'allow')  # ends at the backstop: fully listed, nothing omitted
+        with mock.patch.object(cg, 'CLONE_WALK_MAX_DEPTH', 1):
+            self.expect(['rm -rf %s' % top], 'block', rule='git-clone-delete-unverifiable')
+
+    def test_generated_budget_makes_the_walk_incomplete(self):
+        with mock.patch.object(cg, 'CLONE_WALK_MAX_GENERATED_ENTRIES', 2, create=True):
+            self.expect(['rm -rf %s' % self.artefacts, 'rm -rf %s/node_modules' % self.artefacts],
+                        'block', rule='git-clone-delete-unverifiable')
+            self.expect(['rm -rf %s' % self.plain], 'allow')
+
+    def test_generated_output_without_a_repository_stays_deletable(self):
+        self.expect(['rm -rf %s' % self.artefacts, 'rm -rf %s/build' % self.artefacts,
+                     'rm -rf %s/node_modules' % self.artefacts, 'rm -rf %s' % self.pushed], 'allow')
+
+
 if __name__ == '__main__':
     unittest.main()

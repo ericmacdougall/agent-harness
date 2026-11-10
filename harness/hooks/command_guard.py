@@ -2187,14 +2187,17 @@ def git_code_deletes_git_path(code):
 # Time: the hook's alarm fires at 2 * max_seconds + 1 (7 s) and a timeout on a harmless-looking command is only a
 # warning, so the whole check has CLONE_TOTAL_SECONDS per decision; one ls-remote gets min(20 s, what is left), and
 # anything that does not finish refuses the delete as unverifiable.
-CLONE_WALK_MAX_ENTRIES = 20000
-CLONE_WALK_MAX_DEPTH = 6
+# The walk never skips a subtree silently (PR 175 receipt r9 F1): a directory it does not enumerate (deeper than the
+# depth backstop, past an entry or time bound, unreadable) makes it incomplete, and an incomplete walk refuses.
+CLONE_WALK_MAX_ENTRIES = 20000  # entries listed outside generated directories
+CLONE_WALK_MAX_GENERATED_ENTRIES = 200000  # entries listed inside generated directories (CLONE_SHALLOW_NAMES)
+CLONE_WALK_MAX_DEPTH = 64  # a backstop, not a cut-off: a subdirectory below it makes the walk incomplete
 CLONE_WALK_SECONDS = 1.5
 CLONE_TOTAL_SECONDS = 4.0
 CLONE_LS_REMOTE_TIMEOUT = 20.0
 CLONE_ALLOWED_HOSTS = ('github.com', 't2-dev')
-# generated directories: their own top is checked for a repository, their contents are not walked (a tree of
-# packages can exceed the walk bound, and nobody clones into one)
+# generated directories: walked like any other (a clone can sit below build/ or node_modules/), but their entries count
+# against CLONE_WALK_MAX_GENERATED_ENTRIES so a package tree does not exhaust the bound for hand-made directories
 CLONE_SHALLOW_NAMES = frozenset(('node_modules', '__pycache__', '.venv', 'venv', '.tox', '.mypy_cache', '.pytest_cache',
                                  '.ruff_cache', '.gradle', '.next', '.cache', 'build', 'dist', 'target', '.nuxt',
                                  '.parcel-cache', '.turbo', 'coverage'))
@@ -2247,9 +2250,10 @@ CLONE_HOST_ALLOWED = _clone_host_allowed  # replaced in tests
 def clone_walk(top):
     """(repositories, complete): every directory below `top` (top included) holding a `.git` entry, and bare
     repositories by content. No symlink is followed and `.git` is never entered; working trees are walked for nested
-    repositories. Directories deeper than CLONE_WALK_MAX_DEPTH are not walked; the entry or time bound, or an
-    unreadable directory, makes the walk incomplete."""
-    repos, seen = [], 0
+    repositories. complete is True only when every directory below `top` was listed: a subdirectory deeper than
+    CLONE_WALK_MAX_DEPTH, the entry bounds (CLONE_WALK_MAX_ENTRIES, CLONE_WALK_MAX_GENERATED_ENTRIES inside generated
+    directories), the time bound, or an unreadable directory makes it incomplete. Nothing is skipped silently."""
+    repos, seen, generated = [], 0, 0
     stop = time.monotonic() + CLONE_WALK_SECONDS
     stack = [(top, 0, posixpath.basename(top.rstrip('/')) in CLONE_SHALLOW_NAMES)]
     while stack:
@@ -2260,16 +2264,20 @@ def clone_walk(top):
                 and os.path.isdir(os.path.join(current, 'refs')):
             repos.append(current)
             continue  # a bare repository: its files are the git directory
-        if depth >= CLONE_WALK_MAX_DEPTH or (shallow and depth > 0):
-            continue
         try:
             with os.scandir(current) as entries:
                 for entry in entries:
-                    seen += 1
-                    if seen > CLONE_WALK_MAX_ENTRIES or time.monotonic() > stop:
+                    if shallow:
+                        generated += 1
+                    else:
+                        seen += 1
+                    if seen > CLONE_WALK_MAX_ENTRIES or generated > CLONE_WALK_MAX_GENERATED_ENTRIES \
+                            or time.monotonic() > stop:
                         return repos, False
                     if entry.name == '.git' or not entry.is_dir(follow_symlinks=False):
                         continue
+                    if depth >= CLONE_WALK_MAX_DEPTH:
+                        return repos, False  # a subdirectory below the backstop would go unlisted
                     stack.append((entry.path, depth + 1, shallow or entry.name in CLONE_SHALLOW_NAMES))
         except OSError:
             return repos, False
@@ -5127,8 +5135,9 @@ class Analyzer:
             repos, complete = clone_walk(path)
             if not complete:
                 return 'unverifiable', ('the walk for repositories below it did not finish (more than %d entries, '
-                                        '%.1f s, or an unreadable directory)' % (CLONE_WALK_MAX_ENTRIES,
-                                                                                 CLONE_WALK_SECONDS))
+                                        '%d in generated directories, %d levels deep, %.1f s, or an unreadable '
+                                        'directory)' % (CLONE_WALK_MAX_ENTRIES, CLONE_WALK_MAX_GENERATED_ENTRIES,
+                                                        CLONE_WALK_MAX_DEPTH, CLONE_WALK_SECONDS))
             if not repos:
                 return 'ok', []
             if self._clone_deadline is None:
