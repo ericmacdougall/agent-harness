@@ -37,7 +37,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",  # Hawkeye ports (goodqa#14908)
          "backup_watch.py", "kimi_review.py", "installer_scan.py",
          "trivy_gate.py",  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
-         "mission_coverage.py")  # mission goals: owner, disposition or done evidence (goodqa#15565)
+         "mission_coverage.py", "mission_gate.py")  # mission goals: owner, disposition or done evidence (goodqa#15565)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -87,7 +87,8 @@ def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
-                         "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py")}
+                         "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",
+                         "mission_gate.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -230,6 +231,10 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     managed.setdefault("SubagentStop", []).append({"matcher": SUBAGENT_MATCHER, "hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "dropped_gate.py"), "subagent-stop"],
         "timeout": 15}]})
+    # Mission gate (goodqa#15565): blocks main's turn end while an active mission goal has no live owner, no live
+    # disposition and no done evidence. Main only, bounded per signature, silent where no goals file exists.
+    managed.setdefault("Stop", []).append({"hooks": [{"type": "command", "command": "python3",
+                                                       "args": [str(claude / "hooks" / "mission_gate.py")], "timeout": 15}]})
     # WAL cadence (rule W04, goodqa#14908): one bounded nudge when a big uncommitted diff has no recent WAL note.
     # Fails open on its own errors, so no onFailure.
     cadence = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "wal_cadence.py")], "timeout": 30}

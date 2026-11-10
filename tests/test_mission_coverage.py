@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HOOKS = ROOT / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 import mission_coverage as mc  # noqa: E402
+import mission_gate  # noqa: E402
 import ops_watch as ow  # noqa: E402
 
 NOW = 1_800_000_000.0
@@ -278,6 +279,89 @@ class Stalled(Base):
         self.assertEqual(mc.owner_progress(self.home, SESSION, "a1111111"), NOW - 3000)
 
 
+class Gate(Base):
+    def test_uncovered_goal_blocks_main_and_names_the_fix(self):
+        self.write_goals([goal()])
+        out = self.stop()
+        self.assertEqual(out.get("decision"), "block")
+        for text in ("leads", "goodqa#15095", "mission_coverage.py defer --goal leads --ask",
+                     "--user-source", "mission_coverage.py done --goal leads", "start an owner"):
+            self.assertIn(text, out["reason"])
+
+    def test_covered_goal_does_not_block(self):
+        self.write_goals([goal()])
+        self.assertEqual(self.stop([row("a1111111")]), {})
+
+    def test_main_only(self):
+        self.write_goals([goal()])
+        self.assertEqual(self.stop(agent_id="a9999999", agent_type="task-owner"), {})
+        self.assertEqual(self.stop(transcript_path=str(self.home / "elsewhere.jsonl")), {})
+
+    def test_absent_goals_file_never_blocks(self):
+        self.assertFalse(mc.goals_path(self.home).exists())
+        self.assertEqual(self.stop(), {})
+
+    def test_corrupt_goals_file_fails_safe_loud(self):
+        path = mc.goals_path(self.home)
+        path.parent.mkdir(parents=True, mode=0o700)
+        path.write_text("{not json")
+        out = self.stop()
+        self.assertEqual(out.get("decision"), "block")
+        self.assertIn("goals file unreadable", out["reason"])
+        self.assertEqual(out["reason"].count("goals file unreadable"), 1)
+
+    def test_valve_lets_the_turn_end_after_25_blocks_and_rings_high(self):
+        self.write_goals([goal()])
+        for i in range(25):
+            self.assertEqual(self.stop(now=NOW + i).get("decision"), "block", i)
+        out = self.stop(now=NOW + 30)
+        self.assertNotIn("decision", out)
+        self.assertIn("leads", out.get("systemMessage", ""))
+        ring = [e for e in ow.read_ring(ow.ring_path(self.home)) if e.get("key") == "mission:gate-valve"]
+        self.assertTrue(ring and ring[-1]["event"] == "raise" and ring[-1]["severity"] == "high")
+
+    def test_repeated_stop_hook_active_does_not_loop(self):
+        self.write_goals([goal()])
+        out = self.stop(stop_hook_active=True)
+        self.assertNotIn("decision", out)
+        self.assertIn("leads", out.get("systemMessage", ""))
+
+    def test_tampered_goals_file_blocks_loudly(self):
+        self.write_goals([goal(), goal("tokens", ticket="goodqa#15561", priority=2)])
+        path = mc.goals_path(self.home)
+        data = json.loads(path.read_text())
+        path.write_text(json.dumps([g for g in data if g["id"] != "leads"]))  # an agent drops a goal by hand
+        out = self.stop([row("a1111111", ticket="GoodQA #15561")])
+        self.assertEqual(out.get("decision"), "block")
+        self.assertIn("outside mission_coverage.py", out["reason"])
+
+    def test_cap_full_message_names_a_victim_and_the_queue_option(self):
+        goals = [goal(), goal("g2", ticket="goodqa#2", priority=2), goal("g9", ticket="goodqa#9", priority=9)]
+        self.write_goals(goals)
+        mc.set_goal(self.home, "leads", priority=1)
+        rows = [row(f"a000000{i}", ticket=f"GoodQA #{i}", last=NOW - (3000 if i == 3 else 60))
+                for i in range(1, 9)]  # 8 live owners, cap 8; a0000003 is the most idle owner on no goal
+        with mock.patch.object(mc, "owner_cap", return_value=8):
+            out = self.stop(rows)
+        self.assertEqual(out.get("decision"), "block")
+        self.assertIn("owner cap full (8/8)", out["reason"])
+        self.assertIn("a0000003", out["reason"])  # owner of goodqa#3: on no mission goal, so freed first
+        self.assertIn("queue", out["reason"])
+        advice = mc.cap_advice(mc.evaluate([goal(), goal("g9", ticket="goodqa#9", priority=9)],
+                                           [row(f"a000000{i}", ticket=f"GoodQA #{i}") for i in (9,)] +
+                                           [row(f"b000000{i}", ticket="GoodQA #9") for i in range(1, 8)],
+                                           NOW, asks={}, verify_source=never, verify_evidence=lambda g: False),
+                               [row(f"a000000{i}", ticket=f"GoodQA #{i}") for i in (9,)] +
+                               [row(f"b000000{i}", ticket="GoodQA #9") for i in range(1, 8)], 8)
+        self.assertIn("g9", advice)  # every owner is on a goal: the lowest priority goal's owner is named
+
+    def test_cap_not_full_says_nothing_about_the_cap(self):
+        self.write_goals([goal()])
+        with mock.patch.object(mc, "owner_cap", return_value=8):
+            out = self.stop([row("a0000001", ticket="GoodQA #1")])
+        self.assertNotIn("owner cap full", out["reason"])
+
+
 class Hostile(Base):
     def write_raw(self, data: bytes):
         path = mc.goals_path(self.home)
@@ -475,6 +559,17 @@ class Notify(Base):
             def new_message(*a, **k):
                 raise Chat.ChatError("no-target")
         mc.notify_main(["leads"], home=self.home, session=SESSION, chat=Chat)
+
+
+class Install(unittest.TestCase):
+    def test_gate_is_registered_next_to_the_other_stop_hooks(self):
+        sys.path.insert(0, str(ROOT))
+        import install  # noqa: PLC0415
+        self.assertIn("mission_gate.py", install.HOOKS)
+        self.assertIn("mission_coverage.py", install.HOOKS)
+        managed = install.managed_hooks(Path("/h/.claude"))
+        stops = [str(h.get("args")) for g in managed["Stop"] for h in g["hooks"]]
+        self.assertTrue(any("mission_gate.py" in s for s in stops))
 
 
 if __name__ == "__main__":
