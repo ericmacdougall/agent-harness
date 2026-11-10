@@ -2152,6 +2152,174 @@ def git_code_deletes_git_path(code):
     return False
 
 
+# ---- whole clones (goodqa#15565 follow-up, main's decision)
+# A recursive delete of a directory that holds a repository (a clone, a linked worktree, or an ancestor such as
+# ~/repos) is refused unless every repository found in it is provably lossless: every commit reachable from any ref
+# (branches, tags, stash, tracking refs) or HEAD is reachable from a sha an allowlisted network remote lists right now
+# (`git ls-remote`, run outside the repository so its config cannot redirect it). Uncommitted files do not block; the
+# allowed verdict is a warning that names them. An approve-delete marker on the exact literal path also lets it go.
+# Time: the hook's alarm fires at 2 * max_seconds + 1 (7 s) and a timeout on a harmless-looking command is only a
+# warning, so the whole check has CLONE_TOTAL_SECONDS per decision; one ls-remote gets min(20 s, what is left), and
+# anything that does not finish refuses the delete as unverifiable.
+CLONE_WALK_MAX_ENTRIES = 20000
+CLONE_WALK_MAX_DEPTH = 6
+CLONE_WALK_SECONDS = 1.5
+CLONE_TOTAL_SECONDS = 4.0
+CLONE_LS_REMOTE_TIMEOUT = 20.0
+CLONE_ALLOWED_HOSTS = ('github.com', 't2-dev')
+# generated directories: their own top is checked for a repository, their contents are not walked (a tree of
+# packages can exceed the walk bound, and nobody clones into one)
+CLONE_SHALLOW_NAMES = frozenset(('node_modules', '__pycache__', '.venv', 'venv', '.tox', '.mypy_cache', '.pytest_cache',
+                                 '.ruff_cache', '.gradle', '.next', '.cache', 'build', 'dist', 'target', '.nuxt',
+                                 '.parcel-cache', '.turbo', 'coverage'))
+# another host's directory cannot be walked from here; only these generated names may be removed recursively there
+CLONE_REMOTE_OK_NAMES = CLONE_SHALLOW_NAMES
+# git config that could run a program while the guard inspects a repository is overridden on the command line
+_CLONE_GIT_SAFE = ('-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.ext.allow=never',
+                   '-c', 'protocol.file.allow=never', '-c', 'core.sshCommand=/usr/bin/ssh', '-c', 'credential.helper=',
+                   '-c', 'core.pager=cat', '-c', 'core.untrackedCache=false', '-c', 'core.attributesFile=/dev/null',
+                   '-c', 'core.alternateRefsCommand=', '-c', 'diff.external=', '-c', 'status.submoduleSummary=false')
+
+
+def _clone_git(repo, args, timeout, stdin=None):
+    """git by an absolute system path with a constructed environment (_git_bin/_git_env); repo None runs outside any
+    repository. Returns (exit code, stdout). Raises subprocess.TimeoutExpired, OSError or ValueError."""
+    where = ['-C', repo] if repo else ['-C', '/']
+    done = subprocess.run([_git_bin()] + list(_CLONE_GIT_SAFE) + where + list(args), stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, env=_git_env(), timeout=max(0.2, timeout), check=False,
+                          input=stdin.encode() if stdin is not None else None)
+    return done.returncode, done.stdout[:8 << 20].decode('utf-8', 'replace')
+
+
+def _clone_ls_remote(url, timeout):
+    """Live head and tag shas of `url`, or None when it did not answer. Outside the repository: no insteadOf."""
+    code, out = _clone_git(None, ['ls-remote', '--upload-pack=git-upload-pack', '--', url, 'refs/heads/*',
+                                  'refs/tags/*'], timeout)
+    if code != 0:
+        return None
+    return [line.split()[0] for line in out.splitlines() if line.split()]
+
+
+def _clone_url_host(url):
+    """The host of a network git URL (https, ssh, git+ssh or scp-like), else ''. Local paths, file:// and ext:: give
+    ''. (Copied from the no-backup helper so this rule does not change with that code.)"""
+    url = str(url or '').strip()
+    m = re.match(r'^(?:https|ssh|git\+ssh)://(?:[^@/\s]+@)?([A-Za-z0-9.-]+)(?::\d+)?/\S+$', url, re.I)
+    if not m and not url.startswith(('/', '.', '~')) and '://' not in url and '::' not in url:
+        m = re.match(r'^(?:[A-Za-z0-9._-]+@)?([A-Za-z0-9.-]+):\S+$', url)
+    return m.group(1).casefold() if m else ''
+
+
+def _clone_host_allowed(host):
+    return bool(host) and host.casefold() in CLONE_ALLOWED_HOSTS
+
+
+CLONE_LS_REMOTE = _clone_ls_remote  # replaced in tests
+CLONE_HOST_ALLOWED = _clone_host_allowed  # replaced in tests
+
+
+def clone_walk(top):
+    """(repositories, complete): every directory below `top` (top included) holding a `.git` entry, and bare
+    repositories by content. No symlink is followed and `.git` is never entered; working trees are walked for nested
+    repositories. Directories deeper than CLONE_WALK_MAX_DEPTH are not walked; the entry or time bound, or an
+    unreadable directory, makes the walk incomplete."""
+    repos, seen = [], 0
+    stop = time.monotonic() + CLONE_WALK_SECONDS
+    stack = [(top, 0, posixpath.basename(top.rstrip('/')) in CLONE_SHALLOW_NAMES)]
+    while stack:
+        current, depth, shallow = stack.pop()
+        if os.path.lexists(os.path.join(current, '.git')):
+            repos.append(current)
+        elif os.path.isfile(os.path.join(current, 'HEAD')) and os.path.isdir(os.path.join(current, 'objects')) \
+                and os.path.isdir(os.path.join(current, 'refs')):
+            repos.append(current)
+            continue  # a bare repository: its files are the git directory
+        if depth >= CLONE_WALK_MAX_DEPTH or (shallow and depth > 0):
+            continue
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    seen += 1
+                    if seen > CLONE_WALK_MAX_ENTRIES or time.monotonic() > stop:
+                        return repos, False
+                    if entry.name == '.git' or not entry.is_dir(follow_symlinks=False):
+                        continue
+                    stack.append((entry.path, depth + 1, shallow or entry.name in CLONE_SHALLOW_NAMES))
+        except OSError:
+            return repos, False
+    return repos, True
+
+
+def clone_push_state(repo, deadline, cache):
+    """('ok', notes) | ('unpushed', reason) | ('unverifiable', reason) for one repository. `cache` holds live
+    listings per URL for one decision."""
+    def left():
+        remaining = deadline - time.monotonic()
+        if remaining < 0.3:
+            raise TimeoutError('time budget')
+        return remaining
+    try:
+        code, urls = _clone_git(repo, ['config', '--get-regexp', r'^remote\..*\.url$'], min(left(), 2.0))
+        live, answered, failed, hosts = set(), [], [], []
+        for line in (urls.splitlines()[:8] if code == 0 else []):
+            url = line.partition(' ')[2].strip()
+            host = _clone_url_host(url)
+            hosts.append(host or '(local or unparsed)')
+            if not CLONE_HOST_ALLOWED(host):
+                continue
+            if url not in cache:
+                try:
+                    cache[url] = CLONE_LS_REMOTE(url, min(CLONE_LS_REMOTE_TIMEOUT, left()))
+                except (subprocess.SubprocessError, OSError, ValueError):
+                    cache[url] = None
+            if cache[url] is None:
+                failed.append(host)
+                continue
+            answered.append(host)
+            live.update(s for s in cache[url] if re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', str(s)))
+        if not answered:
+            if failed:
+                return 'unverifiable', 'cannot verify push: %s did not answer a live listing' % ', '.join(failed[:3])
+            return 'unpushed', 'it has no remote on %s (remotes seen: %s)' % (
+                ', '.join(CLONE_ALLOWED_HOSTS), ', '.join(hosts[:4]) or 'none')
+        present = []
+        if live:
+            code, out = _clone_git(repo, ['cat-file', '--batch-check=%(objectname) %(objecttype)'], min(left(), 3.0),
+                                   stdin='\n'.join(sorted(live)) + '\n')
+            present = [ln.split()[0] for ln in out.splitlines() if ln.endswith((' commit', ' tag'))]
+        # --all covers every worktree's HEAD; deleting a linked worktree (its .git is a file) loses only its own HEAD,
+        # since the shared refs and the other worktrees live in the main repository's git directory
+        heads = (['--single-worktree'] if os.path.isfile(os.path.join(repo, '.git')) else []) + ['--all']
+        if _clone_git(repo, ['rev-parse', '--verify', '-q', 'HEAD'], min(left(), 2.0))[0] == 0:
+            heads.append('HEAD')
+        code, extra = _clone_git(repo, ['rev-list', '--max-count=1'] + heads + ['--stdin'], min(left(), 3.0),
+                                 stdin=''.join('^%s\n' % s for s in present))
+        if code != 0:
+            return 'unverifiable', 'cannot verify push: git rev-list failed'
+        if extra.strip():
+            missing = len(live) - len(present)
+            return 'unpushed', ('a commit on a branch, tag, stash, tracking ref or detached HEAD is on no live ref of '
+                                '%s%s; push it (and drop or push any stash) or back it up and approve the delete'
+                                % (', '.join(sorted(set(answered))[:3]),
+                                   ' (%d live refs are not in this clone: run `git fetch` first)' % missing
+                                   if missing else ''))
+        notes = []
+        try:
+            code, status = _clone_git(repo, ['status', '--porcelain=v1', '-z', '--untracked-files=normal'],
+                                      min(left(), 2.0))
+            if code == 0 and status.strip('\x00'):
+                notes.append('uncommitted or untracked files')
+            elif code != 0:
+                notes.append('a working tree git could not read (uncommitted files unknown)')
+        except (TimeoutError, subprocess.SubprocessError):
+            notes.append('a working tree not checked in time (uncommitted files unknown)')
+        return 'ok', notes
+    except TimeoutError:
+        return 'unverifiable', 'cannot verify push: the time budget ran out'
+    except (subprocess.SubprocessError, OSError, ValueError) as error:
+        return 'unverifiable', 'cannot verify push (%s)' % type(error).__name__
+
+
 def _list_operands(name, texts):
     """File operands of a GIT_LIST_READERS command given its argument texts, or None when its output is not a subset of
     its input lines (grep -o/-r, uniq/sort writing elsewhere is fine). An empty list means it reads stdin."""
@@ -2332,6 +2500,12 @@ class Analyzer:
         self._git_texts = []
         self._git_frames = []
         self._git_flow_feeds = {}
+        # whole-clone rule: the delete being judged is recursive; live listings per URL, the per-decision deadline and
+        # each path's verdict (so a second `>!` reading does not repeat git or the network)
+        self._git_recursive = False
+        self._clone_cache = {}
+        self._clone_deadline = None
+        self._clone_done = {}
 
     def _probe(self, kind, path, fn):
         """One disk probe per analysis. The command has not run, so a path's lexists/realpath/marker answer is
@@ -3695,8 +3869,16 @@ class Analyzer:
                         'find follows symlinks (-L or -follow) while deleting, so a link inside the tree can lead '
                         'into a protected harness location',
                         'drop -L/-follow; find does not need to follow links to clean a build tree')
-            for r in roots:
-                self.protected_target('find -delete/-exec', r)
+            # without a name/path/regex test find deletes everything under its roots, repositories included; a test that
+            # could match .git is git_find_patterns' job
+            whole = not any(t in ('-name', '-iname', '-path', '-ipath', '-wholename', '-iwholename', '-regex',
+                                  '-iregex') for t in texts)
+            saved, self._git_recursive = getattr(self, '_git_recursive', False), whole
+            try:
+                for r in roots:
+                    self.protected_target('find -delete/-exec', r)
+            finally:
+                self._git_recursive = saved
             self.git_find_patterns(texts)
         for body in exec_cmds:
             if not body:
@@ -4783,6 +4965,9 @@ class Analyzer:
                 kind = 'git'  # a directory named like a lock file is not a lock file
             if kind is None and exact and not remote and self._git_dir_by_content(path):
                 kind = 'git'
+            if kind is None and getattr(self, '_git_recursive', False) and not word.dynamic \
+                    and not is_dynamic_path(alt) and self.git_clone_refuse(what, path, exact, remote):
+                return True
             if kind != 'git':
                 continue
             if exact and not remote and ctx.marker is not None and ctx.marker(path):
@@ -4802,6 +4987,95 @@ class Analyzer:
             if self._git_check_feed(what, self._git_feed_from_text(sub, remote)):
                 return True
         return False
+
+    @staticmethod
+    def _recursive_rm(name, args, texts):
+        """rm -r/-R/--recursive, Remove-Item -Recurse, trash (which takes directories whole)."""
+        if name in ('trash', 'trash-put', 'srm', 'shred'):
+            return name in ('trash', 'trash-put')
+        if name in ('rmdir', 'unlink'):
+            return False  # rmdir removes only an empty directory, unlink a single file
+        return bool(_flag_letters(args) & {'r', 'R'}) or '--recursive' in texts or any(
+            t.casefold() in ('-recurse', '-r', '/s') for t in texts)
+
+    def git_clone_refuse(self, what, path, exact, remote):
+        """Whole-clone rule (see CLONE_TOTAL_SECONDS): a recursive delete of a directory holding a repository. True when
+        it added a refusal; an allowed delete of a repository with uncommitted files adds a warning."""
+        ctx = self.ctx
+        leaf = posixpath.basename(path.rstrip('/'))
+        if remote:
+            if leaf in CLONE_REMOTE_OK_NAMES and not any(ch in path for ch in GLOB_CHARS):
+                return False
+            ctx.add(LOG_DELETE, 'git-clone-delete-unverifiable',
+                    ('%s removes a directory on another host (%s); the guard cannot walk it there to rule out a git '
+                     'repository with unpushed work, and no approval made here covers it' % (what, path[-80:]))[:300],
+                    'run the delete on that host itself, where the guard checks the push state or an approve-delete '
+                    'marker; generated directories (%s) may be removed remotely'
+                    % ', '.join(sorted(CLONE_REMOTE_OK_NAMES)[:6]))
+            return True
+        segs = Compiled._segs(path.casefold())
+        if any(_prefix_match(segs, r) for r in self.c.roots):
+            return False  # the harness trees keep their own rules (own worktree, reproducible clone, work_gc)
+        if any(ch in path for ch in GLOB_CHARS):
+            matches = self._glob_with_hidden(path, 2000)
+            if matches is None:
+                ctx.add(LOG_DELETE, 'git-clone-delete-unverifiable', ('%s: the pattern %s matches too much to check for '
+                        'git repositories' % (what, path[-60:]))[:300], 'delete the directories by literal path')
+                return True
+            return any(self.git_clone_refuse(what, m, True, False) for m in matches[:2000])
+        if not self._probe('id', path, os.path.isdir) or self._probe('il', path, os.path.islink):
+            return False  # a file, a missing path, or a symlink (rm removes the link only)
+        if exact and ctx.marker is not None and ctx.marker(path):
+            return False
+        done = self._clone_done.get(path)
+        if done is None:
+            done = self._clone_verdict(path)
+            self._clone_done[path] = done
+        kind, detail = done
+        if kind == 'ok':
+            if detail:
+                ctx.add('git_clone_note', 'git-clone-delete-dirty',
+                        ('%s removes %s: every commit is pushed, but it holds %s, which will be lost'
+                         % (what, path[-80:], '; '.join(detail)[:120]))[:300],
+                        'commit and push them first if they matter')
+            return False
+        if kind == 'unverifiable':
+            ctx.add(LOG_DELETE, 'git-clone-delete-unverifiable',
+                    ('%s removes %s, which holds a git repository, and %s' % (what, path[-80:], detail))[:300],
+                    'retry when the remote answers, or back it up to Dropbox and run `command_guard.py approve-delete '
+                    '--path P --remote REMOTE`, then delete the literal path')
+        else:
+            ctx.add(LOG_DELETE, 'git-clone-delete',
+                    ('%s removes %s, which holds a git repository with work that may exist nowhere else: %s'
+                     % (what, path[-80:], detail))[:300],
+                    'push every branch, tag and stash (or `git bundle create X.bundle --all`), or back it up to Dropbox '
+                    'and run `command_guard.py approve-delete --path P --remote REMOTE`, then delete the literal path')
+        return True
+
+    def _clone_verdict(self, path):
+        """('ok', notes) | ('unpushed'|'unverifiable', detail) for every repository under `path`."""
+        started = time.monotonic()
+        try:
+            repos, complete = clone_walk(path)
+            if not complete:
+                return 'unverifiable', ('the walk for repositories below it did not finish (more than %d entries, '
+                                        '%.1f s, or an unreadable directory)' % (CLONE_WALK_MAX_ENTRIES,
+                                                                                 CLONE_WALK_SECONDS))
+            if not repos:
+                return 'ok', []
+            if self._clone_deadline is None:
+                self._clone_deadline = time.monotonic() + CLONE_TOTAL_SECONDS
+            notes = []
+            for repo in repos:
+                kind, detail = clone_push_state(repo, self._clone_deadline, self._clone_cache)
+                shown = posixpath.relpath(repo, path) if repo != path else posixpath.basename(path)
+                if kind != 'ok':
+                    return kind, '%s: %s' % (shown[-60:], detail)
+                notes.extend('%s in %s' % (n, shown[-40:]) for n in detail)
+            return 'ok', notes
+        finally:
+            # git and the network are credited back to the analysis budget; CLONE_TOTAL_SECONDS bounds them
+            self.ctx.budget.deadline += time.monotonic() - started
 
     # A feed describes what a stdin- or list-fed delete receives:
     #   ('lines', [text], label)      literal lines (a list file read here, echo/printf words, a here-string or heredoc)
@@ -4980,7 +5254,17 @@ class Analyzer:
         if feed is None:
             cmd = pl.cmds[idx] if pl is not None and idx < len(pl.cmds) else None
             feed = self._git_stdin_feed(cmd, pl, idx, remote)
-        self._git_check_feed('xargs deletion', feed)
+        saved, self._git_recursive = getattr(self, '_git_recursive', False), self._recursive_text(texts)
+        try:
+            self._git_check_feed('xargs deletion', feed)
+        finally:
+            self._git_recursive = saved
+
+    @staticmethod
+    def _recursive_text(texts):
+        """A delete spelled in words (xargs rm -rf, ssh host rm -r ...) that removes directories whole."""
+        return bool(re.search(r'(?:^|\s)(?:-[A-Za-z]*[rR][A-Za-z]*|--recursive)(?:\s|$)', ' '.join(texts))) or any(
+            norm_name(t) in ('trash', 'trash-put', 'rimraf') for t in texts)
 
     def git_note_read_feed(self, args, cmd, pl, idx):
         """`read p` / `mapfile a`: remember what fed it, so a later `rm "$p"` checks those paths. A `while read` loop
@@ -5022,10 +5306,16 @@ class Analyzer:
         texts = [a.text for a in args]
         if not any(a.subs for a in args) or not STDIN_DELETER.search(' '.join(texts)):
             return
-        for a in args:
-            for sub in a.subs:
-                if self._git_check_feed('remote deletion', self._git_feed_from_text(sub, getattr(self, '_git_remote', 0) > 0)):
-                    return
+        saved = getattr(self, '_git_recursive', False)
+        # the operands run on the other host: a recursive delete of them is judged as remote (see git_clone_refuse)
+        self._git_recursive, self._git_remote = self._recursive_text(texts), getattr(self, '_git_remote', 0) + 1
+        try:
+            for a in args:
+                for sub in a.subs:
+                    if self._git_check_feed('remote deletion', self._git_feed_from_text(sub, self._git_remote > 1)):
+                        return
+        finally:
+            self._git_recursive, self._git_remote = saved, self._git_remote - 1
 
     def git_find_patterns(self, texts):
         """find -delete / -exec rm: a -name/-path/-regex test that can match a .git directory or a path inside one, not
@@ -5321,8 +5611,13 @@ class Analyzer:
         if name in RM_CMDS:
             if ctx.ps:
                 nd = [a for a in args if not re.match(r'^-[A-Za-z]+$', a.text)]
-            for w in nd:
-                self.refuse(name, w)
+            saved = getattr(self, '_git_recursive', False)
+            self._git_recursive = self._recursive_rm(name, args, texts)  # goodqa#15565 whole-clone rule
+            try:
+                for w in nd:
+                    self.refuse(name, w)
+            finally:
+                self._git_recursive = saved
         elif name in MV_CMDS:
             dest, sources = None, nd
             if '-t' in texts or '--target-directory' in texts:
@@ -5425,7 +5720,11 @@ class Analyzer:
                    or t == '--remove-sent-files' for t in texts):
                 pos = [a for a in nd if not self._remote_spec(a.text)]
                 if any(t.startswith('--del') for t in texts) and nd and not self._remote_spec(nd[-1].text):
-                    self.refuse('rsync --delete (destination)', nd[-1])
+                    saved, self._git_recursive = getattr(self, '_git_recursive', False), True
+                    try:
+                        self.refuse('rsync --delete (destination)', nd[-1])
+                    finally:
+                        self._git_recursive = saved
                 if '--remove-source-files' in texts or '--remove-sent-files' in texts:
                     for w in pos[:-1] if pos and pos[-1] is nd[-1] else pos:
                         self.refuse('rsync --remove-source-files (source)', w)

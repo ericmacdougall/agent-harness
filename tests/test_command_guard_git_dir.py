@@ -16,6 +16,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 HOOKS = Path(os.environ.get('CG_HOOKS_DIR') or ROOT / 'harness/hooks')
@@ -88,7 +89,8 @@ class GitDirCase(unittest.TestCase):
         for row in rows:
             verdict, message = self.decide(row, cwd=cwd, marker=marker)
             # a block must come from this rule, not from an unrelated one (a parse failure, a harness-root rule)
-            if verdict != want or (want == 'block' and 'git-dir-delete' not in message):
+            if verdict != want or (want == 'block' and 'git-dir-delete' not in message
+                                   and 'git-clone-delete' not in message):
                 wrong.append('%r -> %s %s' % (row, verdict, message.splitlines()[:1]))
         self.assertEqual(wrong, [], '%d of %d rows wrong:\n%s' % (len(wrong), len(rows), '\n'.join(wrong)))
 
@@ -248,10 +250,13 @@ class RemoteDeleteTests(GitDirCase):
             'ssh dev2 rm -rf $(cat @SWEEP@)',
         ], 'block')
         self.expect([
-            'ssh dev2 xargs rm -rf < @OK@',
             'cat @OK@ | ssh dev2 xargs rm -f',
             'ssh dev2 rm -rf /home/eric/tmp/build',
+            'ssh dev2 rm -rf /srv/app/node_modules',
         ], 'allow')
+        # the whole-clone rule: a recursive delete of another host's directories cannot be walked from here, so a list
+        # without .git entries still blocks when it names ordinary directories there
+        self.expect(['ssh dev2 xargs rm -rf < @OK@'], 'block')
 
     def test_remote_list_files_cannot_be_read_so_they_block(self):
         self.expect([
@@ -334,6 +339,233 @@ class InterpreterTests(GitDirCase):
             "python3 -c \"import os; os.remove('.git/index.lock')\"",
             "node -e \"require('fs').rmSync('dist', {recursive: true})\"",
         ], 'allow')
+
+
+class CloneDeleteCase(unittest.TestCase):
+    """goodqa#15565 follow-up (main's decision): deleting a directory that holds a git repository (a clone, a linked
+    worktree, or an ancestor such as ~/repos) is refused unless every repository in it is provably pushed to a live
+    allowlisted remote, or an approve-delete marker covers the exact path. A local bare repository stands in for the
+    network remote through an injected ls-remote."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix='cg-clone-')
+        cls.home = Path(os.path.realpath(cls._tmp.name))
+        cls._old_home = os.environ.get('HOME')
+        os.environ['HOME'] = str(cls.home)
+        h = cls.home
+        for rel in ('.claude/projects/p/a.jsonl', '.agent-harness/state/x.json'):
+            (h / rel).parent.mkdir(parents=True, exist_ok=True)
+            (h / rel).write_text('x\n')
+        cls.clones = []
+        cls.remote = h / 'remote/proj.git'
+        run('git', 'init', '-q', '--bare', '-b', 'main', str(cls.remote))
+        cls.url = 'https://github.com/acme/proj.git'
+        repos = h / 'repos'
+        cls.pushed = cls.clone(repos / 'pushed')
+        cls.unpushed = cls.clone(repos / 'unpushed')
+        cls.commit(cls.unpushed, 'local only')
+        cls.stashed = cls.clone(repos / 'stashed')
+        (cls.stashed / 'c-stashed.txt').write_text('changed\n')
+        run('git', 'stash', '-q', cwd=str(cls.stashed))
+        assert run('git', 'stash', 'list', cwd=str(cls.stashed)).strip()
+        cls.detached = cls.clone(repos / 'detached')
+        run('git', 'checkout', '-q', '--detach', cwd=str(cls.detached))
+        cls.commit(cls.detached, 'detached work')
+        cls.tagged = cls.clone(repos / 'tagged')
+        cls.commit(cls.tagged, 'tagged only')
+        run('git', 'tag', 'v-local', cwd=str(cls.tagged))
+        run('git', 'reset', '-q', '--hard', 'HEAD~1', cwd=str(cls.tagged))
+        cls.dirty = cls.clone(h / 'dirtyhold/dirty')
+        (cls.dirty / 'notes.txt').write_text('uncommitted\n')
+        cls.noremote = h / 'loose/noremote'
+        run('git', 'init', '-q', '-b', 'main', str(cls.noremote))
+        cls.commit(cls.noremote, 'no remote')
+        cls.badhost = cls.clone(h / 'loose/badhost')
+        run('git', 'remote', 'set-url', 'origin', 'https://evil.example/acme/proj.git', cwd=str(cls.badhost))
+        cls.holder = h / 'holder'  # only pushed, clean repositories, one nested two levels down
+        cls.clone(cls.holder / 'a')
+        cls.clone(cls.holder / 'group/b')
+        (cls.holder / 'notes').mkdir()
+        cls.nested_parent = h / 'nestedparent'  # a plain directory with an unpushed repository two levels down
+        inner = cls.clone(cls.nested_parent / 'x/inner')
+        cls.commit(inner, 'inner local')
+        cls.outer = cls.clone(h / 'outer')  # pushed outer, unpushed repository inside its working tree
+        cls.commit(cls.clone(cls.outer / 'vendor/sub'), 'sub local')
+        cls.wt_main = cls.clone(h / 'wtmain/main')
+        cls.wt_clean = h / 'wtmain/clean'
+        run('git', 'worktree', 'add', '-q', '--detach', str(cls.wt_clean), cwd=str(cls.wt_main))
+        cls.wt_dirty = h / 'wtmain/detached'
+        run('git', 'worktree', 'add', '-q', '--detach', str(cls.wt_dirty), cwd=str(cls.wt_main))
+        cls.commit(cls.wt_dirty, 'worktree detached work')
+        cls.plain = h / 'plain/a/b'
+        cls.plain.mkdir(parents=True)
+        (cls.plain / 'f.txt').write_text('x\n')
+        (cls.pushed / 'node_modules/pkg').mkdir(parents=True)
+        (cls.pushed / 'build').mkdir()
+        cls.many = h / 'many'
+        (cls.many / 'deep').mkdir(parents=True)
+        for k in range(60):
+            (cls.many / ('f%02d' % k)).write_text('x\n')
+        lists = h / 'lists'
+        lists.mkdir()
+        cls.bad_list = lists / 'bad.txt'
+        cls.bad_list.write_text('%s\n%s\n' % (cls.plain, cls.unpushed))
+        cls.good_list = lists / 'good.txt'
+        cls.good_list.write_text('%s\n%s\n' % (cls.plain, cls.pushed / 'build'))
+        # every clone sees the remote's final tips (later clones pushed after earlier ones fetched), as after a fetch
+        for path in cls.clones:
+            run('git', 'fetch', '-q', str(cls.remote), '+refs/heads/*:refs/remotes/origin/*', cwd=str(path))
+        cls.policy = cg.load_policy(path=str(h / 'no-such-policy.json'))
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._old_home is None:
+            os.environ.pop('HOME', None)
+        else:
+            os.environ['HOME'] = cls._old_home
+        cls._tmp.cleanup()
+
+    @classmethod
+    def commit(cls, path, message):
+        (Path(path) / ('%s.txt' % message.replace(' ', '-'))).write_text(message + '\n')
+        run('git', 'add', '-A', cwd=str(path))
+        run('git', 'commit', '-q', '-m', message, cwd=str(path))
+
+    @classmethod
+    def clone(cls, path):
+        """A clone whose branch is pushed to the bare remote, its origin URL then pointed at github.com."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        run('git', 'clone', '-q', str(cls.remote), str(path))
+        if not run('git', 'branch', '--list', cwd=str(path)).strip():  # the first clone of an empty remote
+            run('git', 'checkout', '-q', '-b', 'main', cwd=str(path))
+        cls.commit(path, 'c-%s' % path.name)
+        run('git', 'push', '-q', 'origin', 'HEAD:main', cwd=str(path))
+        run('git', 'fetch', '-q', 'origin', cwd=str(path))
+        run('git', 'remote', 'set-url', 'origin', cls.url, cwd=str(path))
+        cls.clones.append(path)
+        return path
+
+    def setUp(self):
+        self.calls = []
+
+        def ls_remote(url, timeout):
+            self.calls.append(url)
+            if url != self.url:
+                return None
+            done = subprocess.run(['git', '--git-dir', str(self.remote), 'for-each-ref', '--format=%(objectname)',
+                                   'refs/heads', 'refs/tags'], stdout=subprocess.PIPE, check=False)
+            return done.stdout.decode().split()
+        self.patches = [mock.patch.object(cg, 'CLONE_LS_REMOTE', ls_remote, create=True)]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+
+    def decide(self, command, cwd=None, marker=None):
+        cwd = str(cwd or self.home)
+        compiled = cg.Compiled(self.policy, home=str(self.home), cwd=cwd)
+        return cg.decide(command, compiled, cwd=cwd, marker=marker)
+
+    def expect(self, rows, want, rule=None, cwd=None, marker=None):
+        wrong = []
+        for row in rows:
+            verdict, message = self.decide(row, cwd=cwd, marker=marker)
+            if verdict != want or (rule and rule not in message):
+                wrong.append('%r -> %s %s' % (row, verdict, message.splitlines()[:1]))
+        self.assertEqual(wrong, [], '%d of %d rows wrong:\n%s' % (len(wrong), len(rows), '\n'.join(wrong)))
+
+
+class CloneDeleteTests(CloneDeleteCase):
+    def test_unpushed_work_in_a_repository_blocks(self):
+        self.expect(['rm -rf %s' % self.unpushed, 'rm -rf %s' % self.stashed, 'rm -rf %s' % self.detached,
+                     'rm -rf %s' % self.tagged, 'rm -rf %s' % self.noremote, 'rm -rf %s' % self.badhost,
+                     'rm -r %s/' % self.unpushed, 'cd %s && rm -rf unpushed' % (self.home / 'repos')],
+                    'block', rule='git-clone-delete')
+
+    def test_ancestors_holding_unpushed_repositories_block(self):
+        self.expect(['rm -rf %s' % (self.home / 'repos'), 'rm -rf %s/*' % (self.home / 'repos'),
+                     'find %s -maxdepth 1 -exec rm -rf {} +' % (self.home / 'repos'),
+                     'find %s -delete' % (self.home / 'repos'),
+                     'rm -rf %s' % self.nested_parent, 'rm -rf %s' % self.outer,
+                     'rsync -a --delete %s/ %s/' % (self.plain, self.unpushed)],
+                    'block', rule='git-clone-delete')
+
+    def test_linked_worktree_with_unpushed_detached_head_blocks(self):
+        self.expect(['rm -rf %s' % self.wt_dirty], 'block', rule='git-clone-delete')
+
+    def test_list_fed_and_remote_clone_deletes_block(self):
+        self.expect(['xargs rm -rf < %s' % self.bad_list, 'cat %s | xargs rm -rf' % self.bad_list,
+                     'rm -rf $(cat %s)' % self.bad_list,
+                     'while read p; do rm -rf "$p"; done < %s' % self.bad_list],
+                    'block', rule='git-clone-delete')
+        # another host's directory cannot be walked or pushed-checked from here
+        self.expect(['ssh dev2 rm -rf /home/eric/repos/harness', "ssh dev2 'rm -rf /home/eric/repos'",
+                     "ssh dev2 'cd /home/eric/repos && rm -rf bugtracker'", 'ssh dev2 xargs rm -rf < %s' % self.good_list],
+                    'block', rule='git-clone-delete-unverifiable')
+
+    def test_network_failure_blocks_as_unverifiable(self):
+        with mock.patch.object(cg, 'CLONE_LS_REMOTE', lambda url, timeout: None, create=True):
+            self.expect(['rm -rf %s' % self.pushed, 'rm -rf %s' % self.holder], 'block',
+                        rule='git-clone-delete-unverifiable')
+
+        def boom(url, timeout):
+            raise subprocess.TimeoutExpired('git', timeout)
+        with mock.patch.object(cg, 'CLONE_LS_REMOTE', boom, create=True):
+            self.expect(['rm -rf %s' % self.pushed], 'block', rule='git-clone-delete-unverifiable')
+
+    def test_incomplete_walk_blocks_as_unverifiable(self):
+        with mock.patch.object(cg, 'CLONE_WALK_MAX_ENTRIES', 50, create=True):
+            self.expect(['rm -rf %s' % self.many], 'block', rule='git-clone-delete-unverifiable')
+
+    def test_pushed_repositories_stay_deletable(self):
+        self.expect(['rm -rf %s' % self.pushed, 'rm -rf %s' % self.holder, 'rm -rf %s' % self.wt_clean,
+                     'xargs rm -rf < %s' % self.good_list], 'allow')
+
+    def test_live_listing_is_cached_per_url_within_one_decision(self):
+        self.assertEqual(self.decide('rm -rf %s' % self.holder)[0], 'allow')
+        self.assertEqual(self.calls, [self.url])
+
+    def test_dirty_working_tree_alone_does_not_block_but_is_named(self):
+        verdict, message = self.decide('rm -rf %s' % self.dirty)
+        self.assertEqual(verdict, 'warn', message)
+        self.assertIn('git-clone-delete', message)
+        self.assertIn('uncommitted', message)
+
+    def test_ordinary_directory_deletes_stay_allowed(self):
+        self.expect(['rm -rf node_modules', 'rm -rf build', 'rm -rf %s/node_modules' % self.pushed,
+                     'rm -rf %s' % (self.home / 'plain'), 'rm -rf %s' % self.plain, 'rm -rf %s/src' % self.pushed,
+                     'rm -f %s/c-pushed.txt' % self.pushed, 'rm -rf %s' % (self.home / 'nothing-here'),
+                     'ssh dev2 rm -rf /srv/app/node_modules', 'ssh dev2 rm -f /home/eric/repos/harness/README.md',
+                     'rm -rf %s' % self.many], 'allow', cwd=self.pushed)
+
+
+class CloneApprovalTests(CloneDeleteCase):
+    class Verifier:
+        def remote_types(self):
+            return {'dropbox': 'dropbox'}
+
+        def verify(self, local_root, manifest, remote):
+            return cg.VerifyResult(True, checked=len(manifest))
+
+    def test_verified_backup_approval_covers_the_exact_clone(self):
+        target = self.clone(self.home / ('approved/u-%d' % time.monotonic_ns()))
+        self.commit(target, 'local work')
+        past = time.time() - 3600
+        for root, dirs, files in os.walk(str(target), topdown=False):
+            for name in dirs + files:
+                os.utime(os.path.join(root, name), (past, past), follow_symlinks=False)
+        os.utime(str(target), (past, past))
+        self.assertEqual(self.decide('rm -rf %s' % target)[0], 'block')
+        cg.approve_delete(str(target), 'dropbox:backups/x', verifier=self.Verifier(), home=str(self.home),
+                          policy=self.policy)
+        approvals = cg.Approvals(home=str(self.home), compiled=cg.Compiled(self.policy, home=str(self.home)))
+        self.assertEqual(self.decide('rm -rf %s' % target, marker=approvals)[0], 'allow')
+        approvals = cg.Approvals(home=str(self.home), compiled=cg.Compiled(self.policy, home=str(self.home)))
+        self.assertEqual(self.decide('rm -rf %s' % target.parent, marker=approvals)[0], 'block')
 
 
 if __name__ == '__main__':
