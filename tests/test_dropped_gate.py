@@ -462,6 +462,77 @@ class BindingEndToEnd(Base):
         self.assertIn("quietone", self.owners()["undisposed"])
 
 
+class SameTicketReassignment(Base):
+    """PR 163 final-gate review F1 (GoodQA #15565): liveness.holds_work lets a live non-owner agent hold a stream when
+    it holds the stream's ticket, but `ah owners` checked reassignment coverage without the ticket, so a valid
+    same-ticket reassignment left the owner undisposed and kept the Stop gate blocked. dropowner's stream is
+    goodqa#14791 (its WAL note)."""
+
+    def add_live_general(self, name, ticket):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 900), "event": "subagent", "agent_id": name, "agent_type": "general-purpose"}])
+        jl(w / ("agent-%s.jsonl" % name), [{"at": iso(NOW - 20), "event": "intent", "note": "working GoodQA " + ticket}])
+
+    def add_returned(self, name):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 9000), "event": "subagent", "agent_id": name, "agent_type": "task-owner"},
+                              {"at": iso(NOW - 200), "event": "subagent_stop", "agent_id": name, "agent_type": "task-owner"}])
+        jl(w / ("agent-%s.jsonl" % name), [{"at": iso(NOW - 4000), "event": "intent", "note": "was working"}])
+
+    def reassign(self, agent, ref, key):
+        ah.write(self.home, "task.dispose", {"agent": agent, "session": SESSION, "kind": "reassigned", "at": iso(NOW),
+                                             "ref": ref}, SESSION, key)
+
+    def check_shape(self, by, holder, ticket):
+        self.assertEqual(by["dropowner"]["state"], "DROPPED")
+        self.assertTrue(liveness.same_ticket(by["dropowner"]["ticket"], "goodqa#14791"))
+        self.assertIs(by[holder]["owner"], False)  # live, not an owner: holds only by ticket
+        self.assertTrue(by[holder]["state"].startswith("live"), by[holder]["state"])
+        self.assertTrue(liveness.same_ticket(by[holder]["ticket"], ticket))
+
+    def test_a_live_non_owner_on_the_same_ticket_takes_the_reassignment(self):
+        self.add_live_general("samestream01", "goodqa#14791")
+        self.reassign("dropowner", "samestream01", "st-same-00000")
+        out = self.owners()
+        by = {r["agent_id"]: r for r in out["owners"]}
+        self.check_shape(by, "samestream01", "goodqa#14791")
+        self.assertTrue(by["dropowner"]["disposition"]["live"])
+        self.assertFalse(by["dropowner"]["decision_required"])
+        self.assertNotIn("dropowner", out["undisposed"])
+        self.assertEqual(self.stop(), {})
+
+    def test_a_live_non_owner_on_another_ticket_does_not(self):
+        self.add_live_general("otherstream1", "goodqa#999")
+        self.reassign("dropowner", "otherstream1", "st-other-0000")
+        out = self.owners()
+        by = {r["agent_id"]: r for r in out["owners"]}
+        self.check_shape(by, "otherstream1", "goodqa#999")
+        self.assertFalse(by["dropowner"]["disposition"]["live"])
+        self.assertIn("dropowner", out["undisposed"])
+        self.assertEqual(self.stop().get("decision"), "block")
+
+    def test_a_chain_reaches_the_same_ticket_holder_at_its_end(self):
+        """A reassigned to B (returned, holds nothing) reassigned to C, where only C holds the stream's ticket."""
+        self.add_returned("middle0001")
+        self.add_live_general("chainend001", "goodqa#14791")
+        self.reassign("middle0001", "chainend001", "st-chain-b000")
+        self.reassign("dropowner", "middle0001", "st-chain-a000")
+        out = self.owners()
+        by = {r["agent_id"]: r for r in out["owners"]}
+        self.check_shape(by, "chainend001", "goodqa#14791")
+        self.assertTrue(by["dropowner"]["disposition"]["live"])
+        self.assertNotIn("dropowner", out["undisposed"])
+
+    def test_a_chain_ending_on_another_ticket_does_not(self):
+        self.add_returned("middle0002")
+        self.add_live_general("chainend002", "goodqa#999")
+        self.reassign("middle0002", "chainend002", "st-chain-d000")
+        self.reassign("dropowner", "middle0002", "st-chain-c000")
+        out = self.owners()
+        self.assertFalse({r["agent_id"]: r for r in out["owners"]}["dropowner"]["disposition"]["live"])
+        self.assertIn("dropowner", out["undisposed"])
+
+
 class SubagentStopGate(Base):
     """I7: a sub-agent cannot end its turn with pending work and no armed waiter (desktop release owner, 2026-11-05)."""
 

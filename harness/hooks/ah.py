@@ -399,26 +399,28 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     live_parents = {r["parent"] for r in rows if r.get("parent") and r["state"] == "live"}
     by_id = {r["agent_id"]: r for r in rows}
 
-    def covered(agent_id, seen=()):
+    def covered(agent_id, seen=(), ticket=None):
         """A reassignment target holds the work when it is live, or is DROPPED but excused by its own live disposition
         (a named wait, a fresh resume, or a further reassignment). The chain is cycle-safe and each link
         keeps its own expiry, so an inherited wait ends when the target's wait ends (goodqa#14791).
         A target whose own disposition is permanent (closed, legacy, superseded, wontdo) does not hold reassigned
         work: that excuse would skip every check the dispose guard makes on the reassigned owner, and one legacy row
-        could clear any number of drops (PR review of 24a786c, F1; main's decision). Close each owner on its own."""
+        could clear any number of drops (PR review of 24a786c, F1; main's decision). Close each owner on its own.
+        `ticket` is the reassigned stream's ticket, carried down the whole chain, so a live non-owner holding that
+        ticket holds the work here exactly as in liveness.disposition_bound (PR 163 final-gate review F1)."""
         t = by_id.get(agent_id)
         if t is None or agent_id in seen:
             return False
         td = disp.get(agent_id)
         if td and td.get("kind") in GUARDED_KINDS and not t["state"].startswith(("live", "working", "waiting")):
             return False  # checked first: the row loop below relabels such a target (superseded, unverified-legacy)
-        if liveness.holds_work(t) or agent_id in live_parents:  # GoodQA #15565: live means active in the last 10 min
+        if liveness.holds_work(t, ticket) or agent_id in live_parents:  # GoodQA #15565: live means active in the last 10 min
             return True
         # Any other state (SILENT, DROPPED, done, handoff, returned, waiting) is excused only by the target's own bound
         # disposition: an owner that returned a result and then went into a named wait on a live holder still holds
         # the work (main repro 2026-11-06: pet-leads-x moved to a done owner waiting on goodqa#14883).
         if td and td.get("kind") == "reassigned":
-            return covered(td.get("ref"), seen + (agent_id,))
+            return covered(td.get("ref"), seen + (agent_id,), ticket)
         if td and td.get("kind") == "waiting":
             return (liveness.disposition_live(td, now, last_activity=parse_ts(t["last_activity"]) or 0.0)
                     and liveness.disposition_bound(td, t, by_id, rows, asks))
@@ -429,10 +431,11 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         last_wal = parse_ts(r["last_activity"]) or 0.0
         alive = liveness.disposition_live(d, now, last_activity=last_wal,
                                           replacement_live=bool(d and d.get("kind") == "reassigned"
-                                                                and covered(d.get("ref"), (r["agent_id"],))))
+                                                                and covered(d.get("ref"), (r["agent_id"],), r.get("ticket"))))
         if alive and d and d.get("kind") in liveness.BINDING_KINDS:
             # GoodQA #15565 (never-drop 16.1): a claim that someone holds the work counts only while the named holder is live
-            alive = liveness.disposition_bound(d, r, by_id, rows, asks, lambda ref: covered(ref, (r["agent_id"],)))
+            alive = liveness.disposition_bound(d, r, by_id, rows, asks,
+                                               lambda ref: covered(ref, (r["agent_id"],), r.get("ticket")))
         r["disposition"] = dict(d, live=alive) if d else None
         r["decision_required"] = bool(r["owner"] and r["state"] in ("DROPPED", "SILENT-HIGH") and not alive)
         if d and d.get("kind") in ("legacy", "superseded", "wontdo") and r["state"] not in ("done", "handoff", "returned") \
@@ -448,7 +451,8 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             # #134 red-team P4: only main's wait acknowledges, marked --ack-handoff (an owner cannot set it)
             # GoodQA #15565 (red-team D1): resumed and reassigned acknowledge only while their named holder is live
             acknowledged = (kind in ("resumed", "reassigned")
-                            and liveness.disposition_bound(d, r, by_id, rows, asks, lambda ref, me=r["agent_id"]: covered(ref, (me,)))
+                            and liveness.disposition_bound(d, r, by_id, rows, asks,
+                                                           lambda ref, me=r["agent_id"], tk=r.get("ticket"): covered(ref, (me,), tk))
                             ) or kind in GUARDED_KINDS or (
                 kind == "waiting" and d.get("ack_handoff") is True
                 and liveness.disposition_live(d, now, last_activity=handed)
