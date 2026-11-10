@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -34,12 +35,16 @@ class Case(unittest.TestCase):
         self.head_ok = True
 
     def runner(self, argv, timeout, env=None):
+        # a linear-history model only: divergence and unknown shas are exercised with real git in RealGitAncestry
+        if "rev-parse" in argv and argv[-1].endswith("^{commit}"):
+            return 0, argv[-1][: -len("^{commit}")] + "\n"
         if "rev-parse" in argv:
             return (0, HEAD + "\n") if self.head_ok else (128, "")
         if "log" in argv:
             return 0, "\n".join(str(int(t)) for t in self.commits) + "\n"
         if "merge-base" in argv:
-            return (0 if self.deployed_ahead else 1), ""
+            deployed_is_ancestor = argv[-1] == HEAD
+            return (0 if deployed_is_ancestor != self.deployed_ahead else 1), ""
         return 1, ""
 
     def deployed(self, sha=OLD):
@@ -78,8 +83,6 @@ class MergedNotDeployed(Case):
         (self.home / "deployed.json").write_text("not json")
         self.assertIn("no readable deploy record", self.run_check()[0]["message"])
         self.deployed()
-        self.commits = []  # git finds nothing between the shas: not an ancestor
-        self.assertIn("have diverged", self.run_check()[0]["message"])
         self.deployed_ahead = True  # a hotfix deployed ahead of the ref is not merged-not-deployed
         self.assertEqual(self.run_check(), [])
         self.deployed_ahead = False
@@ -149,6 +152,105 @@ class OpenPending(Case):
         self.wal("sess-bbbb-2222", [{"at": iso(NOW - 9 * 3600), "event": "check", "note": "PENDING_REAL_TEST t1: z"}])
         self.wal("sess-cccc-3333", [{"at": iso(NOW - 2 * 3600), "event": "check", "note": "REALLY_TESTED t1: unrelated"}])
         self.assertEqual([a["key"] for a in self.run_check()], ["pending-open:sess-bbb"])
+
+
+class RealGitAncestry(Case):
+    """Codex final gate F1 on 144ca3d: ancestry is established with real git before the age threshold applies. A diverged
+    deploy whose deployed..head range holds YOUNG commits only reachable from head used to return no alert at all."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.home / "repo"
+        self.cfg["deploys"]["services"][0]["ref"] = "main"
+        self.genv = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                         GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                         GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+        self.git("init", "-q", "-b", "main")
+        self.base = self.commit("base", NOW - 30 * 3600)
+
+    def git(self, *args, env=None):
+        p = subprocess.run(["git", "-C", str(self.repo), *args], capture_output=True, text=True, env=env or self.genv,
+                           check=True)
+        return p.stdout.strip()
+
+    def commit(self, msg, ts):
+        env = dict(self.genv, GIT_AUTHOR_DATE=f"@{int(ts)} +0000", GIT_COMMITTER_DATE=f"@{int(ts)} +0000")
+        self.git("commit", "-q", "--allow-empty", "-m", msg, env=env)
+        return self.git("rev-parse", "HEAD")
+
+    def side_branch(self, *stamps):
+        """Commits on a branch off base that main never sees; returns the tip (the deployed build)."""
+        self.git("checkout", "-q", "-b", "side", self.base)
+        tip = None
+        for i, ts in enumerate(stamps):
+            tip = self.commit(f"side{i}", ts)
+        self.git("checkout", "-q", "main")
+        return tip
+
+    def check(self, runner=None):
+        return ow.check_deploys(self.cfg, {}, runner or ow.run, NOW)
+
+    def test_diverged_with_young_commits_only_on_head_alerts_naming_both_shas(self):
+        deployed = self.side_branch(NOW - 900)
+        head = self.commit("young-main", NOW - 600)
+        self.assertTrue(self.git("log", "--format=%ct", f"{deployed}..{head}"))  # the range is nonempty and young
+        self.deployed(deployed)
+        got = self.check()
+        self.assertEqual([a["key"] for a in got], ["deploy-drift:solver"])
+        self.assertIn("diverged", got[0]["message"])
+        self.assertIn(deployed[:8], got[0]["message"])
+        self.assertIn(head[:8], got[0]["message"])
+
+    def test_diverged_with_old_commits_is_divergence_not_merely_behind(self):
+        deployed = self.side_branch(NOW - 20 * 3600)
+        self.commit("old-main", NOW - 10 * 3600)
+        self.deployed(deployed)
+        got = self.check()
+        self.assertEqual(len(got), 1)
+        self.assertIn("diverged", got[0]["message"])
+        self.assertNotIn("not deployed", got[0]["message"])
+
+    def test_behind_young_is_quiet_and_behind_old_alerts_as_behind(self):
+        self.commit("young", NOW - 600)
+        self.deployed(self.base)
+        self.assertEqual(self.check(), [])
+        self.deployed(self.base[:12])  # a short sha in the deploy record resolves too
+        self.assertEqual(self.check(), [])
+        self.git("reset", "-q", "--hard", self.base)
+        self.commit("old", NOW - 5 * 3600)
+        self.commit("young", NOW - 600)
+        self.deployed(self.base)
+        got = self.check()
+        self.assertEqual(len(got), 1)
+        self.assertIn("2 merged commit(s) not deployed, oldest 5h old", got[0]["message"])
+
+    def test_deployed_ahead_of_head_or_at_head_is_quiet(self):
+        head = self.git("rev-parse", "HEAD")
+        self.deployed(head)
+        self.assertEqual(self.check(), [])
+        self.git("checkout", "-q", "-b", "hotfix")
+        ahead = self.commit("hotfix", NOW - 10 * 3600)
+        self.git("checkout", "-q", "main")
+        self.deployed(ahead)
+        self.assertEqual(self.check(), [])
+
+    def test_a_deployed_sha_unknown_to_the_repo_is_reported(self):
+        self.commit("main", NOW - 5 * 3600)
+        self.deployed("deadbeef" * 5)
+        got = self.check()
+        self.assertEqual(len(got), 1)
+        self.assertIn("deadbeef", got[0]["message"])
+        self.assertIn("not in the repo", got[0]["message"])
+
+    def test_a_failing_git_call_is_a_check_error_not_silence(self):
+        self.commit("young", NOW - 600)
+        self.deployed(self.base)
+        for verb in ("merge-base", "log"):
+            def broken(argv, timeout, env=None, verb=verb):
+                return (128, "") if verb in argv else ow.run(argv, timeout, env=env)
+            got = self.check(broken)
+            self.assertEqual(len(got), 1, verb)
+            self.assertIn("cannot be judged", got[0]["message"], verb)
 
 
 if __name__ == "__main__":

@@ -1570,10 +1570,11 @@ def check_deploys(cfg, state, runner, now):
     """GoodQA #15565 (never-drop slice 3): a fix that merged but never deployed, and a PENDING_REAL_TEST that never closed.
 
     services: each {name, repo, ref (default origin/main), deployed_file}. deployed_file is JSON {"sha": ...} written by
-    the deploy tool. When the ref moved past that sha and the OLDEST undeployed commit is older than merged_after_h, one
-    warning per service lists how many commits wait. A service with no readable deploy record is reported too (the drift
-    cannot be judged). Pending: every PENDING_REAL_TEST older than pending_after_h with no REALLY_TESTED of the same id in
-    the same session is listed, one alert per session."""
+    the deploy tool. Ancestry is settled first: when the deployed sha is an ancestor of the ref and the OLDEST undeployed
+    commit is older than merged_after_h, one warning per service lists how many commits wait; a deploy ahead of the ref is
+    quiet; diverged histories are reported at any age. A service with no readable deploy record, a deployed sha the repo
+    does not know, or a failing git call is reported too (the drift cannot be judged). Pending: every PENDING_REAL_TEST
+    older than pending_after_h with no REALLY_TESTED of the same id in the same session is listed, one alert per session."""
     d = cfg.get("deploys") or {}
     home = home_of(cfg)
     out = []
@@ -1600,16 +1601,35 @@ def check_deploys(cfg, state, runner, now):
                              {"service": name}))
             continue
         head = head.strip()
-        if head.startswith(deployed) or deployed.startswith(head):
+        # Codex final gate F1: establish ancestry BEFORE any age threshold. deployed..head of a diverged pair holds commits
+        # only reachable from head, so judging its ages alone hid a young divergence and called an old one merely behind.
+        rc, full = runner(["git", "-C", repo, "rev-parse", "--verify", "--quiet", "--end-of-options", f"{deployed}^{{commit}}"],
+                          30, env=env)
+        if rc != 0 or not full.strip():
+            out.append(alert("deploys", key, "warning", f"{name}: deployed {deployed[:12]} is not in the repo (or git failed), "
+                             f"so drift against {ref} {head[:8]} cannot be judged", {"service": name}))
+            continue
+        deployed = full.strip()
+        if deployed == head:
+            continue
+        # --is-ancestor exits 0 (yes) or 1 (no); anything else is a git failure, never read as "no alert"
+        behind, _ = runner(["git", "-C", repo, "merge-base", "--is-ancestor", deployed, head], 30, env=env)
+        ahead = runner(["git", "-C", repo, "merge-base", "--is-ancestor", head, deployed], 30, env=env)[0] if behind == 1 else 1
+        if behind not in (0, 1) or ahead not in (0, 1):
+            out.append(alert("deploys", key, "warning", f"{name}: git merge-base failed for deployed {deployed[:8]} and {ref} "
+                             f"{head[:8]}, so drift cannot be judged", {"service": name}))
+            continue
+        if behind == 1 and ahead == 0:
+            continue  # the deployed build is ahead of the ref (a hotfix or an unmerged deploy): not merged-not-deployed
+        if behind == 1:
+            out.append(alert("deploys", key, "warning", f"{name}: deployed {deployed[:8]} and {ref} {head[:8]} have diverged",
+                             {"service": name, "deployed": deployed, "head": head}))
             continue
         rc, times = runner(["git", "-C", repo, "log", "--format=%ct", f"{deployed}..{head}"], 30, env=env)
         stamps = sorted(int(x) for x in times.split() if x.isdigit()) if rc == 0 else []
-        if not stamps:
-            ahead, _ = runner(["git", "-C", repo, "merge-base", "--is-ancestor", head, deployed], 30, env=env)
-            if ahead == 0:
-                continue  # the deployed build is ahead of the ref (a hotfix or an unmerged deploy): not merged-not-deployed
-            out.append(alert("deploys", key, "warning", f"{name}: deployed {deployed[:8]} and {ref} {head[:8]} have diverged",
-                             {"service": name}))
+        if rc != 0 or not stamps:
+            out.append(alert("deploys", key, "warning", f"{name}: git log of {deployed[:8]}..{head[:8]} failed or was empty, so "
+                             f"drift cannot be judged", {"service": name}))
         elif now - stamps[0] >= merged_after:
             out.append(alert("deploys", key, "warning",
                              f"{name}: {len(stamps)} merged commit(s) not deployed, oldest {int((now - stamps[0]) // 3600)}h old "
