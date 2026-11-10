@@ -1,0 +1,61 @@
+/**
+ * goodqa#15598 (spec v3.2 D3): the blind pin lives in the sealed bytes, so every opener refuses a blind secret without the
+ * capability, whatever row shape the call site passes. Written first and run red on origin/main (the functions do not exist).
+ */
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import {
+  VaultBlindSecretError,
+  issueBlindRevealCapability,
+  openVaultSecret,
+  sealBlindVaultSecret,
+  sealVaultSecret,
+  loadVaultKeyring,
+} from '@bugtracker/db';
+
+const KEK = Buffer.alloc(32, 7).toString('base64');
+const keyring = loadVaultKeyring(KEK);
+
+describe('blind sealing (D3 choke point)', () => {
+  it('an ordinary secret opens exactly as before, with or without a capability', () => {
+    const sealed = sealVaultSecret('plain-value', keyring);
+    expect(openVaultSecret(sealed, keyring)).toBe('plain-value');
+    expect(openVaultSecret(sealed, keyring, issueBlindRevealCapability())).toBe('plain-value');
+  });
+
+  it('a blind secret refuses every opener that does not hold an issued capability, whatever row shape it passes', () => {
+    const sealed = sealBlindVaultSecret('gqk_secret_value', keyring);
+    expect(() => openVaultSecret(sealed, keyring)).toThrow(VaultBlindSecretError);
+    // a partial row (the shape many call sites pass) is refused the same way
+    const partial = { kekKeyId: sealed.kekKeyId, dekWrapped: sealed.dekWrapped, iv: sealed.iv, authTag: sealed.authTag, ciphertext: sealed.ciphertext };
+    expect(() => openVaultSecret(partial, keyring)).toThrow(VaultBlindSecretError);
+    // a forged capability (a plain object, a frozen copy) is refused
+    expect(() => openVaultSecret(sealed, keyring, {} as never)).toThrow(VaultBlindSecretError);
+    expect(() => openVaultSecret(sealed, keyring, Object.freeze({}) as never)).toThrow(VaultBlindSecretError);
+  });
+
+  it('an issued capability opens it and strips the marker; the refusal never carries the value', () => {
+    const sealed = sealBlindVaultSecret('gqk_secret_value', keyring);
+    expect(openVaultSecret(sealed, keyring, issueBlindRevealCapability())).toBe('gqk_secret_value');
+    try {
+      openVaultSecret(sealed, keyring);
+    } catch (err) {
+      expect(String((err as Error).message)).not.toContain('gqk_secret_value');
+    }
+  });
+
+  it('only modules/vault-env may issue the capability (census)', () => {
+    const root = join(__dirname, '..', 'src');
+    const offenders: string[] = [];
+    const walk = (dir: string) => {
+      for (const name of readdirSync(dir)) {
+        const p = join(dir, name);
+        if (statSync(p).isDirectory()) walk(p);
+        else if (p.endsWith('.ts') && readFileSync(p, 'utf8').includes('issueBlindRevealCapability') && !p.includes(`${join('modules', 'vault-env')}`)) offenders.push(p);
+      }
+    };
+    walk(root);
+    expect(offenders).toEqual([]);
+  });
+});

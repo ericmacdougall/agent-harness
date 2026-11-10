@@ -1,0 +1,11 @@
+chore(scratch): goodqa#15598 build WIP copies and final review transcripts
+
+Why: the owner handoff to the next delivery owner needs every spec, review
+transcript and WIP copy on a pushed branch.
+What: crypto patch and the vault-blind-seal test copy under mirror/m15598,
+the v3.2 review transcripts, and the commit message drafts.
+Testing: not run: scratch copies only, the real checks ran on t2-dev
+(commit 8a23d034e6c on feat/goodqa-15598-mint-to-vault).
+Refs: GoodQA #15598
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
