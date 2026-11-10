@@ -447,7 +447,7 @@ export async function applyUserTokenRoutePolicy(
   if (w4) {
     policy.signedInPersonOnly = false;
     policy.nonDelegable = null;
-    policy.abilities = [...new Set([...policy.abilities, 'crm', 'read'])].sort();
+    policy.abilities = [...new Set([...policy.abilities, 'crm' as const, 'read' as const])].sort();
   }
   if (bound) {
     // A desktop session never reaches a session action (its grant is an explicit human grant to a token, not to a screen).

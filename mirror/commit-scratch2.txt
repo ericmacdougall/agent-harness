@@ -1,0 +1,12 @@
+chore(scratch): S1e-a spec v3, N1 fix copies and review reports
+
+Why: the Mac scratch worktree holds the edit copies, patch scripts, spec v3
+and review reports for goodqa#15561 slice S1e-a; committing keeps them
+recoverable. The shipped code is on the t2-dev branch.
+What: mirror copies of routes.ts, auth-gate.ts and the test file, the patch
+scripts, spec-15561-s1e.md v3 and the adversarial and acceptance reports.
+Testing: not run: scratch files only, the real checks ran on t2-dev
+(commit 0c5d5dce533 on feat/goodqa-15561-s1e-timeline-default).
+Refs: GoodQA #15561
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

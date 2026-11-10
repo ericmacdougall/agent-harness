@@ -1,0 +1,34 @@
+Acceptance delta review 2: spec v2 goodqa#15561 S1e-a (code 7fa436767c8). Reviewer: agent-a67bb58fd4e77a64e. Read-only; no probes run; no tests run.
+VERDICT: BLOCK (narrow, three small spec/test fixes; the three earlier material findings are closed)
+
+EARLIER FINDINGS
+1 AC-5 not runnable: CLOSED. AC-5 now names a disposable org, token source (#15598 or tester's own account), the agent-browser limits, and a labelled API-level fallback needing the user's sourced OK, "never as click-tested". Verify by is spec_flow.py click-test by an independent tester.
+2 D3/Outcome false in one state: CLOSED. Outcome "a bearer call with the same token keeps today's answers on both routes"; D3 "answers identical to c81dfd8f in every switch state: contact detail user_token_non_delegable; the timeline keeps whichever session-action refusal the switch state gives". Test 'the bearer answers are unchanged in each switch state' exists.
+3 AC-1 one switch state: CLOSED. AC-1 lists off / on-not-opted / on-opted with and without grant; test 'AC-1 matrix (F4)' (line 227) plus line 67.
+
+NEW FINDINGS
+M1 (material, spec vs test) NEG-12 contradicts D1 and its test is vacuous for HEAD.
+ NEG-12: "a HEAD or any non-GET method on those paths is not opened by W4 (DELETE on the detail path is refused)".
+ D1: "HEAD maps to GET (existing methodOf), so a HEAD on either route is covered the same way".
+ The test is titled 'HEAD on the two routes behaves like GET ... and other methods are not opened' but never sends HEAD. It sends PATCH and asserts [200,403,404] (accepts nearly anything) and DELETE expecting 403. Nothing pins HEAD in either direction, so a regression (HEAD opened or closed) passes. Fix: decide HEAD (D1 says opened), reword NEG-12, add an inj('HEAD') assertion; tighten PATCH to the exact current answer.
+M2 (material, untested negatives) NEG-4 "a member without crm:read gets 403 from the handler" and AC-3 "an owner without crm:read ... is refused" have no test (grep for crm:read/role in the new file finds none; only the non-member case at line 151, asserted >=403, a weak bound). NEG-1 "a token without read cannot start a session; removing read or desktop_signin mid-session ends the session" is tested only for missing crm (lines 79, 162). Add tests or narrow the NEG text.
+M3 (material, evidence) Commit message says "tsc clean", but ~/release-evidence/g15561-s1e-tsc.txt is a V8 heap OOM abort (SIGABRT, "tsc --noEmit -p ." killed). That is not a pass. Rerun tsc with a larger heap on t2-dev and keep the output.
+
+MINOR
+m1 AC-3 says "a contact id of org B under org A's route is 404" unqualified; NEG-2/D2 say the timeline is 200 with empty page. Qualify AC-3 (detail 404, timeline 200 empty).
+m2 AC-1 Verify by says "9 of 12 red", but the file now has 20 tests (mutant runs show 20). Red evidence covers only the first 12; the 8 added tests (F1-F8) were never shown failing on 72290cc761e. 4 mutants cover opt-out, crmswitch, ability, operator; HEAD, busy_only, bearer-per-state, delegated-door pin have no mutant. State this or re-run red for the full file.
+m3 AC-1 "no user_token.session_action audit row": I found no assertion for it in the test lines read; unverified.
+m4 NEG-11 is linked to AC-4 (privacy) though it is the switch behaviour; AC-4 text carries it, so consistent, but AC-1 or AC-2 would read better.
+m5 A2: "set through the existing entitlement-override mechanism" does not say who can set userTokens.contactTimelines or whether the key must be registered in the entitlement catalog. An opt-out nobody can set is not an opt-out. Name the setter and add a test or a follow-up ticket id.
+m6 Outcome says "no org-owner opt-in" while D6/A2 add an org opt-OUT and a CRM family switch; the Outcome should say refusals from those two apply.
+
+SCOPE / CONSISTENCY (asked)
+Scope "In" lists desktop-token-session.ts, auth-gate.ts, and tests. The commit also changes apps/api/src/plugins/auth.ts (applyApiKeyOrgSwitches: contact_timelines_disabled and crm_api_disabled for W4 routes) and the opt-out helper contactTimelinesOnForOrg (in desktop-token-session.ts, covered). plugins/auth.ts is NOT in Scope: REPORTED, add it. The org opt-out is also not in Scope or the Risk table (risk table has no row for opt-out bypass or CRM switch; NEG-11 is not in the table's negative-case column). Tests named generically: gmail-limited-use.test.ts and user-token-desktop-session-delegation.test.ts are changed but listed only in Verify by, not Scope.
+D1-D6 vs code: w4 requires bound && delegated && createdVia != operator && exact key; code matches D1. policy.abilities is force-unioned with crm+read, matching AC-1. D5 snapshot change is exactly two entries (verified in diff). D4 not independently verified in code.
+Source syntax: all new Sources valid kinds (answer:, ticket:, inferred:). A1-A3 are labelled inferred; D6 inferred from "the review of this spec" is acceptable. AC links: NEG-11 -> AC-4 and NEG-12 -> AC-2 exist.
+AC/NEG to test map: AC-1 yes; AC-2/NEG-8/9 yes; NEG-2,3,5,6,7,10 yes (by title); NEG-11 yes (line 254-274); NEG-12 operator yes, HEAD no (M1); NEG-4 member-without-crm:read no (M2); NEG-1 partial (M2).
+
+NOT VERIFIED
+Test bodies for NEG-6/7/10/11 and the matrix beyond titles; org agent-pause, rate and scope steps still running for W4 routes; evidence files other than tails (counts only); any live behaviour; operator-token path beyond the one test.
+
+PROBES: none declared or run.

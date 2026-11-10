@@ -1,0 +1,191 @@
+ADVERSARIAL DELTA REVIEW + PRIVACY RED-TEAM: goodqa#15561 slice S1e-a
+Reviewer: agent a1fa97d18c55c5a00 (red-team), auth and privacy domain
+Spec v2: /Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/agent-aaef3bc78b40c0c22/spec-15561-s1e.md
+Code: t2-dev ~/wt-15561, commit 7fa436767c8 (baseline 72290cc761e), read-only. No repo edits, no commits.
+Date: 2026-11-09
+
+VERDICT: BLOCK
+
+One HIGH finding, confirmed by a live probe: through the newly opened bound-session timeline, the free-text `q` search
+works as a content oracle over Gmail mailbox-read mail, a colleague's `personal` entries and a colleague's `busy_only`
+titles. The cause is that withholding happens after the SQL LIMIT, while `nextCursor` and the match set are computed
+before it. One MEDIUM finding: the org "off switch" (A2) cannot be operated by an org admin, and the spec's claim that it
+is set "through the existing entitlement-override mechanism" is false for that mechanism. F1..F14 are otherwise
+closed or reduced to LOW.
+
+===================================================================================================
+NEW FINDINGS
+===================================================================================================
+
+N1 HIGH (CONFIRMED by probe P1): `q` + pre-filter `nextCursor` = content oracle over withheld entries
+  Code:
+   - modules/crm/routes.ts:119-132: the contact timeline accepts `q`, `pinned`, `fieldChanges`, `cursor` and `limit`.
+   - modules/crm/service.ts:105-108: `q` becomes `search_document @@ websearch_to_tsquery(...)`. search_document is
+     generated from title (A) + body (B). For a Gmail ingest, title = subject and body = snippet.
+   - service.ts contactTimeline: `.limit(limit)`, then
+       const nextCursor = entries.length === limit && last ? `${last.occursAt.toISOString()}|${last.id}` : null;
+     Both lines run BEFORE the route's `timelineWithSubjects` (removes others' `personal` entries, turns `busy_only`
+     into "Busy") and `forTimelineReader` (drops Gmail mailbox-read entries for an agent credential).
+  Live result: probe P1 on t2-dev, commit 7fa436767c8, bound session from a desktop_signin+read+crm token,
+  GET .../crm/contacts/:id/timeline?limit=1&q=<word>.
+   Gmail (subject "Acquisition zebracorn terms", snippet "we accept the quokkaprice offer", real ingestInboxMessage):
+     q=zebracorn     -> {"timeline":[], "nextCursor":"2026-08-12T10:00:00.000Z|78280710-...(the Gmail entry id)"}
+     q=quokkaprice   -> {"timeline":[], "nextCursor":"2026-08-12T10:00:00.000Z|78280710-..."}
+     q=platypusword  -> {"timeline":[], "nextCursor":null}
+     control: the owner's signed-in session sees the message (200, contains "zebracorn").
+   Colleague `personal` task "Personal wombatsecret note" (member session of another member):
+     q=wombatsecret  -> {"timeline":[], "nextCursor":"2026-08-11T14:05:00.000Z|1e202db6-...(the personal entry id)"}
+   Colleague `busy_only` meeting "Layoff narwhalplan briefing":
+     q=narwhalplan   -> one row {"title":"Busy", visibility busy_only, ...} ; q=platypusword -> [] / null
+  Consequence: an agent holding a desktop_signin+read+crm token starts a bound session (A1 accepts that it can). With
+  q, it learns word by word whether a withheld Gmail message (Google restricted-scope data; the privacy page promises
+  that this content "never reaches a model or an agent", lib/gmail-limited-use.ts:1) or a colleague's private note
+  contains a given term. It also gets each hidden entry's id and exact timestamp. A busy_only row appears only when its
+  hidden title matches. The ledger records `q=…` with the value stripped (user-tokens/service.ts:323), so the terms
+  searched are not auditable. Until now, an agent could reach this route only through a session action, which needs
+  the platform switch, the org owner's opt-in and an explicit `session:crm_timeline` grant. W4 opens it by default.
+  (Signed-in humans have the same personal/busy_only oracle today; that is pre-existing and should get its own ticket.)
+  The contact detail route has the same root cause, at lower severity. It takes no `q`, but `timelineNextCursor`
+  names the last raw row, which can be a withheld entry's id and timestamp, when the first page is full.
+  Why the tests miss it: NEG-6 and NEG-7, and their tests, assert only that withheld content is absent from the body.
+  No test sends `q`, `pinned` or a small `limit`.
+  Proportionate fix (any one, plus the NEG):
+   (a) Preferred: push the reader filters into SQL before LIMIT, for every caller. For an agent reader, exclude
+       `gmailMailboxReadEntry(db)`. Exclude other members' `personal` rows. Never let `q`/`pinned` match a
+       `busy_only` row the reader cannot see in detail. Then `nextCursor` and the match set cover only visible rows.
+   (b) Minimum for this slice: on W4 (bound door), refuse `q` and `pinned` with 400 or ignore them, and build
+       `nextCursor` so it never names a withheld row. Do the same for `timelineNextCursor` on detail.
+  NEG to add: for a bound session, `q` (and `pinned`) matching only a withheld Gmail, personal or busy_only entry gives
+  a response byte-identical to `q` matching nothing, and no response contains a withheld entry's id.
+
+N2 MEDIUM (CONFIRMED by code reading): no org admin can set the A2 opt-out, so F3 is closed only on paper
+  Spec A2: "the override is set through the existing entitlement-override mechanism". Code comment
+  (desktop-token-session.ts:219): "on unless an org admin sets the entitlement override ...".
+  Code:
+   - PATCH /v1/orgs/:orgId/entitlements (modules/billing/routes.ts:292-337) requires `requireVerifiedPlatformAdmin`
+     AND org owner, and rejects any key outside FEATURE_KEYS ("Unknown entitlement keys"). 'userTokens.contactTimelines'
+     is not in FEATURE_KEYS (lib/entitlements.ts), and grep finds no writer anywhere in apps/ or packages/.
+   - The org opt-in for session actions has its own route (modules/user-tokens/routes.ts:141). The opt-out has none.
+   - The platform-admin org PATCH (modules/admin/routes.ts:141, z.record(z.string(), boolean|number)) probably
+     accepts the key. Not executed.
+  Consequence: a customer org admin has no way to turn W4 off. Only a GoodQA platform operator can, through the admin
+  route or a DB write. The "default with an org-level off switch" reading of "Yes, on by default" is therefore not
+  delivered as written. The test sets it by direct DB update, so it passes anyway.
+  Fix: either add an org-admin route that mirrors the session-actions opt-in (org admin, audited, step-up as that route
+  has it), or correct A2 and the code comment to "a platform-operator switch; org-admin control is ticket #N", labelled
+  TARGET_MISMATCH against the F3 ask. Add a NEG for whichever path is the real control.
+
+N3 LOW: the operator exclusion is not applied in the switch branch, so the refusal code depends on order.
+  plugins/auth.ts w4Route (`!!opts.delegated && isSessionOnlyOpened(...)`) does not check createdVia. In an org that has
+  opted out or turned CRM off, an operator token's bound session therefore gets 404 contact_timelines_disabled or
+  crm_api_disabled, not the 403 user_token_non_delegable that NEG-12 pins. Every outcome is a refusal and no data
+  leaks; the refusal code just depends on order. The fix is to add the same createdVia !== 'operator' check, or to
+  accept this behaviour and say so.
+
+N4 LOW: test strength gaps (each passes a wrong variant)
+  - The busy_only test (F6) asserts only that the title and join link are absent. It does not assert that a "Busy" row is present
+    with subjects [] and author null, so it would pass with no row at all, or with a row that leaks `subjects`.
+  - NEG-4 says "exact codes pinned"; the test accepts [403, 404].
+  - NEG-9/F10: the bearer timeline accepts any of four codes in every switch state; the spec still says
+    "the existing session-action refusal" without the per-state code.
+  - The slice plan's mutant "waiver for bearer too must fail NEG-9" is not among the four mutant files (ability,
+    crmswitch, operator, optout).
+  - F12 (project-scoped token: reportedIssues/project-linked entries; org agent-pause) and F13 (ledger with `q`):
+    no NEG was added. N1 makes F13 relevant again.
+
+===================================================================================================
+F1..F14 DELTA (closed / open)
+===================================================================================================
+F1 CLOSED. auth.ts: `(apiKeyRouteResources(r.method, route)?.includes('crm') || w4Route) && !(await isFeatureEnabled(..., CRM_API_KEY_FLAG))`
+   gives 404 crm_api_disabled for a member. Test "crm.api.enabled off: 404 crm_api_disabled on both routes"; mutant
+   mut-crmswitch was killed.
+F2 CLOSED (as an accepted, labelled assumption). Gate: `token.createdVia !== 'operator'` in `w4`. A1 now says
+   "an agent holding a desktop_signin + read + crm token can start one and read timelines through it". Test pins the
+   operator refusal; mutant mut-operator was killed. Residual: token-minted descendants are not excluded (option (b) was
+   not taken), and the assumption is labelled. N1 raises the stakes of A1.
+F3 PARTIAL, see N2. The default rule is right: `?.[KEY] !== false` is on for null overrides, a missing key or true,
+   and off only for exactly false. But no org admin can operate the switch.
+F4 CLOSED. AC-1 is now a matrix, and the test covers platform on with no opt-in, with opt-in, and with and without
+   session:crm_timeline. It asserts a zero count of `user_token.session_action` audit rows. In code, `sessionAction = w4 ? undefined : ...` and
+   `req.userTokenSessionAction` is set only `if (sessionAction && routeOrgId)` (auth-gate.ts:712-715), so no W4
+   request can reach it.
+F5 CLOSED. NEG-2 now reads "200 with an empty page on the timeline route"; the test asserts it, and contactTimeline
+   filters on timeline_links.org_id.
+F6 PARTIAL. List-absence on both routes and the busy_only case are in the spec; the test is weak (N4).
+F7 CLOSED. Test `desktopRouteDoor('GET', k) === 'delegated'` for both keys. gmail-limited-use.test.ts adds a bound-
+   session case: real ingestInboxMessage, both routes, the hand-logged email received, and a positive control (the
+   owner sees GMAIL_SNIPPET).
+F8 CLOSED. W4 cannot apply outside the two exact keys or to another door:
+   `w4 = !!bound && bound.door === 'delegated' && ... && isSessionOnlyOpened(req.method, bound.routeKey)`, and
+   `isSessionOnlyOpened` is an exact `Set.has` of "METHOD key" with HEAD->GET. The test pins set equality and HEAD.
+   The bearer door is unreachable because `bound` is undefined. In plugins/auth.ts `delegated` is passed only from
+   authenticateBoundSession (6348); bearer uses `userTokenGateDeps(req)` (6377). Clearing `policy.nonDelegable` for W4:
+   today no USER_TOKEN_NON_DELEGABLE_RULES pattern matches either route, and the inventory test still asserts
+   `p.nonDelegable` is null for every delegated entry, W4 included. A future rule on these paths would therefore fail
+   that pin rather than hide silently. Governance-session-only still runs after W4. The policy object is fresh per call
+   (userTokenRoutePolicy returns a new literal), so the W4 mutation cannot leak into another request.
+F9 CLOSED. Risks now say "the access token is renewed by refresh, so the bound is the token chain's end, infinite for
+   a non-expiring token".
+F10 OPEN (LOW), see N4.
+F11 CLOSED. NEG-1 covers dropping read or desktop_signin mid-session; the test accepts [401, 403] with no data.
+F12 OPEN (LOW). No project-scoped token NEG and no agent-pause NEG.
+F13 OPEN (LOW). No `q` in the ledger NEG.
+F14 CLOSED. "from `apps/api` on t2-dev".
+
+===================================================================================================
+REQUESTED ANGLES (answers)
+===================================================================================================
+- W4 outside the two exact keys or on a non-bound door: no (F8 above).
+- Any path to req.userTokenSessionAction: no (F4 above).
+- An org-existence oracle in the w4Route branch: the distinct codes are thrown only when `opts.userId` is a member AND
+  the org is in the token's orgIds; a non-member falls through to the handler's requireOrgPermission, as on every other
+  CRM route (pre-existing). A hypothesis only: the non-member path does one extra org-row read before the membership
+  check, a negligible timing difference.
+- Does clearing nonDelegable/signedInPersonOnly hide a future rule: nonDelegable no, because the pin catches it
+  (F8). signedInPersonOnly is cleared by design. Later re-imposers (membership, org-admin, webhook, browser-grant sets)
+  do not cover these keys.
+- Opt-out default with entitlementOverrides null: correct (on). See N2 for operability.
+- q / limit / cursor on the timeline: N1 (HIGH). The cursor is parsed with split('|'), and only the reader's own org and
+  contact are in the WHERE, so a forged cursor cannot cross tenants.
+- Tenant mixing by contactId from another org: none. Detail gives 404 (getContact); the timeline gives 200 with an
+  empty page, because the query is scoped by orgId on both the entry and the link. Probed by the owner's test, and
+  consistent with the code.
+- Rate limit and ledger for refused requests: enforceTokenRate runs before the switches. Switch and opt-out refusals go
+  through `refusal(...)`, which writes a ledger row. The test checks one refused row (the ability case). The rate
+  values were not examined. They bound N1's speed but do not prevent it.
+
+===================================================================================================
+SCOPE vs THE USER'S ANSWER
+===================================================================================================
+- Wider than "Yes, on by default" (contact timelines for token sessions):
+  (1) N1: the session can infer content it is not shown, including Gmail mailbox content that is withheld from agents
+      by policy. Nothing in the answer covers that.
+  (2) Contact detail rests on A3 (inferred from Q7, which main assigned to the bearer slice). It is labelled.
+- Narrower: the "off switch" (A2) is platform-operator only (N2). Both A1 and A2 are labelled ASSUMPTION, correctly.
+
+===================================================================================================
+PROBES (declared and run through run_probe.py on t2-dev)
+===================================================================================================
+P1 (three runs, same declaration):
+  run_probe.py --class hang --worst-case "focused vitest run of one out-of-tree probe file against a pooled test DB:
+  a hung run holding one pgpool lease and up to ~3 GB RSS; no writes outside ~/review-scratch/s1e-probe and the
+  runner sandbox TMPDIR" --max-rss-gb 6 --timeout-s 300 --max-procs 64 --net -- ~/review-scratch/s1e-probe/run.sh
+  Run 1: completed, child rc 69 (pgpool unreachable under the sandbox HOME). Run 2: completed, child rc 1 (probe setup
+  error: platform setting written before a user existed). Run 3: completed inside its bounds (peak 2.6 GB, 5 procs,
+  49 s), child rc 0, with the N1 outputs quoted above. There was no bound breach.
+  Files: probe source /Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-aaef3bc78b40c0c22/redteam-s1e-probe/
+  (a copy is at t2-dev ~/review-scratch/s1e-probe/, outside the repo, with node_modules symlinked to the worktree).
+  Reports: t2-dev ~/review-scratch/s1e-probe/probe-report{,2,3}.json; log probe.txt.
+Not a probe: ~/review-scratch/run15561.sh rt2-s1e test/user-token-contact-timeline-default.test.ts gave 21/21
+  passing (35 s).
+
+===================================================================================================
+NOT EXAMINED / NOT VERIFIED
+===================================================================================================
+- The full suite was not run, nor any of the other touched suites (inventory, delegation, bearer-parity,
+  gmail-limited-use). The mutant files were read only for their counts.
+- Whether the platform-admin PATCH (admin/routes.ts:657) accepts 'userTokens.contactTimelines' (not executed).
+- The token rate-limit values (rateAllowed).
+- Whether `pinned` and `fieldChanges` give further oracles (same root cause as N1; not probed).
+- The desktop app UI and the live deploy (AC-5). The production state of userTokens.sessionActions and the org opt-ins.
+- The OWASP ASVS v5 lens (V8 authorization, V14 data protection, V16 logging) guided coverage; this is not a compliance claim.

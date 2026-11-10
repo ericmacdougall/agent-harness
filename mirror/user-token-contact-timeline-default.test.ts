@@ -153,7 +153,7 @@ describe('AC-3 / NEG-2..5: the tenant boundary and revocation hold', () => {
     const { session } = await bound(CRM, outsider);
     for (const u of [detail(w.org.id, contactA), timeline(w.org.id, contactA)]) {
       const r = await inj('GET', u, session.headers);
-      expect(r.statusCode, `${u} ${r.body}`).toBeGreaterThanOrEqual(403);
+      expect([403, 404], `${u} ${r.body}`).toContain(r.statusCode);
       expect(r.body).not.toContain('Ada');
       expect(r.body).not.toContain('Shared follow up');
     }
@@ -282,15 +282,26 @@ describe('F2 / F8 / F7: operator tokens, HEAD, exact keys, the delegated door', 
       expect([r.statusCode, codeOf(r)], u).toEqual([403, 'user_token_non_delegable']);
     }
   });
-  it('HEAD on the two routes behaves like GET for the bound session, and other methods on them are not opened', async () => {
+  it('HEAD is covered exactly like GET on the two routes (200 with crm, refused without), and no other method on those paths is opened', async () => {
     const { session } = await bound(['desktop_signin', 'read', 'write', 'crm']);
-    for (const u of [detail(w.org.id, contactA)]) {
-      const patchR = await inj('PATCH', u, session.headers, { firstName: 'Zed' });
-      expect([200, 403, 404]).toContain(patchR.statusCode); // PATCH on the detail path is the existing CRM write door, unchanged by W4
+    for (const u of [detail(w.org.id, contactA), timeline(w.org.id, contactA)]) {
+      const h = await inj('HEAD', u, session.headers);
+      expect(h.statusCode, `HEAD ${u}`).toBe(200);
     }
+    const noCrm = await bound(['desktop_signin', 'read']);
+    for (const u of [detail(w.org.id, contactA), timeline(w.org.id, contactA)]) {
+      const h = await inj('HEAD', u, noCrm.session.headers);
+      expect(h.statusCode, `HEAD no crm ${u}`).toBe(403);
+    }
+    // PATCH on the detail path stays the ordinary CRM write door (allowed by crm+write, owner role), never a W4 path
+    const patchR = await inj('PATCH', detail(w.org.id, contactA), session.headers, { firstName: 'Zed' });
+    expect(patchR.statusCode, patchR.body).toBe(200);
     const del = await inj('DELETE', detail(w.org.id, contactA), session.headers);
     expect(del.statusCode).toBe(403);
-    expect(codeOf(del)).not.toBe('contact_timelines_disabled');
+    expect(['user_token_non_delegable', 'desktop_token_session_scope']).toContain(codeOf(del));
+    // POST on the timeline path is the existing session-only timeline create, still refused to a bound session
+    const post = await inj('POST', `/v1/orgs/${w.org.id}/crm/timeline`, session.headers, { kind: 'task', title: 'x', occursAt: '2026-08-11T14:05:00.000Z', links: [] });
+    expect(post.statusCode).toBe(403);
   });
   it('both keys are on the delegated door, not the host door (the Gmail withholding and live token re-read depend on it)', async () => {
     const { desktopRouteDoor } = await import('../src/lib/desktop-token-session');
@@ -313,5 +324,50 @@ describe('F6: busy_only entries arrive opaque to a colleague session on both rou
       expect(r.body, u).not.toContain('Renewal negotiation');
       expect(r.body, u).not.toContain('zoom.us/j/987654321');
     }
+  });
+});
+
+describe('NEG-1 (rest): read and desktop_signin are needed to start and to keep a session', () => {
+  it('a token without read cannot start a session; removing read or desktop_signin mid-session refuses or ends it', async () => {
+    const noRead = await mint(w.owner, ['desktop_signin', 'crm']);
+    const start = await inj('POST', '/v1/me/desktop-session', noRead.headers, { client: 'desktop-ctl' });
+    expect(start.statusCode, start.body).toBeGreaterThanOrEqual(400);
+    for (const drop of ['read', 'desktop_signin']) {
+      const { token, session } = await bound(CRM);
+      expect((await inj('GET', detail(w.org.id, contactA), session.headers)).statusCode).toBe(200);
+      await ctx.db.update(userTokens).set({ abilities: CRM.filter((a) => a !== drop) }).where(eq(userTokens.id, token.id));
+      const r = await inj('GET', detail(w.org.id, contactA), session.headers);
+      expect([401, 403], `${drop} removed: ${r.body}`).toContain(r.statusCode);
+      expect(r.body).not.toContain('Ada');
+    }
+  });
+});
+
+describe('NEG-13 (red-team N1): a bound session cannot probe withheld entries through q, pinned or the cursor', () => {
+  it('q and pinned are refused on the timeline; a page showing no visible entry gives no cursor and no withheld id', async () => {
+    const colleague = await addMember(ctx, w.org.id, { role: 'admin', extraPermissions: ['crm:create', 'crm:edit'], name: 'Colleague3' });
+    const mate = await addMember(ctx, w.org.id, { role: 'member', name: 'Mate3' });
+    const hiddenId = await logEntry(w.org.id, colleague.headers, contactA, 'Personal wombatsecret note', {
+      visibility: 'personal', ownerUserId: colleague.user.id, occursAt: '2026-09-01T10:00:00.000Z',
+    });
+    const { session } = await bound(CRM, mate);
+    for (const qs of ['?q=wombatsecret', '?q=platypusword', '?pinned=true']) {
+      const r = await inj('GET', `${timeline(w.org.id, contactA)}${qs}`, session.headers);
+      expect([r.statusCode, codeOf(r)], qs).toEqual([400, 'user_token_filter_unsupported']);
+      expect(r.body).not.toContain(hiddenId);
+    }
+    // newest raw row is the colleague personal entry: limit=1 shows nothing visible, and must not hand back its id or time
+    const page = await inj('GET', `${timeline(w.org.id, contactA)}?limit=1`, session.headers);
+    expect(page.statusCode, page.body).toBe(200);
+    expect(page.body).not.toContain(hiddenId);
+    expect(page.body).not.toContain('2026-09-01');
+    expect((page.json() as { nextCursor: string | null }).nextCursor).toBeNull();
+    // the contact detail embeds the same first page and must not name it either
+    const d = await inj('GET', detail(w.org.id, contactA), session.headers);
+    expect(d.body).not.toContain(hiddenId);
+    // control: the colleague signed in sees the entry and a person's own paging is unchanged
+    const own = await inj('GET', `${timeline(w.org.id, contactA)}?q=wombatsecret`, colleague.headers);
+    expect(own.statusCode, own.body).toBe(200);
+    expect(own.body).toContain(hiddenId);
   });
 });
