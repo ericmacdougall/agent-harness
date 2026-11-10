@@ -229,6 +229,35 @@ def main():
         if not re.fullmatch(r'w[0-9a-f]{11}', args.recites) or not args.source:
             parser.error('--recites needs an entry id (w + 11 hex) and a --source on this row')
         record['recites'] = args.recites
+    try:  # GoodQA #15565: a checkpoint or handoff that narrows a target the user stated needs an ASSUMPTION label
+        import target_ledger
+        policy = target_ledger.load_policy()
+        users_own = False
+        if args.source and target_ledger.USER_SOURCE.match(args.source):
+            try:  # exempt only a source that RESOLVES to the user's own turn, never one that merely looks like it (review F4)
+                import provenance
+                resolved = provenance.resolve(args.source)
+                users_own = bool(resolved.get('ok')) and resolved.get('kind') in ('user', 'answer', 'queue') \
+                    and not resolved.get('weak')
+            except Exception:  # noqa: BLE001 - an unresolvable source is not the user's word
+                users_own = False
+        if policy.get('mode') != 'off' and args.event in target_ledger.CHECKED_EVENTS and not args.by and not users_own:
+            ledger = target_ledger.ledger_from_wal(path.parent / 'main.jsonl', policy.get('terms') or [], policy.get('nouns') or [])
+            require_ask = bool(policy.get('require_ask'))
+            found = target_ledger.check_text(note, ledger, policy.get('narrowing') or [], require_ask,
+                                           policy.get('term_narrowing') or [],
+                                           target_ledger.registered_asks(path.parent) if require_ask else None)
+            if found:
+                text = target_ledger.advice(found, bool(policy.get('require_ask')))
+                if policy.get('mode') == 'enforce':
+                    print(json.dumps({'status': 'REFUSED', 'event': args.event, 'problem': text[:300],
+                                      'hint': 'nothing was written; add the label (and ask id) or state the user target'}),
+                          file=sys.stderr)
+                    return 2
+                warnings.append(text[:300])
+                record['target_flags'] = len(found)
+    except Exception:  # noqa: BLE001 - a missing module, a bad policy or a hostile log must never stop a note being written
+        pass
     append(path, record)
     for warning in warnings:
         print('wal_note: provenance warning: ' + warning, file=sys.stderr)
