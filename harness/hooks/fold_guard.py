@@ -36,10 +36,11 @@ FOLD_WORDS = re.compile(r"\b(?:fold(?:ed|ing)?|clos(?:e|ed|ing)|won'?t[ -]?fix|d
 # A LATER sentence of the user's turn voids a fold only when it refuses, defers or retracts it (red-team ad4294 E1: words
 # like "next", "should" or "think" in an unrelated later sentence must not void a legitimate fold).
 FOLD_REFUSE = re.compile(r"\b(?:not|never|don'?t|do not|keep|stop|unless|if|without|leave|reopen|no|later|wait|pause|hold|"
-                         r"defer|tomorrow|let me think|think (?:about|it over)|sleep on|get back)\b|n't\b", re.I)
+                         r"defer|tomorrow|let me think|think (?:about|it over)|sleep on|get back|"
+                         r"once|after|before|when|while|until|but|only|except|pending|soon)\b|n't\b", re.I)  # R1: conditions too
 # The sentence that HOLDS the excerpt (and the excerpt itself) must also be free of hedges and conditions (E2).
-FOLD_NEGATION = re.compile(FOLD_REFUSE.pattern[:-len(r")\b|n't\b")] + r"|once|after|before|when|while|until|but|only|except|"
-                           r"pending|soon|might|maybe|should|eventually|next|think|unsure|consider\w*|hmm|perhaps|could|may|"
+FOLD_NEGATION = re.compile(FOLD_REFUSE.pattern[:-len(r")\b|n't\b")] + r"|might|maybe|should|eventually|next|think|unsure|"
+                           r"consider\w*|hmm|perhaps|could|may|suppose|hopefully|presumably|whatever|ish|"
                            r"probably|possibly|likely|guess|wonder\w*|tbd|for now|sort of|kind of|lean\w*|seems?|"
                            r"i'?d|rather)\b|n't\b", re.I)
 FOLD_RETRACT = re.compile(r"\b(?:never ?mind|scratch that|actually|hold on|belay|forget (?:it|that)|on second thought)\b", re.I)

@@ -265,7 +265,15 @@ class FoldCase(unittest.TestCase):
             with self.subTest(turn=turn), mock.patch("provenance.resolve", lambda s, *a, **k: good), \
                     mock.patch.object(fold_guard, "_turn_text", lambda s, t=turn: t):
                 self.assertEqual(self.wont_fix(note), (0, ""), turn)
-        for hedge in ("probably close #14518", "we could close #14518", "you may close #14518", "close #14518, i guess",
+        for turn in ("Close #14518. Only do it once the deploy finishes.", "Close #14518. Do that after the PR merges.",
+                     "Close #14518. But only when #99 is done.", "Close #14518. Except it is still pending the click-test.",
+                     "Close #14518. Hold off until Friday.", "Close #14518. Not yet.", "Close #14518. Soon, not now."):
+            note = "x\nFold-Override: user:%s/%s \"Close #14518.\"" % (uuid.uuid4(), uuid.uuid4())  # red-team R1: later conditions
+            with self.subTest(later=turn), mock.patch("provenance.resolve", lambda s, *a, **k: good), \
+                    mock.patch.object(fold_guard, "_turn_text", lambda s, t=turn: t):
+                self.assertEqual(self.wont_fix(note)[0], 2, turn)
+        for hedge in ("I suppose close #14518", "hopefully close #14518", "presumably close #14518",
+                      "close #14518 or whatever", "probably close #14518", "we could close #14518", "you may close #14518", "close #14518, i guess",
                       "I wonder whether to close #14518", "close #14518 for now", "close #14518 tbd", "close #14518 sort of"):
             note = "x\nFold-Override: user:%s/%s \"%s\"" % (uuid.uuid4(), uuid.uuid4(), hedge)
             with self.subTest(hedge=hedge), mock.patch("provenance.resolve", lambda s, *a, **k: good), \
