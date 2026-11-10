@@ -69,7 +69,8 @@ class PeerReviewTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.guard_environment = patch.dict(os.environ, {
-            'AGENT_HARNESS_USAGE_DIR': str(self.root / 'usage-state')})
+            'AGENT_HARNESS_USAGE_DIR': str(self.root / 'usage-state'),
+            'AGENT_HARNESS_ESCALATION_DIR': str(self.root / 'escalation-state')})
         self.guard_environment.start()
         self.addCleanup(self.guard_environment.stop)
         # Never discover a real reviewer CLI from the machine's install locations.

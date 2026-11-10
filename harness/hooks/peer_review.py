@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent read-only Codex review, with a blind Opus CLI fallback."""
+"""Independent read-only review with tiered automatic or explicit Codex-only routing."""
 
 # Hooks run under the host python3, which is 3.9 on macOS; keep annotations lazy.
 from __future__ import annotations
@@ -755,8 +755,47 @@ def kimi_attempt(prompt, packet_path, timeout):
     return 0, result['text'], '', 1
 
 
+def reviewer_mode(mode, secondary='default'):
+    if not isinstance(mode, str) or mode not in {'auto', 'codex-only'}:
+        raise OSError('unsupported reviewer routing mode')
+    if mode == 'codex-only' and secondary != 'default':
+        raise OSError('Codex-only routing cannot select a secondary reviewer')
+    return mode
+
+
+def select_reviewer(policy, author_rung, author_harness, available=None, mode='auto'):
+    reviewer_mode(mode)
+    eligible = {'openai': True, 'claude': True, **(available or {})}
+    if mode == 'codex-only':
+        eligible['claude'] = False
+    selection = tiers.reviewer_for(policy, author_rung, author_harness, eligible)
+    if mode == 'codex-only':
+        # A routing restriction is not evidence that the excluded provider is down.
+        selection = dict(selection, why=selection['why'].split(';', 1)[0] + '; requested Codex-only route')
+    return selection
+
+
+def review_routing(selection, mode='auto', secondary='default'):
+    reviewer_mode(mode, secondary)
+    harness = selection.get('harness')
+    if harness not in {'openai', 'claude'} or (mode == 'codex-only' and harness != 'openai'):
+        raise OSError('reviewer selection contradicts the requested routing mode')
+    primary = 'codex' if harness == 'openai' else 'claude'
+    order = [primary]
+    if mode == 'auto':
+        order.append('kimi' if secondary == 'kimi' else 'claude' if primary == 'codex' else 'codex')
+    return {'requested_mode': mode, 'attempt_order': order,
+            'effective_fallback': order[1] if len(order) > 1 else None}
+
+
+def routing_evidence(options):
+    return {**options.get('review_routing', {}), 'actual_reviewer': options.get('actual_reviewer')}
+
+
 def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, content: str, options=None):
     options = options or {}
+    mode = reviewer_mode(options.get('reviewer', 'auto'), options.get('secondary', 'default'))
+    options.pop('actual_reviewer', None)  # a reused internal options dict must not reuse a prior reviewer's identity
     verdict = ("Begin exactly VERDICT: PASS or VERDICT: BLOCK." if stage == 'pr' else
                "Begin exactly " + ('PLAN' if stage == 'plan' else 'CODE_INSPECTION') + "_RESULT: ACCEPT or "
                + ('PLAN' if stage == 'plan' else 'CODE_INSPECTION') + "_RESULT: BLOCK. This is not PR signoff.")
@@ -777,21 +816,20 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
     if 'selection' not in options:
         # Direct callers without a selection get the unknown-author choice from the table.
         policy = tiers.load_policy()
-        options['selection'] = tiers.reviewer_for(policy, None, 'unknown')
+        options['selection'] = select_reviewer(policy, None, 'unknown', mode=mode)
         options.setdefault('codex_model', policy['rungs'][options['selection']['rung']]['models']['openai'])
         options.setdefault('claude_model', policy['rungs'][options['selection']['rung']]['models']['claude'])
     selection = options['selection']
+    options['review_routing'] = review_routing(selection, mode, options.get('secondary', 'default'))
     effort, rung = selection['effort'], selection['rung']
     codex_model, claude_model = options['codex_model'], options['claude_model']
     options.setdefault('launches', 0)
     options.setdefault('usage', [])
     codex_entry = ('codex', 'Codex %s %s (rung %s)' % (codex_model, effort, rung), options.get('pool', 'default'))
     claude_entry = ('claude', 'Claude %s %s (rung %s)' % (claude_model, effort, rung), options.get('fallback_pool', 'default'))
-    # The tier table picks the primary; the other harness at the same rung is the one authorized fallback.
-    order = (codex_entry, claude_entry) if selection['harness'] == 'openai' else (claude_entry, codex_entry)
-    if options.get('secondary') == 'kimi':
-        # The one authorized independent fallback is Kimi (subscription CLI) instead of the other harness.
-        order = (order[0], ('kimi', 'Kimi kimi-code/k3.1-pro-highspeed (subscription CLI)', 'kimi'))
+    entries = {'codex': codex_entry, 'claude': claude_entry,
+               'kimi': ('kimi', 'Kimi kimi-code/k3.1-pro-highspeed (subscription CLI)', 'kimi')}
+    order = tuple(entries[name] for name in options['review_routing']['attempt_order'])
     primary = order[0][0]
     for provider, source, pool in order:
         remaining = deadline - time.monotonic()
@@ -860,9 +898,10 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                                account_cooldown=outcome['account_cooldown'], reset_at=outcome['reset_at'])
         if outcome['result'] != 'NO_RESULT':
             options['outcome'] = outcome
+            options['actual_reviewer'] = provider
             options['reviewer_harness'] = {'codex': 'openai', 'claude': 'claude'}.get(provider, 'unknown')
             return source, stage_report(stage, outcome['report']), failure
-        if provider != primary or not outcome['fallback_allowed']:
+        if len(order) == 1 or provider != primary or not outcome['fallback_allowed']:
             raise ReviewFailure(outcome, source)
         failure = 'Primary reviewer unavailable (' + outcome['reason'] + '); used authorized independent fallback.'
     raise OSError('no valid reviewer result')
@@ -871,6 +910,8 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
 def provider_toolchains(resolutions):
     specifications = {}
     for provider in ('codex', 'claude'):
+        if provider not in resolutions:
+            continue
         executable = resolutions[provider]['path']
         specifications[provider] = {'executable': provider, 'public': True, 'sha256': None}
         if executable is None:
@@ -1198,6 +1239,8 @@ def write_selection_receipt(run_id, args, head, packet_sha256, author_rung, sele
         path = root / (run_id + '.json')
         body = json.dumps({'schema': 1, 'run_id': run_id, 'task': args.task, 'stage': args.stage, 'head': head,
                            'packet_sha256': packet_sha256, 'author_rung': author_rung, 'author_harness': args.author_harness,
+                           'review_routing': review_routing(selection, getattr(args, 'reviewer', 'auto'),
+                                                            getattr(args, 'secondary', 'default')),
                            'selection': selection, 'at': ladder.now()}, sort_keys=True)
         path.write_text(body); os.chmod(path, 0o600)
     except OSError as error:
@@ -1255,6 +1298,8 @@ def main() -> int:
     parser.add_argument('--repeat-reason', help='Spend at most one additional declared attempt with a reason')
     parser.add_argument('--pool', default='default', help='Opaque Codex auth-pool alias; never a credential')
     parser.add_argument('--fallback-pool', default='default', help='Opaque independent Claude auth-pool alias')
+    parser.add_argument('--reviewer', choices=('auto', 'codex-only'), default='auto',
+                        help='Execution routing only: codex-only excludes every fallback, without changing author or merge authority')
     parser.add_argument('--secondary', choices=('default', 'kimi'), default='default',
                         help="Authorized independent fallback: 'default' is the other harness; 'kimi' is the user's "
                              "Kimi subscription via kimi_review.py (tool-less, egress-gated, packet text only)")
@@ -1267,6 +1312,8 @@ def main() -> int:
     parser.add_argument('--github-repo', help='Exact owner/repo binding for an optional reviewed GitHub PR')
     parser.add_argument('--pr', type=int, help='Exact pull request number; requires --github-repo')
     args = parser.parse_args()
+    if args.reviewer == 'codex-only' and args.secondary != 'default':
+        parser.error('--reviewer codex-only cannot be combined with --secondary kimi')
     if (args.github_repo is None) != (args.pr is None):
         parser.error('--github-repo and --pr must be supplied together')
     if args.github_repo is not None and args.stage != 'pr':
@@ -1433,28 +1480,33 @@ def main() -> int:
             author_rung = None
     # Availability uses the launch's own trust-checked discovery, so a CLI found only at a policy location counts
     # and a binary inside the reviewed repo does not.
+    providers = ('codex',) if args.reviewer == 'codex-only' else diagnostics.PROVIDERS
     try:
         found = {name: diagnostics.discover_executable(name, policy=review_policy(),
                                                        roots=diagnostics.untrusted_roots(repo=repo))
-                 for name in diagnostics.PROVIDERS}
+                 for name in providers}
     except OSError as error:  # for example a deleted working directory
         target.close()
         evidence.close()
         print(diagnostics.render(diagnostics.classify_isolation_error(error), stage=args.stage, head=before[0]),
               file=sys.stderr)
         return 2
-    available = {'openai': bool(found['codex']['path']), 'claude': bool(found['claude']['path'])}
-    selection = tiers.reviewer_for(policy, author_rung, args.author_harness, available)
+    available = {'openai': bool(found.get('codex', {}).get('path')), 'claude': bool(found.get('claude', {}).get('path'))}
+    selection = select_reviewer(policy, author_rung, args.author_harness, available, args.reviewer)
     if selection['harness'] is None:
         target.close()
         evidence.close()
         if selection['rung'] is None:  # the tier table gives this author rung no reviewer; no CLI is at fault
             print('Review refused: author rung %s is review-only and needs no reviewer' % author_rung, file=sys.stderr)
             return 2
-        print('Review refused: no review harness is available for rung %s (codex and claude both unavailable)'
-              % selection['rung'], file=sys.stderr)
+        if args.reviewer == 'codex-only':
+            print('Review refused: requested Codex-only route has no trusted Codex CLI for rung %s'
+                  % selection['rung'], file=sys.stderr)
+        else:
+            print('Review refused: no review harness is available for rung %s (codex and claude both unavailable)'
+                  % selection['rung'], file=sys.stderr)
         # One diagnostic per provider: their causes and next steps can differ. Nothing was reserved, so no run record.
-        for name in diagnostics.PROVIDERS:
+        for name in providers:
             print(diagnostics.render(diagnostics.provider_attempt(name, found[name], None, '', '', {}),
                                      stage=args.stage, head=before[0]), file=sys.stderr)
         return 2
@@ -1472,7 +1524,9 @@ def main() -> int:
             print('Review refused: reviewer rung %s needs user permission recorded for the task by approve-top '
                   '(--task with a ledger permission); --author-rung alone is not a record' % selection['rung'], file=sys.stderr)
             return 2
-    options = {'packet_path': packet, 'secondary': args.secondary, 'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
+    options = {'packet_path': packet, 'secondary': args.secondary, 'reviewer': args.reviewer,
+               'review_routing': review_routing(selection, args.reviewer, args.secondary),
+               'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
                'selection': selection, 'author_rung': author_rung, 'permission': permission,
                'codex_model': policy['rungs'][selection['rung']]['models']['openai'],
                'claude_model': policy['rungs'][selection['rung']]['models']['claude']}
@@ -1488,7 +1542,7 @@ def main() -> int:
             _CHILD_PATH_ROOTS[:] = diagnostics.untrusted_roots(repo=repo, snapshot=snapshot)
             resolutions = {name: diagnostics.discover_executable(
                 name, policy=review_policy(), roots=list(_CHILD_PATH_ROOTS))
-                for name in diagnostics.PROVIDERS}
+                for name in providers}
             options['resolutions'] = resolutions
             options['domain_section'], options['domain_disabled'] = domain_section(snapshot, base)
             if repo_state(repo) != before:
@@ -1498,6 +1552,7 @@ def main() -> int:
                 argv=['peer_review', args.stage, options['codex_model'], options['claude_model'], selection['effort'],
                       selection['rung'], selection['harness'], args.pool, args.fallback_pool,
                       '--snapshot-base', base or 'none', '--secondary', args.secondary,
+                      '--reviewer', args.reviewer, '--attempt-order', ','.join(options['review_routing']['attempt_order']),
                       # The effective review policy (shipped or override) changes discovery and quota classification.
                       '--review-policy', hashlib.sha256(json.dumps(review_policy(), sort_keys=True).encode()).hexdigest()],
                 cwd=repo,
@@ -1549,6 +1604,7 @@ def main() -> int:
                                            result='NO_RESULT', reason=reason,
                                            usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
                                                   'executables': diagnostics.executable_record(options.get('resolutions', {})),
+                                                  'review_routing': routing_evidence(options),
                                                   'diagnostic': diagnosis['code']})
                 record_in_ladder(args, store, failed, before[0], policy)
             except (OSError, GuardError):
@@ -1574,7 +1630,8 @@ def main() -> int:
                               f"Fallback reason: {advisory.failure}\n\n{body}\n", before_publish=evidence.verify)
             target.verify_current()
             run_record.finish(execution='COMPLETED', result='NO_RESULT', reason='ADVISORY', exit_code=4,
-                              usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', [])})
+                              usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
+                                     'review_routing': routing_evidence(options)})
         except (OSError, subprocess.TimeoutExpired, GuardError) as error:
             print(f'Advisory publication failed: {diagnostics.sanitize(error)}; nothing published.', file=sys.stderr)
             target.close()
@@ -1615,6 +1672,9 @@ def main() -> int:
                           f"Author-Rung: {author_rung or 'unknown'}{' (author unknown: lowest writer rung reviewer)' if selection['author_unknown'] else ''}\n"
                           f"Reviewer-Rung: {selection['rung']}\nReviewer-Selection: {selection['harness']} {selection['model']} "
                           f"{selection['effort']}; {selection['why']}\n"
+                          f"Reviewer-Route: {args.reviewer}; attempts {','.join(options['review_routing']['attempt_order'])}; "
+                          f"fallback {options['review_routing']['effective_fallback'] or 'none'}\n"
+                          f"Reviewer-Actual: {options.get('actual_reviewer', 'unknown')}\n"
                           f"{'Permission: ' + str(permission['ask_id']) + chr(10) if permission else ''}"
                           f"Review input: isolated committed snapshot (depth 1"
                           f"{', base ' + base if base and base != before[0] else ''})\n"
@@ -1642,7 +1702,8 @@ def main() -> int:
             reason='NONE' if passed else 'CODE_FINDINGS', exit_code=0,
             review=review_metadata,
             usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
-                   'executables': diagnostics.executable_record(options.get('resolutions', {}))})
+                   'executables': diagnostics.executable_record(options.get('resolutions', {})),
+                   'review_routing': routing_evidence(options)})
         finalized = True
         final = store.load_ref(reference)
         if final['result'] != ('CHECK_OK' if passed else 'CHECK_FAILED') or final['reason'] != ('NONE' if passed else 'CODE_FINDINGS'):
