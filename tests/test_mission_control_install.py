@@ -229,6 +229,37 @@ class MissionDesktopTools(unittest.TestCase):
         self.assertIn("error", bad_id)
         self.assertIn("error", extra)
 
+    def test_a_read_but_unanswered_message_stays_listed_until_its_reply(self):  # goodqa#15565 desktop blind spot
+        second, _ = self.chat.new_message("claude", "second desktop ask", client_key="k" + "c" * 20,
+                                          session="claude-desktop")
+        read, pending = self.call(self.tool(1, "mc_read", {"id": self.record["id"]}), self.tool(2, "mc_pending", {}))
+        self.assertEqual(read["result"]["structuredContent"]["status"], "OK")
+        self.assertEqual(self.chat.state(self.record["id"])["status"], "delivered")
+        listed = pending["result"]["structuredContent"]
+        self.assertEqual([(r["id"], r["status"]) for r in listed["pending"]],
+                         [(self.record["id"], "delivered"), (second["id"], "queued")])
+        self.assertEqual(listed["other_sessions"], 1, "the terminal session's message is counted, not shown")
+        self.assertNotIn(self.terminal["id"], json.dumps(pending))
+        for words in ("summarise", "second desktop ask", "terminal main only"):
+            self.assertNotIn(words, json.dumps(pending), "pending never carries the text")
+        reread, reply, after = self.call(self.tool(3, "mc_read", {"id": self.record["id"]}),
+                                         self.tool(4, "mc_reply", {"id": self.record["id"], "text": "done"}),
+                                         self.tool(5, "mc_pending", {}))
+        self.assertIn("please summarise goodqa#15585", reread["result"]["structuredContent"]["framed"])
+        self.assertIn("AUTHORITY:", reread["result"]["structuredContent"]["framed"])
+        self.assertEqual(reply["result"]["structuredContent"]["status"], "SENT")
+        self.assertEqual([(r["id"], r["status"]) for r in after["result"]["structuredContent"]["pending"]],
+                         [(second["id"], "queued")], "a message leaves the list only when answered")
+
+    def test_pending_names_at_most_fifty_and_counts_the_rest(self):
+        for n in range(54):
+            self.chat.new_message("claude", f"bulk {n}", client_key=f"kbulk{n:016d}", session="claude-desktop")
+        [pending] = self.call(self.tool(1, "mc_pending", {}))
+        listed = pending["result"]["structuredContent"]
+        self.assertEqual(len(listed["pending"]), 50)
+        self.assertEqual(listed["unread"], 55)
+        self.assertEqual(listed["more"], 5)
+
     def test_mission_tools_report_not_installed(self):
         with patch.dict(os.environ, {"MC_HOOKS": str(Path(self.temp.name) / "nowhere")}):
             [result] = self.call(self.tool(1, "mc_pending", {}))

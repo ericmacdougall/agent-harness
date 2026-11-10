@@ -378,9 +378,14 @@ def mc_tool(name: str, arguments: dict) -> dict:
         if arguments:
             raise InvalidReference('Unsupported arguments')
         chat.register_target(DESKTOP_SESSION, os.getpid(), waiting=False)  # attach or refresh: pickable in the page
-        rows = chat.pending('claude', DESKTOP_SESSION)
+        # unread = queued plus read-but-unanswered: a message leaves this list only when mc_reply answers it, so a
+        # read whose result the app lost is listed again (goodqa#15565). Ids and status only, never text.
+        rows, others = chat.unread('claude', DESKTOP_SESSION)
+        limit = chat.LIST_MAX
         return {'status': 'OK', 'session': DESKTOP_SESSION,
-                'pending': [{'id': r['id'], 'created': r.get('created')} for r in rows[:50]]}
+                'pending': [{'id': r['record']['id'], 'created': r['record'].get('created'), 'status': r['status']}
+                            for r in rows[:limit]],
+                'unread': len(rows), 'more': max(0, len(rows) - limit), 'other_sessions': others}
     message_id = arguments.get('id')
     if not isinstance(message_id, str) or not MC_ID.match(message_id):
         raise InvalidReference('Unsupported arguments')
@@ -417,7 +422,8 @@ def mc_tool_list():
     read_only = {'readOnlyHint': True, 'destructiveHint': False, 'idempotentHint': True, 'openWorldHint': False}
     return [
         {'name': 'mc_pending', 'description': 'Attach this app as the Mission Control chat target "claude-desktop" '
-         '(the user can then pick it in the dashboard) and list the messages waiting for it: ids only, no text. Use '
+         '(the user can then pick it in the dashboard) and list its unread messages: ids and status (queued, or '
+         'delivered = read but not yet answered), no text. A message stays listed until mc_reply answers it. Use '
          'when the user asks you to check the dashboard.',
          'inputSchema': {'type': 'object', 'additionalProperties': False, 'properties': {}},
          'annotations': {**read_only, 'readOnlyHint': False}},
