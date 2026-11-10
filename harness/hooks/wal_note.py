@@ -229,6 +229,24 @@ def main():
         if not re.fullmatch(r'w[0-9a-f]{11}', args.recites) or not args.source:
             parser.error('--recites needs an entry id (w + 11 hex) and a --source on this row')
         record['recites'] = args.recites
+    try:  # GoodQA #15565: a checkpoint or handoff that narrows a target the user stated needs an ASSUMPTION label
+        import target_ledger
+        policy = target_ledger.load_policy()
+        users_own = bool(args.source and target_ledger.USER_SOURCE.match(args.source))  # the user's words are not narrowing
+        if policy.get('mode') != 'off' and args.event in target_ledger.CHECKED_EVENTS and not args.by and not users_own:
+            ledger = target_ledger.ledger_from_wal(path.parent / 'main.jsonl', policy.get('terms') or [], policy.get('nouns') or [])
+            found = target_ledger.check_text(note, ledger, policy.get('narrowing') or [], bool(policy.get('require_ask')))
+            if found:
+                text = target_ledger.advice(found, bool(policy.get('require_ask')))
+                if policy.get('mode') == 'enforce':
+                    print(json.dumps({'status': 'REFUSED', 'event': args.event, 'problem': text[:300],
+                                      'hint': 'nothing was written; add the label (and ask id) or state the user target'}),
+                          file=sys.stderr)
+                    return 2
+                warnings.append(text[:300])
+                record['target_flags'] = len(found)
+    except ImportError:
+        pass  # a partial install without the ledger module: the note is still written
     append(path, record)
     for warning in warnings:
         print('wal_note: provenance warning: ' + warning, file=sys.stderr)
