@@ -120,7 +120,8 @@ export function messages(chat, pending = []) {
     const partial = replying.get(m.id);
     if (partial && !partial.final && status !== 'answered' && status !== 'failed') status = 'answering';
     out.push({ id: m.id, from: 'user', to: m.to === 'codex' ? 'codex' : 'claude', session: str(m.session, 128), text: str(m.text), ts: validIso(m.ts) || new Date().toISOString(),
-      status: m.status === 'forged' || m.label === 'FORGED' ? 'forged' : status, reason: str(m.reason, 300), client_key: str(m.client_key, 64) });
+      status: m.status === 'forged' || m.label === 'FORGED' ? 'forged' : status, reason: str(m.reason, 300), client_key: str(m.client_key, 64),
+      read_at: validIso(m.read_at) || '' });
   }
   for (const r of replies) {
     if (!r || typeof r.id !== 'string' || !['claude', 'codex'].includes(r.from)) continue;
@@ -142,3 +143,16 @@ export function repos(events, limit = 3) {
   for (const e of events) if (e.subject.repo && ['push', 'release', 'deploy'].includes(e.kind)) counts.set(e.subject.repo, (counts.get(e.subject.repo) || 0) + 1);
   return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit).map(([repo]) => repo);
 }
+
+// ---- needs you
+// The user's replies to one ask (oldest first), each with main's replies to it. A reply is a chat message whose text
+// starts with `[ask:<id>]` exactly; `[ask:<id>x]` is another ask.
+export function trailOf(messages, id) {
+  const tag = `[ask:${id}]`;
+  return (Array.isArray(messages) ? messages : [])
+    .filter(m => m && m.from === 'user' && typeof m.text === 'string' && m.text.startsWith(tag))
+    .map(m => ({ message: m, text: m.text.slice(tag.length).trim(),
+      replies: messages.filter(r => r && r.from !== 'user' && r.reply_to === m.id) }));
+}
+// An ask still needs the user until a reply of theirs is on its way (a failed or rejected send does not count).
+export const waitingOnUser = (messages, ask) => !trailOf(messages, ask.id).some(t => !['failed', 'forged'].includes(t.message.status));

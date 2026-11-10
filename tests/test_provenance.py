@@ -465,6 +465,33 @@ class Enforcement(Env):
                                capture_output=True, text=True, env=env)
         self.assertNotIn("items", json.loads(plain.stdout))  # the existing counts-only contract is unchanged
 
+    def test_ledger_sees_asks_and_resolutions_past_the_first_200(self):  # goodqa#15585: resolved asks kept showing
+        source = self.user(HUMAN, QUOTE)
+        rows = []
+        for i in range(260):
+            rows.append({"event": "ask", "id": f"wbulkask{i:04d}", "at": f"2026-11-09T00:{i // 60:02d}:{i % 60:02d}Z",
+                         "note": f"ask {i}", "reason": "r", "source": source})
+        for i in range(250):  # resolve all but the last ten, in another WAL of the same session
+            rows.append({"event": "ask_resolved", "id": f"wbulkres{i:04d}", "ref": f"wbulkask{i:04d}", "source": source})
+        (self.wals / "main.jsonl").write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows[:260]))
+        (self.wals / "agent-a1.jsonl").write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows[260:]))
+        open_ids = [item["id"] for item in provenance.ask_items(SID)["items"]]
+        self.assertEqual(open_ids, [f"wbulkask{i:04d}" for i in range(250, 260)])
+
+    def test_resolved_items_keep_seven_days_newest_first(self):  # goodqa#15585 Answered history
+        import datetime as dt
+        now = dt.datetime.now(dt.timezone.utc)
+        source = self.user(HUMAN, QUOTE)
+        rows = [{"event": "ask", "id": f"wres{i}", "at": "2026-11-01T00:00:00Z", "note": f"n{i}", "source": source}
+                for i in range(3)]
+        for i, days in enumerate((1, 3, 9)):
+            rows.append({"event": "ask_resolved", "id": f"wfix{i}", "ref": f"wres{i}", "note": f"how {i}",
+                         "at": (now - dt.timedelta(days=days)).isoformat(), "source": source})
+        (self.wals / "main.jsonl").write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows))
+        resolved = provenance.ask_items(SID)["resolved"]
+        self.assertEqual([r["id"] for r in resolved], ["wres0", "wres1"])  # the 9-day-old one is out of the window
+        self.assertEqual(resolved[0]["resolution"], "how 0")
+
     def test_concurrent_appends(self):  # AC-6
         procs = [subprocess.Popen([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "requirement",
                                    "--note", f"r{i}", "--source", self.user(HUMAN, QUOTE)],

@@ -293,6 +293,12 @@ def set_state(msg_id: str, status: str, *, reason: str = "", root: Path | None =
         raise ChatError("bad-id", "not a dashboard message id")
     root = root or home()
     value = {"id": msg_id, "status": status, "at": now_iso(), "reason": reason[:200]}
+    # when main first read it (the claim), kept through later states: the page shows pickup latency
+    if status in ("delivered", "answered"):
+        earlier = state(msg_id, root).get("read_at")
+        read_at = earlier if isinstance(earlier, str) else (value["at"] if status == "delivered" else None)
+        if read_at:
+            value["read_at"] = read_at
     write_json(chat_dir(root) / "state" / (msg_id + ".json"), value)
     marker = chat_dir(root) / "queue" / msg_id
     if status == "queued":

@@ -487,17 +487,21 @@ class Owners(Collector):
         return [r["ticket"] for r in self.rows if r.get("ticket") and r.get("state") in ("live", "working", "quiet")]
 
 
+ASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+
 class Asks(Collector):
     """Open asks for the user from main's session (provenance ledger), shown as the page's "Needs you" list.
 
     Read-only. Replies go through the existing chat channel as `[ask:<id>] text`; main resolves the ask."""
     name = "asks"
-    interval = 120.0  # the ledger resolve costs a few CPU seconds; asks change on a minutes scale
+    interval = 60.0  # the ledger resolve costs about 2 CPU seconds; a resolved ask leaves the list within a minute
 
     def __init__(self, hub, health, runner, session_fn):
         super().__init__(hub, health)
         self.runner, self.session_fn = runner, session_fn
         self.items: list[dict] = []
+        self.resolved: list[dict] = []
         self.session = ""
 
     def tick(self, now: float):
@@ -512,19 +516,29 @@ class Asks(Collector):
             raise RuntimeError(f"provenance asks exited {code}")
         items = []
         for raw in data["items"][:100]:
-            if not isinstance(raw, dict) or not re.match(r"^[A-Za-z0-9_-]{1,40}$", str(raw.get("id", ""))):
+            if not isinstance(raw, dict) or not ASK_ID_RE.match(str(raw.get("id", ""))):
                 continue
             note = ev.short(str(raw.get("note", "")), 400)
             items.append({"id": str(raw["id"]), "kind": str(raw.get("kind", ""))[:12], "at": str(raw.get("at", ""))[:40],
                           "text": note, "why": ev.short(str(raw.get("reason", "")), 200),
                           "owner": ev.short(str(raw.get("owner", "")), 60), "ticket": _ticket_in(note),
                           "session": session})
-        self.items, self.session = items, session
+        resolved = []
+        for raw in (data.get("resolved") if isinstance(data.get("resolved"), list) else [])[:100]:
+            if not isinstance(raw, dict) or not ASK_ID_RE.match(str(raw.get("id", ""))):
+                continue
+            note = ev.short(str(raw.get("note", "")), 400)
+            resolved.append({"id": str(raw["id"]), "at": str(raw.get("at", ""))[:40], "text": note,
+                             "ticket": _ticket_in(note), "owner": ev.short(str(raw.get("owner", "")), 60),
+                             "resolved_at": str(raw.get("resolved_at", ""))[:40],
+                             "resolution": ev.short(str(raw.get("resolution", "")), 300),
+                             "decision": ev.short(str(raw.get("decision", "")), 40)})
+        self.items, self.resolved, self.session = items, resolved, session
         self.hub.snapshot("asks", self.snapshot())
         return f"{len(items)} open"
 
     def snapshot(self) -> dict:
-        return {"items": self.items, "session": self.session}
+        return {"items": self.items, "resolved": self.resolved, "session": self.session}
 
 
 class GitHub(Collector):

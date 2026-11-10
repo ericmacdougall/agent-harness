@@ -17,7 +17,7 @@ let savedMotion = true;
 try { savedMotion = localStorage.getItem('mc-motion') !== 'off'; } catch { /* storage is optional */ }
 let state = {
   initiatives: [], initiativesStale: false, initiativesError: '', owners: [], ownerRows: [], events: [], messages: [], sources: [],
-  host: '', chat: null, pending: [], sessions: [], mainSession: '', asks: [], asksSession: '',
+  host: '', chat: null, pending: [], sessions: [], mainSession: '', asks: [], asksResolved: [], asksSession: '',
   connection: 'connecting', now: Date.now(), filters: Object.keys(KINDS),
   selection: null, highlight: null, tab: 'overview', responder: 'claude', session: '',
   motion: savedMotion && !media.matches, motionPreference: savedMotion, reducedMotion: media.matches,
@@ -174,7 +174,8 @@ export function retryMessage(id) {
 // so it carries no authority beyond the chat channel's own; main resolves the ask from it.
 export function setAsks(snapshot) {
   const items = Array.isArray(snapshot?.items) ? snapshot.items.filter(a => a && /^[A-Za-z0-9_-]{1,40}$/.test(String(a.id))) : [];
-  update({ asks: items, asksSession: String(snapshot?.session || '') }, 'asks');
+  const resolved = Array.isArray(snapshot?.resolved) ? snapshot.resolved.filter(a => a && /^[A-Za-z0-9_-]{1,40}$/.test(String(a.id))) : [];
+  update({ asks: items, asksResolved: resolved, asksSession: String(snapshot?.session || '') }, 'asks');
 }
 export function askReplyAccess(ask, current = state) { return chatAccess(current, 'claude', ask?.session || current.asksSession); }
 export function sendAskReply(ask, text) {

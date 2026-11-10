@@ -355,12 +355,14 @@ class App:
     def chat_snapshot(self) -> dict:
         messages = []
         for record in mc_chat.inbox(self.root, limit=60):
+            msg_state = mc_chat.state(record.get("id", ""), self.root)
             messages.append({"id": record.get("id"), "from": "user", "to": record.get("to"),
+                             "read_at": msg_state.get("read_at") if isinstance(msg_state.get("read_at"), str) else None,
                              "client_key": record.get("client_key") if record.get("verified") else "",
                              "session": record.get("session"), "thread": record.get("thread"),
                              "text": str(record.get("text", ""))[:mc_chat.MAX_TEXT], "ts": record.get("created"),
                              "status": "forged" if not record.get("verified") else record.get("state"),
-                             "reason": mc_chat.state(record.get("id", ""), self.root).get("reason", ""),
+                             "reason": msg_state.get("reason", ""),
                              "label": "you · via dashboard" if record.get("verified") else "FORGED"})
         replies = {}
         for reply in mc_chat.outbox(self.root, limit=120):

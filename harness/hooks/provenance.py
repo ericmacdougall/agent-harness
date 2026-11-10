@@ -18,6 +18,7 @@ ticket sources are syntax-checked and flagged `deferred` unless a local cache al
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -32,6 +33,7 @@ import safe_input  # noqa: E402
 POLICY_FILE = HERE / "provenance_policy.json"
 MAX_LINE = 8 * 1024 * 1024        # a transcript or WAL line larger than this is never parsed
 MAX_HITS = 200                    # lines parsed per lookup
+LEDGER_MAX_HITS = 100_000         # the asks ledger reads every ask and resolution; a cap here silently hid late ones
 MAX_TEXT = 2 * 1024 * 1024
 MAX_SCAN_BYTES = 1 << 30          # a transcript or WAL larger than this is not scanned
 SCAN_SECONDS = 3.0                # wall-clock budget for one scan
@@ -444,7 +446,7 @@ def _line_around(fd: int, index: int, size: int):
             fwd *= 4
 
 
-def _lines_containing(path: Path, needle: bytes):
+def _lines_containing(path: Path, needle: bytes, max_hits: int = MAX_HITS):
     """Yield the line (or None when oversized) for each line containing needle. bytes.find on 8 MiB chunks:
     mmap.find is a naive loop on Python 3.9 and 5 to 10 times slower on a 75 MB transcript."""
     fd = open_regular(path)
@@ -454,7 +456,7 @@ def _lines_containing(path: Path, needle: bytes):
             raise Problem("file-too-large", f"{clip(path.name, 60)} is larger than {MAX_SCAN_BYTES >> 20} MiB; not scanned")
         deadline = time.monotonic() + SCAN_SECONDS
         offset, hits, carry, next_line = 0, 0, b"", 0
-        while offset < size and hits < MAX_HITS:
+        while offset < size and hits < max_hits:
             if time.monotonic() > deadline:
                 raise Problem("scan-timeout", f"scan of {clip(path.name, 60)} exceeded {SCAN_SECONDS:.0f}s")
             chunk = os.pread(fd, min(CHUNK, size - offset), offset)
@@ -463,7 +465,7 @@ def _lines_containing(path: Path, needle: bytes):
             base = offset - len(carry)
             data = carry + chunk
             pos = 0
-            while hits < MAX_HITS:
+            while hits < max_hits:
                 index = data.find(needle, pos)
                 if index < 0:
                     break
@@ -1270,7 +1272,7 @@ def ledger(session: str, home=None) -> list:
     for path in session_wals(session, home):
         for needle in (b'"event":"ask"', b'"event":"ask_resolved"'):
             try:
-                for line in _lines_containing(path, needle):
+                for line in _lines_containing(path, needle, LEDGER_MAX_HITS):
                     if line is None:
                         continue
                     try:
@@ -1292,9 +1294,9 @@ def ledger(session: str, home=None) -> list:
     return sorted(asks.values(), key=lambda r: r["at"])
 
 
-def classify_asks(session: str, home=None, ctx=None) -> tuple:
+def classify_asks(session: str, home=None, ctx=None, entries=None) -> tuple:
     """Open asks split by how well their source resolves: (traced, assumptions, unverified, blocked, closed count)."""
-    entries = ledger(session, home)
+    entries = ledger(session, home) if entries is None else entries
     ctx = dict(ctx or {}, home=home, want_text=True)
     traced, assumptions, blocked, unverified, closed = [], [], [], [], 0
     for record in entries:
@@ -1319,7 +1321,8 @@ def ask_items(session: str, home=None, ctx=None) -> dict:
     """The open asks a person may be shown, as data (Mission Control's "Needs you" list).
 
     Blocked asks (no resolvable source) are left out, exactly as the text ledger says not to present them."""
-    traced, assumptions, unverified, blocked, closed = classify_asks(session, home, ctx)
+    entries = ledger(session, home)
+    traced, assumptions, unverified, blocked, closed = classify_asks(session, home, ctx, entries)
     items = []
     for kind, rows in (("traced", traced), ("unverified", unverified), ("assumption", assumptions)):
         for record, result in rows:
@@ -1328,7 +1331,31 @@ def ask_items(session: str, home=None, ctx=None) -> dict:
                           "owner": record["_wal"].stem, "source_label": result["label"] if result else ""})
     items.sort(key=lambda item: item["at"])
     return {"counts": {"traced": len(traced), "unverified": len(unverified), "assumptions": len(assumptions),
-                       "blocked": len(blocked), "closed": closed}, "items": items}
+                       "blocked": len(blocked), "closed": closed}, "items": items,
+            "resolved": resolved_items(session, home, entries=entries)}
+
+
+def resolved_items(session: str, home=None, days: float = 7.0, limit: int = 100, entries=None) -> list:
+    """Asks resolved in the last `days`, newest first: the page's "Answered" history. Text is raw (the reader
+    redacts, then clips)."""
+    cutoff = time.time() - days * 86400
+    rows = []
+    for record in ledger(session, home) if entries is None else entries:
+        done = record.get("_closed")
+        if not isinstance(done, dict):
+            continue
+        when = str(done.get("at") or "")
+        try:
+            stamp = datetime.datetime.fromisoformat(when.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        if stamp < cutoff:
+            continue
+        rows.append({"id": record["id"], "at": record.get("at", ""), "note": str(record.get("note", ""))[:4000],
+                     "owner": record["_wal"].stem, "resolved_at": when,
+                     "resolution": str(done.get("note", ""))[:2000], "decision": str(done.get("decision", ""))[:40]})
+    rows.sort(key=lambda row: row["resolved_at"], reverse=True)
+    return rows[:limit]
 
 
 def render_asks(session: str, home=None, ctx=None) -> tuple:

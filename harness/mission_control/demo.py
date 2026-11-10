@@ -238,7 +238,11 @@ class DemoRunner:
                  "createdAt": _iso(self.started - 3600)}]})
         if kind == "provenance-asks" and len(args) == 1:
             return 0, json.dumps({"counts": {"traced": len(ASKS), "blocked": 0}, "items": [
-                {**ask, "at": _iso(time.time() - age), "owner": "main"} for ask, age in ASKS]})
+                {**ask, "at": _iso(time.time() - age), "owner": "main"} for ask, age in ASKS],
+                "resolved": [{"id": "wdemoask0900", "at": _iso(time.time() - 90000), "owner": "main",
+                              "note": "Use the staging database for the reports rehearsal? (demo#104)",
+                              "resolved_at": _iso(time.time() - 86000), "decision": "approved",
+                              "resolution": "answered by the user: yes, staging first"}]})
         if kind == "gh-user" and not args:
             return 1, ""  # the GitHub source shows as failing, so the page's error notice can be checked
         raise PermissionError(f"demo mode runs no commands ({kind})")

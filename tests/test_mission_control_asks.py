@@ -69,6 +69,17 @@ class AsksCollector(unittest.TestCase):
         asks.run(0.0)
         self.assertNotIn("abcdef12", json.dumps(asks.snapshot()))
 
+    def test_resolved_history_is_bounded_redacted_and_kept_as_text(self):
+        resolved = [{"id": "wdone0000001", "note": "<b>ship?</b> (goodqa#15585)", "resolved_at": "2026-11-10T02:00:00Z",
+                     "resolution": "answered: token=abcdef1234567890abcdef1234", "decision": "approved"},
+                    {"id": "bad id", "note": "dropped"}]
+        asks, _hub, _health = collector(FakeRunner(0, {"items": [], "resolved": resolved}))
+        asks.run(0.0)
+        self.assertEqual([r["id"] for r in asks.resolved], ["wdone0000001"])
+        self.assertEqual(asks.resolved[0]["ticket"], "goodqa#15585")
+        self.assertIn("<b>ship?</b>", asks.resolved[0]["text"])
+        self.assertNotIn("abcdef12", json.dumps(asks.snapshot()))
+
     def test_a_failing_ledger_keeps_the_last_list_and_shows_an_error(self):
         runner = FakeRunner(0, {"items": [{"id": "wkeep0000001", "note": "keep me"}]})
         asks, _hub, health = collector(runner)

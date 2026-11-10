@@ -156,3 +156,22 @@ test('every module parses', () => {
     assert.equal(result.status, 0, `${name}: ${result.stderr}`);
   }
 });
+
+test('needs you: a reply leaves a trail with read time and main\'s answer, and the ask stops waiting on the user', () => {
+  const chat = { messages: [
+    { id: 'dash-1', to: 'claude', text: '[ask:wabc] flag first please', ts: '2026-11-10T02:00:00Z', status: 'answered', read_at: '2026-11-10T02:01:30Z', client_key: 'k1' },
+    { id: 'dash-2', to: 'claude', text: '[ask:wabcd] another ask', ts: '2026-11-10T02:02:00Z', status: 'queued', client_key: 'k2' },
+    { id: 'dash-3', to: 'claude', text: '[ask:wxyz] lost', ts: '2026-11-10T02:03:00Z', status: 'failed', client_key: 'k3' },
+  ], replies: [{ id: 'r1', from: 'claude', reply_to: 'dash-1', text: 'Done, flag first.', ts: '2026-11-10T02:02:00Z', final: true }] };
+  const messages = adapt.messages(chat);
+  const trail = adapt.trailOf(messages, 'wabc');
+  assert.equal(trail.length, 1);  // [ask:wabcd] belongs to another ask
+  assert.equal(trail[0].text, 'flag first please');
+  assert.equal(trail[0].message.read_at, '2026-11-10T02:01:30Z');
+  assert.deepEqual(trail[0].replies.map(r => r.text), ['Done, flag first.']);
+  assert.equal(adapt.waitingOnUser(messages, { id: 'wabc' }), false);
+  assert.equal(adapt.waitingOnUser(messages, { id: 'wxyz' }), true);   // a failed send still needs the user
+  assert.equal(adapt.waitingOnUser(messages, { id: 'wnone' }), true);
+  const pending = [{ id: 'local-k9', client_key: 'k9', from: 'user', to: 'claude', text: '[ask:wnone] on its way', ts: '2026-11-10T02:04:00Z', status: 'sending' }];
+  assert.equal(adapt.waitingOnUser(adapt.messages(chat, pending), { id: 'wnone' }), false);  // shown as answered at once
+});

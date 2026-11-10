@@ -128,6 +128,19 @@ class Wait(Base):
 
 
 class Delivery(Base):
+    def test_the_read_time_survives_the_answer(self):  # goodqa#15585: the page shows when main picked a reply up
+        self.attach()
+        record, _ = self.send()
+        self.assertNotIn("read_at", mc_chat.state(record["id"]))  # queued: not read yet
+        with redirect_stdout(io.StringIO()):
+            mc_inbox.main(["read", record["id"]])
+        read_at = mc_chat.state(record["id"])["read_at"]
+        time.sleep(1.1)
+        mc_chat.write_reply(record["id"], "claude", "answer")
+        after = mc_chat.state(record["id"])
+        self.assertEqual((after["status"], after["read_at"]), ("answered", read_at))
+        self.assertNotEqual(after["at"], read_at)
+
     def test_reading_an_answered_message_never_reopens_it(self):  # red-team F4
         self.attach()
         record, _ = self.send()
