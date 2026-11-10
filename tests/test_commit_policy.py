@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -620,6 +621,65 @@ class InspectionRegressions(Fixture):
                    "tool_input": {"input": "*** docs: run git commit -m wip"}}
         self.assertEqual(cp.run_hook(payload, POLICY)[0], 0)
         self.assertEqual(cp.run_hook({**payload, "tool_name": "write_stdin"}, POLICY)[0], 2)
+
+    def test_edit_command_envelopes_never_parse_file_text(self):
+        patch = "*** Begin Patch\n*** Add File: message.txt\n+git commit -m 'unfinished\n*** End Patch"
+        for name in ("apply_patch", "Write", "Edit", "MultiEdit", "NotebookEdit"):
+            for tool_input in ({"command": patch}, {"cmd": patch}, {"input": patch}, patch,
+                               ["bash", "-lc", patch]):
+                with self.subTest(name=name, tool_input=tool_input):
+                    payload = {"session_id": "s", "cwd": str(self.repo), "tool_name": name,
+                               "tool_input": tool_input}
+                    self.assertFalse(cp.may_commit(payload))
+                    self.assertEqual(cp.run_hook(payload, POLICY), (0, ""))
+
+    def test_edit_identity_is_exact_and_canonical_name_wins(self):
+        command = "git commit -m 'unfinished"
+        for name in ("Bash", "exec_command", "write_stdin", "unknown_exec", "xapply_patch",
+                     "apply_patch_exec", "functions.apply_patch", "functions__apply_patch", "", None, 0,
+                     ["apply_patch"]):
+            for tool_input in ({"command": command}, {"cmd": command}, command,
+                               ["bash", "-lc", command]):
+                with self.subTest(name=name, tool_input=tool_input):
+                    payload = {"session_id": "s", "cwd": str(self.repo), "tool_name": name,
+                               "toolName": "apply_patch", "tool_input": tool_input}
+                    self.assertTrue(cp.may_commit(payload))
+                    self.assertEqual(cp.run_hook(payload, POLICY)[0], 2)
+        alias = {"toolName": "apply_patch", "tool_input": {"command": command}}
+        self.assertFalse(cp.may_commit(alias))
+        self.assertEqual(cp.run_hook(alias, POLICY), (0, ""))
+
+    def test_recognized_edits_return_before_parsers(self):
+        payload = {"tool_name": "apply_patch", "tool_input": {"command": "file text"}}
+        with mock.patch.object(cp, "command_text", side_effect=AssertionError("parser reached")):
+            self.assertFalse(cp.may_commit(payload))
+            self.assertEqual(cp.run_hook(payload, POLICY), (0, ""))
+        with mock.patch.object(cp, "analyze", side_effect=AssertionError("shell parser reached")):
+            payload["tool_input"]["command"] = "git commit -m 'unfinished"
+            self.assertEqual(cp.run_hook(payload, POLICY), (0, ""))
+
+    def test_native_edit_command_envelope_cli(self):
+        patch = "*** Begin Patch\n*** Add File: message.txt\n+git commit -m 'unfinished\n*** End Patch"
+        for name, expected in (("apply_patch", 0), ("Bash", 2), ("unknown_exec", 2)):
+            with self.subTest(name=name):
+                payload = {"session_id": "s", "cwd": str(self.repo), "tool_name": name,
+                           "tool_input": {"command": patch}}
+                result = self.run_cli("hook", stdin=json.dumps(payload))
+                self.assertEqual(result.returncode, expected, result.stderr)
+
+    def test_invalid_policy_does_not_turn_edit_text_into_execution(self):
+        copy = self.root / "hooks-edit-invalid-policy"
+        shutil.copytree(HOOKS, copy, ignore=shutil.ignore_patterns("__pycache__"))
+        (copy / "commit_policy.json").write_text("{")
+        command = "git commit -m 'unfinished"
+        for name, expected in (("apply_patch", 0), ("Write", 0), ("Bash", 2), ("unknown_exec", 2)):
+            with self.subTest(name=name):
+                result = subprocess.run(
+                    [sys.executable, str(copy / "commit_policy.py"), "hook"],
+                    input=json.dumps({"session_id": "s", "cwd": str(self.repo), "tool_name": name,
+                                      "tool_input": {"command": command}}), capture_output=True,
+                    text=True, env=self.env, timeout=60)
+                self.assertEqual(result.returncode, expected, result.stderr)
 
     def test_agent_markers_exclude_codex_home(self):
         self.assertIn("CODEX_TOOL_CALL_ID", cp.AGENT_MARKERS)
