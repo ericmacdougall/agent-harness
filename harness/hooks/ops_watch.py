@@ -1594,16 +1594,21 @@ def check_deploys(cfg, state, runner, now):
             out.append(alert("deploys", key, "warning", f"{name}: no readable deploy record, so merged-not-deployed cannot be judged",
                              {"service": name}))
             continue
-        rc, head = runner(["git", "-C", repo, "rev-parse", ref], 30, env=env)
+        rc, head = runner(["git", "-C", repo, "rev-parse", "--verify", "--end-of-options", ref], 30, env=env)
         if rc != 0:
+            out.append(alert("deploys", key, "warning", f"{name}: cannot resolve {ref} in the repo, so drift cannot be judged",
+                             {"service": name}))
             continue
         head = head.strip()
         if head.startswith(deployed) or deployed.startswith(head):
             continue
-        rc, times = runner(["git", "-C", repo, "log", "--format=%ct", f"{deployed}..{ref}"], 30, env=env)
+        rc, times = runner(["git", "-C", repo, "log", "--format=%ct", f"{deployed}..{head}"], 30, env=env)
         stamps = sorted(int(x) for x in times.split() if x.isdigit()) if rc == 0 else []
         if not stamps:
-            out.append(alert("deploys", key, "warning", f"{name}: deployed {deployed[:8]} is not an ancestor of {ref} {head[:8]}",
+            ahead, _ = runner(["git", "-C", repo, "merge-base", "--is-ancestor", head, deployed], 30, env=env)
+            if ahead == 0:
+                continue  # the deployed build is ahead of the ref (a hotfix or an unmerged deploy): not merged-not-deployed
+            out.append(alert("deploys", key, "warning", f"{name}: deployed {deployed[:8]} and {ref} {head[:8]} have diverged",
                              {"service": name}))
         elif now - stamps[0] >= merged_after:
             out.append(alert("deploys", key, "warning",
@@ -1617,14 +1622,16 @@ def check_deploys(cfg, state, runner, now):
     except OSError:
         sessions = []
     for session in sessions:
-        pending, tested = {}, set()
+        pending, tested, unscanned = {}, {}, []  # id -> latest PENDING time, id -> latest REALLY_TESTED time
         for path in session.glob("*.jsonl"):
             try:
-                st = path.stat()
-                if now - st.st_mtime > look or st.st_size > MAX_DEPLOY_WAL_BYTES:
+                if now - path.lstat().st_mtime > look:
                     continue
-                text = path.read_text(encoding="utf-8", errors="replace")
+                # regular files only, never a symlink, a FIFO or a device; over the cap RAISES instead of being cut, and the
+                # file is reported as not scanned (red-team a5: a silent skip would clear a real alert)
+                text = read_text_capped(path, MAX_DEPLOY_WAL_BYTES)
             except OSError:
+                unscanned.append(path.name)
                 continue
             for raw in text.splitlines():
                 if "REAL" not in raw:
@@ -1636,12 +1643,19 @@ def check_deploys(cfg, state, runner, now):
                 note = str(row.get("note") or "") if isinstance(row, dict) else ""
                 at = parse_ts(row.get("at")) if isinstance(row, dict) else None
                 m = TESTED_NOTE_RE.match(note)
-                if m:
-                    tested.add(m.group(1))
+                if m and at is not None:
+                    tested[m.group(1)] = max(at, tested.get(m.group(1), at))
                 m = PENDING_NOTE_RE.match(note)
                 if m and at is not None:
-                    pending[m.group(1)] = min(at, pending.get(m.group(1), at))
-        old = sorted(i for i, at in pending.items() if i not in tested and now - at >= pending_after)
+                    pending[m.group(1)] = max(at, pending.get(m.group(1), at))
+        # open = the LATEST pending is newer than the latest test: a behavior change that re-opens an id invalidates the
+        # earlier live test (red-team a5 A1)
+        old = sorted(i for i, at in pending.items() if at > tested.get(i, 0.0) and now - at >= pending_after)
+        if unscanned:
+            out.append(alert("deploys", f"pending-unscanned:{session.name[:8]}", "warning",
+                             f"{len(unscanned)} log file(s) of session {session.name[:8]} could not be scanned for open "
+                             f"PENDING_REAL_TEST (over {MAX_DEPLOY_WAL_BYTES >> 20} MiB, not a regular file or unreadable)",
+                             {"session": session.name[:8], "files": unscanned[:5]}))
         if old:
             out.append(alert("deploys", f"pending-open:{session.name[:8]}", "warning",
                              f"{len(old)} PENDING_REAL_TEST open for {int(pending_after // 3600)}h or more with no REALLY_TESTED "

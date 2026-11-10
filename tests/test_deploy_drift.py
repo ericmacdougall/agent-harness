@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
@@ -29,12 +30,16 @@ class Case(unittest.TestCase):
         self.cfg["deploys"] = dict(self.cfg["deploys"], services=[
             {"name": "solver", "repo": "~/repo", "ref": "origin/main", "deployed_file": "~/deployed.json"}])
         self.commits = [NOW - 5 * 3600, NOW - 3 * 3600, NOW - 600]  # oldest first: three merged since the deploy
+        self.deployed_ahead = False
+        self.head_ok = True
 
     def runner(self, argv, timeout, env=None):
         if "rev-parse" in argv:
-            return 0, HEAD + "\n"
+            return (0, HEAD + "\n") if self.head_ok else (128, "")
         if "log" in argv:
             return 0, "\n".join(str(int(t)) for t in self.commits) + "\n"
+        if "merge-base" in argv:
+            return (0 if self.deployed_ahead else 1), ""
         return 1, ""
 
     def deployed(self, sha=OLD):
@@ -74,7 +79,12 @@ class MergedNotDeployed(Case):
         self.assertIn("no readable deploy record", self.run_check()[0]["message"])
         self.deployed()
         self.commits = []  # git finds nothing between the shas: not an ancestor
-        self.assertIn("not an ancestor", self.run_check()[0]["message"])
+        self.assertIn("have diverged", self.run_check()[0]["message"])
+        self.deployed_ahead = True  # a hotfix deployed ahead of the ref is not merged-not-deployed
+        self.assertEqual(self.run_check(), [])
+        self.deployed_ahead = False
+        self.head_ok = False
+        self.assertIn("cannot resolve", self.run_check()[0]["message"])
 
     def test_the_check_is_registered_and_can_be_switched_off(self):
         self.assertIn("deploys", ow.DEFAULT_CHECKS)
@@ -98,6 +108,32 @@ class OpenPending(Case):
         self.assertIn("solve-live-screen", got[0]["message"])
         self.assertNotIn("done-one", got[0]["message"])
         self.assertNotIn("too-young", got[0]["message"])
+
+    def test_a_pending_raised_again_after_a_test_is_open_again(self):
+        # red-team a5 A1: a behavior change invalidates the earlier live test
+        self.wal("sess-dddd-4444", [
+            {"at": iso(NOW - 20 * 3600), "event": "check", "note": "PENDING_REAL_TEST t1: x"},
+            {"at": iso(NOW - 19 * 3600), "event": "check", "note": "REALLY_TESTED t1: live ok"},
+            {"at": iso(NOW - 10 * 3600), "event": "check", "note": "PENDING_REAL_TEST t1: behavior changed, retest"}])
+        self.assertEqual([a["key"] for a in self.run_check()], ["pending-open:sess-ddd"])
+        self.wal("sess-dddd-4444", [{"at": iso(NOW - 1 * 3600), "event": "check", "note": "REALLY_TESTED t1: retested"}])
+        self.assertEqual(self.run_check(), [])
+
+    def test_an_unreadable_wal_is_reported_not_skipped_so_a_real_alarm_cannot_clear(self):
+        # red-team a5 A2 and A3: oversize, FIFO and symlinked logs
+        self.wal("sess-eeee-5555", [{"at": iso(NOW - 9 * 3600), "event": "check", "note": "PENDING_REAL_TEST t9: y"}])
+        d = self.home / ".claude" / "wals" / "sess-eeee-5555"
+        self.assertEqual([a["key"] for a in self.run_check()], ["pending-open:sess-eee"])
+        with mock.patch.object(ow, "MAX_DEPLOY_WAL_BYTES", 10):  # now every log is "over the cap"
+            keys = [a["key"] for a in self.run_check()]
+        self.assertEqual(keys, ["pending-unscanned:sess-eee"])
+        os.mkfifo(d / "fifo.jsonl")
+        os.symlink("/dev/zero", d / "zero.jsonl")
+        for name in ("main.jsonl", "fifo.jsonl", "zero.jsonl"):
+            os.utime(d / name, (NOW, NOW), follow_symlinks=False)  # inside the lookback on the fixture clock
+        got = self.run_check()  # returns at once: neither the FIFO nor /dev/zero is read
+        keys = sorted(a["key"] for a in got)
+        self.assertEqual(keys, ["pending-open:sess-eee", "pending-unscanned:sess-eee"])
 
     def test_a_tested_id_in_another_session_does_not_close_it_and_a_clean_session_is_quiet(self):
         self.wal("sess-bbbb-2222", [{"at": iso(NOW - 9 * 3600), "event": "check", "note": "PENDING_REAL_TEST t1: z"}])
