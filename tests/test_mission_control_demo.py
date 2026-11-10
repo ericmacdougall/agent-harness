@@ -210,7 +210,8 @@ class Http(Base):
         self.app.demo_refuse_first = True
         cookie, state = self.login()
         resp, data = self.send(cookie, state["csrf"], "key-refuse-0001")
-        self.assertEqual(resp.status, 503, data)
+        self.assertEqual(resp.status, 409, data)  # not 5xx, which the page would silently retry
+        self.assertLess(resp.status, 500)
         self.assertEqual(json.loads(data)["error"], "demo-refused")
         self.assertEqual(len(mc_chat.inbox(self.root)), 0)
         self.assertEqual(self.send(cookie, state["csrf"], "key-refuse-0001")[0].status, 201)
@@ -256,16 +257,22 @@ class Http(Base):
         short = socket.gethostname().split(".")[0]
         if not set(short.lower()) <= set("0123456789abcdef"):  # a hex-only name could collide with the digest
             self.assertNotIn(short, data.decode())
-        head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True)
-        if head.returncode == 0:  # AC-26: run from a checkout, the commit must be the checkout's HEAD, not None
-            self.assertEqual(value["build"]["commit"], head.stdout.strip())
         _cookie, state = self.login()
         self.assertEqual(state["host"], "demo")
+
+    def test_healthz_build_commit_is_the_checkout_head(self):
+        # AC-26: run from a checkout, the commit must be the checkout's HEAD, never None. Skipped loudly, not passed,
+        # where no checkout is available.
+        head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True)
+        if head.returncode != 0:
+            self.skipTest("not running from a git checkout; AC-26 needs one")
+        value = json.loads(self.request("GET", "/healthz")[1])
+        self.assertEqual(value["build"]["commit"], head.stdout.strip())
 
     def test_a_ts_net_host_is_refused_unless_it_was_allowed(self):
         # NEG-20: only the one --demo-host name is accepted; the real server never passes one, so it refuses them all.
         cookie, _state = self.login()
-        self.assertEqual(self.request("GET", "/healthz", host="erics-macbook-air.tail980dbb.ts.net")[0].status, 403)
+        self.assertEqual(self.request("GET", "/healthz", host="other.tail1234.ts.net")[0].status, 403)
         plain = mcs.build_app(demo_args(free_port()))
         self.assertNotIn(self.HOST, plain.auth.hosts)
         self.assertEqual({h for h in plain.auth.hosts if "ts.net" in h}, set())
@@ -308,6 +315,22 @@ class DemoHome(Base):
                     with self.assertRaises(demo.DemoError):
                         mcs.build_app(demo_args(free_port()))
                 self.assertEqual(list(decoy.iterdir()), [])
+
+    def test_hard_linked_files_in_the_home_are_refused(self):
+        # R1 (adversarial re-review, probe P2): O_NOFOLLOW does not stop a hard link; the decoy must stay untouched.
+        for planted in ("demo/initiatives.json", "log/server.log"):
+            with self.subTest(planted=planted):
+                home = self.base / ("hl-" + planted.replace("/", "-"))
+                demo.prepare_home(home)
+                victim = self.base / ("victim-" + planted.replace("/", "-"))
+                victim.write_text("untouched\n")
+                target = home / planted
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.link(victim, target)
+                with mock.patch.dict(os.environ, {"MC_HOME": str(home)}):
+                    with self.assertRaises(demo.DemoError):
+                        mcs.build_app(demo_args(free_port()))
+                self.assertEqual(victim.read_text(), "untouched\n")
 
     def test_url_demo_host_refuses_an_unmarked_copy_holding_a_secret(self):
         # L-c: a backup copy of the real home elsewhere must not sign Funnel codes with the real secret.

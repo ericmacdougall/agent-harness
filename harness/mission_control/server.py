@@ -321,7 +321,8 @@ class App:
             time.sleep(self.demo_delay_s)
         if self.demo_refuse_first:
             self.demo_refuse_first = False  # demo knob: the first send is refused before it is stored, once
-            return 503, {"error": "demo-refused", "message": "demo instance refused this send once"}
+            # 409, not 5xx: the page retries a 5xx once with the same key, which would hide the refusal.
+            return 409, {"error": "demo-refused", "message": "demo instance refused this send once"}
         try:
             record, created = mc_chat.new_message(to, body.get("text"), client_key=body.get("client_key"),
                                                   session=body.get("session"), thread=body.get("thread"),

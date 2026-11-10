@@ -81,10 +81,14 @@ def prepare_home(root: Path) -> Path:
         os.close(fd)
     # No symlink anywhere under the home: a nested link (demo/wals, a session folder, log/server.log) would let fixture
     # or log writes land outside it. os.walk does not follow directory links, so each link is seen once, as an entry.
+    # A hard-linked file (st_nlink > 1) is refused too: O_NOFOLLOW does not stop writes through a hard link.
     for top, dirs, files in os.walk(root, followlinks=False):
         for name in dirs + files:
-            if os.path.islink(os.path.join(top, name)):
-                raise DemoError(f"refusing --demo: {os.path.join(top, name)} is a symlink inside the demo home")
+            path = os.path.join(top, name)
+            if os.path.islink(path):
+                raise DemoError(f"refusing --demo: {path} is a symlink inside the demo home")
+            if name in files and os.lstat(path).st_nlink > 1:
+                raise DemoError(f"refusing --demo: {path} is hard-linked to a file elsewhere")
     return root
 
 
