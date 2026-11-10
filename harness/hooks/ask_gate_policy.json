@@ -1,0 +1,41 @@
+{
+  "_doc": "GoodQA #15565 ask hygiene. mode: off | warn | enforce. human_only terms always keep an ask (the harness rules reserve these steps for a person). agent_doable rules refuse an ask an agent can do itself. A GRANT: row of the user's own words in the main log refuses asks that share min_shared distinctive words with it.",
+  "mode": "warn",
+  "min_shared": 2,
+  "human_only": [
+    "captcha",
+    "payment",
+    "credit card",
+    "billing",
+    "new terms",
+    "terms of service",
+    "create an account",
+    "new account",
+    "production password",
+    "type the password",
+    "foreign",
+    "another session",
+    "other session",
+    "orphan",
+    "no owner",
+    "not yours",
+    "someone else"
+  ],
+  "agent_doable": [
+    {
+      "id": "process-stop",
+      "pattern": "\\b(?:please|can you|could you)\\s+(?:kill|terminate|stop)\\b",
+      "why": "stopping a process you own is `ah kill --pid N --reason R`; a foreign process needs the user's OK only for --foreign"
+    },
+    {
+      "id": "sign-in",
+      "pattern": "\\b(?:please|can you|could you|may i|should i)\\s+(?:sign|log)[ -]?in\\b|\\b(?:sign|log)[ -]?in (?:for|to) (?:me|us)\\b",
+      "why": "an account the user already owns is reached through his GoodQA user token, an email approve link or device code, or secure-login (CLAUDE.md section 4)"
+    },
+    {
+      "id": "plain-chore",
+      "pattern": "\\b(?:please|can you|could you)\\s+(?:run|click|open|check|look at|verify)\\b",
+      "why": "an agent can run, click, open or check this itself"
+    }
+  ]
+}
