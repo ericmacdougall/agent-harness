@@ -36,7 +36,8 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "dropped_gate.py", "ask_reminders.py",  # dropped-owner gate and ask reminders (goodqa#14791)
          "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",  # Hawkeye ports (goodqa#14908)
          "backup_watch.py", "kimi_review.py", "installer_scan.py",
-         "trivy_gate.py")  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
+         "trivy_gate.py",  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
+         "mission_coverage.py")  # mission goals: owner, disposition or done evidence (goodqa#15565)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)

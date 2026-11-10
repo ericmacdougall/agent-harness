@@ -1,0 +1,67 @@
+[
+ {
+  "id": "leads",
+  "initiative": "GoodQA: 1,000 leads in the CRM view, some found through the desktop app's browser",
+  "state": "Not started tonight",
+  "owner": "none live",
+  "ticket": "goodqa#15095",
+  "milestones_done": 2,
+  "milestones_total": 5,
+  "pct": 40,
+  "next_step": "Next stream once user tokens finish (#15095)",
+  "note": "No live owner right now; the audit will hand it off.",
+  "updated": "2026-11-10T02:10Z",
+  "estimate_by": "main"
+ },
+ {
+  "id": "tokens",
+  "initiative": "GoodQA: user tokens and token-started desktop sessions (CRM, messages, contact detail)",
+  "state": "Live on goodqa.app",
+  "owner": "aaef3bc7",
+  "ticket": "goodqa#15561",
+  "milestones_done": 3,
+  "milestones_total": 8,
+  "pct": 70,
+  "next_step": "c81dfd8f live; next: timelines on by default, then key-mint route #15598",
+  "note": "",
+  "updated": "2026-11-10T02:10Z",
+  "estimate_by": "main"
+ },
+ {
+  "id": "selfupdate",
+  "initiative": "GoodQA desktop self-update",
+  "state": "Partly proven",
+  "owner": "none live",
+  "ticket": "",
+  "milestones_done": 2,
+  "milestones_total": 4,
+  "pct": 50,
+  "next_step": "Linux self-update proof on a test VM (no owner)",
+  "note": "",
+  "updated": "2026-11-10T02:10Z",
+  "estimate_by": "main"
+ },
+ {
+  "id": "audit",
+  "initiative": "4-day audit of everything you asked for",
+  "state": "Done",
+  "owner": "main (workflow)",
+  "ticket": "",
+  "milestones_done": 0,
+  "milestones_total": 5,
+  "pct": 100,
+  "next_step": "53 stale questions triaged; 43 closed",
+  "note": "",
+  "updated": "2026-11-10T02:10Z",
+  "estimate_by": "main"
+ },
+ {
+  "id": "missioncontrol",
+  "name": "Mission Control dashboard",
+  "status": "Needs-you panel live; fixing sign-out",
+  "owner": "ac46242e",
+  "next_step": "Fix wrong relaunch path + keep sessions across restarts; retest window approved",
+  "updated": "2026-11-10T02:10Z",
+  "estimate_by": "main"
+ }
+]
