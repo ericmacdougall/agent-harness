@@ -14,14 +14,20 @@ async function ownerAccess() {
 }
 // A RELATIVE redirect: the helper and the web share one https origin (the helper is mounted under /__ct by tailscale serve).
 const target = (path) => path;
+// A bound desktop session's access token lives 15 minutes: start a fresh session from the token file on every hit (what ctl sign-in does).
+async function freshSession(tokenFile) {
+  const r = await fetch(`${API}/v1/me/desktop-session`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${read(tokenFile)}` }, body: JSON.stringify({ client: 'desktop-ctl' }) });
+  const j = await r.json();
+  return j.tokens.accessToken;
+}
 http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, `http://${HOST}`);
     const who = u.pathname.replace(/^\/s\//, '');
     let value = null;
     if (who === 'owner') value = await ownerAccess();
-    else if (who === 'crm') value = read(S.files.crmSessionAccessFile);
-    else if (who === 'nocrm') value = read(S.files.nocrmSessionAccessFile);
+    else if (who === 'crm') value = await freshSession(S.files.crmTokenFile);
+    else if (who === 'nocrm') value = await freshSession(S.files.nocrmTokenFile);
     else if (who === 'clear') value = '';
     else { res.writeHead(404).end('unknown'); return; }
     const to = u.searchParams.get('to') || `/o/${S.orgSlug}/crm`;
