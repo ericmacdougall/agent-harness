@@ -58,6 +58,20 @@ class ResolvedAskAlerts(Base):
         self.main_log(SESS, [resolved("w00000000004")])
         self.assertEqual(self.keys(), set())
 
+    def test_each_ask_is_tied_to_its_own_session_prefix(self):
+        self.raise_ask("w00000000010", session="abcd1234")
+        self.raise_ask("w00000000011", session="ffff9999")
+        self.main_log(SESS, [resolved("w00000000011")])  # session abcd1234's log resolves the OTHER session's ask id
+        self.assertEqual(self.keys(), {"ask:w00000000010:due", "ask:w00000000011:due"})
+        self.main_log(OTHER, [resolved("w00000000011")])
+        self.assertEqual(self.keys(), {"ask:w00000000010:due"})
+
+    def test_a_wildcard_or_malformed_session_prefix_matches_nothing(self):
+        self.raise_ask("w00000000012", session="*")
+        self.raise_ask("w00000000013", session="../..")
+        self.main_log(SESS, [resolved("w00000000012"), resolved("w00000000013")])
+        self.assertEqual(self.keys(), {"ask:w00000000012:due", "ask:w00000000013:due"})
+
     def test_agent_logs_are_not_read(self):
         self.raise_ask("w00000000005")
         self.main_log(SESS, [])

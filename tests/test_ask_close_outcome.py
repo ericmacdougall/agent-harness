@@ -108,6 +108,30 @@ class OutcomeClose(unittest.TestCase):
         self.assertEqual((row["by"], row["closed_by"]), ("ask-sweep", "ask-sweep"))
         self.assertNotIn("decision", row)
 
+    def test_line_number_evidence_naming_the_ask_itself_is_refused(self):
+        code, err = self.run_note("--outcome", "obsolete", "--source", "wal:%s#L1" % self.wal)
+        self.assertEqual(code, 2)
+        self.assertIn("the ask itself", err)
+
+    def test_a_tool_close_cannot_carry_a_decision(self):
+        code, _ = self.run_note("--by", "ask-sweep", "--decision", "approved", "--source", USER)
+        self.assertEqual(code, 2)
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_a_tool_or_obsolete_close_never_satisfies_the_top_rung_pair_check(self):
+        import escalation
+        folder = self.home / "walsroot" / "sess-9"
+        folder.mkdir(parents=True)
+        main = folder / "main.jsonl"
+        ask = {"event": "ask", "id": "wtop00000001", "note": "[task:T1] top rung", "source": USER, "reason": "r" * 12}
+        for extra in ({"closed_by": "ask-sweep", "decision": "approved"}, {"outcome": "obsolete", "decision": "approved"}):
+            resolved = dict({"event": "ask_resolved", "ref": "wtop00000001", "source": USER}, **extra)
+            main.write_text(json.dumps(ask) + "\n" + json.dumps(resolved) + "\n")
+            with mock.patch.dict(os.environ, {"AGENT_HARNESS_WALS_DIR": str(self.home / "walsroot")}):
+                with self.assertRaises(escalation.LedgerError) as caught:
+                    escalation.verify_ask_pair(main, "wtop00000001", "T1", allow_env_root=True)
+            self.assertIn("closed by a tool", str(caught.exception))
+
     def test_a_resolved_ask_is_not_open_again_and_the_row_is_not_an_approval_for_the_kill_gate(self):
         self.run_note("--outcome", "obsolete", "--source", "wal:/x/main.jsonl#w0123456789a")
         code, _ = self.run_note("--outcome", "obsolete", "--source", "wal:/x/main.jsonl#w0123456789a")

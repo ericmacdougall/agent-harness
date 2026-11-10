@@ -81,6 +81,17 @@ def outcome_evidence_problem(source, ref):
     source = (source or '').strip()
     if re.search(r'#' + re.escape(ref) + r'\s*$', source):
         return 'the evidence is the ask itself'
+    line = re.match(r'^wal:(.+)#L(\d{1,9})\s*$', source)
+    if line:  # the line-number form can name the ask's own entry too
+        try:
+            with open(line.group(1), 'rb') as handle:
+                for number, raw in enumerate(handle, 1):
+                    if number == int(line.group(2)):
+                        if json.loads(raw).get('id') == ref:
+                            return 'the evidence is the ask itself (by line number)'
+                        break
+        except (OSError, ValueError, AttributeError):
+            pass
     try:
         import provenance
         result = provenance.resolve(source)
@@ -262,6 +273,8 @@ def main():
         if args.by.strip() not in TOOL_WRITERS:
             parser.error(f'--by must be one of {sorted(TOOL_WRITERS)}: tool-written rows are an allowlist, not a claim')
         record['by'] = args.by.strip()
+        if args.event == 'ask_resolved' and args.decision:
+            parser.error('a tool close (--by) is bookkeeping and cannot carry --decision: only a person approves')
         if args.event == 'ask_resolved':
             record.setdefault('closed_by', record['by'])  # a tool close is bookkeeping, not a user approval
     if args.recites:

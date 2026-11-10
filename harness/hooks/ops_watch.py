@@ -295,7 +295,7 @@ def resolved_ask_ids(home: Path, wanted: dict) -> set:
     session prefix the alert names (GoodQA #15565: a closed ask kept alerting until the daemon's next tick, and a tick over
     budget skipped alerts altogether). Regular files only, bounded bytes; a row without a source never hides an alert."""
     found = set()
-    for prefix in sorted({p for p in wanted.values() if p}):
+    for prefix in sorted({p for p in wanted.values() if re.fullmatch(r"[0-9a-f]{8}", p or "")}):
         ids = {i for i, p in wanted.items() if p == prefix}
         for main_log in sorted((home / ".claude" / "wals").glob(prefix + "*/main.jsonl")):
             try:

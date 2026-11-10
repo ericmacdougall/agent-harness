@@ -117,6 +117,17 @@ class Close(Base):
         self.assertNotIn("--outcome", argv)
 
 
+class RealProvenance(Base):
+    def test_verified_uses_provenance_and_rejects_a_record_not_bound_to_an_ask_user_question(self):
+        home = self.root / "h"
+        proj = home / ".claude" / "projects" / "p"
+        proj.mkdir(parents=True)
+        (proj / f"{SESSION}.jsonl").write_text(json.dumps(answer_record("u1", {"[ask:w00000000001] Q?": "A real answer here"})) + "\n")
+        self.assertFalse(sw.verified(SESSION, "u1", home))  # the record has no AskUserQuestion tool_use binding
+        self.assertFalse(sw.verified(SESSION, "no-such-uuid", home))
+        self.assertFalse(sw.verified("22222222-2222-4222-8222-222222222222", "u1", home))  # no transcript
+
+
 class Cli(Base):
     def setUp(self):
         super().setUp()
@@ -156,6 +167,13 @@ class Cli(Base):
         self.assertEqual(code, 0)
         self.assertEqual([c["ask"] for c in doc["closed"]], ["w00000000002"])  # the stale ask has no answer: never closed here
         self.assertEqual([s["ask"] for s in doc["stale"]], ["w00000000003"])
+
+    def test_a_short_answer_stays_unclosable_even_when_named_with_only(self):
+        proj = self.home / ".claude" / "projects" / "p" / f"{SESSION}.jsonl"
+        proj.write_text(json.dumps(answer_record("u2", {"[ask:w00000000001] Fable?": "No"})) + "\n")
+        code, doc = self.run_main("--apply", "--only", "w00000000001")
+        self.assertEqual((code, doc["answered"], doc["closed"]), (0, [], []))
+        self.assertEqual([s["ask"] for s in doc["short"]], ["w00000000001"])
 
     def test_a_bad_session_id_is_refused(self):
         out = io.StringIO()
