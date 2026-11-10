@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import fcntl
+from contextlib import contextmanager
 import json
 import os
 import re
@@ -74,10 +76,13 @@ def ensure_dirs(root: Path | None = None) -> Path:
     for sub in ("", "chat", "chat/inbox", "chat/outbox", "chat/state", "chat/queue", "chat/claims", "chat/answered",
                 "chat/keys", "chat/targets", "chat/blocks"):
         path = root / sub if sub else root
+        existed = os.path.lexists(path)
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         if path.is_symlink():
             raise ChatError("unsafe-path", f"{path} is a symlink")
         os.chmod(path, 0o700)
+        if not existed:
+            _sync_dir(path.parent)
     indexed = root / "chat" / "queue" / ".indexed"
     if not os.path.lexists(indexed):
         # A store from before the queue markers: index its queued messages, then write the sentinel. A run killed
@@ -99,10 +104,12 @@ def _mark(path: Path) -> None:
     for _ in range(2):
         try:
             os.close(os.open(path, flags, 0o600))
+            _sync_dir(path.parent)
             return
         except FileExistsError:
             try:
                 if stat.S_ISREG(os.lstat(path).st_mode):
+                    _sync_dir(path.parent)
                     return
                 os.unlink(path)
             except FileNotFoundError:
@@ -110,6 +117,14 @@ def _mark(path: Path) -> None:
             except OSError as exc:  # a directory squatting the name, for example
                 raise ChatError("unsafe-path", f"{path.name} is held by a non-regular file") from exc
     raise ChatError("unsafe-path", f"{path.name} keeps reappearing as a non-regular file")
+
+
+def _sync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def atomic_write(path: Path, data: bytes) -> None:
@@ -121,6 +136,7 @@ def atomic_write(path: Path, data: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
+        _sync_dir(path.parent)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -240,6 +256,53 @@ def _key_path(root: Path, client_key: str) -> Path:
     return chat_dir(root) / "keys" / (hashlib.sha256(client_key.encode("utf-8")).hexdigest()[:40] + ".json")
 
 
+@contextmanager
+def _creation_lock(root: Path, client_key: str):
+    """Serialize one key on a pinned regular inode; never replace or unlink lock files."""
+    directory = os.open(chat_dir(root) / "keys", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    fd = None
+    try:
+        name = _key_path(root, client_key).with_suffix(".lock").name
+        try:
+            fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         0o600, dir_fd=directory)
+        except OSError as exc:
+            raise ChatError("unsafe-path", "message creation lock is unavailable") from exc
+        pinned = os.fstat(fd)
+        if not stat.S_ISREG(pinned.st_mode) or pinned.st_nlink != 1:
+            raise ChatError("unsafe-path", "message creation lock is not a private regular file")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        linked = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (linked.st_dev, linked.st_ino) != (pinned.st_dev, pinned.st_ino):
+            raise ChatError("unsafe-path", "message creation lock changed")
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(directory)
+
+
+def _restore_creation(record: dict, root: Path) -> None:
+    """Finish interrupted publication without reopening claimed or settled work."""
+    path = chat_dir(root) / "inbox" / (record["id"] + ".json")
+    if os.path.lexists(path):
+        if read_json(path) != record:
+            raise ChatError("key-conflict", "reserved message does not match its inbox record")
+    else:
+        write_json(path, record)
+    current = state(record["id"], root).get("status")
+    if current == "unknown":
+        state_path = chat_dir(root) / "state" / (record["id"] + ".json")
+        if os.path.lexists(state_path):
+            raise ChatError("key-conflict", "reserved message has unreadable state")
+        if answered_marked(record["id"], root) or os.path.lexists(chat_dir(root) / "claims" / record["id"]):
+            return  # interrupted delivery/finalization belongs to its worker, never reopen it
+        set_state(record["id"], "queued", root=root)
+    elif current == "queued" and not answered_marked(record["id"], root):
+        if not os.path.lexists(chat_dir(root) / "claims" / record["id"]):
+            _mark(chat_dir(root) / "queue" / record["id"])
+
+
 def new_message(to: str, text, *, client_key: str, session: str | None = None, thread: str | None = None,
                 root: Path | None = None, ts: float | None = None) -> tuple[dict, bool]:
     """Create (or return, for a repeated client_key) a signed inbox record. Returns (record, created)."""
@@ -251,26 +314,34 @@ def new_message(to: str, text, *, client_key: str, session: str | None = None, t
     if to == "claude":
         if not isinstance(session, str) or not SESSION_RE.match(session):
             raise ChatError("bad-session", "a Claude message needs a session id")
-        if not target_registered(session, root):
-            raise ChatError("no-target", "no main attached for that session")
     else:
         session = None
     if thread is not None and (not isinstance(thread, str) or not THREAD_RE.match(thread)):
         raise ChatError("bad-thread", "thread is not a valid initiative id")
     clean = _redact(clean_text(text))
-    known = read_json(_key_path(root, client_key))
-    if isinstance(known, dict) and ID_RE.match(str(known.get("id", ""))):
-        existing = read_json(chat_dir(root) / "inbox" / (known["id"] + ".json"))
-        if existing:
-            return existing, False
-    key = secret(root)
-    record = sign({"schema": SCHEMA, "id": "dash-" + ulid(ts), "client_key": client_key, "from": "user",
-                   "origin": "dashboard", "label": LABEL, "to": to, "session": session, "thread": thread,
-                   "reply_to": None, "text": clean, "created": now_iso(ts)}, key)
-    write_json(chat_dir(root) / "inbox" / (record["id"] + ".json"), record)
-    write_json(_key_path(root, client_key), {"id": record["id"]})
-    set_state(record["id"], "queued", root=root)
-    return record, True
+    payload = {"schema": SCHEMA, "client_key": client_key, "from": "user", "origin": "dashboard",
+               "label": LABEL, "to": to, "session": session, "thread": thread, "reply_to": None, "text": clean}
+    with _creation_lock(root, client_key):
+        key = secret(root)
+        index = _key_path(root, client_key)
+        if os.path.lexists(index):
+            known = read_json(index)
+            if not isinstance(known, dict) or not ID_RE.match(str(known.get("id", ""))):
+                raise ChatError("key-conflict", "client key has an unreadable reservation")
+            # Legacy indexes contain only the id; validate the signed inbox before accepting them.
+            record = known.get("record") if "record" in known else get(known["id"], root)
+            if (not verified(record, key) or record.get("id") != known["id"]
+                    or any(record.get(field) != value for field, value in payload.items())):
+                raise ChatError("key-conflict", "client key was already used for another or invalid message")
+            _restore_creation(record, root)
+            return record, False
+        if to == "claude" and not target_registered(session, root):
+            raise ChatError("no-target", "no main attached for that session")
+        record = sign(dict(payload, id="dash-" + ulid(ts), created=now_iso(ts)), key)
+        # Reservation comes first: any later interruption recovers this exact signed message id.
+        write_json(index, {"id": record["id"], "record": record})
+        _restore_creation(record, root)
+        return record, True
 
 
 def get(msg_id: str, root: Path | None = None):

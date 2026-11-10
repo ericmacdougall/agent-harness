@@ -111,6 +111,8 @@ Sending is idempotent:
 
 - Each send carries a client key.
 - If the response is lost, the page retries once with the same key, so a double-click or a retry never queues two messages.
+- The server serializes each key and durably reserves its signed message before publishing the inbox and queue. A retry repairs interrupted publication with the original message ID, without reopening claimed or answered work.
+- Reusing a key with different text, runtime, session or thread returns HTTP 409 (`key-conflict`). An unreadable reservation or invalid signature also fails closed; it never silently creates a second message. Older key indexes remain readable after signature and payload validation.
 - The draft is cleared once the server accepts the message.
 
 ### Per runtime

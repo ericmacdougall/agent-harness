@@ -452,7 +452,7 @@ class App:
                                                   session=body.get("session"), thread=body.get("thread"),
                                                   root=self.root)
         except mc_chat.ChatError as exc:
-            status = 409 if exc.code == "no-target" else 400
+            status = 409 if exc.code in ("no-target", "key-conflict") else 400
             return status, {"error": exc.code, "message": str(exc)}
         self.hub.publish(ev.make("chat", "dashboard", f"you → {to}", eid=f"chat:{record['id']}",
                                  actor={"runtime": "dashboard"}, subject={"initiative": record.get("thread") or ""}))
