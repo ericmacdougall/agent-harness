@@ -40,6 +40,21 @@ The probe is a bounded guardrail, not an isolation boundary against an agent
 that can replace installed code. Concurrent undetectable exec-away-and-back and
 unrecognized wrapper runtimes are outside the assurance provided by snapshots.
 
+### Operational requirement: restart sessions after a runtime self-update
+
+The probe fails closed. A long-running session whose runtime binary was deleted or replaced by a
+self-update (the kernel then reports no executable path and the Security framework refuses a guest
+lookup) has no verifiable identity. Such a session is denied main authority and, with commit
+attribution active, its commits are refused as "native runtime attribution uncertain". This is
+intended and is deliberately not relaxed for deleted binaries (user decision, goodqa#15565). After
+installing, and after any runtime self-update, restart the affected sessions (resume with the same
+session id) so they run the current binary. A stale session shows a runtime process whose
+`lsof -p <pid>` text file no longer exists.
+
+A Terminal-launched session has root-owned `/usr/bin/login` above its shell, and the kernel withholds
+its BSD info from the user. Only that exact kernel path ends the walk as a non-native chain; any other
+unreadable ancestor, and the caller itself, stay uncertain.
+
 ## Weak native user-message discovery
 
 Pass a bounded app `read_thread` snapshot on stdin:
