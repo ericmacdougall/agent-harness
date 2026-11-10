@@ -852,6 +852,213 @@ class OwnerLiveness(StoreFixture):
                 self.assertEqual(refused.exception.reason, 'UNKNOWN')
 
 
+class CompletedUncertainPools(OwnerLiveness):
+    """Completed timeout history cannot orphan a pool or excuse missing child evidence."""
+
+    def uncertain(self, *, label='focused', launches=1, children=1, execution='INTERRUPTED', reason='TIMEOUT',
+                  pools=('fixture-pool',)):
+        owner = self.child()
+        run = self.begin_owned(self.facts_for(owner), label=label)
+        for pool in pools:
+            self.store.acquire_pool('claude', pool, run.run_id)
+        recorded = [self.child() for _ in range(children)]
+        for child in recorded:
+            run.note_child(child)
+        usage = {} if launches is None else {'provider_launches': launches}
+        final = run.finish(execution=execution, result='NO_RESULT', reason=reason, usage=usage)
+        return run, owner, recorded, final
+
+    def stop_owned(self, *processes):
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+
+    def pool(self, name='fixture-pool'):
+        with self.store._lock():
+            directory, state = self.store._pool('claude', name)
+        return directory, state
+
+    def test_completed_timeout_reconciles_only_dead_recorded_incarnations(self):
+        run, owner, children, final = self.uncertain()
+        directory = self.store.root / 'runs' / run.run_id
+        history = {name: (directory / name).read_bytes() for name in ('start.json', 'final.json', 'completion.json')}
+        self.stop_owned(owner, *children)
+        with self.future():
+            report = self.store.auto_reconcile(run.run_id)
+        self.assertTrue(report['reconciled'])
+        self.assertIsNone(self.pool()[1]['active'])
+        record = json.loads(self.reconciled_path(run).read_text())
+        self.assertEqual((record['execution'], record['result']), ('UNKNOWN', 'NO_RESULT'))
+        self.assertFalse(self.store.reuse(self.subject, self.identity, final)['eligible'])
+        for name, body in history.items():
+            self.assertEqual((directory / name).read_bytes(), body)
+        events = list((self.store.root / 'pools').glob('*/events/*.json'))
+        with self.future():
+            self.assertEqual(self.store.auto_reconcile(run.run_id)['why'], 'already reconciled')
+        self.assertEqual(list((self.store.root / 'pools').glob('*/events/*.json')), events)
+        with self.assertRaises(guard.GuardError):
+            self.store.acquire_pool('claude', 'fixture-pool', run.run_id)
+
+    def test_completed_unknown_missing_child_record_cannot_hide_a_live_child(self):
+        run, owner, _, _ = self.uncertain(launches=1, children=0, execution='COMPLETED', reason='UNKNOWN')
+        escaped = self.child()
+        self.stop_owned(owner)
+        with self.future():
+            report = self.store.auto_reconcile(run.run_id)
+        self.assertFalse(report['reconciled'])
+        self.assertIn('child', report['why'])
+        self.assertEqual(self.pool()[1]['active'], run.run_id)
+        self.assertIsNone(escaped.poll())
+        self.assertFalse(self.reconciled_path(run).exists())
+
+    def test_begin_reconciles_completed_uncertainty_before_justified_repeat(self):
+        run, owner, children, _ = self.uncertain()
+        self.stop_owned(owner, *children)
+        with self.future():
+            retry = self.begin(repeat_reason='owned reviewer ended', aggregate_timeout=30)
+        self.assertTrue(self.reconciled_path(run).exists())
+        self.store.acquire_pool('claude', 'fixture-pool', retry.run_id)
+        self.assertEqual(self.pool()[1]['active'], retry.run_id)
+
+    def test_acquire_pool_reconciles_a_different_completed_uncertain_owner(self):
+        run, owner, children, _ = self.uncertain()
+        self.stop_owned(owner, *children)
+        retry = self.begin_owned(self.facts_for(self.child()), label='independent-invocation')
+        with self.future():
+            self.store.acquire_pool('claude', 'fixture-pool', retry.run_id)
+        self.assertTrue(self.reconciled_path(run).exists())
+        self.assertEqual(self.pool()[1]['active'], retry.run_id)
+
+    def test_completed_run_still_waits_for_child_and_deadline(self):
+        run, owner, children, _ = self.uncertain()
+        self.stop_owned(owner)
+        with self.future():
+            self.assertFalse(self.store.auto_reconcile(run.run_id)['reconciled'])
+        self.assertIsNone(children[0].poll())
+        self.stop_owned(*children)
+        self.assertFalse(self.store.auto_reconcile(run.run_id)['reconciled'])
+        self.assertFalse(self.reconciled_path(run).exists())
+
+    def test_corrupt_pool_history_blocks_completed_reconciliation(self):
+        run, owner, children, _ = self.uncertain()
+        self.stop_owned(owner, *children)
+        directory, _ = self.pool()
+        before = (directory / 'head.json').read_bytes()
+        index = json.loads(before)
+        event = directory / 'events' / (index['event'] + '.json')
+        event.write_bytes(event.read_bytes() + b' ')
+        with self.future(), self.assertRaises(guard.GuardError):
+            self.store.auto_reconcile(run.run_id)
+        self.assertFalse(self.reconciled_path(run).exists())
+        self.assertEqual((directory / 'head.json').read_bytes(), before)
+
+    def test_completed_unknown_launch_count_and_short_child_record_stay_uncertain(self):
+        for label, launches, children in [('missing', None, 1), ('short', 2, 1), ('boolean', True, 1),
+                                          ('zero-completed', 0, 0)]:
+            with self.subTest(label=label):
+                run, owner, recorded, _ = self.uncertain(label=label, launches=launches, children=children,
+                                                        execution='COMPLETED', reason='UNKNOWN')
+                self.stop_owned(owner, *recorded)
+                try:
+                    with self.future():
+                        report = self.store.auto_reconcile(run.run_id)
+                    self.assertFalse(report['reconciled'])
+                    self.assertIn('launch', report['why'])
+                    self.assertFalse(self.reconciled_path(run).exists())
+                finally:
+                    self.store.reconcile(run.run_id, actor='fixture', reason='owned fixture ended', evidence='all fixture children joined')
+
+    def test_completed_not_started_requires_positive_zero_launch_evidence(self):
+        run, owner, _, _ = self.uncertain(launches=0, children=0, execution='NOT_STARTED', reason='UNKNOWN')
+        self.stop_owned(owner)
+        with self.future():
+            self.assertTrue(self.store.auto_reconcile(run.run_id)['reconciled'])
+        self.assertIsNone(self.pool()[1]['active'])
+
+    def test_completed_uncertain_reboot_independently_resolves_absent_children(self):
+        owner = self.child()
+        run = self.begin_owned(self.facts_for(owner, boot_id='procboot:before'), label='reboot-completed')
+        self.store.acquire_pool('claude', 'fixture-pool', run.run_id)
+        run.finish(execution='INTERRUPTED', result='NO_RESULT', reason='TIMEOUT', usage={})
+        with self.future(), mock.patch.object(guard, 'boot_identity', return_value='procboot:after'):
+            report = self.store.auto_reconcile(run.run_id)
+        self.assertTrue(report['reconciled'])
+        self.assertIn('reboot', report['liveness']['why'])
+        self.assertIsNone(self.pool()[1]['active'])
+        self.assertIsNone(owner.poll(), 'the new-boot PID control must not be signalled')
+
+    def test_completion_reference_and_final_identity_must_match_start(self):
+        run, owner, children, _ = self.uncertain()
+        self.stop_owned(owner, *children)
+        directory = self.store.root / 'runs' / run.run_id
+        completion = (directory / 'completion.json').read_bytes()
+        final = (directory / 'final.json').read_bytes()
+        pool_dir, _ = self.pool()
+        head = (pool_dir / 'head.json').read_bytes()
+        for label in ('wrong-run', 'wrong-digest', 'changed-subject', 'changed-invocation', 'bad-schema'):
+            with self.subTest(label=label):
+                c = json.loads(completion); f = json.loads(final)
+                if label == 'wrong-run': c['reference']['run_id'] = 'f' * 32
+                elif label == 'wrong-digest': c['reference']['sha256'] = 'f' * 64
+                elif label == 'bad-schema': c['extra'] = True
+                else:
+                    field = 'subject' if label == 'changed-subject' else 'invocation'
+                    f[field]['fingerprint'] = 'f' * 64
+                    body = guard.encoded(f)
+                    (directory / 'final.json').write_bytes(body)
+                    c['reference']['sha256'] = hashlib.sha256(body).hexdigest()
+                (directory / 'completion.json').write_bytes(guard.encoded(c))
+                with self.future(), self.assertRaises(guard.GuardError):
+                    self.store.auto_reconcile(run.run_id)
+                self.assertFalse(self.reconciled_path(run).exists())
+                self.assertEqual((pool_dir / 'head.json').read_bytes(), head)
+                (directory / 'completion.json').write_bytes(completion)
+                (directory / 'final.json').write_bytes(final)
+
+    def test_interrupted_marker_publication_resumes_without_rewriting_history(self):
+        run, owner, children, _ = self.uncertain()
+        self.stop_owned(owner, *children)
+        with mock.patch.object(self.store, '_pool_event', side_effect=OSError('fixture disk full')):
+            with self.assertRaises(OSError):
+                self.store.reconcile(run.run_id, actor='fixture', reason='owned processes ended', evidence='all fixture PIDs joined')
+        marker = self.reconciled_path(run).read_bytes()
+        self.assertEqual(self.pool()[1]['active'], run.run_id)
+        with self.future():
+            report = self.store.auto_reconcile(run.run_id)
+        self.assertTrue(report['reconciled'])
+        self.assertIsNone(self.pool()[1]['active'])
+        self.assertEqual(self.reconciled_path(run).read_bytes(), marker)
+
+    def test_partial_multiple_pool_resume_preserves_newer_owner_and_cooldown(self):
+        run, owner, children, _ = self.uncertain(pools=('fixture-pool', 'second-pool'))
+        self.store.release_pool('claude', 'second-pool', run.run_id, reason='TIMEOUT')
+        self.stop_owned(owner, *children)
+        original = self.store._pool_event
+        calls = []
+        def fail_second(directory, state, action, **facts):
+            calls.append(state['pool'])
+            if len(calls) == 2: raise OSError('fixture interrupted after first pool')
+            return original(directory, state, action, **facts)
+        with mock.patch.object(self.store, '_pool_event', side_effect=fail_second), self.assertRaises(OSError):
+            self.store.reconcile(run.run_id, actor='fixture', reason='owned processes ended', evidence='all fixture PIDs joined')
+        marker = self.reconciled_path(run).read_bytes()
+        released = calls[0]; remaining = calls[1]
+        next_run = self.begin_owned(self.facts_for(self.child()), label='new-owner')
+        self.store.acquire_pool('claude', released, next_run.run_id)
+        newer_dir, newer = self.pool(released); before_newer = (newer_dir / 'head.json').read_bytes()
+        before_remaining = self.pool(remaining)[1]
+        with self.future():
+            self.assertTrue(self.store.auto_reconcile(run.run_id)['reconciled'])
+        self.assertEqual(self.pool(released)[1]['active'], next_run.run_id)
+        self.assertEqual((newer_dir / 'head.json').read_bytes(), before_newer)
+        after = self.pool(remaining)[1]
+        self.assertIsNone(after['active'])
+        self.assertEqual({k: after[k] for k in ('cooldown', 'reason', 'reset_at')},
+                         {k: before_remaining[k] for k in ('cooldown', 'reason', 'reset_at')})
+        self.assertEqual(self.reconciled_path(run).read_bytes(), marker)
+
+
 class ZeroLaunchAttempts(StoreFixture):
     """GoodQA goodqa#14526: infrastructure refusals before any provider ran do not spend the repeat budget."""
 
