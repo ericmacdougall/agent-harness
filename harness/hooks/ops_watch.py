@@ -290,28 +290,30 @@ ASK_DUE_KEY = re.compile(r"^ask:(w[0-9a-f]{11}):due$")
 RESOLVED_SCAN_MAX_BYTES = 32 << 20
 
 
-def resolved_ask_ids(home: Path, ids: set) -> set:
-    """Which of these ask ids have an `ask_resolved` row in any session main log (GoodQA #15565: a closed ask kept alerting
-    until the daemon's next tick, and a tick over budget skipped alerts altogether). Regular files only, bounded bytes."""
+def resolved_ask_ids(home: Path, wanted: dict) -> set:
+    """Which asks have a sourced `ask_resolved` row in THEIR OWN session main log. `wanted` maps ask id to the 8-character
+    session prefix the alert names (GoodQA #15565: a closed ask kept alerting until the daemon's next tick, and a tick over
+    budget skipped alerts altogether). Regular files only, bounded bytes; a row without a source never hides an alert."""
     found = set()
-    if not ids:
-        return found
-    for main_log in sorted((home / ".claude" / "wals").glob("*/main.jsonl")):
-        try:
-            if main_log.is_symlink() or not main_log.is_file() or main_log.stat().st_size > RESOLVED_SCAN_MAX_BYTES:
+    for prefix in sorted({p for p in wanted.values() if p}):
+        ids = {i for i, p in wanted.items() if p == prefix}
+        for main_log in sorted((home / ".claude" / "wals").glob(prefix + "*/main.jsonl")):
+            try:
+                if main_log.is_symlink() or not main_log.is_file() or main_log.stat().st_size > RESOLVED_SCAN_MAX_BYTES:
+                    continue
+                with open(main_log, "rb") as handle:
+                    for raw in handle:
+                        if b'"ask_resolved"' not in raw:
+                            continue
+                        try:
+                            rec = json.loads(raw)
+                        except (ValueError, RecursionError):
+                            continue
+                        if (isinstance(rec, dict) and rec.get("event") == "ask_resolved" and rec.get("ref") in ids
+                                and rec.get("source")):
+                            found.add(rec["ref"])
+            except OSError:
                 continue
-            with open(main_log, "rb") as handle:
-                for raw in handle:
-                    if b'"ask_resolved"' not in raw:
-                        continue
-                    try:
-                        rec = json.loads(raw)
-                    except (ValueError, RecursionError):
-                        continue
-                    if isinstance(rec, dict) and rec.get("event") == "ask_resolved" and rec.get("ref") in ids:
-                        found.add(rec["ref"])
-        except OSError:
-            continue
     return found
 
 
@@ -322,11 +324,14 @@ def active_alerts(home: Path) -> list:
     for (host, _src, _key), e in latest_by_key(read_ring(ring_path(home))).items():
         if e.get("event") == "raise":
             act.append(e if e.get("host") == host else dict(e, host=host))
-    due = {m.group(1) for e in act for m in [ASK_DUE_KEY.match(str(e.get("key") or ""))] if m}
-    if due:
-        gone = resolved_ask_ids(home, due)
-        act = [e for e in act if not (ASK_DUE_KEY.match(str(e.get("key") or ""))
-                                      and ASK_DUE_KEY.match(str(e.get("key"))).group(1) in gone)]
+    wanted = {}
+    for e in act:
+        m = ASK_DUE_KEY.match(str(e.get("key") or ""))
+        if m:
+            wanted[m.group(1)] = str((e.get("detail") or {}).get("session") or "")[:8]
+    if wanted:
+        gone = resolved_ask_ids(home, wanted)
+        act = [e for e in act if (ASK_DUE_KEY.match(str(e.get("key") or "")) or [None, None])[1] not in gone]
     return sorted(act, key=lambda e: (-SEVERITIES.get(e.get("severity"), 0), e.get("key", "")))
 
 

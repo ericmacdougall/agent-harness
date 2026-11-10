@@ -76,6 +76,38 @@ class OutcomeClose(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("--outcome", err)
 
+    def test_evidence_that_is_the_ask_itself_or_traces_to_a_human_turn_is_refused(self):
+        code, err = self.run_note("--outcome", "obsolete", "--source", "wal:/x/main.jsonl#wask00000001")
+        self.assertEqual(code, 2)
+        self.assertIn("the ask itself", err)
+        human = dict(OK, origin="user")
+        argv = ["wal_note.py", "--wal", str(self.wal), "--event", "ask_resolved", "--ref", "wask00000001", "--note", "closing",
+                "--outcome", "obsolete", "--source", "wal:/x/main.jsonl#w0123456789a"]
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}), mock.patch("sys.argv", argv), \
+                mock.patch("provenance.resolve", lambda *a, **k: dict(human)), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = wal_note.main()
+        self.assertEqual(code, 2)
+        self.assertIn("human turn", err.getvalue())
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_evidence_must_really_resolve_unmocked(self):
+        argv = ["wal_note.py", "--wal", str(self.wal), "--event", "ask_resolved", "--ref", "wask00000001", "--note", "closing",
+                "--outcome", "obsolete", "--source", "wal:/nonexistent/main.jsonl#w0123456789a"]
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}), mock.patch("sys.argv", argv), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = wal_note.main()
+        self.assertEqual(code, 2)  # a source that does not resolve closes nothing
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_a_tool_close_is_marked_and_never_an_approval_row(self):
+        code, err = self.run_note("--by", "ask-sweep", "--source", USER)
+        self.assertIn(code, (0, None), err)
+        row = self.rows()[-1]
+        self.assertEqual((row["by"], row["closed_by"]), ("ask-sweep", "ask-sweep"))
+        self.assertNotIn("decision", row)
+
     def test_a_resolved_ask_is_not_open_again_and_the_row_is_not_an_approval_for_the_kill_gate(self):
         self.run_note("--outcome", "obsolete", "--source", "wal:/x/main.jsonl#w0123456789a")
         code, _ = self.run_note("--outcome", "obsolete", "--source", "wal:/x/main.jsonl#w0123456789a")
