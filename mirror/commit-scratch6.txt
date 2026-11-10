@@ -1,0 +1,10 @@
+docs(spec): goodqa#15598 spec v3 and v3.1 with delta review reports
+
+Why: both delta spec reviews blocked v2; v3 and v3.1 answer them and the
+reports are kept so the review trail survives in the scratch worktree.
+What: spec v3, v3.1 and their patch scripts, plus the acceptance and
+adversarial delta reports for v2.
+Testing: not run: documents only, v3.1 lints PASS with spec_flow.py.
+Refs: GoodQA #15598
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

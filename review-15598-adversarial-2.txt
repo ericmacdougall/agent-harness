@@ -1,0 +1,104 @@
+DELTA ADVERSARIAL SPEC REVIEW goodqa#15598 spec-15598-v2.md
+Reviewer: agent:aebc8c3ffa03ad58e (opus). Code read-only at bugtracker 26d95f46ada7 on t2-dev. No probes, no live
+calls, no edits. Material findings only.
+
+VERDICT: BLOCK. v2 closes most of round 1, but three material gaps remain (N1-N3) and one acceptance test lets a wrong
+implementation pass (N4). Each fix is small and text-level.
+
+=== ROUND 1 STATUS ===
+F1 choke point plus census: closed in design, but the session exemption reopens it (N1).
+F2 own ability: closed by A1, but NEG-8 as worded does not test it (N4).
+F3 grantee control: partly closed. A2 is right in principle but cannot be enforced for personas and misses the key a
+   persona speaks through (N2).
+F4 desktop session: open (N1).
+F5 integrity (D4): closed.
+F6 DB rate limit and unique-index idempotency (D6, D7): closed.
+F7 redaction (D9): closed.
+F8 unmutable owner email (D8): closed.
+Rollback (D11, fail closed, never drop the table): closed.
+
+=== MATERIAL FINDINGS ===
+
+N1 [HIGH] D3's session exemption is defined by the ABSENCE of agent markers, applies at every opener, and many openers
+have no request credential at all.
+  - D3: the wrapper admits "a signed-in person's session (AuthContext without userTokenId, apiKeyId, MCP dispatch
+    marker or desktop-session binding)". NEG-5 says the non-vault openers refuse a blind secret "through a signed-in
+    session" too. D3 and NEG-5 contradict each other. D3 as written lets a session open the secret through the
+    automation HTTP node, SMTP and the others.
+  - Openers without a request: http-node/reconcile.ts:58 runs a saved workflow in the background as
+    `actorId: w.createdBy`. step-test/service.ts testStep receives only `actorId` (a user id string), not an
+    AuthContext. If call sites hand the wrapper `{ userId }`, it shows none of the agent markers and passes as a
+    "session". Exploit: a user token creates a workflow whose http_request credential is the blind secret. The
+    background reconciler then opens it as the user and sends it to the agent's URL. NEG-5 tests the user token on the
+    step-test request, not the background run.
+  - How to tell a desktop session bound to a token from a signed-in session (you asked for the field): a bound
+    desktop session is a REAL `sessions` row. auth.sessionId is a real uuid, so `isRealSessionId` is true. The binding
+    lives in `sessions.login_method`, read with `desktopMintingTokenId(loginMethod) !== null`
+    (lib/desktop-token-session.ts:30; plugins/auth.ts:6758). For such a session, plugins/auth.ts:6340-6349 sends the
+    request through `applyUserTokenRoutePolicy(..., 'desktop_session', ...)` and sets
+    `req.userTokenDoor = { via: 'desktop_session', ... }`. I did NOT verify that this policy stamps
+    `req.auth.userTokenId`, so do not rely on userTokenId alone.
+  FIX: (a) define the exemption POSITIVELY and only on `POST /vault/secrets/:id/reveal`:
+    isRealSessionId(auth.sessionId) && !auth.userTokenId && !auth.apiKeyId && !req.userTokenDoor
+    && desktopMintingTokenId(session.loginMethod) === null (re-read live), and no MCP or in-process dispatch.
+    (b) Every other opener refuses a blind secret unconditionally. Only the grantee on vault-env/reveal passes.
+    (c) The wrapper takes a typed caller ({kind: 'session'|'user_token'|'api_key'|'system', ...}). Background and
+    worker sites pass 'system', which always refuses a blind secret. Add NEG cases for the saved-workflow background
+    run, and for a desktop session minted by the same token on the vault reveal route.
+
+N2 [HIGH] A2 cannot be enforced from existing data, and for a persona grantee it checks the wrong row.
+  - personas (packages/db/src/schema/personas.ts:52-73) record only `createdBy` (a user) and `createdAt`. There is no
+    record of whether a session or a token created the row. `POST /v1/orgs/:p/api-keys/:p/persona` is reachable by a
+    user token (in the token allow list; agents.manage). So "created by a signed-in person's session, not by any user
+    token" cannot be checked for any persona that exists today.
+  - api_keys has `created_by_user_token_id` (orgs.ts:360), but it is also set when a token re-scopes or extends a
+    key (user-token-key-tie.ts header: "a key a token LOOSENS ... becomes the token's"). I found no record of MCP
+    pairing or automation creation (hypothesis: pairing-created keys are indistinguishable; not verified).
+  - Laundering path without any deliberate leak: vault-env resolves a persona by the KEY it speaks through
+    (vault-env/service.ts keyPrincipal: persona WHERE apiKeyId = the caller's key). Suppose a person, signed in,
+    gives a persona to an agent's key: a key minted through a token, whose plaintext the agent holds. That persona
+    passes A2 as written (human-created, old). The agent's key then reads as the grantee. Giving a bot a persona is a
+    normal action, so this is not the "human deliberately hands over the secret" residual the spec states.
+  FIX: add provenance columns in this migration: personas.created_via ('session'|'user_token'|'api_key'|'pairing')
+    plus created_via_id, and the same for api_keys. Rows with unknown provenance (all existing ones) are ineligible
+    unless a signed-in person confirms them on a session-only route, which is the bootstrap step. For a persona
+    grantee, apply A2 to BOTH the persona and the key it speaks through: key created by a session,
+    created_by_user_token_id NULL, never tied to a token later, at least 60 minutes old. Re-check this on every
+    reveal, not only at mint time (D10 already joins on eligibility; make the key part explicit). Add NEG-6 cases: a
+    session-created persona on a token-minted key is refused; a session-created key later extended or re-scoped by a
+    token is refused.
+
+N3 [MEDIUM-HIGH] D10 contradicts an existing security invariant without saying so.
+  - Today any key minted or loosened through a token is the token's, revoked with it, and "its life follows the
+    token's live chain" (user-token-key-tie.ts; api-keys/routes.ts:154). AuthContext.apiKeyCreatedByUserTokenId also
+    makes such a key refused by the personal-principal rules (plugins/auth.ts AuthContext doc). For the minted key to
+    outlive the token, D10 must leave created_by_user_token_id unset. That silently drops both protections: a key
+    the token created survives revocation of a compromised token, and it can act as an owner-mode personal principal.
+  Is D10 acceptable? Only with these changes. (a) Keep a separate, non-lifetime marker (e.g. minted_via_user_token_id
+    on api_keys, or the blind row) that the personal-principal rules treat exactly like created_by_user_token_id.
+    (b) Revoking the minting token emails the owner the list of keys it minted to vaults, with a one-step
+    session-only "revoke all keys minted by this token". (c) The 90-day expiry in D1 stays mandatory. Record the
+    choice as a decision with main as the source. Otherwise keep the existing tie, so the key dies with the token,
+    and state that hosts must be re-minted.
+
+N4 [MEDIUM] NEG-8 lets the wrong implementation pass. It reads: "a token with tokens.mint_to_vault and also
+  tokens.create_other_keys is refused by the new route (or the proof token is shown to lack it and plain POST
+  /api-keys with that token is refused)". Satisfying only the second branch passes even if the route accepts a token
+  that holds both abilities. That is the case finding F2 was about. FIX: drop the "or". The route must refuse any
+  token holding tokens.create_other_keys or `all` (A1 says mint_to_vault is not part of `all`; also state that `all`
+  plus mint_to_vault is refused). The live-proof token check is an additional test, not an alternative.
+
+=== CHECKED, NO NEW MATERIAL HOLE ===
+- D5: same 400 for all grantee errors, row lock on the grantee, self-principal exclusion. Fine, once N2 adds
+  provenance.
+- A3: the allow-list entry bound to the exact secret id in the blind row, and vault-env/config left session-only. Fine.
+  The grantee match must use keyPrincipal's resolved principal. If a persona is retired, the request resolves to the
+  key and is refused; add one test for that.
+- D6 and D7: unique index scoped per token, so another token replaying cannot learn the ids; 410 after revoke;
+  counted from the DB under an advisory lock. Fine.
+
+=== NOT VERIFIED ===
+- Whether applyUserTokenRoutePolicy sets req.auth.userTokenId for a bound desktop session.
+- MCP pairing key provenance.
+- MCP tool code (get_secret, read_requested_secret, call_api).
+- The token-policy rows for the automation and connector routes.
