@@ -29,6 +29,8 @@ DEMO_SESSION = "demo-main-0000-4000-8000-000000000000"
 DESKTOP_SESSION = "claude-desktop"
 DEMO_HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+ts\.net$")
 ECHO_AFTER_S = 4.0
+BURST_EVERY = 20  # pulses (about one minute)
+BURST_SIZE = 30
 ECHO_TEXT = ("Demo instance: your message was received and stored in a disposable inbox. "
              "Nothing was sent to any agent.")
 
@@ -174,21 +176,22 @@ OWNERS = [
 ]
 
 INITIATIVES = [
-    {"id": "demo#101", "initiative": "Checkout redesign", "state": "In progress", "pct": 62, "milestones_done": 5,
-     "milestones_total": 8, "milestones": ["Spec", "Design", "API", "Form", "Payments", "Review", "Click-test",
-                                           "Live"],
+    {"id": "demo#101", "initiative": "Checkout redesign", "state": "In progress", "milestones_done": 5,
+     "milestones_total": 8, "milestones": "Done: Spec · Done: Design · Done: API · Done: Form · Done: Payments · "
+                                          "Not yet: Review · Not yet: Click-test · Not yet: Live",
      "owner": "a1live0demo", "ticket": "demo#101", "next_step": "Finish the payment form and its error states",
      "next_eta": "~2 h", "full_eta": "~1 day", "estimate_by": "main", "note": "Demo data"},
-    {"id": "demo#104", "initiative": "Reports table migration", "state": "At risk", "pct": 30,
-     "milestones_done": 1, "milestones_total": 4, "owner": "a4held0demo", "ticket": "demo#104",
+    {"id": "demo#104", "initiative": "Reports table migration", "state": "At risk",
+     "milestones_done": 1, "milestones_total": 4,
+     "milestones": "Done: Spec · Not yet: Backup · Not yet: Canary · Not yet: Live", "owner": "a4held0demo", "ticket": "demo#104",
      "next_step": "Wait for the nightly backup, then migrate in a canary", "next_eta": "~8 h",
      "full_eta": "~2 days", "estimate_by": "owner"},
-    {"id": "demo#103", "initiative": "Release 0.4", "state": "Merged, not live", "pct": 85, "milestones_done": 6,
+    {"id": "demo#103", "initiative": "Release 0.4", "state": "Merged, not live", "milestones_done": 6,
      "milestones_total": 7, "owner": "a3fini0demo", "ticket": "demo#103", "next_step": "Deploy and test live",
      "next_eta": "~1 h", "full_eta": "~1 h"},
     {"id": "demo#109", "initiative": "Onboarding emails", "state": "Not started", "ticket": "demo#109",
      "next_step": "Write the spec", "note": "No owner yet"},
-    {"id": "demo#108", "initiative": "Docs refresh", "state": "Done", "pct": 100, "milestones_done": 3,
+    {"id": "demo#108", "initiative": "Docs refresh", "state": "Done", "milestones_done": 3,
      "milestones_total": 3, "ticket": "demo#108"},
 ]
 
@@ -268,6 +271,16 @@ class DemoLoop:
         line = {"schema": "mc.event/1", "id": f"demo:{int(now)}:{self.n}", "ts": _iso(now), "kind": kind,
                 "summary": summary, "subject": subject}
         _write(self.root / "sources" / "demo.jsonl", json.dumps(line) + "\n", append=True)
+        # Tool activity: two tool-call records for a2 each pulse, shown only with 'Show tool activity'.
+        tools = self.root / "demo" / "wals" / DEMO_SESSION / f"agent-{OWNERS[1][0]}.jsonl"
+        _write(tools, "".join(json.dumps({"at": _iso(now), "event": "pretool", "tool": name}) + "\n"
+                              for name in ("Read", "Bash")), append=True)
+        if self.n % BURST_EVERY == 0:
+            # A burst: more lines at once than the hub's 20-per-second budget, so a burst summary row appears.
+            burst = "".join(json.dumps({"schema": "mc.event/1", "id": f"demo:{int(now)}:{self.n}:b{i}", "ts": _iso(now),
+                                        "kind": "wal", "summary": f"check: burst line {i + 1} of {BURST_SIZE}",
+                                        "subject": {"ticket": "demo#101"}}) + "\n" for i in range(BURST_SIZE))
+            _write(self.root / "sources" / "demo.jsonl", burst, append=True)
         if self.n % 3 == 0:
             agent = OWNERS[self.n % 3][0]
             wal = self.root / "demo" / "wals" / DEMO_SESSION / f"agent-{agent}.jsonl"

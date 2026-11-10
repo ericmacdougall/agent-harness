@@ -382,7 +382,7 @@ class Initiatives(Collector):
         self.hub.snapshot("initiatives", self.snapshot(mtime))
 
     def snapshot(self, mtime=None) -> dict:
-        return {"items": self.items, "stale": self.stale, "error": self.error, "path": str(self.path or ""),
+        return {"items": self.items, "stale": self.stale, "error": self.error,
                 "mtime": mtime}
 
 

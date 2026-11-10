@@ -174,10 +174,13 @@ To tie a test run to a commit, run the checkout's own `harness/mission_control/s
 
 The page's `#gl=off` view flag forces the static (no-WebGL) view, so the fallback can be checked in any browser.
 
-Two knobs exercise the slow-network cases:
+Three knobs exercise the slow-network and failure cases:
 
-- `MC_DEMO_CHAT_DELAY_MS=3000` holds each chat accept for 3 s.
+- `MC_DEMO_CHAT_DELAY_MS=3000` holds each chat send for 3 s before anything is stored, so the page's "Sending…" state and an edit made while pending can be seen.
 - `MC_DEMO_DROP_FIRST=1` stores the first message and then drops its response, so the page's same-key retry can be checked.
+- `MC_DEMO_REFUSE_FIRST=1` refuses the first send (503) without storing it, so the failed message, its Retry button and the kept text can be checked.
+
+The demo feed also writes two tool-call records each pulse (seen with "Show tool activity"), and about once a minute a burst of 30 lines, which shows as a "more events in a burst" row.
 
 `--demo-host NAME.ts.net` (only with `--demo`) also accepts that exact Tailscale Funnel host, with the Origin `https://NAME.ts.net`. The server still binds 127.0.0.1. Any other name is refused, and the LaunchAgent never passes `--demo`. On that host the session cookie is marked `Secure`. There is no launch-failure lockout: the 128-bit MAC cannot be guessed, and behind a Funnel all clients share 127.0.0.1, so a shared lockout would let one client block another's genuine code. Opening a Funnel exposes the page publicly, so only do it for a short, approved window, and close it afterwards.
 

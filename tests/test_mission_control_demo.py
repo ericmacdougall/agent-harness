@@ -191,6 +191,43 @@ class Http(Base):
         self.assertEqual(self.send(cookie, state["csrf"], "key-delay-0001")[0].status, 201)
         self.assertGreaterEqual(time.time() - start, 1.0)
 
+    def test_delay_holds_before_the_message_is_stored(self):
+        # AC-21: the page's 'Sending…' state must last the whole delay, so nothing is stored (or pushed) until after it.
+        demo.DemoLoop(self.root, threading.Event()).heartbeat()
+        self.app.demo_delay_s = 1.5
+        cookie, state = self.login()
+        done = threading.Event()
+        threading.Thread(target=lambda: (self.send(cookie, state["csrf"], "key-delay-0002"), done.set()),
+                         daemon=True).start()
+        time.sleep(0.7)
+        self.assertEqual(len(mc_chat.inbox(self.root)), 0)
+        self.assertTrue(done.wait(10))
+        self.assertEqual(len(mc_chat.inbox(self.root)), 1)
+
+    def test_refuse_first_refuses_once_without_storing(self):
+        # AC-21: a refused send is reachable in the click-test and stores nothing; the retry then succeeds.
+        demo.DemoLoop(self.root, threading.Event()).heartbeat()
+        self.app.demo_refuse_first = True
+        cookie, state = self.login()
+        resp, data = self.send(cookie, state["csrf"], "key-refuse-0001")
+        self.assertEqual(resp.status, 503, data)
+        self.assertEqual(json.loads(data)["error"], "demo-refused")
+        self.assertEqual(len(mc_chat.inbox(self.root)), 0)
+        self.assertEqual(self.send(cookie, state["csrf"], "key-refuse-0001")[0].status, 201)
+        self.assertEqual(len(mc_chat.inbox(self.root)), 1)
+
+    def test_fixture_initiatives_have_milestones_and_computed_percentages(self):
+        # AC-17: each listed milestone renders, and the shown percentage is computed from the counts.
+        self.app.initiatives.run(time.time())
+        snapshot = self.app.hub.snapshots["initiatives"]
+        self.assertNotIn(str(Path.home()), json.dumps(snapshot))  # no file paths reach a demo session
+        rows = {row["ticket"]: row for row in snapshot["items"]}
+        self.assertEqual(len(rows), 5)
+        self.assertEqual([i["done"] for i in rows["demo#101"]["milestone_items"]], [True] * 5 + [False] * 3)
+        self.assertEqual(len(rows["demo#104"]["milestone_items"]), 4)
+        self.assertEqual({k: rows[k]["pct"] for k in rows},
+                         {"demo#101": 62, "demo#104": 25, "demo#103": 86, "demo#109": None, "demo#108": 100})
+
 
     def test_junk_launch_codes_never_block_a_genuine_one(self):
         # NEG-23: behind a Funnel every client is 127.0.0.1; a scanner must not lock the tester out.
@@ -345,6 +382,24 @@ class EchoAndActivity(Base):
         lines = (self.root / "sources" / "demo.jsonl").read_text().splitlines()
         self.assertEqual(len(lines), 6)
         self.assertTrue(all(json.loads(line)["schema"] == "mc.event/1" for line in lines))
+
+    def test_demo_feeds_tool_activity_and_a_burst_through_the_real_collectors(self):
+        # AC-18: 'Show tool activity' and burst rows have something to show on the demo instance.
+        app = mcs.build_app(demo_args(free_port()))
+        loop = demo.DemoLoop(self.root, threading.Event())
+        loop.n = demo.BURST_EVERY - 1  # the next pulse is a burst pulse
+        app.tailer.run(time.time())
+        app.drop.run(time.time())
+        loop.pulse(time.time())
+        app.tailer.next_at = app.drop.next_at = 0
+        app.tailer.run(time.time())
+        app.drop.run(time.time())
+        app.hub.publish(mcs.ev.make("system", "test", "after the window", eid="probe:1"))  # flushes nothing yet
+        time.sleep(1.05)
+        app.hub.publish(mcs.ev.make("system", "test", "next window", eid="probe:2"))
+        summaries = [e["summary"] for e in app.hub.recent()]
+        self.assertTrue(any(s.endswith("tool calls · last Bash") for s in summaries), summaries[-5:])
+        self.assertTrue(any(s.endswith("more events in a burst") for s in summaries), summaries[-5:])
 
 
 class LaunchCode(Base):

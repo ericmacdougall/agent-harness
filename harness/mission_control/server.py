@@ -198,11 +198,13 @@ class App:
         self.build = demo_mode.build_identity(HERE, HOOKS) if demo else None
         self.demo_delay_s = 0.0
         self.demo_drop_first = False
+        self.demo_refuse_first = False
         if demo:
             if runner is None or wal_roots is None:
                 raise demo_mode.DemoError("demo mode needs its DemoRunner and fixture WAL roots")
             self.demo_delay_s = min(max(int(os.environ.get("MC_DEMO_CHAT_DELAY_MS") or 0), 0), 10_000) / 1000
             self.demo_drop_first = os.environ.get("MC_DEMO_DROP_FIRST") == "1"
+            self.demo_refuse_first = os.environ.get("MC_DEMO_REFUSE_FIRST") == "1"
         mc_chat.ensure_dirs(root)
         (root / "sources").mkdir(mode=0o700, exist_ok=True)
         (root / "log").mkdir(mode=0o700, exist_ok=True)
@@ -313,6 +315,13 @@ class App:
             ok, reason = self.codex.availability()
             if not ok:
                 return 409, {"error": "unavailable", "message": reason}
+        if self.demo_delay_s:
+            # Demo knob: a slow accept before anything is stored, so the page's 'Sending…' state and an edit made
+            # while it is pending can be seen for the whole delay.
+            time.sleep(self.demo_delay_s)
+        if self.demo_refuse_first:
+            self.demo_refuse_first = False  # demo knob: the first send is refused before it is stored, once
+            return 503, {"error": "demo-refused", "message": "demo instance refused this send once"}
         try:
             record, created = mc_chat.new_message(to, body.get("text"), client_key=body.get("client_key"),
                                                   session=body.get("session"), thread=body.get("thread"),
@@ -323,8 +332,6 @@ class App:
         self.hub.publish(ev.make("chat", "dashboard", f"you → {to}", eid=f"chat:{record['id']}",
                                  actor={"runtime": "dashboard"}, subject={"initiative": record.get("thread") or ""}))
         self.refresh_chat(force=True)
-        if self.demo_delay_s:
-            time.sleep(self.demo_delay_s)  # demo knob: a slow accept, for the delayed-response click-test cases
         return (201 if created else 200), {"id": record["id"], "created": created,
                                            "status": mc_chat.state(record["id"], self.root).get("status")}
 

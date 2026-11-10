@@ -317,7 +317,9 @@ export async function mountScene() {
   }
   function eventPulse(event) {
     const { from, to } = endpoints(event);
-    staticFlash(event.kind === 'wal' && nodes.has(event.actor.agent) ? event.actor.agent : to);
+    // The static view has labels but no WebGL nodes, so an owner's label is found through labelNodes too.
+    const agent = event.actor.agent;
+    staticFlash(event.kind === 'wal' && (nodes.has(agent) || labelNodes.has(agent)) ? agent : to);
     if (!available || getState().fallback || !getState().motion || document.hidden || !visible) return;
     const color = KINDS[event.kind]?.color || '#eaff9e';
     const end = nodes.get(to).position.clone();
