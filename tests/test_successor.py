@@ -245,6 +245,71 @@ class Hardening(Case):
         log.write_text("")
         self.assertFalse(sc.verify_log(self.home, SESSION))
 
+    def _tamper_then_succeed(self, tamper):
+        """Codex final gate F2: a succeed after a tail truncation or a deleted log must not append, rewrite the head or
+        launch; the inconsistent state stays as it is for explicit recovery."""
+        self.kit()
+        self.launcher()
+        self.succeed(live=8, cap=8, now=1000.0)
+        self.succeed(live=8, cap=8, now=1000.0 + sc.CAP_REFRESH_S + 5)  # a second (refreshed) wait row
+        base = self.home / ".agent-harness/state/successor" / SESSION
+        log, head = base / "requests.jsonl", base / "requests.jsonl.head"
+        tamper(log, head)
+        before_log = log.read_bytes() if log.exists() else None
+        before_head = head.read_bytes() if head.exists() else None
+        launched = []
+        with self.assertRaises(sc.SuccessorError) as cm:
+            self.succeed(live=0, cap=8, now=5000.0, runner=lambda cmd, **kw: launched.append(cmd) or mock.Mock(pid=3))
+        self.assertEqual(cm.exception.code, "log_inconsistent")
+        self.assertIn("recover", str(cm.exception))
+        self.assertEqual(launched, [])
+        self.assertEqual(log.read_bytes() if log.exists() else None, before_log)  # no new request row
+        self.assertEqual(head.read_bytes() if head.exists() else None, before_head)  # head never replaced
+        self.assertFalse(sc.verify_log(self.home, SESSION))  # still detectable after the refused call
+        with self.assertRaises(sc.SuccessorError):
+            sc._append(self.home, SESSION, {"schema": 1, "at": 6000.0, "agent": AGENT, "status": "cap_wait"})
+        self.assertEqual(head.read_bytes() if head.exists() else None, before_head)
+        prompts = base / "prompts"
+        self.assertEqual(list(prompts.glob("*.md")) if prompts.exists() else [], [])
+
+    def test_truncate_then_succeed_refuses_and_preserves_the_evidence(self):
+        def drop_last(log, head):
+            lines = log.read_text().splitlines()
+            log.write_text("\n".join(lines[:-1]) + "\n")
+        self._tamper_then_succeed(drop_last)
+
+    def test_delete_then_succeed_refuses_and_preserves_the_evidence(self):
+        self._tamper_then_succeed(lambda log, head: log.unlink())
+
+    def test_emptied_log_deleted_head_or_edited_row_then_succeed_refuses(self):
+        root = self.home
+        for name, tamper in (("emptied", lambda log, head: log.write_text("")),
+                             ("headless", lambda log, head: head.unlink()),
+                             ("edited", lambda log, head: log.write_text(log.read_text().replace('"cap":8', '"cap":99', 1)))):
+            with self.subTest(tamper=name):
+                self.home = root / name  # a fresh state tree per case
+                self._tamper_then_succeed(tamper)
+
+    def test_a_row_written_before_a_crash_skipped_the_head_is_kept_not_refused(self):
+        # a crash between the row fsync and the head replace leaves the log one row AHEAD: nothing was lost
+        self.kit()
+        self.succeed(live=8, cap=8, now=1000.0)
+        head = self.home / ".agent-harness/state/successor" / SESSION / "requests.jsonl.head"
+        stale_head = head.read_bytes()
+        self.succeed(live=8, cap=8, now=1000.0 + sc.CAP_REFRESH_S + 5)
+        head.write_bytes(stale_head)
+        self.assertTrue(sc.verify_log(self.home, SESSION))
+        out = self.succeed(live=0, cap=8, now=3000.0)
+        self.assertEqual(out["status"], "ready")
+        self.assertEqual(json.loads(head.read_text())["n"], 3)
+
+    def test_a_consistent_log_keeps_appending(self):
+        self.kit()
+        self.succeed(live=8, cap=8, now=1000.0)
+        out = self.succeed(live=0, cap=8, now=3000.0)
+        self.assertEqual(out["status"], "ready")
+        self.assertTrue(sc.verify_log(self.home, SESSION))
+
     def test_the_prompt_marks_kit_text_as_untrusted(self):
         out = self.succeed(dry_run=True)
         self.assertIn("untrusted data", out["prompt"])
@@ -343,6 +408,75 @@ class AhdStep(Case):
         done = daemon.request_successors(self.rows(n=5), 10_000.0, 1e12)
         self.assertEqual(sorted(c[4] for c in calls), ["a3", "a4"])
         self.assertEqual(len(done), 2)
+
+    def integrated(self, live, launches):
+        """The ahd step wired to the real succeed (Codex final gate F1): the runner runs `ah task succeed` in-process with
+        a controlled live owner count, so the test sees what the daemon actually causes in the request log."""
+        import ahd
+        owners = self.rows(n=5)[SESSION]
+
+        def runner(argv, timeout, stdin=None):
+            agent, session = argv[argv.index("--agent") + 1], argv[argv.index("--session") + 1]
+            out = sc.succeed(self.home, session, agent, owners_doc=owners, live_count=live[0], cap=8, now=10_000.0,
+                             runner=lambda cmd, **kw: launches.append(cmd) or mock.Mock(pid=11))
+            return (3 if out.get("status") == "cap_wait" else 0), json.dumps(out), ""
+        patch = mock.patch.object(ahd, "home", lambda: self.home)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return ahd.Daemon(policy={"successor_main_idle_s": 1800, "ah": ["ah"]}, runner=runner)
+
+    def wait(self, agent, at):
+        sc._append(self.home, SESSION, {"schema": 1, "at": at, "agent": agent, "session": SESSION, "status": "cap_wait",
+                                        "live_owners": 8, "cap": 8})
+
+    def test_a_stale_cap_wait_is_rechecked_and_stays_waiting_while_the_cap_is_full(self):
+        live, launches = [8], []
+        daemon = self.integrated(live, launches)
+        self.main_wal(age=3600)
+        self.wait("a0", 10_000.0 - sc.CAP_REFRESH_S - 30)  # stale
+        self.wait("a1", 10_000.0 - 60)  # young: not rechecked yet
+        done = daemon.request_successors(self.rows(n=2), 10_000.0, 1e12)
+        self.assertEqual([d[1] for d in done], ["a0"])
+        rows = sc.read_requests(self.home, SESSION)
+        a0 = [r for r in rows if r["agent"] == "a0"]
+        self.assertEqual([r["status"] for r in a0], ["cap_wait", "cap_wait"])
+        self.assertEqual(a0[-1]["at"], 10_000.0)  # the wait was refreshed, still one live request
+        self.assertEqual(launches, [])
+        self.assertTrue(sc.verify_log(self.home, SESSION))
+
+    def test_a_stale_wait_becomes_launched_once_capacity_frees_without_main(self):
+        live, launches = [8], []
+        daemon = self.integrated(live, launches)
+        self.main_wal(age=3600)
+        (self.home / ".agent-harness").mkdir(parents=True, exist_ok=True)
+        (self.home / ".agent-harness" / "successor.json").write_text(json.dumps({"launcher": ["claude-x", "{prompt_file}"]}))
+        self.wait("a0", 10_000.0 - sc.CAP_REFRESH_S - 30)
+        live[0] = 3  # a cap slot frees while main is away
+        daemon.request_successors(self.rows(n=1), 10_000.0, 1e12)
+        statuses = [r["status"] for r in sc.read_requests(self.home, SESSION) if r["agent"] == "a0"]
+        self.assertEqual(statuses, ["cap_wait", "ready", "launched"])
+        self.assertEqual(len(launches), 1)
+
+    def test_stale_waits_are_rechecked_oldest_first_within_the_tick_budget(self):
+        calls = []
+        daemon = self.daemon(calls, per_tick=None)
+        self.main_wal(age=3600)
+        ages = {"a0": 700, "a1": 5000, "a2": 900, "a3": 3000, "a4": 1200}  # all older than the 10 minute recheck
+        for agent, age in ages.items():
+            self.wait(agent, 10_000.0 - age)
+        done = daemon.request_successors(self.rows(n=5), 10_000.0, 1e12)
+        self.assertEqual([c[4] for c in calls], ["a1", "a3", "a4"])
+        self.assertEqual(len(done), 3)
+
+    def test_a_tampered_log_is_reported_not_retried_every_tick(self):
+        calls = []
+        daemon = self.daemon(calls)
+        self.main_wal(age=3600)
+        self.wait("a0", 10_000.0 - 5000)
+        (self.home / ".agent-harness/state/successor" / SESSION / "requests.jsonl.head").unlink()
+        done = daemon.request_successors(self.rows(), 10_000.0, 1e12)
+        self.assertEqual(calls, [])
+        self.assertEqual(done, [(SESSION[:8], "*", "log_inconsistent")])
 
     def test_nothing_while_main_is_active(self):
         calls = []

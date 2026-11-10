@@ -786,22 +786,39 @@ class Daemon:
                 docs[s] = doc
         return docs
 
-    def _has_request(self, session: str, agent: str, ts: float) -> bool:
-        """A live successor request (ready, launched, cap_wait, launch backoff) already exists for this stream."""
+    def _request_rows(self, session: str):
+        """The session's successor request rows, or None when the log does not match its head (left for recovery)."""
         try:
             import successor  # noqa: PLC0415
-            return successor.open_request(successor.read_requests(home(), session), agent, ts) is not None
-        except Exception:  # noqa: BLE001 - unreadable log: ask `ah`, which dedupes by itself
-            return False
+        except Exception:  # noqa: BLE001 - no module: ask `ah`, which dedupes by itself
+            return []
+        try:
+            ok, rows, _ = successor._consistent(home(), session)
+        except Exception:  # noqa: BLE001 - unreadable log: ask `ah`, which validates and dedupes by itself
+            return []
+        return rows if ok else None
 
     def request_successors(self, docs: dict, ts: float, deadline: float) -> list:
         """GoodQA #15565 (never-drop 16.2): while main is absent (its WAL idle for successor_main_idle_s), ask `ah task
         succeed` for a successor for each owner `ah owners` marks decision_required and idle that long. The verb is
         idempotent per agent, cap-safe (a full cap records a wait and alerts main, never exceeds) and never launches
-        unless ~/.agent-harness/successor.json names a launcher. At most successor_per_tick calls per tick."""
+        unless ~/.agent-harness/successor.json names a launcher. At most successor_per_tick calls per tick.
+
+        A stream whose only live request is a cap_wait older than successor_recheck_s (default the successor module's
+        CAP_REFRESH_S, 10 minutes) is asked again (Codex final gate F1): succeed refreshes the wait while the cap stays
+        full and turns it into a ready (or launched) request once a slot frees, so a stream is never parked for ever
+        while main is away. Rechecks go first, oldest wait first, so a freed slot goes to the longest waiter; streams
+        with no request yet follow in `ah owners` order. A younger wait, or a ready/launched/backoff request, is skipped
+        and spends no budget. A session whose request log does not match its head is not touched: it is reported once
+        per tick as (session, "*", "log_inconsistent") for main to recover."""
         limit = float(self.policy.get("successor_main_idle_s", 1800))
         budget = int(self.policy.get("successor_per_tick", 3))
-        done = []
+        try:
+            import successor  # noqa: PLC0415
+        except Exception:  # noqa: BLE001 - no module: every eligible stream goes to `ah`, which dedupes by itself
+            successor = None
+        recheck = float(self.policy.get("successor_recheck_s", getattr(successor, "CAP_REFRESH_S", 600)))
+        waits, fresh, done = [], [], []
         for session, doc in docs.items():
             try:
                 idle = ts - os.stat(home() / ".claude" / "wals" / session / "main.jsonl").st_mtime
@@ -809,13 +826,26 @@ class Daemon:
                 continue
             if idle < limit:
                 continue
+            rows = self._request_rows(session)
+            if rows is None:
+                done.append((session[:8], "*", "log_inconsistent"))
+                continue
             for row in doc.get("owners") or []:
-                if len(done) >= budget:
-                    return done
-                if row.get("decision_required") is True and (row.get("idle_s") or 0) >= limit \
-                        and not self._has_request(session, str(row.get("agent_id")), ts):  # a waiting stream must not eat the budget
-                    rc, _ = self.call("task succeed", ["--agent", str(row.get("agent_id")), "--session", session], deadline)
-                    done.append((session[:8], str(row.get("agent_id"))[:12], rc))
+                agent = str(row.get("agent_id"))
+                if not (row.get("decision_required") is True and (row.get("idle_s") or 0) >= limit):
+                    continue
+                try:
+                    existing = successor.open_request(rows, agent, ts) if successor else None
+                except Exception:  # noqa: BLE001
+                    existing = None
+                if existing is None:
+                    fresh.append((session, agent))
+                elif existing.get("status") == "cap_wait" and ts - float(existing.get("at") or 0) >= recheck:
+                    waits.append((float(existing.get("at") or 0), session, agent))
+        calls = [(s, a) for _, s, a in sorted(waits, key=lambda w: w[0])] + fresh
+        for session, agent in calls[:max(0, budget)]:
+            rc, _ = self.call("task succeed", ["--agent", agent, "--session", session], deadline)
+            done.append((session[:8], agent[:12], rc))
         return done
 
     def key_for(self, op: str, key: str, flag, cur, extra: str = "") -> str:

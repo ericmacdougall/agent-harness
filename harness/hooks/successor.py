@@ -16,6 +16,8 @@ A dropped owner leaves its stream ownerless until someone picks it up. This modu
            never spawns two successors for one stream.
 
 Requests are an O_APPEND hash-chained log (`requests.jsonl`), so a truncation or edit is detectable (`verify`).
+Every writer validates the log against its head file under the lock first: a log that lost or changed rows is refused
+(code log_inconsistent, exit 4) and left untouched for explicit recovery; nothing decides from it and nothing launches.
 No disposition is written: a disposition binds to a LIVE holder (liveness.disposition_bound), and a request is not one.
 Main records `reassigned --ref <successor agent id>` once the successor shows activity.
 
@@ -180,9 +182,54 @@ def locked(home: Path, session: str):
         os.close(lock)
 
 
+def _head_path(home: Path, session: str) -> Path:
+    return Path(str(state_dir(home, session) / "requests.jsonl") + ".head")
+
+
+def _consistent(home: Path, session: str):
+    """(ok, rows, why): the log and its head file agree. A fresh session (no log, no head) is consistent and empty."""
+    path = state_dir(home, session) / "requests.jsonl"
+    head_path = _head_path(home, session)
+    rows = read_requests(home, session)
+    if not head_path.exists():
+        if rows or (path.exists() and path.stat().st_size):
+            return False, rows, "the head file is missing while the log holds rows"
+        return True, rows, ""
+    try:
+        head = json.loads(head_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False, rows, "the head file is unreadable"
+    n = head.get("n") if isinstance(head, dict) else None
+    # the log may run AHEAD of the head (a crash between the row's fsync and the head replace): that row extends the
+    # recorded chain and loses nothing, so it is accepted; a log SHORTER than the head, or one whose row n does not carry
+    # the recorded hash, lost or changed history and is refused
+    if not isinstance(n, int) or n < 1 or n > len(rows) or head.get("sha") != rows[n - 1].get("sha"):
+        return False, rows, f"the head records {n if isinstance(n, int) else '?'} rows, the log has {len(rows)}"
+    if not verify_chain(rows):
+        return False, rows, "the hash chain is broken"
+    return True, rows, ""
+
+
+def checked_requests_locked(home: Path, session: str) -> list:
+    """The request rows, validated against the saved head. Call with the writer lock held. An inconsistent log (a dropped
+    tail, a deleted or edited log, a missing head) is refused and left exactly as it is: nothing decides from it and the
+    head is never rewritten over it (Codex final gate F2)."""
+    ok, rows, why = _consistent(home, session)
+    if not ok:
+        base = state_dir(home, session)
+        raise SuccessorError(
+            "log_inconsistent",
+            f"successor request log for session {session[:8]} does not match its head file ({why}); nothing was appended "
+            f"or launched. To recover: inspect it with `python3 ~/.claude/hooks/successor.py verify --session {session}` "
+            f"and `ah task kits --session {session}`, compare "
+            f"with the ops ring and WALs, then move {base}/requests.jsonl and requests.jsonl.head together into an archive "
+            "folder (never delete them) and rerun `ah task succeed`, which starts a fresh log.", 4)
+    return rows
+
+
 def _append_locked(home: Path, session: str, body: dict) -> dict:
     path = _log_path(home, session)
-    rows = read_requests(home, session)
+    rows = checked_requests_locked(home, session)  # never chain onto (or re-head) a log that lost rows
     prev = rows[-1]["sha"] if rows else ""
     row = dict(body, prev=prev, sha=_digest(prev, body))
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -206,15 +253,7 @@ def _append(home: Path, session: str, body: dict) -> dict:
 
 def verify_log(home: Path, session: str) -> bool:
     """Chain intact AND the head file agrees with the last row (catches a truncated tail or a deleted log)."""
-    rows = read_requests(home, session)
-    head_path = Path(str(_log_path(home, session)) + ".head")
-    try:
-        head = json.loads(head_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return not rows
-    if not rows:
-        return False
-    return verify_chain(rows) and head.get("n") == len(rows) and head.get("sha") == rows[-1].get("sha")
+    return _consistent(home, session)[0]
 
 
 def open_request(rows: list, agent: str, now: float | None = None):
@@ -236,7 +275,8 @@ def open_request(rows: list, agent: str, now: float | None = None):
 
 def pending_agents(rows: list, now: float, exclude: str | None = None) -> set:
     """Streams with a ready or launched request still inside its TTL: their successor may not show in `ah owners` yet, so
-    they count against the owner cap. One helper, used by succeed and by the Stop gate, so both judge the cap alike."""
+    they count against the owner cap. succeed uses it here; the Stop gate that is meant to share it lives on the stacked
+    branch feat/stop-gate-no-yield (PR 166), not on this branch."""
     found = set()
     for agent in {r.get("agent") for r in rows}:
         request = open_request(rows, agent, now)
@@ -290,7 +330,7 @@ def succeed(home: Path, session: str, agent: str, *, owners_doc: dict, live_coun
                                             "SILENT-HIGH owner with no live disposition gets a successor", 3)
     kit = read_kit(home, session, agent) or derive_kit(row, session)
     with locked(home, session):  # read, dedupe, cap check and the ready row are ONE step (red-team F1, F2)
-        rows = read_requests(home, session)
+        rows = checked_requests_locked(home, session)  # a log that lost rows decides nothing (Codex final gate F2)
         existing = open_request(rows, agent, now)
         # live_count is a snapshot of `ah owners`, which does not show a launched successor until it writes its log, so
         # requests already ready or launched for OTHER streams count against the cap too
