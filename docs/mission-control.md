@@ -149,6 +149,29 @@ Two parties are trusted, and this is stated rather than defended:
 - Same-user processes can read the install secret, so the inbox signature stops accidental or naive forgery but not a determined local attacker. The authority limit on `dash:` messages is what bounds the damage: the frame says a message is not proof the user typed it, and anything consequential needs the terminal.
 - Inbox reads never block: a FIFO or device planted under a `.json` name is skipped, so no hook can hang on one.
 
+## Demo mode
+
+`serve --demo` runs the page on fixture data for click-tests and screenshots. Nothing real is read or run:
+
+- The collectors get a canned runner, so `ah`, `gh`, ssh and `codex` never start. Real WALs are not read.
+- Fixture initiatives, owners (including held amber owners) and WAL lines live in `MC_HOME/demo/`.
+- A demo source pulses every few seconds. GitHub shows as failing, so the error notice can be checked.
+- Chat lands only in the disposable `MC_HOME`. The targets `demo-main` and `claude-desktop` are fake, and each message gets a canned reply after 4 s. No agent ever sees it.
+
+```
+MC_HOME=<disposable dir> python3 ~/.agent-harness/mission-control/app/server.py serve --demo --port 47699
+MC_HOME=<same dir> python3 ~/.agent-harness/mission-control/app/server.py url --port 47699   # another 60 s code
+```
+
+It refuses to start if `MC_HOME` is unset, or is the real `~/.agent-harness/mission-control` (or inside or above it). It prints a launch link to the terminal only; codes are never logged.
+
+Two knobs exercise the slow-network cases:
+
+- `MC_DEMO_CHAT_DELAY_MS=3000` holds each chat accept for 3 s.
+- `MC_DEMO_DROP_FIRST=1` stores the first message and then drops its response, so the page's same-key retry can be checked.
+
+`--demo-host NAME.ts.net` (only with `--demo`) also accepts that exact Tailscale Funnel host, with the Origin `https://NAME.ts.net`. The server still binds 127.0.0.1. Any other name is refused, and the LaunchAgent never passes `--demo`. Opening a Funnel exposes the page publicly, so only do it for a short, approved window, and close it afterwards.
+
 ## Rollback
 
 - Stop the service: `launchctl bootout gui/$(id -u)/com.agent-harness.mission-control`. To keep it off across installs, run `python3 install.py --apply --no-mission-control`.

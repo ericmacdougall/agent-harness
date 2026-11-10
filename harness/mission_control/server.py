@@ -52,6 +52,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(1, str(HOOKS))
 
 import collectors as col  # noqa: E402
+import demo as demo_mode  # noqa: E402
 import events as ev  # noqa: E402
 import mc_chat  # noqa: E402
 from codex_responder import CodexResponder  # noqa: E402
@@ -101,6 +102,12 @@ class Auth:
         self.failures: list[float] = []
         self.hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
         self.origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+
+    def allow_demo_host(self, host: str) -> None:
+        """Demo mode only: one checked *.ts.net Funnel host, reached over https (the bind stays 127.0.0.1)."""
+        host = demo_mode.check_demo_host(host, True)
+        self.hosts.add(host)
+        self.origins.add(f"https://{host}")
 
     def redeem(self, code: str, now: float | None = None) -> str | None:
         """A fresh session id for a valid, unexpired, unused launch code; else None (rate limited)."""
@@ -184,8 +191,17 @@ def codex_binary() -> str | None:
 
 class App:
     def __init__(self, *, port: int, root: Path, initiatives: str | None, remote: bool, fabric_bin: str | None,
-                 runner: Runner | None = None, wal_roots=None, start_threads: bool = True, codex: bool = True):
+                 runner: Runner | None = None, wal_roots=None, start_threads: bool = True, codex: bool = True,
+                 demo: bool = False):
         self.port, self.root = port, root
+        self.demo = demo
+        self.demo_delay_s = 0.0
+        self.demo_drop_first = False
+        if demo:
+            if runner is None or wal_roots is None:
+                raise demo_mode.DemoError("demo mode needs its DemoRunner and fixture WAL roots")
+            self.demo_delay_s = min(max(int(os.environ.get("MC_DEMO_CHAT_DELAY_MS") or 0), 0), 10_000) / 1000
+            self.demo_drop_first = os.environ.get("MC_DEMO_DROP_FIRST") == "1"
         mc_chat.ensure_dirs(root)
         (root / "sources").mkdir(mode=0o700, exist_ok=True)
         (root / "log").mkdir(mode=0o700, exist_ok=True)
@@ -225,7 +241,10 @@ class App:
         return refs + self.owners.tickets()
 
     def start(self) -> None:
-        for target, name in ((self.loop, "collectors"), (self.codex.loop, "codex"), (self.chat_loop, "chat")):
+        loops = [(self.loop, "collectors"), (self.codex.loop, "codex"), (self.chat_loop, "chat")]
+        if self.demo:
+            loops.append((demo_mode.DemoLoop(self.root, self.stop).run, "demo"))
+        for target, name in loops:
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self.threads.append(thread)
@@ -303,6 +322,8 @@ class App:
         self.hub.publish(ev.make("chat", "dashboard", f"you → {to}", eid=f"chat:{record['id']}",
                                  actor={"runtime": "dashboard"}, subject={"initiative": record.get("thread") or ""}))
         self.refresh_chat(force=True)
+        if self.demo_delay_s:
+            time.sleep(self.demo_delay_s)  # demo knob: a slow accept, for the delayed-response click-test cases
         return (201 if created else 200), {"id": record["id"], "created": created,
                                            "status": mc_chat.state(record["id"], self.root).get("status")}
 
@@ -418,6 +439,10 @@ class Handler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError):
             return self.deny(400, "bad-json")
         status, value = self.app.post_chat(body)
+        if self.app.demo and self.app.demo_drop_first and status == 201:
+            self.app.demo_drop_first = False  # demo knob: the message is stored but its response is lost, once
+            self.close_connection = True
+            return None
         return self.send_json(status, value)
 
     def do_PUT(self):
@@ -550,8 +575,11 @@ def make_logger(root: Path) -> logging.Logger:
 
 # ---------------------------------------------------------------- CLI
 
-def launch_url(port: int) -> str:
-    return f"http://127.0.0.1:{port}/launch?c={mint_code(mc_chat.secret())}"
+def launch_url(port: int, demo_host: str | None = None) -> str:
+    code = mint_code(mc_chat.secret())
+    if demo_host:
+        return f"https://{demo_host}/launch?c={code}"
+    return f"http://127.0.0.1:{port}/launch?c={code}"
 
 
 def plist_text(port: int, python: str) -> str:
@@ -633,13 +661,38 @@ def cmd_status(args) -> int:
     return 0 if health.get("ok") else 1
 
 
+def build_app(args) -> App:
+    """The App for `serve`. In demo mode the real Runner is never constructed: the DemoRunner is passed in, and
+    remote probes, Codex, Fabric and real WALs are all off."""
+    if args.demo:
+        root = demo_mode.check_demo_home(os.environ.get("MC_HOME"))
+        mc_chat.ensure_dirs(root)
+        fixture = demo_mode.seed(root)
+        app = App(port=args.port, root=root, initiatives=fixture["initiatives"], remote=False, fabric_bin=None,
+                  runner=demo_mode.DemoRunner(), wal_roots=fixture["wal_roots"], start_threads=False, codex=False,
+                  demo=True)
+        if args.demo_host:
+            app.auth.allow_demo_host(args.demo_host)
+        return app
+    root = mc_chat.home()
+    return App(port=args.port, root=root, initiatives=args.initiatives or default_initiatives(),
+               remote=not args.no_remote, fabric_bin=args.fabric_bin, start_threads=False, codex=not args.no_codex)
+
+
 def cmd_serve(args) -> int:
+    try:
+        args.demo_host = demo_mode.check_demo_host(args.demo_host, args.demo)
+        if args.demo:
+            demo_mode.check_demo_home(os.environ.get("MC_HOME"))
+    except demo_mode.DemoError as exc:
+        print(f"mission-control: {exc}", file=sys.stderr)
+        return 2
     root = mc_chat.home()
     log = make_logger(root)
-    initiatives = args.initiatives or default_initiatives()
+    initiatives = None
     try:
-        app = App(port=args.port, root=root, initiatives=initiatives, remote=not args.no_remote,
-                  fabric_bin=args.fabric_bin, start_threads=False, codex=not args.no_codex)
+        app = build_app(args)
+        initiatives = app.initiatives.path
         server = Server(app, Path(args.web or (HERE / "web")), log)
     except OSError as exc:
         log.error("cannot bind 127.0.0.1:%s: %s", args.port, exc)
@@ -648,6 +701,12 @@ def cmd_serve(args) -> int:
     app.start()
     log.info("serving on 127.0.0.1:%s initiatives=%s", args.port, initiatives or "-")
     print(f"mission-control: serving on http://127.0.0.1:{args.port} (open with `server.py open`)", flush=True)
+    if args.demo:
+        # A fresh launch code goes to this local terminal only: it is never logged or served.
+        print("DEMO MODE: fixture data only; chat reaches no agent.", flush=True)
+        print(f"launch (60 s, single use): {launch_url(args.port, args.demo_host)}", flush=True)
+        print(f"more codes: MC_HOME=<this home> server.py url --port {args.port}"
+              + (f" --demo-host {args.demo_host}" if args.demo_host else ""), flush=True)
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
@@ -668,9 +727,14 @@ def main(argv=None) -> int:
     p.add_argument("--no-codex", action="store_true", help="never run codex exec (disposable or test instances)")
     p.add_argument("--fabric-bin")
     p.add_argument("--web")
+    p.add_argument("--demo", action="store_true",
+                   help="fixture data only, no commands run, chat reaches no agent (needs a disposable MC_HOME)")
+    p.add_argument("--demo-host", help="with --demo only: also accept this *.ts.net Funnel host over https")
     for name in ("url", "open", "status"):
         q = sub.add_parser(name)
         q.add_argument("--port", type=int, default=DEFAULT_PORT)
+        if name == "url":
+            q.add_argument("--demo-host", help="print the https Funnel form of the link for a demo instance")
     for name in ("install-launchd", "uninstall-launchd"):
         q = sub.add_parser(name)
         q.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -681,7 +745,12 @@ def main(argv=None) -> int:
     if args.cmd == "serve":
         return cmd_serve(args)
     if args.cmd == "url":
-        print(launch_url(args.port))
+        try:
+            host = demo_mode.check_demo_host(args.demo_host, True) if args.demo_host else None
+        except demo_mode.DemoError as exc:
+            print(f"mission-control: {exc}", file=sys.stderr)
+            return 2
+        print(launch_url(args.port, host))
         return 0
     if args.cmd == "open":
         subprocess.run(["open", launch_url(args.port)], check=False)
