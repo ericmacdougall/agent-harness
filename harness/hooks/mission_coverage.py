@@ -14,18 +14,23 @@ Goals live in ONE canonical file, ~/.agent-harness/mission/goals.json (dir 0700,
 Every write goes through this tool and appends a hash-chained row to ~/.agent-harness/state/mission-goals-audit.jsonl
 (rotated into chained segments past MAX_AUDIT_BYTES); a goals file that no longer matches the chain head is tampered.
 
-Main-only commands (set --ticket/--repo, defer --user-source, import-initiatives, reseal, activate, set-session, bind,
-retire) need a one-shot stamp that main's own PreToolUse hook (mission_gate.py pretool, caller_identity.is_main) writes
-for that exact command; a sub-agent's shell, a copied script or a cron job finds none. Each of them raises a high
-`mission:goals:changed` ops alert.
+Main-only commands (set --ticket/--repo, defer --user-source/--ticket, import-initiatives, reseal, activate,
+set-session, bind, retire) need a one-shot stamp that main's own PreToolUse hook (mission_gate.py pretool,
+caller_identity.is_main) writes for that exact argument list (argv_key) when the script runs at shell command
+position; the command consumes it first, before parsing (claim_main). A sub-agent's shell, a copied script, a cron job,
+an echoed or here-document line, and a leftover stamp from a different command find none. Once goals.json names a
+mission session, only that session's main passes (require_main; set_session has the hand-over rule). Each of them
+raises a high `mission:goals:changed` ops alert, as does every ask or ticket wait. Stamps are not signed: a same-user
+process can write one (the documented threat model, see caller_identity.py and docs/operations.md).
 
 A goal is covered by
   (a) a LIVE OWNER: an `ah owners` row of an owner type (never a helper) in a running state whose stream ticket (the
       first GoodQA ticket in its WAL) is the goal's ticket, or whose exact full agent id main bound to the goal;
   (b) a LIVE DISPOSITION: an `ah task dispose` waiting/resumed/reassigned disposition that ah reports live, on such an
-      owner; a wait on an open ask that names the goal, or on another open ticket, with `until` at most WAIT_MAX_S
-      ahead and at most MAX_RENEWALS waits in a row; or a deferral whose `user:`/`answer:` source resolves through
-      provenance.py to the user's own words naming the goal and saying defer, without a condition or refusal;
+      owner; a wait on an open ask that names the goal, or (main) on another ticket that is still open when checked,
+      with `until` at most WAIT_MAX_S ahead and at most MAX_RENEWALS waits in a row; or a deferral whose `user:`/
+      `answer:` one-segment source resolves through provenance.py to the user's own words saying defer right next to
+      the goal, with no condition, refusal or negation anywhere in the user's sentence;
   (c) DONE EVIDENCE: status 'done' with a deploy record and a later live REALLY_TESTED entry from the mission session
       that name the goal's ticket (ah's own evidence resolvers, the DONE_LIVE rule).
 'imported' goals are not enforced until main activates them; 'retired' needs the user's words naming the goal.
@@ -91,10 +96,27 @@ SCRIPT = "python3 ~/.claude/hooks/mission_coverage.py"
 GENESIS = "0" * 64
 MAIN_ONLY = ("set", "defer", "import-initiatives", "reseal", "activate", "set-session", "bind", "retire")
 STAMP_PURPOSE = "mission-main"
-DEFER_WORDS = re.compile(r"\b(?:defer\w*|later|park\w*|paus\w*|hold\w*|not now|drop\w*|cancel\w*|wait\w*)\b")
-RETIRE_WORDS = re.compile(r"\b(?:drop\w*|cancel\w*|retir\w*|kill\w*|abandon\w*|scrap\w*|stop\w*)\b")
 REFUSAL_WORDS = re.compile(r"\b(?:don't|dont|do not|never|not|no|if|unless|maybe|perhaps|whether|should|could|would|"
                            r"won't|can't|cannot)\b|\?")
+# defer and retire also refuse words that undo or redirect the verb ("stop parking leads", "park X instead of leads")
+NEGATING_WORDS = re.compile(r"\b(?:stop\w*|quit\w*|resum\w*|restart\w*|unpark\w*|unpaus\w*|undo\w*|except|instead)\b")
+# The verb sits right next to the goal (<g> stands for its id or #ticket, with "the", "goal", "work" and the like
+# folded in); "wait", "later", "hold" and "stop" alone are not a decision (H1, delta red-team of PR 179).
+_G = "<g>"
+DEFER_PHRASES = re.compile(
+    r"(?:^| )(?:(?:defer|defers|deferred|deferring|park|parks|parked|parking|pause|pauses|paused|pausing|postpone|"
+    r"postpones|postponed|postponing|shelve|shelves|shelved|shelving) <g>|hold off on <g>|put <g> on hold|"
+    r"<g> (?:can wait|on hold)|<g> (?:is|are) (?:deferred|parked|paused|postponed|shelved|on hold))(?: |$)")
+RETIRE_PHRASES = re.compile(
+    r"(?:^| )(?:(?:drop|drops|dropped|dropping|cancel|cancels|cancelled|canceled|cancelling|canceling|retire|retires|"
+    r"retired|retiring|kill|kills|killed|killing|abandon|abandons|abandoned|abandoning|scrap|scraps|scrapped|"
+    r"scrapping) <g>|<g> (?:is|are|was|has been) (?:dropped|cancelled|canceled|retired|killed|abandoned|scrapped|"
+    r"dead))(?: |$)")
+HANDOVER_WORDS = re.compile(r"\b(?:take|takes|taking|took) over\b|\btakeover\b|\bhand(?:s|ed|ing)? (?:it )?over\b|"
+                            r"\bhandover\b|\btransfer\w*|\bown\b|\bowns\b|\bruns?\b|\bresume\b|\bcontinue\b|"
+                            r"\bswitch\w*|\bmove\b")
+LEAD_FILLER = {"the", "this", "that", "our", "my", "goodqa"}
+TRAIL_FILLER = {"goal", "goals", "work", "stream", "ticket", "initiative", "project", "effort"}
 
 
 class MissionError(ValueError):
@@ -200,22 +222,52 @@ def names_goal(text, goal: dict) -> bool:
     return bool(key) and re.search(r"#\s*%s(?![0-9])" % key.split("#")[1], low) is not None
 
 
-def _words_ok(text, goal: dict, verbs) -> bool:
+def goal_tokens(text, goal: dict) -> str:
+    """The text as space-separated words with each mention of the goal (its id, also spelt with spaces or hyphens,
+    or '#<ticket number>') replaced by <g>, and filler next to it ("the leads goal", "goodqa#15095") folded in."""
     low = _norm_words(text)
-    if not names_goal(low, goal) or not verbs.search(low):
+    words = [re.sub(r"\s+", "", w) for w in re.findall(r"#\s*[0-9]+|[a-z0-9]+(?:'[a-z]+)?", low)]
+    gid = re.sub(r"[^a-z0-9]", "", str(goal.get("id") or "").lower())
+    key = ticket_key(goal.get("ticket")) or ""
+    number = "#" + key.split("#")[1] if key else None
+    lead = LEAD_FILLER | ({key.split("#")[0]} if key else set())
+    out, i = [], 0
+    while i < len(words):
+        for n in (3, 2, 1):
+            span = words[i:i + n]
+            if len(span) == n and ((gid and "".join(span) == gid) or (n == 1 and number and span[0] == number)):
+                while out and out[-1] in lead:
+                    out.pop()
+                if not out or out[-1] != _G:
+                    out.append(_G)
+                i += n
+                while i < len(words) and words[i] in TRAIL_FILLER:
+                    i += 1
+                break
+        else:
+            out.append(words[i])
+            i += 1
+    return " ".join(out)
+
+
+def _words_ok(text, goal: dict, phrases) -> bool:
+    low = _norm_words(text)
+    if not low or REFUSAL_WORDS.search(low.replace("not now", "")) or NEGATING_WORDS.search(low):
         return False
-    return REFUSAL_WORDS.search(low.replace("not now", "")) is None
+    return phrases.search(goal_tokens(low, goal)) is not None
 
 
 def deferral_words_ok(text, goal: dict) -> bool:
-    """The user's quoted words name the goal and say defer/park/hold/wait/later..., with no refusal or condition
-    ("don't", "if", "maybe", a question)."""
-    return _words_ok(text, goal, DEFER_WORDS)
+    """The user's words say defer/park/pause/postpone/shelve right next to the goal ("park leads", "put #15095 on
+    hold", "leads can wait"), with no refusal, condition or negation anywhere in them ("don't", "if", "maybe", a
+    question, "stop parking", "instead"). Callers pass the whole sentence around the quote (user_context)."""
+    return _words_ok(text, goal, DEFER_PHRASES)
 
 
 def retire_words_ok(text, goal: dict) -> bool:
-    """The user's quoted words name the goal and say drop/cancel/retire/stop..., with no refusal or condition."""
-    return _words_ok(text, goal, RETIRE_WORDS)
+    """The user's words say drop/cancel/retire/abandon/scrap (or kill) right next to the goal, with no refusal,
+    condition or negation anywhere in them."""
+    return _words_ok(text, goal, RETIRE_PHRASES)
 
 
 def source_excerpt(source) -> str:
@@ -224,6 +276,66 @@ def source_excerpt(source) -> str:
         return str(provenance.parse_source(source).get("excerpt") or "")
     except Exception:  # noqa: BLE001 - an unparseable source has no words
         return ""
+
+
+def _one_segment(excerpt: str) -> bool:
+    return "..." not in excerpt.replace("…", "...")
+
+
+def excerpt_words_ok(source, goal: dict, kind: str) -> bool:
+    """Pure check of a stored source (no transcript read): one quoted segment whose words pass the check for kind
+    ('defer' or 'retire'). assess() adds the whole-sentence check (context_words_ok)."""
+    words = source_excerpt(source)
+    if not words or not _one_segment(words):
+        return False
+    return (deferral_words_ok if kind == "defer" else retire_words_ok)(words, goal)
+
+
+def sentences_around(text: str, excerpt: str) -> str:
+    """Every sentence of text that holds an occurrence of excerpt (both whitespace-normalised), joined; '' when the
+    excerpt is not in text. A sentence ends at . ! ? or ; followed by a space, or at a removed non-user block."""
+    if not excerpt:
+        return ""
+    found, start = [], 0
+    while True:
+        at = text.find(excerpt, start)
+        if at < 0:
+            break
+        heads = [m.end() for m in re.finditer(r"[.!?;](?= )|￼", text[:at])]
+        tail = re.search(r"[.!?;](?= |$)|￼", text[at + len(excerpt):])
+        end = at + len(excerpt) + (tail.end() if tail else len(text))
+        found.append(text[heads[-1] if heads else 0:end].strip())
+        start = at + 1
+    return " | ".join(dict.fromkeys(found))
+
+
+def user_context(source) -> str:
+    """The sentence(s) of the user's own turn that hold the quoted words: '' unless the source is a user: or answer:
+    source that provenance.py resolves to a human-authored turn and its excerpt is one segment (no '...')."""
+    try:
+        import provenance  # noqa: PLC0415
+        parsed = provenance.parse_source(source)
+        if parsed.get("kind") != "user" or parsed.get("variant", "user") not in ("user", "answer"):
+            return ""
+        excerpt = provenance.norm(parsed.get("excerpt") or "")
+        if not excerpt or not _one_segment(excerpt):
+            return ""
+        result = provenance.resolve(source, {"home": claude_dir(), "want_text": True})
+        if not (result.get("ok") and result.get("origin") == "user" and not result.get("weak")):
+            return ""
+        text = next((n.get("text") for n in result.get("chain") or [] if n.get("kind") == "user"), None)
+        return sentences_around(provenance.norm(text), excerpt) if isinstance(text, str) else ""
+    except Exception:  # noqa: BLE001 - an unresolvable source has no words
+        return ""
+
+
+def context_words_ok(source, goal: dict, kind: str) -> bool:
+    """The whole sentence around the user's quote passes the check for kind, not only the quoted fragment (a
+    faithful partial quote of "please do not defer leads until friday" is refused)."""
+    if not excerpt_words_ok(source, goal, kind):
+        return False
+    context = user_context(source)
+    return bool(context) and (deferral_words_ok if kind == "defer" else retire_words_ok)(context, goal)
 
 
 # ------------------------------------------------------------------ goals file: read and validate
@@ -547,15 +659,51 @@ def _find(goals: list, goal_id: str) -> dict:
 
 # ------------------------------------------------------------------ main-only proof and change alerts
 
-def require_main(home: Path, cmd: str, goal: str = "*") -> dict:
-    """The stamp main's PreToolUse hook wrote for exactly this command (single use, 10 minutes); MissionError naming
-    main otherwise."""
+_PROOF: dict = {}  # the stamp claim_main took for this process's own argv: {"cmd", "stamp"}; used at most once
+
+
+def argv_key(argv) -> str:
+    """Digest of the exact argument list after the script (subcommand first; `--flag=value` read as `--flag value`).
+    main's PreToolUse hook and the command it runs compute it from the same words (M2, delta red-team of PR 179)."""
+    words = []
+    for a in argv:
+        a = str(a)
+        words.extend(a.split("=", 1) if a.startswith("--") and "=" in a else [a])
+    return hashlib.sha256(json.dumps(words, separators=(",", ":")).encode("utf-8", "replace")).hexdigest()
+
+
+def claim_main(argv, home: Path) -> None:
+    """Take (consume) the one-shot stamp main's hook wrote for exactly this argument list, before anything parses or
+    validates it: a command that then fails, prints --help or exits on an argparse error leaves no stamp behind."""
+    _PROOF.clear()
+    argv = [str(a) for a in argv or []]
+    if not argv or argv[0] not in MAIN_ONLY:
+        return
     import caller_identity  # noqa: PLC0415
-    stamp = caller_identity.take_stamp(STAMP_PURPOSE, [cmd, goal or "*"], home=home)
+    stamp = caller_identity.take_stamp(STAMP_PURPOSE, [argv[0], argv_key(argv)], home=home)
+    if stamp is not None:
+        _PROOF.update(cmd=argv[0], stamp=stamp)
+
+
+def require_main(home: Path, cmd: str, handover: bool = False) -> dict:
+    """The stamp claim_main took for this command (single use, at most 10 minutes old) from the main session that
+    owns the mission; MissionError otherwise. Once goals.json names a mission session, another top-level session
+    (another main, or a sub-agent's own `claude -p`) is refused even with a stamp of its own (M1). handover=True
+    (set-session only) returns a foreign stamp so set_session can apply its hand-over rule."""
+    stamp = _PROOF.get("stamp") if _PROOF.get("cmd") == cmd else None
+    _PROOF.clear()
     if stamp is None:
-        raise MissionError(f"`{cmd}` is main-only: only the main agent may run it, and main's PreToolUse hook found no "
-                           f"main command `{SCRIPT} {cmd}{'' if goal in (None, '*') else ' --goal ' + clean(goal)}` in the "
-                           "last 10 minutes. A sub-agent asks main to run it.")
+        raise MissionError(f"`{cmd}` is main-only: only the main agent may run it, and main's PreToolUse hook saw no "
+                           f"main command `{SCRIPT} {cmd} ...` with exactly these arguments in the last 10 minutes (run "
+                           "it as a plain command, not inside echo, a here-document, bash -c or a script). A sub-agent "
+                           "asks main to run it.")
+    mission = mission_session_of(home)
+    caller = str(stamp.get("session") or "").lower()
+    if mission and caller != mission and not handover:
+        raise MissionError(f"`{cmd}` is refused: the mission belongs to main session {mission}, and this is another "
+                           f"top-level session ({clean(caller, 40) or 'unknown'}). Ask that main to run it; to move the "
+                           f"mission here, that main runs `{SCRIPT} set-session --session <this session>`, or this "
+                           f"main cites the user's words in this session: `{SCRIPT} set-session --user-source \"user:...\"`")
     return stamp
 
 
@@ -605,6 +753,7 @@ def set_goal(home: Path, goal_id: str, *, title=None, ticket=None, priority=None
              clear_deferral: bool = False) -> dict:
     """Title, priority, clearing a deferral and setting a goal active again are open (they never hide work);
     a ticket or repos change is main-only and alerts."""
+    stamp = require_main(home, "set") if (ticket is not None or repos is not None) else None
     if status == "done":
         raise MissionError(f"a goal is marked done only with evidence: `{SCRIPT} done --goal {goal_id} --deploy <deploy "
                            f"WAL id> --live-test <REALLY_TESTED id>`")
@@ -614,8 +763,7 @@ def set_goal(home: Path, goal_id: str, *, title=None, ticket=None, priority=None
         raise MissionError("status: set only accepts active")
     if ticket is not None and ticket and not ticket_key(ticket):
         raise MissionError("ticket must look like goodqa#123 or Project#123")
-    stamp = require_main(home, "set", goal_id) if (ticket is not None or repos is not None) else None
-    detail = {k: v for k, v in (("title", clean(title, 120) if title is not None else None),
+    detail ={k: v for k, v in (("title", clean(title, 120) if title is not None else None),
                                 ("ticket", (ticket_key(ticket) or "") if ticket is not None else None),
                                 ("priority", priority), ("status", status), ("repos", repos),
                                 ("clear_deferral", clear_deferral or None)) if v is not None}
@@ -714,11 +862,15 @@ def mission_session_of(home: Path) -> str:
 
 def defer_goal(home: Path, goal_id: str, *, ask=None, ticket=None, user_source=None, until=None, session=None,
                now=None) -> dict:
+    """A wait on an open ask that names the goal (open to every caller: the ask is main's own WAL entry), a wait on
+    another open ticket (main-only: it parks a goal with no owner for up to 7 days on a relation nothing else
+    records, and a ticket that merely mentions the goal is something any agent can create), or the user's own
+    deferral (main-only). Every one raises `mission:goals:changed`."""
+    stamp = require_main(home, "defer") if (user_source or ticket) else None
     now = time.time() if now is None else now
     given = [x for x in (ask, ticket, user_source) if x]
     if len(given) != 1:
         raise MissionError("name exactly one of --ask ASKID, --ticket TICKET or --user-source SOURCE")
-    stamp = require_main(home, "defer", goal_id) if user_source else None
     until_ts = parse_ts(until) if until else 0.0
     if until and not until_ts:
         raise MissionError("--until must be an ISO time such as 2026-11-12T09:00Z")
@@ -762,9 +914,10 @@ def defer_goal(home: Path, goal_id: str, *, ask=None, ticket=None, user_source=N
             raise MissionError("--user-source must be a user: or answer: source that resolves to the user's own words "
                                "(`ah user-msg --recent N` prints it); agent decisions, inferred:, pasted: and tickets "
                                "cannot defer a mission goal")
-        if not deferral_words_ok(source_excerpt(user_source), current):
-            raise MissionError(f"the quoted words must name goal {goal_id} (or its ticket number) and say defer, park, "
-                               "hold, pause, wait or later, with no condition or refusal")
+        if not context_words_ok(user_source, current, "defer"):
+            raise MissionError(f"the quote must be one segment (no '...') and the user's whole sentence must say defer, "
+                               f"park, pause, postpone or shelve right next to goal {goal_id} (or #its ticket), or "
+                               "'<goal> can wait' / 'put <goal> on hold', with no condition, refusal or negation")
         deferral = {"by": "user", "source": user_source, "until": iso(until_ts) if until else None}
 
     def change(doc):
@@ -787,6 +940,11 @@ def defer_goal(home: Path, goal_id: str, *, ask=None, ticket=None, user_source=N
     doc = _mutate(home, "defer", goal_id, change, detail, stamp=stamp)
     if user_source:
         changed_alert(home, f"mission goal {goal_id} deferred by main on the user's words", {"goal": goal_id})
+    else:
+        changed_alert(home, f"mission goal {goal_id} now waits on {deferral['by']} {deferral['ref']} until "
+                            f"{deferral['until']} (wait {deferral.get('renewal')} of {MAX_RENEWALS})"
+                            + (" by main" if stamp else ""), {"goal": goal_id, "by": deferral["by"],
+                                                              "ref": deferral["ref"], "until": deferral["until"]})
     return doc
 
 
@@ -822,7 +980,7 @@ def done_goal(home: Path, goal_id: str, *, deploy: str, live_test: str, session=
 
 def activate_goal(home: Path, goal_id: str) -> dict:
     """Main-only: an imported goal becomes active (enforced)."""
-    stamp = require_main(home, "activate", goal_id)
+    stamp = require_main(home, "activate")
 
     def change(doc):
         g = _find(doc["goals"], goal_id)
@@ -837,16 +995,17 @@ def activate_goal(home: Path, goal_id: str) -> dict:
 
 def retire_goal(home: Path, goal_id: str, user_source: str) -> dict:
     """Main-only: the user cancelled the goal, in words that name it."""
-    stamp = require_main(home, "retire", goal_id)
+    stamp = require_main(home, "retire")
     loaded = load_goals(home)
     current = next((g for g in loaded.get("goals") or [] if g["id"] == goal_id), None)
     if current is None:
         raise MissionError(f"no goal {clean(goal_id)!r}")
     if not verify_user_source(user_source):
         raise MissionError("--user-source must be a user: or answer: source that resolves to the user's own words")
-    if not retire_words_ok(source_excerpt(user_source), current):
-        raise MissionError(f"the quoted words must name goal {goal_id} (or its ticket number) and say drop, cancel, "
-                           "retire or stop, with no condition or refusal")
+    if not context_words_ok(user_source, current, "retire"):
+        raise MissionError(f"the quote must be one segment (no '...') and the user's whole sentence must say drop, "
+                           f"cancel, retire, abandon or scrap right next to goal {goal_id} (or #its ticket), with no "
+                           "condition, refusal or negation")
 
     def change(doc):
         g = _find(doc["goals"], goal_id)
@@ -861,7 +1020,7 @@ def retire_goal(home: Path, goal_id: str, user_source: str) -> dict:
 def bind_agent(home: Path, goal_id: str, agent: str, source: str, remove: bool = False) -> dict:
     """Main-only: bind (or unbind) an owner's exact full agent id to a goal. It covers only while `ah owners` reports
     that exact id as a live owner-type row."""
-    stamp = require_main(home, "bind", goal_id)
+    stamp = require_main(home, "bind")
     if not isinstance(agent, str) or not AGENT_RE.match(agent):
         raise MissionError("--agent takes the owner's full agent id as `ah owners` prints it (16+ characters), never a "
                            "prefix")
@@ -884,18 +1043,62 @@ def bind_agent(home: Path, goal_id: str, agent: str, source: str, remove: bool =
     return doc
 
 
-def set_session(home: Path, session: str) -> dict:
-    """Main-only: the session whose main the Stop gate holds to the mission."""
-    stamp = require_main(home, "set-session")
-    session = session or str(stamp.get("session") or "")
-    if not SESSION_RE.match(session or ""):
+def handover_words_ok(text) -> bool:
+    """The user's sentence moves the mission: it says 'mission' and take over / hand over / own / run / resume /
+    continue / transfer / switch / move, with no refusal or condition."""
+    low = _norm_words(text)
+    return (bool(re.search(r"\bmission\b", low)) and HANDOVER_WORDS.search(low) is not None
+            and REFUSAL_WORDS.search(low) is None)
+
+
+def set_session(home: Path, session: str, user_source=None) -> dict:
+    """Main-only: the session whose main the Stop gate holds to the mission. The rule (M1, delta red-team of PR 179):
+      - no mission session yet: any main sets it (the first set-session or import claims it);
+      - the mission main may move it, to itself or to another session id (a planned hand-over);
+      - any other top-level session may take it only for itself, and only with --user-source: a user: or answer:
+        source from ITS OWN transcript whose whole sentence says to move the mission ("take over the mission in
+        this session"). That is the recovery when the old main died; a sub-agent's own `claude -p` has no such
+        words from the user and stays out. Every change raises `mission:goals:changed`."""
+    stamp = require_main(home, "set-session", handover=True)
+    caller = str(stamp.get("session") or "").lower()
+    target = (session or caller).lower()
+    if not SESSION_RE.match(target or ""):
         raise MissionError("--session must be a session id")
+    mission = mission_session_of(home)
+    how = "claimed" if not mission else "moved by the mission main"
+    if mission and caller != mission:
+        if target != caller:
+            raise MissionError(f"the mission belongs to main session {mission}; another session may only take it for "
+                               "itself, never move it elsewhere")
+        if not user_source:
+            raise MissionError(f"the mission belongs to main session {mission}; only that main moves it "
+                               f"(`{SCRIPT} set-session --session <id>`). To take it over here, cite the user's words "
+                               f"in this session: `{SCRIPT} set-session --user-source \"user:<this session>/<uuid> "
+                               "\\\"take over the mission ...\\\"\"`")
+        try:
+            import provenance  # noqa: PLC0415
+            cited = str(provenance.parse_source(user_source).get("session") or "").lower()
+        except Exception:  # noqa: BLE001
+            cited = ""
+        if cited != caller:
+            raise MissionError("--user-source must be the user's words in this session's own transcript (a hand-over "
+                               "is asked for in the session that takes the mission)")
+        if not handover_words_ok(user_context(user_source)):
+            raise MissionError("the user's whole sentence must say to move the mission here (for example 'take over "
+                               "the mission'), as a one-segment quote, with no condition or refusal")
+        how = "taken over on the user's words"
 
     def change(doc):
-        doc["mission_session"] = session.lower()
+        if (doc.get("mission_session") or "") != mission:
+            raise MissionError("the mission session changed while this ran; check it with `report` and run it again")
+        doc["mission_session"] = target
         return doc
-    doc = _mutate(home, "set-session", "*", change, {"session": session.lower()}, stamp=stamp)
-    changed_alert(home, f"mission session set to {session.lower()} by main", {"session": session.lower()})
+    detail = {"session": target, "from": mission, "how": how}
+    if user_source:
+        detail["words"] = clean(source_excerpt(user_source), 200)
+    doc = _mutate(home, "set-session", "*", change, detail, stamp=stamp)
+    changed_alert(home, f"mission session set to {target} ({how}; was {mission or 'none'})",
+                  {"session": target, "from": mission})
     return doc
 
 
@@ -1041,10 +1244,10 @@ CACHE_POS_S = 86400
 CACHE_NEG_S = 60
 
 
-def _cached(home: Path, kind: str, key: str, check, now=None) -> bool:
-    """Signed verification cache: a pass is remembered for a day, a failure for 60 s (so an unresolvable source does
-    not rescan a 400 MB transcript on every Stop); both keyed by everything they checked. An unsigned or forged
-    cache is ignored."""
+def _cached(home: Path, kind: str, key: str, check, now=None, pos_s: int = CACHE_POS_S):
+    """Signed verification cache: a pass is remembered for pos_s (a day by default), a failure for 60 s (so an
+    unresolvable source does not rescan a 400 MB transcript on every Stop); both keyed by everything they checked. An
+    unsigned or forged cache is ignored. check=None only looks: the fresh cached answer, or None."""
     now = time.time() if now is None else now
     path = private_dir(home) / "verify-cache.json"
     digest = sha(f"{kind}|{key}".encode())
@@ -1053,8 +1256,10 @@ def _cached(home: Path, kind: str, key: str, check, now=None) -> bool:
     hit = entries.get(digest)
     if isinstance(hit, list) and len(hit) == 2 and isinstance(hit[0], (int, float)) and isinstance(hit[1], bool):
         age = now - hit[0]
-        if 0 <= age < (CACHE_POS_S if hit[1] else CACHE_NEG_S):
+        if 0 <= age < (min(pos_s, CACHE_POS_S) if hit[1] else CACHE_NEG_S):
             return hit[1]
+    if check is None:
+        return None
     ok = bool(check())
     keep = {k: v for k, v in entries.items() if isinstance(v, list) and len(v) == 2
             and isinstance(v[0], (int, float)) and 0 <= now - v[0] < CACHE_POS_S}
@@ -1310,8 +1515,12 @@ def main_session(home: Path) -> str:
 
 # ------------------------------------------------------------------ the rule (pure)
 
-def deferral_status(goal: dict, now: float, asks: dict, verify_source):
-    """(state, reason): state WAITING or DEFERRED when the deferral is live, else None with why not."""
+def deferral_status(goal: dict, now: float, asks: dict, verify_source, tickets=None, words_ok=None):
+    """(state, reason): state WAITING or DEFERRED when the deferral is live, else None with why not.
+    tickets: {ticket key: 'open'|'closed'|'missing'|None} from waited_ticket_states (None = GoodQA did not answer in
+    time); a waited-on ticket that is closed or missing no longer covers. words_ok(source, goal, kind): the user's
+    words check (excerpt_words_ok when not given; assess passes the whole-sentence check)."""
+    words_ok = words_ok or excerpt_words_ok
     d = goal.get("deferral")
     if not isinstance(d, dict):
         return None, "no deferral"
@@ -1335,13 +1544,21 @@ def deferral_status(goal: dict, now: float, asks: dict, verify_source):
             return "WAITING", f"waits on open ask {shown} until {iso(until)}"
         if not ticket_key(ref) or same_ticket(ref, goal.get("ticket")):
             return None, "a ticket wait must name another ticket"
+        if tickets is not None:
+            state = tickets.get(ticket_key(ref))
+            if state in ("closed", "missing"):
+                return None, f"it waits on {ticket_key(ref)}, which is {state} in GoodQA"
+            if state != "open":
+                return "WAITING", (f"waits on {ticket_key(ref)} until {iso(until)} (GoodQA did not answer in time; "
+                                   "open state not confirmed this turn)")
         return "WAITING", f"waits on {ticket_key(ref)} until {iso(until)}"
     if by == "user":
         if d.get("until") and (not until or until <= now):
             return None, "the user's deferral ended"
         words = source_excerpt(d.get("source"))
-        if not deferral_words_ok(words, goal):
-            return None, "its deferral words do not name this goal and say defer without a condition"
+        if not words_ok(d.get("source"), goal, "defer"):
+            return None, ("its deferral words do not say defer right next to this goal in one quoted segment, without "
+                          "a condition or refusal in the user's sentence")
         if not verify_source(d.get("source")):
             return None, "its deferral source does not resolve to the user's own words (user: or answer:)"
         return "DEFERRED", f'deferred by the user: "{clean(words)}"' + (f" until {iso(until)}" if until else "")
@@ -1355,10 +1572,12 @@ def _matches(row, goal, key) -> bool:
 
 
 def evaluate(goals, rows, now, asks=None, verify_source=None, verify_evidence=None, progress=None, commits=None,
-             pol=None, stall_s: int = STALL_S) -> list:
+             pol=None, stall_s: int = STALL_S, tickets=None, words_ok=None) -> list:
     """One result per goal: {id, title, ticket, priority, status, state, reason, owners, progress_age_s}. state is
-    UNCOVERED, STALLED, COVERED, WAITING, DEFERRED, DONE, RETIRED or IMPORTED. Owners come only from `rows`."""
+    UNCOVERED, STALLED, COVERED, WAITING, DEFERRED, DONE, RETIRED or IMPORTED. Owners come only from `rows`.
+    tickets and words_ok: see deferral_status."""
     verify_source = verify_source or verify_user_source
+    words_ok = words_ok or excerpt_words_ok
     verify_evidence = verify_evidence or (lambda g: False)
     progress, commits = progress or {}, commits or {}
     rows = [r for r in rows or [] if isinstance(r, dict)]
@@ -1379,7 +1598,7 @@ def evaluate(goals, rows, now, asks=None, verify_source=None, verify_evidence=No
         if res["status"] == "retired":
             src = (g.get("retire") or {}).get("source")
             words = source_excerpt(src)
-            if retire_words_ok(words, g) and verify_source(src):
+            if words_ok(src, g, "retire") and verify_source(src):
                 res["state"], res["reason"] = "RETIRED", f'retired by the user: "{clean(words)}"'
             else:
                 res["reason"] = "marked retired but the user's words naming it do not resolve"
@@ -1410,7 +1629,7 @@ def evaluate(goals, rows, now, asks=None, verify_source=None, verify_evidence=No
             res["state"] = "WAITING"
             res["reason"] = f"ah disposition {clean(d.get('kind'), 12)} on owner {clean(held[0]['agent_id'], 40)} is live"
             continue
-        state, why = deferral_status(g, now, asks, verify_source)
+        state, why = deferral_status(g, now, asks, verify_source, tickets=tickets, words_ok=words_ok)
         if state:
             res["state"], res["reason"] = state, why
             continue
@@ -1588,6 +1807,40 @@ def mission_alerts(assessment: dict) -> list:
 
 # ------------------------------------------------------------------ assessment (I/O around the rule)
 
+TICKET_CHECK_S = 2.5        # GoodQA lookups for waited-on tickets at Stop, all in parallel (the hook has 15 s)
+TICKET_OPEN_CACHE_S = 600   # an "open" answer is reused for 10 minutes; closed, missing or no answer never is
+
+
+def waited_ticket_states(home: Path, goals, now=None, budget: float = TICKET_CHECK_S) -> dict:
+    """{ticket key: 'open'|'closed'|'missing'|None} for each ticket an active or deferred goal waits on (M3: a
+    waited-on ticket that closed stops covering). Lookups run in parallel within budget; None = no answer in time."""
+    import threading  # noqa: PLC0415
+    refs = sorted({ticket_key(g["deferral"].get("ref")) for g in goals or []
+                   if g.get("status") in ("active", "deferred") and isinstance(g.get("deferral"), dict)
+                   and g["deferral"].get("by") == "ticket" and ticket_key(g["deferral"].get("ref"))})[:20]
+    out, todo = {}, []
+    for ref in refs:
+        if _cached(home, "ticket-open", ref, None, now, pos_s=TICKET_OPEN_CACHE_S) is True:
+            out[ref] = "open"
+        else:
+            todo.append(ref)
+    box, workers = {}, []
+    for ref in todo:
+        def work(r=ref):
+            box[r] = ticket_state(r, timeout=budget)
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        workers.append(t)
+    end = time.monotonic() + budget
+    for t in workers:
+        t.join(max(0.0, end - time.monotonic()))
+    for ref in todo:
+        out[ref] = box.get(ref)
+        if out[ref] == "open":
+            _cached(home, "ticket-open", ref, lambda: True, now, pos_s=TICKET_OPEN_CACHE_S)
+    return out
+
+
 def assess(home: Path, session: str, now=None, with_commits: bool = False, deadline_s=None,
            prefer_snapshot: bool = False, save_snapshot: bool = False) -> dict:
     """{"state": absent|error|tampered|owners-unavailable|ok, "results", "advice", "error", "mission_session"}."""
@@ -1625,7 +1878,10 @@ def assess(home: Path, session: str, now=None, with_commits: bool = False, deadl
                        verify_evidence=lambda g: _cached(home, "evidence", json.dumps(
                            [g.get("ticket"), g.get("done_evidence"), mission], sort_keys=True),
                            lambda: verify_done_evidence(home, g, mission)),
-                       progress=progress, commits=commits, pol=pol)
+                       progress=progress, commits=commits, pol=pol,
+                       tickets=waited_ticket_states(home, goals, now),
+                       words_ok=lambda s, g, kind: _cached(home, "words-" + kind, json.dumps(
+                           [s, g.get("id"), ticket_key(g.get("ticket"))]), lambda: context_words_ok(s, g, kind)))
     cap = owner_cap()
     ranked = cap_candidates(results, rows, cap, pol, now)
     return {"state": "ok", "results": results, "advice": cap_advice(results, rows, cap, pol), "session": session,
@@ -1706,6 +1962,7 @@ def build_parser():
     b.add_argument("--remove", action="store_true")
     ss = sub.add_parser("set-session", help="(main) the session whose main the Stop gate holds")
     ss.add_argument("--session", default="")
+    ss.add_argument("--user-source", help="another session taking the mission: the user's words in this session")
     i = sub.add_parser("import-initiatives", help="(main) merge the dashboard initiatives.json into goals.json")
     i.add_argument("file")
     r = sub.add_parser("reseal", help="(main) record a goals file changed outside this tool (audited)")
@@ -1744,7 +2001,7 @@ def run(args, home: Path) -> tuple:
         bind_agent(home, args.goal, args.agent, args.source, remove=args.remove)
         return {"ok": True, "goal": args.goal}, 0
     if args.cmd == "set-session":
-        doc = set_session(home, args.session)
+        doc = set_session(home, args.session, user_source=args.user_source)
         return {"ok": True, "mission_session": doc["mission_session"]}, 0
     if args.cmd == "import-initiatives":
         return dict(import_initiatives(home, args.file), ok=True), 0
@@ -1782,12 +2039,20 @@ def render(doc: dict) -> str:
 
 
 def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    claim_main(argv, home_dir())  # before parsing: a failing or --help main command leaves no stamp behind (M2)
+    try:
+        args = build_parser().parse_args(argv)
+    except SystemExit:
+        _PROOF.clear()
+        raise
     try:
         doc, rc = run(args, home_dir())
     except MissionError as error:
         print(json.dumps({"ok": False, "error": str(error)}), file=sys.stderr)
         return 2
+    finally:
+        _PROOF.clear()  # never carried past the one command it was taken for
     print(json.dumps(doc, indent=1) if getattr(args, "json", False) or args.cmd not in ("report", "check")
           else render(doc))
     return rc

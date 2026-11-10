@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Mission gate: a Stop hook that blocks the main agent's turn from ending while any active mission goal is UNCOVERED
 (GoodQA goodqa#15565; the rule lives in mission_coverage.py), and the PreToolUse(Bash) hook that stamps main's own
-main-only mission commands (`mission_gate.py pretool`).
+main-only mission commands (`mission_gate.py pretool`): one stamp per command that runs mission_coverage.py at shell
+command position, keyed by its exact argument list; echoed, quoted, grepped or here-document text is never stamped.
 
 Evidence: 2026-11-10 the leads goal (goodqa#15095) had no owner all night; the user had to ask "whats moving the
 slowest" and then "why doesnt the dashboard and harness deal with this?". The dropped-owner gate only sees owners that
@@ -25,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -92,49 +94,98 @@ def ring(home: Path, event: str, message: str, detail: dict, key: str = VALVE_KE
         pass
 
 
+PUNCT = set(";&|()<>\n")
+PYTHON = re.compile(r"^python(?:\d+(?:\.\d+)*)?$")
+ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
 def _words(cmd: str) -> list:
+    """Shell words and operator runs. `#` is a word character here (bash starts a comment only at a word start;
+    `goodqa#9` is one word); a word that starts with `#` is treated as a comment in simple_commands."""
     import shlex  # noqa: PLC0415
     try:
         lexer = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>\n")
         lexer.whitespace_split = True
+        lexer.whitespace = " \t\r"  # a newline separates commands, as in bash (shlex counts it as whitespace)
+        lexer.commenters = ""
         return list(lexer)
     except ValueError:
         return []
 
 
-def stamps_for(cmd: str) -> list:
-    """[(subcommand, goal)] for each main-only mission_coverage.py command in a Bash command line."""
-    out = []
+def _is_op(word: str) -> bool:
+    return bool(word) and set(word) <= PUNCT
+
+
+def _is_sep(word: str) -> bool:
+    return _is_op(word) and (bool(set(word) & set(";|()\n")) or word in ("&", "&&"))
+
+
+def simple_commands(cmd: str) -> list:
+    """The argument lists the shell would run, split at ; & && | || ( ) and newlines, with redirections (and their
+    targets and fd numbers) removed and comments dropped. [] for a command with a here-document: its body is text,
+    not commands, and the lexer cannot tell where it ends."""
     words = _words(cmd[:20000])
-    for i, w in enumerate(words):
-        if not w.endswith("mission_coverage.py") or i + 1 >= len(words):
+    if any("<<" in w for w in words if _is_op(w)):
+        return []
+    out, cur, i = [], [], 0
+    while i < len(words):
+        w = words[i]
+        if _is_sep(w):
+            out.append(cur)
+            cur = []
+        elif _is_op(w):  # a redirection: drop it, its target, and an fd number written just before it
+            if cur and cur[-1].isdigit():
+                cur.pop()
+            i += 1
+        elif w.startswith("#"):  # a comment runs to the end of the line
+            while i + 1 < len(words) and "\n" not in words[i + 1]:
+                i += 1
+        else:
+            cur.append(w)
+        i += 1
+    out.append(cur)
+    return [c for c in out if c]
+
+
+def mission_argv(words: list):
+    """The argv after the script when this simple command runs mission_coverage.py itself (`[VAR=x ...] [python3
+    [-flags]] .../mission_coverage.py SUB ...`); None when the script name is only an argument (echo, grep, cat)."""
+    i = 0
+    while i < len(words) and ASSIGN.match(words[i]):
+        i += 1
+    if i < len(words) and PYTHON.match(os.path.basename(words[i])):
+        i += 1
+        while i < len(words) and re.match(r"^-[A-Za-z]+$", words[i]) and words[i] not in ("-c", "-m"):
+            i += 1
+    if i < len(words) and os.path.basename(words[i]) == "mission_coverage.py":
+        return words[i + 1:]
+    return None
+
+
+def stamps_for(cmd: str) -> list:
+    """[(subcommand, argv key)] for each main-only mission_coverage.py command this Bash line runs. The key is
+    mission_coverage.argv_key of the exact argument list, so the stamp covers that command and nothing else."""
+    import mission_coverage as mc  # noqa: PLC0415
+    out = []
+    for words in simple_commands(cmd):
+        argv = mission_argv(words)
+        if not argv or argv[0] not in MAIN_ONLY:
             continue
-        sub = words[i + 1]
-        if sub not in MAIN_ONLY:
+        flags = {x.split("=", 1)[0] for x in argv[1:] if x.startswith("--")}
+        if argv[0] == "set" and not flags & {"--ticket", "--repo"}:
             continue
-        tail = []
-        for x in words[i + 2:]:
-            if x and set(x) <= set(";&|()<>\n"):
-                break
-            tail.append(x)
-        flags = {x.split("=", 1)[0] for x in tail if x.startswith("--")}
-        if sub == "set" and not flags & {"--ticket", "--repo"}:
+        if argv[0] == "defer" and not flags & {"--user-source", "--ticket"}:
             continue
-        if sub == "defer" and "--user-source" not in flags:
-            continue
-        goal = "*"
-        for j, x in enumerate(tail):
-            if x == "--goal" and j + 1 < len(tail):
-                goal = tail[j + 1]
-            elif x.startswith("--goal="):
-                goal = x.split("=", 1)[1]
-        out.append((sub, goal))
+        # bash expands an unquoted leading ~ (`import-initiatives ~/x.json`); the process sees the expanded path
+        argv = [os.path.expanduser(w) if w == "~" or w.startswith("~/") else w for w in argv]
+        out.append((argv[0], mc.argv_key(argv)))
     return out
 
 
 def cmd_pretool(payload: dict) -> dict:
     """PreToolUse(Bash): when main (proven by caller_identity.is_main) runs a main-only mission command, record a
-    one-shot stamp for exactly that subcommand and goal. Never denies anything; a sub-agent gets no stamp."""
+    one-shot stamp for exactly that argument list. Never denies anything; a sub-agent gets no stamp."""
     if payload.get("tool_name") != "Bash":
         return {}
     tool_input = payload.get("tool_input")
@@ -145,8 +196,8 @@ def cmd_pretool(payload: dict) -> dict:
     if not caller_identity.is_main(payload):
         return {}
     session = str(payload.get("session_id") or "")
-    for sub, goal in stamps_for(cmd)[:10]:
-        caller_identity.put_stamp(STAMP_PURPOSE, [sub, goal], session=session, home=home_dir())
+    for sub, key in stamps_for(cmd)[:10]:
+        caller_identity.put_stamp(STAMP_PURPOSE, [sub, key], session=session, home=home_dir())
     return {}
 
 

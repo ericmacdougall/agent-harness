@@ -1252,7 +1252,7 @@ One canonical file, `~/.agent-harness/mission/goals.json` (directory 0700 and no
 
 | field | type | meaning |
 | --- | --- | --- |
-| `mission_session` | session id | the main session the Stop gate holds to the mission; set by the first `import-initiatives` or by `set-session` (main only) |
+| `mission_session` | session id | the main session the Stop gate holds to the mission; set by the first `import-initiatives` or by `set-session` (main only; see the hand-over rule below) |
 | `id` | `[a-z0-9][a-z0-9_-]{0,63}` | unique goal id (the dashboard initiative id) |
 | `title` | text, up to 300 | what the goal is |
 | `ticket` | `goodqa#N`, `Project#N` or `""` | the stream ticket; owners are matched by it, never by name. Changing it is main only |
@@ -1283,19 +1283,47 @@ Readers take a shared lock on `mission-goals.lock`, so a concurrent write is nev
     mission_coverage.py set --goal leads --ticket T | --repo PATH...                                      # main
     mission_coverage.py bind --goal leads --agent <full agent id> --source ticket:goodqa#15095 [--remove] # main
     mission_coverage.py defer --goal leads --ask <open ask naming the goal> --until <ISO, at most 7 days ahead>
-    mission_coverage.py defer --goal leads --ticket <open blocking ticket> --until <ISO, at most 7 days ahead>
+    mission_coverage.py defer --goal leads --ticket <open blocking ticket> --until <ISO, at most 7 days ahead>  # main
     mission_coverage.py defer --goal leads --user-source "<user: or answer: source>" [--until <ISO>]     # main
     mission_coverage.py retire --goal leads --user-source "<user: or answer: source>"                    # main
     mission_coverage.py done --goal leads --deploy <deploy WAL id> --live-test <REALLY_TESTED id>
-    mission_coverage.py set-session [--session S]                                                         # main
+    mission_coverage.py set-session [--session S] | --user-source "<user: source in this session>"       # main
     mission_coverage.py reseal --reason "<what changed and why>" [--force]                                # main
     mission_coverage.py verify | report [--json] | check
 
-Main-only commands need a one-shot stamp (`caller_identity.put_stamp`, purpose `mission-main`, keyed by subcommand
-and goal, single use, 10 minutes) that `mission_gate.py pretool` writes only when the PreToolUse payload proves main
-(`caller_identity.is_main`) and the Bash command runs that exact subcommand. A sub-agent's shell, a copied script or a
-cron job finds no stamp and gets a refusal naming main. Every main-only change raises a high `mission:goals:changed`
-alert (source `mission-coverage`) with the old and new value. `reseal` is refused while the chain is intact unless
+Main-only commands need a one-shot stamp (`caller_identity.put_stamp`, purpose `mission-main`, single use, 10
+minutes) that `mission_gate.py pretool` writes only when the PreToolUse payload proves main (`caller_identity.is_main`)
+and the Bash command runs `mission_coverage.py` itself:
+
+- The stamp is keyed by the sha256 of the exact argument list after the script (`argv_key`; `--flag=value` reads as
+  `--flag value`), so it covers that one command and nothing else.
+- The hook stamps only a script at command position: the first word of a simple command (after `;`, `&&`, `||`, `|`,
+  `(` or a newline), optionally after `VAR=x` words and `python3 [-flags]`. Redirections and their targets (`2>&1`,
+  `> out`) and `#` comments are left out of the argument list. Text that only mentions the script is never stamped:
+  `echo`, `grep`, `printf '...'`, `bash -c '...'`, and any command with a here-document (`<<`). `goodqa#9` is one word,
+  as in bash.
+- The command takes (consumes) its stamp first, before argparse or any validation. A main command that then fails,
+  prints `--help` or exits on an argparse error leaves nothing a later process could use.
+- Once goals.json names a mission session, the stamp must come from that session. Another top-level session (another
+  main, or a sub-agent's own `claude -p`) is refused even with a stamp of its own.
+- A leading unquoted `~/` is expanded as bash does. Other arguments the shell computes (`$VAR`, `$(...)`, globs) differ
+  from what the hook saw, so such a command is refused. Run main-only commands with literal arguments.
+
+A sub-agent's shell, a copied script or a cron job finds no stamp and gets a refusal naming main. Every main-only
+change, and every ask or ticket wait, raises a high `mission:goals:changed` alert (source `mission-coverage`) with the
+old and new value.
+
+Hand-over (`set-session`): with no mission session yet, any main sets it. The mission main may move it, to itself or to
+another session id. Any other session may take it only for itself, with `--user-source`: a `user:` or `answer:` source
+from its own transcript whose whole sentence says to move the mission ("take over the mission in this session"), as a
+one-segment quote with no condition or refusal. That is the recovery when the old main died. The change re-checks the
+mission session under the write lock.
+
+Limit (threat model): stamps are not signed. A same-user process can write a stamp file into
+`~/.agent-harness/state/main-stamps/` itself, as it can edit the hooks or the HMAC key. Stamps stop careless agents and
+the copied-command, leftover-stamp and other-session cases above, not a same-user agent that sets out to forge them. A
+stamp left by a main command that never ran (for example `false && mission_coverage.py reseal ...`) can still be used
+within 10 minutes by a process that runs exactly the same argument list. `reseal` is refused while the chain is intact unless
 main passes `--force`; its audit row records the sealed hash, the hand-edited file's hash and the removed goal ids.
 
 `ah task register` rows no longer bind owners: ah records the caller from the environment (`AH_AGENT_ID`, else
@@ -1318,13 +1346,21 @@ A goal with status `active` (or `deferred`) is covered by
 2. a live disposition:
    - an `ah task dispose` waiting, resumed or reassigned disposition that ah reports live, on such an owner row;
    - a wait on an ask that is open in main's WAL and whose text names the goal id or ticket;
-   - a wait on another ticket that was open in GoodQA when it was recorded (checked through ah's adapter, 10 s bound);
+   - a wait on another ticket (main only) that was open in GoodQA when it was recorded (checked through ah's adapter,
+     10 s bound). The Stop gate and `report` check it again: a waited-on ticket that is now closed or missing no longer
+     covers. Those lookups run in parallel within 2.5 s; an "open" answer is reused for 10 minutes, and no answer in time
+     keeps the wait with "open state not confirmed this turn";
    - an ask or ticket wait needs `until` in the future and at most 7 days ahead, and at most 2 waits in a row
      without the user's word; the third makes the goal UNCOVERED again;
    - a deferral the user decided: its `user:`/`answer:` source resolves through provenance.py to the user's own words,
-     and the quoted words name the goal (id, also hyphenated or spaced, or `#<ticket number>`). They must also say
-     defer, later, park, pause, hold, not now, drop, cancel or wait, with no refusal or condition word (don't, not, no,
-     if, unless, maybe, should, a question mark). `report` prints the quoted words;
+     quoted as one segment (no `...`). The verb must sit right next to the goal (id, also hyphenated or spaced, or
+     `#<ticket number>`, with "the", "goal", "work" and the project name folded in): defer, park, pause, postpone or
+     shelve the goal, hold off on it, put it on hold, "<goal> can wait", or "<goal> is deferred/parked/paused/on hold".
+     The whole sentence of the user's turn that holds the quote (not only the quoted fragment) must contain no refusal,
+     condition or negation (don't, not, no, never, if, unless, maybe, should, a question mark, stop, quit, resume,
+     restart, except, instead). "wait", "later", "hold" and "stop" alone are not a decision. `report` prints the quoted
+     words. `retire` follows the same rules with drop, cancel, retire, abandon or scrap (or the word kill) next to the
+     goal, or "<goal> is dropped/cancelled/retired/dead";
 3. done evidence (status `done`): a deploy record and a later REALLY_TESTED entry against a live target, both from the
    mission session's WALs and both naming the goal's ticket, checked with `ah`'s own evidence resolvers (the DONE_LIVE
    rule).

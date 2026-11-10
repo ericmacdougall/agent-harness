@@ -88,16 +88,43 @@ class Base(unittest.TestCase):
         return {r["id"]: r for r in mc.evaluate(goals, list(rows), NOW, **kw)}
 
     def as_main(self, cmd, goal="*"):
-        """What main's PreToolUse hook records before main runs a main-only mission command."""
+        """What main's PreToolUse hook records for `mission_coverage.py CMD [--goal GOAL]`, then what that process does
+        with it before parsing (claim_main); the test then calls the library function the CLI would call."""
         import caller_identity  # noqa: PLC0415
-        caller_identity.put_stamp("mission-main", [cmd, goal], session=SESSION, home=self.home)
+        argv = [cmd] + ([] if goal == "*" else ["--goal", goal])
+        caller_identity.put_stamp("mission-main", [cmd, mc.argv_key(argv)], session=SESSION, home=self.home)
+        mc.claim_main(argv, self.home)
+        self.addCleanup(mc._PROOF.clear)
 
     def write_goals(self, goals):
         for g in goals:
             mc.add_goal(self.home, g["id"], g.get("title") or g["id"], g.get("ticket", ""), g.get("priority", 3))
         if mc.load_goals(self.home).get("mission_session") != SESSION:
-            self.as_main("set-session")
-            mc.set_session(self.home, SESSION)
+            self.assertEqual(self.main_cli(["set-session", "--session", SESSION])[0], 0)
+
+    def hook(self, cmd, session=SESSION, transcript=None):
+        """main's PreToolUse(Bash) hook seeing `cmd` in session `session` (a top-level transcript of its own)."""
+        return mission_gate.cmd_pretool({"tool_name": "Bash", "tool_input": {"command": cmd}, "session_id": session,
+                                         "hook_event_name": "PreToolUse",
+                                         "transcript_path": str(transcript or self.transcript)})
+
+    def cli(self, argv):
+        """(rc, stdout + stderr) of `mission_coverage.py argv` run in this process."""
+        import contextlib  # noqa: PLC0415
+        import io  # noqa: PLC0415
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            try:
+                rc = mc.main(list(argv))
+            except SystemExit as stop:
+                rc = stop.code if isinstance(stop.code, int) else 2
+        return rc, out.getvalue()
+
+    def main_cli(self, argv, session=SESSION, transcript=None):
+        """main types `python3 ~/.claude/hooks/mission_coverage.py argv` in Bash: its hook runs, then the command."""
+        import shlex  # noqa: PLC0415
+        self.hook(mc.SCRIPT + " " + " ".join(shlex.quote(a) for a in argv), session, transcript)
+        return self.cli(argv)
 
     def payload(self, **extra):
         p = {"session_id": SESSION, "hook_event_name": "Stop", "stop_hook_active": False,
@@ -703,10 +730,11 @@ class RedTeam179(Base):
                                         "agent_id": "a9", "transcript_path": str(self.transcript)})
         self.assertEqual(sub, {})
         import caller_identity  # noqa: PLC0415
-        self.assertIsNone(caller_identity.take_stamp("mission-main", ["set", "leads"]))
+        key = ["set", mc.argv_key(["set", "--goal", "leads", "--ticket", "goodqa#1"])]
+        self.assertIsNone(caller_identity.take_stamp("mission-main", key))
         mission_gate.cmd_pretool({"tool_name": "Bash", "tool_input": {"command": cmd}, "session_id": SESSION,
                                   "transcript_path": str(self.transcript)})
-        self.assertIsNotNone(caller_identity.take_stamp("mission-main", ["set", "leads"]))
+        self.assertIsNotNone(caller_identity.take_stamp("mission-main", key))
 
     # M1b: an ah registration (any caller, any source, 8-char prefix) never binds; main binds an exact live owner id
     def test_ah_registration_never_binds_and_bind_needs_the_exact_live_owner_id(self):
@@ -830,9 +858,11 @@ class RedTeam179(Base):
         self.write_goals([goal()])
         for state in ("closed", None):
             with mock.patch.object(mc, "ticket_state", return_value=state):
-                with self.assertRaises(mc.MissionError):
+                with self.assertRaisesRegex(mc.MissionError, "open ticket"):
+                    self.as_main("defer", "leads")
                     mc.defer_goal(self.home, "leads", ticket="goodqa#1", until=iso(NOW + 3600), session=SESSION, now=NOW)
         with mock.patch.object(mc, "ticket_state", return_value="open"):
+            self.as_main("defer", "leads")
             mc.defer_goal(self.home, "leads", ticket="goodqa#1", until=iso(NOW + 3600), session=SESSION, now=NOW)
 
     def test_ask_wait_needs_an_ask_that_names_the_goal(self):
@@ -1049,6 +1079,204 @@ class RedTeam179(Base):
                          "UNCOVERED")
 
 
+OTHER = "bbbbbbbb-0000-4000-8000-000000000002"
+OTHER_UUID = "cccccccc-dddd-4eee-8fff-000000000001"
+OTHER_NO_UUID = "cccccccc-dddd-4eee-8fff-000000000003"
+REFUSING_UUID = "dddddddd-eeee-4fff-8000-000000000002"
+MAIN_HANDOVER_UUID = "dddddddd-eeee-4fff-8000-000000000004"
+THIRD = "eeeeeeee-0000-4000-8000-000000000003"
+REFUSING_TEXT = ("please do not defer leads until friday, it is the top priority. "
+                 "don't stop leads (goodqa#15095), stop the newsletter. "
+                 "park leads (goodqa#15095) for now. the newsletter stays live this week.")
+
+
+def user_line(uid, text, ts):
+    return json.dumps({"type": "user", "uuid": uid, "origin": {"kind": "human"}, "timestamp": iso(ts),
+                       "message": {"role": "user", "content": text}}) + "\n"
+
+
+class RedTeam179Delta(Base):
+    """Delta red-team of PR 179 (e5977a6) returned BLOCK: M1 any top-level session could run main-only commands and
+    take the mission; M2 a stamp outlived the command main ran (failed, --help, echoed text); M3 any caller could park
+    a goal on an unrelated open ticket; H1 a faithful partial quote of a refusing sentence passed the word checks.
+    Each test fails against e5977a6 (probes: rt179b_probes/probe.py P1, P2, P3, P4, P5 and quote.py)."""
+
+    def setUp(self):
+        super().setUp()
+        self.other_tr = self.home / ".claude" / "projects" / "proj" / f"{OTHER}.jsonl"
+        self.other_tr.write_text(
+            user_line(OTHER_UUID, "the old session died. take over the mission in this session.", NOW - 120)
+            + user_line(OTHER_NO_UUID, "please do not take over the mission until tomorrow", NOW - 60))
+        with open(self.transcript, "a") as fh:
+            fh.write(user_line(REFUSING_UUID, REFUSING_TEXT, NOW - 300))
+            fh.write(user_line(MAIN_HANDOVER_UUID, "the other session takes over the mission now.", NOW - 200))
+
+    def ticket_of(self, gid):
+        return {g["id"]: g for g in mc.load_goals(self.home)["goals"]}[gid]["ticket"]
+
+    # M1: once a mission session is set, only that main runs main-only commands
+    def test_another_top_level_session_cannot_take_over_or_change_the_mission(self):
+        self.write_goals([goal(), goal("tokens", ticket="goodqa#15561")])
+        self.assertEqual(self.stop().get("decision"), "block")
+        attempts = [["set-session"], ["set-session", "--session", OTHER],
+                    ["set", "--goal", "leads", "--ticket", "goodqa#555"],
+                    ["bind", "--goal", "leads", "--agent", "a1111111aaaaaaaaa", "--source", "ticket:goodqa#15095"],
+                    ["retire", "--goal", "tokens", "--user-source", f'user:{SESSION}/{USER_UUID} "drop the tokens goal"'],
+                    ["reseal", "--reason", "a reason that is long enough", "--force"]]
+        for argv in attempts:
+            rc, out = self.main_cli(argv, session=OTHER, transcript=self.other_tr)
+            self.assertEqual(rc, 2, (argv, out))
+            self.assertIn("mission", out)
+        self.assertEqual(mc.mission_session_of(self.home), SESSION)
+        self.assertEqual(self.ticket_of("leads"), "goodqa#15095")
+        self.assertEqual({g["id"]: g["status"] for g in mc.load_goals(self.home)["goals"]}["tokens"], "active")
+        self.assertEqual(self.stop().get("decision"), "block")  # the real main is still held
+
+    def test_mission_main_hands_over_and_a_new_session_needs_the_users_words_in_it(self):
+        self.write_goals([goal()])
+        good = f'user:{OTHER}/{OTHER_UUID} "take over the mission in this session"'
+        refused = [["--user-source", f'user:{SESSION}/{MAIN_HANDOVER_UUID} "takes over the mission now"'],  # words
+                   # from another session's transcript, even hand-over words
+                   ["--user-source", f'user:{OTHER}/{OTHER_NO_UUID} "take over the mission until tomorrow"'],  # refusing
+                   ["--user-source", f'user:{OTHER}/{OTHER_UUID} "the old session died"'],  # no hand-over words
+                   ["--session", THIRD, "--user-source", good]]  # a foreign session takes it only for itself
+        for extra in refused:
+            rc, out = self.main_cli(["set-session"] + extra, session=OTHER, transcript=self.other_tr)
+            self.assertEqual(rc, 2, (extra, out))
+            self.assertEqual(mc.mission_session_of(self.home), SESSION)
+        rc, out = self.main_cli(["set-session", "--user-source", good], session=OTHER, transcript=self.other_tr)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(mc.mission_session_of(self.home), OTHER)
+        rc, out = self.main_cli(["set", "--goal", "leads", "--ticket", "goodqa#555"])  # the old main is out now
+        self.assertEqual(rc, 2, out)
+        rc, out = self.main_cli(["set-session", "--session", SESSION], session=OTHER, transcript=self.other_tr)
+        self.assertEqual(rc, 0, out)  # the mission main hands it back by id
+        self.assertEqual(mc.mission_session_of(self.home), SESSION)
+
+    # M2: a stamp covers exactly the command main ran, once, and never text that does not run
+    def test_failed_or_help_main_command_leaves_no_stamp_a_sub_agent_can_use(self):
+        self.write_goals([goal()])
+        rc, _ = self.main_cli(["set", "--goal", "leads", "--ticket", "goodqa-100"])
+        self.assertEqual(rc, 2)
+        rc, _ = self.cli(["set", "--goal", "leads", "--ticket", "goodqa#555"])  # sub-agent, no hook of its own
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.ticket_of("leads"), "goodqa#15095")
+        rc, _ = self.main_cli(["reseal", "--help"])
+        self.assertEqual(rc, 0)
+        rc, _ = self.main_cli(["set", "--goal", "leads", "--ticket"])  # argparse error
+        self.assertEqual(rc, 2)
+        import caller_identity  # noqa: PLC0415
+        self.assertEqual(sorted(caller_identity.stamp_dir(self.home).glob("*.json")), [])
+
+    def test_stamp_covers_only_the_exact_argument_list_and_is_used_once(self):
+        self.write_goals([goal()])
+        self.hook(mc.SCRIPT + " set --goal leads --ticket goodqa#100")
+        self.assertEqual(self.cli(["set", "--goal", "leads", "--ticket", "goodqa#555"])[0], 2)
+        self.assertEqual(self.ticket_of("leads"), "goodqa#15095")
+        self.assertEqual(self.cli(["set", "--goal", "leads", "--ticket", "goodqa#100"])[0], 0)
+        self.assertEqual(self.ticket_of("leads"), "goodqa#100")
+        self.assertEqual(self.cli(["set", "--goal", "leads", "--ticket", "goodqa#100"])[0], 2)  # used once
+
+    def test_echoed_heredoc_or_quoted_text_is_never_stamped_and_real_shell_forms_are(self):
+        s = mc.SCRIPT
+        for cmd in (f"echo {s} reseal --reason x", f"cat <<EOF\n{s} reseal --reason x\nEOF",
+                    f"printf '%s' \"{s} reseal --reason x\"", f"bash -c '{s} reseal --reason x'",
+                    f"grep -n {s.split()[1]} reseal notes.txt"):
+            self.assertEqual(mission_gate.stamps_for(cmd), [], cmd)
+        self.write_goals([goal()])
+        self.hook(f"cd /tmp && {s} set --ticket goodqa#9 --goal leads 2>&1 | tail -3")
+        self.assertEqual(self.cli(["set", "--ticket", "goodqa#9", "--goal", "leads"])[0], 0)
+        self.assertEqual(self.ticket_of("leads"), "goodqa#9")
+        self.hook(f"{s} set --goal=leads --ticket 'goodqa#15095' ; true")
+        self.assertEqual(self.cli(["set", "--goal=leads", "--ticket", "goodqa#15095"])[0], 0)
+        self.assertEqual(self.ticket_of("leads"), "goodqa#15095")
+        key = mc.argv_key(["set", "--goal", "leads", "--ticket", "goodqa#9"])
+        for multi in (f"cd /tmp\n{s} set --goal leads --ticket goodqa#9", f"# set the ticket\n{s} set --goal leads --ticket goodqa#9"):
+            self.assertEqual(mission_gate.stamps_for(multi), [("set", key)], multi)  # a newline separates commands
+        tilde = mission_gate.stamps_for(f"{s} import-initiatives ~/dash/initiatives.json # refresh")
+        self.assertEqual(tilde, [("import-initiatives",
+                                  mc.argv_key(["import-initiatives", str(self.home / "dash" / "initiatives.json")]))])
+
+    # M3: a ticket wait is main-only, every wait alerts, and Stop re-checks that the ticket is still open
+    def test_ticket_wait_is_main_only_and_every_wait_raises_a_change_alert(self):
+        self.write_goals([goal()])
+        until = iso(time.time() + 3600)
+        rc, out = self.cli(["defer", "--goal", "leads", "--ticket", "goodqa#1", "--until", until])
+        self.assertEqual(rc, 2, out)
+        self.assertNotIn("deferral", mc.load_goals(self.home)["goals"][0])
+        before = len(ring_events(self.home, "mission:goals:changed"))
+        rc, out = self.main_cli(["defer", "--goal", "leads", "--ticket", "goodqa#1", "--until", until])
+        self.assertEqual(rc, 0, out)
+        rc, out = self.cli(["defer", "--goal", "leads", "--ask", ASK, "--until", until])
+        self.assertEqual(rc, 0, out)
+        ev = ring_events(self.home, "mission:goals:changed")[before:]
+        self.assertEqual([e["event"] for e in ev], ["raise", "raise"])
+        self.assertTrue(all("wait" in e["message"] for e in ev))
+
+    def test_stop_rechecks_that_the_waited_on_ticket_is_still_open(self):
+        self.write_goals([goal()])
+        self.assertEqual(self.main_cli(["defer", "--goal", "leads", "--ticket", "goodqa#15561", "--until",
+                                        iso(time.time() + 3600)])[0], 0)
+        now = time.time()
+        with mock.patch.object(mc, "owner_rows", return_value=[]):
+            for state in ("closed", "missing"):
+                with mock.patch.object(mc, "ticket_state", return_value=state):
+                    res = {r["id"]: r for r in mc.assess(self.home, SESSION, now)["results"]}["leads"]
+                    self.assertEqual(res["state"], "UNCOVERED", res)
+                    self.assertIn(state, res["reason"])
+            with mock.patch.object(mc, "ticket_state", return_value="open"):
+                res = {r["id"]: r for r in mc.assess(self.home, SESSION, now)["results"]}["leads"]
+                self.assertEqual(res["state"], "WAITING", res)
+
+    # H1: the refusal check reads the whole sentence; defer and retire quotes are one segment; verbs sit by the goal
+    def test_partial_quote_of_a_refusing_sentence_cannot_defer_or_retire(self):
+        self.write_goals([goal()])
+        src = f"user:{SESSION}/{REFUSING_UUID} "
+        for argv in (["defer", "--goal", "leads", "--user-source", src + '"defer leads until friday"'],
+                     ["retire", "--goal", "leads", "--user-source", src + '"stop leads (goodqa#15095)"'],
+                     ["defer", "--goal", "leads", "--user-source",
+                      src + '"park leads (goodqa#15095) ... newsletter stays live"']):
+            rc, out = self.main_cli(argv)
+            self.assertEqual(rc, 2, (argv, out))
+        self.assertEqual(mc.load_goals(self.home)["goals"][0]["status"], "active")
+        rc, out = self.main_cli(["defer", "--goal", "leads", "--user-source", src + '"park leads (goodqa#15095) for now"'])
+        self.assertEqual(rc, 0, out)
+        with mock.patch.object(mc, "owner_rows", return_value=[]):  # the whole-sentence check at Stop passes it
+            res = {r["id"]: r for r in mc.assess(self.home, SESSION, time.time())["results"]}["leads"]
+        self.assertEqual(res["state"], "DEFERRED", res)
+        stored = mc.load_goals(self.home)["goals"][0]
+        refusing = dict(stored, deferral=dict(stored["deferral"], source=src + '"defer leads until friday"'))
+        self.assertTrue(mc.excerpt_words_ok(refusing["deferral"]["source"], refusing, "defer"))  # the fragment alone
+        self.assertFalse(mc.context_words_ok(refusing["deferral"]["source"], refusing, "defer"))  # its sentence
+
+        def legacy(doc):  # a deferral e5977a6 accepted from that partial quote, still in the file
+            doc["goals"][0]["deferral"] = refusing["deferral"]
+            return doc
+        mc._mutate(self.home, "defer", "leads", legacy, {})
+        with mock.patch.object(mc, "owner_rows", return_value=[]):
+            res = {r["id"]: r for r in mc.assess(self.home, SESSION, time.time())["results"]}["leads"]
+        self.assertEqual(res["state"], "UNCOVERED", res)
+        # at Stop too: a stored multi-segment quote no longer defers
+        g = goal(status="deferred", deferral={"by": "user", "source": src + '"park leads (goodqa#15095) ... stays live"'})
+        self.assertEqual(self.results([g], verify_source=always)["leads"]["state"], "UNCOVERED")
+
+    def test_word_checks_reject_opposite_meanings_and_keep_plain_ones(self):
+        g = goal()
+        for text in ("stop holding leads, ship it today", "leads: the wait is over, push hard",
+                     "leads later today must be live", "get leads done, cancel everything else",
+                     "leads has been parked too long, restart it", "stop parking leads"):
+            self.assertFalse(mc.deferral_words_ok(text, g), text)
+        for text in ("stop ignoring leads", "leads: kill the blockers and finish", "drop everything for leads",
+                     "stop leads"):
+            self.assertFalse(mc.retire_words_ok(text, g), text)
+        for text in ("defer leads until monday", "park leads (goodqa#15095) for now", "put #15095 on hold",
+                     "leads can wait until next week", "pause the leads work"):
+            self.assertTrue(mc.deferral_words_ok(text, g), text)
+        for text in ("retire leads", "cancel goodqa#15095", "leads is cancelled"):
+            self.assertTrue(mc.retire_words_ok(text, g), text)
+        self.assertTrue(mc.retire_words_ok("drop the tokens goal, we cancel it", goal("tokens", ticket="")))
+
+
 class MutantKills(Base):
     """Survivors of the mutation check on the red-team fixes."""
 
@@ -1059,6 +1287,7 @@ class MutantKills(Base):
 
     def test_goal_cannot_wait_on_its_own_ticket(self):  # M01
         self.write_goals([goal()])
+        self.as_main("defer", "leads")
         with self.assertRaisesRegex(mc.MissionError, "own ticket"):
             mc.defer_goal(self.home, "leads", ticket="goodqa#15095", until=iso(NOW + 3600), session=SESSION, now=NOW)
 
