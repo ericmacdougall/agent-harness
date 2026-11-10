@@ -1,4 +1,4 @@
-"""Scenario B3.17: the owner cap (memory: at most 8 active owners since 2026-11-09, GoodQA #15585) is enforced by the spawn hook, helpers are exempt,
+"""Scenario B3.17: the owner cap (memory: at most 8 active owners) is enforced by the spawn hook, helpers are exempt,
 and warn mode no longer narrates allowed spawns (B24: enforce it or say nothing)."""
 
 import json
@@ -22,67 +22,64 @@ class OwnerCap(unittest.TestCase):
         self.root = Path(self.temp.name) / 'state'; self.root.mkdir(mode=0o700)
         self.home = Path(self.temp.name) / 'home'; self.home.mkdir()  # no main WAL: the live map decides
         self.policy = tiers.load_policy()
-        self.cap = self.policy['caps']['session_owner_agents']
-        self.full = 'owner cap %d reached' % self.cap
         self.env = mock.patch.dict(os.environ, {'AGENT_HARNESS_ESCALATION_DIR': str(self.root), 'AH_HOME': str(self.home)})
         self.env.start(); self.addCleanup(self.env.stop)
 
     def test_shipped_caps_match_the_user_rule(self):
         caps = self.policy['caps']
-        self.assertEqual(caps['session_owner_agents'], 8)  # main WAL wd89d1d837e0: "up owner slots to 8"
-        self.assertLessEqual(caps['session_live_agents'], 16)
+        self.assertEqual(caps['session_owner_agents'], 8)  # the user raised it from 4 on 2026-11-09
+        self.assertEqual(caps['session_live_agents'], 16)
         self.assertIn('task-owner', caps['owner_types']); self.assertNotIn('red-team', caps['owner_types'])
 
-    def test_fifth_owner_is_denied_with_the_live_ids_and_helpers_still_pass(self):
-        for n in range(self.cap):
+    def test_ninth_owner_is_denied_with_the_live_ids_and_helpers_still_pass(self):
+        for n in range(8):
             gate.live_update('s7', 'owner-%d' % n, start=True, agent_type='task-owner')
         gate.live_update('s7', 'reviewer-1', start=True, agent_type='red-team')  # a helper never counts as an owner
-        self.assertEqual(gate.live_owner_ids('s7', self.policy), ['owner-%d' % n for n in range(self.cap)])
+        self.assertEqual(gate.live_owner_ids('s7', self.policy), ['owner-%d' % n for n in range(8)])
         reason, owners = gate.owner_cap_decision('s7', {'subagent_type': 'task-owner'}, self.policy)
-        self.assertIn(self.full, reason); self.assertIn('owner-0', reason); self.assertIn('ah.py owners', reason)
+        self.assertIn('owner cap 8 reached', reason); self.assertIn('owner-0', reason); self.assertIn('ah.py owners', reason)
         for helper in ('red-team', 'click-tester', 'fixer', 'Explore', 'Plan'):
             self.assertEqual(gate.owner_cap_decision('s7', {'subagent_type': helper}, self.policy)[0], None, helper)
         for invented in ('helper', 'assistant', 'owner-lite'):  # round 2: an unknown label is an owner, not an exemption
-            self.assertIn(self.full, gate.owner_cap_decision('s7', {'subagent_type': invented}, self.policy)[0] or '', invented)
+            self.assertIn('owner cap 8 reached', gate.owner_cap_decision('s7', {'subagent_type': invented}, self.policy)[0] or '', invented)
         gate.live_update('s7', 'owner-2', start=False)
         self.assertIsNone(gate.owner_cap_decision('s7', {'subagent_type': 'general-purpose'}, self.policy)[0])
 
     def test_owner_count_prefers_wal_liveness_over_the_expiring_live_map(self):
         # Kimi round 1 (HIGH): the live map forgets an owner after 30 minutes without a start/stop; ah owners does not.
-        rows = [{'agent_id': 'longrunner%d' % n, 'owner': True, 'state': 'live'} for n in range(self.cap)]
+        rows = [{'agent_id': 'longrunner%d' % n, 'owner': True, 'state': 'live'} for n in range(8)]
         rows.append({'agent_id': 'helper1', 'type': 'red-team', 'owner': False, 'state': 'live'})
         rows.append({'agent_id': 'finished1', 'owner': True, 'state': 'done'})
         with mock.patch('ah.owners', return_value={'owners': rows}):
-            self.assertEqual(gate.live_owner_ids('s8', self.policy), ['longrunner%d' % n for n in range(self.cap)])
+            self.assertEqual(gate.live_owner_ids('s8', self.policy), ['longrunner%d' % n for n in range(8)])
             self.assertIsNotNone(gate.owner_cap_decision('s8', {'subagent_type': 'task-owner'}, self.policy)[0])
 
     def test_unmocked_owner_count_includes_general_purpose_and_quiet_owners(self):
-        # Review F3: ah owners flags only task-owner agents, so cap+2 live general-purpose owners counted zero. This test
+        # Review F3: ah owners flags only task-owner agents, so six live general-purpose owners counted zero. This test
         # writes real session WALs and lets ah.owners classify them (no mock).
         import json as _json
         import time as _time
         now = _time.time()
         iso = lambda ts: _time.strftime('%Y-%m-%dT%H:%M:%S+00:00', _time.gmtime(ts))
         wals = self.home / '.claude' / 'wals' / 's10'; wals.mkdir(parents=True)
-        main = [{'at': iso(now - 3000), 'event': 'subagent', 'agent_id': 'gp%d' % n, 'agent_type': 'general-purpose'} for n in range(self.cap + 2)]
+        main = [{'at': iso(now - 3000), 'event': 'subagent', 'agent_id': 'gp%d' % n, 'agent_type': 'general-purpose'} for n in range(10)]
         main.append({'at': iso(now - 3000), 'event': 'subagent', 'agent_id': 'rt1', 'agent_type': 'red-team'})
         main.append({'at': iso(now - 3000), 'event': 'subagent', 'agent_id': 'done1', 'agent_type': 'general-purpose'})
         main.append({'at': iso(now - 100), 'event': 'subagent_stop', 'agent_id': 'done1', 'agent_type': 'general-purpose'})
         (wals / 'main.jsonl').write_text(''.join(_json.dumps(r) + '\n' for r in main))
-        quiet = self.cap + 1
-        for n in range(self.cap + 2):  # the last one has been quiet for 25 minutes: still running, still an owner
-            age = 1500 if n == quiet else 60
+        for n in range(10):  # gp5 has been quiet for 9 minutes: still running, still an owner
+            age = 540 if n == 5 else 60  # 9 min quiet: still inside the idle window on main and after #157
             (wals / ('agent-gp%d.jsonl' % n)).write_text(_json.dumps({'at': iso(now - age), 'event': 'intent', 'note': 'work'}) + '\n')
         (wals / 'agent-rt1.jsonl').write_text(_json.dumps({'at': iso(now - 60), 'event': 'intent', 'note': 'review'}) + '\n')
         (wals / 'agent-done1.jsonl').write_text(_json.dumps({'at': iso(now - 200), 'event': 'result', 'note': 'finished'}) + '\n')
         owners = gate.live_owner_ids('s10', self.policy)
-        self.assertEqual(owners, ['gp%d' % n for n in range(self.cap + 2)])
+        self.assertEqual(owners, ['gp%d' % n for n in range(10)])
         reason, _ = gate.owner_cap_decision('s10', {'subagent_type': 'general-purpose'}, self.policy)
-        self.assertIn(self.full, reason or '')
+        self.assertIn('owner cap 8 reached', reason or '')
         self.assertIsNone(gate.owner_cap_decision('s10', {'subagent_type': 'red-team'}, self.policy)[0])
 
     def test_hook_denies_in_enforce_and_warn_mode_is_silent_on_allowed_spawns(self):
-        for n in range(self.cap):
+        for n in range(8):
             gate.live_update('s9', 'owner-%d' % n, start=True, agent_type='general-purpose')
 
         def run_hook(data, mode):

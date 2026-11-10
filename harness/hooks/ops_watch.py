@@ -100,7 +100,7 @@ def defaults(host: str) -> dict:
         "peers": [],
         # goodqa#15234: point events (a refused copy, a foreign process stop) describe something that happened, not a
         # condition that can stop being true, so nothing ever cleared them. They expire after ttl_h without a repeat.
-        "point_events": {"prefixes": ["heavy:", "ah-" + "kill:"], "ttl_h": 6},
+        "point_events": {"prefixes": ["heavy:", "ah-" + "kill:", "bgwait:"], "ttl_h": 6},  # bgwait: a waiter gave up (goodqa#15565)
         # goodqa#15070: timer jobs on other hosts, read over ssh: [{"host", "unit", "user": bool, "max_age_h"}]
         "remote_units": [],
         "sinks": {"comment": {"mode": "none"}, "deadman": [], "comment_min_interval_s": 1800},
