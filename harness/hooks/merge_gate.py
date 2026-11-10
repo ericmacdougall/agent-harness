@@ -37,6 +37,7 @@ import os
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -1807,6 +1808,184 @@ def touched_paths(tool_input):
     return paths
 
 
+def _edit_tool(payload):
+    """The canonical field is authoritative even when malformed; aliases cannot repair it."""
+    value = payload.get('tool_name') if 'tool_name' in payload else payload.get('toolName')
+    return value.lower() if isinstance(value, str) and value.isascii() else ''
+
+
+def _patch_paths(value):
+    if not isinstance(value, str) or len(value) > MAX_COMMAND_CHARS:
+        raise GateError('unsupported patch input')
+    lines = value.splitlines()
+    if (not 2 <= len(lines) <= 10000 or lines[0] != '*** Begin Patch'
+            or lines[-1] != '*** End Patch'):
+        raise GateError('incomplete patch envelope')
+    paths, operation, moved = [], None, False
+    for line in lines[1:-1]:
+        header = re.fullmatch(r'\*\*\* (Add|Update|Delete) File: (.+)', line)
+        if header:
+            operation, moved = header[1], False
+            paths.append(header[2])
+        elif line.startswith('*** Move to: '):
+            if operation != 'Update' or moved:
+                raise GateError('ambiguous patch move')
+            moved = True
+            paths.append(line[len('*** Move to: '):])
+        elif line == '*** End of File' and operation == 'Update':
+            pass
+        elif line.startswith('***') or operation is None:
+            raise GateError('unsupported patch header')
+        elif operation == 'Delete' and line:
+            raise GateError('unexpected delete body')
+        elif operation == 'Add' and not line.startswith('+'):
+            raise GateError('unsupported add body')
+        elif operation == 'Update' and line and not line.startswith((' ', '+', '-', '@@')):
+            raise GateError('unsupported update body')
+    if not paths or len(paths) > 128:
+        raise GateError('missing or excessive patch targets')
+    return paths
+
+
+def _edit_paths(tool, value):
+    if tool == 'apply_patch':
+        if isinstance(value, dict):
+            fields = [key for key in ('input', 'patch', 'command', 'cmd') if key in value]
+            if len(fields) != 1 or set(value) != set(fields):
+                raise GateError('ambiguous patch envelope')
+            value = value[fields[0]]
+        return _patch_paths(value)
+    if not isinstance(value, dict):
+        raise GateError('unsupported edit envelope')
+    fields = [key for key in ('file_path', 'path', 'notebook_path') if key in value]
+    if len(fields) > 1:
+        raise GateError('ambiguous edit target')
+    if 'edits' in value:
+        edits = value['edits']
+        if tool != 'multiedit' or not isinstance(edits, list) or not 1 <= len(edits) <= 128:
+            raise GateError('unsupported nested edits')
+        paths = []
+        for entry in edits:
+            if not isinstance(entry, dict) or 'edits' in entry:
+                raise GateError('unsupported nested edit')
+            nested = [key for key in ('file_path', 'path', 'notebook_path') if key in entry]
+            if fields:
+                if nested:
+                    raise GateError('conflicting nested edit target')
+            elif len(nested) == 1:
+                paths.append(entry[nested[0]])
+            else:
+                raise GateError('missing nested edit target')
+        return [value[fields[0]]] if fields else paths
+    if not fields:
+        raise GateError('missing edit target')
+    return [value[fields[0]]]
+
+
+def _effective_target(value, payload, *, home_form=False):
+    """Snapshot of lexical and resolved destinations, not an atomic write capability."""
+    if (not isinstance(value, str) or not value or len(value) > 4096
+            or value != value.strip() or CTRL.search(value)):
+        raise GateError('invalid edit target')
+    if value.startswith('~'):
+        if not home_form or not value.startswith('~/'):
+            raise GateError('ambiguous home expansion')
+        value = str(Path.home() / value[2:])
+    target = Path(value)
+    if not target.is_absolute():
+        cwd = payload.get('cwd')
+        # Native and Claude tool hooks supply the actual operation cwd. An absent
+        # value cannot be reconstructed from this guard's possibly different cwd.
+        if not isinstance(cwd, str) or not Path(cwd).is_absolute() or CTRL.search(cwd):
+            raise GateError('relative target needs an absolute operation cwd')
+        if not Path(cwd).is_dir():
+            raise GateError('operation cwd unavailable')
+        target = Path(cwd) / target
+    lexical = Path(os.path.normpath(str(target)))
+    try:
+        resolved = target.resolve(strict=False)
+        ancestor = target
+        while True:
+            try:
+                info = ancestor.stat()
+                break
+            except FileNotFoundError:
+                parent = ancestor.parent
+                if parent == ancestor:
+                    raise GateError('target parent unavailable')
+                ancestor = parent
+        if ancestor == target:
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise GateError('target is not a single-link regular file')
+        elif not stat.S_ISDIR(info.st_mode):
+            raise GateError('target parent is not a directory')
+    except (OSError, RuntimeError, ValueError) as error:
+        raise GateError('target resolution unavailable') from error
+    if any(STATE_NAMES.search(str(path)) for path in (target, lexical, resolved)):
+        raise GateError('protected state target')
+    return lexical, resolved
+
+
+_LITERAL_PART = r"(?:[A-Za-z0-9_./~:@%+=,\-]+|'[^'\x00]*'|\"(?:[^\"\\$`\x00]|\\[\"\\])*\")"
+_LITERAL_WORD = re.compile(_LITERAL_PART + '+')
+NATIVE_NOTE_EVENTS = {'intent', 'scope', 'decision', 'risk', 'check', 'commit', 'blocker', 'status', 'handoff', 'result'}
+
+
+def _native_note_data(command, payload):
+    """One exact literal note invocation, with no shell expansion, wrapper or second command."""
+    if len(command) > MAX_COMMAND_CHARS:
+        return False
+    words, raw_words, offset = [], [], 0
+    while offset < len(command):
+        if command[offset] in '\r\n':
+            return False  # outside a quoted word, a newline starts another shell command
+        if command[offset] in ' \t':
+            offset += 1
+            continue
+        match = _LITERAL_WORD.match(command, offset)
+        if not match or (match.end() < len(command) and not command[match.end()].isspace()):
+            return False
+        raw = match[0]
+        try:
+            decoded = shlex.split(raw)
+        except ValueError:
+            return False
+        if len(decoded) != 1:
+            return False
+        words.append(decoded[0]); raw_words.append(raw); offset = match.end()
+        if len(words) > 9:
+            return False
+    if len(words) != 9 or words[0] not in {'python3', 'python'} or words[2] != 'note':
+        return False
+    helper = Path.home() / '.codex' / 'agent-harness' / 'wal.py'
+    if words[1] != str(helper) and raw_words[1] != '~/.codex/agent-harness/wal.py':
+        return False
+    values = {}
+    for index in (3, 5, 7):
+        key = words[index]
+        if key not in {'--wal', '--event', '--note'} or key in values:
+            return False
+        values[key] = words[index + 1]
+    if (values.get('--event') not in NATIVE_NOTE_EVENTS or not values.get('--note', '').strip()
+            or values.get('--note', '').startswith('-') or len(values.get('--note', '')) > 4000):
+        return False
+    try:
+        helper_lexical, helper_real = _effective_target(str(helper), payload)
+        if helper_lexical != helper_real or not helper_real.is_file():
+            return False
+        lexical, resolved = _effective_target(values['--wal'], payload, home_form=True)
+        root = Path.home() / '.agent-harness' / 'codex-wals'
+        if lexical != resolved or lexical.parent.parent != root:
+            return False
+        session, filename = lexical.parent.name, lexical.name
+        if (not re.fullmatch(r'[A-Za-z0-9._-]{1,120}', session) or session in {'.', '..'}
+                or not re.fullmatch(r'main\.jsonl|agent-[A-Za-z0-9._-]{1,120}\.jsonl', filename)):
+            return False
+    except (GateError, KeyError, OSError, ValueError):
+        return False
+    return True
+
+
 def _shell_like(name):
     name = str(name or "").lower()
     return name in SHELL_TOOLS or name.startswith(("bash", "shell", "exec"))
@@ -1816,9 +1995,19 @@ def decide(payload, runner, state_dir, now=None):
     """(exit code, stderr text) for one PreToolUse payload."""
     state_dir = Path(state_dir)
     now = now if now is not None else time.time()
-    tool = str(payload.get("tool_name") or "")
+    tool = _edit_tool(payload)
     tool_input = payload.get("tool_input")
     subagent = bool(payload.get("agent_id"))
+    if ('tool_name' in payload and not tool
+            and _edit_tool({'toolName': payload.get('toolName')}) in WRITE_TOOLS):
+        return 2, "merge-gate: malformed canonical edit-tool identity."
+    if tool in WRITE_TOOLS:
+        try:
+            for path in _edit_paths(tool, tool_input):
+                _effective_target(path, payload)
+        except GateError:
+            return 2, "merge-gate: edit targets are protected, ambiguous or unavailable; supply complete ordinary-file targets."
+        return 0, ""
     paths = touched_paths(tool_input)
     if any(STATE_NAMES.search(p) for p in paths):
         return 2, "merge-gate: the waiver, audit and approval files are written only by merge_gate.py itself."
@@ -1827,7 +2016,7 @@ def decide(payload, runner, state_dir, now=None):
         if _shell_like(tool):
             return 2, "merge-gate: the shell command has a shape the gate cannot read; run it as one plain command string."
         return 0, ""
-    if not _shell_like(tool) and tool.lower() in WRITE_TOOLS:
+    if _native_note_data(command, payload):
         return 0, ""
     plain = re.sub(r"[\"'\\$]", "", command)  # w''aive, $M and escaped spellings
     if STATE_NAMES.search(command) or STATE_NAMES.search(plain):
