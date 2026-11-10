@@ -40,6 +40,8 @@ def score_at(scores, y, thr):
 if __name__ == "__main__":
     em = np.load(os.path.join(DATA_DIR, "emb.npz")); sp = np.load(os.path.join(DATA_DIR, "splits.npz"))
     yc, yh = sp["y_calib"].astype(int), sp["y_heldout"].astype(int)
+    drop = json.load(open(os.path.join(DATA_DIR, "drop.json")))
+    keep = np.ones(len(yc), bool); keep[drop["calib"]] = False   # duplicates of held-out/pool items
     out = {}
     runs = [json.loads(l) for l in open(sys.argv[1])]
     runs = [r for r in runs if r["cfg"]["strategy"] == "uncertainty" and r["cfg"]["suite"] == "main"]
@@ -54,13 +56,13 @@ if __name__ == "__main__":
             else:
                 cal, held = em["Z_calib"], em["Z_heldout"]
                 cald, heldd = em["Z_calib_drift"], em["Z_heldout_drift"]
-            t_rej = pick(cal, yc, prec=0.95); t_rev = pick(cal, yc, rec=0.90)
+            cal = cal[keep]; t_rej = pick(cal, yc[keep], prec=0.95); t_rev = pick(cal, yc[keep], rec=0.90)
             d = dict(seed=r["cfg"]["seed"] if getter else None, t_reject=t_rej, t_review=t_rev,
-                     calib_reject=score_at(cal, yc, t_rej), calib_review=score_at(cal, yc, t_rev),
+                     calib_reject=score_at(cal, yc[keep], t_rej), calib_review=score_at(cal, yc[keep], t_rev),
                      held_reject=score_at(held, yh, t_rej), held_review=score_at(held, yh, t_rev),
                      drift_reject_stale=score_at(heldd, yh[:N_DRIFT_HELD], t_rej),
                      drift_review_stale=score_at(heldd, yh[:N_DRIFT_HELD], t_rev))
-            yd = yc[:1000]
+            yd = yc[:1000][keep[:1000]]; cald = cald[keep[:1000]]
             tr2 = pick(cald, yd, prec=0.95); tv2 = pick(cald, yd, rec=0.90)
             d.update(t_reject_recal=tr2, t_review_recal=tv2,
                      drift_reject_recal=score_at(heldd, yh[:N_DRIFT_HELD], tr2),
