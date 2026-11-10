@@ -61,6 +61,78 @@ class BindingTests(unittest.TestCase):
         with self.assertRaises(OSError):
             review.verify_pr_binding("o/r", 5, HEAD, runner=FakePr(rc=1))
 
+    # GoodQA #15565: GitHub owner/repo names are ASCII and case-insensitive; the binding must match them that way
+    # and only that way (no Unicode folding, no prefix/suffix, github.com only).
+    REPO = "ericmacdougall/android-security"
+    PR_URL = "https://github.com/ericmacdougall/Android-security/pull/768"
+
+    def bind(self, expected, url, number=768, head=HEAD, **changes):
+        value = {"number": 768, "url": url, "headRefOid": HEAD, "state": "OPEN"}
+        value.update(changes)
+        return review.verify_pr_binding(expected, number, head, runner=FakePr(value))
+
+    def test_repo_case_differences_bind_to_the_same_repository(self):
+        accepted = (
+            (self.REPO, self.PR_URL),                                              # ParentProof PR 768
+            ("ericmacdougall/Android-security", "https://github.com/ericmacdougall/android-security/pull/768"),
+            ("EricMacDougall/ANDROID-SECURITY", "https://github.com/ericmacdougall/Android-Security/pull/768"),
+            (self.REPO, "https://github.com/ERICMACDOUGALL/ANDROID-SECURITY/pull/768"),
+        )
+        for expected, url in accepted:
+            with self.subTest(expected=expected, url=url):
+                self.assertEqual(self.bind(expected, url), {"repo": self.REPO, "pr": 768})
+
+    def test_case_insensitive_repo_match_keeps_every_other_check_strict(self):
+        rejected = (
+            ("different repo suffix", self.REPO, "https://github.com/ericmacdougall/Android-security2/pull/768", {}),
+            ("homoglyph digit", self.REPO, "https://github.com/ericmacdougall/Android-secur1ty/pull/768", {}),
+            ("fork-like suffix", self.REPO,
+             "https://github.com/ericmacdougall/android-security-fork/pull/768", {}),
+            ("other owner", self.REPO, "https://github.com/someoneelse/Android-security/pull/768", {}),
+            ("owner prefix", self.REPO, "https://github.com/ericmacdougall2/Android-security/pull/768", {}),
+            ("url pr number", self.REPO, "https://github.com/ericmacdougall/Android-security/pull/769", {}),
+            ("json pr number", self.REPO, self.PR_URL, {"number": 769}),
+            ("head", self.REPO, self.PR_URL, {"headRefOid": OTHER}),
+            ("closed", self.REPO, self.PR_URL, {"state": "CLOSED"}),
+            ("merged", self.REPO, self.PR_URL, {"state": "MERGED"}),
+            ("lookalike host suffix", self.REPO,
+             "https://github.com.evil.example/ericmacdougall/Android-security/pull/768", {}),
+            ("lookalike host typo", self.REPO, "https://githuh.com/ericmacdougall/Android-security/pull/768", {}),
+            ("uppercase host", self.REPO, "https://GITHUB.com/ericmacdougall/Android-security/pull/768", {}),
+            ("plain http", self.REPO, "http://github.com/ericmacdougall/Android-security/pull/768", {}),
+            ("userinfo host", self.REPO,
+             "https://github.com@evil.example/ericmacdougall/Android-security/pull/768", {}),
+            ("trailing path", self.REPO, self.PR_URL + "/files", {}),
+            ("trailing slash", self.REPO, self.PR_URL + "/", {}),
+            ("trailing newline", self.REPO, self.PR_URL + "\n", {}),
+            ("query", self.REPO, self.PR_URL + "?x=1", {}),
+            ("nested path", self.REPO,
+             "https://github.com/ericmacdougall/Android-security/x/pull/768", {}),
+            ("unicode digits in number", self.REPO,
+             "https://github.com/ericmacdougall/Android-security/pull/٧٦٨", {}),
+            # Unicode case rules must never widen equality: str.lower() maps KELVIN SIGN to "k",
+            # str.casefold() maps SHARP S to "ss"; dotless/dotted Turkish i must not become "i".
+            ("kelvin sign", "o/k", "https://github.com/o/K/pull/768", {}),
+            ("kelvin owner", "k/r", "https://github.com/K/r/pull/768", {}),
+            ("sharp s", "o/strasse", "https://github.com/o/straße/pull/768", {}),
+            ("dotless i", "o/ripo", "https://github.com/o/rıpo/pull/768", {}),
+            ("dotted capital I", "o/ripo", "https://github.com/o/RİPO/pull/768", {}),
+            ("long s", "o/sec", "https://github.com/o/ſec/pull/768", {}),
+        )
+        for label, expected, url, changes in rejected:
+            with self.subTest(label):
+                with self.assertRaises(OSError):
+                    self.bind(expected, url, **changes)
+        for label, expected in (("expected kelvin", "o/K"), ("expected sharp s", "o/straße"),
+                                ("expected path", "o/r/x"), ("expected url", "https://github.com/o/r")):
+            with self.subTest(label):
+                with self.assertRaises(OSError):
+                    self.bind(expected, "https://github.com/o/r/pull/768")
+        with self.subTest("requested head differs"), self.assertRaises(OSError):
+            self.bind(self.REPO, self.PR_URL, head=OTHER)
+        with self.subTest("requested number differs"), self.assertRaises(OSError):
+            self.bind(self.REPO, self.PR_URL, number=769)
+
     def test_only_pure_cross_harness_pr_pass_is_eligible(self):
         args = SimpleNamespace(stage="pr", author_harness="claude", main_stamp={"purpose": "review-auth"})
         binding = {"repo": "o/r", "pr": 5}
