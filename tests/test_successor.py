@@ -303,6 +303,19 @@ class Hardening(Case):
         self.assertEqual(out["status"], "ready")
         self.assertEqual(json.loads(head.read_text())["n"], 3)
 
+    def test_an_emptied_head_beside_rows_is_refused_but_two_empty_files_are_a_fresh_log(self):
+        self.kit()
+        self.succeed(live=8, cap=8, now=1000.0)
+        base = self.home / ".agent-harness/state/successor" / SESSION
+        (base / "requests.jsonl.head").write_text("")
+        with self.assertRaises(sc.SuccessorError) as cm:
+            self.succeed(live=0, cap=8, now=3000.0)
+        self.assertEqual(cm.exception.code, "log_inconsistent")
+        (base / "requests.jsonl").write_text("")  # both files empty: same as no state at all
+        self.assertTrue(sc.verify_log(self.home, SESSION))
+        self.assertEqual(self.succeed(live=0, cap=8, now=3000.0)["status"], "ready")
+        self.assertTrue(sc.verify_log(self.home, SESSION))
+
     def test_a_consistent_log_keeps_appending(self):
         self.kit()
         self.succeed(live=8, cap=8, now=1000.0)

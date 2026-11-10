@@ -191,9 +191,11 @@ def _consistent(home: Path, session: str):
     path = state_dir(home, session) / "requests.jsonl"
     head_path = _head_path(home, session)
     rows = read_requests(home, session)
-    if not head_path.exists():
+    # an absent or zero-byte head with an absent or zero-byte log is a fresh log (removing both files is the same act as
+    # deleting the state directory and is not detectable without an external anchor); a missing head beside rows is not
+    if not head_path.exists() or head_path.stat().st_size == 0:
         if rows or (path.exists() and path.stat().st_size):
-            return False, rows, "the head file is missing while the log holds rows"
+            return False, rows, "the head file is missing or empty while the log holds rows"
         return True, rows, ""
     try:
         head = json.loads(head_path.read_text(encoding="utf-8"))
