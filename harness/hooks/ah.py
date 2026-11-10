@@ -2786,8 +2786,9 @@ def asks_view(home: Path, session=None, every: bool = False, now=None) -> dict:
         per_wal = {}
         for rec in records:
             per_wal[rec["_wal"]] = per_wal.get(rec["_wal"], 0) + 1
-        # the shared reader reads at most MAX_HITS ask and MAX_HITS ask_resolved lines per WAL: later ones are unseen
-        limited = limited or any(n >= prov.MAX_HITS for n in per_wal.values())
+        # the ledger reads at most LEDGER_MAX_HITS ask and ask_resolved lines per WAL: later ones would be unseen
+        cap = getattr(prov, "LEDGER_MAX_HITS", prov.MAX_HITS)
+        limited = limited or any(n >= cap for n in per_wal.values())
         for rec in records:
             total += 1
             if time.monotonic() > deadline:
