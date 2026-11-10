@@ -176,6 +176,26 @@ def find_self_matching_wait(segments):
     return None
 
 
+FILE_TEST = re.compile(r"(?:\[\[?\s+!?\s*-[fesrdL]\s+\S+|\btest\s+!?\s*-[fesrdL]\s+\S+|\bls\s+(?:-\S+\s+)*\S+\s*(?:>|2>|\|))")
+LOOP_BOUND = re.compile(r"\btimeout\b|\bSECONDS\b|date\s+\+?%?s|\$\(\(|\(\(|\bseq\b|\bexpr\b|\blet\b|\{1\.\.\d+\}|-(?:lt|le|gt|ge)\b|"
+                        r"\bdeadline\b|\bmax_?(?:wait|tries|iter\w*)\b|\bkill\s+-0\b|\binotifywait\s+(?:-\S+\s+)*-t\b|\bpgrep\b", re.IGNORECASE)
+
+
+def find_unbounded_file_wait(segments):
+    """A while/until loop that sleeps until a file exists, with no deadline in the loop (GoodQA #15565: a waiter sat 12 h
+    on a file nothing produced). The loop must name its producer and give up: bg_job.py wait-file does both."""
+    texts = [t for _, t in segments]
+    loop_head = next((i for i, t in enumerate(texts) if re.match(r"^(while|until)\b", t)), None)
+    last_done = max((i for i, t in enumerate(texts) if first_word(t) == "done"), default=None)
+    if loop_head is None or last_done is None or last_done < loop_head:
+        return None
+    head = texts[loop_head]
+    body = " ".join(texts[loop_head:last_done + 1])
+    if not re.search(r"\bsleep\b|inotifywait", body) or not FILE_TEST.search(head) or LOOP_BOUND.search(body):
+        return None
+    return head[:60]
+
+
 MAX_SUBST_SCAN = 4096
 MAX_SUBST_MATCHES = 200
 
@@ -246,6 +266,14 @@ def lint(command, _depth=0):
                                         "is the exception). Use the bracket trick (`%s`), wait on a PID (`kill -0 $PID` "
                                         "or `bg_job.py wait`), or poll for an exit file written by the job "
                                         "(`cmd; echo $? > done.txt`)." % hit))
+    hit = find_unbounded_file_wait(segments)
+    if hit:
+        out.append(("file-wait-unbounded", "This loop (`%s`) waits for a file with no deadline and does not check that "
+                                           "anything is still producing it, so it can wait for ever on a file nothing "
+                                           "writes (a waiter sat 12 h this way). Use `python3 ~/.claude/hooks/bg_job.py "
+                                           "wait-file --file F --producer job:NAME|pid:N --timeout S`: it names the "
+                                           "producer, stops when the producer is gone or time runs out, and raises an "
+                                           "alert." % hit))
     hit = find_pipestatus_after_substitution(command)
     if hit:
         out.append(("pipestatus", "PIPESTATUS is read after a command-substitution assignment (`%s`); it holds only "
