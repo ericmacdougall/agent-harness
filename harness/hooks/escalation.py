@@ -612,11 +612,18 @@ _FILLER = r"^(?:(?:ok|okay|yes|yeah|yep|so|and|then|also|please|just|now)[,\s]+)
 _OBJECT = r"(?:the|this|that|it|its|a|an|my|our|these|those|all|every|each|both|task)"
 _ACTION = (r"(?:do|handle|take\s+over|lead|start|own|design|build|write|run|review|fix|rescue|implement|try|code|draft|"
            r"redo|refactor|debug|test|ship|tackle|finish|work\s+on|go\s+ahead\s+with)")
-_ASKER = _FILLER + r"(?:i\s+(?:just\s+|really\s+|also\s+)*want|have|want|get|run)(?:\s+[\w'/-]+){0,2}?\s+" + _MODEL + r"(?:/[\w-]+)?"
+# Codex review of 09ff454 (r8), F1: only a supported model-name form may sit between the asker and the name: an
+# optional "the", then a vendor or harness word fused by a space ("codex astra", "claude fable", "gpt astra") or any
+# lower model fused by a slash ("opus/fable"). Arbitrary words let "run sonnet replacing fable ..." through.
+_VENDOR = r"(?:codex|claude|gpt[\w.-]*|openai|anthropic)"
+_LOWER_NAME = r"(?:sonnet|opus|haiku|codex|gpt[\w.-]*|kimi|gemini|grok|sol)"
+_FUSED_PREFIX = r"(?:the\s+)?(?:" + _VENDOR + r"\s+|" + _LOWER_NAME + r"\s*/\s*)?"
+_ASKER = (_FILLER + r"(?:i\s+(?:just\s+|really\s+|also\s+)*want|have|want|get|run)\s+" + _FUSED_PREFIX + _MODEL +
+          r"(?:/[\w-]+)?")
 TOP_REQUEST_NEAR = re.compile(
     _ASKER + r"(?=\s+(?:to\s+)?(?:" + _ACTION + r"\s+" + _OBJECT + r"|take\s+over)\b)", re.I)
 TOP_REQUEST_ON = re.compile(
-    _FILLER + r"(?:i\s+(?:just\s+|really\s+|also\s+)*want|want|get|run)(?:\s+[\w'/-]+){0,2}?\s+" + _MODEL + r"(?:/[\w-]+)?"
+    _FILLER + r"(?:i\s+(?:just\s+|really\s+|also\s+)*want|want|get|run)\s+" + _FUSED_PREFIX + _MODEL + r"(?:/[\w-]+)?"
     r"(?=\s+(?:on|for)\s+" + _OBJECT + r"\b)", re.I)
 TOP_CAN = re.compile(
     _FILLER + r"(?:(?:opus|sonnet|codex|haiku)(?:\s*[/,]\s*|\s+(?:and|or)\s+))*" + _MODEL +
@@ -643,8 +650,19 @@ TOP_IDLE_VERB = re.compile(_MODEL + r"(?:/[\w-]+)?\s+(?:(?:to|can|could|should|w
 _CLAUSES = re.compile(r"\s*[,;:()\u2013\u2014]\s*|\s+-\s+|\s+(?:and|but|then|so|or|while|whereas|plus)\s+(?=(?:i|we|you|they|"
                       r"let'?s|let|please|just|also|now|have|get|run|use|using|pass|give|switch|try|go|put|bring|enable|"
                       r"escalate|allow|approve\w*|want|keep|make|tell|ask)\b)", re.I)
-_LOWER = re.compile(r"\b(?:sonnet|opus|haiku|codex|gpt[\w.-]*|kimi|gemini|grok|sol)\b", re.I)
-_LOWER_FUSED = re.compile(r"\b(?:sonnet|opus|haiku|codex|gpt[\w.-]*|kimi)\s*[/\s]\s*$", re.I)
+_LOWER = re.compile(r"\b" + _LOWER_NAME + r"\b", re.I)
+_LOWER_FUSED = re.compile(r"\b(?:" + _LOWER_NAME + r"\s*/\s*|" + _VENDOR + r"\s+)$", re.I)
+# Codex r8 F1: the binding gate every route must pass. In each clause that names the top rung, every other model
+# named must be fused to it ("codex astra", "opus/fable", "fable/opus", "fable and opus"); any other lower model
+# in that clause ("run sonnet replacing fable") means the sentence is about that model, not the top rung.
+_AFTER_MODEL = r"(?:(?<=fable)|(?<=astra)|(?<=rung)|(?<=model)|(?<=tier))"
+_FUSED_FORMS = re.compile(r"\b(?:" + _LOWER_NAME + r"\s*/\s*|" + _VENDOR + r"\s+|" + _LOWER_NAME + r"\s+(?:and|or)\s+)(?=" +
+                          _MODEL + r"\b)|" + _AFTER_MODEL + r"(?:\s*/\s*|\s+(?:and|or)\s+)" + _LOWER_NAME + r"\b",
+                          re.I)
+# Substitution and replacement constructions name the top rung as the thing being displaced.
+TOP_SUBSTITUTE = re.compile(r"\b(?:replac\w*|instead|rather\s+than|in\s+(?:place|lieu)\s+of|swap\w*|switch\w*\s+(?:from|away|back)|"
+                            r"substitut\w*|besides|except|other\s+than|ahead\s+of|versus|vs|fallback|backup|"
+                            r"(?<!take\s)(?<!takes\s)(?<!taking\s)(?<!took\s)over)\b", re.I)
 
 
 def _bound_request(sentence):
@@ -662,7 +680,22 @@ def _bound_request(sentence):
 
 
 _SENTENCES = re.compile(r"(?<=[.!?;])\s+|\n+")
-TOP_RETRACT = re.compile(r"\b(?:never ?mind|scratch that|forget (?:it|that)|hold (?:on|off)|belay)\b", re.I)
+TOP_RETRACT = re.compile(r"\b(?:never ?mind|scratch\w*|scrap\w*|forget (?:it|that)|hold (?:on|off)|belay|undo\w*|ignor\w*|"
+                         r"disregard\w*|abort\w*|rescind\w*|withdraw\w*|revert\w*|call (?:it|that) off)\b", re.I)
+
+
+def _binds(sentence):
+    """Codex r8 F1: True when no clause naming the top rung also names a lower model that is not fused to it."""
+    for clause in _CLAUSES.split(sentence):
+        if TOP_TERMS.search(clause) and _LOWER.search(_FUSED_FORMS.sub(' ', clause)):
+            return False
+    return True
+
+
+def _refuses(sentence):
+    """Codex r8 F2: one refusal and withdrawal predicate for the assenting sentence and every later sentence."""
+    return any(rule.search(sentence) for rule in (TOP_NEGATION, TOP_NEGATION_NEW, TOP_INACTIVE, TOP_IDLE_VERB,
+                                                   TOP_RETRACT, TOP_SUBSTITUTE))
 
 
 def top_assent(text):
@@ -679,7 +712,12 @@ def top_assent(text):
 
     Codex review of 9221bb9 (F1/F2): the request must name the top rung in its own clause ("have fable do nothing,
     run sonnet for the rescue" asks for sonnet), and any refusal or inactivity word in the sentence or a later one
-    (nothing, zero, a break, sit out, pass, idle ...) refuses it whatever other clauses say."""
+    (nothing, zero, a break, sit out, pass, idle ...) refuses it whatever other clauses say.
+
+    Codex review of 09ff454 (r8): every route (plain, have/want/get/run, can) passes one binding gate (no unfused
+    lower model in the top rung's clause, so "run sonnet replacing fable ..." is about sonnet), and one refusal
+    predicate (negations, conditions, inactivity, substitutions, withdrawals such as "pause that", "hold it",
+    "ignore that") runs on the assenting sentence and on every later sentence."""
     sentences = [part.strip() for part in _SENTENCES.split(text or '') if part.strip()]
     mentions = [index for index, sentence in enumerate(sentences) if TOP_TERMS.search(sentence)]
     if not mentions:
@@ -687,13 +725,10 @@ def top_assent(text):
     candidate = sentences[mentions[-1]]
     plain = _bound_request(candidate)
     strict = TOP_REQUEST_NEAR.search(candidate) or TOP_REQUEST_ON.search(candidate) or TOP_CAN.search(candidate)
-    if '?' in candidate or not (plain or strict) or TOP_NEGATION.search(candidate):
-        return None
-    if TOP_NEGATION_NEW.search(candidate) or TOP_INACTIVE.search(candidate) or TOP_IDLE_VERB.search(candidate):
-        return None  # Codex F1/F2: a refusal or inactivity anywhere in the sentence wins over request words elsewhere
-    for later in sentences[mentions[-1] + 1:]:
-        if TOP_NEGATION.search(later) or TOP_RETRACT.search(later) or TOP_INACTIVE.search(later):
-            return None
+    if '?' in candidate or not (plain or strict) or not _binds(candidate):
+        return None  # Codex r8 F1: the binding gate applies to the result of every route
+    if _refuses(candidate) or any(_refuses(later) for later in sentences[mentions[-1] + 1:]):
+        return None  # Codex F1/F2 and r8 F2: a refusal, withdrawal or inactivity here or later wins
     return candidate
 
 
