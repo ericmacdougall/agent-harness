@@ -128,8 +128,10 @@ class NodePaths(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=WORK) as d:
             root=Path(d); repo=root/'repo'; repo.mkdir()
             (repo/'bin').symlink_to(native.parent,target_is_directory=True)
-            with self.assertRaises(il.CheckInterpreterError):
-                il.resolve_node({'PATH':str(repo/'bin')},repo)
+            sibling=root/'sibling'; sibling.mkdir()
+            for directory in (repo/'bin', sibling/'..'/'repo'/'bin'):
+                with self.subTest(directory=str(directory)),self.assertRaises(il.CheckInterpreterError):
+                    il.resolve_node({'PATH':str(directory)},repo)
             external=root/'external'; external.mkdir(); (external/'node').symlink_to(native)
             self.assertEqual(il.resolve_node({'PATH':str(external)},repo),str(native))
 

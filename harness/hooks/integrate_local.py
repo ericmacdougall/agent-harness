@@ -236,11 +236,12 @@ def resolve_node(env, repo=None, timeout=30):
     try:
         if found is None:
             raise OSError()
-        candidate = Path(found).absolute()
+        # Normalize lexical equivalence without resolving away repo-owned links.
+        candidate = Path(os.path.abspath(found))
         path = Path(found).resolve(strict=True)
         if repo is not None:
             root = Path(repo).resolve()
-            if (candidate.is_relative_to(root) or candidate.is_relative_to(Path(repo).absolute())
+            if (candidate.is_relative_to(root) or candidate.is_relative_to(Path(os.path.abspath(repo)))
                     or path.is_relative_to(root)
                     or (candidate.parent.resolve() / candidate.name).is_relative_to(root)):
                 raise OSError()
