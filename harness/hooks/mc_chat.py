@@ -71,8 +71,8 @@ def chat_dir(root: Path | None = None) -> Path:
 
 def ensure_dirs(root: Path | None = None) -> Path:
     root = root or home()
-    for sub in ("", "chat", "chat/inbox", "chat/outbox", "chat/state", "chat/queue", "chat/claims", "chat/keys",
-                "chat/targets", "chat/blocks"):
+    for sub in ("", "chat", "chat/inbox", "chat/outbox", "chat/state", "chat/queue", "chat/claims", "chat/answered",
+                "chat/keys", "chat/targets", "chat/blocks"):
         path = root / sub if sub else root
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         if path.is_symlink():
@@ -101,9 +101,14 @@ def _mark(path: Path) -> None:
             os.close(os.open(path, flags, 0o600))
             return
         except FileExistsError:
-            if stat.S_ISREG(os.lstat(path).st_mode):
-                return
-            os.unlink(path)
+            try:
+                if stat.S_ISREG(os.lstat(path).st_mode):
+                    return
+                os.unlink(path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:  # a directory squatting the name, for example
+                raise ChatError("unsafe-path", f"{path.name} is held by a non-regular file") from exc
     raise ChatError("unsafe-path", f"{path.name} keeps reappearing as a non-regular file")
 
 
@@ -317,15 +322,59 @@ def claim(msg_id: str, root: Path | None = None) -> bool:
         return False
     folder = chat_dir(root) / "claims"
     os.makedirs(folder, mode=0o700, exist_ok=True)
-    try:
-        os.close(os.open(folder / msg_id, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-                         | getattr(os, "O_NONBLOCK", 0), 0o600))
-    except FileExistsError:
-        return False
-    if state(msg_id, root).get("status") != "queued":
+    path = folder / msg_id
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    for attempt in range(2):
+        try:
+            os.close(os.open(path, flags, 0o600))
+            break
+        except FileExistsError:
+            # A claim takes milliseconds to settle. One older than CLAIM_STALE_S whose message is still queued was
+            # left by a process that died mid-claim: drop it and contend again (the exclusive create still decides).
+            if attempt or not _stale_claim(path, msg_id, root):
+                return False
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+    if state(msg_id, root).get("status") != "queued" or answered_marked(msg_id, root):
         return False  # a stale marker (crash between state write and unlink): never reopen settled work
     set_state(msg_id, "delivered", root=root)
+    if answered_marked(msg_id, root):  # a final reply landed between the check and the write: keep it answered
+        set_state(msg_id, "answered", root=root)
     return True
+
+
+CLAIM_STALE_S = 60
+
+
+def _stale_claim(path: Path, msg_id: str, root: Path) -> bool:
+    try:
+        age = time.time() - os.lstat(path).st_mtime
+    except FileNotFoundError:
+        return True
+    return age > CLAIM_STALE_S and state(msg_id, root).get("status") == "queued" and not answered_marked(msg_id, root)
+
+
+def answered_marked(msg_id: str, root: Path | None = None) -> bool:
+    return os.path.lexists(chat_dir(root or home()) / "answered" / msg_id)
+
+
+def _take_answer(msg_id: str, reply_id: str, root: Path, *, allow_same: bool) -> None:
+    """The one final answer per message: an O_EXCL create of chat/answered/<id> holding the reply id. A streamed
+    reply finalising its own reply id may pass again; any other second final reply is refused."""
+    path = chat_dir(root) / "answered" / msg_id
+    os.makedirs(path.parent, mode=0o700, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        held = read_json(path)
+        if allow_same and isinstance(held, dict) and held.get("reply") == reply_id:
+            return
+        raise ChatError("answered", "that message already has a final reply")
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps({"reply": reply_id}) + "\n")
 
 
 def load(msg_id: str, root: Path | None = None):
@@ -370,20 +419,24 @@ def pending(to: str, session: str | None = None, root: Path | None = None) -> li
     and never returned."""
     root = root or home()
     try:
-        names = sorted(n for n in os.listdir(chat_dir(root) / "queue") if ID_RE.match(n))[:QUEUE_SCAN_MAX]
+        names = sorted(n for n in os.listdir(chat_dir(root) / "queue") if ID_RE.match(n))
         secret(root, create=False)
     except (OSError, ChatError):
         return []  # no queue yet, or no readable secret: deliver nothing and mark nothing
-    out = []
+    out, scanned = [], 0
     for msg_id in names:
         status = state(msg_id, root).get("status")
         if status != "queued":
-            if status in STATUSES:  # a stale marker for settled work: drop it, never redeliver
-                try:
-                    os.unlink(chat_dir(root) / "queue" / msg_id)
-                except FileNotFoundError:
-                    pass
+            # Settled work, or a marker with no state at all (set_state writes the state before the marker, so
+            # that is never transient): drop it, so junk markers can neither be redelivered nor fill the window.
+            try:
+                os.unlink(chat_dir(root) / "queue" / msg_id)
+            except OSError:
+                pass
             continue
+        scanned += 1
+        if scanned > QUEUE_SCAN_MAX:
+            break
         try:
             record = load(msg_id, root)
         except ChatError:
@@ -431,9 +484,12 @@ def write_reply(reply_to: str, sender: str, text: str, *, final: bool = True, re
     text = _redact(text.replace("\x00", ""))[:64 * 1024]
     if final and not text.strip():
         raise ChatError("empty", "reply text is empty")
+    streamed = reply_id is not None
     reply_id = reply_id or ("reply-" + ulid())
     if not REPLY_RE.match(reply_id):
         raise ChatError("bad-reply-id", reply_id)
+    if final:
+        _take_answer(reply_to, reply_id, root, allow_same=streamed)
     reply = {"schema": SCHEMA, "id": reply_id, "from": sender, "origin": sender, "to": "user",
              "reply_to": reply_to, "session": record.get("session"), "thread": record.get("thread"),
              "text": text, "final": bool(final), "created": now_iso()}

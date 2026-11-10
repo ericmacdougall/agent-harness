@@ -224,6 +224,68 @@ class Delivery(Base):
         mc_chat.ensure_dirs()
         self.assertEqual([r["id"] for r in mc_chat.pending("claude", SID)], [record["id"]])
 
+    def test_junk_markers_cannot_hide_a_real_message(self):  # delta J1
+        self.attach()
+        for n in range(mc_chat.QUEUE_SCAN_MAX + 20):
+            (self.root / "chat" / "queue" / f"dash-0{n:025d}").touch()
+        record, _ = self.send()
+        self.assertEqual([r["id"] for r in mc_chat.pending("claude", SID)], [record["id"]])
+        self.assertEqual(sorted(n for n in os.listdir(self.root / "chat" / "queue") if not n.startswith(".")),
+                         [record["id"]], "junk markers are dropped")
+
+    def test_an_orphaned_claim_goes_stale_and_the_message_is_delivered(self):  # delta O1
+        self.attach()
+        record, _ = self.send()
+        orphan = self.root / "chat" / "claims" / record["id"]
+        orphan.touch()
+        self.assertFalse(mc_chat.claim(record["id"]), "a fresh claim is respected")
+        old = time.time() - mc_chat.CLAIM_STALE_S - 5
+        os.utime(orphan, (old, old))
+        self.assertTrue(mc_chat.claim(record["id"]))
+        self.assertEqual(mc_chat.state(record["id"])["status"], "delivered")
+        self.assertFalse(mc_chat.claim(record["id"]))
+
+    def test_a_reply_racing_the_claim_stays_answered_once(self):  # delta R1
+        self.attach()
+        record, _ = self.send()
+        real_state = mc_chat.state
+        raced = []
+
+        def state_then_reply(msg_id, root=None):
+            value = real_state(msg_id, root)
+            if not raced and value.get("status") == "queued":
+                raced.append(True)
+                mc_chat.write_reply(record["id"], "claude", "answer one")  # lands between check and write
+            return value
+
+        with mock.patch.object(mc_chat, "state", state_then_reply):
+            mc_chat.claim(record["id"])
+        self.assertEqual(raced, [True])
+        self.assertEqual(mc_chat.state(record["id"])["status"], "answered")
+        with self.assertRaises(mc_chat.ChatError) as caught:
+            mc_chat.write_reply(record["id"], "claude", "answer two")
+        self.assertEqual(caught.exception.code, "answered")
+
+    def test_a_directory_squatting_a_marker_is_a_clean_refusal(self):  # delta D1
+        self.attach()
+        msg_id = "dash-" + mc_chat.ulid()
+        (self.root / "chat" / "queue" / msg_id).mkdir()
+        (self.root / "chat" / "queue" / msg_id / "x").touch()
+        with self.assertRaises(mc_chat.ChatError) as caught:
+            mc_chat.set_state(msg_id, "queued")
+        self.assertEqual(caught.exception.code, "unsafe-path")
+
+    def test_a_streamed_reply_can_finalise_its_own_id_but_not_another(self):
+        self.attach()
+        record, _ = mc_chat.new_message("codex", "stream please", client_key="key-stream-01")
+        mc_chat.claim(record["id"])
+        rid = "reply-" + mc_chat.ulid()
+        mc_chat.write_reply(record["id"], "codex", "part", final=False, reply_id=rid)
+        mc_chat.write_reply(record["id"], "codex", "whole", final=True, reply_id=rid)
+        with self.assertRaises(mc_chat.ChatError):
+            mc_chat.write_reply(record["id"], "codex", "other", final=True, reply_id="reply-" + mc_chat.ulid())
+        self.assertEqual(mc_chat.state(record["id"])["status"], "answered")
+
     def test_read_without_a_secret_is_a_clean_refusal(self):
         self.attach()
         record, _ = self.send()
