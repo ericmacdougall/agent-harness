@@ -61,6 +61,7 @@ export function owners(rows, items = []) {
       type: str(r.type, 40), task: str(r.task, 200) || (r.runtime === 'codex' ? 'Codex session' : 'Owner'), ticket: str(r.ticket, 60),
       state: str(r.state, 24) || 'unknown', ...ownerHold(r, last),
       last_item: { at, active, event: str(last?.event, 40), note: str(last?.note, 200) || 'No work item recorded yet' },
+      progress: validIso(last?.progress_at) ? { at: last.progress_at, event: str(last.progress_event, 40), note: str(last.progress_note, 160) } : null,
       initiative_id: linked ? linked.id : null,
     };
   });
@@ -199,4 +200,51 @@ export function replyStatus(message, time, gap) {
   if (base[message.status]) return base[message.status];
   const read = message.read_at ? `Read by main at ${time(message.read_at)} (${gap(message.ts, message.read_at)})` : 'Read by main';
   return read + ({ answering: ' · answering', answered: ' · answered' }[message.status] || '');
+}
+
+// ---- slowest / at risk: mission goals ranked by time since REAL progress (an owner's result, check, commit, deploy,
+// merge, release or handoff, or a push to the ticket's branch), not by any note. UNCOVERED (no working owner and no
+// recorded disposition) comes first. Derived from ah owners plus initiatives.json until the harness mission-coverage
+// check publishes its own verdicts; `coverage` (id -> {status, reason, action}) overrides when present.
+export const STALLED_AFTER_MS = 90 * 60 * 1000;
+const FINISHED = /\b(done|live|complete|completed|shipped|cancel+ed|parked|on hold)\b/i;
+export function atRisk(initiatives = [], owners = [], events = [], now = Date.now(), coverage = null, limit = 6) {
+  const rows = [];
+  for (const item of initiatives) {
+    if (!item || FINISHED.test(item.state || '')) continue;
+    const key = ticketKey(item.ticket);
+    const number = (key.match(/#(\d+)$/) || [])[1] || '';
+    const linked = owners.filter(o => o.initiative_id === item.id || (key && ticketKey(o.ticket) === key));
+    const working = linked.filter(o => ['live', 'working', 'quiet'].includes(o.state));
+    // a live decision that keeps the goal covered (waiting on a named thing, resumed, reassigned); closed/superseded/
+    // wontdo end that owner's work, not the goal, so they do not cover it
+    const decided = linked.map(o => o.disposition).find(d => d && ['waiting', 'resumed', 'reassigned'].includes(d.kind));
+    const branchHas = number ? new RegExp(`(^|\\D)${number}(\\D|$)`) : null;
+    const pushes = branchHas ? events.filter(e => ['push', 'deploy', 'release'].includes(e.kind) && branchHas.test(e.subject?.branch || '')) : [];
+    const stamps = [...linked.map(o => o.progress && { at: o.progress.at, what: `${o.progress.event} by ${o.name}` }),
+      ...pushes.map(e => ({ at: e.ts, what: e.kind }))]
+      .filter(s => s && Number.isFinite(Date.parse(s.at)) && Date.parse(s.at) <= now + 120000);
+    const last = stamps.sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0] || null;
+    const since = last ? now - Date.parse(last.at) : Infinity;
+    let status, reason;
+    if (!working.length && !decided) {
+      status = 'uncovered';
+      reason = linked.length ? `no working owner (${linked.map(o => `${o.name} ${o.state}`).join(', ')}) and no recorded decision` : 'no owner and no recorded decision';
+    } else if (since > STALLED_AFTER_MS) {
+      status = 'stalled';
+      reason = last ? `no real progress since ${last.what}` : 'no result, commit or deploy recorded yet';
+    } else {
+      status = 'moving';
+      reason = `last progress: ${last.what}`;
+    }
+    const action = decided ? `${decided.kind}${decided.reason ? `: ${decided.reason}` : ''}` : '';
+    const external = coverage && typeof coverage === 'object' ? coverage[item.id] || coverage[key] : null;
+    if (external && ['uncovered', 'stalled', 'moving'].includes(external.status)) {
+      status = external.status; reason = str(external.reason, 200) || reason;
+    }
+    rows.push({ id: item.id, initiative: item.initiative, ticket: item.ticket, status, reason,
+      action: (external && str(external.action, 200)) || action, last: last ? last.at : null, since });
+  }
+  const order = { uncovered: 0, stalled: 1, moving: 2 };
+  return rows.sort((a, b) => order[a.status] - order[b.status] || b.since - a.since).slice(0, limit);
 }

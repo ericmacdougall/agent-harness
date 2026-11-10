@@ -222,3 +222,38 @@ test('a replied ask header follows main: waiting, read, replied; the status line
   assert.equal(status, 'Read by main at 06:39 PM (5 s after you sent it) · answered');
   assert.equal(adapt.replyStatus({ status: 'queued' }, String, String), 'Sent · waiting for main to read it');
 });
+
+test('slowest / at risk: uncovered first, then stalled by oldest real progress; notes are not progress', () => {
+  const now = Date.parse('2026-11-10T06:00:00Z');
+  const initiatives = [
+    { id: 'leads', initiative: 'Leads', ticket: 'goodqa#1', state: 'In progress' },
+    { id: 'pay', initiative: 'Payments', ticket: 'goodqa#2', state: 'In progress' },
+    { id: 'docs', initiative: 'Docs', ticket: 'goodqa#3', state: 'In progress' },
+    { id: 'old', initiative: 'Old', ticket: 'goodqa#4', state: 'Done' },
+    { id: 'held', initiative: 'Held', ticket: 'goodqa#5', state: 'Blocked' },
+    { id: 'closed', initiative: 'Closed owner', ticket: 'goodqa#6', state: 'In progress' },
+  ];
+  const owner = (name, ticket, state, progressAt, extra = {}) => ({ agent_id: name, name, ticket, state, runtime: 'claude',
+    last_item: { at: '2026-11-10T05:59:00Z', active: '2026-11-10T05:59:00Z', note: 'busy note' },
+    progress: progressAt ? { at: progressAt, event: 'commit', note: '' } : null, disposition: null, ...extra });
+  const owners = [
+    owner('p1', 'goodqa#2', 'working', '2026-11-10T01:00:00Z'),        // covered, 5 h since progress, busy notes
+    owner('d1', 'goodqa#3', 'working', '2026-11-10T05:30:00Z'),        // moving
+    owner('h1', 'goodqa#5', 'DROPPED', null, { disposition: { kind: 'waiting', reason: 'on user Stripe step' } }),
+    owner('c1', 'goodqa#6', 'DROPPED', '2026-11-10T05:50:00Z', { disposition: { kind: 'closed', reason: 'done with slice' } }),
+  ];
+  const rows = adapt.atRisk(initiatives, owners, [], now);
+  assert.deepEqual(rows.map(r => [r.id, r.status]), [
+    ['leads', 'uncovered'], ['closed', 'uncovered'], ['held', 'stalled'], ['pay', 'stalled'], ['docs', 'moving']]);
+  assert.match(rows[0].reason, /no owner and no recorded decision/);
+  assert.equal(rows[0].action, '');                       // shown as "Main: no action recorded"
+  assert.equal(rows[2].action, 'waiting: on user Stripe step');
+  assert.match(rows[3].reason, /commit by p1/);
+  // a push to the ticket's branch is progress
+  const pushed = adapt.atRisk(initiatives, owners, [{ kind: 'push', ts: '2026-11-10T05:55:00Z', subject: { branch: 'feat/x-2' } }], now);
+  assert.equal(pushed.find(r => r.id === 'pay').status, 'moving');
+  // the harness coverage check, once it publishes, overrides the derived verdict
+  const override = adapt.atRisk(initiatives, owners, [], now, { docs: { status: 'stalled', reason: 'coverage check', action: 'reassigning' } });
+  const docs = override.find(r => r.id === 'docs');
+  assert.deepEqual([docs.status, docs.action], ['stalled', 'reassigning']);
+});

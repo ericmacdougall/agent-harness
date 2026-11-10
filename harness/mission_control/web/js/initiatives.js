@@ -1,10 +1,40 @@
 import { getState, subscribe, select, highlight } from './store.js';
 import { el, button, progress, checklist, eta, stateClass, age } from './ui.js';
-import { liveFields } from './adapt.js';
+import { liveFields, atRisk } from './adapt.js';
+
+const LABEL = { uncovered: 'UNCOVERED', stalled: 'STALLED', moving: 'moving' };
+function sinceText(row, now) {
+  if (!row.last) return 'no progress recorded';
+  return `progress ${age(row.last, now)}`;
+}
+// The strip that answers "what is moving slowest" without being asked: UNCOVERED first, then STALLED, oldest progress
+// first, each with why and what main is doing about it. "No action recorded" is shown as a problem, not hidden.
+function renderAtRisk(state) {
+  const box = document.getElementById('at-risk-list');
+  if (!box) return;
+  const rows = atRisk(state.initiatives, state.owners, state.events, state.now, state.coverage || null);
+  const fragment = document.createDocumentFragment();
+  for (const row of rows) {
+    const item = el('li', `at-risk-item ${row.status}`);
+    const top = el('div', 'at-risk-top');
+    top.append(el('span', `at-risk-badge ${row.status}`, LABEL[row.status]), el('span', 'ticket-id', row.ticket || 'no ticket'),
+      el('span', 'at-risk-since', sinceText(row, state.now)));
+    const title = button('at-risk-title', row.initiative || row.id, () => select('initiative', row.id));
+    title.setAttribute('aria-label', `${LABEL[row.status]}: ${row.initiative}. Open details`);
+    const action = el('p', `at-risk-action${row.action ? '' : ' none'}`, row.action ? `Main: ${row.action}` : 'Main: no action recorded');
+    item.append(top, title, el('p', 'at-risk-reason', row.reason), action);
+    fragment.append(item);
+  }
+  if (!rows.length) fragment.append(el('li', 'empty-state', 'Nothing open to rank.'));
+  box.replaceChildren(fragment);
+  const flagged = rows.filter(r => r.status !== 'moving').length;
+  document.getElementById('at-risk').classList.toggle('has-risk', flagged > 0);
+}
 
 export function mountInitiatives() {
   const list = document.getElementById('initiatives-list');
   function render(state) {
+    if (!document.getElementById('at-risk')?.contains(document.activeElement)) renderAtRisk(state);
     const expanded = new Set([...list.querySelectorAll('details[open]')].map(item => item.closest('article').dataset.id));
     const fragment = document.createDocumentFragment();
     state.initiatives.forEach(item => {

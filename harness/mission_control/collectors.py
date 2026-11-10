@@ -161,16 +161,32 @@ class WalTailer(Collector):
         except (OSError, Refused):
             return
         newest = None
+        found_item = found_progress = False
         for raw in reversed(lines):
             entry = _json(raw)
             if not entry:
                 continue
             newest = newest or entry
-            if _meaningful(entry):
+            if not found_item and _meaningful(entry):
                 self._remember(tail, entry)
+                found_item = True
+            if not found_progress and _progress(entry):
+                self._remember_progress(tail, entry)
+                found_progress = True
+            if found_item and found_progress:
                 break
         if newest:
             self._remember(tail, newest, meaningful=False)
+
+    def _remember_progress(self, tail: _Tail, entry: dict) -> None:
+        """The newest real progress (PROGRESS_EVENTS) for the slowest/at-risk ranking; never moves backwards."""
+        key = (tail.runtime, tail.session, tail.agent)
+        at = str(entry.get("at", ""))[:40]
+        item = dict(self.last_items.get(key) or {"at": "", "event": "", "note": ""})
+        if at > (item.get("progress_at") or ""):
+            item.update({"progress_at": at, "progress_event": str(entry.get("event", ""))[:40],
+                         "progress_note": ev.short(_note(entry), 160)})
+            self.last_items[key] = item
 
     def _remember(self, tail: _Tail, entry: dict, meaningful: bool = True) -> None:
         """Keep the newest meaningful work item, and separately the time of any activity (tool calls included)."""
@@ -233,6 +249,8 @@ class WalTailer(Collector):
                 self._remember(tail, entry, meaningful=False)
                 continue
             self._remember(tail, entry, meaningful=_meaningful(entry))
+            if _progress(entry):
+                self._remember_progress(tail, entry)
             if sent >= budget:
                 skipped += 1
                 continue
@@ -288,6 +306,14 @@ def _disposition(value) -> dict | None:
     return {"kind": re.sub(r"[^a-z_-]", "", value["kind"].lower())[:20],
             "ref": ev.short(str(value.get("ref") or ""), 60), "reason": ev.short(str(value.get("reason") or ""), 200),
             "until": ev.iso(until) if until else None, "live": value.get("live") is True}
+
+
+PROGRESS_EVENTS = frozenset({"result", "check", "commit", "deploy", "live", "merge", "release", "handoff"})
+
+
+def _progress(entry: dict) -> bool:
+    """Real progress: an agent-written result, check, commit, deploy, merge, release or handoff (not a plan or note)."""
+    return not entry.get("by") and str(entry.get("event", "")).lower() in PROGRESS_EVENTS
 
 
 def _meaningful(entry: dict) -> bool:

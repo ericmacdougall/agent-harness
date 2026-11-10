@@ -157,6 +157,22 @@ class WalTail(Tmp):
         self.assertEqual(events[-1]["actor"], {"runtime": "claude", "session": "sess1", "agent": "abc"})
         self.assertEqual(self.tailer.last_for("claude", "sess1", "abc")["event"], "result")
 
+    def test_real_progress_is_tracked_apart_from_notes(self):  # goodqa#15585 slowest / at risk
+        agent = self.wals / "sess1" / "agent-pro.jsonl"
+        self.append(agent, {"at": "2026-11-10T01:00:00Z", "event": "commit", "note": "abc123 pushed"},
+                    {"at": "2026-11-10T01:30:00Z", "event": "intent", "note": "plan the next step"})
+        self.tailer.run(time.time())  # seed path
+        last = self.tailer.last_for("claude", "sess1", "pro")
+        self.assertEqual((last["note"], last["progress_at"], last["progress_event"]),
+                         ("plan the next step", "2026-11-10T01:00:00Z", "commit"))
+        self.append(agent, {"at": "2026-11-10T02:00:00Z", "event": "note", "note": "thinking"},
+                    {"at": "2026-11-10T02:05:00Z", "event": "check", "note": "gate", "by": "dropped_gate"})
+        self.tailer.run(time.time())  # append path: a note and a gate-written line are not progress
+        self.assertEqual(self.tailer.last_for("claude", "sess1", "pro")["progress_at"], "2026-11-10T01:00:00Z")
+        self.append(agent, {"at": "2026-11-10T02:10:00Z", "event": "result", "note": "REALLY_TESTED y: ok"})
+        self.tailer.run(time.time())
+        self.assertEqual(self.tailer.last_for("claude", "sess1", "pro")["progress_at"], "2026-11-10T02:10:00Z")
+
     def test_codex_wal_and_new_files_are_found(self):
         self.tailer.run(time.time())
         main = self.codex / "thread1" / "main.jsonl"
