@@ -183,7 +183,184 @@ CHECK_TAIL_CHARS = 2000
 
 
 class CheckInterpreterError(OSError):
-    """A Python check would run an absent or unsupported interpreter."""
+    """A check would use an absent, unsupported or indirect interpreter/protocol."""
+
+
+NODE_REPORTER_SHA256 = 'ad31d9370a964cf86e0eac698de388c545de1dc166c10d4aa9ac0229608087e8'
+NODE_PROBE_DIRECTORY = Path.home() / '.agent-harness/work/node-check-probes'
+NODE_SEGMENT = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}')
+NODE_COUNTS = {'tests', 'failed', 'passed', 'cancelled', 'skipped', 'todo', 'topLevel', 'suites'}
+
+
+def focused_node(argv):
+    if len(argv) != 3 or argv[:2] != ['node', '--test']:
+        return False
+    path = argv[2]
+    return (len(path) <= 1024 and path.endswith(('.test.js', '.test.cjs', '.test.mjs'))
+            and all(NODE_SEGMENT.fullmatch(part) for part in path.split('/')))
+
+
+def node_file(repo, relative):
+    """Recheck each component in the actual scratch/original, without following links."""
+    root = Path(repo).resolve(strict=True)
+    path = root
+    for part in relative.split('/'):
+        path = path / part
+        if path.is_symlink():
+            raise CheckInterpreterError('Node check path contains a symbolic link')
+    if not path.is_file() or not path.resolve(strict=True).is_relative_to(root):
+        raise CheckInterpreterError('Node check must name an existing regular file in the repository')
+    return path
+
+
+def node_reporter():
+    path = Path(__file__).absolute().with_name('node_check_reporter.mjs')
+    try:
+        if path.is_symlink() or not path.is_file() or path.resolve().parent != Path(__file__).resolve().parent:
+            raise OSError()
+        with path.open('rb') as stream:
+            content = stream.read(16385)
+        if hashlib.sha256(content).hexdigest() != NODE_REPORTER_SHA256:
+            raise OSError()
+    except OSError:
+        raise CheckInterpreterError('Trusted Node reporter is missing or changed; reinstall reviewed helpers') from None
+    return path.resolve()
+
+
+def resolve_node(env, repo=None, timeout=30):
+    # Node's inherited preload/test controls can execute code before the reporter.
+    if any(key in {'NODE_OPTIONS', 'NODE_PATH', 'NODE_TEST_CONTEXT', 'NODE_V8_COVERAGE', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT'}
+           or key.startswith(('NODE_TEST_', 'DYLD_')) for key in env):
+        raise CheckInterpreterError('Inherited Node injection controls are not supported')
+    found = shutil.which('node', path=env.get('PATH', os.defpath))
+    try:
+        if found is None:
+            raise OSError()
+        candidate = Path(found).absolute()
+        path = Path(found).resolve(strict=True)
+        if repo is not None:
+            root = Path(repo).resolve()
+            if path.is_relative_to(root) or (candidate.parent.resolve() / candidate.name).is_relative_to(root):
+                raise OSError()
+        info = path.stat()
+        with path.open('rb') as stream:
+            magic = stream.read(4)
+        if not stat.S_ISREG(info.st_mode) or magic not in {
+                b'\x7fELF', b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf',
+                b'\xce\xfa\xed\xfe', b'\xfe\xed\xfa\xce',
+                b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca',
+                b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca'}:
+            raise OSError()
+        probe = run_process([str(path), '--input-type=commonjs', '--eval',
+                             'console.log(JSON.stringify([process.execPath,process.versions.node]))'],
+                            env=env, timeout=timeout)
+        identity = json.loads(probe.stdout or '')
+        if (probe.returncode or not isinstance(identity, list) or len(identity) != 2
+                or identity[0] != str(path) or not isinstance(identity[1], str)
+                or re.fullmatch(r'\d+\.\d+\.\d+', identity[1]) is None
+                or int(identity[1].split('.')[0]) < 22
+                or any(getattr(path.stat(), field) != getattr(info, field)
+                       for field in ('st_dev', 'st_ino', 'st_mode', 'st_size', 'st_mtime_ns', 'st_ctime_ns'))):
+            raise OSError()
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+        raise CheckInterpreterError('Node checks need a canonical native Node >=22 outside the repository') from None
+    return str(path)
+
+
+class NodeEvidence:
+    """Bounded protocol consumer. Printed worker text is never a summary record."""
+    def __init__(self, selected, sink=None):
+        self.selected, self.sink = str(selected), sink
+        self.pending = bytearray()
+        self.invalid = False
+        self.summaries = []
+        self.ended = False
+
+    def __call__(self, chunk):
+        # An invalid stream still drains under process.py's original deadline.
+        if self.invalid:
+            return
+        for part in chunk.splitlines(keepends=True):
+            self.pending.extend(part)
+            if len(self.pending) > 16384:
+                self.invalid = True
+                self.pending.clear()
+                return
+            if not part.endswith(b'\n'):
+                continue
+            try:
+                record = json.loads(self.pending.decode('utf-8'))
+                self.pending.clear()
+                self.record(record)
+            except (UnicodeError, ValueError, TypeError):
+                self.invalid = True
+                return
+
+    def record(self, record):
+        if not isinstance(record, dict) or self.ended:
+            raise ValueError()
+        if record.get('kind') == 'diagnostic' and set(record) == {'kind', 'text'}:
+            if not isinstance(record['text'], str) or len(record['text']) > 2000:
+                raise ValueError()
+            if self.sink:
+                self.sink((json.dumps({'kind': 'diagnostic', 'text': redact_output(record['text'])}) + '\n').encode())
+            return
+        if record == {'kind': 'end'}:
+            if len(self.summaries) != 2:
+                raise ValueError()
+            self.ended = True
+            return
+        if (set(record) != {'kind', 'file', 'success', 'counts'} or record['kind'] != 'summary'
+                or record['success'] is not True or len(self.summaries) >= 2
+                or record['file'] != (self.selected if not self.summaries else None)):
+            raise ValueError()
+        counts = record['counts']
+        if (not isinstance(counts, dict) or set(counts) != NODE_COUNTS
+                or any(type(n) is not int or not 0 <= n <= 1_000_000_000 for n in counts.values())
+                or counts['passed'] <= 0 or counts['failed'] or counts['cancelled']
+                or counts['tests'] != sum(counts[k] for k in ('passed', 'failed', 'cancelled', 'skipped', 'todo'))
+                or counts['topLevel'] <= 0 or counts['topLevel'] > counts['tests'] + counts['suites']
+                or self.summaries and counts != self.summaries[0]):
+            raise ValueError()
+        self.summaries.append(counts)
+
+    def passed(self):
+        return not self.invalid and not self.pending and self.ended and len(self.summaries) == 2
+
+
+def run_node(repo, command, environment, timeout, sink=None):
+    if not focused_node(command):
+        raise CheckInterpreterError('Node check command is outside the focused form')
+    interpreter = resolve_node(environment, repo)
+    selected = node_file(repo, command[2])
+    reporter = node_reporter()
+    evidence = NodeEvidence(selected, sink)
+    result = run_process([interpreter, '--test', '--test-concurrency=1', '--test-reporter', str(reporter), str(selected)],
+                         cwd=repo, env=environment, timeout=timeout, discard_output=True, sink=evidence)
+    if result.returncode == 0 and not evidence.passed():
+        return subprocess.CompletedProcess(command, 1, None, None)
+    return result
+
+
+def require_node_protocol(environment, repo=None):
+    """Two fixed real controls before effects; a major version is not protocol proof."""
+    interpreter = resolve_node(environment, repo)
+    reporter = node_reporter()
+    try:
+        private_directory(NODE_PROBE_DIRECTORY)
+        with tempfile.TemporaryDirectory(prefix='capability-', dir=NODE_PROBE_DIRECTORY) as directory:
+            root = Path(directory)
+            (root / 'genuine.test.mjs').write_text(
+                "import test from 'node:test'; import assert from 'node:assert/strict';\n"
+                "test('delivery capability', () => assert.equal(2 + 2, 4));\n")
+            (root / 'empty.test.mjs').write_text("import 'node:test';\n")
+            genuine = run_node(root, ['node', '--test', 'genuine.test.mjs'], environment, 15)
+            empty = run_node(root, ['node', '--test', 'empty.test.mjs'], environment, 15)
+            if (genuine.returncode != 0 or empty.returncode == 0
+                    or resolve_node(environment, repo) != interpreter or node_reporter() != reporter):
+                raise OSError()
+    except (OSError, subprocess.TimeoutExpired):
+        raise CheckInterpreterError('Node reporter protocol capability checks failed before delivery') from None
 
 
 def resolve_check_interpreter(name, env=None, timeout=30):
@@ -313,6 +490,8 @@ def run(repo, command, *, timeout=None, discard_output=False, env=None, sink=Non
     if sink is not None:
         output_options['sink'] = sink
     environment = {**(os.environ if env is None else env), "PYTHONDONTWRITEBYTECODE": "1"}
+    if command and command[0] == 'node':
+        return run_node(repo, command, environment, timeout, sink)
     executed = command
     if command and command[0] in CHECK_PYTHON_NAMES:
         executed = [resolve_check_interpreter(command[0], environment), *command[1:]]
@@ -330,11 +509,13 @@ def check_timeout(args):
     return args.timeout if value is None else value
 
 
-def require_check_interpreters(commands):
-    """Fail before any effect when a Python check would use an unsupported interpreter."""
+def require_check_interpreters(commands, repo=None):
+    """Fail before effects when a check's interpreter or Node protocol is unsupported."""
     for command in commands:
         if command and command[0] in CHECK_PYTHON_NAMES:
             resolve_check_interpreter(command[0])
+    if any(command and command[0] == 'node' for command in commands):
+        require_node_protocol(dict(os.environ), repo)
 
 
 def run_git(repo, *args, timeout=600):
@@ -389,6 +570,8 @@ def focused_unittest(options):
 def approved_check(argv):
     if not argv:
         return False
+    if argv[0] == 'node':
+        return focused_node(argv)
     if argv[0] == "go" and len(argv) >= 2:
         if argv[1:] == ["vet", "./..."]:
             return True
@@ -451,7 +634,7 @@ def main():
         report("BLOCKED_POLICY", "Verification command is outside the approved test/build set")
         return 2
     try:
-        require_check_interpreters(checks)
+        require_check_interpreters(checks, args.repo)
     except CheckInterpreterError as error:
         report("BLOCKED_POLICY", str(error))
         return 2
