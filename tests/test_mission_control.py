@@ -630,7 +630,7 @@ class ServerHarness(Tmp):
         return resp, data
 
     def login(self):
-        code = mcs.mint_code(mc_chat.secret())
+        code = mcs.mint_code(mc_chat.secret(), self.app.auth.launch_generation)
         resp, _ = self.request("GET", "/launch?c=" + code, {"Sec-Fetch-Site": "none"})
         self.assertEqual(resp.status, 303)
         cookie = resp.getheader("Set-Cookie").split(";")[0]
@@ -646,7 +646,7 @@ class ServerHarness(Tmp):
 
 class Security(ServerHarness):
     def test_launch_code_is_single_use_and_expires(self):
-        code = mcs.mint_code(mc_chat.secret())
+        code = mcs.mint_code(mc_chat.secret(), self.app.auth.launch_generation)
         first, _ = self.request("GET", "/launch?c=" + code)
         again, _ = self.request("GET", "/launch?c=" + code)
         self.assertEqual((first.status, again.status), (303, 401))
@@ -654,9 +654,9 @@ class Security(ServerHarness):
         cookie = first.getheader("Set-Cookie")
         for flag in ("HttpOnly", "SameSite=Strict", "Path=/"):
             self.assertIn(flag, cookie)
-        old = mcs.mint_code(mc_chat.secret(), now=time.time() - 61)
+        old = mcs.mint_code(mc_chat.secret(), self.app.auth.launch_generation, now=time.time() - 61)
         self.assertEqual(self.request("GET", "/launch?c=" + old)[0].status, 401)
-        forged = mcs.mint_code(b"k" * 32)
+        forged = mcs.mint_code(b"k" * 32, self.app.auth.launch_generation)
         self.assertEqual(self.request("GET", "/launch?c=" + forged)[0].status, 401)
 
     def test_dns_rebinding_host_is_refused_everywhere(self):
@@ -720,7 +720,7 @@ class Security(ServerHarness):
         self.assertIsNone(resp.getheader("Access-Control-Allow-Origin"))
 
     def test_log_has_no_query_strings(self):
-        code = mcs.mint_code(mc_chat.secret())
+        code = mcs.mint_code(mc_chat.secret(), self.app.auth.launch_generation)
         self.request("GET", "/launch?c=" + code)
         for handler in mcs.make_logger(self.root).handlers:
             handler.flush()

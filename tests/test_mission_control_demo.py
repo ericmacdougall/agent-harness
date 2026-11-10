@@ -150,7 +150,7 @@ class Http(Base):
             conn.close()
 
     def login(self, host=None):
-        resp, _ = self.request("GET", "/launch?c=" + mcs.mint_code(mc_chat.secret()), {"Sec-Fetch-Site": "none"},
+        resp, _ = self.request("GET", "/launch?c=" + mcs.mint_code(mc_chat.secret(), self.app.auth.launch_generation), {"Sec-Fetch-Site": "none"},
                                host=host)
         self.assertEqual(resp.status, 303)
         cookie = resp.getheader("Set-Cookie").split(";")[0]
@@ -242,9 +242,9 @@ class Http(Base):
         self.assertTrue(cookie.startswith("mc_sid="))
 
     def test_funnel_cookie_is_secure_and_loopback_cookie_works_over_http(self):
-        resp, _ = self.request("GET", "/launch?c=" + mcs.mint_code(mc_chat.secret()), {"Sec-Fetch-Site": "none"})
+        resp, _ = self.request("GET", "/launch?c=" + mcs.mint_code(mc_chat.secret(), self.app.auth.launch_generation), {"Sec-Fetch-Site": "none"})
         self.assertIn("; Secure", resp.getheader("Set-Cookie"))
-        resp, _ = self.request("GET", "/launch?c=" + mcs.mint_code(mc_chat.secret()), {"Sec-Fetch-Site": "none"},
+        resp, _ = self.request("GET", "/launch?c=" + mcs.mint_code(mc_chat.secret(), self.app.auth.launch_generation), {"Sec-Fetch-Site": "none"},
                                host=f"127.0.0.1:{self.port}")
         self.assertEqual(resp.status, 303)
         self.assertNotIn("Secure", resp.getheader("Set-Cookie"))

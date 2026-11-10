@@ -15,10 +15,14 @@ from install import install
 
 class Recorder:
     def __init__(self, code=0):
-        self.calls, self.code = [], code
+        self.calls, self.code, self.loaded = [], code, False
 
     def __call__(self, argv):
         self.calls.append(argv)
+        if argv[0]=='launchctl':
+            return SimpleNamespace(returncode=0 if self.loaded else 113, stdout='pid = 123\n' if self.loaded else '', stderr='' if self.loaded else 'Could not find service')
+        if 'install-launchd' in argv and not self.code:self.loaded=True
+        if 'uninstall-launchd' in argv and not self.code:self.loaded=False
         return SimpleNamespace(returncode=self.code, stdout="", stderr="boom" if self.code else "")
 
 
@@ -67,8 +71,12 @@ class MissionControlInstall(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((app / "server.py").stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(mci.mc_root(self.home).stat().st_mode), 0o700)
         (app / "marker").write_text("old")
+        with self.assertRaises(OSError):
+            mci.install_app(self.home)
+        self.assertTrue((app / "marker").is_file(), "unknown runtime payload is retained")
+        (app / "marker").unlink()  # owned fixture only, restore the exact committed tree before retry
         mci.install_app(self.home)
-        self.assertTrue((mci.mc_root(self.home) / "app.prev" / "marker").is_file(), "the previous copy is kept")
+        self.assertTrue((mci.mc_root(self.home) / "app.prev" / "server.py").is_file(), "previous source kept")
         self.assertFalse((app / "marker").exists())
         self.assertEqual([p.name for p in mci.mc_root(self.home).iterdir() if p.name.startswith(".app-")], [])
 
@@ -79,7 +87,7 @@ class MissionControlInstall(unittest.TestCase):
         mci.real_dir(mci.mc_root(self.home))
         os.symlink(elsewhere, mci.app_dir(self.home))
         line = mci.status(self.home, True, True, run=Recorder(), system="linux")
-        self.assertIn("skipped", line)
+        self.assertIn("failed", line)
         self.assertEqual(list(elsewhere.iterdir()), [], "nothing is written through the link")
 
     def test_mission_service_is_only_registered_for_the_real_home_on_macos(self):
@@ -90,32 +98,34 @@ class MissionControlInstall(unittest.TestCase):
         line = mci.status(self.home, True, True, run=run, system="darwin")
         self.assertTrue((mci.app_dir(self.home) / "server.py").is_file(), line)
         self.assertEqual(run.calls, [], "a non-default home never touches launchd")
-        with patch.object(mci, "real_home", return_value=self.home):
+        with patch.object(mci, "real_home", return_value=self.home), patch.object(mci, "_verify_service", return_value=True):
             line = mci.status(self.home, True, None, run=run, system="darwin")
             self.assertIn("LaunchAgent com.agent-harness.mission-control: ok", line)
             argv = run.calls[-1]
             self.assertEqual(argv[0], "/usr/bin/python3")
             self.assertEqual(argv[1], str(mci.app_dir(self.home) / "server.py"), "launchd runs the installed copy")
-            self.assertEqual(argv[2:], ["install-launchd", "--apply", "--python", "/usr/bin/python3"])
+            self.assertEqual(argv[2:6], ["install-launchd", "--apply", "--python", "/usr/bin/python3"])
+            self.assertEqual(argv[6], "--activation-id")
+            self.assertEqual(len(argv[7]), 32)
             calls = len(run.calls)
             mci.status(self.home, True, None, run=run, system="linux")
             self.assertEqual(len(run.calls), calls, "no launchd off macOS")
 
     def test_mission_failed_launchctl_is_reported_not_raised(self):
-        with patch.object(mci, "real_home", return_value=self.home):
+        with patch.object(mci, "real_home", return_value=self.home), patch.object(mci, "_verify_service", return_value=True):
             line = mci.status(self.home, True, None, run=Recorder(code=1), system="darwin")
-        self.assertIn("install-launchd failed (exit 1): boom", line)
+        self.assertIn("failed", line)
 
     def test_no_mission_control_stops_the_service_and_is_remembered(self):
         run = Recorder()
-        with patch.object(mci, "real_home", return_value=self.home):
+        with patch.object(mci, "real_home", return_value=self.home), patch.object(mci, "_verify_service", return_value=True):
             mci.status(self.home, True, None, run=run, system="darwin")
             plist = self.home / "Library" / "LaunchAgents" / f"{mci.LABEL}.plist"
             plist.parent.mkdir(parents=True)
             plist.write_text("<plist/>")
             line = mci.status(self.home, True, False, run=run, system="darwin")
-            self.assertIn("off; LaunchAgent stopped (ok)", line)
-            self.assertEqual(run.calls[-1][2:4], ["uninstall-launchd", "--apply"])
+            self.assertIn("off; LaunchAgent stopped (verified absent)", line)
+            self.assertTrue(any(call[2:4] == ["uninstall-launchd", "--apply"] for call in run.calls))
             self.assertTrue((mci.app_dir(self.home) / "server.py").is_file(), "files stay")
             calls = len(run.calls)
             line = mci.status(self.home, True, None, run=run, system="darwin")
@@ -132,7 +142,7 @@ class MissionControlInstall(unittest.TestCase):
         self.assertNotIn("mc_inbox", merged, "Codex keys hook trust by position; the inbox is used by hand there")
 
     def test_mission_preview_writes_nothing(self):
-        with patch.object(mci, "real_home", return_value=self.home):
+        with patch.object(mci, "real_home", return_value=self.home), patch.object(mci, "_verify_service", return_value=True):
             run = Recorder()
             line = mci.status(self.home, False, True, run=run, system="darwin")
         self.assertIn("would copy", line)

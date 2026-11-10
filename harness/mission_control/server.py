@@ -72,6 +72,7 @@ MAX_CONNECTIONS = 32  # AC-9
 MAX_BODY = 16 * 1024
 IO_TIMEOUT_S = 10
 SSE_HEARTBEAT_S = 15
+SSE_WRITE_TIMEOUT_S = 5
 CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
                  ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8",
                  ".svg": "image/svg+xml", ".png": "image/png", ".json": "application/json", ".txt": "text/plain"}
@@ -89,9 +90,11 @@ def _unb64(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
-def mint_code(key: bytes, now: float | None = None) -> str:
+def mint_code(key: bytes, generation: str, now: float | None = None) -> str:
+    if not isinstance(generation, str) or not re.fullmatch('[0-9a-f]{32}', generation):
+        raise ValueError('running launch generation required')
     now = time.time() if now is None else now
-    payload = int(now).to_bytes(8, "big") + secrets.token_bytes(16)
+    payload = int(now).to_bytes(8, "big") + secrets.token_bytes(16) + bytes.fromhex(generation)
     mac = hmac.new(key, b"mc-launch|" + payload, hashlib.sha256).digest()[:16]
     return _b64(payload) + "." + _b64(mac)
 
@@ -135,6 +138,7 @@ class Auth:
         self.sessions: dict[str, dict] = {}
         self.pending_browsers: dict[str, dict] = {}
         self.browser_boot = uuid.uuid4().hex
+        self.launch_generation = secrets.token_hex(16)
         self.hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
         self.origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
         self.key = self._current_key()
@@ -248,7 +252,7 @@ class Auth:
             payload, mac = _unb64(left), _unb64(right)
         except (ValueError, TypeError):
             return None
-        if len(payload) != 24 or len(mac) != 16:
+        if len(payload) != 40 or len(mac) != 16 or payload[24:] != bytes.fromhex(self.launch_generation):
             return None
         expected = hmac.new(key, b"mc-launch|" + payload, hashlib.sha256).digest()[:16]
         return payload if hmac.compare_digest(expected, mac) else None
@@ -418,6 +422,8 @@ class App:
         self.port, self.root = port, root
         self.demo = demo
         self.build = demo_mode.build_identity(HERE, HOOKS) if demo else None
+        self.component_digest = component_digest(HERE)
+        self.activation_id = None
         self.demo_delay_s = 0.0
         self.demo_drop_first = False
         self.demo_refuse_first = False
@@ -655,7 +661,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.deny(403, "host")
         url = urlsplit(self.path)
         if url.path == "/healthz":
-            value = {"ok": True, "version": VERSION}
+            value = {"ok": True, "version": VERSION, "launch_generation": self.app.auth.launch_generation,
+                     "component_digest": self.app.component_digest, "activation_id": self.app.activation_id,
+                     "pid": os.getpid()}
             if self.app.demo:
                 value.update(demo=True, build=self.app.build)
             return self.send_json(200, value)
@@ -867,17 +875,17 @@ class Handler(BaseHTTPRequestHandler):
         if client is None:
             return self.deny(503, "too-many-streams")
         try:
-            last = int(self.headers.get("Last-Event-ID") or "0")
-        except ValueError:
-            last = 0
-        self.connection.settimeout(None)
-        self.send_response(200)
-        for key, value in {"Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-store",
-                           "X-Content-Type-Options": "nosniff", "Content-Security-Policy": CSP,
-                           "Referrer-Policy": "no-referrer", "X-Accel-Buffering": "no"}.items():
-            self.send_header(key, value)
-        self.end_headers()
-        try:
+            try:
+                last = int(self.headers.get("Last-Event-ID") or "0")
+            except ValueError:
+                last = 0
+            self.connection.settimeout(SSE_WRITE_TIMEOUT_S)
+            self.send_response(200)
+            for key, value in {"Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-store",
+                               "X-Content-Type-Options": "nosniff", "Content-Security-Policy": CSP,
+                               "Referrer-Policy": "no-referrer", "X-Accel-Buffering": "no"}.items():
+                self.send_header(key, value)
+            self.end_headers()
             self.wfile.write(b"retry: 3000\n\n")
             for event in self.app.hub.recent(after=last, limit=100) if last else []:
                 if not authorized():
@@ -903,6 +911,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
+            self.close_connection = True
             self.app.hub.detach(client)
 
 
@@ -979,21 +988,68 @@ def make_logger(root: Path) -> logging.Logger:
 
 # ---------------------------------------------------------------- CLI
 
-def launch_url(port: int, demo_host: str | None = None) -> str:
-    code = mint_code(mc_chat.secret())
+def component_digest(root):
+    digest = hashlib.sha256()
+    def walk_error(error):
+        raise OSError('component traversal incomplete') from None
+    if root.is_symlink() or not root.is_dir():
+        raise OSError('unsafe component root')
+    for directory, dirs, names in os.walk(root, followlinks=False, onerror=walk_error):
+        if any((Path(directory)/name).is_symlink() for name in dirs
+               if name not in ('tests','__pycache__') and not name.startswith('.')):
+            raise OSError('component directory alias')
+        dirs[:] = sorted(d for d in dirs if d not in ('tests', '__pycache__') and not d.startswith('.'))
+        for name in sorted(names):
+            path = Path(directory) / name
+            if name.startswith('.') or path.suffix in ('.pyc', '.pyo'):
+                continue
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 8 << 20:
+                raise OSError('invalid app component')
+            digest.update(path.relative_to(root).as_posix().encode() + b'\0' + hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def local_health(port):
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError('invalid local port')
+    connection = http.client.HTTPConnection('127.0.0.1', port, timeout=3)
+    try:
+        connection.request('GET', '/healthz', headers={'Host': f'127.0.0.1:{port}'})
+        response = connection.getresponse()
+        data = response.read(4097)
+        if response.status != 200 or len(data) > 4096:
+            raise ValueError('local health refused')
+        result = json.loads(data, object_pairs_hook=_unique_browser_object)
+        if not isinstance(result, dict) or result.get('ok') is not True:
+            raise ValueError('local health invalid')
+        return result
+    finally:
+        connection.close()
+
+
+def launch_url(port: int, demo_host: str | None = None, *, auth=None) -> str:
+    if auth is None:
+        health = local_health(port)
+        generation = health.get('launch_generation')
+        if demo_host and health.get('demo') is not True:
+            raise ValueError('local demo required')
+    else:
+        generation = auth.launch_generation
+    code = mint_code(mc_chat.secret(create=False), generation)
     if demo_host:
         return f"https://{demo_host}/launch?c={code}"
     return f"http://127.0.0.1:{port}/launch?c={code}"
 
 
-def plist_text(port: int, python: str) -> str:
+def plist_text(port: int, python: str, activation_id=None) -> str:
     """The LaunchAgent, built with plistlib so a path with XML characters cannot change its structure."""
     import plistlib
     root = mc_chat.home()
     path = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:" + str(Path.home() / ".local" / "bin")
     data = {
         "Label": LABEL,
-        "ProgramArguments": [python, str(HERE / "server.py"), "serve", "--port", str(int(port))],
+        "ProgramArguments": [python, str(HERE / "server.py"), "serve", "--port", str(int(port))]
+                            + (["--activation-id", activation_id] if activation_id else []),
         "EnvironmentVariables": {"PATH": path, "MC_HOME": str(root)},
         "RunAtLoad": True,
         "KeepAlive": True,  # restarts after a crash; a taken port fails loudly in the log every ThrottleInterval
@@ -1011,7 +1067,7 @@ def plist_path() -> Path:
 
 
 def cmd_install(args) -> int:
-    text = plist_text(args.port, args.python or "/usr/bin/python3")
+    text = plist_text(args.port, args.python or "/usr/bin/python3", getattr(args, 'activation_id', None))
     target = plist_path()
     domain = f"gui/{os.getuid()}"
     if not args.apply:
@@ -1042,13 +1098,51 @@ def cmd_uninstall(args) -> int:
     if not args.apply:
         print(f"would run launchctl bootout {domain}/{LABEL} and remove {plist_path()}")
         return 0
-    subprocess.run(["launchctl", "bootout", f"{domain}/{LABEL}"], capture_output=True, timeout=30)
+    state, _ = loaded_label()
+    if state == 'unknown':
+        print('stop failed: loaded job state unknown', file=sys.stderr)
+        return 1
+    if state == 'loaded':
+        try:
+            result = subprocess.run(["launchctl", "bootout", f"{domain}/{LABEL}"], capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            print('stop failed: bootout outcome unknown', file=sys.stderr)
+            return 1
+        for attempt in range(5):
+            state, _ = loaded_label()
+            if state == 'absent':
+                break
+            if state == 'unknown' or result.returncode:
+                print('stop failed: job still loaded or unknown', file=sys.stderr)
+                return 1
+            time.sleep(.2)
+        if state != 'absent':
+            print('stop failed: job still loaded', file=sys.stderr)
+            return 1
     try:
         plist_path().unlink()
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError:
+        print('job absent but plist removal failed', file=sys.stderr)
+        return 1
     print(f"uninstalled {LABEL} (data in {mc_chat.home()} kept)")
     return 0
+
+
+def loaded_label():
+    try:
+        result = subprocess.run(['launchctl', 'print', f'gui/{os.getuid()}/{LABEL}'],
+                                capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return 'unknown', None
+    if result.returncode == 0:
+        match = re.search(r'^\s*pid = ([1-9][0-9]*)\s*$', result.stdout or '', re.M)
+        return 'loaded', int(match[1]) if match else None
+    error = result.stderr or ''
+    if result.returncode == 113 and ('Could not find service' in error or 'Could not find specified service' in error):
+        return 'absent', None
+    return 'unknown', None
 
 
 def cmd_status(args) -> int:
@@ -1097,6 +1191,7 @@ def cmd_serve(args) -> int:
     initiatives = None
     try:
         app = build_app(args)
+        app.activation_id = getattr(args, 'activation_id', None)
         initiatives = app.initiatives.path
         server = Server(app, Path(args.web or (HERE / "web")), log)
     except OSError as exc:
@@ -1110,7 +1205,7 @@ def cmd_serve(args) -> int:
         # A fresh launch code goes to this local terminal only: it is never logged or served.
         print("DEMO MODE: fixture data only; chat reaches no agent.", flush=True)
         print(f"build: {json.dumps(app.build, sort_keys=True)}", flush=True)
-        print(f"launch (60 s, single use): {launch_url(args.port, args.demo_host)}", flush=True)
+        print(f"launch (60 s, single use): {launch_url(args.port, args.demo_host, auth=app.auth)}", flush=True)
         print(f"more codes: MC_HOME=<this home> server.py url --port {args.port}"
               + (f" --demo-host {args.demo_host}" if args.demo_host else ""), flush=True)
     try:
@@ -1171,6 +1266,8 @@ def main(argv=None) -> int:
     p.add_argument("--no-codex", action="store_true", help="never run codex exec (disposable or test instances)")
     p.add_argument("--fabric-bin")
     p.add_argument("--web")
+    p.add_argument('--activation-id', type=lambda value: value if re.fullmatch('[0-9a-f]{32}', value) else
+                   parser.error('invalid activation id'))
     p.add_argument("--demo", action="store_true",
                    help="fixture data only, no commands run, chat reaches no agent (needs a disposable MC_HOME)")
     p.add_argument("--demo-host", help="with --demo only: also accept this *.ts.net Funnel host over https")
@@ -1187,6 +1284,9 @@ def main(argv=None) -> int:
         q.add_argument("--port", type=int, default=DEFAULT_PORT)
         q.add_argument("--python")
         q.add_argument("--apply", action="store_true")
+        if name == 'install-launchd':
+            q.add_argument('--activation-id', type=lambda value: value if re.fullmatch('[0-9a-f]{32}', value) else
+                           parser.error('invalid activation id'))
     sub.add_parser("rotate-secret")
     args = parser.parse_args(argv)
     if args.cmd == "approve-browser":
@@ -1205,10 +1305,19 @@ def main(argv=None) -> int:
         except (demo_mode.DemoError, mc_chat.ChatError) as exc:
             print(f"mission-control: {exc}", file=sys.stderr)
             return 2
-        print(launch_url(args.port, host))
+        try:
+            print(launch_url(args.port, host))
+        except Exception:
+            print('mission-control: no valid running local generation', file=sys.stderr)
+            return 2
         return 0
     if args.cmd == "open":
-        subprocess.run(["open", launch_url(args.port)], check=False)
+        try:
+            url=launch_url(args.port)
+        except Exception:
+            print('mission-control: no valid running local generation', file=sys.stderr)
+            return 2
+        subprocess.run(["open", url], check=False)
         print("opened a single-use launch link in your default browser (valid 60 s)")
         return 0
     if args.cmd == "status":

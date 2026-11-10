@@ -41,7 +41,7 @@ class PersistentSessions(unittest.TestCase):
 
     def test_a_session_survives_a_restart_with_the_same_csrf(self):
         first = auth(self.store)
-        sid = first.redeem(mcs.mint_code(KEY))
+        sid = first.redeem(mcs.mint_code(KEY, first.launch_generation))
         self.assertTrue(sid)
         _, before = first.session(cookie(sid))
         restarted = auth(self.store)  # a new process: only the file carries the session over
@@ -51,7 +51,7 @@ class PersistentSessions(unittest.TestCase):
 
     def test_the_file_is_private_and_holds_no_cookie_or_csrf(self):
         first = auth(self.store)
-        sid = first.redeem(mcs.mint_code(KEY))
+        sid = first.redeem(mcs.mint_code(KEY, first.launch_generation))
         _, info = first.session(cookie(sid))
         raw = self.store.read_text()
         self.assertEqual(stat.S_IMODE(os.stat(self.store).st_mode), 0o600)
@@ -61,12 +61,12 @@ class PersistentSessions(unittest.TestCase):
 
     def test_another_secret_expiry_revoke_and_damage_all_sign_out(self):
         first = auth(self.store)
-        sid = first.redeem(mcs.mint_code(KEY))
+        sid = first.redeem(mcs.mint_code(KEY, first.launch_generation))
         self.assertEqual(auth(self.store, key=b"x" * 32).session(cookie(sid)), (None, None))  # secret rotated
         later = time.time() + mcs.SESSION_TTL_S + 5
         self.assertEqual(auth(self.store).session(cookie(sid), now=later), (None, None))  # expired
         again = auth(self.store)
-        sid2 = again.redeem(mcs.mint_code(KEY))
+        sid2 = again.redeem(mcs.mint_code(KEY, again.launch_generation))
         again.revoke_all()
         self.assertEqual(auth(self.store).session(cookie(sid2)), (None, None))  # revoke is persisted
         self.store.write_text("{not json")
@@ -75,11 +75,11 @@ class PersistentSessions(unittest.TestCase):
     def test_rotating_the_secret_under_a_running_server_signs_everyone_out(self):  # red-team M1
         secret = {"key": KEY}
         running = mcs.Auth(lambda: secret["key"], 47615, store=self.store)
-        sid = running.redeem(mcs.mint_code(KEY))
+        sid = running.redeem(mcs.mint_code(KEY, running.launch_generation))
         secret["key"] = b"r" * 32  # rotate-secret runs in another process
         later = time.time() + mcs.TOUCH_PERSIST_S + 5
         self.assertEqual(running.session(cookie(sid), now=later), (None, None))  # at once, no restart needed
-        running.redeem(mcs.mint_code(b"r" * 32))  # a new login saves under the new key...
+        running.redeem(mcs.mint_code(b"r" * 32, running.launch_generation))  # a new login saves under the new key...
         restarted = mcs.Auth(lambda: secret["key"], 47615, store=self.store)
         self.assertEqual(restarted.session(cookie(sid)), (None, None))  # ...without the old session
         self.assertEqual(len(restarted.sessions), 1)
@@ -87,7 +87,7 @@ class PersistentSessions(unittest.TestCase):
     def test_a_session_has_an_absolute_lifetime_and_a_missing_secret_signs_out(self):  # red-team L1, L9
         first = auth(self.store)
         start = time.time()
-        sid = first.redeem(mcs.mint_code(KEY), now=start)
+        sid = first.redeem(mcs.mint_code(KEY, first.launch_generation), now=start)
         step = start
         while step < start + mcs.SESSION_TTL_S - 60:  # kept busy, never idle
             step += 3600
@@ -96,12 +96,13 @@ class PersistentSessions(unittest.TestCase):
 
         def missing():
             raise FileNotFoundError("secret")
-        sid2 = first.redeem(mcs.mint_code(KEY))
+        sid2 = first.redeem(mcs.mint_code(KEY, first.launch_generation))
         first.key_loader = missing
         self.assertEqual(first.session(cookie(sid2)), (None, None))
 
     def test_a_secret_unreadable_at_start_keeps_the_saved_sessions(self):  # delta red-team L-a
-        sid = auth(self.store).redeem(mcs.mint_code(KEY))
+        instance = auth(self.store)
+        sid = instance.redeem(mcs.mint_code(KEY, instance.launch_generation))
         readable = {"ok": False}
 
         def loader():
@@ -117,7 +118,7 @@ class PersistentSessions(unittest.TestCase):
     def test_a_symlinked_store_is_not_read(self):
         real = Path(self.tmp.name) / "elsewhere.json"
         writer = auth(real)
-        sid = writer.redeem(mcs.mint_code(KEY))
+        sid = writer.redeem(mcs.mint_code(KEY, writer.launch_generation))
         self.store.symlink_to(real)
         self.assertEqual(auth(self.store).session(cookie(sid)), (None, None))
 

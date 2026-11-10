@@ -22,7 +22,7 @@ class GenerationBoundary(unittest.TestCase):
             return KEY if len(calls) <= 2 else NEXT_KEY
 
         auth = mcs.Auth(loader, 49999)
-        self.assertFalse(bool(auth.redeem(mcs.mint_code(KEY, now=1000), now=1000)), "old code minted a session")
+        self.assertFalse(bool(auth.redeem(mcs.mint_code(KEY, auth.launch_generation, now=1000), now=1000)), "old code minted a session")
         self.assertFalse(auth.sessions)
 
     def test_rotation_after_signature_verification_refuses_mint(self):
@@ -36,7 +36,7 @@ class GenerationBoundary(unittest.TestCase):
             return result
 
         with mock.patch.object(auth, "_signed_payload", side_effect=verify_then_rotate):
-            self.assertFalse(bool(auth.redeem(mcs.mint_code(KEY, now=1000), now=1000)), "rotation allowed mint")
+            self.assertFalse(bool(auth.redeem(mcs.mint_code(KEY, auth.launch_generation, now=1000), now=1000)), "rotation allowed mint")
         self.assertFalse(auth.sessions)
 
     def test_signature_verification_is_inside_auth_lock(self):
@@ -48,14 +48,14 @@ class GenerationBoundary(unittest.TestCase):
             return original(*args)
 
         with mock.patch.object(auth, "_signed_payload", side_effect=verify):
-            self.assertTrue(auth.redeem(mcs.mint_code(KEY, now=1000), now=1000))
+            self.assertTrue(auth.redeem(mcs.mint_code(KEY, auth.launch_generation, now=1000), now=1000))
 
     def test_stable_generation_preserves_single_use_expiry_and_invalid_refusal(self):
         auth = mcs.Auth(lambda: KEY, 49999)
-        code = mcs.mint_code(KEY, now=1000)
+        code = mcs.mint_code(KEY, auth.launch_generation, now=1000)
         self.assertTrue(auth.redeem(code, now=1000))
         self.assertFalse(bool(auth.redeem(code, now=1000)))
-        self.assertFalse(bool(auth.redeem(mcs.mint_code(KEY, now=900), now=1000)))
+        self.assertFalse(bool(auth.redeem(mcs.mint_code(KEY, auth.launch_generation, now=900), now=1000)))
         self.assertFalse(bool(auth.redeem("malformed", now=1000)))
 
 
@@ -71,7 +71,7 @@ class StreamBoundary(unittest.TestCase):
         self.now[0] = 1000.0
         self.current = {"key": KEY}
         self.auth = mcs.Auth(lambda: self.current["key"], 49999)
-        self.sid = self.auth.redeem(mcs.mint_code(KEY))
+        self.sid = self.auth.redeem(mcs.mint_code(KEY, self.auth.launch_generation))
         self.assertTrue(self.sid)
 
     def invalidate(self, kind):
@@ -149,7 +149,7 @@ class StreamBoundary(unittest.TestCase):
         self.assertNotIn(b"fixture-private", h.wfile.getvalue())
 
     def test_stream_remains_pinned_despite_another_valid_header(self):
-        other = self.auth.redeem(mcs.mint_code(KEY))
+        other = self.auth.redeem(mcs.mint_code(KEY, self.auth.launch_generation))
 
         def revoke_only_original():
             with self.auth.lock:
@@ -172,7 +172,7 @@ class StreamBoundary(unittest.TestCase):
 class NonTouchSession(unittest.TestCase):
     def test_non_touching_validation_and_default_http_activity(self):
         auth = mcs.Auth(lambda: KEY, 49999)
-        sid = auth.redeem(mcs.mint_code(KEY, now=1000), now=1000)
+        sid = auth.redeem(mcs.mint_code(KEY, auth.launch_generation, now=1000), now=1000)
         cookie = "mc_sid=" + sid
         self.assertTrue(auth.session(cookie, now=1010, touch=False)[0])
         self.assertEqual(auth.sessions[auth._hash(sid)]["last"], 1000)
