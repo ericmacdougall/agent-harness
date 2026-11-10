@@ -1,6 +1,7 @@
 import { getState, subscribe, tick, select, setTab, setResponder, toggleFilter, toggleMotion, KINDS } from './store.js';
 import { el, button, progress, checklist, field, eta, age, stateClass } from './ui.js';
 import { mountInitiatives } from './initiatives.js';
+import { liveFields } from './adapt.js';
 import { mountActivity } from './activity.js';
 import { mountOwners } from './owners.js';
 import { mountChat } from './chat.js';
@@ -81,9 +82,13 @@ function renderInspector(state) {
     if (item.note) content.append(el('p', 'detail-intro', item.note));
     if (item.error) content.append(el('p', 'detail-error', `Data error: ${item.error}`));
     content.append(progress(item), checklist(item, true));
-    fields.append(field('Ticket', item.ticket || '—'), field('Owner', item.owner || '—'), field('Next step', item.next_step || '—'),
+    const live = liveFields(item, state.owners, state.asks, state.events, state.now);  // same as the card (click-test a954 F2)
+    fields.append(field('Ticket', item.ticket || '—'),
+      field('Owner', live.owner ? `${live.owner.name} · ${live.owner.state}` : (item.owner ? `${item.owner} · no live owner` : '—')),
+      field('Next step', item.next_step || '—'),
       field('Next step estimate', eta(item.next_eta, item.estimate_by, '')), field('Full completion estimate', eta(item.full_eta, item.estimate_by, '')),
-      field('Updated', item.updated || '—'));
+      field('Updated', live.updated ? `${age(live.updated, state.now)}${live.stale ? ' · no activity for over 30 min' : ''}` : 'No activity recorded'));
+    if (live.note) fields.append(field('Last note', `“${live.note.text}” · ${live.note.by} · ${age(live.note.at, state.now)}`));
     content.append(fields);
     const owner = state.owners.find(entry => entry.initiative_id === item.id);
     if (owner) content.append(button('detail-action', `Inspect owner ${owner.name} ↗`, () => select('owner', owner.agent_id)));

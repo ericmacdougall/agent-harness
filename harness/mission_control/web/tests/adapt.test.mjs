@@ -211,3 +211,14 @@ test('a future or skewed stamp never holds the 30-minute flag off', () => {
   assert.equal(offset.updated, '2026-11-10T07:50:00+05:00');
   assert.equal(offset.stale, false);  // 02:50Z is newer than 02:40Z although it sorts lower as text
 });
+
+test('a replied ask header follows main: waiting, read, replied; the status line states the read time', () => {
+  const t = (status, extra = {}) => ({ message: { status, ts: '2026-11-10T02:00:00Z', ...extra }, replies: [] });
+  assert.equal(adapt.askProgress([t('queued')]), 'Answered by you · waiting for main');
+  assert.equal(adapt.askProgress([t('delivered', { read_at: '2026-11-10T02:00:05Z' })]), 'Answered by you · read by main');
+  assert.equal(adapt.askProgress([{ ...t('answered'), replies: [{ text: 'ok' }] }]), 'Answered by you · main replied');
+  assert.equal(adapt.askProgress([t('failed')]), '');
+  const status = adapt.replyStatus({ status: 'answered', ts: 'a', read_at: 'b' }, () => '06:39 PM', () => '5 s after you sent it');
+  assert.equal(status, 'Read by main at 06:39 PM (5 s after you sent it) · answered');
+  assert.equal(adapt.replyStatus({ status: 'queued' }, String, String), 'Sent · waiting for main to read it');
+});

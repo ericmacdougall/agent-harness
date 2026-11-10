@@ -183,3 +183,20 @@ export function liveFields(item, owners = [], asks = [], events = [], now = Date
   return { owner: owner ? { name: owner.name, state: owner.state, runtime: owner.runtime } : null, note, openAsks,
     push: push ? { summary: push.summary, at: push.ts } : null, updated, stale };
 }
+
+// The header of an ask the user has replied to follows main's progress (click-test a954 F1: it stayed "waiting").
+export function askProgress(trail) {
+  const live = trail.filter(t => !['failed', 'forged'].includes(t.message.status));
+  if (!live.length) return '';
+  if (live.some(t => t.replies.length)) return 'Answered by you · main replied';
+  if (live.some(t => t.message.read_at || ['delivered', 'answering', 'answered'].includes(t.message.status))) return 'Answered by you · read by main';
+  return 'Answered by you · waiting for main';
+}
+// One status line per reply: the read time is stated as "Read by main at T", then where main has got to.
+export function replyStatus(message, time, gap) {
+  const base = { sending: 'Sending…', queued: 'Sent · waiting for main to read it', failed: 'Not sent · retry from the chat panel',
+    forged: 'Rejected: not signed by this dashboard' };
+  if (base[message.status]) return base[message.status];
+  const read = message.read_at ? `Read by main at ${time(message.read_at)} (${gap(message.ts, message.read_at)})` : 'Read by main';
+  return read + ({ answering: ' · answering', answered: ' · answered' }[message.status] || '');
+}

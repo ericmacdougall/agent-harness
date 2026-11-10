@@ -4,12 +4,9 @@
 // `[ask:<id>]`; main resolves the ask from it, and the next ledger read moves it to the history.
 import { getState, subscribe, askReplyAccess, sendAskReply } from './store.js';
 import { el, age } from './ui.js';
-import { trailOf, waitingOnUser } from './adapt.js';
+import { trailOf, waitingOnUser, askProgress, replyStatus } from './adapt.js';
 
 const BASE_TITLE = 'Mission Control';
-const SENT_TEXT = { sending: 'Sending…', queued: 'Sent · waiting for main to read it', delivered: 'Read by main',
-  answering: 'Read by main · answering', answered: 'Read by main · answered', failed: 'Not sent · retry from the chat panel',
-  forged: 'Rejected: not signed by this dashboard' };
 
 const time = iso => { const d = new Date(iso); return Number.isFinite(d.getTime()) ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''; };
 function gap(from, to) {
@@ -27,8 +24,7 @@ function renderTrail(box, trail) {
     const head = el('div', 'needs-trail-head');
     const forged = entry.message.status === 'forged';  // planted in the store, not sent from this page (L5)
     head.append(el('span', `needs-trail-who${forged ? ' forged' : ''}`, forged ? 'Not from you' : 'You'), el('span', '', time(entry.message.ts)));
-    const status = el('span', `needs-trail-status ${entry.message.status}`, SENT_TEXT[entry.message.status] || entry.message.status);
-    if (entry.message.read_at) status.textContent += ` at ${time(entry.message.read_at)} (${gap(entry.message.ts, entry.message.read_at)})`;
+    const status = el('span', `needs-trail-status ${entry.message.status}`, replyStatus(entry.message, time, gap));
     mine.append(head, el('p', 'needs-trail-text', entry.text), status);
     for (const reply of entry.replies) {
       const answer = el('div', 'needs-trail-reply');
@@ -129,7 +125,7 @@ export function mountNeeds() {
       const trail = trailOf(state.messages, ask.id);
       const answered = !waitingOnUser(state.messages, ask);
       parts.row.classList.toggle('answered', answered);
-      parts.kind.textContent = answered ? 'Answered by you · waiting for main' : ask.kind === 'assumption' ? 'Assumption to confirm' : 'Question';
+      parts.kind.textContent = answered ? askProgress(trail) : ask.kind === 'assumption' ? 'Assumption to confirm' : 'Question';
       parts.ticket.textContent = [ask.ticket, ask.owner && ask.owner !== 'main' ? `from ${ask.owner}` : ''].filter(Boolean).join(' · ');
       parts.when.textContent = age(ask.at, state.now);
       if (ask.at) parts.when.dateTime = ask.at;
