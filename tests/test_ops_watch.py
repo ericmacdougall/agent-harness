@@ -506,28 +506,94 @@ class DriftTests(GitFixture):
         self.assertIn("drift:claude-md", a)
         self.assertEqual(a["drift:hooks"]["detail"]["differ"], ["deliver.py"])
 
-    def test_installed_file_not_on_main_is_a_high_local_only_alert(self):
+    def drift_world(self):
         harness = "# Agent Harness engineering workflow\n\nrule one\n"
-        repo = self.make_repo({"HARNESS.md": harness, "harness/hooks/wal.py": "print(1)\n"})
+        repo = self.make_repo({"HARNESS.md": harness, "harness/hooks/wal.py": "print(1)\n", "harness/hooks/old.py": "print('old')\n"})
         claude = self.home / ".claude"
         hooks = claude / "hooks"
         hooks.mkdir(parents=True)
         (hooks / "wal.py").write_text("print(1)\n")
+        (hooks / "old.py").write_text("print('old')\n")
+        (claude / "CLAUDE.md").write_text(f"<!-- agent-harness:start -->\n{harness}<!-- agent-harness:end -->\n")
+        cfg = dict(self.cfg, drift={"repo": str(repo), "ref": "origin/main", "claude_dir": str(claude)})
+        return repo, hooks, cfg
+
+    def test_installed_file_on_no_pushed_branch_is_a_high_local_only_alert(self):
+        repo, hooks, cfg = self.drift_world()
         (hooks / "codex_pool.py").write_text("print('only here')\n")
         (hooks / "codex_pool_policy.json").write_text("{}")
         (hooks / "commit_policy.local.json").write_text("{}")  # machine-local override: expected
         (hooks / "ah.py.bak-pre-1").write_text("x")  # backup: not a hook
         (hooks / "__pycache__").mkdir()
+        (hooks / "dir.py").mkdir()  # a directory named like a hook is not a hook
         (hooks / "linked.py").symlink_to(hooks / "wal.py")  # a symlink is not followed
-        (claude / "CLAUDE.md").write_text(f"<!-- agent-harness:start -->\n{harness}<!-- agent-harness:end -->\n")
-        cfg = dict(self.cfg, drift={"repo": str(repo), "ref": "origin/main", "claude_dir": str(claude)})
         a = keys(ow.check_drift(cfg, ow.run))
         self.assertEqual(a["drift:local-only"]["severity"], "high")
         self.assertEqual(a["drift:local-only"]["detail"]["files"], ["codex_pool.py", "codex_pool_policy.json"])
+        self.assertIn("codex_pool.py, codex_pool_policy.json", a["drift:local-only"]["message"])
         self.assertNotIn("drift:hooks", a)
         (hooks / "codex_pool.py").unlink()
         (hooks / "codex_pool_policy.json").unlink()
         self.assertNotIn("drift:local-only", keys(ow.check_drift(cfg, ow.run)))
+
+    def test_a_pushed_but_unmerged_file_is_a_warning_and_an_edited_one_is_high(self):
+        repo, hooks, cfg = self.drift_world()
+        git("checkout", "-q", "-b", "feat/pool", cwd=repo)
+        (repo / "harness/hooks/codex_pool.py").write_text("print('pushed')\n")
+        git("add", "-A", cwd=repo)
+        git("commit", "-qm", "pool", cwd=repo)
+        git("update-ref", "refs/remotes/origin/feat/pool", "HEAD", cwd=repo)
+        git("checkout", "-q", "main", cwd=repo)
+        (hooks / "codex_pool.py").write_text("print('pushed')\n")  # byte-identical to the pushed branch
+        a = keys(ow.check_drift(cfg, ow.run))
+        self.assertEqual(a["drift:unmerged"]["severity"], "warning")
+        self.assertIn("codex_pool.py", a["drift:unmerged"]["detail"]["files"])
+        self.assertNotIn("drift:local-only", a)
+        (hooks / "codex_pool.py").write_text("print('pushed, then edited locally')\n")
+        a = keys(ow.check_drift(cfg, ow.run))
+        self.assertEqual(a["drift:local-only"]["severity"], "high")
+        self.assertNotIn("drift:unmerged", a)
+
+    def test_a_file_main_retired_is_a_warning_to_delete_it(self):
+        repo, hooks, cfg = self.drift_world()
+        git("rm", "-q", "harness/hooks/old.py", cwd=repo)
+        git("commit", "-qm", "retire old", cwd=repo)
+        git("update-ref", "refs/remotes/origin/main", "HEAD", cwd=repo)
+        (hooks / "old.py").write_text("print('old')\n")
+        a = keys(ow.check_drift(cfg, ow.run))
+        self.assertEqual(a["drift:retired"]["detail"]["files"], ["old.py"])
+        self.assertEqual(a["drift:retired"]["severity"], "warning")
+        self.assertNotIn("drift:local-only", a)
+
+    def test_a_differing_file_and_local_only_files_raise_both_alerts_and_long_lists_are_bounded(self):
+        repo, hooks, cfg = self.drift_world()
+        (hooks / "wal.py").write_text("print('changed')\n")
+        for n in range(8):
+            (hooks / f"mine{n}.py").write_text(f"print({n})\n")
+        a = keys(ow.check_drift(cfg, ow.run))
+        self.assertEqual(a["drift:hooks"]["detail"]["differ"], ["wal.py"])
+        self.assertEqual(len(a["drift:local-only"]["detail"]["files"]), 8)
+        self.assertTrue(a["drift:local-only"]["message"].endswith(" ..."))
+        self.assertIn("8 installed hook file(s)", a["drift:local-only"]["message"])
+
+    def test_an_empty_main_hook_list_is_a_check_error_not_a_flood(self):
+        repo, hooks, cfg = self.drift_world()
+        (hooks / "mine.py").write_text("print(1)\n")
+        git("rm", "-rq", "harness/hooks", cwd=repo)
+        git("commit", "-qm", "restructure", cwd=repo)
+        git("update-ref", "refs/remotes/origin/main", "HEAD", cwd=repo)
+        with self.assertRaises(RuntimeError):
+            ow.check_drift(cfg, ow.run)
+
+    def test_an_unreadable_hooks_folder_is_a_check_error(self):
+        repo, hooks, cfg = self.drift_world()
+        (hooks / "mine.py").write_text("print(1)\n")
+        os.chmod(hooks, 0)
+        self.addCleanup(os.chmod, hooks, 0o755)
+        if os.access(hooks, os.R_OK):
+            self.skipTest("running as a user that ignores permissions")
+        with self.assertRaises((OSError, RuntimeError)):
+            ow.check_drift(cfg, ow.run)
 
     def test_no_repo_skips(self):
         cfg = dict(self.cfg, drift={"repo": str(self.home / "none"), "ref": "origin/main", "claude_dir": str(self.home)})

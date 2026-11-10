@@ -1111,12 +1111,36 @@ def check_drift(cfg, runner):
         out.append(alert("drift", "drift:hooks", "warning",
                          f"installed hooks differ from {ref}: {len(differ)} changed, {len(missing)} missing",
                          {"differ": sorted(differ), "missing": sorted(missing), "ref": ref}))
+    if not on_main:
+        raise RuntimeError("ls-tree returned no hook files: wrong repo or ref")  # never flag every installed hook as local-only
     local_only = local_only_hooks(claude / "hooks", on_main)
-    if local_only:  # work that exists only on this machine is lost with it (GoodQA #15565: codex_pool.py was never pushed)
+    pushed, retired, lost = {}, [], []
+    for name in local_only[:200]:
+        rc, gone = runner(["git", "-C", repo, "log", "-1", "--format=%H", ref, "--", f"harness/hooks/{name}"], 30, env=env)
+        if rc == 0 and (gone or "").strip():  # main had it once and deleted it
+            retired.append(name)
+            continue
+        blob = git_blob_sha(safe_read(claude / "hooks" / name, 16 * 1024 * 1024))
+        rc, commit = runner(["git", "-C", repo, "log", "--remotes=origin", "-1", "--format=%H", f"--find-object={blob}", "--",
+                             f"harness/hooks/{name}"], 30, env=env)
+        if rc == 0 and (commit or "").strip():
+            pushed[name] = commit.strip()[:12]
+        else:
+            lost.append(name)
+    if lost:  # work that exists only on this machine is lost with it (GoodQA #15565: codex_pool.py was never pushed)
         out.append(alert("drift", "drift:local-only", "high",
-                         f"{len(local_only)} installed hook file(s) are not on {ref}: {', '.join(local_only[:6])}"
-                         + (" ..." if len(local_only) > 6 else ""),
-                         {"files": local_only[:50], "ref": ref, "fix": "push the branch and open a PR, or remove the file"}))
+                         f"{len(lost)} installed hook file(s) are on no pushed branch and not on {ref}: {', '.join(lost[:6])}"
+                         + (" ..." if len(lost) > 6 else ""),
+                         {"files": lost[:50], "ref": ref, "fix": "push the branch and open a PR, or remove the file"}))
+    if pushed:  # pushed on a branch that is not merged yet: a merge lag, not a loss risk
+        out.append(alert("drift", "drift:unmerged", "warning",
+                         f"{len(pushed)} installed hook file(s) are pushed but not merged to {ref}: {', '.join(sorted(pushed)[:6])}"
+                         + (" ..." if len(pushed) > 6 else ""),
+                         {"files": dict(sorted(pushed.items())[:50]), "ref": ref}))
+    if retired:  # main deleted these; hosts installed earlier keep them
+        out.append(alert("drift", "drift:retired", "warning",
+                         f"{len(retired)} installed hook file(s) were retired from {ref}; delete them: {', '.join(retired[:6])}",
+                         {"files": retired[:50], "ref": ref}))
     return out
 
 
@@ -1124,10 +1148,9 @@ def local_only_hooks(hooks_dir: Path, on_main: set) -> list:
     """Installed .py and .json hook files that main does not have. Machine-local overrides (*.local.json), editor backups
     and caches are expected; symlinks and subdirectories are not followed."""
     found = []
-    try:
-        entries = sorted(os.scandir(hooks_dir), key=lambda e: e.name)
-    except OSError:
+    if not hooks_dir.is_dir():
         return found
+    entries = sorted(os.scandir(hooks_dir), key=lambda e: e.name)  # an unreadable folder raises: a check error, not silence
     for entry in entries:
         name = entry.name
         if not name.endswith((".py", ".json")) or name.endswith(".local.json") or name in on_main:
