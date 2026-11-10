@@ -533,6 +533,28 @@ class SameTicketReassignment(Base):
         self.assertIn("dropowner", out["undisposed"])
 
 
+class PendingStopNoise(Base):
+    """GoodQA #15565: one pending_stop WAL line per stop episode, not one per stop (1,130 in one session)."""
+
+    def pending(self, key, at):
+        return ah.write(self.home, "task.pending", {"agent": "dropowner", "session": SESSION, "at": iso(at)}, SESSION, key)
+
+    def markers(self):
+        path = self.home / ".claude" / "wals" / SESSION / "agent-dropowner.jsonl"
+        return [json.loads(x) for x in path.read_text().splitlines() if '"pending_stop"' in x]
+
+    def test_repeated_stops_write_one_marker_until_the_owner_acts_again(self):
+        for n in range(5):
+            self.pending("pend-key-%02d-0000" % n, NOW + n * 700)
+        self.assertEqual(len(self.markers()), 1)
+        self.assertEqual(ah.pending_stops(self.home, SESSION).get("dropowner"), NOW)  # the ledger row liveness reads is still written
+        jl(self.home / ".claude" / "wals" / SESSION / "agent-dropowner.jsonl",
+           [{"at": iso(NOW + 4000), "event": "intent", "note": "back at work"}])
+        self.pending("pend-key-09-0000", NOW + 5000)
+        self.pending("pend-key-10-0000", NOW + 5700)
+        self.assertEqual(len(self.markers()), 2)  # a new episode after real activity
+
+
 class SubagentStopGate(Base):
     """I7: a sub-agent cannot end its turn with pending work and no armed waiter (desktop release owner, 2026-11-05)."""
 

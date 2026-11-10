@@ -91,6 +91,9 @@ def defaults(host: str) -> dict:
                       "no_heavy_jobs": darwin},
         "delivery": [],
         "drift": {"repo": None, "ref": "origin/main", "claude_dir": "~/.claude"},
+        # goodqa#15565: merged-not-deployed per registered service, and PENDING_REAL_TEST left open
+        "deploys": {"enabled": True, "services": [], "merged_after_h": 2, "pending_after_h": 6, "lookback_h": 72,
+                    "wal_root": "~/.claude/wals"},
         "codex_dir": "~/.codex",
         # thresholds shared with ahd's liveness.py (DESIGN.md section 5): SILENT 30 min warning, 60 min high
         "liveness": {"enabled": True, "wal_root": "~/.claude/wals", "silent_min": 30, "silent_high_min": 60,
@@ -100,7 +103,7 @@ def defaults(host: str) -> dict:
         "peers": [],
         # goodqa#15234: point events (a refused copy, a foreign process stop) describe something that happened, not a
         # condition that can stop being true, so nothing ever cleared them. They expire after ttl_h without a repeat.
-        "point_events": {"prefixes": ["heavy:", "ah-" + "kill:"], "ttl_h": 6},
+        "point_events": {"prefixes": ["heavy:", "ah-" + "kill:", "bgwait:"], "ttl_h": 6},  # bgwait: a waiter gave up (goodqa#15565)
         # goodqa#15070: timer jobs on other hosts, read over ssh: [{"host", "unit", "user": bool, "max_age_h"}]
         "remote_units": [],
         "sinks": {"comment": {"mode": "none"}, "deadman": [], "comment_min_interval_s": 1800},
@@ -1558,6 +1561,135 @@ def check_liveness(cfg, state, runner, now):
 
 # ---------------------------------------------------------------- run
 
+PENDING_NOTE_RE = re.compile(r"^\s*PENDING_REAL_TEST\s+([A-Za-z0-9][A-Za-z0-9._-]{0,40})\s*:")
+TESTED_NOTE_RE = re.compile(r"^\s*REALLY_TESTED\s+([A-Za-z0-9][A-Za-z0-9._-]{0,40})\s*:")
+MAX_DEPLOY_WAL_BYTES = 32 << 20
+
+
+def check_deploys(cfg, state, runner, now):
+    """GoodQA #15565 (never-drop slice 3): a fix that merged but never deployed, and a PENDING_REAL_TEST that never closed.
+
+    services: each {name, repo, ref (default origin/main), deployed_file}. deployed_file is JSON {"sha": ...} written by
+    the deploy tool. Ancestry is settled first: when the deployed sha is an ancestor of the ref and the OLDEST undeployed
+    commit is older than merged_after_h, one warning per service lists how many commits wait; a deploy ahead of the ref is
+    quiet; diverged histories are reported at any age. A service with no readable deploy record, a deployed sha the repo
+    does not know, or a failing git call is reported too (the drift cannot be judged). Pending: every PENDING_REAL_TEST
+    older than pending_after_h with no REALLY_TESTED of the same id in the same session is listed, one alert per session."""
+    d = cfg.get("deploys") or {}
+    home = home_of(cfg)
+    out = []
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+    merged_after = float(d.get("merged_after_h", 2)) * 3600
+    for svc in d.get("services") or []:
+        name = str(svc.get("name") or "")
+        repo = expand(home, svc.get("repo") or "")
+        if not name or not repo or not os.path.isdir(repo):
+            continue
+        ref = str(svc.get("ref") or "origin/main")
+        key = f"deploy-drift:{name}"
+        try:
+            deployed = json.loads(Path(expand(home, svc.get("deployed_file") or "")).read_text(encoding="utf-8")).get("sha")
+        except (OSError, ValueError, AttributeError):
+            deployed = None
+        if not isinstance(deployed, str) or not re.fullmatch(r"[0-9a-f]{7,40}", deployed):
+            out.append(alert("deploys", key, "warning", f"{name}: no readable deploy record, so merged-not-deployed cannot be judged",
+                             {"service": name}))
+            continue
+        rc, head = runner(["git", "-C", repo, "rev-parse", "--verify", "--end-of-options", ref], 30, env=env)
+        if rc != 0:
+            out.append(alert("deploys", key, "warning", f"{name}: cannot resolve {ref} in the repo, so drift cannot be judged",
+                             {"service": name}))
+            continue
+        head = head.strip()
+        # Codex final gate F1: establish ancestry BEFORE any age threshold. deployed..head of a diverged pair holds commits
+        # only reachable from head, so judging its ages alone hid a young divergence and called an old one merely behind.
+        rc, full = runner(["git", "-C", repo, "rev-parse", "--verify", "--quiet", "--end-of-options", f"{deployed}^{{commit}}"],
+                          30, env=env)
+        if rc != 0 or not full.strip():
+            out.append(alert("deploys", key, "warning", f"{name}: deployed {deployed[:12]} is not in the repo (or git failed), "
+                             f"so drift against {ref} {head[:8]} cannot be judged", {"service": name}))
+            continue
+        deployed = full.strip()
+        if deployed == head:
+            continue
+        # --is-ancestor exits 0 (yes) or 1 (no); anything else is a git failure, never read as "no alert"
+        behind, _ = runner(["git", "-C", repo, "merge-base", "--is-ancestor", deployed, head], 30, env=env)
+        ahead = runner(["git", "-C", repo, "merge-base", "--is-ancestor", head, deployed], 30, env=env)[0] if behind == 1 else 1
+        if behind not in (0, 1) or ahead not in (0, 1):
+            out.append(alert("deploys", key, "warning", f"{name}: git merge-base failed for deployed {deployed[:8]} and {ref} "
+                             f"{head[:8]}, so drift cannot be judged", {"service": name}))
+            continue
+        if behind == 1 and ahead == 0:
+            continue  # the deployed build is ahead of the ref (a hotfix or an unmerged deploy): not merged-not-deployed
+        if behind == 1:
+            out.append(alert("deploys", key, "warning", f"{name}: deployed {deployed[:8]} and {ref} {head[:8]} have diverged",
+                             {"service": name, "deployed": deployed, "head": head}))
+            continue
+        rc, times = runner(["git", "-C", repo, "log", "--format=%ct", f"{deployed}..{head}"], 30, env=env)
+        stamps = sorted(int(x) for x in times.split() if x.isdigit()) if rc == 0 else []
+        if rc != 0 or not stamps:
+            out.append(alert("deploys", key, "warning", f"{name}: git log of {deployed[:8]}..{head[:8]} failed or was empty, so "
+                             f"drift cannot be judged", {"service": name}))
+        elif now - stamps[0] >= merged_after:
+            out.append(alert("deploys", key, "warning",
+                             f"{name}: {len(stamps)} merged commit(s) not deployed, oldest {int((now - stamps[0]) // 3600)}h old "
+                             f"(deployed {deployed[:8]}, {ref} {head[:8]})", {"service": name, "commits": len(stamps)}))
+    pending_after = float(d.get("pending_after_h", 6)) * 3600
+    look = float(d.get("lookback_h", 72)) * 3600
+    root = Path(expand(home, d.get("wal_root") or "~/.claude/wals"))
+    try:
+        sessions = [p for p in root.iterdir() if p.is_dir()]
+    except OSError:
+        sessions = []
+    for session in sessions:
+        events, unscanned = {}, []  # id -> [(time, "P" pending | "T" tested)]
+        for path in session.glob("*.jsonl"):
+            try:
+                if now - path.lstat().st_mtime > look:
+                    continue
+                # regular files only, never a symlink, a FIFO or a device; over the cap RAISES instead of being cut, and the
+                # file is reported as not scanned (red-team a5: a silent skip would clear a real alert)
+                text = read_text_capped(path, MAX_DEPLOY_WAL_BYTES)
+            except OSError:
+                unscanned.append(path.name)
+                continue
+            for raw in text.splitlines():
+                if "REAL" not in raw:
+                    continue
+                try:
+                    row = json.loads(raw)
+                except ValueError:
+                    continue
+                note = str(row.get("note") or "") if isinstance(row, dict) else ""
+                at = parse_ts(row.get("at")) if isinstance(row, dict) else None
+                m = TESTED_NOTE_RE.match(note)
+                if m and at is not None:
+                    events.setdefault(m.group(1), []).append((at, "T"))
+                m = PENDING_NOTE_RE.match(note)
+                if m and at is not None:
+                    events.setdefault(m.group(1), []).append((at, "P"))
+        # An id is open from its FIRST pending after its LAST test: a behavior change that re-opens it invalidates the earlier
+        # live test (red-team ad4294 A1), and restating a PENDING in a recap must not restart its clock (N1).
+        old = []
+        for ident, rows in events.items():
+            since = None
+            for at, kind in sorted(rows):
+                since = None if kind == "T" else (at if since is None else since)
+            if since is not None and now - since >= pending_after:
+                old.append(ident)
+        old.sort()
+        if unscanned:
+            out.append(alert("deploys", f"pending-unscanned:{session.name[:8]}", "warning",
+                             f"{len(unscanned)} log file(s) of session {session.name[:8]} could not be scanned for open "
+                             f"PENDING_REAL_TEST (over {MAX_DEPLOY_WAL_BYTES >> 20} MiB, not a regular file or unreadable)",
+                             {"session": session.name[:8], "files": unscanned[:5]}))
+        if old:
+            out.append(alert("deploys", f"pending-open:{session.name[:8]}", "warning",
+                             f"{len(old)} PENDING_REAL_TEST open for {int(pending_after // 3600)}h or more with no REALLY_TESTED "
+                             f"(session {session.name[:8]}): {', '.join(old[:6])}", {"session": session.name[:8], "ids": old[:20]}))
+    return out
+
+
 DEFAULT_CHECKS = {
     "disk": check_disk,
     "units": lambda c, s, r, n: check_units(c, s, r, n) if c["units"].get("enabled") and shutil.which("systemctl") else [],
@@ -1570,6 +1702,7 @@ DEFAULT_CHECKS = {
     "liveness": lambda c, s, r, n: check_liveness(c, s, r, n) if c["liveness"].get("enabled") else [],
     "peers": check_peers,
     "remote_units": check_remote_units,
+    "deploys": lambda c, s, r, n: check_deploys(c, s, r, n) if (c.get("deploys") or {}).get("enabled", True) else [],
 }
 RUN_CHECK = "_run"    # internal errors; cleared by any completed run
 SINK_CHECK = "_sink"  # delivery failures; cleared when that sink recovers

@@ -1465,7 +1465,10 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
                                          "note": (args.get("note") or "")[:300]})
     elif op == "task.pending":
         wal = _wal_path(home, args["session"], args["agent"])
-        if wal.is_file():  # the marker is written by the gate, never counted as the owner's activity
+        # GoodQA #15565: one marker per stop episode. The gate fires on every stop, and 1,130 pending_stop lines in a
+        # session's WALs were read as work items by the audit and Mission Control. The ledger row (liveness reads it)
+        # is written every time; the WAL line only when the last line is not already a pending_stop.
+        if wal.is_file() and not _last_line_is(wal, "pending_stop"):  # the marker is never counted as owner activity
             _wal_append(home, wal, {"at": now, "event": "pending_stop", "id": wid, "by": "dropped_gate",
                                     "note": "stopped with pending work and no armed waiter (goodqa#14791 I7)"})
         out["wal"] = wid
@@ -1527,6 +1530,20 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
                                   + (f"(`ah kill --pid {','.join(pids)} --reason '<why>'`) " if pids else "")
                                   + "or hand them to the replacement.")
     return out
+
+
+def _last_line_is(path: Path, event: str) -> bool:
+    """Whether the last complete JSON line of a WAL has this event (reads only the final 8 KiB)."""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 8192))
+            tail = handle.read(8192)
+        lines = [ln for ln in tail.splitlines() if ln.strip()]
+        return bool(lines) and json.loads(lines[-1]).get("event") == event
+    except (OSError, ValueError, AttributeError):
+        return False
 
 
 WAIT_LOOP_RE = re.compile(r"\b(?:until|while)\b.{0,400}?\b(?:sleep|pgrep|grep|inotifywait|wait)\b", re.S)
