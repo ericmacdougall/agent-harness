@@ -462,6 +462,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
                         raise OSError('synthetic cleanup failure')
                 with contextlib.ExitStack() as stack:
                     stack.enter_context(patch.dict(os.environ, {'AGENT_HARNESS_USAGE_DIR': str(self.root / ('usage-' + failure))}))
+                    stack.enter_context(patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + system_path()}))
                     stack.enter_context(patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(output)]))
                     stack.enter_context(patch.object(module, 'plan_resource_gate', return_value=(0, '')))
@@ -1048,6 +1049,7 @@ print(json.dumps({{'role': 'assistant', 'content': 'KIMI_ADVISORY: ACCEPT\\nVERD
         errors = io.StringIO()
         with patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(self.output)]), \
+             patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + system_path()}), \
              patch.object(module, 'plan_resource_gate', return_value=(0, '')), \
              patch.object(module, 'review_snapshot', return_value=('fixture', 'PLAN_RESULT: ACCEPT', '')), \
              patch.object(os, 'fsync', side_effect=fsync_then_mutate), \
@@ -1080,6 +1082,7 @@ print(json.dumps({{'role': 'assistant', 'content': 'KIMI_ADVISORY: ACCEPT\\nVERD
         errors = io.StringIO()
         with patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(self.output)]), \
+             patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + system_path()}), \
              patch.object(module, 'plan_resource_gate', return_value=(0, '')), \
              patch.object(module, 'review_snapshot', return_value=('fixture', 'PLAN_RESULT: ACCEPT', '')), \
              patch.object(os, 'link', side_effect=link_then_mutate), \
