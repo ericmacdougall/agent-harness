@@ -28,6 +28,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 MAX_STOP_BLOCKS = 25
+OWNER_SCAN_BUDGET_S = 9  # the hook has 15 s; `ah owners` took ~24 s on a 2,089-owner session (2026-11-10)
 VALVE_KEY = "mission:gate-valve"
 
 
@@ -87,7 +88,7 @@ def cmd_stop(payload: dict, now: float | None = None) -> dict:
     import mission_coverage as mc  # noqa: PLC0415
     if not os.path.lexists(mc.goals_path(home)):
         return {}  # no mission configured on this host
-    a = mc.assess(home, session, now)
+    a = mc.assess(home, session, now, deadline_s=OWNER_SCAN_BUDGET_S)
     if a["state"] == "absent":
         return {}
     if a["state"] == "owners-unavailable":
@@ -107,7 +108,7 @@ def cmd_stop(payload: dict, now: float | None = None) -> dict:
         if not uncovered:
             ring(home, "clear", "mission gate: every goal is covered again", {})
             return {}
-        text = mc.gate_message(a["results"], a.get("advice") or "")
+        text = mc.gate_message(a["results"], a.get("advice") or "") + ("\n" + a["owners_note"] if a.get("owners_note") else "")
         names = [f"{r['id']} ({r['ticket'] or 'no ticket'})" for r in uncovered]
         sig_src = ",".join(sorted(r["id"] for r in uncovered))
     sig = hashlib.sha256(sig_src.encode()).hexdigest()[:16]

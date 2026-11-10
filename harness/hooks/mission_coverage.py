@@ -632,9 +632,99 @@ def live_owner(row, pol=None) -> bool:
     return state.startswith("SILENT") and not _slot_freed(row)
 
 
-def owner_rows(home: Path, session: str, now=None) -> list:
+def stream_tickets(home: Path, session: str) -> dict:
+    """{owner agent: [ticket keys]} registered with `ah task register --ticket` in this session: the stream ticket
+    main bound the owner to, which counts besides the first ticket in the owner's WAL."""
     import ah  # noqa: PLC0415
-    return list(ah.owners(home, session, now=now).get("owners") or [])
+    out = {}
+    for r in ah._ledger(home):
+        a = r.get("args") or {}
+        if r.get("op") != "task.register" or a.get("session") != session or not isinstance(a.get("owner_agent"), str):
+            continue
+        key = ticket_key(a.get("ticket"))
+        if key and key not in out.setdefault(a["owner_agent"], []):
+            out[a["owner_agent"]].append(key)
+    return out
+
+
+def owner_rows(home: Path, session: str, now=None) -> list:
+    """`ah owners` rows, each with `stream_tickets` (registered tickets, matched by agent id or its 8+ char prefix)."""
+    import ah  # noqa: PLC0415
+    rows = list(ah.owners(home, session, now=now).get("owners") or [])
+    bound = stream_tickets(home, session)
+    for r in rows:
+        agent = str(r.get("agent_id") or "")
+        r["stream_tickets"] = sorted({t for owner, ts in bound.items()
+                                      if owner == agent or (len(owner) >= 8 and agent.startswith(owner)) for t in ts})
+    return rows
+
+
+class OwnerDeadline(BaseException):
+    """The owner scan ran past its budget (BaseException: no `except Exception` inside ah may swallow it)."""
+
+
+SNAPSHOT_MAX_S = 15 * 60
+SNAPSHOT_FIELDS = ("agent_id", "type", "ticket", "stream_tickets", "state", "owner", "parent", "last_activity", "idle_s",
+                   "disposition", "decision_required")
+
+
+def owner_snapshot_path(home: Path, session: str) -> Path:
+    return Path(home) / ".agent-harness" / "state" / "mission" / f"owners-{session}.json"
+
+
+def save_owner_snapshot(home: Path, session: str, rows, now=None) -> None:
+    """Keep the last full owner scan (only the fields the rule reads), so a Stop that cannot afford the scan can use it."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", session or ""):
+        return
+    slim = [{k: r.get(k) for k in SNAPSHOT_FIELDS} for r in rows if isinstance(r, dict)][:5000]
+    with contextlib.suppress(OSError, TypeError, ValueError):
+        _atomic(owner_snapshot_path(home, session),
+                json.dumps({"at": time.time() if now is None else now, "session": session, "rows": slim}).encode())
+
+
+def load_owner_snapshot(home: Path, session: str, now=None):
+    """The snapshot when it is at most SNAPSHOT_MAX_S old, else None."""
+    now = time.time() if now is None else now
+    try:
+        path = owner_snapshot_path(home, session)
+        if os.path.islink(path):
+            return None
+        doc = safe_input.safe_json_loads(safe_input.read_bounded(path, 16 << 20), max_depth=MAX_DEPTH)
+    except (safe_input.InputRejected, ValueError, OSError):
+        return None
+    if not isinstance(doc, dict) or doc.get("session") != session or not isinstance(doc.get("rows"), list) \
+            or not isinstance(doc.get("at"), (int, float)) or not 0 <= now - doc["at"] <= SNAPSHOT_MAX_S:
+        return None
+    return doc
+
+
+def owners_bounded(home: Path, session: str, now=None, deadline_s=None) -> tuple:
+    """(rows, note): a live scan (saved as the snapshot), abandoned after deadline_s seconds (SIGALRM, main thread
+    only) in favour of a snapshot at most SNAPSHOT_MAX_S old. Raises OwnerDeadline when neither is available."""
+    import signal  # noqa: PLC0415
+    import threading  # noqa: PLC0415
+    armed = bool(deadline_s) and hasattr(signal, "setitimer") and threading.current_thread() is threading.main_thread()
+    previous = None
+    try:
+        if armed:
+            def expired(_signum, _frame):
+                raise OwnerDeadline()
+            previous = signal.signal(signal.SIGALRM, expired)
+            signal.setitimer(signal.ITIMER_REAL, float(deadline_s))
+        try:
+            rows = owner_rows(home, session, now)
+        finally:
+            if armed:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous)
+        save_owner_snapshot(home, session, rows, now)
+        return rows, ""
+    except OwnerDeadline:
+        snap = load_owner_snapshot(home, session, now)
+        if snap is None:
+            raise
+        age = int((time.time() if now is None else now) - snap["at"])
+        return snap["rows"], f"(owners from the owner snapshot taken {fmt_age(age)} ago: the live scan overran its budget)"
 
 
 def owner_progress(home: Path, session: str, agent: str) -> float:
@@ -750,7 +840,8 @@ def evaluate(goals, rows, now, asks=None, verify_source=None, verify_evidence=No
             else:
                 res["reason"] = "marked done but its done_evidence does not resolve (deploy record + live REALLY_TESTED)"
             continue
-        owners = [r for r in live if key and same_ticket(r.get("ticket"), key)]
+        owners = [r for r in live if key and any(same_ticket(t, key) for t in
+                                                 [r.get("ticket")] + list(r.get("stream_tickets") or [])[:20])]
         if owners:
             res["owners"] = sorted(r["agent_id"] for r in owners)
             last = max([progress.get(r["agent_id"]) or parse_ts(r.get("last_activity")) for r in owners]
@@ -878,7 +969,9 @@ def gate_message(results, advice: str = "") -> str:
     for r in sort_report([x for x in results if x["state"] == "UNCOVERED"]):
         g, t = r["id"], r["ticket"] or "no ticket"
         lines.append(f"  - {g} ({t}, priority {r['priority']}): {r['reason']}\n"
-                     f"      fix one of: start an owner on {t} (its first WAL intent names {t}); or\n"
+                     f"      fix one of: start an owner on {t} (its first WAL ticket is {t}), or bind a live owner to it:\n"
+                     f"      python3 ~/.claude/hooks/ah.py task register --owner-agent <id> --ticket \"GoodQA {t}\" --task <name> "
+                     f"--scope <scope> --source <source>; or\n"
                      f"      {SCRIPT} defer --goal {g} --ask <open ask id> --until <ISO>\n"
                      f"      {SCRIPT} defer --goal {g} --ticket <blocking ticket> --until <ISO>\n"
                      f"      {SCRIPT} defer --goal {g} --user-source '<user:... \"the user's words\">' [--until <ISO>]\n"
@@ -915,7 +1008,7 @@ def mission_alerts(assessment: dict) -> list:
 
 # ------------------------------------------------------------------ assessment (I/O around the rule)
 
-def assess(home: Path, session: str, now=None, with_commits: bool = False) -> dict:
+def assess(home: Path, session: str, now=None, with_commits: bool = False, deadline_s=None) -> dict:
     """{"state": absent|error|tampered|owners-unavailable|ok, "results", "advice", "error"}."""
     now = time.time() if now is None else now
     loaded = load_goals(home)
@@ -927,13 +1020,17 @@ def assess(home: Path, session: str, now=None, with_commits: bool = False) -> di
     if not audit["ok"]:
         return {"state": "tampered", "results": [], "error": audit["problem"]}
     try:
-        rows = owner_rows(home, session, now)
+        rows, owners_note = owners_bounded(home, session, now, deadline_s)
+    except OwnerDeadline:
+        return {"state": "owners-unavailable", "results": [],
+                "error": f"the owner scan overran {deadline_s}s and no owner snapshot is under {SNAPSHOT_MAX_S // 60} min old"}
     except Exception as error:  # noqa: BLE001 - no main WAL here or an ah defect: say so, never guess coverage
         return {"state": "owners-unavailable", "results": [], "error": f"{type(error).__name__}: {str(error)[:120]}"}
     pol = policy()
     goals = loaded["goals"]
     keys = {ticket_key(g.get("ticket")) for g in goals} - {None}
-    covering = [r for r in rows if live_owner(r, pol) and ticket_key(r.get("ticket")) in keys]
+    covering = [r for r in rows if live_owner(r, pol)
+                and {ticket_key(t) for t in [r.get("ticket")] + list(r.get("stream_tickets") or [])} & keys]
     progress = {r["agent_id"]: owner_progress(home, session, r["agent_id"]) for r in covering}
     commits = {}
     if with_commits:
@@ -951,7 +1048,7 @@ def assess(home: Path, session: str, now=None, with_commits: bool = False) -> di
     cap = owner_cap()
     ranked = cap_candidates(results, rows, cap, pol)
     return {"state": "ok", "results": results, "advice": cap_advice(results, rows, cap, pol), "session": session,
-            "victim": ranked[0]["agent_id"] if ranked else None}
+            "victim": ranked[0]["agent_id"] if ranked else None, "owners_note": owners_note}
 
 
 # ------------------------------------------------------------------ waking main (Mission Control inbox + ring)

@@ -561,6 +561,50 @@ class Notify(Base):
         mc.notify_main(["leads"], home=self.home, session=SESSION, chat=Chat)
 
 
+class RealDataFindings(Base):
+    """Dry run on the live session (2026-11-10, read-only): `ah owners` took ~24 s for 2,089 rows, past the 15 s Stop
+    timeout, and the harness owner af9e3370 (first WAL ticket goodqa#15592) did not cover the harness goal
+    (goodqa#15565) it is registered for."""
+
+    def test_registered_stream_ticket_binds_an_owner_to_the_goal(self):
+        import ah  # noqa: PLC0415
+        ah.write(self.home, "task.register", {"task": "harness-fixes", "owner_agent": "af9e3370", "session": SESSION,
+                                              "scope": "harness fixes", "ticket": "GoodQA goodqa#15565",
+                                              "source": f'user:{SESSION}/{USER_UUID} "park the self-update goal"'}, SESSION)
+        self.assertEqual(mc.stream_tickets(self.home, SESSION), {"af9e3370": ["goodqa#15565"]})
+        rows = [row("af9e3370", ticket="GoodQA #15592", stream_tickets=["goodqa#15565"])]
+        self.assertEqual(self.results([goal("harness", ticket="goodqa#15565")], rows)["harness"]["state"], "COVERED")
+        rows = [row("af9e3370", ticket="GoodQA #15592")]  # mentioned later in its WAL, never registered: no cover
+        self.assertEqual(self.results([goal("harness", ticket="goodqa#15565")], rows)["harness"]["state"], "UNCOVERED")
+
+    def test_gate_uses_a_fresh_owner_snapshot_when_the_scan_overruns(self):
+        self.write_goals([goal()])
+        mc.save_owner_snapshot(self.home, SESSION, [row("a1111111")], NOW - 60)
+        with mock.patch.object(mc, "owner_rows", side_effect=mc.OwnerDeadline()):
+            out = mission_gate.cmd_stop(self.payload(), now=NOW)
+        self.assertEqual(out, {})  # covered according to the minute-old snapshot
+        mc.save_owner_snapshot(self.home, SESSION, [], NOW - 60)
+        with mock.patch.object(mc, "owner_rows", side_effect=mc.OwnerDeadline()):
+            out = mission_gate.cmd_stop(self.payload(), now=NOW)
+        self.assertEqual(out.get("decision"), "block")
+        self.assertIn("owner snapshot", out["reason"])
+
+    def test_stale_snapshot_fails_open_loudly(self):
+        self.write_goals([goal()])
+        mc.save_owner_snapshot(self.home, SESSION, [], NOW - 3600)
+        with mock.patch.object(mc, "owner_rows", side_effect=mc.OwnerDeadline()):
+            out = mission_gate.cmd_stop(self.payload(), now=NOW)
+        self.assertNotIn("decision", out)
+        self.assertIn("owner list", out["systemMessage"])
+
+    def test_a_live_scan_refreshes_the_snapshot(self):
+        self.write_goals([goal()])
+        self.stop([row("a1111111")])
+        snap = mc.load_owner_snapshot(self.home, SESSION, NOW + 10)
+        self.assertEqual([r["agent_id"] for r in snap["rows"]], ["a1111111"])
+        self.assertEqual(oct(mc.owner_snapshot_path(self.home, SESSION).stat().st_mode & 0o777), "0o600")
+
+
 class Install(unittest.TestCase):
     def test_gate_is_registered_next_to_the_other_stop_hooks(self):
         sys.path.insert(0, str(ROOT))
