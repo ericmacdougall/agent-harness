@@ -430,6 +430,106 @@ class GitTarget(NoBackupCase):
         (path / 'dist/c.js').write_text('z\n')  # one removed, one added: same count, newer mtime
         self.assertNotEqual(cg._no_backup_state(str(path), 'git')['ignored_sha256'], before)
 
+    def _question_resolver(self, path, extras_text):
+        def resolver(source, now=None, max_age=None, home=None):
+            return {'kind': 'answer', 'session': 'sess-1', 'uid': source.rsplit('/', 1)[-1].lower(), 'at': time.time(),
+                    'text': 'Delete, no backup (Recommended)', 'predefined': True,
+                    'question': 'Delete %s without a backup? %s' % (path, extras_text)}
+        return resolver
+
+    def test_extras_must_equal_a_delimited_token_of_the_question_goodqa_15565(self):
+        # Codex final gate F1: a substring test let a question naming metadata/ also authorize data/.
+        path = self.clone()
+        (path / 'public').mkdir()
+        (path / 'public/keep.txt').write_text('tracked\n')
+        run('git', 'add', 'public/keep.txt', cwd=path)
+        self.ignore(path, 'data/\nmetadata/\npublic/audio/\n')
+        for rel in ('data/survey.csv', 'metadata/m.json'):
+            (path / rel).parent.mkdir(parents=True, exist_ok=True)
+            (path / rel).write_text('x\n')
+        named_metadata = self._question_resolver(path, 'Ignored extras: metadata/')
+        self.refused(path, 'not named in the question', extra_ignored=['data/', 'metadata/'], resolver=named_metadata)
+        self.refused(path, 'not named in the question', extra_ignored=['data/'], resolver=named_metadata)
+        import shutil
+        shutil.rmtree(path / 'data')
+        shutil.rmtree(path / 'metadata')
+        (path / 'public/audio/x').mkdir(parents=True)
+        (path / 'public/audio/x/a.mp3').write_text('x\n')
+        self.refused(path, 'not named in the question', extra_ignored=['public/audio/'],
+                     resolver=self._question_resolver(path, 'Ignored extras: public/audio/x/'))
+        self.refused(path, 'not named in the question', extra_ignored=['public/audio/'],
+                     resolver=self._question_resolver(path, 'Ignored extras: public/audio and data/'))
+        self.refused(path, 'not named in the question', extra_ignored=['public/audio/'],
+                     resolver=self._question_resolver(path, 'Ignored extras: public/audio/s'))
+        # explicit delimiters (quotes, parentheses, commas, trailing full stop) still name the entry exactly
+        for text in ('Ignored extras: "public/audio/".', 'Ignored extras: (public/audio/), x.', "Extras: 'public/audio/';"):
+            with self.subTest(text=text):
+                self.assertTrue(self.approve(path, extra_ignored=['public/audio/'],
+                                             resolver=self._question_resolver(path, text)))
+
+    def test_a_same_count_replacement_with_restored_mtime_voids_the_approval_goodqa_15565(self):
+        # Codex final gate F2: count + newest mtime let dist/a.js be swapped for unique notes unnoticed.
+        path = self.clone()
+        self.ignore(path, 'dist/\n')
+        (path / 'dist/sub').mkdir(parents=True)
+        (path / 'dist/a.js').write_text('x\n')
+        (path / 'dist/sub/b.js').write_text('y\n')
+        before = cg._no_backup_state(str(path), 'git')['ignored_sha256']
+        self.approve(path)
+        self.assertTrue(self.approvals().covers(str(path)))
+        stamps = {rel: os.stat(path / rel).st_mtime_ns for rel in ('dist', 'dist/sub')}
+
+        def restore_dirs():
+            for rel, stamp in stamps.items():
+                os.utime(path / rel, ns=(stamp, stamp))
+
+        a_old = os.stat(path / 'dist/a.js')
+        (path / 'dist/a.js').unlink()
+        (path / 'dist/unique-notes.md').write_text('u\n')  # same size as a.js; its times are set to a.js's below
+        os.utime(path / 'dist/unique-notes.md', ns=(a_old.st_atime_ns, a_old.st_mtime_ns))
+        restore_dirs()
+        self.assertEqual(sum(1 for _ in os.scandir(path / 'dist')), 2)  # same count, same newest directory mtime
+        self.assertNotEqual(cg._no_backup_state(str(path), 'git')['ignored_sha256'], before)
+        self.assertFalse(self.approvals().covers(str(path)))
+        # a recreated nested file with the same name, size and times (only inode and ctime differ) also changes it
+        middle = cg._no_backup_state(str(path), 'git')['ignored_sha256']
+        b_old = os.stat(path / 'dist/sub/b.js')
+        (path / 'dist/sub/b.js').unlink()
+        (path / 'dist/sub/b.js').write_text('z\n')
+        os.utime(path / 'dist/sub/b.js', ns=(b_old.st_atime_ns, b_old.st_mtime_ns))
+        restore_dirs()
+        self.assertNotEqual(cg._no_backup_state(str(path), 'git')['ignored_sha256'], middle)
+
+    def test_local_exclude_rule_past_one_mebibyte_refuses_goodqa_15565(self):
+        # Codex final gate F3: only the first 1 MiB was read.
+        path = self.clone()
+        (path / 'dist').mkdir()
+        (path / 'dist/notes.md').write_text('unique\n')
+        with open(path / '.git' / 'info' / 'exclude', 'w') as handle:
+            handle.write(('#' * 1023 + '\n') * 1100)  # about 1.1 MiB of comments
+            handle.write('dist/\n')
+        self.refused(path, 'local exclude rules')
+        with open(path / '.git' / 'info' / 'exclude', 'w') as handle:
+            handle.write(('#' * 1023 + '\n') * 4200)  # over the 4 MiB inspection limit, comments only
+        self.refused(path, 'exclude')
+
+    def test_local_exclude_inspection_failure_refuses_and_absence_is_fine_goodqa_15565(self):
+        path = self.clone()
+        exclude = path / '.git' / 'info' / 'exclude'
+        exclude.unlink()
+        self.assertTrue(self.approve(path))  # no exclude file at all is fine
+        exclude.mkdir()  # a directory named exclude cannot be inspected
+        self.refused(path, 'exclude')
+        exclude.rmdir()
+        exclude.write_text('dist/\n')
+        os.chmod(exclude, 0)
+        try:
+            if os.access(exclude, os.R_OK):
+                self.skipTest('running as a user that ignores permissions')
+            self.refused(path, 'exclude')
+        finally:
+            os.chmod(exclude, 0o644)
+
     def test_a_late_addition_to_an_ignored_folder_voids_the_approval_goodqa_15565(self):
         path = self.clone()
         self.ignore(path, 'dist/\n')

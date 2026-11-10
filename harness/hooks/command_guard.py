@@ -6369,8 +6369,11 @@ def _extra_ignored_ok(entry, extra):
     return text.endswith('/') or parts[-1].endswith(('.d.ts', '.tsbuildinfo'))
 
 
-def _scan_ignored_dir(path, name):
-    """Walk one ignored folder (never following links) and return (entries, newest mtime_ns). Raises ValueError for a nested
+def _scan_ignored_dir(path, name, manifest=None):
+    """Walk one ignored folder (never following links) and return (entries, newest mtime_ns). When `manifest` (a hashlib
+    object) is given, every entry is fed into it in a deterministic order as relative path, type, mode, size, mtime_ns,
+    inode and ctime_ns, so a same-count replacement with restored directory times still changes it. Raises ValueError
+    for a nested
     repository (its commits may exist nowhere else), a Claude, session or log folder, and, outside third-party trees, a
     secret, key, database, log or transcript file. A folder over IGNORED_SCAN_LIMIT entries is refused."""
     dependency = name in DEPENDENCY_SEGMENTS
@@ -6380,6 +6383,8 @@ def _scan_ignored_dir(path, name):
         raise ValueError('an ignored folder could not be read (%s); refused' % type(error).__name__)
 
     for root, dirs, files in os.walk(path, followlinks=False, onerror=unreadable):
+        dirs.sort()
+        files.sort()
         for d in dirs:
             if d.casefold() == '.git' or d.casefold() in (HARNESS_SEGMENTS if dependency else NEVER_SEGMENTS):
                 raise ValueError('an ignored folder holds a nested repository or a Claude, session or log folder (%s)' % d)
@@ -6393,6 +6398,14 @@ def _scan_ignored_dir(path, name):
             raise ValueError('an ignored folder is too large to check; refused')
         try:
             newest = max(newest, os.lstat(root).st_mtime_ns)
+            if manifest is not None:
+                rel_root = os.path.relpath(root, path)
+                for kind, names in (('d', dirs), ('f', files)):
+                    for entry in names:
+                        st = os.lstat(os.path.join(root, entry))
+                        manifest.update(('%s\0%s\0%o\0%d\0%d\0%d\0%d\n' % (
+                            os.path.join(rel_root, entry), kind, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ino,
+                            st.st_ctime_ns)).encode('utf-8', 'surrogateescape'))
         except OSError:
             raise ValueError('an ignored folder could not be inspected; refused')
     return seen, newest
@@ -6418,6 +6431,40 @@ def _scan_tree_for_nested_repos(real, ignored_dirs):
             raise ValueError('the working tree is too large to check; refused')
 
 
+LOCAL_EXCLUDE_LIMIT = 4 << 20
+
+
+def _refuse_local_exclude_rules(path):
+    """A local-only exclude rule can hide unique files that no committed .gitignore declares disposable. A missing file is
+    fine; the whole file (up to LOCAL_EXCLUDE_LIMIT) is read, and a larger file or any inspection failure refuses."""
+    import safe_input
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise ValueError('.git/info/exclude could not be inspected (%s); refused' % type(error).__name__)
+    try:
+        data = safe_input.read_bounded(path, LOCAL_EXCLUDE_LIMIT)
+    except safe_input.InputRejected as error:
+        raise ValueError('.git/info/exclude could not be inspected (%s: larger than %d bytes, unreadable or not a regular '
+                         'file); refused' % (error.code, LOCAL_EXCLUDE_LIMIT))
+    if any(ln.strip() and not ln.lstrip().startswith(b'#') for ln in data.splitlines()):
+        raise ValueError('the repository has local exclude rules (.git/info/exclude); files they hide are not '
+                         'declared disposable by the committed .gitignore; refused')
+
+
+def _question_tokens(question):
+    """The entries a question names, as explicitly delimited tokens: split on whitespace, commas, semicolons,
+    parentheses, brackets and quotes, with trailing sentence punctuation stripped. Extras must equal one exactly."""
+    tokens = set()
+    for raw in re.split(r'[\s,;()\[\]{}"\'`\u2018\u2019\u201c\u201d]+', question):
+        tok = raw.rstrip('.:!?')
+        if tok:
+            tokens.add(tok)
+    return tokens
+
+
 def _no_backup_state(real, target, home=None, attached=None, extra_ignored=None):
     """Every local fact that makes deleting `real` lose nothing, as a comparable dict. Raises ValueError when unsafe.
     The hook runs it again at delete time, so a change after approval voids the approval. extra_ignored names ignored
@@ -6441,13 +6488,7 @@ def _no_backup_state(real, target, home=None, attached=None, extra_ignored=None)
                          'refused')
     if os.path.lexists(os.path.join(git_dir, 'info', 'attributes')):
         raise ValueError('the repository has .git/info/attributes (local attributes, possibly filters); refused')
-    try:  # a local-only exclude rule can hide unique files that no committed .gitignore declares disposable
-        with open(os.path.join(git_dir, 'info', 'exclude'), 'rb') as handle:
-            if any(ln.strip() and not ln.lstrip().startswith(b'#') for ln in handle.read(1 << 20).splitlines()):
-                raise ValueError('the repository has local exclude rules (.git/info/exclude); files they hide are not '
-                                 'declared disposable by the committed .gitignore; refused')
-    except OSError:
-        pass
+    _refuse_local_exclude_rules(os.path.join(git_dir, 'info', 'exclude'))
     if os.path.lexists(os.path.join(git_dir, 'lfs')):
         raise ValueError('the repository has a git LFS store (.git/lfs), whose objects may be pushed nowhere; refused')
     # submodules first: a gitlink also shows in status, and the accurate reason is the submodule
@@ -6475,8 +6516,11 @@ def _no_backup_state(real, target, home=None, attached=None, extra_ignored=None)
             ignored_dirs.append(rec[3:])
     _scan_tree_for_nested_repos(real, ignored_dirs)
     for rel in sorted(ignored_dirs):
-        count, newest = _scan_ignored_dir(os.path.join(real, rel.rstrip('/')), rel.rstrip('/').rsplit('/', 1)[-1])
-        digest.update(('%s\0%d\0%d\n' % (rel, count, newest)).encode('utf-8', 'surrogateescape'))
+        manifest = hashlib.sha256()
+        count, newest = _scan_ignored_dir(os.path.join(real, rel.rstrip('/')), rel.rstrip('/').rsplit('/', 1)[-1],
+                                          manifest=manifest)
+        digest.update(('%s\0%d\0%d\0%s\n' % (rel, count, newest, manifest.hexdigest())).encode('utf-8',
+                                                                                              'surrogateescape'))
     code, flagged = _git(real, 'ls-files', '-v', '-z')
     if code != 0:
         raise ValueError('cannot list the index')
@@ -6508,7 +6552,7 @@ def _no_backup_state(real, target, home=None, attached=None, extra_ignored=None)
     if code != 0:
         raise ValueError('cannot list refs')
     return {'head': head.strip(), 'refs_sha256': hashlib.sha256(refs.encode()).hexdigest(), 'worktrees': 1,
-            'ignored_sha256': digest.hexdigest(),  # entries and newest mtime of each ignored folder: late additions void it
+            'ignored_sha256': digest.hexdigest(),  # per-entry manifest of each ignored folder: any change voids it
             'extra_ignored': accepted}
 
 
@@ -6809,8 +6853,9 @@ def approve_delete_no_backup(path, user_source, wal, ttl=None, home=None, policy
         if len(extra) > 20 or any(not e or len(e) > 300 or e.startswith('/') or '..' in e.split('/') for e in extra):
             raise ValueError('--also-ignored takes at most 20 relative ignored entries as git prints them (public/audio/)')
         question = str(turn.get('question') or '')
-        for e in extra:  # the user must have seen each extra: it has to appear word for word in the question he answered
-            if e not in question:
+        named = _question_tokens(question)
+        for e in extra:  # the user must have seen each extra: it must be a delimited token of the question he answered
+            if e not in named:
                 raise ValueError('--also-ignored entry %r is not named in the question the user answered; ask again naming it' % e[:60])
         state = _no_backup_state(real, target, home, attached=attached, extra_ignored=extra)
         where = _check_git_pushed(real, ls_remote=ls_remote, hosts=limits.get('no_backup_remote_hosts')
