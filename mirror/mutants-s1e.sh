@@ -22,4 +22,5 @@ run_mutant operator apps/api/src/modules/user-tokens/auth-gate.ts auth-gate.ts "
 run_mutant crmswitch apps/api/src/plugins/auth.ts auth.ts.plugin "(apiKeyRouteResources(r.method, route)?.includes('crm') || w4Route)" "(apiKeyRouteResources(r.method, route)?.includes('crm'))"
 run_mutant optout apps/api/src/lib/desktop-token-session.ts desktop-token-session.ts "!== false;" "!== 'never';"
 run_mutant ability apps/api/src/modules/user-tokens/auth-gate.ts auth-gate.ts "policy.abilities = [...new Set([...policy.abilities, 'crm', 'read'])].sort();" "policy.abilities = [];"
+run_mutant nullcursor apps/api/src/modules/crm/routes.ts routes.ts.crm "  if (!last || last.occursAt === undefined) return null;" "  return null;"
 echo mutants-done

@@ -1,0 +1,23 @@
+Acceptance delta 3: spec v3 + 6b3e44c5a72 + 0c5d5dce533 (goodqa#15561 S1e-a). Reviewer agent-a67bb58fd4e77a64e. Read-only, no probes, no tests run.
+VERDICT: BLOCK on one small item (X1). M1, M2, M3 are closed; D7/NEG-13/A2 are consistent.
+
+CLOSED
+M1: NEG-12 now says "a HEAD on either route is covered exactly like GET (200 with crm, 403 without)"; matches D1; commit says a real HEAD test was added.
+M2: NEG-4 now states the member-without-crm:read limit ("existing handler check ... a stated limit"); acceptable as a disclosed limit. Read-removal and read-less start tests added per commit stat (+34 test lines); non-member pinned.
+M3: tsc3 evidence has 276 TS errors (missing modules, env) and no line naming desktop-token-session, auth-gate, plugins/auth, crm/routes or the new test (grep empty). Baseline equality with origin is the owner's claim; not independently run.
+Scope now names plugins/auth.ts and gmail-limited-use; A2 is labelled TARGET_MISMATCH with who can set the key (platform operator only) and a follow-up. Source syntax valid.
+
+MATERIAL
+X1 NEG-13 has no positive paging control. readerCursor(req, raw, visible) returns null whenever the reader is a desktop session and the last visible entry lacks occursAt, or the page is empty. The only cursor assertion is nextCursor toBeNull for a fully withheld page (test line ~364). A broken variant that returns null always (or builds the wrong cursor string, or mis-shapes occursAt so `last.occursAt === undefined`) passes NEG-13 and silently ends paging for every token session, on the exact page the user clicks. Evidence it can happen: the code relies on `occursAt` being on the entries that forTimelineReader/timelineWithSubjects return; no test shows it is. Fix: a test with >limit visible entries: page 1 with limit=1 has a non-null nextCursor equal to `${iso}|${id}` of the visible entry, and following it returns the next visible entry with no duplicate; plus the same for timelineNextCursor in the detail. Add a mutant (always null) to the evidence.
+
+NON-BLOCKING (record, no repair needed now)
+- Stated limit in D7: a page entirely withheld ends paging, so a run of >=limit colleague personal/Gmail entries newest-first hides all older history from a bound session. Disclosed; consider skipping forward server-side later.
+- Cursor is rebuilt with Date.toISOString (ms) while the DB keyset compares occursAt; same as the existing service code (service.ts 1814), so no new precision issue.
+- "raw page full" still leaks one bit (cursor non-null vs null when visible entries exist), nothing about content.
+
+NOT VERIFIED: actual test run results (counts are from commit messages); whether tsc baseline equals origin; HEAD test body; Spec v3 sections other than those quoted via grep.
+PROBES: none.
+
+ADDENDUM (final, after 2dbdc9c959f): ACCEPT.
+X1 closed: new test asserts exact cursor `2026-09-02T09:00:00.000Z|<newerId>`, page 2 returns the other entry once; always-null mutant evidence g15561-s1e-mut-nullcursor.txt shows 1 failed / 22 passed (23). Test-only commit, 17 lines.
+Accepted limit: contact-detail timelineNextCursor has no positive control (needs 50+ entries; same helper readerCursor). Non-material. Test runs not performed by me.

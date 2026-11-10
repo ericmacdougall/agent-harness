@@ -1,0 +1,54 @@
+ADVERSARIAL DELTA 3: goodqa#15561 slice S1e-a
+Reviewer: agent a1fa97d18c55c5a00 (red-team)
+Code: t2-dev ~/wt-15561, 0c5d5dce533 (diff against reviewed 7fa436767c8), read-only. No edits, no commits.
+Date: 2026-11-09
+
+VERDICT: ACCEPT (no blocking finding). N1's content oracle is closed. Two residual items should be filed as tickets;
+main may treat R1 as material under the privacy rule, and if so it blocks.
+
+N1 STATUS: CLOSED for content (code reading)
+- crm/routes.ts `refuseHiddenMatchFilters`: for `req.userTokenDoor?.via === 'desktop_session'`, a truthy `q` or `pinned`
+  gets 400 user_token_filter_unsupported. The check runs before `crm.contactTimeline`, so no search reaches the
+  hidden rows. `pinned=false` is falsy and is correctly allowed.
+- `readerCursor`: for that reader, the cursor is built from the last VISIBLE entry, and is null when no entry shows. A
+  cursor therefore never names a withheld entry's id or time. This applies to both `nextCursor` and the detail route's
+  `timelineNextCursor`.
+- `fieldChanges` (include/exclude/only) filters on entry kind, not on hidden text. No content oracle.
+- A forged cursor naming a withheld row's (time|id) acts only as a keyset position, and its id is compared with `lt`.
+  It returns nothing hidden beyond R1.
+
+RESIDUALS (not blocking in my judgement; file as tickets)
+
+R1 MEDIUM, HYPOTHESIS (the logic is confirmed by code reading; not probed): cursor presence still reveals that withheld
+  entries exist, and roughly when.
+  Whether a cursor exists still depends on `entries.length === limit`, which service.ts computes over the RAW page
+  before withholding. Choose `limit` = (visible rows older than T) + 1 with a forged cursor at time T. The response then
+  carries a cursor exactly when a withheld row older than T exists. Repeating this over T locates each withheld
+  entry's timestamp: a colleague's personal entry, or the arrival time of a Gmail mailbox-read message. No content,
+  title or id is exposed. It is metadata about Google user data and private notes, and it takes many requests (rate
+  limited and ledgered, with q values stripped).
+  Fix: filter withheld rows in SQL before LIMIT for an agent reader. `gmailMailboxReadEntry(db)` already exists as an
+  SQL predicate, and the personal-visibility rule can be expressed the same way. Then the page, the cursor and
+  fullness all cover visible rows only. Settle it with a probe: a contact with one visible and one withheld (personal or
+  Gmail) entry; compare the bound session's cursor presence for limit=2 with and without the withheld entry.
+
+R2 LOW to MEDIUM (correctness, not privacy): paging can stop early for a token session.
+  Take entries [V1, H1, H2, V2] in time order, H hidden, limit=2. Page 1 shows [V1] with cursor V1. Page 2's raw rows
+  are [H1, H2], so it shows nothing and returns cursor null, which ends paging. V2 is never reachable through the
+  session. The code comment acknowledges this ("null when the page shows none, which ends paging"). The SQL-level fix
+  for R1 removes it too.
+
+Unchanged from delta 2: N3 accepted as is (every outcome is a refusal). N4 partly open (Busy-row assertion,
+project-scoped and agent-pause NEGs) as tickets. The bearer and API-key readers that reach this route through an
+explicit
+session-action grant keep the q oracle, because the guard is keyed on the desktop-session door only. That is
+pre-existing and behind an opt-in plus a grant; file a ticket.
+
+PROBES
+P2 was declared in the WAL (class hang, 300 s, 6 GB, 64 procs, net) but NOT run: writing its file was interrupted and
+I did not retry. R1 and R2 therefore rest on code reading only. The P1 results from delta 2 apply to 7fa436767c8 and
+are superseded for q and the cursor id.
+
+NOT EXAMINED
+The owner's 78-test run and the red-first file (not re-run, not read); the spec v3 text beyond the owner's summary
+(D7, NEG-13, A2 relabelled TARGET_MISMATCH); the live deploy and the UI.

@@ -1,0 +1,11 @@
+chore(scratch): S1e-a PR text, mutant scripts and final review reports
+
+Why: the Mac scratch worktree holds the mutant scripts, PR text and review
+reports for goodqa#15561 slice S1e-a; committing keeps them recoverable.
+What: mutant scripts and copies, the paging test copy, the PR body and the
+acceptance and adversarial delta reports.
+Testing: not run: scratch files only, the real checks ran on t2-dev
+(commit 2dbdc9c959f on feat/goodqa-15561-s1e-timeline-default, PR 1320).
+Refs: GoodQA #15561
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
