@@ -1,4 +1,6 @@
 """Native edit/data contracts never confer permission to change protected state."""
+import io
+import json
 import os
 import shlex
 import sys
@@ -117,6 +119,24 @@ class NativeEditBoundary(NativeEditFixtures):
             self.assertEqual(self.decide('Write', {'file_path': 'notes.txt'}), 2)
         self.assertEqual(self.decide('Write', {'file_path': 'x' * 4097}), 2)
         self.assertEqual(self.decide('MultiEdit', {'edits': [{'path': 'x'}] * 129}), 2)
+
+    def test_missing_dotdot_cannot_hide_effective_hardlink_target(self):
+        alias = self.cwd / 'alias.json'; os.link(self.secret_target, alias)
+        target = 'missing/../alias.json'
+        self.assertEqual((self.cwd / target).resolve().stat().st_nlink, 2)
+        self.assertEqual(self.decide('Write', {'file_path': target, 'content': 'x'}), 2)
+        self.assertEqual(self.secret_target.read_text(), 'fixture unchanged')
+
+    def test_known_edit_resolution_fault_never_falls_through_hook_warning(self):
+        payload = {'tool_name': 'Write', 'tool_input': {'file_path': 'record.json'},
+                   'cwd': str(self.protected), 'agent_id': 'fixture-child'}
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(mg.Path, 'is_dir', side_effect=PermissionError('fixture unreadable cwd')):
+            code = mg.main(['hook', '--state-dir', str(self.state)], runner=None,
+                           stdin=io.BytesIO(json.dumps(payload).encode()), stdout=out, stderr=err)
+        self.assertEqual(code, 2, err.getvalue())
+        self.assertNotIn('warning', err.getvalue().lower())
+        self.assertEqual(self.secret_target.read_text(), 'fixture unchanged')
 
     def test_add_delete_and_top_level_multiedit_contracts(self):
         for operation, body in (('Add', '+fixture\n'), ('Delete', '')):

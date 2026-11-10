@@ -1904,7 +1904,9 @@ def _effective_target(value, payload, *, home_form=False):
     lexical = Path(os.path.normpath(str(target)))
     try:
         resolved = target.resolve(strict=False)
-        ancestor = target
+        # Inspect the effective object too: an unresolved raw component before
+        # '..' can fail stat while normalization still names an existing alias.
+        ancestor = resolved
         while True:
             try:
                 info = ancestor.stat()
@@ -1914,7 +1916,7 @@ def _effective_target(value, payload, *, home_form=False):
                 if parent == ancestor:
                     raise GateError('target parent unavailable')
                 ancestor = parent
-        if ancestor == target:
+        if ancestor == resolved:
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise GateError('target is not a single-link regular file')
         elif not stat.S_ISDIR(info.st_mode):
@@ -2005,7 +2007,9 @@ def decide(payload, runner, state_dir, now=None):
         try:
             for path in _edit_paths(tool, tool_input):
                 _effective_target(path, payload)
-        except GateError:
+        except Exception:
+            # A known edit always needs complete target proof. Do not let a
+            # resolution fault reach the legacy command-hint fail-open path.
             return 2, "merge-gate: edit targets are protected, ambiguous or unavailable; supply complete ordinary-file targets."
         return 0, ""
     paths = touched_paths(tool_input)
