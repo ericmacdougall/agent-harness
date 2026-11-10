@@ -13,7 +13,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "harness" / "hooks"))
 import work_gc as gc  # noqa: E402
 
-REAL_PROCESS_CWDS = gc.process_cwds
+REAL_IN_USE = gc.__dict__.get("in_use_paths")
 
 SESSION = "11111111-1111-4111-8111-111111111111"
 ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@e", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@e")
@@ -57,9 +57,9 @@ class Case(unittest.TestCase):
         self.session.mkdir(parents=True)
         self.wals = self.home / ".claude" / "wals" / SESSION
         self.wals.mkdir(parents=True)
-        for name, value in (("process_cwds", lambda: ["/somewhere/else"]),
+        for name, value in (("in_use_paths", lambda: ["/somewhere/else"]),
                             ("ls_remote", local_ls_remote)):
-            patcher = mock.patch.object(gc, name, value, create=True)
+            patcher = mock.patch.object(gc, name, value, create=True)  # noqa: B023
             patcher.start()
             self.addCleanup(patcher.stop)
         self.repo = self.session / "repo"
@@ -144,6 +144,8 @@ class Worktrees(Case):
             with self.subTest(name=name):
                 self.assertFalse(self.item(plan, path)["ok"], self.item(plan, path))
         self.assertIn("locked", self.item(plan, locked)["reason"])
+        self.assertIn("changed or untracked", self.item(plan, dirty)["reason"])
+        self.assertIn("changed or untracked", self.item(plan, modified)["reason"])
         gc.apply_plan(plan, self.root)
         for path in cases.values():
             self.assertTrue(path.exists())
@@ -186,6 +188,10 @@ class Worktrees(Case):
             "bare_in_build": ({ignore: "build/\n"}, "bare:build/x.git"),
             "sqlite_in_cache": ({ignore: ".cache/\n"},
                                 lambda p: (p / ".cache").mkdir() or (p / ".cache/app.sqlite").write_text("x")),
+            "plain_folder": ({ignore: "auth/\n"},
+                             lambda p: (p / "auth").mkdir() or (p / "auth/tokens.txt").write_text("x")),
+            "session_segment": ({ignore: "wals/dist/\n", "wals/README": "tracked\n"},
+                                lambda p: (p / "wals/dist").mkdir() or (p / "wals/dist/x.js").write_text("x")),
         }
         paths = {}
         for i, (name, (files, maker)) in enumerate(cases.items()):
@@ -214,9 +220,9 @@ class Worktrees(Case):
 
     def test_a_process_inside_the_worktree_keeps_it(self):
         path = self.worktree()
-        with mock.patch.object(gc, "process_cwds", lambda: [str(path / "sub")]):
+        with mock.patch.object(gc, "in_use_paths", lambda: [str(path / "sub")]):
             self.assertFalse(self.item(self.plan(), path)["ok"])
-        with mock.patch.object(gc, "process_cwds", lambda: None):  # an unreadable process list removes nothing
+        with mock.patch.object(gc, "in_use_paths", lambda: None):  # an unreadable process list removes nothing
             self.assertFalse(self.item(self.plan(), path)["ok"])
 
     def test_apply_re_verifies_so_a_change_after_the_plan_is_respected(self):
@@ -423,6 +429,7 @@ class Regenerable(Case):
         self.make(".claude/projects/node_modules/x")
         plan = self.plan()
         self.assertEqual([i for i in plan["items"] if i["ok"]], [])
+        self.assertEqual([i["path"] for i in plan["items"]], [])  # not descended into at all
 
     def test_a_process_inside_or_at_the_repository_root_keeps_the_folder(self):
         proj = self.git_proj("proj", "node_modules/\n")
@@ -430,9 +437,9 @@ class Regenerable(Case):
         self.age_tree(self.session)
         path = proj / "node_modules"
         self.assertEqual(self.ok_paths(self.plan()), {"proj/node_modules"})
-        with mock.patch.object(gc, "process_cwds", lambda: [str(path)]):
+        with mock.patch.object(gc, "in_use_paths", lambda: [str(path)]):
             self.assertEqual(self.ok_paths(self.plan()), set())
-        with mock.patch.object(gc, "process_cwds", lambda: [str(proj)]):  # a dev server run from the repo root
+        with mock.patch.object(gc, "in_use_paths", lambda: [str(proj)]):  # a dev server run from the repo root
             self.assertEqual(self.ok_paths(self.plan()), set())
 
     def test_symlinked_folders_are_ignored(self):
@@ -620,13 +627,340 @@ class Plans(Case):
             plan = self.plan()
         self.assertTrue(plan["partial"])
 
-    def test_a_failing_lsof_is_an_unreadable_process_list(self):
-        fake = subprocess.CompletedProcess(["lsof"], 1, stdout="p1\nn/somewhere\n", stderr="")
-        with mock.patch.object(gc.subprocess, "run", lambda *a, **k: fake):
-            self.assertIsNone(REAL_PROCESS_CWDS())
-        good = subprocess.CompletedProcess(["lsof"], 0, stdout="p1\nn/somewhere\n", stderr="")
-        with mock.patch.object(gc.subprocess, "run", lambda *a, **k: good):
-            self.assertEqual(REAL_PROCESS_CWDS(), ["/somewhere"])
+    def test_a_failing_or_empty_lsof_or_ps_is_an_unreadable_process_list(self):
+        for lsof, ps in (((1, "p1\nn/somewhere\n"), (0, "sh\n")), ((0, ""), (0, "sh\n")),
+                         ((0, "p1\nn/somewhere\n"), (1, "")), ((0, "p1\nn/somewhere\n"), (0, ""))):
+            with self.subTest(lsof=lsof, ps=ps):
+                with fake_processes(lsof, ps):
+                    self.assertIsNone(REAL_IN_USE())
+        with fake_processes((0, "p1\nfcwd\nn/somewhere\n"), (0, "/bin/sh -c x\n")):
+            self.assertEqual(sorted(REAL_IN_USE()), ["/bin/sh", "/somewhere"])
+
+
+def fake_processes(lsof, ps):
+    """Patch subprocess.run inside work_gc so lsof and ps return (returncode, stdout)."""
+    calls = []
+
+    def run(cmd, *a, **k):
+        calls.append(cmd[0])
+        if cmd[0] == "lsof":
+            return subprocess.CompletedProcess(cmd, lsof[0], stdout=lsof[1], stderr="")
+        if cmd[0] == "ps":
+            return subprocess.CompletedProcess(cmd, ps[0], stdout=ps[1], stderr="")
+        return REAL_RUN(cmd, *a, **k)
+
+    return mock.patch.object(gc.subprocess, "run", run)
+
+
+REAL_RUN = subprocess.run
+
+
+class InUse(Case):
+    """M1: a folder is busy when any process path (any fd, or its command line) is under it."""
+
+    def setUp(self):
+        super().setUp()
+        self.real = mock.patch.object(gc, "in_use_paths", REAL_IN_USE)
+        self.real.start()
+        self.addCleanup(self.real.stop)
+
+    def node_modules(self):
+        nm = self.session / "deploy" / "node_modules"
+        (nm / "wrangler").mkdir(parents=True)
+        (nm / "wrangler/cli.js").write_text("x")
+        (nm.parent / "package.json").write_text("{}")
+        for p in (nm / "wrangler/cli.js", nm / "wrangler", nm.parent / "package.json"):
+            age(p, p)
+        age(nm, self.session)
+        return nm
+
+    def test_a_program_run_from_the_folder_keeps_it_though_its_cwd_is_elsewhere(self):
+        nm = self.node_modules()
+        idle = (0, "p6592\nfcwd\nn/Users/x/elsewhere\nftxt\nn/usr/local/bin/node\n")
+        with fake_processes(idle, (0, "/usr/local/bin/node /tmp/other.js\n")):
+            self.assertTrue(self.item(self.plan(), nm)["ok"])
+        with fake_processes(idle, (0, "node %s/wrangler/cli.js tail --format=pretty\n" % nm)):
+            row = self.item(self.plan(), nm)
+        self.assertFalse(row["ok"], row)
+        self.assertIn("uses a path inside", row["reason"])
+        with fake_processes((0, idle[1] + "f12\nn%s/wrangler/cli.js\n" % nm), (0, "esbuild --service=0.19\n")):
+            self.assertFalse(self.item(self.plan(), nm)["ok"])  # an open file inside, nothing on the command line
+        with fake_processes(idle, (0, "node --require=%s/wrangler/cli.js x\n" % nm)):
+            self.assertFalse(self.item(self.plan(), nm)["ok"])  # a path after '='
+
+    def test_apply_takes_a_fresh_snapshot_for_each_item(self):
+        first = self.node_modules()
+        second = self.session / "b" / "node_modules"
+        second.mkdir(parents=True)
+        (second.parent / "package.json").write_text("{}")
+        age(second.parent / "package.json", second.parent / "package.json")
+        age(second, self.session)
+        with mock.patch.object(gc, "in_use_paths", lambda: ["/elsewhere"]):
+            plan = self.plan()
+        self.assertTrue(self.item(plan, first)["ok"] and self.item(plan, second)["ok"])
+        calls = []
+
+        def snapshot():  # the second item comes into use after the first is removed
+            calls.append(1)
+            return ["/elsewhere"] if len(calls) == 1 else [str(second / "x")]
+
+        with mock.patch.object(gc, "in_use_paths", snapshot):
+            results = {r["path"]: r["status"] for r in gc.apply_plan(plan, self.root)}
+        order = [i["path"] for i in plan["items"] if i["ok"]]
+        self.assertEqual([results[p] for p in order], ["removed", "skipped"])
+        self.assertTrue(Path(order[1]).exists())
+
+
+class Round2(Case):
+    """Delta red-team: liveness keys, git env, ls-remote hygiene, reflog, audit order, late swaps, survivors."""
+
+    def subagent(self, worktree, key, fresh=True, name="agent-sub1"):
+        subagents = self.home / ".claude" / "projects" / "-Users-x" / SESSION / "subagents"
+        subagents.mkdir(parents=True, exist_ok=True)
+        (subagents / (name + ".meta.json")).write_text(json.dumps({key: str(worktree), "agentType": "fixer"}))
+        transcript = subagents / (name + ".jsonl")
+        transcript.write_text("{}\n")
+        if not fresh:
+            age(transcript, transcript)
+
+    def test_an_inherited_worktree_path_counts_as_activity_for_the_worktree_and_its_folders(self):
+        path = self.worktree("agent-inh")
+        exclude = Path(out("git", "-C", str(self.repo), "rev-parse", "--absolute-git-dir")) / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text("node_modules/\n")
+        (path / "dirty.txt").write_text("keeps the worktree itself\n")
+        (path / "node_modules").mkdir()
+        (path / "node_modules/x.js").write_text("x\n")
+        self.assertTrue(self.item(self.plan(), path / "node_modules")["ok"])
+        self.subagent(path, "inheritedWorktreePath")
+        plan = self.plan()
+        self.assertFalse(self.item(plan, path / "node_modules")["ok"])
+        self.assertIn("sub-agent", self.item(plan, path / "node_modules")["reason"])
+        (path / "dirty.txt").unlink()
+        row = self.item(self.plan(), path)
+        self.assertFalse(row["ok"], row)
+        self.assertIn("sub-agent", row["reason"])
+
+    def test_a_callers_git_environment_does_not_redirect_the_checks(self):
+        path = self.worktree()
+        other = self.home / "other"
+        run("git", "init", "-q", str(other))
+        (other / "junk.txt").write_text("x\n")
+        with mock.patch.dict(os.environ, {"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other),
+                                          "GIT_INDEX_FILE": str(other / ".git" / "index")}):
+            row = self.item(self.plan(), path)
+        self.assertTrue(row["ok"], row)
+
+    def test_transport_helpers_and_local_scp_lookalikes_are_not_remotes(self):
+        for url in ("ext::github.com:x", "https://github.com/o/r::x", "fd::github.com:3"):
+            self.assertFalse(gc.remote_host_allowed(url), url)
+        for url in (".:x", "..:x", "~:x"):
+            self.assertEqual(gc.remote_host(url), "", url)
+        seen = {}
+
+        def fake(cmd, *a, **k):
+            seen.update(cmd=cmd, env=k.get("env"), stdin=k.get("stdin"), cwd=k.get("cwd"))
+            return subprocess.CompletedProcess(cmd, 0, stdout="%s\trefs/heads/main\n" % ("a" * 40), stderr="")
+
+        with mock.patch.object(gc.subprocess, "run", fake):
+            self.assertEqual(gc.live_ls_remote("https://github.com/o/r.git"), {"refs/heads/main": "a" * 40})
+            self.assertIn("BatchMode=yes", seen["env"]["GIT_SSH_COMMAND"])
+            self.assertEqual(seen["stdin"], subprocess.DEVNULL)
+            self.assertEqual(seen["cwd"], "/")
+            self.assertNotIn("GIT_DIR", seen["env"])
+            seen.clear()
+            self.assertIsNone(gc.live_ls_remote("ext::sh -c x"))
+            self.assertEqual(seen, {})  # never even run
+
+    def test_listings_of_different_urls_do_not_wait_for_each_other(self):
+        import threading
+        ready = threading.Event()
+        answers = {}
+
+        def slow(url):
+            if url == "a":
+                answers["a"] = ready.wait(5)
+            else:
+                ready.set()
+            return {}
+
+        ctx = gc.Context(self.root, 3.0, None, slow)
+        t = threading.Thread(target=ctx.listing, args=("a",))
+        t.start()
+        time.sleep(0.2)
+        ctx.listing("b")
+        t.join(10)
+        self.assertTrue(answers.get("a"))
+
+    def test_reset_away_commits_in_the_worktree_reflog_keep_it(self):
+        path = self.worktree("agent-reset", pushed=False)  # one unpushed commit
+        run("git", "reset", "-q", "--hard", "origin/main", cwd=path)  # HEAD is pushed again; the commit is reflog-only
+        row = self.item(self.plan(), path)
+        self.assertFalse(row["ok"], row)
+        self.assertIn("reflog", row["reason"])
+
+    def test_a_remote_head_tracking_ref_is_never_proof(self):
+        path = self.worktree("agent-rhead", pushed=False)
+        head = out("git", "-C", str(path), "rev-parse", "HEAD")
+        run("git", "update-ref", "refs/remotes/origin/HEAD", head, cwd=path)
+        row = self.item(self.plan(ls_remote=lambda url: {"refs/heads/HEAD": head}), path)
+        self.assertFalse(row["ok"], row)
+
+    def test_submodules_and_hidden_index_entries_keep_the_worktree(self):
+        sub = self.worktree("agent-submod")
+        sha = out("git", "-C", str(self.repo), "rev-parse", "main")
+        run("git", "update-index", "--add", "--cacheinfo", "160000,%s,lib" % sha, cwd=sub)
+        (sub / "lib").mkdir()  # an uninitialized submodule: an empty folder, so status shows nothing
+        run("git", "commit", "-q", "-m", "gitlink", cwd=sub)
+        run("git", "push", "-q", "origin", "HEAD:refs/heads/feat-agent-submod", cwd=sub)
+        run("git", "fetch", "-q", "origin", cwd=sub)
+        hidden = {}
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            path = self.worktree("agent" + flag.replace("--", "-"))
+            run("git", "update-index", flag, "a.txt", cwd=path)
+            (path / "a.txt").write_text("edited where status cannot see it\n")
+            hidden[flag] = path
+        plan = self.plan()
+        self.assertIn("submodule", self.item(plan, sub)["reason"])
+        for flag, path in hidden.items():
+            with self.subTest(flag=flag):
+                self.assertIn("assume-unchanged or skip-worktree", self.item(plan, path)["reason"])
+
+    def test_an_unknown_lock_state_keeps_the_worktree(self):
+        path = self.worktree()
+        with mock.patch.object(gc, "worktree_locked", lambda p: None):
+            row = self.item(self.plan(), path)
+        self.assertFalse(row["ok"])
+        self.assertIn("cannot tell whether the worktree is locked", row["reason"])
+
+    def test_regen_refusals_hold_on_their_own(self):
+        # a session-log location, even with a package.json beside it
+        logs = self.session / "wals"
+        (logs / "node_modules").mkdir(parents=True)
+        (logs / "package.json").write_text("{}")
+        age(logs / "package.json", logs / "package.json")
+        age(logs / "node_modules", self.session)
+        ok, reason = gc.regen_verdict(logs / "node_modules", ["/x"], self.root, 3.0)
+        self.assertFalse(ok)
+        self.assertIn("session-log", reason)
+        # a broken repository around the folder: never fall back to the outside-git rules
+        broken = self.session / "broken"
+        (broken / "node_modules").mkdir(parents=True)
+        (broken / "package.json").write_text("{}")
+        (broken / ".git").write_text("gitdir: /nonexistent/elsewhere\n")
+        for p in (broken / "package.json", broken / ".git"):
+            age(p, p)
+        age(broken / "node_modules", self.session)
+        ok, reason = gc.regen_verdict(broken / "node_modules", ["/x"], self.root, 3.0)
+        self.assertFalse(ok)
+        self.assertIn("could not inspect", reason)
+        # ls-files failing is never read as "nothing tracked"
+        proj = self.session / "proj"
+        run("git", "init", "-q", str(proj))
+        (proj / ".gitignore").write_text("dist/\n")
+        (proj / "dist").mkdir()
+        real_git = gc.git
+
+        def failing(path, *args, **kw):
+            return (1, "") if args and args[0] == "ls-files" else real_git(path, *args, **kw)
+
+        with mock.patch.object(gc, "git", failing):
+            with self.assertRaises(gc.Refuse) as why:
+                gc.check_regen_origin(proj / "dist", self.root)
+        self.assertIn("tracks", str(why.exception))
+        self.assertIn("untracked and ignored", gc.check_regen_origin(proj / "dist", self.root))
+
+    def test_an_unreadable_subfolder_is_never_treated_as_walked(self):
+        dist = self.session / "x" / "dist"
+        (dist / "locked").mkdir(parents=True)
+        (dist / "locked" / "secret.txt").write_text("x")
+        os.chmod(dist / "locked", 0)
+        self.addCleanup(os.chmod, dist / "locked", 0o755)
+        with self.assertRaises(gc.Refuse):
+            gc.scan_folder(dist, "dist")
+
+    def test_chmod_retry_never_touches_the_folder_above(self):
+        top = self.session / "ro"
+        nm = top / "node_modules"
+        nm.mkdir(parents=True)
+        (nm / "x.js").write_text("x")
+        os.chmod(top, 0o555)
+        self.addCleanup(os.chmod, top, 0o755)
+        with self.assertRaises(PermissionError):
+            gc.remove_tree(nm)
+        self.assertEqual(os.stat(top).st_mode & 0o777, 0o555)
+
+    def test_a_plan_for_another_root_is_refused(self):
+        plan = gc.seal({"root": str(self.home / "elsewhere"), "items": []})
+        with self.assertRaises(ValueError):
+            gc.apply_plan(plan, self.root)
+
+    def test_a_worktree_is_reported_removed_only_when_it_is_gone(self):
+        path = self.worktree()
+        plan = self.plan()
+        real_git = gc.git
+
+        def noop_remove(p, *args, **kw):
+            return (0, "") if args[:2] == ("worktree", "remove") else real_git(p, *args, **kw)
+
+        with mock.patch.object(gc, "git", noop_remove):
+            results = gc.apply_plan(plan, self.root)
+        self.assertEqual(results[0]["status"], "failed", results)
+        self.assertTrue(path.exists())
+
+    def test_an_intent_row_precedes_each_removal_and_a_failing_audit_never_stops_the_run(self):
+        node_modules = self.session / "pp" / "node_modules"
+        node_modules.mkdir(parents=True)
+        (node_modules.parent / "package.json").write_text("{}")
+        age(node_modules.parent / "package.json", node_modules.parent / "package.json")
+        age(node_modules, self.session)
+        plan = self.plan()
+        seen = []
+        real_remove = gc.remove_tree
+
+        def remove(path):
+            rows = [json.loads(x) for x in gc.audit_path().read_text().splitlines()]
+            seen.append((rows[-1]["status"], rows[-1]["path"]))
+            real_remove(path)
+
+        with mock.patch.object(gc, "remove_tree", remove):
+            results = gc.apply_plan(plan, self.root)
+        self.assertEqual(seen, [("removing", str(node_modules))])
+        self.assertEqual(results[0]["status"], "removed")
+        statuses = [json.loads(x)["status"] for x in gc.audit_path().read_text().splitlines()]
+        self.assertEqual(statuses[-2:], ["removing", "removed"])
+        # an audit log that cannot be written: nothing is removed, the run finishes, the error is reported
+        node_modules.mkdir()
+        age(node_modules, self.session)
+        plan = self.plan()
+        with mock.patch.object(gc, "record", mock.Mock(side_effect=OSError("disk full"))):
+            results = gc.apply_plan(plan, self.root)
+        self.assertEqual([r["status"] for r in results], ["failed"])
+        self.assertIn("disk full", results[0]["audit_error"])
+        self.assertTrue(node_modules.exists())
+
+    def test_a_folder_swapped_for_a_symlink_after_the_check_is_not_removed(self):
+        outside = self.home / "precious"
+        outside.mkdir()
+        (outside / "keep.txt").write_text("unique\n")
+        node_modules = self.session / "pp" / "node_modules"
+        node_modules.mkdir(parents=True)
+        (node_modules.parent / "package.json").write_text("{}")
+        age(node_modules.parent / "package.json", node_modules.parent / "package.json")
+        age(node_modules, self.session)
+        plan = self.plan()
+        real_verdict = gc.regen_verdict
+
+        def verdict_then_swap(path, *a, **k):
+            result = real_verdict(path, *a, **k)
+            os.rmdir(path)
+            os.symlink(outside, path)
+            return result
+
+        with mock.patch.object(gc, "regen_verdict", verdict_then_swap):
+            results = gc.apply_plan(plan, self.root)
+        self.assertEqual(results[0]["status"], "skipped", results)
+        self.assertTrue((outside / "keep.txt").exists())
 
 
 class Cli(Case):

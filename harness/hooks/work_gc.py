@@ -32,9 +32,14 @@ removes, skips or fails on in `apply` is appended to `~/.agent-harness/state/wor
     work_gc.py plan  [--root DIR] [--idle-hours H] [--out plan.json]    dry run: lists candidates with sizes
     work_gc.py apply --plan plan.json [--root DIR] [--idle-hours H]     re-verifies every item, then removes it
 
-`apply` takes only a plan file produced by `plan` (its items carry a sha256; a hand-edited plan is refused), re-checks
-each item right before removing it with the idle time given on ITS command line, and holds an exclusive lock so two
-applies cannot run at once. Python 3.9+, stdlib only.
+`apply` takes only a plan file produced by `plan`. Its items carry an unkeyed sha256, which only detects accidental or
+careless edits (anyone can recompute it); the protection is that apply re-verifies every item in full, right before
+removing it, with a fresh process snapshot and the idle time given on ITS command line. It holds an exclusive lock so
+two applies cannot run at once, and writes an intent row to the audit log before each removal and a result row after.
+A process "uses" a folder when lsof names any path under it (any fd) or a command line (ps) contains one.
+
+Known limit: `git status` runs the repository's configured filter drivers (clean/process); the repositories under the
+work root are the agents' own clones, so they are trusted to that extent. Python 3.9+, stdlib only.
 """
 from __future__ import annotations
 
@@ -99,13 +104,27 @@ def lock_path() -> Path:
     return home() / ".agent-harness" / "state" / "work-gc.lock"
 
 
-def git(path, *args, timeout=GIT_TIMEOUT, ceiling=None):
+# repository-selecting variables of the caller must never redirect git to another repository
+GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES")
+
+
+def git_env(**extra) -> dict:
+    env = dict(os.environ)
+    for name in GIT_ENV_DROP:
+        env.pop(name, None)
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", **extra)
+    return env
+
+
+def git(path, *args, timeout=GIT_TIMEOUT, ceiling=None, stdin=None):
     """Run git in `path` (plain -C, never cd). `ceiling` stops repository discovery from climbing above it."""
-    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
+    env = git_env()
     if ceiling is not None:
         env["GIT_CEILING_DIRECTORIES"] = str(ceiling)
     done = subprocess.run(["git", "-C", str(path), "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", *args],
-                          capture_output=True, text=True, timeout=timeout, env=env)
+                          capture_output=True, text=True, timeout=timeout, env=env, input=stdin,
+                          stdin=None if stdin is not None else subprocess.DEVNULL)
     return done.returncode, done.stdout
 
 
@@ -117,22 +136,52 @@ def disk_bytes(path: Path) -> int:
         return -1
 
 
-def process_cwds():
-    """Real paths of every process cwd (one lsof call). A failing, non-zero or empty lsof returns None: nothing is removed."""
+def lsof_paths():
+    """Every absolute path lsof names for any process and any fd (cwd, txt, open files, mapped libraries).
+    A failing, non-zero or empty lsof returns None: the process list is unreadable and nothing is removed."""
     try:
-        done = subprocess.run(["lsof", "-d", "cwd", "-Fn"], capture_output=True, text=True, timeout=60)
+        done = subprocess.run(["lsof", "-n", "-Fn"], capture_output=True, text=True, errors="replace", timeout=120,
+                              stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if done.returncode != 0:
         return None
-    lines = [ln[1:] for ln in done.stdout.splitlines() if ln.startswith("n")]
+    lines = [ln[1:] for ln in done.stdout.splitlines() if ln.startswith("n/")]
     return lines or None
 
 
-def _under(cwds, path) -> bool:
+ARGV_PATH = re.compile(r"""(?:^|[\s='"])(/[^\s'"]+)""")
+
+
+def argv_paths():
+    """Absolute paths in every process command line (`ps -axo command=`): a program run from a folder, such as
+    `node <dir>/node_modules/wrangler/cli.js`, need not have its cwd or an open file there. None when ps fails."""
+    try:
+        done = subprocess.run(["ps", "-axo", "command="], capture_output=True, text=True, errors="replace",
+                              timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if done.returncode != 0 or not done.stdout.strip():
+        return None
+    return [m.rstrip("/") or "/" for line in done.stdout.splitlines() for m in ARGV_PATH.findall(line)]
+
+
+def in_use_paths():
+    """ONE snapshot of every path a process uses (lsof, all fds) or names on its command line (ps). None when either
+    list cannot be read, which keeps everything."""
+    files = lsof_paths()
+    if files is None:
+        return None
+    argv = argv_paths()
+    if argv is None:
+        return None
+    return files + argv
+
+
+def _under(used, path) -> bool:
     for target in {str(path).rstrip("/"), os.path.realpath(path)}:
         prefix = target + "/"
-        if any(c == target or c.startswith(prefix) for c in cwds):
+        if any(c == target or c.startswith(prefix) for c in used):
             return True
     return False
 
@@ -147,14 +196,15 @@ def repo_anchor(path: Path, root: Path):
     return None
 
 
-def busy(path: Path, cwds, root: Path = None) -> bool:
-    """A process has its cwd inside path, or at/under the repository root above it (a dev server run from the repo)."""
-    if cwds is None:
+def busy(path: Path, used, root: Path = None) -> bool:
+    """A process uses a path inside `path` (cwd, open or executed file, command-line argument), or one at/under the
+    repository root above it (a dev server run from the repo). `used` is None when the snapshot was unreadable."""
+    if used is None:
         return True
-    if _under(cwds, path):
+    if _under(used, path):
         return True
     anchor = repo_anchor(path, root) if root is not None else None
-    return anchor is not None and _under(cwds, anchor)
+    return anchor is not None and _under(used, anchor)
 
 
 # ---------------------------------------------------------------- what an ignored or rebuildable folder may hold
@@ -252,17 +302,21 @@ def remote_host(url) -> str:
 
 
 def remote_host_allowed(url) -> bool:
+    """Only https, ssh, git+ssh or scp-like URLs on an allowed host; never a transport helper (`<helper>::<address>`)."""
+    if "::" in str(url or ""):
+        return False
     return remote_host(url) in ALLOWED_HOSTS
 
 
 def live_ls_remote(url):
     """{refname: sha} of the live heads of `url`, listed from outside any repository, or None when it did not answer."""
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GIT_ASKPASS="/bin/true")
-    env.pop("GIT_DIR", None)
+    if not remote_host_allowed(url):
+        return None
+    env = git_env(GIT_ASKPASS="/bin/true", GIT_SSH_COMMAND="ssh -oBatchMode=yes -oConnectTimeout=10")
     try:
         done = subprocess.run(["git", "-c", "protocol.ext.allow=never", "-c", "protocol.file.allow=never",
                                "ls-remote", "--heads", "--", url], cwd="/", capture_output=True, text=True,
-                              timeout=LS_REMOTE_TIMEOUT, env=env)
+                              timeout=LS_REMOTE_TIMEOUT, env=env, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if done.returncode != 0:
@@ -276,23 +330,30 @@ ls_remote = live_ls_remote
 
 
 class Context:
-    """Per-run facts shared by every verdict: process cwds, remote checks, the ls-remote cache, sub-agent activity."""
+    """Per-run facts shared by every verdict: remote checks, the ls-remote cache, sub-agent activity."""
 
-    def __init__(self, root: Path, idle_hours: float, cwds, remote_allowed_fn=None, ls_remote_fn=None):
-        self.root, self.idle_hours, self.cwds = Path(root), float(idle_hours), cwds
+    def __init__(self, root: Path, idle_hours: float, remote_allowed_fn=None, ls_remote_fn=None):
+        self.root, self.idle_hours = Path(root), float(idle_hours)
         self.remote_allowed = remote_allowed_fn or remote_allowed
         self.ls_remote = ls_remote_fn or ls_remote
-        self._listings, self._activity = {}, {}
+        self._listings, self._activity, self._url_locks = {}, {}, {}
         self._lock = threading.Lock()
 
     def listing(self, url):
+        """The live listing of `url`, fetched once per run. Only that URL's own lock is held during the network call."""
         with self._lock:
-            if url not in self._listings:
-                try:
-                    self._listings[url] = self.ls_remote(url)
-                except Exception:  # noqa: BLE001 - an unanswered listing keeps the worktree
-                    self._listings[url] = None
-            return self._listings[url]
+            url_lock = self._url_locks.setdefault(url, threading.Lock())
+        with url_lock:
+            with self._lock:
+                if url in self._listings:
+                    return self._listings[url]
+            try:
+                live = self.ls_remote(url)
+            except Exception:  # noqa: BLE001 - an unanswered listing keeps the worktree
+                live = None
+            with self._lock:
+                self._listings[url] = live
+            return live
 
     def subagent_written(self, session: str, worktree: Path):
         """Newest mtime of a sub-agent transcript whose meta names this worktree, else None (missing files = no info)."""
@@ -308,15 +369,18 @@ class Context:
                     try:
                         with open(meta, encoding="utf-8") as handle:
                             data = json.loads(handle.read(65536))
-                        where = data.get("worktreePath") if isinstance(data, dict) else None
-                        if not isinstance(where, str) or not where:
+                        # worktreePath, inheritedWorktreePath (most metas), and any future *WorktreePath key
+                        wheres = [v for k, v in data.items() if isinstance(k, str) and k.endswith("orktreePath")
+                                  and isinstance(v, str) and v] if isinstance(data, dict) else []
+                        if not wheres:
                             continue
                         transcript = meta.with_name(meta.name[:-len(".meta.json")] + ".jsonl")
                         mtime = transcript.stat().st_mtime
                     except (OSError, ValueError):
                         continue
-                    key = os.path.realpath(where)
-                    found[key] = max(found.get(key, 0.0), mtime)
+                    for where in wheres:
+                        key = os.path.realpath(where)
+                        found[key] = max(found.get(key, 0.0), mtime)
                 self._activity[session] = found
             return self._activity[session].get(os.path.realpath(worktree))
 
@@ -355,10 +419,32 @@ def pushed(path: Path, ctx: Context) -> str:
             continue
         for ref, sha in rows:
             if live.get("refs/heads/" + ref[len(prefix):]) == sha:
+                check_reflog_pushed(path, [ctx.listing(u) for _, u in candidates])
                 return "pushed: %s equals the live tip on %s" % (ref, remote_host(url) or name)
     if unanswered:
         raise Refuse("cannot verify push: the remote did not answer ls-remote")
     raise Refuse("HEAD is on no live remote branch tip (unpushed, or a stale or hand-set tracking ref)")
+
+
+def check_reflog_pushed(path: Path, listings) -> None:
+    """Raise Refuse when the worktree's own HEAD reflog holds a commit that no live remote head contains: work an
+    agent committed and then reset away exists only in this worktree's reflog, which `worktree remove` deletes."""
+    code, reflog = git(path, "reflog", "show", "--format=%H", "HEAD")
+    if code != 0:
+        raise Refuse("cannot read the worktree's reflog")
+    shas = sorted({ln.strip() for ln in reflog.splitlines() if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", ln.strip())})
+    if not shas:
+        return
+    live = sorted({sha for listing in listings if listing for sha in listing.values()
+                   if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(sha))})
+    present = []
+    if live:  # a live sha this clone lacks cannot be negated; leaving it out only lists more, never hides a commit
+        code, out = git(path, "cat-file", "--batch-check=%(objectname) %(objecttype)", stdin="\n".join(live) + "\n")
+        present = [ln.split()[0] for ln in out.splitlines() if ln.endswith(" commit")] if code == 0 else []
+    code, extra = git(path, "rev-list", "--max-count=1", "--stdin",
+                      stdin="".join("%s\n" % sha for sha in shas) + "".join("^%s\n" % sha for sha in present))
+    if code != 0 or extra.strip():
+        raise Refuse("the worktree's reflog holds a commit on no live remote branch (reset or rebased-away work)")
 
 
 # ---------------------------------------------------------------- verdicts
@@ -457,9 +543,9 @@ def check_worktree_contents(path: Path) -> None:
                 raise Refuse("ignored folder %s/ %s" % (rel[:60], why))
 
 
-def worktree_verdict(path: Path, root: Path, idle_hours: float, cwds, ctx: Context = None) -> tuple:
+def worktree_verdict(path: Path, root: Path, idle_hours: float, used, ctx: Context = None) -> tuple:
     """(ok, reason). ok only when removing the worktree loses nothing."""
-    ctx = ctx or Context(root, idle_hours, cwds)
+    ctx = ctx or Context(root, idle_hours)
     try:
         if _repo_of(path) is None:
             raise Refuse("not an agent worktree: needs <repo>/.claude/worktrees/agent-* with a .git file into <repo>/.git/worktrees")
@@ -472,8 +558,8 @@ def worktree_verdict(path: Path, root: Path, idle_hours: float, cwds, ctx: Conte
         written = ctx.subagent_written(session, path)
         if written is not None and (time.time() - written) / 3600.0 < idle_hours:
             raise Refuse("a sub-agent transcript naming this worktree was written %.1f h ago" % ((time.time() - written) / 3600.0))
-        if busy(path, cwds, root):
-            raise Refuse("a process has its cwd inside it (or the process list was unreadable)")
+        if busy(path, used, root):
+            raise Refuse("a process uses a path inside it (or the process list was unreadable)")
         locked = worktree_locked(path)
         if locked is None:
             raise Refuse("cannot tell whether the worktree is locked")
@@ -508,7 +594,7 @@ def _protected_location(path: Path, root: Path) -> bool:
     return False
 
 
-def regen_verdict(path: Path, cwds, root: Path = None, idle_hours: float = MIN_IDLE_HOURS, ctx: Context = None) -> tuple:
+def regen_verdict(path: Path, used, root: Path = None, idle_hours: float = MIN_IDLE_HOURS, ctx: Context = None) -> tuple:
     """(ok, reason) for a rebuildable-folder candidate; re-run in full by apply."""
     try:
         if path.name not in REGEN_NAMES:
@@ -519,7 +605,7 @@ def regen_verdict(path: Path, cwds, root: Path = None, idle_hours: float = MIN_I
             raise Refuse("no work root given")
         if _protected_location(path, root):
             raise Refuse("inside .git, a session-log, state or Claude folder")
-        ctx = ctx or Context(root, idle_hours, cwds)
+        ctx = ctx or Context(root, idle_hours)
         owner = enclosing_worktree(path)
         if owner is not None:  # a live agent is probably using its own dependencies
             idle = agent_log_idle_hours(owner, session_of(owner, root) or "")
@@ -535,8 +621,8 @@ def regen_verdict(path: Path, cwds, root: Path = None, idle_hours: float = MIN_I
                 raise Refuse("cannot stat")
             if changed < idle_hours:
                 raise Refuse("changed %.1f h ago (< %.1f h)" % (changed, idle_hours))
-        if busy(path, cwds, root):
-            raise Refuse("a process has its cwd inside it or at its repository root (or the process list was unreadable)")
+        if busy(path, used, root):
+            raise Refuse("a process uses a path inside it or at its repository root (or the process list was unreadable)")
         origin = check_regen_origin(path, root)
         scan_folder(path, path.name)
         return True, "rebuildable folder (%s)" % origin
@@ -596,7 +682,8 @@ def items_digest(items) -> str:
 
 
 def seal(plan: dict) -> dict:
-    """Record the sha256 of the plan's items, so apply can refuse a hand-edited plan."""
+    """Record an unkeyed sha256 of the plan's items: apply refuses a plan edited by accident or by hand without
+    recomputing it. It is not authentication; apply re-verifies every item regardless."""
     plan["items_sha256"] = items_digest(plan.get("items", []))
     return plan
 
@@ -604,8 +691,8 @@ def seal(plan: dict) -> dict:
 def make_plan(root: Path, idle_hours: float, workers=8, remote_allowed=None, ls_remote=None) -> dict:
     idle_hours = check_idle_hours(idle_hours)
     root = Path(os.path.realpath(root))
-    cwds = process_cwds()
-    ctx = Context(root, idle_hours, cwds, remote_allowed, ls_remote)
+    used = in_use_paths()  # ONE snapshot of every path a process uses, for the whole plan
+    ctx = Context(root, idle_hours, remote_allowed, ls_remote)
     state = {"partial": False}
     found = list(scan(root, time.monotonic() + SCAN_SECONDS, state))
     items = []
@@ -613,9 +700,9 @@ def make_plan(root: Path, idle_hours: float, workers=8, remote_allowed=None, ls_
     def judge(item):
         kind, path = item
         if kind == "worktree":
-            ok, reason = worktree_verdict(path, root, idle_hours, cwds, ctx)
+            ok, reason = worktree_verdict(path, root, idle_hours, used, ctx)
         else:
-            ok, reason = regen_verdict(path, cwds, root, idle_hours, ctx)
+            ok, reason = regen_verdict(path, used, root, idle_hours, ctx)
         return {"kind": kind, "path": str(path), "ok": ok, "reason": reason,
                 "bytes": disk_bytes(path) if ok else 0}
 
@@ -682,32 +769,42 @@ def path_in_root(path, root_real: str) -> bool:
     return real == str(path) and real.startswith(root_real.rstrip("/") + "/")
 
 
-def _apply_one(item: dict, root: Path, root_real: str, idle: float, cwds, ctx: Context, row: dict) -> None:
+OUTSIDE_ROOT = "path is a symlink, not normalized, or outside the work root"
+
+
+def _apply_one(item: dict, root: Path, root_real: str, idle: float, ctx: Context, row: dict) -> None:
     path = Path(item["path"])
+    kind = item.get("kind")
     if not path_in_root(path, root_real):
-        row.update(status="skipped", reason="path is a symlink, not normalized, or outside the work root")
+        row.update(status="skipped", reason=OUTSIDE_ROOT)
         return
-    if item.get("kind") == "worktree":
-        ok, reason = worktree_verdict(path, root, idle, cwds, ctx)
-        row.update(reason=reason)
-        if not ok:
-            row["status"] = "skipped"
-            return
-        repo = _repo_of(path)
-        code, _ = git(repo, "worktree", "remove", "--force", str(path), timeout=600)
-        row["status"] = "removed" if code == 0 and not path.exists() else "failed"
-        if row["status"] == "failed":
-            row["error"] = "git worktree remove exited %d" % code
-    elif item.get("kind") == "regen":
-        ok, reason = regen_verdict(path, cwds, root, idle, ctx)
-        row.update(reason=reason)
-        if not ok:
-            row["status"] = "skipped"
-            return
-        remove_tree(path)
-        row["status"] = "removed" if not path.exists() else "failed"
-    else:
+    if kind not in ("worktree", "regen"):
         row.update(status="skipped", reason="unknown kind")
+        return
+    used = in_use_paths()  # a fresh snapshot right before this item, not the one the plan or an earlier item saw
+    if kind == "worktree":
+        ok, reason = worktree_verdict(path, root, idle, used, ctx)
+    else:
+        ok, reason = regen_verdict(path, used, root, idle, ctx)
+    row.update(reason=reason)
+    if not ok:
+        row["status"] = "skipped"
+        return
+    if not path_in_root(path, root_real):  # swapped for a symlink between the verdict and now
+        row.update(status="skipped", reason=OUTSIDE_ROOT + " (changed after the check)")
+        return
+    record(dict(row, status="removing"))  # the intent row comes first: no removal is ever unrecorded
+    if kind == "worktree":
+        repo = _repo_of(path)
+        if repo is None or not path_in_root(path, root_real):
+            raise RuntimeError("the worktree changed after the check")
+        code, _ = git(repo, "worktree", "remove", "--force", str(path), timeout=600)
+        row["status"] = "removed" if code == 0 and not os.path.lexists(path) else "failed"
+        if row["status"] == "failed":
+            row["error"] = "git worktree remove exited %d%s" % (code, " but the folder is still there" if code == 0 else "")
+    else:
+        remove_tree(path)
+        row["status"] = "removed" if not os.path.lexists(path) else "failed"
 
 
 def apply_plan(plan: dict, root: Path, idle_hours: float = MIN_IDLE_HOURS, remote_allowed=None, ls_remote=None) -> list:
@@ -723,8 +820,7 @@ def apply_plan(plan: dict, root: Path, idle_hours: float = MIN_IDLE_HOURS, remot
         raise ValueError("the plan was made for %s, not %s" % (plan["root"], root))
     results = []
     with exclusive_lock():
-        cwds = process_cwds()
-        ctx = Context(root, idle, cwds, remote_allowed, ls_remote)
+        ctx = Context(root, idle, remote_allowed, ls_remote)
         root_real = os.path.realpath(root)
         for item in items:
             if not isinstance(item, dict) or not item.get("ok"):
@@ -732,10 +828,16 @@ def apply_plan(plan: dict, root: Path, idle_hours: float = MIN_IDLE_HOURS, remot
             row = {"at": time.time(), "path": str(item.get("path")), "kind": str(item.get("kind")),
                    "bytes": item.get("bytes", 0) if isinstance(item.get("bytes", 0), int) else 0}
             try:
-                _apply_one(item, root, root_real, idle, cwds, ctx, row)
+                _apply_one(item, root, root_real, idle, ctx, row)
+                record(row)
             except Exception as error:  # noqa: BLE001 - one bad item must not stop the run or go unrecorded
                 row.update(status="failed", error="%s: %s" % (type(error).__name__, error))
-            record(row)
+                try:
+                    record(row)
+                except Exception as audit_error:  # noqa: BLE001 - say so loudly, keep going
+                    row["audit_error"] = "%s: %s" % (type(audit_error).__name__, audit_error)
+                    print("work_gc: could not write the audit row for %s: %s" % (row["path"], audit_error),
+                          file=sys.stderr)
             results.append(row)
     return results
 
