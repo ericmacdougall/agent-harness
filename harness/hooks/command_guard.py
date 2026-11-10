@@ -5411,6 +5411,22 @@ class Analyzer:
 
     REMOTE_SHELL = re.compile(r'(?:\S*/)?(?:ba|z|k|da|a|)sh(?:\s+-[a-z]+)*\s*')
 
+    def _git_remote_text(self, text, depth):
+        """Judge a script that runs on the other host for deletes only: its other findings (kills, secrets) keep their
+        own rules for text down a pipe, and its cd and variables do not carry into this command."""
+        if type(self).script is not Analyzer.script:
+            return  # a subclass (kill_guard) judges piped text by its own rules; deletes are command_guard's
+        ctx = self.ctx
+        before = len(ctx.findings)
+        keep = {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(ctx).items()
+                if k not in ('findings', 'budget', 'c', 'marker', 'files_read', 'unterminated', 'readings_capped')}
+        try:
+            self.script(text, depth + 1, tail_visible=True)
+        finally:
+            for k, v in keep.items():
+                setattr(ctx, k, v)
+            ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE]
+
     def git_ssh_remote_script(self, rest, depth):
         """Red-team F6: a local script fed to a remote shell (`ssh host bash -s < wipe.sh`, `cat wipe.sh | ssh host`,
         `ssh host "$(cat wipe.sh)"`) runs its text there, so judge that text as remote commands."""
@@ -5421,7 +5437,7 @@ class Analyzer:
             for sub in a.subs:
                 feed = self._git_feed_from_text(sub, False)
                 if feed[0] == 'lines':
-                    self.script('\n'.join(feed[1])[:262144], depth + 1, tail_visible=True)
+                    self._git_remote_text('\n'.join(feed[1])[:262144], depth)
         joined = ' '.join(a.text for a in rest).strip()
         if joined and not self.REMOTE_SHELL.fullmatch(joined):
             return  # the remote command reads stdin itself (xargs is handled by its own feed)
@@ -5430,7 +5446,7 @@ class Analyzer:
             return
         feed = self._git_stdin_feed(cmd, pl, idx, outer_remote)
         if feed[0] == 'lines':
-            self.script('\n'.join(feed[1])[:262144], depth + 1, tail_visible=True)
+            self._git_remote_text('\n'.join(feed[1])[:262144], depth)
         elif feed[0] == 'unverifiable':
             self._git_unverifiable('a remote shell script', feed[1])
         elif feed[0] == 'computed' and GIT_MENTION.search(feed[1] or ''):
