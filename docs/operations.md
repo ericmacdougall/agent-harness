@@ -21,6 +21,7 @@
 | `domain_gates.py`, `domain_checklists.json` | Blockchain domain gates: detect blockchain work from repo signals and supply a risk checklist, test scaffolds and follow-up prompts to specs and review prompts. |
 | `worktree_hygiene.py` | Stop/SubagentStop gate (rule S18): no turn ends with uncommitted work in a worktree it touched; reports unpushed, merged and duplicate worktrees (vendored from Hawkeye). |
 | `wal_cadence.py` | Stop/SubagentStop nudge (rule W04): one bounded block when a big uncommitted diff has no recent human-readable WAL entry (ported from Hawkeye). |
+| `mission_coverage.py`, `mission_gate.py` | Mission goals (goodqa#15565): the goals file and its audit chain, the coverage rule, and the Stop gate that blocks main while a goal has no live owner, live disposition or done evidence (see Mission coverage). |
 | `prod_delete_guard.py` | PreToolUse gate on destructive SQL against production databases, lifted only by a user-sourced, target-bound grant (ported from Hawkeye). |
 | `spec_flow.py`, `spec_policy.json`, `spec_template.md` | Spec-driven tickets: spec documents, spec reviews, per-criterion evidence, click-test records, sign-off and the done gate (CLI, plan-review ticket gate, PreToolUse hook on GoodQA status changes). |
 
@@ -1235,6 +1236,91 @@ Workaround: from such a cwd, spawn `general-purpose` owners and tell each to cre
 work directory (`git -C <repo> worktree add -b <branch> ~/.agent-harness/work/<session>/<task>/wt <base>`). A
 `WorktreeCreate` hook is deliberately not installed: it replaces Claude's worktree logic for every worktree, including
 owners already working in real repositories, and Claude never auto-removes the worktrees such a hook makes for subagents.
+
+## Mission coverage
+
+Every active mission goal must be held by someone, wait on something named, or be done with evidence (goodqa#15565).
+The dropped-owner gate only sees owners that existed and stopped; on 2026-11-10 the leads goal (goodqa#15095) had no
+owner all night and nothing said so. `harness/hooks/mission_coverage.py` holds the rule, `mission_gate.py` enforces it
+at main's Stop, and the ops-watch `mission` check alerts on it.
+
+### Goals file
+
+One canonical file, `~/.agent-harness/mission/goals.json` (directory 0700, file 0600, at most 1 MiB, 500 goals,
+nesting depth 8; a symlink, FIFO or any wrong type makes the whole file unreadable). It is a JSON list of goals:
+
+| field | type | meaning |
+| --- | --- | --- |
+| `id` | `[a-z0-9][a-z0-9_-]{0,63}` | unique goal id (the dashboard initiative id) |
+| `title` | text, up to 300 | what the goal is |
+| `ticket` | `goodqa#N`, `Project#N` or `""` | the stream ticket; owners are matched by it, never by name. A goal without a ticket cannot be covered by an owner |
+| `priority` | integer 1..9 | 1 is the most important |
+| `status` | `active`, `done`, `deferred` | `done` only through `done`, `deferred` only through `defer --user-source` |
+| `deferral` | `{by: user\|ask\|ticket, ref, until, source}` | what the goal waits on (see the rule) |
+| `done_evidence` | `[{kind: deploy\|really_tested, ref, session}]` | WAL ids proving it is live and tested |
+| `repos` | list of paths, optional | repositories whose commits naming the ticket count as progress |
+| `dashboard` | object, informational | copied from the dashboard on import; never read by the rule (its `owner` field covers nothing) |
+
+Write it only through the tool; each write appends a hash-chained row (`prev` = sha256 of the previous row, the last
+row's hash in `mission-goals-audit.head`, the goals file's sha256 in `after_sha`) to
+`~/.agent-harness/state/mission-goals-audit.jsonl`. A goals file that does not match the chain head (a goal removed or
+edited by hand, an edited or deleted audit row) is treated as tampered: the gate blocks and every write is refused until
+`reseal --reason` records the change as an audited row.
+
+    mission_coverage.py import-initiatives ~/.agent-harness/work/<session>/dashboard/initiatives.json
+    mission_coverage.py add --goal leads --title "1,000 leads in the CRM view" --ticket goodqa#15095 --priority 1
+    mission_coverage.py set --goal leads [--title T] [--ticket T] [--priority N] [--repo PATH]... [--status active] [--clear-deferral]
+    mission_coverage.py defer --goal leads --ask <open ask id> --until <ISO, at most 7 days ahead>
+    mission_coverage.py defer --goal leads --ticket <blocking ticket> --until <ISO, at most 7 days ahead>
+    mission_coverage.py defer --goal leads --user-source '<user: or answer: source>' [--until <ISO>]
+    mission_coverage.py done --goal leads --deploy <deploy WAL id> --live-test <REALLY_TESTED id> [--session S]
+    mission_coverage.py reseal --reason "<what changed and why>"
+    mission_coverage.py verify | report [--json] | check
+
+`import-initiatives` is an idempotent merge: new ids become active goals at priority 3; existing goals keep every field
+a person set and only gain a missing ticket and the informational `dashboard` block. Nothing is removed and nothing is
+marked done (a dashboard "Done" is not evidence). The dashboard's initiatives.json stays a derived view.
+
+### The rule
+
+A goal with status `active` (or `deferred`) is covered by
+
+1. a live owner: an `ah owners` row of an owner type (never a helper such as red-team, click-tester, fixer, Explore,
+   Plan) in state live, working, quiet or SILENT (SILENT not after an ending disposition), whose stream ticket equals
+   the goal's ticket. Stream tickets are the first GoodQA ticket in the owner's WAL plus any ticket main registered for
+   it with `ah task register --owner-agent <id> --ticket "GoodQA goodqa#N" ...`. A nested sub-agent owner counts;
+2. a live disposition: a wait on an ask that is open in main's WAL, or on another ticket, with `until` in the future
+   and at most 7 days ahead; or a deferral the user decided, whose `user:`/`answer:` source resolves through
+   provenance.py to the user's own words (`inferred:`, `pasted:`, tickets and agent text never count), with `until` in
+   the future or none;
+3. done evidence (status `done`): a deploy record and a later REALLY_TESTED entry against a live target, both naming the
+   goal's ticket, checked with `ah`'s own evidence resolvers (the DONE_LIVE rule). Both are required.
+
+Anything else is UNCOVERED. A covered goal is STALLED when none of its owners wrote an own WAL entry (hook lifecycle
+rows excluded) and no commit in its `repos` names the ticket for more than 45 minutes; the report gives the age.
+
+When the owner cap (`model_tiers.json` caps.session_owner_agents) is full and a goal is uncovered, the message names the
+owner to free or queue: owners on no mission goal first (most idle first), then owners of the lowest-priority, most
+stalled goal, plus the option to queue the goal on its ticket.
+
+### Enforcement
+
+- Stop gate (`mission_gate.py`, registered next to the dropped-owner gate): main only (`caller_identity.is_main`).
+  No goals file on a host means no block. It blocks with each uncovered goal, its ticket and the exact fixes; an
+  unreadable or tampered file blocks with one line. At most 25 blocks per signature (the sorted uncovered ids), then the
+  turn may end and a high `mission:gate-valve` alert (source `mission-gate`) goes to the ring; it clears when every goal
+  is covered. A repeated Stop in the same turn is not blocked. The owner scan has a 9 s budget; past it the gate uses the
+  last full scan (`~/.agent-harness/state/mission/owners-<session>.json`, refreshed by every full scan, used only when at
+  most 15 minutes old) and says so, otherwise it fails open with a message.
+- ops-watch `mission` check (enabled by default, `{"mission": {"enabled": false}}` in ops-watch.json turns it off):
+  `mission:<goal>:uncovered` (high, `stop_block`), `mission:<goal>:stalled` (warning), `mission:goals:unreadable` (high).
+  Alerts clear when the goal is covered. It uses the session in `CLAUDE_CODE_SESSION_ID`, else the newest main WAL.
+- Waking main: when the uncovered set gains a goal, `notify_main` raises `mission:notify` (source `mission-coverage`) and,
+  where `mc_chat` (Mission Control, goodqa#15585) is installed and main registered a target, drops an inbox message
+  marked as coming from the harness, not the user. It clears when nothing is uncovered.
+- Checkpoint: `mission_coverage.py report --json` lists goals slowest first (UNCOVERED by priority, STALLED oldest first,
+  covered by least recent progress, then waiting, deferred, done) and a `coverage` map keyed by goal id and ticket with
+  `{status: uncovered|stalled|moving, reason, action}` for Mission Control.
 
 ## Design limits
 
