@@ -1,0 +1,23 @@
+DELTA ACCEPTANCE REVIEW 3, goodqa#15598 spec-15598-v31.md (reviewer a96f4ee2abe080235). Read-only; no probes; t2-dev code read only.
+
+RECOMMENDATION: ACCEPT, conditional on three text-only edits (E1-E3) made before `spec_flow.py attach`; no further review round needed for them. No design-level material finding remains.
+
+ROUND-2 CLOSURE
+M1 closed: D13 adds `created_via` (+ `created_via_id`) on api_keys and personas, default `unknown`, backfill `unknown` except audit-proven session rows, eligibility exactly `session`, `created_by_user_token_id` NULL, never later tied, 60 min, re-checked at every reveal. Default-unknown means a creation path that forgets to set it fails closed, so no census of creation paths is required. A2 and NEG-6/NEG-18 cover org-API-key-created, token-tied-later (the PATCH/extend tieTo hole I cited), retired persona. Accept.
+M2 closed: `goodqa run --secrets` and GOODQA_API_KEY_FILE exist in the repo (docs/features/goodqa-cli.md, packages/goodqa/README.md, vault-env/routes.ts mentions --secrets); the curl uses stdin config (-K -) so the value is not in argv; stat, post-revoke 401, non-grantee/owner refusals, vaultEnv.enabled precondition, grantee provenance and human step recorded as a limitation. See E2.
+M3 closed: D3 caller kinds, no session/admin/owner reveal, D4 DELETE only by a signed-in session, NEG-9. System kind for the reconciler (NEG-18). Accept.
+Earlier residuals: NEG-8 "or" removed (conflict refused with `user_token_ability_conflict`); D10 rewritten and clear; 90-day/410 labelled in A4; name collision 409 in NEG-17; replay-before-limiter stated; rotation disclosed; A5 labelled "needs main's confirmation". Sources on NEG-6/8/13/17/18 are now labelled inferred.
+
+REQUIRED TEXT EDITS
+E1 Stale contradiction in the Risk table: row 2 reads "Only the grantee and a signed-in person can open it". D3, D4, NEG-9 and the Risks bullet say NO signed-in person can. Change the row to "Only the grantee can open it". Likewise D7 says "numbers are a proposal" and the last Risks bullet "numbers in D7 are a proposal pending main" while A4 says accepted by main ("The numbers are fine."): make them agree (cite A4 as accepted, keep the source citation to main's decision; I could not verify that quote).
+E2 AC-4's authenticated call hits `GET /v1/orgs/ORGID/api-keys`. On t2-dev (api-keys/routes.ts:195-197) that route requires `org:manage_api_keys` for the key's owning user, i.e. an admin-level key; a least-privilege disposable key (read scope, member role) would get 403 and the AC could not pass without over-privileging the proof key. Specify the mint parameters used by AC-4 (e.g. scopes read, maxOrgRole member) and use a member-floor read, e.g. `GET /v1/orgs/ORGID/api-keys/agents` (requireOrgRole at member, same file ~line 224) or `/v1/me`, and say which status is expected. Also state which org the tester uses and that the 200 comes from the MINTED key (the file was written with it) not the grantee key.
+E3 Migration wording is stale: Resource budget and Risks say "additive (new table)" / "additive table", but D10/D13 add columns to api_keys and personas (`created_via`, `created_via_id`, `minted_via_user_token_id`). Say "new table and additive columns; rollback is the flag, never drop the table; the columns may stay". Also state the backfill is idempotent and runs in the same migration, and that a failed backfill leaves rows `unknown` (fail closed).
+
+NON-BLOCKING NOTES
+- A5 (minted key outlives its minting token) is a real tradeoff main must confirm; with the tie removed, `minted_via_user_token_id` must be treated as created_by_user_token_id by the personal-principal rules (D10 states it); a test for "a minted key never acts as an owner-mode personal principal" is not a named NEG. Add one to NEG-15 or NEG-16 if cheap.
+- Resource budget still says "dev2 (the t2-dev host)".
+- AC-5 is observational (read a rule, record on 15561), acceptable as a separate claim.
+- D8 alert uses "the direct account email the vault already uses for rotate": not verified by me.
+
+NOT EXAMINED
+`goodqa run` exact flag semantics beyond existence; the real migration and backfill SQL; the opener census; Sentry scrub; no live calls.

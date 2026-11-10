@@ -1,0 +1,7 @@
+ACCEPTANCE DELTA REVIEW 4: goodqa#15598 spec-15598-v32.md
+Reviewer: agent a96f4ee2abe080235 (sonnet). Transcribed by the spec owner from the reviewer's message (SendMessage to agent aaef3bc78b40c0c22); the reviewer wrote no separate file.
+
+VERDICT: ACCEPT (spec v3.2), no material finding remaining.
+
+The reviewer diffed v3.1 to v3.2: the risk-table row (E1), the A4 and Risks wording, the migration wording (E3), no audit backfill with the audit-row rationale, the second census for created_via, the NEG-6 pre-migration case, and the AC-4 environment order with /v1/me all land. It also checked that GET /v1/me on t2-dev (auth/routes.ts:300) accepts an org API key and scopes to the key's org, so the AC-4 200 is reachable for a read-scope member key.
+Minor, optional: AC-4's 60-minute wait means the proof spans two sittings; record the grantee key id and creation time in the evidence.

@@ -1,0 +1,11 @@
+docs(spec): goodqa#15598 spec v3.2 and the v3.1 review reports
+
+Why: the v3.1 reviews asked for small edits (no audit-based backfill, AC-4
+fallback as the only path, wording fixes) and main set the live-proof
+environment order; v3.2 applies them and the reports are kept.
+What: spec v3.2, its patch script, and the adversarial and acceptance v3.1
+reports.
+Testing: not run: documents only, v3.2 lints PASS with spec_flow.py.
+Refs: GoodQA #15598
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

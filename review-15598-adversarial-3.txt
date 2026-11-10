@@ -1,0 +1,52 @@
+DELTA ADVERSARIAL SPEC REVIEW 3 goodqa#15598 spec-15598-v31.md
+Reviewer: agent:aebc8c3ffa03ad58e (opus). Read the diff v2 to v3.1 plus code read-only at bugtracker 26d95f46ada7.
+No probes, no live calls, no edits. Material findings only.
+
+VERDICT: BLOCK on ONE material finding (P1). The fix is one sentence in A2/D13 and one in AC-4, and it can be checked
+by diff. The rest of v3.1 is acceptable. Once P1 is changed as below, I accept without another round: main can confirm
+the change against this report.
+
+=== ROUND 2 STATUS ===
+N1 closed. D3 admits only the `grantee_reveal` caller kind, which only vault-env/reveal produces; background sites
+   pass `system`; no session, admin or owner may read; NEG-18 covers the reconciler and a bound desktop session.
+N2 closed in design (provenance columns, A2 applied to a persona and its key, re-checked at every reveal), except
+   for the backfill rule (P1).
+N3 closed. A5 is labelled for main. minted_via_user_token_id is treated like created_by_user_token_id. Owner email on
+   token revoke. 90-day expiry mandatory. Leaving out the revoke-all route is acceptable given the 90-day cap and
+   per-key revoke.
+N4 closed. NEG-8 has no "or" and refuses `all` or create_other_keys together with mint_to_vault.
+
+=== MATERIAL FINDING ===
+
+P1 [HIGH, confirmed in code] The backfill exception "rows whose creation audit row proves a signed-in session"
+cannot be implemented truthfully. A naive implementation reopens the laundering path.
+  - The api_key.created audit row (api-keys/service.ts:231-248, and the runner path at :484-492) records
+    actorKind 'user' and actorId = the user, whoever acted: a signed-in session, a user token, or an org API key
+    acting with its creator's authority. `changes` holds name, scopes, role, kind, scopedToUserId, canCreateIssues
+    and expiresAt. It holds no credential kind, no session id and no token id. Nothing in the row distinguishes a
+    session.
+  - An implementer told to "upgrade where the audit row proves a session" will probably treat actorKind 'user' as
+    proof, which marks every pre-migration key as `session`. created_by_user_token_id catches keys minted by tokens
+    after that column existed, but not keys minted by an org API key, MCP pairing, or keys from before the column.
+    Any such key whose plaintext an agent held becomes an eligible grantee, which is exactly what A2 exists to stop.
+  - Personas have no creation audit carrying credential kind either, so the same applies.
+  FIX: backfill EVERY existing api_keys and personas row as `unknown`, with no audit-based upgrade. Eligibility
+  starts only with keys and personas created after the migration ships, where the creation path sets created_via
+  from the authenticated context. In AC-4, make the fallback the only path: the tester creates the grantee key
+  through a signed-in session after deploy and waits 60 minutes, recorded as a limitation. Add one NEG-6 case: a
+  pre-migration key whose creation audit row shows actorKind 'user' is refused as `unknown`.
+
+=== CHECKED, NOT MATERIAL (notes) ===
+- AC-4 runs the grantee step through an agent on the grantee host. That host's own operator can read the value; this
+  is inherent to "a host holds the grantee". The invariant is about the MINTING agent, and the click-tester is
+  independent. State in Risks that the grantee host's operator is trusted with the key.
+- D4: DELETE limited to a signed-in session with org:manage_vault, and an agent cannot delete. This removes the
+  forced-swap path. Fine.
+- D10: rotation by re-mint under a new name with 409 vault_name_taken. Fine. Under the D7 rate limit, the
+  people-watch schedule must stay within 5 per hour per token, which it does.
+
+=== NOT VERIFIED ===
+- That every key and persona creation path can set created_via from the authenticated context (MCP pairing, QA
+  Commander enrolment, runner enrolment, agent-hosts registration). The census for created_via should cover all
+  inserts into api_keys and personas, the same way the opener census covers openers.
+- MCP tool code. The desktop-session start policy (AC-5).

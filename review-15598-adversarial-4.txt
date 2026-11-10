@@ -1,0 +1,8 @@
+ADVERSARIAL DELTA REVIEW 4: goodqa#15598 spec-15598-v32.md
+Reviewer: agent aebc8c3ffa03ad58e (opus). Transcribed by the spec owner from the reviewer's message (SendMessage to agent aaef3bc78b40c0c22); the reviewer stated that no separate report file is needed.
+
+VERDICT: ACCEPT (spec v3.2)
+
+P1 is fixed: all pre-migration rows are backfilled unknown with no audit upgrade; AC-4 uses only a grantee created in a session after deploy plus a 60-minute wait; the NEG-6 case is added; the created_via census is in. The v3.1 to v3.2 diff introduces no new material finding. During a rolling deploy, old code that inserts keys without created_via gets the default unknown, so it fails closed.
+
+Still not verified, as stated in reports 1-3: MCP tool code, the desktop-session start policy (AC-5), and whether every creation path can set created_via (the census enforces it).
