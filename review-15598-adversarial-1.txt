@@ -1,0 +1,151 @@
+ADVERSARIAL SPEC REVIEW goodqa#15598 spec-15598-v1.md (mint-to-vault, blind pin)
+Reviewer: agent:aebc8c3ffa03ad58e (opus). Code read-only at bugtracker 26d95f46ada7 on t2-dev (origin/main is now
+9ea5dc772525, deploy-record commits only, no code drift in the paths below). No probes were run (spec review, nothing
+runnable). No live calls, no repo edits.
+
+VERDICT: BLOCK. The design's goal is "the agent never obtains the key". As written, the agent that mints can still get
+the key, or use it fully, through paths D3 does not name, and D4 does not stop the agent naming a grantee it controls.
+
+=== MATERIAL FINDINGS (ranked) ===
+
+F1 [CRITICAL, confirmed in code] D3 lists "reveal" routes. The real exposure is every opener of vault plaintext, and the
+automation HTTP node sends a vault secret to a caller-chosen URL.
+  - apps/api/src/modules/automations/step-test/service.ts:77-84: on a live http_request, validateHttpRefs, then
+    openSecretPlaintext(row, ...) and sendHttpRequest(action, { secret }).
+  - http-node/schema.ts validateHttpRefs (line 10-16) checks only org scope plus secretAccessFor(...).canView. An org
+    admin or owner can always view (vault/routes.ts:88 "an org/project owner-or-admin is always unrestricted").
+  - http-node/client.ts:88-91 puts the value in an Authorization header, a named header, or a QUERY PARAMETER
+    ("if (credential.placement === 'query') targetUrl.searchParams.set(credential.name!, value)") on any public target
+    validateWebhookTarget accepts. The response redaction protects only the step result, not the receiving server.
+  - Same opener in http-node/reconcile.ts:58 (saved workflows run as w.createdBy).
+  So a user token with crm:edit and the automations family, held by an org admin, can send the minted key to a host it
+  reads. It can also use the key as a bearer against GoodQA's own API (for example POST /v1/orgs/:id/api-keys) and get a
+  NEW plaintext token back in the response, which the redaction does not catch because it is a different string. Either
+  way the purpose fails. D3's wording ("every other reveal path refuse it") would let an implementer patch the four
+  reveal routes and pass AC-2 and NEG-3/4 while this path stays open. No AC or NEG case names it.
+  The full set of openers at this SHA (git grep openSecretPlaintext|openVaultSecret, non-test) is about 30 sites:
+  vault/routes.ts:331, vault-env/routes.ts:196, secret-requests/routes.ts:469, requested-secret.ts:204,
+  agent-browsers/secret-broker.ts:34 and worker.ts:167 (gated on kind 'password', so an api_key kind is refused today:
+  incidental, not a control), automations step-test:84 and reconcile:58, network-connectors/service.ts:126,
+  deploy-connections/service.ts:160, machines/integration.ts:301, inference-paths/service.ts:481,
+  outreach/smtp/deliver.ts:289 and setup.ts:60, mailer-providers/connections-service.ts:156,
+  marketing-mailer:193, marketing-prospecting:240, marketing-social:279, marketing/seo/keyword-provider.ts:68,
+  social-connectors metrics.ts:117 and runtime.ts:27, sites/cloudflare-binding.ts:125, ghl-reader/vault.ts:28,
+  cms/sanity-drafts.ts:112, ahrefs/service.ts:153, workers/service.ts:190, private-network:254,
+  qa-commander-harness:289, messaging/routes.ts:2729. Many take a secret id or name the caller configures and send the
+  value to a provider host the caller may set (SMTP host, deploy target, inference base URL, network connector).
+  FIX (required before attach): put the blind check in ONE choke point, a wrapper over openSecretPlaintext or
+  getVaultSecretOr404 that refuses a blind secret unless the call site passes an explicit "grantee vault-env reveal"
+  capability, and add a test that fails if any new openSecretPlaintext call site bypasses it (the user-token policy's
+  census pattern). Add NEG cases: automation step-test, saved workflow, smtp, deploy, inference, connector paths all
+  refuse a blind secret for an org owner acting through a user token AND through a signed-in session.
+
+F2 [CRITICAL, confirmed in policy] The token that can blind-mint can already mint a key in plaintext, so blind minting
+gains nothing against a compromised or misbehaving agent, and taking approval off the blind route widens what an
+unapproved token can do.
+  - D-1 recommends the same ceiling as POST /api-keys: user-token-policy.ts:228-233 needs tokens.create_other_keys
+    with approval 'tokens.create_other_keys', and api-keys/routes.ts:181-182 says "The full token is returned exactly
+    once ... return reply.status(201).send({ apiKey, token })".
+  - Any token holding tokens.create_other_keys can call that route and receive plaintext. Today that is gated by
+    approval when the token has requireHumanApproval. The new route drops approval (main decision), so a token that
+    would otherwise ask first now mints keys with no ask. The minted key only ever reaches a grantee, but see F3.
+  FIX: the property "this agent never sees a key" holds only if the minting token CANNOT call plain POST /api-keys.
+  Give the new route its own ability (e.g. tokens.mint_to_vault) that does NOT imply tokens.create_other_keys, and
+  state as an invariant and a NEG case that the token used for the AC-4 live proof lacks tokens.create_other_keys and
+  is refused on POST /api-keys. Otherwise state plainly that the design is hygiene for a cooperative agent, not a
+  control against a compromised one, and record it as such.
+
+F3 [CRITICAL, design] The central question: D4 does not stop the agent naming a grantee it holds.
+  - D4 refuses only the minting token's "own user-token-minted key" and the key being minted. The same token (agents.manage,
+    user-token-policy.ts:217 covers api-keys and personas WRITE) can mint a plain key K1 (F2), or create a persona on a
+    key it holds, then name K1 or that persona as grantee. The rule "not the minting token's own key" is defeated by a
+    second token of the same user, by a key minted by another agent of the same user, or by any key whose plaintext an
+    agent ever saw (every key from plain POST /api-keys).
+  - Possession is never proven: a persona or api_key id is just a database row. The server cannot tell that the host
+    holding the grantee is not the agent.
+  - The grantee then needs a vault-env allow-list entry. vault-env/routes.ts:263-267 makes config writes session-only
+    ("Only a person signed in changes who may read secrets into an environment. No key or token can."). D3 says the
+    allow-list entry is "set by the same transaction" by the user-token mint. That quietly breaks the existing
+    session-only invariant: the mint route becomes a way for a token to change who may read secrets into an
+    environment, for itself. This must be named as a change and justified, or removed.
+  WHAT CLOSES IT (minimum): the grantee must be a principal that (a) no agent credential could have received in
+  plaintext and (b) existed and was bound before the mint. Concretely, any one of:
+    1. Grantee restricted to a machine-bound principal: a machine enrollment or agent-host identity whose secret was
+       generated on the host and is never returned by any API, the same idea as design B.
+    2. Grantee must already be on the vault-env allow-list, put there by a signed-in person (the existing session-only
+       PUT), at least N minutes (say 60) before the mint, and must not have been created by any user token or by a
+       key minted through one (createdByUserTokenId IS NULL, and the key was not shown to a token).
+    3. Grantee created by a signed-in person's session only (keys and personas created through any token excluded).
+  Option 2 reuses existing controls, keeps "no ask at mint time", and pushes the one human act to bootstrap, which the
+  spec already treats as a one-time human step (Risks, first bullet). Add NEG cases: grantee created by the same user's
+  other token, grantee persona created via a token, grantee added to the allow-list less than N minutes ago, grantee
+  key that was ever returned in plaintext: all refused before minting.
+
+F4 [HIGH] D3(b) exempts "a signed-in person's session". An org admin's session can reveal the key, so a human can
+always see it, which is acceptable. But the desktop session from goodqa#15561 is exactly the thing being minted (AC-12):
+D3 says "not a desktop session bound to a token". It must state how the server tells them apart (the AuthContext field)
+and NEG-4 must test a desktop session minted by the same user token on every opener in F1, not just the reveal routes.
+
+F5 [HIGH] Integrity and stealth-substitution paths not covered:
+  - PATCH /vault/secrets/:id with value (vault/routes.ts:355-358) needs only manage access (admin is unrestricted).
+    D7 says rotate "stays human-session only" but names no gate for it; today a user token with secrets.request can PATCH.
+    An agent could swap the sealed value for a key it knows, so the grantee host then runs on an attacker-held key. Make
+    PATCH value, PUT/DELETE grants, rename (vault-env reads by NAME: orgSecretsByName, a rename plus a new secret
+    with the old name redirects the host) and delete refuse a blind secret for every agent credential. Add NEG cases.
+  - vault-env resolves by name (service.ts orgSecretsByName). D3 must bind the blind row to the secret id, and the
+    grantee rule must name the exact id or name, never a prefix pattern (NAME_PATTERN_RE allows "prefix*").
+
+F6 [MEDIUM] Rate limit and idempotency:
+  - vault-env takeRateLimit is per process (service.ts:452-474: "A multi-instance deployment multiplies it by the
+    instance count"). D6's 5/hour per token must be backed by the DB (count rows in vault_blind_mints in the
+    transaction under a per-token advisory lock), or NEG-10 passes on one instance and fails in prod.
+  - D5: idempotency key unique on (org_id, idempotency_key_hash) must be a DB unique constraint, with the insert first
+    in the transaction, so NEG-8 is decided by the database, not a read-then-write. Say what is hashed (the key plus
+    the canonical body) and that a replay after the key was revoked returns 409 or 410, not the stale ids.
+  - "No oracle" (NEG-3): the mint route's own errors (grantee not found vs not allowed) are an existence oracle for
+    principal ids. Answer them uniformly.
+
+F7 [MEDIUM] Redaction claim is unverifiable as written. NEG-1 greps "server logs of the test run" for the token. The
+token is also passed into createVaultSecret and sealSecretPlaintext. Any thrown DB error with parameters (drizzle
+errors include params) and Sentry breadcrumbs could carry it. Require: the token is never a query parameter (only the
+sealed fields are), the handler wraps mint+seal in a catch that throws a fresh AppError without cause, and the test
+forces a DB failure AFTER seal and greps the Sentry scrub output too.
+
+F8 [MEDIUM] Owner alert is the main compensating control, but createNotifications can be muted or batched, and the
+alert goes to "owner and admins", which can be the agent's own user. Use the direct, unmutable account email the vault
+already uses for rotate (vault/routes.ts:360-367 rationale), and include grantee label, scopes and the token id.
+
+=== ON QUESTION 5 (skipping human approval) ===
+Not acceptable as specified, because F2 and F3 mean the controls do not bound what the agent can get. It becomes
+acceptable with: a dedicated ability that excludes tokens.create_other_keys (F2), a grantee that a signed-in person
+pre-authorised on the allow-list at least N minutes earlier and that no token created or ever saw (F3 option 2), the
+single-choke-point blind check (F1), and DB-backed rate limit plus an unmutable owner email. The approval moves to
+bootstrap once, which matches main's decision not to ask at mint time.
+
+=== MIGRATION AND ROLLBACK (question 6) ===
+Additive table, fine. Rollback is NOT safe as stated: dropping vault_blind_mints silently UNBLINDS every minted secret
+(it becomes an ordinary org secret, readable by every org admin and by every opener in F1). Rollback must instead
+delete those secrets and revoke their keys (or code must fail closed when the table is missing). The migration needs an
+FK to vault_secrets ON DELETE CASCADE and to api_keys, and a check that a revoked key revokes the secret's readability
+(D7) through a join, not a cleanup job.
+
+=== LESSER NOTES ===
+- Baseline drift: spec baseline 26d95f46ada7, origin/main 9ea5dc772525 (deploy records only). Fine.
+- AC-1 "failing first ... 404" is vacuous for the security properties: a 404 proves the route is missing, not that the
+  blind pin works. Each NEG case must fail against a variant with the blind check removed.
+- AC-4 live proof does not cover F1 or F3; add one live negative: the minting token's step-test with the blind secret
+  as credential is refused.
+- ASSUMPTION A1 and D-1 contradict each other (A1 says do NOT reuse tokens.create_other_keys; D-1 recommends exactly
+  that ceiling). Resolve per F2.
+
+=== NOT EXAMINED ===
+- MCP tool code (get_secret, read_requested_secret, call_api) and product-expert: not read. call_api is a pass-through
+  to the HTTP routes, so it inherits F1 if it can reach automations step-test; not confirmed.
+- lib/user-token-policy.ts rules for automations step-test and the routes in F1 (which ability, whether approval
+  applies): not read; the F1 reachability by a user token is likely, not confirmed.
+- auth-gate.ts, gmail-limited-use.ts, in-process-dispatch.ts, credential-kind.ts isAgentCredential: not read.
+- mintOrgApiKey (api-keys/service.ts:158) and assertApiKeyWithinUserToken (user-token-ceiling.ts:26) bodies: located,
+  not reviewed in detail.
+- Export, backup and KEK rotate: rotate-kek (vault/routes.ts:587) re-wraps DEKs and returns no plaintext. Org data
+  export: not examined.
+- No probes declared or run.

@@ -1,0 +1,10 @@
+docs(spec): goodqa#15598 mint-to-vault spec v1, v2 and review reports
+
+Why: the key-mint spec for goodqa#15598 and the first two review reports
+live in the scratch worktree; committing keeps them recoverable.
+What: spec v1 and v2 (v2 answers the adversarial and acceptance blocks) and
+the adversarial and acceptance reports for v1.
+Testing: not run: documents only, the spec lints PASS with spec_flow.py.
+Refs: GoodQA #15598
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
