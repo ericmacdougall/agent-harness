@@ -383,6 +383,11 @@ class Hostile(Base):
     def test_deep_nesting(self):
         self.write_raw(b"[" * 50000 + b"]" * 50000)
         self.assert_refused()
+        nested = {}
+        for _ in range(20):  # valid types, but deeper than the goals schema ever needs (mutation check survivor)
+            nested = {"x": nested}
+        self.write_raw(json.dumps([goal(dashboard=nested)]).encode())
+        self.assert_refused()
 
     def test_symlink(self):
         real = self.home / "real.json"
@@ -429,6 +434,13 @@ class AuditChain(Base):
         lines = path.read_text().splitlines()
         path.write_text("\n".join([lines[0], lines[2]]) + "\n")
         self.assertFalse(mc.verify_audit(self.home)["ok"])
+
+    def test_edited_or_dropped_last_row_is_detected_by_the_head(self):
+        self.write_goals([goal(), goal("tokens", ticket="goodqa#15561")])
+        path = mc.audit_path(self.home)
+        lines = path.read_text().splitlines()
+        path.write_text("\n".join(lines[:-1] + [lines[-1].replace('"add"', '"set"')]) + "\n")
+        self.assertIn("head", mc.verify_audit(self.home)["problem"])
 
     def test_goal_removed_by_hand_is_detected(self):
         self.write_goals([goal(), goal("tokens", ticket="goodqa#15561")])
@@ -517,6 +529,33 @@ class CoverageMapShape(Base):
         doc = self.report(rows, cap=2)
         self.assertIn("azzzzzz1", doc["coverage"]["leads"]["action"])
         self.assertIn("azzzzzz1", doc["coverage"]["goodqa#15095"]["action"])
+
+
+class OpsWatch(Base):
+    def cfg(self):
+        return ow.load_config(self.home, host="mac", overrides={})
+
+    def test_check_raises_uncovered_high_and_stalled_warning_and_clears(self):
+        self.write_goals([goal(), goal("tokens", ticket="goodqa#15561", priority=2)])
+        rows = [row("a1111111", ticket="GoodQA #15561")]
+        state = {}
+        with mock.patch.object(mc, "owner_rows", return_value=rows), \
+                mock.patch.object(mc, "owner_progress", return_value=NOW - 50 * 60), \
+                mock.patch.object(mc, "notify_main") as notify:
+            alerts = {a["key"]: a for a in ow.check_mission(self.cfg(), state, None, NOW)}
+        self.assertEqual(alerts["mission:leads:uncovered"]["severity"], "high")
+        self.assertTrue(alerts["mission:leads:uncovered"]["detail"]["stop_block"])
+        self.assertEqual(alerts["mission:tokens:stalled"]["severity"], "warning")
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args[0][0], ["leads"])
+        with mock.patch.object(mc, "owner_rows", return_value=rows + [row("a2222222")]), \
+                mock.patch.object(mc, "owner_progress", return_value=NOW - 60), \
+                mock.patch.object(mc, "notify_main") as notify:
+            self.assertEqual(ow.check_mission(self.cfg(), state, None, NOW), [])
+        self.assertIn("mission", ow.DEFAULT_CHECKS)
+
+    def test_check_is_silent_without_a_goals_file(self):
+        self.assertEqual(ow.check_mission(self.cfg(), {}, None, NOW), [])
 
 
 class Notify(Base):

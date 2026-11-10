@@ -1556,6 +1556,29 @@ def check_liveness(cfg, state, runner, now):
     return out
 
 
+def check_mission(cfg, state, runner, now):
+    """Mission coverage (goodqa#15565): mission:<goal>:uncovered (high, stop_block) and mission:<goal>:stalled
+    (warning) from mission_coverage.assess; mission:goals:unreadable when the goals file cannot be trusted. Silent on a
+    host without ~/.agent-harness/mission/goals.json. When the set of uncovered goals gains a goal it wakes main
+    (mission_coverage.notify_main); when it empties it clears that notice. Each full owner scan here also refreshes the
+    owner snapshot the Stop gate falls back to."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import mission_coverage as mc  # noqa: PLC0415 - installed beside this file
+    home = Path(home_of(cfg))
+    if not os.path.lexists(mc.goals_path(home)):
+        return []
+    session = mc.main_session(home)
+    assessment = mc.assess(home, session, now, with_commits=True)
+    uncovered = sorted(r["id"] for r in assessment.get("results") or [] if r["state"] == "UNCOVERED")
+    notified = [g for g in state.get("mission_notified") or [] if isinstance(g, str)]
+    if set(uncovered) - set(notified):
+        mc.notify_main(uncovered, home=home, session=session)
+    elif notified and not uncovered:
+        mc.notify_main([], home=home, session=session)
+    state["mission_notified"] = uncovered
+    return mc.mission_alerts(assessment)
+
+
 # ---------------------------------------------------------------- run
 
 DEFAULT_CHECKS = {
@@ -1570,6 +1593,7 @@ DEFAULT_CHECKS = {
     "liveness": lambda c, s, r, n: check_liveness(c, s, r, n) if c["liveness"].get("enabled") else [],
     "peers": check_peers,
     "remote_units": check_remote_units,
+    "mission": lambda c, s, r, n: check_mission(c, s, r, n) if (c.get("mission") or {}).get("enabled", True) else [],
 }
 RUN_CHECK = "_run"    # internal errors; cleared by any completed run
 SINK_CHECK = "_sink"  # delivery failures; cleared when that sink recovers

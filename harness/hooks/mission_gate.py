@@ -108,7 +108,9 @@ def cmd_stop(payload: dict, now: float | None = None) -> dict:
         if not uncovered:
             ring(home, "clear", "mission gate: every goal is covered again", {})
             return {}
-        text = mc.gate_message(a["results"], a.get("advice") or "") + ("\n" + a["owners_note"] if a.get("owners_note") else "")
+        text = mc.gate_message(a["results"], a.get("advice") or "")
+        if a.get("owners_note"):
+            text += "\n" + a["owners_note"]
         names = [f"{r['id']} ({r['ticket'] or 'no ticket'})" for r in uncovered]
         sig_src = ",".join(sorted(r["id"] for r in uncovered))
     sig = hashlib.sha256(sig_src.encode()).hexdigest()[:16]
