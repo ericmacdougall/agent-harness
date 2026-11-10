@@ -32,5 +32,7 @@
   {"id": "file-wait-counter", "command": "i=0; until [ -f out.txt ] || [ $i -ge 120 ]; do sleep 5; i=$((i+1)); done"},
   {"id": "file-wait-seconds", "command": "until [ -f out.txt ] || [ $SECONDS -gt 600 ]; do sleep 5; done"},
   {"id": "file-wait-for-bounded", "command": "for i in $(seq 1 120); do [ -f out.txt ] && break; sleep 5; done"},
-  {"id": "file-check-no-wait", "command": "if [ -f out.txt ]; then cat out.txt; fi"}
+  {"id": "file-check-no-wait", "command": "if [ -f out.txt ]; then cat out.txt; fi"},
+  {"id": "file-wait-with-producer-check", "command": "until [ -f out.txt ] || ! kill -0 $PID 2>/dev/null; do sleep 1; done"},
+  {"id": "file-wait-inotify-timeout", "command": "until [ -f out.txt ]; do inotifywait -t 5 -e create . ; done"}
 ]

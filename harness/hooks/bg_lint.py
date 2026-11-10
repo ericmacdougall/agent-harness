@@ -178,7 +178,7 @@ def find_self_matching_wait(segments):
 
 FILE_TEST = re.compile(r"(?:\[\[?\s+!?\s*-[fesrdL]\s+\S+|\btest\s+!?\s*-[fesrdL]\s+\S+|\bls\s+(?:-\S+\s+)*\S+\s*(?:>|2>|\|))")
 LOOP_BOUND = re.compile(r"\btimeout\b|\bSECONDS\b|date\s+\+?%?s|\$\(\(|\(\(|\bseq\b|\bexpr\b|\blet\b|\{1\.\.\d+\}|-(?:lt|le|gt|ge)\b|"
-                        r"\bdeadline\b|\bmax_?(?:wait|tries|iter\w*)\b", re.IGNORECASE)
+                        r"\bdeadline\b|\bmax_?(?:wait|tries|iter\w*)\b|\bkill\s+-0\b|\binotifywait\s+(?:-\S+\s+)*-t\b|\bpgrep\b", re.IGNORECASE)
 
 
 def find_unbounded_file_wait(segments):

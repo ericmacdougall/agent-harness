@@ -379,7 +379,7 @@ def _wait_alert(name, reason, detail):
         import ops_watch
         ops_watch.emit({"host": ops_watch.default_host(), "source": "bg-wait", "event": "raise", "severity": "high",
                         "check": "bg-wait", "key": "bgwait:%s:%s" % (name, reason),
-                        "message": "background waiter %s gave up: %s" % (name, detail)[:300], "detail": {"reason": reason}})
+                        "message": ("background waiter %s gave up: %s" % (name, detail))[:300], "detail": {"reason": reason}})
     except Exception:  # noqa: BLE001 - an alert failure never changes the waiter's exit status
         pass
 
@@ -391,6 +391,9 @@ def cmd_wait_file(args):
     if args.timeout is None or not 0 < args.timeout <= MAX_FILE_WAIT_S:
         print("UNPROVEN reason=--timeout is required, 1 to %d seconds" % MAX_FILE_WAIT_S)
         return EXIT_USAGE
+    if not math.isfinite(args.poll) or not 0.05 <= args.poll <= 60:
+        print("UNPROVEN reason=--poll must be between 0.05 and 60 seconds")
+        return EXIT_USAGE
     alive, label = _producer_alive(args.producer, directory)
     if alive is None:
         print("UNPROVEN reason=--producer must be job:<bg_job name> or pid:<number>, naming what writes %s" % args.file)
@@ -400,7 +403,7 @@ def cmd_wait_file(args):
     gone_looks = 0
     while True:
         try:
-            ready = os.path.getsize(args.file) >= args.min_bytes
+            ready = os.path.isfile(args.file) and os.path.getsize(args.file) >= args.min_bytes  # a directory is not output
         except OSError:
             ready = False
         if ready:
@@ -410,7 +413,7 @@ def cmd_wait_file(args):
         gone_looks = 0 if alive else gone_looks + 1
         if gone_looks >= 2:  # two looks: one failed `ps` read must not end a live producer's wait
             try:
-                if os.path.getsize(args.file) >= args.min_bytes:
+                if os.path.isfile(args.file) and os.path.getsize(args.file) >= args.min_bytes:
                     continue  # it landed between the checks
             except OSError:
                 pass
@@ -421,7 +424,7 @@ def cmd_wait_file(args):
             print("TIMEOUT file=%s producer=%s still running after %ss" % (args.file, label, args.timeout))
             _wait_alert(name, "timeout", "%s still not written after %ss (producer %s)" % (args.file, args.timeout, label))
             return EXIT_TIMEOUT
-        time.sleep(args.poll)
+        time.sleep(max(0.05, min(args.poll, end - time.time())))  # the timeout stays a hard bound
 
 
 def cmd_status(args):

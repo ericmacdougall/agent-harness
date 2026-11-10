@@ -412,6 +412,24 @@ class WaitFile(Base):
         self.assertIn("TIMEOUT", res.stdout)
         self.assertIn(b"bgwait:slow.txt:timeout", self.alerts())
 
+    def test_poll_is_bounded_and_a_directory_is_not_a_ready_file(self):
+        # red-team ad4294 W2 and W3
+        target = self.tmp / "later.txt"
+        for poll in ("0", "-1", "nan", "1e9", "61"):
+            res = run_bg("wait-file", "--file", str(target), "--producer", "pid:%d" % os.getpid(), "--timeout", "5",
+                         "--poll", poll)
+            self.assertNotEqual(res.returncode, 0, poll)
+            self.assertNotIn("FILE_READY", res.stdout, poll)
+        started = time.time()
+        res = self.wait_file(self.tmp, "pid:%d" % os.getpid(), timeout="2")  # a directory is not output
+        self.assertEqual(res.returncode, 3, res.stdout)
+        self.assertLess(time.time() - started, 6)
+        slow = subprocess.run([sys.executable, str(BG_JOB), "wait-file", "--file", str(target), "--producer",
+                               "pid:%d" % os.getpid(), "--timeout", "1", "--poll", "30", "--dir", str(self.jobs)],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=20,
+                              env=dict(os.environ, HOME=str(self.tmp)))
+        self.assertEqual(slow.returncode, 3)  # the 30 s poll did not push the 1 s timeout out
+
     def test_a_dead_pid_or_unknown_job_is_not_a_producer(self):
         target = self.tmp / "x.txt"
         dead = subprocess.Popen([sys.executable, "-c", "pass"])
