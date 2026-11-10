@@ -76,7 +76,14 @@ def grants_from_rows(rows) -> list:
             continue
         found = GRANT.match(str(row.get("note") or ""))
         if found:
-            out.append({"text": found.group(1).strip()[:200], "tokens": _tokens(found.group(1)), "row": row.get("id")})
+            tokens = _tokens(found.group(1))
+            quoted = " ".join(re.findall(r'"([^"\n]*)"', str(row.get("source") or "")))
+            # The grant must be a paraphrase of the user's quoted words: an agent could cite any real user message and
+            # write an unrelated GRANT (review F2), so the tokens must also occur in the quoted excerpt, one of them distinctive.
+            backed = tokens & _tokens(quoted)
+            if len(backed) < 2 or not backed - GENERIC:
+                continue
+            out.append({"text": found.group(1).strip()[:200], "tokens": backed, "row": row.get("id")})
     return out
 
 
@@ -90,7 +97,7 @@ def grants_from_wal(main_wal: Path) -> list:
             if line:
                 try:
                     rows.append(json.loads(line))
-                except ValueError:
+                except (ValueError, RecursionError):  # one hostile line must not drop every grant
                     continue
     except Exception:  # noqa: BLE001 - no readable main log: no grants
         return []
@@ -101,14 +108,14 @@ def agent_doable(note: str, reason: str, grants: list, policy: dict) -> tuple:
     """(True, why) when a new ask should be refused as agent-doable or already granted, else (False, "")."""
     text = f"{note or ''} {reason or ''}"
     low = text.lower()
-    if any(term.lower() in low for term in policy.get("human_only") or []):
+    if any(re.search(r"\b" + re.escape(term.lower()), low) for term in policy.get("human_only") or []):
         return False, ""  # CAPTCHA, payment, new terms, a new account, a production password stay human steps
     asked = _tokens(text)
     for grant in grants:
         shared = asked & grant["tokens"]
         if len(shared) >= policy.get("min_shared", 2) and shared - GENERIC:  # at least one distinctive word in common
             return True, (f"already granted by the user ({grant['text'][:100]}; shared words: {', '.join(sorted(shared)[:4])}): "
-                          "do it, and record REALLY_TESTED")
+                          "if no step needs a person, do it and record REALLY_TESTED")
     for rule in policy.get("agent_doable") or []:
         if rule["re"].search(text):
             return True, rule["why"]

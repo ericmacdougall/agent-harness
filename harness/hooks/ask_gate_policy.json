@@ -1,25 +1,13 @@
 {
-  "_doc": "GoodQA #15565 ask hygiene. mode: off | warn | enforce. human_only terms always keep an ask (the harness rules reserve these steps for a person). agent_doable rules refuse an ask an agent can do itself. A GRANT: row of the user's own words in the main log refuses asks that share min_shared distinctive words with it.",
+  "_doc": "GoodQA #15565 ask hygiene. mode: off | warn | enforce (ship warn: enforce needs a replay over real asks with 0 false refusals first). human_only terms always keep an ask: the harness rules reserve these steps for a person, and anything that needs his email, phone, passkey, password, bank or approval is his. agent_doable rules flag an ask an agent can do itself. A GRANT: row of the user's own words in the main log flags asks that share min_shared words, one distinctive, with it.",
   "mode": "warn",
   "min_shared": 2,
   "human_only": [
-    "captcha",
-    "payment",
-    "credit card",
-    "billing",
-    "new terms",
-    "terms of service",
-    "create an account",
-    "new account",
-    "production password",
-    "type the password",
-    "foreign",
-    "another session",
-    "other session",
-    "orphan",
-    "no owner",
-    "not yours",
-    "someone else"
+    "captcha", "payment", "credit card", "billing", "wire", "invoice", "refund", "bank",
+    "new terms", "terms of service", "create an account", "new account",
+    "production password", "type the password", "password", "passkey", "2fa", "mfa", "one-time", "otp", "sms", "verification code",
+    "email", "e-mail", "phone", "approve link", "approval link", "push approval", "approve", "identity", "enroll", "vault",
+    "foreign", "another session", "other session", "orphan", "no owner", "not yours", "someone else", "your own", "not mine", "eric"
   ],
   "agent_doable": [
     {
@@ -29,13 +17,13 @@
     },
     {
       "id": "sign-in",
-      "pattern": "\\b(?:please|can you|could you|may i|should i)\\s+(?:sign|log)[ -]?in\\b|\\b(?:sign|log)[ -]?in (?:for|to) (?:me|us)\\b",
+      "pattern": "\\b(?:please|can you|could you)\\s+(?:sign|log)[ -]?in\\b|\\b(?:sign|log)[ -]?in (?:for|to) (?:me|us)\\b",
       "why": "an account the user already owns is reached through his GoodQA user token, an email approve link or device code, or secure-login (CLAUDE.md section 4)"
     },
     {
       "id": "plain-chore",
-      "pattern": "\\b(?:please|can you|could you)\\s+(?:run|click|open|check|look at|verify)\\b",
-      "why": "an agent can run, click, open or check this itself"
+      "pattern": "\\b(?:please|can you|could you)\\s+(?:run|look at)\\b",
+      "why": "an agent can run or look at this itself"
     }
   ]
 }
