@@ -5499,7 +5499,8 @@ class Approvals:
                     continue
                 if entry.get('kind') == NO_BACKUP_KIND:
                     # no copy exists, so the state that made the deletion safe is checked again right now
-                    if _no_backup_state(real, entry.get('target'), self.home) != entry.get('state'):
+                    if _no_backup_state(real, entry.get('target'), self.home,
+                                        extra_ignored=(entry.get('state') or {}).get('extra_ignored')) != entry.get('state'):
                         continue
                 elif stat_manifest(real, self.limits) != entry.get('stat_sha256'):
                     continue
@@ -6320,28 +6321,92 @@ def _image_size(real):
     return total
 
 
-# Ignored paths a clone can rebuild from its lockfile and sources. Matching is by path segment, never by substring.
+# Ignored paths a clone can rebuild from its lockfile and sources. A status entry counts only when it is a whole ignored
+# folder whose own name is on this list (git collapses a wholly ignored folder to one `name/` line); the folder is then
+# walked: see _scan_ignored_dir.
 REGENERABLE_SEGMENTS = frozenset((
     'node_modules', '.next', '.nuxt', '.turbo', '.parcel-cache', '.cache', '.wrangler', '.media-cache', 'dist', 'build',
     'out', 'coverage', '.pytest_cache', '.mypy_cache', '.ruff_cache', '__pycache__', '.venv', 'venv', 'target', '.gradle',
     '.svelte-kit', '.vercel', '.output', '.angular', '.expo', 'storybook-static', '.tox', '.eggs'))
-REGENERABLE_NAMES = re.compile(r'(?:\.pyc|\.pyo|\.tsbuildinfo|\.DS_Store)$')
-NEVER_SEGMENTS = frozenset(('.claude', 'wals', 'projects', 'sessions', 'transcripts'))
+# third-party trees hold fixtures (keys, databases) that are part of a package, so only the name-independent checks apply
+DEPENDENCY_SEGMENTS = frozenset(('node_modules', 'venv', '.venv', '__pycache__', '.tox', '.eggs', '.gradle'))
+NEVER_SEGMENTS = frozenset(('.claude', '.codex', '.agent-harness', 'wals', 'projects', 'sessions', 'transcripts', 'state',
+                            'logs'))
+# folders only this harness and its agents create: refused even inside third-party trees (a package may have its own state/logs)
+HARNESS_SEGMENTS = frozenset(('.claude', '.codex', '.agent-harness'))
+SECRET_OR_RECORD_FILE = re.compile(
+    r'(?:^\.env(?:\..*)?$|^\.npmrc$|^\.netrc$|^id_[a-z0-9_]+$|\.(?:pem|key|p12|pfx|kdbx|db|sqlite3?|jsonl|log)$)', re.I)
+IGNORED_SCAN_LIMIT = 3000000
 
 
-def _regenerable_ignored(path):
-    """True when an ignored path is rebuildable output: it is, or sits under, a known build or dependency folder, or it is
-    a bytecode or OS file. Any other ignored file (a log, an env file, a key, a database, notes) is not, and neither is
-    anything under a Claude, session or log-named folder."""
-    parts = [seg for seg in str(path).replace('\\', '/').split('/') if seg]
+def _regenerable_ignored(entry):
+    """True when a `git status --ignored` entry is rebuildable output: a whole ignored folder named like a build or
+    dependency folder (trailing slash), or a bytecode or OS file. A listed file inside a mixed folder, a folder whose own
+    name is not on the list, and anything with a Claude, session or log segment are not."""
+    text = str(entry).replace('\\', '/')
+    parts = [seg for seg in text.split('/') if seg]
     if not parts or '..' in parts or any(seg.casefold() in NEVER_SEGMENTS for seg in parts):
         return False
-    return any(seg in REGENERABLE_SEGMENTS for seg in parts) or bool(REGENERABLE_NAMES.search(parts[-1]))
+    if text.endswith('/'):
+        return parts[-1] in REGENERABLE_SEGMENTS
+    name = parts[-1]
+    if name == '.DS_Store' or name.endswith('.tsbuildinfo'):
+        return True
+    return name.endswith(('.pyc', '.pyo')) and len(parts) > 1 and parts[-2] == '__pycache__'
 
 
-def _no_backup_state(real, target, home=None, attached=None):
+def _extra_ignored_ok(entry, extra):
+    """An entry the approver named: exact match to a listed relative entry, no `..`, and no Claude, session or log segment."""
+    text = str(entry).replace('\\', '/')
+    parts = [seg for seg in text.split('/') if seg]
+    return (text in (extra or ()) and bool(parts) and '..' not in parts and not text.startswith('/')
+            and not any(seg.casefold() in NEVER_SEGMENTS for seg in parts))
+
+
+def _scan_ignored_dir(path, name):
+    """Walk one ignored folder (never following links) and return (entries, newest mtime_ns). Raises ValueError for a nested
+    repository (its commits may exist nowhere else), a Claude, session or log folder, and, outside third-party trees, a
+    secret, key, database, log or transcript file. A folder over IGNORED_SCAN_LIMIT entries is refused."""
+    dependency = name in DEPENDENCY_SEGMENTS
+    seen, newest = 0, 0
+    for root, dirs, files in os.walk(path, followlinks=False):
+        for d in dirs:
+            if d == '.git' or d.casefold() in (HARNESS_SEGMENTS if dependency else NEVER_SEGMENTS):
+                raise ValueError('an ignored folder holds a nested repository or a Claude, session or log folder (%s)' % d)
+        for f in files:
+            if f == '.git' or (not dependency and SECRET_OR_RECORD_FILE.search(f)):
+                raise ValueError('an ignored folder holds a secret, key, database, log or nested repository file (%s)' % f)
+        seen += len(dirs) + len(files)
+        if seen > IGNORED_SCAN_LIMIT:
+            raise ValueError('an ignored folder is too large to check; refused')
+        try:
+            newest = max(newest, os.lstat(root).st_mtime_ns)
+        except OSError:
+            raise ValueError('an ignored folder could not be inspected; refused')
+    return seen, newest
+
+
+def _scan_tree_for_nested_repos(real, ignored_dirs):
+    """Refuse any `.git` below the clone root outside the (separately scanned) ignored folders: git never lists a nested
+    repository's contents, so unpushed commits there would be invisible to every other check."""
+    skip = {os.path.join(real, d.rstrip('/')) for d in ignored_dirs}
+    seen = 0
+    for root, dirs, files in os.walk(real, followlinks=False):
+        if root == real:
+            dirs[:] = [d for d in dirs if d != '.git']
+        if '.git' in dirs or '.git' in files:
+            raise ValueError('a nested repository or .git entry exists inside the working tree; its commits are not checked')
+        dirs[:] = [d for d in dirs if os.path.join(root, d) not in skip]
+        seen += len(dirs) + len(files)
+        if seen > IGNORED_SCAN_LIMIT:
+            raise ValueError('the working tree is too large to check; refused')
+
+
+def _no_backup_state(real, target, home=None, attached=None, extra_ignored=None):
     """Every local fact that makes deleting `real` lose nothing, as a comparable dict. Raises ValueError when unsafe.
-    The hook runs it again at delete time, so a change after approval voids the approval."""
+    The hook runs it again at delete time, so a change after approval voids the approval. extra_ignored names ignored
+    entries (as `git status --ignored` prints them) the approver accepts beyond the build-folder list; they are recorded in
+    the state, must still be ignored by the repository, and get the same folder scan (no secret, log, nested repo)."""
     if target == 'image':
         if real in (attached or _attached_images)():
             raise ValueError('the disk image is attached; detach it first (hdiutil detach)')
@@ -6367,16 +6432,28 @@ def _no_backup_state(real, target, home=None, attached=None):
     if code != 0 or any(rec.startswith('160000 ') for rec in staged.split('\0')) or \
             os.path.lexists(os.path.join(real, '.gitmodules')) or os.path.lexists(os.path.join(git_dir, 'modules')):
         raise ValueError('the repository has submodules; their commits are not checked, so it is refused')
-    code, status = _git(real, 'status', '--porcelain=v1', '--ignored', '--untracked-files=all', '-z')
+    code, status = _git(real, 'status', '--porcelain=v1', '--untracked-files=all', '-z')
+    if code != 0 or status:
+        raise ValueError('the working tree has changed, untracked or ignored files; they exist nowhere else')
+    # ignored entries only, wholly ignored folders collapsed to one `name/` line
+    code, status = _git(real, 'status', '--porcelain=v1', '--ignored=traditional', '--untracked-files=normal', '-z')
     if code != 0:
         raise ValueError('the working tree has changed, untracked or ignored files; they exist nowhere else')
+    accepted = sorted(set(extra_ignored or []))
+    ignored_dirs, digest = [], hashlib.sha256()
     for rec in status.split('\0'):
         if not rec:
             continue
         # GoodQA #15565: ignored build output and dependency folders are regenerable by definition; anything else that
         # git reports (a change, an untracked file, an ignored log or env file) exists nowhere else and still refuses.
-        if not rec.startswith('!! ') or not _regenerable_ignored(rec[3:]):
+        if not rec.startswith('!! ') or not (_regenerable_ignored(rec[3:]) or _extra_ignored_ok(rec[3:], accepted)):
             raise ValueError('the working tree has changed, untracked or ignored files; they exist nowhere else')
+        if rec.endswith('/'):
+            ignored_dirs.append(rec[3:])
+    _scan_tree_for_nested_repos(real, ignored_dirs)
+    for rel in sorted(ignored_dirs):
+        count, newest = _scan_ignored_dir(os.path.join(real, rel.rstrip('/')), rel.rstrip('/').rsplit('/', 1)[-1])
+        digest.update(('%s\0%d\0%d\n' % (rel, count, newest)).encode('utf-8', 'surrogateescape'))
     code, flagged = _git(real, 'ls-files', '-v', '-z')
     if code != 0:
         raise ValueError('cannot list the index')
@@ -6407,7 +6484,9 @@ def _no_backup_state(real, target, home=None, attached=None):
     code, refs = _git(real, 'for-each-ref', '--format=%(objectname) %(refname)')
     if code != 0:
         raise ValueError('cannot list refs')
-    return {'head': head.strip(), 'refs_sha256': hashlib.sha256(refs.encode()).hexdigest(), 'worktrees': 1}
+    return {'head': head.strip(), 'refs_sha256': hashlib.sha256(refs.encode()).hexdigest(), 'worktrees': 1,
+            'ignored_sha256': digest.hexdigest(),  # entries and newest mtime of each ignored folder: late additions void it
+            'extra_ignored': accepted}
 
 
 def _remote_host(url):
@@ -6641,7 +6720,7 @@ def _environment_refusal(user_home):
 
 
 def approve_delete_no_backup(path, user_source, wal, ttl=None, home=None, policy=None, now=None, resolver=None,
-                             attached=None, ls_remote=None):
+                             attached=None, ls_remote=None, extra_ignored=None):
     """Write a single-use approval for deleting `path` without a backup, on a user's approval. Returns the entry.
     Raises ValueError on refusal (and audits it)."""
     policy = policy or load_policy()
@@ -6703,7 +6782,10 @@ def approve_delete_no_backup(path, user_source, wal, ttl=None, home=None, policy
             raise ValueError('the selected answer does not say delete (or it declines): the option must be exactly '
                              '"Delete, no backup" (optionally "(Recommended)"); ask the user again')
         target = _target_kind(real, home=user_home)
-        state = _no_backup_state(real, target, home, attached=attached)
+        extra = [str(e) for e in (extra_ignored or [])]
+        if len(extra) > 20 or any(not e or len(e) > 300 or e.startswith('/') or '..' in e.split('/') for e in extra):
+            raise ValueError('--also-ignored takes at most 20 relative ignored entries as git prints them (public/audio/)')
+        state = _no_backup_state(real, target, home, attached=attached, extra_ignored=extra)
         where = _check_git_pushed(real, ls_remote=ls_remote, hosts=limits.get('no_backup_remote_hosts')
                                   or DEFAULT_REMOTE_HOSTS) if target == 'git' else None
         size = _image_size(real) if target == 'image' else None
@@ -7111,6 +7193,10 @@ def main(argv=None):
     appr.add_argument('--wal', required=True, help='WAL that records this approval')
     appr.add_argument('--backup-verified-sha256', dest='digest')
     appr.add_argument('--ttl', type=int)
+    appr.add_argument('--also-ignored', dest='also_ignored', nargs='+', metavar='ENTRY',
+                      help='--no-backup only: ignored entries (as git status --ignored prints them, e.g. public/audio/) the '
+                           'approver accepts as rebuildable beyond the build-folder list; recorded in the approval, scanned '
+                           'for secrets, logs and nested repositories')
     sub.add_parser('revoke-delete')
     scan = sub.add_parser('scan-wal')
     scan.add_argument('paths', nargs='+')
@@ -7149,7 +7235,8 @@ def main(argv=None):
                   '--backup-verified-sha256', file=sys.stderr)
             return 2
         try:
-            entry = approve_delete_no_backup(args.path, args.user_source, args.wal, ttl=args.ttl)
+            entry = approve_delete_no_backup(args.path, args.user_source, args.wal, ttl=args.ttl,
+                                             extra_ignored=args.also_ignored)
         except (ValueError, OSError, subprocess.SubprocessError) as error:
             print('approve-delete refused: %s' % error, file=sys.stderr)
             return 2

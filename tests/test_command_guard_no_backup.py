@@ -176,11 +176,14 @@ class GitTarget(NoBackupCase):
     def test_ignored_build_output_and_dependencies_are_regenerable_goodqa_15565(self):
         path = self.clone()
         self.ignore(path, 'node_modules/\n.next/\ndist/\n__pycache__/\n*.pyc\n')
-        for rel in ('node_modules/a/index.js', '.next/cache/x.json', 'dist/app.js', 'tests/__pycache__/m.pyc'):
+        for rel in ('node_modules/a/index.js', 'node_modules/a/test/fixture.pem', 'node_modules/pkg/state/store.js',
+                    'node_modules/pkg/logs/readme.md', '.next/cache/x.json', 'dist/app.js',
+                    'tests/__pycache__/m.pyc'):
             (path / rel).parent.mkdir(parents=True, exist_ok=True)
             (path / rel).write_text('built\n')
         entry = self.approve(path)
         self.assertEqual(entry['target'], 'git')
+        self.assertTrue(entry['state']['ignored_sha256'])
         self.assertTrue(self.approvals().covers(str(path)))
 
     def test_one_non_regenerable_ignored_file_among_build_output_still_refuses(self):
@@ -195,13 +198,129 @@ class GitTarget(NoBackupCase):
                 self.refused(path, 'untracked or ignored')
             (path / rel).unlink()
 
-    def test_regenerable_rule_is_by_segment_and_never_for_claude_or_log_folders(self):
+    def test_regenerable_rule_is_whole_folder_only_and_never_for_claude_or_log_folders(self):
         ok = cg._regenerable_ignored
-        for good in ('node_modules/', '.next/', 'app/.next/server/x.js', 'a/b/dist/c.js', 'x/__pycache__/y.pyc', 'z.pyc', '.DS_Store'):
+        for good in ('node_modules/', '.next/', 'app/.next/', 'a/b/dist/', 'x/__pycache__/y.pyc', '.DS_Store', 'a.tsbuildinfo'):
             self.assertTrue(ok(good), good)
         for bad in ('run.log', '.env', 'distance/x.js', 'mynode_modules/x', 'build.sh', 'notes/a.txt', 'dist/../secrets',
-                    '.claude/projects/p/a.jsonl', 'dist/wals/main.jsonl', 'node_modules/sessions/s.json', '', '/'):
+                    '.claude/projects/p/a.jsonl', 'dist/wals/main.jsonl', 'node_modules/sessions/s.json', '', '/',
+                    'build/.env', 'out/id_ed25519', 'target/prod.sqlite3', '.cache/notes.md', 'dist/logs/claude.log',
+                    'data/build/thesis.docx', 'research/out/results.csv', 'dist/sub/', 'out', 'notes/build', 'z.pyc',
+                    'secret_source_only.pyc', 'Build/', 'NODE_MODULES/', 'dist/.codex/', 'dist/.agent-harness/state/',
+                    'dist/WALS/', 'venv/my_patched_lib.py', 'dist/app.js', '.next/cache/x.json'):
             self.assertFalse(ok(bad), bad)
+
+    def test_unlisted_status_codes_refuse_goodqa_15565(self):
+        path = self.clone()
+        self.ignore(path, 'dist/\n')
+        (path / 'dist').mkdir()
+        (path / 'dist/app.js').write_text('x\n')
+        (path / 'newfile.js').write_text('untracked unique work\n')  # '?? ' is never trusted
+        self.refused(path, 'untracked or ignored')
+        (path / 'newfile.js').unlink()
+        (path / 'README').write_text('modified\n')  # ' M ' is never trusted
+        self.refused(path, 'untracked or ignored')
+
+    def test_nested_repos_with_unpushed_commits_refuse_wherever_they_hide_goodqa_15565(self):
+        path = self.clone()
+        self.ignore(path, 'dist/\nbuild/\n')
+        for rel in ('dist/sub', 'build', 'notes/inner', 'data'):
+            inner = path / rel
+            inner.mkdir(parents=True, exist_ok=True)
+            run('git', 'init', '-q', '-b', 'main', str(inner))
+            (inner / 'u').write_text('unpushed unique work\n')
+            run('git', 'add', '-A', cwd=inner)
+            run('git', 'commit', '-q', '-m', 'unpushed', cwd=inner)
+            with self.subTest(rel=rel):
+                self.refused(path)
+            import shutil
+            shutil.rmtree(inner, ignore_errors=True)
+        (path / 'notes/.git').mkdir(parents=True)  # a bare .git folder that is not a repository
+        (path / 'notes/.git/precious.txt').write_text('x\n')
+        self.refused(path)
+
+    def test_secrets_logs_databases_and_session_folders_inside_build_folders_refuse_goodqa_15565(self):
+        path = self.clone()
+        self.ignore(path, 'dist/\nbuild/\nout/\ntarget/\n.cache/\n')
+        cases = {'build/.env': 'SECRET', 'out/id_ed25519': 'key', 'target/prod.sqlite3': 'db', 'dist/logs/run.log': 'log',
+                 'dist/.codex/rollout.jsonl': 'x', 'dist/.agent-harness/state/approvals.json': '{}', 'dist/WALS/x': 'x',
+                 '.cache/history.jsonl': 'x', 'build/key.pem': 'x', 'dist/.npmrc': 'token'}
+        for rel, content in cases.items():
+            full = path / rel
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text(content)
+            with self.subTest(rel=rel):
+                self.refused(path)
+            full.unlink()
+            for parent in full.parents:
+                if parent == path:
+                    break
+                if parent.name in ('dist', 'build', 'out', 'target', '.cache'):
+                    continue
+                try:
+                    parent.rmdir()
+                except OSError:
+                    pass
+
+    def test_harness_folders_refuse_even_inside_a_dependency_tree_goodqa_15565(self):
+        path = self.clone()
+        self.ignore(path, 'node_modules/\n')
+        (path / 'node_modules/pkg/.claude').mkdir(parents=True)
+        (path / 'node_modules/pkg/.claude/x').write_text('x\n')
+        self.refused(path)
+
+    def test_case_variants_and_files_named_like_build_folders_refuse_goodqa_15565(self):
+        path = self.clone()
+        self.ignore(path, 'Build/\nout\nnotes/build\n')
+        (path / 'Build').mkdir()
+        (path / 'Build/x.js').write_text('x\n')
+        (path / 'out').write_text('a plain file named out\n')
+        self.refused(path, 'untracked or ignored')
+
+    def test_named_extra_ignored_entries_are_accepted_recorded_and_still_scanned_goodqa_15565(self):
+        path = self.clone()
+        (path / 'public').mkdir()
+        (path / 'public/keep.txt').write_text('tracked\n')  # keeps git from collapsing public/ whole
+        run('git', 'add', 'public/keep.txt', cwd=path)
+        self.ignore(path, 'dist/\npublic/audio/\nnext-env.d.ts\n')
+        for rel in ('dist/app.js', 'public/audio/a.mp3', 'next-env.d.ts'):
+            (path / rel).parent.mkdir(parents=True, exist_ok=True)
+            (path / rel).write_text('generated\n')
+        self.refused(path, 'untracked or ignored')  # not on the build-folder list
+        self.refused(path, 'untracked or ignored', extra_ignored=['public/audio/'])  # next-env.d.ts is still unnamed
+        entry = self.approve(path, extra_ignored=['public/audio/', 'next-env.d.ts'])
+        self.assertEqual(entry['state']['extra_ignored'], ['next-env.d.ts', 'public/audio/'])
+        self.assertTrue(self.approvals().covers(str(path)))  # the hook-time check keeps the recorded extras
+        (path / 'public/audio/late.mp3').write_text('added later\n')
+        self.assertFalse(self.approvals().covers(str(path)))
+
+    def test_extras_cannot_widen_past_secrets_nested_repos_claude_folders_or_bad_names_goodqa_15565(self):
+        path = self.clone()
+        (path / 'public').mkdir()
+        (path / 'public/keep.txt').write_text('tracked\n')
+        run('git', 'add', 'public/keep.txt', cwd=path)
+        self.ignore(path, 'public/audio/\n.codex/\n')
+        (path / 'public/audio').mkdir(parents=True, exist_ok=True)
+        (path / 'public/audio/a.mp3').write_text('x\n')
+        (path / 'public/audio/.env').write_text('SECRET\n')
+        self.refused(path, extra_ignored=['public/audio/'])
+        (path / 'public/audio/.env').unlink()
+        (path / '.codex').mkdir()
+        (path / '.codex/x').write_text('x\n')
+        self.refused(path, extra_ignored=['.codex/'])
+        for bad in (['../x/'], ['/etc/'], ['a/../b/'], [''], ['x/'] * 21):
+            with self.subTest(bad=bad[:1]):
+                self.refused(path, extra_ignored=bad)
+
+    def test_a_late_addition_to_an_ignored_folder_voids_the_approval_goodqa_15565(self):
+        path = self.clone()
+        self.ignore(path, 'dist/\n')
+        (path / 'dist').mkdir()
+        (path / 'dist/app.js').write_text('x\n')
+        self.approve(path)
+        self.assertTrue(self.approvals().covers(str(path)))
+        (path / 'dist/late-unique-notes.md').write_text('written after approval\n')
+        self.assertFalse(self.approvals().covers(str(path)))
 
     def test_a_new_ignored_log_after_approval_cannot_ride_the_old_approval_goodqa_15565(self):
         path = self.clone()
