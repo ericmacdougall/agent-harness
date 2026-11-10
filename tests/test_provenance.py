@@ -456,6 +456,7 @@ class Enforcement(Env):
         self.assertEqual((by_id[good]["kind"], by_id[guess]["kind"]), ("traced", "assumption"))
         self.assertEqual(by_id[good]["note"], "<b>confirm</b> the policy mode (goodqa#15585)")  # raw; the page renders text
         self.assertEqual((data["counts"]["blocked"], data["counts"]["closed"]), (1, 1))
+        self.assertNotIn("…", by_id[good]["note"])  # not clipped here: the reader redacts first, then clips
         env = dict(os.environ, HOME=str(self.home))
         out = subprocess.run([sys.executable, str(HOOKS / "provenance.py"), "asks", "--session", SID, "--json", "--items"],
                              capture_output=True, text=True, env=env)

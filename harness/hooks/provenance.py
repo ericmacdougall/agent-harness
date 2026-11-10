@@ -1324,7 +1324,7 @@ def ask_items(session: str, home=None, ctx=None) -> dict:
     for kind, rows in (("traced", traced), ("unverified", unverified), ("assumption", assumptions)):
         for record, result in rows:
             items.append({"id": record["id"], "kind": kind, "at": record.get("at", ""),
-                          "note": clip(record.get("note", ""), 400), "reason": clip(record.get("reason", ""), 200),
+                          "note": str(record.get("note", ""))[:4000], "reason": str(record.get("reason", ""))[:2000],
                           "owner": record["_wal"].stem, "source_label": result["label"] if result else ""})
     items.sort(key=lambda item: item["at"])
     return {"counts": {"traced": len(traced), "unverified": len(unverified), "assumptions": len(assumptions),

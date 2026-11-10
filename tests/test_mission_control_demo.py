@@ -98,6 +98,8 @@ class Guards(Base):
             now = time.time()
             for collector in app.collectors:
                 collector.run(now)
+            self.assertNotIn(app.asks, app.collectors)  # own thread: a slow ledger never stalls the live feed
+            app.asks.run(now)
             app.codex.step()
         self.assertTrue(app.demo)
         self.assertEqual({k for k, _ in app.runner.calls} - {"ah-owners", "ah-ticket-comments", "gh-user", "provenance-asks"}, set())

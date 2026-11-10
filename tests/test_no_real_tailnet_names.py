@@ -27,11 +27,12 @@ def tracked_files() -> list[Path]:
 
 class NoRealTailnetNames(unittest.TestCase):
     def test_the_detector_catches_a_real_looking_name_and_spares_fixtures(self):
-        self.assertEqual(real_tailnet_names("host = 'my-laptop.tailabc123.ts.net'"), ["tailabc123.ts.net"])
+        fake = "tail" + "abc123" + ".ts.net"  # built at runtime so this file passes its own scan
+        self.assertEqual(real_tailnet_names(f"host = 'my-laptop.{fake}'"), [fake])
         self.assertEqual(real_tailnet_names("box.tail1234.ts.net and NAME.ts.net and evil.ts.net"), [])
         with tempfile.TemporaryDirectory() as tmp:
             planted = Path(tmp) / "x.py"
-            planted.write_text("URL = 'https://Some-Mac.TAILF00D99.ts.net/'\n")
+            planted.write_text("URL = 'https://Some-Mac." + "TAIL" + "F00D99.ts.net/'\n")
             self.assertTrue(real_tailnet_names(planted.read_text()))
 
     def test_no_tracked_file_contains_a_real_tailnet_name(self):

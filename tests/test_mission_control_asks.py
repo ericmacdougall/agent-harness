@@ -63,6 +63,12 @@ class AsksCollector(unittest.TestCase):
         self.assertEqual(first["session"], SID)
         self.assertEqual(hub.snapshots["asks"], asks.snapshot())
 
+    def test_a_secret_past_the_display_limit_is_redacted_before_clipping(self):
+        note = "x" * 390 + " token=abcdef1234567890abcdef1234"
+        asks, _hub, _health = collector(FakeRunner(0, {"items": [{"id": "wlong0000001", "note": note}]}))
+        asks.run(0.0)
+        self.assertNotIn("abcdef12", json.dumps(asks.snapshot()))
+
     def test_a_failing_ledger_keeps_the_last_list_and_shows_an_error(self):
         runner = FakeRunner(0, {"items": [{"id": "wkeep0000001", "note": "keep me"}]})
         asks, _hub, health = collector(runner)

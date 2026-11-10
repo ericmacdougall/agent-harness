@@ -231,7 +231,7 @@ class App:
         self.drop = col.FileDrop(self.hub, self.health, self.reader, root / "sources")
         self.asks = col.Asks(self.hub, self.health, self.runner, lambda: self.owners.session)
         self.collectors = [self.tailer, self.initiatives, self.drop, self.owners, self.github, self.tickets,
-                           self.remote, self.asks]
+                           self.remote]
         self.codex = CodexResponder(self.hub, self.health, self.runner, codex_binary(), root,
                                     disabled="" if codex else "Codex chat is turned off for this instance")
         self.chat_sig = None
@@ -245,13 +245,22 @@ class App:
         return refs + self.owners.tickets()
 
     def start(self) -> None:
-        loops = [(self.loop, "collectors"), (self.codex.loop, "codex"), (self.chat_loop, "chat")]
+        loops = [(self.loop, "collectors"), (self.codex.loop, "codex"), (self.chat_loop, "chat"),
+                 (self.asks_loop, "asks")]
         if self.demo:
             loops.append((demo_mode.DemoLoop(self.root, self.stop).run, "demo"))
         for target, name in loops:
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self.threads.append(thread)
+
+    def asks_loop(self) -> None:
+        """Its own thread: the ledger resolve takes seconds and must not delay the live feed."""
+        while not self.stop.is_set():
+            now = time.time()
+            if self.asks.due(now):
+                self.asks.run(now)
+            self.stop.wait(1.0)
 
     def loop(self) -> None:
         while not self.stop.is_set():

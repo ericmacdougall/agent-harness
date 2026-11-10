@@ -77,7 +77,7 @@ export function mountNeeds() {
       // server order (oldest first); move a row only when it is out of place, so a focused reply box keeps focus
       if (list.children[index] !== parts.row) list.insertBefore(parts.row, list.children[index] || null);
       parts.kind.textContent = ask.kind === 'assumption' ? 'Assumption to confirm' : 'Question';
-      parts.ticket.textContent = ask.ticket || '';
+      parts.ticket.textContent = [ask.ticket, ask.owner && ask.owner !== 'main' ? `from ${ask.owner}` : ''].filter(Boolean).join(' · ');
       parts.when.textContent = age(ask.at, state.now);
       if (ask.at) parts.when.dateTime = ask.at;
       parts.text.textContent = ask.text || '(no text recorded)';
