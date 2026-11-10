@@ -186,7 +186,7 @@ def main():
             return 2
         mode, problem, assumption = provenance_check('ask', args.source)  # the answer is sourced like an ask (M1)
         if problem:
-            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': problem[:300],
+            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': problem[:700],
                               'hint': 'the resolution source must resolve: user:, answer:, queue: or ticket:'}), file=sys.stderr)
             return 2
         record['ref'] = args.ref
@@ -204,16 +204,16 @@ def main():
         if problem and args.source and caller_error(problem):
             # A source that was given but can never resolve is a caller error, whatever the mode: writing it
             # anyway (quarantined) only moved the failure to the stop hook (main WAL w842c8dfc127, 2026-11-06).
-            print(json.dumps({'status': 'REFUSED', 'event': args.event, 'problem': problem[:300],
+            print(json.dumps({'status': 'REFUSED', 'event': args.event, 'problem': problem[:700],
                               'hint': 'nothing was written; fix the --source (see provenance.py) and retry'}), file=sys.stderr)
             return 2
         if problem:
             if mode == 'enforce':
-                print(json.dumps({'status': 'REFUSED', 'event': args.event, 'problem': problem[:300],
+                print(json.dumps({'status': 'REFUSED', 'event': args.event, 'problem': problem[:700],
                                   'hint': 'cite the origin with --source; see provenance.py find-user'}), file=sys.stderr)
                 return 2
             if mode == 'warn':
-                warnings.append(problem[:300])
+                warnings.append(problem[:700])
                 record['provenance'] = 'missing' if not args.source else 'unverified'
                 if not args.source or 'rejected' in problem or 'failed' in problem:  # missing, rejected or unresolvable: quarantined (P11)
                     record['unsourced'] = True  # an unverifiable ticket (tracker unreachable) is not a quarantine case

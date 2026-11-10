@@ -40,6 +40,7 @@ MAX_RESOLVES = 40                 # sources resolved per top-level claim
 MAX_DEPTH = 8                     # wal: pointer chain depth
 EXCERPT_MIN, EXCERPT_MAX, EXCERPT_SEGMENTS = 12, 300, 3
 RATIONALE_MIN = 10
+INFERRED_EXAMPLE = "e.g. `inferred: from ticket:GoodQA proj#12 ; wal:/path/main.jsonl#w0123456789a -- why those imply this`"
 MODES = ("off", "warn", "enforce")
 DEFAULT_POLICY = {
     "schema": 1, "spec": "enforce", "plan_packet": "warn", "ask_user_question": "enforce", "stop_lint": "warn", "ticket_lookup": "enforce",
@@ -379,13 +380,13 @@ def parse_source(text: str) -> dict:
     if kind == "inferred":
         head = split_outside_quotes(rest, " -- ")
         if len(head) < 2 or not re.match(r"(?is)^from\s+\S", head[0]):
-            raise Problem("inferred-no-inputs", "inferred: needs `from <source> ; <source> -- <rationale>`")
+            raise Problem("inferred-no-inputs", "inferred: needs `from <source> ; <source> -- <rationale>`, " + INFERRED_EXAMPLE)
         rationale = " -- ".join(head[1:]).strip()
         if len(rationale) < RATIONALE_MIN:
-            raise Problem("inferred-no-rationale", f"inferred: needs a rationale of {RATIONALE_MIN}+ characters after ` -- `")
+            raise Problem("inferred-no-rationale", f"inferred: needs a rationale of {RATIONALE_MIN}+ characters after ` -- `; " + INFERRED_EXAMPLE)
         inputs = [part.strip() for part in split_outside_quotes(head[0].strip()[4:].strip(), ";") if part.strip()]
         if not inputs:
-            raise Problem("inferred-no-inputs", "inferred: lists no input sources")
+            raise Problem("inferred-no-inputs", "inferred: lists no input sources, " + INFERRED_EXAMPLE)
         return {"kind": "inferred", "inputs": inputs, "rationale": rationale}
     raise Problem("unknown-kind", f"`{clip(kind, 20)}:` is not a source kind; agent memory and chat are not sources")
 
@@ -1069,7 +1070,7 @@ def _resolve(source, ctx, depth, seen, result):
                 # Name the input: the generic "Source must start with ..." text read as if the whole `inferred:`
                 # source were malformed (main WAL w8d5f765ea4c, 2026-11-06).
                 message = ("is free text, not a source: each input after `from` must be user:, answer:, queue:, pasted:, "
-                           "ticket:, wal: or file:, separated by ` ; `; the rationale goes after ` -- `"
+                           "ticket:, wal: or file:, separated by ` ; `; the rationale goes after ` -- `, " + INFERRED_EXAMPLE
                            if problem.code == "bad-syntax" and problem.message.startswith("Source must start with")
                            else problem.message)
                 result["problems"].append({"code": problem.code, "message": f"inferred input `{clip(item, 60)}` {message}"})

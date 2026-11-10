@@ -272,6 +272,15 @@ class UserSources(Env):
 
 
 class OtherKinds(Env):
+    def test_inferred_errors_carry_a_worked_example_goodqa_15565(self):
+        for source in ("inferred: because I think so", "inferred: from -- because I think so",
+                       "inferred: from ticket:GoodQA harness#1 -- short",
+                       "inferred: from my own notes about it -- a long enough rationale text"):
+            with self.subTest(source=source):
+                result = provenance.resolve(source)
+                self.assertFalse(result["ok"])
+                self.assertIn("inferred: from ticket:GoodQA", result["problems"][0]["message"], result)
+
     def test_inferred_needs_grounded_inputs_and_is_an_assumption(self):  # AC-3
         self.reject("inferred: because I think so", "inferred-no-inputs")
         self.reject("inferred: from -- because I think so", "inferred-no-inputs")
