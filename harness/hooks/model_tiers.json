@@ -35,11 +35,11 @@
       "astra": {"aliases": [], "id_pattern": "^gpt-[0-9.]+-astra$", "rung_by_effort": {"low": "R5", "medium": "R5", "high": "R6", "xhigh": "R6", "max": "R6"}}
     }
   },
-  "caps": {"session_live_agents": 12, "session_owner_agents": 4, "live_ttl_seconds": 1800,
+  "caps": {"session_live_agents": 16, "session_owner_agents": 8, "live_ttl_seconds": 1800,
            "owner_types": ["task-owner", "general-purpose", "claude", "fork", ""],
            "helper_types": ["red-team", "click-tester", "reviewer", "fixer", "Explore", "Plan", "claude-code-guide", "statusline-setup"],
            "top_assent_max_age_seconds": 43200,
-           "_doc": "owner cap (memory feedback-token-budget: at most 4 active owners): owner_types count toward session_owner_agents; helpers (red-team, click-tester, fixer, Explore, Plan) count only toward session_live_agents. The owner count comes from ah owners liveness when the session has a main WAL, else from the SubagentStart live map."},
+           "_doc": "owner cap (memory feedback-token-budget: at most 8 active owners, raised from 4 by the user on 2026-11-09): owner_types count toward session_owner_agents; helpers (red-team, click-tester, fixer, Explore, Plan) count only toward session_live_agents. The owner count comes from ah owners liveness when the session has a main WAL, else from the SubagentStart live map."},
   "default_effort": "medium",
   "efforts": ["low", "medium", "high", "xhigh", "max"]
 }
