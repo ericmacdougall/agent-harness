@@ -167,7 +167,7 @@ def unmet_items(issue: dict, comments: list, spec_view=None, extra_pending=()) -
 
 
 def check_carry(note: str, items: list, source_number: int, source_project: str, adapter, source_id=None,
-                priority=None) -> tuple:
+                priority=None, closing_ids=frozenset()) -> tuple:
     """(ok, problem). The named target must be a different, still-open ticket that names this ticket and every
     unfinished item id, so the work is visible where it will be tracked."""
     found = CARRY.search(note or "")
@@ -184,6 +184,9 @@ def check_carry(note: str, items: list, source_number: int, source_project: str,
         return False, f"Carried-to {slug}#{number} could not be read ({type(error).__name__})"
     if not isinstance(target, dict):
         return False, f"Carried-to {slug}#{number} does not exist (or this key cannot see it)"
+    if str(target.get("id") or "").lower() in {str(i).lower() for i in closing_ids}:
+        # review F1 (PR 164): a bulk close of A and B where each carries its work to the other leaves nothing open to track it
+        return False, f"Carried-to {slug}#{number} is closed or archived by this same request, so it would not stay open"
     if target.get("status") not in OPEN_STATUSES or target.get("closedAt"):
         return False, f"Carried-to {slug}#{number} is not an open ticket (status {target.get('status')})"
     text = norm("\n".join(_bodies(target, adapter.all_comments(target["id"]))))
@@ -255,13 +258,13 @@ def _turn_text(source: str) -> str:
 
 
 def assess(issue: dict, comments: list, note: str, adapter, spec_view=None, extra_pending=(),
-           resolver=None) -> dict:
+           resolver=None, closing_ids=frozenset()) -> dict:
     """{"unmet": [...], "allowed": bool, "problems": [str]} for one close/fold of `issue`."""
     items = unmet_items(issue, comments, spec_view, extra_pending)
     if not items:
         return {"unmet": [], "allowed": True, "problems": []}
     number, project = issue.get("number"), str(issue.get("_project_slug") or "")
-    carried, why_carry = (check_carry(note, items, number, project, adapter, issue.get("id"), issue.get("priority"))
+    carried, why_carry = (check_carry(note, items, number, project, adapter, issue.get("id"), issue.get("priority"), closing_ids)
                           if CARRY.search(note or "") else (False, None))
     if carried:
         return {"unmet": items, "allowed": True, "problems": []}

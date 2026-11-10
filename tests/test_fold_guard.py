@@ -194,6 +194,53 @@ class FoldCase(unittest.TestCase):
         self.assertEqual(code, 2, text)
         self.assertIn("not an open ticket", text)
 
+    # ---- review F1 (PR 164): a carry destination closed by the same request is not open
+
+    def bulk_items(self, *pairs):
+        return {"items": [{"issueId": iid, "status": "duplicate", "note": "folded\nCarried-to: GoodQA harness#%d" % target}
+                          for iid, target in pairs]}
+
+    def test_a_bulk_close_of_two_tickets_that_carry_into_each_other_is_blocked_whole(self):
+        for t in (self.src, self.umb):
+            t["priority"] = "urgent"
+            t["description"] = "- [ ] AC-1\n"
+        self.comment(UMB, "Carried from #14518: AC-1")
+        self.comment(SRC, "Carried from #15529: AC-1")
+        code, text = self.hook("bulk_update_issues", self.bulk_items((SRC, 15529), (UMB, 14518)))
+        self.assertEqual(code, 2, text)
+        self.assertEqual(text.count("same request"), 2, text)  # both tickets are refused, not just one
+        # control: closing only SRC with the same carry is allowed, because UMB stays open
+        self.assertEqual(self.hook("bulk_update_issues", self.bulk_items((SRC, 15529))), (0, ""))
+
+    def test_a_longer_cycle_and_a_destination_with_nothing_unfinished_are_blocked_too(self):
+        third = str(uuid.uuid4())
+        self.adapter.issues[third] = issue(15530, id=third, priority="urgent", description="- [ ] AC-1\n")
+        self.comments[third] = [{"id": "c", "body": "Carried from #14518 and #15529: AC-1"}]
+        for t in (self.src, self.umb):
+            t["priority"] = "urgent"
+            t["description"] = "- [ ] AC-1\n"
+        self.comment(UMB, "Carried from #14518: AC-1")
+        self.comment(SRC, "Carried from #15530: AC-1")
+        # SRC -> UMB, UMB -> third, third -> SRC: a three-cycle closed in one request
+        code, text = self.hook("bulk_update_issues", self.bulk_items((SRC, 15529), (UMB, 15530), (third, 14518)))
+        self.assertEqual(code, 2, text)
+        # a destination with no unfinished work of its own is still closed by the request, so it cannot hold the carry
+        self.comments[third] = [{"id": "c2", "body": "Carried from #14518: AC-1"}]
+        self.adapter.issues[third]["description"] = "done"
+        code, text = self.hook("bulk_update_issues", self.bulk_items((SRC, 15530), (third, 15529)))
+        self.assertEqual(code, 2, text)
+        self.assertIn("same request", text)
+
+    def test_the_destination_match_ignores_id_case(self):
+        for t in (self.src, self.umb):
+            t["priority"] = "urgent"
+            t["description"] = "- [ ] AC-1\n"
+        self.comment(UMB, "Carried from #14518: AC-1")
+        items = self.bulk_items((SRC, 15529), (UMB.upper(), 14518))
+        self.adapter.issues[UMB.upper()] = self.umb
+        code, text = self.hook("bulk_update_issues", items)
+        self.assertEqual(code, 2, text)
+
     # ---- AC4: override needs the user's own sourced words
 
     def test_override_needs_a_resolving_user_source(self):

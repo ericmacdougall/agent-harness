@@ -1418,6 +1418,7 @@ def fold_check(targets: list, config: dict, spec_policy: dict, deadline: float, 
     if len(targets) > cap:
         return [f"fold guard: {len(targets)} tickets in one close call (limit {cap}); close them in smaller batches so each "
                 "one can be checked within the hook's time limit"]
+    closing_ids = frozenset(str(t[0]).lower() for t in targets if isinstance(t[0], str))  # every ticket this request closes or archives
     resolved = []
     for issue_id, what, note in targets:  # read every ticket first, so the WALs are scanned once for all of them
         if isinstance(issue_id, str) and re.fullmatch(UUID, issue_id):
@@ -1449,7 +1450,7 @@ def fold_check(targets: list, config: dict, spec_policy: dict, deadline: float, 
         tested = fold_guard.tested_in_text(fold_guard._bodies(issue, comments))
         result = fold_guard.assess(issue, comments, note, adapter, spec_view=unmet_acs(records, index),
                                    extra_pending=[p for p in pending.get(issue.get("number") or 0, []) if p not in tested],
-                                   resolver=resolver)
+                                   resolver=resolver, closing_ids=closing_ids)
         if not result["allowed"]:
             problems.append(fold_guard.format_block(f"issue #{issue.get('number')} ({issue_id[:8]})", what, result))
     return problems
