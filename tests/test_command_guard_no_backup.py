@@ -166,6 +166,52 @@ class GitTarget(NoBackupCase):
         (path / 'run.log').write_text('a log that exists nowhere else\n')
         self.refused(path, 'untracked or ignored')
 
+    def ignore(self, path, patterns):
+        (path / '.gitignore').write_text(patterns)
+        run('git', 'add', '.gitignore', cwd=path)
+        run('git', 'commit', '-q', '-m', 'ignore', cwd=path)
+        run('git', 'push', '-q', str(self.remote), 'main', cwd=path)
+        run('git', 'fetch', '-q', str(self.remote), 'main:refs/remotes/origin/main', cwd=path)
+
+    def test_ignored_build_output_and_dependencies_are_regenerable_goodqa_15565(self):
+        path = self.clone()
+        self.ignore(path, 'node_modules/\n.next/\ndist/\n__pycache__/\n*.pyc\n')
+        for rel in ('node_modules/a/index.js', '.next/cache/x.json', 'dist/app.js', 'tests/__pycache__/m.pyc'):
+            (path / rel).parent.mkdir(parents=True, exist_ok=True)
+            (path / rel).write_text('built\n')
+        entry = self.approve(path)
+        self.assertEqual(entry['target'], 'git')
+        self.assertTrue(self.approvals().covers(str(path)))
+
+    def test_one_non_regenerable_ignored_file_among_build_output_still_refuses(self):
+        path = self.clone()
+        self.ignore(path, 'node_modules/\n*.log\n.env\nnotes/\n')
+        (path / 'node_modules').mkdir()
+        (path / 'node_modules/a.js').write_text('x\n')
+        for rel in ('run.log', '.env', 'notes/todo.txt'):
+            (path / rel).parent.mkdir(parents=True, exist_ok=True)
+            (path / rel).write_text('only here\n')
+            with self.subTest(rel=rel):
+                self.refused(path, 'untracked or ignored')
+            (path / rel).unlink()
+
+    def test_regenerable_rule_is_by_segment_and_never_for_claude_or_log_folders(self):
+        ok = cg._regenerable_ignored
+        for good in ('node_modules/', '.next/', 'app/.next/server/x.js', 'a/b/dist/c.js', 'x/__pycache__/y.pyc', 'z.pyc', '.DS_Store'):
+            self.assertTrue(ok(good), good)
+        for bad in ('run.log', '.env', 'distance/x.js', 'mynode_modules/x', 'build.sh', 'notes/a.txt', 'dist/../secrets',
+                    '.claude/projects/p/a.jsonl', 'dist/wals/main.jsonl', 'node_modules/sessions/s.json', '', '/'):
+            self.assertFalse(ok(bad), bad)
+
+    def test_a_new_ignored_log_after_approval_cannot_ride_the_old_approval_goodqa_15565(self):
+        path = self.clone()
+        self.ignore(path, 'dist/\n*.log\n')
+        (path / 'dist').mkdir()
+        (path / 'dist/app.js').write_text('x\n')
+        self.approve(path)
+        (path / 'late.log').write_text('unique\n')
+        self.assertFalse(self.approvals().covers(str(path)))
+
     def test_unpushed_commit_refused(self):
         path = self.clone()
         (path / 'b').write_text('b\n')

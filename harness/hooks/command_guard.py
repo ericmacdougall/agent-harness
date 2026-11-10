@@ -6320,6 +6320,25 @@ def _image_size(real):
     return total
 
 
+# Ignored paths a clone can rebuild from its lockfile and sources. Matching is by path segment, never by substring.
+REGENERABLE_SEGMENTS = frozenset((
+    'node_modules', '.next', '.nuxt', '.turbo', '.parcel-cache', '.cache', '.wrangler', '.media-cache', 'dist', 'build',
+    'out', 'coverage', '.pytest_cache', '.mypy_cache', '.ruff_cache', '__pycache__', '.venv', 'venv', 'target', '.gradle',
+    '.svelte-kit', '.vercel', '.output', '.angular', '.expo', 'storybook-static', '.tox', '.eggs'))
+REGENERABLE_NAMES = re.compile(r'(?:\.pyc|\.pyo|\.tsbuildinfo|\.DS_Store)$')
+NEVER_SEGMENTS = frozenset(('.claude', 'wals', 'projects', 'sessions', 'transcripts'))
+
+
+def _regenerable_ignored(path):
+    """True when an ignored path is rebuildable output: it is, or sits under, a known build or dependency folder, or it is
+    a bytecode or OS file. Any other ignored file (a log, an env file, a key, a database, notes) is not, and neither is
+    anything under a Claude, session or log-named folder."""
+    parts = [seg for seg in str(path).replace('\\', '/').split('/') if seg]
+    if not parts or '..' in parts or any(seg.casefold() in NEVER_SEGMENTS for seg in parts):
+        return False
+    return any(seg in REGENERABLE_SEGMENTS for seg in parts) or bool(REGENERABLE_NAMES.search(parts[-1]))
+
+
 def _no_backup_state(real, target, home=None, attached=None):
     """Every local fact that makes deleting `real` lose nothing, as a comparable dict. Raises ValueError when unsafe.
     The hook runs it again at delete time, so a change after approval voids the approval."""
@@ -6349,8 +6368,15 @@ def _no_backup_state(real, target, home=None, attached=None):
             os.path.lexists(os.path.join(real, '.gitmodules')) or os.path.lexists(os.path.join(git_dir, 'modules')):
         raise ValueError('the repository has submodules; their commits are not checked, so it is refused')
     code, status = _git(real, 'status', '--porcelain=v1', '--ignored', '--untracked-files=all', '-z')
-    if code != 0 or status:
+    if code != 0:
         raise ValueError('the working tree has changed, untracked or ignored files; they exist nowhere else')
+    for rec in status.split('\0'):
+        if not rec:
+            continue
+        # GoodQA #15565: ignored build output and dependency folders are regenerable by definition; anything else that
+        # git reports (a change, an untracked file, an ignored log or env file) exists nowhere else and still refuses.
+        if not rec.startswith('!! ') or not _regenerable_ignored(rec[3:]):
+            raise ValueError('the working tree has changed, untracked or ignored files; they exist nowhere else')
     code, flagged = _git(real, 'ls-files', '-v', '-z')
     if code != 0:
         raise ValueError('cannot list the index')
