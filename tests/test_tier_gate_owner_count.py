@@ -80,10 +80,11 @@ class OwnerCount(unittest.TestCase):
         rows = {'owners': [silent('a', {'kind': 'reassigned', 'live': True}), silent('b', {'kind': 'waiting', 'live': True}),
                            silent('c', {'kind': 'superseded', 'live': True}), silent('d', {'kind': 'wontdo', 'live': True}),
                            silent('e', {'kind': 'waiting', 'live': False}), silent('f', {'kind': 'resumed', 'live': True}),
-                           silent('g', None), silent('h', {'kind': 'reassigned', 'live': False}, state='live')]}
+                           silent('g', None), silent('h', {'kind': 'reassigned', 'live': False}, state='live'),
+                           silent('i', {'kind': 'reassigned', 'live': False}), silent('j', {'kind': 'legacy', 'live': True})]}  # i: successor not live
         rows['owners'][6]['decision_required'] = False
         with mock.patch.object(ah, 'owners', return_value=rows):
-            self.assertEqual(gate.live_owner_ids(SID, self.policy), ['e' * 32, 'f' * 32, 'g' * 32, 'h' * 32])
+            self.assertEqual(gate.live_owner_ids(SID, self.policy), ['e' * 32, 'f' * 32, 'g' * 32, 'h' * 32, 'i' * 32])
         rows['owners'][0]['decision_required'] = True  # ah still wants a decision: the slot stays held
         with mock.patch.object(ah, 'owners', return_value=rows):
             self.assertIn('a' * 32, gate.live_owner_ids(SID, self.policy))

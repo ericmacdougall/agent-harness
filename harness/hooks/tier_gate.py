@@ -594,9 +594,14 @@ def _slot_freed(row):
     the four slots. With never-drop 16.1, a reassignment frees a slot only while its successor is live (af265a5's
     had returned, so that owner is ownerless and decision_required, not disposed)."""
     disp = row.get('disposition')
-    if not isinstance(disp, dict) or disp.get('kind') == 'resumed':
+    if not isinstance(disp, dict) or row.get('decision_required') is True:
         return False
-    return liveness.row_disposed(row)
+    kind = disp.get('kind')
+    if kind in ('closed', 'superseded', 'wontdo', 'legacy'):
+        return True
+    # a reassignment or a wait frees the slot only while its holder is live (`live` is ah's own verdict); this is checked
+    # here, not left to liveness.row_disposed, which accepted any reassignment until never-drop 16.1 lands (red-team ad4294 B1)
+    return kind in ('reassigned', 'waiting') and disp.get('live') is True
 
 
 IDLE_OWNER_MAX_S = liveness.SILENT_S  # an owner-type agent `ah` calls idle-helper holds its slot while it is merely quiet
