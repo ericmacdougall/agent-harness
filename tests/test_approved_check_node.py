@@ -173,6 +173,28 @@ class RealNode(unittest.TestCase):
         self.assertEqual(result.returncode,0)
         self.assertLess(max(map(len,seen)),16384)
 
+    def test_real_integration_selects_file_introduced_by_target_commit(self):
+        import test_delivery_helpers as helpers
+        with patch.object(tempfile,'tempdir',str(WORK)):
+            fixture=helpers.DeliveryHelpers()
+            try:
+                fixture.setUp()
+                selected=fixture.feature/'new.test.mjs'
+                selected.write_text(GOOD)
+                helpers.cmd('git','add','new.test.mjs',cwd=fixture.feature)
+                helpers.cmd('git','commit','-qm','add focused Node assertion',cwd=fixture.feature)
+                fixture.feature_head=helpers.cmd('git','rev-parse','HEAD',cwd=fixture.feature).stdout.strip()
+                self.assertFalse((fixture.repo/'new.test.mjs').exists())
+                argv=fixture.integrate_args('--timeout','30','--check-timeout','30')
+                argv[argv.index('--check')+1]='node --test new.test.mjs'
+                result=subprocess.run(argv,env=helpers.isolated_env(),capture_output=True,text=True,timeout=180)
+                self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+                self.assertEqual(json.loads(result.stdout)['status'],'INTEGRATED')
+                self.assertEqual((fixture.repo/'new.test.mjs').read_text(),GOOD)
+                self.assertEqual(helpers.cmd('git','status','--porcelain',cwd=fixture.repo).stdout,'')
+            finally:
+                fixture.doCleanups()
+
     def test_real_delivery_checks_use_evidence(self):
         import deliver
         logs=self.repo/'logs'

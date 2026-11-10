@@ -347,15 +347,16 @@ def require_node_protocol(environment, repo=None):
     interpreter = resolve_node(environment, repo)
     reporter = node_reporter()
     try:
-        private_directory(NODE_PROBE_DIRECTORY)
+        for directory in (NODE_PROBE_DIRECTORY.parent.parent, NODE_PROBE_DIRECTORY.parent, NODE_PROBE_DIRECTORY):
+            private_directory(directory)
         with tempfile.TemporaryDirectory(prefix='capability-', dir=NODE_PROBE_DIRECTORY) as directory:
             root = Path(directory)
             (root / 'genuine.test.mjs').write_text(
                 "import test from 'node:test'; import assert from 'node:assert/strict';\n"
                 "test('delivery capability', () => assert.equal(2 + 2, 4));\n")
             (root / 'empty.test.mjs').write_text("import 'node:test';\n")
-            genuine = run_node(root, ['node', '--test', 'genuine.test.mjs'], environment, 15)
-            empty = run_node(root, ['node', '--test', 'empty.test.mjs'], environment, 15)
+            genuine = run_node(root, ['node', '--test', 'genuine.test.mjs'], environment, 30)
+            empty = run_node(root, ['node', '--test', 'empty.test.mjs'], environment, 30)
             if (genuine.returncode != 0 or empty.returncode == 0
                     or resolve_node(environment, repo) != interpreter or node_reporter() != reporter):
                 raise OSError()
