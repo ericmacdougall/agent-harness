@@ -286,12 +286,47 @@ def latest_by_key(events: list) -> dict:
     return latest
 
 
+ASK_DUE_KEY = re.compile(r"^ask:(w[0-9a-f]{11}):due$")
+RESOLVED_SCAN_MAX_BYTES = 32 << 20
+
+
+def resolved_ask_ids(home: Path, ids: set) -> set:
+    """Which of these ask ids have an `ask_resolved` row in any session main log (GoodQA #15565: a closed ask kept alerting
+    until the daemon's next tick, and a tick over budget skipped alerts altogether). Regular files only, bounded bytes."""
+    found = set()
+    if not ids:
+        return found
+    for main_log in sorted((home / ".claude" / "wals").glob("*/main.jsonl")):
+        try:
+            if main_log.is_symlink() or not main_log.is_file() or main_log.stat().st_size > RESOLVED_SCAN_MAX_BYTES:
+                continue
+            with open(main_log, "rb") as handle:
+                for raw in handle:
+                    if b'"ask_resolved"' not in raw:
+                        continue
+                    try:
+                        rec = json.loads(raw)
+                    except (ValueError, RecursionError):
+                        continue
+                    if isinstance(rec, dict) and rec.get("event") == "ask_resolved" and rec.get("ref") in ids:
+                        found.add(rec["ref"])
+        except OSError:
+            continue
+    return found
+
+
 def active_alerts(home: Path) -> list:
-    """Active = the latest event per (host, source, key) is a raise. Highest severity first."""
+    """Active = the latest event per (host, source, key) is a raise. Highest severity first. An ask alert whose ask is
+    resolved is not active, whether or not the daemon has cleared it yet."""
     act = []
     for (host, _src, _key), e in latest_by_key(read_ring(ring_path(home))).items():
         if e.get("event") == "raise":
             act.append(e if e.get("host") == host else dict(e, host=host))
+    due = {m.group(1) for e in act for m in [ASK_DUE_KEY.match(str(e.get("key") or ""))] if m}
+    if due:
+        gone = resolved_ask_ids(home, due)
+        act = [e for e in act if not (ASK_DUE_KEY.match(str(e.get("key") or ""))
+                                      and ASK_DUE_KEY.match(str(e.get("key"))).group(1) in gone)]
     return sorted(act, key=lambda e: (-SEVERITIES.get(e.get("severity"), 0), e.get("key", "")))
 
 

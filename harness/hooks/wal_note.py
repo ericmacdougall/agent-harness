@@ -139,6 +139,9 @@ def main():
     parser.add_argument('--ref', help='id of the ask being closed (ask_resolved)')
     parser.add_argument('--decision', choices=('approved', 'declined'),
                         help='ask_resolved only: the explicit outcome (escalation.py reads this field, never the note text)')
+    parser.add_argument('--outcome', choices=('obsolete', 'not_user'),
+                        help='ask_resolved only: close an ask nobody can answer any more (obsolete) or that was never the user\'s to answer '
+                             '(not_user) on wal:/file:/ticket: evidence; never an approval (no decision field), so it cannot authorize anything')
     parser.add_argument('--by', help='tool that writes this row on an agent\'s behalf (never quarantined; cites its state in the note)')
     parser.add_argument('--recites', help='id of an unsourced entry of this WAL that this sourced row re-cites (clears its quarantine)')
     args = parser.parse_args()
@@ -180,9 +183,17 @@ def main():
                               'hint': 'cite the answer: user:<session>/<uuid> "words", answer:<id> or queue:<id> (ah user-msg)'}),
                   file=sys.stderr)
             return 2
-        if not re.match(r'^(user:|uuid:|answer:|queue:|ticket:)', args.source.strip()):
+        if args.outcome:
+            if args.decision:
+                parser.error('--outcome closes an ask without an approval: do not combine it with --decision')
+            if not re.match(r'^(wal:|file:|ticket:)', args.source.strip()):
+                print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': '--outcome needs wal:, file: or ticket: evidence',
+                                  'hint': 'cite the entry or commit that shows the ask is obsolete or not the user\'s; inferred: is not evidence'}),
+                      file=sys.stderr)
+                return 2
+        elif not re.match(r'^(user:|uuid:|answer:|queue:|ticket:)', args.source.strip()):
             print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved source must be the answer: user:, answer:, queue: or ticket:',
-                              'hint': 'an ask cannot be closed on an inferred: or file: source'}), file=sys.stderr)
+                              'hint': 'an ask cannot be closed on an inferred: or file: source; use --outcome obsolete|not_user with wal:/file: evidence'}), file=sys.stderr)
             return 2
         mode, problem, assumption = provenance_check('ask', args.source)  # the answer is sourced like an ask (M1)
         if problem:
@@ -195,10 +206,13 @@ def main():
         record['source'] = args.source.strip()[:2000]
         if args.decision:
             record['decision'] = args.decision
+        if args.outcome:
+            record['outcome'] = args.outcome
+            record['closed_by'] = 'agent'  # an audit mark: no user words back this close
         if assumption:
             record['assumption'] = True
-    elif args.decision:
-        parser.error('--decision applies to ask_resolved only')
+    elif args.decision or args.outcome:
+        parser.error('--decision and --outcome apply to ask_resolved only')
     if args.event in SOURCED:
         mode, problem, assumption = provenance_check(args.event, args.source)
         if problem and args.source and caller_error(problem):
