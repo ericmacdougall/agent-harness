@@ -101,7 +101,15 @@ def probe_runtime_origin(pid=None, *, backend=None):
             if current in seen:
                 return OriginObservation("unknown", native, "ancestry_cycle")
             seen.add(current)
-            process = backend.process(current)
+            try:
+                process = backend.process(current)
+            except OSError:
+                # A Terminal session has root-owned /usr/bin/login above its shell; the kernel withholds its BSD
+                # info from the user. It cannot be an OpenAI runtime that launched this caller, so it ends the walk.
+                # Only the exact system path counts, and never the caller itself; anything else stays uncertain.
+                if current != pid and getattr(backend, "is_terminal_login", lambda _pid: False)(current):
+                    break
+                raise
             if not _valid_process(process, current):
                 return OriginObservation("unknown", native, "invalid_process_identity")
             chain.append(process)
@@ -202,6 +210,12 @@ class DarwinBackend:
             raise OSError("kernel executable identity unavailable")
         return ProcessIdentity(info.pid, info.ppid, info.uid, info.start_sec * 1000000 + info.start_usec,
                                path.value.decode("utf-8", "strict"))
+
+    def is_terminal_login(self, pid):
+        path = ct.create_string_buffer(4096)
+        if self.proc.proc_pidpath(pid, path, len(path)) <= 0:
+            return False
+        return path.value == b"/usr/bin/login"
 
     def _constant(self, name):
         return ct.c_void_p.in_dll(self.sec, name).value
