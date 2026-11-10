@@ -79,7 +79,8 @@ class InertPreview(unittest.TestCase):
             bad = subprocess.run([sys.executable, str(HOOKS / "native_admission.py"), "preview", "--registry", str(link)],
                                  input="{}", text=True, capture_output=True, env=env, timeout=5)
             self.assertNotEqual(bad.returncode, 0)
-            self.assertEqual(list(Path(home).iterdir()), [link])
+            # macOS creates ~/Library for any process using CoreFoundation; nothing else may appear.
+            self.assertEqual([p for p in Path(home).iterdir() if p.name != "Library"], [link])
 
 
 if __name__ == "__main__": unittest.main()

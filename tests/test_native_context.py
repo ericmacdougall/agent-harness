@@ -162,6 +162,80 @@ class ReviewRuntimeRegressions(unittest.TestCase):
         self.assertTrue(result.native_lineage)
 
 
+class TerminalLoginEndsTheWalk(unittest.TestCase):
+    """A Terminal-launched session has /usr/bin/login (root, unreadable BSD info) above its shell.
+
+    Before this, the probe failed with probe_failed there and every Terminal-launched Claude main lost main
+    authority on macOS (goodqa#15565); a root-owned login cannot be an OpenAI runtime that launched the caller.
+    """
+
+    class Chain(FakeBackend):
+        login_is_terminal = True
+
+        def __init__(self):
+            super().__init__()
+            self.processes = {
+                10: nc.ProcessIdentity(10, 20, 1000, 1, "/usr/bin/python3"),
+                20: nc.ProcessIdentity(20, 30, 1000, 2, "/bin/zsh"),
+            }
+
+        def process(self, pid):
+            if pid == 30:
+                raise OSError("kernel process identity unavailable")
+            return super().process(pid)
+
+        def is_terminal_login(self, pid):
+            return pid == 30 and self.login_is_terminal
+
+    def test_unreadable_terminal_login_is_the_end_of_a_non_native_chain(self):
+        result = nc.probe_runtime_origin(10, backend=self.Chain())
+        self.assertEqual(result.reason, "no_native_runtime")
+        self.assertFalse(result.native_lineage)
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(nc, "probe_runtime_origin", return_value=result):
+            self.assertIsNone(nc.native_deny_reason({}))
+
+    def test_any_other_unreadable_ancestor_still_fails_closed(self):
+        backend = self.Chain()
+        backend.login_is_terminal = False
+        result = nc.probe_runtime_origin(10, backend=backend)
+        self.assertEqual(result.reason, "probe_failed")
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(nc, "probe_runtime_origin", return_value=result):
+            self.assertIsNotNone(nc.native_deny_reason({}))
+
+    def test_a_native_runtime_below_login_is_still_found(self):
+        backend = self.Chain()
+        backend.processes[20] = nc.ProcessIdentity(20, 30, 1000, 2, "/Applications/Example/CodexCLI/codex")
+        result = nc.probe_runtime_origin(10, backend=backend)
+        self.assertEqual(result.origin, "openai")
+        self.assertTrue(result.native_lineage)
+
+    def test_the_caller_itself_unreadable_is_never_excused(self):
+        backend = self.Chain()
+        result = nc.probe_runtime_origin(30, backend=backend)
+        self.assertEqual(result.reason, "probe_failed")
+
+    @unittest.skipUnless(sys.platform == "darwin", "exercises the macOS libproc backend")
+    def test_real_backend_accepts_only_the_exact_system_login_path(self):
+        import ctypes as ct
+
+        def backend(path):
+            class FakeLibproc:
+                @staticmethod
+                def proc_pidpath(pid, buffer, size):
+                    data = path.encode()
+                    ct.memmove(buffer, data, len(data))
+                    return len(data)
+
+            value = nc.DarwinBackend.__new__(nc.DarwinBackend)
+            value.proc = FakeLibproc()
+            return value
+
+        self.assertTrue(backend("/usr/bin/login").is_terminal_login(756))
+        for path in ("/usr/bin/login/", "/tmp/usr/bin/login", "/usr/bin/sudo", "/usr/local/bin/login", "login", ""):
+            with self.subTest(path=path):
+                self.assertFalse(backend(path).is_terminal_login(756))
+
+
 class Packaging(unittest.TestCase):
     @staticmethod
     def manifest(filename, field):
