@@ -1084,7 +1084,7 @@ sys.exit(cp.entry(["hook"]))
 
 class AuthorTrailerHarness(unittest.TestCase):
     """goodqa#15253 #134 red-team B1: the author trailer is review evidence, so it must name the committing harness."""
-    BODY = ("fix(x): change a thing\n\nWhy: a reason that is long enough.\n\nWhat: the change.\n\n"
+    BODY = ("fix(x): change a thing\n\nWhy: a reason that is long enough.\n\nWhat: describe the intended fixture change.\n\n"
             "Testing: `python3 -m unittest tests.test_x` 3 OK\n\nRefs: GoodQA #1234\n\n")
 
     def problems(self, harness, trailer):
@@ -1117,7 +1117,11 @@ class AuthorTrailerHarness(unittest.TestCase):
 
     def test_both_installed_copies_accept_the_committing_harness_trailer(self):
         # delta red-team D-F1: the ~/.claude and ~/.codex hooks both run on every commit; neither may refuse the
-        # trailer of the harness actually committing, and both refuse the other one
+        # trailer of the harness actually committing, and both refuse the other one.
+        # A synthetic marker is not the actual test-host origin: provide an
+        # explicit genuine-Claude/no-native or verified-native test condition.
+        # This in-process fixture exists only inside disposable helper copies;
+        # production gains no origin CLI/config/provider override.
         import shutil
         import tempfile
         with tempfile.TemporaryDirectory() as home:
@@ -1126,18 +1130,29 @@ class AuthorTrailerHarness(unittest.TestCase):
                 shutil.copytree(HOOKS, dest, ignore=shutil.ignore_patterns("__pycache__"))
             msg = Path(home) / "msg.txt"
             base = {"HOME": home, "PATH": "/usr/bin:/bin"}
-            cases = (({"CLAUDECODE": "1"}, "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>", False),
-                     ({"CODEX_THREAD_ID": "t1"}, "Co-Authored-By: GPT-5 Codex <noreply@openai.com>", False),
-                     ({"CLAUDECODE": "1"}, "Co-Authored-By: GPT-5 Codex <noreply@openai.com>", True),
-                     ({"CODEX_THREAD_ID": "t1"}, "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>", True))
-            for marker, trailer, refused in cases:
+            claude = "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+            codex = "Co-Authored-By: GPT-5 Codex <noreply@openai.com>"
+            cases = (("legacy", {"CLAUDECODE": "1"}, claude, False),
+                     ("legacy", {"CODEX_THREAD_ID": "t1"}, codex, False),
+                     ("legacy", {"CLAUDECODE": "1"}, codex, True),
+                     ("legacy", {"CODEX_THREAD_ID": "t1"}, claude, True),
+                     ("native", {"CLAUDECODE": "1"}, codex, False),
+                     ("native", {"CLAUDECODE": "1"}, claude, True),
+                     ("native", {"CODEX_THREAD_ID": "t1"}, codex, False),
+                     ("native", {"CODEX_THREAD_ID": "t1"}, claude, True))
+            for origin, marker, trailer, refused in cases:
                 msg.write_text(self.BODY + trailer + "\n")
+                observation = ("nc.OriginObservation('unknown',False,'no_native_runtime')" if origin == "legacy"
+                               else "nc.OriginObservation('openai',True,'running_code_verified')")
+                fixture = ("import sys; sys.path.insert(0,sys.argv[1]); import commit_policy as cp,native_context as nc; "
+                           "cp.probe_runtime_origin=lambda: " + observation + "; raise SystemExit(cp.main(sys.argv[2:]))")
                 for dest in copies:
-                    with self.subTest(copy=dest.parent.name, marker=marker, trailer=trailer):
-                        out = subprocess.run([sys.executable, "-I", str(dest / "commit_policy.py"), "check-message",
+                    with self.subTest(copy=dest.parent.name, origin=origin, marker=marker, trailer=trailer):
+                        out = subprocess.run([sys.executable, "-I", "-B", "-c", fixture, str(dest), "check-message",
                                               "--file", str(msg)], capture_output=True, text=True, timeout=60,
                                              env=dict(base, **marker))
                         self.assertEqual("this commit is made from the" in out.stdout, refused, out.stdout[-400:])
+                        self.assertEqual(out.returncode, 2 if refused else 0, out.stderr[-400:])
 
 if __name__ == "__main__":
     unittest.main()
