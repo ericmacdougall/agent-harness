@@ -1622,7 +1622,7 @@ def check_deploys(cfg, state, runner, now):
     except OSError:
         sessions = []
     for session in sessions:
-        pending, tested, unscanned = {}, {}, []  # id -> latest PENDING time, id -> latest REALLY_TESTED time
+        events, unscanned = {}, []  # id -> [(time, "P" pending | "T" tested)]
         for path in session.glob("*.jsonl"):
             try:
                 if now - path.lstat().st_mtime > look:
@@ -1644,13 +1644,20 @@ def check_deploys(cfg, state, runner, now):
                 at = parse_ts(row.get("at")) if isinstance(row, dict) else None
                 m = TESTED_NOTE_RE.match(note)
                 if m and at is not None:
-                    tested[m.group(1)] = max(at, tested.get(m.group(1), at))
+                    events.setdefault(m.group(1), []).append((at, "T"))
                 m = PENDING_NOTE_RE.match(note)
                 if m and at is not None:
-                    pending[m.group(1)] = max(at, pending.get(m.group(1), at))
-        # open = the LATEST pending is newer than the latest test: a behavior change that re-opens an id invalidates the
-        # earlier live test (red-team a5 A1)
-        old = sorted(i for i, at in pending.items() if at > tested.get(i, 0.0) and now - at >= pending_after)
+                    events.setdefault(m.group(1), []).append((at, "P"))
+        # An id is open from its FIRST pending after its LAST test: a behavior change that re-opens it invalidates the earlier
+        # live test (red-team ad4294 A1), and restating a PENDING in a recap must not restart its clock (N1).
+        old = []
+        for ident, rows in events.items():
+            since = None
+            for at, kind in sorted(rows):
+                since = None if kind == "T" else (at if since is None else since)
+            if since is not None and now - since >= pending_after:
+                old.append(ident)
+        old.sort()
         if unscanned:
             out.append(alert("deploys", f"pending-unscanned:{session.name[:8]}", "warning",
                              f"{len(unscanned)} log file(s) of session {session.name[:8]} could not be scanned for open "

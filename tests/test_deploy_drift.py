@@ -119,6 +119,16 @@ class OpenPending(Case):
         self.wal("sess-dddd-4444", [{"at": iso(NOW - 1 * 3600), "event": "check", "note": "REALLY_TESTED t1: retested"}])
         self.assertEqual(self.run_check(), [])
 
+    def test_restating_a_pending_in_a_recap_does_not_restart_its_clock(self):
+        # red-team ad4294 N1: an id open for 20 h and mentioned again 1 h ago is still open for 20 h
+        self.wal("sess-ffff-6666", [
+            {"at": iso(NOW - 20 * 3600), "event": "check", "note": "PENDING_REAL_TEST t1: x"},
+            {"at": iso(NOW - 1 * 3600), "event": "status", "note": "PENDING_REAL_TEST t1: x (restated in the recap)"}])
+        self.assertEqual([a["key"] for a in self.run_check()], ["pending-open:sess-fff"])
+        self.wal("sess-ffff-6666", [{"at": iso(NOW - 30 * 60), "event": "check", "note": "REALLY_TESTED t1: ok"},
+                                    {"at": iso(NOW - 10 * 60), "event": "check", "note": "PENDING_REAL_TEST t1: changed"}])
+        self.assertEqual(self.run_check(), [])  # re-opened after a test: young again
+
     def test_an_unreadable_wal_is_reported_not_skipped_so_a_real_alarm_cannot_clear(self):
         # red-team a5 A2 and A3: oversize, FIFO and symlinked logs
         self.wal("sess-eeee-5555", [{"at": iso(NOW - 9 * 3600), "event": "check", "note": "PENDING_REAL_TEST t9: y"}])
