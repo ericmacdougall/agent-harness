@@ -115,7 +115,7 @@ export function setChatTransport(send) { transport = send; }
 export function setResponder(responder) { update({ responder }, 'routing'); update({}, 'chat'); }
 export function setSession(session) { update({ session }, 'routing'); update({}, 'chat'); }
 export function chatAccess(current = state, responder = current.responder, session = current.session) {
-  if (current.connection === 'expired') return { disabled: true, presence: 'SIGNED OUT', notice: 'This dashboard session ended. Run `python3 ~/.claude/mission-control/server.py open` for a fresh link.' };
+  if (current.connection === 'expired') return { disabled: true, presence: 'SIGNED OUT', notice: 'This dashboard session ended. Run `mc` in a terminal (or `python3 ~/.agent-harness/mission-control/app/server.py open`) for a fresh link.' };
   if (current.connection !== 'live') return { disabled: true, presence: current.connection.toUpperCase(), notice: current.connection === 'offline' ? 'Mission Control is offline. Your draft stays here; sending resumes when it is back.' : 'Reconnecting to the stream. Sending is paused; your draft is kept.' };
   if (responder === 'claude') {
     const main = current.chatAvailability.claude[session];

@@ -143,6 +143,35 @@ def install_app(home: Path, source: Path = SOURCE) -> int:
     return len(files)
 
 
+LAUNCHER_MARK = "# agent-harness mission-control launcher"
+
+
+def launcher_text(home: Path) -> str:
+    server = app_dir(home) / "server.py"
+    return (f"#!/bin/sh\n{LAUNCHER_MARK}: opens the dashboard with a fresh one-time link.\n"
+            f"exec /usr/bin/python3 \"{server}\" open \"$@\"\n")
+
+
+def install_launcher(home: Path) -> str:
+    """~/.local/bin/mc runs `server.py open`. Never replaces a file the installer did not write."""
+    bindir = home / ".local" / "bin"
+    target = bindir / "mc"
+    try:
+        bindir.mkdir(mode=0o755, parents=True, exist_ok=True)
+        if bindir.is_symlink() or not bindir.is_dir():
+            return f"launcher skipped: {bindir} is not a real directory"
+        if target.is_symlink() or (target.exists() and LAUNCHER_MARK not in target.read_text(errors="replace")[:400]):
+            return f"launcher skipped: {target} exists and is not ours"
+        temporary = bindir / f".mc.{secrets.token_hex(4)}"
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o755)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(launcher_text(home))
+        os.replace(temporary, target)
+        return f"launcher {target}"
+    except OSError as error:
+        return f"launcher skipped ({error.__class__.__name__})"
+
+
 def default_runner(argv: list[str]):
     return subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120, check=False)
 
@@ -198,7 +227,7 @@ def status(home: Path, apply: bool, flag=None, *, run=None, system: str | None =
             result = run_service(home, "install-launchd", run or default_runner)
             line += f"; LaunchAgent {LABEL}: {result}"
             if result == "ok":
-                line += f"; open it with `python3 {app_dir(home) / 'server.py'} open`"
+                line += f"; {install_launcher(home)}; open it with `mc` or `python3 {app_dir(home) / 'server.py'} open`"
         elif is_real:
             line += f"; no launchd on {system}: run `python3 {app_dir(home) / 'server.py'} serve` yourself"
         return line

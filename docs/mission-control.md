@@ -16,6 +16,7 @@ The event and chat formats are in [mission-control-events.md](mission-control-ev
 
 | Task | Command |
 | --- | --- |
+| Open the dashboard | `mc` (installed to `~/.local/bin/mc`; it runs `python3 ~/.agent-harness/mission-control/app/server.py open`, which prints and opens a fresh one-time link). The installer never replaces an `mc` it did not write. |
 | Install, or reinstall after a harness update | `python3 install.py --apply`. This copies the app to `~/.agent-harness/mission-control/app/` and registers the LaunchAgent. |
 | Open the dashboard | `python3 ~/.agent-harness/mission-control/app/server.py open`. This opens a single-use launch link, valid for 60 s. |
 | Print a launch link instead | `python3 ~/.agent-harness/mission-control/app/server.py url` |
@@ -134,7 +135,7 @@ These are untrusted:
 The server defends against them as follows:
 
 - **Bind**: `127.0.0.1` only. A taken port fails loudly in the log and is retried by launchd every 15 s. The server never falls back to another interface.
-- **Access**: a launch code is an HMAC of the 0600 install secret; it is valid for 60 s and only once. It is exchanged for a fresh HttpOnly, SameSite=Strict session cookie, with a 303 redirect to a clean `/`. The access log never records query strings.
+- **Access**: a launch code is an HMAC of the 0600 install secret; it is valid for 60 s and only once. It is exchanged for a fresh HttpOnly, SameSite=Strict session cookie, with a 303 redirect to a clean `/`. The access log never records query strings. Sessions survive a restart or reinstall: `~/.agent-harness/mission-control/sessions.json` (0600) holds only sha256 hashes of session ids with their times, bound to the install secret; the CSRF token is derived from the secret and the session id, so nothing in the file can be replayed. Demo mode keeps sessions in memory only.
 - **Requests**:
   - Every request has its Host checked against an exact allowlist, which defends against DNS rebinding.
   - Data reads and the event stream need `Sec-Fetch-Site: same-origin` or an exact Origin.

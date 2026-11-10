@@ -92,15 +92,69 @@ def mint_code(key: bytes, now: float | None = None) -> str:
     return _b64(payload) + "." + _b64(mac)
 
 
+SESSION_STORE_MAX = 64 * 1024
+TOUCH_PERSIST_S = 60  # a session's `last` is written back at most once a minute
+
+
 class Auth:
-    def __init__(self, key_loader, port: int):
+    """Launch codes and cookie sessions.
+
+    Sessions are keyed by sha256(sid); the sid itself lives only in the browser cookie. The CSRF token is derived from
+    the install secret and the sid, so nothing on disk can be replayed as a cookie or a CSRF header. With `store`
+    set, sessions survive a restart or reinstall (0600 file, bound to the current secret); demo mode passes none."""
+
+    def __init__(self, key_loader, port: int, store: Path | None = None):
         self.key_loader = key_loader
         self.port = port
+        self.store = store
         self.lock = threading.Lock()
         self.used: dict[bytes, float] = {}
         self.sessions: dict[str, dict] = {}
         self.hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
         self.origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+        self._load()
+
+    @staticmethod
+    def _hash(sid: str) -> str:
+        return hashlib.sha256(sid.encode("utf-8", "replace")).hexdigest()
+
+    def _csrf(self, sid: str) -> str:
+        return _b64(hmac.new(self.key_loader(), b"mc-csrf|" + sid.encode("utf-8", "replace"), hashlib.sha256).digest())
+
+    def _key_id(self) -> str:
+        return hmac.new(self.key_loader(), b"mc-session-store", hashlib.sha256).hexdigest()[:16]
+
+    def _load(self) -> None:
+        if self.store is None:
+            return
+        data = mc_chat.read_json(self.store, limit=SESSION_STORE_MAX)
+        try:
+            if not isinstance(data, dict) or data.get("v") != 1 or data.get("key") != self._key_id():
+                return  # absent, damaged, or written under another secret: start signed out
+        except Exception:  # noqa: BLE001 - no readable secret: start signed out
+            return
+        now = time.time()
+        rows = data.get("sessions") if isinstance(data.get("sessions"), dict) else {}
+        for key, row in rows.items():
+            if not (isinstance(key, str) and len(key) == 64 and isinstance(row, dict)):
+                continue
+            created, last = row.get("created"), row.get("last")
+            if not all(isinstance(v, (int, float)) for v in (created, last)) or now - last > SESSION_TTL_S:
+                continue
+            self.sessions[key] = {"created": float(created), "last": float(last), "saved": float(last)}
+        while len(self.sessions) > MAX_SESSIONS:
+            self.sessions.pop(min(self.sessions, key=lambda k: self.sessions[k]["last"]))
+
+    def _save_locked(self) -> None:
+        if self.store is None:
+            return
+        rows = {k: {"created": v["created"], "last": v["last"]} for k, v in self.sessions.items()}
+        try:
+            mc_chat.write_json(self.store, {"v": 1, "key": self._key_id(), "sessions": rows})
+            for v in self.sessions.values():
+                v["saved"] = v["last"]
+        except Exception:  # noqa: BLE001 - sessions still work in memory; a restart signs out, as before
+            pass
 
     def allow_demo_host(self, host: str) -> None:
         """Demo mode only: one checked *.ts.net Funnel host, reached over https (the bind stays 127.0.0.1)."""
@@ -143,7 +197,8 @@ class Auth:
             oldest = min(self.sessions, key=lambda s: self.sessions[s]["last"])
             self.sessions.pop(oldest, None)
         sid = secrets.token_urlsafe(32)
-        self.sessions[sid] = {"csrf": secrets.token_urlsafe(32), "created": now, "last": now}
+        self.sessions[self._hash(sid)] = {"created": now, "last": now, "saved": now}
+        self._save_locked()
         return sid
 
     def session(self, cookie_header: str | None, now: float | None = None):
@@ -153,19 +208,24 @@ class Auth:
             name, _, value = part.strip().partition("=")
             if name == "mc_sid":
                 sid = value
-        if not sid:
+        if not sid or len(sid) > 128:
             return None, None
+        key = self._hash(sid)
         with self.lock:
-            info = self.sessions.get(sid)
+            info = self.sessions.get(key)
             if not info or now - info["last"] > SESSION_TTL_S:
-                self.sessions.pop(sid, None)
+                if self.sessions.pop(key, None) is not None:
+                    self._save_locked()
                 return None, None
             info["last"] = now
-            return sid, info
+            if now - info.get("saved", 0) >= TOUCH_PERSIST_S:
+                self._save_locked()
+        return sid, {"csrf": self._csrf(sid), "created": info["created"], "last": now}
 
     def revoke_all(self) -> None:
         with self.lock:
             self.sessions.clear()
+            self._save_locked()
 
 
 # ---------------------------------------------------------------- the application (state + collectors)
@@ -209,7 +269,8 @@ class App:
         (root / "sources").mkdir(mode=0o700, exist_ok=True)
         (root / "log").mkdir(mode=0o700, exist_ok=True)
         self.key = mc_chat.secret(root)
-        self.auth = Auth(lambda: mc_chat.secret(root, create=False), port)
+        self.auth = Auth(lambda: mc_chat.secret(root, create=False), port,
+                         store=None if demo else root / "sessions.json")
         self.hub = ev.Hub()
         self.health = col.Health(self.hub)
         self.started = time.time()
@@ -424,7 +485,8 @@ class Handler(BaseHTTPRequestHandler):
         if not sid:
             if document:
                 page = (b"<!doctype html><meta charset=utf-8><title>Mission Control</title>"
-                        b"<p>Open Mission Control with <code>python3 ~/.claude/mission-control/server.py open</code>."
+                        b"<p>Open Mission Control: run <code>mc</code> in a terminal"
+                        b" (or <code>python3 ~/.agent-harness/mission-control/app/server.py open</code>)."
                         b" Launch links work once and expire after 60 seconds.</p>")
                 return self.send_secure(401, page, "text/html; charset=utf-8")
             return self.deny(401, "session")
