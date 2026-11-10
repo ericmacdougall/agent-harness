@@ -565,6 +565,85 @@ class DriftTests(GitFixture):
         self.assertEqual(a["drift:retired"]["severity"], "warning")
         self.assertNotIn("drift:local-only", a)
 
+    def test_a_file_edited_after_main_retired_it_is_high_not_retired(self):
+        """Codex gate F1: a filename in main's history is no proof the installed content is recoverable from main."""
+        repo, hooks, cfg = self.drift_world()
+        git("rm", "-q", "harness/hooks/old.py", cwd=repo)
+        git("commit", "-qm", "retire old", cwd=repo)
+        git("update-ref", "refs/remotes/origin/main", "HEAD", cwd=repo)
+        (hooks / "old.py").write_text("print('old, then edited on this host')\n")
+        a = keys(ow.check_drift(cfg, ow.run))
+        self.assertNotIn("drift:retired", a)
+        self.assertEqual(a["drift:local-only"]["severity"], "high")
+        self.assertEqual(a["drift:local-only"]["detail"]["files"], ["old.py"])
+
+    def test_an_older_main_version_of_a_retired_file_is_retired(self):
+        repo, hooks, cfg = self.drift_world()
+        (repo / "harness/hooks/old.py").write_text("print('old v2')\n")
+        git("commit", "-qam", "old v2", cwd=repo)
+        git("rm", "-q", "harness/hooks/old.py", cwd=repo)
+        git("commit", "-qm", "retire old", cwd=repo)
+        git("update-ref", "refs/remotes/origin/main", "HEAD", cwd=repo)
+        (hooks / "old.py").write_text("print('old')\n")  # v1: this host was never updated, but main has the bytes
+        a = keys(ow.check_drift(cfg, ow.run))
+        self.assertEqual(a["drift:retired"]["detail"]["files"], ["old.py"])
+        self.assertNotIn("drift:local-only", a)
+
+    def history_runner(self, main_hit=lambda name: False, remote_hit=lambda name: True, main_rc=0, remote_rc=0,
+                       calls=None):
+        """ow.run for the tree lookups; canned answers for the per-file history searches (fast for many files)."""
+        def runner(argv, timeout, stdin=None, env=None, cwd=None):
+            if "log" in argv:
+                name = argv[-1].rsplit("/", 1)[-1]
+                if calls is not None:
+                    calls.append(name)
+                if "--remotes=origin" in argv:
+                    return remote_rc, ("c0ffee" * 7 + "\n") if remote_rc == 0 and remote_hit(name) else ""
+                return main_rc, ("beef" * 10 + "\n") if main_rc == 0 and main_hit(name) else ""
+            return ow.run(argv, timeout, stdin=stdin, env=env, cwd=cwd)
+        return runner
+
+    def test_every_local_only_candidate_is_examined_not_a_prefix(self):
+        """Codex gate F2: local_only[:200] hid every file after the 200th."""
+        repo, hooks, cfg = self.drift_world()
+        for n in range(250):
+            (hooks / f"pushed{n:03d}.py").write_text(f"print({n})\n")
+        (hooks / "zz_unpublished.py").write_text("print('only here')\n")  # sorts after all 250
+        a = keys(ow.check_drift(cfg, self.history_runner(remote_hit=lambda name: name != "zz_unpublished.py")))
+        self.assertEqual(a["drift:local-only"]["detail"]["files"], ["zz_unpublished.py"])
+        self.assertIn("250 installed hook file(s) are pushed", a["drift:unmerged"]["message"])
+        self.assertNotIn("drift:incomplete", a)
+
+    def test_a_budget_or_cap_overflow_is_reported_as_incomplete(self):
+        repo, hooks, cfg = self.drift_world()
+        for n in range(5):
+            (hooks / f"mine{n}.py").write_text(f"print({n})\n")
+        cfg["drift"] = dict(cfg["drift"], local_only_max=3)
+        calls = []
+        a = keys(ow.check_drift(cfg, self.history_runner(remote_hit=lambda name: False, calls=calls)))
+        self.assertEqual(a["drift:incomplete"]["severity"], "warning")
+        self.assertEqual(a["drift:incomplete"]["detail"]["unchecked"], ["mine3.py", "mine4.py"])
+        self.assertIn("2 of 5", a["drift:incomplete"]["message"])
+        self.assertEqual(a["drift:local-only"]["detail"]["files"], ["mine0.py", "mine1.py", "mine2.py"])
+        self.assertNotIn("mine3.py", calls)
+        cfg["drift"] = dict(cfg["drift"], local_only_max=1000, local_only_budget_s=0)
+        a = keys(ow.check_drift(cfg, self.history_runner(remote_hit=lambda name: False)))
+        self.assertIn("5 of 5", a["drift:incomplete"]["message"])
+        self.assertNotIn("drift:local-only", a)  # nothing checked is never claimed lost
+
+    def test_a_failed_main_history_lookup_is_a_check_error_not_a_loss_claim(self):
+        """Codex gate F3: nonzero git status is not an empty answer."""
+        repo, hooks, cfg = self.drift_world()
+        (hooks / "mine.py").write_text("print(1)\n")
+        with self.assertRaises(RuntimeError):
+            ow.check_drift(cfg, self.history_runner(main_rc=128))
+
+    def test_a_failed_remote_history_lookup_is_a_check_error_not_a_loss_claim(self):
+        repo, hooks, cfg = self.drift_world()
+        (hooks / "mine.py").write_text("print(1)\n")
+        with self.assertRaises(RuntimeError):
+            ow.check_drift(cfg, self.history_runner(remote_rc=128))
+
     def test_a_differing_file_and_local_only_files_raise_both_alerts_and_long_lists_are_bounded(self):
         repo, hooks, cfg = self.drift_world()
         (hooks / "wal.py").write_text("print('changed')\n")

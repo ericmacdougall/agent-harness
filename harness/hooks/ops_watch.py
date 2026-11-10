@@ -1115,18 +1115,41 @@ def check_drift(cfg, runner):
         raise RuntimeError("ls-tree returned no hook files: wrong repo or ref")  # never flag every installed hook as local-only
     local_only = local_only_hooks(claude / "hooks", on_main)
     pushed, retired, lost = {}, [], []
-    for name in local_only[:200]:
-        rc, gone = runner(["git", "-C", repo, "log", "-1", "--format=%H", ref, "--", f"harness/hooks/{name}"], 30, env=env)
-        if rc == 0 and (gone or "").strip():  # main had it once and deleted it
-            retired.append(name)
-            continue
+    cap, budget = int(d.get("local_only_max", 1000)), float(d.get("local_only_budget_s", 60))
+    deadline = time.monotonic() + budget
+    checked = 0
+    for name in local_only:
+        remaining = deadline - time.monotonic()
+        if checked >= cap or remaining <= 0:
+            break
+        path = f"harness/hooks/{name}"
         blob = git_blob_sha(safe_read(claude / "hooks" / name, 16 * 1024 * 1024))
+        # retired only when these exact bytes once sat at this path on main: then deleting loses nothing. A file main
+        # deleted and this host edited or recreated falls through, like any other unpublished file (Codex gate F1).
+        rc, gone = runner(["git", "-C", repo, "log", "-1", "--format=%H", f"--find-object={blob}", ref, "--", path],
+                          max(1, min(30, remaining)), env=env)
+        if rc != 0:  # a failed lookup is not an empty answer: never turn it into a loss claim (Codex gate F3)
+            raise RuntimeError("git log of main history failed")
+        if (gone or "").strip():
+            retired.append(name)
+            checked += 1
+            continue
         rc, commit = runner(["git", "-C", repo, "log", "--remotes=origin", "-1", "--format=%H", f"--find-object={blob}", "--",
-                             f"harness/hooks/{name}"], 30, env=env)
-        if rc == 0 and (commit or "").strip():
+                             path], max(1, min(30, deadline - time.monotonic())), env=env)
+        if rc != 0:
+            raise RuntimeError("git log of pushed branches failed")
+        if (commit or "").strip():
             pushed[name] = commit.strip()[:12]
         else:
             lost.append(name)
+        checked += 1
+    unchecked = local_only[checked:]
+    if unchecked:  # never a silent prefix (Codex gate F2): say how many were not examined this run
+        out.append(alert("drift", "drift:incomplete", "warning",
+                         f"drift did not check {len(unchecked)} of {len(local_only)} installed hook file(s) not on {ref} "
+                         f"(cap {cap}, budget {budget:g}s): {', '.join(unchecked[:6])}" + (" ..." if len(unchecked) > 6 else ""),
+                         {"unchecked": unchecked[:50], "unchecked_count": len(unchecked), "total": len(local_only),
+                          "ref": ref}))
     if lost:  # work that exists only on this machine is lost with it (GoodQA #15565: codex_pool.py was never pushed)
         out.append(alert("drift", "drift:local-only", "high",
                          f"{len(lost)} installed hook file(s) are on no pushed branch and not on {ref}: {', '.join(lost[:6])}"
