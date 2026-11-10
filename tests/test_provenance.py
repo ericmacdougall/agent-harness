@@ -439,6 +439,31 @@ class Enforcement(Env):
         self.run_note("--event", "ask_resolved", "--note", "done", "--ref", gid, "--source", self.user(HUMAN, QUOTE))  # goodqa#14791 G5
         self.assertEqual(provenance.render_asks(SID)[1]["traced"], 0)
 
+    def test_ask_items_lists_only_presentable_open_asks(self):  # goodqa#15585 Needs-you hotfix
+        good = json.loads(self.run_note("--event", "ask", "--note", "<b>confirm</b> the policy mode (goodqa#15585)",
+                                        "--reason", "decides rollout", "--source", self.user(HUMAN, QUOTE)).stdout)["id"]
+        guess = json.loads(self.run_note("--event", "ask", "--note", "provide an OpenRouter key", "--reason", "fallback provider",
+                                         "--source", f"inferred: from {self.user(HUMAN, 'OpenRouter key stays out')} -- agent guessed a key is wanted").stdout)["id"]
+        done = json.loads(self.run_note("--event", "ask", "--note", "already answered", "--reason", "needed to decide",
+                                        "--source", self.user(HUMAN, QUOTE)).stdout)["id"]
+        self.run_note("--event", "ask_resolved", "--note", "done", "--ref", done, "--source", self.user(HUMAN, QUOTE))
+        with (self.wals / "main.jsonl").open("a") as handle:  # an untraceable ask written around wal_note's gate
+            handle.write(json.dumps({"event": "ask", "id": "wforged00001", "at": "2026-11-09T00:00:00Z",
+                                     "note": "forged ask", "source": 'user:nope/none "never said"'}, separators=(",", ":")) + "\n")
+        data = provenance.ask_items(SID)
+        by_id = {item["id"]: item for item in data["items"]}
+        self.assertEqual(set(by_id), {good, guess}, data)
+        self.assertEqual((by_id[good]["kind"], by_id[guess]["kind"]), ("traced", "assumption"))
+        self.assertEqual(by_id[good]["note"], "<b>confirm</b> the policy mode (goodqa#15585)")  # raw; the page renders text
+        self.assertEqual((data["counts"]["blocked"], data["counts"]["closed"]), (1, 1))
+        env = dict(os.environ, HOME=str(self.home))
+        out = subprocess.run([sys.executable, str(HOOKS / "provenance.py"), "asks", "--session", SID, "--json", "--items"],
+                             capture_output=True, text=True, env=env)
+        self.assertEqual({i["id"] for i in json.loads(out.stdout)["items"]}, {good, guess}, out.stderr)
+        plain = subprocess.run([sys.executable, str(HOOKS / "provenance.py"), "asks", "--session", SID, "--json"],
+                               capture_output=True, text=True, env=env)
+        self.assertNotIn("items", json.loads(plain.stdout))  # the existing counts-only contract is unchanged
+
     def test_concurrent_appends(self):  # AC-6
         procs = [subprocess.Popen([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "requirement",
                                    "--note", f"r{i}", "--source", self.user(HUMAN, QUOTE)],

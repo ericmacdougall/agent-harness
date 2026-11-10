@@ -17,6 +17,7 @@ from pathlib import Path
 TICKET_RE = re.compile(r"^(?:GoodQA )?[a-z0-9][a-z0-9-]{0,39}#[0-9]{1,7}$")
 LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 CURSOR_RE = re.compile(r"^[A-Za-z0-9._:=-]{0,128}$")
+SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{7,63}$")
 SAFE_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "SSH_AUTH_SOCK", "GH_CONFIG_DIR",
             "XDG_CONFIG_HOME")
 SECRET_ENV = re.compile(r"(?i)(TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|AUTH)")
@@ -56,6 +57,10 @@ class Runner:
             return [self.python, "-I", self.ah, "sessions"]
         if kind == "ah-ticket-comments" and len(args) == 1 and TICKET_RE.match(str(args[0])):
             return [self.python, "-I", self.ah, "ticket", "comments", str(args[0])]
+        if kind == "provenance-asks" and len(args) == 1 and SESSION_RE.match(str(args[0])):
+            # read-only: the open asks of one session, as data (the "Needs you" list)
+            return [self.python, "-I", str(Path(self.ah).with_name("provenance.py")), "asks", "--session", str(args[0]),
+                    "--json", "--items"]
         if kind == "gh-user" and not args:
             return [self.gh, "api", "user", "--method", "GET"]
         if kind == "gh-events" and len(args) == 1 and LOGIN_RE.match(str(args[0])):

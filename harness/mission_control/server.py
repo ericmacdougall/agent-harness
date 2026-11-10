@@ -229,8 +229,9 @@ class App:
         self.remote = col.Remote(self.hub, self.health, self.runner, enabled=remote, fabric=bool(fabric_bin),
                                  drop_dir=root / "sources")
         self.drop = col.FileDrop(self.hub, self.health, self.reader, root / "sources")
+        self.asks = col.Asks(self.hub, self.health, self.runner, lambda: self.owners.session)
         self.collectors = [self.tailer, self.initiatives, self.drop, self.owners, self.github, self.tickets,
-                           self.remote]
+                           self.remote, self.asks]
         self.codex = CodexResponder(self.hub, self.health, self.runner, codex_binary(), root,
                                     disabled="" if codex else "Codex chat is turned off for this instance")
         self.chat_sig = None
@@ -305,7 +306,7 @@ class App:
         return {"version": VERSION, "started": ev.iso(self.started), "host": "demo" if self.demo else ev.HOST,
                 "initiatives": self.initiatives.snapshot(), "owners": self.owners.rows,
                 "health": self.health.snapshot(), "events": self.hub.recent(limit=200),
-                "chat": self.chat_snapshot(), "limits": {"chat_max": mc_chat.MAX_TEXT}}
+                "chat": self.chat_snapshot(), "asks": self.asks.snapshot(), "limits": {"chat_max": mc_chat.MAX_TEXT}}
 
     def post_chat(self, body: dict) -> tuple[int, dict]:
         if not isinstance(body, dict):

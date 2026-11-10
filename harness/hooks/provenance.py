@@ -1292,7 +1292,8 @@ def ledger(session: str, home=None) -> list:
     return sorted(asks.values(), key=lambda r: r["at"])
 
 
-def render_asks(session: str, home=None, ctx=None) -> tuple:
+def classify_asks(session: str, home=None, ctx=None) -> tuple:
+    """Open asks split by how well their source resolves: (traced, assumptions, unverified, blocked, closed count)."""
     entries = ledger(session, home)
     ctx = dict(ctx or {}, home=home, want_text=True)
     traced, assumptions, blocked, unverified, closed = [], [], [], [], 0
@@ -1311,6 +1312,27 @@ def render_asks(session: str, home=None, ctx=None) -> tuple:
             unverified.append(row)
         else:
             traced.append(row)
+    return traced, assumptions, unverified, blocked, closed
+
+
+def ask_items(session: str, home=None, ctx=None) -> dict:
+    """The open asks a person may be shown, as data (Mission Control's "Needs you" list).
+
+    Blocked asks (no resolvable source) are left out, exactly as the text ledger says not to present them."""
+    traced, assumptions, unverified, blocked, closed = classify_asks(session, home, ctx)
+    items = []
+    for kind, rows in (("traced", traced), ("unverified", unverified), ("assumption", assumptions)):
+        for record, result in rows:
+            items.append({"id": record["id"], "kind": kind, "at": record.get("at", ""),
+                          "note": clip(record.get("note", ""), 400), "reason": clip(record.get("reason", ""), 200),
+                          "owner": record["_wal"].stem, "source_label": result["label"] if result else ""})
+    items.sort(key=lambda item: item["at"])
+    return {"counts": {"traced": len(traced), "unverified": len(unverified), "assumptions": len(assumptions),
+                       "blocked": len(blocked), "closed": closed}, "items": items}
+
+
+def render_asks(session: str, home=None, ctx=None) -> tuple:
+    traced, assumptions, unverified, blocked, closed = classify_asks(session, home, ctx)
     lines = [f"Asks ledger for session {session}: {len(traced)} traceable, {len(assumptions)} assumptions, {len(unverified)} unverified citations, "
              f"{len(blocked)} blocked, {closed} resolved"]
 
@@ -1397,6 +1419,7 @@ def build_parser():
     asks = sub.add_parser("asks", help="list the session's open asks with citations")
     asks.add_argument("--session", required=True)
     asks.add_argument("--json", action="store_true")
+    asks.add_argument("--items", action="store_true", help="with --json: also list the presentable open asks")
     return parser
 
 
@@ -1471,6 +1494,10 @@ def main(argv=None) -> int:
             store_ticket(found.group(1), int(found.group(2)), args.title, args.checked_by)
             print(f"cached {args.ref}")
             return 0
+        if args.command == "asks" and args.json and args.items:
+            data = ask_items(args.session)
+            print(json.dumps(data))
+            return 2 if data["counts"]["blocked"] else 0
         if args.command == "asks":
             text, counts = render_asks(args.session)
             print(json.dumps(counts) if args.json else text)

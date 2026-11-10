@@ -19,6 +19,7 @@
       <div class="topbar-tools">
         <span id="connection" class="connection connecting" role="status"><i></i><span>Connecting</span></span>
         <time id="live-clock" class="mono">00:00:00</time><span class="clock-zone">LOCAL</span>
+        <button id="needs-button" class="quiet-button needs-button" type="button" aria-haspopup="dialog" aria-controls="needs-dialog"><span aria-hidden="true">?</span> Needs you <span id="needs-count" class="needs-count">0</span></button>
         <button id="motion-toggle" class="quiet-button motion-control" aria-pressed="true"><svg class="motion-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7.5" stroke-dasharray="2.2 2.6"/><circle cx="12" cy="12" r="2"/></svg><span id="motion-label">Motion on</span></button>
       </div>
     </header>
@@ -91,6 +92,7 @@
   </div>
 
   <dialog id="approval-dialog" aria-labelledby="approval-title" aria-describedby="approval-copy"><div class="dialog-top"><h2 id="approval-title">Approvals need the terminal</h2><button class="icon-button" id="approval-close" aria-label="Close approval explanation">×</button></div><p id="approval-copy" class="approval-copy">Dashboard messages reach your agents labelled as dashboard text. They can start or steer ordinary work, but they cannot approve production, deletion, credential or account actions, or top-rung models, and they never override a hard rule. Give those approvals in the terminal attached to your agent.</p></dialog>
+  <dialog id="needs-dialog" class="needs-dialog" aria-labelledby="needs-title"><div class="dialog-top"><h2 id="needs-title">Needs you</h2><button class="icon-button" id="needs-close" aria-label="Close needs you">×</button></div><p class="needs-intro">Open questions from main. Your reply goes to main through the chat channel, tagged with the ask id; main resolves the ask. Text below is written by agents.</p><ul id="needs-list" class="needs-list"></ul></dialog>
   <dialog id="inspector" class="inspector"><div class="dialog-top"><span class="eyebrow" id="inspector-type">DETAIL</span><button class="icon-button" id="inspector-close" aria-label="Close details">×</button></div><div id="inspector-content"></div></dialog>
   <div id="page-error" class="page-error" role="alert" hidden></div>
   <div id="activity-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>

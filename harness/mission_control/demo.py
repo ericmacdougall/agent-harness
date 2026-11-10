@@ -199,6 +199,17 @@ INITIATIVES = [
      "milestones_total": 3, "ticket": "demo#108"},
 ]
 
+# Open asks for the "Needs you" list. The third is hostile on purpose: ask text is agent-written and must render as
+# text, never as markup.
+ASKS = [
+    ({"id": "wdemoask0001", "kind": "traced", "note": "Ship the checkout redesign behind a flag first, or straight to "
+      "everyone? (demo#101)", "reason": "Recommended: flag first, 10% for a day"}, 1500),
+    ({"id": "wdemoask0002", "kind": "assumption", "note": "Keep the nightly backup window at 02:00, or move it to "
+      "04:00 for the migration? (demo#104)", "reason": "Blocks the reports migration"}, 7200),
+    ({"id": "wdemoask0003", "kind": "traced", "note": "<img src=x onerror=alert(1)> Approve the docs copy? (demo#108)",
+      "reason": "<script>alert(2)</script>"}, 300),
+]
+
 PULSES = [
     ("push", "pushed 2 commits to feat/checkout-form", {"repo": "demo/shop", "branch": "feat/checkout-form"}),
     ("wal", "check: payment form unit tests pass", {"ticket": "demo#101"}),
@@ -225,6 +236,9 @@ class DemoRunner:
             return 0, json.dumps({"comments": [
                 {"id": f"{args[0]}-c1", "body": "Demo comment: looks good, one nit on naming.",
                  "createdAt": _iso(self.started - 3600)}]})
+        if kind == "provenance-asks" and len(args) == 1:
+            return 0, json.dumps({"counts": {"traced": len(ASKS), "blocked": 0}, "items": [
+                {**ask, "at": _iso(time.time() - age), "owner": "main"} for ask, age in ASKS]})
         if kind == "gh-user" and not args:
             return 1, ""  # the GitHub source shows as failing, so the page's error notice can be checked
         raise PermissionError(f"demo mode runs no commands ({kind})")

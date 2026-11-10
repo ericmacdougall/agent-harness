@@ -4,11 +4,12 @@ import { mountInitiatives } from './initiatives.js';
 import { mountActivity } from './activity.js';
 import { mountOwners } from './owners.js';
 import { mountChat } from './chat.js';
+import { mountNeeds } from './needs.js';
 import { mountHealth } from './health.js';
 import { mountScene } from './scene.js';
 import * as live from './live.js';
 
-mountInitiatives(); mountActivity(); mountOwners(); mountChat(); mountHealth();
+mountInitiatives(); mountActivity(); mountOwners(); mountChat(); mountHealth(); mountNeeds();
 mountScene();
 
 const filters = document.getElementById('event-filters');

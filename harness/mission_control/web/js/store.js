@@ -17,7 +17,7 @@ let savedMotion = true;
 try { savedMotion = localStorage.getItem('mc-motion') !== 'off'; } catch { /* storage is optional */ }
 let state = {
   initiatives: [], initiativesStale: false, initiativesError: '', owners: [], ownerRows: [], events: [], messages: [], sources: [],
-  host: '', chat: null, pending: [], sessions: [], mainSession: '',
+  host: '', chat: null, pending: [], sessions: [], mainSession: '', asks: [], asksSession: '',
   connection: 'connecting', now: Date.now(), filters: Object.keys(KINDS),
   selection: null, highlight: null, tab: 'overview', responder: 'claude', session: '',
   motion: savedMotion && !media.matches, motionPreference: savedMotion, reducedMotion: media.matches,
@@ -169,5 +169,25 @@ export function retryMessage(id) {
   const pending = [...state.pending, item].slice(-20);
   update({ pending, messages: adapt.messages(state.chat, pending) }, 'chat');
   deliver(item);
+}
+// ---- needs you: open asks from main's session. A reply is an ordinary chat message to main, tagged with the ask id,
+// so it carries no authority beyond the chat channel's own; main resolves the ask from it.
+export function setAsks(snapshot) {
+  const items = Array.isArray(snapshot?.items) ? snapshot.items.filter(a => a && /^[A-Za-z0-9_-]{1,40}$/.test(String(a.id))) : [];
+  update({ asks: items, asksSession: String(snapshot?.session || '') }, 'asks');
+}
+export function askReplyAccess(ask, current = state) { return chatAccess(current, 'claude', ask?.session || current.asksSession); }
+export function sendAskReply(ask, text) {
+  const clean = String(text).trim();
+  const session = ask?.session || state.asksSession;
+  const body = `[ask:${ask?.id}] ${clean}`;
+  if (!clean || !ask?.id || body.length > 4000 || askReplyAccess(ask).disabled || !transport) return false;
+  const key = adapt.newClientKey();
+  const item = { id: `local-${key}`, client_key: key, from: 'user', to: 'claude', session, thread: null,
+    text: body, ts: new Date().toISOString(), status: 'sending', reason: '' };
+  const pending = [...state.pending, item].slice(-20);
+  update({ pending, messages: adapt.messages(state.chat, pending) }, 'chat');
+  deliver(item);
+  return key;
 }
 export const messageSession = id => state.messages.find(m => m.id === id)?.session || state.session;
