@@ -6369,45 +6369,82 @@ def _extra_ignored_ok(entry, extra):
     return text.endswith('/') or parts[-1].endswith(('.d.ts', '.tsbuildinfo'))
 
 
+MANIFEST_BATCH = 2048
+MANIFEST_WORKERS = 4
+MANIFEST_IN_FLIGHT = 32
+
+
+def _manifest_rows(batch):
+    """One manifest chunk: (relative path, type, mode, size, mtime_ns, inode, ctime_ns) per entry, from lstat."""
+    out = []
+    for rel, kind, full in batch:
+        st = os.lstat(full)
+        out.append('%s\0%s\0%o\0%d\0%d\0%d\0%d\n' % (rel, kind, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ino,
+                                                    st.st_ctime_ns))
+    return ''.join(out).encode('utf-8', 'surrogateescape')
+
+
 def _scan_ignored_dir(path, name, manifest=None):
     """Walk one ignored folder (never following links) and return (entries, newest mtime_ns). When `manifest` (a hashlib
     object) is given, every entry is fed into it in a deterministic order as relative path, type, mode, size, mtime_ns,
-    inode and ctime_ns, so a same-count replacement with restored directory times still changes it. Raises ValueError
-    for a nested
+    inode and ctime_ns, so a same-count replacement with restored directory times still changes it (the lstat calls run
+    in ordered chunks on a small thread pool; results are consumed in submission order). Raises ValueError for a nested
     repository (its commits may exist nowhere else), a Claude, session or log folder, and, outside third-party trees, a
     secret, key, database, log or transcript file. A folder over IGNORED_SCAN_LIMIT entries is refused."""
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
     dependency = name in DEPENDENCY_SEGMENTS
     seen, newest = 0, 0
+    pool = ThreadPoolExecutor(max_workers=MANIFEST_WORKERS) if manifest is not None else None
+    pending, batch = deque(), []
 
     def unreadable(error):
         raise ValueError('an ignored folder could not be read (%s); refused' % type(error).__name__)
 
-    for root, dirs, files in os.walk(path, followlinks=False, onerror=unreadable):
-        dirs.sort()
-        files.sort()
-        for d in dirs:
-            if d.casefold() == '.git' or d.casefold() in (HARNESS_SEGMENTS if dependency else NEVER_SEGMENTS):
-                raise ValueError('an ignored folder holds a nested repository or a Claude, session or log folder (%s)' % d)
-        if 'HEAD' in files and 'objects' in dirs and 'refs' in dirs:
-            raise ValueError('an ignored folder holds a bare repository; refused')
-        for f in files:
-            if f.casefold() == '.git' or (not dependency and SECRET_OR_RECORD_FILE.search(f)):
-                raise ValueError('an ignored folder holds a secret, key, database, log or nested repository file (%s)' % f)
-        seen += len(dirs) + len(files)
-        if seen > IGNORED_SCAN_LIMIT:
-            raise ValueError('an ignored folder is too large to check; refused')
-        try:
-            newest = max(newest, os.lstat(root).st_mtime_ns)
-            if manifest is not None:
+    def drain(keep):
+        while len(pending) > keep:
+            try:
+                manifest.update(pending.popleft().result())
+            except OSError:
+                raise ValueError('an ignored folder could not be inspected; refused')
+
+    try:
+        for root, dirs, files in os.walk(path, followlinks=False, onerror=unreadable):
+            dirs.sort()
+            files.sort()
+            for d in dirs:
+                if d.casefold() == '.git' or d.casefold() in (HARNESS_SEGMENTS if dependency else NEVER_SEGMENTS):
+                    raise ValueError('an ignored folder holds a nested repository or a Claude, session or log folder '
+                                     '(%s)' % d)
+            if 'HEAD' in files and 'objects' in dirs and 'refs' in dirs:
+                raise ValueError('an ignored folder holds a bare repository; refused')
+            for f in files:
+                if f.casefold() == '.git' or (not dependency and SECRET_OR_RECORD_FILE.search(f)):
+                    raise ValueError('an ignored folder holds a secret, key, database, log or nested repository file '
+                                     '(%s)' % f)
+            seen += len(dirs) + len(files)
+            if seen > IGNORED_SCAN_LIMIT:
+                raise ValueError('an ignored folder is too large to check; refused')
+            try:
+                newest = max(newest, os.lstat(root).st_mtime_ns)
+            except OSError:
+                raise ValueError('an ignored folder could not be inspected; refused')
+            if pool is not None:
                 rel_root = os.path.relpath(root, path)
                 for kind, names in (('d', dirs), ('f', files)):
                     for entry in names:
-                        st = os.lstat(os.path.join(root, entry))
-                        manifest.update(('%s\0%s\0%o\0%d\0%d\0%d\0%d\n' % (
-                            os.path.join(rel_root, entry), kind, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ino,
-                            st.st_ctime_ns)).encode('utf-8', 'surrogateescape'))
-        except OSError:
-            raise ValueError('an ignored folder could not be inspected; refused')
+                        batch.append((os.path.join(rel_root, entry), kind, os.path.join(root, entry)))
+                        if len(batch) >= MANIFEST_BATCH:
+                            pending.append(pool.submit(_manifest_rows, batch))
+                            batch = []
+                            drain(MANIFEST_IN_FLIGHT)
+        if pool is not None:
+            if batch:
+                pending.append(pool.submit(_manifest_rows, batch))
+            drain(0)
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
     return seen, newest
 
 
