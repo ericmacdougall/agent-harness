@@ -156,3 +156,26 @@ export function trailOf(messages, id) {
 }
 // An ask still needs the user until a reply of theirs is on its way (a failed or rejected send does not count).
 export const waitingOnUser = (messages, ask) => !trailOf(messages, ask.id).some(t => !['failed', 'forged'].includes(t.message.status));
+
+// ---- initiative live fields: derived from the owners, WAL notes, asks and pushes the page already has, so a row is
+// current even when initiatives.json (names, links, estimates) was last edited hours ago.
+export const STALE_AFTER_MS = 30 * 60 * 1000;
+export const ticketKey = value => String(value || '').trim().toLowerCase().replace(/^goodqa\s+/, '');
+export function liveFields(item, owners = [], asks = [], events = [], now = Date.now()) {
+  const key = ticketKey(item.ticket);
+  const number = (key.match(/#(\d+)$/) || [])[1] || '';
+  const linked = owners.filter(o => o.initiative_id === item.id || (key && ticketKey(o.ticket) === key));
+  const rank = o => (['live', 'working'].includes(o.state) ? 0 : 1);
+  const owner = [...linked].sort((a, b) => rank(a) - rank(b) || String(b.last_item?.active || '').localeCompare(String(a.last_item?.active || '')))[0] || null;
+  const notes = linked.filter(o => o.last_item?.at).sort((a, b) => b.last_item.at.localeCompare(a.last_item.at));
+  const note = notes[0] ? { text: notes[0].last_item.note, at: notes[0].last_item.at, by: notes[0].name } : null;
+  const openAsks = key ? asks.filter(a => ticketKey(a.ticket) === key).length : 0;
+  const branchHas = number ? new RegExp(`(^|\\D)${number}(\\D|$)`) : null;
+  const push = branchHas ? events.filter(e => e.kind === 'push' && branchHas.test(e.subject?.branch || ''))
+    .sort((a, b) => b.ts.localeCompare(a.ts))[0] || null : null;
+  const stamps = [owner?.last_item?.active, note?.at, push?.ts, validIso(item.updated)].filter(Boolean);
+  const updated = stamps.sort().pop() || null;
+  const stale = !updated || now - Date.parse(updated) > STALE_AFTER_MS;
+  return { owner: owner ? { name: owner.name, state: owner.state, runtime: owner.runtime } : null, note, openAsks,
+    push: push ? { summary: push.summary, at: push.ts } : null, updated, stale };
+}

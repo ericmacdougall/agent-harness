@@ -175,3 +175,26 @@ test('needs you: a reply leaves a trail with read time and main\'s answer, and t
   const pending = [{ id: 'local-k9', client_key: 'k9', from: 'user', to: 'claude', text: '[ask:wnone] on its way', ts: '2026-11-10T02:04:00Z', status: 'sending' }];
   assert.equal(adapt.waitingOnUser(adapt.messages(chat, pending), { id: 'wnone' }), false);  // shown as answered at once
 });
+
+test('initiative live fields come from owners, notes, asks and pushes, and go stale after 30 minutes', () => {
+  const now = Date.parse('2026-11-10T03:00:00Z');
+  const item = { id: 'goodqa_15585', ticket: 'goodqa#15585', updated: '2026-11-10T00:52:00Z' };
+  const owners = [
+    { agent_id: 'a1', name: 'a1', state: 'idle', ticket: 'GoodQA goodqa#15585', runtime: 'claude', last_item: { at: '2026-11-10T02:40:00Z', active: '2026-11-10T02:41:00Z', note: 'older note' } },
+    { agent_id: 'a2', name: 'a2', state: 'working', initiative_id: 'goodqa_15585', runtime: 'claude', last_item: { at: '2026-11-10T02:55:00Z', active: '2026-11-10T02:56:00Z', note: 'installed 07643c7' } },
+    { agent_id: 'a3', name: 'a3', state: 'live', ticket: 'goodqa#15586', runtime: 'claude', last_item: { at: '2026-11-10T02:59:00Z', note: 'other ticket' } },
+  ];
+  const asks = [{ id: 'w1', ticket: 'goodqa#15585' }, { id: 'w2', ticket: 'goodqa#155850' }, { id: 'w3', ticket: '' }];
+  const events = [{ kind: 'push', ts: '2026-11-10T02:50:00Z', summary: 'x: 1 commit(s) to feat/mission-control-15585', subject: { branch: 'feat/mission-control-15585' } },
+    { kind: 'push', ts: '2026-11-10T02:58:00Z', summary: 'other', subject: { branch: 'feat/x-155850' } }];
+  const live = adapt.liveFields(item, owners, asks, events, now);
+  assert.deepEqual(live.owner, { name: 'a2', state: 'working', runtime: 'claude' });
+  assert.equal(live.note.text, 'installed 07643c7');
+  assert.equal(live.openAsks, 1);
+  assert.equal(live.push.at, '2026-11-10T02:50:00Z');
+  assert.equal(live.updated, '2026-11-10T02:56:00Z');
+  assert.equal(live.stale, false);
+  const quiet = adapt.liveFields({ id: 'z', ticket: 'goodqa#1', updated: '2026-11-10T02:00:00Z' }, owners, asks, events, now);
+  assert.equal(quiet.owner, null);
+  assert.equal(quiet.stale, true);  // only the hand-edited time, an hour old
+});

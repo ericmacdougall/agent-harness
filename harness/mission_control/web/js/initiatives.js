@@ -1,5 +1,6 @@
 import { getState, subscribe, select, highlight } from './store.js';
-import { el, button, progress, checklist, eta, stateClass } from './ui.js';
+import { el, button, progress, checklist, eta, stateClass, age } from './ui.js';
+import { liveFields } from './adapt.js';
 
 export function mountInitiatives() {
   const list = document.getElementById('initiatives-list');
@@ -18,16 +19,26 @@ export function mountInitiatives() {
       title.addEventListener('blur', () => highlight(null));
       card.addEventListener('pointerenter', () => highlight(item.id));
       card.addEventListener('pointerleave', () => highlight(null));
-      const owner = state.owners.find(owner => owner.initiative_id === item.id && owner.state === 'live') || state.owners.find(owner => owner.initiative_id === item.id);
+      const live = liveFields(item, state.owners, state.asks, state.events, state.now);
+      const owner = live.owner;
       const ownerLine = el('div', 'initiative-owner');
-      ownerLine.append(el('span', '', owner?.runtime === 'codex' ? '◇' : '✳'), el('span', '', owner ? `${owner.name} · ${owner.runtime} · ${owner.state}` : (item.owner || 'no owner')));
+      ownerLine.append(el('span', '', owner?.runtime === 'codex' ? '◇' : '✳'), el('span', '', owner ? `${owner.name} · ${owner.runtime} · ${owner.state}` : (item.owner ? `${item.owner} · no live owner` : 'no owner')));
+      const liveBox = el('div', 'initiative-live');
+      if (live.note) liveBox.append(el('p', 'initiative-live-note', `“${live.note.text}” · ${live.note.by} · ${age(live.note.at, state.now)}`));
+      const facts = [];
+      if (live.openAsks) facts.push(`${live.openAsks} open ask${live.openAsks === 1 ? '' : 's'}`);
+      if (live.push) facts.push(`last push ${age(live.push.at, state.now)}`);
+      if (facts.length) liveBox.append(el('p', 'initiative-live-facts', facts.join(' · ')));
+      const updated = el('p', `initiative-updated${live.stale ? ' stale' : ''}`, live.updated ? `Updated ${age(live.updated, state.now)}${live.stale ? ' · no activity for over 30 min' : ''}` : 'No activity recorded');
+      liveBox.append(updated);
       const line = el('div', 'progress-line');
       line.append(progress(item), el('span', `progress-pct${item.pct === null ? ' unknown' : ''}`, item.pct === null ? '—' : `${item.pct}%`));
       const next = el('p', 'initiative-next');
       next.append(el('strong', '', 'Next  '), document.createTextNode(item.next_step || 'not set'));
       const estimates = el('div', 'initiative-estimates');
       estimates.append(el('p', 'eta', eta(item.next_eta, item.estimate_by, 'Next')), el('p', 'eta', eta(item.full_eta, item.estimate_by, 'Done')));
-      card.append(top, title, ownerLine, line, checklist(item, expanded.has(item.id)), next, estimates);
+      card.classList.toggle('stale-row', live.stale);
+      card.append(top, title, ownerLine, liveBox, line, checklist(item, expanded.has(item.id)), next, estimates);
       if (item.error) card.append(el('p', 'initiative-note error', `↳ Data error: ${item.error}`));
       else if (/at risk|blocked/i.test(item.state) && item.note) card.append(el('p', 'initiative-note', `↳ ${item.note.slice(0, 160)}`));
       fragment.append(card);
@@ -38,8 +49,9 @@ export function mountInitiatives() {
     document.getElementById('initiative-count').textContent = String(state.initiatives.length).padStart(2, '0');
   }
   render(getState());
+  setInterval(() => { if (!document.hidden) render(getState()); }, 30000);  // ages and the 30-min flag
   subscribe((state, reason) => {
-    if (reason === 'initiatives' || reason === 'owners') render(state);
+    if (['initiatives', 'owners', 'asks', 'seed'].includes(reason)) render(state);
     if (reason === 'highlight') list.querySelectorAll('article').forEach(card => card.classList.toggle('is-highlighted', card.dataset.id === state.highlight));
   });
 }
