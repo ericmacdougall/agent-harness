@@ -76,6 +76,25 @@ class Installer(unittest.TestCase):
         self.assertIn("not ours", install.timeout_shim_status(self.home, True, [str(self.bin)]))
         self.assertEqual((self.bin / "timeout").read_text(), "#!/bin/sh\necho mine\n")
 
+    def test_a_planted_link_a_directory_or_a_lookalike_marker_is_never_written_through_or_replaced(self):
+        # red-team ad4294 C2
+        victim = self.home / "victim.txt"
+        victim.write_text("keep me")
+        os.symlink(victim, self.bin / f".timeout.tmp{os.getpid()}")  # planted at the temp name
+        status = install.timeout_shim_status(self.home, True, [str(self.bin)])
+        self.assertIn("not placed", status)
+        self.assertEqual(victim.read_text(), "keep me")
+        os.unlink(self.bin / f".timeout.tmp{os.getpid()}")
+        (self.bin / "timeout").mkdir()  # a directory named timeout must not abort the install
+        self.assertIn("not a regular file", install.timeout_shim_status(self.home, True, [str(self.bin)]))
+        os.rmdir(self.bin / "timeout")
+        (self.bin / "timeout").write_text("#!/bin/sh\necho mine\n# GoodQA #15565 is only a comment here\n")
+        self.assertIn("not ours", install.timeout_shim_status(self.home, True, [str(self.bin)]))
+        os.unlink(self.bin / "timeout")
+        os.symlink(victim, self.bin / "timeout")
+        self.assertIn("link", install.timeout_shim_status(self.home, True, [str(self.bin)]))
+        self.assertEqual(victim.read_text(), "keep me")
+
     def test_skips_when_local_bin_is_not_on_path(self):
         self.assertIn("not on PATH", install.timeout_shim_status(self.home, True, ["/usr/bin"]))
 

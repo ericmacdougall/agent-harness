@@ -951,10 +951,17 @@ def timeout_shim_status(home: Path, apply: bool, path_dirs=None) -> str:
     target = home / ".local" / "bin" / "timeout"
     source = ROOT / "harness" / "bin" / "timeout"
     shim = source.read_bytes()
-    if target.is_file() and not target.is_symlink():
-        if target.read_bytes() == shim:
+    if target.is_symlink() or (target.exists() and not target.is_file()):
+        return f"timeout shim: skipped ({target} is a link or not a regular file; not touched)"
+    if target.is_file():
+        try:
+            current = target.read_bytes()
+        except OSError:
+            return f"timeout shim: skipped ({target} cannot be read)"
+        if current == shim:
             return f"timeout shim: current at {target}"
-        if b"GoodQA #15565" not in target.read_bytes():
+        lines = current.split(b"\n", 2)
+        if len(lines) < 2 or not lines[1].startswith(b'"""timeout: a GNU-compatible stand-in'):  # our own shim's 2nd line
             return f"timeout shim: skipped ({target} exists and is not ours)"
     elif shutil.which("timeout", path=os.pathsep.join(dirs)) or shutil.which("gtimeout", path=os.pathsep.join(dirs)):
         return "timeout shim: not needed (timeout or gtimeout is on PATH)"
@@ -962,11 +969,16 @@ def timeout_shim_status(home: Path, apply: bool, path_dirs=None) -> str:
         return f"timeout shim: skipped ({target.parent} is not on PATH)"
     if not apply:
         return f"timeout shim: would place {target}"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(".timeout.tmp")
-    tmp.write_bytes(shim)
-    os.chmod(tmp, 0o755)
-    os.replace(tmp, target)
+    tmp = target.with_name(f".timeout.tmp{os.getpid()}")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # O_EXCL | O_NOFOLLOW: a planted link at the temp name is refused, never written through
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o755)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(shim)
+        os.replace(tmp, target)
+    except OSError as error:  # an install step that cannot place the shim reports it and goes on
+        return f"timeout shim: not placed ({error.__class__.__name__}: {error.strerror or error})"
     return f"timeout shim: placed {target}"
 
 
