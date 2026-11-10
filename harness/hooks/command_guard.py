@@ -3265,7 +3265,12 @@ class Analyzer:
             self.xargs_input(args, pl.cmds[idx] if pl is not None and idx < len(pl.cmds) else None)
             self._replacement_strings(texts, False)  # before git() sees `xargs -I % git % remove`
             while i < len(args) and texts[i].startswith('-'):
-                i += 2 if texts[i] in ('-n', '-I', '-J', '-R', '-S', '-P', '-d', '-L', '-a', '-E', '-s') else 1
+                # codex r8 F1: a bundle ending in a value letter (`-tI XX`, `-0n 1`) also takes the next word
+                bundle = texts[i][1:] if not texts[i].startswith('--') else ''
+                ends_in_value = next((not bundle[k + 1:] for k, ch in enumerate(bundle)
+                                      if ch in 'nIJRSPdLaEs'), False)
+                takes_value = texts[i] in ('-n', '-I', '-J', '-R', '-S', '-P', '-d', '-L', '-a', '-E', '-s')
+                i += 2 if takes_value or ends_in_value else 1
             if i < len(args) and self._placeholder(args[i]):
                 # goodqa#15346 codex F2 audit: `echo git | xargs -I{} {} worktree remove P` runs a program named by its input
                 ctx.add(LOG_DELETE, 'linked-worktree-remove',
@@ -3333,25 +3338,101 @@ class Analyzer:
                                '--basenameextensionreplace', '--seqreplace', '--slotreplace', '--header', '--csv',
                                '--null', '-0', '--trim', '--sqlworker', '--sqlandworker', '-s', '--max-chars')
 
-    def _replacement_strings(self, texts, parallel):
-        """goodqa#15346 codex F2 audit: the -I/-J/-i/--replace strings of an xargs or parallel command. They are
-        remembered for the rest of the analysis so git() treats a word holding one as data (`xargs -I % git % remove`)."""
-        found = []
+    # goodqa#15565 codex r8 F1: every GNU parallel option that defines or renames a replacement string. parallel parses
+    # with Getopt::Long, so any unique prefix of a long option works (`--repl XX` is --replace) and single-letter options
+    # bundle (`-kIXX` is -k -I XX). --replace and -i take an optional value: the next word when it is not an option.
+    PARALLEL_RENAMES = ('replace', 'extensionreplace', 'er', 'basenamereplace', 'bnr', 'dirnamereplace', 'dnr',
+                        'basenameextensionreplace', 'bner', 'seqreplace', 'slotreplace', 'rpl', 'parens')
+    XARGS_RENAMES = ('replace',)  # GNU xargs: --replace[=R] (an optional value only after =), -i[R], -I R; BSD -J R
+    # single-letter options whose value is the rest of the bundle or the next word: a bundle ends at one of them
+    PARALLEL_LETTER_VALUES = frozenset('aCdEjJLlnNPSsI')
+    XARGS_LETTER_VALUES = frozenset('adEeIJLlnPRSs')
+
+    def _replacement_options(self, texts, parallel):
+        """goodqa#15565 codex r8 F1: (option, value) for every option of an xargs or parallel command that defines a
+        replacement string, in any spelling: separate or attached value, `=`, an abbreviated long option, a bundle.
+        The value is None when an optional value is absent. An abbreviation matching several options yields each."""
+        renames = self.PARALLEL_RENAMES if parallel else self.XARGS_RENAMES
+        letters = self.PARALLEL_LETTER_VALUES if parallel else self.XARGS_LETTER_VALUES
         for k, t in enumerate(texts):
-            if t in ('-I', '-J') and k + 1 < len(texts):
-                found.append(texts[k + 1])
-            elif t.startswith(('-I', '-J')) and len(t) > 2:
-                found.append(t[2:])
-            elif t.startswith('--replace='):
-                found.append(t.split('=', 1)[1])
-            elif t in ('-i', '--replace'):
-                found.append('{}')
-            elif t.startswith('-i') and len(t) > 2 and not parallel:
-                found.append(t[2:])
+            nxt = texts[k + 1] if k + 1 < len(texts) else None
+            if t.startswith('--') and len(t) > 2:
+                name, eq, val = t[2:].partition('=')
+                if parallel and 'plus'.startswith(name):
+                    yield 'plus', None
+                for opt in [n for n in renames if n == name] or [n for n in renames if n.startswith(name)]:
+                    if eq:
+                        yield opt, val
+                    elif opt != 'replace':
+                        yield opt, nxt
+                    else:  # optional value: parallel takes the next word unless it looks like an option; xargs never
+                        yield opt, nxt if parallel and nxt is not None and not nxt.startswith('-') else None
+            elif t.startswith('-') and len(t) > 1:
+                for pos, ch in enumerate(t[1:], 1):
+                    rest = t[pos + 1:]
+                    if ch in ('I', 'J'):
+                        yield ch, rest or nxt
+                        break
+                    if ch == 'i':
+                        yield 'i', rest or (nxt if parallel and nxt is not None and not nxt.startswith('-') else None)
+                        break
+                    if ch in letters:
+                        break
+
+    def _parallel_rename_width(self, t, nxt):
+        """How many words a parallel replacement option spans: 2 when its value is the next word, 1 when attached or
+        absent, None when `t` is not such an option (or, for a bundle, ends without one)."""
+        if t.startswith('--'):
+            name, eq, _val = t[2:].partition('=')
+            opts = [n for n in self.PARALLEL_RENAMES if n == name] or [n for n in self.PARALLEL_RENAMES if name and
+                                                                        n.startswith(name)]
+            if not opts:
+                return None
+            if eq or nxt is None:
+                return 1
+            return 2 if any(o != 'replace' for o in opts) or not nxt.startswith('-') else 1
+        if t.startswith('-') and len(t) > 1:
+            for pos, ch in enumerate(t[1:], 1):
+                if ch == 'i' or ch in self.PARALLEL_LETTER_VALUES:
+                    if t[pos + 1:] or nxt is None or (ch == 'i' and nxt.startswith('-')):
+                        return 1 if ch in 'iI' else None
+                    return 2 if ch in 'iI' else None
+        return None
+
+    def _replacement_info(self, texts, parallel):
+        """The replacement strings of an xargs or parallel command, and whether any of them is computed in a way the
+        guard cannot reproduce (a perl expression from --rpl or --parens, the --plus forms, a basename, an extension,
+        a sequence number): such a command is never enumerated, only judged literally with the strings as data.
+        The strings are remembered for the rest of the analysis so git() and _placeholder_program treat a word holding
+        one as data (`xargs -I % git % remove`, `parallel --rpl 'XX ...' 'git XX remove P' ::: x`)."""
+        found, opaque, any_brace = [], False, False
+        for opt, value in self._replacement_options(texts, parallel):
+            if opt == 'plus':
+                opaque = any_brace = True  # --plus adds {:n} {#re} {%re} {/re/s} {choose_k} ...: every {...} is data
+                continue
+            if opt in ('I', 'J', 'i', 'replace'):
+                found.append(value if value is not None else '{}')
+                continue
+            opaque = True
+            value = value or ''
+            if opt == 'rpl':  # --rpl 'TAG perl': TAG is replaced; a {TAG} also has positional forms ({2TAG})
+                tag = value.split(None, 1)[0] if value.strip() else ''
+                found.append(tag)
+                any_brace = any_brace or (tag.startswith('{') and tag.endswith('}'))
+            elif opt == 'parens':  # the {= =} delimiters, both halves of one string: LEFT perl RIGHT
+                found.append(value[:len(value) // 2] or value)
+            else:
+                found.append(value)
         found = [r for r in found if r]
         if found:
             self.ctx.replstrs = set(getattr(self.ctx, 'replstrs', ())) | set(found)
-        return found
+        if any_brace:
+            self.ctx.repl_any_brace = True
+        return found, opaque
+
+    def _replacement_strings(self, texts, parallel):
+        """goodqa#15346 codex F2 audit: the -I/-J/-i/--replace strings of an xargs or parallel command."""
+        return self._replacement_info(texts, parallel)[0]
 
     def _parallel_program_starts(self, texts, cut):
         """Where parallel's command may begin: after its options and their values, and also one word later when the
@@ -3359,8 +3440,11 @@ class Analyzer:
         j, unknown_before = 0, False
         while j < cut and texts[j].startswith('-'):
             t = texts[j]
+            width = self._parallel_rename_width(t, texts[j + 1] if j + 1 < cut else None)
             if t in self.PARALLEL_VALUE_OPTS:
                 j, unknown_before = j + 2, False
+            elif width:  # codex r8 F1: `--replace XX`, `--er XX`, `-kI XX` take the next word; `-kIXX` does not
+                j, unknown_before = j + width, False
             else:
                 j, unknown_before = j + 1, '=' not in t and t not in ('-k', '--keep-order', '-v', '--verbose', '-q',
                                                                       '--quote', '--dry-run', '--tag', '-u', '-g')
@@ -3397,7 +3481,7 @@ class Analyzer:
             start, shell = False, posixpath.basename(tok) in SHELLS or tok == 'eval'
         return False
 
-    def parallel_jobs(self, texts, stops, starts, repl, depth):
+    def parallel_jobs(self, texts, stops, starts, repl, depth, opaque=False):
         """goodqa#15346 codex F2: substitute every argument combination into every possible command of a parallel
         command and judge each job. Returns True when every job was judged; False when the arguments cannot be
         enumerated (a file, columns, several per job): the caller judges the command literally. More than
@@ -3425,7 +3509,7 @@ class Analyzer:
                          % PARALLEL_MAX_COMBINATIONS)
             return False
         head = texts[:stops[0]]
-        if any(s is None for s in sources) or any(
+        if opaque or any(s is None for s in sources) or any(
                 t in self.PARALLEL_NOT_ENUMERABLE or t.split('=', 1)[0] in self.PARALLEL_NOT_ENUMERABLE for t in head
                 if t.startswith('-')) or any('{=' in t for t in head):
             return False
@@ -3482,10 +3566,10 @@ class Analyzer:
         texts = [a.text for a in args]
         stops = [k for k, t in enumerate(texts) if t.startswith(':::')] if parallel else []
         cut = stops[0] if stops else len(texts)
-        repl = self._replacement_strings(texts[:cut], parallel)
+        repl, opaque = self._replacement_info(texts[:cut], parallel)
         starts = self._parallel_program_starts(texts, cut) if parallel else []
         # codex F2: every job of a parallel command with its data on the command line is judged, or the command is refused
-        enumerated = parallel and self.parallel_jobs(texts, stops, starts, repl, depth)
+        enumerated = parallel and self.parallel_jobs(texts, stops, starts, repl, depth, opaque)
         if parallel and not enumerated and any(self._placeholder_program(' '.join(texts[p:cut])) for p in starts):
             ctx.add(LOG_DELETE, 'linked-worktree-remove',
                     'a command name supplied by parallel data the guard cannot see cannot be verified',
@@ -3844,7 +3928,8 @@ class Analyzer:
         """goodqa#15346 codex F2 audit: the word holds a GNU parallel replacement string or an xargs/parallel -I/-J
         replacement seen in this command, so its text is only known at run time."""
         text = word.text
-        return bool(PARALLEL_PLACEHOLDER.search(text) or any(r in text for r in getattr(self.ctx, 'replstrs', ()) if r))
+        return bool(PARALLEL_PLACEHOLDER.search(text) or any(r in text for r in getattr(self.ctx, 'replstrs', ()) if r)
+                    or (getattr(self.ctx, 'repl_any_brace', False) and re.search(r'\{[^{}]*\}', text)))
 
     GIT_ENV_CONFIG = re.compile(r'\b(GIT_CONFIG_(?:KEY_\w*|PARAMETERS|GLOBAL|SYSTEM)|GIT_CONFIG(?![A-Za-z0-9_]))'
                                 r'(?:=((?:\'[^\']*\'|"[^"]*"|[^\s;|&()<>])*))?')

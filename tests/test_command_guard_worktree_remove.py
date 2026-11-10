@@ -568,5 +568,98 @@ class WorktreeRemoveIndirectRound3(WorktreeRemoveCase):
         self.assertEqual(self.decide('git worktree remove %s' % p)[0], 'allow')
 
 
+class WorktreeRemoveIndirectRound4(WorktreeRemoveCase):
+    """goodqa#15565 codex r8 on f28bfce (BLOCK) F1: a GNU parallel replacement string named by `--replace XX` (separate
+    value), an attached or bundled -I/-i, an abbreviated long option, or a renaming option whose substitution the guard
+    cannot reproduce (--rpl, --er/--bnr/--dnr/--bner, --seqreplace, --slotreplace, --parens, --plus) hid the git
+    subcommand or the program. Every spelling, every data source (::: :::: stdin), quoted and unquoted templates."""
+
+    def setUp(self):
+        super().setUp()
+        self.p = str(self.linked)
+        self.lst = self.home / 'list.txt'
+        self.lst.write_text('worktree\n')
+
+    def blocked(self, forms):
+        return [c[:160] for c in forms if self.decide(c)[0] != 'block']
+
+    def sources(self, opts, tmpl, arg='worktree'):
+        """The same template with its data after :::, in a :::: file and on stdin; quoted and unquoted."""
+        quoted = "'%s'" % tmpl
+        return ['parallel %s %s ::: %s' % (opts, quoted, arg), 'parallel %s %s ::: %s' % (opts, tmpl, arg),
+                'parallel %s %s :::: %s' % (opts, quoted, self.lst), 'cat %s | parallel %s %s' % (self.lst, opts, quoted),
+                'parallel %s %s < %s' % (opts, tmpl, self.lst)]
+
+    def test_r8_reviewer_forms_block(self):
+        p = self.p
+        forms = (
+            "parallel --replace XX 'git XX remove --force %s' ::: worktree" % p,
+            "parallel --rpl 'XX $_=\"worktree\"' 'git XX remove --force %s' ::: x" % p,
+            "parallel --extensionreplace XX 'git XX remove --force %s' ::: worktree.x" % p,
+        )
+        self.assertEqual(self.blocked(forms), [], 'a reviewer form of r8 F1 slipped through')
+
+    def test_r8_separate_value_replacement_strings_block(self):
+        tmpl = 'git XX remove --force %s' % self.p
+        forms = []
+        for opts in ('--replace XX', '-i XX', '-k --replace XX', '-I XX', '-kI XX', '--repl XX', '--replac XX'):
+            forms += self.sources(opts, tmpl)
+        self.assertEqual(self.blocked(forms), [], 'a separate-value replacement string slipped through')
+
+    def test_r8_attached_value_replacement_strings_block(self):
+        tmpl = 'git XX remove --force %s' % self.p
+        forms = []
+        for opts in ('--replace=XX', '-IXX', '-kIXX', '-iXX', '-kiXX', '--repl=XX'):
+            forms += self.sources(opts, tmpl)
+        self.assertEqual(self.blocked(forms), [], 'an attached replacement string slipped through')
+
+    def test_r8_renaming_options_block(self):
+        tmpl = 'git XX remove --force %s' % self.p
+        forms = []
+        for opts in ('--er XX', '--er=XX', '--extensionreplace=XX', '--ext XX', '--bnr XX', '--basenamereplace XX',
+                     '--dnr XX', '--dirnamereplace=XX', '--bner XX', '--basenameextensionreplace XX', '--seqreplace XX',
+                     '--slotreplace XX', '--slotreplace=XX', "--rpl 'XX s/x/w/'", "--rpl='XX s/x/w/'",
+                     "-k --rpl 'XX $_=\"worktree\"'"):
+            forms += self.sources(opts, tmpl, 'worktree.x')
+        self.assertEqual(self.blocked(forms), [], 'a renaming option slipped through')
+
+    def test_r8_unverifiable_substitution_in_program_or_worktree_position_blocks(self):
+        p = self.p
+        forms = []
+        forms += self.sources("--rpl 'XX $_=\"git\"'", 'XX worktree remove --force %s' % p, 'x')   # program position
+        forms += self.sources('--er XX', 'XX worktree remove --force %s' % p, 'git.x')
+        forms += self.sources('--slotreplace XX', 'git worktree XX --force %s' % p, 'x')      # worktree subcommand
+        forms += self.sources("--rpl '{w} $_=\"worktree\"'", 'git {1w} remove --force %s' % p, 'x')  # positional tag
+        forms += self.sources('--plus', 'git {:1} remove --force %s' % p, 'xworktree')     # a --plus string
+        # --parens ,,,, makes ,,perl,, the perl expression (the man page's own example)
+        forms += self.sources('--parens ,,,,', ',,s/x/git/,, worktree remove --force %s' % p, 'x')
+        forms += self.sources('--parens=,,,,', 'git ,,$_=\"wor\".\"ktree\",, remove --force %s' % p, 'x')
+        # abbreviated renaming options are not in the not-enumerable table: enumerating them would substitute the raw
+        # argument (git.x, x) where parallel substitutes git and the perl result
+        forms += self.sources('--ext XX', 'XX worktree remove --force %s' % p, 'git.x')
+        forms += self.sources("--rp 'XX $_=\"wor\".\"ktree\"'", 'git XX remove --force %s' % p, 'x')
+        forms.append("parallel -I XX 'XX worktree remove --force %s' ::: git" % p)
+        forms.append("parallel --replace -k 'git {} remove --force %s' ::: worktree" % p)  # no value: the default {}
+        self.assertEqual(self.blocked(forms), [], 'an unverifiable substitution slipped through')
+
+    def test_r8_xargs_bundled_replacement_blocks(self):
+        lst = self.lst
+        forms = ("xargs -tI XX git XX remove --force < %s" % lst, "xargs -tIXX git XX remove --force < %s" % lst,
+                 "xargs -0iXX git XX remove --force < %s" % lst, "xargs --replace=XX git XX remove --force < %s" % lst)
+        self.assertEqual(self.blocked(forms), [], 'a bundled xargs replacement string slipped through')
+
+    def test_r8_harmless_forms_stay_allowed(self):
+        lst, primary = self.lst, self.primary
+        for c in ("parallel --replace XX 'echo XX' ::: a b", "cat %s | parallel --replace XX 'echo XX'" % lst,
+                  "cat %s | parallel -kI XX 'echo XX'" % lst, "cat %s | parallel -kIXX 'echo XX'" % lst,
+                  "parallel -k --er XX 'gzip XX' ::: a.txt", "parallel --bnr XX 'echo XX' :::: %s" % lst,
+                  "cat %s | parallel --rpl 'XX s/a/b/' 'echo XX'" % lst, "parallel --plus 'echo {%.txt}' ::: a.txt",
+                  "parallel --rpl '{r} s/a/b/' 'echo {r}' ::: a", "parallel -I XX 'git -C XX status' ::: %s" % primary,
+                  "parallel --replace=XX 'git -C XX status' ::: %s" % primary, "parallel --seqreplace N 'echo N {}' ::: a",
+                  "xargs -tI XX echo XX < %s" % lst, "parallel --replace 'echo {}' ::: a"):
+            self.assertEqual(self.decide(c)[0], 'allow', c)
+        self.assertEqual(self.decide('git worktree remove %s' % self.p)[0], 'allow')
+
+
 def cg_quote(text):
     return text if text.isalnum() else "'" + text.replace("'", "'\\''") + "'"
