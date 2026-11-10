@@ -1,0 +1,7 @@
+Checkpoint 1 (plan) for Lab E.
+
+Done: ticket and WAL scope; t2-dev ~/lab-e (venv, llama-cpp-python 0.3.36, numpy, sklearn); public data pulled and licence-checked: Baton Rouge Legacy Purchase Orders (Public Domain, 49,308 rows: 13,501 headers, 35,807 line items) and Oregon Lottery POs (US Gov public domain, 24k lines); models Qwen2.5-3B and 1.5B Instruct Q4_K_M (open weight, local). Benchmark on shared 48-core t2-dev, 12 threads, 140-token prompt, 160 tokens out: 3B about 9 s per doc, 1.5B about 3 s per doc (warm). Footprint 3.5 GB of 45 GB free, Mac untouched.
+
+Design: ERP PO record + supplier email -> extractor -> deterministic checker -> confirm / reject / needs-human. Emails are generated via claude CLI (sonnet, batched) from real PO lines with a behaviour spec (exact, qty change, price change, date slip, substitution, partial, reject, ambiguous, off-topic, plus style/noise variants). ASSUMPTION: synthetic emails on real PO data, because no labelled public supplier-email corpus exists; label noise measured by an independent second audit.
+Splits by PO hash: train/few-shot pool, dev (tuning), H1 held-out n>=400 opened once, H2 fresh n>=400 for the tune-on-test demonstration. Systems: S0 regex, S1 local 3B zero-shot, S2 local 3B + validators/abstain, S3 retrieved few-shot, S4 claude reference. Gate: preregistered file hashed before H1 opens.
+Next: PO case builder, generation, audit, then systems on dev.
