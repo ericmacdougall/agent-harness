@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import secrets
 import shutil
 import stat
@@ -149,7 +150,7 @@ LAUNCHER_MARK = "# agent-harness mission-control launcher"
 def launcher_text(home: Path) -> str:
     server = app_dir(home) / "server.py"
     return (f"#!/bin/sh\n{LAUNCHER_MARK}: opens the dashboard with a fresh one-time link.\n"
-            f"exec /usr/bin/python3 \"{server}\" open \"$@\"\n")
+            f"exec /usr/bin/python3 {shlex.quote(str(server))} open \"$@\"\n")
 
 
 def install_launcher(home: Path) -> str:

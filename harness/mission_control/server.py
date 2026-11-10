@@ -112,7 +112,26 @@ class Auth:
         self.sessions: dict[str, dict] = {}
         self.hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
         self.origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+        self.key = self._current_key()
         self._load()
+
+    def _current_key(self) -> str | None:
+        try:
+            return self._key_id()
+        except Exception:  # noqa: BLE001 - no readable secret
+            return None
+
+    def _key_check_locked(self) -> bool:
+        """False when no secret is readable. A rotated secret (rotate-secret, from another process) signs every
+        session out at once and is never saved under the new key (red-team M1)."""
+        current = self._current_key()
+        if current is None:
+            return False
+        if current != self.key:
+            self.sessions.clear()
+            self.key = current
+            self._save_locked()
+        return True
 
     @staticmethod
     def _hash(sid: str) -> str:
@@ -129,7 +148,7 @@ class Auth:
             return
         data = mc_chat.read_json(self.store, limit=SESSION_STORE_MAX)
         try:
-            if not isinstance(data, dict) or data.get("v") != 1 or data.get("key") != self._key_id():
+            if not isinstance(data, dict) or data.get("v") != 1 or self.key is None or data.get("key") != self.key:
                 return  # absent, damaged, or written under another secret: start signed out
         except Exception:  # noqa: BLE001 - no readable secret: start signed out
             return
@@ -139,18 +158,23 @@ class Auth:
             if not (isinstance(key, str) and len(key) == 64 and isinstance(row, dict)):
                 continue
             created, last = row.get("created"), row.get("last")
-            if not all(isinstance(v, (int, float)) for v in (created, last)) or now - last > SESSION_TTL_S:
+            if not all(isinstance(v, (int, float)) for v in (created, last)) or self._expired(created, last, now):
                 continue
             self.sessions[key] = {"created": float(created), "last": float(last), "saved": float(last)}
         while len(self.sessions) > MAX_SESSIONS:
             self.sessions.pop(min(self.sessions, key=lambda k: self.sessions[k]["last"]))
 
+    @staticmethod
+    def _expired(created: float, last: float, now: float) -> bool:
+        # idle limit, and an absolute limit matching the cookie's Max-Age, so a busy tab cannot live forever (L1)
+        return now - last > SESSION_TTL_S or now - created > SESSION_TTL_S
+
     def _save_locked(self) -> None:
-        if self.store is None:
+        if self.store is None or self.key is None:
             return
         rows = {k: {"created": v["created"], "last": v["last"]} for k, v in self.sessions.items()}
         try:
-            mc_chat.write_json(self.store, {"v": 1, "key": self._key_id(), "sessions": rows})
+            mc_chat.write_json(self.store, {"v": 1, "key": self.key, "sessions": rows})
             for v in self.sessions.values():
                 v["saved"] = v["last"]
         except Exception:  # noqa: BLE001 - sessions still work in memory; a restart signs out, as before
@@ -193,6 +217,8 @@ class Auth:
         if payload in self.used:
             return None
         self.used[payload] = now
+        if not self._key_check_locked():
+            return None
         if len(self.sessions) >= MAX_SESSIONS:
             oldest = min(self.sessions, key=lambda s: self.sessions[s]["last"])
             self.sessions.pop(oldest, None)
@@ -212,15 +238,21 @@ class Auth:
             return None, None
         key = self._hash(sid)
         with self.lock:
+            if not self._key_check_locked():
+                return None, None  # no secret: a clean sign-out, not a 500 (L9)
             info = self.sessions.get(key)
-            if not info or now - info["last"] > SESSION_TTL_S:
+            if not info or self._expired(info["created"], info["last"], now):
                 if self.sessions.pop(key, None) is not None:
                     self._save_locked()
                 return None, None
             info["last"] = now
             if now - info.get("saved", 0) >= TOUCH_PERSIST_S:
                 self._save_locked()
-        return sid, {"csrf": self._csrf(sid), "created": info["created"], "last": now}
+        try:
+            csrf = self._csrf(sid)
+        except Exception:  # noqa: BLE001 - the secret vanished mid-request
+            return None, None
+        return sid, {"csrf": csrf, "created": info["created"], "last": now}
 
     def revoke_all(self) -> None:
         with self.lock:

@@ -72,6 +72,34 @@ class PersistentSessions(unittest.TestCase):
         self.store.write_text("{not json")
         self.assertEqual(auth(self.store).sessions, {})  # damaged file: signed out, no crash
 
+    def test_rotating_the_secret_under_a_running_server_signs_everyone_out(self):  # red-team M1
+        secret = {"key": KEY}
+        running = mcs.Auth(lambda: secret["key"], 47615, store=self.store)
+        sid = running.redeem(mcs.mint_code(KEY))
+        secret["key"] = b"r" * 32  # rotate-secret runs in another process
+        later = time.time() + mcs.TOUCH_PERSIST_S + 5
+        self.assertEqual(running.session(cookie(sid), now=later), (None, None))  # at once, no restart needed
+        running.redeem(mcs.mint_code(b"r" * 32))  # a new login saves under the new key...
+        restarted = mcs.Auth(lambda: secret["key"], 47615, store=self.store)
+        self.assertEqual(restarted.session(cookie(sid)), (None, None))  # ...without the old session
+        self.assertEqual(len(restarted.sessions), 1)
+
+    def test_a_session_has_an_absolute_lifetime_and_a_missing_secret_signs_out(self):  # red-team L1, L9
+        first = auth(self.store)
+        start = time.time()
+        sid = first.redeem(mcs.mint_code(KEY), now=start)
+        step = start
+        while step < start + mcs.SESSION_TTL_S - 60:  # kept busy, never idle
+            step += 3600
+            self.assertIsNotNone(first.session(cookie(sid), now=step)[0])
+        self.assertEqual(first.session(cookie(sid), now=start + mcs.SESSION_TTL_S + 5), (None, None))
+
+        def missing():
+            raise FileNotFoundError("secret")
+        sid2 = first.redeem(mcs.mint_code(KEY))
+        first.key_loader = missing
+        self.assertEqual(first.session(cookie(sid2)), (None, None))
+
     def test_a_symlinked_store_is_not_read(self):
         real = Path(self.tmp.name) / "elsewhere.json"
         writer = auth(real)
@@ -95,6 +123,14 @@ class PersistentSessions(unittest.TestCase):
         finally:
             os.environ.clear()
             os.environ.update(os.environ_backup)
+
+
+class LauncherQuoting(unittest.TestCase):
+    def test_a_home_with_shell_metacharacters_is_quoted(self):  # red-team L2
+        import shlex
+        home = Path('/tmp/o"$(touch pwned)`x`\\ q')
+        argv = shlex.split(mci.launcher_text(home).splitlines()[-1])
+        self.assertEqual(argv[:3], ["exec", "/usr/bin/python3", str(mci.app_dir(home) / "server.py")])
 
 
 class SignInHints(unittest.TestCase):
@@ -123,7 +159,7 @@ class SignInHints(unittest.TestCase):
             launcher = home / ".local" / "bin" / "mc"
             self.assertTrue(os.access(launcher, os.X_OK))
             text = launcher.read_text()
-            target = re.search(r'exec /usr/bin/python3 "([^"]+)" open', text).group(1)
+            target = __import__("shlex").split(text.splitlines()[-1])[2]
             self.assertTrue(Path(target).is_file())
             self.assertIn("launcher", mci.install_launcher(home))  # our own launcher is refreshed
             launcher.write_text("#!/bin/sh\necho midnight commander\n")

@@ -25,7 +25,8 @@ function renderTrail(box, trail) {
   for (const entry of trail) {
     const mine = el('li', 'needs-trail-item');
     const head = el('div', 'needs-trail-head');
-    head.append(el('span', 'needs-trail-who', 'You'), el('span', '', time(entry.message.ts)));
+    const forged = entry.message.status === 'forged';  // planted in the store, not sent from this page (L5)
+    head.append(el('span', `needs-trail-who${forged ? ' forged' : ''}`, forged ? 'Not from you' : 'You'), el('span', '', time(entry.message.ts)));
     const status = el('span', `needs-trail-status ${entry.message.status}`, SENT_TEXT[entry.message.status] || entry.message.status);
     if (entry.message.read_at) status.textContent += ` at ${time(entry.message.read_at)} (${gap(entry.message.ts, entry.message.read_at)})`;
     mine.append(head, el('p', 'needs-trail-text', entry.text), status);
