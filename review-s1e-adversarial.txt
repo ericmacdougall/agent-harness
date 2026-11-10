@@ -1,0 +1,116 @@
+ADVERSARIAL SPEC REVIEW: goodqa#15561 slice S1e (contact detail and timeline for a bound desktop session, on by default)
+Reviewer: agent a13ba6b81103d6a9d (red-team), auth and privacy domain
+Spec: /Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/agent-aaef3bc78b40c0c22/spec-15561-s1e.md
+Code read: t2-dev /home/eric/wt-15561 at 72290cc761e (origin/main, c81dfd8f live), read-only. Paths below are under apps/api/src unless noted.
+Date: 2026-11-09
+
+VERDICT: BLOCK
+
+Four high findings. Two of them contradict the code: D1 says crm.api.enabled applies, and the ASSUMPTION treats a bound session as a person. One is a target-fidelity gap: the user said "on by default" and the spec removes the off switch. One is an AC that a partial implementation still passes. All four can be fixed in the spec text before anyone writes code.
+
+---------------------------------------------------------------------------------------------------
+HIGH
+---------------------------------------------------------------------------------------------------
+
+F1 (CONFIRMED, contradicts code): the org CRM switch does NOT run for these two routes.
+  Spec D1: "Every other gate step still runs: ability ceiling, org allow-list (404), org agent-pause, org switches (`crm.api.enabled`), ..."
+  Code:
+   - Both routes are SESSION_ONLY: plugins/auth.ts:4641 'GET /v1/orgs/:p/crm/contacts/:p' and :4644 'GET /v1/orgs/:p/crm/contacts/:p/timeline'.
+   - The switch step is applyApiKeyOrgSwitchesForUserToken (plugins/auth.ts:6212). It begins
+       const resources = apiKeyRouteResources(req.method, routePattern);
+       if (!resources) { ...; return; }
+     and the CRM check comes later, at :6234 (`if (resources.includes('crm') && !isFeatureEnabled(..., CRM_API_KEY_FLAG)) throw 404`). apiKeyRouteResources (:5662) reads API_KEY_ALLOWED, which does not list session-only routes, so it returns undefined and the function exits early.
+   - The delegated door's crm_api_disabled branch (plugins/auth.ts:6320) also keys on apiKeyRouteResources(...)?.includes('crm'), so it never fires for these routes either.
+  Consequence: suppose an org admin turns CRM off for agents (crm.api.enabled off). The contact list is then refused with crm_api_disabled (pinned by test/user-token-desktop-session-delegation.test.ts:316). Yet contact detail and the full timeline (mail, SMS and call content) stay open to the same bound session. The spec says that control holds; it does not.
+  Fix: W4 must apply the CRM family switch to both routes itself (same 404 crm_api_disabled for a member org, plain 404 otherwise). Add a NEG: crm.api.enabled off means both routes refuse through the bound session.
+
+F2 (CONFIRMED, contradicts the ASSUMPTION's premise): a bound desktop session is not "the person at the desktop".
+  Spec ASSUMPTION: "'token sessions' means the BOUND desktop session (the person at the desktop), not an agent holding the same token by bearer ... the opt-in exists to control what an AGENT may read".
+  Code:
+   - modules/user-tokens/routes.ts:147-149 (mint handler doc): "a user token starts a desktop session for its OWNER, so an agent can sign the owner's desktop app in with no browser and no human step."
+   - lib/user-token-policy.ts:351: POST /v1/me/desktop-session carries approval 'desktop_signin', but not approvalAlways. Under the gate's legacyMustAsk (modules/user-tokens/auth-gate.ts, just before `const mustAsk`), the mint asks only when token.requireHumanApproval is true. `desktop_signin` is part of `all`.
+   - The operator token, which is non-expiring and held by an agent, is admitted on the delegated CRM door. lib/desktop-token-session.ts:266-268 excludes it only from the HOST waivers, and test/user-token-desktop-session-delegation.test.ts:545 pins "the operator token is admitted for CRM".
+   - The spec's own Risks section says it: "a session started from a token never belongs to a person at the keyboard".
+  Consequence: any agent holding a desktop_signin + read + crm token can POST /v1/me/desktop-session and read every contact timeline with the JWT it gets back, while its bearer call is refused. The "bearer unchanged" boundary is only cosmetic, and D5's "one deliberate exception" is a credential-laundering path. On the delegated door the code already treats the bound actor as an agent: req.auth carries userTokenId, and gmailContentWithheldFrom withholds Gmail from it. The ASSUMPTION therefore contradicts the code it rests on.
+  Fix (pick one and say which in the spec):
+   (a) Make it the same decision for both carriers, honestly labelled. Before building, put one sourced question to the user through main: does "token sessions" include bearer tokens?
+   (b) Keep it sessions-only, but restrict W4 to a session that a human proved. For example: exclude createdVia 'operator' and token-minted descendants (created_by_token_id not null), and require that the mint consumed a human approval, recorded on the session's login_method or an audit row.
+   At minimum: exclude operator tokens from W4, as the host waivers already do, and rewrite the ASSUMPTION's rationale so it does not claim sessions-only keeps agents out.
+
+F3 (TARGET FIDELITY): "on by default" became "always on, with no off switch".
+  Spec Outcome: "with no org-owner opt-in and no `userTokens.sessionActions` switch". D1 removes the org requirement entirely.
+  The user's words, "Yes, on by default" (answer:.../419b4bba), describe a DEFAULT, which implies a setting someone can still change. GoodQA has customer organizations, and this removes every customer org admin's control over whether member tokens read their customers' mail, SMS and call timelines. The spec has no opt-out and no NEG for one. Reading "default" as "unconditional" narrows the user's words and should be labelled TARGET_MISMATCH. Otherwise, implement an org setting that counts as on when unset and stays off when an org admin explicitly turns it off.
+  Fix: an org-level key that is on when unset and off when explicitly false (can be set from the org settings UI, audited). Add NEG: explicit off means both routes refuse through the bound session. If main reads the answer as unconditional, record that as a decision with its source and confidence, not as the user's words.
+
+F4 (CONFIRMED, a wrong implementation passes AC-1): only one state of the platform flag is tested.
+  AC-1: "with the platform switch `userTokens.sessionActions` off and the org not opted in."
+  The timeline is a session-action candidate (modules/user-tokens/session-actions.ts:19). In the gate (auth-gate.ts, the `if (bound)` block after userTokenRequestRoutePolicy) there are three branches:
+   - platform off: candidate refusal (`if (candidate) throw ... rule: 'session_action'`), which is what AC-1 exercises.
+   - platform on, org not opted in: `disabled` is true, so `throw ... rule: 'session_actions_disabled'`.
+   - platform on, org opted in: sessionAction is set. policy.abilities gains 'session:crm_timeline', the refusal fires without that ability and sessionActionGrantedAt, and req.userTokenSessionAction is set. withSessionAction (session-actions.ts:107-139) then takes the session path, which re-requires the grant and writes a 'user_token.session_action' audit.
+  An implementation that removes only the first refusal passes AC-1 and fails in production when the platform switch is on. A partial implementation could also reroute the bound session through the session-action path.
+  Fix: make AC-1 a matrix covering platform off; on with no opt-in; on with opt-in and a token without session:crm_timeline; on with opt-in and a token with it. All four must give 200 through the bound session. Assert that req.userTokenSessionAction stays unset for a bound request: no 'user_token.session_action' audit row, and the handler takes the legacy refreshLegacyUserTokenCeilings path (session-actions.ts:98-105). Pin NEG-9's bearer answers for each flag state too.
+
+---------------------------------------------------------------------------------------------------
+MEDIUM
+---------------------------------------------------------------------------------------------------
+
+F5 (CONFIRMED, contradicts code): the timeline route gives no 404 for a contact of another org.
+  NEG-2: "a contact id that belongs to org B requested under the contact route and the timeline route of org A is 404".
+  The timeline handler (modules/crm/routes.ts:1141-1163) never calls crm.getContact. contactTimeline (modules/crm/service.ts:1756-1786) filters on timelineEntries.orgId = orgId and timelineLinks.contactId = contactId, and returns 200 with an empty page. No data leaks, but NEG-2 as written cannot pass without a handler change, which contradicts D2 ("handlers run unchanged"). An implementer facing the red test may weaken it quietly.
+  Fix: either change NEG-2 for the timeline to "200, zero entries, no entry of org B", or add a getContact existence check to the timeline handler. That check changes the signed-in answer too, so list it in Scope and test it.
+
+F6 (CONFIRMED, cannot be observed): "404 by id" for personal entries, and busy_only is not covered.
+  AC-4 / NEG-6: "absent in the list, 404 by id". Neither route has a GET-by-entry-id. The only by-id CRM timeline routes are PATCH, archive, ai/action-items and attendance (crm/routes.ts:1232, 1260, 1523, 1814), all refused to a bound session. A "404 by id" assertion would therefore pass vacuously, or be "proven" through a route that answers 403 for an unrelated reason.
+  Missing case: timelineWithSubjects (crm/routes.ts:208-231) collapses a colleague's busy_only entry to "Busy" with subjects [] and author null. That is the subtle leak, and the spec does not mention it.
+  The contact detail response embeds the first timeline page (crm/routes.ts:758) plus reportedIssues, so every privacy NEG must check BOTH responses.
+  Fix: replace "404 by id" with list-absence on both routes. Add NEG: a colleague's busy_only entry arrives as "Busy" with subjects [] and author null on both routes. State that the owner's OWN personal entries are visible to the session; that follows from auth.userId = owner, so make it an explicit, accepted behaviour.
+
+F7 (door pinning, so the privacy controls cannot quietly vanish): Gmail withholding and the live re-read depend on the DELEGATED door.
+  On the host door the gate sets req.auth = { userId, sessionId, email } with no userTokenId (auth-gate.ts, `if (bound?.door === 'host')`). gmailContentWithheldFrom then returns false, because isAgentCredential (lib/credential-kind.ts:32) checks apiKeyId or userTokenId. withSessionAction also runs the handler without the live token re-read (session-actions.ts:98).
+  The spec mixes the two: D1 says "added to the delegated table", but the Decisions section says "Widening to bearer is one flag in the host-door waiver set". An implementer who follows the second sentence leaks Gmail mailbox-read content.
+  Fix: state that W4 lives on the delegated door only, and pin desktopRouteDoor(...) === 'delegated' for both keys. NEG-7 must seed a real Gmail mailbox-read entry (provider 'gmail', provenance 'mailbox-read') linked to the contact, with a positive control: the signed-in owner session sees it. Without that, an empty seed passes vacuously.
+
+F8: ways the W4 waiver could be wider than the two routes (requested angle).
+  1. HEAD: methodOf and desktopRouteDoor map HEAD to GET (lib/desktop-token-session.ts:138, 223), and Fastify exposes HEAD for GET routes. W4 therefore covers four method keys, not two. Name this in the spec and in the pin.
+  2. Keying: if W4 keys on sessionActionFor/candidate, or on a regex such as /crm/contacts/:p(/|$), it also opens GET/POST /crm/timeline (the org-wide feed, session-actions.ts:17-18) or contacts/:p/sms, /files, /meetings, /call, /export. Require exact string keys. The pin must assert two things: equality of the exported W4 set, and a property test over the full registered route inventory showing the waiver fires on exactly those keys. Checking the constant alone does not prove the function's behaviour.
+  3. Placement: putting W4 in userTokenRequestRoutePolicy, userTokenRoutePolicy or USER_TOKEN_BEYOND_API_KEY_ROUTES would widen bearer as well. NEG-9 catches that only when it runs under every flag state (see F4).
+  4. Principals: operator tokens and token-minted child tokens (see F2). The bound branch excludes commander_turn and oauth, but nothing else.
+  5. Ordering: W4 must clear signedInPersonOnly and the candidate refusal AFTER the nonDelegable, governance and media-grant steps and must never touch nonDelegable. Otherwise a future non-delegable rule on /crm/contacts would be overridden.
+  6. Pin drift: the existing delegated-table test asserts signedInPersonOnly === false for every entry (test/user-token-desktop-surface-inventory.test.ts:134-139). The subset test (test/user-token-desktop-session-delegation.test.ts:423-441) needs a carve-out too. Each carve-out must name the exact keys, not "entries with a W4 flag".
+
+---------------------------------------------------------------------------------------------------
+LOW
+---------------------------------------------------------------------------------------------------
+
+F9: Risks: "bounded by token revoke, the 15-minute access token". Refresh rotation renews the access token, and the session lifetime is capped only at the token chain's end. That end is infinite for a non-expiring token, including the operator token. Correct the text, or cap W4 sessions.
+F10: NEG-9: "the existing session-action answer on the timeline" depends on the flag state (signed_in_person, session_actions_disabled, or session-action grant refusal). Spell out the exact code for each state.
+F11: Narrowing: NEG-5 covers revoke and crm removal. Removing `read` or `desktop_signin` mid-session ends the session (desktopBindingState, lib/desktop-token-session.ts:68-69). The comment at :51 says the opposite for `read`. Add that case so the behaviour is pinned.
+F12: Project allow-list: visibleProjectIds intersects the token's projectIds (lib/access.ts:809-810), which governs project-linked timeline entries and reportedIssues on contact detail. Add one NEG with a project-scoped token so a later refactor cannot drop it. The org agent-pause has no NEG either.
+F13: Ledger: query values are already stripped (modules/user-tokens/service.ts:301 stripQuerySecrets). NEG-10 can cheaply assert that a `?q=<search text>` value never reaches the ledger. The timeline accepts free-text `q` (crm/routes.ts:119-132).
+F14: AC-1's Verify by does not say where to run it. Give the directory (apps/api) and the host (dev2/t2-dev per Resource budget), so the command runs as written.
+
+---------------------------------------------------------------------------------------------------
+Checked and found consistent with code
+---------------------------------------------------------------------------------------------------
+- Today both routes refuse a bound session with user_token_non_delegable (boundRouteClassRefusal, explained CRM surface, signedInPersonOnly), so AC-1's failing-first claim holds.
+- The ability rule gives ['crm','read'] for both (lib/user-token-policy.ts:291 plus the GET default).
+- Contact detail is org-scoped through getContact (crm/service.ts:1895-1903, 404) and requireOrgPermission('crm:read').
+- On the delegated door, Gmail withholding applies (req.auth.userTokenId set).
+- A desktop session can only be minted by a token with orgIds === null (user-tokens/routes.ts:161-163), so NEG-3 has to narrow the org list after the session starts. The spec says this.
+- Neither route is a zero-write read, so both are ledgered. doorDetail adds via and sessionId.
+- Source syntax: the answer: and ticket: lines are well formed, and the ASSUMPTION carries an inferred: source and is labelled.
+
+---------------------------------------------------------------------------------------------------
+Probes
+---------------------------------------------------------------------------------------------------
+None declared and none run. This was a read-only review of the spec and code. No hostile-input, resource or network probe was needed to reach these findings, so run_probe.py was not used.
+
+---------------------------------------------------------------------------------------------------
+Not examined / not verified
+---------------------------------------------------------------------------------------------------
+- The exact question text behind answer 419b4bba. I saw only main's WAL requirement note ("Contact timelines for token sessions are on by default"), so I cannot tell whether the user was asked about bearer tokens as well.
+- The production value of the platform setting userTokens.sessionActions, and how many orgs opted in. This decides how bad F4 is in practice.
+- Whether the desktop app's contact page calls exactly these two routes, or also /sms, /files or /meetings, which would turn into refusals in the click-test.
+- No tests were run. The OWASP ASVS v5 lens (V8 authorization, V14 data protection, V16 logging) guided coverage; this is not a compliance claim.
+- The untracked files in the worktree (apps/api/.click-seed.ts, apps/web/public/public/) were not reviewed.

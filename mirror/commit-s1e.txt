@@ -1,0 +1,19 @@
+feat(user-tokens): contact detail and timeline in token desktop sessions
+
+Why: the user answered "Yes, on by default" for contact timelines in a
+desktop session started from a user token; clicking a person in the CRM
+needs the contact record and its timeline, both refused to a bound session.
+What: waiver W4 on the bound delegated door only, exact keys for contact
+detail and contact timeline, ability crm + read, no org opt-in and no
+session-actions switch. The org CRM switch and a new org opt-out
+(userTokens.contactTimelines false) apply to both routes. Operator tokens
+get no W4. Bearer answers are unchanged in every switch state; snapshot and
+subset pins carry a carve-out naming exactly the two keys.
+Testing: `pnpm exec vitest run` from apps/api on t2-dev: the new
+user-token-contact-timeline-default test (red first: 9 of 12 failed on
+72290cc761e), the inventory, delegation, bearer-parity, rt3, desktop-session
+and gmail-limited-use suites green (user-tokens-policy keeps its 2 baseline
+failures), tsc clean, 4 mutants killed.
+Refs: GoodQA #15561
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

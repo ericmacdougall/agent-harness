@@ -1,0 +1,12 @@
+chore(scratch): S1e-a edit copies, specs, review reports and kit scripts
+
+Why: the Mac scratch worktree holds the edit copies, patch scripts, spec
+v2 and the review reports for goodqa#15561 slice S1e-a; keeping them in a
+commit makes them recoverable. The shipped code is on the t2-dev branch.
+What: mirror copies of the S1e-a sources and tests, patch and push scripts,
+spec-15561-s1e.md, and the adversarial and acceptance review reports.
+Testing: not run: scratch files only, the real checks ran on t2-dev
+(commit 7fa436767c8 on feat/goodqa-15561-s1e-timeline-default).
+Refs: GoodQA #15561
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

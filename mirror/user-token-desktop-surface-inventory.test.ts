@@ -20,7 +20,7 @@ import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildApp } from '../src/app';
 import { loadConfig } from '../src/config';
-import { DESKTOP_DELEGATED_SURFACES, HOST_APPROVAL_WAIVED_ROUTES, HOST_BASE_READ_ROUTES, desktopRouteDoor, desktopRouteKey } from '../src/lib/desktop-token-session';
+import { DESKTOP_DELEGATED_SURFACES, DESKTOP_SESSION_ONLY_OPENED, HOST_APPROVAL_WAIVED_ROUTES, HOST_BASE_READ_ROUTES, desktopRouteDoor, desktopRouteKey } from '../src/lib/desktop-token-session';
 import { userTokenRoutePolicy } from '../src/lib/user-token-policy';
 import * as authPlugin from '../src/plugins/auth';
 
@@ -136,7 +136,8 @@ describe('the bound session\'s doors are pinned to the code (goodqa#15561 AC-6, 
       expect(r, `${entry.route} is not a registered route`).toBeDefined();
       const p = userTokenRoutePolicy(r!.method, r!.url, authPlugin.isApiKeyReachableRoute(r!.method, r!.url));
       expect(p.nonDelegable, entry.route).toBeNull();
-      expect(p.signedInPersonOnly, entry.route).toBe(false);
+      // W4 (goodqa#15561 S1e-a): exactly the named pair is session-only for bearer and opened for the bound door only.
+      if (!DESKTOP_SESSION_ONLY_OPENED.has(entry.route)) expect(p.signedInPersonOnly, entry.route).toBe(false);
       expect(authPlugin.isGovernanceSessionOnlyRoute(r!.method, r!.url), entry.route).toBe(false);
       expect([...p.abilities].sort(), entry.route).toEqual([...entry.abilities].sort());
       expect(desktopRouteDoor(r!.method, r!.url.replace(/:[A-Za-z]+/g, ':p')), entry.route).toBe('delegated');

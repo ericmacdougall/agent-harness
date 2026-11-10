@@ -21,7 +21,7 @@ import {
   USER_TOKEN_SHAPE,
   expandUserTokenAbilities,
 } from '@bugtracker/shared';
-import { applyHostDoorWaivers, desktopExplainedSurface, isDesktopPollRoute } from '../../lib/desktop-token-session';
+import { applyHostDoorWaivers, desktopExplainedSurface, isDesktopPollRoute, isSessionOnlyOpened } from '../../lib/desktop-token-session';
 import { requestClientIp } from '../../lib/client-ip';
 import { AppError, Errors } from '../../lib/errors';
 import { isInProcessDispatch } from '../../lib/in-process-dispatch';
@@ -437,10 +437,21 @@ export async function applyUserTokenRoutePolicy(
 
   const candidate = sessionActionFor(req.method, routePattern);
   const orgOptIn = !!(sessionActionsOn && candidate && routeOrgId && await sessionActionsEnabledForOrg(req.server.db, routeOrgId));
-  const { policy, sessionAction, disabled } = userTokenRequestRoutePolicy(req.method, routePattern, deps.isApiKeyReachableRoute(req.method, routePattern), sessionActionsOn, orgOptIn);
+  // W4 (goodqa#15561 S1e-a, user answer "Yes, on by default"): on the bound delegated door only, contact detail and the contact
+  // timeline are ordinary `crm` + `read` routes: not session-only, not a session action, no org opt-in and no platform switch.
+  const w4 = !!bound && bound.door === 'delegated' && token.createdVia !== 'operator' && isSessionOnlyOpened(req.method, bound.routeKey);
+  const requestPolicy = userTokenRequestRoutePolicy(req.method, routePattern, deps.isApiKeyReachableRoute(req.method, routePattern), sessionActionsOn && !w4, w4 ? false : orgOptIn);
+  const { policy } = requestPolicy;
+  const sessionAction = w4 ? undefined : requestPolicy.sessionAction;
+  const disabled = w4 ? false : requestPolicy.disabled;
+  if (w4) {
+    policy.signedInPersonOnly = false;
+    policy.nonDelegable = null;
+    policy.abilities = [...new Set([...policy.abilities, 'crm', 'read'])].sort();
+  }
   if (bound) {
     // A desktop session never reaches a session action (its grant is an explicit human grant to a token, not to a screen).
-    if (candidate) throw refusal(req, token, routePattern, new AppError(403, 'user_token_non_delegable', 'A desktop session cannot perform session actions.', { rule: 'session_action' }));
+    if (candidate && !w4) throw refusal(req, token, routePattern, new AppError(403, 'user_token_non_delegable', 'A desktop session cannot perform session actions.', { rule: 'session_action' }));
     // Host door: the same gate, with the three named waivers (lib/desktop-token-session.ts applyHostDoorWaivers).
     if (bound.door === 'host') applyHostDoorWaivers(req.method, bound.routeKey, policy, expandUserTokenAbilities(token.abilities), token.createdVia);
   }

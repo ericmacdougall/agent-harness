@@ -102,7 +102,8 @@ describe('AC-1: a bound session reaches the CRM list and saved-view reads its to
 
   it('NEG-25: the CRM routes that are session-only for every token answer user_token_non_delegable, not a blank or role 403', async () => {
     const { session } = await bound(CRM_WRITE_SESSION);
-    for (const u of [crmUrl('/contacts/00000000-0000-4000-8000-000000000000'), crmUrl('/contacts/export'), crmUrl('/contacts/00000000-0000-4000-8000-000000000000/timeline')]) {
+    // S1e-a (W4) opened contact detail and the contact timeline for the bound door only (see user-token-contact-timeline-default.test.ts).
+    for (const u of [crmUrl('/contacts/export'), crmUrl('/contacts/00000000-0000-4000-8000-000000000000/meetings')]) {
       const res = await inj('GET', u, session.headers);
       expect(res.statusCode, u).toBe(403);
       expect(codeOf(res), u).toBe('user_token_non_delegable');
@@ -425,6 +426,7 @@ describe('AC-13: the bound answer never exceeds the bearer answer for the same t
   const gate = (a: string) => GATE.test(a.split(' ').slice(1).join(' '));
   // the named differences: W1 (machines non-delegable waived on allow-listed machine routes), W2 (session-only host routes served),
   // W3 (approval waived on the enrollment routes). Everything else must be equal or bound-refused.
+  const W4_PAIR = ['/v1/orgs/:org/crm/contacts/00000000-0000-4000-8000-000000000000', '/v1/orgs/:org/crm/contacts/00000000-0000-4000-8000-000000000000/timeline'];
   const WAIVED = /\/v1\/orgs\/[^/]+\/machines(\/|$)|\/v1\/machines\/|\/v1\/me\/remote-control\/catalog|\/v1\/me\/machine-enrollments/;
 
   it('for 40+ routes and two token shapes, a bound session is never allowed what the bearer call is refused, and delegated routes answer exactly as bearer', async () => {
@@ -438,6 +440,8 @@ describe('AC-13: the bound answer never exceeds the bearer answer for the same t
         const viaBearer = answerOf(await inj(r.method, url, token.headers, r.body));
         const label = `${abilities.length} abilities ${r.method} ${r.url}: session ${viaSession} / bearer ${viaBearer}`;
         if (WAIVED.test(r.url)) continue;
+        // W4 (goodqa#15561 S1e-a): the one deliberate exception pair, named by exact key and pinned in user-token-contact-timeline-default.test.ts.
+        if (r.method === 'GET' && W4_PAIR.includes(r.url)) continue;
         if (!gate(viaSession) && gate(viaBearer)) throw new Error(`session exceeds bearer: ${label}`);
         if (/\/crm\/(contacts|companies|segments|records)|\/entitlements|\/members$/.test(r.url) && r.method !== 'DELETE') expect(viaSession, label).toBe(viaBearer);
       }

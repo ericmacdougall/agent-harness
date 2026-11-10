@@ -175,6 +175,9 @@ export const DESKTOP_DELEGATED_SURFACES: readonly DesktopDelegatedSurface[] = [
   crm('GET /v1/orgs/:p/crm/tags', CRM_READ),
   crm('GET /v1/orgs/:p/crm/:p/:p/fields', CRM_READ),
   crm('GET /v1/orgs/:p/crm/:p/:p/tags', CRM_READ),
+  // W4 (goodqa#15561 S1e-a, user answer "Yes, on by default"): contact detail and the contact timeline, for the bound session only.
+  crm('GET /v1/orgs/:p/crm/contacts/:p', CRM_READ),
+  crm('GET /v1/orgs/:p/crm/contacts/:p/timeline', CRM_READ),
   crm('GET /v1/orgs/:p/entitlements', ['read']),
   crm('GET /v1/orgs/:p/members', ['read']),
   // writes: need `write` AND the owner's own role permission (the handler's requireOrgPermission, untouched)
@@ -197,6 +200,28 @@ export const DESKTOP_DELEGATED_SURFACES: readonly DesktopDelegatedSurface[] = [
   crm('DELETE /v1/orgs/:p/crm/:p/:p/tags/:p', CRM_DELETE),
 ];
 const DELEGATED: ReadonlyMap<string, DesktopDelegatedSurface> = new Map(DESKTOP_DELEGATED_SURFACES.map((s) => [s.route, s]));
+
+/**
+ * W4: the two routes that are session-only for every credential (contact detail) or a session action behind the platform switch,
+ * the org owner's opt-in and a `session:crm_timeline` grant (the contact timeline), and that a BOUND desktop session reads with
+ * just `crm` + `read`, with no opt-in and no switch (the user's answer "Yes, on by default"). The bearer door is NOT touched: a
+ * bearer call with the same token keeps today's answers. The one deliberate exception to "bound is a subset of bearer", pinned
+ * by test (exact set) so a new route cannot join silently.
+ */
+export const DESKTOP_SESSION_ONLY_OPENED: ReadonlySet<string> = new Set([
+  'GET /v1/orgs/:p/crm/contacts/:p',
+  'GET /v1/orgs/:p/crm/contacts/:p/timeline',
+]);
+/** Exact string keys; HEAD maps to GET (methodOf), so a HEAD on either route is covered the same way and answers the same. */
+export function isSessionOnlyOpened(method: string, routeKey: string): boolean {
+  return DESKTOP_SESSION_ONLY_OPENED.has(`${methodOf(method)} ${routeKey}`);
+}
+/** Org opt-OUT for W4: on unless an org admin sets the entitlement override `userTokens.contactTimelines` to exactly false. */
+export const CONTACT_TIMELINES_KEY = 'userTokens.contactTimelines';
+export async function contactTimelinesOnForOrg(db: DbOrTx, orgId: string): Promise<boolean> {
+  const [org] = await db.select({ overrides: organizations.entitlementOverrides }).from(organizations).where(eq(organizations.id, orgId)).limit(1);
+  return (org?.overrides as Record<string, unknown> | null | undefined)?.[CONTACT_TIMELINES_KEY] !== false;
+}
 
 export type DesktopDoor = 'host' | 'delegated';
 
