@@ -166,9 +166,9 @@ MC_HOME=<same dir> python3 ~/.agent-harness/mission-control/app/server.py url --
 It refuses to start (exit 2) in these cases, before anything is written:
 - `MC_HOME` is unset, or is the real `~/.agent-harness/mission-control` (or inside or above it);
 - `MC_HOME` is a non-empty directory without the `.mc-demo-home` marker that demo mode writes into an empty home;
-- its `demo`, `sources`, `log` or `chat` folder is a symlink or lies outside it.
+- any entry anywhere under it is a symlink (for example `sources`, `demo/wals` or `log/server.log`).
 
-Fixture files are written without following symlinks. It prints a launch link to the terminal; codes are never written to a file. `url --demo-host` works only for an existing demo home; it never creates a secret and never uses the real install's.
+Fixture files are written without following symlinks. It prints a launch link to the terminal; codes are never written to a file. `url --demo-host` works only for an existing demo home that carries the marker; it never creates a secret and never uses the real install's, including from a backup copy of the real home.
 
 To tie a test run to a commit, run the checkout's own `harness/mission_control/server.py` with `MC_HOOKS=<checkout>/harness/hooks`. The startup banner and `/healthz` then report `build`, which holds the commit, a digest of the served files, and `hooks: checkout` or `installed`. It contains no paths and no host name, because `/healthz` needs no session. In demo mode, `/api/state` shows the host as `demo`.
 

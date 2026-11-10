@@ -63,7 +63,6 @@ def check_demo_home(env_home: str | None) -> Path:
 
 
 MARKER = ".mc-demo-home"
-DEMO_SUBDIRS = ("demo", "sources", "log", "chat")
 
 
 def prepare_home(root: Path) -> Path:
@@ -78,12 +77,18 @@ def prepare_home(root: Path) -> Path:
             raise DemoError(f"refusing --demo: {root} is not empty and is not a demo home")
         fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
         os.close(fd)
-    real = root.resolve()
-    for name in DEMO_SUBDIRS:
-        sub = root / name
-        if sub.is_symlink() or (sub.exists() and real not in sub.resolve().parents):
-            raise DemoError(f"refusing --demo: {sub} is a symlink or lies outside the demo home")
+    # No symlink anywhere under the home: a nested link (demo/wals, a session folder, log/server.log) would let fixture
+    # or log writes land outside it. os.walk does not follow directory links, so each link is seen once, as an entry.
+    for top, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs + files:
+            if os.path.islink(os.path.join(top, name)):
+                raise DemoError(f"refusing --demo: {os.path.join(top, name)} is a symlink inside the demo home")
     return root
+
+
+def is_demo_home(root: Path) -> bool:
+    marker = root / MARKER
+    return marker.is_file() and not marker.is_symlink()
 
 
 def _write(path: Path, text: str, append: bool = False) -> None:

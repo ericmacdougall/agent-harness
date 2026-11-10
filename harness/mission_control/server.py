@@ -757,7 +757,9 @@ def main(argv=None) -> int:
             host = None
             if args.demo_host:
                 host = demo_mode.check_demo_host(args.demo_host, True)
-                demo_mode.check_demo_home(os.environ.get("MC_HOME"))
+                home = demo_mode.check_demo_home(os.environ.get("MC_HOME"))
+                if not demo_mode.is_demo_home(home):  # e.g. a backup copy of the real home: never sign with its secret
+                    raise demo_mode.DemoError(f"{home} is not a demo home (no {demo_mode.MARKER} marker)")
                 mc_chat.secret(create=False)  # an existing demo instance only: never mint a new secret here
         except (demo_mode.DemoError, mc_chat.ChatError) as exc:
             print(f"mission-control: {exc}", file=sys.stderr)

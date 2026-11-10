@@ -216,9 +216,22 @@ class Http(Base):
         self.assertRegex(value["build"]["digest"], r"^[0-9a-f]{16}$")
         self.assertIn(value["build"]["hooks"], ("checkout", "installed"))
         self.assertNotIn(str(Path.home()), data.decode())
-        self.assertNotIn(socket.gethostname().split(".")[0], data.decode())
+        short = socket.gethostname().split(".")[0]
+        if not set(short.lower()) <= set("0123456789abcdef"):  # a hex-only name could collide with the digest
+            self.assertNotIn(short, data.decode())
+        head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True)
+        if head.returncode == 0:  # AC-26: run from a checkout, the commit must be the checkout's HEAD, not None
+            self.assertEqual(value["build"]["commit"], head.stdout.strip())
         _cookie, state = self.login()
         self.assertEqual(state["host"], "demo")
+
+    def test_a_ts_net_host_is_refused_unless_it_was_allowed(self):
+        # NEG-20: only the one --demo-host name is accepted; the real server never passes one, so it refuses them all.
+        cookie, _state = self.login()
+        self.assertEqual(self.request("GET", "/healthz", host="erics-macbook-air.tail980dbb.ts.net")[0].status, 403)
+        plain = mcs.build_app(demo_args(free_port()))
+        self.assertNotIn(self.HOST, plain.auth.hosts)
+        self.assertEqual({h for h in plain.auth.hosts if "ts.net" in h}, set())
 
 
 class DemoHome(Base):
@@ -241,6 +254,33 @@ class DemoHome(Base):
         with self.assertRaises(demo.DemoError):
             mcs.build_app(demo_args(free_port()))
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_nested_symlinks_anywhere_in_the_home_are_refused(self):
+        # N2 (adversarial re-review): demo/wals, a session folder and log/server.log were written through.
+        for n, planted in enumerate(("demo/wals", f"demo/wals/{demo.DEMO_SESSION}", "log/server.log")):
+            with self.subTest(planted=planted):
+                decoy = self.base / f"decoy-{n}"
+                decoy.mkdir()
+                home = self.base / ("h-" + planted.replace("/", "-"))
+                demo.prepare_home(home)
+                link = home / planted
+                link.parent.mkdir(parents=True, exist_ok=True)
+                target = decoy / "server.log" if planted.endswith(".log") else decoy
+                link.symlink_to(target, target_is_directory=not planted.endswith(".log"))
+                with mock.patch.dict(os.environ, {"MC_HOME": str(home)}):
+                    with self.assertRaises(demo.DemoError):
+                        mcs.build_app(demo_args(free_port()))
+                self.assertEqual(list(decoy.iterdir()), [])
+
+    def test_url_demo_host_refuses_an_unmarked_copy_holding_a_secret(self):
+        # L-c: a backup copy of the real home elsewhere must not sign Funnel codes with the real secret.
+        copy = self.base / "backup-of-real-home"
+        copy.mkdir()
+        mc_chat.secret(copy)
+        out = subprocess.run([sys.executable, str(SERVER), "url", "--port", "47699", "--demo-host", "box.tail1234.ts.net"],
+                             capture_output=True, text=True, timeout=30, env={**os.environ, "MC_HOME": str(copy)})
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertNotIn("launch?c=", out.stdout)
 
     def test_fixture_writes_never_follow_a_planted_file_symlink(self):
         demo.prepare_home(self.root)
