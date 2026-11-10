@@ -171,7 +171,10 @@ dashboard", and it uses these tools:
 
 - `mc_pending` attaches the app as its own chat target, `claude-desktop`. You
   can then pick that target in the dashboard's session picker. The tool also
-  lists the ids of messages waiting for it, with no text.
+  lists its unread messages with no text: ids with status `queued` or
+  `delivered` (read, not yet answered), at most 50 plus a count of the rest,
+  and a count of messages for other sessions. A message stays listed until
+  `mc_reply` answers it.
 - `mc_read` returns one message addressed to `claude-desktop`, only if its
   server signature verifies, in the framed and fenced form with the
   authority notice.
