@@ -220,3 +220,30 @@ thread associated with a named supervisor is not duplicated.
 This read-side integration does not enable direct messages to named owners. The existing
 chat channels keep their existing routing until the generation-bound, durable inbox and
 reply-correlation integration is installed and tested.
+# Login in a managed local browser
+
+For an approved local browser tab that cannot receive a private launch URL, visit
+`http://127.0.0.1:47615/auth/browser` and choose **Begin local login**. The page
+shows a public request ID and the exact local command:
+
+```sh
+python3 ~/.agent-harness/mission-control/app/server.py approve-browser --request-id <PUBLIC_REQUEST_ID> --port 47615
+```
+
+Run that command on the same computer, then choose **Continue** in the original
+tab. Approval expires after two minutes. The public ID cannot sign in another
+browser: an HttpOnly cookie binds the request to the original tab's browser
+session. The local command loads the existing MC key internally and sends a
+purpose-bound approval directly to the configured loopback port, without proxy
+discovery or redirects. It prints only the outcome. Do not copy launch URLs,
+approval signatures, cookies or keys into browser tools, chat or tickets.
+
+This flow does not change GoodQA permissions or create remote access. Its product
+binding is the exact configured `127.0.0.1` port; individual browser grants must
+still allow that origin. Demo/Funnel login is unsupported by this flow. A pending
+request expires on restart, revocation, unavailable key or key rotation. Cookies
+are host/path scoped; the port-specific cookie name and signed origin separate
+the flow, but do not claim confidentiality from hostile local services. The
+existing single-use `server.py open` path remains available for the default
+browser. A timeout reports an unknown outcome; inspect the original browser
+before deciding whether another approval is needed.

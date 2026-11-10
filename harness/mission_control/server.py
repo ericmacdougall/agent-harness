@@ -20,11 +20,14 @@ import argparse
 import base64
 import glob
 import hashlib
+import html
 import hmac
+import http.client
 import json
 import logging
 import logging.handlers
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -33,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -94,6 +98,25 @@ def mint_code(key: bytes, now: float | None = None) -> str:
 
 SESSION_STORE_MAX = 64 * 1024
 TOUCH_PERSIST_S = 60  # a session's `last` is written back at most once a minute
+BROWSER_TTL_S = 120
+BROWSER_MAX_PENDING = 16
+BROWSER_ID = re.compile(r"[0-9a-f]{32}\.[0-9a-f]{32}\Z")
+BROWSER_NONCE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
+
+
+def browser_approval_mac(key, request_id, port, issued):
+    message = json.dumps(["mc-browser-approve/1", request_id, f"http://127.0.0.1:{port}", issued],
+                         separators=(",", ":")).encode("ascii")
+    return hmac.new(key, message, hashlib.sha256).hexdigest()
+
+
+def _unique_browser_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate")
+        result[key] = value
+    return result
 
 
 class Auth:
@@ -110,6 +133,8 @@ class Auth:
         self.lock = threading.Lock()
         self.used: dict[bytes, float] = {}
         self.sessions: dict[str, dict] = {}
+        self.pending_browsers: dict[str, dict] = {}
+        self.browser_boot = uuid.uuid4().hex
         self.hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
         self.origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
         self.key = self._current_key()
@@ -126,6 +151,7 @@ class Auth:
         session out at once and is never saved under the new key (red-team M1)."""
         current = self._current_key()
         if current is None:
+            self._clear_browsers_locked()
             return False
         if self.key is None:  # the secret was unreadable at start and is back: load what was saved, wipe nothing (L-a)
             self.key = current
@@ -133,6 +159,7 @@ class Auth:
             return True
         if current != self.key:
             self.sessions.clear()
+            self._clear_browsers_locked()
             self.key = current
             self._save_locked()
         return True
@@ -236,6 +263,9 @@ class Auth:
         if not self._key_check_locked() or self.key != generation:
             return None
         self.used[payload] = now
+        return self._new_session_locked(now)
+
+    def _new_session_locked(self, now):
         if len(self.sessions) >= MAX_SESSIONS:
             oldest = min(self.sessions, key=lambda s: self.sessions[s]["last"])
             self.sessions.pop(oldest, None)
@@ -275,7 +305,89 @@ class Auth:
     def revoke_all(self) -> None:
         with self.lock:
             self.sessions.clear()
+            self._clear_browsers_locked()
             self._save_locked()
+
+    def _clear_browsers_locked(self):
+        self.pending_browsers.clear()
+        self.browser_boot = uuid.uuid4().hex
+
+    def _browser_key_locked(self):
+        if not self._key_check_locked():
+            return None
+        try:
+            key = self.key_loader()
+            if self._key_generation(key) == self.key:
+                return key
+        except Exception:  # unavailable/changed key invalidates pending approval, never reflects the error
+            pass
+        self._clear_browsers_locked()
+        return None
+
+    def _prune_browsers_locked(self, now):
+        self.pending_browsers = {rid: row for rid, row in self.pending_browsers.items()
+                                 if 0 <= now - row["created"] <= BROWSER_TTL_S and row["generation"] == self.key}
+
+    def browser_begin(self, nonce=None, *, now=None):
+        now = time.time() if now is None else now
+        with self.lock:
+            if self._browser_key_locked() is None:
+                return None
+            self._prune_browsers_locked(now)
+            if isinstance(nonce, str) and BROWSER_NONCE.fullmatch(nonce):
+                for rid, row in self.pending_browsers.items():
+                    if hmac.compare_digest(row["nonce_hash"], self._hash(nonce)):
+                        return rid, nonce
+            if len(self.pending_browsers) >= BROWSER_MAX_PENDING:
+                return None
+            rid, nonce = self.browser_boot + "." + uuid.uuid4().hex, secrets.token_urlsafe(32)
+            self.pending_browsers[rid] = {"created": now, "generation": self.key, "nonce_hash": self._hash(nonce),
+                                          "approved": False, "last_claim": None}
+            return rid, nonce
+
+    def browser_approve(self, request_id, issued, mac, *, now=None):
+        now = time.time() if now is None else now
+        if (not isinstance(request_id, str) or not BROWSER_ID.fullmatch(request_id)
+                or type(issued) is not int or not 0 <= now - issued <= 30
+                or not isinstance(mac, str) or not re.fullmatch("[0-9a-f]{64}", mac)):
+            return False
+        with self.lock:
+            key = self._browser_key_locked()
+            if key is None:
+                return False
+            generation = self.key
+            self._prune_browsers_locked(now)
+            row = self.pending_browsers.get(request_id)
+            if (not row or row["approved"] or request_id.split(".")[0] != self.browser_boot
+                    or not hmac.compare_digest(browser_approval_mac(key, request_id, self.port, issued), mac)):
+                return False
+            if not self._key_check_locked() or self.key != generation:
+                return False
+            row["approved"] = True
+            return True
+
+    def browser_claim(self, request_id, nonce, *, now=None):
+        now = time.time() if now is None else now
+        if (not isinstance(request_id, str) or not BROWSER_ID.fullmatch(request_id)
+                or not isinstance(nonce, str) or not BROWSER_NONCE.fullmatch(nonce)):
+            return "invalid", None
+        with self.lock:
+            if self._browser_key_locked() is None:
+                return "invalid", None
+            generation = self.key
+            self._prune_browsers_locked(now)
+            row = self.pending_browsers.get(request_id)
+            if not row or not hmac.compare_digest(row["nonce_hash"], self._hash(nonce)):
+                return "invalid", None
+            if row["last_claim"] is not None and now - row["last_claim"] < 1:
+                return "pending", None
+            row["last_claim"] = now
+            if not row["approved"]:
+                return "pending", None
+            if not self._key_check_locked() or self.key != generation:
+                return "invalid", None
+            del self.pending_browsers[request_id]
+            return "ok", self._new_session_locked(now)
 
 
 # ---------------------------------------------------------------- the application (state + collectors)
@@ -504,7 +616,8 @@ class Handler(BaseHTTPRequestHandler):
                    "Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Resource-Policy": "same-origin"}
         headers.update(extra or {})
         for key, value in headers.items():
-            self.send_header(key, value)
+            for item in value if key == "Set-Cookie" and isinstance(value, list) else [value]:
+                self.send_header(key, item)
         self.end_headers()
         if body and self.command != "HEAD":
             self.wfile.write(body)
@@ -548,6 +661,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200, value)
         if url.path == "/launch":
             return self.launch(url)
+        if url.path == "/auth/browser":
+            if not self.browser_available():
+                return self.deny(404, "not-found")
+            if url.query or not self.same_origin_read(document=True):
+                return self.deny(403, "cross-site")
+            if self.app.auth.session(self.headers.get("Cookie"), touch=False)[0]:
+                return self.send_secure(303, extra={"Location": "/"})
+            return self.browser_page(200)
         document = url.path in ("/", "/index.html")
         if not self.same_origin_read(document=document):
             return self.deny(403, "cross-site")
@@ -558,6 +679,8 @@ class Handler(BaseHTTPRequestHandler):
                         b"<p>Open Mission Control: run <code>mc</code> in a terminal"
                         b" (or <code>python3 ~/.agent-harness/mission-control/app/server.py open</code>)."
                         b" Launch links work once and expire after 60 seconds.</p>")
+                if self.browser_available():
+                    page += b'<p><a href="/auth/browser">Approve this browser locally</a></p>'
                 return self.send_secure(401, page, "text/html; charset=utf-8")
             return self.deny(401, "session")
         if url.path == "/api/state":
@@ -571,6 +694,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.host_ok():
             return self.deny(403, "host")
+        if urlsplit(self.path).path.startswith("/auth/browser/"):
+            return self.browser_post()
         if self.headers.get("Origin") not in self.app.auth.origins:
             return self.deny(403, "origin")
         sid, info = self.authed()
@@ -603,6 +728,106 @@ class Handler(BaseHTTPRequestHandler):
         self.deny(405, "method")
 
     do_DELETE = do_PATCH = do_OPTIONS = do_PUT
+
+    def browser_available(self):
+        return (not self.app.demo and self.client_address[0] == "127.0.0.1"
+                and self.headers.get_all("Host") == [f"127.0.0.1:{self.app.auth.port}"])
+
+    def browser_cookie(self):
+        name = f"mc_browser_bind_{self.app.auth.port}"
+        values = [part.strip().partition("=")[2] for part in (self.headers.get("Cookie") or "").split(";")
+                  if part.strip().partition("=")[0] == name]
+        return values[0] if len(values) == 1 and BROWSER_NONCE.fullmatch(values[0]) else None
+
+    def browser_page(self, status, request_id=None, cookie=None):
+        origin = f"http://127.0.0.1:{self.app.auth.port}"
+        page = ("<!doctype html><meta charset=utf-8><title>Approve Mission Control browser</title>"
+                "<h1>Approve this browser locally</h1><p>This grants a Mission Control session on "
+                + origin + ". Keep using this same browser tab.</p>")
+        if request_id is None:
+            page += ('<form method="post" action="/auth/browser/request">'
+                     '<input type="hidden" name="action" value="begin"><button>Begin local login</button></form>')
+        else:
+            rid = html.escape(request_id, quote=True)
+            page += ("<p>Public request ID: <code>" + rid + "</code></p>"
+                     "<p>On this computer, approve only this request:</p><code>"
+                     "python3 ~/.agent-harness/mission-control/app/server.py approve-browser --request-id "
+                     + rid + " --port " + str(self.app.auth.port) + "</code>"
+                     '<p>Approval expires after two minutes. Then choose Continue:</p>'
+                     '<form method="post" action="/auth/browser/claim">'
+                     '<input type="hidden" name="request_id" value="' + rid + '">'
+                     '<button>Continue</button></form>')
+        extra = None if cookie is None else {"Set-Cookie": cookie}
+        return self.send_secure(status, page.encode("utf-8"), "text/html; charset=utf-8", extra)
+
+    def browser_post(self):
+        if not self.browser_available():
+            return self.deny(404, "not-found")
+        url = urlsplit(self.path)
+        if url.query or url.path not in {"/auth/browser/request", "/auth/browser/claim", "/auth/browser/approve"}:
+            return self.deny(404, "not-found")
+        native = url.path == "/auth/browser/approve"
+        if native:
+            if self.headers.get_all("Origin") or self.headers.get_all("Sec-Fetch-Site"):
+                return self.deny(403, "approval-refused")
+        elif (self.headers.get_all("Origin") != [f"http://127.0.0.1:{self.app.auth.port}"]
+              or self.headers.get_all("Sec-Fetch-Site") != ["same-origin"]):
+            return self.deny(403, "origin")
+        expected_type = "application/json" if native else "application/x-www-form-urlencoded"
+        if self.headers.get_all("Content-Type") != [expected_type]:
+            return self.deny(415, "content-type")
+        lengths = self.headers.get_all("Content-Length") or []
+        if (len(lengths) != 1 or not lengths[0].isdigit() or self.headers.get("Transfer-Encoding")
+                or self.headers.get("Content-Encoding")):
+            return self.deny(400, "length")
+        length = int(lengths[0])
+        if not 0 < length <= 1024:
+            return self.deny(413, "body-size")
+
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+            if native:
+                value = json.loads(raw, object_pairs_hook=_unique_browser_object)
+                if not isinstance(value, dict) or set(value) != {"request_id", "issued", "mac"}:
+                    raise ValueError("shape")
+            else:
+                parsed = parse_qs(raw, strict_parsing=True, keep_blank_values=True, max_num_fields=4)
+                if any(len(v) != 1 for v in parsed.values()):
+                    raise ValueError("duplicate")
+                value = {k: v[0] for k, v in parsed.items()}
+                expected = {"action"} if url.path.endswith("/request") else {"request_id"}
+                if set(value) != expected or ("action" in value and value["action"] != "begin"):
+                    raise ValueError("shape")
+        except (ValueError, UnicodeError):
+            return self.deny(400, "bad-body")
+        if native:
+            accepted = self.app.auth.browser_approve(value["request_id"], value["issued"], value["mac"])
+            return self.send_json(200, {"status": "approved"}) if accepted else self.deny(403, "approval-refused")
+        if self.app.auth.session(self.headers.get("Cookie"), touch=False)[0]:
+            return self.send_secure(303, extra={"Location": "/"})
+        binding_name = f"mc_browser_bind_{self.app.auth.port}"
+        if (len(self.headers.get("Cookie") or "") > 2048 or len(self.headers.get_all("Cookie") or []) > 1
+                or sum(part.strip().partition("=")[0] == binding_name
+                       for part in (self.headers.get("Cookie") or "").split(";")) > 1):
+            return self.deny(400, "cookie")
+        nonce = self.browser_cookie()
+        name = f"mc_browser_bind_{self.app.auth.port}"
+        if url.path.endswith("/request"):
+            result = self.app.auth.browser_begin(nonce)
+            if result is None:
+                return self.deny(429, "request-unavailable")
+            request_id, nonce = result
+            cookie = f"{name}={nonce}; HttpOnly; SameSite=Strict; Path=/auth/browser; Max-Age={BROWSER_TTL_S}"
+            return self.browser_page(201, request_id, cookie)
+        request_id = value["request_id"]
+        status, sid = self.app.auth.browser_claim(request_id, nonce)
+        if status == "pending":
+            return self.browser_page(202, request_id)
+        if status != "ok":
+            return self.deny(403, "claim-refused")
+        return self.send_secure(303, extra={"Location": "/", "Set-Cookie": [
+            f"mc_sid={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_S}",
+            f"{name}=; HttpOnly; SameSite=Strict; Path=/auth/browser; Max-Age=0"]})
 
     def launch(self, url):
         code = (parse_qs(url.query).get("c") or [""])[0]
@@ -894,6 +1119,44 @@ def cmd_serve(args) -> int:
     return 0
 
 
+def approve_browser(args):
+    """The approval MAC stays inside a direct local connection; public ID is never a bearer credential."""
+    if (type(args.port) is not int or not 1 <= args.port <= 65535
+            or not isinstance(args.request_id, str) or not BROWSER_ID.fullmatch(args.request_id)):
+        print("local browser approval refused: invalid request")
+        return 2
+    connection = None
+    try:
+        issued = int(time.time())
+        key = mc_chat.secret(create=False)
+        body = json.dumps({"request_id": args.request_id, "issued": issued,
+                           "mac": browser_approval_mac(key, args.request_id, args.port, issued)})
+        # http.client uses a literal TCP destination, no ambient proxy discovery and no redirect following.
+        connection = http.client.HTTPConnection("127.0.0.1", args.port, timeout=3)
+        connection.request("POST", "/auth/browser/approve", body=body,
+                           headers={"Content-Type": "application/json", "Host": f"127.0.0.1:{args.port}"})
+        response = connection.getresponse()
+        raw = response.read(1025)
+        if (response.status != 200 or len(raw) > 1024
+                or json.loads(raw, object_pairs_hook=_unique_browser_object) != {"status": "approved"}):
+            print("local browser approval refused")
+            return 2
+        print("approved this browser request; return to the same tab and choose Continue")
+        return 0
+    except (TimeoutError, socket.timeout):
+        print("local browser approval outcome unknown; inspect the browser before retrying")
+        return 2
+    except Exception:  # no URL, body, headers, MAC, key or reflected transport exception may escape
+        print("local browser approval failed")
+        return 2
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="mission-control", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -912,6 +1175,9 @@ def main(argv=None) -> int:
         q.add_argument("--port", type=int, default=DEFAULT_PORT)
         if name == "url":
             q.add_argument("--demo-host", help="print the https Funnel form of the link for a demo instance")
+    q = sub.add_parser("approve-browser", help="approve one public request for its original local browser only")
+    q.add_argument("--request-id", required=True)
+    q.add_argument("--port", type=int, default=DEFAULT_PORT)
     for name in ("install-launchd", "uninstall-launchd"):
         q = sub.add_parser(name)
         q.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -919,6 +1185,8 @@ def main(argv=None) -> int:
         q.add_argument("--apply", action="store_true")
     sub.add_parser("rotate-secret")
     args = parser.parse_args(argv)
+    if args.cmd == "approve-browser":
+        return approve_browser(args)
     if args.cmd == "serve":
         return cmd_serve(args)
     if args.cmd == "url":
