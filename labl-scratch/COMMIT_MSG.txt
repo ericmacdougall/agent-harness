@@ -1,0 +1,8 @@
+test(lab-l): scratch copy of Lab L sources
+
+Why: durable local copy of lab sources authored on the Mac while the real runs and repos live on t2-dev ~/lab-l; not for delivery to this repo.
+What: labl-scratch/ml-loop-lab (loop, embed, tuning, analysis) and labl-scratch/python-ai-backend-lab (benchmarks, typing corpus).
+Testing: `python run_typing.py --out ../results/typing.json` on t2-dev: exit 0, 21 variants run, 14 of 14 type bugs and 0 of 6 logic bugs caught by mypy and pyright; other scripts not run yet.
+Refs: GoodQA #15642
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
