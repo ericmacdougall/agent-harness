@@ -587,14 +587,31 @@ def _owners_with_deadline(home, session_id, seconds):
 
 
 def _slot_freed(row):
-    """F4: a silent owner frees its slot only for an ending disposition (closed, superseded, wontdo, or reassigned) that
-    `ah` does not still mark decision_required. `live: true` alone never frees it: a resumed owner inside its grace and a
-    waiting owner are still owners."""
+    """A silent owner frees its slot when main disposed of it the way the liveness alerts already accept
+    (liveness.row_disposed, goodqa#15322): the work was reassigned, closed, superseded or written off, or a named wait is
+    still live (a reassignment or wait counts only while its holder is live, never-drop 16.1). A `resumed` owner is working, so it keeps its slot, and `ah` still marking
+    decision_required keeps it too. GoodQA #15565: a0680533 (live wait) was SILENT-HIGH and disposed, yet held one of
+    the four slots. With never-drop 16.1, a reassignment frees a slot only while its successor is live (af265a5's
+    had returned, so that owner is ownerless and decision_required, not disposed)."""
     disp = row.get('disposition')
     if not isinstance(disp, dict) or row.get('decision_required') is True:
         return False
     kind = disp.get('kind')
-    return kind in ('closed', 'superseded', 'wontdo') or (kind == 'reassigned' and disp.get('live') is True)
+    if kind in ('closed', 'superseded', 'wontdo', 'legacy'):
+        return True
+    # a reassignment or a wait frees the slot only while its holder is live (`live` is ah's own verdict); this is checked
+    # here, not left to liveness.row_disposed, which accepted any reassignment until never-drop 16.1 lands (red-team ad4294 B1)
+    return kind in ('reassigned', 'waiting') and disp.get('live') is True
+
+
+IDLE_OWNER_MAX_S = liveness.SILENT_S  # an owner-type agent `ah` calls idle-helper holds its slot while it is merely quiet
+
+
+def _counts_while_idle(row):
+    """`ah owners` flags only task-owner agents as owners, so a quiet general-purpose owner is classified idle-helper.
+    It is still running (never stopped), so it holds a slot while its idle time is known and under IDLE_OWNER_MAX_S (a longer-idle one is stale, not working)."""
+    idle = row.get('idle_s')
+    return str(row.get('state') or '') == 'idle-helper' and isinstance(idle, (int, float)) and idle < IDLE_OWNER_MAX_S
 
 
 def live_owner_ids(session_id, policy):
@@ -605,10 +622,11 @@ def live_owner_ids(session_id, policy):
                                      OWNER_COUNT_DEADLINE_S)
         return sorted(r['agent_id'] for r in data.get('owners') or []
                       if counts_as_owner(r.get('type'), policy, r.get('owner'))
-                      and str(r.get('state') or '').startswith(RUNNING_STATES)
+                      and (str(r.get('state') or '').startswith(RUNNING_STATES) or _counts_while_idle(r))
                       # a silent owner that main disposed of (reassigned, closed, ...) frees its slot; an owner that is
                       # live, working or quiet always counts, whatever its disposition (red-team C3)
-                      and (str(r.get('state') or '').startswith(('live', 'working', 'quiet')) or not _slot_freed(r)))
+                      and (str(r.get('state') or '').startswith(('live', 'working', 'quiet')) or _counts_while_idle(r)
+                           or not _slot_freed(r)))
     except (Exception, _Deadline):  # noqa: BLE001,B036 - no main WAL yet, a partial install or a scan past its deadline: the live map decides
         pass
     try:
