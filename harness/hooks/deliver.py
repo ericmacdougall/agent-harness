@@ -1717,7 +1717,7 @@ def finish(args):
     try:
         # Before any checkout effect: a bare python3 that resolves to an
         # unsupported interpreter would only fail after the fast-forward.
-        require_check_interpreters(checks)
+        require_check_interpreters(checks, args.original)
     except CheckInterpreterError as error:
         raise DeliveryError("BLOCKED_POLICY", str(error), code=2) from None
     with Workflow(args) as flow:
