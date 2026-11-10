@@ -243,8 +243,10 @@ def main():
                 users_own = False
         if policy.get('mode') != 'off' and args.event in target_ledger.CHECKED_EVENTS and not args.by and not users_own:
             ledger = target_ledger.ledger_from_wal(path.parent / 'main.jsonl', policy.get('terms') or [], policy.get('nouns') or [])
-            found = target_ledger.check_text(note, ledger, policy.get('narrowing') or [], bool(policy.get('require_ask')),
-                                           policy.get('term_narrowing') or [])
+            require_ask = bool(policy.get('require_ask'))
+            found = target_ledger.check_text(note, ledger, policy.get('narrowing') or [], require_ask,
+                                           policy.get('term_narrowing') or [],
+                                           target_ledger.registered_asks(path.parent) if require_ask else None)
             if found:
                 text = target_ledger.advice(found, bool(policy.get('require_ask')))
                 if policy.get('mode') == 'enforce':

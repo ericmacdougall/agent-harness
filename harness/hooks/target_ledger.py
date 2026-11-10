@@ -14,7 +14,8 @@ note and the quoted words of its source it extracts
   - states a SMALLER number of a ledgered noun next to a narrowing word (in that sentence or its neighbours) or a done word,
   - names a ledgered noun (all-target) or term with a narrowing word in the same sentence
 unless a sentence that STARTS with ASSUMPTION or TARGET_MISMATCH covers it (the same sentence or an adjacent one; with
-require_ask, an ask id in the note too). A label inside a code span, a file name or the middle of a sentence is not a label.
+require_ask, the id of an `ask` row registered in this session's logs in the note too). A label inside a code span, a
+file name or the middle of a sentence is not a label.
 Stdlib only; Python 3.9+.
 """
 from __future__ import annotations
@@ -38,13 +39,14 @@ ALL_OF = re.compile(r"\ball[ \t]+(?:the[ \t]+|of[ \t]+the[ \t]+)?([a-z][a-z-]*)"
 CODE_SPAN = re.compile(r"`[^`\n]*`")
 LABEL_START = re.compile(r"^[\s(\[\"'*_>-]*(?:ASSUMPTION|TARGET_MISMATCH)(?![\w./-])")
 ASK_ID = re.compile(r"\bw[0-9a-f]{11}\b")
+CLAUSES = re.compile(r"[,:()]|\s+-\s+|\s+(?:but|while|whereas)\s+")
 SENTENCES = re.compile(r"(?<=[.!?;])\s+|\n+")
 STOP_NOUNS = {"the", "a", "an", "of", "and", "or", "to", "in", "on", "for", "with", "by", "is", "are", "was", "were", "at",
               "pilot", "only", "done", "complete", "completed", "finished"}
 ALIASES = {"repository": "repo", "repositorie": "repo", "repositories": "repo", "repos": "repo"}
 DONE = re.compile(r"\b(?:done|complete|completed|finished|shipped|delivered|reached)\b", re.I)
 PART_OF = re.compile(r"\b(?:sample|subset|portion|fraction|slice)\b|\b(?:part|some|few)\b[ \t]+of\b", re.I)
-FULL_SCOPE =re.compile(r"\b(?:all|every|each|whole|entire)\b", re.I)
+FULL_SCOPE = re.compile(r"\b(?:all|every|each|whole|entire)\b[ \t]+((?:[a-z][a-z-]*[ \t]+){0,2}[a-z][a-z-]*)", re.I)
 CHECKED_EVENTS = ("handoff", "result", "status", "decision", "check", "scope")
 DEFAULT_POLICY = {"mode": "warn", "terms": [], "narrowing": [], "term_narrowing": [], "nouns": [], "require_ask": False}
 MAX_LEDGER_BYTES = 16 << 20
@@ -75,9 +77,21 @@ def _stem(word: str) -> str:
     return word[:-1] if word.endswith("s") and not word.endswith("ss") else word
 
 
-def _noun(phrase: str) -> str:
-    words = [w for w in re.findall(r"[a-z][a-z-]*", phrase.lower()) if w not in STOP_NOUNS]
-    return _stem(words[-1]) if words else ""
+def _noun(phrase: str, nouns=()) -> str:
+    """The counted noun of the words after a number. With configured nouns, the LAST configured noun before the first
+    stop word ("1000 email leads today", "1000 leads by Friday" -> lead): a trailing adverb, deadline or qualifier never
+    hides it (final-gate F3). Without nouns, the last word before the first stop word."""
+    head = []
+    for w in re.findall(r"[a-z][a-z-]*", phrase.lower()):
+        if w in STOP_NOUNS:
+            if head:
+                break
+            continue
+        head.append(_stem(w))
+    if nouns:
+        found = [w for w in head if w in nouns]
+        return found[-1] if found else ""
+    return head[-1] if head else ""
 
 
 def _nouns(phrase: str) -> set:
@@ -107,8 +121,8 @@ def extract_targets(text: str, terms=(), nouns=()) -> list:
     """Targets stated in the user's words."""
     out = []
     for m in COUNT.finditer(text or ""):
-        number, noun = _number(m.group(1)), _noun(m.group(2))
-        if number is not None and number >= 10 and noun and (not nouns or noun in nouns):
+        number, noun = _number(m.group(1)), _noun(m.group(2), nouns)
+        if number is not None and number >= 10 and noun:
             out.append({"kind": "count", "number": number, "noun": noun})
     for m in ALL_OF.finditer(text or ""):
         noun = _noun(m.group(1))
@@ -165,6 +179,27 @@ def _has_word(low: str, words) -> bool:
     return any(re.search(r"\b" + re.escape(w) + r"\b", low) for w in words)
 
 
+def _full_scope(plain: str, noun: str) -> bool:
+    """A full-scope word bound to the ledgered noun ("all repos", "every one of the repos"), never one about something
+    else in the sentence ("core repos only, all tests passed"; final-gate F2)."""
+    return any(noun in _nouns(m.group(1)) for m in FULL_SCOPE.finditer(plain))
+
+
+def registered_asks(wal_dir) -> set:
+    """Ids of the `ask` rows (open or resolved) in the main and agent logs of the session whose log folder is wal_dir
+    (<home>/wals/<session>), read with provenance's asks ledger. Empty when the folder is not a session log folder or
+    cannot be read, so require_ask fails closed (final-gate F4)."""
+    try:
+        wal_dir = Path(wal_dir)
+        if wal_dir.parent.name != "wals" or wal_dir.is_symlink():
+            return set()
+        import provenance
+        return {r["id"] for r in provenance.ledger(wal_dir.name, home=wal_dir.parent.parent)
+                if isinstance(r.get("id"), str) and ASK_ID.fullmatch(r["id"])}
+    except Exception:  # noqa: BLE001 - no readable asks: no ask exempts a note
+        return set()
+
+
 def _labelled(sentences: list, i: int) -> bool:
     """A sentence that STARTS with the label covers its own sentence and the two beside it."""
     for j in (i - 1, i, i + 1):
@@ -173,14 +208,18 @@ def _labelled(sentences: list, i: int) -> bool:
     return False
 
 
-def check_text(text: str, ledger: list, narrowing=(), require_ask: bool = False, term_narrowing=()) -> list:
-    """Findings [{"sentence", "why", "target"}] for sentences that narrow a ledgered target and are not labelled."""
+def check_text(text: str, ledger: list, narrowing=(), require_ask: bool = False, term_narrowing=(),
+               registered_asks=None) -> list:
+    """Findings [{"sentence", "why", "target"}] for sentences that narrow a ledgered target and are not labelled.
+    With require_ask, a label counts only beside an ask id in registered_asks (the session's own `ask` rows); an id
+    that merely has the shape, or no registry at all, never does."""
     if not ledger or not text:
         return []
     words = [str(w).lower() for w in narrowing]
     term_words = words + [str(w).lower() for w in term_narrowing]  # common words only count next to a ledgered method
     sentences = [s for s in SENTENCES.split(text) if s.strip()]
-    asked = bool(ASK_ID.search(text))
+    known = set(registered_asks or ())
+    asked = any(m.group(0) in known for m in ASK_ID.finditer(text))
     findings = []
     for i, sentence in enumerate(sentences):
         plain = CODE_SPAN.sub(" ", sentence)
@@ -192,15 +231,19 @@ def check_text(text: str, ledger: list, narrowing=(), require_ask: bool = False,
                 numbers = [(_number(m.group(1)), m.group(2)) for m in COUNT.finditer(plain)]
                 same = [n for n, phrase in numbers if n is not None and target["noun"] in _nouns(phrase)]
                 if same and max(same) >= target["number"]:
-                    if not PART_OF.search(plain):
+                    smaller = [n for n in same if n < target["number"]]
+                    if PART_OF.search(plain):
+                        hit = (f"takes a part of the stated {target['number']} {target['noun']}s", target)
+                        same = []  # reported below
+                    elif smaller and _has_word(low, words):
+                        same = smaller  # a smaller result beside a mention of the target is still smaller (final-gate F1)
+                    else:
                         continue  # the full count is stated: not a narrowing
-                    hit = (f"takes a part of the stated {target['number']} {target['noun']}s", target)
-                    same = []  # reported below
                 if same and (_has_word(around, words) or DONE.search(plain)):
                     hit = (f"states {min(same)} {target['noun']}s against the stated {target['number']}", target)
             elif target["kind"] == "all":
-                named = target["noun"] in _nouns(plain)
-                if named and not FULL_SCOPE.search(plain) and _has_word(low, words):
+                clauses = [c for c in CLAUSES.split(low) if target["noun"] in _nouns(c)]
+                if clauses and not _full_scope(plain, target["noun"]) and any(_has_word(c, words) for c in clauses):
                     hit = (f"narrows 'all {target['noun']}s' with a narrowing word", target)
             elif target["kind"] == "term" and target["term"] in low and _has_word(around, term_words):
                 hit = (f"narrows the stated method '{target['term']}'", target)

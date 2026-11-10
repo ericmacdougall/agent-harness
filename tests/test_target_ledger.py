@@ -80,7 +80,8 @@ class Narrowing(unittest.TestCase):
         text = "ASSUMPTION: 25-lead pilot only."
         self.assertEqual(tl.check_text(text, LEDGER, POLICY["narrowing"]), [])
         self.assertTrue(tl.check_text(text, LEDGER, POLICY["narrowing"], require_ask=True))
-        self.assertEqual(tl.check_text(text + " ask w0123456789a", LEDGER, POLICY["narrowing"], require_ask=True), [])
+        self.assertEqual(tl.check_text(text + " ask w0123456789a", LEDGER, POLICY["narrowing"], require_ask=True,
+                                       registered_asks={"w0123456789a"}), [])
 
     def test_no_ledger_means_nothing_to_check(self):
         self.assertEqual(tl.check_text("25-lead pilot", [], POLICY["narrowing"]), [])
@@ -156,6 +157,90 @@ class ReviewFindings(unittest.TestCase):
             self.assertTrue(seen.get("max_total_bytes") and seen.get("max_seconds"))
 
 
+def ledger_of(note):
+    return tl.ledger_from_rows([row(note)], POLICY["terms"], POLICY["nouns"])
+
+
+def write_rows(folder, rows, name="main.jsonl"):
+    folder.mkdir(parents=True, exist_ok=True)
+    with open(folder / name, "a") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, separators=(",", ":")) + "\n")
+    return folder
+
+
+class FinalGateFindings(unittest.TestCase):
+    """Codex final-gate review of c2aafbc: F1 to F4."""
+
+    def flag(self, text, ledger, **kw):
+        return tl.check_text(text, ledger, POLICY["narrowing"], term_narrowing=POLICY["term_narrowing"], **kw)
+
+    def test_f3_a_trailing_adverb_deadline_or_qualifier_keeps_the_count_target(self):
+        for suffix in ("", " today", " by Friday", " this week", " each", " in the CRM", " for the pilot",
+                       " by end of day", " asap"):
+            note = "Collect 1000 leads" + suffix
+            with self.subTest(note=note):
+                ledger = ledger_of(note)
+                self.assertEqual([(t["number"], t["noun"]) for t in ledger if t["kind"] == "count"], [(1000, "lead")], note)
+                self.assertTrue(self.flag("Dialer slice done on a 25-lead pilot.", ledger), note)  # downstream narrowing
+                self.assertEqual(self.flag("Collected 1000 leads.", ledger), [], note)
+
+    def test_f3_the_head_noun_is_found_not_a_modifier_or_a_word_after_a_preposition(self):
+        self.assertEqual([t["noun"] for t in ledger_of("Collect 1000 email leads today") if t["kind"] == "count"], ["lead"])
+        self.assertEqual([t for t in ledger_of("Wait 1000 seconds for the hosts") if t["kind"] == "count"], [])
+
+    def test_f4_require_ask_needs_a_registered_ask_of_this_session(self):
+        text = "ASSUMPTION: 25-lead pilot; ask wdeadbeef123"
+        ledger = ledger_of("Collect 1000 leads")
+        self.assertTrue(self.flag(text, ledger, require_ask=True))                           # no registry: fails closed
+        self.assertTrue(self.flag(text, ledger, require_ask=True, registered_asks=set()))
+        self.assertTrue(self.flag(text, ledger, require_ask=True, registered_asks={"w0123456789a"}))
+        self.assertEqual(self.flag(text, ledger, require_ask=True, registered_asks={"wdeadbeef123"}), [])
+
+    def test_f4_registered_asks_reads_ask_rows_open_or_resolved_of_this_session_only(self):
+        with tempfile.TemporaryDirectory() as home:
+            mine = write_rows(Path(home) / "wals" / "sess-a", [
+                {"event": "ask", "id": "w111111111aa", "note": "open ask"},
+                {"event": "ask", "id": "w222222222bb", "note": "resolved ask"},
+                {"event": "ask_resolved", "id": "w333333333cc", "ref": "w222222222bb"},
+                {"event": "decision", "id": "w444444444dd", "note": "a decision, not an ask"}])
+            write_rows(mine, [{"event": "ask", "id": "w555555555ee", "note": "agent ask"}], "agent-x.jsonl")
+            write_rows(Path(home) / "wals" / "sess-b", [{"event": "ask", "id": "w666666666ff", "note": "other session"}])
+            asks = tl.registered_asks(mine)
+            self.assertEqual(asks, {"w111111111aa", "w222222222bb", "w555555555ee"})
+            ledger = ledger_of("Collect 1000 leads")
+            for ident, ok in (("wdeadbeef123", False), ("w444444444dd", False), ("w666666666ff", False),
+                              ("w333333333cc", False), ("w111111111aa", True), ("w222222222bb", True)):
+                with self.subTest(ident=ident):
+                    found = self.flag(f"ASSUMPTION: 25-lead pilot; ask {ident}", ledger, require_ask=True, registered_asks=asks)
+                    self.assertEqual(found == [], ok, ident)
+            self.assertEqual(tl.registered_asks(Path(home) / "not-a-wal-dir"), set())
+
+    def test_f1_a_mention_of_the_target_does_not_cancel_a_smaller_result(self):
+        ledger = ledger_of("Collect 1000 leads")
+        for text in ("25-lead pilot done against the 1000 leads requested.", "Only 25 leads done, target was 1000 leads.",
+                     "Pilot of 25 leads out of the 1000 leads."):
+            with self.subTest(text=text):
+                self.assertTrue(self.flag(text, ledger), text)
+        for text in ("Collected 1000 leads.", "Collected all 1000 leads; 25 leads were duplicates and removed.",
+                     "Ran 1,000 leads in a pilot environment.", "1000 leads done, 1200 leads found."):
+            with self.subTest(text=text):
+                self.assertEqual(self.flag(text, ledger), [], text)
+
+    def test_f2_a_full_scope_word_must_bind_to_the_ledgered_noun(self):
+        ledger = ledger_of("Cover all repositories")
+        self.assertIn(("all", "repo"), [(t["kind"], t.get("noun")) for t in ledger])
+        ledger = [t for t in ledger if t["kind"] == "all"]  # the all-scope rule alone (the 'all repos' term has its own)
+        for text in ("Reviewed core repositories only, all tests passed.", "Every check green; core repos only."):
+            with self.subTest(text=text):
+                self.assertTrue(self.flag(text, ledger), text)
+        for text in ("Covered all repositories; the core suite only ran once.", "Covered all of the repos; core checks only.",
+                     "Every repo reviewed; only cosmetic issues.",
+                     "Planning only, no repo changes.", "Release-only config (pinned keys for the repo host)."):
+            with self.subTest(text=text):
+                self.assertEqual(self.flag(text, ledger), [], text)
+
+
 class WalNote(unittest.TestCase):
     """Through wal_note.py itself, with a throwaway HOME."""
 
@@ -217,6 +302,25 @@ class WalNote(unittest.TestCase):
         self.mode = "warn"
         code, _, err = self.write("Dialer slice done on a 25-lead pilot.", source="user:fake")
         self.assertIn("target ledger", err)  # in warn mode the advice is no longer dropped either
+
+    def test_f4_require_ask_through_wal_note_needs_a_registered_ask_of_this_session(self):
+        write_rows(self.wal.parent, [{"event": "ask", "id": "w0a0a0a0a0a0", "note": "pilot ok?"},
+                                     {"event": "decision", "id": "w0b0b0b0b0b0", "note": "x"}])
+        write_rows(self.home / ".claude" / "wals" / "sess-2", [{"event": "ask", "id": "w0c0c0c0c0c0", "note": "y"}])
+        policy = dict(tl.load_policy(), mode="enforce", require_ask=True)
+        for ident, refused in (("wdeadbeef123", True), ("w0b0b0b0b0b0", True), ("w0c0c0c0c0c0", True), ("w0a0a0a0a0a0", False)):
+            with self.subTest(ident=ident):
+                argv = ["wal_note.py", "--wal", str(self.wal), "--event", "status", "--note",
+                        f"ASSUMPTION: 25-lead pilot; ask {ident}"]
+                err = io.StringIO()
+                with mock.patch.dict(os.environ, {"HOME": str(self.home)}), mock.patch("sys.argv", argv), \
+                        mock.patch.object(tl, "load_policy", lambda *a, **k: policy), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    try:
+                        code = wal_note.main()
+                    except SystemExit as exit_:
+                        code = exit_.code
+                self.assertEqual(code == 2, refused, (ident, err.getvalue()))
 
     def test_f5_a_hostile_policy_or_ledger_never_stops_a_note_being_written(self):
         with mock.patch.object(tl, "ledger_from_wal", mock.Mock(side_effect=RuntimeError("boom"))):
