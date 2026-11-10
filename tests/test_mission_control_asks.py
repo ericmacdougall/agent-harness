@@ -100,6 +100,11 @@ class Page(unittest.TestCase):
             self.assertNotIn(sink, source, sink)
         self.assertIn("parts.text.textContent = ask.text", source)
 
+    def test_escape_closes_dialogs_without_relying_on_native_cancel(self):  # click-test F1 (af566316)
+        main = (WEB / "main.js").read_text()
+        self.assertIn("if (event.key !== 'Escape') return;", main)
+        self.assertIn("document.querySelectorAll('dialog[open]')", main)
+
     def test_a_reply_is_an_ordinary_tagged_chat_message_to_main(self):
         store = (WEB / "store.js").read_text()
         body = re.search(r"export function sendAskReply[\s\S]*?\n}\n", store).group(0)

@@ -141,6 +141,15 @@ inspector.addEventListener('click', event => {
 const approval = document.getElementById('approval-dialog');
 document.getElementById('approval-help').addEventListener('click', () => approval.showModal());
 document.getElementById('approval-close').addEventListener('click', () => approval.close());
+// Escape closes the open dialog explicitly, not only through the browser's native cancel (which assistive and
+// automation tools that send synthetic keys do not trigger). Closing an already-closed dialog is a no-op.
+document.addEventListener('keydown', event => {
+  if (event.key !== 'Escape') return;
+  const open = [...document.querySelectorAll('dialog[open]')].pop();
+  if (!open) return;
+  event.preventDefault();
+  if (open === inspector) select(null); else open.close();
+});
 
 // iOS VisualViewport accounts for keyboard resizing and focus-driven panning.
 const visual = window.visualViewport;
