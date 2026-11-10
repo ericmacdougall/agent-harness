@@ -178,7 +178,7 @@ Three knobs exercise the slow-network and failure cases:
 
 - `MC_DEMO_CHAT_DELAY_MS=3000` holds each chat send for 3 s before anything is stored, so the page's "Sending…" state and an edit made while pending can be seen.
 - `MC_DEMO_DROP_FIRST=1` stores the first message and then drops its response, so the page's same-key retry can be checked.
-- `MC_DEMO_REFUSE_FIRST=1` refuses the first send (503) without storing it, so the failed message, its Retry button and the kept text can be checked.
+- `MC_DEMO_REFUSE_FIRST=1` refuses the first send (409, which the page does not retry) without storing it, so the failed message, its Retry button and the kept text can be checked.
 
 The demo feed also writes two tool-call records each pulse (seen with "Show tool activity"), and about once a minute a burst of 30 lines, which shows as a "more events in a burst" row.
 
