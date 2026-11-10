@@ -419,6 +419,221 @@ class BgJobLedger(Base):
         self.assertFalse(kg.Ownership(elsewhere, home=self.home, policy=kg.load_policy()).check(child)[0])
 
 
+LSOF = json.loads((ROOT / 'tests' / 'data' / 'lsof_unix_macos.json').read_text())
+
+
+class LsofParser(unittest.TestCase):
+    """The PRODUCTION macOS socket discovery (Probe._unix_fds -> parse_lsof_unix -> stdio_bound_to) on captured,
+    sanitised `lsof -F ftdn` output (tests/data/capture_lsof_unix.py regenerates it). Only `_run` is replaced, by a
+    function that returns the fixture for the argv Probe builds, so the argv, the parser and the pairing rule are all
+    the production code."""
+
+    HOOK, SESSION = LSOF['hook_pid'], LSOF['session_pid']
+
+    def probe(self, hook=None, session=None):
+        texts = {self.HOOK: LSOF['hook_stdio'] if hook is None else hook,
+                 self.SESSION: LSOF['session_all'] if session is None else session}
+        calls = []
+
+        def fake_run(argv, *a, **k):
+            calls.append(list(argv))
+            pid = int(argv[argv.index('-p') + 1])
+            return texts.get(pid, '')
+
+        patch = mock.patch.object(kg, '_run', fake_run)
+        patch.start()
+        self.addCleanup(patch.stop)
+        probe = kg.Probe()
+        probe.proc = False      # the macOS path, also when this suite runs on Linux
+        probe.calls = calls
+        return probe
+
+    def bound(self, **kw):
+        probe = self.probe(**kw)
+        return kg.stdio_bound_to(probe, self.HOOK, self.SESSION)
+
+    def test_captured_hook_socketpairs_prove_the_hook(self):
+        probe = self.probe()
+        self.assertEqual(probe.stdio_sockets(self.HOOK), {1: ('0x00000000000a0001', '0x00000000000a0002'),
+                                                          2: ('0x00000000000a0003', '0x00000000000a0004')})
+        self.assertEqual(probe.unix_sockets(self.SESSION), {'0x00000000000a0002': '0x00000000000a0001',
+                                                            '0x00000000000a0004': '0x00000000000a0003'})
+        self.assertTrue(kg.stdio_bound_to(probe, self.HOOK, self.SESSION))
+        self.assertIn(['lsof', '-n', '-P', '-a', '-p', str(self.HOOK), '-d', '1,2', '-F', 'ftdn'], probe.calls)
+        self.assertIn(['lsof', '-n', '-P', '-a', '-p', str(self.SESSION), '-F', 'ftdn'], probe.calls)
+
+    def test_real_claude_session_output_parses_every_unix_socket(self):
+        text = LSOF['claude_session_unix']
+        rows = kg.parse_lsof_unix(text, LSOF['claude_session_pid'])
+        self.assertEqual(len(rows), text.count('\ntunix\n'))
+        named = [r for r in rows if not r[2]]
+        self.assertEqual(len(named), text.count('n/sanitised/listening.sock'))
+        self.assertTrue(all(r[2].startswith('0x') for r in rows if r not in named))
+        self.assertEqual(kg.parse_lsof_unix(text, LSOF['claude_session_pid'] + 1), [], 'output for another pid')
+
+    def test_peer_held_with_the_wrong_reverse_end_fails(self):
+        swapped = LSOF['session_all'].replace('n->0x00000000000a0001', 'n->0x00000000000a0003')
+        self.assertFalse(self.bound(session=swapped))
+
+    def test_missing_or_malformed_peer_data_fails_closed(self):
+        hook, session = LSOF['hook_stdio'], LSOF['session_all']
+        cases = {
+            'no output at all': dict(hook=''),
+            'session unreadable': dict(session=''),
+            'fd 2 missing': dict(hook=hook.split('f2\n')[0]),
+            'fd 1 peer line missing': dict(hook=hook.replace('n->0x00000000000a0002\n', '')),
+            'fd 1 named socket': dict(hook=hook.replace('n->0x00000000000a0002', 'n/tmp/listen.sock')),
+            'fd 1 peer none': dict(hook=hook.replace('n->0x00000000000a0002', 'n->(none)')),
+            'fd 1 bare arrow': dict(hook=hook.replace('n->0x00000000000a0002', 'n->')),
+            'fd 1 peer with junk': dict(hook=hook.replace('n->0x00000000000a0002', 'n->0x00000000000a0002 x')),
+            'fd 1 not hex': dict(hook=hook.replace('d0x00000000000a0001', 'd0xZZ')),
+            # the same non-hex address on both sides: only the address format rejects it
+            'non-hex address on both ends': dict(hook=hook.replace('0x00000000000a0001', '0xNOTHEX'),
+                                                 session=session.replace('0x00000000000a0001', '0xNOTHEX')),
+            'fd 1 device not an address': dict(hook=hook.replace('d0x00000000000a0001', 'd1,2')),
+            'fd 1 not unix': dict(hook=hook.replace('tunix', 'tIPv4', 1)),
+            'fd 1 type repeated': dict(hook=hook.replace('tunix\n', 'tunix\ntunix\n', 1)),
+            'fd 1 two names': dict(hook=hook.replace('n->0x00000000000a0002\n',
+                                                     'n->0x00000000000a0002\nn->0x00000000000a0002\n')),
+            # a second, conflicting listing of fd 1 placed first, so a last-one-wins parser would pass
+            'fd 1 listed twice': dict(hook=hook.replace('p2222\n', 'p2222\nf1\ntunix\nd0x00000000000a0009\n'
+                                                                    'n->0x00000000000a0008\n')),
+            'hook output for another pid': dict(hook=hook.replace('p2222', 'p2223')),
+            'no p line': dict(hook=hook.replace('p2222\n', '')),
+            'both fds one socket': dict(hook=hook.replace('d0x00000000000a0003\nn->0x00000000000a0004',
+                                                          'd0x00000000000a0001\nn->0x00000000000a0002')),
+            'session holds only one end': dict(session=session.split('f6\n')[0]),
+            'session output for another pid': dict(session=session.replace('p1111', 'p1112')),
+            'session lists an end with two peers': dict(
+                session=session.replace('f4\n', 'f8\ntunix\nd0x00000000000a0002\nn->0x00000000000a0077\nf4\n')),
+            'garbage': dict(hook='\x00\xff\nf\nt\nd\nn\n', session='p\nf1\n'),
+        }
+        self.assertTrue(self.bound(), 'control: the captured output passes')
+        for name, kw in cases.items():
+            with self.subTest(case=name):
+                self.assertFalse(self.bound(**kw))
+
+    def test_linux_has_no_socket_data(self):
+        probe = kg.Probe()
+        probe.proc = True
+        self.assertEqual(probe._unix_fds(os.getpid()), [])
+
+
+def _emulator(test, env):
+    emu = subprocess.Popen([sys.executable, '-I', str(ROOT / 'tests' / 'claude_hook_emulator.py')], env=env,
+                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, start_new_session=True)
+    test.addCleanup(emu.stdout.close)
+    test.addCleanup(emu.wait, 30)
+    test.addCleanup(emu.stdin.close)
+
+    def ask(**req):
+        emu.stdin.write(json.dumps(req) + '\n')
+        emu.stdin.flush()
+        return json.loads(emu.stdout.readline())
+    return ask
+
+
+@unittest.skipUnless(sys.platform == 'darwin' and os.path.exists('/usr/sbin/lsof'), 'needs the real macOS lsof')
+class RealMacTopology(Base):
+    """End to end on real processes: tests/claude_hook_emulator.py plays the Claude Code session process (topology
+    measured live), and the hook entry runs exactly as install.py registers it (`python3 kill_guard.py record-bg`,
+    payload on stdin) with HOME set to this test's disposable directory. No probe is faked. Every process started
+    here is stopped by process group in cleanup; nothing else is signalled."""
+
+    CMD = 'sleep 30 & (sleep 30 &) ; wait'      # S, its child, and an orphan that keeps S's process group
+
+    def setUp(self):
+        super().setUp()
+        for path in (self.root, self.other):
+            subprocess.run(['git', 'init', '-q', path], check=True, timeout=30)
+        self.env = dict(os.environ, HOME=self.home, PATH='/usr/bin:/bin:/usr/sbin:/sbin')
+        self.ask = _emulator(self, self.env)
+        self.hook = [sys.executable, '-I', str(HOOKS / 'kill_guard.py'), 'record-bg']
+
+    def start_bg(self, task):
+        pid = self.ask(op='bg', task=task, cmd=self.CMD)['pid']
+        self.addCleanup(self._stop_group, pid)
+        members = []
+        for _ in range(200):
+            table = kg.Probe().table()
+            members = [p for p, (_pp, pg, _u) in table.items() if pg == pid and p != pid]
+            if len(members) >= 2 and any(table[p][0] == pid for p in members) and \
+                    any(table[p][0] != pid for p in members):
+                break
+            time.sleep(0.02)
+        child = [p for p in members if kg.Probe().ppid(p) == pid]
+        orphan = [p for p in members if kg.Probe().ppid(p) != pid]
+        self.assertTrue(child and orphan, members)
+        return pid, child[0], orphan[0]
+
+    @staticmethod
+    def _stop_group(pgid):
+        import signal  # noqa: PLC0415
+        try:
+            if os.getpgid(pgid) == pgid:   # still the group this test started
+                os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    def ledger_bytes(self):
+        path = kg.ledger_path(self.root, self.home)
+        return Path(path).read_bytes() if Path(path).exists() else None
+
+    def test_real_hook_records_and_only_this_worktree_may_stop_the_group(self):
+        shell, child, orphan = self.start_bg('liveA1')
+        before = self.ledger_bytes()
+
+        # 1. hand-run from a tool call, naming the live task id: a child of its tool shell, output on the tasks file
+        hand = self.ask(op='tool', cmd='%s -I %s record-bg < {payload}' % (sys.executable, HOOKS / 'kill_guard.py'),
+                        payload=payload(self.root, task='liveA1'))
+        # 2. redirected first
+        redirected = self.ask(op='tool', payload=payload(self.root, task='liveA1'),
+                              cmd='exec >/dev/null 2>&1; %s -I %s record-bg < {payload}' % (
+                                  sys.executable, HOOKS / 'kill_guard.py'))
+        # 3. exec in place of the tool shell with both fds on the tool shell's one socketpair to the session process
+        execd = self.ask(op='tool', payload=payload(self.root, task='liveA1'),
+                         cmd='exec %s -I %s record-bg 1>&{sock} 2>&{sock} < {payload}' % (
+                             sys.executable, HOOKS / 'kill_guard.py'))
+        for name, out in (('hand-run', hand), ('redirected', redirected), ('exec', execd)):
+            with self.subTest(case=name):
+                self.assertEqual(out['rc'], 0, out)
+                self.assertNotIn('recorded', out['out'])
+        self.assertEqual(self.ledger_bytes(), before, 'hand-run and redirected recorders must not write the ledger')
+        self.assertIsNone(before)
+        for pid in (shell, child, orphan):
+            self.assertFalse(self.own(kg.Probe()).check(pid)[0], 'nothing is owned before the hook records')
+
+        # 4. the hook as Claude Code runs it
+        done = self.ask(op='hook', argv=self.hook, payload=payload(self.root, task='liveA1'))
+        self.assertEqual(done['rc'], 0, done)
+        self.assertIn('background shell pid %d is recorded' % shell, done['out'], done)
+        self.assertEqual(kg.read_ledger_groups(self.root, self.home), [(shell, kg.Probe().start(shell))])
+
+        for pid in (shell, child, orphan):
+            with self.subTest(pid=pid):
+                verdict, _rule, message, _ = kg.decide('kill %d' % pid, cwd=self.root, home=self.home,
+                                                       ownership=self.own(kg.Probe()))
+                self.assertEqual(verdict, 'allow', message)
+                verdict, _rule, message, _ = kg.decide(
+                    'kill %d' % pid, cwd=self.other, home=self.home,
+                    ownership=kg.Ownership(self.other, home=self.home, policy=kg.load_policy()))
+                self.assertEqual(verdict, 'block', message)
+
+        # 5. the same hook for a foreground call or another task id records nothing more
+        rows = self.ledger_bytes()
+        fg = self.ask(op='hook', argv=self.hook, payload=payload(self.root, response={'stdout': '', 'stderr': ''}))
+        other = self.ask(op='hook', argv=self.hook, payload=payload(self.root, task='nosuchtask'))
+        self.assertEqual((fg['out'], other['out']), ('', ''))
+        self.assertEqual(self.ledger_bytes(), rows)
+
+    def test_real_hook_in_another_worktree_records_only_there(self):
+        shell, _child, _orphan = self.start_bg('liveB1')
+        done = self.ask(op='hook', argv=self.hook, payload=payload(self.other, task='liveB1'))
+        self.assertIn('pid %d is recorded' % shell, done['out'], done)
+        self.assertEqual(kg.read_ledger_groups(self.root, self.home), [])
+        self.assertFalse(self.own(kg.Probe()).check(shell)[0])
+
+
 class InstallWiring(unittest.TestCase):
     def test_post_tool_use_hook_is_registered(self):
         sys.path.insert(0, str(ROOT))

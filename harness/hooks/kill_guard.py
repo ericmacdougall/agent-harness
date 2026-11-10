@@ -622,6 +622,52 @@ def _run(argv, timeout=2.0, cwd=None, env=None, any_status=False):
     return done.stdout[:65536].decode('utf-8', 'replace')
 
 
+LSOF_ADDR = re.compile(r'0x[0-9a-f]{1,32}')
+
+
+def parse_lsof_unix(text, pid):
+    """[(fd, own address, peer address or '')] for the unix sockets in `lsof -n -P -a -p PID -F ftdn` output (macOS).
+
+    As printed by macOS lsof (captured fixture: tests/data/lsof_unix_macos.json), each process starts with `pPID` and
+    each open file with `fFD`, followed by `tTYPE`, `dDEVICE` (for a unix socket, its kernel address) and `nNAME`
+    (`->0xPEER` for a connected socket, a path for a named one). Fails closed: a record is kept only under the
+    `p` line of the requested pid, with a numeric fd, type unix, a hex address and exactly one name line; a name that
+    is not exactly `->0x<hex>` gives an empty peer, which never proves a pairing. Output for any other pid, or no
+    output at all, yields nothing."""
+    rows, cur, here = [], None, False
+
+    def flush(record):
+        if record is None or not here or record.get('bad'):
+            return
+        names = record.get('n', [])
+        if record.get('t') != 'unix' or len(names) != 1 or not record['f'].isdigit() \
+                or not LSOF_ADDR.fullmatch(record.get('d', '')):
+            return
+        name = names[0]
+        peer = name[2:] if name.startswith('->') and LSOF_ADDR.fullmatch(name[2:]) else ''
+        rows.append((record['f'], record['d'], peer))
+
+    for line in (text or '').splitlines():
+        tag, value = line[:1], line[1:]
+        if tag == 'p':
+            flush(cur)
+            cur = None
+            here = value.isdigit() and int(value) == int(pid)
+        elif tag == 'f':
+            flush(cur)
+            cur = {'f': value}
+        elif cur is None:
+            continue
+        elif tag in ('t', 'd'):
+            if tag in cur:
+                cur['bad'] = True           # a repeated field: the record is not trusted
+            cur[tag] = value
+        elif tag == 'n':
+            cur.setdefault('n', []).append(value)
+    flush(cur)
+    return rows
+
+
 class Probe:
     """Reads facts about a PID. Every method returns None when the fact cannot be read (then the PID is unprovable)."""
 
@@ -738,26 +784,21 @@ class Probe:
         if self.proc:
             return []
         argv = ['lsof', '-n', '-P', '-a', '-p', str(int(pid))] + (['-d', fds] if fds else []) + ['-F', 'ftdn']
-        out = _run(argv, timeout=5.0, any_status=True)
-        rows, cur = [], {}
-        for line in (out or '').splitlines():
-            tag, value = line[:1], line[1:]
-            if tag == 'f':
-                cur = {'f': value}
-            elif tag in ('t', 'd'):
-                cur[tag] = value
-            elif tag == 'n' and cur.get('t') == 'unix' and cur.get('d', '').startswith('0x'):
-                peer = value[2:] if value.startswith('->0x') else ''
-                rows.append((cur['f'], cur['d'], peer))
-        return rows
+        return parse_lsof_unix(_run(argv, timeout=5.0, any_status=True), pid)
 
     def stdio_sockets(self, pid):
         """{1: (own, peer), 2: (own, peer)} for whichever of fd 1 and fd 2 are unix sockets."""
-        return {int(f): (own, peer) for f, own, peer in self._unix_fds(pid, '1,2') if f in ('1', '2')}
+        rows = [(int(f), own, peer) for f, own, peer in self._unix_fds(pid, '1,2') if f in ('1', '2')]
+        fds = [f for f, _own, _peer in rows]
+        return {f: (own, peer) for f, own, peer in rows if fds.count(f) == 1}
 
     def unix_sockets(self, pid):
-        """{own address: peer address} for every unix socket pid holds."""
-        return {own: peer for _f, own, peer in self._unix_fds(pid)}
+        """{own address: peer address} for every unix socket pid holds. An address listed with two different peers
+        (malformed output) maps to '' so it proves nothing."""
+        result = {}
+        for _f, own, peer in self._unix_fds(pid):
+            result[own] = peer if result.get(own, peer) == peer else ''
+        return result
 
     def fd_paths(self, pids):
         """{pid: {path of fd 1, path of fd 2}} for the given pids (missing pids are left out)."""
