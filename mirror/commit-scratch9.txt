@@ -1,0 +1,10 @@
+docs(handoff): goodqa delivery handoff copy and final watch log
+
+Why: main moved GoodQA delivery to the next owner; the handoff text and the
+completed S1e-a watch log are kept in the scratch worktree as a copy.
+What: handoff-goodqa.md (also at codex-owners/handoffs/goodqa.md), the
+completed watch-s1e.log and backup files.
+Testing: not run: documents and logs only.
+Refs: GoodQA #15561
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
