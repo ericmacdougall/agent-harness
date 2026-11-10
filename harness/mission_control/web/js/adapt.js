@@ -51,13 +51,15 @@ export function ownerHold(r, last) {
 export function owners(rows, items = []) {
   if (!Array.isArray(rows)) return [];
   return rows.filter(r => r && typeof r === 'object' && r.agent_id).map(r => {
-    const id = str(r.agent_id, 40);
+    const id = str(r.agent_id, 80);
     const linked = items.find(i => (ownerKey(i.owner) && id.toLowerCase().startsWith(ownerKey(i.owner))) || (r.ticket && i.ticket === r.ticket));
     const last = r.last_item && typeof r.last_item === 'object' ? r.last_item : null;
     const at = validIso(last?.at) || null;
     const active = [validIso(last?.active_at), at, validIso(r.last_activity)].filter(Boolean).sort().pop() || null;
     return {
-      agent_id: id, name: r.runtime === 'codex' ? `codex ${shortId(id)}` : shortId(id), runtime: r.runtime === 'codex' ? 'codex' : 'claude',
+      agent_id: id, name: str(r.name, 64) || (r.runtime === 'codex' ? `codex ${shortId(id)}` : shortId(id)), runtime: r.runtime === 'codex' ? 'codex' : 'claude',
+      harness: r.runtime === 'codex' ? 'openai' : 'claude', model: str(r.model, 80), stream: str(r.stream, 160),
+      last_reply: str(r.last_reply, 2000), source_stale: r.source_stale === true,
       type: str(r.type, 40), task: str(r.task, 200) || (r.runtime === 'codex' ? 'Codex session' : 'Owner'), ticket: str(r.ticket, 60),
       state: str(r.state, 24) || 'unknown', ...ownerHold(r, last),
       last_item: { at, active, event: str(last?.event, 40), note: str(last?.note, 200) || 'No work item recorded yet' },
@@ -68,7 +70,7 @@ export function owners(rows, items = []) {
 }
 
 const SOURCE_NAMES = { wals: 'Claude + Codex WALs', initiatives: 'Initiatives file', owners: 'Owners', github: 'GitHub', goodqa: 'GoodQA tickets',
-  't2-dev': 't2-dev', 'file-drop': 'Event drops', codex: 'Codex chat', chat: 'Chat store' };
+  't2-dev': 't2-dev', 'file-drop': 'Event drops', codex: 'Codex chat', chat: 'Chat store', 'codex-owners': 'OpenAI supervised owners' };
 export function sources(rows) {
   if (!Array.isArray(rows)) return [];
   return rows.filter(r => r && r.name).map(r => ({

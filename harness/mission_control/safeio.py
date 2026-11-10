@@ -12,6 +12,7 @@ import re
 import shutil
 import stat
 import subprocess
+from contextlib import ExitStack
 from pathlib import Path
 
 TICKET_RE = re.compile(r"^(?:GoodQA )?[a-z0-9][a-z0-9-]{0,39}#[0-9]{1,7}$")
@@ -132,3 +133,53 @@ class Reader:
     def read(self, path, limit: int) -> bytes:
         with self.open(path) as handle:
             return handle.read(limit)
+
+    def owner_statuses(self, root, *, max_owners=128, limit=65536):
+        """Only <root>/<owner>/status.json, with every directory pinned without following links.
+
+        Never opens turns, inboxes, outboxes or arbitrary paths from the status payload.
+        A failed scan is distinct from a healthy empty directory.
+        """
+        root = Path(os.path.abspath(root))
+        if credential_path(root) or root not in self.roots:
+            raise Refused('owner root is outside the readable roots')
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        with ExitStack() as stack:
+            directory = os.open(root.anchor, flags)
+            stack.callback(os.close, directory)
+            for part in root.parts[1:]:
+                directory = os.open(part, flags, dir_fd=directory)
+                stack.callback(os.close, directory)
+            names = []
+            with os.scandir(directory) as entries:
+                for index, entry in enumerate(entries):
+                    if index >= 1024:
+                        raise Refused('owner directory entry budget exceeded')
+                    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', entry.name):
+                        continue
+                    if entry.is_symlink():
+                        raise Refused('owner directory is a symlink')
+                    if entry.is_dir(follow_symlinks=False):
+                        names.append(entry.name)
+            if len(names) > max_owners:
+                raise Refused('owner count budget exceeded')
+            rows = []
+            for name in sorted(names):
+                child = os.open(name, flags, dir_fd=directory)
+                try:
+                    # A directory being provisioned has no status yet; it is not an owner.
+                    try:
+                        fd = os.open('status.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=child)
+                    except FileNotFoundError:
+                        rows.append((name, None))
+                        continue
+                    with os.fdopen(fd, 'rb') as handle:
+                        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                            raise Refused('owner status is not a regular file')
+                        data = handle.read(limit + 1)
+                    if len(data) > limit:
+                        raise Refused('owner status size budget exceeded')
+                    rows.append((name, data))
+                finally:
+                    os.close(child)
+            return rows

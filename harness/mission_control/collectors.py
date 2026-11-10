@@ -447,6 +447,76 @@ def clean_initiative(row, index: int) -> dict:
     return out
 
 
+class SupervisedOwners(Collector):
+    """Named OpenAI supervisors, independent of ah and the WAL discovery path."""
+    name = 'codex-owners'
+    interval = 2.0
+
+    def __init__(self, hub, health, reader, root, *, alive=None, on_change=None):
+        super().__init__(hub, health)
+        self.reader, self.root = reader, Path(root)
+        self.alive = alive or self._alive
+        self.on_change = on_change
+        self.rows = []
+
+    @staticmethod
+    def _alive(pid):
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)  # existence probe only, never signals an owner
+            return True
+        except PermissionError:
+            return True
+        except ProcessLookupError:
+            return False
+
+    def tick(self, now):
+        try:
+            rows = []
+            known = {row['name'] for row in self.rows}
+            for name, raw in self.reader.owner_statuses(self.root):
+                if raw is None:
+                    if name in known:
+                        raise ValueError('known owner status is missing')
+                    continue
+                value = _json(raw)
+                if not value or value.get('name') != name or value.get('harness') != 'openai':
+                    raise ValueError('invalid owner status identity')
+                state = value.get('state')
+                if state not in ('running', 'idle', 'stopped'):
+                    raise ValueError('invalid supervisor state')
+                if state != 'stopped':
+                    if not self.alive(value.get('supervisor_pid')):
+                        state = 'offline'
+                    elif state == 'running':
+                        state = 'live'
+                    else:
+                        state = {'WAITING': 'waiting', 'BLOCKED': 'blocked', 'ERROR': 'error'}.get(
+                            value.get('last_status'), 'idle')
+                ticket = str(value.get('ticket') or '')
+                activity = str(value.get('last_activity') or value.get('turn_ended') or value.get('started') or '')[:40]
+                reply = ev.short(value.get('last_reply') or '', 2000)
+                rows.append({'agent_id': 'openai:' + name, 'name': name, 'runtime': 'codex', 'harness': 'openai',
+                             'model': ev.short(value.get('model'), 80), 'stream': ev.short(value.get('stream'), 160),
+                             'type': 'owner', 'task': ev.short(value.get('stream') or name, 160),
+                             'ticket': ticket if TICKET_RE.fullmatch(ticket) else '', 'state': state,
+                             'last_activity': activity, 'last_reply': reply, 'last_status': ev.short(value.get('last_status'), 40),
+                             'thread': ev.short(value.get('thread'), 64), 'source_stale': False,
+                             'last_item': {'at': str(value.get('turn_ended') or '')[:40] if reply else '',
+                                           'active_at': activity, 'event': 'reply' if reply else '',
+                                           'note': ev.short(reply, 200) if reply else 'No reply recorded yet'}})
+            self.rows = rows
+        except Exception:
+            self.rows = [{**row, 'source_stale': True} for row in self.rows]
+            if self.on_change:
+                self.on_change()
+            raise
+        if self.on_change:
+            self.on_change()
+        return f'{len(self.rows)} supervised owners'
+
+
 class Owners(Collector):
     name = "owners"
     interval = 60.0
@@ -457,12 +527,47 @@ class Owners(Collector):
         self.rows: list[dict] = []
         self.states: dict[str, str] = {}
         self.session = ""
+        self.claude_rows = []
+        self.supervised = None
+
+    def publish(self):
+        managed = []
+        for source in self.supervised.rows if self.supervised else []:
+            row = dict(source)
+            # Keep verified progress and meaningful work from the supervisor's real WAL thread.
+            # A reply timestamp alone is not evidence of progress for the at-risk strip.
+            items = [item for (runtime, session, _), item in list(self.tailer.last_items.items())
+                     if runtime == 'codex' and session == row.get('thread')] if self.tailer else []
+            if items:
+                last = dict(max(items, key=lambda item: item.get('at') or ''))
+                progress = max(items, key=lambda item: item.get('progress_at') or '')
+                for key in ('progress_at', 'progress_event', 'progress_note'):
+                    if progress.get(key):
+                        last[key] = progress[key]
+                last['active_at'] = max([row.get('last_activity') or ''] +
+                                        [item.get('active_at') or item.get('at') or '' for item in items])
+                row['last_item'] = last
+            managed.append(row)
+        threads = {r.get('thread') for r in managed if r.get('thread')}
+        wals = [r for r in self.codex_rows(time.time()) if r['agent_id'] not in threads]
+        self.rows = self.claude_rows + managed + wals
+        self.hub.snapshot('owners', self.rows)
 
     def tick(self, now: float):
+        try:
+            return self._tick(now)
+        except Exception:
+            self.claude_rows = [{**row, 'source_stale': True} for row in self.claude_rows]
+            self.publish()
+            raise
+
+    def _tick(self, now: float):
         code, out = self.runner.run("ah-owners", timeout=30)
         if code != 0:
             raise RuntimeError(f"ah owners exited {code}")
         data = json.loads(out)
+        if not isinstance(data, dict) or not isinstance(data.get('owners'), list):
+            raise ValueError('invalid Claude owner snapshot')
         self.session = str(data.get("session") or "")
         rows = []
         for row in data.get("owners") or []:
@@ -477,6 +582,9 @@ class Owners(Collector):
                 continue  # a malformed id is dropped, never rewritten into a different-looking one
             ticket = str(row.get("ticket") or "")
             item = {"agent_id": agent, "runtime": "claude", "type": str(row.get("type") or "")[:40],
+                    "harness": "claude", "model": ev.short(row.get("model"), 80),
+                    "stream": ev.short(row.get("stream") or row.get("task"), 160),
+                    "last_reply": ev.short(row.get("last_reply"), 2000),
                     "task": ev.short(row.get("task") or "", 160), "ticket": ticket if TICKET_RE.match(ticket) else "",
                     "state": state[:24], "severity": str(row.get("severity") or "info")[:8],
                     "last_activity": str(row.get("last_activity") or "")[:40], "idle_s": idle,
@@ -492,8 +600,8 @@ class Owners(Collector):
                                          severity="high" if state.startswith(("DROPPED", "SILENT")) else "info"))
             self.states[agent] = state
         rows.sort(key=lambda r: (r["state"] not in ("live", "working"), r["idle_s"] or 0))
-        self.rows = rows[:60] + self.codex_rows(now)
-        self.hub.snapshot("owners", self.rows)
+        self.claude_rows = rows[:60]
+        self.publish()
         return f"{len(rows)} owners"
 
     def codex_rows(self, now: float) -> list[dict]:

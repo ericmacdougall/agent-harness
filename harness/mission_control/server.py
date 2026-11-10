@@ -321,6 +321,12 @@ class App:
         self.tailer = col.WalTailer(self.hub, self.health, self.reader, wal_roots)
         self.initiatives = col.Initiatives(self.hub, self.health, self.reader, initiatives)
         self.owners = col.Owners(self.hub, self.health, self.runner, self.tailer)
+        self.supervised = None
+        if not demo:
+            owner_root = home / '.agent-harness' / 'codex-owners'
+            self.supervised = col.SupervisedOwners(self.hub, self.health, Reader([owner_root]), owner_root,
+                                                   on_change=self.owners.publish)
+            self.owners.supervised = self.supervised
         self.github = col.GitHub(self.hub, self.health, self.runner)
         self.tickets = col.Tickets(self.hub, self.health, self.runner, self.tracked_tickets)
         self.remote = col.Remote(self.hub, self.health, self.runner, enabled=remote, fabric=bool(fabric_bin),
@@ -344,12 +350,21 @@ class App:
     def start(self) -> None:
         loops = [(self.loop, "collectors"), (self.codex.loop, "codex"), (self.chat_loop, "chat"),
                  (self.asks_loop, "asks")]
+        if self.supervised:
+            loops.append((self.supervised_loop, 'supervised-owners'))
         if self.demo:
             loops.append((demo_mode.DemoLoop(self.root, self.stop).run, "demo"))
         for target, name in loops:
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self.threads.append(thread)
+
+    def supervised_loop(self) -> None:
+        while not self.stop.is_set():
+            now = time.time()
+            if self.supervised.due(now):
+                self.supervised.run(now)
+            self.stop.wait(0.5)
 
     def asks_loop(self) -> None:
         """Its own thread: the ledger resolve takes seconds and must not delay the live feed."""

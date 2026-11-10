@@ -96,7 +96,11 @@ function renderInspector(state) {
     const owner = state.owners.find(entry => entry.agent_id === id); if (!owner) return select(null);
     title.textContent = owner.name;
     content.append(title, el('span', `state-badge ${stateClass(owner.state)}`, owner.state), el('p', 'detail-intro', owner.task));
-    fields.append(field('Agent id', owner.agent_id), field('Runtime', owner.runtime), field('Role', owner.type || '—'), field('Ticket', owner.ticket || '—'),
+    fields.append(field('Agent id', owner.agent_id), field('Harness', owner.harness === 'openai' ? 'OpenAI / Codex' : 'Claude'),
+      field('Model', owner.model || 'Not recorded by the owner source'), field('Stream', owner.stream || owner.task),
+      field('Source', owner.source_stale ? 'Stale · showing last known status' : 'Current snapshot'),
+      field('Role', owner.type || '—'), field('Ticket', owner.ticket || '—'),
+      field('Last reply', owner.last_reply || 'No reply available from the owner source'),
       field('Last work item', owner.last_item.note), field('Work item kind', owner.last_item.event || '—'),
       field('Work item written', owner.last_item.at ? `${age(owner.last_item.at, state.now)} · ${new Date(owner.last_item.at).toLocaleString()}` : '—'),
       field('Last active', owner.last_item.active ? `${age(owner.last_item.active, state.now)} · ${new Date(owner.last_item.active).toLocaleString()}` : '—'));

@@ -257,3 +257,24 @@ test('slowest / at risk: uncovered first, then stalled by oldest real progress; 
   const docs = override.find(r => r.id === 'docs');
   assert.deepEqual([docs.status, docs.action], ['stalled', 'reassigning']);
 });
+
+test('named OpenAI owners keep harness model stream reply and stale source identity', () => {
+  const [owner] = adapt.owners([{ agent_id: 'openai:mission-control', name: 'mission-control', runtime: 'codex', harness: 'openai',
+    model: 'gpt-6.1-sol', stream: 'mission-control', ticket: 'goodqa#15585', state: 'live', last_reply: '<b>Reply</b>', source_stale: true }]);
+  assert.equal(owner.name, 'mission-control');
+  assert.equal(owner.harness, 'openai');
+  assert.equal(owner.model, 'gpt-6.1-sol');
+  assert.equal(owner.stream, 'mission-control');
+  assert.equal(owner.last_reply, '<b>Reply</b>');
+  assert.equal(owner.source_stale, true);
+});
+
+test('named OpenAI owner with merged WAL result remains moving in the at-risk strip', () => {
+  const items=[{id:'mission-control', initiative:'Mission Control',ticket:'goodqa#15585',state:'Building'}];
+  const owners=adapt.owners([{agent_id:'openai:mission-control',name:'mission-control',runtime:'codex',state:'live',ticket:'goodqa#15585',
+    last_item:{at:'2026-11-10T03:00:00Z',active_at:'2026-11-10T03:00:00Z',note:'next step',
+      progress_at:'2026-11-10T02:58:00Z',progress_event:'check',progress_note:'REALLY_TESTED fixture passed'}}],items);
+  const [risk]=adapt.atRisk(items,owners,[],Date.parse('2026-11-10T03:01:00Z'));
+  assert.equal(risk.status,'moving');
+  assert.match(risk.reason,/check by mission-control/);
+});

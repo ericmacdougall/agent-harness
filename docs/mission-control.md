@@ -195,3 +195,26 @@ The demo feed also writes two tool-call records each pulse (seen with "Show tool
 
 - **Remote access over Tailscale.** It would need a second listener on the tailnet address, with the same launch-code and cookie model plus an allowlist of tailnet identities. It is off until it has its own review.
 - **Fabric events.** Fabric will write events through the event-drop directory, or through the t2-dev probe once `fabric control export` ships. The format is fixed in [mission-control-events.md](mission-control-events.md).
+
+### Named OpenAI owners
+
+The dashboard reads supervised Codex owners independently from Claude owner discovery.
+It polls `~/.agent-harness/codex-owners/<name>/status.json` every two seconds and displays
+harness, recorded model, stream, ticket, state, last activity, and a redacted last reply.
+An unavailable Claude source does not suppress those rows. The source health is shown as
+**OpenAI supervised owners**; a failed scan retains the last good rows with **STALE SOURCE**.
+A successful empty scan clears the rows. Missing or invalid state is a source error, never
+reported as a healthy empty fleet.
+
+The collector reads status files only, with no symlinks in the directory chain, at most
+128 owner directories, and 64 KiB per status file. It does not read turn logs, credentials,
+inboxes, or outboxes. Supervisor process checks use signal zero only. A running supervisor
+is shown as live; an idle supervisor retains its waiting/blocked/error state when recorded;
+a stopped supervisor and an unreachable supervisor are distinct. A reported DONE is shown
+as idle and does not establish deployed-and-tested delivery. Models absent from the source
+are explicitly unknown. Raw Codex WAL rows remain available for unmanaged sessions; a WAL
+thread associated with a named supervisor is not duplicated.
+
+This read-side integration does not enable direct messages to named owners. The existing
+chat channels keep their existing routing until the generation-bound, durable inbox and
+reply-correlation integration is installed and tested.

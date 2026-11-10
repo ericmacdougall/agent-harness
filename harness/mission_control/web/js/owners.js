@@ -1,7 +1,7 @@
 import { getState, subscribe, select, update, highlight } from './store.js';
 import { el, button, age, freshness, stateClass } from './ui.js';
 
-const ACTIVE = /^(live|working|finishing|waiting-on-)/;
+const ACTIVE = /^(live|working|finishing|waiting|blocked|error|offline)/;
 
 // What the owner itself or a recorded disposition says, beside the ah owners state (never instead of it).
 export function holdLine(owner) {
@@ -57,12 +57,12 @@ export function mountOwners() {
       const holdText = holdLine(owner);
       parts.hold.textContent = holdText;
       parts.hold.hidden = !holdText;
-      parts.runtime.textContent = owner.runtime === 'claude' ? 'Claude' : 'Codex';
+      parts.runtime.textContent = `${owner.runtime === 'claude' ? 'Claude' : 'OpenAI'} · ${owner.model || 'model unknown'}`;
       parts.avatar.className = `runtime-avatar ${owner.runtime}`;
       parts.avatar.textContent = owner.runtime === 'claude' ? '✳' : '◇';
       parts.status.textContent = severe(owner) ? `! ${owner.state}` : owner.held ? `${owner.state} · ${owner.disposition?.live ? owner.disposition.kind : 'waiting'}` : `${owner.state === 'live' ? '• ' : ''}${owner.state}`;
       parts.status.className = `owner-state ${owner.held ? 'held' : stateClass(owner.state)}`;
-      parts.task.textContent = owner.task;
+      parts.task.textContent = [owner.stream || owner.task, owner.ticket, owner.source_stale ? 'STALE SOURCE' : ''].filter(Boolean).join(' · ');
       parts.note.textContent = owner.last_item.note;
       parts.time.dateTime = owner.last_item.active || '';
       parts.time.title = owner.last_item.at ? `Work item written ${new Date(owner.last_item.at).toLocaleString()}` : 'No work item yet';
