@@ -918,13 +918,17 @@ def verify_pr_binding(repository, number, head, *, runner=None):
         raise OSError('could not verify the reviewed PR binding: ' + str(error)) from None
     if not isinstance(value, dict):
         raise OSError('reviewed PR binding is unreadable')
-    match = re.match(r'^https://github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)$', str(value.get('url') or ''))
-    if (not match or match.group(1) + '/' + match.group(2) != repository.lower()
+    # Exact github.com host, ASCII names and digits, nothing after the number (fullmatch: no trailing newline).
+    match = re.fullmatch(r'https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([0-9]+)',
+                         str(value.get('url') or ''))
+    # GitHub owner/repo names are case-insensitive (GoodQA #15565): compare ASCII-folded identities on both sides.
+    expected = merge_gate.repo_key(repository)
+    if (not match or expected is None or merge_gate.repo_key(match.group(1) + '/' + match.group(2)) != expected
             or int(match.group(3)) != number or type(value.get('number')) is not int
             or value['number'] != number or value.get('headRefOid') != head
             or str(value.get('state') or '').upper() != 'OPEN'):
         raise OSError('reviewed PR differs from the requested repository, number, HEAD or open state')
-    return {'repo': repository.lower(), 'pr': number}
+    return {'repo': expected, 'pr': number}
 
 
 AUTHOR_TRAILER = re.compile(r'^co-authored-by:\s*(.+)$', re.I | re.M)
