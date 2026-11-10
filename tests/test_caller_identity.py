@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "harness" / "hooks"))
@@ -15,6 +16,10 @@ SID = "11111111-2222-3333-4444-555555555555"
 
 class IsMain(unittest.TestCase):
     def setUp(self):
+        # These fixtures model genuinely Claude calls, independent of test-host ancestry.
+        non_native = mock.patch.object(ci, "native_deny_reason", return_value=None)
+        non_native.start()
+        self.addCleanup(non_native.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.claude = Path(os.path.realpath(self.tmp.name)) / ".claude"
@@ -56,6 +61,32 @@ class IsMain(unittest.TestCase):
         for name, payload in cases.items():
             with self.subTest(name=name):
                 self.assertFalse(ci.is_main(payload, self.claude))
+
+
+class NativeMainPrecedence(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.claude = Path(self.tmp.name).resolve() / ".claude"
+        transcript = self.claude / "projects" / "fixture" / (SID + ".jsonl")
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text("{}\n")
+        self.payload = {"session_id": SID, "transcript_path": str(transcript), "tool_name": "Bash"}
+
+    def test_native_marker_cannot_claim_an_existing_claude_root(self):
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "native-test-fixture"}):
+            self.assertFalse(ci.is_main(self.payload, self.claude))
+
+    def test_verified_native_origin_precedes_claude_transcript(self):
+        with mock.patch.object(ci, "native_deny_reason", return_value="verified_openai_origin", create=True):
+            self.assertFalse(ci.is_main(self.payload, self.claude))
+
+    def test_native_child_and_root_looking_payloads_cannot_inherit_claude_main(self):
+        with mock.patch.object(ci, "native_deny_reason", return_value="native_origin_has_no_main_admission"):
+            for fields in ({"agent_id": "child"}, {"agent_type": "worker"},
+                           {"agentType": "child", "role": "main"}, {"role": "main", "generation": "claimed"}):
+                with self.subTest(fields=fields):
+                    self.assertFalse(ci.is_main(dict(self.payload, **fields), self.claude))
 
 
 class Stamps(unittest.TestCase):
