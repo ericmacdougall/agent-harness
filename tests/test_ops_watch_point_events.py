@@ -44,6 +44,13 @@ class PointEventTests(Base):
         self.run_once()
         self.assertEqual(self.active_keys(), set())
 
+    def test_a_waiter_that_gave_up_expires_like_any_point_event(self):
+        # goodqa#15565: bg_job wait-file raises bgwait:<file>:<reason> once; nothing re-derives the key, so it must expire
+        self.raise_at("bgwait:out.txt:timeout", 7, source="bg-wait", severity="high")
+        self.raise_at("bgwait:new.txt:producer-gone", 1, source="bg-wait", severity="high")
+        self.run_once()
+        self.assertEqual(self.active_keys(), {"bgwait:new.txt:producer-gone"})
+
     def test_recent_point_event_stays(self):
         self.raise_at("heavy:copy:o2", 1)
         self.run_once()
