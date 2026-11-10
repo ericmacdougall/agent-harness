@@ -2070,12 +2070,22 @@ def fallback_scan(text, ctx):
 #   COMMIT_EDITMSG                       the last commit message buffer (the commit itself holds the message)
 #   ORIG_HEAD, FETCH_HEAD                pointers rewritten by the next reset/merge/rebase and fetch
 #   MERGE_HEAD, MERGE_MSG, MERGE_MODE, MERGE_RR   in-progress merge bookkeeping (the same as `git merge --abort`)
+#   CHERRY_PICK_HEAD, REVERT_HEAD, AUTO_MERGE, BISECT_LOG   the same for cherry-pick, revert, ort merges and bisect
+#   gc.log, gc.pid                       a failed or killed `git gc --auto` (git asks for gc.log to be removed)
+#   objects/pack/tmp_pack_*, tmp_idx_*, .tmp-*-pack*   partial packs a killed fetch or repack leaves behind
+# rebase-merge/, rebase-apply/ and sequencer/ stay refused: they can hold an autostash (`git rebase --abort`/--quit).
 # MERGE_AUTOSTASH is deliberately absent: it names the stash commit holding the user's uncommitted changes.
 # The named files count only directly in a git directory (or .git/worktrees/<name>/, a linked worktree's private
 # directory), never deeper: `.git/refs/heads/ORIG_HEAD` is a branch.
 GIT_DIR_SEG = '.git'
 GIT_TRANSIENT_NAMES = frozenset(('commit_editmsg', 'orig_head', 'fetch_head', 'merge_head', 'merge_msg', 'merge_mode',
-                                 'merge_rr'))
+                                 'merge_rr', 'cherry_pick_head', 'revert_head', 'auto_merge', 'bisect_log', 'gc.log',
+                                 'gc.pid'))
+GIT_TEMP_PACK = re.compile(r'(?:tmp_pack_|tmp_idx_|\.tmp-\d+-pack)[^/]*')
+# the parts of a git directory whose loss loses commits or refs when they are overwritten or truncated (`: > .git/HEAD`);
+# info/exclude, hooks, config and description are routinely rewritten
+GIT_OVERWRITE_CRITICAL = frozenset(('objects', 'refs', 'packed-refs', 'head', 'index', 'logs', 'shallow', 'worktrees',
+                                    'modules', 'commondir', 'gitdir'))
 # `.git` as a whole path component in raw text (not .github, .gitignore, foo.git or not.git)
 GIT_MENTION = re.compile(r'(?i)(?:^|(?<=[\s/\'"=:(*,]))\.git(?=$|[\s/\'"*;|&)\\,])')
 # a delete call in interpreter code (quotes are spaces and text is casefolded by _scan_text)
@@ -2093,6 +2103,10 @@ GIT_LIST_VALUE_OPTS = {'head': ('-n', '-c', '--lines', '--bytes'), 'tail': ('-n'
                        'shuf': ('-n', '-o', '--head-count', '--output')}
 GIT_LIST_MAX_BYTES = 4 << 20
 GIT_LIST_MAX_LINES = 50000
+# xargs options that take the next word as their value (GNU and BSD spellings)
+XARGS_VALUE_OPTS = frozenset(('-n', '-I', '-P', '-d', '-L', '-E', '-s', '-J', '-R', '-S', '--max-args',
+                              '--delimiter', '--max-procs', '--replace', '--max-lines', '--eof', '--max-chars',
+                              '--process-slot-var'))
 STDIN_DELETER = re.compile(r'(?:^|[\s/])(?:rm|rmdir|unlink|shred|srm|mv|truncate|rimraf|trash(?:-put)?)(?:\s|$)')
 
 
@@ -2135,7 +2149,19 @@ def git_path_kind(path):
         return 'transient'
     if leaf in GIT_TRANSIENT_NAMES and (len(rest) == 1 or (len(rest) == 3 and rest[0].casefold() == 'worktrees')):
         return 'transient'
+    if len(rest) == 3 and [r.casefold() for r in rest[:2]] == ['objects', 'pack'] and GIT_TEMP_PACK.fullmatch(rest[2]):
+        return 'transient'
     return 'git'
+
+
+def git_overwrite_critical(path):
+    """`path` is a part of a git directory whose overwrite or truncation loses commits or refs (GIT_OVERWRITE_CRITICAL)."""
+    if git_path_kind(path) != 'git':
+        return False
+    segs = [s for s in path.replace('\\', '/').split('/') if s]
+    hits = [k for k, seg in enumerate(segs) if seg.casefold() == GIT_DIR_SEG]
+    rest = segs[hits[-1] + 1:] if hits else []  # no literal `.git`: a wildcard component stands for it
+    return not rest or any(_has_glob(seg) for seg in rest) or rest[0].casefold() in GIT_OVERWRITE_CRITICAL
 
 
 def git_code_deletes_git_path(code):
@@ -2703,12 +2729,19 @@ class Analyzer:
                 continue
             for prev in pl.cmds[:idx]:
                 pw = self._skip_assigns(strip_reserved(prev.words))[1]
-                for w in pw[1:]:
+                is_find = bool(pw) and norm_name(pw[0].text) == 'find'
+                for k, w in enumerate(pw[1:], 1):
                     if w.text.startswith('-') or w.text in ('(', ')', '!'):
                         continue
-                    if self.refuse('xargs deletion of paths listed by an earlier stage', w,
-                                   tiers=('log', 'root', 'ancestor', 'unknown')):
-                        break
+                    # a find test's value is a pattern, not a path: git_xargs_feed judges which .git paths it selects
+                    pattern = is_find and pw[k - 1].text in self.FIND_TESTS
+                    saved, self._git_skip = getattr(self, '_git_skip', False), pattern
+                    try:
+                        if self.refuse('xargs deletion of paths listed by an earlier stage', w,
+                                       tiers=('log', 'root', 'ancestor', 'unknown')):
+                            break
+                    finally:
+                        self._git_skip = saved
         # `find ~/.aws -type f | xargs cat`: a printing reader over paths listed by an earlier stage
         for idx, cmd in enumerate(pl.cmds):
             words = self._skip_assigns(strip_reserved(cmd.words))[1]
@@ -2848,6 +2881,7 @@ class Analyzer:
         self.redirects(cmd, pl, idx, bool(rest), depth)
         if head_nonexec:
             self.bind_loop_var(words)
+            self.git_note_loop_feed(words)
             rest = []
         if not rest:
             self.assignments(assigns, depth)
@@ -2933,6 +2967,7 @@ class Analyzer:
             text = a.text
             name, _, value = text.partition('=')
             name = name.rstrip('+')
+            self.git_note_assign_feed(name, a)
             before = ctx.secret_seen
             self.subs(a, depth, visible=False)
             tainted = ctx.secret_seen > before or any(ctx.c.secret_name(v.lstrip('!')) or v in ctx.tainted for v in a.vars)
@@ -3729,27 +3764,30 @@ class Analyzer:
 
     def ssh(self, args, depth):
         texts = [a.text for a in args]
-        value_opts = set('bcDEeFIiJLlmOopQRSWw')
-        i, host_seen = 0, False
-        while i < len(texts):
-            t = texts[i]
-            if not host_seen:
-                if t.startswith('-') and len(t) > 1:
-                    flag = t[1]
-                    if t[1:] and flag in value_opts and len(t) == 2:
-                        i += 2
-                    else:
-                        i += 1
-                    continue
-                host_seen = True
-                i += 1
-                break
-            i += 1
-        rest = texts[i:]
-        if rest and rest[0] == '--':
-            rest = rest[1:]
+        value_opts = set('bcDEeFIiJLlmOopQRSWwBP')
+
+        def skip_options(i):
+            # OpenSSH keeps parsing options after the destination (`ssh dev2 -p 22 'rm -rf x'`, red-team F5)
+            while i < len(texts):
+                t = texts[i]
+                if t == '--':
+                    return i + 1
+                if not (t.startswith('-') and len(t) > 1):
+                    return i
+                consumed = 1
+                for k, letter in enumerate(t[1:]):
+                    if letter in value_opts:
+                        consumed = 2 if k == len(t) - 2 else 1  # the value glued on, or the next word
+                        break
+                i += consumed
+            return i
+
+        host = skip_options(0)
+        start = skip_options(host + 1) if host < len(texts) else len(texts)
+        rest = texts[start:]
         if rest:
             self.script(' '.join(rest), depth + 1, tail_visible=True)
+        self.git_ssh_remote_script(args[start:], depth)
 
     def container(self, name, args, words, depth, pl, idx):
         texts = [a.text for a in args]
@@ -4885,7 +4923,10 @@ class Analyzer:
             return False
         # the full tiers without need_existing mark a delete or a move away (rm, mv sources, find -delete, rsync --delete,
         # rclone purge, xargs input ...); overwrites and truncation pass narrower tiers or need_existing
-        if 'ancestor' in tiers and not need_existing and self.git_dir_refuse(what, word):
+        if 'ancestor' in tiers and not need_existing and not getattr(self, '_git_skip', False) \
+                and self.git_dir_refuse(what, word):
+            return True
+        if need_existing and self.git_overwrite_refuse(what, word):
             return True
         cls, path, literal = self.target_class(word)
         if cls is None or cls not in tiers:
@@ -4923,10 +4964,31 @@ class Analyzer:
         return _GitFrame(self, (cmd, pl, idx, getattr(self, '_git_remote', 0) > 0), remote)
 
     def _git_add(self, what, shown, remote):
+        instead = self.GIT_INSTEAD
+        if re.search(r'(?i)/\.git/(?:rebase-merge|rebase-apply|sequencer)(?:/|$)', '/' + shown.lstrip('/')):
+            # these can hold the autostash of the user's uncommitted changes, so only git may remove them
+            instead = ('to leave a stuck rebase, cherry-pick or revert run `git rebase --abort` (or `git rebase --quit` to '
+                       'keep the current state; the same for cherry-pick/revert); both restore any autostash')
         self.ctx.add(LOG_DELETE, 'git-dir-delete',
                      ('%s targets a git directory%s (%s), which holds commits, branches and stashes that may exist '
                       'nowhere else' % (what, ' on another host' if remote else '', shown[-80:]))[:300],
-                     self.GIT_INSTEAD)
+                     instead)
+
+    def git_overwrite_refuse(self, what, word):
+        """Red-team M1: truncating or overwriting a git directory's objects, refs, HEAD or index (`: > .git/packed-refs`,
+        `truncate -s0`, `dd of=`, `cp /dev/null`)."""
+        if word.dynamic and not word.alts:
+            return False
+        for alt in (word.all_alts() or word.alts)[:32]:
+            path = norm_path(alt, self.ctx)
+            if git_overwrite_critical(path):
+                self.ctx.add(LOG_DELETE, 'git-dir-delete',
+                             ('%s replaces %s inside a git directory, which loses the commits or refs it records'
+                              % (what, path[-80:]))[:300],
+                             'use git itself (git update-ref, git checkout, git reset, git gc); back the directory up '
+                             'first if it is damaged')
+                return True
+        return False
 
     def _git_unverifiable(self, what, why):
         self.ctx.add(LOG_DELETE, 'git-dir-delete-unverifiable',
@@ -4983,6 +5045,12 @@ class Analyzer:
             if hint and GIT_MENTION.search(hint):
                 self._git_add(what, hint, remote)
                 return True
+        if len(word.subs) == 1 and not word.vars and re.search(
+                r'\bgit\b[^|;&]*\brev-parse\b[^|;&]*--(?:absolute-git-dir|git-dir|git-common-dir)\b', word.subs[0]):
+            # `"$(git rev-parse --git-dir)/index.lock"`: judge the literal suffix as a path inside .git (red-team M3)
+            head, mark, suffix = (word.alts[0] if word.alts else word.text).partition(SUB_MARK)
+            if mark and not head and not _has_glob(suffix) and git_path_kind('/.git' + suffix) == 'transient':
+                return False
         for sub in word.subs:  # `rm -rf $(cat list)`: the substitution's output is the operand list
             if self._git_check_feed(what, self._git_feed_from_text(sub, remote)):
                 return True
@@ -5160,6 +5228,8 @@ class Analyzer:
                 return ('computed', joined)
             body = ' '.join(t for t in texts if t not in ('-n', '-e', '-ne', '-en', '-E'))
             return ('lines', re.split(r'\s+|\\n', decode_ansi(body)), name)
+        if name == 'find':
+            return self._git_find_feed(args, joined, remote)
         if name == 'ls' and any(re.fullmatch(r'-[A-Za-z]*[aA][A-Za-z]*', t) or t in ('--all', '--almost-all')
                                 for t in texts):
             return ('computed', joined + ' .git')  # ls -a lists .git itself
@@ -5168,6 +5238,12 @@ class Analyzer:
                 not a.dynamic and not a.text.startswith('-') and os.path.isfile(norm_path(a.text, self.ctx))
                 for a in args[:16])):
             return ('unverifiable', 'a list file transformed by `%s`' % name[:30])
+        # red-team F4: `cat LIST | tr -d '\r' | xargs rm` - a program reading a list on stdin transforms it
+        upstream = self._git_stdin_feed(cmd, pl, idx, remote)
+        if upstream[0] in ('lines', 'unverifiable'):
+            return ('unverifiable', 'a list transformed by `%s`' % name[:30])
+        if upstream[0] == 'computed':
+            return ('computed', joined + ' ' + upstream[1])
         return ('computed', joined)
 
     def _git_stdin_feed(self, cmd, pl, idx, remote):
@@ -5186,6 +5262,12 @@ class Analyzer:
                 return self._git_read_list(r.target, remote)
         if pl is not None and idx > 0:
             return self._git_feed_from_stage(pl.cmds[idx - 1], pl, idx - 1, remote)
+        # red-team F3: parse() drops `( )` and `{ }` groups, so `{ cat LIST; } | xargs rm` and `cat LIST | (xargs rm)`
+        # look like a stage with no input. A pipe into or out of a group anywhere in this text cannot be followed.
+        texts = getattr(self, '_git_texts', [])
+        current = texts[-1] if texts else (getattr(self.ctx, 'raw_top', '') or '')
+        if re.search(r'[)}]\s*\|(?!\|)|(?<!\|)\|\s*[({]', current[:200000]):
+            return ('unverifiable', 'a pipe into or out of a ( ) or { } group')
         frames = getattr(self, '_git_frames', [])
         if frames:
             outer = frames.pop()
@@ -5238,7 +5320,9 @@ class Analyzer:
             return
         remote = getattr(self, '_git_remote', 0) > 0
         feed = None
-        for k, t in enumerate(texts):
+        k = 0
+        while k < len(texts):
+            t = texts[k]
             word = None
             if t in ('-a', '--arg-file') and k + 1 < len(args):
                 word = args[k + 1]
@@ -5251,6 +5335,7 @@ class Analyzer:
                 break
             if not t.startswith('-'):
                 break  # the command xargs runs starts here
+            k += 2 if t in XARGS_VALUE_OPTS else 1  # red-team F1: `xargs -d '\n' -a LIST`, `-n 1 -a LIST`
         if feed is None:
             cmd = pl.cmds[idx] if pl is not None and idx < len(pl.cmds) else None
             feed = self._git_stdin_feed(cmd, pl, idx, remote)
@@ -5300,6 +5385,57 @@ class Analyzer:
             for name in names:
                 store[name] = store.get(name, []) + feeds
 
+    def _git_store_feeds(self, name, feeds):
+        store = getattr(self, '_git_flow_feeds', None)
+        if store is not None and feeds and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name or ''):
+            store[name] = store.get(name, []) + feeds
+
+    def git_note_loop_feed(self, words):
+        """`for p in $(cat LIST)` / `for p in WORDS`: a later `rm "$p"` checks every item (red-team F2)."""
+        if len(words) < 4 or words[0].text != 'for' or words[2].text != 'in':
+            return
+        remote = getattr(self, '_git_remote', 0) > 0
+        feeds = []
+        for item in words[3:]:
+            if item.text in (';', 'do'):
+                continue
+            for sub in item.subs:
+                feeds.append(self._git_feed_from_text(sub, remote))
+        self._git_store_feeds(words[1].text, feeds)
+
+    def git_note_assign_feed(self, name, word):
+        """`L=$(cat LIST)` / `L="$(< LIST)"`: a later `rm -rf $L` checks every path the substitution prints."""
+        if word.subs:
+            remote = getattr(self, '_git_remote', 0) > 0
+            self._git_store_feeds(name, [self._git_feed_from_text(sub, remote) for sub in word.subs])
+
+    REMOTE_SHELL = re.compile(r'(?:\S*/)?(?:ba|z|k|da|a|)sh(?:\s+-[a-z]+)*\s*')
+
+    def git_ssh_remote_script(self, rest, depth):
+        """Red-team F6: a local script fed to a remote shell (`ssh host bash -s < wipe.sh`, `cat wipe.sh | ssh host`,
+        `ssh host "$(cat wipe.sh)"`) runs its text there, so judge that text as remote commands."""
+        frames = getattr(self, '_git_frames', [])
+        if not frames:
+            return
+        for a in rest:  # a local substitution whose output becomes the remote command text
+            for sub in a.subs:
+                feed = self._git_feed_from_text(sub, False)
+                if feed[0] == 'lines':
+                    self.script('\n'.join(feed[1])[:262144], depth + 1, tail_visible=True)
+        joined = ' '.join(a.text for a in rest).strip()
+        if joined and not self.REMOTE_SHELL.fullmatch(joined):
+            return  # the remote command reads stdin itself (xargs is handled by its own feed)
+        cmd, pl, idx, outer_remote = frames[-1]
+        if cmd is None:
+            return
+        feed = self._git_stdin_feed(cmd, pl, idx, outer_remote)
+        if feed[0] == 'lines':
+            self.script('\n'.join(feed[1])[:262144], depth + 1, tail_visible=True)
+        elif feed[0] == 'unverifiable':
+            self._git_unverifiable('a remote shell script', feed[1])
+        elif feed[0] == 'computed' and GIT_MENTION.search(feed[1] or ''):
+            self._git_add('a remote shell script', feed[1][:60], True)
+
     def git_ssh_local_subs(self, args):
         """`ssh host rm -rf $(cat list)`: an unquoted substitution runs here, before the connection, and its output
         becomes the remote command's operands."""
@@ -5317,9 +5453,40 @@ class Analyzer:
         finally:
             self._git_recursive, self._git_remote = saved, self._git_remote - 1
 
+    @staticmethod
+    def _rsync_excludes_git(texts):
+        """rsync excludes every .git (`--exclude=.git`, `--exclude .git/`, a filter rule, -C) and does not delete
+        excluded files."""
+        if '--delete-excluded' in texts:
+            return False
+        for k, t in enumerate(texts):
+            value = None
+            if t in ('--exclude', '--filter', '-f') and k + 1 < len(texts):
+                value = texts[k + 1]
+            elif t.startswith(('--exclude=', '--filter=')):
+                value = t.split('=', 1)[1]
+            elif t == '--cvs-exclude' or re.fullmatch(r'-[a-zA-Z]*C[a-zA-Z]*', t):
+                return True  # the CVS exclusion list includes .git/
+            if value is None:
+                continue
+            value = value.strip()
+            if t.startswith(('--filter', '-f')):
+                m = re.fullmatch(r'(?:-|exclude|hide)[,!]*\s+(.+)', value)
+                value = m.group(1).strip() if m else ''
+            if value.rstrip('/').casefold() in ('.git', '**/.git'):
+                return True
+        return False
+
     def git_find_patterns(self, texts):
         """find -delete / -exec rm: a -name/-path/-regex test that can match a .git directory or a path inside one, not
         used as an exclusion (`-not -path '*/.git/*'`, `-name .git -prune -o ...`)."""
+        hit = self._find_git_hit(texts)
+        if hit:
+            self._git_add('find -delete/-exec %s %s' % hit, hit[1], getattr(self, '_git_remote', 0) > 0)
+
+    @staticmethod
+    def _find_git_hit(texts):
+        """(test, pattern) of the first find test that can select a .git path and is not an exclusion, else None."""
         tests = ('-name', '-iname', '-path', '-ipath', '-wholename', '-iwholename', '-regex', '-iregex')
         for k, t in enumerate(texts[:-1]):
             if t not in tests:
@@ -5339,8 +5506,36 @@ class Analyzer:
             pruned = texts[k + 2:k + 3] == ['-prune'] and texts[k + 3:k + 4] in (['-o'], ['-or'])
             if negated or pruned:
                 continue
-            self._git_add('find -delete/-exec %s %s' % (t, pattern[:40]), pattern, getattr(self, '_git_remote', 0) > 0)
-            return
+            return t, pattern[:40]
+        return None
+
+    FIND_TESTS = ('-name', '-iname', '-path', '-ipath', '-wholename', '-iwholename', '-regex', '-iregex')
+
+    def _git_find_feed(self, args, joined, remote):
+        """What `find` prints, for `find ... | xargs rm`: its start points (and their .git) when it has no name or path
+        test, a `.git` mention when a test can select one, nothing to check when every test excludes .git."""
+        texts = [a.text for a in args]
+        if self._find_git_hit(texts):
+            return ('computed', '.git ' + joined)
+        if any(t in self.FIND_TESTS for t in texts):
+            return ('computed', '')  # filtered, and .git is excluded or cannot match
+        starts = []
+        for a in args:
+            if a.text.startswith(('-', '!', '(')) or a.text in ('-H', '-L', '-P'):
+                if a.text in ('-H', '-L', '-P'):
+                    continue
+                break
+            starts.append(a)
+        starts = starts or [_literal_word('.')]
+        if remote or any(a.dynamic or a.subs for a in starts):
+            return ('computed', '.git ' + joined)
+        lines = []
+        for a in starts:
+            path = norm_path(a.text, self.ctx)
+            lines.append(a.text)
+            if os.path.lexists(path.rstrip('/') + '/.git'):
+                lines.append(path.rstrip('/') + '/.git')
+        return ('lines', lines, 'find ' + ' '.join(t for t in texts[:3])[:50])
 
     LONE_RM = re.compile(r'^[ \t]*(?:/bin/|/usr/bin/)?(?:rm|rmdir)(?:[ \t]+-[A-Za-z-]+)*(?:[ \t]+--)?(?:[ \t]+[^ \t\x00-\x1f\x7f;&|<>`$()\\"\'*?\[\]{}~#!]+)+[ \t]*$')
 
@@ -5719,12 +5914,26 @@ class Analyzer:
             if any(t.startswith('--delete') or t.startswith('--del') or t == '--remove-source-files'
                    or t == '--remove-sent-files' for t in texts):
                 pos = [a for a in nd if not self._remote_spec(a.text)]
+                # rsync never deletes what it excludes (unless --delete-excluded), so `--exclude=.git` keeps every
+                # repository's .git below the destination
+                keeps_git = self._rsync_excludes_git(texts)
                 if any(t.startswith('--del') for t in texts) and nd and not self._remote_spec(nd[-1].text):
-                    saved, self._git_recursive = getattr(self, '_git_recursive', False), True
+                    saved = getattr(self, '_git_recursive', False), getattr(self, '_git_skip', False)
+                    self._git_recursive, self._git_skip = True, keeps_git
                     try:
                         self.refuse('rsync --delete (destination)', nd[-1])
                     finally:
-                        self._git_recursive = saved
+                        self._git_recursive, self._git_skip = saved
+                elif any(t.startswith('--del') for t in texts) and nd and not keeps_git:
+                    # red-team F7: `rsync --delete src/ dev2:repos/x/` wipes a clone (or its .git) on the other host
+                    dest = nd[-1].text.split(':', 1)[-1]
+                    leaf = posixpath.basename(dest.rstrip('/'))
+                    if leaf not in CLONE_REMOTE_OK_NAMES or nd[-1].dynamic:
+                        self.ctx.add(LOG_DELETE, 'git-clone-delete-unverifiable',
+                                     ('rsync --delete replaces %s on another host; the guard cannot check it there for a '
+                                      'git repository with unpushed work' % nd[-1].text[-80:])[:300],
+                                     'add --exclude=.git (rsync then keeps every .git below the destination), or run '
+                                     'the sync on that host itself')
                 if '--remove-source-files' in texts or '--remove-sent-files' in texts:
                     for w in pos[:-1] if pos and pos[-1] is nd[-1] else pos:
                         self.refuse('rsync --remove-source-files (source)', w)
@@ -5791,6 +6000,15 @@ class Analyzer:
         """git clean -f inside a protected tree removes untracked logs and state."""
         letters = _flag_letters(args)
         if not ('f' in letters or '--force' in texts) or 'n' in letters or '--dry-run' in texts:
+            return
+        forces = sum(a.text.count('f') for a in args if re.fullmatch(r'-[A-Za-z]+', a.text)) + texts.count('--force')
+        if forces >= 2 and ('d' in letters or '--directories' in texts):
+            # red-team M2: a second -f makes git clean remove untracked nested repositories, .git and all
+            self.ctx.add(LOG_DELETE, 'git-clone-delete',
+                         'git clean -ffd removes untracked nested git repositories with their .git directories, which '
+                         'may hold work that exists nowhere else',
+                         'use a single -f (git clean -fd skips nested repositories), or `git clean -ffdn` to list them '
+                         'first and push or back them up')
             return
         base = norm_path(cwd_word.text, self.ctx) if cwd_word is not None and not cwd_word.dynamic else (
             None if cwd_word is not None else self.ctx.cwd)

@@ -543,6 +543,166 @@ class CloneDeleteTests(CloneDeleteCase):
                      'rm -rf %s' % self.many], 'allow', cwd=self.pushed)
 
 
+class CloneVerifierStrictnessTests(CloneDeleteCase):
+    def test_a_remote_off_the_allowlist_is_never_listed_and_refuses_as_unpushed(self):
+        verdict, message = self.decide('rm -rf %s' % self.badhost)
+        self.assertEqual(verdict, 'block')
+        self.assertIn('[log_delete/git-clone-delete]', message)
+        self.assertNotIn('https://evil.example/acme/proj.git', self.calls)
+
+    def test_a_git_failure_refuses_as_unverifiable(self):
+        broken = self.clone(self.home / ('broken/b-%d' % time.monotonic_ns()))
+        run('git', 'fetch', '-q', str(self.remote), '+refs/heads/*:refs/remotes/origin/*', cwd=str(broken))
+        (broken / '.git/refs/heads/dangling').write_text('0123456789abcdef0123456789abcdef01234567\n')
+        verdict, message = self.decide('rm -rf %s' % broken)
+        self.assertEqual(verdict, 'block', message)
+        self.assertIn('git-clone-delete-unverifiable', message)
+
+
+class RedTeamTests(GitDirCase):
+    """PR 175 red-team (45ce84f) reproducers. LIST (@SWEEP@) holds a line naming REPO/.git."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        h = cls.home
+        cls.wipe = h / 'lists/wipe.sh'
+        cls.wipe.write_text('#!/bin/sh\nrm -rf /home/eric/repos/bugtracker/.git\n')
+        cls.nul = h / 'lists/nul.txt'
+        cls.nul.write_bytes(b'%s/junk/a\x00%s/.git\x00' % (str(h).encode(), str(cls.repo).encode()))
+        cls.spaced = h / 'lists/spaced.txt'
+        cls.spaced.write_text('%s/junk/a %s/.git\n' % (h, cls.repo))
+        cls.long = h / 'lists/long.txt'
+        cls.long.write_text(''.join('%s/junk/f%02d\n' % (h, k) for k in range(20)))
+        cls.fifo = h / 'lists/fifo'
+        os.mkfifo(str(cls.fifo))
+        (cls.repo / '.git/dir.lock').mkdir()
+        (cls.repo / 'src').mkdir()
+
+    def blocks(self, rows, cwd='@REPO@'):
+        self.expect(rows, 'block', cwd=cwd)
+
+    def test_xargs_value_options_before_the_list_file(self):
+        self.blocks(["xargs -d '\\n' -a @SWEEP@ rm -rf", 'xargs -n 1 -a @SWEEP@ rm -rf', 'xargs -P 4 -a @SWEEP@ rm -rf',
+                     'xargs -I {} -a @SWEEP@ rm -rf {}', 'xargs --max-args 1 -a @SWEEP@ rm -rf',
+                     "xargs --delimiter '\\n' -a @SWEEP@ rm -rf", 'xargs -E END -a @SWEEP@ rm -rf',
+                     'xargs -L 1 -a @SWEEP@ rm -rf', 'xargs --max-procs 2 -a @SWEEP@ rm -rf'])
+
+    def test_lists_carried_through_a_variable_or_for_loop(self):
+        self.blocks(['for p in $(cat @SWEEP@); do rm -rf "$p"; done', 'for p in `cat @SWEEP@`; do rm -rf "$p"; done',
+                     'L=$(cat @SWEEP@); rm -rf $L', 'L="$(< @SWEEP@)"; rm -rf $L',
+                     'for p in @REPO@/.git; do rm -rf "$p"; done', 'D=$(echo @REPO@/.git); rm -rf "$D"'])
+
+    def test_grouped_and_subshell_producers(self):
+        self.blocks(['{ cat @SWEEP@; } | xargs rm -rf', '(cat @SWEEP@; cat @OK@) | xargs rm -rf',
+                     'cat @SWEEP@ | (xargs rm -rf)', 'cat @SWEEP@ | { xargs rm -rf; }'])
+
+    def test_transformed_lists_fail_closed(self):
+        self.blocks(["cat @SWEEP@ | tr -d '\\r' | xargs rm -rf", "cat @OK@ | sed 's/x/y/' | xargs rm -rf",
+                     "cat @OK@ | awk '{print}' | xargs rm -f", 'cat @OK@ | cut -c1- | xargs rm -f'])
+
+    def test_ssh_options_after_the_host(self):
+        self.blocks(['ssh dev2 -p 22 xargs rm -rf < @SWEEP@', "ssh dev2 -o BatchMode=yes 'rm -rf x/.git'",
+                     "ssh dev2 -p 22 'xargs -a /home/eric/sweep.txt rm -rf'",
+                     "ssh host -o ProxyCommand=none 'rm -rf x/.git'"])
+
+    def test_local_script_fed_to_a_remote_shell(self):
+        self.blocks(['ssh host bash -s < @HOME@/lists/wipe.sh', 'ssh host sh < @HOME@/lists/wipe.sh',
+                     'ssh host < @HOME@/lists/wipe.sh', "ssh host 'bash -s' < @HOME@/lists/wipe.sh",
+                     'cat @HOME@/lists/wipe.sh | ssh dev2 bash', 'ssh host "$(cat @HOME@/lists/wipe.sh)"',
+                     'ssh host bash -s < "$SCRIPT"'])
+
+    def test_whole_clone_shapes(self):
+        self.blocks(['rm -rf @REPO@', 'cd .. && rm -rf proj', 'rm -rf .', 'rm -rf @REPO@/.git/..',
+                     'find @REPO@ -delete', 'find . -mindepth 1 -delete', 'find . | xargs rm -rf',
+                     'rm -rf @HOME@/repos/*', "ssh dev2 'rm -rf /home/eric/repos/bugtracker'",
+                     'rsync -a --delete @HOME@/lists/ @REPO@/', 'rsync -a --delete src/ dev2:repos/x/',
+                     'rsync -a --delete src/ dev2:repos/x/.git/', 'rsync -a --delete src/ dev2:/home/eric/repos/x'])
+        self.expect(['rsync -a --delete --exclude=.git src/ dev2:repos/x/', 'rsync -a --delete src/ dev2:app/node_modules/',
+                     'rsync -a --delete --exclude .git @HOME@/lists/ @REPO@/'], 'allow')
+
+    def test_overwriting_git_internals_blocks(self):
+        self.blocks([': > .git/packed-refs', 'truncate -s0 .git/packed-refs', 'dd if=/dev/zero of=.git/packed-refs',
+                     'cp /dev/null .git/index', '> .git/HEAD', 'echo x > .git/refs/heads/master'])
+        self.expect(['echo "*.log" >> .git/info/exclude', 'echo "*.log" > .git/info/exclude',
+                     'cp hook.sh .git/hooks/pre-commit', 'echo msg > .git/COMMIT_EDITMSG'], 'allow')
+
+    def test_git_clean_double_force_deletes_nested_repositories(self):
+        self.blocks(['git clean -ffd', 'git clean -ffdx', 'git clean -f -f -d', 'git -C @REPO@ clean -ffdx',
+                     "ssh dev2 'cd /home/eric/repos/x && git clean -ffdx'"])
+        self.expect(['git clean -fd', 'git clean -n', 'git clean -ffdn'], 'allow')
+
+    def test_rev_parse_git_dir_with_a_transient_suffix_is_allowed(self):
+        self.expect(['rm -f "$(git rev-parse --git-dir)/index.lock"', 'rm -f "$(git rev-parse --git-dir)/COMMIT_EDITMSG"',
+                     'rm -f "$(git rev-parse --absolute-git-dir)/refs/heads/main.lock"'], 'allow')
+        self.blocks(['rm -rf "$(git rev-parse --git-dir)/objects"', 'rm -rf "$(git rev-parse --git-dir)"'])
+
+    def test_find_producer_excluding_git_is_allowed(self):
+        self.expect(["find . -path ./.git -prune -o -name '*.tmp' -print | xargs rm -f",
+                     "find . -not -path '*/.git/*' -name '*.tmp' | xargs rm -f",
+                     "find . -name .git -prune -o -name '*.tmp' -exec rm {} +",
+                     "find . -not -path '*/.git/*' -name '*.tmp' -delete"], 'allow')
+        self.blocks(["find . -name .git | xargs rm -rf", "find . -path '*/.git/*' | xargs rm -f"])
+
+    def test_more_transient_files_and_rebase_message(self):
+        self.expect(['rm -f .git/gc.log', 'rm -f .git/gc.pid', 'rm -f .git/objects/pack/tmp_pack_abc123',
+                     'rm -f .git/objects/pack/.tmp-1234-pack-abc.pack', 'rm -f .git/CHERRY_PICK_HEAD',
+                     'rm -f .git/REVERT_HEAD', 'rm -f .git/AUTO_MERGE', 'rm -f .git/BISECT_LOG'], 'allow')
+        verdict, message = self.decide('rm -rf .git/rebase-merge')
+        self.assertEqual(verdict, 'block')
+        self.assertIn('git rebase --abort', message)
+
+    def test_transient_names_only_directly_in_the_git_directory(self):  # M04, M05
+        self.blocks(['rm -f .git/refs/heads/ORIG_HEAD', 'rm -f .git/refs/heads/COMMIT_EDITMSG', 'rm -rf .git/dir.lock'])
+
+    def test_list_caps(self):  # M11, M12
+        with mock.patch.object(cg, 'GIT_LIST_MAX_LINES', 5):
+            self.blocks(['xargs rm -rf < @HOME@/lists/long.txt'])
+        with mock.patch.object(cg, 'GIT_LIST_MAX_BYTES', 64):
+            self.blocks(['xargs rm -rf < @HOME@/lists/long.txt'])
+        self.expect(['xargs rm -f < @HOME@/lists/long.txt'], 'allow')
+
+    def test_fifo_list_does_not_hang_and_blocks(self):  # M13
+        import threading
+        out = []
+        worker = threading.Thread(target=lambda: out.append(self.decide('xargs rm -rf < @HOME@/lists/fifo')))
+        worker.daemon = True
+        worker.start()
+        worker.join(20)
+        self.assertFalse(worker.is_alive(), 'the guard hung on a FIFO list')
+        self.assertEqual(out[0][0], 'block')
+        self.assertIn('git-dir-delete-unverifiable', out[0][1])
+
+    def test_list_written_by_the_same_command(self):  # M14
+        self.blocks(['echo @REPO@/.git > @HOME@/lists/long.txt; xargs rm -rf < @HOME@/lists/long.txt'])
+
+    def test_grep_only_matching_recursive_and_ls_all(self):  # M15, M16
+        self.blocks(['grep -o x @OK@ | xargs rm -rf', 'grep -r junk @HOME@/lists | xargs rm -rf', 'ls -a | xargs rm -rf',
+                     'ls -A @REPO@ | xargs rm -rf'])
+
+    def test_whitespace_and_nul_separated_lists(self):  # M19, M20
+        self.blocks(['xargs rm -rf < @HOME@/lists/spaced.txt', 'xargs -0 rm -rf < @HOME@/lists/nul.txt'])
+
+    def test_container_hop_is_remote(self):  # M22
+        verdict, message = self.decide('docker exec c xargs -a @OK@ rm -f')
+        self.assertEqual(verdict, 'block', message)
+        self.assertIn('another host', message)
+
+    def test_casefold_is_part_of_the_match(self):  # M29
+        self.assertEqual(cg.git_path_kind('/x/.GIT/HEAD'), 'git')
+        self.assertEqual(cg.git_path_kind('/x/.Git'), 'git')
+        self.assertIsNone(cg.git_path_kind('/x/.GITHUB/a'))
+
+    def test_uniq_second_operand_is_an_output(self):  # M30
+        self.expect(['uniq @OK@ @HOME@/lists/uniq-out.txt | xargs rm -f'], 'allow')
+        self.blocks(['uniq @SWEEP@ | xargs rm -rf'])
+
+    def test_remote_list_that_also_exists_locally_is_still_remote(self):  # M33
+        verdict, message = self.decide("ssh dev2 'xargs -a @OK@ rm -f'")
+        self.assertEqual(verdict, 'block', message)
+        self.assertIn('another host', message)
+
+
 class CloneApprovalTests(CloneDeleteCase):
     class Verifier:
         def remote_types(self):
