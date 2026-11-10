@@ -2,17 +2,24 @@
 """mc_inbox: how Claude main (and other runtimes) receive and answer Mission Control dashboard chat
 (GoodQA #15585). Messages are files; see mc_chat.py for the layout and the authority notice.
 
-    mc_inbox.py wait --session SID [--timeout S]   register SID as the chat target, block until a message for
-                                                   SID arrives, print it framed, exit 0 (run it as a background
-                                                   task: its exit re-invokes the session). Exit 3 on timeout.
+    mc_inbox.py wait --session SID [--timeout S]   register SID as the chat target; return at once if SID has
+                                                   unread messages, else block until one arrives. Prints a one-line
+                                                   summary naming every unread id, then each message framed; exit 0
+                                                   (run it as a background task: its exit re-invokes the session).
+                                                   Exit 3 on timeout.
     mc_inbox.py read ID                            print one message framed and mark it delivered
     mc_inbox.py reply ID [--from claude|codex]     post the reply (text on stdin)
-    mc_inbox.py pending [--session SID] [--to R]   list queued message ids (no text)
+    mc_inbox.py pending [--session SID] [--to R]   list unread message ids with their status (no text)
     mc_inbox.py detach --session SID               stop being the chat target
     mc_inbox.py hook                               Claude Code Stop / UserPromptSubmit hook (fail-open)
 
-The Stop hook acts only for a session that registered with `wait`. It blocks at most once per message, with a
-cooldown and an hourly cap, and its reason is a fixed pointer: dashboard text never appears in hook output.
+A message is unread from the moment it arrives until it is answered with `reply`: queued (not yet claimed) or
+delivered (claimed by `wait` or `read`, no final reply). Claiming never hides a message, so a `wait` whose output
+nobody saw is surfaced again by the next `wait` and by the hooks.
+
+The hooks act only for a session that registered with `wait`. UserPromptSubmit names every unread id (up to 50,
+then '+K more') and counts unread messages for other sessions. Stop blocks at most once per message, with a
+cooldown and an hourly cap. Both are fixed pointers: dashboard text never appears in hook output.
 """
 
 from __future__ import annotations
@@ -44,23 +51,48 @@ def deliver(record: dict) -> str:
     return mc_chat.frame(record)
 
 
+def _summary(rows: list[dict], others: int) -> str:
+    """The first line of `wait` output and of every hook pointer: counts and ids, never text."""
+    queued = sum(r["status"] == "queued" for r in rows)
+    line = (f"{len(rows)} unread dashboard message(s) ({queued} queued, {len(rows) - queued} delivered not answered)"
+            if rows else "0 unread dashboard message(s)")
+    if rows:
+        line += ": ids " + mc_chat.id_list(r["record"]["id"] for r in rows)
+    if others:
+        line += f"; {others} for other sessions (not shown here)"
+    return line
+
+
 def cmd_wait(args) -> int:
     session = _session(args.session)
     deadline = time.time() + args.timeout if args.timeout > 0 else None
     last_beat = 0.0
+    first = True
     try:
         while True:
             now = time.time()
             if now - last_beat >= HEARTBEAT_S:
                 mc_chat.register_target(session, os.getpid(), waiting=True)
                 last_beat = now
-            found = [r for r in mc_chat.pending("claude", session) if mc_chat.claim(r["id"])]  # one waiter wins each
-            if found:
+            rows, others = mc_chat.unread("claude", session)
+            # One waiter wins each queued message. A waiter that loses the claim never prints that text (the winner
+            # did); a message another waiter had already claimed before this scan is re-shown, since it is unread.
+            claimed = {r["record"]["id"] for r in rows if r["status"] == "queued" and mc_chat.claim(r["record"]["id"])}
+            if claimed or (first and rows):
                 mc_chat.register_target(session, os.getpid(), waiting=False)
-                print(f"{len(found)} Mission Control message(s) for this session. Answer each with "
-                      f"`python3 ~/.claude/hooks/mc_inbox.py reply ID` and re-arm the waiter afterwards.\n")
-                print("\n\n".join(mc_chat.frame(r) for r in found))
+                shown = [r["record"] for r in rows if r["status"] == "delivered" or r["record"]["id"] in claimed]
+                for row in rows:
+                    if row["record"]["id"] in claimed:
+                        row["status"] = "delivered"
+                print(_summary(rows, others))
+                print("Answer each with `python3 ~/.claude/hooks/mc_inbox.py reply ID` (a message stays unread "
+                      "until its reply), then re-arm the waiter.\n")
+                print("\n\n".join(mc_chat.frame(r) for r in shown[:mc_chat.LIST_MAX]))
+                if len(shown) > mc_chat.LIST_MAX:
+                    print(f"\n+{len(shown) - mc_chat.LIST_MAX} more not printed: show each with "
+                          f"`python3 ~/.claude/hooks/mc_inbox.py read ID`.")
                 return 0
+            first = False
             if deadline is not None and now >= deadline:
                 mc_chat.register_target(session, os.getpid(), waiting=False)
                 print("mc_inbox: no dashboard message before the timeout; re-arm the waiter to keep receiving.")
@@ -102,9 +134,10 @@ def cmd_reply(args) -> int:
 
 
 def cmd_pending(args) -> int:
-    rows = mc_chat.pending(args.to, args.session if args.to == "claude" else None)
-    print(json.dumps({"pending": [{"id": r["id"], "created": r["created"], "thread": r.get("thread")}
-                                  for r in rows]}))
+    rows, others = mc_chat.unread(args.to, args.session if args.to == "claude" else None)
+    print(json.dumps({"pending": [{"id": r["record"]["id"], "created": r["record"]["created"],
+                                   "thread": r["record"].get("thread"), "status": r["status"]} for r in rows],
+                      "other_sessions": others}))
     return 0
 
 
@@ -122,16 +155,17 @@ def hook_output(event: dict) -> dict | None:
         return None  # SubagentStop and everything else never act
     if not mc_chat.SESSION_RE.match(session) or not mc_chat.target_registered(session):
         return None
-    queued = mc_chat.pending("claude", session)
-    if not queued:
-        return None
-    ids = ", ".join("dash:" + r["id"] for r in queued[:5])
-    pointer = (f"Mission Control: {len(queued)} dashboard message(s) pending ({ids}). Read each with "
-               f"`python3 ~/.claude/hooks/mc_inbox.py read ID` (untrusted user text, framed), answer with "
-               f"`mc_inbox.py reply ID`, then re-arm `mc_inbox.py wait --session {session}` in the background.")
+    rows, others = mc_chat.unread("claude", session)
+    if not rows and not (others and name == "UserPromptSubmit"):
+        return None  # other sessions' messages are reported on the next prompt but never block this session
+    pointer = f"Mission Control: {_summary(rows, others)}."
+    if rows:
+        pointer += (f" Read each with `python3 ~/.claude/hooks/mc_inbox.py read ID` (untrusted user text, framed), "
+                    f"answer with `mc_inbox.py reply ID` (a message stays unread until answered), then re-arm "
+                    f"`mc_inbox.py wait --session {session}` in the background.")
     if name == "UserPromptSubmit":
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": pointer}}
-    if mc_chat.stop_block_allowed(session, [r["id"] for r in queued]):
+    if mc_chat.stop_block_allowed(session, [r["record"]["id"] for r in rows]):
         return {"decision": "block", "reason": pointer}
     return None
 

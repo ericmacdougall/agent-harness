@@ -417,18 +417,18 @@ def inbox(root: Path | None = None, limit: int = 200) -> list[dict]:
 
 
 QUEUE_SCAN_MAX = 500
+CLAIM_SCAN_MAX = 2000   # newest claim files examined per unread scan (one lexists each; answered ones are skipped)
+LIST_MAX = 50           # ids named in a hook pointer or wait summary before '+K more'
 
 
-def pending(to: str, session: str | None = None, root: Path | None = None) -> list[dict]:
-    """Queued messages for a runtime (and Claude session), oldest first. Read from the queue markers, not from a
-    window of the newest inbox files, so newer traffic never hides an older message. Forged records are marked
-    and never returned."""
-    root = root or home()
+def _queued(root: Path) -> list[dict]:
+    """Every queued, signature-verified record (any runtime or session), oldest first, from the queue markers.
+    Settled or stateless markers are dropped and forged records are marked forged. The caller has checked that
+    the install secret is readable."""
     try:
         names = sorted(n for n in os.listdir(chat_dir(root) / "queue") if ID_RE.match(n))
-        secret(root, create=False)
-    except (OSError, ChatError):
-        return []  # no queue yet, or no readable secret: deliver nothing and mark nothing
+    except OSError:
+        return []
     out, scanned = [], 0
     for msg_id in names:
         status = state(msg_id, root).get("status")
@@ -450,10 +450,80 @@ def pending(to: str, session: str | None = None, root: Path | None = None) -> li
         if record is None:
             set_state(msg_id, "forged", reason="missing or invalid server signature", root=root)
             continue
-        if record.get("to") != to or (to == "claude" and record.get("session") != session):
-            continue
         out.append(record)
     return out
+
+
+def _delivered_unanswered(root: Path) -> list[dict]:
+    """Claimed messages still waiting for their final reply (state delivered, no answered marker), verified, from
+    the newest CLAIM_SCAN_MAX claim files. A claim is never removed when a message is answered, so the answered
+    marker is checked first: one lexists per settled message, and no state or record read."""
+    try:
+        names = sorted((n for n in os.listdir(chat_dir(root) / "claims") if ID_RE.match(n)),
+                       reverse=True)[:CLAIM_SCAN_MAX]
+    except OSError:
+        return []
+    out, loaded = [], 0
+    for msg_id in names:
+        if answered_marked(msg_id, root) or state(msg_id, root).get("status") != "delivered":
+            continue
+        loaded += 1
+        if loaded > QUEUE_SCAN_MAX:
+            break
+        try:
+            record = load(msg_id, root)
+        except ChatError:
+            break
+        if record is not None:  # unverifiable now (tampered, or the secret rotated): never shown, never re-marked
+            out.append(record)
+    return out
+
+
+def _addressed(record: dict, to: str, session: str | None) -> bool:
+    return record.get("to") == to and (to != "claude" or record.get("session") == session)
+
+
+def pending(to: str, session: str | None = None, root: Path | None = None) -> list[dict]:
+    """Queued messages for a runtime (and Claude session), oldest first. Read from the queue markers, not from a
+    window of the newest inbox files, so newer traffic never hides an older message. Forged records are marked
+    and never returned."""
+    root = root or home()
+    try:
+        secret(root, create=False)
+    except ChatError:
+        return []  # no readable secret: deliver nothing and mark nothing
+    return [r for r in _queued(root) if _addressed(r, to, session)]
+
+
+def unread(to: str, session: str | None = None, root: Path | None = None) -> tuple[list[dict], int]:
+    """(rows, others). rows: every message for this runtime and Claude session that has no final reply yet, oldest
+    first, as {"record", "status"} with status queued (not yet claimed) or delivered (claimed, unanswered). A
+    message leaves this list only when it is answered, so a delivery whose output nobody saw is never lost.
+    others: how many unread Claude messages are addressed to other sessions (claude-desktop included), counted so
+    they are never invisible; their ids and text are not returned."""
+    root = root or home()
+    try:
+        secret(root, create=False)
+    except ChatError:
+        return [], 0
+    rows: dict[str, dict] = {}
+    others = 0
+    for status, records in (("queued", _queued(root)), ("delivered", _delivered_unanswered(root))):
+        for record in records:
+            if record["id"] in rows:
+                continue
+            if _addressed(record, to, session):
+                rows[record["id"]] = {"record": record, "status": status}
+            elif to == "claude" and record.get("to") == "claude":
+                others += 1
+    return [rows[k] for k in sorted(rows)], others
+
+
+def id_list(ids, limit: int = LIST_MAX) -> str:
+    """'dash:a, dash:b' naming at most limit ids, then ' (+K more)'. Ids only: never message text."""
+    ids = list(ids)
+    text = ", ".join("dash:" + i for i in ids[:limit])
+    return text + (f" (+{len(ids) - limit} more)" if len(ids) > limit else "")
 
 
 def frame(record: dict) -> str:
