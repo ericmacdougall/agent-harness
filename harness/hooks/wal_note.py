@@ -163,6 +163,21 @@ def main():
         if not args.reason or len(args.reason.strip()) < 10:
             parser.error('an ask needs --reason (10+ characters): why the user is being asked')
         record['reason'] = args.reason.strip()[:1000]
+        try:  # GoodQA #15565: do not route agent-doable or already-granted work to the user
+            import ask_gate
+            gate = ask_gate.load_policy()
+            if gate.get('mode') != 'off' and not args.by:
+                doable, why = ask_gate.agent_doable(note, record['reason'], ask_gate.grants_from_wal(path.parent / 'main.jsonl'), gate)
+                if doable:
+                    if gate.get('mode') == 'enforce':
+                        print(json.dumps({'status': 'REFUSED', 'event': 'ask', 'problem': ('agent-doable: ' + why)[:300],
+                                          'hint': 'do it yourself and record the result; a step that needs a person (CAPTCHA, '
+                                                  'payment, new terms) stays an ask'}), file=sys.stderr)
+                        return 2
+                    warnings.append(('ask hygiene: this ask looks agent-doable: ' + why)[:300])
+                    record['agent_doable'] = True
+        except Exception:  # noqa: BLE001 - a missing module or hostile input never stops an ask being written
+            pass
     if args.event == 'ask_resolved':
         if not args.ref or not re.fullmatch(r'[A-Za-z0-9_-]{4,40}', args.ref):
             parser.error('ask_resolved needs --ref <ask id>')
