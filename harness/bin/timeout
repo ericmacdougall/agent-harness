@@ -29,10 +29,18 @@ def duration(text):
 
 
 def signum(text):
+    """A signal this host can deliver, by number or name; anything else (0, out of range, SIG_DFL) is a usage error,
+    rejected before COMMAND starts (Codex final-gate F1: `-s 999999` used to crash after launch)."""
     name = text.upper()
     if name.isdigit():
-        return int(name)
-    return int(getattr(signal, name if name.startswith("SIG") else "SIG" + name))
+        number = int(name)
+        if number not in signal.valid_signals():
+            raise ValueError("invalid signal %s" % text)
+        return number
+    try:
+        return int(signal.Signals[name if name.startswith("SIG") else "SIG" + name])
+    except KeyError:
+        raise ValueError("invalid signal %s" % text) from None
 
 
 def main(argv):
@@ -75,29 +83,53 @@ def main(argv):
         sys.stderr.write("timeout: failed to run command '%s': %s\n" % (args[0], error.strerror))
         return 126
 
+    failures = []
+
+    def stop_hard():
+        if not foreground:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except (OSError, ValueError, OverflowError):
+                pass
+        try:
+            child.kill()
+        except OSError:
+            pass
+
     def send(number):
         try:
             os.killpg(child.pid, number) if not foreground else child.send_signal(number)
         except (ProcessLookupError, PermissionError):
-            pass
+            pass  # the group is gone, or only exited members remain
+        except (OSError, ValueError, OverflowError) as error:  # never leave COMMAND running when delivery fails
+            failures.append(error)
+            stop_hard()
 
     for forwarded in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(forwarded, lambda number, _frame: send(number))
     end = time.monotonic() + limit if limit else None
     timed_out = False
-    while child.poll() is None:
-        if end is not None and not timed_out and time.monotonic() >= end:
-            timed_out = True
-            send(sig)
-            if sig != signal.SIGKILL and kill_after:
-                end = time.monotonic() + kill_after
-                continue
-            if not kill_after:
+    try:
+        while child.poll() is None:
+            if end is not None and not timed_out and time.monotonic() >= end:
+                timed_out = True
+                send(sig)
+                if sig != signal.SIGKILL and kill_after:
+                    end = time.monotonic() + kill_after
+                    continue
+                if not kill_after:
+                    end = None
+            elif end is not None and timed_out and time.monotonic() >= end:
+                send(signal.SIGKILL)
                 end = None
-        elif end is not None and timed_out and time.monotonic() >= end:
-            send(signal.SIGKILL)
-            end = None
-        time.sleep(0.02)
+            time.sleep(0.02)
+    finally:
+        if child.poll() is None:  # an unexpected error in timeout itself still stops and reaps COMMAND
+            stop_hard()
+            child.wait()
+    if failures:
+        sys.stderr.write("timeout: failed to send signal: %s\n" % failures[0])
+        return 125
     code = child.returncode
     if code < 0:
         code = 128 + -code
