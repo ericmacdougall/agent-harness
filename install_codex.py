@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
+import importlib.util
 import json
 import os
 import secrets
@@ -51,6 +53,56 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'installer_scan.py')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
+# Codex owner supervisor (GoodQA #15565): installed beside the hooks it vets, where owner sandboxes cannot write.
+OWNER_SUPERVISOR = ROOT / 'harness' / 'bin' / 'codex_owner.py'
+INSTALL_MANIFEST = 'install-manifest.json'  # sha256 of every installed harness file; codex_owner.py --strict-vet
+
+
+def install_manifest(payloads, harness_dir: Path) -> bytes:
+    """The manifest records what this install wrote into agent-harness/, so a later edit is detectable."""
+    files = {destination.name: hashlib.sha256(data).hexdigest() for destination, data in payloads
+             if destination.parent == harness_dir}
+    return (json.dumps({'schema': 1, 'files': dict(sorted(files.items()))}, indent=2) + '\n').encode()
+
+
+def _ops_watch():
+    spec = importlib.util.spec_from_file_location('agent_harness_ops_watch', ROOT / 'harness' / 'hooks' / 'ops_watch.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def codex_trust_report(codex_home: Path) -> list[str]:
+    """Which hooks.json hooks Codex will skip as untrusted, by ops_watch's own algorithm (codex_expected_trust and
+    TRUST_RE). Read-only: trusting a hook is the user's review in /hooks, so trusted_hash is never written here."""
+    hooks = codex_home / 'hooks.json'
+    conf = codex_home / 'config.toml'
+    if not hooks.is_file():
+        return ['codex:trust: no hooks.json; nothing to check']
+    try:
+        ops = _ops_watch()
+        expected = ops.codex_expected_trust(hooks)
+        trusted = dict(ops.TRUST_RE.findall(ops.read_text_capped(conf))) if conf.is_file() else {}
+        data = json.loads(ops.read_text_capped(hooks))
+    except (OSError, ValueError, AttributeError) as error:
+        return [f'codex:trust: could not check hook trust ({error})']
+    prefix = f'{hooks}:'
+    bad = sorted(key for key, value in expected.items() if trusted.get(key) != value)
+    if not bad:
+        return [f'codex:trust: all {len(expected)} hooks.json hooks are trusted in config.toml']
+    commands = {}
+    for event, groups in (data.get('hooks') or {}).items():
+        for gi, group in enumerate(groups or []):
+            for hi, handler in enumerate(group.get('hooks') or []):
+                commands[f'{prefix}{ops.snake(event)}:{gi}:{hi}'] = str(handler.get('command', ''))
+    lines = [f'WARNING codex:trust: {len(bad)} of {len(expected)} hooks.json hooks are untrusted or changed since '
+             'trust in config.toml; Codex skips them silently, so these guards are OFF in Codex sessions:']
+    lines += [f'  {key[len(prefix):]}  {"changed" if key in trusted else "untrusted"}  {commands.get(key, "")}'
+              for key in bad]
+    lines += ['  Route 1: trust them with /hooks in an interactive Codex session.',
+              f'  Route 2: run owners through {codex_home / "agent-harness" / "codex_owner.py"}, which vets the hooks '
+              'before every turn and only then passes --dangerously-bypass-hook-trust.']
+    return lines
 
 
 def merge_marked(existing: str, addition: str) -> str:
@@ -299,12 +351,14 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False, comma
               (SOURCE.parent / 'harness' / 'hooks' / 'ops_watch.py', harness_dir / 'ops_watch.py')]  # alert parity (goodqa#14613 M9)
     files += [(ROOT / 'harness' / 'hooks' / name, harness_dir / name)
               for name in DELIVERY_HELPERS]
-    files += [(ROOT / 'harness' / 'tools' / 'watch-tests.py', harness_dir / 'watch-tests.py')]
+    files += [(ROOT / 'harness' / 'tools' / 'watch-tests.py', harness_dir / 'watch-tests.py'),
+              (OWNER_SUPERVISOR, harness_dir / 'codex_owner.py')]
+    manifest_path = harness_dir / INSTALL_MANIFEST
     instructions_path = codex_home / 'AGENTS.md'
     hooks_path = codex_home / 'hooks.json'
     config_path = codex_home / 'config.toml'
     user_files = [] if hooks_only else [instructions_path, hooks_path, config_path]
-    managed = [destination for _, destination in files] + user_files
+    managed = [destination for _, destination in files] + [manifest_path] + user_files
     directories = [home, codex_home, codex_home / 'agents', codex_home / 'skills', skill_dir,
                    skill_dir / 'references', harness_dir, backup_root, wal_parent, wal_dir]
     if any(path.is_symlink() for path in [*managed, *directories]):
@@ -320,6 +374,7 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False, comma
         originals = {path: read_regular(path, pinned_parent=pins.fd(path.parent),
                                         retain_fd=pins.file_fds) for path in managed}
         payloads = [(destination, source.read_bytes()) for source, destination in files]
+        payloads.append((manifest_path, install_manifest(payloads, harness_dir)))
         if not hooks_only:
             existing_instructions = originals[instructions_path][0].decode() if originals[instructions_path] else ''
             existing_hooks = json.loads(originals[hooks_path][0].decode()) if originals[hooks_path] else {}
@@ -433,7 +488,8 @@ def main() -> None:
     print(f'  {netwatch_status(args.home, args.apply, args.netwatch)}')
     print(f'  {local_profile_status(args.home, args.home / ".codex" / "agent-harness")}')
     if args.apply:
-        print('Review and trust the new user hooks with /hooks in a new Codex session.')
+        for line in codex_trust_report(args.home.expanduser().resolve() / '.codex'):
+            print(line)
 
 
 if __name__ == '__main__':

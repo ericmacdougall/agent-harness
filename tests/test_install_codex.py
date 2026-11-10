@@ -1,5 +1,6 @@
 """Codex-native installer and WAL behavior in disposable user homes."""
 
+import hashlib
 import io
 import json
 import os
@@ -698,3 +699,96 @@ class CodexCopiesTheDropboxBudget(unittest.TestCase):
         import install_codex
         self.assertIn('heavy_job_guard.py', install_codex.DELIVERY_HELPERS)
         self.assertIn('dropbox_budget.conf', install_codex.DELIVERY_HELPERS)
+
+
+@unittest.skipUnless(tomllib is not None, 'Codex installer requires Python 3.11+')
+class CodexOwnerInstallTests(unittest.TestCase):
+    """GoodQA #15565: the owner supervisor ships beside the hooks, with a per-file manifest and a trust report."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name).resolve()
+        self.codex_home = self.home / '.codex'
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_main(self, *argv):
+        import install_codex
+        out = io.StringIO()
+        with patch.object(sys, 'argv', ['install_codex.py', '--home', str(self.home), '--no-netwatch', *argv]), \
+                patch('install_codex.netwatch_status', return_value='netwatch: skipped (test)'), \
+                patch('install_codex.install_git_backstop', return_value='git backstop: skipped (test)'), \
+                patch('sys.stdout', out):
+            install_codex.main()
+        return out.getvalue()
+
+    def test_supervisor_and_manifest_are_installed_and_pinned(self):
+        install(self.home, apply=True)
+        harness_dir = self.codex_home / 'agent-harness'
+        installed = harness_dir / 'codex_owner.py'
+        self.assertEqual(installed.read_bytes(), (ROOT / 'harness' / 'bin' / 'codex_owner.py').read_bytes())
+        manifest = json.loads((harness_dir / 'install-manifest.json').read_text())
+        self.assertEqual(manifest['schema'], 1)
+        on_disk = {p.name for p in harness_dir.iterdir() if p.is_file() and p.name != 'install-manifest.json'}
+        self.assertEqual(set(manifest['files']), on_disk)
+        for name, digest in manifest['files'].items():
+            self.assertEqual(hashlib.sha256((harness_dir / name).read_bytes()).hexdigest(), digest, name)
+        self.assertFalse(stat.S_IMODE((harness_dir / 'install-manifest.json').stat().st_mode) & 0o022)
+
+    def test_hooks_only_install_also_writes_the_manifest(self):
+        install(self.home, apply=True, hooks_only=True)
+        self.assertTrue((self.codex_home / 'agent-harness' / 'install-manifest.json').is_file())
+        self.assertFalse((self.codex_home / 'hooks.json').exists())
+
+    def test_fresh_install_passes_strict_vet_and_an_edit_fails_it(self):
+        install(self.home, apply=True)
+        env = {k: v for k, v in os.environ.items() if not k.startswith('CODEX_')}
+        env['HOME'] = str(self.home)
+
+        def vet():
+            return subprocess.run([sys.executable, str(self.codex_home / 'agent-harness' / 'codex_owner.py'),
+                                   'vet', '--strict-vet'], env=env, capture_output=True, text=True, timeout=30)
+        first = vet()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertIn('(strict)', first.stdout)
+        with open(self.codex_home / 'agent-harness' / 'command_guard_hook.py', 'a') as handle:
+            handle.write('\n# edited after install\n')
+        second = vet()
+        self.assertEqual(second.returncode, 1)
+        self.assertIn('command_guard_hook.py differs from the install manifest', second.stdout)
+
+    def test_apply_prints_trust_report_and_never_writes_trusted_hash(self):
+        output = self.run_main('--apply')
+        self.assertIn('WARNING codex:trust:', output)
+        self.assertIn('pre_tool_use:', output)
+        self.assertIn('heavy_job_guard.py', output)
+        self.assertIn('/hooks in an interactive Codex session', output)
+        self.assertIn('--dangerously-bypass-hook-trust', output)
+        self.assertIn(str(self.codex_home / 'agent-harness' / 'codex_owner.py'), output)
+        self.assertNotIn('trusted_hash', (self.codex_home / 'config.toml').read_text())
+
+    def test_trust_report_matches_ops_watch_and_clears_when_trusted(self):
+        import install_codex
+        install(self.home, apply=True)
+        ops = install_codex._ops_watch()
+        expected = ops.codex_expected_trust(self.codex_home / 'hooks.json')
+        report = install_codex.codex_trust_report(self.codex_home)
+        self.assertIn(f'{len(expected)} of {len(expected)} hooks.json hooks', report[0])
+        config = self.codex_home / 'config.toml'
+        keys = sorted(expected)
+        trusted = ''.join(f'\n[hooks.state."{key}"]\ntrusted_hash = "{expected[key]}"\n' for key in keys[1:])
+        trusted += f'\n[hooks.state."{keys[0]}"]\ntrusted_hash = "sha256:stale"\n'
+        config.write_text(config.read_text() + trusted)
+        report = install_codex.codex_trust_report(self.codex_home)
+        self.assertIn(f'1 of {len(expected)}', report[0])
+        self.assertTrue(any('changed' in line for line in report[1:]))
+        config.write_text(config.read_text().replace('sha256:stale', expected[keys[0]]))
+        self.assertEqual(install_codex.codex_trust_report(self.codex_home),
+                         [f'codex:trust: all {len(expected)} hooks.json hooks are trusted in config.toml'])
+
+    def test_trust_report_survives_malformed_hooks_json(self):
+        import install_codex
+        self.codex_home.mkdir()
+        (self.codex_home / 'hooks.json').write_text('{bad')
+        self.assertIn('could not check', install_codex.codex_trust_report(self.codex_home)[0])
