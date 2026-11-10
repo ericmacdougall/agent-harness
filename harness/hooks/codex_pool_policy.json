@@ -2,6 +2,7 @@
   "schema": 1,
   "note": "Budget and rotation policy for codex_pool.py. Caps confirmed by the user 2026-11-08 (WAL wa7703ef35c7). Prices are ESTIMATES in USD per million tokens (OpenAI exposes no balance API); keep them at or above list price so the ledger over-counts rather than under-counts.",
   "project": "goodqa-28dd3",
+  "ledger_platform": "darwin",
   "secret_prefix": "openai-codex-key-",
   "ssh_host": "t2-dev",
   "api_base": "https://api.openai.com",

@@ -7,12 +7,14 @@ import json
 import os
 import signal
 import stat
+import contextlib
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -103,9 +105,16 @@ class Base(unittest.TestCase):
         self.policy = json.loads(json.dumps(REAL_POLICY))
         self.policy['keys'] = [{'alias': a, 'enabled': True} for a in self.aliases]
         self.env_extra = {}
+        # the CODEX_POOL_* overrides below work only with this marker beside the script (red-team of PR 172)
+        self.marker = SCRIPT.parent / '.allow-test-overrides'
+        self.marker_existed = self.marker.exists()  # another module may own it for the whole run
+        self.marker.write_text('tests only\n')
 
     def tearDown(self):
         self.tmp.cleanup()
+        if not self.marker_existed:
+            with contextlib.suppress(OSError):
+                self.marker.unlink()
 
     def write_policy(self):
         (self.t / 'policy.json').write_text(json.dumps(self.policy))
@@ -270,14 +279,14 @@ class Models(Base):
         self.assertEqual(self.run_review('gpt-6-astra').returncode, 3)
 
     def test_daybreak_only_for_redteam_on_key_with_access(self):
-        refused = self.pool('run', '--purpose', 'review', '--model', 'gpt-5.6-cyber', '--', 'exec', '-')
+        refused = self.pool('run', '--purpose', 'review', '--model', 'gpt-5.6-cyber', '--', 'exec', '--json', '-')
         self.assertEqual(refused.returncode, 3)
-        none = self.pool('run', '--purpose', 'redteam', '--model', 'gpt-5.6-cyber', '--', 'exec', '-')
+        none = self.pool('run', '--purpose', 'redteam', '--model', 'gpt-5.6-cyber', '--', 'exec', '--json', '-')
         self.assertEqual(none.returncode, 4)  # no key has probed access
         self.assertEqual(self.codex_calls(), [])
         state = {'schema': 1, 'subscription': {}, 'keys': {'bbb': {'probe': {'daybreak': ['gpt-5.6-cyber'], 'result': 'ok'}}}}
         (self.t / 'state' / 'state.json').write_text(json.dumps(state))
-        granted = self.pool('run', '--purpose', 'redteam', '--model', 'gpt-5.6-cyber', '--', 'exec', '-')
+        granted = self.pool('run', '--purpose', 'redteam', '--model', 'gpt-5.6-cyber', '--', 'exec', '--json', '-')
         self.assertEqual(granted.returncode, 0, granted.stderr)
         self.assertEqual(self.gcloud_calls(), ['bbb'])
 
@@ -356,19 +365,69 @@ class Hardening(Base):
         self.assertNotIn('xxxxxxxxxxxxxxxxxxxxxxxx', result.stdout)
 
     def test_success_without_json_is_never_retried_or_free(self):
-        result = self.pool('run', '--purpose', 'review', '--model', 'gpt-6.1-terra', '--keys-only', '--', 'exec', '-',
+        result = self.pool('run', '--purpose', 'review', '--model', 'gpt-6.1-terra', '--keys-only', '--', 'exec', '--json', '-',
                            FAKE_NO_JSON='1')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.gcloud_calls()), 1)
         rows = self.ledger()
         self.assertEqual(rows[-1]['usd'], rows[0]['usd'])
         self.assertEqual(rows[-1]['status'], 'ok_no_usage')
+        state = json.loads((self.t / 'state' / 'state.json').read_text())  # spend was not metered: the key rests until midnight UTC
+        health = [v['health'] for v in state['keys'].values() if v.get('health')]
+        self.assertEqual([h['result'] for h in health], ['unknown-usage'])
+        self.assertTrue(health[0]['until'] > rows[-1].get('at', '')[:10])
+
+    def test_a_run_without_json_is_refused_because_it_cannot_be_metered(self):
+        result = self.pool('run', '--purpose', 'review', '--model', 'gpt-6.1-terra', '--keys-only', '--', 'exec', '-')
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn('--json', result.stderr)
+        self.assertEqual(self.gcloud_calls(), [])  # refused before any key was fetched
+
+    def test_a_run_above_the_per_run_cap_rests_the_key_for_the_day(self):
+        result = self.run_review(FAKE_OUT='900000')  # 900k output tokens at terra prices is far above the $5 per-run cap
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = self.ledger()
+        self.assertIn('over_run_cap', rows[-1]['status'])
+        state = json.loads((self.t / 'state' / 'state.json').read_text())
+        self.assertIn('unknown-usage', json.dumps(state))
+        self.assertGreater(rows[-1]['usd'], 5)
+
+    def test_the_ledger_platform_gate_refuses_other_hosts(self):
+        self.policy['ledger_platform'] = 'plan9'
+        result = self.run_review()
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn('one ledger', result.stderr)
+        self.assertEqual(self.gcloud_calls(), [])
+
+    def test_overrides_and_codex_bin_are_ignored_without_the_marker(self):
+        import importlib.util
+        copy = self.t / 'copy'
+        copy.mkdir()
+        shutil_copy = __import__('shutil').copy
+        shutil_copy(SCRIPT, copy / 'codex_pool.py')
+        shutil_copy(HOOKS / 'codex_pool_policy.json', copy / 'codex_pool_policy.json')
+        spec = importlib.util.spec_from_file_location('codex_pool_nomarker', copy / 'codex_pool.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertFalse(module.overrides_allowed())
+        with unittest.mock.patch.dict(os.environ, {'CODEX_POOL_STATE_DIR': str(self.t / 'evil'), 'CODEX_POOL_POLICY': str(self.t / 'p.json'),
+                                                     'CODEX_POOL_CODEX_BIN': str(self.codex), 'CODEX_POOL_GCLOUD_BIN': str(self.gcloud)}):
+            for name in ('CODEX_POOL_STATE_DIR', 'CODEX_POOL_POLICY', 'CODEX_POOL_CODEX_BIN', 'CODEX_POOL_GCLOUD_BIN', 'CODEX_POOL_API_BASE'):
+                self.assertIsNone(module.override(name), name)
+            with unittest.mock.patch.object(module.shutil, 'which', lambda name: None), \
+                    unittest.mock.patch.object(module.os, 'access', lambda path, mode: False):
+                with self.assertRaises(module.PoolError):
+                    module.codex_binary(str(self.codex))  # --codex-bin is ignored too
+            self.assertNotEqual(module.Store().root, self.t / 'evil')
 
     def test_stderr_prose_after_work_is_not_a_key_failure(self):
         result = self.run_review(FAKE_STDERR_401='1')
         self.assertEqual(result.returncode, 1)
         self.assertEqual(len(self.gcloud_calls()), 1)  # no retry on other keys
-        self.assertFalse((self.t / 'state' / 'state.json').exists())  # no key was marked unhealthy
+        state_file = self.t / 'state' / 'state.json'  # no key was marked bad (401 and the like); unmetered spend only rests it
+        results = [v['health']['result'] for v in json.loads(state_file.read_text()).get('keys', {}).values() if v.get('health')] \
+            if state_file.exists() else []
+        self.assertEqual(results, ['unknown-usage'])
         rows = self.ledger()
         self.assertEqual(rows[-1]['usd'], rows[0]['usd'])
 
@@ -376,7 +435,8 @@ class Hardening(Base):
         for bad in (['exec', '--sandbox', 'danger-full-access', '-'], ['exec', '--dangerously-bypass-approvals-and-sandbox'],
                     ['exec', '--add-dir', '/'], ['exec', '-c', 'sandbox_workspace_write.network_access=true'],
                     ['exec', '-c', 'model_reasoning_effort=xhigh'], ['exec', '-c', 'review_model=gpt-6-astra'],
-                    ['exec', 'review'], ['exec', '--full-auto'], ['exec', '-c', 'shell_environment_policy.inherit=all']):
+                    ['exec', 'review'], ['exec', '--full-auto'], ['exec', '-c', 'shell_environment_policy.inherit=all'],
+                    ['exec', '-sdanger-full-access', '-'], ['exec', '-s=danger-full-access', '-'], ['exec', '-sfoo', '-']):
             result = self.pool('run', '--purpose', 'review', '--model', 'gpt-6.1-terra', '--keys-only', '--', *bad)
             self.assertEqual(result.returncode, 3, (bad, result.stderr))
         self.assertEqual(self.codex_calls(), [])
@@ -481,6 +541,28 @@ class Probe(Base):
         self.assertEqual(status.returncode, 0)
         self.assertIn('401', status.stdout)
         self.assertNotIn('SECRETTAIL', status.stdout)
+
+
+class FiniteAmounts(Base):
+    def test_a_nan_or_infinite_ledger_row_or_price_is_refused_not_counted(self):
+        sys.path.insert(0, str(HOOKS))
+        import codex_pool
+        for bad in (float('nan'), float('inf'), -1, True, 'x'):
+            with self.subTest(bad=repr(bad)):
+                with self.assertRaises(codex_pool.PoolError):
+                    codex_pool.effective_spend([{'type': 'settle', 'run': 'r', 'alias': 'a', 'usd': bad}])
+        self.policy['caps_usd']['total_day'] = float('nan')
+        self.write_policy()
+        with unittest.mock.patch.dict(os.environ, {'CODEX_POOL_POLICY': str(self.t / 'policy.json')}):
+            with self.assertRaises(codex_pool.PoolError):
+                codex_pool.load_policy()
+        self.policy = json.loads(json.dumps(REAL_POLICY))
+        first = next(iter(self.policy['prices']['families']))
+        self.policy['prices']['families'][first]['out'] = float('inf')
+        self.write_policy()
+        with unittest.mock.patch.dict(os.environ, {'CODEX_POOL_POLICY': str(self.t / 'policy.json')}):
+            with self.assertRaises(codex_pool.PoolError):
+                codex_pool.load_policy()
 
 
 class Integration(Base):

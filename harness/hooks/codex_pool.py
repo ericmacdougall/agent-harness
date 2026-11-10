@@ -14,6 +14,7 @@ import base64
 import contextlib
 import fcntl
 import json
+import math
 import os
 import re
 import shutil
@@ -60,8 +61,19 @@ class Terminated(BaseException):
 
 
 # ---------------------------------------------------------------- policy and store
+def overrides_allowed():
+    """CODEX_POOL_* environment overrides and --codex-bin exist for the tests only (red-team of PR 172: any program an agent
+    writes could receive the decoded key, and a fresh state directory or policy resets the caps). They work only when this
+    marker file sits beside the script; the installer never ships it."""
+    return (HERE / '.allow-test-overrides').is_file()
+
+
+def override(name):
+    return os.environ.get(name) if overrides_allowed() else None
+
+
 def load_policy():
-    path = Path(os.environ.get('CODEX_POOL_POLICY') or HERE / 'codex_pool_policy.json')
+    path = Path(override('CODEX_POOL_POLICY') or HERE / 'codex_pool_policy.json')
     try:
         policy = json.loads(path.read_text())  # input-ok: local policy file, small
     except (OSError, ValueError) as error:
@@ -70,6 +82,12 @@ def load_policy():
     if policy.get('schema') != SCHEMA or not all(isinstance(caps.get(k), (int, float)) and caps[k] > 0
                                                  for k in ('per_run', 'per_key_day', 'total_day', 'total_month')):
         raise PoolError('policy invalid')
+    if not all(math.isfinite(caps[k]) for k in caps if isinstance(caps[k], (int, float))):
+        raise PoolError('policy invalid')
+    for family in list(policy.get('prices', {}).get('families', {}).values()) + list(policy.get('prices', {}).get('models', {}).values()):
+        if isinstance(family, dict) and any(not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) or v < 0
+                                            for k, v in family.items() if k in ('in', 'cached', 'out', 'reserve_usd')):
+            raise PoolError('policy has a non-finite or negative price')
     for key in policy['keys']:
         if not ALIAS.match(key['alias']):
             raise PoolError('policy has an unsafe alias')
@@ -88,7 +106,7 @@ class Store:
     """State JSON plus an append-only JSONL ledger, both under one flock-protected directory."""
 
     def __init__(self, root=None):
-        self.root = Path(root or os.environ.get('CODEX_POOL_STATE_DIR') or Path.home() / '.agent-harness' / 'codex-pool')
+        self.root = Path(root or override('CODEX_POOL_STATE_DIR') or Path.home() / '.agent-harness' / 'codex-pool')
         if self.root.is_symlink():
             raise PoolError('state directory cannot be a symlink')
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -170,7 +188,7 @@ def effective_spend(rows):
     for row in rows:
         kind, run = row.get('type'), row.get('run')
         usd = row.get('usd')
-        if not isinstance(usd, (int, float)) or usd < 0 or kind not in ('reserve', 'settle', 'probe') or not run:
+        if not isinstance(usd, (int, float)) or isinstance(usd, bool) or not math.isfinite(usd) or usd < 0 or kind not in ('reserve', 'settle', 'probe') or not run:
             raise PoolError('ledger row malformed; refusing to run until it is repaired')
         if kind == 'reserve' and run not in runs:
             runs[run] = {'alias': row.get('alias'), 'at': row.get('at', ''), 'usd': usd}
@@ -242,7 +260,7 @@ def fetch_key(policy, alias):
     if not ALIAS.match(alias):
         raise PoolError('bad alias')
     secret = policy['secret_prefix'] + alias
-    gcloud = os.environ.get('CODEX_POOL_GCLOUD_BIN') or shutil.which('gcloud')
+    gcloud = override('CODEX_POOL_GCLOUD_BIN') or shutil.which('gcloud')
     if gcloud:
         cmd = [gcloud, 'secrets', 'versions', 'access', 'latest', '--secret=' + secret, '--project=' + policy['project']]
     else:
@@ -369,7 +387,7 @@ def run_child(cmd, env, stdin_bytes, max_seconds, key=None):
 
 
 def codex_binary(explicit=None):
-    candidates = [explicit, os.environ.get('CODEX_POOL_CODEX_BIN'), shutil.which('codex'),
+    candidates = [explicit if overrides_allowed() else None, override('CODEX_POOL_CODEX_BIN'), shutil.which('codex'),
                   '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex']
     for candidate in candidates:
         if candidate and os.access(candidate, os.X_OK):
@@ -394,6 +412,8 @@ def validate_passthrough(args):
             i += 1
             continue
         flag = token.split('=', 1)[0]
+        if re.match(r'^-s\S', token) and not token.startswith('--') and token[2:].lstrip('=') not in ALLOWED_SANDBOX:
+            raise PoolError('sandbox %s is not allowed through the pool' % token[2:], EXIT_REFUSED)  # -sdanger-full-access
         if flag in ('-s', '--sandbox'):
             value = token.split('=', 1)[1] if '=' in token else (args[i + 1] if i + 1 < len(args) else '')
             if value not in ALLOWED_SANDBOX:
@@ -432,7 +452,7 @@ def key_usable(policy, state, entry, now, daybreak_model=None):
     result = health.get('result')
     if result in ('401', 'insufficient_quota', 'codex-restricted'):
         return False
-    if result == 'rate-limited' and health.get('until', '') > iso(now):
+    if result in ('rate-limited', 'unknown-usage') and health.get('until', '') > iso(now):
         return False
     if daybreak_model and daybreak_model not in (saved.get('probe') or {}).get('daybreak', []):
         return False
@@ -471,7 +491,12 @@ def settle(store, run_id, alias, usd, status, **extra):
         store.append({'type': 'settle', 'run': run_id, 'alias': alias, 'usd': round(float(usd), 6), 'status': status, **extra})
 
 
-def mark_health(store, alias, result, minutes=0, detail=''):
+def next_utc_midnight(now=None):
+    now = now or utcnow()
+    return iso((now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0))
+
+
+def mark_health(store, alias, result, minutes=0, detail='', until=None):
     with store.lock():
         state = store.state()
         health = {'result': result, 'at': iso(utcnow())}
@@ -479,6 +504,8 @@ def mark_health(store, alias, result, minutes=0, detail=''):
             health['detail'] = scrub(detail.encode()[:300]).decode('utf-8', 'replace')
         if minutes:
             health['until'] = iso(utcnow() + timedelta(minutes=minutes))
+        if until:
+            health['until'] = until
         state['keys'].setdefault(alias, {})['health'] = health
         store.save_state(state)
 
@@ -528,6 +555,12 @@ def run_command(args):
         raise PoolError('REFUSED: %s needs an escalation.py approve-top record for --task' % model, EXIT_REFUSED)
     if not re.match(r'^(low|medium|high|xhigh|max)$', effort or ''):
         raise PoolError('unknown effort', EXIT_REFUSED)
+    if '--json' not in passthrough:
+        raise PoolError('REFUSED: pass --json after exec so the pool can meter usage; an unmetered run cannot be capped', EXIT_REFUSED)
+    ledger_platform = policy.get('ledger_platform')
+    if ledger_platform and sys.platform != ledger_platform:
+        raise PoolError('REFUSED: API-key runs are metered by one ledger on the %s host (the user caps are global); '
+                        'run this on that host' % ledger_platform, EXIT_REFUSED)
     sweep_stale_homes(store.root / 'homes', 2 * policy['max_run_seconds'])
     stdin_bytes = b'' if sys.stdin is None or sys.stdin.isatty() else sys.stdin.buffer.read(MAX_STDIN + 1)
     if len(stdin_bytes) > MAX_STDIN:
@@ -605,6 +638,9 @@ def run_with_key(store, policy, run_id, alias, reserve, price, purpose, model, e
             status = 'ok' if code == 0 else 'failed_after_usage'
             if usd > reserve:
                 status += '_over_reserve'
+            if usd > policy['caps_usd']['per_run']:  # the per-run cap cannot be enforced mid-run: stop using this key today
+                status += '_over_run_cap'
+                mark_health(store, alias, 'unknown-usage', until=next_utc_midnight(), detail='run cost above the per-run cap')
         elif failure in ('401', 'insufficient_quota', 'rate-limited', 'codex-restricted'):
             usd, status, retry = 0.0, failure, True
             mark_health(store, alias, failure, policy['rate_limit_cooldown_minutes'] if failure == 'rate-limited' else 0,
@@ -612,11 +648,14 @@ def run_with_key(store, policy, run_id, alias, reserve, price, purpose, model, e
         else:
             # No usage report and no classified pre-work failure: keep the full reserve, never assume it was free.
             status = 'timeout_unknown_usage' if timed_out else ('ok_no_usage' if code == 0 else 'failed_unknown_usage')
+            mark_health(store, alias, 'unknown-usage', until=next_utc_midnight(), detail=status)  # spend not metered: rest the key
     except PoolError as error:
         status, usd, retry = 'fetch_failed', 0.0, True
         err = ('codex-pool: %s\n' % error).encode()
     except Terminated:
         status = 'terminated_unknown_usage'
+        with contextlib.suppress(Exception):
+            mark_health(store, alias, 'unknown-usage', until=next_utc_midnight(), detail=status)
         err = b'codex-pool: terminated\n'
         code = 143
     finally:
@@ -650,7 +689,7 @@ def http_json(method, url, key, body=None):
 
 
 def probe_alias(store, policy, alias):
-    base = os.environ.get('CODEX_POOL_API_BASE') or policy['api_base']
+    base = override('CODEX_POOL_API_BASE') or policy['api_base']
     key = fetch_key(policy, alias)
     result, code_text = 'error', None
     try:

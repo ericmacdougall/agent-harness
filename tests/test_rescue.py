@@ -18,6 +18,9 @@ hermetic.install()
 # A real quota-blocked mark in the machine's codex-pool must not reroute these fake-codex tests.
 os.environ['CODEX_POOL_STATE_DIR'] = tempfile.mkdtemp(prefix='rescue-pool-state-')
 atexit.register(shutil.rmtree, os.environ['CODEX_POOL_STATE_DIR'], True)
+_POOL_MARKER = Path(__file__).resolve().parents[1] / 'harness' / 'hooks' / '.allow-test-overrides'  # CODEX_POOL_* works only with it
+_POOL_MARKER.write_text('tests only\n')
+atexit.register(lambda: _POOL_MARKER.unlink(missing_ok=True))
 
 RESCUE = Path(__file__).resolve().parents[1] / 'harness/hooks/rescue.py'
 # Outer test watchdogs, not product deadlines. Validation runs several Git reads.

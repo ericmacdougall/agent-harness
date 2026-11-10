@@ -17,3 +17,4 @@ console/console
 commit_policy.local.json
 spec_policy.local.json
 leak-denylist.txt
+harness/hooks/.allow-test-overrides

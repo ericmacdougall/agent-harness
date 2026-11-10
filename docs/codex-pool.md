@@ -44,9 +44,15 @@ Failure handling: a key is marked unhealthy and the next key tried only when a s
 keeps the full reserve in the ledger and is not retried. A refused or unusable pool prints a prose "usage limit
 reached" error record so `peer_review.py` may use its one independent fallback without placing a cooldown.
 
-Known limits: caps are per host (the Mac and t2-dev keep separate ledgers) and are enforced at reservation, not
-mid-run; set a hard monthly limit on each OpenAI project as the real backstop. `CODEX_POOL_STATE_DIR` and
-`CODEX_POOL_POLICY` can redirect the ledger and policy, so the caps guard budget, not a hostile local user.
+The caps are global (the user's decision, 2026-11-09): one ledger on the Mac, and API-key runs refuse on any other host
+(`ledger_platform` in the policy). Every run must pass `--json` after `exec` so usage can be metered; a run whose
+usage cannot be read (no usage record, timeout, termination) or that costs more than the per-run cap rests that key
+until midnight UTC. The `CODEX_POOL_*` environment variables and `--codex-bin` (they could hand the decoded key to any
+program, or reset the ledger) work only when a `.allow-test-overrides` file sits beside the script; the installer
+never ships it and the tests create it.
+
+Known limits: caps are enforced at reservation, not mid-run; set a hard monthly limit on each OpenAI project as the real
+backstop. A SIGKILLed pool can leave its codex child running until its own end (tracked as a follow-up).
 
 ## Commands
 

@@ -53,6 +53,9 @@ def system_path():
     return _SYSTEM_BIN[0].name
 
 
+_POOL_MARKER = Path(__file__).resolve().parents[1] / "harness" / "hooks" / ".allow-test-overrides"
+
+
 def setUpModule():  # tests never call the ticket tracker; restored in tearDownModule so it cannot leak into other modules
     global _OFFLINE
     global _POOL_DIR
@@ -61,6 +64,7 @@ def setUpModule():  # tests never call the ticket tracker; restored in tearDownM
     _OFFLINE = __import__("unittest.mock", fromlist=["patch"]).patch.dict(
         os.environ, {"HARNESS_PROVENANCE_OFFLINE": "1", "CODEX_POOL_STATE_DIR": _POOL_DIR})
     _OFFLINE.start()
+    _POOL_MARKER.write_text("tests only\n")  # CODEX_POOL_STATE_DIR is honoured only with this marker (PR 172 red-team)
 
 
 def fresh_pool_state():
@@ -71,6 +75,7 @@ def fresh_pool_state():
 
 def tearDownModule():
     _OFFLINE.stop()
+    _POOL_MARKER.unlink(missing_ok=True) if hasattr(Path, "unlink") else None
     shutil.rmtree(_POOL_DIR, ignore_errors=True)
 
 
