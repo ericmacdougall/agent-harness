@@ -602,21 +602,65 @@ TOP_NEGATION = re.compile(r"\b(?:not|no|never|don'?t|do not|doesn'?t|won'?t|stop
 # GoodQA #15565: plain asks such as "have codex astra do the layout", "i just want astra on the first round" and
 # "fable/opus can take over ..." are assent. have/want/get/run/can are common in idle talk ("I have astra open in a
 # tab", "fable can write about it"), so these forms are strict: the sentence must START with the request (optional
-# filler such as "ok," or "i just"), the model name follows within two words, and an action word must follow it.
-# They also refuse the extra words below (inflected stops, concessions, cost talk) that the older phrases never saw.
+# filler such as "ok," or "i just"), the model name follows within two words, and a concrete task assignment must
+# follow it: an action verb WITH an object ("do the layout", "to take over", "review the ui") or, for want/get/run
+# only, "on/for <the|this|...>". A bare "do" or "take" is not an assignment (Codex review of 9221bb9, F2: "have
+# fable do zero work", "i want astra to take a break"). They also refuse the extra words below (inflected stops,
+# concessions, cost talk) that the older phrases never saw; since Codex F1 those words refuse the plain route too.
 _MODEL = r"(?:fable|astra|top[ -](?:writing[ -])?(?:rung|model|tier))"
 _FILLER = r"^(?:(?:ok|okay|yes|yeah|yep|so|and|then|also|please|just|now)[,\s]+)*"
+_OBJECT = r"(?:the|this|that|it|its|a|an|my|our|these|those|all|every|each|both|task)"
+_ACTION = (r"(?:do|handle|take\s+over|lead|start|own|design|build|write|run|review|fix|rescue|implement|try|code|draft|"
+           r"redo|refactor|debug|test|ship|tackle|finish|work\s+on|go\s+ahead\s+with)")
+_ASKER = _FILLER + r"(?:i\s+(?:just\s+|really\s+|also\s+)*want|have|want|get|run)(?:\s+[\w'/-]+){0,2}?\s+" + _MODEL + r"(?:/[\w-]+)?"
 TOP_REQUEST_NEAR = re.compile(
-    _FILLER + r"(?:i\s+(?:just\s+|really\s+|also\s+)*)?(?:have|want|get|run)(?:\s+[\w'/-]+){0,2}?\s+" + _MODEL + r"(?:/[\w-]+)?"
-    r"(?=\s+(?:on|to\s+(?:do|handle|take|lead|start|own|work|design|build|write)|do|handle|take|lead|start|own|work|design|"
-    r"build|write|for|first|this|that|it|all|every|each|the)\b)", re.I)
+    _ASKER + r"(?=\s+(?:to\s+)?(?:" + _ACTION + r"\s+" + _OBJECT + r"|take\s+over)\b)", re.I)
+TOP_REQUEST_ON = re.compile(
+    _FILLER + r"(?:i\s+(?:just\s+|really\s+|also\s+)*want|want|get|run)(?:\s+[\w'/-]+){0,2}?\s+" + _MODEL + r"(?:/[\w-]+)?"
+    r"(?=\s+(?:on|for)\s+" + _OBJECT + r"\b)", re.I)
 TOP_CAN = re.compile(
     _FILLER + r"(?:(?:opus|sonnet|codex|haiku)(?:\s*[/,]\s*|\s+(?:and|or)\s+))*" + _MODEL +
-    r"(?:\s*[/,]\s*[\w-]+|\s+(?:and|or)\s+[\w-]+)?\s+can\s+(?:take\s+over|take|lead|handle|start|own|do\s+(?:the|this|it|that))\b", re.I)
+    r"(?:\s*[/,]\s*[\w-]+|\s+(?:and|or)\s+[\w-]+)?\s+can\s+(?:take\s+over|(?:take|lead|handle|start|own|do)\s+"
+    r"(?:the|this|it|that|these|those|all|my|our))\b", re.I)
 TOP_NEGATION_NEW = re.compile(r"\b(?:stopp(?:ed|ing)|kill\w*|cancell?\w*|remov\w*|ban(?:ned|s)?|paus\w*|gone|rid|shut\w*|hold|"
                               r"uninstall\w*|down|out|drop\w*|skip\w*|but|only|after|once|when|while|since|because|although|"
                               r"though|until|before|know|why|how|about|bill\w*|cost\w*|credits?|nothing|none|neither|nor|"
                               r"faster|slower|better|worse|list)\b", re.I)
+# Codex review of 9221bb9, F2: a closed list of inactivity and non-assignment words. Any of them anywhere in the
+# assenting sentence (or a later one) refuses it, whatever request words surround it ("have fable do nothing, run
+# sonnet for the rescue"). Conservative by design: a refused real ask costs one rephrase, a false grant cannot be undone.
+TOP_INACTIVE = re.compile(
+    r"\b(?:nothing|none|zero|nowhere|nil|naught|idl\w*|break|breather|naps?|napping|sleep\w*|vacation|holiday|bench\w*|"
+    r"sidelines?|sit\w*\s+(?:(?:this|that|it)\s+(?:one\s+)?)?out|sit\w*\s+(?:idle|still|back|tight)|"
+    r"stand\w*\s+(?:down|by|aside)|step\w*\s+(?:back|aside|down)|(?:day|days|time|night)\s+off|skip\w*|chill\w*|"
+    r"relax\w*|easy|no\s+work|pass\s+on|la(?:y|id)\s+off|wait\w*|(?:take|takes|taking|took|have|get|a)\s+(?:a\s+)?rest)\b",
+    re.I)
+TOP_IDLE_VERB = re.compile(_MODEL + r"(?:/[\w-]+)?\s+(?:(?:to|can|could|should|will|may|must|might)\s+)?"
+                           r"(?:pass|rest|idle|nap|sleep|wait|relax|chill|stop|quit|watch\w*|observe|lurk)\b", re.I)
+# Codex review of 9221bb9, F1: on the plain route the request word must govern the top-rung name in the SAME clause,
+# with no other model named between them ("run sonnet for the rescue, fable is great" asks for sonnet). A lower model
+# directly fused to the name ("codex astra", "opus/fable") is the same pick and does not break the binding.
+_CLAUSES = re.compile(r"\s*[,;:()\u2013\u2014]\s*|\s+-\s+|\s+(?:and|but|then|so|or|while|whereas|plus)\s+(?=(?:i|we|you|they|"
+                      r"let'?s|let|please|just|also|now|have|get|run|use|using|pass|give|switch|try|go|put|bring|enable|"
+                      r"escalate|allow|approve\w*|want|keep|make|tell|ask)\b)", re.I)
+_LOWER = re.compile(r"\b(?:sonnet|opus|haiku|codex|gpt[\w.-]*|kimi|gemini|grok|sol)\b", re.I)
+_LOWER_FUSED = re.compile(r"\b(?:sonnet|opus|haiku|codex|gpt[\w.-]*|kimi)\s*[/\s]\s*$", re.I)
+
+
+def _bound_request(sentence):
+    """True when one clause holds a request word and a top-rung name with no other model named between them."""
+    for clause in _CLAUSES.split(sentence):
+        for request in TOP_REQUEST.finditer(clause):
+            for term in TOP_TERMS.finditer(clause):
+                lo, hi = sorted((request, term), key=lambda m: m.start())
+                between = clause[lo.end():hi.start()]
+                if term.start() > request.start():
+                    between = _LOWER_FUSED.sub('', between)
+                if not _LOWER.search(between):
+                    return True
+    return False
+
+
 _SENTENCES = re.compile(r"(?<=[.!?;])\s+|\n+")
 TOP_RETRACT = re.compile(r"\b(?:never ?mind|scratch that|forget (?:it|that)|hold (?:on|off)|belay)\b", re.I)
 
@@ -631,18 +675,24 @@ def top_assent(text):
 
     Delta review D1: the latest word decides. Only the LAST sentence that names the top rung can be assent, it
     must pass those rules itself, and any later sentence that negates or retracts ("no, stop", "never mind",
-    "scratch that") voids it. An earlier request never survives a later refusal."""
+    "scratch that") voids it. An earlier request never survives a later refusal.
+
+    Codex review of 9221bb9 (F1/F2): the request must name the top rung in its own clause ("have fable do nothing,
+    run sonnet for the rescue" asks for sonnet), and any refusal or inactivity word in the sentence or a later one
+    (nothing, zero, a break, sit out, pass, idle ...) refuses it whatever other clauses say."""
     sentences = [part.strip() for part in _SENTENCES.split(text or '') if part.strip()]
     mentions = [index for index, sentence in enumerate(sentences) if TOP_TERMS.search(sentence)]
     if not mentions:
         return None
     candidate = sentences[mentions[-1]]
-    plain = TOP_REQUEST.search(candidate)
-    strict = (TOP_REQUEST_NEAR.search(candidate) or TOP_CAN.search(candidate)) and not TOP_NEGATION_NEW.search(candidate)
+    plain = _bound_request(candidate)
+    strict = TOP_REQUEST_NEAR.search(candidate) or TOP_REQUEST_ON.search(candidate) or TOP_CAN.search(candidate)
     if '?' in candidate or not (plain or strict) or TOP_NEGATION.search(candidate):
         return None
+    if TOP_NEGATION_NEW.search(candidate) or TOP_INACTIVE.search(candidate) or TOP_IDLE_VERB.search(candidate):
+        return None  # Codex F1/F2: a refusal or inactivity anywhere in the sentence wins over request words elsewhere
     for later in sentences[mentions[-1] + 1:]:
-        if TOP_NEGATION.search(later) or TOP_RETRACT.search(later):
+        if TOP_NEGATION.search(later) or TOP_RETRACT.search(later) or TOP_INACTIVE.search(later):
             return None
     return candidate
 

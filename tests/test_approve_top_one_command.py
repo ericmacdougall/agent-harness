@@ -187,6 +187,40 @@ class Assent(unittest.TestCase):
             with self.subTest(words=words):
                 self.assertIsNone(esc.top_assent(words))
 
+    def test_codex_f1_a_lower_model_request_in_another_clause_never_overrides_a_top_model_refusal(self):
+        # Codex final-gate review of 9221bb9, F1 (GoodQA #15565): request words about another model, in another
+        # clause, made the plain route accept a sentence whose only words about the top model refuse or idle it.
+        for words in ('have fable do nothing, run sonnet for the rescue', 'run sonnet for the rescue, have fable do nothing',
+                      'have fable do nothing and use sonnet for the rescue', 'fable sits this out; use opus for the rescue',
+                      'fable is great, use sonnet for the rescue', 'fable can rest, run sonnet', 'astra takes a break, use opus',
+                      'run sonnet for the rescue with fable watching', 'use sonnet for the rescue with fable nearby',
+                      'use opus or fable for the rescue', 'use fable, but only after ten',
+                      'use sonnet for the rescue and fable for nothing', 'use fable for nothing',
+                      'use fable for the rescue. actually have it do nothing.'):
+            with self.subTest(words=words):
+                self.assertIsNone(esc.top_assent(words))
+
+    def test_codex_f2_inactivity_and_non_assignment_after_the_model_are_not_assent(self):
+        # Codex final-gate review of 9221bb9, F2: "do" / "to take" were enough of an action word.
+        for words in ('have fable do zero work', 'i want astra to take a break', 'have fable do no work',
+                      'have astra take the day off', 'i want fable to rest', 'have fable pass', 'i want astra idle',
+                      'have astra sit out', 'i want fable to sit this one out', 'get astra to take a nap',
+                      'have fable go nowhere', 'astra can take a break', 'fable can pass', 'have fable skip the rescue',
+                      'i want astra on the bench', 'have fable stand down', 'i want astra to sleep', 'have fable do',
+                      'i want fable to take it easy', 'i want astra to relax', 'astra can take some time',
+                      # statements, not asks: "have X on Y" and "I have X do Y" describe, they do not assign
+                      'I have astra on the second monitor', 'i have fable do the layouts every week'):
+            with self.subTest(words=words):
+                self.assertIsNone(esc.top_assent(words))
+
+    def test_new_forms_accept_a_concrete_assignment(self):
+        for words in ('have astra review the layout', 'have fable fix the rescue', 'i want astra to build the ui',
+                      'get fable to implement the parser', 'have fable work on the rescue', 'i want fable to take over the rescue',
+                      'use sonnet for tests and use fable for the rescue', 'have fable do the rest of the layout',
+                      'use codex astra for the layout', 'use opus/fable for the rescue'):
+            with self.subTest(words=words):
+                self.assertIsNotNone(esc.top_assent(words))
+
     def test_request_must_start_the_sentence_and_an_action_word_must_follow_the_model(self):
         for words in ('ok, i just want astra on the first round of ui', 'Please have codex astra do the initial layout/design',
                       'then get astra to do the rescue', 'opus/fable can take over the rescue'):
