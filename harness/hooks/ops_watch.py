@@ -1092,13 +1092,14 @@ def check_drift(cfg, runner):
     rc, tree = runner(["git", "-C", repo, "ls-tree", ref, "harness/hooks/"], 30, env=env)
     if rc != 0:
         raise RuntimeError("git ls-tree failed")
-    differ, missing = [], []
+    differ, missing, on_main = [], [], set()
     for line in (tree or "").splitlines():
         meta, _, rel = line.partition("\t")
         parts = meta.split()
         if len(parts) != 3 or parts[1] != "blob":
             continue
         name = rel.rsplit("/", 1)[-1]
+        on_main.add(name)
         installed = claude / "hooks" / name
         if not installed.is_file():
             if name.endswith(".py"):
@@ -1110,7 +1111,33 @@ def check_drift(cfg, runner):
         out.append(alert("drift", "drift:hooks", "warning",
                          f"installed hooks differ from {ref}: {len(differ)} changed, {len(missing)} missing",
                          {"differ": sorted(differ), "missing": sorted(missing), "ref": ref}))
+    local_only = local_only_hooks(claude / "hooks", on_main)
+    if local_only:  # work that exists only on this machine is lost with it (GoodQA #15565: codex_pool.py was never pushed)
+        out.append(alert("drift", "drift:local-only", "high",
+                         f"{len(local_only)} installed hook file(s) are not on {ref}: {', '.join(local_only[:6])}"
+                         + (" ..." if len(local_only) > 6 else ""),
+                         {"files": local_only[:50], "ref": ref, "fix": "push the branch and open a PR, or remove the file"}))
     return out
+
+
+def local_only_hooks(hooks_dir: Path, on_main: set) -> list:
+    """Installed .py and .json hook files that main does not have. Machine-local overrides (*.local.json), editor backups
+    and caches are expected; symlinks and subdirectories are not followed."""
+    found = []
+    try:
+        entries = sorted(os.scandir(hooks_dir), key=lambda e: e.name)
+    except OSError:
+        return found
+    for entry in entries:
+        name = entry.name
+        if not name.endswith((".py", ".json")) or name.endswith(".local.json") or name in on_main:
+            continue
+        try:
+            if entry.is_file(follow_symlinks=False):
+                found.append(name)
+        except OSError:
+            continue
+    return found
 
 
 # ---------------------------------------------------------------- 7. Codex hook trust

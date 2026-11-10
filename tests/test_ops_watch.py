@@ -506,6 +506,29 @@ class DriftTests(GitFixture):
         self.assertIn("drift:claude-md", a)
         self.assertEqual(a["drift:hooks"]["detail"]["differ"], ["deliver.py"])
 
+    def test_installed_file_not_on_main_is_a_high_local_only_alert(self):
+        harness = "# Agent Harness engineering workflow\n\nrule one\n"
+        repo = self.make_repo({"HARNESS.md": harness, "harness/hooks/wal.py": "print(1)\n"})
+        claude = self.home / ".claude"
+        hooks = claude / "hooks"
+        hooks.mkdir(parents=True)
+        (hooks / "wal.py").write_text("print(1)\n")
+        (hooks / "codex_pool.py").write_text("print('only here')\n")
+        (hooks / "codex_pool_policy.json").write_text("{}")
+        (hooks / "commit_policy.local.json").write_text("{}")  # machine-local override: expected
+        (hooks / "ah.py.bak-pre-1").write_text("x")  # backup: not a hook
+        (hooks / "__pycache__").mkdir()
+        (hooks / "linked.py").symlink_to(hooks / "wal.py")  # a symlink is not followed
+        (claude / "CLAUDE.md").write_text(f"<!-- agent-harness:start -->\n{harness}<!-- agent-harness:end -->\n")
+        cfg = dict(self.cfg, drift={"repo": str(repo), "ref": "origin/main", "claude_dir": str(claude)})
+        a = keys(ow.check_drift(cfg, ow.run))
+        self.assertEqual(a["drift:local-only"]["severity"], "high")
+        self.assertEqual(a["drift:local-only"]["detail"]["files"], ["codex_pool.py", "codex_pool_policy.json"])
+        self.assertNotIn("drift:hooks", a)
+        (hooks / "codex_pool.py").unlink()
+        (hooks / "codex_pool_policy.json").unlink()
+        self.assertNotIn("drift:local-only", keys(ow.check_drift(cfg, ow.run)))
+
     def test_no_repo_skips(self):
         cfg = dict(self.cfg, drift={"repo": str(self.home / "none"), "ref": "origin/main", "claude_dir": str(self.home)})
         self.assertEqual(ow.check_drift(cfg, ow.run), [])
