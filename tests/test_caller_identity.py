@@ -88,6 +88,20 @@ class NativeMainPrecedence(unittest.TestCase):
                 with self.subTest(fields=fields):
                     self.assertFalse(ci.is_main(dict(self.payload, **fields), self.claude))
 
+    def test_renamed_signed_runtime_with_cleared_hints_cannot_claim_claude_main(self):
+        import native_context as nc
+        path = "/Applications/Example/renamed-runtime"
+        processes = {10: nc.ProcessIdentity(10, 20, 1000, 1, "/usr/bin/python3"),
+                     20: nc.ProcessIdentity(20, 1, 1000, 2, path)}
+        class Backend:
+            def process(self, pid): return processes[pid]
+            def signature(self, pid):
+                return nc.CodeIdentity("codex", nc.OPENAI_TEAM, "a" * 40, path) if pid == 20 else None
+        probe = nc.probe_runtime_origin
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                nc, "probe_runtime_origin", side_effect=lambda: probe(10, backend=Backend())):
+            self.assertFalse(ci.is_main(self.payload, self.claude))
+
 
 class Stamps(unittest.TestCase):
     def setUp(self):

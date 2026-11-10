@@ -102,4 +102,30 @@ class NativeCandidates(unittest.TestCase):
         self.assertEqual(caught.exception.code, "approval_invalid")
 
 
+class ReviewPrivacyRegressions(unittest.TestCase):
+    def test_value_only_excerpt_from_credential_source_rejects(self):
+        data = snapshot()
+        synthetic = "fixture-only-private-value"
+        data["turns"][0]["items"][0]["content"][0]["text"] = "password=" + synthetic
+        citation = ns.list_candidates(data)[0]["citation"]
+        with self.assertRaises(ValueError):
+            ns.resolve_candidate(data, citation, synthetic)
+
+    def test_listing_cutoff_cannot_expose_a_credential_prefix(self):
+        data = snapshot()
+        # A value can begin before the cutoff while its label is outside the
+        # displayed range in a selected excerpt. Full-source privacy takes priority.
+        data["turns"][0]["items"][0]["content"][0]["text"] = "x" * 244 + " password=fixture-only-value"
+        self.assertTrue(ns.find(data["turns"][0]["items"][0]["content"][0]["text"]))
+        result = ns.list_candidates(data)[0]
+        self.assertEqual(result["excerpt"], "[REDACTED:source-credential]")
+
+    def test_credential_outside_cutoff_still_disables_excerpt_resolution(self):
+        data = snapshot()
+        data["turns"][0]["items"][0]["content"][0]["text"] = "safe context " * 30 + " password=fixture-only-value"
+        result = ns.list_candidates(data)[0]
+        self.assertEqual(result["excerpt"], "[REDACTED:source-credential]")
+        with self.assertRaises(ValueError): ns.resolve_candidate(data, result["citation"], "safe context")
+
+
 if __name__ == "__main__": unittest.main()

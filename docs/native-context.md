@@ -14,8 +14,9 @@ commit.
 
 Run `python3 harness/hooks/native_context.py probe` in the source checkout.
 On macOS the probe walks a bounded kernel-observed ancestry chain and checks the
-nearest recognized Codex runtime using Security.framework's **running guest**
-validation against the pinned OpenAI team and executable identifier. It rechecks
+running Codex identity using Security.framework's **running guest** validation
+against the pinned OpenAI team and executable identifier at each bounded ancestor,
+independent of its filename. A basename is only a deny hint. It rechecks
 kernel PID/start/parent/executable facts and running code identity/CDHash around
 the attestation. A changed process, same-PID exec swap, invalid signature,
 inaccessible guest or ambiguous ancestry returns unknown. A nearer recognized
@@ -48,8 +49,12 @@ python3 harness/hooks/native_user_source.py list < private-native-snapshot.json
 
 The snapshot requires `thread.id`, `thread.hostId`, and `turns` containing actual
 turn/item IDs and text `userMessage` items. The listing preserves those opaque
-identities in `codex:<host>/<thread>/<turn>/<item>` citations. Excerpts are bounded
-and redacted; identifiers are not converted into Claude UUIDs. The literal
+identities in `codex:<host>/<thread>/<turn>/<item>` citations. The entire bounded
+source is checked for credential shapes before any excerpt selection or display
+cutoff. If any are found, discovery returns metadata and a fixed redacted marker;
+excerpt resolution rejects for that source, including value-only selections and
+apparently safe aliases elsewhere in the message. This deliberately favors
+privacy over excerpt availability. Identifiers are not converted into Claude UUIDs. The literal
 excerpt resolver requires the exact host/thread/turn/item and matching source
 text. Assistant, tool, hook, compaction and explicitly automated messages are
 excluded. Duplicate keys/identities and oversized or malformed inputs reject.

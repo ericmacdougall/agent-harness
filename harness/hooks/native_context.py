@@ -20,6 +20,9 @@ OPENAI_TEAM = "2DC432GLL2"
 CODE_REQUIREMENT = 'anchor apple generic and identifier "codex" and certificate leaf[subject.OU] = "2DC432GLL2"'
 NATIVE_MARKERS = ("CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "CODEX_SANDBOX")
 MAX_INPUT = 1024 * 1024
+# Security/CSCommon.h: the running guest is unsigned or does not satisfy this
+# pinned requirement. Other verification errors remain ambiguous and fail closed.
+NOT_APPROVED_SIGNATURE = {-67062, -67050}  # errSecCSUnsigned, errSecCSReqFailed
 
 
 def decode_candidate_json(data):
@@ -74,6 +77,13 @@ def _valid_process(value, pid):
             and len(value.executable) <= 4096 and "\x00" not in value.executable)
 
 
+def _approved_code(code, process):
+    return (isinstance(code, CodeIdentity) and code.identifier == "codex" and code.team == OPENAI_TEAM
+            and isinstance(code.cdhash, str) and bool(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", code.cdhash))
+            and isinstance(code.executable, str)
+            and os.path.realpath(code.executable) == os.path.realpath(process.executable))
+
+
 def probe_runtime_origin(pid=None, *, backend=None):
     """Bounded origin-only probe; a supplied backend is an in-process test double."""
     pid = os.getpid() if pid is None else pid
@@ -96,19 +106,24 @@ def probe_runtime_origin(pid=None, *, backend=None):
                 return OriginObservation("unknown", native, "invalid_process_identity")
             chain.append(process)
             name = os.path.basename(process.executable)
-            if name in {"claude", "kimi"}:
-                barrier = True  # an outer Codex process is not this nearer runtime's author
-            if name == "codex":
+            # A basename is only a deny hint. Signed code may be renamed, so
+            # query the running guest for every ancestor before classifying it.
+            native = native or name == "codex"
+            first = backend.signature(current)
+            if _approved_code(first, process):
                 native = True
                 if not barrier:
                     candidate = process
                 break
+            if name in {"claude", "kimi"}:
+                barrier = True  # an outer Codex process is not this nearer runtime's author
+            if name == "codex":
+                return OriginObservation("unknown", True, "code_identity_unverified")
             current = process.parent
         else:
             return OriginObservation("unknown", native, "ancestry_limit")
         if candidate is None:
             return OriginObservation("unknown", native, "nearer_other_runtime" if native else "no_native_runtime")
-        first = backend.signature(candidate.pid)
         for previous in chain:
             if backend.process(previous.pid) != previous:
                 return OriginObservation("unknown", True, "process_changed")
@@ -116,9 +131,7 @@ def probe_runtime_origin(pid=None, *, backend=None):
         for previous in chain:
             if backend.process(previous.pid) != previous:
                 return OriginObservation("unknown", True, "process_changed")
-        if (not isinstance(first, CodeIdentity) or first != second or first.identifier != "codex"
-                or first.team != OPENAI_TEAM or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", first.cdhash)
-                or os.path.realpath(first.executable) != os.path.realpath(candidate.executable)):
+        if first != second or not _approved_code(second, candidate):
             return OriginObservation("unknown", True, "code_identity_unverified")
         return OriginObservation("openai", True, "running_code_verified", candidate.pid, first)
     except (OSError, ValueError, TypeError, AttributeError, OverflowError):
@@ -221,7 +234,10 @@ class DarwinBackend:
             requirement = ct.c_void_p()
             check(self.sec.SecRequirementCreateWithString(rule, 0, ct.byref(requirement)))
             hold(requirement.value)
-            check(self.sec.SecCodeCheckValidity(guest, 0, requirement))
+            status = self.sec.SecCodeCheckValidity(guest, 0, requirement)
+            if status in NOT_APPROVED_SIGNATURE:
+                return None
+            check(status)
             information = ct.c_void_p()
             check(self.sec.SecCodeCopySigningInformation(guest, 2, ct.byref(information)))
             hold(information.value)

@@ -90,9 +90,14 @@ def _messages(snapshot):
 
 def _candidate(message, excerpt=None):
     host, thread, turn, item, text = message
+    # Inspect the entire bounded source before cutting/selecting an excerpt.
+    # Losing the label or crossing a cutoff can make a credential value look
+    # harmless to a redactor. Suppress all text for such sources, including
+    # apparently safe aliases elsewhere in the same message.
+    display = "[REDACTED:source-credential]" if find(text) else (text[:256] if excerpt is None else excerpt)
     return {"citation": f"codex:{host}/{thread}/{turn}/{item}",
             "platform": "codex", "host": host, "thread": thread,
-            "turn": turn, "item": item, "excerpt": redact(text[:256] if excerpt is None else excerpt),
+            "turn": turn, "item": item, "excerpt": redact(display),
             "evidence_class": "untrusted_candidate", "weak": True,
             "event_time": None, "human_origin": "unverified",
             "main_authority": False, "strong_user_source": False,
@@ -115,6 +120,8 @@ def resolve_candidate(snapshot, citation, excerpt):
     for message in _messages(snapshot):
         candidate = _candidate(message)
         if candidate["citation"] == citation and excerpt in message[-1]:
+            if find(message[-1]):
+                raise ValueError("credential-shaped source has metadata only")
             return _candidate(message, excerpt)
     raise ValueError("native candidate does not match")
 

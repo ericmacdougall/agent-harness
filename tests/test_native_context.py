@@ -31,6 +31,8 @@ class FakeBackend:
         return self.processes[pid]
 
     def signature(self, pid):
+        if pid != 20:
+            return None
         self.calls += 1
         result = self.signed
         if self.swap and self.calls == 1:
@@ -73,7 +75,10 @@ class RuntimeOrigin(unittest.TestCase):
         backend = FakeBackend(); backend.processes[10] = replace(backend.processes[10], parent=10)
         self.assertEqual(nc.probe_runtime_origin(10, backend=backend).origin, "unknown")
         backend = FakeBackend()
-        with mock.patch.object(backend, "signature", side_effect=OSError("guest unavailable")):
+        def inaccessible(pid):
+            if pid == 20: raise OSError("guest unavailable")
+            return None
+        with mock.patch.object(backend, "signature", side_effect=inaccessible):
             value = nc.probe_runtime_origin(10, backend=backend)
         self.assertEqual(value.origin, "unknown")
         self.assertTrue(value.native_lineage)
@@ -117,6 +122,44 @@ class DenyOnly(unittest.TestCase):
         value = nc.OriginObservation("unknown", False, "no_native_runtime")
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(nc, "probe_runtime_origin", return_value=value):
             self.assertIsNone(nc.native_deny_reason({}))
+
+
+class ReviewRuntimeRegressions(unittest.TestCase):
+    def test_renamed_signed_runtime_is_verified_independent_of_basename(self):
+        class Renamed(FakeBackend):
+            def signature(self, pid):
+                if pid == 10: return None
+                return super().signature(pid)
+        backend = Renamed()
+        path = "/Applications/Example/CodexCLI/renamed-runtime"
+        backend.processes[20] = replace(backend.processes[20], executable=path)
+        backend.signed = replace(backend.signed, executable=path)
+        result = nc.probe_runtime_origin(10, backend=backend)
+        self.assertEqual(result.origin, "openai")
+        self.assertTrue(result.native_lineage)
+        self.assertGreaterEqual(backend.calls, 2)
+        self.assertFalse(result.main_authority)
+
+    def test_renamed_outer_codex_does_not_cross_nearer_runtime_barrier(self):
+        backend = FakeBackend()
+        backend.processes[10] = replace(backend.processes[10], executable="/usr/local/bin/claude")
+        path = "/Applications/Example/CodexCLI/renamed-runtime"
+        backend.processes[20] = replace(backend.processes[20], executable=path)
+        backend.signed = replace(backend.signed, executable=path)
+        result = nc.probe_runtime_origin(10, backend=backend)
+        self.assertEqual(result.origin, "unknown")
+        self.assertTrue(result.native_lineage)
+        self.assertEqual(result.reason, "nearer_other_runtime")
+
+    def test_renamed_runtime_still_checks_same_pid_same_start_exec_races(self):
+        backend = FakeBackend()
+        path = "/Applications/Example/CodexCLI/renamed-runtime"
+        backend.processes[20] = replace(backend.processes[20], executable=path)
+        backend.signed = replace(backend.signed, executable=path)
+        backend.swap = lambda b: setattr(b, "signed", replace(b.signed, cdhash="b" * 40))
+        result = nc.probe_runtime_origin(10, backend=backend)
+        self.assertEqual(result.origin, "unknown")
+        self.assertTrue(result.native_lineage)
 
 
 class Packaging(unittest.TestCase):
