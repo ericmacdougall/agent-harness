@@ -680,7 +680,8 @@ A PID is yours when it is not PID 1, not the hook process or any ancestor of it 
 
 1. its cwd (Linux `/proc/PID/cwd`, macOS `lsof -a -d cwd -p PID`) is inside your git worktree;
 2. its program (`argv[0]`) is a path inside your worktree, or `argv[0]` is an interpreter or shell and `argv[1]` is a path inside your worktree (a `tail` or editor that merely names a file there does not count);
-3. it is in this worktree's spawn ledger with the same start time.
+3. it is in this worktree's spawn ledger with the same start time;
+4. it is, descends from (current parent chain), or is in the process group of a recorded background shell or bg_job wrapper of this worktree, and that recorded process still has its recorded start time or is gone (goodqa#15565, below).
 
 Your worktree is the git toplevel of the tool call's working directory, not of a `cd` inside the command, so a `cd` into another owner's worktree proves nothing. Worktrees nested inside yours are excluded, and `/`, HOME and its ancestors are never used. Anything that cannot be read, times out (2 s per probe) or does not parse is unprovable and blocked. The probes run only after a kill verb is found, so ordinary commands cost nothing extra.
 
@@ -699,6 +700,8 @@ Everything else fails closed, whatever it would expand to: `$!`, `PID=4001; kill
 ### Starting processes you will need to stop
 
 `python3 ~/.claude/hooks/kill_guard.py spawn [--log FILE] -- CMD ARGS...` starts the command detached from inside a git worktree, records its PID and start time in `~/.agent-harness/state/kill-guard/ledger-<hash>.jsonl` with an HMAC under a 0600 key in a 0700 directory, and prints the PID. `spawn` takes a command, never a PID, and the guard judges the spawned command as if you had typed it. The ledger protects against accident: anyone who can read the key can forge a line. A later call's `kill "$SERVER_PID"` is blocked by design; use the printed PID literally, or `netwatch orphans --kill --pid N`.
+
+**Background calls and bg_job (2026-11-09, goodqa#15565).** Two more routes write the same ledger, as "group" rows with their own HMAC domain (a spawn row cannot be relabelled as one, and older readers ignore them). The PostToolUse hook `kill_guard.py record-bg` (Bash, fails open) runs after every Bash call; for a `run_in_background` call it records the call's shell S only when S is a live direct child of the hook's own ancestor (the session process), leads its own session and process group, has your uid, has stdout or stderr open on `tasks/<backgroundTaskId>.output` (the id comes from the tool response), is the only such process, and has the same start time before and after those checks. `bg_job.py launch` records the wrapper it starts (a new session) the same way. From then on the same worktree may `kill PID` S, anything whose parent chain reaches S, and any member of process group S, such as `nohup rclone copy ... &` reparented to launchd with its cwd outside the worktree. Another worktree is refused, and so is a group whose recorded root now runs with another start time (a reused PID). Nothing is recorded for a foreground `cmd &` (the hook gets no id for it: start long jobs with `run_in_background` or `bg_job.py launch`), for a call outside a git worktree (main in HOME), or for a shell that exited or redirected its output before the hook ran. No argv is stored. record-bg also records nothing when it runs inside a Bash tool call (this process or an ancestor below the session process writes to a `tasks/*.output` file), so an agent cannot record another agent's task by running it by hand. The file is compacted to its newest 2000 rows past 1 MiB.
 
 ### Remote kills
 

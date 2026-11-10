@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 HOOKS = ROOT / "harness" / "hooks"
@@ -30,6 +31,11 @@ class Base(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.jobs = self.tmp / "jobs"
         self.started = []
+        # launch records its wrapper in kill_guard's ledger under HOME when run inside a git worktree (goodqa#15565):
+        # keep that in a scratch HOME, never the real one
+        home = mock.patch.dict(os.environ, {"HOME": str(self.tmp)})
+        home.start()
+        self.addCleanup(home.stop)
 
     def tearDown(self):
         if self.started:

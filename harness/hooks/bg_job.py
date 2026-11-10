@@ -24,6 +24,9 @@ Records live in --dir, else $BG_JOB_DIR, else $AGENT_HARNESS_TASK_DIR/bg-jobs, e
 PID, start time, log path, status path, argv hash and a nonce. PID liveness is proven by the process command line
 carrying the nonce, so a reused PID is not mistaken for the job.
 
+Inside a git worktree, launch also records the wrapper (pid and start time, no argv) in kill_guard's ledger for that
+worktree, so the same worktree may stop the job or its child with a plain `kill PID` (goodqa#15565).
+
 Not for secrets: argv is stored in the record. Per-stage pipeline status: use `set -o pipefail`, or write each stage
 to its own file; `X=$(a | b)` followed by PIPESTATUS gives only the assignment's status.
 
@@ -211,6 +214,23 @@ def cmd_run(args):
     return code
 
 
+def record_in_kill_ledger(pid):
+    """Record the wrapper we just started (our own child, leader of its own new session) as a kill_guard group row
+    of the current git worktree, so the agent that launched the job may stop it or its child with a plain kill
+    (goodqa#15565). Best effort: outside a worktree (main in HOME) or on any error nothing is recorded, and the job
+    is still launched; the guard then refuses the kill exactly as before."""
+    try:
+        import kill_guard  # noqa: PLC0415 - same hooks directory
+        root, _nested = kill_guard.find_worktree(os.getcwd())
+        if not root:
+            return
+        start = kill_guard.Probe().start(pid)
+        if start is not None:
+            kill_guard.append_ledger(root, pid, start, kind="group")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def cmd_launch(args):
     if not NAME_RE.match(args.name):
         print("FAILED_TO_START reason=bad job name (use letters, digits, . _ -)")
@@ -256,6 +276,7 @@ def _launch_locked(args, argv, directory):
                "--nonce", nonce, "--"] + argv
     proc = subprocess.Popen(wrapper, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             start_new_session=True, close_fds=True)
+    record_in_kill_ledger(proc.pid)
     try:
         atomic_write_json(os.path.join(directory, args.name + ".json"),
                           {"name": args.name, "pid": proc.pid, "nonce": nonce, "start": time.time(), "log": log,

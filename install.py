@@ -137,6 +137,14 @@ def kill_guard_group(claude: Path) -> dict:
         "timeout": 30, "onFailure": "block"}]}
 
 
+def kill_guard_record_group(claude: Path) -> dict:
+    """Records the shell of a run_in_background Bash call in the kill guard's worktree ledger, so the agent may stop
+    what it started (goodqa#15565). It only adds proof, so it fails open: no onFailure."""
+    return {"matcher": "Bash", "hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "kill_guard.py"), "record-bg"],
+        "timeout": 10}]}
+
+
 def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = True,
                   log_backup: bool = True) -> dict[str, list[dict]]:
     script = str(claude / "hooks" / "wal.py")
@@ -213,6 +221,7 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     if command_guard:
         managed["PreToolUse"].insert(0, command_guard_group(claude))
         managed["PreToolUse"].insert(1, kill_guard_group(claude))
+        managed.setdefault("PostToolUse", []).append(kill_guard_record_group(claude))
     if log_backup:
         # Visible alert when the scheduled log backup has not succeeded for an hour; fails open. Only registered
         # where the backup is opted in (--log-backup, or already installed), so a host without it gets no alert.
