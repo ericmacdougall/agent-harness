@@ -118,12 +118,81 @@ class Shim(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(started[0].pid, 0)  # reaped: no process, not even a zombie
 
+    def run_with_denied_signals(self, argv, denied):
+        """Run shim.main(argv) in a guarded thread with os.killpg and os.kill raising PermissionError for the
+        signal numbers in `denied` (Codex final-gate r8 F1). Returns (code, stderr, elapsed)."""
+        import io
+        import threading
+        shim = load_shim()
+        shim.CLEANUP_GRACE = 0.5
+        started, real_popen, real_killpg, real_kill = [], subprocess.Popen, os.killpg, os.kill
+
+        def spy(*args, **kwargs):
+            started.append(real_popen(*args, **kwargs))
+            return started[-1]
+
+        def gate(real):
+            def call(pid, number):
+                if number in denied and any(pid == child.pid for child in started):
+                    raise PermissionError(errno.EPERM, "Operation not permitted")
+                return real(pid, number)
+            return call
+
+        def cleanup():
+            for child in started:
+                if child.poll() is None:
+                    real_kill(child.pid, signal.SIGKILL)
+                    child.wait()
+        self.addCleanup(cleanup)
+        stderr, outcome = io.StringIO(), {}
+
+        def target():
+            try:
+                outcome["code"] = shim.main(argv)
+            except BaseException as error:  # noqa: B036 - reported as a test failure below
+                outcome["error"] = error
+
+        began = time.monotonic()
+        with mock.patch.object(shim.subprocess, "Popen", spy), mock.patch.object(shim.os, "killpg", gate(real_killpg)), \
+                mock.patch.object(shim.os, "kill", gate(real_kill)), mock.patch.object(shim.sys, "stderr", stderr), \
+                mock.patch.object(shim.signal, "signal"):  # handlers can only be installed from the main thread
+            runner = threading.Thread(target=target, daemon=True)
+            runner.start()
+            runner.join(15)
+            hung = runner.is_alive()
+            if hung:  # stop the command so the supervisor's poll loop can end before the mocks are removed
+                for child in started:
+                    real_kill(child.pid, signal.SIGKILL)
+                runner.join(5)
+        self.assertFalse(hung, "timeout polled forever after a denied signal")
+        self.assertNotIn("error", outcome, "an error escaped main(): %r" % outcome.get("error"))
+        return outcome["code"], stderr.getvalue(), time.monotonic() - began
+
+    def test_a_denied_timeout_signal_ends_in_bounded_time_with_125_and_a_diagnostic(self):
+        everything = set(signal.valid_signals())
+        code, err, elapsed = self.run_with_denied_signals(
+            ["0.2", sys.executable, "-c", "import time; time.sleep(30)"], everything)
+        self.assertEqual(code, 125)
+        self.assertLess(elapsed, 10)
+        self.assertIn("timeout: failed to send signal", err)
+        self.assertIn("could not be stopped", err)
+
+    def test_a_denied_kill_after_sigkill_ends_in_bounded_time_with_125_and_a_diagnostic(self):
+        code, err, elapsed = self.run_with_denied_signals(
+            ["-k", "0.2", "0.2", sys.executable, "-c",
+             "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"],
+            {signal.SIGKILL})
+        self.assertEqual(code, 125)
+        self.assertLess(elapsed, 10)
+        self.assertIn("timeout: failed to send signal", err)
+        self.assertIn("could not be stopped", err)
+
 
 class Installer(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.home = Path(self.tmp.name)
+        self.home = Path(self.tmp.name).resolve()  # the installer resolves home (/var -> /private/var on macOS)
         self.bin = self.home / ".local" / "bin"
         self.bin.mkdir(parents=True)
 
@@ -203,26 +272,74 @@ class Installer(unittest.TestCase):
         self.assertTrue(target.is_symlink())
         self.assertEqual(victim.read_text(), "keep me")
 
-    def test_an_owned_shim_swapped_for_a_foreign_file_before_publish_survives(self):
-        target = self.outdated_shim()
+    FOREIGN = "#!/bin/sh\necho foreign\n"
 
-        def swap():
-            os.unlink(target)
-            target.write_text("#!/bin/sh\necho foreign\n")
-        status = self.publish_race(swap)
-        self.assertNotIn("placed " + str(target), status)
-        self.assertEqual(target.read_text(), "#!/bin/sh\necho foreign\n")
+    def swap_target(self):
+        target = self.bin / "timeout"
+        os.unlink(target)
+        target.write_text(self.FOREIGN)
 
-    def test_an_owned_shim_rewritten_in_place_before_publish_survives(self):
-        target = self.outdated_shim()
-        status = self.publish_race(lambda: target.write_text("#!/bin/sh\necho rewritten\n"))
-        self.assertNotIn("placed " + str(target), status)
-        self.assertEqual(target.read_text(), "#!/bin/sh\necho rewritten\n")
+    def test_an_existing_shim_swapped_right_before_publication_is_never_replaced(self):
+        # Codex final-gate r8 F2: the window between the last identity read and os.replace let a swap be clobbered
+        target, swaps = self.outdated_shim(), []
+        real_replace, real_link = os.replace, os.link
 
-    def test_an_outdated_owned_shim_is_updated_when_nothing_interferes(self):
+        def swap_then(real):
+            def call(src, dst, *args, **kwargs):
+                if Path(dst) == target and not swaps:
+                    swaps.append(real.__name__)
+                    self.swap_target()  # immediately after the final read, immediately before publication
+                return real(src, dst, *args, **kwargs)
+            return call
+
+        with mock.patch.object(install.os, "replace", swap_then(real_replace)), \
+                mock.patch.object(install.os, "link", swap_then(real_link)):
+            status = install.timeout_shim_status(self.home, True, [str(self.bin)])
+        self.assertNotIn("timeout shim: placed", status)
+        self.assertNotEqual(target.read_bytes(), SHIM.read_bytes(), "an existing target was replaced")
+        expected = self.FOREIGN if swaps else SHIM.read_text() + "# an older revision\n"
+        self.assertEqual(target.read_text(), expected)
+
+    def test_an_existing_shim_swapped_right_after_it_is_read_survives(self):
+        target, real_read = self.outdated_shim(), Path.read_bytes
+        swaps = []
+
+        def read_then_swap(path):
+            data = real_read(path)
+            if path == target and not swaps:
+                swaps.append(path)
+                self.swap_target()
+            return data
+
+        with mock.patch.object(Path, "read_bytes", read_then_swap):
+            status = install.timeout_shim_status(self.home, True, [str(self.bin)])
+        self.assertTrue(swaps, "the installer never read the target; the race was not exercised")
+        self.assertNotIn("timeout shim: placed", status)
+        self.assertEqual(target.read_text(), self.FOREIGN)
+
+    def test_an_outdated_shim_is_left_untouched_with_an_instruction(self):
         target = self.outdated_shim()
-        self.assertIn("placed", self.publish_race(lambda: None))
+        before = (target.read_bytes(), os.lstat(target).st_ino)
+        status = install.timeout_shim_status(self.home, True, [str(self.bin)])
+        self.assertEqual((target.read_bytes(), os.lstat(target).st_ino), before)
+        self.assertIn("not replaced automatically", status)
+        self.assertIn("remove %s" % target, status)
+        self.assertIn("re-run", status)
+        self.assertEqual([p.name for p in self.bin.iterdir()], ["timeout"])  # no temp file left behind
+
+    def test_a_missing_target_is_still_published_with_a_no_clobber_link(self):
+        target, linked = self.bin / "timeout", []
+        real_link = os.link
+
+        def spy(src, dst, *args, **kwargs):
+            linked.append(Path(dst))
+            return real_link(src, dst, *args, **kwargs)
+
+        with mock.patch.object(install.os, "link", spy):
+            self.assertIn("placed", install.timeout_shim_status(self.home, True, [str(self.bin)]))
+        self.assertEqual(linked, [target])
         self.assertEqual(target.read_bytes(), SHIM.read_bytes())
+        self.assertIn("current", install.timeout_shim_status(self.home, True, [str(self.bin)]))
 
     def test_skips_when_local_bin_is_not_on_path(self):
         self.assertIn("not on PATH", install.timeout_shim_status(self.home, True, ["/usr/bin"]))
