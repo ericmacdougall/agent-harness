@@ -444,3 +444,129 @@ class WorktreeRemoveIndirectRound2(WorktreeRemoveCase):
 
     def test_lone_literal_form_still_passes(self):
         self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'allow')
+
+
+class WorktreeRemoveIndirectRound3(WorktreeRemoveCase):
+    """goodqa#15346 codex review of c70e378 (BLOCK): F1 an attached `-c<key>=<value>` alias, F2 parallel substitutions past
+    a fixed count were never analysed. Plus the audit of the same classes: every other channel that defines an alias or
+    supplies the subcommand, and every cap that silently allowed the remainder."""
+
+    CAP = getattr(cg, 'PARALLEL_MAX_COMBINATIONS', 1000)
+
+    def setUp(self):
+        super().setUp()
+        self.p = str(self.linked)
+        self.lst = self.home / 'list.txt'
+        self.lst.write_text(self.p + '\n')
+
+    def par(self, n, pos, item='worktree', tmpl="'git {} remove --force %s'"):
+        items = ['status'] * n
+        if pos is not None:
+            items[pos - 1] = cg_quote(item)
+        return 'parallel -j 4 ' + (tmpl % self.p) + ' ::: ' + ' '.join(items)
+
+    def blocked(self, forms):
+        return [c[:160] for c in forms if self.decide(c)[0] != 'block']
+
+    def test_f1_attached_dash_c_alias_blocks(self):
+        p, lst = self.p, self.lst
+        forms = (
+            "xargs git -calias.wr='worktree remove --force' wr < %s" % lst,
+            "xargs git -calias.wm='worktree move' wm < %s" % lst,
+            "git -calias.wr='worktree remove --force' wr %s" % p,
+            "git -p --no-pager -calias.wr='worktree remove --force' wr %s" % p,      # after other options
+            "git -cALIAS.wr='worktree remove --force' wr %s" % p,
+            "xargs git -cinclude.path=/tmp/x wr < %s" % lst,
+            "parallel -j 4 'git -calias.wr=\"worktree remove --force\" wr {}' ::: %s" % p,   # inside a quoted template
+            "xargs -I{} sh -c 'git -calias.wr=\"worktree remove --force\" wr {}' < %s" % lst,
+            "xargs git -c alias.wr=\"$A\" wr < %s" % lst,
+        )
+        self.assertEqual(self.blocked(forms), [], 'an attached -c alias slipped through')
+
+    def test_f2_parallel_substitution_at_every_position_blocks(self):
+        forms = []
+        for pos in (1, 49, 50, 51, 52, 120):
+            n = max(pos, 60)
+            forms.append(self.par(n, pos))                                            # the reviewer's form
+            forms.append(self.par(n, pos, 'worktree remove', "'git {} --force %s'"))  # a two-word argument
+            forms.append(self.par(n, pos, tmpl="'git {1} remove --force %s'"))        # positional replacement string
+            forms.append(self.par(n, pos, tmpl="'git {.} remove --force %s'"))
+            forms.append(self.par(n, pos, tmpl="-I @@ 'git @@ remove --force %s'"))   # a custom replacement string
+        forms.append('parallel -j 4 git ::: worktree ::: remove ::: %s' % self.p)        # several sources, appended
+        forms.append("parallel -j 4 'git {} --force %s' ::: worktree ::: remove" % self.p)  # {} joins every source
+        forms.append('parallel -j 4 git ::: %s ::: remove ::: %s' % (' '.join(['status'] * 59 + ['worktree']), self.p))
+        forms.append('parallel ::: git ::: worktree ::: remove ::: %s' % self.p)                # no command: args run
+        self.assertEqual(self.blocked(forms), [], 'a parallel substitution past the analysed range slipped through')
+
+    def test_f2_coverage_cap_is_explicit(self):
+        # chosen behaviour: every combination up to PARALLEL_MAX_COMBINATIONS is analysed; past it the command is refused
+        self.assertGreaterEqual(self.CAP, 1000)
+        self.assertEqual(self.decide(self.par(51, None))[0], 'allow')        # 51 safe entries are analysed and pass
+        self.assertEqual(self.decide(self.par(self.CAP, None))[0], 'allow')  # exactly at the cap: still fully analysed
+        self.assertEqual(self.decide(self.par(self.CAP + 1, None))[0], 'block')  # past it: refused, never waved through
+        self.assertEqual(self.decide("parallel -j 4 'echo {}' ::: " + ' '.join(['x'] * (self.CAP + 1)))[0], 'block')
+        # a cartesian product past the cap is refused even though each list is short
+        self.assertEqual(self.decide('parallel echo ::: %s ::: %s' % (' '.join(['a'] * 40), ' '.join(['b'] * 40)))[0],
+                         'block')
+
+    def test_unknown_parallel_data_with_a_placeholder_command_blocks(self):
+        p, lst = self.p, self.lst
+        forms = (
+            "parallel -j 4 'git {} remove --force %s' :::: %s" % (p, lst),           # data in a file
+            "cat %s | parallel -j 4 'git {} remove --force %s'" % (lst, p),          # data on stdin
+            "cat %s | parallel -j 4 '{} worktree remove --force %s'" % (lst, p),     # the program is the data
+            "parallel -j 4 '{} worktree remove --force %s' :::: %s" % (p, lst),
+            "echo git | xargs -I{} {} worktree remove --force %s" % p,
+            "echo git | xargs -I %% %% worktree remove --force %s" % p,
+            "parallel -j 4 'git {=s/x/y/=} remove --force %s' ::: xorktree" % p,     # a perl replacement string
+            "parallel --colsep , 'git {1} {2} --force %s' ::: worktree,remove" % p,
+            "cat %s | parallel -j 4 'git -c {} wr %s'" % (lst, p),                    # the alias is the data
+            "parallel -j 4 'git -c {} wr %s' ::: 'alias.wr=worktree remove --force'" % p,
+            "parallel 'sh -c {}' ::: 'git worktree remove --force %s'" % p,
+            "parallel -X 'git {} --force %s' ::: worktree remove" % p,                # several arguments per job
+            "parallel -m git {} ::: worktree remove %s" % p,
+            "xargs -i git {} remove --force < %s" % lst,
+        )
+        self.assertEqual(self.blocked(forms), [], 'parallel data the guard cannot see slipped through')
+
+    def test_other_alias_and_subcommand_channels_block(self):
+        p, lst = self.p, self.lst
+        cfg = "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.wr GIT_CONFIG_VALUE_0='worktree remove --force'"
+        forms = (
+            "K=alias.wr; GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=$K GIT_CONFIG_VALUE_0='worktree remove --force' git wr %s" % p,
+            "%s xargs git wr < %s" % (cfg, lst),
+            "env %s git wr %s" % (cfg, p),
+            "xargs env %s git wr < %s" % (cfg, lst),
+            "GIT_CONFIG_PARAMETERS=\"'alias.wr'='worktree remove --force'\" xargs git wr < %s" % lst,
+            "GIT_CONFIG_GLOBAL=%s/evil xargs git wr < %s" % (self.home, lst),        # a config file the guard cannot read
+            "git --config-env=ALIAS.wr=W wr %s" % p,
+            "git -c help.autocorrect=immediate wroktree remove --force %s" % p,      # git corrects the typo and runs it
+            "xargs git wroktree remove --force < %s" % lst,                          # autocorrect set in the user config
+            "xargs -I %% git %% remove --force < %s" % lst,                            # xargs replacement as the subcommand
+            "xargs -I XX git -c XX.wr='worktree remove --force' wr < %s" % lst,      # ... or inside a -c key
+            "find %s -maxdepth 0 -exec git -calias.wr='worktree remove --force' wr {} +" % p,
+            'xargs git -c "$X" wr < %s' % lst,                                        # a -c key built at run time
+            "read K; git -c \"$K=worktree remove --force\" wr %s" % p,
+            "git config \"$K\" 'worktree remove --force'",
+            "export GIT_CONFIG_GLOBAL=%s/x; xargs git wr < %s" % (self.home, lst),
+            "xargs git --exec-path=%s/bin wr < %s" % (self.home, lst),               # runs DIR/git-wr
+        )
+        self.assertEqual(self.blocked(forms), [], 'an alias or subcommand channel slipped through')
+
+    def test_round3_harmless_forms_stay_allowed(self):
+        p, lst = self.p, self.lst
+        for c in ('git -c user.name=x status', 'GIT_CONFIG_GLOBAL=/dev/null git status', 'git -c help.autocorrect=0 status',
+                  'git remote remove origin', "git -c alias.st=status st", 'xargs git worktree list < %s' % lst,
+                  "cat %s | parallel -j 4 'git -C {} status'" % lst, "parallel -j 4 'git -C {} status' ::: %s" % self.primary,
+                  "xargs grep -n 'worktree remove' < %s" % lst, "parallel -j 4 'echo {}' ::: a b c",
+                  "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=x git status",
+                  'git -c "user.name=$NAME" commit -m x', 'git config user.name "$NAME"', 'git branchless move -s a -d b',
+                  "xargs -i echo {} < %s" % lst, "xargs -I{} echo {} < %s" % lst, "ls | parallel 'gzip {}'",
+                  "parallel -k echo {} ::: a b c", "parallel 'echo {}; echo done' ::: a", 'seq 10 | parallel echo',
+                  'export GIT_CONFIG_GLOBAL=/dev/null; git status'):
+            self.assertEqual(self.decide(c)[0], 'allow', c)
+        self.assertEqual(self.decide('git worktree remove %s' % p)[0], 'allow')
+
+
+def cg_quote(text):
+    return text if text.isalnum() else "'" + text.replace("'", "'\\''") + "'"
