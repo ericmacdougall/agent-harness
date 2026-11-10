@@ -92,6 +92,47 @@ class NodePaths(unittest.TestCase):
             p=Path(d)/'node'; p.write_text('#!/bin/sh\necho "v26.10.0"\n'); p.chmod(0o700)
             with self.assertRaises(il.CheckInterpreterError): il.resolve_node({'PATH':d})
 
+    @unittest.skipUnless(hasattr(os,'mkfifo'),'POSIX executable FIFO control')
+    def test_executable_fifo_is_refused_before_open_or_version_child(self):
+        with tempfile.TemporaryDirectory(dir=WORK) as d:
+            root=Path(d); candidate=root/'node'; marker=root/'version-child-started'
+            script = ("import sys,os; from pathlib import Path; sys.path.insert(0,sys.argv[1]); "
+                      "import integrate_local as i\n"
+                      "def forbidden(*args,**kwargs):\n"
+                      "    Path(sys.argv[3]).write_text('unexpected child'); raise AssertionError('version child started')\n"
+                      "i.run_process=forbidden\n"
+                      "original_open=os.open\n"
+                      "def swapped(path,flags,*args,**kwargs):\n"
+                      "    if Path(path)==Path(sys.argv[2])/'node':\n"
+                      "        Path(path).unlink()\n"
+                      "        if sys.argv[4]=='swap-fifo': os.mkfifo(path,0o700)\n"
+                      "        else: Path(path).symlink_to('/dev/null')\n"
+                      "    return original_open(path,flags,*args,**kwargs)\n"
+                      "if sys.argv[4]!='fifo': i.os.open=swapped\n"
+                      "try: i.resolve_node({'PATH':sys.argv[2]})\n"
+                      "except i.CheckInterpreterError: sys.exit(0)\n"
+                      "sys.exit(1)\n")
+            for mode in ('fifo','swap-fifo','swap-link'):
+                with self.subTest(mode=mode):
+                    if candidate.exists() or candidate.is_symlink(): candidate.unlink()
+                    if mode=='fifo': os.mkfifo(candidate,0o700)
+                    else: candidate.write_bytes(b'\x7fELF0000'); candidate.chmod(0o700)
+                    result=subprocess.run([sys.executable,'-c',script,str(Path(il.__file__).parent),str(root),str(marker),mode],
+                                          capture_output=True,text=True,timeout=3)
+                    self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+                    self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(shutil.which('node'),'real native executable required')
+    def test_repo_path_directory_symlink_is_refused_but_external_alias_passes(self):
+        native=Path(shutil.which('node')).resolve()
+        with tempfile.TemporaryDirectory(dir=WORK) as d:
+            root=Path(d); repo=root/'repo'; repo.mkdir()
+            (repo/'bin').symlink_to(native.parent,target_is_directory=True)
+            with self.assertRaises(il.CheckInterpreterError):
+                il.resolve_node({'PATH':str(repo/'bin')},repo)
+            external=root/'external'; external.mkdir(); (external/'node').symlink_to(native)
+            self.assertEqual(il.resolve_node({'PATH':str(external)},repo),str(native))
+
     @unittest.skipUnless(shutil.which('node'),'real native executable required')
     def test_old_silent_and_identity_mismatch_probes_are_refused(self):
         executable=str(Path(shutil.which('node')).resolve())

@@ -240,12 +240,24 @@ def resolve_node(env, repo=None, timeout=30):
         path = Path(found).resolve(strict=True)
         if repo is not None:
             root = Path(repo).resolve()
-            if path.is_relative_to(root) or (candidate.parent.resolve() / candidate.name).is_relative_to(root):
+            if (candidate.is_relative_to(root) or candidate.is_relative_to(Path(repo).absolute())
+                    or path.is_relative_to(root)
+                    or (candidate.parent.resolve() / candidate.name).is_relative_to(root)):
                 raise OSError()
         info = path.stat()
-        with path.open('rb') as stream:
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError()
+        # A FIFO/device must not block before the bounded version child starts,
+        # including a replacement between stat and open. Refuse final links.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+        with os.fdopen(fd, 'rb') as stream:
+            opened = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(opened.st_mode)
+                    or any(getattr(opened, field) != getattr(info, field)
+                           for field in ('st_dev', 'st_ino', 'st_mode', 'st_size', 'st_mtime_ns', 'st_ctime_ns'))):
+                raise OSError()
             magic = stream.read(4)
-        if not stat.S_ISREG(info.st_mode) or magic not in {
+        if magic not in {
                 b'\x7fELF', b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf',
                 b'\xce\xfa\xed\xfe', b'\xfe\xed\xfa\xce',
                 b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca',
