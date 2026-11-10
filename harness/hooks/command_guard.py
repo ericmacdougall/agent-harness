@@ -6335,7 +6335,8 @@ NEVER_SEGMENTS = frozenset(('.claude', '.codex', '.agent-harness', 'wals', 'proj
 # folders only this harness and its agents create: refused even inside third-party trees (a package may have its own state/logs)
 HARNESS_SEGMENTS = frozenset(('.claude', '.codex', '.agent-harness'))
 SECRET_OR_RECORD_FILE = re.compile(
-    r'(?:^\.env(?:\..*)?$|^\.npmrc$|^\.netrc$|^id_[a-z0-9_]+$|\.(?:pem|key|p12|pfx|kdbx|db|sqlite3?|jsonl|log)$)', re.I)
+    r'(?:^\.env(?:\..*)?$|^\.npmrc$|^\.netrc$|^\.pgpass$|^id_[a-z0-9_]+$|^credentials(?:\..*)?$|^service[-_]account.*\.json$|'
+    r'\.(?:pem|key|p12|pfx|kdbx|db|sqlite3?|jsonl|log|jks|keystore|tfstate|tfvars|ovpn|sql(?:\.gz)?)$)', re.I)
 IGNORED_SCAN_LIMIT = 3000000
 
 
@@ -6359,8 +6360,13 @@ def _extra_ignored_ok(entry, extra):
     """An entry the approver named: exact match to a listed relative entry, no `..`, and no Claude, session or log segment."""
     text = str(entry).replace('\\', '/')
     parts = [seg for seg in text.split('/') if seg]
-    return (text in (extra or ()) and bool(parts) and '..' not in parts and not text.startswith('/')
-            and not any(seg.casefold() in NEVER_SEGMENTS for seg in parts))
+    if not (text in (extra or ()) and bool(parts) and '..' not in parts and not text.startswith('/')
+            and not any(seg.casefold() in NEVER_SEGMENTS for seg in parts)):
+        return False
+    if SECRET_OR_RECORD_FILE.search(parts[-1]):
+        return False  # a named .env, key, database or log is never an accepted extra
+    # A named FILE is accepted only when it is generated type or build metadata; folders are scanned like build folders.
+    return text.endswith('/') or parts[-1].endswith(('.d.ts', '.tsbuildinfo'))
 
 
 def _scan_ignored_dir(path, name):
@@ -6369,12 +6375,18 @@ def _scan_ignored_dir(path, name):
     secret, key, database, log or transcript file. A folder over IGNORED_SCAN_LIMIT entries is refused."""
     dependency = name in DEPENDENCY_SEGMENTS
     seen, newest = 0, 0
-    for root, dirs, files in os.walk(path, followlinks=False):
+
+    def unreadable(error):
+        raise ValueError('an ignored folder could not be read (%s); refused' % type(error).__name__)
+
+    for root, dirs, files in os.walk(path, followlinks=False, onerror=unreadable):
         for d in dirs:
-            if d == '.git' or d.casefold() in (HARNESS_SEGMENTS if dependency else NEVER_SEGMENTS):
+            if d.casefold() == '.git' or d.casefold() in (HARNESS_SEGMENTS if dependency else NEVER_SEGMENTS):
                 raise ValueError('an ignored folder holds a nested repository or a Claude, session or log folder (%s)' % d)
+        if 'HEAD' in files and 'objects' in dirs and 'refs' in dirs:
+            raise ValueError('an ignored folder holds a bare repository; refused')
         for f in files:
-            if f == '.git' or (not dependency and SECRET_OR_RECORD_FILE.search(f)):
+            if f.casefold() == '.git' or (not dependency and SECRET_OR_RECORD_FILE.search(f)):
                 raise ValueError('an ignored folder holds a secret, key, database, log or nested repository file (%s)' % f)
         seen += len(dirs) + len(files)
         if seen > IGNORED_SCAN_LIMIT:
@@ -6391,10 +6403,14 @@ def _scan_tree_for_nested_repos(real, ignored_dirs):
     repository's contents, so unpushed commits there would be invisible to every other check."""
     skip = {os.path.join(real, d.rstrip('/')) for d in ignored_dirs}
     seen = 0
-    for root, dirs, files in os.walk(real, followlinks=False):
+
+    def unreadable(error):
+        raise ValueError('the working tree could not be read (%s); refused' % type(error).__name__)
+
+    for root, dirs, files in os.walk(real, followlinks=False, onerror=unreadable):
         if root == real:
             dirs[:] = [d for d in dirs if d != '.git']
-        if '.git' in dirs or '.git' in files:
+        if any(d.casefold() == '.git' for d in dirs) or any(f.casefold() == '.git' for f in files):
             raise ValueError('a nested repository or .git entry exists inside the working tree; its commits are not checked')
         dirs[:] = [d for d in dirs if os.path.join(root, d) not in skip]
         seen += len(dirs) + len(files)
@@ -6425,6 +6441,13 @@ def _no_backup_state(real, target, home=None, attached=None, extra_ignored=None)
                          'refused')
     if os.path.lexists(os.path.join(git_dir, 'info', 'attributes')):
         raise ValueError('the repository has .git/info/attributes (local attributes, possibly filters); refused')
+    try:  # a local-only exclude rule can hide unique files that no committed .gitignore declares disposable
+        with open(os.path.join(git_dir, 'info', 'exclude'), 'rb') as handle:
+            if any(ln.strip() and not ln.lstrip().startswith(b'#') for ln in handle.read(1 << 20).splitlines()):
+                raise ValueError('the repository has local exclude rules (.git/info/exclude); files they hide are not '
+                                 'declared disposable by the committed .gitignore; refused')
+    except OSError:
+        pass
     if os.path.lexists(os.path.join(git_dir, 'lfs')):
         raise ValueError('the repository has a git LFS store (.git/lfs), whose objects may be pushed nowhere; refused')
     # submodules first: a gitlink also shows in status, and the accurate reason is the submodule
@@ -6785,6 +6808,10 @@ def approve_delete_no_backup(path, user_source, wal, ttl=None, home=None, policy
         extra = [str(e) for e in (extra_ignored or [])]
         if len(extra) > 20 or any(not e or len(e) > 300 or e.startswith('/') or '..' in e.split('/') for e in extra):
             raise ValueError('--also-ignored takes at most 20 relative ignored entries as git prints them (public/audio/)')
+        question = str(turn.get('question') or '')
+        for e in extra:  # the user must have seen each extra: it has to appear word for word in the question he answered
+            if e not in question:
+                raise ValueError('--also-ignored entry %r is not named in the question the user answered; ask again naming it' % e[:60])
         state = _no_backup_state(real, target, home, attached=attached, extra_ignored=extra)
         where = _check_git_pushed(real, ls_remote=ls_remote, hosts=limits.get('no_backup_remote_hosts')
                                   or DEFAULT_REMOTE_HOSTS) if target == 'git' else None

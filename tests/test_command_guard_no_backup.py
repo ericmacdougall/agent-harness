@@ -35,13 +35,14 @@ def run(*args, cwd=None):
     return done.stdout.decode()
 
 
-def ok_resolver_for(*paths, text='Delete, no backup (Recommended)', session='sess-1', predefined=True):
+def ok_resolver_for(*paths, text='Delete, no backup (Recommended)', session='sess-1', predefined=True, also=()):
     """A resolver for an answer in `session`: one question naming `paths`, whose selected predefined option is
     `text`."""
     def resolver(source, now=None, max_age=None, home=None):
         return {'kind': 'answer', 'session': session, 'uid': source.rsplit('/', 1)[-1].lower(), 'at': time.time(),
                 'text': text, 'predefined': predefined,
-                'question': 'Delete %s without a backup?' % ' and '.join(str(p) for p in paths)}
+                'question': 'Delete %s without a backup?%s' % (' and '.join(str(p) for p in paths),
+                                                              (' Ignored extras: ' + ', '.join(also)) if also else '')}
     return resolver
 
 
@@ -287,8 +288,10 @@ class GitTarget(NoBackupCase):
             (path / rel).parent.mkdir(parents=True, exist_ok=True)
             (path / rel).write_text('generated\n')
         self.refused(path, 'untracked or ignored')  # not on the build-folder list
-        self.refused(path, 'untracked or ignored', extra_ignored=['public/audio/'])  # next-env.d.ts is still unnamed
-        entry = self.approve(path, extra_ignored=['public/audio/', 'next-env.d.ts'])
+        self.refused(path, 'untracked or ignored', extra_ignored=['public/audio/'],
+                     resolver=ok_resolver_for(path, also=['public/audio/']))  # next-env.d.ts is still unnamed
+        entry = self.approve(path, extra_ignored=['public/audio/', 'next-env.d.ts'],
+                             resolver=ok_resolver_for(path, also=['public/audio/', 'next-env.d.ts']))
         self.assertEqual(entry['state']['extra_ignored'], ['next-env.d.ts', 'public/audio/'])
         self.assertTrue(self.approvals().covers(str(path)))  # the hook-time check keeps the recorded extras
         (path / 'public/audio/late.mp3').write_text('added later\n')
@@ -303,14 +306,129 @@ class GitTarget(NoBackupCase):
         (path / 'public/audio').mkdir(parents=True, exist_ok=True)
         (path / 'public/audio/a.mp3').write_text('x\n')
         (path / 'public/audio/.env').write_text('SECRET\n')
-        self.refused(path, extra_ignored=['public/audio/'])
+        self.refused(path, extra_ignored=['public/audio/'], resolver=ok_resolver_for(path, also=['public/audio/']))
         (path / 'public/audio/.env').unlink()
         (path / '.codex').mkdir()
         (path / '.codex/x').write_text('x\n')
-        self.refused(path, extra_ignored=['.codex/'])
+        self.refused(path, extra_ignored=['.codex/'], resolver=ok_resolver_for(path, also=['.codex/']))
         for bad in (['../x/'], ['/etc/'], ['a/../b/'], [''], ['x/'] * 21):
             with self.subTest(bad=bad[:1]):
-                self.refused(path, extra_ignored=bad)
+                self.refused(path, extra_ignored=bad, resolver=ok_resolver_for(path, also=bad))
+
+    def test_file_extras_must_be_generated_metadata_and_never_secrets_goodqa_15565(self):
+        path = self.clone()
+        self.ignore(path, '.env\nx.pem\nnotes.md\nnext-env.d.ts\n')
+        for name in ('.env', 'x.pem', 'notes.md'):
+            (path / name).write_text('unique\n')
+        for extra in ('.env', 'x.pem', 'notes.md'):
+            with self.subTest(extra=extra):
+                self.refused(path, extra_ignored=[extra], resolver=ok_resolver_for(path, also=[extra]))
+        for name in ('.env', 'x.pem', 'notes.md'):
+            (path / name).unlink()
+        (path / 'next-env.d.ts').write_text('generated\n')
+        self.assertTrue(self.approve(path, extra_ignored=['next-env.d.ts'],
+                                     resolver=ok_resolver_for(path, also=['next-env.d.ts'])))
+
+    def test_an_extra_the_user_never_saw_is_refused_goodqa_15565(self):
+        path = self.clone()
+        (path / 'public').mkdir()
+        (path / 'public/keep.txt').write_text('tracked\n')
+        run('git', 'add', 'public/keep.txt', cwd=path)
+        self.ignore(path, 'data/\npublic/audio/\n')
+        (path / 'data').mkdir()
+        (path / 'data/survey.csv').write_text('unique dataset\n')
+        (path / 'public/audio').mkdir()
+        (path / 'public/audio/a.mp3').write_text('x\n')
+        self.refused(path, 'not named in the question', extra_ignored=['data/'])  # the answered question names only the clone
+        self.refused(path, 'not named in the question', extra_ignored=['public/audio/'],
+                     resolver=ok_resolver_for(path, also=['data/']))
+        import shutil
+        shutil.rmtree(path / 'data')  # the unnamed dataset is gone; only the named media folder remains ignored
+        self.assertTrue(self.approve(path, extra_ignored=['public/audio/'],
+                                     resolver=ok_resolver_for(path, also=['public/audio/'])))
+
+    def test_extra_count_limit_is_enforced_with_distinct_entries_goodqa_15565(self):
+        path = self.clone()
+        many = ['d%d/' % n for n in range(21)]
+        self.refused(path, '--also-ignored takes', extra_ignored=many, resolver=ok_resolver_for(path, also=many))
+
+    def test_case_variants_of_git_bare_repos_and_gitlink_files_refuse_goodqa_15565(self):
+        import shutil
+        path = self.clone()
+        self.ignore(path, 'dist/\nnode_modules/\n')
+        (path / 'dist').mkdir()
+        (path / 'dist/a.js').write_text('x\n')
+        (path / 'node_modules').mkdir()
+        (path / 'node_modules/a.js').write_text('x\n')
+        cases = [('dist/inner/.GIT', 'dir'), ('node_modules/pkg/.Git', 'file'), ('dist/.git', 'file'),
+                 ('dist/mirror.git', 'bare'), ('plain/.git', 'file')]
+        for rel, kind in cases:
+            full = path / rel
+            if kind == 'dir':
+                (full / 'objects').mkdir(parents=True)
+            elif kind == 'file':
+                full.parent.mkdir(parents=True, exist_ok=True)
+                full.write_text('gitdir: /elsewhere\n')
+            else:
+                (full / 'objects').mkdir(parents=True)
+                (full / 'refs').mkdir()
+                (full / 'HEAD').write_text('ref: refs/heads/main\n')
+            with self.subTest(rel=rel):
+                self.refused(path)
+            if kind == 'file':
+                full.unlink()
+            else:
+                shutil.rmtree(full, ignore_errors=True)
+
+    def test_more_secret_names_and_case_variants_refuse_goodqa_15565(self):
+        path = self.clone()
+        self.ignore(path, 'dist/\n')
+        (path / 'dist').mkdir()
+        for name in ('credentials.json', 'service-account-prod.json', 'ID_RSA', 'prod.tfstate', 'app.keystore',
+                     'dump.sql.gz', '.PGPASS'):
+            full = path / 'dist' / name
+            full.write_text('x\n')
+            with self.subTest(name=name):
+                self.refused(path)
+            full.unlink()
+
+    def test_local_exclude_rules_refuse_goodqa_15565(self):
+        path = self.clone()
+        (path / 'out').mkdir()
+        (path / 'out/notes.md').write_text('unique\n')
+        with open(path / '.git' / 'info' / 'exclude', 'a') as handle:
+            handle.write('out/\n')
+        self.refused(path, 'local exclude rules')
+
+    def test_an_unreadable_ignored_folder_refuses_goodqa_15565(self):
+        path = self.clone()
+        self.ignore(path, 'dist/\n')
+        (path / 'dist/locked').mkdir(parents=True)
+        (path / 'dist/locked/x.txt').write_text('hidden\n')
+        os.chmod(path / 'dist/locked', 0)
+        try:
+            if os.access(path / 'dist/locked', os.R_OK):
+                self.skipTest('running as a user that ignores permissions')
+            self.refused(path, 'could not be read')
+        finally:
+            os.chmod(path / 'dist/locked', 0o755)
+
+    def test_the_digest_sees_an_added_file_after_mtime_is_restored_and_a_swap_goodqa_15565(self):
+        path = self.clone()
+        self.ignore(path, 'dist/\n')
+        (path / 'dist').mkdir()
+        (path / 'dist/a.js').write_text('x\n')
+        before = cg._no_backup_state(str(path), 'git')['ignored_sha256']
+        stamp = os.stat(path / 'dist').st_mtime_ns
+        (path / 'dist/b.js').write_text('y\n')
+        os.utime(path / 'dist', ns=(stamp, stamp))  # mtime restored: only the count differs
+        self.assertNotEqual(cg._no_backup_state(str(path), 'git')['ignored_sha256'], before)
+        (path / 'dist/b.js').unlink()
+        os.utime(path / 'dist', ns=(stamp, stamp))
+        self.assertEqual(cg._no_backup_state(str(path), 'git')['ignored_sha256'], before)
+        (path / 'dist/a.js').unlink()
+        (path / 'dist/c.js').write_text('z\n')  # one removed, one added: same count, newer mtime
+        self.assertNotEqual(cg._no_backup_state(str(path), 'git')['ignored_sha256'], before)
 
     def test_a_late_addition_to_an_ignored_folder_voids_the_approval_goodqa_15565(self):
         path = self.clone()
