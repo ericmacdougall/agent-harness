@@ -2057,6 +2057,132 @@ def fallback_scan(text, ctx):
     return findings
 
 
+# --------------------------------------------------------------------------- git directories (goodqa#15565)
+#
+# A `.git` directory (or a bare/separate git directory) holds commits, branches, stashes and reflogs that may exist
+# nowhere else. On dev2 a sweep list fed through `ssh ... xargs rm -rf` deleted two of them and lost unpushed work, so
+# deleting or moving away a git directory, or anything inside one, is refused anywhere on disk unless the existing
+# approve-delete marker (a verified Dropbox backup) covers that exact literal local path.
+#
+# The only exceptions are files git itself creates per operation and recreates on demand. Removing them never loses a
+# commit, and removing a stale one is git's own documented recovery:
+#   *.lock anywhere in a git directory   index.lock, HEAD.lock, refs/heads/x.lock ... left behind by a killed git
+#   COMMIT_EDITMSG                       the last commit message buffer (the commit itself holds the message)
+#   ORIG_HEAD, FETCH_HEAD                pointers rewritten by the next reset/merge/rebase and fetch
+#   MERGE_HEAD, MERGE_MSG, MERGE_MODE, MERGE_RR   in-progress merge bookkeeping (the same as `git merge --abort`)
+# MERGE_AUTOSTASH is deliberately absent: it names the stash commit holding the user's uncommitted changes.
+# The named files count only directly in a git directory (or .git/worktrees/<name>/, a linked worktree's private
+# directory), never deeper: `.git/refs/heads/ORIG_HEAD` is a branch.
+GIT_DIR_SEG = '.git'
+GIT_TRANSIENT_NAMES = frozenset(('commit_editmsg', 'orig_head', 'fetch_head', 'merge_head', 'merge_msg', 'merge_mode',
+                                 'merge_rr'))
+# `.git` as a whole path component in raw text (not .github, .gitignore, foo.git or not.git)
+GIT_MENTION = re.compile(r'(?i)(?:^|(?<=[\s/\'"=:(*,]))\.git(?=$|[\s/\'"*;|&)\\,])')
+# a delete call in interpreter code (quotes are spaces and text is casefolded by _scan_text)
+GIT_CODE_DELETE = re.compile(r'\b(?:rm|rmdir|unlink|shred|rmtree|remove|rimraf|rm_rf|rm_r|rm_f|remove_tree|removedirs|'
+                             r'remove_dir|remove_entry|remove_entry_secure|rmdirsync|unlinksync|rmsync|delete)\b|'
+                             r'\bfs\.(?:rm|rmdir|unlink)\b|\bfs\.promises\.(?:rm|rmdir|unlink)\b')
+GIT_CODE_PATH = re.compile(r'(?:^|(?<=[\s/=(,+]))\.git(?=[\s/;)]|$)((?:/[^\s/;)]+)*)')
+# commands whose output lines are a subset of the lines of the files they read: a list fed through them is checked by
+# reading those files. Anything else that reads a list file transforms it, so the list cannot be verified.
+GIT_LIST_READERS = frozenset(('cat', 'tac', 'head', 'tail', 'sort', 'uniq', 'grep', 'egrep', 'fgrep', 'shuf'))
+GIT_LIST_VALUE_OPTS = {'head': ('-n', '-c', '--lines', '--bytes'), 'tail': ('-n', '-c', '--lines', '--bytes'),
+                       'sort': ('-k', '-t', '-S', '-T', '-o', '--key', '--field-separator', '--buffer-size',
+                                '--temporary-directory', '--output'),
+                       'grep': ('-e', '-f', '-m', '-A', '-B', '-C', '--regexp', '--file', '--max-count'),
+                       'shuf': ('-n', '-o', '--head-count', '--output')}
+GIT_LIST_MAX_BYTES = 4 << 20
+GIT_LIST_MAX_LINES = 50000
+STDIN_DELETER = re.compile(r'(?:^|[\s/])(?:rm|rmdir|unlink|shred|srm|mv|truncate|rimraf|trash(?:-put)?)(?:\s|$)')
+
+
+class _GitFrame:
+    """Context for Analyzer._git_frame: pushes the command a nested script inherits stdin from, and counts remote hops."""
+
+    def __init__(self, analyzer, frame, remote):
+        self.analyzer, self.frame, self.remote = analyzer, frame, remote
+
+    def __enter__(self):
+        a = self.analyzer
+        if not hasattr(a, '_git_frames'):
+            a._git_frames, a._git_remote = [], 0
+        a._git_frames.append(self.frame)
+        a._git_remote += 1 if self.remote else 0
+        return self
+
+    def __exit__(self, *exc):
+        a = self.analyzer
+        a._git_frames.pop()
+        a._git_remote -= 1 if self.remote else 0
+        return False
+
+
+def git_path_kind(path):
+    """None when `path` has no `.git` component, 'transient' for an allowlisted per-operation file inside a git
+    directory, else 'git'. A wildcard component that can match `.git` (`.g*`, `.*`, `?git`) counts as `.git`; one that
+    cannot start with a dot (`*`) does not, as in the shell without dotglob."""
+    segs = [s for s in path.replace('\\', '/').split('/') if s]
+    hits = [k for k, s in enumerate(segs) if s.casefold() == GIT_DIR_SEG or (
+        _has_glob(s) and s[:1] in ('.', '?', '[') and _fnmatchcase(GIT_DIR_SEG, s.casefold()))]
+    if not hits:
+        return None
+    k = hits[-1]
+    rest = segs[k + 1:]
+    if segs[k].casefold() != GIT_DIR_SEG or not rest or any(_has_glob(s) or s in ('.', '..') for s in rest):
+        return 'git'
+    leaf = rest[-1].casefold()
+    if leaf.endswith('.lock') and len(leaf) > len('.lock'):
+        return 'transient'
+    if leaf in GIT_TRANSIENT_NAMES and (len(rest) == 1 or (len(rest) == 3 and rest[0].casefold() == 'worktrees')):
+        return 'transient'
+    return 'git'
+
+
+def git_code_deletes_git_path(code):
+    """A line of interpreter code that calls a delete and names a non-transient path inside a `.git` directory."""
+    if '.git' not in code.casefold():
+        return False
+    for line in code.splitlines()[:5000]:
+        scanned = _scan_text(line)
+        if '.git' not in scanned or not GIT_CODE_DELETE.search(scanned):
+            continue
+        for m in GIT_CODE_PATH.finditer(scanned):
+            if git_path_kind('/.git' + m.group(1)) == 'git':
+                return True
+    return False
+
+
+def _list_operands(name, texts):
+    """File operands of a GIT_LIST_READERS command given its argument texts, or None when its output is not a subset of
+    its input lines (grep -o/-r, uniq/sort writing elsewhere is fine). An empty list means it reads stdin."""
+    valued = GIT_LIST_VALUE_OPTS.get('grep' if name in ('egrep', 'fgrep') else name, ())
+    if name in ('grep', 'egrep', 'fgrep') and any(
+            t in ('-o', '--only-matching', '-r', '-R', '--recursive') or re.fullmatch(r'-[A-Za-z]*[oRr][A-Za-z]*', t)
+            for t in texts):
+        return None
+    out, pattern_given, k = [], False, 0
+    while k < len(texts):
+        t = texts[k]
+        if t == '--':
+            out.extend(texts[k + 1:])
+            break
+        if t in valued:
+            pattern_given = pattern_given or t in ('-e', '-f', '--regexp', '--file')
+            k += 2
+            continue
+        if t.startswith('-') and t != '-':
+            pattern_given = pattern_given or t.startswith(('--regexp=', '--file=')) or bool(re.fullmatch(r'-[ef].+', t))
+            k += 1
+            continue
+        out.append(t)
+        k += 1
+    if name in ('grep', 'egrep', 'fgrep') and not pattern_given:
+        out = out[1:]
+    if name == 'uniq':
+        out = out[:1]  # the second operand is the output file
+    return out
+
+
 # --------------------------------------------------------------------------- analysis
 
 class Ctx:
@@ -2199,6 +2325,13 @@ class Analyzer:
     def __init__(self, compiled, cwd=None, ps=False, marker=None):
         self.ctx = Ctx(compiled, cwd, ps, marker)
         self.c = compiled
+        # goodqa#15565 (kept on the analyser, not in Ctx state, so `>!` readings never fork them): ssh/container hops
+        # open around the current text, the script texts being analysed, the commands whose stdin a nested script
+        # inherits, and what each `read`/`mapfile` variable was fed from
+        self._git_remote = 0
+        self._git_texts = []
+        self._git_frames = []
+        self._git_flow_feeds = {}
 
     def _probe(self, kind, path, fn):
         """One disk probe per analysis. The command has not run, so a path's lexists/realpath/marker answer is
@@ -2247,6 +2380,9 @@ class Analyzer:
             ctx.tail_visible = tail_visible
         if isinstance(text, str) and len(ctx.seen_texts) < 256:
             ctx.seen_texts.append(text[:200000])
+        texts = getattr(self, '_git_texts', None)
+        if texts is not None:
+            texts.append(text if isinstance(text, str) else ' '.join(map(str, text)))
         try:
             lexer = Lexer(ctx, ctx.ps)
             tokens = lexer.lex(text)
@@ -2261,6 +2397,8 @@ class Analyzer:
                 self._run_tokens(tokens, depth)
         finally:
             ctx.ps, ctx.tail_visible = saved_ps, saved_tail
+            if texts:
+                texts.pop()
 
     def _run_tokens(self, tokens, depth):
         self.check_tokens(tokens)
@@ -2867,6 +3005,7 @@ class Analyzer:
                 if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', a.text):
                     ctx.flow_vars.add(a.text)
                     ctx.vars.pop(a.text, None)
+            self.git_note_read_feed(args, cmd, pl, idx)
             return
         if name in ('popd', 'pop-location'):
             ctx.cwd_unknown = True
@@ -2919,14 +3058,18 @@ class Analyzer:
                             self.refuse('fd --exec ' + inner, w)
                     break
         if name in SHELLS or name in PS_SHELLS:
-            self.shell(name, args, depth, pl, idx)
+            with self._git_frame(cmd, pl, idx, remote=False):
+                self.shell(name, args, depth, pl, idx)
             return
         if name == 'ssh' or name == 'mosh':
-            self.ssh(args, depth)
+            self.git_ssh_local_subs(args)
+            with self._git_frame(cmd, pl, idx, remote=True):
+                self.ssh(args, depth)
             return
         if name in ('docker', 'podman', 'nerdctl', 'kubectl', 'oc'):
             self.secret_clis(name, [a.text for a in args], visible=self.out_visible(pl, idx, True))
-            self.container(name, args, words, depth, pl, idx)
+            with self._git_frame(cmd, pl, idx, remote=True):
+                self.container(name, args, words, depth, pl, idx)
             return
         if name.startswith('docker-credential-') and 'get' in [a.text for a in args] \
                 and self.out_visible(pl, idx, True):
@@ -3219,6 +3362,7 @@ class Analyzer:
             if name in ('start-process', 'start', 'call'):
                 pass
         elif name == 'xargs':
+            self.git_xargs_feed(args, pl, idx)
             self.xargs_input(args, pl.cmds[idx] if pl is not None and idx < len(pl.cmds) else None)
             while i < len(args) and texts[i].startswith('-'):
                 i += 2 if texts[i] in ('-n', '-I', '-P', '-d', '-L', '-a', '-E', '-s', '-i', '-l') else 1
@@ -3553,6 +3697,7 @@ class Analyzer:
                         'drop -L/-follow; find does not need to follow links to clean a build tree')
             for r in roots:
                 self.protected_target('find -delete/-exec', r)
+            self.git_find_patterns(texts)
         for body in exec_cmds:
             if not body:
                 continue
@@ -4113,6 +4258,9 @@ class Analyzer:
 
     def code(self, code, depth):
         ctx = self.ctx
+        if git_code_deletes_git_path(code):
+            ctx.add(LOG_DELETE, 'git-dir-delete', 'script code deletes a path inside a .git directory, which holds commits '
+                    'and branches that may exist nowhere else', self.GIT_INSTEAD)
         # destroyer words inside a regex pattern are data: the log-delete text rule reads the code without them
         blanked = blank_regex_patterns(code) if read_only_pattern_script(code) else code
         for f in fallback_scan(code, ctx.c):
@@ -4553,6 +4701,10 @@ class Analyzer:
         ctx = self.ctx
         if self._own_temp_file(word):
             return False
+        # the full tiers without need_existing mark a delete or a move away (rm, mv sources, find -delete, rsync --delete,
+        # rclone purge, xargs input ...); overwrites and truncation pass narrower tiers or need_existing
+        if 'ancestor' in tiers and not need_existing and self.git_dir_refuse(what, word):
+            return True
         cls, path, literal = self.target_class(word)
         if cls is None or cls not in tiers:
             return False
@@ -4576,6 +4728,329 @@ class Analyzer:
                                                            'variables cannot be approved')
                 + self._clone_hint(path))
         return True
+
+    # ---- git directories (goodqa#15565; the rule and its allowlist are described at GIT_TRANSIENT_NAMES)
+    GIT_INSTEAD = ('push every branch first (or `git bundle create X.bundle --all`), back the directory up to Dropbox, run '
+                   '`command_guard.py approve-delete --path P --remote REMOTE` on the host that holds it, then delete the '
+                   'literal path there; a stale .git/*.lock, COMMIT_EDITMSG, ORIG_HEAD, FETCH_HEAD or MERGE_HEAD/MSG/MODE '
+                   'file can be removed directly')
+
+    def _git_frame(self, cmd, pl, idx, remote):
+        """Around ssh/container/shell analysis: the nested text inherits this command's stdin, and an ssh or container
+        hop runs it elsewhere (its paths are not this machine's, its list files cannot be read, no approval applies)."""
+        return _GitFrame(self, (cmd, pl, idx, getattr(self, '_git_remote', 0) > 0), remote)
+
+    def _git_add(self, what, shown, remote):
+        self.ctx.add(LOG_DELETE, 'git-dir-delete',
+                     ('%s targets a git directory%s (%s), which holds commits, branches and stashes that may exist '
+                      'nowhere else' % (what, ' on another host' if remote else '', shown[-80:]))[:300],
+                     self.GIT_INSTEAD)
+
+    def _git_unverifiable(self, what, why):
+        self.ctx.add(LOG_DELETE, 'git-dir-delete-unverifiable',
+                     ('%s deletes paths read from %s, which the guard cannot read to rule out git directories'
+                      % (what, why[:120]))[:300],
+                     'name the paths literally on the command line, or keep the list in a local regular file the guard '
+                     'can read and run the delete on the host that holds it')
+
+    def _git_dir_by_content(self, path):
+        """`path` or an ancestor is a git directory by its content (a bare repository or a --separate-git-dir)."""
+        p = path.rstrip('/')
+        for _ in range(64):
+            if not p or p == '/':
+                return False
+            if self._probe('if', p + '/HEAD', os.path.isfile) and self._probe('id', p + '/objects', os.path.isdir) \
+                    and self._probe('id', p + '/refs', os.path.isdir):
+                return True
+            p = posixpath.dirname(p)
+        return False
+
+    def git_dir_refuse(self, what, word):
+        """Refuse a delete or move of a git directory or anything inside one (see GIT_TRANSIENT_NAMES). True when it
+        added a finding. An approve-delete marker can cover only an exact, literal path on this machine."""
+        ctx = self.ctx
+        remote = getattr(self, '_git_remote', 0) > 0
+        alts = word.all_alts()
+        if alts is None:
+            alts = [_unq(word.overflow or '')] + word.alts[:32]
+        literal = not word.dynamic and not word.glob and not word.subs
+        for alt in alts:
+            path = norm_path(alt, ctx)
+            exact = literal and not any(ch in alt for ch in GLOB_CHARS) and not is_dynamic_path(alt)
+            kind = git_path_kind(path)
+            if kind == 'transient' and not remote and self._probe('id', path, os.path.isdir) \
+                    and not self._probe('il', path, os.path.islink):
+                kind = 'git'  # a directory named like a lock file is not a lock file
+            if kind is None and exact and not remote and self._git_dir_by_content(path):
+                kind = 'git'
+            if kind != 'git':
+                continue
+            if exact and not remote and ctx.marker is not None and ctx.marker(path):
+                continue
+            self._git_add(what, path, remote)
+            return True
+        for v in word.vars:  # a `read`/`mapfile` variable carries whatever fed that read
+            name = v.lstrip('!')
+            for feed in getattr(self, '_git_flow_feeds', {}).get(name, ()):
+                if self._git_check_feed(what, feed):
+                    return True
+            hint = ctx.var_hints.get(name)
+            if hint and GIT_MENTION.search(hint):
+                self._git_add(what, hint, remote)
+                return True
+        for sub in word.subs:  # `rm -rf $(cat list)`: the substitution's output is the operand list
+            if self._git_check_feed(what, self._git_feed_from_text(sub, remote)):
+                return True
+        return False
+
+    # A feed describes what a stdin- or list-fed delete receives:
+    #   ('lines', [text], label)      literal lines (a list file read here, echo/printf words, a here-string or heredoc)
+    #   ('unverifiable', reason)      a list the guard cannot read (another host, missing, dynamic name, transformed)
+    #   ('computed', text)            another program's output; refused only when that program's text names `.git`
+    #   ('none',)                     nothing (an empty stdin)
+
+    def _git_check_feed(self, what, feed):
+        kind = feed[0]
+        if kind == 'unverifiable':
+            self._git_unverifiable(what, feed[1])
+            return True
+        if kind == 'computed':
+            if GIT_MENTION.search(feed[1] or ''):
+                self._git_add(what, 'a list produced by: ' + feed[1][:60], getattr(self, '_git_remote', 0) > 0)
+                return True
+            return False
+        if kind != 'lines':
+            return False
+        checked = 0
+        for line in feed[1]:
+            line = line.strip().strip('\'"')
+            if not line:
+                continue
+            for cand in [line] + (line.split() if re.search(r'\s', line) else []):
+                checked += 1
+                if checked > GIT_LIST_MAX_LINES:
+                    self._git_unverifiable(what, '%s (too many entries to check)' % feed[2])
+                    return True
+                if self.git_dir_refuse(what + ' (from %s)' % feed[2][:60], _literal_word(cand.strip('\'"'))):
+                    return True
+        return False
+
+    def _git_read_list(self, word, remote, label=None):
+        """A list file named by `word`: ('lines', ...) when it is a local regular file the guard can read in full."""
+        if remote:
+            return ('unverifiable', 'a list file on another host (%s)' % word.text[:60])
+        if word.dynamic or word.glob or word.subs or any(ch in word.text for ch in GLOB_CHARS) \
+                or is_dynamic_path(word.text):
+            return ('unverifiable', 'a list file whose name is computed at run time (%s)' % word.text[:60])
+        path = norm_path(word.text, self.ctx)
+        if path.casefold() in self.ctx.created or path.casefold() in self.ctx.written:
+            return ('unverifiable', 'a list file this same command writes (%s)' % path[-60:])
+        try:
+            st = os.stat(path)
+            if not stat.S_ISREG(st.st_mode):
+                return ('unverifiable', 'a list path that is not a regular file (%s)' % path[-60:])
+            if st.st_size > GIT_LIST_MAX_BYTES:
+                return ('unverifiable', 'a list file larger than %d bytes (%s)' % (GIT_LIST_MAX_BYTES, path[-60:]))
+            with open(path, 'rb') as handle:
+                data = handle.read(GIT_LIST_MAX_BYTES + 1)
+        except (OSError, ValueError):
+            return ('unverifiable', 'a list file that cannot be read (%s)' % path[-60:])
+        text = data.decode('utf-8', 'replace')
+        return ('lines', re.split(r'[\n\x00]', text), label or ('list file ' + path[-60:]))
+
+    def _git_feed_from_stage(self, cmd, pl, idx, remote):
+        """What the pipeline stage `cmd` prints, as a feed."""
+        words = [self.resolve(w) for w in self._skip_assigns(strip_reserved(cmd.words))[1]]
+        if not words:
+            return self._git_stdin_feed(cmd, pl, idx, remote)
+        name = norm_name(words[0].text)
+        args = words[1:]
+        texts = [a.text for a in args]
+        joined = ' '.join(w.text for w in words)
+        if name in GIT_LIST_READERS:
+            operands = _list_operands(name, texts)
+            if operands is None:
+                return ('unverifiable', '`%s` output that is not a subset of a list file\'s lines' % name)
+            files = [a for a in args if a.text in operands and a.text != '-']
+            if not files:
+                return self._git_stdin_feed(cmd, pl, idx, remote)
+            lines = []
+            for f in files:
+                feed = self._git_read_list(f, remote)
+                if feed[0] != 'lines':
+                    return feed
+                lines.extend(feed[1])
+            return ('lines', lines, '%s %s' % (name, files[0].text[-50:]))
+        if name in ('echo', 'printf'):
+            if any(a.dynamic or a.subs for a in args):
+                return ('computed', joined)
+            body = ' '.join(t for t in texts if t not in ('-n', '-e', '-ne', '-en', '-E'))
+            return ('lines', re.split(r'\s+|\\n', decode_ansi(body)), name)
+        if name == 'ls' and any(re.fullmatch(r'-[A-Za-z]*[aA][A-Za-z]*', t) or t in ('--all', '--almost-all')
+                                for t in texts):
+            return ('computed', joined + ' .git')  # ls -a lists .git itself
+        # any other program reading a local file or a redirected file transforms a list the guard could check
+        if any(r.op in ('<', '<>') and r.fd in (None, '0') for r in cmd.redirs) or (not remote and any(
+                not a.dynamic and not a.text.startswith('-') and os.path.isfile(norm_path(a.text, self.ctx))
+                for a in args[:16])):
+            return ('unverifiable', 'a list file transformed by `%s`' % name[:30])
+        return ('computed', joined)
+
+    def _git_stdin_feed(self, cmd, pl, idx, remote):
+        """What `cmd` reads on stdin: its own redirect, the previous pipeline stage, or what a nested script inherits
+        from the ssh/shell command that runs it."""
+        for r in reversed(cmd.redirs if cmd is not None else []):
+            if r.op == '<<<' and r.target is not None:
+                if r.target.dynamic or r.target.subs:
+                    return ('computed', r.target.text + ' ' + ' '.join(r.target.subs))
+                return ('lines', re.split(r'\s+', r.target.text), 'here-string')
+            if r.op in ('<<', '<<-'):
+                return ('lines', r.body.splitlines(), 'heredoc')
+            if r.op in ('<', '<>') and r.fd in (None, '0') and r.target is not None:
+                if r.target.subs:  # `< <(cmd)`
+                    return self._git_feed_from_text(r.target.subs[-1], remote)
+                return self._git_read_list(r.target, remote)
+        if pl is not None and idx > 0:
+            return self._git_feed_from_stage(pl.cmds[idx - 1], pl, idx - 1, remote)
+        frames = getattr(self, '_git_frames', [])
+        if frames:
+            outer = frames.pop()
+            try:
+                return self._git_stdin_feed(outer[0], outer[1], outer[2], outer[3])
+            finally:
+                frames.append(outer)
+        return ('none',)
+
+    def _git_feed_from_text(self, text, remote):
+        """The output of a substitution's text (`cat list`, `< list`, `grep x list | sort`), as a feed."""
+        text = (text or '').strip()
+        if re.search(r'\bgit\b[^|;&]*\brev-parse\b[^|;&]*--(?:absolute-git-dir|git-dir|git-common-dir)\b', text):
+            return ('computed', '.git ' + text)  # $(git rev-parse --git-dir) prints the git directory itself
+        last = text.rsplit('|', 1)[-1].strip()
+        if re.fullmatch(r'<\s*\S+', last):  # $(< list)
+            last = 'cat ' + last[1:].strip()
+        try:
+            tokens = shlex.split(last)
+        except ValueError:
+            return ('unverifiable', 'a substitution the guard cannot parse')
+        if not tokens:
+            return ('none',)
+        name = norm_name(tokens[0])
+        if name in GIT_LIST_READERS:
+            operands = _list_operands(name, tokens[1:])
+            if operands is None:
+                return ('unverifiable', '`%s` output that is not a subset of a list file\'s lines' % name)
+            files = [t for t in operands if t != '-']
+            if not files:
+                return ('computed', text) if '|' not in text else self._git_feed_from_text(text.rsplit('|', 1)[0], remote)
+            lines = []
+            for f in files:
+                w = _literal_word(f)
+                w.dynamic = '$' in f or '`' in f
+                feed = self._git_read_list(w, remote)
+                if feed[0] != 'lines':
+                    return feed
+                lines.extend(feed[1])
+            return ('lines', lines, '%s %s' % (name, files[0][-50:]))
+        if name in ('sed', 'awk', 'gawk', 'cut', 'tr', 'perl', 'jq', 'xargs') and (not remote and any(
+                not t.startswith('-') and os.path.isfile(norm_path(t, self.ctx)) for t in tokens[1:16]) or remote):
+            return ('unverifiable', 'a list file transformed by `%s`' % name[:30])
+        return ('computed', text)
+
+    def git_xargs_feed(self, args, pl, idx):
+        """xargs running a delete: check every path its input list names (goodqa#15565)."""
+        texts = [a.text for a in args]
+        if not STDIN_DELETER.search(' '.join(texts)):
+            return
+        remote = getattr(self, '_git_remote', 0) > 0
+        feed = None
+        for k, t in enumerate(texts):
+            word = None
+            if t in ('-a', '--arg-file') and k + 1 < len(args):
+                word = args[k + 1]
+            elif t.startswith('--arg-file='):
+                word = _literal_word(t.split('=', 1)[1])
+            elif re.fullmatch(r'-a.+', t):
+                word = _literal_word(t[2:])
+            if word is not None:
+                feed = self._git_feed_from_text(word.subs[-1], remote) if word.subs else self._git_read_list(word, remote)
+                break
+            if not t.startswith('-'):
+                break  # the command xargs runs starts here
+        if feed is None:
+            cmd = pl.cmds[idx] if pl is not None and idx < len(pl.cmds) else None
+            feed = self._git_stdin_feed(cmd, pl, idx, remote)
+        self._git_check_feed('xargs deletion', feed)
+
+    def git_note_read_feed(self, args, cmd, pl, idx):
+        """`read p` / `mapfile a`: remember what fed it, so a later `rm "$p"` checks those paths. A `while read` loop
+        takes its input from `done < list`, which comes after the body, so the current text is searched for that."""
+        names = [a.text for a in args if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', a.text)]
+        if not names:
+            names = ['REPLY', 'MAPFILE']
+        remote = getattr(self, '_git_remote', 0) > 0
+        feeds = []
+        own = self._git_stdin_feed(cmd, pl, idx, remote) if (cmd is not None and cmd.redirs) or idx > 0 else None
+        if own is not None:
+            feeds.append(own)
+        texts = getattr(self, '_git_texts', [])
+        current = texts[-1] if texts else (getattr(self.ctx, 'raw_top', '') or '')
+        for m in re.finditer(r'\bdone\s*(<<<|0?<(?![<(&])|<\s*<\()\s*("[^"]*"|\'[^\']*\'|[^\s;&|)]+)?', current[:200000]):
+            op, target = m.group(1), (m.group(2) or '')
+            if op.endswith('('):  # done < <(cmd)
+                start = m.end(1) - 1
+                end = scan_balanced(current, start + 1) if start + 1 < len(current) else -1
+                inner = current[start + 1:end - 1] if isinstance(end, int) and end > start else current[start + 1:]
+                feeds.append(self._git_feed_from_text(inner, remote))
+            elif op == '<<<':
+                feeds.append(('lines', re.split(r'\s+', target.strip('\'"')), 'here-string'))
+            else:
+                unq = target[1:-1] if target[:1] in ('"', "'") and target[-1:] == target[:1] else target
+                w = _literal_word(unq)
+                w.dynamic = '$' in unq or '`' in unq if target[:1] != "'" else False
+                feeds.append(self._git_read_list(w, remote))
+        if not feeds and idx == 0 and (cmd is None or not cmd.redirs):
+            feeds.append(self._git_stdin_feed(cmd, pl, idx, remote))  # inherited from an ssh/shell command
+        store = getattr(self, '_git_flow_feeds', None)
+        if store is not None:
+            for name in names:
+                store[name] = store.get(name, []) + feeds
+
+    def git_ssh_local_subs(self, args):
+        """`ssh host rm -rf $(cat list)`: an unquoted substitution runs here, before the connection, and its output
+        becomes the remote command's operands."""
+        texts = [a.text for a in args]
+        if not any(a.subs for a in args) or not STDIN_DELETER.search(' '.join(texts)):
+            return
+        for a in args:
+            for sub in a.subs:
+                if self._git_check_feed('remote deletion', self._git_feed_from_text(sub, getattr(self, '_git_remote', 0) > 0)):
+                    return
+
+    def git_find_patterns(self, texts):
+        """find -delete / -exec rm: a -name/-path/-regex test that can match a .git directory or a path inside one, not
+        used as an exclusion (`-not -path '*/.git/*'`, `-name .git -prune -o ...`)."""
+        tests = ('-name', '-iname', '-path', '-ipath', '-wholename', '-iwholename', '-regex', '-iregex')
+        for k, t in enumerate(texts[:-1]):
+            if t not in tests:
+                continue
+            pattern = texts[k + 1]
+            if t.endswith('regex'):
+                hit = bool(re.search(r'(?i)\\?\.git(?![a-z0-9_-])', pattern)) or pattern in ('.*', '.+')
+            elif t.endswith('name') and 'path' not in t and 'whole' not in t:
+                hit = _fnmatchcase(GIT_DIR_SEG, pattern.casefold())
+            else:
+                folded = pattern.casefold()
+                hit = any(_fnmatchcase(GIT_DIR_SEG, seg) for seg in folded.split('/') if seg) or any(
+                    _fnmatchcase(sample, folded) for sample in ('./.git', './.git/head', './r/.git/objects/ab/cd01'))
+            if not hit:
+                continue
+            negated = k > 0 and texts[k - 1] in ('-not', '!')
+            pruned = texts[k + 2:k + 3] == ['-prune'] and texts[k + 3:k + 4] in (['-o'], ['-or'])
+            if negated or pruned:
+                continue
+            self._git_add('find -delete/-exec %s %s' % (t, pattern[:40]), pattern, getattr(self, '_git_remote', 0) > 0)
+            return
 
     LONE_RM = re.compile(r'^[ \t]*(?:/bin/|/usr/bin/)?(?:rm|rmdir)(?:[ \t]+-[A-Za-z-]+)*(?:[ \t]+--)?(?:[ \t]+[^ \t\x00-\x1f\x7f;&|<>`$()\\"\'*?\[\]{}~#!]+)+[ \t]*$')
 
