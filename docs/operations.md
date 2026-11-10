@@ -1242,85 +1242,145 @@ owners already working in real repositories, and Claude never auto-removes the w
 Every active mission goal must be held by someone, wait on something named, or be done with evidence (goodqa#15565).
 The dropped-owner gate only sees owners that existed and stopped; on 2026-11-10 the leads goal (goodqa#15095) had no
 owner all night and nothing said so. `harness/hooks/mission_coverage.py` holds the rule, `mission_gate.py` enforces it
-at main's Stop, and the ops-watch `mission` check alerts on it.
+at main's Stop (and stamps main's main-only commands), and the ops-watch `mission` check alerts on it.
 
 ### Goals file
 
-One canonical file, `~/.agent-harness/mission/goals.json` (directory 0700, file 0600, at most 1 MiB, 500 goals,
-nesting depth 8; a symlink, FIFO or any wrong type makes the whole file unreadable). It is a JSON list of goals:
+One canonical file, `~/.agent-harness/mission/goals.json` (directory 0700 and not a symlink, file 0600, at most 1 MiB,
+500 goals, nesting depth 8; a symlink, FIFO or any wrong type makes the whole file unreadable). It is a JSON object
+`{"mission_session": "<session id>", "goals": [...]}` (a bare list, the first format, has no mission session):
 
 | field | type | meaning |
 | --- | --- | --- |
+| `mission_session` | session id | the main session the Stop gate holds to the mission; set by the first `import-initiatives` or by `set-session` (main only) |
 | `id` | `[a-z0-9][a-z0-9_-]{0,63}` | unique goal id (the dashboard initiative id) |
 | `title` | text, up to 300 | what the goal is |
-| `ticket` | `goodqa#N`, `Project#N` or `""` | the stream ticket; owners are matched by it, never by name. A goal without a ticket cannot be covered by an owner |
+| `ticket` | `goodqa#N`, `Project#N` or `""` | the stream ticket; owners are matched by it, never by name. Changing it is main only |
 | `priority` | integer 1..9 | 1 is the most important |
-| `status` | `active`, `done`, `deferred` | `done` only through `done`, `deferred` only through `defer --user-source` |
-| `deferral` | `{by: user\|ask\|ticket, ref, until, source}` | what the goal waits on (see the rule) |
+| `status` | `imported`, `active`, `done`, `deferred`, `retired` | `imported` is reported, not enforced, until `activate`; `done` only through `done`, `deferred` only through `defer --user-source`, `retired` only through `retire` |
+| `deferral` | `{by: user\|ask\|ticket, ref, until, source, renewal}` | what the goal waits on; `ref` must be an ask id (`ask`) or a ticket (`ticket`), `until` an ISO time, or the file is unreadable |
+| `wait_count` | integer | ask/ticket waits in a row without the user's word |
+| `bound` | list of full agent ids | owners main bound to the goal (`bind`) |
+| `retire` | `{source}` | the user's words that cancelled the goal |
 | `done_evidence` | `[{kind: deploy\|really_tested, ref, session}]` | WAL ids proving it is live and tested |
-| `repos` | list of paths, optional | repositories whose commits naming the ticket count as progress |
+| `repos` | list of paths, optional | repositories whose commits naming the ticket count as progress (main only) |
 | `dashboard` | object, informational | copied from the dashboard on import; never read by the rule (its `owner` field covers nothing) |
 
-Write it only through the tool; each write appends a hash-chained row (`prev` = sha256 of the previous row, the last
-row's hash in `mission-goals-audit.head`, the goals file's sha256 in `after_sha`) to
-`~/.agent-harness/state/mission-goals-audit.jsonl`. A goals file that does not match the chain head (a goal removed or
-edited by hand, an edited or deleted audit row) is treated as tampered: the gate blocks and every write is refused until
-`reseal --reason` records the change as an audited row.
+Write it only through the tool. Each write appends a hash-chained row to
+`~/.agent-harness/state/mission-goals-audit.jsonl`: `prev` is the sha256 of the previous row, the last row's hash is in
+`mission-goals-audit.head`, the goals file's sha256 is in `after_sha`, and the mission session is in `session`. Past
+16 MiB the file is renamed to `mission-goals-audit.NNNNNN.jsonl` and the chain continues in a new file. A goals file
+that does not match the chain head is treated as tampered: a goal removed or edited by hand, or an audit row edited or
+deleted in any segment. The gate then blocks the session the chain names (never a session the edited file names), and
+every write is refused until main runs `reseal --reason`.
 
-    mission_coverage.py import-initiatives ~/.agent-harness/work/<session>/dashboard/initiatives.json
+Readers take a shared lock on `mission-goals.lock`, so a concurrent write is never read as tampered.
+
+    mission_coverage.py import-initiatives ~/.agent-harness/work/<session>/dashboard/initiatives.json   # main
+    mission_coverage.py activate --goal leads                                                             # main
     mission_coverage.py add --goal leads --title "1,000 leads in the CRM view" --ticket goodqa#15095 --priority 1
-    mission_coverage.py set --goal leads [--title T] [--ticket T] [--priority N] [--repo PATH]... [--status active] [--clear-deferral]
-    mission_coverage.py defer --goal leads --ask <open ask id> --until <ISO, at most 7 days ahead>
-    mission_coverage.py defer --goal leads --ticket <blocking ticket> --until <ISO, at most 7 days ahead>
-    mission_coverage.py defer --goal leads --user-source '<user: or answer: source>' [--until <ISO>]
-    mission_coverage.py done --goal leads --deploy <deploy WAL id> --live-test <REALLY_TESTED id> [--session S]
-    mission_coverage.py reseal --reason "<what changed and why>"
+    mission_coverage.py set --goal leads [--title T] [--priority N] [--status active] [--clear-deferral]
+    mission_coverage.py set --goal leads --ticket T | --repo PATH...                                      # main
+    mission_coverage.py bind --goal leads --agent <full agent id> --source ticket:goodqa#15095 [--remove] # main
+    mission_coverage.py defer --goal leads --ask <open ask naming the goal> --until <ISO, at most 7 days ahead>
+    mission_coverage.py defer --goal leads --ticket <open blocking ticket> --until <ISO, at most 7 days ahead>
+    mission_coverage.py defer --goal leads --user-source "<user: or answer: source>" [--until <ISO>]     # main
+    mission_coverage.py retire --goal leads --user-source "<user: or answer: source>"                    # main
+    mission_coverage.py done --goal leads --deploy <deploy WAL id> --live-test <REALLY_TESTED id>
+    mission_coverage.py set-session [--session S]                                                         # main
+    mission_coverage.py reseal --reason "<what changed and why>" [--force]                                # main
     mission_coverage.py verify | report [--json] | check
 
-`import-initiatives` is an idempotent merge: new ids become active goals at priority 3; existing goals keep every field
-a person set and only gain a missing ticket and the informational `dashboard` block. Nothing is removed and nothing is
-marked done (a dashboard "Done" is not evidence). The dashboard's initiatives.json stays a derived view.
+Main-only commands need a one-shot stamp (`caller_identity.put_stamp`, purpose `mission-main`, keyed by subcommand
+and goal, single use, 10 minutes) that `mission_gate.py pretool` writes only when the PreToolUse payload proves main
+(`caller_identity.is_main`) and the Bash command runs that exact subcommand. A sub-agent's shell, a copied script or a
+cron job finds no stamp and gets a refusal naming main. Every main-only change raises a high `mission:goals:changed`
+alert (source `mission-coverage`) with the old and new value. `reseal` is refused while the chain is intact unless
+main passes `--force`; its audit row records the sealed hash, the hand-edited file's hash and the removed goal ids.
+
+`ah task register` rows no longer bind owners: ah records the caller from the environment (`AH_AGENT_ID`, else
+`unknown`), so a registration cannot prove that main wrote it. Use `bind`, which needs main's stamp, a full agent id
+(16+ characters, never a prefix) and a `user:`, `answer:`, `queue:` or `ticket:` source. The binding covers only while
+`ah owners` reports that exact id as a live owner-type row.
+
+`import-initiatives` is an idempotent merge. New ids come in as `imported`: reported, not enforced. Dashboard rows whose
+state starts with done, live, complete, shipped or retired are marked `needs_evidence`. Existing goals keep every field,
+their status included, and only gain a missing ticket and the informational `dashboard` block. Nothing is removed and
+nothing is marked done (a dashboard "Done" is not evidence).
 
 ### The rule
 
 A goal with status `active` (or `deferred`) is covered by
 
 1. a live owner: an `ah owners` row of an owner type (never a helper such as red-team, click-tester, fixer, Explore,
-   Plan) in state live, working, quiet or SILENT (SILENT not after an ending disposition), whose stream ticket equals
-   the goal's ticket. Stream tickets are the first GoodQA ticket in the owner's WAL plus any ticket main registered for
-   it with `ah task register --owner-agent <id> --ticket "GoodQA goodqa#N" ...`. A nested sub-agent owner counts;
-2. a live disposition: a wait on an ask that is open in main's WAL, or on another ticket, with `until` in the future
-   and at most 7 days ahead; or a deferral the user decided, whose `user:`/`answer:` source resolves through
-   provenance.py to the user's own words (`inferred:`, `pasted:`, tickets and agent text never count), with `until` in
-   the future or none;
-3. done evidence (status `done`): a deploy record and a later REALLY_TESTED entry against a live target, both naming the
-   goal's ticket, checked with `ah`'s own evidence resolvers (the DONE_LIVE rule). Both are required.
+   Plan) in state live, working, quiet or SILENT (SILENT not after an ending disposition), whose stream ticket (the
+   first GoodQA ticket in its WAL) equals the goal's ticket, or whose exact agent id main bound to the goal;
+2. a live disposition:
+   - an `ah task dispose` waiting, resumed or reassigned disposition that ah reports live, on such an owner row;
+   - a wait on an ask that is open in main's WAL and whose text names the goal id or ticket;
+   - a wait on another ticket that was open in GoodQA when it was recorded (checked through ah's adapter, 10 s bound);
+   - an ask or ticket wait needs `until` in the future and at most 7 days ahead, and at most 2 waits in a row
+     without the user's word; the third makes the goal UNCOVERED again;
+   - a deferral the user decided: its `user:`/`answer:` source resolves through provenance.py to the user's own words,
+     and the quoted words name the goal (id, also hyphenated or spaced, or `#<ticket number>`). They must also say
+     defer, later, park, pause, hold, not now, drop, cancel or wait, with no refusal or condition word (don't, not, no,
+     if, unless, maybe, should, a question mark). `report` prints the quoted words;
+3. done evidence (status `done`): a deploy record and a later REALLY_TESTED entry against a live target, both from the
+   mission session's WALs and both naming the goal's ticket, checked with `ah`'s own evidence resolvers (the DONE_LIVE
+   rule).
 
-Anything else is UNCOVERED. A covered goal is STALLED when none of its owners wrote an own WAL entry (hook lifecycle
-rows excluded) and no commit in its `repos` names the ticket for more than 45 minutes; the report gives the age.
+`retired` counts only while the user's quoted words name the goal and say drop, cancel, retire or stop. `imported`
+never blocks. Anything else is UNCOVERED.
+
+A covered goal is STALLED when none of its owners wrote an own WAL entry for more than 45 minutes and no commit in its
+`repos` names the ticket in that time. Hook lifecycle rows and rows another agent wrote into the owner's WAL do not
+count. The report gives the age.
 
 When the owner cap (`model_tiers.json` caps.session_owner_agents) is full and a goal is uncovered, the message names the
 owner to free or queue: owners on no mission goal first (most idle first), then owners of the lowest-priority, most
 stalled goal, plus the option to queue the goal on its ticket.
 
+### Owner lists and signatures
+
+`ah owners` has no cheaper mode; on a 2,089-owner session it takes 10-25 s, more than a Stop hook can spend.
+
+- ops-watch (every 10 minutes) runs the full scan, bounded by `mission.timeout_s` (default 120). It writes the scan to
+  `~/.agent-harness/state/mission/owners-<session>.json`, signed with HMAC-SHA256 and carrying `by: ops_watch` and a
+  monotone `seq` that is kept in a signed seq file. ops-watch is the only writer; the gate never writes it.
+- The Stop gate uses that snapshot when its signature, session, writer and seq check out and it is at most 15 minutes
+  old. Otherwise it scans live within 9 s.
+- A missing, forged, replayed, foreign or stale snapshot plus an overrun scan never counts as coverage. The turn may
+  end with "owner list unavailable", and the gate raises a high `mission:scan:unavailable` alert.
+- The verification cache (`state/mission/verify-cache.json`) is signed the same way. It remembers a pass for a day and
+  a failure for 60 s; a failure is never cached as a pass.
+- Limit: the key (`state/mission/hmac.key`, 0600) is readable by every process of the same user. The signatures stop a
+  stray write or a careless agent, not a same-user agent that sets out to forge them. Such an agent can also edit the
+  hooks (see `caller_identity.py`).
+
 ### Enforcement
 
-- Stop gate (`mission_gate.py`, registered next to the dropped-owner gate): main only (`caller_identity.is_main`).
-  No goals file on a host means no block. It blocks with each uncovered goal, its ticket and the exact fixes; an
-  unreadable or tampered file blocks with one line. At most 25 blocks per signature (the sorted uncovered ids), then the
-  turn may end and a high `mission:gate-valve` alert (source `mission-gate`) goes to the ring; it clears when every goal
-  is covered. A repeated Stop in the same turn is not blocked. The owner scan has a 9 s budget; past it the gate uses the
-  last full scan (`~/.agent-harness/state/mission/owners-<session>.json`, refreshed by every full scan, used only when at
-  most 15 minutes old) and says so, otherwise it fails open with a message.
-- ops-watch `mission` check (enabled by default, `{"mission": {"enabled": false}}` in ops-watch.json turns it off):
-  `mission:<goal>:uncovered` (high, `stop_block`), `mission:<goal>:stalled` (warning), `mission:goals:unreadable` (high).
-  Alerts clear when the goal is covered. It uses the session in `CLAUDE_CODE_SESSION_ID`, else the newest main WAL.
-- Waking main: when the uncovered set gains a goal, `notify_main` raises `mission:notify` (source `mission-coverage`) and,
-  where `mc_chat` (Mission Control, goodqa#15585) is installed and main registered a target, drops an inbox message
-  marked as coming from the harness, not the user. It clears when nothing is uncovered.
-- Checkpoint: `mission_coverage.py report --json` lists goals slowest first (UNCOVERED by priority, STALLED oldest first,
-  covered by least recent progress, then waiting, deferred, done) and a `coverage` map keyed by goal id and ticket with
-  `{status: uncovered|stalled|moving, reason, action}` for Mission Control.
+- Stop gate (`mission_gate.py`, registered next to the dropped-owner gate):
+  - It runs only for main (`caller_identity.is_main`) and only in the mission session. Other sessions, sub-agents and
+    hosts without a goals file never block.
+  - It blocks with the 5 worst uncovered goals, the count of the rest, `mission_coverage.py report` and the fixes once,
+    in at most 1.5 KB. Every value from the goals file, a WAL or a ticket is stripped of control characters and capped
+    at 80 characters. A goal without a ticket gets "give it a ticket with `set --goal ID --ticket T` first".
+  - An unreadable or tampered file blocks with one line.
+  - At most 25 blocks per signature (the sorted uncovered ids). After that the turn may end and a high
+    `mission:gate-valve` alert goes to the ring. The count starts again from zero when the signature clears or changes.
+  - A repeated Stop in the same turn is not blocked.
+- ops-watch `mission` check (enabled by default; `{"mission": {"enabled": false}}` in ops-watch.json turns it off):
+  - It checks the session in `mission_session` and raises `mission:<goal>:uncovered` (high, `stop_block`),
+    `mission:<goal>:stalled` (warning) and `mission:goals:unreadable` (high). Alerts clear when the goal is covered.
+  - When the owner scan is unavailable, it keeps the last mission alerts, raises `mission:scan:unavailable`
+    (warning) and sends no "covered again" notice.
+- Waking main: when the uncovered set gains a goal, `notify_main` raises `mission:notify` (source `mission-coverage`).
+  Where `mc_chat` (Mission Control, goodqa#15585) is installed and main registered a target, it also drops an inbox
+  message marked as coming from the harness, not the user. It clears when nothing is uncovered.
+- Checkpoint: `mission_coverage.py report --json` lists goals slowest first: UNCOVERED by priority, STALLED oldest
+  first, covered by least recent progress, then waiting, deferred, imported, done and retired. It includes a
+  `coverage` map for Mission Control, keyed by goal id and ticket, with `{status: uncovered|stalled|moving, reason,
+  action}`.
 
 ## Design limits
 

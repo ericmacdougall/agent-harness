@@ -250,6 +250,10 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     managed.setdefault("PreToolUse", []).append({"matcher": "Bash", "hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "dropped_gate.py"), "pretool"],
         "timeout": 5}]})
+    # Main-only mission commands (goodqa#15565 red-team M1): main's own hook stamps them; never denies anything.
+    managed.setdefault("PreToolUse", []).append({"matcher": "Bash", "hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "mission_gate.py"), "pretool"],
+        "timeout": 5}]})
     # Local-ledger reminder (docs/ledger.md): rate limited and dismissible; fails open, so no onFailure.
     reminder = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "ledger_reminder.py")], "timeout": 3}
     for event in ("SessionStart", "UserPromptSubmit"):

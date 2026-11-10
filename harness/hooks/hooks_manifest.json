@@ -582,6 +582,20 @@
    "rules": []
   },
   {
+   "id": "mission-gate:pretool",
+   "script": "mission_gate.py",
+   "arg": "pretool",
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
    "id": "dropped-gate:pretool",
    "script": "dropped_gate.py",
    "arg": "pretool",
