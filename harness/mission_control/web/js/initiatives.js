@@ -49,7 +49,8 @@ export function mountInitiatives() {
     document.getElementById('initiative-count').textContent = String(state.initiatives.length).padStart(2, '0');
   }
   render(getState());
-  setInterval(() => { if (!document.hidden) render(getState()); }, 30000);  // ages and the 30-min flag
+  // ages and the 30-min flag; skipped while the keyboard is inside the list so focus is never lost (L-d)
+  setInterval(() => { if (!document.hidden && !list.contains(document.activeElement)) render(getState()); }, 30000);
   subscribe((state, reason) => {
     if (['initiatives', 'owners', 'asks', 'seed'].includes(reason)) render(state);
     if (reason === 'highlight') list.querySelectorAll('article').forEach(card => card.classList.toggle('is-highlighted', card.dataset.id === state.highlight));

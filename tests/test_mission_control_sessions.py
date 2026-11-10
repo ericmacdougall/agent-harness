@@ -100,6 +100,20 @@ class PersistentSessions(unittest.TestCase):
         first.key_loader = missing
         self.assertEqual(first.session(cookie(sid2)), (None, None))
 
+    def test_a_secret_unreadable_at_start_keeps_the_saved_sessions(self):  # delta red-team L-a
+        sid = auth(self.store).redeem(mcs.mint_code(KEY))
+        readable = {"ok": False}
+
+        def loader():
+            if not readable["ok"]:
+                raise FileNotFoundError("secret")
+            return KEY
+        started = mcs.Auth(loader, 47615, store=self.store)
+        self.assertEqual(started.session(cookie(sid)), (None, None))  # signed out while unreadable
+        readable["ok"] = True
+        self.assertEqual(started.session(cookie(sid))[0], sid)  # back, and nothing was wiped
+        self.assertEqual(auth(self.store).session(cookie(sid))[0], sid)
+
     def test_a_symlinked_store_is_not_read(self):
         real = Path(self.tmp.name) / "elsewhere.json"
         writer = auth(real)

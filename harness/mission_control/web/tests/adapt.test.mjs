@@ -198,3 +198,16 @@ test('initiative live fields come from owners, notes, asks and pushes, and go st
   assert.equal(quiet.owner, null);
   assert.equal(quiet.stale, true);  // only the hand-edited time, an hour old
 });
+
+test('a future or skewed stamp never holds the 30-minute flag off', () => {
+  const now = Date.parse('2026-11-10T03:00:00Z');
+  const owners = [{ agent_id: 'a', name: 'a', state: 'working', ticket: 'goodqa#7', runtime: 'claude',
+    last_item: { at: '2026-11-10T01:00:00Z', active: '2027-01-01T00:00:00Z', note: 'skewed' } }];
+  const live = adapt.liveFields({ id: 'x', ticket: 'goodqa#7' }, owners, [], [], now);
+  assert.equal(live.stale, true);
+  assert.equal(live.updated, '2026-11-10T01:00:00Z');
+  const offset = adapt.liveFields({ id: 'x', ticket: 'goodqa#7', updated: '2026-11-10T07:50:00+05:00' },
+    [{ ...owners[0], last_item: { at: '2026-11-10T02:40:00Z', note: 'n' } }], [], [], now);
+  assert.equal(offset.updated, '2026-11-10T07:50:00+05:00');
+  assert.equal(offset.stale, false);  // 02:50Z is newer than 02:40Z although it sorts lower as text
+});

@@ -173,9 +173,13 @@ export function liveFields(item, owners = [], asks = [], events = [], now = Date
   const branchHas = number ? new RegExp(`(^|\\D)${number}(\\D|$)`) : null;
   const push = branchHas ? events.filter(e => e.kind === 'push' && branchHas.test(e.subject?.branch || ''))
     .sort((a, b) => b.ts.localeCompare(a.ts))[0] || null : null;
-  const stamps = [owner?.last_item?.active, note?.at, push?.ts, validIso(item.updated)].filter(Boolean);
-  const updated = stamps.sort().pop() || null;
-  const stale = !updated || now - Date.parse(updated) > STALE_AFTER_MS;
+  // compare instants, not strings (mixed offsets), and ignore times in the future (clock skew or a bad writer), so a
+  // skewed stamp can never hold the 30-minute flag off (delta red-team L-c)
+  const stamps = [owner?.last_item?.active, note?.at, push?.ts, validIso(item.updated)]
+    .filter(Boolean).map(ts => ({ ts, ms: Date.parse(ts) })).filter(s => Number.isFinite(s.ms) && s.ms <= now + 120000);
+  const newest = stamps.sort((a, b) => a.ms - b.ms).pop() || null;
+  const updated = newest ? newest.ts : null;
+  const stale = !newest || now - newest.ms > STALE_AFTER_MS;
   return { owner: owner ? { name: owner.name, state: owner.state, runtime: owner.runtime } : null, note, openAsks,
     push: push ? { summary: push.summary, at: push.ts } : null, updated, stale };
 }

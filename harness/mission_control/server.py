@@ -127,6 +127,10 @@ class Auth:
         current = self._current_key()
         if current is None:
             return False
+        if self.key is None:  # the secret was unreadable at start and is back: load what was saved, wipe nothing (L-a)
+            self.key = current
+            self._load()
+            return True
         if current != self.key:
             self.sessions.clear()
             self.key = current
