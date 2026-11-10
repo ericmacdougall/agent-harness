@@ -33,8 +33,15 @@ OVERRIDE = re.compile(r"(?im)^[ \t]*Fold-Override:[ \t]*(.+?)[ \t\r]*$")
 UNCHECKED = re.compile(r"(?m)^[ \t]*(?:[-*+]|\d{1,3}[.)])[ \t]+\[ {1,2}\][ \t]+(.+?)[ \t\r]*$")
 FOLD_WORDS = re.compile(r"\b(?:fold(?:ed|ing)?|clos(?:e|ed|ing)|won'?t[ -]?fix|duplicate|drop(?:ped)?|abandon\w*|cancel\w*|"
                         r"supersed\w*|no longer (?:needed|wanted)|not needed)\b", re.I)
-FOLD_NEGATION = re.compile(r"\b(?:not|never|don'?t|do not|keep|stop|unless|if|without|leave|reopen|no|once|after|before|when|"
-                           r"while|until|later|wait|pause|hold|defer|but|only|except|pending|tomorrow|soon|might|maybe|should|eventually|next|think|unsure|consider\w*|hmm|perhaps)\b|n't\b", re.I)
+# A LATER sentence of the user's turn voids a fold only when it refuses, defers or retracts it (red-team ad4294 E1: words
+# like "next", "should" or "think" in an unrelated later sentence must not void a legitimate fold).
+FOLD_REFUSE = re.compile(r"\b(?:not|never|don'?t|do not|keep|stop|unless|if|without|leave|reopen|no|later|wait|pause|hold|"
+                         r"defer|tomorrow|let me think|think (?:about|it over)|sleep on|get back)\b|n't\b", re.I)
+# The sentence that HOLDS the excerpt (and the excerpt itself) must also be free of hedges and conditions (E2).
+FOLD_NEGATION = re.compile(FOLD_REFUSE.pattern[:-len(r")\b|n't\b")] + r"|once|after|before|when|while|until|but|only|except|"
+                           r"pending|soon|might|maybe|should|eventually|next|think|unsure|consider\w*|hmm|perhaps|could|may|"
+                           r"probably|possibly|likely|guess|wonder\w*|tbd|for now|sort of|kind of|lean\w*|seems?|"
+                           r"i'?d|rather)\b|n't\b", re.I)
 FOLD_RETRACT = re.compile(r"\b(?:never ?mind|scratch that|actually|hold on|belay|forget (?:it|that)|on second thought)\b", re.I)
 PRIORITY_RANK ={"immediate": 4, "urgent": 3, "high": 2, "medium": 1, "low": 0, "none": 0}
 PENDING_NOTE = re.compile(r"(?m)^[ \t]*PENDING_REAL_TEST[ \t]+([A-Za-z0-9][A-Za-z0-9._-]{0,40})[ \t]*:")
@@ -233,7 +240,7 @@ def check_override(note: str, resolver=None, number=None, turn_text=None, slug="
         if FOLD_NEGATION.search(sentence) or "?" in sentence:
             return False, "the user's sentence holding the excerpt refuses, defers, conditions or questions the fold"
     for later in every[max(holding) + 1:]:  # the latest word decides: a later retraction voids the instruction
-        if FOLD_NEGATION.search(later) or FOLD_RETRACT.search(later):
+        if FOLD_REFUSE.search(later) or FOLD_RETRACT.search(later):
             return False, "a later sentence of the user's turn refuses, defers or retracts the fold"
     return True, ""
 

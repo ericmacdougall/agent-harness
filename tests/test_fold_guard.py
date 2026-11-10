@@ -251,6 +251,27 @@ class FoldCase(unittest.TestCase):
                     mock.patch.object(fold_guard, "_turn_text", lambda s, t=turn: t):
                 self.assertEqual(self.wont_fix(note)[0], 2)
 
+    def test_unrelated_later_sentences_do_not_void_a_legitimate_fold_but_hedges_in_the_fold_sentence_do(self):
+        # red-team ad4294 E1 and E2
+        self.src["priority"] = "immediate"
+        good = {"ok": True, "kind": "user", "weak": False}
+        legit = [("Close #14518.", "Close #14518. Next, please look at the queue."),
+                 ("fold #14518 into #15565", "Please fold #14518 into #15565. You should post the comment on the umbrella."),
+                 ("close #14518", "close #14518, it is a duplicate. I think we covered it in #15565."),
+                 ("Close #14518 as a duplicate.", "Close #14518 as a duplicate. Consider the umbrella the source of truth."),
+                 ("Drop #14518.", "Drop #14518. I should have said so earlier.")]
+        for excerpt, turn in legit:
+            note = "x\nFold-Override: user:%s/%s \"%s\"" % (uuid.uuid4(), uuid.uuid4(), excerpt)
+            with self.subTest(turn=turn), mock.patch("provenance.resolve", lambda s, *a, **k: good), \
+                    mock.patch.object(fold_guard, "_turn_text", lambda s, t=turn: t):
+                self.assertEqual(self.wont_fix(note), (0, ""), turn)
+        for hedge in ("probably close #14518", "we could close #14518", "you may close #14518", "close #14518, i guess",
+                      "I wonder whether to close #14518", "close #14518 for now", "close #14518 tbd", "close #14518 sort of"):
+            note = "x\nFold-Override: user:%s/%s \"%s\"" % (uuid.uuid4(), uuid.uuid4(), hedge)
+            with self.subTest(hedge=hedge), mock.patch("provenance.resolve", lambda s, *a, **k: good), \
+                    mock.patch.object(fold_guard, "_turn_text", lambda s, t=hedge: t):
+                self.assertEqual(self.wont_fix(note)[0], 2, hedge)
+
     def test_an_unreadable_turn_fails_closed(self):
         self.src["priority"] = "immediate"
         good = {"ok": True, "kind": "user", "weak": False}
