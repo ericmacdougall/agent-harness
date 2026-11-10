@@ -51,5 +51,17 @@
     "vm",
     "server",
     "branch"
+  ],
+  "term_narrowing": [
+    "rather than",
+    "without",
+    "no",
+    "skipped",
+    "instead of",
+    "main",
+    "single",
+    "shared",
+    "just",
+    "limited"
   ]
 }

@@ -232,10 +232,19 @@ def main():
     try:  # GoodQA #15565: a checkpoint or handoff that narrows a target the user stated needs an ASSUMPTION label
         import target_ledger
         policy = target_ledger.load_policy()
-        users_own = bool(args.source and target_ledger.USER_SOURCE.match(args.source))  # the user's words are not narrowing
+        users_own = False
+        if args.source and target_ledger.USER_SOURCE.match(args.source):
+            try:  # exempt only a source that RESOLVES to the user's own turn, never one that merely looks like it (review F4)
+                import provenance
+                resolved = provenance.resolve(args.source)
+                users_own = bool(resolved.get('ok')) and resolved.get('kind') in ('user', 'answer', 'queue') \
+                    and not resolved.get('weak')
+            except Exception:  # noqa: BLE001 - an unresolvable source is not the user's word
+                users_own = False
         if policy.get('mode') != 'off' and args.event in target_ledger.CHECKED_EVENTS and not args.by and not users_own:
             ledger = target_ledger.ledger_from_wal(path.parent / 'main.jsonl', policy.get('terms') or [], policy.get('nouns') or [])
-            found = target_ledger.check_text(note, ledger, policy.get('narrowing') or [], bool(policy.get('require_ask')))
+            found = target_ledger.check_text(note, ledger, policy.get('narrowing') or [], bool(policy.get('require_ask')),
+                                           policy.get('term_narrowing') or [])
             if found:
                 text = target_ledger.advice(found, bool(policy.get('require_ask')))
                 if policy.get('mode') == 'enforce':
@@ -245,8 +254,8 @@ def main():
                     return 2
                 warnings.append(text[:300])
                 record['target_flags'] = len(found)
-    except ImportError:
-        pass  # a partial install without the ledger module: the note is still written
+    except Exception:  # noqa: BLE001 - a missing module, a bad policy or a hostile log must never stop a note being written
+        pass
     append(path, record)
     for warning in warnings:
         print('wal_note: provenance warning: ' + warning, file=sys.stderr)
