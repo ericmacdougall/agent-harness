@@ -113,6 +113,19 @@ GRAPHQL_MERGE = re.compile(r"mergePullRequest|enablePullRequestAutoMerge|enqueue
 REST_MERGE = re.compile(r"(?:repos/([^/\s'\"]+)/([^/\s'\"]+)/)?pulls/(\d+)/merge\b")
 CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 SHA = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+REPO_NAME = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def repo_key(value):
+    """The comparable identity of a GitHub owner/repo, or None. GitHub names are ASCII and case-insensitive
+    (GoodQA #15565), so only A-Z fold; str.lower()/casefold() would map KELVIN SIGN to 'k' or SHARP S to 'ss'
+    and let a different name compare equal, so any non-ASCII or malformed value has no identity at all."""
+    if not isinstance(value, str) or not REPO_NAME.fullmatch(value):
+        return None
+    return value.translate(ASCII_LOWER)
+
+
 VALUE_FLAGS = {"-R", "--repo", "--match-head-commit", "-b", "--body", "-F", "--body-file", "-t", "--subject",
                "-A", "--author-email", "-X", "--method", "-H", "--header", "-f", "--raw-field", "--field", "-q",
                "--jq", "--input", "--hostname", "--cache", "-p", "--preview", "--template"}
@@ -1360,7 +1373,9 @@ def evaluate_pr(client, slug, number, target=None):
     if not m:
         raise GateError("the pull request URL is unreadable")
     real_slug, real_number = m.group(1) + "/" + m.group(2), int(m.group(3))
-    if slug and slug.lower() != real_slug.lower():
+    if repo_key(real_slug) is None:
+        raise GateError("the pull request repository name is unreadable")
+    if slug and repo_key(slug) != repo_key(real_slug):
         raise GateError("the pull request belongs to " + clean(real_slug) + ", not " + clean(slug))
     if number and int(number) != real_number:
         raise GateError("the pull request number differs from the target")
@@ -1582,7 +1597,8 @@ def _active(records, repo, pr, head, now, review_ok=True):
     for r in records:
         if not review_ok and r.get("approval_source") == "settled-review":
             continue  # #134 red-team P1/B1: a review authorization never passes a failing, pending or missing check
-        if (r.get("event") == "waive" and r.get("id") not in used and str(r.get("repo", "")).lower() == repo.lower()
+        if (r.get("event") == "waive" and r.get("id") not in used and repo_key(repo) is not None
+                and repo_key(r.get("repo")) == repo_key(repo)
                 and r.get("pr") == pr and r.get("head") == head and now < float(r.get("ts", 0)) + WAIVER_TTL_SECONDS):
             return r
     return None
@@ -1860,8 +1876,17 @@ def _stamp_waive(command, payload, state_dir, now):
 def _stamp_review(command, payload, now):
     """B2: the peer_review run that may mint a merge authorization gets a one-shot stamp, only from proven main."""
     import caller_identity  # noqa: PLC0415
-    if not caller_identity.is_main(payload) or not _plain_peer_review(command):
+    if not _plain_peer_review(command):
         return
+    if not caller_identity.is_main(payload):
+        # This role is scoped to the review receipt. Generic main authority
+        # still controls waivers, protected Stop, and owner handoffs.
+        try:
+            from native_main import is_desktop_review_root  # noqa: PLC0415
+            if is_desktop_review_root(payload) is not True:
+                return
+        except Exception:
+            return
     tokens, _ = tokenize(command)
     values = {}
     for index, token in enumerate(tokens):

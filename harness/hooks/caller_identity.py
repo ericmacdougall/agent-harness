@@ -1,7 +1,8 @@
 """Who is calling a hook, and one-shot stamps that only the main agent's hook writes (goodqa#15253).
 
-A payload without agent_id does not prove that main is calling: Codex hook payloads never carry agent_id
-(#134 red-team B7). is_main() needs positive evidence instead. The payload has no agent_id and no agent_type, its
+A payload without agent_id does not prove that main is calling (#134 red-team B7).
+Native runtime evidence or ambiguous native context denies legacy Claude-main
+fallback; OpenAI origin does not authenticate a thread or role. Otherwise the payload has no agent_id and no agent_type, its
 session_id is a Claude session id, and its transcript_path is the regular file
 <claude home>/projects/<project>/<session_id>.jsonl. A sub-agent transcript is under .../<session_id>/subagents/,
 and a Codex rollout is under ~/.codex, so neither qualifies.
@@ -23,6 +24,8 @@ import time
 import uuid
 from pathlib import Path
 
+from native_context import native_deny_reason
+
 SESSION_ID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 STAMP_TTL_SECONDS = 600
 STAMP_DIR = "main-stamps"
@@ -38,6 +41,8 @@ def claude_home(home=None) -> Path:
 def is_main(payload, claude_dir=None) -> bool:
     """True only for a Claude Code main-agent payload, proven by its own transcript path (see module doc)."""
     if not isinstance(payload, dict) or payload.get("agent_id") or payload.get("agent_type"):
+        return False
+    if native_deny_reason(payload):
         return False
     session, path = payload.get("session_id"), payload.get("transcript_path")
     if not isinstance(session, str) or not SESSION_ID.match(session) or not isinstance(path, str) or "\x00" in path:

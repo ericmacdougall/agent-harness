@@ -32,11 +32,13 @@ AGENTS = ('harness_owner.toml', 'harness_reviewer.toml', 'harness_red_team.toml'
 SKILL_FILES = ('SKILL.md', 'references/owner-workflow.md',
                'references/testing-and-evals.md', 'references/delivery.md')
 DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report_file.py',
-                    'usage_guard.py', 'publish_feature.py', 'integrate_local.py', 'deliver.py',
+                    'usage_guard.py', 'publish_feature.py', 'integrate_local.py', 'node_check_reporter.mjs', 'deliver.py',
                     'ticket_adapters.py', 'commit_policy.py', 'commit_policy.json',
                     # Spec flow commands work by hand in Codex; its done hook is Claude Code only.
                     'spec_flow.py', 'spec_policy.json', 'spec_template.md', 'provenance.py', 'provenance_policy.json',
                     'provenance_hooks.py', 'safe_input.py', 'caller_identity.py', 'domain_gates.py', 'domain_checklists.json',
+                    'native_context.py', 'native_user_source.py', 'native_admission.py', 'native_main.py',
+                    'wal_note.py',  # ah task/ticket writes and doctor import this helper.
                     'commit_policy.local.json.example', 'spec_policy.local.json.example',
                     'model_tiers.py', 'model_tiers.json', 'escalation.py', 'tier_gate.py',
                     # Destructive and config-dump command guard (GoodQA #14471): launcher plus analyser.

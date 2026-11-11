@@ -53,6 +53,11 @@ MAX_PID = 4194304
 GUARDED_TOOLS = {'bash', 'powershell', 'shell', 'local_shell', 'exec_command', 'unified_exec', 'write_stdin',
                  'container.exec'}
 COMMAND_KEYS = ('command', 'cmd', 'script', 'chars', 'input')
+# File-edit tools write text and run nothing; the shell tool that later runs the file is judged then (GoodQA #15565).
+# Codex apply_patch carries the patch body in tool_input.command. Same set as merge_gate.WRITE_TOOLS and the tools
+# commit_policy.shell_like excludes; kept local so the launcher imports nothing extra. Exact casefolded match only:
+# write_stdin types into a running shell and stays guarded.
+EDIT_TOOLS = frozenset({'apply_patch', 'write', 'edit', 'multiedit', 'notebookedit'})
 PROTECTED_COMM = {'claude', 'codex', 'sshd', 'launchd', 'systemd', 'init', 'tmux', 'screen', 'netwatch', 'login',
                   'terminal', 'iterm2', 'alacritty', 'kitty', 'wezterm', 'gnome-terminal', 'sudo'}
 SHELL_COMM = {'zsh', 'bash', 'sh', 'fish', 'dash', 'ksh', 'tcsh', 'csh'}  # protected when interactive
@@ -1813,6 +1818,11 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
 
 # --------------------------------------------------------------------------- hook entry points
 
+def is_edit_tool(payload):
+    """True for a file-edit tool (EDIT_TOOLS, exact name after casefold); a missing name is not one."""
+    return str(payload.get('tool_name') or payload.get('toolName') or '').casefold() in EDIT_TOOLS
+
+
 def guarded_text(raw):
     """(is_shell_tool, command text) for a PreToolUse payload; unparsable input counts as guarded."""
     try:
@@ -1821,6 +1831,8 @@ def guarded_text(raw):
         return True, raw
     if not isinstance(payload, dict):
         return True, raw
+    if is_edit_tool(payload):  # file text is not a command, even under a `command` key
+        return False, ''
     tool = str(payload.get('tool_name') or payload.get('toolName') or '').casefold()
     tool_input = payload.get('tool_input') or payload.get('toolInput') or {}
     has_command = isinstance(tool_input, dict) and any(k in tool_input for k in COMMAND_KEYS[:3])
@@ -1868,6 +1880,8 @@ def analyze_main(data=None):
             if fallback_blocks(raw):
                 return emit('block', block_message('unparsable-payload', 'the hook payload is not valid JSON and '
                                                    'mentions a kill verb or indirection'))
+            return 0
+        if isinstance(payload, dict) and is_edit_tool(payload):  # writing a file runs nothing (GoodQA #15565)
             return 0
         cg = _import_base()
         command, ps = cg.extract_command(payload)
