@@ -125,6 +125,41 @@ class StampBinding(Base):
                 self.assertEqual(self.stamps(), [])
                 self.assertEqual(self.record()[0], 3)
 
+    def test_no_stamp_is_left_behind_by_a_command_the_cli_would_refuse(self):
+        # red-team m-1: the CLI exits before it takes the stamp when a required option is missing or malformed.
+        no_reason = ("python3 ~/.claude/hooks/merge_gate.py waive --repo o/r --pr 5 --head " + HEAD +
+                     " --ticket 'GoodQA #14502'")
+        upper = PLAIN.replace(HEAD, HEAD.upper())
+        short = PLAIN.replace(HEAD, HEAD[:20])
+        not_digit = PLAIN.replace("--pr 5", "--pr five")
+        for label, command in (("no reason", no_reason), ("uppercase head", upper), ("short head", short),
+                               ("pr not a number", not_digit)):
+            with self.subTest(label):
+                self.decide_as(command, main=True)
+                self.assertEqual(self.stamps(), [])
+
+    def test_the_documented_isolated_python_form_mints(self):
+        for command in (PLAIN.replace("python3 ", "python3 -I ", 1), PLAIN.replace("python3 ", "python3 -I -B ", 1),
+                        PLAIN.replace("python3 ", "python3.12 ", 1)):
+            with self.subTest(command=command[:40]):
+                self.decide_as(command, main=True)
+                self.assertEqual(len(self.stamps()), 1)
+                self.record()
+
+    def test_other_programs_subcommands_and_unbalanced_quotes_mint_nothing(self):
+        for command in (PLAIN.replace("merge_gate.py", "other.py"),
+                        # the program is not merge_gate.py although the words merge_gate and waive follow each other
+                        PLAIN.replace("~/.claude/hooks/merge_gate.py waive", "/tmp/x.py merge_gate waive"),
+                        PLAIN.replace("~/.claude/hooks/merge_gate.py waive", "/tmp/x.py waive") + " merge_gate waive",
+                        # an option before the subcommand is not the documented one-command form
+                        PLAIN.replace("merge_gate.py waive", "merge_gate.py --state-dir /tmp/s waive"),
+                        PLAIN.replace("merge_gate.py waive", "merge_gate.py report waive"),
+                        PLAIN + " 'unbalanced",
+                        PLAIN.replace("python3 ", "node ", 1)):
+            with self.subTest(command=command[:50]):
+                self.decide_as(command, main=True)
+                self.assertEqual(self.stamps(), [])
+
     def test_an_error_while_deciding_main_is_not_proof(self):
         with mock.patch.object(caller_identity, "is_main", side_effect=RuntimeError("boom")):
             code, text = mg.decide(bash(PLAIN), FakeGh(SCENARIOS["green"]), self.state)

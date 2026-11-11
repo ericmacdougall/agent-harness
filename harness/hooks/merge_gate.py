@@ -1899,10 +1899,12 @@ def _plain_waive(command):
 def _stamp_waive(command, payload, state_dir, now):
     tokens, _ = tokenize(command)
     values = {}
-    for name in ("--repo", "--pr", "--head", "--ticket"):
+    # Every option the CLI requires must be present and well formed, or the CLI would exit before it takes the stamp
+    # and a live stamp would be left behind for any later caller with the same arguments (red-team m-1).
+    for name in ("--repo", "--pr", "--head", "--ticket", "--reason"):
         if name in tokens and tokens.index(name) + 1 < len(tokens):
             values[name] = tokens[tokens.index(name) + 1]
-    if len(values) == 4 and values["--pr"].isdigit():
+    if len(values) == 5 and values["--pr"].isdigit() and re.match(r"^[0-9a-f]{40}", values["--head"]):
         session = clean(payload.get("session_id") or "unknown", 40)
         put_stamp(state_dir, stamp_key(values["--repo"], int(values["--pr"]), values["--head"], values["--ticket"]),
                   "main:session-" + re.sub(r"[^A-Za-z0-9_.-]", "", session) + "(hook)", now)
