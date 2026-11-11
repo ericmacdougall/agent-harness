@@ -1896,18 +1896,39 @@ def _plain_waive(command):
     return len(rest) >= 2 and os.path.basename(rest[0]) == "merge_gate.py" and rest[1] == "waive"
 
 
+_HEAD = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+
+
 def _stamp_waive(command, payload, state_dir, now):
-    tokens, _ = tokenize(command)
-    values = {}
-    # Every option the CLI requires must be present and well formed, or the CLI would exit before it takes the stamp
-    # and a live stamp would be left behind for any later caller with the same arguments (red-team m-1).
-    for name in ("--repo", "--pr", "--head", "--ticket", "--reason"):
-        if name in tokens and tokens.index(name) + 1 < len(tokens):
-            values[name] = tokens[tokens.index(name) + 1]
-    if len(values) == 5 and values["--pr"].isdigit() and re.match(r"^[0-9a-f]{40}", values["--head"]):
-        session = clean(payload.get("session_id") or "unknown", 40)
-        put_stamp(state_dir, stamp_key(values["--repo"], int(values["--pr"]), values["--head"], values["--ticket"]),
-                  "main:session-" + re.sub(r"[^A-Za-z0-9_.-]", "", session) + "(hook)", now)
+    """Mint the stamp only when the strict CLI parser accepts the command and reads it unambiguously: no repeated or
+    abbreviated option, no `--state-dir` other than the hook's own, and values `add_waiver` would accept. Anything the
+    CLI would read differently or refuse leaves no live stamp behind (red-team m-1, F1, F2)."""
+    try:
+        rest = shlex.split(command, comments=False)[1:]
+        while rest and rest[0] in ("-I", "-u", "-B", "-E", "-s"):
+            rest = rest[1:]
+        rest = rest[2:]  # skip merge_gate.py and the subcommand
+        names = [t.split("=", 1)[0] for t in rest if t.startswith("--")]
+        if len(names) != len(set(names)):
+            return
+        args = _build_parser(strict=True).parse_args(["waive"] + rest)
+        raw_pr = next((rest[i + 1] for i, t in enumerate(rest[:-1]) if t == "--pr"), None)
+        raw_pr = raw_pr if raw_pr is not None else next((t[5:] for t in rest if t.startswith("--pr=")), "")
+        if not (raw_pr.isascii() and raw_pr.isdigit()):  # int() also takes spaces, signs, underscores, other scripts
+            return
+        if args.state_dir is not None and Path(args.state_dir).resolve() != Path(state_dir).resolve():
+            return
+        if not (isinstance(args.pr, int) and args.pr > 0 and _HEAD.fullmatch(args.head or "")):
+            return
+        if not re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", args.repo) or \
+                not re.match(r"^GoodQA (?:[\w-]+)?#\d+$", args.ticket) or not (10 <= len(args.reason) <= 500) or \
+                CTRL.search(args.reason):
+            return
+    except (_ParseRefused, ValueError, OSError):
+        return
+    session = clean(payload.get("session_id") or "unknown", 40)
+    put_stamp(state_dir, stamp_key(args.repo, args.pr, args.head, args.ticket),
+              "main:session-" + re.sub(r"[^A-Za-z0-9_.-]", "", session) + "(hook)", now)
 
 
 def _stamp_review(command, payload, now):
@@ -1916,8 +1937,9 @@ def _stamp_review(command, payload, now):
     if not _plain_peer_review(command):
         return
     if not caller_identity.is_main(payload):
-        # This role is scoped to the review receipt. Generic main authority
-        # still controls waivers, protected Stop, and owner handoffs.
+        # A Codex Desktop root is accepted here for the review receipt and, by the user's decision (answer
+        # b6714826, goodqa#15565), for recording merge waivers (_may_record_waiver). Generic main authority still
+        # controls protected Stop and owner handoffs.
         try:
             from native_main import is_desktop_review_root  # noqa: PLC0415
             if is_desktop_review_root(payload) is not True:
@@ -2018,12 +2040,28 @@ def _fault(error, text, stderr):
 
 # ---------------------------------------------------------------------------------------------------- cli
 
-def main(argv=None, runner=None, stdin=None, stdout=None, stderr=None):
-    stdout, stderr = stdout or sys.stdout, stderr or sys.stderr
-    parser = argparse.ArgumentParser(description="PR merge gate: hook, check, waive, report.")
-    sub = parser.add_subparsers(dest="command", required=True)
+class _ParseRefused(Exception):
+    """A strict parse refused the arguments (the hook minting a stamp must refuse what the CLI would)."""
+
+
+class _Parser(argparse.ArgumentParser):
+    strict = False
+
+    def error(self, message):
+        if self.strict:
+            raise _ParseRefused(message)
+        super().error(message)
+
+
+def _build_parser(strict=False):
+    """The CLI's own parser. The hook parses a candidate command with the same one (strict, no abbreviations) so a
+    stamp is minted only for arguments the CLI reads identically (red-team F1)."""
+    parser = _Parser(description="PR merge gate: hook, check, waive, report.", allow_abbrev=not strict)
+    parser.strict = strict
+    sub = parser.add_subparsers(dest="command", required=True, parser_class=_Parser)
     for name in ("hook", "report", "check", "waive"):
-        p = sub.add_parser(name)
+        p = sub.add_parser(name, allow_abbrev=not strict)
+        p.strict = strict
         p.add_argument("--state-dir", default=None)
         if name in ("check", "waive"):
             p.add_argument("--repo", required=True)
@@ -2033,6 +2071,12 @@ def main(argv=None, runner=None, stdin=None, stdout=None, stderr=None):
             p.add_argument("--ticket", required=True)
             p.add_argument("--reason", required=True)
             p.add_argument("--approved-by", default=None)
+    return parser
+
+
+def main(argv=None, runner=None, stdin=None, stdout=None, stderr=None):
+    stdout, stderr = stdout or sys.stdout, stderr or sys.stderr
+    parser = _build_parser()
     try:
         args = parser.parse_args(argv)
     except SystemExit as error:
@@ -2050,7 +2094,7 @@ def main(argv=None, runner=None, stdin=None, stdout=None, stderr=None):
         stdout.write(("merge-gate: all checks green on " + str(info.get("head")) + "\n") if allowed else text + "\n")
         return 0 if allowed else 2
     approved, source = args.approved_by, "asserted"
-    if re.match(r"^[0-9a-f]{40}", args.head or ""):
+    if _HEAD.fullmatch(args.head or ""):
         stamped = take_stamp(state_dir, stamp_key(args.repo, args.pr, args.head, args.ticket))
         if stamped:
             approved, source = stamped, "hook"

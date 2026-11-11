@@ -138,6 +138,55 @@ class StampBinding(Base):
                 self.decide_as(command, main=True)
                 self.assertEqual(self.stamps(), [])
 
+    def test_the_hook_and_the_cli_read_the_arguments_identically_or_nothing_is_minted(self):
+        # red-team r3 F1: each of these made the old hook stamp one key while argparse used another.
+        other_head = "b" * 40
+        other_state = tempfile.mkdtemp()
+        cases = {
+            "state-dir after the subcommand": PLAIN.replace("waive ", "waive --state-dir " + other_state + " ", 1),
+            "state-dir equals form": PLAIN.replace("waive ", "waive --state-dir=" + other_state + " ", 1),
+            "repeated repo": PLAIN + " --repo x/y",
+            "repeated head": PLAIN + " --head " + other_head,
+            "equals form overrides head": PLAIN + " --head=" + other_head,
+            "equals form overrides ticket": PLAIN + " --ticket='GoodQA #1'",
+            "abbreviated option": PLAIN.replace("--reason", "--reas"),
+            "pr with a plus sign and a space": PLAIN.replace("--pr 5", "--pr ' +5'"),
+            "unicode digit pr": PLAIN.replace("--pr 5", "--pr ٥"),
+            "superscript pr": PLAIN.replace("--pr 5", "--pr ²"),
+            "head with a trailing newline": PLAIN.replace("--head " + HEAD, "--head '" + HEAD + "\n'"),
+            "head longer than 40 and not 64": PLAIN.replace(HEAD, HEAD + "ab"),
+            "extra unknown option": PLAIN + " --force",
+        }
+        for label, command in cases.items():
+            with self.subTest(label):
+                for leftover in self.state.rglob("*.json"):
+                    leftover.unlink()
+                self.decide_as(command, main=True)
+                self.assertEqual(self.stamps(), [])
+
+    def test_a_state_dir_equal_to_the_hooks_own_still_mints(self):
+        command = PLAIN.replace("waive ", "waive --state-dir " + str(self.state) + " ", 1)
+        self.decide_as(command, main=True)
+        self.assertEqual(len(self.stamps()), 1)
+        self.assertEqual(self.record()[0], 0)
+
+    def test_a_sixty_four_hex_head_still_mints(self):
+        long_head = "a" * 64
+        self.decide_as(PLAIN.replace(HEAD, long_head), main=True)
+        self.assertEqual(len(self.stamps()), 1)
+
+    def test_a_codex_child_payload_is_refused_by_the_real_root_check(self):
+        # red-team r3 F4: nothing mocked except main (false): a Codex child payload through the real
+        # native_main.is_desktop_review_root must not be proof.
+        child = bash(PLAIN, session_id="01a1c3fd-aaaa-bbbb-cccc-000000000000", parent_thread_id="01a1c3fd-0000-0000-0000-000000000001",
+                     agent_type="worker")
+        self.assertIs(native_main.is_desktop_review_root(child), False)
+        self.assertFalse(mg._may_record_waiver(child))
+        with mock.patch.object(caller_identity, "is_main", return_value=False):
+            code, text = mg.decide(child, FakeGh(SCENARIOS["green"]), self.state)
+        self.assertEqual(code, 2, text)
+        self.assertEqual(self.stamps(), [])
+
     def test_the_documented_isolated_python_form_mints(self):
         for command in (PLAIN.replace("python3 ", "python3 -I ", 1), PLAIN.replace("python3 ", "python3 -I -B ", 1),
                         PLAIN.replace("python3 ", "python3.12 ", 1)):
