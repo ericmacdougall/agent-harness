@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Merge a reviewed feature commit into the original clean checkout, with checks."""
 
+from __future__ import annotations
+
 import argparse
 import fcntl
 import hashlib
@@ -17,8 +19,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
+from typing import NamedTuple
 
+from github_identity import github_repository
 from git_safety import _bounded_git, git_environment, require_safe_source
 from process import cleanup_discarded, run as run_process
 
@@ -184,6 +189,160 @@ CHECK_TAIL_CHARS = 2000
 
 class CheckInterpreterError(OSError):
     """A check would use an absent, unsupported or indirect interpreter/protocol."""
+
+
+SCOPED_HARNESS_ROOT = Path('/home/eric/delivery/goodqa-01a1c402/bugtracker-harness')
+SCOPED_HARNESS_REPOSITORY = 'ericmacdougall/bugtracker-harness'
+SCOPED_HOME = '/home/eric'
+SCOPED_TOOLS = {
+    'python3': (Path('/usr/bin/python3'), Path('/usr/bin/python3.12')),
+    'go': (Path('/usr/bin/go'), Path('/usr/lib/go-1.22/bin/go')),
+}
+SCOPED_TOOL_UID = 0
+SCOPED_HARNESS_SOURCE = '2887dfc46abb2864fc8260f92c53e4e3c91c2bd7'
+SCOPED_HARNESS_TREE = '07401ce8a4c52e6fc573b53737ae29c1c7c494d6'
+SCOPED_HARNESS_CURRENT = '9d412e9ea0342d5956140f6440a2e31f51a72710'
+SCOPED_HARNESS_TREES = {
+    SCOPED_HARNESS_SOURCE: SCOPED_HARNESS_TREE,
+    SCOPED_HARNESS_CURRENT: '40763106dc61b4b210ee37b88e80703e950f7351',
+}
+SCOPED_DESKTOP = ('npm', 'run', 'test:release', '--', '--only=desktop')
+SCOPED_DESKTOP_HOLD = 'Desktop delivery check requires a qualified same-run per-file result carrier'
+SCOPED_UNITTEST = tuple(
+    ('python3', '-m', 'unittest', 'discover', '-s', directory, '-p', name)
+    for directory, name in (
+        ('bin', 'test_release_bootstrap.py'),
+        ('lanes/qac-pool-runner', 'test_release_authority_boundaries.py'),
+        ('lanes/qac-pool-runner', 'test_release_bindings.py'),
+    )
+)
+SCOPED_PYTEST = ('python3', '-m', 'pytest', '-q', 'bin/test_goodqa_bugs_release.py')
+_GO_RELEASE = 'harness/framework/cmd/harness-release'
+_GO_GUARD = 'harness/framework/internal/testguard'
+_GO_BINDING = 'TestProductionTransportSelectorStopsBeforePython'
+_GO_TRIAGE = 'TestTriageDryRunRequiresExactAggregateOutcome'
+_GO_LISTENER = 'TestHeldQualificationListenerIsBoundLoopbackAndNoLease'
+_GO_CLASSIFIER = 'TestOwnedTriageUnitTextUsesClosedClassifier'
+_GO_TESTS = {
+    _GO_RELEASE: frozenset((_GO_BINDING, _GO_BINDING + '/approved', _GO_BINDING + '/changed-target', _GO_TRIAGE)),
+    _GO_GUARD: frozenset((_GO_LISTENER,)),
+}
+SCOPED_GO = ('go', '-C', 'framework', 'test', '-mod=readonly', '-count=1', '-json', '-run',
+             f'^({_GO_BINDING}|{_GO_TRIAGE}|{_GO_LISTENER})$', './cmd/harness-release', './internal/testguard')
+SCOPED_GO_CURRENT = (*SCOPED_GO[:8], f'^({_GO_BINDING}|{_GO_TRIAGE}|{_GO_LISTENER}|{_GO_CLASSIFIER})$',
+                     *SCOPED_GO[9:])
+SCOPED_GO_SOURCES = {SCOPED_GO: SCOPED_HARNESS_SOURCE, SCOPED_GO_CURRENT: SCOPED_HARNESS_CURRENT}
+SCOPED_HARNESS = frozenset((*SCOPED_UNITTEST, SCOPED_PYTEST, *SCOPED_GO_SOURCES))
+
+
+def scoped_environment(command, environment):
+    if tuple(command) not in SCOPED_HARNESS:
+        raise CheckInterpreterError('Unknown scoped delivery profile')
+    forbidden = {'LANE_ROOT', 'QAC_API', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT', 'BASH_ENV', 'ENV'}
+    prefixes = ('QAC_BINDING', 'DYLD_', 'PYTHON', 'PYTEST_', 'GIT_')
+    if tuple(command) in SCOPED_GO_SOURCES:
+        forbidden.update({'CC', 'CXX', 'AR', 'PKG_CONFIG', 'GOFLAGS', 'GOTOOLCHAIN', 'GOWORK', 'GOENV',
+                          'GOROOT', 'GOPATH', 'GOCACHE', 'GOMODCACHE', 'GOPROXY', 'GOSUMDB',
+                          'GOPRIVATE', 'GONOPROXY', 'GONOSUMDB', 'GOINSECURE', 'GOEXPERIMENT',
+                          'GOOS', 'GOARCH', 'GODEBUG', 'GOTMPDIR'})
+        prefixes += ('CGO_',)
+    if any(key in forbidden or key.startswith(prefixes) for key in environment):
+        raise CheckInterpreterError('Scoped delivery check environment contains an unsupported override')
+    if environment.get('HOME') != SCOPED_HOME:
+        raise CheckInterpreterError('Scoped delivery check environment is outside the approved account')
+    # Keep the child independent of caller secrets and test selectors. Repository
+    # fixture code remains trusted, as it is for other delivery checks.
+    child = {key: environment[key] for key in ('HOME', 'LANG', 'LC_ALL') if key in environment}
+    child['PATH'] = '/usr/bin:/bin'
+    if tuple(command) in SCOPED_GO_SOURCES:
+        child.update(GOTOOLCHAIN='local', GOWORK='off', GOENV='off', GOPROXY='off', GOSUMDB='off', CGO_ENABLED='0')
+    else:
+        child.update(PYTHONDONTWRITEBYTECODE='1', PYTHONNOUSERSITE='1', PYTEST_DISABLE_PLUGIN_AUTOLOAD='1')
+    return child
+
+
+def _unique_json_record(pairs):
+    values = {}
+    for key, value in pairs:
+        if key in values:
+            raise ValueError('duplicate JSON field')
+        values[key] = value
+    return values
+
+
+class ScopedGoEvidence:
+    """Require exact package and test lifetimes, including binding subtests."""
+
+    def __init__(self, command=SCOPED_GO):
+        self.pending = bytearray()
+        self.bytes_seen = 0
+        self.invalid = False
+        self.packages = {}
+        self.tests = {}
+        self.expected = dict(_GO_TESTS)
+        if command == SCOPED_GO_CURRENT:
+            self.expected[_GO_RELEASE] |= {
+                _GO_CLASSIFIER,
+                _GO_CLASSIFIER + '/qac-held-release-15648-triage-owned-unit-classifier.service',
+                _GO_CLASSIFIER + '/qac-held-release-15648-triage-owned-unit-classifier.timer',
+                _GO_CLASSIFIER + '/99-held-release-15648.conf',
+            }
+
+    def __call__(self, chunk):
+        self.bytes_seen += len(chunk)
+        if self.invalid or self.bytes_seen > 2_000_000:
+            self.invalid = True
+            return
+        for part in chunk.splitlines(keepends=True):
+            self.pending.extend(part)
+            if len(self.pending) > 32_768:
+                self.invalid = True
+                return
+            if not part.endswith(b'\n'):
+                continue
+            try:
+                row = json.loads(self.pending, object_pairs_hook=_unique_json_record)
+                self._record(row)
+            except (UnicodeError, ValueError, TypeError, KeyError, RecursionError):
+                self.invalid = True
+                return
+            finally:
+                self.pending.clear()
+
+    def _record(self, row):
+        if not isinstance(row, dict) or set(row) - {'Time', 'Action', 'Package', 'Test', 'Elapsed', 'Output'}:
+            raise ValueError()
+        action, package = row['Action'], row['Package']
+        if package not in self.expected or self.packages.get(package) == 'pass':
+            raise ValueError()
+        if 'Test' not in row:
+            if action == 'start' and package not in self.packages:
+                self.packages[package] = 'start'
+            elif action == 'pass' and self.packages.get(package) == 'start':
+                if any(self.tests.get((package, name)) != 'pass' for name in self.expected[package]):
+                    raise ValueError()
+                self.packages[package] = 'pass'
+            elif action != 'output' or self.packages.get(package) != 'start':
+                raise ValueError()
+            return
+        name = row['Test']
+        key = package, name
+        if self.packages.get(package) != 'start' or name not in self.expected[package]:
+            raise ValueError()
+        if '/' in name and self.tests.get((package, name.split('/')[0])) != 'run':
+            raise ValueError()
+        if action == 'run' and key not in self.tests:
+            self.tests[key] = 'run'
+        elif action == 'pass' and self.tests.get(key) == 'run':
+            if any(self.tests.get((package, child)) != 'pass'
+                   for child in self.expected[package] if child.startswith(name + '/')):
+                raise ValueError()
+            self.tests[key] = 'pass'
+        elif action != 'output' or key not in self.tests:
+            raise ValueError()
+
+    def passed(self):
+        return not self.invalid and not self.pending and self.packages == dict.fromkeys(self.expected, 'pass')
 
 
 NODE_REPORTER_SHA256 = 'ad31d9370a964cf86e0eac698de388c545de1dc166c10d4aa9ac0229608087e8'
@@ -355,6 +514,292 @@ def run_node(repo, command, environment, timeout, sink=None):
     return result
 
 
+class ScopedCheckContext(NamedTuple):
+    original: Path
+    original_identity: tuple
+    common: Path
+    common_identity: tuple
+    checkout: Path
+    checkout_identity: tuple
+    source: str
+    target: str | None
+    journal: Path | None
+
+
+def _scoped_original(repo):
+    try:
+        path = Path(repo).absolute()
+        if (path != SCOPED_HARNESS_ROOT or path.resolve(strict=True) != path
+                or os.geteuid() == 0 or path.stat(follow_symlinks=False).st_uid != os.geteuid()):
+            raise ValueError()
+        root = inspect_git(path, 'rev-parse', '--show-toplevel', timeout=5)
+        if root.returncode or root.stdout.strip() != str(path):
+            raise ValueError()
+        for flags in (('--all',), ('--push', '--all')):
+            remote = inspect_git(path, 'remote', 'get-url', *flags, 'origin', timeout=5)
+            lines = remote.stdout.splitlines()
+            if remote.returncode or len(lines) != 1 or github_repository(lines[0]) != SCOPED_HARNESS_REPOSITORY:
+                raise ValueError()
+        common, info = git_common_directory(path, 5)
+        return path, checkout_identity(path), common, (info.st_dev, info.st_ino)
+    except (OSError, RuntimeError, ValueError, TypeError, subprocess.TimeoutExpired):
+        raise CheckInterpreterError('Scoped check requires the exact approved harness original') from None
+
+
+def _scoped_tree(repo, target, source):
+    try:
+        if not isinstance(target, str) or re.fullmatch(r'[0-9a-f]{40}', target) is None:
+            raise ValueError()
+        result = inspect_git(repo, 'rev-parse', '--verify', target + '^{tree}', timeout=5)
+        if result.returncode or result.stdout.strip() != SCOPED_HARNESS_TREES[source]:
+            raise ValueError()
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        raise CheckInterpreterError('Scoped check target differs from the reviewed harness tree') from None
+
+
+def scoped_check_context(commands, original, source, *, target=None, checkout=None, journal=None):
+    """Bind only the new profiles to the canonical source and worktree."""
+    if any(tuple(command) == SCOPED_DESKTOP for command in commands):
+        raise CheckInterpreterError(SCOPED_DESKTOP_HOLD)
+    if not any(tuple(command) in SCOPED_HARNESS for command in commands):
+        return None
+    if source not in SCOPED_HARNESS_TREES or any(
+            tuple(command) in SCOPED_GO_SOURCES and SCOPED_GO_SOURCES[tuple(command)] != source
+            for command in commands):
+        raise CheckInterpreterError('Scoped check source revision is not qualified')
+    path, identity, common, common_id = _scoped_original(original)
+    if target is not None:
+        _scoped_tree(path, target, source)
+    candidate = Path(checkout) if checkout is not None else path
+    try:
+        context = ScopedCheckContext(path, identity, common, common_id, candidate,
+                                     checkout_identity(candidate), source, target, journal)
+        if candidate != path:
+            _scoped_checkout(candidate, context)
+        return context
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+        raise CheckInterpreterError('Scoped check checkout is not bound to delivery custody') from None
+
+
+def _scoped_checkout(repo, context):
+    if not isinstance(context, ScopedCheckContext) or context.source not in SCOPED_HARNESS_TREES:
+        raise CheckInterpreterError('Scoped check requires a bound delivery context')
+    path = Path(repo).absolute()
+    if (path != context.checkout or path.resolve(strict=True) != path
+            or checkout_identity(path) != context.checkout_identity
+            or _scoped_original(context.original) != (context.original, context.original_identity,
+                                                        context.common, context.common_identity)):
+        raise CheckInterpreterError('Scoped check checkout or original identity changed')
+    if path != context.original:
+        journal_root = context.common / 'agent-harness' / 'delivery-scratch'
+        if (context.journal is None or not context.journal.is_relative_to(journal_root)
+                or context.journal.resolve(strict=True) != context.journal):
+            raise CheckInterpreterError('Scoped scratch check requires its owned journal')
+        record = read_journal(context.journal)
+        common, info = git_common_directory(path, 5)
+        if (common != context.common or (info.st_dev, info.st_ino) != context.common_identity
+                or record.get('original') != str(context.original)
+                or (record.get('original_dev'), record.get('original_ino')) != context.original_identity
+                or record.get('source') != context.source or record.get('scratch') != str(path)
+                or (record.get('scratch_dev'), record.get('scratch_ino')) != context.checkout_identity
+                or record.get('container') != str(path.parent)
+                or checkout_identity(path.parent) != (record.get('container_dev'), record.get('container_ino'))):
+            raise CheckInterpreterError('Scoped scratch check lost its journal binding')
+    else:
+        head = inspect_git(path, 'rev-parse', '--verify', 'HEAD', timeout=5)
+        if context.target is None or head.returncode or head.stdout.strip() != context.target:
+            raise CheckInterpreterError('Scoped original check does not match its pinned target')
+    return path
+
+
+def _scoped_paths(command):
+    if command in SCOPED_GO_SOURCES:
+        return (
+            'framework/go.mod',
+            'framework/cmd/harness-release/production_bindings_test.go',
+            'framework/cmd/harness-release/triage_release_test.go',
+            'framework/internal/testguard/held_listener_linux_test.go',
+        )
+    if command == SCOPED_PYTEST:
+        return command[-1], 'conftest.py', 'pyproject.toml'
+    return (command[5] + '/' + command[7],)
+
+
+def _scoped_file_row(path):
+    info = path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise CheckInterpreterError('Scoped check input is not a single-link regular file')
+    return info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def _scoped_inputs(repo, command, context):
+    try:
+        path = _scoped_checkout(repo, context)
+        require_safe_source(path, git_environment(), timeout=5)
+        for options in (('--cached', '--quiet', SCOPED_HARNESS_TREES[context.source]), ('--quiet',)):
+            if inspect_git(path, 'diff', *options, '--', timeout=5).returncode:
+                raise CheckInterpreterError('Scoped check index or checkout differs from the reviewed tree')
+        head = inspect_git(path, 'rev-parse', '--verify', 'HEAD', timeout=5)
+        if head.returncode or re.fullmatch(r'[0-9a-f]{40}\n', head.stdout) is None:
+            raise CheckInterpreterError('Scoped check HEAD is unverifiable')
+        bindings = {}
+        for relative in _scoped_paths(command):
+            selected = node_file(path, relative)
+            before = _scoped_file_row(selected)
+            result = inspect_git(path, 'ls-files', '--stage', '--', relative, timeout=5)
+            expected = re.fullmatch(r'100(?:644|755) ([0-9a-f]{40}) 0\t' + re.escape(relative) + r'\n', result.stdout)
+            raw = inspect_git(path, 'hash-object', '--no-filters', '--', relative, timeout=5)
+            if (result.returncode or expected is None or raw.returncode or raw.stdout.strip() != expected[1]
+                    or _scoped_file_row(selected) != before or node_file(path, relative) != selected):
+                raise CheckInterpreterError('Scoped check input is untracked or changed')
+            bindings[relative] = before, expected[1]
+        if command in SCOPED_UNITTEST:
+            _unique_discovery_file(path / command[5], command[7])
+        code, extra = _bounded_git(path, ['ls-files', '--others', '--directory', '-z'],
+                                   git_environment(), timeout=5, limit=4096)
+        if code or extra:
+            raise CheckInterpreterError('Scoped check checkout contains untracked or ignored inputs')
+        return head.stdout.strip(), bindings
+    except CheckInterpreterError:
+        raise
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+        raise CheckInterpreterError('Scoped check inputs could not be verified') from None
+
+
+def _unique_discovery_file(root, name):
+    directories, seen = [root], 0
+    while directories:
+        directory = directories.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                seen += 1
+                if seen > 4096:
+                    raise CheckInterpreterError('Scoped unittest discovery tree exceeds its bound')
+                if entry.name == name and directory != root:
+                    raise CheckInterpreterError('Scoped unittest discovery is ambiguous')
+                if entry.is_symlink() and (entry.is_dir() or entry.name == '__init__.py'):
+                    raise CheckInterpreterError('Scoped unittest discovery has an aliased package')
+                if entry.is_dir(follow_symlinks=False) and (Path(entry.path) / '__init__.py').exists():
+                    directories.append(Path(entry.path))
+
+
+def _scoped_tool(command, environment, repo):
+    name = command[0]
+    try:
+        declared, expected = SCOPED_TOOLS[name]
+        tool = declared.resolve(strict=True)
+        if tool != expected or declared.is_relative_to(repo) or tool.is_relative_to(repo):
+            raise ValueError()
+        row = _scoped_file_row(tool)
+        if row[2] & 0o022:
+            raise ValueError()
+        fd = os.open(tool, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, 'rb') as source:
+            opened = os.fstat(source.fileno())
+            if (opened.st_uid != SCOPED_TOOL_UID
+                    or (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_size,
+                 opened.st_mtime_ns, opened.st_ctime_ns) != row
+                    or source.read(4) not in {b'\x7fELF', b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf',
+                                    b'\xce\xfa\xed\xfe', b'\xfe\xed\xfa\xce',
+                                    b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf'}):
+                raise ValueError()
+        if command in SCOPED_GO_SOURCES:
+            if sys.platform != 'linux':
+                raise ValueError()
+            result = run_process([str(tool), 'version'], env=environment, timeout=5)
+            version = re.fullmatch(r'go version go(\d+)\.(\d+)(?:\.\d+)? linux/[a-z0-9]+\n?', result.stdout or '')
+            if result.returncode or version is None or (int(version[1]), int(version[2])) < (1, 22):
+                raise ValueError()
+        else:
+            resolve_check_interpreter(str(tool), environment, timeout=5)
+            if command == SCOPED_PYTEST:
+                probe = 'import importlib.util, sys; sys.exit(importlib.util.find_spec("pytest") is None)'
+                if run_process([str(tool), '-I', '-c', probe], env=environment, timeout=5).returncode:
+                    raise ValueError()
+        if _scoped_file_row(tool) != row or declared.resolve(strict=True) != tool:
+            raise ValueError()
+        return tool, row
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+        raise CheckInterpreterError('Scoped check needs the qualified external test interpreter') from None
+
+
+def scoped_pytest_passed(report, relative):
+    """Consume only an owned, bounded xunit1 report for the selected test file."""
+    try:
+        fd = os.open(report, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, 'rb') as source:
+            before = os.fstat(source.fileno())
+            if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid != os.geteuid()
+                    or not 0 < before.st_size <= 262_144):
+                return False
+            data = source.read(262_145)
+            after = os.fstat(source.fileno())
+        identity = lambda row: (row.st_dev, row.st_ino, row.st_mode, row.st_size, row.st_mtime_ns, row.st_ctime_ns)
+        if len(data) != before.st_size or not (
+                identity(before) == identity(after) == identity(report.stat(follow_symlinks=False))):
+            return False
+        text = data.decode('utf-8')
+        if '<!' in text:
+            return False
+        root = ET.fromstring(text)
+        if root.tag != 'testsuites' or len(root) != 1 or root[0].tag != 'testsuite':
+            return False
+        suite = root[0]
+        cases = suite.findall('testcase')
+        names = [case.get('name', '') for case in cases]
+        return (0 < len(cases) <= 1024 and len(set(names)) == len(names)
+                and len(cases) == len(suite)
+                and suite.get('tests') == str(len(cases))
+                and all(suite.get(key) == '0' for key in ('errors', 'failures', 'skipped'))
+                and all(case.get('file') == relative and name.startswith('test_')
+                        and not any(child.tag not in ('system-out', 'system-err') for child in case)
+                        for case, name in zip(cases, names)))
+    except (OSError, ET.ParseError, ValueError):
+        return False
+
+
+def run_scoped_check(repo, command, context, environment, timeout, sink):
+    if command == SCOPED_DESKTOP:
+        raise CheckInterpreterError(SCOPED_DESKTOP_HOLD)
+    if not isinstance(context, ScopedCheckContext):
+        raise CheckInterpreterError('Scoped check requires a bound delivery context')
+    if type(timeout) is not int or not 1 <= timeout <= 7200:
+        raise CheckInterpreterError('Scoped check requires a finite delivery check timeout')
+    if command in SCOPED_GO_SOURCES and SCOPED_GO_SOURCES[command] != context.source:
+        raise CheckInterpreterError('Scoped Go check does not match the qualified source revision')
+    scoped = scoped_environment(command, environment)
+    before = _scoped_inputs(repo, command, context)
+    tool, tool_row = _scoped_tool(command, scoped, context.original)
+    if tool.is_relative_to(context.checkout):
+        raise CheckInterpreterError('Scoped check interpreter is inside the check checkout')
+    with tempfile.TemporaryDirectory(prefix='scoped-delivery-result-') as directory:
+        report = Path(directory) / 'result.xml'
+        scoped['TMPDIR'] = directory
+        evidence = ScopedGoEvidence(command) if command in SCOPED_GO_SOURCES else None
+        argv = [str(tool), *command[1:]]
+        if evidence is not None:
+            scoped['GOCACHE'] = str(Path(directory) / 'go-cache')
+            scoped['GOMODCACHE'] = str(Path(directory) / 'go-modules')
+        if command in SCOPED_UNITTEST:
+            argv = [str(tool), '-c', NONEMPTY_UNITTEST, *command[3:]]
+        elif command == SCOPED_PYTEST:
+            argv.extend(('-p', 'no:cacheprovider', '-o', 'junit_family=xunit1', '--junitxml', str(report)))
+        result = run_process(argv, cwd=repo, env=scoped, timeout=timeout, discard_output=True,
+                             sink=evidence)
+        valid = (evidence.passed() if evidence is not None else
+                 scoped_pytest_passed(report, command[-1]) if command == SCOPED_PYTEST else True)
+    if _scoped_file_row(tool) != tool_row or _scoped_inputs(repo, command, context) != before:
+        raise CheckInterpreterError('Scoped check changed an input or executable identity')
+    if result.returncode == 0 and not valid:
+        return subprocess.CompletedProcess(command, 1, None, None)
+    if result.returncode == 0 and sink:
+        record = {'kind': 'scoped-check-pass', 'argv': list(command), 'source': context.source,
+                  'tree': SCOPED_HARNESS_TREES[context.source], 'checkout': list(context.checkout_identity),
+                  'head': before[0], 'inputs': {path: row[1] for path, row in before[1].items()}}
+        sink((json.dumps(record, sort_keys=True) + '\n').encode())
+    return result
+
+
 def require_node_protocol(environment, repo=None):
     """Two fixed real controls before effects; a major version is not protocol proof."""
     interpreter = resolve_node(environment, repo)
@@ -498,12 +943,16 @@ class CheckLog:
         return {'check_log': str(self.path), 'check_tail': tail, 'check_log_truncated': self.truncated}
 
 
-def run(repo, command, *, timeout=None, discard_output=False, env=None, sink=None):
+def run(repo, command, *, timeout=None, discard_output=False, env=None, sink=None, scoped_context=None):
     # Python test runners otherwise leave untracked __pycache__ after an aborted merge.
     output_options = {'discard_output': True} if discard_output else {}
     if sink is not None:
         output_options['sink'] = sink
-    environment = {**(os.environ if env is None else env), "PYTHONDONTWRITEBYTECODE": "1"}
+    environment = os.environ if env is None else env
+    typed = tuple(command)
+    if typed == SCOPED_DESKTOP or typed in SCOPED_HARNESS:
+        return run_scoped_check(repo, typed, scoped_context, environment, timeout, sink)
+    environment = {**environment, "PYTHONDONTWRITEBYTECODE": "1"}
     if command and command[0] == 'node':
         return run_node(repo, command, environment, timeout, sink)
     executed = command
@@ -526,7 +975,13 @@ def check_timeout(args):
 def require_check_interpreters(commands, repo=None):
     """Fail before effects when a check's interpreter or Node protocol is unsupported."""
     for command in commands:
-        if command and command[0] in CHECK_PYTHON_NAMES:
+        typed = tuple(command)
+        if typed == SCOPED_DESKTOP:
+            raise CheckInterpreterError(SCOPED_DESKTOP_HOLD)
+        if typed in SCOPED_HARNESS:
+            original, _, _, _ = _scoped_original(repo)
+            _scoped_tool(typed, scoped_environment(typed, os.environ), original)
+        elif command and command[0] in CHECK_PYTHON_NAMES:
             resolve_check_interpreter(command[0])
     if any(command and command[0] == 'node' for command in commands):
         require_node_protocol(dict(os.environ), repo)
@@ -584,6 +1039,8 @@ def focused_unittest(options):
 def approved_check(argv):
     if not argv:
         return False
+    if tuple(argv) == SCOPED_DESKTOP or tuple(argv) in SCOPED_HARNESS:
+        return True
     if argv[0] == 'node':
         return focused_node(argv)
     if argv[0] == "go" and len(argv) >= 2:
@@ -649,6 +1106,8 @@ def main():
         return 2
     try:
         require_check_interpreters(checks, args.repo)
+        if any(tuple(command) in SCOPED_HARNESS for command in checks) and args.resolve_journal:
+            raise CheckInterpreterError('Scoped delivery profiles cannot certify an unrelated recovery baseline')
     except CheckInterpreterError as error:
         report("BLOCKED_POLICY", str(error))
         return 2
@@ -1656,6 +2115,12 @@ def integrate_scratch(args, preparations, checks):
         report('BLOCKED_POLICY', 'Checkout, ref, or journal identity text is invalid')
         return 2
     repo = args.repo.resolve()
+    try:
+        scoped_original = scoped_check_context(checks, repo, args.expected_source_head,
+                                               target=args.expected_source_head)
+    except CheckInterpreterError as error:
+        report('BLOCKED_POLICY', str(error))
+        return 2
     directory = None
     record = None
     phase = 'preflight'
@@ -1762,11 +2227,21 @@ def integrate_scratch(args, preparations, checks):
             return scratch_abort(repo, scratch, directory / 'journal.json',
                                  'Scratch merge tree could not be recorded', phase='merge')
         intended_tree = intended.stdout.strip()
+        scoped_scratch = None
+        if scoped_original is not None:
+            try:
+                if intended_tree != SCOPED_HARNESS_TREES[scoped_original.source]:
+                    raise CheckInterpreterError('Scratch merge differs from the scoped reviewed tree')
+                scoped_scratch = scoped_check_context(checks, repo, args.expected_source_head,
+                                                      checkout=scratch, journal=directory)
+            except CheckInterpreterError as error:
+                return scratch_abort(repo, scratch, directory / 'journal.json', str(error), phase='check')
         for kind, commands in (('prepare', preparations), ('check', checks)):
             for command in commands:
                 phase = kind
                 try:
-                    result = run(scratch, command, timeout=check_timeout(args), discard_output=True)
+                    scoped = {'scoped_context': scoped_scratch} if scoped_scratch is not None else {}
+                    result = run(scratch, command, timeout=check_timeout(args), discard_output=True, **scoped)
                 except (OSError, subprocess.TimeoutExpired) as error:
                     if getattr(error, 'cleanup_incomplete', False):
                         return scratch_failure(repo, scratch, directory / 'journal.json',
@@ -1854,11 +2329,14 @@ def integrate_scratch(args, preparations, checks):
                                    'Original checkout advanced but is dirty or unverifiable',
                                    phase='verify', candidate=candidate, recovery_ref=ref,
                                    original_head=observed, status='DELIVERED_CHECK_FAILED')
+        if scoped_original is not None:
+            scoped_original = scoped_check_context(checks, repo, args.expected_source_head, target=candidate)
         for kind, commands in (('prepare', preparations), ('check', checks)):
             for command in commands:
                 phase = kind
                 try:
-                    result = run(repo, command, timeout=check_timeout(args), discard_output=True)
+                    scoped = {'scoped_context': scoped_original} if scoped_original is not None else {}
+                    result = run(repo, command, timeout=check_timeout(args), discard_output=True, **scoped)
                 except (OSError, subprocess.TimeoutExpired):
                     return scratch_failure(repo, scratch, directory / 'journal.json',
                                            'Delivered checkout check could not complete; HEAD advanced',
