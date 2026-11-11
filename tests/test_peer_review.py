@@ -69,7 +69,8 @@ class PeerReviewTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.guard_environment = patch.dict(os.environ, {
-            'AGENT_HARNESS_USAGE_DIR': str(self.root / 'usage-state')})
+            'AGENT_HARNESS_USAGE_DIR': str(self.root / 'usage-state'),
+            'AGENT_HARNESS_ESCALATION_DIR': str(self.root / 'escalation-state')})
         self.guard_environment.start()
         self.addCleanup(self.guard_environment.stop)
         # Never discover a real reviewer CLI from the machine's install locations.
@@ -461,6 +462,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
                         raise OSError('synthetic cleanup failure')
                 with contextlib.ExitStack() as stack:
                     stack.enter_context(patch.dict(os.environ, {'AGENT_HARNESS_USAGE_DIR': str(self.root / ('usage-' + failure))}))
+                    stack.enter_context(patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + system_path()}))
                     stack.enter_context(patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(output)]))
                     stack.enter_context(patch.object(module, 'plan_resource_gate', return_value=(0, '')))
@@ -1047,6 +1049,7 @@ print(json.dumps({{'role': 'assistant', 'content': 'KIMI_ADVISORY: ACCEPT\\nVERD
         errors = io.StringIO()
         with patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(self.output)]), \
+             patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + system_path()}), \
              patch.object(module, 'plan_resource_gate', return_value=(0, '')), \
              patch.object(module, 'review_snapshot', return_value=('fixture', 'PLAN_RESULT: ACCEPT', '')), \
              patch.object(os, 'fsync', side_effect=fsync_then_mutate), \
@@ -1079,6 +1082,7 @@ print(json.dumps({{'role': 'assistant', 'content': 'KIMI_ADVISORY: ACCEPT\\nVERD
         errors = io.StringIO()
         with patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(self.output)]), \
+             patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + system_path()}), \
              patch.object(module, 'plan_resource_gate', return_value=(0, '')), \
              patch.object(module, 'review_snapshot', return_value=('fixture', 'PLAN_RESULT: ACCEPT', '')), \
              patch.object(os, 'link', side_effect=link_then_mutate), \
