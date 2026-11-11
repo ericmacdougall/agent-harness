@@ -1,4 +1,4 @@
-"""Read-only native runtime origin evidence. This module never admits a main agent.
+"""Read-only runtime origin evidence. This module never admits a main agent.
 
 Kernel ancestry and running code can identify an OpenAI runtime, but cannot
 authenticate a hook event or select a thread in a shared desktop process.
@@ -18,6 +18,10 @@ from safe_input import safe_json_loads
 
 OPENAI_TEAM = "2DC432GLL2"
 CODE_REQUIREMENT = 'anchor apple generic and identifier "codex" and certificate leaf[subject.OU] = "2DC432GLL2"'
+_CLAUDE_IDENTIFIER = "com.anthropic.claude-code"
+_CLAUDE_TEAM = "Q6L2SF6YDW"
+_CLAUDE_REQUIREMENT = (f'anchor apple generic and identifier "{_CLAUDE_IDENTIFIER}" '
+                       f'and certificate leaf[subject.OU] = "{_CLAUDE_TEAM}"')
 NATIVE_MARKERS = ("CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "CODEX_SANDBOX")
 MAX_INPUT = 1024 * 1024
 # Security/CSCommon.h: the running guest is unsigned or does not satisfy this
@@ -101,7 +105,11 @@ def _valid_process(value, pid):
 
 
 def _approved_code(code, process):
-    return (isinstance(code, CodeIdentity) and code.identifier == "codex" and code.team == OPENAI_TEAM
+    return _matches_signed_executable(code, process, "codex", OPENAI_TEAM)
+
+
+def _matches_signed_executable(code, process, identifier, team):
+    return (isinstance(code, CodeIdentity) and code.identifier == identifier and code.team == team
             and isinstance(code.cdhash, str) and bool(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", code.cdhash))
             and isinstance(code.executable, str)
             and os.path.realpath(code.executable) == os.path.realpath(process.executable))
@@ -165,14 +173,24 @@ def _mixed_chain_change(backend, chain, codes, generations, links, boundaries):
 
 def probe_runtime_origin(pid=None, *, backend=None):
     """Bounded origin-only probe; a supplied backend is an in-process test double."""
+    return _probe_origin(pid, backend=backend, commit_attribution=False)
+
+
+def probe_commit_runtime_origin(pid=None, *, backend=None):
+    """Read-only proof for a current commit's author claim."""
+    return _probe_origin(pid, backend=backend, commit_attribution=True)
+
+
+def _probe_origin(pid, *, backend, commit_attribution):
     pid = os.getpid() if pid is None else pid
     native = False
     try:
         if backend is None:
             if sys.platform != "darwin":
                 return OriginObservation("unknown", False, "unsupported_platform")
-            backend = DarwinBackend()
+            backend = _CommitDarwinBackend() if commit_attribution else DarwinBackend()
         chain, codes, seen, barrier, candidate = [], [], set(), False, None
+        candidate_origin = "openai"
         boundaries, generations, links = [], {}, []
         upper_unique, previous_node, ended_at_init = None, None, False
         current = pid
@@ -236,6 +254,14 @@ def probe_runtime_origin(pid=None, *, backend=None):
                 if not barrier:
                     candidate = process
                 break
+            if commit_attribution and first is not None:
+                if not _matches_signed_executable(first, process, _CLAUDE_IDENTIFIER, _CLAUDE_TEAM):
+                    return OriginObservation("unknown", native, "code_identity_unverified")
+                if barrier:
+                    return OriginObservation("unknown", native, "nearer_other_runtime")
+                candidate = process
+                candidate_origin = "claude"
+                break
             if name in {"claude", "kimi"}:
                 barrier = True  # an outer Codex process is not this nearer runtime's author
             if name == "codex":
@@ -247,7 +273,7 @@ def probe_runtime_origin(pid=None, *, backend=None):
             current = process.parent
         else:
             return OriginObservation("unknown", native, "ancestry_limit")
-        if boundaries and not native and not ended_at_init:
+        if boundaries and not native and not ended_at_init and candidate is None:
             raise OSError("upper ancestry incomplete")
         changed = _mixed_chain_change(backend, chain, codes, generations, links, boundaries)
         if changed:
@@ -259,6 +285,10 @@ def probe_runtime_origin(pid=None, *, backend=None):
                     return OriginObservation("unknown", native, changed)
         if candidate is None:
             return OriginObservation("unknown", native, "nearer_other_runtime" if native else "no_native_runtime")
+        if candidate_origin == "claude":
+            if not _matches_signed_executable(codes[-1], candidate, _CLAUDE_IDENTIFIER, _CLAUDE_TEAM):
+                return OriginObservation("unknown", native, "code_identity_unverified")
+            return OriginObservation("claude", False, "running_claude_code_verified", candidate.pid, codes[-1])
         if not _approved_code(codes[-1], candidate):
             return OriginObservation("unknown", True, "code_identity_unverified")
         return OriginObservation("openai", True, "running_code_verified", candidate.pid, codes[-1])
@@ -398,6 +428,9 @@ class DarwinBackend:
         return buffer.value.decode("utf-8", "strict")
 
     def signature(self, pid):
+        return self._signature(pid, (CODE_REQUIREMENT,))
+
+    def _signature(self, pid, requirements):
         owned = []
         def hold(value):
             if not value: raise OSError("Security framework allocation failed")
@@ -413,14 +446,18 @@ class DarwinBackend:
             guest = ct.c_void_p()
             check(self.sec.SecCodeCopyGuestWithAttributes(None, attributes, 0, ct.byref(guest)))
             hold(guest.value)
-            rule = hold(self.cf.CFStringCreateWithCString(None, CODE_REQUIREMENT.encode(), 0x08000100))
-            requirement = ct.c_void_p()
-            check(self.sec.SecRequirementCreateWithString(rule, 0, ct.byref(requirement)))
-            hold(requirement.value)
-            status = self.sec.SecCodeCheckValidity(guest, 0, requirement)
-            if status in NOT_APPROVED_SIGNATURE:
+            for text in requirements:
+                rule = hold(self.cf.CFStringCreateWithCString(None, text.encode(), 0x08000100))
+                requirement = ct.c_void_p()
+                check(self.sec.SecRequirementCreateWithString(rule, 0, ct.byref(requirement)))
+                hold(requirement.value)
+                status = self.sec.SecCodeCheckValidity(guest, 0, requirement)
+                if status in NOT_APPROVED_SIGNATURE:
+                    continue
+                check(status)
+                break
+            else:
                 return None
-            check(status)
             information = ct.c_void_p()
             check(self.sec.SecCodeCopySigningInformation(guest, 2, ct.byref(information)))
             hold(information.value)
@@ -438,6 +475,11 @@ class DarwinBackend:
                                 self._text(field("kSecCodeInfoTeamIdentifier")), cdhash, self._text(path))
         finally:
             for value in reversed(owned): self.cf.CFRelease(value)
+
+
+class _CommitDarwinBackend(DarwinBackend):
+    def signature(self, pid):
+        return self._signature(pid, (CODE_REQUIREMENT, _CLAUDE_REQUIREMENT))
 
 
 def main():

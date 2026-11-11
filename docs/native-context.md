@@ -124,10 +124,17 @@ it is not an approval receipt or a source/diff authenticity claim.
 The current-message paths in `commit_policy.py` explicitly pass an immutable
 `CommitAttribution` to validation. A verified nearest OpenAI running identity can
 establish OpenAI harness authorship with missing markers or one stale inherited
-Claude flag. This does not mutate or suppress any environment marker. Mixed
-Claude/Codex markers and uncertain native runtime evidence refuse the guarded
-current-message decision rather than silently skip it. A filename, payload role,
-thread identifier or supplied JSON cannot establish verified origin.
+Claude flag. The commit-specific probe can also verify the nearest running Claude
+Code executable against its pinned Anthropic signing requirement. It accepts a
+truthful Claude claim with absent or Claude-only markers. A conflicting Codex
+marker on verified Claude or both marker families on verified OpenAI leave the
+claim unresolved. A filename, payload role, thread identifier or supplied JSON
+cannot establish verified origin.
+
+An unresolved current attribution refuses recognized harness co-author claims.
+Messages without a harness co-author claim still go through the ordinary
+message and ticket checks. The existing generic origin probe and authority
+checks use the OpenAI requirement alone.
 
 This applies to supported current commit actions in the PreToolUse path and to
 already-marked, already-scoped backstop/check-message paths. Unmarked ordinary
@@ -145,7 +152,7 @@ silently become a positive Claude label. A nearer recognized runtime barrier
 cannot be overruled by an outer OpenAI ancestor.
 
 Signed standalone owners, ordinary tool subprocesses and children can have
-truthful OpenAI harness attribution while main authority remains false. No stamp,
+truthful harness attribution while main authority remains false. No stamp,
 strong user source, human approval, session bootstrap or admission is created.
 The original affected-owner hook environment remains unobserved; source controls
 and an ordinary-process compatibility probe cannot establish that its original

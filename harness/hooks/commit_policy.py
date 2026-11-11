@@ -37,7 +37,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))  # sibling imports also work for isolated-mode installed helper invocations
-from native_context import OriginObservation, probe_runtime_origin  # noqa: E402
+from native_context import OriginObservation, probe_commit_runtime_origin  # noqa: E402
 
 POLICY_FILE = HERE / "commit_policy.json"
 LOCAL_PROFILE_NAME = "commit_policy.local.json"
@@ -392,7 +392,7 @@ def current_commit_attribution():
     There is no payload, environment or CLI switch that supplies runtime evidence.
     """
     try:
-        origin = probe_runtime_origin()
+        origin = probe_commit_runtime_origin()
     except Exception:
         return CommitAttribution(None, "unknown", "runtime probe unavailable", True)
     if not isinstance(origin, OriginObservation):
@@ -401,6 +401,10 @@ def current_commit_attribution():
         if any(os.environ.get(name) for name in CLAUDE_MARKERS) and any(os.environ.get(name) for name in CODEX_MARKERS):
             return CommitAttribution(None, "unknown", "mixed harness markers", True)
         return CommitAttribution("openai", "verified_runtime_origin", "running OpenAI identity")
+    if origin.origin == "claude" and origin.native_lineage is False and origin.reason == "running_claude_code_verified":
+        if any(os.environ.get(name) for name in CODEX_MARKERS):
+            return CommitAttribution(None, "unknown", "Codex marker conflicts with running Anthropic identity", True)
+        return CommitAttribution("claude", "verified_runtime_origin", "running Anthropic identity")
     if (origin.origin != "unknown" or origin.native_lineage
             or origin.reason not in {"unsupported_platform", "no_native_runtime"}):
         return CommitAttribution(None, "unknown", "native runtime attribution uncertain", True)
@@ -562,15 +566,14 @@ def validate(message: str, *, policy: dict, previous: str | None = None, is_merg
                                 "e.g. 'Authorized-by: Eric, GoodQA #14151'")
     if misplaced:
         problems.append("trailers: move Co-Authored-By/Signed-off-by lines to a final paragraph after a blank line")
-    if attribution is not None and attribution.blocked:
+    named = {trailer_harness(line) for line in trailers if re.match(r"(?i)\s*co-authored-by\s*:", line)} - {None}
+    if named and attribution is not None and attribution.blocked:
         problems.append("trailers: cannot establish the current committing harness (" + attribution.reason +
                         "); refusing uncertain native attribution")
     harness = commit_harness(attribution=attribution)
-    if harness:
-        named = {trailer_harness(line) for line in trailers if re.match(r"(?i)\s*co-authored-by\s*:", line)} - {None}
-        if named - {harness}:
-            problems.append("trailers: Co-Authored-By names %s, but this commit is made from the %s harness; the "
-                            "author trailer is review evidence (goodqa#15253)" % (", ".join(sorted(named - {harness})), harness))
+    if harness and named - {harness}:
+        problems.append("trailers: Co-Authored-By names %s, but this commit is made from the %s harness; the "
+                        "author trailer is review evidence (goodqa#15253)" % (", ".join(sorted(named - {harness})), harness))
     if previous is not None and normalize(previous) == text:
         problems.append("message: identical to the previous commit; describe this change specifically")
     return problems

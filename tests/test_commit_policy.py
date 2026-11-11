@@ -395,7 +395,7 @@ class Fixture(unittest.TestCase):
         profile = Path(__file__).resolve().parent / "data" / "policy_profile_fixture.json"
         copy_fixture_file(profile, copy / cp.LOCAL_PROFILE_NAME)
         with (copy / "native_context.py").open("a", encoding="utf-8") as handle:
-            handle.write("\n\ndef probe_runtime_origin():\n"
+            handle.write("\n\ndef probe_commit_runtime_origin():\n"
                          "    return OriginObservation('unknown', False, 'no_native_runtime')\n")
         self.env.pop("AGENT_HARNESS_POLICY_LOCAL", None)
         self.hook_script = copy / "commit_policy.py"
@@ -1177,7 +1177,7 @@ class AuthorTrailerHarness(unittest.TestCase):
                 observation = ("nc.OriginObservation('unknown',False,'no_native_runtime')" if origin == "legacy"
                                else "nc.OriginObservation('openai',True,'running_code_verified')")
                 fixture = ("import sys; sys.path.insert(0,sys.argv[1]); import commit_policy as cp,native_context as nc; "
-                           "cp.probe_runtime_origin=lambda: " + observation + "; raise SystemExit(cp.main(sys.argv[2:]))")
+                           "cp.probe_commit_runtime_origin=lambda: " + observation + "; raise SystemExit(cp.main(sys.argv[2:]))")
                 for dest in copies:
                     with self.subTest(copy=dest.parent.name, origin=origin, marker=marker, trailer=trailer):
                         out = subprocess.run([sys.executable, "-I", "-B", "-c", fixture, str(dest), "check-message",
