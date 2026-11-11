@@ -511,15 +511,31 @@ class LiveReceipts(unittest.TestCase):
             for _ in range(100):
                 if guard.pid_exists(children[0]['pid']) is False: break
                 time.sleep(.05)
+            # PR 185: the supervisor died before any final record, so on the SAME boot the unrecorded-spawn risk is
+            # not excluded by a dead owner and a passed deadline. The sweep must decline and say why.
             swept = subprocess.run(self.command('sweep'), env=env, capture_output=True, text=True, timeout=20)
             value = json.loads(swept.stdout)
-            self.assertEqual((swept.returncode, value['reconciled']), (0, [run_id]))
+            self.assertEqual((swept.returncode, value['reconciled']), (0, []))
+            self.assertIn('reboot proof', value['reports'][0]['why'])
+            self.assertFalse((self.store_path / 'runs' / run_id / 'reconciled.json').exists())
+            declined = subprocess.run(self.command('reconcile', '--run', run_id, '--auto'), env=env,
+                                      capture_output=True, text=True, timeout=20)
+            self.assertIn('reboot proof', json.loads(declined.stdout)['automatic_reconciliation']['why'])
+            self.assertFalse((self.store_path / 'runs' / run_id / 'reconciled.json').exists())
+            self.assertFalse((self.store_path / 'runs' / run_id / 'final.json').exists())
+            repeated, refused = self.invoke(*arguments)
+            self.assertEqual((repeated.returncode, refused['reason']), (2, 'UNKNOWN'))
+            # Recovery stays possible through explicit operator evidence, which is append-only.
+            manual = subprocess.run(self.command('reconcile', '--run', run_id, '--actor', 'fixture',
+                                                 '--reason', 'owner and recorded child are dead on this host',
+                                                 '--evidence', 'sweep declined without reboot proof; child pid checked'),
+                                    env=env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(manual.returncode, 0, manual.stderr)
             self.assertEqual(json.loads((self.store_path / 'runs' / run_id / 'reconciled.json').read_text())['kind'],
-                             'automatic_reconciliation')
+                             'manual_reconciliation')
             again = subprocess.run(self.command('reconcile', '--run', run_id, '--auto'), env=env,
                                    capture_output=True, text=True, timeout=20)
             self.assertEqual(json.loads(again.stdout)['automatic_reconciliation']['why'], 'already reconciled')
-            self.assertFalse((self.store_path / 'runs' / run_id / 'final.json').exists())
             repeated, refused = self.invoke(*arguments)
             self.assertEqual((repeated.returncode, refused['reason']), (2, 'BUDGET_EXHAUSTED'))
         finally:
@@ -580,7 +596,10 @@ class OwnerLiveness(StoreFixture):
 
     def reboot(self):
         # Explicit positive-only simulation; ordinary and completed-run fixtures stay on the same boot.
-        scheme = guard.boot_identity().split(':', 1)[0]
+        current = guard.boot_identity()
+        if current is None:
+            self.skipTest('this host exposes no boot identifier (no /proc boot_id and no kern.bootsessionuuid)')
+        scheme = current.split(':', 1)[0]
         return mock.patch.object(guard, 'boot_identity', return_value=scheme + ':22222222-2222-4222-8222-222222222222')
 
     def reconciled_path(self, run):
