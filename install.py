@@ -38,7 +38,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "dropped_gate.py", "ask_reminders.py",  # dropped-owner gate and ask reminders (goodqa#14791)
          "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",  # Hawkeye ports (goodqa#14908)
          "backup_watch.py", "kimi_review.py", "installer_scan.py",
-         "trivy_gate.py")  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
+         "trivy_gate.py", "mc_chat.py", "mc_inbox.py")  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -88,7 +88,7 @@ def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
-                         "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py")}
+                         "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py", "mc_inbox.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -250,6 +250,9 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     reminder = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "ledger_reminder.py")], "timeout": 3}
     for event in ("SessionStart", "UserPromptSubmit"):
         managed.setdefault(event, []).append({"hooks": [reminder]})
+    # Fixed inbox pointer only; legacy Stop hook fails open (GoodQA #15585).
+    managed.setdefault("Stop", []).append({"hooks": [{"type": "command", "command": "python3",
+        "args": [str(claude / "hooks" / "mc_inbox.py"), "hook"], "timeout": 5}]})
     return managed
 
 
@@ -943,6 +946,15 @@ def install_git_backstop(home: Path, apply: bool) -> str:
     return git_hook_status(home, GIT_HOOK_KEY, home / ".claude" / "hooks" / "commit_policy.py", apply=apply)
 
 
+def mission_control_status(home: Path, apply: bool, flag) -> str:
+    """Optional dashboard; never fails the harness install (mission_control_install.status never raises)."""
+    try:
+        import mission_control_install
+        return mission_control_install.status(home, apply, flag)
+    except Exception as error:  # noqa: BLE001
+        return f"mission control: skipped ({error.__class__.__name__}: {error})"
+
+
 def netwatch_status(home: Path, apply: bool, flag) -> str:
     """Optional monitor; never fails the harness install.
 
@@ -1089,6 +1101,13 @@ def main() -> None:
                           help="do not install or upgrade the netwatch monitor (remembered)")
     netwatch.add_argument("--netwatch", dest="netwatch", action="store_true",
                           help="install or upgrade the pinned netwatch monitor (the default; remembered)")
+    mission = parser.add_mutually_exclusive_group()
+    mission.add_argument("--mission-control", dest="mission_control", action="store_true", default=None,
+                         help="install Mission Control (the local fleet dashboard) and, on macOS, its LaunchAgent "
+                              "(the default; remembered)")
+    mission.add_argument("--no-mission-control", dest="mission_control", action="store_false",
+                         help="do not install Mission Control; where installed, stop its LaunchAgent (files and chat "
+                              "data stay; remembered)")
     parser.add_argument("--no-provenance-hooks", dest="provenance", action="store_false",
                         help="do not register the provenance hooks (ask-gate, stop-lint, prompt) and remove any "
                              "registered by an earlier install; the files stay installed; not remembered")
@@ -1135,6 +1154,7 @@ def main() -> None:
     print(f"  {local_profile_status(args.home)}")
     print(f"  {command_guard_status(args.command_guard)}")
     print(f"  {log_backup_status(args.home, args.apply, args.log_backup)}")
+    print(f"  {mission_control_status(args.home, args.apply, args.mission_control)}")
     if not args.apply:
         print("Run with --apply to install. Existing files will be backed up.")
 

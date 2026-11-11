@@ -50,7 +50,9 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     # deliver.py prepare --scan trivy imports it (goodqa#15295)
                     'trivy_gate.py',
                     # AGENTS.md tells Codex to scan third-party installers first (goodqa#15253 step 4)
-                    'installer_scan.py')
+                    'installer_scan.py',
+                    # Manual MC inbox helpers only; no Codex hook or bridge.
+                    'mc_chat.py', 'mc_inbox.py')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 

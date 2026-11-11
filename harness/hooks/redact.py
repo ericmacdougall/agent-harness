@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Shared secret redaction: one high-recall shape list for WAL notes, scans and (later) every other redactor.
 
-Stdlib only, linear-time patterns with bounded repetition, so hostile input cannot trigger catastrophic
-backtracking. `redact(text)` replaces each secret with `[REDACTED:<kind>]`; `find(text)` returns the kinds and
-offsets WITHOUT the values, which is what scanners must print.
+Stdlib only. Existing general patterns scan bounded chunks. Simple complete-span patterns scan the input
+without chunk boundaries. `redact(text)` replaces each secret with `[REDACTED:<kind>]`; `find(text)` returns
+the kinds and offsets WITHOUT the values, which is what scanners must print.
 
 Recall over precision: a false positive costs a placeholder in a note, a false negative leaks a credential into
 a transcript that is never deleted. Shapes cover Dropbox/rclone OAuth blobs, Anthropic, OpenAI, GitHub, AWS,
@@ -24,6 +24,17 @@ _KEYS = (r'(?:[a-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|api[_-]?
 # PEM bodies are unbounded: scan them separately so chunk boundaries and regex body caps cannot expose a tail.
 PEM_BEGIN = re.compile(r'-----BEGIN [A-Z0-9 ]{0,40}(?:PRIVATE KEY|ENCRYPTED PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----')
 PEM_END = re.compile(r'-----END [A-Z0-9 ]{0,40}-----')
+
+# These literal prefixes and disjoint character runs are linear across the input.
+# A complete scan avoids reporting a partial token at a chunk edge. In the
+# SendGrid shape the literal separator cannot occur within either body segment.
+COMPLETE_SHAPES = (
+    ('stripe', re.compile(r'\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}')),
+    ('stripe-webhook', re.compile(r'\bwhsec_[A-Za-z0-9]{16,}')),
+    ('huggingface', re.compile(r'\bhf_[A-Za-z0-9]{20,}')),
+    ('gitlab', re.compile(r'\bglpat-[A-Za-z0-9_-]{20,}')),
+    ('sendgrid', re.compile(r'\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}')),
+)
 
 # (kind, compiled pattern). Order matters: specific shapes first so the kind label is the most useful one.
 PATTERNS = [
@@ -76,21 +87,26 @@ def _find_pem(text):
         cursor = stop
 
 
+def _find_patterns(text, base, patterns, hits, seen):
+    for kind, pattern in patterns:
+        for match in pattern.finditer(text):
+            if '[REDACTED:' in match.group(0):
+                continue
+            span = (base + match.start(), base + match.end())
+            if span in seen:
+                continue
+            seen.add(span)
+            hits.append((kind, span[0], span[1]))
+
+
 def find(text):
     """[(kind, start, end)] for every secret-shaped span. Values are never returned."""
     text = str(text)
     hits = _find_pem(text)
     seen = {(start, end) for _kind, start, end in hits}
+    _find_patterns(text, 0, COMPLETE_SHAPES, hits, seen)
     for base, chunk in _chunks(text):
-        for kind, pattern in PATTERNS:
-            for match in pattern.finditer(chunk):
-                if '[REDACTED:' in match.group(0):
-                    continue
-                span = (base + match.start(), base + match.end())
-                if span in seen:
-                    continue
-                seen.add(span)
-                hits.append((kind, span[0], span[1]))
+        _find_patterns(chunk, base, PATTERNS, hits, seen)
     return sorted(hits, key=lambda hit: (hit[1], hit[2]))
 
 
