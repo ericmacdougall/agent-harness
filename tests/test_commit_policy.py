@@ -6,6 +6,7 @@ import os
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -372,6 +373,32 @@ class Fixture(unittest.TestCase):
         git("remote", "add", "origin", self.ORIGIN, cwd=self.repo, env=self.env)
         self.commit(CHORE)
         self.wal = self.home / ".claude" / "wals" / "sess-1" / "main.jsonl"
+        self.hook_script = HOOKS / "commit_policy.py"
+
+    def use_legacy_origin_fixture(self):
+        """Exercise the real CLI with a deterministic non-native process observation."""
+        def copy_fixture_file(source, destination):
+            if source.resolve(strict=True) != source:
+                raise ValueError(f"aliased fixture source: {source.name}")
+            fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError(f"unsafe fixture source: {source.name}")
+                destination.write_bytes(handle.read())
+
+        copy = self.root / "legacy-origin-hooks"
+        copy.mkdir(mode=0o700)
+        for name in ("commit_policy.py", "commit_policy.json", "native_context.py", "safe_input.py",
+                     "ticket_adapters.py", "process.py", "wal.py", "wal_note.py"):
+            copy_fixture_file(HOOKS / name, copy / name)
+        profile = Path(__file__).resolve().parent / "data" / "policy_profile_fixture.json"
+        copy_fixture_file(profile, copy / cp.LOCAL_PROFILE_NAME)
+        with (copy / "native_context.py").open("a", encoding="utf-8") as handle:
+            handle.write("\n\ndef probe_runtime_origin():\n"
+                         "    return OriginObservation('unknown', False, 'no_native_runtime')\n")
+        self.env.pop("AGENT_HARNESS_POLICY_LOCAL", None)
+        self.hook_script = copy / "commit_policy.py"
 
     def commit(self, message, extra_env=None):
         path = self.root / "m.txt"
@@ -380,11 +407,15 @@ class Fixture(unittest.TestCase):
                               env={**self.env, **(extra_env or {})}, capture_output=True, text=True, timeout=60)
 
     def run_cli(self, *args, stdin=None, extra_env=None):
-        return subprocess.run([sys.executable, str(HOOKS / "commit_policy.py"), *args], input=stdin,
+        return subprocess.run([sys.executable, str(self.hook_script), *args], input=stdin,
                               env={**self.env, **(extra_env or {})}, capture_output=True, text=True, timeout=60)
 
 
 class PreToolUseHook(Fixture):
+    def setUp(self):
+        super().setUp()
+        self.use_legacy_origin_fixture()
+
     def payload(self, command, **extra):
         return json.dumps({"session_id": "sess-1", "cwd": str(self.repo), "hook_event_name": "PreToolUse",
                            "tool_name": "Bash", "tool_input": {"command": command, "description": "x"},
@@ -630,9 +661,10 @@ class InspectionRegressions(Fixture):
                      "config-based hooks need git 2.54+ (dev2/T2 run 2.43); the backstop is inactive there")
 class GitBackstop(Fixture):
     def install_hook(self):
+        self.use_legacy_origin_fixture()
         git("config", "--global", "hook.agent-harness-commit-policy.event", "commit-msg", cwd=self.repo, env=self.env)
         git("config", "--global", "hook.agent-harness-commit-policy.command",
-            cp.git_hook_command(HOOKS / "commit_policy.py"), cwd=self.repo, env=self.env)
+            cp.git_hook_command(self.hook_script), cwd=self.repo, env=self.env)
 
     def test_backstop_scope_and_chaining(self):
         self.install_hook()
@@ -1084,7 +1116,7 @@ sys.exit(cp.entry(["hook"]))
 
 class AuthorTrailerHarness(unittest.TestCase):
     """goodqa#15253 #134 red-team B1: the author trailer is review evidence, so it must name the committing harness."""
-    BODY = ("fix(x): change a thing\n\nWhy: a reason that is long enough.\n\nWhat: the change.\n\n"
+    BODY = ("fix(x): change a thing\n\nWhy: a reason that is long enough.\n\nWhat: describe the intended fixture change.\n\n"
             "Testing: `python3 -m unittest tests.test_x` 3 OK\n\nRefs: GoodQA #1234\n\n")
 
     def problems(self, harness, trailer):
@@ -1117,7 +1149,11 @@ class AuthorTrailerHarness(unittest.TestCase):
 
     def test_both_installed_copies_accept_the_committing_harness_trailer(self):
         # delta red-team D-F1: the ~/.claude and ~/.codex hooks both run on every commit; neither may refuse the
-        # trailer of the harness actually committing, and both refuse the other one
+        # trailer of the harness actually committing, and both refuse the other one.
+        # A synthetic marker is not the actual test-host origin: provide an
+        # explicit genuine-Claude/no-native or verified-native test condition.
+        # This in-process fixture exists only inside disposable helper copies;
+        # production gains no origin CLI/config/provider override.
         import shutil
         import tempfile
         with tempfile.TemporaryDirectory() as home:
@@ -1126,18 +1162,29 @@ class AuthorTrailerHarness(unittest.TestCase):
                 shutil.copytree(HOOKS, dest, ignore=shutil.ignore_patterns("__pycache__"))
             msg = Path(home) / "msg.txt"
             base = {"HOME": home, "PATH": "/usr/bin:/bin"}
-            cases = (({"CLAUDECODE": "1"}, "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>", False),
-                     ({"CODEX_THREAD_ID": "t1"}, "Co-Authored-By: GPT-5 Codex <noreply@openai.com>", False),
-                     ({"CLAUDECODE": "1"}, "Co-Authored-By: GPT-5 Codex <noreply@openai.com>", True),
-                     ({"CODEX_THREAD_ID": "t1"}, "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>", True))
-            for marker, trailer, refused in cases:
+            claude = "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+            codex = "Co-Authored-By: GPT-5 Codex <noreply@openai.com>"
+            cases = (("legacy", {"CLAUDECODE": "1"}, claude, False),
+                     ("legacy", {"CODEX_THREAD_ID": "t1"}, codex, False),
+                     ("legacy", {"CLAUDECODE": "1"}, codex, True),
+                     ("legacy", {"CODEX_THREAD_ID": "t1"}, claude, True),
+                     ("native", {"CLAUDECODE": "1"}, codex, False),
+                     ("native", {"CLAUDECODE": "1"}, claude, True),
+                     ("native", {"CODEX_THREAD_ID": "t1"}, codex, False),
+                     ("native", {"CODEX_THREAD_ID": "t1"}, claude, True))
+            for origin, marker, trailer, refused in cases:
                 msg.write_text(self.BODY + trailer + "\n")
+                observation = ("nc.OriginObservation('unknown',False,'no_native_runtime')" if origin == "legacy"
+                               else "nc.OriginObservation('openai',True,'running_code_verified')")
+                fixture = ("import sys; sys.path.insert(0,sys.argv[1]); import commit_policy as cp,native_context as nc; "
+                           "cp.probe_runtime_origin=lambda: " + observation + "; raise SystemExit(cp.main(sys.argv[2:]))")
                 for dest in copies:
-                    with self.subTest(copy=dest.parent.name, marker=marker, trailer=trailer):
-                        out = subprocess.run([sys.executable, "-I", str(dest / "commit_policy.py"), "check-message",
+                    with self.subTest(copy=dest.parent.name, origin=origin, marker=marker, trailer=trailer):
+                        out = subprocess.run([sys.executable, "-I", "-B", "-c", fixture, str(dest), "check-message",
                                               "--file", str(msg)], capture_output=True, text=True, timeout=60,
                                              env=dict(base, **marker))
                         self.assertEqual("this commit is made from the" in out.stdout, refused, out.stdout[-400:])
+                        self.assertEqual(out.returncode, 2 if refused else 0, out.stderr[-400:])
 
 if __name__ == "__main__":
     unittest.main()
