@@ -41,7 +41,7 @@ ASK_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{7,63}$")
 # Only the ask's own tag names its ticket. A ticket merely mentioned in the text ("goodqa#14000 was closed by
 # mistake; may I reopen it?") is never a reason to hide the ask.
-TICKET_TAG_RE = re.compile(r"\[ticket:([a-z][a-z0-9-]{1,30}#\d{2,7})\]")
+TICKET_TAG_RE = re.compile(r"^\s*\[ticket:([a-z][a-z0-9-]{1,30}#\d{2,7})\]")  # it must open the note
 AGENT_RE = re.compile(r"^agent-([A-Za-z0-9]{1,64})$")
 
 
@@ -150,7 +150,7 @@ def _decide(data: dict, owners, ticket_status, activity: dict, cache: dict, now:
         if ident in out:
             continue
         agent = AGENT_RE.match(str(row.get("owner", "")))
-        ticket = TICKET_TAG_RE.search(str(row.get("note", "")))
+        ticket = TICKET_TAG_RE.match(str(row.get("note", "")))
         asked = _epoch(row.get("at")) or now
         last = max(asked, activity.get(ident) or 0)
         until = _epoch(row.get("until")) if row.get("until") else None

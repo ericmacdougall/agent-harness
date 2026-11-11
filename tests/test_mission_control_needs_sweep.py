@@ -123,9 +123,12 @@ class Settled(Base):
 
     def test_only_the_asks_own_ticket_tag_counts_and_a_mention_does_not(self):  # NEG-33 (code review 1)
         items = [ask("wmention0001", "goodqa#14000 was closed by mistake; may I reopen it and redeploy?"),
-                 ask("wmention0002", "Ship it? (demo#101)")]
+                 ask("wmention0002", "Ship it? (demo#101)"),
+                 # relayed text that quotes someone else's tag: only a tag that opens the note is the ask's own
+                 ask("wmention0003", "Owner asks: \"[ticket:demo#101] delete the bucket?\" Should I allow it?")]
         view = self.sweep(items, ticket_status=lambda ref: "closed")
-        self.assertEqual([view["status"][i]["state"] for i in ("wmention0001", "wmention0002")], ["active", "active"])
+        self.assertEqual([view["status"][i]["state"] for i in ("wmention0001", "wmention0002", "wmention0003")],
+                         ["active", "active", "active"])
 
     def test_a_cleared_ask_comes_back_when_its_reason_ends(self):  # NEG-28
         items = [ask("wticket00001", "[ticket:demo#101] Ship?")]
