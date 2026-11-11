@@ -280,11 +280,15 @@ class GateTests(Base):
         with self.assertRaises(ah.AhError):
             self.dispose("reassigned", "disp-reassign-unknown", ref="nobody0001")
 
-    def test_block_count_is_bounded_per_signature(self):
-        blocks = sum(1 for _ in range(6) if self.stop().get("decision") == "block")
-        self.assertEqual(blocks, dropped_gate.MAX_STOP_BLOCKS)
+    def test_block_count_has_a_hard_backstop_per_signature(self):
+        # GoodQA #15565 (16.3): no yield after 3 blocks any more; only the hard backstop ends an unsatisfiable loop
+        limit = dropped_gate.MAX_STOP_BLOCKS
+        self.assertGreaterEqual(limit, 20)
+        blocks = sum(1 for _ in range(limit + 4) if self.stop().get("decision") == "block")
+        self.assertEqual(blocks, limit)
         out = self.stop()
         self.assertNotEqual(out.get("decision"), "block")
+        self.assertIn("yielded after", out.get("systemMessage", ""))
         self.assertIn("dropowner", out.get("systemMessage", ""))  # still named, never silent
         # a new signature (another owner dropped) gets its own bound
         w = self.home / ".claude" / "wals" / SESSION
@@ -293,11 +297,130 @@ class GateTests(Base):
         jl(w / "agent-dropowner2.jsonl", [{"at": iso(NOW - 4000), "event": "intent", "note": "second"}])
         self.assertEqual(self.stop().get("decision"), "block")
 
-    def test_stop_hook_active_passes_through_with_a_message(self):
+    def test_a_repeated_stop_is_still_blocked_and_offers_the_successor_command(self):
+        # 16.3: stop_hook_active no longer lets the turn end; a repeated Stop is the case the gate exists for
         payload = {"session_id": SESSION, "hook_event_name": "Stop", "stop_hook_active": True}
-        out = dropped_gate.cmd_stop(payload, now=NOW)
+        for _ in range(5):
+            out = dropped_gate.cmd_stop(payload, now=NOW)
+            self.assertEqual(out.get("decision"), "block")
+        self.assertIn("dropowner", out["reason"])
+        self.assertIn("task succeed", out["reason"])
+
+    # ---- the cap_wait valve (spec AC-7), with real request rows and a patched owner count
+
+    def cap_row(self, agent, at=None, status="cap_wait"):
+        import successor
+        successor._append(self.home, SESSION, {"schema": 1, "at": NOW - 600 if at is None else at, "agent": agent,
+                                               "session": SESSION, "status": status})
+
+    def second_owner(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 9000), "event": "subagent", "agent_id": "dropowner2", "agent_type": "task-owner"},
+                              {"at": iso(NOW - 100), "event": "subagent_stop", "agent_id": "dropowner2", "agent_type": "task-owner"}])
+        jl(w / "agent-dropowner2.jsonl", [{"at": iso(NOW - 4000), "event": "intent", "note": "second"}])
+
+    def stop_with_cap(self, live=4, cap=4):
+        import model_tiers
+        import tier_gate
+        with mock.patch.object(model_tiers, "load_policy", lambda: {"caps": {"session_owner_agents": cap}}), \
+                mock.patch.object(tier_gate, "live_owner_ids", lambda session, policy: ["o"] * live):
+            return dropped_gate.cmd_stop({"session_id": SESSION, "hook_event_name": "Stop"}, now=NOW)
+
+    def test_a_cap_wait_for_the_only_undisposed_owner_lets_the_turn_end_while_the_cap_is_full(self):
+        self.cap_row("dropowner")
+        out = self.stop_with_cap()
         self.assertNotEqual(out.get("decision"), "block")
-        self.assertIn("dropowner", out.get("systemMessage", ""))
+        self.assertIn("waiting on the owner cap", out.get("systemMessage", ""))
+
+    def test_one_cap_wait_among_two_undisposed_owners_does_not_end_the_turn_two_do(self):
+        # acceptance review a3318610 F2: the old test had one undisposed owner, so any() passed as well as all()
+        self.second_owner()
+        self.cap_row("dropowner")
+        self.assertEqual(self.stop_with_cap().get("decision"), "block")
+        self.cap_row("dropowner2")
+        self.assertNotEqual(self.stop_with_cap().get("decision"), "block")
+
+    def test_the_gate_counts_pending_successors_the_way_succeed_does(self):
+        # acceptance review N2: 3 live owners plus 1 ready successor of another stream is a full cap of 4 for both
+        self.cap_row("dropowner")
+        self.cap_row("another", status="ready", at=NOW - 60)
+        self.assertNotEqual(self.stop_with_cap(live=3, cap=4).get("decision"), "block")
+        self.assertEqual(self.stop_with_cap(live=2, cap=4).get("decision"), "block")
+
+    def test_a_refreshed_cap_wait_reopens_the_valve_after_the_old_one_aged_out(self):
+        # acceptance review N1: the valve closes at 30 minutes, and succeed writes a fresh row once the wait is 10 minutes old
+        import successor
+        self.cap_row("dropowner", at=NOW - 2400)
+        self.assertEqual(self.stop_with_cap().get("decision"), "block")
+        self.cap_row("dropowner", at=NOW - 60)  # what succeed appends on its next call
+        self.assertNotEqual(self.stop_with_cap().get("decision"), "block")
+        self.assertEqual(successor.open_request(successor.read_requests(self.home, SESSION), "dropowner", NOW)["at"], NOW - 60)
+
+    def test_the_refresh_threshold_stays_below_the_gate_limit(self):
+        import successor
+        self.assertLess(successor.CAP_REFRESH_S, dropped_gate.CAP_WAIT_MAX_AGE_S)  # acceptance review a3318610 M1
+
+    def test_succeed_refuses_a_malformed_agent_id(self):
+        import successor
+        for bad in ("../x", "", "a b", "x" * 80):
+            with self.assertRaises(successor.SuccessorError, msg=bad):  # acceptance review F6
+                successor.succeed(self.home, SESSION, bad, owners_doc={"owners": []}, live_count=0, cap=4)
+
+    def test_a_freed_slot_closes_the_valve(self):
+        # acceptance review F1: a cap_wait must not excuse the Stop once a slot is free
+        self.cap_row("dropowner")
+        self.assertEqual(self.stop_with_cap(live=3, cap=4).get("decision"), "block")
+
+    def test_stale_ready_foreign_or_forged_requests_never_excuse_a_stop(self):
+        import successor
+        self.cap_row("dropowner", at=NOW - 3600)  # older than the 30 minute limit
+        self.assertEqual(self.stop_with_cap().get("decision"), "block")
+        log = self.home / ".agent-harness/state/successor" / SESSION
+        for name in ("requests.jsonl", "requests.jsonl.head"):
+            (log / name).write_text("")
+        self.cap_row("dropowner", status="ready")  # a ready, never launched successor is not a cap wait
+        self.assertEqual(self.stop_with_cap().get("decision"), "block")
+        for name in ("requests.jsonl", "requests.jsonl.head"):
+            (log / name).write_text("")
+        self.cap_row("someoneelse")  # a different agent
+        self.assertEqual(self.stop_with_cap().get("decision"), "block")
+        for name in ("requests.jsonl", "requests.jsonl.head"):
+            (log / name).write_text("")
+        (log / "requests.jsonl").write_text(json.dumps({"schema": 1, "at": NOW - 60, "agent": "dropowner", "session": SESSION,
+                                                        "status": "cap_wait"}) + "\n")  # hand-written, no chain, no head
+        self.assertFalse(successor.verify_log(self.home, SESSION))
+        self.assertEqual(self.stop_with_cap().get("decision"), "block")
+
+    def test_the_backstop_raises_exactly_one_high_alert_naming_the_owner(self):
+        import ops_watch
+        emitted = []
+        with mock.patch.object(ops_watch, "emit", lambda event, *a, **k: emitted.append(event) or 1):
+            for _ in range(dropped_gate.MAX_STOP_BLOCKS):
+                self.assertEqual(self.stop().get("decision"), "block")
+            self.assertEqual(emitted, [])
+            out = self.stop()
+        self.assertNotEqual(out.get("decision"), "block")
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual((emitted[0]["severity"], emitted[0]["check"]), ("high", "dropped-gate"))
+        self.assertIn("dropowner", emitted[0]["detail"]["agents"])
+
+    def test_a_counter_that_cannot_be_saved_fails_open_with_an_alert(self):
+        # red-team F5: with a read-only home the block counter never advanced and the backstop never fired
+        import ops_watch
+        emitted = []
+        with mock.patch.object(dropped_gate, "save_state", lambda session, state: False), \
+                mock.patch.object(ops_watch, "emit", lambda event, *a, **k: emitted.append(event) or 1):
+            out = self.stop()
+        self.assertNotEqual(out.get("decision"), "block")
+        self.assertIn("cannot be written", out.get("systemMessage", ""))
+        self.assertEqual(len(emitted), 1)
+
+    def test_a_per_session_total_backstop_covers_a_changing_undisposed_set(self):
+        # red-team F9: every new signature gets its own 25 blocks, so alternating sets never ended
+        with mock.patch.object(dropped_gate, "load_state", lambda session: {"total_blocks": dropped_gate.TOTAL_STOP_BLOCKS}):
+            out = self.stop()
+        self.assertNotEqual(out.get("decision"), "block")
+        self.assertIn("yielded after", out.get("systemMessage", ""))
 
 
 class ReassignInheritsTargetWait(Base):
