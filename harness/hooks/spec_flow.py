@@ -670,6 +670,156 @@ def checked_wal(path: Path) -> Path:
     return path
 
 
+_NATIVE_REVIEW_COLUMNS = ("id", "source", "thread_source", "originator", "agent_path", "agent_role",
+                          "attached_thread_parent_id")
+_NATIVE_REVIEW_QUERY = "SELECT " + ", ".join(
+    f"CASE WHEN {name} IS NULL OR (typeof({name})='text' AND length(CAST({name} AS BLOB))<=512) "
+    f"THEN {name} ELSE X'' END" for name in _NATIVE_REVIEW_COLUMNS
+) + ", CASE WHEN typeof(archived)='integer' THEN archived ELSE X'' END FROM main.threads WHERE id IN (?,?) LIMIT 3"
+
+
+def _native_path(path, uid, *, directory=False, maximum=None, optional=False):
+    try:
+        item = path.lstat()
+    except FileNotFoundError:
+        if optional:
+            return None
+        raise
+    if (path.resolve(strict=True) != path or item.st_uid != uid or item.st_mode & 0o022
+            or (not stat.S_ISDIR(item.st_mode) if directory else not stat.S_ISREG(item.st_mode))
+            or (not directory and (item.st_nlink != 1 or (maximum is not None and item.st_size > maximum)))):
+        raise ValueError("unqualified native metadata path")
+    return item.st_dev, item.st_ino, item.st_uid, item.st_mode
+
+
+def _native_database_binding(home, uid):
+    db = home / ".codex/state_5.sqlite"
+    return (_native_path(home, uid, directory=True),
+            _native_path(db.parent, uid, directory=True),
+            _native_path(db, uid, maximum=256 * 1024 * 1024),
+            _native_path(db.with_name(db.name + "-wal"), uid, maximum=64 * 1024 * 1024, optional=True),
+            _native_path(db.with_name(db.name + "-shm"), uid, maximum=4 * 1024 * 1024, optional=True))
+
+
+def _native_review_rows(home, uid, agent, parent):
+    """Historical identity projection, never a current-caller or main-role grant."""
+    import sqlite3
+    db = home / ".codex/state_5.sqlite"
+    deadline = time.monotonic() + 0.20
+    before = _native_database_binding(home, uid)
+    descriptor = os.open(db, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        item = os.fstat(descriptor)
+        if (item.st_dev, item.st_ino, item.st_uid, item.st_mode) != before[2]:
+            raise ValueError("native database changed")
+        header = os.pread(descriptor, 20, 0)
+    finally:
+        os.close(descriptor)
+    if len(header) != 20 or header[:16] != b"SQLite format 3\0":
+        raise ValueError("unsupported native database")
+    if header[18:20] == b"\x02\x02":
+        if before[3] is None or before[4] is None:
+            raise ValueError("native WAL companions unavailable")
+    elif header[18:20] != b"\x01\x01" or before[3] is not None or before[4] is not None:
+        raise ValueError("unsupported native journal state")
+    if _native_path(db.with_name(db.name + "-journal"), uid, maximum=64 * 1024 * 1024, optional=True):
+        raise ValueError("native journal unavailable")
+    connection = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=0.05)
+    try:
+        connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 100)
+        connection.execute("PRAGMA trusted_schema=OFF")
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        tables = connection.execute("PRAGMA main.table_list('threads')").fetchmany(2)
+        if len(tables) != 1 or tables[0][:3] != ("main", "threads", "table"):
+            raise ValueError("native identity table unavailable")
+        count = connection.execute(
+            "SELECT count(*) FROM pragma_table_xinfo('threads','main') WHERE name IN "
+            "('id','source','thread_source','originator','agent_path','agent_role','attached_thread_parent_id','archived') "
+            "AND hidden=0").fetchone()
+        if count != (8,):
+            raise ValueError("native identity columns unavailable")
+        rows = connection.execute(_NATIVE_REVIEW_QUERY, (agent, parent)).fetchmany(3)
+    finally:
+        connection.close()
+    if time.monotonic() > deadline or _native_database_binding(home, uid) != before or len(rows) != 2:
+        raise ValueError("native identity snapshot unavailable")
+    if any(any(value is not None and type(value) is not str for value in row[:-1])
+           or type(row[-1]) is not int or row[-1] not in (0, 1) for row in rows):
+        raise ValueError("native identity fields unavailable")
+    indexed = {row[0]: row for row in rows}
+    if set(indexed) != {agent, parent}:
+        raise ValueError("native identity rows unavailable")
+    return indexed
+
+
+def _native_review_source(path, agent, role):
+    """Return explicit native review provenance, or None only for a nonnative path."""
+    raw = Path(os.path.expanduser(str(path))).absolute()
+    try:
+        resolved = raw.resolve()
+    except (OSError, RuntimeError):
+        raise SpecError("review WAL path unavailable", EXIT_USAGE) from None
+    # Legacy operation must not acquire a new platform/SQLite prerequisite.
+    def native_shape(value):
+        return any(value.parts[index:index + 2] == (".agent-harness", "codex-wals")
+                   for index in range(len(value.parts) - 1))
+    if not native_shape(raw) and not native_shape(resolved):
+        return None
+    try:
+        import pwd
+        import sqlite3
+    except ImportError:
+        raise SpecError("native review metadata unsupported", EXIT_USAGE) from None
+    uid = os.getuid()
+    try:
+        home = Path(pwd.getpwuid(uid).pw_dir)
+        root = home / ".agent-harness/codex-wals"
+        native = raw.is_relative_to(root) or resolved.is_relative_to(root)
+        if not native:
+            raise ValueError("unqualified native review family")
+        parts = raw.relative_to(root).parts
+        if (raw != resolved or ".." in raw.parts or len(parts) != 2 or parts[1] != "main.jsonl"
+                or re.fullmatch(UUID, parts[0]) is None or re.fullmatch(UUID, agent) is None or agent == parts[0]):
+            raise ValueError("native review WAL shape unavailable")
+        parent = parts[0]
+        directories = (home, home / ".agent-harness", root, raw.parent)
+        before = tuple(_native_path(item, uid, directory=True) for item in directories)
+        wal_binding = _native_path(raw, uid, maximum=64_000_000)
+        expected = {"adversarial": "harness_red_team", "acceptance": "harness_reviewer"}.get(role)
+        rows = _native_review_rows(home, uid, agent, parent)
+        parent_row, child = rows[parent], rows[agent]
+        if (parent_row[1:4] != ("vscode", "user", "Codex Desktop") or any(parent_row[i] is not None for i in (4, 5, 6))
+                or child[2:4] != ("subagent", "Codex Desktop") or child[5] != expected or expected is None
+                or child[6] not in (None, parent)):
+            raise ValueError("native reviewer family or role unavailable")
+        safe_input.safe_json_loads(child[1], max_depth=8, max_bytes=512)
+        def unique_pairs(items):
+            value = {}
+            for key, item in items:
+                if key in value:
+                    raise ValueError("duplicate native metadata key")
+                value[key] = item
+            return value
+        source = json.loads(child[1], object_pairs_hook=unique_pairs,
+                            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("invalid native number")))
+        if (not isinstance(source, dict) or set(source) != {"subagent"}
+                or not isinstance(source["subagent"], dict) or set(source["subagent"]) != {"thread_spawn"}):
+            raise ValueError("native reviewer source unavailable")
+        spawn = source["subagent"]["thread_spawn"]
+        if (not isinstance(spawn, dict) or set(spawn) - {"parent_thread_id", "depth", "agent_path", "agent_role", "agent_nickname"}
+                or spawn.get("parent_thread_id") != parent or type(spawn.get("depth")) is not int or spawn["depth"] != 1
+                or not child[4] or spawn.get("agent_path") != child[4] or spawn.get("agent_role") != expected):
+            raise ValueError("native reviewer parent or role conflicts")
+        if (tuple(_native_path(item, uid, directory=True) for item in directories) != before
+                or _native_path(raw, uid, maximum=64_000_000) != wal_binding):
+            raise ValueError("native review WAL binding changed")
+        return {"family": "codex", "agent_type": expected, "model": None,
+                "source": "Codex native reviewer metadata; parent bound to native WAL session"}
+    except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, RuntimeError):
+        raise SpecError("native reviewer metadata unavailable or conflicting", EXIT_USAGE) from None
+
+
 def wal_entries(path: Path):
     try:
         raw = read_regular(path, 64_000_000)
@@ -1558,18 +1708,22 @@ def cmd_review(args, spec_policy):
         if not args.wal or not args.verdict or not args.report_file:
             raise SpecError("--agent needs --wal <main WAL>, --verdict and --report-file", EXIT_USAGE)
         agent = safe_id(args.agent)
-        types = [e.get("agent_type") for e in wal_entries(checked_wal(Path(args.wal)))
-                 if e.get("event") == "subagent" and e.get("agent_id") == agent]
-        if not types:
-            raise SpecError(f"agent {args.agent} has no subagent record in {args.wal}")
-        if types[0] not in REVIEWER_AGENT_TYPES:
-            raise SpecError(f"agent {args.agent} is a {types[0] or 'typeless'} agent; only "
-                            f"{', '.join(REVIEWER_AGENT_TYPES)} agents may record a review")
-        if args.role == "adversarial" and types[0] != "red-team":
-            raise SpecError("the adversarial review must come from a red-team agent, a helper receipt or a human")
+        native = _native_review_source(Path(args.wal), agent, args.role)
+        if native is None:
+            types = [e.get("agent_type") for e in wal_entries(checked_wal(Path(args.wal)))
+                     if e.get("event") == "subagent" and e.get("agent_id") == agent]
+            if not types:
+                raise SpecError(f"agent {args.agent} has no subagent record in {args.wal}")
+            if types[0] not in REVIEWER_AGENT_TYPES:
+                raise SpecError(f"agent {args.agent} is a {types[0] or 'typeless'} agent; only "
+                                f"{', '.join(REVIEWER_AGENT_TYPES)} agents may record a review")
+            if args.role == "adversarial" and types[0] != "red-team":
+                raise SpecError("the adversarial review must come from a red-team agent, a helper receipt or a human")
+            provenance = {"model": types[0], "source": f"WAL-verified {types[0]} agent", "agent_type": types[0]}
+        else:
+            provenance = native
         data = read_regular(Path(args.report_file), 1_000_000)
-        entry = {"kind": "agent", "identity": agent, "model": types[0], "verdict": args.verdict,
-                 "source": f"WAL-verified {types[0]} agent", "agent_type": types[0],
+        entry = {"kind": "agent", "identity": agent, "verdict": args.verdict, **provenance,
                  "report": {"path": str(Path(args.report_file).absolute()), "sha256": sha256_bytes(data)}}
     elif args.human:
         if not args.verdict or not args.source:
