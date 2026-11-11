@@ -50,6 +50,19 @@ class ProcessIdentity:
 
 
 @dataclass(frozen=True)
+class TerminalBoundary:
+    pid: int
+    parent: int
+    uid: int
+    executable: str
+    unique_id: int
+    parent_unique_id: int
+    id_version: int
+    original_parent_version: int
+    executable_uuid: bytes
+
+
+@dataclass(frozen=True)
 class CodeIdentity:
     identifier: str
     team: str
@@ -84,6 +97,32 @@ def _approved_code(code, process):
             and os.path.realpath(code.executable) == os.path.realpath(process.executable))
 
 
+def _valid_boundary(value, pid):
+    return (isinstance(value, TerminalBoundary) and type(value.pid) is int and value.pid == pid
+            and 1 < pid < 2 ** 31 and type(value.parent) is int
+            and 0 < value.parent < 2 ** 31 and value.parent != pid
+            and type(value.uid) is int and value.uid == 0 and value.executable == "/usr/bin/login"
+            and all(type(n) is int and 0 < n < 2 ** 64 for n in (value.unique_id, value.parent_unique_id))
+            and type(value.id_version) is int and -(2 ** 31) <= value.id_version < 2 ** 31
+            and value.id_version != 0 and type(value.original_parent_version) is int
+            and -(2 ** 31) <= value.original_parent_version < 2 ** 31
+            and type(value.executable_uuid) is bytes
+            and len(value.executable_uuid) == 16 and any(value.executable_uuid))
+
+
+def _chain_change(backend, chain, codes):
+    for previous in chain:
+        if backend.process(previous.pid) != previous:
+            return "process_changed"
+    for previous, code in zip(chain, codes):
+        if backend.signature(previous.pid) != code:
+            return "code_identity_unverified"
+    for previous in chain:
+        if backend.process(previous.pid) != previous:
+            return "process_changed"
+    return None
+
+
 def probe_runtime_origin(pid=None, *, backend=None):
     """Bounded origin-only probe; a supplied backend is an in-process test double."""
     pid = os.getpid() if pid is None else pid
@@ -93,7 +132,7 @@ def probe_runtime_origin(pid=None, *, backend=None):
             if sys.platform != "darwin":
                 return OriginObservation("unknown", False, "unsupported_platform")
             backend = DarwinBackend()
-        chain, seen, barrier, candidate = [], set(), False, None
+        chain, codes, seen, barrier, candidate, boundary = [], [], set(), False, None, None
         current = pid
         for _ in range(32):
             if current <= 1:
@@ -104,12 +143,14 @@ def probe_runtime_origin(pid=None, *, backend=None):
             try:
                 process = backend.process(current)
             except OSError:
-                # A Terminal session has root-owned /usr/bin/login above its shell; the kernel withholds its BSD
-                # info from the user. It cannot be an OpenAI runtime that launched this caller, so it ends the walk.
-                # Only the exact system path counts, and never the caller itself; anything else stays uncertain.
-                if current != pid and getattr(backend, "is_terminal_login", lambda _pid: False)(current):
-                    break
-                raise
+                # Full BSD info is same-user restricted. The smaller kernel APIs
+                # can bind a root login to a stable process and executable generation.
+                if current == pid or not chain or chain[-1].parent != current:
+                    raise
+                boundary = backend.terminal_login_identity(current)
+                if not _valid_boundary(boundary, current):
+                    raise OSError("terminal boundary identity unavailable")
+                break
             if not _valid_process(process, current):
                 return OriginObservation("unknown", native, "invalid_process_identity")
             chain.append(process)
@@ -118,6 +159,9 @@ def probe_runtime_origin(pid=None, *, backend=None):
             # query the running guest for every ancestor before classifying it.
             native = native or name == "codex"
             first = backend.signature(current)
+            if first is not None and not isinstance(first, CodeIdentity):
+                raise OSError("running code observation unavailable")
+            codes.append(first)
             if _approved_code(first, process):
                 native = True
                 if not barrier:
@@ -130,18 +174,22 @@ def probe_runtime_origin(pid=None, *, backend=None):
             current = process.parent
         else:
             return OriginObservation("unknown", native, "ancestry_limit")
+        changed = _chain_change(backend, chain, codes)
+        if changed:
+            return OriginObservation("unknown", native, changed)
+        if boundary is not None:
+            for _ in range(2):
+                repeated = backend.terminal_login_identity(boundary.pid)
+                if not _valid_boundary(repeated, boundary.pid) or repeated != boundary:
+                    return OriginObservation("unknown", native, "process_changed")
+                changed = _chain_change(backend, chain, codes)
+                if changed:
+                    return OriginObservation("unknown", native, changed)
         if candidate is None:
             return OriginObservation("unknown", native, "nearer_other_runtime" if native else "no_native_runtime")
-        for previous in chain:
-            if backend.process(previous.pid) != previous:
-                return OriginObservation("unknown", True, "process_changed")
-        second = backend.signature(candidate.pid)
-        for previous in chain:
-            if backend.process(previous.pid) != previous:
-                return OriginObservation("unknown", True, "process_changed")
-        if first != second or not _approved_code(second, candidate):
+        if not _approved_code(codes[-1], candidate):
             return OriginObservation("unknown", True, "code_identity_unverified")
-        return OriginObservation("openai", True, "running_code_verified", candidate.pid, first)
+        return OriginObservation("openai", True, "running_code_verified", candidate.pid, codes[-1])
     except (OSError, ValueError, TypeError, AttributeError, OverflowError):
         return OriginObservation("unknown", native, "probe_failed")
 
@@ -169,6 +217,18 @@ class DarwinBackend:
         _fields_ += [("comm", ct.c_char * 16), ("name", ct.c_char * 32)]
         _fields_ += [(name, ct.c_uint32) for name in ("nfiles", "pgid", "pjobc", "tdev", "tpgid")]
         _fields_ += [("nice", ct.c_int32), ("start_sec", ct.c_uint64), ("start_usec", ct.c_uint64)]
+
+    class ShortBSDInfo(ct.Structure):
+        _fields_ = [(name, ct.c_uint32) for name in ("pid", "ppid", "pgid", "status")]
+        _fields_ += [("comm", ct.c_char * 16)]
+        _fields_ += [(name, ct.c_uint32) for name in
+                    ("flags", "uid", "gid", "ruid", "rgid", "svuid", "svgid", "reserved")]
+
+    class UniqueInfo(ct.Structure):
+        _fields_ = [("uuid", ct.c_ubyte * 16), ("uniqueid", ct.c_uint64),
+                    ("parent_uniqueid", ct.c_uint64), ("idversion", ct.c_int32),
+                    ("original_parent_version", ct.c_int32), ("reserve2", ct.c_uint64),
+                    ("reserve3", ct.c_uint64)]
 
     def __init__(self):
         if sys.platform != "darwin":
@@ -211,11 +271,36 @@ class DarwinBackend:
         return ProcessIdentity(info.pid, info.ppid, info.uid, info.start_sec * 1000000 + info.start_usec,
                                path.value.decode("utf-8", "strict"))
 
-    def is_terminal_login(self, pid):
+    def terminal_login_identity(self, pid):
+        # Apple proc_info.h/proc_info_private.h: flavors 13 and 17. Unlike
+        # full BSD info, these do not require the target to have our UID.
+        if (type(pid) is not int or not 1 < pid < 2 ** 31
+                or ct.sizeof(self.ShortBSDInfo) != 64 or ct.sizeof(self.UniqueInfo) != 56):
+            raise OSError("terminal boundary ABI unavailable")
+        def unique():
+            info = self.UniqueInfo()
+            if self.proc.proc_pidinfo(pid, 17, 0, ct.byref(info), 56) != 56:
+                raise OSError("kernel process generation unavailable")
+            return info
+        before = unique()
+        info = self.ShortBSDInfo()
+        if self.proc.proc_pidinfo(pid, 13, 0, ct.byref(info), 64) != 64:
+            raise OSError("kernel short process identity unavailable")
         path = ct.create_string_buffer(4096)
-        if self.proc.proc_pidpath(pid, path, len(path)) <= 0:
-            return False
-        return path.value == b"/usr/bin/login"
+        path_size = self.proc.proc_pidpath(pid, path, len(path))
+        if path_size <= 0 or path_size != len(path.value) or path_size >= len(path):
+            raise OSError("kernel executable identity unavailable")
+        after = unique()
+        meaningful = lambda value: (bytes(value.uuid), value.uniqueid, value.parent_uniqueid,
+                                    value.idversion, value.original_parent_version)
+        if meaningful(before) != meaningful(after):
+            raise OSError("kernel process generation changed")
+        value = TerminalBoundary(info.pid, info.ppid, info.uid, path.value.decode("utf-8", "strict"),
+                                 before.uniqueid, before.parent_uniqueid, before.idversion,
+                                 before.original_parent_version, bytes(before.uuid))
+        if not _valid_boundary(value, pid):
+            raise OSError("terminal boundary identity unavailable")
+        return value
 
     def _constant(self, name):
         return ct.c_void_p.in_dll(self.sec, name).value
