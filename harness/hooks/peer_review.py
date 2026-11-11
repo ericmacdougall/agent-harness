@@ -800,9 +800,11 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         timeout = min(720, options.get('timeout', 720), remaining)
         leased = False
         resolution, code, stdout, stderr = None, None, '', ''
+        launch_state, local_detail = 'NOT_STARTED', ''
         try:
             if provider == 'kimi':
                 resolution = {'path': 'kimi_review.py'}
+                launch_state = 'UNCONFIRMED'
                 code, stdout, stderr, launched = kimi_attempt(
                     prompt.replace(verdict, 'Begin exactly KIMI_ADVISORY: ACCEPT or KIMI_ADVISORY: BLOCK.'),
                     options.get('packet_path'), timeout)
@@ -836,6 +838,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                         if timeout <= 0:
                             outcome = {**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}
                         else:
+                            launch_state = 'UNCONFIRMED'
                             options['launches'] += 1
                             # The child is recorded for the usage guard's liveness rule when a run record exists.
                             code, stdout, stderr = run(cmd, prompt, snapshot, timeout,
@@ -843,10 +846,12 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                             last_message = last.read_text(errors='replace') if last.exists() else ''
                             outcome = normalize_provider(provider, code, stdout, stderr, last_message, stage)
         except GuardError as error:
+            local_detail = diagnostics.sanitize(error.message)
             outcome = {**provider_failure({}), 'reason': error.reason,
                        'fallback_allowed': error.reason in {'QUOTA', 'AUTH'}}
         options.setdefault('attempts', []).append(
-            diagnostics.provider_attempt(provider, resolution, code, stdout, stderr, outcome))
+            diagnostics.provider_attempt(provider, resolution, code, stdout, stderr, outcome,
+                                         launch_state=launch_state, local_detail=local_detail))
         if outcome.get('usage') is not None:
             options['usage'].append({'provider': provider, 'reported': outcome['usage']})
         if leased and outcome['reason'] not in {'TIMEOUT', 'UNKNOWN'}:
