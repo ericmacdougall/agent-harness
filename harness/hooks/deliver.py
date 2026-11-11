@@ -28,7 +28,7 @@ from github_identity import github_repository, repository_name
 from git_safety import git_environment, require_safe_source
 from integrate_local import (ALLOWED_GIT_ENV, CheckInterpreterError, CheckLog, ExternalApplyError,
                              OriginalScope, acquire_scope_lock, approved_check, approved_prepare, redact_output,
-                             require_check_interpreters,
+                             require_check_interpreters, require_scoped_environment,
                              checkout_identity, git_common_directory, journal_key,
                              fsync_directory, private_directory, read_journal, run as run_check,
                              scope_key, scoped_check_context, valid_identity_text, write_journal)
@@ -1445,6 +1445,7 @@ def resume_executor():
 
 def delivery_check_scope(flow, checks, *, target=None):
     try:
+        require_scoped_environment(checks)
         return scoped_check_context(checks, flow.original, flow.state['source_head'], target=target)
     except CheckInterpreterError as error:
         raise DeliveryError('BLOCKED_POLICY', str(error), code=2) from None
@@ -1587,6 +1588,8 @@ def remote_finish(flow, preparations, checks):
                 if origin_destination(flow.original)[0] != state["repository"]:
                     raise DeliveryError("BLOCKED_POLICY", "Original repository changed before sync", code=2)
                 verify_remote_descendant(flow, url, target)
+                if check_scope is not None and delivery_check_scope(flow, checks, target=target) != check_scope:
+                    raise DeliveryError("RECHECK_REQUIRED", "Scoped original custody changed before sync")
                 flow.save(phase="REMOTE_APPLYING", target=target, merge_head=merge_head,
                           apply_base=current, checks_digest=digest)
                 guard = scope.reserve_external(base=current, target=target, task_digest=task_generation_digest(flow))
@@ -1594,6 +1597,8 @@ def remote_finish(flow, preparations, checks):
                 if snapshot(flow.original, flow.branch) != current:
                     raise DeliveryError("RECHECK_REQUIRED", "Original changed before fast-forward")
                 if current != target:
+                    if check_scope is not None and delivery_check_scope(flow, checks, target=target) != check_scope:
+                        raise DeliveryError("RECHECK_REQUIRED", "Scoped original custody changed before fast-forward")
                     code, _ = git(flow.original, "merge", "--ff-only", "--no-overwrite-ignore",
                                   "--no-autostash", target, timeout=args.timeout)
                     if code:

@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
-import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
 
@@ -194,6 +194,7 @@ class CheckInterpreterError(OSError):
 SCOPED_HARNESS_ROOT = Path('/home/eric/delivery/goodqa-01a1c402/bugtracker-harness')
 SCOPED_HARNESS_REPOSITORY = 'ericmacdougall/bugtracker-harness'
 SCOPED_HOME = '/home/eric'
+SCOPED_RESULT_ROOT = Path('/home/eric/.agent-harness/work')
 SCOPED_TOOLS = {
     'python3': (Path('/usr/bin/python3'), Path('/usr/bin/python3.12')),
     'go': (Path('/usr/bin/go'), Path('/usr/lib/go-1.22/bin/go')),
@@ -217,6 +218,10 @@ SCOPED_UNITTEST = tuple(
     )
 )
 SCOPED_PYTEST = ('python3', '-m', 'pytest', '-q', 'bin/test_goodqa_bugs_release.py')
+SCOPED_HOLDS = {
+    SCOPED_DESKTOP: SCOPED_DESKTOP_HOLD,
+    SCOPED_PYTEST: 'Scoped pytest requires a qualified distribution and startup closure',
+}
 _GO_RELEASE = 'harness/framework/cmd/harness-release'
 _GO_GUARD = 'harness/framework/internal/testguard'
 _GO_BINDING = 'TestProductionTransportSelectorStopsBeforePython'
@@ -232,13 +237,14 @@ SCOPED_GO = ('go', '-C', 'framework', 'test', '-mod=readonly', '-count=1', '-jso
 SCOPED_GO_CURRENT = (*SCOPED_GO[:8], f'^({_GO_BINDING}|{_GO_TRIAGE}|{_GO_LISTENER}|{_GO_CLASSIFIER})$',
                      *SCOPED_GO[9:])
 SCOPED_GO_SOURCES = {SCOPED_GO: SCOPED_HARNESS_SOURCE, SCOPED_GO_CURRENT: SCOPED_HARNESS_CURRENT}
-SCOPED_HARNESS = frozenset((*SCOPED_UNITTEST, SCOPED_PYTEST, *SCOPED_GO_SOURCES))
+SCOPED_HARNESS = frozenset((*SCOPED_UNITTEST, *SCOPED_GO_SOURCES))
 
 
 def scoped_environment(command, environment):
     if tuple(command) not in SCOPED_HARNESS:
         raise CheckInterpreterError('Unknown scoped delivery profile')
-    forbidden = {'LANE_ROOT', 'QAC_API', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT', 'BASH_ENV', 'ENV'}
+    forbidden = {'LANE_ROOT', 'QAC_API', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT', 'BASH_ENV', 'ENV',
+                 'TMPDIR', 'TEMP', 'TMP', 'TEMPDIR'}
     prefixes = ('QAC_BINDING', 'DYLD_', 'PYTHON', 'PYTEST_', 'GIT_')
     if tuple(command) in SCOPED_GO_SOURCES:
         forbidden.update({'CC', 'CXX', 'AR', 'PKG_CONFIG', 'GOFLAGS', 'GOTOOLCHAIN', 'GOWORK', 'GOENV',
@@ -256,9 +262,13 @@ def scoped_environment(command, environment):
     child['PATH'] = '/usr/bin:/bin'
     if tuple(command) in SCOPED_GO_SOURCES:
         child.update(GOTOOLCHAIN='local', GOWORK='off', GOENV='off', GOPROXY='off', GOSUMDB='off', CGO_ENABLED='0')
-    else:
-        child.update(PYTHONDONTWRITEBYTECODE='1', PYTHONNOUSERSITE='1', PYTEST_DISABLE_PLUGIN_AUTOLOAD='1')
     return child
+
+
+def require_scoped_environment(commands):
+    for command in commands:
+        if tuple(command) in SCOPED_HARNESS:
+            scoped_environment(command, os.environ)
 
 
 def _unique_json_record(pairs):
@@ -524,6 +534,8 @@ class ScopedCheckContext(NamedTuple):
     source: str
     target: str | None
     journal: Path | None
+    result_root: Path
+    result_identity: tuple
 
 
 def _scoped_original(repo):
@@ -557,11 +569,84 @@ def _scoped_tree(repo, target, source):
         raise CheckInterpreterError('Scoped check target differs from the reviewed harness tree') from None
 
 
+def _scoped_result_root():
+    try:
+        root = SCOPED_RESULT_ROOT
+        if not root.is_absolute() or root.resolve(strict=True) != root:
+            raise OSError()
+        info = private_directory(root, create=False)
+        return root, (info.st_dev, info.st_ino)
+    except (OSError, RuntimeError):
+        raise CheckInterpreterError('Scoped check needs its canonical owner-only result root') from None
+
+
+@contextmanager
+def _scoped_artifacts(context):
+    root = context.result_root, context.result_identity
+    if _scoped_result_root() != root:
+        raise CheckInterpreterError('Scoped check result root changed')
+    directory = Path(tempfile.mkdtemp(prefix='scoped-delivery-result-', dir=context.result_root))
+    identity = checkout_identity(directory)
+    try:
+        private_directory(directory, create=False)
+        if _scoped_result_root() != root or directory.resolve(strict=True) != directory:
+            raise CheckInterpreterError('Scoped check result directory changed')
+        yield directory
+    finally:
+        if (_scoped_result_root() != root or directory.resolve(strict=True) != directory
+                or checkout_identity(directory) != identity):
+            raise CheckInterpreterError('Scoped check result directory changed; cleanup held')
+        shutil.rmtree(directory)
+
+
+def _scoped_no_extras(repo):
+    code, extra = _bounded_git(repo, ['ls-files', '--others', '--directory', '-z'],
+                               git_environment(), timeout=5, limit=4096)
+    if code or extra:
+        raise CheckInterpreterError('Scoped check checkout contains untracked or ignored inputs')
+
+
+def _scoped_original_inputs(repo, commands, target):
+    """Check hazards in the existing checkout and modes in the pinned target."""
+    try:
+        require_safe_source(repo, git_environment(), timeout=5)
+        _scoped_no_extras(repo)
+        paths = {path for command in commands for path in _scoped_paths(command)}
+        for relative in sorted(paths):
+            if target is not None:
+                row = inspect_git(repo, 'ls-tree', target, '--', relative, timeout=5)
+                if row.returncode or re.fullmatch(
+                        r'100(?:644|755) blob [0-9a-f]{40}\t' + re.escape(relative) + r'\n', row.stdout) is None:
+                    raise CheckInterpreterError('Scoped target input is missing or has an unsafe Git mode')
+            parts = Path(relative).parts
+            path = repo
+            for part in parts[:-1]:
+                path /= part
+                try:
+                    mode = path.lstat().st_mode
+                except FileNotFoundError:
+                    break
+                if not stat.S_ISDIR(mode):
+                    raise CheckInterpreterError('Scoped original input has an aliased or invalid ancestor')
+            else:
+                try:
+                    _scoped_file_row(path / parts[-1])
+                except FileNotFoundError:
+                    pass
+    except CheckInterpreterError:
+        raise
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+        raise CheckInterpreterError('Scoped original or target inputs could not be verified') from None
+
+
 def scoped_check_context(commands, original, source, *, target=None, checkout=None, journal=None):
     """Bind only the new profiles to the canonical source and worktree."""
-    if any(tuple(command) == SCOPED_DESKTOP for command in commands):
-        raise CheckInterpreterError(SCOPED_DESKTOP_HOLD)
-    if not any(tuple(command) in SCOPED_HARNESS for command in commands):
+    typed = [tuple(command) for command in commands]
+    for command in typed:
+        if command in SCOPED_HOLDS:
+            raise CheckInterpreterError(SCOPED_HOLDS[command])
+    active = [command for command in typed if command in SCOPED_HARNESS]
+    if not active:
         return None
     if source not in SCOPED_HARNESS_TREES or any(
             tuple(command) in SCOPED_GO_SOURCES and SCOPED_GO_SOURCES[tuple(command)] != source
@@ -570,10 +655,13 @@ def scoped_check_context(commands, original, source, *, target=None, checkout=No
     path, identity, common, common_id = _scoped_original(original)
     if target is not None:
         _scoped_tree(path, target, source)
+    _scoped_original_inputs(path, active, target)
+    result_root, result_identity = _scoped_result_root()
     candidate = Path(checkout) if checkout is not None else path
     try:
         context = ScopedCheckContext(path, identity, common, common_id, candidate,
-                                     checkout_identity(candidate), source, target, journal)
+                                     checkout_identity(candidate), source, target, journal,
+                                     result_root, result_identity)
         if candidate != path:
             _scoped_checkout(candidate, context)
         return context
@@ -620,8 +708,6 @@ def _scoped_paths(command):
             'framework/cmd/harness-release/triage_release_test.go',
             'framework/internal/testguard/held_listener_linux_test.go',
         )
-    if command == SCOPED_PYTEST:
-        return command[-1], 'conftest.py', 'pyproject.toml'
     return (command[5] + '/' + command[7],)
 
 
@@ -655,10 +741,7 @@ def _scoped_inputs(repo, command, context):
             bindings[relative] = before, expected[1]
         if command in SCOPED_UNITTEST:
             _unique_discovery_file(path / command[5], command[7])
-        code, extra = _bounded_git(path, ['ls-files', '--others', '--directory', '-z'],
-                                   git_environment(), timeout=5, limit=4096)
-        if code or extra:
-            raise CheckInterpreterError('Scoped check checkout contains untracked or ignored inputs')
+        _scoped_no_extras(path)
         return head.stdout.strip(), bindings
     except CheckInterpreterError:
         raise
@@ -711,11 +794,11 @@ def _scoped_tool(command, environment, repo):
             if result.returncode or version is None or (int(version[1]), int(version[2])) < (1, 22):
                 raise ValueError()
         else:
-            resolve_check_interpreter(str(tool), environment, timeout=5)
-            if command == SCOPED_PYTEST:
-                probe = 'import importlib.util, sys; sys.exit(importlib.util.find_spec("pytest") is None)'
-                if run_process([str(tool), '-I', '-c', probe], env=environment, timeout=5).returncode:
-                    raise ValueError()
+            probe = 'import sys; print("%d.%d" % sys.version_info[:2])'
+            result = run_process([str(tool), '-I', '-S', '-B', '-c', probe], env=environment, timeout=5)
+            version = re.fullmatch(r'(\d+)\.(\d+)\n?', result.stdout or '')
+            if result.returncode or version is None or (int(version[1]), int(version[2])) < MIN_CHECK_PYTHON:
+                raise ValueError()
         if _scoped_file_row(tool) != row or declared.resolve(strict=True) != tool:
             raise ValueError()
         return tool, row
@@ -723,44 +806,9 @@ def _scoped_tool(command, environment, repo):
         raise CheckInterpreterError('Scoped check needs the qualified external test interpreter') from None
 
 
-def scoped_pytest_passed(report, relative):
-    """Consume only an owned, bounded xunit1 report for the selected test file."""
-    try:
-        fd = os.open(report, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-        with os.fdopen(fd, 'rb') as source:
-            before = os.fstat(source.fileno())
-            if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid != os.geteuid()
-                    or not 0 < before.st_size <= 262_144):
-                return False
-            data = source.read(262_145)
-            after = os.fstat(source.fileno())
-        identity = lambda row: (row.st_dev, row.st_ino, row.st_mode, row.st_size, row.st_mtime_ns, row.st_ctime_ns)
-        if len(data) != before.st_size or not (
-                identity(before) == identity(after) == identity(report.stat(follow_symlinks=False))):
-            return False
-        text = data.decode('utf-8')
-        if '<!' in text:
-            return False
-        root = ET.fromstring(text)
-        if root.tag != 'testsuites' or len(root) != 1 or root[0].tag != 'testsuite':
-            return False
-        suite = root[0]
-        cases = suite.findall('testcase')
-        names = [case.get('name', '') for case in cases]
-        return (0 < len(cases) <= 1024 and len(set(names)) == len(names)
-                and len(cases) == len(suite)
-                and suite.get('tests') == str(len(cases))
-                and all(suite.get(key) == '0' for key in ('errors', 'failures', 'skipped'))
-                and all(case.get('file') == relative and name.startswith('test_')
-                        and not any(child.tag not in ('system-out', 'system-err') for child in case)
-                        for case, name in zip(cases, names)))
-    except (OSError, ET.ParseError, ValueError):
-        return False
-
-
 def run_scoped_check(repo, command, context, environment, timeout, sink):
-    if command == SCOPED_DESKTOP:
-        raise CheckInterpreterError(SCOPED_DESKTOP_HOLD)
+    if command in SCOPED_HOLDS:
+        raise CheckInterpreterError(SCOPED_HOLDS[command])
     if not isinstance(context, ScopedCheckContext):
         raise CheckInterpreterError('Scoped check requires a bound delivery context')
     if type(timeout) is not int or not 1 <= timeout <= 7200:
@@ -769,26 +817,26 @@ def run_scoped_check(repo, command, context, environment, timeout, sink):
         raise CheckInterpreterError('Scoped Go check does not match the qualified source revision')
     scoped = scoped_environment(command, environment)
     before = _scoped_inputs(repo, command, context)
+    root = context.result_root, context.result_identity
+    if _scoped_result_root() != root:
+        raise CheckInterpreterError('Scoped check result root changed')
     tool, tool_row = _scoped_tool(command, scoped, context.original)
     if tool.is_relative_to(context.checkout):
         raise CheckInterpreterError('Scoped check interpreter is inside the check checkout')
-    with tempfile.TemporaryDirectory(prefix='scoped-delivery-result-') as directory:
-        report = Path(directory) / 'result.xml'
-        scoped['TMPDIR'] = directory
+    with _scoped_artifacts(context) as directory:
+        scoped['TMPDIR'] = str(directory)
         evidence = ScopedGoEvidence(command) if command in SCOPED_GO_SOURCES else None
         argv = [str(tool), *command[1:]]
         if evidence is not None:
-            scoped['GOCACHE'] = str(Path(directory) / 'go-cache')
-            scoped['GOMODCACHE'] = str(Path(directory) / 'go-modules')
+            scoped['GOCACHE'] = str(directory / 'go-cache')
+            scoped['GOMODCACHE'] = str(directory / 'go-modules')
         if command in SCOPED_UNITTEST:
-            argv = [str(tool), '-c', NONEMPTY_UNITTEST, *command[3:]]
-        elif command == SCOPED_PYTEST:
-            argv.extend(('-p', 'no:cacheprovider', '-o', 'junit_family=xunit1', '--junitxml', str(report)))
+            argv = [str(tool), '-S', '-B', '-c', NONEMPTY_UNITTEST, *command[3:]]
         result = run_process(argv, cwd=repo, env=scoped, timeout=timeout, discard_output=True,
                              sink=evidence)
-        valid = (evidence.passed() if evidence is not None else
-                 scoped_pytest_passed(report, command[-1]) if command == SCOPED_PYTEST else True)
-    if _scoped_file_row(tool) != tool_row or _scoped_inputs(repo, command, context) != before:
+        valid = evidence is None or evidence.passed()
+    if (_scoped_result_root() != root or _scoped_file_row(tool) != tool_row
+            or _scoped_inputs(repo, command, context) != before):
         raise CheckInterpreterError('Scoped check changed an input or executable identity')
     if result.returncode == 0 and not valid:
         return subprocess.CompletedProcess(command, 1, None, None)
@@ -950,7 +998,7 @@ def run(repo, command, *, timeout=None, discard_output=False, env=None, sink=Non
         output_options['sink'] = sink
     environment = os.environ if env is None else env
     typed = tuple(command)
-    if typed == SCOPED_DESKTOP or typed in SCOPED_HARNESS:
+    if typed in SCOPED_HOLDS or typed in SCOPED_HARNESS:
         return run_scoped_check(repo, typed, scoped_context, environment, timeout, sink)
     environment = {**environment, "PYTHONDONTWRITEBYTECODE": "1"}
     if command and command[0] == 'node':
@@ -974,16 +1022,18 @@ def check_timeout(args):
 
 def require_check_interpreters(commands, repo=None):
     """Fail before effects when a check's interpreter or Node protocol is unsupported."""
-    for command in commands:
-        typed = tuple(command)
-        if typed == SCOPED_DESKTOP:
-            raise CheckInterpreterError(SCOPED_DESKTOP_HOLD)
+    typed_commands = [tuple(command) for command in commands]
+    for typed in typed_commands:
+        if typed in SCOPED_HOLDS:
+            raise CheckInterpreterError(SCOPED_HOLDS[typed])
+    for typed in typed_commands:
         if typed in SCOPED_HARNESS:
             original, _, _, _ = _scoped_original(repo)
+            _scoped_result_root()
             _scoped_tool(typed, scoped_environment(typed, os.environ), original)
-        elif command and command[0] in CHECK_PYTHON_NAMES:
-            resolve_check_interpreter(command[0])
-    if any(command and command[0] == 'node' for command in commands):
+        elif typed and typed[0] in CHECK_PYTHON_NAMES:
+            resolve_check_interpreter(typed[0])
+    if any(typed and typed[0] == 'node' for typed in typed_commands):
         require_node_protocol(dict(os.environ), repo)
 
 
@@ -1039,7 +1089,7 @@ def focused_unittest(options):
 def approved_check(argv):
     if not argv:
         return False
-    if tuple(argv) == SCOPED_DESKTOP or tuple(argv) in SCOPED_HARNESS:
+    if tuple(argv) in SCOPED_HOLDS or tuple(argv) in SCOPED_HARNESS:
         return True
     if argv[0] == 'node':
         return focused_node(argv)
@@ -2116,6 +2166,7 @@ def integrate_scratch(args, preparations, checks):
         return 2
     repo = args.repo.resolve()
     try:
+        require_scoped_environment(checks)
         scoped_original = scoped_check_context(checks, repo, args.expected_source_head,
                                                target=args.expected_source_head)
     except CheckInterpreterError as error:
@@ -2312,6 +2363,15 @@ def integrate_scratch(args, preparations, checks):
                                    'Original or candidate changed before apply', phase='apply',
                                    candidate=candidate, recovery_ref=ref,
                                    original_head=inspect_git(repo, 'rev-parse', 'HEAD', timeout=30).stdout.strip())
+        if scoped_original is not None:
+            try:
+                pending_scope = scoped_check_context(checks, repo, args.expected_source_head, target=candidate)
+                if pending_scope._replace(target=scoped_original.target) != scoped_original:
+                    raise CheckInterpreterError('Scoped original custody changed before fast-forward')
+                scoped_original = pending_scope
+            except CheckInterpreterError as error:
+                return scratch_failure(repo, scratch, directory / 'journal.json', str(error), phase='apply',
+                                       candidate=candidate, recovery_ref=ref, original_head=observed_head(repo))
         advanced = run_git_discard_nohooks(repo, 'merge', '--ff-only', '--no-overwrite-ignore',
                                            '--no-autostash', candidate, timeout=args.timeout)
         observed = observed_head(repo)
@@ -2329,8 +2389,6 @@ def integrate_scratch(args, preparations, checks):
                                    'Original checkout advanced but is dirty or unverifiable',
                                    phase='verify', candidate=candidate, recovery_ref=ref,
                                    original_head=observed, status='DELIVERED_CHECK_FAILED')
-        if scoped_original is not None:
-            scoped_original = scoped_check_context(checks, repo, args.expected_source_head, target=candidate)
         for kind, commands in (('prepare', preparations), ('check', checks)):
             for command in commands:
                 phase = kind
