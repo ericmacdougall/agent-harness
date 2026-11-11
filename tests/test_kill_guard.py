@@ -656,6 +656,7 @@ class Policy(unittest.TestCase):
                     'command': ['self', 'cmd', 'pl', 'idx', 'depth'],
                     'inner_words': ['self', 'words', 'depth', 'pl', 'idx', 'via_xargs'],
                     'script': ['self', 'text', 'depth', 'tail_visible', 'ps'],
+                    'heredoc': ['self', 'rd', 'name', 'words', 'pl', 'idx', 'depth'],
                     'ssh': ['self', 'args', 'depth'],
                     'container': ['self', 'name', 'args', 'words', 'depth', 'pl', 'idx'],
                     'check_tokens': ['self', 'tokens'],
