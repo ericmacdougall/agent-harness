@@ -12,7 +12,9 @@ What it blocks, before the command runs, on Claude Code (Bash, PowerShell) and C
     eval or a shell; the guard does not compute what that text becomes;
   * a plain `kill PID` unless every target is a literal PID that is provably the caller's own: its cwd, or argv[0]
     or argv[1], is inside the caller's own git worktree (the toplevel of the tool call's cwd), or it is in the
-    per-worktree spawn ledger written by `kill_guard.py spawn -- CMD...`;
+    per-worktree spawn ledger written by `kill_guard.py spawn -- CMD...`, or it is (or descends from, or is in the
+    process group of) a run_in_background shell recorded by `kill_guard.py record-bg` (PostToolUse) or a bg_job.py
+    launch wrapper, with the start time still matching (goodqa#15565);
   * `netwatch orphans --kill --pid N[,N...]` unless every PID passes the same ownership proof, except that the main
     agent (proven by caller_identity.is_main) outside any git worktree, such as main in HOME, needs only the basic checks
     (not init, not its own ancestor, same uid, not a protected process or interactive shell);
@@ -28,7 +30,8 @@ It reuses command_guard.Analyzer for lexing, parsing, wrappers, aliases, heredoc
 overrides the methods listed in OVERRIDDEN (a test pins their signatures). Threat model: careless agents and common
 obfuscation, not an agent that edits its own hooks. See docs/operations.md, "Kill guard".
 
-Entry points: `hook` (PreToolUse launcher, fails closed), `analyze` (child process), `spawn`, `explain`.
+Entry points: `hook` (PreToolUse launcher, fails closed), `analyze` (child process), `spawn`, `explain`, `record-bg`
+(PostToolUse recorder, fails open).
 Python 3.9+, standard library only.
 """
 
@@ -357,13 +360,22 @@ def ledger_path(root, home=None):
     return state_dir(home) / ('ledger-%s.jsonl' % hashlib.sha256(root.encode('utf-8', 'replace')).hexdigest()[:16])
 
 
-def ledger_mac(key, root, pid, start, ts):
-    return hmac.new(key, ('%s\n%d\n%s\n%d' % (root, pid, start, ts)).encode('utf-8', 'replace'),
+LEDGER_KINDS = (None, 'group')
+LEDGER_COMPACT_BYTES = 1 << 20  # past this size append_ledger keeps only the newest LEDGER_KEEP_LINES rows
+LEDGER_KEEP_LINES = 2000  # what readers use anyway (ledger_max_lines)
+
+
+def ledger_mac(key, root, pid, start, ts, kind=None):
+    """A plain row (`kill_guard.py spawn`) proves one pid. A 'group' row (goodqa#15565) proves a tool-call shell or a
+    bg_job wrapper and what descends from it. Group rows have their own MAC domain, so neither kind can be relabelled
+    as the other, and readers that predate group rows reject them."""
+    prefix = '' if kind is None else '%s\n' % kind
+    return hmac.new(key, (prefix + '%s\n%d\n%s\n%d' % (root, pid, start, ts)).encode('utf-8', 'replace'),
                     hashlib.sha256).hexdigest()
 
 
-def read_ledger(root, home=None, max_lines=2000):
-    """Valid entries (pid, start) for this worktree. Anything unreadable, unsafe or unauthenticated yields nothing."""
+def _ledger_rows(root, home=None, max_lines=2000):
+    """Valid (kind, pid, start) rows for this worktree. Anything unreadable, unsafe or unauthenticated yields nothing."""
     key = read_key(home)
     if not key:
         return []
@@ -374,25 +386,96 @@ def read_ledger(root, home=None, max_lines=2000):
     for line in data.decode('utf-8', 'replace').splitlines()[-max_lines:]:
         try:
             entry = json.loads(line)
-            pid, start, ts, mac, entry_root = int(entry['pid']), str(entry['start']), int(entry['ts']), \
+            pid, start, ts, mac, entry_root = int(entry['pid']), entry['start'], int(entry['ts']), \
                 str(entry['mac']), str(entry['root'])
-        except (ValueError, KeyError, TypeError):
+            kind = entry.get('kind')
+        except (ValueError, KeyError, TypeError, AttributeError):
             continue
-        if entry_root == root and hmac.compare_digest(mac, ledger_mac(key, root, pid, start, ts)):
-            out.append((pid, start))
+        if kind not in LEDGER_KINDS:
+            continue
+        if kind is None:
+            start = str(start)  # unchanged rule for spawn rows
+        elif not isinstance(start, str) or not 1 < pid <= MAX_PID:
+            continue
+        if entry_root == root and hmac.compare_digest(mac, ledger_mac(key, root, pid, start, ts, kind)):
+            out.append((kind, pid, start))
     return out
 
 
-def append_ledger(root, pid, start, home=None):
+def read_ledger(root, home=None, max_lines=2000):
+    """Plain entries (pid, start) for this worktree, written by `kill_guard.py spawn`."""
+    return [(pid, start) for kind, pid, start in _ledger_rows(root, home, max_lines) if kind is None]
+
+
+def read_ledger_groups(root, home=None, max_lines=2000):
+    """Group entries (pid, start): recorded tool-call shells and bg_job wrappers of this worktree (goodqa#15565)."""
+    return [(pid, start) for kind, pid, start in _ledger_rows(root, home, max_lines) if kind == 'group']
+
+
+def _compact_ledger(path):
+    """Keep the newest LEDGER_KEEP_LINES rows. A row appended during the rewrite can be lost, which only makes a later
+    kill fail closed. Never follows links; the new file is created 0600 next to the old one and renamed over it."""
+    data = _read_secure_file(path, LEDGER_COMPACT_BYTES * 4, tail=True)
+    if data is None:
+        return
+    keep = data.decode('utf-8', 'replace').splitlines()[-LEDGER_KEEP_LINES:]
+    tmp = '%s.tmp.%d' % (path, os.getpid())
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    try:
+        os.write(fd, ''.join(line + '\n' for line in keep).encode('utf-8'))
+    finally:
+        os.close(fd)
+    os.replace(tmp, str(path))
+
+
+def append_ledger(root, pid, start, home=None, kind=None):
+    if kind not in LEDGER_KINDS:
+        raise ValueError('unknown ledger kind')
     key = ensure_key(home)
     ts = int(time.time())
-    entry = {'pid': pid, 'start': start, 'ts': ts, 'root': root, 'mac': ledger_mac(key, root, pid, start, ts)}
+    entry = {'pid': pid, 'start': start, 'ts': ts, 'root': root, 'mac': ledger_mac(key, root, pid, start, ts, kind)}
+    if kind is not None:
+        entry['kind'] = kind
     path = ledger_path(root, home)
     fd = os.open(str(path), os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, 'O_NOFOLLOW', 0), 0o600)
     try:
         os.write(fd, (json.dumps(entry, sort_keys=True) + '\n').encode('utf-8'))
+        size = os.fstat(fd).st_size
     finally:
         os.close(fd)
+    if size > LEDGER_COMPACT_BYTES:
+        try:
+            _compact_ledger(path)
+        except OSError:
+            pass  # the row is written; an uncompacted file is still read from its bounded tail
+
+
+def group_owned(probe, pid, groups, max_hops=64):
+    """True when pid is a recorded group root S whose start time still matches, descends from such an S through its
+    current parent chain, or is a member of process group S. For a group member, S must either still run with the
+    recorded start time or be gone: while any member of group S lives, the kernel does not hand out pid S again
+    (XNU and Linux both refuse a new pid that names a live process group or session)."""
+    if not groups:
+        return False
+    roots = {}
+    for root_pid, start in groups:
+        roots.setdefault(root_pid, set()).add(start)
+    cur, seen = pid, set()
+    for _ in range(max_hops):
+        if cur is None or cur <= 1 or cur in seen:
+            break
+        seen.add(cur)
+        if cur in roots and probe.start(cur) in roots[cur]:
+            return True
+        cur = probe.ppid(cur)
+    getter = getattr(probe, 'pgid', None)
+    group = getter(pid) if getter else None
+    if group is None or group == pid or group not in roots:
+        return False
+    start = probe.start(group)
+    if start is None:
+        return probe.uid(group) is None  # gone; a live process whose start cannot be read proves nothing
+    return start in roots[group]
 
 
 # ---- remote spawn ledger (goodqa#14927): the one route to a remote kill. Separate from the local ledger functions
@@ -533,15 +616,61 @@ def audit(rule, raw, pids, home=None):
 CLEAN_ENV = {'PATH': '/usr/sbin:/usr/bin:/bin:/sbin', 'LC_ALL': 'C'}
 
 
-def _run(argv, timeout=2.0, cwd=None, env=None):
+def _run(argv, timeout=2.0, cwd=None, env=None, any_status=False):
     try:
         done = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                               timeout=timeout, cwd=cwd, env=env or CLEAN_ENV, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
-    if done.returncode != 0:
+    if done.returncode != 0 and not (any_status and done.returncode > 0):
         return None
     return done.stdout[:65536].decode('utf-8', 'replace')
+
+
+LSOF_ADDR = re.compile(r'0x[0-9a-f]{1,32}')
+
+
+def parse_lsof_unix(text, pid):
+    """[(fd, own address, peer address or '')] for the unix sockets in `lsof -n -P -a -p PID -F ftdn` output (macOS).
+
+    As printed by macOS lsof (captured fixture: tests/data/lsof_unix_macos.json), each process starts with `pPID` and
+    each open file with `fFD`, followed by `tTYPE`, `dDEVICE` (for a unix socket, its kernel address) and `nNAME`
+    (`->0xPEER` for a connected socket, a path for a named one). Fails closed: a record is kept only under the
+    `p` line of the requested pid, with a numeric fd, type unix, a hex address and exactly one name line; a name that
+    is not exactly `->0x<hex>` gives an empty peer, which never proves a pairing. Output for any other pid, or no
+    output at all, yields nothing."""
+    rows, cur, here = [], None, False
+
+    def flush(record):
+        if record is None or not here or record.get('bad'):
+            return
+        names = record.get('n', [])
+        if record.get('t') != 'unix' or len(names) != 1 or not record['f'].isdigit() \
+                or not LSOF_ADDR.fullmatch(record.get('d', '')):
+            return
+        name = names[0]
+        peer = name[2:] if name.startswith('->') and LSOF_ADDR.fullmatch(name[2:]) else ''
+        rows.append((record['f'], record['d'], peer))
+
+    for line in (text or '').splitlines():
+        tag, value = line[:1], line[1:]
+        if tag == 'p':
+            flush(cur)
+            cur = None
+            here = value.isdigit() and int(value) == int(pid)
+        elif tag == 'f':
+            flush(cur)
+            cur = {'f': value}
+        elif cur is None:
+            continue
+        elif tag in ('t', 'd'):
+            if tag in cur:
+                cur['bad'] = True           # a repeated field: the record is not trusted
+            cur[tag] = value
+        elif tag == 'n':
+            cur.setdefault('n', []).append(value)
+    flush(cur)
+    return rows
 
 
 class Probe:
@@ -632,6 +761,78 @@ class Probe:
         parts = out.split() if out else []
         return parts[:4] or None
 
+    def pgid(self, pid):
+        try:
+            return os.getpgid(pid)
+        except (OSError, OverflowError):
+            return None
+
+    def sid(self, pid):
+        try:
+            return os.getsid(pid)
+        except (OSError, OverflowError):
+            return None
+
+    def table(self):
+        """{pid: (ppid, pgid, uid)} for every process, from one `ps` read; {} when it cannot be read."""
+        out = _run(['ps', '-axo', 'pid=,ppid=,pgid=,uid='], timeout=5.0)
+        table = {}
+        for line in (out or '').splitlines():
+            parts = line.split()
+            if len(parts) == 4 and all(p.isdigit() for p in parts):
+                pid, ppid, pgid, uid = (int(p) for p in parts)
+                table[pid] = (ppid, pgid, uid)
+        return table
+
+    def _unix_fds(self, pid, fds=None):
+        """[(fd, own address, peer address or '')] for the unix sockets of pid (macOS lsof); [] on Linux or error."""
+        if self.proc:
+            return []
+        argv = ['lsof', '-n', '-P', '-a', '-p', str(int(pid))] + (['-d', fds] if fds else []) + ['-F', 'ftdn']
+        return parse_lsof_unix(_run(argv, timeout=5.0, any_status=True), pid)
+
+    def stdio_sockets(self, pid):
+        """{1: (own, peer), 2: (own, peer)} for whichever of fd 1 and fd 2 are unix sockets."""
+        rows = [(int(f), own, peer) for f, own, peer in self._unix_fds(pid, '1,2') if f in ('1', '2')]
+        fds = [f for f, _own, _peer in rows]
+        return {f: (own, peer) for f, own, peer in rows if fds.count(f) == 1}
+
+    def unix_sockets(self, pid):
+        """{own address: peer address} for every unix socket pid holds. An address listed with two different peers
+        (malformed output) maps to '' so it proves nothing."""
+        result = {}
+        for _f, own, peer in self._unix_fds(pid):
+            result[own] = peer if result.get(own, peer) == peer else ''
+        return result
+
+    def fd_paths(self, pids):
+        """{pid: {path of fd 1, path of fd 2}} for the given pids (missing pids are left out)."""
+        pids = [int(p) for p in pids][:256]
+        result = {}
+        if not pids:
+            return result
+        if self.proc:
+            for pid in pids:
+                paths = set()
+                for fd in (1, 2):
+                    try:
+                        paths.add(os.readlink('/proc/%d/fd/%d' % (pid, fd)))
+                    except OSError:
+                        pass
+                if paths:
+                    result[pid] = paths
+            return result
+        # lsof exits 1 when any listed pid has gone, yet still prints the others: its status is not used
+        out = _run(['lsof', '-a', '-p', ','.join(str(p) for p in pids), '-d', '1,2', '-Fpn'], timeout=5.0,
+                   any_status=True)
+        current = None
+        for line in (out or '').splitlines():
+            if line.startswith('p') and line[1:].isdigit():
+                current = int(line[1:])
+            elif line.startswith('n') and current is not None:
+                result.setdefault(current, set()).add(line[1:])
+        return result
+
 
 # --------------------------------------------------------------------------- ownership
 
@@ -681,6 +882,7 @@ class Ownership:
         self._tree = None
         self._ancestors = None
         self._ledger = None
+        self._groups = None
         self._memo = {}
 
     def tree(self):
@@ -743,6 +945,10 @@ class Ownership:
         start = self.probe.start(pid)
         if start is not None and (pid, start) in self._ledger:
             return True, 'ledger', 'spawned by this worktree'
+        if self._groups is None:
+            self._groups = read_ledger_groups(root, self.home, int(self.policy.get('ledger_max_lines', 2000)))
+        if group_owned(self.probe, pid, self._groups):
+            return True, 'ledger-group', 'started by a background call or bg_job launch of this worktree'
         cwd = self.probe.cwd(pid)
         if cwd and self._inside(cwd, root, nested):
             return True, 'cwd', 'cwd is inside this worktree'
@@ -1963,6 +2169,103 @@ def _fallback(raw, text, why):
     return 0
 
 
+# --------------------------------------------------------------------------- record-bg (PostToolUse, goodqa#15565)
+
+TASK_ID = re.compile(r'[A-Za-z0-9_-]{1,64}')
+RECORD_MAX_STDIN = 1 << 20
+
+
+def stdio_bound_to(probe, pid, parent):
+    """True when fd 1 and fd 2 of pid are two DIFFERENT unix sockets, each paired with a socket that `parent` holds and
+    whose own peer is that fd (an unnamed pair, not a connection accepted on a named listening socket). Unknown or
+    unreadable facts are False. Linux is not supported yet (no peer data without sock_diag), so it is False there."""
+    mine = probe.stdio_sockets(pid) or {}
+    one, two = mine.get(1), mine.get(2)
+    if not one or not two or one[0] == two[0]:
+        return False
+    held = probe.unix_sockets(parent) or {}
+    return all(peer and held.get(peer) == own for own, peer in (one, two))
+
+
+def record_bg(payload, home=None, probe=None, runner=None):
+    """Record the shell of a run_in_background Bash call as a group row of the call's worktree. (pid, why) or
+    (None, why); it never raises for bad input and never signals anything.
+
+    Claude Code gives a PostToolUse hook no pid, only tool_response.backgroundTaskId, and runs the call in a shell S
+    that it starts as a session and process-group leader with stdout and stderr on .../tasks/<id>.output. S is
+    recorded only when ALL of these hold, read from the live process table:
+      * this recorder is a hook Claude Code started: a direct child of the session process whose fd 1 and fd 2 are
+        two distinct unix sockets paired with sockets that the session process holds (stdio_bound_to);
+      * S is a direct child of that same session process;
+      * S leads its own process group and session (so nothing outside S can join its group) and is the caller's uid;
+      * fd 1 or 2 of S is a file named exactly <backgroundTaskId>.output in a directory named tasks;
+      * exactly one process qualifies, and S's start time is the same before and after the checks.
+    A foreground call (no backgroundTaskId), a call outside a git worktree (main in HOME), a shell that has already
+    exited or redirected its output, and any ambiguity record nothing; a later kill then stays refused."""
+    if not isinstance(payload, dict) or str(payload.get('tool_name') or '') != 'Bash':
+        return None, 'not-bash'
+    response = payload.get('tool_response')
+    task = response.get('backgroundTaskId') if isinstance(response, dict) else None
+    if not isinstance(task, str) or not TASK_ID.fullmatch(task):
+        return None, 'not-background'
+    cwd = payload.get('cwd')
+    if not isinstance(cwd, str) or not cwd.startswith('/'):
+        return None, 'no-worktree'
+    root, _nested = find_worktree(cwd, home, runner)
+    if not root:
+        return None, 'no-worktree'
+    probe = probe or Probe()
+    me = os.getpid()
+    parent = probe.ppid(me)
+    # Bind the recorder to Claude Code itself (red-team F1). Measured on macOS 2026-11-09: Claude Code starts each hook
+    # as a direct child of the session process, in a new session of its own, with fd 1 and fd 2 on two distinct unix
+    # socketpairs whose other ends the session process holds. A tool shell is also a direct child, but its fd 1/2 are
+    # the tasks file and it holds only ONE socketpair to the session process (fd 11), so a process born inside a tool
+    # call, even one that execs this recorder in place of the tool shell after `exec 1>&11 2>&11`, fails here.
+    if parent is None or parent <= 1 or not stdio_bound_to(probe, me, parent):
+        return None, 'not-hook'
+    candidates = [pid for pid, (ppid, pgid, uid) in probe.table().items()
+                  if ppid == parent and pgid == pid and uid == os.getuid() and pid != me]
+    wanted = task + '.output'
+    matches = [pid for pid, paths in probe.fd_paths(candidates).items() if pid in candidates and any(
+        isinstance(p, str) and os.path.basename(p) == wanted and os.path.basename(os.path.dirname(p)) == 'tasks'
+        for p in paths)]
+    if not matches:
+        return None, 'no-shell'
+    if len(matches) > 1:
+        return None, 'ambiguous'
+    shell = matches[0]
+    first = probe.start(shell)
+    if first is None or probe.sid(shell) != shell or probe.pgid(shell) != shell or probe.uid(shell) != os.getuid() \
+            or probe.ppid(shell) != parent or probe.start(shell) != first:
+        return None, 'unproven'
+    append_ledger(root, shell, first, home, kind='group')
+    return shell, 'recorded'
+
+
+def record_bg_main():
+    """PostToolUse entry. Fails open and prints nothing on its own errors: it only ever adds proof, so a failure
+    leaves the old behaviour (a refused kill), never a wrong allow."""
+    if hasattr(signal, 'SIGALRM'):
+        def _timeout(_s, _f):
+            raise TimeoutError('record-bg wall-clock limit')
+        signal.signal(signal.SIGALRM, _timeout)
+        signal.alarm(8)
+    try:
+        payload = json.loads(sys.stdin.buffer.read(RECORD_MAX_STDIN).decode('utf-8', 'replace'))
+        pid, why = record_bg(payload)
+        if pid is not None:
+            print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'additionalContext': (
+                'kill_guard: background shell pid %d is recorded for this worktree; it and the processes it starts '
+                'are yours to stop with kill PID.' % pid)}}))
+    except BaseException:  # noqa: BLE001
+        pass
+    finally:
+        if hasattr(signal, 'SIGALRM'):
+            signal.alarm(0)
+    return 0
+
+
 # --------------------------------------------------------------------------- spawn and explain
 
 def spawn_main(argv):
@@ -2032,7 +2335,7 @@ def explain_main(argv):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or argv[0] in ('-h', '--help'):
-        sys.stdout.write(__doc__.split('Entry points')[0] + 'Commands: hook | analyze | spawn | explain\n')
+        sys.stdout.write(__doc__.split('Entry points')[0] + 'Commands: hook | analyze | spawn | explain | record-bg\n')
         return 0
     command, rest = argv[0], argv[1:]
     if command == 'hook':
@@ -2041,6 +2344,8 @@ def main(argv=None):
         return analyze_main()
     if command == 'spawn':
         return spawn_main(rest)
+    if command == 'record-bg':
+        return record_bg_main()
     if command == 'explain':
         return explain_main(rest)
     sys.stderr.write('unknown command %s\n' % one_line(command, 30))
