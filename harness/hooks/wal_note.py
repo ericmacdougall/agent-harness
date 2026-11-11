@@ -50,7 +50,7 @@ SECRET_PATTERN = re.compile(
 )
 
 
-def provenance_check(event, source):
+def provenance_check(event, source, allow_mc=False):
     """(mode, problem-or-None, is_assumption). Never raises: a resolver failure is a problem, not a crash."""
     try:
         import provenance
@@ -62,7 +62,7 @@ def provenance_check(event, source):
             return mode, None, False
         if not source:
             return mode, f'{event} has no --source', False
-        result = provenance.resolve(source)
+        result = provenance.resolve(source, {'allow_mc': True} if allow_mc else None)
         if not result['ok']:
             first = result['problems'][0] if result['problems'] else {'code': 'rejected', 'message': 'rejected'}
             return mode, f"source rejected ({first['code']}): {first['message']}", result['assumption']
@@ -180,15 +180,22 @@ def main():
                               'hint': 'cite the answer: user:<session>/<uuid> "words", answer:<id> or queue:<id> (ah user-msg)'}),
                   file=sys.stderr)
             return 2
-        if not re.match(r'^(user:|uuid:|answer:|queue:|ticket:)', args.source.strip()):
-            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved source must be the answer: user:, answer:, queue: or ticket:',
+        if not re.match(r'^(user:|uuid:|answer:|queue:|mc:|ticket:)', args.source.strip()):
+            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved source must be the answer: user:, answer:, queue:, mc: or ticket:',
                               'hint': 'an ask cannot be closed on an inferred: or file: source'}), file=sys.stderr)
             return 2
-        mode, problem, assumption = provenance_check('ask', args.source)  # the answer is sourced like an ask (M1)
+        mode, problem, assumption = provenance_check('ask', args.source, allow_mc=True)  # the answer is sourced like an ask (M1)
         if problem:
             print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': problem[:300],
                               'hint': 'the resolution source must resolve: user:, answer:, queue: or ticket:'}), file=sys.stderr)
             return 2
+        if args.source.strip().lower().startswith('mc:'):
+            import provenance as _prov  # noqa: PLC0415
+            bound = _prov.mc_bind(args.source.strip(), args.ref, args.decision)
+            if bound:
+                print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': bound[:300],
+                                  'hint': 'an mc: source closes only the ask it names, with its own decision'}), file=sys.stderr)
+                return 2
         record['ref'] = args.ref
         if ask_wal:
             record['ask_wal'] = ask_wal

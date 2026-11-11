@@ -358,6 +358,17 @@ def parse_source(text: str) -> dict:
             raise Problem("excerpt-missing", f"a {kind}: source needs a verbatim quoted excerpt of the user's words")
         return {"kind": "user", "variant": kind, "session": found.group(1).lower(), "ident": ident, "excerpt": excerpt,
                 "uuid": ident if kind == "answer" else f"{ident[0]}#{ident[1]}"}
+    if kind == "mc":
+        # A Mission Control dashboard approval (spec GoodQA #15585). Same node shape as answer:, but resolve() only
+        # accepts it when the caller allows it (ask_resolved), and escalation never does.
+        found = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]{0,127})/(dash-[0-9A-HJKMNP-TV-Z]{26})\s*(.*)$", rest, re.S)
+        if not found:
+            raise Problem("bad-syntax", "mc: needs <session>/<dash-id> then a quoted excerpt")
+        excerpt = parse_excerpt(found.group(3))
+        if excerpt is None:
+            raise Problem("excerpt-missing", "an mc: source needs a verbatim quoted excerpt of the decision line")
+        return {"kind": "user", "variant": "mc", "session": found.group(1), "ident": found.group(2),
+                "excerpt": excerpt, "uuid": found.group(2)}
     if kind == "ticket":
         found = re.match(r"^GoodQA\s+([A-Za-z0-9_.-]{1,80})#(\d{1,9})(?:\s+comment\s+([0-9A-Za-z-]{4,64}))?$", rest)
         if not found:
@@ -568,6 +579,8 @@ def user_authorship(record: dict, pasted: bool = False):
 
 QUEUE_WRAPPER = re.compile(r"^\s*<[A-Za-z][\w:-]*[\s>/]")
 ANSWER_TRUST = "AskUserQuestion tool result bound to an AskUserQuestion tool_use in the same transcript"
+MC_TRUST = ("Mission Control dashboard approval, HMAC-signed by the local server after an authenticated session click "
+            "(accidental-damage threat model: a process running as this user could forge it)")
 QUEUE_TRUST = "transcript queue-operation record without an origin marker (accidental-damage threat model)"
 
 
@@ -718,6 +731,34 @@ def _has_human_turn(path: Path) -> bool:
         if isinstance(record, dict) and user_authorship(record)[0] is not None:
             return True
     return False
+
+
+def mc_turn(session: str, ident: str, home=None) -> dict:
+    """The signed, delivered Mission Control approval record, or Problem. Every field comes from the signed record."""
+    import mc_chat  # noqa: PLC0415
+    try:
+        evidence = mc_chat.approval_evidence(session, ident)
+    except mc_chat.ChatError as error:
+        raise Problem("message-not-found", f"no usable dashboard approval {clip(str(ident), 40)}: {error}") from None
+    return {"text": evidence["text"], "timestamp": evidence["created"], "uuid": ident, "session": session,
+            "evidence": evidence}
+
+
+def mc_bind(source: str, ref: str, decision) -> str | None:
+    """None when the mc: source is a verified approval of exactly ask `ref` with the matching decision, else why not."""
+    try:
+        parsed = parse_source(source)
+        if parsed.get("variant") != "mc":
+            return "not an mc: source"
+        evidence = mc_turn(parsed["session"], parsed["ident"])["evidence"]
+    except Problem as problem:
+        return problem.message
+    if evidence["ask_id"] != ref:
+        return f"that dashboard decision is for ask {evidence['ask_id']}, not {ref}"
+    expected = "approved" if evidence["decision"] == "approve" else "declined"
+    if decision != expected:
+        return f"that dashboard decision is {expected}; --decision must say {expected}"
+    return None
 
 
 def queue_turn(session: str, ident, home=None) -> dict:
@@ -972,6 +1013,10 @@ def _resolve(source, ctx, depth, seen, result):
             turn = answer_turn(parsed["session"], parsed["ident"], home)
         elif variant == "queue":
             turn = queue_turn(parsed["session"], parsed["ident"], home)
+        elif variant == "mc":
+            if not ctx.get("allow_mc"):
+                raise Problem("mc-not-allowed", "an mc: source may only close an ask (ask_resolved); it is not a user turn")
+            turn = mc_turn(parsed["session"], parsed["ident"], home)
         else:
             turn = user_turn(parsed["session"], parsed["uuid"], home)
         reason = excerpt_in(turn["text"], parsed["excerpt"])
@@ -981,7 +1026,7 @@ def _resolve(source, ctx, depth, seen, result):
                 "timestamp": turn["timestamp"], "status": "verified"}
         if variant != "user":
             node["variant"] = variant
-            node["trust"] = ANSWER_TRUST if variant == "answer" else QUEUE_TRUST
+            node["trust"] = {"answer": ANSWER_TRUST, "mc": MC_TRUST}.get(variant, QUEUE_TRUST)
         if ctx.get("want_text"):
             node["text"] = turn["text"]
         node["excerpt"] = parsed["excerpt"]
