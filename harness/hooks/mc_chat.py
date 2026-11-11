@@ -454,7 +454,7 @@ def expire_due(msg_ids, root: Path | None = None, now: float | None = None) -> l
         try:
             record = load(msg_id, root)
         except ChatError:
-            return out
+            continue
         if (record is not None and record.get("approval") is not None
                 and state(msg_id, root).get("status") == "queued" and not _expire_if_due(record, root, now)):
             out.append(msg_id)

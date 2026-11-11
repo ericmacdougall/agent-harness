@@ -96,7 +96,7 @@ Every asks read is also a sweep (at least every 5 minutes, inside the dashboard 
 
 | Section | Rule |
 | --- | --- |
-| Cleared recently | The ask is settled: resolved in a session WAL, its ticket closed, its owner gone with a recorded reassignment, or a duplicate of an older open ask (same text and reason). Each row gives the reason and the evidence id. |
+| Cleared recently | The ask is settled: resolved in a session WAL, the ticket named by its own `[ticket:ref]` tag closed (re-read every 30 minutes, so a reopen brings it back), its owner gone with a recorded reassignment, or the same words as an older ask of the same WAL that is still in plain view. Each row gives the reason and the evidence id. |
 | Stale | Still open and answerable, but past its `until`, or 72 hours with no reply or decision. Never hidden. |
 | Untraceable | Its source does not resolve through `provenance.py`. It is flagged, not shown as a valid ask, and has no controls. |
 

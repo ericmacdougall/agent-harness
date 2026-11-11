@@ -105,11 +105,15 @@ export function mountNeeds() {
     actions.setAttribute('role', 'group');
     actions.setAttribute('aria-label', `Decide ask ${ask.id}`);
     const current = () => rows.get(ask.id)?.ask || ask;
-    const arm = decision => () => { arming.set(ask.id, decision); paint(getState()); parts.confirm.focus(); };
+    let armedAt = 0;
+    const arm = decision => () => { arming.set(ask.id, decision); armedAt = performance.now(); paint(getState()); parts.confirm.focus(); };
     const approve = button('needs-decide approve', 'Approve', arm('approve'));
     const deny = button('needs-decide deny', 'Deny', arm('deny'));
     for (const control of [approve, deny]) control.setAttribute('aria-describedby', text.id);
-    const confirm = button('needs-decide confirm', '', () => {
+    const confirm = button('needs-decide confirm', '', event => {
+      // Confirm appears where Approve was: the second click of a double-click, or a held Enter repeating, must not
+      // land on it. It takes a separate, deliberate activation.
+      if (event.detail > 1 || performance.now() - armedAt < 500) return;
       const decision = arming.get(ask.id);
       arming.delete(ask.id);
       if (decision && decideAsk(current(), decision, input.value)) { drafts.delete(ask.id); input.value = ''; }
@@ -117,6 +121,7 @@ export function mountNeeds() {
       parts.status.focus();
     });
     confirm.setAttribute('aria-describedby', text.id);
+    confirm.addEventListener('keydown', event => { if (event.repeat && (event.key === 'Enter' || event.key === ' ')) event.preventDefault(); });
     const cancel = button('needs-decide cancel', 'Cancel', () => {
       const decision = arming.get(ask.id);
       arming.delete(ask.id); paint(getState());

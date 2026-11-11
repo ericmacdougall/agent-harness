@@ -89,8 +89,10 @@ class Resolve(Env):
         grounded = provenance.resolve(f"inferred: from {source} -- a dashboard click is not a requirement",
                                       {"allow_mc": True})
         self.assertFalse(grounded["ok"])
-        nested = provenance.resolve(f"wal:{self.wals / 'main.jsonl'}#wres00000001")
+        # even a caller that allows mc: at the top level never reaches one through a wal: pointer
+        nested = provenance.resolve(f"wal:{self.wals / 'main.jsonl'}#wres00000001", {"allow_mc": True})
         self.assertFalse(nested["ok"])
+        self.assertIn("mc-not-allowed", [p["code"] for p in nested["problems"]])
 
 
 class Binding(Env):

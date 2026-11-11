@@ -73,8 +73,9 @@ class Settled(Base):
             lookups.append(ref)
             return {"demo#101": "closed", "demo#102": "open"}.get(ref)  # demo#103: lookup failed -> None
 
-        items = [ask("wticket00001"), ask("wticket00002", "Keep the window? (demo#102)"),
-                 ask("wticket00003", "Other? (demo#103)")]
+        items = [ask("wticket00001", "[ticket:demo#101] Ship the redesign behind a flag?"),
+                 ask("wticket00002", "[ticket:demo#102] Keep the window?"),
+                 ask("wticket00003", "[ticket:demo#103] Other?")]
         view = self.sweep(items, ticket_status=status)
         self.assertEqual(view["status"]["wticket00001"], {"state": "cleared", "reason": "ticket-closed",
                                                           "evidence": "ticket:demo#101"})
@@ -85,7 +86,7 @@ class Settled(Base):
 
     def test_ticket_lookups_are_budgeted_per_sweep(self):  # NEG-30
         calls = []
-        items = [ask(f"wbulk{i:07d}", f"q{i} (demo#{200 + i})") for i in range(40)]
+        items = [ask(f"wbulk{i:07d}", f"[ticket:demo#{200 + i}] q{i}") for i in range(40)]
         self.sweep(items, ticket_status=lambda ref: calls.append(ref) or "open")
         self.assertLessEqual(len(calls), ns.TICKET_LOOKUPS_PER_SWEEP)
 
@@ -110,11 +111,28 @@ class Settled(Base):
                                                           "evidence": "ask:wdup00000001"})
         self.assertEqual(view["status"]["wdup00000003"]["state"], "active")
 
+    def test_a_duplicate_never_hides_the_only_copy_the_user_can_see_and_decide(self):  # NEG-32 (code review 1)
+        # A re-ask of a question that went stale stays in view: the stale original cannot absorb it.
+        view = self.sweep([ask("wold00000001", "Still want this?", age_h=96), ask("wnew00000001", "Still want this?", age_h=1)])
+        self.assertEqual((view["status"]["wold00000001"]["state"], view["status"]["wnew00000001"]["state"]), ("stale", "active"))
+        # An owner's earlier look-alike (a decoy, or a relayed question) never clears main's ask, nor the reverse.
+        view = self.sweep([ask("wdecoy000001", "Deploy to prod?", age_h=5, owner="agent-evil01"),
+                           ask("wreal0000001", "Deploy to prod?", age_h=1)])
+        self.assertEqual((view["status"]["wdecoy000001"]["state"], view["status"]["wreal0000001"]["state"]), ("active", "active"))
+        self.assertEqual(view["cleared"], [])
+
+    def test_only_the_asks_own_ticket_tag_counts_and_a_mention_does_not(self):  # NEG-33 (code review 1)
+        items = [ask("wmention0001", "goodqa#14000 was closed by mistake; may I reopen it and redeploy?"),
+                 ask("wmention0002", "Ship it? (demo#101)")]
+        view = self.sweep(items, ticket_status=lambda ref: "closed")
+        self.assertEqual([view["status"][i]["state"] for i in ("wmention0001", "wmention0002")], ["active", "active"])
+
     def test_a_cleared_ask_comes_back_when_its_reason_ends(self):  # NEG-28
-        items = [ask("wticket00001")]
+        items = [ask("wticket00001", "[ticket:demo#101] Ship?")]
         self.sweep(items, ticket_status=lambda ref: "closed")
-        ns.forget_tickets(self.root)  # the ticket was reopened
-        view = self.sweep(items, ticket_status=lambda ref: "open", now=NOW + 300)
+        still = self.sweep(items, ticket_status=lambda ref: "open", now=NOW + 300)
+        self.assertEqual(still["status"]["wticket00001"]["state"], "cleared", "inside the recheck window")
+        view = self.sweep(items, ticket_status=lambda ref: "open", now=NOW + ns.TICKET_RECHECK_S + 60)  # reopened
         self.assertEqual(view["status"]["wticket00001"]["state"], "active")
         self.assertEqual([r["action"] for r in self.audit()], ["cleared", "restored"])
 
@@ -154,7 +172,7 @@ class Safety(Base):
         (wals / "main.jsonl").write_text(json.dumps({"event": "ask", "id": "wopen0000001", "note": "q"}) + "\n")
         before = (wals / "main.jsonl").read_bytes()
         with mock.patch.dict(os.environ, {"HOME": self.tmp.name}):
-            self.sweep([ask("wopen0000001", age_h=500)], ticket_status=lambda ref: "closed")
+            self.sweep([ask("wopen0000001", "[ticket:demo#101] Ship?", age_h=500)], ticket_status=lambda ref: "closed")
         self.assertEqual((wals / "main.jsonl").read_bytes(), before)
         self.assertEqual(mc_chat.inbox(self.root), [])
         self.assertEqual(mc_chat.outbox(self.root), [])
@@ -219,7 +237,7 @@ class Collector(Base):
     def test_snapshot_sections(self):
         now = time.time()
         payload = {"items": [{"id": "wkeep0000001", "kind": "traced", "at": iso(now - 60), "note": "Keep? (demo#102)", "owner": "main"},
-                             {"id": "wclosed00001", "kind": "traced", "at": iso(now - 60), "note": "Closed? (demo#101)", "owner": "main"},
+                             {"id": "wclosed00001", "kind": "traced", "at": iso(now - 60), "note": "[ticket:demo#101] Closed?", "owner": "main"},
                              {"id": "wstale000001", "kind": "traced", "at": iso(now - 90 * 3600), "note": "Old? (demo#102)", "owner": "main"}],
                    "blocked": [{"id": "wbad00000001", "note": "No source?", "owner": "main", "at": iso(now - 60), "problem": "no source"}],
                    "resolved": []}

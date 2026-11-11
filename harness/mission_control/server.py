@@ -436,7 +436,13 @@ class App:
     def chat_snapshot(self) -> dict:
         messages = []
         waiting: list[tuple[float, str]] = []
-        for record in mc_chat.inbox(self.root, limit=60):
+        # The newest 60 chat messages, plus every decision among the newest 240 records: a standing decision must
+        # not scroll out of the page's view behind ordinary chat (the card would offer its buttons again).
+        records = mc_chat.inbox(self.root, limit=240)
+        recent = {r.get("id") for r in records[-60:]}
+        for record in records:
+            if record.get("id") not in recent and not (record.get("verified") and isinstance(record.get("approval"), dict)):
+                continue
             msg_state = mc_chat.state(record.get("id", ""), self.root)
             approval = None
             if record.get("verified") and mc_chat.approval_ok(record.get("approval"), str(record.get("session"))):
@@ -532,11 +538,10 @@ class App:
             time.sleep(self.demo_delay_s)  # demo knob: the 'Sending' state stays visible for the whole delay
         with self.approve_lock:
             try:
-                view = self.asks.read(session)
+                view = self.asks.refresh(session)
             except Exception as exc:  # noqa: BLE001 - an unreadable ledger decides nothing
                 self.health.error("asks", f"{type(exc).__name__}: {str(exc)[:160]}")
                 return 503, {"error": "asks-unavailable", "message": "the asks ledger could not be read; nothing was sent"}
-            self.asks.publish(view, session)
             # a stale ask is still open and can be decided; a flagged or cleared one cannot
             item = next((a for a in view["items"] + view["stale"] if a["id"] == ask_id), None)
             if item is None:

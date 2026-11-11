@@ -214,6 +214,27 @@ class Approve(ApproveHarness):
                                                "expires": mc_chat.load(value["id"])["approval"]["expires"]})
         self.assertNotIn("digest", message["approval"])
 
+    def test_a_standing_decision_stays_in_the_snapshot_behind_newer_chat(self):  # code review 1
+        _, value = self.approve()
+        for i in range(70):
+            mc_chat.new_message("claude", f"note {i}", client_key=f"flood-key-{i:04d}", session=SID)
+        snapshot = self.app.chat_snapshot()["messages"]
+        self.assertIn(value["id"], [m["id"] for m in snapshot if m.get("approval")])
+        self.assertLessEqual(len([m for m in snapshot if not m.get("approval")]), 60)
+
+    def test_a_click_and_the_sweep_never_publish_out_of_order(self):  # code review 1
+        import threading
+        order = []
+        real, publish = self.app.asks.read, self.app.asks.publish
+        self.app.asks.read = lambda session, now=None: (order.append("read"), real(session, now))[1]
+        self.app.asks.publish = lambda view, session: (order.append("publish"), publish(view, session))[1]
+        threads = [threading.Thread(target=self.app.asks.refresh, args=(SID,)) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(order, ["read", "publish"] * 4)
+
     def test_an_unclaimed_decision_expires_in_the_snapshot_and_can_be_made_again(self):  # AC-6, NEG-4
         _, value = self.approve()
         record = mc_chat.load(value["id"])

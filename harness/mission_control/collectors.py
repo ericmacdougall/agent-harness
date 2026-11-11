@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import stat
+import threading
 import time
 from pathlib import Path
 
@@ -768,6 +769,7 @@ class Asks(Collector):
         self.cleared: list[dict] = []
         self.swept_at = ""
         self.session = ""
+        self.lock = threading.Lock()  # one ledger read at a time, and its view is published before the next starts
         self.dirty = False      # set when a WAL ask or ask_resolved line was seen: read the ledger at the next tick
         self.read_at = 0.0
 
@@ -777,14 +779,22 @@ class Asks(Collector):
             self.next_at = now + 10  # the owners collector learns main's session shortly after start
             self.health.off(self.name, "no main session known yet")
             return "off"
-        self.publish(self.read(session, now), session)
+        self.refresh(session, now)
         return f"{len(self.items)} open, {len(self.stale)} stale, {len(self.flagged)} flagged"
+
+    def refresh(self, session: str, now: float | None = None) -> dict:
+        """Read, sweep and publish as one step, so a decision click and the sweeper thread never run two ledger
+        reads at once and an older view is never published after a newer one."""
+        with self.lock:
+            view = self.read(session, now)
+            self.publish(view, session)
+            return view
 
     def read(self, session: str, now: float | None = None) -> dict:
         """One fresh ledger read and sweep. Raises when the ledger cannot be read; never returns a partial list
         as whole. The view: active items, stale items, flagged (untraceable) items, cleared-recently rows."""
         now = time.time() if now is None else now
-        code, out = self.runner.run("provenance-asks", session, timeout=60, limit=1024 * 1024)
+        code, out = self.runner.run("provenance-asks", session, timeout=60, limit=4 * 1024 * 1024)
         data = _json(out.encode("utf-8", "replace")) if out else None
         if code not in (0, 2) or not isinstance(data, dict) or not isinstance(data.get("items"), list):
             raise RuntimeError(f"provenance asks exited {code}")

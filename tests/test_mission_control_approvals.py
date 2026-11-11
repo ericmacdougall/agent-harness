@@ -261,6 +261,13 @@ class Rev2(Base):
         self.assertEqual(mc_chat.expire_due([record["id"]], now=1000.0 + mc_chat.APPROVAL_TTL_S), [record["id"]])
         self.assertEqual(mc_chat.state(record["id"])["status"], "expired")
 
+    def test_expire_due_goes_on_past_an_unreadable_record(self):  # code review 1
+        record, _ = self.approve(ts=1000.0)
+        late = 1000.0 + mc_chat.APPROVAL_TTL_S
+        forged = "dash-" + "0" * 26
+        mc_chat.write_json(mc_chat.chat_dir() / "inbox" / (forged + ".json"), {"id": forged, "sig": "00"})
+        self.assertEqual(mc_chat.expire_due([forged, "not-an-id", record["id"]], now=late), [record["id"]])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,8 +2,9 @@
 
 One sweep takes the asks ledger of main's session (open, blocked and recently resolved asks) and decides, per ask:
 
-    cleared   settled, so hidden: resolved in a session WAL, its ticket closed, its owner gone and reassigned, or a
-              duplicate of an older open ask. Listed under "cleared recently" with the reason and the evidence.
+    cleared   settled, so hidden: resolved in a session WAL, the ticket named by its own `[ticket:ref]` tag closed,
+              its owner gone and reassigned, or the same words as an older ask of the same WAL that is in plain view.
+              Listed under "cleared recently" with the reason and the evidence.
     stale     past its `until` (or TTL_S with no activity). Moved to the Stale section; still answerable; never hidden.
     flagged   its source does not trace. Shown as untraceable, never as a valid ask.
     active    everything else.
@@ -34,11 +35,13 @@ HEARTBEAT_STALE_S = 3 * SWEEP_EVERY_S
 CLEARED_KEEP_S = 7 * 86400        # "cleared recently"
 CLEARED_SHOWN = 50
 TICKET_LOOKUPS_PER_SWEEP = 8
-TICKET_OPEN_RECHECK_S = 30 * 60   # an open ticket is looked up again after this long; a closed one is remembered
+TICKET_RECHECK_S = 30 * 60        # a ticket state, open or closed, is looked up again after this long (a reopen restores its asks)
 AUDIT_MAX_BYTES = 4 * 1024 * 1024
 ASK_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{7,63}$")
-TICKET_RE = re.compile(r"\b([a-z][a-z0-9-]{1,30}#\d{2,7})\b")
+# Only the ask's own tag names its ticket. A ticket merely mentioned in the text ("goodqa#14000 was closed by
+# mistake; may I reopen it?") is never a reason to hide the ask.
+TICKET_TAG_RE = re.compile(r"\[ticket:([a-z][a-z0-9-]{1,30}#\d{2,7})\]")
 AGENT_RE = re.compile(r"^agent-([A-Za-z0-9]{1,64})$")
 
 
@@ -92,18 +95,12 @@ def _tickets(folder: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def forget_tickets(root: Path) -> None:
-    """Drop the remembered ticket states (a ticket was reopened, or a test wants a clean slate)."""
-    with _lock(needs_dir(root)):
-        mc_chat.write_json(needs_dir(root) / "tickets.json", {})
-
-
 def _ticket_state(ref: str, cache: dict, lookup, budget: list, now: float) -> str | None:
     known = cache.get(ref)
-    if isinstance(known, dict) and (known.get("state") == "closed" or now - known.get("at", 0) < TICKET_OPEN_RECHECK_S):
+    if isinstance(known, dict) and 0 <= now - known.get("at", 0) < TICKET_RECHECK_S:
         return known.get("state")
     if lookup is None or budget[0] <= 0:
-        return known.get("state") if isinstance(known, dict) and known.get("state") == "open" else None
+        return None  # no fresh answer: unknown, which never hides an ask
     budget[0] -= 1
     try:
         state = lookup(ref)
@@ -147,33 +144,32 @@ def _decide(data: dict, owners, ticket_status, activity: dict, cache: dict, now:
                               "reason": "no traceable source: " + _clip(row.get("problem") or "source does not resolve", 160)}
     gone = _gone_owners(owners)
     budget = [TICKET_LOOKUPS_PER_SWEEP]
-    oldest: dict[str, str] = {}
+    absorbing: dict[tuple, str] = {}  # (owner WAL, text) -> the oldest ACTIVE ask with those words
     for row in sorted(rows, key=lambda r: (str(r.get("at", "")), r["id"])):
         ident = row["id"]
         if ident in out:
             continue
         agent = AGENT_RE.match(str(row.get("owner", "")))
-        ticket = TICKET_RE.search(str(row.get("note", "")))
-        key = _text_key(row)
+        ticket = TICKET_TAG_RE.search(str(row.get("note", "")))
+        asked = _epoch(row.get("at")) or now
+        last = max(asked, activity.get(ident) or 0)
+        until = _epoch(row.get("until")) if row.get("until") else None
+        stale, why = (now >= until, "past its until time") if until is not None \
+            else (now - last >= TTL_S, f"no activity for {_days(now - last)}")
+        key = (str(row.get("owner", "")), _text_key(row))
         if agent and agent.group(1) in gone:
             out[ident] = {"state": "cleared", "reason": "owner-reassigned", "evidence": gone[agent.group(1)]}
-        elif key in oldest:
-            out[ident] = {"state": "cleared", "reason": "duplicate", "evidence": "ask:" + oldest[key]}
         elif ticket and _ticket_state(ticket.group(1), cache, ticket_status, budget, now) == "closed":
             out[ident] = {"state": "cleared", "reason": "ticket-closed", "evidence": "ticket:" + ticket.group(1)}
+        elif key in absorbing:
+            # Same words, same WAL, and the older copy is in plain view (active): the user still sees and can
+            # answer the question. A stale copy, or one another agent registered, never absorbs an ask.
+            out[ident] = {"state": "cleared", "reason": "duplicate", "evidence": "ask:" + absorbing[key]}
+        elif stale:
+            out[ident] = {"state": "stale", "reason": why, "evidence": "age"}
         else:
-            oldest[key] = ident
-            asked = _epoch(row.get("at")) or now
-            last = max(asked, activity.get(ident) or 0)
-            until = _epoch(row.get("until")) if row.get("until") else None
-            if until is not None:
-                stale = now >= until
-                why = "past its until time"
-            else:
-                stale = now - last >= TTL_S
-                why = f"no activity for {_days(now - last)}"
-            out[ident] = ({"state": "stale", "reason": why, "evidence": "age"} if stale
-                          else {"state": "active", "reason": "", "evidence": ""})
+            absorbing[key] = ident
+            out[ident] = {"state": "active", "reason": "", "evidence": ""}
     return out
 
 
