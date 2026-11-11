@@ -173,7 +173,21 @@ class TerminalLoginEndsTheWalk(unittest.TestCase):
             self.processes = {
                 10: nc.ProcessIdentity(10, 20, 1000, 1, "/usr/bin/python3"),
                 20: nc.ProcessIdentity(20, 30, 1000, 2, "/bin/zsh"),
+                40: nc.ProcessIdentity(40, 1, 1000, 4,
+                    '/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal'),
             }
+
+        def process_generation(self, pid):
+            if pid == 30:
+                value = getattr(self, 'boundary', nc.TerminalBoundary(
+                    30, 40, 0, '/usr/bin/login', 300, 400, 3, 4, b'u' * 16))
+                return nc.KernelGeneration(value.pid, value.unique_id, value.parent_unique_id,
+                    value.id_version, value.original_parent_version, value.executable_uuid)
+            if pid == 40:
+                return nc.KernelGeneration(40, 400, 1, 4, 1, b't' * 16)
+            if pid == 1:
+                return nc.KernelGeneration(1, 1, 0, 1, 0, b'l' * 16)
+            raise OSError('inert missing generation')
 
         def process(self, pid):
             if pid == 30:
@@ -392,6 +406,193 @@ class StableBoundaryRegressions(unittest.TestCase):
             self.denied(b)
 
 
+class LoginAncestorRegressions(unittest.TestCase):
+    @dataclass(frozen=True)
+    class Generation:
+        pid: int
+        unique_id: int
+        parent_unique_id: int
+        id_version: int
+        original_parent_version: int
+        executable_uuid: bytes
+
+    class Chain(StableBoundaryRegressions.Chain):
+        def __init__(self):
+            super().__init__()
+            cls = getattr(nc, 'KernelGeneration', LoginAncestorRegressions.Generation)
+            self.processes[20] = replace(self.processes[20], executable='/usr/local/bin/claude')
+            self.processes[40] = nc.ProcessIdentity(40, 1, 1000, 4,
+                '/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal')
+            self.generations = {40: cls(40, 400, 1, 4, 1, b't' * 16),
+                                1: cls(1, 1, 0, 1, 0, b'l' * 16)}
+            self.generation_reads = []
+
+        def process_generation(self, pid):
+            self.generation_reads.append(pid)
+            if pid == 30:
+                return super().process_generation(pid)
+            if pid not in self.generations:
+                raise OSError('inert missing generation')
+            return self.generations[pid]
+
+    def legacy_main(self, observation):
+        import caller_identity as ci
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve() / '.claude'
+            sid = '11111111-2222-3333-4444-555555555555'
+            transcript = home / 'projects' / 'fixture' / (sid + '.jsonl')
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text('{}\n')
+            payload = {'session_id': sid, 'transcript_path': str(transcript), 'tool_name': 'Bash'}
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(nc, 'probe_runtime_origin', return_value=observation):
+                return ci.is_main(payload, home)
+
+    def test_direct_native_parent_above_login_never_allows_legacy(self):
+        b = self.Chain(); path = '/Applications/Fixture/renamed-runtime'
+        b.processes[40] = replace(b.processes[40], executable=path)
+        b.codes[40] = nc.CodeIdentity('codex', nc.OPENAI_TEAM, 'c' * 40, path)
+        self.assertFalse(self.legacy_main(nc.probe_runtime_origin(10, backend=b)))
+
+    def test_further_native_ancestor_above_login_never_allows_legacy(self):
+        b = self.Chain(); path = '/Applications/Fixture/renamed-runtime'
+        b.processes[40] = replace(b.processes[40], parent=50, executable='/usr/bin/plain')
+        b.generations[40] = replace(b.generations[40], parent_unique_id=500)
+        b.processes[50] = nc.ProcessIdentity(50, 1, 1000, 5, path)
+        b.generations[50] = replace(b.generations[40], pid=50, unique_id=500, parent_unique_id=1)
+        b.codes[50] = nc.CodeIdentity('codex', nc.OPENAI_TEAM, 'd' * 40, path)
+        self.assertFalse(self.legacy_main(nc.probe_runtime_origin(10, backend=b)))
+
+    def test_login_parent_unique_mismatch_never_allows_legacy(self):
+        b = self.Chain(); b.generations[40] = replace(b.generations[40], unique_id=401)
+        self.assertFalse(self.legacy_main(nc.probe_runtime_origin(10, backend=b)))
+
+    def test_normal_terminal_full_chain_remains_a_useful_positive(self):
+        b = self.Chain(); result = nc.probe_runtime_origin(10, backend=b)
+        self.assertEqual(result.reason, 'no_native_runtime')
+        self.assertTrue(self.legacy_main(result))
+        self.assertIn(40, b.generation_reads)
+        self.assertIn(1, b.generation_reads)
+
+    def assert_denied(self, backend):
+        result = nc.probe_runtime_origin(10, backend=backend)
+        self.assertFalse(self.legacy_main(result))
+        self.assertNotEqual(result.reason, 'no_native_runtime')
+
+    def test_upper_generation_fields_and_pid_one_are_rechecked(self):
+        for pid, field, value in ((40, 'unique_id', 401), (40, 'parent_unique_id', 2),
+                (40, 'id_version', 9), (40, 'original_parent_version', 9),
+                (40, 'executable_uuid', b'v' * 16), (1, 'unique_id', 2),
+                (1, 'parent_unique_id', 2), (1, 'id_version', 9)):
+            with self.subTest(pid=pid, field=field):
+                b = self.Chain()
+                def mutate(obj, pid=pid, field=field, value=value):
+                    if obj.boundary_calls == 2:
+                        obj.generations[pid] = replace(obj.generations[pid], **{field: value})
+                b.mutate = mutate
+                self.assert_denied(b)
+                self.assertGreaterEqual(b.boundary_calls, 2)
+
+    def test_upper_process_and_code_changes_during_boundary_recheck_deny(self):
+        for target in (2, 3):
+            for field, value in (('uid', 0), ('started', 99), ('parent', 50),
+                                 ('executable', '/tmp/changed'), ('code', True)):
+                with self.subTest(target=target, field=field):
+                    b = self.Chain()
+                    def mutate(obj, target=target, field=field, value=value):
+                        if obj.boundary_calls == target:
+                            if field == 'code':
+                                obj.codes[40] = nc.CodeIdentity('codex', nc.OPENAI_TEAM,
+                                    'e' * 40, obj.processes[40].executable)
+                            else:
+                                obj.processes[40] = replace(obj.processes[40], **{field: value})
+                    b.mutate = mutate
+                    self.assert_denied(b)
+
+    def test_missing_generation_wrong_upper_link_and_unknown_code_deny(self):
+        for kind in ('missing', 'malformed', 'init-link', 'zero-root', 'code-error', 'basename'):
+            with self.subTest(kind=kind):
+                b = self.Chain()
+                if kind == 'missing':
+                    b.process_generation = None
+                elif kind == 'malformed':
+                    b.generations[40] = replace(b.generations[40], unique_id=True)
+                elif kind == 'init-link':
+                    b.generations[40] = replace(b.generations[40], parent_unique_id=2)
+                elif kind == 'zero-root':
+                    b.processes[40] = replace(b.processes[40], parent=0)
+                elif kind == 'code-error':
+                    b.signature = lambda _pid: object()
+                else:
+                    b.processes[40] = replace(b.processes[40], executable='/tmp/codex')
+                self.assert_denied(b)
+
+    def test_generation_change_during_upper_process_acquisition_denies(self):
+        b = self.Chain()
+        original = b.process
+        def process(pid):
+            value = original(pid)
+            if pid == 40:
+                b.generations[40] = replace(b.generations[40], id_version=99)
+            return value
+        b.process = process
+        self.assert_denied(b)
+
+    class NestedChain(Chain):
+        def __init__(self):
+            super().__init__()
+            self.processes[40] = replace(self.processes[40], parent=50)
+            self.generations[40] = replace(self.generations[40], parent_unique_id=500)
+            self.second = nc.TerminalBoundary(50, 60, 0, '/usr/bin/login',
+                                            500, 600, 5, 6, b'v' * 16)
+            self.processes[60] = nc.ProcessIdentity(60, 1, 1000, 6, '/usr/bin/plain')
+            self.generations[50] = nc.KernelGeneration(50, 500, 600, 5, 6, b'v' * 16)
+            self.generations[60] = nc.KernelGeneration(60, 600, 1, 6, 1, b'w' * 16)
+            self.second_calls = 0
+            self.nested_mutate = None
+
+        def process(self, pid):
+            if pid == 50:
+                raise OSError('inert nested login full BSD restriction')
+            return super().process(pid)
+
+        def terminal_login_identity(self, pid):
+            if pid == 50:
+                self.second_calls += 1
+                if self.nested_mutate:
+                    self.nested_mutate(self)
+                return self.second
+            return super().terminal_login_identity(pid)
+
+    def test_nested_logins_continue_and_retain_earlier_boundary(self):
+        b = self.NestedChain()
+        result = nc.probe_runtime_origin(10, backend=b)
+        self.assertEqual(result.reason, 'no_native_runtime')
+        self.assertTrue(self.legacy_main(result))
+        self.assertGreaterEqual(b.second_calls, 3)
+        b = self.NestedChain()
+        def mutate(obj):
+            if obj.second_calls == 2:
+                obj.boundary = replace(obj.boundary, id_version=99)
+        b.nested_mutate = mutate
+        self.assert_denied(b)
+        b = self.NestedChain()
+        b.codes[60] = nc.CodeIdentity('codex', nc.OPENAI_TEAM, 'f' * 40,
+                                    b.processes[60].executable)
+        self.assert_denied(b)
+
+    def test_upper_ancestry_shares_cycle_and_hop_budget(self):
+        b = self.Chain()
+        b.processes[40] = replace(b.processes[40], parent=30)
+        b.generations[40] = replace(b.generations[40], parent_unique_id=300)
+        self.assert_denied(b)
+        b = self.Chain()
+        for pid in range(40, 75):
+            b.processes[pid] = nc.ProcessIdentity(pid, pid + 1, 1000, pid, '/usr/bin/plain')
+            b.generations[pid] = nc.KernelGeneration(pid, pid * 10, (pid + 1) * 10,
+                                                    pid, pid + 1, b'z' * 16)
+        self.assert_denied(b)
+
+
 class KernelBoundaryABI(unittest.TestCase):
     def backend(self, *, results=None, mutate=None, path="/usr/bin/login", path_result=None):
         import ctypes as ct
@@ -432,6 +633,20 @@ class KernelBoundaryABI(unittest.TestCase):
         self.assertEqual(backend.terminal_login_identity(30),
                          nc.TerminalBoundary(30, 40, 0, "/usr/bin/login", 300, 400, 3, 4, b"u" * 16))
         self.assertEqual(calls, [(17, 0, 56), (13, 0, 64), (17, 0, 56)])
+
+    def test_upper_generation_reader_uses_exact_live_abi_and_bounds(self):
+        backend, calls = self.backend()
+        self.assertEqual(backend.process_generation(30),
+            nc.KernelGeneration(30, 300, 400, 3, 4, b'u' * 16))
+        self.assertEqual(calls, [(17, 0, 56)])
+        for result in (-1, 0, 55, 57):
+            with self.subTest(result=result), self.assertRaises(OSError):
+                self.backend(results={17: result})[0].process_generation(30)
+        for pid in (True, 0, -1, 2 ** 31, '30'):
+            with self.subTest(pid=pid), self.assertRaises(OSError):
+                backend.process_generation(pid)
+        with self.assertRaises(OSError):
+            backend.process_generation(1)  # Fake has nonzero parent ID; real init must have zero.
 
     def test_bad_sizes_and_missing_paths_fail_closed(self):
         for flavor, values in ((13, (-1, 0, 63, 65)), (17, (-1, 0, 55, 57))):

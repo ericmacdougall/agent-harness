@@ -50,6 +50,16 @@ class ProcessIdentity:
 
 
 @dataclass(frozen=True)
+class KernelGeneration:
+    pid: int
+    unique_id: int
+    parent_unique_id: int
+    id_version: int
+    original_parent_version: int
+    executable_uuid: bytes
+
+
+@dataclass(frozen=True)
 class TerminalBoundary:
     pid: int
     parent: int
@@ -123,6 +133,36 @@ def _chain_change(backend, chain, codes):
     return None
 
 
+def _valid_generation(value, pid):
+    return (isinstance(value, KernelGeneration) and type(value.pid) is int and value.pid == pid
+            and 1 <= pid < 2 ** 31 and type(value.unique_id) is int and 0 < value.unique_id < 2 ** 64
+            and type(value.parent_unique_id) is int and 0 <= value.parent_unique_id < 2 ** 64
+            and (value.parent_unique_id == 0 if pid == 1 else value.parent_unique_id > 0)
+            and type(value.id_version) is int and -(2 ** 31) <= value.id_version < 2 ** 31
+            and value.id_version != 0 and type(value.original_parent_version) is int
+            and -(2 ** 31) <= value.original_parent_version < 2 ** 31
+            and type(value.executable_uuid) is bytes and len(value.executable_uuid) == 16
+            and any(value.executable_uuid))
+
+
+def _mixed_chain_change(backend, chain, codes, generations, links, boundaries):
+    changed = _chain_change(backend, chain, codes)
+    if changed or not generations:
+        return changed
+    for previous in boundaries:
+        current = backend.terminal_login_identity(previous.pid)
+        if not _valid_boundary(current, previous.pid) or current != previous:
+            return "process_changed"
+    for pid, previous in generations.items():
+        current = backend.process_generation(pid)
+        if not _valid_generation(current, pid) or current != previous:
+            return "process_changed"
+    for parent, unique_id in links:
+        if parent not in generations or generations[parent].unique_id != unique_id:
+            return "parent_identity_unverified"
+    return _chain_change(backend, chain, codes)
+
+
 def probe_runtime_origin(pid=None, *, backend=None):
     """Bounded origin-only probe; a supplied backend is an in-process test double."""
     pid = os.getpid() if pid is None else pid
@@ -132,25 +172,50 @@ def probe_runtime_origin(pid=None, *, backend=None):
             if sys.platform != "darwin":
                 return OriginObservation("unknown", False, "unsupported_platform")
             backend = DarwinBackend()
-        chain, codes, seen, barrier, candidate, boundary = [], [], set(), False, None, None
+        chain, codes, seen, barrier, candidate = [], [], set(), False, None
+        boundaries, generations, links = [], {}, []
+        upper_unique, previous_node, ended_at_init = None, None, False
         current = pid
         for _ in range(32):
             if current <= 1:
+                if boundaries:
+                    if current != 1:
+                        raise OSError("upper ancestry did not reach init")
+                    generation = backend.process_generation(1)
+                    if not _valid_generation(generation, 1) or generation.unique_id != upper_unique:
+                        raise OSError("init parent identity unavailable")
+                    generations[1] = generation
+                    ended_at_init = True
                 break
             if current in seen:
                 return OriginObservation("unknown", native, "ancestry_cycle")
             seen.add(current)
+            generation = None
+            if boundaries:
+                generation = backend.process_generation(current)
+                if not _valid_generation(generation, current) or generation.unique_id != upper_unique:
+                    raise OSError("upper parent identity unavailable")
+                generations[current] = generation
             try:
                 process = backend.process(current)
             except OSError:
                 # Full BSD info is same-user restricted. The smaller kernel APIs
                 # can bind a root login to a stable process and executable generation.
-                if current == pid or not chain or chain[-1].parent != current:
+                if current == pid or previous_node is None or previous_node.parent != current:
                     raise
                 boundary = backend.terminal_login_identity(current)
                 if not _valid_boundary(boundary, current):
                     raise OSError("terminal boundary identity unavailable")
-                break
+                boundary_generation = KernelGeneration(boundary.pid, boundary.unique_id,
+                    boundary.parent_unique_id, boundary.id_version,
+                    boundary.original_parent_version, boundary.executable_uuid)
+                if generation is not None and generation != boundary_generation:
+                    raise OSError("login generation changed")
+                generations[current] = boundary_generation
+                boundaries.append(boundary)
+                links.append((boundary.parent, boundary.parent_unique_id))
+                upper_unique, previous_node, current = boundary.parent_unique_id, boundary, boundary.parent
+                continue  # A genuine login does not prove who launched it.
             if not _valid_process(process, current):
                 return OriginObservation("unknown", native, "invalid_process_identity")
             chain.append(process)
@@ -162,6 +227,10 @@ def probe_runtime_origin(pid=None, *, backend=None):
             if first is not None and not isinstance(first, CodeIdentity):
                 raise OSError("running code observation unavailable")
             codes.append(first)
+            if generation is not None:
+                repeated = backend.process_generation(current)
+                if not _valid_generation(repeated, current) or repeated != generation:
+                    raise OSError("upper process generation changed")
             if _approved_code(first, process):
                 native = True
                 if not barrier:
@@ -171,18 +240,21 @@ def probe_runtime_origin(pid=None, *, backend=None):
                 barrier = True  # an outer Codex process is not this nearer runtime's author
             if name == "codex":
                 return OriginObservation("unknown", True, "code_identity_unverified")
+            if generation is not None:
+                links.append((process.parent, generation.parent_unique_id))
+                upper_unique = generation.parent_unique_id
+            previous_node = process
             current = process.parent
         else:
             return OriginObservation("unknown", native, "ancestry_limit")
-        changed = _chain_change(backend, chain, codes)
+        if boundaries and not native and not ended_at_init:
+            raise OSError("upper ancestry incomplete")
+        changed = _mixed_chain_change(backend, chain, codes, generations, links, boundaries)
         if changed:
             return OriginObservation("unknown", native, changed)
-        if boundary is not None:
+        if boundaries:
             for _ in range(2):
-                repeated = backend.terminal_login_identity(boundary.pid)
-                if not _valid_boundary(repeated, boundary.pid) or repeated != boundary:
-                    return OriginObservation("unknown", native, "process_changed")
-                changed = _chain_change(backend, chain, codes)
+                changed = _mixed_chain_change(backend, chain, codes, generations, links, boundaries)
                 if changed:
                     return OriginObservation("unknown", native, changed)
         if candidate is None:
@@ -300,6 +372,18 @@ class DarwinBackend:
                                  before.original_parent_version, bytes(before.uuid))
         if not _valid_boundary(value, pid):
             raise OSError("terminal boundary identity unavailable")
+        return value
+
+    def process_generation(self, pid):
+        if type(pid) is not int or not 1 <= pid < 2 ** 31 or ct.sizeof(self.UniqueInfo) != 56:
+            raise OSError("kernel generation ABI unavailable")
+        info = self.UniqueInfo()
+        if self.proc.proc_pidinfo(pid, 17, 0, ct.byref(info), 56) != 56:
+            raise OSError("kernel process generation unavailable")
+        value = KernelGeneration(pid, info.uniqueid, info.parent_uniqueid, info.idversion,
+                                 info.original_parent_version, bytes(info.uuid))
+        if not _valid_generation(value, pid):
+            raise OSError("kernel generation identity unavailable")
         return value
 
     def _constant(self, name):
