@@ -2,6 +2,7 @@
   "schema": 1,
   "mode": "warn",
   "plan_ticket_gate": "warn",
+  "fold_guard": "enforce",
   "ticket_system": "goodqa",
   "enforced_projects": [],
   "projects": {},
