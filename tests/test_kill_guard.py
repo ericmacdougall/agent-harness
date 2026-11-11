@@ -1235,5 +1235,46 @@ class ScriptArgumentTextIsData(WorldCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(self.decide(cmd)[0], 'block', cmd)
 
+class CodexHomeHarnessCli(WorldCase):
+    """goodqa#15565: a Codex owner records WAL notes with the installed copy under ~/.codex/agent-harness, in
+    the isolated form `python3 -I ...`. Only the ~/.claude/hooks copy was exempt, so a note mentioning kill
+    from Codex was refused as interpreter signalling."""
+    DATA = [
+        "python3 -I ~/.codex/agent-harness/wal_note.py --wal ~/w.jsonl --event status --note 'owner will kill nothing'",
+        "python3 -I -B ~/.codex/agent-harness/wal_note.py --event note --note 'os.kill is not called here'",
+        "python3 -I ~/.codex/agent-harness/provenance.py trace --note 'a kill-guard false positive'",
+        "python3 -I ~/.codex/agent-harness/ah.py owners --note 'kill the stuck job later'",
+        "python3 ~/.codex/agent-harness/wal_note.py --event note --note 'kill nothing'",
+    ]
+    CODE = [  # the exemption stays exactly as narrow as the ~/.claude/hooks one
+        "python3 -I ~/.codex/agent-harness/run_capped.py --max-rss-gb 1 -- kill -9 4242",
+        "python3 -I ~/.codex/agent-harness/spec_flow.py --note 'will kill the job'",  # not on this exemption's list
+        "python3 -I '~/.codex/agent-harness/wal_note.py' --note 'kill'",  # a quoted ~ is a literal directory
+        "python3 -I ~/.codex/agent-harness/../../tmp/wal_note.py --note 'kill'",
+        "python3 -I ~/.codex/agent-harness/wal_note.py/../x.py --note 'kill'",
+        "python3 -I ./.codex/agent-harness/wal_note.py --note 'kill'",
+        "python3 -I /tmp/.codex/agent-harness/wal_note.py --note 'kill'",
+        "python3 -I ~/.codex/other/wal_note.py --note 'kill'",
+        "python3 -I ~/.evil/agent-harness/wal_note.py --note 'kill'",  # only the two install roots
+        "python3 -I /.codex/agent-harness/wal_note.py --note 'kill'",  # a root-level dir is not the caller's HOME
+        "HOME=/tmp/x; python3 -I ~/.codex/agent-harness/wal_note.py --note 'kill'",  # ~ may no longer be the install root
+        "HOME=/tmp/x python3 -I ~/.codex/agent-harness/wal_note.py --note 'kill'",
+        "FOO=1 python3 -I ~/.codex/agent-harness/wal_note.py --note 'kill'",  # an assignment prefix stays refused
+        "python3 -I ~/.codex/agent-harness/ah.py kill --pid 4242 --reason r",
+        "python3 -I ~/.codex/agent-harness/wal_note.py --note 'x'; python3 -c 'import os; os.kill(5, 9)'",
+        "python3 -I -c 'import os; os.kill(5, 9)' ~/.codex/agent-harness/wal_note.py",
+    ]
+
+    def test_codex_home_cli_text_is_data(self):
+        for cmd in self.DATA:
+            with self.subTest(cmd=cmd):
+                self.assertNotEqual(self.decide(cmd)[0], 'block', cmd)
+
+    def test_everything_else_still_blocks(self):
+        for cmd in self.CODE:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.decide(cmd)[0], 'block', cmd)
+
+
 if __name__ == '__main__':
     unittest.main()
