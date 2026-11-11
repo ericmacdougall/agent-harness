@@ -1835,9 +1835,11 @@ def decide(payload, runner, state_dir, now=None):
     if subagent and PEER_REVIEW_AUTH.search(plain):
         return 2, ("merge-gate: a subagent cannot run the PR review that mints a merge authorization (--github-repo/"
                    "--pr); run it without the GitHub binding, or ask the main agent.")
-    if subagent and (STATE_GLOB.search(plain) or _waiver_attempt(command)):
+    # goodqa#15684: a missing agent_id is not proof of main (Codex hook payloads never carry one), so the waiver path
+    # needs the positive proof the review stamp already needs.
+    if (STATE_GLOB.search(plain) or _waiver_attempt(command)) and (subagent or not _proven_main(payload)):
         return 2, "merge-gate: only the main agent may record a waiver; ask the main agent."
-    if WAIVE_CMD.search(command) and not subagent:
+    if WAIVE_CMD.search(command) and not subagent and _plain_waive(command) and _proven_main(payload):
         _stamp_waive(command, payload, state_dir, now)
     if PEER_REVIEW_AUTH.search(plain):
         _stamp_review(command, payload, now)
@@ -1859,6 +1861,33 @@ def decide(payload, runner, state_dir, now=None):
     if blocks:
         return 2, "\n".join(blocks)
     return 0, ""
+
+
+def _proven_main(payload):
+    """Positive proof that main is calling (caller_identity.is_main); any failure to decide is not proof."""
+    try:
+        import caller_identity  # noqa: PLC0415
+        return bool(caller_identity.is_main(payload))
+    except Exception:  # noqa: BLE001 - fail closed
+        return False
+
+
+def _plain_waive(command):
+    """Only ONE plain `python3 [-I] .../merge_gate.py waive ...` command mints the stamp: no newline, `;`, `&`, `|`,
+    backtick, `<`, `>` or `$(` anywhere (so no echo, printf, pipe, redirect, wrapper or quoted separator), the same
+    rule `_plain_peer_review` applies to the review stamp."""
+    if _SHELL_SYNTAX.search(command):
+        return False
+    try:
+        argv = shlex.split(command, comments=False)
+    except ValueError:
+        return False
+    if not argv or not _PYTHON.fullmatch(os.path.basename(argv[0])):
+        return False
+    rest = argv[1:]
+    while rest and rest[0] in ("-I", "-u", "-B", "-E", "-s"):
+        rest = rest[1:]
+    return len(rest) >= 2 and os.path.basename(rest[0]) == "merge_gate.py" and rest[1] == "waive"
 
 
 def _stamp_waive(command, payload, state_dir, now):

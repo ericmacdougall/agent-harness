@@ -388,7 +388,10 @@ class Waivers(Base):
     def test_hook_stamp_gives_hook_approval_and_subagent_cannot_waive(self):
         cmd = ("python3 ~/.claude/hooks/merge_gate.py waive --repo o/r --pr 5 --head " + HEAD +
                " --ticket 'GoodQA #14502' --reason 'approved by main after review'")
-        code, text = mg.decide(bash(cmd), FakeGh(SCENARIOS["green"]), self.state)
+        import caller_identity  # noqa: PLC0415
+        from unittest import mock  # noqa: PLC0415
+        with mock.patch.object(caller_identity, "is_main", return_value=True):  # goodqa#15684: the stamp needs main proof
+            code, text = mg.decide(bash(cmd), FakeGh(SCENARIOS["green"]), self.state)
         self.assertEqual(code, 0, text)
         out, err = io.StringIO(), io.StringIO()
         argv = ["waive", "--state-dir", str(self.state), "--repo", "o/r", "--pr", "5", "--head", HEAD,
