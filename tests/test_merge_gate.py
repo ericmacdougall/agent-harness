@@ -1102,3 +1102,67 @@ class FalsePositives15122(Base):
             with self.subTest(command):
                 code, text = mg.decide(bash(command, **self.SUB), FakeGh(SCENARIOS["green"]), self.state)
                 self.assertEqual(code, 2, text)
+
+
+class RepoIdentityCase(unittest.TestCase):
+    """GoodQA #15565: owner/repo identity is ASCII case-insensitive, never Unicode-folded."""
+
+    class PastRepoCheck(Exception):
+        pass
+
+    def evaluate(self, slug, url, number=5):
+        past = self.PastRepoCheck
+
+        def runner(args, timeout, cwd=None):
+            if list(args[:2]) == ["pr", "view"]:
+                return 0, json.dumps({"number": 5, "url": url, "headRefOid": HEAD, "baseRefName": "main",
+                                      "state": "OPEN", "mergeStateStatus": "CLEAN", "statusCheckRollup": []}), ""
+            raise past(" ".join(args))
+
+        return mg.evaluate_pr(mg.Client(runner, time.monotonic() + 10), slug, number)
+
+    def test_repo_key_is_ascii_only_case_insensitive(self):
+        self.assertEqual(mg.repo_key("ericmacdougall/Android-security"), "ericmacdougall/android-security")
+        self.assertEqual(mg.repo_key("O.x/R_y-Z"), "o.x/r_y-z")
+        for bad in ("o/K", "o/straße", "o/rıpo", "o/RİPO", "o/ſec", "o/r/x", "o/r\n",
+                    "", None, "o", "/r", "o/", "https://github.com/o/r", "o/r ", 5):
+            with self.subTest(bad=bad):
+                self.assertIsNone(mg.repo_key(bad))
+
+    def test_pr_repo_check_ignores_ascii_case_only(self):
+        for slug, url in (("ericmacdougall/android-security",
+                           "https://github.com/ericmacdougall/Android-security/pull/5"),
+                          ("ericmacdougall/Android-security",
+                           "https://github.com/ericmacdougall/android-security/pull/5")):
+            with self.subTest(slug=slug, url=url), self.assertRaises(self.PastRepoCheck):
+                self.evaluate(slug, url)
+        for slug, url in (("ericmacdougall/android-security",
+                           "https://github.com/ericmacdougall/Android-security2/pull/5"),
+                          ("ericmacdougall/android-security",
+                           "https://github.com/ericmacdougall/android-security-fork/pull/5"),
+                          ("ericmacdougall/android-security",
+                           "https://github.com/other/Android-security/pull/5"),
+                          ("o/k", "https://github.com/o/K/pull/5"),
+                          ("o/strasse", "https://github.com/o/straße/pull/5"),
+                          ("o/ripo", "https://github.com/o/rıpo/pull/5"),
+                          (None, "https://github.com/o/K/pull/5")):
+            with self.subTest(slug=slug, url=url), self.assertRaises(mg.GateError):
+                self.evaluate(slug, url)
+        with self.subTest("number"), self.assertRaises(mg.GateError):
+            self.evaluate("o/r", "https://github.com/O/R/pull/6", number=5)
+
+    def test_authorization_repo_match_ignores_ascii_case_only(self):
+        now = time.time()
+        record = {"event": "waive", "id": "mgw-case", "repo": "ericmacdougall/android-security", "pr": 768,
+                  "head": HEAD, "ts": now}
+        self.assertIs(mg._active([record], "ericmacdougall/Android-security", 768, HEAD, now), record)
+        self.assertEqual(mg._active([dict(record, repo="o/k")], "o/K", 768, HEAD, now)["repo"], "o/k")
+        for repo, pr, head in (("ericmacdougall/Android-security2", 768, HEAD),
+                               ("ericmacdougall/Android-security", 769, HEAD),
+                               ("ericmacdougall/Android-security", 768, OTHER)):
+            with self.subTest(repo=repo, pr=pr, head=head):
+                self.assertIsNone(mg._active([record], repo, pr, head, now))
+        for stored, asked in (("o/k", "o/K"), ("o/K", "o/k"), ("o/ss", "o/ß"),
+                              ("o/K", "o/ß"), ("o/K", "o/K")):
+            with self.subTest(stored=stored, asked=asked):
+                self.assertIsNone(mg._active([dict(record, repo=stored)], asked, 768, HEAD, now))

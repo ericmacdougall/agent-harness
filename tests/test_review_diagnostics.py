@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -57,7 +58,7 @@ class ContractTests(unittest.TestCase):
         'FALLBACK_NO_RESULT', 'SNAPSHOT_TIMEOUT', 'SNAPSHOT_GIT_FAILED', 'SNAPSHOT_PARTIAL_CLONE',
         'SNAPSHOT_SPARSE_INDEX', 'SNAPSHOT_HIDDEN_INDEX_FLAG', 'SNAPSHOT_SHALLOW', 'SNAPSHOT_GRAFTS_ALTERNATES',
         'SNAPSHOT_CASE_COLLISION', 'SNAPSHOT_GITLINK', 'SNAPSHOT_SOURCE_CHANGED', 'PYTHON_UNSUPPORTED',
-        'ISOLATION_FAILED'}
+        'ISOLATION_FAILED', 'REVIEW_NOT_STARTED', 'REVIEW_LAUNCH_UNCONFIRMED'}
 
     def test_code_set_is_pinned(self):
         self.assertEqual(set(rd.CONTRACT), self.EXPECTED_CODES)
@@ -1156,6 +1157,95 @@ class MergeCompositionTests(unittest.TestCase):
         self.assertEqual(codex_prompt.read_text().count(self.GUIDANCE), 1)
         self.assertEqual(claude_prompt.read_text().count(self.GUIDANCE), 1)
         self.assertIn('QUOTA', self.output.read_text())
+
+
+class LocalLaunchDiagnosticsTests(unittest.TestCase):
+    """A local lease refusal and an unrecorded spawned child are different facts."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='local-review-diagnostic-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.module = load_peer_review()
+        self.resolution = {'name': 'claude', 'path': sys.executable, 'source': 'fixture',
+                           'rejected': [], 'searched': []}
+
+    def options(self, note_child):
+        store = types.SimpleNamespace(acquire_pool=unittest.mock.Mock(), release_pool=unittest.mock.Mock())
+        run = types.SimpleNamespace(run_id='a' * 32, timeout=5, note_child=note_child)
+        return {'selection': {'effort': 'medium', 'rung': 'fixture', 'harness': 'claude', 'review_budget_usd': 1},
+                'codex_model': 'fixture', 'claude_model': 'fixture', 'timeout': 5,
+                'store': store, 'run_record': run,
+                'resolutions': {'claude': self.resolution, 'codex': self.resolution}}
+
+    def test_no_exit_code_alone_never_claims_not_started_or_provider_outage(self):
+        outcome = {**self.module.provider_failure({}), 'reason': 'TRANSIENT_INFRA'}
+        diag = rd.provider_attempt('claude', self.resolution, None, '', '', outcome)
+        self.assertEqual(diag['code'], 'REVIEW_LAUNCH_UNCONFIRMED')
+        self.assertNotIn('overloaded', rd.render(diag).lower())
+        self.assertNotIn('no provider was launched', rd.render(diag).lower())
+
+    def test_real_caller_supplies_positive_prelaunch_lease_refusal(self):
+        options = self.options(unittest.mock.Mock())
+        options['store'].acquire_pool.side_effect = self.module.GuardError(
+            'TRANSIENT_INFRA', 'Provider pool has an active or unreconciled owner; no provider was launched')
+        original = rd.provider_attempt
+        with patch.object(self.module.diagnostics, 'provider_attempt', wraps=original) as capture, \
+                patch.object(self.module, 'run', side_effect=AssertionError('launch boundary reached')):
+            with self.assertRaises(self.module.ReviewFailure):
+                self.module.review_snapshot(self.root, HEAD, 'pr', '', 'fixture packet', options)
+        self.assertEqual(options['launches'], 0)
+        self.assertEqual(capture.call_args.kwargs.get('launch_state'), 'NOT_STARTED')
+        self.assertIn('unreconciled owner', capture.call_args.kwargs.get('local_detail', ''))
+        diag = options['attempts'][-1]
+        self.assertEqual(diag['code'], 'REVIEW_NOT_STARTED')
+        self.assertIn('NOT_STARTED', rd.render(diag))
+        self.assertNotIn('overloaded', rd.render(diag).lower())
+
+    def test_local_context_preserves_reason_redacts_details_and_does_not_change_outcome(self):
+        for reason in ('QUOTA', 'AUTH', 'UNKNOWN', 'TRANSIENT_INFRA'):
+            with self.subTest(reason=reason):
+                outcome = {**self.module.provider_failure({}), 'reason': reason}
+                before = dict(outcome)
+                diag = rd.provider_attempt('claude', self.resolution, None, '', '', outcome,
+                                           launch_state='NOT_STARTED',
+                                           local_detail='token=synthetic12345678901234567890 local pool refused')
+                self.assertEqual((diag['code'], diag['reason']), ('REVIEW_NOT_STARTED', reason))
+                self.assertEqual(outcome, before)
+                self.assertNotIn('synthetic12345678901234567890', rd.render(diag))
+                missing = rd.provider_attempt('claude', {'path': None}, None, '', '', outcome,
+                                              launch_state='NOT_STARTED')
+                self.assertEqual(missing['code'], 'EXEC_NOT_FOUND')
+                executed = rd.provider_attempt('claude', self.resolution, 1, '', '', outcome)
+                self.assertNotIn(executed['code'], ('REVIEW_NOT_STARTED', 'REVIEW_LAUNCH_UNCONFIRMED'))
+
+    def test_actual_spawn_before_failed_child_record_stays_unconfirmed_even_if_cleanup_fails(self):
+        import process as process_module
+        spawned = []
+        def record_fails(child):
+            spawned.append(child)
+            raise self.module.GuardError('UNKNOWN', 'Synthetic child recording failed')
+        options = self.options(record_fails)
+        def short_lived_fixture(_command, **kwargs):
+            return process_module.run([sys.executable, '-c', 'import time; time.sleep(10)'], **kwargs)
+        original = rd.provider_attempt
+        try:
+            with patch.object(self.module, 'run_process', side_effect=short_lived_fixture), \
+                    patch.object(process_module, 'signal_group', side_effect=OSError('synthetic cleanup failure')), \
+                    patch.object(self.module.diagnostics, 'provider_attempt', wraps=original) as capture:
+                with self.assertRaises(self.module.ReviewFailure):
+                    self.module.review_snapshot(self.root, HEAD, 'pr', '', 'fixture packet', options)
+            self.assertEqual(len(spawned), 1)
+            self.assertIsNone(spawned[0].poll(), 'positive control: failed cleanup left the owned fixture alive')
+            self.assertEqual(options['launches'], 1)
+            self.assertEqual(capture.call_args.kwargs.get('launch_state'), 'UNCONFIRMED')
+            self.assertEqual(options['attempts'][-1]['code'], 'REVIEW_LAUNCH_UNCONFIRMED')
+            self.assertNotIn('NOT_STARTED', rd.render(options['attempts'][-1]))
+            self.assertFalse(options['store'].release_pool.called, 'unknown ownership remains reserved')
+        finally:
+            for child in spawned:
+                if child.poll() is None: child.kill()
+                child.wait(timeout=5)
 
 
 if __name__ == '__main__':

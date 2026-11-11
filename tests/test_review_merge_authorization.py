@@ -61,6 +61,78 @@ class BindingTests(unittest.TestCase):
         with self.assertRaises(OSError):
             review.verify_pr_binding("o/r", 5, HEAD, runner=FakePr(rc=1))
 
+    # GoodQA #15565: GitHub owner/repo names are ASCII and case-insensitive; the binding must match them that way
+    # and only that way (no Unicode folding, no prefix/suffix, github.com only).
+    REPO = "ericmacdougall/android-security"
+    PR_URL = "https://github.com/ericmacdougall/Android-security/pull/768"
+
+    def bind(self, expected, url, number=768, head=HEAD, **changes):
+        value = {"number": 768, "url": url, "headRefOid": HEAD, "state": "OPEN"}
+        value.update(changes)
+        return review.verify_pr_binding(expected, number, head, runner=FakePr(value))
+
+    def test_repo_case_differences_bind_to_the_same_repository(self):
+        accepted = (
+            (self.REPO, self.PR_URL),                                              # ParentProof PR 768
+            ("ericmacdougall/Android-security", "https://github.com/ericmacdougall/android-security/pull/768"),
+            ("EricMacDougall/ANDROID-SECURITY", "https://github.com/ericmacdougall/Android-Security/pull/768"),
+            (self.REPO, "https://github.com/ERICMACDOUGALL/ANDROID-SECURITY/pull/768"),
+        )
+        for expected, url in accepted:
+            with self.subTest(expected=expected, url=url):
+                self.assertEqual(self.bind(expected, url), {"repo": self.REPO, "pr": 768})
+
+    def test_case_insensitive_repo_match_keeps_every_other_check_strict(self):
+        rejected = (
+            ("different repo suffix", self.REPO, "https://github.com/ericmacdougall/Android-security2/pull/768", {}),
+            ("homoglyph digit", self.REPO, "https://github.com/ericmacdougall/Android-secur1ty/pull/768", {}),
+            ("fork-like suffix", self.REPO,
+             "https://github.com/ericmacdougall/android-security-fork/pull/768", {}),
+            ("other owner", self.REPO, "https://github.com/someoneelse/Android-security/pull/768", {}),
+            ("owner prefix", self.REPO, "https://github.com/ericmacdougall2/Android-security/pull/768", {}),
+            ("url pr number", self.REPO, "https://github.com/ericmacdougall/Android-security/pull/769", {}),
+            ("json pr number", self.REPO, self.PR_URL, {"number": 769}),
+            ("head", self.REPO, self.PR_URL, {"headRefOid": OTHER}),
+            ("closed", self.REPO, self.PR_URL, {"state": "CLOSED"}),
+            ("merged", self.REPO, self.PR_URL, {"state": "MERGED"}),
+            ("lookalike host suffix", self.REPO,
+             "https://github.com.evil.example/ericmacdougall/Android-security/pull/768", {}),
+            ("lookalike host typo", self.REPO, "https://githuh.com/ericmacdougall/Android-security/pull/768", {}),
+            ("uppercase host", self.REPO, "https://GITHUB.com/ericmacdougall/Android-security/pull/768", {}),
+            ("plain http", self.REPO, "http://github.com/ericmacdougall/Android-security/pull/768", {}),
+            ("userinfo host", self.REPO,
+             "https://github.com@evil.example/ericmacdougall/Android-security/pull/768", {}),
+            ("trailing path", self.REPO, self.PR_URL + "/files", {}),
+            ("trailing slash", self.REPO, self.PR_URL + "/", {}),
+            ("trailing newline", self.REPO, self.PR_URL + "\n", {}),
+            ("query", self.REPO, self.PR_URL + "?x=1", {}),
+            ("nested path", self.REPO,
+             "https://github.com/ericmacdougall/Android-security/x/pull/768", {}),
+            ("unicode digits in number", self.REPO,
+             "https://github.com/ericmacdougall/Android-security/pull/٧٦٨", {}),
+            # Unicode case rules must never widen equality: str.lower() maps KELVIN SIGN to "k",
+            # str.casefold() maps SHARP S to "ss"; dotless/dotted Turkish i must not become "i".
+            ("kelvin sign", "o/k", "https://github.com/o/K/pull/768", {}),
+            ("kelvin owner", "k/r", "https://github.com/K/r/pull/768", {}),
+            ("sharp s", "o/strasse", "https://github.com/o/straße/pull/768", {}),
+            ("dotless i", "o/ripo", "https://github.com/o/rıpo/pull/768", {}),
+            ("dotted capital I", "o/ripo", "https://github.com/o/RİPO/pull/768", {}),
+            ("long s", "o/sec", "https://github.com/o/ſec/pull/768", {}),
+        )
+        for label, expected, url, changes in rejected:
+            with self.subTest(label):
+                with self.assertRaises(OSError):
+                    self.bind(expected, url, **changes)
+        for label, expected in (("expected kelvin", "o/K"), ("expected sharp s", "o/straße"),
+                                ("expected path", "o/r/x"), ("expected url", "https://github.com/o/r")):
+            with self.subTest(label):
+                with self.assertRaises(OSError):
+                    self.bind(expected, "https://github.com/o/r/pull/768")
+        with self.subTest("requested head differs"), self.assertRaises(OSError):
+            self.bind(self.REPO, self.PR_URL, head=OTHER)
+        with self.subTest("requested number differs"), self.assertRaises(OSError):
+            self.bind(self.REPO, self.PR_URL, number=769)
+
     def test_only_pure_cross_harness_pr_pass_is_eligible(self):
         args = SimpleNamespace(stage="pr", author_harness="claude", main_stamp={"purpose": "review-auth"})
         binding = {"repo": "o/r", "pr": 5}
@@ -342,6 +414,43 @@ class EndToEndTests(unittest.TestCase):
         result = self.run_review("--author-harness", "claude")
         self.assertNotIn("Merge authorization:", result.stdout, result.stdout + result.stderr)
         self.assertIn("do not prove the author harness", result.stderr)
+
+
+class NativeReviewReceiptScope(unittest.TestCase):
+    COMMAND = "python3 ~/.claude/hooks/peer_review.py pr --repo /w --github-repo o/r --pr 5 --packet /p"
+    PAYLOAD = {"session_id": "11111111-2222-4333-8444-555555555555", "agent_id": None}
+
+    def check_path(self, command, native, claude=False):
+        import caller_identity
+
+        adapter = SimpleNamespace(is_desktop_review_root=native)
+        with mock.patch.dict(sys.modules, {"native_main": adapter}), \
+                mock.patch.object(caller_identity, "is_main", return_value=claude), \
+                mock.patch.object(caller_identity, "put_stamp") as stamp:
+            mg._stamp_review(command, self.PAYLOAD, 123)
+        return stamp
+
+    def test_native_root_can_write_only_the_existing_review_receipt(self):
+        native = mock.Mock(return_value=True)
+        stamp = self.check_path(self.COMMAND, native)
+        native.assert_called_once_with(self.PAYLOAD)
+        stamp.assert_called_once_with("review-auth", ["o/r", 5], session=self.PAYLOAD["session_id"], now=123)
+
+    def test_nonplain_commands_do_not_reach_native_admission(self):
+        for command in ("echo " + self.COMMAND, self.COMMAND + " | tee output", "true; " + self.COMMAND):
+            with self.subTest(command=command):
+                native = mock.Mock(return_value=True)
+                self.check_path(command, native).assert_not_called()
+                native.assert_not_called()
+
+    def test_native_denial_or_error_writes_no_receipt(self):
+        for native in (mock.Mock(return_value=False), mock.Mock(side_effect=OSError)):
+            self.check_path(self.COMMAND, native).assert_not_called()
+
+    def test_genuine_claude_success_short_circuits_native_lookup(self):
+        native = mock.Mock(side_effect=AssertionError)
+        self.check_path(self.COMMAND, native, claude=True).assert_called_once()
+        native.assert_not_called()
 
 
 class SubagentAuthorization(unittest.TestCase):

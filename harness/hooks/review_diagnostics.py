@@ -67,6 +67,10 @@ CONTRACT = {
                       ['Sign in again with the provider CLI, then rerun once.']),
     'PROVIDER_UNAVAILABLE': ('TRANSIENT_INFRA', 'The provider was overloaded, rate limited or its model was unavailable.',
                              ['Rerun once later; the helper already tried the independent fallback if one was allowed.']),
+    'REVIEW_NOT_STARTED': ('TRANSIENT_INFRA', 'Local review infrastructure refused before the provider launch boundary (NOT_STARTED); no provider response was observed.',
+                           ['Inspect the local run receipt and provider-pool reservation or cooldown. Reconcile only with the required ownership evidence; do not retry unchanged.']),
+    'REVIEW_LAUNCH_UNCONFIRMED': ('UNKNOWN', 'No reviewer exit status was recorded; a provider process may have started. This does not establish a provider outage.',
+                                ['Inspect the run and child records and reconcile uncertain process ownership before any retry. Do not assume best-effort cleanup succeeded.']),
     'BUDGET_EXHAUSTED': ('BUDGET_EXHAUSTED', 'The 1440 second review budget (720 per provider) was used up.',
                          ['Do not loop. Reconcile the usage store, then decide with the main agent whether one repeat with --repeat-reason is justified.']),
     'PROVIDER_TIMEOUT': ('TIMEOUT', 'The provider exceeded its 720 second deadline.',
@@ -450,7 +454,7 @@ PROVIDER_REASON_CODES = {'TRANSIENT_INFRA': 'PROVIDER_UNAVAILABLE', 'BUDGET_EXHA
                          'UNKNOWN': 'PROVIDER_IO_UNKNOWN', 'INVALID_OUTPUT': 'PROVIDER_INVALID_OUTPUT'}
 
 
-def provider_attempt(provider, resolution, code, stdout, stderr, outcome):
+def provider_attempt(provider, resolution, code, stdout, stderr, outcome, *, launch_state=None, local_detail=''):
     """Bounded, sanitized diagnostic for one provider launch (None when it needs none)."""
     if resolution is None or not resolution.get('path'):
         rejected = (resolution or {}).get('rejected') or []
@@ -459,6 +463,13 @@ def provider_attempt(provider, resolution, code, stdout, stderr, outcome):
                   'searched %d locations (PATH and policy): %s' % (len(searched), ', '.join(searched[:8])))
         return diagnostic('EXEC_UNTRUSTED' if rejected else 'EXEC_NOT_FOUND', provider=provider, detail=detail)
     reason = outcome.get('reason')
+    if code is None:
+        # Only the caller's trusted pre-launch stage can prove no launch. In particular,
+        # Popen may succeed before an on_spawn/child-record failure leaves code unset.
+        code_name = 'REVIEW_NOT_STARTED' if launch_state == 'NOT_STARTED' else 'REVIEW_LAUNCH_UNCONFIRMED'
+        typed_reason = reason if reason in PROVIDER_REASON_CODES else 'UNKNOWN'
+        detail = ('Local outcome: ' + typed_reason + '. ' + sanitize(local_detail, 400)).strip()
+        return {**diagnostic(code_name, provider=provider, detail=detail), 'reason': typed_reason}
     if reason in ('NONE', 'CODE_FINDINGS'):
         return None
     return diagnostic(PROVIDER_REASON_CODES.get(reason, 'PROVIDER_INVALID_OUTPUT'), provider=provider,
