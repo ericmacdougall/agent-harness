@@ -151,3 +151,7 @@ dialog{background:var(--k-111512);border:1px solid var(--k-454d3b);border-radius
 .needs-dialog{padding-top:0}
 .needs-dialog .dialog-top{position:sticky;top:0;z-index:2;background:var(--k-111512);padding:20px 0 10px;margin-bottom:6px}
 .needs-top{flex-wrap:wrap;row-gap:2px}
+.needs-section-note{font-size:12px;line-height:1.5;color:var(--muted);margin:0 0 10px}
+.needs-item.flagged{border-color:var(--k-f1a6a666)}
+.needs-answer[hidden]{display:none}
+.needs-history+.needs-history{margin-top:0}

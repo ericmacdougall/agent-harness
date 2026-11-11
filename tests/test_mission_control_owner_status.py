@@ -19,7 +19,7 @@ class SupervisedOwners(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name) / 'owners'
+        self.root = Path(self.tmp.name).resolve() / 'owners'  # macOS: /var is a link to /private/var
         self.root.mkdir()
         self.hub = ev.Hub()
         self.health = col.Health(self.hub)

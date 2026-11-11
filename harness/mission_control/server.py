@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import base64
 import glob
+import gzip
 import hashlib
 import hmac
 import json
@@ -346,7 +347,9 @@ class App:
         self.remote = col.Remote(self.hub, self.health, self.runner, enabled=remote, fabric=bool(fabric_bin),
                                  drop_dir=root / "sources")
         self.drop = col.FileDrop(self.hub, self.health, self.reader, root / "sources")
-        self.asks = col.Asks(self.hub, self.health, self.runner, lambda: self.owners.session)
+        self.asks = col.Asks(self.hub, self.health, self.runner, lambda: self.owners.session, root=root,
+                             owners_fn=lambda: self.owners.rows)
+        self.tailer.on_ask = self.asks.mark_dirty
         self.collectors = [self.tailer, self.initiatives, self.drop, self.owners, self.github, self.tickets,
                            self.remote]
         self.codex = CodexResponder(self.hub, self.health, self.runner, codex_binary(), root,
@@ -382,8 +385,15 @@ class App:
                 self.supervised.run(now)
             self.stop.wait(0.5)
 
+    def wake(self) -> None:
+        """A page attached: sources that were on their idle cadence refresh now."""
+        now = time.time()
+        for collector in self.collectors:
+            collector.wake(now)
+
     def asks_loop(self) -> None:
-        """Its own thread: the ledger resolve takes seconds and must not delay the live feed."""
+        """The Needs-you sweeper, on its own thread: the ledger read takes seconds and must not delay the live
+        feed. Each run is a sweep (needs_sweep) and leaves a heartbeat that ops_watch reads."""
         while not self.stop.is_set():
             now = time.time()
             if self.asks.due(now):
@@ -522,12 +532,13 @@ class App:
             time.sleep(self.demo_delay_s)  # demo knob: the 'Sending' state stays visible for the whole delay
         with self.approve_lock:
             try:
-                items, resolved = self.asks.read(session)
+                view = self.asks.read(session)
             except Exception as exc:  # noqa: BLE001 - an unreadable ledger decides nothing
                 self.health.error("asks", f"{type(exc).__name__}: {str(exc)[:160]}")
                 return 503, {"error": "asks-unavailable", "message": "the asks ledger could not be read; nothing was sent"}
-            self.asks.publish(items, resolved, session)
-            item = next((a for a in items if a["id"] == ask_id), None)
+            self.asks.publish(view, session)
+            # a stale ask is still open and can be decided; a flagged or cleared one cannot
+            item = next((a for a in view["items"] + view["stale"] if a["id"] == ask_id), None)
             if item is None:
                 return 409, {"error": "not-open", "message": "this ask is no longer open"}
             if not item["approvable"]:
@@ -700,7 +711,20 @@ class Handler(BaseHTTPRequestHandler):
         if real is None:
             return self.deny(404, "not-found")
         ctype = CONTENT_TYPES.get(Path(rel).suffix, "application/octet-stream")
-        return self.send_secure(200, real.read_bytes(), ctype)
+        data = real.read_bytes()
+        if rel == "index.html":
+            return self.send_secure(200, data, ctype)  # the shell is never cached
+        # Assets revalidate on every load (no-cache) and cost a 304 when unchanged; text is gzipped when the browser
+        # accepts it. Only an authenticated same-origin request reaches this point, so the validator leaks nothing.
+        tag = '"' + hashlib.sha256(data).hexdigest()[:32] + '"'
+        extra = {"ETag": tag, "Cache-Control": "no-cache, private", "Vary": "Accept-Encoding, Cookie"}
+        if self.headers.get("If-None-Match") == tag:
+            return self.send_secure(304, b"", ctype, extra)
+        if ctype.startswith(("text/", "image/svg", "application/json")) and len(data) > 1024 \
+                and "gzip" in (self.headers.get("Accept-Encoding") or ""):
+            data = self.server.gzipped(rel, tag, data)  # type: ignore[attr-defined]
+            extra["Content-Encoding"] = "gzip"
+        return self.send_secure(200, data, ctype, extra)
 
     def stream(self, sid) -> None:
         def authorized():
@@ -716,6 +740,9 @@ class Handler(BaseHTTPRequestHandler):
         client = self.app.hub.attach()
         if client is None:
             return self.deny(503, "too-many-streams")
+        wake = getattr(self.app, "wake", None)
+        if wake:
+            wake()  # sources on their idle cadence refresh for the page that just attached
         try:
             last = int(self.headers.get("Last-Event-ID") or "0")
         except ValueError:
@@ -764,9 +791,18 @@ class Server(ThreadingHTTPServer):
     def __init__(self, app: App, web_dir: Path, log: logging.Logger):
         self.app, self.log = app, log
         self.static_files = self._index(web_dir)
+        self.gzip_cache: dict[str, tuple[str, bytes]] = {}  # rel -> (etag, gzip bytes): compressed once per version
         self.conn_lock = threading.Lock()
         self.live: dict[socket.socket, list] = {}  # socket -> [accepted_at, authed]
         super().__init__(("127.0.0.1", app.port), Handler)
+
+    def gzipped(self, rel: str, tag: str, data: bytes) -> bytes:
+        cached = self.gzip_cache.get(rel)
+        if cached and cached[0] == tag:
+            return cached[1]
+        packed = gzip.compress(data, compresslevel=6, mtime=0)
+        self.gzip_cache[rel] = (tag, packed)
+        return packed
 
     @staticmethod
     def _index(web_dir: Path) -> dict[str, Path]:

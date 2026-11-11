@@ -19,6 +19,7 @@ try { const theme = localStorage.getItem('mc-theme'); if (['light', 'dark'].incl
 let state = {
   initiatives: [], initiativesStale: false, initiativesError: '', owners: [], ownerRows: [], events: [], messages: [], sources: [],
   host: '', chat: null, pending: [], sessions: [], mainSession: '', asks: [], asksResolved: [], asksSession: '',
+  asksStale: [], asksFlagged: [], asksCleared: [], asksSweptAt: '',
   decisions: {},  // ask id -> this page's own Approve/Deny click while it is in flight or after it was refused
   connection: 'connecting', now: Date.now(), filters: Object.keys(KINDS),
   selection: null, highlight: null, tab: 'overview', responder: 'claude', session: '',
@@ -186,7 +187,11 @@ export function retryMessage(id) {
 export function setAsks(snapshot) {
   const items = Array.isArray(snapshot?.items) ? snapshot.items.filter(a => a && /^[A-Za-z0-9_-]{1,40}$/.test(String(a.id))) : [];
   const resolved = Array.isArray(snapshot?.resolved) ? snapshot.resolved.filter(a => a && /^[A-Za-z0-9_-]{1,40}$/.test(String(a.id))) : [];
-  update({ asks: items, asksResolved: resolved, asksSession: String(snapshot?.session || '') }, 'asks');
+  const list = key => (Array.isArray(snapshot?.[key]) ? snapshot[key].filter(a => a && /^[A-Za-z0-9_-]{1,40}$/.test(String(a.id))) : []);
+  // the sweeper's sections: stale asks are still open and answerable; flagged ones are not valid asks; cleared rows
+  // are settled asks it hid, each with its reason
+  update({ asks: items, asksResolved: resolved, asksStale: list('stale'), asksFlagged: list('flagged'), asksCleared: list('cleared'),
+    asksSweptAt: typeof snapshot?.swept_at === 'string' ? snapshot.swept_at : '', asksSession: String(snapshot?.session || '') }, 'asks');
 }
 export function askReplyAccess(ask, current = state) { return chatAccess(current, 'claude', ask?.session || current.asksSession); }
 export function sendAskReply(ask, text) {

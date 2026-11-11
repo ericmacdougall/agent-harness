@@ -61,6 +61,9 @@ class Runner:
             return [self.python, "-I", self.ah, "sessions"]
         if kind == "ah-ticket-comments" and len(args) == 1 and TICKET_RE.match(str(args[0])):
             return [self.python, "-I", self.ah, "ticket", "comments", str(args[0])]
+        if kind == "ah-ticket-get" and len(args) == 1 and TICKET_RE.match(str(args[0])):
+            # read-only: one ticket's state, for the Needs-you sweeper (a closed ticket settles its asks)
+            return [self.python, "-I", self.ah, "ticket", "get", str(args[0])]
         if kind == "provenance-asks" and len(args) == 1 and SESSION_RE.match(str(args[0])):
             # read-only: the open asks of one session, as data (the "Needs you" list)
             return [self.python, "-I", str(Path(self.ah).with_name("provenance.py")), "asks", "--session", str(args[0]),

@@ -1175,6 +1175,33 @@ def check_codex_trust(cfg):
                   {"untrusted": untrusted, "changed": changed, "hooks_json": str(hooks)})]
 
 
+# ---------------------------------------------------------------- Mission Control "Needs you" sweeper
+
+MC_SWEEP_STALE_S = 15 * 60  # three missed sweeps (the sweeper runs every 5 minutes inside the dashboard server)
+
+
+def check_mc_sweeper(cfg, now):
+    """A dead Needs-you sweeper is an alert (GoodQA #15585). It runs inside the Mission Control server and writes
+    <home>/.agent-harness/mission-control/needs/heartbeat.json after every sweep. No heartbeat file means the
+    sweeper was never installed here: silent. An unreadable or old heartbeat raises."""
+    path = home_of(cfg) / ".agent-harness" / "mission-control" / "needs" / "heartbeat.json"
+    try:
+        if not path.is_file() or path.is_symlink():
+            return []
+        raw = read_text_capped(path, 4096)
+        at = json.loads(raw).get("at")
+        age = now - float(at)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return [alert("mission-control", "mc:needs-sweeper", "high",
+                      "Mission Control Needs-you sweeper heartbeat is unreadable; the list may be stale", {"path": str(path)})]
+    if age <= MC_SWEEP_STALE_S:
+        return []
+    return [alert("mission-control", "mc:needs-sweeper", "high",
+                  f"Mission Control Needs-you sweeper has not run for {int(age // 60)} min (expected every 5): "
+                  f"settled and stale asks are not being cleared; check `server.py status` and the launchd job",
+                  {"path": str(path), "age_s": int(age)})]
+
+
 # ---------------------------------------------------------------- peers
 
 def active_json_path(home: Path) -> Path:
@@ -1699,6 +1726,7 @@ DEFAULT_CHECKS = {
     "delivery": lambda c, s, r, n: check_delivery(c, r),
     "drift": lambda c, s, r, n: check_drift(c, r),
     "codex": lambda c, s, r, n: check_codex_trust(c),
+    "mission-control": lambda c, s, r, n: check_mc_sweeper(c, n),
     "liveness": lambda c, s, r, n: check_liveness(c, s, r, n) if c["liveness"].get("enabled") else [],
     "peers": check_peers,
     "remote_units": check_remote_units,

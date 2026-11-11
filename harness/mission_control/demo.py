@@ -237,12 +237,24 @@ class DemoRunner:
                 {"id": f"{args[0]}-c1", "body": "Demo comment: looks good, one nit on naming.",
                  "createdAt": _iso(self.started - 3600)}]})
         if kind == "provenance-asks" and len(args) == 1:
-            return 0, json.dumps({"counts": {"traced": len(ASKS), "blocked": 0}, "items": [
-                {**ask, "at": _iso(time.time() - age), "owner": "main"} for ask, age in ASKS],
+            return 0, json.dumps({"counts": {"traced": len(ASKS), "blocked": 1}, "items": [
+                {**ask, "at": _iso(time.time() - age), "owner": "main"} for ask, age in ASKS] + [
+                # four days old with no answer: the sweeper moves it to Stale
+                {"id": "wdemoask0004", "kind": "traced", "owner": "main", "at": _iso(time.time() - 4 * 86400),
+                 "note": "Archive the old onboarding email templates? (demo#109)", "reason": "Nobody has opened them since March"},
+                # same words as the first ask: the sweeper clears it as a duplicate
+                {"id": "wdemoask0005", "kind": "traced", "owner": "main", "at": _iso(time.time() - 600),
+                 "note": ASKS[0][0]["note"], "reason": ASKS[0][0]["reason"]}],
+                "blocked": [{"id": "wdemoask0006", "owner": "main", "at": _iso(time.time() - 900),
+                             "note": "Rotate the staging API keys now? (demo#105)", "reason": "",
+                             "problem": "source rejected (message-not-found): no such user message"}],
                 "resolved": [{"id": "wdemoask0900", "at": _iso(time.time() - 90000), "owner": "main",
                               "note": "Use the staging database for the reports rehearsal? (demo#104)",
                               "resolved_at": _iso(time.time() - 86000), "decision": "approved",
+                              "resolved_by": "wdemores0900",
                               "resolution": "answered by the user: yes, staging first"}]})
+        if kind == "ah-ticket-get" and len(args) == 1:
+            return 0, json.dumps({"issue": {"closedAt": None, "archivedAt": None}})
         if kind == "gh-user" and not args:
             return 1, ""  # the GitHub source shows as failing, so the page's error notice can be checked
         raise PermissionError(f"demo mode runs no commands ({kind})")

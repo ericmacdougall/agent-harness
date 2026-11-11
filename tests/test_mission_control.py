@@ -291,6 +291,7 @@ class GithubEvents(Tmp):
     def test_failure_is_shown_and_not_retried_faster(self):
         runner = FakeRunner({"gh-user": (1, "")})
         gh = col.GitHub(self.hub, self.health, runner)
+        self.hub.attach()  # a page is watching: the normal interval applies (with none, the idle interval does)
         now = time.time()
         gh.run(now)
         self.assertEqual(self.health.rows["github"]["status"], "error")

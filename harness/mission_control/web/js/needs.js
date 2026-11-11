@@ -59,6 +59,14 @@ export function mountNeeds() {
   const historyList = document.getElementById('needs-history-list');
   const historyCount = document.getElementById('needs-history-count');
   const announcer = document.getElementById('needs-announcer');
+  const sections = [
+    { key: 'asks', list, box: null, count: null },
+    { key: 'asksStale', list: document.getElementById('needs-stale-list'), box: document.getElementById('needs-stale'), count: document.getElementById('needs-stale-count') },
+    { key: 'asksFlagged', list: document.getElementById('needs-flagged-list'), box: document.getElementById('needs-flagged'), count: document.getElementById('needs-flagged-count') },
+  ];
+  const clearedBox = document.getElementById('needs-cleared'), clearedList = document.getElementById('needs-cleared-list');
+  const clearedCount = document.getElementById('needs-cleared-count'), swept = document.getElementById('needs-swept');
+  const CLEARED_WHY = { resolved: 'resolved', 'ticket-closed': 'its ticket is closed', 'owner-reassigned': 'its owner is gone and the work was reassigned', duplicate: 'duplicate of an older ask' };
   const drafts = new Map();     // ask id -> unsent text; kept across re-renders, cleared once a send is accepted
   const arming = new Map();     // ask id -> 'approve' | 'deny' while the confirm step is showing
   const announced = new Map();  // ask id -> last decision status read out
@@ -156,28 +164,54 @@ export function mountNeeds() {
   }
 
   function paint(state) {
-    const asks = state.asks;
-    const waiting = asks.filter(ask => waitingOnUser(state.messages, ask) && state.decisions[ask.id]?.status !== 'sending').length;
+    const waiting = state.asks.filter(ask => waitingOnUser(state.messages, ask) && state.decisions[ask.id]?.status !== 'sending').length;
+    const stale = state.asksStale.length;
     count.textContent = String(waiting);
     open.classList.toggle('has-asks', waiting > 0);
-    open.setAttribute('aria-label', waiting ? `Needs you: ${waiting} open ask${waiting === 1 ? '' : 's'}` : 'Needs you: nothing waiting on you');
+    open.setAttribute('aria-label', (waiting ? `Needs you: ${waiting} open ask${waiting === 1 ? '' : 's'}` : 'Needs you: nothing waiting on you') + (stale ? `, ${stale} stale` : ''));
     document.title = waiting ? `(${waiting}) ${BASE_TITLE}` : BASE_TITLE;
-    const wanted = new Set(asks.map(a => a.id));
+    const wanted = new Set(sections.flatMap(section => state[section.key].map(a => a.id)));
     for (const [id, parts] of rows) if (!wanted.has(id)) { parts.row.remove(); rows.delete(id); drafts.delete(id); arming.delete(id); announced.delete(id); }
     list.querySelector('.empty-state')?.remove();
-    if (!asks.length) list.append(el('li', 'empty-state', 'Nothing needs you right now.'));
-    asks.forEach((ask, index) => {
+    if (!state.asks.length) list.append(el('li', 'empty-state', stale ? 'Nothing new needs you. Older open asks are under Stale.' : 'Nothing needs you right now.'));
+    for (const section of sections) {
+      if (section.box) { section.box.hidden = !state[section.key].length; section.count.textContent = String(state[section.key].length); }
+      state[section.key].forEach((ask, index) => paintAsk(state, section, ask, index));
+    }
+    paintCleared(state);
+    paintHistory(state);
+  }
+
+  function paintCleared(state) {
+    const cleared = state.asksCleared;
+    clearedBox.hidden = !cleared.length;
+    clearedCount.textContent = String(cleared.length);
+    swept.textContent = state.asksSweptAt ? `Settled asks the sweeper hid, with the reason and its evidence. Last sweep ${age(state.asksSweptAt, state.now)}.` : '';
+    clearedList.replaceChildren(...cleared.map(row => {
+      const item = el('li');
+      item.append(el('b', '', CLEARED_WHY[row.reason] || String(row.reason || 'cleared')), document.createTextNode(` · ${row.text || row.id} · ${row.evidence || 'no evidence recorded'} · ${age(row.at, state.now)}`));
+      return item;
+    }));
+  }
+
+  function paintAsk(state, section, ask, index) {
+    {
+      const list = section.list;
+      const flagged = section.key === 'asksFlagged';
       let parts = rows.get(ask.id);
       if (!parts) { parts = build(ask); rows.set(ask.id, parts); }
       if (parts.ask.digest !== ask.digest && arming.has(ask.id)) arming.delete(ask.id);  // the text changed under a half-made decision
       parts.ask = ask;
+      parts.row.classList.toggle('flagged', flagged);
+      parts.row.querySelector('.needs-answer').hidden = flagged;  // not a valid ask: nothing to decide or answer
       // server order (oldest first); move a row only when it is out of place, so a focused control keeps focus
       if (list.children[index] !== parts.row) list.insertBefore(parts.row, list.children[index] || null);
       const trail = trailOf(state.messages, ask.id);
       const decision = decisionOf(state.messages, ask, state.decisions[ask.id]);
       const answered = !waitingOnUser(state.messages, ask) || decision?.live;
       parts.row.classList.toggle('answered', !!answered);
-      parts.kind.textContent = answered ? askProgress(trail, decision) : ask.kind === 'assumption' ? 'Assumption to confirm' : 'Question';
+      parts.kind.textContent = flagged ? 'Untraceable' : answered ? askProgress(trail, decision) : ask.stale ? `Stale · ${ask.stale}` : ask.kind === 'assumption' ? 'Assumption to confirm' : 'Question';
+      parts.kind.classList.toggle('needs-flag', flagged);
       parts.from.textContent = origin(ask);
       parts.when.textContent = age(ask.at, state.now);
       if (ask.at) parts.when.dateTime = ask.at;
@@ -216,6 +250,7 @@ export function mountNeeds() {
       let line = '', tone = '';
       if (armed) { line = `${armed === 'deny' ? 'Deny' : 'Approve'} this ask? Main reads it as your decision${words ? ', with your note' : ''}. It cannot be changed here once main has read it.`; tone = 'confirm'; }
       else if (decision) { line = decisionStatus(decision, { now: state.now, waiting: !!state.chatAvailability.claude[ask.session || state.asksSession]?.waiting, time, gap }); tone = decision.status; }
+      else if (flagged) { line = `${ask.flagged || 'No traceable source'}. ${ask.blocked || ''}`.trim(); tone = 'failed'; }
       else if (!ask.approvable) { line = ask.blocked || 'This ask cannot be decided here. Answer with a reply.'; tone = 'blocked'; }
       else if (access.disabled) { line = access.notice; tone = 'blocked'; }
       else if (reply.notice) { line = reply.notice; tone = 'note'; }
@@ -228,13 +263,12 @@ export function mountNeeds() {
       const spoken = decision ? `${decision.decision}:${decision.status}` : '';
       if (announced.has(ask.id) && announced.get(ask.id) !== spoken && line && announcer) announcer.textContent = `Ask ${ask.id}: ${line}`;
       announced.set(ask.id, spoken);
-    });
-    paintHistory(state);
+    }
   }
   subscribe((state, reason) => {
     if (reason === 'tick') {
       for (const parts of rows.values()) parts.when.textContent = age(parts.ask.at, state.now);
-      if (dialog.open && state.asks.some(ask => decisionOf(state.messages, ask)?.status === 'queued')) paint(state);  // the expiry countdown
+      if (dialog.open && [...state.asks, ...state.asksStale].some(ask => decisionOf(state.messages, ask)?.status === 'queued')) paint(state);  // the expiry countdown
       return;
     }
     if (['asks', 'chat', 'connection', 'routing', 'availability', 'update'].includes(reason)) paint(state);

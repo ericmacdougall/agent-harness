@@ -27,16 +27,28 @@ TERMINAL = ("done", "handoff", "returned", "idle-helper", "unverified-legacy", "
 class Collector:
     name = "collector"
     interval = 60.0
+    idle_interval = 0.0  # when greater than interval: the cadence while no page is attached (costly sources)
 
     def __init__(self, hub, health):
         self.hub, self.health = hub, health
         self.next_at = 0.0
+        self.ran_at = None
 
     def due(self, now: float) -> bool:
         return now >= self.next_at
 
+    def watched(self) -> bool:
+        return bool(getattr(self.hub, "clients", True))
+
+    def wake(self, now: float) -> None:
+        """A page attached: a source that was on its idle cadence runs as soon as its normal interval allows."""
+        if self.idle_interval > self.interval and self.ran_at is not None:
+            self.next_at = min(self.next_at, self.ran_at + self.interval)
+
     def run(self, now: float) -> None:
-        self.next_at = now + self.interval  # set first: a failing source is never retried faster
+        # set first: a failing source is never retried faster
+        self.next_at = now + (self.interval if self.watched() else max(self.interval, self.idle_interval))
+        self.ran_at = now
         try:
             detail = self.tick(now)
             self.health.ok(self.name, detail)
@@ -122,6 +134,7 @@ class WalTailer(Collector):
     def __init__(self, hub, health, reader, roots):
         super().__init__(hub, health)
         self.reader, self.roots = reader, roots  # [(Path, runtime)]
+        self.on_ask = None  # called when a WAL line registers or resolves an ask (the asks collector re-reads)
         self.files: dict[str, _Tail] = {}
         self.last_scan = 0.0
         self.last_items: dict[tuple, dict] = {}
@@ -283,6 +296,8 @@ class WalTailer(Collector):
         return {"runtime": tail.runtime, "session": tail.session, "agent": tail.agent}
 
     def _emit(self, tail: _Tail, entry: dict, kind: str, offset=None) -> int:
+        if kind in ("ask", "ask_resolved") and self.on_ask:
+            self.on_ask()
         note = _note(entry)
         actor = self._actor(tail)
         subject = {"ticket": _ticket_in(note)}
@@ -533,6 +548,7 @@ class SupervisedOwners(Collector):
 class Owners(Collector):
     name = "owners"
     interval = 60.0
+    idle_interval = 300.0  # `ah owners` costs about 6 CPU seconds a run: five times less often with no page open
 
     def __init__(self, hub, health, runner, tailer):
         super().__init__(hub, health)
@@ -736,14 +752,24 @@ class Asks(Collector):
     Read-only. Replies go through the existing chat channel as `[ask:<id>] text`; a decision goes through
     POST /api/approve, which re-reads the ledger with `read()` at the click. Main resolves the ask either way."""
     name = "asks"
-    interval = 60.0  # the ledger resolve costs about 2 CPU seconds; a resolved ask leaves the list within a minute
+    # The ledger read costs about 5 CPU seconds on a busy session, so it is not a poll: it runs when a WAL line
+    # registers or resolves an ask (mark_dirty, debounced), at an Approve or Deny click, and at every sweep.
+    interval = 300.0
+    DEBOUNCE_S = 5.0
 
-    def __init__(self, hub, health, runner, session_fn):
+    def __init__(self, hub, health, runner, session_fn, root=None, owners_fn=None):
         super().__init__(hub, health)
         self.runner, self.session_fn = runner, session_fn
+        self.root, self.owners_fn = root, owners_fn  # with a root, every ledger read is also a sweep (needs_sweep)
         self.items: list[dict] = []
         self.resolved: list[dict] = []
+        self.stale: list[dict] = []
+        self.flagged: list[dict] = []
+        self.cleared: list[dict] = []
+        self.swept_at = ""
         self.session = ""
+        self.dirty = False      # set when a WAL ask or ask_resolved line was seen: read the ledger at the next tick
+        self.read_at = 0.0
 
     def tick(self, now: float):
         session = self.session_fn() or ""
@@ -751,32 +777,84 @@ class Asks(Collector):
             self.next_at = now + 10  # the owners collector learns main's session shortly after start
             self.health.off(self.name, "no main session known yet")
             return "off"
-        items, resolved = self.read(session)
-        self.publish(items, resolved, session)
-        return f"{len(items)} open"
+        self.publish(self.read(session, now), session)
+        return f"{len(self.items)} open, {len(self.stale)} stale, {len(self.flagged)} flagged"
 
-    def read(self, session: str) -> tuple[list[dict], list[dict]]:
-        """One fresh ledger read. Raises when the ledger cannot be read; never returns a partial list as whole."""
+    def read(self, session: str, now: float | None = None) -> dict:
+        """One fresh ledger read and sweep. Raises when the ledger cannot be read; never returns a partial list
+        as whole. The view: active items, stale items, flagged (untraceable) items, cleared-recently rows."""
+        now = time.time() if now is None else now
         code, out = self.runner.run("provenance-asks", session, timeout=60, limit=1024 * 1024)
         data = _json(out.encode("utf-8", "replace")) if out else None
         if code not in (0, 2) or not isinstance(data, dict) or not isinstance(data.get("items"), list):
             raise RuntimeError(f"provenance asks exited {code}")
-        items = []
-        for raw in data["items"][:100]:
-            if not isinstance(raw, dict) or not ASK_ID_RE.match(str(raw.get("id", ""))):
-                continue
-            items.append(self.item(session, raw))
+        self.dirty, self.read_at = False, now
+        raw = [r for r in data["items"][:100] if isinstance(r, dict) and ASK_ID_RE.match(str(r.get("id", "")))]
+        blocked = [r for r in (data.get("blocked") if isinstance(data.get("blocked"), list) else [])[:100]
+                   if isinstance(r, dict) and ASK_ID_RE.match(str(r.get("id", "")))]
         resolved = []
-        for raw in (data.get("resolved") if isinstance(data.get("resolved"), list) else [])[:100]:
-            if not isinstance(raw, dict) or not ASK_ID_RE.match(str(raw.get("id", ""))):
+        for row in (data.get("resolved") if isinstance(data.get("resolved"), list) else [])[:100]:
+            if not isinstance(row, dict) or not ASK_ID_RE.match(str(row.get("id", ""))):
                 continue
-            note = ev.short(str(raw.get("note", "")), 400)
-            resolved.append({"id": str(raw["id"]), "at": str(raw.get("at", ""))[:40], "text": note,
-                             "ticket": _ticket_in(note), "owner": ev.short(str(raw.get("owner", "")), 60),
-                             "resolved_at": str(raw.get("resolved_at", ""))[:40],
-                             "resolution": ev.short(str(raw.get("resolution", "")), 300),
-                             "decision": ev.short(str(raw.get("decision", "")), 40)})
-        return items, resolved
+            note = ev.short(str(row.get("note", "")), 400)
+            resolved.append({"id": str(row["id"]), "at": str(row.get("at", ""))[:40], "text": note,
+                             "ticket": _ticket_in(note), "owner": ev.short(str(row.get("owner", "")), 60),
+                             "resolved_at": str(row.get("resolved_at", ""))[:40],
+                             "resolution": ev.short(str(row.get("resolution", "")), 300),
+                             "decision": ev.short(str(row.get("decision", "")), 40)})
+        view = {"items": [], "stale": [], "flagged": [], "cleared": [], "resolved": resolved, "swept_at": ""}
+        status = {}
+        if self.root is not None:
+            import needs_sweep  # noqa: PLC0415
+            swept = needs_sweep.sweep(self.root, session, {"items": raw, "blocked": blocked, "resolved": data.get("resolved") or []},
+                                      owners=self.owners_fn() if self.owners_fn else (), ticket_status=self.ticket_status,
+                                      activity=self.activity(), now=now)
+            status, view["cleared"], view["swept_at"] = swept["status"], swept["cleared"], ev.iso(swept["swept_at"])
+        for row in raw:
+            verdict = status.get(str(row["id"]), {"state": "active"})
+            if verdict["state"] == "cleared":
+                continue  # settled: listed under cleared-recently with its reason, never as an open ask
+            item = self.item(session, row)
+            if verdict["state"] == "stale":
+                view["stale"].append(dict(item, stale=verdict["reason"]))
+            else:
+                view["items"].append(item)
+        for row in blocked:
+            verdict = status.get(str(row["id"]))
+            item = self.item(session, row)
+            why = verdict["reason"] if verdict else "no traceable source: " + ev.short(str(row.get("problem", "")), 160)
+            view["flagged"].append(dict(item, digest="", approvable=False, flagged=why,
+                                        blocked="This ask does not trace to a real source, so it is not shown as a valid ask. Main has to restate it with its source."))
+        return view
+
+    def mark_dirty(self) -> None:
+        self.dirty = True
+
+    def due(self, now: float) -> bool:
+        return now >= self.next_at or (self.dirty and now - self.read_at >= self.DEBOUNCE_S)
+
+    def ticket_status(self, ref: str):
+        """'closed', 'open' or None (unknown) for one ticket: a read-only lookup through the allowlisted runner."""
+        code, out = self.runner.run("ah-ticket-get", ref, timeout=15, limit=256 * 1024)
+        issue = (_json(out.encode("utf-8", "replace")) or {}).get("issue") if code == 0 and out else None
+        if not isinstance(issue, dict):
+            return None
+        return "closed" if issue.get("closedAt") or issue.get("archivedAt") else "open"
+
+    def activity(self) -> dict:
+        """ask id -> epoch of the user's newest reply or decision on it (from the dashboard inbox)."""
+        import mc_chat  # noqa: PLC0415
+        out: dict[str, float] = {}
+        for record in mc_chat.inbox(self.root, limit=200):
+            if not record.get("verified"):
+                continue
+            approval = record.get("approval") if isinstance(record.get("approval"), dict) else {}
+            tagged = re.match(r"\[ask:([A-Za-z0-9_-]{1,40})\]", str(record.get("text", "")))
+            ident = approval.get("ask_id") or (tagged.group(1) if tagged else None)
+            stamp = ev.parse_ts(record.get("created"))
+            if ident and stamp:
+                out[ident] = max(out.get(ident, 0), stamp)
+        return out
 
     @staticmethod
     def item(session: str, raw: dict) -> dict:
@@ -802,18 +880,21 @@ class Asks(Collector):
                 "text": text, "why": why, "owner": owner, "ticket": _ticket_in(text), "session": session,
                 "digest": digest if not blocked else "", "approvable": not blocked, "blocked": blocked}
 
-    def publish(self, items: list[dict], resolved: list[dict], session: str) -> None:
-        self.items, self.resolved, self.session = items, resolved, session
+    def publish(self, view: dict, session: str) -> None:
+        self.items, self.resolved, self.session = view["items"], view["resolved"], session
+        self.stale, self.flagged, self.cleared, self.swept_at = view["stale"], view["flagged"], view["cleared"], view["swept_at"]
         self.hub.snapshot("asks", self.snapshot())
 
     def snapshot(self) -> dict:
-        return {"items": self.items, "resolved": self.resolved, "session": self.session}
+        return {"items": self.items, "resolved": self.resolved, "session": self.session, "stale": self.stale,
+                "flagged": self.flagged, "cleared": self.cleared, "swept_at": self.swept_at}
 
 
 class GitHub(Collector):
     """Pushes and releases from the authenticated user's GitHub events feed: one request per minute."""
     name = "github"
     interval = 60.0
+    idle_interval = 300.0
 
     def __init__(self, hub, health, runner):
         super().__init__(hub, health)
@@ -879,6 +960,7 @@ class Tickets(Collector):
     """GoodQA checkpoint comments on tracked tickets: one ticket read per tick (10 s), round robin, max 12."""
     name = "goodqa"
     interval = 10.0
+    idle_interval = 120.0
     MAX_TICKETS = 12
 
     def __init__(self, hub, health, runner, sources):
@@ -1032,6 +1114,7 @@ class Remote(Collector):
     Fabric ships `control export`."""
     name = "t2-dev"
     interval = 60.0
+    idle_interval = 300.0
 
     def __init__(self, hub, health, runner, enabled=True, fabric=False, drop_dir=None):
         super().__init__(hub, health)

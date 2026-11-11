@@ -100,7 +100,7 @@ class AsksCollector(unittest.TestCase):
         runner = demo.DemoRunner()
         asks, _hub, _health = collector(runner)
         asks.run(0.0)
-        self.assertEqual(len(asks.items), len(demo.ASKS))
+        self.assertEqual(len(asks.items), len(demo.ASKS) + 2)  # no sweeper on this collector: the stale and duplicate fixtures are listed
         self.assertTrue(any("<script>" in a["why"] for a in asks.items))  # the hostile fixture survives as text
 
 

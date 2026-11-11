@@ -18,6 +18,17 @@
     "reply_to": {"type": ["string", "null"], "description": "Replies: the dash- id answered."},
     "text": {"type": "string", "maxLength": 65536, "description": "Redacted at rest. Messages are at most 4000 characters."},
     "final": {"type": "boolean", "description": "Replies: false while Codex is still streaming."},
+    "approval": {"type": "object", "description": "Messages only: a dashboard decision (Approve or Deny) on one open ask of the session's main WAL, covered by sig. Unclaimed at `expires`, its state becomes `expired` and it is never delivered or cited.",
+      "required": ["tag", "ask_id", "decision", "digest", "text", "reason", "wal", "expires"],
+      "properties": {
+        "tag": {"const": "mc-approve|v2"},
+        "ask_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,40}$"},
+        "decision": {"enum": ["approve", "deny"]},
+        "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the canonical JSON [tag, session, wal, ask_id, text, reason]."},
+        "text": {"type": "string", "maxLength": 4000, "description": "The whole ask text as shown, redacted."},
+        "reason": {"type": "string", "maxLength": 2000},
+        "wal": {"const": "main"},
+        "expires": {"type": "number", "description": "Epoch seconds: created plus 30 minutes."}}},
     "created": {"type": "string", "description": "RFC 3339 UTC with milliseconds."},
     "sig": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Messages: HMAC-SHA256 over the canonical record without sig."}
   }

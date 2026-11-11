@@ -1412,10 +1412,19 @@ def ask_items(session: str, home=None, ctx=None) -> dict:
         for record, result in rows:
             items.append({"id": record["id"], "kind": kind, "at": record.get("at", ""),
                           "note": str(record.get("note", ""))[:4000], "reason": str(record.get("reason", ""))[:2000],
-                          "owner": record["_wal"].stem, "source_label": result["label"] if result else ""})
+                          "owner": record["_wal"].stem, "source_label": result["label"] if result else "",
+                          **({"until": str(record["until"])[:40]} if record.get("until") else {})})
     items.sort(key=lambda item: item["at"])
+    # Blocked asks are never presented as asks; a reader that wants to FLAG them (the Needs-you sweeper) gets them
+    # apart, each with the reason its source does not resolve.
+    flagged = []
+    for record, result in blocked:
+        problem = result["problems"][0] if result and result["problems"] else {"code": "no-source", "message": "the ask has no source"}
+        flagged.append({"id": record["id"], "at": record.get("at", ""), "note": str(record.get("note", ""))[:4000],
+                        "reason": str(record.get("reason", ""))[:2000], "owner": record["_wal"].stem,
+                        "problem": f"{problem['code']}: {clip(problem['message'], 200)}"})
     return {"counts": {"traced": len(traced), "unverified": len(unverified), "assumptions": len(assumptions),
-                       "blocked": len(blocked), "closed": closed}, "items": items,
+                       "blocked": len(blocked), "closed": closed}, "items": items, "blocked": flagged,
             "resolved": resolved_items(session, home, entries=entries)}
 
 
@@ -1436,7 +1445,7 @@ def resolved_items(session: str, home=None, days: float = 7.0, limit: int = 100,
         if stamp < cutoff:
             continue
         rows.append({"id": record["id"], "at": record.get("at", ""), "note": str(record.get("note", ""))[:4000],
-                     "owner": record["_wal"].stem, "resolved_at": when,
+                     "owner": record["_wal"].stem, "resolved_at": when, "resolved_by": str(done.get("id", ""))[:40],
                      "resolution": str(done.get("note", ""))[:2000], "decision": str(done.get("decision", ""))[:40]})
     rows.sort(key=lambda row: row["resolved_at"], reverse=True)
     return rows[:limit]
