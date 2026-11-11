@@ -1302,6 +1302,10 @@ and the Bash command runs `mission_coverage.py` itself:
   `> out`) and `#` comments are left out of the argument list. Text that only mentions the script is never stamped:
   `echo`, `grep`, `printf '...'`, `bash -c '...'`, and any command with a here-document (`<<`). `goodqa#9` is one word,
   as in bash.
+- The line is split by a quote-aware tokenizer (`mission_gate.shell_tokens`), not by shlex: a quoted or backslash-escaped
+  `;`, `&&`, `|`, `(`, `)` or newline is part of a word and never starts a command, so `echo ";" mission_coverage.py
+  reseal ...` gets no stamp (r14 F1). A line with `$(...)`, backticks, `<(...)`, `$'...'`, a here-document or an
+  unbalanced quote gets no stamp at all, nor does an argument the shell computes (`$VAR`, an unquoted glob or brace).
 - The command takes (consumes) its stamp first, before argparse or any validation. A main command that then fails,
   prints `--help` or exits on an argparse error leaves nothing a later process could use.
 - Once goals.json names a mission session, the stamp must come from that session. Another top-level session (another
@@ -1316,7 +1320,12 @@ old and new value.
 Hand-over (`set-session`): with no mission session yet, any main sets it. The mission main may move it, to itself or to
 another session id. Any other session may take it only for itself, with `--user-source`: a `user:` or `answer:` source
 from its own transcript whose whole sentence says to move the mission ("take over the mission in this session"), as a
-one-segment quote with no condition or refusal. That is the recovery when the old main died. The change re-checks the
+one-segment quote with no condition or refusal. The sentence must say take over the mission, or hand, move, transfer,
+pass or bring the mission here or to this session, and either name this session as the destination ("here", "this
+session", "you") or be an imperative ("Take over the mission."). A refusal, condition or question anywhere in it, a
+cancelling word (stop, cancel, drop, abort, keep, leave, block) or another destination ("the other session", "to
+session <id>") refuses it (r14 F2). The same shared checker (`user_words_ok`) judges defer, retire and takeover
+quotes. That is the recovery when the old main died. The change re-checks the
 mission session under the write lock.
 
 Limit (threat model): stamps are not signed. A same-user process can write a stamp file into
@@ -1357,8 +1366,10 @@ A goal with status `active` (or `deferred`) is covered by
      `#<ticket number>`, with "the", "goal", "work" and the project name folded in): defer, park, pause, postpone or
      shelve the goal, hold off on it, put it on hold, "<goal> can wait", or "<goal> is deferred/parked/paused/on hold".
      The whole sentence of the user's turn that holds the quote (not only the quoted fragment) must contain no refusal,
-     condition or negation (don't, not, no, never, if, unless, maybe, should, a question mark, stop, quit, resume,
-     restart, except, instead). "wait", "later", "hold" and "stop" alone are not a decision. `report` prints the quoted
+     condition or negation (don't, not, no, never, any "n't" form, if, unless, maybe, should, might, a question mark,
+     stop, quit, resume, restart, abort, except, instead, never mind). The sentence is judged as written: no word is
+     removed first, so "Do not now pause leads" and "do not pause leads, not now" are refusals (r14 F3). "wait",
+     "later", "hold" and "stop" alone are not a decision. `report` prints the quoted
      words. `retire` follows the same rules with drop, cancel, retire, abandon or scrap (or the word kill) next to the
      goal, or "<goal> is dropped/cancelled/retired/dead";
 3. done evidence (status `done`): a deploy record and a later REALLY_TESTED entry against a live target, both from the

@@ -96,10 +96,16 @@ SCRIPT = "python3 ~/.claude/hooks/mission_coverage.py"
 GENESIS = "0" * 64
 MAIN_ONLY = ("set", "defer", "import-initiatives", "reseal", "activate", "set-session", "bind", "retire")
 STAMP_PURPOSE = "mission-main"
-REFUSAL_WORDS = re.compile(r"\b(?:don't|dont|do not|never|not|no|if|unless|maybe|perhaps|whether|should|could|would|"
-                           r"won't|can't|cannot)\b|\?")
-# defer and retire also refuse words that undo or redirect the verb ("stop parking leads", "park X instead of leads")
-NEGATING_WORDS = re.compile(r"\b(?:stop\w*|quit\w*|resum\w*|restart\w*|unpark\w*|unpaus\w*|undo\w*|except|instead)\b")
+# Every user quote (defer, retire, takeover) is judged by user_words_ok on the whole sentence, as written: no word
+# is ever removed to make a phrase pass (r14 F3: eade6bd deleted "not now" before the refusal check).
+REFUSAL_WORDS = re.compile(r"\b(?:don't|dont|do not|never|not|no|nor|neither|if|unless|maybe|perhaps|whether|should|"
+                           r"could|would|might|won't|can't|cannot|"
+                           r"(?:does|did|is|are|was|were|wo|ca|should|would|could|must|have|has|had|need)n'?t)\b|"
+                           r"n't\b|\?")
+# words that undo, retract or redirect the verb ("stop parking leads", "park X instead of leads", "never mind")
+NEGATING_WORDS = re.compile(r"\b(?:stop\w*|quit\w*|resum\w*|restart\w*|unpark\w*|unpaus\w*|undo\w*|except|instead|"
+                            r"abort\w*|halt\w*|revert\w*|refus\w*|reject\w*|veto\w*|never ?mind|scratch that|"
+                            r"forget (?:it|that)|belay)\b")
 # The verb sits right next to the goal (<g> stands for its id or #ticket, with "the", "goal", "work" and the like
 # folded in); "wait", "later", "hold" and "stop" alone are not a decision (H1, delta red-team of PR 179).
 _G = "<g>"
@@ -112,9 +118,21 @@ RETIRE_PHRASES = re.compile(
     r"retired|retiring|kill|kills|killed|killing|abandon|abandons|abandoned|abandoning|scrap|scraps|scrapped|"
     r"scrapping) <g>|<g> (?:is|are|was|has been) (?:dropped|cancelled|canceled|retired|killed|abandoned|scrapped|"
     r"dead))(?: |$)")
-HANDOVER_WORDS = re.compile(r"\b(?:take|takes|taking|took) over\b|\btakeover\b|\bhand(?:s|ed|ing)? (?:it )?over\b|"
-                            r"\bhandover\b|\btransfer\w*|\bown\b|\bowns\b|\bruns?\b|\bresume\b|\bcontinue\b|"
-                            r"\bswitch\w*|\bmove\b")
+# A takeover names the mission right after its verb (<g> stands for "the mission") and says where it goes: this
+# session ("here", "this session", "you"), or the sentence is an imperative to this session ("take over the
+# mission."). Cancelling words and another destination refuse it (r14 F2: "stop the mission takeover").
+TAKEOVER_PHRASES = re.compile(
+    r"(?:^| )(?:(?:take|takes|taking|took) over <g>|(?:take|takes|taking|took) <g> over|"
+    r"(?:hand|hands|handed|handing|move|moves|moved|moving|transfer|transfers|transferred|transferring|pass|passes|"
+    r"passed|passing|bring|brings|brought|bringing) (?:over )?<g> (?:over )?(?:here|to you|to this session|"
+    r"into this session|in this session))(?: |$)")
+TAKEOVER_DESTINATION = re.compile(r"\b(?:here|this session|you|yourself)\b")
+TAKEOVER_IMPERATIVE = re.compile(r"^(?:(?:please|ok|okay|yes|right|alright|now|so|and|then|go ahead and) )*$")
+TAKEOVER_UNDO = re.compile(r"\b(?:cancel\w*|drop\w*|abandon\w*|kill\w*|scrap\w*|block\w*|prevent\w*|avoid\w*|"
+                           r"keep|leave|hold off|give (?:it )?back|other|another|previous)\b|"
+                           r"\bto (?:the |that |a |old |original |first )*(?:session|main|agent|owner|chat|window)\b|"
+                           r"\b(?:to|for) (?:session )?[0-9a-f]{8}\b")
+MISSION_GOAL = {"id": "mission", "ticket": ""}
 LEAD_FILLER = {"the", "this", "that", "our", "my", "goodqa"}
 TRAIL_FILLER = {"goal", "goals", "work", "stream", "ticket", "initiative", "project", "effort"}
 
@@ -250,24 +268,47 @@ def goal_tokens(text, goal: dict) -> str:
     return " ".join(out)
 
 
-def _words_ok(text, goal: dict, phrases) -> bool:
-    low = _norm_words(text)
-    if not low or REFUSAL_WORDS.search(low.replace("not now", "")) or NEGATING_WORDS.search(low):
+def _takeover_tokens_ok(tokens: str) -> bool:
+    m = TAKEOVER_PHRASES.search(tokens)
+    if m is None:
         return False
-    return phrases.search(goal_tokens(low, goal)) is not None
+    lead = tokens[:m.start()].strip()
+    imperative = TAKEOVER_IMPERATIVE.match(lead + " " if lead else "") is not None
+    return TAKEOVER_DESTINATION.search(tokens) is not None or imperative
+
+
+WORD_RULES = {  # kind: (phrase test on goal_tokens of one sentence, extra undoing words for that kind)
+    "defer": (lambda tokens: DEFER_PHRASES.search(tokens) is not None, None),
+    "retire": (lambda tokens: RETIRE_PHRASES.search(tokens) is not None, None),
+    "takeover": (_takeover_tokens_ok, TAKEOVER_UNDO),
+}
+
+
+def user_words_ok(text, kind: str, goal: dict = None) -> bool:
+    """The one negation-aware check of the user's words, shared by defer, retire and takeover (r14 F2/F3). The text
+    (a quote, or every sentence around it joined by ' | ') must hold no refusal, condition, question or undoing word
+    anywhere, judged on the full text as written, and each sentence must hold the kind's phrase next to the goal
+    (the mission for 'takeover')."""
+    phrase_ok, undo = WORD_RULES[kind]
+    low = _norm_words(text)
+    if not low or REFUSAL_WORDS.search(low) or NEGATING_WORDS.search(low) or (undo and undo.search(low)):
+        return False
+    target = MISSION_GOAL if kind == "takeover" else goal
+    sentences = [part for part in low.split(" | ") if part.strip()]
+    return bool(sentences) and all(phrase_ok(goal_tokens(part, target)) for part in sentences)
 
 
 def deferral_words_ok(text, goal: dict) -> bool:
     """The user's words say defer/park/pause/postpone/shelve right next to the goal ("park leads", "put #15095 on
     hold", "leads can wait"), with no refusal, condition or negation anywhere in them ("don't", "if", "maybe", a
     question, "stop parking", "instead"). Callers pass the whole sentence around the quote (user_context)."""
-    return _words_ok(text, goal, DEFER_PHRASES)
+    return user_words_ok(text, "defer", goal)
 
 
 def retire_words_ok(text, goal: dict) -> bool:
     """The user's words say drop/cancel/retire/abandon/scrap (or kill) right next to the goal, with no refusal,
     condition or negation anywhere in them."""
-    return _words_ok(text, goal, RETIRE_PHRASES)
+    return user_words_ok(text, "retire", goal)
 
 
 def source_excerpt(source) -> str:
@@ -1044,11 +1085,10 @@ def bind_agent(home: Path, goal_id: str, agent: str, source: str, remove: bool =
 
 
 def handover_words_ok(text) -> bool:
-    """The user's sentence moves the mission: it says 'mission' and take over / hand over / own / run / resume /
-    continue / transfer / switch / move, with no refusal or condition."""
-    low = _norm_words(text)
-    return (bool(re.search(r"\bmission\b", low)) and HANDOVER_WORDS.search(low) is not None
-            and REFUSAL_WORDS.search(low) is None)
+    """The user's sentence moves the mission to this session: take over the mission (here / in this session / as an
+    imperative), or hand / move / transfer the mission here, with no refusal, condition, cancellation or other
+    destination (user_words_ok, kind 'takeover')."""
+    return user_words_ok(text, "takeover")
 
 
 def set_session(home: Path, session: str, user_source=None) -> dict:

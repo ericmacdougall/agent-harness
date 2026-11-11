@@ -3,6 +3,8 @@
 (GoodQA goodqa#15565; the rule lives in mission_coverage.py), and the PreToolUse(Bash) hook that stamps main's own
 main-only mission commands (`mission_gate.py pretool`): one stamp per command that runs mission_coverage.py at shell
 command position, keyed by its exact argument list; echoed, quoted, grepped or here-document text is never stamped.
+The command line is split by a quote-aware tokenizer (shell_tokens): quoted or escaped punctuation is a word
+character, never a separator (r14 F1), and a line whose words only the shell knows gets no stamp at all.
 
 Evidence: 2026-11-10 the leads goal (goodqa#15095) had no owner all night; the user had to ask "whats moving the
 slowest" and then "why doesnt the dashboard and harness deal with this?". The dropped-owner gate only sees owners that
@@ -94,55 +96,130 @@ def ring(home: Path, event: str, message: str, detail: dict, key: str = VALVE_KE
         pass
 
 
-PUNCT = set(";&|()<>\n")
 PYTHON = re.compile(r"^python(?:\d+(?:\.\d+)*)?$")
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Control operators end a simple command; redirection operators take the next word as their target. Longest first.
+SEPARATORS = (";;&", ";;", ";&", "&&", "||", "|&", ";", "&", "|", "(", ")", "\n")
+REDIRECTS = ("&>>", "&>", ">>", ">&", "<&", "<>", ">|", "<", ">")
+HEREDOCS = ("<<<", "<<-", "<<")
+OPERATORS = tuple(sorted(SEPARATORS + REDIRECTS + HEREDOCS, key=len, reverse=True))
+OPERATOR_START = set(";&|()<>\n")
 
 
-def _words(cmd: str) -> list:
-    """Shell words and operator runs. `#` is a word character here (bash starts a comment only at a word start;
-    `goodqa#9` is one word); a word that starts with `#` is treated as a comment in simple_commands."""
-    import shlex  # noqa: PLC0415
-    try:
-        lexer = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>\n")
-        lexer.whitespace_split = True
-        lexer.whitespace = " \t\r"  # a newline separates commands, as in bash (shlex counts it as whitespace)
-        lexer.commenters = ""
-        return list(lexer)
-    except ValueError:
-        return []
+class Unparsed(ValueError):
+    """The words of this command line cannot be known without running the shell (r14 F1: fail closed, no stamp)."""
 
 
-def _is_op(word: str) -> bool:
-    return bool(word) and set(word) <= PUNCT
+class Word(str):
+    """One shell word after quote removal. `computed`: it holds a `$` expansion or an unquoted glob or brace the
+    shell may rewrite, so the process could see other text; `tilde`: it starts with an unquoted `~` (bash expands `~` and `~/...`)."""
+    computed = False
+    tilde = False
 
 
-def _is_sep(word: str) -> bool:
-    return _is_op(word) and (bool(set(word) & set(";|()\n")) or word in ("&", "&&"))
+def shell_tokens(cmd: str) -> list:
+    """[(kind, text)] with kind 'op' (an unquoted, unescaped operator) or 'word' (a Word). Quote state is tracked on
+    the raw text, so `";"`, `';'`, `\\;` and a newline inside quotes are word characters, never operators (r14 F1).
+    `#` starts a comment only at the start of a word. Raises Unparsed for forms whose words or commands only the
+    shell knows: an unbalanced quote, `$(...)`, backticks, `<(...)`/`>(...)`, `$'...'`, or a here-document."""
+    out, i, n = [], 0, len(cmd)
+    buf, computed, tilde, quoted = None, False, False, False
+
+    def flush():
+        nonlocal buf, computed, tilde, quoted
+        if buf is not None:
+            word = Word("".join(buf))
+            word.computed, word.tilde = computed, tilde
+            out.append(("word", word))
+        buf, computed, tilde, quoted = None, False, False, False
+
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            if cmd.startswith("\\\n", i):  # a line continuation joins the lines
+                i += 2
+                continue
+            buf = [] if buf is None else buf
+            quoted = True
+            buf.append(cmd[i + 1] if i + 1 < n else "")
+            i += 2
+        elif c == "'":
+            close = cmd.find("'", i + 1)
+            if close < 0:
+                raise Unparsed("unbalanced single quote")
+            buf = [] if buf is None else buf
+            quoted = True
+            buf.append(cmd[i + 1:close])
+            i = close + 1
+        elif c == '"':
+            buf = [] if buf is None else buf
+            quoted = True
+            i += 1
+            while True:
+                if i >= n:
+                    raise Unparsed("unbalanced double quote")
+                d = cmd[i]
+                if d == '"':
+                    i += 1
+                    break
+                if d == "\\" and i + 1 < n and cmd[i + 1] in '$`"\\\n':
+                    buf.append("" if cmd[i + 1] == "\n" else cmd[i + 1])
+                    i += 2
+                    continue
+                if d == "`" or cmd.startswith("$(", i):
+                    raise Unparsed("command substitution")
+                computed = computed or d == "$"
+                buf.append(d)
+                i += 1
+        elif c == "`" or cmd.startswith("$(", i) or cmd.startswith("$'", i):
+            raise Unparsed("command substitution or ANSI-C quoting")
+        elif c in " \t\r":
+            flush()
+            i += 1
+        elif c == "#" and buf is None:  # a comment runs to the end of the line (the newline still separates)
+            while i < n and cmd[i] != "\n":
+                i += 1
+        elif c in OPERATOR_START:
+            if c in "<>" and cmd.startswith("(", i + 1):
+                raise Unparsed("process substitution")
+            op = next(o for o in OPERATORS if cmd.startswith(o, i))
+            if op in HEREDOCS:
+                raise Unparsed("here-document")
+            if op in REDIRECTS and buf is not None and not quoted and "".join(buf).isdigit():
+                buf, computed, tilde, quoted = None, False, False, False  # `2>&1`: the fd number belongs to the operator
+            flush()
+            out.append(("op", op))
+            i += len(op)
+        else:
+            if buf is None:
+                buf, tilde = [], c == "~"
+            computed = computed or c in "$*?[{"  # an expansion or a glob: the process may see other words
+            buf.append(c)
+            i += 1
+    flush()
+    return out
 
 
 def simple_commands(cmd: str) -> list:
-    """The argument lists the shell would run, split at ; & && | || ( ) and newlines, with redirections (and their
-    targets and fd numbers) removed and comments dropped. [] for a command with a here-document: its body is text,
-    not commands, and the lexer cannot tell where it ends."""
-    words = _words(cmd[:20000])
-    if any("<<" in w for w in words if _is_op(w)):
+    """The argument lists (lists of Word) the shell would run, split only at unquoted control operators, with
+    redirections and their targets removed and comments dropped. [] for the whole line when shell_tokens cannot
+    know its words (substitutions, here-documents, unbalanced quotes): no stamp is better than a wrong one."""
+    if len(cmd) > 20000:  # never stamp a truncated command line
+        return []
+    try:
+        tokens = shell_tokens(cmd)
+    except Unparsed:
         return []
     out, cur, i = [], [], 0
-    while i < len(words):
-        w = words[i]
-        if _is_sep(w):
+    while i < len(tokens):
+        kind, text = tokens[i]
+        if kind == "word":
+            cur.append(text)
+        elif text in SEPARATORS:
             out.append(cur)
             cur = []
-        elif _is_op(w):  # a redirection: drop it, its target, and an fd number written just before it
-            if cur and cur[-1].isdigit():
-                cur.pop()
+        elif i + 1 < len(tokens) and tokens[i + 1][0] == "word":  # a redirection: drop its target too
             i += 1
-        elif w.startswith("#"):  # a comment runs to the end of the line
-            while i + 1 < len(words) and "\n" not in words[i + 1]:
-                i += 1
-        else:
-            cur.append(w)
         i += 1
     out.append(cur)
     return [c for c in out if c]
@@ -172,13 +249,16 @@ def stamps_for(cmd: str) -> list:
         argv = mission_argv(words)
         if not argv or argv[0] not in MAIN_ONLY:
             continue
+        if any(getattr(w, "computed", False) for w in argv):
+            continue  # the process would see what the shell computed, not these words
         flags = {x.split("=", 1)[0] for x in argv[1:] if x.startswith("--")}
         if argv[0] == "set" and not flags & {"--ticket", "--repo"}:
             continue
         if argv[0] == "defer" and not flags & {"--user-source", "--ticket"}:
             continue
         # bash expands an unquoted leading ~ (`import-initiatives ~/x.json`); the process sees the expanded path
-        argv = [os.path.expanduser(w) if w == "~" or w.startswith("~/") else w for w in argv]
+        argv = [os.path.expanduser(w) if getattr(w, "tilde", False) and (w == "~" or w.startswith("~/")) else str(w)
+                for w in argv]
         out.append((argv[0], mc.argv_key(argv)))
     return out
 

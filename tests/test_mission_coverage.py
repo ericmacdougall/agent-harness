@@ -1277,6 +1277,193 @@ class RedTeam179Delta(Base):
         self.assertTrue(mc.retire_words_ok("drop the tokens goal, we cancel it", goal("tokens", ticket="")))
 
 
+R14_BASE = "cccccccc-dddd-4eee-8fff-0000000014"  # + two digits: user turns of the r14 tests
+R14_TAKEOVER_REFUSALS = (
+    "stop the mission takeover",  # r14 F2 probe
+    "cancel the mission transfer",  # r14 F2 probe
+    "do not take over the mission in this session",
+    "don't take over the mission here",
+    "never take over the mission in this session",
+    "do not, whatever the old main says about it, take over the mission here",  # negation far from the verb
+    "do not take over the mission here, not now",  # double negation
+    "please take over the mission here, not now",
+    "take over the mission here? only if it died",
+    "you shouldn't take over the mission here",
+    "abort taking over the mission here",
+    "the mission runs fine in this session",  # no transfer at all ("runs" passed e5977a6's word list)
+    "let the other session take over the mission",  # another destination
+    "hand the mission over to the other session",
+    "take over the mission, then hand it to session bbbbbbbb",
+    "the night session takes over the mission now",  # someone else takes it: no destination, not an imperative
+    "codex takes over the mission",
+)
+R14_TAKEOVER_OK = ("take over the mission in this session", "Take over the mission.", "please take over the mission here",
+                   "you take over the mission now", "hand the mission over to this session", "move the mission here",
+                   "ok, take over the mission from here")
+
+
+class RedTeam179R14(Base):
+    """Receipt r14 of PR 179 (Codex, BLOCK on eade6bd): F1 quoted or escaped shell punctuation split the command and
+    an echoed mission command got a stamp; F2 an explicit refusal ("stop the mission takeover") authorised set-session
+    takeover; F3 `low.replace("not now", "")` erased negation, so "Do not now pause leads" deferred. These tests fail
+    against eade6bd; the fix parses shell words with their quoting and judges every user quote with one shared
+    negation-aware checker (mc.user_words_ok)."""
+
+    S = mc.SCRIPT
+    P = "~/.claude/hooks/mission_coverage.py"
+
+    def no_stamp_cases(self):
+        s, p = self.S, self.P
+        return [
+            ("quoted ; inside one echo word", f'echo "a ; {s} reseal --reason x"'),
+            ("quoted ; as its own word (r14 probe)", 'echo ";" python3 mission_coverage.py reseal --reason x'),
+            ("quoted ; before the full script path", f'echo ";" {s} reseal --reason x'),
+            ("single-quoted &&", f"echo '&&' {s} reseal --reason x"),
+            ("printf with && inside the quote", f"printf '%s' \"&& {p} set-session\""),
+            ("printf with && as a quoted word", f"printf '%s\\n' '&&' {p} set-session"),
+            ("assignment holding a quoted ;", f'x=";" echo {s} reseal --reason x'),
+            ("backslash-escaped ;", f"echo \\; {s} reseal --reason x"),
+            ("backslash-escaped &&", f"echo \\&\\& {s} reseal --reason x"),
+            ("backslash-escaped | glued to a word", f"echo x\\|{s} reseal --reason x"),
+            ("quoted |", f"echo '|' {s} reseal --reason x"),
+            ("quoted ( )", f"echo '(' {s} reseal --reason x ')'"),
+            ("newline inside double quotes", f'echo "a\n{s} reseal --reason x"'),
+            ("newline inside single quotes", f"echo 'a\n{s} reseal --reason x'"),
+            ("grep pattern argument", f'grep -e ";" {s} reseal notes.txt'),
+            ("command substitution", f"echo $({s} reseal --reason x)"),
+            ("quoted command substitution", f'echo "$({s} reseal --reason x)"'),
+            ("backticks", f"echo `{s} reseal --reason x`"),
+            ("process substitution", f"cat <({s} reseal --reason x)"),
+            ("comment after a word", f"echo hi # ; {s} reseal --reason x"),
+            ("comment line", f"# {s} reseal --reason x"),
+            ("quoted here-document", f"cat <<'EOF'\n; {s} reseal --reason x\nEOF"),
+            ("here-string", f"cat <<< \"; {s} reseal --reason x\""),
+            ("ANSI-C quoted ;", f"echo $';' {s} reseal --reason x"),
+            ("unbalanced quote", f'echo "; {s} reseal --reason x'),
+        ]
+
+    # F1: only a command that really runs mission_coverage.py mints a stamp
+    def test_quoted_or_escaped_punctuation_never_splits_or_mints_a_stamp(self):
+        import caller_identity  # noqa: PLC0415
+        for label, cmd in self.no_stamp_cases():
+            with self.subTest(label):
+                self.assertEqual(mission_gate.stamps_for(cmd), [], cmd)
+                self.hook(cmd)
+                self.assertEqual(sorted(caller_identity.stamp_dir(self.home).glob("*.json")), [], cmd)
+
+    def test_echoed_set_command_with_a_quoted_separator_cannot_change_the_ticket(self):
+        self.write_goals([goal()])
+        self.hook(f'echo ";" {self.S} set --goal leads --ticket goodqa#9')
+        rc, out = self.cli(["set", "--goal", "leads", "--ticket", "goodqa#9"])  # a later process with the same argv
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(mc.load_goals(self.home)["goals"][0]["ticket"], "goodqa#15095")
+        self.hook(f'x=";"; {self.S} set --goal leads --ticket goodqa#9')  # a real separator after the quoted one
+        rc, out = self.cli(["set", "--goal", "leads", "--ticket", "goodqa#9"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(mc.load_goals(self.home)["goals"][0]["ticket"], "goodqa#9")
+
+    def test_real_commands_keep_quoted_punctuation_inside_their_arguments(self):
+        s = self.S
+
+        def key(*argv):
+            return [("reseal", mc.argv_key(["reseal"] + list(argv)))]
+        self.assertEqual(mission_gate.stamps_for(f'x=";"; {s} reseal --reason y'), key("--reason", "y"))
+        self.assertEqual(mission_gate.stamps_for(f'x=";" {s} reseal --reason y'), key("--reason", "y"))
+        self.assertEqual(mission_gate.stamps_for(f'echo ";" ; {s} reseal --reason y'), key("--reason", "y"))
+        self.assertEqual(mission_gate.stamps_for(f'echo "#" && {s} reseal --reason y'), key("--reason", "y"))
+        self.assertEqual(mission_gate.stamps_for(f'{s} reseal --reason "a; b && c | d (e)"'),
+                         key("--reason", "a; b && c | d (e)"))
+        self.assertEqual(mission_gate.stamps_for(f"{s} reseal --reason 'it'\"'\"'s; fine'"), key("--reason", "it's; fine"))
+        self.assertEqual(mission_gate.stamps_for(f"{s} reseal --reason a\\;b"), key("--reason", "a;b"))
+        self.assertEqual(mission_gate.stamps_for(f"{s} reseal \\\n --reason y"), key("--reason", "y"))  # continuation
+        self.assertEqual(mission_gate.stamps_for(f"{s} reseal --reason y 2>&1 | tail -3"), key("--reason", "y"))
+        self.assertEqual(mission_gate.stamps_for(f"{s} reseal --reason '~/x'"), key("--reason", "~/x"))  # quoted ~ stays
+        self.assertEqual(mission_gate.stamps_for(f"{s} reseal --reason \"$R\""), [])  # computed by the shell
+
+    # F2: a refusal, a cancellation or another destination never authorises a takeover
+    def test_takeover_refusals_fail_the_shared_check_and_affirmatives_pass(self):
+        for text in R14_TAKEOVER_REFUSALS:
+            self.assertFalse(mc.handover_words_ok(text), text)
+        for text in R14_TAKEOVER_OK:
+            self.assertTrue(mc.handover_words_ok(text), text)
+
+    def test_refusing_takeover_sources_leave_the_mission_session_unchanged(self):
+        self.write_goals([goal()])
+        other_tr = self.home / ".claude" / "projects" / "proj" / f"{OTHER}.jsonl"
+        lines = [user_line(f"{R14_BASE}{i:02d}", text, NOW - 100 + i) for i, text in enumerate(R14_TAKEOVER_REFUSALS)]
+        good = len(R14_TAKEOVER_REFUSALS)
+        lines.append(user_line(f"{R14_BASE}{good:02d}", "the old main died. Take over the mission here.", NOW - 10))
+        other_tr.write_text("".join(lines))
+        for i, text in enumerate(R14_TAKEOVER_REFUSALS):
+            src = f'user:{OTHER}/{R14_BASE}{i:02d} "{text}"'
+            rc, out = self.main_cli(["set-session", "--user-source", src], session=OTHER, transcript=other_tr)
+            self.assertEqual(rc, 2, (text, out))
+            self.assertEqual(mc.mission_session_of(self.home), SESSION, text)
+        src = f'user:{OTHER}/{R14_BASE}{good:02d} "Take over the mission here."'
+        rc, out = self.main_cli(["set-session", "--user-source", src], session=OTHER, transcript=other_tr)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(mc.mission_session_of(self.home), OTHER)
+
+    # F3: negation is never deleted to make a phrase pass
+    def test_double_negation_with_not_now_refuses_defer_and_retire(self):
+        g = goal()
+        for text in ("Do not now pause leads.", "do not pause leads, not now", "never park leads, not now",
+                     "don't defer leads (not now)", "park leads? not now"):
+            self.assertFalse(mc.deferral_words_ok(text, g), text)
+        for text in ("Do not now cancel leads.", "don't drop leads, not now", "never retire leads, not now"):
+            self.assertFalse(mc.retire_words_ok(text, g), text)
+        self.assertTrue(mc.deferral_words_ok("park leads for now", g))
+        self.assertTrue(mc.retire_words_ok("cancel leads now", g))
+        # every sentence that holds the quote (user_context joins them with ' | ') must say it, not just one
+        self.assertFalse(mc.user_words_ok("park leads for now | the team will repark leads later", "defer", g))
+        self.assertTrue(mc.user_words_ok("park leads for now | park leads till monday", "defer", g))
+        self.assertFalse(mc.user_words_ok("take over the mission here | the mission is fine", "takeover"))
+
+    def test_not_now_refusals_cannot_defer_or_retire_by_command_or_at_stop(self):
+        self.write_goals([goal()])
+        with open(self.transcript, "a") as fh:
+            fh.write(user_line(f"{R14_BASE}90", "Do not now pause leads.", NOW - 50))
+            fh.write(user_line(f"{R14_BASE}91", "Do not now cancel leads.", NOW - 40))
+        defer_src = f'user:{SESSION}/{R14_BASE}90 "Do not now pause leads."'
+        retire_src = f'user:{SESSION}/{R14_BASE}91 "Do not now cancel leads."'
+        rc, out = self.main_cli(["defer", "--goal", "leads", "--user-source", defer_src])
+        self.assertEqual(rc, 2, out)
+        rc, out = self.main_cli(["retire", "--goal", "leads", "--user-source", retire_src])
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(mc.load_goals(self.home)["goals"][0]["status"], "active")
+        stored = goal(status="deferred", deferral={"by": "user", "source": defer_src})
+        self.assertEqual(self.results([stored], verify_source=always)["leads"]["state"], "UNCOVERED")
+        retired = goal(status="retired", retire={"source": retire_src})
+        self.assertEqual(self.results([retired], verify_source=always)["leads"]["state"], "UNCOVERED")
+
+    # one shared checker: defer, retire and takeover all go through mc.user_words_ok
+    def test_defer_retire_and_takeover_share_one_checker(self):
+        g = goal()
+        with mock.patch.object(mc, "user_words_ok", return_value=False) as shared:
+            self.assertFalse(mc.deferral_words_ok("park leads", g))
+            self.assertFalse(mc.retire_words_ok("retire leads", g))
+            self.assertFalse(mc.handover_words_ok("take over the mission here"))
+            self.assertFalse(mc.context_words_ok(f'user:{SESSION}/{USER_UUID} "park leads (goodqa#15095) for now"',
+                                                 g, "defer"))
+        kinds = [c.args[1] for c in shared.call_args_list]
+        self.assertEqual(kinds, ["defer", "retire", "takeover", "defer"])
+        import inspect  # noqa: PLC0415
+        src = inspect.getsource(mc)
+        self.assertEqual(src.count("REFUSAL_WORDS.search("), 1)  # the refusal check lives in one place
+        self.assertNotIn('replace("not now"', src)
+
+    def test_set_session_takeover_consults_the_shared_checker(self):
+        self.write_goals([goal()])
+        other_tr = self.home / ".claude" / "projects" / "proj" / f"{OTHER}.jsonl"
+        other_tr.write_text(user_line(OTHER_UUID, "take over the mission in this session.", NOW - 60))
+        src = f'user:{OTHER}/{OTHER_UUID} "take over the mission in this session"'
+        with mock.patch.object(mc, "user_words_ok", return_value=False) as shared:
+            rc, out = self.main_cli(["set-session", "--user-source", src], session=OTHER, transcript=other_tr)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("takeover", [c.args[1] for c in shared.call_args_list])
+        self.assertEqual(mc.mission_session_of(self.home), SESSION)
+
+
 class MutantKills(Base):
     """Survivors of the mutation check on the red-team fixes."""
 
