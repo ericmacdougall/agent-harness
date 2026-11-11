@@ -85,7 +85,8 @@ class UncertainReasonText(Fixtures):
         for reason in nc.FAILURE_REASONS:
             found = self.problems(nc.OriginObservation("unknown", False, reason, failed_pid=77, failed_name="x"))
             self.assertIn(reason, found[0])
-            remedies[reason] = found[0].split(");")[0]
+            import re
+            remedies[reason] = re.search(r"\); (.+?)\); refusing", found[0]).group(1)
         self.assertEqual(len(set(remedies.values())), 3)
 
     def test_hostile_or_malformed_failure_fields_never_reach_the_text(self):
