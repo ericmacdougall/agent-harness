@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""timeout: a GNU-compatible stand-in for hosts without coreutils (macOS), installed only when none exists.
+
+    timeout [-s SIGNAL] [-k DURATION] [--preserve-status] [--foreground] DURATION COMMAND [ARG]...
+
+Runs COMMAND in its own process group and signals the whole group when DURATION passes (default SIGTERM; -k sends
+SIGKILL that long after). Exit status: the command's; 124 on timeout (or the command's status with
+--preserve-status); 125 when timeout itself fails, including a signal it cannot deliver (it then stops COMMAND
+with SIGKILL if allowed and gives up after a few seconds, never waiting forever); 126 when COMMAND cannot be run; 127 when it is not found.
+DURATION and -k take a number with an optional s, m, h or d suffix; 0 means no limit.
+GoodQA #15565: `ah status` under zsh failed with `timeout: command not found`. Stdlib only; Python 3.9+.
+"""
+import os
+import signal
+import subprocess
+import sys
+import time
+
+UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+CLEANUP_GRACE = 3.0  # seconds to wait for COMMAND to exit after a failed signal delivery before giving up (125)
+
+
+def duration(text):
+    unit = 1
+    if text and text[-1] in UNITS:
+        unit, text = UNITS[text[-1]], text[:-1]
+    value = float(text) * unit
+    if value < 0 or value != value or value == float("inf"):
+        raise ValueError(text)
+    return value
+
+
+def signum(text):
+    """A signal this host can deliver, by number or name; anything else (0, out of range, SIG_DFL) is a usage error,
+    rejected before COMMAND starts (Codex final-gate F1: `-s 999999` used to crash after launch)."""
+    name = text.upper()
+    if name.isdigit():
+        number = int(name)
+        if number not in signal.valid_signals():
+            raise ValueError("invalid signal %s" % text)
+        return number
+    try:
+        return int(signal.Signals[name if name.startswith("SIG") else "SIG" + name])
+    except KeyError:
+        raise ValueError("invalid signal %s" % text) from None
+
+
+def main(argv):
+    sig, kill_after, preserve, foreground, args = signal.SIGTERM, 0.0, False, False, list(argv)
+    try:
+        while args and args[0].startswith("-") and args[0] != "-":
+            opt = args.pop(0)
+            if opt == "--":
+                break
+            if opt in ("-s", "--signal"):
+                sig = signum(args.pop(0))
+            elif opt.startswith("--signal="):
+                sig = signum(opt.split("=", 1)[1])
+            elif opt.startswith("-s") and len(opt) > 2:
+                sig = signum(opt[2:])
+            elif opt in ("-k", "--kill-after"):
+                kill_after = duration(args.pop(0))
+            elif opt.startswith("--kill-after="):
+                kill_after = duration(opt.split("=", 1)[1])
+            elif opt.startswith("-k") and len(opt) > 2:
+                kill_after = duration(opt[2:])
+            elif opt == "--preserve-status":
+                preserve = True
+            elif opt in ("--foreground", "-v", "--verbose"):
+                foreground = foreground or opt == "--foreground"
+            else:
+                raise ValueError(opt)
+        limit = duration(args.pop(0))
+        if not args:
+            raise ValueError("missing command")
+    except (ValueError, IndexError, AttributeError) as error:
+        sys.stderr.write("timeout: invalid usage (%s)\n" % error)
+        return 125
+    try:
+        child = subprocess.Popen(args, start_new_session=not foreground)
+    except FileNotFoundError:
+        sys.stderr.write("timeout: failed to run command '%s': No such file or directory\n" % args[0])
+        return 127
+    except OSError as error:
+        sys.stderr.write("timeout: failed to run command '%s': %s\n" % (args[0], error.strerror))
+        return 126
+
+    failures = []
+
+    def attempt(action):
+        try:
+            action()
+        except (OSError, ValueError, OverflowError):
+            pass
+
+    def stop_hard():
+        """The permitted cleanup, SIGKILL last: the group, then the child directly."""
+        if not foreground:
+            attempt(lambda: os.killpg(child.pid, signal.SIGKILL))
+        attempt(child.kill)
+
+    def send(number):
+        try:
+            os.killpg(child.pid, number) if not foreground else child.send_signal(number)
+        except ProcessLookupError:
+            pass  # the group is gone
+        except (OSError, ValueError, OverflowError) as error:  # never leave COMMAND running when delivery fails
+            if isinstance(error, PermissionError) and child.poll() is not None:
+                return  # macOS refuses to signal a group whose members have all exited; the command is done
+            # Codex final-gate r8 F1: a denied signal does not prove the command stopped
+            failures.append(error)
+            sys.stderr.write("timeout: failed to send signal %d to command (pid %d): %s\n" % (number, child.pid, error))
+            if not foreground:
+                attempt(lambda: os.kill(child.pid, number))  # the child directly, then the group, SIGKILL last
+            stop_hard()
+
+    for forwarded in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(forwarded, lambda number, _frame: send(number))
+    end = time.monotonic() + limit if limit else None
+    timed_out, gave_up, cleanup_end = False, False, None
+    try:
+        while child.poll() is None:
+            if failures:  # cleanup after a failed delivery waits a bounded time, never forever
+                cleanup_end = cleanup_end or time.monotonic() + CLEANUP_GRACE
+                if time.monotonic() >= cleanup_end:
+                    gave_up = True
+                    sys.stderr.write("timeout: command (pid %d) could not be stopped; giving up after %gs\n"
+                                     % (child.pid, CLEANUP_GRACE))
+                    return 125
+            elif end is not None and not timed_out and time.monotonic() >= end:
+                timed_out = True
+                send(sig)
+                if sig != signal.SIGKILL and kill_after:
+                    end = time.monotonic() + kill_after
+                    continue
+                if not kill_after:
+                    end = None
+            elif end is not None and timed_out and time.monotonic() >= end:
+                send(signal.SIGKILL)
+                end = None
+            time.sleep(0.02)
+    finally:
+        if not gave_up and child.poll() is None:  # an unexpected error in timeout itself still stops and reaps
+            stop_hard()
+            try:
+                child.wait(timeout=CLEANUP_GRACE)
+            except subprocess.TimeoutExpired:
+                sys.stderr.write("timeout: command (pid %d) could not be stopped\n" % child.pid)
+    if failures:
+        return 125  # the failed delivery was reported on stderr when it happened
+    code = child.returncode
+    if code < 0:
+        code = 128 + -code
+    if timed_out and not preserve:
+        return 124
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

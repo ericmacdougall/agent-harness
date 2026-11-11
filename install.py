@@ -943,6 +943,69 @@ def install_git_backstop(home: Path, apply: bool) -> str:
     return git_hook_status(home, GIT_HOOK_KEY, home / ".claude" / "hooks" / "commit_policy.py", apply=apply)
 
 
+def timeout_shim_status(home: Path, apply: bool, path_dirs=None) -> str:
+    """GoodQA #15565: agents write `timeout N cmd`, and macOS ships no coreutils `timeout` ("timeout: command not found",
+    seen under `ah status`). Place harness/bin/timeout in ~/.local/bin only when no timeout/gtimeout is on PATH and
+    ~/.local/bin is on PATH. Never replace anything that exists at the destination, not even an older copy of our own
+    shim: no check-then-replace sequence is race-free (Codex final-gate r8 F2), so an outdated shim gets an
+    instruction instead, and a new shim is published only with a no-clobber link."""
+    import shutil
+    home = home.expanduser().resolve()
+    dirs = [d for d in (path_dirs if path_dirs is not None else os.environ.get("PATH", "").split(os.pathsep)) if d]
+    target = home / ".local" / "bin" / "timeout"
+    source = ROOT / "harness" / "bin" / "timeout"
+    shim = source.read_bytes()
+    if target.is_symlink() or (target.exists() and not target.is_file()):
+        return f"timeout shim: skipped ({target} is a link or not a regular file; not touched)"
+    if target.is_file():
+        try:
+            current = target.read_bytes()
+        except OSError:
+            return f"timeout shim: skipped ({target} cannot be read)"
+        if current == shim:
+            return f"timeout shim: current at {target}"
+        lines = current.split(b"\n", 2)
+        if len(lines) < 2 or not lines[1].startswith(b'"""timeout: a GNU-compatible stand-in'):  # our own shim's 2nd line
+            return f"timeout shim: skipped ({target} exists and is not ours)"
+        return (f"timeout shim: outdated at {target}; not replaced automatically. To update it, remove {target} "
+                f"and re-run the installer with --apply")
+    elif shutil.which("timeout", path=os.pathsep.join(dirs)) or shutil.which("gtimeout", path=os.pathsep.join(dirs)):
+        return "timeout shim: not needed (timeout or gtimeout is on PATH)"
+    if str(target.parent) not in {str(Path(d).expanduser().resolve()) for d in dirs}:
+        return f"timeout shim: skipped ({target.parent} is not on PATH)"
+    if not apply:
+        return f"timeout shim: would place {target}"
+    tmp = target.with_name(f".timeout.tmp{os.getpid()}")
+    created = False  # only a temp file this call created is ours to remove; a planted one is left alone
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # O_EXCL | O_NOFOLLOW: a planted link at the temp name is refused, never written through
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o755)
+        created = True
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(shim)
+        # Codex final-gate F2: publish without clobbering anything that appeared after the checks above
+        try:
+            os.link(tmp, target)  # atomic and no-clobber: fails if any file or link now exists at target
+        except FileExistsError:
+            return f"timeout shim: skipped ({target} appeared during install; not touched)"
+        except OSError as error:
+            if error.errno not in (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK):
+                raise
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o755)  # no hard links here
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(shim)
+    except OSError as error:  # an install step that cannot place the shim reports it and goes on
+        return f"timeout shim: not placed ({error.__class__.__name__}: {error.strerror or error})"
+    finally:
+        if created:
+            try:
+                os.unlink(tmp)  # the published name is a separate link; the temp name is ours to remove
+            except OSError:
+                pass
+    return f"timeout shim: placed {target}"
+
+
 def netwatch_status(home: Path, apply: bool, flag) -> str:
     """Optional monitor; never fails the harness install.
 
@@ -1125,6 +1188,7 @@ def main() -> None:
     for path in changes:
         print(f"  {path}")
     print(f"  {install_git_backstop(args.home, args.apply)}")
+    print(f"  {timeout_shim_status(args.home, args.apply)}")
     if args.hooks_only:
         print("  CLAUDE.md and settings.json: not touched (--hooks-only)")
         if not args.apply:
