@@ -32,7 +32,7 @@ from git_safety import git_environment as safe_git_environment, require_safe_sou
 from report_file import ReportTarget
 import escalation as ladder
 import model_tiers as tiers
-from usage_guard import GuardError, UsageStore, capture_subject, invocation_identity
+from usage_guard import GuardError, PoolUnavailable, UsageStore, capture_subject, invocation_identity
 
 
 PACKET_LIMIT = 150_000
@@ -887,6 +887,16 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
             local_detail = diagnostics.sanitize(error.message)
             outcome = {**provider_failure({}), 'reason': error.reason,
                        'fallback_allowed': error.reason in {'QUOTA', 'AUTH'}}
+            if isinstance(error, PoolUnavailable) and launch_state == 'NOT_STARTED':
+                # The pool refused its lease before any call: nothing ran, so the one authorised independent fallback
+                # cannot lose or duplicate work. The reserved pool itself is left exactly as it is.
+                holder = error.holder if isinstance(error.holder, str) and RUN_ID.fullmatch(error.holder) else None
+                outcome.update(lease_refused=True, holder=holder, fallback_allowed=provider == primary)
+                if holder:
+                    base = 'python3 ~/.claude/hooks/usage_guard.py reconcile --run ' + holder
+                    local_detail = diagnostics.sanitize(
+                        '%s pool reserved by run %s. Reconcile: `%s --auto`; if it says completed: `%s --actor <who> '
+                        "--reason '<why>' --evidence '<proof>'`" % (provider, holder, base, base), 400)
         options.setdefault('attempts', []).append(
             diagnostics.provider_attempt(provider, resolution, code, stdout, stderr, outcome,
                                          launch_state=launch_state, local_detail=local_detail))
@@ -903,8 +913,15 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
             return source, stage_report(stage, outcome['report']), failure
         if len(order) == 1 or provider != primary or not outcome['fallback_allowed']:
             raise ReviewFailure(outcome, source)
-        failure = 'Primary reviewer unavailable (' + outcome['reason'] + '); used authorized independent fallback.'
+        if outcome.get('lease_refused'):
+            failure = ('Primary reviewer pool is reserved%s (no provider was launched); used authorized independent '
+                       'fallback.' % (' by run ' + outcome['holder'] if outcome.get('holder') else ''))
+        else:
+            failure = 'Primary reviewer unavailable (' + outcome['reason'] + '); used authorized independent fallback.'
     raise OSError('no valid reviewer result')
+
+
+RUN_ID = re.compile(r'[0-9a-f]{32}')
 
 
 def provider_toolchains(resolutions):

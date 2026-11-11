@@ -1481,6 +1481,116 @@ class ProviderEnvelopeTests(unittest.TestCase):
         self.assertIn('fallback', reason)
 
 
+class ReservedPoolFallbackTests(unittest.TestCase):
+    """goodqa#15565: a provider pool that an earlier run never released refuses its lease before any launch. That
+    must not stop the one authorised independent fallback, and the diagnostic must name the holder and the fix."""
+    module = __import__('peer_review')
+    guard = __import__('usage_guard')
+    HOLDER = '98535f2e6b2db3ae1efb0d5c5d07f1f9'
+    VALID = json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'VERDICT: PASS'})
+
+    class Store:
+        def __init__(self, refusals):
+            self.refusals, self.leases, self.released = refusals, [], []
+
+        def acquire_pool(self, provider, pool, run_id):
+            if provider in self.refusals:
+                raise self.refusals[provider]
+            self.leases.append(provider)
+
+        def release_pool(self, provider, pool, run_id, **kwargs):
+            self.released.append((provider, kwargs.get('reason')))
+
+    def refusal(self, reason='TRANSIENT_INFRA', kind='active'):
+        return self.guard.PoolUnavailable(reason, 'Provider pool has an active or unreconciled owner; no provider was '
+                                          'launched', holder=self.HOLDER, kind=kind)
+
+    def review(self, store, *, options=None, run_result=None):
+        calls = []
+
+        def run(command, prompt, cwd, timeout, **kwargs):
+            calls.append(command[0])
+            return run_result(command) if run_result else (0, self.VALID, '')
+        record = type('Record', (), {'run_id': 'r' * 32, 'timeout': 1440, 'note_child': staticmethod(lambda child: None)})()
+        opts = {'store': store, 'run_record': record, **(options or {})}
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(self.module.diagnostics, 'discover_executable',
+                          side_effect=lambda name, **_: {'name': name, 'path': '/fixture/' + name, 'source': 'PATH', 'rejected': []}), \
+             patch.object(self.module, 'run', side_effect=run):
+            try:
+                source, report, reason = self.module.review_snapshot(Path(temporary), 'a' * 40, 'pr', 'Review', 'Evidence', opts)
+                return calls, source, report, reason, opts, None
+            except self.module.ReviewFailure as error:
+                return calls, None, None, None, opts, error
+
+    def test_a_reserved_primary_pool_uses_the_fallback_and_never_launches_the_primary(self):
+        store = self.Store({'codex': self.refusal()})
+        calls, source, report, reason, options, error = self.review(store)
+        self.assertIsNone(error)
+        self.assertEqual(calls, ['/fixture/claude'])
+        self.assertEqual(report, 'VERDICT: PASS')
+        self.assertIn('Claude', source)
+        self.assertEqual(store.leases, ['claude'])
+        self.assertEqual(store.released, [('claude', 'NONE')])  # the reserved pool is never released or reconciled here
+        self.assertIn(self.HOLDER, reason)
+        self.assertIn('no provider was launched', reason)
+        self.assertEqual(options['launches'], 1)
+
+    def test_the_attempt_diagnostic_names_the_holder_and_the_reconcile_command(self):
+        store = self.Store({'codex': self.refusal()})
+        _, _, _, _, options, _ = self.review(store)
+        first = options['attempts'][0]
+        rendered = self.module.diagnostics.render(first)
+        self.assertEqual(first['provider'], 'codex')
+        self.assertIn(self.HOLDER, rendered)
+        self.assertIn('usage_guard.py reconcile --run ' + self.HOLDER + ' --auto', rendered)
+        self.assertIn('--actor', rendered)
+        self.assertNotIn('Rerun once later', rendered)
+
+    def test_an_unknown_ownership_refusal_also_falls_back(self):
+        store = self.Store({'codex': self.refusal('UNKNOWN')})
+        calls, _, report, _, _, error = self.review(store)
+        self.assertEqual((error, calls, report), (None, ['/fixture/claude'], 'VERDICT: PASS'))
+
+    def test_a_cooldown_refusal_with_quota_still_falls_back(self):
+        store = self.Store({'codex': self.refusal('QUOTA', 'cooldown')})
+        calls, _, report, _, _, error = self.review(store)
+        self.assertEqual((error, calls, report), (None, ['/fixture/claude'], 'VERDICT: PASS'))
+
+    def test_a_reserved_fallback_pool_ends_the_review_after_the_primary_ran(self):
+        quota = json.dumps({'type': 'turn.failed', 'error': {'code': 'insufficient_quota'}})
+        store = self.Store({'claude': self.refusal()})
+        calls, _, _, _, _, error = self.review(store, run_result=lambda command: (1, quota, ''))
+        self.assertEqual(calls, ['/fixture/codex'])
+        self.assertIsNotNone(error)
+
+    def test_both_pools_reserved_launches_nothing_and_fails_with_the_holder(self):
+        store = self.Store({'codex': self.refusal(), 'claude': self.refusal()})
+        calls, _, _, _, options, error = self.review(store)
+        self.assertEqual(calls, [])
+        self.assertIsNotNone(error)
+        self.assertEqual(options.get('launches', 0), 0)
+        self.assertIn(self.HOLDER, self.module.diagnostics.render(options['attempts'][-1]))
+
+    def test_a_non_pool_guard_error_never_unlocks_the_fallback(self):
+        store = self.Store({'codex': self.guard.GuardError('TRANSIENT_INFRA', 'run is closed')})
+        calls, _, _, _, _, error = self.review(store)
+        self.assertEqual(calls, [])
+        self.assertIsNotNone(error)
+
+    def test_the_fallback_is_used_once_and_only_after_the_primary(self):
+        store = self.Store({'codex': self.refusal()})
+        calls, _, _, _, _, _ = self.review(store, options={'secondary': 'default'})
+        self.assertEqual(calls, ['/fixture/claude'])
+
+    def test_a_hostile_holder_id_never_reaches_the_command_text(self):
+        hostile = self.guard.PoolUnavailable('TRANSIENT_INFRA', 'reserved', holder='x; rm -rf /', kind='active')
+        _, _, _, _, options, _ = self.review(self.Store({'codex': hostile}))
+        rendered = self.module.diagnostics.render(options['attempts'][0])
+        self.assertNotIn('rm -rf', rendered)
+        self.assertNotIn('--run x', rendered)
+
+
 if __name__ == '__main__':
     unittest.main()
 
