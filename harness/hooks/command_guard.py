@@ -34,6 +34,7 @@ interpreter one-liners (python -c, node -e): their code text is scanned, not exe
 from __future__ import annotations
 
 import argparse
+import difflib
 import fnmatch
 import hashlib
 import hmac
@@ -1814,6 +1815,41 @@ def _nondash(args):
     return out
 
 
+def _git_config_hides_subcommand(word, from_env=False, text=None):
+    """goodqa#15346 red-team M3/M4: a `-c`/`--config-env` setting that can make a plain-looking subcommand run
+    `git worktree remove`: an alias whose value names worktree, is built at run time, is a shell alias, or is read
+    from the environment; or an include that can define one. A plain alias to another subcommand is not one."""
+    low = (text if text is not None else word.text).casefold()
+    if low.startswith(('include.', 'includeif.')):
+        return True
+    if not low.startswith('alias.'):
+        return False
+    return bool(from_env or word.dynamic or word.subs or 'worktree' in low or '!' in low)
+
+
+# goodqa#15346 codex F2: GNU parallel replacement strings: {} {1} {.} {/} {//} {/.} {#} {%} {3/.} {+/} ... and {=perl=}
+PARALLEL_PLACEHOLDER = re.compile(r'\{[0-9]*[+./#%]*\}|\{=.*?=\}', re.S)
+# Every argument combination of a parallel command up to this many is substituted into every template and analysed.
+# Past it coverage would be incomplete, so the command is refused instead of analysing a prefix and allowing the rest.
+PARALLEL_MAX_COMBINATIONS = 1000
+# Settings that change what an unknown git subcommand runs without naming worktree: typo correction runs the closest
+# command (`git -c help.autocorrect=1 wroktree remove`), a config file or include can define any alias.
+GIT_CONFIG_OPAQUE_KEYS = ('help.autocorrect', 'include.', 'includeif.')
+GIT_CONFIG_KEY = re.compile(r'[A-Za-z][A-Za-z0-9-]*(?:\..*)?\.[A-Za-z][A-Za-z0-9-]*$', re.S)
+
+
+def _git_config_opaque(word, text=None):
+    """goodqa#15346 codex F1 audit: True when one `-c` / `--config-env` / attached `-c<key>=<value>` setting may change
+    what an unknown subcommand runs (typo correction, an include) or its key is not a literal git key (built at run
+    time, a parallel placeholder). Aliases that name worktree are _git_config_hides_subcommand's job."""
+    text = word.text if text is None else text
+    raw = word.raw if word.raw is not None and text == word.text else text
+    key_raw = raw.split('=', 1)[0]
+    key = text.split('=', 1)[0]
+    return bool(re.search(r'[$`]', key_raw) or PARALLEL_PLACEHOLDER.search(key) or not GIT_CONFIG_KEY.match(key)
+                or key.casefold().startswith(GIT_CONFIG_OPAQUE_KEYS))
+
+
 def _is_subseq(required, tokens):
     it = iter(tokens)
     return all(any(r == t for t in it) for r in required)
@@ -2107,7 +2143,7 @@ class Ctx:
 
     # what one reading of a script can change; findings accumulate across readings and the rest is not analysis state
     NOT_STATE = ('findings', 'budget', 'c', 'marker', 'raw_top', 'ps', 'tail_visible', 'fork_depth', 'readings_capped',
-                 'fs_cache', 'seen_texts')
+                 'fs_cache', 'seen_texts', 'git_env_cache')
 
     def state(self):
         return {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(self).items()
@@ -2943,6 +2979,11 @@ class Analyzer:
         if name == 'find':
             self.find(args, depth, pl, idx)
             return
+        if name == 'git-worktree':  # red-team M3: the separate program is the same command
+            self.git([_literal_word('worktree')] + list(args), words, cmd.words)
+        if name in ('export', 'declare', 'typeset', 'readonly', 'local') and any(
+                re.match(r'GIT_CONFIG_(?:KEY_\d+|PARAMETERS)=.*(?:alias\.|include)', t, re.I) for t in texts):
+            ctx.git_config_alias_env = True  # goodqa#15346 M4: a later `git wr` may run an alias read from the environment
         if name == 'git':
             self.git(args, words, cmd.words)
         if name == 'rclone':
@@ -3131,10 +3172,12 @@ class Analyzer:
                 self.inner_words(args[k:], depth, pl, idx)
             return True
         if name == 'parallel':
+            self.indirect_scan(args, depth, pl, idx, parallel=True)
             if ':::' in texts:
                 cut = texts.index(':::')
                 head = [t for t in texts[:cut] if not t.startswith('-')]
-                for item in texts[cut + 1:][:32]:
+                # codex F2 audit: no silent [:32]; indirect_scan has already refused more than PARALLEL_MAX_COMBINATIONS
+                for item in texts[cut + 1:][:PARALLEL_MAX_COMBINATIONS]:
                     self.script(' '.join(head).replace('{}', _quote_for_rebuild(item)) + ' ' +
                                 _quote_for_rebuild(item), depth + 1, tail_visible=True)
             else:
@@ -3220,12 +3263,16 @@ class Analyzer:
                 pass
         elif name == 'xargs':
             self.xargs_input(args, pl.cmds[idx] if pl is not None and idx < len(pl.cmds) else None)
+            self._replacement_strings(texts, False)  # before git() sees `xargs -I % git % remove`
             while i < len(args) and texts[i].startswith('-'):
-                i += 2 if texts[i] in ('-n', '-I', '-P', '-d', '-L', '-a', '-E', '-s', '-i', '-l') else 1
+                i += 2 if texts[i] in ('-n', '-I', '-J', '-R', '-S', '-P', '-d', '-L', '-a', '-E', '-s') else 1
+            if i < len(args) and self._placeholder(args[i]):
+                # goodqa#15346 codex F2 audit: `echo git | xargs -I{} {} worktree remove P` runs a program named by its input
+                ctx.add(LOG_DELETE, 'linked-worktree-remove',
+                        'a command name supplied by xargs input cannot be verified', 'name the command literally')
             if i < len(args):
                 self.inner_words(args[i:], depth, pl, idx, via_xargs=True)
-            else:
-                pass
+            self.indirect_scan(args, depth, pl, idx)
             return
         elif name in ('watch',):
             pass
@@ -3264,6 +3311,197 @@ class Analyzer:
                              'xargs deletes paths given on its input, and that input names a protected harness location',
                              'delete only paths inside your own task worktree, named directly')
                 return
+
+    INDIRECT_COMMANDS = frozenset(('git', 'rm', 'rmdir', 'unlink', 'mv', 'shred', 'truncate', 'find', 'rsync', 'sh', 'bash',
+                                   'zsh', 'dash', 'ksh', 'env', 'sudo', 'ssh', 'xargs', 'parallel', 'eval', 'git-worktree'))
+
+    # GNU parallel options that take a separate value (a table is never complete: _parallel_program_starts also tries
+    # the word after an unknown option)
+    PARALLEL_VALUE_OPTS = frozenset((
+        '-j', '--jobs', '-P', '--max-procs', '-I', '-S', '--sshlogin', '-a', '--arg-file', '-d', '--delimiter', '-E',
+        '-N', '-n', '--max-args', '-L', '--max-lines', '-l', '-s', '--max-chars', '-C', '--colsep', '--joblog',
+        '--results', '--res', '--tmpdir', '--workdir', '--wd', '--tagstring', '--timeout', '--delay', '--retries',
+        '--load', '--memfree', '--basefile', '--bf', '--return', '--transferfile', '--tf', '--env', '--sshloginfile',
+        '--slf', '--block', '--block-size', '--recstart', '--recend', '--header', '--halt', '--termseq', '--limit',
+        '--rpl', '--shebang', '--profile', '-J', '--memsuspend', '--nice', '--ssh', '--sqlmaster', '--sqlworker',
+        '--sqlandworker', '--tee', '--fifo', '--cat', '--hostgroups', '--hgrp', '--progress-sep', '--color-failed'))
+    # options that make a job's arguments differ from one argument combination (several per job, columns, a file, a
+    # custom expression): such a command is judged literally, never by enumeration
+    PARALLEL_NOT_ENUMERABLE = ('-a', '--arg-file', '-C', '--colsep', '--rpl', '--plus', '--pipe', '--pipepart', '-X',
+                               '-m', '--xargs', '-N', '-n', '--max-args', '-L', '--max-lines', '-l', '--er',
+                               '--extensionreplace', '--bnr', '--basenamereplace', '--dnr', '--dirnamereplace', '--bner',
+                               '--basenameextensionreplace', '--seqreplace', '--slotreplace', '--header', '--csv',
+                               '--null', '-0', '--trim', '--sqlworker', '--sqlandworker', '-s', '--max-chars')
+
+    def _replacement_strings(self, texts, parallel):
+        """goodqa#15346 codex F2 audit: the -I/-J/-i/--replace strings of an xargs or parallel command. They are
+        remembered for the rest of the analysis so git() treats a word holding one as data (`xargs -I % git % remove`)."""
+        found = []
+        for k, t in enumerate(texts):
+            if t in ('-I', '-J') and k + 1 < len(texts):
+                found.append(texts[k + 1])
+            elif t.startswith(('-I', '-J')) and len(t) > 2:
+                found.append(t[2:])
+            elif t.startswith('--replace='):
+                found.append(t.split('=', 1)[1])
+            elif t in ('-i', '--replace'):
+                found.append('{}')
+            elif t.startswith('-i') and len(t) > 2 and not parallel:
+                found.append(t[2:])
+        found = [r for r in found if r]
+        if found:
+            self.ctx.replstrs = set(getattr(self.ctx, 'replstrs', ())) | set(found)
+        return found
+
+    def _parallel_program_starts(self, texts, cut):
+        """Where parallel's command may begin: after its options and their values, and also one word later when the
+        option before it is unknown (it may take a value)."""
+        j, unknown_before = 0, False
+        while j < cut and texts[j].startswith('-'):
+            t = texts[j]
+            if t in self.PARALLEL_VALUE_OPTS:
+                j, unknown_before = j + 2, False
+            else:
+                j, unknown_before = j + 1, '=' not in t and t not in ('-k', '--keep-order', '-v', '--verbose', '-q',
+                                                                      '--quote', '--dry-run', '--tag', '-u', '-g')
+        starts = [min(j, cut)]  # == cut: no command, parallel runs the arguments themselves
+        if unknown_before and j + 1 < cut:
+            starts.append(j + 1)
+        return starts
+
+    def _placeholder_program(self, text):
+        """True when a replacement string stands where a shell command name goes in `text` (`{} worktree remove P`,
+        `sh -c {}`, `a; {} x`): the program itself is data."""
+        try:
+            lex = shlex.shlex(text, posix=True, punctuation_chars=';&|()')
+            lex.whitespace_split = True
+            tokens = list(lex)
+        except ValueError:
+            return bool(PARALLEL_PLACEHOLDER.search(text))
+        start, shell = True, False
+        for tok in tokens:
+            if tok and set(tok) <= set(';&|()'):
+                start, shell = True, False
+                continue
+            if shell and not tok.startswith('-'):
+                if self._placeholder_program(tok):
+                    return True
+                shell = False
+                continue
+            if not start:
+                continue
+            if re.match(r'[A-Za-z_][A-Za-z0-9_]*=', tok) or tok in WRAPPERS_SIMPLE or tok in ('env', 'sudo', 'xargs'):
+                continue
+            if self._placeholder(_literal_word(tok)):
+                return True
+            start, shell = False, posixpath.basename(tok) in SHELLS or tok == 'eval'
+        return False
+
+    def parallel_jobs(self, texts, stops, starts, repl, depth):
+        """goodqa#15346 codex F2: substitute every argument combination into every possible command of a parallel
+        command and judge each job. Returns True when every job was judged; False when the arguments cannot be
+        enumerated (a file, columns, several per job): the caller judges the command literally. More than
+        PARALLEL_MAX_COMBINATIONS combinations is refused: analysing a prefix and allowing the rest is the bug."""
+        if not stops:
+            return False
+        sources, current = [], None
+        for t in texts[stops[0]:]:
+            if t in (':::', ':::+'):
+                current = []
+                sources.append(current)
+            elif t.startswith('::::'):
+                current = None
+                sources.append(None)
+            elif current is not None:
+                current.append(t)
+        total = 1
+        for source in sources:
+            total *= max(len(source), 1) if source is not None else 1
+        if total > PARALLEL_MAX_COMBINATIONS:  # a refusal, not Blocked: an unanalysable command only warns
+            self.ctx.add(LOG_DELETE, 'parallel-coverage',
+                         'parallel has %d argument combinations; the guard judges at most %d, so the rest would go '
+                         'unchecked' % (total, PARALLEL_MAX_COMBINATIONS),
+                         'split the arguments into several parallel commands of at most %d each'
+                         % PARALLEL_MAX_COMBINATIONS)
+            return False
+        head = texts[:stops[0]]
+        if any(s is None for s in sources) or any(
+                t in self.PARALLEL_NOT_ENUMERABLE or t.split('=', 1)[0] in self.PARALLEL_NOT_ENUMERABLE for t in head
+                if t.startswith('-')) or any('{=' in t for t in head):
+            return False
+        templates = list(dict.fromkeys(' '.join(head[p:]) for p in starts))
+        combos = [[]]
+        for source in sources:
+            combos = [c + [v] for c in combos for v in (source or [''])]
+
+        def value(v, mod):
+            mod = mod.lstrip('+')
+            if mod in ('#', '%'):
+                return '1'
+            if mod == '//':
+                return posixpath.dirname(v)
+            if mod.startswith('/'):
+                v, mod = posixpath.basename(v), mod[1:]
+            while mod.startswith('.'):
+                v, mod = posixpath.splitext(v)[0], mod[1:]
+            return v
+
+        try:
+            for combo in combos:
+                # parallel shell-quotes each argument; also judge it unquoted in case a quoting option is off
+                for quote in ((_quote_for_rebuild, str) if any(re.search(r'[^\w./,:@%+=-]', v) for v in combo)
+                              else (str,)):
+                    def fill(m, combo=combo, quote=quote):
+                        body = m.group(0)[1:-1]
+                        num = re.match(r'\d*', body).group(0)
+                        vals = combo if not num else ([combo[int(num) - 1]] if 0 < int(num) <= len(combo) else [''])
+                        return ' '.join(quote(value(v, body[len(num):])) for v in vals)
+                    joined = ' '.join(quote(v) for v in combo)
+                    for template in templates:
+                        job = PARALLEL_PLACEHOLDER.sub(fill, template)
+                        for r in repl:
+                            job = job.replace(r, joined)
+                        if job == template:  # no replacement string: parallel appends the arguments
+                            job = (template + ' ' + joined).strip()
+                        self.ctx.budget.tick()
+                        self.script(job, depth + 1)
+        except Blocked:  # out of budget before every job was judged: refuse (a bare Blocked would only warn)
+            self.ctx.add(LOG_DELETE, 'parallel-coverage', 'the guard ran out of time before judging every parallel job',
+                         'split the arguments into several smaller parallel commands')
+            raise
+        return True
+
+    def indirect_scan(self, args, depth, pl, idx, parallel=False):
+        """goodqa#15346 red-team H1/H2: xargs and parallel take many options with a separate value (-J % -R 1 -S 255,
+        --max-args 1, --arg-file F, -j 4, -a F). A table of them is always incomplete, so every later word that names a
+        command that can delete is also analysed as the start of a command (bounded). Over-blocking an odd argument that
+        merely spells such a name is accepted: fail toward block."""
+        # red-team M1: every argument is scanned, however many options come first (a fixed bound let a repeated option push
+        # the command out of range). The shared budget (ctx.budget.tick) still bounds the work.
+        ctx = self.ctx
+        texts = [a.text for a in args]
+        stops = [k for k, t in enumerate(texts) if t.startswith(':::')] if parallel else []
+        cut = stops[0] if stops else len(texts)
+        repl = self._replacement_strings(texts[:cut], parallel)
+        starts = self._parallel_program_starts(texts, cut) if parallel else []
+        # codex F2: every job of a parallel command with its data on the command line is judged, or the command is refused
+        enumerated = parallel and self.parallel_jobs(texts, stops, starts, repl, depth)
+        if parallel and not enumerated and any(self._placeholder_program(' '.join(texts[p:cut])) for p in starts):
+            ctx.add(LOG_DELETE, 'linked-worktree-remove',
+                    'a command name supplied by parallel data the guard cannot see cannot be verified',
+                    'name the command literally, or list every argument after ::: in the command')
+        for j in range(len(args)):
+            text = texts[j]
+            if text.startswith('-'):
+                continue
+            if enumerated and j < cut and re.search(r'\s', text.strip()):
+                continue  # every job this template runs was judged by parallel_jobs
+            if posixpath.basename(text) in self.INDIRECT_COMMANDS:
+                self.inner_words(args[j:], depth, pl, idx, via_xargs=True)
+            elif re.search(r'\s', text.strip()) and posixpath.basename(text.split(None, 1)[0]) in self.INDIRECT_COMMANDS:
+                # red-team M2: parallel runs a quoted word, or an argument after ::: when no command is given, as a
+                # shell command line (`parallel -j 4 'git worktree remove --force {}' ::: DIR`)
+                self.script(text, depth + 1)
 
     def inner_words(self, words, depth, pl, idx, via_xargs=False):
         if not words:
@@ -3572,6 +3810,8 @@ class Analyzer:
                             ctx.add(SECRET_DUMP, 'find-exec-credentials',
                                     'find -exec prints files from a credential directory',
                                     'list names only: find DIR -name PATTERN -print')
+            if bname == 'git':  # goodqa#15346: find -exec git worktree remove {} + was never looked at
+                self.git(body[1:], body, body)
             if bname in WRAPPERS_SIMPLE | SHELLS:
                 cmd = Cmd()
                 cmd.words = list(body)
@@ -3590,6 +3830,58 @@ class Analyzer:
     OWNED_READ_SUBS = frozenset(('status', 'log', 'diff', 'show', 'ls-files', 'ls-tree', 'rev-parse', 'rev-list', 'describe',
                                  'blame', 'grep', 'cat-file', 'shortlog', 'show-ref', 'for-each-ref', 'merge-base', 'fetch',
                                  'version', 'help', 'check-ignore', 'name-rev', 'diff-tree', 'diff-index', 'count-objects'))
+    # goodqa#15346: git ignores an alias named like a built-in command, so only another subcommand can hide one
+    GIT_BUILTIN_SUBS = (OWNED_CHANGES | OWNED_READ_SUBS | frozenset((
+        'archive', 'bundle', 'fsck', 'format-patch', 'send-email', 'range-diff', 'rerere', 'maintenance', 'hash-object',
+        'mktree', 'write-tree', 'commit-tree', 'var', 'whatchanged', 'cherry', 'request-pull', 'annotate', 'difftool',
+        'mergetool', 'show-branch', 'verify-commit', 'verify-tag', 'repack', 'pack-objects', 'index-pack', 'credential',
+        'hook', 'bugreport', 'stripspace', 'interpret-trailers', 'mv', 'grep', 'ls-remote', 'fetch-pack', 'citool',
+        'gui', 'gitk', 'instaweb', 'column', 'check-attr', 'check-ref-format', 'merge-file', 'merge-tree', 'mailinfo',
+        'mailsplit', 'patch-id', 'unpack-objects', 'prune-packed', 'multi-pack-index', 'commit-graph', 'pack-refs',
+        'symbolic-ref', 'for-each-repo', 'sh-i18n', 'scalar', 'backfill', 'replay', 'diagnose', 'refs'))) - {'lfs'}
+
+    def _placeholder(self, word):
+        """goodqa#15346 codex F2 audit: the word holds a GNU parallel replacement string or an xargs/parallel -I/-J
+        replacement seen in this command, so its text is only known at run time."""
+        text = word.text
+        return bool(PARALLEL_PLACEHOLDER.search(text) or any(r in text for r in getattr(self.ctx, 'replstrs', ()) if r))
+
+    GIT_ENV_CONFIG = re.compile(r'\b(GIT_CONFIG_(?:KEY_\w*|PARAMETERS|GLOBAL|SYSTEM)|GIT_CONFIG(?![A-Za-z0-9_]))'
+                                r'(?:=((?:\'[^\']*\'|"[^"]*"|[^\s;|&()<>])*))?')
+
+    def _git_env_config(self):
+        """goodqa#15346 codex F1 audit: git config given through the environment anywhere in this command (a prefix of
+        xargs or env, `env K=V git`, a variable key, export after read). 'alias' when a literal alias or include is
+        defined, 'opaque' when an unknown subcommand could be redefined (a config file, a key built at run time, typo
+        correction), else None. Matched on the raw texts, so a name the parser never resolved still counts."""
+        ctx = self.ctx
+        seen = [t for t in (getattr(ctx, 'seen_texts', None) or []) if isinstance(t, str)]
+        raw = getattr(ctx, 'raw_top', '') or ''
+        key = (len(raw), hash(raw), len(seen))
+        cached = getattr(ctx, 'git_env_cache', None)
+        if cached and cached[0] == key:
+            return cached[1]
+        result = None
+        for text in [raw] + seen:
+            if 'GIT_CONFIG' not in text:
+                continue
+            for m in self.GIT_ENV_CONFIG.finditer(text):
+                name, value = m.group(1), m.group(2)
+                low = (value or '').casefold()
+                if name.endswith(('GLOBAL', 'SYSTEM')) or name == 'GIT_CONFIG':
+                    kind = None if value is not None and value.strip('\'"') == '/dev/null' else 'opaque'
+                elif value is None or re.search(r'[$`{}]', value):
+                    kind = 'opaque'
+                elif 'alias.' in low or 'include' in low:
+                    kind = 'alias'
+                elif 'autocorrect' in low:
+                    kind = 'opaque'
+                else:
+                    kind = None
+                if kind == 'alias' or (kind and result is None):
+                    result = kind
+        ctx.git_env_cache = (key, result)
+        return result
 
     def owned_checkout(self, sub, rest, cwd_word, locations=(), alias=False):
         """goodqa#15307: an agent's git command may not change a checkout a timer or service builds from. Owned means a
@@ -3682,20 +3974,43 @@ class Analyzer:
         cwd_words = []
         locations = []
         alias = False
+        alias_removes = False
+        opaque = self._git_env_config()  # codex F1 audit: aliases or config files given through the environment
+        if opaque == 'alias':
+            alias = alias_removes = True
+        opaque = bool(opaque)
         while i < len(texts):
             t = texts[i]
-            if t in ('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env'):
+            if t in ('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env',
+                     '--attr-source'):
                 if t in ('-C', '--work-tree') and i + 1 < len(args):
                     cwd_word = args[i + 1]
                     if t == '-C':
                         cwd_words.append(args[i + 1])
                 if t in ('--git-dir', '--work-tree') and i + 1 < len(args):
                     locations.append(args[i + 1].text)
-                if t == '-c' and i + 1 < len(args) and args[i + 1].text.casefold().startswith('alias.'):
-                    alias = True
+                if t in ('-c', '--config-env') and i + 1 < len(args):
+                    alias = alias or args[i + 1].text.casefold().startswith('alias.')
+                    alias_removes = alias_removes or _git_config_hides_subcommand(args[i + 1], t == '--config-env')
+                    opaque = opaque or _git_config_opaque(args[i + 1]) or self._placeholder(args[i + 1])
                 i += 2
             elif t.startswith(('--git-dir=', '--work-tree=')):
                 locations.append(t.split('=', 1)[1])
+                i += 1
+            elif t.startswith('--config-env='):  # red-team M4: --config-env=alias.wr=VAR reads the alias from the environment
+                alias = alias or t.split('=', 1)[1].casefold().startswith('alias.')
+                alias_removes = alias_removes or _git_config_hides_subcommand(args[i], True, t.split('=', 1)[1])
+                opaque = opaque or _git_config_opaque(args[i], t.split('=', 1)[1]) or self._placeholder(args[i])
+                i += 1
+            elif t.startswith('-c') and len(t) > 2:
+                # codex F1: an attached `-calias.wr=...` gets the same alias and include checks as `-c alias.wr=...`
+                # (git 2.54 rejects the attached form, but the guard must not depend on that)
+                alias = alias or t[2:].casefold().startswith('alias.')
+                alias_removes = alias_removes or _git_config_hides_subcommand(args[i], False, t[2:])
+                opaque = opaque or _git_config_opaque(args[i], t[2:]) or self._placeholder(args[i])
+                i += 1
+            elif t.startswith('--exec-path='):  # an unknown subcommand runs DIR/git-<sub>, a program the guard cannot see
+                opaque = True
                 i += 1
             elif t.startswith('-'):
                 i += 1
@@ -3708,16 +4023,74 @@ class Analyzer:
         for name in ('GIT_DIR', 'GIT_WORK_TREE'):
             if isinstance(self.ctx.vars.get(name), str):
                 locations.append(self.ctx.vars[name])
+        # red-team M4: GIT_CONFIG_KEY_n=alias.x (GIT_CONFIG_COUNT) defines an alias from the environment, also after export
+        env_pairs = [(assign.text if hasattr(assign, 'text') else str(assign)) for assign in (cmd_words or ())]
+        env_pairs += ['%s=%s' % (k, v) for k, v in self.ctx.vars.items() if isinstance(v, str)]
+        if getattr(ctx, 'git_config_alias_env', False) or any(
+                re.match(r'GIT_CONFIG_(?:KEY_\d+|PARAMETERS)=.*(?:alias\.|include)', e, re.I) for e in env_pairs):
+            alias = True
+            alias_removes = True
         sub = texts[i] if i < len(texts) else ''
         rest = texts[i + 1:]
+        if sub == 'worktree':
+            alias_removes = False  # the real subcommand is judged directly below
+        built_sub = i < len(args) and (args[i].dynamic or bool(args[i].subs))
+        built_worktree_sub = sub == 'worktree' and len(args) > i + 1 and (args[i + 1].dynamic or bool(args[i + 1].subs)
+                                                                         or self._placeholder(args[i + 1]))
+        if i < len(args) and self._placeholder(args[i]):
+            # codex F2 audit: the subcommand is xargs/parallel/find data (`git {} --force P ::: worktree ::: remove`)
+            ctx.add(LOG_DELETE, 'linked-worktree-remove',
+                    'a git subcommand supplied by xargs, parallel or find data cannot be verified',
+                    'write the git subcommand literally')
+        if sub and sub not in self.GIT_BUILTIN_SUBS and (opaque or rest[:1] and rest[0].casefold() in ('remove', 'move') and (
+                difflib.SequenceMatcher(None, sub.casefold(), 'worktree').ratio() >= 0.5)):
+            # codex F1 audit: typo correction (help.autocorrect, also from the user's config) runs `git wroktree remove`
+            # as worktree remove; a config file, include or built key can define an alias for any unknown subcommand
+            ctx.add(LOG_DELETE, 'linked-worktree-remove',
+                    'an unknown git subcommand %r may run worktree remove (typo correction or an alias from config the '
+                    'guard cannot read)' % sub[:40],
+                    'write the git subcommand literally, without -c help.autocorrect, includes or config files')
+        if built_worktree_sub or (built_sub and any(
+                t.casefold() in ('remove', 'rm', 'move', 'mv') or '{}' in t or t in (':::', '::::') for t in rest)):
+            # red-team M3: git $(echo worktree) remove ... / git "$W" remove ... with the target on stdin or in a placeholder
+            ctx.add(LOG_DELETE, 'linked-worktree-remove',
+                    'a git subcommand built at run time next to remove or move cannot be verified',
+                    'write git worktree remove literally, as the standalone non-forced form')
+        config_key = _nondash(args[i + 1:])[:1] if sub == 'config' else []
+        if sub == 'config' and (any(t.casefold().startswith('alias.') for t in rest) or any(
+                k.dynamic or k.subs or self._placeholder(k) for k in config_key)) and any(
+                'worktree' in a.text.casefold() or '!' in a.text or a.dynamic or a.subs for a in args[i + 1:]):
+            ctx.add(LOG_DELETE, 'linked-worktree-remove',
+                    'git config defines an alias that can run worktree remove, which cannot be verified later',
+                    'do not define such an alias; use the standalone literal non-forced form')
         self.owned_checkout(sub, rest, cwd_words, locations, alias)
         if sub == 'clean':
             self.git_clean(args[i + 1:], rest, cwd_word)
         if sub == 'worktree' and rest[:1] == ['remove'] and self._removable_linked_worktree(args[i + 1:], cwd_words):
             return  # the only exemption: one literal, clean, published, registered linked-worktree top
-        if sub == 'worktree' and rest[:1] in (['remove'], ['prune']):
+        if sub == 'worktree' and rest[:1] == ['remove']:
+            targets = _nondash(args[i + 2:])
+            # goodqa#15346: a remove reached through xargs, find -exec, parallel or a wrapper has its target on stdin or
+            # in a placeholder, so no refusal below could judge it. Only the lone verified literal form returns above.
+            if not targets or any('{}' in w.text or w.text in (':::', '::::') or '{' in w.text and '}' in w.text
+                                  for w in targets):
+                ctx.add(LOG_DELETE, 'linked-worktree-remove',
+                        'git worktree remove without a literal target on its command line (xargs, find -exec, parallel '
+                        'or a placeholder) cannot be verified',
+                        'use the standalone literal non-forced form after cleaning and publishing the worktree')
+        # red-team M2/M4: an alias to worktree remove, or a subcommand built at run time, acts on its literal targets
+        if (alias_removes or (i < len(args) and (args[i].dynamic or args[i].subs))
+                or (sub == 'worktree' and len(args) > i + 1 and (args[i + 1].dynamic or args[i + 1].subs))
+                or (alias and sub not in self.OWNED_READ_SUBS and sub not in self.OWNED_CHANGES)):
+            for w in _nondash(args[i + 1:]):
+                self.refuse('git worktree remove (alias or built subcommand)', w)
+            if alias_removes:
+                ctx.add(LOG_DELETE, 'linked-worktree-remove',
+                        'a git alias that runs worktree remove or move cannot be verified',
+                        'use the standalone literal non-forced form after cleaning and publishing the worktree')
+        if sub == 'worktree' and rest[:1] in (['remove'], ['prune'], ['move']):
             for w in _nondash(args[i + 2:]):
-                refused = self.refuse('git worktree remove', w)
+                refused = self.refuse('git worktree ' + rest[0], w)
                 if rest[:1] == ['remove'] and not refused:
                     ctx.add(LOG_DELETE, 'linked-worktree-remove',
                             'git worktree remove is allowed only for one verified clean, published, registered linked '
