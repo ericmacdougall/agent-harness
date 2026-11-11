@@ -191,8 +191,8 @@ class ReviewRound1(Base):
         """Round 3 B1: main's own shell carries CLAUDE_CODE_CHILD_SESSION=1 and the _agent AI_AGENT suffix (observed in
         main's shell); with that exact environment main must be able to resume, and the audit must not claim "main"."""
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_CHILD_SESSION": "1", "AI_AGENT": "claude-code_2-1-318_agent"}):
-            r = ah.write(self.home, "task.dispose", {"agent": "handoffowner", "session": SESSION, "kind": "resumed", "at": iso(NOW)},
-                         SESSION, "main-ack-01")
+            r = ah.write(self.home, "task.dispose", {"agent": "handoffowner", "session": SESSION, "kind": "resumed", "at": iso(NOW),
+                                                 "ref": "handoffowner"}, SESSION, "main-ack-01")
         self.assertEqual(r["result"], "applied")
         audit = [json.loads(x) for x in (ah.store_dir(self.home) / "audit.jsonl").read_text().splitlines()]
         self.assertEqual(audit[-1]["actor"]["agent_id"], "unknown")  # never a claimed "main"

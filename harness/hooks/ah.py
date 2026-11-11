@@ -399,40 +399,45 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     live_parents = {r["parent"] for r in rows if r.get("parent") and r["state"] == "live"}
     by_id = {r["agent_id"]: r for r in rows}
 
-    def covered(agent_id, seen=()):
+    def covered(agent_id, seen=(), ticket=None):
         """A reassignment target holds the work when it is live, or is DROPPED but excused by its own live disposition
         (a named wait, a fresh resume, or a further reassignment). The chain is cycle-safe and each link
         keeps its own expiry, so an inherited wait ends when the target's wait ends (goodqa#14791).
         A target whose own disposition is permanent (closed, legacy, superseded, wontdo) does not hold reassigned
         work: that excuse would skip every check the dispose guard makes on the reassigned owner, and one legacy row
-        could clear any number of drops (PR review of 24a786c, F1; main's decision). Close each owner on its own."""
+        could clear any number of drops (PR review of 24a786c, F1; main's decision). Close each owner on its own.
+        `ticket` is the reassigned stream's ticket, carried down the whole chain, so a live non-owner holding that
+        ticket holds the work here exactly as in liveness.disposition_bound (PR 163 final-gate review F1)."""
         t = by_id.get(agent_id)
         if t is None or agent_id in seen:
             return False
         td = disp.get(agent_id)
         if td and td.get("kind") in GUARDED_KINDS and not t["state"].startswith(("live", "working", "waiting")):
             return False  # checked first: the row loop below relabels such a target (superseded, unverified-legacy)
-        if t["state"] not in ("DROPPED", "done", "handoff", "returned") or agent_id in live_parents:
+        if liveness.holds_work(t, ticket) or agent_id in live_parents:  # GoodQA #15565: live means active in the last 10 min
             return True
-        # Any non-live state (DROPPED, done, handoff, returned) is excused only by the target's own live disposition:
-        # an owner that returned a result and then went into a named wait still holds the work (main repro
-        # 2026-11-06: pet-leads-x reassigned to a done owner waiting on goodqa#14883).
+        # Any other state (SILENT, DROPPED, done, handoff, returned, waiting) is excused only by the target's own bound
+        # disposition: an owner that returned a result and then went into a named wait on a live holder still holds
+        # the work (main repro 2026-11-06: pet-leads-x moved to a done owner waiting on goodqa#14883).
         if td and td.get("kind") == "reassigned":
-            return covered(td.get("ref"), seen + (agent_id,))
-        if td and td.get("kind") == "resumed" and t["state"] != "DROPPED":
-            # `resumed` stays live once any later activity exists; a target that resumed and then finished (done,
-            # handoff, returned) holds no wait, so only a named wait excuses it (PR #107 review F1)
-            return False
-        return liveness.disposition_live(td, now, last_activity=parse_ts(t["last_activity"]) or 0.0)
+            return covered(td.get("ref"), seen + (agent_id,), ticket)
+        if td and td.get("kind") == "waiting":
+            return (liveness.disposition_live(td, now, last_activity=parse_ts(t["last_activity"]) or 0.0)
+                    and liveness.disposition_bound(td, t, by_id, rows, asks))
+        return False
 
     for r in rows:
         d = disp.get(r["agent_id"])
         last_wal = parse_ts(r["last_activity"]) or 0.0
         alive = liveness.disposition_live(d, now, last_activity=last_wal,
                                           replacement_live=bool(d and d.get("kind") == "reassigned"
-                                                                and covered(d.get("ref"), (r["agent_id"],))))
+                                                                and covered(d.get("ref"), (r["agent_id"],), r.get("ticket"))))
+        if alive and d and d.get("kind") in liveness.BINDING_KINDS:
+            # GoodQA #15565 (never-drop 16.1): a claim that someone holds the work counts only while the named holder is live
+            alive = liveness.disposition_bound(d, r, by_id, rows, asks,
+                                               lambda ref: covered(ref, (r["agent_id"],), r.get("ticket")))
         r["disposition"] = dict(d, live=alive) if d else None
-        r["decision_required"] = bool(r["owner"] and r["state"] == "DROPPED" and not alive)
+        r["decision_required"] = bool(r["owner"] and r["state"] in ("DROPPED", "SILENT-HIGH") and not alive)
         if d and d.get("kind") in ("legacy", "superseded", "wontdo") and r["state"] not in ("done", "handoff", "returned") \
                 and not r["state"].startswith(("live", "working", "waiting")):
             label = "unverified-legacy" if d["kind"] == "legacy" else d["kind"]
@@ -444,9 +449,14 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             d = disp.get(r["agent_id"])
             kind = d.get("kind") if d else None
             # #134 red-team P4: only main's wait acknowledges, marked --ack-handoff (an owner cannot set it)
-            acknowledged = kind in ("resumed", "reassigned") + GUARDED_KINDS or (
+            # GoodQA #15565 (red-team D1): resumed and reassigned acknowledge only while their named holder is live
+            acknowledged = (kind in ("resumed", "reassigned")
+                            and liveness.disposition_bound(d, r, by_id, rows, asks,
+                                                           lambda ref, me=r["agent_id"], tk=r.get("ticket"): covered(ref, (me,), tk))
+                            ) or kind in GUARDED_KINDS or (
                 kind == "waiting" and d.get("ack_handoff") is True
-                and liveness.disposition_live(d, now, last_activity=handed))
+                and liveness.disposition_live(d, now, last_activity=handed)
+                and liveness.disposition_bound(d, r, by_id, rows, asks))
             acked = bool(acknowledged and float(d.get("at") or 0) >= handed - 10)
             # A helper spawned by another agent hands its result back to that parent, which takes it by design. The
             # claim is honoured only when it is believable and the parent is plainly receiving: the child is a nested
@@ -1485,6 +1495,11 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
             state = ask_states(main_wal).get(ref)
             raise AhError("bad_request", f"task.dispose waiting: ask {ref} " + ("is already answered (ask_resolved)"
                           if state == "resolved" else "is not in this session's WAL"), 3)
+        if args["kind"] == "resumed" and not (ref and ref != "main" and OWNER_ID_RE.match(ref) and (_wal_has(main_wal, "subagent", None, agent=ref)
+                                                       or (main_wal.parent / f"{ref}.jsonl").is_file())):
+            # GoodQA #15565 (never-drop 16.1): a resume is a claim that an agent holds the work, so it names that agent
+            raise AhError("bad_request", "task.dispose resumed: --ref must name the agent of this session that took the "
+                                         "work back (the resumed or re-spawned owner); it counts only while that agent is live", 3)
         if args["kind"] == "reassigned" and not (_wal_has(main_wal, "subagent", None, agent=ref)
                                                 or (main_wal.parent / f"{ref}.jsonl").is_file()):
             raise AhError("bad_request", f"task.dispose reassigned: {ref} is not an agent of this session", 3)

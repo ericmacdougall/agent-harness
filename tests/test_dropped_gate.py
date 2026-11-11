@@ -243,7 +243,9 @@ class GateTests(Base):
         self.assertIn("ah task dispose", out["reason"])
 
     def test_resumed_clears_then_expires_without_activity(self):
-        self.dispose("resumed", "disp-resumed-0001")
+        with self.assertRaises(ah.AhError):  # GoodQA #15565: a resume names the agent that took the work
+            self.dispose("resumed", "disp-resumed-noref")
+        self.dispose("resumed", "disp-resumed-0001", ref="aliveowner")
         self.assertEqual(self.stop(), {})
         self.assertEqual(self.owners()["undisposed"], [])
         later = NOW + liveness.RESUMED_GRACE_S + 60  # no activity followed the "resumed": it re-blocks
@@ -272,7 +274,7 @@ class GateTests(Base):
              "note": "REALLY_TESTED DG-LIVE-1: dropowner verified live on https://app.example: pass"}])
         self.dispose("closed", "disp-closed-ok", reason="verified dropowner's v1.2.0 deploy serves and passes live",
                      deployed="wde000000001", live_test="DG-LIVE-1")
-        self.assertEqual(self.stop(now=NOW + 10 * 86400), {})
+        self.assertNotIn("dropowner", self.owners(now=NOW + 10 * 86400)["undisposed"])
 
     def test_reassigned_is_live_only_while_the_replacement_is(self):
         self.dispose("reassigned", "disp-reassign-ok", ref="aliveowner")
@@ -329,7 +331,7 @@ class ReassignInheritsTargetWait(Base):
         self.wait("waitowner", "key-tw-2-0000", NOW + 3600)
         self.dispose("reassigned", "key-tw-r2-0000", ref="waitowner")
         later = NOW + 3601
-        self.assertEqual(self.owners(now=later)["undisposed"], ["dropowner", "waitowner"])
+        self.assertEqual(self.owners(now=later)["undisposed"], ["aliveowner", "dropowner", "waitowner"])  # aliveowner: SILENT-HIGH by then
         self.assertEqual(self.stop(now=later).get("decision"), "block")
 
     def test_reassigned_to_a_dropped_target_without_a_decision_still_blocks(self):
@@ -363,7 +365,7 @@ class ReassignInheritsTargetWait(Base):
     def test_reassigned_to_a_done_target_in_a_live_named_wait_holds(self):
         """Main's repro 2026-11-06 (pet-leads-x -> a9830089): target state done + live waiting disposition."""
         self.add_done_target()
-        self.wait("doneowner", "key-tw-6-0000", NOW + 3600, ref="GoodQA goodqa#14883")
+        self.wait("doneowner", "key-tw-6-0000", NOW + 3600, ref="wa5b00000001")  # an open ask binds; an ownerless ticket does not
         self.dispose("reassigned", "key-tw-r6-0000", ref="doneowner")
         by = {r["agent_id"]: r for r in self.owners()["owners"]}
         self.assertEqual(by["doneowner"]["state"], "done")  # the fixture really has the repro shape
@@ -382,7 +384,7 @@ class ReassignInheritsTargetWait(Base):
         finished, holds no wait and must not excuse work reassigned to it."""
         self.add_done_target()
         ah.write(self.home, "task.dispose", {"agent": "doneowner", "session": SESSION, "kind": "resumed",
-                                             "at": iso(NOW - 5000)}, SESSION, "key-tw-8-0000")
+                                             "at": iso(NOW - 5000), "ref": "doneowner"}, SESSION, "key-tw-8-0000")
         self.dispose("reassigned", "key-tw-r8-0000", ref="doneowner")
         by = {r["agent_id"]: r for r in self.owners()["owners"]}
         self.assertEqual(by["doneowner"]["state"], "done")
@@ -408,6 +410,127 @@ class ReassignInheritsTargetWait(Base):
         undisposed = self.owners()["undisposed"]
         self.assertIn("dropowner", undisposed)
         self.assertNotIn("doneowner", undisposed)
+
+
+class BindingEndToEnd(Base):
+    """GoodQA #15565 (never-drop 16.1), through `ah owners` and `ah task dispose`, not just liveness.disposition_bound."""
+
+    def add_returned(self, name="retowner", kind="task-owner"):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 9000), "event": "subagent", "agent_id": name, "agent_type": kind},
+                              {"at": iso(NOW - 200), "event": "subagent_stop", "agent_id": name, "agent_type": kind}])
+        jl(w / ("agent-%s.jsonl" % name), [{"at": iso(NOW - 4000), "event": "intent", "note": "was working"}])
+
+    def test_reassigning_to_a_returned_agent_leaves_the_owner_undisposed_and_a_live_one_excuses_it(self):
+        self.add_returned()
+        self.dispose("reassigned", "e2e-r1-000000", ref="retowner")
+        self.assertIn("dropowner", self.owners()["undisposed"])
+        self.dispose("reassigned", "e2e-r2-000000", ref="aliveowner")
+        self.assertNotIn("dropowner", self.owners()["undisposed"])
+
+    def test_a_live_helper_is_not_a_holder_and_main_is_not_an_agent_ref(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 900), "event": "subagent", "agent_id": "reviewer01", "agent_type": "red-team"}])
+        jl(w / "agent-reviewer01.jsonl", [{"at": iso(NOW - 20), "event": "intent", "note": "reviewing"}])
+        self.dispose("reassigned", "e2e-h1-000000", ref="reviewer01")
+        self.assertIn("dropowner", self.owners()["undisposed"])
+        for ref in ("main", "../x", ""):
+            with self.assertRaises(ah.AhError, msg=ref):
+                self.dispose("resumed", "e2e-m-" + str(len(ref)) + "00000", ref=ref)
+
+    def test_a_handoff_is_acknowledged_only_by_a_live_holder(self):
+        self.add_returned()
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "agent-dropowner.jsonl", [{"at": iso(NOW), "event": "handoff", "note": "to main: result ready"}])
+        jl(w / "main.jsonl", [{"at": iso(NOW), "event": "subagent_stop", "agent_id": "dropowner", "agent_type": "task-owner"}])
+        later = NOW + ah.HANDOFF_ACK_S + 60
+        self.dispose("resumed", "e2e-ack-dead00", now=NOW + 5, ref="retowner")  # a returned agent holds nothing
+        by = {r["agent_id"]: r for r in self.owners(now=later)["owners"]}
+        self.assertIn("handoff-unacked", by["dropowner"]["flags"])
+        jl(w / "agent-aliveowner.jsonl", [{"at": iso(later - 10), "event": "intent", "note": "alive"}])
+        self.dispose("resumed", "e2e-ack-live00", now=NOW + 6, ref="aliveowner")
+        by = {r["agent_id"]: r for r in self.owners(now=later)["owners"]}
+        self.assertNotIn("handoff-unacked", by["dropowner"]["flags"])
+
+    def test_silent_high_owner_needs_a_bound_disposition(self):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 9000), "event": "subagent", "agent_id": "quietone", "agent_type": "task-owner"}])
+        jl(w / "agent-quietone.jsonl", [{"at": iso(NOW - 5400), "event": "intent", "note": "quiet for 90 minutes"}])
+        by = {r["agent_id"]: r for r in self.owners()["owners"]}
+        self.assertEqual(by["quietone"]["state"], "SILENT-HIGH")
+        self.assertTrue(by["quietone"]["decision_required"])
+        self.assertIn("quietone", self.owners()["undisposed"])
+
+
+class SameTicketReassignment(Base):
+    """PR 163 final-gate review F1 (GoodQA #15565): liveness.holds_work lets a live non-owner agent hold a stream when
+    it holds the stream's ticket, but `ah owners` checked reassignment coverage without the ticket, so a valid
+    same-ticket reassignment left the owner undisposed and kept the Stop gate blocked. dropowner's stream is
+    goodqa#14791 (its WAL note)."""
+
+    def add_live_general(self, name, ticket):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 900), "event": "subagent", "agent_id": name, "agent_type": "general-purpose"}])
+        jl(w / ("agent-%s.jsonl" % name), [{"at": iso(NOW - 20), "event": "intent", "note": "working GoodQA " + ticket}])
+
+    def add_returned(self, name):
+        w = self.home / ".claude" / "wals" / SESSION
+        jl(w / "main.jsonl", [{"at": iso(NOW - 9000), "event": "subagent", "agent_id": name, "agent_type": "task-owner"},
+                              {"at": iso(NOW - 200), "event": "subagent_stop", "agent_id": name, "agent_type": "task-owner"}])
+        jl(w / ("agent-%s.jsonl" % name), [{"at": iso(NOW - 4000), "event": "intent", "note": "was working"}])
+
+    def reassign(self, agent, ref, key):
+        ah.write(self.home, "task.dispose", {"agent": agent, "session": SESSION, "kind": "reassigned", "at": iso(NOW),
+                                             "ref": ref}, SESSION, key)
+
+    def check_shape(self, by, holder, ticket):
+        self.assertEqual(by["dropowner"]["state"], "DROPPED")
+        self.assertTrue(liveness.same_ticket(by["dropowner"]["ticket"], "goodqa#14791"))
+        self.assertIs(by[holder]["owner"], False)  # live, not an owner: holds only by ticket
+        self.assertTrue(by[holder]["state"].startswith("live"), by[holder]["state"])
+        self.assertTrue(liveness.same_ticket(by[holder]["ticket"], ticket))
+
+    def test_a_live_non_owner_on_the_same_ticket_takes_the_reassignment(self):
+        self.add_live_general("samestream01", "goodqa#14791")
+        self.reassign("dropowner", "samestream01", "st-same-00000")
+        out = self.owners()
+        by = {r["agent_id"]: r for r in out["owners"]}
+        self.check_shape(by, "samestream01", "goodqa#14791")
+        self.assertTrue(by["dropowner"]["disposition"]["live"])
+        self.assertFalse(by["dropowner"]["decision_required"])
+        self.assertNotIn("dropowner", out["undisposed"])
+        self.assertEqual(self.stop(), {})
+
+    def test_a_live_non_owner_on_another_ticket_does_not(self):
+        self.add_live_general("otherstream1", "goodqa#999")
+        self.reassign("dropowner", "otherstream1", "st-other-0000")
+        out = self.owners()
+        by = {r["agent_id"]: r for r in out["owners"]}
+        self.check_shape(by, "otherstream1", "goodqa#999")
+        self.assertFalse(by["dropowner"]["disposition"]["live"])
+        self.assertIn("dropowner", out["undisposed"])
+        self.assertEqual(self.stop().get("decision"), "block")
+
+    def test_a_chain_reaches_the_same_ticket_holder_at_its_end(self):
+        """A reassigned to B (returned, holds nothing) reassigned to C, where only C holds the stream's ticket."""
+        self.add_returned("middle0001")
+        self.add_live_general("chainend001", "goodqa#14791")
+        self.reassign("middle0001", "chainend001", "st-chain-b000")
+        self.reassign("dropowner", "middle0001", "st-chain-a000")
+        out = self.owners()
+        by = {r["agent_id"]: r for r in out["owners"]}
+        self.check_shape(by, "chainend001", "goodqa#14791")
+        self.assertTrue(by["dropowner"]["disposition"]["live"])
+        self.assertNotIn("dropowner", out["undisposed"])
+
+    def test_a_chain_ending_on_another_ticket_does_not(self):
+        self.add_returned("middle0002")
+        self.add_live_general("chainend002", "goodqa#999")
+        self.reassign("middle0002", "chainend002", "st-chain-d000")
+        self.reassign("dropowner", "middle0002", "st-chain-c000")
+        out = self.owners()
+        self.assertFalse({r["agent_id"]: r for r in out["owners"]}["dropowner"]["disposition"]["live"])
+        self.assertIn("dropowner", out["undisposed"])
 
 
 class PendingStopNoise(Base):
@@ -596,9 +719,9 @@ class TaskWalOwners(Base):
         self.assertEqual(by["fable-review"]["type"], "task-wal")
         self.assertEqual(by["finished-task"]["state"], "done")
         self.assertEqual(by["quiet-task"]["state"], "SILENT-HIGH")
-        self.assertEqual(data["undisposed"], ["dropowner", "fable-review"])
+        self.assertEqual(data["undisposed"], ["dropowner", "fable-review", "quiet-task"])  # SILENT-HIGH needs a decision too
         self.dispose_task("fable-review")
-        self.assertEqual(self.owners()["undisposed"], ["dropowner"])
+        self.assertEqual(self.owners()["undisposed"], ["dropowner", "quiet-task"])
 
     def test_waiting_on_a_dropped_agent_needs_a_decision(self):
         """Part 3 #7: `waiting on <agent id>` must not park an owner once that agent is itself DROPPED."""

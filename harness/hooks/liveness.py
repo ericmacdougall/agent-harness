@@ -110,7 +110,98 @@ def disposition_live(disp: dict | None, now: float, last_activity: float = 0.0, 
     return (last_activity > at) or (now - at < RESUMED_GRACE_S)
 
 
-ENDING_DISPOSITIONS = frozenset(("reassigned", "closed", "superseded", "wontdo", "legacy"))
+# GoodQA #15565 (never-drop 16.1): `reassigned` is no longer an ending disposition. A disposition is a CLAIM that someone
+# holds the work, so resumed/reassigned/waiting excuse a row only while the thing they name is bound and live
+# (disposition_bound). All 10 DROPPED/SILENT-HIGH rows on 2026-11-09 were "disposed" and ownerless.
+ENDING_DISPOSITIONS = frozenset(("closed", "superseded", "wontdo", "legacy"))
+LIVE_BIND_S = 10 * 60  # a successor counts as live when `ah owners` saw it active within this window
+BINDING_KINDS = ("resumed", "reassigned", "waiting")
+
+
+def holds_work(row, stream_ticket=None) -> bool:
+    """A live successor: running and active within LIVE_BIND_S (never a stopped, SILENT, DROPPED or unknown agent).
+
+    It must also be an OWNER (`ah owners` flags task-owners, registered agents and agents main named in a WAL note), or
+    hold the same ticket as the stream it is excused for: a reviewer spawned as general-purpose is live but owns nothing
+    (red-team a5fc13ab R3). A row `ah` still marks decision_required holds nothing either."""
+    if not isinstance(row, dict) or str(row.get("type") or "") in NON_HOLDER_TYPES or row.get("decision_required") is True:
+        return False
+    if not (row.get("owner") is True or (stream_ticket and same_ticket(stream_ticket, row.get("ticket")))):
+        return False
+    state = str(row.get("state") or "")
+    idle = row.get("idle_s")
+    if state.startswith(("live", "working")):
+        return True
+    if state.startswith("waiting-on-"):
+        return True  # parked in a named wait: `ah owners` already demotes a wait on a closed ask or a dead agent to DROPPED
+    return state in ("quiet", "idle-helper") and isinstance(idle, (int, float)) and idle <= LIVE_BIND_S
+
+
+# Reviewers and other helpers are live agents but never hold a stream: naming one as a successor or wait target is a
+# claim about the wrong agent (red-team a5fc13ab D2).
+NON_HOLDER_TYPES = ("red-team", "click-tester", "reviewer", "fixer", "Explore", "Plan", "claude-code-guide",
+                    "statusline-setup")
+_TICKET = re.compile(r"(?:\b([A-Za-z0-9][A-Za-z0-9-]*))?#(\d{1,10})\b")
+
+
+def ticket_key(ref) -> tuple:
+    """(project slug or "", number) of the first ticket reference in ref: "GoodQA goodqa#15476" -> ("goodqa", "15476")."""
+    found = _TICKET.search(str(ref or ""))
+    if not found:
+        return ("", "")
+    return ((found.group(1) or "").lower(), found.group(2))
+
+
+def same_ticket(a, b) -> bool:
+    """Same number, and the same project when both name one (parent-proof#665 is not goodqa#665)."""
+    (sa, na), (sb, nb) = ticket_key(a), ticket_key(b)
+    return bool(na) and na == nb and (not sa or not sb or sa == sb)
+
+
+def ticket_number(ref) -> str:
+    return ticket_key(ref)[1]
+
+
+def resolve_agent(ref, by_id: dict):
+    """The row an agent ref names: the full id, or a unique prefix of at least 8 characters."""
+    ref = str(ref or "")
+    if ref in by_id:
+        return by_id[ref]
+    if len(ref) >= 8:
+        hits = [row for key, row in by_id.items() if key.startswith(ref)]
+        if len(hits) == 1:
+            return hits[0]
+    return None
+
+
+def disposition_bound(disp: dict, row: dict, by_id: dict, rows: list, asks: dict, covered=None) -> bool:
+    """Whether the thing a resumed/reassigned/waiting disposition names holds the work right now.
+
+    A helper type (reviewer, red-team, click-tester, ...) never holds a stream; a ticket wait matches project and number.
+    resumed     --ref must be a live agent (the re-spawned or resumed owner); no ref binds only a row that is itself live
+    reassigned  --ref must be a live agent, or one whose own disposition is bound (`covered`, chain-safe, from ah)
+    waiting     --ref is an ask id still open in this session, a live agent, or a ticket that a LIVE owner (not this row)
+                holds. A named wait on an ownerless ticket is the drop it was meant to prevent.
+    Time limits (waiting --until, resumed grace) stay in disposition_live; this adds the binding."""
+    kind = disp.get("kind") if isinstance(disp, dict) else None
+    ref = str(disp.get("ref") or "") if isinstance(disp, dict) else ""
+    if kind not in BINDING_KINDS:
+        return True
+    if kind == "resumed":
+        target = resolve_agent(ref, by_id) if ref else row
+        return holds_work(target, row.get("ticket"))
+    if kind == "reassigned":
+        target = resolve_agent(ref, by_id)
+        if target is None or target is row:
+            return False
+        return holds_work(target, row.get("ticket")) or bool(covered and covered(target["agent_id"]))
+    if re.fullmatch(r"w[0-9a-f]{11}", ref):
+        return asks.get(ref) == "open"
+    target = resolve_agent(ref, by_id)
+    if target is not None:
+        return target is not row and holds_work(target, row.get("ticket"))
+    return bool(ticket_number(ref)) and any(r is not row and r.get("owner") and holds_work(r, row.get("ticket"))
+                                            and same_ticket(ref, r.get("ticket")) for r in rows)
 
 
 def row_disposed(row: dict) -> bool:
