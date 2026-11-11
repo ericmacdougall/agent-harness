@@ -487,6 +487,15 @@ class SupervisedOwners(Collector):
         self.alive = alive or self._alive
         self.on_change = on_change
         self.rows = []
+        self.published = None                       # the rows last handed to on_change
+        self.parsed: dict[str, tuple] = {}          # owner name -> (raw status bytes, parsed value)
+
+    def _changed(self) -> None:
+        """Tell the owners panel only when a row actually changed: a tick over unchanged status files used to
+        rebuild and push the whole owners snapshot to every page every 2 seconds."""
+        if self.on_change and self.rows != self.published:
+            self.published = [dict(row) for row in self.rows]
+            self.on_change()
 
     @staticmethod
     def _alive(pid):
@@ -509,7 +518,8 @@ class SupervisedOwners(Collector):
                     if name in known:
                         raise ValueError('known owner status is missing')
                     continue
-                value = _json(raw)
+                cached = self.parsed.get(name)
+                value = cached[1] if cached and cached[0] == raw else _json(raw)
                 if not value or value.get('name') != name or value.get('harness') != 'openai':
                     raise ValueError('invalid owner status identity')
                 state = value.get('state')
@@ -525,7 +535,11 @@ class SupervisedOwners(Collector):
                             value.get('last_status'), 'idle')
                 ticket = str(value.get('ticket') or '')
                 activity = str(value.get('last_activity') or value.get('turn_ended') or value.get('started') or '')[:40]
-                reply = ev.short(value.get('last_reply') or '', 2000)
+                if not (cached and cached[0] == raw):
+                    # redaction and clipping are the costly part: done once per version of the status file
+                    value = dict(value, _reply=ev.short(value.get('last_reply') or '', 2000))
+                    self.parsed[name] = (raw, value)
+                reply = value['_reply']
                 rows.append({'agent_id': 'openai:' + name, 'name': name, 'runtime': 'codex', 'harness': 'openai',
                              'model': ev.short(value.get('model'), 80), 'stream': ev.short(value.get('stream'), 160),
                              'type': 'owner', 'task': ev.short(value.get('stream') or name, 160),
@@ -538,11 +552,9 @@ class SupervisedOwners(Collector):
             self.rows = rows
         except Exception:
             self.rows = [{**row, 'source_stale': True} for row in self.rows]
-            if self.on_change:
-                self.on_change()
+            self._changed()
             raise
-        if self.on_change:
-            self.on_change()
+        self._changed()
         return f'{len(self.rows)} supervised owners'
 
 

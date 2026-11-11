@@ -38,6 +38,23 @@ class SupervisedOwners(unittest.TestCase):
         return col.SupervisedOwners(self.hub, self.health, safeio.Reader([self.root]), self.root,
                                     alive=lambda pid: pid == 123)
 
+    def test_unchanged_status_is_not_republished_every_tick(self):  # mc-perf: was an owners snapshot every 2 s
+        self.write()
+        seen = []
+        c = col.SupervisedOwners(self.hub, self.health, safeio.Reader([self.root]), self.root,
+                                 alive=lambda pid: pid == 123, on_change=lambda: seen.append(1))
+        for now in (1, 3, 5, 7):
+            c.run(now)
+        self.assertEqual(len(seen), 1, "four ticks over an unchanged status publish once")
+        self.write(last_reply='A newer reply')
+        c.run(9)
+        self.assertEqual((len(seen), c.rows[0]['last_reply']), (2, 'A newer reply'))
+        c.alive = lambda pid: False  # the supervisor died: same file, different state
+        c.run(11)
+        self.assertEqual((len(seen), c.rows[0]['state']), (3, 'offline'))
+        c.run(13)
+        self.assertEqual(len(seen), 3)
+
     def test_named_owner_fields_and_live_state(self):
         self.write()
         c = self.collector(); c.run(1)
