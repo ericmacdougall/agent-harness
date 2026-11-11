@@ -18,7 +18,7 @@ export function mountHealth() {
       row.className = `health-item ${source.state}`;
       name.textContent = source.name;
       status.textContent = `${source.state} · `;
-      time.textContent = `checked ${age(source.checked, state.now)}`;
+      time.textContent = age(source.checked, state.now);
       time.dateTime = source.checked;
       row.setAttribute('aria-label', `${source.name}: ${source.state}. Last checked ${age(source.checked, state.now)}. ${source.note}`);
     });
@@ -28,6 +28,6 @@ export function mountHealth() {
   render(getState());
   subscribe((state, reason) => {
     if (reason === 'health') render(state);
-    if (reason === 'tick') list.querySelectorAll('time').forEach(time => { time.textContent = `checked ${age(time.dateTime, state.now)}`; });
+    if (reason === 'tick') list.querySelectorAll('time').forEach(time => { time.textContent = age(time.dateTime, state.now); });
   });
 }

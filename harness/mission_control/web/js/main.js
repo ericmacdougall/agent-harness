@@ -1,4 +1,4 @@
-import { getState, subscribe, tick, select, setTab, setResponder, toggleFilter, toggleMotion, KINDS } from './store.js';
+import { getState, subscribe, tick, select, setTab, setResponder, toggleFilter, toggleMotion, cycleTheme, KINDS } from './store.js';
 import { el, button, progress, checklist, field, eta, age, stateClass } from './ui.js';
 import { mountInitiatives } from './initiatives.js';
 import { liveFields } from './adapt.js';
@@ -23,6 +23,21 @@ Object.entries(KINDS).forEach(([key, kind]) => {
   chip.append(icon, el('span', '', kind.label)); filters.append(chip);
 });
 document.getElementById('motion-toggle').addEventListener('click', toggleMotion);
+document.getElementById('theme-toggle').addEventListener('click', cycleTheme);
+const scheme = window.matchMedia('(prefers-color-scheme: light)');
+const THEME_TEXT = { auto: 'Theme: auto', light: 'Theme: light', dark: 'Theme: dark' };
+function applyTheme(state) {
+  const resolved = state.theme === 'auto' ? (scheme.matches ? 'light' : 'dark') : state.theme;
+  document.documentElement.dataset.theme = resolved;
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', resolved === 'light' ? '#f6f6f1' : '#000000');
+  const toggle = document.getElementById('theme-toggle');
+  toggle.dataset.mode = state.theme;
+  document.getElementById('theme-label').textContent = THEME_TEXT[state.theme];
+  toggle.setAttribute('aria-label', `${THEME_TEXT[state.theme]}${state.theme === 'auto' ? ` (${resolved}, follows your system)` : ''}. Change theme`);
+}
+scheme.addEventListener('change', () => applyTheme(getState()));
+applyTheme(getState());
+subscribe((state, reason) => { if (reason === 'theme') applyTheme(state); });
 document.querySelectorAll('.bottom-tabs button').forEach(tab => tab.addEventListener('click', () => setTab(tab.dataset.tab)));
 
 const CONNECTION_TEXT = { live: 'Live', connecting: 'Connecting', reconnecting: 'Reconnecting', offline: 'Offline', expired: 'Signed out' };
@@ -109,13 +124,18 @@ function renderInspector(state) {
     if (owner.waitNote) fields.append(field('Agent says', owner.waitNote));
     content.append(fields);
     if (owner.initiative_id) content.append(button('detail-action', 'Open linked initiative ↗', () => select('initiative', owner.initiative_id)));
-    content.append(el('p', 'detail-intro', 'Owner controls unavailable: no verified native command route is connected. The Chat panel uses only its displayed destination.'));
-    for (const label of ['Talk to this owner', 'Pause / resume', 'Reassign owner', 'Change model / machine', 'Change owner slots']) {
-      const unavailable = button('detail-action', `${label} · unavailable`, () => {});
-      unavailable.disabled = true;
-      unavailable.title = 'This control has no verified backend and cannot submit an action.';
-      content.append(unavailable);
-    }
+    // Owners take direction through main: this page has no verified route to an owner, so it offers the one that
+    // works (a message to main that names the owner) and no controls that cannot act.
+    content.append(button('detail-action secondary', 'Message main about this owner', () => {
+      select(null);
+      setResponder('claude');
+      setTab('chat');
+      const input = document.getElementById('chat-input');
+      if (!input.value.trim()) { input.value = `About owner ${owner.name} (${owner.agent_id}): `; input.dispatchEvent(new Event('input', { bubbles: true })); }
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }));
+    content.append(el('p', 'detail-note', 'Owners take direction through main. Pausing, reassigning or messaging an owner directly is done by main; ask it here.'));
   } else if (kind === 'event') {
     const event = [...state.events, ...state.feedSnapshot].find(entry => entry.id === id); if (!event) return select(null);
     title.textContent = `${KINDS[event.kind].icon} ${KINDS[event.kind].label}`;

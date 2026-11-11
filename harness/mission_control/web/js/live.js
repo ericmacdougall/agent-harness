@@ -1,6 +1,6 @@
-// Transport to the local Mission Control server: GET /api/state, SSE /api/events, POST /api/chat.
+// Transport to the local Mission Control server: GET /api/state, SSE /api/events, POST /api/chat, POST /api/approve.
 // Same-origin only; the session cookie is HttpOnly and the CSRF token lives in memory, never in storage.
-import { setInitiatives, setOwners, setSources, setHost, seedEvents, ingestEvent, setConnection, setChat, setCodex, setChatTransport, setAsks } from './store.js';
+import { setInitiatives, setOwners, setSources, setHost, seedEvents, ingestEvent, setConnection, setChat, setCodex, setChatTransport, setApproveTransport, setAsks } from './store.js';
 
 let csrf = '';
 let source = null;
@@ -95,8 +95,45 @@ export async function sendChat(item) {
   }
 }
 
+// POST /api/approve. Every refusal is turned into words the card can show; nothing is assumed sent.
+const APPROVE_WHY = {
+  'no-target': 'main is not attached, so it could not be delivered', 'no-main': 'Mission Control does not know main yet',
+  'not-open': 'this ask is no longer open', 'stale-digest': 'the ask changed since you read it; read it again and decide',
+  'key-conflict': 'this page reused a request id; decide again', 'asks-unavailable': 'the asks ledger could not be read',
+  csrf: 'this page is out of date; reload it', 'bad-note': 'the note has characters that cannot be sent or is too long',
+};
+async function postApproval(item) {
+  const body = JSON.stringify({ ask_id: item.ask_id, digest: item.digest, decision: item.decision, client_key: item.client_key, note: item.note || null });
+  let response;
+  try {
+    response = await fetch('/api/approve', { method: 'POST', credentials: 'same-origin', cache: 'no-store',
+      headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': csrf }, body });
+  } catch {
+    throw new SendError('no answer from Mission Control; it may or may not have been recorded. Choosing the same decision again is safe', true);
+  }
+  if (response.status === 401) { setConnection('expired'); throw new SendError('this dashboard session ended', false); }
+  if (response.ok) return response.json().catch(() => ({}));
+  let detail = {};
+  try { detail = await response.json(); } catch { /* keep the status code */ }
+  if (detail.error === 'already-decided') {
+    const made = detail.decision === 'approve' ? 'approved' : detail.decision === 'deny' ? 'denied' : 'decided';
+    throw new SendError(`this ask was already ${made}, here or in another tab. A sent decision cannot be changed from this page; tell main in a reply`, false);
+  }
+  throw new SendError(APPROVE_WHY[detail.error] || detail.message || `refused (${response.status})`, response.status >= 500);
+}
+export async function sendApproval(item) {
+  try {
+    return await postApproval(item);
+  } catch (error) {
+    if (!error.retryable) throw error;
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    return postApproval(item);  // same client_key: the server returns the same record, never a second decision
+  }
+}
+
 export async function start() {
   setChatTransport(sendChat);
+  setApproveTransport(sendApproval);
   try {
     if (await loadState()) connect();
   } catch {

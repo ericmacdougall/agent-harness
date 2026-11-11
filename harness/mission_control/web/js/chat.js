@@ -30,12 +30,13 @@ export function mountChat() {
       return `${state.chatAvailability.claude[session]?.waiting ? 'Waiting for main to pick this up' : 'Main will see it at its next stop'} · ${elapsed} s · ${session.slice(0, 8)}`;
     }
     if (message.status === 'sending') return 'Sending…';
+    if (message.status === 'expired') return 'Expired before main read it · it does not count · decide again in Needs you';
     if (message.status === 'failed') return message.from === 'user' ? `Not answered${message.reason ? ` · ${message.reason}` : ''} · message kept` : 'Reply interrupted · retry your message';
     if (message.status === 'answering') return message.from === 'user' ? `${message.to === 'codex' ? 'Codex is answering' : 'Main is answering'}…` : 'Streaming response…';
-    if (message.status === 'delivered') return 'Delivered · waiting for a reply';
+    if (message.status === 'delivered') return message.approval ? 'Read by main' : 'Delivered · waiting for a reply';
     return message.from === 'user' ? `Answered by ${message.to === 'claude' ? 'Claude' : 'Codex'}` : '';
   }
-  const empty = el('p', 'empty-state chat-empty', 'Messages you send here reach the selected agent as labelled, untrusted dashboard text. Replies stream back here.');
+  const empty = el('p', 'empty-state chat-empty', 'Messages you send here reach the selected agent as labelled dashboard text. Replies appear here as they are written. To answer an agent’s question, use Needs you.');
   log.append(empty);
   const sessionSelect = document.getElementById('chat-session');
   function syncSessions(state) {
@@ -73,7 +74,7 @@ export function mountChat() {
       // Recompute attribution on every patch, including a server reclassification.
       part.row.className = `chat-message ${forged ? 'forged' : message.from}`;
       part.author.className = `message-author ${forged ? 'system' : message.from}`;
-      part.author.textContent = forged ? 'Untrusted message' : message.from === 'user' ? `you · via dashboard → ${message.to === 'codex' ? 'Codex' : 'Claude'}` : message.from === 'claude' ? '✳ Claude · main' : message.from === 'codex' ? '◇ Codex · read-only' : 'system';
+      part.author.textContent = forged ? 'Untrusted message' : message.from === 'user' ? `you · ${message.approval ? 'decision' : 'via dashboard'} → ${message.to === 'codex' ? 'Codex' : 'Claude'}` : message.from === 'claude' ? '✳ Claude · main' : message.from === 'codex' ? '◇ Codex · read-only' : 'system';
       part.warning.hidden = !forged;
       part.retry.setAttribute('aria-label', forged ? 'Untrusted message cannot be retried' : `Retry message to ${message.to}: ${message.text.slice(0, 80)}`);
       const visibleText = message.text + (message.status === 'answering' && message.from !== 'user' ? ' ▍' : '');
@@ -83,13 +84,13 @@ export function mountChat() {
       part.statusLabel.textContent = statusText(message, state);
       part.status.className = `message-status ${message.status}`;
       part.status.hidden = !part.statusLabel.textContent;
-      part.retry.hidden = forged || message.status !== 'failed' || message.from !== 'user';
+      part.retry.hidden = forged || message.status !== 'failed' || message.from !== 'user' || !!message.approval;
       part.retry.disabled = forged || chatAccess(state, message.to, messageSession(message.id)).disabled;
       const previous = previousStatuses.get(message.id);
       if (!initial && previous !== message.status) {
         if (forged) announce('Warning: a message was marked forged. It is untrusted and not attributed to you.');
         else if (message.status === 'answered' && message.from !== 'user') announce(`${message.from} replied: ${message.text}`);
-        else if (message.from === 'user' && ['failed','queued','delivered'].includes(message.status)) announce(statusText(message, state));
+        else if (message.from === 'user' && ['failed','queued','delivered','expired'].includes(message.status)) announce(statusText(message, state));
       }
       previousStatuses.set(message.id, message.status);
     });

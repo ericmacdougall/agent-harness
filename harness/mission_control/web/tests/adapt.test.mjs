@@ -278,3 +278,41 @@ test('named OpenAI owner with merged WAL result remains moving in the at-risk st
   assert.equal(risk.status,'moving');
   assert.match(risk.reason,/check by mission-control/);
 });
+
+test('decisions: the server record drives the card; expired or refused leaves the ask open', () => {
+  const ask = { id: 'wabc', session: 's1' };
+  const record = (status, extra = {}) => ({ id: 'dash-1', to: 'claude', session: 's1', text: 'Dashboard decision: APPROVED ask wabc', ts: '2026-11-11T10:00:00Z', status,
+    client_key: 'k1', approval: { ask_id: 'wabc', decision: 'approve', expires: Date.parse('2026-11-11T10:30:00Z') / 1000 }, ...extra });
+  const list = status => adapt.messages({ messages: [record(status)] });
+  assert.equal(adapt.decisionOf(list('queued'), ask).live, true);
+  assert.equal(adapt.waitingOnUser(list('queued'), ask), false);
+  assert.equal(adapt.decisionOf(list('expired'), ask).live, false);
+  assert.equal(adapt.waitingOnUser(list('expired'), ask), true);                       // an expired decision counts for nothing
+  assert.equal(adapt.decisionOf(list('queued'), { id: 'wother', session: 's1' }), null);   // bound to its own ask
+  assert.equal(adapt.decisionOf(list('queued'), { id: 'wabc', session: 's2' }), null);     // and its own session
+  const forged = adapt.messages({ messages: [record('forged')] });
+  assert.equal(adapt.decisionOf(forged, ask), null);                                    // a planted record is never a decision
+  assert.equal(adapt.approvalOf({ ask_id: 'wabc', decision: 'maybe' }), null);
+  // this page's click: sending until the server's record arrives; a refusal shows its reason and frees the buttons
+  const sending = adapt.decisionOf([], ask, { decision: 'deny', status: 'sending', ts: '2026-11-11T10:00:01Z' });
+  assert.deepEqual([sending.status, sending.live], ['sending', true]);
+  const refused = adapt.decisionOf([], ask, { decision: 'deny', status: 'failed', reason: 'main is not attached', ts: '2026-11-11T10:00:01Z' });
+  assert.deepEqual([refused.status, refused.live], ['failed', false]);
+  // another tab already decided: the standing record wins over this page's refused opposite click
+  const standing = adapt.decisionOf(list('delivered'), ask, { decision: 'deny', status: 'failed', reason: 'already', ts: '2026-11-11T10:05:00Z' });
+  assert.deepEqual([standing.decision, standing.status, standing.live], ['approve', 'delivered', true]);
+});
+
+test('decision status lines say exactly how far a decision got', () => {
+  const now = Date.parse('2026-11-11T10:10:00Z');
+  const base = { decision: 'approve', replies: [], expires: '2026-11-11T10:30:00Z', message: { ts: '2026-11-11T10:00:00Z', read_at: '2026-11-11T10:00:04Z' } };
+  const line = (status, opts = {}) => adapt.decisionStatus({ ...base, status, ...opts.d }, { now, waiting: opts.waiting ?? true, time: () => '10:00', gap: () => '4 s after you sent it' });
+  assert.equal(line('sending'), 'Sending your approval…');
+  assert.equal(line('queued'), 'Approved · sent, waiting for main to read it · expires in 20 min if unread');
+  assert.match(line('queued', { waiting: false }), /main is busy and reads it at its next stop/);
+  assert.equal(line('delivered'), 'Approved · read by main at 10:00 (4 s after you sent it)');
+  assert.match(line('answered'), /main replied$/);
+  assert.match(line('expired'), /expired before main read it, so it does not count/);
+  assert.match(line('failed', { d: { reason: 'main is not attached', decision: 'deny' } }), /^Your denial was not recorded: main is not attached\. Nothing was sent\.$/);
+  assert.equal(adapt.askProgress([], { ...base, status: 'delivered', live: true }), 'Approved by you · read by main');
+});

@@ -13,15 +13,18 @@ export const KINDS = Object.freeze({
   system: { label: 'System', icon: '⊞', color: '#c7c9ce' },
 });
 const media = window.matchMedia('(prefers-reduced-motion: reduce)');
-let savedMotion = true;
+let savedMotion = true, savedTheme = 'auto';
 try { savedMotion = localStorage.getItem('mc-motion') !== 'off'; } catch { /* storage is optional */ }
+try { const theme = localStorage.getItem('mc-theme'); if (['light', 'dark'].includes(theme)) savedTheme = theme; } catch { /* optional */ }
 let state = {
   initiatives: [], initiativesStale: false, initiativesError: '', owners: [], ownerRows: [], events: [], messages: [], sources: [],
   host: '', chat: null, pending: [], sessions: [], mainSession: '', asks: [], asksResolved: [], asksSession: '',
+  decisions: {},  // ask id -> this page's own Approve/Deny click while it is in flight or after it was refused
   connection: 'connecting', now: Date.now(), filters: Object.keys(KINDS),
   selection: null, highlight: null, tab: 'overview', responder: 'claude', session: '',
   motion: savedMotion && !media.matches, motionPreference: savedMotion, reducedMotion: media.matches,
   feedPaused: false, feedSnapshot: [], buffered: 0, ownerFilter: 'active', fallback: false, showQuiet: false,
+  theme: savedTheme,
   chatAvailability: { claude: {}, codex: { state: 'unavailable', blockedUntil: null, reason: 'Checking Codex…' } },
 };
 const listeners = new Set();
@@ -60,6 +63,12 @@ export function toggleMotion() {
   const preference = !state.motionPreference;
   try { localStorage.setItem('mc-motion', preference ? 'on' : 'off'); } catch { /* optional */ }
   update({ motionPreference: preference, motion: preference && !state.reducedMotion }, 'motion');
+}
+// Theme: auto follows the system; light and dark are the user's own choice and are remembered on this device.
+export function cycleTheme() {
+  const theme = { auto: 'light', light: 'dark', dark: 'auto' }[state.theme] || 'auto';
+  try { if (theme === 'auto') localStorage.removeItem('mc-theme'); else localStorage.setItem('mc-theme', theme); } catch { /* optional */ }
+  update({ theme }, 'theme');
 }
 media.addEventListener('change', event => update({ reducedMotion: event.matches, motion: state.motionPreference && !event.matches }, 'motion'));
 
@@ -100,8 +109,10 @@ export function setChat(chat) {
   const codex = chat.codex ? adapt.codex(chat.codex) : state.chatAvailability.codex;
   const known = new Set((chat.messages || []).map(m => m.client_key).filter(Boolean));
   const pending = state.pending.filter(p => !known.has(p.client_key));
+  // a click the server has recorded is shown from the server's record from here on
+  const decisions = Object.fromEntries(Object.entries(state.decisions).filter(([, d]) => !known.has(d.client_key)));
   const session = sessions.some(s => s.id === state.session) ? state.session : sessions[0]?.id || state.session || '';
-  update({ chat, pending, sessions, mainSession: String(chat.main_session || ''), session, chatAvailability: { claude, codex },
+  update({ chat, pending, decisions, sessions, mainSession: String(chat.main_session || ''), session, chatAvailability: { claude, codex },
     messages: adapt.messages(chat, pending) }, 'chat');
   update({}, 'availability');
 }
@@ -159,7 +170,7 @@ export function sendMessage(text, { thread = null } = {}) {
 // A local message the server never confirmed keeps its key (idempotent); a server-side failure is a new send.
 export function retryMessage(id) {
   const message = state.messages.find(m => m.id === id);
-  if (!message || message.from !== 'user' || message.status !== 'failed' || !transport) return;
+  if (!message || message.from !== 'user' || message.status !== 'failed' || message.approval || !transport) return;  // a decision is never resent as chat text
   if (chatAccess(state, message.to, message.session || state.session).disabled) return;
   const local = state.pending.find(p => p.id === id);
   if (local) { patchPending(local.client_key, { status: 'sending', reason: '' }); deliver({ ...local }); return; }
@@ -190,5 +201,36 @@ export function sendAskReply(ask, text) {
   update({ pending, messages: adapt.messages(state.chat, pending) }, 'chat');
   deliver(item);
   return key;
+}
+// ---- decisions: Approve or Deny on an open ask. The request carries only the ask id, the digest of the text this
+// page showed and the decision; the server re-reads the ask and signs the record. Nothing here is optimistic: the
+// card says "sending" until the server has stored the record, then follows the record's own state.
+let approveTransport;
+export const DECISION_NOTE_MAX = 500;
+export function setApproveTransport(send) { approveTransport = send; }
+export function decisionAccess(ask, current = state) {
+  if (!ask?.approvable) return { disabled: true, notice: ask?.blocked || 'This ask cannot be decided here. Answer with a reply.' };
+  const access = askReplyAccess(ask, current);
+  if (access.disabled) return { disabled: true, notice: access.presence === 'NO MAIN' ? 'Main is not attached, so a decision cannot be delivered. In main, run `python3 ~/.claude/hooks/mc_inbox.py wait --session <id>` in the background.' : access.notice };
+  return { disabled: false, notice: '' };
+}
+function setDecision(askId, value) {
+  const decisions = { ...state.decisions };
+  if (value) decisions[askId] = value; else delete decisions[askId];
+  update({ decisions }, 'chat');
+}
+export function decideAsk(ask, decision, note = '') {
+  const clean = String(note || '').trim();
+  if (!ask?.id || !['approve', 'deny'].includes(decision) || clean.length > DECISION_NOTE_MAX || !approveTransport) return false;
+  if (decisionAccess(ask).disabled || state.decisions[ask.id]?.status === 'sending') return false;
+  // a retry after "no response" reuses the key, so the server returns the same record and never a second one
+  const previous = state.decisions[ask.id];
+  const client_key = previous?.retryable && previous.decision === decision && previous.note === clean ? previous.client_key : adapt.newClientKey();
+  const item = { ask_id: ask.id, digest: ask.digest, decision, note: clean, client_key, ts: new Date().toISOString(), status: 'sending', reason: '' };
+  setDecision(ask.id, item);
+  approveTransport(item).then(
+    () => { if (state.decisions[ask.id]?.client_key === client_key) setDecision(ask.id, { ...item, status: 'sent' }); },
+    error => { if (state.decisions[ask.id]?.client_key === client_key) setDecision(ask.id, { ...item, status: 'failed', retryable: !!error?.retryable, reason: String(error?.message || 'no answer from Mission Control').slice(0, 200) }); });
+  return true;
 }
 export const messageSession = id => state.messages.find(m => m.id === id)?.session || state.session;

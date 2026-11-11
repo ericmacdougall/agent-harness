@@ -109,7 +109,13 @@ export function sessions(targets, mainSession) {
     .sort((a, b) => Number(b.id === mainSession) - Number(a.id === mainSession));
 }
 
-const USER_STATUS = { queued: 'queued', delivered: 'delivered', answered: 'answered', failed: 'failed', forged: 'forged', unavailable: 'failed', answering: 'answering' };
+const USER_STATUS = { queued: 'queued', delivered: 'delivered', answered: 'answered', failed: 'failed', forged: 'forged', unavailable: 'failed', answering: 'answering', expired: 'expired' };
+
+// The signed decision a dashboard record carries, as the server reports it: ask id, decision and expiry, nothing else.
+export function approvalOf(raw) {
+  if (!raw || typeof raw !== 'object' || !/^[A-Za-z0-9_-]{1,40}$/.test(str(raw.ask_id)) || !['approve', 'deny'].includes(raw.decision)) return null;
+  return { ask_id: raw.ask_id, decision: raw.decision, expires: isoFromEpoch(raw.expires) || '' };
+}
 
 // Server records plus this page's pending sends (keyed by client_key) -> one ordered message list.
 export function messages(chat, pending = []) {
@@ -126,7 +132,7 @@ export function messages(chat, pending = []) {
     if (partial && !partial.final && status !== 'answered' && status !== 'failed') status = 'answering';
     out.push({ id: m.id, from: 'user', to: m.to === 'codex' ? 'codex' : 'claude', session: str(m.session, 128), text: str(m.text), ts: validIso(m.ts) || new Date().toISOString(),
       status: m.status === 'forged' || m.label === 'FORGED' ? 'forged' : status, reason: str(m.reason, 300), client_key: str(m.client_key, 64),
-      read_at: validIso(m.read_at) || '' });
+      read_at: validIso(m.read_at) || '', approval: m.status === 'forged' || m.label === 'FORGED' ? null : approvalOf(m.approval) });
   }
   for (const r of replies) {
     if (!r || typeof r.id !== 'string' || !['claude', 'codex'].includes(r.from)) continue;
@@ -160,7 +166,47 @@ export function trailOf(messages, id) {
       replies: messages.filter(r => r && r.from !== 'user' && r.reply_to === m.id) }));
 }
 // An ask still needs the user until a reply of theirs is on its way (a failed or rejected send does not count).
-export const waitingOnUser = (messages, ask) => !trailOf(messages, ask.id).some(t => !['failed', 'forged'].includes(t.message.status));
+export const waitingOnUser = (messages, ask) => !trailOf(messages, ask.id).some(t => !['failed', 'forged'].includes(t.message.status))
+  && !decisionOf(messages, ask)?.live;
+
+// ---- decisions: Approve or Deny on an ask is a signed server record (a chat message that carries `approval`).
+// The newest record for the ask decides what the card shows; `local` is this page's own click still in flight or
+// refused. `live` means a decision is standing or on its way, so the buttons stay away; an expired or refused one
+// leaves the ask open and the buttons back.
+export function decisionOf(messages, ask, local = null) {
+  const records = (Array.isArray(messages) ? messages : [])
+    .filter(m => m && m.from === 'user' && m.approval && m.approval.ask_id === ask?.id && (!ask?.session || !m.session || m.session === ask.session));
+  const record = records[records.length - 1] || null;
+  const recordLive = record && ['queued', 'delivered', 'answering', 'answered'].includes(record.status);
+  // 'sent': the server stored the record; its snapshot follows within a second, so the card still says sending.
+  // A standing record always wins over this page's refused click (another tab decided first).
+  const pending = local && ['sending', 'sent'].includes(local.status);
+  if (local && (pending || (!recordLive && (!record || Date.parse(local.ts) > Date.parse(record.ts))))) {
+    const status = pending ? 'sending' : 'failed';
+    return { decision: local.decision, status, reason: str(local.reason, 300), live: pending, message: null, replies: [] };
+  }
+  if (!record) return null;
+  const status = ['queued', 'delivered', 'answering', 'answered', 'expired'].includes(record.status) ? record.status : 'failed';
+  return { decision: record.approval.decision, status, reason: str(record.reason, 300), live: !['expired', 'failed'].includes(status),
+    message: record, expires: record.approval.expires, replies: messages.filter(r => r && r.from !== 'user' && r.reply_to === record.id) };
+}
+const minutesLeft = (expires, now) => Math.max(1, Math.ceil((Date.parse(expires) - now) / 60000));
+// One honest line for a decision: what was decided and exactly how far it has got.
+export function decisionStatus(decision, { now = Date.now(), waiting = true, time = String, gap = () => '' } = {}) {
+  if (!decision) return '';
+  const noun = decision.decision === 'approve' ? 'approval' : 'denial';
+  const done = decision.decision === 'approve' ? 'Approved' : 'Denied';
+  if (decision.status === 'sending') return `Sending your ${noun}…`;
+  if (decision.status === 'failed') return `Your ${noun} was not recorded${decision.reason ? `: ${decision.reason}` : ''}. Nothing was sent.`;
+  if (decision.status === 'expired') return `Your ${noun} expired before main read it, so it does not count. Decide again when main is listening.`;
+  if (decision.status === 'queued') {
+    const left = Number.isFinite(Date.parse(decision.expires)) ? ` · expires in ${minutesLeft(decision.expires, now)} min if unread` : '';
+    return `${done} · sent, ${waiting ? 'waiting for main to read it' : 'main is busy and reads it at its next stop'}${left}`;
+  }
+  const message = decision.message || {};
+  const read = message.read_at ? `read by main at ${time(message.read_at)}${gap(message.ts, message.read_at) ? ` (${gap(message.ts, message.read_at)})` : ''}` : 'read by main';
+  return `${done} · ${read}${decision.status === 'answering' ? ' · main is answering' : decision.status === 'answered' ? ' · main replied' : ''}`;
+}
 
 // ---- initiative live fields: derived from the owners, WAL notes, asks and pushes the page already has, so a row is
 // current even when initiatives.json (names, links, estimates) was last edited hours ago.
@@ -190,7 +236,11 @@ export function liveFields(item, owners = [], asks = [], events = [], now = Date
 }
 
 // The header of an ask the user has replied to follows main's progress (click-test a954 F1: it stayed "waiting").
-export function askProgress(trail) {
+export function askProgress(trail, decision = null) {
+  if (decision?.live) {
+    const done = decision.decision === 'approve' ? 'Approved by you' : 'Denied by you';
+    return decision.status === 'sending' ? 'Sending your decision' : `${done} · ${decision.replies.length ? 'main replied' : decision.status === 'queued' ? 'waiting for main' : 'read by main'}`;
+  }
   const live = trail.filter(t => !['failed', 'forged'].includes(t.message.status));
   if (!live.length) return '';
   if (live.some(t => t.replies.length)) return 'Answered by you · main replied';
