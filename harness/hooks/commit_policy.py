@@ -31,10 +31,14 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))  # sibling imports also work for isolated-mode installed helper invocations
+from native_context import OriginObservation, probe_commit_runtime_origin  # noqa: E402
+
 POLICY_FILE = HERE / "commit_policy.json"
 LOCAL_PROFILE_NAME = "commit_policy.local.json"
 LEDGER = Path.home() / ".agent-harness" / "commit-policy" / "waivers.jsonl"
@@ -353,14 +357,24 @@ def ledger_checker(policy: dict, context, as_of_ms: int):
 
 # goodqa#15253 B1: which harness a commit is made from. Delta red-team D-F1: not where this file is installed,
 # because both the ~/.claude and the ~/.codex commit-msg hooks run on every commit, so an install-path rule made each
-# copy refuse the other harness's trailer. The committing process's own markers decide; with neither or both, or
-# only the ambiguous AI_AGENT, the check does not apply.
+# copy refuse the other harness's trailer. Legacy/history callers retain marker-only behavior.
+# Current-message entry points pass explicit runtime attribution; no ambient mode reinterprets history.
 HARNESS_OVERRIDE = None  # tests set 'claude', 'openai' or '' (unknown)
 CLAUDE_MARKERS = ("CLAUDECODE",)
 CODEX_MARKERS = ("CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "CODEX_SANDBOX")
 
 
-def commit_harness(env=None):
+@dataclass(frozen=True)
+class CommitAttribution:
+    harness: str | None
+    evidence: str
+    reason: str
+    blocked: bool = False
+
+
+def commit_harness(env=None, *, attribution=None):
+    if attribution is not None:
+        return attribution.harness
     if HARNESS_OVERRIDE is not None:
         return HARNESS_OVERRIDE or None
     env = os.environ if env is None else env
@@ -369,6 +383,32 @@ def commit_harness(env=None):
     if claude == codex:
         return None
     return "claude" if claude else "openai"
+
+
+def current_commit_attribution():
+    """Origin of this current message only; never a main, approval or human identity.
+
+    Called explicitly by current-commit entry points, not validate/history by default.
+    There is no payload, environment or CLI switch that supplies runtime evidence.
+    """
+    try:
+        origin = probe_commit_runtime_origin()
+    except Exception:
+        return CommitAttribution(None, "unknown", "runtime probe unavailable", True)
+    if not isinstance(origin, OriginObservation):
+        return CommitAttribution(None, "unknown", "runtime evidence malformed", True)
+    if origin.origin == "openai" and origin.native_lineage and origin.reason == "running_code_verified":
+        if any(os.environ.get(name) for name in CLAUDE_MARKERS) and any(os.environ.get(name) for name in CODEX_MARKERS):
+            return CommitAttribution(None, "unknown", "mixed harness markers", True)
+        return CommitAttribution("openai", "verified_runtime_origin", "running OpenAI identity")
+    if origin.origin == "claude" and origin.native_lineage is False and origin.reason == "running_claude_code_verified":
+        if any(os.environ.get(name) for name in CODEX_MARKERS):
+            return CommitAttribution(None, "unknown", "Codex marker conflicts with running Anthropic identity", True)
+        return CommitAttribution("claude", "verified_runtime_origin", "running Anthropic identity")
+    if (origin.origin != "unknown" or origin.native_lineage
+            or origin.reason not in {"unsupported_platform", "no_native_runtime"}):
+        return CommitAttribution(None, "unknown", "native runtime attribution uncertain", True)
+    return CommitAttribution(commit_harness(), "legacy_marker", "no new runtime evidence")
 
 
 def trailer_harness(line: str):
@@ -383,7 +423,7 @@ def trailer_harness(line: str):
 
 def validate(message: str, *, policy: dict, previous: str | None = None, is_merge: bool = False,
              allow_autosquash: bool = False, strip_comments: bool = False,
-             tickets_required: bool = True, ledger=None) -> list:
+             tickets_required: bool = True, ledger=None, attribution: CommitAttribution | None = None) -> list:
     """Return a list of human-readable violations (empty means compliant).
 
     tickets_required is False for repos no ticket system tracks: Refs must still
@@ -526,12 +566,14 @@ def validate(message: str, *, policy: dict, previous: str | None = None, is_merg
                                 "e.g. 'Authorized-by: Eric, GoodQA #14151'")
     if misplaced:
         problems.append("trailers: move Co-Authored-By/Signed-off-by lines to a final paragraph after a blank line")
-    harness = commit_harness()
-    if harness:
-        named = {trailer_harness(line) for line in trailers if re.match(r"(?i)\s*co-authored-by\s*:", line)} - {None}
-        if named - {harness}:
-            problems.append("trailers: Co-Authored-By names %s, but this commit is made from the %s harness; the "
-                            "author trailer is review evidence (goodqa#15253)" % (", ".join(sorted(named - {harness})), harness))
+    named = {trailer_harness(line) for line in trailers if re.match(r"(?i)\s*co-authored-by\s*:", line)} - {None}
+    if named and attribution is not None and attribution.blocked:
+        problems.append("trailers: cannot establish the current committing harness (" + attribution.reason +
+                        "); refusing uncertain native attribution")
+    harness = commit_harness(attribution=attribution)
+    if harness and named - {harness}:
+        problems.append("trailers: Co-Authored-By names %s, but this commit is made from the %s harness; the "
+                        "author trailer is review evidence (goodqa#15253)" % (", ".join(sorted(named - {harness})), harness))
     if previous is not None and normalize(previous) == text:
         problems.append("message: identical to the previous commit; describe this change specifically")
     return problems
@@ -1549,7 +1591,7 @@ def run_hook(payload: dict, policy: dict) -> tuple:
                             is_merge=bool(facts and facts["merging"]),
                             allow_autosquash=bool(facts and not facts["published"]
                                                   and facts["branch"] not in ("main", "master", "")),
-                            tickets_required=required, ledger=ledger)
+                            tickets_required=required, ledger=ledger, attribution=current_commit_attribution())
         if problems:
             subject = digest(message)
             if session_dir is not None and find_waiver("message", subject, policy, session_dir=session_dir):
@@ -1661,7 +1703,8 @@ def run_git_hook(path: str, policy: dict) -> tuple:
                         is_merge=facts["merging"],
                         allow_autosquash=not facts["published"] and facts["branch"] not in ("main", "master", ""),
                         tickets_required=ticket_context["tracked"],
-                        ledger=ledger_checker(policy, ticket_context, int(time.time() * 1000)))
+                        ledger=ledger_checker(policy, ticket_context, int(time.time() * 1000)),
+                        attribution=current_commit_attribution())
     if not problems or find_waiver("message", digest(message), policy):
         return 0, ""
     text = block_text(problems, message, policy, subject=digest(message))
@@ -2116,9 +2159,11 @@ def main(argv=None) -> int:
                 return 2
             sys.path.insert(0, str(HERE))
             problems = validate(message, policy=policy, previous=previous, tickets_required=ticket_context["tracked"],
-                                ledger=ledger_checker(policy, ticket_context, int(time.time() * 1000)))
+                                ledger=ledger_checker(policy, ticket_context, int(time.time() * 1000)),
+                                attribution=current_commit_attribution() if agent_environment() else None)
         else:
-            problems = validate(message, policy=policy, previous=previous)
+            problems = validate(message, policy=policy, previous=previous,
+                                attribution=current_commit_attribution() if agent_environment() else None)
         print(json.dumps({"status": "BLOCKED" if problems else "PASS", "problems": problems,
                           "digest": digest(message)}, indent=1))
         return 2 if problems else 0

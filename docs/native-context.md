@@ -2,8 +2,9 @@
 
 OpenAI runtime origin, a user-message candidate and authority to act as main are
 separate facts. This increment provides read-only origin diagnostics, weak native
-citations and an inert bootstrap preview. It does not enable native main-agent
-stamps, change commit attribution, authorize protected stops or install hooks.
+citations and an inert bootstrap preview. Current-message attribution wiring is
+described below. Neither capability enables native main-agent stamps, authorizes
+protected stops or installs hooks.
 Both installer copy manifests include the three modules, since `caller_identity`
 imports `native_context`. The Codex copy set also includes the existing
 `wal_note.py`, required by `ah` writes and its doctor import contract. This is
@@ -51,8 +52,10 @@ session id) so they run the current binary. A stale session shows a runtime proc
 `lsof -p <pid>` text file no longer exists.
 
 A Terminal-launched session has root-owned `/usr/bin/login` above its shell, and the kernel withholds
-its BSD info from the user. Only that exact kernel path ends the walk as a non-native chain; any other
-unreadable ancestor, and the caller itself, stay uncertain.
+its full BSD info from the user. The probe validates the structured identity of that ancestor and
+continues above it. Fallback after finding no native runtime requires matching parent process generations
+through PID 1. Missing or inconsistent evidence, any other unreadable ancestor, and an unreadable caller
+stay uncertain.
 
 ## Weak native user-message discovery
 
@@ -116,6 +119,47 @@ stdin, never a registry file or symlink. It cannot apply, enroll, activate, invo
 elevation, write a stamp or launch an operation. A digest binds candidate bytes;
 it is not an approval receipt or a source/diff authenticity claim.
 
+## Current-message attribution
+
+The current-message paths in `commit_policy.py` explicitly pass an immutable
+`CommitAttribution` to validation. A verified nearest OpenAI running identity can
+establish OpenAI harness authorship with missing markers or one stale inherited
+Claude flag. The commit-specific probe can also verify the nearest running Claude
+Code executable against its pinned Anthropic signing requirement. It accepts a
+truthful Claude claim with absent or Claude-only markers. A conflicting Codex
+marker on verified Claude or both marker families on verified OpenAI leave the
+claim unresolved. A filename, payload role, thread identifier or supplied JSON
+cannot establish verified origin.
+
+An unresolved current attribution refuses recognized harness co-author claims.
+Messages without a harness co-author claim still go through the ordinary
+message and ticket checks. The existing generic origin probe and authority
+checks use the OpenAI requirement alone.
+
+This applies to supported current commit actions in the PreToolUse path and to
+already-marked, already-scoped backstop/check-message paths. Unmarked ordinary
+human backstops and check-message calls do not gain native probing or enforcement.
+Historical ranges and PR-text validation also never infer fresh local origin.
+They retain existing legacy behavior; `commit_harness()` remains a compatible
+marker classifier unless an explicit typed attribution snapshot is supplied.
+There is no mutable ambient current/history mode, payload flag or CLI option
+that requests trusted origin.
+
+On unsupported hosts or a definitive no-native-runtime result, existing legacy
+marker compatibility remains. That weaker path is labelled `legacy_marker`,
+not verified runtime origin. Unavailable/ambiguous native evidence does not
+silently become a positive Claude label. A nearer recognized runtime barrier
+cannot be overruled by an outer OpenAI ancestor.
+
+Signed standalone owners, ordinary tool subprocesses and children can have
+truthful harness attribution while main authority remains false. No stamp,
+strong user source, human approval, session bootstrap or admission is created.
+The original affected-owner hook environment remains unobserved; source controls
+and an ordinary-process compatibility probe cannot establish that its original
+rejection is fixed. A reviewed deployment and an existing authorized owner retry
+remain necessary before making that claim. The separate native user-consent and
+session-resolution gap is not repaired by author attribution.
+
 ## Remaining activation boundary
 
 Automatic native-main admission stays disabled until a separately reviewed
@@ -135,5 +179,6 @@ hooks/plugins. Existing exact-PID, freshness, same-session and interactive-proce
 stop controls remain unchanged. Weak citations cannot satisfy those controls.
 
 The original commit-hook marker-loss diagnosis remains unverified until an
-existing affected hook is observed with metadata-only diagnostics. Do not enable
-attribution from this probe or suppress markers to work around that gap.
+existing affected hook is observed with metadata-only diagnostics. Do not infer
+that event from an ordinary-process probe, suppress markers, or expand the
+current-message wiring into privileged native admission.
