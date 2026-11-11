@@ -1876,8 +1876,17 @@ def _stamp_waive(command, payload, state_dir, now):
 def _stamp_review(command, payload, now):
     """B2: the peer_review run that may mint a merge authorization gets a one-shot stamp, only from proven main."""
     import caller_identity  # noqa: PLC0415
-    if not caller_identity.is_main(payload) or not _plain_peer_review(command):
+    if not _plain_peer_review(command):
         return
+    if not caller_identity.is_main(payload):
+        # This role is scoped to the review receipt. Generic main authority
+        # still controls waivers, protected Stop, and owner handoffs.
+        try:
+            from native_main import is_desktop_review_root  # noqa: PLC0415
+            if is_desktop_review_root(payload) is not True:
+                return
+        except Exception:
+            return
     tokens, _ = tokenize(command)
     values = {}
     for index, token in enumerate(tokens):

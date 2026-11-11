@@ -24,6 +24,7 @@ AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
 HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "usage_guard.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "node_check_reporter.mjs", "deliver.py",
          "ticket_adapters.py", "commit_policy.py", "commit_policy.json", "workdir.py",
          "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "caller_identity.py", "review_map.py",
+         "native_context.py", "native_user_source.py", "native_admission.py", "native_main.py",
          "review_diagnostics.py", "review_policy.json", "merge_gate.py",
          "heavy_job_guard.py", "dropbox_budget.conf", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py", "ops_watch.py", "resource_limits.json",
          "domain_gates.py", "domain_checklists.json",
