@@ -1837,9 +1837,9 @@ def decide(payload, runner, state_dir, now=None):
                    "--pr); run it without the GitHub binding, or ask the main agent.")
     # goodqa#15684: a missing agent_id is not proof of main (Codex hook payloads never carry one), so the waiver path
     # needs the positive proof the review stamp already needs.
-    if (STATE_GLOB.search(plain) or _waiver_attempt(command)) and (subagent or not _proven_main(payload)):
+    if (STATE_GLOB.search(plain) or _waiver_attempt(command)) and (subagent or not _may_record_waiver(payload)):
         return 2, "merge-gate: only the main agent may record a waiver; ask the main agent."
-    if WAIVE_CMD.search(command) and not subagent and _plain_waive(command) and _proven_main(payload):
+    if WAIVE_CMD.search(command) and not subagent and _plain_waive(command) and _may_record_waiver(payload):
         _stamp_waive(command, payload, state_dir, now)
     if PEER_REVIEW_AUTH.search(plain):
         _stamp_review(command, payload, now)
@@ -1863,11 +1863,17 @@ def decide(payload, runner, state_dir, now=None):
     return 0, ""
 
 
-def _proven_main(payload):
-    """Positive proof that main is calling (caller_identity.is_main); any failure to decide is not proof."""
+def _may_record_waiver(payload):
+    """Positive proof of who is calling: the main agent (caller_identity.is_main), or the current user-driven Codex
+    Desktop root session (native_main.is_desktop_review_root: its own metadata row, nearest verified runtime and signed
+    GUI parent; a spawned child, a standalone CLI and a missing or unqualified row are not roots). Any failure to
+    decide is not proof."""
     try:
         import caller_identity  # noqa: PLC0415
-        return bool(caller_identity.is_main(payload))
+        if caller_identity.is_main(payload):
+            return True
+        from native_main import is_desktop_review_root  # noqa: PLC0415
+        return is_desktop_review_root(payload) is True
     except Exception:  # noqa: BLE001 - fail closed
         return False
 
@@ -2048,7 +2054,8 @@ def main(argv=None, runner=None, stdin=None, stdout=None, stderr=None):
             approved, source = stamped, "hook"
     if not approved:
         stderr.write("merge-gate: a waiver needs main-agent approval: run it through the main agent so the hook stamps "
-                     "it, or pass --approved-by main:<agent-id>.\n")
+                     "it, or pass --approved-by main:<agent-id>. The hook stamps only ONE plain command: a ; & | < > "
+                     "backtick or $( anywhere in it, including inside --reason, means no stamp.\n")
         return 3
     try:
         record = add_waiver(state_dir, args.repo, args.pr, args.head, args.ticket, args.reason, approved, source)

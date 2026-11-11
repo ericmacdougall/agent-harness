@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_merge_gate import HEAD, SCENARIOS, Base, FakeGh, bash, mg  # noqa: E402
 
 import caller_identity  # noqa: E402
+import native_main  # noqa: E402
 
 TICKET = "GoodQA #14502"
 REASON = "approved by main after review"
@@ -26,9 +27,48 @@ PLAIN = ("python3 ~/.claude/hooks/merge_gate.py waive --repo o/r --pr 5 --head "
 
 
 class StampBinding(Base):
-    def decide_as(self, command, *, main, **extra):
-        with mock.patch.object(caller_identity, "is_main", return_value=main):
+    def decide_as(self, command, *, main, root=False, **extra):
+        """main: what caller_identity.is_main says; root: what native_main.is_desktop_review_root says."""
+        with mock.patch.object(caller_identity, "is_main", return_value=main), \
+                mock.patch.object(native_main, "is_desktop_review_root", return_value=root):
             return mg.decide(bash(command, **extra), FakeGh(SCENARIOS["green"]), self.state)
+
+    def test_a_codex_desktop_root_session_may_record_but_a_codex_child_may_not(self):
+        # The current user-driven Codex Desktop root (is_main is false for every Codex payload) works ...
+        code, text = self.decide_as(PLAIN, main=False, root=True)
+        self.assertEqual(code, 0, text)
+        self.assertEqual(len(self.stamps()), 1)
+        done, message = self.record()
+        self.assertEqual(done, 0, message)
+        self.assertIn("(hook)", message)
+
+    def test_a_codex_child_or_standalone_cli_is_refused(self):
+        code, text = self.decide_as(PLAIN, main=False, root=False)
+        self.assertEqual(code, 2, text)
+        self.assertEqual(self.stamps(), [])
+
+    def test_an_agent_id_always_wins_over_root_proof(self):
+        code, text = self.decide_as(PLAIN, main=False, root=True, agent_id="child-1")
+        self.assertEqual(code, 2, text)
+        self.assertEqual(self.stamps(), [])
+
+    def test_root_proof_must_be_exactly_true_and_errors_are_not_proof(self):
+        for value in ("yes", 1, object(), None):
+            with self.subTest(value=repr(value)[:20]):
+                code, _ = self.decide_as(PLAIN, main=False, root=value)
+                self.assertEqual(code, 2)
+                self.assertEqual(self.stamps(), [])
+        with mock.patch.object(caller_identity, "is_main", return_value=False), \
+                mock.patch.object(native_main, "is_desktop_review_root", side_effect=RuntimeError("boom")):
+            code, _ = mg.decide(bash(PLAIN), FakeGh(SCENARIOS["green"]), self.state)
+        self.assertEqual(code, 2)
+        self.assertEqual(self.stamps(), [])
+
+    def test_the_cli_error_text_documents_the_no_stamp_rule(self):
+        done, message = self.record()
+        self.assertEqual(done, 3)
+        for needle in ("--approved-by", "ONE plain command", "backtick", "--reason", "no stamp"):
+            self.assertIn(needle, message)
 
     def record(self):
         out, err = io.StringIO(), io.StringIO()
