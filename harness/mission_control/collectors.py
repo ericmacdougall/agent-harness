@@ -481,20 +481,34 @@ class SupervisedOwners(Collector):
     name = 'codex-owners'
     interval = 2.0
 
-    def __init__(self, hub, health, reader, root, *, alive=None, on_change=None):
+    def __init__(self, hub, health, reader, root, *, alive=None, on_change=None, tailer=None):
         super().__init__(hub, health)
         self.reader, self.root = reader, Path(root)
         self.alive = alive or self._alive
         self.on_change = on_change
+        self.tailer = tailer                        # WAL tailer: Owners.publish merges its items for our threads
         self.rows = []
-        self.published = None                       # the rows last handed to on_change
+        self.published = None                       # (rows, tailer fingerprint) last handed to on_change
         self.parsed: dict[str, tuple] = {}          # owner name -> (raw status bytes, parsed value)
 
+    def _wal_fingerprint(self) -> tuple:
+        """What Owners.publish reads from the tailer for the supervised threads (last item, progress and activity
+        times). A new WAL line on a supervised owner changes it even when the status file did not."""
+        threads = {row.get('thread') for row in self.rows if row.get('thread')}
+        items = getattr(self.tailer, 'last_items', None) or {}
+        return tuple(sorted((session, str(agent), str(item.get('at') or ''), str(item.get('progress_at') or ''),
+                             str(item.get('active_at') or ''))
+                            for (runtime, session, agent), item in list(items.items())
+                            if runtime == 'codex' and session in threads))
+
     def _changed(self) -> None:
-        """Tell the owners panel only when a row actually changed: a tick over unchanged status files used to
-        rebuild and push the whole owners snapshot to every page every 2 seconds."""
-        if self.on_change and self.rows != self.published:
-            self.published = [dict(row) for row in self.rows]
+        """Tell the owners panel only when a row or its WAL progress actually changed: a tick over unchanged
+        status files used to rebuild and push the whole owners snapshot to every page every 2 seconds."""
+        if not self.on_change:
+            return
+        current = ([dict(row) for row in self.rows], self._wal_fingerprint())
+        if current != self.published:
+            self.published = current
             self.on_change()
 
     @staticmethod
@@ -550,6 +564,9 @@ class SupervisedOwners(Collector):
                                            'active_at': activity, 'event': 'reply' if reply else '',
                                            'note': ev.short(reply, 200) if reply else 'No reply recorded yet'}})
             self.rows = rows
+            seen = {row['name'] for row in rows}
+            for name in [n for n in self.parsed if n not in seen]:
+                del self.parsed[name]               # an owner that is gone no longer holds its cached status
         except Exception:
             self.rows = [{**row, 'source_stale': True} for row in self.rows]
             self._changed()
@@ -841,7 +858,10 @@ class Asks(Collector):
                 continue  # settled: listed under cleared-recently with its reason, never as an open ask
             item = self.item(session, row)
             if row in pending:
-                item["unchecked"] = "Its source could not be checked this sweep: " + ev.short(str(row.get("problem", "")), 120)
+                # Listed so the user sees it, but nothing verified its source: never a signed Approve or Deny.
+                item.update(unchecked="Its source could not be checked this sweep: " + ev.short(str(row.get("problem", "")), 120),
+                            digest="", approvable=False,
+                            blocked="Its source could not be checked, so it cannot be approved or denied here. Answer with a reply.")
             if verdict["state"] == "stale":
                 view["stale"].append(dict(item, stale=verdict["reason"]))
             else:

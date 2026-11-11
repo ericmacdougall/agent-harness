@@ -340,7 +340,7 @@ class App:
         if not demo:
             owner_root = home / '.agent-harness' / 'codex-owners'
             self.supervised = col.SupervisedOwners(self.hub, self.health, Reader([owner_root]), owner_root,
-                                                   on_change=self.owners.publish)
+                                                   on_change=self.owners.publish, tailer=self.tailer)
             self.owners.supervised = self.supervised
         self.github = col.GitHub(self.hub, self.health, self.runner)
         self.tickets = col.Tickets(self.hub, self.health, self.runner, self.tracked_tickets)
@@ -546,8 +546,9 @@ class App:
             item = next((a for a in view["items"] + view["stale"] if a["id"] == ask_id), None)
             if item is None:
                 return 409, {"error": "not-open", "message": "this ask is no longer open"}
-            if not item["approvable"]:
-                return 409, {"error": "not-approvable", "message": item["blocked"]}
+            if not item["approvable"] or item.get("unchecked") or not item.get("digest"):
+                return 409, {"error": "not-approvable",
+                             "message": item.get("blocked") or "this ask cannot be decided here; answer with a reply"}
             if not isinstance(digest, str) or not hmac.compare_digest(digest.encode("utf-8", "replace"),
                                                                       item["digest"].encode()):
                 return 409, {"error": "stale-digest",

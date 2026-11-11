@@ -178,6 +178,14 @@ class StaleAndFlagged(Base):
         self.assertEqual(view["status"]["wslow0000002"]["state"], "stale")
         self.assertEqual([r["action"] for r in self.audit()], ["stale"])
 
+    def test_too_many_sources_stays_flagged_as_untraceable(self):  # r1 F1: a caller error, never "not checked"
+        blocked = [{"id": "wmany0000001", "note": "Ship it?", "owner": "main", "at": iso(NOW - 60),
+                    "problem": "too-many-sources: more than 40 sources to resolve"}]
+        view = self.sweep([], blocked=blocked)
+        self.assertEqual(view["status"]["wmany0000001"]["state"], "flagged")
+        self.assertIn("too-many-sources", view["status"]["wmany0000001"]["reason"])
+        self.assertFalse(ns.unchecked(blocked[0]))
+
 
 class Safety(Base):
     def test_it_never_writes_a_wal_or_an_answer(self):  # AC-14, NEG-25
@@ -274,8 +282,40 @@ class Collector(Base):
         asks.run(now)
         snap = asks.snapshot()
         self.assertEqual(snap["flagged"], [])
-        self.assertEqual([(a["id"], a["approvable"]) for a in snap["items"]], [("wslow0000001", True)])
+        # r1 F1: listed so the user sees it, but its source was never verified: answer by reply only
+        self.assertEqual([(a["id"], a["approvable"], a["digest"]) for a in snap["items"]], [("wslow0000001", False, "")])
         self.assertIn("could not be checked", snap["items"][0]["unchecked"])
+        self.assertIn("reply", snap["items"][0]["blocked"])
+
+    def test_unchecked_asks_are_never_approvable(self):  # r1 F1: scan-timeout and internal, active or stale
+        now = time.time()
+        payload = {"items": [], "resolved": [], "blocked": [
+            {"id": "wslow0000001", "note": "Refund policy?", "owner": "main", "at": iso(now - 60),
+             "problem": "scan-timeout: scan of session.jsonl exceeded 3s"},
+            {"id": "wint00000001", "note": "Delete bucket?", "owner": "main", "at": iso(now - 60),
+             "problem": "internal: resolver error KeyError"},
+            {"id": "wint00000002", "note": "Old one?", "owner": "main", "at": iso(now - 90 * 3600),
+             "problem": "internal: resolver error KeyError"}]}
+        asks = self.collector(payload)
+        asks.run(now)
+        snap = asks.snapshot()
+        shown = {a["id"]: a for a in snap["items"] + snap["stale"]}
+        self.assertEqual(sorted(shown), ["wint00000001", "wint00000002", "wslow0000001"])
+        for ident, row in shown.items():
+            with self.subTest(ident):
+                self.assertEqual((row["approvable"], row["digest"]), (False, ""))
+                self.assertTrue(row["blocked"])
+
+    def test_too_many_sources_is_flagged_in_the_snapshot(self):  # r1 F1
+        now = time.time()
+        payload = {"items": [], "resolved": [], "blocked": [
+            {"id": "wmany0000001", "note": "Ship it?", "owner": "main", "at": iso(now - 60),
+             "problem": "too-many-sources: more than 40 sources to resolve"}]}
+        asks = self.collector(payload)
+        asks.run(now)
+        snap = asks.snapshot()
+        self.assertEqual(snap["items"], [])
+        self.assertEqual([(a["id"], a["approvable"], a["digest"]) for a in snap["flagged"]], [("wmany0000001", False, "")])
 
     def test_ticket_shape_is_allowlisted(self):
         import safeio

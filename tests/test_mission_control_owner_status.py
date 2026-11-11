@@ -55,6 +55,39 @@ class SupervisedOwners(unittest.TestCase):
         c.run(13)
         self.assertEqual(len(seen), 3)
 
+    def test_a_wal_line_alone_republishes_within_a_cycle(self):  # r1 F2: status file unchanged, WAL moved
+        self.write()
+        seen = []
+        tailer = type('Tailer', (), {})()
+        tailer.last_items = {('codex', 'thread-a', 'main'): {'at': '2026-11-10T03:00:00Z', 'event': 'note', 'note': 'x',
+                                                             'active_at': '2026-11-10T03:00:00Z'}}
+        c = col.SupervisedOwners(self.hub, self.health, safeio.Reader([self.root]), self.root,
+                                 alive=lambda pid: pid == 123, on_change=lambda: seen.append(1))
+        c.tailer = tailer
+        c.run(1); c.run(3)
+        self.assertEqual(len(seen), 1)
+        tailer.last_items[('codex', 'thread-a', 'main')] = dict(
+            tailer.last_items[('codex', 'thread-a', 'main')], progress_at='2026-11-10T03:05:00Z')
+        c.run(5)
+        self.assertEqual(len(seen), 2, "new progress on the supervised thread publishes on the next 2 s tick")
+        tailer.last_items[('codex', 'thread-a', 'main')] = dict(
+            tailer.last_items[('codex', 'thread-a', 'main')], active_at='2026-11-10T03:06:00Z')
+        c.run(7)
+        self.assertEqual(len(seen), 3, "new activity publishes too")
+        tailer.last_items[('codex', 'thread-other', 'main')] = {'at': '2026-11-10T04:00:00Z', 'active_at': '2026-11-10T04:00:00Z'}
+        c.run(9)
+        self.assertEqual(len(seen), 3, "a WAL line on a thread nobody supervises is not a reason to publish")
+
+    def test_parsed_cache_drops_owners_that_are_gone(self):  # r1 F3
+        import shutil
+        self.write('mission-control'); gone = self.write('old-owner')
+        c = self.collector(); c.run(1)
+        self.assertEqual(set(c.parsed), {'mission-control', 'old-owner'})
+        shutil.rmtree(gone)
+        c.run(3)
+        self.assertEqual([r['name'] for r in c.rows], ['mission-control'])
+        self.assertEqual(set(c.parsed), {'mission-control'})
+
     def test_named_owner_fields_and_live_state(self):
         self.write()
         c = self.collector(); c.run(1)

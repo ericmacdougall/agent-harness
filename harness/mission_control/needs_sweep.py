@@ -44,8 +44,10 @@ SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{7,63}$")
 TICKET_TAG_RE = re.compile(r"^\s*\[ticket:([a-z][a-z0-9-]{1,30}#\d{2,7})\]")  # it must open the note
 AGENT_RE = re.compile(r"^agent-([A-Za-z0-9]{1,64})$")
 # Provenance could not finish the check (it ran out of time or hit its own error). That is "not checked this
-# sweep", never "untraceable": the ask stays an ordinary ask.
-UNCHECKED_RE = re.compile(r"^(scan-timeout|internal|too-many-sources)\b")
+# sweep", never "untraceable": the ask stays listed, but its source was never verified, so the page shows it as
+# answerable by reply only (no Approve or Deny, no digest) and /api/approve refuses it. too-many-sources is not
+# here: it is a caller error (wal_note.CALLER_ERROR_CODES), a source that can never resolve, so it stays flagged.
+UNCHECKED_RE = re.compile(r"^(scan-timeout|internal)\b")
 
 
 def unchecked(row: dict) -> bool:

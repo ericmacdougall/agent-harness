@@ -147,6 +147,23 @@ class Approve(ApproveHarness):
             self.assertEqual((status, value["error"]), (409, "not-approvable"), value)
         self.assertEqual(self.stored(), [])
 
+    def test_an_ask_whose_source_could_not_be_checked_is_refused(self):  # r1 F1
+        problems = {"wslow0000001": "scan-timeout: scan of session.jsonl exceeded 3s",
+                    "wint00000001": "internal: resolver error KeyError"}
+        blocked = [dict(item(ident, "May main push feat/%s?" % ident), problem=problem) for ident, problem in problems.items()]
+        self.app.runner.outputs["provenance-asks"] = lambda *_a: (0, json.dumps(
+            {"counts": {}, "items": [], "blocked": blocked, "resolved": []}))
+        self.app.asks.run(time.time())
+        for ident in problems:
+            with self.subTest(ident):
+                # the digest a pre-fix page would have shown: the server must refuse even a well-formed one
+                digest = mc_chat.ask_snapshot(SID, "main", ident, "May main push feat/%s?" % ident,
+                                              "it changes a shared branch")["digest"]
+                status, value = self.approve(ask=ident, digest=digest, key="unchecked-" + ident)
+                self.assertEqual((status, value.get("error")), (409, "not-approvable"), value)
+                self.assertFalse(self.shown(ident)["approvable"])
+        self.assertEqual(self.stored(), [])
+
     def test_main_not_attached_is_refused_and_nothing_is_stored(self):  # AC-8, NEG-8
         mc_chat.detach_target(SID)
         status, value = self.approve()
