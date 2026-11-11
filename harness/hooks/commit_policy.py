@@ -397,9 +397,7 @@ def current_commit_attribution():
         return CommitAttribution(None, "unknown", "runtime probe unavailable", True)
     if not isinstance(origin, OriginObservation):
         return CommitAttribution(None, "unknown", "runtime evidence malformed", True)
-    if origin.origin == "openai" and origin.native_lineage and origin.reason == "running_code_verified":
-        if any(os.environ.get(name) for name in CLAUDE_MARKERS) and any(os.environ.get(name) for name in CODEX_MARKERS):
-            return CommitAttribution(None, "unknown", "mixed harness markers", True)
+    if origin.origin == "openai" and origin.native_lineage is True and origin.reason == "running_code_verified":
         return CommitAttribution("openai", "verified_runtime_origin", "running OpenAI identity")
     if origin.origin == "claude" and origin.native_lineage is False and origin.reason == "running_claude_code_verified":
         if any(os.environ.get(name) for name in CODEX_MARKERS):

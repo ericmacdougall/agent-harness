@@ -122,14 +122,15 @@ it is not an approval receipt or a source/diff authenticity claim.
 ## Current-message attribution
 
 The current-message paths in `commit_policy.py` explicitly pass an immutable
-`CommitAttribution` to validation. A verified nearest OpenAI running identity can
-establish OpenAI harness authorship with missing markers or one stale inherited
-Claude flag. The commit-specific probe can also verify the nearest running Claude
-Code executable against its pinned Anthropic signing requirement. It accepts a
+`CommitAttribution` to validation. Verified nearest OpenAI running identity
+establishes OpenAI harness authorship for the current message regardless of
+inherited marker combinations. The positive branch requires literal boolean
+lineage evidence. A contradictory co-author trailer still fails validation.
+The commit-specific probe can also verify the nearest running Claude Code
+executable against its pinned Anthropic signing requirement. It accepts a
 truthful Claude claim with absent or Claude-only markers. A conflicting Codex
-marker on verified Claude or both marker families on verified OpenAI leave the
-claim unresolved. A filename, payload role, thread identifier or supplied JSON
-cannot establish verified origin.
+marker on verified Claude leaves the claim unresolved. A filename, payload role,
+thread identifier or supplied JSON cannot establish verified origin.
 
 An unresolved current attribution refuses recognized harness co-author claims.
 Messages without a harness co-author claim still go through the ordinary
