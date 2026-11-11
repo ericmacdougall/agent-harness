@@ -23,6 +23,8 @@ _CLAUDE_TEAM = "Q6L2SF6YDW"
 _CLAUDE_REQUIREMENT = (f'anchor apple generic and identifier "{_CLAUDE_IDENTIFIER}" '
                        f'and certificate leaf[subject.OU] = "{_CLAUDE_TEAM}"')
 NATIVE_MARKERS = ("CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "CODEX_SANDBOX")
+# Kernel short names of agent runtimes: the CLI names, or a versioned binary such as Claude's "2.1.319".
+RUNTIME_NAME = re.compile(r"claude|codex|kimi|\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.]+)?")
 MAX_INPUT = 1024 * 1024
 # Security/CSCommon.h: the running guest is unsigned or does not satisfy this
 # pinned requirement. Other verification errors remain ambiguous and fail closed.
@@ -94,6 +96,23 @@ class OriginObservation:
     role: str = "unknown"
     main_authority: bool = False
     strong_user_source: bool = False
+    failed_pid: int | None = None   # the ancestor the probe could not identify (reason says why), else None
+    failed_name: str = ""           # its short kernel name, clean text only; never a path
+
+
+FAILURE_REASONS = ("ancestor_binary_replaced", "ancestor_unreadable", "signature_refused")
+
+
+def _clean_name(value):
+    return re.sub(r"[^A-Za-z0-9._-]", "", str(value))[:32]
+
+
+class ProbeFailure(OSError):
+    """A probe failure that knows which ancestor failed and why. It still means uncertain, so it still denies."""
+
+    def __init__(self, reason, pid, name="", message=None):
+        super().__init__(message or reason)
+        self.reason, self.pid, self.name = reason, pid, _clean_name(name)
 
 
 def _valid_process(value, pid):
@@ -216,14 +235,21 @@ def _probe_origin(pid, *, backend, commit_attribution):
                 generations[current] = generation
             try:
                 process = backend.process(current)
-            except OSError:
+            except OSError as error:
                 # Full BSD info is same-user restricted. The smaller kernel APIs
                 # can bind a root login to a stable process and executable generation.
                 if current == pid or previous_node is None or previous_node.parent != current:
                     raise
-                boundary = backend.terminal_login_identity(current)
+                if isinstance(error, ProbeFailure) and error.reason != "ancestor_unreadable":
+                    raise  # a replaced binary or a refused signature is never a login boundary
+                if not hasattr(backend, "terminal_login_identity"):
+                    raise
+                try:
+                    boundary = backend.terminal_login_identity(current)
+                except OSError:
+                    raise ProbeFailure("ancestor_unreadable", current) from None
                 if not _valid_boundary(boundary, current):
-                    raise OSError("terminal boundary identity unavailable")
+                    raise ProbeFailure("ancestor_unreadable", current)
                 boundary_generation = KernelGeneration(boundary.pid, boundary.unique_id,
                     boundary.parent_unique_id, boundary.id_version,
                     boundary.original_parent_version, boundary.executable_uuid)
@@ -292,6 +318,9 @@ def _probe_origin(pid, *, backend, commit_attribution):
         if not _approved_code(codes[-1], candidate):
             return OriginObservation("unknown", True, "code_identity_unverified")
         return OriginObservation("openai", True, "running_code_verified", candidate.pid, codes[-1])
+    except ProbeFailure as failure:
+        return OriginObservation("unknown", native, failure.reason, failed_pid=failure.pid,
+                                 failed_name=failure.name)
     except (OSError, ValueError, TypeError, AttributeError, OverflowError):
         return OriginObservation("unknown", native, "probe_failed")
 
@@ -340,6 +369,8 @@ class DarwinBackend:
         self.proc.proc_pidinfo.restype = ct.c_int
         self.proc.proc_pidpath.argtypes = [ct.c_int, ct.c_void_p, ct.c_uint32]
         self.proc.proc_pidpath.restype = ct.c_int
+        self.proc.proc_listallpids.argtypes = [ct.c_void_p, ct.c_int]
+        self.proc.proc_listallpids.restype = ct.c_int
         self.cf = ct.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
         self.sec = ct.CDLL("/System/Library/Frameworks/Security.framework/Security")
         signatures = {
@@ -366,9 +397,14 @@ class DarwinBackend:
     def process(self, pid):
         info = self.BSDInfo()
         if self.proc.proc_pidinfo(pid, 3, 0, ct.byref(info), ct.sizeof(info)) != ct.sizeof(info):
-            raise OSError("kernel process identity unavailable")
+            raise ProbeFailure("ancestor_unreadable", pid, message="kernel process identity unavailable")  # another uid, or gone
         path = ct.create_string_buffer(4096)
-        if self.proc.proc_pidpath(pid, path, len(path)) <= 0 or info.start_usec >= 1000000:
+        if self.proc.proc_pidpath(pid, path, len(path)) <= 0:
+            # BSD info is readable but the kernel has no path: the runtime binary was replaced or deleted
+            # (a self-update) while this process kept running. Still uncertain; the remedy is a restart.
+            raise ProbeFailure("ancestor_binary_replaced", pid, bytes(info.comm).split(b"\x00", 1)[0].decode("utf-8", "replace"),
+                               message="kernel executable identity unavailable")
+        if info.start_usec >= 1000000:
             raise OSError("kernel executable identity unavailable")
         return ProcessIdentity(info.pid, info.ppid, info.uid, info.start_sec * 1000000 + info.start_usec,
                                path.value.decode("utf-8", "strict"))
@@ -427,6 +463,29 @@ class DarwinBackend:
             raise OSError("signing string unavailable")
         return buffer.value.decode("utf-8", "strict")
 
+    def stale_runtimes(self):
+        """Runtime processes (by kernel short name) whose binary no longer exists: readable BSD info, no path."""
+        count = self.proc.proc_listallpids(None, 0)
+        if type(count) is not int or not 0 < count < 100000:
+            return []
+        buffer = (ct.c_int * (count + 64))()
+        found = self.proc.proc_listallpids(buffer, ct.sizeof(buffer))
+        rows = []
+        for pid in list(buffer)[:found if type(found) is int and found > 0 else 0]:
+            if pid <= 1 or pid == os.getpid():
+                continue
+            info = self.BSDInfo()
+            if self.proc.proc_pidinfo(pid, 3, 0, ct.byref(info), ct.sizeof(info)) != ct.sizeof(info):
+                continue
+            name = bytes(info.comm).split(b"\x00", 1)[0].decode("utf-8", "replace")
+            if not RUNTIME_NAME.fullmatch(name):
+                continue
+            path = ct.create_string_buffer(4096)
+            if self.proc.proc_pidpath(pid, path, len(path)) > 0:
+                continue
+            rows.append({"pid": info.pid, "ppid": info.ppid, "name": _clean_name(name), "started": int(info.start_sec)})
+        return sorted(rows, key=lambda row: row["pid"])
+
     def signature(self, pid):
         return self._signature(pid, (CODE_REQUIREMENT,))
 
@@ -436,7 +495,7 @@ class DarwinBackend:
             if not value: raise OSError("Security framework allocation failed")
             owned.append(value); return value
         def check(status):
-            if status != 0: raise OSError("running code verification refused")
+            if status != 0: raise ProbeFailure("signature_refused", pid, message="running code verification refused")
         try:
             number = ct.c_int64(pid)
             pid_number = hold(self.cf.CFNumberCreate(None, 4, ct.byref(number)))
@@ -482,10 +541,27 @@ class _CommitDarwinBackend(DarwinBackend):
         return self._signature(pid, (CODE_REQUIREMENT, _CLAUDE_REQUIREMENT))
 
 
+def stale_runtime_processes(backend=None):
+    """Read-only list of runtime processes that outlived their binary (a self-update replaced it). Empty where the
+    platform has no kernel path facts. Such a process cannot be identified by the origin probe, so it is denied
+    main authority and commit attribution until restarted."""
+    try:
+        if backend is None:
+            if sys.platform != "darwin":
+                return []
+            backend = DarwinBackend()
+        return backend.stale_runtimes()
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+        return []
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=["probe"])
-    parser.parse_args()
+    parser.add_argument("operation", choices=["probe", "stale"])
+    args = parser.parse_args()
+    if args.operation == "stale":
+        print(json.dumps(stale_runtime_processes(), sort_keys=True))
+        return 0
     print(json.dumps(asdict(probe_runtime_origin()), sort_keys=True))
     return 0
 

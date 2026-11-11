@@ -63,6 +63,51 @@ class Fixtures(unittest.TestCase):
             return cp.main(["check-message", "--file", str(self.message)])
 
 
+class UncertainReasonText(Fixtures):
+    """goodqa#15646 plan A: the refusal says which process failed and what to do. It still refuses."""
+
+    def problems(self, observation, claim="claude"):
+        self.probe.return_value = observation
+        attribution = cp.current_commit_attribution()
+        self.assertTrue(attribution.blocked)
+        return [p for p in cp.validate(BODY + TRAILERS[claim], policy=POLICY, attribution=attribution)
+                if "cannot establish the current committing harness" in p]
+
+    def test_a_replaced_binary_names_the_pid_and_says_to_restart(self):
+        found = self.problems(nc.OriginObservation("unknown", False, "ancestor_binary_replaced",
+                                                   failed_pid=2990, failed_name="claude"))
+        self.assertEqual(len(found), 1)
+        for needle in ("ancestor_binary_replaced", "pid 2990", "claude", "restart"):
+            self.assertIn(needle, found[0])
+
+    def test_each_named_reason_has_its_own_remedy_and_still_refuses(self):
+        remedies = {}
+        for reason in nc.FAILURE_REASONS:
+            found = self.problems(nc.OriginObservation("unknown", False, reason, failed_pid=77, failed_name="x"))
+            self.assertIn(reason, found[0])
+            remedies[reason] = found[0].split(");")[0]
+        self.assertEqual(len(set(remedies.values())), 3)
+
+    def test_hostile_or_malformed_failure_fields_never_reach_the_text(self):
+        for pid, name in ((None, "claude"), ("12; rm -rf /", "claude"), (True, "x"), (-5, "x"), (2 ** 40, "x")):
+            with self.subTest(pid=pid):
+                found = self.problems(nc.OriginObservation("unknown", False, "ancestor_binary_replaced",
+                                                           failed_pid=pid, failed_name=name))
+                self.assertNotIn("rm -rf", found[0])
+                self.assertNotIn("pid", found[0].replace("pid is", ""))
+        found = self.problems(nc.OriginObservation("unknown", False, "ancestor_binary_replaced",
+                                                   failed_pid=5, failed_name="a/b c\n;`x`"))
+        self.assertRegex(found[0], r"pid 5 [A-Za-z0-9._-]*[)]")
+
+    def test_other_uncertain_reasons_keep_the_original_text(self):
+        found = self.problems(nc.OriginObservation("unknown", False, "probe_failed"))
+        self.assertIn("(native runtime attribution uncertain)", found[0])
+
+    def test_an_unknown_reason_with_a_pid_is_not_decorated(self):
+        found = self.problems(nc.OriginObservation("unknown", False, "process_changed", failed_pid=9, failed_name="x"))
+        self.assertNotIn("pid 9", found[0])
+
+
 class CurrentMessageAttribution(Fixtures):
     def test_uncertain_origin_only_blocks_messages_that_claim_a_harness(self):
         os.environ["CLAUDECODE"] = "fixture"
@@ -251,7 +296,7 @@ class CommitRuntimeProbe(unittest.TestCase):
                 self.assertFalse(result.strong_user_source)
                 self.assertNotIn(mock.call(30), process.call_args_list)
                 generic = nc.probe_runtime_origin(10, backend=chain)
-                self.assertEqual(generic.reason, "nearer_other_runtime" if outer else "probe_failed")
+                self.assertEqual(generic.reason, "nearer_other_runtime" if outer else "ancestor_unreadable")
                 self.assertEqual(generic.native_lineage, outer)
 
     def test_renamed_claude_and_lower_signed_codex(self):
