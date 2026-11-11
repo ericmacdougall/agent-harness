@@ -221,8 +221,9 @@ export function mountNeeds() {
       parts.when.textContent = age(ask.at, state.now);
       if (ask.at) parts.when.dateTime = ask.at;
       if (parts.text.textContent !== (ask.text || '(no text recorded)')) parts.text.textContent = ask.text || '(no text recorded)';
-      parts.why.textContent = ask.why ? `Why: ${ask.why}` : '';
-      parts.why.hidden = !ask.why;
+      const why = [ask.why ? `Why: ${ask.why}` : '', ask.unchecked || ''].filter(Boolean).join('\n');
+      parts.why.textContent = why;
+      parts.why.hidden = !why;
       renderTrail(parts.trail, trail, decision);
 
       const reply = askReplyAccess(ask, state);

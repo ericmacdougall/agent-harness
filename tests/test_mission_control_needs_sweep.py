@@ -168,6 +168,17 @@ class StaleAndFlagged(Base):
         self.assertEqual([(r["action"], r["ask_id"]) for r in self.audit()], [("flagged", "wbad00000001")])
 
 
+    def test_a_source_check_that_timed_out_is_not_called_untraceable(self):  # found live, 2026-11-11
+        blocked = [{"id": "wslow0000001", "note": "Refund policy for packs?", "owner": "main", "at": iso(NOW - 60),
+                    "problem": "scan-timeout: scan of session.jsonl exceeded 3s"},
+                   {"id": "wslow0000002", "note": "Old and slow?", "owner": "main", "at": iso(NOW - 90 * 3600),
+                    "problem": "internal: resolver error KeyError"}]
+        view = self.sweep([], blocked=blocked)
+        self.assertEqual(view["status"]["wslow0000001"]["state"], "active")
+        self.assertEqual(view["status"]["wslow0000002"]["state"], "stale")
+        self.assertEqual([r["action"] for r in self.audit()], ["stale"])
+
+
 class Safety(Base):
     def test_it_never_writes_a_wal_or_an_answer(self):  # AC-14, NEG-25
         wals = Path(self.tmp.name) / "wals" / SID
@@ -253,6 +264,18 @@ class Collector(Base):
         self.assertEqual([(a["id"], a["approvable"]) for a in snap["flagged"]], [("wbad00000001", False)])
         self.assertEqual([(c["id"], c["reason"]) for c in snap["cleared"]], [("wclosed00001", "ticket-closed")])
         self.assertIsInstance(snap["swept_at"], str)
+
+    def test_an_unchecked_ask_is_listed_as_an_ask_with_a_note(self):
+        now = time.time()
+        payload = {"items": [], "resolved": [], "blocked": [
+            {"id": "wslow0000001", "note": "Refund policy for packs?", "owner": "main", "at": iso(now - 60),
+             "problem": "scan-timeout: scan of session.jsonl exceeded 3s"}]}
+        asks = self.collector(payload)
+        asks.run(now)
+        snap = asks.snapshot()
+        self.assertEqual(snap["flagged"], [])
+        self.assertEqual([(a["id"], a["approvable"]) for a in snap["items"]], [("wslow0000001", True)])
+        self.assertIn("could not be checked", snap["items"][0]["unchecked"])
 
     def test_ticket_shape_is_allowlisted(self):
         import safeio

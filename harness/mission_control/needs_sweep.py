@@ -43,6 +43,13 @@ SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{7,63}$")
 # mistake; may I reopen it?") is never a reason to hide the ask.
 TICKET_TAG_RE = re.compile(r"^\s*\[ticket:([a-z][a-z0-9-]{1,30}#\d{2,7})\]")  # it must open the note
 AGENT_RE = re.compile(r"^agent-([A-Za-z0-9]{1,64})$")
+# Provenance could not finish the check (it ran out of time or hit its own error). That is "not checked this
+# sweep", never "untraceable": the ask stays an ordinary ask.
+UNCHECKED_RE = re.compile(r"^(scan-timeout|internal|too-many-sources)\b")
+
+
+def unchecked(row: dict) -> bool:
+    return bool(UNCHECKED_RE.match(str(row.get("problem", ""))))
 
 
 def needs_dir(root: Path) -> Path:
@@ -140,6 +147,9 @@ def _decide(data: dict, owners, ticket_status, activity: dict, cache: dict, now:
                               "evidence": "wal:" + by if ASK_RE.match(by) else "wal:ask_resolved"}
     for row in data.get("blocked") or []:
         if isinstance(row, dict) and ASK_RE.match(str(row.get("id", ""))) and row["id"] not in out:
+            if unchecked(row):
+                rows.append(row)  # judged like any open ask below
+                continue
             out[row["id"]] = {"state": "flagged", "evidence": "provenance",
                               "reason": "no traceable source: " + _clip(row.get("problem") or "source does not resolve", 160)}
     gone = _gone_owners(owners)

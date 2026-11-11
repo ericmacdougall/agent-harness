@@ -820,11 +820,16 @@ class Asks(Collector):
                                       owners=self.owners_fn() if self.owners_fn else (), ticket_status=self.ticket_status,
                                       activity=self.activity(), now=now)
             status, view["cleared"], view["swept_at"] = swept["status"], swept["cleared"], ev.iso(swept["swept_at"])
-        for row in raw:
+        import needs_sweep as _sweep  # noqa: PLC0415
+        pending = [r for r in blocked if _sweep.unchecked(r)]
+        blocked = [r for r in blocked if not _sweep.unchecked(r)]
+        for row in raw + pending:
             verdict = status.get(str(row["id"]), {"state": "active"})
             if verdict["state"] == "cleared":
                 continue  # settled: listed under cleared-recently with its reason, never as an open ask
             item = self.item(session, row)
+            if row in pending:
+                item["unchecked"] = "Its source could not be checked this sweep: " + ev.short(str(row.get("problem", "")), 120)
             if verdict["state"] == "stale":
                 view["stale"].append(dict(item, stale=verdict["reason"]))
             else:
