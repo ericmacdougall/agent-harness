@@ -67,6 +67,15 @@ class GuardError(Exception):
         self.reason, self.message, self.reference = reason, message, reference
 
 
+class PoolUnavailable(GuardError):
+    """acquire_pool refused a provider pool (reserved by an unreleased run, or cooling down). No provider was
+    launched. `holder` is the run id that holds the pool and `kind` is 'active' or 'cooldown'."""
+
+    def __init__(self, reason, message, *, holder=None, kind='active', reference=None):
+        super().__init__(reason, message, reference)
+        self.holder, self.kind = holder, kind
+
+
 def encoded(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')
 
@@ -947,10 +956,12 @@ class UsageStore:
             if state['active'] is not None and self._auto_reconcile_locked(state['active'])['reconciled']:
                 directory, state = self._pool(provider, pool)
             if state['active'] is not None:
-                raise GuardError('UNKNOWN' if state['reason'] in {'UNKNOWN', 'TIMEOUT'} else 'TRANSIENT_INFRA',
-                                 'Provider pool has an active or unreconciled owner; no provider was launched')
+                raise PoolUnavailable('UNKNOWN' if state['reason'] in {'UNKNOWN', 'TIMEOUT'} else 'TRANSIENT_INFRA',
+                                      'Provider pool has an active or unreconciled owner; no provider was launched',
+                                      holder=state['active'], kind='active')
             if state['cooldown'] and (state['reset_at'] is None or time.time() < state['reset_at']):
-                raise GuardError(state['reason'], 'Provider pool requires availability evidence or its reliable reset')
+                raise PoolUnavailable(state['reason'], 'Provider pool requires availability evidence or its reliable reset',
+                                      kind='cooldown')
             state = {**state, 'active': run_id, 'cooldown': False, 'reason': 'NONE', 'reset_at': None}
             self._pool_event(directory, state, 'RESERVED')
 

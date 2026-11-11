@@ -276,6 +276,22 @@ class EvidenceStore(StoreFixture):
         self.assertTrue(set(before) < set(after))
         self.store.acquire_pool('codex', 'fixture-pool', next_run.run_id)
 
+    def test_refused_pool_leases_name_the_holder_and_the_kind(self):
+        # goodqa#15565: peer_review needs to tell a refused lease (nothing launched) from other guard errors.
+        run = self.begin()
+        self.store.acquire_pool('codex', 'fixture-pool', run.run_id)
+        other = guard.invocation_identity(self.subject, purpose='other-model', argv=['other-model'], cwd=self.repo)
+        waiting = self.store.begin(self.subject, other, owner='fixture', label='other', timeout=10, minimum_bytes=0)
+        with self.assertRaises(guard.PoolUnavailable) as active:
+            self.store.acquire_pool('codex', 'fixture-pool', waiting.run_id)
+        self.assertIsInstance(active.exception, guard.GuardError)
+        self.assertEqual((active.exception.kind, active.exception.holder), ('active', run.run_id))
+        self.store.release_pool('codex', 'fixture-pool', run.run_id, reason='QUOTA', account_cooldown=True)
+        with self.assertRaises(guard.PoolUnavailable) as cooling:
+            self.store.acquire_pool('codex', 'fixture-pool', waiting.run_id)
+        self.assertEqual((cooling.exception.kind, cooling.exception.reason, cooling.exception.holder),
+                         ('cooldown', 'QUOTA', None))
+
     def test_parallel_processes_cannot_duplicate_one_reservation(self):
         script = ('import sys\nfrom pathlib import Path\n'
                   f'sys.path.insert(0,{str(HOOKS)!r})\nimport usage_guard as g\n'
