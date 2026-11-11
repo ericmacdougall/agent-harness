@@ -79,7 +79,7 @@ def validate(event) -> str | None:
         return "unknown schema"
     if event.get("kind") not in KINDS:
         return "unknown kind"
-    if not isinstance(event.get("id"), str) or not ID_RE.match(event["id"]):
+    if not isinstance(event.get("id"), str) or not ID_RE.fullmatch(event["id"]):
         return "bad id"
     if not isinstance(event.get("ts"), str) or not TS_RE.match(event["ts"]):
         return "bad ts"
@@ -94,14 +94,20 @@ def validate(event) -> str | None:
     count = event.get("count", 1)
     if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= 10**9:
         return "bad count"
+    if "historic" in event and not isinstance(event["historic"], bool):
+        return "bad historic"
     return None
 
 
 def normalize_external(event: dict, source: str) -> dict:
     """Re-build a validated external event through make(): re-redacted, fields re-sanitized, source pinned."""
-    return make(event["kind"], source, event.get("summary", ""), eid=event["id"], ts=parse_ts(event["ts"]),
+    normalized = make(event["kind"], source, event.get("summary", ""), eid=event["id"], ts=parse_ts(event["ts"]),
                 actor=event.get("actor"), subject=event.get("subject"), severity=event.get("severity", "info"),
-                count=event.get("count", 1))
+                count=event.get("count", 1), historic=event.get("historic") is True)
+    # Valid external IDs allow 200 characters; the generic word sanitizer caps display fields at160.
+    # Preserve the validated identity instead of collapsing different producer IDs to one prefix.
+    normalized["id"] = event["id"]
+    return normalized
 
 
 class Client:

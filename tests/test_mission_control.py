@@ -583,6 +583,33 @@ class CodexResponderTests(Tmp):
         self.assertLess(time.time() - started, 15)
         self.assertEqual(mc_chat.state(record["id"])["status"], "failed")
 
+    def test_named_owner_message_is_not_claimed_or_marked_unavailable(self):
+        record = self.send()
+        owner = {"harness": "openai", "name": "mission-control",
+                 "generation": "12345678-1234-4234-8234-123456789abc"}
+        named = mc_chat.sign(dict(record, owner=owner), mc_chat.secret())
+        mc_chat.write_json(mc_chat.chat_dir() / "inbox" / (record["id"] + ".json"), named)
+        for available in ((False, "generic disabled"), (True, "ready")):
+            with self.subTest(available=available):
+                with mock.patch.object(self.responder, "availability", return_value=available):
+                    self.responder.step()
+                self.assertEqual(mc_chat.state(record["id"])["status"], "queued")
+        self.assertFalse((self.bindir / "argv.json").exists())
+
+    def test_observer_cannot_advance_responder_scan(self):
+        owner = {"harness": "openai", "name": "another-owner",
+                 "generation": "12345678-1234-4234-8234-123456789abc"}
+        for i in range(2):
+            mc_chat.new_message("codex", "ordinary work", client_key="backlog-owner-" + str(i), owner=owner, ts=100 + i)
+        target, _ = mc_chat.new_message("codex", "ordinary work", client_key="generic-target-key", ts=102)
+        mc_chat.new_message("codex", "ordinary work", client_key="backlog-owner-end", owner=owner, ts=103)
+        with mock.patch.object(mc_chat, "QUEUE_SCAN_MAX", 2):
+            with mock.patch.object(self.responder, "availability", return_value=(True, "ready")):
+                for _ in range(4):
+                    self.responder.step()
+                    mc_chat.pending("codex", root=self.root)  # observer never claims a record
+        self.assertEqual(mc_chat.state(target["id"])["status"], "answered")
+
     def test_unavailable_when_not_subscription_or_blocked(self):
         for runner, words in ((FakeRunner({"codex-login-status": (0, "Logged in using an API key")}), "subscription"),
                               (FakeRunner({"codex-login-status": (0, "Logged in using ChatGPT"),
@@ -645,6 +672,16 @@ class ServerHarness(Tmp):
 
 
 class Security(ServerHarness):
+    def test_named_recipient_is_refused_until_bridge_is_ready(self):
+        cookie, csrf = self.login()
+        mc_chat.register_target("sess-1", os.getpid())
+        body = {"to": "claude", "session": "sess-1", "text": "talk to owner", "client_key": "owner-post-key",
+                "owner": {"harness": "claude", "agent_id": "owner-agent-1", "main_session": "sess-1"}}
+        resp, data = self.post(cookie, csrf, body)
+        self.assertEqual(resp.status, 409)
+        self.assertEqual(json.loads(data)["error"], "owner-route-unavailable")
+        self.assertEqual(mc_chat.inbox(), [])
+
     def test_launch_code_is_single_use_and_expires(self):
         code = mcs.mint_code(mc_chat.secret())
         first, _ = self.request("GET", "/launch?c=" + code)

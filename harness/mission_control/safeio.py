@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
+import selectors
 import shutil
 import stat
 import subprocess
+import time
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -73,9 +76,13 @@ class Runner:
                       "head -c 65536")
             return [self.ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-a", "-x", "-T",
                     self.remote_host, script]
-        if kind == "fabric-export" and len(args) == 1 and self.fabric_bin and CURSOR_RE.match(str(args[0])):
+        if (kind == "fabric-export" and len(args) == 1 and self.fabric_bin
+                and isinstance(args[0], str) and CURSOR_RE.fullmatch(args[0])):
+            command = shlex.quote(str(self.fabric_bin)) + " control export"
+            if args[0]:
+                command += " --since " + shlex.quote(args[0])
             return [self.ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-a", "-x", "-T", self.remote_host,
-                    f"{self.fabric_bin} control export --since {args[0] or '0'}"]
+                    command]
         if kind == "codex-login-status" and not args and self.codex:
             return [self.codex, "login", "status"]
         if kind == "codex-pool-status" and not args:
@@ -85,6 +92,8 @@ class Runner:
     def run(self, kind: str, *args, timeout: float = 20.0, limit: int = 4 * 1024 * 1024) -> tuple[int, str]:
         argv = self.argv(kind, *args)
         try:
+            if kind == "fabric-export":
+                return self._bounded_export(argv, timeout, limit)
             proc = subprocess.run(argv, capture_output=True, timeout=timeout, env=scrubbed_env(),
                                   stdin=subprocess.DEVNULL, cwd="/")
         except subprocess.TimeoutExpired:
@@ -92,6 +101,51 @@ class Runner:
         except OSError as exc:
             return 127, str(exc)[:200]
         return proc.returncode, proc.stdout[:limit].decode("utf-8", "replace")
+
+    def _bounded_export(self, argv: list[str], timeout: float, limit: int) -> tuple[int, str]:
+        """Read at most limit+1 bytes, refusing overflow rather than turning truncation into a valid batch."""
+        if type(limit) is not int or not 0 <= limit <= 1024 * 1024:
+            raise Refused("invalid Fabric output limit")
+        deadline = time.monotonic() + timeout
+        selector = selectors.DefaultSelector()
+        try:
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    stdin=subprocess.DEVNULL, cwd="/", env=scrubbed_env())
+        except BaseException:
+            selector.close()
+            raise
+        try:
+            os.set_blocking(proc.stdout.fileno(), False)
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            output = bytearray()
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    return 124, ""
+                try:
+                    chunk = os.read(proc.stdout.fileno(), min(65536, limit + 1 - len(output)))
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) > limit:
+                    return 65, ""
+            try:
+                code = proc.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                return 124, ""
+            return code, output.decode("utf-8", "replace")
+        finally:
+            selector.close()
+            # This is only the read-only export subprocess created above, never an owner or process group.
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            proc.wait()
+            proc.stdout.close()
 
 
 def credential_path(path: Path) -> bool:

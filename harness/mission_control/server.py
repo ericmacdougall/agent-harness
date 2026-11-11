@@ -145,7 +145,11 @@ class Auth:
         return _b64(hmac.new(self.key_loader(), b"mc-csrf|" + sid.encode("utf-8", "replace"), hashlib.sha256).digest())
 
     def _key_id(self) -> str:
-        return hmac.new(self.key_loader(), b"mc-session-store", hashlib.sha256).hexdigest()[:16]
+        return self._key_generation(self.key_loader())
+
+    @staticmethod
+    def _key_generation(key: bytes) -> str:
+        return hmac.new(key, b"mc-session-store", hashlib.sha256).hexdigest()[:16]
 
     def _load(self) -> None:
         if self.store is None:
@@ -196,13 +200,22 @@ class Auth:
         There is deliberately no failure lockout: the 128-bit MAC cannot be guessed, and behind a Funnel every client
         shares 127.0.0.1, so a shared lockout would only let one client's junk block another's genuine code."""
         now = time.time() if now is None else now
-        payload = self._signed_payload(code)
-        if payload is None:
-            return None
         with self.lock:
-            return self._redeem_locked(payload, now)
+            if not self._key_check_locked():
+                return None
+            try:
+                key = self.key_loader()
+                generation = self._key_generation(key)
+            except Exception:  # noqa: BLE001 - unavailable key is a clean sign-out
+                return None
+            if generation != self.key:
+                return None
+            payload = self._signed_payload(code, key)
+            if payload is None:
+                return None
+            return self._redeem_locked(payload, now, generation)
 
-    def _signed_payload(self, code):
+    def _signed_payload(self, code, key):
         try:
             left, right = str(code).split(".", 1)
             payload, mac = _unb64(left), _unb64(right)
@@ -210,19 +223,19 @@ class Auth:
             return None
         if len(payload) != 24 or len(mac) != 16:
             return None
-        expected = hmac.new(self.key_loader(), b"mc-launch|" + payload, hashlib.sha256).digest()[:16]
+        expected = hmac.new(key, b"mc-launch|" + payload, hashlib.sha256).digest()[:16]
         return payload if hmac.compare_digest(expected, mac) else None
 
-    def _redeem_locked(self, payload, now):
+    def _redeem_locked(self, payload, now, generation):
         minted = int.from_bytes(payload[:8], "big")
         if not -5 <= now - minted <= LAUNCH_TTL_S:
             return None
         self.used = {k: t for k, t in self.used.items() if now - t < 2 * LAUNCH_TTL_S}
         if payload in self.used:
             return None
-        self.used[payload] = now
-        if not self._key_check_locked():
+        if not self._key_check_locked() or self.key != generation:
             return None
+        self.used[payload] = now
         if len(self.sessions) >= MAX_SESSIONS:
             oldest = min(self.sessions, key=lambda s: self.sessions[s]["last"])
             self.sessions.pop(oldest, None)
@@ -231,7 +244,7 @@ class Auth:
         self._save_locked()
         return sid
 
-    def session(self, cookie_header: str | None, now: float | None = None):
+    def session(self, cookie_header: str | None, now: float | None = None, *, touch: bool = True):
         now = time.time() if now is None else now
         sid = None
         for part in (cookie_header or "").split(";"):
@@ -249,14 +262,15 @@ class Auth:
                 if self.sessions.pop(key, None) is not None:
                     self._save_locked()
                 return None, None
-            info["last"] = now
-            if now - info.get("saved", 0) >= TOUCH_PERSIST_S:
-                self._save_locked()
+            if touch:
+                info["last"] = now
+                if now - info.get("saved", 0) >= TOUCH_PERSIST_S:
+                    self._save_locked()
         try:
             csrf = self._csrf(sid)
         except Exception:  # noqa: BLE001 - the secret vanished mid-request
             return None, None
-        return sid, {"csrf": csrf, "created": info["created"], "last": now}
+        return sid, {"csrf": csrf, "created": info["created"], "last": info["last"]}
 
     def revoke_all(self) -> None:
         with self.lock:
@@ -435,6 +449,9 @@ class App:
         if not isinstance(body, dict):
             return 400, {"error": "bad-json"}
         to = body.get("to")
+        if body.get("owner") is not None:
+            return 409, {"error": "owner-route-unavailable",
+                         "message": "Named-owner delivery requires the supervisor bridge upgrade"}
         if to == "codex":
             ok, reason = self.codex.availability()
             if not ok:
@@ -548,7 +565,7 @@ class Handler(BaseHTTPRequestHandler):
             state["csrf"] = info["csrf"]
             return self.send_json(200, state)
         if url.path == "/api/events":
-            return self.stream(info)
+            return self.stream(sid)
         return self.static(url.path)
 
     def do_POST(self):
@@ -606,7 +623,17 @@ class Handler(BaseHTTPRequestHandler):
         ctype = CONTENT_TYPES.get(Path(rel).suffix, "application/octet-stream")
         return self.send_secure(200, real.read_bytes(), ctype)
 
-    def stream(self, info) -> None:
+    def stream(self, sid) -> None:
+        def authorized():
+            try:
+                current, _ = self.app.auth.session("mc_sid=" + sid, touch=False)
+                return current is not None and hmac.compare_digest(current, sid)
+            except Exception:  # noqa: BLE001 - no stream output on uncertain authentication
+                return False
+
+        if not authorized():
+            self.close_connection = True
+            return self.deny(401, "session")
         client = self.app.hub.attach()
         if client is None:
             return self.deny(503, "too-many-streams")
@@ -624,15 +651,24 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.wfile.write(b"retry: 3000\n\n")
             for event in self.app.hub.recent(after=last, limit=100) if last else []:
+                if not authorized():
+                    self.close_connection = True
+                    return
                 self.wfile.write(self.app.hub.frame(0, "event", event))
             self.wfile.flush()
             while not self.app.stop.is_set():
                 frames = client.take(SSE_HEARTBEAT_S)
                 if frames is None:
                     break  # dropped as a slow client
+                if not authorized():
+                    self.close_connection = True
+                    break
                 if not frames:
                     self.wfile.write(b": keepalive\n\n")
                 for frame in frames:
+                    if not authorized():
+                        self.close_connection = True
+                        return
                     self.wfile.write(frame)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):

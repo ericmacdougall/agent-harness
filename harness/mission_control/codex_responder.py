@@ -107,7 +107,7 @@ class CodexResponder:
 
     def step(self) -> None:
         ok, reason = self.availability()  # cached for AVAIL_TTL_S, so the dock always shows a current reason
-        queued = mc_chat.pending("codex", root=self.root)
+        queued = mc_chat.pending("codex", root=self.root, consumer="codex-responder")
         if not queued:
             return
         record = queued[0]

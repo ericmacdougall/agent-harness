@@ -220,3 +220,23 @@ thread associated with a named supervisor is not duplicated.
 This read-side integration does not enable direct messages to named owners. The existing
 chat channels keep their existing routing until the generation-bound, durable inbox and
 reply-correlation integration is installed and tested.
+
+The chat store's named-recipient contract signs an OpenAI owner's name and immutable
+generation, or a Claude owner's agent ID and exact registered main session. Client-key
+retries cannot change that recipient. Named OpenAI messages are excluded from generic
+pending, unread, read and reply paths; only the exact generation can claim them. Their
+frame retains the dashboard authority limits and asks for an ordinary returned answer,
+which a completed-turn bridge must correlate before publication. Claude frames identify
+the owner and route via main, retaining the existing reply command. Until the supervisor
+bridge is ready, HTTP requests carrying a named owner fail with `owner-route-unavailable`
+rather than silently sending through a generic channel.
+
+Queue and unread scans keep a durable read cursor per recipient route, operation and
+logical consumer. Delivery workers pass stable consumer names; observers use a separate
+default scope, so observation cannot advance a worker's traversal. Each poll examines
+at most 2,000 markers and loads at most 500 candidate records, then resumes circularly on
+the next poll. A backlog for one stopped owner therefore cannot permanently hide another
+route's messages. Cursors do not authorize delivery or change message state; signatures,
+exact recipient matching and atomic claims remain required. Results and unread counts
+are bounded pages rather than an unbounded inventory; an empty page does not prove the
+whole queue is empty. Polling workers retain their progress across restarts.

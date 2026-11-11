@@ -310,7 +310,7 @@ class DemoLoop:
 
     def echo(self, now: float) -> None:
         for session in (DEMO_SESSION, DESKTOP_SESSION):
-            for record in mc_chat.pending("claude", session, root=self.root):
+            for record in mc_chat.pending("claude", session, root=self.root, consumer="demo-responder"):
                 first = self.seen.setdefault(record["id"], now)
                 if now - first >= ECHO_AFTER_S and mc_chat.claim(record["id"], root=self.root):
                     mc_chat.write_reply(record["id"], "claude", ECHO_TEXT, root=self.root)

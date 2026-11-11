@@ -57,9 +57,11 @@ export function owners(rows, items = []) {
     const at = validIso(last?.at) || null;
     const active = [validIso(last?.active_at), at, validIso(r.last_activity)].filter(Boolean).sort().pop() || null;
     return {
-      agent_id: id, name: str(r.name, 64) || (r.runtime === 'codex' ? `codex ${shortId(id)}` : shortId(id)), runtime: r.runtime === 'codex' ? 'codex' : 'claude',
-      harness: r.runtime === 'codex' ? 'openai' : 'claude', model: str(r.model, 80), stream: str(r.stream, 160),
+      agent_id: id, name: str(r.name, 64) || (r.runtime === 'codex' ? `codex ${shortId(id)}` : shortId(id)), runtime: ['codex', 'claude'].includes(r.runtime) ? r.runtime : 'unknown',
+      harness: r.runtime === 'codex' ? 'openai' : r.runtime === 'claude' ? 'claude' : 'unknown', model: str(r.model, 80), stream: str(r.stream, 160),
       last_reply: str(r.last_reply, 2000), source_stale: r.source_stale === true,
+      observed_at: validIso(str(r.observed_at).replace(' UTC', 'Z').replace(' ', 'T')),
+      native_status: str(r.native_status?.type, 40),
       type: str(r.type, 40), task: str(r.task, 200) || (r.runtime === 'codex' ? 'Codex session' : 'Owner'), ticket: str(r.ticket, 60),
       state: str(r.state, 24) || 'unknown', ...ownerHold(r, last),
       last_item: { at, active, event: str(last?.event, 40), note: str(last?.note, 200) || 'No work item recorded yet' },

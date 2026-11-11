@@ -96,7 +96,7 @@ function renderInspector(state) {
     const owner = state.owners.find(entry => entry.agent_id === id); if (!owner) return select(null);
     title.textContent = owner.name;
     content.append(title, el('span', `state-badge ${stateClass(owner.state)}`, owner.state), el('p', 'detail-intro', owner.task));
-    fields.append(field('Agent id', owner.agent_id), field('Harness', owner.harness === 'openai' ? 'OpenAI / Codex' : 'Claude'),
+    fields.append(field('Agent id', owner.agent_id), field('Harness', owner.harness === 'openai' ? 'OpenAI / Codex' : owner.harness === 'claude' ? 'Claude' : 'Unknown · source not verified'),
       field('Model', owner.model || 'Not recorded by the owner source'), field('Stream', owner.stream || owner.task),
       field('Source', owner.source_stale ? 'Stale · showing last known status' : 'Current snapshot'),
       field('Role', owner.type || '—'), field('Ticket', owner.ticket || '—'),
@@ -109,6 +109,13 @@ function renderInspector(state) {
     if (owner.waitNote) fields.append(field('Agent says', owner.waitNote));
     content.append(fields);
     if (owner.initiative_id) content.append(button('detail-action', 'Open linked initiative ↗', () => select('initiative', owner.initiative_id)));
+    content.append(el('p', 'detail-intro', 'Owner controls unavailable: no verified native command route is connected. The Chat panel uses only its displayed destination.'));
+    for (const label of ['Talk to this owner', 'Pause / resume', 'Reassign owner', 'Change model / machine', 'Change owner slots']) {
+      const unavailable = button('detail-action', `${label} · unavailable`, () => {});
+      unavailable.disabled = true;
+      unavailable.title = 'This control has no verified backend and cannot submit an action.';
+      content.append(unavailable);
+    }
   } else if (kind === 'event') {
     const event = [...state.events, ...state.feedSnapshot].find(entry => entry.id === id); if (!event) return select(null);
     title.textContent = `${KINDS[event.kind].icon} ${KINDS[event.kind].label}`;

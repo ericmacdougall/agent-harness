@@ -47,6 +47,8 @@ def _session(value: str) -> str:
 def deliver(record: dict) -> str:
     """The framed message. Its state moves from queued to delivered only through the atomic claim, so a reread
     never reopens an answered message and two readers never both take a queued one."""
+    if mc_chat.supervised(record):
+        raise mc_chat.ChatError("owner-route-required", "named OpenAI messages are delivered by their supervisor bridge")
     mc_chat.claim(record["id"])
     return mc_chat.frame(record)
 
@@ -74,7 +76,7 @@ def cmd_wait(args) -> int:
             if now - last_beat >= HEARTBEAT_S:
                 mc_chat.register_target(session, os.getpid(), waiting=True)
                 last_beat = now
-            rows, others = mc_chat.unread("claude", session)
+            rows, others = mc_chat.unread("claude", session, consumer="claude-waiter")
             # One waiter wins each queued message. A waiter that loses the claim never prints that text (the winner
             # did); a message another waiter had already claimed before this scan is re-shown, since it is unread.
             claimed = {r["record"]["id"] for r in rows if r["status"] == "queued" and mc_chat.claim(r["record"]["id"])}
@@ -118,7 +120,11 @@ def cmd_read(args) -> int:
         print("mc_inbox: FORGED: that record was not written by the Mission Control server; not delivered",
               file=sys.stderr)
         return 2
-    print(deliver(record))
+    try:
+        print(deliver(record))
+    except mc_chat.ChatError as exc:
+        print(f"mc_inbox: refused ({exc.code}): {exc}", file=sys.stderr)
+        return 2
     return 0
 
 

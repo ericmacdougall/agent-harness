@@ -4,14 +4,17 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import fcntl
 import os
 import re
+import secrets
 import stat
 import time
 from pathlib import Path
 
 import events as ev
-from safeio import Refused, TICKET_RE
+from safeio import CURSOR_RE, Refused, TICKET_RE
 
 TOOL_EVENTS = ("pretool", "posttool", "PreToolUse", "PostToolUse")
 LIFECYCLE_EVENTS = ("subagent", "subagent_stop", "SubagentStart", "SubagentStop", "prompt", "UserPromptSubmit", "session",
@@ -71,21 +74,26 @@ class Health:
 
 
 class _Tail:
-    __slots__ = ("ino", "offset", "partial", "runtime", "session", "agent", "size", "dropped", "skipping")
+    __slots__ = ("ino", "offset", "partial", "runtime", "session", "agent", "size", "dropped", "skipping", "line_offsets", "source", "generation")
 
     def __init__(self, ino, offset, runtime, session, agent):
         self.ino, self.offset, self.partial = ino, offset, b""
         self.dropped, self.skipping = 0, False
         self.runtime, self.session, self.agent, self.size = runtime, session, agent, offset
+        self.line_offsets, self.source, self.generation = [], "", 0
 
 
 def split_lines(state: _Tail, data: bytes, max_line: int = 64 * 1024) -> list[bytes]:
     """Complete lines from state.partial + data; a partial tail is kept (bounded) until its newline."""
+    position = state.offset - len(data) - len(state.partial)
+    state.line_offsets = []
     buf = state.partial + data
     lines = buf.split(b"\n")
     state.partial = lines.pop()
     out = []
     for n, line in enumerate(lines):
+        start = position
+        position += len(line) + 1
         if state.skipping and n == 0:
             state.skipping = False  # the tail of an over-long line already counted as dropped
             continue
@@ -93,6 +101,7 @@ def split_lines(state: _Tail, data: bytes, max_line: int = 64 * 1024) -> list[by
             state.dropped += 1
         elif line.strip():
             out.append(line)
+            state.line_offsets.append(start)
     if len(state.partial) > max_line:
         state.partial = b""  # an over-long line is dropped, not buffered without bound
         if not state.skipping:
@@ -146,6 +155,7 @@ class WalTailer(Collector):
                         continue
                     agent = "main" if item.name == "main.jsonl" else re.sub(r"^agent-", "", item.name[:-6])
                     tail = _Tail(info.st_ino, info.st_size if initial else 0, runtime, entry.name, agent)
+                    tail.source = hashlib.sha256(os.fsencode(item.path) + str(info.st_dev).encode()).hexdigest()[:16]
                     self.files[item.path] = tail
                     if initial:
                         self._seed_last(item.path, tail, info)
@@ -216,6 +226,7 @@ class WalTailer(Collector):
                 continue
             if info.st_ino != tail.ino or info.st_size < tail.offset:  # replaced or truncated: start over
                 tail.ino, tail.offset, tail.partial = info.st_ino, 0, b""
+                tail.generation += 1
             if info.st_size == tail.offset:
                 continue
             try:
@@ -238,7 +249,7 @@ class WalTailer(Collector):
         tools = 0
         sent = skipped = 0
         last_tool = None
-        for raw in lines:
+        for index, raw in enumerate(lines):
             entry = _json(raw)
             if not entry:
                 continue
@@ -254,13 +265,14 @@ class WalTailer(Collector):
             if sent >= budget:
                 skipped += 1
                 continue
-            sent += self._emit(tail, entry, kind)
+            offset = tail.line_offsets[index] if index < len(tail.line_offsets) else tail.offset + index
+            sent += self._emit(tail, entry, kind, offset)
         if tools:
             if sent < budget:
                 tool = str((last_tool or {}).get("tool", "tool"))[:40]
                 self.hub.publish(ev.make("wal", f"{tail.runtime}-wal",
                                          f"{tools} tool call{'s' if tools > 1 else ''} · last {tool}",
-                                         eid=f"wal:{tail.session}:{tail.agent}:{tail.offset}:t", count=tools,
+                                         eid=f"wal:{tail.runtime}:{tail.session}:{tail.agent}:{tail.source}:{tail.ino}:{tail.generation}:{tail.offset}:t", count=tools,
                                          actor=self._actor(tail), quiet=True))
                 sent += 1
             else:
@@ -270,19 +282,20 @@ class WalTailer(Collector):
     def _actor(self, tail: _Tail) -> dict:
         return {"runtime": tail.runtime, "session": tail.session, "agent": tail.agent}
 
-    def _emit(self, tail: _Tail, entry: dict, kind: str) -> int:
+    def _emit(self, tail: _Tail, entry: dict, kind: str, offset=None) -> int:
         note = _note(entry)
         actor = self._actor(tail)
         subject = {"ticket": _ticket_in(note)}
         meaningful = _meaningful(entry)
         summary = f"{kind}: {note}" if meaningful else _lifecycle_summary(entry, kind, note)
+        location = f"{tail.runtime}:{tail.session}:{tail.agent}:{tail.source}:{tail.ino}:{tail.generation}:{tail.offset if offset is None else offset}"
         self.hub.publish(ev.make("wal", f"{tail.runtime}-wal", summary,
-                                 eid=f"wal:{tail.session}:{tail.agent}:{tail.offset}:{str(entry.get('id', ''))[:20]}",
+                                 eid="wal:" + hashlib.sha256(location.encode()).hexdigest(),
                                  actor=actor, subject=subject, quiet=not meaningful,
                                  severity="warn" if kind in ("blocker", "risk", "incident") else "info"))
         if DEPLOY_RE.search(note) or kind in ("deploy", "deployed"):
             self.hub.publish(ev.make("deploy", f"{tail.runtime}-wal", note or kind, actor=actor, subject=subject,
-                                     eid=f"deploy:{tail.session}:{tail.agent}:{tail.offset}"))
+                                     eid="deploy:" + hashlib.sha256(location.encode()).hexdigest()))
             return 2
         return 1
 
@@ -529,6 +542,8 @@ class Owners(Collector):
         self.session = ""
         self.claude_rows = []
         self.supervised = None
+        self.native_projects = {}
+        self.native_observation = {}
 
     def publish(self):
         managed = []
@@ -550,7 +565,19 @@ class Owners(Collector):
             managed.append(row)
         threads = {r.get('thread') for r in managed if r.get('thread')}
         wals = [r for r in self.codex_rows(time.time()) if r['agent_id'] not in threads]
-        self.rows = self.claude_rows + managed + wals
+        combined = {}
+        for row in self.claude_rows + wals + managed:
+            row = dict(row)
+            thread = row.get('thread')
+            key = (row.get('runtime'), thread, row.get('agent', 'main')) if thread else (row.get('runtime'), row['agent_id'])
+            previous = combined.get(key, {})
+            merged = {**previous, **row}
+            for field in ('name', 'model', 'stream', 'ticket'):
+                merged[field] = row.get(field) or previous.get(field, '')
+            combined[key] = merged
+        aliases = {'codex-' + r.get('name', '') for r in managed}
+        self.rows = [r for r in combined.values() if not (r.get('runtime') == 'codex' and
+                     r.get('agent_id') in aliases and not r.get('thread'))]
         self.hub.snapshot('owners', self.rows)
 
     def tick(self, now: float):
@@ -581,21 +608,30 @@ class Owners(Collector):
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", agent):
                 continue  # a malformed id is dropped, never rewritten into a different-looking one
             ticket = str(row.get("ticket") or "")
-            item = {"agent_id": agent, "runtime": "claude", "type": str(row.get("type") or "")[:40],
-                    "harness": "claude", "model": ev.short(row.get("model"), 80),
+            explicit = ('codex' if row.get('runtime') == 'codex' or row.get('harness') == 'openai' or agent.startswith('codex-')
+                        else 'claude' if row.get('runtime') == 'claude' or row.get('harness') == 'claude' else None)
+            worker = str(row.get('agent') or row.get('worker_id') or agent)
+            matches = [(runtime, session, w) for runtime, session, w in self.tailer.last_items
+                       if w == worker and (not explicit or runtime == explicit)
+                       and (not (row.get('thread') or row.get('thread_id')) or session == (row.get('thread') or row.get('thread_id')))] if self.tailer else []
+            runtime = explicit or (matches[0][0] if len(matches) == 1 else 'claude' if re.fullmatch(r'a[0-9a-f]{16}', agent) else 'unknown')
+            thread = str(row.get('thread') or row.get('thread_id') or (matches[0][1] if len(matches) == 1 else ''))
+            item = {"agent_id": agent, "runtime": runtime, "type": str(row.get("type") or "")[:40],
+                    "harness": 'openai' if runtime == 'codex' else runtime, 'thread': thread, 'agent': worker,
+                    "model": ev.short(row.get("model"), 80),
                     "stream": ev.short(row.get("stream") or row.get("task"), 160),
                     "last_reply": ev.short(row.get("last_reply"), 2000),
                     "task": ev.short(row.get("task") or "", 160), "ticket": ticket if TICKET_RE.match(ticket) else "",
                     "state": state[:24], "severity": str(row.get("severity") or "info")[:8],
                     "last_activity": str(row.get("last_activity") or "")[:40], "idle_s": idle,
-                    "last_item": self.tailer.last_for("claude", self.session, agent) if self.tailer else None,
+                    "last_item": self.tailer.last_for(runtime, thread or self.session, worker) if self.tailer else None,
                     "disposition": _disposition(row.get("disposition"))}
             rows.append(item)
             previous = self.states.get(agent)
             if previous and previous != state:
                 self.hub.publish(ev.make("owner", "ah-owners", f"{agent} {previous} → {state}",
                                          eid=f"owner:{agent}:{state}:{int(now)}",
-                                         actor={"runtime": "claude", "session": self.session, "agent": agent},
+                                         actor={"runtime": runtime, "session": thread or self.session, "agent": agent},
                                          subject={"ticket": item["ticket"]},
                                          severity="high" if state.startswith(("DROPPED", "SILENT")) else "info"))
             self.states[agent] = state
@@ -608,14 +644,84 @@ class Owners(Collector):
         rows = []
         if not self.tailer:
             return rows
+        projects = dict(self.native_projects)
+        registry_stale = False
+        config = Path(os.environ.get('MC_HOME') or Path.home() / '.agent-harness/mission-control') / 'projects.json'
+        try:
+            fd = os.open(config, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'rb') as handle:
+                if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    raise ValueError('projects source is not regular')
+                data = handle.read(65537)
+            if len(data) > 65536:
+                raise ValueError('projects source exceeds budget')
+            value = json.loads(data)
+            if not isinstance(value, dict) or not isinstance(value.get('projects'), list) or len(value['projects']) > 32:
+                raise ValueError('invalid project registry')
+            fresh = {}
+            for item in value['projects']:
+                if not isinstance(item, dict) or not re.fullmatch(r'[A-Za-z0-9-]{8,64}', str(item.get('thread_id', ''))):
+                    raise ValueError('invalid project identity')
+                fresh[item['thread_id']] = item
+            self.native_projects = projects = fresh
+            self.native_observation = {k: value.get(k) for k in ('schema', 'ttl_seconds', 'observed_at_utc')}
+            self.health.ok('native-projects', f'{len(projects)} registered projects')
+        except FileNotFoundError:
+            registry_stale = bool(projects)
+            self.health.off('native-projects', 'Project registry missing; cached names are stale' if projects else 'Project registry not configured')
+        except (OSError, ValueError, TypeError, AttributeError):
+            registry_stale = True
+            self.health.error('native-projects', 'Native project registry unavailable; WAL streams remain visible')
+        observed = set()
+        metadata = self.native_observation
+        observed_at = metadata.get('observed_at_utc')
+        # Root's native format uses a UTC suffix; never reinterpret this as activity.
+        stamp = ev.parse_ts(str(observed_at or '').replace(' UTC', 'Z').replace(' ', 'T'), 0)
+        observation_age = now - stamp
+        observation_valid = metadata.get('schema') == 'mc.native-project-observations/1' and type(metadata.get('ttl_seconds')) is int and metadata['ttl_seconds'] == 120 and stamp > 0
+        def observation(project):
+            valid = observation_valid and project.get('runtime') == 'codex' and project.get('observation_source') == 'codex_app.wait_threads'
+            active = valid and isinstance(project.get('native_status'), dict) and project['native_status'].get('type') == 'active'
+            return ('observed' if active and 0 <= observation_age <= 120 and not registry_stale else
+                    'stale' if valid and observation_age > 120 else 'unknown')
         for (runtime, session, agent), item in list(self.tailer.last_items.items()):
             if runtime != "codex":
                 continue
-            rows.append({"agent_id": session[:40], "runtime": "codex", "type": "codex", "task": "", "ticket": "",
-                         "state": "codex", "severity": "info", "last_activity": item.get("at"), "idle_s": None,
-                         "last_item": item})
+            project = projects.get(session, {})
+            observed.add((session, agent))
+            active = item.get('active_at') or item.get('at')
+            age = now - ev.parse_ts(active, 0)
+            stale = not active or age < 0 or age > 120 or bool(project and registry_stale)
+            rows.append({"agent_id": f'codex:{session}:{agent}', 'thread': session, 'agent': agent,
+                         'name': ev.short(project.get('project') or session[:8], 48) + ('' if agent == 'main' else ' · ' + agent[:8]),
+                         "runtime": "codex", 'harness': 'openai', 'model': ev.short(project.get('model'), 80),
+                         "type": 'project' if agent == 'main' and project else 'background',
+                         "task": ev.short(project.get('title') or 'Observed native Codex WAL', 160), 'stream': ev.short(project.get('project'), 80),
+                         "ticket": "", "state": 'stale' if stale else 'observed',
+                         'source_stale': stale, "severity": "info", "last_activity": active,
+                         "idle_s": max(0, age) if active else None, "last_item": item})
+        for session, project in projects.items():
+            if (session, 'main') not in observed:
+                rows.insert(0, {'agent_id': f'codex:{session}:main', 'thread': session, 'agent': 'main',
+                               'name': ev.short(project.get('project'), 64), 'runtime': 'codex', 'harness': 'openai',
+                               'type': 'project', 'state': observation(project), 'source_stale': observation(project) != 'observed',
+                               'observed_at': observed_at, 'native_status': project.get('native_status'),
+                               'model': ev.short(project.get('model'), 80), 'provider': ev.short(project.get('provider'), 80),
+                               'task': 'Registered project; no current WAL observation', 'last_item': {}})
+        for row in rows:
+            project = projects.get(row['thread'], {})
+            if row.get('type') == 'project' and observation_valid:
+                row['observed_at'] = observed_at
+                row['native_status'] = project.get('native_status')
+                if observation(project) == 'observed':
+                    row['state'], row['source_stale'] = 'observed', False
         rows.sort(key=lambda r: r.get("last_activity") or "", reverse=True)
-        return rows[:12]
+        rows.sort(key=lambda r: r.get('type') != 'project')
+        if len(rows) > 200:
+            self.health.error('native-streams', f'{len(rows)} streams observed; showing 200 with registered projects first')
+        else:
+            self.health.ok('native-streams', f'{len(rows)} streams observed')
+        return rows[:200]
 
     def tickets(self) -> list[str]:
         return [r["ticket"] for r in self.rows if r.get("ticket") and r.get("state") in ("live", "working", "quiet")]
@@ -792,6 +898,106 @@ class Tickets(Collector):
         return f"{ref} ({len(tickets)} tracked)"
 
 
+FABRIC_CHECKPOINT = ".fabric-commit.json"
+
+
+def _fabric_offset(path: Path, info, data_fd: int) -> int | None:
+    """The accepted prefix of the MC-managed drop file. An absent checkpoint is a legacy file.
+
+    A malformed checkpoint is never permission to read an unaccepted tail.
+    """
+    try:
+        fd = os.open(path.parent / FABRIC_CHECKPOINT, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    try:
+        checkpoint_info = os.fstat(fd)
+        if not stat.S_ISREG(checkpoint_info.st_mode) or checkpoint_info.st_nlink != 1:
+            raise Refused("unsafe Fabric checkpoint")
+        data = os.read(fd, 1025)
+    finally:
+        os.close(fd)
+    try:
+        checkpoint = json.loads(data) if len(data) <= 1024 else None
+    except (ValueError, UnicodeDecodeError):
+        checkpoint = None
+    if (not isinstance(checkpoint, dict) or set(checkpoint) != {"schema", "dev", "ino", "offset"}
+            or checkpoint.get("schema") != "mc.fabric.commit/1"
+            or checkpoint.get("dev") != info.st_dev or checkpoint.get("ino") != info.st_ino
+            or type(checkpoint.get("offset")) is not int
+            or not 0 <= checkpoint["offset"] <= info.st_size):
+        raise Refused("invalid Fabric committed-prefix checkpoint")
+    if checkpoint["offset"] and os.pread(data_fd, 1, checkpoint["offset"] - 1) != b"\n":
+        raise Refused("Fabric committed prefix is not a complete line")
+    return checkpoint["offset"]
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        size = os.write(fd, view)
+        if size <= 0:
+            raise OSError("short Fabric write")
+        view = view[size:]
+
+
+def _fabric_checkpoint(path: Path, info, offset: int) -> None:
+    checkpoint = path.parent / FABRIC_CHECKPOINT
+    temporary = checkpoint.with_name(checkpoint.name + "." + secrets.token_hex(8) + ".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        value = {"schema": "mc.fabric.commit/1", "dev": info.st_dev, "ino": info.st_ino, "offset": offset}
+        _write_all(fd, (json.dumps(value) + "\n").encode())
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(temporary, checkpoint)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if fd != -1:
+            os.close(fd)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _fabric_append(path: Path, payload: bytes) -> None:
+    """Publish only a complete durable batch. A failed tail stays invisible and is replaced on retry.
+
+    Readers take a shared lock and obey the committed prefix even after this process exits unexpectedly.
+    Only unaccepted bytes beyond that prefix can be truncated; accepted events are never rewritten.
+    """
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        from fabric_state import maintenance_guard
+        maintenance_guard(path.parent)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise Refused("Fabric drop must be a private regular file")
+        offset = _fabric_offset(path, info, fd)
+        if offset is None:
+            offset = info.st_size
+            if offset and os.pread(fd, 1, offset - 1) != b"\n":
+                raise Refused("legacy Fabric drop ends in an incomplete line")
+            # Publish the old accepted prefix before any new data can reach the file.
+            os.fsync(fd)
+            _fabric_checkpoint(path, info, offset)
+        elif info.st_size > offset:
+            os.ftruncate(fd, offset)  # only the previous attempt's unaccepted tail
+        os.lseek(fd, offset, os.SEEK_SET)
+        _write_all(fd, payload)
+        os.fsync(fd)
+        _fabric_checkpoint(path, info, offset + len(payload))
+    finally:
+        os.close(fd)
+
+
 class Remote(Collector):
     """At most one ssh to the remote host per minute: a fixed WAL probe, alternating with the Fabric export once
     Fabric ships `control export`."""
@@ -842,19 +1048,24 @@ class Remote(Collector):
         code, out = self.runner.run("fabric-export", self.cursor, timeout=15, limit=1024 * 1024)
         if code != 0:
             raise RuntimeError(f"fabric export exited {code}")
-        lines = [line for line in out.splitlines() if line.strip()]
+        if not isinstance(out, str) or len(out.encode("utf-8")) > 1024 * 1024:
+            raise ValueError("Fabric response exceeds its byte budget")
+        lines = [line for line in out.split("\n") if line.strip()]
+        if not lines or len(lines) > 5001:
+            raise ValueError("Fabric response is incomplete or exceeds its line budget")
+        tail = _json(lines[-1].encode("utf-8"))
+        if (not isinstance(tail, dict) or set(tail) != {"cursor"}
+                or not isinstance(tail["cursor"], str) or not CURSOR_RE.fullmatch(tail["cursor"])):
+            raise ValueError("Fabric response has no valid cursor footer")
+        lines = lines[:-1]
+        for line in lines:
+            if len(line.encode("utf-8")) > 8192 or ev.validate(_json(line.encode("utf-8"))):
+                raise ValueError("Fabric response contains an invalid event line")
         if lines:
-            tail = _json(lines[-1].encode("utf-8"))
-            if tail and set(tail) == {"cursor"} and isinstance(tail["cursor"], str):
-                self.cursor = tail["cursor"][:128]
-                lines = lines[:-1]
-        if lines and self.drop_dir:
-            path = Path(self.drop_dir) / "fabric.jsonl"
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600)
-            with os.fdopen(fd, "a", encoding="utf-8") as handle:
-                for line in lines[:5000]:
-                    if len(line) <= 8192:
-                        handle.write(line + "\n")
+            if not self.drop_dir:
+                raise ValueError("Fabric event sink is not configured")
+            _fabric_append(Path(self.drop_dir) / "fabric.jsonl", ("\n".join(lines) + "\n").encode("utf-8"))
+        self.cursor = tail["cursor"]  # acknowledgment only after the whole batch is accepted
         return f"fabric {len(lines)} lines"
 
 
@@ -893,15 +1104,25 @@ class FileDrop(Collector):
                 continue
             if not stat.S_ISREG(info.st_mode):
                 continue
-            tail = self.files.get(entry.path)
-            if tail is None or tail.ino != info.st_ino or info.st_size < tail.offset:
-                tail = self.files[entry.path] = _Tail(info.st_ino, 0, "external", name[:-6], name[:-6])
-            if info.st_size == tail.offset:
-                continue
             try:
                 with self.reader.open(entry.path) as handle:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        continue  # an active publisher owns the file; observation never waits on it
+                    info = os.fstat(handle.fileno())
+                    if name == "fabric.jsonl":
+                        from fabric_state import maintenance_guard
+                        maintenance_guard(self.drop_dir)
+                    accepted = _fabric_offset(Path(entry.path), info, handle.fileno()) if name == "fabric.jsonl" else None
+                    end = info.st_size if accepted is None else accepted
+                    tail = self.files.get(entry.path)
+                    if tail is None or tail.ino != info.st_ino or end < tail.offset:
+                        tail = self.files[entry.path] = _Tail(info.st_ino, 0, "external", name[:-6], name[:-6])
+                    if end == tail.offset:
+                        continue
                     handle.seek(tail.offset)
-                    data = handle.read(512 * 1024)
+                    data = handle.read(min(512 * 1024, end - tail.offset))
             except (OSError, Refused):
                 self.skipped += 1
                 continue

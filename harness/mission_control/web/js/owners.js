@@ -1,7 +1,7 @@
 import { getState, subscribe, select, update, highlight } from './store.js';
 import { el, button, age, freshness, stateClass } from './ui.js';
 
-const ACTIVE = /^(live|working|finishing|waiting|blocked|error|offline)/;
+const ACTIVE = /^(live|working|finishing|waiting|blocked|error|offline|observed|stale|unknown)/;
 
 // What the owner itself or a recorded disposition says, beside the ah owners state (never instead of it).
 export function holdLine(owner) {
@@ -19,7 +19,7 @@ export function mountOwners() {
   document.getElementById('owner-filter').addEventListener('change', event => update({ ownerFilter: event.target.value }, 'owner-filter'));
   function render(state) {
     const severe = owner => owner.severe;
-    const rank = owner => owner.severe ? 0 : owner.state === 'live' ? 1 : owner.runtime === 'codex' ? 3 : 2;
+    const rank = owner => owner.severe ? 0 : owner.type === 'project' || owner.state === 'live' ? 1 : owner.runtime === 'codex' ? 3 : 2;
     const active = owner => owner.severe || owner.held || ACTIVE.test(owner.state);
     const matches = owner => state.ownerFilter === 'all' || (state.ownerFilter === 'active' ? active(owner)
       : owner.state.startsWith(state.ownerFilter) || (state.ownerFilter === 'codex' && owner.runtime === 'codex'));
@@ -57,12 +57,16 @@ export function mountOwners() {
       const holdText = holdLine(owner);
       parts.hold.textContent = holdText;
       parts.hold.hidden = !holdText;
-      parts.runtime.textContent = `${owner.runtime === 'claude' ? 'Claude' : 'OpenAI'} · ${owner.model || 'model unknown'}`;
+      parts.runtime.textContent = `${owner.runtime === 'claude' ? 'Claude' : owner.runtime === 'codex' ? 'OpenAI' : 'Harness unknown'} · ${owner.model || 'model unknown'}`;
       parts.avatar.className = `runtime-avatar ${owner.runtime}`;
       parts.avatar.textContent = owner.runtime === 'claude' ? '✳' : '◇';
       parts.status.textContent = severe(owner) ? `! ${owner.state}` : owner.held ? `${owner.state} · ${owner.disposition?.live ? owner.disposition.kind : 'waiting'}` : `${owner.state === 'live' ? '• ' : ''}${owner.state}`;
       parts.status.className = `owner-state ${owner.held ? 'held' : stateClass(owner.state)}`;
-      parts.task.textContent = [owner.stream || owner.task, owner.ticket, owner.source_stale ? 'STALE SOURCE' : ''].filter(Boolean).join(' · ');
+      const observationAge = owner.observed_at ? (state.now - Date.parse(owner.observed_at)) / 1000 : null;
+      const native = observationAge === null ? '' : observationAge >= 0 && observationAge <= 120 && !owner.source_stale
+        ? `Native ${owner.native_status || 'unknown'} observed ${new Date(owner.observed_at).toLocaleTimeString()}`
+        : `Native observation stale/unknown (${new Date(owner.observed_at).toLocaleTimeString()})`;
+      parts.task.textContent = [owner.stream || owner.task, owner.ticket, native, owner.source_stale ? 'STALE SOURCE' : ''].filter(Boolean).join(' · ');
       parts.note.textContent = owner.last_item.note;
       parts.time.dateTime = owner.last_item.active || '';
       parts.time.title = owner.last_item.at ? `Work item written ${new Date(owner.last_item.at).toLocaleString()}` : 'No work item yet';

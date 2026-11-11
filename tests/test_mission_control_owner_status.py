@@ -131,7 +131,7 @@ class SupervisedOwners(unittest.TestCase):
                            ('codex','unmanaged','main'):{'at':'2026-11-10T02:00:00Z'}}
         owners=col.Owners(self.hub,self.health,mock.Mock(),tailer)
         owners.supervised=c; owners.publish()
-        self.assertEqual([r['agent_id'] for r in owners.rows], ['openai:mission-control','unmanaged'])
+        self.assertEqual([r['agent_id'] for r in owners.rows], ['openai:mission-control','codex:unmanaged:main'])
 
     def test_named_supervisor_preserves_wal_progress_for_at_risk(self):
         self.write(); c=self.collector(); c.run(1)
