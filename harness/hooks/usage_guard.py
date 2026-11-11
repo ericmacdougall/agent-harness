@@ -67,6 +67,15 @@ class GuardError(Exception):
         self.reason, self.message, self.reference = reason, message, reference
 
 
+class PoolUnavailable(GuardError):
+    """acquire_pool refused a provider pool (reserved by an unreleased run, or cooling down). No provider was
+    launched. `holder` is the run id that holds the pool and `kind` is 'active' or 'cooldown'."""
+
+    def __init__(self, reason, message, *, holder=None, kind='active', reference=None):
+        super().__init__(reason, message, reference)
+        self.holder, self.kind = holder, kind
+
+
 def encoded(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')
 
@@ -313,6 +322,23 @@ def owner_liveness(start, children=()):
             facts.update(state='UNCERTAIN', why='child pid %d %s: %s' % (child['pid'], child_state.lower(), child_why))
             return facts
     return facts
+
+
+def incomplete_reboot_proven(start):
+    """Without terminal launch evidence, only a typed same-host reboot covers unrecorded children."""
+    owner = start.get('owner_process') if isinstance(start, dict) else None
+    if not isinstance(owner, dict) or owner.get('host') != host_identity():
+        return False
+    identities = []
+    for token in (owner.get('boot_id'), boot_identity()):
+        if not isinstance(token, str):
+            return False
+        match = re.fullmatch(r'(procboot|bootsession):([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-'
+                             r'[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})', token)
+        if match is None:
+            return False
+        identities.append((match[1], match[2].lower()))
+    return identities[0][0] == identities[1][0] and identities[0][1] != identities[1][1]
 
 
 class Subject(dict):
@@ -814,7 +840,9 @@ class UsageStore:
                             or record.get('started_at') != started.get('started_at')):
                         raise GuardError('UNKNOWN', 'Completion does not match its referenced START')
                     if record.get('reason') in {'UNKNOWN', 'TIMEOUT'} and not reconciled:
-                        raise GuardError('UNKNOWN', 'Uncertain prior result requires recorded reconciliation', entry['start'])
+                        reconciled = self._auto_reconcile_locked(entry['run_id'])['reconciled']
+                        if not reconciled:
+                            raise GuardError('UNKNOWN', 'Uncertain prior result requires recorded reconciliation', entry['start'])
                     elapsed = record.get('elapsed_seconds')
                     if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0:
                         raise GuardError('UNKNOWN', 'Elapsed execution budget is invalid')
@@ -928,10 +956,12 @@ class UsageStore:
             if state['active'] is not None and self._auto_reconcile_locked(state['active'])['reconciled']:
                 directory, state = self._pool(provider, pool)
             if state['active'] is not None:
-                raise GuardError('UNKNOWN' if state['reason'] in {'UNKNOWN', 'TIMEOUT'} else 'TRANSIENT_INFRA',
-                                 'Provider pool has an active or unreconciled owner; no provider was launched')
+                raise PoolUnavailable('UNKNOWN' if state['reason'] in {'UNKNOWN', 'TIMEOUT'} else 'TRANSIENT_INFRA',
+                                      'Provider pool has an active or unreconciled owner; no provider was launched',
+                                      holder=state['active'], kind='active')
             if state['cooldown'] and (state['reset_at'] is None or time.time() < state['reset_at']):
-                raise GuardError(state['reason'], 'Provider pool requires availability evidence or its reliable reset')
+                raise PoolUnavailable(state['reason'], 'Provider pool requires availability evidence or its reliable reset',
+                                      kind='cooldown')
             state = {**state, 'active': run_id, 'cooldown': False, 'reason': 'NONE', 'reset_at': None}
             self._pool_event(directory, state, 'RESERVED')
 
@@ -963,13 +993,56 @@ class UsageStore:
     def _publish_reconciliation(self, run_id, *, kind, actor, reason, evidence):
         directory = self._run_directory(run_id)
         affected = self._affected_pools(run_id)
-        self._publish(directory, 'reconciled.json', {'schema': SCHEMA, 'kind': kind,
-                      'run_id': run_id, 'actor': actor, 'reason': reason, 'evidence': evidence,
-                      'at': now_utc().isoformat(), 'execution': 'UNKNOWN', 'result': 'NO_RESULT'})
+        if self._reconciliation(directory, run_id):
+            # A crash can leave the immutable marker ahead of one or more pool heads.
+            # Resume only the remaining exact pointers, retaining the original authority/evidence.
+            prior = read_json(directory / 'reconciled.json')
+            actor, reason, evidence = prior['actor'], prior['reason'], prior['evidence']
+        else:
+            self._publish(directory, 'reconciled.json', {'schema': SCHEMA, 'kind': kind,
+                          'run_id': run_id, 'actor': actor, 'reason': reason, 'evidence': evidence,
+                          'at': now_utc().isoformat(), 'execution': 'UNKNOWN', 'result': 'NO_RESULT'})
         for pool, state in affected:
             self._pool_event(pool, {**state, 'active': None}, 'RECONCILED', actor=actor,
                              reason=reason, evidence=evidence)
         return len(affected)
+
+    def _completion_final(self, directory, run_id, start):
+        """Validate a completion through its indexed START and digest-bound FINAL before using it."""
+        value = read_json(directory / 'completion.json')
+        if (set(value) != {'schema', 'reference'} or type(value.get('schema')) is not int
+                or value['schema'] != SCHEMA or not isinstance(value.get('reference'), dict)
+                or value['reference'].get('run_id') != run_id or value['reference'].get('record') != 'final'):
+            raise GuardError('UNKNOWN', 'Completion is malformed or belongs to another run')
+        final = self.load_ref(value['reference'])
+        if (final['subject'] != start['subject'] or final['invocation'] != start['invocation']
+                or final.get('started_at') != start.get('started_at')):
+            raise GuardError('UNKNOWN', 'Completion FINAL identity does not match its indexed START')
+        return final
+
+    def _completed_children_proven(self, start, final, children):
+        """A completed uncertain run needs complete launch records, or independent reboot proof."""
+        owner = start.get('owner_process') or {}
+        recorded_boot, current_boot = owner.get('boot_id'), boot_identity()
+        if (owner.get('host') == host_identity() and isinstance(recorded_boot, str)
+                and isinstance(current_boot, str) and 0 < len(recorded_boot) <= 256
+                and 0 < len(current_boot) <= 256 and same_scheme(recorded_boot, current_boot)
+                and recorded_boot != current_boot):
+            return True  # all prior-boot children are gone, including any unrecorded spawn
+        usage = final.get('usage')
+        launches = usage.get('provider_launches') if isinstance(usage, dict) else None
+        if type(launches) is not int or not 0 <= launches <= 64 or len(children) != launches:
+            return False
+        if launches == 0:
+            return final['execution'] == 'NOT_STARTED'
+        identities = set()
+        for child in children:
+            if (not isinstance(child, dict) or set(child) != {'pid', 'process_started'}
+                    or not valid_pid(child.get('pid')) or not isinstance(child.get('process_started'), str)
+                    or not 0 < len(child['process_started']) <= 256):
+                return False
+            identities.add((child['pid'], child['process_started']))
+        return len(identities) == launches
 
     def reconcile(self, run_id, *, actor, reason, evidence):
         for value in (actor, reason, evidence): safe_text(value)
@@ -1020,19 +1093,34 @@ class UsageStore:
         repaired = self._repair_interrupted_publish(directory)
         if repaired: report['repaired_stage_files'] = repaired
         start = self._owned_start(run_id)
-        if os.path.lexists(directory / 'completion.json'):
-            report['why'] = 'completed'
-            return report
+        final = (self._completion_final(directory, run_id, start)
+                 if os.path.lexists(directory / 'completion.json') else None)
         if self._reconciliation(directory, run_id):
-            report['why'] = 'already reconciled'
+            count = self._publish_reconciliation(run_id, kind='automatic_reconciliation', actor=AUTO_ACTOR,
+                                                reason='Resume reconciliation', evidence='Existing immutable reconciliation')
+            report.update(reconciled=bool(count), pools=count,
+                          why='resumed reconciliation' if count else 'already reconciled')
             return report
-        liveness = owner_liveness(start, self._children(directory))
+        if final is not None:
+            if (final['result'] != 'NO_RESULT' or final['reason'] not in {'TIMEOUT', 'UNKNOWN'}
+                    or final['execution'] not in {'INTERRUPTED', 'UNKNOWN', 'COMPLETED', 'NOT_STARTED'}
+                    or not self._affected_pools(run_id)):
+                report['why'] = 'completed'
+                return report
+        children = self._children(directory)
+        liveness = owner_liveness(start, children)
         report['liveness'] = liveness
         if liveness['state'] != 'DEAD':
             report['why'] = 'owner ' + liveness['state'].lower() + ': ' + liveness['why']
             return report
         if not liveness['past_deadline']:
             report['why'] = 'dead owner before deadline'
+            return report
+        if final is None and not incomplete_reboot_proven(start):
+            report['why'] = 'incomplete launch/child evidence requires independent same-host reboot proof'
+            return report
+        if final is not None and not self._completed_children_proven(start, final, children):
+            report['why'] = 'completed uncertain launch/child evidence is incomplete'
             return report
         evidence = ('pid %d on host %s: %s; deadline %s; checked %s' % (
             liveness['pid'], liveness['host'], liveness['why'], liveness['deadline'], now_utc().isoformat()))[:500]

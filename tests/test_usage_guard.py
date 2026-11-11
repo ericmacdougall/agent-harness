@@ -276,6 +276,22 @@ class EvidenceStore(StoreFixture):
         self.assertTrue(set(before) < set(after))
         self.store.acquire_pool('codex', 'fixture-pool', next_run.run_id)
 
+    def test_refused_pool_leases_name_the_holder_and_the_kind(self):
+        # goodqa#15565: peer_review needs to tell a refused lease (nothing launched) from other guard errors.
+        run = self.begin()
+        self.store.acquire_pool('codex', 'fixture-pool', run.run_id)
+        other = guard.invocation_identity(self.subject, purpose='other-model', argv=['other-model'], cwd=self.repo)
+        waiting = self.store.begin(self.subject, other, owner='fixture', label='other', timeout=10, minimum_bytes=0)
+        with self.assertRaises(guard.PoolUnavailable) as active:
+            self.store.acquire_pool('codex', 'fixture-pool', waiting.run_id)
+        self.assertIsInstance(active.exception, guard.GuardError)
+        self.assertEqual((active.exception.kind, active.exception.holder), ('active', run.run_id))
+        self.store.release_pool('codex', 'fixture-pool', run.run_id, reason='QUOTA', account_cooldown=True)
+        with self.assertRaises(guard.PoolUnavailable) as cooling:
+            self.store.acquire_pool('codex', 'fixture-pool', waiting.run_id)
+        self.assertEqual((cooling.exception.kind, cooling.exception.reason, cooling.exception.holder),
+                         ('cooldown', 'QUOTA', None))
+
     def test_parallel_processes_cannot_duplicate_one_reservation(self):
         script = ('import sys\nfrom pathlib import Path\n'
                   f'sys.path.insert(0,{str(HOOKS)!r})\nimport usage_guard as g\n'
@@ -511,15 +527,31 @@ class LiveReceipts(unittest.TestCase):
             for _ in range(100):
                 if guard.pid_exists(children[0]['pid']) is False: break
                 time.sleep(.05)
+            # PR 185: the supervisor died before any final record, so on the SAME boot the unrecorded-spawn risk is
+            # not excluded by a dead owner and a passed deadline. The sweep must decline and say why.
             swept = subprocess.run(self.command('sweep'), env=env, capture_output=True, text=True, timeout=20)
             value = json.loads(swept.stdout)
-            self.assertEqual((swept.returncode, value['reconciled']), (0, [run_id]))
+            self.assertEqual((swept.returncode, value['reconciled']), (0, []))
+            self.assertIn('reboot proof', value['reports'][0]['why'])
+            self.assertFalse((self.store_path / 'runs' / run_id / 'reconciled.json').exists())
+            declined = subprocess.run(self.command('reconcile', '--run', run_id, '--auto'), env=env,
+                                      capture_output=True, text=True, timeout=20)
+            self.assertIn('reboot proof', json.loads(declined.stdout)['automatic_reconciliation']['why'])
+            self.assertFalse((self.store_path / 'runs' / run_id / 'reconciled.json').exists())
+            self.assertFalse((self.store_path / 'runs' / run_id / 'final.json').exists())
+            repeated, refused = self.invoke(*arguments)
+            self.assertEqual((repeated.returncode, refused['reason']), (2, 'UNKNOWN'))
+            # Recovery stays possible through explicit operator evidence, which is append-only.
+            manual = subprocess.run(self.command('reconcile', '--run', run_id, '--actor', 'fixture',
+                                                 '--reason', 'owner and recorded child are dead on this host',
+                                                 '--evidence', 'sweep declined without reboot proof; child pid checked'),
+                                    env=env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(manual.returncode, 0, manual.stderr)
             self.assertEqual(json.loads((self.store_path / 'runs' / run_id / 'reconciled.json').read_text())['kind'],
-                             'automatic_reconciliation')
+                             'manual_reconciliation')
             again = subprocess.run(self.command('reconcile', '--run', run_id, '--auto'), env=env,
                                    capture_output=True, text=True, timeout=20)
             self.assertEqual(json.loads(again.stdout)['automatic_reconciliation']['why'], 'already reconciled')
-            self.assertFalse((self.store_path / 'runs' / run_id / 'final.json').exists())
             repeated, refused = self.invoke(*arguments)
             self.assertEqual((repeated.returncode, refused['reason']), (2, 'BUDGET_EXHAUSTED'))
         finally:
@@ -577,6 +609,14 @@ class OwnerLiveness(StoreFixture):
 
     def future(self):
         return mock.patch.object(guard, 'now_utc', return_value=datetime.now(timezone.utc) + timedelta(days=1))
+
+    def reboot(self):
+        # Explicit positive-only simulation; ordinary and completed-run fixtures stay on the same boot.
+        current = guard.boot_identity()
+        if current is None:
+            self.skipTest('this host exposes no boot identifier (no /proc boot_id and no kern.bootsessionuuid)')
+        scheme = current.split(':', 1)[0]
+        return mock.patch.object(guard, 'boot_identity', return_value=scheme + ':22222222-2222-4222-8222-222222222222')
 
     def reconciled_path(self, run):
         return self.store.root / 'runs' / run.run_id / 'reconciled.json'
@@ -637,7 +677,7 @@ class OwnerLiveness(StoreFixture):
         with self.assertRaises(guard.GuardError) as refused: self.begin(repeat_reason='retry', aggregate_timeout=30)
         self.assertEqual(refused.exception.reason, 'UNKNOWN')
         self.assertFalse(self.reconciled_path(run).exists())
-        with self.future():
+        with self.future(), self.reboot():
             report = self.store.auto_reconcile(run.run_id)
         self.assertTrue(report['reconciled']); self.assertEqual(report['liveness']['state'], 'DEAD')
         record = json.loads(self.reconciled_path(run).read_text())
@@ -663,7 +703,7 @@ class OwnerLiveness(StoreFixture):
         run = self.begin_owned(facts)
         self.store.acquire_pool('codex', 'fixture-pool', run.run_id)
         child.kill(); child.wait(timeout=5)
-        with self.future():
+        with self.future(), self.reboot():
             retry = self.begin(repeat_reason='owner died', aggregate_timeout=30)
             self.store.acquire_pool('codex', 'fixture-pool', retry.run_id)
         self.assertTrue(self.reconciled_path(run).exists())
@@ -700,9 +740,9 @@ class OwnerLiveness(StoreFixture):
         real = guard.process_start_token(alive.pid)
         reused = self.begin_owned(self.facts_for(alive, process_started=real + 'x'), label='reused')
         with self.future(): report = self.store.auto_reconcile(reused.run_id)
-        self.assertTrue(report['reconciled']); self.assertIn('pid reused', report['liveness']['why'])
-        rebooted = self.begin_owned(self.facts_for(alive, boot_id='bootsession:before'), label='rebooted')
-        with self.future(), mock.patch.object(guard, 'boot_identity', return_value='bootsession:after'):
+        self.assertFalse(report['reconciled']); self.assertIn('pid reused', report['liveness']['why'])
+        rebooted = self.begin_owned(self.facts_for(alive, boot_id='bootsession:11111111-1111-4111-8111-111111111111'), label='rebooted')
+        with self.future(), mock.patch.object(guard, 'boot_identity', return_value='bootsession:22222222-2222-4222-8222-222222222222'):
             report = self.store.auto_reconcile(rebooted.run_id)
         self.assertTrue(report['reconciled']); self.assertIn('rebooted', report['liveness']['why'])
         # F24: an id from another build or scheme (for example the old kern.boottime text) never proves a reboot.
@@ -726,7 +766,7 @@ class OwnerLiveness(StoreFixture):
         with self.future(): report = self.store.auto_reconcile(run.run_id)
         self.assertFalse(report['reconciled']); self.assertIn('child pid %d alive' % reviewer.pid, report['liveness']['why'])
         reviewer.kill(); reviewer.wait(timeout=5)
-        with self.future(): self.assertTrue(self.store.auto_reconcile(run.run_id)['reconciled'])
+        with self.future(): self.assertFalse(self.store.auto_reconcile(run.run_id)['reconciled'])
         with self.assertRaises(guard.GuardError): run.note_child(2 ** 40)
 
     def test_child_with_live_group_members_is_not_dead(self):
@@ -752,7 +792,7 @@ class OwnerLiveness(StoreFixture):
         for _ in range(100):
             if guard.group_empty(leader.pid): break
             time.sleep(.05)
-        with self.future(): self.assertTrue(self.store.auto_reconcile(run.run_id)['reconciled'])
+        with self.future(): self.assertFalse(self.store.auto_reconcile(run.run_id)['reconciled'])
 
     def test_failed_child_record_kills_the_child(self):
         import process as process_module
@@ -788,7 +828,7 @@ class OwnerLiveness(StoreFixture):
         self.assertEqual(os.stat(directory / 'children.json').st_nlink, 2)
         supervisor.kill(); supervisor.wait(timeout=5); reviewer.kill(); reviewer.wait(timeout=5)
         with self.future(): report = self.store.auto_reconcile(run.run_id)
-        self.assertTrue(report['reconciled']); self.assertEqual(report['repaired_stage_files'], 1)
+        self.assertFalse(report['reconciled']); self.assertEqual(report['repaired_stage_files'], 1)
         self.assertEqual(os.stat(directory / 'children.json').st_nlink, 1)
         self.assertFalse((directory / '.stage-deadbeef').exists())
 
@@ -796,7 +836,7 @@ class OwnerLiveness(StoreFixture):
         child = self.child()
         run = self.begin_owned(self.facts_for(child))
         child.kill(); child.wait(timeout=5)
-        with self.future(): self.assertTrue(self.store.auto_reconcile(run.run_id)['reconciled'])
+        with self.future(), self.reboot(): self.assertTrue(self.store.auto_reconcile(run.run_id)['reconciled'])
         with self.assertRaises(guard.GuardError) as refused: self.finish(run)
         self.assertEqual(refused.exception.reason, 'UNKNOWN')
         self.assertFalse((self.store.root / 'runs' / run.run_id / 'final.json').exists())
@@ -817,7 +857,8 @@ class OwnerLiveness(StoreFixture):
             self.assertEqual(self.store.auto_reconcile(done.run_id)['why'], 'completed')
             report = {item['run_id']: item for item in self.store.sweep()}
         self.assertEqual(report[done.run_id]['why'], 'completed')
-        self.assertTrue(report[dead.run_id]['reconciled'])
+        self.assertFalse(report[dead.run_id]['reconciled'])
+        self.assertIn('incomplete', report[dead.run_id]['why'])
         self.assertEqual(json.loads((self.store.root / 'runs' / done.run_id / 'final.json').read_text())['result'], 'CHECK_OK')
 
     def test_legacy_start_without_owner_process_key_stays_uncertain(self):
@@ -839,7 +880,7 @@ class OwnerLiveness(StoreFixture):
         child = self.child()
         run = self.begin_owned(self.facts_for(child))
         child.kill(); child.wait(timeout=5)
-        with self.future(): self.store.auto_reconcile(run.run_id)
+        with self.future(), self.reboot(): self.store.auto_reconcile(run.run_id)
         path = self.reconciled_path(run); original = json.loads(path.read_text())
         tampers = {'other-run': {**original, 'run_id': 'f' * 32}, 'wrong-kind': {**original, 'kind': 'blessing'},
                    'wrong-actor': {**original, 'actor': 'someone'},
@@ -850,6 +891,367 @@ class OwnerLiveness(StoreFixture):
                 path.write_text(json.dumps(record))
                 with self.assertRaises(guard.GuardError) as refused: self.begin(repeat_reason='retry', aggregate_timeout=30)
                 self.assertEqual(refused.exception.reason, 'UNKNOWN')
+
+
+class IncompleteReservationSafety(StoreFixture):
+    """Incomplete launch lists never prove all same-boot descendants are gone."""
+
+    child = OwnerLiveness.child
+    facts_for = OwnerLiveness.facts_for
+    begin_owned = OwnerLiveness.begin_owned
+    future = OwnerLiveness.future
+    reconciled_path = OwnerLiveness.reconciled_path
+    OLD_BOOT = 'procboot:11111111-1111-4111-8111-111111111111'
+    NEW_BOOT = 'procboot:22222222-2222-4222-8222-222222222222'
+
+    def incomplete(self, label='focused', **facts):
+        owner = self.child()
+        run = self.begin_owned(self.facts_for(owner, **facts), label=label)
+        self.store.acquire_pool('codex', label, run.run_id)
+        owner.kill(); owner.wait(timeout=5)
+        return run
+
+    def pool_bytes(self):
+        return {str(path.relative_to(self.store.root)): path.read_bytes()
+                for path in (self.store.root / 'pools').glob('**/*.json')}
+
+    def assert_held(self, run):
+        before = self.pool_bytes()
+        with self.future(): report = self.store.auto_reconcile(run.run_id)
+        self.assertFalse(report['reconciled'])
+        self.assertFalse(self.reconciled_path(run).exists())
+        self.assertEqual(self.pool_bytes(), before)
+        inspected = self.store.inspect(run.start_ref)
+        self.assertEqual((inspected['execution'], inspected['result']), ('UNKNOWN', 'NO_RESULT'))
+        return report
+
+    def test_real_spawn_failed_registration_and_cleanup_no_final_stays_held(self):
+        import process as process_module
+        run = self.incomplete()
+        seen = []
+        def callback(child):
+            seen.append(child)
+            run.note_child(child)
+        try:
+            with mock.patch.object(self.store, 'record_child', side_effect=guard.GuardError('UNKNOWN', 'fixture registration failed')), \
+                    mock.patch.object(process_module, 'signal_group', side_effect=OSError('fixture cleanup failed')):
+                with self.assertRaises(guard.GuardError):
+                    process_module.run([sys.executable, '-c', 'import time; time.sleep(30)'], timeout=5, on_spawn=callback)
+            self.assertEqual(len(seen), 1)
+            self.assertIsNone(seen[0].poll())
+            directory = self.store.root / 'runs' / run.run_id
+            self.assertFalse((directory / 'children.json').exists())
+            self.assertFalse((directory / 'final.json').exists())
+            self.assertFalse((directory / 'completion.json').exists())
+            report = self.assert_held(run)
+            self.assertEqual(report['liveness']['state'], 'DEAD')
+            self.assertIn('incomplete', report['why'])
+            self.assertIsNone(seen[0].poll())
+        finally:
+            for child in seen:
+                if child.poll() is None: os.killpg(child.pid, signal.SIGKILL)
+                child.wait(timeout=5)
+
+    def test_missing_empty_and_all_dead_children_never_prove_completeness(self):
+        for label in ('missing', 'empty', 'dead'):
+            with self.subTest(label=label):
+                run = self.incomplete(label)
+                directory = self.store.root / 'runs' / run.run_id
+                if label != 'missing':
+                    children = []
+                    if label == 'dead':
+                        child = self.child(); token = guard.process_start_token(child.pid)
+                        child.kill(); child.wait(timeout=5)
+                        children = [{'pid': child.pid, 'process_started': token}]
+                    self.store._publish(directory, 'children.json', {'schema': 1, 'run_id': run.run_id, 'children': children})
+                self.assertIn('incomplete', self.assert_held(run)['why'])
+
+    def test_orphan_final_is_not_a_terminal_completeness_record(self):
+        run = self.incomplete()
+        self.store._publish(self.store.root / 'runs' / run.run_id, 'final.json',
+                            {'usage': {'provider_launches': 0}, 'execution': 'NOT_STARTED'})
+        self.assert_held(run)
+
+    def test_alleged_counts_do_not_upgrade_children_metadata(self):
+        for number, count in enumerate((0, True, -1, None, '0')):
+            with self.subTest(count=count):
+                run = self.incomplete('count-' + str(number))
+                self.store._publish(self.store.root / 'runs' / run.run_id, 'children.json',
+                                    {'schema': 1, 'run_id': run.run_id, 'children': [], 'provider_launches': count})
+                before = self.pool_bytes()
+                with self.future(), self.assertRaises(guard.GuardError): self.store.auto_reconcile(run.run_id)
+                self.assertEqual(self.pool_bytes(), before)
+                self.assertFalse(self.reconciled_path(run).exists())
+
+    def test_typed_same_host_reboot_releases_unknown_only(self):
+        run = self.incomplete(boot_id=self.OLD_BOOT)
+        start = (self.store.root / 'runs' / run.run_id / 'start.json').read_bytes()
+        with self.future(), mock.patch.object(guard, 'boot_identity', return_value=self.NEW_BOOT):
+            report = self.store.auto_reconcile(run.run_id)
+        self.assertTrue(report['reconciled'])
+        record = json.loads(self.reconciled_path(run).read_text())
+        self.assertEqual((record['execution'], record['result']), ('UNKNOWN', 'NO_RESULT'))
+        self.assertEqual((self.store.root / 'runs' / run.run_id / 'start.json').read_bytes(), start)
+        self.assertFalse((self.store.root / 'runs' / run.run_id / 'final.json').exists())
+        self.assertTrue(all(json.loads(path.read_text())['state']['active'] is None
+                            for path in (self.store.root / 'pools').glob('*/events/*.json')
+                            if json.loads(path.read_text())['action'] == 'RECONCILED'))
+
+    def test_invalid_or_non_reboot_boot_evidence_remains_unknown(self):
+        cases = [(None, self.NEW_BOOT), (self.OLD_BOOT, None), ('procboot:', self.NEW_BOOT),
+                 ('procboot:before', 'procboot:after'), ('other:111', 'other:222'),
+                 (self.OLD_BOOT, self.NEW_BOOT.replace('procboot:', 'bootsession:')),
+                 (self.OLD_BOOT, self.OLD_BOOT), ('procboot:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+                                              'procboot:AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA'),
+                 ('procboot:' + 'a' * 400, self.NEW_BOOT)]
+        for number, (old, current) in enumerate(cases):
+            with self.subTest(old=old, current=current):
+                run = self.incomplete('boot-' + str(number), boot_id=old)
+                with mock.patch.object(guard, 'boot_identity', return_value=current): self.assert_held(run)
+
+    def test_live_owner_child_pid_reuse_host_and_deadline_controls(self):
+        live = self.child()
+        run = self.begin_owned(self.facts_for(live), label='live-owner')
+        self.assert_held(run)
+        token = guard.process_start_token(live.pid)
+        reused = self.begin_owned(self.facts_for(live, process_started=token + 'x'), label='pid-reuse')
+        self.assert_held(reused)
+        other = self.incomplete('other-host', host='other.fixture', boot_id=self.OLD_BOOT)
+        with mock.patch.object(guard, 'boot_identity', return_value=self.NEW_BOOT): self.assert_held(other)
+        child_run = self.incomplete('live-child')
+        child_run.note_child(live)
+        self.assert_held(child_run)
+        early = self.incomplete('early', boot_id=self.OLD_BOOT)
+        with mock.patch.object(guard, 'boot_identity', return_value=self.NEW_BOOT):
+            report = self.store.auto_reconcile(early.run_id)
+        self.assertFalse(report['reconciled'])
+        self.assertEqual(report['why'], 'dead owner before deadline')
+
+    def test_malformed_completion_never_becomes_absent(self):
+        run = self.incomplete(boot_id=self.OLD_BOOT)
+        self.store._publish(self.store.root / 'runs' / run.run_id, 'completion.json', {'usage': {'provider_launches': 0}})
+        with self.future(), mock.patch.object(guard, 'boot_identity', return_value=self.NEW_BOOT):
+            with self.assertRaises(guard.GuardError): self.store.auto_reconcile(run.run_id)
+        self.assertFalse(self.reconciled_path(run).exists())
+
+    def test_existing_marker_resumes_exact_incomplete_pointer(self):
+        run = self.incomplete()
+        with mock.patch.object(self.store, '_pool_event', side_effect=OSError('fixture interrupted publication')):
+            with self.assertRaises(OSError):
+                self.store.reconcile(run.run_id, actor='fixture', reason='owned fixture proof', evidence='fixture only')
+        marker = self.reconciled_path(run).read_bytes()
+        with self.future(): report = self.store.auto_reconcile(run.run_id)
+        self.assertTrue(report['reconciled'])
+        self.assertEqual(report['why'], 'resumed reconciliation')
+        self.assertEqual(self.reconciled_path(run).read_bytes(), marker)
+        with self.future(): self.assertEqual(self.store.auto_reconcile(run.run_id)['why'], 'already reconciled')
+
+
+class CompletedUncertainPools(OwnerLiveness):
+    """Completed timeout history cannot orphan a pool or excuse missing child evidence."""
+
+    def uncertain(self, *, label='focused', launches=1, children=1, execution='INTERRUPTED', reason='TIMEOUT',
+                  pools=('fixture-pool',)):
+        owner = self.child()
+        run = self.begin_owned(self.facts_for(owner), label=label)
+        for pool in pools:
+            self.store.acquire_pool('claude', pool, run.run_id)
+        recorded = [self.child() for _ in range(children)]
+        for child in recorded:
+            run.note_child(child)
+        usage = {} if launches is None else {'provider_launches': launches}
+        final = run.finish(execution=execution, result='NO_RESULT', reason=reason, usage=usage)
+        return run, owner, recorded, final
+
+    def stop_owned(self, *processes):
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+
+    def pool(self, name='fixture-pool'):
+        with self.store._lock():
+            directory, state = self.store._pool('claude', name)
+        return directory, state
+
+    def test_completed_timeout_reconciles_only_dead_recorded_incarnations(self):
+        run, owner, children, final = self.uncertain()
+        directory = self.store.root / 'runs' / run.run_id
+        history = {name: (directory / name).read_bytes() for name in ('start.json', 'final.json', 'completion.json')}
+        self.stop_owned(owner, *children)
+        with self.future():
+            report = self.store.auto_reconcile(run.run_id)
+        self.assertTrue(report['reconciled'])
+        self.assertIsNone(self.pool()[1]['active'])
+        record = json.loads(self.reconciled_path(run).read_text())
+        self.assertEqual((record['execution'], record['result']), ('UNKNOWN', 'NO_RESULT'))
+        self.assertFalse(self.store.reuse(self.subject, self.identity, final)['eligible'])
+        for name, body in history.items():
+            self.assertEqual((directory / name).read_bytes(), body)
+        events = list((self.store.root / 'pools').glob('*/events/*.json'))
+        with self.future():
+            self.assertEqual(self.store.auto_reconcile(run.run_id)['why'], 'already reconciled')
+        self.assertEqual(list((self.store.root / 'pools').glob('*/events/*.json')), events)
+        with self.assertRaises(guard.GuardError):
+            self.store.acquire_pool('claude', 'fixture-pool', run.run_id)
+
+    def test_completed_unknown_missing_child_record_cannot_hide_a_live_child(self):
+        run, owner, _, _ = self.uncertain(launches=1, children=0, execution='COMPLETED', reason='UNKNOWN')
+        escaped = self.child()
+        self.stop_owned(owner)
+        with self.future():
+            report = self.store.auto_reconcile(run.run_id)
+        self.assertFalse(report['reconciled'])
+        self.assertIn('child', report['why'])
+        self.assertEqual(self.pool()[1]['active'], run.run_id)
+        self.assertIsNone(escaped.poll())
+        self.assertFalse(self.reconciled_path(run).exists())
+
+    def test_begin_reconciles_completed_uncertainty_before_justified_repeat(self):
+        run, owner, children, _ = self.uncertain()
+        self.stop_owned(owner, *children)
+        with self.future():
+            retry = self.begin(repeat_reason='owned reviewer ended', aggregate_timeout=30)
+        self.assertTrue(self.reconciled_path(run).exists())
+        self.store.acquire_pool('claude', 'fixture-pool', retry.run_id)
+        self.assertEqual(self.pool()[1]['active'], retry.run_id)
+
+    def test_acquire_pool_reconciles_a_different_completed_uncertain_owner(self):
+        run, owner, children, _ = self.uncertain()
+        self.stop_owned(owner, *children)
+        retry = self.begin_owned(self.facts_for(self.child()), label='independent-invocation')
+        with self.future():
+            self.store.acquire_pool('claude', 'fixture-pool', retry.run_id)
+        self.assertTrue(self.reconciled_path(run).exists())
+        self.assertEqual(self.pool()[1]['active'], retry.run_id)
+
+    def test_completed_run_still_waits_for_child_and_deadline(self):
+        run, owner, children, _ = self.uncertain()
+        self.stop_owned(owner)
+        with self.future():
+            self.assertFalse(self.store.auto_reconcile(run.run_id)['reconciled'])
+        self.assertIsNone(children[0].poll())
+        self.stop_owned(*children)
+        self.assertFalse(self.store.auto_reconcile(run.run_id)['reconciled'])
+        self.assertFalse(self.reconciled_path(run).exists())
+
+    def test_corrupt_pool_history_blocks_completed_reconciliation(self):
+        run, owner, children, _ = self.uncertain()
+        self.stop_owned(owner, *children)
+        directory, _ = self.pool()
+        before = (directory / 'head.json').read_bytes()
+        index = json.loads(before)
+        event = directory / 'events' / (index['event'] + '.json')
+        event.write_bytes(event.read_bytes() + b' ')
+        with self.future(), self.assertRaises(guard.GuardError):
+            self.store.auto_reconcile(run.run_id)
+        self.assertFalse(self.reconciled_path(run).exists())
+        self.assertEqual((directory / 'head.json').read_bytes(), before)
+
+    def test_completed_unknown_launch_count_and_short_child_record_stay_uncertain(self):
+        for label, launches, children in [('missing', None, 1), ('short', 2, 1), ('boolean', True, 1),
+                                          ('zero-completed', 0, 0)]:
+            with self.subTest(label=label):
+                run, owner, recorded, _ = self.uncertain(label=label, launches=launches, children=children,
+                                                        execution='COMPLETED', reason='UNKNOWN')
+                self.stop_owned(owner, *recorded)
+                try:
+                    with self.future():
+                        report = self.store.auto_reconcile(run.run_id)
+                    self.assertFalse(report['reconciled'])
+                    self.assertIn('launch', report['why'])
+                    self.assertFalse(self.reconciled_path(run).exists())
+                finally:
+                    self.store.reconcile(run.run_id, actor='fixture', reason='owned fixture ended', evidence='all fixture children joined')
+
+    def test_completed_not_started_requires_positive_zero_launch_evidence(self):
+        run, owner, _, _ = self.uncertain(launches=0, children=0, execution='NOT_STARTED', reason='UNKNOWN')
+        self.stop_owned(owner)
+        with self.future():
+            self.assertTrue(self.store.auto_reconcile(run.run_id)['reconciled'])
+        self.assertIsNone(self.pool()[1]['active'])
+
+    def test_completed_uncertain_reboot_independently_resolves_absent_children(self):
+        owner = self.child()
+        run = self.begin_owned(self.facts_for(owner, boot_id='procboot:before'), label='reboot-completed')
+        self.store.acquire_pool('claude', 'fixture-pool', run.run_id)
+        run.finish(execution='INTERRUPTED', result='NO_RESULT', reason='TIMEOUT', usage={})
+        with self.future(), mock.patch.object(guard, 'boot_identity', return_value='procboot:after'):
+            report = self.store.auto_reconcile(run.run_id)
+        self.assertTrue(report['reconciled'])
+        self.assertIn('reboot', report['liveness']['why'])
+        self.assertIsNone(self.pool()[1]['active'])
+        self.assertIsNone(owner.poll(), 'the new-boot PID control must not be signalled')
+
+    def test_completion_reference_and_final_identity_must_match_start(self):
+        run, owner, children, _ = self.uncertain()
+        self.stop_owned(owner, *children)
+        directory = self.store.root / 'runs' / run.run_id
+        completion = (directory / 'completion.json').read_bytes()
+        final = (directory / 'final.json').read_bytes()
+        pool_dir, _ = self.pool()
+        head = (pool_dir / 'head.json').read_bytes()
+        for label in ('wrong-run', 'wrong-digest', 'changed-subject', 'changed-invocation', 'bad-schema'):
+            with self.subTest(label=label):
+                c = json.loads(completion); f = json.loads(final)
+                if label == 'wrong-run': c['reference']['run_id'] = 'f' * 32
+                elif label == 'wrong-digest': c['reference']['sha256'] = 'f' * 64
+                elif label == 'bad-schema': c['extra'] = True
+                else:
+                    field = 'subject' if label == 'changed-subject' else 'invocation'
+                    f[field]['fingerprint'] = 'f' * 64
+                    body = guard.encoded(f)
+                    (directory / 'final.json').write_bytes(body)
+                    c['reference']['sha256'] = hashlib.sha256(body).hexdigest()
+                (directory / 'completion.json').write_bytes(guard.encoded(c))
+                with self.future(), self.assertRaises(guard.GuardError):
+                    self.store.auto_reconcile(run.run_id)
+                self.assertFalse(self.reconciled_path(run).exists())
+                self.assertEqual((pool_dir / 'head.json').read_bytes(), head)
+                (directory / 'completion.json').write_bytes(completion)
+                (directory / 'final.json').write_bytes(final)
+
+    def test_interrupted_marker_publication_resumes_without_rewriting_history(self):
+        run, owner, children, _ = self.uncertain()
+        self.stop_owned(owner, *children)
+        with mock.patch.object(self.store, '_pool_event', side_effect=OSError('fixture disk full')):
+            with self.assertRaises(OSError):
+                self.store.reconcile(run.run_id, actor='fixture', reason='owned processes ended', evidence='all fixture PIDs joined')
+        marker = self.reconciled_path(run).read_bytes()
+        self.assertEqual(self.pool()[1]['active'], run.run_id)
+        with self.future():
+            report = self.store.auto_reconcile(run.run_id)
+        self.assertTrue(report['reconciled'])
+        self.assertIsNone(self.pool()[1]['active'])
+        self.assertEqual(self.reconciled_path(run).read_bytes(), marker)
+
+    def test_partial_multiple_pool_resume_preserves_newer_owner_and_cooldown(self):
+        run, owner, children, _ = self.uncertain(pools=('fixture-pool', 'second-pool'))
+        self.store.release_pool('claude', 'second-pool', run.run_id, reason='TIMEOUT')
+        self.stop_owned(owner, *children)
+        original = self.store._pool_event
+        calls = []
+        def fail_second(directory, state, action, **facts):
+            calls.append(state['pool'])
+            if len(calls) == 2: raise OSError('fixture interrupted after first pool')
+            return original(directory, state, action, **facts)
+        with mock.patch.object(self.store, '_pool_event', side_effect=fail_second), self.assertRaises(OSError):
+            self.store.reconcile(run.run_id, actor='fixture', reason='owned processes ended', evidence='all fixture PIDs joined')
+        marker = self.reconciled_path(run).read_bytes()
+        released = calls[0]; remaining = calls[1]
+        next_run = self.begin_owned(self.facts_for(self.child()), label='new-owner')
+        self.store.acquire_pool('claude', released, next_run.run_id)
+        newer_dir, newer = self.pool(released); before_newer = (newer_dir / 'head.json').read_bytes()
+        before_remaining = self.pool(remaining)[1]
+        with self.future():
+            self.assertTrue(self.store.auto_reconcile(run.run_id)['reconciled'])
+        self.assertEqual(self.pool(released)[1]['active'], next_run.run_id)
+        self.assertEqual((newer_dir / 'head.json').read_bytes(), before_newer)
+        after = self.pool(remaining)[1]
+        self.assertIsNone(after['active'])
+        self.assertEqual({k: after[k] for k in ('cooldown', 'reason', 'reset_at')},
+                         {k: before_remaining[k] for k in ('cooldown', 'reason', 'reset_at')})
+        self.assertEqual(self.reconciled_path(run).read_bytes(), marker)
 
 
 class ZeroLaunchAttempts(StoreFixture):

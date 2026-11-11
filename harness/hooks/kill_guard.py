@@ -233,10 +233,12 @@ def pure_data_python(code):
     return True
 
 
-def hook_script_ok(raw, names):
-    """The raw word names ~/.claude/hooks/<name>.py or the same path under the caller's real HOME, nothing else."""
+def hook_script_ok(raw, names, codex=False):
+    """The raw word names ~/.claude/hooks/<name>.py or the same path under the caller's real HOME, nothing else.
+    With codex=True the Codex install copy ~/.codex/agent-harness/<name>.py counts as well (goodqa#15565)."""
     home = re.escape(str(Path.home()))
-    return bool(re.fullmatch(r'(?:~|%s)/\.claude/hooks/(?:%s)\.py' % (home, '|'.join(names)), raw or ''))
+    root = r'\.claude/hooks' if not codex else r'(?:\.claude/hooks|\.codex/agent-harness)'
+    return bool(re.fullmatch(r'(?:~|%s)/%s/(?:%s)\.py' % (home, root, '|'.join(names)), raw or ''))
 
 
 # --------------------------------------------------------------------------- policy and small helpers
@@ -1429,7 +1431,8 @@ def make_analyzer_class(cg):
             i = 0
             while i < len(args) and args[i].text in ('-I', '-B', '-u'):
                 i += 1
-            if i >= len(args) or not hook_script_ok(args[i].raw, ('ah', 'wal_note', 'provenance')) or self.home_moved():
+            if i >= len(args) or not hook_script_ok(args[i].raw, ('ah', 'wal_note', 'provenance'), codex=True) \
+                    or self.home_moved():
                 return False
             if args[i].text.endswith('/ah.py'):
                 # only a known non-kill subcommand (optionally after the top-level --text) makes the rest data

@@ -570,6 +570,32 @@
    ]
   },
   {
+   "id": "mission-gate:stop",
+   "script": "mission_gate.py",
+   "arg": null,
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "mission-gate:pretool",
+   "script": "mission_gate.py",
+   "arg": "pretool",
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
    "id": "dropped-gate:pretool",
    "script": "dropped_gate.py",
    "arg": "pretool",

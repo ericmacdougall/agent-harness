@@ -511,6 +511,50 @@ class DriftTests(GitFixture):
         self.assertEqual(ow.check_drift(cfg, ow.run), [])
 
 
+class StaleRuntimeTests(Base):
+    """goodqa#15646 plan A: runtime sessions that outlived their binary are listed so restarts are scheduled."""
+
+    ROWS = [{"pid": 2990, "ppid": 761, "name": "claude", "started": 1794126395},
+            {"pid": 4010, "ppid": 1, "name": "codex", "started": 1794200000}]
+
+    def run_check(self, rows):
+        import native_context
+        with mock.patch.object(native_context, "stale_runtime_processes", return_value=rows):
+            return ow.check_stale_runtimes(self.cfg)
+
+    def test_nothing_stale_is_silent(self):
+        self.assertEqual(self.run_check([]), [])
+
+    def test_stale_runtimes_raise_one_warning_naming_pids_and_the_remedy(self):
+        alerts = self.run_check(self.ROWS)
+        self.assertEqual(len(alerts), 1)
+        alert = alerts[0]
+        self.assertEqual((alert["check"], alert["key"], alert["severity"]), ("runtime", "runtime:stale", "warning"))
+        for needle in ("claude pid 2990", "codex pid 4010", "restart"):
+            self.assertIn(needle, alert["message"])
+        self.assertEqual([row["pid"] for row in alert["detail"]["processes"]], [2990, 4010])
+
+    def test_message_and_detail_are_bounded_and_clean(self):
+        rows = [{"pid": 1000 + i, "ppid": 1, "name": "claude", "started": 1} for i in range(40)]
+        alert = self.run_check(rows)[0]
+        self.assertLessEqual(len(alert["message"]), 400)
+        self.assertEqual(len(alert["detail"]["processes"]), 10)
+        self.assertIn("40", alert["message"])
+
+    def test_a_scan_that_raises_is_silent_not_a_crash(self):
+        import native_context
+        with mock.patch.object(native_context, "stale_runtime_processes", side_effect=RuntimeError("boom")):
+            self.assertEqual(ow.check_stale_runtimes(self.cfg), [])
+
+    def test_the_check_is_registered_and_can_be_disabled(self):
+        self.assertIn("runtime", ow.DEFAULT_CHECKS)
+        import native_context
+        with mock.patch.object(native_context, "stale_runtime_processes", return_value=self.ROWS):
+            off = dict(self.cfg, stale_runtime={"enabled": False})
+            self.assertEqual(ow.DEFAULT_CHECKS["runtime"](off, {}, None, 0), [])
+            self.assertEqual(len(ow.DEFAULT_CHECKS["runtime"](self.cfg, {}, None, 0)), 1)
+
+
 class CodexTrustTests(Base):
     def write(self, trust_all=True, tamper=False):
         codex = self.home / ".codex"

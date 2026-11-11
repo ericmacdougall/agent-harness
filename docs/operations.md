@@ -21,6 +21,7 @@
 | `domain_gates.py`, `domain_checklists.json` | Blockchain domain gates: detect blockchain work from repo signals and supply a risk checklist, test scaffolds and follow-up prompts to specs and review prompts. |
 | `worktree_hygiene.py` | Stop/SubagentStop gate (rule S18): no turn ends with uncommitted work in a worktree it touched; reports unpushed, merged and duplicate worktrees (vendored from Hawkeye). |
 | `wal_cadence.py` | Stop/SubagentStop nudge (rule W04): one bounded block when a big uncommitted diff has no recent human-readable WAL entry (ported from Hawkeye). |
+| `mission_coverage.py`, `mission_gate.py` | Mission goals (goodqa#15565): the goals file and its audit chain, the coverage rule, and the Stop gate that blocks main while a goal has no live owner, live disposition or done evidence (see Mission coverage). |
 | `prod_delete_guard.py` | PreToolUse gate on destructive SQL against production databases, lifted only by a user-sourced, target-bound grant (ported from Hawkeye). |
 | `spec_flow.py`, `spec_policy.json`, `spec_template.md` | Spec-driven tickets: spec documents, spec reviews, per-criterion evidence, click-test records, sign-off and the done gate (CLI, plan-review ticket gate, PreToolUse hook on GoodQA status changes). |
 
@@ -44,6 +45,7 @@ python3 ~/.claude/hooks/peer_review.py pr --repo <worktree> --packet <p> --outpu
 
 - **The result is advisory, never a sign-off.** Kimi sees only the packet text (and any snapshot files you pass), never the repository, and the author controls that text. Report headers say so: `Reviewer: kimi-code/<model>`, `Reviewer-Rung: n/a`, `Review-Input: packet text only (no repository snapshot, no tools)`, `Advisory: yes`. Other headers: `Reviewed-Model`, `Reviewed-Packet-SHA256` (raw packet bytes), `Reviewed-HEAD` when given, `Tokens-In-Estimate` and `Tokens-Out-Estimate` (the CLI reports no usage, so these are bytes/3), `Cost-USD: 0 (subscription)`, `Request-Id` (the CLI session id). The verdict line is `KIMI_ADVISORY: ACCEPT|BLOCK`. Reports are created exclusively with mode 0600.
 - **peer_review.py:** `--secondary kimi` makes Kimi the single authorized independent fallback in place of the other harness, so one primary plus one fallback with no same-provider loop is unchanged. Kimi runs only after the primary fails with a quota, auth or availability error. Its answer is written to the report path with the advisory headers, the receipt records reason `ADVISORY`, the run exits 4 (not 0 pass, not 3 block), a `VERDICT: PASS` line in its text is neutralised, and nothing is recorded in the task ladder. A main-agent decision is needed before any Kimi opinion counts toward a gate; it would then need to see the gated diff, not the packet alone.
+- **Codex-only execution:** `peer_review.py ... --reviewer codex-only` restricts both tier selection and the actual attempt order to Codex. It never leases or launches Claude or Kimi, including when Codex is absent, capped, unauthenticated or returns no valid result; `--secondary kimi` conflicts and refuses before reservation. Default `--reviewer auto` preserves the existing routing. The reviewer rung, effort, model permissions, evidenced author and review/merge eligibility are unchanged. Requested route, effective attempt order and actual validated reviewer are recorded in invocation, selection/report and execution evidence. A same-harness or unknown-author review can produce a bound review result while remaining ineligible to authorize a merge; selecting Codex does not supply a missing main stamp, human/source/session proof or approval. Source publication, installation and an actual reviewed invocation remain distinct states.
 - **Egress gate (fails closed, before the CLI starts):** it refuses private locations (`~/.agent-harness/scratch` task outputs, local log-backup staging, `.claude/wals`, `.claude/projects`, `.claude/shell-snapshots`, `.claude.json`, `.codex`, `.config/gh`, `.config/gcloud`, `.ssh`, `.gnupg`, `.aws`, `.kimi-code` and the other Kimi directories, harness state, the leak denylist, keychains), matched case-insensitively and by inode, plus `*.jsonl`, `.env*`, names containing `secret`, `token` or `transcript`, and key files. It refuses any file with more than one hard link and any symlink inside a snapshot directory. Content is normalised (NFKC, invisible characters dropped, common lookalike letters folded) and then refused when it matches `redact.py` shapes, other key shapes (Stripe, short keys, base32 seeds, credential URLs, split tokens), long high-entropy strings (git and sha256 digests pass; lockfiles up to 200 KB may carry integrity hashes), WAL or Claude-transcript shaped JSON, the private `~/.agent-harness/leak-denylist.txt`, or the forbidden topics (yates, apex_app_pos, Granola, interview and Solve material). Verbatim user work-instruction quotes in `Source:` lines are allowed. Emails are redacted. The cap is 1.5 MB, collection stops reading at the cap, the gate checks a 20 second limit between scan steps and scans in 64 KB chunks, and because the prompt travels in argv the CLI path also refuses payloads over 600 KB (the Mac limit; Linux limits one argument to 128 KB). A refusal names the rule and line, never the matched text, and a refused call is not counted as a launch. In `peer_review.py` the gate also checks the packet path itself.
 - **Isolation:** the agent file is parsed back and must declare `tools: []`; any tool call or tool record in the output fails the review closed. The CLI runs in an empty directory outside any repository, with a minimal environment (`HOME`, `XDG_*`, `TMPDIR`, `PATH`, `LANG`, `KIMI_*` limits), a scratch `HOME`, and a scratch `KIMI_CODE_HOME` whose `config.toml` carries only the managed provider, the one model and `default_permission_mode = "manual"`. The login directories are symlinked in, never read. The user's plugins (including kimi-cu), MCP servers, hooks and permission mode therefore cannot apply. `KIMI_LOOP_MAX_STEPS_PER_TURN=1` and `KIMI_LOOP_MAX_ATTEMPTS_PER_STEP=1` bound the CLI's own loop and its internal 429 retry. The CLI version must be 2.5.x (tested range) and its path passes the same executable trust checks as codex and claude. The child runs in its own process group, which is killed on exit. The CLI writes its session records into the scratch home, which is deleted when the call ends; nothing is added to `~/.kimi-code/sessions`.
 - **Fast mode and swarm:** every call defaults to K3.1 Pro fast mode, which the CLI exposes as the alias `kimi-code/k3.1-pro-highspeed` (listed as "2x usage cost" against the subscription quota). Swarm cannot be enabled: the Kimi Code docs say only the user can turn swarm mode on (`/swarm` in the TUI), swarms are unavailable in `kimi -p`, and there is no flag or config key for it (confirmed by experiment on CLI 2.5.2). Docs checked 2026-11-07: https://moonshotai.github.io/kimi-code/ (llms-full.txt, release 2.3.2 and the AgentSwarm tool entry).
@@ -122,14 +124,16 @@ python3 ~/.codex/agent-harness/usage_guard.py reconcile --run RUN_ID --actor own
 python3 ~/.codex/agent-harness/usage_guard.py ack-pool --provider codex --pool default --actor owner-a --reason 'Availability change verified' --evidence 'private-evidence-reference'
 ```
 
-Every START also records who holds the reservation (`owner_process`: pid, host, boot id, a process start-time token taken with TZ=UTC, and a deadline of the run's recorded timeout plus 60 s of grace; `AGENT_HARNESS_DEADLINE_GRACE` 0..3600 shortens the grace for live tests). A supervisor records each child it spawns through `process.run(on_spawn=run.note_child)` in `children.json`; peer_review records its reviewer process. A reservation without a FINAL is reconciled automatically, on the next `begin`, `acquire_pool`, `reconcile --auto` or `sweep`, only when all of these are proven on the same host: the owner is dead (pid gone, or alive with a different start token of the same scheme, or the boot id changed), every recorded child is dead by the same rule, and the deadline has passed. The record is a `reconciled.json` of kind `automatic_reconciliation` with the liveness facts as evidence; it keeps the run UNKNOWN / NO_RESULT, releases the pools the run held with a `RECONCILED` event, and never writes a FINAL; a late `finish` on a reconciled run is refused and its result discarded. A dead owner before its deadline, an owner on another host, a live owner or child, a START without owner facts, a boot id that cannot be read, and any pool held by a FINAL that itself says TIMEOUT or UNKNOWN stay uncertain and still need the manual command above.
+Every START also records who holds the reservation (`owner_process`: pid, host, boot id, a process start-time token taken with TZ=UTC, and a deadline of the run's recorded timeout plus 60 s of grace; `AGENT_HARNESS_DEADLINE_GRACE` 0..3600 shortens the grace for live tests). A supervisor records each child it spawns through `process.run(on_spawn=run.note_child)` in `children.json`; peer_review records its reviewer process. Automatic reconciliation on the next `begin`, `acquire_pool`, `reconcile --auto` or `sweep` requires same-host proof that the owner and every recorded child are dead, plus an expired deadline. An incomplete reservation without a valid completion-bound FINAL additionally requires independent reboot proof: matching supported `procboot` or `bootsession` schemes, canonical UUID payloads from the recorded and current kernel boot identities, and distinct UUID values. Letter-case differences alone are not a reboot. On the same boot, even an empty list or all registered children being dead cannot establish that an unregistered spawn is gone; START and children.json have no terminal launch-completeness certificate. Such runs remain UNKNOWN and need the manual evidence path above. A bare final.json without its valid completion reference does not supply that certificate; malformed completion evidence is refused.
+
+A completion-bound FINAL with NO_RESULT and TIMEOUT or UNKNOWN can release an exact still-held pool under the existing strict completed-run rule: complete, unique recorded child identities matching the declared provider-launch count, or independent same-host reboot proof. Zero-launch evidence additionally requires NOT_STARTED; an absent/unknown count or missing child record alone never proves cleanup. Completion, FINAL and indexed START identities are checked before using this history. The append-only `reconciled.json` keeps UNKNOWN / NO_RESULT and releases only matching pool pointers through `RECONCILED` events; old FINAL/completion records stay unchanged. An interrupted publication resumes outstanding matching pointers using the original valid marker, preserving newer owners and cooldown. This does not retroactively rewrite prior reconciliation history. A late `finish` stays refused. Other-host/live/unprovable owners or children, incomplete launch evidence and pre-deadline reservations remain unresolved. No blanket pool clearing or reboot is prescribed as recovery.
 
 ```sh
 python3 ~/.codex/agent-harness/usage_guard.py reconcile --run RUN_ID --auto
 python3 ~/.codex/agent-harness/usage_guard.py sweep
 ```
 
-`sweep` prints one report per run (`reconciled`, `why`, `liveness`), probes only runs without a completion, and is safe to run on a schedule; the dead-man check uses it.
+`sweep` prints one report per run (`reconciled`, `why`, `liveness`), examines incomplete or eligible uncertain reservations, and is safe to run on a schedule; the dead-man check uses it. Review diagnostics distinguish a positively observed local `REVIEW_NOT_STARTED` refusal from `REVIEW_LAUNCH_UNCONFIRMED`: no exit status alone cannot prove that no child started, because child-record callbacks run after process creation. Neither diagnostic is evidence of an external provider outage; inspect the local receipt and pool/child state before a changed-state retry.
 
 Attempt budget: an attempt is zero-launch only when its FINAL shows `provider_launches` 0 (an int), no reported usage, execution `NOT_STARTED` and reason TRANSIENT_INFRA, LOW_DISK, QUOTA or AUTH: the provider was never launched and the refusal was infrastructure. Such attempts do not spend the two-launch repeat budget and the next attempt needs no `--repeat-reason`. Launched attempts, content outcomes (CODE_FINDINGS, INPUT_CHANGED, INVALID_OUTPUT), uncertain results and reconciled runs without a FINAL still count. Zero-launch attempts are bounded to 6 per rolling hour per invocation (`ZERO_LAUNCH_CAP`, `ZERO_LAUNCH_WINDOW`) and 32 attempt slots in all (`MAX_ATTEMPTS`); the refusal is `BUDGET_EXHAUSTED` and names the infrastructure, not the packet. Every attempt's elapsed time still counts against the declared aggregate budget.
 
@@ -221,6 +225,8 @@ The rescue wrapper does not stage or commit leftover model edits. It always exit
 | `PROVIDER_USAGE_LIMIT` | `QUOTA` | The provider reported a usage limit in free text (no structured code). | Wait for the limit to reset or use the other authorized provider; the helper already tries one independent fallback and will not retry this provider. No account-pool cooldown is written because the text is unstructured. |
 | `PROVIDER_AUTH` | `AUTH` | The provider rejected authentication. | Sign in again with the provider CLI, then rerun once. |
 | `PROVIDER_UNAVAILABLE` | `TRANSIENT_INFRA` | The provider was overloaded, rate limited or its model was unavailable. | Rerun once later; the helper already tried the independent fallback if one was allowed. |
+| `REVIEW_NOT_STARTED` | `TRANSIENT_INFRA` | Local review infrastructure refused before the provider launch boundary (NOT_STARTED); no provider response was observed. | Inspect the local run receipt and provider-pool reservation or cooldown. Reconcile only with the required ownership evidence; do not retry unchanged. |
+| `REVIEW_LAUNCH_UNCONFIRMED` | `UNKNOWN` | No reviewer exit status was recorded; a provider process may have started. This does not establish a provider outage. | Inspect the run and child records and reconcile uncertain process ownership before any retry. Do not assume best-effort cleanup succeeded. |
 | `BUDGET_EXHAUSTED` | `BUDGET_EXHAUSTED` | The 1440 second review budget (720 per provider) was used up. | Do not loop. Reconcile the usage store, then decide with the main agent whether one repeat with --repeat-reason is justified. |
 | `PROVIDER_TIMEOUT` | `TIMEOUT` | The provider exceeded its 720 second deadline. | Reconcile the run in the usage store before any retry; do not loop. |
 | `PROVIDER_IO_UNKNOWN` | `UNKNOWN` | The provider process could not be supervised to a known end. | Reconcile the unknown run in the usage store before any retry. |
@@ -1235,6 +1241,198 @@ Workaround: from such a cwd, spawn `general-purpose` owners and tell each to cre
 work directory (`git -C <repo> worktree add -b <branch> ~/.agent-harness/work/<session>/<task>/wt <base>`). A
 `WorktreeCreate` hook is deliberately not installed: it replaces Claude's worktree logic for every worktree, including
 owners already working in real repositories, and Claude never auto-removes the worktrees such a hook makes for subagents.
+
+## Mission coverage
+
+Every active mission goal must be held by someone, wait on something named, or be done with evidence (goodqa#15565).
+The dropped-owner gate only sees owners that existed and stopped; on 2026-11-10 the leads goal (goodqa#15095) had no
+owner all night and nothing said so. `harness/hooks/mission_coverage.py` holds the rule, `mission_gate.py` enforces it
+at main's Stop (and stamps main's main-only commands), and the ops-watch `mission` check alerts on it.
+
+### Goals file
+
+One canonical file, `~/.agent-harness/mission/goals.json` (directory 0700 and not a symlink, file 0600, at most 1 MiB,
+500 goals, nesting depth 8; a symlink, FIFO or any wrong type makes the whole file unreadable). It is a JSON object
+`{"mission_session": "<session id>", "goals": [...]}` (a bare list, the first format, has no mission session):
+
+| field | type | meaning |
+| --- | --- | --- |
+| `mission_session` | session id | the main session the Stop gate holds to the mission; set by the first `import-initiatives` or by `set-session` (main only; see the hand-over rule below) |
+| `id` | `[a-z0-9][a-z0-9_-]{0,63}` | unique goal id (the dashboard initiative id) |
+| `title` | text, up to 300 | what the goal is |
+| `ticket` | `goodqa#N`, `Project#N` or `""` | the stream ticket; owners are matched by it, never by name. Changing it is main only |
+| `priority` | integer 1..9 | 1 is the most important |
+| `status` | `imported`, `active`, `done`, `deferred`, `retired` | `imported` is reported, not enforced, until `activate`; `done` only through `done`, `deferred` only through `defer --user-source`, `retired` only through `retire` |
+| `deferral` | `{by: user\|ask\|ticket, ref, until, source, renewal}` | what the goal waits on; `ref` must be an ask id (`ask`) or a ticket (`ticket`), `until` an ISO time, or the file is unreadable |
+| `wait_count` | integer | ask/ticket waits in a row without the user's word |
+| `bound` | list of full agent ids | owners main bound to the goal (`bind`) |
+| `retire` | `{source}` | the user's words that cancelled the goal |
+| `done_evidence` | `[{kind: deploy\|really_tested, ref, session}]` | WAL ids proving it is live and tested |
+| `repos` | list of paths, optional | repositories whose commits naming the ticket count as progress (main only) |
+| `dashboard` | object, informational | copied from the dashboard on import; never read by the rule (its `owner` field covers nothing) |
+
+Write it only through the tool. Each write appends a hash-chained row to
+`~/.agent-harness/state/mission-goals-audit.jsonl`: `prev` is the sha256 of the previous row, the last row's hash is in
+`mission-goals-audit.head`, the goals file's sha256 is in `after_sha`, and the mission session is in `session`. Past
+16 MiB the file is renamed to `mission-goals-audit.NNNNNN.jsonl` and the chain continues in a new file. A goals file
+that does not match the chain head is treated as tampered: a goal removed or edited by hand, or an audit row edited or
+deleted in any segment. The gate then blocks the session the chain names (never a session the edited file names), and
+every write is refused until main runs `reseal --reason`.
+
+Readers take a shared lock on `mission-goals.lock`, so a concurrent write is never read as tampered.
+
+    mission_coverage.py import-initiatives ~/.agent-harness/work/<session>/dashboard/initiatives.json   # main
+    mission_coverage.py activate --goal leads                                                             # main
+    mission_coverage.py add --goal leads --title "1,000 leads in the CRM view" --ticket goodqa#15095 --priority 1
+    mission_coverage.py set --goal leads [--title T] [--priority N] [--status active] [--clear-deferral]
+    mission_coverage.py set --goal leads --ticket T | --repo PATH...                                      # main
+    mission_coverage.py bind --goal leads --agent <full agent id> --source ticket:goodqa#15095 [--remove] # main
+    mission_coverage.py defer --goal leads --ask <open ask naming the goal> --until <ISO, at most 7 days ahead>
+    mission_coverage.py defer --goal leads --ticket <open blocking ticket> --until <ISO, at most 7 days ahead>  # main
+    mission_coverage.py defer --goal leads --user-source "<user: or answer: source>" [--until <ISO>]     # main
+    mission_coverage.py retire --goal leads --user-source "<user: or answer: source>"                    # main
+    mission_coverage.py done --goal leads --deploy <deploy WAL id> --live-test <REALLY_TESTED id>
+    mission_coverage.py set-session [--session S] | --user-source "<user: source in this session>"       # main
+    mission_coverage.py reseal --reason "<what changed and why>" [--force]                                # main
+    mission_coverage.py verify | report [--json] | check
+
+Main-only commands need a one-shot stamp (`caller_identity.put_stamp`, purpose `mission-main`, single use, 10
+minutes) that `mission_gate.py pretool` writes only when the PreToolUse payload proves main (`caller_identity.is_main`)
+and the Bash command runs `mission_coverage.py` itself:
+
+- The stamp is keyed by the sha256 of the exact argument list after the script (`argv_key`; `--flag=value` reads as
+  `--flag value`), so it covers that one command and nothing else.
+- The hook stamps only a script at command position: the first word of a simple command (after `;`, `&&`, `||`, `|`,
+  `(` or a newline), optionally after `VAR=x` words and `python3 [-flags]`. Redirections and their targets (`2>&1`,
+  `> out`) and `#` comments are left out of the argument list. Text that only mentions the script is never stamped:
+  `echo`, `grep`, `printf '...'`, `bash -c '...'`, and any command with a here-document (`<<`). `goodqa#9` is one word,
+  as in bash.
+- The line is split by a quote-aware tokenizer (`mission_gate.shell_tokens`), not by shlex: a quoted or backslash-escaped
+  `;`, `&&`, `|`, `(`, `)` or newline is part of a word and never starts a command, so `echo ";" mission_coverage.py
+  reseal ...` gets no stamp (r14 F1). A line with `$(...)`, backticks, `<(...)`, `$'...'`, a here-document or an
+  unbalanced quote gets no stamp at all, nor does an argument the shell computes (`$VAR`, an unquoted glob or brace).
+- The command takes (consumes) its stamp first, before argparse or any validation. A main command that then fails,
+  prints `--help` or exits on an argparse error leaves nothing a later process could use.
+- Once goals.json names a mission session, the stamp must come from that session. Another top-level session (another
+  main, or a sub-agent's own `claude -p`) is refused even with a stamp of its own.
+- A leading unquoted `~/` is expanded as bash does. Other arguments the shell computes (`$VAR`, `$(...)`, globs) differ
+  from what the hook saw, so such a command is refused. Run main-only commands with literal arguments.
+
+A sub-agent's shell, a copied script or a cron job finds no stamp and gets a refusal naming main. Every main-only
+change, and every ask or ticket wait, raises a high `mission:goals:changed` alert (source `mission-coverage`) with the
+old and new value.
+
+Hand-over (`set-session`): with no mission session yet, any main sets it. The mission main may move it, to itself or to
+another session id. Any other session may take it only for itself, with `--user-source`: a `user:` or `answer:` source
+from its own transcript whose whole sentence says to move the mission ("take over the mission in this session"), as a
+one-segment quote with no condition or refusal. The sentence must say take over the mission, or hand, move, transfer,
+pass or bring the mission here or to this session, and either name this session as the destination ("here", "this
+session", "you") or be an imperative ("Take over the mission."). A refusal, condition or question anywhere in it, a
+cancelling word (stop, cancel, drop, abort, keep, leave, block) or another destination ("the other session", "to
+session <id>") refuses it (r14 F2). The same shared checker (`user_words_ok`) judges defer, retire and takeover
+quotes. That is the recovery when the old main died. The change re-checks the
+mission session under the write lock.
+
+Limit (threat model): stamps are not signed. A same-user process can write a stamp file into
+`~/.agent-harness/state/main-stamps/` itself, as it can edit the hooks or the HMAC key. Stamps stop careless agents and
+the copied-command, leftover-stamp and other-session cases above, not a same-user agent that sets out to forge them. A
+stamp left by a main command that never ran (for example `false && mission_coverage.py reseal ...`) can still be used
+within 10 minutes by a process that runs exactly the same argument list. `reseal` is refused while the chain is intact unless
+main passes `--force`; its audit row records the sealed hash, the hand-edited file's hash and the removed goal ids.
+
+`ah task register` rows no longer bind owners: ah records the caller from the environment (`AH_AGENT_ID`, else
+`unknown`), so a registration cannot prove that main wrote it. Use `bind`, which needs main's stamp, a full agent id
+(16+ characters, never a prefix) and a `user:`, `answer:`, `queue:` or `ticket:` source. The binding covers only while
+`ah owners` reports that exact id as a live owner-type row.
+
+`import-initiatives` is an idempotent merge. New ids come in as `imported`: reported, not enforced. Dashboard rows whose
+state starts with done, live, complete, shipped or retired are marked `needs_evidence`. Existing goals keep every field,
+their status included, and only gain a missing ticket and the informational `dashboard` block. Nothing is removed and
+nothing is marked done (a dashboard "Done" is not evidence).
+
+### The rule
+
+A goal with status `active` (or `deferred`) is covered by
+
+1. a live owner: an `ah owners` row of an owner type (never a helper such as red-team, click-tester, fixer, Explore,
+   Plan) in state live, working, quiet or SILENT (SILENT not after an ending disposition), whose stream ticket (the
+   first GoodQA ticket in its WAL) equals the goal's ticket, or whose exact agent id main bound to the goal;
+2. a live disposition:
+   - an `ah task dispose` waiting, resumed or reassigned disposition that ah reports live, on such an owner row;
+   - a wait on an ask that is open in main's WAL and whose text names the goal id or ticket;
+   - a wait on another ticket (main only) that was open in GoodQA when it was recorded (checked through ah's adapter,
+     10 s bound). The Stop gate and `report` check it again: a waited-on ticket that is now closed or missing no longer
+     covers. Those lookups run in parallel within 2.5 s; an "open" answer is reused for 10 minutes, and no answer in time
+     keeps the wait with "open state not confirmed this turn";
+   - an ask or ticket wait needs `until` in the future and at most 7 days ahead, and at most 2 waits in a row
+     without the user's word; the third makes the goal UNCOVERED again;
+   - a deferral the user decided: its `user:`/`answer:` source resolves through provenance.py to the user's own words,
+     quoted as one segment (no `...`). The verb must sit right next to the goal (id, also hyphenated or spaced, or
+     `#<ticket number>`, with "the", "goal", "work" and the project name folded in): defer, park, pause, postpone or
+     shelve the goal, hold off on it, put it on hold, "<goal> can wait", or "<goal> is deferred/parked/paused/on hold".
+     The whole sentence of the user's turn that holds the quote (not only the quoted fragment) must contain no refusal,
+     condition or negation (don't, not, no, never, any "n't" form, if, unless, maybe, should, might, a question mark,
+     stop, quit, resume, restart, abort, except, instead, never mind). The sentence is judged as written: no word is
+     removed first, so "Do not now pause leads" and "do not pause leads, not now" are refusals (r14 F3). "wait",
+     "later", "hold" and "stop" alone are not a decision. `report` prints the quoted
+     words. `retire` follows the same rules with drop, cancel, retire, abandon or scrap (or the word kill) next to the
+     goal, or "<goal> is dropped/cancelled/retired/dead";
+3. done evidence (status `done`): a deploy record and a later REALLY_TESTED entry against a live target, both from the
+   mission session's WALs and both naming the goal's ticket, checked with `ah`'s own evidence resolvers (the DONE_LIVE
+   rule).
+
+`retired` counts only while the user's quoted words name the goal and say drop, cancel, retire or stop. `imported`
+never blocks. Anything else is UNCOVERED.
+
+A covered goal is STALLED when none of its owners wrote an own WAL entry for more than 45 minutes and no commit in its
+`repos` names the ticket in that time. Hook lifecycle rows and rows another agent wrote into the owner's WAL do not
+count. The report gives the age.
+
+When the owner cap (`model_tiers.json` caps.session_owner_agents) is full and a goal is uncovered, the message names the
+owner to free or queue: owners on no mission goal first (most idle first), then owners of the lowest-priority, most
+stalled goal, plus the option to queue the goal on its ticket.
+
+### Owner lists and signatures
+
+`ah owners` has no cheaper mode; on a 2,089-owner session it takes 10-25 s, more than a Stop hook can spend.
+
+- ops-watch (every 10 minutes) runs the full scan, bounded by `mission.timeout_s` (default 120). It writes the scan to
+  `~/.agent-harness/state/mission/owners-<session>.json`, signed with HMAC-SHA256 and carrying `by: ops_watch` and a
+  monotone `seq` that is kept in a signed seq file. ops-watch is the only writer; the gate never writes it.
+- The Stop gate uses that snapshot when its signature, session, writer and seq check out and it is at most 15 minutes
+  old. Otherwise it scans live within 9 s.
+- A missing, forged, replayed, foreign or stale snapshot plus an overrun scan never counts as coverage. The turn may
+  end with "owner list unavailable", and the gate raises a high `mission:scan:unavailable` alert.
+- The verification cache (`state/mission/verify-cache.json`) is signed the same way. It remembers a pass for a day and
+  a failure for 60 s; a failure is never cached as a pass.
+- Limit: the key (`state/mission/hmac.key`, 0600) is readable by every process of the same user. The signatures stop a
+  stray write or a careless agent, not a same-user agent that sets out to forge them. Such an agent can also edit the
+  hooks (see `caller_identity.py`).
+
+### Enforcement
+
+- Stop gate (`mission_gate.py`, registered next to the dropped-owner gate):
+  - It runs only for main (`caller_identity.is_main`) and only in the mission session. Other sessions, sub-agents and
+    hosts without a goals file never block.
+  - It blocks with the 5 worst uncovered goals, the count of the rest, `mission_coverage.py report` and the fixes once,
+    in at most 1.5 KB. Every value from the goals file, a WAL or a ticket is stripped of control characters and capped
+    at 80 characters. A goal without a ticket gets "give it a ticket with `set --goal ID --ticket T` first".
+  - An unreadable or tampered file blocks with one line.
+  - At most 25 blocks per signature (the sorted uncovered ids). After that the turn may end and a high
+    `mission:gate-valve` alert goes to the ring. The count starts again from zero when the signature clears or changes.
+  - A repeated Stop in the same turn is not blocked.
+- ops-watch `mission` check (enabled by default; `{"mission": {"enabled": false}}` in ops-watch.json turns it off):
+  - It checks the session in `mission_session` and raises `mission:<goal>:uncovered` (high, `stop_block`),
+    `mission:<goal>:stalled` (warning) and `mission:goals:unreadable` (high). Alerts clear when the goal is covered.
+  - When the owner scan is unavailable, it keeps the last mission alerts, raises `mission:scan:unavailable`
+    (warning) and sends no "covered again" notice.
+- Waking main: when the uncovered set gains a goal, `notify_main` raises `mission:notify` (source `mission-coverage`).
+  Where `mc_chat` (Mission Control, goodqa#15585) is installed and main registered a target, it also drops an inbox
+  message marked as coming from the harness, not the user. It clears when nothing is uncovered.
+- Checkpoint: `mission_coverage.py report --json` lists goals slowest first: UNCOVERED by priority, STALLED oldest
+  first, covered by least recent progress, then waiting, deferred, imported, done and retired. It includes a
+  `coverage` map for Mission Control, keyed by goal id and ticket, with `{status: uncovered|stalled|moving, reason,
+  action}`.
 
 ## Design limits
 
