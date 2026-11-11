@@ -1175,6 +1175,26 @@ def check_codex_trust(cfg):
                   {"untrusted": untrusted, "changed": changed, "hooks_json": str(hooks)})]
 
 
+def check_stale_runtimes(cfg):
+    """Runtime sessions (Claude, Codex, Kimi) still running a binary that a self-update replaced. The origin probe
+    cannot identify them, so they are denied main authority and commit attribution until restarted (fail-closed by
+    decision, goodqa#15646). Listed so restarts are scheduled instead of discovered through a refused commit."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import native_context  # noqa: PLC0415 - absent on hosts without the native probe
+        rows = native_context.stale_runtime_processes()
+    except Exception:  # noqa: BLE001 - a detector must never crash the watch
+        return []
+    if not rows:
+        return []
+    shown = ", ".join("%s pid %d" % (r["name"], r["pid"]) for r in rows[:5])
+    more = " and %d more" % (len(rows) - 5) if len(rows) > 5 else ""
+    return [alert("runtime", "runtime:stale", "warning",
+                  "%d runtime session(s) run a binary replaced by an update (%s%s); restart them (resume the same "
+                  "session) or they are denied main authority and commits" % (len(rows), shown, more),
+                  {"processes": rows[:10]})]
+
+
 # ---------------------------------------------------------------- peers
 
 def active_json_path(home: Path) -> Path:
@@ -1735,6 +1755,7 @@ DEFAULT_CHECKS = {
     "delivery": lambda c, s, r, n: check_delivery(c, r),
     "drift": lambda c, s, r, n: check_drift(c, r),
     "codex": lambda c, s, r, n: check_codex_trust(c),
+    "runtime": lambda c, s, r, n: check_stale_runtimes(c) if (c.get("stale_runtime") or {}).get("enabled", True) else [],
     "liveness": lambda c, s, r, n: check_liveness(c, s, r, n) if c["liveness"].get("enabled") else [],
     "peers": check_peers,
     "remote_units": check_remote_units,

@@ -210,7 +210,7 @@ class TerminalLoginEndsTheWalk(unittest.TestCase):
         backend = self.Chain()
         backend.login_is_terminal = False
         result = nc.probe_runtime_origin(10, backend=backend)
-        self.assertEqual(result.reason, "probe_failed")
+        self.assertEqual((result.reason, result.failed_pid), ("ancestor_unreadable", 30))  # named now, still uncertain
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(nc, "probe_runtime_origin", return_value=result):
             self.assertIsNotNone(nc.native_deny_reason({}))
 
@@ -664,6 +664,182 @@ class KernelBoundaryABI(unittest.TestCase):
                 self.backend(mutate=lambda obj, name=name, value=value: setattr(obj, name, value))[0].terminal_login_identity(30)
         with self.assertRaises(OSError):
             self.backend(mutate=lambda obj: obj.uuid.__setitem__(0, 0))[0].terminal_login_identity(30)
+
+
+class ProbeFailureReasons(unittest.TestCase):
+    """goodqa#15646 plan A: a failed probe names WHICH ancestor failed and why. Behaviour stays fail-closed."""
+
+    class Failing(FakeBackend):
+        def __init__(self, reason, pid=20, name="claude"):
+            super().__init__()
+            self.processes[10] = nc.ProcessIdentity(10, 20, 1000, 1, "/usr/bin/python3")
+            self.reason, self.fail_pid, self.fail_name = reason, pid, name
+
+        def process(self, pid):
+            if pid == self.fail_pid:
+                raise nc.ProbeFailure(self.reason, pid, self.fail_name)
+            return super().process(pid)
+
+    def test_each_reason_code_is_reported_with_the_failing_pid_and_name(self):
+        for reason in ("ancestor_binary_replaced", "ancestor_unreadable", "signature_refused"):
+            with self.subTest(reason=reason):
+                value = nc.probe_runtime_origin(10, backend=self.Failing(reason))
+                self.assertEqual((value.origin, value.reason, value.failed_pid, value.failed_name),
+                                 ("unknown", reason, 20, "claude"))
+                self.assertFalse(value.main_authority)
+
+    def test_a_named_failure_still_denies_main_and_never_falls_through(self):
+        for reason in ("ancestor_binary_replaced", "ancestor_unreadable", "signature_refused"):
+            with self.subTest(reason=reason):
+                value = nc.probe_runtime_origin(10, backend=self.Failing(reason))
+                with mock.patch.dict(os.environ, {}, clear=True), \
+                        mock.patch.object(nc, "probe_runtime_origin", return_value=value):
+                    self.assertEqual(nc.native_deny_reason({}), "runtime_origin_uncertain")
+
+    def test_a_replaced_binary_is_never_offered_to_the_login_boundary_path(self):
+        class Guarded(self.Failing):
+            def terminal_login_identity(self, pid):
+                raise AssertionError("a replaced binary must not be examined as a login boundary")
+        for reason in ("ancestor_binary_replaced", "signature_refused"):
+            with self.subTest(reason=reason):
+                value = nc.probe_runtime_origin(10, backend=Guarded(reason))
+                self.assertEqual((value.reason, value.failed_pid), (reason, 20))
+
+    def test_an_unreadable_ancestor_that_is_not_a_login_is_named_not_generic(self):
+        class NotLogin(self.Failing):
+            def terminal_login_identity(self, pid):
+                raise OSError("not a login boundary")
+        value = nc.probe_runtime_origin(10, backend=NotLogin("ancestor_unreadable"))
+        self.assertEqual((value.reason, value.failed_pid), ("ancestor_unreadable", 20))
+
+    def test_a_generic_error_is_still_probe_failed_without_a_pid(self):
+        class Generic(FakeBackend):
+            def process(self, pid):
+                if pid == 20:
+                    raise OSError("something else")
+                return super().process(pid)
+        value = nc.probe_runtime_origin(10, backend=Generic())
+        self.assertEqual((value.reason, value.failed_pid, value.failed_name), ("probe_failed", None, ""))
+
+    def test_the_failing_name_is_clean_text_never_a_path(self):
+        value = nc.probe_runtime_origin(10, backend=self.Failing("ancestor_unreadable", name="/tmp/x y\n;rm"))
+        self.assertRegex(value.failed_name, r"^[A-Za-z0-9._-]{0,32}$")
+        self.assertNotIn("/", value.failed_name)
+
+    def test_the_caller_itself_failing_is_reported_too(self):
+        value = nc.probe_runtime_origin(10, backend=self.Failing("ancestor_unreadable", pid=10, name="python3"))
+        self.assertEqual((value.reason, value.failed_pid), ("ancestor_unreadable", 10))
+
+    @staticmethod
+    def libproc(pidinfo_ok, path_len, comm=b"claude"):
+        class Fake:
+            @staticmethod
+            def proc_pidinfo(pid, flavor, arg, ref, size):
+                if not pidinfo_ok:
+                    return 0
+                info = ref._obj
+                info.pid, info.ppid, info.uid, info.start_sec, info.start_usec = pid, 761, 501, 1794126395, 763881
+                info.comm = comm
+                return size
+
+            @staticmethod
+            def proc_pidpath(pid, buffer, size):
+                return path_len
+        backend = nc.DarwinBackend.__new__(nc.DarwinBackend)
+        backend.proc = Fake()
+        return backend
+
+    @unittest.skipUnless(sys.platform == "darwin", "exercises the macOS libproc backend")
+    def test_real_backend_tells_a_replaced_binary_from_an_unreadable_process(self):
+        with self.assertRaises(nc.ProbeFailure) as replaced:
+            self.libproc(True, 0).process(2990)
+        self.assertEqual((replaced.exception.reason, replaced.exception.pid, replaced.exception.name),
+                         ("ancestor_binary_replaced", 2990, "claude"))
+        with self.assertRaises(nc.ProbeFailure) as unreadable:
+            self.libproc(False, 0).process(756)
+        self.assertEqual((unreadable.exception.reason, unreadable.exception.pid), ("ancestor_unreadable", 756))
+
+    @unittest.skipUnless(sys.platform == "darwin", "exercises the macOS libproc backend")
+    def test_a_readable_process_is_still_returned(self):
+        value = self.libproc(True, len(b"/usr/bin/true"), b"true").process(321)
+        self.assertEqual((value.pid, value.parent), (321, 761))
+
+    @unittest.skipUnless(sys.platform == "darwin", "exercises the macOS Security backend")
+    def test_a_refused_guest_lookup_is_signature_refused(self):
+        class Cf:
+            def __getattr__(self, name):
+                return lambda *args: 1
+
+        class Sec:
+            @staticmethod
+            def SecCodeCopyGuestWithAttributes(*args):
+                return 100002
+
+        backend = nc.DarwinBackend.__new__(nc.DarwinBackend)
+        backend.cf, backend.sec = Cf(), Sec()
+        backend._constant = lambda name: 1
+        with self.assertRaises(nc.ProbeFailure) as refused:
+            backend.signature(2990)
+        self.assertEqual((refused.exception.reason, refused.exception.pid), ("signature_refused", 2990))
+
+
+class StaleRuntimeDetector(unittest.TestCase):
+    """Runtime processes whose binary was deleted by a self-update, so restarts are scheduled, not discovered."""
+
+    @staticmethod
+    def backend(rows):
+        """rows: pid -> (pidinfo_ok, path_len, comm, ppid)."""
+        class Fake:
+            @staticmethod
+            def proc_listallpids(buffer, size):
+                import ctypes as ct
+                pids = sorted(rows)
+                if buffer is None:
+                    return len(pids)  # the real call returns a pid count
+                array = ct.cast(buffer, ct.POINTER(ct.c_int))
+                for i, pid in enumerate(pids):
+                    array[i] = pid
+                return len(pids)
+
+            @staticmethod
+            def proc_pidinfo(pid, flavor, arg, ref, size):
+                ok, _, comm, ppid = rows[pid]
+                if not ok:
+                    return 0
+                info = ref._obj
+                info.pid, info.ppid, info.uid, info.start_sec, info.start_usec = pid, ppid, 501, 1794126395, 5
+                info.comm = comm
+                return size
+
+            @staticmethod
+            def proc_pidpath(pid, buffer, size):
+                return rows[pid][1]
+        backend = nc.DarwinBackend.__new__(nc.DarwinBackend)
+        backend.proc = Fake()
+        return backend
+
+    @unittest.skipUnless(sys.platform == "darwin", "exercises the macOS libproc backend")
+    def test_lists_only_runtime_processes_that_lost_their_binary(self):
+        rows = {
+            100: (True, 0, b"claude", 7),        # stale Claude session
+            101: (True, 0, b"2.1.319", 7),       # stale versioned Claude binary name
+            102: (True, 0, b"codex", 7),         # stale Codex
+            103: (True, 15, b"claude", 7),       # live runtime: has a kernel path
+            104: (True, 0, b"sleep", 7),         # not a runtime: ignored
+            105: (False, 0, b"claude", 7),       # other uid or gone: cannot tell, not listed
+        }
+        found = nc.stale_runtime_processes(backend=self.backend(rows))
+        self.assertEqual([(row["pid"], row["name"]) for row in found],
+                         [(100, "claude"), (101, "2.1.319"), (102, "codex")])
+        self.assertTrue(all(set(row) == {"pid", "ppid", "name", "started"} for row in found))
+
+    @unittest.skipUnless(sys.platform == "darwin", "exercises the macOS libproc backend")
+    def test_no_stale_runtime_is_an_empty_list(self):
+        self.assertEqual(nc.stale_runtime_processes(backend=self.backend({100: (True, 15, b"claude", 7)})), [])
+
+    def test_unsupported_platform_is_an_empty_list_never_an_error(self):
+        with mock.patch.object(nc.sys, "platform", "linux"):
+            self.assertEqual(nc.stale_runtime_processes(), [])
 
 
 class Packaging(unittest.TestCase):

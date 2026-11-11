@@ -407,8 +407,25 @@ def current_commit_attribution():
         return CommitAttribution("claude", "verified_runtime_origin", "running Anthropic identity")
     if (origin.origin != "unknown" or origin.native_lineage
             or origin.reason not in {"unsupported_platform", "no_native_runtime"}):
-        return CommitAttribution(None, "unknown", "native runtime attribution uncertain", True)
+        return CommitAttribution(None, "unknown", _uncertain_reason(origin), True)
     return CommitAttribution(commit_harness(), "legacy_marker", "no new runtime evidence")
+
+
+# Named probe failures (goodqa#15646): same refusal, but the text says which process and what to do.
+UNCERTAIN_REMEDY = {
+    "ancestor_binary_replaced": "its runtime binary was replaced by an update; restart the session that owns it, then retry",
+    "ancestor_unreadable": "that ancestor belongs to another user or cannot be read; commit from the session's own shell",
+    "signature_refused": "the OS refused to verify that process's code signature; restart the session that owns it, then retry",
+}
+
+
+def _uncertain_reason(origin):
+    reason, pid = getattr(origin, "reason", None), getattr(origin, "failed_pid", None)
+    if reason not in UNCERTAIN_REMEDY or type(pid) is not int or not 1 < pid < 2 ** 31:
+        return "native runtime attribution uncertain"
+    name = re.sub(r"[^A-Za-z0-9._-]", "", str(getattr(origin, "failed_name", "")))[:32]
+    return "native runtime attribution uncertain: %s (pid %d%s); %s" % (
+        reason, pid, " " + name if name else "", UNCERTAIN_REMEDY[reason])
 
 
 def trailer_harness(line: str):
