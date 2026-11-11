@@ -733,7 +733,8 @@ ASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 class Asks(Collector):
     """Open asks for the user from main's session (provenance ledger), shown as the page's "Needs you" list.
 
-    Read-only. Replies go through the existing chat channel as `[ask:<id>] text`; main resolves the ask."""
+    Read-only. Replies go through the existing chat channel as `[ask:<id>] text`; a decision goes through
+    POST /api/approve, which re-reads the ledger with `read()` at the click. Main resolves the ask either way."""
     name = "asks"
     interval = 60.0  # the ledger resolve costs about 2 CPU seconds; a resolved ask leaves the list within a minute
 
@@ -750,6 +751,12 @@ class Asks(Collector):
             self.next_at = now + 10  # the owners collector learns main's session shortly after start
             self.health.off(self.name, "no main session known yet")
             return "off"
+        items, resolved = self.read(session)
+        self.publish(items, resolved, session)
+        return f"{len(items)} open"
+
+    def read(self, session: str) -> tuple[list[dict], list[dict]]:
+        """One fresh ledger read. Raises when the ledger cannot be read; never returns a partial list as whole."""
         code, out = self.runner.run("provenance-asks", session, timeout=60, limit=1024 * 1024)
         data = _json(out.encode("utf-8", "replace")) if out else None
         if code not in (0, 2) or not isinstance(data, dict) or not isinstance(data.get("items"), list):
@@ -758,11 +765,7 @@ class Asks(Collector):
         for raw in data["items"][:100]:
             if not isinstance(raw, dict) or not ASK_ID_RE.match(str(raw.get("id", ""))):
                 continue
-            note = ev.short(str(raw.get("note", "")), 400)
-            items.append({"id": str(raw["id"]), "kind": str(raw.get("kind", ""))[:12], "at": str(raw.get("at", ""))[:40],
-                          "text": note, "why": ev.short(str(raw.get("reason", "")), 200),
-                          "owner": ev.short(str(raw.get("owner", "")), 60), "ticket": _ticket_in(note),
-                          "session": session})
+            items.append(self.item(session, raw))
         resolved = []
         for raw in (data.get("resolved") if isinstance(data.get("resolved"), list) else [])[:100]:
             if not isinstance(raw, dict) or not ASK_ID_RE.match(str(raw.get("id", ""))):
@@ -773,9 +776,35 @@ class Asks(Collector):
                              "resolved_at": str(raw.get("resolved_at", ""))[:40],
                              "resolution": ev.short(str(raw.get("resolution", "")), 300),
                              "decision": ev.short(str(raw.get("decision", "")), 40)})
+        return items, resolved
+
+    @staticmethod
+    def item(session: str, raw: dict) -> dict:
+        """One open ask as the page shows it. `text` and `why` are the whole ask (redacted, never clipped) and
+        `digest` covers exactly them, so what the user reads is what a decision signs. An ask that cannot be shown
+        whole, that an owner registered, or that needs the terminal carries `blocked` and is not approvable."""
+        import mc_chat  # noqa: PLC0415 - the chat store lives with the hooks; the server puts it on sys.path
+        ask_id, owner = str(raw["id"]), ev.short(str(raw.get("owner", "")), 60)
+        note, reason = str(raw.get("note", "")), str(raw.get("reason", ""))
+        text, why, digest, blocked = ev.short(note, mc_chat.MAX_TEXT), ev.short(reason, mc_chat.REASON_MAX), "", ""
+        if owner != "main":
+            blocked = "Registered by an owner, not by main. Answer with a reply; main decides what to do with it."
+        else:
+            try:
+                shown = mc_chat.ask_snapshot(session, "main", ask_id, note, reason)
+                text, why, digest = shown["text"], shown["reason"], shown["digest"]
+                blocked = mc_chat.terminal_only(text, why) or ""
+                if blocked:
+                    blocked += ". Answer it there."
+            except mc_chat.ChatError:
+                blocked = "This ask cannot be shown in full, so it cannot be decided here. Answer with a reply."
+        return {"id": ask_id, "kind": str(raw.get("kind", ""))[:12], "at": str(raw.get("at", ""))[:40],
+                "text": text, "why": why, "owner": owner, "ticket": _ticket_in(text), "session": session,
+                "digest": digest if not blocked else "", "approvable": not blocked, "blocked": blocked}
+
+    def publish(self, items: list[dict], resolved: list[dict], session: str) -> None:
         self.items, self.resolved, self.session = items, resolved, session
         self.hub.snapshot("asks", self.snapshot())
-        return f"{len(items)} open"
 
     def snapshot(self) -> dict:
         return {"items": self.items, "resolved": self.resolved, "session": self.session}

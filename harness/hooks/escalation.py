@@ -649,7 +649,7 @@ def verify_top_source(source, allow_env_root=False, max_age_seconds=TOP_ASSENT_M
         parsed = prov.parse_source(source)
     except prov.Problem as error:
         raise LedgerError('no_assent', 'the ask source does not parse (%s).%s' % (error, fix)) from None
-    if parsed.get('kind') != 'user' or parsed.get('variant') == 'mc':
+    if parsed.get('kind') != 'user':
         raise LedgerError('no_assent', 'top-rung permission needs a user:, answer: or queue: source.' + fix)
     home = None if allow_env_root else installed_home() / '.claude'
     try:

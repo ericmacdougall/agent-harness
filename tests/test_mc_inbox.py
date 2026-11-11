@@ -593,5 +593,48 @@ class Unread(Base):  # goodqa#15565: a claimed message stays unread until it is 
         self.assertIn("dash:" + record["id"], out.splitlines()[0])
 
 
+class WaiterNudge(Base):
+    """Spec rev 2 item 7 / NEG-17: a session that is the chat target but has no running waiter is told so on a
+    prompt, at most once per 30 minutes, with a fixed pointer that never replaces a delivery pointer."""
+
+    def context(self, now=None):
+        with mock.patch.object(mc_chat.time, "time", return_value=now) if now else mock.MagicMock():
+            out = self.hook("UserPromptSubmit")
+        return out["hookSpecificOutput"]["additionalContext"] if out else None
+
+    def test_dead_waiter_is_named_once_per_half_hour(self):
+        mc_chat.register_target(SID, os.getpid(), waiting=False)  # the waiter returned and was never re-armed
+        first = self.context()
+        self.assertIn("mc_inbox.py wait --session " + SID, first)
+        self.assertNotIn("dash:", first)
+        self.assertIsNone(self.context(), "the pointer is shown once per window")
+        later = time.time() + mc_chat.NUDGE_EVERY_S + 1
+        self.assertIn("no `mc_inbox.py wait` is running", self.context(now=later))
+
+    def test_a_dead_pid_counts_as_no_waiter(self):
+        mc_chat.register_target(SID, 2 ** 22 + 12345, waiting=True)
+        self.assertIn("no `mc_inbox.py wait` is running", self.context())
+
+    def test_silent_with_a_live_waiter_without_a_target_and_on_stop(self):
+        self.assertIsNone(self.context(), "never a target: nothing to say")
+        self.attach()
+        self.assertIsNone(self.context())
+        mc_chat.register_target(SID, os.getpid(), waiting=False)
+        self.assertIsNone(self.hook("Stop"), "a nudge never blocks a stop")
+        self.assertIsNotNone(self.context(), "and Stop did not use up the prompt's pointer")
+
+    def test_it_never_replaces_or_spends_on_a_delivery_pointer(self):
+        self.attach()
+        record, _ = self.send()
+        mc_chat.register_target(SID, os.getpid(), waiting=False)
+        pointer = self.context()
+        self.assertIn("dash:" + record["id"], pointer)
+        self.assertIn("re-arm", pointer)
+        with redirect_stdout(io.StringIO()):
+            mc_inbox.main(["read", record["id"]])
+        mc_chat.write_reply(record["id"], "claude", "done")
+        self.assertIn("no `mc_inbox.py wait` is running", self.context(), "the delivery pointer did not spend it")
+
+
 if __name__ == "__main__":
     unittest.main()

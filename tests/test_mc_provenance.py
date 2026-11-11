@@ -36,7 +36,8 @@ class Env(unittest.TestCase):
              "source": "inferred: from nothing -- test fixture only"}) + "\n")
 
     def delivered(self, decision="approve", ask=ASK):
-        record, _ = mc_chat.new_approval(SESSION, ask, TEXT, decision, client_key="key-" + decision + ask[-6:])
+        record, _ = mc_chat.new_approval(SESSION, ask, TEXT, decision, client_key="key-" + decision + ask[-6:],
+                                         reason="r")  # the fixture ask's reason: the digest covers it
         mc_chat.claim(record["id"])
         verb = "APPROVED" if decision == "approve" else "DENIED"
         return record, f'mc:{SESSION}/{record["id"]} "Dashboard decision: {verb} ask {ask}"'
@@ -50,7 +51,8 @@ class Resolve(Env):
         ok = provenance.resolve(source, {"allow_mc": True})
         self.assertTrue(ok["ok"], ok["problems"])
         node = ok["chain"][0]
-        self.assertEqual((node["variant"], ok["origin"]), ("mc", "user"))
+        self.assertEqual((node["kind"], ok["kind"], ok["origin"], ok["label"]), ("mc", "mc", "dashboard", "DASHBOARD"))
+        self.assertFalse([n for n in ok["chain"] if n.get("kind") == "user"])  # never a user turn (review 2 item 1)
         self.assertIn("accidental-damage", node["trust"])
 
     def test_excerpt_must_be_in_the_record_text(self):
@@ -67,11 +69,28 @@ class Resolve(Env):
         self.assertFalse(provenance.resolve(foreign, {"allow_mc": True})["ok"])
 
     def test_mc_never_counts_as_a_requirement_user_source(self):
-        # parse_source keeps kind "user" so ask_resolved can use it; escalation and every other caller must not.
         import escalation
         _, source = self.delivered()
+        self.assertEqual(provenance.parse_source(source)["kind"], "mc")
         with self.assertRaises(escalation.LedgerError):
             escalation.verify_top_source(source)
+
+    def test_every_user_origin_consumer_refuses_mc(self):  # review 2 item 1
+        import ah_kill
+        import prod_delete_guard
+        _, source = self.delivered()
+        with self.assertRaises(ValueError):
+            prod_delete_guard.resolve_user_source(source, str(self.home))
+        with (self.wals / "main.jsonl").open("a") as handle:
+            handle.write(json.dumps({"at": "2026-11-11T10:05:00+00:00", "event": "ask_resolved", "id": "wres00000001",
+                                     "ref": ASK, "note": "decided", "source": source, "decision": "approved"}) + "\n")
+        with self.assertRaises(ah_kill.KillError):
+            ah_kill.resolve_approval(ASK, SESSION, str(self.home))
+        grounded = provenance.resolve(f"inferred: from {source} -- a dashboard click is not a requirement",
+                                      {"allow_mc": True})
+        self.assertFalse(grounded["ok"])
+        nested = provenance.resolve(f"wal:{self.wals / 'main.jsonl'}#wres00000001")
+        self.assertFalse(nested["ok"])
 
 
 class Binding(Env):
@@ -107,6 +126,31 @@ class WalNote(Env):
         _, approve = self.delivered("approve", ask="wsecond123456")
         self.assertEqual(self.run_note(approve, "approved").returncode, 2)  # approval names another ask
         self.assertEqual(len((self.wals / "main.jsonl").read_text().splitlines()), 1)
+
+    def test_ask_resolved_rechecks_the_digest_against_the_ask_being_closed(self):  # review 2 item 3
+        _, source = self.delivered()
+        wal = self.wals / "main.jsonl"
+        wal.write_text(wal.read_text().replace(TEXT, "May main FORCE push branch feat/x to origin?"))
+        done = self.run_note(source, "approved")
+        self.assertEqual(done.returncode, 2, done.stdout)
+        self.assertIn("changed", done.stderr)
+
+    def test_ask_resolved_refuses_mc_for_an_owner_wal_ask_and_a_top_rung_ask(self):  # NEG-20, NEG-21
+        owner_ask = "wowner000001"
+        (self.wals / "agent-a1b2c3.jsonl").write_text(json.dumps(
+            {"at": "2026-11-11T10:00:00+00:00", "event": "ask", "id": owner_ask, "note": TEXT, "reason": "r"}) + "\n")
+        _, source = self.delivered(ask=owner_ask)
+        self.assertEqual(self.run_note(source, "approved", ref=owner_ask).returncode, 2)
+        top = "wtoprung0001"
+        note = "[task:x] top writing rung (Fable/Astra) for this task only"
+        with (self.wals / "main.jsonl").open("a") as handle:
+            handle.write(json.dumps({"at": "2026-11-11T10:01:00+00:00", "event": "ask", "id": top, "note": note,
+                                     "reason": "r"}) + "\n")
+        record, _ = mc_chat.new_approval(SESSION, top, note, "approve", client_key="key-top-rung-01", reason="r")
+        mc_chat.claim(record["id"])
+        done = self.run_note(f'mc:{SESSION}/{record["id"]} "Dashboard decision: APPROVED ask {top}"', "approved", ref=top)
+        self.assertEqual(done.returncode, 2, done.stdout)
+        self.assertIn("terminal", done.stderr)
 
     def test_other_events_do_not_accept_mc(self):
         _, source = self.delivered()

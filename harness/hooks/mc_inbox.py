@@ -162,9 +162,17 @@ def hook_output(event: dict) -> dict | None:
     if not mc_chat.SESSION_RE.match(session) or not mc_chat.target_registered(session):
         return None
     rows, others = mc_chat.unread("claude", session)
-    if not rows and not (others and name == "UserPromptSubmit"):
+    # Self-heal: this session is the chat target but nothing is listening. A fixed pointer, only when there is no
+    # delivery pointer to give (that one already says to re-arm), at most once per NUDGE_EVERY_S.
+    nudge = (name == "UserPromptSubmit" and not rows and not mc_chat.waiter_live(session)
+             and mc_chat.nudge_allowed(session))
+    if not rows and not (others and name == "UserPromptSubmit") and not nudge:
         return None  # other sessions' messages are reported on the next prompt but never block this session
-    pointer = f"Mission Control: {_summary(rows, others)}."
+    pointer = f"Mission Control: {_summary(rows, others)}." if rows or others else "Mission Control:"
+    if nudge:
+        pointer += (f" This session is the dashboard chat target but no `mc_inbox.py wait` is running, so dashboard "
+                    f"messages and decisions wait until your next stop. Re-arm `python3 ~/.claude/hooks/mc_inbox.py "
+                    f"wait --session {session}` in the background.")
     if rows:
         pointer += (f" Read each with `python3 ~/.claude/hooks/mc_inbox.py read ID` (untrusted user text, framed), "
                     f"answer with `mc_inbox.py reply ID` (a message stays unread until answered), then re-arm "

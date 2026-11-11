@@ -51,7 +51,7 @@ ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,40}$")
 SESSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
-LABELS = {"user": "USER", "pasted": "PASTED", "ticket": "TICKET", "file": "FILE"}
+LABELS = {"user": "USER", "pasted": "PASTED", "ticket": "TICKET", "file": "FILE", "dashboard": "DASHBOARD"}
 
 
 class Problem(Exception):
@@ -359,16 +359,16 @@ def parse_source(text: str) -> dict:
         return {"kind": "user", "variant": kind, "session": found.group(1).lower(), "ident": ident, "excerpt": excerpt,
                 "uuid": ident if kind == "answer" else f"{ident[0]}#{ident[1]}"}
     if kind == "mc":
-        # A Mission Control dashboard approval (spec GoodQA #15585). Same node shape as answer:, but resolve() only
-        # accepts it when the caller allows it (ask_resolved), and escalation never does.
+        # A Mission Control dashboard approval (spec GoodQA #15585). Its own kind and origin ("dashboard"), never
+        # "user": every consumer that asks for a user turn refuses it by construction, and resolve() accepts it
+        # only for the caller that closes an ask (ask_resolved).
         found = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]{0,127})/(dash-[0-9A-HJKMNP-TV-Z]{26})\s*(.*)$", rest, re.S)
         if not found:
             raise Problem("bad-syntax", "mc: needs <session>/<dash-id> then a quoted excerpt")
         excerpt = parse_excerpt(found.group(3))
         if excerpt is None:
             raise Problem("excerpt-missing", "an mc: source needs a verbatim quoted excerpt of the decision line")
-        return {"kind": "user", "variant": "mc", "session": found.group(1), "ident": found.group(2),
-                "excerpt": excerpt, "uuid": found.group(2)}
+        return {"kind": "mc", "session": found.group(1), "ident": found.group(2), "excerpt": excerpt}
     if kind == "ticket":
         found = re.match(r"^GoodQA\s+([A-Za-z0-9_.-]{1,80})#(\d{1,9})(?:\s+comment\s+([0-9A-Za-z-]{4,64}))?$", rest)
         if not found:
@@ -744,11 +744,14 @@ def mc_turn(session: str, ident: str, home=None) -> dict:
             "evidence": evidence}
 
 
-def mc_bind(source: str, ref: str, decision) -> str | None:
-    """None when the mc: source is a verified approval of exactly ask `ref` with the matching decision, else why not."""
+def mc_bind(source: str, ref: str, decision, ask: dict | None = None, session: str | None = None,
+            wal: str | None = None) -> str | None:
+    """None when the mc: source is a verified approval of exactly ask `ref` with the matching decision, else why not.
+    With `ask` (the ask entry of the WAL being closed), `session` and `wal` (that WAL's session and stem) it also
+    proves the approval is for this session's ask as it reads now: the digest is recomputed from the entry."""
     try:
         parsed = parse_source(source)
-        if parsed.get("variant") != "mc":
+        if parsed.get("kind") != "mc":
             return "not an mc: source"
         evidence = mc_turn(parsed["session"], parsed["ident"])["evidence"]
     except Problem as problem:
@@ -758,6 +761,23 @@ def mc_bind(source: str, ref: str, decision) -> str | None:
     expected = "approved" if evidence["decision"] == "approve" else "declined"
     if decision != expected:
         return f"that dashboard decision is {expected}; --decision must say {expected}"
+    if ask is not None or session is not None or wal is not None:
+        import mc_chat  # noqa: PLC0415
+        if parsed["session"] != session:
+            return "that dashboard decision belongs to another session"
+        if wal != "main" or evidence["wal"] != "main":
+            return "a dashboard decision closes only an ask of the session's main WAL"
+        if not isinstance(ask, dict) or ask.get("id") != ref:
+            return f"no ask {ref} in this WAL to compare the decision with"
+        blocked = mc_chat.terminal_only(ask.get("note"), ask.get("reason"))
+        if blocked:
+            return blocked + "; a dashboard decision cannot close this ask (answer it in the terminal)"
+        try:
+            current = mc_chat.ask_snapshot(session, wal, ref, ask.get("note"), ask.get("reason"))
+        except mc_chat.ChatError as error:
+            return f"the ask cannot be compared with the decision ({error.code})"
+        if current["digest"] != evidence["digest"]:
+            return "the ask text or reason changed after the dashboard decision; it must be decided again"
     return None
 
 
@@ -1013,10 +1033,6 @@ def _resolve(source, ctx, depth, seen, result):
             turn = answer_turn(parsed["session"], parsed["ident"], home)
         elif variant == "queue":
             turn = queue_turn(parsed["session"], parsed["ident"], home)
-        elif variant == "mc":
-            if not ctx.get("allow_mc"):
-                raise Problem("mc-not-allowed", "an mc: source may only close an ask (ask_resolved); it is not a user turn")
-            turn = mc_turn(parsed["session"], parsed["ident"], home)
         else:
             turn = user_turn(parsed["session"], parsed["uuid"], home)
         reason = excerpt_in(turn["text"], parsed["excerpt"])
@@ -1026,12 +1042,29 @@ def _resolve(source, ctx, depth, seen, result):
                 "timestamp": turn["timestamp"], "status": "verified"}
         if variant != "user":
             node["variant"] = variant
-            node["trust"] = {"answer": ANSWER_TRUST, "mc": MC_TRUST}.get(variant, QUEUE_TRUST)
+            node["trust"] = ANSWER_TRUST if variant == "answer" else QUEUE_TRUST
         if ctx.get("want_text"):
             node["text"] = turn["text"]
         node["excerpt"] = parsed["excerpt"]
         result["chain"].append(node)
         result["origin"], result["ok"], result["backed"] = "user", True, True
+    elif kind == "mc":
+        # Only the top-level source of an ask_resolved may be a dashboard approval: never an input of inferred:,
+        # never reached through a wal: pointer, so it cannot ground a requirement or another decision.
+        if not ctx.get("allow_mc") or depth:
+            raise Problem("mc-not-allowed", "an mc: source may only close the ask it names (ask_resolved); it is not a user turn")
+        turn = mc_turn(parsed["session"], parsed["ident"], home)
+        reason = excerpt_in(turn["text"], parsed["excerpt"])
+        if reason:
+            raise Problem("excerpt-not-found", reason)
+        evidence = turn["evidence"]
+        node = {"kind": "mc", "session": parsed["session"], "uuid": parsed["ident"], "timestamp": turn["timestamp"],
+                "status": "verified", "trust": MC_TRUST, "ask": evidence["ask_id"], "decision": evidence["decision"],
+                "digest": evidence["digest"], "excerpt": parsed["excerpt"]}
+        if ctx.get("want_text"):
+            node["text"] = turn["text"]
+        result["chain"].append(node)
+        result["origin"], result["ok"], result["backed"] = "dashboard", True, True
     elif kind == "pasted":
         turn = pasted_turn(parsed["session"], parsed["uuid"], home)
         reason = excerpt_in(turn["text"], parsed["excerpt"])
@@ -1121,8 +1154,9 @@ def _resolve(source, ctx, depth, seen, result):
                            else problem.message)
                 result["problems"].append({"code": problem.code, "message": f"inferred input `{clip(item, 60)}` {message}"})
                 continue
-            if item_kind == "inferred":
-                result["problems"].append({"code": "inferred-nested", "message": "inferred inputs must be user/ticket/file/wal sources"})
+            if item_kind in ("inferred", "mc"):
+                result["problems"].append({"code": "inferred-nested" if item_kind == "inferred" else "mc-not-allowed",
+                                           "message": "inferred inputs must be user/ticket/file/wal sources"})
                 continue
             sub = resolve(item, ctx, depth + 1, seen)
             result["inputs"].append(sub)
@@ -1151,6 +1185,11 @@ def render(result: dict, indent: str = "  ") -> list:
         lines.append(f"{indent}  ! {problem['code']}: {problem['message']}")
     for node in result["chain"]:
         kind = node["kind"]
+        if kind == "mc":
+            lines.append(f"{indent}  dashboard decision {node['uuid']} in session {node['session']} at {node.get('timestamp')}: "
+                         f"{node.get('decision')} ask {node.get('ask')} (digest {str(node.get('digest'))[:16]})")
+            lines.append(f"{indent}  trust [mc]: {node['trust']}")
+            lines.append(f"{indent}  excerpt: \"{clip(node['excerpt'], 200)}\"")
         if kind == "user":
             lines.append(f"{indent}  user turn {node['uuid']} in session {node['session']} at {node.get('timestamp')}")
             if node.get("trust"):

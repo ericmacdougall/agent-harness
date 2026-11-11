@@ -201,5 +201,66 @@ class Evidence(Base):
             mc_chat.approval_evidence(SESSION, forged["id"])
 
 
+class Rev2(Base):
+    """Spec rev 2 (review 2): the digest covers reason and WAL, the decision slot is per session, evidence needs a
+    claim time, and a refusal names the decision already made."""
+
+    def test_digest_binds_reason_and_wal(self):
+        base = mc_chat.ask_digest(SESSION, ASK, TEXT, "why", "main")
+        self.assertNotEqual(base, mc_chat.ask_digest(SESSION, ASK, TEXT, "another why", "main"))
+        self.assertNotEqual(base, mc_chat.ask_digest(SESSION, ASK, TEXT, "why", "agent-a1"))
+        record, _ = self.approve(reason="why", wal="main", digest=base)
+        self.assertEqual((record["approval"]["reason"], record["approval"]["wal"]), ("why", "main"))
+        with self.assertRaises(mc_chat.ChatError) as ctx:
+            self.approve(key="key-approve-0002", reason="another why", digest=base)
+        self.assertEqual(ctx.exception.code, "stale-digest")
+
+    def test_snapshot_is_what_is_signed_and_refuses_unprintable_text(self):
+        snap = mc_chat.ask_snapshot(SESSION, "main", ASK, "  " + TEXT + "\r\n", " why ")
+        self.assertEqual((snap["text"], snap["reason"]), (TEXT, "why"))
+        self.assertEqual(snap["digest"], mc_chat.ask_digest(SESSION, ASK, TEXT, "why", "main"))
+        for bad in ("\x1b[2Jhidden", "", "x" * (mc_chat.MAX_TEXT + 1)):
+            with self.assertRaises(mc_chat.ChatError):
+                mc_chat.ask_snapshot(SESSION, "main", ASK, bad, "")
+
+    def test_same_ask_id_in_two_sessions_never_collide(self):  # review 2 item 4
+        other = "99999999-2222-4333-8444-555555555555"
+        mc_chat.register_target(other, os.getpid())
+        mine, _ = self.approve("approve")
+        theirs, created = mc_chat.new_approval(other, ASK, TEXT, "deny", client_key="key-other-sess-1")
+        self.assertTrue(created)
+        self.assertNotEqual(mine["id"], theirs["id"])
+        self.assertEqual((mine["approval"]["decision"], theirs["approval"]["decision"]), ("approve", "deny"))
+
+    def test_refusal_names_the_existing_decision(self):
+        self.approve("approve")
+        with self.assertRaises(mc_chat.ChatError) as ctx:
+            self.approve("deny", key="key-deny-000001")
+        self.assertEqual((ctx.exception.code, ctx.exception.decision), ("already-decided", "approve"))
+
+    def test_evidence_needs_a_recorded_claim_time(self):
+        record, _ = self.approve()
+        mc_chat.claim(record["id"])
+        self.assertEqual(mc_chat.approval_evidence(SESSION, record["id"])["wal"], "main")
+        path = mc_chat.chat_dir() / "state" / (record["id"] + ".json")
+        value = mc_chat.read_json(path)
+        value.pop("read_at")
+        mc_chat.write_json(path, value)
+        with self.assertRaises(mc_chat.ChatError) as ctx:
+            mc_chat.approval_evidence(SESSION, record["id"])
+        self.assertEqual(ctx.exception.code, "not-delivered")
+
+    def test_terminal_only_asks_are_named(self):
+        self.assertTrue(mc_chat.terminal_only("[task:x] top writing rung (Fable/Astra) for this task only"))
+        self.assertTrue(mc_chat.terminal_only("Let the owner use ASTRA here?", ""))
+        self.assertIsNone(mc_chat.terminal_only("May main push branch feat/x to origin?", "shared branch"))
+
+    def test_expire_due_marks_only_unclaimed_expired_approvals(self):
+        record, _ = self.approve(ts=1000.0)
+        self.assertEqual(mc_chat.expire_due([record["id"]], now=1000.0 + mc_chat.APPROVAL_TTL_S - 1), [])
+        self.assertEqual(mc_chat.expire_due([record["id"]], now=1000.0 + mc_chat.APPROVAL_TTL_S), [record["id"]])
+        self.assertEqual(mc_chat.state(record["id"])["status"], "expired")
+
+
 if __name__ == "__main__":
     unittest.main()

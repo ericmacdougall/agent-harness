@@ -75,6 +75,26 @@ def provenance_check(event, source, allow_mc=False):
         return 'enforce' if event in ('requirement', 'ask') else 'warn', f'provenance check failed ({type(error).__name__})', False
 
 
+def ask_entry(path, ref: str):
+    """The last `ask` entry with id `ref` in this WAL (bounded tail read), or None."""
+    try:
+        import safe_input  # noqa: PLC0415
+        tail = safe_input.read_tail(path, 4 << 20)
+    except Exception:  # noqa: BLE001
+        return None
+    found = None
+    for raw in tail.splitlines():
+        if ref.encode() not in raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and rec.get('event') == 'ask' and rec.get('id') == ref:
+            found = rec
+    return found
+
+
 def open_ask_exists(path, ref: str) -> bool:
     """True when `ref` is an `ask` entry of this WAL with no later `ask_resolved` naming it (bounded tail read)."""
     try:
@@ -191,7 +211,10 @@ def main():
             return 2
         if args.source.strip().lower().startswith('mc:'):
             import provenance as _prov  # noqa: PLC0415
-            bound = _prov.mc_bind(args.source.strip(), args.ref, args.decision)
+            # The decision must be for THIS session's ask as it reads in THIS main WAL now (spec rev 2: ids repeat
+            # across sessions and WALs, and an ask an owner registered is never closed by a dashboard click).
+            bound = _prov.mc_bind(args.source.strip(), args.ref, args.decision, ask=ask_entry(path, args.ref),
+                                  session=path.parent.name, wal=path.stem if ask_wal is None else ask_wal)
             if bound:
                 print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': bound[:300],
                                   'hint': 'an mc: source closes only the ask it names, with its own decision'}), file=sys.stderr)

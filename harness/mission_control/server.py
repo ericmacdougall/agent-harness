@@ -352,6 +352,8 @@ class App:
         self.codex = CodexResponder(self.hub, self.health, self.runner, codex_binary(), root,
                                     disabled="" if codex else "Codex chat is turned off for this instance")
         self.chat_sig = None
+        self.approval_watch: tuple[float, list[str]] | None = None  # (earliest expiry, queued approval ids)
+        self.approve_lock = threading.Lock()  # one ledger read and one decision at a time
         self.stop = threading.Event()
         self.threads: list[threading.Thread] = []
         if start_threads:
@@ -412,6 +414,10 @@ class App:
                 sig.append((info.st_mtime_ns, len(os.listdir(chat / sub))))
             except OSError:
                 sig.append(None)
+        watch = self.approval_watch
+        if watch and time.time() >= watch[0]:
+            mc_chat.expire_due(watch[1], self.root)  # an unclaimed decision reads "expired" without any waiter
+            force = True
         if sig == self.chat_sig and not force:
             return
         self.chat_sig = sig
@@ -419,9 +425,21 @@ class App:
 
     def chat_snapshot(self) -> dict:
         messages = []
+        waiting: list[tuple[float, str]] = []
         for record in mc_chat.inbox(self.root, limit=60):
             msg_state = mc_chat.state(record.get("id", ""), self.root)
-            messages.append({"id": record.get("id"), "from": "user", "to": record.get("to"),
+            approval = None
+            if record.get("verified") and mc_chat.approval_ok(record.get("approval"), str(record.get("session"))):
+                signed = record["approval"]
+                # ask id, decision and expiry only: the page restores its buttons from these after a reload
+                approval = {"ask_id": signed["ask_id"], "decision": signed["decision"], "expires": signed["expires"]}
+                if record.get("state") == "queued":
+                    if mc_chat.expire_due([record["id"]], self.root):
+                        record["state"] = "expired"
+                        msg_state = mc_chat.state(record["id"], self.root)
+                    else:
+                        waiting.append((signed["expires"], record["id"]))
+            messages.append({"id": record.get("id"), "from": "user", "to": record.get("to"), "approval": approval,
                              "read_at": msg_state.get("read_at") if isinstance(msg_state.get("read_at"), str) else None,
                              "client_key": record.get("client_key") if record.get("verified") else "",
                              "session": record.get("session"), "thread": record.get("thread"),
@@ -434,6 +452,7 @@ class App:
             replies[reply.get("id")] = {"id": reply.get("id"), "from": reply.get("from"),
                                         "reply_to": reply.get("reply_to"), "text": str(reply.get("text", ""))[:65536],
                                         "ts": reply.get("created"), "final": bool(reply.get("final"))}
+        self.approval_watch = (min(w[0] for w in waiting), [w[1] for w in waiting]) if waiting else None
         return {"messages": messages, "replies": list(replies.values())[-60:],
                 "targets": mc_chat.targets(self.root), "main_session": self.owners.session,
                 "codex": {"available": self.codex.available[0], "reason": self.codex.available[1],
@@ -443,7 +462,9 @@ class App:
         return {"version": VERSION, "started": ev.iso(self.started), "host": "demo" if self.demo else ev.HOST,
                 "initiatives": self.initiatives.snapshot(), "owners": self.owners.rows,
                 "health": self.health.snapshot(), "events": self.hub.recent(limit=200),
-                "chat": self.chat_snapshot(), "asks": self.asks.snapshot(), "limits": {"chat_max": mc_chat.MAX_TEXT}}
+                "chat": self.chat_snapshot(), "asks": self.asks.snapshot(),
+                "limits": {"chat_max": mc_chat.MAX_TEXT, "approval_note_max": mc_chat.APPROVAL_NOTE_MAX,
+                           "approval_ttl_s": mc_chat.APPROVAL_TTL_S}}
 
     def post_chat(self, body: dict) -> tuple[int, dict]:
         if not isinstance(body, dict):
@@ -475,6 +496,63 @@ class App:
                                  actor={"runtime": "dashboard"}, subject={"initiative": record.get("thread") or ""}))
         self.refresh_chat(force=True)
         return (201 if created else 200), {"id": record["id"], "created": created,
+                                           "status": mc_chat.state(record["id"], self.root).get("status")}
+
+    def post_approve(self, body: dict) -> tuple[int, dict]:
+        """One Approve or Deny click on an open ask of main's session. The request names the ask, the digest of
+        what the page showed and the decision; the session, the ask text and its reason always come from a fresh
+        ledger read made here, never from the request."""
+        if not isinstance(body, dict):
+            return 400, {"error": "bad-json"}
+        ask_id, decision, key = body.get("ask_id"), body.get("decision"), body.get("client_key")
+        digest, note = body.get("digest"), body.get("note")
+        if not isinstance(ask_id, str) or not mc_chat.ASK_RE.fullmatch(ask_id):
+            return 400, {"error": "bad-ask", "message": "not an ask id"}
+        if decision not in mc_chat.DECISIONS:
+            return 400, {"error": "bad-decision", "message": "decision must be approve or deny"}
+        if not isinstance(key, str) or not mc_chat.CLIENT_KEY_RE.fullmatch(key):
+            return 400, {"error": "bad-key", "message": "client_key must be 8-64 url-safe characters"}
+        if note is not None and (not isinstance(note, str) or len(note) > mc_chat.APPROVAL_NOTE_MAX):
+            return 400, {"error": "bad-note",
+                         "message": f"the note must be text of at most {mc_chat.APPROVAL_NOTE_MAX} characters"}
+        session = self.owners.session or ""
+        if not session:
+            return 409, {"error": "no-main", "message": "Mission Control does not know main's session yet"}
+        if self.demo_delay_s:
+            time.sleep(self.demo_delay_s)  # demo knob: the 'Sending' state stays visible for the whole delay
+        with self.approve_lock:
+            try:
+                items, resolved = self.asks.read(session)
+            except Exception as exc:  # noqa: BLE001 - an unreadable ledger decides nothing
+                self.health.error("asks", f"{type(exc).__name__}: {str(exc)[:160]}")
+                return 503, {"error": "asks-unavailable", "message": "the asks ledger could not be read; nothing was sent"}
+            self.asks.publish(items, resolved, session)
+            item = next((a for a in items if a["id"] == ask_id), None)
+            if item is None:
+                return 409, {"error": "not-open", "message": "this ask is no longer open"}
+            if not item["approvable"]:
+                return 409, {"error": "not-approvable", "message": item["blocked"]}
+            if not isinstance(digest, str) or not hmac.compare_digest(digest.encode("utf-8", "replace"),
+                                                                      item["digest"].encode()):
+                return 409, {"error": "stale-digest",
+                             "message": "the ask changed since it was shown; read it again and decide"}
+            try:
+                record, created = mc_chat.new_approval(session, ask_id, item["text"], decision, client_key=key,
+                                                       digest=digest, note=note, reason=item["why"], wal="main",
+                                                       root=self.root)
+            except mc_chat.ChatError as exc:
+                status = 409 if exc.code in ("no-target", "key-conflict", "already-decided", "stale-digest") else 400
+                value = {"error": exc.code, "message": str(exc)}
+                if exc.decision:
+                    value["decision"] = exc.decision
+                return status, value
+        verb = "approved" if record["approval"]["decision"] == "approve" else "denied"
+        self.hub.publish(ev.make("chat", "dashboard", f"you {verb} ask {ask_id}", eid=f"chat:{record['id']}",
+                                 actor={"runtime": "dashboard"}, subject={"initiative": ""}))
+        self.refresh_chat(force=True)
+        return (201 if created else 200), {"id": record["id"], "created": created, "ask_id": ask_id,
+                                           "decision": record["approval"]["decision"],
+                                           "expires": record["approval"]["expires"],
                                            "status": mc_chat.state(record["id"], self.root).get("status")}
 
 
@@ -578,7 +656,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.deny(401, "session")
         if not hmac.compare_digest(str(self.headers.get("X-MC-CSRF") or ""), info["csrf"]):
             return self.deny(403, "csrf")
-        if urlsplit(self.path).path != "/api/chat":
+        route = urlsplit(self.path).path
+        if route not in ("/api/chat", "/api/approve"):
             return self.deny(404, "not-found")
         if "application/json" not in (self.headers.get("Content-Type") or ""):
             return self.deny(415, "content-type")
@@ -592,7 +671,7 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length).decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return self.deny(400, "bad-json")
-        status, value = self.app.post_chat(body)
+        status, value = self.app.post_approve(body) if route == "/api/approve" else self.app.post_chat(body)
         if self.app.demo and self.app.demo_drop_first and status == 201:
             self.app.demo_drop_first = False  # demo knob: the message is stored but its response is lost, once
             self.close_connection = True
