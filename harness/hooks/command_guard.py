@@ -4021,6 +4021,41 @@ class Analyzer:
     def _count_only(args):
         return bool(_flag_letters(args) & set('cqlL') or _longs(args) & {'--count', '--quiet', '--silent', '--files-with-matches', '--files-without-match'})
 
+    def _curl_credential_words(self, args):
+        """Omit only a proven --noproxy value; unknown argv roles keep every candidate."""
+        no_value = {'--silent', '--show-error'}
+        one_value = {'--max-time', '--output', '--write-out', '--url', '--noproxy', '-o'}
+        omitted, i = set(), 0
+        # Shell expansion can change option positions or create extra operands.
+        if any(w.dynamic or w.subs or w.vars or w.glob or w.overflow or len(w.alts) != 1 for w in args):
+            return args
+        while i < len(args):
+            self.ctx.budget.tick()
+            text = args[i].text
+            if text == '--':
+                break
+            if not text.startswith('-') or text == '-':
+                i += 1
+                continue
+            option, attached, _value = text.partition('=') if text.startswith('--') else (text, '', '')
+            if option in no_value and not attached:
+                i += 1
+                continue
+            if option not in one_value:
+                return args
+            if attached:
+                if option == '--noproxy':
+                    omitted.add(i)
+                i += 1
+                continue
+            if i + 1 >= len(args):
+                return args
+            if option == '--noproxy':
+                omitted.add(i + 1)
+            # A required value is consumed even if it looks like an option or --.
+            i += 2
+        return [word for index, word in enumerate(args) if index not in omitted]
+
     def read_creds(self, name, args, pl, idx):
         ctx = self.ctx
         texts = [a.text for a in args]
@@ -4050,7 +4085,7 @@ class Analyzer:
         if name == 'sed' or name == 'awk' or name in ('gawk', 'mawk', 'jq', 'yq'):
             words = words[1:] if words else words  # first positional is the program
         if name in EXFIL_CMDS:
-            words = [w for w in args]
+            words = self._curl_credential_words(args) if name == 'curl' else list(args)
         recursive = name in GREP_CMDS and (_flag_letters(args) & set('rR') or name in ('rg', 'ag', 'ack') or '--recursive' in _longs(args))
         for w in words:
             t = w.text
