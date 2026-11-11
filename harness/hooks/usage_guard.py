@@ -315,6 +315,23 @@ def owner_liveness(start, children=()):
     return facts
 
 
+def incomplete_reboot_proven(start):
+    """Without terminal launch evidence, only a typed same-host reboot covers unrecorded children."""
+    owner = start.get('owner_process') if isinstance(start, dict) else None
+    if not isinstance(owner, dict) or owner.get('host') != host_identity():
+        return False
+    identities = []
+    for token in (owner.get('boot_id'), boot_identity()):
+        if not isinstance(token, str):
+            return False
+        match = re.fullmatch(r'(procboot|bootsession):([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-'
+                             r'[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})', token)
+        if match is None:
+            return False
+        identities.append((match[1], match[2].lower()))
+    return identities[0][0] == identities[1][0] and identities[0][1] != identities[1][1]
+
+
 class Subject(dict):
     """Serializable metadata, with private in-memory inputs for a final reprobe."""
     def probe(self):
@@ -1087,6 +1104,9 @@ class UsageStore:
             return report
         if not liveness['past_deadline']:
             report['why'] = 'dead owner before deadline'
+            return report
+        if final is None and not incomplete_reboot_proven(start):
+            report['why'] = 'incomplete launch/child evidence requires independent same-host reboot proof'
             return report
         if final is not None and not self._completed_children_proven(start, final, children):
             report['why'] = 'completed uncertain launch/child evidence is incomplete'
