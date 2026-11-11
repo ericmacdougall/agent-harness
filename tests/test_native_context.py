@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest import mock
 
@@ -163,11 +163,7 @@ class ReviewRuntimeRegressions(unittest.TestCase):
 
 
 class TerminalLoginEndsTheWalk(unittest.TestCase):
-    """A Terminal-launched session has /usr/bin/login (root, unreadable BSD info) above its shell.
-
-    Before this, the probe failed with probe_failed there and every Terminal-launched Claude main lost main
-    authority on macOS (goodqa#15565); a root-owned login cannot be an OpenAI runtime that launched the caller.
-    """
+    """Terminal compatibility requires a stable kernel boundary, not a path-only guess."""
 
     class Chain(FakeBackend):
         login_is_terminal = True
@@ -184,8 +180,10 @@ class TerminalLoginEndsTheWalk(unittest.TestCase):
                 raise OSError("kernel process identity unavailable")
             return super().process(pid)
 
-        def is_terminal_login(self, pid):
-            return pid == 30 and self.login_is_terminal
+        def terminal_login_identity(self, pid):
+            if pid != 30 or not self.login_is_terminal:
+                raise OSError("boundary unavailable")
+            return nc.TerminalBoundary(30, 40, 0, "/usr/bin/login", 300, 400, 3, 4, b"u" * 16)
 
     def test_unreadable_terminal_login_is_the_end_of_a_non_native_chain(self):
         result = nc.probe_runtime_origin(10, backend=self.Chain())
@@ -221,6 +219,18 @@ class TerminalLoginEndsTheWalk(unittest.TestCase):
         def backend(path):
             class FakeLibproc:
                 @staticmethod
+                def proc_pidinfo(pid, flavor, arg, buffer, size):
+                    if flavor == 17:
+                        value = nc.DarwinBackend.UniqueInfo.from_buffer_copy(
+                            b"u" * 16 + (300).to_bytes(8, sys.byteorder) + (400).to_bytes(8, sys.byteorder)
+                            + (3).to_bytes(4, sys.byteorder) + (4).to_bytes(4, sys.byteorder) + b"\0" * 16)
+                    else:
+                        value = nc.DarwinBackend.ShortBSDInfo()
+                        value.pid, value.ppid, value.uid = pid, 40, 0
+                    ct.memmove(buffer, ct.byref(value), size)
+                    return size
+
+                @staticmethod
                 def proc_pidpath(pid, buffer, size):
                     data = path.encode()
                     ct.memmove(buffer, data, len(data))
@@ -230,10 +240,202 @@ class TerminalLoginEndsTheWalk(unittest.TestCase):
             value.proc = FakeLibproc()
             return value
 
-        self.assertTrue(backend("/usr/bin/login").is_terminal_login(756))
+        self.assertEqual(backend("/usr/bin/login").terminal_login_identity(756).pid, 756)
         for path in ("/usr/bin/login/", "/tmp/usr/bin/login", "/usr/bin/sudo", "/usr/local/bin/login", "login", ""):
             with self.subTest(path=path):
-                self.assertFalse(backend(path).is_terminal_login(756))
+                with self.assertRaises(OSError):
+                    backend(path).terminal_login_identity(756)
+
+
+class StableBoundaryRegressions(unittest.TestCase):
+    @dataclass(frozen=True)
+    class Record:
+        pid: int = 30
+        parent: int = 40
+        uid: int = 0
+        executable: str = "/usr/bin/login"
+        unique_id: int = 300
+        parent_unique_id: int = 400
+        id_version: int = 3
+        original_parent_version: int = 4
+        executable_uuid: bytes = b"u" * 16
+
+    class Chain(TerminalLoginEndsTheWalk.Chain):
+        def __init__(self):
+            super().__init__()
+            cls = getattr(nc, "TerminalBoundary", StableBoundaryRegressions.Record)
+            self.boundary = cls(30, 40, 0, "/usr/bin/login", 300, 400, 3, 4, b"u" * 16)
+            self.boundary_calls = 0
+            self.mutate = None
+            self.codes = {}
+
+        def signature(self, pid):
+            return self.codes.get(pid)
+
+        def event(self):
+            self.boundary_calls += 1
+            if self.mutate:
+                self.mutate(self)
+
+        def is_terminal_login(self, pid):
+            self.event()
+            return pid == 30
+
+        def terminal_login_identity(self, pid):
+            self.event()
+            return self.boundary
+
+    def denied(self, backend):
+        value = nc.probe_runtime_origin(10, backend=backend)
+        self.assertNotIn(value.reason, {"no_native_runtime", "nearer_other_runtime"})
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(nc, "probe_runtime_origin", return_value=value):
+            self.assertIsNotNone(nc.native_deny_reason({}))
+
+    def test_collected_changes_during_boundary_never_permit_legacy_fallback(self):
+        for field, value in (("parent", 41), ("started", 99), ("executable", "/tmp/changed"), ("uid", 0)):
+            with self.subTest(field=field):
+                b = self.Chain()
+                b.mutate = lambda obj, field=field, value=value: obj.processes.__setitem__(20, replace(obj.processes[20], **{field: value}))
+                self.denied(b)
+        b = self.Chain()
+        b.mutate = lambda obj: obj.codes.__setitem__(20, nc.CodeIdentity("codex", nc.OPENAI_TEAM, "b" * 40, "/bin/zsh"))
+        self.denied(b)
+
+    def test_boundary_changes_never_permit_legacy_fallback(self):
+        for field, value in (("unique_id", 301), ("parent_unique_id", 401), ("parent", 41),
+                             ("uid", 501), ("id_version", 4), ("original_parent_version", 5), ("executable_uuid", b"v" * 16),
+                             ("executable", "/tmp/login")):
+            with self.subTest(field=field):
+                b = self.Chain()
+                def mutate(obj, field=field, value=value):
+                    if obj.boundary_calls >= 2:
+                        obj.boundary = replace(obj.boundary, **{field: value})
+                b.mutate = mutate
+                self.denied(b)
+
+    def test_invalid_boundary_records_never_permit_legacy_fallback(self):
+        for changes in ({"uid": 501}, {"pid": 31}, {"parent": 30}, {"unique_id": 0},
+                        {"parent_unique_id": 0}, {"id_version": 0}, {"executable_uuid": b""},
+                        {"executable": "/usr/bin/login/"}):
+            with self.subTest(changes=changes):
+                b = self.Chain(); b.boundary = replace(b.boundary, **changes)
+                self.denied(b)
+
+    def test_ordinary_pid_one_chain_rechecks_before_no_native_result(self):
+        b = self.Chain(); b.processes[20] = replace(b.processes[20], parent=1)
+        def changed(pid):
+            if pid == 20:
+                b.processes[10] = replace(b.processes[10], started=99)
+            return None
+        b.signature = changed
+        self.denied(b)
+
+    def test_stable_boundary_reaches_all_rechecks_without_legacy_boolean(self):
+        b = self.Chain()
+        def forbidden(_pid):
+            self.fail("path-only method must not be called")
+        b.is_terminal_login = forbidden
+        result = nc.probe_runtime_origin(10, backend=b)
+        self.assertEqual(result.reason, "no_native_runtime")
+        self.assertGreaterEqual(b.boundary_calls, 3)
+
+    def test_collected_mutation_during_boundary_rechecks_is_seen(self):
+        for target in (2, 3):
+            with self.subTest(boundary_read=target):
+                b = self.Chain()
+                def changed(obj, target=target):
+                    if obj.boundary_calls == target:
+                        obj.processes[20] = replace(obj.processes[20], started=99)
+                b.mutate = changed
+                self.denied(b)
+                self.assertGreaterEqual(b.boundary_calls, target)
+
+    def test_missing_boolean_or_failed_boundary_is_uncertain(self):
+        for value in (True, False, None):
+            with self.subTest(value=value):
+                b = self.Chain(); b.terminal_login_identity = lambda _pid: value
+                self.denied(b)
+        b = TerminalLoginEndsTheWalk.Chain()
+        with mock.patch.object(type(b), "terminal_login_identity", None):
+            self.denied(b)
+        b = self.Chain()
+        def unavailable(_pid):
+            raise OSError("inert failure")
+        b.terminal_login_identity = unavailable
+        self.denied(b)
+
+    def test_code_recheck_errors_and_changes_at_pid_one_fail_closed(self):
+        for failure in (True, False):
+            b = self.Chain(); b.processes[20] = replace(b.processes[20], parent=1)
+            calls = []
+            def signature(pid):
+                calls.append(pid)
+                if pid == 20 and len(calls) > 2:
+                    if failure:
+                        raise OSError("inert failed recheck")
+                    return nc.CodeIdentity("codex", nc.OPENAI_TEAM, "b" * 40, "/bin/zsh")
+                return None
+            b.signature = signature
+            self.denied(b)
+
+
+class KernelBoundaryABI(unittest.TestCase):
+    def backend(self, *, results=None, mutate=None, path="/usr/bin/login", path_result=None):
+        import ctypes as ct
+        calls = []
+        class InertLibproc:
+            @staticmethod
+            def proc_pidinfo(pid, flavor, arg, buffer, size):
+                calls.append((flavor, arg, size))
+                if flavor == 17:
+                    value = nc.DarwinBackend.UniqueInfo()
+                    value.uuid[:] = b"u" * 16
+                    value.uniqueid, value.parent_uniqueid = 300, 400
+                    value.idversion, value.original_parent_version = 3, 4
+                    if mutate and len(calls) == 3:
+                        mutate(value)
+                else:
+                    value = nc.DarwinBackend.ShortBSDInfo()
+                    value.pid, value.ppid, value.uid = pid, 40, 0
+                self.assertEqual(arg, 0)
+                self.assertEqual(size, 56 if flavor == 17 else 64)
+                ct.memmove(buffer, ct.byref(value), size)
+                return (results or {}).get(flavor, size)
+
+            @staticmethod
+            def proc_pidpath(pid, buffer, size):
+                data = path.encode()
+                ct.memmove(buffer, data, len(data))
+                return len(data) if path_result is None else path_result
+        backend = nc.DarwinBackend.__new__(nc.DarwinBackend)
+        backend.proc = InertLibproc()
+        return backend, calls
+
+    def test_exact_abi_success_and_live_argument(self):
+        import ctypes as ct
+        self.assertEqual(ct.sizeof(nc.DarwinBackend.ShortBSDInfo), 64)
+        self.assertEqual(ct.sizeof(nc.DarwinBackend.UniqueInfo), 56)
+        backend, calls = self.backend()
+        self.assertEqual(backend.terminal_login_identity(30),
+                         nc.TerminalBoundary(30, 40, 0, "/usr/bin/login", 300, 400, 3, 4, b"u" * 16))
+        self.assertEqual(calls, [(17, 0, 56), (13, 0, 64), (17, 0, 56)])
+
+    def test_bad_sizes_and_missing_paths_fail_closed(self):
+        for flavor, values in ((13, (-1, 0, 63, 65)), (17, (-1, 0, 55, 57))):
+            for result in values:
+                with self.subTest(flavor=flavor, result=result), self.assertRaises(OSError):
+                    self.backend(results={flavor: result})[0].terminal_login_identity(30)
+        for result in (-1, 0, 4, 4096, 8192):
+            with self.subTest(path_result=result), self.assertRaises(OSError):
+                self.backend(path_result=result)[0].terminal_login_identity(30)
+
+    def test_each_meaningful_unique_field_is_bracketed(self):
+        for name, value in (("uniqueid", 301), ("parent_uniqueid", 401), ("idversion", 4),
+                            ("original_parent_version", 5)):
+            with self.subTest(name=name), self.assertRaises(OSError):
+                self.backend(mutate=lambda obj, name=name, value=value: setattr(obj, name, value))[0].terminal_login_identity(30)
+        with self.assertRaises(OSError):
+            self.backend(mutate=lambda obj: obj.uuid.__setitem__(0, 0))[0].terminal_login_identity(30)
 
 
 class Packaging(unittest.TestCase):
