@@ -1559,6 +1559,42 @@ def check_liveness(cfg, state, runner, now):
     return out
 
 
+def check_mission(cfg, state, runner, now):
+    """Mission coverage (goodqa#15565): mission:<goal>:uncovered (high, stop_block) and mission:<goal>:stalled
+    (warning) from mission_coverage.assess for the mission session (goals.json mission_session);
+    mission:goals:unreadable when the goals file cannot be trusted. Silent on a host without a goals file or a mission
+    session. Each full owner scan here is signed as the owner snapshot the Stop gate reads (ops-watch is its only
+    writer). When the scan is unavailable (overran mission.timeout_s, or ah failed) the last mission alerts are kept
+    and mission:scan:unavailable is raised: an unavailable scan never clears anything. When the set of uncovered goals
+    gains a goal it wakes main (mission_coverage.notify_main); when it empties it clears that notice."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import mission_coverage as mc  # noqa: PLC0415 - installed beside this file
+    home = Path(home_of(cfg))
+    if not os.path.lexists(mc.goals_path(home)) and not mc.audit_segments(home):
+        return []
+    session = mc.mission_session_of(home)
+    if not session:
+        return []
+    timeout = float((cfg.get("mission") or {}).get("timeout_s", 120))
+    assessment = mc.assess(home, session, now, with_commits=True, deadline_s=timeout, save_snapshot=True)
+    if assessment.get("state") == "owners-unavailable":
+        kept = [{"check": "mission", "key": key, "severity": a.get("severity", "warning"),
+                 "message": a.get("message", ""), "detail": a.get("detail") or {}}
+                for key, a in (state.get("active") or {}).items()
+                if key.startswith("mission:") and key != "mission:scan:unavailable" and a.get("check") == "mission"]
+        return kept + [{"check": "mission", "key": "mission:scan:unavailable", "severity": "warning",
+                        "message": f"mission coverage could not list owners ({mc.clean(assessment.get('error'), 160)}); "
+                                   "the last mission alerts are kept", "detail": {"stop_block": False}}]
+    uncovered = sorted(r["id"] for r in assessment.get("results") or [] if r["state"] == "UNCOVERED")
+    notified = [g for g in state.get("mission_notified") or [] if isinstance(g, str)]
+    if set(uncovered) - set(notified):
+        mc.notify_main(uncovered, home=home, session=session)
+    elif notified and not uncovered:
+        mc.notify_main([], home=home, session=session)
+    state["mission_notified"] = uncovered
+    return mc.mission_alerts(assessment)
+
+
 # ---------------------------------------------------------------- run
 
 PENDING_NOTE_RE = re.compile(r"^\s*PENDING_REAL_TEST\s+([A-Za-z0-9][A-Za-z0-9._-]{0,40})\s*:")
@@ -1703,6 +1739,7 @@ DEFAULT_CHECKS = {
     "peers": check_peers,
     "remote_units": check_remote_units,
     "deploys": lambda c, s, r, n: check_deploys(c, s, r, n) if (c.get("deploys") or {}).get("enabled", True) else [],
+    "mission": lambda c, s, r, n: check_mission(c, s, r, n) if (c.get("mission") or {}).get("enabled", True) else [],
 }
 RUN_CHECK = "_run"    # internal errors; cleared by any completed run
 SINK_CHECK = "_sink"  # delivery failures; cleared when that sink recovers
