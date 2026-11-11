@@ -3,6 +3,7 @@ Initiatives AC-1/NEG-1, WalTail AC-2/NEG-2/NEG-9, GithubEvents+Deploys AC-3/NEG-
 CodexResponder AC-6/NEG-6, Security AC-7/NEG-7, ReadOnly+Redaction AC-8/NEG-8, Budget AC-9/NEG-9,
 Schema+FileDrop AC-13/NEG-13."""
 import http.client
+import importlib.util
 import json
 import os
 import re
@@ -407,6 +408,237 @@ class FileDrop(Tmp):
         self.assertEqual(events[0]["source"], "fabric")
         self.assertNotIn(STRIPE, json.dumps(events))
         self.assertEqual(fd.skipped, 5)  # schema, kind, oversize, broken, symlink
+
+
+class PrivacyBoundaries(Tmp):
+    @staticmethod
+    def shape():
+        return "hf_" + "q" * 24
+
+    def test_file_drop_refuses_credential_shapes_before_seen_and_sse(self):
+        folder = self.base / "drop"
+        folder.mkdir()
+        valid = ev.make("deploy", "external", "ordinary", eid="ordinary")
+        value = self.shape()
+        rejected = [
+            dict(valid, id=value),
+            dict(valid, id="actor", actor={"session": value}),
+            dict(valid, id="subject", subject={"branch": value}),
+        ]
+        kept = tuple("id-" + "n" * 196 + suffix for suffix in ("a", "b"))
+        accepted = [dict(valid, id=event_id, summary="fixture " + value) for event_id in kept]
+        (folder / "external.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rejected + accepted))
+        (folder / (value + ".jsonl")).write_text(json.dumps(dict(valid, id="pinned-source")) + "\n")
+        source = col.FileDrop(self.hub, self.health, mcs.Reader([self.base]), folder)
+        client = self.hub.attach()
+        source.tick(0)
+        recent = self.hub.recent()
+        self.assertEqual(source.accepted, len(kept))
+        self.assertEqual(source.skipped, len(rejected) + 1)
+        self.assertTrue(source.seen == set(kept), "only admitted identities may enter deduplication")
+        self.assertTrue(all(value not in path for path in source.files), "refused source must not be retained")
+        self.assertTrue([row["id"] for row in recent] == list(kept), "keep distinct exact nonsecret identities")
+        self.assertTrue(all("[REDACTED:huggingface]" in row["summary"] for row in recent))
+        frames = client.take(0)
+        self.assertEqual(len(frames), len(kept))
+        self.assertTrue(all(value.encode() not in frame for frame in frames), "no shape may enter an SSE frame")
+
+    def test_raw_trim_and_emitted_word_projection_are_both_checked(self):
+        value = self.shape()
+        cases = (
+            ("source-trim", {"source": "!" * 32 + value}),
+            ("actor-trim", {"actor": {"session": "!" * 150 + value}}),
+            ("subject-trim", {"subject": {"repo": "!" * 150 + value}}),
+            ("word-replacement", {"actor": {"session": "hf?" + "q" * 24}}),
+            ("oversized-raw", {"subject": {"ref": "." * 9000}}),
+        )
+        client = self.hub.attach()
+        for label, fields in cases:
+            with self.subTest(label=label):
+                options = dict(source="ordinary", eid="ordinary")
+                options.update(fields)
+                self.assertFalse(self.hub.publish(ev.make("wal", summary="ordinary", **options)))
+        raw = ev.make("wal", "ordinary", "ordinary", eid="ordinary")
+        raw["id"] = value
+        self.assertFalse(self.hub.publish(raw))
+        self.assertEqual(len(self.hub.recent()), 0)
+        self.assertEqual(len(client.take(0)), 0)
+        self.assertEqual(self.hub.window[1], 0)
+
+    def test_github_convert_checks_actual_raw_inputs_before_its_earlier_clipping(self):
+        value = self.shape()
+        cases = (
+            ("id", {"id": "." * 26 + value}, {}),
+            ("repo", {"repo": {"name": "." * 112 + value}}, {}),
+            ("branch", {}, {"ref": "refs/heads/" + "." * 112 + value}),
+            ("tag", {"type": "ReleaseEvent"}, {"release": {"tag_name": "." * 72 + value}}),
+            ("created-branch", {"type": "CreateEvent"}, {"ref_type": "branch", "ref": "." * 112 + value}),
+        )
+        for label, fields, payload in cases:
+            with self.subTest(label=label):
+                item = {"id": 42, "repo": {"name": "owner/repo"}, "type": "PushEvent", "payload": payload}
+                item.update(fields)
+                self.assertTrue(col.GitHub.convert(item) is None, "raw structured value must be refused")
+        normal = col.GitHub.convert({"id": 42, "repo": {"name": "owner/repo"}, "type": "PushEvent",
+                                     "payload": {"ref": "refs/heads/topic"}})
+        self.assertEqual(normal["id"], "github:42")
+        self.assertEqual(normal["subject"]["branch"], "topic")
+
+    def test_local_hostname_is_checked_before_split_and_clipping(self):
+        def fresh_events(raw_host):
+            spec = importlib.util.spec_from_file_location("fixture_events", ev.__file__)
+            module = importlib.util.module_from_spec(spec)
+            with mock.patch("socket.gethostname", return_value=raw_host):
+                spec.loader.exec_module(module)
+            return module
+
+        value = self.shape()
+        cases = ("-" * 59 + value + ".local", "fixture-box." + value)
+        for index, raw_host in enumerate(cases):
+            with self.subTest(case=index):
+                module = fresh_events(raw_host)
+                hub = module.Hub(max_rate=100)
+                client = hub.attach()
+                self.assertFalse(hub.publish(module.make("owner", "fixture", "ordinary", eid="ordinary")))
+                self.assertFalse(hub.recent())
+                self.assertFalse(client.take(0))
+        module = fresh_events("fixture-box.local")
+        normal = module.make("owner", "fixture", "ordinary", eid="ordinary")
+        self.assertEqual(normal["host"], "fixture-box")
+        self.assertTrue(module.Hub(max_rate=100).publish(normal))
+
+    def test_ticket_comment_id_is_checked_before_clipping_and_seen(self):
+        value = self.shape()
+        comments = {"comments": [{"id": "-" * 35 + value}, {"id": "ordinary"}]}
+        runner = FakeRunner({"ah-ticket-comments": lambda ref: (0, json.dumps(comments))})
+        poll = col.Tickets(self.hub, self.health, runner, lambda: ["goodqa#15585"])
+        client = self.hub.attach()
+        poll.tick(time.time())
+        self.assertTrue(poll.seen["goodqa#15585"] == {"ordinary"}, "only admitted comment IDs enter seen")
+        self.assertTrue([row["id"] for row in self.hub.recent()] == ["goodqa:ordinary"])
+        self.assertEqual(len(client.take(0)), 1)
+
+    def test_normal_fabric_fields_and_optional_hub_tenant_survive(self):
+        folder = self.base / "fabric-fields"
+        folder.mkdir()
+        actor = {"runtime": "codex", "session": "session-1", "agent": "main"}
+        subject = {"repo": "owner/repo", "branch": "main", "ref": "refs/heads/main",
+                   "ticket": "goodqa#15585", "initiative": "fixture"}
+        row = dict(ev.make("owner", "exporter", "ordinary", eid="fabric:one", actor=actor, subject=subject),
+                   tenant="fixture-tenant")
+        (folder / "fabric.jsonl").write_text(json.dumps(row) + "\n")
+        source = col.FileDrop(self.hub, self.health, mcs.Reader([self.base]), folder)
+        source.tick(0)
+        admitted, = self.hub.recent()
+        self.assertEqual(admitted["actor"], actor)
+        self.assertEqual(admitted["subject"], subject)
+        self.assertNotIn("tenant", admitted)  # existing FileDrop projection drops exporter metadata
+        self.assertTrue(self.hub.publish(dict(row, id="direct:ordinary")))
+        self.assertFalse(self.hub.publish(dict(row, id="direct:refused", tenant=self.shape())))
+        self.assertEqual(self.hub.recent()[-1]["tenant"], "fixture-tenant")
+
+    def test_fabric_ingress_refuses_full_decoded_lines_before_any_sink_effect(self):
+        value = self.shape()
+        ordinary = ev.make("owner", "exporter", "ordinary", eid="fabric:one")
+        encoded = json.dumps(ordinary)
+        escaped = json.dumps(dict(ordinary, discarded={"nested": [value]})).replace("hf_", r"\u0068f_")
+        duplicate = encoded[:-1] + ', "ignored": ' + json.dumps(value) + ', "ignored": null}'
+        invalid = "contains an invalid event line"
+        privacy = "failed event privacy admission"
+        cases = (
+            ("escaped-value", escaped, privacy),
+            ("nested-key", json.dumps(dict(ordinary, ignored=[{value: False}])), privacy),
+            ("summary", json.dumps(dict(ordinary, summary=value)), privacy),
+            ("duplicate", duplicate, invalid),
+            ("depth", encoded[:-1] + ', "ignored":' + "[" * 34 + "0" + "]" * 34 + "}", privacy),
+            ("parser-depth", encoded[:-1] + ', "ignored":' + "[" * 1500 + "0" + "]" * 1500 + "}", invalid),
+            ("nan", json.dumps(dict(ordinary, ignored=float("nan"))), invalid),
+            ("infinity", json.dumps(dict(ordinary, ignored=float("inf"))), invalid),
+            ("escaped-surrogate", json.dumps(dict(ordinary, ignored="\ud800")), privacy),
+            ("non-utf8", json.dumps(dict(ordinary, ignored="\ud800"), ensure_ascii=False), "is not valid UTF-8"),
+        )
+        for label, line, category in cases:
+            with self.subTest(label=label):
+                folder = self.base / label
+                folder.mkdir()
+                runner = mock.Mock()
+                runner.run.return_value = (0, line + '\n{"cursor":"fx1:refused"}\n')
+                remote = col.Remote(self.hub, self.health, runner, fabric=True, drop_dir=folder)
+                with self.assertRaisesRegex(ValueError, f"^Fabric response {category}$"):
+                    remote.fabric_export()
+                self.assertEqual(remote.cursor, "")
+                self.assertFalse(tuple(folder.iterdir()), "refused initial batch must create no files")
+
+    def test_fabric_decoded_node_ceiling_counts_keys_and_values(self):
+        self.assertFalse(col._fabric_privacy_refused({"metadata": [0] * 4093}))
+        self.assertTrue(col._fabric_privacy_refused({"metadata": [0] * 4094}))
+
+    def test_fabric_ingress_preserves_committed_prefix_and_safe_retry_bytes(self):
+        import redact
+
+        folder = self.base / "durable-fabric"
+        folder.mkdir()
+        runner = mock.Mock()
+        remote = col.Remote(self.hub, self.health, runner, fabric=True, drop_dir=folder)
+        first = json.dumps(ev.make("owner", "exporter", "ordinary", eid="fabric:first"), separators=(",", ":"))
+        good = json.dumps(ev.make("owner", "exporter", "[REDACTED:huggingface]", eid="fabric:good"), indent=None)
+        bad = json.dumps(dict(json.loads(good), id="fabric:bad", summary=self.shape()))
+
+        def response(lines, cursor):
+            runner.run.return_value = (0, "\n".join([*lines, json.dumps({"cursor": cursor})]) + "\n")
+
+        response([first], "fx1:first")
+        remote.fabric_export()
+        sink = folder / "fabric.jsonl"
+        checkpoint = folder / col.FABRIC_CHECKPOINT
+        before = sink.read_bytes(), checkpoint.read_bytes(), checkpoint.stat().st_ino
+        response([good, bad], "fx1:second")
+        with self.assertRaisesRegex(ValueError, "^Fabric response failed event privacy admission$"):
+            remote.fabric_export()
+        self.assertTrue((sink.read_bytes(), checkpoint.read_bytes(), checkpoint.stat().st_ino) == before)
+        self.assertEqual(remote.cursor, "fx1:first")
+        response([good], "fx1:second")
+        with mock.patch.object(redact, "has_secret", None):
+            with self.assertRaisesRegex(ValueError, "^Fabric response failed event privacy admission$"):
+                remote.fabric_export()
+        self.assertTrue((sink.read_bytes(), checkpoint.read_bytes(), checkpoint.stat().st_ino) == before)
+        self.assertEqual(remote.cursor, "fx1:first")
+        remote.fabric_export()
+        runner.run.assert_called_with("fabric-export", "fx1:first", timeout=15, limit=1024 * 1024)
+        self.assertEqual(remote.cursor, "fx1:second")
+        self.assertTrue(sink.read_bytes() == (first + "\n" + good + "\n").encode())
+
+    def test_chat_missing_redactor_has_no_creation_or_reply_effect(self):
+        empty = self.base / "empty-chat-root"
+        existing = self.base / "existing-chat-root"
+        message, _ = mc_chat.new_message("codex", "ordinary fixture", client_key="fixture-key", root=existing)
+
+        def state(root):
+            result = {}
+            for path in (root, *root.rglob("*")):
+                info = path.stat()
+                data = path.read_bytes() if path.is_file() and path.name != "secret" else None
+                result[path.relative_to(root)] = (info.st_mode, info.st_size, info.st_mtime_ns, data)
+            return result
+
+        before = state(existing)
+        original_import = __import__
+        def missing(name, *args, **kwargs):
+            if name == "redact":
+                raise ImportError("fixture dependency unavailable")
+            return original_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=missing):
+            with self.subTest(entry="create"):
+                with self.assertRaises(mc_chat.ChatError) as error:
+                    mc_chat.new_message("codex", self.shape(), client_key="empty-fixture", root=empty)
+                self.assertEqual(error.exception.code, "redaction-unavailable")
+                self.assertFalse(empty.exists())
+            with self.subTest(entry="reply"):
+                with self.assertRaises(mc_chat.ChatError) as error:
+                    mc_chat.write_reply(message["id"], "codex", self.shape(), root=existing)
+                self.assertEqual(error.exception.code, "redaction-unavailable")
+                self.assertTrue(state(existing) == before, "no persistent reply or state may change")
 
 
 class ReadOnly(unittest.TestCase):

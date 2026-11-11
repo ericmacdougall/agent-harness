@@ -810,7 +810,7 @@ class GitHub(Collector):
         fresh = 0
         for item in reversed(items[:100]):
             event = self.convert(item, historic=not self.seeded)
-            if event is None or event["id"] in self.seen:
+            if ev.refused_projection(event) or event["id"] in self.seen:
                 continue
             self.seen.add(event["id"])
             self.hub.publish(event)
@@ -825,22 +825,37 @@ class GitHub(Collector):
         if not isinstance(item, dict):
             return None
         kind = item.get("type")
-        repo = str((item.get("repo") or {}).get("name") or "")[:120]
+        repo_item = item.get("repo") or {}
+        if not isinstance(repo_item, dict):
+            return None
+        raw_repo, raw_id = repo_item.get("name"), item.get("id")
+        if ev.structured_fields_refused(raw_repo, raw_id):
+            return None
+        repo = str(raw_repo or "")[:120]
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-        eid = "github:" + re.sub(r"[^0-9A-Za-z]", "", str(item.get("id") or ""))[:30]
+        eid = "github:" + re.sub(r"[^0-9A-Za-z]", "", str(raw_id or ""))[:30]
         ts = ev.parse_ts(item.get("created_at"))
         if kind == "PushEvent":
-            branch = str(payload.get("ref") or "").replace("refs/heads/", "")[:120]
+            raw_branch = payload.get("ref")
+            if ev.structured_fields_refused(raw_branch):
+                return None
+            branch = str(raw_branch or "").replace("refs/heads/", "")[:120]
             size = payload.get("size") if isinstance(payload.get("size"), int) else 1
             return ev.make("push", "github", f"{repo}: {size} commit(s) to {branch}", eid=eid, ts=ts,
                            subject={"repo": repo, "branch": branch}, count=max(1, size), historic=historic)
         if kind == "ReleaseEvent":
             release = payload.get("release") if isinstance(payload.get("release"), dict) else {}
-            tag = str(release.get("tag_name") or "")[:80]
+            raw_tag = release.get("tag_name")
+            if ev.structured_fields_refused(raw_tag):
+                return None
+            tag = str(raw_tag or "")[:80]
             return ev.make("release", "github", f"{repo}: release {tag} {payload.get('action', '')}", eid=eid,
                            ts=ts, subject={"repo": repo, "ref": tag}, historic=historic)
         if kind == "CreateEvent" and payload.get("ref_type") == "branch":
-            branch = str(payload.get("ref") or "")[:120]
+            raw_branch = payload.get("ref")
+            if ev.structured_fields_refused(raw_branch):
+                return None
+            branch = str(raw_branch or "")[:120]
             return ev.make("push", "github", f"{repo}: new branch {branch}", eid=eid, ts=ts,
                            subject={"repo": repo, "branch": branch}, historic=historic)
         return None
@@ -887,13 +902,19 @@ class Tickets(Collector):
         for comment in comments[-50:]:
             if not isinstance(comment, dict):
                 continue
-            cid = re.sub(r"[^0-9A-Za-z-]", "", str(comment.get("id") or ""))[:40]
+            raw_id = comment.get("id")
+            if ev.structured_fields_refused(raw_id):
+                continue
+            cid = re.sub(r"[^0-9A-Za-z-]", "", str(raw_id or ""))[:40]
             if not cid or cid in seen:
                 continue
-            seen.add(cid)
             ts = ev.parse_ts(comment.get("createdAt"), now)
-            self.hub.publish(ev.make("ticket", "goodqa", f"{ref}: {comment.get('body') or ''}", eid=f"goodqa:{cid}",
-                                     ts=ts, subject={"ticket": ref}, historic=first))
+            event = ev.make("ticket", "goodqa", f"{ref}: {comment.get('body') or ''}", eid=f"goodqa:{cid}",
+                            ts=ts, subject={"ticket": ref}, historic=first)
+            if ev.refused_projection(event):
+                continue
+            seen.add(cid)
+            self.hub.publish(event)
         self.seen[ref] = seen
         return f"{ref} ({len(tickets)} tracked)"
 
@@ -998,6 +1019,42 @@ def _fabric_append(path: Path, payload: bytes) -> None:
         os.close(fd)
 
 
+def _fabric_unique_object(pairs):
+    row = dict(pairs)
+    if len(row) != len(pairs):
+        raise ValueError("duplicate event key")
+    return row
+
+
+def _fabric_non_json_number(_value):
+    raise ValueError("non-JSON event number")
+
+
+def _fabric_privacy_refused(event) -> bool:
+    """Inspect every decoded string because the sink retains the original line."""
+    pending = [(event, 0)]
+    visited = 0
+    strings = []
+    while pending:
+        value, depth = pending.pop()
+        visited += 1
+        if depth > 32 or visited > 4096:
+            return True
+        if isinstance(value, str):
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                return True
+            strings.append(value)
+        elif isinstance(value, dict):
+            for key, child in value.items():
+                pending.append((key, depth + 1))
+                pending.append((child, depth + 1))
+        elif isinstance(value, list):
+            pending.extend((child, depth + 1) for child in value)
+    return ev.structured_fields_refused(*strings)
+
+
 class Remote(Collector):
     """At most one ssh to the remote host per minute: a fixed WAL probe, alternating with the Fabric export once
     Fabric ships `control export`."""
@@ -1048,7 +1105,13 @@ class Remote(Collector):
         code, out = self.runner.run("fabric-export", self.cursor, timeout=15, limit=1024 * 1024)
         if code != 0:
             raise RuntimeError(f"fabric export exited {code}")
-        if not isinstance(out, str) or len(out.encode("utf-8")) > 1024 * 1024:
+        if not isinstance(out, str):
+            raise ValueError("Fabric response exceeds its byte budget")
+        try:
+            size = len(out.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise ValueError("Fabric response is not valid UTF-8") from None
+        if size > 1024 * 1024:
             raise ValueError("Fabric response exceeds its byte budget")
         lines = [line for line in out.split("\n") if line.strip()]
         if not lines or len(lines) > 5001:
@@ -1059,8 +1122,16 @@ class Remote(Collector):
             raise ValueError("Fabric response has no valid cursor footer")
         lines = lines[:-1]
         for line in lines:
-            if len(line.encode("utf-8")) > 8192 or ev.validate(_json(line.encode("utf-8"))):
+            if len(line.encode("utf-8")) > 8192:
                 raise ValueError("Fabric response contains an invalid event line")
+            try:
+                event = json.loads(line, object_pairs_hook=_fabric_unique_object, parse_constant=_fabric_non_json_number)
+            except (ValueError, RecursionError):
+                raise ValueError("Fabric response contains an invalid event line") from None
+            if ev.validate(event):
+                raise ValueError("Fabric response contains an invalid event line")
+            if _fabric_privacy_refused(event):
+                raise ValueError("Fabric response failed event privacy admission")
         if lines:
             if not self.drop_dir:
                 raise ValueError("Fabric event sink is not configured")
@@ -1092,6 +1163,10 @@ class FileDrop(Collector):
         for entry in entries[:32]:
             name = entry.name
             if not name.endswith(".jsonl") or not re.match(r"^[a-z0-9][a-z0-9_-]{0,31}\.jsonl$", name):
+                continue
+            source = name[:-6]
+            if ev.structured_fields_refused(source):
+                self.skipped += 1
                 continue
             if entry.is_symlink():
                 if entry.path not in self.bad_files:
@@ -1136,7 +1211,10 @@ class FileDrop(Collector):
                 if reason:
                     self.skipped += 1
                     continue
-                normalized = ev.normalize_external(event, name[:-6])
+                normalized = ev.normalize_external(event, source)
+                if ev.refused_projection(normalized):
+                    self.skipped += 1
+                    continue
                 if normalized["id"] in self.seen:
                     continue
                 self.seen.add(normalized["id"])

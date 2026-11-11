@@ -15,10 +15,12 @@ SCHEMA = "mc.event/1"
 KINDS = ("wal", "push", "release", "deploy", "ticket", "chat", "owner", "initiative", "system")
 SEVERITIES = ("info", "warn", "high")
 SUMMARY_MAX = 280
+STRUCTURED_SCAN_MAX = 8192
+ACTOR_FIELDS = ("runtime", "session", "agent")
+SUBJECT_FIELDS = ("repo", "branch", "ref", "ticket", "initiative")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/#-]{0,199}$")
 TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
 WORD_RE = re.compile(r"^[A-Za-z0-9._:@/#+-]{0,160}$")
-HOST = socket.gethostname().split(".")[0][:64]
 
 
 def _redact(text: str) -> str:
@@ -50,17 +52,61 @@ def _word(value) -> str:
     return value if WORD_RE.match(value) else re.sub(r"[^A-Za-z0-9._:@/#+-]", "_", value)
 
 
+def structured_fields_refused(*values) -> bool:
+    """Fail closed without returning or logging an inspected value."""
+    try:
+        from redact import has_secret
+    except ImportError:
+        return True
+    if not callable(has_secret):
+        return True
+    for value in values:
+        if value is None or type(value) is int and value.bit_length() <= 64:
+            continue
+        if not isinstance(value, str) or len(value) > STRUCTURED_SCAN_MAX or has_secret(value):
+            return True
+    return False
+
+
+def _local_host() -> str:
+    raw_host = socket.gethostname()
+    if structured_fields_refused(raw_host):
+        return ""
+    label = raw_host.split(".", 1)[0][:64]
+    return "" if structured_fields_refused(label) else label
+
+
+HOST = _local_host()
+
+
+def _retained_values(actor, subject):
+    return (*(actor.get(key) for key in ACTOR_FIELDS), *(subject.get(key) for key in SUBJECT_FIELDS))
+
+
+def refused_projection(event) -> bool:
+    if not isinstance(event, dict):
+        return True
+    actor, subject = event.get("actor", {}), event.get("subject", {})
+    if (not isinstance(actor, dict) or not isinstance(subject, dict)
+            or len(actor) > len(ACTOR_FIELDS) or len(subject) > len(SUBJECT_FIELDS)
+            or actor.keys() - ACTOR_FIELDS or subject.keys() - SUBJECT_FIELDS):
+        return True
+    return structured_fields_refused(event.get("id"), event.get("source"), event.get("host"),
+                                     event.get("tenant"), *actor.values(), *subject.values())
+
+
 def make(kind: str, source: str, summary, *, eid: str, ts: float | None = None, actor: dict | None = None,
          subject: dict | None = None, severity: str = "info", count: int = 1, historic: bool = False,
-         quiet: bool = False) -> dict:
+         quiet: bool = False) -> dict | None:
     actor = actor or {}
     subject = subject or {}
+    if not HOST or structured_fields_refused(eid, source, *_retained_values(actor, subject)):
+        return None
     event = {
         "schema": SCHEMA, "id": _word(eid)[:200], "ts": iso(ts), "kind": kind, "source": _word(source)[:40],
         "host": HOST,
-        "actor": {k: _word(actor.get(k)) for k in ("runtime", "session", "agent") if actor.get(k)},
-        "subject": {k: _word(subject.get(k)) for k in ("repo", "branch", "ref", "ticket", "initiative")
-                    if subject.get(k)},
+        "actor": {k: _word(actor[k]) for k in ACTOR_FIELDS if actor.get(k)},
+        "subject": {k: _word(subject[k]) for k in SUBJECT_FIELDS if subject.get(k)},
         "summary": short(summary), "severity": severity if severity in SEVERITIES else "info",
         "count": max(1, int(count)),
     }
@@ -99,11 +145,13 @@ def validate(event) -> str | None:
     return None
 
 
-def normalize_external(event: dict, source: str) -> dict:
+def normalize_external(event: dict, source: str) -> dict | None:
     """Re-build a validated external event through make(): re-redacted, fields re-sanitized, source pinned."""
     normalized = make(event["kind"], source, event.get("summary", ""), eid=event["id"], ts=parse_ts(event["ts"]),
                 actor=event.get("actor"), subject=event.get("subject"), severity=event.get("severity", "info"),
                 count=event.get("count", 1), historic=event.get("historic") is True)
+    if normalized is None:
+        return None
     # Valid external IDs allow 200 characters; the generic word sanitizer caps display fields at160.
     # Preserve the validated identity instead of collapsing different producer IDs to one prefix.
     normalized["id"] = event["id"]
@@ -158,16 +206,20 @@ class Hub:
         for client in list(self.clients):
             client.push(frame)
 
-    def publish(self, event: dict) -> bool:
+    def publish(self, event: dict | None) -> bool:
         """Add an event; over the rate budget it is counted into a burst summary instead of sent."""
+        if refused_projection(event):
+            return False
         with self.lock:
             now = time.monotonic()
             if now - self.window[0] >= 1.0:
                 if self.suppressed:
                     loud = self.suppressed - self.suppressed_quiet
-                    self._emit_locked(make("system", "mission-control", f"{self.suppressed} more events in a burst",
-                                           eid=f"burst:{int(now * 1000)}", count=self.suppressed, severity="info",
-                                           quiet=loud == 0))
+                    burst = make("system", "mission-control", f"{self.suppressed} more events in a burst",
+                                 eid=f"burst:{int(now * 1000)}", count=self.suppressed, severity="info",
+                                 quiet=loud == 0)
+                    if not refused_projection(burst):
+                        self._emit_locked(burst)
                     self.suppressed = self.suppressed_quiet = 0
                 self.window = [now, 0]
             # Quiet activity (tool calls, lifecycle) gets half the budget so it never crowds out work items.

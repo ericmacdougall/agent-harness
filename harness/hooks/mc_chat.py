@@ -226,12 +226,14 @@ def clean_text(text) -> str:
     return text
 
 
-def _redact(text: str) -> str:
+def _require_redactor():
     try:
-        import redact  # the harness redaction, installed beside this file
-    except ImportError:  # pragma: no cover - always installed together
-        return text
-    return redact.redact(text)
+        from redact import redact
+    except ImportError:
+        raise ChatError("redaction-unavailable", "chat redaction is unavailable") from None
+    if not callable(redact):
+        raise ChatError("redaction-unavailable", "chat redaction is unavailable")
+    return redact
 
 
 def _canonical(record: dict) -> bytes:
@@ -306,6 +308,7 @@ def _restore_creation(record: dict, root: Path) -> None:
 def new_message(to: str, text, *, client_key: str, session: str | None = None, thread: str | None = None,
                 root: Path | None = None, ts: float | None = None) -> tuple[dict, bool]:
     """Create (or return, for a repeated client_key) a signed inbox record. Returns (record, created)."""
+    redact = _require_redactor()
     root = ensure_dirs(root)
     if to not in RUNTIMES:
         raise ChatError("bad-target", "to must be claude or codex")
@@ -318,7 +321,7 @@ def new_message(to: str, text, *, client_key: str, session: str | None = None, t
         session = None
     if thread is not None and (not isinstance(thread, str) or not THREAD_RE.match(thread)):
         raise ChatError("bad-thread", "thread is not a valid initiative id")
-    clean = _redact(clean_text(text))
+    clean = redact(clean_text(text))
     payload = {"schema": SCHEMA, "client_key": client_key, "from": "user", "origin": "dashboard",
                "label": LABEL, "to": to, "session": session, "thread": thread, "reply_to": None, "text": clean}
     with _creation_lock(root, client_key):
@@ -616,6 +619,7 @@ def frame(record: dict) -> str:
 
 def write_reply(reply_to: str, sender: str, text: str, *, final: bool = True, reply_id: str | None = None,
                 root: Path | None = None) -> dict:
+    redact = _require_redactor()
     root = ensure_dirs(root)
     if sender not in RUNTIMES:
         raise ChatError("bad-sender", "replies come from claude or codex")
@@ -628,7 +632,7 @@ def write_reply(reply_to: str, sender: str, text: str, *, final: bool = True, re
         raise ChatError("answered", "that message already has a final reply")
     if not isinstance(text, str):
         raise ChatError("bad-text", "reply text must be a string")
-    text = _redact(text.replace("\x00", ""))[:64 * 1024]
+    text = redact(text.replace("\x00", ""))[:64 * 1024]
     if final and not text.strip():
         raise ChatError("empty", "reply text is empty")
     streamed = reply_id is not None
