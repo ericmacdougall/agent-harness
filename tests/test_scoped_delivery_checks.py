@@ -20,6 +20,10 @@ import deliver as remote_delivery
 
 DESKTOP = ["npm", "run", "test:release", "--", "--only=desktop"]
 PYTEST = ["python3", "-m", "pytest", "-q", "bin/test_goodqa_bugs_release.py"]
+PREPARATION = ["npm", "ci", "--prefer-offline"]
+LEGACY = ["python3", "-m", "unittest", "discover", "-s", "tests"]
+PREPARATION_HOLD = "Scoped delivery checks do not support preparation commands"
+BASELINE_HOLD = "Scoped delivery profiles cannot certify an unrelated recovery baseline"
 UNITTESTS = [
     ["python3", "-m", "unittest", "discover", "-s", directory, "-p", filename]
     for directory, filename in (
@@ -47,6 +51,47 @@ CLASSIFIER_CHILDREN = tuple(CLASSIFIER + "/" + suffix for suffix in (
 
 
 class ScopeGrammar(unittest.TestCase):
+    def test_preparation_plan_admission_preserves_held_and_legacy_vectors(self):
+        with mock.patch.multiple(delivery, _scoped_original=mock.DEFAULT, _scoped_result_root=mock.DEFAULT,
+                                 _scoped_tool=mock.DEFAULT, resolve_check_interpreter=mock.DEFAULT) as probes:
+            for command in (*UNITTESTS, GO, GO_CURRENT):
+                with self.subTest(vector=command[0], selector=command[-1]):
+                    with self.assertRaisesRegex(delivery.CheckInterpreterError, PREPARATION_HOLD):
+                        delivery.require_check_interpreters([LEGACY, command], preparations=[PREPARATION])
+                    with self.assertRaisesRegex(delivery.CheckInterpreterError, PREPARATION_HOLD):
+                        delivery.scoped_check_context([command], None, None, preparations=[PREPARATION])
+            for held in (DESKTOP, PYTEST):
+                with self.subTest(held=held[0]):
+                    with self.assertRaises(delivery.CheckInterpreterError) as error:
+                        delivery.require_check_interpreters([GO, held], preparations=[PREPARATION])
+                    self.assertEqual(str(error.exception), delivery.SCOPED_HOLDS[tuple(held)])
+            for probe in probes.values():
+                probe.assert_not_called()
+            self.assertIsNone(delivery.scoped_check_context([LEGACY], None, None, preparations=[PREPARATION]))
+            delivery.require_check_interpreters([LEGACY], preparations=[PREPARATION])
+            probes["resolve_check_interpreter"].assert_called_once_with("python3")
+
+    def test_finish_combination_is_refused_before_workflow_or_interpreter(self):
+        args = SimpleNamespace(prepare=[shlex.join(PREPARATION)], check=[shlex.join(UNITTESTS[0])],
+                               original=Path.cwd(), resolve_baseline=None)
+        with mock.patch.object(remote_delivery, "Workflow") as workflow, \
+                mock.patch.object(delivery, "_scoped_original") as probe:
+            with self.assertRaisesRegex(remote_delivery.DeliveryError, PREPARATION_HOLD) as error:
+                remote_delivery.finish(args)
+        self.assertEqual((error.exception.status, error.exception.code), ("BLOCKED_POLICY", 2))
+        workflow.assert_not_called()
+        probe.assert_not_called()
+
+    def test_direct_delivery_scope_refuses_before_environment_or_flow_lookup(self):
+        flow = mock.Mock(original=Path.cwd(), state={"source_head": "1" * 40})
+        with mock.patch.object(remote_delivery, "require_scoped_environment",
+                               side_effect=delivery.CheckInterpreterError("fixture environment reached")) as environment:
+            with self.subTest(boundary="policy"):
+                with self.assertRaisesRegex(remote_delivery.DeliveryError, PREPARATION_HOLD):
+                    remote_delivery.delivery_check_scope(flow, [UNITTESTS[0]], preparations=[PREPARATION])
+            with self.subTest(boundary="no-environment"):
+                environment.assert_not_called()
+
     def test_exact_vectors_are_recognized(self):
         for command in [DESKTOP, PYTEST, GO, GO_CURRENT, *UNITTESTS]:
             with self.subTest(command=command):
@@ -252,6 +297,23 @@ class OwnedScopedExecution(unittest.TestCase):
         self.assertEqual(record["head"], scope.target)
         self.assertEqual(record["kind"], "scoped-check-pass")
 
+    def test_direct_check_dispatch_preserves_one_shot_inputs(self):
+        scope = self.select("import unittest\nclass Fixture(unittest.TestCase):\n"
+                            "    def test_real(self):\n        self.assertEqual(2+3, 5)\n")
+        with mock.patch.object(remote_delivery, "run_check", return_value=subprocess.CompletedProcess(LEGACY, 0)) as run:
+            remote_delivery.run_checks(self.repo, iter([PREPARATION]), iter([LEGACY]), 5, self.results / "legacy")
+            with self.subTest(boundary="legacy-ordered-dispatch"):
+                self.assertEqual([call.args[1] for call in run.call_args_list], [PREPARATION, LEGACY])
+        logs = self.results / "scoped"
+        with mock.patch.dict(os.environ, {**self.environment, "PATH": os.defpath}, clear=True):
+            try:
+                remote_delivery.run_checks(self.repo, iter(()), iter([UNITTESTS[0]]), 5, logs, scoped_context=scope)
+            except remote_delivery.DeliveryError as error:
+                self.fail(f"empty preparation iterator must allow a scoped run: {error.status}")
+        [path] = logs.iterdir()
+        record = json.loads(path.read_text().splitlines()[-1])
+        self.assertEqual((record["kind"], record["head"]), ("scoped-check-pass", scope.target))
+
     def test_local_delivery_checks_owned_scratch_and_final_tree(self):
         base, scope, argv = self.local_candidate()
         status, output = self.local_run(argv)
@@ -331,7 +393,35 @@ class OwnedScopedExecution(unittest.TestCase):
         self.assertTrue(flow.save.called)
         original_scope.__enter__.return_value.reserve_external.assert_called_once()
 
-    def remote_run_fixture(self, base, candidate, *, reserve=None):
+    def test_scoped_preparation_refuses_before_actual_remote_fast_forward(self):
+        base, candidate, _ = self.local_candidate()
+        marker = self.repo / "owned-preparation-marker"
+        original_run = remote_delivery.run_check
+
+        def fake_prepare(repo, argv, **options):
+            if argv == PREPARATION:
+                marker.write_text("owned fixture only")
+                return subprocess.CompletedProcess(argv, 0)
+            return original_run(repo, argv, **options)
+
+        with mock.patch.object(remote_delivery, "run_check", side_effect=fake_prepare) as runner, \
+                mock.patch.object(remote_delivery, "fetch_target") as fetch:
+            flow, scope, error = self.remote_run_fixture(base, candidate, preparations=[PREPARATION], fetch=fetch)
+        for label, observed, expected in (
+            ("head-is-base", self.git("rev-parse", "HEAD") == base, True),
+            ("marker-absent", marker.exists(), False),
+            ("workflow-save-absent", flow.save.called, False),
+            ("reservation-absent", scope.__enter__.return_value.reserve_external.called, False),
+            ("fetch-absent", fetch.called, False),
+            ("runner-absent", runner.called, False),
+            ("log-absent", (self.results / "checks").exists(), False),
+            ("checkout-clean", self.git("status", "--porcelain") == "", True),
+            ("policy", (error.status, error.code, str(error)), ("BLOCKED_POLICY", 2, PREPARATION_HOLD)),
+        ):
+            with self.subTest(boundary=label):
+                self.assertEqual(observed, expected)
+
+    def remote_run_fixture(self, base, candidate, *, reserve=None, preparations=(), fetch=None):
         flow = mock.Mock(original=self.repo, branch="main", directory=self.results,
                          args=SimpleNamespace(timeout=5, check_timeout=5))
         flow.state = {"phase": "PR_READY", "source_head": candidate.source, "baseline": base,
@@ -340,23 +430,123 @@ class OwnedScopedExecution(unittest.TestCase):
         target = candidate.source
         original_scope = mock.MagicMock()
         reservation = original_scope.__enter__.return_value.reserve_external
-        reservation.return_value = SimpleNamespace(key="fixture")
+        reservation.return_value = SimpleNamespace(key="fixture", journal=None)
         reservation.side_effect = reserve
+        if preparations:
+            flow.save.side_effect = lambda **fields: flow.state.update(fields)
         def execute(repo, *args, timeout=5):
             result = subprocess.run(["git", "-C", str(repo), *args], env=delivery.git_environment(isolated=True),
                                     capture_output=True, text=True, timeout=timeout)
             return result.returncode, result.stdout
         with mock.patch.multiple(
                 remote_delivery, verify_remote_pr=mock.Mock(return_value={"state": "MERGED", "mergeCommit": {"oid": target}}),
-                github_target=mock.Mock(return_value=target), fetch_target=mock.Mock(),
+                github_target=mock.Mock(return_value=target), fetch_target=fetch if fetch is not None else mock.Mock(),
                 verify_remote_descendant=mock.Mock(), OriginalScope=mock.Mock(return_value=original_scope),
                 task_generation_digest=mock.Mock(return_value="fixture"), git=execute,
                 snapshot=lambda *args: self.git("rev-parse", "HEAD")), \
                 mock.patch.dict(os.environ, {**self.environment, "PATH": os.defpath}, clear=True):
-            with self.assertRaises(remote_delivery.DeliveryError):
-                remote_delivery.remote_finish(flow, [], [UNITTESTS[0]])
+            with self.assertRaises(remote_delivery.DeliveryError) as caught:
+                remote_delivery.remote_finish(flow, preparations, [UNITTESTS[0]])
+        if preparations:
+            return flow, original_scope, caught.exception
         self.assertEqual(self.git("rev-parse", "HEAD"), base)
         return flow, original_scope
+
+    def test_local_prepare_and_direct_resolution_stop_before_scratch(self):
+        base, scope, argv = self.local_candidate()
+        direct = SimpleNamespace(repo=self.repo, original_branch="main", expected_head=base,
+                                 source="feature", expected_source_head=scope.source, timeout=5,
+                                 check_timeout=5, resolve_journal="0" * 64)
+        with mock.patch.object(delivery, "run", return_value=subprocess.CompletedProcess(PREPARATION, 1)) as runner, \
+                mock.patch.object(delivery, "scratch_journal_root", wraps=delivery.scratch_journal_root) as reserve:
+            status, output = self.local_run([*argv, "--prepare", shlex.join(PREPARATION)])
+            for label, observed, expected in (
+                ("local-status", status, 2), ("local-message", PREPARATION_HOLD in output, True),
+                ("local-reserve", reserve.called, False), ("local-runner", runner.called, False),
+            ):
+                with self.subTest(boundary=label):
+                    self.assertEqual(observed, expected)
+            reserve.reset_mock()
+            runner.reset_mock()
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, {**self.environment, "PATH": os.defpath}, clear=True), redirect_stdout(out):
+                status = delivery.integrate_scratch(direct, [], [UNITTESTS[0]])
+            for label, observed, expected in (
+                ("direct-status", status, 2), ("direct-message", BASELINE_HOLD in out.getvalue(), True),
+                ("direct-reserve", reserve.called, False), ("direct-runner", runner.called, False),
+            ):
+                with self.subTest(boundary=label):
+                    self.assertEqual(observed, expected)
+        self.assertEqual(self.git("rev-parse", "HEAD"), base)
+
+    def test_bound_preparation_is_refused_before_log_or_child(self):
+        scope = self.select("import unittest\n")
+        log_dir = self.results / "checks"
+        with mock.patch.object(remote_delivery, "run_check", return_value=subprocess.CompletedProcess(PREPARATION, 0)) as runner:
+            with self.subTest(boundary="dispatcher"):
+                with self.assertRaisesRegex(remote_delivery.DeliveryError, PREPARATION_HOLD):
+                    remote_delivery.run_checks(self.repo, [PREPARATION], [LEGACY], 5, log_dir, scoped_context=scope)
+            with self.subTest(boundary="no-log"):
+                self.assertFalse(log_dir.exists())
+            with self.subTest(boundary="no-dispatched-child"):
+                runner.assert_not_called()
+        with mock.patch.object(delivery, "run_process", return_value=subprocess.CompletedProcess(PREPARATION, 0)) as runner:
+            for argv in (PREPARATION, tuple(PREPARATION)):
+                with self.subTest(representation=type(argv).__name__):
+                    with self.assertRaisesRegex(delivery.CheckInterpreterError, PREPARATION_HOLD):
+                        delivery.run(self.repo, argv, scoped_context=scope)
+            with self.subTest(boundary="no-single-child"):
+                runner.assert_not_called()
+
+    def test_direct_pending_paths_refuse_before_original_scope(self):
+        scope = self.select("import unittest\n")
+        pending = {"phase": "REMOTE_APPLYING", "guard_key": "1" * 64, "local_key": None,
+                   "source_head": scope.source, "target": scope.target, "merge_head": scope.target,
+                   "apply_base": scope.target, "baseline": scope.target, "pr_number": 1,
+                   "checks_digest": remote_delivery.checks_digest([PREPARATION], [UNITTESTS[0]])}
+        flow = mock.Mock(original=self.repo, branch="main", directory=self.results,
+                         args=SimpleNamespace(timeout=5, resolve_baseline=scope.target), state=pending)
+        before = pending.copy()
+        for entry, preparations, checks, message in (
+            (remote_delivery.resume_remote_finish, [PREPARATION], [UNITTESTS[0]], PREPARATION_HOLD),
+            (remote_delivery.local_completion, [PREPARATION], [UNITTESTS[0]], PREPARATION_HOLD),
+            (remote_delivery.resolve_baseline, [], [UNITTESTS[0]], BASELINE_HOLD),
+            (remote_delivery.resolve_baseline, [], [LEGACY, UNITTESTS[0]], BASELINE_HOLD),
+        ):
+            with self.subTest(entry=entry.__name__, checks=len(checks)):
+                boundary = remote_delivery.DeliveryError("FIXTURE_BOUNDARY", "OriginalScope reached")
+                with mock.patch.object(remote_delivery, "OriginalScope", side_effect=boundary) as original:
+                    with self.subTest(boundary="policy"):
+                        with self.assertRaisesRegex(remote_delivery.DeliveryError, message):
+                            entry(flow, preparations, checks)
+                    with self.subTest(boundary="no-lock"):
+                        original.assert_not_called()
+        self.assertEqual(pending, before)
+        flow.save.assert_not_called()
+        self.assertEqual(self.git("rev-parse", "HEAD"), scope.target)
+
+    def test_local_child_uses_admitted_vectors_instead_of_divergent_raw_arguments(self):
+        base, scope, _ = self.local_candidate()
+        common = delivery.git_common_directory(self.repo, 5)[0]
+        raw = SimpleNamespace(timeout=5, check_timeout=5, prepare=[shlex.join(PREPARATION)], check=["npm test"])
+        state = {"phase": "LOCAL_READY", "source": str(self.repo), "source_branch": "feature",
+                 "source_head": scope.source, "baseline": base}
+        flow = mock.Mock(original=self.repo, branch="main", identity=delivery.checkout_identity(self.repo),
+                         common=common, args=raw, state=state, ticket_exit=0)
+        bounded = mock.Mock(return_value=(0, '{"status":"INTEGRATED"}'))
+        with mock.patch.multiple(remote_delivery, verify_source=mock.Mock(), local_completion=mock.Mock(return_value=True),
+                                 bounded=bounded, snapshot=lambda *args: self.git("rev-parse", "HEAD"),
+                                 ancestry=mock.Mock(return_value=False)), \
+                mock.patch.dict(os.environ, {**self.environment, "PATH": os.defpath}, clear=True):
+            result = remote_delivery.local_finish(flow, [], [UNITTESTS[0]])
+            command = bounded.call_args.args[0]
+        self.assertEqual(result, 0)
+        self.assertEqual(flow.save.call_args.kwargs["checks_digest"], remote_delivery.checks_digest([], [UNITTESTS[0]]))
+        with self.subTest(boundary="no-raw-preparation"):
+            self.assertNotIn("--prepare", command)
+        with self.subTest(boundary="same-admitted-vector"):
+            self.assertEqual(shlex.split(command[command.index("--check") + 1]), UNITTESTS[0])
+        self.assertEqual(self.git("rev-parse", "HEAD"), base)
 
     def test_scoped_python_suppresses_startup_and_ambient_environment(self):
         runtime = self.results / "runtime"

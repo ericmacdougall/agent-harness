@@ -639,18 +639,28 @@ def _scoped_original_inputs(repo, commands, target):
         raise CheckInterpreterError('Scoped original or target inputs could not be verified') from None
 
 
-def scoped_check_context(commands, original, source, *, target=None, checkout=None, journal=None):
-    """Bind only the new profiles to the canonical source and worktree."""
+def admit_check_plan(commands, *, preparations=(), scoped_context=None, recovery=False):
+    """Reject incompatible scoped work before probing tools or opening a checkout."""
     typed = [tuple(command) for command in commands]
     for command in typed:
         if command in SCOPED_HOLDS:
             raise CheckInterpreterError(SCOPED_HOLDS[command])
+    active = any(command in SCOPED_HARNESS for command in typed)
+    if preparations and (active or isinstance(scoped_context, ScopedCheckContext)):
+        raise CheckInterpreterError('Scoped delivery checks do not support preparation commands')
+    if recovery and active:
+        raise CheckInterpreterError('Scoped delivery profiles cannot certify an unrelated recovery baseline')
+    return typed
+
+
+def scoped_check_context(commands, original, source, *, preparations=(), target=None, checkout=None, journal=None):
+    """Bind only the new profiles to the canonical source and worktree."""
+    typed = admit_check_plan(commands, preparations=preparations)
     active = [command for command in typed if command in SCOPED_HARNESS]
     if not active:
         return None
     if source not in SCOPED_HARNESS_TREES or any(
-            tuple(command) in SCOPED_GO_SOURCES and SCOPED_GO_SOURCES[tuple(command)] != source
-            for command in commands):
+            command in SCOPED_GO_SOURCES and SCOPED_GO_SOURCES[command] != source for command in active):
         raise CheckInterpreterError('Scoped check source revision is not qualified')
     path, identity, common, common_id = _scoped_original(original)
     if target is not None:
@@ -1000,6 +1010,8 @@ def run(repo, command, *, timeout=None, discard_output=False, env=None, sink=Non
     typed = tuple(command)
     if typed in SCOPED_HOLDS or typed in SCOPED_HARNESS:
         return run_scoped_check(repo, typed, scoped_context, environment, timeout, sink)
+    if isinstance(scoped_context, ScopedCheckContext) and approved_prepare(list(typed)):
+        admit_check_plan((), preparations=(typed,), scoped_context=scoped_context)
     environment = {**environment, "PYTHONDONTWRITEBYTECODE": "1"}
     if command and command[0] == 'node':
         return run_node(repo, command, environment, timeout, sink)
@@ -1020,12 +1032,9 @@ def check_timeout(args):
     return args.timeout if value is None else value
 
 
-def require_check_interpreters(commands, repo=None):
+def require_check_interpreters(commands, repo=None, *, preparations=(), recovery=False):
     """Fail before effects when a check's interpreter or Node protocol is unsupported."""
-    typed_commands = [tuple(command) for command in commands]
-    for typed in typed_commands:
-        if typed in SCOPED_HOLDS:
-            raise CheckInterpreterError(SCOPED_HOLDS[typed])
+    typed_commands = admit_check_plan(commands, preparations=preparations, recovery=recovery)
     for typed in typed_commands:
         if typed in SCOPED_HARNESS:
             original, _, _, _ = _scoped_original(repo)
@@ -1155,9 +1164,7 @@ def main():
         report("BLOCKED_POLICY", "Verification command is outside the approved test/build set")
         return 2
     try:
-        require_check_interpreters(checks, args.repo)
-        if any(tuple(command) in SCOPED_HARNESS for command in checks) and args.resolve_journal:
-            raise CheckInterpreterError('Scoped delivery profiles cannot certify an unrelated recovery baseline')
+        require_check_interpreters(checks, args.repo, preparations=preparations, recovery=bool(args.resolve_journal))
     except CheckInterpreterError as error:
         report("BLOCKED_POLICY", str(error))
         return 2
@@ -2155,6 +2162,11 @@ class OriginalScope:
 
 
 def integrate_scratch(args, preparations, checks):
+    try:
+        admit_check_plan(checks, preparations=preparations, recovery=bool(getattr(args, 'resolve_journal', None)))
+    except CheckInterpreterError as error:
+        report('BLOCKED_POLICY', str(error))
+        return 2
     if any(name.startswith('GIT_') and name not in ALLOWED_GIT_ENV for name in os.environ):
         report('BLOCKED_POLICY', 'Inherited Git routing or configuration override is unsupported')
         return 2
@@ -2168,7 +2180,7 @@ def integrate_scratch(args, preparations, checks):
     try:
         require_scoped_environment(checks)
         scoped_original = scoped_check_context(checks, repo, args.expected_source_head,
-                                               target=args.expected_source_head)
+                                               preparations=preparations, target=args.expected_source_head)
     except CheckInterpreterError as error:
         report('BLOCKED_POLICY', str(error))
         return 2
@@ -2284,7 +2296,7 @@ def integrate_scratch(args, preparations, checks):
                 if intended_tree != SCOPED_HARNESS_TREES[scoped_original.source]:
                     raise CheckInterpreterError('Scratch merge differs from the scoped reviewed tree')
                 scoped_scratch = scoped_check_context(checks, repo, args.expected_source_head,
-                                                      checkout=scratch, journal=directory)
+                                                      preparations=preparations, checkout=scratch, journal=directory)
             except CheckInterpreterError as error:
                 return scratch_abort(repo, scratch, directory / 'journal.json', str(error), phase='check')
         for kind, commands in (('prepare', preparations), ('check', checks)):
@@ -2365,7 +2377,8 @@ def integrate_scratch(args, preparations, checks):
                                    original_head=inspect_git(repo, 'rev-parse', 'HEAD', timeout=30).stdout.strip())
         if scoped_original is not None:
             try:
-                pending_scope = scoped_check_context(checks, repo, args.expected_source_head, target=candidate)
+                pending_scope = scoped_check_context(checks, repo, args.expected_source_head,
+                                                     preparations=preparations, target=candidate)
                 if pending_scope._replace(target=scoped_original.target) != scoped_original:
                     raise CheckInterpreterError('Scoped original custody changed before fast-forward')
                 scoped_original = pending_scope
