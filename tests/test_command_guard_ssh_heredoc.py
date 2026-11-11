@@ -247,9 +247,12 @@ class SSHHeredoc(unittest.TestCase):
         call = heredoc('ssh %s python3 -' % HOST)
         prefixes = (
             '# ssh(){ /bin/sh -s; }\n',
+            '# function ssh { /bin/sh -s; }\n',
             "printf '%s' 'ssh(){ /bin/sh -s; }'; ",
             "printf '%s' 'function ssh { /bin/sh -s; }'; ",
+            "printf '%s' 'function'; ",
             "cat <<'PUBLIC_DATA'\nssh(){ /bin/sh -s; }\nPUBLIC_DATA\n",
+            "cat <<'PUBLIC_DATA'\nfunction\nPUBLIC_DATA\n",
         )
         for prefix in prefixes:
             with self.subTest(prefix=prefix):
@@ -286,6 +289,22 @@ class SSHHeredoc(unittest.TestCase):
         self.assertEqual(seen, [True, True])
         self.assertTrue(analyzer.ctx.function_syntax_seen)
         self.assertTrue(any(f.rule == 'env-dump' for f in findings))
+
+    def test_function_keyword_after_options_preempts_relaxation(self):
+        call = heredoc('ssh %s python3 -' % HOST, 'set')
+        for declaration in ('time -p function ssh { /bin/sh -s; }; ',
+                            'time -p \\\nfunction ssh { /bin/sh -s; }; ',
+                            'time -p function \\\nssh { /bin/sh -s; }; '):
+            with self.subTest(declaration=declaration):
+                verdict, message = self.command(declaration + call)
+                self.assertEqual(verdict, 'block')
+                self.assertIn('env-dump', message)
+
+    def test_unquoted_function_data_retains_conservative_analysis(self):
+        # Deliberate compatibility cost: without parsing every shell prefix,
+        # even an unquoted data argument retains the previous shell reading.
+        text = "printf '%s' function; " + heredoc('ssh %s python3 -' % HOST)
+        self.assertEqual(self.command(text)[0], 'block')
 
 
 if __name__ == '__main__':

@@ -2274,10 +2274,10 @@ class Analyzer:
             if kind != 'w':
                 continue
             parentheses = tokens[i + 1:i + 3] == [('op', '('), ('op', ')')]
-            previous = tokens[i - 1] if i else None
-            boundary = (previous is None or previous[0] == 'op'
-                        or previous[0] == 'w' and not previous[1].quoted and previous[1].text in RESERVED)
-            keyword = not word.quoted and word.text == 'function' and boundary
+            # Do not guess an unbounded shell-prefix grammar (time -p, etc.).
+            # Even an unquoted data argument conservatively retains the old
+            # shell reading; quoted words, comments and heredoc data do not.
+            keyword = not word.quoted and word.text == 'function'
             if parentheses or keyword:
                 self.ctx.function_syntax_seen = True
         self.check_tokens(tokens)
