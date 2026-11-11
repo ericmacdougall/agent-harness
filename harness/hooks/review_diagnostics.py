@@ -67,6 +67,9 @@ CONTRACT = {
                       ['Sign in again with the provider CLI, then rerun once.']),
     'PROVIDER_UNAVAILABLE': ('TRANSIENT_INFRA', 'The provider was overloaded, rate limited or its model was unavailable.',
                              ['Rerun once later; the helper already tried the independent fallback if one was allowed.']),
+    'POOL_RESERVED': ('TRANSIENT_INFRA', "The provider's usage pool is reserved by an earlier run that never released it; "
+                      'no provider was launched for this attempt.',
+                      ['Reconcile the run that holds the pool (the commands are in Detail), then rerun once.']),
     'BUDGET_EXHAUSTED': ('BUDGET_EXHAUSTED', 'The 1440 second review budget (720 per provider) was used up.',
                          ['Do not loop. Reconcile the usage store, then decide with the main agent whether one repeat with --repeat-reason is justified.']),
     'PROVIDER_TIMEOUT': ('TIMEOUT', 'The provider exceeded its 720 second deadline.',
@@ -450,6 +453,22 @@ PROVIDER_REASON_CODES = {'TRANSIENT_INFRA': 'PROVIDER_UNAVAILABLE', 'BUDGET_EXHA
                          'UNKNOWN': 'PROVIDER_IO_UNKNOWN', 'INVALID_OUTPUT': 'PROVIDER_INVALID_OUTPUT'}
 
 
+_RUN_ID = re.compile(r'[0-9a-f]{32}')
+
+
+def _pool_detail(provider, outcome):
+    """Which run holds the pool and the exact reconcile commands. The run id is interpolated only when it is a
+    32-hex id, so a hostile value never reaches the command text."""
+    holder = outcome.get('holder')
+    if outcome.get('pool_kind') == 'cooldown' or not (isinstance(holder, str) and _RUN_ID.fullmatch(holder)):
+        return 'the %s pool is cooling down or its holder is unknown; no provider was launched' % sanitize(provider, 20)
+    tool = 'python3 ~/.claude/hooks/usage_guard.py reconcile --run ' + holder
+    return ('the %s pool is reserved by run %s; no provider was launched. Reconcile: `%s --auto` (acts only when the '
+            'owner is provably dead past its deadline and the run has no completion record); if that says completed, '
+            "an operator runs `%s --actor <who> --reason '<why>' --evidence '<proof>'`"
+            % (sanitize(provider, 20), holder, tool, tool))
+
+
 def provider_attempt(provider, resolution, code, stdout, stderr, outcome):
     """Bounded, sanitized diagnostic for one provider launch (None when it needs none)."""
     if resolution is None or not resolution.get('path'):
@@ -461,6 +480,8 @@ def provider_attempt(provider, resolution, code, stdout, stderr, outcome):
     reason = outcome.get('reason')
     if reason in ('NONE', 'CODE_FINDINGS'):
         return None
+    if outcome.get('lease_refused') is True:
+        return diagnostic('POOL_RESERVED', provider=provider, detail=_pool_detail(provider, outcome))
     return diagnostic(PROVIDER_REASON_CODES.get(reason, 'PROVIDER_INVALID_OUTPUT'), provider=provider,
                       exit_code=code, detail='exit code %s' % code,
                       excerpt=(stderr or '') + ' ' + (stdout or ''))

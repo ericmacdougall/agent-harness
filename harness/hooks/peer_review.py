@@ -32,7 +32,7 @@ from git_safety import git_environment as safe_git_environment, require_safe_sou
 from report_file import ReportTarget
 import escalation as ladder
 import model_tiers as tiers
-from usage_guard import GuardError, UsageStore, capture_subject, invocation_identity
+from usage_guard import GuardError, PoolUnavailable, UsageStore, capture_subject, invocation_identity
 
 
 PACKET_LIMIT = 150_000
@@ -794,6 +794,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         order = (order[0], ('kimi', 'Kimi kimi-code/k3.1-pro-highspeed (subscription CLI)', 'kimi'))
     primary = order[0][0]
     for provider, source, pool in order:
+        launches_before = options['launches']
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ReviewFailure({**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}, source)
@@ -845,6 +846,11 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         except GuardError as error:
             outcome = {**provider_failure({}), 'reason': error.reason,
                        'fallback_allowed': error.reason in {'QUOTA', 'AUTH'}}
+            if isinstance(error, PoolUnavailable) and not launched_here(options, launches_before):
+                # The pool refused its lease before any call: nothing ran, so nothing can be lost by using the one
+                # authorised independent fallback. The reserved pool itself is left exactly as it is.
+                outcome.update(lease_refused=True, holder=error.holder, pool_kind=error.kind,
+                               fallback_allowed=provider == primary)
         options.setdefault('attempts', []).append(
             diagnostics.provider_attempt(provider, resolution, code, stdout, stderr, outcome))
         if outcome.get('usage') is not None:
@@ -859,8 +865,21 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
             return source, stage_report(stage, outcome['report']), failure
         if provider != primary or not outcome['fallback_allowed']:
             raise ReviewFailure(outcome, source)
-        failure = 'Primary reviewer unavailable (' + outcome['reason'] + '); used authorized independent fallback.'
+        if outcome.get('lease_refused'):
+            holder = outcome.get('holder')
+            failure = ('Primary reviewer pool is reserved%s (no provider was launched); used authorized independent '
+                       'fallback.' % (' by run ' + holder if isinstance(holder, str) and RUN_ID.fullmatch(holder) else ''))
+        else:
+            failure = 'Primary reviewer unavailable (' + outcome['reason'] + '); used authorized independent fallback.'
     raise OSError('no valid reviewer result')
+
+
+RUN_ID = re.compile(r'[0-9a-f]{32}')
+
+
+def launched_here(options, before):
+    """True when a provider process was started since `before` (a refused lease never starts one)."""
+    return options['launches'] != before
 
 
 def provider_toolchains(resolutions):
