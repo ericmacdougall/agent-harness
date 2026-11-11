@@ -416,6 +416,43 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("do not prove the author harness", result.stderr)
 
 
+class NativeReviewReceiptScope(unittest.TestCase):
+    COMMAND = "python3 ~/.claude/hooks/peer_review.py pr --repo /w --github-repo o/r --pr 5 --packet /p"
+    PAYLOAD = {"session_id": "11111111-2222-4333-8444-555555555555", "agent_id": None}
+
+    def check_path(self, command, native, claude=False):
+        import caller_identity
+
+        adapter = SimpleNamespace(is_desktop_review_root=native)
+        with mock.patch.dict(sys.modules, {"native_main": adapter}), \
+                mock.patch.object(caller_identity, "is_main", return_value=claude), \
+                mock.patch.object(caller_identity, "put_stamp") as stamp:
+            mg._stamp_review(command, self.PAYLOAD, 123)
+        return stamp
+
+    def test_native_root_can_write_only_the_existing_review_receipt(self):
+        native = mock.Mock(return_value=True)
+        stamp = self.check_path(self.COMMAND, native)
+        native.assert_called_once_with(self.PAYLOAD)
+        stamp.assert_called_once_with("review-auth", ["o/r", 5], session=self.PAYLOAD["session_id"], now=123)
+
+    def test_nonplain_commands_do_not_reach_native_admission(self):
+        for command in ("echo " + self.COMMAND, self.COMMAND + " | tee output", "true; " + self.COMMAND):
+            with self.subTest(command=command):
+                native = mock.Mock(return_value=True)
+                self.check_path(command, native).assert_not_called()
+                native.assert_not_called()
+
+    def test_native_denial_or_error_writes_no_receipt(self):
+        for native in (mock.Mock(return_value=False), mock.Mock(side_effect=OSError)):
+            self.check_path(self.COMMAND, native).assert_not_called()
+
+    def test_genuine_claude_success_short_circuits_native_lookup(self):
+        native = mock.Mock(side_effect=AssertionError)
+        self.check_path(self.COMMAND, native, claude=True).assert_called_once()
+        native.assert_not_called()
+
+
 class SubagentAuthorization(unittest.TestCase):
     """#134 red-team P2: a subagent cannot mint a merge authorization."""
 

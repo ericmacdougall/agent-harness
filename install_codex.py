@@ -37,7 +37,7 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     # Spec flow commands work by hand in Codex; its done hook is Claude Code only.
                     'spec_flow.py', 'spec_policy.json', 'spec_template.md', 'provenance.py', 'provenance_policy.json',
                     'provenance_hooks.py', 'safe_input.py', 'caller_identity.py', 'domain_gates.py', 'domain_checklists.json',
-                    'native_context.py', 'native_user_source.py', 'native_admission.py',
+                    'native_context.py', 'native_user_source.py', 'native_admission.py', 'native_main.py',
                     'wal_note.py',  # ah task/ticket writes and doctor import this helper.
                     'commit_policy.local.json.example', 'spec_policy.local.json.example',
                     'model_tiers.py', 'model_tiers.json', 'escalation.py', 'tier_gate.py',
