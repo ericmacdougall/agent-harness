@@ -147,6 +147,123 @@ class Assent(unittest.TestCase):
                 self.assertIsNotNone(esc.top_assent(words))
         self.assertEqual(esc.top_assent('the blog is done. Use fable for the rescue! thanks'), 'Use fable for the rescue!')
 
+    def test_have_want_get_run_with_the_model_name_are_assent(self):
+        # GoodQA #15565: the user's plain words that were refused as no_assent on 2026-11-09.
+        for words in ('have codex astra do the initial layout/design', 'i just want astra on the first round of ui',
+                      'get astra on the rescue', 'run astra for the layout', 'I want fable on this one'):
+            with self.subTest(words=words):
+                self.assertIsNotNone(esc.top_assent(words))
+
+    def test_model_name_then_can_is_assent_unless_negated_or_a_question(self):
+        for words in ('fable/opus can take over the rescue', 'astra can handle the layout', 'fable and opus can do this'):
+            with self.subTest(words=words):
+                self.assertIsNotNone(esc.top_assent(words))
+        for words in ("fable can't take over", 'can fable take over?', 'fable can take over if opus fails',
+                      'fable can be expensive', 'astra can take over. no, stop.', 'fable can not do it'):
+            with self.subTest(words=words):
+                self.assertIsNone(esc.top_assent(words))
+
+    def test_have_want_get_keep_negation_condition_question_and_adjacency_checks(self):
+        for words in ('i do not want astra on this', "don't have astra do it", 'want astra if the rescue fails?',
+                      'i want astra later', 'should we have astra do it?', 'have astra disabled', 'get astra off the list',
+                      'i want the blog fixed and astra is slow', 'have a nice day, thanks for astra',
+                      'i want astra. no, never mind.', 'have the rescue finish before fable is mentioned in a long clause here'):
+            with self.subTest(words=words):
+                self.assertIsNone(esc.top_assent(words))
+
+    def test_red_team_idle_statements_are_not_assent(self):
+        # red-team a5fc13ab and acceptance review abe6da04 (GoodQA #15565): statements, not requests
+        for words in ('I have astra open in a tab', 'I have the astra bill here', 'I have astra credits left', 'you want astra',
+                      'I get fable bills', 'we want astra costs down', 'i want astra killed', 'i want astra banned',
+                      'i want astra paused', 'i want fable gone', 'i want astra to be stopped', 'get rid of astra',
+                      'I know fable can do the layout', 'fable can do it but only after ten', 'astra can review the invoice',
+                      'fable can write about it', 'have fable skip it', 'i want astra audited', 'i have seen astra break layouts',
+                      'we have used fable before', 'i get astra confused with fable', 'you have astra in the list',
+                      'i want astra and fable compared in the report', 'i want astra on hold',
+                      'have fable do nothing', 'have fable do none of it', 'i want fable to be faster',
+                      'get fable to the top of the list',  # acceptance review a9e06f96 A1
+                      # the user's own 2026-11-09 sentence is conditional, so it stays refused (TARGET_MISMATCH, see the spec)
+                      'fable/opus can take over design work too if astras had a couple passes'):
+            with self.subTest(words=words):
+                self.assertIsNone(esc.top_assent(words))
+
+    def test_codex_f1_a_lower_model_request_in_another_clause_never_overrides_a_top_model_refusal(self):
+        # Codex final-gate review of 9221bb9, F1 (GoodQA #15565): request words about another model, in another
+        # clause, made the plain route accept a sentence whose only words about the top model refuse or idle it.
+        for words in ('have fable do nothing, run sonnet for the rescue', 'run sonnet for the rescue, have fable do nothing',
+                      'have fable do nothing and use sonnet for the rescue', 'fable sits this out; use opus for the rescue',
+                      'fable is great, use sonnet for the rescue', 'fable can rest, run sonnet', 'astra takes a break, use opus',
+                      'run sonnet for the rescue with fable watching', 'use sonnet for the rescue with fable nearby',
+                      'use opus or fable for the rescue', 'use fable, but only after ten',
+                      'use sonnet for the rescue and fable for nothing', 'use fable for nothing',
+                      'use fable for the rescue. actually have it do nothing.'):
+            with self.subTest(words=words):
+                self.assertIsNone(esc.top_assent(words))
+
+    def test_codex_f2_inactivity_and_non_assignment_after_the_model_are_not_assent(self):
+        # Codex final-gate review of 9221bb9, F2: "do" / "to take" were enough of an action word.
+        for words in ('have fable do zero work', 'i want astra to take a break', 'have fable do no work',
+                      'have astra take the day off', 'i want fable to rest', 'have fable pass', 'i want astra idle',
+                      'have astra sit out', 'i want fable to sit this one out', 'get astra to take a nap',
+                      'have fable go nowhere', 'astra can take a break', 'fable can pass', 'have fable skip the rescue',
+                      'i want astra on the bench', 'have fable stand down', 'i want astra to sleep', 'have fable do',
+                      'i want fable to take it easy', 'i want astra to relax', 'astra can take some time',
+                      # statements, not asks: "have X on Y" and "I have X do Y" describe, they do not assign
+                      'I have astra on the second monitor', 'i have fable do the layouts every week'):
+            with self.subTest(words=words):
+                self.assertIsNone(esc.top_assent(words))
+
+    def test_new_forms_accept_a_concrete_assignment(self):
+        for words in ('have astra review the layout', 'have fable fix the rescue', 'i want astra to build the ui',
+                      'get fable to implement the parser', 'have fable work on the rescue', 'i want fable to take over the rescue',
+                      'use sonnet for tests and use fable for the rescue', 'have fable do the rest of the layout',
+                      'use codex astra for the layout', 'use opus/fable for the rescue'):
+            with self.subTest(words=words):
+                self.assertIsNotNone(esc.top_assent(words))
+
+    def test_codex_r8_f1_every_route_binds_the_request_to_the_top_model(self):
+        # Codex final-gate review of 09ff454 (receipt r8), F1: the strict have/want/get/run routes allowed two arbitrary
+        # words before the model name and skipped the clause binding, so a replacement read as assent.
+        for words in ('run sonnet replacing fable for the rescue', 'run sonnet replacing astra to review the layout',
+                      'use sonnet instead of fable for the rescue', 'use sonnet rather than fable for the rescue',
+                      'use sonnet in place of fable for the rescue', 'swap fable for sonnet on the rescue',
+                      'swap in sonnet for astra on the layout', 'switch from fable to sonnet for the rescue',
+                      'replace fable with sonnet for the rescue', 'have sonnet replace fable on the rescue',
+                      'fable replaced by sonnet for the rescue', 'not fable but sonnet for the rescue', 'fable no, sonnet yes',
+                      'get sonnet over astra on the rescue', 'run opus ahead of fable for the layout',
+                      'want anything besides fable on the rescue', 'have sonnet and not astra do the layout',
+                      'get sonnet, then astra on the rescue', 'have opus fable do the layout', 'run sonnet astra for the layout',
+                      'use sonnet as a substitute for fable on the rescue', 'have fable step aside for sonnet on the rescue',
+                      'run the docs and sonnet with fable for the rescue',
+                      # one per layer, so each rule is load-bearing on its own (mutation check)
+                      'have our intern astra do the layout', 'get our intern astra on the rescue',  # arbitrary words
+                      'let fable defer to sonnet on the rescue', 'give fable\'s slot to sonnet for the rescue',  # gate
+                      'use anything besides fable for the rescue', 'use anything other than astra for the layout',
+                      'use fable as the backup for the rescue',  # substitution words, no lower model named
+                      'let fable start and sonnet finish the rescue'):  # a lower model coordinated after a non-model word
+            with self.subTest(words=words):
+                self.assertIsNone(esc.top_assent(words))
+        for words in ('have codex astra do the initial layout/design', 'use opus/fable for the rescue',
+                      'run opus/fable for the rescue', 'have claude fable fix the rescue', 'get gpt astra on the layout',
+                      'have the top model do the rescue', 'fable and opus can do this'):
+            with self.subTest(words=words):
+                self.assertIsNotNone(esc.top_assent(words))
+
+    def test_codex_r8_f2_a_later_withdrawal_uses_the_same_refusal_rules(self):
+        # Codex final-gate review of 09ff454 (receipt r8), F2: the later-sentence scan skipped TOP_NEGATION_NEW.
+        for later in ('Pause that.', 'Hold it.', 'Hold on.', 'Hold off.', 'Stop that.', 'Scrap that.', 'Cancel that.',
+                      'Never mind.', 'Forget it.', 'Actually no.', 'Not now.', 'Wait with that.', 'Skip it.', 'Drop it.',
+                      'Undo that.', 'Ignore that.', 'Belay that.', 'Disregard that.', 'Call it off.', 'Abort.'):
+            words = 'Use fable for the rescue. ' + later
+            with self.subTest(words=words):
+                self.assertIsNone(esc.top_assent(words))
+
+    def test_request_must_start_the_sentence_and_an_action_word_must_follow_the_model(self):
+        for words in ('ok, i just want astra on the first round of ui', 'Please have codex astra do the initial layout/design',
+                      'then get astra to do the rescue', 'opus/fable can take over the rescue'):
+            with self.subTest(words=words):
+                self.assertIsNotNone(esc.top_assent(words))
+
     def test_review_d1_a_later_retraction_wins(self):
         # Delta review D1: the latest word decides; an earlier request never survives a later retraction.
         for words in ('use fable. actually no, stop.', 'Use Fable. Never mind, do not use fable',
