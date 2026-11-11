@@ -261,7 +261,8 @@ def _strip_heredocs(cmd: str) -> str:
         body = cmd.find("\n", m.end())
         if body < 0:
             break
-        out.append(cmd[pos:body + 1])
+        # The body is dropped, and so is the marker: the quote-aware splitter refuses a here-document operator.
+        out.append(cmd[pos:m.start()] + cmd[m.end():body + 1])
         end = re.compile(r"^[ \t]*" + re.escape(m.group(2)) + r"[ \t]*$", re.M).search(cmd, body + 1)
         pos = at = end.end() if end else len(cmd)
     out.append(cmd[pos:])
@@ -269,32 +270,48 @@ def _strip_heredocs(cmd: str) -> str:
 
 
 def _segments(cmd: str):
-    """Shell words split into simple commands at ; & | && || ( ) and newlines. None when it does not tokenize."""
-    import shlex  # noqa: PLC0415
-    lex = shlex.shlex(cmd.replace("\\\n", " ").replace("\n", " ; "), posix=True, punctuation_chars=";&|()<>")
-    lex.whitespace_split = True
-    lex.commenters = ""
-    segs, cur = [], []
-    try:
-        for tok in lex:
-            if tok and set(tok) <= set(";&|()"):
-                segs.append(cur)
-                cur = []
-            else:
-                cur.append(tok)
-    except ValueError:  # an unbalanced quote
-        return None
-    segs.append(cur)
-    return segs
+    """Shell words split into simple commands at unquoted ; & | && || ( ) and newlines (quote-aware, shellwords.py:
+    a quoted or escaped `;` is part of a word, never a separator). None when the words cannot be known without
+    running the shell: an unbalanced quote, a substitution, a here-document or an oversized line."""
+    from shellwords import split_commands  # noqa: PLC0415
+    return split_commands(cmd)
 
 
-def _acks(seg: list, depth: int = 0) -> bool:
-    """Whether one simple command is `[wrappers] [python] .../ah[.py] [global opts] task dispose ... --kind <ack>`."""
+def _skip_wrappers(seg: list) -> int:
+    """Index of the first word after leading VAR=x assignments and wrapper commands (env, nice, time, ...) and their
+    options."""
     i = 0
     while i < len(seg) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[i]) or seg[i] in _WRAPPERS
                             or (i and seg[i - 1] in _WRAPPERS and (seg[i].startswith("-") or seg[i].isdigit()))
                             or (i and seg[i - 1] in ("-n", "-u") and seg[i].lstrip("-").isdigit())):
         i += 1
+    return i
+
+
+def _dispose_rest(seg: list):
+    """The words after `ah` when this simple command directly runs `[wrappers] [python] .../ah[.py] ... task dispose`
+    (no shell -c, eval or python -c), else None."""
+    i = _skip_wrappers(seg)
+    if i < len(seg) and os.path.basename(seg[i]).startswith("python"):
+        if "-c" in seg[i + 1:]:
+            return None
+        i += 1
+        while i < len(seg) and seg[i].startswith("-"):
+            i += 1
+    if i >= len(seg) or os.path.basename(seg[i]) not in ("ah", "ah.py"):
+        return None
+    rest = list(seg[i + 1:])
+    return rest if [t for t in rest if not t.startswith("-")][:2] == ["task", "dispose"] else None
+
+
+def _is_ack_handoff_flag(token: str) -> bool:
+    name = token.partition("=")[0]
+    return len(name) >= 5 and "--ack-handoff".startswith(name) and name.startswith("--a")
+
+
+def _acks(seg: list, depth: int = 0) -> bool:
+    """Whether one simple command is `[wrappers] [python] .../ah[.py] [global opts] task dispose ... --kind <ack>`."""
+    i = _skip_wrappers(seg)
     flag = None
     if i < len(seg) and os.path.basename(seg[i]) in _SHELLS:  # `bash -c`, and clusters: `bash -lc`, `sh -ec` (24a786c F2)
         flag = next((j for j in range(i + 1, len(seg)) if _SHELL_C.match(seg[j])), None)
@@ -345,16 +362,21 @@ def _stamp_ack(cmd: str, payload: dict) -> None:
     if "ack-handoff" not in cmd and "ack_handoff" not in cmd:
         return
     import caller_identity  # noqa: PLC0415
-    import shlex  # noqa: PLC0415
-    try:
-        words = shlex.split(cmd, comments=False)
-    except ValueError:
+    # Only a simple command that really runs `ah task dispose ... --ack-handoff` is stamped, and only for the
+    # `--agent` words of that same command: echoed, grepped or printed text, another segment's words, and a line the
+    # shell alone can read (substitutions, here-documents, unbalanced quotes) mint nothing.
+    segments = _segments(cmd)
+    if segments is None:
         return
-    for index, word in enumerate(words):
-        agent = words[index + 1] if word == "--agent" and index + 1 < len(words) else (
-            word.split("=", 1)[1] if word.startswith("--agent=") else None)
-        if agent and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", agent):
-            caller_identity.put_stamp("ack-handoff", [agent], session=str(payload.get("session_id") or ""))
+    for seg in segments:
+        rest = _dispose_rest(seg)
+        if rest is None or not any(_is_ack_handoff_flag(token) for token in rest):
+            continue
+        for index, word in enumerate(rest):
+            agent = rest[index + 1] if word == "--agent" and index + 1 < len(rest) else (
+                word.split("=", 1)[1] if word.startswith("--agent=") else None)
+            if agent and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", agent):
+                caller_identity.put_stamp("ack-handoff", [agent], session=str(payload.get("session_id") or ""))
 
 
 def cmd_pretool(payload: dict) -> dict:

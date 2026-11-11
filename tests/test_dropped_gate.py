@@ -658,5 +658,81 @@ class TaskWalOwners(Base):
         self.assertNotIn("0 dropped", p.stdout)
 
 
+class QuotedPunctuation(Base):
+    """goodqa#15684 (same flaw as PR 179 r14 F1): quoted or escaped shell punctuation is a word character. The old
+    splitter cut `--note ";"` into two commands, so the acknowledging flags were no longer in the `ah task dispose`
+    segment and a sub-agent's resume or close was not recognised. Every string here is data judged in memory."""
+    BASE = "python3 ~/.claude/hooks/ah.py task dispose --agent X"
+
+    def test_quoted_or_escaped_separators_do_not_hide_an_acknowledgement(self):
+        notes = ['--note ";"', "--note '&&'", "--note \\;", '--note "a; b"', '--note "x | y"', "--note '('", '--note ")"',
+                 "--note 'two\nlines'", '--note "a && b ; c"', "--note \\&\\&", "--note '||'", "--note ';;'"]
+        for note in notes:
+            for tail in ("--kind resumed", "--kind closed", "--kind waiting --ack-handoff", "--kind=superseded"):
+                with self.subTest(note=note, tail=tail):
+                    self.assertTrue(dropped_gate.acknowledges(self.BASE + " " + note + " " + tail))
+                    self.assertTrue(dropped_gate.acknowledges(self.BASE + " " + tail + " " + note))
+
+    def test_a_quoted_separator_inside_a_shell_wrapper_is_still_judged(self):
+        self.assertTrue(dropped_gate.acknowledges("bash -c '" + self.BASE + " --note \";\" --kind resumed'"))
+        self.assertTrue(dropped_gate.acknowledges("true && " + self.BASE + " --note ';' --kind closed"))
+
+    def test_text_that_only_mentions_an_acknowledgement_is_not_one(self):
+        for command in ('echo "' + self.BASE + ' --kind resumed"',
+                        "echo " + self.BASE.replace("python3 ~/.claude/hooks/ah.py", "ah") + " --kind resumed",
+                        "grep -n ';' notes.txt ; ah task dispose --agent X --kind waiting --ref wa5b00000004 --until X",
+                        self.BASE + " --kind waiting --ref wa5b00000004 --until X --note ';'",
+                        "ah task list --note ';' --kind resumed",
+                        "echo ';' ; echo ah task dispose --kind resumed"):
+            with self.subTest(command=command[:60]):
+                self.assertFalse(dropped_gate.acknowledges(command))
+
+    def test_a_line_the_shell_alone_can_read_is_judged_conservatively(self):
+        # An unbalanced quote or a substitution cannot be split; the old substring judgement applies.
+        for command in (self.BASE + " --note 'open --kind resumed", self.BASE + " --note $(echo hi) --kind closed"):
+            with self.subTest(command=command[:50]):
+                self.assertTrue(dropped_gate.acknowledges(command))
+
+    def stamped(self, command, agents):
+        import caller_identity
+        dropped_gate._stamp_ack(command, {"session_id": SESSION})
+        return [a for a in agents if caller_identity.take_stamp("ack-handoff", [a], home=self.home) is not None]
+
+    def test_the_handoff_stamp_is_minted_only_for_a_command_that_really_runs_the_dispose(self):
+        self.assertEqual(self.stamped("python3 ~/.claude/hooks/ah.py task dispose --agent owner-1 --kind waiting "
+                                      "--ack-handoff --ref wa5b00000006 --until 2026-11-09T00:00:00Z", ["owner-1"]),
+                         ["owner-1"])
+        for command in ('echo "ah task dispose --agent owner-2 --ack-handoff"',
+                        "echo ah task dispose --agent owner-2 --ack-handoff",
+                        "grep -n --agent owner-2 --ack-handoff notes.txt",
+                        "printf %s 'ah task dispose --agent owner-2 --kind waiting --ack-handoff'",
+                        "ah task list --agent owner-2 --ack-handoff",
+                        "ah task dispose --agent owner-2 --kind waiting --ref wa5b00000006 --until X ; "
+                        "echo --ack-handoff"):
+            with self.subTest(command=command[:60]):
+                self.assertEqual(self.stamped(command, ["owner-2"]), [])
+
+    def test_the_stamp_covers_only_the_agents_of_the_dispose_segment(self):
+        command = ("ah task dispose --agent owner-3 --kind waiting --ack-handoff --ref wa5b00000006 --until X ; "
+                   "ah task dispose --agent owner-4 --kind waiting --ref wa5b00000006 --until X ; echo --agent owner-5")
+        self.assertEqual(self.stamped(command, ["owner-3", "owner-4", "owner-5"]), ["owner-3"])
+
+    def test_inline_python_code_and_oversized_lines_are_never_stamped(self):
+        self.assertEqual(self.stamped("python3 -c 'print(1)' task dispose --agent owner-7 --kind waiting --ack-handoff",
+                                      ["owner-7"]), [])
+        # `-c` takes the next word as code, so the ah that follows is that code, not the program
+        self.assertEqual(self.stamped("python3 -c ah task dispose --agent owner-7 --kind waiting --ack-handoff",
+                                      ["owner-7"]), [])
+        padded = ("ah task dispose --agent owner-8 --kind waiting --ack-handoff --ref wa5b00000006 --until X"
+                  + " " * 21000)
+        self.assertEqual(self.stamped(padded, ["owner-8"]), [])
+        # An oversized line cannot be split, so a real acknowledgement in it is still judged by the substring rule.
+        self.assertTrue(dropped_gate.acknowledges("ah task dispose --agent X --kind resumed" + " " * 21000))
+
+    def test_a_quoted_separator_does_not_move_the_agent_out_of_its_segment(self):
+        command = 'ah task dispose --agent owner-6 --note ";" --kind waiting --ack-handoff --ref wa5b00000006 --until X'
+        self.assertEqual(self.stamped(command, ["owner-6"]), ["owner-6"])
+
+
 if __name__ == "__main__":
     unittest.main()
