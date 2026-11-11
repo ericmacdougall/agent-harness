@@ -350,6 +350,19 @@ class StableBoundaryRegressions(unittest.TestCase):
                 self.denied(b)
                 self.assertGreaterEqual(b.boundary_calls, target)
 
+    def test_same_path_running_code_change_during_late_boundary_is_seen(self):
+        for target in (2, 3):
+            with self.subTest(boundary_read=target):
+                b = self.Chain()
+                original = dict(b.processes)
+                def changed(obj, target=target):
+                    if obj.boundary_calls == target:
+                        obj.codes[20] = nc.CodeIdentity("codex", nc.OPENAI_TEAM, "b" * 40, "/bin/zsh")
+                b.mutate = changed
+                self.denied(b)
+                self.assertEqual(b.processes, original)
+                self.assertGreaterEqual(b.boundary_calls, target)
+
     def test_missing_boolean_or_failed_boundary_is_uncertain(self):
         for value in (True, False, None):
             with self.subTest(value=value):

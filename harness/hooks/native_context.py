@@ -110,6 +110,19 @@ def _valid_boundary(value, pid):
             and len(value.executable_uuid) == 16 and any(value.executable_uuid))
 
 
+def _chain_change(backend, chain, codes):
+    for previous in chain:
+        if backend.process(previous.pid) != previous:
+            return "process_changed"
+    for previous, code in zip(chain, codes):
+        if backend.signature(previous.pid) != code:
+            return "code_identity_unverified"
+    for previous in chain:
+        if backend.process(previous.pid) != previous:
+            return "process_changed"
+    return None
+
+
 def probe_runtime_origin(pid=None, *, backend=None):
     """Bounded origin-only probe; a supplied backend is an in-process test double."""
     pid = os.getpid() if pid is None else pid
@@ -161,25 +174,17 @@ def probe_runtime_origin(pid=None, *, backend=None):
             current = process.parent
         else:
             return OriginObservation("unknown", native, "ancestry_limit")
-        for previous in chain:
-            if backend.process(previous.pid) != previous:
-                return OriginObservation("unknown", native, "process_changed")
-        for previous, code in zip(chain, codes):
-            if backend.signature(previous.pid) != code:
-                return OriginObservation("unknown", native, "code_identity_unverified")
+        changed = _chain_change(backend, chain, codes)
+        if changed:
+            return OriginObservation("unknown", native, changed)
         if boundary is not None:
-            repeated = backend.terminal_login_identity(boundary.pid)
-            if not _valid_boundary(repeated, boundary.pid) or repeated != boundary:
-                return OriginObservation("unknown", native, "process_changed")
-        for previous in chain:
-            if backend.process(previous.pid) != previous:
-                return OriginObservation("unknown", native, "process_changed")
-        if boundary is not None and backend.terminal_login_identity(boundary.pid) != boundary:
-            return OriginObservation("unknown", native, "process_changed")
-        if boundary is not None:
-            for previous in chain:
-                if backend.process(previous.pid) != previous:
+            for _ in range(2):
+                repeated = backend.terminal_login_identity(boundary.pid)
+                if not _valid_boundary(repeated, boundary.pid) or repeated != boundary:
                     return OriginObservation("unknown", native, "process_changed")
+                changed = _chain_change(backend, chain, codes)
+                if changed:
+                    return OriginObservation("unknown", native, changed)
         if candidate is None:
             return OriginObservation("unknown", native, "nearer_other_runtime" if native else "no_native_runtime")
         if not _approved_code(codes[-1], candidate):
