@@ -209,6 +209,84 @@ class SSHHeredoc(unittest.TestCase):
         self.assertFalse(analyzer._ssh_python_stdin(rd, words, pipeline, 0))
         self.assertEqual(analyzer.ctx.state(), before)
 
+    def test_function_declarations_preserve_shell_body_analysis(self):
+        call = heredoc('ssh %s python3 -' % HOST, 'set')
+        declarations = (
+            'ssh(){ /bin/sh -s; }; ',
+            'ssh ()\n{ /bin/sh -s; }; ',
+            'function ssh { /bin/sh -s; }; ',
+            'function ssh() { /bin/sh -s; }; ',
+            "'ssh'(){ /bin/sh -s; }; ",
+            'PUBLIC=ssh; $PUBLIC(){ /bin/sh -s; }; ',
+            'function $PUBLIC { /bin/sh -s; }; ',
+            'if true; then function ssh { /bin/sh -s; }; fi; ',
+            '{ function ssh { /bin/sh -s; }; }; ',
+            'time function ssh { /bin/sh -s; }; ',
+            # Any declaration is conservatively retained as provenance, even
+            # when the analyzer cannot prove which names a shell defines.
+            'unrelated(){ :; }; ',
+            'ssh another_name(){ /bin/sh -s; }; ',
+        )
+        for declaration in declarations:
+            with self.subTest(declaration=declaration):
+                verdict, message = self.command(declaration + call)
+                self.assertEqual(verdict, 'block')
+                self.assertIn('env-dump', message)
+
+    def test_later_and_nested_declarations_preempt_relaxation(self):
+        call = heredoc('ssh %s python3 -' % HOST, 'set')
+        # Later declarations in the same parsed stream are conservative evidence
+        # too; no claim is made that they already executed in the real shell.
+        self.assertEqual(self.command(call + '\nssh(){ /bin/sh -s; };')[0], 'block')
+        nested = "ssh(){ /bin/sh -s; }; " + call
+        for wrapper in ('bash -c ', 'env bash -c ', 'sudo bash -c '):
+            with self.subTest(wrapper=wrapper):
+                self.assertEqual(self.command(wrapper + cg._quote_for_rebuild(nested))[0], 'block')
+
+    def test_function_text_in_data_does_not_taint_context(self):
+        call = heredoc('ssh %s python3 -' % HOST)
+        prefixes = (
+            '# ssh(){ /bin/sh -s; }\n',
+            "printf '%s' 'ssh(){ /bin/sh -s; }'; ",
+            "printf '%s' 'function ssh { /bin/sh -s; }'; ",
+            "cat <<'PUBLIC_DATA'\nssh(){ /bin/sh -s; }\nPUBLIC_DATA\n",
+        )
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix):
+                self.assertEqual(self.command(prefix + call)[0], 'allow')
+
+    def test_function_provenance_is_snapshot_and_merge_state(self):
+        analyzer = cg.Analyzer(self.compiled, cwd=self.home)
+        start = analyzer.ctx.state()
+        self.assertFalse(start['function_syntax_seen'])
+        analyzer.script('ssh(){ :; };', 0)
+        after = analyzer.ctx.state()
+        self.assertTrue(after['function_syntax_seen'])
+        analyzer.ctx.restore(start)
+        self.assertFalse(analyzer.ctx.function_syntax_seen)
+        analyzer.ctx.merge(after)
+        self.assertTrue(analyzer.ctx.function_syntax_seen)
+        rd, words, pipeline = self.parsed(heredoc('ssh %s python3 -' % HOST))
+        self.assertFalse(analyzer._ssh_python_stdin(rd, words, pipeline, 0))
+
+    def test_function_provenance_survives_both_clobber_readings(self):
+        analyzer = cg.Analyzer(self.compiled, cwd=self.home)
+        seen = []
+        original = analyzer._run_tokens
+
+        def record(tokens, depth):
+            original(tokens, depth)
+            if depth == 0:
+                seen.append(analyzer.ctx.function_syntax_seen)
+
+        text = 'echo public >! public-output; ssh(){ /bin/sh -s; }; ' + heredoc(
+            'ssh %s python3 -' % HOST, 'set')
+        with mock.patch.object(analyzer, '_run_tokens', side_effect=record):
+            findings = analyzer.run(text)
+        self.assertEqual(seen, [True, True])
+        self.assertTrue(analyzer.ctx.function_syntax_seen)
+        self.assertTrue(any(f.rule == 'env-dump' for f in findings))
+
 
 if __name__ == '__main__':
     unittest.main()

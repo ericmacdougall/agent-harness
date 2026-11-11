@@ -2089,6 +2089,7 @@ class Ctx:
         self.vars = {}
         self.tainted = set()
         self.aliases = {}
+        self.function_syntax_seen = False  # declaration provenance, not a function interpreter
         self.findings = []
         self.secret_seen = 0
         self.tail_visible = True
@@ -2263,6 +2264,22 @@ class Analyzer:
             ctx.ps, ctx.tail_visible = saved_ps, saved_tail
 
     def _run_tokens(self, tokens, depth):
+        # Preserve original lexical provenance before parse() drops parentheses
+        # and before subclass check_tokens() can normalize declaration syntax.
+        # Any function definition makes a bare SSH consumer uncertain. Keeping
+        # this monotonic is conservative across nested scripts and both >!
+        # readings; normal context snapshots restore/merge it like other flags.
+        for i, (kind, word) in enumerate(tokens):
+            self.ctx.budget.tick()
+            if kind != 'w':
+                continue
+            parentheses = tokens[i + 1:i + 3] == [('op', '('), ('op', ')')]
+            previous = tokens[i - 1] if i else None
+            boundary = (previous is None or previous[0] == 'op'
+                        or previous[0] == 'w' and not previous[1].quoted and previous[1].text in RESERVED)
+            keyword = not word.quoted and word.text == 'function' and boundary
+            if parentheses or keyword:
+                self.ctx.function_syntax_seen = True
         self.check_tokens(tokens)
         for pipeline in parse(tokens):
             self.pipeline(pipeline, depth)
@@ -2714,7 +2731,7 @@ class Analyzer:
                         or len(word.alts) != 1)
 
         if (not words or norm_name(words[0].text) != 'ssh' or self.ctx.ps or self.ctx.unterminated
-                or 'ssh' in self.ctx.aliases
+                or 'ssh' in self.ctx.aliases or self.ctx.function_syntax_seen
                 or any(not literal(word) for word in words) or pl is None or idx != 0
                 or pl.bg or not pl.cmds or rd.fd not in (None, '0')):
             return False
