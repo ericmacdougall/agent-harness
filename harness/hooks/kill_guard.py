@@ -1338,7 +1338,9 @@ def make_analyzer_class(cg):
                 if rest:
                     self.inner_words(args[args.index(rest[0]):], depth, pl, idx)
             elif name in cg.INTERPRETERS or INTERPRETER_NAME.fullmatch(name):
-                if not self.is_ah_kill(name, args, cmd, depth) and not self.is_harness_cli(name, args, cmd, depth):
+                if (not self.is_ah_kill(name, args, cmd, depth)
+                        and not self.is_harness_cli(name, args, cmd, depth)
+                        and not self.is_native_wal_note(name, args, cmd, pl, depth)):
                     self.check_interpreter(name, texts, cmd, args)
             self.check_spawn(name, args, texts, depth, pl, idx)
             self.check_text_runners(name, args, texts, cmd, depth)
@@ -1442,6 +1444,56 @@ def make_analyzer_class(cg):
                 if not rest or rest[0] not in AH_SUBCOMMANDS:
                     return False
             return True
+
+        def is_native_wal_note(self, name, args, cmd, pl, depth):
+            """Only the installed native WAL's complete literal note form has data arguments (GoodQA #15646).
+            Unknown shapes retain the ordinary interpreter scan; no other wal.py subcommand is exempt."""
+            if (not name.startswith('python') or not INTERPRETER_NAME.fullmatch(name) or self.remote or depth
+                    or len(pl.cmds) != 1 or pl.bg):
+                return False
+            words = getattr(cmd, 'words', None) or []
+            if not words or words[0].raw != name or self.home_moved() or getattr(cmd, 'redirs', []):
+                return False
+            if any(a.dynamic or a.subs or a.vars or a.glob or a.overflow or len(a.alts) != 1 for a in args):
+                return False
+            i = 0
+            while i < len(args) and args[i].text in ('-I', '-B', '-u'):
+                self.ctx.budget.tick()
+                i += 1
+            home = re.escape(str(Path.home()).rstrip('/'))
+            if (i + 1 >= len(args)
+                    or not re.fullmatch(r'(?:~|%s)/\.codex/agent-harness/wal\.py' % home, args[i].raw or '')
+                    or args[i + 1].text != 'note'):
+                return False
+            i += 2
+            values = {}
+            while i < len(args):
+                self.ctx.budget.tick()
+                key, eq, value = args[i].text.partition('=')
+                if key not in ('--wal', '--event', '--note') or key in values:
+                    return False
+                if not eq:
+                    i += 1
+                    if i >= len(args) or args[i].text.startswith('-'):
+                        return False  # argparse will not consume an option-looking separate value
+                    value = args[i].text
+                values[key] = value
+                i += 1
+            if set(values) != {'--wal', '--event', '--note'}:
+                return False
+            if values['--event'] not in {'intent', 'scope', 'decision', 'risk', 'check', 'commit',
+                                         'blocker', 'status', 'handoff', 'result'}:
+                return False
+            if not 1 <= len(values['--note'].strip()) <= 4000:
+                return False
+            root = str(Path.home()).rstrip('/') + '/.agent-harness/codex-wals/'
+            path = values['--wal']
+            if not path.startswith(root) or '\x00' in path:
+                return False
+            parts = path[len(root):].split('/')
+            return (len(parts) == 2 and re.fullmatch(r'[A-Za-z0-9._-]{1,120}', parts[0]) is not None
+                    and parts[0] not in ('.', '..') and len(parts[1]) > len('.jsonl')
+                    and parts[1].endswith('.jsonl'))
 
         def is_ah_kill(self, name, args, cmd, depth):
             """True only for the literal form `python3 [-I|-B|-u] ~/.claude/hooks/ah.py kill --pid N[,N] --reason R
