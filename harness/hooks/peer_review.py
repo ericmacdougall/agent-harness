@@ -137,60 +137,87 @@ def verdict_match(stage, report):
 
 
 ANY_MARKER = re.compile(r'(?:VERDICT|[A-Z_]*_RESULT)\s*:\s*(?:PASS|ACCEPT|BLOCK)')
-DECORATION = re.compile(r'^(?:\*\*|__|#{1,6}\s+|>\s*)+|(?:\*\*|__)+\s*$')
+# Bold and heading marks only. A quote mark is never stripped: a quoted line is somebody else's text.
+DECORATION = re.compile(r'^(?:\*\*|__|#{1,6}\s+)+|(?:\*\*|__)+\s*$')
+FENCE = re.compile(r'^\s{0,3}(?:`{3,}|~{3,})')
+VERDICT_LINE = {'pr': r'VERDICT: (PASS|BLOCK)', 'plan': r'PLAN_RESULT: (ACCEPT|BLOCK)',
+                'code-inspection': r'CODE_INSPECTION_RESULT: (ACCEPT|BLOCK)'}
 HOIST_MAX_LINES = 60
 HOIST_MAX_CHARS = 8000
 
 
 def hoist_verdict(stage, text):
     """A reviewer that writes a short preamble before its verdict (goodqa#15723 lost three PR 207 receipts to this) still
-    gave a verdict. It is accepted only when the verdict is unambiguous: exactly ONE verdict-looking marker in the whole
-    text, on a line of its own (markdown bold or a heading mark is ignored) within the first lines, and the stage's own
-    marker. The text is returned verdict first, the preamble moved below with a note, so every later check (the pass
-    marker, the ticket parser, stage_report) still sees a first-line verdict. Anything else is returned unchanged."""
+    gave a verdict. It is accepted only when it is unambiguous: exactly ONE verdict-looking marker in the whole text; a
+    line that is exactly the stage's verdict (nothing before it, nothing after it: trailing prose, a quote mark or a
+    code span disqualify it); not inside a fenced block; within the first lines; and never a PASS or ACCEPT carrying
+    markdown decoration (a decorated line is only ever a BLOCK). The text is returned verdict first, the preamble moved
+    below with a note, so the pass marker, the ticket parser and stage_report still see a first-line verdict. Anything
+    else is returned unchanged."""
     if not isinstance(text, str) or verdict_match(stage, text):
         return text
-    lines = text.strip().splitlines()
-    if len(ANY_MARKER.findall(text)) != 1:
+    pattern = VERDICT_LINE.get(stage) if stage is not None else '|'.join(VERDICT_LINE.values())
+    if pattern is None or len(ANY_MARKER.findall(text)) != 1:
         return text
+    lines = text.strip().splitlines()
+    fenced = False
     for index, line in enumerate(lines[:HOIST_MAX_LINES]):
-        clean = DECORATION.sub('', line.strip()).strip()
-        if index and verdict_match(stage, clean):
-            preamble = '\n'.join(lines[:index]).strip()
-            if len(preamble) > HOIST_MAX_CHARS:
-                return text
-            rest = '\n'.join(lines[index + 1:]).strip()
-            note = ('[harness: the reviewer wrote %d line(s) before its verdict; the verdict line was moved to the top '
-                    'and the preamble is kept below]' % index)
-            return clean + '\n' + (rest + '\n\n' if rest else '\n') + note + '\n' + preamble
+        if FENCE.match(line):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        plain = line.strip()
+        clean = DECORATION.sub('', plain).strip()
+        found = re.fullmatch(pattern, clean)
+        if not found:
+            continue
+        verdict = next(group for group in found.groups() if group is not None)
+        if verdict in {'PASS', 'ACCEPT'} and clean != plain:
+            return text  # a decorated line never makes a pass
+        preamble = '\n'.join(lines[:index]).strip()
+        if len(preamble) > HOIST_MAX_CHARS:
+            return text
+        rest = '\n'.join(lines[index + 1:]).strip()
+        if not index:
+            return clean + ('\n' + rest if rest else '')
+        note = ('[harness: the reviewer wrote %d line(s) before its verdict; the verdict line was moved to the top '
+                'and the preamble is kept below]' % index)
+        return clean + '\n' + (rest + '\n\n' if rest else '\n') + note + '\n' + preamble
     return text
 
 
 RAW_KEEP = 4 * 1024 * 1024
 
 
-def persist_raw_output(prefix, provider, code, stdout, stderr, last_message):
+def persist_raw_output(target, provider, code, stdout, stderr, last_message):
     """Keep the reviewer's raw answer in a private mode-600 file when it could not be parsed, so its findings are never
-    lost (goodqa#15723). Returns the path or None; never raises."""
-    if not prefix:
+    lost (goodqa#15723). It is written through the report target's directory handle, after the directory is confirmed
+    to be the one that was validated (outside the worktree, not swapped), exactly like the report. Returns the path or
+    None; never raises."""
+    if target is None or getattr(target, 'fd', None) is None:
         return None
     try:
+        if not target.directory_is_current():
+            return None
         body = ('provider: %s\nexit code: %s\n--- stdout ---\n%s\n--- last message ---\n%s\n--- stderr ---\n%s\n'
                 % (provider, code, stdout or '', last_message or '', stderr or ''))
         data = body.encode('utf-8', errors='replace')[:RAW_KEEP]
         for counter in range(100):
-            path = '%s.raw-%s-%d.txt' % (prefix, provider, counter)
+            name = '%s.raw-%s-%d.txt' % (target.path.name, provider, counter)
             try:
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=target.fd)
             except FileExistsError:
                 continue
             try:
                 os.fchmod(fd, 0o600)
-                os.write(fd, data)
+                view = memoryview(data)
+                while view:  # a single write may be partial
+                    view = view[os.write(fd, view):]
             finally:
                 os.close(fd)
-            return path
-    except OSError:
+            return str(target.parent / name)
+    except (OSError, ValueError):
         return None
     return None
 
@@ -958,7 +985,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                         '%s pool reserved by run %s. Reconcile: `%s --auto`; if it says completed: `%s --actor <who> '
                         "--reason '<why>' --evidence '<proof>'`" % (provider, holder, base, base), 400)
         if outcome.get('reason') == 'INVALID_OUTPUT' and (stdout or stderr or last_message):
-            saved = persist_raw_output(options.get('raw_prefix'), provider, code, stdout, stderr, last_message)
+            saved = persist_raw_output(options.get('raw_target'), provider, code, stdout, stderr, last_message)
             if saved:
                 print('Reviewer output could not be parsed; the raw answer is saved (mode 600): ' + saved, file=sys.stderr)
         options.setdefault('attempts', []).append(
@@ -1605,7 +1632,7 @@ def main() -> int:
             print('Review refused: reviewer rung %s needs user permission recorded for the task by approve-top '
                   '(--task with a ledger permission); --author-rung alone is not a record' % selection['rung'], file=sys.stderr)
             return 2
-    options = {'raw_prefix': str(output_arg), 'packet_path': packet, 'secondary': args.secondary, 'reviewer': args.reviewer,
+    options = {'raw_target': target, 'packet_path': packet, 'secondary': args.secondary, 'reviewer': args.reviewer,
                'review_routing': review_routing(selection, args.reviewer, args.secondary),
                'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
                'selection': selection, 'author_rung': author_rung, 'permission': permission,
