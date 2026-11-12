@@ -374,10 +374,11 @@ class RedTeamRound2(Repo):
 
         def exited(path):
             raise OSError(errno.ESRCH, "no such process")
+        same_user = {"name": "bash", "uid": os.getuid()}
         for link, expected in ((denied, None), (exited, [])):
             with mock.patch.object(cg.os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
                     mock.patch.object(cg.os, "listdir", lambda p: ["555"] if p == "/proc" else []), \
-                    mock.patch.object(cg.os, "readlink", link):
+                    mock.patch.object(cg.os, "readlink", link), mock.patch.object(cg, "_proc_status", lambda pid: same_user):
                 self.assertEqual(cg.busy_processes(str(self.linked)), expected)
 
     def test_lsof_exit_one_means_nothing_found_only_when_it_said_nothing_else(self):

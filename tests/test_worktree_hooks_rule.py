@@ -82,6 +82,26 @@ class Hooks(Repo):
         self.assertFalse(cg.verify_worktree(str(self.linked), policy=off)["removable"])
         self.assertIn("switched off", cg.verify_worktree(str(self.linked), policy=off)["reason"])
 
+    def test_a_config_defined_hook_is_refused_by_the_config_rule_which_is_what_stops_it(self):
+        # git 2.54 reads hook.NAME.event and hook.NAME.command from config and hooksPath does not switch them off, so the
+        # [hook] section refusal is the real control (red-team F2)
+        with open(self.primary / ".git" / "config", "a") as handle:
+            handle.write('[hook "x"]\n\tevent = pre-push\n\tcommand = /bin/true\n')
+        report = self.verify()
+        self.assertFalse(report["removable"])
+        self.assertIn("[hook] section", report["reason"])
+
+    def test_a_plain_removal_does_run_a_hook_which_is_why_the_route_forces_its_safeguards(self):
+        # red-team F1/F3: the bare command DOES run post-index-change through the status it starts; the route is safe only
+        # because of core.hooksPath=/dev/null and GIT_OPTIONAL_LOCKS=0, and the hook form (a bare command) must stay strict
+        done = subprocess.run(["git", "-C", str(self.primary), "worktree", "remove", "--", str(self.linked)],
+                              env=dict(GIT_ENV, GIT_OPTIONAL_LOCKS="1"), capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(self.marker.exists(), "git no longer runs hooks in a plain removal: revisit the strict hook form")
+        self.assertIn("GIT_OPTIONAL_LOCKS", cg._clone_env())
+        self.assertEqual(cg._clone_env()["GIT_OPTIONAL_LOCKS"], "0")
+
     # ---- NEG-5
     def test_hook_files_of_odd_shapes_are_ignored_and_nothing_runs(self):
         (self.hooks / "pre-rebase").symlink_to(self.hooks / "pre-push")
@@ -203,15 +223,14 @@ class OtherUsersProcesses(Repo):
                 raise OSError(value, "fake")
             return value
 
-        def owner(path):
-            pid = path.split("/")[2]
-            value = owners[pid]
+        def status(pid):
+            value = owners[str(pid)]
             if isinstance(value, int) and value < 0:
-                raise OSError(-value, "fake")
-            return mock.Mock(st_uid=value)
+                return "gone" if -value in (errno.ENOENT, errno.ESRCH) else None
+            return {"name": "x", "uid": value}
         with mock.patch.object(cg.os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
                 mock.patch.object(cg.os, "listdir", lambda p: list(listing) if p == "/proc" else []), \
-                mock.patch.object(cg.os, "readlink", link), mock.patch.object(cg.os, "stat", owner):
+                mock.patch.object(cg.os, "readlink", link), mock.patch.object(cg, "_proc_status", status):
             return cg.busy_processes(str(self.linked))
 
     def test_an_unreadable_process_of_another_user_is_skipped_but_a_same_user_one_fails_closed(self):
@@ -219,7 +238,8 @@ class OtherUsersProcesses(Repo):
         self.assertEqual(self.scan({"111": errno.EACCES}, {"111": other}, ["111"]), [])
         self.assertIsNone(self.scan({"111": errno.EACCES}, {"111": me}, ["111"]))
         self.assertIsNone(self.scan({"111": errno.EPERM}, {"111": me}, ["111"]))
-        self.assertIsNone(self.scan({"111": errno.EACCES}, {"111": -errno.ENOENT}, ["111"]))  # owner lookup fails
+        self.assertEqual(self.scan({"111": errno.EACCES}, {"111": -errno.ENOENT}, ["111"]), [])  # exited between the two reads
+        self.assertIsNone(self.scan({"111": errno.EACCES}, {"111": -errno.EIO}, ["111"]))  # an owner lookup that fails otherwise
         self.assertIsNone(self.scan({"111": errno.EIO}, {"111": other}, ["111"]))  # any other error
         # an exited process is skipped, as before
         self.assertEqual(self.scan({"111": errno.ENOENT}, {}, ["111"]), [])
@@ -235,12 +255,11 @@ class OtherUsersProcesses(Repo):
                 raise OSError(value, "fake")
             return value
 
-        def owner(path):
-            return mock.Mock(st_uid=owners[path.split("/")[2]])
+        def status(pid):
+            return {"name": names.get(str(pid)), "uid": owners[str(pid)]}
         with mock.patch.object(cg.os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
                 mock.patch.object(cg.os, "listdir", lambda p: list(listing) if p == "/proc" else []), \
-                mock.patch.object(cg.os, "readlink", link), mock.patch.object(cg.os, "stat", owner), \
-                mock.patch.object(cg, "_proc_name", lambda pid: names.get(str(pid))):
+                mock.patch.object(cg.os, "readlink", link), mock.patch.object(cg, "_proc_status", status):
             return cg.busy_processes(str(self.linked), skip)
 
     def test_a_same_user_unreadable_process_is_skipped_only_when_its_name_is_in_the_skip_list(self):
@@ -267,6 +286,38 @@ class OtherUsersProcesses(Repo):
         with mock.patch.object(cg, "busy_processes", lambda path, skip=(): seen.append(skip) or real(path, skip)):
             cg.verify_worktree(str(self.linked))
         self.assertEqual(tuple(seen[0]), tuple(names))
+
+    def test_the_status_reader_reads_the_world_readable_status_file_and_takes_the_real_uid(self):
+        opened = []
+
+        def fake_open(path, *args, **kwargs):
+            opened.append(path)
+            import io
+            return io.StringIO("Name:\tssh-agent\nUmask:\t0022\nUid:\t1000\t0\t0\t0\nGid:\t1000\t1000\t1000\t1000\n")
+        with mock.patch.object(cg, "open", fake_open, create=True):
+            self.assertEqual(cg._proc_status("4242"), {"name": "ssh-agent", "uid": 1000})
+        self.assertEqual(opened, ["/proc/4242/status"])  # never /proc/PID/cwd, whose stat would follow the link and fail
+
+        def gone(path, *args, **kwargs):
+            raise FileNotFoundError(errno.ENOENT, "gone")
+
+        def broken(path, *args, **kwargs):
+            raise OSError(errno.EIO, "io")
+        with mock.patch.object(cg, "open", gone, create=True):
+            self.assertEqual(cg._proc_status("4242"), "gone")
+        with mock.patch.object(cg, "open", broken, create=True):
+            self.assertIsNone(cg._proc_status("4242"))
+
+        def junk(path, *args, **kwargs):
+            import io
+            return io.StringIO("Name:\tx\nUid:\tnot-a-number\n")
+        with mock.patch.object(cg, "open", junk, create=True):
+            self.assertIsNone(cg._proc_status("4242"))
+
+    def test_a_process_that_made_itself_non_inspectable_is_still_seen_as_the_callers_by_its_real_uid(self):
+        # a same-user process that is not dumpable shows /proc/PID owned by root, but its real uid in status is the callers
+        me = os.getuid()
+        self.assertIsNone(self.scan({"111": errno.EACCES}, {"111": me}, ["111"]))
 
     def test_a_readable_process_inside_the_worktree_blocks_whoever_owns_it(self):
         inside = str(self.linked) + "/src"

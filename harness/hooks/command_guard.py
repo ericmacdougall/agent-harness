@@ -1700,8 +1700,11 @@ def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None):
             bad = _per_worktree_config_refusal(path, common, git_dir, cwd, step)
         if bad:
             return bad
-        # A worktree removal runs no hook, and the delegated route runs every git call with core.hooksPath=/dev/null, so only
-        # that route (policy allow_hooks is exactly True) skips this rule; the hook form and every other caller stay strict.
+        # A bare `git worktree remove` DOES run a hook (post-index-change, through the status it starts), so the hook form and
+        # every other caller keep this rule. The delegated route is safe for two reasons: every git call carries
+        # core.hooksPath=/dev/null and the sanitized environment sets GIT_OPTIONAL_LOCKS=0 (no index write, so no hook), and
+        # config-defined hooks (git 2.54 reads hook.NAME.event and .command; hooksPath does not switch them off) are stopped by
+        # the [hook] section refusal in _config_refusal. Only that route (policy allow_hooks exactly True) skips this rule.
         hooks_dir = os.path.join(common, 'hooks')
         if cfg.get('allow_hooks') is not True and os.path.isdir(hooks_dir) \
                 and any(not n.endswith('.sample') for n in os.listdir(hooks_dir)):
@@ -1881,16 +1884,24 @@ def authenticated_remote_refs(url, repo, timeout):
     return refs
 
 
-def _proc_name(pid):
-    """The Name of a process from /proc/PID/status (world readable), or None."""
+def _proc_status(pid):
+    """{'name': Name, 'uid': real uid} from /proc/PID/status, which any user can read whatever the process set about
+    being inspected; 'gone' when the process has exited; None when it cannot be read or parsed. The real uid is used, not
+    the owner of /proc/PID: a same-user process that made itself non-dumpable shows /proc/PID owned by root, and the
+    owner would call it another user's (red-team F4)."""
     try:
+        name = uid = None
         with open('/proc/%s/status' % pid) as handle:
             for line in handle:
                 if line.startswith('Name:'):
-                    return line.partition(':')[2].strip()
-    except OSError:
+                    name = line.partition(':')[2].strip()
+                elif line.startswith('Uid:'):
+                    uid = int(line.partition(':')[2].split()[0])
+        return {'name': name, 'uid': uid} if uid is not None else None
+    except (FileNotFoundError, ProcessLookupError):
+        return 'gone'
+    except (OSError, ValueError, IndexError):
         return None
-    return None
 
 
 def busy_processes(path, skip_names=()):
@@ -1911,17 +1922,18 @@ def busy_processes(path, skip_names=()):
                         if error.errno in (errno.ENOENT, errno.ESRCH):
                             continue  # exited while we looked
                         if error.errno in (errno.EACCES, errno.EPERM):
-                            try:
-                                owned_by_another_user = os.stat('/proc/%s' % entry).st_uid != os.getuid()
-                            except OSError:
-                                return None  # an owner we cannot determine is a process we could not see
-                            if owned_by_another_user:
+                            status = _proc_status(entry)
+                            if status == 'gone':
+                                continue  # exited between the two reads
+                            if status is None:
+                                return None  # an identity we cannot determine is a process we could not see
+                            if status['uid'] != os.getuid():
                                 continue  # the documented limit: other users processes are invisible without root
                             # A same-user process whose cwd link is unreadable (a daemon that dropped dumpability or lives under
                             # another security profile: ssh-agent, gpg-agent, tailscaled, systemd, docker on t2-dev) is skipped
                             # only when its exact /proc name is in the policy list, which names services, never a shell or an
-                            # agent; any other name, a failing name lookup or an empty list keeps the refusal.
-                            if skip_names and _proc_name(entry) in skip_names:
+                            # agent; any other name, a missing name or an empty list keeps the refusal.
+                            if skip_names and status['name'] in skip_names:
                                 continue
                         return None  # a same-user process we could not read, and any other error
                     if cwd == path or cwd.startswith(path + os.sep):
@@ -1969,7 +1981,8 @@ def delegated_policy(base=None):
     """The user policy (when given) with the delegated route's own rules laid over its reproducible_clone section: the
     scaled budget and allow_hooks. The route always applies them, whatever the caller loaded (the real t2-dev proof showed
     the command line passed the loaded user policy straight down, so the delegated rules were never in force); a policy
-    can still switch the exemption off with enabled false."""
+    can still switch the exemption off with enabled false when it is passed in by code (a policy FILE cannot: load_policy
+    ignores the reproducible_clone section of a file)."""
     base = base if isinstance(base, dict) else {}
     section = base.get('reproducible_clone')
     merged = dict(section) if isinstance(section, dict) else {}
