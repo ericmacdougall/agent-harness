@@ -141,7 +141,25 @@ def mission_session(doc: dict) -> str:
         mission = str(doc.get("mission_session") or "").lower()
         _remember_mission(mission)
         return mission
-    return _remembered_mission()
+    return _remembered_mission() or _ledger_header_mission()
+
+
+def _ledger_header_mission() -> str:
+    """The mission session from the ledger header alone (red-team F5): goals.json parsed and its audit chain verified,
+    WALs not read. On a fresh install no pointer is remembered yet, so a WAL read that times out or fails must still
+    reach the mission session with GOALS UNAVAILABLE; a missing, unreadable or tampered ledger gives none, so scope
+    never widens (NEG-8). Remembered once read."""
+    try:
+        import mission_coverage as mc  # noqa: PLC0415
+        home = _home()
+        loaded = mc.load_goals(home)
+        mission = str(loaded.get("mission_session") or "").lower()
+        if loaded.get("state") != "ok" or not SESSION_ID_RE.match(mission) or not mc.verify_audit(home).get("ok"):
+            return ""
+        _remember_mission(mission)
+        return mission
+    except Exception:  # noqa: BLE001 - no hint: nothing is injected, as before
+        return ""
 
 
 def in_scope(payload: dict, doc: dict) -> bool:

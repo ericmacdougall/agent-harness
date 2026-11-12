@@ -1327,9 +1327,16 @@ Readers take a shared lock on `mission-goals.lock`, so a concurrent write is nev
     mission_coverage.py reseal --reason "<what changed and why>" [--force]                                # main
     mission_coverage.py verify | report [--json] | check
 
-Main-only commands need a one-shot stamp (`caller_identity.put_stamp`, purpose `mission-main`, single use, 10
-minutes) that `mission_gate.py pretool` writes only when the PreToolUse payload proves main (`caller_identity.is_main`)
-and the Bash command runs `mission_coverage.py` itself:
+Main-only commands need a one-shot stamp (`caller_identity.put_stamp`, purpose `mission-main`, single use, 60 s,
+bound to main's tool call) that `mission_gate.py pretool` writes only when the PreToolUse payload proves main
+(`caller_identity.is_main`) and the Bash command runs `mission_coverage.py` itself:
+
+- The stamp carries the call's `tool_use_id`, main's transcript path and the transcript size at that moment
+  (goodqa#15754 red-team F1). The command honours it only while that call is still running: once main's transcript
+  holds the call's `tool_result` (the call ended, or another hook denied it, or the user rejected it), the stamp is
+  dead for every process. `mission_gate.py posttool` (PostToolUse, PostToolUseFailure and PermissionDenied, Bash) also
+  deletes the call's unconsumed stamps. A payload without `tool_use_id` gets no stamp. Run main-only commands in the
+  foreground: a `run_in_background` call returns its tool_result at once, so its command is refused.
 
 - The stamp is keyed by the sha256 of the exact argument list after the script (`argv_key`; `--flag=value` reads as
   `--flag value`), so it covers that one command and nothing else.
@@ -1476,9 +1483,18 @@ stalled goal, plus the option to queue the goal on its ticket.
   `--event deploy` (naming a sha or version). States: DONE_LIVE (main-attached deploy and a later main-attached live
   PASS), LIVE_TESTED (main-attached live PASS, no deploy), LIVE_UNTESTED, VERIFIED, FAILING (a main-attached FAIL
   clears only with a main-attached PASS of the same check), IN_PROGRESS, UNKNOWN (no record, never "not started").
+- Attach pins the row (red-team F2): the ledger entry stores `row_sha` (sha256 of the row as canonical JSON),
+  `row_verdict` and `row_at`. A row whose WAL content changed after attach shows as `TAMPERED` in `ah goals`, never
+  counts, and is named on a `WARNING: TAMPERED evidence` line; main reads the row again and re-attaches it (or
+  removes it with `--remove`). Entries attached before pinning still count but are flagged `(unpinned)`; main's
+  re-attach of the same id pins them.
+- One pass per WAL file (red-team F5): `ah goals` and the hooks read each WAL file once for all attached ids and goal
+  tags, within one time budget (hooks 5 s, `ah goals` 20 s). A read that runs out of time is the state `timeout`
+  (`GOALS UNAVAILABLE (timeout)`, exit 2), never a partial answer.
   `ah status` calls a deploy record linked to a REALLY_TESTED row LINKED_LIVE; prose live claims are LIVE_LEGACY.
 - `status_truth.py` hooks, mission session only (decided from the ledger, remembered in
-  `~/.agent-harness/state/status-truth/mission-session` so a broken ledger never widens it): UserPromptSubmit injects
+  `~/.agent-harness/state/status-truth/mission-session` so a broken ledger never widens it; before the first remembered
+  value, from the verified ledger header, so a first-run timeout still says GOALS UNAVAILABLE there): UserPromptSubmit injects
   the goals for a status question; SessionStart re-injects them after a compaction; Stop lints the final assistant
   text (contradictions against the ledger, and a status answer given without running `ah goals`). Injected text holds
   only fixed-pattern fields (ids, check names, enums, ages, the main-set target). Policy key `status_lint` in

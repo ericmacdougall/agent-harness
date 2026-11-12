@@ -192,6 +192,184 @@ class F1StampBoundToExecutedCall(Base):
         self.assertEqual(self.by_of_live_test(), ("DONE_LIVE", ["main"]))
         self.assertEqual(self.stamps(), [])
 
+    def test_unverifiable_transcript_fails_closed(self):
+        """A missing or shrunken transcript, or a payload without a tool_use_id, never yields a usable stamp."""
+        plain = self.line.replace("cd /nonexistent && ", "")
+        self.pretool(plain, "")  # no tool_use_id: no stamp at all
+        self.assertEqual(self.stamps(), [])
+        self.pretool(plain, self.tool_id())
+        self.transcript.write_text("")  # shrunk below the recorded offset
+        mc.claim_main(self.args, self.home)
+        self.assertIsNone(mc._PROOF.get("stamp"))
+        self.pretool(plain, self.tool_id())
+        self.transcript.unlink()
+        mc.claim_main(self.args, self.home)
+        self.assertIsNone(mc._PROOF.get("stamp"))
+
+
+# ---------------------------------------------------------------------------------------------------- F2
+class F2PinnedEvidence(Base):
+    def setUp(self):
+        super().setUp()
+        self.seed()
+        self.dep = self.row("main.jsonl", {"event": "deploy", "id": "wd0000000002",
+                                           "note": "DEPLOYED abc1234def to prod goodqa#100"})
+        self.lt = self.row(OWNER_WAL, {"event": "result", "id": "wa0000000002", "result": "FAIL", "live": True,
+                                       "note": "REALLY_TESTED prod-smoke FAIL: login 500 goodqa#100"})
+        for wid, kind in ((self.dep, "deploy"), (self.lt, "live_test")):
+            self.assertEqual(self.main_run(["attach", "--goal", "prod-move", "--evidence", wid, "--kind", kind])[0], 0)
+
+    def rewrite(self, wid, **fields):
+        p = self.wal / OWNER_WAL
+        rows = [json.loads(x) for x in p.read_text().splitlines()]
+        for r in rows:
+            if r["id"] == wid:
+                r.update(fields)
+        p.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    def test_attach_pins_row_hash_verdict_and_at(self):
+        ev = next(e for e in mc.load_goals(self.home)["goals"][0]["evidence"] if e["id"] == self.lt)
+        rec = json.loads((self.wal / OWNER_WAL).read_text().splitlines()[0])
+        self.assertEqual(ev["row_sha"], mc.row_digest(rec))
+        self.assertEqual(ev["row_verdict"], "FAIL")
+        self.assertEqual(ev["row_at"], rec["at"])
+
+    def test_probe_b_rewritten_row_is_tampered_and_never_counts(self):
+        self.assertEqual(self.goal()["state"], "FAILING")
+        self.rewrite(self.lt, result="PASS", note="REALLY_TESTED prod-smoke PASS: ok goodqa#100")
+        g = self.goal()
+        self.assertNotEqual(g["state"], "DONE_LIVE")
+        item = next(e for e in g["evidence"] if e["id"] == self.lt)
+        self.assertEqual(item["verdict"], "TAMPERED")
+        self.assertEqual(g["tampered"], [self.lt])
+        text = gv.goals_text(gv.goals_report(self.home, session=SESSION), notes=False)
+        self.assertIn("TAMPERED", text)
+        self.assertIn(self.lt, text)
+
+    def test_moved_timestamp_is_tampered(self):
+        self.rewrite(self.lt, at=iso(time.time() + 3600))
+        self.assertEqual(self.goal()["tampered"], [self.lt])
+
+    def test_legacy_unpinned_entry_counts_but_is_flagged_and_main_reattach_pins_it(self):
+        self.rewrite(self.lt, result="PASS", note="REALLY_TESTED prod-smoke PASS: ok goodqa#100")
+
+        def strip(doc):  # a ledger written before pinning: no row_sha / row_verdict / row_at
+            for e in doc["goals"][0]["evidence"]:
+                for k in ("row_sha", "row_verdict", "row_at"):
+                    e.pop(k, None)
+            return doc
+        mc._mutate(self.home, "fixture", "*", strip, {})
+        g = self.goal()
+        self.assertEqual(g["state"], "DONE_LIVE")  # legacy rows still count (documented choice)
+        self.assertEqual(sorted(g["unpinned"]), sorted([self.dep, self.lt]))
+        self.assertTrue(all(e.get("unpinned") for e in g["evidence"]))
+        self.assertIn("unpinned", gv.goals_text(gv.goals_report(self.home, session=SESSION), notes=False))
+        for wid, kind in ((self.dep, "deploy"), (self.lt, "live_test")):
+            self.assertEqual(self.main_run(["attach", "--goal", "prod-move", "--evidence", wid, "--kind", kind])[0], 0)
+        g = self.goal()
+        self.assertEqual(g["unpinned"], [])
+        self.assertEqual(g["state"], "DONE_LIVE")
+
+    def test_malformed_pin_fails_ledger_validation(self):
+        def bad(doc):
+            doc["goals"][0]["evidence"][0]["row_sha"] = "not-a-hash"
+            return doc
+        with self.assertRaises(Exception):
+            mc._mutate(self.home, "fixture", "*", bad, {})
+        self.assertEqual(mc.load_goals(self.home)["state"], "ok")
+
+
+# ---------------------------------------------------------------------------------------------------- F5
+class F5OnePassAndVisibleBudget(Base):
+    GOALS, PER = 4, 3
+
+    def build(self, filler_mb=0):
+        self.seed("goal-0", "goodqa#200")
+        for gi in range(1, self.GOALS):
+            mc.add_goal(self.home, f"goal-{gi}", f"goal {gi}", f"goodqa#{200 + gi}")
+        if filler_mb:
+            line = json.dumps({"at": "2026-11-01T00:00:00+00:00", "event": "pretool", "tool": "Bash",
+                               "target_chars": 100, "pad": "x" * 200}) + "\n"
+            with open(self.wal / "main.jsonl", "a") as fh:
+                fh.write(line * (filler_mb * 1024 * 1024 // len(line)))
+        n = 0
+        for gi in range(self.GOALS):
+            for k in range(self.PER):
+                n += 1
+                wid = "w%011x" % (0xabc00000 + n)
+                self.row("main.jsonl", {"event": "result", "id": wid, "result": "PASS",
+                                        "note": f"REALLY_TESTED chk{gi}-{k} PASS: x goodqa#{200 + gi}"})
+                self.assertEqual(self.main_run(["attach", "--goal", f"goal-{gi}", "--evidence", wid,
+                                                "--kind", "test"])[0], 0)
+
+    def test_each_wal_file_is_read_once_per_report(self):
+        self.build()
+        opened = []
+        real = safe_input.open_regular_file
+
+        def counting(path, *a, **kw):
+            opened.append(Path(str(path)).name)
+            return real(path, *a, **kw)
+        with mock.patch.object(safe_input, "open_regular_file", side_effect=counting):
+            doc = gv.goals_report(self.home, session=SESSION)
+        self.assertEqual(doc["state"], "ok")
+        self.assertTrue(all(g["state"] == "VERIFIED" for g in doc["goals"]), [g["state"] for g in doc["goals"]])
+        self.assertEqual(opened.count("main.jsonl"), 1, opened)
+
+    def test_exhausted_budget_is_an_unavailable_report_not_a_partial_one(self):
+        self.build()
+        with mock.patch.object(gv, "EVIDENCE_BUDGET_S", 0.0, create=True):
+            doc = gv.goals_report(self.home, session=SESSION)
+        self.assertEqual(doc["state"], "timeout")
+        self.assertIn("GOALS UNAVAILABLE (timeout)", gv.goals_text(doc))
+
+    def hook(self, session, script):
+        """status_truth.py prompt in a child process (its watchdog calls os._exit), with `script` run first."""
+        code = ("import sys; sys.path.insert(0, %r)\nimport status_truth as st, goals_view as gv\n%s\n"
+                "sys.exit(st.main(['prompt']))" % (str(HOOKS), script))
+        env = dict(os.environ)
+        started = time.monotonic()
+        r = subprocess.run([sys.executable, "-c", code], input=json.dumps({"session_id": session, "prompt": "whats left?",
+                                                                           "transcript_path": ""}),
+                           env=env, capture_output=True, text=True, timeout=60)
+        return r, time.monotonic() - started
+
+    def test_fresh_install_timeout_still_says_unavailable_in_the_mission_session_only(self):
+        """No mission pointer remembered yet (fresh install), and the ledger read overruns the hook's wall clock: the
+        mission session still gets GOALS UNAVAILABLE (from the ledger header, read before the WAL scan); another
+        session gets nothing (NEG-8)."""
+        self.build()
+        pointer = self.home / ".agent-harness" / "state" / "status-truth" / "mission-session"
+        self.assertFalse(pointer.exists())
+        slow = ("import time\nst.WALL_LIMIT_S = 1.0\n_real = gv.goals_report\n"
+                "def _slow(*a, **k):\n    time.sleep(5)\n    return _real(*a, **k)\ngv.goals_report = _slow")
+        r, _ = self.hook(SESSION, slow)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.count('{"hookSpecificOutput"'), 1, r.stdout)
+        self.assertIn("GOALS UNAVAILABLE (timeout)", json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"])
+        r, _ = self.hook(OTHER, slow)
+        self.assertEqual(r.stdout.strip(), "")
+
+    def test_in_budget_overrun_reports_unavailable_without_the_watchdog(self):
+        self.build()
+        r, _ = self.hook(SESSION, "gv.EVIDENCE_BUDGET_S = 0.0")
+        self.assertIn("GOALS UNAVAILABLE (timeout)", r.stdout)
+        r, _ = self.hook(OTHER, "gv.EVIDENCE_BUDGET_S = 0.0")
+        self.assertEqual(r.stdout.strip(), "")
+
+    def test_large_wal_resolves_inside_the_hook_budget(self):
+        """Timing (bounded: one ~90 MB WAL in a temp dir, well under 60 s). The red-team saw 8.1 s and no output for
+        100 MB x 30 attached rows on the old per-row rescan; one pass must finish inside the hook's wall clock."""
+        self.GOALS, self.PER = 10, 3
+        self.build(filler_mb=90)
+        self.assertLess((self.wal / "main.jsonl").stat().st_size, 200 << 20)
+        r, took = self.hook(SESSION, "")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("GOALS UNAVAILABLE", ctx)
+        self.assertIn("goal-9", ctx)
+        self.assertLess(took, 8.0)
+
 
 if __name__ == "__main__":
     unittest.main()

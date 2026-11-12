@@ -12,7 +12,8 @@ Goals live in ONE canonical file, ~/.agent-harness/mission/goals.json (dir 0700,
      source, renewal}, wait_count, bound [full agent ids main bound to the goal], retire {source},
      done_evidence [{kind: 'deploy'|'really_tested', ref, session}], repos [paths], dashboard {...informational},
      target {text, source} (main-only; the source resolves to the user's own words), aliases [words the status lint
-     matches], evidence [{id, session, wal, kind: 'deploy'|'live_test'|'test', at, by}] (goodqa#15754: WAL rows that
+     matches], evidence [{id, session, wal, kind: 'deploy'|'live_test'|'test', at, by, row_sha, row_verdict, row_at}]
+     (row_*: the row as attach saw it, so a later rewrite reads TAMPERED, red-team F2) (goodqa#15754: WAL rows that
      `ah goals` reads with no time window; `attach` checks each id exists)}]}
 Every write goes through this tool and appends a hash-chained row to ~/.agent-harness/state/mission-goals-audit.jsonl
 (rotated into chained segments past MAX_AUDIT_BYTES); a goals file that no longer matches the chain head is tampered.
@@ -103,6 +104,8 @@ GENESIS = "0" * 64
 MAIN_ONLY = ("set", "defer", "import-initiatives", "reseal", "activate", "set-session", "bind", "retire", "attach")
 # attach is open to an owner whose evidence row (or its WAL) names the goal; main's stamp lifts that and allows --remove
 ATTACH_KINDS = ("deploy", "live_test", "test")
+PIN_VERDICTS = ("DEPLOY", "PASS", "FAIL", "UNSTATED")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_ATTACHED = 50
 MAX_ALIASES = 12
 WAL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}\.jsonl$")
@@ -195,6 +198,13 @@ def parse_ts(value) -> float:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
     return parsed.timestamp()
+
+
+def row_digest(rec) -> str:
+    """sha256 of a WAL row as canonical JSON (sorted keys, no spaces): what attach pins and ah goals re-checks (F2).
+    Canonical rather than the raw line, so re-serialising an unchanged row (key order, spacing) is not a change."""
+    return hashlib.sha256(json.dumps(rec, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                          .encode("utf-8", "replace")).hexdigest()
 
 
 def sha(data: bytes) -> str:
@@ -485,6 +495,12 @@ def _check_goal(g, index: int) -> dict:
                     or r.get("kind") not in ATTACH_KINDS:
                 raise ValueError(f"{where}: evidence rows need id (w + 11 hex), session, wal and kind "
                                  f"{'|'.join(ATTACH_KINDS)}")
+            pinned = [k for k in ("row_sha", "row_verdict", "row_at") if k in r]
+            if pinned and (len(pinned) != 3 or not isinstance(r["row_sha"], str) or not SHA256_RE.match(r["row_sha"])
+                           or r["row_verdict"] not in PIN_VERDICTS or not isinstance(r["row_at"], str)
+                           or len(r["row_at"]) > 64):
+                raise ValueError(f"{where}: an evidence pin needs row_sha (sha256 hex), row_verdict "
+                                 f"{'|'.join(PIN_VERDICTS)} and row_at (a timestamp string)")
     return g
 
 
@@ -990,6 +1006,7 @@ def attach_evidence(home: Path, goal_id: str, wid: str, *, kind: str = "", sessi
                            "(event deploy/release/install or a DEPLOYED/INSTALLED/RELEASED note naming a sha or "
                            "version) are evidence")
     kind = kind or found_kind
+    pin_verdict = goals_view.verdict(rec) or ("DEPLOY" if found_kind == "deploy" else "UNSTATED")
     if kind not in ATTACH_KINDS or (found_kind == "deploy") != (kind == "deploy"):
         raise MissionError(f"--kind {clean(kind, 20)} does not fit a {found_kind} row")
     loaded = load_goals(home)
@@ -1006,7 +1023,10 @@ def attach_evidence(home: Path, goal_id: str, wid: str, *, kind: str = "", sessi
             # spec rev 3 NEG-4 (red-team H3): a re-attach would rewrite main's row (by, kind); only main changes it
             raise MissionError(f"{wid} is already attached to {goal_id} by main; only main can change or remove it")
         rows = [r for r in g.get("evidence") or [] if r.get("id") != wid]
-        rows.append({"id": wid, "session": session, "wal": wal_name, "kind": kind, "at": iso(time.time()), "by": by})
+        # F2: pin the row as attach saw it; ah goals marks it TAMPERED when the WAL row changes later (a re-attach
+        # re-pins: main's re-attach is how a legacy, unpinned entry gets its pin)
+        rows.append({"id": wid, "session": session, "wal": wal_name, "kind": kind, "at": iso(time.time()), "by": by,
+                     "row_sha": row_digest(rec), "row_verdict": pin_verdict, "row_at": str(rec.get("at") or "")[:64]})
         if len(rows) > MAX_ATTACHED:
             raise MissionError(f"goal {goal_id} already has {MAX_ATTACHED} evidence rows; main removes stale ones")
         g["evidence"] = rows
