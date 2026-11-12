@@ -6,4 +6,6 @@ Reviewed: notes/goodqa-15743/spec.md (v4) at 6a18019 against code on PR 215 at 3
 History: the first v4 pass BLOCKed on one item, D7 versus D4: the hook-form exemption refused partial clones only because the shared config check rejected the extensions section, which git 2.54 no longer writes; the test meant to prove the refusal was vacuous (it reached a real ls-remote). Fixed in code (the shared check refuses promisor and partial-clone filter keys unless clone-remove opts in; a test that fails if the network is reached) and in D4.
 Final pass: M-a (any promisor value not plainly false refuses), M-b (the ah worktree-remove behaviour change stated in D4 and Scope, accepted by main), L-a (the directory set taken right after the cutoff and before git status), L-b (walk_delete requires the set) are closed; Out list and AC-6 consistent; no new high. Still open and not blocking: Review-policy standard (two reviews recorded), files kept because macOS metadata changed their ctime are never cleared.
 
+Pass 5 (spec v4 at 969e431, code 8647cd2): ACCEPT, no new high. Observations kept as follow-ups: an intermediate shell can still pass the parent-environment check (outside the careless-agent threat model, now a stated limit in AC-4), an empty argv[0] shifts the parse by one and fails safe.
+
 Verdict: ACCEPT

@@ -13,4 +13,6 @@ Round 3 (final confirmation of the working tree): ACCEPT with one medium and two
 
 Rounds 4 to 6 (spec v4, reviewed at 231ed6e, c05b858 and 6a18019 against code 6c1f357, 32e303d and 3fabef1): ACCEPT each time. Round 4 found no new high; round 5 found two mediums (the verified directory set was read at the end of verification, so a directory moved in during the git status and scan window would be deleted; `ah worktree-remove` shares the tightened config check and the spec did not say so); round 6 confirmed both are closed (set taken right after the cutoff, behaviour change stated in D4 and Scope and pinned by a test), the Out list and D4 agree, AC-6 states the early set and its single gap. D6, D7 and D8 are honestly labelled owner assumptions; AC-4 is stated plainly as weakened.
 
+Round 7 (spec v4 at 969e431 plus one stated-limit sentence in AC-4, code 8647cd2): ACCEPT. The environment read is sound (KERN_PROCARGS2 layout, argc handling, start-environment limit). Findings kept as follow-ups: sysctl called without argtypes (fragile on arm64), an empty string in the environment ends the parse early, and the parent check looks one level up so a deliberately wrapping shell with an inline override passes it (now a stated limit in AC-4).
+
 Verdict: ACCEPT
