@@ -20,6 +20,7 @@ MUTANTS = {
     "option values not skipped": ("if key in flags and '=' not in text:\n                        skip = True", "if False:\n                        skip = True"),
     "rsync -R path not rebuilt": ("relative = name == 'rsync' and (bool(letters & {'R'})", "relative = False and (bool(letters & {'R'})"),
     "rsync --files-from sources not treated as hidden": ("hidden = name == 'rsync' and any(", "hidden = False and any("),
+    "sshpass prompt value not skipped": ("'sshpass': ('-f', '-d', '-p', '-P'),", "'sshpass': ('-f', '-d', '-p'),"),
     "sshpass not unwrapped": ("'call', 'start', 'sshpass'}", "'call', 'start'}"),
     "rsync compress-choice value not skipped": ("'--zc', '--zl', '--compress-choice',", "'--zl',"),
     "cluster value flag not skipped": ("skip = k == len(text) - 2", "skip = False"),

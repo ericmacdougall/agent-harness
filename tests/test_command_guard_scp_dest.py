@@ -86,6 +86,7 @@ BLOCKED = [
     "sshpass -p x scp x t2-dev:~/.claude/hooks/command_guard.py",
     "sshpass -f pw rsync -a x t2-dev:~/.claude/hooks/command_guard.py",
     "sshpass -e scp x t2-dev:~/.claude/hooks/command_guard.py",
+    "sshpass -P assword: -f pw scp command_guard.py t2-dev:.claude/hooks/",
 ]
 ALLOWED = [
     "scp t2-dev:~/.claude/hooks/command_guard.py /tmp/x",
