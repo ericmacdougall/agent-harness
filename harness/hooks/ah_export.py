@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import bisect
 import html
+import itertools
 import json
 import os
 from pathlib import Path
@@ -61,6 +62,8 @@ _IPV4 = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
 # finding 12).
 _CONTROL = re.compile("[\\x00-\\x08\\x0b-\\x1f\\x7f\\u00ad\\u034f\\u061c\\u200b-\\u200f\\u202a-\\u202e"
                       "\\u2060-\\u2069\\ufe00-\\ufe0f\\ufeff\\U000e0000-\\U000e007f]")
+MAX_KEYS = 1000  # keys per dict and items per list kept for display
+MAX_INT_CHARS = 64  # longer integer literals are refused: CPython 3.9 parses them in quadratic time
 SECTION_CAP = 500  # entries rendered per evidence section; the rest are counted in an "N more" line
 # Compared case-folded against the resolved path relative to home (APFS is case-insensitive by default).
 _SYNC_PREFIXES = ("dropbox", "onedrive", "google drive", "box sync")
@@ -94,6 +97,12 @@ def _mask_rejoined(value: str) -> str:
             last = run.end()
     pieces.append(joined[last:])
     return "".join(pieces)
+
+
+def _bounded_int(text: str) -> int:
+    if len(text) > MAX_INT_CHARS:
+        raise ValueError("integer literal over %d characters" % MAX_INT_CHARS)
+    return int(text)
 
 
 def _load_redactor():
@@ -131,12 +140,13 @@ class _Scrubber:
         if depth > MAX_DEPTH:
             return "[nested too deep]"
         if isinstance(value, dict):
-            out = {}
-            for key, item in value.items():
+            out, seen = {}, {}
+            for key, item in itertools.islice(value.items(), MAX_KEYS):  # code inspection 1-2: keys are capped
                 clean_key = self.text(key)
-                base, n = clean_key, 2
+                base = clean_key
                 while clean_key in out:  # two keys that redact to the same text must not overwrite each other
-                    clean_key, n = "%s #%d" % (base, n), n + 1
+                    seen[base] = seen.get(base, 1) + 1
+                    clean_key = "%s #%d" % (base, seen[base])
                 if isinstance(key, str) and self.secret_key.fullmatch(key) and item not in (None, ""):
                     self.redactions += 1
                     out[clean_key] = "[REDACTED:field]"
@@ -144,7 +154,7 @@ class _Scrubber:
                     out[clean_key] = self.obj(item, depth + 1)
             return out
         if isinstance(value, list):
-            return [self.obj(item, depth + 1) for item in value[:1000]]
+            return [self.obj(item, depth + 1) for item in value[:MAX_KEYS]]
         if value is None or isinstance(value, bool) or isinstance(value, (int, float)):
             return value
         return self.text(value)
@@ -195,12 +205,12 @@ def _read(ah, sd: Path):
             if not raw.strip():
                 continue
             try:
-                rec = json.loads(raw)
+                rec = json.loads(raw, parse_int=_bounded_int)
             except (ValueError, RecursionError):  # RecursionError: hostile nesting depth
                 skipped += 1
                 continue
-            if not isinstance(rec, dict) or not rec.get("event"):
-                skipped += 1
+            if not isinstance(rec, dict) or not isinstance(rec.get("event"), str) or not rec.get("event"):
+                skipped += 1  # code inspection 3: a non-string event is malformed, never a crash
                 continue
             rows.append((agent, rec))
     return rows, unread, skipped, agents
@@ -434,6 +444,9 @@ def _display(ah, report: dict, count: int, redacted) -> dict:
     for key in _EVIDENCE_KEYS:
         shown = []
         for entry in report.get(key) or []:
+            if len(shown) >= SECTION_CAP:  # counted for the "N more" line, never redacted (code inspection 2)
+                shown.append({})
+                continue
             index = entry.get("row")
             if not isinstance(index, int) or not 0 <= index < count:
                 shown.append({"agent": "?", "note": "(source row unavailable)"})

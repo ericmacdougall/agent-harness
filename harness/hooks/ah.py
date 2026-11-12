@@ -2393,8 +2393,15 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
     supplied = given is not None
     row_index = {id(rec): i for i, (_agent, rec) in enumerate(given)} if supplied else {}
     rows, unread = [], list(unread or [])
-    if given is None:
-        given = []
+
+    def consider(agent, rec):
+        if not isinstance(rec, dict) or not rec.get("event"):
+            return
+        at = parse_ts(rec.get("at"))
+        if at >= cutoff:
+            rows.append((agent, at, rec))
+
+    if given is None:  # ah status: filter while reading, so only rows in the window are kept (code inspection 6)
         sd = session_dir(home, session)
         if not (sd / "main.jsonl").is_file():
             raise AhError("session_unknown", f"no main WAL for session {session!r}")
@@ -2407,16 +2414,13 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
                 continue
             for raw in text.splitlines():
                 try:
-                    given.append((agent, json.loads(raw)))
+                    rec = json.loads(raw)
                 except ValueError:
                     continue
-    for agent, rec in given:
-        if not isinstance(rec, dict) or not rec.get("event"):
-            continue
-        at = parse_ts(rec.get("at"))
-        if at < cutoff:
-            continue
-        rows.append((agent, at, rec))
+                consider(agent, rec)
+    else:
+        for agent, rec in given:
+            consider(agent, rec)
     rows.sort(key=lambda r: r[1])
     import goals_view  # noqa: PLC0415 - one verdict and deploy-record rule with ah goals (goodqa#15754)
     verified, pending, live, claimed, blockers, commits, asks, resolved, assumptions, decisions = {}, {}, [], [], [], [], {}, set(), [], []

@@ -397,9 +397,11 @@ class Output(Base):
         self.assertNotIn('sync_warning', r)
 
     def test_crash_before_link_leaves_nothing(self):
-        with mock.patch.object(ah_export.os, 'link', side_effect=OSError('boom')):
-            with self.assertRaises(Exception):
+        with mock.patch.object(ah_export.os, 'link', side_effect=OSError('boom')) as link:
+            with self.assertRaises(OSError) as caught:
                 self.export()
+        self.assertEqual(str(caught.exception), 'boom')  # failed at the link step, not earlier
+        self.assertEqual(link.call_count, 1)
         root = self.exports_root()
         self.assertEqual(list(root.iterdir()) if root.exists() else [], [])
 
@@ -451,9 +453,28 @@ class Inputs(Base):
             for _ in range(200):
                 nested = {'k': nested}
             fh.write(json.dumps({'event': 'status', 'note': nested}).encode() + b'\n')
+        # Code inspection 3-4: a list-valued event and a huge integer literal are skipped, never a crash or a stall.
+        jl(self.w / 'agent-owner1.jsonl', [{'at': iso(NOW - 30), 'event': ['status'], 'note': 'list event'}])
+        with open(self.w / 'agent-owner1.jsonl', 'ab') as fh:
+            fh.write(b'{"event": "status", "note": ' + b'9' * 100_000 + b'}\n')
+        started = time.monotonic()
         r = self.export()
+        self.assertLess(time.monotonic() - started, 5)
         self.assertTrue(r['ok'])
-        self.assertGreaterEqual(r['rows_skipped'], 3)
+        self.assertGreaterEqual(r['rows_skipped'], 5)
+        self.assertNotIn('list event', self.html(r))
+
+    def test_key_flood_is_capped(self):
+        """Code inspection 1-2: 4,000 keys that all mask to [ip] once took 13 s; keys are capped at MAX_KEYS."""
+        row = {'at': iso(NOW - 20), 'event': 'status', 'note': 'key flood'}
+        row.update({'10.0.%d.%d' % (i // 250, i % 250): 1 for i in range(4000)})
+        jl(self.w / 'agent-owner1.jsonl', [row])
+        started = time.monotonic()
+        r = self.export()
+        self.assertLess(time.monotonic() - started, 5)
+        scrub = ah_export._Scrubber(*ah_export._load_redactor())
+        self.assertLessEqual(len(scrub.obj(row)), ah_export.MAX_KEYS)
+        self.assertIn('key flood', self.html(r))
 
     def test_bounds_priority_and_unread(self):
         jl(self.w / 'agent-bulk.jsonl', [{'at': iso(NOW - 100 + i / 1000), 'event': 'status', 'note': f'row {i}'}
@@ -465,6 +486,7 @@ class Inputs(Base):
         page = self.html(r)
         self.assertIn('omitted', page)
         self.assertNotIn('L' * (ah_export.FIELD_CAP + 1), page)
+        self.assertIn('L' * ah_export.FIELD_CAP + ' [... capped at %d characters]' % ah_export.FIELD_CAP, page)
         for early in ('PENDING_REAL_TEST EXP-1', 'ship the export behind no flag', 'approve the export PR',
                       'handoff: export ready for review', 'GoodQA returned 403'):
             self.assertIn(early, page, early)  # priority rows survive the cap
