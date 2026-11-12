@@ -1,0 +1,69 @@
+{
+ "v": 1,
+ "reviews": [
+  {
+   "kind": "agent",
+   "identity": "a0c568dfa08e7eb86",
+   "verdict": "ACCEPT",
+   "model": "red-team",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/notes/goodqa-15759/review-opus-m5-m7.md",
+    "sha256": "5e60e4f74d03f3f06c523f6fea41964bd1f0642e378d09ec6c87a9534468d630"
+   },
+   "role": "adversarial",
+   "core_sha": "9098189e7b4111e9d733286d4150acb8f9a2f0f4dca91590de00d8af91b4b61e",
+   "at": "2026-11-12T16:18:30.148464+00:00",
+   "key": "agent:a0c568dfa08e7eb86"
+  },
+  {
+   "kind": "agent",
+   "identity": "a5d878417503c1093",
+   "verdict": "ACCEPT",
+   "model": "red-team",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/notes/goodqa-15759/review-sonnet-m5-m7.md",
+    "sha256": "1be2d88b68d8626dccfccd230eedb5d80b28ca0bce1e764f0842f8c08fb25d86"
+   },
+   "role": "acceptance",
+   "core_sha": "9098189e7b4111e9d733286d4150acb8f9a2f0f4dca91590de00d8af91b4b61e",
+   "at": "2026-11-12T16:18:30.427870+00:00",
+   "key": "agent:a5d878417503c1093"
+  },
+  {
+   "kind": "agent",
+   "identity": "a0c568dfa08e7eb86",
+   "verdict": "ACCEPT",
+   "model": "red-team",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/notes/goodqa-15759/review-opus-r1-delta.md",
+    "sha256": "a81d0b2cb4ab09a3779629bf9306abaa96e917b16810f7055a41299c932132a0"
+   },
+   "role": "adversarial",
+   "core_sha": "a8afeb831a128b0afdd62558f6383f581086312ab25fd05245fbe0de6996d090",
+   "at": "2026-11-12T16:50:09.810657+00:00",
+   "key": "agent:a0c568dfa08e7eb86"
+  },
+  {
+   "kind": "agent",
+   "identity": "a5d878417503c1093",
+   "verdict": "ACCEPT",
+   "model": "red-team",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/notes/goodqa-15759/review-sonnet-r1-delta.md",
+    "sha256": "3f49fd169782a4babd9cc53625e1f173ecd55cfdcfc8eca511b5fd09fb89ec4f"
+   },
+   "role": "acceptance",
+   "core_sha": "a8afeb831a128b0afdd62558f6383f581086312ab25fd05245fbe0de6996d090",
+   "at": "2026-11-12T16:50:10.027173+00:00",
+   "key": "agent:a5d878417503c1093"
+  }
+ ]
+}

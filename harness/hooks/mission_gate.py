@@ -42,7 +42,8 @@ OWNER_SCAN_BUDGET_S = 9  # the hook has 15 s; `ah owners` took ~24 s on a 2,089-
 VALVE_KEY = "mission:gate-valve"
 SCAN_KEY = "mission:scan:unavailable"
 STAMP_PURPOSE = "mission-main"
-MAIN_ONLY = ("set", "defer", "import-initiatives", "reseal", "activate", "set-session", "bind", "retire")
+MAIN_ONLY = ("set", "defer", "import-initiatives", "reseal", "activate", "set-session", "bind", "retire",
+             "attach")
 
 
 def home_dir() -> Path:
@@ -130,7 +131,7 @@ def stamps_for(cmd: str) -> list:
         if any(getattr(w, "computed", False) for w in argv):
             continue  # the process would see what the shell computed, not these words
         flags = {x.split("=", 1)[0] for x in argv[1:] if x.startswith("--")}
-        if argv[0] == "set" and not flags & {"--ticket", "--repo"}:
+        if argv[0] == "set" and not flags & {"--ticket", "--repo", "--target", "--target-source", "--alias"}:
             continue
         if argv[0] == "defer" and not flags & {"--user-source", "--ticket"}:
             continue

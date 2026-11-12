@@ -1,0 +1,28 @@
+{
+ "note": "Author-written regression set (goodqa#15754). Rev 2 pre-registered 12 positive and 9 clean lines (WAL w6eda5d45d70). Rev 3 applies main's ruling on red-team M2 (only DONE_LIVE is done): the four rev-2 positives that say a LIVE_TESTED goal is not done, not met, cannot be called done or has nobody working on it are true under that ruling and moved to clean, and the two rev-2 clean lines that call a LIVE_TESTED goal done moved to positive. This set is written and graded by the author, so it is a regression test, not a recall measurement; the recall measurement is the non-author set main routes. Ledger: prod-move, leads, self-update LIVE_TESTED; user-tokens, harness-asks, parentproof UNKNOWN. Threshold: every positive flagged, no clean line flagged.",
+ "positive": [
+  "- **Self-update:** the desktop self-update has had no work this stretch.",
+  "- **Self-update is not live** on the Mac mini yet.",
+  "- **User tokens: done.** Minting works everywhere.",
+  "- User tokens are done and tested live.",
+  "**3. Harness asks: done.** Nothing is left.",
+  "The harness asks are all done.",
+  "**4. ParentProof: done and live.**",
+  "ParentProof is complete.",
+  "**1. Prod move: done.** dev2 was powered off on Nov 10 and t2 checked healthy.",
+  "- **Self-update: done and tested live.** The app updated itself to 0.2.57."
+ ],
+ "clean": [
+  "**1. Prod move: not done.** I haven't checked the services yet.",
+  "**1. Prod move:** we can't call the prod move done until every service has moved.",
+  "- **1000 leads in the CRM view: nobody is working on it right now.**",
+  "- **Leads:** the 1000 leads goal is not met; the browser is not built.",
+  "- **1000 leads: the count is met.** The CRM had 1416 people on Nov 9.",
+  "- **User tokens:** minting is built; the machine-route refusal is still open (goodqa#15638).",
+  "**3. Harness asks:** two pieces are live and one waits on your decision.",
+  "**4. ParentProof:** both accessibility runs are still going on t2-dev.",
+  "I fixed the typo in README.md; that edit is done.",
+  "The refactor is complete and the tests pass.",
+  "Done: committed 7d7e0e4b and pushed the branch."
+ ]
+}

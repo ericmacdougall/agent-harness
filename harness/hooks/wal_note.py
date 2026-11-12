@@ -14,7 +14,12 @@ from wal import append
 
 
 EVENTS = {'intent', 'scope', 'decision', 'risk', 'check', 'commit', 'blocker', 'status', 'handoff', 'result',
-          'requirement', 'ask', 'ask_resolved'}
+          'requirement', 'ask', 'ask_resolved', 'deploy'}
+# Structured evidence (goodqa#15754): `ah goals` and `ah status` read these fields instead of guessing from prose.
+GOAL_RE = re.compile(r'^[a-z0-9][a-z0-9_-]{0,63}$')
+TICKET_RE = re.compile(r'^\s*(?:GoodQA\s+)?[A-Za-z][A-Za-z0-9-]{0,62}\s*#\s*[1-9][0-9]{0,9}\s*$')
+REALLY_TESTED_RE = re.compile(r'^\s*REALLY_TESTED\s+[A-Za-z0-9._-]+')
+SHA_OR_VERSION_RE = re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b|\bv\d+\.\d+(?:\.\d+)?\b|\b\d+\.\d+\.\d+\b")  # as goals_view.SHA_OR_VERSION
 # Events whose origin must be traceable (provenance.py). The mode per event is in provenance_policy.json.
 SOURCED = ('requirement', 'ask', 'blocker', 'scope', 'decision')
 TOOL_WRITERS = frozenset({'escalation', 'ahd', 'dropped_gate', 'ah-run'})  # rows these tools write on an agent's behalf (goodqa#14791)
@@ -161,6 +166,10 @@ def main():
                         help='ask_resolved only: the explicit outcome (escalation.py reads this field, never the note text)')
     parser.add_argument('--by', help='tool that writes this row on an agent\'s behalf (never quarantined; cites its state in the note)')
     parser.add_argument('--recites', help='id of an unsourced entry of this WAL that this sourced row re-cites (clears its quarantine)')
+    parser.add_argument('--goal', help='mission goal id this row is evidence for (ah goals lists it as a tag candidate)')
+    parser.add_argument('--ticket', help='ticket this row is about, e.g. goodqa#123')
+    parser.add_argument('--result', choices=('PASS', 'FAIL'), help='REALLY_TESTED rows: the stated result')
+    parser.add_argument('--live', action='store_true', help='REALLY_TESTED rows: the test ran against the live system')
     args = parser.parse_args()
     root = Path.home() / '.claude' / 'wals'
     path = args.wal.absolute()
@@ -176,8 +185,24 @@ def main():
     for label, value in (('source', args.source), ('reason', args.reason)):
         if value and SECRET_PATTERN.search(value):
             parser.error(label + ' appears to contain a credential; redact it first')
+    if args.goal is not None and not GOAL_RE.match(args.goal):
+        parser.error('--goal: a goal id (lower-case letters, digits, - and _)')
+    if args.ticket is not None and not TICKET_RE.match(args.ticket):
+        parser.error('--ticket: like goodqa#123')
+    if (args.result or args.live) and not REALLY_TESTED_RE.match(note):
+        parser.error('--result and --live apply to a note starting REALLY_TESTED <check id>')
+    if args.event == 'deploy' and not SHA_OR_VERSION_RE.search(note):
+        parser.error('a deploy row names the deployed sha or version (merged is not live)')
     record = {'at': datetime.now(timezone.utc).isoformat(), 'event': args.event, 'note': note,
               'id': 'w' + uuid.uuid4().hex[:11]}
+    if args.goal:
+        record['goal'] = args.goal
+    if args.ticket:
+        record['ticket'] = re.sub(r'\s+', '', args.ticket)
+    if args.result:
+        record['result'] = args.result
+    if args.live:
+        record['live'] = True
     warnings = []
     if args.event == 'ask':
         if not args.reason or len(args.reason.strip()) < 10:

@@ -2406,7 +2406,7 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
 SAFE_TEXT = re.compile(r"[^A-Za-z0-9 ._:/%+()\[\],=@#~-]")
 
 
-def injection_text(home: Path | None = None, max_chars: int = 700) -> str:
+def injection_text(home: Path | None = None, max_chars: int = 700, session: str = "") -> str:
     """Context line for wal.py. Never raises; "" when nothing is active. Alert text can carry dir, unit, branch
     or process names, so it is reduced to a safe character set and labelled as data."""
     try:
@@ -2434,9 +2434,13 @@ def injection_text(home: Path | None = None, max_chars: int = 700) -> str:
         for h, group in live.items():
             group.sort(key=lambda x: -SEVERITIES.get(x[0], 0))
             top = max(SEVERITIES.get(g[0], 0) for g in group)
-            names = ", ".join(str(g[1]).split("/", 1)[-1] for g in group[:4])
+            # goodqa#15754: one owner can hold several alert rows (a critical and a high under one key); count owners
+            seen = list(dict.fromkeys(str(g[1]) for g in group))
+            names = ", ".join(k.split("/", 1)[-1] for k in seen[:4])
+            mine = sum(1 for k in seen if session and k.split(":", 1)[-1].startswith(session[:8] + "/"))
+            share = f" ({mine} in this session)" if session else ""
             rest.append(([k for k, v in SEVERITIES.items() if v == top][0], h, "liveness",
-                         f"{len(group)} owner(s) silent or dropped: {names}{', ...' if len(group) > 4 else ''}"))
+                         f"{len(seen)} owner(s) silent or dropped{share}: {names}{', ...' if len(seen) > 4 else ''}"))
         items = sorted(rest, key=lambda x: -SEVERITIES.get(x[0], 0))
 
         def clean(v, n):

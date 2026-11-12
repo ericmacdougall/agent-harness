@@ -69,6 +69,37 @@ Both WAL writers refuse symlinks from `.claude` down to the log, hardlinked logs
 
 For behavior changes, use matching `PENDING_REAL_TEST <id>:` and `REALLY_TESTED <id>:` notes through `wal_note.py` before editing and after observation. Use `status` for the pending note and `check` for the verified note. The latter names the command or live steps, result, and applicable commit; any unmatched pending ID stays visible in the handoff. This is a concise audit trail, not an automated Stop gate. A disposable live slug-fix trial recorded `V1` before the edit, observed the baseline test fail, reran it successfully after the edit, and recorded the matched proof. A separate Stop-hook probe showed why the global gate was rejected: it ran on a simple arithmetic answer and forced an unnecessary second turn when configured to demand a test.
 
+### Exporting a session (`ah export`)
+
+`ah export --session SESSION_ID` writes one self-contained HTML file. It is meant for reading a handoff or review without opening the raw WALs. The idea comes from Pi's `/export` (pi.dev, MIT); Pi's `/share` upload has no counterpart here (goodqa#15788).
+
+```sh
+python3 ~/.claude/hooks/ah.py export --session SESSION_ID                    # all rows
+python3 ~/.claude/hooks/ah.py export --session SESSION_ID --since 6h --agent AGENT_ID
+python3 ~/.claude/hooks/ah.py export --session SESSION_ID --out ~/exports/handoff.html
+```
+
+What the page contains:
+- The agent tree.
+- Every row that carries a note: intents, decisions, asks, results, commits, blockers, handoffs and the like.
+- The evidence classes, computed by the same `status_report` rules as `ah status`.
+- A list of the WALs it did not read: symlinks, non-regular files, files over 64 MB, and anything past the 256 MB or 4,096-file session caps.
+
+Redaction:
+- Every string in every row goes through `redact.py`, keys and values alike.
+- E-mail local parts, home-directory paths and IPv4 addresses are masked.
+- Redaction runs on the original text, then again after control, bidi and zero-width characters are removed; a long token-like run that held or touched a removed character is masked as `[REDACTED:split]`. So neither a token split by an invisible character nor one whose only boundary was a control character slips through. Each field is capped at 2,000 characters, and each evidence section shows at most 500 entries plus a count of the rest.
+- The evidence classes are computed on the raw rows, so a cap or mask cannot change a verdict. Each entry is then displayed from its redacted row.
+- Redaction is pattern-based, so names, hostnames, ticket text and phone numbers stay. The page says so in a banner.
+
+The page has no script, no external reference and a strict CSP.
+
+Where the file goes:
+- By default it goes under `~/.agent-harness/work/SESSION_ID/exports/`, with the file 0600 and the directory 0700.
+- `--out` writes a new file elsewhere. It refuses an existing name, a symlink, any folder inside a repository work tree, and sync folders (Dropbox, OneDrive, Google Drive, Box, `~/Library/CloudStorage`, `~/Library/Mobile Documents`). Desktop and Documents only get a `sync_warning`.
+- `ah` never uploads the file. Note that the hourly log backup copies `~/.agent-harness/work`, together with the raw WALs it was built from, to your private backup. Use `--out` for a folder outside it.
+- If the redactor is missing, the export refuses. Review the file before sharing it with anyone.
+
 ## Usage guard
 
 Both editions install the same standard-library helper: `~/.claude/hooks/usage_guard.py` or `~/.codex/agent-harness/usage_guard.py`. It guards commands routed through it. Direct shell commands and native agents remain workflow-governed; no daemon, global Stop gate, permission reduction or distributed account enforcement is installed. Tiny fixes need no new receipt or model call.
@@ -1433,6 +1464,33 @@ stalled goal, plus the option to queue the goal on its ticket.
   first, covered by least recent progress, then waiting, deferred, imported, done and retired. It includes a
   `coverage` map for Mission Control, keyed by goal id and ticket, with `{status: uncovered|stalled|moving, reason,
   action}`.
+
+### Goal status: `ah goals` and the status lint (goodqa#15754)
+
+- `ah goals` reports every goal of the ledger with its state and its evidence of any age (`--json` for all of it,
+  `--candidates` for unattached deploy and REALLY_TESTED rows that name a goal, read only). It is the source for a
+  "whats left" answer; `ah status --since` lists recent evidence only.
+- Evidence: main attaches rows with `mission_coverage.py attach --goal G --evidence wID --kind test|live_test|deploy`;
+  owners may attach rows from WALs that name the goal, with an explicit PASS or FAIL, and never re-attach main's
+  rows. Owners tag rows with `wal_note.py --goal G --result PASS|FAIL [--live]` and write deploy records with
+  `--event deploy` (naming a sha or version). States: DONE_LIVE (main-attached deploy and a later main-attached live
+  PASS), LIVE_TESTED (main-attached live PASS, no deploy), LIVE_UNTESTED, VERIFIED, FAILING (a main-attached FAIL
+  clears only with a main-attached PASS of the same check), IN_PROGRESS, UNKNOWN (no record, never "not started").
+  `ah status` calls a deploy record linked to a REALLY_TESTED row LINKED_LIVE; prose live claims are LIVE_LEGACY.
+- `status_truth.py` hooks, mission session only (decided from the ledger, remembered in
+  `~/.agent-harness/state/status-truth/mission-session` so a broken ledger never widens it): UserPromptSubmit injects
+  the goals for a status question; SessionStart re-injects them after a compaction; Stop lints the final assistant
+  text (contradictions against the ledger, and a status answer given without running `ah goals`). Injected text holds
+  only fixed-pattern fields (ids, check names, enums, ages, the main-set target). Policy key `status_lint` in
+  provenance_policy.json: `warn` (shipped: a systemMessage the user sees, and a flag row in
+  `~/.agent-harness/state/status-truth/flags.jsonl` with ids and rules only), `enforce` (blocks once per human turn
+  through `stop_blocks.py`; main switches it only on the spec's precision bound) or `off`. When the transcript tail
+  holds no user prompt the turn is unknown and the lint only warns, in enforce too.
+  `status_truth.py calibrate <transcript>` replays both rules over a transcript.
+- `ah owners` lists in `attention` each SILENT owner whose recorded wait expired, or that has been silent 6 h with no
+  disposition (row reason `wait-expired` or `silent-undisposed`); `ah status` prints the same list on its owners line.
+  It is a report for main to look at: it does not set `decision_required`, so the dropped-owner Stop gate and ahd
+  successor requests ignore it (a silent owner may be a long build that writes no WAL lines).
 
 ## Design limits
 
