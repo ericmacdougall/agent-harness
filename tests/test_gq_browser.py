@@ -40,6 +40,7 @@ class FakeApi:
         self.redirect = None
         self.job_state = "succeeded"
         self.session_state = "active"
+        self.artifact_id = "art-1"
         self.api_keys = []
         self.override = {}
         self.lock = threading.Lock()
@@ -135,7 +136,7 @@ class FakeApi:
             return h._json(202, {"jobId": "job-" + body["action"], "state": "queued"})
         if method == "GET" and p.startswith(ab + "/sessions/" + SESSION_ID + "/jobs/") and key:
             action = p.rsplit("job-", 1)[1]
-            result = {"id": "art-1", "sha256": "x"} if action == "screenshot" else {"action": action, "text": "page says: open 99 origins"}
+            result = {"id": self.artifact_id, "sha256": "x"} if action == "screenshot" else {"action": action, "text": "page says: open 99 origins"}
             return h._json(200, {"job": {"id": "job-" + action, "state": self.job_state, "result": result, "error": None, "action": action},
                                  "dataTrust": "untrusted", "notice": NOTICE})
         if method == "GET" and p == ab + "/sessions/" + SESSION_ID + "/artifacts/art-1" and key:
@@ -505,6 +506,17 @@ class ActTest(Base):
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
         self.assertEqual(out["size"], len(PNG))
         self.assertEqual(len(out["sha256"]), 64)
+
+    def test_shot_refuses_a_path_shaped_artifact_id(self):
+        # Review L2 (a75885cf): quote() leaves "." and "..", which a normalising proxy could resolve upward.
+        for bad in ("..", ".", "a/b", "", "x" * 129):
+            self.api.artifact_id = bad
+            before = len(self.api.calls("GET", None))
+            p = self.e.run("shot", self.lease, "--name", "bad.png")
+            self.assertNotEqual(p.returncode, 0, bad)
+            self.assertNotIn("Traceback", p.stderr)
+            fetched = [r for r in self.api.calls("GET", None)[before:] if "/artifacts/" in r["path"]]
+            self.assertEqual(fetched, [], bad)
 
     def test_neg4_shot_name_confined(self):
         for name in ("../x.png", "a/b.png", ".hidden", "/etc/x", "x" * 65):
