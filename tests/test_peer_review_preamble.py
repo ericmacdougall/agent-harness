@@ -199,6 +199,44 @@ class Preamble(unittest.TestCase):
         chars = ("x" * 1998) + "\n\nVERDICT: BLOCK\n"  # 1998 + '\n' + '' = 1999 chars of preamble
         self.assertEqual(self.parse(chars)['result'], 'CHECK_FAILED')
 
+    def test_a_first_line_verdict_with_trailing_prose_is_not_a_verdict(self):
+        # receipt r1 F1 (High) on the first-line fast path: words after the marker were accepted and later dropped
+        for verdict in ('PASS', 'BLOCK'):
+            for line in ('VERDICT: %s but I could not inspect', 'VERDICT: %s.', 'VERDICT: %s - partial',
+                         'VERDICT: %s:', 'VERDICT: %s\tbecause', ' VERDICT: %s', '    VERDICT: %s', '\tVERDICT: %s',
+                         '**VERDICT: %s**', '> VERDICT: %s'):
+                for tail in ('', '\n\nF1 text\n'):
+                    with self.subTest(line=line % verdict, tail=bool(tail)):
+                        self.invalid(line % verdict + tail)
+        self.invalid("PLAN_RESULT: ACCEPT with caveats\n", stage='plan')
+        self.invalid("CODE_INSPECTION_RESULT: ACCEPT.\n", stage='code-inspection')
+        self.invalid("VERDICT: PASS but unchecked\n", stage=None)
+        with self.assertRaises(OSError):
+            self.module.stage_report('pr', 'VERDICT: PASS but I could not inspect')
+
+    def test_a_bare_first_line_verdict_is_accepted(self):
+        for text, result in (("VERDICT: PASS", 'CHECK_OK'), ("VERDICT: PASS\n\nlooks fine\n", 'CHECK_OK'),
+                             ("VERDICT: PASS   \nlooks fine\n", 'CHECK_OK'), ("\n\nVERDICT: BLOCK\nF1\n", 'CHECK_FAILED'),
+                             ("VERDICT: BLOCK\r\nF1\r\n", 'CHECK_FAILED')):
+            with self.subTest(text=text):
+                got = self.parse(text)
+                self.assertEqual(got['result'], result)
+                self.assertNotIn('[harness:', got['report'])
+        self.assertEqual(self.parse("PLAN_RESULT: ACCEPT\nok\n", stage='plan')['result'], 'CHECK_OK')
+        self.assertEqual(self.parse("CODE_INSPECTION_RESULT: BLOCK\nbad\n", stage='code-inspection')['result'],
+                         'CHECK_FAILED')
+        self.assertEqual(self.parse("PLAN_RESULT: ACCEPT\nok\n", stage=None)['result'], 'CHECK_OK')
+        self.assertTrue(self.module.stage_report('pr', 'VERDICT: PASS\nok').startswith('VERDICT: PASS\n'))
+
+    def test_hoist_verdict_itself_refuses_prose_and_leading_whitespace(self):
+        # each layer holds on its own: the hoist must not move such a line even though verdict_match would refuse it
+        for text in ("Summary.\n\nVERDICT: PASS but I could not inspect\n\nF1\n", "Summary.\n\nVERDICT: PASS.\n",
+                     "Summary.\n\n VERDICT: PASS\n\nF1\n", "Summary.\n\n  VERDICT: BLOCK\n\nF1\n",
+                     "Summary.\n\n**VERDICT: BLOCK**\n\nF1\n"):
+            with self.subTest(text=text):
+                self.assertEqual(self.module.hoist_verdict('pr', text), text)
+        self.assertTrue(self.module.hoist_verdict('pr', "Summary.\n\nVERDICT: PASS\n\nF1\n").startswith('VERDICT: PASS\n'))
+
     def test_a_first_line_verdict_is_untouched_and_a_quoted_marker_below_it_is_not_a_second_verdict(self):
         text = "VERDICT: BLOCK\nF1 says the packet's 'VERDICT: PASS' line was echoed.\n"
         result = self.parse(text)

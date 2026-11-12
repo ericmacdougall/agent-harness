@@ -128,12 +128,19 @@ def provider_usage(record):
 
 
 def verdict_match(stage, report):
+    """The verdict is the first non-blank line, and that line must be EXACTLY the stage's marker at column 0: only
+    trailing spaces, tabs or a CR are ignored. Anything after the marker on its line (prose, punctuation, a reason)
+    or before it (whitespace, a quote mark, decoration) is not a verdict (receipt r1 F1 on PR 211, goodqa#15723)."""
     prefix = {'pr': r'VERDICT: (PASS|BLOCK)', 'plan': r'PLAN_RESULT: (ACCEPT|BLOCK)',
               'code-inspection': r'CODE_INSPECTION_RESULT: (ACCEPT|BLOCK)'}
     if stage is None:
-        return re.match(r'^(?:VERDICT: (PASS|BLOCK)|(?:PLAN|CODE_INSPECTION)_RESULT: (ACCEPT|BLOCK))(?=\s|$)',
-                        report.strip())
-    return re.match('^' + prefix[stage] + r'(?=\s|$)', report.strip()) if stage in prefix else None
+        pattern = r'VERDICT: (PASS|BLOCK)|(?:PLAN|CODE_INSPECTION)_RESULT: (ACCEPT|BLOCK)'
+    elif stage in prefix:
+        pattern = prefix[stage]
+    else:
+        return None
+    first = next((line for line in report.split('\n') if line.strip()), '')
+    return re.fullmatch(pattern, first.rstrip(' \t\r'))
 
 
 ANY_MARKER = re.compile(r'(?:VERDICT|[A-Z_]*_RESULT)\s*:\s*(?:PASS|ACCEPT|BLOCK)')
