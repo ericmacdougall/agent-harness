@@ -390,6 +390,23 @@ class RedTeamRound2(Repo):
                 self.assertEqual(cg.busy_processes(str(self.linked)), expected)
 
     # F6: the delegated verifier has its own, larger, budget
+    def test_the_nested_repository_scan_is_bounded_by_what_is_left_of_the_budget(self):
+        (self.primary / ".git/info/exclude").write_text("node_modules/\n")
+        (self.linked / "node_modules").mkdir()
+        (self.linked / "node_modules" / "x.js").write_text("x\n")
+        seen = []
+        real = cg._nested_repo
+
+        def spy(directory, limit=250000, deep=False, seconds=1.5):
+            seen.append(seconds)
+            return real(directory, limit=limit, deep=deep, seconds=seconds)
+        tight = {"reproducible_clone": {"total_seconds": 6.0, "remote_seconds": 2.0, "scale": 15.0}}
+        with mock.patch.object(cg, "_nested_repo", spy):
+            self.assertIsNone(cg.linked_worktree_remove_refusal(str(self.linked), os.sep, tight))
+        self.assertTrue(seen, "the ignored build directory was not scanned")
+        self.assertLessEqual(max(seen), 6.0)  # never more than the budget has left, not 1.5 * 15 = 22.5 s
+        self.assertGreater(min(seen), 0.1)
+
     def test_the_verifier_uses_its_own_scaled_budget_and_the_hook_default_is_unchanged(self):
         seen = []
         real = cg._git_out
@@ -565,12 +582,40 @@ class Delegation(unittest.TestCase):
                        {"out": json.dumps({"removable": True, "removed": "maybe", "verifier": 2})}):
             with self.subTest(answer=str(answer)[:40]):
                 before = len(self.audit_rows())
-                with self.assertRaises(ah_worktree.WorktreeError):
+                with self.assertRaises(ah_worktree.WorktreeError) as caught:
                     self.remove(FakeRun(answer))
+                self.assertNoRemovalClaim(str(caught.exception))
                 rows = self.audit_rows()[before:]
                 self.assertEqual([row["event"] for row in rows], ["start", "result"])
                 self.assertIsNone(rows[1]["removed"])  # unknown: the remote command may have run
                 self.assertIn("unknown", rows[1]["why"])
+
+    def assertNoRemovalClaim(self, text):
+        """After the runner started the host may already have removed the tree: the message must say the outcome is
+        unknown and point at the host, and must never say that nothing was removed (red-team r4 F1)."""
+        lowered = text.lower()
+        for claim in ("nothing removed", "nothing was removed", "nothing is assumed removed", "not removed"):
+            self.assertNotIn(claim, lowered)
+        self.assertIn("unknown", lowered)
+        self.assertIn("check the host", lowered)
+
+    # red-team r4 F2: a null `removed` beside removable true is not a definite answer
+    def test_a_null_removed_beside_removable_true_is_an_unknown_outcome_not_a_failure(self):
+        for removed in (None, "missing"):
+            body = {"removable": True, "verifier": 2, "head": "a" * 40}
+            if removed != "missing":
+                body["removed"] = None
+            with self.subTest(removed=removed):
+                result = self.remove(FakeRun({"out": json.dumps(body)}))
+                row = self.audit_rows()[-1]
+                self.assertIsNone(row["removed"])
+                self.assertIsNone(result["removed"])
+                self.assertFalse(result["ok"])
+                self.assertIn("unknown", (row["why"] or "").lower())
+        # removable false with no removed key is a definite refusal: False
+        result = self.remove(FakeRun({"out": json.dumps({"removable": False, "verifier": 2, "reason": "not clean"})}))
+        self.assertIs(self.audit_rows()[-1]["removed"], False)
+        self.assertIs(result["removed"], False)
 
     def test_a_definite_answer_is_recorded_as_a_definite_outcome(self):
         self.remove(FakeRun(verdict(removable=False, removed=False, reason="the working tree is not clean")))
@@ -593,6 +638,8 @@ class Delegation(unittest.TestCase):
                 with self.assertRaises(ah_worktree.WorktreeError) as caught:
                     self.remove(FakeRun(answer))
                 self.assertEqual(caught.exception.code, "verifier_outdated")
+                self.assertNoRemovalClaim(str(caught.exception))  # {"removed": true} said it WAS removed
+                self.assertEqual(self.audit_rows()[-1]["removed"], None)
 
     def test_a_refusal_from_the_verifier_is_reported_not_overridden(self):
         run = FakeRun(verdict(removable=False, removed=False, reason="the working tree is not clean"))

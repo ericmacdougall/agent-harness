@@ -1604,7 +1604,7 @@ def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None):
                 if not (name.endswith('/') and (leaf in ignored_ok or (top_ignored and leaf in ignored_top_ok))):
                     return 'it holds an ignored file or folder that is not a whole regenerable build directory'
                 found = _nested_repo(os.path.join(path, name), limit=int(250000 * scale), deep=leaf not in ignored_ok,
-                                     seconds=1.5 * scale)
+                                     seconds=max(0.2, min(left(), 1.5 * scale)))  # inside the budget that is left
                 if found == 'large':
                     return 'an ignored build directory is too large to check for nested repositories in time'
                 if found:

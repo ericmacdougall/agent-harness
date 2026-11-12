@@ -85,19 +85,25 @@ VERIFY_SECONDS, SCAN_SECONDS, REMOVE_SECONDS, CONNECT_SECONDS, SLACK_SECONDS = 1
 CALL_TIMEOUT = VERIFY_SECONDS + SCAN_SECONDS + REMOVE_SECONDS + CONNECT_SECONDS + SLACK_SECONDS
 
 
+UNKNOWN = "the outcome is unknown: the removal may already have happened, check the host before retrying"
+
+
 def _call(runner, host, path, authenticated):
+    """Run the verifier. Once the runner has started, every failure here leaves the outcome UNKNOWN: the remote command
+    keeps running after an ssh client dies and a garbled answer may still come from a verifier that removed the tree,
+    so no message from here says that nothing was removed."""
     try:
         done = runner(_argv(host, path, authenticated), capture_output=True, text=True, timeout=CALL_TIMEOUT)
         data = json.loads(done.stdout)
     except (OSError, subprocess.SubprocessError, ValueError):
-        raise WorktreeError("host_unreachable", "could not run the verifier on %s" % host, 3)
+        raise WorktreeError("host_unreachable", "could not run the verifier on %s (%s)" % (host, UNKNOWN), 3)
     if not isinstance(data, dict) or not isinstance(data.get("removable"), bool):
-        raise WorktreeError("host_unreachable", "unexpected answer from the verifier on %s (nothing removed)" % host, 3)
+        raise WorktreeError("host_unreachable", "unexpected answer from the verifier on %s (%s)" % (host, UNKNOWN), 3)
     if data.get("verifier") != VERIFIER_VERSION:
         raise WorktreeError("verifier_outdated", "the verifier on %s is not version %d: install command_guard.py there "
-                            "(nothing was removed)" % (host, VERIFIER_VERSION), 3)
+                            "(%s)" % (host, VERIFIER_VERSION, UNKNOWN), 3)
     if data.get("removed") not in (None, True, False):
-        raise WorktreeError("host_unreachable", "malformed answer from %s (nothing is assumed removed)" % host, 3)
+        raise WorktreeError("host_unreachable", "malformed answer from %s (%s)" % (host, UNKNOWN), 3)
     return data
 
 
@@ -119,17 +125,25 @@ def remove(host, path, reason, authenticated=False, session="", agent="", home=N
         audit(home, {"event": "start", "run": run_id, "host": host, "path": path, "reason": reason,
                      "remote_auth": bool(authenticated), "caller": who})
     except OSError:
-        raise WorktreeError("audit_failed", "could not write the audit row; nothing was removed", 3)
+        raise WorktreeError("audit_failed", "could not write the audit row; nothing was run, nothing was removed", 3)
     # Once the runner has been started the outcome is UNKNOWN until the verifier answers: a killed ssh client does not stop
     # the remote command, so "no answer" is never recorded as "not removed" (removed: null).
     outcome = {"event": "result", "run": run_id, "host": host, "path": path, "removed": None,
                "why": "no answer from the verifier (outcome unknown)"}
     try:
         result = _call(runner, host, path, authenticated)
-        removed = result.get("removed") is True and result.get("removable") is True
+        # A definite outcome needs a definite answer: `removable: false` is a refusal (nothing ran); `removable: true`
+        # needs a real boolean `removed`, and a null or missing one is an unknown outcome (red-team r4 F2).
+        if result.get("removable") is False:
+            removed = False
+        elif isinstance(result.get("removed"), bool):
+            removed = result["removed"]
+        else:
+            removed = None
+        why = result.get("reason") if removed is not None else (result.get("reason") or "") + " (" + UNKNOWN + ")"
         outcome.update(removed=removed, head=result.get("head"), freed_bytes=result.get("freed_bytes"),
                        directory_removed=result.get("directory_removed"),
-                       registry_entry_left=result.get("registry_entry_left"), why=result.get("reason"))
+                       registry_entry_left=result.get("registry_entry_left"), why=why)
     except WorktreeError as error:
         outcome.update(why="%s: %s (outcome unknown, check the host)" % (error.code, error))
         raise
@@ -138,8 +152,9 @@ def remove(host, path, reason, authenticated=False, session="", agent="", home=N
             audit(home, outcome)
         except OSError:
             outcome["audit_warning"] = "the outcome row could not be written"
-    answer = {"ok": removed, "run": run_id, "host": host, "path": path, "removed": removed, "head": result.get("head"),
-              "freed_bytes": result.get("freed_bytes"), "reason": _redact(result.get("reason") or "") or None,
+    answer = {"ok": removed is True, "run": run_id, "host": host, "path": path, "removed": removed,
+              "head": result.get("head"), "freed_bytes": result.get("freed_bytes"),
+              "reason": _redact(outcome["why"] or "") or None,
               "directory_removed": result.get("directory_removed"),
               "registry_entry_left": result.get("registry_entry_left")}
     if "audit_warning" in outcome:
