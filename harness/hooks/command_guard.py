@@ -1324,6 +1324,17 @@ def _git_out(repo, args, timeout, stdin=None):
     return done.stdout.decode('utf-8', 'surrogateescape')
 
 
+def _git_try(repo, args, timeout):
+    """Like _git_out (same sanitized environment and flags) but returns (returncode, stdout, stderr) so a caller can tell
+    "not a git repository" from every other failure."""
+    done = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+                           '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always',
+                           '-c', 'protocol.ssh.allow=always', '-c', 'protocol.git.allow=always', '-C', repo] + list(args),
+                          capture_output=True, timeout=max(0.2, timeout), env=_clone_env())
+    return (done.returncode, done.stdout[:65536].decode('utf-8', 'surrogateescape'),
+            done.stderr[:4096].decode('utf-8', 'surrogateescape'))
+
+
 def _live_remote_refs(url, repo, timeout):
     """ref -> sha as the remote reports it now (read-only ls-remote). Replaced in tests."""
     out = _git_out(repo, ['ls-remote', '--heads', '--tags', '--', url], timeout)
@@ -1392,7 +1403,8 @@ def _per_worktree_items_refusal(listing):
             if not has_value or word not in _FALSE_WORDS:
                 return 'a per-worktree config makes the worktree bare'
             continue
-        return 'a per-worktree config sets %s' % re.sub(r'[^\x21-\x7e]', '?', key)[:60]
+        return 'a per-worktree config sets %s.%s' % (re.sub(r'[^a-z0-9_-]', '?', key.partition('.')[0])[:20],
+                                                      re.sub(r'[^a-z0-9_-]', '?', key.rsplit('.', 1)[-1])[:30])  # never a subsection: it can hold a URL with a token
     return None
 
 
@@ -1406,13 +1418,18 @@ def _per_worktree_config_refusal(path, common, git_dir, cwd, step):
     decide it."""
     files = [os.path.join(common, 'config.worktree'), os.path.join(git_dir, 'config.worktree')]
     if cwd and os.path.isdir(cwd):
-        try:
-            lines = _git_out(cwd, ['rev-parse', '--path-format=absolute', '--absolute-git-dir', '--git-common-dir'],
-                             step(2.0)).splitlines()
-            if len(lines) >= 2 and os.path.realpath(lines[1]) == os.path.realpath(common):
-                files.append(os.path.join(os.path.realpath(lines[0]), 'config.worktree'))
-        except ValueError:
-            pass  # the caller is not inside a repository
+        # The caller's own file is vetted whenever the caller stands inside ANY repository: comparing its common directory
+        # with ours by path text is fooled by a case spelling or a firmlink on macOS (red-team F1), so no match is tried.
+        # Only git's own "not a git repository" lets the lookup be skipped; any other failure or odd output refuses.
+        code, out, err = _git_try(cwd, ['rev-parse', '--path-format=absolute', '--absolute-git-dir'], step(2.0))
+        if code != 0:
+            if 'not a git repository' not in err.lower():
+                return 'could not determine the calling worktree'
+        else:
+            lines = out.splitlines()
+            if len(lines) != 1 or not lines[0].startswith('/'):
+                return 'could not determine the calling worktree'
+            files.append(os.path.join(os.path.realpath(lines[0]), 'config.worktree'))
     seen = set()
     for file in files:
         if file in seen:

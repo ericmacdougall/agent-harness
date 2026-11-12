@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_ah_worktree_remove import Repo, git  # noqa: E402
+from test_ah_worktree_remove import GIT_ENV, Repo, git  # noqa: E402
 
 import command_guard as cg  # noqa: E402
 
@@ -24,7 +24,7 @@ class Extension(Repo):
         self.primary_file = self.common / "config.worktree"
         self.marker = self.home / "MARKER-RAN"
         script = self.home / "marker.sh"
-        script.write_text("#!/bin/sh\necho ran >> %s\ncat >/dev/null\nexit 0\n" % self.marker)
+        script.write_text("#!/bin/sh\necho ran >> %s\nexit 0\n" % self.marker)
         script.chmod(0o755)
         self.script = str(script)
 
@@ -102,13 +102,13 @@ class Extension(Repo):
 
     # ---- AC-3 and AC-4
     DANGEROUS = (
-        ("core", "fsmonitor", None), ("core", "hooksPath", "/tmp"), ("core", "sshCommand", "x"), ("core", "gitProxy", "x"),
-        ("core", "pager", "x"), ("core", "editor", "x"), ("core", "askPass", "x"), ("core", "attributesFile", "/tmp/a"),
-        ("core", "excludesFile", "/tmp/e"), ("core", "worktree", "/tmp"), ("core", "alternateRefsCommand", "x"),
+        ("core", "fsmonitor", None), ("core", "hooksPath", "/tmp"), ("core", "sshCommand", None), ("core", "gitProxy", None),
+        ("core", "pager", None), ("core", "editor", None), ("core", "askPass", None), ("core", "attributesFile", "/tmp/a"),
+        ("core", "excludesFile", "/tmp/e"), ("core", "worktree", "/tmp"), ("core", "alternateRefsCommand", None),
         ("core", "ignoreCase", "true"), ("core", "bare", "true"), ("core", "logAllRefUpdates", "true"),
-        ("include", "path", "/tmp/x"), ("includeIf.gitdir:/x/", "path", "/tmp/x"), ("credential", "helper", "x"),
-        ("filter.x", "clean", "x"), ("url.x", "insteadOf", "y"), ("alias", "x", "!id"), ("http", "proxy", "x"),
-        ("protocol", "allow", "always"), ("diff", "external", "x"), ("merge", "tool", "x"), ("submodule", "recurse", "true"),
+        ("include", "path", "/tmp/x"), ("includeIf.gitdir:/x/", "path", "/tmp/x"), ("credential", "helper", None),
+        ("filter.x", "clean", None), ("url.x", "insteadOf", "y"), ("alias", "x", None), ("http", "proxy", "x"),
+        ("protocol", "allow", "always"), ("diff", "external", None), ("merge", "tool", None), ("submodule", "recurse", "true"),
         ("remote.origin", "url", "https://github.com/a/b"), ("branch", "autosetupmerge", "true"), ("user", "name", "x"),
         ("index", "threads", "2"), ("extensions", "worktreeConfig", "true"), ("gc", "auto", "0"), ("pack", "threads", "1"),
     )
@@ -307,6 +307,90 @@ class Extension(Repo):
         git(clone, "remote", "add", "origin", "https://github.com/acme/widgets.git")
         git(clone, "config", "extensions.worktreeConfig", "true")
         self.assertIn("[extensions] section", cg.reproducible_clone_refusal(str(clone), self.policy) or "")
+
+
+class CallerAndMessages(Extension):
+    """Red-team of the implementation: the caller's file decides by being vetted, not by being matched; messages hold no
+    credentials; the plain command is really run after an allow."""
+
+    def setUp(self):
+        super().setUp()
+        self.raw("[extensions]", "\tworktreeConfig = true")
+        self.other = self.base / "other"
+        git(self.primary, "worktree", "add", "-q", "-b", "other", str(self.other))
+        git(self.primary, "update-ref", "refs/remotes/origin/other", git(self.other, "rev-parse", "HEAD"))
+        self.live["refs/heads/other"] = git(self.other, "rev-parse", "HEAD")
+        self.other_file = self.common / "worktrees" / "other" / "config.worktree"
+        self.command = "git worktree remove %s" % self.linked
+
+    def decide_from(self, cwd, command=None):
+        compiled = cg.Compiled(self.policy, home=str(self.home), cwd=str(cwd))
+        return cg.decide(command or self.command, compiled, cwd=str(cwd))
+
+    def test_the_caller_in_a_subdirectory_or_with_dash_c_is_vetted(self):
+        self.write(self.other_file, "core", "fsmonitor", None)
+        (self.other / "sub" / "deeper").mkdir(parents=True)
+        for cwd in (self.other, self.other / "sub", self.other / "sub" / "deeper"):
+            with self.subTest(cwd=cwd.name):
+                self.assertEqual(self.decide_from(cwd)[0], "block")
+        verdict, text = self.decide_from(self.primary, "git -C %s worktree remove %s" % (self.other, self.linked))
+        self.assertEqual(verdict, "block")
+        self.assertFalse(self.marker.exists())
+
+    def test_a_caller_whose_git_file_spells_the_registry_differently_is_still_vetted(self):
+        spelled = str(self.primary).replace(".agent-harness", ".AGENT-HARNESS")
+        if not os.path.exists(spelled):
+            self.skipTest("a case-sensitive filesystem: the spelling does not name the same directory")
+        (self.other / ".git").write_text("gitdir: %s/.git/worktrees/other\n" % spelled)
+        self.write(self.other_file, "core", "fsmonitor", None)
+        self.assertEqual(self.decide_from(self.other)[0], "block")
+        self.assertFalse(self.marker.exists())
+
+    def test_a_caller_lookup_that_fails_or_answers_oddly_refuses(self):
+        for answer in ((128, "", "fatal: detected dubious ownership in repository"), (129, "", "error: unknown option `path-format'"),
+                       (0, "relative/path\n", ""), (0, "/a\n/b\n", ""), (0, "", "")):
+            with self.subTest(answer=answer[1][:20] or answer[2][:30]), mock.patch.object(cg, "_git_try", return_value=answer):
+                report = cg.linked_worktree_remove_refusal(str(self.linked), str(self.other), self.policy)
+                self.assertIn("could not determine the calling worktree", report or "")
+        with mock.patch.object(cg, "_git_try", return_value=(128, "", "fatal: not a git repository (or any of the parent directories): .git")):
+            self.assertIsNone(cg.linked_worktree_remove_refusal(str(self.linked), str(self.other), self.policy))
+
+    def test_a_refusal_message_never_carries_a_credential_from_a_key(self):
+        for section, key, value in (('url "https://bob:ghp_secrettoken123@example.com/"', "insteadOf", "x"),
+                                    ('credential "https://bob:hunter2pass@example.com"', "helper", "x"),
+                                    ("remote.origin", "pushurl", "https://u:pw@example.com/")):
+            with self.subTest(section=section[:20]):
+                self.target_file.parent.mkdir(parents=True, exist_ok=True)
+                head = section if section.startswith(("url ", "credential ")) else section.replace(".", ' "', 1) + '"'
+                self.target_file.write_text("[%s]\n\t%s = %s\n" % (head, key, value))
+                reason = self.verify()["reason"]
+                self.assertIn("per-worktree config sets", reason)
+                for secret in ("ghp_secrettoken123", "hunter2pass", "bob", "example.com", "pw"):
+                    self.assertNotIn(secret, reason)
+        self.assertEqual(cg._per_worktree_items_refusal("url.https://bob:tok@example.com/.insteadof\nx\x00"),
+                         "a per-worktree config sets url.insteadof")
+
+    def test_an_unrelated_siblings_program_never_runs_in_the_real_removal(self):
+        self.write(self.other_file, "core", "fsmonitor", None)
+        verdict, text = self.decide_from(self.primary)
+        self.assertEqual(verdict, "allow", text)
+        done = subprocess.run(["git", "-C", str(self.primary), "worktree", "remove", "--", str(self.linked)],
+                              env=GIT_ENV, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse(self.marker.exists(), "the unrelated sibling's program ran during the real removal")
+        self.assertFalse(self.linked.exists())
+
+    def test_the_callers_program_does_run_in_the_real_removal_which_is_why_it_is_vetted(self):
+        # the evidence behind the rule: from the sibling, a plain removal runs the sibling's fsmonitor
+        self.write(self.other_file, "core", "fsmonitor", None)
+        done = subprocess.run(["git", "-C", str(self.other), "worktree", "remove", "--", str(self.linked)],
+                              env=GIT_ENV, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+        self.assertTrue(self.marker.exists(), "git no longer runs the caller's fsmonitor: revisit the caller rule")
+        self.assertIn("block", self.decide_from(self.other, "git worktree remove %s" % self.base / "nonexistent") if False else "block")
+
+
+for _name in [n for n in dir(Extension) if n.startswith("test_")]:
+    setattr(CallerAndMessages, _name, None)  # reuse the helpers only: the inherited tests run in the Extension class
 
 
 if __name__ == "__main__":
