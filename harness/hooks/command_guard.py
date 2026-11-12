@@ -1885,23 +1885,35 @@ def authenticated_remote_refs(url, repo, timeout):
 
 
 def _proc_status(pid):
-    """{'name': Name, 'uid': real uid} from /proc/PID/status, which any user can read whatever the process set about
+    """{'name': Name, 'uid': real uid, 'ppid': parent pid} from /proc/PID/status, which any user can read whatever the process set about
     being inspected; 'gone' when the process has exited; None when it cannot be read or parsed. The real uid is used, not
     the owner of /proc/PID: a same-user process that made itself non-dumpable shows /proc/PID owned by root, and the
     owner would call it another user's (red-team F4)."""
     try:
-        name = uid = None
+        name = uid = ppid = None
         with open('/proc/%s/status' % pid) as handle:
             for line in handle:
                 if line.startswith('Name:'):
                     name = line.partition(':')[2].strip()
                 elif line.startswith('Uid:'):
                     uid = int(line.partition(':')[2].split()[0])
-        return {'name': name, 'uid': uid} if uid is not None else None
+                elif line.startswith('PPid:'):
+                    ppid = int(line.partition(':')[2].split()[0])
+        return {'name': name, 'uid': uid, 'ppid': ppid} if uid is not None else None
     except (FileNotFoundError, ProcessLookupError):
         return 'gone'
     except (OSError, ValueError, IndexError):
         return None
+
+
+def _proc_cmd0(pid):
+    """The basename of argv[0] from /proc/PID/cmdline (world readable), or None when it cannot be read or is empty."""
+    try:
+        with open('/proc/%s/cmdline' % pid, 'rb') as handle:
+            first = handle.read(4096).split(b'\x00')[0]
+    except OSError:
+        return None
+    return os.path.basename(first.decode('utf-8', 'replace')) or None
 
 
 def busy_scan(path, skip_names=()):
@@ -1933,12 +1945,23 @@ def busy_scan(path, skip_names=()):
                             result['failed'] = True  # an identity we cannot determine is a process we could not see
                             return result
                         if status['uid'] != os.getuid():
-                            continue  # the documented limit: other users processes are invisible without root
-                        # A same-user process whose cwd link is unreadable (a daemon that dropped dumpability or lives under
-                        # another security profile: ssh-agent, gpg-agent, tailscaled, systemd, docker on t2-dev) is skipped
-                        # only when its exact /proc name is in the policy list, which names services, never a shell or an
-                        # agent; any other process (a shell run through sg or sudo) is reported, and refuses.
-                        if skip_names and status['name'] in skip_names:
+                            # Another user's process is invisible without root (the documented limit). A process whose real uid
+                            # is 0 and whose parent is a process of THIS user (sudo -s, sudo -i run from the callers shell) is
+                            # the caller's own work, not a daemon: it is listed and refuses. A boot-time root daemon (parent
+                            # root or init) and a kernel thread (parent 0 or 2) are skipped; a parent that cannot be read
+                            # does not make a root process skippable.
+                            if status['uid'] == 0 and status.get('ppid') not in (0, 2):
+                                parent = _proc_status(str(status.get('ppid')))
+                                if not isinstance(parent, dict) or parent['uid'] == os.getuid():
+                                    result['unreadable'].append((int(entry), status['name'] or '?'))
+                            continue
+                        # A same-user process whose cwd link is unreadable is skipped only for the few programs that are known
+                        # to change to / when they start (the user systemd manager, ssh-agent): the process Name must be on the
+                        # policy list AND the command line (argv[0] basename) must agree. comm can be set by the process itself
+                        # (prctl PR_SET_NAME, exec -a) and so can argv[0]: this protects against accident, not against a
+                        # hostile same-user process; it is a standing limit, not a control. Anything else (a shell run through
+                        # sg, the docker client, a helper, any other name, an unreadable command line) is reported and refuses.
+                        if skip_names and status['name'] in skip_names and _proc_cmd0(entry) == status['name']:
                             continue
                         result['unreadable'].append((int(entry), status['name'] or '?'))
                         continue
@@ -1990,8 +2013,7 @@ VERIFY_SECONDS = 120.0
 REMOVE_SECONDS = 900
 WORKTREE_POLICY = {'reproducible_clone': {'total_seconds': VERIFY_SECONDS, 'remote_seconds': 30.0, 'scale': 15.0,
                                          'allow_hooks': True,
-                                         'busy_skip_names': ('systemd', '(sd-pam)', 'ssh-agent', 'gpg-agent', 'tailscaled',
-                                                             'docker')}}
+                                         'busy_skip_names': ('systemd', 'ssh-agent')}}
 
 
 def delegated_policy(base=None):

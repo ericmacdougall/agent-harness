@@ -276,7 +276,7 @@ class OtherUsersProcesses(Repo):
         self.assertEqual(self.scan({"111": errno.ESRCH}, {}, ["111"]), [])
 
     # the real t2-dev scan: same-user daemons (ssh-agent, gpg-agent, tailscaled, systemd, sd-pam, docker) cannot be read
-    def scan_names(self, readlinks, owners, names, skip, listing):
+    def scan_names(self, readlinks, owners, names, skip, listing, cmds=None, ppids=None):
         real_isdir = os.path.isdir
 
         def link(path):
@@ -286,10 +286,16 @@ class OtherUsersProcesses(Repo):
             return value
 
         def status(pid):
-            return {"name": names.get(str(pid)), "uid": owners[str(pid)]}
+            if str(pid) not in owners:
+                return "gone"
+            return {"name": names.get(str(pid)), "uid": owners[str(pid)], "ppid": (ppids or {}).get(str(pid), 1)}
+
+        def cmd0(pid):
+            return (cmds or {}).get(str(pid), names.get(str(pid)))
         with mock.patch.object(cg.os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
                 mock.patch.object(cg.os, "listdir", lambda p: list(listing) if p == "/proc" else []), \
-                mock.patch.object(cg.os, "readlink", link), mock.patch.object(cg, "_proc_status", status):
+                mock.patch.object(cg.os, "readlink", link), mock.patch.object(cg, "_proc_status", status), \
+                mock.patch.object(cg, "_proc_cmd0", cmd0, create=True):
             return cg.busy_processes(str(self.linked), skip)
 
     def test_a_same_user_unreadable_process_is_skipped_only_when_its_name_is_in_the_skip_list(self):
@@ -304,12 +310,78 @@ class OtherUsersProcesses(Repo):
         self.assertEqual(self.scan_names({"111": errno.EACCES, "222": str(self.linked) + "/x"}, {"111": me, "222": me},
                                          {"111": "ssh-agent"}, ("ssh-agent",), ["111", "222"]), [(222, "pid")])
 
+    # receipt r1 on PR 214, F1: the docker CLIENT is a user workload, never a service
+    def test_an_unreadable_same_user_docker_process_refuses_even_with_the_delegated_list(self):
+        me = os.getuid()
+        names = cg.WORKTREE_POLICY["reproducible_clone"]["busy_skip_names"]
+        for name in ("docker", "docker-compose", "docker-buildx", "dockerd", "sg", "bash", "tailscaled", "gpg-agent", "(sd-pam)"):
+            with self.subTest(name=name):
+                self.assertIsNone(self.scan_names({"111": errno.EACCES}, {"111": me}, {"111": name}, names, ["111"]))
+        # the two listed programs are skipped only when their command line agrees with the name
+        for name in names:
+            self.assertEqual(self.scan_names({"111": errno.EACCES}, {"111": me}, {"111": name}, names, ["111"]), [])
+
+    # receipt r1 on PR 214, F3: comm can be set by the process, so the command line must agree too (a limit, not a proof)
+    def test_a_listed_name_is_skipped_only_when_the_command_line_agrees_and_the_limit_is_documented(self):
+        me = os.getuid()
+        names = cg.WORKTREE_POLICY["reproducible_clone"]["busy_skip_names"]
+        spoofed = self.scan_names({"111": errno.EACCES}, {"111": me}, {"111": "systemd"}, names, ["111"], cmds={"111": "bash"})
+        self.assertIsNone(spoofed)
+        unreadable_cmdline = self.scan_names({"111": errno.EACCES}, {"111": me}, {"111": "ssh-agent"}, names, ["111"],
+                                             cmds={"111": None})
+        self.assertIsNone(unreadable_cmdline)
+        honest = self.scan_names({"111": errno.EACCES}, {"111": me}, {"111": "ssh-agent"}, names, ["111"], cmds={"111": "ssh-agent"})
+        self.assertEqual(honest, [])
+        source = (Path(cg.__file__)).read_text()
+        self.assertIn("comm can be set by the process", source)  # the standing limit is written where the skip is decided
+
+    def test_the_command_line_reader_returns_the_basename_of_argv_zero(self):
+        import io
+
+        def fake_open(path, mode="r", *args, **kwargs):
+            self.assertEqual(path, "/proc/4242/cmdline")
+            return io.BytesIO(b"/usr/bin/ssh-agent\x00-s\x00")
+        with mock.patch.object(cg, "open", fake_open, create=True):
+            self.assertEqual(cg._proc_cmd0("4242"), "ssh-agent")
+
+        def empty(path, mode="r", *args, **kwargs):
+            return io.BytesIO(b"")
+
+        def broken(path, mode="r", *args, **kwargs):
+            raise OSError(errno.EACCES, "denied")
+        with mock.patch.object(cg, "open", empty, create=True):
+            self.assertIsNone(cg._proc_cmd0("4242"))
+        with mock.patch.object(cg, "open", broken, create=True):
+            self.assertIsNone(cg._proc_cmd0("4242"))
+
+    # receipt r1 on PR 214, F2: a root shell started from the callers own shell (sudo -s, sudo -i) is not another user's
+    def test_an_unreadable_root_process_whose_parent_is_the_caller_refuses_but_a_boot_time_root_daemon_is_skipped(self):
+        me = os.getuid()
+        names = cg.WORKTREE_POLICY["reproducible_clone"]["busy_skip_names"]
+        sudo_shell = self.scan_names({"500": errno.EACCES}, {"500": 0, "400": me}, {"500": "bash", "400": "sudo"}, names,
+                                     ["500"], ppids={"500": 400})
+        self.assertIsNone(sudo_shell)  # real uid 0, parent is the callers sudo: refused and named
+        daemon = self.scan_names({"500": errno.EACCES}, {"500": 0, "1": 0}, {"500": "sshd", "1": "systemd"}, names, ["500"],
+                                 ppids={"500": 1})
+        self.assertEqual(daemon, [])
+        kernel = self.scan_names({"500": errno.EACCES}, {"500": 0}, {"500": "kworker"}, names, ["500"], ppids={"500": 2})
+        self.assertEqual(kernel, [])
+        # a parent that cannot be read is not a reason to skip a root process: fail closed
+        unknown_parent = self.scan_names({"500": errno.EACCES}, {"500": 0}, {"500": "bash"}, names, ["500"],
+                                         ppids={"500": 400})
+        self.assertIsNone(unknown_parent)
+        other_user = self.scan_names({"500": errno.EACCES}, {"500": me + 1}, {"500": "bash"}, names, ["500"])
+        self.assertEqual(other_user, [])  # another non-root user stays skipped
+
     def test_the_delegated_policy_carries_the_standard_daemon_names_and_the_hook_default_has_none(self):
         names = cg.WORKTREE_POLICY["reproducible_clone"]["busy_skip_names"]
-        for daemon in ("systemd", "(sd-pam)", "ssh-agent", "gpg-agent", "tailscaled", "docker"):
-            self.assertIn(daemon, names)
-        for shell in ("bash", "zsh", "sh", "node", "python3", "claude", "git", "vim", "tmux"):
-            self.assertNotIn(shell, names)
+        # only programs that are known to chdir to / at start (the user systemd manager and ssh-agent); the rest of the
+        # first draft (docker, gpg-agent, tailscaled, (sd-pam)) had no such evidence: the docker CLIENT is a user workload
+        # started inside project directories (receipt r1 on PR 214, F1)
+        self.assertEqual(tuple(names), ("systemd", "ssh-agent"))
+        for not_a_service in ("docker", "docker-compose", "dockerd", "gpg-agent", "tailscaled", "(sd-pam)", "bash", "zsh",
+                              "sh", "node", "python3", "claude", "git", "vim", "tmux", "sg", "sudo"):
+            self.assertNotIn(not_a_service, names)
         self.assertNotIn("busy_skip_names", cg.DEFAULT_POLICY["reproducible_clone"])
         seen = []
         real = cg.busy_scan
@@ -323,9 +395,9 @@ class OtherUsersProcesses(Repo):
         def fake_open(path, *args, **kwargs):
             opened.append(path)
             import io
-            return io.StringIO("Name:\tssh-agent\nUmask:\t0022\nUid:\t1000\t0\t0\t0\nGid:\t1000\t1000\t1000\t1000\n")
+            return io.StringIO("Name:\tssh-agent\nUmask:\t0022\nPPid:\t77\nUid:\t1000\t0\t0\t0\nGid:\t1000\t1000\t1000\t1000\n")
         with mock.patch.object(cg, "open", fake_open, create=True):
-            self.assertEqual(cg._proc_status("4242"), {"name": "ssh-agent", "uid": 1000})
+            self.assertEqual(cg._proc_status("4242"), {"name": "ssh-agent", "uid": 1000, "ppid": 77})
         self.assertEqual(opened, ["/proc/4242/status"])  # never /proc/PID/cwd, whose stat would follow the link and fail
 
         def gone(path, *args, **kwargs):
