@@ -100,10 +100,12 @@ Checkpoint: not required (under 10 min per step); every step is idempotent (a re
 
 ## Reviews
 
-Spec core sha256: `d5760e67f95efd7721d177ce878d1c9af97a8f684627b8618c5449c8842cb80b`
+Spec core sha256: `ff8b5ff6ea84b532774e2d727bfaa082d6f6f4ebfcd328b9216104e1f0b27381`
 
 | Role | Verdict | Reviewer | Kind | Source | Bound to |
 |---|---|---|---|---|---|
+| adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | stale |
+| acceptance | ACCEPT | a5d878417503c1093 (red-team) | agent | WAL-verified red-team agent | stale |
 | adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | stale |
 | acceptance | ACCEPT | a5d878417503c1093 (red-team) | agent | WAL-verified red-team agent | stale |
 | adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | current |
