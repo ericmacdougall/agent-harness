@@ -402,7 +402,7 @@ def dispatch_summary(state, rung, policy):
             'fingerprint': excluded[-1].get('fingerprint')} if excluded else None},
         'would_exclude_below_rung': {'count': len(would), 'latest': {
             'seq': would[-1].get('seq'), 'note': 'counted: caps.dispatch_exclude_below_rung is false'} if would else None},
-        'exclusion_enabled': bool(policy.get('caps', {}).get('dispatch_exclude_below_rung')),
+        'exclusion_enabled': tiers.cap_on(policy, 'dispatch_exclude_below_rung'),
         'below_rung_dispatches': sum(1 for d in considered if d.get('owner') and d.get('phase') == 'closed'
                                      and match_of(d.get('candidates'), rung, policy) == 'below'),
         'counted_requested_below': {'count': len(requested), 'latest': {
@@ -923,7 +923,7 @@ class Ledger:
         if not isinstance(agent_id, str) or not AGENT_ID.fullmatch(agent_id):
             return False
         effort = effort if effort in EFFORTS else None
-        narrow = bool(self.policy.get('caps', {}).get('dispatch_narrow_by_stop_effort'))
+        narrow = tiers.cap_on(self.policy, 'dispatch_narrow_by_stop_effort')
         fd = self._lock(task)
         try:
             state, _ = self._read(task)
@@ -1019,7 +1019,8 @@ class Ledger:
                 excluded, check, owners = dispatch_decision(state, before['rung'], self.policy)
                 # PR 225 receipt F1: the exclusion is off until caps.dispatch_exclude_below_rung is true (main flips it
                 # after the AC-8 live proof). Until then the decision is recorded as would_exclude and the FAIL counts.
-                if excluded and not self.policy.get('caps', {}).get('dispatch_exclude_below_rung'):
+                # r8 A1-1: only the JSON value true turns it on; a quoted "false" stays off.
+                if excluded and not tiers.cap_on(self.policy, 'dispatch_exclude_below_rung'):
                     excluded, check['decision'] = False, 'would_exclude'
                     while len(json.dumps(check, separators=(',', ':'))) > 256 and check['ids']:
                         check['ids'].pop(0); check['models'].pop(0)
