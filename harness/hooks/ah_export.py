@@ -22,6 +22,7 @@ The command fails closed: no redactor, an unsafe target or an oversized page mea
 
 from __future__ import annotations
 
+import bisect
 import html
 import json
 import os
@@ -68,6 +69,33 @@ _SYNC_DIRS = ("library/cloudstorage", "library/mobile documents")
 _WARN_DIRS = ("desktop", "documents")
 
 
+_TOKEN_RUN = re.compile(r"[A-Za-z0-9_+/=.-]{16,}")
+
+
+def _mask_rejoined(value: str) -> str:
+    """Remove _CONTROL characters; a token-like run of 16+ characters that held or touched a removed one becomes
+    [REDACTED:split]. A short word next to a removed character is kept."""
+    out, marks, pos, length = [], [], 0, 0
+    for match in _CONTROL.finditer(value):
+        out.append(value[pos:match.start()])
+        length += match.start() - pos
+        pos = match.end()
+        marks.append(length)  # sorted offsets in the joined string where a character was removed
+    out.append(value[pos:])
+    joined = "".join(out)
+    if not marks:
+        return joined
+    pieces, last = [], 0
+    for run in _TOKEN_RUN.finditer(joined):
+        i = bisect.bisect_left(marks, run.start())
+        if i < len(marks) and marks[i] <= run.end():
+            pieces.append(joined[last:run.start()])
+            pieces.append("[REDACTED:split]")
+            last = run.end()
+    pieces.append(joined[last:])
+    return "".join(pieces)
+
+
 def _load_redactor():
     import redact  # noqa: PLC0415 - loaded at use so a missing redactor is a refusal, not an import crash
     if not callable(getattr(redact, "redact", None)) or not isinstance(getattr(redact, "_KEYS", None), str):
@@ -84,10 +112,12 @@ class _Scrubber:
             value = json.dumps(value, default=str, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
         value = value[:PRE_TRIM]
         before = value.count("[REDACTED:")
-        # Redact, remove controls, redact again: the first pass catches a token whose word boundary is a control
-        # character (word + CR + token), the second one a token that an invisible character split and the removal
-        # rejoined (acceptance r6 re-ack and adversarial delta finding 12). redact() skips existing placeholders.
-        value = self.redact(_CONTROL.sub("", self.redact(value)))
+        # Redact, remove controls, mask rejoined runs, redact again. Pass 1 catches a token whose word boundary is a
+        # control character (word + CR + token). Removal rejoins a token an invisible character split, but can also
+        # glue it to the word before it, defeating redact.py's leading \b (adversarial r7 delta), so any long
+        # token-like run that contained or touched a removed character is masked whole; over-redaction is accepted.
+        # Pass 2 catches the rest. redact() skips existing placeholders.
+        value = self.redact(_mask_rejoined(self.redact(value)))
         self.redactions += max(0, value.count("[REDACTED:") - before)
         value = _EMAIL.sub("[email]@", value)
         value = _HOME.sub("~", value)

@@ -217,9 +217,18 @@ class Redaction(Base):
         # Acceptance r6 re-ack: a control that is the token's only word boundary must not be removed first.
         joiners = ('\r', '\x0b', '\x0c', '\x1b', '​')
         notes += ['progress done' + ch + GITHUB2 for ch in joiners]
+        # Adversarial r7 delta: a removable character both before the prefix and inside the token.
+        for before in ('\r', '​'):
+            notes.append('done' + before + ANTHROPIC[:7] + '​' + ANTHROPIC[7:])
+            notes.append('done' + before + GITHUB2[:4] + '​' + GITHUB2[4:])
+        notes.append('keep' + '​' + 'short words')
         jl(self.w / 'agent-owner1.jsonl', [{'at': iso(NOW - 300 + i), 'event': 'status', 'note': n}
                                            for i, n in enumerate(notes)])
         raw = self.html(self.export())
+        self.assertIn('keepshort words', raw)  # a short word beside a removed character is not over-redacted
+        self.assertIn('[REDACTED:split]', raw)
+        for seg in segments(ANTHROPIC, 12):
+            self.assertNotIn(seg, raw, repr(seg))
         for secret in (GITHUB, GITHUB2):
             for seg in segments(secret, 4):
                 self.assertNotIn(seg, raw, repr(seg))
