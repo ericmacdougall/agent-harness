@@ -188,9 +188,13 @@ class StampBinding(Base):
         self.assertEqual(self.stamps(), [])
 
     def test_the_documented_isolated_python_form_mints(self):
+        # python3.N mints only when this host can find it (rescue PR 207 M1: python3.99 left an orphan stamp), so the
+        # python3.12 case pretends it is on PATH; python3 itself is the real lookup.
+        real_which = mg.shutil.which
+        found = lambda name, *a, **k: "/usr/bin/python3.12" if name == "python3.12" else real_which(name, *a, **k)  # noqa: E731
         for command in (PLAIN.replace("python3 ", "python3 -I ", 1), PLAIN.replace("python3 ", "python3 -I -B ", 1),
                         PLAIN.replace("python3 ", "python3.12 ", 1)):
-            with self.subTest(command=command[:40]):
+            with self.subTest(command=command[:40]), mock.patch.object(mg.shutil, "which", side_effect=found):
                 self.decide_as(command, main=True)
                 self.assertEqual(len(self.stamps()), 1)
                 self.record()
@@ -260,6 +264,104 @@ class StampBinding(Base):
             code, text = mg.decide(payload, FakeGh(SCENARIOS["green"]), self.state)
             self.assertEqual(code, 0, text)
             self.assertEqual(len(self.stamps()), 1)
+
+
+class OrphanedStamps(Base):
+    """Red-team PR 207 M1/L1 (rescue): the hook mints before the shell runs, so a command the shell runs differently,
+    or not at all, must mint nothing. Each negative case here left a live stamp on 587627b."""
+
+    decide_as = StampBinding.decide_as
+    record = StampBinding.record
+    stamps = StampBinding.stamps
+
+    def assert_no_stamp(self, command, expect_code=None):
+        for leftover in self.state.rglob("*.json"):
+            leftover.unlink()
+        code, text = self.decide_as(command, main=True)
+        if expect_code is not None:
+            self.assertEqual(code, expect_code, text)
+        self.assertEqual(self.stamps(), [])
+        return code, text
+
+    def test_m1_shell_rewrites_mint_nothing(self):
+        other_head = "b" * 40
+        cases = {
+            "comment hides the head": PLAIN.replace(" --head " + HEAD, "") + " --approved-by # --head " + HEAD,
+            "brace expansion adds a second head": PLAIN + " --approved-by {main:x,--head=" + other_head + "}",
+            "ANSI-C quoting": PLAIN + " --approved-by $'\\x2d\\x2dhead'",
+            "carriage return inside a word": PLAIN.replace(" --head " + HEAD, " --head " + HEAD + "\r--approved-by\rx"),
+            "zsh unmatched glob": PLAIN + " --approved-by x*zzqq",
+            "question-mark glob": PLAIN + " --approved-by x?zzqq",
+            "bracket glob": PLAIN + " --approved-by x[a]zzqq",
+            "zsh equals expansion": PLAIN + " --approved-by =nosuchcmdzzqq",
+            "tilde unknown user": PLAIN + " --approved-by ~nosuchuserzzqq",
+            "dollar variable": PLAIN + " --approved-by main:$USER",
+            "tab control character": PLAIN + "\t--approved-by x",
+            "zsh glob qualifier parenthesis": PLAIN + " --approved-by x(N)",
+        }
+        for label, command in cases.items():
+            with self.subTest(label):
+                self.assert_no_stamp(command)
+
+    def test_m1_wrong_program_mints_nothing(self):
+        cases = {
+            "missing script path": PLAIN.replace("~/.claude/hooks/merge_gate.py", "/nonexistent/dir/merge_gate.py"),
+            "relative script path": PLAIN.replace("~/.claude/hooks/merge_gate.py", "merge_gate.py"),
+            "missing interpreter": PLAIN.replace("python3 ", "python3.99 ", 1),
+            "interpreter path that does not exist": PLAIN.replace("python3 ", "/nonexistent/bin/python3 ", 1),
+        }
+        for label, command in cases.items():
+            with self.subTest(label):
+                self.assert_no_stamp(command)
+
+    def test_m1_a_command_the_hook_itself_blocks_mints_nothing(self):
+        # The reason text reads as a merge to find_merges, so decide() blocks the command; it never runs.
+        command = PLAIN.replace("'approved by main after review'", "'gh pr merge 7 -R o/r needs this'")
+        self.assert_no_stamp(command, expect_code=2)
+
+    def test_l1_help_flag_does_not_end_the_hook_and_mints_nothing(self):
+        for flag in ("-h", "--help"):
+            with self.subTest(flag):
+                out = io.StringIO()
+                with mock.patch("sys.stdout", out):
+                    self.assert_no_stamp(PLAIN + " " + flag, expect_code=0)
+                self.assertEqual(out.getvalue(), "")
+
+    def test_the_documented_forms_still_mint(self):
+        install = Path(os.path.expanduser("~")) / ".codex" / "agent-harness" / "merge_gate.py"
+        for label, command in (("claude install", PLAIN),
+                               ("literal home", PLAIN.replace("~/", os.path.expanduser("~") + "/", 1)),
+                               ("codex install", PLAIN.replace("~/.claude/hooks/merge_gate.py", str(install))),
+                               ("the running gate", PLAIN.replace("~/.claude/hooks/merge_gate.py", mg.__file__)),
+                               ("quoted reason with glob characters",
+                                PLAIN.replace("'approved by main after review'", "'ok? [x] {y} *z ~w =v #u (t)'"))):
+            with self.subTest(label):
+                for leftover in self.state.rglob("*.json"):
+                    leftover.unlink()
+                code, text = self.decide_as(command, main=True)
+                self.assertEqual(code, 0, text)
+                self.assertEqual(len(self.stamps()), 1)
+
+    def test_an_absolute_interpreter_path_mints_only_when_it_is_an_executable_python(self):
+        with tempfile.TemporaryDirectory() as folder:
+            interpreter = Path(folder) / "python3.12"
+            interpreter.write_text("#!/bin/sh\n")
+            interpreter.chmod(0o700)
+            code, text = self.decide_as(PLAIN.replace("python3 ", str(interpreter) + " ", 1), main=True)
+            self.assertEqual(code, 0, text)
+            self.assertEqual(len(self.stamps()), 1)
+            interpreter.chmod(0o600)
+            self.assert_no_stamp(PLAIN.replace("python3 ", str(interpreter) + " ", 1))
+
+    def test_a_waive_stamp_lives_at_most_120_seconds(self):
+        self.assertEqual(mg.STAMP_TTL_SECONDS, 120)
+        import time as _time  # noqa: PLC0415
+        for age, expected in ((60, 0), (300, 3)):
+            with self.subTest(age=age):
+                with mock.patch.object(caller_identity, "is_main", return_value=True):
+                    mg.decide(bash(PLAIN), FakeGh(SCENARIOS["green"]), self.state, now=_time.time() - age)
+                self.assertEqual(len(self.stamps()), 1)
+                self.assertEqual(self.record()[0], expected)
 
 
 if __name__ == "__main__":
