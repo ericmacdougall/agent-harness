@@ -53,8 +53,12 @@ CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-acti
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@(?=[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})*\.[A-Za-z]{2,24}\b)")
 _HOME = re.compile(r"/(?:Users|home)/[^/\s\"'<>]{1,128}")
 _IPV4 = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
-# NUL and other C0 controls except tab and newline, DEL, bidi embedding/override/isolate marks, zero-width characters
-_CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f​-‏‪-‮⁠-⁩﻿]")
+# NUL and other C0 controls except tab and newline, DEL, the Arabic letter mark, zero-width and directional marks,
+# bidi embedding/override/isolate controls, word joiner and invisible operators, and the BOM. They are removed BEFORE
+# redaction, so a token split by an invisible character (ghp_ + U+200B + body) is rejoined and still redacted
+# (adversarial delta finding 12).
+_CONTROL = re.compile("[\\x00-\\x08\\x0b-\\x1f\\x7f\\u061c\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2069\\ufeff]")
+SECTION_CAP = 500  # entries rendered per evidence section; the rest are counted in an "N more" line
 # Compared case-folded against the resolved path relative to home (APFS is case-insensitive by default).
 _SYNC_PREFIXES = ("dropbox", "onedrive", "google drive", "box sync")
 _SYNC_EXACT = ("box",)
@@ -76,14 +80,13 @@ class _Scrubber:
     def text(self, value) -> str:
         if not isinstance(value, str):
             value = json.dumps(value, default=str, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
-        value = value[:PRE_TRIM]
+        value = _CONTROL.sub("", value[:PRE_TRIM])
         before = value.count("[REDACTED:")
         value = self.redact(value)
         self.redactions += max(0, value.count("[REDACTED:") - before)
         value = _EMAIL.sub("[email]@", value)
         value = _HOME.sub("~", value)
         value = _IPV4.sub("[ip]", value)
-        value = _CONTROL.sub("?", value)
         if len(value) > FIELD_CAP:
             value = value[:FIELD_CAP] + " [... capped at %d characters]" % FIELD_CAP
         return value
@@ -301,9 +304,12 @@ def _e(value) -> str:
 
 def _evidence_rows(entries, columns):
     out = ["<table><thead><tr>" + "".join("<th>%s</th>" % _e(c) for c, _ in columns) + "</tr></thead><tbody>"]
-    for entry in entries:
+    for entry in entries[:SECTION_CAP]:
         out.append("<tr>" + "".join('<td class="t">%s</td>' % _e(entry.get(key)) for _, key in columns) + "</tr>")
     out.append("</tbody></table>")
+    if len(entries) > SECTION_CAP:
+        out.append('<p class="muted">%d more not shown (section capped at %d; run ah status for the full list).</p>'
+                   % (len(entries) - SECTION_CAP, SECTION_CAP))
     return "".join(out)
 
 
@@ -318,8 +324,8 @@ def _render(session, generated, report, tree, counts, timeline, omitted, unread,
              '%d malformed rows skipped.</p></header><main>' % (_e(session), _e(generated), _e(since_label),
                                                                  len(timeline), omitted, skipped)]
     if omitted:
-        parts.append("<p>%d older rows omitted to stay under %d; scope, intent, decision, requirement, ask, handoff, "
-                     "blocker and risk rows were kept first.</p>" % (omitted, MAX_ROWS))
+        parts.append("<p>%d older rows omitted to stay under %d; %s rows were kept first.</p>"
+                     % (omitted, MAX_ROWS, _e(", ".join(sorted(PRIORITY)))))
     sections = (
         ("VERIFIED (REALLY_TESTED)", report.get("verified"), (("Check", "check"), ("Agent", "agent"), ("At", "at"), ("Note", "note"))),
         ("FAILED (REALLY_TESTED with FAIL; never proof)", report.get("failed"), (("Check", "check"), ("Agent", "agent"), ("At", "at"), ("Note", "note"))),

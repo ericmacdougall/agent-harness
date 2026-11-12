@@ -83,12 +83,12 @@ What the page contains:
 - The agent tree.
 - Every row that carries a note: intents, decisions, asks, results, commits, blockers, handoffs and the like.
 - The evidence classes, computed by the same `status_report` rules as `ah status`.
-- A list of the WALs it did not read: symlinks, non-regular files, files over 64 MB, and anything past the 256 MB or 512-file session caps.
+- A list of the WALs it did not read: symlinks, non-regular files, files over 64 MB, and anything past the 256 MB or 4,096-file session caps.
 
 Redaction:
 - Every string in every row goes through `redact.py`, keys and values alike.
 - E-mail local parts, home-directory paths and IPv4 addresses are masked.
-- Control, bidi and zero-width characters are replaced, and each field is capped at 2,000 characters.
+- Control, bidi and zero-width characters are removed before redaction, so a token split by an invisible character is still caught. Each field is capped at 2,000 characters, and each evidence section shows at most 500 entries plus a count of the rest.
 - The evidence classes are computed on the raw rows, so a cap or mask cannot change a verdict. Each entry is then displayed from its redacted row.
 - Redaction is pattern-based, so names, hostnames, ticket text and phone numbers stay. The page says so in a banner.
 

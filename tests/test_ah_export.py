@@ -163,6 +163,24 @@ class FullExport(Base):
                                 'asks_open', 'assumptions', 'decisions', 'commits')}
         self.assertEqual(classes(exported), classes(direct))
         self.assertTrue(all('row' in e for e in exported['verified'] + exported['failed']))
+        # The page, not just the report: LONG-1 sits under FAILED only, the IP deploy row under LIVE.
+        page = self.html(self.export())
+
+        def section(title):
+            start = page.index('<h3>' + title)
+            end = page.find('<h3>', start + 4)
+            return page[start:end if end != -1 else len(page)]
+        self.assertIn('LONG-1', section('FAILED'))
+        self.assertNotIn('LONG-1', section('VERIFIED'))
+        self.assertIn('build abc1234def', section('LIVE (deploy'))
+        self.assertIn('[ip]', section('LIVE (deploy'))
+
+    def test_section_cap_counts_the_rest(self):
+        jl(self.w / 'agent-owner1.jsonl', [
+            {'at': iso(NOW - 2500 + i), 'event': 'commit', 'note': 'c%04d feat(x): y' % i}
+            for i in range(ah_export.SECTION_CAP + 7)])
+        page = self.html(self.export())
+        self.assertIn('8 more not shown (section capped at %d' % ah_export.SECTION_CAP, page)
 
 
 class Redaction(Base):
@@ -190,6 +208,19 @@ class Redaction(Base):
         self.assertIn('[REDACTED:', raw)
         self.assertIn('@example.com', raw)
         self.assertGreater(r['redactions'], 0)
+
+    def test_invisible_split_token_redacted(self):
+        """Adversarial delta finding 12: controls are removed before redaction, so a split token is still caught."""
+        body = GITHUB[4:]
+        notes = ['split ghp_​' + body, 'split ghp_؜' + body, 'split ghp_⁦' + body,
+                 'split ghp_\x07' + body]
+        jl(self.w / 'agent-owner1.jsonl', [{'at': iso(NOW - 300 + i), 'event': 'status', 'note': n}
+                                           for i, n in enumerate(notes)])
+        raw = self.html(self.export())
+        for seg in segments(GITHUB, 4):
+            self.assertNotIn(seg, raw)
+        for ch in ('​', '؜', '⁦', '\x07'):
+            self.assertNotIn(ch, raw)
 
     def test_straddling_secrets_redacted(self):
         # straddles status_report's 240-character note cut, leaving 16 body characters (too few for the pattern)
@@ -473,10 +504,44 @@ class Installers(unittest.TestCase):
                 names.add(node.value)
         return names
 
+    @staticmethod
+    def local_imports(node):
+        """Harness modules imported anywhere inside an AST node, module level or inside functions."""
+        found = set()
+        for n in ast.walk(node):
+            if isinstance(n, ast.Import):
+                found |= {a.name.split('.')[0] for a in n.names}
+            elif isinstance(n, ast.ImportFrom) and n.module and not n.level:
+                found.add(n.module.split('.')[0])
+        return {m for m in found if (HOOKS / (m + '.py')).is_file()}
+
+    @classmethod
+    def export_chain(cls):
+        """Walk the imports the export path can load (adversarial delta finding A). ah.py is walked only at module
+        level and inside status_report, since export calls nothing else in it; every other module reached is walked
+        in full, including lazy function-level imports, so a missing transitive helper fails here."""
+        ah_tree = ast.parse((HOOKS / 'ah.py').read_text(encoding='utf-8'))
+        start = set()
+        for n in ah_tree.body:
+            if isinstance(n, (ast.Import, ast.ImportFrom)) or (
+                    isinstance(n, ast.FunctionDef) and n.name == 'status_report'):
+                start |= cls.local_imports(n)
+        seen, todo = {'ah'}, ['ah_export', *sorted(start)]
+        while todo:
+            module = todo.pop()
+            if module in seen:
+                continue
+            seen.add(module)
+            todo += sorted(cls.local_imports(ast.parse((HOOKS / (module + '.py')).read_text(encoding='utf-8'))))
+        return seen
+
+    def test_import_walk_reaches_known_chain(self):
+        chain = self.export_chain()
+        for module in ('ah_export', 'ah', 'redact', 'safe_input', 'goals_view', 'mission_coverage'):
+            self.assertIn(module, chain)
+
     def test_installer_lists_cover_import_chain(self):
-        # The modules the export path loads: ah_export itself, ah (status_report), redact, safe_input (bounded
-        # reads) and goals_view (imported by status_report).
-        needed = {'ah_export', 'ah', 'redact', 'safe_input', 'goals_view'}
+        needed = self.export_chain()
         for installer in ('install.py', 'install_codex.py'):
             listed = self.listed(installer)
             for module in needed:

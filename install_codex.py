@@ -47,6 +47,9 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'dropped_gate.py', 'ah.py', 'ah_worktree.py', 'ah_install.py', 'liveness.py',
                     # ah export and ah status: status_report imports goals_view (goodqa#15788)
                     'ah_export.py', 'goals_view.py',
+                    # goals_view imports mission_coverage at load; spec_flow and others import these lazily
+                    # (tests/test_ah_export.py walks the chain).
+                    'mission_coverage.py', 'resource_budget.py', 'workdir.py',
                     'shellwords.py',  # dropped_gate's pretool path imports it (PR 208 red-team)
                     # Heavy-job guard (goodqa#14817): keeps large copies, suites and builds off the Mac for Codex too.
                     'heavy_job_guard.py', 'dropbox_budget.conf', 'resource_limits.json',
