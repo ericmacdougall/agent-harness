@@ -299,6 +299,7 @@ class Inject(Base):
         self.assertIn("w16dc0f5dd6b", text)
         self.assertIn("LIVE_TESTED", text)
         self.assertIn("Only DONE_LIVE is done: never call a goal below it done", text)  # a81a99f3 final note 1
+        self.assertIn("A goal below DONE_LIVE (including LIVE_TESTED) must not be called done", text)  # main
         self.assertNotIn("t2 healthy", text)  # no agent-written note text
         self.assertLessEqual(len(text.encode()), 4096)
 
