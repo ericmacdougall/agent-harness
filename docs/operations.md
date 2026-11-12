@@ -1434,6 +1434,33 @@ stalled goal, plus the option to queue the goal on its ticket.
   `coverage` map for Mission Control, keyed by goal id and ticket, with `{status: uncovered|stalled|moving, reason,
   action}`.
 
+### Goal status: `ah goals` and the status lint (goodqa#15754)
+
+- `ah goals` reports every goal of the ledger with its state and its evidence of any age (`--json` for all of it,
+  `--candidates` for unattached deploy and REALLY_TESTED rows that name a goal, read only). It is the source for a
+  "whats left" answer; `ah status --since` lists recent evidence only.
+- Evidence: main attaches rows with `mission_coverage.py attach --goal G --evidence wID --kind test|live_test|deploy`;
+  owners may attach rows from WALs that name the goal, with an explicit PASS or FAIL, and never re-attach main's
+  rows. Owners tag rows with `wal_note.py --goal G --result PASS|FAIL [--live]` and write deploy records with
+  `--event deploy` (naming a sha or version). States: DONE_LIVE (main-attached deploy and a later main-attached live
+  PASS), LIVE_TESTED (main-attached live PASS, no deploy), LIVE_UNTESTED, VERIFIED, FAILING (a main-attached FAIL
+  clears only with a main-attached PASS of the same check), IN_PROGRESS, UNKNOWN (no record, never "not started").
+  `ah status` calls a deploy record linked to a REALLY_TESTED row LINKED_LIVE; prose live claims are LIVE_LEGACY.
+- `status_truth.py` hooks, mission session only (decided from the ledger, remembered in
+  `~/.agent-harness/state/status-truth/mission-session` so a broken ledger never widens it): UserPromptSubmit injects
+  the goals for a status question; SessionStart re-injects them after a compaction; Stop lints the final assistant
+  text (contradictions against the ledger, and a status answer given without running `ah goals`). Injected text holds
+  only fixed-pattern fields (ids, check names, enums, ages, the main-set target). Policy key `status_lint` in
+  provenance_policy.json: `warn` (shipped: a systemMessage the user sees, and a flag row in
+  `~/.agent-harness/state/status-truth/flags.jsonl` with ids and rules only), `enforce` (blocks once per human turn
+  through `stop_blocks.py`; main switches it only on the spec's precision bound) or `off`. When the transcript tail
+  holds no user prompt the turn is unknown and the lint only warns, in enforce too.
+  `status_truth.py calibrate <transcript>` replays both rules over a transcript.
+- `ah owners` lists in `attention` each SILENT owner whose recorded wait expired, or that has been silent 6 h with no
+  disposition (row reason `wait-expired` or `silent-undisposed`); `ah status` prints the same list on its owners line.
+  It is a report for main to look at: it does not set `decision_required`, so the dropped-owner Stop gate and ahd
+  successor requests ignore it (a silent owner may be a long build that writes no WAL lines).
+
 ## Design limits
 
 The policy is intentionally risk-scaled. The small fix path skips worktrees and review loops. A normal code task gets only relevant tests and documents. The agents must not infer that the presence of a test or a reviewer PASS proves quality. Independent checks, reviewer availability, UI tool access and remote permissions vary by environment; handoffs must say exactly what ran and what did not.
