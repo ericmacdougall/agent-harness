@@ -225,8 +225,9 @@ def _parse_slots(data: bytes) -> list:
             obj = json.loads(data[i:i + SLOT_BYTES].decode("utf-8", "replace").strip())
         except ValueError:
             continue
-        if isinstance(obj, dict) and isinstance(obj.get("seq"), int):
-            out.append(obj)
+        if (isinstance(obj, dict) and isinstance(obj.get("seq"), int)
+                and all(isinstance(obj.get(k), (str, type(None))) for k in ("host", "source", "key"))):
+            out.append(obj)  # a row whose host, source or key is not a string would crash every reader
     return sorted(out, key=lambda e: e["seq"])
 
 
@@ -245,6 +246,8 @@ def emit(event: dict, path: Path | None = None, home: Path | None = None) -> int
     missing = [k for k in REQUIRED if not event.get(k)]
     if missing:
         raise ValueError(f"alert event missing {missing}")
+    if not all(isinstance(event.get(k), str) for k in ("host", "source", "key")):
+        raise ValueError("alert event host, source and key must be strings")
     if event["severity"] not in SEVERITIES or event["event"] not in ("raise", "clear"):
         raise ValueError("bad severity or event")
     event = dict(event, message=redact(event["message"]), detail=redact_obj(event.get("detail") or {}))
@@ -2204,6 +2207,87 @@ def compact(e: dict) -> dict:
     return {k: e.get(k) for k in ("host", "event", "severity", "key", "message", "detail", "seq", "at")}
 
 
+def queue_events(cfg: dict, state: dict, news: list, now: float) -> None:
+    """Queue alert transitions for the digest and, for critical raises, the deadman mail (at most one mail per key per 6 h,
+    so a flapping threshold does not flood; no deadman configured: nothing to queue)."""
+    state["pending_comment"] = ((state.get("pending_comment") or []) + [compact(e) for e in news])[-500:]
+    sent = state.setdefault("deadman_sent", {})
+    for e in news:
+        if (cfg["sinks"].get("deadman") and e["event"] == "raise" and e["severity"] == "critical"
+                and now - sent.get(e["key"], 0) > 6 * 3600):
+            state.setdefault("pending_deadman", []).append(compact(e))
+            sent[e["key"]] = now
+
+
+FWD_KEYS_MAX = 200  # keys remembered as forwarded-raised (a bounded state slot)
+
+
+def forward_foreign(cfg: dict, home: Path, state: dict, ring: Path, now: float) -> list:
+    """goodqa#15827: critical raise and clear events that a foreign source wrote to this host's ring (fabd-health, any script
+    using `ops_watch.py emit`) never reached the digest or the deadman queue, because only run_once's own transitions are
+    queued. Returns the ring rows to queue now and advances state["fwd_seq"] (persisted with the queues in one state write, so
+    a crash re-forwards rather than loses). Rules: source other than ops-watch, this host, severity critical for a raise, a
+    clear only for a key that was forwarded as raised, text refreshes (updated, reasserted) skipped. The first run (or a ring
+    whose sequence restarted below the stored one) forwards only what is standing, never the history."""
+    host = cfg["host"]
+    rows = sorted(read_ring(ring), key=lambda e: e.get("seq") or 0)
+    try:
+        info = os.stat(ring)
+    except FileNotFoundError:
+        state.setdefault("fwd_seq", 0)  # no ring yet: everything that appears later is new
+        return []
+    except OSError:
+        return []  # the ring cannot be examined: unknown, never a reset; position and keys stay as they are
+    ring_id = f"{info.st_dev}:{info.st_ino}"
+    top = max([e.get("seq") or 0 for e in rows] or [0])
+    seen = state.get("fwd_seq")
+    if isinstance(seen, int) and not rows:
+        return []  # an unreadable or empty read after a forward is "unknown": keep fwd_seq, never replay on the next good read
+    active = state.setdefault("fwd_active", {})  # key -> seq of the raise that was forwarded
+    stored_id = state.get("fwd_ring")
+    low = isinstance(seen, int) and top < seen
+    state["fwd_low"] = (state.get("fwd_low") or 0) + 1 if low else 0
+    # a real reset needs a positive signal: the ring file itself was replaced, or the sequence stayed below the stored
+    # position on three consecutive runs; one low read (a torn newest slot) is not one
+    recreated = isinstance(seen, int) and ((bool(stored_id) and stored_id != ring_id) or state["fwd_low"] >= 3)
+    if low and not recreated:
+        return []
+    out = []
+    if not isinstance(seen, int) or recreated:  # first run or a recreated ring
+        before = dict(active)
+        active.clear()
+        state["fwd_low"] = 0
+        for (h, src, key), e in latest_by_key(rows).items():
+            if h != host or src == SOURCE:
+                continue
+            if e.get("event") == "raise" and e.get("severity") == "critical":
+                out.append(e)
+                active[f"{src}/{key}"] = e.get("seq") or 0
+            elif e.get("event") == "clear" and f"{src}/{key}" in before:
+                out.append(e)  # a clear the old sequence never delivered: the digest must not keep it standing
+    else:
+        for e in rows:
+            if (e.get("seq") or 0) <= seen or ring_host(e) != host or e.get("source") == SOURCE:
+                continue
+            detail = e.get("detail") if isinstance(e.get("detail"), dict) else {}  # emit() lets any JSON through as detail
+            if not isinstance(e.get("key"), str) or not isinstance(e.get("source"), str):
+                continue  # one malformed foreign row must never stop the alert path
+            ident = f"{e.get('source')}/{e.get('key')}"
+            if e.get("event") == "raise" and e.get("severity") == "critical":
+                if detail.get("updated") or detail.get("reasserted"):
+                    continue  # a text refresh is not a new alert
+                active[ident] = e.get("seq") or 0
+                out.append(e)
+            elif e.get("event") == "clear" and ident in active:  # an expiry clear carries updated=true and still closes the raise
+                del active[ident]
+                out.append(e)
+    state["fwd_seq"] = top
+    state["fwd_ring"] = ring_id
+    while len(active) > FWD_KEYS_MAX:
+        active.pop(min(active, key=active.get))
+    return out
+
+
 def _transition(host, kind, key, a, extra=None) -> dict:
     return {"host": host, "source": SOURCE, "event": kind, "severity": a.get("severity", "info"), "key": key,
             "message": a.get("message", ""), "detail": {**(a.get("detail") or {}), **(extra or {})},
@@ -2322,14 +2406,7 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
                 rc = 2
                 print(f"ops-watch: alert ring write failed ({type(exc).__name__}): {e['key']}", file=sys.stderr)
                 active.get(e["key"], {}).pop("written", None)  # not written: next run reads what the ring really says
-        news = [e for e in evs if not (e.get("detail") or {}).get("updated")]  # a text refresh alerts nobody
-        state["pending_comment"] = ((state.get("pending_comment") or []) + [compact(e) for e in news])[-500:]
-        sent = state.setdefault("deadman_sent", {})
-        for e in news:  # critical raises, at most one deadman mail per key per 6 h (flapping thresholds)
-            if (cfg["sinks"].get("deadman") and e["event"] == "raise" and e["severity"] == "critical"
-                    and now - sent.get(e["key"], 0) > 6 * 3600):  # no deadman configured: nothing to queue
-                state.setdefault("pending_deadman", []).append(compact(e))
-                sent[e["key"]] = now
+        queue_events(cfg, state, [e for e in evs if not (e.get("detail") or {}).get("updated")], now)  # a text refresh alerts nobody
         try:
             save_state(home, state)
         except (OSError, ValueError) as exc:
@@ -2338,6 +2415,14 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
 
     events += expire_point_events(cfg, latest_by_key(read_ring(ring)), active, now, ring)
     persist(events)  # durable before any slow sink: a crash or timeout below cannot re-raise these
+    foreign = forward_foreign(cfg, home, state, ring, now)
+    if foreign:
+        queue_events(cfg, state, [dict(e, detail=e["detail"] if isinstance(e.get("detail"), dict) else {}) for e in foreign], now)
+        try:
+            save_state(home, state)  # queues and the forwarded seq in one write: idempotent across a restart
+        except (OSError, ValueError) as exc:
+            rc = 2
+            print(f"ops-watch: state write failed ({type(exc).__name__})", file=sys.stderr)
     latest = latest_by_key(read_ring(ring))
     reassert = [_transition(host, "raise", k, a, {"reasserted": True}) for k, a in sorted(active.items())
                 if latest.get((host, SOURCE, k), {}).get("event") != "raise"]
