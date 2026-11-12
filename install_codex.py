@@ -45,6 +45,7 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'command_guard.py', 'command_guard_hook.py', 'redact.py', 'kill_guard.py', 'kill_guard_policy.json', 'merge_gate.py', 'bg_job.py',
                     # Dropped-owner gate on Codex Stop and its reads (goodqa#14791 P18)
                     'dropped_gate.py', 'ah.py', 'ah_worktree.py', 'liveness.py',
+                    'shellwords.py',  # dropped_gate's pretool path imports it (PR 208 red-team)
                     # Heavy-job guard (goodqa#14817): keeps large copies, suites and builds off the Mac for Codex too.
                     'heavy_job_guard.py', 'dropbox_budget.conf', 'resource_limits.json',
                     # deliver.py prepare --scan trivy imports it (goodqa#15295)

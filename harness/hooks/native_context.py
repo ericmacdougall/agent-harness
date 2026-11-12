@@ -483,8 +483,26 @@ class DarwinBackend:
             path = ct.create_string_buffer(4096)
             if self.proc.proc_pidpath(pid, path, len(path)) > 0:
                 continue
+            args = self.process_args(pid)
+            if args is not None and args[1:2] == [HELPER_FLAG]:
+                continue  # the Chrome extension's native-messaging helper: not a session, holds no authority
             rows.append({"pid": info.pid, "ppid": info.ppid, "name": _clean_name(name), "started": int(info.start_sec)})
         return sorted(rows, key=lambda row: row["pid"])
+
+    def process_args(self, pid):
+        """argv of a process through sysctl KERN_PROCARGS2 (readable for the caller's own processes), else None."""
+        try:
+            libc = ct.CDLL(None)
+            mib = (ct.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+            size = ct.c_size_t(0)
+            if libc.sysctl(mib, 3, None, ct.byref(size), None, 0) != 0 or not 0 < size.value <= 4 * 1024 * 1024:
+                return None
+            buffer = ct.create_string_buffer(size.value)
+            if libc.sysctl(mib, 3, buffer, ct.byref(size), None, 0) != 0:
+                return None
+            return parse_procargs(buffer.raw[:size.value])
+        except (OSError, ValueError, AttributeError, TypeError):
+            return None
 
     def signature(self, pid):
         return self._signature(pid, (CODE_REQUIREMENT,))
@@ -539,6 +557,33 @@ class DarwinBackend:
 class _CommitDarwinBackend(DarwinBackend):
     def signature(self, pid):
         return self._signature(pid, (CODE_REQUIREMENT, _CLAUDE_REQUIREMENT))
+
+
+HELPER_FLAG = "--chrome-native-host"
+
+
+def parse_procargs(buffer):
+    """argv from a KERN_PROCARGS2 buffer: an int argc, the exec path, NUL padding, argc NUL-terminated arguments, then
+    the environment (ignored). None when the buffer is malformed."""
+    if not isinstance(buffer, (bytes, bytearray)) or len(buffer) < 5:
+        return None
+    argc = int.from_bytes(buffer[:4], sys.byteorder, signed=True)
+    if not 0 <= argc <= 4096:
+        return None
+    end = buffer.find(b"\x00", 4)
+    if end < 0:
+        return None
+    i = end
+    while i < len(buffer) and buffer[i] == 0:
+        i += 1
+    args = []
+    for _ in range(argc):
+        j = buffer.find(b"\x00", i)
+        if j < 0:
+            return None
+        args.append(bytes(buffer[i:j]).decode("utf-8", "replace"))
+        i = j + 1
+    return args
 
 
 def stale_runtime_processes(backend=None):

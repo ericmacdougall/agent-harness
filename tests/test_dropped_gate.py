@@ -658,5 +658,323 @@ class TaskWalOwners(Base):
         self.assertNotIn("0 dropped", p.stdout)
 
 
+class QuotedPunctuation(Base):
+    """goodqa#15684 (same flaw as PR 179 r14 F1): quoted or escaped shell punctuation is a word character. The old
+    splitter cut `--note ";"` into two commands, so the acknowledging flags were no longer in the `ah task dispose`
+    segment and a sub-agent's resume or close was not recognised. Every string here is data judged in memory."""
+    BASE = "python3 ~/.claude/hooks/ah.py task dispose --agent X"
+
+    def test_quoted_or_escaped_separators_do_not_hide_an_acknowledgement(self):
+        notes = ['--note ";"', "--note '&&'", "--note \\;", '--note "a; b"', '--note "x | y"', "--note '('", '--note ")"',
+                 "--note 'two\nlines'", '--note "a && b ; c"', "--note \\&\\&", "--note '||'", "--note ';;'"]
+        for note in notes:
+            for tail in ("--kind resumed", "--kind closed", "--kind waiting --ack-handoff", "--kind=superseded"):
+                with self.subTest(note=note, tail=tail):
+                    self.assertTrue(dropped_gate.acknowledges(self.BASE + " " + note + " " + tail))
+                    self.assertTrue(dropped_gate.acknowledges(self.BASE + " " + tail + " " + note))
+
+    def test_a_quoted_separator_inside_a_shell_wrapper_is_still_judged(self):
+        self.assertTrue(dropped_gate.acknowledges("bash -c '" + self.BASE + " --note \";\" --kind resumed'"))
+        self.assertTrue(dropped_gate.acknowledges("true && " + self.BASE + " --note ';' --kind closed"))
+
+    def test_text_that_only_mentions_an_acknowledgement_is_not_one(self):
+        for command in ('echo "' + self.BASE + ' --kind resumed"',
+                        "echo " + self.BASE.replace("python3 ~/.claude/hooks/ah.py", "ah") + " --kind resumed",
+                        "grep -n ';' notes.txt ; ah task dispose --agent X --kind waiting --ref wa5b00000004 --until X",
+                        self.BASE + " --kind waiting --ref wa5b00000004 --until X --note ';'",
+                        "ah task list --note ';' --kind resumed",
+                        "echo ';' ; echo ah task dispose --kind resumed"):
+            with self.subTest(command=command[:60]):
+                self.assertFalse(dropped_gate.acknowledges(command))
+
+    def test_a_line_the_shell_alone_can_read_is_judged_conservatively(self):
+        # An unbalanced quote cannot be split, so the substring judgement applies. A `$(...)` is read in lenient mode:
+        # the command here is really `ah`, so it is judged on its words; a computed COMMAND word is the next test.
+        for command in (self.BASE + " --note 'open --kind resumed", self.BASE + " --note $(echo hi) --kind closed"):
+            with self.subTest(command=command[:50]):
+                self.assertTrue(dropped_gate.acknowledges(command))
+
+    def stamped(self, command, agents):
+        import caller_identity
+        dropped_gate._stamp_ack(command, {"session_id": SESSION})
+        return [a for a in agents if caller_identity.take_stamp("ack-handoff", [a], home=self.home) is not None]
+
+    def test_the_handoff_stamp_is_minted_only_for_a_command_that_really_runs_the_dispose(self):
+        self.assertEqual(self.stamped("python3 ~/.claude/hooks/ah.py task dispose --agent owner-1 --kind waiting "
+                                      "--ack-handoff --ref wa5b00000006 --until 2026-11-09T00:00:00Z", ["owner-1"]),
+                         ["owner-1"])
+        for command in ('echo "ah task dispose --agent owner-2 --ack-handoff"',
+                        "echo ah task dispose --agent owner-2 --ack-handoff",
+                        "grep -n --agent owner-2 --ack-handoff notes.txt",
+                        "printf %s 'ah task dispose --agent owner-2 --kind waiting --ack-handoff'",
+                        "ah task list --agent owner-2 --ack-handoff",
+                        "ah task dispose --agent owner-2 --kind waiting --ref wa5b00000006 --until X ; "
+                        "echo --ack-handoff"):
+            with self.subTest(command=command[:60]):
+                self.assertEqual(self.stamped(command, ["owner-2"]), [])
+
+    def test_the_stamp_covers_only_the_agents_of_the_dispose_segment(self):
+        command = ("ah task dispose --agent owner-3 --kind waiting --ack-handoff --ref wa5b00000006 --until X ; "
+                   "ah task dispose --agent owner-4 --kind waiting --ref wa5b00000006 --until X ; echo --agent owner-5")
+        self.assertEqual(self.stamped(command, ["owner-3", "owner-4", "owner-5"]), ["owner-3"])
+
+    def test_inline_python_code_and_oversized_lines_are_never_stamped(self):
+        self.assertEqual(self.stamped("python3 -c 'print(1)' task dispose --agent owner-7 --kind waiting --ack-handoff",
+                                      ["owner-7"]), [])
+        # `-c` takes the next word as code, so the ah that follows is that code, not the program
+        self.assertEqual(self.stamped("python3 -c ah task dispose --agent owner-7 --kind waiting --ack-handoff",
+                                      ["owner-7"]), [])
+        padded = ("ah task dispose --agent owner-8 --kind waiting --ack-handoff --ref wa5b00000006 --until X"
+                  + " " * 21000)
+        self.assertEqual(self.stamped(padded, ["owner-8"]), ["owner-8"])  # a long line is read, not skipped (r1 F1)
+        huge = padded + " " * (dropped_gate.PRETOOL_MAX + 1)
+        self.assertEqual(self.stamped(huge, ["owner-9"]), [])
+        # An oversized line cannot be split, so a real acknowledgement in it is still judged by the substring rule.
+        self.assertTrue(dropped_gate.acknowledges("ah task dispose --agent X --kind resumed" + " " * 101000))
+
+    def test_a_quoted_separator_does_not_move_the_agent_out_of_its_segment(self):
+        command = 'ah task dispose --agent owner-6 --reason ";" --kind waiting --ack-handoff --ref wa5b00000006 --until X'
+        self.assertEqual(self.stamped(command, ["owner-6"]), ["owner-6"])
+
+
+class ReviewRound1(Base):
+    """PR 208 red-team round 1 (goodqa#15684): the stamp must survive the forms main really types, a here-document is
+    judged only where the shell would see one, and a stamp is minted only for a command ah's own parser accepts."""
+    DISPOSE = "ah task dispose --agent A --kind waiting --ack-handoff --ref wa5b00000006"
+    RESUME = "ah task dispose --agent X --kind resumed"
+
+    stamped = QuotedPunctuation.stamped
+
+    def test_main_forms_with_a_computed_value_a_wrapper_or_a_heredoc_are_still_stamped(self):
+        for command in (self.DISPOSE + ' --until "$(date -u -v+1H +%FT%TZ)"',
+                        self.DISPOSE + " --until `date -u +%FT%TZ`",
+                        "cat > n <<EOF\nnote\nEOF\n" + self.DISPOSE + " --until X",
+                        "timeout 30s " + self.DISPOSE + " --until X",
+                        "python3 -X utf8 ~/.claude/hooks/" + self.DISPOSE.replace("ah ", "ah.py ", 1) + " --until X",
+                        "env -u FOO " + self.DISPOSE + " --until X",
+                        "sudo -u eric " + self.DISPOSE + " --until X",
+                        "AH_HOME=/x nice -n 5 " + self.DISPOSE + " --until X"):
+            with self.subTest(command=command[:70]):
+                self.assertEqual(self.stamped(command, ["A"]), ["A"])
+
+    def test_a_command_ah_would_not_run_mints_no_stamp(self):
+        for command in ("ah --help task dispose --agent A --kind waiting --ack-handoff",
+                        "ah task dispose -h --agent A --kind waiting --ack-handoff",
+                        "command -v ah task dispose --agent A --kind waiting --ack-handoff",
+                        "ah task dispose --agent A --kind waiting",
+                        "ah task dispose --agent A --kind nonsense --ack-handoff",
+                        "ah task dispose --kind waiting --ack-handoff",
+                        'ah task dispose --agent "$(echo A)" --kind waiting --ack-handoff',
+                        "ah task dispose --agent $WHO --kind waiting --ack-handoff"):
+            with self.subTest(command=command[:70]):
+                self.assertEqual(self.stamped(command, ["A", "Y", "$(echo A)", "$WHO"]), [])
+
+    def test_an_agent_flag_inside_another_options_value_is_not_the_agent(self):
+        # argparse refuses an option-looking value, so ah would not run this: no stamp for A or Y (it used to stamp Y)
+        command = self.DISPOSE + ' --reason "--agent=Y"'
+        self.assertEqual(self.stamped(command, ["A", "Y"]), [])
+        command = self.DISPOSE + ' --reason "see --agent Y"'
+        self.assertEqual(self.stamped(command, ["A", "Y"]), ["A"])
+
+    def test_a_hidden_heredoc_marker_does_not_hide_the_next_line(self):
+        for prefix in ('echo "<<EOF"', "echo '<<EOF'", "true # <<EOF", "echo \\<<EOF", "cat <<<EOF"):
+            with self.subTest(prefix=prefix):
+                self.assertTrue(dropped_gate.acknowledges(prefix + "\n" + self.RESUME + " --reason r\nEOF"))
+
+    def test_a_real_heredoc_body_is_data_unless_a_shell_runs_it(self):
+        self.assertFalse(dropped_gate.acknowledges("cat <<EOF\n" + self.RESUME + "\nEOF"))
+        self.assertFalse(dropped_gate.acknowledges("cat <<'EOF' > n.md\n" + self.RESUME + "\nEOF\necho done"))
+        self.assertFalse(dropped_gate.acknowledges("cat <<-EOF\n\t" + self.RESUME + "\n\tEOF"))
+        self.assertTrue(dropped_gate.acknowledges("cat <<-EOF\n\tx\n\tEOF\n" + self.RESUME))  # a tab-indented end marker
+        self.assertTrue(dropped_gate.acknowledges("bash <<EOF\n" + self.RESUME + "\nEOF"))
+        self.assertTrue(dropped_gate.acknowledges("cat <<'EOF' | bash\n" + self.RESUME + "\nEOF"))
+        self.assertTrue(dropped_gate.acknowledges("cat <<'EOF' | sh -e\n" + self.RESUME + "\nEOF"))
+        # an unquoted delimiter expands $(...) in the body, and the shell runs it; a quoted one does not
+        self.assertTrue(dropped_gate.acknowledges("cat <<EOF\n$(" + self.RESUME + ")\nEOF"))
+        self.assertFalse(dropped_gate.acknowledges("cat <<'EOF'\n$(" + self.RESUME + ")\nEOF"))
+        # the command after the body is judged on its own
+        self.assertTrue(dropped_gate.acknowledges("cat <<EOF\nnote\nEOF\n" + self.RESUME))
+
+    def test_substitutions_are_judged_by_what_they_run(self):
+        for command in ("$(" + self.RESUME + ")", "echo $(" + self.RESUME + ")", "echo `" + self.RESUME + "`",
+                        'echo "$(' + self.RESUME + ')"', "x=$(" + self.RESUME + ")"):
+            with self.subTest(command=command[:50]):
+                self.assertTrue(dropped_gate.acknowledges(command))
+        self.assertTrue(dropped_gate.acknowledges(self.RESUME + ' --until "$(date)"'))
+
+    def test_wrappers_do_not_hide_an_acknowledgement(self):
+        for wrapper in ("timeout 30s ", "timeout -s KILL 10 ", "sudo -u eric ", "env -u FOO ", "nice -n 5 ", "nohup "):
+            with self.subTest(wrapper=wrapper):
+                self.assertTrue(dropped_gate.acknowledges(wrapper + self.RESUME))
+        self.assertTrue(dropped_gate.acknowledges("python3 -X utf8 ~/.claude/hooks/ah.py task dispose --agent X "
+                                                  "--kind resumed"))
+        self.assertTrue(dropped_gate.acknowledges("python3 -W ignore -I ah.py task dispose --agent X --kind closed"))
+        self.assertFalse(dropped_gate.acknowledges("command -v " + self.RESUME))
+
+    def test_commands_that_only_mention_the_words_are_not_denied(self):
+        message = "git commit -m \"$(cat <<'EOF'\nfix: it's about dispose and closed\nEOF\n)\""
+        self.assertFalse(dropped_gate.acknowledges(message))
+        self.assertFalse(dropped_gate.acknowledges("echo dispose closed" + " " * 30000))
+        self.assertFalse(dropped_gate.acknowledges("grep -n \"$(echo dispose)\" notes.txt # closed"))
+
+    def test_the_strict_tokenizer_mission_gate_uses_still_refuses_what_only_the_shell_can_read(self):
+        import shellwords
+        for command in ("cat <<EOF\nx\nEOF", "cat <<-EOF\nx\nEOF", "cat <<< word", "echo $(date)", "echo `date`",
+                        'echo "$(date)"'):
+            with self.subTest(command=command):
+                self.assertIsNone(shellwords.split_commands(command))
+                self.assertIsNotNone(shellwords.split_commands(command, lenient=True))
+
+    def test_a_computed_command_word_is_judged_by_the_conservative_text_rule(self):
+        # red-team r2 F1: lenient mode made `$(command -v ah)` one opaque word, so the dispose behind it was not seen
+        for program in ('"$(command -v ah)"', "$(command -v ah)", "`which ah`", "$AH", "${AH}", '"$(printf ah)"', "a?",
+                        "/usr/local/bin/a[h]", "{ah,}"):
+            for tail in ("--kind closed", "--kind resumed", "--kind waiting --ack-handoff"):
+                with self.subTest(program=program, tail=tail):
+                    self.assertTrue(dropped_gate.acknowledges(program + " task dispose --agent X " + tail))
+        # a computed subcommand word with an ack word still denies; plain computed text with no ack word does not
+        self.assertTrue(dropped_gate.acknowledges("ah $(echo task) dispose --agent X --kind closed"))
+        self.assertTrue(dropped_gate.acknowledges("ah task $(echo dispose) --agent X --kind resumed"))
+        self.assertFalse(dropped_gate.acknowledges("$(command -v ls) -l"))
+        self.assertFalse(dropped_gate.acknowledges('"$(command -v ah)" task list --agent X'))
+        self.assertFalse(dropped_gate.acknowledges("$(date) is the date; echo done"))
+        # a computed assignment before a literal program is still read as the program it is
+        self.assertTrue(dropped_gate.acknowledges("WHEN=$(date) " + self.RESUME))
+        self.assertFalse(dropped_gate.acknowledges("WHEN=$(date) ah task list"))
+
+    def test_python_here_documents_are_judged_by_what_the_code_says(self):
+        # red-team r2 F2: `-c` code is judged by the substring rule, so is code on stdin
+        body = 'import os; os.system("ah task dispose --agent X --kind closed")'
+        for command in ("python3 - <<'EOF'\n" + body + "\nEOF", "python3 <<EOF\n" + body + "\nEOF",
+                        "cat <<'EOF' | python3\n" + body + "\nEOF", "python -X dev - <<'EOF'\n" + body + "\nEOF",
+                        "python3 -c '" + body.replace("'", "") + "'"):
+            with self.subTest(command=command[:40]):
+                self.assertTrue(dropped_gate.acknowledges(command))
+        # python code that mentions neither word is data to the gate; a shell body is still read as shell
+        self.assertFalse(dropped_gate.acknowledges("python3 - <<'EOF'\nprint('hello')\nEOF"))
+        self.assertTrue(dropped_gate.acknowledges("python3 - <<'EOF' ; bash <<'EOF2'\nprint(1)\nEOF\n" + self.RESUME + "\nEOF2"))
+        self.assertTrue(dropped_gate.acknowledges("bash <<'EOF'\n" + self.RESUME + "\nEOF"))
+        self.assertFalse(dropped_gate.acknowledges("cat <<'EOF'\n" + body + "\nEOF"))  # cat prints it, nothing runs it
+
+    def test_the_unused_text_pattern_is_gone(self):
+        self.assertFalse(hasattr(dropped_gate, "_RUNS_TEXT"))
+
+    def test_nested_and_unbalanced_substitutions_fail_safe(self):
+        nest = "echo " + "$(" * 12 + "date" + ")" * 12
+        self.assertFalse(dropped_gate.acknowledges(nest))  # too deep to read: the conservative text rule, no ack words
+        self.assertTrue(dropped_gate.acknowledges(nest + " ; " + self.RESUME))
+        self.assertTrue(dropped_gate.acknowledges("echo $(" + self.RESUME))  # unbalanced: judged by the text rule
+
+
+class ReviewRound3(Base):
+    """PR 208 red-team r3 (goodqa#15684), rescue: a word the shell computes, in ANY position of a command that may run
+    ah, hides what ah receives (a computed `--kind`, `--agent`, `task` or `dispose`, `${VAR}`, `$'...'`), and text
+    piped into a shell or python is code. Two rounds fixed one position at a time; these cover the class."""
+    WAIT = " --kind waiting --ref wa5b00000006 --until 2026-11-12T00:00:00Z"
+
+    stamped = QuotedPunctuation.stamped
+
+    def test_a_computed_kind_value_is_denied_behind_any_program(self):
+        for command in ('K=closed; "$(command -v ah)" task dispose --agent X --kind "$K"',
+                        '$AH task dispose --agent X --kind "${K}"',
+                        "$AH task dispose --agent X --kind=$K",
+                        '"$(command -v ah)" task dispose --agent X --kind "$(printf clo)sed"',
+                        "`which ah` task dispose --agent X --kind `printf resumed`",
+                        'python3 "$AHPY" task dispose --agent X --kind "$K"',
+                        "ah task dispose --agent X --kind clos?d",
+                        "ah task dispose --agent X --kind {closed,}"):
+            with self.subTest(command=command):
+                self.assertTrue(dropped_gate.acknowledges(command))
+
+    def test_a_computed_agent_or_option_word_that_can_split_into_flags_is_denied(self):
+        for command in ("A='X --kind closed'; ah task dispose --agent $A",
+                        "ah task dispose --agent $(cat /x/agent-id)" + self.WAIT,
+                        "ah task dispose --agent X ${F}",
+                        'ah task dispose --agent X "$F"' + self.WAIT,
+                        "ah task dispose --agent X --until=$(date -u +%FT%TZ) --kind waiting --ref wa5b00000006",
+                        '"$AH" task dispose --agent X "$F"'):
+            with self.subTest(command=command):
+                self.assertTrue(dropped_gate.acknowledges(command))
+
+    def test_computed_task_and_dispose_words_are_denied(self):
+        for command in ('$AH "$T" "$D" --agent X --kind closed',
+                        "$AH task $(printf dis)pose --agent X --kind resumed",
+                        '"$(command -v ah)" "$T" dispose --agent X --kind "$K"',
+                        'python3 "$AHPY" task "$(echo dispose)" --agent X --kind closed',
+                        '${AH} task dispose --agent X --kind "${K}"',
+                        'ah task "$D" --agent X --kind waiting --ref wa5b00000006 --until X',
+                        "X='ah task dispose --agent Y --kind closed'; $X",
+                        "X='ah task dispose --agent Y --kind closed'; eval \"$X\""):
+            with self.subTest(command=command):
+                self.assertTrue(dropped_gate.acknowledges(command))
+
+    def test_ansi_c_quoting_is_a_computed_word_not_a_hole(self):
+        for command in ("ah task dispose --agent X --kind $'\\x63losed'",
+                        "ah task $'dis'pose --agent X --kind $'clo'sed",
+                        "$'\\x61h' task dispose --agent X --kind $'resumed'",
+                        "ah task dispose --agent X $'--kind=\\x63losed'"):
+            with self.subTest(command=command):
+                self.assertTrue(dropped_gate.acknowledges(command))
+        import shellwords
+        self.assertIsNone(shellwords.split_commands("echo $'x'"))  # the strict tokenizer still refuses it
+        word = shellwords.split_commands("echo $'a b'", lenient=True)[0][1]
+        self.assertTrue(word.computed)
+        self.assertFalse(word.splits)  # quoted: one word
+
+    def test_text_piped_or_here_stringed_into_a_shell_or_python_is_code(self):
+        code = 'import os; os.system("ah task dispose --agent X --kind closed")'
+        for command in ("printf '%s' '" + code + "' | python3",
+                        "printf 'ah task dispose --agent X --kind closed\\n' | sh",
+                        "echo 'ah task dispose --agent X --kind resumed' | bash -s",
+                        "echo ah task dispose --agent X --kind resumed | zsh",
+                        "echo 'ah task dispose --agent X --kind closed' | source /dev/stdin",
+                        "echo 'ah task dispose --agent X --kind closed' |& sh",
+                        "echo 'ah task dispose --agent X --kind closed' | \"$SHELL\"",
+                        "bash <<< 'ah task dispose --agent X --kind closed'",
+                        "python3 <<< '" + code + "'"):
+            with self.subTest(command=command[:60]):
+                self.assertTrue(dropped_gate.acknowledges(command))
+
+    def test_harmless_forms_stay_allowed(self):
+        for command in ("git commit -m \"$(cat <<'EOF'\nfix(dropped-gate): dispose acks are closed to sub-agents\nEOF\n)\"",
+                        "git commit -F - <<'EOF'\nfix: ah task dispose --kind closed is main's\nEOF",
+                        "echo dispose closed", "printf '%s\\n' 'ah task dispose --agent X --kind closed'",
+                        'echo "$(date) dispose closed"', "echo $HOME dispose resumed",
+                        "ah task dispose --agent X --kind waiting --ref wa5b00000006 --until \"$(date -u +%FT%TZ)\"",
+                        'ah task dispose --agent "$(cat /x/agent-id)"' + self.WAIT,
+                        '"$AH" task dispose --agent X' + self.WAIT,
+                        "$AH task dispose --agent X --kind waiting --ref wa5b00000006 --until \"$(date)\"",
+                        'ah ticket comment goodqa#1 --body "$(cat /x/note.md)"',
+                        'ah ticket comment goodqa#1 --body "$(cat /x/note.md)" --note closed',
+                        'ah ticket comment goodqa#1 --body "$(cat /x/dispose-plan.md)"',
+                        '"$PY" -m pytest "$T"', "$HOME/bin/tool --flag value",
+                        "printf 'echo hi\\n' | sh", "cat notes.txt | python3 x.py",
+                        "cat <<< 'ah task dispose --agent X --kind closed'",
+                        "grep -c dispose log.txt | sh -c 'read n; echo $n'"):
+            with self.subTest(command=command[:60]):
+                self.assertFalse(dropped_gate.acknowledges(command))
+
+    def test_a_body_that_expands_a_variable_set_on_the_line_is_judged_with_it(self):
+        # receipt r1 at 37f481d F1: the nested judgement of a here-string or here-document body lost the line's X=...
+        shell_x = "X='ah task dispose --agent Y --kind closed'; "
+        py_x = "X='import os; os.system(\"ah task dispose --agent Y --kind closed\")'; "
+        for command in (shell_x + 'bash <<< "$X"', py_x + 'python3 <<< "$X"', shell_x + '. /dev/stdin <<< "$X"',
+                        shell_x + "bash <<EOF\n$X\nEOF", shell_x + "sh <<< `echo $X`",
+                        shell_x + 'bash -c "eval \\"$X\\""', shell_x + 'echo "$(eval "$X")"',
+                        shell_x + "bash -c 'bash <<< \"$X\"'"):
+            with self.subTest(command=command):
+                self.assertTrue(dropped_gate.acknowledges(command))
+        for command in (shell_x + 'cat <<< "$X"', shell_x + "cat <<EOF\n$X\nEOF", 'bash <<< "$HOME"',
+                        "N=3; bash <<EOF\necho $N\nEOF", "git commit -F - <<EOF\nfix: dispose is closed to $USER\nEOF"):
+            with self.subTest(command=command):
+                self.assertFalse(dropped_gate.acknowledges(command))
+
+    def test_main_ack_handoff_with_a_literal_until_is_still_stamped(self):
+        command = ("ah task dispose --agent A --kind waiting --ack-handoff --ref wa5b00000006 "
+                   "--until 2026-11-12T00:00:00Z")
+        self.assertEqual(self.stamped(command, ["A"]), ["A"])
+        self.assertEqual(self.stamped(command.replace("2026-11-12T00:00:00Z", '"$(date -u +%FT%TZ)"'), ["A"]), ["A"])
+
+
 if __name__ == "__main__":
     unittest.main()
