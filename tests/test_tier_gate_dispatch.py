@@ -1019,7 +1019,87 @@ class ShippedDefault(Fixture):
         self.climb_to('sd2', 'R2')
         self.pre('work [task:sd2]', tool_use_id='h1')
         self.post('work [task:sd2]', tool_use_id='h1', agent_id='agsd2')
-        self.assertEqual(self.fail_once('sd2')['event']['class'], 'FAIL')
+        event = self.fail_once('sd2')['event']
+        self.assertEqual(event['class'], 'FAIL')
+        # r8 A1-2: the dispatch was recorded and judged below; only the cap kept the FAIL counted.
+        self.assertEqual(event['dispatch_check']['decision'], 'would_exclude')
+        self.assertLessEqual(len(json.dumps(event['dispatch_check'], separators=(',', ':'))), 256)
+        self.assertIs(self.ledger.status('sd2')['exclusion_enabled'], False)
+
+    def test_ladder_state_equals_no_dispatch_control(self):
+        """r8 A1-2 (acceptance review): with the shipped cap, the ladder ends where it would with no dispatch."""
+        def run(task, with_dispatch):
+            self.climb_to(task, 'R2')
+            if with_dispatch:
+                self.owner(task, 'eq-' + task, SONNET)
+            for _ in range(self.policy['failures_per_rung'] + 1):
+                self.fail_once(task)
+            st = self.ledger.status(task)
+            return {k: st[k] for k in ('rung', 'failures_at_rung', 'climbs', 'blocked_by', 'permission')}
+        control = run('eqb', False)
+        self.assertEqual(run('eqa', True), control)
+        # Non-vacuous: with the switch really on, the same sequence ends somewhere else.
+        on = json.loads(json.dumps(self.policy)); on['caps']['dispatch_exclude_below_rung'] = True
+        self.ledger = esc.Ledger(self.root, on)
+        self.assertNotEqual(run('eqc', True), control)
+
+
+class StrictCaps(Fixture):
+    """r8 A1-1 (red-team a7939032): only the JSON value true turns a dispatch cap on."""
+
+    def ledger_with(self, **caps):
+        policy = json.loads(json.dumps(self.policy))
+        policy['caps'].update(caps)
+        return esc.Ledger(self.root, policy)  # bypasses validate on purpose: a hand-built policy dict
+
+    def test_non_bool_exclude_cap_never_excludes(self):
+        for i, value in enumerate(['false', 'no', 'true', 1, 'yes', [True]]):
+            task = 'sc%d' % i
+            self.ledger = self.ledger_with(dispatch_exclude_below_rung=value)
+            self.positive(task)
+            event = self.fail_once(task)['event']
+            self.assertEqual((event['class'], event['dispatch_check']['decision']), ('FAIL', 'would_exclude'), value)
+            self.assertIs(self.ledger.status(task)['exclusion_enabled'], False, value)
+        self.ledger = self.ledger_with(dispatch_exclude_below_rung=True)  # control: the real bool turns it on
+        self.positive('sct')
+        self.assertEqual(self.fail_once('sct')['event']['class'], 'NOT_COUNTED')
+        self.assertIs(self.ledger.status('sct')['exclusion_enabled'], True)
+
+    def test_non_bool_narrow_cap_never_narrows(self):
+        for i, value in enumerate(['true', 1, 'false']):
+            task = 'sn%d' % i
+            self.ledger = self.ledger_with(dispatch_narrow_by_stop_effort=value)
+            self.climb_to(task, 'R2')
+            self.owner(task, 'op-' + task, OPUS, agent_id='agsn%d' % i)
+            self.ledger.end_dispatch(task, 'agsn%d' % i, effort='medium')
+            [d] = self.dispatches(task)
+            self.assertNotEqual(d['candidates'], ['R1'], value)
+        self.ledger = self.ledger_with(dispatch_narrow_by_stop_effort=True)  # control
+        self.climb_to('snt', 'R2')
+        self.owner('snt', 'op-snt', OPUS, agent_id='agsnt')
+        self.ledger.end_dispatch('snt', 'agsnt', effort='medium')
+        [d] = self.dispatches('snt')
+        self.assertEqual(d['candidates'], ['R1'])
+
+    def test_validate_rejects_non_bool_caps_and_non_dict_caps(self):
+        for key in tiers.BOOL_CAPS:
+            for value in ('false', 1, 'true', None):
+                policy = json.loads(json.dumps(self.policy)); policy['caps'][key] = value
+                with self.assertRaises(tiers.TierError, msg=(key, value)):
+                    tiers.validate(policy)
+            for value in (True, False):
+                policy = json.loads(json.dumps(self.policy)); policy['caps'][key] = value
+                tiers.validate(policy)
+        for caps in ([], 'x', None):
+            policy = json.loads(json.dumps(self.policy)); policy['caps'] = caps
+            with self.assertRaises(tiers.TierError, msg=caps):
+                tiers.validate(policy)
+
+    def test_quoted_false_table_is_refused_at_load(self):
+        """A hand-edited table holding the string "false" fails closed at load instead of turning exclusion on."""
+        path = self.policy_file('warn', dispatch_exclude_below_rung='false')
+        with self.assertRaisesRegex(tiers.TierError, 'caps.dispatch_exclude_below_rung'):
+            tiers.load_policy(str(path))
 
 
 class OverflowCleanup(Fixture):
@@ -1027,13 +1107,15 @@ class OverflowCleanup(Fixture):
 
     def test_one_old_generation_kept(self):
         side = self.root / 'ov.dispatch-open.jsonl'
+        other = self.root / 'ov2.dispatch-open.123.old'  # another task whose key shares the prefix 'ov'
+        other.write_bytes(b'keep\n')
         for round_ in range(3):
             side.write_bytes(b'x\n' * (esc.SIDE_LIMIT // 2 + 10))
             with mock.patch.object(esc, 'epoch', return_value=time.time() + round_):
                 self.ledger.load('ov')
         olds = sorted(self.root.glob('ov.dispatch-open.*.old'))
         self.assertEqual(len(olds), 1, olds)
-        self.assertEqual(list(self.root.glob('other.dispatch-open.*.old')), [])
+        self.assertEqual(other.read_bytes(), b'keep\n')  # r8 A1-3: a different task's .old survives
 
 
 class WiringAndDocs(unittest.TestCase):
