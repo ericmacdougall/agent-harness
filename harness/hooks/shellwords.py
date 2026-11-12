@@ -6,6 +6,11 @@ on PR 179; goodqa#15684). A line whose words only the shell itself can know (an 
 `<(...)`, `$'...'`, a here-document) raises Unparsed, and the callers choose their own safe side: the stamp hooks mint
 nothing, the dropped-owner gate falls back to its conservative substring judgement.
 
+`lenient=True` (dropped_gate) reads the two forms a real command line uses all the time instead of giving up: a
+balanced `$(...)` or backtick span is one computed word (its body is reported through `bodies` so the caller can judge
+what it runs), and a here-document is recognised only where the shell would see one (an unquoted `<<` operator; never
+in a quoted word, a comment or a `<<<` here-string), its body skipped and handed back on the command it feeds.
+
 Stdlib only, Python 3.9 compatible. Used by mission_gate.py and dropped_gate.py.
 """
 from __future__ import annotations
@@ -17,6 +22,7 @@ HEREDOCS = ("<<<", "<<-", "<<")
 OPERATORS = tuple(sorted(SEPARATORS + REDIRECTS + HEREDOCS, key=len, reverse=True))
 OPERATOR_START = set(";&|()<>\n")
 MAX_LINE = 20000  # never judge a truncated command line
+MAX_NEST = 8  # nested `$(...)` levels read before giving up
 
 
 class Unparsed(ValueError):
@@ -31,13 +37,67 @@ class Word(str):
     tilde = False
 
 
-def shell_tokens(cmd: str) -> list:
-    """[(kind, text)] with kind 'op' (an unquoted, unescaped operator) or 'word' (a Word). Quote state is tracked on
-    the raw text, so `";"`, `';'`, `\\;` and a newline inside quotes are word characters, never operators.
-    `#` starts a comment only at the start of a word. Raises Unparsed for forms whose words or commands only the
-    shell knows: an unbalanced quote, `$(...)`, backticks, `<(...)`/`>(...)`, `$'...'`, or a here-document."""
-    out, i, n = [], 0, len(cmd)
+class Command(list):
+    """The words of one simple command. `heredocs`: the here-document bodies (str) that feed it (lenient mode)."""
+    heredocs = ()
+
+
+def shell_tokens(cmd: str, lenient: bool = False, bodies: list = None) -> list:
+    """[(kind, text)] with kind 'op' (an unquoted, unescaped operator), 'word' (a Word) or, lenient only, 'heredoc'
+    (the body of a here-document, emitted right after the newline that ends its line). Quote state is tracked on the
+    raw text, so `";"`, `';'`, `\\;` and a newline inside quotes are word characters, never operators. `#` starts a
+    comment only at the start of a word. Raises Unparsed for forms whose words or commands only the shell knows: an
+    unbalanced quote, `<(...)`/`>(...)`, `$'...'`, and (not lenient) `$(...)`, backticks or a here-document.
+    `bodies`, if given, collects the text of every `$(...)` and backtick span (and of each substitution in an unquoted
+    here-document body) so the caller can judge what they run."""
+    tokens, _ = _scan(cmd, 0, False, lenient, bodies, 0)
+    return tokens
+
+
+def _heredoc_delimiter(cmd: str, i: int):
+    """(delimiter, quoted, next index) of the word after `<<` at i, or None."""
+    n = len(cmd)
+    while i < n and cmd[i] in " \t":
+        i += 1
+    out, quoted, start = [], False, i
+    while i < n and cmd[i] not in " \t\r\n" and cmd[i] not in OPERATOR_START:
+        c = cmd[i]
+        if c in "'\"":
+            close = cmd.find(c, i + 1)
+            if close < 0:
+                return None
+            out.append(cmd[i + 1:close])
+            quoted, i = True, close + 1
+        elif c == "\\" and i + 1 < n:
+            out.append(cmd[i + 1])
+            quoted, i = True, i + 2
+        else:
+            out.append(c)
+            i += 1
+    return ("".join(out), quoted, i) if i > start else None
+
+
+def _heredoc_body(cmd: str, at: int, delimiter: str, strip_tabs: bool):
+    """(body, index after the terminator line) for a body that starts at `at` (just after a newline)."""
+    pos = at
+    while pos <= len(cmd):
+        eol = cmd.find("\n", pos)
+        line = cmd[pos:] if eol < 0 else cmd[pos:eol]
+        if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+            return cmd[at:pos], (len(cmd) if eol < 0 else eol + 1)
+        if eol < 0:
+            break
+        pos = eol + 1
+    return cmd[at:], len(cmd)  # no terminator: the body runs to the end of the text
+
+
+def _scan(cmd: str, i: int, nested: bool, lenient: bool, bodies, level: int):
+    """Tokens from index i. nested: stop after the unmatched `)` that closes a `$(`. Returns (tokens, next index)."""
+    if level > MAX_NEST:
+        raise Unparsed("substitutions nested too deeply")
+    out, n = [], len(cmd)
     buf, computed, tilde, quoted = None, False, False, False
+    depth, pending = 0, []
 
     def flush():
         nonlocal buf, computed, tilde, quoted
@@ -46,6 +106,26 @@ def shell_tokens(cmd: str) -> list:
             word.computed, word.tilde = computed, tilde
             out.append(("word", word))
         buf, computed, tilde, quoted = None, False, False, False
+
+    def substitution(start):
+        """Index after the `$(...)` or backtick span at start, as one computed piece of the current word."""
+        nonlocal buf, computed
+        if cmd[start] == "`":
+            j = start + 1
+            while j < n and cmd[j] != "`":
+                j += 2 if cmd[j] == "\\" else 1
+            if j >= n:
+                raise Unparsed("unbalanced backtick")
+            body, end = cmd[start + 1:j], j + 1
+        else:
+            _, end = _scan(cmd, start + 2, True, lenient, bodies, level + 1)
+            body = cmd[start + 2:end - 1]
+        if bodies is not None:
+            bodies.append(body)
+        buf = [] if buf is None else buf
+        buf.append(cmd[start:end])
+        computed = True
+        return end
 
     while i < n:
         c = cmd[i]
@@ -81,12 +161,17 @@ def shell_tokens(cmd: str) -> list:
                     i += 2
                     continue
                 if d == "`" or cmd.startswith("$(", i):
-                    raise Unparsed("command substitution")
+                    if not lenient:
+                        raise Unparsed("command substitution")
+                    i = substitution(i)
+                    continue
                 computed = computed or d == "$"
                 buf.append(d)
                 i += 1
         elif c == "`" or cmd.startswith("$(", i) or cmd.startswith("$'", i):
-            raise Unparsed("command substitution or ANSI-C quoting")
+            if cmd.startswith("$'", i) or not lenient:
+                raise Unparsed("command substitution or ANSI-C quoting")
+            i = substitution(i)
         elif c in " \t\r":
             flush()
             i += 1
@@ -97,45 +182,100 @@ def shell_tokens(cmd: str) -> list:
             if c in "<>" and cmd.startswith("(", i + 1):
                 raise Unparsed("process substitution")
             op = next(o for o in OPERATORS if cmd.startswith(o, i))
-            if op in HEREDOCS:
+            if op in HEREDOCS and not lenient:
                 raise Unparsed("here-document")
             if op in REDIRECTS and buf is not None and not quoted and "".join(buf).isdigit():
                 buf, computed, tilde, quoted = None, False, False, False  # `2>&1`: the fd number belongs to the operator
             flush()
-            out.append(("op", op))
             i += len(op)
+            if op in ("<<-", "<<"):
+                found = _heredoc_delimiter(cmd, i)
+                if found is None:
+                    raise Unparsed("here-document without a readable delimiter")
+                delimiter, delimiter_quoted, i = found
+                pending.append((delimiter, delimiter_quoted, op == "<<-"))
+                out.append(("op", op))
+                continue
+            if op == ")" and nested:
+                if depth == 0:
+                    return out, i
+                depth -= 1
+            elif op == "(":
+                depth += 1
+            out.append(("op", op))
+            if op == "\n" and pending:
+                for delimiter, delimiter_quoted, strip in pending:
+                    body, i = _heredoc_body(cmd, i, delimiter, strip)
+                    if not delimiter_quoted and bodies is not None:
+                        bodies.extend(_body_substitutions(body, lenient, level))
+                    out.append(("heredoc", body))
+                pending = []
         else:
             if buf is None:
                 buf, tilde = [], c == "~"
             computed = computed or c in "$*?[{"  # an expansion or a glob: the process may see other words
             buf.append(c)
             i += 1
+    if nested:
+        raise Unparsed("unbalanced $(")
     flush()
-    return out
+    return out, i
 
 
-def split_commands(cmd: str):
+def _body_substitutions(body: str, lenient: bool, level: int) -> list:
+    """The `$(...)` and backtick bodies an unquoted here-document expands (the shell runs them)."""
+    found, i, n = [], 0, len(body)
+    while i < n:
+        if body[i] == "\\":
+            i += 2
+        elif body.startswith("$(", i):
+            try:
+                _, end = _scan(body, i + 2, True, lenient, None, level + 1)
+            except Unparsed:
+                found.append(body[i + 2:])
+                break
+            found.append(body[i + 2:end - 1])
+            i = end
+        elif body[i] == "`":
+            j = i + 1
+            while j < n and body[j] != "`":
+                j += 2 if body[j] == "\\" else 1
+            found.append(body[i + 1:j])
+            i = j + 1
+        else:
+            i += 1
+    return found
+
+
+def split_commands(cmd: str, lenient: bool = False, bodies: list = None, limit: int = MAX_LINE):
     """The argument lists (lists of Word) the shell would run, split only at unquoted control operators, with
     redirections and their targets removed and comments dropped. None when the words cannot be known (see Unparsed,
-    or a line over MAX_LINE characters); an empty list for a line with no command."""
-    if len(cmd) > MAX_LINE:
+    or a line over MAX_LINE characters); an empty list for a line with no command. Lenient: see the module doc; each
+    command is a Command whose `heredocs` holds the here-document bodies that feed the command ending that line."""
+    if len(cmd) > limit:
         return None
     try:
-        tokens = shell_tokens(cmd)
+        tokens = shell_tokens(cmd, lenient, bodies)
     except Unparsed:
         return None
-    out, cur, i = [], [], 0
+    out, cur, i = [], Command(), 0
     while i < len(tokens):
         kind, text = tokens[i]
         if kind == "word":
             cur.append(text)
+        elif kind == "heredoc":
+            owner = out[-1] if out else cur
+            owner.heredocs = tuple(owner.heredocs) + (text,)
         elif text in SEPARATORS:
             out.append(cur)
-            cur = []
+            cur = Command()
+        elif text in ("<<-", "<<"):
+            pass  # a here-document operator: its delimiter was consumed by the scanner
         elif i + 1 < len(tokens) and tokens[i + 1][0] == "word":  # a redirection: drop its target too
             i += 1
         i += 1
     out.append(cur)
+    # A here-document keeps its command even when the command has no words (`<<EOF` alone): nothing runs it.
     return [c for c in out if c]
 
 

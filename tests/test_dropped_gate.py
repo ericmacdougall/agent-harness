@@ -725,13 +725,111 @@ class QuotedPunctuation(Base):
                                       ["owner-7"]), [])
         padded = ("ah task dispose --agent owner-8 --kind waiting --ack-handoff --ref wa5b00000006 --until X"
                   + " " * 21000)
-        self.assertEqual(self.stamped(padded, ["owner-8"]), [])
+        self.assertEqual(self.stamped(padded, ["owner-8"]), ["owner-8"])  # a long line is read, not skipped (r1 F1)
+        huge = padded + " " * (dropped_gate.PRETOOL_MAX + 1)
+        self.assertEqual(self.stamped(huge, ["owner-9"]), [])
         # An oversized line cannot be split, so a real acknowledgement in it is still judged by the substring rule.
-        self.assertTrue(dropped_gate.acknowledges("ah task dispose --agent X --kind resumed" + " " * 21000))
+        self.assertTrue(dropped_gate.acknowledges("ah task dispose --agent X --kind resumed" + " " * 101000))
 
     def test_a_quoted_separator_does_not_move_the_agent_out_of_its_segment(self):
-        command = 'ah task dispose --agent owner-6 --note ";" --kind waiting --ack-handoff --ref wa5b00000006 --until X'
+        command = 'ah task dispose --agent owner-6 --reason ";" --kind waiting --ack-handoff --ref wa5b00000006 --until X'
         self.assertEqual(self.stamped(command, ["owner-6"]), ["owner-6"])
+
+
+class ReviewRound1(Base):
+    """PR 208 red-team round 1 (goodqa#15684): the stamp must survive the forms main really types, a here-document is
+    judged only where the shell would see one, and a stamp is minted only for a command ah's own parser accepts."""
+    DISPOSE = "ah task dispose --agent A --kind waiting --ack-handoff --ref wa5b00000006"
+    RESUME = "ah task dispose --agent X --kind resumed"
+
+    stamped = QuotedPunctuation.stamped
+
+    def test_main_forms_with_a_computed_value_a_wrapper_or_a_heredoc_are_still_stamped(self):
+        for command in (self.DISPOSE + ' --until "$(date -u -v+1H +%FT%TZ)"',
+                        self.DISPOSE + " --until `date -u +%FT%TZ`",
+                        "cat > n <<EOF\nnote\nEOF\n" + self.DISPOSE + " --until X",
+                        "timeout 30s " + self.DISPOSE + " --until X",
+                        "python3 -X utf8 ~/.claude/hooks/" + self.DISPOSE.replace("ah ", "ah.py ", 1) + " --until X",
+                        "env -u FOO " + self.DISPOSE + " --until X",
+                        "sudo -u eric " + self.DISPOSE + " --until X",
+                        "AH_HOME=/x nice -n 5 " + self.DISPOSE + " --until X"):
+            with self.subTest(command=command[:70]):
+                self.assertEqual(self.stamped(command, ["A"]), ["A"])
+
+    def test_a_command_ah_would_not_run_mints_no_stamp(self):
+        for command in ("ah --help task dispose --agent A --kind waiting --ack-handoff",
+                        "ah task dispose -h --agent A --kind waiting --ack-handoff",
+                        "command -v ah task dispose --agent A --kind waiting --ack-handoff",
+                        "ah task dispose --agent A --kind waiting",
+                        "ah task dispose --agent A --kind nonsense --ack-handoff",
+                        "ah task dispose --kind waiting --ack-handoff",
+                        'ah task dispose --agent "$(echo A)" --kind waiting --ack-handoff',
+                        "ah task dispose --agent $WHO --kind waiting --ack-handoff"):
+            with self.subTest(command=command[:70]):
+                self.assertEqual(self.stamped(command, ["A", "Y", "$(echo A)", "$WHO"]), [])
+
+    def test_an_agent_flag_inside_another_options_value_is_not_the_agent(self):
+        # argparse refuses an option-looking value, so ah would not run this: no stamp for A or Y (it used to stamp Y)
+        command = self.DISPOSE + ' --reason "--agent=Y"'
+        self.assertEqual(self.stamped(command, ["A", "Y"]), [])
+        command = self.DISPOSE + ' --reason "see --agent Y"'
+        self.assertEqual(self.stamped(command, ["A", "Y"]), ["A"])
+
+    def test_a_hidden_heredoc_marker_does_not_hide_the_next_line(self):
+        for prefix in ('echo "<<EOF"', "echo '<<EOF'", "true # <<EOF", "echo \\<<EOF", "cat <<<EOF"):
+            with self.subTest(prefix=prefix):
+                self.assertTrue(dropped_gate.acknowledges(prefix + "\n" + self.RESUME + " --reason r\nEOF"))
+
+    def test_a_real_heredoc_body_is_data_unless_a_shell_runs_it(self):
+        self.assertFalse(dropped_gate.acknowledges("cat <<EOF\n" + self.RESUME + "\nEOF"))
+        self.assertFalse(dropped_gate.acknowledges("cat <<'EOF' > n.md\n" + self.RESUME + "\nEOF\necho done"))
+        self.assertFalse(dropped_gate.acknowledges("cat <<-EOF\n\t" + self.RESUME + "\n\tEOF"))
+        self.assertTrue(dropped_gate.acknowledges("cat <<-EOF\n\tx\n\tEOF\n" + self.RESUME))  # a tab-indented end marker
+        self.assertTrue(dropped_gate.acknowledges("bash <<EOF\n" + self.RESUME + "\nEOF"))
+        self.assertTrue(dropped_gate.acknowledges("cat <<'EOF' | bash\n" + self.RESUME + "\nEOF"))
+        self.assertTrue(dropped_gate.acknowledges("cat <<'EOF' | sh -e\n" + self.RESUME + "\nEOF"))
+        # an unquoted delimiter expands $(...) in the body, and the shell runs it; a quoted one does not
+        self.assertTrue(dropped_gate.acknowledges("cat <<EOF\n$(" + self.RESUME + ")\nEOF"))
+        self.assertFalse(dropped_gate.acknowledges("cat <<'EOF'\n$(" + self.RESUME + ")\nEOF"))
+        # the command after the body is judged on its own
+        self.assertTrue(dropped_gate.acknowledges("cat <<EOF\nnote\nEOF\n" + self.RESUME))
+
+    def test_substitutions_are_judged_by_what_they_run(self):
+        for command in ("$(" + self.RESUME + ")", "echo $(" + self.RESUME + ")", "echo `" + self.RESUME + "`",
+                        'echo "$(' + self.RESUME + ')"', "x=$(" + self.RESUME + ")"):
+            with self.subTest(command=command[:50]):
+                self.assertTrue(dropped_gate.acknowledges(command))
+        self.assertTrue(dropped_gate.acknowledges(self.RESUME + ' --until "$(date)"'))
+
+    def test_wrappers_do_not_hide_an_acknowledgement(self):
+        for wrapper in ("timeout 30s ", "timeout -s KILL 10 ", "sudo -u eric ", "env -u FOO ", "nice -n 5 ", "nohup "):
+            with self.subTest(wrapper=wrapper):
+                self.assertTrue(dropped_gate.acknowledges(wrapper + self.RESUME))
+        self.assertTrue(dropped_gate.acknowledges("python3 -X utf8 ~/.claude/hooks/ah.py task dispose --agent X "
+                                                  "--kind resumed"))
+        self.assertTrue(dropped_gate.acknowledges("python3 -W ignore -I ah.py task dispose --agent X --kind closed"))
+        self.assertFalse(dropped_gate.acknowledges("command -v " + self.RESUME))
+
+    def test_commands_that_only_mention_the_words_are_not_denied(self):
+        message = "git commit -m \"$(cat <<'EOF'\nfix: it's about dispose and closed\nEOF\n)\""
+        self.assertFalse(dropped_gate.acknowledges(message))
+        self.assertFalse(dropped_gate.acknowledges("python3 - <<'EOF'\nprint('dispose closed')\nEOF"))
+        self.assertFalse(dropped_gate.acknowledges("echo dispose closed" + " " * 30000))
+        self.assertFalse(dropped_gate.acknowledges("grep -n \"$(echo dispose)\" notes.txt # closed"))
+
+    def test_the_strict_tokenizer_mission_gate_uses_still_refuses_what_only_the_shell_can_read(self):
+        import shellwords
+        for command in ("cat <<EOF\nx\nEOF", "cat <<-EOF\nx\nEOF", "cat <<< word", "echo $(date)", "echo `date`",
+                        'echo "$(date)"'):
+            with self.subTest(command=command):
+                self.assertIsNone(shellwords.split_commands(command))
+                self.assertIsNotNone(shellwords.split_commands(command, lenient=True))
+
+    def test_nested_and_unbalanced_substitutions_fail_safe(self):
+        nest = "echo " + "$(" * 12 + "date" + ")" * 12
+        self.assertFalse(dropped_gate.acknowledges(nest))  # too deep to read: the conservative text rule, no ack words
+        self.assertTrue(dropped_gate.acknowledges(nest + " ; " + self.RESUME))
+        self.assertTrue(dropped_gate.acknowledges("echo $(" + self.RESUME))  # unbalanced: judged by the text rule
 
 
 if __name__ == "__main__":

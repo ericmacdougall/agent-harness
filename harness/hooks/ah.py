@@ -2156,7 +2156,10 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
             # control. A main payload's hook stamps this agent; anything else (a sub-agent, Codex, a script) has none.
             if caller_identity.take_stamp("ack-handoff", [args.get("agent")], home=home) is None:
                 raise AhError("forbidden", "task.dispose --ack-handoff: only the main agent acknowledges a handoff (its "
-                                           "hook stamps the call); none was found for " + str(args.get("agent")), 3)
+                                           "hook stamps the call); none was found for " + str(args.get("agent")) +
+                                           ". If you are the main agent: the hook stamps only a command it can read, so "
+                                           "pass a literal --agent and run ONE plain `ah task dispose ...` command (no "
+                                           "$(...) in --agent, no wrapper that hides ah)", 3)
         if op == "task.dispose" and (args.get("kind") in ("resumed", "reassigned") + GUARDED_KINDS
                                      or args.get("ack_handoff")) \
                 and actor_id() == args.get("agent"):  # first, so an owner's self-ack is named as such
