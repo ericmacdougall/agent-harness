@@ -121,6 +121,7 @@ DEFAULT_POLICY = {
         r'(^|/)\.npmrc$', r'(^|/)\.netrc$', r'(^|/)\.pgpass$', r'(^|/)\.git-credentials$',
         r'(^|/)\.docker/config\.json$', r'(^|/)\.config/gh/hosts\.yml$', r'(^|/)\.kube/config$',
         r'(^|/)\.vault-token$',
+        r'(^|/)\.config/goodqa/user-token$', r'(^|/)\.agent-harness/gq-browser/[0-9a-f]{16}/key$',
         r'(^|/)\.config/gcloud/(?:credentials\.db|access_tokens\.db|application_default_credentials\.json|legacy_credentials/.*)$',
         r'(^|/)\.gnupg/(?:private-keys-v1\.d/.*|secring\.gpg)$',
         r'^/proc/(?:self|[0-9]+|\*)/environ$', r'^/proc/[^/]+/environ$'],
