@@ -310,7 +310,7 @@ def _config_checks(path):
             ext[key.lower()] = value.strip()
         else:
             kept.append(item)
-    bad = cg._config_refusal('\x00'.join(kept))
+    bad = cg._config_refusal('\x00'.join(kept), allow_partial_clone=True)
     if bad:
         refuse(bad)
     remotes, promisor, filters, legacy = set(), {}, {}, False
@@ -441,6 +441,60 @@ def snapshot_digest(snap):
     return hashlib.sha256(json.dumps(snap, sort_keys=True).encode()).hexdigest()
 
 
+def dir_inodes(path):
+    """{(device, inode)} of the target directory and every directory below it, read just before the removal. The walk deletes
+    only directories in this set, so a directory that appears later (created, or moved in whole with its old files) is never
+    walked into, on the first run or on a resume."""
+    found = set()
+    for root, dirs, _files in os.walk(path):
+        try:
+            info = os.lstat(root)
+        except OSError:
+            continue
+        if stat.S_ISDIR(info.st_mode):
+            found.add((info.st_dev, info.st_ino))
+    return found
+
+
+def dirs_text(dirs):
+    return ''.join('%d %d\n' % pair for pair in sorted(dirs))
+
+
+def dirs_path(home, audit_id):
+    return os.path.join(str(home), '.agent-harness', 'clone-remove', audit_id + '.dirs')
+
+
+def write_dirs(home, audit_id, dirs):
+    """Persist the verified directory set (fsynced) before anything moves; returns (sha256, count)."""
+    text = dirs_text(dirs)
+    path = dirs_path(home, audit_id)
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, text.encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return hashlib.sha256(text.encode()).hexdigest(), len(dirs)
+
+
+def read_dirs(home, audit_id, sha256, count):
+    try:
+        with open(dirs_path(home, audit_id), 'rb') as handle:
+            raw = handle.read(256 * 1024 * 1024)
+    except OSError:
+        refuse('the recorded directory set for that audit id is missing')
+    if hashlib.sha256(raw).hexdigest() != sha256:
+        refuse('the recorded directory set does not match its audit row')
+    pairs = set()
+    for line in raw.decode().splitlines():
+        a, _, b = line.partition(' ')
+        pairs.add((int(a), int(b)))
+    if len(pairs) != count:
+        refuse('the recorded directory set has the wrong size')
+    return pairs
+
+
 def _tree_size(path):
     seen, total = set(), 0
     for root, dirs, files in os.walk(path):
@@ -545,7 +599,8 @@ def verify_clone(path, session, home, authenticated=False, cutoff_ns=None):
             refuse('a live owner (%s) works on the target' % hit)
         result.update(snapshot=snap, snapshot_sha256=snapshot_digest(snap), urls=urls_redacted, proof=known_proof,
                       ignored_dirs=ignored_dirs, entries=sorted(os.listdir(path)), size_estimate=_tree_size(path),
-                      git_version='%d.%d' % git_version(), removable=True, seconds=round(time.monotonic() - started, 1))
+                      git_version='%d.%d' % git_version(), removable=True, seconds=round(time.monotonic() - started, 1),
+                      dirs=dir_inodes(path))
         if check_target(path, session, home) != ident:
             refuse('the directory changed identity during verification')
     except CloneError as error:
@@ -583,21 +638,12 @@ def audit_rows(home, audit_id):
 
 
 # ----------------------------------------------------------------------------- the descriptor walk
-def _birth_ns(info):
-    """When a directory was created (st_birthtime where the platform has it, else its ctime). Used for directories on a
-    RESUMED walk only: a directory's ctime also moves when the interrupted run removed a child, so only the birth time
-    still says "created after verification began". The first run judges every entry by ctime (a directory moved in after
-    verification has a new ctime but an old birth time); files are always judged by ctime."""
-    birth = getattr(info, 'st_birthtime', None)
-    return int(birth * 1e9) if birth else info.st_ctime_ns
-
-
 def _fd_ident(fd):
     info = os.fstat(fd)
     return info.st_dev, info.st_ino
 
 
-def walk_delete(root_fd, cutoff_ns, exempt=None, dev=None, resumed=False):
+def walk_delete(root_fd, cutoff_ns, exempt=None, dev=None, allowed_dirs=None):
     """Delete the contents of the directory `root_fd` (not the directory itself) without following a symlink, crossing a
     device or deleting anything whose ctime, judged at its first lstat, is newer than cutoff_ns. Holds one descriptor at a
     time below the root (each ascent reopens the parent through `..` and compares its identity), so a 300-deep tree works
@@ -633,7 +679,15 @@ def walk_delete(root_fd, cutoff_ns, exempt=None, dev=None, resumed=False):
                 continue
             if not frame['rel'] and exempt.get(name) == info.st_ino:
                 continue  # the marker: removed by the caller just before the root
-            if (_birth_ns(info) if (resumed and stat.S_ISDIR(info.st_mode)) else info.st_ctime_ns) > cutoff_ns:
+            if stat.S_ISDIR(info.st_mode):
+                # A directory is judged by membership in the verified set, never by a timestamp: its ctime moves when a
+                # child is removed (also by an interrupted earlier run) and a directory moved in whole keeps its old birth
+                # time and its files' old ctimes. A directory that is not in the set is kept whole.
+                if allowed_dirs is not None and (info.st_dev, info.st_ino) not in allowed_dirs:
+                    stats['left'].append('%s (not part of the verified tree)' % rel)
+                    frame['kept'] = True
+                    continue
+            elif info.st_ctime_ns > cutoff_ns:
                 stats['left'].append('%s (changed after verification began)' % rel)
                 frame['kept'] = True
                 continue
@@ -761,6 +815,7 @@ def remove_clone(path, reason, session, home, agent='', authenticated=False, ver
               'proof': verdict['proof'], 'size_estimate': verdict['size_estimate'], 'git_version': verdict['git_version'],
               'verifier_version': VERSION, 'urls': verdict['urls']}
     try:
+        intent['dirs_sha256'], intent['dirs_count'] = write_dirs(home, audit_id, verdict['dirs'])
         audit(home, intent)  # fail closed: nothing is renamed when the row cannot be written and fsynced
     except (OSError, ValueError, TypeError) as error:
         raise CloneError('refused', 'the audit row could not be written (%s); nothing was changed' % type(error).__name__)
@@ -790,7 +845,7 @@ def remove_clone(path, reason, session, home, agent='', authenticated=False, ver
     except OSError as error:
         _result_row(home, session, agent, audit_id, False, False, ['stopped before any deletion (%s)' % type(error).__name__])
         raise CloneError('refused', 'stopped before any deletion (%s)' % type(error).__name__)
-    return _finish(home, session, agent, audit_id, quarantine, intent, ident)
+    return _finish(home, session, agent, audit_id, quarantine, intent, ident, allowed_dirs=verdict["dirs"])
 
 
 def _write_marker(quarantine, audit_id, digest):
@@ -828,9 +883,8 @@ def _result_row(home, session, agent, audit_id, removed, directory_removed, left
         pass
 
 
-def _finish(home, session, agent, audit_id, quarantine, intent, ident, marker_ino=None):
+def _finish(home, session, agent, audit_id, quarantine, intent, ident, marker_ino=None, allowed_dirs=None):
     parent, qname = os.path.split(quarantine)
-    resumed = marker_ino is not None
     if marker_ino is None:
         try:
             marker_ino = _write_marker(quarantine, audit_id, intent['snapshot_sha256'])
@@ -854,7 +908,7 @@ def _finish(home, session, agent, audit_id, quarantine, intent, ident, marker_in
         if _fd_ident(qfd) != (ident['dev'], ident['ino']):
             raise CloneError('unknown', 'the quarantine identity changed before the walk')
         fcntl.flock(qfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        stats = walk_delete(qfd, intent['cutoff_ns'], exempt={MARKER_NAME: marker_ino}, dev=ident['dev'], resumed=resumed)
+        stats = walk_delete(qfd, intent['cutoff_ns'], exempt={MARKER_NAME: marker_ino}, dev=ident['dev'], allowed_dirs=allowed_dirs)
         result['left'] = stats['left']
         if not stats['left']:
             try:
@@ -947,4 +1001,5 @@ def resume_clone(audit_id, session, home, agent=''):
         refuse('refs exist in the quarantine that were not in the recorded snapshot')
     check_processes(quarantine)
     ident = {'dev': intent['dev'], 'ino': intent['ino'], 'parent_dev': intent['parent_dev'], 'parent_ino': intent['parent_ino']}
-    return _finish(home, session, agent, audit_id, quarantine, intent, ident, marker_ino=minfo.st_ino)
+    return _finish(home, session, agent, audit_id, quarantine, intent, ident, marker_ino=minfo.st_ino,
+                   allowed_dirs=read_dirs(home, audit_id, intent["dirs_sha256"], intent["dirs_count"]))

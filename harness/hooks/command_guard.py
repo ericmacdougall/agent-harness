@@ -1367,7 +1367,7 @@ _FALSE_WORDS = ('false', 'no', 'off', '0')
 WORKTREE_CONFIG_BYTES = 64 * 1024
 
 
-def _config_refusal(listing, allow_worktree_config=False):
+def _config_refusal(listing, allow_worktree_config=False, allow_partial_clone=False):
     """`git config --local -z --list` output (git's own parse: a BOM, quoting or case games cannot hide a key).
     Refuses an include, a section outside the whitelist, or a key that names a program git would run.
     `allow_worktree_config` (the linked-worktree verifier only) accepts exactly one extension, `extensions.worktreeConfig`,
@@ -1390,6 +1390,9 @@ def _config_refusal(listing, allow_worktree_config=False):
             return 'the repository config includes another file'
         if section not in CLONE_CONFIG_SECTIONS:
             return 'the repository config has a [%s] section' % section[:20]
+        if not allow_partial_clone and ((section == 'remote' and leaf == 'partialclonefilter')
+                                        or (section == 'remote' and leaf == 'promisor' and (not has_value or value.strip().lower() in _TRUE_WORDS))):
+            return 'the repository is a partial clone (a promisor remote), which this check cannot judge without fetching'
         if key == 'core.logallrefupdates' and has_value and value.strip().lower() not in _TRUE_WORDS + ('always',):
             return 'reflogs are switched off in the repository config'  # git also reads 00, 0k and an empty value as false
         if '%s.%s' % (section, leaf) in CLONE_CONFIG_BAD_KEYS or (section == 'core' and leaf in CLONE_CONFIG_BAD_KEYS_CORE):

@@ -12,7 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_ah_clone_remove as T  # noqa: E402
-SESSION, ah, cr, git = T.SESSION, T.ah, T.cr, T.git
+SESSION, ah, cr, git, cg = T.SESSION, T.ah, T.cr, T.git, T.cg
 
 
 class Identity(T.Base):
@@ -33,42 +33,100 @@ class Identity(T.Base):
         code, text = self.cli(dict(base, CLAUDE_CODE_SESSION_ID=SESSION), SESSION, None, "--path", path)
         self.assertEqual(code, 0, text)
         self.assertTrue(json.loads(text)["removable"])
+        code, text = self.cli(dict(base, CLAUDE_CODE_SESSION_ID=SESSION), None, None, "--path", path)
+        self.assertNotEqual(code, 0, text)  # the calling shell's session cannot be read: refuse
+        code, text = self.cli({"AH_HOME": self.home, "CLAUDE_SESSION_ID": SESSION}, SESSION, None, "--path", path)
+        self.assertNotEqual(code, 0, text)  # the CLAUDE_SESSION_ID fallback is not accepted
         code, text = self.cli(dict(base, CLAUDE_CODE_SESSION_ID=SESSION), SESSION, "/somewhere/else", "--path", path)
         self.assertNotEqual(code, 0, text)  # an AH_HOME that is not the account's real home
         self.assertTrue(os.path.isdir(path))
 
 
-class FirstRunAndResume(T.Walk):
-    def newer(self, resumed):
+class VerifiedTree(T.Walk):
+    def test_a_directory_outside_the_verified_set_is_kept_whole_on_any_walk(self):  # AC-6, F1
+        root = self.tree()
+        allowed = cr.dir_inodes(root)
+        os.makedirs(os.path.join(root, "moved-in"))
+        Path(root, "moved-in", "precious").write_text("x")
+        stats = self.run_walk(root, allowed_dirs=allowed)
+        self.assertEqual(Path(root, "moved-in", "precious").read_text(), "x")
+        self.assertEqual([entry.split(" ")[0] for entry in stats["left"]], ["moved-in"])
+        self.assertEqual(sorted(os.listdir(root)), ["moved-in"])
+
+    def test_a_touched_but_verified_directory_is_still_emptied_and_a_new_file_in_it_is_kept(self):  # AC-8
         root = self.tree()
         cutoff = os.lstat(os.path.join(root, "sub", "deep", "c")).st_ctime_ns
+        allowed = cr.dir_inodes(root)
         time.sleep(0.05)
-        Path(root, "late").write_text("x")
         Path(root, "sub", "later").write_text("x")
-        os.makedirs(os.path.join(root, "newdir"))
-        Path(root, "newdir", "inner").write_text("x")
-        return root, self.run_walk(root, cutoff, resumed=resumed)
-
-    def test_first_run_judges_every_entry_by_ctime_so_a_touched_directory_is_kept_whole(self):  # AC-6, H2, M3
-        root, stats = self.newer(False)
-        self.assertTrue(os.path.exists(os.path.join(root, "late")))
-        self.assertTrue(os.path.exists(os.path.join(root, "newdir", "inner")))
-        self.assertTrue(os.path.exists(os.path.join(root, "sub", "b")), "sub was touched after the cutoff: kept whole")
-        self.assertEqual(sorted(entry.split(" ")[0] for entry in stats["left"]), ["late", "newdir", "sub"])
-        self.assertFalse(os.path.exists(os.path.join(root, "a")))
-
-    def test_a_resumed_walk_judges_directories_by_birth_so_a_partly_emptied_one_is_finished(self):  # AC-8
-        root, stats = self.newer(True)
-        self.assertTrue(os.path.exists(os.path.join(root, "late")))
-        self.assertTrue(os.path.exists(os.path.join(root, "newdir", "inner")), "born after the cutoff: kept whole")
+        Path(root, "late").write_text("x")
+        stats = self.run_walk(root, cutoff, allowed_dirs=allowed)
+        self.assertFalse(os.path.exists(os.path.join(root, "sub", "b")), "an old file in a verified directory is deleted")
         self.assertTrue(os.path.exists(os.path.join(root, "sub", "later")))
-        self.assertFalse(os.path.exists(os.path.join(root, "sub", "b")), "an old file in an old directory is deleted on resume")
-        self.assertEqual(sorted(entry.split(" ")[0] for entry in stats["left"]), ["late", "newdir", "sub/later"])
+        self.assertTrue(os.path.exists(os.path.join(root, "late")))
+        self.assertEqual(sorted(entry.split(" ")[0] for entry in stats["left"]), ["late", "sub/later"])
 
 
 class Rollback(T.Base):
     def quarantines(self):
         return [n for n in os.listdir(self.receipts) if n.startswith(cr.QUARANTINE_PREFIX)]
+
+    def test_resume_never_deletes_what_the_first_run_kept(self):  # F1 (receipt r1b)
+        path = self.clone()
+        old = os.path.join(self.tmp, "olddir")
+        os.makedirs(old)
+        Path(old, "precious").write_text("x")
+
+        def move_in(event, **kw):
+            if event == "after_verify":
+                os.rename(old, os.path.join(path, "moved-in"))
+        with mock.patch.object(cr, "HOOK", move_in):
+            result = self.remove(path)
+        self.assertIsNone(result["removed"])
+        again = cr.resume_clone(result["audit_id"], SESSION, self.home)
+        self.assertIsNone(again["removed"])
+        self.assertEqual(Path(result["quarantine"], "moved-in", "precious").read_text(), "x")
+
+    def test_a_file_moved_into_the_clone_after_verification_is_kept(self):  # real filesystem, no patched stat
+        path = self.clone()
+        stray = os.path.join(self.tmp, "stray.txt")
+        Path(stray).write_text("x")
+        os.utime(stray, (1_000_000_000, 1_000_000_000))
+
+        def move_in(event, **kw):
+            if event == "after_verify":
+                os.rename(stray, os.path.join(path, "stray.txt"))
+        with mock.patch.object(cr, "HOOK", move_in):
+            result = self.remove(path)
+        self.assertEqual(Path(result["quarantine"], "stray.txt").read_text(), "x")
+
+    def test_a_missing_or_altered_directory_set_refuses_resume(self):  # F1
+        path = self.clone()
+        real = os.unlink
+        count = []
+
+        def failing(name, *a, **kw):
+            count.append(name)
+            if len(count) > 3:
+                raise OSError(5, "io")
+            return real(name, *a, **kw)
+        with mock.patch.object(os, "unlink", failing):
+            result = self.remove(path)
+        sidecar = cr.dirs_path(self.home, result["audit_id"])
+        saved = Path(sidecar).read_text()
+        Path(sidecar).write_text(saved + "1 2\n")
+        with self.assertRaises(cr.CloneError):
+            cr.resume_clone(result["audit_id"], SESSION, self.home)
+        os.unlink(sidecar)
+        with self.assertRaises(cr.CloneError):
+            cr.resume_clone(result["audit_id"], SESSION, self.home)
+        self.assertTrue(os.path.isdir(result["quarantine"]))
+
+    def test_the_hook_form_exemption_refuses_a_partial_clone_by_its_keys_without_the_network(self):  # D4, review of spec v4
+        path = self.clone(partial=True)
+        with mock.patch.object(cg, "REMOTE_LS", side_effect=AssertionError("the network must not be reached")):
+            reason = cg.reproducible_clone_refusal(path)
+        self.assertIn("partial clone", reason)
 
     def test_a_directory_moved_into_the_clone_after_verification_is_kept(self):  # M3
         path = self.clone()

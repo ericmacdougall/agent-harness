@@ -18,20 +18,23 @@ MUTANTS = {
                            ["FullAndPartialClone.test_partial_clone_is_removable_and_every_git_call_denies_the_network"]),
     "symlink followed": ("info = os.lstat(name, dir_fd=frame['fd'])", "info = os.stat(name, dir_fd=frame['fd'])",
                          ["Walk.test_a_symlink_is_removed_as_a_link_and_its_target_survives"]),
-    "no cutoff": ("info.st_ctime_ns) > cutoff_ns:", "info.st_ctime_ns) > 2 ** 62:",
-                  ["review:FirstRunAndResume.test_first_run_judges_every_entry_by_ctime_so_a_touched_directory_is_kept_whole",
+    "no cutoff": ("elif info.st_ctime_ns > cutoff_ns:", "elif False:",
+                  ["review:VerifiedTree.test_a_touched_but_verified_directory_is_still_emptied_and_a_new_file_in_it_is_kept",
                    "Removal.test_a_file_written_after_verification_survives_even_through_resume"]),
-    "birth time used on the first run": ("if (_birth_ns(info) if (resumed and stat.S_ISDIR(info.st_mode)) else info.st_ctime_ns) > cutoff_ns:",
-                                         "if (_birth_ns(info) if stat.S_ISDIR(info.st_mode) else info.st_ctime_ns) > cutoff_ns:",
-                                         ["review:Rollback.test_a_directory_moved_into_the_clone_after_verification_is_kept"]),
-    "ctime used on resume": ("if (_birth_ns(info) if (resumed and stat.S_ISDIR(info.st_mode)) else info.st_ctime_ns) > cutoff_ns:",
-                             "if info.st_ctime_ns > cutoff_ns:", ["Removal.test_an_interrupted_walk_is_finished_by_resume"]),
+    "verified directory set ignored": ("if allowed_dirs is not None and (info.st_dev, info.st_ino) not in allowed_dirs:", "if False:",
+                                       ["review:VerifiedTree.test_a_directory_outside_the_verified_set_is_kept_whole_on_any_walk",
+                                        "review:Rollback.test_resume_never_deletes_what_the_first_run_kept"]),
+    "directory set not checked on resume": (["if hashlib.sha256(raw).hexdigest() != sha256:", "if len(pairs) != count:"], ["if False:", "if False:"],
+                                            ["review:Rollback.test_a_missing_or_altered_directory_set_refuses_resume"]),
+    "directories judged by ctime again": ("if allowed_dirs is not None and (info.st_dev, info.st_ino) not in allowed_dirs:", "if info.st_ctime_ns > cutoff_ns:",
+                                          ["Removal.test_an_interrupted_walk_is_finished_by_resume"]),
+    "hook-form accepts a partial clone": ("if not allow_partial_clone and ((section == 'remote'", "if False and ((section == 'remote'",
+                                          ["review:Rollback.test_the_hook_form_exemption_refuses_a_partial_clone_by_its_keys_without_the_network"]),
     "unwritable marker not restored": ("            _restore(parent, qname, intent, ident)\n            _result_row(", "            raise\n            _result_row(",
                                        ["review:Rollback.test_an_unwritable_marker_puts_the_clone_back_and_records_it"]),
     "relative alternates mis-resolved": ("os.path.join(os.path.dirname(os.path.dirname(candidate)), line))", "os.path.join(os.path.dirname(candidate), line))",
                                          ["review:Rollback.test_a_relative_alternates_entry_is_resolved_against_objects"]),
-    "token userinfo accepted": ("re.compile(r'^(?:https?|git)://[^/\\s]*@|://[^/@\\s]*:[^/@\\s]*@')", "re.compile(r'://[^/@\\s]*:[^/@\\s]*@')",
-                                ["review:Rollback.test_a_token_as_the_only_userinfo_refuses"]),
+    "token userinfo accepted": ("re.compile(r'^(?:https?|git)://", "re.compile(r'^(?:nomatch)://", ["review:Rollback.test_a_token_as_the_only_userinfo_refuses"]),
     "device crossed": ("if info.st_dev != dev:", "if False:", ["Walk.test_a_second_device_is_not_crossed"]),
     "intent row not required": ("raise CloneError('refused', 'the audit row could not be written (%s); nothing was changed' % type(error).__name__)",
                                 "pass", ["Removal.test_the_intent_row_must_be_written_before_anything_moves"]),
@@ -69,7 +72,7 @@ def main():
             shutil.copy(ROOT / "tests" / "test_ah_clone_remove_review.py", tmp / "tests")
             for extra in ("install.py", "install_codex.py"):
                 shutil.copy(ROOT / extra, tmp / extra)
-            target = tmp / "harness" / "hooks" / "clone_remove.py"
+            target = tmp / "harness" / "hooks" / ("command_guard.py" if name.startswith("hook-form") else "clone_remove.py")
             text = target.read_text()
             olds, news = (old, new) if isinstance(old, list) else ([old], [new])
             if any(o not in text for o in olds):

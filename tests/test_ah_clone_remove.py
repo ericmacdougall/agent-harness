@@ -163,10 +163,6 @@ class FullAndPartialClone(Base):
         self.assertTrue(os.path.exists(log), "control: a plain git call must contact the remote, or this test proves nothing")
         self.assertRefused(path, "remote.uploadpack")
 
-    def test_the_hook_form_exemption_still_refuses_a_partial_clone(self):  # AC-2, D4
-        path = self.clone(partial=True)
-        self.assertIsNotNone(cg.reproducible_clone_refusal(path))
-
     def test_partial_clone_variants_refuse(self):  # AC-5, NEG-4
         cases = {
             "other filter": lambda p: git(p, "config", "remote.origin.partialclonefilter", "blob:limit=1k"),
