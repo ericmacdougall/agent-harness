@@ -15,4 +15,6 @@ Rounds 4 to 6 (spec v4, reviewed at 231ed6e, c05b858 and 6a18019 against code 6c
 
 Round 7 (spec v4 at 969e431 plus one stated-limit sentence in AC-4, code 8647cd2): ACCEPT. The environment read is sound (KERN_PROCARGS2 layout, argc handling, start-environment limit). Findings kept as follow-ups: sysctl called without argtypes (fragile on arm64), an empty string in the environment ends the parse early, and the parent check looks one level up so a deliberately wrapping shell with an inline override passes it (now a stated limit in AC-4).
 
+Rounds 8 to 10 (spec v4 at 640d82d, 8ca46b1 and the final text, code 0a07513): ACCEPT each time. The environment-identity model was withdrawn (probe: no ancestor start environment carries the session variable) and replaced by option A with a STATED LIMIT that the session identity is caller-settable. Findings applied: the old sentence claiming the session is never caller-settable deleted, the loss list (a) to (e) added, D2 and Risks point to the limit and to goodqa#15751, the loss headline reworded to match the named exceptions. The user acceptance of the residual is a pending ask registered by main, not granted.
+
 Verdict: ACCEPT
