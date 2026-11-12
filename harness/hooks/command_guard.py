@@ -1881,7 +1881,19 @@ def authenticated_remote_refs(url, repo, timeout):
     return refs
 
 
-def busy_processes(path):
+def _proc_name(pid):
+    """The Name of a process from /proc/PID/status (world readable), or None."""
+    try:
+        with open('/proc/%s/status' % pid) as handle:
+            for line in handle:
+                if line.startswith('Name:'):
+                    return line.partition(':')[2].strip()
+    except OSError:
+        return None
+    return None
+
+
+def busy_processes(path, skip_names=()):
     """Processes whose working directory is the worktree or inside it: [(pid, command)], or None when that cannot be
     checked completely (fail closed). A process of the SAME user that cannot be inspected is a None, not a skip, and so
     is any other error; a process that has exited (ENOENT, ESRCH) is skipped, and so is one that cannot be read because it
@@ -1905,6 +1917,12 @@ def busy_processes(path):
                                 return None  # an owner we cannot determine is a process we could not see
                             if owned_by_another_user:
                                 continue  # the documented limit: other users processes are invisible without root
+                            # A same-user process whose cwd link is unreadable (a daemon that dropped dumpability or lives under
+                            # another security profile: ssh-agent, gpg-agent, tailscaled, systemd, docker on t2-dev) is skipped
+                            # only when its exact /proc name is in the policy list, which names services, never a shell or an
+                            # agent; any other name, a failing name lookup or an empty list keeps the refusal.
+                            if skip_names and _proc_name(entry) in skip_names:
+                                continue
                         return None  # a same-user process we could not read, and any other error
                     if cwd == path or cwd.startswith(path + os.sep):
                         found.append((int(entry), 'pid'))
@@ -1942,7 +1960,9 @@ def registry_lists(repo, path):
 VERIFY_SECONDS = 120.0
 REMOVE_SECONDS = 900
 WORKTREE_POLICY = {'reproducible_clone': {'total_seconds': VERIFY_SECONDS, 'remote_seconds': 30.0, 'scale': 15.0,
-                                         'allow_hooks': True}}
+                                         'allow_hooks': True,
+                                         'busy_skip_names': ('systemd', '(sd-pam)', 'ssh-agent', 'gpg-agent', 'tailscaled',
+                                                             'docker')}}
 
 
 def delegated_policy(base=None):
@@ -1964,7 +1984,8 @@ def verify_worktree(path, authenticated=False, policy=None):
               'verifier': VERIFIER_VERSION}
     reason = worktree_scope_refusal(path) if isinstance(path, str) and os.path.isabs(path) else 'not a literal absolute path'
     if reason is None:
-        reason = linked_worktree_remove_refusal(path, os.sep, delegated_policy(policy),
+        effective = delegated_policy(policy)
+        reason = linked_worktree_remove_refusal(path, os.sep, effective,
                                                 remote_ls=authenticated_remote_refs if authenticated else None)
         try:
             report['head'] = _git_out(path, ['rev-parse', '--verify', 'HEAD'], 2.0).strip()
@@ -1972,7 +1993,7 @@ def verify_worktree(path, authenticated=False, policy=None):
         except (ValueError, OSError, subprocess.SubprocessError):
             pass
     if reason is None:
-        busy = busy_processes(path)
+        busy = busy_processes(path, tuple(delegated_policy(policy)['reproducible_clone'].get('busy_skip_names') or ()))
         if busy is None:
             reason = 'could not check for processes using the worktree'
         elif busy:

@@ -225,6 +225,49 @@ class OtherUsersProcesses(Repo):
         self.assertEqual(self.scan({"111": errno.ENOENT}, {}, ["111"]), [])
         self.assertEqual(self.scan({"111": errno.ESRCH}, {}, ["111"]), [])
 
+    # the real t2-dev scan: same-user daemons (ssh-agent, gpg-agent, tailscaled, systemd, sd-pam, docker) cannot be read
+    def scan_names(self, readlinks, owners, names, skip, listing):
+        real_isdir = os.path.isdir
+
+        def link(path):
+            value = readlinks[path.split("/")[2]]
+            if isinstance(value, int):
+                raise OSError(value, "fake")
+            return value
+
+        def owner(path):
+            return mock.Mock(st_uid=owners[path.split("/")[2]])
+        with mock.patch.object(cg.os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
+                mock.patch.object(cg.os, "listdir", lambda p: list(listing) if p == "/proc" else []), \
+                mock.patch.object(cg.os, "readlink", link), mock.patch.object(cg.os, "stat", owner), \
+                mock.patch.object(cg, "_proc_name", lambda pid: names.get(str(pid))):
+            return cg.busy_processes(str(self.linked), skip)
+
+    def test_a_same_user_unreadable_process_is_skipped_only_when_its_name_is_in_the_skip_list(self):
+        me = os.getuid()
+        args = ({"111": errno.EACCES, "222": errno.EACCES}, {"111": me, "222": me}, {"111": "ssh-agent", "222": "bash"})
+        self.assertIsNone(self.scan_names(*args, (), ["111", "222"]))  # no list: fail closed as before
+        self.assertIsNone(self.scan_names(*args, ("ssh-agent",), ["111", "222"]))  # bash is not a daemon: still closed
+        self.assertEqual(self.scan_names({"111": errno.EACCES}, {"111": me}, {"111": "ssh-agent"}, ("ssh-agent",), ["111"]), [])
+        # the name must match exactly, a name lookup that fails closes, and a readable busy process still blocks
+        self.assertIsNone(self.scan_names({"111": errno.EACCES}, {"111": me}, {"111": "ssh-agent2"}, ("ssh-agent",), ["111"]))
+        self.assertIsNone(self.scan_names({"111": errno.EACCES}, {"111": me}, {}, ("ssh-agent",), ["111"]))
+        self.assertEqual(self.scan_names({"111": errno.EACCES, "222": str(self.linked) + "/x"}, {"111": me, "222": me},
+                                         {"111": "ssh-agent"}, ("ssh-agent",), ["111", "222"]), [(222, "pid")])
+
+    def test_the_delegated_policy_carries_the_standard_daemon_names_and_the_hook_default_has_none(self):
+        names = cg.WORKTREE_POLICY["reproducible_clone"]["busy_skip_names"]
+        for daemon in ("systemd", "(sd-pam)", "ssh-agent", "gpg-agent", "tailscaled", "docker"):
+            self.assertIn(daemon, names)
+        for shell in ("bash", "zsh", "sh", "node", "python3", "claude", "git", "vim", "tmux"):
+            self.assertNotIn(shell, names)
+        self.assertNotIn("busy_skip_names", cg.DEFAULT_POLICY["reproducible_clone"])
+        seen = []
+        real = cg.busy_processes
+        with mock.patch.object(cg, "busy_processes", lambda path, skip=(): seen.append(skip) or real(path, skip)):
+            cg.verify_worktree(str(self.linked))
+        self.assertEqual(tuple(seen[0]), tuple(names))
+
     def test_a_readable_process_inside_the_worktree_blocks_whoever_owns_it(self):
         inside = str(self.linked) + "/src"
         self.assertEqual(self.scan({"111": inside, "222": "/elsewhere"}, {"111": os.getuid() + 1, "222": os.getuid()},
