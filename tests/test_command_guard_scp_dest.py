@@ -64,6 +64,7 @@ BLOCKED = [
     "rsync -a x t2-dev:~/.claude/hooks/command_guard.py -e ssh",
     "scp x t2-dev:~/.claude/hooks/command_guard.py -rP 22",
     "rsync -a x t2-dev:~/.claude/hooks/command_guard.py --max-alloc 1G",
+    "rsync -a x t2-dev:~/.claude/hooks/command_guard.py --some-future-opt 1G",
     # an empty remote path is the remote home (review M6)
     "rsync -a ./.claude t2-dev:",
     "scp -r .claude t2-dev:",
@@ -72,6 +73,19 @@ BLOCKED = [
     "rsync -a ./ t2-dev:~/",
     "rsync -a --delete proj/ t2-dev:~/",
     "rsync -a --delete proj t2-dev:~/",
+    # rsync -R / --relative / --files-from rebuild the source path under the destination (receipt r1 F1)
+    "rsync -R .claude/hooks/command_guard.py t2-dev:",
+    "rsync -aR .claude/hooks/command_guard.py t2-dev:~/",
+    "rsync -aR ./.claude/hooks t2-dev:~/",
+    "rsync -R /home/eric/.claude/hooks/command_guard.py t2-dev:/",
+    "rsync --relative .claude/hooks/command_guard.py t2-dev:",
+    "rsync -R /home/eric/./.claude/hooks/command_guard.py t2-dev:~/",
+    "rsync --files-from=list.txt . t2-dev:~/",
+    "rsync -a --files-from list.txt ./ t2-dev:~/",
+    # sshpass is looked through (receipt r1 F2)
+    "sshpass -p x scp x t2-dev:~/.claude/hooks/command_guard.py",
+    "sshpass -f pw rsync -a x t2-dev:~/.claude/hooks/command_guard.py",
+    "sshpass -e scp x t2-dev:~/.claude/hooks/command_guard.py",
 ]
 ALLOWED = [
     "scp t2-dev:~/.claude/hooks/command_guard.py /tmp/x",
@@ -95,6 +109,11 @@ ALLOWED = [
     "rsync -avze ssh proj t2-dev:~/proj2/",
     "rsync -a proj t2-dev:~/p --max-alloc 1G",
     "rsync --rsh ssh t2-dev:~/.claude/hooks/command_guard.py /tmp/x",
+    "rsync --zc zstd t2-dev:~/.claude/hooks/command_guard.py ./",
+    "rsync --copy-as eric t2-dev:~/.claude/hooks/command_guard.py ./",
+    "rsync -R src/app.py t2-dev:~/proj/",
+    "rsync -aR ./proj/x.py t2-dev:~/",
+    "sshpass -p x scp x t2-dev:/tmp/x",
     "rsync --exclude '*.pyc' t2-dev:~/.claude/hooks/ /tmp/h/",
     "scp -P22 x t2-dev:~/x",
     "scp -rP 22 x t2-dev:/tmp/x",

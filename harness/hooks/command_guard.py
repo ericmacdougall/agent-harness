@@ -2257,7 +2257,7 @@ SHELLS = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'bus
 PS_SHELLS = {'pwsh', 'powershell'}
 INTERPRETERS = {'python', 'python3', 'python2', 'node', 'nodejs', 'perl', 'ruby', 'php', 'deno', 'bun', 'lua', 'rscript',
                 'osascript', 'pypy', 'pypy3', 'tclsh', 'awk-script'}
-WRAPPER_VALUE_OPTS = {'nice': ('-n', '--adjustment'), 'ionice': ('-c', '-n', '-p', '-t'), 'chrt': ('-p',),
+WRAPPER_VALUE_OPTS = {'sshpass': ('-f', '-d', '-p'), 'nice': ('-n', '--adjustment'), 'ionice': ('-c', '-n', '-p', '-t'), 'chrt': ('-p',),
                       'stdbuf': ('-i', '-o', '-e'), 'caffeinate': ('-t', '-w'), 'watch': ('-n', '-d', '--interval'),
                       'strace': ('-o', '-e', '-p', '-s', '-u'), 'ltrace': ('-o', '-e', '-p', '-s', '-u'),
                       'runuser': ('-u', '-g', '-G'), 'su': ('-s', '-g', '-G'), 'sg': (), 'setsid': (),
@@ -2266,7 +2266,7 @@ WRAPPER_VALUE_OPTS = {'nice': ('-n', '--adjustment'), 'ionice': ('-c', '-n', '-p
 WRAPPERS_SIMPLE = {'command', 'builtin', 'exec', 'nohup', 'time', 'nice', 'ionice', 'setsid', 'stdbuf', 'caffeinate',
                    'noglob', 'unbuffer', 'chrt', 'taskset', 'doas', 'sudo', 'env', 'xargs', 'timeout', 'watch', 'gosu',
                    'chroot', 'runuser', 'strace', 'ltrace', 'script', 'dtruss', 'arch', 'nsenter', 'firejail', 'sandbox-exec',
-                   'start-process', 'invoke-expression', 'iex', 'invoke-command', 'icm', 'call', 'start'}
+                   'start-process', 'invoke-expression', 'iex', 'invoke-command', 'icm', 'call', 'start', 'sshpass'}
 RM_CMDS = {'rm', 'unlink', 'rmdir', 'shred', 'srm', 'trash', 'trash-put', 'remove-item', 'ri', 'del', 'erase', 'rd',
            'rimraf', 'gio-trash'}
 MV_CMDS = {'mv', 'move-item', 'mi', 'move', 'rename-item', 'ren', 'rni'}
@@ -3695,7 +3695,7 @@ class Analyzer:
             while i < len(args) and (texts[i].startswith('-') or i == 0 and False):
                 i += 2 if texts[i] in ('-s', '-k', '--signal', '--kill-after') else 1
             i += 1  # duration
-        elif name in ('nice', 'ionice', 'chrt', 'taskset', 'stdbuf', 'caffeinate', 'watch', 'strace', 'ltrace', 'setsid', 'arch', 'nohup', 'unbuffer', 'dtruss', 'chroot', 'nsenter', 'firejail', 'sandbox-exec', 'script', 'gosu', 'runuser', 'su', 'sg', 'time', 'noglob', 'command', 'builtin', 'exec', 'start-process', 'start', 'call', 'invoke-command', 'icm'):
+        elif name in ('nice', 'ionice', 'chrt', 'taskset', 'stdbuf', 'caffeinate', 'watch', 'strace', 'ltrace', 'setsid', 'arch', 'nohup', 'unbuffer', 'dtruss', 'chroot', 'nsenter', 'firejail', 'sandbox-exec', 'script', 'gosu', 'runuser', 'su', 'sg', 'time', 'noglob', 'command', 'builtin', 'exec', 'start-process', 'start', 'call', 'invoke-command', 'icm', 'sshpass'):
             valued = WRAPPER_VALUE_OPTS.get(name, ())
             while i < len(args) and texts[i].startswith('-'):
                 i += 2 if texts[i] in valued else 1
@@ -5514,7 +5514,8 @@ class Analyzer:
                          '--modify-window', '--protocol', '--chown', '--usermap', '--groupmap', '--iconv', '--out-format', '--password-file',
                          '--address', '--sockopts', '--write-batch', '--only-write-batch', '--read-batch', '--info', '--debug',
                          '--compress-level', '--skip-compress', '--temp-dir', '--max-delete', '--checksum-choice', '--cc', '--stop-after',
-                         '--stop-at', '--outbuf', '--remote-option', '-M'}
+                         '--stop-at', '--outbuf', '--remote-option', '-M', '--zc', '--zl', '--compress-choice', '--log-file-format', '--copy-as',
+                         '--checksum-seed', '--max-alloc', '--early-input', '--dparam', '--files-from', '--exclude-from', '-@'}
 
     def _copy_operands(self, name, args):
         """The positional operands of scp or rsync with option VALUES skipped (a value after the destination must not hide it).
@@ -5574,6 +5575,16 @@ class Analyzer:
             return out
         return [rest if rest.startswith(('/', '~')) else '~/' + rest]
 
+    @staticmethod
+    def _relative_tail(text):
+        """The part of a source path rsync -R rebuilds under the destination: after a `/./` marker, else without a leading `/` or `./`."""
+        if '/./' in text:
+            return text.split('/./', 1)[1].strip('/')
+        text = text.lstrip('/')
+        while text.startswith('./'):
+            text = text[2:].lstrip('/')
+        return '' if text in ('.', '..') else text.strip('/')
+
     def remote_copy_dest(self, name, args, texts):
         """scp and rsync copying TO a remote path that names a protected harness location (hooks, WALs, state): the same refusal
         as a local or ssh-wrapped cp (goodqa#15759; the 2026-11-11 t2-dev install of command_guard.py used scp after the cp was
@@ -5589,6 +5600,8 @@ class Analyzer:
         recursive = bool(letters & {'r', 'R'}) or '--recursive' in texts or (name == 'rsync' and (bool(letters & {'a'}) or '--archive' in texts or
                                                                                         any(s.text.endswith('/') for s in operands[:-1])))
         deleting = name == 'rsync' and any(t.startswith('--del') or t in ('--remove-source-files', '--remove-sent-files') for t in texts)
+        relative = name == 'rsync' and (bool(letters & {'R'}) or '--relative' in texts or any(t.startswith('--files-from') for t in texts))
+        hidden = name == 'rsync' and any(t.startswith('--files-from') for t in texts)  # the sources are in a file the guard cannot read
         # the destination is the last operand, and every remote operand that follows a local one is an upload target too (an
         # unknown option value after the destination must not hide it)
         dests, seen_local = [], False
@@ -5606,16 +5619,20 @@ class Analyzer:
                 text = source.text
                 base = posixpath.basename(text.rstrip('/'))
                 contents = text.endswith('/') or text.rstrip('/') in ('.', '..')
+                rel = self._relative_tail(text) if relative else ''
                 for path in paths:
-                    if contents or not base:
+                    if rel:  # rsync -R rebuilds the source path under the destination (cut at a /./ marker)
+                        named.append(path.rstrip('/') + '/' + rel)
+                        roots.append(path.rstrip('/') + '/' + rel)
+                    elif contents or not base:
                         roots.append(path)
                     else:
                         named.append(path.rstrip('/') + '/' + base)
                         roots.append(path.rstrip('/') + '/' + base)
-            if not sources or deleting:
+            if not sources or deleting or hidden:
                 roots += paths
             for candidate, tiers in [(c, ('log', 'unknown')) for c in named] + \
-                    [(r, ('log', 'unknown', 'ancestor')) for r in roots if recursive or deleting]:
+                    [(r, ('log', 'unknown', 'ancestor')) for r in roots if recursive or deleting or hidden]:
                 fake = Word()
                 fake.alts = [candidate]
                 fake.dynamic, fake.subs, fake.vars = dest.dynamic, dest.subs, dest.vars
