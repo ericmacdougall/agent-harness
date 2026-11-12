@@ -5517,8 +5517,10 @@ class Analyzer:
                          '--stop-at', '--outbuf', '--remote-option', '-M'}
 
     def _copy_operands(self, name, args):
-        """The positional operands of scp or rsync with option VALUES skipped (a value after the destination must not hide it)."""
+        """The positional operands of scp or rsync with option VALUES skipped (a value after the destination must not hide it).
+        A short cluster such as `-avze ssh` or `-rP 22` ends in a value flag whose value is the NEXT word; `-P22` carries it."""
         flags = self.SCP_VALUE_FLAGS if name == 'scp' else self.RSYNC_VALUE_FLAGS
+        letters = {f[1] for f in flags if len(f) == 2}
         out, skip, ended = [], False, False
         for word in args:
             text = word.text
@@ -5529,9 +5531,15 @@ class Analyzer:
                 ended = True
                 continue
             if not ended and text.startswith('-') and len(text) > 1:
-                key = text.split('=', 1)[0] if text.startswith('--') else text
-                if key in flags and '=' not in text:
-                    skip = True
+                if text.startswith('--'):
+                    key = text.split('=', 1)[0]
+                    if key in flags and '=' not in text:
+                        skip = True
+                else:
+                    for k, ch in enumerate(text[1:]):
+                        if ch in letters:
+                            skip = k == len(text) - 2  # a value flag LAST in the cluster takes the next word; otherwise the rest is its value
+                            break
                 continue
             out.append(word)
         return out
@@ -5555,8 +5563,10 @@ class Analyzer:
                 match = self.REMOTE_DEST.match(text)
                 if match:
                     rest = match.group(1)
-        if rest is None or rest == '':
+        if rest is None:
             return None
+        if rest == '':
+            return ['~']  # `host:` is the remote home
         rest = unquote(rest) if urlish else rest
         if urlish:
             rest = rest[2:] if rest.startswith(('/~/', '~/')) else rest
@@ -5575,29 +5585,44 @@ class Analyzer:
         operands = self._copy_operands(name, args)
         if len(operands) < 2:
             return
-        dest = operands[-1]
-        paths = self.remote_paths(dest.text)
-        if not paths:
-            return
         letters = _flag_letters(args)
         recursive = bool(letters & {'r', 'R'}) or '--recursive' in texts or (name == 'rsync' and (bool(letters & {'a'}) or '--archive' in texts or
                                                                                         any(s.text.endswith('/') for s in operands[:-1])))
         deleting = name == 'rsync' and any(t.startswith('--del') or t in ('--remove-source-files', '--remove-sent-files') for t in texts)
-        candidates = list(paths)
-        for source in operands[:-1]:
-            base = posixpath.basename(source.text.rstrip('/'))
-            if base and not self.remote_paths(source.text):
-                candidates += [p.rstrip('/') + '/' + base for p in paths]
-        for candidate in candidates:
-            fake = Word()
-            fake.alts = [candidate]
-            fake.dynamic, fake.subs, fake.vars = dest.dynamic, dest.subs, dest.vars
-            cls, _resolved, _literal = self.target_class(fake)
-            contains = cls == 'ancestor' and (recursive or deleting)
-            if cls in ('log', 'unknown') or contains:
-                self.refuse(name + ' to a remote harness path (the sanctioned route is `ah install-files`)', fake,
-                            tiers=('log', 'unknown', 'ancestor') if contains else ('log', 'unknown'))
-                return
+        # the destination is the last operand, and every remote operand that follows a local one is an upload target too (an
+        # unknown option value after the destination must not hide it)
+        dests, seen_local = [], False
+        for index, operand in enumerate(operands):
+            if self.remote_paths(operand.text):
+                if index == len(operands) - 1 or seen_local:
+                    dests.append(operand)
+            else:
+                seen_local = True
+        for dest in dests:
+            paths = self.remote_paths(dest.text)
+            sources = [o for o in operands if o is not dest and not self.remote_paths(o.text)]
+            named, roots = list(paths), []
+            for source in sources:
+                text = source.text
+                base = posixpath.basename(text.rstrip('/'))
+                contents = text.endswith('/') or text.rstrip('/') in ('.', '..')
+                for path in paths:
+                    if contents or not base:
+                        roots.append(path)
+                    else:
+                        named.append(path.rstrip('/') + '/' + base)
+                        roots.append(path.rstrip('/') + '/' + base)
+            if not sources or deleting:
+                roots += paths
+            for candidate, tiers in [(c, ('log', 'unknown')) for c in named] + \
+                    [(r, ('log', 'unknown', 'ancestor')) for r in roots if recursive or deleting]:
+                fake = Word()
+                fake.alts = [candidate]
+                fake.dynamic, fake.subs, fake.vars = dest.dynamic, dest.subs, dest.vars
+                cls, _resolved, _literal = self.target_class(fake)
+                if cls in tiers:
+                    self.refuse(name + ' to a remote harness path (the sanctioned route is `ah install-files`)', fake, tiers=tiers)
+                    return
 
     def overwrite_dest(self, what, word):
         """cp/mv/ln/install onto an existing Tier A file (or into a protected dir by glob/variable)."""

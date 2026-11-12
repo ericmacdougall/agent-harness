@@ -59,6 +59,19 @@ BLOCKED = [
     "rsync -av ./hooks/ t2-dev:~/.claude/hooks/",
     "scp -r hooks t2-dev:~/.claude/",
     "scp -r hooks/ t2-dev:~/.claude/hooks",
+    # a short cluster ending in a value flag after the destination, and an unknown option with a value (review M5)
+    "rsync x t2-dev:~/.claude/hooks/command_guard.py -avze ssh",
+    "rsync -a x t2-dev:~/.claude/hooks/command_guard.py -e ssh",
+    "scp x t2-dev:~/.claude/hooks/command_guard.py -rP 22",
+    "rsync -a x t2-dev:~/.claude/hooks/command_guard.py --max-alloc 1G",
+    # an empty remote path is the remote home (review M6)
+    "rsync -a ./.claude t2-dev:",
+    "scp -r .claude t2-dev:",
+    "scp -r .claude user@t2-dev:",
+    # contents copied to the home or a delete into it still reach the protected files (review M7, kept)
+    "rsync -a ./ t2-dev:~/",
+    "rsync -a --delete proj/ t2-dev:~/",
+    "rsync -a --delete proj t2-dev:~/",
 ]
 ALLOWED = [
     "scp t2-dev:~/.claude/hooks/command_guard.py /tmp/x",
@@ -76,6 +89,15 @@ ALLOWED = [
     "rsync -av -e 'ssh -p 22' t2-dev:~/.claude/hooks/ /tmp/h/",
     "scp -r src t2-dev:~/project/",
     "scp x scp://t2-dev/tmp/x",
+    # a project copied INTO the home is not a copy over the harness directories (review M7)
+    "scp -r proj t2-dev:~/",
+    "rsync -a proj t2-dev:~/",
+    "rsync -avze ssh proj t2-dev:~/proj2/",
+    "rsync -a proj t2-dev:~/p --max-alloc 1G",
+    "rsync --rsh ssh t2-dev:~/.claude/hooks/command_guard.py /tmp/x",
+    "rsync --exclude '*.pyc' t2-dev:~/.claude/hooks/ /tmp/h/",
+    "scp -P22 x t2-dev:~/x",
+    "scp -rP 22 x t2-dev:/tmp/x",
 ]
 
 
