@@ -98,3 +98,11 @@ Checkpoint: not required (under 10 min per step); every step is idempotent: veri
 - A lazy fetch changes the clone or leaks a credential: mitigation, AC-2 protocol denial plus lazy-fetch off, canary test, no credential in output.
 - The tool becomes a general rm: mitigation, scope strictly inside the work directory, a real .git directory, host local only, policy from code, literal path, audit on both ends, hook-form rm exemption unchanged.
 - Known limits: dangling and cruft-pack objects that no ref or reflog reaches are not protected; notes and refs that `ls-remote --heads --tags` does not list always refuse (clear message).
+
+## Reviews
+
+Spec core sha256: `cc5e6dbdcdbd2a0b05fa2db5027dc126b1f0a899b4c4e4a49e944baf3fab08e4`
+
+| Role | Verdict | Reviewer | Kind | Source | Bound to |
+|---|---|---|---|---|---|
+| adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | current |

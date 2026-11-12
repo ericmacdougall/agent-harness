@@ -1,0 +1,21 @@
+{
+ "v": 1,
+ "reviews": [
+  {
+   "kind": "agent",
+   "identity": "a0c568dfa08e7eb86",
+   "verdict": "ACCEPT",
+   "model": "red-team",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/notes/goodqa-15743/review-opus-delta.md",
+    "sha256": "ee561b413186eb17515eaf290fb3bd50dc4e7c56b4285ff8c4909bcf88942fee"
+   },
+   "role": "adversarial",
+   "core_sha": "cc5e6dbdcdbd2a0b05fa2db5027dc126b1f0a899b4c4e4a49e944baf3fab08e4",
+   "at": "2026-11-12T04:51:41.385179+00:00",
+   "key": "agent:a0c568dfa08e7eb86"
+  }
+ ]
+}
