@@ -9,7 +9,10 @@ around a guard. This command is the sanctioned route:
   * the host gets a constant remote program (REMOTE_SCRIPT, text never built from caller input) run as one shell-quoted
     command through ssh: stage and verify every file (nothing live changes), then rename them in a fixed order with
     command_guard.py LAST, read the shas back and compare the host's own self-test with its baseline; anything worse rolls
-    every file back (guard first);
+    every file back (guard first). Worse: a guard probe changed, a doctor check newly failing, or a hook wired before
+    and not wired after. A hook row that the baseline manifest did not declare and that settings.json does not register
+    (doctor MISSING) is not worse: this command never edits settings.json, so the result lists it as `unregistered` and
+    it does not run until install.py's settings merge registers it (goodqa#15754 AC-10);
   * an audit row on the Mac before the first remote write and after the run, one on the host; an unknown outcome is never
     reported as installed or refused; a host with an unfinished run refuses new runs until it is resumed or rolled back.
 
@@ -168,7 +171,11 @@ def selftest():
                 items = data if isinstance(data, list) else data.get("findings") or data.get("checks") or []
                 failing = sorted(str(i.get("id") or "?") for i in items
                                  if isinstance(i, dict) and str(i.get("state", "WIRED")) not in ("WIRED", "PENDING"))
-                res["doctor"] = {"flags": True, "failing": failing, "exit": p.returncode}
+                states = {}
+                for i in items[:400]:
+                    if isinstance(i, dict):
+                        states[str(i.get("id") or "?")[:80]] = str(i.get("state", "WIRED"))[:20]
+                res["doctor"] = {"flags": True, "failing": failing, "exit": p.returncode, "states": states}
         except subprocess.TimeoutExpired:
             res["doctor"] = {"flags": True, "failing": None, "timeout": True}
         except Exception as e:
@@ -601,6 +608,25 @@ def sha256(data):
 
 
 # ----------------------------------------------------------------------------- the self-test comparison
+UNREGISTERED = "MISSING"  # doctor's state for a declared hook that settings.json does not register
+
+
+def _states(result):
+    states = (result.get("doctor") or {}).get("states")
+    return states if isinstance(states, dict) else None
+
+
+def newly_declared_unregistered(before, after):
+    """Doctor ids the baseline manifest did not declare at all and that are declared but unregistered after the install
+    (goodqa#15754 AC-10: install-files ships a manifest that adds hook rows, and never edits settings.json, so those rows
+    are MISSING until main registers them). They are reported, not a regression. Empty when either side has no states
+    (an older baseline): the strict rule applies."""
+    s0, s1 = _states(before), _states(after)
+    if s0 is None or s1 is None:
+        return []
+    return sorted(i for i, state in s1.items() if i not in s0 and state == UNREGISTERED)
+
+
 def selftest_worse(before, after):
     """None when `after` is no worse than `before`, else the reason."""
     for key, was in (before.get("guard") or {}).items():
@@ -613,7 +639,14 @@ def selftest_worse(before, after):
     if d0.get("failing") is not None:
         if d1.get("failing") is None:
             return "doctor could not run after the install"
-        new = sorted(set(d1["failing"]) - set(d0["failing"]))
+        s0, s1 = _states(before), _states(after)
+        if s0 is not None and s1 is not None:
+            # a hook wired before the install must still be declared and wired after it (a renamed or dropped row of a
+            # wired hook is a regression, not a new row)
+            lost = sorted(i for i, state in s0.items() if state == "WIRED" and s1.get(i) != "WIRED")
+            if lost:
+                return "doctor checks no longer wired: %s" % ", ".join(lost[:10])
+        new = sorted(set(d1["failing"]) - set(d0["failing"]) - set(newly_declared_unregistered(before, after)))
         if new:
             return "new failing doctor checks: %s" % ", ".join(new[:10])
     return None
@@ -666,7 +699,8 @@ def finish(home, run, host, result, exit_code, extra, ticket, poster, kind_):
         out["audit_warning"] = "the result row could not be written on this machine"
     summary = {n: {"old": v.get("old_sha"), "new": v.get("new_sha")} for n, v in (extra.get("files") or {}).items()}
     out["ticket_comment"] = post_comment(ticket, "ah install-files %s on %s: %s (run %s) ref %s files %s" % (
-        kind_, host, result, run, extra.get("ref"), json.dumps(summary)[:1500]), poster)
+        kind_, host, result, run, extra.get("ref"), json.dumps(summary)[:1500])
+        + ("; " + str(extra["note"])[:500] if extra.get("note") else ""), poster)
     if exit_code != 0:
         raise InstallError(result, "%s on %s (run %s)%s" % (result, host, run, ": " + str(extra["reason"]) if extra.get("reason") else ""), exit_code, out)
     return out
@@ -816,7 +850,14 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
             remote.call(op, args)
         except InstallError:
             pass
-    return finish(home, run, host, "installed", 0, {"ref": ref, "files": plan, "selftest_after": after}, ticket, poster, kind_)
+    extra = {"ref": ref, "files": plan, "selftest_after": after}
+    unregistered = newly_declared_unregistered(before, after)
+    if unregistered:
+        # installed, but these hooks do not run until settings.json registers them (install.py's merge): never "live"
+        extra["unregistered"] = unregistered
+        extra["note"] = ("hooks declared by the new manifest but not registered in settings.json on %s (they do not run "
+                         "until registered): %s" % (host, ", ".join(unregistered[:10])))
+    return finish(home, run, host, "installed", 0, extra, ticket, poster, kind_)
 
 
 def _keep_mac_copy(home, remote, run, name, old_sha):
