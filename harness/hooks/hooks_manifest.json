@@ -725,6 +725,42 @@
    ],
    "status": "installed",
    "rules": []
+  },
+  {
+   "id": "status-truth:prompt",
+   "script": "status_truth.py",
+   "arg": "prompt",
+   "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "status-truth:session-start",
+   "script": "status_truth.py",
+   "arg": "session-start",
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "status-truth:stop",
+   "script": "status_truth.py",
+   "arg": "stop",
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
   }
  ]
 }

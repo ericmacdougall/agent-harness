@@ -975,13 +975,15 @@ def attach_evidence(home: Path, goal_id: str, wid: str, *, kind: str = "", sessi
     if rec is None:
         raise MissionError(f"no WAL entry {wid} in session {session}: attach only rows that exist")
     note = str(rec.get("note") or "")
-    if rec.get("event") == "deploy":
+    import goals_view  # noqa: PLC0415 - one deploy-record rule, shared with ah goals
+    if goals_view.is_deploy_record(rec):
         found_kind = "deploy"
     elif RT_NOTE.match(note):
         found_kind = "live_test" if rec.get("live") is True else "test"
     else:
-        raise MissionError(f"{wid} is a {clean(rec.get('event'), 20)} row: only REALLY_TESTED rows and deploy events "
-                           "are evidence")
+        raise MissionError(f"{wid} is a {clean(rec.get('event'), 20)} row: only REALLY_TESTED rows and deploy records "
+                           "(event deploy/release/install or a DEPLOYED/INSTALLED/RELEASED note naming a sha or "
+                           "version) are evidence")
     kind = kind or found_kind
     if kind not in ATTACH_KINDS or (found_kind == "deploy") != (kind == "deploy"):
         raise MissionError(f"--kind {clean(kind, 20)} does not fit a {found_kind} row")
