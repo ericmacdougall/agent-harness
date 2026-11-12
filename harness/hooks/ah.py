@@ -300,7 +300,7 @@ def discover_agents(home: Path, session: str, wal: Path) -> dict:
     return found
 
 
-SILENT_UNDISPOSED_S = 6 * 3600  # as liveness.TASK_ABANDON_S: silent this long with no disposition needs a decision
+SILENT_UNDISPOSED_S = 6 * 3600  # as liveness.TASK_ABANDON_S: silent this long with no disposition is reported
 
 
 def owners(home: Path, session: str, now: float | None = None, comments=None) -> dict:
@@ -436,13 +436,15 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                                                                 and covered(d.get("ref"), (r["agent_id"],))))
         r["disposition"] = dict(d, live=alive) if d else None
         r["decision_required"] = bool(r["owner"] and r["state"] == "DROPPED" and not alive)
+        r["attention"] = []
         if r["owner"] and str(r["state"]).startswith("SILENT") and not alive \
                 and ((d is not None and d.get("kind") in ("waiting", "resumed", "reassigned"))
                      or (d is None and (r["idle_s"] or 0) >= SILENT_UNDISPOSED_S)):
-            # goodqa#15754: a silent owner whose recorded wait expired, or one silent SILENT_UNDISPOSED_S with no
-            # disposition at all, needs main's decision; a fresh SILENT owner (31 min, no disposition) does not
-            r["decision_required"] = True
-            r["flags"] = list(r.get("flags") or []) + ["wait-expired" if d is not None else "silent-undisposed"]
+            # goodqa#15754 (receipt r1 F1, main's ruling): a silent owner whose recorded wait expired, or one silent
+            # SILENT_UNDISPOSED_S with no disposition, is REPORTED in `attention` for main to look at. It does not set
+            # decision_required, which drives the dropped-owner Stop gate, ahd successor requests and tier_gate: a
+            # silent owner may be a live process (a long build) and must not get a successor or block main's Stop.
+            r["attention"] = ["wait-expired" if d is not None else "silent-undisposed"]
         if d and d.get("kind") in ("legacy", "superseded", "wontdo") and r["state"] not in ("done", "handoff", "returned") \
                 and not r["state"].startswith(("live", "working", "waiting")):
             label = "unverified-legacy" if d["kind"] == "legacy" else d["kind"]
@@ -492,6 +494,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     return {"session": session, "generated": iso(now), "counts": counts, "owners": rows, "source": "direct",
             "deadlines": dls,
             "undisposed": sorted([r["agent_id"] for r in rows if r["decision_required"]] + [d["id"] for d in missed]),
+            "attention": sorted(r["agent_id"] for r in rows if r.get("attention")),
             "legacy_unverified": sorted(a for a, d in disp.items() if d.get("kind") == "legacy")}
 
 
@@ -2477,6 +2480,7 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
     try:
         data = owners(home, session, now=now)
         owners_summary = {"counts": data.get("counts"), "undisposed": data.get("undisposed"),
+                          "attention": data.get("attention"),
                           "live": sorted(r["agent_id"] for r in data.get("owners") or []
                                          if r.get("owner") and str(r.get("state")).startswith(("live", "working")))}
     except Exception:  # noqa: BLE001 - the evidence report must not fail on the owner view
@@ -2514,7 +2518,8 @@ def status_text(data: dict) -> str:
     o = data.get("owners") or {}
     if "counts" in o:
         lines.append(f"## OWNERS live {len(o.get('live') or [])}: {', '.join(a[:12] for a in o.get('live') or [])}; "
-                     f"undisposed: {', '.join(o.get('undisposed') or []) or 'none'}")
+                     f"undisposed: {', '.join(o.get('undisposed') or []) or 'none'}; "
+                     f"attention (silent, wait expired or none): {', '.join(o.get('attention') or []) or 'none'}")
     else:
         lines.append("## OWNERS " + str(o.get("error", "")))
     lines.append("(" + data["rule"] + ")")

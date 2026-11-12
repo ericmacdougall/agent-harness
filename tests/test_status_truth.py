@@ -269,6 +269,31 @@ class Lint(Base):
         self.assertEqual(turn["prompt"], "fix the readme")
         self.assertNotIn("was not run", self.stop_raw(recs).get("reason", ""))
 
+    def test_private_state_refuses_a_symlinked_ancestor(self):
+        """Receipt r1: a link planted at state/ (not the immediate parent) must not redirect the counter, the flag log
+        or the injection marker; the counter fails open (False) and the writer raises, so nothing lands outside."""
+        import stop_blocks  # noqa: PLC0415
+        outside = self.home / "outside"
+        outside.mkdir()
+        state = self.home / ".agent-harness" / "state"
+        self.assertFalse(state.exists())  # fresh temp home: nothing written yet
+        state.parent.mkdir(exist_ok=True)
+        state.symlink_to(outside, target_is_directory=True)
+        self.assertFalse(stop_blocks.allow(SESSION, "u-prompt-1", "status_truth"))
+        with self.assertRaises(OSError):
+            st._write_private(st._marker_path(SESSION), "x")
+        st._mark_injected(SESSION, "whats left")  # swallowed, still writes nothing
+        self.assertEqual(list(outside.rglob("*")), [])
+
+    def test_no_opener_in_enforce_mode_never_blocks_however_the_answer_changes(self):
+        """Receipt r1 F2 NEG: with no user-prompt record in the tail the turn is unknown. Keying the once-per-turn
+        counter on the answer let each rewrite block again; now an unknown turn only warns, whatever the answer."""
+        self.seed()
+        for text, uuid in ((WRONG, "a1"), (WRONG + "\n\nStill: nobody is working on the leads.", "a2")):
+            out = self.stop_raw([self.answer(text, uuid)])
+            self.assertNotEqual(out.get("decision"), "block")
+            self.assertTrue(out.get("systemMessage", "").startswith("status-truth (turn unknown, not blocked): "))
+
     def test_calibrate_counts_the_skip_rule_with_the_contradictions(self):
         self.seed()
         two_goals = "Prod move and self-update both remain in progress; nothing more to report on the leads."
@@ -359,6 +384,30 @@ class Inject(Base):
         text = self.ctx(st.cmd_session_start({"session_id": SESSION, "source": "compact"}))
         self.assertIn("self-update", text)
         self.assertEqual(st.cmd_session_start({"session_id": SESSION, "source": "startup"}), {})
+
+    def test_watchdog_fallback_and_handler_result_print_once_between_them(self):
+        """Receipt r1 F4: the watchdog's timeout fallback and the handler's result used to print independently, so a
+        handler finishing at the limit could put two JSON documents on stdout (invalid hook output)."""
+        import threading  # noqa: PLC0415
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", io.StringIO()), \
+                mock.patch.dict(st._RELEVANT, {"value": True}), mock.patch.dict(st._EMITTED, {"value": False}):
+            st._watch("prompt", time.monotonic(), limit=0)  # times out at once; holds the emit lock to the exit
+            late = threading.Thread(target=st._emit, args=(json.dumps({"late": 1}),), daemon=True)
+            late.start()
+            late.join(0.3)
+            self.assertTrue(late.is_alive())  # blocked: the process exits before it can print
+            st._EMIT_LOCK.release()
+            late.join(2)
+            lines = [x for x in out.getvalue().splitlines() if x.strip()]
+            self.assertEqual(len(lines), 1)
+            self.assertIn("GOALS UNAVAILABLE (timeout)", lines[0])
+            out.seek(0)
+            out.truncate()
+            st._EMITTED["value"] = False
+            self.assertTrue(st._emit(json.dumps({"result": 1})))  # the handler wins the race this time
+            st._fallback("prompt", "timeout")
+            self.assertEqual(out.getvalue().strip(), json.dumps({"result": 1}))
 
     def test_cli_fails_open_and_still_injects_on_crash(self):
         self.seed()

@@ -15,17 +15,36 @@ import re
 from pathlib import Path
 
 
+def _root() -> Path:
+    return Path(os.environ.get("AH_HOME") or Path.home()) / ".agent-harness"
+
+
 def _path(session: str) -> Path:
-    home = Path(os.environ.get("AH_HOME") or Path.home())
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", session or "unknown")[:120]
-    return home / ".agent-harness" / "state" / "stop-blocks" / f"{safe}.json"
+    return _root() / "state" / "stop-blocks" / f"{safe}.json"
+
+
+def symlink_in_chain(directory: Path, root: Path = None) -> bool:
+    """True when `directory` or any ancestor up to and including `root` (default ~/.agent-harness) is a symlink, so a
+    planted link at state/ or state/<name>/ cannot redirect a private write (receipt r1). Missing parts are not
+    links."""
+    root = Path(root or _root())
+    d = Path(directory)
+    while True:
+        if os.path.islink(d):
+            return True
+        if d == root or d.parent == d:
+            return False
+        d = d.parent
 
 
 def allow(session: str, turn: str, hook: str, per_hook: int = 1, total: int = 3) -> bool:
     try:
         path = _path(session)
+        if symlink_in_chain(path.parent):  # before mkdir too, so nothing is created through a link
+            return False
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if os.path.islink(path.parent):
+        if symlink_in_chain(path.parent):
             return False
         try:
             state = json.loads(path.read_text())

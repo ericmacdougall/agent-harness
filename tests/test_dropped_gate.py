@@ -272,10 +272,7 @@ class GateTests(Base):
              "note": "REALLY_TESTED DG-LIVE-1: dropowner verified live on https://app.example: pass"}])
         self.dispose("closed", "disp-closed-ok", reason="verified dropowner's v1.2.0 deploy serves and passes live",
                      deployed="wde000000001", live_test="DG-LIVE-1")
-        # goodqa#15754: ten days on, the fixture's other owner (aliveowner) is SILENT with no disposition and needs a
-        # decision of its own; the closed owner never comes back
-        self.assertNotIn("dropowner", self.stop(now=NOW + 10 * 86400).get("reason", ""))
-        self.assertEqual(self.stop(now=NOW + 3600), {})
+        self.assertEqual(self.stop(now=NOW + 10 * 86400), {})
 
     def test_reassigned_is_live_only_while_the_replacement_is(self):
         self.dispose("reassigned", "disp-reassign-ok", ref="aliveowner")

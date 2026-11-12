@@ -1453,8 +1453,13 @@ stalled goal, plus the option to queue the goal on its ticket.
   only fixed-pattern fields (ids, check names, enums, ages, the main-set target). Policy key `status_lint` in
   provenance_policy.json: `warn` (shipped: a systemMessage the user sees, and a flag row in
   `~/.agent-harness/state/status-truth/flags.jsonl` with ids and rules only), `enforce` (blocks once per human turn
-  through `stop_blocks.py`; main switches it only on the spec's precision bound) or `off`.
+  through `stop_blocks.py`; main switches it only on the spec's precision bound) or `off`. When the transcript tail
+  holds no user prompt the turn is unknown and the lint only warns, in enforce too.
   `status_truth.py calibrate <transcript>` replays both rules over a transcript.
+- `ah owners` lists in `attention` each SILENT owner whose recorded wait expired, or that has been silent 6 h with no
+  disposition (row reason `wait-expired` or `silent-undisposed`); `ah status` prints the same list on its owners line.
+  It is a report for main to look at: it does not set `decision_required`, so the dropped-owner Stop gate and ahd
+  successor requests ignore it (a silent owner may be a long build that writes no WAL lines).
 
 ## Design limits
 

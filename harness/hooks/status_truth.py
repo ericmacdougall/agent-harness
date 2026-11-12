@@ -35,6 +35,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -338,8 +339,8 @@ def current_turn(payload: dict) -> dict:
         # the injection counts only when this hook injected for this very prompt (the marker holds its hash), never
         # because some record quotes the goals text (red-team L2)
         out["consulted"] = out["consulted"] or _injected_marker(payload, out["prompt"])
-    if not out["prompt_id"]:  # no opener in the tail (red-team L1): key on the answer, so turns still differ
-        out["prompt_id"] = "answer:" + hashlib.sha256(out["answer"].encode()).hexdigest()[:16]
+    # no opener in the tail: prompt_id stays "" and cmd_stop never blocks (receipt r1 F2): a key made from the answer
+    # would change with every rewrite and let the hook block the same turn again and again
     return out
 
 
@@ -365,9 +366,14 @@ def _injected_marker(payload: dict, prompt: str) -> bool:
 
 
 def _write_private(path: Path, text: str, append: bool = False) -> None:
-    """0600 file in a 0700 dir, never through a symlink."""
+    """0600 file in a 0700 dir, never through a symlink (the file, its directory or any directory up to the state
+    root, receipt r1)."""
+    import stop_blocks  # noqa: PLC0415
+    root = _home() / ".agent-harness"
+    if stop_blocks.symlink_in_chain(path.parent, root):
+        raise OSError("state dir is a symlink")
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if os.path.islink(path.parent):
+    if stop_blocks.symlink_in_chain(path.parent, root):
         raise OSError("state dir is a symlink")
     flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC) | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(str(path), flags, 0o600)
@@ -522,12 +528,17 @@ def cmd_stop(payload: dict) -> dict:
     text = ("Status-truth: your answer disagrees with or skipped the goal ledger. Run `python3 ~/.claude/hooks/ah.py "
             "goals` and restate from it. Only DONE_LIVE is done; for anything below it say the state and name the "
             "unmet part of the target:\n" + "\n".join(problems))
-    if mode == "enforce":
+    if mode == "enforce" and turn["prompt_id"]:  # no known turn: fail open to a warning (receipt r1 F2)
         import stop_blocks  # noqa: PLC0415
         if stop_blocks.allow(str(payload.get("session_id") or ""), turn["prompt_id"], "status_truth"):
             return {"decision": "block", "reason": text[:LIMIT]}
-    return {"systemMessage": ("status-truth (already blocked once): " if mode == "enforce" else "status-truth warning: ")
-            + text[:1500]}
+    if mode != "enforce":
+        lead = "status-truth warning: "
+    elif not turn["prompt_id"]:
+        lead = "status-truth (turn unknown, not blocked): "
+    else:
+        lead = "status-truth (already blocked once): "
+    return {"systemMessage": lead + text[:1500]}
 
 
 # ------------------------------------------------------------------ calibration
@@ -588,28 +599,50 @@ def calibrate(path: str, uuids=(), limit: int = 200, simulate_injection: bool = 
     return out
 
 
+_EMIT_LOCK = threading.Lock()
+_EMITTED = {"value": False}
+
+
+def _emit(text: str) -> bool:
+    """Print one JSON document to stdout at most once per process (receipt r1 F4): the watchdog fallback and the
+    handler's result race, and two documents on stdout would be invalid hook output."""
+    with _EMIT_LOCK:
+        if _EMITTED["value"]:
+            return False
+        _EMITTED["value"] = True
+        print(text, flush=True)
+        return True
+
+
 def _fallback(command: str, reason: str) -> None:
     """On a timeout or crash the injection hooks still say status is unknown (spec delta H3); Stop stays silent."""
     event = {"prompt": "UserPromptSubmit", "session-start": "SessionStart"}.get(command)
     if event:
         lead = PROMPT_LEAD if command == "prompt" else COMPACT_LEAD
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": event,
-                                                 "additionalContext": lead + UNAVAILABLE.format(reason)}}), flush=True)
+        _emit(json.dumps({"hookSpecificOutput": {"hookEventName": event,
+                                                 "additionalContext": lead + UNAVAILABLE.format(reason)}}))
 
 
 _RELEVANT = {"value": False}  # set once the prompt is a status question (or a compact start): only then fall back
 
 
+def _watch(command: str, started: float, limit: float = None) -> None:
+    limit = WALL_LIMIT_S if limit is None else limit
+    while time.monotonic() - started < limit:
+        time.sleep(0.05)
+    print("status_truth: time limit; skipped", file=sys.stderr, flush=True)
+    if _RELEVANT["value"]:
+        _fallback(command, "timeout")
+    # hold the emit lock to the exit so a handler result cannot follow the fallback onto stdout
+    _EMIT_LOCK.acquire()
+    _EMITTED["value"] = True
+
+
 def _watchdog(command: str) -> None:
-    import threading  # noqa: PLC0415
     started = time.monotonic()
 
     def watch():
-        while time.monotonic() - started < WALL_LIMIT_S:
-            time.sleep(0.05)
-        print("status_truth: time limit; skipped", file=sys.stderr, flush=True)
-        if _RELEVANT["value"]:
-            _fallback(command, "timeout")
+        _watch(command, started)
         os._exit(0)
     threading.Thread(target=watch, daemon=True).start()
 
@@ -631,6 +664,7 @@ def main(argv=None) -> int:
         for row in calibrate(a.transcript, tuple(a.uuid), a.limit, not a.no_simulate_injection):
             print(json.dumps(row))
         return 0
+    _EMITTED["value"] = False  # one hook run per process; reset so in-process callers (tests) start clean
     _watchdog(argv[0])
     try:
         import safe_input  # noqa: PLC0415
@@ -650,7 +684,7 @@ def main(argv=None) -> int:
             _fallback(argv[0], f"error {type(error).__name__}")
         return 0
     if result:
-        print(json.dumps(result))
+        _emit(json.dumps(result))
     return 0
 
 

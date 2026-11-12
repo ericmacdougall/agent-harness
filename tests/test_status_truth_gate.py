@@ -55,23 +55,50 @@ class ExpiredWait(unittest.TestCase):
         data = self.owner(49 * 3600, {"kind": "waiting", "at": NOW - 40 * 3600, "until": NOW - 9 * 3600,
                                       "ref": "goodqa#15643", "seq": 1})
         self.assertTrue(self.row(data)["state"].startswith("SILENT"))
-        self.assertIn(AGENT, data["undisposed"])
-        self.assertIn("wait-expired", self.row(data)["flags"])
+        self.assertIn(AGENT, data["attention"])
+        self.assertIn("wait-expired", self.row(data)["attention"])
+        self.assertNotIn(AGENT, data["undisposed"])  # receipt r1 F1: reported, never a gate or successor input
+        self.assertFalse(self.row(data)["decision_required"])
 
     def test_live_wait_stays_quiet(self):
         data = self.owner(49 * 3600, {"kind": "waiting", "at": NOW - 3600, "until": NOW + 4 * 86400,
                                       "ref": "goodqa#15643", "seq": 1})
         self.assertNotIn(AGENT, data["undisposed"])
+        self.assertNotIn(AGENT, data["attention"])
 
     def test_owner_quiet_31_minutes_is_not_undisposed(self):
         data = self.owner(31 * 60, None)
         self.assertEqual(self.row(data)["state"], "SILENT")
         self.assertNotIn(AGENT, data["undisposed"])
+        self.assertNotIn(AGENT, data["attention"])
 
     def test_silent_7h_without_any_disposition_needs_a_decision(self):
         data = self.owner(7 * 3600, None)
-        self.assertIn(AGENT, data["undisposed"])
-        self.assertIn("silent-undisposed", self.row(data)["flags"])
+        self.assertIn(AGENT, data["attention"])
+        self.assertIn("silent-undisposed", self.row(data)["attention"])
+        self.assertNotIn(AGENT, data["undisposed"])
+        self.assertFalse(self.row(data)["decision_required"])
+
+
+    def test_ahd_requests_no_successor_for_a_silent_owner(self):
+        """Receipt r1 F1 NEG: a SILENT owner (here 7 h with no disposition; it may be a running process, such as a long
+        build that writes no WAL lines) is only reported. ahd, which asks `ah task succeed` for every decision_required
+        row while main is away, makes no call for it, and the dropped-owner gate does not list it."""
+        import ahd  # noqa: PLC0415
+        data = self.owner(7 * 3600, None)
+        os.utime(self.wal / "main.jsonl", (NOW - 7200, NOW - 7200))  # main away 2 h: ahd's successor step is active
+        calls = []
+
+        def runner(argv, timeout, stdin=None):
+            calls.append(argv)
+            return 0, "{}", ""
+        with mock.patch.object(ahd, "home", lambda: self.home):
+            daemon = ahd.Daemon(policy={"successor_main_idle_s": 1800, "ah": ["ah"]}, runner=runner)
+            done = daemon.request_successors({SESSION: data}, NOW, 1e12)
+        self.assertEqual([c for c in calls if "succeed" in c], [])
+        self.assertEqual([d for d in done if d[1] == AGENT[:12]], [])
+        self.assertNotIn(AGENT, data["undisposed"])
+        self.assertIn(AGENT, data["attention"])
 
 
 class Digest(unittest.TestCase):
