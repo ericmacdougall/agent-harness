@@ -126,6 +126,9 @@ DEFAULT_POLICY = {
         r'(^|/)\.gnupg/(?:private-keys-v1\.d/.*|secring\.gpg)$',
         r'^/proc/(?:self|[0-9]+|\*)/environ$', r'^/proc/[^/]+/environ$'],
     'credential_allow_regexes': [r'\.pub$', r'\.env\.(?:example|sample|template|dist|defaults)$', r'-cert\.pub$'],
+    # directories that HOLD a credential file among harmless ones (config.json, lease files): a recursive reader, an archive to
+    # stdout, a copy tool or a find -exec naming the directory prints the secret; a plain read of a neighbour stays allowed
+    'credential_parent_dirs': ['{home}/.config/goodqa', '{home}/.agent-harness/gq-browser'],
     'credential_dirs': ['{home}/.ssh', '{home}/.aws', '{home}/.config/rclone', '{home}/.claude/goodqa-hive',
                         '{home}/.gnupg', '{home}/.docker', '{home}/.config/gh', '{home}/.config/gcloud',
                         '{home}/.kube'],
@@ -167,7 +170,7 @@ ALWAYS_ENFORCED = (SECRET_DUMP, LOG_DELETE)
 # written or replaced policy cannot switch the guard off.
 ADDITIVE_LISTS = ('protected_log_roots', 'protected_segment_names', 'protected_file_names', 'protected_file_suffixes',
                   'protected_roots', 'keep_names', 'keep_suffixes', 'keep_segments', 'generic_homes', 'ancestor_roots',
-                  'state_files', 'credential_path_regexes', 'credential_dirs', 'credential_samples',
+                  'state_files', 'credential_path_regexes', 'credential_dirs', 'credential_parent_dirs', 'credential_samples',
                   'rclone_blocked_config', 'guard_files', 'owned_checkouts')
 
 
@@ -272,6 +275,7 @@ class Compiled:
         self.cred = [re.compile(r, re.I) for r in policy['credential_path_regexes']]
         self.cred_allow = [re.compile(r, re.I) for r in policy['credential_allow_regexes']]
         self.cred_dirs = [self._segs(fmt(t, h)) for t in policy['credential_dirs'] for h in homes]
+        self.cred_parent_dirs = [self._segs(fmt(t, h)) for t in policy['credential_parent_dirs'] for h in homes]
         self.cred_samples = [fmt(t, h) for t in policy['credential_samples'] for h in homes]
         self.secret_env = re.compile(policy['secret_env_regex'])
         self.secret_env_excl = re.compile(policy['secret_env_exclude_regex'])
@@ -2251,6 +2255,7 @@ PRINT_FILE_CMDS = {'cat', 'head', 'tail', 'less', 'more', 'most', 'bat', 'batcat
                    'emacs', 'pr', 'column', 'jq', 'yq', 'tee', 'type', 'get-content', 'gc', 'select-string', 'sls',
                    'openssl', 'cmp', 'xargs-cat', 'highlight', 'ccat', 'pygmentize', 'tr', 'look', 'expand', 'unexpand',
                    'split', 'csplit', 'tar', 'zip', 'gzip', 'bzip2', 'xz', 'zstd', 'lz4', '7z', 'zcat', 'cpio'}
+ARCHIVE_CMDS = {'tar', 'bsdtar', 'gtar', 'zip', '7z', 'cpio'}
 GREP_CMDS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'zgrep', 'select-string', 'sls', 'pt'}
 EXFIL_CMDS = {'curl', 'wget', 'scp', 'sftp', 'nc', 'ncat', 'netcat', 'socat', 'rsync', 'http', 'https', 'xh', 'telnet'}
 ECHO_CMDS = {'echo', 'printf', 'print', 'write-output', 'write-host', 'out-host', 'out-string', 'say', 'logger',
@@ -4058,7 +4063,7 @@ class Analyzer:
             if bname in PRINT_FILE_CMDS or bname in GREP_CMDS or bname in EXFIL_CMDS:
                 for r in roots:
                     p = norm_path(r.text, ctx, ctx.cwd)
-                    if self.under_cred_dir(p) or self.is_cred_path(r.text, r):
+                    if self.under_cred_dir(p) or self.under_cred_parent(p, below=True) or self.is_cred_path(r.text, r):
                         ctx.secret_seen += 1
                         if self.out_visible(pl, idx, True) and not (bname in GREP_CMDS and self._count_only(body[1:])):
                             ctx.add(SECRET_DUMP, 'find-exec-credentials',
@@ -4515,6 +4520,17 @@ class Analyzer:
                 return True
         return False
 
+    def under_cred_parent(self, path, below=False):
+        """path is a directory that holds a credential among harmless files (or an ancestor of one); with `below` also a path
+        inside it (a key directory), for readers that walk their operand."""
+        segs = Compiled._segs(path)
+        for d in self.c.cred_parent_dirs:
+            if len(segs) <= len(d) and d[:len(segs)] == segs:
+                return True
+            if below and len(segs) > len(d) and segs[:len(d)] == d and not segs[len(d):][-1:] == ['config.json']:
+                return True
+        return False
+
     @staticmethod
     def _count_only(args):
         return bool(_flag_letters(args) & set('cqlL') or _longs(args) & {'--count', '--quiet', '--silent', '--files-with-matches', '--files-without-match'})
@@ -4561,6 +4577,8 @@ class Analyzer:
                     continue
             hit = self.is_cred_path(t, w) if t == w.text else self._cred_one(t)
             dir_hit = recursive and self.under_cred_dir(norm_path(t, ctx), or_above=True)
+            if not dir_hit and (recursive or name in ARCHIVE_CMDS or name in EXFIL_CMDS):
+                dir_hit = self.under_cred_parent(norm_path(t, ctx))  # the directory itself or an ancestor; a file inside is judged by name
             if hit or dir_hit:
                 ctx.secret_seen += 1
                 if count_only:
