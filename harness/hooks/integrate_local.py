@@ -569,15 +569,19 @@ def report(status, message, **extra):
 
 
 FOCUSED_TEST_FILE = re.compile(r"test_[A-Za-z0-9_]{1,100}\.py")
+FOCUSED_TOOL_TESTS = re.compile(r"tools/[A-Za-z_][A-Za-z0-9_]{0,63}")
 
 
 def focused_unittest(options):
-    """`-m unittest discover -s tests -p <one literal test_*.py name>`: one file name, no glob, path or extra argv
-    (discovery matches that name in tests/ and its subpackages).
+    """One literal test basename under tests or a bounded tools/<identifier>, optionally ending in -v.
+    Discovery may match that same basename in subpackages; no glob, filename path or extra argv is admitted.
 
     A name that matches no file is still safe: run() wraps every `-m unittest discover` check so that an empty or
     all-skipped discovery fails (Python before 3.12 would otherwise exit zero)."""
-    return (len(options) == 7 and options[:6] == ["-m", "unittest", "discover", "-s", "tests", "-p"]
+    options = options[:-1] if options[-1:] == ["-v"] else options
+    return (len(options) == 7 and options[:4] == ["-m", "unittest", "discover", "-s"]
+            and (options[4] == "tests" or FOCUSED_TOOL_TESTS.fullmatch(options[4]) is not None)
+            and options[5] == "-p"
             and FOCUSED_TEST_FILE.fullmatch(options[6]) is not None)
 
 
