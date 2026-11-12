@@ -39,6 +39,7 @@ class Fixture(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='dispatch-'); self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / 'state'; self.root.mkdir(mode=0o700)
         self.policy = tiers.load_policy()
+        self.policy.setdefault('caps', {})['dispatch_exclude_below_rung'] = True  # PR 225 F1: off by default
         self.ledger = esc.Ledger(self.root, self.policy)
         env = mock.patch.dict(os.environ, {'AGENT_HARNESS_ESCALATION_DIR': str(self.root)})
         env.start(); self.addCleanup(env.stop)
@@ -991,6 +992,50 @@ class SpecR7Review(Fixture):
         self.assertEqual(list(self.root.glob('*.dispatch-open.jsonl')), [])
 
 
+class ShippedDefault(Fixture):
+    """PR 225 receipt F1: the shipped tier table never excludes; it records the would-be decision only."""
+
+    def setUp(self):
+        super().setUp()
+        self.policy = tiers.load_policy()  # the shipped table, unmodified
+        self.ledger = esc.Ledger(self.root, self.policy)
+
+    def test_shipped_cap_is_false(self):
+        self.assertIs(self.policy['caps'].get('dispatch_exclude_below_rung'), False)
+
+    def test_default_never_excludes_but_records_would_exclude(self):
+        self.positive('sd1')
+        status = self.fail_once('sd1')
+        event = status['event']
+        self.assertEqual(event['class'], 'FAIL')
+        self.assertEqual(event['dispatch_check']['decision'], 'would_exclude')
+        state = self.ledger.load('sd1')
+        self.assertFalse([e for e in state['events'] if (e.get('dispatch_check') or {}).get('decision') == 'excluded'])
+        summary = self.ledger.status('sd1')
+        self.assertEqual(summary['excluded_below_rung']['count'], 0)
+        self.assertEqual(summary['would_exclude_below_rung']['count'], 1)
+
+    def test_default_hook_path_never_excludes(self):
+        self.climb_to('sd2', 'R2')
+        self.pre('work [task:sd2]', tool_use_id='h1')
+        self.post('work [task:sd2]', tool_use_id='h1', agent_id='agsd2')
+        self.assertEqual(self.fail_once('sd2')['event']['class'], 'FAIL')
+
+
+class OverflowCleanup(Fixture):
+    """PR 225 receipt F4: renamed overflow side files keep one generation per task."""
+
+    def test_one_old_generation_kept(self):
+        side = self.root / 'ov.dispatch-open.jsonl'
+        for round_ in range(3):
+            side.write_bytes(b'x\n' * (esc.SIDE_LIMIT // 2 + 10))
+            with mock.patch.object(esc, 'epoch', return_value=time.time() + round_):
+                self.ledger.load('ov')
+        olds = sorted(self.root.glob('ov.dispatch-open.*.old'))
+        self.assertEqual(len(olds), 1, olds)
+        self.assertEqual(list(self.root.glob('other.dispatch-open.*.old')), [])
+
+
 class WiringAndDocs(unittest.TestCase):
     def test_install_wires_dispatch(self):
         sys.path.insert(0, str(ROOT))
@@ -1033,7 +1078,8 @@ class WiringAndDocs(unittest.TestCase):
             self.assertIn(word, line)
         section = operations[operations.index('Dispatch records'):operations.index('## Review and rescue')]
         for word in ('excluded_below_rung', 'counted_requested_below', 'window_dispatches', '24 hours',
-                     'dispatch_narrow_by_stop_effort', 'main', 'ASSUMPTION'):
+                     'dispatch_narrow_by_stop_effort', 'dispatch_exclude_below_rung', 'would_exclude', 'main',
+                     'ASSUMPTION'):
             self.assertIn(word, section)
 
 

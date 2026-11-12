@@ -229,6 +229,11 @@ OPEN_FIELDS = ('tool_use_id', 'kind', 'subagent_type', 'owner', 'reviewer', 'req
 KINDS = ('agent', 'workflow', 'bash')
 
 
+def glob_escape(text):
+    import glob
+    return glob.escape(text)
+
+
 def epoch():
     import time
     return time.time()
@@ -384,6 +389,8 @@ def dispatch_summary(state, rung, policy):
                 'agent_id': d.get('agent_id')}
     excluded = [e for e in state.get('events') or [] if isinstance(e, dict)
                 and (e.get('dispatch_check') or {}).get('decision') == 'excluded']
+    would = [e for e in state.get('events') or [] if isinstance(e, dict)
+             and (e.get('dispatch_check') or {}).get('decision') == 'would_exclude']
     requested = [e for e in state.get('events') or [] if isinstance(e, dict) and e.get('class') == 'FAIL'
                  and (e.get('dispatch_check') or {}).get('requested_below')]
     return {
@@ -393,6 +400,9 @@ def dispatch_summary(state, rung, policy):
         'excluded_below_rung': {'count': len(excluded), 'latest': {
             'seq': excluded[-1].get('seq'), 'reason': excluded[-1].get('why'),
             'fingerprint': excluded[-1].get('fingerprint')} if excluded else None},
+        'would_exclude_below_rung': {'count': len(would), 'latest': {
+            'seq': would[-1].get('seq'), 'note': 'counted: caps.dispatch_exclude_below_rung is false'} if would else None},
+        'exclusion_enabled': bool(policy.get('caps', {}).get('dispatch_exclude_below_rung')),
         'below_rung_dispatches': sum(1 for d in considered if d.get('owner') and d.get('phase') == 'closed'
                                      and match_of(d.get('candidates'), rung, policy) == 'below'),
         'counted_requested_below': {'count': len(requested), 'latest': {
@@ -860,7 +870,17 @@ class Ledger:
             try:
                 os.rename(*rename)
             except OSError:
-                pass  # the next merge re-reads from offset 0; duplicates are skipped by tool_use_id
+                return  # the next merge re-reads from offset 0; duplicates are skipped by tool_use_id
+            # PR 225 receipt F4: keep one renamed generation per task (the newest); older ones are removed.
+            target = Path(rename[1])
+            prefix = target.name.split('.dispatch-open.')[0] + '.dispatch-open.'
+            for old in target.parent.glob(glob_escape(prefix) + '*.old'):
+                if old != target and old.name[len(prefix):-len('.old')].isdigit():
+                    try:
+                        if not old.is_symlink() and old.is_file():
+                            old.unlink()
+                    except OSError:
+                        pass
 
     def close_dispatch(self, task, tool_use_id, *, status, agent_id, resolved_model, models_used, kind='agent',
                        subagent_type=None, owner=None, reviewer=None):
@@ -997,6 +1017,12 @@ class Ledger:
                 # goodqa#15794: a failure produced while only proven below-rung writing runs were active does not
                 # push the ladder. Anything open, unknown, at or above the rung keeps it counting.
                 excluded, check, owners = dispatch_decision(state, before['rung'], self.policy)
+                # PR 225 receipt F1: the exclusion is off until caps.dispatch_exclude_below_rung is true (main flips it
+                # after the AC-8 live proof). Until then the decision is recorded as would_exclude and the FAIL counts.
+                if excluded and not self.policy.get('caps', {}).get('dispatch_exclude_below_rung'):
+                    excluded, check['decision'] = False, 'would_exclude'
+                    while len(json.dumps(check, separators=(',', ':'))) > 256 and check['ids']:
+                        check['ids'].pop(0); check['models'].pop(0)
                 if excluded:
                     klass, why = 'NOT_COUNTED', 'dispatched below rung (owners: %s; rung_at %s)' % (owners, before['rung'])
             event = {'seq': len(state['events']) + 1, 'at': now(), 'kind': kind, 'class': klass, 'why': why,
