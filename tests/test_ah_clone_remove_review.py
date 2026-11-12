@@ -138,6 +138,48 @@ class ParentEnvironment(T.Base):
         self.assertIn("session", text)
 
 
+class RemoteAuth(T.Base):
+    """A private https remote could never answer: the verifier nulls the global git config, which removes the account's
+    credential helper (measured live: an authenticated ls-remote of a private repository failed, a public one worked)."""
+
+    def test_the_authenticated_listing_names_one_host_scoped_helper_and_the_anonymous_one_none(self):
+        url = "https://github.com/acme/widgets.git"
+        with mock.patch.object(cr.shutil, "which", lambda name, path=None: "/opt/homebrew/bin/gh"):
+            auth = cr.remote_ls_argv("/r", url, True)
+            anon = cr.remote_ls_argv("/r", url, False)
+        self.assertIn("credential.https://github.com.helper=!/opt/homebrew/bin/gh auth git-credential", auth)
+        self.assertIn("credential.helper=", auth)  # any other helper is cleared first
+        self.assertFalse([a for a in anon if a.startswith("credential.")])
+        for argv in (auth, anon):
+            self.assertIn("protocol.allow=never", argv)
+            self.assertEqual(argv[-3:], ["ls-remote", "--", url])
+            self.assertFalse([a for a in argv if "token" in a.lower() or "password" in a.lower()])
+
+    def test_the_authenticated_listing_degrades_to_no_helper_when_gh_is_missing(self):
+        with mock.patch.object(cr.shutil, "which", lambda name, path=None: None):
+            argv = cr.remote_ls_argv("/r", "https://github.com/a/b.git", True)
+        self.assertFalse([a for a in argv if a.startswith("credential.")])
+
+    def test_remote_auth_reaches_the_real_listing_with_the_helper(self):
+        seen = []
+
+        def fake(argv, *a, **kw):
+            seen.append(list(argv))
+            return __import__("subprocess").CompletedProcess(argv, 0, ("a" * 40 + "\trefs/heads/main\n").encode(), b"")
+        with mock.patch.object(cr.subprocess, "run", fake):
+            refs = T.REAL_REMOTE_LS("https://github.com/a/b.git", "/r", 5, True)
+        self.assertEqual(list(refs), ["refs/heads/main"])
+        self.assertTrue([a for a in seen[0] if a.startswith("credential.https://github.com.helper=")] or not cr.shutil.which("gh"))
+
+    def test_the_home_is_checked_before_the_session(self):  # r4 F3
+        env = {"AH_HOME": self.home, "CLAUDE_CODE_SESSION_ID": "no-such-session-xxxx"}
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), redirect_stdout(out), mock.patch.object(cr, "trusted_home", lambda: "/elsewhere"):
+            code = ah.main(["clone-remove", "--path", "/x/y", "--reason", "why", "--verify-only"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("real home", out.getvalue())
+
+
 class IntentFields(T.Base):
     def interrupted(self):
         path = self.clone()

@@ -23,6 +23,7 @@ import clone_remove as cr  # noqa: E402
 import command_guard as cg  # noqa: E402
 
 REAL_LSOF = cr._lsof_open
+REAL_REMOTE_LS = cr.REMOTE_LS
 URL = "https://github.com/acme/widgets.git"
 SESSION = "sess-1"
 GIT_ENV = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}

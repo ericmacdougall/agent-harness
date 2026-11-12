@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import time
@@ -64,14 +65,27 @@ def _hook(event, **info):
         HOOK(event, **info)
 
 
+def remote_ls_argv(repo, url, authenticated):
+    """The one network command. The verifier environment nulls the global git config (no program from config may run), which
+    also removes the account's credential helper, so a PRIVATE https remote could never answer (measured: an authenticated
+    ls-remote of a private repository failed while a public one worked). With `--remote-auth` ONLY, one fixed, host-scoped
+    helper is passed explicitly: the GitHub CLI's git credential helper for github.com, after clearing any other helper.
+    The token never appears in argv, output or the audit; the helper hands it to git, not to this tool."""
+    argv = ['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never',
+            '-c', 'protocol.https.allow=always', '-c', 'protocol.ssh.allow=always']
+    if authenticated is True:
+        gh = shutil.which('gh', path=cg._clone_env()['PATH'])
+        if gh:
+            argv += ['-c', 'credential.helper=', '-c', 'credential.https://github.com.helper=!%s auth git-credential' % gh]
+    return argv + ['-C', repo, 'ls-remote', '--', url]
+
+
 def REMOTE_LS(url, repo, timeout, authenticated=False):
     """ref -> sha as the remote reports it now: ALL refs (heads, tags, pull heads). The only network call. Replaced in tests."""
     env = cg._clone_env()
     if authenticated is not True:
         env.pop('SSH_AUTH_SOCK', None)
-    done = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never',
-                           '-c', 'protocol.https.allow=always', '-c', 'protocol.ssh.allow=always', '-C', repo,
-                           'ls-remote', '--', url], capture_output=True, timeout=max(1.0, timeout), env=env)
+    done = subprocess.run(remote_ls_argv(repo, url, authenticated), capture_output=True, timeout=max(1.0, timeout), env=env)
     if done.returncode != 0 or len(done.stdout) > 64 * 1024 * 1024:
         raise ValueError('ls-remote failed')
     refs = {}

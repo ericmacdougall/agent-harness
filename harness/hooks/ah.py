@@ -3237,13 +3237,13 @@ def run(args, home: Path) -> dict:
     if cmd == "clone-remove":
         import clone_remove
         session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")  # the harness variable only (not env_session's CLAUDE_SESSION_ID fallback)
+        if str(home) != clone_remove.trusted_home():  # the home first: the session directories are looked up under it
+            raise AhError("refused", "clone-remove works only on the account's real home directory (AH_HOME and HOME overrides "
+                          "are not accepted for this command)", 2)
         try:
             clone_remove.require_session(session, str(home))  # existence only; identity is caller-settable (see the spec limit)
         except clone_remove.CloneError as e:
             raise AhError(e.code, str(e), e.exit_code)
-        if str(home) != clone_remove.trusted_home():
-            raise AhError("refused", "clone-remove works only on the account's real home directory (AH_HOME and HOME overrides "
-                          "are not accepted for this command)", 2)
         agent = args.agent or os.environ.get("AH_AGENT_ID", "")
         try:
             if args.resume:
