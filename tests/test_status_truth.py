@@ -154,6 +154,15 @@ class Lint(Base):
         self.assertNotEqual(out.get("decision"), "block")
         self.assertIn("GOALS UNAVAILABLE", out.get("systemMessage", ""))
 
+    def test_turn_id_comes_from_the_user_prompt_and_a_new_turn_resets_the_counter(self):
+        import stop_blocks  # noqa: PLC0415
+        self.assertTrue(stop_blocks.allow(SESSION, "u-prompt-1", "status_truth"))
+        self.assertFalse(stop_blocks.allow(SESSION, "u-prompt-1", "status_truth"))
+        self.assertTrue(stop_blocks.allow(SESSION, "u-prompt-2", "status_truth"))  # next user turn
+        with mock.patch.object(st, "_read_tail", side_effect=lambda p: Path(p).read_bytes()):
+            turn = st.current_turn({"session_id": SESSION, "transcript_path": self.transcript("whats left", WRONG)})
+        self.assertEqual(turn["prompt_id"], "u-prompt-1")  # the user record's uuid, not the Stop payload
+
     def test_off_mode_does_nothing(self):
         self.seed()
         with mock.patch.object(st, "_policy_mode", return_value="off"):

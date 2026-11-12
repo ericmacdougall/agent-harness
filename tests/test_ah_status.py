@@ -69,11 +69,13 @@ class StatusReport(unittest.TestCase):
         r = self.report()
         self.assertEqual([v['check'] for v in r['verified']], ['PP-615', 'LEADS-50'])
         self.assertEqual([p['check'] for p in r['pending']], ['LESSONS-LIVE'])  # PP-615 was verified, so it left pending
-        live = {e['note'].split()[0]: e['label'] for e in r['live']}
-        self.assertEqual(live['ParentProof'], 'DONE_LIVE')  # shares sha a67ab74f with the REALLY_TESTED
-        self.assertEqual(live['blog'], 'LIVE_UNTESTED')
-        self.assertEqual(live['lead'], 'LIVE_TARGET_MISMATCH')  # round 2: tested and live, but against a narrowed target
-        self.assertNotIn('course PR #43 merged, not live', [e['note'] for e in r['live']])
+        # goodqa#15754: prose live claims are not deploy records; they keep their label under LIVE_LEGACY
+        self.assertEqual(r['live'], [])
+        live = {e['note'].split()[0]: e['label'] for e in r['live_legacy']}
+        self.assertEqual(live['ParentProof'], 'LEGACY_DONE_LIVE')  # shares sha a67ab74f with the REALLY_TESTED
+        self.assertEqual(live['blog'], 'LEGACY_LIVE_UNTESTED')
+        self.assertEqual(live['lead'], 'LEGACY_LIVE_TARGET_MISMATCH')  # tested and live, but against a narrowed target
+        self.assertNotIn('course PR #43 merged, not live', [e['note'] for e in r['live_legacy']])
         claimed = [c['note'] for c in r['claimed']]
         self.assertTrue(any('Kimi reviewer done' in c for c in claimed))  # narrative "done" never becomes VERIFIED or LIVE
         self.assertTrue(any('merged, not live' in c for c in claimed))
@@ -82,18 +84,18 @@ class StatusReport(unittest.TestCase):
         labels = {a['id']: a['label'] for a in r['assumptions']}
         self.assertEqual(labels, {'wdec1': 'TARGET_MISMATCH', 'wdec3': 'ASSUMPTION', 'wdec4': 'TARGET_MISMATCH'})
         self.assertEqual([d['id'] for d in r['decisions']], ['wdec2'])
-        self.assertNotIn('wold', [e['id'] for e in r['live']])  # outside the window
+        self.assertNotIn('wold', [e['id'] for e in r['live_legacy']])  # outside the window
         self.assertEqual(len(r['commits']), 1)
 
     def test_text_rendering_and_window_parsing(self):
         text = ah.status_text(self.report())
-        for heading in ('VERIFIED (REALLY_TESTED) (2)', 'LIVE (3)', 'PENDING checks', 'CLAIMED only', 'ASKS open (1)', 'TARGET_MISMATCH'):
+        for heading in ('VERIFIED (REALLY_TESTED) (2)', 'LIVE_LEGACY (prose live claims, not deploy records) (3)', 'PENDING checks', 'CLAIMED only', 'ASKS open (1)', 'TARGET_MISMATCH'):
             self.assertIn(heading, text)
         self.assertIn('never write a status list from memory', text)
         self.assertEqual(ah.parse_since('90m'), 5400); self.assertEqual(ah.parse_since('2d'), 172800)
         with self.assertRaises(ah.AhError):
             ah.parse_since('soon')
-        self.assertEqual(len(self.report('2d')['live']), 4)  # the 30 h old LIVE note is inside a 2-day window
+        self.assertEqual(len(self.report('2d')['live_legacy']), 4)  # the 30 h old LIVE note is inside a 2-day window
 
     def test_an_all_digit_token_never_links_live_to_a_test(self):
         # Review F7: a version code or date shared by a unit test and a LIVE note is not evidence that the live thing
@@ -104,11 +106,11 @@ class StatusReport(unittest.TestCase):
             {'at': iso(NOW - 800), 'event': 'check', 'note': 'REALLY_TESTED LIVE-2: ticket #4242 verified on prod'},
             {'at': iso(NOW - 700), 'event': 'status', 'note': 'gadget for #4242 is live'},
         ])
-        live = {e['note'].split()[0]: e for e in self.report()['live']}
-        self.assertEqual(live['widget']['label'], 'LIVE_UNTESTED')
+        live = {e['note'].split()[0]: e for e in self.report()['live_legacy']}
+        self.assertEqual(live['widget']['label'], 'LEGACY_LIVE_UNTESTED')
         self.assertEqual(live['widget']['shared_evidence'], [])
-        self.assertEqual(live['gadget']['label'], 'DONE_LIVE')
-        self.assertEqual(live['ParentProof']['label'], 'DONE_LIVE')  # a67ab74f still links
+        self.assertEqual(live['gadget']['label'], 'LEGACY_DONE_LIVE')
+        self.assertEqual(live['ParentProof']['label'], 'LEGACY_DONE_LIVE')  # a67ab74f still links
 
     def test_a_wal_that_could_not_be_read_is_listed(self):
         # Review F9: an evidence report must say which WALs it did not read instead of skipping them silently.

@@ -300,6 +300,9 @@ def discover_agents(home: Path, session: str, wal: Path) -> dict:
     return found
 
 
+SILENT_UNDISPOSED_S = 6 * 3600  # as liveness.TASK_ABANDON_S: silent this long with no disposition needs a decision
+
+
 def owners(home: Path, session: str, now: float | None = None, comments=None) -> dict:
     now = time.time() if now is None else now
     wal = session_dir(home, session)
@@ -433,6 +436,13 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                                                                 and covered(d.get("ref"), (r["agent_id"],))))
         r["disposition"] = dict(d, live=alive) if d else None
         r["decision_required"] = bool(r["owner"] and r["state"] == "DROPPED" and not alive)
+        if r["owner"] and str(r["state"]).startswith("SILENT") and not alive \
+                and ((d is not None and d.get("kind") in ("waiting", "resumed", "reassigned"))
+                     or (d is None and (r["idle_s"] or 0) >= SILENT_UNDISPOSED_S)):
+            # goodqa#15754: a silent owner whose recorded wait expired, or one silent SILENT_UNDISPOSED_S with no
+            # disposition at all, needs main's decision; a fresh SILENT owner (31 min, no disposition) does not
+            r["decision_required"] = True
+            r["flags"] = list(r.get("flags") or []) + ["wait-expired" if d is not None else "silent-undisposed"]
         if d and d.get("kind") in ("legacy", "superseded", "wontdo") and r["state"] not in ("done", "handoff", "returned") \
                 and not r["state"].startswith(("live", "working", "waiting")):
             label = "unverified-legacy" if d["kind"] == "legacy" else d["kind"]
@@ -2393,7 +2403,9 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
                 continue
             rows.append((agent, at, rec))
     rows.sort(key=lambda r: r[1])
+    import goals_view  # noqa: PLC0415 - one verdict and deploy-record rule with ah goals (goodqa#15754)
     verified, pending, live, claimed, blockers, commits, asks, resolved, assumptions, decisions = {}, {}, [], [], [], [], {}, set(), [], []
+    failed, live_legacy = {}, []
 
     def item(agent, at, rec, extra=None):
         out = {"agent": agent, "at": iso(at), "id": rec.get("id"), "event": rec.get("event"),
@@ -2407,7 +2419,17 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
         ev = rec.get("event")
         m = _RT.match(note)
         if m:
-            verified[m.group(1)] = item(agent, at, rec, {"check": m.group(1)})
+            verdict = goals_view.verdict(rec)  # PASS, FAIL or UNSTATED (legacy row without a stated result)
+            entry = item(agent, at, rec, {"check": m.group(1), "verdict": verdict})
+            if verdict == "FAIL":
+                failed[m.group(1)] = entry
+                verified.pop(m.group(1), None)
+            else:
+                verified[m.group(1)] = entry
+                failed.pop(m.group(1), None)
+            continue
+        if goals_view.is_deploy_record(rec):
+            live.append(item(agent, at, rec))  # LIVE comes from deploy records only
             continue
         m = _PT.match(note)
         if m:
@@ -2431,7 +2453,7 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
                 decisions.append(item(agent, at, rec, {"source": source[:160]}))
         if ev in ("status", "result", "handoff", "check", "commit", "decision"):
             if _LIVE.search(note) and not _NOT_LIVE.search(note):
-                live.append(item(agent, at, rec))
+                live_legacy.append(item(agent, at, rec))  # prose "deployed/live": kept, labelled, never LIVE
             elif ev in ("status", "result", "handoff") and _CLAIM.search(note):
                 claimed.append(item(agent, at, rec))
     verified_tokens = set()
@@ -2441,13 +2463,15 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
     for a in assumptions:
         if a["label"] == "TARGET_MISMATCH":
             mismatch_tokens |= _tokens(a["note"])
-    for entry in live:
+    for entry in live + live_legacy:
         shared = _tokens(entry["note"]) & verified_tokens
         entry["label"] = "DONE_LIVE" if shared else "LIVE_UNTESTED"
         entry["shared_evidence"] = sorted(shared)
         if _tokens(entry["note"]) & mismatch_tokens:
             # 50bca42: a stream whose target was moved without the user never reads as done against that target
             entry["label"] = "LIVE_TARGET_MISMATCH"
+    for entry in live_legacy:  # goodqa#15754: a prose claim is not a deploy record
+        entry["label"] = "LEGACY_" + entry["label"]
     try:
         data = owners(home, session, now=now)
         owners_summary = {"counts": data.get("counts"), "undisposed": data.get("undisposed"),
@@ -2458,7 +2482,9 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
     return {"session": session, "since_s": since_s, "generated": iso(now), "entries": len(rows),
             "verified": sorted(verified.values(), key=lambda e: e["at"]),
             "pending": sorted((v for k, v in pending.items() if k not in verified), key=lambda e: e["at"]),
-            "live": live, "claimed": claimed, "blockers": blockers, "commits": commits,
+            "live": live, "live_legacy": live_legacy,
+            "failed": sorted(failed.values(), key=lambda e: e["at"]),
+            "claimed": claimed, "blockers": blockers, "commits": commits,
             "asks_open": [a for k, a in asks.items() if k not in resolved],
             "assumptions": assumptions, "decisions": decisions, "owners": owners_summary, "unread": unread,
             "rule": "edit this report; never write a status list from memory (nov-7-issues-2 B2.5)"}
@@ -2471,7 +2497,11 @@ def status_text(data: dict) -> str:
         return out
     lines = [f"# Evidence status for {data['session'][:12]} over the last {int(data['since_s'] // 3600)}h ({data['entries']} WAL entries)"]
     lines += block("VERIFIED (REALLY_TESTED)", data["verified"], lambda r: f"  {r['check']:<24} {r['agent'][:12]:<12} {r['note'][:110]}")
-    lines += block("LIVE", data["live"], lambda r: f"  {r['label']:<14} {r['agent'][:12]:<12} {r['note'][:110]}")
+    lines += block("FAILED (REALLY_TESTED ... FAIL; never proof)", data.get("failed") or [],
+                   lambda r: f"  {r['check']:<24} {r['agent'][:12]:<12} {r['note'][:110]}")
+    lines += block("LIVE (deploy records)", data["live"], lambda r: f"  {r['label']:<14} {r['agent'][:12]:<12} {r['note'][:110]}")
+    lines += block("LIVE_LEGACY (prose live claims, not deploy records)", data.get("live_legacy") or [],
+                   lambda r: f"  {r['label']:<21} {r['agent'][:12]:<12} {r['note'][:100]}")
     lines += block("PENDING checks (declared, not yet REALLY_TESTED)", data["pending"], lambda r: f"  {r['check']:<24} {r['agent'][:12]:<12} {r['note'][:100]}")
     lines += block("CLAIMED only (narrative, no evidence entry)", data["claimed"], lambda r: f"  {r['agent'][:12]:<12} {r['note'][:120]}")
     lines += block("BLOCKED", data["blockers"], lambda r: f"  {r['agent'][:12]:<12} {r['note'][:120]}")
