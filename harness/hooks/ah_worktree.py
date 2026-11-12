@@ -104,6 +104,9 @@ def _call(runner, host, path, authenticated):
                             "(%s)" % (host, VERIFIER_VERSION, UNKNOWN), 3)
     if data.get("removed") not in (None, True, False):
         raise WorktreeError("host_unreachable", "malformed answer from %s (%s)" % (host, UNKNOWN), 3)
+    if data["removable"] is False and data.get("removed") is True:
+        # a verifier that refused cannot also have removed: the answer contradicts itself (receipt r5 N1)
+        raise WorktreeError("host_unreachable", "contradictory answer from %s (%s)" % (host, UNKNOWN), 3)
     return data
 
 
@@ -134,13 +137,23 @@ def remove(host, path, reason, authenticated=False, session="", agent="", home=N
         result = _call(runner, host, path, authenticated)
         # A definite outcome needs a definite answer: `removable: false` is a refusal (nothing ran); `removable: true`
         # needs a real boolean `removed`, and a null or missing one is an unknown outcome (red-team r4 F2).
+        partly = False
         if result.get("removable") is False:
             removed = False
         elif isinstance(result.get("removed"), bool):
             removed = result["removed"]
+            if removed is False:
+                # removable true and not removed: the removal STARTED and did not complete (a timeout, a git error after it
+                # began deleting). The tree may be partly deleted, and the verifier cannot always tell a clean failure
+                # from a partial one, so it is not recorded as a definite "not removed" (receipt r5 N2).
+                removed, partly = None, True
         else:
             removed = None
-        why = result.get("reason") if removed is not None else (result.get("reason") or "") + " (" + UNKNOWN + ")"
+        if partly:
+            why = (result.get("reason") or "") + " (the removal started and did not complete: the worktree may be partly " \
+                                                 "deleted, check the host before retrying)"
+        else:
+            why = result.get("reason") if removed is not None else (result.get("reason") or "") + " (" + UNKNOWN + ")"
         outcome.update(removed=removed, head=result.get("head"), freed_bytes=result.get("freed_bytes"),
                        directory_removed=result.get("directory_removed"),
                        registry_entry_left=result.get("registry_entry_left"), why=why)
