@@ -4,14 +4,13 @@ command_guard refuses `git worktree remove` outside a few shapes, and it cannot 
 thing this command does is hand a literal path to the fixed verifier `command_guard.py remove-worktree` ON the target
 host: the same checks the guard's own exemption applies (a registered linked worktree, clean, nothing private that
 would be lost, its exact HEAD live on an allowlisted remote), a scope check (strictly under the home directory, never
-harness or credential state), an identity re-check around the verification, and then the plain non-forced
-`git worktree remove`. Nothing here accepts a flag that relaxes a check; there is no --force.
+harness or credential state), a check that no process works inside it, an identity re-check around the verification,
+and then the plain non-forced `git worktree remove`. Nothing here accepts a flag that relaxes a check; there is no
+--force, and the caller cannot supply branch refs: `--remote-auth` only makes the verifier read the remote with the
+target host's OWN credentials (a private repository), in a scrubbed environment (red-team of PR 212, F1 and F2).
 
-`--remote-heads-from HOST` is for a private repository the target cannot read: ah runs `git ls-remote --heads` for the
-URLs the target reports (github.com only, strict pattern) on HOST, which has credentials, and passes the refs to the
-verifier on stdin. The verifier still checks the exact HEAD against them.
-
-Every call writes an audit row before it acts (fail closed) and a row with the outcome.
+The caller's audit row is written before anything runs (fail closed) and again with the outcome; the verifier writes its
+own row on the target host.
 """
 from __future__ import annotations
 
@@ -29,9 +28,8 @@ HERE = Path(__file__).resolve().parent
 REMOTE_HOSTS = ("t2-dev",)
 HOSTS = ("local",) + REMOTE_HOSTS
 MAX_REASON = 500
+VERIFIER_VERSION = 2
 PATH_RE = re.compile(r"/[A-Za-z0-9_@+=:,.-]+(?:/[A-Za-z0-9_@+=:,.-]+)*")
-GITHUB_URL = re.compile(r"(?:https://github\.com/[\w.-]+/[\w.-]+?(?:\.git)?|git@github\.com:[\w.-]+/[\w.-]+?(?:\.git)?)")
-SHA = re.compile(r"[0-9a-f]{40,64}")
 
 
 class WorktreeError(Exception):
@@ -45,16 +43,17 @@ def _now():
 
 
 def _redact(text):
-    return re.sub(r"(?i)(token|password|secret|key)[=: ]+\S+", r"\1=[redacted]", str(text))
+    return re.sub(r"(?i)(token|password|secret|key|authorization)[=: ]+\S+", r"\1=[redacted]", str(text))
 
 
 def audit(home, record):
     """Append one JSON row; raises when it cannot (the caller stops before acting)."""
     path = Path(home) / ".agent-harness" / "worktree-audit.jsonl"
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    record = dict(record, at=_now())
-    if record.get("reason"):
-        record["reason"] = _redact(record["reason"])[:MAX_REASON]
+    record = dict(record, at=_now(), by="ah")
+    for key in ("reason", "why"):
+        if record.get(key):
+            record[key] = _redact(record[key])[:MAX_REASON]
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         os.fchmod(fd, 0o600)
@@ -71,68 +70,33 @@ def check_path(path):
     return path
 
 
-def _argv(host, sub, path, extra=()):
-    tail = ["verify-worktree" if sub == "verify" else "remove-worktree", "--path", path, *extra]
+def _argv(host, path, authenticated):
+    tail = ["remove-worktree", "--path", path] + (["--remote-auth"] if authenticated else [])
     if host == "local":
         return [sys.executable, "-I", str(HERE / "command_guard.py"), *tail]
     cmd = "python3 -I .claude/hooks/command_guard.py " + " ".join(shlex.quote(t) for t in tail)
     return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", host, cmd]
 
 
-def _call(runner, host, sub, path, heads=None, expect_head=None):
-    extra = []
-    if heads is not None:
-        extra.append("--heads-stdin")
-    if expect_head:
-        extra += ["--expect-head", expect_head]
+def _call(runner, host, path, authenticated):
     try:
-        done = runner(_argv(host, sub, path, extra), capture_output=True, text=True, timeout=420,
-                      input=json.dumps(heads) if heads is not None else None)
+        done = runner(_argv(host, path, authenticated), capture_output=True, text=True, timeout=420)
         data = json.loads(done.stdout)
     except (OSError, subprocess.SubprocessError, ValueError):
         raise WorktreeError("host_unreachable", "could not run the verifier on %s" % host, 3)
     if not isinstance(data, dict) or not isinstance(data.get("removable"), bool):
         raise WorktreeError("host_unreachable", "unexpected answer from the verifier on %s (nothing removed)" % host, 3)
+    if data.get("verifier") != VERIFIER_VERSION:
+        raise WorktreeError("verifier_outdated", "the verifier on %s is not version %d: install command_guard.py there "
+                            "(nothing was removed)" % (host, VERIFIER_VERSION), 3)
     if data.get("removed") not in (None, True, False):
         raise WorktreeError("host_unreachable", "malformed answer from %s (nothing is assumed removed)" % host, 3)
     return data
 
 
-def fetch_heads(runner, source, urls):
-    """{url: {ref: sha}} from `git ls-remote --heads` run on `source` (credentialed), only for github.com URLs."""
-    heads = {}
-    for url in urls:
-        if not isinstance(url, str) or not GITHUB_URL.fullmatch(url):
-            raise WorktreeError("bad_request", "--remote-heads-from reads only github.com remotes; refusing a remote URL")
-        cmd = ["git", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always",
-               "ls-remote", "--heads", "--", url]
-        if source == "local":
-            argv, env = cmd, dict(os.environ, GIT_TERMINAL_PROMPT="0")
-        else:
-            argv, env = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", source,
-                         "GIT_TERMINAL_PROMPT=0 " + " ".join(shlex.quote(t) for t in cmd)], None
-        try:
-            done = runner(argv, capture_output=True, text=True, timeout=60, env=env)
-        except (OSError, subprocess.SubprocessError):
-            raise WorktreeError("host_unreachable", "ls-remote on %s did not run" % source, 3)
-        if done.returncode != 0:
-            raise WorktreeError("remote_unreadable", "ls-remote on %s could not read the remote" % source, 3)
-        refs = {}
-        for line in done.stdout.splitlines():
-            sha, _, ref = line.partition("\t")
-            if SHA.fullmatch(sha) and ref.startswith("refs/heads/"):
-                refs[ref] = sha
-        if not refs:
-            raise WorktreeError("remote_unreadable", "ls-remote on %s returned no branches" % source, 3)
-        heads[url] = refs
-    return heads
-
-
-def remove(host, path, reason, heads_from=None, session="", agent="", home=None, runner=subprocess.run):
+def remove(host, path, reason, authenticated=False, session="", agent="", home=None, runner=subprocess.run):
     if host not in HOSTS:
         raise WorktreeError("bad_request", "--host must be one of %s" % ", ".join(HOSTS))
-    if heads_from is not None and heads_from not in HOSTS:
-        raise WorktreeError("bad_request", "--remote-heads-from must be one of %s" % ", ".join(HOSTS))
     path = check_path(path)
     reason = (reason or "").strip()
     if not reason or len(reason) > MAX_REASON or re.search(r"[\x00-\x08\x0b-\x1f\x7f]", reason):
@@ -146,24 +110,29 @@ def remove(host, path, reason, heads_from=None, session="", agent="", home=None,
     who = {"session": session or None, "agent": agent or None}
     try:
         audit(home, {"event": "start", "run": run_id, "host": host, "path": path, "reason": reason,
-                     "heads_from": heads_from, "caller": who})
+                     "remote_auth": bool(authenticated), "caller": who})
     except OSError:
         raise WorktreeError("audit_failed", "could not write the audit row; nothing was removed", 3)
-    heads = expect = None
-    if heads_from is not None:
-        report = _call(runner, host, "verify", path)
-        expect = report.get("head") if isinstance(report.get("head"), str) and SHA.fullmatch(report["head"]) else None
-        if not report.get("removable") and not str(report.get("reason") or "").startswith("the remote did not answer"):
-            audit(home, {"event": "refused", "run": run_id, "host": host, "path": path, "why": report.get("reason")})
-            return {"ok": False, "run": run_id, "host": host, "path": path, "removed": False,
-                    "reason": report.get("reason")}
-        urls = [u for group in (report.get("urls") or {}).values() for u in (group if isinstance(group, list) else [])]
-        if not urls or not expect:
-            raise WorktreeError("remote_unreadable", "the verifier reported no remote URL or HEAD to check", 3)
-        heads = fetch_heads(runner, heads_from, urls)
-    result = _call(runner, host, "remove", path, heads=heads, expect_head=expect)
-    removed = result.get("removed") is True and result.get("removable") is True
-    audit(home, {"event": "result", "run": run_id, "host": host, "path": path, "removed": removed,
-                 "head": result.get("head"), "freed_bytes": result.get("freed_bytes"), "why": result.get("reason")})
-    return {"ok": removed, "run": run_id, "host": host, "path": path, "removed": removed, "head": result.get("head"),
-            "freed_bytes": result.get("freed_bytes"), "reason": result.get("reason")}
+    outcome = {"event": "result", "run": run_id, "host": host, "path": path, "removed": None,
+               "why": "no answer from the verifier"}
+    try:
+        result = _call(runner, host, path, authenticated)
+        removed = result.get("removed") is True and result.get("removable") is True
+        outcome.update(removed=removed, head=result.get("head"), freed_bytes=result.get("freed_bytes"),
+                       directory_removed=result.get("directory_removed"),
+                       registry_entry_left=result.get("registry_entry_left"), why=result.get("reason"))
+    except WorktreeError as error:
+        outcome.update(removed=False, why="%s: %s" % (error.code, error))
+        raise
+    finally:
+        try:
+            audit(home, outcome)
+        except OSError:
+            outcome["audit_warning"] = "the outcome row could not be written"
+    answer = {"ok": removed, "run": run_id, "host": host, "path": path, "removed": removed, "head": result.get("head"),
+              "freed_bytes": result.get("freed_bytes"), "reason": _redact(result.get("reason") or "") or None,
+              "directory_removed": result.get("directory_removed"),
+              "registry_entry_left": result.get("registry_entry_left")}
+    if "audit_warning" in outcome:
+        answer["audit_warning"] = outcome["audit_warning"]
+    return answer

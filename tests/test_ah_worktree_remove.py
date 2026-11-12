@@ -4,6 +4,7 @@ The removal under test only ever touches temporary directories under a temporary
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -64,9 +65,24 @@ class Verifier(Repo):
         report = cg.remove_worktree(str(self.linked), policy=self.policy)
         self.assertTrue(report["removed"], report)
         self.assertEqual(report["head"], self.head)
+        self.assertEqual(report["verifier"], cg.VERIFIER_VERSION)
         self.assertFalse(self.linked.exists())
         self.assertNotIn(str(self.linked), git(self.primary, "worktree", "list", "--porcelain"))
         self.assertTrue(self.primary.exists())
+
+    def test_the_target_host_audits_a_removal_itself(self):
+        cg.remove_worktree(str(self.linked), policy=self.policy)
+        rows = [json.loads(line) for line in (self.home / ".agent-harness/worktree-audit.jsonl").read_text().splitlines()]
+        self.assertEqual([row["event"] for row in rows], ["remove", "result"])
+        self.assertEqual(rows[0]["path"], str(self.linked))
+        self.assertTrue(rows[1]["removed"])
+
+    def test_verify_alone_removes_nothing(self):
+        report = cg.verify_worktree(str(self.linked), policy=self.policy)
+        self.assertTrue(report["removable"], report)
+        self.assertEqual(report["repo"], str(self.primary))
+        self.assertEqual(report["urls"], {"origin": [URL]})
+        self.assertTrue(self.linked.exists())
 
     def test_the_removal_is_the_plain_non_forced_git_command_from_the_primary_worktree(self):
         real, seen = subprocess.run, []
@@ -83,13 +99,6 @@ class Verifier(Repo):
         self.assertEqual(seen[0][seen[0].index("-C") + 1], str(self.primary))
         self.assertEqual(seen[0][-2:], ["--", str(self.linked)])
 
-    def test_verify_alone_removes_nothing(self):
-        report = cg.verify_worktree(str(self.linked), policy=self.policy)
-        self.assertTrue(report["removable"], report)
-        self.assertEqual(report["repo"], str(self.primary))
-        self.assertEqual(report["urls"], {"origin": [URL]})
-        self.assertTrue(self.linked.exists())
-
     def refused(self, path, fragment, **kwargs):
         report = cg.remove_worktree(str(path), policy=self.policy, **kwargs)
         self.assertFalse(report["removable"], report)
@@ -101,17 +110,20 @@ class Verifier(Repo):
         self.refused(self.primary, "not a plain file")
         self.assertTrue(self.primary.exists())
 
-    def test_paths_outside_scope_are_refused(self):
+    def test_paths_outside_scope_are_refused_including_other_case_spellings(self):
         outside = Path(tempfile.mkdtemp(prefix="outside-"))
-        self.addCleanup(lambda: __import__("shutil").rmtree(outside, ignore_errors=True))
+        self.addCleanup(lambda: shutil.rmtree(outside, ignore_errors=True))
         self.refused(outside, "outside the home")
         (self.home / ".claude").mkdir()
         self.refused(self.home / ".claude", "protected state")
         (self.home / ".agent-harness/logs").mkdir(parents=True)
         self.refused(self.home / ".agent-harness/logs", "inside work/")
         self.refused(self.home, "outside the home")
-        report = cg.verify_worktree("relative/path", policy=self.policy)
-        self.assertFalse(report["removable"])
+        self.assertFalse(cg.verify_worktree("relative/path", policy=self.policy)["removable"])
+        # red-team L1: a case spelling must not slip past the deny list (APFS is case insensitive)
+        for spelling in (".CLAUDE", ".Codex", ".SSH", "LIBRARY", ".Agent-Harness/logs"):
+            self.assertIsNotNone(cg.worktree_scope_refusal(str(self.home / spelling / "x")), spelling)
+        self.assertIsNone(cg.worktree_scope_refusal(str(self.home / ".AGENT-HARNESS" / "WORK" / "s" / "t")))
 
     def test_dirty_untracked_unpublished_symlinked_and_nested_are_refused(self):
         (self.linked / "a.txt").write_text("changed\n")
@@ -136,8 +148,8 @@ class Verifier(Repo):
     def test_a_path_swapped_between_verification_and_removal_is_refused(self):
         real = cg.verify_worktree
 
-        def swapping(path, heads=None, policy=None):
-            report = real(path, heads, policy)
+        def swapping(path, authenticated=False, policy=None):
+            report = real(path, authenticated, policy)
             os.rename(path, path + ".old")
             os.mkdir(path)
             return report
@@ -147,50 +159,166 @@ class Verifier(Repo):
         self.assertIn("changed while", report["reason"])
         self.assertTrue(Path(str(self.linked) + ".old").exists())
 
-    def test_a_private_remote_is_reported_as_unanswered_and_heads_from_a_credentialed_host_decide(self):
+    # red-team F4: a worktree somebody is working in
+    def test_a_process_working_inside_the_worktree_blocks_the_removal(self):
+        sleeper = subprocess.Popen(["sleep", "60"], cwd=str(self.linked))
+        self.addCleanup(lambda: (sleeper.kill(), sleeper.wait()))
+        sub = self.linked / "deeper"
+        sub.mkdir()
+        report = self.refused(self.linked, "process is using the worktree")
+        self.assertIn("pid %d" % sleeper.pid, report["reason"])
+        self.assertTrue(self.linked.exists())
+        sleeper.kill()
+        sleeper.wait()
+        sub.rmdir()
+        self.assertTrue(cg.remove_worktree(str(self.linked), policy=self.policy)["removed"])
+
+    def test_a_process_check_that_cannot_run_fails_closed(self):
+        with mock.patch.object(cg, "busy_processes", return_value=None):
+            self.refused(self.linked, "could not check for processes")
+        self.assertTrue(self.linked.exists())
+
+    def test_busy_processes_reads_lsof_output_and_ignores_other_directories(self):
+        out = "p123\ncsleep\nn%s/sub\np124\ncvim\nn/elsewhere/x\np%d\ncself\nn%s\n" % (self.linked, os.getpid(), self.linked)
+        fake = subprocess.CompletedProcess([], 0, out, "")
+        real_isdir = os.path.isdir
+        with mock.patch.object(cg.os.path, "isdir", lambda p: False if p == "/proc/self" else real_isdir(p)), \
+                mock.patch.object(cg.subprocess, "run", return_value=fake):
+            self.assertEqual(cg.busy_processes(str(self.linked)), [(123, "sleep")])
+
+    # red-team F1: refs can no longer be supplied by the caller
+    def test_forged_refs_cannot_publish_an_unpublished_head(self):
+        git(self.linked, "checkout", "-q", "--detach")
+        (self.linked / "local.txt").write_text("local\n")
+        git(self.linked, "add", "local.txt")
+        git(self.linked, "commit", "-q", "-m", "local only")
+        forged = git(self.linked, "rev-parse", "HEAD")
+        out = io.StringIO()
+        with redirect_stdout(out), mock.patch.object(sys, "stdin", io.StringIO(json.dumps({URL: {"refs/heads/main": forged}}))):
+            with self.assertRaises(SystemExit), mock.patch.object(sys, "stderr", io.StringIO()):
+                cg.main(["remove-worktree", "--path", str(self.linked), "--heads-stdin"])
+        self.assertTrue(self.linked.exists())
+        report = cg.remove_worktree(str(self.linked), policy=self.policy)  # the real remote still lacks the commit
+        self.assertFalse(report["removed"])
+        self.assertIn("not present on a live", report["reason"])
+
+    def test_a_private_remote_is_unanswered_anonymously_and_answered_with_the_hosts_own_credentials(self):
         def refuses(url, repo, timeout):
             raise ValueError("git ls-remote failed")
         with mock.patch.object(cg, "REMOTE_LS", refuses):
             report = cg.verify_worktree(str(self.linked), policy=self.policy)
             self.assertFalse(report["removable"])
             self.assertIn("did not answer (private, unreachable or deleted", report["reason"])
-            ok = cg.verify_worktree(str(self.linked), {URL: dict(self.live)}, self.policy)
-            self.assertTrue(ok["removable"], ok)
-            # supplied heads that do not contain the HEAD prove nothing
-            stale = cg.verify_worktree(str(self.linked), {URL: {"refs/heads/main": "1" * 40}}, self.policy)
-            self.assertFalse(stale["removable"])
-            empty = cg.verify_worktree(str(self.linked), {URL: {}}, self.policy)
-            self.assertFalse(empty["removable"])
-            unknown_url = cg.verify_worktree(str(self.linked), {"https://github.com/other/repo.git": dict(self.live)},
-                                             self.policy)
-            self.assertFalse(unknown_url["removable"])
+            with mock.patch.object(cg, "authenticated_remote_refs", lambda url, repo, timeout: dict(self.live)):
+                ok = cg.verify_worktree(str(self.linked), authenticated=True, policy=self.policy)
+                self.assertTrue(ok["removable"], ok)
+            with mock.patch.object(cg, "authenticated_remote_refs", lambda url, repo, timeout: {"refs/heads/main": "1" * 40}):
+                self.assertFalse(cg.verify_worktree(str(self.linked), authenticated=True, policy=self.policy)["removable"])
 
-    def run_cli(self, *argv, stdin=""):
+    def test_the_credentialed_ls_remote_runs_in_a_scrubbed_environment_from_slash(self):
+        seen = {}
+
+        def fake(argv, **kwargs):
+            seen.update(argv=argv, **kwargs)
+            return subprocess.CompletedProcess(argv, 0, ("%s\trefs/heads/main\n" % ("a" * 40)).encode(), b"")
+        poisoned = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "url.ssh://evil/.insteadOf",
+                    "GIT_CONFIG_VALUE_0": "https://github.com/", "GIT_SSH_COMMAND": "evil", "GIT_DIR": "/x",
+                    "SSH_AUTH_SOCK": "/tmp/agent.sock"}
+        with mock.patch.dict(os.environ, poisoned), mock.patch.object(cg.subprocess, "run", fake):
+            refs = cg.authenticated_remote_refs(URL, str(self.linked), 5)
+        self.assertEqual(refs, {"refs/heads/main": "a" * 40})
+        self.assertEqual(seen["cwd"], os.sep)
+        env = seen["env"]
+        self.assertEqual(sorted(k for k in env if k.startswith("GIT_")),
+                         ["GIT_ASKPASS", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT"])
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], "/dev/null")
+        self.assertEqual(env["SSH_AUTH_SOCK"], "/tmp/agent.sock")
+        self.assertEqual(seen["argv"][-3:], ["--tags", "--", URL])
+        self.assertNotIn("-C", seen["argv"])
+
+    def test_the_credentialed_ls_remote_reads_only_github_remotes(self):
+        for url in ("https://evil.example/a/b.git", "file:///etc", "ext::sh -c id", "https://github.com/a/b;id", "-oProxy=x",
+                    "ssh://git@github.com/a/b.git", "git@evil.com:a/b.git", "", None):
+            with self.subTest(url=url), mock.patch.object(cg.subprocess, "run") as run:
+                with self.assertRaises(ValueError):
+                    cg.authenticated_remote_refs(url, "/", 5)
+                run.assert_not_called()
+        with mock.patch.object(cg.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 128, b"", b"denied")):
+            with self.assertRaises(ValueError):
+                cg.authenticated_remote_refs("git@github.com:a/b.git", "/", 5)
+
+    def run_cli(self, *argv):
         out = io.StringIO()
-        with redirect_stdout(out), mock.patch.object(sys, "stdin", io.StringIO(stdin)):
+        with redirect_stdout(out):
             code = cg.main(list(argv))
         return code, json.loads(out.getvalue())
 
     def test_the_cli_prints_json_and_its_exit_code_follows_the_verdict(self):
         code, data = self.run_cli("verify-worktree", "--path", str(self.linked))
-        self.assertEqual((code, data["removable"]), (0, True))
+        self.assertEqual((code, data["removable"], data["verifier"]), (0, True, cg.VERIFIER_VERSION))
         code, data = self.run_cli("remove-worktree", "--path", str(self.primary))
         self.assertEqual((code, data["removed"]), (1, False))
-        code, data = self.run_cli("remove-worktree", "--path", str(self.linked), "--heads-stdin", stdin="not json")
-        self.assertEqual((code, data["removed"]), (2, False))
         self.assertTrue(self.linked.exists())
         code, data = self.run_cli("remove-worktree", "--path", str(self.linked))
         self.assertEqual((code, data["removed"]), (0, True))
 
+    def test_a_removal_that_deletes_the_directory_but_fails_is_reported_in_two_states(self):
+        real = subprocess.run
+
+        def half(argv, *args, **kwargs):
+            if "worktree" in argv and "remove" in argv:
+                shutil.rmtree(self.linked)
+                return subprocess.CompletedProcess(argv, 1, "", "error: failed to delete registry")
+            return real(argv, *args, **kwargs)
+        with mock.patch.object(cg.subprocess, "run", half):
+            report = cg.remove_worktree(str(self.linked), policy=self.policy)
+        self.assertFalse(report["removed"])
+        self.assertTrue(report["directory_removed"])
+        self.assertTrue(report["registry_entry_left"])
+        self.assertIn("directory gone, registry entry left", report["reason"])
+
+
+class MoreVerifier(Repo):
+    def test_git_saying_ok_while_the_directory_is_still_there_is_not_a_removal(self):
+        real = subprocess.run
+
+        def lying(argv, *args, **kwargs):
+            if "worktree" in argv and "remove" in argv:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return real(argv, *args, **kwargs)
+        with mock.patch.object(cg.subprocess, "run", lying):
+            report = cg.remove_worktree(str(self.linked), policy=self.policy)
+        self.assertFalse(report["removed"])
+        self.assertFalse(report["directory_removed"])
+        self.assertTrue(report["registry_entry_left"])
+
+    def test_busy_processes_on_a_proc_filesystem_host_reads_cwd_links(self):
+        cwd = {"111": str(self.linked) + "/deep", "222": "/elsewhere", "333": str(self.linked) + "x"}
+
+        def link(path):
+            pid = path.split("/")[2]
+            if pid not in cwd:
+                raise OSError("gone")
+            return cwd[pid]
+        real_isdir = os.path.isdir
+        with mock.patch.object(cg.os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
+                mock.patch.object(cg.os, "listdir", lambda p: ["111", "222", "333", "444", "self"] if p == "/proc" else []), \
+                mock.patch.object(cg.os, "readlink", link):
+            self.assertEqual(cg.busy_processes(str(self.linked)), [(111, "pid")])
+
 
 class GuardMessage(Repo):
-    def test_the_refusal_text_carries_the_verifier_reason_and_the_next_step(self):
+    def test_the_refusal_text_carries_the_verifier_reason_and_the_next_step_without_advising_discard(self):
         (self.linked / "a.txt").write_text("changed\n")
         compiled = cg.Compiled(self.policy, home=str(self.home), cwd=str(self.primary))
         verdict, text = cg.decide("git worktree remove %s" % self.linked, compiled, cwd=str(self.primary))
         self.assertEqual(verdict, "block")
         self.assertIn("verifier: the working tree is not clean", text)
-        self.assertIn("commit or clean the worktree", text)
+        self.assertIn("commit and push what you need", text)
+        self.assertIn("belongs to another owner, leave it", text)
+        for harmful in ("git clean", "discard", "reset --hard", "clean the worktree"):
+            self.assertNotIn(harmful, text)
         git(self.linked, "checkout", "-q", "--", "a.txt")
 
         def refuses(url, repo, timeout):
@@ -199,8 +327,14 @@ class GuardMessage(Repo):
             verdict, text = cg.decide("git worktree remove %s" % self.linked, compiled, cwd=str(self.primary))
         self.assertEqual(verdict, "block")
         self.assertIn("the remote did not answer (private, unreachable or deleted", text)
-        self.assertIn("--remote-heads-from local", text)
+        self.assertIn("--remote-auth", text)
+        self.assertNotIn("--remote-heads-from", text)
         self.assertNotIn(str(self.home), text.replace(str(self.linked), ""))
+
+    def test_a_reason_from_one_segment_is_not_shown_for_another(self):
+        self.assertIsNone(cg._worktree_instead(None))
+        self.assertIsNone(cg._worktree_instead(""))
+        self.assertIn("verifier: x", cg._worktree_instead("x"))
 
 
 class FakeRun:
@@ -219,7 +353,7 @@ class FakeRun:
 
 def verdict(**kw):
     base = {"removable": True, "removed": True, "head": "a" * 40, "reason": None, "urls": {"origin": [URL]},
-            "freed_bytes": 10}
+            "freed_bytes": 10, "verifier": 2}
     base.update(kw)
     return {"out": json.dumps(base)}
 
@@ -232,8 +366,8 @@ class Delegation(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
 
-    def remove(self, runner, host="t2-dev", path=None, reason="merged and published", heads_from=None):
-        return ah_worktree.remove(host, path or self.PATH, reason, heads_from, "s1", "agent-x", self.home, runner)
+    def remove(self, runner, host="t2-dev", path=None, reason="merged and published", authenticated=False):
+        return ah_worktree.remove(host, path or self.PATH, reason, authenticated, "s1", "agent-x", self.home, runner)
 
     def audit_rows(self):
         file = self.home / ".agent-harness" / "worktree-audit.jsonl"
@@ -248,8 +382,16 @@ class Delegation(unittest.TestCase):
         self.assertEqual(argv[6], "t2-dev")
         self.assertEqual(argv[7], "python3 -I .claude/hooks/command_guard.py remove-worktree --path " + self.PATH)
         self.assertNotIn("--force", " ".join(argv))
-        events = [row["event"] for row in self.audit_rows()]
-        self.assertEqual(events, ["start", "result"])
+        self.assertEqual([row["event"] for row in self.audit_rows()], ["start", "result"])
+        self.assertEqual(len(run.calls), 1)
+
+    def test_remote_auth_adds_one_flag_and_never_any_refs(self):
+        run = FakeRun(verdict())
+        self.remove(run, authenticated=True)
+        self.assertEqual(run.calls[0][0][7], "python3 -I .claude/hooks/command_guard.py remove-worktree --path "
+                         + self.PATH + " --remote-auth")
+        self.assertNotIn("input", run.calls[0][1])
+        self.assertNotIn("ls-remote", " ".join(run.calls[0][0]))
 
     def test_local_runs_the_verifier_from_the_hooks_directory_with_isolation(self):
         run = FakeRun(verdict())
@@ -263,7 +405,7 @@ class Delegation(unittest.TestCase):
         for kwargs in ({"host": "dev2"}, {"host": "t2-dev; id"}, {"path": "relative/p"}, {"path": "/a/../b"},
                        {"path": "/a/b/"}, {"path": "/a/b c"}, {"path": "/a/$(x)"}, {"path": "/a/b;rm"}, {"path": "/"},
                        {"path": "/a//b"}, {"path": "/a/é"}, {"reason": ""}, {"reason": "x" * 501},
-                       {"reason": "bad\x01reason"}, {"heads_from": "dev2"}):
+                       {"reason": "bad\x01reason"}):
             with self.subTest(kwargs=str(kwargs)[:40]):
                 run = FakeRun()
                 with self.assertRaises(ah_worktree.WorktreeError):
@@ -271,22 +413,36 @@ class Delegation(unittest.TestCase):
                 self.assertEqual(run.calls, [])
                 self.assertEqual(self.audit_rows(), [])
 
-    def test_there_is_no_force_or_second_path_flag(self):
+    def test_there_is_no_force_second_path_or_caller_supplied_refs_flag(self):
         parser = ah.build_parser()
         base = ["worktree-remove", "--host", "t2-dev", "--path", self.PATH, "--reason", "r"]
         parser.parse_args(base)
-        for extra in (["--force"], ["-f"], ["--path", "/a/b"][:0] + ["--forc"], ["--no-verify"]):
+        parser.parse_args(base + ["--remote-auth"])
+        for extra in (["--force"], ["-f"], ["--forc"], ["--no-verify"], ["--heads-stdin"], ["--remote-heads-from", "local"],
+                      ["--remote-aut"]):
             with self.subTest(extra=extra), self.assertRaises(SystemExit), redirect_stderr_null():
                 parser.parse_args(base + extra)
 
-    def test_an_unanswerable_or_malformed_verifier_removes_nothing(self):
+    def test_an_unanswerable_or_malformed_verifier_removes_nothing_and_is_audited(self):
         for answer in ({"out": ""}, {"out": "not json"}, {"out": "[]"}, {"out": json.dumps({"removed": True})},
-                       {"out": json.dumps({"removable": "yes"})}, OSError("ssh failed"),
+                       {"out": json.dumps({"removable": "yes", "verifier": 2})}, OSError("ssh failed"),
                        subprocess.TimeoutExpired("ssh", 1),
-                       {"out": json.dumps({"removable": True, "removed": "maybe"})}):
+                       {"out": json.dumps({"removable": True, "removed": "maybe", "verifier": 2})}):
             with self.subTest(answer=str(answer)[:40]):
+                before = len(self.audit_rows())
                 with self.assertRaises(ah_worktree.WorktreeError):
                     self.remove(FakeRun(answer))
+                rows = self.audit_rows()[before:]
+                self.assertEqual([row["event"] for row in rows], ["start", "result"])
+                self.assertIs(rows[1]["removed"], False)
+
+    def test_an_old_verifier_on_the_target_is_refused_by_version(self):
+        for answer in (verdict(verifier=1), {"out": json.dumps({"removable": True, "removed": True})},
+                       verdict(verifier="2")):
+            with self.subTest(answer=str(answer)[:50]):
+                with self.assertRaises(ah_worktree.WorktreeError) as caught:
+                    self.remove(FakeRun(answer))
+                self.assertEqual(caught.exception.code, "verifier_outdated")
 
     def test_a_refusal_from_the_verifier_is_reported_not_overridden(self):
         run = FakeRun(verdict(removable=False, removed=False, reason="the working tree is not clean"))
@@ -295,6 +451,23 @@ class Delegation(unittest.TestCase):
         self.assertFalse(result["removed"])
         self.assertIn("not clean", result["reason"])
         self.assertEqual(len(run.calls), 1)
+
+    def test_the_outcome_row_redacts_the_reason_and_survives_a_failing_audit_after_the_removal(self):
+        run = FakeRun(verdict(removable=False, removed=False, reason="failed: token=ghp_abc123 bad"))
+        result = self.remove(run)
+        self.assertNotIn("ghp_abc123", json.dumps(self.audit_rows()))
+        self.assertNotIn("ghp_abc123", json.dumps(result))
+        real, calls = ah_worktree.audit, []
+
+        def second_fails(home, record):
+            calls.append(record["event"])
+            if record["event"] == "result":
+                raise OSError("disk full")
+            return real(home, record)
+        with mock.patch.object(ah_worktree, "audit", second_fails):
+            result = self.remove(FakeRun(verdict()))
+        self.assertTrue(result["removed"])  # the removal happened and is still reported
+        self.assertIn("audit_warning", result)
 
     def test_the_audit_start_row_is_written_before_the_verifier_runs_and_a_failed_audit_stops_everything(self):
         seen = []
@@ -317,51 +490,14 @@ class Delegation(unittest.TestCase):
                 self.remove(run, host="local")
         self.assertEqual(run.calls, [])
 
-    def test_heads_from_a_credentialed_host_pass_the_refs_to_the_verifier_on_stdin(self):
-        sha = "a" * 40
-        refs = {"out": "%s\trefs/heads/main\n%s\trefs/heads/feature\n" % (sha, sha)}
-        run = FakeRun(verdict(removable=False, removed=False,
-                              reason="the remote did not answer (private, unreachable or deleted: x)"), refs, verdict())
-        result = self.remove(run, host="t2-dev", heads_from="local")
-        self.assertTrue(result["ok"], result)
-        ls_argv, ls_kwargs = run.calls[1]
-        self.assertEqual(ls_argv[-3:], ["ls-remote", "--heads", "--"][:0] + ["--heads", "--", URL])
-        self.assertEqual(ls_kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
-        final_argv, final_kwargs = run.calls[2]
-        self.assertIn("--heads-stdin", final_argv[-1])
-        self.assertIn("--expect-head " + sha, final_argv[-1])
-        self.assertEqual(json.loads(final_kwargs["input"]), {URL: {"refs/heads/main": sha, "refs/heads/feature": sha}})
-
-    def test_heads_from_reads_only_github_and_fails_closed(self):
-        evil = ["https://evil.example/x/y.git", "file:///etc", "ext::sh -c id", "https://github.com/a/b;id", "-oProxy=x"]
-        for url in evil:
-            with self.subTest(url=url):
-                run = FakeRun(verdict(removable=False, removed=False, reason="the remote did not answer (x)",
-                                      urls={"origin": [url]}))
-                with self.assertRaises(ah_worktree.WorktreeError):
-                    self.remove(run, heads_from="local")
-                self.assertEqual(len(run.calls), 1)
-        for ls in ({"code": 128, "err": "denied"}, {"out": ""}, {"out": "zz\trefs/heads/x\n"}, OSError("no git")):
-            with self.subTest(ls=str(ls)[:30]):
-                run = FakeRun(verdict(removable=False, removed=False, reason="the remote did not answer (x)"), ls)
-                with self.assertRaises(ah_worktree.WorktreeError):
-                    self.remove(run, heads_from="local")
-                self.assertEqual(len(run.calls), 2)
-
-    def test_heads_from_is_not_used_when_the_verifier_refuses_for_another_reason(self):
-        run = FakeRun(verdict(removable=False, removed=False, reason="the working tree is not clean"))
-        result = self.remove(run, heads_from="local")
-        self.assertFalse(result["ok"])
-        self.assertEqual(len(run.calls), 1)
-        self.assertEqual([r["event"] for r in self.audit_rows()], ["start", "refused"])
-
     def test_the_command_is_wired_into_ah_and_installed(self):
         with mock.patch.object(ah_worktree, "remove", return_value={"ok": True}) as remove:
             out = io.StringIO()
             with redirect_stdout(out):
-                code = ah.main(["worktree-remove", "--host", "local", "--path", self.PATH, "--reason", "why"])
+                code = ah.main(["worktree-remove", "--host", "local", "--path", self.PATH, "--reason", "why",
+                                "--remote-auth"])
         self.assertEqual(code, 0)
-        self.assertEqual(remove.call_args[0][:3], ("local", self.PATH, "why"))
+        self.assertEqual(remove.call_args[0][:4], ("local", self.PATH, "why", True))
         text = (ROOT / "install.py").read_text() + (ROOT / "install_codex.py").read_text()
         self.assertIn("ah_worktree.py", text)
 

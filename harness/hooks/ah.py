@@ -3062,9 +3062,9 @@ def build_parser():
     wp.add_argument("--host", required=True, help="local or t2-dev")
     wp.add_argument("--path", required=True, help="one literal absolute path")
     wp.add_argument("--reason", required=True, help="why (mandatory, logged)")
-    wp.add_argument("--remote-heads-from", dest="heads_from", metavar="HOST",
-                    help="private repository: read the branch heads with ls-remote on this credentialed host (local or "
-                         "t2-dev); the verifier still checks the exact HEAD against them")
+    wp.add_argument("--remote-auth", dest="remote_auth", action="store_true",
+                    help="private repository: the verifier reads the remote with the TARGET host's own credentials in a "
+                         "scrubbed environment (branch refs cannot be supplied by the caller)")
     wp.add_argument("--session")
     wp.add_argument("--agent", help="calling agent id for the audit row")
     _no_abbrev(p)
@@ -3215,7 +3215,7 @@ def run(args, home: Path) -> dict:
     if cmd == "worktree-remove":
         import ah_worktree
         try:
-            return ah_worktree.remove(args.host, args.path, args.reason, args.heads_from,
+            return ah_worktree.remove(args.host, args.path, args.reason, args.remote_auth,
                                       args.session or env_session() or "", args.agent or os.environ.get("AH_AGENT_ID", ""),
                                       home)
         except ah_worktree.WorktreeError as e:

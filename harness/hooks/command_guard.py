@@ -43,6 +43,7 @@ import posixpath
 import re
 import secrets as _secrets
 import shlex
+import shutil
 import stat
 import signal
 import subprocess
@@ -1688,19 +1689,22 @@ def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None):
         return 'could not verify (%s)' % type(error).__name__
 
 
-WORKTREE_HOME_DENY = ('.claude', '.codex', '.ssh', '.config', '.gnupg', '.aws', '.kimi-code', 'Library', '.Trash')
+WORKTREE_HOME_DENY = ('.claude', '.codex', '.ssh', '.config', '.gnupg', '.aws', '.kimi-code', 'library', '.trash')
+VERIFIER_VERSION = 2  # `ah worktree-remove` refuses a verifier that does not report this (an old install on the target)
+GITHUB_REMOTE = re.compile(r'(?:https://github\.com/[\w.-]+/[\w.-]+?(?:\.git)?|git@github\.com:[\w.-]+/[\w.-]+?(?:\.git)?)')
 
 
 def worktree_scope_refusal(path):
     """Where `ah worktree-remove` may act: strictly under the caller's home, never the home itself, never the harness
-    or credential state, and under ~/.agent-harness only inside work/."""
+    or credential state, and under ~/.agent-harness only inside work/. Names are compared case-folded (APFS is case
+    insensitive)."""
     home = os.path.realpath(os.path.expanduser('~'))
-    if not path.startswith(home + os.sep):
+    if not path.casefold().startswith(home.casefold() + os.sep):
         return 'the path is outside the home directory'
     parts = path[len(home) + 1:].split(os.sep)
-    if parts[0] in WORKTREE_HOME_DENY:
-        return 'the path is inside protected state (%s)' % parts[0]
-    if parts[0] == '.agent-harness' and (len(parts) < 3 or parts[1] != 'work'):
+    if parts[0].casefold() in WORKTREE_HOME_DENY:
+        return 'the path is inside protected state (%s)' % parts[0][:30]
+    if parts[0].casefold() == '.agent-harness' and (len(parts) < 3 or parts[1].casefold() != 'work'):
         return 'under ~/.agent-harness only a worktree inside work/ is removable'
     return None
 
@@ -1717,35 +1721,125 @@ def _primary_and_urls(path):
     return primary, urls
 
 
-def verify_worktree(path, heads=None, policy=None):
-    """Read-only verdict as a dict {removable, reason, head, repo, urls}. `heads` ({url: {ref: sha}}) replaces the
-    guard's own ls-remote with refs a credentialed host reported (the caller is trusted to have run ls-remote)."""
-    report = {'path': path, 'removable': False, 'reason': None, 'head': None, 'repo': None, 'urls': {}}
+def _authenticated_env():
+    """The only environment the credentialed ls-remote sees: no GIT_* variable, no global or system git config (so no
+    url.insteadOf rewrite, helper or ssh command can redirect it), the caller's agent socket and home for credentials."""
+    env = {'HOME': os.path.expanduser('~'), 'GIT_TERMINAL_PROMPT': '0', 'GIT_CONFIG_GLOBAL': '/dev/null',
+           'GIT_CONFIG_NOSYSTEM': '1', 'GIT_ASKPASS': '/bin/true', 'LC_ALL': 'C',
+           'PATH': os.pathsep.join(q for q in os.environ.get('PATH', '').split(os.pathsep) if q.startswith('/'))
+           or '/usr/bin:/bin'}
+    if os.environ.get('SSH_AUTH_SOCK'):
+        env['SSH_AUTH_SOCK'] = os.environ['SSH_AUTH_SOCK']
+    return env
+
+
+def authenticated_remote_refs(url, repo, timeout):
+    """ref -> sha like _live_remote_refs, but read with this host's own credentials (a private repository). The caller
+    cannot supply the refs: only the real remote's answer counts. Only a github.com URL; cwd is `/`, the environment is
+    _authenticated_env(), and the credential helper is gh's, named explicitly."""
+    if not isinstance(url, str) or not GITHUB_REMOTE.fullmatch(url):
+        raise ValueError('not a github.com remote')
+    gh = shutil.which('gh', path=_authenticated_env()['PATH'])
+    command = ['git', '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always', '-c', 'protocol.ssh.allow=always']
+    if gh:
+        command += ['-c', 'credential.helper=', '-c', 'credential.helper=!%s auth git-credential' % shlex.quote(gh)]
+    done = subprocess.run(command + ['ls-remote', '--heads', '--tags', '--', url], capture_output=True, cwd=os.sep,
+                          timeout=max(0.2, timeout), env=_authenticated_env())
+    if done.returncode != 0 or len(done.stdout) > 8 * 1024 * 1024:
+        raise ValueError('git ls-remote failed')
+    refs = {}
+    for line in done.stdout.decode('utf-8', 'surrogateescape').splitlines():
+        sha, _, ref = line.partition('\t')
+        if re.fullmatch(r'[0-9a-f]{40,64}', sha) and ref and not ref.endswith('^{}'):
+            refs[ref] = sha
+    return refs
+
+
+def busy_processes(path):
+    """Processes whose working directory is the worktree or inside it: [(pid, command)], or None when that cannot be
+    checked (fail closed). Open files are not checked; plain `git worktree remove` also deletes ignored files."""
+    found = []
+    try:
+        if os.path.isdir('/proc/self'):
+            for entry in os.listdir('/proc'):
+                if entry.isdigit() and int(entry) != os.getpid():
+                    try:
+                        cwd = os.readlink('/proc/%s/cwd' % entry)
+                    except OSError:
+                        continue
+                    if cwd == path or cwd.startswith(path + os.sep):
+                        found.append((int(entry), 'pid'))
+            return found
+        done = subprocess.run(['lsof', '-a', '-d', 'cwd', '-F', 'pcn'], capture_output=True, text=True, timeout=20,
+                              env={'PATH': '/usr/sbin:/usr/bin:/bin', 'LC_ALL': 'C'}, cwd=os.sep)
+        if done.returncode not in (0, 1):
+            return None
+        pid = command = None
+        for line in done.stdout.splitlines():
+            if line.startswith('p') and line[1:].isdigit():
+                pid, command = int(line[1:]), ''
+            elif line.startswith('c'):
+                command = line[1:40]
+            elif line.startswith('n') and pid != os.getpid():
+                name = os.path.realpath(line[1:]) if line[1:].startswith('/') else line[1:]
+                if name == path or name.startswith(path + os.sep):
+                    found.append((pid, command))
+        return found
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def verify_worktree(path, authenticated=False, policy=None):
+    """Read-only verdict as a dict {removable, reason, head, repo, urls, verifier}. `authenticated` reads the remote with
+    this host's own credentials (authenticated_remote_refs) instead of the guard's anonymous ls-remote."""
+    report = {'path': path, 'removable': False, 'reason': None, 'head': None, 'repo': None, 'urls': {},
+              'verifier': VERIFIER_VERSION}
     reason = worktree_scope_refusal(path) if isinstance(path, str) and os.path.isabs(path) else 'not a literal absolute path'
     if reason is None:
-        remote_ls = None
-        if heads is not None:
-            remote_ls = lambda url, repo, timeout: dict(heads.get(url) or {})  # noqa: E731
-        reason = linked_worktree_remove_refusal(path, os.sep, policy, remote_ls=remote_ls)
+        reason = linked_worktree_remove_refusal(path, os.sep, policy,
+                                                remote_ls=authenticated_remote_refs if authenticated else None)
         try:
             report['head'] = _git_out(path, ['rev-parse', '--verify', 'HEAD'], 2.0).strip()
             report['repo'], report['urls'] = _primary_and_urls(path)
         except (ValueError, OSError, subprocess.SubprocessError):
             pass
+    if reason is None:
+        busy = busy_processes(path)
+        if busy is None:
+            reason = 'could not check for processes using the worktree'
+        elif busy:
+            reason = 'a process is using the worktree as its working directory (pid %d, %s)' % busy[0]
     report['reason'] = reason
     report['removable'] = reason is None and bool(report['repo']) and bool(report['head'])
     return report
 
 
-def remove_worktree(path, heads=None, expect_head=None, policy=None):
+def _worktree_audit(record):
+    """One row in the target host's own ~/.agent-harness/worktree-audit.jsonl; never raises."""
+    try:
+        folder = os.path.join(os.path.expanduser('~'), '.agent-harness')
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        record = dict(record, at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), by='command_guard')
+        fd = os.open(os.path.join(folder, 'worktree-audit.jsonl'),
+                     os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, (json.dumps(record, separators=(',', ':')) + '\n').encode())
+        finally:
+            os.close(fd)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def remove_worktree(path, authenticated=False, expect_head=None, policy=None):
     """Verify, then run the plain non-forced `git worktree remove` from the primary worktree. The directory identity is
-    compared before and after the verification, and an expected HEAD must still match."""
-    import shutil
+    compared before and after the verification, and an expected HEAD must still match. Every attempt that reaches the
+    removal is audited on this host (the audit of `ah` lives on the caller's host)."""
     try:
         before = os.lstat(path)
     except OSError as error:
-        return {'path': path, 'removable': False, 'removed': False, 'reason': 'cannot stat the path (%s)' % type(error).__name__}
-    report = verify_worktree(path, heads, policy)
+        return {'path': path, 'removable': False, 'removed': False, 'verifier': VERIFIER_VERSION,
+                'reason': 'cannot stat the path (%s)' % type(error).__name__}
+    report = verify_worktree(path, authenticated, policy)
     report['removed'] = False
     if not report['removable']:
         return report
@@ -1761,12 +1855,20 @@ def remove_worktree(path, heads=None, expect_head=None, policy=None):
         return report
     home = os.path.realpath(os.path.expanduser('~'))
     free_before = shutil.disk_usage(home).free
+    _worktree_audit({'event': 'remove', 'path': path, 'head': report['head'], 'repo': report['repo']})
     done = subprocess.run(['git', '-c', 'core.hooksPath=/dev/null', '-C', report['repo'], 'worktree', 'remove', '--', path],
                           capture_output=True, text=True, timeout=300, env=_clone_env())
-    report['removed'] = done.returncode == 0 and not os.path.lexists(path)
+    gone = not os.path.lexists(path)
+    listed = path in _git_out(report['repo'], ['worktree', 'list', '--porcelain'], 5.0) if os.path.isdir(report['repo']) else False
+    report['directory_removed'] = gone
+    report['registry_entry_left'] = bool(listed)
+    report['removed'] = done.returncode == 0 and gone and not listed
     report['freed_bytes'] = max(0, shutil.disk_usage(home).free - free_before)
     if not report['removed']:
-        report['reason'] = ('git worktree remove failed: ' + (done.stderr or '').strip()[:200]).strip()
+        report['reason'] = ('git worktree remove did not complete cleanly (directory %s, registry entry %s): %s' % (
+            'gone' if gone else 'still there', 'left' if listed else 'gone', (done.stderr or '').strip()[:200])).strip()
+    _worktree_audit({'event': 'result', 'path': path, 'removed': report['removed'],
+                     'directory_removed': gone, 'registry_entry_left': bool(listed)})
     return report
 
 
@@ -1787,18 +1889,21 @@ def _worktree_instead(reason):
 
 
 def _worktree_next_step(reason):
-    """What to do about a verifier reason (None when there is nothing specific to say)."""
+    """What to do about a verifier reason (None when there is nothing specific to say). Never advises discarding work."""
     reason = str(reason or '')
     if 'stale or names a moved' in reason:
         return 'run git fetch --prune <remote> in the repository, then repeat the removal'
     if 'did not answer' in reason:
         return ('the guard reads the remote without credentials; for a private repository use '
                 'python3 -I ~/.claude/hooks/ah.py worktree-remove --host local --path <abs path> --reason <why> '
-                '--remote-heads-from local')
+                '--remote-auth')
     if 'not clean' in reason or 'ignored' in reason:
-        return 'commit or clean the worktree, then repeat the removal'
+        return ('if the worktree is yours, commit and push what you need and move out any ignored files you want to keep; '
+                'if it belongs to another owner, leave it')
     if 'not present on a live' in reason or 'unpublished' in reason:
         return 'push the worktree HEAD to its remote, then repeat the removal'
+    if 'process is using' in reason:
+        return 'stop the process that works in the worktree first'
     return None
 
 
@@ -3835,7 +3940,7 @@ class Analyzer:
         if sub == 'worktree' and rest[:1] in (['remove'], ['prune']):
             for w in _nondash(args[i + 2:]):
                 refused = self.refuse('git worktree remove', w,
-                                      instead=_worktree_instead(getattr(self, '_worktree_reason', None)))
+                                      instead=_worktree_instead(getattr(self, '_worktree_reason', None) if rest[:1] == ['remove'] else None))
                 if rest[:1] == ['remove'] and not refused:
                     reason = getattr(self, '_worktree_reason', None)
                     ctx.add(LOG_DELETE, 'linked-worktree-remove',
@@ -4715,9 +4820,9 @@ class Analyzer:
         r'(' + _LITERAL + r')[ \t]*$')
 
     def _removable_linked_worktree(self, args, cwd_words=()):
-        self._worktree_reason = None
         """A standalone `git [-C /literal/repo] worktree remove /literal/top`; every other shape keeps the ordinary
         refusal."""
+        self._worktree_reason = None
         if len(args) not in (2, 3) or args[0].text != 'remove' or (len(args) == 3 and args[1].text != '--'):
             return False
         word = args[-1]
@@ -7212,7 +7317,8 @@ def main(argv=None):
     for name in ('verify-worktree', 'remove-worktree'):
         wt = sub.add_parser(name, help='JSON verdict for one linked worktree (ah worktree-remove runs this on the target host)')
         wt.add_argument('--path', required=True)
-        wt.add_argument('--heads-stdin', action='store_true', help='read {url: {ref: sha}} from stdin instead of ls-remote')
+        wt.add_argument('--remote-auth', action='store_true',
+                        help='read the remote with this host\'s own credentials (private repository); refs cannot be supplied')
         if name == 'remove-worktree':
             wt.add_argument('--expect-head')
     sub.add_parser('revoke-delete')
@@ -7289,20 +7395,11 @@ def main(argv=None):
                           'manifest_sha256': entry['manifest_sha256'], 'files': entry['files']}))
         return 0
     if args.cmd in ('verify-worktree', 'remove-worktree'):
-        heads = None
-        if args.heads_stdin:
-            try:
-                heads = json.loads(sys.stdin.read(1 << 20))
-                if not isinstance(heads, dict) or not all(isinstance(v, dict) for v in heads.values()):
-                    raise ValueError('heads must be {url: {ref: sha}}')
-            except ValueError as error:
-                print(json.dumps({'removable': False, 'removed': False, 'reason': 'bad heads input: %s' % error}))
-                return 2
         policy = load_policy()
         if args.cmd == 'verify-worktree':
-            result = verify_worktree(args.path, heads, policy)
+            result = verify_worktree(args.path, args.remote_auth, policy)
         else:
-            result = remove_worktree(args.path, heads, args.expect_head, policy)
+            result = remove_worktree(args.path, args.remote_auth, args.expect_head, policy)
         print(json.dumps(result))
         return 0 if result.get('removable') and (args.cmd == 'verify-worktree' or result.get('removed')) else 1
     if args.cmd == 'revoke-delete':
