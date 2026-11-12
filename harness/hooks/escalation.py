@@ -574,6 +574,27 @@ def note_pending_stop(root, agent_id, effort):
     return _update_index(root, change)
 
 
+def _apply_resume(state, agent_id, t):
+    """Reopen the newest dispatch for agent_id (clear its end, mark it resumed and live from t). A resume of an agent
+    whose record was shed, or a malformed id, adds one synthetic unknown open dispatch that blocks the window."""
+    seq = len(state.get('events') or [])
+    dispatches = state['dispatches']
+    agent = agent_id if isinstance(agent_id, str) and AGENT_ID.fullmatch(agent_id) else None
+    dispatch = next((d for d in reversed(dispatches) if isinstance(d, dict) and agent
+                     and d.get('agent_id') == agent), None)
+    if dispatch is None:
+        ident = ('synthetic-resumed_unknown-%s' % (agent or 'invalid'))[:64]
+        dispatch = next((d for d in dispatches if isinstance(d, dict) and d.get('tool_use_id') == ident), None)
+        if dispatch is None:
+            dispatch = {'tool_use_id': ident, 'kind': 'unknown', 'phase': 'open', 'owner': False, 'reviewer': False,
+                        'reason': 'resumed_unknown', 'agent_id': agent, 'at': now()}
+            dispatches.append(dispatch)
+        dispatch['after_seq'] = seq
+    dispatch.pop('ended_at', None)
+    dispatch.pop('ended_seq', None)
+    dispatch.update(resumed_seq=seq, t=t)
+
+
 class Ledger:
     def __init__(self, root=None, policy=None):
         self.root = Path(root) if root else state_root()
@@ -646,7 +667,7 @@ class Ledger:
         if len(body) > MAX_STATE:
             raise LedgerError('state_corrupt', 'state would exceed its size bound')
         temporary = path.with_suffix('.tmp')
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        fd = _open_regular_for_write(temporary)  # delta inspection D1: a FIFO here never hangs a spawn-path write
         with os.fdopen(fd, 'wb') as handle:
             handle.write(body); handle.flush(); os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -683,7 +704,9 @@ class Ledger:
         try:
             if remainder:  # never drop a durable reset: the rest is absorbed on the next load
                 tmp = path.with_suffix('.tmp')
-                tmp.write_text('\n'.join(remainder) + '\n', encoding='utf-8'); os.chmod(tmp, 0o600); os.replace(tmp, path)
+                with os.fdopen(_open_regular_for_write(tmp), 'w', encoding='utf-8') as handle:
+                    handle.write('\n'.join(remainder) + '\n')
+                os.chmod(tmp, 0o600); os.replace(tmp, path)
             else:
                 os.unlink(path)
         except OSError:
@@ -790,6 +813,11 @@ class Ledger:
                 continue
             if ident in known:
                 continue
+            if line.get('kind') == 'resume':
+                _apply_resume(state, clean_str(line.get('agent_id'), 64), t)
+                known.add(ident)
+                changed[0] = True
+                continue
             try:
                 started = min(float(line.get('at')), t)
             except (TypeError, ValueError):
@@ -889,34 +917,19 @@ class Ledger:
         return dispatch is not None
 
     def reopen_dispatch(self, task, agent_id):
-        """SubagentStart or SendMessage on an indexed agent (inspection F5): a resumed run is live again, so its
-        dispatch is reopened; when the record was already shed, an unknown dispatch blocks the window instead."""
+        """SubagentStart or SendMessage on an indexed agent (inspection F5): append one resume line to the side file.
+        Like open_dispatch it takes no ledger lock (spec r7 AC-10: no added wait on the hook path); the next locked
+        operation's merge reopens the dispatch. A forged resume line can only make a window count, never exclude."""
         if not isinstance(agent_id, str) or not AGENT_ID.fullmatch(agent_id):
             return False
-        fd = self._lock(task)
+        import time
+        record = {'tool_use_id': ('resume-%s-%d' % (agent_id, time.time_ns()))[:64], 'kind': 'resume',
+                  'agent_id': agent_id, 'at': epoch()}
+        fd = _open_regular_for_write(self._side_path(task), append=True)
         try:
-            state, _ = self._read(task)
-            _, rename = self._merge_side(task, state)
-            t, seq = epoch(), len(state['events'])
-            dispatch = next((d for d in reversed(state['dispatches']) if isinstance(d, dict)
-                             and d.get('agent_id') == agent_id), None)
-            if dispatch is None:
-                ident = ('synthetic-resumed_unknown-' + agent_id)[:64]
-                dispatch = next((d for d in state['dispatches'] if isinstance(d, dict) and d.get('tool_use_id') == ident),
-                                None)
-                if dispatch is None:
-                    dispatch = {'tool_use_id': ident, 'kind': 'unknown', 'phase': 'open', 'owner': False,
-                                'reviewer': False, 'reason': 'resumed_unknown', 'agent_id': agent_id, 'at': now()}
-                    state['dispatches'].append(dispatch)
-                dispatch['after_seq'] = seq
-            dispatch.pop('ended_at', None)
-            dispatch.pop('ended_seq', None)
-            dispatch.update(resumed_seq=seq, t=t)
-            _evict(state, t, self.policy)
-            self._write(task, state)
+            os.write(fd, json.dumps(record, sort_keys=True, separators=(',', ':')).encode('utf-8') + b'\n')
         finally:
             os.close(fd)
-        self._after_write(rename)
         return True
 
     def load(self, task):

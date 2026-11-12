@@ -727,7 +727,9 @@ def open_spawn_dispatch(data, tool, command, decision, updated, facts, policy, m
         # Inspection F6: every launch segment counts; only a segment that is itself a peer_review.py run is skipped,
         # and the task key may sit in any segment of the line.
         launches = [s for s in split_segments(command) if BASH_DISPATCH.search(s) and not _is_review_segment(s)]
-        task = facts.get('task') or esc.task_key_from(*launches) or esc.task_key_from(command)
+        first = next((s for s in split_segments(command) if LAUNCH.search(s)), '')
+        own = facts.get('task') if not _is_review_segment(first) else None  # m2: a review segment's --task is not the launch's
+        task = esc.task_key_from(*launches) or own or esc.task_key_from(command)
         if not task or not launches:
             return
         single = len(launches) == 1 and 'peer_review.py' not in command  # facts describe this launch only then

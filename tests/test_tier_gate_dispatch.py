@@ -788,6 +788,33 @@ class InspectionRound1(Fixture):
         self.assertNotEqual(outcome['open'], 'returned')
         self.assertIn('side_not_regular', [d.get('reason') for d in self.dispatches('n8')])
 
+    def test_d1_fifo_ledger_tmp_never_blocks(self):
+        """Delta inspection D1: a merge makes status() write the ledger on the spawn path; a FIFO at <task>.tmp must
+        fail the write at once instead of hanging the PreToolUse hook."""
+        import threading
+        self.climb_to('n8d', 'R1')
+        os.mkfifo(self.root / 'n8d.tmp')
+        self.ledger.open_dispatch('n8d', {'tool_use_id': 'd1', 'owner': True})
+        outcome = {}
+
+        def run():
+            try:
+                outcome['rung'] = self.ledger.status('n8d')['rung']
+            except Exception as error:  # noqa: BLE001
+                outcome['error'] = type(error).__name__
+            outcome['done'] = True
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start(); worker.join(5)
+        self.assertTrue(outcome.get('done'), 'status() blocked on a FIFO at the ledger tmp path')
+        self.assertEqual(outcome.get('rung'), 'R1')
+        self.assertEqual(self.fail_once('n8d')['event']['rung_at'], 'R1')
+
+    def test_m2_bash_task_from_launch_not_review(self):
+        self.climb_to('kj', 'R1')
+        self.hook('hook', {'tool_name': 'Bash', 'session_id': 's', 'tool_use_id': 'bm2',
+                           'tool_input': {'command': 'python3 peer_review.py pr --task kk && claude -p "go [task:kj]"'}})
+        self.assertIn('bash', [d.get('kind') for d in self.dispatches('kj')])
+
     def test_f9_dispatch_action_exit0_with_symlinked_state(self):
         link = Path(self.temp.name) / 'state-link'
         link.symlink_to(self.root)
@@ -797,6 +824,73 @@ class InspectionRound1(Fixture):
             result = subprocess.run([sys.executable, str(HOOKS / 'tier_gate.py'), 'dispatch'], input=raw,
                                     capture_output=True, text=True, timeout=30, env=env)
             self.assertEqual((result.returncode, result.stdout, result.stderr), (0, '', ''))
+
+
+class ResumeHookPath(Fixture):
+    """Spec r7 AC-10: the resume path (SubagentStart, PostToolUse SendMessage) never waits on the ledger lock, adds
+    nothing to stdout, and fails open; Agent/Task calls still run exactly one PostToolUse tier_gate entry."""
+
+    def side(self, task):
+        return self.root / (task + '.dispatch-open.jsonl')
+
+    def held(self, task):
+        import fcntl
+        fd = os.open(self.root / (task + '.lock'), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+
+    def test_resume_never_waits_on_lock(self):
+        self.owner('r10', 'opus-r10', OPUS, status='completed', agent_id='agr10')
+        self.held('r10')
+        for action, data in (
+                ('start', {'agent_id': 'agr10', 'agent_type': 'task-owner', 'session_id': 'sdisp',
+                           'hook_event_name': 'SubagentStart'}),
+                ('dispatch', {'tool_name': 'SendMessage', 'tool_input': {'to': 'agr10', 'message': 'm'},
+                              'tool_response': {}, 'session_id': 'sdisp', 'tool_use_id': 'sm2',
+                              'hook_event_name': 'PostToolUse'})):
+            with self.subTest(action=action):
+                started = time.monotonic()
+                result = self.hook(action, data)
+                self.assertLess(time.monotonic() - started, esc.LOCK_SECONDS)
+                self.assertEqual(result.stdout, '')
+        lines = [json.loads(l) for l in self.side('r10').read_text().splitlines()]
+        self.assertEqual([l['kind'] for l in lines[-2:]], ['resume', 'resume'])
+
+    def test_resume_fails_open(self):
+        link = Path(self.temp.name) / 'state-link2'
+        link.symlink_to(self.root)
+        env = {**os.environ, 'AGENT_HARNESS_ESCALATION_DIR': str(link)}
+        cases = (('start', {'agent_id': 'agx', 'session_id': 's', 'hook_event_name': 'SubagentStart'}),
+                 ('dispatch', {'tool_name': 'SendMessage', 'tool_input': {'to': 'agx'}, 'tool_response': {}}),
+                 ('dispatch', {'tool_name': 'SendMessage', 'tool_input': ['not', 'a', 'dict']}),
+                 ('dispatch', {'tool_name': 'SendMessage', 'tool_input': {'to': 'up/../dir name'}}))
+        for action, data in cases:
+            with self.subTest(action=action, data=data):
+                result = subprocess.run([sys.executable, str(HOOKS / 'tier_gate.py'), action], input=json.dumps(data),
+                                        capture_output=True, text=True, timeout=30, env=env)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, '', ''))
+        # an unindexed (new) agent's SubagentStart writes nothing
+        self.hook('start', {'agent_id': 'agnew', 'session_id': 's', 'hook_event_name': 'SubagentStart'})
+        self.assertEqual(list(self.root.glob('*.dispatch-open.jsonl')), [])
+
+    def test_forged_resume_line_only_reopens(self):
+        self.positive('r10f')
+        with open(self.side('r10f'), 'a') as handle:
+            handle.write(json.dumps({'tool_use_id': 'resume-x', 'kind': 'resume', 'agent_id': 'agpos-r10f'}) + '\n')
+            handle.write(json.dumps({'tool_use_id': 'resume-y', 'kind': 'resume', 'agent_id': 'bad/id'}) + '\n')
+        reasons = [d.get('reason') for d in self.dispatches('r10f')]
+        self.assertIn('resumed_unknown', reasons)
+        self.assertEqual(self.fail_once('r10f')['event']['class'], 'FAIL')
+
+    def test_agent_task_run_one_posttool_entry(self):
+        sys.path.insert(0, str(ROOT))
+        import install
+        hooks = install.managed_hooks(Path('/h/.claude'))
+        for tool in ('Agent', 'Task', 'SendMessage'):
+            entries = [h for g in hooks.get('PostToolUse', []) if re.fullmatch(g.get('matcher', '.*'), tool)
+                       for h in g['hooks'] if 'tier_gate.py' in json.dumps(h)]
+            self.assertEqual(len(entries), 1, tool)
+            self.assertNotIn('onFailure', entries[0])
 
 
 class WiringAndDocs(unittest.TestCase):
