@@ -366,7 +366,7 @@ def _computed_acks(seg: list, i: int, ctx: str) -> bool:
 def _acks(seg: list, depth: int = 0, ctx: str = "") -> bool:
     """Whether one simple command is `[wrappers] [python] .../ah[.py] [global opts] task dispose ... --kind <ack>`, or
     may be one: any word the shell computes is judged by the conservative rules (_computed_acks, _says)."""
-    ctx = " ".join(seg) + " " + ctx
+    outer, ctx = ctx, " ".join(seg) + " " + ctx  # outer: the NAME=value words of the enclosing lines
     i = _skip_wrappers(seg)
     if i < len(seg) and _computed(seg[i]):
         return _computed_acks(seg, i, ctx)
@@ -375,10 +375,8 @@ def _acks(seg: list, depth: int = 0, ctx: str = "") -> bool:
         flag = next((j for j in range(i + 1, len(seg)) if _SHELL_C.match(seg[j])), None)
     if i < len(seg) and (seg[i] == "eval" or flag is not None):
         words = seg[flag + 1:] if flag is not None else seg[i + 1:]
-        code = " ".join(words)
-        if any(_computed(w) for w in words) and _says(ctx):
-            return True  # `X='ah task dispose ...'; eval "$X"`: the code is computed from text the line holds
-        return acknowledges(code, depth + 1) if depth < 3 else _says(code)
+        code = " ".join(words)  # judged with the line's NAME=value words: `X='...'; eval "$X"` (r3 F1, r1 F1)
+        return acknowledges(code, depth + 1, outer) if depth < 3 else _says(code + " " + outer)
     if i < len(seg) and os.path.basename(seg[i]).startswith("python"):
         rest = seg[i + 1:]
         if "-c" in rest:  # inline code: judged by what it says
@@ -420,9 +418,10 @@ def _runs_text(seg: list):
     return "python" if name.startswith("python") else None
 
 
-def acknowledges(cmd: str, depth: int = 0) -> bool:
+def acknowledges(cmd: str, depth: int = 0, ctx: str = "") -> bool:
     """Whether a Bash command runs an `ah task dispose` that resumes, reassigns, closes, supersedes, wontdoes or legacies
-    an owner.
+    an owner. `ctx`: the NAME=value words of the lines that enclose this one (a here-document, here-string, `eval` or
+    `-c` body), so `X='...'; bash <<< "$X"` is judged with what X holds (receipt r1 at 37f481d, F1).
 
     Residual (red-team r3 F3, goodqa#15734): code that builds the words at run time (python `"clo" + "sed"`, printf
     escapes piped into a shell, a script file, a variable set by an earlier command) is judged only by the text the
@@ -433,9 +432,9 @@ def acknowledges(cmd: str, depth: int = 0) -> bool:
     segs = _segments(cmd, bodies)
     if segs is None:
         return _says(cmd)
-    if depth < 3 and any(acknowledges(body, depth + 1) for body in bodies):
+    assigned = " ".join([w for s in segs for w in s if _ASSIGNMENT.match(w)] + ([ctx] if ctx else []))
+    if depth < 3 and any(acknowledges(body, depth + 1, assigned) for body in bodies):
         return True  # `$(ah task dispose ...)` and backticks run too (24a786c F2); judged as their own command line
-    assigned = " ".join(w for s in segs for w in s if _ASSIGNMENT.match(w))
     if any(_acks(s, depth, assigned) for s in segs):
         return True
     kinds = {kind for kind in (_runs_text(s) for s in segs) if kind}
@@ -444,7 +443,9 @@ def acknowledges(cmd: str, depth: int = 0) -> bool:
     shell, python = bool(kinds & {"shell", "any"}), bool(kinds & {"python", "any"})
     for s in segs:  # `bash <<EOF`, `cat <<'EOF' | bash`, `python3 - <<EOF`, `bash <<< '...'`: code on stdin
         for body in s.heredocs:
-            if shell and (acknowledges(body, depth + 1) if depth < 3 else _says(body)):
+            if (shell or python) and ("$" in body or "`" in body) and _says(cmd + " " + assigned):
+                return True  # a body with an expansion is code computed from text the line holds (r1 F1, as pipes)
+            if shell and (acknowledges(body, depth + 1, assigned) if depth < 3 else _says(body)):
                 return True
             if python and _says(body):
                 return True  # python code is judged by what it says, as `-c` is

@@ -954,6 +954,21 @@ class ReviewRound3(Base):
             with self.subTest(command=command[:60]):
                 self.assertFalse(dropped_gate.acknowledges(command))
 
+    def test_a_body_that_expands_a_variable_set_on_the_line_is_judged_with_it(self):
+        # receipt r1 at 37f481d F1: the nested judgement of a here-string or here-document body lost the line's X=...
+        shell_x = "X='ah task dispose --agent Y --kind closed'; "
+        py_x = "X='import os; os.system(\"ah task dispose --agent Y --kind closed\")'; "
+        for command in (shell_x + 'bash <<< "$X"', py_x + 'python3 <<< "$X"', shell_x + '. /dev/stdin <<< "$X"',
+                        shell_x + "bash <<EOF\n$X\nEOF", shell_x + "sh <<< `echo $X`",
+                        shell_x + 'bash -c "eval \\"$X\\""', shell_x + 'echo "$(eval "$X")"',
+                        shell_x + "bash -c 'bash <<< \"$X\"'"):
+            with self.subTest(command=command):
+                self.assertTrue(dropped_gate.acknowledges(command))
+        for command in (shell_x + 'cat <<< "$X"', shell_x + "cat <<EOF\n$X\nEOF", 'bash <<< "$HOME"',
+                        "N=3; bash <<EOF\necho $N\nEOF", "git commit -F - <<EOF\nfix: dispose is closed to $USER\nEOF"):
+            with self.subTest(command=command):
+                self.assertFalse(dropped_gate.acknowledges(command))
+
     def test_main_ack_handoff_with_a_literal_until_is_still_stamped(self):
         command = ("ah task dispose --agent A --kind waiting --ack-handoff --ref wa5b00000006 "
                    "--until 2026-11-12T00:00:00Z")
