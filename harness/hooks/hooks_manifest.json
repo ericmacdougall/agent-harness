@@ -389,6 +389,23 @@
    ]
   },
   {
+   "id": "tier_gate:dispatch",
+   "script": "tier_gate.py",
+   "arg": "dispatch",
+   "event": "PostToolUse",
+   "tools": [
+    "Agent",
+    "Task"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S25"
+   ]
+  },
+  {
    "id": "work_assignments:guard",
    "script": "work_assignments.py",
    "arg": null,

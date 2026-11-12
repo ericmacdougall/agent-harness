@@ -180,6 +180,28 @@ A refusal lists the live owner ids. The cap ships in warn mode with the rest of 
 
 `peer_review.py --task TASK [--author-rung R] [--author-harness claude|openai]` picks the reviewer from the table (one rung above the author, the other harness preferred, the same harness one effort up when the other is unavailable, an unknown author reviewed at Opus/Sol medium and flagged), writes a selection receipt under `~/.agent-harness/escalation/selections/`, stamps `Author-Rung`, `Reviewer-Rung` and `Reviewer-Selection` on the report, and records the FINAL receipt in the task ledger so reviews count where they are consumed. `rescue.py --task TASK` runs at the task's computed writing rung on the other harness; `--rung` overrides it; a rung that needs permission is refused before any launch unless `approve-top` recorded it.
 
+### Dispatch records
+
+The ladder records which model each spawn actually ran on (goodqa#15794). This stops an author who was run below the task's rung from pushing the ladder up with failures that the rung's model did not produce.
+
+- **Open:** PreToolUse appends one line to `~/.agent-harness/escalation/<task>.dispatch-open.jsonl` for every Agent, Task or Workflow spawn that will run (allowed, or denied in warn mode), and for claude/codex/rescue Bash launches whose task key resolves. It takes no ledger lock. Every locked ledger operation merges the complete lines past a stored (inode, offset). Merging never truncates the file in place; an over-bound file (over 256 KiB) is renamed to `.old` after the ledger write.
+- **Close:** the PostToolUse `tier_gate.py dispatch` action closes the record with `resolvedModel` and `modelsUsed` and indexes `agent_id -> task`. It prints nothing and cannot block a tool that already ran.
+- **End:** SubagentStop sets `ended_at` and records `observed_effort` from the hook's `effort.level`. A foreground stop that arrives before its close is held as a pending stop for up to an hour.
+- **Rule:** a FAIL at rung R is NOT_COUNTED ("dispatched below rung") only when at least one owner dispatch is considered and every considered non-reviewer dispatch (owners, fixers and other helpers) is a closed agent run whose candidate rungs all sit below R. Considered means: merged since the ledger entered R, or still live.
+- **ASSUMPTION:** before a stop, only the model family is known, so only Sonnet under an Opus rung (or Opus under a Fable rung) is excluded. An opus run at the wrong effort keeps counting. It appears in `counted_requested_below` ("counted, requested below rung, effort unverified"). `observed_effort` narrows candidates only when `caps.dispatch_narrow_by_stop_effort` is true. That flag is false until a live check proves the field reports the subagent's own effort (spec AC-9).
+- **What keeps counting:** an open dispatch, an unknown model, a Workflow or Bash dispatch, an at-rung fixer, or a synthetic unknown dispatch. Synthetic unknowns come from an over-bound, garbled (for example a crashed mid-line append), rewritten or non-regular side file, and each carries a `reason`.
+- **Not seen:** main working directly under a task key leaves no dispatch. A FAIL from main's own work during a window holding only below-rung owner dispatches is therefore excluded.
+- **Staleness:** a dispatch with no `ended_at` is presumed ended after 24 hours. A SubagentStop that never fires only keeps failures counting for that long.
+
+Read it with `python3 ~/.claude/hooks/escalation.py status --task TASK`:
+- `last_dispatch`;
+- `window_dispatches` (up to 8, each with phase, models, observed_effort, requested and selected rung, candidates, match against the current rung, and a reason for synthetic entries);
+- `excluded_below_rung` (count and latest reason);
+- `below_rung_dispatches`;
+- `counted_requested_below`.
+
+Every dispatch also writes a `dispatch` line to `gate.jsonl`. Open failures appear there as `dispatch_open_failed`.
+
 ## Review and rescue
 
 ```sh

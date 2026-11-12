@@ -205,7 +205,294 @@ def ladder_status(state, policy):
         blocked.append('max_total_review_usd')
     needs_permission = policy['rungs'][computed['rung']]['needs_user_permission']
     return {**computed, 'blocked_by': blocked, 'needs_user_permission': needs_permission,
-            'permission': state.get('permission'), 'task': state['task']}
+            'permission': state.get('permission'), 'task': state['task'],
+            **dispatch_summary(state, computed['rung'], policy)}
+
+
+# ---- Dispatch records (goodqa#15794, spec h17 r6): which model a spawn actually ran on --------------------------
+# PreToolUse appends an open record to a lock-free per-task side file; every locked ledger operation merges complete
+# lines past a stored (inode, offset) and never truncates in place. PostToolUse closes the record with the models the
+# harness reported; SubagentStop ends it. A FAIL is excluded from the ladder only when every non-reviewer dispatch in
+# its attribution window is a closed agent run proven below the rung and at least one of them is an owner.
+MAX_DISPATCHES = 64
+DISPATCH_LIVE_SECONDS = 24 * 3600
+DISPATCH_BYTES = 1024
+INDEX_LIMIT = 512
+PENDING_STOP_LIMIT = 64
+PENDING_STOP_SECONDS = 3600
+SIDE_LIMIT = 256 * 1024
+SIDE_LINE = 2048
+EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')
+AGENT_ID = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+_CTRL = re.compile(r'[\x00-\x1f\x7f]')
+OPEN_FIELDS = ('tool_use_id', 'kind', 'subagent_type', 'owner', 'reviewer', 'requested', 'selected', 'at')
+KINDS = ('agent', 'workflow', 'bash')
+
+
+def epoch():
+    import time
+    return time.time()
+
+
+def clean_str(value, cap=64):
+    """A short printable string, or None. Used for every hook-supplied identifier and model name."""
+    if not isinstance(value, str):
+        return None
+    value = _CTRL.sub('', value).strip()[:cap]
+    return value or None
+
+
+def _spec_of(value):
+    """A {model, effort, rung} triple with every field cleaned, or None."""
+    if not isinstance(value, dict):
+        return None
+    return {'model': clean_str(value.get('model'), 32), 'effort': clean_str(value.get('effort'), 16),
+            'rung': clean_str(value.get('rung'), 8)}
+
+
+def family_of(model, policy):
+    """The tier-table family a model id or alias belongs to, or None."""
+    model = clean_str(model, 128)
+    if not model:
+        return None
+    for families in (policy.get('families') or {}).values():
+        for family in (families or {}).values():
+            aliases = [str(a).lower() for a in family.get('aliases') or []]
+            pattern = family.get('id_pattern')
+            if model.lower() in aliases or (pattern and re.search(pattern, model.lower())):  # as tiers.classify
+                return family
+    return None
+
+
+def candidates_for(models, policy, effort=None):
+    """Rungs the run could have been at. Family-only unless an observed effort is given; None when unknown."""
+    order = tiers.rung_order(policy)
+    out = set()
+    for model in models or []:
+        family = family_of(model, policy)
+        if family is None:
+            return None
+        by_effort = family.get('rung_by_effort') or {}
+        if effort and effort in by_effort:
+            out.add(by_effort[effort])
+        elif effort and '*' in by_effort:
+            out.add(by_effort['*'])
+        else:
+            out.update(by_effort.values())
+    if not out or any(rung not in order for rung in out):
+        return None
+    return sorted(out, key=order.index)
+
+
+def match_of(candidates, rung, policy):
+    order = tiers.rung_order(policy)
+    if not candidates or rung not in order or any(c not in order for c in candidates):
+        return 'unknown'
+    at = order.index(rung)
+    positions = [order.index(c) for c in candidates]
+    if all(p < at for p in positions):
+        return 'below'
+    if all(p > at for p in positions):
+        return 'above'
+    return 'match' if rung in candidates else 'unknown'
+
+
+def _live(dispatch, t):
+    try:
+        started = float(dispatch.get('t') or 0)
+    except (TypeError, ValueError):
+        started = 0.0
+    return not dispatch.get('ended_at') and t - started < DISPATCH_LIVE_SECONDS
+
+
+def _rung_lower(rung, than, policy):
+    order = tiers.rung_order(policy)
+    return rung in order and than in order and order.index(rung) < order.index(than)
+
+
+def _window(state, rung, t):
+    """(entered seq, considered dispatches) for a FAIL at `rung`."""
+    entered = 0
+    for escalation in state.get('escalations') or []:
+        if isinstance(escalation, dict) and escalation.get('to') == rung and isinstance(escalation.get('seq'), int):
+            entered = max(entered, escalation['seq'])
+    considered = []
+    for dispatch in state.get('dispatches') or []:
+        if not isinstance(dispatch, dict) or dispatch.get('reviewer'):
+            continue
+        after = dispatch.get('after_seq') if isinstance(dispatch.get('after_seq'), int) else 0
+        if after >= entered or _live(dispatch, t):
+            considered.append(dispatch)
+    return entered, considered
+
+
+def dispatch_decision(state, rung, policy, t=None):
+    """(excluded, check) for a FAIL at `rung`. Pure."""
+    t = epoch() if t is None else t
+    _, considered = _window(state, rung, t)
+    owners = [d for d in considered if d.get('owner')]
+    excluded = bool(owners) and all(
+        d.get('phase') == 'closed' and d.get('kind') == 'agent' and match_of(d.get('candidates'), rung, policy) == 'below'
+        for d in considered)
+    requested_below = any(_rung_lower((d.get(k) or {}).get('rung'), rung, policy)
+                          for d in owners for k in ('requested', 'selected'))
+    shown = considered[-4:]
+    check = {'decision': 'excluded' if excluded else 'counted',
+             'ids': [str(d.get('tool_use_id') or '')[:16] for d in shown],
+             'models': [str(d.get('resolved_model') or d.get('kind') or '')[:32] for d in shown],
+             'requested_below': requested_below}
+    while len(json.dumps(check, separators=(',', ':'))) > 256 and check['ids']:
+        check['ids'].pop(0); check['models'].pop(0)  # the newest entries are kept within the byte bound
+    names = ', '.join(str(d.get('resolved_model') or '?')[:32] for d in owners[:4])
+    return excluded, check, names
+
+
+def dispatch_summary(state, rung, policy):
+    """Status fields: last dispatch, the bounded window list, exclusions and requested-below counts."""
+    t = epoch()
+    dispatches = [d for d in state.get('dispatches') or [] if isinstance(d, dict)]
+    _, considered = _window(state, rung, t)
+
+    def view(d):
+        return {'tool_use_id': d.get('tool_use_id'), 'kind': d.get('kind'), 'subagent_type': d.get('subagent_type'),
+                'owner': bool(d.get('owner')), 'reviewer': bool(d.get('reviewer')), 'phase': d.get('phase'),
+                'reason': d.get('reason'), 'resolved_model': d.get('resolved_model'),
+                'observed_effort': d.get('observed_effort'),
+                'requested_rung': (d.get('requested') or {}).get('rung'),
+                'selected_rung': (d.get('selected') or {}).get('rung'), 'candidates': d.get('candidates'),
+                'match': match_of(d.get('candidates'), rung, policy), 'ended': bool(d.get('ended_at')),
+                'agent_id': d.get('agent_id')}
+    excluded = [e for e in state.get('events') or [] if isinstance(e, dict)
+                and (e.get('dispatch_check') or {}).get('decision') == 'excluded']
+    requested = [e for e in state.get('events') or [] if isinstance(e, dict) and e.get('class') == 'FAIL'
+                 and (e.get('dispatch_check') or {}).get('requested_below')]
+    return {
+        'last_dispatch': view(dispatches[-1]) if dispatches else None,
+        'window_dispatches': [view(d) for d in considered[-8:]],
+        'excluded_below_rung': {'count': len(excluded), 'latest': {
+            'seq': excluded[-1].get('seq'), 'reason': excluded[-1].get('why'),
+            'fingerprint': excluded[-1].get('fingerprint')} if excluded else None},
+        'below_rung_dispatches': sum(1 for d in considered if d.get('owner') and d.get('phase') == 'closed'
+                                     and match_of(d.get('candidates'), rung, policy) == 'below'),
+        'counted_requested_below': {'count': len(requested), 'latest': {
+            'seq': requested[-1].get('seq'),
+            'note': 'counted, requested below rung, effort unverified'} if requested else None},
+    }
+
+
+def _bounded_dispatch(dispatch):
+    """Drop optional detail until the record serializes within DISPATCH_BYTES."""
+    for key in ('models_used', 'selected', 'requested', 'subagent_type'):
+        if len(json.dumps(dispatch, separators=(',', ':'))) <= DISPATCH_BYTES:
+            break
+        dispatch.pop(key, None)
+    return dispatch
+
+
+def _evict(dispatches, t):
+    """Keep at most MAX_DISPATCHES: ended or stale records go first (oldest first), live ones only after."""
+    while len(dispatches) > MAX_DISPATCHES:
+        victim = next((i for i, d in enumerate(dispatches) if not _live(d, t)), 0)
+        dispatches.pop(victim)
+    return dispatches
+
+
+def _index_path(root):
+    return Path(root) / 'dispatch_index.json'
+
+
+def _read_index(root):
+    path = _index_path(root)
+    try:
+        info = os.stat(path, follow_symlinks=False)
+        if not os.path.isfile(path) or os.path.islink(path) or info.st_size > 4 * SIDE_LIMIT:
+            return {}
+        index = json.loads(path.read_bytes())  # input-ok: own 0600 file, size checked above
+    except (OSError, ValueError, UnicodeError):
+        return {}
+    return index if isinstance(index, dict) else {}
+
+
+def _update_index(root, change):
+    """Apply change(index) under a short lock and replace the file atomically (0600). Fail-open: False on any error."""
+    import time
+    root = Path(root)
+    try:
+        fd = os.open(root / 'dispatch_index.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return False
+    try:
+        deadline = time.monotonic() + 0.5
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.02)
+        index = _read_index(root)
+        result = change(index)
+        now_t = epoch()
+        tasks = [k for k, v in index.items() if isinstance(v, str)]
+        for key in tasks[:max(0, len(tasks) - INDEX_LIMIT)]:
+            index.pop(key, None)
+        pending = [k for k, v in index.items() if isinstance(v, dict)]
+        for key in pending:
+            try:
+                if now_t - float(index[key].get('stopped_t') or 0) > PENDING_STOP_SECONDS:
+                    index.pop(key, None)
+            except (TypeError, ValueError, AttributeError):
+                index.pop(key, None)
+        pending = [k for k, v in index.items() if isinstance(v, dict)]
+        for key in pending[:max(0, len(pending) - PENDING_STOP_LIMIT)]:
+            index.pop(key, None)
+        temporary = _index_path(root).with_suffix('.tmp')
+        out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(out, 'w', encoding='utf-8') as handle:
+            handle.write(json.dumps(index, separators=(',', ':')))
+        os.replace(temporary, _index_path(root))
+        os.chmod(_index_path(root), 0o600)
+        return result if result is not None else True
+    except (OSError, ValueError, TypeError):
+        return False
+    finally:
+        os.close(fd)
+
+
+def index_agent(root, agent_id, task):
+    """agent_id -> task, newest last; returns any pending stop that was waiting for this agent, else None."""
+    if not AGENT_ID.fullmatch(str(agent_id or '')) or not SAFE_KEY.fullmatch(str(task or '')):
+        return None
+    found = {}
+
+    def change(index):
+        prior = index.pop(agent_id, None)
+        if isinstance(prior, dict):
+            found['pending'] = prior
+        index[agent_id] = task
+    _update_index(root, change)
+    return found.get('pending')
+
+
+def lookup_agent(root, agent_id):
+    """The indexed task (a valid key) for agent_id, or None. A hostile value can never name a path."""
+    if not AGENT_ID.fullmatch(str(agent_id or '')):
+        return None
+    task = _read_index(root).get(agent_id)
+    return task if isinstance(task, str) and SAFE_KEY.fullmatch(task) else None
+
+
+def note_pending_stop(root, agent_id, effort):
+    """A stop that arrived before its close (foreground): remembered for at most PENDING_STOP_SECONDS."""
+    if not AGENT_ID.fullmatch(str(agent_id or '')):
+        return False
+
+    def change(index):
+        if not isinstance(index.get(agent_id), str):
+            index.pop(agent_id, None)
+            index[agent_id] = {'stopped_at': now(), 'stopped_t': epoch(), 'effort': effort if effort in EFFORTS else None}
+    return _update_index(root, change)
 
 
 class Ledger:
@@ -319,15 +606,208 @@ class Ledger:
             pass
         return absorbed
 
+    # ---- dispatch records ---------------------------------------------------------------------------------------
+    def _side_path(self, task):
+        self.path(task)  # validates the key
+        return self.root / (task + '.dispatch-open.jsonl')
+
+    def open_dispatch(self, task, fields):
+        """PreToolUse: append one whitelisted open record to the side file. Takes no ledger lock."""
+        record = {key: fields.get(key) for key in OPEN_FIELDS if key in fields}
+        record['tool_use_id'] = clean_str(fields.get('tool_use_id'), 64)
+        if not record['tool_use_id']:
+            raise LedgerError('unclassifiable_evidence', 'dispatch without a tool_use_id')
+        record['kind'] = fields.get('kind') if fields.get('kind') in KINDS else 'agent'
+        record['subagent_type'] = clean_str(fields.get('subagent_type'), 48)
+        record['owner'], record['reviewer'] = bool(fields.get('owner')), bool(fields.get('reviewer'))
+        record['requested'], record['selected'] = _spec_of(fields.get('requested')), _spec_of(fields.get('selected'))
+        record['at'] = epoch()
+        line = json.dumps(record, sort_keys=True, separators=(',', ':')).encode('utf-8') + b'\n'
+        if len(line) > SIDE_LINE:
+            record['requested'] = record['selected'] = record['subagent_type'] = None
+            line = json.dumps(record, sort_keys=True, separators=(',', ':')).encode('utf-8') + b'\n'
+        fd = os.open(self._side_path(task), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, line)  # one write of at most SIDE_LINE bytes under O_APPEND
+        finally:
+            os.close(fd)
+        return record
+
+    def _merge_side(self, task, state):
+        """Merge complete side-file lines past the stored (inode, offset). Returns (changed, rename_after_write).
+        Never truncates; an over-bound file is renamed only after the caller has written the ledger."""
+        import stat as stat_mod
+        path, t = self._side_path(task), epoch()
+        dispatches = state.get('dispatches')
+        if not isinstance(dispatches, list):
+            dispatches = state['dispatches'] = []
+        side = state.get('side') if isinstance(state.get('side'), dict) else {}
+        known = {d.get('tool_use_id') for d in dispatches if isinstance(d, dict)}
+        changed = [False]
+
+        def synthetic(reason, key):
+            ident = ('synthetic-%s-%s' % (reason, key))[:64]
+            if ident in known:
+                return
+            dispatches.append({'tool_use_id': ident, 'kind': 'unknown', 'phase': 'open', 'owner': False,
+                               'reviewer': False, 'reason': reason, 'after_seq': len(state['events']), 't': t,
+                               'at': now()})
+            known.add(ident)
+            changed[0] = True
+
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return False, None
+        except OSError:
+            synthetic('side_not_regular', 'lstat')
+            return changed[0], None
+        if not stat_mod.S_ISREG(info.st_mode):
+            synthetic('side_not_regular', '%d-%d' % (info.st_ino, int(info.st_mtime)))
+            return changed[0], None
+        same = side.get('ino') == info.st_ino and isinstance(side.get('offset'), int)
+        offset = side['offset'] if same else 0
+        if same and offset > info.st_size:
+            synthetic('side_rewritten', '%d-%d' % (info.st_ino, int(t)))
+            offset = 0
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, 'rb') as handle:
+                if os.fstat(handle.fileno()).st_ino != info.st_ino:
+                    return changed[0], None  # replaced between lstat and open: the next merge reads it
+                handle.seek(offset)
+                chunk = handle.read(SIDE_LIMIT)  # input-ok: bounded by SIDE_LIMIT
+        except OSError:
+            synthetic('side_not_regular', 'open-%d' % info.st_ino)
+            return changed[0], None
+        end = chunk.rfind(b'\n')
+        if end < 0:
+            if len(chunk) >= SIDE_LIMIT:  # one line longer than the whole read bound
+                synthetic('side_garbled', '%d-%d' % (info.st_ino, offset))
+                offset += len(chunk)
+            body = b''
+        else:
+            body = chunk[:end + 1]
+        for raw in body.split(b'\n')[:-1]:
+            line_at, offset = offset, offset + len(raw) + 1
+            try:
+                if len(raw) > SIDE_LINE:
+                    raise ValueError('long line')
+                line = json.loads(raw.decode('utf-8'))
+                if not isinstance(line, dict):
+                    raise ValueError('not an object')
+                ident = clean_str(line.get('tool_use_id'), 64)
+                if not ident:
+                    raise ValueError('no tool_use_id')
+            except (ValueError, UnicodeError):
+                synthetic('side_garbled', '%d-%d' % (info.st_ino, line_at))
+                continue
+            if ident in known:
+                continue
+            try:
+                started = min(float(line.get('at')), t)
+            except (TypeError, ValueError):
+                started = t
+            dispatches.append({'tool_use_id': ident, 'kind': line.get('kind') if line.get('kind') in KINDS else 'agent',
+                               'subagent_type': clean_str(line.get('subagent_type'), 48),
+                               'owner': bool(line.get('owner')), 'reviewer': bool(line.get('reviewer')),
+                               'requested': _spec_of(line.get('requested')), 'selected': _spec_of(line.get('selected')),
+                               'phase': 'open', 'after_seq': len(state['events']), 't': started, 'at': now()})
+            known.add(ident)
+            changed[0] = True
+        rename = None
+        if info.st_size > SIDE_LIMIT:
+            synthetic('side_overflow', '%d' % info.st_ino)
+            rename = (path, self.root / ('%s.dispatch-open.%d.old' % (task, int(t))))
+            state['side'] = {'ino': None, 'offset': 0}
+            changed[0] = True
+        elif not same or offset != side.get('offset'):
+            state['side'] = {'ino': info.st_ino, 'offset': offset}
+            changed[0] = True
+        _evict(dispatches, t)
+        return changed[0], rename
+
+    @staticmethod
+    def _after_write(rename):
+        if rename:
+            try:
+                os.rename(*rename)
+            except OSError:
+                pass  # the next merge re-reads from offset 0; duplicates are skipped by tool_use_id
+
+    def close_dispatch(self, task, tool_use_id, *, status, agent_id, resolved_model, models_used, kind='agent',
+                       subagent_type=None, owner=None, reviewer=None):
+        """PostToolUse: close the open record for tool_use_id with the models the harness reported."""
+        ident = clean_str(tool_use_id, 64)
+        if not ident:
+            raise LedgerError('unclassifiable_evidence', 'dispatch without a tool_use_id')
+        agent = agent_id if isinstance(agent_id, str) and AGENT_ID.fullmatch(agent_id) else None
+        resolved = clean_str(resolved_model, 64)
+        used = [m for m in (clean_str(x, 64) for x in (models_used if isinstance(models_used, list) else [])[:8]) if m]
+        fd = self._lock(task)
+        try:
+            state, _ = self._read(task)
+            _, rename = self._merge_side(task, state)
+            t = epoch()
+            dispatch = next((d for d in reversed(state['dispatches']) if isinstance(d, dict)
+                             and d.get('tool_use_id') == ident and d.get('phase') == 'open'), None)
+            if dispatch is None:
+                dispatch = {'tool_use_id': ident, 'kind': kind if kind in KINDS else 'agent',
+                            'subagent_type': clean_str(subagent_type, 48), 'owner': bool(owner),
+                            'reviewer': bool(reviewer), 'after_seq': len(state['events']), 't': t, 'at': now()}
+                state['dispatches'].append(dispatch)
+            models = ([resolved] if resolved else []) + [m for m in used if m != resolved]
+            dispatch.update(phase='closed', status=clean_str(status, 24), agent_id=agent, resolved_model=resolved,
+                            models_used=used, candidates=candidates_for(models, self.policy) if models else None)
+            if dispatch['status'] == 'completed':
+                dispatch['ended_at'] = now()
+            _bounded_dispatch(dispatch)
+            _evict(state['dispatches'], t)
+            self._write(task, state)
+        finally:
+            os.close(fd)
+        self._after_write(rename)
+        return dispatch
+
+    def end_dispatch(self, task, agent_id, effort=None):
+        """SubagentStop: mark the dispatch for agent_id ended and record the observed effort. Narrows candidates
+        only when caps.dispatch_narrow_by_stop_effort is true (off until the AC-9 live proof)."""
+        if not isinstance(agent_id, str) or not AGENT_ID.fullmatch(agent_id):
+            return False
+        effort = effort if effort in EFFORTS else None
+        narrow = bool(self.policy.get('caps', {}).get('dispatch_narrow_by_stop_effort'))
+        fd = self._lock(task)
+        try:
+            state, _ = self._read(task)
+            _, rename = self._merge_side(task, state)
+            dispatch = next((d for d in reversed(state['dispatches']) if isinstance(d, dict)
+                             and d.get('agent_id') == agent_id), None)
+            if dispatch is not None:
+                dispatch.setdefault('ended_at', now())
+                if effort:
+                    dispatch['observed_effort'] = effort
+                    if narrow:
+                        models = ([dispatch['resolved_model']] if dispatch.get('resolved_model') else []) \
+                            + [m for m in dispatch.get('models_used') or [] if m != dispatch.get('resolved_model')]
+                        if models:
+                            dispatch['candidates'] = candidates_for(models, self.policy, effort)
+            self._write(task, state)
+        finally:
+            os.close(fd)
+        self._after_write(rename)
+        return dispatch is not None
+
     def load(self, task):
         fd = self._lock(task)
         try:
             state, reset = self._read(task)
-            if self._absorb_pending(task, state) or reset is not None:
+            merged, rename = self._merge_side(task, state)
+            if self._absorb_pending(task, state) or reset is not None or merged:
                 self._write(task, state)
-            return state
         finally:
             os.close(fd)
+        self._after_write(rename)  # reached only after a successful write (or when nothing needed writing)
+        return state
 
     def record(self, task, receipt_bytes, *, kind, source, head=None, notify=None):
         """Append one receipt-derived event; replaying the same bytes is a no-op. Returns the ladder status."""
@@ -342,6 +822,7 @@ class Ledger:
         try:
             state, reset = self._read(task)
             self._absorb_pending(task, state)
+            _, rename = self._merge_side(task, state)
             if any(event.get('receipt_sha256') == sha for event in state['events']):
                 status = ladder_status(state, self.policy)
                 status['replayed'] = True
@@ -356,9 +837,18 @@ class Ledger:
                                         'prior_state_sha256': None, 'preserved_copy': None, 'detail': 'not JSON'})
             if head is None and isinstance(receipt, dict):
                 head = (receipt.get('subject') or {}).get('head')  # the receipt's own HEAD, never a caller claim
+            check = None
+            if klass == 'FAIL':
+                # goodqa#15794: a failure produced while only proven below-rung writing runs were active does not
+                # push the ladder. Anything open, unknown, at or above the rung keeps it counting.
+                excluded, check, owners = dispatch_decision(state, before['rung'], self.policy)
+                if excluded:
+                    klass, why = 'NOT_COUNTED', 'dispatched below rung (owners: %s; rung_at %s)' % (owners, before['rung'])
             event = {'seq': len(state['events']) + 1, 'at': now(), 'kind': kind, 'class': klass, 'why': why,
                      'fingerprint': fp, 'receipt_sha256': sha, 'source': source, 'head': head,
                      'rung_at': before['rung']}
+            if check is not None:
+                event['dispatch_check'] = check
             launched = isinstance(receipt, dict) and isinstance(receipt.get('usage'), dict) \
                 and type(receipt['usage'].get('provider_launches')) is int and receipt['usage']['provider_launches'] >= 1
             if kind == 'review' and launched and klass != 'PASS':
@@ -377,6 +867,7 @@ class Ledger:
                               'evidence': sha, 'fingerprint': fp, 'seq': event['seq']}
                 state['escalations'].append(escalation)
             self._write(task, state)
+            self._after_write(rename)
             status = ladder_status(state, self.policy)
             status['event'] = event
             pending = []
@@ -434,7 +925,19 @@ class Ledger:
             fresh = self.fresh(task, generated=state.get('generated_key', False))
             fresh['resets'] = state.get('resets', []) + [record]
             fresh['permission'] = state.get('permission')
+            # goodqa#15794: live dispatches survive a reset (a running opus owner must still block an exclusion);
+            # ended or stale ones are dropped so they cannot re-enter a later window. after_seq restarts at 0.
+            t = epoch()
+            try:
+                _, rename = self._merge_side(task, state)
+            except LedgerError:
+                rename = None
+            fresh['dispatches'] = [{**d, 'after_seq': 0} for d in state.get('dispatches') or []
+                                   if isinstance(d, dict) and _live(d, t)]
+            if isinstance(state.get('side'), dict):
+                fresh['side'] = state['side']
             self._write(task, fresh)
+            self._after_write(rename)
         finally:
             os.close(fd)
         self._notify(task, 'reset', record, notify)

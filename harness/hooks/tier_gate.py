@@ -654,9 +654,121 @@ def owner_cap_decision(session_id, tool_input, policy):
                                                       Path(__file__).resolve().parent / 'ah.py')), owners
 
 
+ACTIONS = ('hook', 'start', 'stop', 'dispatch')
+BASH_DISPATCH = re.compile(r'(^|[\s;&|(/`\'"=\\])(claude|codex|rescue\.py)(\s|$|[\'"`)])', re.IGNORECASE)
+
+
+def _gate_log(record):
+    try:
+        log = esc.state_root() / 'gate.jsonl'
+        esc.rotate_log(log)
+        with open(log, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(record, sort_keys=True, default=str) + '\n')
+        os.chmod(log, 0o600)
+    except OSError:
+        pass
+
+
+def _spec_from(value):
+    if not isinstance(value, dict):
+        return None
+    return {'model': value.get('model'), 'effort': value.get('effort'), 'rung': value.get('rung')}
+
+
+def _selected_from(updated, requested, policy, mode):
+    """What will actually run: updatedInput applies only in enforce mode (warn mode never rewrites)."""
+    if mode == 'enforce' and isinstance(updated, dict):
+        found = tiers.classify(updated.get('model') or 'sonnet', updated.get('effort'), policy)
+        if found:
+            return {'model': updated.get('model'), 'effort': found['effort'], 'rung': found['rung']}
+    return requested
+
+
+def open_spawn_dispatch(data, tool, command, decision, updated, facts, policy, mode, ledger, session_id):
+    """goodqa#15794: record an open dispatch for a spawn or launch that will run. Never changes the decision."""
+    if decision != 'allow' and not (decision == 'deny' and mode == 'warn'):
+        return  # an enforced deny never runs
+    tool_input = data.get('tool_input') if isinstance(data.get('tool_input'), dict) else {}
+    tool_use_id = data.get('tool_use_id')
+    if tool in SPAWN_TOOLS:
+        prompt, description = str(tool_input.get('prompt') or ''), str(tool_input.get('description') or '')
+        task = facts.get('task')
+        if not task:  # the owner-cap and live-cap paths skip decide_spawn: same key rule, no ledger.status
+            task = esc.task_key_from(prompt, description) or esc.generated_key(session_id or '', description or prompt[:200])
+        subagent_type = str(tool_input.get('subagent_type') or '')
+        requested = _spec_from(facts.get('requested')) if 'requested' in facts else _spec_from(requested_spec(tool_input, policy))
+        kind = 'workflow' if tool == 'Workflow' else 'agent'
+        fields = {'tool_use_id': tool_use_id, 'kind': kind, 'subagent_type': subagent_type,
+                  'owner': kind == 'agent' and counts_as_owner(subagent_type, policy),
+                  'reviewer': subagent_type in REVIEWER_TYPES,  # the type alone: a [review:] mark never hides a writer
+                  'requested': requested, 'selected': _selected_from(updated, requested, policy, mode)}
+    elif tool == 'Bash':
+        task = facts.get('task')
+        if not task or 'peer_review.py' in command or not BASH_DISPATCH.search(command):
+            return
+        found = tiers.classify(facts['model'], facts.get('effort'), policy) if facts.get('model') else None
+        requested = {'model': facts.get('model'), 'effort': facts.get('effort'), 'rung': (found or {}).get('rung')}
+        fields = {'tool_use_id': tool_use_id, 'kind': 'bash', 'subagent_type': None, 'owner': False,
+                  'reviewer': False, 'requested': requested, 'selected': requested}
+    else:
+        return
+    ledger.open_dispatch(task, fields)
+
+
+def record_dispatch(data):
+    """PostToolUse for Agent/Task: close the open dispatch with the harness-reported models. Silent and fail-open:
+    every path returns without output; nothing here can block (the tool already ran)."""
+    record = {'at': esc.now(), 'tool': data.get('tool_name'), 'decision': 'dispatch'}
+    try:
+        tool = data.get('tool_name')
+        response = data.get('tool_response')
+        if tool not in ('Agent', 'Task') or not isinstance(response, dict):
+            record['result'] = 'ignored'
+            return
+        tool_input = data.get('tool_input') if isinstance(data.get('tool_input'), dict) else {}
+        prompt, description = str(tool_input.get('prompt') or ''), str(tool_input.get('description') or '')
+        task = esc.task_key_from(prompt, description) or esc.generated_key(str(data.get('session_id') or ''),
+                                                                           description or prompt[:200])
+        policy = tiers.load_policy()
+        ledger = esc.Ledger(policy=policy)
+        subagent_type = str(tool_input.get('subagent_type') or '')
+        dispatch = ledger.close_dispatch(
+            task, data.get('tool_use_id'), status=response.get('status'), agent_id=response.get('agentId'),
+            resolved_model=response.get('resolvedModel'), models_used=response.get('modelsUsed'),
+            subagent_type=subagent_type, owner=counts_as_owner(subagent_type, policy),
+            reviewer=subagent_type in REVIEWER_TYPES)
+        record.update(task=task, tool_use_id=dispatch.get('tool_use_id'), agent_id=dispatch.get('agent_id'),
+                      resolved_model=dispatch.get('resolved_model'), candidates=dispatch.get('candidates'))
+        if dispatch.get('agent_id'):
+            pending = esc.index_agent(ledger.root, dispatch['agent_id'], task)
+            if isinstance(pending, dict):  # a foreground stop that arrived before this close
+                ledger.end_dispatch(task, dispatch['agent_id'], pending.get('effort'))
+                record['pending_stop'] = True
+        record['result'] = 'closed'
+    except BaseException as error:  # noqa: BLE001  fail-open by design
+        record['result'] = 'error'
+        record['error'] = '%s: %s' % (type(error).__name__, str(error)[:120])
+    finally:
+        _gate_log(record)
+
+
+def end_from_stop(data, ledger):
+    """SubagentStop: end the indexed dispatch and record the observed effort; remember a stop that beat its close."""
+    agent_id = data.get('agent_id')
+    effort = data.get('effort')
+    level = effort.get('level') if isinstance(effort, dict) else None
+    task = esc.lookup_agent(ledger.root, agent_id)
+    if task:
+        ledger.end_dispatch(task, agent_id, level)
+    else:
+        esc.note_pending_stop(ledger.root, agent_id, level)
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     action = argv[0] if argv else 'hook'
+    if action not in ACTIONS:
+        return 0  # an unknown action (install skew) is a no-op
     unreadable = None
     try:
         data = json.loads(safe_input.read_stdin_bounded().decode('utf-8', errors='replace'))
@@ -666,6 +778,13 @@ def main(argv=None):
         data, unreadable = {}, 'hook input is not JSON'
     if not isinstance(data, dict):
         data, unreadable = {}, unreadable or 'hook input is not an object'
+    if action == 'dispatch':
+        # Before the policy load, the owner scan and decide_spawn: PostToolUse only records, silently.
+        if unreadable:
+            _gate_log({'at': esc.now(), 'decision': 'dispatch', 'result': 'unreadable', 'error': unreadable})
+        else:
+            record_dispatch(data)
+        return 0
     if unreadable and action == 'hook':
         # Input the hook cannot read (an over-bound stdin from a huge command, or malformed JSON) is never a
         # silent allow: the tool call is refused in enforce and flagged in warn, the same as an oversize line.
@@ -707,6 +826,12 @@ def _main(action, data, tool, command, applies):
         return 0
     if action in ('start', 'stop'):
         count = live_update(session_id, data.get('agent_id'), start=(action == 'start'), agent_type=data.get('agent_type'))
+        if action == 'stop':
+            try:
+                end_from_stop(data, ledger)
+            except BaseException as error:  # noqa: BLE001  fail-open: a stop never fails on dispatch bookkeeping
+                _gate_log({'at': esc.now(), 'decision': 'dispatch_end_failed',
+                           'error': '%s: %s' % (type(error).__name__, str(error)[:120])})
         cap = int(policy.get('caps', {}).get('session_live_agents', LIVE_CAP_DEFAULT))
         if action == 'start' and count > cap:
             print(json.dumps({'hookSpecificOutput': {'hookEventName': 'SubagentStart',
@@ -727,14 +852,12 @@ def _main(action, data, tool, command, applies):
     else:
         return 0
     record = {'at': esc.now(), 'tool': tool, 'decision': decision, 'reason': reason, 'mode': mode, 'facts': facts}
+    _gate_log(record)
     try:
-        log = esc.state_root() / 'gate.jsonl'
-        esc.rotate_log(log)
-        with open(log, 'a', encoding='utf-8') as handle:
-            handle.write(json.dumps(record, sort_keys=True, default=str) + '\n')
-        os.chmod(log, 0o600)
-    except OSError:
-        pass
+        open_spawn_dispatch(data, tool, command, decision, updated, facts, policy, mode, ledger, session_id)
+    except BaseException as error:  # noqa: BLE001  the decision and output never depend on the dispatch record
+        _gate_log({'at': esc.now(), 'tool': tool, 'decision': 'dispatch_open_failed',
+                   'error': '%s: %s' % (type(error).__name__, str(error)[:120])})
     if decision == 'allow' and updated is None:
         return 0  # nothing to change; the decision and its reason are in gate.jsonl
     if mode == 'warn':
