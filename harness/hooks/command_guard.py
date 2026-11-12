@@ -1692,8 +1692,11 @@ def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None):
             bad = _per_worktree_config_refusal(path, common, git_dir, cwd, step)
         if bad:
             return bad
+        # A worktree removal runs no hook, and the delegated route runs every git call with core.hooksPath=/dev/null, so only
+        # that route (policy allow_hooks is exactly True) skips this rule; the hook form and every other caller stay strict.
         hooks_dir = os.path.join(common, 'hooks')
-        if os.path.isdir(hooks_dir) and any(not n.endswith('.sample') for n in os.listdir(hooks_dir)):
+        if cfg.get('allow_hooks') is not True and os.path.isdir(hooks_dir) \
+                and any(not n.endswith('.sample') for n in os.listdir(hooks_dir)):
             return 'it has hand-written git hooks'
         for entry in _git_out(path, ['ls-files', '-s', '-z'], step(3.0)).split('\x00'):
             if entry.startswith('160000'):
@@ -1854,7 +1857,8 @@ def authenticated_remote_refs(url, repo, timeout):
     if not isinstance(url, str) or not GITHUB_REMOTE.fullmatch(url):
         raise ValueError('not a github.com remote')
     gh = shutil.which('gh', path=_authenticated_env()['PATH'])
-    command = ['git', '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always', '-c', 'protocol.ssh.allow=always']
+    command = ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always',
+               '-c', 'protocol.ssh.allow=always']
     if gh:
         command += ['-c', 'credential.helper=', '-c', 'credential.helper=!%s auth git-credential' % shlex.quote(gh)]
     done = subprocess.run(command + ['ls-remote', '--heads', '--tags', '--', url], capture_output=True, cwd=os.sep,
@@ -1871,10 +1875,11 @@ def authenticated_remote_refs(url, repo, timeout):
 
 def busy_processes(path):
     """Processes whose working directory is the worktree or inside it: [(pid, command)], or None when that cannot be
-    checked completely (fail closed). A process that cannot be inspected (permission denied, another user's) is a None,
-    not a skip; only a process that has exited (ENOENT, ESRCH) is skipped. Limits, stated: only processes of the same
-    user are visible without root, and open files other than the working directory are not checked; plain
-    `git worktree remove` also deletes ignored files."""
+    checked completely (fail closed). A process of the SAME user that cannot be inspected is a None, not a skip, and so
+    is any other error; a process that has exited (ENOENT, ESRCH) is skipped, and so is one that cannot be read because it
+    belongs to ANOTHER user (a Linux host has root daemons whose /proc/PID/cwd a normal user cannot read; goodqa#15739).
+    Limits, stated: other users' processes are invisible without root, and open files other than the working directory
+    are not checked; plain `git worktree remove` also deletes ignored files."""
     found = []
     try:
         if os.path.isdir('/proc/self'):
@@ -1885,7 +1890,14 @@ def busy_processes(path):
                     except OSError as error:
                         if error.errno in (errno.ENOENT, errno.ESRCH):
                             continue  # exited while we looked
-                        return None  # EACCES and anything else: a process we could not see
+                        if error.errno in (errno.EACCES, errno.EPERM):
+                            try:
+                                owned_by_another_user = os.stat('/proc/%s' % entry).st_uid != os.getuid()
+                            except OSError:
+                                return None  # an owner we cannot determine is a process we could not see
+                            if owned_by_another_user:
+                                continue  # the documented limit: other users processes are invisible without root
+                        return None  # a same-user process we could not read, and any other error
                     if cwd == path or cwd.startswith(path + os.sep):
                         found.append((int(entry), 'pid'))
             return found
@@ -1921,7 +1933,8 @@ def registry_lists(repo, path):
 # allows their sum plus the process scan and the ssh connect (ah_worktree.CALL_TIMEOUT).
 VERIFY_SECONDS = 120.0
 REMOVE_SECONDS = 900
-WORKTREE_POLICY = {'reproducible_clone': {'total_seconds': VERIFY_SECONDS, 'remote_seconds': 30.0, 'scale': 15.0}}
+WORKTREE_POLICY = {'reproducible_clone': {'total_seconds': VERIFY_SECONDS, 'remote_seconds': 30.0, 'scale': 15.0,
+                                         'allow_hooks': True}}
 
 
 def verify_worktree(path, authenticated=False, policy=None):
