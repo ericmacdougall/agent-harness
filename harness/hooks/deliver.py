@@ -27,11 +27,11 @@ from urllib.parse import quote
 from github_identity import github_repository, repository_name
 from git_safety import git_environment, require_safe_source
 from integrate_local import (ALLOWED_GIT_ENV, CheckInterpreterError, CheckLog, ExternalApplyError,
-                             OriginalScope, acquire_scope_lock, approved_check, approved_prepare, redact_output,
-                             require_check_interpreters,
+                             OriginalScope, acquire_scope_lock, admit_check_plan, approved_check, approved_prepare, redact_output,
+                             require_check_interpreters, require_scoped_environment,
                              checkout_identity, git_common_directory, journal_key,
                              fsync_directory, private_directory, read_journal, run as run_check,
-                             scope_key, valid_identity_text, write_journal)
+                             scope_key, scoped_check_context, valid_identity_text, write_journal)
 from process import cleanup_discarded
 import wal as wal_log
 
@@ -323,7 +323,16 @@ def check_facts(error):
     return {name: facts[name] for name in CHECK_FACTS if name in facts}
 
 
-def run_checks(repo, preparations, checks, timeout, log_directory):
+def require_delivery_check_plan(preparations, checks, *, scoped_context=None, recovery=False):
+    try:
+        admit_check_plan(checks, preparations=preparations, scoped_context=scoped_context, recovery=recovery)
+    except CheckInterpreterError as error:
+        raise DeliveryError('BLOCKED_POLICY', str(error), code=2) from None
+
+
+def run_checks(repo, preparations, checks, timeout, log_directory, *, scoped_context=None):
+    preparations, checks = tuple(preparations), tuple(checks)
+    require_delivery_check_plan(preparations, checks, scoped_context=scoped_context)
     # Output goes to an owner-only bounded log; failures report its path and a
     # redacted tail, so a failed delivery check is diagnosable without rerunning.
     try:
@@ -334,7 +343,8 @@ def run_checks(repo, preparations, checks, timeout, log_directory):
         for command in (*preparations, *checks):
             log.header(command)
             try:
-                result = run_check(repo, command, timeout=timeout, discard_output=True, sink=log)
+                scoped = {'scoped_context': scoped_context} if scoped_context is not None else {}
+                result = run_check(repo, command, timeout=timeout, discard_output=True, sink=log, **scoped)
             except subprocess.TimeoutExpired:
                 log.close()
                 raise DeliveryError("DELIVERED_CHECK_FAILED", f"Delivered checkout check exceeded {timeout} seconds",
@@ -1442,8 +1452,19 @@ def resume_executor():
             "helpers_sha256": {name: hashlib.sha256(data).hexdigest() for name, data in observed.items()}}
 
 
+def delivery_check_scope(flow, checks, *, preparations=(), target=None):
+    require_delivery_check_plan(preparations, checks)
+    try:
+        require_scoped_environment(checks)
+        return scoped_check_context(checks, flow.original, flow.state['source_head'],
+                                    preparations=preparations, target=target)
+    except CheckInterpreterError as error:
+        raise DeliveryError('BLOCKED_POLICY', str(error), code=2) from None
+
+
 def resume_remote_finish(flow, preparations, checks):
     """Resume only the same pending transaction already at its pinned target."""
+    require_delivery_check_plan(preparations, checks)
     args, state = flow.args, flow.state
     digest = checks_digest(preparations, checks)
     if (state["phase"] != "REMOTE_APPLYING" or state["guard_key"] is None
@@ -1479,6 +1500,7 @@ def resume_remote_finish(flow, preparations, checks):
         if not ancestry(flow.original, state["merge_head"], state["target"]):
             raise recovery_error(flow, "Merged PR is absent from the pinned target", state["apply_base"])
         verify_remote_descendant(flow, url, state["target"])
+        check_scope = delivery_check_scope(flow, checks, preparations=preparations, target=state["target"])
         revalidate()
         attempts = flow.directory / "resumes"
         private_directory(attempts)
@@ -1493,7 +1515,8 @@ def resume_remote_finish(flow, preparations, checks):
         write_journal(attempt / "start", start, first=True)
         try:
             revalidate()
-            run_checks(flow.original, preparations, checks, args.check_timeout, flow.directory / "checks")
+            scoped = {'scoped_context': check_scope} if check_scope is not None else {}
+            run_checks(flow.original, preparations, checks, args.check_timeout, flow.directory / "checks", **scoped)
             revalidate()
             if origin_destination(flow.original)[0] != state["repository"]:
                 raise DeliveryError("BLOCKED_POLICY", "Original repository changed after checks", code=2)
@@ -1524,6 +1547,7 @@ def resume_remote_finish(flow, preparations, checks):
 
 
 def remote_finish(flow, preparations, checks):
+    require_delivery_check_plan(preparations, checks)
     args, state = flow.args, flow.state
     if state["phase"] not in {"PR_READY", "REMOTE_APPLYING"}:
         raise DeliveryError("BLOCKED_POLICY", "Remote finish requires a PR_READY generation", code=2)
@@ -1561,6 +1585,7 @@ def remote_finish(flow, preparations, checks):
     if not ancestry(flow.original, merge_head, target):
         raise DeliveryError("BLOCKED_POLICY", "PR merge commit is absent from the remote target", code=2)
     verify_remote_descendant(flow, url, target, observed=current_target)
+    check_scope = delivery_check_scope(flow, checks, preparations=preparations, target=target)
     digest, guard = checks_digest(preparations, checks), None
     with OriginalScope(flow.original, flow.branch, args.timeout) as scope:
         try:
@@ -1576,6 +1601,9 @@ def remote_finish(flow, preparations, checks):
                 if origin_destination(flow.original)[0] != state["repository"]:
                     raise DeliveryError("BLOCKED_POLICY", "Original repository changed before sync", code=2)
                 verify_remote_descendant(flow, url, target)
+                if check_scope is not None and delivery_check_scope(
+                        flow, checks, preparations=preparations, target=target) != check_scope:
+                    raise DeliveryError("RECHECK_REQUIRED", "Scoped original custody changed before sync")
                 flow.save(phase="REMOTE_APPLYING", target=target, merge_head=merge_head,
                           apply_base=current, checks_digest=digest)
                 guard = scope.reserve_external(base=current, target=target, task_digest=task_generation_digest(flow))
@@ -1583,13 +1611,17 @@ def remote_finish(flow, preparations, checks):
                 if snapshot(flow.original, flow.branch) != current:
                     raise DeliveryError("RECHECK_REQUIRED", "Original changed before fast-forward")
                 if current != target:
+                    if check_scope is not None and delivery_check_scope(
+                            flow, checks, preparations=preparations, target=target) != check_scope:
+                        raise DeliveryError("RECHECK_REQUIRED", "Scoped original custody changed before fast-forward")
                     code, _ = git(flow.original, "merge", "--ff-only", "--no-overwrite-ignore",
                                   "--no-autostash", target, timeout=args.timeout)
                     if code:
                         raise DeliveryError("BLOCKED_LOCAL", "Protected fast-forward was refused")
             if snapshot(flow.original, flow.branch) != target:
                 raise DeliveryError("DELIVERED_CHECK_FAILED", "Original changed during sync")
-            run_checks(flow.original, preparations, checks, args.check_timeout, flow.directory / "checks")
+            scoped = {'scoped_context': check_scope} if check_scope is not None else {}
+            run_checks(flow.original, preparations, checks, args.check_timeout, flow.directory / "checks", **scoped)
             if snapshot(flow.original, flow.branch) != target:
                 raise DeliveryError("DELIVERED_CHECK_FAILED", "Checks changed the delivered checkout")
             if origin_destination(flow.original)[0] != state["repository"]:
@@ -1636,6 +1668,7 @@ def remote_finish(flow, preparations, checks):
 
 def local_completion(flow, preparations, checks):
     """Reconcile the child's journal while holding the shared original lock."""
+    require_delivery_check_plan(preparations, checks)
     from integrate_local import scan_journals
     with OriginalScope(flow.original, flow.branch, flow.args.timeout) as scope:
         blocked_path, blocked, completed = scan_journals(scope.root, flow.original, scope.identity,
@@ -1652,7 +1685,9 @@ def local_completion(flow, preparations, checks):
             return False
         if not ancestry(flow.original, flow.state["source_head"], current):
             raise recovery_error(flow, "Local delivery is absent from current checkout", flow.state["baseline"])
-        run_checks(flow.original, preparations, checks, flow.args.check_timeout, flow.directory / "checks")
+        check_scope = delivery_check_scope(flow, checks, preparations=preparations, target=current)
+        scoped = {'scoped_context': check_scope} if check_scope is not None else {}
+        run_checks(flow.original, preparations, checks, flow.args.check_timeout, flow.directory / "checks", **scoped)
         if snapshot(flow.original, flow.branch) != current:
             raise recovery_error(flow, "Local checks changed the delivered checkout", flow.state["baseline"])
         flow.complete("local", current, checks_digest(preparations, checks))
@@ -1664,6 +1699,13 @@ def local_completion(flow, preparations, checks):
 
 
 def local_finish(flow, preparations, checks):
+    preparations = [list(command) for command in preparations]
+    checks = [list(command) for command in checks]
+    require_delivery_check_plan(preparations, checks)
+    verification_flags = []
+    for flag, commands in (("--prepare", preparations), ("--check", checks)):
+        for argv in commands:
+            verification_flags.extend((flag, shlex.join(argv)))
     state = flow.state
     if state["phase"] not in {"REMOTE_BLOCKED", "LOCAL_READY", "LOCAL_APPLYING"}:
         raise DeliveryError("BLOCKED_POLICY", "Local finish requires explicit local-only mode or settled remote failure", code=2)
@@ -1675,6 +1717,7 @@ def local_finish(flow, preparations, checks):
         if local_completion(flow, preparations, checks):
             return getattr(flow, "ticket_exit", 0)
     verify_source(flow)
+    delivery_check_scope(flow, checks, preparations=preparations, target=state["source_head"])
     if git_common_directory(source, 30)[0] != flow.common:
         raise DeliveryError("BLOCKED_POLICY", "Local delivery requires worktrees of the same repository", code=2)
     current = snapshot(flow.original, flow.branch)
@@ -1692,9 +1735,7 @@ def local_finish(flow, preparations, checks):
                "--original-branch", flow.branch, "--expected-head", current, "--source", state["source_branch"],
                "--expected-source-head", state["source_head"],
                "--timeout", str(flow.args.timeout), "--check-timeout", str(flow.args.check_timeout)]
-    for name in ("prepare", "check"):
-        for value in getattr(flow.args, name):
-            command.extend(("--" + name, value))
+    command.extend(verification_flags)
     try:
         # Each preparation/check gets its check deadline; Git steps keep --timeout.
         code, output = bounded(command, timeout=2 * (len(checks) + len(preparations)) * flow.args.check_timeout
@@ -1717,7 +1758,8 @@ def finish(args):
     try:
         # Before any checkout effect: a bare python3 that resolves to an
         # unsupported interpreter would only fail after the fast-forward.
-        require_check_interpreters(checks, args.original)
+        require_check_interpreters(checks, args.original, preparations=preparations,
+                                   recovery=args.resolve_baseline is not None)
     except CheckInterpreterError as error:
         raise DeliveryError("BLOCKED_POLICY", str(error), code=2) from None
     with Workflow(args) as flow:
@@ -1726,6 +1768,7 @@ def finish(args):
             raise DeliveryError("BLOCKED_POLICY", "Prepared generation is missing", code=2)
         if args.kit_file is not None and kit_digest(args.kit_file) != state["kit_digest"]:
             raise DeliveryError("BLOCKED_POLICY", "Run kit changed since prepare", code=2)
+        delivery_check_scope(flow, checks, preparations=preparations)
         if args.resolve_baseline is not None:
             return resolve_baseline(flow, preparations, checks)
         if args.resume:
@@ -1749,6 +1792,7 @@ def finish(args):
 
 def resolve_baseline(flow, preparations, checks):
     """Settle an interrupted workflow after actual shared barriers are resolved."""
+    require_delivery_check_plan(preparations, checks, recovery=True)
     from integrate_local import scan_journals
     if flow.state["phase"] not in {"REMOTE_APPLYING", "LOCAL_APPLYING"}:
         raise DeliveryError("BLOCKED_POLICY", "Only an interrupted apply can accept a new baseline", code=2)
