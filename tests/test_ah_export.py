@@ -134,31 +134,49 @@ class FullExport(Base):
         self.assertEqual(r['agents'], 3)  # main plus two agent WALs
         self.assertNotIn('target_chars', page)  # hook metadata is counted, not rendered
 
-    def test_status_report_gets_redacted_rows(self):
-        jl(self.w / 'agent-owner1.jsonl', [{'at': iso(NOW - 900), 'event': 'decision', 'note': 'k ' + GITHUB}])
+    def test_classes_match_ah_status(self):
+        """Adversarial review r3 finding 2: classes are computed on raw rows, so a cap or mask cannot change them."""
+        jl(self.w / 'agent-owner1.jsonl', [
+            {'at': iso(NOW - 900), 'event': 'check', 'note': 'REALLY_TESTED LONG-1: ' + 'z' * 2100 + ' FAILED'},
+            {'at': iso(NOW - 890), 'event': 'status', 'note': 'DEPLOYED to 10.1.2.3 build abc1234def'},
+            {'at': iso(NOW - 880), 'event': 'decision', 'note': 'keep sourced', 'assumption': False,
+             'source': 'user:x/y "z"'},
+        ])
+        since = float('inf')
+        with mock.patch('time.time', return_value=NOW):
+            direct = ah.status_report(self.home, SESSION, since, now=NOW)
         seen = {}
         real = ah.status_report
 
         def spy(home, session, since_s, now=None, **kw):
-            seen.update(kw)
-            return real(home, session, since_s, now=now, **kw)
+            result = real(home, session, since_s, now=now, **kw)
+            seen['report'] = result
+            return result
         with mock.patch.object(ah, 'status_report', side_effect=spy):
             self.export()
-        self.assertIn('rows', seen)
-        blob = json.dumps(seen['rows'], default=str)
-        self.assertNotIn(GITHUB[4:16], blob)
-        self.assertIn('[REDACTED:', blob)
+        exported = seen['report']
+
+        def classes(report):
+            return {key: sorted(((e.get('id'), e.get('event'), e.get('label'), e.get('verdict'), e.get('note'))
+                                 for e in report.get(key) or []), key=repr)
+                    for key in ('verified', 'failed', 'live', 'live_legacy', 'pending', 'claimed', 'blockers',
+                                'asks_open', 'assumptions', 'decisions', 'commits')}
+        self.assertEqual(classes(exported), classes(direct))
+        self.assertTrue(all('row' in e for e in exported['verified'] + exported['failed']))
 
 
 class Redaction(Base):
     def test_secrets_everywhere_redacted(self):
-        jl(self.w / 'main.jsonl', [{'at': iso(NOW - 600), 'event': 'subagent', 'agent_id': 'id' + GITHUB2,
+        # Token shapes need a non-word character before their prefix (redact.py \b; goodqa#15790 tracks glued tokens)
+        jl(self.w / 'main.jsonl', [{'at': iso(NOW - 600), 'event': 'subagent', 'agent_id': 'id-' + GITHUB2,
                                     'agent_type': 'x'}])
+        jl(self.w / ('agent-' + GITHUB + '.jsonl'), [{'at': iso(NOW - 590), 'event': 'status', 'note': 'named wal'}])
         jl(self.w / 'agent-owner1.jsonl', [
             {'at': iso(NOW - 500), 'event': 'decision', 'id': 'wsec', 'note': f'key {ANTHROPIC} and {GITHUB}\n{PEM}',
              'source': f'password={PASSWORD}', 'reason': f'mail {EMAIL_LOCAL}@example.com from 10.20.30.40',
              'ref': GITHUB, 'extra': ANTHROPIC, 'nested': {GITHUB2: 'v'}},
-            {'at': iso(NOW - 450), 'event': 'status', 'note': {'deep': [PASSWORD, f'token={GITHUB2}']}},
+            {'at': iso(NOW - 450), 'event': 'status', 'note': {'deep': ['password=' + PASSWORD, f'token={GITHUB2}'],
+                                                               'password': PASSWORD}},
             {'at': iso(NOW - 440), 'event': 'status', 'note': 'path /Users/janeoperator/proj and /home/janeoperator/x'},
         ])
         r = self.export()
@@ -174,8 +192,9 @@ class Redaction(Base):
         self.assertGreater(r['redactions'], 0)
 
     def test_straddling_secrets_redacted(self):
-        at240 = 'y' * 230 + GITHUB  # straddles status_report's 240-character note cut
-        at_cap = 'x' * (ah_export.FIELD_CAP - 10) + GITHUB2  # straddles the export's own field cap
+        # straddles status_report's 240-character note cut, leaving 16 body characters (too few for the pattern)
+        at240 = 'y' * 219 + ' ' + GITHUB
+        at_cap = 'x' * (ah_export.FIELD_CAP - 11) + ' ' + GITHUB2  # straddles the export's own field cap
         jl(self.w / 'agent-owner1.jsonl', [
             {'at': iso(NOW - 400), 'event': 'decision', 'note': at240, 'source': 'user:x/y "z"'},
             {'at': iso(NOW - 390), 'event': 'blocker', 'note': at240},
@@ -224,7 +243,8 @@ class Injection(Base):
             page = self.html(self.export())
         parsed = Tags()
         parsed.feed(page)
-        self.assertFalse({'src', 'href', 'srcset', 'action', 'http-equiv'} & {a.lower() for a in parsed.attrs})
+        self.assertFalse({'src', 'href', 'srcset', 'action'} & {a.lower() for a in parsed.attrs})
+        self.assertEqual(re.findall(r'(?i)http-equiv="([^"]*)"', page), ['Content-Security-Policy'])  # the CSP meta only
         # outside text nodes (escaped user text may mention url( as text): check the markup skeleton only
         skeleton = re.sub(r'>[^<]*<', '><', page)
         self.assertNotRegex(skeleton, r'(?i)url\(|@import|<link|file:|=\s*["\']?//')
@@ -305,6 +325,13 @@ class Output(Base):
                 self.export('--out', str(d / 'e.html'))
             self.assertEqual(caught.exception.code, 'out_in_sync_root', sync)
 
+    def test_sync_root_reached_through_a_symlink_is_refused(self):
+        (self.home / 'Dropbox').mkdir()
+        (self.home / 'innocent').symlink_to(self.home / 'Dropbox')
+        with self.assertRaises(ah.AhError) as caught:
+            self.export('--out', str(self.home / 'innocent' / 'e.html'))
+        self.assertEqual(caught.exception.code, 'out_in_sync_root')
+
     def test_desktop_gets_a_sync_warning(self):
         d = self.home / 'Desktop'
         d.mkdir()
@@ -374,6 +401,12 @@ class Inputs(Base):
         with open(self.w / 'agent-owner1.jsonl', 'ab') as fh:
             fh.write(b'not json\n[1,2]\n{"event": "status", "at": "x", "note": 42}\n')
             fh.write(b'{"event": "status", "note": ["a", {"b": 1}]}\n\xff\xfe broken utf8\n')
+            fh.write(b'[' * 100_000 + b']' * 100_000 + b'\n')  # RecursionError in json.loads
+            fh.write(b'{"event": "status", "note": "lone \\ud800 surrogate"}\n')
+            nested = 'x'
+            for _ in range(200):
+                nested = {'k': nested}
+            fh.write(json.dumps({'event': 'status', 'note': nested}).encode() + b'\n')
         r = self.export()
         self.assertTrue(r['ok'])
         self.assertGreaterEqual(r['rows_skipped'], 3)
@@ -405,6 +438,13 @@ class Inputs(Base):
         self.assertIn('agent-link.jsonl', page)
         self.assertTrue(any(u['wal'] == 'agent-link.jsonl' for u in r['unread']))
 
+    def test_oversized_wal_listed_unread(self):
+        jl(self.w / 'agent-big.jsonl', [{'at': iso(NOW - 10), 'event': 'status', 'note': 'BIG FILE ROW ' + 'b' * 400}])
+        with mock.patch.object(ah_export, 'WAL_LIMIT', 256):
+            r = self.export()
+        self.assertTrue(any(u['wal'] == 'agent-big.jsonl' for u in r['unread']))
+        self.assertNotIn('BIG FILE ROW', self.html(r))
+
     def test_agent_and_since_filters(self):
         page = self.html(self.export('--agent', 'rt2'))
         self.assertIn('red-team: no material findings', page)
@@ -433,27 +473,9 @@ class Installers(unittest.TestCase):
                 names.add(node.value)
         return names
 
-    @staticmethod
-    def local_imports(module, seen=None):
-        """Every harness/hooks module reachable by import from `module` (static walk)."""
-        seen = set() if seen is None else seen
-        if module in seen:
-            return seen
-        path = HOOKS / (module + '.py')
-        if not path.is_file():
-            return seen
-        seen.add(module)
-        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
-            names = []
-            if isinstance(node, ast.Import):
-                names = [a.name.split('.')[0] for a in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
-                names = [node.module.split('.')[0]]
-            for n in names:
-                Installers.local_imports(n, seen)
-        return seen
-
     def test_installer_lists_cover_import_chain(self):
+        # The modules the export path loads: ah_export itself, ah (status_report), redact, safe_input (bounded
+        # reads) and goals_view (imported by status_report).
         needed = {'ah_export', 'ah', 'redact', 'safe_input', 'goals_view'}
         for installer in ('install.py', 'install_codex.py'):
             listed = self.listed(installer)

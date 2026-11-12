@@ -2377,34 +2377,46 @@ def _tokens(note: str) -> set:
     return {t.lower() for t in _TOKEN.findall(note or "")}
 
 
-def status_report(home: Path, session: str, since_s: float, now: float | None = None) -> dict:
+def status_report(home: Path, session: str, since_s: float, now: float | None = None, *, rows=None,
+                  unread=None) -> dict:
     """What the WALs prove, by class. Narrative is never promoted: VERIFIED needs a REALLY_TESTED entry, LIVE needs a
     deploy/live note, LINKED_LIVE needs both to share a ticket or sha token; a note that only says "done" is CLAIMED.
-    Targets changed without a user source are TARGET_MISMATCH; other unsourced decisions are ASSUMPTION."""
+    Targets changed without a user source are TARGET_MISMATCH; other unsourced decisions are ASSUMPTION.
+
+    rows: already-read (agent, record) pairs from a caller that read the WALs itself (ah export, goodqa#15788). The
+    report then opens no file and skips the owners view, and every entry carries "row", the index of its source
+    pair, so the caller can render the entry from its own redacted copy instead of the report's text cuts.
+    unread: that caller's list of WALs it did not read."""
     now = time.time() if now is None else now
     cutoff = now - since_s
-    sd = session_dir(home, session)
-    if not (sd / "main.jsonl").is_file():
-        raise AhError("session_unknown", f"no main WAL for session {session!r}")
-    rows, unread = [], []
-    for path in sorted(sd.glob("*.jsonl")):
-        agent = "main" if path.name == "main.jsonl" else path.stem[len("agent-"):] if path.stem.startswith("agent-") else path.stem
-        try:
-            text = _bounded(path).decode("utf-8", "replace")
-        except OSError as e:  # F9: an evidence report names what it did not read (over 64 MB, not a regular file)
-            unread.append({"wal": path.name, "agent": agent, "reason": str(e) or type(e).__name__})
-            continue
-        for raw in text.splitlines():
+    given = rows
+    supplied = given is not None
+    row_index = {id(rec): i for i, (_agent, rec) in enumerate(given)} if supplied else {}
+    rows, unread = [], list(unread or [])
+    if given is None:
+        given = []
+        sd = session_dir(home, session)
+        if not (sd / "main.jsonl").is_file():
+            raise AhError("session_unknown", f"no main WAL for session {session!r}")
+        for path in sorted(sd.glob("*.jsonl")):
+            agent = "main" if path.name == "main.jsonl" else path.stem[len("agent-"):] if path.stem.startswith("agent-") else path.stem
             try:
-                rec = json.loads(raw)
-            except ValueError:
+                text = _bounded(path).decode("utf-8", "replace")
+            except OSError as e:  # F9: an evidence report names what it did not read (over 64 MB, not a regular file)
+                unread.append({"wal": path.name, "agent": agent, "reason": str(e) or type(e).__name__})
                 continue
-            if not isinstance(rec, dict) or not rec.get("event"):
-                continue
-            at = parse_ts(rec.get("at"))
-            if at < cutoff:
-                continue
-            rows.append((agent, at, rec))
+            for raw in text.splitlines():
+                try:
+                    given.append((agent, json.loads(raw)))
+                except ValueError:
+                    continue
+    for agent, rec in given:
+        if not isinstance(rec, dict) or not rec.get("event"):
+            continue
+        at = parse_ts(rec.get("at"))
+        if at < cutoff:
+            continue
+        rows.append((agent, at, rec))
     rows.sort(key=lambda r: r[1])
     import goals_view  # noqa: PLC0415 - one verdict and deploy-record rule with ah goals (goodqa#15754)
     verified, pending, live, claimed, blockers, commits, asks, resolved, assumptions, decisions = {}, {}, [], [], [], [], {}, set(), [], []
@@ -2413,6 +2425,8 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
     def item(agent, at, rec, extra=None):
         out = {"agent": agent, "at": iso(at), "id": rec.get("id"), "event": rec.get("event"),
                "note": re.sub(r"\s+", " ", str(rec.get("note") or ""))[:240]}
+        if supplied:
+            out["row"] = row_index.get(id(rec))
         if extra:
             out.update(extra)
         return out
@@ -2478,13 +2492,15 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
     for entry in live_legacy:  # goodqa#15754: a prose claim is not a deploy record
         entry["label"] = "LEGACY_" + entry["label"]
     try:
+        if supplied:  # the owners view reads WALs itself; a caller that supplied its rows gets none of it
+            raise LookupError("owners view not computed for supplied rows")
         data = owners(home, session, now=now)
         owners_summary = {"counts": data.get("counts"), "undisposed": data.get("undisposed"),
                           "attention": data.get("attention"),
                           "live": sorted(r["agent_id"] for r in data.get("owners") or []
                                          if r.get("owner") and str(r.get("state")).startswith(("live", "working")))}
     except Exception:  # noqa: BLE001 - the evidence report must not fail on the owner view
-        owners_summary = {"error": "owners view unavailable"}
+        owners_summary = {"error": "owners view not included (run ah owners)" if supplied else "owners view unavailable"}
     return {"session": session, "since_s": since_s, "generated": iso(now), "entries": len(rows),
             "verified": sorted(verified.values(), key=lambda e: e["at"]),
             "pending": sorted((v for k, v in pending.items() if k not in verified), key=lambda e: e["at"]),
