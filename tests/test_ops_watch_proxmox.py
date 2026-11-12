@@ -330,7 +330,7 @@ class CommandAndConfigTests(Base):
 
     def test_jump_ssh_config_and_pinned_known_hosts_build_a_strict_command(self):
         # goodqa#15771: the Mac reaches t2-proxmox only through t2-dev, with no edit to ~/.ssh/config (main's ruling).
-        self.cfg["proxmox_pools"] = [{"host": "root@100.83.24.47", "storage": "local", "mount": "/var/lib/vz",
+        self.cfg["proxmox_pools"] = [{"host": "t2-proxmox", "storage": "local", "mount": "/var/lib/vz",
                                       "watch_vms": [102, 103], "jump": "t2-dev",
                                       "ssh_config": "/Users/x/.ssh/config_fleetops",
                                       "known_hosts": "/Users/x/work/t2-proxmox.known_hosts"}]
@@ -340,8 +340,9 @@ class CommandAndConfigTests(Base):
         self.assertEqual(argv[5:13], ["-F", "/Users/x/.ssh/config_fleetops", "-J", "t2-dev",
                                       "-o", "UserKnownHostsFile=/Users/x/work/t2-proxmox.known_hosts",
                                       "-o", "StrictHostKeyChecking=yes"])
-        self.assertEqual(argv[13:15], ["--", "root@100.83.24.47"])
-        self.assertEqual(got["disk:volume:root@100.83.24.47:/var/lib/vz"]["severity"], "high")
+        self.assertEqual(argv[13:15], ["--", "t2-proxmox"])
+        # AC-1 key and NEG-4: the alias names the alert, never an address
+        self.assertEqual(got["disk:volume:t2-proxmox:/var/lib/vz"]["severity"], "high")
 
     def test_unsafe_jump_or_paths_are_refused_before_ssh(self):
         base = {"host": "t2-proxmox"}
@@ -373,6 +374,31 @@ class CommandAndConfigTests(Base):
         self.assertIs(ow.DEFAULT_CHECKS["proxmox_pool"], ow.check_proxmox_pool)
         self.cfg["proxmox_pools"] = []
         self.assertEqual(ow.check_proxmox_pool(self.cfg, {}, Runner((0, "")), NOW), [])
+
+
+class RedTeamRound2Tests(Base):
+    """goodqa#15771 adversarial spec review: any exception in probe or parse is UNKNOWN, never a generic check error."""
+
+    def test_undecodable_output_is_unknown_and_escalates(self):
+        boom = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        got, state, _ = self.run_check(boom)
+        self.assertEqual(got["disk:unknown:t2-proxmox:/var/lib/vz"]["severity"], "warning")
+        self.assertIn("probe or parse error", got["disk:unknown:t2-proxmox:/var/lib/vz"]["message"])
+        got = self.run_check(boom, state=state, now=NOW + 1801)[0]
+        self.assertEqual(got["disk:unknown:t2-proxmox:/var/lib/vz"]["severity"], "high")
+
+    def test_corrupt_saved_samples_give_unknown_then_recover(self):
+        state = {"proxmox_pools": {"t2-proxmox:/var/lib/vz": {"first_try": NOW - 60, "samples": [["x"], None]}}}
+        got = self.run_check((0, probe()), state=state)[0]
+        self.assertIn("disk:unknown:t2-proxmox:/var/lib/vz", got)
+        got = self.run_check((0, probe()), state=state, now=NOW + 60)[0]
+        self.assertEqual(got["disk:volume:t2-proxmox:/var/lib/vz"]["severity"], "high")
+        self.assertNotIn("disk:unknown:t2-proxmox:/var/lib/vz", got)
+
+    def test_corrupt_saved_record_restarts(self):
+        state = {"proxmox_pools": {"t2-proxmox:/var/lib/vz": "junk"}}
+        got = self.run_check((0, probe()), state=state)[0]
+        self.assertEqual(got["disk:volume:t2-proxmox:/var/lib/vz"]["severity"], "high")
 
 
 class RunOnceTests(Base):

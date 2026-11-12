@@ -109,14 +109,14 @@ Host and unit names must be plain words, and `max_age_h` must be a finite positi
 {"proxmox_pools": [{"host": "t2-proxmox", "storage": "local", "mount": "/var/lib/vz", "watch_vms": [102, 103]}]}
 ```
 
-A host reachable only through another one takes three optional keys, with no edit to `~/.ssh/config`: `jump` (a plain-word ssh host, passed as `-J`), `ssh_config` (an absolute path, passed as `-F`) and `known_hosts` (an absolute path to a pinned known_hosts file; it turns on `StrictHostKeyChecking=yes`). The Mac reaches t2-proxmox this way:
+A host reachable only through another one takes three optional keys, with no edit to `~/.ssh/config`: `ssh_config` (an absolute path, passed as `-F`), `jump` (a plain-word ssh host, passed as `-J`) and `known_hosts` (an absolute path to a pinned known_hosts file; it turns on `StrictHostKeyChecking=yes`). Prefer a dedicated `ssh_config` file that defines the host alias: the alias then names the alert (`disk:volume:t2-proxmox:...`, never an address), and the jump hop gets its own settings from that file (an `-J` hop does not inherit BatchMode, ConnectTimeout or the pinned known_hosts). The Mac reaches t2-proxmox this way, with both files kept in `~/.agent-harness/ops-watch/` (0600):
 
 ```json
-{"proxmox_pools": [{"host": "root@100.83.24.47", "jump": "t2-dev", "ssh_config": "/Users/eric/.ssh/config_fleetops",
-  "known_hosts": "<work dir>/t2-proxmox.known_hosts", "storage": "local", "mount": "/var/lib/vz", "watch_vms": [102, 103]}]}
+{"proxmox_pools": [{"host": "t2-proxmox", "ssh_config": "/Users/eric/.agent-harness/ops-watch/ssh_config.t2-proxmox",
+  "storage": "local", "mount": "/var/lib/vz", "watch_vms": [102, 103]}]}
 ```
 
-Copy the known_hosts lines from the jump host's own trusted file (`ssh-keygen -F ADDRESS` there), never by trust on first use.
+`ssh_config.t2-proxmox` holds `Host t2-proxmox` (HostName, `User root`, `ProxyJump t2-dev`, `BatchMode yes`, `StrictHostKeyChecking yes`, `UserKnownHostsFile ~/.agent-harness/ops-watch/known_hosts.t2-proxmox`) followed by `Include ~/.ssh/config_fleetops` for t2-dev. Copy the known_hosts lines from the jump host's own trusted file (`ssh-keygen -F ADDRESS` there), never by trust on first use. Any exception while probing or parsing (undecodable bytes, a corrupt saved sample) is `disk:unknown`, which turns high after 30 minutes without a good read.
 
 Each run makes one read-only call: `ssh -o BatchMode=yes -o ConnectTimeout=5 [-F CFG] [-J JUMP] [-o UserKnownHostsFile=KH -o StrictHostKeyChecking=yes] -- HOST SCRIPT` with 25 s in total. `pvesm status` headers with or without `(KiB)` after each size column (pve 8 prints them) both parse; any other unit is UNKNOWN. The script is fixed text: `pvesm status --storage STORAGE`, `qm list` and `qm config` for every VM, and `du -sk MOUNT/images/*`. Host, storage and mount are checked against plain-word patterns and VM ids must be integers, so a bad entry is refused as `disk:config:...` before ssh. Nothing changes on the hypervisor. Alerts (key suffix `HOST:MOUNT`):
 

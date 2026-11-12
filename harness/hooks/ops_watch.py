@@ -1479,30 +1479,41 @@ def check_proxmox_pool(cfg, state, runner, now):
             out.append(alert("proxmox_pool", f"disk:config:{base}", "warning",
                              "proxmox pool entry has an unsafe host, storage, mount or VM id", {"host": host[:64]}))
             continue
-        rec = seen.setdefault(base, {"first_try": now, "samples": []})
+        rec = seen.get(base)
+        if not isinstance(rec, dict) or not isinstance(rec.get("first_try"), (int, float)):
+            rec = seen[base] = {"first_try": now, "samples": []}  # a corrupt saved record restarts, never crashes
+        mark = len(out)
         try:
             # optional jump host, ssh config and a pinned known_hosts file (host-key checking stays strict)
             opts = (["-F", ssh_config] if ssh_config else []) + (["-J", jump] if jump else []) + (
                 ["-o", f"UserKnownHostsFile={known_hosts}", "-o", "StrictHostKeyChecking=yes"] if known_hosts else [])
-            rc, text = runner(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", *opts, "--", host,
-                               pool_script(storage, mount)], 25)
-        except (subprocess.TimeoutExpired, OSError):
-            rc, text, why = 255, "", "unreachable or timed out"
-        else:
-            why = "unreachable or ssh failed" if rc != 0 else "unusable output"
-        parsed = parse_pool_probe(text, storage) if rc == 0 and len(text or "") <= 1048576 else None
-        if parsed is None:
-            out.extend(a for a in rec.get("alerts") or [] if isinstance(a, dict) and a.get("check") == "proxmox_pool")
-            stale = now - rec.get("ok_at", rec["first_try"]) > POOL_UNKNOWN_HIGH_S
-            out.append(alert("proxmox_pool", f"disk:unknown:{base}", "high" if stale else "warning",
-                             f"UNKNOWN: cannot read {host} {storage} pool ({why}); capacity is not being watched",
-                             {"host": host[:64], "reason": why}))
-            continue
-        total, used, avail = parsed["status"]
-        mark = len(out)
-        _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, used, avail, now)
-        rec["ok_at"] = now
-        rec["alerts"] = out[mark:]
+            try:
+                rc, text = runner(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", *opts, "--", host,
+                                   pool_script(storage, mount)], 25)
+            except (subprocess.TimeoutExpired, OSError):
+                rc, text, why = 255, "", "unreachable or timed out"
+            else:
+                why = "unreachable or ssh failed" if rc != 0 else "unusable output"
+            parsed = parse_pool_probe(text, storage) if rc == 0 and len(text or "") <= 1048576 else None
+            if parsed is not None:
+                total, used, avail = parsed["status"]
+                _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, used, avail, now)
+                rec["ok_at"] = now
+                rec["alerts"] = out[mark:]
+                continue
+        except Exception:  # undecodable output, a corrupt sample, anything else: UNKNOWN, never a generic check error
+            del out[mark:]
+            why = "probe or parse error"
+            if not isinstance(rec.get("samples"), list) or not all(
+                    isinstance(s, (list, tuple)) and s and isinstance(s[0], (int, float)) for s in rec["samples"]):
+                rec["samples"] = []
+        prior = rec.get("alerts") if isinstance(rec.get("alerts"), list) else []
+        out.extend(a for a in prior if isinstance(a, dict) and a.get("check") == "proxmox_pool")
+        ok_at = rec.get("ok_at") if isinstance(rec.get("ok_at"), (int, float)) else rec["first_try"]
+        stale = now - ok_at > POOL_UNKNOWN_HIGH_S
+        out.append(alert("proxmox_pool", f"disk:unknown:{base}", "high" if stale else "warning",
+                         f"UNKNOWN: cannot read {host} {storage} pool ({why}); capacity is not being watched",
+                         {"host": host[:64], "reason": why}))
     return out
 
 
