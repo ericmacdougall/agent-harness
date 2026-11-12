@@ -92,10 +92,19 @@ class ViewTests(unittest.TestCase):
         self.assertEqual((out["total"], out["truncated"]), (1, False))
 
     def test_asks_flagged_truncated_when_reader_limit_is_hit(self):
-        n = ah._prov().MAX_HITS + 5
+        prov = ah._prov()
+        n = prov.MAX_HITS + 5  # past the old 200-line cap: every ask is now seen (goodqa#15585)
         rows = [{"at": iso(NOW), "event": "ask", "id": f"a{i}", "note": "n", "reason": "r", "source": ""} for i in range(n)]
         self.wal(S1, rows)
-        self.assertTrue(ah.asks_view(self.home, S1, now=NOW)["truncated"])
+        out = ah.asks_view(self.home, S1, now=NOW)
+        self.assertFalse(out["truncated"])
+        self.assertEqual(out["total"], n)
+        old = prov.LEDGER_MAX_HITS
+        prov.LEDGER_MAX_HITS = 50  # at the ledger's own cap the view still says it is partial
+        try:
+            self.assertTrue(ah.asks_view(self.home, S1, now=NOW)["truncated"])
+        finally:
+            prov.LEDGER_MAX_HITS = old
 
     def test_view_stops_at_time_budget_and_says_truncated(self):
         self.wal(S1, [{"at": iso(NOW), "event": "requirement", "id": "w1", "note": "x", "source": "q"}])

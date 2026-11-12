@@ -819,6 +819,35 @@ class StaleRuntimeDetector(unittest.TestCase):
         return backend
 
     @unittest.skipUnless(sys.platform == "darwin", "exercises the macOS libproc backend")
+    def test_chrome_native_host_helpers_are_not_sessions_and_are_not_listed(self):
+        # The Claude-in-Chrome extension keeps `claude --chrome-native-host` helpers alive across self-updates. They
+        # run on the deleted binary but are not sessions and hold no authority, so they must not raise the alert.
+        rows = {
+            200: (True, 0, b"claude", 7),    # helper
+            201: (True, 0, b"2.1.319", 7),   # helper under the versioned binary name
+            202: (True, 0, b"claude", 7),    # a real stale session
+            203: (True, 0, b"claude", 7),    # argv unreadable: stays visible
+            204: (True, 0, b"claude", 7),    # the flag is not the first argument: a session, stays visible
+        }
+        args = {200: ["claude", "--chrome-native-host"], 201: ["/x/2.1.319", "--chrome-native-host"],
+                202: ["claude", "--dangerously-skip-permissions"], 203: None,
+                204: ["claude", "--resume", "x", "--chrome-native-host"]}
+        backend = self.backend(rows)
+        backend.process_args = lambda pid: args[pid]
+        found = nc.stale_runtime_processes(backend=backend)
+        self.assertEqual([row["pid"] for row in found], [202, 203, 204])
+
+    def test_procargs_parser_reads_argv_and_refuses_malformed_buffers(self):
+        import struct
+        good = struct.pack("i", 2) + b"/x/claude\x00\x00\x00claude\x00--chrome-native-host\x00HOME=/h\x00"
+        self.assertEqual(nc.parse_procargs(good), ["claude", "--chrome-native-host"])
+        self.assertEqual(nc.parse_procargs(struct.pack("i", 0) + b"/x/claude\x00\x00"), [])
+        for bad in (b"", b"\x01\x00", struct.pack("i", -1) + b"x\x00", struct.pack("i", 9999) + b"/x\x00\x00a\x00",
+                    struct.pack("i", 2) + b"/x\x00\x00only-one\x00", struct.pack("i", 1) + b"no terminator"):
+            with self.subTest(bad=bad[:12]):
+                self.assertIsNone(nc.parse_procargs(bad))
+
+    @unittest.skipUnless(sys.platform == "darwin", "exercises the macOS libproc backend")
     def test_lists_only_runtime_processes_that_lost_their_binary(self):
         rows = {
             100: (True, 0, b"claude", 7),        # stale Claude session

@@ -439,6 +439,59 @@ class Enforcement(Env):
         self.run_note("--event", "ask_resolved", "--note", "done", "--ref", gid, "--source", self.user(HUMAN, QUOTE))  # goodqa#14791 G5
         self.assertEqual(provenance.render_asks(SID)[1]["traced"], 0)
 
+    def test_ask_items_lists_only_presentable_open_asks(self):  # goodqa#15585 Needs-you hotfix
+        good = json.loads(self.run_note("--event", "ask", "--note", "<b>confirm</b> the policy mode (goodqa#15585)",
+                                        "--reason", "decides rollout", "--source", self.user(HUMAN, QUOTE)).stdout)["id"]
+        guess = json.loads(self.run_note("--event", "ask", "--note", "provide an OpenRouter key", "--reason", "fallback provider",
+                                         "--source", f"inferred: from {self.user(HUMAN, 'OpenRouter key stays out')} -- agent guessed a key is wanted").stdout)["id"]
+        done = json.loads(self.run_note("--event", "ask", "--note", "already answered", "--reason", "needed to decide",
+                                        "--source", self.user(HUMAN, QUOTE)).stdout)["id"]
+        self.run_note("--event", "ask_resolved", "--note", "done", "--ref", done, "--source", self.user(HUMAN, QUOTE))
+        with (self.wals / "main.jsonl").open("a") as handle:  # an untraceable ask written around wal_note's gate
+            handle.write(json.dumps({"event": "ask", "id": "wforged00001", "at": "2026-11-09T00:00:00Z",
+                                     "note": "forged ask", "source": 'user:nope/none "never said"'}, separators=(",", ":")) + "\n")
+        data = provenance.ask_items(SID)
+        by_id = {item["id"]: item for item in data["items"]}
+        self.assertEqual(set(by_id), {good, guess}, data)
+        self.assertEqual((by_id[good]["kind"], by_id[guess]["kind"]), ("traced", "assumption"))
+        self.assertEqual(by_id[good]["note"], "<b>confirm</b> the policy mode (goodqa#15585)")  # raw; the page renders text
+        self.assertEqual((data["counts"]["blocked"], data["counts"]["closed"]), (1, 1))
+        self.assertNotIn("…", by_id[good]["note"])  # not clipped here: the reader redacts first, then clips
+        env = dict(os.environ, HOME=str(self.home))
+        out = subprocess.run([sys.executable, str(HOOKS / "provenance.py"), "asks", "--session", SID, "--json", "--items"],
+                             capture_output=True, text=True, env=env)
+        self.assertEqual({i["id"] for i in json.loads(out.stdout)["items"]}, {good, guess}, out.stderr)
+        plain = subprocess.run([sys.executable, str(HOOKS / "provenance.py"), "asks", "--session", SID, "--json"],
+                               capture_output=True, text=True, env=env)
+        self.assertNotIn("items", json.loads(plain.stdout))  # the existing counts-only contract is unchanged
+
+    def test_ledger_sees_asks_and_resolutions_past_the_first_200(self):  # goodqa#15585: resolved asks kept showing
+        source = self.user(HUMAN, QUOTE)
+        rows = []
+        for i in range(260):
+            rows.append({"event": "ask", "id": f"wbulkask{i:04d}", "at": f"2026-11-09T00:{i // 60:02d}:{i % 60:02d}Z",
+                         "note": f"ask {i}", "reason": "r", "source": source})
+        for i in range(250):  # resolve all but the last ten, in another WAL of the same session
+            rows.append({"event": "ask_resolved", "id": f"wbulkres{i:04d}", "ref": f"wbulkask{i:04d}", "source": source})
+        (self.wals / "main.jsonl").write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows[:260]))
+        (self.wals / "agent-a1.jsonl").write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows[260:]))
+        open_ids = [item["id"] for item in provenance.ask_items(SID)["items"]]
+        self.assertEqual(open_ids, [f"wbulkask{i:04d}" for i in range(250, 260)])
+
+    def test_resolved_items_keep_seven_days_newest_first(self):  # goodqa#15585 Answered history
+        import datetime as dt
+        now = dt.datetime.now(dt.timezone.utc)
+        source = self.user(HUMAN, QUOTE)
+        rows = [{"event": "ask", "id": f"wres{i}", "at": "2026-11-01T00:00:00Z", "note": f"n{i}", "source": source}
+                for i in range(3)]
+        for i, days in enumerate((1, 3, 9)):
+            rows.append({"event": "ask_resolved", "id": f"wfix{i}", "ref": f"wres{i}", "note": f"how {i}",
+                         "at": (now - dt.timedelta(days=days)).isoformat(), "source": source})
+        (self.wals / "main.jsonl").write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows))
+        resolved = provenance.ask_items(SID)["resolved"]
+        self.assertEqual([r["id"] for r in resolved], ["wres0", "wres1"])  # the 9-day-old one is out of the window
+        self.assertEqual(resolved[0]["resolution"], "how 0")
+
     def test_concurrent_appends(self):  # AC-6
         procs = [subprocess.Popen([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "requirement",
                                    "--note", f"r{i}", "--source", self.user(HUMAN, QUOTE)],

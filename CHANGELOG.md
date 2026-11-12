@@ -6,6 +6,9 @@ group by pull request.
 
 ## Unreleased
 
+### Added
+- Mission Control (goodqa#15585): a local, read-only, realtime dashboard of the agent fleet, with initiative progress, each owner's last work item, pulses for WAL writes, pushes, releases, deploys and ticket checkpoints, and chat with Claude main or Codex. It is bound to 127.0.0.1 behind a single-use launch link, and it runs as the LaunchAgent `com.agent-harness.mission-control`, installed by `install.py --apply` (`--no-mission-control` opts out). See [docs/mission-control.md](docs/mission-control.md). Tests: `python3 -m unittest tests.test_mission_control tests.test_mission_control_install tests.test_mc_inbox`.
+
 ### Fixed
 - kill_guard false positive (goodqa#15365): a path glob in argument position of an ssh remote command (`ssh host 'ls tools/x/*'`) is no longer read as the command name `*` and refused as `[broad-kill]`. A glob in command position, and every real kill through ssh, still block. Tests: `python3 -m unittest tests.test_kill_guard_ssh_glob`.
 - merge gate false positives (goodqa#15122): `git push gh <sha>:refs/heads/<feature>` (a remote named gh) is no longer read as a gh call; read-only gh calls whose words come from a literal variable in the same command pass; the subagent exception-record block allows only known free-text forms (notes through the harness helpers, commit messages, ticket bodies, print and search commands) and keeps the old text rule for every other program; any builtin that can assign (`printf -v`, `declare -n`, `trap`, `read`) makes literal variables unknown; pushes to `heads/main`, through `xargs`, or with alias or push config on the command line block. New: a `git push` to main or master, `--all`, `--mirror` or a destination built at run time blocks.

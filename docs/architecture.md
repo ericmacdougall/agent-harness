@@ -12,7 +12,8 @@ Agent Harness is a set of installed instructions, role definitions and standalon
 | Installers | `install.py`, `install_codex.py`, `install_tui_plugin.py`, `log_backup_install.py`, `netwatch_install.py` | Preview by default, `--apply` to write; they merge settings and back up replaced files. |
 | `harness` binary | `cmd/harness`, `internal/*` | Go CLI. Currently ports `harness tickets` (the local git-ref ledger, see [ledger](ledger.md)), `ledger-mcp`, and `version`. Other subcommands refuse and point back to the Python helper. |
 | Console | `console/` | Local Go application with an embedded browser UI that drives Codex and Claude Code CLIs. Unreleased baseline; see [console](console.md). |
-| TUI plugin | `plugins/harness-tui` | Optional offline reference view opened from a chat; see [tui-plugin](tui-plugin.md). |
+| TUI plugin | `plugins/harness-tui` | Optional offline reference view opened from a chat; also answers Mission Control chat from Claude desktop. See [tui-plugin](tui-plugin.md). |
+| Mission Control | `harness/mission_control`, `mission_control_install.py`, `harness/hooks/mc_inbox.py` | Local read-only realtime fleet dashboard with chat, run by launchd on the Mac; see [mission-control](mission-control.md). |
 
 ## Data flow
 

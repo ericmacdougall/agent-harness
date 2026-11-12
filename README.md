@@ -131,6 +131,7 @@ Verified against this repository on 2026-11-08 (main at `2eca3c5`). "Shipped" me
 - Optional log backup and netwatch installs, and the Harness TUI plugin ([docs/tui-plugin.md](docs/tui-plugin.md)).
 
 **In progress**
+- Mission Control, the local realtime fleet dashboard (`goodqa#15585`; [docs/mission-control.md](docs/mission-control.md)).
 - Console durable event-log rebuild (`GoodQA #35692`). The console on `main` is an unreleased baseline with three tests skipped by name until the rebuild lands ([console/README.md](console/README.md)).
 - Log-backup bulk lane and heavy-work guards (`goodqa#15062`, `goodqa#15147`, `goodqa#14817`; see the Unreleased section of [CHANGELOG.md](CHANGELOG.md)).
 
