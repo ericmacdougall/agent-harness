@@ -1330,9 +1330,20 @@ def _git_try(repo, args, timeout):
     done = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
                            '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always',
                            '-c', 'protocol.ssh.allow=always', '-c', 'protocol.git.allow=always', '-C', repo] + list(args),
-                          capture_output=True, timeout=max(0.2, timeout), env=_clone_env())
+                          capture_output=True, timeout=max(0.2, timeout), env=_try_env())
     return (done.returncode, done.stdout[:65536].decode('utf-8', 'surrogateescape'),
             done.stderr[:4096].decode('utf-8', 'surrogateescape'))
+
+
+def _try_env():
+    """_clone_env for a caller that reads git's own error text: the C locale (a translated "not a git repository" must not
+    be mistaken for another failure) and a repository search as wide as the real command's (the user's shell may allow
+    crossing filesystems)."""
+    env = _clone_env()
+    env['LC_ALL'] = 'C'
+    env.pop('LANGUAGE', None)
+    env['GIT_DISCOVERY_ACROSS_FILESYSTEM'] = '1'
+    return env
 
 
 def _live_remote_refs(url, repo, timeout):
@@ -1423,7 +1434,7 @@ def _per_worktree_config_refusal(path, common, git_dir, cwd, step):
         # Only git's own "not a git repository" lets the lookup be skipped; any other failure or odd output refuses.
         code, out, err = _git_try(cwd, ['rev-parse', '--path-format=absolute', '--absolute-git-dir'], step(2.0))
         if code != 0:
-            if 'not a git repository' not in err.lower():
+            if not (err.splitlines() or [''])[0].startswith('fatal: not a git repository'):  # the first line only
                 return 'could not determine the calling worktree'
         else:
             lines = out.splitlines()

@@ -346,6 +346,37 @@ class CallerAndMessages(Extension):
         self.assertEqual(self.decide_from(self.other)[0], "block")
         self.assertFalse(self.marker.exists())
 
+    # re-review N1, N2, N3
+    def test_the_caller_lookup_runs_in_the_c_locale_and_searches_as_widely_as_the_real_command(self):
+        seen = {}
+
+        def fake(argv, **kwargs):
+            seen.update(kwargs)
+            return subprocess.CompletedProcess(argv, 0, b"/x/.git\n", b"")
+        poisoned = {"LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8", "LANGUAGE": "de", "GIT_DIR": "/nowhere"}
+        with mock.patch.dict(os.environ, poisoned), mock.patch.object(cg.subprocess, "run", fake):
+            cg._git_try("/", ["rev-parse"], 5)
+        env = seen["env"]
+        self.assertEqual(env["LC_ALL"], "C")
+        self.assertNotIn("LANGUAGE", env)
+        self.assertEqual(env["GIT_DISCOVERY_ACROSS_FILESYSTEM"], "1")
+        self.assertNotIn("GIT_DIR", env)
+
+    def test_only_a_first_line_that_says_not_a_git_repository_skips_the_callers_file(self):
+        skipped = (128, "", "fatal: not a git repository (or any of the parent directories): .git\n")
+        for answer, expect_skip in ((skipped, True),
+                                    ((128, "", "fatal: detected dubious ownership in repository at '/x/not a git repository'\n"), False),
+                                    ((128, "", "fatal: some other failure\nnot a git repository\n"), False),
+                                    ((128, "", "error: cannot stat '/tmp/not a git repository': Permission denied\n"), False),
+                                    ((128, "", "fatal: not a git repository\n"), True),
+                                    ((128, "", ""), False)):
+            with self.subTest(stderr=answer[2][:50]), mock.patch.object(cg, "_git_try", return_value=answer):
+                refusal = cg.linked_worktree_remove_refusal(str(self.linked), str(self.other), self.policy)
+                if expect_skip:
+                    self.assertIsNone(refusal)
+                else:
+                    self.assertIn("could not determine the calling worktree", refusal or "")
+
     def test_a_caller_lookup_that_fails_or_answers_oddly_refuses(self):
         for answer in ((128, "", "fatal: detected dubious ownership in repository"), (129, "", "error: unknown option `path-format'"),
                        (0, "relative/path\n", ""), (0, "/a\n/b\n", ""), (0, "", "")):
@@ -386,7 +417,6 @@ class CallerAndMessages(Extension):
         done = subprocess.run(["git", "-C", str(self.other), "worktree", "remove", "--", str(self.linked)],
                               env=GIT_ENV, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
         self.assertTrue(self.marker.exists(), "git no longer runs the caller's fsmonitor: revisit the caller rule")
-        self.assertIn("block", self.decide_from(self.other, "git worktree remove %s" % self.base / "nonexistent") if False else "block")
 
 
 for _name in [n for n in dir(Extension) if n.startswith("test_")]:
