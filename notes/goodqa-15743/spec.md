@@ -97,15 +97,17 @@ Checkpoint: not required (under 10 min per step); every step is idempotent: veri
 - Walk races and symlink or mount traversal: mitigation, AC-6 descriptor walk with identity checks, no cross-device descent, up-front mount refusal.
 - Another repository borrows this clone's objects: mitigation, AC-3 alternates scan and commondir refusal, NEG-11.
 - A lazy fetch changes the clone or leaks a credential: mitigation, AC-2 protocol denial plus lazy-fetch off, canary test, no credential in output.
-- The tool becomes a general rm: mitigation, scope strictly inside the work directory, a real .git directory, host local only, policy from code, literal path, audit on both ends, hook-form rm exemption unchanged.
+- The tool becomes a general rm: mitigation, scope strictly inside the work directory, a real .git directory, host local only, policy from code, literal path, audit on both ends, hook-form rm exemption tightened, not widened (D4).
 - Known limits: dangling and cruft-pack objects that no ref or reflog reaches are not protected; notes and refs that the full ls-remote listing (heads, tags, pull heads) does not list always refuse (clear message).
 
 ## Reviews
 
-Spec core sha256: `02cbe341f5abd5c443515376403371112eead6eca0b0a1498632f067440e6ef2`
+Spec core sha256: `76eb1e1f7a4ff1cf00991d27c8bcab80e34dc8873b2c787536f6b65e50525658`
 
 | Role | Verdict | Reviewer | Kind | Source | Bound to |
 |---|---|---|---|---|---|
+| adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | stale |
+| acceptance | ACCEPT | a5d878417503c1093 (red-team) | agent | WAL-verified red-team agent | stale |
 | adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | stale |
 | acceptance | ACCEPT | a5d878417503c1093 (red-team) | agent | WAL-verified red-team agent | stale |
 | adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | current |

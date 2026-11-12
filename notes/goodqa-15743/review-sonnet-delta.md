@@ -1,10 +1,9 @@
-# Spec review (acceptance, delta) of goodqa#15743 spec v3
+# Spec review (acceptance, delta passes) of goodqa#15743 spec v4
 
-Reviewer: native agent a5d878417503c1093 (Sonnet), WAL ids w914718f0cf3 and waef258cccb5 (round 1, BLOCK on v1: eight high findings H1..H8) and w7089a82129b (delta round).
-Reviewed: notes/goodqa-15743/spec.md at d0c2b1c. The reviewer read receipts/wt-pp768 read-only and found it in main's session with only allowlisted .git entries, sample hooks only, info holding only exclude, about 1.3 GB.
+Reviewer: native agent a5d878417503c1093 (Sonnet), WAL ids w914718f0cf3 and waef258cccb5 (round 1, BLOCK on v1), w7089a82129b (v3 ACCEPT), w37dfcd8425f (v4 first pass, BLOCK), wae3b29eaf5b (v4 final pass, ACCEPT).
+Reviewed: notes/goodqa-15743/spec.md (v4) at 6a18019 against code on PR 215 at 3fabef195ced7a0e120fb3ca5509ad8df978f2d8. The only later change is one Risks-list phrase the reviewer pointed out ("hook-form rm exemption unchanged" now reads "tightened, not widened (D4)").
 
-Delta result: each of H1..H8 is closed by a testable AC or NEG (H1 by honest waivers and AC-3/AC-8/AC-9, H2 by AC-8 with NEG-7/NEG-10, H3 by AC-6 with NEG-6, H4 by the alternates scan and NEG-11, H5 by all-namespace refs and NEG-12, H6 by D1 and the injected runner, H7 by AC-2/NEG-5 with a canary and argv spy, H8 by the lfs and info/attributes refusals). D1..D5 judged sound; D5 conditions: ls-remote must list refs/pull/*/head (no --heads --tags) and refs/pull/*/merge stays out of the proof set.
-
-Mediums raised and folded into the spec in the follow-up commit: M2 live-owner rule matches an owner whose worktree or working directory is the target (caller excluded, no WAL text match), M3 one lsof listing filtered by path prefix instead of +D, M4 cutoff leftovers reported for a human as a recorded limitation, M5 refs differing inside the quarantine rename the directory back and refuse. M1 (Review-policy) is satisfied: standard keeps two reviews and both are recorded.
+History: the first v4 pass BLOCKed on one item, D7 versus D4: the hook-form exemption refused partial clones only because the shared config check rejected the extensions section, which git 2.54 no longer writes; the test meant to prove the refusal was vacuous (it reached a real ls-remote). Fixed in code (the shared check refuses promisor and partial-clone filter keys unless clone-remove opts in; a test that fails if the network is reached) and in D4.
+Final pass: M-a (any promisor value not plainly false refuses), M-b (the ah worktree-remove behaviour change stated in D4 and Scope, accepted by main), L-a (the directory set taken right after the cutoff and before git status), L-b (walk_delete requires the set) are closed; Out list and AC-6 consistent; no new high. Still open and not blocking: Review-policy standard (two reviews recorded), files kept because macOS metadata changed their ctime are never cleared.
 
 Verdict: ACCEPT

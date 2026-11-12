@@ -11,4 +11,6 @@ Not examined by the reviewer: implementation code (none yet), APFS ctime behavio
 
 Round 3 (final confirmation of the working tree): ACCEPT with one medium and two lows, all applied by the author in the final spec text: compare refs before writing the marker (a difference leaves no marker), fsync the marker-inode row before any deletion, exact-or-slash lsof prefix match, the Known-limits wording; NEG-16 added.
 
+Rounds 4 to 6 (spec v4, reviewed at 231ed6e, c05b858 and 6a18019 against code 6c1f357, 32e303d and 3fabef1): ACCEPT each time. Round 4 found no new high; round 5 found two mediums (the verified directory set was read at the end of verification, so a directory moved in during the git status and scan window would be deleted; `ah worktree-remove` shares the tightened config check and the spec did not say so); round 6 confirmed both are closed (set taken right after the cutoff, behaviour change stated in D4 and Scope and pinned by a test), the Out list and D4 agree, AC-6 states the early set and its single gap. D6, D7 and D8 are honestly labelled owner assumptions; AC-4 is stated plainly as weakened.
+
 Verdict: ACCEPT
