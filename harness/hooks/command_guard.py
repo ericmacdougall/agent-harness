@@ -3455,7 +3455,7 @@ class Analyzer:
         if name in PRINT_FILE_CMDS or name in GREP_CMDS or name in EXFIL_CMDS or name in ('openssl', 'source'):
             self.read_creds(name, args, pl, idx)
         if name in RM_CMDS or name in MV_CMDS or name in OVERWRITE_CMDS or name in (
-                'sed', 'perl', 'ruby', 'awk', 'gawk', 'rsync', 'rclone', 'tar', 'zip', 'dd', 'truncate', 'set-content',
+                'sed', 'perl', 'ruby', 'awk', 'gawk', 'rsync', 'scp', 'rclone', 'tar', 'zip', 'dd', 'truncate', 'set-content',
                 'out-file', 'curl', 'wget', 'touch', 'mkdir', 'unzip', 'bsdtar', 'gtar'):
             self.destructive(name, args, texts)
         if not (name in PRINT_FILE_CMDS or name in GREP_CMDS or name in EXFIL_CMDS):
@@ -5444,7 +5444,10 @@ class Analyzer:
                 for w in (nd[1:] if name == 'sed' and nd else nd):
                     if not self.state_dest(w):
                         self.refuse(name + ' -i (rewrites in place)', w, tiers=('log', 'unknown'))
+        elif name == 'scp':
+            self.remote_copy_dest(name, nd)
         elif name == 'rsync':
+            self.remote_copy_dest(name, nd)
             if any(t.startswith('--delete') or t.startswith('--del') or t == '--remove-source-files'
                    or t == '--remove-sent-files' for t in texts):
                 pos = [a for a in nd if not self._remote_spec(a.text)]
@@ -5499,6 +5502,43 @@ class Analyzer:
     def _remote_spec(text):
         return bool(re.match(r'^[A-Za-z0-9_.@-]+:(?!/)', text)) or bool(re.match(r'^[A-Za-z0-9_.@-]+::', text)) \
             or bool(re.match(r'^[A-Za-z0-9_.@-]+:/', text) and not text.startswith('/'))
+
+    REMOTE_DEST = re.compile(r'^(?:[A-Za-z0-9_.-]+@)?(?:[A-Za-z0-9_.-]+|\[[0-9a-fA-F:]+\]):(?!:)(.*)$', re.S)
+
+    def remote_copy_dest(self, name, nd):
+        """scp and rsync copying TO a remote path that names a protected harness location (hooks, WALs, state): the same
+        refusal as a local cp or an ssh-wrapped cp (goodqa#15759; the 2026-11-11 t2-dev install of command_guard.py used scp
+        after the cp was refused). A path relative to the remote home is read as `~/path`. A download (a remote SOURCE, a
+        local destination) is not touched. sftp batch commands are not parsed (stated limit)."""
+        if len(nd) < 2:
+            return
+        dest = nd[-1]
+        text = dest.text
+        if text.startswith('scp://'):
+            match = re.match(r'^scp://[^/]+/(.*)$', text, re.S)
+            path = '/' + match.group(1) if match else None
+        else:
+            match = self.REMOTE_DEST.match(text) if self._remote_spec(text) or re.match(r'^[A-Za-z0-9_.@-]+:~', text) else None
+            path = match.group(1) if match else None
+        if path is None or path == '':
+            return
+        if not path.startswith(('/', '~')):
+            path = '~/' + path
+        # the destination itself, and (for a directory destination) each source file name placed inside it: a hook file that
+        # already exists there is what gets overwritten, exactly as with a local cp (a directory source is not expanded: limit)
+        candidates = [path]
+        for source in nd[:-1]:
+            base = posixpath.basename(source.text.rstrip('/'))
+            if base and not self._remote_spec(source.text):
+                candidates.append(path.rstrip('/') + '/' + base)
+        for candidate in candidates:
+            fake = Word()
+            fake.alts = [candidate]
+            fake.dynamic, fake.subs, fake.vars = dest.dynamic, dest.subs, dest.vars
+            cls, _resolved, _literal = self.target_class(fake)
+            if cls in ('log', 'unknown'):
+                self.refuse(name + ' to a remote harness path (the sanctioned route is `ah install-files`)', fake, tiers=('log', 'unknown'))
+                return
 
     def overwrite_dest(self, what, word):
         """cp/mv/ln/install onto an existing Tier A file (or into a protected dir by glob/variable)."""
