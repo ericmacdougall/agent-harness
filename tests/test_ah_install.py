@@ -162,6 +162,100 @@ class Listed(Base):
         self.assertEqual(self.calls, [])
 
 
+class Receipt1c(Base):
+    """Receipt r1c: a failed attempt must not unblock a host in an unknown state, a hanging guard must be rolled back, and a rollback
+    reports the real state of a file it was asked to remove."""
+
+    def unknown_install(self):
+        self.inject = ("commit", 1, "after")  # the commit ran on the host and the answer was lost
+        with self.assertRaises(ai.InstallError) as caught:
+            self.install()
+        self.inject = None
+        return caught.exception.data["run"]
+
+    def assertHostRefuses(self):
+        error = self.refused()
+        self.assertEqual(error.code, "unfinished_run")
+
+    def test_a_rollback_lost_at_the_lock_does_not_clear_the_unfinished_run(self):  # F1
+        run = self.unknown_install()
+        self.assertHostRefuses()
+        self.inject = ("lock", self.counts.get("lock", 0) + 1)
+        with self.assertRaises(ai.InstallError) as caught:
+            ai.rollback(run, TICKET, (), self.mac, "s", "a", self.runner, lambda t, x: None)
+        self.assertEqual(caught.exception.data["result"], "attempt_refused")
+        self.inject = None
+        self.assertHostRefuses()
+        self.assertEqual(ai.unfinished_runs(self.mac, "t2-dev"), [run])
+
+    def test_a_resume_refused_by_another_runs_lock_does_not_clear_the_unfinished_run(self):  # F1
+        run = self.unknown_install()
+        lock = self.hooks / ".ah-install" / "lock"
+        lock.mkdir(parents=True, exist_ok=True)
+        (lock / "run").write_text("ins-eeeeeeeeeeee")
+        with self.assertRaises(ai.InstallError) as caught:
+            ai.resume(run, TICKET, self.mac, "s", "a", self.runner, lambda t, x: None)
+        self.assertEqual(caught.exception.data["result"], "attempt_refused")
+        shutil.rmtree(lock)
+        self.assertHostRefuses()
+
+    def test_a_resume_that_fails_at_stage_is_unknown_and_the_host_keeps_refusing(self):  # F1
+        run = self.unknown_install()
+        (self.hooks / "extra.py").write_bytes(self.base_bytes("extra.py"))  # one file is back at its old bytes: the resume must stage it
+        self.inject = ("stage", self.counts.get("stage", 0) + 1)
+        with self.assertRaises(ai.InstallError) as caught:
+            ai.resume(run, TICKET, self.mac, "s", "a", self.runner, lambda t, x: None)
+        self.assertEqual(caught.exception.data["result"], "unknown")
+        self.inject = None
+        self.assertHostRefuses()
+
+    def test_only_a_definite_result_clears_an_unfinished_run(self):  # F1
+        for result, cleared in (("installed", True), ("rolled_back", True), ("restored", True), ("already_current", True), ("refused", True),
+                                ("unknown", False), ("attempt_refused", False)):
+            with self.subTest(result):
+                home = Path(self.tmp, "audit-" + result)
+                ai.audit(home, {"event": "start", "kind": "install", "run": "ins-000000000001", "host": "t2-dev"})
+                ai.audit(home, {"event": "result", "kind": "install", "run": "ins-000000000001", "host": "t2-dev", "result": result})
+                self.assertEqual(ai.unfinished_runs(home, "t2-dev") == [], cleared)
+
+    def test_a_guard_that_hangs_forever_after_the_install_is_rolled_back_not_left_live(self):  # F2
+        side = Path(self.tmp, "hang")
+        git(self.tmp, "clone", "-q", str(self.origin), str(side))
+        (side / "harness" / "hooks" / "command_guard.py").write_bytes(b"import time\ntime.sleep(1000)\n")
+        git(side, "add", "-A")
+        git(side, "commit", "-q", "-m", "hanging guard")
+        git(side, "push", "-q", "origin", "main")
+        ref = git(side, "rev-parse", "HEAD")
+        before = {n: self.live(n) for n in NAMES}
+        quick = ai.REMOTE_SCRIPT.replace("60, 120, 200", "1, 1, 3")
+        self.assertNotEqual(quick, ai.REMOTE_SCRIPT)
+        started = __import__("time").time()
+        with mock.patch.object(ai, "REMOTE_SCRIPT", quick):
+            with self.assertRaises(ai.InstallError) as caught:
+                self.install(ref=ref, files=("ah.py", "command_guard.py"))
+        self.assertLess(__import__("time").time() - started, 120)
+        self.assertEqual(caught.exception.data["result"], "rolled_back")
+        self.assertEqual({n: self.live(n) for n in NAMES}, before)
+
+    def test_an_after_test_that_does_not_answer_in_time_attempts_a_rollback_guard_first(self):  # F2
+        self.inject = ("selftest", 2)  # the baseline answers, the after-install test never does
+        before = {n: self.live(n) for n in NAMES}
+        with self.assertRaises(ai.InstallError) as caught:
+            self.install(files=("ah.py", "command_guard.py"))
+        self.assertEqual(caught.exception.data["result"], "rolled_back")
+        self.assertEqual({n: self.live(n) for n in NAMES}, before)
+
+    def test_a_rollback_that_could_not_remove_a_file_does_not_report_restored(self):  # F3
+        (self.hooks / "extra.py").unlink()
+        run = self.install(files=("extra.py",))["run"]
+        (self.hooks / "extra.py").write_bytes(b"# changed by someone else\n")
+        with self.assertRaises(ai.InstallError) as caught:
+            ai.rollback(run, TICKET, ("extra.py",), self.mac, "s", "a", self.runner, lambda t, x: None)
+        self.assertEqual(caught.exception.data["result"], "unknown")
+        self.assertIn("read-back differs", str(caught.exception.data["reason"]))
+        self.assertTrue((self.hooks / "extra.py").exists())
+
+
 class Hardening(Base):
     """Findings of the code review (M2 to M6, L3 to L6)."""
 

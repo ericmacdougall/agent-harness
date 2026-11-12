@@ -40,7 +40,7 @@ REF_RE = re.compile(r"[0-9a-f]{40}")
 TICKET_RE = re.compile(r"GoodQA [A-Za-z0-9_-]+#[0-9]+")
 RUN_RE = re.compile(r"ins-[0-9a-f]{12}")
 SSH_TIMEOUT = 120
-SELFTEST_TIMEOUT = 300
+SELFTEST_TIMEOUT = 330  # clearly above the remote TOTAL_DEADLINE (200 s) plus python and ssh start-up, so a local timeout is a lost link, not a slow self-test
 HOST_AUDIT = ".agent-harness/install-audit.jsonl"
 FIRST = ("doctor.py", "ah.py")  # no special order beyond: command_guard.py is always last
 
@@ -133,26 +133,34 @@ def replace_with(name, data, mode):
     write_exclusive(t, data, 0o600, mode)
     return t
 
+PROBE_TIMEOUT, DOCTOR_TIMEOUT, TOTAL_DEADLINE = 60, 120, 200  # the whole self-test ends inside TOTAL_DEADLINE seconds, always
+
 def selftest():
     guard = os.path.join(HOOKS, "command_guard.py")
     res = {"guard": {}, "doctor": None}
+    deadline = time.time() + TOTAL_DEADLINE
     probes = {"allow": "ls -la",
               "deny_wal": "rm -rf ~/.claude/wals",
               "deny_hooks_copy": 'ssh t2-dev "cp x ~/.claude/hooks/command_guard.py"'}
     for key, cmd in probes.items():
+        if deadline - time.time() <= 0.5:
+            res["guard"][key] = {"exit": None, "verdict": "error:deadline", "rule": ""}
+            continue
         try:
-            p = subprocess.run([sys.executable, "-I", guard, "check", cmd], capture_output=True, text=True, timeout=60,
-                               cwd=os.path.expanduser("~"))
+            p = subprocess.run([sys.executable, "-I", guard, "check", cmd], capture_output=True, text=True,
+                               timeout=max(0.5, min(PROBE_TIMEOUT, deadline - time.time())), cwd=os.path.expanduser("~"))
             data = json.loads((p.stdout or "").strip().splitlines()[-1])
             rule = re.search(r"\[([A-Za-z0-9_/-]+)\]", data.get("message") or "")
             res["guard"][key] = {"exit": p.returncode, "verdict": str(data.get("verdict")), "rule": rule.group(1) if rule else ""}
         except Exception as e:
             res["guard"][key] = {"exit": None, "verdict": "error:" + type(e).__name__, "rule": ""}
     doctor = os.path.join(HOOKS, "doctor.py")
-    if os.path.exists(doctor):
+    if os.path.exists(doctor) and deadline - time.time() <= 0.5:
+        res["doctor"] = {"flags": True, "failing": None, "timeout": True}
+    elif os.path.exists(doctor):
         try:
             p = subprocess.run([sys.executable, "-I", doctor, "check", "--json", "--no-canary"], capture_output=True, text=True,
-                               timeout=120, cwd=os.path.expanduser("~"))
+                               timeout=max(0.5, min(DOCTOR_TIMEOUT, deadline - time.time())), cwd=os.path.expanduser("~"))
             if "unrecognized arguments" in (p.stderr or ""):
                 res["doctor"] = {"flags": False, "failing": None}
             else:
@@ -280,7 +288,7 @@ elif op == "restore":
             p = live(name)
             if kind(p) == "file" and sha(p) == item["remove_if_sha"]:
                 os.unlink(p)
-            out["live"][name] = None
+            out["live"][name] = sha(p) if kind(p) == "file" else None  # the REAL state after: a file that was not removed shows its sha
             continue
         data = sys.stdin.buffer.read(item["size"])
         if hashlib.sha256(data).hexdigest() != item["sha256"]:
@@ -564,17 +572,27 @@ def audit_rows(home):
     return rows
 
 
+CLEARING = ("installed", "rolled_back", "restored", "already_current", "refused")  # definite results; attempt_refused and unknown never clear
+
+
 def unfinished_runs(home, host):
-    """Runs on this host whose start row has no definite result (missing or unknown)."""
-    starts, done = {}, {}
+    """Runs on this host with an install or a rollback ATTEMPT that has no definite result. Only a definite result clears an
+    attempt: installed, rolled_back, restored, already_current, or `refused` of a NEW install (nothing live changed). A resume
+    or rollback that fails records `attempt_refused`, which does NOT clear: the host is still in the state the earlier
+    attempt left it in."""
+    opened = {}
     for row in audit_rows(home):
         if row.get("host") != host or not row.get("run"):
             continue
-        if row.get("event") == "start" and row.get("kind") in ("install", "resume", "rollback"):
-            starts[row["run"]] = row
-        elif row.get("event") == "result":
-            done[row["run"]] = row.get("result")
-    return [r for r in starts if done.get(r) in (None, "unknown")]
+        run, kind_ = row["run"], row.get("kind")
+        if row.get("event") == "start" and kind_ in ("install", "resume", "rollback"):
+            opened[(run, "rollback" if kind_ == "rollback" else "install")] = True
+        elif row.get("event") == "result" and row.get("result") in CLEARING:
+            if kind_ == "rollback" or row.get("result") == "restored":
+                opened[(run, "rollback")] = False
+            if row.get("result") == "restored" or kind_ != "rollback":
+                opened[(run, "install")] = False
+    return sorted({run for (run, _which), is_open in opened.items() if is_open})
 
 
 def sha256(data):
@@ -635,7 +653,10 @@ def post_comment(ticket, text, poster):
 
 
 def finish(home, run, host, result, exit_code, extra, ticket, poster, kind_):
-    """Write the result row, post the one ticket comment and return (exit 0) or raise (any other exit)."""
+    """Write the result row, post the one ticket comment and return (exit 0) or raise (any other exit). A resume or a rollback that
+    is refused is recorded as `attempt_refused`: it must not clear an unfinished run (the host may still be half installed)."""
+    if result == "refused" and kind_ in ("resume", "rollback"):
+        result = "attempt_refused"
     row = dict({"event": "result", "run": run, "host": host, "kind": kind_, "result": result}, **extra)
     out = dict({"ok": exit_code == 0, "run": run, "host": host, "result": result, "exit_code": exit_code}, **extra)
     try:
@@ -734,8 +755,8 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
         raise InstallError("audit_failed", "could not write the audit row; nothing was changed", 3, {"ok": False})
     if not applied:
         return finish(home, run, host, "already_current", 0, {"ref": ref, "files": plan}, ticket, poster, kind_)
-    if resume_of and not todo:
-        remote.started = True  # everything is already live from the interrupted run: only the after-test remains
+    if resume_of:
+        remote.started = True  # the interrupted run may have reached its commit: a failure is never a clean refusal, it is unknown or a rollback
     locked = False
     try:
         remote.call("lock", {"run": run})
@@ -756,7 +777,14 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
             if wrong:
                 raise InstallError("readback_mismatch", "read-back sha differs for %s" % ", ".join(wrong), 2)
         _hook("after_commit", run=run, host=host)
-        after = remote.call("selftest", timeout=SELFTEST_TIMEOUT)
+        try:
+            after = remote.call("selftest", timeout=SELFTEST_TIMEOUT)
+        except InstallError as error:
+            if error.code != "lost":
+                raise
+            # the self-test we started did not answer in time: that is a bad sign, not a lost link to ignore; try to roll back
+            # (guard first); if ssh is really gone the rollback itself reports unknown
+            raise InstallError("selftest_worse", "the after-install self-test did not answer in time", 4)
         why = selftest_worse(before, after)
         if why:
             raise InstallError("selftest_worse", why, 4)
@@ -765,14 +793,16 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
             error = InstallError("unexpected", "%s: %s" % (type(error).__name__, str(error)[:120]), 5 if remote.started else 2)
         if remote.started and error.code in ("lost", "unexpected"):
             return finish(home, run, host, "unknown", 5, {"ref": ref, "files": plan, "reason": "%s; check %s before retrying" % (error, host)}, ticket, poster, kind_)
+        if not locked:  # the lock was never taken (held by another run, or no answer): touch nothing on the host, not even a rollback
+            note = "; a lock may remain on %s until it is stale (30 minutes)" % host if error.code == "lost" else ""
+            return finish(home, run, host, "refused", 2, {"ref": ref, "files": plan, "reason": (str(error)[:300] + note)}, ticket, poster, kind_)
         if remote.started:
             return _roll_back(home, run, host, plan, applied, remote, error, ticket, poster, kind_, ref)
         try:
             remote.call("cleanup", {"names": todo})
         except InstallError:
             pass
-        note = "; a lock may remain on %s until it is stale (30 minutes)" % host if error.code == "lost" and not locked else ""
-        return finish(home, run, host, "refused", 2, {"ref": ref, "files": plan, "reason": (str(error)[:300] + note)}, ticket, poster, kind_)
+        return finish(home, run, host, "refused", 2, {"ref": ref, "files": plan, "reason": str(error)[:300]}, ticket, poster, kind_)
     finally:
         if locked:
             try:
@@ -844,7 +874,7 @@ def _roll_back(home, run, host, plan, todo, remote, cause, ticket, poster, kind_
         again = remote.call("selftest", timeout=SELFTEST_TIMEOUT)
     except InstallError as error:
         return finish(home, run, host, "unknown", 5, {"ref": ref, "files": plan, "reason": "rollback incomplete: %s; check %s" % (error, host)}, ticket, poster, kind_)
-    bad = [i["name"] for i in items if not i.get("remove_if_sha") and got["live"].get(i["name"]) != plan[i["name"]]["old_sha"]]
+    bad = [i["name"] for i in items if got["live"].get(i["name"]) != (None if i.get("remove_if_sha") else plan[i["name"]]["old_sha"])]
     if bad:
         return finish(home, run, host, "unknown", 5, {"ref": ref, "files": plan, "reason": "rollback incomplete: read-back differs for %s; check %s" % (", ".join(bad), host)}, ticket, poster, kind_)
     return finish(home, run, host, "rolled_back", 4, {"ref": ref, "files": plan, "reason": str(cause)[:300], "selftest_after_rollback": again}, ticket, poster, kind_)
@@ -906,7 +936,7 @@ def rollback(run_id, ticket, force_files=(), home=None, session="", agent="", ru
                 remote.call("unlock", {"run": run_id})
             except InstallError:
                 pass
-    bad = [i["name"] for i in items if not i.get("remove_if_sha") and got["live"].get(i["name"]) != plan[i["name"]]["old_sha"]]
+    bad = [i["name"] for i in items if got["live"].get(i["name"]) != (None if i.get("remove_if_sha") else plan[i["name"]]["old_sha"])]
     if bad:
         return finish(home, run_id, host, "unknown", 5, {"files": plan, "reason": "rollback incomplete: read-back differs for %s; check %s" % (", ".join(bad), host)}, ticket, poster, "rollback")
     why = selftest_worse(row.get("baseline") or {}, after)
