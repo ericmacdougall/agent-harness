@@ -110,6 +110,8 @@ class ThresholdTests(Base):
         got = self.pool(total_g=30, used_g=11, avail_g=19)
         self.assertEqual(got[KEY]["severity"], "critical")
         self.assertNotIn(KEY, self.pool(total_g=100, used_g=70, avail_g=30))
+        # acceptance review r2 F2: exactly 20 GiB free is not under the floor
+        self.assertNotIn(KEY, self.pool(total_g=100, used_g=80, avail_g=20))
 
     def test_provisioned_counts_only_the_pool_storage(self):
         self.assertEqual(self.pool()[KEY]["detail"]["provisioned_gib"], 1536.0)
@@ -212,6 +214,15 @@ class GrowthTests(Base):
         state = {}
         self.sample(state, 800, NOW - 24 * 3600)
         self.assertEqual(self.run_check((0, probe(pvesm(used_g=848, avail_g=56))), state, NOW)[0][GROWTH]["severity"], "high")
+
+    def test_growth_boundary_is_strictly_more_than_10_gib_a_day(self):
+        # acceptance review r2 F2: exactly 10 GiB/day is silent, just over alerts
+        state = {}
+        self.sample(state, 800, NOW - 24 * 3600)
+        self.assertNotIn(GROWTH, self.run_check((0, probe(pvesm(used_g=810, avail_g=106))), state, NOW)[0])
+        state = {}
+        self.sample(state, 800, NOW - 24 * 3600)
+        self.assertIn(GROWTH, self.run_check((0, probe(pvesm(used_g=811, avail_g=105))), state, NOW)[0])
 
     def test_slow_growth_is_silent(self):
         state = {}
