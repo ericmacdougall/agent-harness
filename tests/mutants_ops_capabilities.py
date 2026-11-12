@@ -18,8 +18,12 @@ MUTANTS = {
                                          '    if True:'),
     "decorated line": ('        caps.append("forward-foreign-critical")', '        caps.append("forward-foreign-critical v1")'),
     "subcommand exits non-zero": ('        print("\\n".join(capabilities()))\n        return 0', '        print("\\n".join(capabilities()))\n        return 1'),
-    "probe loads config and state": ('    if cmd == "capabilities":  # no config, no state, no ring: a pure probe\n',
-                                     '    if cmd == "capabilities":  # no config, no state, no ring: a pure probe\n        save_state(home, {})\n'),
+    "probe writes under home": ('    if cmd == "capabilities":  # no home, no config, no state, no ring: a pure probe (works with HOME unset)\n',
+                                '    if cmd == "capabilities":  # no home, no config, no state, no ring: a pure probe (works with HOME unset)\n'
+                                '        Path.home().joinpath("touched").write_text("x")\n'),
+    "forwarder not called by run_once": ("    foreign = forward_foreign(cfg, home, state, ring, now)", "    foreign = []"),
+    "home resolved before the probe": ('    cmd = args.cmd or "run"\n    if cmd == "capabilities":',
+                                       '    cmd = args.cmd or "run"\n    home = Path.home()\n    if cmd == "capabilities":'),
     "duplicate line": ('    caps = ["emit"]', '    caps = ["emit", "emit"]'),
 }
 

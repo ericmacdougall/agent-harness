@@ -49,6 +49,40 @@ class Capabilities(unittest.TestCase):
         finally:
             ow.forward_foreign = saved
 
+    def test_the_probe_works_with_no_home_at_all(self):
+        code = ("import sys, pwd\n"
+                "def no_entry(uid):\n"
+                "    raise KeyError(uid)\n"
+                "pwd.getpwuid = no_entry\n"
+                "sys.path.insert(0, %r)\n"
+                "import ops_watch\n"
+                "sys.exit(ops_watch.main(['capabilities']))\n" % str(HOOKS))
+        env = dict(os.environ)
+        env.pop("HOME", None)
+        done = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("forward-foreign-critical", done.stdout.split("\n"))
+
+    def test_the_forwarder_is_wired_into_run_once_not_only_defined(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            cfg = ow.load_config(home, host="testhost", overrides={})
+            cfg["sinks"] = {"comment_min_interval_s": 0, "comment": {"mode": "cmd", "argv": ["fake-comment"]}, "deadman": []}
+            cfg["processes"] = dict(cfg["processes"], meminfo=str(home / "no-meminfo"))
+            cfg["liveness"] = dict(cfg["liveness"], wal_root=str(home / "wals"), gq=None)
+            posted = []
+
+            def runner(argv, timeout, stdin=None, env=None, cwd=None):
+                if argv and argv[0] == "fake-comment":
+                    posted.append(stdin or "")
+                    return 0, ""
+                return 127, ""
+            ow.run_once(cfg, home, runner=runner, checks={}, now=1.0)
+            ow.emit({"host": "testhost", "source": "fabd-health", "event": "raise", "severity": "critical",
+                     "key": "fabric:live-down:fabd", "message": "down", "detail": {}}, home=home)
+            ow.run_once(cfg, home, runner=runner, checks={}, now=2.0)
+        self.assertTrue(any("fabric:live-down:fabd" in body for body in posted))  # run_once itself carried it to the digest
+
     def test_the_listed_capability_is_real_a_foreign_critical_reaches_the_queue(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)

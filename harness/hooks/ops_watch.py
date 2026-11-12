@@ -2682,11 +2682,11 @@ def main(argv=None) -> int:
     sub.add_parser("capabilities", help="print one capability per line (an installer can grep -qx for one)")
     sub.add_parser("relay-comment", help="post stdin as one comment on the ops-watch alerts ticket (peer relay)")
     args = ap.parse_args(argv)
-    home = Path.home()
     cmd = args.cmd or "run"
-    if cmd == "capabilities":  # no config, no state, no ring: a pure probe
+    if cmd == "capabilities":  # no home, no config, no state, no ring: a pure probe (works with HOME unset)
         print("\n".join(capabilities()))
         return 0
+    home = Path.home()
     try:
         if cmd == "emit":
             print(emit(json.loads(args.json), home=home))
