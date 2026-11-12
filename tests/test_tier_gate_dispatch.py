@@ -465,7 +465,9 @@ class Negatives(Fixture):
         self.stop('aggp')
         [opus] = [d for d in self.dispatches('k9') if d['tool_use_id'] == 'opus-bg']
         self.assertIn('ended_at', opus)
-        self.assertEqual(self.fail_once('k9')['event']['class'], 'NOT_COUNTED')
+        # inspection F4 (spec r7 NEG-9): the opus run ended inside this R2 window, so the window keeps counting
+        self.assertEqual(opus['ended_seq'], len(self.ledger.load('k9')['events']))
+        self.assertEqual(self.fail_once('k9')['event']['class'], 'FAIL')
 
     def test_warn_deny_spawn_opens_dispatch(self):
         self.climb_to('kx', 'R2')
@@ -643,6 +645,160 @@ class Index(Fixture):
         self.assertFalse((self.root.parent / 'etc').exists())
 
 
+class InspectionRound1(Fixture):
+    """Code inspection a0dd5f0a (BLOCK on 0686124c): findings F1-F9, each failing before its fix."""
+
+    def side(self, task):
+        return self.root / (task + '.dispatch-open.jsonl')
+
+    def test_f1_near_full_merge_never_resets(self):
+        self.climb_to('n1', 'R2')
+        state = self.ledger.load('n1')
+        used = len(json.dumps(state, sort_keys=True, separators=(',', ':')))
+        state['filler_for_test'] = 'x' * (esc.MAX_STATE - used - 120)
+        self.ledger._write('n1', state)
+        self.ledger.open_dispatch('n1', {'tool_use_id': 'near-full', 'owner': True, 'subagent_type': 'task-owner'})
+        decision = gate.decide_spawn({'tool_name': 'Agent', 'session_id': 's',
+                                      'tool_input': {'prompt': 'x [task:n1]', 'description': 'd',
+                                                     'subagent_type': 'task-owner', 'model': 'sonnet'}},
+                                     self.policy, self.ledger, session_id='s')
+        self.assertNotIn('reset', json.dumps(decision[3]))
+        status = self.ledger.status('n1')
+        self.assertEqual(status['rung'], 'R2')
+        self.assertFalse([r for r in self.ledger.load('n1')['resets'] if r.get('code') == 'state_corrupt'])
+
+    def test_f1_shed_dispatch_taints_window(self):
+        self.climb_to('n1b', 'R2')
+        self.owner('n1b', 'opus-w', OPUS, status='completed')
+        self.owner('n1b', 'son-w', SONNET)
+        state = self.ledger.load('n1b')
+        used = len(json.dumps(state, sort_keys=True, separators=(',', ':')))
+        state['filler_for_test'] = 'x' * (esc.MAX_STATE - used + 40)  # only shedding a dispatch makes it fit
+        self.ledger._write('n1b', state)
+        self.assertEqual(self.fail_once('n1b')['event']['class'], 'FAIL')
+
+    def test_f2_deep_json_line_is_garbled(self):
+        self.positive('n2')
+        with open(self.side('n2'), 'ab') as handle:
+            handle.write(b'[' * 1000 + b']' * 1000 + b'\n')
+        reasons = [d.get('reason') for d in self.dispatches('n2')]
+        self.assertIn('side_garbled', reasons)
+        self.assertEqual(self.fail_once('n2')['event']['class'], 'FAIL')
+        self.assertEqual(self.ledger.load('n2')['side']['offset'], self.side('n2').stat().st_size)
+
+    def test_f3_reviewer_flood_keeps_window_writer(self):
+        self.climb_to('n3', 'R2')
+        self.owner('n3', 'opus-done', OPUS, status='completed')
+        for i in range(esc.MAX_DISPATCHES - 1):
+            self.owner('n3', 'rt%02d' % i, SONNET, subagent_type='red-team', status='completed')
+        self.owner('n3', 'son', SONNET)
+        self.assertIn('opus-done', [d['tool_use_id'] for d in self.dispatches('n3')])
+        self.assertEqual(self.fail_once('n3')['event']['class'], 'FAIL')
+
+    def test_f3_evicted_window_writer_taints(self):
+        """Harmless below-rung records go first (they never hide anything); when an at-rung record must go, a
+        durable taint keeps the window counting. 64 open records arrive in one merge to force that eviction."""
+        for task, with_opus in (('n3b', True), ('n3c', False)):
+            with self.subTest(with_opus=with_opus):
+                self.climb_to(task, 'R2')
+                if with_opus:
+                    self.owner(task, 'opus-done', OPUS, status='completed')
+                for i in range(esc.MAX_DISPATCHES):
+                    self.owner(task, 's%02d' % i, SONNET, close=False)
+                ids = [d['tool_use_id'] for d in self.dispatches(task)]
+                self.assertEqual(len(ids), esc.MAX_DISPATCHES)
+                self.assertNotIn('opus-done', ids)
+                for i in range(esc.MAX_DISPATCHES):
+                    self.ledger.close_dispatch(task, 's%02d' % i, status='completed', agent_id='ag%s%02d' % (task, i),
+                                               resolved_model=SONNET, models_used=[])
+                expected = 'FAIL' if with_opus else 'NOT_COUNTED'
+                event = self.fail_once(task)['event']
+                self.assertEqual(event['class'], expected)
+                self.assertEqual(event['dispatch_check'].get('tainted', False), with_opus)
+
+    def test_f4_owner_ended_before_window_is_ignored(self):
+        self.owner('n4', 'opus-early', OPUS, agent_id='agearly')
+        self.stop('agearly')
+        self.positive('n4')
+        self.assertEqual(self.fail_once('n4')['event']['class'], 'NOT_COUNTED')
+
+    def test_f5_resume_reopens_dispatch(self):
+        for task, how in (('n5', 'start'), ('n5b', 'send'), ('n5c', None)):
+            with self.subTest(how=how):
+                self.owner(task, 'opus-' + task, OPUS, status='completed', agent_id='ag' + task)
+                self.positive(task)
+                if how == 'start':
+                    self.hook('start', {'agent_id': 'ag' + task, 'agent_type': 'task-owner', 'session_id': 'sdisp',
+                                        'hook_event_name': 'SubagentStart'})
+                elif how == 'send':
+                    self.hook('dispatch', {'tool_name': 'SendMessage', 'tool_input': {'to': 'ag' + task, 'message': 'm'},
+                                           'tool_response': {}, 'session_id': 'sdisp', 'tool_use_id': 'sm1',
+                                           'hook_event_name': 'PostToolUse'})
+                expected = 'NOT_COUNTED' if how is None else 'FAIL'
+                self.assertEqual(self.fail_once(task)['event']['class'], expected)
+
+    def test_f5_resume_of_evicted_agent_is_unknown(self):
+        esc.index_agent(self.root, 'aggone', 'n5d')
+        self.positive('n5d')
+        self.hook('start', {'agent_id': 'aggone', 'agent_type': 'task-owner', 'session_id': 'sdisp',
+                            'hook_event_name': 'SubagentStart'})
+        self.assertIn('resumed_unknown', [d.get('reason') for d in self.dispatches('n5d')])
+        self.assertEqual(self.fail_once('n5d')['event']['class'], 'FAIL')
+
+    def test_f6_bash_launch_beside_peer_review_opens_dispatch(self):
+        for task, command in (('n6', 'claude --model sonnet -p "fix [task:n6]" && python3 peer_review.py pr --task n6'),
+                              ('n6b', 'claude --version && claude -p "fix it [task:n6b]"'),
+                              ('n6d', 'claude -p "fix it, then run peer_review.py [task:n6d]"')):
+            with self.subTest(command=command):
+                self.climb_to(task, 'R2')
+                self.hook('hook', {'tool_name': 'Bash', 'tool_input': {'command': command}, 'session_id': 's',
+                                   'tool_use_id': 'b-' + task})
+                self.assertIn('bash', [d.get('kind') for d in self.dispatches(task)])
+        self.climb_to('n6c', 'R2')
+        self.hook('hook', {'tool_name': 'Bash', 'tool_input': {'command': 'python3 peer_review.py pr --task n6c'},
+                           'session_id': 's', 'tool_use_id': 'b-n6c'})
+        self.assertNotIn('bash', [d.get('kind') for d in self.dispatches('n6c')])
+
+    def test_f7_garbled_flood_is_one_synthetic_and_fast(self):
+        self.positive('n7')
+        self.side('n7').write_bytes(b'x\n' * 20000)
+        started = time.monotonic()
+        garbled = [d for d in self.dispatches('n7') if d.get('reason') == 'side_garbled']
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(len(garbled), 1)
+        self.assertEqual(self.fail_once('n7')['event']['class'], 'FAIL')
+
+    def test_f8_fifo_paths_never_block(self):
+        import threading
+        os.mkfifo(self.side('n8'))
+        os.mkfifo(self.root / 'dispatch_index.tmp')
+        outcome = {}
+
+        def run():
+            try:
+                self.ledger.open_dispatch('n8', {'tool_use_id': 'f1', 'owner': True})
+                outcome['open'] = 'returned'
+            except OSError as error:
+                outcome['open'] = type(error).__name__
+            outcome['index'] = esc.index_agent(self.root, 'agfifo', 'n8')
+            outcome['done'] = True
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start(); worker.join(5)
+        self.assertTrue(outcome.get('done'), outcome)
+        self.assertNotEqual(outcome['open'], 'returned')
+        self.assertIn('side_not_regular', [d.get('reason') for d in self.dispatches('n8')])
+
+    def test_f9_dispatch_action_exit0_with_symlinked_state(self):
+        link = Path(self.temp.name) / 'state-link'
+        link.symlink_to(self.root)
+        env = {**os.environ, 'AGENT_HARNESS_ESCALATION_DIR': str(link)}
+        for raw in ('not json', json.dumps({'tool_name': 'Agent', 'tool_input': {}, 'tool_response': {'status': 'x'},
+                                            'tool_use_id': 't'})):
+            result = subprocess.run([sys.executable, str(HOOKS / 'tier_gate.py'), 'dispatch'], input=raw,
+                                    capture_output=True, text=True, timeout=30, env=env)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, '', ''))
+
+
 class WiringAndDocs(unittest.TestCase):
     def test_install_wires_dispatch(self):
         sys.path.insert(0, str(ROOT))
@@ -651,7 +807,7 @@ class WiringAndDocs(unittest.TestCase):
         groups = [g for g in hooks.get('PostToolUse', [])
                   if any('tier_gate.py' in json.dumps(h) for h in g['hooks'])]
         self.assertEqual(len(groups), 1)
-        self.assertEqual(groups[0]['matcher'], 'Agent|Task')
+        self.assertEqual(groups[0]['matcher'], 'Agent|Task|SendMessage')
         [hook] = groups[0]['hooks']
         self.assertIn('dispatch', json.dumps(hook))
         self.assertNotIn('onFailure', hook)
@@ -683,7 +839,7 @@ class WiringAndDocs(unittest.TestCase):
         line = reference[reference.index('`tier_gate.py`'):][:1500]
         for word in ('PostToolUse', 'SubagentStop', 'Workflow'):
             self.assertIn(word, line)
-        section = operations[operations.index('Dispatch records'):][:4000]
+        section = operations[operations.index('Dispatch records'):operations.index('## Review and rescue')]
         for word in ('excluded_below_rung', 'counted_requested_below', 'window_dispatches', '24 hours',
                      'dispatch_narrow_by_stop_effort', 'main', 'ASSUMPTION'):
             self.assertIn(word, section)

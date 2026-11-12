@@ -310,28 +310,46 @@ def _rung_lower(rung, than, policy):
     return rung in order and than in order and order.index(rung) < order.index(than)
 
 
-def _window(state, rung, t):
-    """(entered seq, considered dispatches) for a FAIL at `rung`."""
+def _last_seq(dispatch):
+    """The latest event count at which the dispatch was seen running: opened, resumed or ended (inspection F4)."""
+    seqs = [dispatch.get(k) for k in ('after_seq', 'resumed_seq', 'ended_seq') if type(dispatch.get(k)) is int]
+    return max(seqs) if seqs else 0
+
+
+def _entered(state, rung=None):
+    """The event seq at which the ledger entered `rung` (the latest escalation when rung is None); 0 if never."""
     entered = 0
     for escalation in state.get('escalations') or []:
-        if isinstance(escalation, dict) and escalation.get('to') == rung and isinstance(escalation.get('seq'), int):
+        if (isinstance(escalation, dict) and type(escalation.get('seq')) is int
+                and (rung is None or escalation.get('to') == rung)):
             entered = max(entered, escalation['seq'])
-    considered = []
-    for dispatch in state.get('dispatches') or []:
-        if not isinstance(dispatch, dict) or dispatch.get('reviewer'):
-            continue
-        after = dispatch.get('after_seq') if isinstance(dispatch.get('after_seq'), int) else 0
-        if after >= entered or _live(dispatch, t):
-            considered.append(dispatch)
-    return entered, considered
+    return entered
+
+
+def _tainted(state, entered, t):
+    """True when a dispatch that this window would have considered was shed for space (inspection F1/F3)."""
+    taint = state.get('dispatch_taint')
+    if not isinstance(taint, dict):
+        return False
+    seq, until = taint.get('seq'), taint.get('until_t')
+    return (type(seq) is int and entered <= seq) or (isinstance(until, (int, float)) and t < until)
+
+
+def _window(state, rung, t):
+    """(entered seq, considered dispatches, tainted) for a FAIL at `rung`. A dispatch is considered when it was
+    opened, resumed or ended at or after the window opened, or is still live."""
+    entered = _entered(state, rung)
+    considered = [d for d in state.get('dispatches') or [] if isinstance(d, dict) and not d.get('reviewer')
+                  and (_last_seq(d) >= entered or _live(d, t))]
+    return entered, considered, _tainted(state, entered, t)
 
 
 def dispatch_decision(state, rung, policy, t=None):
     """(excluded, check) for a FAIL at `rung`. Pure."""
     t = epoch() if t is None else t
-    _, considered = _window(state, rung, t)
+    _, considered, tainted = _window(state, rung, t)
     owners = [d for d in considered if d.get('owner')]
-    excluded = bool(owners) and all(
+    excluded = not tainted and bool(owners) and all(
         d.get('phase') == 'closed' and d.get('kind') == 'agent' and match_of(d.get('candidates'), rung, policy) == 'below'
         for d in considered)
     requested_below = any(_rung_lower((d.get(k) or {}).get('rung'), rung, policy)
@@ -341,6 +359,8 @@ def dispatch_decision(state, rung, policy, t=None):
              'ids': [str(d.get('tool_use_id') or '')[:16] for d in shown],
              'models': [str(d.get('resolved_model') or d.get('kind') or '')[:32] for d in shown],
              'requested_below': requested_below}
+    if tainted:
+        check['tainted'] = True
     while len(json.dumps(check, separators=(',', ':'))) > 256 and check['ids']:
         check['ids'].pop(0); check['models'].pop(0)  # the newest entries are kept within the byte bound
     names = ', '.join(str(d.get('resolved_model') or '?')[:32] for d in owners[:4])
@@ -351,7 +371,7 @@ def dispatch_summary(state, rung, policy):
     """Status fields: last dispatch, the bounded window list, exclusions and requested-below counts."""
     t = epoch()
     dispatches = [d for d in state.get('dispatches') or [] if isinstance(d, dict)]
-    _, considered = _window(state, rung, t)
+    _, considered, tainted = _window(state, rung, t)
 
     def view(d):
         return {'tool_use_id': d.get('tool_use_id'), 'kind': d.get('kind'), 'subagent_type': d.get('subagent_type'),
@@ -369,6 +389,7 @@ def dispatch_summary(state, rung, policy):
     return {
         'last_dispatch': view(dispatches[-1]) if dispatches else None,
         'window_dispatches': [view(d) for d in considered[-8:]],
+        'window_tainted': tainted,
         'excluded_below_rung': {'count': len(excluded), 'latest': {
             'seq': excluded[-1].get('seq'), 'reason': excluded[-1].get('why'),
             'fingerprint': excluded[-1].get('fingerprint')} if excluded else None},
@@ -389,12 +410,70 @@ def _bounded_dispatch(dispatch):
     return dispatch
 
 
-def _evict(dispatches, t):
-    """Keep at most MAX_DISPATCHES: ended or stale records go first (oldest first), live ones only after."""
-    while len(dispatches) > MAX_DISPATCHES:
-        victim = next((i for i, d in enumerate(dispatches) if not _live(d, t)), 0)
-        dispatches.pop(victim)
+def _evict(state, t, policy, keep=MAX_DISPATCHES, need_bytes=0):
+    """Shed dispatches down to `keep` (and until at least need_bytes are freed), in linear time. Order (inspection
+    F3): reviewers, then records no window can consider, then harmless window records (closed agent runs below the
+    current rung), then other window records, then live ones; oldest first within each class. Shedding a record a
+    window would still consider and that could block an exclusion leaves a durable taint, so the window counts."""
+    dispatches = state.get('dispatches')
+    if not isinstance(dispatches, list):
+        return []
+    excess = len(dispatches) - keep
+    if excess <= 0 and need_bytes <= 0:
+        return dispatches
+    entered = _entered(state)
+    rung = rung_of(state.get('events') or [], policy)['rung'] if policy else None
+
+    def klass(d):
+        if not isinstance(d, dict) or d.get('reviewer'):
+            return 0
+        if _live(d, t):
+            return 4
+        if _last_seq(d) < entered:
+            return 1
+        harmless = (rung and d.get('phase') == 'closed' and d.get('kind') == 'agent'
+                    and match_of(d.get('candidates'), rung, policy) == 'below')
+        return 2 if harmless else 3
+    order = sorted(range(len(dispatches)), key=lambda i: (klass(dispatches[i]), i))
+    drop, freed = set(), 0
+    for i in order:
+        if len(drop) >= max(excess, 0) and freed >= need_bytes:
+            break
+        drop.add(i)
+        freed += len(json.dumps(dispatches[i], separators=(',', ':'))) + 1
+        kind = klass(dispatches[i])
+        if kind >= 3:
+            taint = state.get('dispatch_taint') if isinstance(state.get('dispatch_taint'), dict) else {}
+            if kind == 3:
+                taint['seq'] = max(taint.get('seq') if type(taint.get('seq')) is int else 0, _last_seq(dispatches[i]))
+            else:
+                try:
+                    started = float(dispatches[i].get('t') or 0)
+                except (TypeError, ValueError):
+                    started = t
+                until = taint.get('until_t') if isinstance(taint.get('until_t'), (int, float)) else 0
+                taint['until_t'] = max(until, started + DISPATCH_LIVE_SECONDS)
+            state['dispatch_taint'] = taint
+    dispatches[:] = [d for i, d in enumerate(dispatches) if i not in drop]
     return dispatches
+
+
+def _open_regular_for_write(path, append=False):
+    """Open a private file for writing without ever blocking (inspection F8): a FIFO or other special file at the
+    path makes O_NONBLOCK fail or the fstat check refuse it. A non-regular scratch file is removed first."""
+    import stat as stat_mod
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_APPEND if append else os.O_TRUNC)
+    if not append:
+        try:
+            if not stat_mod.S_ISREG(os.lstat(path).st_mode):
+                os.unlink(path)
+        except FileNotFoundError:
+            pass
+    fd = os.open(path, flags, 0o600)
+    if not stat_mod.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError('not a regular file: %s' % Path(path).name)
+    return fd
 
 
 def _index_path(root):
@@ -448,7 +527,7 @@ def _update_index(root, change):
         for key in pending[:max(0, len(pending) - PENDING_STOP_LIMIT)]:
             index.pop(key, None)
         temporary = _index_path(root).with_suffix('.tmp')
-        out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        out = _open_regular_for_write(temporary)
         with os.fdopen(out, 'w', encoding='utf-8') as handle:
             handle.write(json.dumps(index, separators=(',', ':')))
         os.replace(temporary, _index_path(root))
@@ -559,6 +638,11 @@ class Ledger:
     def _write(self, task, state):
         path = self.path(task)
         body = json.dumps(state, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        if len(body) > MAX_STATE and state.get('dispatches'):
+            # Inspection F1: dispatch records never push a ledger over its bound. They are shed (with a taint where
+            # that could hide an at-rung run) before the write can fail.
+            _evict(state, epoch(), self.policy, keep=len(state['dispatches']), need_bytes=len(body) - MAX_STATE + 256)
+            body = json.dumps(state, sort_keys=True, separators=(',', ':')).encode('utf-8')
         if len(body) > MAX_STATE:
             raise LedgerError('state_corrupt', 'state would exceed its size bound')
         temporary = path.with_suffix('.tmp')
@@ -626,7 +710,7 @@ class Ledger:
         if len(line) > SIDE_LINE:
             record['requested'] = record['selected'] = record['subagent_type'] = None
             line = json.dumps(record, sort_keys=True, separators=(',', ':')).encode('utf-8') + b'\n'
-        fd = os.open(self._side_path(task), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        fd = _open_regular_for_write(self._side_path(task), append=True)
         try:
             os.write(fd, line)  # one write of at most SIDE_LINE bytes under O_APPEND
         finally:
@@ -671,9 +755,9 @@ class Ledger:
             synthetic('side_rewritten', '%d-%d' % (info.st_ino, int(t)))
             offset = 0
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             with os.fdopen(fd, 'rb') as handle:
-                if os.fstat(handle.fileno()).st_ino != info.st_ino:
+                if os.fstat(handle.fileno()).st_ino != info.st_ino or not stat_mod.S_ISREG(os.fstat(handle.fileno()).st_mode):
                     return changed[0], None  # replaced between lstat and open: the next merge reads it
                 handle.seek(offset)
                 chunk = handle.read(SIDE_LIMIT)  # input-ok: bounded by SIDE_LIMIT
@@ -689,8 +773,9 @@ class Ledger:
             body = b''
         else:
             body = chunk[:end + 1]
+        start = offset  # one synthetic per reason per merge (inspection F7), keyed by where this merge began
         for raw in body.split(b'\n')[:-1]:
-            line_at, offset = offset, offset + len(raw) + 1
+            offset += len(raw) + 1
             try:
                 if len(raw) > SIDE_LINE:
                     raise ValueError('long line')
@@ -700,8 +785,8 @@ class Ledger:
                 ident = clean_str(line.get('tool_use_id'), 64)
                 if not ident:
                     raise ValueError('no tool_use_id')
-            except (ValueError, UnicodeError):
-                synthetic('side_garbled', '%d-%d' % (info.st_ino, line_at))
+            except Exception:  # noqa: BLE001  inspection F2: RecursionError, MemoryError, anything: a garbled line
+                synthetic('side_garbled', '%d-%d' % (info.st_ino, start))
                 continue
             if ident in known:
                 continue
@@ -725,7 +810,7 @@ class Ledger:
         elif not same or offset != side.get('offset'):
             state['side'] = {'ino': info.st_ino, 'offset': offset}
             changed[0] = True
-        _evict(dispatches, t)
+        _evict(state, t, self.policy)
         return changed[0], rename
 
     def _after_side_read(self, task):
@@ -765,8 +850,9 @@ class Ledger:
                             models_used=used, candidates=candidates_for(models, self.policy) if models else None)
             if dispatch['status'] == 'completed':
                 dispatch['ended_at'] = now()
+                dispatch['ended_seq'] = len(state['events'])
             _bounded_dispatch(dispatch)
-            _evict(state['dispatches'], t)
+            _evict(state, t, self.policy)
             self._write(task, state)
         finally:
             os.close(fd)
@@ -787,7 +873,8 @@ class Ledger:
             dispatch = next((d for d in reversed(state['dispatches']) if isinstance(d, dict)
                              and d.get('agent_id') == agent_id), None)
             if dispatch is not None:
-                dispatch.setdefault('ended_at', now())
+                if not dispatch.get('ended_at'):
+                    dispatch['ended_at'], dispatch['ended_seq'] = now(), len(state['events'])
                 if effort:
                     dispatch['observed_effort'] = effort
                     if narrow:
@@ -801,13 +888,50 @@ class Ledger:
         self._after_write(rename)
         return dispatch is not None
 
+    def reopen_dispatch(self, task, agent_id):
+        """SubagentStart or SendMessage on an indexed agent (inspection F5): a resumed run is live again, so its
+        dispatch is reopened; when the record was already shed, an unknown dispatch blocks the window instead."""
+        if not isinstance(agent_id, str) or not AGENT_ID.fullmatch(agent_id):
+            return False
+        fd = self._lock(task)
+        try:
+            state, _ = self._read(task)
+            _, rename = self._merge_side(task, state)
+            t, seq = epoch(), len(state['events'])
+            dispatch = next((d for d in reversed(state['dispatches']) if isinstance(d, dict)
+                             and d.get('agent_id') == agent_id), None)
+            if dispatch is None:
+                ident = ('synthetic-resumed_unknown-' + agent_id)[:64]
+                dispatch = next((d for d in state['dispatches'] if isinstance(d, dict) and d.get('tool_use_id') == ident),
+                                None)
+                if dispatch is None:
+                    dispatch = {'tool_use_id': ident, 'kind': 'unknown', 'phase': 'open', 'owner': False,
+                                'reviewer': False, 'reason': 'resumed_unknown', 'agent_id': agent_id, 'at': now()}
+                    state['dispatches'].append(dispatch)
+                dispatch['after_seq'] = seq
+            dispatch.pop('ended_at', None)
+            dispatch.pop('ended_seq', None)
+            dispatch.update(resumed_seq=seq, t=t)
+            _evict(state, t, self.policy)
+            self._write(task, state)
+        finally:
+            os.close(fd)
+        self._after_write(rename)
+        return True
+
     def load(self, task):
         fd = self._lock(task)
         try:
             state, reset = self._read(task)
             merged, rename = self._merge_side(task, state)
-            if self._absorb_pending(task, state) or reset is not None or merged:
-                self._write(task, state)
+            absorbed = self._absorb_pending(task, state)
+            if absorbed or reset is not None or merged:
+                try:
+                    self._write(task, state)
+                except LedgerError:
+                    if absorbed or reset is not None:
+                        raise
+                    rename = None  # inspection F1: a merge alone never surfaces as state_corrupt (and a reset)
         finally:
             os.close(fd)
         self._after_write(rename)  # reached only after a successful write (or when nothing needed writing)
@@ -940,6 +1064,9 @@ class Ledger:
                                    if isinstance(d, dict) and _live(d, t)]
             if isinstance(state.get('side'), dict):
                 fresh['side'] = state['side']
+            taint = state.get('dispatch_taint')
+            if isinstance(taint, dict) and isinstance(taint.get('until_t'), (int, float)) and t < taint['until_t']:
+                fresh['dispatch_taint'] = {'until_t': taint['until_t']}  # a shed live run still blocks after a reset
             self._write(task, fresh)
             self._after_write(rename)
         finally:

@@ -665,7 +665,7 @@ def _gate_log(record):
         with open(log, 'a', encoding='utf-8') as handle:
             handle.write(json.dumps(record, sort_keys=True, default=str) + '\n')
         os.chmod(log, 0o600)
-    except OSError:
+    except Exception:  # noqa: BLE001  inspection F9: a symlinked state dir (LedgerError) must not escape either
         pass
 
 
@@ -682,6 +682,25 @@ def _selected_from(updated, requested, policy, mode):
         if found:
             return {'model': updated.get('model'), 'effort': found['effort'], 'rung': found['rung']}
     return requested
+
+
+def _is_review_segment(segment):
+    """True when the segment's program is peer_review.py itself (directly or as `python3 peer_review.py`); a
+    launch that merely mentions it in a prompt is still a launch. Unparsable segments are launches."""
+    try:
+        words = shlex.split(segment)
+    except ValueError:
+        return False
+    program = command_program(words)
+    if program == 'peer_review.py':
+        return True
+    if not re.fullmatch(r'python[0-9.]*', program or ''):
+        return False
+    bases = [w.rsplit('/', 1)[-1].lower() for w in words]
+    if program not in bases:
+        return False
+    rest = [b for w, b in zip(words[bases.index(program) + 1:], bases[bases.index(program) + 1:]) if not w.startswith('-')]
+    return bool(rest) and rest[0] == 'peer_review.py'
 
 
 def open_spawn_dispatch(data, tool, command, decision, updated, facts, policy, mode, ledger, session_id):
@@ -705,11 +724,16 @@ def open_spawn_dispatch(data, tool, command, decision, updated, facts, policy, m
                   'reviewer': subagent_type in REVIEWER_TYPES,  # the type alone: a [review:] mark never hides a writer
                   'requested': requested, 'selected': _selected_from(updated, requested, policy, mode)}
     elif tool == 'Bash':
-        task = facts.get('task')
-        if not task or 'peer_review.py' in command or not BASH_DISPATCH.search(command):
+        # Inspection F6: every launch segment counts; only a segment that is itself a peer_review.py run is skipped,
+        # and the task key may sit in any segment of the line.
+        launches = [s for s in split_segments(command) if BASH_DISPATCH.search(s) and not _is_review_segment(s)]
+        task = facts.get('task') or esc.task_key_from(*launches) or esc.task_key_from(command)
+        if not task or not launches:
             return
-        found = tiers.classify(facts['model'], facts.get('effort'), policy) if facts.get('model') else None
-        requested = {'model': facts.get('model'), 'effort': facts.get('effort'), 'rung': (found or {}).get('rung')}
+        single = len(launches) == 1 and 'peer_review.py' not in command  # facts describe this launch only then
+        model, effort = (facts.get('model'), facts.get('effort')) if single else (None, None)
+        found = tiers.classify(model, effort, policy) if model else None
+        requested = {'model': model, 'effort': effort, 'rung': (found or {}).get('rung')}
         fields = {'tool_use_id': tool_use_id, 'kind': 'bash', 'subagent_type': None, 'owner': False,
                   'reviewer': False, 'requested': requested, 'selected': requested}
     else:
@@ -717,13 +741,28 @@ def open_spawn_dispatch(data, tool, command, decision, updated, facts, policy, m
     ledger.open_dispatch(task, fields)
 
 
+def reopen_resumed(agent_id, ledger):
+    """Inspection F5: a resumed agent (SubagentStart, or a SendMessage to its agent id) runs again. Only an agent
+    this ledger indexed is reopened; a new spawn is not yet indexed, and a name never resolves to a path."""
+    task = esc.lookup_agent(ledger.root, agent_id)
+    if task:
+        ledger.reopen_dispatch(task, agent_id)
+        return task
+    return None
+
+
 def record_dispatch(data):
-    """PostToolUse for Agent/Task: close the open dispatch with the harness-reported models. Silent and fail-open:
-    every path returns without output; nothing here can block (the tool already ran)."""
+    """PostToolUse for Agent/Task (close the open dispatch with the harness-reported models) and SendMessage
+    (reopen a resumed agent). Silent and fail-open: every path returns without output; nothing here can block."""
     record = {'at': esc.now(), 'tool': data.get('tool_name'), 'decision': 'dispatch'}
     try:
         tool = data.get('tool_name')
         response = data.get('tool_response')
+        if tool == 'SendMessage':
+            target = (data.get('tool_input') or {}).get('to') if isinstance(data.get('tool_input'), dict) else None
+            task = reopen_resumed(esc.clean_str(target, 64), esc.Ledger(policy=tiers.load_policy()))
+            record.update(task=task, result='reopened' if task else 'ignored')
+            return
         if tool not in ('Agent', 'Task') or not isinstance(response, dict):
             record['result'] = 'ignored'
             return
@@ -828,12 +867,14 @@ def _main(action, data, tool, command, applies):
         return 0
     if action in ('start', 'stop'):
         count = live_update(session_id, data.get('agent_id'), start=(action == 'start'), agent_type=data.get('agent_type'))
-        if action == 'stop':
-            try:
+        try:
+            if action == 'stop':
                 end_from_stop(data, ledger)
-            except BaseException as error:  # noqa: BLE001  fail-open: a stop never fails on dispatch bookkeeping
-                _gate_log({'at': esc.now(), 'decision': 'dispatch_end_failed',
-                           'error': '%s: %s' % (type(error).__name__, str(error)[:120])})
+            else:
+                reopen_resumed(data.get('agent_id'), ledger)
+        except BaseException as error:  # noqa: BLE001  fail-open: start/stop never fail on dispatch bookkeeping
+            _gate_log({'at': esc.now(), 'decision': 'dispatch_%s_failed' % action,
+                       'error': '%s: %s' % (type(error).__name__, str(error)[:120])})
         cap = int(policy.get('caps', {}).get('session_live_agents', LIVE_CAP_DEFAULT))
         if action == 'start' and count > cap:
             print(json.dumps({'hookSpecificOutput': {'hookEventName': 'SubagentStart',

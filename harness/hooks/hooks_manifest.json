@@ -395,7 +395,8 @@
    "event": "PostToolUse",
    "tools": [
     "Agent",
-    "Task"
+    "Task",
+    "SendMessage"
    ],
    "flavors": [
     "claude"
