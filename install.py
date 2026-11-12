@@ -266,6 +266,12 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     managed.setdefault("PreToolUse", []).append({"matcher": "Bash", "hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "mission_gate.py"), "pretool"],
         "timeout": 5}]})
+    # ... and deletes that stamp when the call ends, fails or is denied (goodqa#15754 red-team F1): a stamp of a call
+    # that never ran must not be honoured by a later process. Never denies anything; fails open.
+    for event in ("PostToolUse", "PostToolUseFailure", "PermissionDenied"):
+        managed.setdefault(event, []).append({"matcher": "Bash", "hooks": [{
+            "type": "command", "command": "python3", "args": [str(claude / "hooks" / "mission_gate.py"), "posttool"],
+            "timeout": 5}]})
     # Local-ledger reminder (docs/ledger.md): rate limited and dismissible; fails open, so no onFailure.
     reminder = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "ledger_reminder.py")], "timeout": 3}
     for event in ("SessionStart", "UserPromptSubmit"):

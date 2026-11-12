@@ -21,7 +21,10 @@ Main-only commands (set --ticket/--repo, defer --user-source/--ticket, import-in
 set-session, bind, retire) need a one-shot stamp that main's own PreToolUse hook (mission_gate.py pretool,
 caller_identity.is_main) writes for that exact argument list (argv_key) when the script runs at shell command
 position; the command consumes it first, before parsing (claim_main). A sub-agent's shell, a copied script, a cron job,
-an echoed or here-document line, and a leftover stamp from a different command find none. Once goals.json names a
+an echoed or here-document line, and a leftover stamp from a different command find none. The stamp is bound to main's
+tool call (goodqa#15754 red-team F1): it carries main's tool_use_id and is honoured only while that call is still running
+and at most MAIN_STAMP_TTL_SECONDS old, so a stamp of a call that never ran (denied by another hook, rejected, or
+`cd /nonexistent && ...`) is dead for every later process. Once goals.json names a
 mission session, only that session's main passes (require_main; set_session has the hand-over rule). Each of them
 raises a high `mission:goals:changed` ops alert, as does every ask or ticket wait. Stamps are not signed: a same-user
 process can write one (the documented threat model, see caller_identity.py and docs/operations.md).
@@ -105,6 +108,7 @@ MAX_ALIASES = 12
 WAL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}\.jsonl$")
 ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9 ./#+-]{1,39}$")
 STAMP_PURPOSE = "mission-main"
+MAIN_STAMP_TTL_SECONDS = 60  # F1: the stamp lives only as long as main's own call (bound to its tool_use_id)
 # Every user quote (defer, retire, takeover) is judged by user_words_ok on the whole sentence, as written: no word
 # is ever removed to make a phrase pass (r14 F3: eade6bd deleted "not now" before the refusal check).
 REFUSAL_WORDS = re.compile(r"\b(?:don't|dont|do not|never|not|no|nor|neither|if|unless|maybe|perhaps|whether|should|"
@@ -750,13 +754,14 @@ def claim_main(argv, home: Path) -> None:
     if not argv or argv[0] not in MAIN_ONLY:
         return
     import caller_identity  # noqa: PLC0415
-    stamp = caller_identity.take_stamp(STAMP_PURPOSE, [argv[0], argv_key(argv)], home=home)
+    stamp = caller_identity.take_stamp(STAMP_PURPOSE, [argv[0], argv_key(argv)], home=home, bound=True,
+                                       ttl=MAIN_STAMP_TTL_SECONDS)
     if stamp is not None:
         _PROOF.update(cmd=argv[0], stamp=stamp)
 
 
 def require_main(home: Path, cmd: str, handover: bool = False) -> dict:
-    """The stamp claim_main took for this command (single use, at most 10 minutes old) from the main session that
+    """The stamp claim_main took for this command (single use, bound to main's still-running call, at most 60 s old) from the main session that
     owns the mission; MissionError otherwise. Once goals.json names a mission session, another top-level session
     (another main, or a sub-agent's own `claude -p`) is refused even with a stamp of its own (M1). handover=True
     (set-session only) returns a foreign stamp so set_session can apply its hand-over rule."""
@@ -764,8 +769,8 @@ def require_main(home: Path, cmd: str, handover: bool = False) -> dict:
     _PROOF.clear()
     if stamp is None:
         raise MissionError(f"`{cmd}` is main-only: only the main agent may run it, and main's PreToolUse hook saw no "
-                           f"main command `{SCRIPT} {cmd} ...` with exactly these arguments in the last 10 minutes (run "
-                           "it as a plain command, not inside echo, a here-document, bash -c or a script). A sub-agent "
+                           f"main command `{SCRIPT} {cmd} ...` with exactly these arguments in this still-running call (run "
+                           "it as a plain foreground command, not inside echo, a here-document, bash -c or a script). A sub-agent "
                            "asks main to run it.")
     mission = mission_session_of(home)
     caller = str(stamp.get("session") or "").lower()
