@@ -3020,6 +3020,12 @@ def build_parser():
         v.add_argument("--all", action="store_true", help="every session with a main WAL")
         v.add_argument("--json", action="store_true", help="accepted for symmetry; output is always JSON")
     sub.add_parser("sessions", help="sessions with a main WAL, newest first")
+    ex = sub.add_parser("export", help="write one session's WALs as a redacted, local-only HTML file (goodqa#15788); "
+                                       "never uploaded")
+    ex.add_argument("--session")
+    ex.add_argument("--since", help="window: <n>m|h|d (default: every row)")
+    ex.add_argument("--agent", action="append", default=[], help="timeline for this agent only (repeatable)")
+    ex.add_argument("--out", help="FILE.html outside any repository or sync folder (default: the session work dir)")
     dl = sub.add_parser("deadline", help="dated one-shot obligations (goodqa#14791 G3)")
     dls = dl.add_subparsers(dest="sub", required=True)
     da = dls.add_parser("add")
@@ -3216,6 +3222,9 @@ def run(args, home: Path) -> dict:
         if not s:
             raise AhError("session_unknown", "no session: pass --session or set CLAUDE_CODE_SESSION_ID")
         return status_report(home, s, parse_since(args.since))
+    if cmd == "export":  # goodqa#15788: local, redacted HTML; never uploaded (pi-dev-port H1)
+        import ah_export  # noqa: PLC0415
+        return ah_export.export(sys.modules[__name__], home, args)
     if cmd == "goals":  # goodqa#15754: no time window on attached evidence; a missing or tampered ledger exits 2
         import goals_view  # noqa: PLC0415
         if args.candidates:
