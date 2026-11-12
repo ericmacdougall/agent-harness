@@ -2255,7 +2255,7 @@ PRINT_FILE_CMDS = {'cat', 'head', 'tail', 'less', 'more', 'most', 'bat', 'batcat
                    'emacs', 'pr', 'column', 'jq', 'yq', 'tee', 'type', 'get-content', 'gc', 'select-string', 'sls',
                    'openssl', 'cmp', 'xargs-cat', 'highlight', 'ccat', 'pygmentize', 'tr', 'look', 'expand', 'unexpand',
                    'split', 'csplit', 'tar', 'zip', 'gzip', 'bzip2', 'xz', 'zstd', 'lz4', '7z', 'zcat', 'cpio'}
-ARCHIVE_CMDS = {'tar', 'bsdtar', 'gtar', 'zip', '7z', 'cpio'}
+ARCHIVE_CMDS = {'tar', 'bsdtar', 'gtar', 'zip', '7z', 'cpio', 'pax', 'gzip', 'bzip2', 'xz', 'zstd'}
 GREP_CMDS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'zgrep', 'select-string', 'sls', 'pt'}
 EXFIL_CMDS = {'curl', 'wget', 'scp', 'sftp', 'nc', 'ncat', 'netcat', 'socat', 'rsync', 'http', 'https', 'xh', 'telnet'}
 ECHO_CMDS = {'echo', 'printf', 'print', 'write-output', 'write-host', 'out-host', 'out-string', 'say', 'logger',
@@ -3459,7 +3459,7 @@ class Analyzer:
             if k + 1 < len(texts) and texts[k + 1] in ('json.tool', 'base64', 'tokenize', 'pickletools', 'quopri',
                                                        'uu', 'zipfile', 'tarfile', 'gzip', 'http.server'):
                 self.read_creds('cat', args[k + 2:], pl, idx)
-        if name in PRINT_FILE_CMDS or name in GREP_CMDS or name in EXFIL_CMDS or name in ('openssl', 'source'):
+        if name in PRINT_FILE_CMDS or name in GREP_CMDS or name in EXFIL_CMDS or name in ARCHIVE_CMDS or name in ('openssl', 'source'):
             self.read_creds(name, args, pl, idx)
         if name in RM_CMDS or name in MV_CMDS or name in OVERWRITE_CMDS or name in (
                 'sed', 'perl', 'ruby', 'awk', 'gawk', 'rsync', 'rclone', 'tar', 'zip', 'dd', 'truncate', 'set-content',
@@ -4566,6 +4566,15 @@ class Analyzer:
         if name in EXFIL_CMDS:
             words = [w for w in args]
         recursive = name in GREP_CMDS and (_flag_letters(args) & set('rR') or name in ('rg', 'ag', 'ack') or '--recursive' in _longs(args))
+        if recursive and not words and idx == 0 and self.under_cred_parent(ctx.cwd):
+            # a recursive search with no path operand searches the working directory: `cd ~/.config/goodqa && rg .`, or any
+            # search from the home directory, which contains it
+            ctx.secret_seen += 1
+            if not count_only and self.out_visible(pl, idx, True):
+                ctx.add(SECRET_DUMP, 'credential-file',
+                        '`%s` with no path searches the working directory, which holds or contains a credential file' % name,
+                        'name a path outside the credential directories, or search with `grep -c` / `rg -c` to count')
+                return
         for w in words:
             t = w.text
             if name in EXFIL_CMDS:
@@ -4578,7 +4587,7 @@ class Analyzer:
             hit = self.is_cred_path(t, w) if t == w.text else self._cred_one(t)
             dir_hit = recursive and self.under_cred_dir(norm_path(t, ctx), or_above=True)
             if not dir_hit and (recursive or name in ARCHIVE_CMDS or name in EXFIL_CMDS):
-                dir_hit = self.under_cred_parent(norm_path(t, ctx))  # the directory itself or an ancestor; a file inside is judged by name
+                dir_hit = self.under_cred_parent(norm_path(t, ctx), below=True)  # the directory, an ancestor, or a key directory inside (config.json excepted)
             if hit or dir_hit:
                 ctx.secret_seen += 1
                 if count_only:
