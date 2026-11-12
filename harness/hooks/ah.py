@@ -3070,6 +3070,17 @@ def build_parser():
                          "scrubbed environment (branch refs cannot be supplied by the caller)")
     wp.add_argument("--session")
     wp.add_argument("--agent", help="calling agent id for the audit row")
+    cp = sub.add_parser("clone-remove", help="remove ONE verified clean, fully pushed primary clone under this session's "
+                        "receipts directory, this machine only (audited; see clone_remove.py; no --force exists)")
+    cp.add_argument("--path", help="one literal absolute path: ~/.agent-harness/work/<this session>/receipts/wt-NAME")
+    cp.add_argument("--reason", help="why (mandatory, logged)")
+    cp.add_argument("--remote-auth", dest="remote_auth", action="store_true",
+                    help="private repository: read the remote (the one ls-remote) with the caller's own credentials")
+    cp.add_argument("--verify-only", dest="verify_only", action="store_true",
+                    help="print the verdict and the deletion plan; change nothing")
+    cp.add_argument("--resume", metavar="AUDIT_ID", help="finish the interrupted removal with this audit id (its quarantine "
+                    "directory only)")
+    cp.add_argument("--agent", help="calling agent id for the audit row")
     _no_abbrev(p)
     return p
 
@@ -3222,6 +3233,21 @@ def run(args, home: Path) -> dict:
                                       args.session or env_session() or "", args.agent or os.environ.get("AH_AGENT_ID", ""),
                                       home)
         except ah_worktree.WorktreeError as e:
+            raise AhError(e.code, str(e), e.exit_code)
+    if cmd == "clone-remove":
+        import clone_remove
+        session = env_session()  # the harness session identity only: no flag or other variable can name another session
+        agent = args.agent or os.environ.get("AH_AGENT_ID", "")
+        try:
+            if args.resume:
+                if args.path:
+                    raise AhError("bad_request", "--resume takes the audit id only; drop --path", 2)
+                return clone_remove.resume_clone(args.resume, session, str(home), agent)
+            if not args.path or not (args.reason or "").strip():
+                raise AhError("bad_request", "--path and --reason are required", 2)
+            return clone_remove.remove_clone(args.path, args.reason, session, str(home), agent, args.remote_auth,
+                                             args.verify_only)
+        except clone_remove.CloneError as e:
             raise AhError(e.code, str(e), e.exit_code)
     raise AhError("unknown_command", cmd)
 
