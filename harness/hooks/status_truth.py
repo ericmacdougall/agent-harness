@@ -17,9 +17,16 @@ finished goals from main's context.
 
 Contradiction rule (deliberately narrow, so ordinary "done" talk is never flagged): a line that names a goal (its
 aliases, its id as words) and says it is not done / not live / nobody working / no work, while the ledger shows that
-goal DONE_LIVE or VERIFIED; or a line that says a goal is done while the ledger shows it FAILING or UNKNOWN.
-Mode: provenance_policy.json `status_lint` (off | warn | enforce). Every command fails open on its own errors (stderr
-note, exit 0), and a second Stop in a row (stop_hook_active) is never blocked. Output is capped at 4 KB and redacted.
+goal DONE_LIVE or LIVE_TESTED; or a line that says a goal is done while the ledger shows it FAILING, UNKNOWN, VERIFIED
+or LIVE_UNTESTED. Skip rule: the answer states goal status (two or more goals, or any goal in reply to a status question)
+with no `ah goals` call and no goals injection since the human prompt that opened the turn (a typed prompt or a queued
+one; task notifications and peer messages do not open a turn).
+Mode: provenance_policy.json `status_lint` (off | warn | enforce). In warn mode (shipped) the finding is a
+systemMessage the user sees and the model does not, so a wrong answer still goes out; the prompt injection is the
+control until enforce. In enforce mode stop_blocks.allow bounds blocks per human turn (once for this hook), independent
+of stop_hook_active. Limits: only the last assistant text of the turn is linted, so a status answer followed by a
+short closing message escapes. Every command fails open on its own errors (stderr note, exit 0). Output is capped at
+4 KB and redacted.
 """
 from __future__ import annotations
 
@@ -61,6 +68,7 @@ BACKED = ("DONE_LIVE", "LIVE_TESTED")                          # "not done / nob
 UNBACKED = ("FAILING", "UNKNOWN", "VERIFIED", "LIVE_UNTESTED")  # "is done" over-claims these
 UNAVAILABLE = "GOALS UNAVAILABLE ({}): goal status is unknown; do not answer status from memory. Say it is unknown."
 GOALS_CALL = re.compile(r"\bah(?:\.py)?\s+goals\b")
+INJECT_MARK = "Goals from the mission ledger"  # first words of goals_view.goals_text: the injection landed
 
 
 def _policy_mode() -> str:
@@ -174,16 +182,39 @@ def _text_of(record) -> str:
     return ""
 
 
+MACHINE_PREFIX = ("<task-notification>", "<agent-message")
+
+
+def _human_origin(origin) -> bool:
+    """A record's `origin` names who wrote it; absent (older Claude Code) means unknown, judged by text instead."""
+    return origin is None or (isinstance(origin, dict) and origin.get("kind") == "human")
+
+
 def _human_turn(record) -> bool:
     if record.get("type") != "user" or record.get("isSidechain") or "toolUseResult" in record:
         return False
-    if record.get("isMeta") or record.get("isCompactSummary"):
+    if record.get("isMeta") or record.get("isCompactSummary") or not _human_origin(record.get("origin")):
         return False
     content = (record.get("message") or {}).get("content")
     if isinstance(content, list) and content and all(isinstance(b, dict) and b.get("type") == "tool_result"
                                                       for b in content):
         return False
-    return True
+    return not _text_of(record).lstrip().startswith(MACHINE_PREFIX)  # a task notification or peer message
+
+
+def _opener(record):
+    """(prompt, prompt_id) when the record is a human prompt that opens a turn, else None. A prompt typed while main
+    was busy arrives as an `attachment` of type queued_command (the 2026-11-12 "whats left" was one, origin human);
+    queued task notifications and peer messages are not human prompts (spec delta C1)."""
+    if _human_turn(record):
+        return _text_of(record), str(record.get("uuid") or record.get("timestamp") or "")
+    att = record.get("attachment") if record.get("type") == "attachment" else None
+    if isinstance(att, dict) and att.get("type") == "queued_command" and isinstance(att.get("prompt"), str):
+        origin = att.get("origin")
+        human = (isinstance(origin, dict) and origin.get("kind") == "human") or (origin is None and att.get("humanTurn"))
+        if human and not att["prompt"].lstrip().startswith(MACHINE_PREFIX):
+            return att["prompt"], str(att.get("source_uuid") or record.get("uuid") or att.get("timestamp") or "")
+    return None
 
 
 def current_turn(payload: dict) -> dict:
@@ -216,14 +247,13 @@ def current_turn(payload: dict) -> dict:
                         out["consulted"] = True
             if not out["answer"]:
                 out["answer"] = _text_of(rec).strip()
-        elif rec.get("type") == "attachment" or rec.get("type") == "system":
-            if "Goals from the mission ledger" in json.dumps(rec)[:200000]:
-                out["consulted"] = True
-        elif _human_turn(rec):
-            out["prompt"] = _text_of(rec)
-            out["prompt_id"] = str(rec.get("uuid") or rec.get("timestamp") or "")
+        elif _opener(rec) is not None:
+            out["prompt"], out["prompt_id"] = _opener(rec)
             break
-        elif rec.get("type") == "user" and "Goals from the mission ledger" in json.dumps(rec)[:200000]:
+        elif rec.get("type") == "attachment" or rec.get("type") == "system":
+            if INJECT_MARK in json.dumps(rec)[:200000]:
+                out["consulted"] = True
+        elif rec.get("type") == "user" and INJECT_MARK in json.dumps(rec)[:200000]:
             out["consulted"] = True
     if isinstance(direct, str) and direct.strip():
         out["answer"] = direct
@@ -335,13 +365,17 @@ def cmd_stop(payload: dict) -> dict:
 
 # ------------------------------------------------------------------ calibration
 
-def calibrate(path: str, uuids=(), limit: int = 200) -> list:
+def calibrate(path: str, uuids=(), limit: int = 200, simulate_injection: bool = True) -> list:
+    """Replay both Stop rules over a transcript (spec delta C2): `contradicted` (the answer disagrees with the ledger
+    as of its own timestamp) and `skipped` (it states goal status with no `ah goals` call and no injection since the
+    prompt that opened its turn). `flagged` is either. With simulate_injection a status question counts as consulted,
+    because the installed prompt hook injects the goals for it; historical transcripts predate the hook."""
     import safe_input  # noqa: PLC0415
     import mission_coverage as mc  # noqa: PLC0415
     messages = []
-    prompt = ""
+    prompt, consulted = "", False
     for _, raw in safe_input.iter_jsonl_lines(path, 16 << 20):
-        if raw is None or (b'"type":"assistant"' not in raw and b'"type":"user"' not in raw):
+        if raw is None:  # offline replay: parse every record, the 16 MB read cap bounds it
             continue
         try:
             rec = json.loads(raw)
@@ -349,14 +383,23 @@ def calibrate(path: str, uuids=(), limit: int = 200) -> list:
             continue
         if not isinstance(rec, dict) or rec.get("isSidechain"):
             continue
-        if _human_turn(rec):
-            prompt = _text_of(rec)
+        opened = _opener(rec)
+        if opened is not None:
+            prompt, consulted = opened[0], False
             continue
         if rec.get("type") != "assistant":
+            if INJECT_MARK in raw.decode("utf-8", "ignore")[:200000]:
+                consulted = True
             continue
+        content = (rec.get("message") or {}).get("content")
+        for blk in content if isinstance(content, list) else []:
+            if isinstance(blk, dict) and blk.get("type") == "tool_use" and \
+                    GOALS_CALL.search(str((blk.get("input") or {}).get("command") or "")):
+                consulted = True
         text = _text_of(rec).strip()
         if text:
-            messages.append({"uuid": rec.get("uuid"), "at": rec.get("timestamp"), "text": text, "prompt": prompt})
+            messages.append({"uuid": rec.get("uuid"), "at": rec.get("timestamp"), "text": text, "prompt": prompt,
+                             "consulted": consulted})
     if uuids:
         messages = [m for m in messages if m["uuid"] in uuids]
     else:
@@ -369,9 +412,14 @@ def calibrate(path: str, uuids=(), limit: int = 200) -> list:
             cache[day] = goals_doc(as_of=at)
         v = classify(m["text"], cache[day])
         asked = is_status_question(m["prompt"])
-        out.append({"uuid": m["uuid"], "at": m["at"], "status_answer": v["status_answer"] or (asked and bool(v["goals"])),
-                    "asked": asked, "goals": v["goals"], "flagged": bool(v["contradictions"]),
-                    "contradictions": v["contradictions"]})
+        gate = bool(STATUS_WORD.search(m["text"]))  # the same cheap gate cmd_stop applies first
+        states = gate and (v["status_answer"] or (asked and bool(v["goals"])))
+        consulted = m["consulted"] or (simulate_injection and asked)
+        contradicted = gate and bool(v["contradictions"])
+        skipped = states and not consulted
+        out.append({"uuid": m["uuid"], "at": m["at"], "status_answer": states, "asked": asked, "goals": v["goals"],
+                    "consulted": consulted, "contradicted": contradicted, "skipped": skipped,
+                    "flagged": contradicted or skipped, "contradictions": v["contradictions"] if gate else []})
     return out
 
 
@@ -412,8 +460,10 @@ def main(argv=None) -> int:
         p.add_argument("transcript")
         p.add_argument("--uuid", action="append", default=[])
         p.add_argument("--limit", type=int, default=200)
+        p.add_argument("--no-simulate-injection", action="store_true",
+                       help="do not count a status question as consulted (as if the prompt hook were absent)")
         a = p.parse_args(argv[1:])
-        for row in calibrate(a.transcript, tuple(a.uuid), a.limit):
+        for row in calibrate(a.transcript, tuple(a.uuid), a.limit, not a.no_simulate_injection):
             print(json.dumps(row))
         return 0
     _watchdog(argv[0])

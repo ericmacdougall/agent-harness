@@ -90,6 +90,26 @@ class Base(unittest.TestCase):
 
 
 class AhGoals(Base):
+    def test_candidates_list_unattached_rows_naming_a_goal_and_change_nothing(self):  # spec delta C3
+        self.seed()
+        self.jl("agent-auser0token000001.jsonl", [
+            {"at": iso(NOW - 600), "event": "deploy", "id": "wdep00015638", "note": "DEPLOYED goodqa#15638 03876da2"},
+            {"at": iso(NOW - 500), "event": "check", "id": "wrt00015638a",
+             "note": "REALLY_TESTED ut-mint PASS: user tokens mint a key on goodqa.app"}])
+        before = gv.goals_report(self.home, session=SESSION)
+        doc = gv.candidates(self.home, session=SESSION)
+        ut = {r["id"]: r for r in doc["goals"]["user-tokens"]}
+        self.assertEqual(set(ut), {"wdep00015638", "wrt00015638a"})
+        self.assertEqual(ut["wdep00015638"]["kind"], "deploy")
+        self.assertNotIn("w0000000beef", [r["id"] for rows in doc["goals"].values() for r in rows])  # #99999
+        leads = {r["id"]: r["verdict"] for r in doc["goals"]["leads"]}
+        self.assertEqual(leads, {"wfa11ed00001": "FAIL"})  # names "leads"; a FAIL is listed with its verdict
+        # w53ff16565a1 names neither the ticket nor an alias in its own row; wstatus00001 is not evidence
+        self.assertEqual(gv.goals_report(self.home, session=SESSION)["goals"], before["goals"])  # read only
+        rc, out = self.cli(ah, ["goals", "--candidates", "--session", SESSION])
+        self.assertEqual(rc, 0)
+        self.assertIn("mission_coverage.py attach --goal user-tokens --evidence wdep00015638 --kind deploy", out)
+
     def test_old_proof_is_invisible_to_status_24h_and_visible_to_goals(self):
         """The failing-first case: the only proof is 4 days old."""
         self.seed()
@@ -302,6 +322,12 @@ class Target(Base):
 
 
 class Verdicts(unittest.TestCase):
+    def test_deploy_record_needs_a_real_sha_or_version(self):  # spec delta N4
+        for note in ("DEPLOYED app 0.2.57 to t2", "DEPLOYED v1.2 to prod", "DEPLOYED 03876da2 to t2"):
+            self.assertTrue(gv.is_deploy_record({"event": "note", "note": note}), note)
+        for note in ("DEPLOYED in 2.5 minutes", "DEPLOYED 1234567 rows"):
+            self.assertFalse(gv.is_deploy_record({"event": "note", "note": note}), note)
+
     def test_verdicts(self):
         self.assertEqual(gv.verdict({"event": "check", "note": "REALLY_TESTED x PASS: ok"}), "PASS")
         self.assertEqual(gv.verdict({"event": "check", "note": "REALLY_TESTED x: FAIL rc=1"}), "FAIL")

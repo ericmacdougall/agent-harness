@@ -25,6 +25,8 @@ def allow(session: str, turn: str, hook: str, per_hook: int = 1, total: int = 3)
     try:
         path = _path(session)
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.path.islink(path.parent):
+            return False
         try:
             state = json.loads(path.read_text())
         except (OSError, ValueError):
@@ -36,7 +38,12 @@ def allow(session: str, turn: str, hook: str, per_hook: int = 1, total: int = 3)
             return False
         hooks[hook] = hooks.get(hook, 0) + 1
         tmp = path.with_suffix(f".{os.getpid()}.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            tmp.unlink()  # a stale temp from a crashed run of this pid
+        except FileNotFoundError:
+            pass
+        # never write through a planted symlink (as mission_gate.save_state); the rename replaces a symlink target
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
         with os.fdopen(fd, "w") as fh:
             json.dump(state, fh)
         os.replace(tmp, path)

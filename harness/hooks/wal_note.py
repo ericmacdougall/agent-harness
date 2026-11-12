@@ -19,7 +19,7 @@ EVENTS = {'intent', 'scope', 'decision', 'risk', 'check', 'commit', 'blocker', '
 GOAL_RE = re.compile(r'^[a-z0-9][a-z0-9_-]{0,63}$')
 TICKET_RE = re.compile(r'^\s*(?:GoodQA\s+)?[A-Za-z][A-Za-z0-9-]{0,62}\s*#\s*[1-9][0-9]{0,9}\s*$')
 REALLY_TESTED_RE = re.compile(r'^\s*REALLY_TESTED\s+[A-Za-z0-9._-]+')
-SHA_OR_VERSION_RE = re.compile(r'\b[0-9a-f]{7,40}\b|\bv?\d+\.\d+(?:\.\d+)?\b')
+SHA_OR_VERSION_RE = re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b|\bv\d+\.\d+(?:\.\d+)?\b|\b\d+\.\d+\.\d+\b")  # as goals_view.SHA_OR_VERSION
 # Events whose origin must be traceable (provenance.py). The mode per event is in provenance_policy.json.
 SOURCED = ('requirement', 'ask', 'blocker', 'scope', 'decision')
 TOOL_WRITERS = frozenset({'escalation', 'ahd', 'dropped_gate', 'ah-run'})  # rows these tools write on an agent's behalf (goodqa#14791)

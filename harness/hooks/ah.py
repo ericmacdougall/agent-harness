@@ -3034,6 +3034,8 @@ def build_parser():
                                       "the entry point for 'what is left'")
     gl.add_argument("--session")
     gl.add_argument("--json", action="store_true", help="the full report as JSON (text is capped at 4 KB)")
+    gl.add_argument("--candidates", action="store_true", help="list unattached deploy and REALLY_TESTED rows naming "
+                                                              "each goal, for main to attach or decline (read only)")
     ap = sub.add_parser("approve-top", help="record the user's permission for the top writing rung for one task: "
                                             "verifies the user's own words ask for it, writes the ask pair, records the task grant")
     ap.add_argument("--task", required=True, help="the [task:<key>] the spawn will carry")
@@ -3196,6 +3198,8 @@ def run(args, home: Path) -> dict:
         return status_report(home, s, parse_since(args.since))
     if cmd == "goals":  # goodqa#15754: no time window on attached evidence; a missing or tampered ledger exits 2
         import goals_view  # noqa: PLC0415
+        if args.candidates:
+            return dict(goals_view.candidates(home, session=args.session), candidates=True)
         return goals_view.goals_report(home, session=args.session)
     if cmd == "approve-top":
         return approve_top_cmd(home, args)
@@ -3283,7 +3287,8 @@ def main(argv=None) -> int:
         return 4
     if args.cmd == "goals":
         import goals_view  # noqa: PLC0415
-        sys.stdout.write((json.dumps(data, indent=2) if args.json else goals_view.goals_text(data)) + "\n")
+        text = goals_view.candidates_text(data) if data.get("candidates") else goals_view.goals_text(data)
+        sys.stdout.write((json.dumps(data, indent=2) if args.json else text) + "\n")
         return 0 if data.get("state") == "ok" else 2
     if args.text:
         sys.stdout.write(render_text(args.cmd, data) + "\n")

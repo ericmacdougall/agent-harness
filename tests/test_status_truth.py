@@ -163,6 +163,73 @@ class Lint(Base):
             turn = st.current_turn({"session_id": SESSION, "transcript_path": self.transcript("whats left", WRONG)})
         self.assertEqual(turn["prompt_id"], "u-prompt-1")  # the user record's uuid, not the Stop payload
 
+    # Spec delta C1: real record shapes from the incident transcript. The 06:59:45Z "whats left" was an attachment of
+    # type queued_command with origin human; the turn also carried task-notification user records (origin
+    # task-notification), which are not human prompts.
+    def raw_transcript(self, recs):
+        path = self.home / ".claude" / "projects" / "p" / f"{SESSION}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        return str(path)
+
+    QUEUED = {"type": "attachment", "uuid": "att-1", "timestamp": iso(NOW),
+              "attachment": {"type": "queued_command", "prompt": "whats left", "source_uuid": "src-whats-left",
+                             "commandMode": "prompt", "origin": {"kind": "human"}, "humanTurn": True}}
+    NOTE_USER = {"type": "user", "uuid": "u-note", "origin": {"kind": "task-notification", "producer": "session-task"},
+                 "message": {"role": "user", "content": "<task-notification>\n<task-id>x</task-id>\n"
+                                                        "<status>completed</status>\n</task-notification>"}}
+    NOTE_QUEUED = {"type": "attachment", "uuid": "att-2",
+                   "attachment": {"type": "queued_command", "prompt": "<task-notification>\n<status>completed</status>",
+                                  "origin": {"kind": "task-notification", "producer": "session-task"}}}
+
+    def answer(self, text, uuid="a9"):
+        return {"type": "assistant", "uuid": uuid, "message": {"content": [{"type": "text", "text": text}]}}
+
+    def stop_raw(self, recs):
+        with mock.patch.object(st, "_read_tail", side_effect=lambda p: Path(p).read_bytes()):
+            return st.cmd_stop({"session_id": SESSION, "transcript_path": self.raw_transcript(recs),
+                                "hook_event_name": "Stop"})
+
+    def test_queued_human_prompt_opens_the_turn_and_a_task_notification_does_not(self):
+        self.seed()
+        recs = [{"type": "user", "uuid": "u-old", "origin": {"kind": "human"},
+                 "message": {"role": "user", "content": "fix the readme"}},
+                self.QUEUED, self.NOTE_USER, self.answer(RIGHT)]
+        out = self.stop_raw(recs)
+        self.assertIn("`ah goals` was not run", out.get("reason", ""))  # asked: the queued prompt is the question
+        with mock.patch.object(st, "_read_tail", side_effect=lambda p: Path(p).read_bytes()):
+            turn = st.current_turn({"session_id": SESSION, "transcript_path": self.raw_transcript(recs)})
+        self.assertEqual((turn["prompt"], turn["prompt_id"]), ("whats left", "src-whats-left"))
+
+    def test_queued_status_question_with_absent_ledger_says_unavailable(self):
+        out = self.stop_raw([self.QUEUED, self.NOTE_USER, self.answer(WRONG)])
+        self.assertIn("GOALS UNAVAILABLE", out.get("systemMessage", ""))
+
+    def test_queued_task_notification_is_not_a_human_prompt(self):
+        self.seed()
+        one_goal = "Self-update is not live yet, the installer still needs work."  # one goal: needs `asked`
+        recs = [{"type": "user", "uuid": "u-old", "origin": {"kind": "human"},
+                 "message": {"role": "user", "content": "fix the readme"}},
+                self.NOTE_QUEUED, self.NOTE_USER, self.answer(one_goal)]
+        with mock.patch.object(st, "_read_tail", side_effect=lambda p: Path(p).read_bytes()):
+            turn = st.current_turn({"session_id": SESSION, "transcript_path": self.raw_transcript(recs)})
+        self.assertEqual(turn["prompt"], "fix the readme")
+        self.assertNotIn("was not run", self.stop_raw(recs).get("reason", ""))
+
+    def test_calibrate_counts_the_skip_rule_with_the_contradictions(self):
+        self.seed()
+        two_goals = "Prod move and self-update both remain in progress; nothing more to report on the leads."
+        path = self.raw_transcript([
+            {"type": "user", "uuid": "u-old", "origin": {"kind": "human"}, "timestamp": iso(NOW),
+             "message": {"role": "user", "content": "fix the readme"}},
+            dict(self.answer(two_goals, "a-unasked"), timestamp=iso(NOW)),
+            self.QUEUED, self.NOTE_USER, dict(self.answer(RIGHT, "a-asked"), timestamp=iso(NOW))])
+        rows = {r["uuid"]: r for r in st.calibrate(path)}
+        self.assertTrue(rows["a-unasked"]["skipped"] and rows["a-unasked"]["flagged"])  # states status, no ah goals
+        self.assertFalse(rows["a-asked"]["skipped"])  # a status question gets the injection once installed
+        bare = {r["uuid"]: r for r in st.calibrate(path, simulate_injection=False)}
+        self.assertTrue(bare["a-asked"]["asked"] and bare["a-asked"]["skipped"])
+
     def test_off_mode_does_nothing(self):
         self.seed()
         with mock.patch.object(st, "_policy_mode", return_value="off"):

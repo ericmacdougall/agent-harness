@@ -62,7 +62,8 @@ def excerpt(text, cap: int = NOTE_CAP) -> str:
 
 DEPLOY_EVENTS = ("deploy", "release", "install")
 DEPLOY_NOTE = re.compile(r"^\s*(?:DEPLOYED|INSTALLED|RELEASED)\b")
-SHA_OR_VERSION = re.compile(r"\b[0-9a-f]{7,40}\b|\bv?\d+\.\d+(?:\.\d+)?\b")
+# a git sha (with a hex letter), vX.Y or X.Y.Z; a bare decimal ("in 2.5 minutes") is not a version
+SHA_OR_VERSION = re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b|\bv\d+\.\d+(?:\.\d+)?\b|\b\d+\.\d+\.\d+\b")
 
 
 def is_deploy_record(rec: dict) -> bool:
@@ -126,6 +127,83 @@ def tagged_rows(home: Path, session: str, goal_ids, as_of=None, budget_s: float 
                 continue
             out[rec["goal"]].append((path.name, rec))
     return {"rows": out, "partial": partial}
+
+
+def _goal_patterns(goal: dict) -> list:
+    """Word patterns that name a goal in a WAL note: its ticket numbers, aliases and id as words."""
+    pats = []
+    for num in re.findall(r"\d{3,}", str(goal.get("ticket") or "")):
+        pats.append(re.compile(rf"#\s?{num}\b|goodqa#{num}\b|\bticket {num}\b", re.I))
+    for word in list(goal.get("aliases") or []) + [str(goal.get("id") or "").replace("-", " ")]:
+        word = str(word).strip()
+        if len(word) >= 3:
+            pats.append(re.compile(r"(?<![A-Za-z0-9])" + re.escape(word).replace(r"\ ", r"[\s_-]+") + r"(?![A-Za-z0-9])",
+                                   re.I))
+    return pats
+
+
+def candidates(home: Path, session=None, per_goal: int = 8, budget_s: float = TAG_SCAN_SECONDS) -> dict:
+    """Unattached deploy records and REALLY_TESTED rows in the mission session's WALs that name a goal (its ticket,
+    alias or id), newest first, for main to attach with `mission_coverage.py attach` or decline (spec delta C3). Read
+    only; never changes a state. Rows of other sessions are not scanned (attach takes --session for those)."""
+    loaded = mc.load_goals(home)
+    if loaded["state"] != "ok":
+        return {"state": loaded["state"], "goals": {}}
+    session = (session or loaded.get("mission_session") or mc.main_session(home) or "").lower()
+    goals = loaded["goals"]
+    pats = {g["id"]: _goal_patterns(g) for g in goals}
+    attached = {g["id"]: {str(e.get("id")) for e in g.get("evidence") or []} for g in goals}
+    found, partial = {g["id"]: [] for g in goals}, False
+    folder = mc.claude_dir() / "wals" / session
+    if not mc.SESSION_RE.match(session) or not folder.is_dir() or folder.is_symlink():
+        return {"state": "ok", "session": session, "goals": found, "partial": False}
+    started = time.monotonic()
+    for path in sorted(folder.glob("*.jsonl"), key=lambda q: (q.name != "main.jsonl", -_mtime(q), q.name)):
+        if time.monotonic() - started > budget_s:
+            partial = True
+            break
+        if path.is_symlink() or not mc.WAL_NAME_RE.match(path.name):
+            continue
+        try:
+            raw_all = safe_input.read_bounded(path, TAG_SCAN_BYTES)
+        except (OSError, safe_input.InputRejected):
+            partial = True
+            continue
+        for raw in raw_all.splitlines():
+            if b"REALLY_TESTED" not in raw and b"DEPLOY" not in raw.upper() and b"INSTALLED" not in raw \
+                    and b"RELEASED" not in raw:
+                continue
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            v = verdict(rec) if isinstance(rec, dict) else ""
+            wid = str(rec.get("id") or "") if v else ""
+            if not wid:
+                continue
+            text = " ".join(str(rec.get(k) or "") for k in ("note", "goal", "ticket"))
+            for gid, plist in pats.items():
+                if wid in attached[gid] or not any(pt.search(text) for pt in plist):
+                    continue
+                found[gid].append({"id": wid, "wal": path.name, "at": rec.get("at"), "verdict": v,
+                                   "kind": "deploy" if v == "DEPLOY" else ("live_test" if rec.get("live") else "test"),
+                                   "note": excerpt(rec.get("note"))})
+    for gid in found:
+        found[gid] = sorted(found[gid], key=lambda r: str(r.get("at") or ""), reverse=True)[:per_goal]
+    return {"state": "ok", "session": session, "goals": found, "partial": partial}
+
+
+def candidates_text(doc: dict) -> str:
+    if doc.get("state") != "ok":
+        return f"GOALS UNAVAILABLE ({doc.get('state')}): no candidates"
+    lines = [f"Candidate evidence in session {doc.get('session')} (unattached; main attaches or declines each; "
+             "kind is a guess: a live test needs a live target)" + (" PARTIAL SCAN" if doc.get("partial") else "")]
+    for gid, rows in doc["goals"].items():
+        lines.append(f"{gid}: {len(rows)} candidate(s)" + ("" if rows else " -> stays as the ledger shows it"))
+        for r in rows:
+            lines.append(f"  {r['id']} {r['verdict']} {r['at']} {r['wal']}: {r['note']}")
+            lines.append(f"    mission_coverage.py attach --goal {gid} --evidence {r['id']} --kind {r['kind']}")
+    return "\n".join(lines)
 
 
 def _mtime(path: Path) -> float:
