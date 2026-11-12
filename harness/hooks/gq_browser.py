@@ -50,11 +50,13 @@ class Refused(Exception):
 
 
 class ApiError(Exception):
-    def __init__(self, what, status=None, code=None, lost=False):
+    def __init__(self, what, status=None, code=None, lost=False, detail=None):
         super().__init__(what)
-        self.what, self.status, self.code, self.lost = what, status, code, lost
+        self.what, self.status, self.code, self.lost, self.detail = what, status, code, lost, detail
 
     def __str__(self):
+        if self.detail:
+            return self.detail
         if self.lost:
             return "%s: no response (connection lost or timed out)" % self.what
         return "%s -> HTTP %s %s" % (self.what, self.status, self.code or "")
@@ -235,6 +237,21 @@ class Api:
             raise ApiError(what, 0, "invalid_json")
 
 
+def obj(value, what):
+    """A response body must be a JSON object; anything else is unexpected_response (never an AttributeError)."""
+    if not isinstance(value, dict):
+        raise ApiError(what, 0, "unexpected_response")
+    return value
+
+
+def activate_seconds():
+    """60 s activation limit. Tests may shorten it (never lengthen it) with GQ_BROWSER_ACTIVATE_SECONDS."""
+    try:
+        return min(60.0, max(0.5, float(os.environ.get("GQ_BROWSER_ACTIVATE_SECONDS") or 60)))
+    except ValueError:
+        return 60.0
+
+
 def iso(ts):
     return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
@@ -287,69 +304,113 @@ def op_open(origins, hours=1.0, ttl=900, org=None, base=None, project=None):
     save_state(d, state)
     expires = iso(started + hours * 3600)
     o = "/orgs/%s" % org
+    key_id = key = None
     try:
-        minted = api.call("POST", o + "/api-keys", token, {"name": KEY_PREFIX + lease, "scopes": ["agents", "write"], "expiresAt": expires})
-        key_id, key = (minted.get("apiKey") or {}).get("id"), minted.get("token")
-        if not isinstance(key_id, str) or not isinstance(key, str):
+        minted = obj(api.call("POST", o + "/api-keys", token, {"name": KEY_PREFIX + lease, "scopes": ["agents", "write"], "expiresAt": expires}), "POST api-keys")
+        api_key = minted.get("apiKey")
+        key_id = api_key.get("id") if isinstance(api_key, dict) else None
+        if isinstance(key_id, str) and UUID_RE.match(key_id):
+            # Record the id before anything else can fail, so cleanup can always delete the key.
+            state["keyId"] = key_id
+            save_state(d, state)
+        if not isinstance(key_id, str) or not UUID_RE.match(key_id) or not isinstance(minted.get("token"), str):
             raise ApiError("POST api-keys", 0, "unexpected_response")
+        key = minted["token"]
         write_new(os.path.join(d, "key"), key.encode())
-        state["keyId"] = key_id
+        granted = obj(api.call("POST", o + "/agent-browsers/grants", token, {"projectId": project, "apiKeyId": key_id, "origins": origins, "expiresAt": expires}), "POST grants")
+        grant = granted.get("grant")
+        state["grantId"] = grant.get("id") if isinstance(grant, dict) and isinstance(grant.get("id"), str) else None
+        state["sessionRequested"] = True
         save_state(d, state)
-    except ApiError:
-        state["closed"] = True
-        save_state(d, state)
-        raise
-    try:
-        granted = api.call("POST", o + "/agent-browsers/grants", token, {"projectId": project, "apiKeyId": key_id, "origins": origins, "expiresAt": expires})
-        state["grantId"] = (granted.get("grant") or {}).get("id")
-        save_state(d, state)
-        opened = api.call("POST", o + "/agent-browsers/sessions", key, {"projectId": project, "origins": origins, "ttlSeconds": max(30, min(ttl, int(hours * 3600)))})
-        session = opened.get("session") or {}
-        state["sessionId"] = session.get("id")
+        opened = obj(api.call("POST", o + "/agent-browsers/sessions", key, {"projectId": project, "origins": origins, "ttlSeconds": max(30, min(ttl, int(hours * 3600)))}), "POST sessions")
+        session = obj(opened.get("session"), "POST sessions")
+        sid = session.get("id")
+        if not isinstance(sid, str) or not UUID_RE.match(sid):
+            raise ApiError("POST sessions", 0, "unexpected_response")
+        state["sessionId"] = sid
         save_state(d, state)
         sstate = session.get("state")
-        deadline = time.time() + 60
+        limit = activate_seconds()
+        deadline = time.time() + limit
         while sstate != "active":
             if sstate in ("closed", "failed", "stopping"):
                 raise ApiError("lease", 0, "lease_ended_" + str(sstate))
             if time.time() > deadline:
-                raise ApiError("lease", 0, "not_active_in_60s")
+                raise ApiError("lease", 0, "not_active_in_%ds" % limit)
             time.sleep(0.5)
-            sstate = (api.call("GET", o + "/agent-browsers/sessions/%s" % state["sessionId"], key).get("session") or {}).get("state")
-    except ApiError as e:
-        cleanup = _teardown(api, d, state, token)
-        raise ApiError(str(e) + "; cleanup: " + cleanup, getattr(e, "status", None))
+            got = obj(api.call("GET", o + "/agent-browsers/sessions/%s" % sid, key), "GET session")
+            sstate = got.get("session").get("state") if isinstance(got.get("session"), dict) else None
+    except BaseException as e:
+        # Every failure path (API error, lost response, bad response shape, local file error, Ctrl-C) cleans up.
+        cleanup = _teardown(api, d, state, token, key)
+        if isinstance(e, ApiError):
+            raise ApiError(e.what, e.status, e.code, e.lost, detail="%s; cleanup: %s" % (e, cleanup)) from None
+        if isinstance(e, Exception):
+            raise ApiError("open", 0, "local_error", detail="open failed (%s); cleanup: %s" % (type(e).__name__, cleanup)) from None
+        raise
     return {"leaseId": lease, "sessionId": state["sessionId"], "grantId": state["grantId"], "keyId": key_id,
             "expiresAt": expires, "state": "active", "msToReady": int((time.time() - started) * 1000)}
 
 
+def _lease_sessions(api, o, key):
+    """Session ids the lease's own key can see. The key is minted per lease, so every one belongs to this lease."""
+    rows = obj(api.call("GET", o + "/agent-browsers/sessions", key), "GET sessions").get("sessions")
+    if not isinstance(rows, list):
+        raise ApiError("GET sessions", 0, "unexpected_response")
+    return [r["id"] for r in rows if isinstance(r, dict) and isinstance(r.get("id"), str) and UUID_RE.match(r["id"])
+            and r.get("state") not in ("closed", "failed")]
+
+
 def _teardown(api, d, state, token, key=None):
-    """Stop the lease (key), revoke the grant and delete the key (user token). Returns a short cleanup report."""
+    """Stop the lease (key), revoke the grant and delete the key (user token).
+
+    Every step runs even when an earlier one fails, and the report names every step that failed."""
     o = "/orgs/%s" % state["org"]
-    if state.get("sessionId") and key:
+    done, failed = [], []
+    if key:
         try:
-            api.call("POST", o + "/agent-browsers/sessions/%s/stop" % state["sessionId"], key)
-        except ApiError:
-            pass
+            if state.get("sessionId"):
+                sids = [state["sessionId"]]
+            elif state.get("sessionRequested"):
+                # The create response was lost or unreadable: the server may still have started a session.
+                sids = _lease_sessions(api, o, key)
+            else:
+                sids = []
+            for sid in sids:
+                api.call("POST", o + "/agent-browsers/sessions/%s/stop" % sid, key)
+            if sids:
+                done.append("session_stopped")
+        except Exception:
+            failed.append("stop_failed")
+    elif state.get("sessionId") or state.get("sessionRequested"):
+        failed.append("stop_skipped_no_key")
     if state.get("grantId"):
         try:
             api.call("POST", o + "/agent-browsers/grants/%s/revoke" % state["grantId"], token)
-        except ApiError:
-            pass
-    report = "nothing_to_clean"
+            done.append("grant_revoked")
+        except Exception:
+            failed.append("revoke_failed grant %s" % state["grantId"])
+    key_failed = False
     if state.get("keyId"):
         try:
             api.call("DELETE", o + "/api-keys/%s" % state["keyId"], token)
-            report = "key_deleted"
-        except ApiError:
-            report = "key_delete_failed key %s (it stays live until its expiry)" % state["keyId"]
+            done.append("key_deleted")
+        except Exception:
+            key_failed = True
+            failed.append("key_delete_failed key %s (it stays live until its expiry)" % state["keyId"])
     try:
         os.unlink(os.path.join(d, "key"))
     except FileNotFoundError:
         pass
-    state["closed"] = report != "nothing_to_clean" and not report.startswith("key_delete_failed") or report == "nothing_to_clean"
-    save_state(d, state)
-    return report
+    except OSError:
+        failed.append("key_file_remove_failed")
+    # A lease whose key could not be deleted stays open, so close can retry it.
+    state["closed"] = not key_failed
+    try:
+        save_state(d, state)
+    except OSError:
+        failed.append("state_save_failed")
+    return ", ".join(done + failed) or "nothing_to_clean"
 
 
 def _lease(lease):
@@ -382,12 +443,12 @@ def _run_job(lease, body):
     key = read_key(d)
     api = Api(base, "")
     o = "/orgs/%s/agent-browsers/sessions/%s" % (state["org"], state["sessionId"])
-    queued = api.call("POST", o + "/actions", key, body)
+    queued = obj(api.call("POST", o + "/actions", key, body), "POST actions")
     job_id = queued.get("jobId")
     wait = float(os.environ.get("GQ_BROWSER_WAIT_SECONDS") or 30)
     deadline = time.time() + wait
     while True:
-        job = api.call("GET", o + "/jobs/%s" % job_id, key).get("job") or {}
+        job = obj(obj(api.call("GET", o + "/jobs/%s" % urllib.parse.quote(str(job_id), safe=""), key), "GET job").get("job") or {}, "GET job")
         if job.get("state") in ("succeeded", "failed"):
             return {"untrusted": True, "notice": NOTICE, "jobId": job_id, "state": job.get("state"),
                     "error": job.get("error"), "result": job.get("result")}
@@ -428,9 +489,9 @@ def op_status(lease, job=None):
     api = Api(base, "")
     o = "/orgs/%s/agent-browsers/sessions/%s" % (state["org"], state["sessionId"])
     if job:
-        j = api.call("GET", o + "/jobs/%s" % urllib.parse.quote(str(job), safe=""), key).get("job") or {}
+        j = obj(obj(api.call("GET", o + "/jobs/%s" % urllib.parse.quote(str(job), safe=""), key), "GET job").get("job") or {}, "GET job")
         return {"untrusted": True, "notice": NOTICE, "jobId": job, "state": j.get("state"), "result": j.get("result"), "error": j.get("error")}
-    s = api.call("GET", o, key).get("session") or {}
+    s = obj(obj(api.call("GET", o, key), "GET session").get("session") or {}, "GET session")
     return {"leaseId": lease, "sessionId": state["sessionId"], "state": s.get("state")}
 
 
@@ -466,8 +527,8 @@ def op_list(orphans=False):
 
 
 def _own_keys(api, token, org):
-    me = (api.call("GET", "/me", token).get("user") or {}).get("id")
-    rows = api.call("GET", "/orgs/%s/api-keys" % org, token).get("apiKeys")
+    me = obj(obj(api.call("GET", "/me", token), "GET me").get("user") or {}, "GET me").get("id")
+    rows = obj(api.call("GET", "/orgs/%s/api-keys" % org, token), "GET api-keys").get("apiKeys")
     if not isinstance(me, str) or not isinstance(rows, list):
         raise ApiError("key lookup", 0, "unexpected_response")
     own = []
@@ -493,6 +554,13 @@ def op_keys(orphans=False, delete=None, org=None, base=None):
 
 
 # ------------------------------------------------------------------ MCP
+
+def _local_error(e):
+    """Type and errno only: an exception message may quote a path or a response body."""
+    if isinstance(e, OSError):
+        return "%s (errno %s)" % (type(e).__name__, e.errno)
+    return type(e).__name__
+
 
 TOOLS = [
     {"name": "gq_browser_open", "description": "Open a GoodQA worker browser lease for exact origins. Returns ids only.",
@@ -565,8 +633,10 @@ def mcp(stdin=sys.stdin, stdout=sys.stdout):
             try:
                 out = call_tool(p.get("name"), p.get("arguments") or {})
                 res = {"content": [{"type": "text", "text": json.dumps(out)}]}
-            except (Refused, ApiError, OSError, ValueError) as e:
+            except (Refused, ApiError) as e:
                 res = {"content": [{"type": "text", "text": "refused: %s" % e}], "isError": True}
+            except Exception as e:  # noqa: BLE001 - one bad call must never end the stdio server
+                res = {"content": [{"type": "text", "text": "error: %s" % _local_error(e)}], "isError": True}
         else:
             stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "method not found"}}) + "\n")
             stdout.flush()
@@ -634,6 +704,9 @@ def main(argv=None):
         return 2
     except ApiError as e:
         print("gq_browser: %s" % e, file=sys.stderr)
+        return 1
+    except Exception as e:  # noqa: BLE001 - a short message, never a traceback that could carry state
+        print("gq_browser: error: %s" % _local_error(e), file=sys.stderr)
         return 1
     print(json.dumps(out))
     return 0

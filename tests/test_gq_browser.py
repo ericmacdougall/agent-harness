@@ -41,6 +41,7 @@ class FakeApi:
         self.job_state = "succeeded"
         self.session_state = "active"
         self.api_keys = []
+        self.override = {}
         self.lock = threading.Lock()
         api = self
 
@@ -66,6 +67,9 @@ class FakeApi:
                     self.send_header("content-length", "0")
                     self.end_headers()
                     return
+                for (m, suffix), (status, payload) in api.override.items():
+                    if m == method and path.endswith(suffix):
+                        return self._json(status, payload)
                 for (m, suffix), status in api.fail.items():
                     if m == method and path.endswith(suffix):
                         return self._json(status, {"error": {"code": "forced_%d" % status, "message": "forced"}})
@@ -282,7 +286,9 @@ class OpenTest(Base):
         try:
             self.api.redirect = other.base.rsplit("/v1", 1)[0]
             p = self.open(check=None)
-            self.assertNotEqual(p.returncode, 0)
+            self.assertEqual(p.returncode, 1)
+            self.assertIn('gq_browser: ', p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
             self.assertEqual(other.requests, [])
         finally:
             other.close()
@@ -328,34 +334,44 @@ class OpenTest(Base):
     def test_neg7_human_approval_stops_chain(self):
         self.api.fail[("POST", "/api-keys")] = 409
         p = self.open(check=None)
-        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn('gq_browser: ', p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
         self.assertEqual(self.api.calls("POST", "/grants"), [])
 
     def test_ac6_grant_refused_after_key_deletes_key(self):
         self.api.fail[("POST", "/grants")] = 400
         p = self.open(check=None)
-        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn('gq_browser: ', p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
         self.assertEqual(len(self.api.calls("DELETE", "/api-keys/" + KEY_ID)), 1)
         self.assertIn("key_deleted", p.stdout + p.stderr)
 
     def test_ac7_lost_session_response_deletes_key(self):
         self.api.drop.add(("POST", "/agent-browsers/sessions"))
         p = self.open(check=None)
-        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn('gq_browser: ', p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
         self.assertEqual(len(self.api.calls("DELETE", "/api-keys/" + KEY_ID)), 1)
         self.assertIn("key_deleted", p.stdout + p.stderr)
 
     def test_ac7_lost_grant_response_deletes_key(self):
         self.api.drop.add(("POST", "/grants"))
         p = self.open(check=None)
-        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn('gq_browser: ', p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
         self.assertEqual(len(self.api.calls("DELETE", "/api-keys/" + KEY_ID)), 1)
 
     def test_c3_failed_key_delete_reported(self):
         self.api.fail[("POST", "/grants")] = 400
         self.api.fail[("DELETE", "/api-keys/" + KEY_ID)] = 500
         p = self.open(check=None)
-        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn('gq_browser: ', p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
         self.assertIn("key_delete_failed", p.stdout + p.stderr)
         self.assertIn(KEY_ID, p.stdout + p.stderr)
 
@@ -364,6 +380,89 @@ class OpenTest(Base):
         self.assertNotEqual(a["leaseId"], b["leaseId"])
         self.assertTrue((self.lease_dir(a["leaseId"]) / "state.json").exists())
         self.assertTrue((self.lease_dir(b["leaseId"]) / "state.json").exists())
+
+    def assert_full_cleanup(self, p, stops=1):
+        self.assertEqual(p.returncode, 1, (p.stdout, p.stderr))
+        self.assertNotIn("Traceback", p.stderr)
+        stop = self.api.calls("POST", "/stop")
+        self.assertEqual(len(stop), stops)
+        for r in stop:
+            self.assertEqual(r["auth"], "Bearer " + KEY_VALUE)
+        self.assertEqual(len(self.api.calls("POST", "/revoke")), 1)
+        self.assertEqual(len(self.api.calls("DELETE", "/api-keys/" + KEY_ID)), 1)
+
+    def test_f1_session_created_then_failed_is_stopped(self):
+        self.api.session_state = "failed"
+        p = self.open(check=None)
+        self.assert_full_cleanup(p)
+        self.assertIn("lease_ended_failed", p.stderr)
+        self.assertIn("session_stopped", p.stderr)
+
+    def test_f1_activation_timeout_stops_session(self):
+        self.api.session_state = "pending"
+        p = self.e.run("open", "--origin", "https://example.com", env={"GQ_BROWSER_ACTIVATE_SECONDS": "1"})
+        self.assert_full_cleanup(p)
+        self.assertIn("not_active_in_1s", p.stderr)
+
+    def test_f1_lost_session_response_stops_what_the_key_sees(self):
+        self.api.drop.add(("POST", "/agent-browsers/sessions"))
+        p = self.open(check=None)
+        self.assert_full_cleanup(p)
+        listed = self.api.calls("GET", "/agent-browsers/sessions")
+        self.assertEqual([r["auth"] for r in listed], ["Bearer " + KEY_VALUE])
+        self.assertTrue(self.api.calls("POST", "/sessions/" + SESSION_ID + "/stop"))
+
+    def test_f2_non_object_responses_clean_up(self):
+        cases = [(("POST", "/agent-browsers/grants"), (201, [])),
+                 (("POST", "/agent-browsers/sessions"), (201, "x")),
+                 (("POST", "/agent-browsers/sessions"), (201, {"session": []})),
+                 (("GET", "/sessions/" + SESSION_ID), (200, [1]))]
+        for i, (where, reply) in enumerate(cases, 1):
+            self.api.override = {where: reply}
+            p = self.open(check=None)
+            self.assertEqual(p.returncode, 1, (where, p.stderr))
+            self.assertNotIn("Traceback", p.stderr, where)
+            self.assertIn("unexpected_response", p.stderr, where)
+            self.assertEqual(len(self.api.calls("DELETE", "/api-keys/" + KEY_ID)), i, where)
+
+    def test_f2_mint_response_not_an_object_is_a_short_error(self):
+        self.api.override = {("POST", "/api-keys"): (201, ["no"])}
+        p = self.open(check=None)
+        self.assertEqual(p.returncode, 1)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(self.api.calls("POST", "/grants"), [])
+
+    def test_f2_key_file_write_failure_deletes_key(self):
+        import importlib.util
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("gq_browser_under_test", CLIENT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        real = mod.write_new
+
+        def failing(path, data, mode=0o600):
+            if os.path.basename(path) == "key":
+                raise OSError(28, "No space left on device")
+            return real(path, data, mode)
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.e.home), "GQ_BROWSER_TEST_LOOPBACK": "1"}), \
+                mock.patch.object(mod, "write_new", failing):
+            with self.assertRaises(mod.ApiError) as cm:
+                mod.op_open(["https://example.com"])
+        self.assertIn("OSError", str(cm.exception))
+        self.assertIn("key_deleted", str(cm.exception))
+        self.assertEqual(len(self.api.calls("DELETE", "/api-keys/" + KEY_ID)), 1)
+        self.assertEqual(self.api.calls("POST", "/grants"), [])
+
+    def test_f2_missing_key_file_is_a_short_error(self):
+        lease = self.open()["leaseId"]
+        self.api.fail[("DELETE", "/api-keys/" + KEY_ID)] = 500
+        p = self.e.run("close", lease)
+        self.assertIn("key_delete_failed", p.stdout)
+        p = self.e.run("act", lease, "read_page")
+        self.assertEqual(p.returncode, 1)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertIn("FileNotFoundError", p.stderr)
 
 
 class ActTest(Base):
@@ -415,7 +514,9 @@ class ActTest(Base):
         shots.mkdir(exist_ok=True, mode=0o700)
         os.symlink(self.e.outside, shots / "trap.png")
         p = self.e.run("shot", self.lease, "--name", "trap.png")
-        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn('gq_browser: refused:', p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
         self.assertEqual(self.e.outside.read_text(), "untouched")
 
 
@@ -440,11 +541,21 @@ class CloseTest(Base):
         self.assertEqual(len(self.api.calls("POST", "/revoke")), 1)
         self.assertEqual(len(self.api.calls("DELETE", "/api-keys/" + KEY_ID)), 1)
 
+    def test_f4_cleanup_report_names_every_failed_step(self):
+        self.api.fail[("POST", "/stop")] = 500
+        self.api.fail[("POST", "/revoke")] = 500
+        out = json.loads(self.e.run("close", self.lease, check=0).stdout)
+        self.assertIn("stop_failed", out["cleanup"])
+        self.assertIn("revoke_failed grant " + GRANT_ID, out["cleanup"])
+        self.assertIn("key_deleted", out["cleanup"])
+
     def test_neg4_foreign_or_malformed_lease_refused(self):
         for bad in ("0123456789abcdef", "../x", "a/b", "/etc", "ABCDEF0123456789"):
             n = len(self.api.requests)
             p = self.e.run("close", bad)
-            self.assertNotEqual(p.returncode, 0, bad)
+            self.assertEqual(p.returncode, 2, bad)
+            self.assertIn('gq_browser: refused:', p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
             self.assertEqual(len(self.api.requests), n, bad)
         self.assertEqual(self.e.outside.read_text(), "untouched")
 
@@ -453,7 +564,9 @@ class CloseTest(Base):
         os.symlink(self.e.outside.parent, self.e.state / evil)
         n = len(self.api.requests)
         p = self.e.run("close", evil)
-        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn('gq_browser: refused:', p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
         self.assertEqual(len(self.api.requests), n)
         self.assertEqual(self.e.outside.read_text(), "untouched")
 
@@ -477,7 +590,9 @@ class OrphanTest(Base):
         self.assertEqual([k["id"] for k in out["keys"]], [mine["id"]])
         for k in (theirs, unprefixed):
             p = self.e.run("keys", "--delete", k["id"])
-            self.assertNotEqual(p.returncode, 0)
+            self.assertEqual(p.returncode, 2)
+            self.assertIn('gq_browser: refused:', p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
         self.assertEqual(self.api.calls("DELETE", "/api-keys/" + theirs["id"]), [])
         self.assertEqual(self.api.calls("DELETE", "/api-keys/" + unprefixed["id"]), [])
         self.e.run("keys", "--delete", mine["id"], check=0)
@@ -486,11 +601,15 @@ class OrphanTest(Base):
     def test_neg9_keys_lookup_failure_or_missing_fields_shows_nothing(self):
         self.api.api_keys = [{"id": "77777777-7777-4777-8777-777777777777", "name": "gq-browser:aaaaaaaaaaaaaaaa"}]
         p = self.e.run("keys", "--orphans")
-        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn('gq_browser: ', p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
         self.assertNotIn("77777777", p.stdout)
         self.api.fail[("GET", "/api-keys")] = 403
         p = self.e.run("keys", "--delete", "77777777-7777-4777-8777-777777777777")
-        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn('gq_browser: ', p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
         self.assertEqual(self.api.calls("DELETE", "/api-keys/77777777-7777-4777-8777-777777777777"), [])
 
 
@@ -534,6 +653,16 @@ class McpTest(Base):
             self.assertTrue(r.get("error") or r["result"].get("isError"), r)
         self.assertEqual(self.api.requests, [])
 
+    def test_f2_mcp_survives_a_non_object_response(self):
+        self.api.override = {("POST", "/agent-browsers/grants"): (201, [])}
+        out = self.rpc([{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "gq_browser_open", "arguments": {"origins": ["https://example.com"]}}},
+                        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}])
+        self.assertEqual(len(out), 2)
+        self.assertIs(out[0]["result"]["isError"], True)
+        self.assertIn("unexpected_response", out[0]["result"]["content"][0]["text"])
+        self.assertTrue(out[1]["result"]["tools"])
+        self.assertEqual(len(self.api.calls("DELETE", "/api-keys/" + KEY_ID)), 1)
+
     def test_neg6_mcp_has_no_credential_or_remote_tools(self):
         out = self.rpc([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}])
         text = json.dumps(out)
@@ -549,7 +678,9 @@ class GuardClaimTest(unittest.TestCase):
         import command_guard as g
         token = "~/.config/goo" + "dqa/user-tok" + "en"
         key = "~/.agent-harness/gq-browser/0123456789abcdef/k" + "ey"
-        blocked = all(g.decide(c)[0] != "allow" for c in ("ca" + "t " + token, "bas" + "e64 " + key))
+        # A fixed policy (built-in defaults; the path does not exist) so the host's installed policy cannot change the result.
+        compiled = g.Compiled(g.load_policy(Path(tempfile.gettempdir()) / "gq-browser-no-such-policy.json"))
+        blocked = all(g.decide(c, compiled)[0] == "block" for c in ("ca" + "t " + token, "bas" + "e64 " + key))
         doc = (CLIENT.parents[2] / "docs" / "gq-browser.md").read_text()
         if blocked:
             self.assertIn("command guard refuses", doc)
