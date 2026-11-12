@@ -53,11 +53,13 @@ CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-acti
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@(?=[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})*\.[A-Za-z]{2,24}\b)")
 _HOME = re.compile(r"/(?:Users|home)/[^/\s\"'<>]{1,128}")
 _IPV4 = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
-# NUL and other C0 controls except tab and newline, DEL, the Arabic letter mark, zero-width and directional marks,
-# bidi embedding/override/isolate controls, word joiner and invisible operators, and the BOM. They are removed BEFORE
-# redaction, so a token split by an invisible character (ghp_ + U+200B + body) is rejoined and still redacted
-# (adversarial delta finding 12).
-_CONTROL = re.compile("[\\x00-\\x08\\x0b-\\x1f\\x7f\\u061c\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2069\\ufeff]")
+# NUL and other C0 controls except tab and newline, DEL, soft hyphen, combining grapheme joiner, the Arabic letter
+# mark, zero-width and directional marks, bidi embedding/override/isolate controls, word joiner and invisible
+# operators, variation selectors, the BOM and tag characters. They are removed between two redaction passes, so a
+# token split by an invisible character (ghp_ + U+200B + body) is rejoined and still redacted (adversarial delta
+# finding 12).
+_CONTROL = re.compile("[\\x00-\\x08\\x0b-\\x1f\\x7f\\u00ad\\u034f\\u061c\\u200b-\\u200f\\u202a-\\u202e"
+                      "\\u2060-\\u2069\\ufe00-\\ufe0f\\ufeff\\U000e0000-\\U000e007f]")
 SECTION_CAP = 500  # entries rendered per evidence section; the rest are counted in an "N more" line
 # Compared case-folded against the resolved path relative to home (APFS is case-insensitive by default).
 _SYNC_PREFIXES = ("dropbox", "onedrive", "google drive", "box sync")
@@ -80,9 +82,12 @@ class _Scrubber:
     def text(self, value) -> str:
         if not isinstance(value, str):
             value = json.dumps(value, default=str, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
-        value = _CONTROL.sub("", value[:PRE_TRIM])
+        value = value[:PRE_TRIM]
         before = value.count("[REDACTED:")
-        value = self.redact(value)
+        # Redact, remove controls, redact again: the first pass catches a token whose word boundary is a control
+        # character (word + CR + token), the second one a token that an invisible character split and the removal
+        # rejoined (acceptance r6 re-ack and adversarial delta finding 12). redact() skips existing placeholders.
+        value = self.redact(_CONTROL.sub("", self.redact(value)))
         self.redactions += max(0, value.count("[REDACTED:") - before)
         value = _EMAIL.sub("[email]@", value)
         value = _HOME.sub("~", value)

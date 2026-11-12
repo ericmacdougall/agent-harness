@@ -212,15 +212,19 @@ class Redaction(Base):
     def test_invisible_split_token_redacted(self):
         """Adversarial delta finding 12: controls are removed before redaction, so a split token is still caught."""
         body = GITHUB[4:]
-        notes = ['split ghp_​' + body, 'split ghp_؜' + body, 'split ghp_⁦' + body,
-                 'split ghp_\x07' + body]
+        splitters = ('​', '؜', '⁦', '\x07', '­', '͏', '️', '\U000e0041')
+        notes = ['split ghp_' + ch + body for ch in splitters]
+        # Acceptance r6 re-ack: a control that is the token's only word boundary must not be removed first.
+        joiners = ('\r', '\x0b', '\x0c', '\x1b', '​')
+        notes += ['progress done' + ch + GITHUB2 for ch in joiners]
         jl(self.w / 'agent-owner1.jsonl', [{'at': iso(NOW - 300 + i), 'event': 'status', 'note': n}
                                            for i, n in enumerate(notes)])
         raw = self.html(self.export())
-        for seg in segments(GITHUB, 4):
-            self.assertNotIn(seg, raw)
-        for ch in ('​', '؜', '⁦', '\x07'):
-            self.assertNotIn(ch, raw)
+        for secret in (GITHUB, GITHUB2):
+            for seg in segments(secret, 4):
+                self.assertNotIn(seg, raw, repr(seg))
+        for ch in set(splitters + joiners):
+            self.assertNotIn(ch, raw, repr(ch))
 
     def test_straddling_secrets_redacted(self):
         # straddles status_report's 240-character note cut, leaving 16 body characters (too few for the pattern)
