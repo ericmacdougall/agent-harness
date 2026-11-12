@@ -1391,7 +1391,7 @@ def _config_refusal(listing, allow_worktree_config=False, allow_partial_clone=Fa
         if section not in CLONE_CONFIG_SECTIONS:
             return 'the repository config has a [%s] section' % section[:20]
         if not allow_partial_clone and ((section == 'remote' and leaf == 'partialclonefilter')
-                                        or (section == 'remote' and leaf == 'promisor' and (not has_value or value.strip().lower() in _TRUE_WORDS))):
+                                        or (section == 'remote' and leaf == 'promisor' and (not has_value or value.strip().lower() not in _FALSE_WORDS))):
             return 'the repository is a partial clone (a promisor remote), which this check cannot judge without fetching'
         if key == 'core.logallrefupdates' and has_value and value.strip().lower() not in _TRUE_WORDS + ('always',):
             return 'reflogs are switched off in the repository config'  # git also reads 00, 0k and an empty value as false

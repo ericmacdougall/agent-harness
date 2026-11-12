@@ -87,6 +87,42 @@ class Rollback(T.Base):
         self.assertIsNone(again["removed"])
         self.assertEqual(Path(result["quarantine"], "moved-in", "precious").read_text(), "x")
 
+    def test_a_directory_moved_in_while_verification_runs_is_kept(self):  # Opus spec review, window between status and the end
+        path = self.clone()
+        old = os.path.join(self.tmp, "olddir")
+        os.makedirs(old)
+        Path(old, "precious").write_text("x")
+
+        def move_in(event, **kw):
+            if event == "after_status":
+                os.rename(old, os.path.join(path, "moved-in"))
+        with mock.patch.object(cr, "HOOK", move_in):
+            result = self.remove(path)
+        self.assertIsNone(result["removed"])
+        self.assertEqual(Path(result["quarantine"], "moved-in", "precious").read_text(), "x")
+
+    def test_the_walk_cannot_be_called_without_a_verified_directory_set(self):
+        fd = os.open(self.tmp, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, fd)
+        with self.assertRaises(TypeError):
+            cr.walk_delete(fd, 2 ** 62)
+
+    def test_any_promisor_value_git_reads_as_true_refuses_in_the_hook_form(self):  # Sonnet review M-a
+        path = self.clone(partial=True)
+        git(path, "config", "--unset", "remote.origin.partialclonefilter")
+        git(path, "config", "remote.origin.promisor", "2")
+        with mock.patch.object(cg, "REMOTE_LS", side_effect=AssertionError("the network must not be reached")):
+            self.assertIn("partial clone", cg.reproducible_clone_refusal(path))
+
+    def test_a_linked_worktree_of_a_partial_clone_is_refused_by_the_reclaim_route(self):  # D4 behaviour change, accepted by main
+        primary = self.clone(partial=True)
+        linked = os.path.join(self.tmp, "linked-wt")
+        git(primary, "worktree", "add", "-q", "--detach", linked)
+        with mock.patch.object(cg, "REMOTE_LS", side_effect=AssertionError("the network must not be reached")):
+            reason = cg.linked_worktree_remove_refusal(linked, self.tmp, remote_ls=lambda *a, **k: {})
+        self.assertIsNotNone(reason)
+        self.assertIn("partial clone", reason)
+
     def test_a_file_moved_into_the_clone_after_verification_is_kept(self):  # real filesystem, no patched stat
         path = self.clone()
         stray = os.path.join(self.tmp, "stray.txt")

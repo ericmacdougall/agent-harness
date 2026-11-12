@@ -519,6 +519,10 @@ def verify_clone(path, session, home, authenticated=False, cutoff_ns=None):
         started = time.monotonic()
         result['identity'] = ident
         result['cutoff_ns'] = cutoff_ns if cutoff_ns is not None else time.time_ns()
+        # The verified directory set is taken NOW, right after the cutoff and before git status and the long scans: a directory
+        # that appears (or is moved in whole, keeping its old file ctimes) during the minutes of verification is then outside
+        # the set and kept whole. Only directories created while this one walk runs can still join it.
+        verified_dirs = dir_inodes(path)
         _structure_checks(path)
         partial = _config_checks(path)
         result['partial_clone'] = partial
@@ -551,6 +555,7 @@ def verify_clone(path, session, home, authenticated=False, cutoff_ns=None):
                     or run_git(path, ['ls-files', '--error-unmatch', '--', source], 10.0, check=False)[0] != 0:
                 refuse('an ignored build directory is ignored only by a local exclude, not by a tracked .gitignore')
             ignored_dirs.append(name)
+        _hook('after_status', path=path)
         snap = snapshot(path)
         if snap['stash']:
             refuse('it has a stash')
@@ -600,7 +605,7 @@ def verify_clone(path, session, home, authenticated=False, cutoff_ns=None):
         result.update(snapshot=snap, snapshot_sha256=snapshot_digest(snap), urls=urls_redacted, proof=known_proof,
                       ignored_dirs=ignored_dirs, entries=sorted(os.listdir(path)), size_estimate=_tree_size(path),
                       git_version='%d.%d' % git_version(), removable=True, seconds=round(time.monotonic() - started, 1),
-                      dirs=dir_inodes(path))
+                      dirs=verified_dirs)
         if check_target(path, session, home) != ident:
             refuse('the directory changed identity during verification')
     except CloneError as error:
@@ -643,7 +648,7 @@ def _fd_ident(fd):
     return info.st_dev, info.st_ino
 
 
-def walk_delete(root_fd, cutoff_ns, exempt=None, dev=None, allowed_dirs=None):
+def walk_delete(root_fd, cutoff_ns, allowed_dirs, exempt=None, dev=None):
     """Delete the contents of the directory `root_fd` (not the directory itself) without following a symlink, crossing a
     device or deleting anything whose ctime, judged at its first lstat, is newer than cutoff_ns. Holds one descriptor at a
     time below the root (each ascent reopens the parent through `..` and compares its identity), so a 300-deep tree works
@@ -683,7 +688,7 @@ def walk_delete(root_fd, cutoff_ns, exempt=None, dev=None, allowed_dirs=None):
                 # A directory is judged by membership in the verified set, never by a timestamp: its ctime moves when a
                 # child is removed (also by an interrupted earlier run) and a directory moved in whole keeps its old birth
                 # time and its files' old ctimes. A directory that is not in the set is kept whole.
-                if allowed_dirs is not None and (info.st_dev, info.st_ino) not in allowed_dirs:
+                if (info.st_dev, info.st_ino) not in allowed_dirs:
                     stats['left'].append('%s (not part of the verified tree)' % rel)
                     frame['kept'] = True
                     continue
@@ -908,7 +913,7 @@ def _finish(home, session, agent, audit_id, quarantine, intent, ident, marker_in
         if _fd_ident(qfd) != (ident['dev'], ident['ino']):
             raise CloneError('unknown', 'the quarantine identity changed before the walk')
         fcntl.flock(qfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        stats = walk_delete(qfd, intent['cutoff_ns'], exempt={MARKER_NAME: marker_ino}, dev=ident['dev'], allowed_dirs=allowed_dirs)
+        stats = walk_delete(qfd, intent['cutoff_ns'], allowed_dirs, exempt={MARKER_NAME: marker_ino}, dev=ident['dev'])
         result['left'] = stats['left']
         if not stats['left']:
             try:

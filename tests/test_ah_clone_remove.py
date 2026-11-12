@@ -408,6 +408,7 @@ class Walk(Base):
     def run_walk(self, root, cutoff=None, **kw):
         fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
         try:
+            kw.setdefault("allowed_dirs", cr.dir_inodes(root))
             return cr.walk_delete(fd, cutoff if cutoff is not None else 2 ** 62, **kw)
         finally:
             os.close(fd)
