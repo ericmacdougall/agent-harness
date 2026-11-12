@@ -3070,6 +3070,19 @@ def build_parser():
                          "scrubbed environment (branch refs cannot be supplied by the caller)")
     wp.add_argument("--session")
     wp.add_argument("--agent", help="calling agent id for the audit row")
+    ip = sub.add_parser("install-files", help="install MERGED listed hook files on a remote host (audited; see ah_install.py; "
+                        "the bytes come only from a commit on the canonical main; main only)")
+    ip.add_argument("--host", required=True, help="t2-dev or ah-mac-mini")
+    ip.add_argument("--from-ref", dest="from_ref", help="a full 40-hex commit sha on the canonical main")
+    ip.add_argument("--file", dest="files", action="append", help="a bare hook file name (repeatable)")
+    ip.add_argument("--ticket", help="GoodQA project#N (required for a real run, a resume and a rollback)")
+    ip.add_argument("--dry-run", dest="dry_run", action="store_true", help="print the plan, change nothing on the host")
+    ip.add_argument("--resume", metavar="RUN_ID", help="finish an interrupted run with its original self-test baseline")
+    ip.add_argument("--rollback", metavar="RUN_ID", help="undo a run from its backups")
+    ip.add_argument("--force-file", dest="force_files", action="append", help="rollback only: restore this file even if a later run changed it")
+    ip.add_argument("--allow-older", dest="allow_older", action="store_true",
+                    help="install a ref even when a newer merged version of a file exists on main (a downgrade; audited)")
+    ip.add_argument("--agent", help="calling agent id for the audit row")
     _no_abbrev(p)
     return p
 
@@ -3222,6 +3235,23 @@ def run(args, home: Path) -> dict:
                                       args.session or env_session() or "", args.agent or os.environ.get("AH_AGENT_ID", ""),
                                       home)
         except ah_worktree.WorktreeError as e:
+            raise AhError(e.code, str(e), e.exit_code)
+    if cmd == "install-files":
+        import ah_install
+        session = env_session() or ""
+        agent = args.agent or os.environ.get("AH_AGENT_ID", "")
+        try:
+            ah_install.check_inputs(args.host, args.from_ref, args.files, args.ticket, args.dry_run, args.resume, args.rollback,
+                                    tuple(args.force_files or ()), args.allow_older)
+            if args.rollback:
+                return ah_install.rollback(args.rollback, args.ticket, tuple(args.force_files or ()), home, session, agent)
+            if args.resume:
+                return ah_install.resume(args.resume, args.ticket, home, session, agent)
+            return ah_install.install_files(args.host, args.from_ref, args.files, args.ticket, args.dry_run, home, session, agent,
+                                            allow_older=args.allow_older)
+        except ah_install.InstallError as e:
+            if e.data:  # a definite non-success result (rolled_back, unknown, refused after the start row): the full JSON, exit code kept
+                print(json.dumps(e.data, indent=2, default=str))
             raise AhError(e.code, str(e), e.exit_code)
     raise AhError("unknown_command", cmd)
 
