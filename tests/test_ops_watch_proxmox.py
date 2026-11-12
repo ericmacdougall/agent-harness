@@ -395,6 +395,16 @@ class RedTeamRound2Tests(Base):
         self.assertEqual(got["disk:volume:t2-proxmox:/var/lib/vz"]["severity"], "high")
         self.assertNotIn("disk:unknown:t2-proxmox:/var/lib/vz", got)
 
+    def test_sample_with_good_time_but_bad_values_is_reset_not_stuck(self):
+        # delta review d2: a row like [t, "x", {}] must not keep the pool UNKNOWN until it ages out (48 h)
+        state = {"proxmox_pools": {"t2-proxmox:/var/lib/vz": {"first_try": NOW - 60,
+                                                              "samples": [[NOW - 86400, "x", {}]]}}}
+        got = self.run_check((0, probe()), state=state)[0]
+        self.assertIn("disk:unknown:t2-proxmox:/var/lib/vz", got)
+        got = self.run_check((0, probe()), state=state, now=NOW + 60)[0]
+        self.assertNotIn("disk:unknown:t2-proxmox:/var/lib/vz", got)
+        self.assertEqual(got["disk:volume:t2-proxmox:/var/lib/vz"]["severity"], "high")
+
     def test_corrupt_saved_record_restarts(self):
         state = {"proxmox_pools": {"t2-proxmox:/var/lib/vz": "junk"}}
         got = self.run_check((0, probe()), state=state)[0]

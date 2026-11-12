@@ -1460,6 +1460,13 @@ def pool_baseline(samples: list, now: float):
     return min(ok, key=lambda s: abs(now - s[0] - 24 * 3600)) if ok else None
 
 
+def _pool_sample_ok(s) -> bool:
+    """A stored sample is [time, used_bytes, {vm id: bytes}] as _pool_alerts writes it."""
+    num = (int, float)
+    return (isinstance(s, (list, tuple)) and len(s) == 3 and type(s[0]) in num and type(s[1]) in num
+            and isinstance(s[2], dict) and all(type(v) in num for v in s[2].values()))
+
+
 def check_proxmox_pool(cfg, state, runner, now):
     out = []
     seen = state.setdefault("proxmox_pools", {})
@@ -1504,8 +1511,7 @@ def check_proxmox_pool(cfg, state, runner, now):
         except Exception:  # undecodable output, a corrupt sample, anything else: UNKNOWN, never a generic check error
             del out[mark:]
             why = "probe or parse error"
-            if not isinstance(rec.get("samples"), list) or not all(
-                    isinstance(s, (list, tuple)) and s and isinstance(s[0], (int, float)) for s in rec["samples"]):
+            if not isinstance(rec.get("samples"), list) or not all(_pool_sample_ok(s) for s in rec["samples"]):
                 rec["samples"] = []
         prior = rec.get("alerts") if isinstance(rec.get("alerts"), list) else []
         out.extend(a for a in prior if isinstance(a, dict) and a.get("check") == "proxmox_pool")
