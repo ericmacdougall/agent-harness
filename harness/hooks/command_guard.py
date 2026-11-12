@@ -4533,7 +4533,7 @@ class Analyzer:
 
     @staticmethod
     def _count_only(args):
-        return bool(_flag_letters(args) & set('cqlL') or _longs(args) & {'--count', '--quiet', '--silent', '--files-with-matches', '--files-without-match'})
+        return bool(_flag_letters(args) & set('cqlL') or _longs(args) & {'--count', '--quiet', '--silent', '--files-with-matches', '--files-without-match', '--files'})
 
     def read_creds(self, name, args, pl, idx):
         ctx = self.ctx
@@ -4566,7 +4566,8 @@ class Analyzer:
         if name in EXFIL_CMDS:
             words = [w for w in args]
         recursive = name in GREP_CMDS and (_flag_letters(args) & set('rR') or name in ('rg', 'ag', 'ack') or '--recursive' in _longs(args))
-        if recursive and not words and idx == 0 and self.under_cred_parent(ctx.cwd):
+        reads_stdin = idx > 0 and name in ('rg', 'ag', 'ack')  # a piped rg reads stdin; GNU grep -r with no operand still walks the directory
+        if recursive and not words and not reads_stdin and self.under_cred_parent(ctx.cwd, below=True):
             # a recursive search with no path operand searches the working directory: `cd ~/.config/goodqa && rg .`, or any
             # search from the home directory, which contains it
             ctx.secret_seen += 1
