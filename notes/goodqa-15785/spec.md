@@ -85,9 +85,11 @@ Domain-gate: staging-exists waived (a local guard rule; the harness batch instal
 
 ## Reviews
 
-Spec core sha256: `0f968b46fcbf3b6fc5f8c2912f76a2e2a5abf557da85d4f0349b6e37acc4cdec`
+Spec core sha256: `abc6eaee443198e2f55a06da9cec48905f416066555bf9231755210ebda6b0ac`
 
 | Role | Verdict | Reviewer | Kind | Source | Bound to |
 |---|---|---|---|---|---|
+| adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | stale |
+| acceptance | ACCEPT | a5d878417503c1093 (red-team) | agent | WAL-verified red-team agent | stale |
 | adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | current |
 | acceptance | ACCEPT | a5d878417503c1093 (red-team) | agent | WAL-verified red-team agent | current |
