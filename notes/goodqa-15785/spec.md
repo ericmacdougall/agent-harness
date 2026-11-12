@@ -43,6 +43,7 @@ Checkpoint: not required (under 10 min and 4 GB)
 
 - A program reads the token by a path the text rule cannot see (a script, a variable in the path): stated limit, the guard sees command text only; the sanctioned reader is the in-process client.
 - Stated limits of a text guard, the same as for the existing credential files: `cp -r`, `cp -R` and `ditto` of either directory to a readable place and a later read of the copy in another command (a copy is not a print), names fed through a pipe (`find DIR | cpio -o`, `find DIR -type f | xargs cat`: the pipeline form of a find -exec reader, which is refused), a script walking the directory (`python3 -c` with `os.walk`), `cp` of the file to a readable name and a later `cat` of the copy in another command, `export TOK=$(cat F)` and a later `echo $TOK`, an archive of the directory piped to a reader, and a glob inside a key directory whose 16-hex name the agent already knows (`cat .../0123456789abcdef/*`). `ls ~/.agent-harness/gq-browser/*` stays allowed.
+- The implied-target gap (a recursive search with no path operand) existed for every credential directory, not only these two; the new rule judges the working directory against the two GoodQA parent directories only, and the other credential directories (`~/.ssh`, `~/.aws`) keep their current behaviour (a separate ticket if wanted).
 - A false refusal of a legitimate command naming the file: mitigation, the regexes anchor the exact file names and the neighbour cases are pinned.
 
 ## Domain checklist
