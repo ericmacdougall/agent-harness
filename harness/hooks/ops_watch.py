@@ -2019,9 +2019,11 @@ def forward_foreign(cfg: dict, home: Path, state: dict, ring: Path, now: float) 
         for e in rows:
             if (e.get("seq") or 0) <= seen or ring_host(e) != host or e.get("source") == SOURCE:
                 continue
-            detail = e.get("detail") or {}
+            detail = e.get("detail") if isinstance(e.get("detail"), dict) else {}  # emit() lets any JSON through as detail
             if detail.get("updated") or detail.get("reasserted"):
                 continue
+            if not isinstance(e.get("key"), str) or not isinstance(e.get("source"), str):
+                continue  # one malformed foreign row must never stop the alert path
             ident = f"{e.get('source')}/{e.get('key')}"
             if e.get("event") == "raise" and e.get("severity") == "critical":
                 active[ident] = e.get("seq") or 0
@@ -2164,7 +2166,7 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
     persist(events)  # durable before any slow sink: a crash or timeout below cannot re-raise these
     foreign = forward_foreign(cfg, home, state, ring, now)
     if foreign:
-        queue_events(cfg, state, [dict(e, detail=e.get("detail") or {}) for e in foreign], now)
+        queue_events(cfg, state, [dict(e, detail=e["detail"] if isinstance(e.get("detail"), dict) else {}) for e in foreign], now)
         try:
             save_state(home, state)  # queues and the forwarded seq in one write: idempotent across a restart
         except (OSError, ValueError) as exc:

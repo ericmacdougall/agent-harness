@@ -141,6 +141,19 @@ class Forwarding(Base):
         self.assertEqual(self.delivered("`fabric:second`"), 1)
         self.assertEqual(self.delivered("CLEAR"), 1)
 
+    def test_a_foreign_row_with_a_malformed_detail_does_not_stop_the_alert_path(self):
+        self.run_once()
+        for index, detail in enumerate(("oops", ["a"], 7)):
+            self.emit(key=f"fabric:odd{index}", detail=detail)
+        self.emit()  # a well formed critical after the odd rows
+        self.run_once()  # four mails queued, three sent per run by design: rc may be 2 here
+        self.assertEqual(self.delivered(f"`{KEY}`"), 1)
+        for index in range(3):
+            self.assertEqual(self.delivered(f"`fabric:odd{index}`"), 1)  # forwarded with an empty detail, not dropped
+        self.assertEqual(self.run_once(), 0)  # the fourth mail goes out and nothing is stuck
+        self.assertEqual(self.delivered(f"`{KEY}`"), 1)  # and the seq advanced past them
+        self.assertEqual(len(self.dead), 4)
+
     def test_no_deadman_configured_still_feeds_the_digest(self):
         self.cfg["sinks"] = dict(self.cfg["sinks"], deadman=[])
         self.run_once()

@@ -59,6 +59,8 @@ Checkpoint: not required (under 10 min and 4 GB)
 - A noisy foreign critical flapping: mitigation, one mail per key per 6 hours and the digest's own per-host interval.
 - A foreign source that already delivers its own critical alerts now also appears in the digest: accepted; the ring is the one alert channel and the digest is its record.
 - The state slot grows: mitigation, forwarded-raised keys are capped at 200 in a 512 KiB slot.
+- A malformed foreign row (a non-object detail, a non-string key or source) is skipped or read as an empty detail; it never stops the alert path and the forwarded seq still advances (found by review H1; tested with string, list and number details).
+- Stated limits (review L1 to L4, M1, M2, tracked in the follow-up ticket): a repeated critical raise without a refresh flag is forwarded again (the digest keeps one entry per key and the deadman limit is one mail per key per 6 hours); a recreated ring that grows past the stored sequence before the next run (within one 2 minute pass) loses its early rows; the 200-key bound forgets the oldest standing key; a foreign writer using the `ops-watch` source label is skipped (the ring is unauthenticated local state); the queued copy drops `source`, so a foreign key with the same name as an ops-watch key shares its digest entry and mail throttle; a foreign source must stamp the configured host label (the short hostname, `mac` on the Mac) or its rows are not forwarded.
 - A raise that falls out of the 1024-slot ring while standing (N3 of the Fabric review) is not re-forwarded: stated limit, tracked separately.
 
 ## Domain checklist

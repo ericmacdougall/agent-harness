@@ -14,7 +14,7 @@ TARGET = "ops_watch.py"
 
 MUTANTS = {
     "forwarding removed": ("    foreign = forward_foreign(cfg, home, state, ring, now)", "    foreign = []"),
-    "deadman not fed": ("        queue_events(cfg, state, [dict(e, detail=e.get(\"detail\") or {}) for e in foreign], now)",
+    "deadman not fed": ("        queue_events(cfg, state, [dict(e, detail=e[\"detail\"] if isinstance(e.get(\"detail\"), dict) else {}) for e in foreign], now)",
                         "        state[\"pending_comment\"] = ((state.get(\"pending_comment\") or []) + [compact(e) for e in foreign])[-500:]"),
     "every severity forwarded": ("            if e.get(\"event\") == \"raise\" and e.get(\"severity\") == \"critical\":\n                active[ident]",
                                  "            if e.get(\"event\") == \"raise\":\n                active[ident]"),
@@ -29,6 +29,8 @@ MUTANTS = {
                                       " or ring_host(e) != host:\n                continue"),
     "ring reset ignored": ("    if not isinstance(seen, int) or top < seen:  # first run or a recreated ring",
                            "    if not isinstance(seen, int):  # first run or a recreated ring"),
+    "non-dict detail trusted": ('            detail = e.get("detail") if isinstance(e.get("detail"), dict) else {}  # emit() lets any JSON through as detail',
+                                '            detail = e.get("detail") or {}'),
     "reset drops the lost clear": ("            elif e.get(\"event\") == \"clear\" and f\"{src}/{key}\" in before:", "            elif False:"),
 }
 
