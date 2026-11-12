@@ -16,30 +16,65 @@ SESSION, ah, cr, git, cg = T.SESSION, T.ah, T.cr, T.git, T.cg
 
 
 class Identity(T.Base):
-    def cli(self, env, parent_session, trusted, *extra):
+    def cli(self, env, trusted, *extra):
         out = io.StringIO()
         with mock.patch.dict(os.environ, env), redirect_stdout(out), \
-                mock.patch.object(cr, "parent_session_env", lambda pid: parent_session), \
                 mock.patch.object(cr, "trusted_home", lambda: trusted or self.home):
             code = ah.main(["clone-remove", "--reason", "why", "--verify-only", *extra])
         return code, out.getvalue()
 
-    def test_the_cli_takes_the_session_from_the_harness_identity_only(self):  # NEG-15, M2
+    def make_session_dirs(self, session):
+        os.makedirs(os.path.join(self.home, ".claude", "wals", session), exist_ok=True)
+        os.makedirs(os.path.join(self.home, ".agent-harness", "work", session), exist_ok=True)
+
+    def test_the_command_gets_past_the_session_gate_for_a_real_session(self):  # option A, POSITIVE end to end through ah.main
         path = self.clone()
-        os.makedirs(os.path.join(self.home, ".agent-harness", "work", "other", "receipts"))
-        base = {"AH_HOME": self.home, "AH_SESSION": SESSION, "SESSION": SESSION}
-        code, text = self.cli(dict(base, CLAUDE_CODE_SESSION_ID="other"), SESSION, None, "--path", path)
-        self.assertNotEqual(code, 0, text)  # a variable that differs from the calling shell's session
-        code, text = self.cli(dict(base, CLAUDE_CODE_SESSION_ID=SESSION), SESSION, None, "--path", path)
+        self.make_session_dirs(SESSION)
+        code, text = self.cli({"AH_HOME": self.home, "CLAUDE_CODE_SESSION_ID": SESSION}, None, "--path", path)
         self.assertEqual(code, 0, text)
         self.assertTrue(json.loads(text)["removable"])
-        code, text = self.cli(dict(base, CLAUDE_CODE_SESSION_ID=SESSION), None, None, "--path", path)
-        self.assertNotEqual(code, 0, text)  # the calling shell's session cannot be read: refuse
-        code, text = self.cli({"AH_HOME": self.home, "CLAUDE_SESSION_ID": SESSION}, SESSION, None, "--path", path)
-        self.assertNotEqual(code, 0, text)  # the CLAUDE_SESSION_ID fallback is not accepted
-        code, text = self.cli(dict(base, CLAUDE_CODE_SESSION_ID=SESSION), SESSION, "/somewhere/else", "--path", path)
-        self.assertNotEqual(code, 0, text)  # an AH_HOME that is not the account's real home
         self.assertTrue(os.path.isdir(path))
+
+    def test_a_session_without_its_wal_or_work_directory_is_refused(self):  # option A
+        path = self.clone()
+        env = {"AH_HOME": self.home, "CLAUDE_CODE_SESSION_ID": SESSION}
+        code, text = self.cli(env, None, "--path", path)  # the work directory exists, the WAL directory does not
+        self.assertNotEqual(code, 0, text)
+        self.assertIn("WAL directory", text)
+        os.makedirs(os.path.join(self.home, ".claude", "wals", SESSION))
+        shutil_rmtree = __import__("shutil").rmtree
+        shutil_rmtree(os.path.join(self.home, ".agent-harness", "work", SESSION))
+        code, text = self.cli(env, None, "--path", path)
+        self.assertNotEqual(code, 0, text)
+        self.assertIn("work directory", text)
+
+    def test_a_missing_malformed_or_fallback_session_is_refused(self):  # option A
+        path = self.clone()
+        self.make_session_dirs(SESSION)
+        for env in ({"AH_HOME": self.home}, {"AH_HOME": self.home, "CLAUDE_CODE_SESSION_ID": "../x"},
+                    {"AH_HOME": self.home, "CLAUDE_SESSION_ID": SESSION}):
+            with self.subTest(env):
+                clean = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID")}
+                with mock.patch.dict(os.environ, clean, clear=True):
+                    code, text = self.cli(env, None, "--path", path)
+                self.assertNotEqual(code, 0, text)
+
+    def test_an_untrusted_home_is_refused_and_the_forged_session_limit_is_real(self):  # option A, STATED LIMIT
+        path = self.clone()
+        self.make_session_dirs(SESSION)
+        env = {"AH_HOME": self.home, "CLAUDE_CODE_SESSION_ID": SESSION}
+        code, text = self.cli(env, "/somewhere/else", "--path", path)
+        self.assertNotEqual(code, 0, text)
+        # The limit, pinned so nobody mistakes it for a control: a caller who names ANOTHER existing session reaches that
+        # session's clean, fully pushed receipts clone (identity is caller-settable; see the spec).
+        self.make_session_dirs("other-session")
+        other = os.path.join(self.home, ".agent-harness", "work", "other-session", "receipts")
+        os.makedirs(other, exist_ok=True)
+        stolen = os.path.join(other, "wt-a")
+        T.git(self.tmp, "clone", "-q", "file://" + self.origin, stolen)
+        T.git(stolen, "remote", "set-url", "origin", T.URL)
+        code, text = self.cli(dict(env, CLAUDE_CODE_SESSION_ID="other-session"), None, "--path", stolen)
+        self.assertEqual(code, 0, text)
 
 
 class ParentEnvironment(T.Base):
@@ -79,27 +114,26 @@ class ParentEnvironment(T.Base):
         with self.assertRaises(ValueError):
             cr.parse_procargs2(b"\x01\x00")
 
-    def run_ah_under_parent(self, parent_env, inline_value):
-        """A real parent process with parent_env whose command line carries an inline override, running the real `ah`
-        with that override in ITS environment, exactly what `zsh -c 'CLAUDE_CODE_SESSION_ID=x ah ...'` does."""
-        import subprocess
-        ah_py = str(T.HOOKS / "ah.py")
-        code = ("import subprocess, sys, os\n"
-                "env = dict(os.environ, AH_HOME=sys.argv[3])\n"
-                "env[%s] = sys.argv[1]\n"
-                "r = subprocess.run([sys.executable, sys.argv[2], 'clone-remove', '--path', '/x/y', '--reason', 'r', '--verify-only'],"
-                " env=env, capture_output=True, text=True)\n"
-                "print(r.returncode); print(r.stdout + r.stderr)\n") % repr(cr.SESSION_VAR)
-        done = subprocess.run([sys.executable, "-c", code, inline_value, ah_py, self.home, cr.SESSION_VAR + "=" + inline_value],
-                              env=parent_env, capture_output=True, text=True, timeout=120)
-        lines = done.stdout.splitlines()
-        return int(lines[0]), "\n".join(lines[1:])
+    def test_an_empty_argv0_shifts_the_parse_and_fails_safe(self):  # r3 F3, a pinned limit
+        buf = (2).to_bytes(4, "little") + b"/usr/bin/x\x00\x00\x00" + b"\x00" + b"arg1\x00" \
+            + (cr.SESSION_VAR + "=REAL").encode() + b"\x00PATH=/bin\x00\x00"
+        env = cr.parse_procargs2(buf)
+        self.assertNotIn(cr.SESSION_VAR + "=REAL", env)  # the first environment entry is skipped: a lookup misses and refuses
+        self.assertNotIn("arg1", env)  # an argument is never read as an environment entry
 
-    def test_an_inline_override_against_the_real_ah_is_refused_by_the_parsers_own_reading(self):  # r2 F1 end to end
-        code, text = self.run_ah_under_parent(self.clean_env(**{cr.SESSION_VAR: "REAL-SESSION"}), "OTHER-SESSION")
+    def run_real_ah(self, env):
+        import subprocess
+        clean = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "AH_HOME")}
+        clean.update(env)
+        done = subprocess.run([sys.executable, str(T.HOOKS / "ah.py"), "clone-remove", "--path", "/x/y", "--reason", "r",
+                               "--verify-only"], env=clean, capture_output=True, text=True, timeout=120)
+        return done.returncode, done.stdout + done.stderr
+
+    def test_the_real_ah_refuses_a_missing_or_unknown_session_in_a_real_process(self):  # option A, unmocked
+        code, text = self.run_real_ah({})
         self.assertNotEqual(code, 0, text)
         self.assertIn("session", text)
-        code, text = self.run_ah_under_parent(self.clean_env(), "OTHER-SESSION")
+        code, text = self.run_real_ah({"CLAUDE_CODE_SESSION_ID": "no-such-session-" + "x" * 8})
         self.assertNotEqual(code, 0, text)
         self.assertIn("session", text)
 

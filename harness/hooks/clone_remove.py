@@ -127,7 +127,10 @@ SESSION_VAR = 'CLAUDE_CODE_SESSION_ID'
 def parse_procargs2(buf):
     """The ENVIRONMENT strings of a macOS KERN_PROCARGS2 buffer, never the command line: int argc, the executable path,
     NUL padding, argc argument strings, then the environment strings up to the first empty one. Raises ValueError when the
-    buffer is malformed."""
+    buffer is malformed. Known limit (pinned by a test): the padding after the executable path is a run of NULs of unknown
+    length, so an EMPTY argv[0] cannot be told from padding; the parse then shifts by one and skips the first environment
+    entry, which can only make a lookup miss (fail safe), never read an argument as an environment entry. UNUSED by
+    `ah clone-remove` (see require_session); kept tested for the hook-written token follow-up."""
     if len(buf) < 8:
         raise ValueError('short buffer')
     argc = int.from_bytes(buf[:4], 'little')
@@ -180,6 +183,21 @@ def parent_session_env(pid):
     if len(values) != 1 or not values[0]:
         return None
     return values[0]
+
+
+def require_session(session, home):
+    """The session must be a real one on this account: its WAL directory and its work directory both exist. This is NOT
+    proof of identity: the session comes from the command's own CLAUDE_CODE_SESSION_ID, which the caller can set, so a
+    deliberately forged value can name another existing session (the spec states this limit; a hook-written token that `ah`
+    verifies is the follow-up). The process-environment readers above are NOT used for this check: the harness adds the
+    variable to the command after the shell started, so no ancestor process carries it (measured on this Mac); they stay
+    tested for that follow-up."""
+    if not isinstance(session, str) or not SESSION_RE.fullmatch(session):
+        refuse('the calling session is unknown (CLAUDE_CODE_SESSION_ID is missing or malformed)')
+    for label, path in (('WAL', os.path.join(str(home), '.claude', 'wals', session)),
+                        ('work', os.path.join(work_root(home), session))):
+        if os.path.islink(path) or not os.path.isdir(path):
+            refuse('the session has no %s directory, so it is not a session of this account' % label)
 
 
 def trusted_home():
