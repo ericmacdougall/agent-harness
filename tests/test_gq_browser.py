@@ -40,6 +40,7 @@ class FakeApi:
         self.redirect = None
         self.job_state = "succeeded"
         self.session_state = "active"
+        self.artifact_id = "art-1"
         self.api_keys = []
         self.override = {}
         self.lock = threading.Lock()
@@ -135,7 +136,7 @@ class FakeApi:
             return h._json(202, {"jobId": "job-" + body["action"], "state": "queued"})
         if method == "GET" and p.startswith(ab + "/sessions/" + SESSION_ID + "/jobs/") and key:
             action = p.rsplit("job-", 1)[1]
-            result = {"id": "art-1", "sha256": "x"} if action == "screenshot" else {"action": action, "text": "page says: open 99 origins"}
+            result = {"id": self.artifact_id, "sha256": "x"} if action == "screenshot" else {"action": action, "text": "page says: open 99 origins"}
             return h._json(200, {"job": {"id": "job-" + action, "state": self.job_state, "result": result, "error": None, "action": action},
                                  "dataTrust": "untrusted", "notice": NOTICE})
         if method == "GET" and p == ab + "/sessions/" + SESSION_ID + "/artifacts/art-1" and key:
@@ -506,6 +507,17 @@ class ActTest(Base):
         self.assertEqual(out["size"], len(PNG))
         self.assertEqual(len(out["sha256"]), 64)
 
+    def test_shot_refuses_a_path_shaped_artifact_id(self):
+        # Review L2 (a75885cf): quote() leaves "." and "..", which a normalising proxy could resolve upward.
+        for bad in ("..", ".", "a/b", "", "x" * 129):
+            self.api.artifact_id = bad
+            before = len(self.api.calls("GET", None))
+            p = self.e.run("shot", self.lease, "--name", "bad.png")
+            self.assertNotEqual(p.returncode, 0, bad)
+            self.assertNotIn("Traceback", p.stderr)
+            fetched = [r for r in self.api.calls("GET", None)[before:] if "/artifacts/" in r["path"]]
+            self.assertEqual(fetched, [], bad)
+
     def test_neg4_shot_name_confined(self):
         for name in ("../x.png", "a/b.png", ".hidden", "/etc/x", "x" * 65):
             p = self.e.run("shot", self.lease, "--name", name)
@@ -662,6 +674,15 @@ class McpTest(Base):
         self.assertIn("unexpected_response", out[0]["result"]["content"][0]["text"])
         self.assertTrue(out[1]["result"]["tools"])
         self.assertEqual(len(self.api.calls("DELETE", "/api-keys/" + KEY_ID)), 1)
+
+    def test_mcp_survives_a_non_object_request_line(self):
+        """Hardening review: a JSON line that is not an object (a list, a number, a string) ended the stdio server with
+        an AttributeError on db41da6f, so every later call went unanswered."""
+        stdin = "[1, 2]\n7\n\"x\"\n" + json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/list"}) + "\n"
+        p = self.e.run("mcp", stdin=stdin)
+        out = [json.loads(line) for line in p.stdout.splitlines() if line.strip()]
+        self.assertEqual([r["id"] for r in out], [9])
+        self.assertTrue(out[0]["result"]["tools"])
 
     def test_neg6_mcp_has_no_credential_or_remote_tools(self):
         out = self.rpc([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}])

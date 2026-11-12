@@ -36,6 +36,7 @@ KEY_PREFIX = "gq-browser:"
 LEASE_RE = re.compile(r"^[0-9a-f]{16}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$")
 UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+ARTIFACT_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$")  # a server value; never "." or ".."
 MAX_ORIGINS, MAX_HOURS = 16, 24
 PAGE_CHANGING = {"navigate", "click", "type", "tabs_new", "tabs_switch", "tabs_close"}
 ACTIONS = {"navigate": ("url",), "click": ("selector",), "type": ("selector", "text"), "get_text": (), "read_page": (),
@@ -476,7 +477,11 @@ def op_shot(lease, name=None):
     if out.get("state") != "succeeded" or not isinstance(out.get("result"), dict) or not out["result"].get("id"):
         raise ApiError("screenshot", 0, "no_artifact")
     key = read_key(d)
-    data = Api(base, "").call("GET", "/orgs/%s/agent-browsers/sessions/%s/artifacts/%s" % (state["org"], state["sessionId"], out["result"]["id"]), key, raw=True)
+    artifact = out["result"]["id"]
+    if not isinstance(artifact, str) or not ARTIFACT_RE.match(artifact):
+        raise ApiError("screenshot", 0, "unexpected_response")  # a server value must never become a path of its own
+    artifact = urllib.parse.quote(artifact, safe="")
+    data = Api(base, "").call("GET", "/orgs/%s/agent-browsers/sessions/%s/artifacts/%s" % (state["org"], state["sessionId"], artifact), key, raw=True)
     write_new(target, data)
     return {"path": target, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
@@ -621,6 +626,8 @@ def mcp(stdin=sys.stdin, stdout=sys.stdout):
             msg = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(msg, dict):
+            continue  # not a JSON-RPC request object; one bad line must never end the stdio server
         mid, method = msg.get("id"), msg.get("method")
         if mid is None:
             continue
