@@ -238,80 +238,158 @@ def cmd_subagent_stop(payload: dict, now: float | None = None) -> dict:
 
 ACK_KINDS = ("resumed", "reassigned", "closed", "legacy", "superseded", "wontdo")
 PRETOOL_MAX = 100_000  # larger commands are judged by a cheap substring test (round 5, minor 2: no regex backtracking)
-_HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 _WRAPPERS = {"env", "nice", "command", "exec", "time", "nohup", "timeout", "sudo", "stdbuf", "builtin"}
+_WRAPPER_VALUE_OPTIONS = {"-u", "-n", "-s", "-k", "-g", "-C", "-U", "-S", "-p", "-D", "-o", "-e", "-i"}
+_DURATION = re.compile(r"^[0-9]+(?:\.[0-9]+)?[smhd]?$")
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
-_RUNS_TEXT = re.compile(r"(?:^|[\s;&|(])(?:(?:ba|z|da|k)?sh|fish|python[0-9.]*|eval|source|\.)(?:\s|$)")
 _SHELL_C = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")  # a short-option cluster that carries -c
-_BACKTICK = re.compile(r"`([^`]*)`")
 _KIND_WORD = re.compile(r"\b(?:" + "|".join(ACK_KINDS) + r")\b|ack[-_]handoff")
 
 
-def _strip_heredocs(cmd: str) -> str:
-    """Drop heredoc bodies: text fed to cat or a file is data, not a command (round 5, minor 3)."""
-    out, pos, at = [], 0, 0
-    for _ in range(64):
-        m = _HEREDOC.search(cmd, at)
-        if not m:
-            break
-        at = m.end()
-        head = cmd[cmd.rfind("\n", 0, m.start()) + 1:m.start()]
-        if _RUNS_TEXT.search(head):  # `bash <<EOF` runs its body: keep it
-            continue
-        body = cmd.find("\n", m.end())
-        if body < 0:
-            break
-        out.append(cmd[pos:body + 1])
-        end = re.compile(r"^[ \t]*" + re.escape(m.group(2)) + r"[ \t]*$", re.M).search(cmd, body + 1)
-        pos = at = end.end() if end else len(cmd)
-    out.append(cmd[pos:])
-    return "".join(out)
+def _segments(cmd: str, bodies=None):
+    """Simple commands (lenient shell words, shellwords.py): split at unquoted ; & | && || ( ) and newlines, a quoted or
+    escaped `;` is part of a word, a balanced `$(...)` or backtick span is one computed word (its text goes to
+    `bodies`), a here-document is recognised only as the shell would see one and rides on its Command. None when
+    the words cannot be known without running the shell: an unbalanced quote or `<(`, or an oversized line."""
+    from shellwords import split_commands  # noqa: PLC0415
+    return split_commands(cmd, lenient=True, bodies=bodies, limit=PRETOOL_MAX)
 
 
-def _segments(cmd: str):
-    """Shell words split into simple commands at ; & | && || ( ) and newlines. None when it does not tokenize."""
-    import shlex  # noqa: PLC0415
-    lex = shlex.shlex(cmd.replace("\\\n", " ").replace("\n", " ; "), posix=True, punctuation_chars=";&|()<>")
-    lex.whitespace_split = True
-    lex.commenters = ""
-    segs, cur = [], []
-    try:
-        for tok in lex:
-            if tok and set(tok) <= set(";&|()"):
-                segs.append(cur)
-                cur = []
-            else:
-                cur.append(tok)
-    except ValueError:  # an unbalanced quote
-        return None
-    segs.append(cur)
-    return segs
-
-
-def _acks(seg: list, depth: int = 0) -> bool:
-    """Whether one simple command is `[wrappers] [python] .../ah[.py] [global opts] task dispose ... --kind <ack>`."""
+def _skip_wrappers(seg: list) -> int:
+    """Index of the first word after leading VAR=x assignments and wrapper commands (env, nice, timeout, sudo ...) with
+    their options, option values and `timeout`'s duration. `command -v ah` runs nothing: len(seg)."""
     i = 0
-    while i < len(seg) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[i]) or seg[i] in _WRAPPERS
-                            or (i and seg[i - 1] in _WRAPPERS and (seg[i].startswith("-") or seg[i].isdigit()))
-                            or (i and seg[i - 1] in ("-n", "-u") and seg[i].lstrip("-").isdigit())):
-        i += 1
+    while i < len(seg):
+        word = seg[i]
+        if _ASSIGNMENT.match(word):
+            i += 1
+        elif word in _WRAPPERS:
+            i += 1
+            while i < len(seg) and seg[i].startswith("-") and seg[i] != "--":
+                if word in ("command", "builtin") and seg[i] in ("-v", "-V"):
+                    return len(seg)
+                i += 2 if seg[i] in _WRAPPER_VALUE_OPTIONS and i + 1 < len(seg) else 1
+            if word == "timeout" and i < len(seg) and _DURATION.match(seg[i]):
+                i += 1
+            elif word in ("nice", "stdbuf", "time") and i < len(seg) and seg[i].lstrip("-").isdigit():
+                i += 1
+        else:
+            break
+    return i
+
+
+def _after_python(seg: list, i: int) -> int:
+    """Index after `python3 [options]` (-X, -W and -Q take a value) with i at the interpreter word."""
+    i += 1
+    while i < len(seg) and seg[i].startswith("-"):
+        i += 2 if seg[i] in ("-X", "-W", "-Q") else 1
+    return i
+
+
+def _dispose_rest(seg: list):
+    """The words after `ah` when this simple command directly runs `[wrappers] [python] .../ah[.py] ... task dispose`
+    (no shell -c, eval or python -c), else None."""
+    i = _skip_wrappers(seg)
+    if i < len(seg) and os.path.basename(seg[i]).startswith("python"):
+        if "-c" in seg[i + 1:]:
+            return None
+        i = _after_python(seg, i)
+    if i >= len(seg) or os.path.basename(seg[i]) not in ("ah", "ah.py"):
+        return None
+    rest = list(seg[i + 1:])
+    return rest if [t for t in rest if not t.startswith("-")][:2] == ["task", "dispose"] else None
+
+
+def _says(text: str) -> bool:
+    """The conservative text rule: the text mentions dispose and an acknowledging kind (or `--ack-handoff`)."""
+    return "dispose" in text and bool(_KIND_WORD.search(text))
+
+
+# Options of `ah task dispose` whose value cannot change what it acknowledges. A computed value of one of these, when
+# the shell cannot split it (quoted), reaches ah as that option's value; argparse refuses an option-looking value.
+_SAFE_VALUE_OPTIONS = {"--agent", "--ref", "--until", "--reason", "--deployed", "--live-test", "--evidence",
+                       "--session", "--key"}
+
+
+def _computed(word) -> bool:
+    return bool(getattr(word, "computed", False))
+
+
+def _read_rest(rest: list):
+    """(literal positional words, a computed word sits where the subcommand is read, any unsafe computed word, a
+    literal `--kind`/`--ack...` flag) for the words after the program. A computed word is unsafe unless it is the
+    unsplittable value of a _SAFE_VALUE_OPTIONS option (`--until "$(date)"`, `--agent="$A"`): anywhere else it may be
+    `task`, `dispose`, a kind, or (unquoted) several words such as `--kind closed`."""
+    literal, pos_unsafe, unsafe, kind_flag, value_of = [], False, False, False, None
+    for tok in rest:
+        opt, value_of = value_of, None
+        if opt is not None:  # the value of the option before it
+            if _computed(tok) and (opt == "--kind" or getattr(tok, "splits", False)):
+                unsafe = True
+            continue
+        name, eq, _ = tok.partition("=")
+        if name.startswith(("--kind", "--ack")):
+            kind_flag = True
+        if _computed(tok):
+            if eq and name in _SAFE_VALUE_OPTIONS and not getattr(tok, "splits", False):
+                continue  # `--until="$(date)"`: the literal option name, an unsplittable value
+            unsafe = True
+            pos_unsafe = pos_unsafe or len(literal) < 2
+        elif tok.startswith("-"):
+            if not eq and (tok in _SAFE_VALUE_OPTIONS or tok == "--kind"):
+                value_of = tok
+        else:
+            literal.append(tok)
+    return literal, pos_unsafe, unsafe, kind_flag
+
+
+def _computed_acks(seg: list, i: int, ctx: str) -> bool:
+    """The conservative judgement for a simple command whose program (seg[i]) may be ah and whose words hold a computed
+    word in a position that can change what ah receives (red-team r2 F1, r3 F1: one position at a time was not enough).
+    `ctx` is this command's own text plus every `NAME=value` word of the line (`K=closed; $AH ... --kind "$K"`).
+    - A literal ah whose literal words already name another subcommand (`ah ticket comment ... "$(cat f)"`) is not a
+      dispose. Otherwise a literal ah with an unsafe computed word is denied when it may be the dispose.
+    - A computed program (`"$(command -v ah)"`, `$AH`, a glob, a computed python script) is denied when the line can
+      say dispose and an ack (as text, or through an unsafe computed word in the subcommand or kind positions)."""
+    literal, pos_unsafe, unsafe, kind_flag = _read_rest(seg[i + 1:])
+    if not _computed(seg[i]):
+        if not unsafe:
+            return False  # judged on its words by the caller
+        if not pos_unsafe and len(literal) >= 2 and literal[:2] != ["task", "dispose"]:
+            return False
+        return pos_unsafe or "dispose" in ctx
+    acks = bool(_KIND_WORD.search(ctx))
+    return ("dispose" in ctx and (acks or unsafe)) or (pos_unsafe and (acks or kind_flag))
+
+
+def _acks(seg: list, depth: int = 0, ctx: str = "") -> bool:
+    """Whether one simple command is `[wrappers] [python] .../ah[.py] [global opts] task dispose ... --kind <ack>`, or
+    may be one: any word the shell computes is judged by the conservative rules (_computed_acks, _says)."""
+    outer, ctx = ctx, " ".join(seg) + " " + ctx  # outer: the NAME=value words of the enclosing lines
+    i = _skip_wrappers(seg)
+    if i < len(seg) and _computed(seg[i]):
+        return _computed_acks(seg, i, ctx)
     flag = None
     if i < len(seg) and os.path.basename(seg[i]) in _SHELLS:  # `bash -c`, and clusters: `bash -lc`, `sh -ec` (24a786c F2)
         flag = next((j for j in range(i + 1, len(seg)) if _SHELL_C.match(seg[j])), None)
     if i < len(seg) and (seg[i] == "eval" or flag is not None):
-        code = " ".join(seg[flag + 1:] if flag is not None else seg[i + 1:])
-        return acknowledges(code, depth + 1) if depth < 3 else ("dispose" in code and bool(_KIND_WORD.search(code)))
+        words = seg[flag + 1:] if flag is not None else seg[i + 1:]
+        code = " ".join(words)  # judged with the line's NAME=value words: `X='...'; eval "$X"` (r3 F1, r1 F1)
+        return acknowledges(code, depth + 1, outer) if depth < 3 else _says(code + " " + outer)
     if i < len(seg) and os.path.basename(seg[i]).startswith("python"):
         rest = seg[i + 1:]
         if "-c" in rest:  # inline code: judged by what it says
             code = " ".join(rest[rest.index("-c") + 1:])
-            return "dispose" in code and bool(_KIND_WORD.search(code))
-        i += 1
-        while i < len(seg) and seg[i].startswith("-"):
-            i += 1
+            return _says(code) or (any(_computed(w) for w in rest) and _says(ctx))
+        i = _after_python(seg, i)
+        if i < len(seg) and _computed(seg[i]):  # `python3 "$AHPY" task dispose ...`: a computed script
+            return _computed_acks(seg, i, ctx)
     if i >= len(seg) or os.path.basename(seg[i]) not in ("ah", "ah.py"):
-        return False
-    rest = [t for t in seg[i + 1:]]
+        return False  # a literal program that is not ah: computed arguments cannot make it run ah (bodies are judged)
+    if _computed_acks(seg, i, ctx):
+        return True
+    rest = list(seg[i + 1:])
     words = [t for t in rest if not t.startswith("-")]
     if words[:2] != ["task", "dispose"]:
         return False
@@ -326,34 +404,89 @@ def _acks(seg: list, depth: int = 0) -> bool:
     return False
 
 
-def acknowledges(cmd: str, depth: int = 0) -> bool:
+def _runs_text(seg: list):
+    """What this simple command executes from its input: 'shell' (a shell, eval, source or `.`), 'python', 'any' (a
+    computed program: it may be either) or None. A here-document, here-string or pipe feeding it is code, not data."""
+    i = _skip_wrappers(seg)
+    if i >= len(seg):
+        return None
+    if _computed(seg[i]):
+        return "any"
+    name = os.path.basename(seg[i])
+    if name in _SHELLS or seg[i] in ("eval", "source", "."):
+        return "shell"
+    return "python" if name.startswith("python") else None
+
+
+def acknowledges(cmd: str, depth: int = 0, ctx: str = "") -> bool:
     """Whether a Bash command runs an `ah task dispose` that resumes, reassigns, closes, supersedes, wontdoes or legacies
-    an owner."""
+    an owner. `ctx`: the NAME=value words of the lines that enclose this one (a here-document, here-string, `eval` or
+    `-c` body), so `X='...'; bash <<< "$X"` is judged with what X holds (receipt r1 at 37f481d, F1).
+
+    Residual (red-team r3 F3, goodqa#15734): code that builds the words at run time (python `"clo" + "sed"`, printf
+    escapes piped into a shell, a script file, a variable set by an earlier command) is judged only by the text the
+    line holds. The gate is advisory against a sub-agent that hides the call; the dispose guard does not rely on it."""
     if len(cmd) > PRETOOL_MAX:
-        return "dispose" in cmd and bool(_KIND_WORD.search(cmd))
-    text = _strip_heredocs(cmd)
-    if depth < 3 and any(acknowledges(m.group(1), depth + 1) for m in _BACKTICK.finditer(text)):
-        return True  # `ah task dispose ...` in backticks runs too (24a786c F2); judged as its own command line
-    segs = _segments(text)
+        return _says(cmd)
+    bodies = []
+    segs = _segments(cmd, bodies)
     if segs is None:
-        return "dispose" in cmd and bool(_KIND_WORD.search(cmd))
-    return any(_acks(s, depth) for s in segs if s)
+        return _says(cmd)
+    assigned = " ".join([w for s in segs for w in s if _ASSIGNMENT.match(w)] + ([ctx] if ctx else []))
+    if depth < 3 and any(acknowledges(body, depth + 1, assigned) for body in bodies):
+        return True  # `$(ah task dispose ...)` and backticks run too (24a786c F2); judged as their own command line
+    if any(_acks(s, depth, assigned) for s in segs):
+        return True
+    kinds = {kind for kind in (_runs_text(s) for s in segs) if kind}
+    if any(s.piped and _runs_text(s) for s in segs) and _says(cmd):
+        return True  # `printf '...' | python3`, `echo ... | sh`: text piped into a shell or python is code (r3 F2)
+    shell, python = bool(kinds & {"shell", "any"}), bool(kinds & {"python", "any"})
+    for s in segs:  # `bash <<EOF`, `cat <<'EOF' | bash`, `python3 - <<EOF`, `bash <<< '...'`: code on stdin
+        for body in s.heredocs:
+            if (shell or python) and ("$" in body or "`" in body) and _says(cmd + " " + assigned):
+                return True  # a body with an expansion is code computed from text the line holds (r1 F1, as pipes)
+            if shell and (acknowledges(body, depth + 1, assigned) if depth < 3 else _says(body)):
+                return True
+            if python and _says(body):
+                return True  # python code is judged by what it says, as `-c` is
+    return False
+
+
+def _parse_dispose(rest: list):
+    """`ah`'s own parser applied to the words after `ah` (nothing runs): the namespace, or None when ah would refuse
+    them or only print help."""
+    import contextlib  # noqa: PLC0415
+    import io  # noqa: PLC0415
+    try:
+        import ah  # noqa: PLC0415
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return ah.build_parser().parse_args([str(word) for word in rest])
+    except (SystemExit, Exception):  # noqa: BLE001 - a refusal, --help or an import problem mints nothing
+        return None
 
 
 def _stamp_ack(cmd: str, payload: dict) -> None:
-    """One stamp per `--agent ID` of a main command that mentions --ack-handoff (#134 red-team B4)."""
+    """One stamp per `--agent ID` of a main command that really runs `ah task dispose --ack-handoff` (#134 red-team
+    B4). A simple command is stamped only when ah's own parser accepts its words as `task dispose ... --ack-handoff`,
+    and only for the agent that parser reads: echoed, grepped or printed text, `--help`, `command -v`, an `--agent=`
+    inside another option's value, another segment's words and a line the shell alone can read mint nothing. A
+    computed word (`--until "$(date ...)"`) is fine; a computed `--agent` fails the id pattern."""
     if "ack-handoff" not in cmd and "ack_handoff" not in cmd:
         return
     import caller_identity  # noqa: PLC0415
-    import shlex  # noqa: PLC0415
-    try:
-        words = shlex.split(cmd, comments=False)
-    except ValueError:
+    segments = _segments(cmd)
+    if segments is None:
         return
-    for index, word in enumerate(words):
-        agent = words[index + 1] if word == "--agent" and index + 1 < len(words) else (
-            word.split("=", 1)[1] if word.startswith("--agent=") else None)
-        if agent and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", agent):
+    for seg in segments:
+        rest = _dispose_rest(seg)
+        if rest is None:
+            continue
+        args = _parse_dispose(rest)
+        if args is None or getattr(args, "cmd", None) != "task" or getattr(args, "sub", None) != "dispose" \
+                or not getattr(args, "ack_handoff", False):
+            continue
+        agent = getattr(args, "agent", None)
+        if isinstance(agent, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", agent):
             caller_identity.put_stamp("ack-handoff", [agent], session=str(payload.get("session_id") or ""))
 
 

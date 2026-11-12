@@ -40,7 +40,8 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "backup_watch.py", "kimi_review.py", "installer_scan.py",
          "trivy_gate.py",  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
          "mc_chat.py", "mc_inbox.py",  # Mission Control chat store and inbox CLI/hook (goodqa#15585)
-         "mission_coverage.py", "mission_gate.py")  # mission goals: owner, disposition or done evidence (goodqa#15565)
+         "mission_coverage.py", "mission_gate.py",  # mission goals: owner, disposition or done evidence (goodqa#15565)
+         "shellwords.py")  # quote-aware command splitting shared by mission_gate and dropped_gate (goodqa#15684)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
