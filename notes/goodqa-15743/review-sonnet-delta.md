@@ -10,4 +10,6 @@ Pass 5 (spec v4 at 969e431, code 8647cd2): ACCEPT, no new high. Observations kep
 
 Pass 6 (spec v4 at 640d82d, code 0a07513): BLOCK on one leftover contradiction in AC-4 (the old never-caller-settable sentence beside the stated limit). Pass 7 (8ca46b1): ACCEPT after the sentence was deleted and the loss list completed; wording nits (headline breadth, inode reuse in item e, reflog messages in item b, NEG-1 pointer to the limit) applied in the final text.
 
+Pass 8 (spec v4 at the tip, code 56b8dd9): ACCEPT, no new high. Nits filed as a follow-up ticket: the gh path is not shell-quoted, and one RemoteAuth test proves nothing on a machine without gh.
+
 Verdict: ACCEPT

@@ -1,0 +1,7 @@
+Follow-up lows from the sixth spec review pass of goodqa#15743 (ah clone-remove, PR 215), all about the one authenticated ls-remote in clone_remove.py (remote_ls_argv and REMOTE_LS). None blocks the merge; the reviewers accepted the design (helper only with --remote-auth, host-scoped to github.com, other helpers cleared, token never in argv, output or audit, fails closed when gh is missing).
+
+1. The gh path is spliced unquoted into a `!` (shell) helper string; a PATH entry with spaces or shell metacharacters breaks it or injects into it. Use shlex.quote, as command_guard.authenticated_remote_refs does.
+2. gh is resolved with shutil.which over the caller's PATH (absolute entries only), so a gh planted early on PATH receives the credential request. Pin gh to known locations (/opt/homebrew/bin, /usr/local/bin, /usr/bin) for the authenticated call.
+3. ls-remote runs with -C repo, so the clone's local config applies at the moment of the network call (a small window after the config check). With an explicit URL it needs no repository: drop -C repo and run it with cwd=/ like command_guard.authenticated_remote_refs.
+4. With --remote-auth and no gh found, report "gh not found" instead of the generic "the remote did not answer".
+5. Test weakness: test_remote_auth_reaches_the_real_listing_with_the_helper ends in `... or not cr.shutil.which("gh")` and proves nothing on a machine without gh; patch shutil.which as the first RemoteAuth test does.

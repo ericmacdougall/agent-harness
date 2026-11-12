@@ -17,4 +17,6 @@ Round 7 (spec v4 at 969e431 plus one stated-limit sentence in AC-4, code 8647cd2
 
 Rounds 8 to 10 (spec v4 at 640d82d, 8ca46b1 and the final text, code 0a07513): ACCEPT each time. The environment-identity model was withdrawn (probe: no ancestor start environment carries the session variable) and replaced by option A with a STATED LIMIT that the session identity is caller-settable. Findings applied: the old sentence claiming the session is never caller-settable deleted, the loss list (a) to (e) added, D2 and Risks point to the limit and to goodqa#15751, the loss headline reworded to match the named exceptions. The user acceptance of the residual is a pending ask registered by main, not granted.
 
+Round 11 (spec v4 at 5d40d30, code 56b8dd9): ACCEPT. The AC-2 clause for the github.com-scoped gh credential helper (only with --remote-auth, other helpers cleared, no token in argv, output or audit, fails closed without gh) matches the code. Lows filed as a follow-up ticket: quote the gh path in the helper string, pin gh to known install locations, run ls-remote from / with no -C repo, report gh not found.
+
 Verdict: ACCEPT
