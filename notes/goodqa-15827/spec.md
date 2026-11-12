@@ -99,3 +99,12 @@ Domain-gate: self-update-e2e waived (no such behaviour is added or changed; ring
 Domain-gate: transport-proof waived (no such behaviour is added or changed; ring rows move into existing queues)
 Domain-gate: rollback-not-blocked waived (no such behaviour is added or changed; ring rows move into existing queues)
 Domain-gate: staging-exists waived (no such behaviour is added or changed; ring rows move into existing queues)
+
+## Reviews
+
+Spec core sha256: `81f479036fdc08923d609d65e91549d2b703cd9d39f17aea7f4a335d12da81c0`
+
+| Role | Verdict | Reviewer | Kind | Source | Bound to |
+|---|---|---|---|---|---|
+| adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | current |
+| acceptance | ACCEPT | a5d878417503c1093 (red-team) | agent | WAL-verified red-team agent | current |
