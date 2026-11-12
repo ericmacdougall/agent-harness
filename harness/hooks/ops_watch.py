@@ -106,6 +106,8 @@ def defaults(host: str) -> dict:
         "point_events": {"prefixes": ["heavy:", "ah-" + "kill:", "bgwait:"], "ttl_h": 6},  # bgwait: a waiter gave up (goodqa#15565)
         # goodqa#15070: timer jobs on other hosts, read over ssh: [{"host", "unit", "user": bool, "max_age_h"}]
         "remote_units": [],
+        # goodqa#15771: read-only capacity watch of a Proxmox pool: [{"host", "storage", "mount", "watch_vms": [ids]}]
+        "proxmox_pools": [],
         "sinks": {"comment": {"mode": "none"}, "deadman": [], "comment_min_interval_s": 1800},
     }
 
@@ -1352,6 +1354,191 @@ def _read_unit(out, rec, key, host, unit, svc, tmr, now, max_age):
                          {"host": host, "unit": unit, "age_h": round(hours, 1)}))
 
 
+# ---------------------------------------------------------------- 7c. Proxmox storage pool (goodqa#15771)
+# Read-only capacity watch of a dir-type Proxmox pool whose thin guest disks can fill it. One bounded ssh call
+# runs a fixed script (pvesm status, qm list/config, du -sk of the image dirs). The only caller input is a
+# validated host, storage name, mount path and integer VM ids. A failed or unusable read is UNKNOWN, never OK,
+# and nothing the remote side prints is copied into an alert.
+
+POOL_STORAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}")
+POOL_MOUNT = re.compile(r"/[A-Za-z0-9._/-]{1,100}")
+POOL_DISK = re.compile(r"^(?:scsi|virtio|sata|ide|efidisk|tpmstate)\d+:\s*([A-Za-z0-9_-]+):[^,\s]*(?P<rest>.*)$")
+POOL_SIZE = re.compile(r"(?:^|,)size=(\d+(?:\.\d+)?)([KMGT]?)(?:,|$)")
+POOL_UNITS = {"": 1 / GIB, "K": KIB / GIB, "M": KIB ** 2 / GIB, "G": 1.0, "T": 1024.0}
+POOL_WARN_PCT, POOL_HIGH_PCT, POOL_CRIT_PCT, POOL_FLOOR_GIB = 85.0, 92.0, 97.0, 20.0
+POOL_GROWTH_GIB_DAY, POOL_GROWTH_MIN_S, POOL_GROWTH_MAX_S = 10.0, 6 * 3600, 24 * 3600
+POOL_SAMPLE_GAP_S, POOL_SAMPLE_KEEP_S, POOL_SAMPLE_MAX = 1800, 48 * 3600, 120
+POOL_UNKNOWN_HIGH_S = 1800
+
+
+def pool_script(storage: str, mount: str) -> str:
+    return (f"echo '##PVESM'; pvesm status --storage {storage}; echo '##QM'; "
+            "for v in $(qm list | awk 'NR>1{print $1}'); do echo \"##VM $v\"; qm config \"$v\"; done; "
+            f"echo '##DU'; du -sk {mount}/images/*; echo '##END'")
+
+
+def _pool_num(text):
+    try:
+        v = float(text)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v >= 0 else None
+
+
+def parse_pool_status(text: str, storage: str):
+    """(total, used, avail) in bytes from `pvesm status` output, or None for anything unusable."""
+    lines = [l.split() for l in (text or "").splitlines() if l.strip()]
+    if not lines or lines[0][:6] != ["Name", "Type", "Status", "Total", "Used", "Available"]:
+        return None
+    rows = [l for l in lines[1:] if l[0] == storage]
+    if len(rows) != 1 or len(rows[0]) != 7 or rows[0][2] != "active":
+        return None
+    total, used, avail = (_pool_num(x) for x in rows[0][3:6])
+    if None in (total, used, avail) or total <= 0 or used > total or avail > total:
+        return None
+    return total * KIB, used * KIB, avail * KIB
+
+
+def parse_pool_probe(text: str, storage: str):
+    """{status, vms: {id: {sizes: gib|None}}, du: {id: bytes}} or None when the output is unusable or truncated."""
+    sections, cur, vm = {}, None, None
+    for line in (text or "").splitlines():
+        m = re.fullmatch(r"##(PVESM|QM|DU|END)", line)
+        if m:
+            cur, vm = m.group(1), None
+            sections.setdefault(cur, [])
+            continue
+        m = re.fullmatch(r"##VM (\d{1,10})", line)
+        if m and cur == "QM":
+            vm = int(m.group(1))
+            sections.setdefault("VM", {}).setdefault(vm, [])
+            continue
+        if cur == "QM" and vm is not None:
+            sections["VM"][vm].append(line)
+        elif cur in ("PVESM", "DU"):
+            sections[cur].append(line)
+    if "END" not in sections:
+        return None
+    status = parse_pool_status("\n".join(sections.get("PVESM", [])), storage)
+    if status is None:
+        return None
+    vms = {}
+    for vm_id, cfg in sections.get("VM", {}).items():
+        total = 0.0
+        for line in cfg:
+            m = POOL_DISK.match(line.strip())
+            if not m or m.group(1) != storage:
+                continue
+            size = POOL_SIZE.search(m.group("rest"))
+            if not size:
+                total = None
+                break
+            total += float(size.group(1)) * POOL_UNITS[size.group(2)]
+        vms[vm_id] = {"gib": total if cfg else None}  # no config lines at all: unknown, not zero
+    du = {}
+    for line in sections.get("DU", []):
+        m = re.fullmatch(r"(\d+)\s+\S*/images/(\d{1,10})", line.strip())
+        if m:
+            du[int(m.group(2))] = int(m.group(1)) * KIB
+    return {"status": status, "vms": vms, "du": du}
+
+
+def pool_baseline(samples: list, now: float):
+    """The oldest stored sample 6 h to 24 h old, else None."""
+    ok = [s for s in samples if POOL_GROWTH_MIN_S <= now - s[0] <= POOL_GROWTH_MAX_S]
+    return min(ok, key=lambda s: s[0]) if ok else None
+
+
+def check_proxmox_pool(cfg, state, runner, now):
+    out = []
+    seen = state.setdefault("proxmox_pools", {})
+    for entry in cfg.get("proxmox_pools") or []:
+        entry = entry if isinstance(entry, dict) else {}
+        host = str(entry.get("host", ""))
+        storage, mount = str(entry.get("storage", "local")), str(entry.get("mount", "/var/lib/vz"))
+        watch = entry.get("watch_vms", [])
+        base = f"{host[:64]}:{mount[:100]}"
+        if (not REMOTE_HOST.fullmatch(host) or not POOL_STORAGE.fullmatch(storage) or not POOL_MOUNT.fullmatch(mount)
+                or ".." in mount or not isinstance(watch, list)
+                or any(type(v) is not int or not 0 < v < 10 ** 10 for v in watch)):
+            out.append(alert("proxmox_pool", f"disk:config:{base}", "warning",
+                             "proxmox pool entry has an unsafe host, storage, mount or VM id", {"host": host[:64]}))
+            continue
+        rec = seen.setdefault(base, {"first_try": now, "samples": []})
+        try:
+            rc, text = runner(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", host,
+                               pool_script(storage, mount)], 25)
+        except (subprocess.TimeoutExpired, OSError):
+            rc, text, why = 255, "", "unreachable or timed out"
+        else:
+            why = "unreachable or ssh failed" if rc != 0 else "unusable output"
+        parsed = parse_pool_probe(text, storage) if rc == 0 and len(text or "") <= 1048576 else None
+        if parsed is None:
+            out.extend(a for a in rec.get("alerts") or [] if isinstance(a, dict) and a.get("check") == "proxmox_pool")
+            stale = now - rec.get("ok_at", rec["first_try"]) > POOL_UNKNOWN_HIGH_S
+            out.append(alert("proxmox_pool", f"disk:unknown:{base}", "high" if stale else "warning",
+                             f"UNKNOWN: cannot read {host} {storage} pool ({why}); capacity is not being watched",
+                             {"host": host[:64], "reason": why}))
+            continue
+        total, used, avail = parsed["status"]
+        mark = len(out)
+        _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, used, avail, now)
+        rec["ok_at"] = now
+        rec["alerts"] = out[mark:]
+    return out
+
+
+def _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, used, avail, now):
+    pct = 100.0 * used / total
+    free_gib = avail / GIB
+    samples = rec.setdefault("samples", [])
+    samples[:] = [s for s in samples if 0 <= now - s[0] <= POOL_SAMPLE_KEEP_S]  # also drops clock-skewed future rows
+    vm_used = {str(v): parsed["du"].get(v) for v in watch}
+    last = max((s[0] for s in samples), default=None)
+    base_sample = pool_baseline(samples, now)
+    if last is None or now - last >= POOL_SAMPLE_GAP_S:
+        samples.append([now, int(used), {k: v for k, v in vm_used.items() if v is not None}])
+        del samples[:-POOL_SAMPLE_MAX]
+    days = (now - base_sample[0]) / 86400 if base_sample else None
+
+    def per_day(delta):
+        return round(max(delta, 0) / GIB / days, 2) if days else None
+
+    provisioned = [v["gib"] for v in parsed["vms"].values()]
+    unsized = sorted(str(k) for k, v in parsed["vms"].items() if v["gib"] is None)
+    prov_gib = round(sum(g for g in provisioned if g), 2)
+    vms = {}
+    for v in watch:
+        gib = (parsed["vms"].get(v) or {}).get("gib")
+        actual = parsed["du"].get(v)
+        old = (base_sample[2].get(str(v)) if base_sample else None)
+        vms[str(v)] = {"allocated_gib": None if gib is None else round(gib, 2),
+                       "actual_gib": None if actual is None else round(actual / GIB, 2),
+                       "growth_gib_day": per_day(actual - old) if actual is not None and old is not None else None}
+    detail = {"host": host[:64], "storage": storage, "used_pct": round(pct, 1), "free_bytes": int(avail),
+              "total_bytes": int(total), "total_gib": round(total / GIB, 2), "provisioned_gib": prov_gib,
+              "overcommit_ratio": round(prov_gib / (total / GIB), 2), "vms": vms, "unsized_vms": unsized}
+    sev = None
+    if pct >= POOL_CRIT_PCT or free_gib < POOL_FLOOR_GIB:
+        sev = "critical"
+    elif pct >= POOL_HIGH_PCT:
+        sev = "high"
+    elif pct >= POOL_WARN_PCT:
+        sev = "warning"
+    if sev:
+        out.append(alert("proxmox_pool", f"disk:volume:{base}", sev,
+                         f"{host} {storage} pool {pct:.1f}% used, {free_gib:.0f} GiB free, "
+                         f"{detail['overcommit_ratio']}x overcommitted", detail))
+    if base_sample:
+        rate = per_day(used - base_sample[1])
+        if rate is not None and rate > POOL_GROWTH_GIB_DAY:
+            to_full = free_gib / rate
+            out.append(alert("proxmox_pool", f"disk:growth:{base}", "high" if to_full <= 3 else "warning",
+                             f"{host} {storage} pool growing {rate:.0f} GiB/day, full in about {to_full:.1f} days",
+                             {"host": host[:64], "growth_gib_day": rate, "free_gib": round(free_gib, 1),
+                              "days_to_full": round(to_full, 1), "threshold_gib_day": POOL_GROWTH_GIB_DAY}))
+
+
 # ---------------------------------------------------------------- 8. owner liveness
 
 TERMINAL_EVENTS = ("handoff", "result", "done", "delivered")
@@ -1787,6 +1974,7 @@ DEFAULT_CHECKS = {
     "liveness": lambda c, s, r, n: check_liveness(c, s, r, n) if c["liveness"].get("enabled") else [],
     "peers": check_peers,
     "remote_units": check_remote_units,
+    "proxmox_pool": check_proxmox_pool,
     "deploys": lambda c, s, r, n: check_deploys(c, s, r, n) if (c.get("deploys") or {}).get("enabled", True) else [],
     "mission": lambda c, s, r, n: check_mission(c, s, r, n) if (c.get("mission") or {}).get("enabled", True) else [],
 }

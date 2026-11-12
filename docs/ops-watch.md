@@ -103,4 +103,18 @@ systemctl --user disable --now ops-watch.timer                # stop (Linux)
 
 Host and unit names must be plain words, and `max_age_h` must be a finite positive number; any other entry is refused as `:config` and never reaches ssh.
 
+`proxmox_pools` (goodqa#15771) watches the capacity of a dir-type Proxmox storage pool whose thin guest disks can fill it. It is empty by default; enable it per host in `ops-watch.json`:
+
+```json
+{"proxmox_pools": [{"host": "t2-proxmox", "storage": "local", "mount": "/var/lib/vz", "watch_vms": [102, 103]}]}
+```
+
+Each run makes one read-only call: `ssh -o BatchMode=yes -o ConnectTimeout=5 -- HOST SCRIPT` with 25 s in total. The script is fixed text: `pvesm status --storage STORAGE`, `qm list` and `qm config` for every VM, and `du -sk MOUNT/images/*`. Host, storage and mount are checked against plain-word patterns and VM ids must be integers, so a bad entry is refused as `disk:config:...` before ssh. Nothing changes on the hypervisor. Alerts (key suffix `HOST:MOUNT`):
+
+- `disk:volume:` warning at 85% used, high at 92%, critical at 97% or under 20 GiB free. The detail holds `overcommit_ratio` (disk sizes on this storage over pool total), `provisioned_gib`, and for each watched VM `allocated_gib`, `actual_gib` (du of its image dir) and `growth_gib_day`.
+- `disk:growth:` more than 10 GiB/day, measured against the oldest stored sample that is 6 to 24 h old (samples every 30 min, kept 48 h, from good reads only). High when the pool would fill within 3 days at that rate, else warning.
+- `disk:unknown:` UNKNOWN: the host cannot be reached or the output is unusable (missing marker, inactive storage, non-numeric or inconsistent numbers). Warning at first, high after 30 min without a good read. The last good alerts stay active meanwhile, so an outage is never green. Alert text never carries remote output or addresses, only the configured host name.
+
+Tests: `python3 -m unittest tests.test_ops_watch_proxmox`.
+
 Tests: `python3 -m unittest tests.test_ops_watch`.

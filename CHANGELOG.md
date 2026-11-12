@@ -7,6 +7,7 @@ group by pull request.
 ## Unreleased
 
 ### Added
+- ops-watch `proxmox_pools` check (goodqa#15771): read-only capacity alert (85/92/97 percent, 20 GiB floor, growth, overcommit, VM 102/103 growth) for a Proxmox pool; UNKNOWN when it cannot be read. Tests: `python3 -m unittest tests.test_ops_watch_proxmox`.
 - Mission Control (goodqa#15585): a local, read-only, realtime dashboard of the agent fleet, with initiative progress, each owner's last work item, pulses for WAL writes, pushes, releases, deploys and ticket checkpoints, and chat with Claude main or Codex. It is bound to 127.0.0.1 behind a single-use launch link, and it runs as the LaunchAgent `com.agent-harness.mission-control`, installed by `install.py --apply` (`--no-mission-control` opts out). See [docs/mission-control.md](docs/mission-control.md). Tests: `python3 -m unittest tests.test_mission_control tests.test_mission_control_install tests.test_mc_inbox`.
 
 ### Fixed
