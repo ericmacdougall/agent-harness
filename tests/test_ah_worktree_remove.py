@@ -175,7 +175,7 @@ class Verifier(Repo):
         self.assertTrue(cg.remove_worktree(str(self.linked), policy=self.policy)["removed"])
 
     def test_a_process_check_that_cannot_run_fails_closed(self):
-        with mock.patch.object(cg, "busy_processes", return_value=None):
+        with mock.patch.object(cg, "busy_scan", return_value={"busy": [], "unreadable": [], "failed": True}):
             self.refused(self.linked, "could not check for processes")
         self.assertTrue(self.linked.exists())
 

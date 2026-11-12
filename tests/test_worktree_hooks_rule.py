@@ -102,6 +102,36 @@ class Hooks(Repo):
         self.assertIn("GIT_OPTIONAL_LOCKS", cg._clone_env())
         self.assertEqual(cg._clone_env()["GIT_OPTIONAL_LOCKS"], "0")
 
+    # the real t2-dev finding: same-user shells run through sg or sudo cannot be inspected; the refusal must name them
+    def test_the_refusal_for_an_uninspectable_same_user_process_names_its_pid_and_name_and_what_to_do(self):
+        real_isdir = os.path.isdir
+        me = os.getuid()
+
+        def link(path):
+            raise OSError(errno.EACCES, "denied")
+        with mock.patch.object(cg.os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
+                mock.patch.object(cg.os, "listdir", lambda p: ["4242", "4243"] if p == "/proc" else []), \
+                mock.patch.object(cg.os, "readlink", link), \
+                mock.patch.object(cg, "_proc_status", lambda pid: {"name": "bash" if pid == "4242" else "sg", "uid": me}):
+            report = self.verify()
+            scan = cg.busy_scan(str(self.linked))
+        self.assertFalse(report["removable"])
+        self.assertIn("could not check for processes using the worktree", report["reason"])
+        self.assertIn("pid 4242 (bash)", report["reason"])
+        self.assertIn("pid 4243 (sg)", report["reason"])
+        self.assertIn("end", report["reason"])  # tells the operator to let them finish
+        self.assertEqual(sorted(scan["unreadable"]), [(4242, "bash"), (4243, "sg")])
+        self.assertEqual(scan["busy"], [])
+        self.assertFalse(scan["failed"])
+        many = [str(1000 + i) for i in range(12)]
+        with mock.patch.object(cg.os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
+                mock.patch.object(cg.os, "listdir", lambda p: many if p == "/proc" else []), \
+                mock.patch.object(cg.os, "readlink", link), \
+                mock.patch.object(cg, "_proc_status", lambda pid: {"name": "bash", "uid": me}):
+            reason = self.verify()["reason"]
+        self.assertLess(len(reason), 400)  # bounded: only the first few are named
+        self.assertIn("and 9 more", reason)
+
     # ---- NEG-5
     def test_hook_files_of_odd_shapes_are_ignored_and_nothing_runs(self):
         (self.hooks / "pre-rebase").symlink_to(self.hooks / "pre-push")
@@ -282,8 +312,8 @@ class OtherUsersProcesses(Repo):
             self.assertNotIn(shell, names)
         self.assertNotIn("busy_skip_names", cg.DEFAULT_POLICY["reproducible_clone"])
         seen = []
-        real = cg.busy_processes
-        with mock.patch.object(cg, "busy_processes", lambda path, skip=(): seen.append(skip) or real(path, skip)):
+        real = cg.busy_scan
+        with mock.patch.object(cg, "busy_scan", lambda path, skip=(): seen.append(skip) or real(path, skip)):
             cg.verify_worktree(str(self.linked))
         self.assertEqual(tuple(seen[0]), tuple(names))
 

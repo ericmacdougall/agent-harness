@@ -1904,14 +1904,16 @@ def _proc_status(pid):
         return None
 
 
-def busy_processes(path, skip_names=()):
-    """Processes whose working directory is the worktree or inside it: [(pid, command)], or None when that cannot be
-    checked completely (fail closed). A process of the SAME user that cannot be inspected is a None, not a skip, and so
-    is any other error; a process that has exited (ENOENT, ESRCH) is skipped, and so is one that cannot be read because it
-    belongs to ANOTHER user (a Linux host has root daemons whose /proc/PID/cwd a normal user cannot read; goodqa#15739).
-    Limits, stated: other users' processes are invisible without root, and open files other than the working directory
-    are not checked; plain `git worktree remove` also deletes ignored files."""
-    found = []
+def busy_scan(path, skip_names=()):
+    """Scan the processes for one whose working directory is the worktree or inside it. Returns {'busy': [(pid, command)],
+    'unreadable': [(pid, name)], 'failed': bool}: `unreadable` lists processes of THIS user whose cwd link cannot be read
+    and that are not on the service list (a shell run through sg or sudo, a setgid helper), `failed` is set when the scan
+    could not be completed at all (fail closed). A process that has exited (ENOENT, ESRCH) is skipped, and so is one that
+    cannot be read because its REAL uid (from the world-readable /proc/PID/status) is another user's (a Linux host has
+    root daemons whose /proc/PID/cwd a normal user cannot read; goodqa#15739); a same-user unreadable process is skipped
+    only by exact Name in `skip_names`. Limits, stated: other users' processes are invisible without root, and open files
+    other than the working directory are not checked; plain `git worktree remove` also deletes ignored files."""
+    result = {'busy': [], 'unreadable': [], 'failed': False}
     try:
         if os.path.isdir('/proc/self'):
             for entry in os.listdir('/proc'):
@@ -1921,28 +1923,33 @@ def busy_processes(path, skip_names=()):
                     except OSError as error:
                         if error.errno in (errno.ENOENT, errno.ESRCH):
                             continue  # exited while we looked
-                        if error.errno in (errno.EACCES, errno.EPERM):
-                            status = _proc_status(entry)
-                            if status == 'gone':
-                                continue  # exited between the two reads
-                            if status is None:
-                                return None  # an identity we cannot determine is a process we could not see
-                            if status['uid'] != os.getuid():
-                                continue  # the documented limit: other users processes are invisible without root
-                            # A same-user process whose cwd link is unreadable (a daemon that dropped dumpability or lives under
-                            # another security profile: ssh-agent, gpg-agent, tailscaled, systemd, docker on t2-dev) is skipped
-                            # only when its exact /proc name is in the policy list, which names services, never a shell or an
-                            # agent; any other name, a missing name or an empty list keeps the refusal.
-                            if skip_names and status['name'] in skip_names:
-                                continue
-                        return None  # a same-user process we could not read, and any other error
+                        if error.errno not in (errno.EACCES, errno.EPERM):
+                            result['failed'] = True  # any other error: a process we could not see
+                            return result
+                        status = _proc_status(entry)
+                        if status == 'gone':
+                            continue  # exited between the two reads
+                        if status is None:
+                            result['failed'] = True  # an identity we cannot determine is a process we could not see
+                            return result
+                        if status['uid'] != os.getuid():
+                            continue  # the documented limit: other users processes are invisible without root
+                        # A same-user process whose cwd link is unreadable (a daemon that dropped dumpability or lives under
+                        # another security profile: ssh-agent, gpg-agent, tailscaled, systemd, docker on t2-dev) is skipped
+                        # only when its exact /proc name is in the policy list, which names services, never a shell or an
+                        # agent; any other process (a shell run through sg or sudo) is reported, and refuses.
+                        if skip_names and status['name'] in skip_names:
+                            continue
+                        result['unreadable'].append((int(entry), status['name'] or '?'))
+                        continue
                     if cwd == path or cwd.startswith(path + os.sep):
-                        found.append((int(entry), 'pid'))
-            return found
+                        result['busy'].append((int(entry), 'pid'))
+            return result
         done = subprocess.run(['lsof', '-a', '-d', 'cwd', '-F', 'pcn'], capture_output=True, text=True, timeout=20,
                               env={'PATH': '/usr/sbin:/usr/bin:/bin', 'LC_ALL': 'C'}, cwd=os.sep)
         if done.returncode not in (0, 1) or (done.returncode == 1 and (done.stderr or '').strip()):
-            return None  # exit 1 is "nothing found" only when lsof said nothing else
+            result['failed'] = True  # exit 1 is "nothing found" only when lsof said nothing else
+            return result
         pid = command = None
         for line in done.stdout.splitlines():
             if line.startswith('p') and line[1:].isdigit():
@@ -1952,10 +1959,20 @@ def busy_processes(path, skip_names=()):
             elif line.startswith('n') and pid != os.getpid():
                 name = os.path.realpath(line[1:]) if line[1:].startswith('/') else line[1:]
                 if name == path or name.startswith(path + os.sep):
-                    found.append((pid, command))
-        return found
+                    result['busy'].append((pid, command))
+        return result
     except (OSError, subprocess.SubprocessError, ValueError):
+        result['failed'] = True
+        return result
+
+
+def busy_processes(path, skip_names=()):
+    """[(pid, command)] of processes working inside the worktree, or None when the scan cannot be trusted to be complete
+    (it failed, or a process of this user could not be inspected): fail closed. See busy_scan for the details."""
+    scan = busy_scan(path, skip_names)
+    if scan['failed'] or scan['unreadable']:
         return None
+    return scan['busy']
 
 
 def registry_lists(repo, path):
@@ -2006,11 +2023,18 @@ def verify_worktree(path, authenticated=False, policy=None):
         except (ValueError, OSError, subprocess.SubprocessError):
             pass
     if reason is None:
-        busy = busy_processes(path, tuple(delegated_policy(policy)['reproducible_clone'].get('busy_skip_names') or ()))
-        if busy is None:
+        scan = busy_scan(path, tuple(delegated_policy(policy)['reproducible_clone'].get('busy_skip_names') or ()))
+        if scan['busy']:
+            reason = 'a process is using the worktree as its working directory (pid %d, %s)' % scan['busy'][0]
+        elif scan['failed']:
             reason = 'could not check for processes using the worktree'
-        elif busy:
-            reason = 'a process is using the worktree as its working directory (pid %d, %s)' % busy[0]
+        elif scan['unreadable']:
+            named = ', '.join('pid %d (%s)' % (pid, re.sub(r'[^A-Za-z0-9_.()-]', '?', name)[:20])
+                              for pid, name in scan['unreadable'][:3])
+            more = len(scan['unreadable']) - 3
+            reason = ('could not check for processes using the worktree: %d process(es) of this user cannot be inspected '
+                      '(%s%s); let them end, then retry' % (len(scan['unreadable']), named,
+                                                            ' and %d more' % more if more > 0 else ''))
     report['reason'] = reason
     report['removable'] = reason is None and bool(report['repo']) and bool(report['head'])
     return report
