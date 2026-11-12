@@ -17,13 +17,13 @@ An agent shell can no longer print the user's GoodQA user token (`~/.config/good
 
 ## Acceptance criteria
 
-- AC-1: a shell read (cat, head -c, tail, base64, strings, less, xxd, grep, sed, awk) of the user-token path or of a gq-browser `16-hex/key` path, in the forms `~/...`, `$HOME/...`, an absolute path and a quoted path, is blocked with the secret_dump rule. Verify by: `python3 -B -m unittest tests.test_command_guard_gq_credentials`. Source: ticket:GoodQA goodqa#15785
+- AC-1: a shell read (cat, head -c, tail, base64, strings, less, xxd, grep, sed, awk) of the user-token path or of a gq-browser `16-hex/key` path, in the forms `~/...`, `$HOME/...`, an absolute path and a quoted path, is blocked with the secret_dump rule, and so is a glob that expands to either file (`cat ~/.agent-harness/gq-browser/*/key`, `cat ~/.config/goodqa/*`, `cat ~/.config/goodqa/user-tok*`), because both paths are also credential samples. Verify by: `python3 -B -m unittest tests.test_command_guard_gq_credentials`. Source: ticket:GoodQA goodqa#15785
 - AC-2: neighbouring files and non-reading commands stay allowed: `cat ~/.config/goodqa/config.json`, `ls ~/.config/goodqa`, `ls ~/.agent-harness/gq-browser`, the lease file in a key directory, a key directory whose name is not 16 hex characters, a file named `keys`, `echo user-token`, and docs that mention the name. Verify by: the same suite. Source: ticket:GoodQA goodqa#15785
 - AC-3: existing credential behaviour does not change. Verify by: `python3 -B -m unittest tests.test_command_guard tests.test_command_guard_owned_checkout tests.test_command_guard_no_backup`. Source: inferred: from ticket:GoodQA goodqa#15785 -- the change adds two patterns and must not alter other verdicts.
 
 ## Negative cases
 
-- NEG-1 (AC-1): a reader with an option before the path (`head -c 5`, `sed -n 1p`) or a path spelled with `$HOME` or an absolute home still blocks. Source: ticket:GoodQA goodqa#15785
+- NEG-1 (AC-1): a glob that expands to the key (`*/key`, `*/k*`) or to the token (`user-tok*`, `user-to?en`, `goodqa/*`) still blocks, and a reader with an option before the path (`head -c 5`, `sed -n 1p`) or a path spelled with `$HOME` or an absolute home still blocks. Source: ticket:GoodQA goodqa#15785
 - NEG-2 (AC-2): a key directory named with fewer than 16 hex digits, a `keys` file and `user-token.md` are not credential files and stay allowed (no false refusal of ordinary docs and neighbours). Source: inferred: from ticket:GoodQA goodqa#15785 -- they anchor the exact file names.
 - NEG-3 (AC-1): the broken variant with the two patterns removed fails the tests (failing-first control, run against the unchanged code: 26 failures). Source: ticket:GoodQA goodqa#15785
 
@@ -42,6 +42,7 @@ Checkpoint: not required (under 10 min and 4 GB)
 ## Risks
 
 - A program reads the token by a path the text rule cannot see (a script, a variable in the path): stated limit, the guard sees command text only; the sanctioned reader is the in-process client.
+- Stated limits of a text guard, the same as for the existing credential files: `cp` of the file to a readable name and a later `cat` of the copy in another command, `export TOK=$(cat F)` and a later `echo $TOK`, an archive of the directory piped to a reader, and a glob inside a key directory whose 16-hex name the agent already knows (`cat .../0123456789abcdef/*`). `ls ~/.agent-harness/gq-browser/*` stays allowed.
 - A false refusal of a legitimate command naming the file: mitigation, the regexes anchor the exact file names and the neighbour cases are pinned.
 
 ## Domain checklist
