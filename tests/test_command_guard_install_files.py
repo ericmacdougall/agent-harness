@@ -77,7 +77,9 @@ class Forms(unittest.TestCase):
         for text in (GOOD + " > out.json", GOOD + " > out.json 2>&1", GOOD + " 2>&1 | tee out.txt", GOOD + " --allow-older"):
             with self.subTest(text[-30:]):
                 self.assertIsNone(cg.install_files_refusal(text, True), text)
-        for viewer in ("grep -rn install-files harness/", "rg install-files", "git log -S install-files", "sed -n 1,5p harness/hooks/ah_install.py"):
+        for viewer in ("grep -rn install-files harness/", "rg install-files", "git log -S install-files", "sed -n 1,5p harness/hooks/ah_install.py",
+                       'git commit -m "fix install-files guard; done"', 'git commit -m "install-files & more | x"',
+                       "git commit -F - <<'E'\nfeat(install-files): add it; and more\nE"):
             with self.subTest(viewer):
                 self.assertIsNone(cg.install_files_refusal(viewer, False), viewer)
 

@@ -7313,6 +7313,41 @@ INSTALL_FILES_SHELLS = {'bash', 'sh', 'zsh', 'dash', 'ksh'}
 INSTALL_FILES_REDIRECT = re.compile(r'^(?:[0-9]*[<>]{1,2}&?[0-9-]*|[0-9]*[<>]{1,2}.+|&>.*|\|&)$')
 
 
+def _install_files_segments(text):
+    """[(tokens, raw segment)] for the simple commands of `text`. Quote-aware first (a `;` or `&` inside a quoted commit message
+    does not split it); when the whole text does not tokenize (a heredoc body, an odd quote) it falls back to a plain split,
+    and a segment that does not tokenize comes back as (None, segment)."""
+    separators = set(';&|\n')
+    try:
+        lex = shlex.shlex(re.sub(r'([<>])&', r'\1@AMP@', text), posix=True, punctuation_chars=';&|')  # `2>&1` is not a separator
+        lex.whitespace = ' \t\r'
+        lex.commenters = ''
+        lex.wordchars += '=:,./~$-+@%^<>'
+        out, current = [], []
+        for token in lex:
+            token = token.replace('@AMP@', '&')
+            if token and all(ch in separators for ch in token):
+                if current:
+                    out.append((current, ' '.join(current)))
+                current = []
+            else:
+                current.append(token)
+        if current:
+            out.append((current, ' '.join(current)))
+        # newlines are plain characters inside this tokenizer: a multi-line text is split on them first
+        if '\n' in text:
+            raise ValueError('multi-line text')
+        return out
+    except ValueError:
+        out = []
+        for segment in re.split(r'[;&|\n]+', text):
+            try:
+                out.append((shlex.split(segment, comments=False, posix=True), segment))
+            except ValueError:
+                out.append((None, segment))
+        return out
+
+
 def _install_files_segment(text, is_main, home, installed, literal, depth=0):
     """None, or the refusal for one command string (recursing into `bash -c` bodies, at most three levels)."""
     flat = re.sub(r'[\'"\\]', '', text)
@@ -7320,10 +7355,8 @@ def _install_files_segment(text, is_main, home, installed, literal, depth=0):
             r'\s*(?:git|cat|grep|egrep|rg|less|head|tail|ls|sed|awk|diff|wc|echo|printf|find|vi|vim|nano|man)\b', text):
         if re.search(r'python|importlib|(?:^|\n)\s*(?:import|from)\s', flat):
             return 'ah install-files: importing ah_install from python is refused; ' + INSTALL_FILES_FORM
-    for segment in re.split(r'[;&|\n]+', text):
-        try:
-            tokens = shlex.split(segment, comments=False, posix=True)
-        except ValueError:
+    for tokens, segment in _install_files_segments(text):
+        if tokens is None:
             if 'install' in segment and ('install-files' in segment or 'ah_install' in segment):
                 return 'ah install-files: the command could not be parsed; ' + INSTALL_FILES_FORM
             continue
