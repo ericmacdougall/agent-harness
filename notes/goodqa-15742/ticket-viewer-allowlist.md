@@ -1,0 +1,6 @@
+Follow-up to goodqa#15742 (ah install-files guard rule), receipt r1c finding F4. The install_files_refusal rule in command_guard.py lets programs that only VIEW the name pass (grep, rg, git, find, sed and similar), by skipping the whole segment when the first token is on that list. Two consequences, both inside the stated limit that the rule is accident prevention and not an access control, but worth closing:
+
+1. `find . -exec python3 <worktree>/ah.py install-files ... \;` and `find ... -execdir` pass, because the find segment is skipped. Proposal: for find, xargs and similar exec-capable viewers, inspect the command after `-exec`, `-execdir`, `-ok` and the xargs command, applying the same literal-form test.
+2. `git -c alias.x='!python3 <worktree>/ah.py install-files ...' x` and `git` aliases that run a shell command pass for the same reason. Proposal: refuse a git command whose -c alias value or config alias starts with `!` and mentions the install command, or inspect git alias values the same way as bash -c bodies.
+
+Acceptance: tests drive `command_guard.py check` and the hook entry for each form (find -exec, -execdir, xargs, git -c alias with a bang) for main and for a sub-agent; the viewer forms (grep, rg, git log -S, find -name) stay allowed; a failing-first mutant removes the exec inspection.
