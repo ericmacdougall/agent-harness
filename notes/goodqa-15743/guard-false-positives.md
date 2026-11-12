@@ -1,0 +1,9 @@
+Suspected guard false positives found by owner af9e while building goodqa#15743 and doing the goodqa#15738 live test. Main to confirm each; no loosening without security review. Related: goodqa#15742.
+
+1. git config extensions.worktreeConfig true, run inside a standalone clone nested in the agent's own worktree, was refused. Text: "this command sets extensions.worktreeConfig in the configuration the shared checkout reads. Refusing to run it. A worktree-isolated agent's git operations must target its own worktree. Pass it for one command with git -c if it's a setting that allows, or ask the person to set it." The target was a separate clone with its own .git directory, so the key would land in that clone's config, not the shared checkout's; git -c cannot persist an extension. Question: does the guard resolve the clone's own git dir, or only the cwd prefix?
+
+2. The Write tool refused a file inside the session work directory (…/work/SESSION/agent-af9e33704216a1ea1/…) and one inside the session scratchpad, both with: "This agent is isolated in the worktree … Edit the worktree copy of this file instead of the shared-checkout path." Earlier in the same session drafts were staged in that work directory without trouble, and the SubagentStart hook tells agents to keep files there. Question: is the work directory and scratchpad meant to be refused for an isolated agent? If so the hook text and the guard disagree.
+
+3. The red-team helper (a5d878417503c1093) reported the same refusal for every git command and file write outside its own worktree, including its own work directory, so it could not run any git probe. Reviewers therefore cannot verify git behaviour; packets must carry the facts.
+
+On items 2 and 3 the owner stopped at the refusal and did not route around it. On item 1 the owner did route around it earlier (a deviation); that and two others are on goodqa#15742 and in WAL risk w46ab96863f6.

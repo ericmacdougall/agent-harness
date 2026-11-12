@@ -1,0 +1,66 @@
+......./Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/clone_remove.py:938: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/ah-cr-emswhstl/home/.agent-harness/work/sess-1/receipts/.clone-remove-20261112T052501-c786e106/.clone-remove-marker' mode='r' encoding='UTF-8'>
+  content = json.loads(open(marker_path).read(4096))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+.../Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/clone_remove.py:938: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/ah-cr-6xo76lpf/home/.agent-harness/work/sess-1/receipts/.clone-remove-20261112T052502-676f8ccb/.clone-remove-marker' mode='r' encoding='UTF-8'>
+  content = json.loads(open(marker_path).read(4096))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+.../Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/clone_remove.py:938: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/ah-cr-fjqozdth/home/.agent-harness/work/sess-1/receipts/.clone-remove-20261112T052503-d31dc0c6/.clone-remove-marker' mode='r' encoding='UTF-8'>
+  content = json.loads(open(marker_path).read(4096))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/clone_remove.py:434: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/ah-cr-fjqozdth/home/.agent-harness/work/sess-1/receipts/.clone-remove-20261112T052503-d31dc0c6/.git/refs/heads/extra' mode='r' encoding='UTF-8'>
+  text = open(file, errors='replace').read(256).strip()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/clone_remove.py:434: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/ah-cr-fjqozdth/home/.agent-harness/work/sess-1/receipts/.clone-remove-20261112T052503-d31dc0c6/.git/refs/heads/main' mode='r' encoding='UTF-8'>
+  text = open(file, errors='replace').read(256).strip()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+.../Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/clone_remove.py:938: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/ah-cr-lhhfs3zy/home/.agent-harness/work/sess-1/receipts/.clone-remove-20261112T052504-c892f5d9/.clone-remove-marker' mode='r' encoding='UTF-8'>
+  content = json.loads(open(marker_path).read(4096))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/clone_remove.py:434: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/ah-cr-lhhfs3zy/home/.agent-harness/work/sess-1/receipts/.clone-remove-20261112T052504-c892f5d9/.git/refs/heads/main' mode='r' encoding='UTF-8'>
+  text = open(file, errors='replace').read(256).strip()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+..../Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/unittest/case.py:632: ResourceWarning: unclosed file <_io.BufferedReader name=4>
+  function, args, kwargs = self._cleanups.pop()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+./Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/clone_remove.py:291: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/ah-cr-zbs9pgqm/home/.agent-harness/work/sess-1/receipts/wt-borrower/.git/objects/info/alternates' mode='r' encoding='UTF-8'>
+  refuse('another repository borrows objects from the target (alternates)')
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+........../Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/clone_remove.py:415: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/ah-cr-k0vgxn2i/home/.agent-harness/work/sess-1/receipts/wt-commit-only-in-logs-HEAD/.git/ORIG_HEAD' mode='r' encoding='UTF-8'>
+  shas |= set(SHA_RE.findall(open(file, errors='replace').read(65536)))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/clone_remove.py:415: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/ah-cr-k0vgxn2i/home/.agent-harness/work/sess-1/receipts/wt-stale-tracking-ref/.git/ORIG_HEAD' mode='r' encoding='UTF-8'>
+  shas |= set(SHA_RE.findall(open(file, errors='replace').read(65536)))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/clone_remove.py:415: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/ah-cr-k0vgxn2i/home/.agent-harness/work/sess-1/receipts/wt-stash/.git/ORIG_HEAD' mode='r' encoding='UTF-8'>
+  shas |= set(SHA_RE.findall(open(file, errors='replace').read(65536)))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/clone_remove.py:384: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/ah-cr-k0vgxn2i/home/.agent-harness/work/sess-1/receipts/wt-missing-alternates-path/.git/objects/info/alternates' mode='r' encoding='UTF-8'>
+  refuse('objects/info/%s names a path that does not exist' % alt)
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/clone_remove.py:286: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/ah-cr-k0vgxn2i/home/.agent-harness/work/sess-1/receipts/wt-missing-alternates-path/.git/objects/info/alternates' mode='r' encoding='UTF-8'>
+  for line in open(candidate, errors='replace'):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+./Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/clone_remove.py:415: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/ah-cr-jqi_003z/home/.agent-harness/work/sess-1/receipts/wt-a/.git/ORIG_HEAD' mode='r' encoding='UTF-8'>
+  shas |= set(SHA_RE.findall(open(file, errors='replace').read(65536)))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/clone_remove.py:415: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/ah-cr-jqi_003z/home/.agent-harness/work/sess-1/receipts/wt-a/.git/ORIG_HEAD' mode='r' encoding='UTF-8'>
+  shas |= set(SHA_RE.findall(open(file, errors='replace').read(65536)))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+..................../Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/clone_remove.py:291: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/ah-cr-cxw49rv7/home/.agent-harness/work/sess-1/receipts/wt-rel/.git/objects/info/alternates' mode='r' encoding='UTF-8'>
+  refuse('another repository borrows objects from the target (alternates)')
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+............................................................../Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/command_guard.py:1597: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/cg-clone-_hxn4gj9/.agent-harness/work/S2/T11/clone/.git/ORIG_HEAD' mode='r' encoding='UTF-8'>
+  local |= set(re.findall(r'[0-9a-f]{40,64}', open(pfile, errors='replace').read(512)))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+................./Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/command_guard.py:1597: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/cg-clone-zxze393q/.agent-harness/work/S2/T28/clone/.git/ORIG_HEAD' mode='r' encoding='UTF-8'>
+  local |= set(re.findall(r'[0-9a-f]{40,64}', open(pfile, errors='replace').read(512)))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/harness/hooks/command_guard.py:1597: ResourceWarning: unclosed file <_io.TextIOWrapper name='/private/var/folders/g7/bszfxt551211997q9yzkvkrw0000gn/T/cg-clone-zxze393q/.agent-harness/work/S2/T28/clone/.git/ORIG_HEAD' mode='r' encoding='UTF-8'>
+  local |= set(re.findall(r'[0-9a-f]{40,64}', open(pfile, errors='replace').read(512)))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+..................................................................s.................................
+----------------------------------------------------------------------
+Ran 231 tests in 120.611s
+
+OK (skipped=1)
+exit 0
