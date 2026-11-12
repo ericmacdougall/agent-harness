@@ -1379,12 +1379,12 @@ def _worktree_config_enabled(listing):
 
 
 def _per_worktree_items_refusal(listing):
-    """What a per-worktree config file may hold: sparse-checkout switches and `core.bare` false. Anything else refuses
-    (names only in the message, never a value)."""
+    """What a per-worktree config file may hold: sparse-checkout switches, `index.sparse` (a sparse index changes the
+    index format only) and `core.bare` false. Anything else refuses (names only in the message, never a value)."""
     for item in filter(None, listing.split('\x00')):
         key, has_value, value = item.partition('\n')
         key, word = key.lower(), value.strip().lower()
-        if key in ('core.sparsecheckout', 'core.sparsecheckoutcone'):
+        if key in ('core.sparsecheckout', 'core.sparsecheckoutcone', 'index.sparse'):
             if has_value and word not in _BOOL_WORDS:
                 return 'a per-worktree config sets %s to a non-boolean value' % key
             continue
@@ -1396,17 +1396,28 @@ def _per_worktree_items_refusal(listing):
     return None
 
 
-def _per_worktree_config_refusal(path, common, step):
+def _per_worktree_config_refusal(path, common, git_dir, cwd, step):
     """With `extensions.worktreeConfig` on, git reads $common/config.worktree for the primary worktree and
-    $common/worktrees/ID/config.worktree for each linked one, and the removal runs from the primary while the hook form
-    can run from any worktree: so EVERY registered file is vetted (lstat first, plain file, size cap, `git config --file`
-    read), before any other command that reads the worktree. A missing file is fine."""
-    folder = os.path.join(common, 'worktrees')
-    try:
-        names = sorted(os.listdir(folder)) if os.path.isdir(folder) else []
-    except OSError:
-        return 'could not list the registered worktrees'
-    for file in [os.path.join(common, 'config.worktree')] + [os.path.join(folder, n, 'config.worktree') for n in names]:
+    $common/worktrees/ID/config.worktree for a linked one. The programs a removal can start are decided by the worktrees
+    whose git commands run: the PRIMARY (the delegated removal runs from there), the TARGET (the cleanliness check runs
+    in it) and the worktree the caller stands in (the hook form runs from the caller's directory). Each of those files
+    is vetted (lstat first, plain file, size cap, `git config --file` read) before any other command that reads the
+    worktree; a missing file is fine. An unrelated linked worktree's file is never read by this removal and does not
+    decide it."""
+    files = [os.path.join(common, 'config.worktree'), os.path.join(git_dir, 'config.worktree')]
+    if cwd and os.path.isdir(cwd):
+        try:
+            lines = _git_out(cwd, ['rev-parse', '--path-format=absolute', '--absolute-git-dir', '--git-common-dir'],
+                             step(2.0)).splitlines()
+            if len(lines) >= 2 and os.path.realpath(lines[1]) == os.path.realpath(common):
+                files.append(os.path.join(os.path.realpath(lines[0]), 'config.worktree'))
+        except ValueError:
+            pass  # the caller is not inside a repository
+    seen = set()
+    for file in files:
+        if file in seen:
+            continue
+        seen.add(file)
         try:
             info = os.lstat(file)
         except FileNotFoundError:
@@ -1650,7 +1661,7 @@ def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None):
         shared = _git_out(path, ['config', '--local', '-z', '--list'], step(2.0))
         bad = _config_refusal(shared, allow_worktree_config=True)
         if not bad and _worktree_config_enabled(shared):
-            bad = _per_worktree_config_refusal(path, common, step)
+            bad = _per_worktree_config_refusal(path, common, git_dir, cwd, step)
         if bad:
             return bad
         hooks_dir = os.path.join(common, 'hooks')

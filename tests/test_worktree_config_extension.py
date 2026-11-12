@@ -110,7 +110,7 @@ class Extension(Repo):
         ("filter.x", "clean", "x"), ("url.x", "insteadOf", "y"), ("alias", "x", "!id"), ("http", "proxy", "x"),
         ("protocol", "allow", "always"), ("diff", "external", "x"), ("merge", "tool", "x"), ("submodule", "recurse", "true"),
         ("remote.origin", "url", "https://github.com/a/b"), ("branch", "autosetupmerge", "true"), ("user", "name", "x"),
-        ("index", "sparse", "true"), ("extensions", "worktreeConfig", "true"), ("gc", "auto", "0"), ("pack", "threads", "1"),
+        ("index", "threads", "2"), ("extensions", "worktreeConfig", "true"), ("gc", "auto", "0"), ("pack", "threads", "1"),
     )
 
     def write(self, file, section, key, value):
@@ -128,7 +128,8 @@ class Extension(Repo):
 
     def test_the_allowlisted_keys_pass(self):
         self.raw("[extensions]", "\tworktreeConfig = true")
-        for body in ("[core]\n\tsparseCheckout = true\n\tsparseCheckoutCone = false\n", "[core]\n\tsparseCheckout\n",
+        for body in ("[core]\n\tsparseCheckout = true\n\tsparseCheckoutCone = false\n[index]\n\tsparse = false\n",
+                     "[index]\n\tsparse = true\n", "[core]\n\tsparseCheckout\n",
                      "[core]\n\tbare = false\n", "[core]\n\tbare = no\n", ""):
             with self.subTest(body=body[:30]):
                 self.target_file.parent.mkdir(parents=True, exist_ok=True)
@@ -139,23 +140,39 @@ class Extension(Repo):
                 self.target_file.write_text(body)
                 self.assertRefused(("per-worktree config",) + self.GIT_STOPS)  # git may reject the value itself
 
-    def test_a_dangerous_key_in_the_primary_or_another_worktree_refuses_in_both_forms(self):
+    def test_the_files_that_decide_are_the_primarys_the_targets_and_the_callers(self):
         other = self.base / "other"
         git(self.primary, "worktree", "add", "-q", "-b", "other", str(other))
         git(self.primary, "update-ref", "refs/remotes/origin/other", git(other, "rev-parse", "HEAD"))
         self.live["refs/heads/other"] = git(other, "rev-parse", "HEAD")
         self.raw("[extensions]", "\tworktreeConfig = true")
         compiled = cg.Compiled(self.policy, home=str(self.home), cwd=str(self.primary))
-        for label, file in (("primary", self.primary_file), ("other linked", self.common / "worktrees" / "other" / "config.worktree")):
-            with self.subTest(label):
-                self.write(file, "core", "fsmonitor", None)
-                self.assertRefused("per-worktree config")  # fsmonitor does not stop git, so the exact reason is pinned
-                verdict, text = cg.decide("git worktree remove %s" % self.linked, compiled, cwd=str(self.primary))
-                self.assertEqual(verdict, "block")
-                self.assertFalse(self.marker.exists())
-                file.unlink()
+        other_file = self.common / "worktrees" / "other" / "config.worktree"
+        command = "git worktree remove %s" % self.linked
+        # the primary's file: the delegated removal runs from the primary, so it refuses in both forms
+        self.write(self.primary_file, "core", "fsmonitor", None)
+        self.assertRefused("per-worktree config")
+        verdict, text = cg.decide(command, compiled, cwd=str(self.primary))
+        self.assertEqual(verdict, "block")
+        self.assertFalse(self.marker.exists())
+        self.primary_file.unlink()
+        # an UNRELATED linked worktree's file is never read by this removal: it must not block it (one odd file must
+        # not freeze every sibling, as it did in the first draft on the real t2-dev proof)
+        self.write(other_file, "core", "fsmonitor", None)
+        self.assertTrue(self.verify()["removable"], self.verify())
+        verdict, text = cg.decide(command, compiled, cwd=str(self.primary))
+        self.assertEqual(verdict, "allow", text)
+        # but when the CALLER stands in that worktree (the hook form runs git there), its file decides
+        verdict, text = cg.decide(command, cg.Compiled(self.policy, home=str(self.home), cwd=str(other)), cwd=str(other))
+        self.assertEqual(verdict, "block")
+        self.assertIn("per-worktree config", text)
+        self.assertFalse(self.marker.exists())
+        other_file.unlink()
+        self.write(self.target_file, "core", "fsmonitor", None)  # and the target's own file
+        self.assertRefused("per-worktree config")
+        self.target_file.unlink()
         self.assertTrue(self.verify()["removable"])
-        verdict, text = cg.decide("git worktree remove %s" % self.linked, compiled, cwd=str(self.primary))
+        verdict, text = cg.decide(command, compiled, cwd=str(self.primary))
         self.assertEqual(verdict, "allow", text)
 
     def test_unsafe_file_shapes_refuse_and_an_absent_file_does_not(self):
@@ -199,10 +216,7 @@ class Extension(Repo):
         self.assertIn("sparsecheckout", self.target_file.read_text().lower())
         self.assertRefused("hidden from git status")
         git(self.linked, "sparse-checkout", "disable")
-        # git 2.54 leaves index.sparse in the file after a disable, which is not allowlisted: the verifier refuses it
-        if "index" in self.target_file.read_text().lower():
-            self.assertRefused("index.sparse")
-            self.target_file.write_text("[core]\n\tsparseCheckout = false\n")
+        # git 2.54 leaves `index.sparse = false` in the file after a disable (the real t2-dev files have it too): allowlisted
         self.assertTrue(self.verify()["removable"], self.verify())
         (self.linked / "a.txt").write_text("changed\n")
         self.assertRefused("not clean")
@@ -214,10 +228,10 @@ class Extension(Repo):
         self.assertIsNone(refuse(""))
         self.assertIsNone(refuse("core.sparsecheckout\ntrue\x00core.sparsecheckoutcone\nfalse\x00core.bare\nfalse\x00"))
         self.assertIsNone(refuse("core.sparsecheckout\x00"))  # a bare key is true, which git accepts here
-        self.assertIsNone(refuse("CORE.SparseCheckout\nYES\x00core.bare\nNo\x00"))
+        self.assertIsNone(refuse("CORE.SparseCheckout\nYES\x00core.bare\nNo\x00index.sparse\nfalse\x00index.sparse\x00"))
         for listing in ("core.sparsecheckout\nmaybe\x00", "core.sparsecheckoutcone\n2\x00", "core.sparsecheckout\n\x00",
                         "core.bare\x00", "core.bare\ntrue\x00", "core.bare\n2\x00", "core.bare\n\x00",
-                        "core.fsmonitor\nx\x00", "index.sparse\ntrue\x00", "extensions.worktreeconfig\ntrue\x00",
+                        "core.fsmonitor\nx\x00", "index.sparse\nmaybe\x00", "index.version\n4\x00", "extensions.worktreeconfig\ntrue\x00",
                         "core.sparsecheckout\ntrue\x00core.hookspath\n/tmp\x00"):
             with self.subTest(listing=listing[:40]):
                 self.assertIsNotNone(refuse(listing))
