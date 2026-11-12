@@ -249,6 +249,55 @@ class Redaction(Base):
             for seg in segments(secret, 4):
                 self.assertNotIn(seg, raw, seg)
 
+    def test_shrinking_match_cannot_pull_a_cut_secret_into_view(self):
+        """PR 223 receipt F1: a long unbounded match (Bearer + 12,180 characters) shrinks to a placeholder; a secret
+        that straddled an earlier pre-redaction cut must not come back inside the rendered field cap."""
+        aws_secret = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYzEXAMPLEKY'  # 40 characters, the aws-key-pair shape
+        filler = 'A' * 12180
+        aws_note = 'Bearer ' + filler + ' AKIAIOSFODNN7EXAMPLE ' + aws_secret
+        gh_note = 'Bearer ' + filler + ' ' + 'x' * (12240 - 7 - 12180 - 1 - 4 - 19) + ' ' + GITHUB
+        self.assertLess(aws_note.index(aws_secret), 12240)
+        self.assertGreater(len(aws_note), 12240)  # the secret straddles 12,240
+        self.assertLess(gh_note.index(GITHUB), 12240)
+        self.assertGreater(len(gh_note), 12240)
+        jl(self.w / 'agent-owner1.jsonl', [
+            {'at': iso(NOW - 300), 'event': 'status', 'note': aws_note},
+            {'at': iso(NOW - 290), 'event': 'status', 'note': gh_note},
+        ])
+        raw = Path(self.export()['path']).read_text(encoding='utf-8')
+        for seg in segments(aws_secret, 0):
+            self.assertNotIn(seg, raw, seg)
+        for seg in segments(GITHUB, 4):
+            self.assertNotIn(seg, raw, seg)
+
+    def test_non_scalar_ask_id_or_ref_is_skipped_not_fatal(self):
+        """PR 223 receipt F2: a list or dict id/ref used to raise TypeError in status_report and stop the export."""
+        jl(self.w / 'main.jsonl', [
+            {'at': iso(NOW - 300), 'event': 'ask', 'id': ['x'], 'note': 'hostile ask'},
+            {'at': iso(NOW - 290), 'event': 'ask_resolved', 'ref': {'a': 1}},
+            {'at': iso(NOW - 280), 'event': 'status', 'note': 'still exported'},
+        ])
+        result = self.export()
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['rows_skipped'], 2)
+        self.assertIn('still exported', Path(result['path']).read_text(encoding='utf-8'))
+        report = ah.status_report(self.home, SESSION, 0, now=NOW,
+                                  rows=[('main', {'event': 'ask', 'id': ['x']}),
+                                        ('main', {'event': 'ask_resolved', 'ref': {'a': 1}})], unread=[])
+        self.assertIsInstance(report, dict)  # ah status itself no longer raises on these rows
+
+    def test_invisible_key_cannot_take_a_rendered_field_name(self):
+        """PR 223 receipt F3: "\\u200bnote" scrubs to "note"; it must not displace the real note."""
+        jl(self.w / 'agent-owner1.jsonl', [
+            {'at': iso(NOW - 300), 'event': 'blocker', '​note': 'ATTACKER TEXT', 'note': 'REAL BLOCKER'},
+        ])
+        scrub = ah_export._Scrubber(*ah_export._load_redactor())
+        clean = scrub.obj({'​note': 'ATTACKER TEXT', 'note': 'REAL BLOCKER'})
+        self.assertEqual(clean['note'], 'REAL BLOCKER')
+        page = Path(self.export()['path']).read_text(encoding='utf-8')
+        blockers = page[page.index('REAL BLOCKER') - 400:page.index('REAL BLOCKER')]
+        self.assertNotIn('ATTACKER TEXT', blockers)
+
     def test_redactor_unavailable_refuses_and_writes_nothing(self):
         with mock.patch.object(ah_export, '_load_redactor', side_effect=ImportError('gone')):
             with self.assertRaises(ah.AhError) as caught:
