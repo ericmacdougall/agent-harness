@@ -2579,6 +2579,7 @@ class Ctx:
         self.vars = {}
         self.tainted = set()
         self.aliases = {}
+        self.function_syntax_seen = False  # declaration provenance, not a function interpreter
         self.findings = []
         self.secret_seen = 0
         self.tail_visible = True
@@ -2753,6 +2754,22 @@ class Analyzer:
             ctx.ps, ctx.tail_visible = saved_ps, saved_tail
 
     def _run_tokens(self, tokens, depth):
+        # Preserve original lexical provenance before parse() drops parentheses
+        # and before subclass check_tokens() can normalize declaration syntax.
+        # Any function definition makes a bare SSH consumer uncertain. Keeping
+        # this monotonic is conservative across nested scripts and both >!
+        # readings; normal context snapshots restore/merge it like other flags.
+        for i, (kind, word) in enumerate(tokens):
+            self.ctx.budget.tick()
+            if kind != 'w':
+                continue
+            parentheses = tokens[i + 1:i + 3] == [('op', '('), ('op', ')')]
+            # Do not guess an unbounded shell-prefix grammar (time -p, etc.).
+            # Even an unquoted data argument conservatively retains the old
+            # shell reading; quoted words, comments and heredoc data do not.
+            keyword = not word.quoted and word.text == 'function'
+            if parentheses or keyword:
+                self.ctx.function_syntax_seen = True
         self.check_tokens(tokens)
         for pipeline in parse(tokens):
             self.pipeline(pipeline, depth)
@@ -3192,6 +3209,83 @@ class Analyzer:
             if self.out_visible(pl, idx, False):
                 self.check_secret_vars(word)
 
+    def _ssh_python_stdin(self, rd, words, pl, idx):
+        """Recognize a closed literal SSH Python-stdin form, without traversing it.
+
+        This is deliberately narrower than ssh(): ambiguity keeps the existing
+        shell reading. Subclasses may use the predicate for their own policy;
+        recognizing code here must not silently replace their script traversal.
+        """
+        def literal(word):
+            return not (word.dynamic or word.vars or word.subs or word.glob or word.overflow
+                        or len(word.alts) != 1)
+
+        if (not words or norm_name(words[0].text) != 'ssh' or self.ctx.ps or self.ctx.unterminated
+                or 'ssh' in self.ctx.aliases or self.ctx.function_syntax_seen
+                or any(not literal(word) for word in words) or pl is None or idx != 0
+                or pl.bg or not pl.cmds or rd.fd not in (None, '0')):
+            return False
+        inputs = [r for r in pl.cmds[idx].redirs if r.fd in (None, '0')
+                  and r.op in ('<', '<>', '<&', '<<', '<<-', '<<<')]
+        if len(inputs) != 1 or inputs[0] is not rd or rd.op not in ('<<', '<<-'):
+            return False
+        texts = [word.text for word in words]
+        i = 1
+        while i < len(texts) and texts[i].startswith('-'):
+            option = texts[i]
+            if option == '--':
+                i += 1
+                break
+            flags = option[1:]
+            if not flags:
+                return False
+            for offset, flag in enumerate(flags):
+                if flag in 'qvTt':
+                    continue
+                if flag not in 'plo':
+                    return False  # includes -n/-f/-N/-s/-G, config and forwarding modes
+                value = flags[offset + 1:]
+                if not value:
+                    i += 1
+                    if i >= len(texts):
+                        return False
+                    value = texts[i]
+                if flag == 'p' and not (len(value) <= 5 and value.isascii() and value.isdigit()
+                                        and 0 < int(value) <= 65535):
+                    return False
+                if flag == 'l' and re.fullmatch(r'[A-Za-z0-9_.-]+', value) is None:
+                    return False
+                if flag == 'o' and re.fullmatch(
+                        r'(?i)(?:BatchMode=(?:yes|no)|ConnectTimeout=[0-9]+|ConnectionAttempts=[0-9]+)', value) is None:
+                    return False
+                break
+            i += 1
+        if i >= len(texts) or re.fullmatch(r'(?:[A-Za-z0-9_.-]+@)?[A-Za-z0-9][A-Za-z0-9_.:-]*', texts[i]) is None:
+            return False
+        i += 1  # destination; a following option is not a proven remote program
+        if i < len(texts) and texts[i] == '--':
+            i += 1
+        remote = ' '.join(texts[i:])
+        if not remote or any(char in remote for char in ('\n', '\r', '\x00', '#')):
+            return False
+        # Lexer may mark incomplete input. Keep that state isolated, while still
+        # charging the caller's finite budget for this extra lexical pass.
+        context = Ctx(self.c, self.ctx.cwd, False)
+        context.budget = self.ctx.budget
+        tokens = Lexer(context, False).lex(remote)
+        if context.unterminated or not tokens or any(kind != 'w' or not literal(word) for kind, word in tokens):
+            return False
+        args = [word.text for _kind, word in tokens]
+        if args[0].startswith('~') or re.fullmatch(r'(?:python(?:[23](?:\.[0-9]+)*)?|pypy[23]?)',
+                                                 args[0].rsplit('/', 1)[-1]) is None:
+            return False
+        j = 1
+        while j < len(args) and args[j] != '-':
+            if re.fullmatch(r'-[bBdeEIOqRsSuvx]+', args[j]) is None:
+                return False  # -c/-m, a script file, valued/unknown options
+            j += 1
+        return j < len(args) and args[j] == '-'
+
     def heredoc(self, rd, name, words, pl, idx, depth):
         ctx = self.ctx
         body = rd.body
@@ -3217,13 +3311,21 @@ class Analyzer:
         if name in INTERPRETERS:
             self.code(body, depth)
             return
+        ssh_python = False
         if name == 'ssh':
-            self.script(body, depth + 1, tail_visible=True)
-            return
+            # Existing subclasses inspect script traversal (not code). Preserve
+            # that contract; KillAnalyzer separately applies its body policy.
+            if type(self) is Analyzer and self._ssh_python_stdin(rd, words, pl, idx):
+                self.code(body, depth)
+                ssh_python = True
+            else:
+                self.script(body, depth + 1, tail_visible=True)
+                return
         if rd.quoted:
             return
         # unquoted delimiter: $(..), `..` and $VAR expand inside the body
-        visible = (name in ECHO_CMDS or name in PRINT_FILE_CMDS or name in PASS_FILTERS) and self.out_visible(pl, idx, False)
+        visible = ssh_python or ((name in ECHO_CMDS or name in PRINT_FILE_CMDS or name in PASS_FILTERS)
+                                 and self.out_visible(pl, idx, False))
         probe = Word()
         lexer = Lexer(ctx, False)
         buf = []

@@ -82,7 +82,7 @@ STOP_COMMANDS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'echo', 'printf', 'cat', 
                  'tee', 'diff', 'find', 'curl', 'wget', 'pytest', 'ssh', 'scp', 'rsync', 'tar', 'zip', 'unzip', 'date'}
 NAME_FIRST = {'gosu', 'chroot', 'flock', 'sg', 'su', 'runuser'}  # gosu git bash: the first operand is no command
 OVERRIDDEN = ('apply', 'command', 'dispatch', 'inner_words', 'script', 'ssh', 'container', 'check_tokens', 'resolve',
-              'bind_loop_var', 'names_for')
+              'bind_loop_var', 'names_for', 'heredoc')
 
 SSH_GLOB_LINE_FIX = True  # goodqa#15365; tests/test_kill_guard_ssh_glob.py flips it in a copy to prove the tests catch a regression
 
@@ -1139,6 +1139,14 @@ def make_analyzer_class(cg):
             finally:
                 if via_xargs:
                     self.xargs -= 1
+
+        def heredoc(self, rd, name, words, pl, idx, depth):
+            if name == 'ssh' and self._ssh_python_stdin(rd, words, pl, idx):
+                # The real command carries the actual heredoc body. Its remote
+                # interpreter was previously traversed only as shell syntax,
+                # missing os.kill/killpg and object termination calls.
+                self.check_interpreter('python3', [], pl.cmds[idx])
+            return super().heredoc(rd, name, words, pl, idx, depth)
 
         def _ssh_host_index(self, texts):
             value_opts = set('bcDEeFIiJLlmOopQRSWwBP')
