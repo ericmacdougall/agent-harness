@@ -128,12 +128,120 @@ def provider_usage(record):
 
 
 def verdict_match(stage, report):
+    """The verdict is the first non-blank line, and that line must be EXACTLY the stage's marker at column 0: only
+    trailing spaces, tabs or a CR are ignored. Anything after the marker on its line (prose, punctuation, a reason)
+    or before it (whitespace, a quote mark, decoration) is not a verdict (receipt r1 F1 on PR 211, goodqa#15723)."""
     prefix = {'pr': r'VERDICT: (PASS|BLOCK)', 'plan': r'PLAN_RESULT: (ACCEPT|BLOCK)',
               'code-inspection': r'CODE_INSPECTION_RESULT: (ACCEPT|BLOCK)'}
     if stage is None:
-        return re.match(r'^(?:VERDICT: (PASS|BLOCK)|(?:PLAN|CODE_INSPECTION)_RESULT: (ACCEPT|BLOCK))(?=\s|$)',
-                        report.strip())
-    return re.match('^' + prefix[stage] + r'(?=\s|$)', report.strip()) if stage in prefix else None
+        pattern = r'VERDICT: (PASS|BLOCK)|(?:PLAN|CODE_INSPECTION)_RESULT: (ACCEPT|BLOCK)'
+    elif stage in prefix:
+        pattern = prefix[stage]
+    else:
+        return None
+    first = next((line for line in report.split('\n') if line.strip()), '')
+    return re.fullmatch(pattern, first.rstrip(' \t\r'))
+
+
+ANY_MARKER = re.compile(r'(?:VERDICT|[A-Z_]*_RESULT)\s*:\s*(?:PASS|ACCEPT|BLOCK)')
+VERDICT_LINE = {'pr': r'VERDICT: (PASS|BLOCK)', 'plan': r'PLAN_RESULT: (ACCEPT|BLOCK)',
+                'code-inspection': r'CODE_INSPECTION_RESULT: (ACCEPT|BLOCK)'}
+HOIST_MAX_LINES = 12
+HOIST_MAX_CHARS = 2000
+
+
+def opens_quoted_text(line):
+    """True when a preamble line could start text the reviewer is quoting rather than writing: a fence, a blockquote,
+    an indented code block (4+ columns of leading space or a tab) or an HTML block. Any of these before the marker
+    makes the hoist refuse, so the marker can never sit inside a container that the parser would have to track."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    indent = line[:len(line) - len(line.lstrip(' \t'))]
+    return (stripped.startswith(('```', '~~~', '>', '<')) or '\t' in indent or len(indent) >= 4)
+
+
+def hoist_verdict(stage, text):
+    """A reviewer that writes a short preamble before its verdict (goodqa#15723) still gave a verdict, but only a BLOCK
+    is ever hoisted: plain prose can quote a marker ("The packet ends with:\n\nVERDICT: PASS", receipt r3 F1), and a
+    quoted BLOCK can only fail the review, which is safe. A PASS or ACCEPT counts only as the bare first non-blank line
+    (verdict_match); after a preamble it stays INVALID_OUTPUT and the raw answer is saved. A BLOCK is hoisted only
+    under these rules; anything else is returned unchanged (INVALID_OUTPUT):
+    - exactly one verdict-looking marker anywhere in the text, and its line is EXACTLY the stage's verdict at column 0
+      (no leading whitespace, quote mark, bold, heading or any other decoration; only trailing spaces are ignored);
+    - the marker is its own paragraph: the line before it is blank and the line after it is blank or the end;
+    - every preamble line before it is plain prose: no fence, no `>` line, no line indented 4+ columns or by a tab,
+      no HTML block line (opens_quoted_text);
+    - the preamble is at most HOIST_MAX_LINES lines and HOIST_MAX_CHARS characters.
+    Lines AFTER the marker may hold fences, quotes and code: reviewers put code in findings, and nothing after the
+    marker can contain it. A marker repeated after it still counts as a second marker, so it is never hoisted.
+    The text is returned verdict first, the preamble moved below with a note, so the pass marker, the ticket parser
+    and stage_report still see a first-line verdict."""
+    if not isinstance(text, str) or verdict_match(stage, text):
+        return text
+    pattern = VERDICT_LINE.get(stage) if stage is not None else '|'.join(VERDICT_LINE.values())
+    if pattern is None or len(ANY_MARKER.findall(text)) != 1:
+        return text
+    lines = [line.rstrip('\r') for line in text.split('\n')]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    for index, line in enumerate(lines[:HOIST_MAX_LINES + 1]):
+        if not re.fullmatch(pattern, line.rstrip(' \t')):
+            if opens_quoted_text(line):
+                return text
+            continue
+        if not line.rstrip(' \t').endswith(': BLOCK'):
+            return text  # receipt r3 F1: a PASS or ACCEPT after a preamble may be quoted; only the first line counts
+        preamble = lines[:index]
+        if (not index or lines[index - 1].strip() or (index + 1 < len(lines) and lines[index + 1].strip())
+                or len('\n'.join(preamble)) > HOIST_MAX_CHARS):
+            return text
+        verdict = line.rstrip(' \t')
+        after = lines[index + 1:]
+        while after and not after[0].strip():
+            after.pop(0)
+        rest = '\n'.join(after)  # leading indentation of a finding is kept
+        note = ('[harness: the reviewer wrote %d line(s) before its verdict; the verdict line was moved to the top '
+                'and the preamble is kept below]' % index)
+        return verdict + '\n' + (rest + '\n\n' if rest else '\n') + note + '\n' + '\n'.join(preamble).strip()
+    return text
+
+
+RAW_KEEP = 4 * 1024 * 1024
+
+
+def persist_raw_output(target, provider, code, stdout, stderr, last_message):
+    """Keep the reviewer's raw answer in a private mode-600 file when it could not be parsed, so its findings are never
+    lost (goodqa#15723). It is written through the report target's directory handle, after the directory is confirmed
+    to be the one that was validated (outside the worktree, not swapped), exactly like the report. Returns the path or
+    None; never raises."""
+    if target is None or getattr(target, 'fd', None) is None:
+        return None
+    try:
+        if not target.directory_is_current():
+            return None
+        body = ('provider: %s\nexit code: %s\n--- stdout ---\n%s\n--- last message ---\n%s\n--- stderr ---\n%s\n'
+                % (provider, code, stdout or '', last_message or '', stderr or ''))
+        data = body.encode('utf-8', errors='replace')[:RAW_KEEP]
+        for counter in range(100):
+            name = '%s.raw-%s-%d.txt' % (target.path.name, provider, counter)
+            try:
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=target.fd)
+            except FileExistsError:
+                continue
+            try:
+                os.fchmod(fd, 0o600)
+                view = memoryview(data)
+                while view:  # a single write may be partial
+                    view = view[os.write(fd, view):]
+            finally:
+                os.close(fd)
+            return str(target.parent / name)
+    except (OSError, ValueError):
+        return None
+    return None
 
 
 def normalize_provider(provider, code, stdout, stderr='', last_message='', requested_stage=None):
@@ -243,6 +351,7 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
         text.encode('utf-8')
     except UnicodeError:
         return invalid
+    text = hoist_verdict(requested_stage, text)
     verdict = verdict_match(requested_stage, text)
     if not verdict:
         return invalid
@@ -792,13 +901,26 @@ def routing_evidence(options):
     return {**options.get('review_routing', {}), 'actual_reviewer': options.get('actual_reviewer')}
 
 
+def verdict_instruction(stage):
+    """The reviewer's verdict instruction. Reviewers that wrote a preface before the verdict lost real receipts
+    (goodqa#15723), and a PASS after a preface is never accepted (a quoted PASS looks the same), so the prompt asks
+    for the verdict as the very first line and says a later PASS is ignored."""
+    if stage == 'pr':
+        marker, ok, tail = 'VERDICT', 'PASS', ''
+    else:
+        marker, ok, tail = ('PLAN' if stage == 'plan' else 'CODE_INSPECTION') + '_RESULT', 'ACCEPT', ' This is not PR signoff.'
+    return ("Begin exactly %s: %s or %s: BLOCK.%s The first line of your reply must be exactly that line and nothing "
+            "else: no preface, summary, heading, quote mark or formatting before it, and no words after it on that "
+            "line. Put findings on the following lines. A %s anywhere other than the first line is ignored and the "
+            "review counts as invalid output; a BLOCK after a preface is still treated as a BLOCK."
+            % (marker, ok, marker, tail, ok))
+
+
 def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, content: str, options=None):
     options = options or {}
     mode = reviewer_mode(options.get('reviewer', 'auto'), options.get('secondary', 'default'))
     options.pop('actual_reviewer', None)  # a reused internal options dict must not reuse a prior reviewer's identity
-    verdict = ("Begin exactly VERDICT: PASS or VERDICT: BLOCK." if stage == 'pr' else
-               "Begin exactly " + ('PLAN' if stage == 'plan' else 'CODE_INSPECTION') + "_RESULT: ACCEPT or "
-               + ('PLAN' if stage == 'plan' else 'CODE_INSPECTION') + "_RESULT: BLOCK. This is not PR signoff.")
+    verdict = verdict_instruction(stage)
     base = options.get('base')
     history = (f"The snapshot holds only the reviewed commit and base {base} (depth 1, no other history); "
                f"check the packet's diff with `git diff {base} HEAD`." if base and base != head else
@@ -837,7 +959,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
             raise ReviewFailure({**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}, source)
         timeout = min(720, options.get('timeout', 720), remaining)
         leased = False
-        resolution, code, stdout, stderr = None, None, '', ''
+        resolution, code, stdout, stderr, last_message = None, None, '', '', ''
         launch_state, local_detail = 'NOT_STARTED', ''
         try:
             if provider == 'kimi':
@@ -897,6 +1019,10 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                     local_detail = diagnostics.sanitize(
                         '%s pool reserved by run %s. Reconcile: `%s --auto`; if it says completed: `%s --actor <who> '
                         "--reason '<why>' --evidence '<proof>'`" % (provider, holder, base, base), 400)
+        if outcome.get('reason') == 'INVALID_OUTPUT' and (stdout or stderr or last_message):
+            saved = persist_raw_output(options.get('raw_target'), provider, code, stdout, stderr, last_message)
+            if saved:
+                print('Reviewer output could not be parsed; the raw answer is saved (mode 600): ' + saved, file=sys.stderr)
         options.setdefault('attempts', []).append(
             diagnostics.provider_attempt(provider, resolution, code, stdout, stderr, outcome,
                                          launch_state=launch_state, local_detail=local_detail))
@@ -1541,7 +1667,7 @@ def main() -> int:
             print('Review refused: reviewer rung %s needs user permission recorded for the task by approve-top '
                   '(--task with a ledger permission); --author-rung alone is not a record' % selection['rung'], file=sys.stderr)
             return 2
-    options = {'packet_path': packet, 'secondary': args.secondary, 'reviewer': args.reviewer,
+    options = {'raw_target': target, 'packet_path': packet, 'secondary': args.secondary, 'reviewer': args.reviewer,
                'review_routing': review_routing(selection, args.reviewer, args.secondary),
                'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
                'selection': selection, 'author_rung': author_rung, 'permission': permission,
