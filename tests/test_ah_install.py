@@ -578,13 +578,13 @@ class SelfTest(Base):
         self.assertIn("new failing", ai.selftest_worse(before, {"guard": guard, "doctor": {"flags": True, "failing": ["a", "b", "c"]}}))
         self.assertIn("could not run", ai.selftest_worse(before, {"guard": guard, "doctor": {"flags": True, "failing": None}}))
 
-    def manifest_commit(self, extra_rows):
+    def manifest_commit(self, extra_rows, first=False):
         """A merged commit whose installer also lists hooks_manifest.json, with `extra_rows` added to the manifest."""
         side = Path(self.tmp, "manifest-side")
         git(self.tmp, "clone", "-q", str(self.origin), str(side))
         (side / "install.py").write_text("HOOKS = %r\n" % (NAMES + ("hooks_manifest.json",),))
         manifest = json.loads((self.hooks / "hooks_manifest.json").read_text())
-        manifest["hooks"] = manifest["hooks"] + list(extra_rows)
+        manifest["hooks"] = list(extra_rows) + manifest["hooks"] if first else manifest["hooks"] + list(extra_rows)
         (side / "harness" / "hooks" / "hooks_manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
         git(side, "add", "-A")
         git(side, "commit", "-q", "-m", "manifest adds rows")
@@ -603,6 +603,7 @@ class SelfTest(Base):
         out = self.install(ref=ref, files=("hooks_manifest.json", "extra.py"), posted=posted)
         self.assertEqual(out["result"], "installed")
         self.assertEqual(out["unregistered"], ["newhook:stop"])
+        self.assertIs(out["registration_needed"], True)
         self.assertIn("not registered in settings.json", out["note"])
         self.assertIn("newhook:stop", posted[-1][1])  # the ticket comment says it too
 
@@ -617,7 +618,12 @@ class SelfTest(Base):
         self.assertIsNone(ai.selftest_worse(before, doc({"a:stop": "WIRED", "b:stop": "MISSING", "new:stop": "MISSING"})))
         self.assertEqual(ai.newly_declared_unregistered(before, doc({"a:stop": "WIRED", "b:stop": "MISSING",
                                                                      "new:stop": "MISSING"})), ["new:stop"])
-        # a new row that is registered but whose script is missing, or whose canary fails, is a regression
+        # a pending row promoted to installed and still unregistered is the same case (review a36299f2 finding 2)
+        pend = doc({"a:stop": "WIRED", "p:stop": "PENDING"})
+        self.assertIsNone(ai.selftest_worse(pend, doc({"a:stop": "WIRED", "p:stop": "MISSING"})))
+        self.assertEqual(ai.newly_declared_unregistered(pend, doc({"a:stop": "WIRED", "p:stop": "MISSING"})), ["p:stop"])
+        # a new row that is registered but whose script is missing is a regression (CANARY_FAIL is covered for a
+        # doctor run with canaries; the install self-test runs --no-canary)
         for state in ("SCRIPT_MISSING", "CANARY_FAIL"):
             self.assertIn("new:stop", ai.selftest_worse(before, doc({"a:stop": "WIRED", "b:stop": "MISSING",
                                                                        "new:stop": state})) or "")
@@ -629,6 +635,16 @@ class SelfTest(Base):
         self.assertIn("new:stop", ai.selftest_worse(old, doc({"a:stop": "WIRED", "b:stop": "MISSING",
                                                                "new:stop": "MISSING"})) or "")
         self.assertEqual(ai.newly_declared_unregistered(old, doc({"new:stop": "MISSING"})), [])
+
+    def test_a_doctor_past_the_state_bound_records_no_states_and_stays_strict(self):  # review a36299f2 finding 1
+        rows = [dict(self.ROW, id="bulk%03d:stop" % n) for n in range(400)]
+        # placed FIRST, so a map cut at 400 rows would hold exactly the new rows and pass them all (on 949fb22d this
+        # installs); with no map past the bound the strict rule rolls back
+        ref = self.manifest_commit(rows, first=True)
+        with self.assertRaises(ai.InstallError) as caught:
+            self.install(ref=ref, files=("hooks_manifest.json", "extra.py"))
+        self.assertEqual(caught.exception.data["result"], "rolled_back")
+        self.assertIn("new failing doctor checks", str(caught.exception))
 
     def test_the_host_self_test_records_each_doctor_state(self):  # goodqa#15754 AC-10
         ref = self.manifest_commit([self.ROW])

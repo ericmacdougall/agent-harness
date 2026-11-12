@@ -171,11 +171,13 @@ def selftest():
                 items = data if isinstance(data, list) else data.get("findings") or data.get("checks") or []
                 failing = sorted(str(i.get("id") or "?") for i in items
                                  if isinstance(i, dict) and str(i.get("state", "WIRED")) not in ("WIRED", "PENDING"))
-                states = {}
-                for i in items[:400]:
-                    if isinstance(i, dict):
-                        states[str(i.get("id") or "?")[:80]] = str(i.get("state", "WIRED"))[:20]
-                res["doctor"] = {"flags": True, "failing": failing, "exit": p.returncode, "states": states}
+                res["doctor"] = {"flags": True, "failing": failing, "exit": p.returncode}
+                ids = [str(i.get("id") or "?") for i in items if isinstance(i, dict)]
+                # past the bound, or with ids that collide when cut, record nothing: the comparison then keeps the
+                # strict rule (a partial map could let a wired row past the bound pass as newly declared)
+                if len(ids) <= 400 and all(len(x) <= 80 for x in ids) and len(set(ids)) == len(ids):
+                    res["doctor"]["states"] = {str(i.get("id") or "?"): str(i.get("state", "WIRED"))[:20]
+                                               for i in items if isinstance(i, dict)}
         except subprocess.TimeoutExpired:
             res["doctor"] = {"flags": True, "failing": None, "timeout": True}
         except Exception as e:
@@ -608,7 +610,8 @@ def sha256(data):
 
 
 # ----------------------------------------------------------------------------- the self-test comparison
-UNREGISTERED = "MISSING"  # doctor's state for a declared hook that settings.json does not register
+UNREGISTERED = "MISSING"  # doctor's state for a declared, required hook that settings.json does not register
+NOT_REGISTERED_BEFORE = ("PENDING",)  # doctor's state for a declared, not yet required row: never registered either
 
 
 def _states(result):
@@ -617,14 +620,16 @@ def _states(result):
 
 
 def newly_declared_unregistered(before, after):
-    """Doctor ids the baseline manifest did not declare at all and that are declared but unregistered after the install
+    """Doctor ids the baseline manifest did not declare (or declared `pending`, so not registered then either) and that
+    are declared but unregistered after the install
     (goodqa#15754 AC-10: install-files ships a manifest that adds hook rows, and never edits settings.json, so those rows
     are MISSING until main registers them). They are reported, not a regression. Empty when either side has no states
     (an older baseline): the strict rule applies."""
     s0, s1 = _states(before), _states(after)
     if s0 is None or s1 is None:
         return []
-    return sorted(i for i, state in s1.items() if i not in s0 and state == UNREGISTERED)
+    return sorted(i for i, state in s1.items()
+                  if state == UNREGISTERED and (i not in s0 or s0[i] in NOT_REGISTERED_BEFORE))
 
 
 def selftest_worse(before, after):
@@ -855,6 +860,7 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
     if unregistered:
         # installed, but these hooks do not run until settings.json registers them (install.py's merge): never "live"
         extra["unregistered"] = unregistered
+        extra["registration_needed"] = True
         extra["note"] = ("hooks declared by the new manifest but not registered in settings.json on %s (they do not run "
                          "until registered): %s" % (host, ", ".join(unregistered[:10])))
     return finish(home, run, host, "installed", 0, extra, ticket, poster, kind_)
