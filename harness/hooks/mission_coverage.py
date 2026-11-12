@@ -10,7 +10,10 @@ Goals live in ONE canonical file, ~/.agent-harness/mission/goals.json (dir 0700,
     {id, title, ticket ('goodqa#N' or 'Project#N'), priority (1 = most important .. 9),
      status ('imported'|'active'|'done'|'deferred'|'retired'), deferral {by: 'user'|'ask'|'ticket', ref, until (ISO),
      source, renewal}, wait_count, bound [full agent ids main bound to the goal], retire {source},
-     done_evidence [{kind: 'deploy'|'really_tested', ref, session}], repos [paths], dashboard {...informational}}]}
+     done_evidence [{kind: 'deploy'|'really_tested', ref, session}], repos [paths], dashboard {...informational},
+     target {text, source} (main-only; the source resolves to the user's own words), aliases [words the status lint
+     matches], evidence [{id, session, wal, kind: 'deploy'|'live_test'|'test', at, by}] (goodqa#15754: WAL rows that
+     `ah goals` reads with no time window; `attach` checks each id exists)}]}
 Every write goes through this tool and appends a hash-chained row to ~/.agent-harness/state/mission-goals-audit.jsonl
 (rotated into chained segments past MAX_AUDIT_BYTES); a goals file that no longer matches the chain head is tampered.
 
@@ -94,7 +97,13 @@ HELPERS_DEFAULT = ("red-team", "click-tester", "reviewer", "fixer", "Explore", "
 DONE_LIKE = ("done", "live", "complete", "completed", "shipped", "retire", "retired")
 SCRIPT = "python3 ~/.claude/hooks/mission_coverage.py"
 GENESIS = "0" * 64
-MAIN_ONLY = ("set", "defer", "import-initiatives", "reseal", "activate", "set-session", "bind", "retire")
+MAIN_ONLY = ("set", "defer", "import-initiatives", "reseal", "activate", "set-session", "bind", "retire", "attach")
+# attach is open to an owner whose evidence row (or its WAL) names the goal; main's stamp lifts that and allows --remove
+ATTACH_KINDS = ("deploy", "live_test", "test")
+MAX_ATTACHED = 50
+MAX_ALIASES = 12
+WAL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}\.jsonl$")
+ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9 ./#+-]{1,39}$")
 STAMP_PURPOSE = "mission-main"
 # Every user quote (defer, retire, takeover) is judged by user_words_ok on the whole sentence, as written: no word
 # is ever removed to make a phrase pass (r14 F3: eade6bd deleted "not now" before the refusal check).
@@ -452,6 +461,26 @@ def _check_goal(g, index: int) -> dict:
         raise ValueError(f"{where}: repos must be a list of paths")
     if g.get("dashboard") is not None and not isinstance(g["dashboard"], dict):
         raise ValueError(f"{where}: dashboard must be an object")
+    tgt = g.get("target")
+    if tgt is not None and (not isinstance(tgt, dict) or not isinstance(tgt.get("text"), str)
+                            or not 0 < len(tgt["text"]) <= 300 or not isinstance(tgt.get("source"), str)
+                            or not 0 < len(tgt["source"]) <= 2000):
+        raise ValueError(f"{where}: target must be {{text, source}}")
+    aliases = g.get("aliases")
+    if aliases is not None and (not isinstance(aliases, list) or len(aliases) > MAX_ALIASES
+                                or not all(isinstance(a, str) and ALIAS_RE.match(a) for a in aliases)):
+        raise ValueError(f"{where}: aliases must be up to {MAX_ALIASES} short lower-case words")
+    attached = g.get("evidence")
+    if attached is not None:
+        if not isinstance(attached, list) or len(attached) > MAX_ATTACHED:
+            raise ValueError(f"{where}: evidence must be a list of up to {MAX_ATTACHED} rows")
+        for r in attached:
+            if not isinstance(r, dict) or not isinstance(r.get("id"), str) or not ASK_ID_RE.match(r["id"]) \
+                    or not isinstance(r.get("session"), str) or not SESSION_RE.match(r["session"]) \
+                    or not isinstance(r.get("wal"), str) or not WAL_NAME_RE.match(r["wal"]) \
+                    or r.get("kind") not in ATTACH_KINDS:
+                raise ValueError(f"{where}: evidence rows need id (w + 11 hex), session, wal and kind "
+                                 f"{'|'.join(ATTACH_KINDS)}")
     return g
 
 
@@ -791,10 +820,24 @@ def add_goal(home: Path, goal_id: str, title: str, ticket: str = "", priority: i
 
 
 def set_goal(home: Path, goal_id: str, *, title=None, ticket=None, priority=None, status=None, repos=None,
-             clear_deferral: bool = False) -> dict:
+             clear_deferral: bool = False, target=None, target_source=None, aliases=None, verify_source=None) -> dict:
     """Title, priority, clearing a deferral and setting a goal active again are open (they never hide work);
-    a ticket or repos change is main-only and alerts."""
-    stamp = require_main(home, "set") if (ticket is not None or repos is not None) else None
+    a ticket, repos, target or aliases change is main-only and alerts. A target needs a user: or answer: source that
+    resolves to the user's own words (goodqa#15754: a target is the user's, never an agent's)."""
+    main_fields = (ticket, repos, target, target_source, aliases)
+    stamp = require_main(home, "set") if any(v is not None for v in main_fields) else None
+    if (target is None) != (target_source is None):
+        raise MissionError("--target and --target-source go together: the target is the user's, cite their words")
+    if target is not None:
+        if not isinstance(target, str) or not 0 < len(target.strip()) <= 300:
+            raise MissionError("--target: 1 to 300 characters")
+        if not (verify_source or verify_user_source)(target_source):
+            raise MissionError("--target-source must be a user: or answer: source that resolves to the user's own "
+                               "words (ah user-msg prints it); an agent cannot set or move a target")
+    if aliases is not None:
+        aliases = [a.strip().lower() for a in aliases if a and a.strip()]
+        if len(aliases) > MAX_ALIASES or not all(ALIAS_RE.match(a) for a in aliases):
+            raise MissionError(f"--alias: up to {MAX_ALIASES} short lower-case words (2-40 characters)")
     if status == "done":
         raise MissionError(f"a goal is marked done only with evidence: `{SCRIPT} done --goal {goal_id} --deploy <deploy "
                            f"WAL id> --live-test <REALLY_TESTED id>`")
@@ -807,7 +850,9 @@ def set_goal(home: Path, goal_id: str, *, title=None, ticket=None, priority=None
     detail ={k: v for k, v in (("title", clean(title, 120) if title is not None else None),
                                 ("ticket", (ticket_key(ticket) or "") if ticket is not None else None),
                                 ("priority", priority), ("status", status), ("repos", repos),
-                                ("clear_deferral", clear_deferral or None)) if v is not None}
+                                ("clear_deferral", clear_deferral or None),
+                                ("target", clean(target, 120) if target is not None else None),
+                                ("aliases", aliases)) if v is not None}
     old = {}
 
     def change(doc):
@@ -821,6 +866,11 @@ def set_goal(home: Path, goal_id: str, *, title=None, ticket=None, priority=None
             g["priority"] = int(priority)
         if repos is not None:
             g["repos"] = list(repos)
+        if target is not None:
+            old["target"] = (g.get("target") or {}).get("text") or ""
+            g["target"] = {"text": target.strip()[:300], "source": target_source.strip()[:2000]}
+        if aliases is not None:
+            g["aliases"] = aliases
         if status == "active":
             if g.get("status") == "imported":
                 raise MissionError(f"an imported goal is activated by main: `{SCRIPT} activate --goal {goal_id}`")
@@ -837,7 +887,121 @@ def set_goal(home: Path, goal_id: str, *, title=None, ticket=None, priority=None
                                                                          "new": ticket_key(ticket) or ""})
     elif repos is not None:
         changed_alert(home, f"mission goal {goal_id} repos changed by main", {"goal": goal_id})
+    if target is not None:
+        changed_alert(home, f"mission goal {goal_id} target set by main from the user's words",
+                      {"goal": goal_id, "old": clean(old.get("target"), 120), "new": clean(target, 120)})
     return doc
+
+
+def find_wal_row(home: Path, session: str, wid: str, wal_name=None):
+    """(wal file name, record) of WAL entry `wid` in `session`'s WAL folder, or (None, None). Reads lines that hold the
+    id only; no time window (goodqa#15754)."""
+    if not SESSION_RE.match(session or "") or not ASK_ID_RE.match(wid or ""):
+        return None, None
+    folder = claude_dir() / "wals" / session
+    if not folder.is_dir() or folder.is_symlink():
+        return None, None
+    names = [wal_name] if wal_name else sorted(p.name for p in folder.glob("*.jsonl"))
+    needle = wid.encode()
+    for name in names:
+        if not WAL_NAME_RE.match(name or ""):
+            continue
+        path = folder / name
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            for _, raw in safe_input.iter_jsonl_lines(path, 1 << 20, max_total_bytes=256 << 20, max_seconds=10):
+                if raw is None or needle not in raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("id") == wid:
+                    return name, rec
+        except (OSError, safe_input.InputRejected):
+            continue
+    return None, None
+
+
+RT_NOTE = re.compile(r"^\s*REALLY_TESTED\s+[A-Za-z0-9._-]+")
+
+
+def _row_names_goal(home: Path, session: str, wal_name: str, rec: dict, goal: dict) -> bool:
+    """The evidence row names the goal (goal field, or the goal's ticket in its ticket field or note), or its WAL
+    names the goal's ticket or id anywhere: an owner attaches only evidence from its own stream."""
+    if rec.get("goal") == goal["id"]:
+        return True
+    key = ticket_key(goal.get("ticket"))
+    if key and (same_ticket(rec.get("ticket"), key) or any(same_ticket(t, key) for t in
+                                                           re.findall(r"[A-Za-z][A-Za-z0-9-]*\s*#\s*\d+|#\d+",
+                                                                      str(rec.get("note") or "")))):
+        return True
+    try:
+        text = safe_input.read_bounded(claude_dir() / "wals" / session / wal_name, 64 << 20).decode("utf-8", "replace")
+    except (OSError, safe_input.InputRejected):
+        return False
+    if re.search(r'"goal":\s*"' + re.escape(goal["id"]) + '"', text):
+        return True
+    if key:
+        slug, number = key.split("#")
+        return bool(re.search(r"(?i)\b" + re.escape(slug) + r"\s*#\s*" + number + r"\b", text))
+    return False
+
+
+def attach_evidence(home: Path, goal_id: str, wid: str, *, kind: str = "", session=None, remove: bool = False) -> dict:
+    """Attach WAL entry `wid` (a REALLY_TESTED row or a deploy event) to a goal, so `ah goals` shows it whatever its age.
+    Open to an owner whose row or WAL names the goal; main (stamp) may attach any row and --remove one."""
+    stamp = _PROOF.get("stamp") if _PROOF.get("cmd") == "attach" else None
+    _PROOF.clear()
+    by = "main" if stamp is not None else "owner"
+    mission = mission_session_of(home)
+    if stamp is not None and mission and str(stamp.get("session") or "").lower() != mission:
+        raise MissionError(f"attach is refused: the mission belongs to main session {mission}")
+    if remove and stamp is None:
+        raise MissionError("attach --remove is main-only (main's PreToolUse hook saw no such command)")
+    session = (session or mission or main_session(home) or "").lower()
+    if not SESSION_RE.match(session):
+        raise MissionError("attach needs --session (the session whose WALs hold the row)")
+    if not ASK_ID_RE.match(wid or ""):
+        raise MissionError("--evidence takes a WAL entry id (w + 11 hex digits)")
+    if remove:
+        def drop(doc):
+            g = _find(doc["goals"], goal_id)
+            g["evidence"] = [r for r in g.get("evidence") or [] if r.get("id") != wid]
+            return doc
+        return _mutate(home, "detach", goal_id, drop, {"id": wid}, stamp=stamp)
+    wal_name, rec = find_wal_row(home, session, wid)
+    if rec is None:
+        raise MissionError(f"no WAL entry {wid} in session {session}: attach only rows that exist")
+    note = str(rec.get("note") or "")
+    if rec.get("event") == "deploy":
+        found_kind = "deploy"
+    elif RT_NOTE.match(note):
+        found_kind = "live_test" if rec.get("live") is True else "test"
+    else:
+        raise MissionError(f"{wid} is a {clean(rec.get('event'), 20)} row: only REALLY_TESTED rows and deploy events "
+                           "are evidence")
+    kind = kind or found_kind
+    if kind not in ATTACH_KINDS or (found_kind == "deploy") != (kind == "deploy"):
+        raise MissionError(f"--kind {clean(kind, 20)} does not fit a {found_kind} row")
+    loaded = load_goals(home)
+    goal = next((g for g in loaded.get("goals") or [] if g["id"] == goal_id), None)
+    if goal is None:
+        raise MissionError(f"no goal {clean(goal_id)!r}; list them with `{SCRIPT} report`")
+    if stamp is None and not _row_names_goal(home, session, wal_name, rec, goal):
+        raise MissionError(f"{wid} comes from {wal_name}, which never names goal {goal_id} or its ticket "
+                           f"{goal.get('ticket') or '(none)'}; tag your row with `--goal {goal_id}` or ask main")
+
+    def change(doc):
+        g = _find(doc["goals"], goal_id)
+        rows = [r for r in g.get("evidence") or [] if r.get("id") != wid]
+        rows.append({"id": wid, "session": session, "wal": wal_name, "kind": kind, "at": iso(time.time()), "by": by})
+        if len(rows) > MAX_ATTACHED:
+            raise MissionError(f"goal {goal_id} already has {MAX_ATTACHED} evidence rows; main removes stale ones")
+        g["evidence"] = rows
+        return doc
+    return _mutate(home, "attach", goal_id, change, {"id": wid, "kind": kind, "wal": wal_name, "by": by}, stamp=stamp)
 
 
 def ask_states(home: Path, session: str) -> dict:
@@ -1978,6 +2142,15 @@ def build_parser():
     s.add_argument("--status", choices=("active",))
     s.add_argument("--repo", action="append", dest="repos")
     s.add_argument("--clear-deferral", action="store_true")
+    s.add_argument("--target", help="(main) the user's measurable target, with --target-source")
+    s.add_argument("--target-source", help="user:<session>/<uuid> \"words\" (ah user-msg prints it)")
+    s.add_argument("--alias", action="append", dest="aliases", help="(main) a word the status lint matches; repeat")
+    at = sub.add_parser("attach", help="attach a REALLY_TESTED row or deploy event to a goal (ah goals shows it)")
+    at.add_argument("--goal", required=True)
+    at.add_argument("--evidence", required=True, help="WAL entry id (w + 11 hex)")
+    at.add_argument("--kind", choices=ATTACH_KINDS)
+    at.add_argument("--session")
+    at.add_argument("--remove", action="store_true", help="(main) detach this id")
     d = sub.add_parser("defer", help="record what a goal waits on, or (main) the user's deferral")
     d.add_argument("--goal", required=True)
     d.add_argument("--ask")
@@ -2022,8 +2195,12 @@ def run(args, home: Path) -> tuple:
         return {"ok": True, "goal": args.goal}, 0
     if args.cmd == "set":
         set_goal(home, args.goal, title=args.title, ticket=args.ticket, priority=args.priority, status=args.status,
-                 repos=args.repos, clear_deferral=args.clear_deferral)
+                 repos=args.repos, clear_deferral=args.clear_deferral, target=args.target,
+                 target_source=args.target_source, aliases=args.aliases)
         return {"ok": True, "goal": args.goal}, 0
+    if args.cmd == "attach":
+        attach_evidence(home, args.goal, args.evidence, kind=args.kind or "", session=args.session, remove=args.remove)
+        return {"ok": True, "goal": args.goal, "evidence": args.evidence}, 0
     if args.cmd == "defer":
         defer_goal(home, args.goal, ask=args.ask, ticket=args.ticket, user_source=args.user_source, until=args.until,
                    session=args.session)

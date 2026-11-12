@@ -3000,6 +3000,10 @@ def build_parser():
     stt = sub.add_parser("status", help="evidence-only status report from the session WALs: VERIFIED, LIVE, PENDING, CLAIMED, ASSUMPTIONS")
     stt.add_argument("--session")
     stt.add_argument("--since", default="12h", help="window: <n>m|h|d (default 12h)")
+    gl = sub.add_parser("goals", help="per-goal status from the mission goal ledger, evidence of any age (goodqa#15754); "
+                                      "the entry point for 'what is left'")
+    gl.add_argument("--session")
+    gl.add_argument("--json", action="store_true", help="the full report as JSON (text is capped at 4 KB)")
     ap = sub.add_parser("approve-top", help="record the user's permission for the top writing rung for one task: "
                                             "verifies the user's own words ask for it, writes the ask pair, records the task grant")
     ap.add_argument("--task", required=True, help="the [task:<key>] the spawn will carry")
@@ -3160,6 +3164,9 @@ def run(args, home: Path) -> dict:
         if not s:
             raise AhError("session_unknown", "no session: pass --session or set CLAUDE_CODE_SESSION_ID")
         return status_report(home, s, parse_since(args.since))
+    if cmd == "goals":  # goodqa#15754: no time window on attached evidence; a missing or tampered ledger exits 2
+        import goals_view  # noqa: PLC0415
+        return goals_view.goals_report(home, session=args.session)
     if cmd == "approve-top":
         return approve_top_cmd(home, args)
     if cmd == "doctor":
@@ -3244,6 +3251,10 @@ def main(argv=None) -> int:
         json.dump({"ok": False, "code": "internal", "type": type(e).__name__}, sys.stdout)
         sys.stdout.write("\n")
         return 4
+    if args.cmd == "goals":
+        import goals_view  # noqa: PLC0415
+        sys.stdout.write((json.dumps(data, indent=2) if args.json else goals_view.goals_text(data)) + "\n")
+        return 0 if data.get("state") == "ok" else 2
     if args.text:
         sys.stdout.write(render_text(args.cmd, data) + "\n")
     else:
