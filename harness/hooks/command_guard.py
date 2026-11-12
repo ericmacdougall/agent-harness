@@ -1324,6 +1324,28 @@ def _git_out(repo, args, timeout, stdin=None):
     return done.stdout.decode('utf-8', 'surrogateescape')
 
 
+def _git_try(repo, args, timeout):
+    """Like _git_out (same sanitized environment and flags) but returns (returncode, stdout, stderr) so a caller can tell
+    "not a git repository" from every other failure."""
+    done = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+                           '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always',
+                           '-c', 'protocol.ssh.allow=always', '-c', 'protocol.git.allow=always', '-C', repo] + list(args),
+                          capture_output=True, timeout=max(0.2, timeout), env=_try_env())
+    return (done.returncode, done.stdout[:65536].decode('utf-8', 'surrogateescape'),
+            done.stderr[:4096].decode('utf-8', 'surrogateescape'))
+
+
+def _try_env():
+    """_clone_env for a caller that reads git's own error text: the C locale (a translated "not a git repository" must not
+    be mistaken for another failure) and a repository search as wide as the real command's (the user's shell may allow
+    crossing filesystems)."""
+    env = _clone_env()
+    env['LC_ALL'] = 'C'
+    env.pop('LANGUAGE', None)
+    env['GIT_DISCOVERY_ACROSS_FILESYSTEM'] = '1'
+    return env
+
+
 def _live_remote_refs(url, repo, timeout):
     """ref -> sha as the remote reports it now (read-only ls-remote). Replaced in tests."""
     out = _git_out(repo, ['ls-remote', '--heads', '--tags', '--', url], timeout)
@@ -1338,22 +1360,105 @@ def _live_remote_refs(url, repo, timeout):
 REMOTE_LS = _live_remote_refs
 
 
-def _config_refusal(listing):
+_TRUE_WORDS = ('true', 'yes', 'on', '1')
+_BOOL_WORDS = ('true', 'false', 'yes', 'no', 'on', 'off', '0', '1')
+_FALSE_WORDS = ('false', 'no', 'off', '0')
+WORKTREE_CONFIG_BYTES = 64 * 1024
+
+
+def _config_refusal(listing, allow_worktree_config=False):
     """`git config --local -z --list` output (git's own parse: a BOM, quoting or case games cannot hide a key).
-    Refuses an include, a section outside the whitelist, or a key that names a program git would run."""
+    Refuses an include, a section outside the whitelist, or a key that names a program git would run.
+    `allow_worktree_config` (the linked-worktree verifier only) accepts exactly one extension, `extensions.worktreeConfig`,
+    once and plainly true; any other extensions key, a subsection spelling, a duplicate or another value still refuses.
+    A bare key and an explicit empty value differ (the item has no newline for a bare key, which git reads as true)."""
+    seen = 0
     for item in filter(None, listing.split('\x00')):
-        key, _, value = item.partition('\n')
+        key, has_value, value = item.partition('\n')
         key = key.lower()
         section, _, rest = key.partition('.')
         leaf = key.rsplit('.', 1)[-1]
+        if allow_worktree_config and key == 'extensions.worktreeconfig':
+            seen += 1
+            if seen > 1:
+                return 'extensions.worktreeConfig is set more than once'
+            if has_value and value.strip().lower() not in _TRUE_WORDS:
+                return 'extensions.worktreeConfig is not plainly true'
+            continue
         if section in ('include', 'includeif'):
             return 'the repository config includes another file'
         if section not in CLONE_CONFIG_SECTIONS:
             return 'the repository config has a [%s] section' % section[:20]
-        if key == 'core.logallrefupdates' and value.strip().lower() in ('false', '0', 'no', 'off', 'never'):
-            return 'reflogs are switched off in the repository config'
+        if key == 'core.logallrefupdates' and has_value and value.strip().lower() not in _TRUE_WORDS + ('always',):
+            return 'reflogs are switched off in the repository config'  # git also reads 00, 0k and an empty value as false
         if '%s.%s' % (section, leaf) in CLONE_CONFIG_BAD_KEYS or (section == 'core' and leaf in CLONE_CONFIG_BAD_KEYS_CORE):
             return 'the repository config sets %s.%s' % (section, leaf)
+    return None
+
+
+def _worktree_config_enabled(listing):
+    return any(item.partition('\n')[0].lower() == 'extensions.worktreeconfig' for item in listing.split('\x00') if item)
+
+
+def _per_worktree_items_refusal(listing):
+    """What a per-worktree config file may hold: sparse-checkout switches, `index.sparse` (a sparse index changes the
+    index format only) and `core.bare` false. Anything else refuses (names only in the message, never a value)."""
+    for item in filter(None, listing.split('\x00')):
+        key, has_value, value = item.partition('\n')
+        key, word = key.lower(), value.strip().lower()
+        if key in ('core.sparsecheckout', 'core.sparsecheckoutcone', 'index.sparse'):
+            if has_value and word not in _BOOL_WORDS:
+                return 'a per-worktree config sets %s to a non-boolean value' % key
+            continue
+        if key == 'core.bare':
+            if not has_value or word not in _FALSE_WORDS:
+                return 'a per-worktree config makes the worktree bare'
+            continue
+        return 'a per-worktree config sets %s.%s' % (re.sub(r'[^a-z0-9_-]', '?', key.partition('.')[0])[:20],
+                                                      re.sub(r'[^a-z0-9_-]', '?', key.rsplit('.', 1)[-1])[:30])  # never a subsection: it can hold a URL with a token
+    return None
+
+
+def _per_worktree_config_refusal(path, common, git_dir, cwd, step):
+    """With `extensions.worktreeConfig` on, git reads $common/config.worktree for the primary worktree and
+    $common/worktrees/ID/config.worktree for a linked one. The programs a removal can start are decided by the worktrees
+    whose git commands run: the PRIMARY (the delegated removal runs from there), the TARGET (the cleanliness check runs
+    in it) and the worktree the caller stands in (the hook form runs from the caller's directory). Each of those files
+    is vetted (lstat first, plain file, size cap, `git config --file` read) before any other command that reads the
+    worktree; a missing file is fine. An unrelated linked worktree's file is never read by this removal and does not
+    decide it."""
+    files = [os.path.join(common, 'config.worktree'), os.path.join(git_dir, 'config.worktree')]
+    if cwd and os.path.isdir(cwd):
+        # The caller's own file is vetted whenever the caller stands inside ANY repository: comparing its common directory
+        # with ours by path text is fooled by a case spelling or a firmlink on macOS (red-team F1), so no match is tried.
+        # Only git's own "not a git repository" lets the lookup be skipped; any other failure or odd output refuses.
+        code, out, err = _git_try(cwd, ['rev-parse', '--path-format=absolute', '--absolute-git-dir'], step(2.0))
+        if code != 0:
+            if not (err.splitlines() or [''])[0].startswith('fatal: not a git repository'):  # the first line only
+                return 'could not determine the calling worktree'
+        else:
+            lines = out.splitlines()
+            if len(lines) != 1 or not lines[0].startswith('/'):
+                return 'could not determine the calling worktree'
+            files.append(os.path.join(os.path.realpath(lines[0]), 'config.worktree'))
+    seen = set()
+    for file in files:
+        if file in seen:
+            continue
+        seen.add(file)
+        try:
+            info = os.lstat(file)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return 'a per-worktree config file cannot be inspected'
+        if not stat.S_ISREG(info.st_mode):
+            return 'a per-worktree config file is not a plain file'
+        if info.st_size > WORKTREE_CONFIG_BYTES:
+            return 'a per-worktree config file is unusually large'
+        bad = _per_worktree_items_refusal(_git_out(path, ['config', '--file', file, '-z', '--list'], step(2.0)))
+        if bad:
+            return bad
     return None
 
 
@@ -1581,7 +1686,10 @@ def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None):
                 return 'local git attributes could hide changes or run filters'
         if os.path.getsize(os.path.join(common, 'config')) > 256 * 1024:
             return 'the repository config is unusually large'
-        bad = _config_refusal(_git_out(path, ['config', '--local', '-z', '--list'], step(2.0)))
+        shared = _git_out(path, ['config', '--local', '-z', '--list'], step(2.0))
+        bad = _config_refusal(shared, allow_worktree_config=True)
+        if not bad and _worktree_config_enabled(shared):
+            bad = _per_worktree_config_refusal(path, common, git_dir, cwd, step)
         if bad:
             return bad
         hooks_dir = os.path.join(common, 'hooks')
@@ -1888,7 +1996,8 @@ def remove_worktree(path, authenticated=False, expect_head=None, policy=None):
     _worktree_audit({'event': 'remove', 'path': path, 'head': report['head'], 'repo': report['repo']})
     problem = None
     try:
-        done = subprocess.run(['git', '-c', 'core.hooksPath=/dev/null', '-C', report['repo'], 'worktree', 'remove', '--', path],
+        done = subprocess.run(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-C', report['repo'],
+                               'worktree', 'remove', '--', path],
                               capture_output=True, text=True, timeout=REMOVE_SECONDS, env=_clone_env())
         returned, stderr = done.returncode, (done.stderr or '').strip()[:200]
     except (subprocess.SubprocessError, OSError, ValueError) as error:

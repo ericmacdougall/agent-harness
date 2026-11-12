@@ -617,6 +617,35 @@ class Delegation(unittest.TestCase):
         self.assertIs(self.audit_rows()[-1]["removed"], False)
         self.assertIs(result["removed"], False)
 
+    # receipt r5 N1: a self-contradicting answer is malformed, so the outcome is unknown
+    def test_removable_false_with_removed_true_is_a_malformed_answer_and_an_unknown_outcome(self):
+        before = len(self.audit_rows())
+        with self.assertRaises(ah_worktree.WorktreeError) as caught:
+            self.remove(FakeRun(verdict(removable=False, removed=True, reason="not clean")))
+        self.assertNoRemovalClaim(str(caught.exception))
+        rows = self.audit_rows()[before:]
+        self.assertIsNone(rows[-1]["removed"])
+        self.assertIn("unknown", rows[-1]["why"])
+
+    # receipt r5 N2: a removal that started and did not complete may have deleted part of the tree
+    def test_a_removal_that_started_and_did_not_complete_is_recorded_as_unknown_not_as_not_removed(self):
+        answer = verdict(removable=True, removed=False, directory_removed=False, registry_entry_left=True,
+                         reason="git worktree remove did not complete cleanly (TimeoutExpired; directory still there, "
+                                "registry entry left): ")
+        result = self.remove(FakeRun(answer))
+        row = self.audit_rows()[-1]
+        self.assertIsNone(row["removed"])
+        self.assertIsNone(result["removed"])
+        self.assertFalse(result["ok"])
+        self.assertIs(result["directory_removed"], False)
+        self.assertIs(result["registry_entry_left"], True)
+        for text in (row["why"], result["reason"]):
+            self.assertIn("partly deleted", text)
+            self.assertIn("check the host", text)
+        # a verifier refusal (nothing ran) stays a definite False
+        self.remove(FakeRun(verdict(removable=False, removed=False, reason="not clean")))
+        self.assertIs(self.audit_rows()[-1]["removed"], False)
+
     def test_a_definite_answer_is_recorded_as_a_definite_outcome(self):
         self.remove(FakeRun(verdict(removable=False, removed=False, reason="the working tree is not clean")))
         self.assertIs(self.audit_rows()[-1]["removed"], False)
