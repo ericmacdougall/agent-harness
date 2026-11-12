@@ -137,53 +137,63 @@ def verdict_match(stage, report):
 
 
 ANY_MARKER = re.compile(r'(?:VERDICT|[A-Z_]*_RESULT)\s*:\s*(?:PASS|ACCEPT|BLOCK)')
-# Bold and heading marks only. A quote mark is never stripped: a quoted line is somebody else's text.
-DECORATION = re.compile(r'^(?:\*\*|__|#{1,6}\s+)+|(?:\*\*|__)+\s*$')
-FENCE = re.compile(r'^\s{0,3}(?:`{3,}|~{3,})')
 VERDICT_LINE = {'pr': r'VERDICT: (PASS|BLOCK)', 'plan': r'PLAN_RESULT: (ACCEPT|BLOCK)',
                 'code-inspection': r'CODE_INSPECTION_RESULT: (ACCEPT|BLOCK)'}
-HOIST_MAX_LINES = 60
-HOIST_MAX_CHARS = 8000
+HOIST_MAX_LINES = 12
+HOIST_MAX_CHARS = 2000
+
+
+def opens_quoted_text(line):
+    """True when a preamble line could start text the reviewer is quoting rather than writing: a fence, a blockquote,
+    an indented code block (4+ columns of leading space or a tab) or an HTML block. Any of these before the marker
+    makes the hoist refuse, so the marker can never sit inside a container that the parser would have to track."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    indent = line[:len(line) - len(line.lstrip(' \t'))]
+    return (stripped.startswith(('```', '~~~', '>', '<')) or '\t' in indent or len(indent) >= 4)
 
 
 def hoist_verdict(stage, text):
-    """A reviewer that writes a short preamble before its verdict (goodqa#15723 lost three PR 207 receipts to this) still
-    gave a verdict. It is accepted only when it is unambiguous: exactly ONE verdict-looking marker in the whole text; a
-    line that is exactly the stage's verdict (nothing before it, nothing after it: trailing prose, a quote mark or a
-    code span disqualify it); not inside a fenced block; within the first lines; and never a PASS or ACCEPT carrying
-    markdown decoration (a decorated line is only ever a BLOCK). The text is returned verdict first, the preamble moved
-    below with a note, so the pass marker, the ticket parser and stage_report still see a first-line verdict. Anything
-    else is returned unchanged."""
+    """A reviewer that writes a short preamble before its verdict (goodqa#15723) still gave a verdict. It is hoisted
+    under ONE conservative rule, the same for PASS and BLOCK; anything else is returned unchanged (INVALID_OUTPUT):
+    - exactly one verdict-looking marker anywhere in the text, and its line is EXACTLY the stage's verdict at column 0
+      (no leading whitespace, quote mark, bold, heading or any other decoration; only trailing spaces are ignored);
+    - the marker is its own paragraph: the line before it is blank and the line after it is blank or the end;
+    - every preamble line before it is plain prose: no fence, no `>` line, no line indented 4+ columns or by a tab,
+      no HTML block line (opens_quoted_text);
+    - the preamble is at most HOIST_MAX_LINES lines and HOIST_MAX_CHARS characters.
+    Lines AFTER the marker may hold fences, quotes and code: reviewers put code in findings, and nothing after the
+    marker can contain it. A marker repeated after it still counts as a second marker, so it is never hoisted.
+    The text is returned verdict first, the preamble moved below with a note, so the pass marker, the ticket parser
+    and stage_report still see a first-line verdict."""
     if not isinstance(text, str) or verdict_match(stage, text):
         return text
     pattern = VERDICT_LINE.get(stage) if stage is not None else '|'.join(VERDICT_LINE.values())
     if pattern is None or len(ANY_MARKER.findall(text)) != 1:
         return text
-    lines = text.strip().splitlines()
-    fenced = False
-    for index, line in enumerate(lines[:HOIST_MAX_LINES]):
-        if FENCE.match(line):
-            fenced = not fenced
+    lines = [line.rstrip('\r') for line in text.split('\n')]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    for index, line in enumerate(lines[:HOIST_MAX_LINES + 1]):
+        if not re.fullmatch(pattern, line.rstrip(' \t')):
+            if opens_quoted_text(line):
+                return text
             continue
-        if fenced:
-            continue
-        plain = line.strip()
-        clean = DECORATION.sub('', plain).strip()
-        found = re.fullmatch(pattern, clean)
-        if not found:
-            continue
-        verdict = next(group for group in found.groups() if group is not None)
-        if verdict in {'PASS', 'ACCEPT'} and clean != plain:
-            return text  # a decorated line never makes a pass
-        preamble = '\n'.join(lines[:index]).strip()
-        if len(preamble) > HOIST_MAX_CHARS:
+        preamble = lines[:index]
+        if (not index or lines[index - 1].strip() or (index + 1 < len(lines) and lines[index + 1].strip())
+                or len('\n'.join(preamble)) > HOIST_MAX_CHARS):
             return text
-        rest = '\n'.join(lines[index + 1:]).strip()
-        if not index:
-            return clean + ('\n' + rest if rest else '')
+        verdict = line.rstrip(' \t')
+        after = lines[index + 1:]
+        while after and not after[0].strip():
+            after.pop(0)
+        rest = '\n'.join(after)  # leading indentation of a finding is kept
         note = ('[harness: the reviewer wrote %d line(s) before its verdict; the verdict line was moved to the top '
                 'and the preamble is kept below]' % index)
-        return clean + '\n' + (rest + '\n\n' if rest else '\n') + note + '\n' + preamble
+        return verdict + '\n' + (rest + '\n\n' if rest else '\n') + note + '\n' + '\n'.join(preamble).strip()
     return text
 
 

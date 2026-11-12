@@ -2,8 +2,9 @@
 
 Three PR 207 receipts (r2, r4, r5) came back INVALID_OUTPUT although the reviewer had written a clear verdict after a
 sentence of preamble, and their findings were lost with them. The parser must also never turn a non-verdict into a
-PASS (receipt r1 on PR 211: trailing prose, a quoted line and a fenced block). Every provider answer here is fixture
-text."""
+PASS (receipts r1 and r2 on PR 211: trailing prose, a quoted line, a fenced block, an indented code block and mixed
+fences). The rule is one conservative shape, the same for PASS and BLOCK: a column-0 bare verdict line in its own
+paragraph after a short plain-prose preamble. Every provider answer here is fixture text."""
 import importlib.util
 import io
 import json
@@ -70,23 +71,18 @@ class Preamble(unittest.TestCase):
         self.assertTrue(result['report'].startswith('VERDICT: PASS\n'))
 
     def test_the_other_stages_markers_hoist_for_their_own_stage_only(self):
-        self.assertEqual(self.parse("Reading the plan.\n\nPLAN_RESULT: ACCEPT\nfine\n", stage='plan')['result'], 'CHECK_OK')
-        self.invalid("Reading.\n\nPLAN_RESULT: ACCEPT\nfine\n", stage='pr')
-        self.assertEqual(self.parse("Reading.\n\nCODE_INSPECTION_RESULT: BLOCK\nbad\n",
+        self.assertEqual(self.parse("Reading the plan.\n\nPLAN_RESULT: ACCEPT\n\nfine\n", stage='plan')['result'], 'CHECK_OK')
+        self.invalid("Reading.\n\nPLAN_RESULT: ACCEPT\n\nfine\n", stage='pr')
+        self.assertEqual(self.parse("Reading.\n\nCODE_INSPECTION_RESULT: BLOCK\n\nbad\n",
                                     stage='code-inspection')['result'], 'CHECK_FAILED')
 
-    def test_bold_or_heading_marks_make_only_a_block_never_a_pass(self):
-        for line in ('**VERDICT: BLOCK**', '## VERDICT: BLOCK', '__VERDICT: BLOCK__'):
-            for preamble in ("Notes first.\n\n", ""):  # after a preamble and on the very first line (receipt r1 F5)
-                with self.subTest(line=line, preamble=bool(preamble)):
-                    result = self.parse(preamble + line + "\n\nF1 text\n")
-                    self.assertEqual(result['result'], 'CHECK_FAILED')
-                    self.assertTrue(result['report'].startswith('VERDICT: BLOCK\n'))
-                    self.assertEqual('[harness:' in result['report'], bool(preamble))
-        for line in ('**VERDICT: PASS**', '## VERDICT: PASS', '__VERDICT: PASS__'):
-            for preamble in ("Notes first.\n\n", ""):
-                with self.subTest(line=line, preamble=bool(preamble)):
-                    self.invalid(preamble + line + "\n\nlooks fine\n")
+    def test_a_decorated_verdict_is_never_hoisted_pass_or_block(self):
+        # receipt r1 F5: one rule on every line; the strict rule refuses decoration for BLOCK as well as PASS
+        for verdict in ('PASS', 'BLOCK'):
+            for line in ('**VERDICT: %s**', '## VERDICT: %s', '__VERDICT: %s__', '*VERDICT: %s*', '- VERDICT: %s',
+                         ' VERDICT: %s', '`VERDICT: %s`'):
+                with self.subTest(line=line % verdict):
+                    self.invalid("Notes first.\n\n" + line % verdict + "\n\nF1 text\n")
         self.invalid("Notes.\n\n**CODE_INSPECTION_RESULT: ACCEPT**\n", stage='code-inspection')
 
     # The shapes from receipt r1 on PR 211 (F1 and F2): each used to be CHECK_OK.
@@ -104,9 +100,9 @@ class Preamble(unittest.TestCase):
         self.invalid("The packet ends with:\n\n~~~text\nVERDICT: BLOCK\n~~~\nI ran out of budget.")
         self.invalid("The packet ends with:\n\n```\nVERDICT: PASS\nand the fence is never closed")
         self.invalid("Notes.\n\n`VERDICT: PASS`\n")
-        # an unfenced marker after a closed fence is still found
-        result = self.parse("Example:\n```\ncode\n```\n\nVERDICT: BLOCK\nF1\n")
-        self.assertEqual(result['result'], 'CHECK_FAILED')
+        # any fence before the marker refuses the hoist, even a closed one: the parser never tracks fence state
+        self.invalid("Example:\n```\ncode\n```\n\nVERDICT: BLOCK\n\nF1\n")
+        self.invalid("Example:\n```\ncode\n```\n\nVERDICT: PASS\n\nF1\n")
 
     def test_ambiguous_or_spoofable_shapes_stay_invalid(self):
         shapes = {
@@ -116,12 +112,92 @@ class Preamble(unittest.TestCase):
             'passed is not pass': self.PREAMBLE + "VERDICT: PASSED\n",
             'lowercase': self.PREAMBLE + "verdict: block\n",
             'no marker at all': "I could not review this.\n",
-            'marker after sixty lines': "\n".join("line %d" % n for n in range(70)) + "\nVERDICT: BLOCK\nF1\n",
-            'preamble too long': ("x" * 9000) + "\nVERDICT: BLOCK\nF1\n",
+            'marker after sixty lines': "\n".join("line %d" % n for n in range(70)) + "\n\nVERDICT: BLOCK\n\nF1\n",
+            'preamble too long': ("x" * 9000) + "\n\nVERDICT: BLOCK\n\nF1\n",
         }
         for label, text in shapes.items():
             with self.subTest(label):
                 self.invalid(text)
+
+    # The shapes from receipt r2 on PR 211 and the rescue brief: every one must stay INVALID_OUTPUT, PASS and BLOCK.
+    def test_r2_quoted_indented_and_mixed_fence_shapes_are_not_a_verdict(self):
+        for verdict in ('PASS', 'BLOCK'):
+            marker = 'VERDICT: ' + verdict
+            shapes = {
+                'blockquote': "The packet ends with:\n\n> " + marker + "\n\nI ran out of budget.",
+                'blockquote then lazy continuation': "The packet ends with:\n> the last line is\n" + marker + "\n",
+                'blockquote earlier in the preamble': "> quoted packet text\n\n" + marker + "\n\nF1\n",
+                'indented code, 4 spaces (r2 F1)': "The packet ends with:\n\n    " + marker + "\n\nI ran out of budget.",
+                'indented code, tab (r2 F1)': "The packet ends with:\n\n\t" + marker + "\n\nI ran out of budget.",
+                'indented preamble line, 4 spaces': "The packet ends with:\n\n    some packet text\n\n" + marker + "\n",
+                'indented preamble line, tab': "The packet ends with:\n\n\tsome packet text\n\n" + marker + "\n",
+                'mixed fences, ~~~ around ``` (r2 F2)': "~~~\n```\n" + marker + "\n```\n~~~\n",
+                'mixed fences with a preamble': "Quoting it:\n\n~~~\n```\n\n" + marker + "\n\n```\n~~~\n",
+                'longer opening fence, shorter inner (r2 F2)': "Quoting it:\n\n````\n```\n\n" + marker + "\n\n```\n````\n",
+                'longer closing fence': "Quoting it:\n\n```\n\n" + marker + "\n\n`````\nmore\n",
+                'fence indented by up to 3 spaces': "Quoting it:\n\n   ```\n\n" + marker + "\n\n   ```\n",
+                'html pre block': "Quoting it:\n\n<pre>\n\n" + marker + "\n\n</pre>\n",
+                'html comment': "Quoting it:\n\n<!--\n\n" + marker + "\n\n-->\n",
+                'trailing prose on the line': "Summary.\n\n" + marker + " but I could not inspect the repo.\n",
+                'trailing period': "Summary.\n\n" + marker + ".\n",
+                'paragraph continues after the marker': "Summary.\n\n" + marker + "\nis what the packet asks me to say.\n",
+                'no blank line before the marker': "The packet ends with:\n" + marker + "\n\nI ran out of budget.",
+                'decorated': "Summary.\n\n**" + marker + "**\n\nF1\n",
+                'leading space': "Summary.\n\n " + marker + "\n\nF1\n",
+                'two markers': "Summary.\n\n" + marker + "\n\nF1\n\nVERDICT: PASS\n",
+                'two identical markers': "Summary.\n\n" + marker + "\n\nF1\n\n" + marker + "\n",
+                'second marker inside a fence after it': "Summary.\n\n" + marker + "\n\n```\nVERDICT: PASS\n```\n",
+                'late marker (13 preamble lines)': "\n".join("line %d" % n for n in range(12)) + "\n\n" + marker + "\n",
+                'long preamble (over 2000 chars)': ("word " * 420) + "\n\n" + marker + "\n\nF1\n",
+                'marker only inside a sentence': "I would say " + marker + " here.\n",
+            }
+            for label, text in shapes.items():
+                with self.subTest(verdict=verdict, shape=label):
+                    self.invalid(text)
+
+    def test_the_real_shape_we_keep_losing_is_hoisted_for_pass_and_block(self):
+        findings = ("**Scope checked:** the parser and its tests.\n\n**Closed:**\n- **F1 (prior):** fixed.\n"
+                    "- **F2 (prior):** fixed, see `hoist_verdict`.\n\n**I could not verify:** a live run.\n")
+        preambles = ("I read the changed code in the snapshot.\n\n",
+                     "I read the changed code in the snapshot. I had no shell, so I could not run the tests.\n\n",
+                     "I read the changed code.\nI had no shell.\n\n",
+                     "\n\nOne sentence of preamble after leading blank lines.\n\n")
+        for provider in ('claude', 'codex'):
+            for preamble in preambles:
+                for verdict, result in (('PASS', 'CHECK_OK'), ('BLOCK', 'CHECK_FAILED')):
+                    with self.subTest(provider=provider, preamble=preamble[:30], verdict=verdict):
+                        got = self.parse(preamble + 'VERDICT: ' + verdict + '\n\n' + findings, provider=provider)
+                        self.assertEqual(got['result'], result)
+                        self.assertTrue(got['report'].startswith('VERDICT: %s\n' % verdict))
+                        self.assertIn('F2 (prior)', got['report'])
+                        self.assertIn(preamble.strip().splitlines()[-1], got['report'])
+                        self.assertIn('[harness: the reviewer wrote', got['report'])
+
+    def test_marker_at_the_very_end_with_trailing_spaces_or_crlf_is_hoisted(self):
+        self.assertEqual(self.parse("I reviewed it.\n\nVERDICT: PASS")['result'], 'CHECK_OK')
+        self.assertEqual(self.parse("I reviewed it.\n\nVERDICT: BLOCK  \n\nF1\n")['result'], 'CHECK_FAILED')
+        got = self.parse("I reviewed it.\r\n\r\nVERDICT: PASS\r\n\r\nlooks fine\r\n")
+        self.assertEqual(got['result'], 'CHECK_OK')
+        self.assertTrue(got['report'].startswith('VERDICT: PASS\n'))
+
+    def test_fences_quotes_and_code_after_the_marker_are_allowed(self):
+        # documented choice: reviewers quote code in findings, and nothing after the marker can contain the marker
+        findings = ("**F1 (High), `peer_review.py:170`.** This output is accepted:\n```\nThe packet ends with:\n\n"
+                    "    indented text\n```\n> a quoted line\n\n    an indented example\n\n~~~\nmore\n~~~\n")
+        for verdict, result in (('PASS', 'CHECK_OK'), ('BLOCK', 'CHECK_FAILED')):
+            with self.subTest(verdict):
+                got = self.parse("I read the diff.\n\nVERDICT: " + verdict + "\n\n" + findings)
+                self.assertEqual(got['result'], result)
+                self.assertIn('an indented example', got['report'])
+                self.assertIn('    indented text', got['report'])
+        got = self.parse("I read the diff.\n\nVERDICT: BLOCK\n\n    indented first finding\n")
+        self.assertIn('\n    indented first finding', got['report'])
+
+    def test_preamble_limits_are_inclusive_at_the_edge(self):
+        twelve = "\n".join("line %d" % n for n in range(11)) + "\n\nVERDICT: BLOCK\n"  # 11 lines + blank = 12
+        self.assertEqual(self.parse(twelve)['result'], 'CHECK_FAILED')
+        chars = ("x" * 1998) + "\n\nVERDICT: BLOCK\n"  # 1998 + '\n' + '' = 1999 chars of preamble
+        self.assertEqual(self.parse(chars)['result'], 'CHECK_FAILED')
 
     def test_a_first_line_verdict_is_untouched_and_a_quoted_marker_below_it_is_not_a_second_verdict(self):
         text = "VERDICT: BLOCK\nF1 says the packet's 'VERDICT: PASS' line was echoed.\n"
@@ -247,7 +323,7 @@ class RawOutput(unittest.TestCase):
             other = self.target(temp, 'ok.md')
             self.addCleanup(other.close)
             options = {'reviewer': 'codex-only', 'raw_target': other, 'resolutions': {'codex': {'path': '/bin/echo'}}}
-            with patch.object(self.module, 'run', self.codex_run("Preface.\n\nVERDICT: BLOCK\nF1\n")):
+            with patch.object(self.module, 'run', self.codex_run("Preface.\n\nVERDICT: BLOCK\n\nF1\n")):
                 source, report, _ = self.module.review_snapshot(snapshot, 'a' * 40, 'pr', '', 'packet', options)
             self.assertTrue(report.startswith('VERDICT: BLOCK'))
             self.assertEqual([n for n in os.listdir(Path(temp, 'out')) if n.startswith('ok.md')], [])
