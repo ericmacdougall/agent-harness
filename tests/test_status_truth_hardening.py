@@ -260,7 +260,10 @@ class F2PinnedEvidence(Base):
             return doc
         mc._mutate(self.home, "fixture", "*", strip, {})
         g = self.goal()
-        self.assertEqual(g["state"], "DONE_LIVE")  # legacy rows still count (documented choice)
+        # review L3: legacy rows still count, but an unpinned row cannot carry a goal to DONE_LIVE until main re-pins it
+        self.assertEqual(g["state"], "UNCONFIRMED")
+        self.assertEqual(g["cap"]["would_be"], "DONE_LIVE")
+        self.assertEqual(sorted(g["cap"]["unpinned"]), sorted([self.dep, self.lt]))
         self.assertEqual(sorted(g["unpinned"]), sorted([self.dep, self.lt]))
         self.assertTrue(all(e.get("unpinned") for e in g["evidence"]))
         self.assertIn("unpinned", gv.goals_text(gv.goals_report(self.home, session=SESSION), notes=False))
@@ -369,6 +372,268 @@ class F5OnePassAndVisibleBudget(Base):
         self.assertNotIn("GOALS UNAVAILABLE", ctx)
         self.assertIn("goal-9", ctx)
         self.assertLess(took, 8.0)
+
+
+# ---------------------------------------------------------------------------------------------------- round 3
+# PR 226 review (pr226-review/review.md): H1, H2, M1 side effect, L1 mutants M5/M10/M14, L2, L3.
+class H1PinnedVerdictStillScores(Base):
+    """review H1 (probe_b2_pins.py, probe_b3_owner_repin.py): a TAMPERED or MISSING pinned row is scored by its pinned
+    verdict at its pinned `at`, and any goal with one is capped below DONE_LIVE until main re-attaches or removes it."""
+    T0 = time.time() - 7200
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+        self.dep = self.row("main.jsonl", {"event": "deploy", "id": "wd0000000003", "at": iso(self.T0),
+                                           "note": "DEPLOYED abc1234def to prod goodqa#100"})
+        self.p1 = self.row(OWNER_WAL, {"event": "result", "id": "wa0000000031", "result": "PASS", "live": True,
+                                       "goal": "prod-move", "at": iso(self.T0 + 300),
+                                       "note": "REALLY_TESTED prod-smoke PASS: ok goodqa#100"})
+        self.f1 = self.row(OWNER_WAL, {"event": "result", "id": "wa0000000032", "result": "FAIL", "live": True,
+                                       "goal": "prod-move", "at": iso(self.T0 + 600),
+                                       "note": "REALLY_TESTED prod-smoke FAIL: login 500 goodqa#100"})
+
+    def attach(self, wid, kind, main=True):
+        argv = ["attach", "--goal", "prod-move", "--evidence", wid, "--kind", kind]
+        return self.main_run(argv) if main else self.run_mc(argv)
+
+    def rows(self):
+        return [json.loads(x) for x in (self.wal / OWNER_WAL).read_text().splitlines()]
+
+    def write(self, rows):
+        (self.wal / OWNER_WAL).write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    def to_pass(self, wid):
+        rows = self.rows()
+        for r in rows:
+            if r["id"] == wid:
+                r.update(result="PASS", note="REALLY_TESTED prod-smoke PASS: ok goodqa#100")
+        self.write(rows)
+
+    def main_attached_regression(self):
+        for wid, kind in ((self.dep, "deploy"), (self.p1, "live_test"), (self.f1, "live_test")):
+            self.assertEqual(self.attach(wid, kind)[0], 0)
+        self.assertEqual(self.goal()["state"], "FAILING")
+
+    def test_probe_b2_main_attached_newer_fail_rewritten_stays_failing(self):
+        self.main_attached_regression()
+        self.to_pass(self.f1)
+        g = self.goal()
+        self.assertEqual(g["state"], "FAILING")  # f4cbf628: DONE_LIVE
+        self.assertEqual(g["tampered"], [self.f1])
+        item = next(e for e in g["evidence"] if e["id"] == self.f1)
+        self.assertEqual((item["verdict"], item["pinned_verdict"]), ("TAMPERED", "FAIL"))
+
+    def test_probe_b2_deleted_fail_row_stays_failing(self):
+        self.main_attached_regression()
+        self.write([r for r in self.rows() if r["id"] != self.f1])
+        g = self.goal()
+        self.assertEqual(g["state"], "FAILING")  # f4cbf628 and origin/main: DONE_LIVE
+        self.assertEqual(g["missing"], [self.f1])
+
+    def test_probe_b2_duplicate_id_pass_prepended_stays_failing(self):
+        self.main_attached_regression()
+        rows = self.rows()
+        dup = dict(next(r for r in rows if r["id"] == self.f1), result="PASS", at=iso(self.T0 + 1200),
+                   note="REALLY_TESTED prod-smoke PASS: ok")
+        self.write([dup] + rows)
+        g = self.goal()
+        self.assertEqual(g["state"], "FAILING")  # f4cbf628: DONE_LIVE
+        self.assertEqual(g["tampered"], [self.f1])
+
+    def test_deleted_unpinned_legacy_fail_row_cannot_leave_done_live(self):
+        """L3: a legacy (unpinned) FAIL row deleted from its WAL has no pin to score from; the goal still cannot read
+        DONE_LIVE while that unpinned row is unresolved."""
+        self.main_attached_regression()
+
+        def strip(doc):
+            for e in doc["goals"][0]["evidence"]:
+                if e["id"] == self.f1:
+                    for k in ("row_sha", "row_verdict", "row_at"):
+                        e.pop(k, None)
+            return doc
+        mc._mutate(self.home, "fixture", "*", strip, {})
+        self.write([r for r in self.rows() if r["id"] != self.f1])
+        g = self.goal()
+        self.assertEqual(g["state"], "UNCONFIRMED")
+        self.assertEqual((g["cap"]["would_be"], g["cap"]["unpinned"]), ("DONE_LIVE", [self.f1]))
+
+    def test_duplicate_id_appended_changes_nothing(self):  # control: the first row with the id is the evidence
+        self.main_attached_regression()
+        with open(self.wal / OWNER_WAL, "a") as fh:
+            fh.write(json.dumps({"event": "result", "id": self.f1, "result": "PASS", "live": True,
+                                 "note": "REALLY_TESTED prod-smoke PASS: ok", "at": iso(self.T0 + 1200)}) + "\n")
+        g = self.goal()
+        self.assertEqual((g["state"], g["tampered"]), ("FAILING", []))
+
+    def test_probe_b3_owner_attached_fail_rewritten_stays_failing_and_owner_cannot_repin(self):
+        for wid, kind in ((self.dep, "deploy"), (self.p1, "live_test")):
+            self.assertEqual(self.attach(wid, kind)[0], 0)
+        self.assertEqual(self.attach(self.f1, "live_test", main=False)[0], 0)  # the owner attaches its own FAIL
+        self.assertEqual(self.goal()["state"], "FAILING")
+        self.to_pass(self.f1)
+        self.assertEqual(self.goal()["state"], "FAILING")  # origin/main: LIVE_UNTESTED; f4cbf628: DONE_LIVE
+        rc, out = self.attach(self.f1, "live_test", main=False)  # the owner re-pins its rewritten row
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("changed since it was attached", out)
+        g = self.goal()
+        self.assertEqual((g["state"], g["tampered"]), ("FAILING", [self.f1]))
+
+    def test_tampered_pass_caps_the_goal_below_done_live_until_main_reattaches(self):
+        for wid, kind in ((self.dep, "deploy"), (self.p1, "live_test")):
+            self.assertEqual(self.attach(wid, kind)[0], 0)
+        self.assertEqual(self.goal()["state"], "DONE_LIVE")
+        rows = self.rows()
+        rows[0]["note"] = "REALLY_TESTED prod-smoke PASS: ok (edited) goodqa#100"
+        self.write(rows)
+        g = self.goal()
+        self.assertEqual(g["state"], "UNCONFIRMED")
+        self.assertEqual(g["cap"], {"would_be": "DONE_LIVE", "tampered": [self.p1], "missing": [], "unpinned": []})
+        doc = gv.goals_report(self.home, session=SESSION)
+        self.assertIn("UNCONFIRMED", gv.goals_text(doc, notes=False))
+        import status_truth as st
+        hits = st.classify("Prod move is done and tested.", doc)["contradictions"]
+        self.assertEqual([(c["goal"], c["state"]) for c in hits], [("prod-move", "UNCONFIRMED")])
+        hits = st.classify("Prod move has not been started.", doc)["contradictions"]  # it has attached evidence
+        self.assertEqual([(c["goal"], c["rule"]) for c in hits], [("prod-move", "no-work")])
+        self.assertEqual(self.attach(self.p1, "live_test")[0], 0)  # main read it and re-attaches: re-pinned
+        g = self.goal()
+        self.assertEqual((g["state"], g["cap"]), ("DONE_LIVE", None))
+
+    def test_missing_pinned_pass_caps_the_goal_until_main_removes_it(self):
+        for wid, kind in ((self.dep, "deploy"), (self.p1, "live_test")):
+            self.assertEqual(self.attach(wid, kind)[0], 0)
+        self.write([r for r in self.rows() if r["id"] != self.p1])
+        g = self.goal()
+        self.assertEqual(g["state"], "UNCONFIRMED")
+        self.assertEqual(g["cap"]["missing"], [self.p1])
+        self.assertEqual(self.main_run(["attach", "--goal", "prod-move", "--evidence", self.p1, "--remove"])[0], 0)
+        self.assertEqual(self.goal()["state"], "LIVE_UNTESTED")
+
+    def test_deferred_goal_still_shows_the_cap(self):
+        for wid, kind in ((self.dep, "deploy"), (self.p1, "live_test")):
+            self.assertEqual(self.attach(wid, kind)[0], 0)
+        self.write([r for r in self.rows() if r["id"] != self.p1])
+
+        def defer(doc):
+            doc["goals"][0]["status"] = "deferred"
+            return doc
+        mc._mutate(self.home, "fixture", "*", defer, {})
+        self.assertEqual(self.goal()["state"], "UNCONFIRMED")
+
+
+class H2CapIsUnavailable(Base):
+    """review H2 / mutant M14: a WAL cut at its scan cap while attached ids are unresolved is GOALS UNAVAILABLE."""
+
+    def build(self):
+        self.seed()
+        pad = json.dumps({"at": iso(time.time()), "event": "pretool", "pad": "x" * 300}) + "\n"
+        self.early = self.row("main.jsonl", {"event": "result", "id": "wc0000000001", "result": "PASS",
+                                             "note": "REALLY_TESTED early PASS: ok goodqa#100"})
+        with open(self.wal / "main.jsonl", "a") as fh:
+            fh.write(pad * 40)
+        self.late = self.row("main.jsonl", {"event": "result", "id": "wc0000000002", "result": "PASS",
+                                            "note": "REALLY_TESTED late PASS: ok goodqa#100"})
+
+    def test_unresolved_attached_row_past_the_cap_is_unavailable(self):
+        self.build()
+        for wid in (self.early, self.late):
+            self.assertEqual(self.main_run(["attach", "--goal", "prod-move", "--evidence", wid, "--kind", "test"])[0], 0)
+        with mock.patch.object(gv, "WAL_SCAN_BYTES", 8192):
+            doc = gv.goals_report(self.home, session=SESSION)
+        self.assertEqual(doc["state"], "timeout")  # f4cbf628: "ok" with the late row MISSING
+        self.assertIn("size cap", doc["error"])
+        self.assertIn("GOALS UNAVAILABLE (timeout)", gv.goals_text(doc))
+
+    def test_capped_file_with_every_attached_row_resolved_stays_ok(self):  # control
+        self.build()
+        self.assertEqual(self.main_run(["attach", "--goal", "prod-move", "--evidence", self.early, "--kind",
+                                        "test"])[0], 0)
+        with mock.patch.object(gv, "WAL_SCAN_BYTES", 8192):
+            doc = gv.goals_report(self.home, session=SESSION)
+        self.assertEqual(doc["state"], "ok")
+        self.assertEqual(doc["goals"][0]["state"], "VERIFIED")
+
+
+class L1MutantGaps(Base):
+    """review L1: mutants M5 (header fallback without the audit check) and M10 (spacing in the tool_use_id scan)."""
+
+    def test_m5_tampered_ledger_header_gives_no_mission_scope(self):
+        """NEG-8: goals.json still parses, but no longer matches its audit chain: no mission session from the header."""
+        import status_truth as st
+        self.seed()
+        self.assertEqual(st._ledger_header_mission(), SESSION)  # control: a verified header names the session
+        pointer = st._pointer_path()
+        pointer.unlink(missing_ok=True)
+        path = mc.goals_path(self.home)
+        doc = json.loads(path.read_text())
+        doc["mission_session"] = OTHER
+        path.write_text(json.dumps(doc))
+        self.assertEqual(mc.load_goals(self.home)["state"], "ok")
+        self.assertFalse(mc.verify_audit(self.home).get("ok"))
+        self.assertEqual(st._ledger_header_mission(), "")
+        self.assertFalse(pointer.exists())
+
+    def test_m10_spaced_tool_result_ends_the_call(self):
+        self.seed()
+        args = ["attach", "--goal", "prod-move", "--evidence", "wd0000000009", "--kind", "deploy"]
+        tid = self.tool_id()
+        self.pretool("python3 ~/.claude/hooks/mission_coverage.py " + " ".join(args), tid)
+        self.assertEqual(len(self.stamps()), 1)
+        with open(self.transcript, "a") as fh:
+            fh.write('{"type": "user", "message": {"content": [{"tool_use_id" : "%s", "type": "tool_result"}]}}\n'
+                     % tid)
+        mc.claim_main(args, self.home)
+        self.assertIsNone(mc._PROOF.get("stamp"))
+
+
+class M1StampNotBurnedByAProbe(Base):
+    """review M1 side effect: take_stamp claimed the stamp before its checks, so any process that failed them (it cannot
+    read main's transcript, its TTL differs) still burned main's stamp and main's own command then failed main-only."""
+
+    def test_failed_check_leaves_the_stamp_for_main(self):
+        self.seed()
+        args = ["attach", "--goal", "prod-move", "--evidence", "wd0000000009", "--kind", "deploy"]
+        tid = self.tool_id()
+        self.pretool("python3 ~/.claude/hooks/mission_coverage.py " + " ".join(args), tid)
+        self.assertEqual(len(self.stamps()), 1)
+        with mock.patch.object(caller_identity, "call_still_running", return_value=False):
+            mc.claim_main(args, self.home)  # a probe that cannot prove the call
+        self.assertIsNone(mc._PROOF.get("stamp"))
+        self.assertEqual(len(self.stamps()), 1)  # f4cbf628: 0 (burned)
+        mc.claim_main(args, self.home)  # main's own process, still inside its call
+        self.assertIsNotNone(mc._PROOF.get("stamp"))
+        self.assertEqual(self.stamps(), [])
+
+    def test_wrong_purpose_or_expired_stamp_is_not_consumed(self):
+        caller_identity.put_stamp("mission-main", ["x", "y"], session=SESSION, home=self.home)
+        self.assertIsNone(caller_identity.take_stamp("mission-main", ["x", "y"], home=self.home, ttl=-1))
+        self.assertEqual(len(self.stamps()), 1)
+        self.assertIsNotNone(caller_identity.take_stamp("mission-main", ["x", "y"], home=self.home))
+        self.assertEqual(self.stamps(), [])
+
+
+class L2CanonicalDigest(Base):
+    def test_lone_surrogates_and_question_mark_digest_differently(self):
+        a = json.loads('{"id":"w0","note":"x\\ud800"}')
+        b = json.loads('{"id":"w0","note":"x\\udc00"}')
+        c = {"id": "w0", "note": "x?"}
+        self.assertEqual(len({mc.row_digest(a), mc.row_digest(b), mc.row_digest(c)}), 3)  # f4cbf628: 1
+
+    def test_pin_made_with_the_old_digest_still_matches_a_non_ascii_row(self):
+        import hashlib
+        rec = {"id": "w0", "note": "REALLY_TESTED x PASS: café — ok"}
+        old = hashlib.sha256(json.dumps(rec, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                             .encode("utf-8", "replace")).hexdigest()
+        self.assertNotEqual(old, mc.row_digest(rec))
+        self.assertTrue(mc.row_matches(old, rec))
+        self.assertTrue(mc.row_matches(mc.row_digest(rec), rec))
+        bad = json.loads('{"id":"w0","note":"x\\ud800"}')  # the old digest collides here: never accepted for it
+        old_bad = hashlib.sha256(json.dumps(bad, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                                 .encode("utf-8", "replace")).hexdigest()
+        self.assertFalse(mc.row_matches(old_bad, bad))
+        # (a legacy pin cannot say whether it was taken over "x?" or "x\ud800"; it keeps matching "x?". No legacy pin
+        # exists outside this branch, and the review found no verdict-changing use.)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,9 @@ session's WALs, and states what the records prove:
   LIVE_UNTESTED  a deploy with no passing live test at or after it
   VERIFIED       a passing test that is not a live test
   FAILING        the newest attached test is a FAIL (a FAIL row never counts as proof)
+  UNCONFIRMED    an attached row changed or vanished after attach (TAMPERED / MISSING against its pin), or an
+                 unpinned legacy row would carry the goal to DONE_LIVE: never done until main re-attaches (re-pins)
+                 or removes the named rows; `cap.would_be` says what the rows would otherwise give
   IN_PROGRESS    no proof yet, an owner holds it (signed ops-watch owner snapshot)
   UNKNOWN        no proof and no known owner. Never "not started": the records do not say that.
   DEFERRED / RETIRED   from the ledger status
@@ -22,11 +25,15 @@ Rows tagged `--goal` but not attached are listed as `tag` candidates and never c
 tag, so it cannot make a goal done (spec review H1). An owner-attached live test without a deploy counts as VERIFIED.
 DONE_LIVE says the attached live test passed; it does not compare the target's number, which is printed beside it.
 Attached rows are pinned (red-team F2): attach stores the row's canonical-JSON sha256, verdict and `at`. A row whose
-content no longer matches its pin reads TAMPERED: it never counts, it is listed in the goal's `tampered` list and the
-text names it. A legacy entry written before pinning has no pin: it still counts (main read it when it attached it)
-but is flagged `unpinned`; main's re-attach of the same id pins it.
+content no longer matches its pin reads TAMPERED, and a pinned row that no longer resolves reads MISSING; both are
+listed (`tampered`, `missing`) and named in the text. PR 226 review H1: such a row is SCORED BY ITS PIN (its pinned
+verdict at its pinned `at`), so rewriting or deleting a FAIL row never removes the FAIL, and the goal is capped at
+UNCONFIRMED (unless it is FAILING) until main re-attaches or removes the row; an owner cannot re-pin a changed row.
+A legacy entry written before pinning has no pin: it still counts (main read it when it attached it) and is flagged
+`unpinned`, but it cannot carry a goal to DONE_LIVE (review L3): main's re-attach of the same id pins it.
 Attached rows are resolved in one pass per WAL file under EVIDENCE_BUDGET_S (red-team F5); a pass that runs out of
-time is the error state "timeout" (GOALS UNAVAILABLE), never a partial answer.
+time is the error state "timeout" (GOALS UNAVAILABLE), never a partial answer; so is a WAL cut at its size cap
+(WAL_SCAN_BYTES) while attached ids in it are unresolved (PR 226 review H2).
 A missing, unreadable or tampered ledger is an error (exit 2), never "nothing left". Output text is at most 4 KB.
 Evidence notes are agent-written WAL text: redacted (dropped when the redactor cannot load) and labelled as data.
 Stdlib only; read-only.
@@ -55,8 +62,8 @@ RT_RE = re.compile(r"^\s*REALLY_TESTED\s+([A-Za-z0-9._-]+)")
 LEGACY_FAIL = re.compile(r"\b(?:FAIL(?:ED|S|ING)?|FALSIFIED|NOT installed)\b|\bcode only\b")
 TAG_RE = re.compile(rb'"goal":\s*"([a-z0-9][a-z0-9_-]{0,63})"')
 COUNTED = ("PASS", "UNSTATED")
-ORDER = {"FAILING": 0, "UNKNOWN": 1, "LIVE_UNTESTED": 2, "IN_PROGRESS": 3, "VERIFIED": 4, "DEFERRED": 5,
-         "LIVE_TESTED": 6, "DONE_LIVE": 7, "RETIRED": 8}
+ORDER = {"FAILING": 0, "UNCONFIRMED": 1, "UNKNOWN": 2, "LIVE_UNTESTED": 3, "IN_PROGRESS": 4, "VERIFIED": 5,
+         "DEFERRED": 6, "LIVE_TESTED": 7, "DONE_LIVE": 8, "RETIRED": 9}
 
 
 def _redact(text: str) -> str:
@@ -114,13 +121,15 @@ def index_wals(home: Path, wanted: dict, tag_session: str, goal_ids, as_of=None,
     tagged `goal: <id>` (wal_note --goal). Files holding attached ids are read first, each once; a tag-only file is
     skipped once tag_budget_s has passed. The whole call stops at budget_s (default EVIDENCE_BUDGET_S): if any file
     with an unresolved attached id was not read to its end, the result says timeout (the caller reports
-    GOALS UNAVAILABLE, never a partial state). Returns {"rows": {(session, wal, id): record}, "tags": {goal: [(wal,
-    record)]}, "timeout": bool, "tag_partial": bool, "capped": [wal names cut at the size cap]}."""
+    GOALS UNAVAILABLE, never a partial state); a file cut at WAL_SCAN_BYTES with an attached id still unresolved is
+    the same timeout (review H2: the rows past the cap are the newest, the likeliest regression FAILs). Returns
+    {"rows": {(session, wal, id): record}, "tags": {goal: [(wal, record)]}, "timeout": bool, "tag_partial": bool,
+    "capped": [wal names cut at the size cap], "capped_unresolved": [wal names cut with attached ids unresolved]}."""
     budget_s = EVIDENCE_BUDGET_S if budget_s is None else budget_s
     started = time.monotonic()
     deadline = started + budget_s
     tags = {g: [] for g in goal_ids}
-    out = {"rows": {}, "tags": tags, "timeout": False, "tag_partial": False, "capped": []}
+    out = {"rows": {}, "tags": tags, "timeout": False, "tag_partial": False, "capped": [], "capped_unresolved": []}
     plan = {}  # path -> {"session", "ids", "tags"}
     for (session, wal), ids in wanted.items():
         folder = mc.claude_dir() / "wals" / str(session)
@@ -157,6 +166,10 @@ def index_wals(home: Path, wanted: dict, tag_session: str, goal_ids, as_of=None,
         if status == "capped":
             out["capped"].append(entry["path"].name)
             out["tag_partial"] = out["tag_partial"] or entry["tags"]
+            if any((entry["session"], entry["path"].name, i) not in out["rows"] for i in entry["ids"]):
+                out["capped_unresolved"].append(entry["path"].name)
+                out["timeout"] = True
+                break
     return out
 
 
@@ -304,16 +317,21 @@ def _mtime(path: Path) -> float:
 
 def _item(home: Path, now: float, session: str, wal: str, rec, kind: str, wid: str, by: str, pin=None) -> dict:
     """One evidence row. pin: the ledger entry of an attached row (row_sha / row_verdict / row_at), None for a tag."""
-    if rec is None:
-        return {"id": wid, "kind": kind, "verdict": "MISSING", "at": None, "age_s": None, "wal": wal, "by": by,
-                "note": "attached id not found in its WAL"}
-    if pin is not None and pin.get("row_sha") and pin.get("row_sha") != mc.row_digest(rec):
+    pinned = pin is not None and bool(pin.get("row_sha"))
+    if rec is None or (pinned and not mc.row_matches(pin.get("row_sha"), rec)):
+        # review H1: a changed (TAMPERED) or vanished (MISSING) pinned row is scored by its pin (`_score`: the pinned
+        # verdict at the pinned `at`, see scored()), so editing or deleting a FAIL row never removes the FAIL
+        label = "MISSING" if rec is None else "TAMPERED"
+        if not pinned:
+            return {"id": wid, "kind": kind, "verdict": "MISSING", "at": None, "age_s": None, "wal": wal, "by": by,
+                    "unpinned": pin is not None, "note": "attached id not found in its WAL"}
         at = mc.parse_ts(pin.get("row_at"))
         at = min(at, now) if at else None
-        return {"id": wid, "kind": kind, "verdict": "TAMPERED", "at": mc.iso(at) if at else None,
+        return {"id": wid, "kind": kind, "verdict": label, "at": mc.iso(at) if at else None,
                 "age_s": int(now - at) if at else None, "wal": wal, "by": by, "_at": at, "_explicit": False,
-                "pinned_verdict": pin.get("row_verdict"), "check": None,
-                "note": "row changed after it was attached; not counted (main re-attaches after reading it)"}
+                "_score": pin.get("row_verdict"), "pinned_verdict": pin.get("row_verdict"), "check": None,
+                "note": ("attached id not found in its WAL" if rec is None else "row changed after it was attached")
+                + "; scored by its pinned verdict, goal capped until main re-attaches or removes it"}
     at = mc.parse_ts(rec.get("at"))
     if at:
         at = min(at, now)  # a future timestamp never sorts ahead of real rows (red-team L5)
@@ -327,6 +345,16 @@ def _item(home: Path, now: float, session: str, wal: str, rec, kind: str, wid: s
             "check": (RT_RE.match(str(rec.get("note") or "")) or [None, None])[1],
             "unpinned": pin is not None and not pin.get("row_sha"),
             "note": excerpt(rec.get("note"))}
+
+
+def scored(i: dict) -> dict:
+    """The row as the state computation sees it: a TAMPERED or MISSING pinned row counts with its pinned verdict at its
+    pinned `at`, under its own id (no check name: only main's re-attach clears it). Owner rows: a pinned FAIL or DEPLOY
+    counts; a pinned PASS does not (whether it was explicit is not pinned), the safe direction."""
+    pv = i.get("_score")
+    if not pv:
+        return i
+    return dict(i, verdict=pv, check=None, _explicit=pv in ("FAIL", "DEPLOY") or i.get("by") == "main")
 
 
 def counted(i: dict) -> bool:
@@ -408,6 +436,11 @@ def goals_report(home: Path, now=None, as_of=None, session=None, owner_rows=None
             wanted.setdefault((r["session"], r["wal"]), set()).add(r["id"])
     index = index_wals(home, wanted, session, [g["id"] for g in goals], as_of=as_of, budget_s=budget_s,
                        tag_budget_s=scan_budget_s)
+    if index["capped_unresolved"]:
+        return dict(base, state="timeout", error="the WAL read for attached evidence stopped at the size cap "
+                                                 f"({WAL_SCAN_BYTES >> 20} MB per file) in "
+                                                 + ", ".join(sorted(set(index["capped_unresolved"])))[:200]
+                                                 + " with attached rows still unresolved; check the WAL sizes")
     if index["timeout"]:
         return dict(base, state="timeout", error="the WAL read for attached evidence ran out of time "
                                                  f"({EVIDENCE_BUDGET_S if budget_s is None else budget_s:g} s); "
@@ -430,7 +463,8 @@ def goals_report(home: Path, now=None, as_of=None, session=None, owner_rows=None
         for r in g.get("evidence") or []:
             rec = index["rows"].get((r["session"], r["wal"], r["id"]))
             # as_of: the pinned `at` when there is one (a moved timestamp cannot hide a row from a replay)
-            if rec is not None and as_of is not None and mc.parse_ts(r.get("row_at") or rec.get("at")) > as_of:
+            when = r.get("row_at") or (rec or {}).get("at")
+            if as_of is not None and when and (rec is not None or r.get("row_sha")) and mc.parse_ts(when) > as_of:
                 continue
             items.append(_item(home, now, r["session"], r["wal"], rec, r["kind"], r["id"], r.get("by") or "?",
                                pin=r))
@@ -444,7 +478,18 @@ def goals_report(home: Path, now=None, as_of=None, session=None, owner_rows=None
             kind = "deploy" if v == "DEPLOY" else ("live_test" if rec.get("live") is True else "test")
             items.append(_item(home, now, session, wal, rec, kind, str(wid or "?"), "tag"))
         status = g.get("status", "active")
-        state = evidence_state(items)
+        state = evidence_state([scored(i) for i in items])
+        # review H1/L3: a changed or vanished pinned row caps the goal below DONE_LIVE (unless it is FAILING) until
+        # main re-attaches or removes it; an unpinned legacy row cannot carry it to DONE_LIVE until main re-pins it
+        cap_ids = {"tampered": [i["id"] for i in items if i["verdict"] == "TAMPERED"],
+                   "missing": [i["id"] for i in items if i["verdict"] == "MISSING" and i.get("_score")],
+                   "unpinned": [i["id"] for i in items if i.get("unpinned")
+                                and (counted(i) or i["verdict"] == "MISSING")]}
+        cap = None
+        if ((cap_ids["tampered"] or cap_ids["missing"]) and state != "FAILING") \
+                or (cap_ids["unpinned"] and state == "DONE_LIVE"):
+            cap = dict(would_be=state or None, **cap_ids)
+            state = "UNCONFIRMED"
         key = mc.ticket_key(g.get("ticket"))
         holders = []
         if owner_rows:
@@ -452,7 +497,7 @@ def goals_report(home: Path, now=None, as_of=None, session=None, owner_rows=None
                               and mc.live_owner(r)} - {None})
         if status == "retired":
             state = "RETIRED"
-        elif status == "deferred" and state not in ("DONE_LIVE", "FAILING"):
+        elif status == "deferred" and state not in ("DONE_LIVE", "FAILING", "UNCONFIRMED"):
             state = "DEFERRED"
         elif not state:
             state = "IN_PROGRESS" if holders else "UNKNOWN"
@@ -460,6 +505,7 @@ def goals_report(home: Path, now=None, as_of=None, session=None, owner_rows=None
         for i in items:
             i.pop("_at", None)
             i.pop("_explicit", None)
+            i.pop("_score", None)
         deferral = g.get("deferral") or {}
         out.append({"id": g["id"], "title": excerpt(g.get("title"), 120), "ticket": key or "",
                     "ledger_status": status, "state": state, "priority": g.get("priority", 3),
@@ -470,7 +516,7 @@ def goals_report(home: Path, now=None, as_of=None, session=None, owner_rows=None
                     "missing": [i["id"] for i in items if i["verdict"] == "MISSING"],
                     "tampered": [i["id"] for i in items if i["verdict"] == "TAMPERED"],
                     "unpinned": [i["id"] for i in items if i.get("unpinned")],
-                    "evidence": items})
+                    "cap": cap, "evidence": items})
     out.sort(key=lambda r: (ORDER.get(r["state"], 9), r["priority"], r["id"]))
     return dict(base, state="ok", session=session, mission_session=mission, goals=out)
 
@@ -491,7 +537,8 @@ def goals_text(doc: dict, limit: int = TEXT_LIMIT, notes: bool = True) -> str:
     head = (f"Goals from the mission ledger ({len(doc['goals'])} goals, evidence of any age"
             + (f", as of {doc['as_of']}" if doc.get("as_of") else "") + "). Report these states; UNKNOWN means "
             "no record either way, never 'not started'. DONE_LIVE = main attached a deploy and a later live PASS; "
-            "LIVE_TESTED = main attached a live PASS, no deploy record (compare the target yourself). Only DONE_LIVE "
+            "LIVE_TESTED = main attached a live PASS, no deploy record (compare the target yourself). UNCONFIRMED = "
+            "attached evidence changed, vanished or is unpinned since attach; not done until main re-attaches. Only DONE_LIVE "
             "is done: never call a goal below it done; say its state and the unmet part of the target. A goal below "
             "DONE_LIVE (including LIVE_TESTED) must not be called done, and is live only when LIVE_TESTED or "
             "LIVE_UNTESTED. FAIL rows never count; owner rows cap at VERIFIED; `tag` rows are unattached candidates."
@@ -505,6 +552,11 @@ def goals_text(doc: dict, limit: int = TEXT_LIMIT, notes: bool = True) -> str:
             bits.append(f"    target: {g['target'][:note_cap]}")
         if g.get("owners"):
             bits.append("    owner: " + ", ".join(a[:17] for a in g["owners"][:3]))
+        if g.get("cap"):
+            c = g["cap"]
+            ids = [x for x in c["tampered"] + c["missing"] + c["unpinned"] if WAL_ID_RE.match(str(x))]
+            bits.append(f"    capped: would be {c.get('would_be') or 'no proof'}; main re-attaches or removes "
+                        + ",".join(ids[:6]))
         if g.get("deferral"):
             d = g["deferral"]
             bits.append(f"    deferred: {d.get('by')} {d.get('ref') or ''} until {d.get('until') or '?'}" if notes
@@ -531,12 +583,13 @@ def goals_text(doc: dict, limit: int = TEXT_LIMIT, notes: bool = True) -> str:
         head += "\nWARNING: attached evidence no longer resolves: " + "; ".join(missing)[:300]
     tampered = [f"{g['id']}:{','.join(g['tampered'])}" for g in doc["goals"] if g.get("tampered")]
     if tampered:
-        head += ("\nWARNING: TAMPERED evidence (WAL row changed after attach; not counted): "
+        head += ("\nWARNING: TAMPERED evidence (WAL row changed after attach; scored by its pinned verdict, goal "
+                 "capped until main re-attaches): "
                  + "; ".join(tampered)[:300])
     unpinned = sum(len(g.get("unpinned") or []) for g in doc["goals"])
     if unpinned:
-        head += (f"\nnote: {unpinned} attached row(s) are unpinned (attached before pinning; counted; main's "
-                 "re-attach pins them)")
+        head += (f"\nnote: {unpinned} attached row(s) are unpinned (attached before pinning; counted, never to "
+                 "DONE_LIVE; main's re-attach pins them)")
     for per_goal, note_cap in ((3, 110), (2, 80), (1, 60), (1, 30), (0, 0)):
         lines = [head]
         for g in doc["goals"]:

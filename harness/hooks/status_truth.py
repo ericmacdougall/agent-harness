@@ -77,7 +77,7 @@ NOBODY = re.compile(r"(?i)\b(?:nobody|no one|no-one) (?:is )?(?:working|on it|ow
 DONE_CLAIM = re.compile(r"(?i)(?:\b(?:is|are|now|all|fully) (?:done|complete|finished)\b|:\s*\**\s*done\b|"
                         r"\bdone and (?:tested|live)\b|\bdone,? (?:deployed|live)\b|\bcomplete and tested\b)")
 LIVE_CLAIM = re.compile(r"(?i)(?:\b(?:is|are|now) live\b|\b(?:has |have )?shipped\b|:\s*\**\s*live\b)")
-EVIDENCED = ("DONE_LIVE", "LIVE_TESTED", "LIVE_UNTESTED", "VERIFIED", "FAILING", "IN_PROGRESS")
+EVIDENCED = ("DONE_LIVE", "LIVE_TESTED", "LIVE_UNTESTED", "VERIFIED", "FAILING", "IN_PROGRESS", "UNCONFIRMED")
 CLAIMS = (  # (name, regex, states it contradicts); negative claims first, a clause matching one is never a done claim
     ("not-done", NOT_DONE, ("DONE_LIVE",)),
     ("not-live", NOT_LIVE, ("DONE_LIVE", "LIVE_TESTED", "LIVE_UNTESTED")),

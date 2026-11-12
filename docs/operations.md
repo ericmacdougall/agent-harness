@@ -1337,6 +1337,17 @@ bound to main's tool call) that `mission_gate.py pretool` writes only when the P
   dead for every process. `mission_gate.py posttool` (PostToolUse, PostToolUseFailure and PermissionDenied, Bash) also
   deletes the call's unconsumed stamps. A payload without `tool_use_id` gets no stamp. Run main-only commands in the
   foreground: a `run_in_background` call returns its tool_result at once, so its command is refused.
+- `take_stamp` runs every check (purpose, TTL, the call still running) before it claims the stamp; a caller that fails
+  one leaves the stamp in place, so a probe cannot burn main's stamp (PR 226 review M1).
+- What the stamp proves today, and its window (PR 226 review M1, not closed): "main's PreToolUse hook saw exactly this
+  argument list in a main call that has not ended yet, at most 60 s ago". It does not prove that the consuming process
+  is main's. Any same-user process that runs the identical argument list inside that window (from PreToolUse until the
+  call's tool_result or Post hook, at most 60 s, including while a permission prompt is open) is taken for main. A
+  per-call nonce (PreToolUse `updatedInput` prefixing `AH_MAIN_NONCE=<random>`, the stamp holding only its hash) would
+  close it: Claude Code 2.1.322 applies `updatedInput` from a settings hook without a permission decision, but it also
+  stores every PreToolUse hook's stdout verbatim in main's transcript, so the nonce would sit in clear text in a Claude
+  log during the call. It was not shipped for that reason; it is the design to reuse for the `review-auth` and
+  `ack-handoff` stamps (goodqa#15829) if that copy is accepted.
 
 - The stamp is keyed by the sha256 of the exact argument list after the script (`argv_key`; `--flag=value` reads as
   `--flag value`), so it covers that one command and nothing else.
@@ -1483,14 +1494,27 @@ stalled goal, plus the option to queue the goal on its ticket.
   `--event deploy` (naming a sha or version). States: DONE_LIVE (main-attached deploy and a later main-attached live
   PASS), LIVE_TESTED (main-attached live PASS, no deploy), LIVE_UNTESTED, VERIFIED, FAILING (a main-attached FAIL
   clears only with a main-attached PASS of the same check), IN_PROGRESS, UNKNOWN (no record, never "not started").
-- Attach pins the row (red-team F2): the ledger entry stores `row_sha` (sha256 of the row as canonical JSON),
-  `row_verdict` and `row_at`. A row whose WAL content changed after attach shows as `TAMPERED` in `ah goals`, never
-  counts, and is named on a `WARNING: TAMPERED evidence` line; main reads the row again and re-attaches it (or
-  removes it with `--remove`). Entries attached before pinning still count but are flagged `(unpinned)`; main's
-  re-attach of the same id pins them.
+- Attach pins the row (red-team F2): the ledger entry stores `row_sha` (sha256 of the row as canonical JSON with
+  ASCII escapes), `row_verdict` and `row_at`. A row whose WAL content changed after attach shows as `TAMPERED` in
+  `ah goals`, a pinned row that no longer resolves as `MISSING`; both are named on a WARNING line.
+- A TAMPERED or MISSING pinned row is scored by its pin (PR 226 review H1): its pinned verdict at its pinned `at`, so
+  rewriting or deleting a FAIL row never removes the FAIL. The goal is also capped at `UNCONFIRMED` (unless it is
+  FAILING), with `cap.would_be` and the row ids in `ah goals --json` and a `capped:` line in the text, until main reads
+  the row and re-attaches it or removes it with `--remove`. An owner cannot re-attach (re-pin) a row that changed
+  since it was attached. The Stop lint treats UNCONFIRMED like any state below DONE_LIVE ("done" is an over-claim).
+  `ah status --since` does not read the goal ledger, so the cap shows in `ah goals` and the status-truth hooks only.
+- Entries attached before pinning still count but are flagged `(unpinned)`, and an unpinned row cannot carry a goal to
+  DONE_LIVE (review L3: the goal reads UNCONFIRMED with `cap.unpinned`). Rollout, once per host that has a ledger
+  (`~/.agent-harness/mission/goals.json`; the Mac has none yet): run `ah goals --json`, and for every id in a goal's
+  `unpinned` list main reads the WAL row and runs `mission_coverage.py attach --goal G --evidence ID --kind KIND`
+  (the same kind) to pin it, or `--remove` to drop it. A row edited before that re-pin cannot be detected; read it.
+- Pins written by the first PR 226 build (ensure_ascii=False digest) still match: `row_matches` accepts that digest
+  for any row without a lone surrogate (the only rows where it collided).
 - One pass per WAL file (red-team F5): `ah goals` and the hooks read each WAL file once for all attached ids and goal
   tags, within one time budget (hooks 5 s, `ah goals` 20 s). A read that runs out of time is the state `timeout`
-  (`GOALS UNAVAILABLE (timeout)`, exit 2), never a partial answer.
+  (`GOALS UNAVAILABLE (timeout)`, exit 2), never a partial answer. So is a WAL file cut at its 256 MB scan cap while
+  attached rows in it are still unresolved (PR 226 review H2); a capped file whose attached rows all resolved only
+  adds a warning.
   `ah status` calls a deploy record linked to a REALLY_TESTED row LINKED_LIVE; prose live claims are LIVE_LEGACY.
 - `status_truth.py` hooks, mission session only (decided from the ledger, remembered in
   `~/.agent-harness/state/status-truth/mission-session` so a broken ledger never widens it; before the first remembered

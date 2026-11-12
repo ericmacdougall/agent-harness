@@ -201,10 +201,32 @@ def parse_ts(value) -> float:
 
 
 def row_digest(rec) -> str:
-    """sha256 of a WAL row as canonical JSON (sorted keys, no spaces): what attach pins and ah goals re-checks (F2).
-    Canonical rather than the raw line, so re-serialising an unchanged row (key order, spacing) is not a change."""
-    return hashlib.sha256(json.dumps(rec, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-                          .encode("utf-8", "replace")).hexdigest()
+    """sha256 of a WAL row as canonical JSON (sorted keys, no spaces, ASCII escapes): what attach pins and ah goals
+    re-checks (F2). Canonical rather than the raw line, so re-serialising an unchanged row (key order, spacing) is not
+    a change. ensure_ascii=True (PR 226 review L2): every character, a lone surrogate included, has its own escape, so
+    no two different rows share one serialisation (ensure_ascii=False with utf-8 "replace" mapped lone surrogates and
+    "?" to the same bytes)."""
+    return hashlib.sha256(json.dumps(rec, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+                          .encode("ascii")).hexdigest()
+
+
+def legacy_row_digest(rec):
+    """The first pinning digest (ensure_ascii=False, utf-8), for pins written before row_digest changed; None for a
+    row the old digest cannot tell apart from another (one holding a lone surrogate, which "replace" turned into
+    "?"). For an ASCII-only row both digests are equal."""
+    try:
+        data = json.dumps(rec, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return hashlib.sha256(data).hexdigest()
+
+
+def row_matches(pin_sha, rec) -> bool:
+    """Whether a pinned row_sha still matches the WAL row: the current digest, or the legacy one where it is
+    collision-free (pins made by the first PR 226 build stay valid rather than all reading TAMPERED)."""
+    if not isinstance(pin_sha, str) or not pin_sha:
+        return False
+    return pin_sha == row_digest(rec) or pin_sha == legacy_row_digest(rec)
 
 
 def sha(data: bytes) -> str:
@@ -1022,6 +1044,12 @@ def attach_evidence(home: Path, goal_id: str, wid: str, *, kind: str = "", sessi
         if stamp is None and any(r.get("id") == wid and r.get("by") == "main" for r in g.get("evidence") or []):
             # spec rev 3 NEG-4 (red-team H3): a re-attach would rewrite main's row (by, kind); only main changes it
             raise MissionError(f"{wid} is already attached to {goal_id} by main; only main can change or remove it")
+        if stamp is None and any(r.get("id") == wid and r.get("row_sha") and not row_matches(r["row_sha"], rec)
+                                 for r in g.get("evidence") or []):
+            # PR 226 review H1 (probe_b3): an owner who rewrote its own attached row must not re-pin it; the changed
+            # row keeps scoring by its pinned verdict until main reads it and re-attaches (or removes) it
+            raise MissionError(f"{wid} changed since it was attached to {goal_id}; only main can re-attach it "
+                               "(ask main to read the row and re-attach or remove it)")
         rows = [r for r in g.get("evidence") or [] if r.get("id") != wid]
         # F2: pin the row as attach saw it; ah goals marks it TAMPERED when the WAL row changes later (a re-attach
         # re-pins: main's re-attach is how a legacy, unpinned entry gets its pin)

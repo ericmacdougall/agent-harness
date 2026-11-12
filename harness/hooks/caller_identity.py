@@ -102,36 +102,65 @@ def put_stamp(purpose: str, parts, session: str = "", home=None, now=None, tool_
 
 def take_stamp(purpose: str, parts, home=None, now=None, bound: bool = False, ttl=None):
     """The stamp record (consumed) or None: missing, already used, expired or unreadable. bound=True also requires a
-    stamp bound to a tool call that has not ended yet (call_still_running); ttl overrides STAMP_TTL_SECONDS."""
+    stamp bound to a tool call that has not ended yet (call_still_running); ttl overrides STAMP_TTL_SECONDS.
+    Every check runs BEFORE the stamp is claimed (PR 226 review M1): a caller that cannot prove the stamp (wrong
+    purpose, too old for its TTL, cannot see main's call still running) leaves it in place, so a probe never burns
+    main's stamp. Of two callers that both pass, the atomic rename lets only one consume it."""
     folder = stamp_dir(home)
     path = folder / (stamp_key(purpose, parts) + ".json")
+    raw = _read_stamp(path)
+    if raw is None or not _stamp_ok(raw, purpose, now, bound, ttl):
+        return None
     claimed = folder / (path.stem + ".%s.claimed" % uuid.uuid4().hex[:8])
     try:
-        if path.is_symlink():
-            return None
         os.rename(str(path), str(claimed))  # atomic: of two takers only one wins
     except OSError:
         return None
-    try:
-        with open(str(claimed), "rb") as handle:
-            data = json.loads(handle.read(4096).decode("utf-8"))
-    except (OSError, ValueError):
-        data = None
-    finally:
+    got = _read_stamp(claimed)
+    if got != raw and (got is None or not _stamp_ok(got, purpose, now, bound, ttl)):
+        # a new stamp replaced the checked one between the read and the claim and this caller cannot prove it: put
+        # it back unless yet another stamp has arrived meanwhile
         try:
-            os.unlink(str(claimed))
+            os.link(str(claimed), str(path))
         except OSError:
             pass
-    if not isinstance(data, dict) or data.get("purpose") != purpose:
+        got = None
+    try:
+        os.unlink(str(claimed))
+    except OSError:
+        pass
+    return json.loads(got.decode("utf-8")) if got is not None else None
+
+
+def _read_stamp(path: Path):
+    """The raw bytes of one stamp file (no symlink, regular file, at most 4096 bytes) or None."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
         return None
     try:
-        if (now or time.time()) - float(data["ts"]) > (STAMP_TTL_SECONDS if ttl is None else ttl):
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
             return None
+        return os.read(fd, 4096)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _stamp_ok(raw: bytes, purpose: str, now, bound: bool, ttl) -> bool:
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return False
+    if not isinstance(data, dict) or data.get("purpose") != purpose:
+        return False
+    try:
+        if (now or time.time()) - float(data["ts"]) > (STAMP_TTL_SECONDS if ttl is None else ttl):
+            return False
     except (KeyError, TypeError, ValueError):
-        return None
-    if bound and not call_still_running(data):
-        return None
-    return data
+        return False
+    return not bound or call_still_running(data)
 
 
 def call_still_running(data) -> bool:
