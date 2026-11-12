@@ -246,6 +246,52 @@ class GrowthTests(Base):
         self.run_check((0, probe()), state, NOW)
 
 
+class RedTeamRound1Tests(Base):
+    """F1 partial read is visible, F3 window to 48 h, F4 unsized/cdrom, F6 mount normalised."""
+
+    def test_partial_read_below_every_threshold_still_raises_unknown_for_watched_vms(self):
+        text = "##PVESM\n" + pvesm(total_g=1000, used_g=500, avail_g=500) + "##QM\n##DU\n##END\n"
+        got = self.run_check((0, text))[0]
+        self.assertEqual(sorted(k for k in got if k.startswith("disk:vmunknown:")),
+                         [f"disk:vmunknown:t2-proxmox:/var/lib/vz:{v}" for v in (102, 103)])
+        self.assertTrue(all(a["message"].startswith("UNKNOWN") for k, a in got.items() if "vmunknown" in k))
+
+    def test_a_watched_vm_missing_from_qm_list_is_unknown_even_with_other_vms_present(self):
+        qm = {k: v for k, v in QM.items() if k != 103}
+        got = self.run_check((0, probe(qm=qm)))[0]
+        self.assertIn("disk:vmunknown:t2-proxmox:/var/lib/vz:103", got)
+        self.assertNotIn("disk:vmunknown:t2-proxmox:/var/lib/vz:102", got)
+
+    def test_complete_read_has_no_vmunknown(self):
+        self.assertFalse([k for k in self.pool() if "vmunknown" in k])
+
+    def test_growth_window_reaches_48_hours(self):
+        state = {}
+        GrowthTests.sample(self, state, 700, NOW - 30 * 3600)
+        got = self.run_check((0, probe()), state, NOW)[0]
+        self.assertIn(GROWTH, got)
+        self.assertEqual(got[GROWTH]["detail"]["growth_gib_day"], 118.4)
+        state = {}
+        GrowthTests.sample(self, state, 700, NOW - 49 * 3600)
+        self.assertNotIn(GROWTH, self.run_check((0, probe()), state, NOW)[0])
+
+    def test_baseline_closest_to_a_day_is_preferred(self):
+        samples = [[NOW - 40 * 3600, 1, {}], [NOW - 25 * 3600, 2, {}], [NOW - 7 * 3600, 3, {}]]
+        self.assertEqual(ow.pool_baseline(samples, NOW)[1], 2)
+
+    def test_unsized_disk_keeps_sized_siblings_and_cdrom_does_not_count(self):
+        qm = {**QM, 103: QM[103] + "scsi2: local:103/vm-103-disk-2.raw\nide2: local:iso/x.iso,media=cdrom,size=4G\n"}
+        d = self.run_check((0, probe(qm=qm)))[0][KEY]["detail"]
+        self.assertEqual(d["vms"]["103"]["allocated_gib"], 500.0)
+        self.assertIn("103", d["unsized_vms"])
+
+    def test_trailing_slash_mount_keeps_one_key_and_state_record(self):
+        self.cfg["proxmox_pools"][0]["mount"] = "/var/lib/vz/"
+        got, state, _ = self.run_check((0, probe()))
+        self.assertIn(KEY, got)
+        self.assertEqual(list(state["proxmox_pools"]), ["t2-proxmox:/var/lib/vz"])
+
+
 class CommandAndConfigTests(Base):
     READ_WORDS = {"echo", "pvesm", "status", "--storage", "qm", "list", "awk", "config", "du", "-sk", "for", "in",
                   "do", "done", "local"}

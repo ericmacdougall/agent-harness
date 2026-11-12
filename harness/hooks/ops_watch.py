@@ -1366,7 +1366,7 @@ POOL_DISK = re.compile(r"^(?:scsi|virtio|sata|ide|efidisk|tpmstate)\d+:\s*([A-Za
 POOL_SIZE = re.compile(r"(?:^|,)size=(\d+(?:\.\d+)?)([KMGT]?)(?:,|$)")
 POOL_UNITS = {"": 1 / GIB, "K": KIB / GIB, "M": KIB ** 2 / GIB, "G": 1.0, "T": 1024.0}
 POOL_WARN_PCT, POOL_HIGH_PCT, POOL_CRIT_PCT, POOL_FLOOR_GIB = 85.0, 92.0, 97.0, 20.0
-POOL_GROWTH_GIB_DAY, POOL_GROWTH_MIN_S, POOL_GROWTH_MAX_S = 10.0, 6 * 3600, 24 * 3600
+POOL_GROWTH_GIB_DAY, POOL_GROWTH_MIN_S, POOL_GROWTH_MAX_S = 10.0, 6 * 3600, 48 * 3600
 POOL_SAMPLE_GAP_S, POOL_SAMPLE_KEEP_S, POOL_SAMPLE_MAX = 1800, 48 * 3600, 120
 POOL_UNKNOWN_HIGH_S = 1800
 
@@ -1424,17 +1424,18 @@ def parse_pool_probe(text: str, storage: str):
         return None
     vms = {}
     for vm_id, cfg in sections.get("VM", {}).items():
-        total = 0.0
+        total, unsized = 0.0, False
         for line in cfg:
             m = POOL_DISK.match(line.strip())
-            if not m or m.group(1) != storage:
+            if not m or m.group(1) != storage or "media=cdrom" in m.group("rest"):
                 continue
             size = POOL_SIZE.search(m.group("rest"))
             if not size:
-                total = None
-                break
+                unsized = True
+                continue
             total += float(size.group(1)) * POOL_UNITS[size.group(2)]
-        vms[vm_id] = {"gib": total if cfg else None}  # no config lines at all: unknown, not zero
+        # no config lines at all: unknown, not zero; a disk without a size keeps the sized ones and is flagged
+        vms[vm_id] = {"gib": None if not cfg or (unsized and not total) else total, "unsized": unsized}
     du = {}
     for line in sections.get("DU", []):
         m = re.fullmatch(r"(\d+)\s+\S*/images/(\d{1,10})", line.strip())
@@ -1444,9 +1445,9 @@ def parse_pool_probe(text: str, storage: str):
 
 
 def pool_baseline(samples: list, now: float):
-    """The oldest stored sample 6 h to 24 h old, else None."""
+    """The stored sample 6 h to 48 h old that is closest to 24 h, else None."""
     ok = [s for s in samples if POOL_GROWTH_MIN_S <= now - s[0] <= POOL_GROWTH_MAX_S]
-    return min(ok, key=lambda s: s[0]) if ok else None
+    return min(ok, key=lambda s: abs(now - s[0] - 24 * 3600)) if ok else None
 
 
 def check_proxmox_pool(cfg, state, runner, now):
@@ -1455,7 +1456,8 @@ def check_proxmox_pool(cfg, state, runner, now):
     for entry in cfg.get("proxmox_pools") or []:
         entry = entry if isinstance(entry, dict) else {}
         host = str(entry.get("host", ""))
-        storage, mount = str(entry.get("storage", "local")), str(entry.get("mount", "/var/lib/vz"))
+        storage = str(entry.get("storage", "local"))
+        mount = str(entry.get("mount", "/var/lib/vz")).rstrip("/") or "/"
         watch = entry.get("watch_vms", [])
         base = f"{host[:64]}:{mount[:100]}"
         if (not REMOTE_HOST.fullmatch(host) or not POOL_STORAGE.fullmatch(storage) or not POOL_MOUNT.fullmatch(mount)
@@ -1505,7 +1507,7 @@ def _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, use
         return round(max(delta, 0) / GIB / days, 2) if days else None
 
     provisioned = [v["gib"] for v in parsed["vms"].values()]
-    unsized = sorted(str(k) for k, v in parsed["vms"].items() if v["gib"] is None)
+    unsized = sorted(str(k) for k, v in parsed["vms"].items() if v["gib"] is None or v.get("unsized"))
     prov_gib = round(sum(g for g in provisioned if g), 2)
     vms = {}
     for v in watch:
@@ -1529,6 +1531,11 @@ def _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, use
         out.append(alert("proxmox_pool", f"disk:volume:{base}", sev,
                          f"{host} {storage} pool {pct:.1f}% used, {free_gib:.0f} GiB free, "
                          f"{detail['overcommit_ratio']}x overcommitted", detail))
+    for v in watch:  # a watched VM that cannot be read must be visible even when the pool is below every threshold
+        if (parsed["vms"].get(v) or {}).get("gib") is None or parsed["du"].get(v) is None:
+            out.append(alert("proxmox_pool", f"disk:vmunknown:{base}:{v}", "warning",
+                             f"UNKNOWN: VM {v} config or disk usage missing from the {host} {storage} probe; "
+                             "its growth is not being watched", {"host": host[:64], "vm": v}))
     if base_sample:
         rate = per_day(used - base_sample[1])
         if rate is not None and rate > POOL_GROWTH_GIB_DAY:
