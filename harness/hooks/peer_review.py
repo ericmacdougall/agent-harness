@@ -162,8 +162,11 @@ def opens_quoted_text(line):
 
 
 def hoist_verdict(stage, text):
-    """A reviewer that writes a short preamble before its verdict (goodqa#15723) still gave a verdict. It is hoisted
-    under ONE conservative rule, the same for PASS and BLOCK; anything else is returned unchanged (INVALID_OUTPUT):
+    """A reviewer that writes a short preamble before its verdict (goodqa#15723) still gave a verdict, but only a BLOCK
+    is ever hoisted: plain prose can quote a marker ("The packet ends with:\n\nVERDICT: PASS", receipt r3 F1), and a
+    quoted BLOCK can only fail the review, which is safe. A PASS or ACCEPT counts only as the bare first non-blank line
+    (verdict_match); after a preamble it stays INVALID_OUTPUT and the raw answer is saved. A BLOCK is hoisted only
+    under these rules; anything else is returned unchanged (INVALID_OUTPUT):
     - exactly one verdict-looking marker anywhere in the text, and its line is EXACTLY the stage's verdict at column 0
       (no leading whitespace, quote mark, bold, heading or any other decoration; only trailing spaces are ignored);
     - the marker is its own paragraph: the line before it is blank and the line after it is blank or the end;
@@ -189,6 +192,8 @@ def hoist_verdict(stage, text):
             if opens_quoted_text(line):
                 return text
             continue
+        if not line.rstrip(' \t').endswith(': BLOCK'):
+            return text  # receipt r3 F1: a PASS or ACCEPT after a preamble may be quoted; only the first line counts
         preamble = lines[:index]
         if (not index or lines[index - 1].strip() or (index + 1 < len(lines) and lines[index + 1].strip())
                 or len('\n'.join(preamble)) > HOIST_MAX_CHARS):
@@ -896,13 +901,26 @@ def routing_evidence(options):
     return {**options.get('review_routing', {}), 'actual_reviewer': options.get('actual_reviewer')}
 
 
+def verdict_instruction(stage):
+    """The reviewer's verdict instruction. Reviewers that wrote a preface before the verdict lost real receipts
+    (goodqa#15723), and a PASS after a preface is never accepted (a quoted PASS looks the same), so the prompt asks
+    for the verdict as the very first line and says a later PASS is ignored."""
+    if stage == 'pr':
+        marker, ok, tail = 'VERDICT', 'PASS', ''
+    else:
+        marker, ok, tail = ('PLAN' if stage == 'plan' else 'CODE_INSPECTION') + '_RESULT', 'ACCEPT', ' This is not PR signoff.'
+    return ("Begin exactly %s: %s or %s: BLOCK.%s The first line of your reply must be exactly that line and nothing "
+            "else: no preface, summary, heading, quote mark or formatting before it, and no words after it on that "
+            "line. Put findings on the following lines. A %s anywhere other than the first line is ignored and the "
+            "review counts as invalid output; a BLOCK after a preface is still treated as a BLOCK."
+            % (marker, ok, marker, tail, ok))
+
+
 def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, content: str, options=None):
     options = options or {}
     mode = reviewer_mode(options.get('reviewer', 'auto'), options.get('secondary', 'default'))
     options.pop('actual_reviewer', None)  # a reused internal options dict must not reuse a prior reviewer's identity
-    verdict = ("Begin exactly VERDICT: PASS or VERDICT: BLOCK." if stage == 'pr' else
-               "Begin exactly " + ('PLAN' if stage == 'plan' else 'CODE_INSPECTION') + "_RESULT: ACCEPT or "
-               + ('PLAN' if stage == 'plan' else 'CODE_INSPECTION') + "_RESULT: BLOCK. This is not PR signoff.")
+    verdict = verdict_instruction(stage)
     base = options.get('base')
     history = (f"The snapshot holds only the reviewed commit and base {base} (depth 1, no other history); "
                f"check the packet's diff with `git diff {base} HEAD`." if base and base != head else

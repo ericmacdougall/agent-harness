@@ -4,7 +4,9 @@ Three PR 207 receipts (r2, r4, r5) came back INVALID_OUTPUT although the reviewe
 sentence of preamble, and their findings were lost with them. The parser must also never turn a non-verdict into a
 PASS (receipts r1 and r2 on PR 211: trailing prose, a quoted line, a fenced block, an indented code block and mixed
 fences). The rule is one conservative shape, the same for PASS and BLOCK: a column-0 bare verdict line in its own
-paragraph after a short plain-prose preamble. Every provider answer here is fixture text."""
+paragraph after a short plain-prose preamble. Receipt r3 showed plain prose can still quote a PASS ("The packet ends
+with:\n\nVERDICT: PASS"), so only a BLOCK is ever hoisted; a PASS or ACCEPT counts only as the bare first non-blank
+line. Every provider answer here is fixture text."""
 import importlib.util
 import io
 import json
@@ -65,14 +67,16 @@ class Preamble(unittest.TestCase):
                 self.assertIn('The caller binding part looks right.', result['report'])
                 self.assertIn('[harness: the reviewer wrote', result['report'])
 
-    def test_a_plain_pass_line_after_a_preamble_is_a_pass_only_when_it_is_the_one_verdict(self):
-        result = self.parse(self.PREAMBLE + "VERDICT: PASS\n\nF1-F4 closed; lows only.\n")
-        self.assertEqual((result['result'], result['reason']), ('CHECK_OK', 'NONE'))
-        self.assertTrue(result['report'].startswith('VERDICT: PASS\n'))
+    def test_a_pass_after_a_preamble_is_never_a_pass(self):
+        # receipt r3 F1: a PASS is accepted only as the bare first non-blank line; after any preamble it is invalid
+        self.invalid(self.PREAMBLE + "VERDICT: PASS\n\nF1-F4 closed; lows only.\n")
+        self.invalid("Reading the plan.\n\nPLAN_RESULT: ACCEPT\n\nfine\n", stage='plan')
+        self.invalid("Reading.\n\nCODE_INSPECTION_RESULT: ACCEPT\n\nfine\n", stage='code-inspection')
+        self.invalid("Reading.\n\nVERDICT: PASS\n\nfine\n", stage=None)
 
     def test_the_other_stages_markers_hoist_for_their_own_stage_only(self):
-        self.assertEqual(self.parse("Reading the plan.\n\nPLAN_RESULT: ACCEPT\n\nfine\n", stage='plan')['result'], 'CHECK_OK')
-        self.invalid("Reading.\n\nPLAN_RESULT: ACCEPT\n\nfine\n", stage='pr')
+        self.assertEqual(self.parse("Reading the plan.\n\nPLAN_RESULT: BLOCK\n\nbad\n", stage='plan')['result'], 'CHECK_FAILED')
+        self.invalid("Reading.\n\nPLAN_RESULT: BLOCK\n\nbad\n", stage='pr')
         self.assertEqual(self.parse("Reading.\n\nCODE_INSPECTION_RESULT: BLOCK\n\nbad\n",
                                     stage='code-inspection')['result'], 'CHECK_FAILED')
 
@@ -155,7 +159,7 @@ class Preamble(unittest.TestCase):
                 with self.subTest(verdict=verdict, shape=label):
                     self.invalid(text)
 
-    def test_the_real_shape_we_keep_losing_is_hoisted_for_pass_and_block(self):
+    def test_the_real_shape_we_keep_losing_is_hoisted_for_block_and_invalid_for_pass(self):
         findings = ("**Scope checked:** the parser and its tests.\n\n**Closed:**\n- **F1 (prior):** fixed.\n"
                     "- **F2 (prior):** fixed, see `hoist_verdict`.\n\n**I could not verify:** a live run.\n")
         preambles = ("I read the changed code in the snapshot.\n\n",
@@ -164,8 +168,13 @@ class Preamble(unittest.TestCase):
                      "\n\nOne sentence of preamble after leading blank lines.\n\n")
         for provider in ('claude', 'codex'):
             for preamble in preambles:
-                for verdict, result in (('PASS', 'CHECK_OK'), ('BLOCK', 'CHECK_FAILED')):
-                    with self.subTest(provider=provider, preamble=preamble[:30], verdict=verdict):
+                with self.subTest(provider=provider, preamble=preamble[:30]):
+                    pass_text = preamble + 'VERDICT: PASS\n\n' + findings
+                    got = self.module.normalize_provider(
+                        provider, 0, self.claude(pass_text) if provider == 'claude' else self.codex(pass_text),
+                        last_message=pass_text if provider == 'codex' else '', requested_stage='pr')
+                    self.assertEqual((got['result'], got['reason']), ('NO_RESULT', 'INVALID_OUTPUT'))
+                    for verdict, result in (('BLOCK', 'CHECK_FAILED'),):
                         got = self.parse(preamble + 'VERDICT: ' + verdict + '\n\n' + findings, provider=provider)
                         self.assertEqual(got['result'], result)
                         self.assertTrue(got['report'].startswith('VERDICT: %s\n' % verdict))
@@ -174,17 +183,18 @@ class Preamble(unittest.TestCase):
                         self.assertIn('[harness: the reviewer wrote', got['report'])
 
     def test_marker_at_the_very_end_with_trailing_spaces_or_crlf_is_hoisted(self):
-        self.assertEqual(self.parse("I reviewed it.\n\nVERDICT: PASS")['result'], 'CHECK_OK')
+        self.assertEqual(self.parse("I reviewed it.\n\nVERDICT: BLOCK")['result'], 'CHECK_FAILED')
         self.assertEqual(self.parse("I reviewed it.\n\nVERDICT: BLOCK  \n\nF1\n")['result'], 'CHECK_FAILED')
-        got = self.parse("I reviewed it.\r\n\r\nVERDICT: PASS\r\n\r\nlooks fine\r\n")
-        self.assertEqual(got['result'], 'CHECK_OK')
-        self.assertTrue(got['report'].startswith('VERDICT: PASS\n'))
+        got = self.parse("I reviewed it.\r\n\r\nVERDICT: BLOCK\r\n\r\nF1\r\n")
+        self.assertEqual(got['result'], 'CHECK_FAILED')
+        self.assertTrue(got['report'].startswith('VERDICT: BLOCK\n'))
+        self.invalid("I reviewed it.\n\nVERDICT: PASS")
 
     def test_fences_quotes_and_code_after_the_marker_are_allowed(self):
         # documented choice: reviewers quote code in findings, and nothing after the marker can contain the marker
         findings = ("**F1 (High), `peer_review.py:170`.** This output is accepted:\n```\nThe packet ends with:\n\n"
                     "    indented text\n```\n> a quoted line\n\n    an indented example\n\n~~~\nmore\n~~~\n")
-        for verdict, result in (('PASS', 'CHECK_OK'), ('BLOCK', 'CHECK_FAILED')):
+        for verdict, result in (('BLOCK', 'CHECK_FAILED'),):
             with self.subTest(verdict):
                 got = self.parse("I read the diff.\n\nVERDICT: " + verdict + "\n\n" + findings)
                 self.assertEqual(got['result'], result)
@@ -230,12 +240,62 @@ class Preamble(unittest.TestCase):
 
     def test_hoist_verdict_itself_refuses_prose_and_leading_whitespace(self):
         # each layer holds on its own: the hoist must not move such a line even though verdict_match would refuse it
-        for text in ("Summary.\n\nVERDICT: PASS but I could not inspect\n\nF1\n", "Summary.\n\nVERDICT: PASS.\n",
-                     "Summary.\n\n VERDICT: PASS\n\nF1\n", "Summary.\n\n  VERDICT: BLOCK\n\nF1\n",
-                     "Summary.\n\n**VERDICT: BLOCK**\n\nF1\n"):
+        for text in ("Summary.\n\nVERDICT: BLOCK but I could not inspect\n\nF1\n", "Summary.\n\nVERDICT: BLOCK.\n",
+                     "Summary.\n\n VERDICT: BLOCK\n\nF1\n", "Summary.\n\n  VERDICT: BLOCK\n\nF1\n",
+                     "Summary.\n\n**VERDICT: BLOCK**\n\nF1\n", "Summary.\n\nVERDICT: PASS\n\nF1\n",
+                     "Summary.\n\nPLAN_RESULT: ACCEPT\n\nF1\n",
+                     "Summary.\n\nVERDICT: BLOCK because the packet line reads: BLOCK\n\nF1\n"):
             with self.subTest(text=text):
                 self.assertEqual(self.module.hoist_verdict('pr', text), text)
-        self.assertTrue(self.module.hoist_verdict('pr', "Summary.\n\nVERDICT: PASS\n\nF1\n").startswith('VERDICT: PASS\n'))
+        self.assertEqual(self.module.hoist_verdict('plan', "Summary.\n\nPLAN_RESULT: ACCEPT\n\nok\n"),
+                         "Summary.\n\nPLAN_RESULT: ACCEPT\n\nok\n")
+        self.assertTrue(self.module.hoist_verdict('pr', "Summary.\n\nVERDICT: BLOCK\n\nF1\n").startswith('VERDICT: BLOCK\n'))
+
+    def test_r3_plain_prose_quoting_a_pass_is_never_a_pass(self):
+        # receipt r3 F1: plain-prose lead-ins that quote the marker as its own paragraph
+        leads = ("The packet ends with:", "The final line must be:", "The packet asks me to emit",
+                 "The packet's last line asks me to emit:", "I was told to write")
+        for lead in leads:
+            for marker, stage in (('VERDICT: PASS', 'pr'), ('PLAN_RESULT: ACCEPT', 'plan'),
+                                  ('CODE_INSPECTION_RESULT: ACCEPT', 'code-inspection')):
+                for tail in ('', '\n\nI ran out of budget.', '\n\nI could not inspect the repo.\n'):
+                    with self.subTest(lead=lead, marker=marker, tail=bool(tail)):
+                        self.invalid(lead + "\n\n" + marker + tail, stage=stage)
+
+    def test_a_block_after_a_plain_preamble_is_still_a_block(self):
+        got = self.parse("I checked the parser and the tests.\n\nVERDICT: BLOCK\n\n**F1 (High)** a real finding.\n")
+        self.assertEqual((got['result'], got['reason']), ('CHECK_FAILED', 'CODE_FINDINGS'))
+        self.assertTrue(got['report'].startswith('VERDICT: BLOCK\n'))
+        self.assertIn('F1 (High)', got['report'])
+        # a quoted BLOCK can only make the review fail, which is safe
+        self.assertEqual(self.parse("The packet ends with:\n\nVERDICT: BLOCK\n\nI ran out of budget.")['result'],
+                         'CHECK_FAILED')
+
+    def test_the_reviewer_prompt_demands_a_first_line_verdict_and_says_a_later_pass_is_ignored(self):
+        for stage, marker, ok in (('pr', 'VERDICT', 'PASS'), ('plan', 'PLAN_RESULT', 'ACCEPT'),
+                                  ('code-inspection', 'CODE_INSPECTION_RESULT', 'ACCEPT')):
+            with self.subTest(stage):
+                text = self.module.verdict_instruction(stage)
+                self.assertIn('Begin exactly %s: %s or %s: BLOCK.' % (marker, ok, marker), text)
+                self.assertIn('The first line of your reply must be exactly that line', text)
+                self.assertIn('no preface', text)
+                self.assertIn('A %s anywhere other than the first line is ignored' % ok, text)
+        self.assertIn('This is not PR signoff.', self.module.verdict_instruction('plan'))
+        self.assertIn('verdict = verdict_instruction(stage)', REVIEW.read_text())
+
+    def test_the_built_prompt_carries_the_instruction(self):
+        captured = {}
+
+        def fake_run(command, prompt, *args, **kwargs):  # run(cmd, prompt, cwd, ...)
+            captured['input'] = prompt
+            return 0, self.codex("VERDICT: BLOCK\nF1\n"), ''
+        with tempfile.TemporaryDirectory() as temp:
+            options = {'reviewer': 'codex-only', 'resolutions': {'codex': {'path': '/bin/echo'}}}
+            with patch.object(self.module, 'run', fake_run):
+                self.module.review_snapshot(Path(temp), 'a' * 40, 'pr', '', 'packet', options)
+        self.assertIn('Untrusted review packet', captured['input'])  # it is the real prompt
+        self.assertIn('The first line of your reply must be exactly that line', captured['input'])
+        self.assertIn('A PASS anywhere other than the first line is ignored', captured['input'])
 
     def test_a_first_line_verdict_is_untouched_and_a_quoted_marker_below_it_is_not_a_second_verdict(self):
         text = "VERDICT: BLOCK\nF1 says the packet's 'VERDICT: PASS' line was echoed.\n"
