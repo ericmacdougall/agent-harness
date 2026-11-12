@@ -217,7 +217,7 @@ def ladder_status(state, policy):
 MAX_DISPATCHES = 64
 DISPATCH_LIVE_SECONDS = 24 * 3600
 DISPATCH_BYTES = 1024
-INDEX_LIMIT = 512
+INDEX_LIMIT = 4096  # r7 m3: about 160 KiB; an old owner stays resolvable across many newer spawns
 PENDING_STOP_LIMIT = 64
 PENDING_STOP_SECONDS = 3600
 SIDE_LIMIT = 256 * 1024
@@ -481,13 +481,16 @@ def _index_path(root):
 
 
 def _read_index(root):
+    import stat as stat_mod
     path = _index_path(root)
     try:
-        info = os.stat(path, follow_symlinks=False)
-        if not os.path.isfile(path) or os.path.islink(path) or info.st_size > 4 * SIDE_LIMIT:
-            return {}
-        index = json.loads(path.read_bytes())  # input-ok: own 0600 file, size checked above
-    except (OSError, ValueError, UnicodeError):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # r7 m9: never blocks on a swapped FIFO
+        with os.fdopen(fd, 'rb') as handle:
+            info = os.fstat(handle.fileno())
+            if not stat_mod.S_ISREG(info.st_mode) or info.st_size > 4 * SIDE_LIMIT:
+                return {}
+            index = json.loads(handle.read(4 * SIDE_LIMIT + 1))  # input-ok: own 0600 file, size checked above
+    except Exception:  # noqa: BLE001  missing, garbled, too deep: an empty index, fail-open
         return {}
     return index if isinstance(index, dict) else {}
 
@@ -574,7 +577,7 @@ def note_pending_stop(root, agent_id, effort):
     return _update_index(root, change)
 
 
-def _apply_resume(state, agent_id, t):
+def _apply_resume(state, agent_id, t, at=None):
     """Reopen the newest dispatch for agent_id (clear its end, mark it resumed and live from t). A resume of an agent
     whose record was shed, or a malformed id, adds one synthetic unknown open dispatch that blocks the window."""
     seq = len(state.get('events') or [])
@@ -582,6 +585,9 @@ def _apply_resume(state, agent_id, t):
     agent = agent_id if isinstance(agent_id, str) and AGENT_ID.fullmatch(agent_id) else None
     dispatch = next((d for d in reversed(dispatches) if isinstance(d, dict) and agent
                      and d.get('agent_id') == agent), None)
+    if dispatch is not None and isinstance(at, (int, float)) and isinstance(dispatch.get('ended_t'), (int, float)) \
+            and at < dispatch['ended_t']:
+        return  # r7 m1: this resume was written before the stop already applied (a late SendMessage line)
     if dispatch is None:
         ident = ('synthetic-resumed_unknown-%s' % (agent or 'invalid'))[:64]
         dispatch = next((d for d in dispatches if isinstance(d, dict) and d.get('tool_use_id') == ident), None)
@@ -817,7 +823,8 @@ class Ledger:
             if ident in known:
                 continue
             if line.get('kind') == 'resume':
-                _apply_resume(state, clean_str(line.get('agent_id'), 64), t)
+                at = line.get('at') if isinstance(line.get('at'), (int, float)) else None
+                _apply_resume(state, clean_str(line.get('agent_id'), 64), t, min(at, t) if at is not None else None)
                 known.add(ident)
                 changed[0] = True
                 continue
@@ -881,7 +888,7 @@ class Ledger:
                             models_used=used, candidates=candidates_for(models, self.policy) if models else None)
             if dispatch['status'] == 'completed':
                 dispatch['ended_at'] = now()
-                dispatch['ended_seq'] = len(state['events'])
+                dispatch['ended_seq'], dispatch['ended_t'] = len(state['events']), t
             _bounded_dispatch(dispatch)
             _evict(state, t, self.policy)
             self._write(task, state)
@@ -906,10 +913,10 @@ class Ledger:
             for synthetic in state['dispatches']:  # inspection m4: a resumed_unknown for this agent ends with it
                 if (isinstance(synthetic, dict) and synthetic.get('reason') == 'resumed_unknown'
                         and synthetic.get('agent_id') == agent_id and not synthetic.get('ended_at')):
-                    synthetic['ended_at'], synthetic['ended_seq'] = now(), len(state['events'])
+                    synthetic['ended_at'], synthetic['ended_seq'], synthetic['ended_t'] = now(), len(state['events']), epoch()
             if dispatch is not None:
                 if not dispatch.get('ended_at'):
-                    dispatch['ended_at'], dispatch['ended_seq'] = now(), len(state['events'])
+                    dispatch['ended_at'], dispatch['ended_seq'], dispatch['ended_t'] = now(), len(state['events']), epoch()
                 if effort:
                     dispatch['observed_effort'] = effort
                     if narrow:
@@ -1080,8 +1087,9 @@ class Ledger:
                 _, rename = self._merge_side(task, state)
             except LedgerError:
                 rename = None
-            fresh['dispatches'] = [{**d, 'after_seq': 0} for d in state.get('dispatches') or []
-                                   if isinstance(d, dict) and _live(d, t)]
+            fresh['dispatches'] = [{**{k: v for k, v in d.items() if k != 'ended_seq'}, 'after_seq': 0,
+                                    **({'resumed_seq': 0} if 'resumed_seq' in d else {})}
+                                   for d in state.get('dispatches') or [] if isinstance(d, dict) and _live(d, t)]
             if isinstance(state.get('side'), dict):
                 fresh['side'] = state['side']
             taint = state.get('dispatch_taint')

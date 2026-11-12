@@ -761,9 +761,18 @@ def record_dispatch(data):
         tool = data.get('tool_name')
         response = data.get('tool_response')
         if tool == 'SendMessage':
+            # r7 M1: the harness's own response names the resumed agent (resumedAgentId) even when `to` is a name;
+            # it wins over `to`. Only the response's key names are logged, never its values.
+            response = response if isinstance(response, dict) else {}
             target = (data.get('tool_input') or {}).get('to') if isinstance(data.get('tool_input'), dict) else None
-            task = reopen_resumed(esc.clean_str(target, 64), esc.Ledger(policy=tiers.load_policy()))
-            record.update(task=task, result='reopened' if task else 'ignored')
+            ledger = esc.Ledger(policy=tiers.load_policy())
+            task = None
+            for candidate in (response.get('resumedAgentId'), response.get('agentId'), target):
+                task = reopen_resumed(esc.clean_str(candidate, 64), ledger)
+                if task:
+                    break
+            record.update(task=task, result='reopened' if task else 'ignored',
+                          response_keys=sorted(esc.clean_str(k, 32) or '?' for k in list(response)[:12]))
             return
         if tool not in ('Agent', 'Task') or not isinstance(response, dict):
             record['result'] = 'ignored'

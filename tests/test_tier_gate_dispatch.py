@@ -621,6 +621,8 @@ class StopEffort(Fixture):
 
 class Index(Fixture):
     def test_index_is_private_bounded_and_corruption_is_a_noop(self):
+        limit = mock.patch.object(esc, 'INDEX_LIMIT', 512)  # the bound logic, at a size this test can fill quickly
+        limit.start(); self.addCleanup(limit.stop)
         for i in range(600):
             esc.index_agent(self.root, 'ag%04d' % i, 'kidx')
         for i in range(100):
@@ -851,7 +853,7 @@ class ResumeHookPath(Fixture):
             with self.subTest(action=action):
                 started = time.monotonic()
                 result = self.hook(action, data)
-                self.assertLess(time.monotonic() - started, esc.LOCK_SECONDS)
+                self.assertLess(time.monotonic() - started, 0.5 * esc.LOCK_SECONDS)  # r7 m7
                 self.assertEqual(result.stdout, '')
         lines = [json.loads(l) for l in self.side('r10').read_text().splitlines()]
         self.assertEqual([l['kind'] for l in lines[-2:]], ['resume', 'resume'])
@@ -859,6 +861,7 @@ class ResumeHookPath(Fixture):
     def test_resume_fails_open(self):
         link = Path(self.temp.name) / 'state-link2'
         link.symlink_to(self.root)
+        esc.index_agent(self.root, 'agx', 'r10s')  # r7 m6: the resume path is really reached
         env = {**os.environ, 'AGENT_HARNESS_ESCALATION_DIR': str(link)}
         cases = (('start', {'agent_id': 'agx', 'session_id': 's', 'hook_event_name': 'SubagentStart'}),
                  ('dispatch', {'tool_name': 'SendMessage', 'tool_input': {'to': 'agx'}, 'tool_response': {}}),
@@ -917,6 +920,75 @@ class ResumeHookPath(Fixture):
                        for h in g['hooks'] if 'tier_gate.py' in json.dumps(h)]
             self.assertEqual(len(entries), 1, tool)
             self.assertNotIn('onFailure', entries[0])
+
+
+class SpecR7Review(Fixture):
+    """Spec r7 adversarial review a7939032 (BLOCK): M1 and minors m1, m2, m3, m8, m9."""
+
+    def side(self, task):
+        return self.root / (task + '.dispatch-open.jsonl')
+
+    def test_m1_send_by_name_resolves_through_response(self):
+        self.owner('s1', 'opus-s1', OPUS, status='completed', agent_id='ags1')
+        self.positive('s1')
+        self.hook('dispatch', {'tool_name': 'SendMessage', 'tool_input': {'to': 'owner name', 'message': 'm'},
+                               'tool_response': {'success': True, 'resumedAgentId': 'ags1', 'message': 'x'},
+                               'session_id': 'sdisp', 'tool_use_id': 'smn', 'hook_event_name': 'PostToolUse'})
+        self.assertEqual(self.fail_once('s1')['event']['class'], 'FAIL')
+        [line] = [l for l in self.gate_lines() if l.get('tool') == 'SendMessage']
+        self.assertEqual((line['result'], line['response_keys']), ('reopened', ['message', 'resumedAgentId', 'success']))
+        self.assertNotIn('ags1', json.dumps(line.get('response_keys')))
+
+    def test_m1_late_resume_after_stop_is_stale(self):
+        self.owner('s2', 'son-s2', SONNET, status='completed', agent_id='ags2')
+        written = time.time()
+        with open(self.side('s2'), 'a') as handle:
+            handle.write(json.dumps({'tool_use_id': 'resume-a', 'kind': 'resume', 'agent_id': 'ags2', 'at': written}) + '\n')
+        self.dispatches('s2')  # the merge reopens it
+        self.ledger.end_dispatch('s2', 'ags2')
+        with open(self.side('s2'), 'a') as handle:  # the SendMessage line, written before the stop, merged after it
+            handle.write(json.dumps({'tool_use_id': 'resume-b', 'kind': 'resume', 'agent_id': 'ags2', 'at': written}) + '\n')
+        [d] = [d for d in self.dispatches('s2') if d['tool_use_id'] == 'son-s2']
+        self.assertTrue(d.get('ended_at'), d)
+
+    def test_m2_reset_rebases_resumed_seq(self):
+        self.owner('s3', 'opus-s3', OPUS, agent_id='ags3')
+        self.climb_to('s3', 'R1')
+        with open(self.side('s3'), 'a') as handle:
+            handle.write(json.dumps({'tool_use_id': 'resume-c', 'kind': 'resume', 'agent_id': 'ags3', 'at': time.time()}) + '\n')
+        self.dispatches('s3')
+        self.ledger.reset('s3', 'state_corrupt', 'test reset')
+        [d] = self.dispatches('s3')
+        self.assertEqual((d['after_seq'], d.get('resumed_seq')), (0, 0))
+        self.assertNotIn('ended_seq', d)
+
+    def test_m3_index_keeps_old_owner(self):
+        esc.index_agent(self.root, 'agold', 's4')
+        for i in range(600):
+            esc.index_agent(self.root, 'agn%03d' % i, 's4x')
+        self.assertEqual(esc.lookup_agent(self.root, 'agold'), 's4')
+
+    def test_m9_index_fifo_never_blocks(self):
+        import threading
+        os.mkfifo(self.root / 'dispatch_index.json')
+        outcome = {}
+
+        def run():
+            outcome['task'] = esc.lookup_agent(self.root, 'agz')
+            outcome['done'] = True
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start(); worker.join(3)
+        self.assertTrue(outcome.get('done'))
+        self.assertIsNone(outcome['task'])
+
+    def test_m8_other_task_tools_ignored(self):
+        for tool in ('TaskStop', 'TaskOutput', 'TaskCreate'):
+            result = self.hook('dispatch', {'tool_name': tool, 'tool_input': {}, 'tool_response': {'ok': True},
+                                            'session_id': 's', 'tool_use_id': 'x-' + tool})
+            self.assertEqual(result.stdout, '')
+        results = [l.get('result') for l in self.gate_lines() if l.get('tool', '').startswith('Task')]
+        self.assertEqual(results, ['ignored'] * 3)
+        self.assertEqual(list(self.root.glob('*.dispatch-open.jsonl')), [])
 
 
 class WiringAndDocs(unittest.TestCase):
