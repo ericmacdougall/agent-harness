@@ -136,6 +136,65 @@ def verdict_match(stage, report):
     return re.match('^' + prefix[stage] + r'(?=\s|$)', report.strip()) if stage in prefix else None
 
 
+ANY_MARKER = re.compile(r'(?:VERDICT|[A-Z_]*_RESULT)\s*:\s*(?:PASS|ACCEPT|BLOCK)')
+DECORATION = re.compile(r'^(?:\*\*|__|#{1,6}\s+|>\s*)+|(?:\*\*|__)+\s*$')
+HOIST_MAX_LINES = 60
+HOIST_MAX_CHARS = 8000
+
+
+def hoist_verdict(stage, text):
+    """A reviewer that writes a short preamble before its verdict (goodqa#15723 lost three PR 207 receipts to this) still
+    gave a verdict. It is accepted only when the verdict is unambiguous: exactly ONE verdict-looking marker in the whole
+    text, on a line of its own (markdown bold or a heading mark is ignored) within the first lines, and the stage's own
+    marker. The text is returned verdict first, the preamble moved below with a note, so every later check (the pass
+    marker, the ticket parser, stage_report) still sees a first-line verdict. Anything else is returned unchanged."""
+    if not isinstance(text, str) or verdict_match(stage, text):
+        return text
+    lines = text.strip().splitlines()
+    if len(ANY_MARKER.findall(text)) != 1:
+        return text
+    for index, line in enumerate(lines[:HOIST_MAX_LINES]):
+        clean = DECORATION.sub('', line.strip()).strip()
+        if index and verdict_match(stage, clean):
+            preamble = '\n'.join(lines[:index]).strip()
+            if len(preamble) > HOIST_MAX_CHARS:
+                return text
+            rest = '\n'.join(lines[index + 1:]).strip()
+            note = ('[harness: the reviewer wrote %d line(s) before its verdict; the verdict line was moved to the top '
+                    'and the preamble is kept below]' % index)
+            return clean + '\n' + (rest + '\n\n' if rest else '\n') + note + '\n' + preamble
+    return text
+
+
+RAW_KEEP = 4 * 1024 * 1024
+
+
+def persist_raw_output(prefix, provider, code, stdout, stderr, last_message):
+    """Keep the reviewer's raw answer in a private mode-600 file when it could not be parsed, so its findings are never
+    lost (goodqa#15723). Returns the path or None; never raises."""
+    if not prefix:
+        return None
+    try:
+        body = ('provider: %s\nexit code: %s\n--- stdout ---\n%s\n--- last message ---\n%s\n--- stderr ---\n%s\n'
+                % (provider, code, stdout or '', last_message or '', stderr or ''))
+        data = body.encode('utf-8', errors='replace')[:RAW_KEEP]
+        for counter in range(100):
+            path = '%s.raw-%s-%d.txt' % (prefix, provider, counter)
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            except FileExistsError:
+                continue
+            try:
+                os.fchmod(fd, 0o600)
+                os.write(fd, data)
+            finally:
+                os.close(fd)
+            return path
+    except OSError:
+        return None
+    return None
+
+
 def normalize_provider(provider, code, stdout, stderr='', last_message='', requested_stage=None):
     """Validate supported terminal envelopes before extracting model verdict text."""
     invalid = provider_failure({})
@@ -243,6 +302,7 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
         text.encode('utf-8')
     except UnicodeError:
         return invalid
+    text = hoist_verdict(requested_stage, text)
     verdict = verdict_match(requested_stage, text)
     if not verdict:
         return invalid
@@ -837,7 +897,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
             raise ReviewFailure({**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}, source)
         timeout = min(720, options.get('timeout', 720), remaining)
         leased = False
-        resolution, code, stdout, stderr = None, None, '', ''
+        resolution, code, stdout, stderr, last_message = None, None, '', '', ''
         launch_state, local_detail = 'NOT_STARTED', ''
         try:
             if provider == 'kimi':
@@ -897,6 +957,10 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                     local_detail = diagnostics.sanitize(
                         '%s pool reserved by run %s. Reconcile: `%s --auto`; if it says completed: `%s --actor <who> '
                         "--reason '<why>' --evidence '<proof>'`" % (provider, holder, base, base), 400)
+        if outcome.get('reason') == 'INVALID_OUTPUT' and (stdout or stderr or last_message):
+            saved = persist_raw_output(options.get('raw_prefix'), provider, code, stdout, stderr, last_message)
+            if saved:
+                print('Reviewer output could not be parsed; the raw answer is saved (mode 600): ' + saved, file=sys.stderr)
         options.setdefault('attempts', []).append(
             diagnostics.provider_attempt(provider, resolution, code, stdout, stderr, outcome,
                                          launch_state=launch_state, local_detail=local_detail))
@@ -1541,7 +1605,7 @@ def main() -> int:
             print('Review refused: reviewer rung %s needs user permission recorded for the task by approve-top '
                   '(--task with a ledger permission); --author-rung alone is not a record' % selection['rung'], file=sys.stderr)
             return 2
-    options = {'packet_path': packet, 'secondary': args.secondary, 'reviewer': args.reviewer,
+    options = {'raw_prefix': str(output_arg), 'packet_path': packet, 'secondary': args.secondary, 'reviewer': args.reviewer,
                'review_routing': review_routing(selection, args.reviewer, args.secondary),
                'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
                'selection': selection, 'author_rung': author_rung, 'permission': permission,
