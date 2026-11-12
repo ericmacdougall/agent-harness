@@ -1342,6 +1342,7 @@ def _try_env():
     env = _clone_env()
     env['LC_ALL'] = 'C'
     env.pop('LANGUAGE', None)
+    env.pop('GIT_CEILING_DIRECTORIES', None)  # _clone_env pins it to /, the real command has none
     env['GIT_DISCOVERY_ACROSS_FILESYSTEM'] = '1'
     return env
 
@@ -1424,8 +1425,12 @@ def _per_worktree_config_refusal(path, common, git_dir, cwd, step):
     $common/worktrees/ID/config.worktree for a linked one. The programs a removal can start are decided by the worktrees
     whose git commands run: the PRIMARY (the delegated removal runs from there), the TARGET (the cleanliness check runs
     in it) and the worktree the caller stands in (the hook form runs from the caller's directory). Each of those files
-    is vetted (lstat first, plain file, size cap, `git config --file` read) before any other command that reads the
-    worktree; a missing file is fine. An unrelated linked worktree's file is never read by this removal and does not
+    is vetted (lstat first, plain file, size cap, `git config --file` read) before any git command that could start a
+    program named by config (`ls-files`, `status`, the removal); a missing file is fine. Four git calls run earlier and do
+    read an unvetted config.worktree (`rev-parse` in the target, `rev-parse` in the caller, `worktree list`, `config
+    --local --list`): they are safe because every git call here carries `core.fsmonitor=false` and `core.hooksPath=/dev/null`
+    and none refreshes the index or runs a filter or helper; the call-order test pins that the vetting precedes `ls-files`
+    and `status`. An unrelated linked worktree's file is never read by this removal and does not
     decide it."""
     files = [os.path.join(common, 'config.worktree'), os.path.join(git_dir, 'config.worktree')]
     if cwd and os.path.isdir(cwd):
@@ -1610,7 +1615,10 @@ def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None):
     Only the checkout being removed is judged; unrelated branches and other worktrees stay out of the decision.
 
     Known window (#134 red-team P6): this runs in the PreToolUse hook, before the command. A file that appears
-    after this check and before `git worktree remove` runs is not seen here. Git itself refuses a worktree with
+    after this check and before `git worktree remove` runs is not seen here. That includes CONFIG files: a
+    `config.worktree` written after the vetting is read by the real command, and in the hook form the user's command
+    carries no `-c core.fsmonitor=false` (the delegated `ah worktree-remove` route does), so a program-valued key added in
+    that window can run (goodqa#15741 tracks the wider hook-form environment gap). Git itself refuses a worktree with
     modified or untracked files, but it removes ignored files (for example a fresh `.env`) without `--force`.
     The guard cannot close that window. Callers must not remove a worktree that another process may still be
     writing to: stop its servers and agents first.
@@ -1692,8 +1700,14 @@ def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None):
             bad = _per_worktree_config_refusal(path, common, git_dir, cwd, step)
         if bad:
             return bad
+        # A bare `git worktree remove` DOES run a hook (post-index-change, through the status it starts), so the hook form and
+        # every other caller keep this rule. The delegated route is safe for two reasons: every git call carries
+        # core.hooksPath=/dev/null and the sanitized environment sets GIT_OPTIONAL_LOCKS=0 (no index write, so no hook), and
+        # config-defined hooks (git 2.54 reads hook.NAME.event and .command; hooksPath does not switch them off) are stopped by
+        # the [hook] section refusal in _config_refusal. Only that route (policy allow_hooks exactly True) skips this rule.
         hooks_dir = os.path.join(common, 'hooks')
-        if os.path.isdir(hooks_dir) and any(not n.endswith('.sample') for n in os.listdir(hooks_dir)):
+        if cfg.get('allow_hooks') is not True and os.path.isdir(hooks_dir) \
+                and any(not n.endswith('.sample') for n in os.listdir(hooks_dir)):
             return 'it has hand-written git hooks'
         for entry in _git_out(path, ['ls-files', '-s', '-z'], step(3.0)).split('\x00'):
             if entry.startswith('160000'):
@@ -1854,7 +1868,8 @@ def authenticated_remote_refs(url, repo, timeout):
     if not isinstance(url, str) or not GITHUB_REMOTE.fullmatch(url):
         raise ValueError('not a github.com remote')
     gh = shutil.which('gh', path=_authenticated_env()['PATH'])
-    command = ['git', '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always', '-c', 'protocol.ssh.allow=always']
+    command = ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always',
+               '-c', 'protocol.ssh.allow=always']
     if gh:
         command += ['-c', 'credential.helper=', '-c', 'credential.helper=!%s auth git-credential' % shlex.quote(gh)]
     done = subprocess.run(command + ['ls-remote', '--heads', '--tags', '--', url], capture_output=True, cwd=os.sep,
@@ -1869,13 +1884,48 @@ def authenticated_remote_refs(url, repo, timeout):
     return refs
 
 
-def busy_processes(path):
-    """Processes whose working directory is the worktree or inside it: [(pid, command)], or None when that cannot be
-    checked completely (fail closed). A process that cannot be inspected (permission denied, another user's) is a None,
-    not a skip; only a process that has exited (ENOENT, ESRCH) is skipped. Limits, stated: only processes of the same
-    user are visible without root, and open files other than the working directory are not checked; plain
-    `git worktree remove` also deletes ignored files."""
-    found = []
+def _proc_status(pid):
+    """{'name': Name, 'uid': real uid, 'ppid': parent pid} from /proc/PID/status, which any user can read whatever the process set about
+    being inspected; 'gone' when the process has exited; None when it cannot be read or parsed. The real uid is used, not
+    the owner of /proc/PID: a same-user process that made itself non-dumpable shows /proc/PID owned by root, and the
+    owner would call it another user's (red-team F4)."""
+    try:
+        name = uid = ppid = None
+        with open('/proc/%s/status' % pid) as handle:
+            for line in handle:
+                if line.startswith('Name:'):
+                    name = line.partition(':')[2].strip()
+                elif line.startswith('Uid:'):
+                    uid = int(line.partition(':')[2].split()[0])
+                elif line.startswith('PPid:'):
+                    ppid = int(line.partition(':')[2].split()[0])
+        return {'name': name, 'uid': uid, 'ppid': ppid} if uid is not None else None
+    except (FileNotFoundError, ProcessLookupError):
+        return 'gone'
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _proc_cmd0(pid):
+    """The basename of argv[0] from /proc/PID/cmdline (world readable), or None when it cannot be read or is empty."""
+    try:
+        with open('/proc/%s/cmdline' % pid, 'rb') as handle:
+            first = handle.read(4096).split(b'\x00')[0]
+    except OSError:
+        return None
+    return os.path.basename(first.decode('utf-8', 'replace')) or None
+
+
+def busy_scan(path, skip_names=()):
+    """Scan the processes for one whose working directory is the worktree or inside it. Returns {'busy': [(pid, command)],
+    'unreadable': [(pid, name)], 'failed': bool}: `unreadable` lists processes of THIS user whose cwd link cannot be read
+    and that are not on the service list (a shell run through sg or sudo, a setgid helper), `failed` is set when the scan
+    could not be completed at all (fail closed). A process that has exited (ENOENT, ESRCH) is skipped, and so is one that
+    cannot be read because its REAL uid (from the world-readable /proc/PID/status) is another user's (a Linux host has
+    root daemons whose /proc/PID/cwd a normal user cannot read; goodqa#15739); a same-user unreadable process is skipped
+    only by exact Name in `skip_names`. Limits, stated: other users' processes are invisible without root, and open files
+    other than the working directory are not checked; plain `git worktree remove` also deletes ignored files."""
+    result = {'busy': [], 'unreadable': [], 'failed': False}
     try:
         if os.path.isdir('/proc/self'):
             for entry in os.listdir('/proc'):
@@ -1885,14 +1935,44 @@ def busy_processes(path):
                     except OSError as error:
                         if error.errno in (errno.ENOENT, errno.ESRCH):
                             continue  # exited while we looked
-                        return None  # EACCES and anything else: a process we could not see
+                        if error.errno not in (errno.EACCES, errno.EPERM):
+                            result['failed'] = True  # any other error: a process we could not see
+                            return result
+                        status = _proc_status(entry)
+                        if status == 'gone':
+                            continue  # exited between the two reads
+                        if status is None:
+                            result['failed'] = True  # an identity we cannot determine is a process we could not see
+                            return result
+                        if status['uid'] != os.getuid():
+                            # Another user's process is invisible without root (the documented limit). A process whose real uid
+                            # is 0 and whose parent is a process of THIS user (sudo -s, sudo -i run from the callers shell) is
+                            # the caller's own work, not a daemon: it is listed and refuses. A boot-time root daemon (parent
+                            # root or init) and a kernel thread (parent 0 or 2) are skipped; a parent that cannot be read
+                            # does not make a root process skippable.
+                            if status['uid'] == 0 and status.get('ppid') not in (0, 2):
+                                parent = _proc_status(str(status.get('ppid')))
+                                if not isinstance(parent, dict) or parent['uid'] == os.getuid():
+                                    result['unreadable'].append((int(entry), status['name'] or '?'))
+                            continue
+                        # A same-user process whose cwd link is unreadable is skipped only for the few programs that are known
+                        # to change to / when they start (the user systemd manager, ssh-agent): the process Name must be on the
+                        # policy list AND the command line (argv[0] basename) must agree. comm can be set by the process itself
+                        # (prctl PR_SET_NAME, exec -a) and so can argv[0]: this protects against accident, not against a
+                        # hostile same-user process; it is a standing limit, not a control. Anything else (a shell run through
+                        # sg, the docker client, a helper, any other name, an unreadable command line) is reported and refuses.
+                        if skip_names and status['name'] in skip_names and _proc_cmd0(entry) == status['name']:
+                            continue
+                        result['unreadable'].append((int(entry), status['name'] or '?'))
+                        continue
                     if cwd == path or cwd.startswith(path + os.sep):
-                        found.append((int(entry), 'pid'))
-            return found
+                        result['busy'].append((int(entry), 'pid'))
+            return result
         done = subprocess.run(['lsof', '-a', '-d', 'cwd', '-F', 'pcn'], capture_output=True, text=True, timeout=20,
                               env={'PATH': '/usr/sbin:/usr/bin:/bin', 'LC_ALL': 'C'}, cwd=os.sep)
         if done.returncode not in (0, 1) or (done.returncode == 1 and (done.stderr or '').strip()):
-            return None  # exit 1 is "nothing found" only when lsof said nothing else
+            result['failed'] = True  # exit 1 is "nothing found" only when lsof said nothing else
+            return result
         pid = command = None
         for line in done.stdout.splitlines():
             if line.startswith('p') and line[1:].isdigit():
@@ -1902,10 +1982,20 @@ def busy_processes(path):
             elif line.startswith('n') and pid != os.getpid():
                 name = os.path.realpath(line[1:]) if line[1:].startswith('/') else line[1:]
                 if name == path or name.startswith(path + os.sep):
-                    found.append((pid, command))
-        return found
+                    result['busy'].append((pid, command))
+        return result
     except (OSError, subprocess.SubprocessError, ValueError):
+        result['failed'] = True
+        return result
+
+
+def busy_processes(path, skip_names=()):
+    """[(pid, command)] of processes working inside the worktree, or None when the scan cannot be trusted to be complete
+    (it failed, or a process of this user could not be inspected): fail closed. See busy_scan for the details."""
+    scan = busy_scan(path, skip_names)
+    if scan['failed'] or scan['unreadable']:
         return None
+    return scan['busy']
 
 
 def registry_lists(repo, path):
@@ -1921,7 +2011,22 @@ def registry_lists(repo, path):
 # allows their sum plus the process scan and the ssh connect (ah_worktree.CALL_TIMEOUT).
 VERIFY_SECONDS = 120.0
 REMOVE_SECONDS = 900
-WORKTREE_POLICY = {'reproducible_clone': {'total_seconds': VERIFY_SECONDS, 'remote_seconds': 30.0, 'scale': 15.0}}
+WORKTREE_POLICY = {'reproducible_clone': {'total_seconds': VERIFY_SECONDS, 'remote_seconds': 30.0, 'scale': 15.0,
+                                         'allow_hooks': True,
+                                         'busy_skip_names': ('systemd', 'ssh-agent')}}
+
+
+def delegated_policy(base=None):
+    """The user policy (when given) with the delegated route's own rules laid over its reproducible_clone section: the
+    scaled budget and allow_hooks. The route always applies them, whatever the caller loaded (the real t2-dev proof showed
+    the command line passed the loaded user policy straight down, so the delegated rules were never in force); a policy
+    can still switch the exemption off with enabled false when it is passed in by code (a policy FILE cannot: load_policy
+    ignores the reproducible_clone section of a file)."""
+    base = base if isinstance(base, dict) else {}
+    section = base.get('reproducible_clone')
+    merged = dict(section) if isinstance(section, dict) else {}
+    merged.update(WORKTREE_POLICY['reproducible_clone'])
+    return dict(base, reproducible_clone=merged)
 
 
 def verify_worktree(path, authenticated=False, policy=None):
@@ -1931,7 +2036,8 @@ def verify_worktree(path, authenticated=False, policy=None):
               'verifier': VERIFIER_VERSION}
     reason = worktree_scope_refusal(path) if isinstance(path, str) and os.path.isabs(path) else 'not a literal absolute path'
     if reason is None:
-        reason = linked_worktree_remove_refusal(path, os.sep, WORKTREE_POLICY if policy is None else policy,
+        effective = delegated_policy(policy)
+        reason = linked_worktree_remove_refusal(path, os.sep, effective,
                                                 remote_ls=authenticated_remote_refs if authenticated else None)
         try:
             report['head'] = _git_out(path, ['rev-parse', '--verify', 'HEAD'], 2.0).strip()
@@ -1939,11 +2045,18 @@ def verify_worktree(path, authenticated=False, policy=None):
         except (ValueError, OSError, subprocess.SubprocessError):
             pass
     if reason is None:
-        busy = busy_processes(path)
-        if busy is None:
+        scan = busy_scan(path, tuple(delegated_policy(policy)['reproducible_clone'].get('busy_skip_names') or ()))
+        if scan['busy']:
+            reason = 'a process is using the worktree as its working directory (pid %d, %s)' % scan['busy'][0]
+        elif scan['failed']:
             reason = 'could not check for processes using the worktree'
-        elif busy:
-            reason = 'a process is using the worktree as its working directory (pid %d, %s)' % busy[0]
+        elif scan['unreadable']:
+            named = ', '.join('pid %d (%s)' % (pid, re.sub(r'[^A-Za-z0-9_.()-]', '?', name)[:20])
+                              for pid, name in scan['unreadable'][:3])
+            more = len(scan['unreadable']) - 3
+            reason = ('could not check for processes using the worktree: %d process(es) of this user cannot be inspected '
+                      '(%s%s); let them end, then retry' % (len(scan['unreadable']), named,
+                                                            ' and %d more' % more if more > 0 else ''))
     report['reason'] = reason
     report['removable'] = reason is None and bool(report['repo']) and bool(report['head'])
     return report

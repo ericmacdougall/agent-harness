@@ -175,7 +175,7 @@ class Verifier(Repo):
         self.assertTrue(cg.remove_worktree(str(self.linked), policy=self.policy)["removed"])
 
     def test_a_process_check_that_cannot_run_fails_closed(self):
-        with mock.patch.object(cg, "busy_processes", return_value=None):
+        with mock.patch.object(cg, "busy_scan", return_value={"busy": [], "unreadable": [], "failed": True}):
             self.refused(self.linked, "could not check for processes")
         self.assertTrue(self.linked.exists())
 
@@ -374,10 +374,11 @@ class RedTeamRound2(Repo):
 
         def exited(path):
             raise OSError(errno.ESRCH, "no such process")
+        same_user = {"name": "bash", "uid": os.getuid()}
         for link, expected in ((denied, None), (exited, [])):
             with mock.patch.object(cg.os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
                     mock.patch.object(cg.os, "listdir", lambda p: ["555"] if p == "/proc" else []), \
-                    mock.patch.object(cg.os, "readlink", link):
+                    mock.patch.object(cg.os, "readlink", link), mock.patch.object(cg, "_proc_status", lambda pid: same_user):
                 self.assertEqual(cg.busy_processes(str(self.linked)), expected)
 
     def test_lsof_exit_one_means_nothing_found_only_when_it_said_nothing_else(self):
@@ -428,7 +429,7 @@ class RedTeamRound2(Repo):
         with mock.patch.object(cg, "linked_worktree_remove_refusal",
                                lambda path, cwd, policy=None, remote_ls=None: used.append(policy) or real_refusal(path, cwd, policy, remote_ls)):
             cg.verify_worktree(str(self.linked))
-        self.assertIs(used[0], cg.WORKTREE_POLICY)
+        self.assertEqual(used[0]["reproducible_clone"], cg.WORKTREE_POLICY["reproducible_clone"])  # the delegated rules, laid over the user policy
 
 
 class GuardMessage(Repo):
