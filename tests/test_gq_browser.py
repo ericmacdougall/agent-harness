@@ -663,6 +663,15 @@ class McpTest(Base):
         self.assertTrue(out[1]["result"]["tools"])
         self.assertEqual(len(self.api.calls("DELETE", "/api-keys/" + KEY_ID)), 1)
 
+    def test_mcp_survives_a_non_object_request_line(self):
+        """Hardening review: a JSON line that is not an object (a list, a number, a string) ended the stdio server with
+        an AttributeError on db41da6f, so every later call went unanswered."""
+        stdin = "[1, 2]\n7\n\"x\"\n" + json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/list"}) + "\n"
+        p = self.e.run("mcp", stdin=stdin)
+        out = [json.loads(line) for line in p.stdout.splitlines() if line.strip()]
+        self.assertEqual([r["id"] for r in out], [9])
+        self.assertTrue(out[0]["result"]["tools"])
+
     def test_neg6_mcp_has_no_credential_or_remote_tools(self):
         out = self.rpc([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}])
         text = json.dumps(out)
