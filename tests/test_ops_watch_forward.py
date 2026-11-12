@@ -206,6 +206,17 @@ class Forwarding(Base):
         self.assertEqual(self.delivered("`fabric:second`"), 1)
         self.assertEqual(len(self.dead), 2)
 
+    def test_a_ring_truncated_in_place_is_noticed_after_three_low_runs(self):
+        ring = self.standing_then()
+        inode = ring.stat().st_ino
+        os.truncate(str(ring), 0)  # the same file, its sequence restarts: only the low-run counter can see it
+        self.emit(key="fabric:third")
+        self.assertEqual(ring.stat().st_ino, inode)
+        for _ in range(3):
+            self.run_once()
+        self.assertEqual(self.delivered("`fabric:third`"), 1)
+        self.assertEqual(len(self.dead), 3)
+
     def test_a_clear_made_while_the_ring_was_unreadable_is_still_forwarded_afterwards(self):
         ring = self.standing_then()
         saved = ring.with_name("alerts.saved")

@@ -32,6 +32,7 @@ MUTANTS = {
     "non-dict detail trusted": ('            detail = e.get("detail") if isinstance(e.get("detail"), dict) else {}  # emit() lets any JSON through as detail',
                                 '            detail = e.get("detail") or {}'),
     "empty or unreadable read treated as a reset": ("    if isinstance(seen, int) and not rows:\n        return []", "    if False:\n        return []"),
+    "three low runs never reset": ("or state[\"fwd_low\"] >= 3)", ")"),
     "one low read resets": ("state[\"fwd_low\"] >= 3)", "state[\"fwd_low\"] >= 1)"),
     "expiry clear skipped": ("            elif e.get(\"event\") == \"clear\" and ident in active:", "            elif e.get(\"event\") == \"clear\" and ident in active and not detail.get(\"updated\"):"),
     "emit accepts a non-string key": ("    if not all(isinstance(event.get(k), str) for k in (\"host\", \"source\", \"key\")):", "    if False:"),

@@ -61,7 +61,7 @@ Checkpoint: not required (under 10 min and 4 GB)
 - A foreign source that already delivers its own critical alerts now also appears in the digest: accepted; the ring is the one alert channel and the digest is its record.
 - The state slot grows: mitigation, forwarded-raised keys are capped at 200 in a 512 KiB slot.
 - A malformed foreign row (a non-object detail, a non-string key or source) is skipped (and `emit()` now refuses a non-string host, source or key, and the ring reader skips a stored row that has one, so such a row cannot crash `latest_by_key`) or read as an empty detail; it never stops the alert path and the forwarded seq still advances (found by review H1; tested with string, list and number details).
-- Stated limits (review L1 to L4, M1, M2, tracked in the follow-up ticket): a repeated critical raise without a refresh flag is forwarded again (the digest keeps one entry per key and the deadman limit is one mail per key per 6 hours); a recreated ring that grows past the stored sequence before the next run (within one 2 minute pass) loses its early rows; the 200-key bound forgets the oldest standing key; a foreign writer using the `ops-watch` source label is skipped (the ring is unauthenticated local state); the queued copy drops `source`, so a foreign key with the same name as an ops-watch key shares its digest entry and mail throttle; a foreign source must stamp the configured host label (the short hostname, `mac` on the Mac) or its rows are not forwarded.
+- Stated limits (review L1 to L4, M1, M2, tracked in the follow-up ticket): a repeated critical raise without a refresh flag is forwarded again (the digest keeps one entry per key and the deadman limit is one mail per key per 6 hours); a ring truncated in place (same inode) is noticed only after three low runs, and a recreated ring on a reused inode that grows past the stored sequence before then loses its early rows (the t2-dev timer interval is 10 minutes, so a same-inode reset can delay a Fabric alert by up to about 30 minutes; a ring epoch stored in the file would close this, follow-up ticket); the 200-key bound forgets the oldest standing key; a foreign writer using the `ops-watch` source label is skipped (the ring is unauthenticated local state); the queued copy drops `source`, so a foreign key with the same name as an ops-watch key shares its digest entry and mail throttle; a foreign source must stamp the configured host label (the short hostname, `mac` on the Mac) or its rows are not forwarded.
 - A raise that falls out of the 1024-slot ring while standing (N3 of the Fabric review) is not re-forwarded: stated limit, tracked separately.
 
 ## Domain checklist
@@ -103,9 +103,11 @@ Domain-gate: staging-exists waived (no such behaviour is added or changed; ring 
 
 ## Reviews
 
-Spec core sha256: `81f479036fdc08923d609d65e91549d2b703cd9d39f17aea7f4a335d12da81c0`
+Spec core sha256: `f141b5413c9b01639dff4309661855541bfbed1472f4d0cc68ea9fa65149cebc`
 
 | Role | Verdict | Reviewer | Kind | Source | Bound to |
 |---|---|---|---|---|---|
+| adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | stale |
+| acceptance | ACCEPT | a5d878417503c1093 (red-team) | agent | WAL-verified red-team agent | stale |
 | adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | current |
 | acceptance | ACCEPT | a5d878417503c1093 (red-team) | agent | WAL-verified red-team agent | current |
