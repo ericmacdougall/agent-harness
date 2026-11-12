@@ -19,8 +19,19 @@ MUTANTS = {
     "symlink followed": ("info = os.lstat(name, dir_fd=frame['fd'])", "info = os.stat(name, dir_fd=frame['fd'])",
                          ["Walk.test_a_symlink_is_removed_as_a_link_and_its_target_survives"]),
     "no cutoff": ("info.st_ctime_ns) > cutoff_ns:", "info.st_ctime_ns) > 2 ** 62:",
-                  ["Walk.test_an_entry_newer_than_the_cutoff_is_kept_and_a_newer_directory_is_kept_whole",
+                  ["review:FirstRunAndResume.test_first_run_judges_every_entry_by_ctime_so_a_touched_directory_is_kept_whole",
                    "Removal.test_a_file_written_after_verification_survives_even_through_resume"]),
+    "birth time used on the first run": ("if (_birth_ns(info) if (resumed and stat.S_ISDIR(info.st_mode)) else info.st_ctime_ns) > cutoff_ns:",
+                                         "if (_birth_ns(info) if stat.S_ISDIR(info.st_mode) else info.st_ctime_ns) > cutoff_ns:",
+                                         ["review:Rollback.test_a_directory_moved_into_the_clone_after_verification_is_kept"]),
+    "ctime used on resume": ("if (_birth_ns(info) if (resumed and stat.S_ISDIR(info.st_mode)) else info.st_ctime_ns) > cutoff_ns:",
+                             "if info.st_ctime_ns > cutoff_ns:", ["Removal.test_an_interrupted_walk_is_finished_by_resume"]),
+    "unwritable marker not restored": ("            _restore(parent, qname, intent, ident)\n            _result_row(", "            raise\n            _result_row(",
+                                       ["review:Rollback.test_an_unwritable_marker_puts_the_clone_back_and_records_it"]),
+    "relative alternates mis-resolved": ("os.path.join(os.path.dirname(os.path.dirname(candidate)), line))", "os.path.join(os.path.dirname(candidate), line))",
+                                         ["review:Rollback.test_a_relative_alternates_entry_is_resolved_against_objects"]),
+    "token userinfo accepted": ("re.compile(r'^(?:https?|git)://[^/\\s]*@|://[^/@\\s]*:[^/@\\s]*@')", "re.compile(r'://[^/@\\s]*:[^/@\\s]*@')",
+                                ["review:Rollback.test_a_token_as_the_only_userinfo_refuses"]),
     "device crossed": ("if info.st_dev != dev:", "if False:", ["Walk.test_a_second_device_is_not_crossed"]),
     "intent row not required": ("raise CloneError('refused', 'the audit row could not be written (%s); nothing was changed' % type(error).__name__)",
                                 "pass", ["Removal.test_the_intent_row_must_be_written_before_anything_moves"]),
@@ -55,6 +66,7 @@ def main():
             shutil.copytree(ROOT / "harness" / "hooks", tmp / "harness" / "hooks", ignore=shutil.ignore_patterns("__pycache__"))
             (tmp / "tests").mkdir()
             shutil.copy(ROOT / "tests" / "test_ah_clone_remove.py", tmp / "tests")
+            shutil.copy(ROOT / "tests" / "test_ah_clone_remove_review.py", tmp / "tests")
             for extra in ("install.py", "install_codex.py"):
                 shutil.copy(ROOT / extra, tmp / extra)
             target = tmp / "harness" / "hooks" / "clone_remove.py"
@@ -67,7 +79,7 @@ def main():
             for o, n in zip(olds, news):
                 text = text.replace(o, n, 1)
             target.write_text(text)
-            done = subprocess.run([sys.executable, "-B", "-m", "unittest"] + ["tests.test_ah_clone_remove." + t for t in tests],
+            done = subprocess.run([sys.executable, "-B", "-m", "unittest"] + [("tests.test_ah_clone_remove_review." + t[7:]) if t.startswith("review:") else ("tests.test_ah_clone_remove." + t) for t in tests],
                                   cwd=str(tmp), capture_output=True, text=True)
             killed = done.returncode != 0
             print("%-36s %s" % (name, "KILLED" if killed else "SURVIVED (test is vacuous)"))

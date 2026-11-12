@@ -45,7 +45,7 @@ STATE_FILES = ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'REBASE_HEAD', '
 PRUNE_DIRS = {'node_modules', '.venv', 'venv', '__pycache__', 'target', 'build', 'dist', '.next', '.cache'}
 SESSION_RE = re.compile(r'[A-Za-z0-9_-]{1,64}')
 SHA_RE = re.compile(r'[0-9a-f]{40,64}')
-CREDENTIAL_URL = re.compile(r'://[^/@\s]*:[^/@\s]*@')
+CREDENTIAL_URL = re.compile(r'^(?:https?|git)://[^/\s]*@|://[^/@\s]*:[^/@\s]*@')
 HOOK = None  # tests only: HOOK(event, **info) at fixed points of the walk and the removal
 
 
@@ -121,6 +121,12 @@ def run_git(repo, args, timeout, stdin=None, check=True):
 
 
 # ----------------------------------------------------------------------------- scope
+def trusted_home():
+    """The account's real home directory (never a caller-set HOME or AH_HOME). Replaced in tests."""
+    import pwd
+    return pwd.getpwuid(os.getuid()).pw_dir
+
+
 def work_root(home):
     return os.path.join(str(home), '.agent-harness', 'work')
 
@@ -196,9 +202,9 @@ def caller_inside(path):
 
 
 def _live_owner_hits(session, path):
-    """Other live owners of this session whose registered task text names the target. `ah owners` does not expose an
-    owner's worktree or working directory, so this is a text match on the row, a disclosed limit; the process scan below
-    covers a running process."""
+    """DISCLOSED LIMIT, NOT A CONTROL: spec AC-4 asks to refuse while another live owner works in the target, but `ah owners`
+    rows carry no worktree or working directory, so nothing can be matched and this returns no hits. The live-use controls
+    are the process working-directory scan and the lsof open-file scan in check_processes."""
     return []
 
 
@@ -218,7 +224,7 @@ def _lsof_open(path):
             pid = int(line[1:])
         elif line.startswith('n') and pid not in (None, os.getpid()):
             name = line[1:]
-            for spelling in (name, os.path.realpath(name) if name.startswith('/') else name):
+            for spelling in (name,):
                 for prefix in (path, '/System/Volumes/Data' + path):
                     if spelling == prefix or spelling.startswith(prefix + os.sep):
                         pids.add(pid)
@@ -280,7 +286,7 @@ def alternates_scan(session_root, target):
                 for line in open(candidate, errors='replace'):
                     line = line.strip()
                     if line:
-                        resolved = os.path.realpath(os.path.join(os.path.dirname(candidate), line))
+                        resolved = os.path.realpath(os.path.join(os.path.dirname(os.path.dirname(candidate)), line))
                         if resolved == target or resolved.startswith(target + os.sep):
                             refuse('another repository borrows objects from the target (alternates)')
         try:
@@ -578,9 +584,10 @@ def audit_rows(home, audit_id):
 
 # ----------------------------------------------------------------------------- the descriptor walk
 def _birth_ns(info):
-    """When a directory was created (st_birthtime where the platform has it, else its ctime). A directory's ctime also moves
-    when this very walk removes a child, so after an interrupted run only the birth time still says "created after
-    verification began"; files are judged by ctime (any write or link change moves it)."""
+    """When a directory was created (st_birthtime where the platform has it, else its ctime). Used for directories on a
+    RESUMED walk only: a directory's ctime also moves when the interrupted run removed a child, so only the birth time
+    still says "created after verification began". The first run judges every entry by ctime (a directory moved in after
+    verification has a new ctime but an old birth time); files are always judged by ctime."""
     birth = getattr(info, 'st_birthtime', None)
     return int(birth * 1e9) if birth else info.st_ctime_ns
 
@@ -590,7 +597,7 @@ def _fd_ident(fd):
     return info.st_dev, info.st_ino
 
 
-def walk_delete(root_fd, cutoff_ns, exempt=None, dev=None):
+def walk_delete(root_fd, cutoff_ns, exempt=None, dev=None, resumed=False):
     """Delete the contents of the directory `root_fd` (not the directory itself) without following a symlink, crossing a
     device or deleting anything whose ctime, judged at its first lstat, is newer than cutoff_ns. Holds one descriptor at a
     time below the root (each ascent reopens the parent through `..` and compares its identity), so a 300-deep tree works
@@ -626,7 +633,7 @@ def walk_delete(root_fd, cutoff_ns, exempt=None, dev=None):
                 continue
             if not frame['rel'] and exempt.get(name) == info.st_ino:
                 continue  # the marker: removed by the caller just before the root
-            if (_birth_ns(info) if stat.S_ISDIR(info.st_mode) else info.st_ctime_ns) > cutoff_ns:
+            if (_birth_ns(info) if (resumed and stat.S_ISDIR(info.st_mode)) else info.st_ctime_ns) > cutoff_ns:
                 stats['left'].append('%s (changed after verification began)' % rel)
                 frame['kept'] = True
                 continue
@@ -757,26 +764,32 @@ def remove_clone(path, reason, session, home, agent='', authenticated=False, ver
         audit(home, intent)  # fail closed: nothing is renamed when the row cannot be written and fsynced
     except (OSError, ValueError, TypeError) as error:
         raise CloneError('refused', 'the audit row could not be written (%s); nothing was changed' % type(error).__name__)
-    pfd = _open_parent(parent, (ident['parent_dev'], ident['parent_ino']))
     try:
-        info = os.lstat(name, dir_fd=pfd)
-        if (info.st_dev, info.st_ino) != (ident['dev'], ident['ino']) or not stat.S_ISDIR(info.st_mode):
-            refuse('the target changed identity after verification')
-        _rename(pfd, name, qname)
-        renamed = True
-        quarantine = os.path.join(parent, qname)
+        pfd = _open_parent(parent, (ident['parent_dev'], ident['parent_ino']))
         try:
-            qinfo = os.lstat(qname, dir_fd=pfd)
-            if (qinfo.st_dev, qinfo.st_ino) != (ident['dev'], ident['ino']):
-                refuse('the quarantined directory is not the verified one')
-            again = snapshot(quarantine)
-            if again != verdict['snapshot']:
-                refuse('the refs, reflog or stash changed after verification')
-        except Exception:
-            os.rename(qname, name, src_dir_fd=pfd, dst_dir_fd=pfd)  # leave the clone exactly as found
-            raise
-    finally:
-        os.close(pfd)
+            info = os.lstat(name, dir_fd=pfd)
+            if (info.st_dev, info.st_ino) != (ident['dev'], ident['ino']) or not stat.S_ISDIR(info.st_mode):
+                refuse('the target changed identity after verification')
+            _rename(pfd, name, qname)
+            quarantine = os.path.join(parent, qname)
+            try:
+                qinfo = os.lstat(qname, dir_fd=pfd)
+                if (qinfo.st_dev, qinfo.st_ino) != (ident['dev'], ident['ino']):
+                    refuse('the quarantined directory is not the verified one')
+                again = snapshot(quarantine)
+                if again != verdict['snapshot']:
+                    refuse('the refs, reflog or stash changed after verification')
+            except Exception:
+                os.rename(qname, name, src_dir_fd=pfd, dst_dir_fd=pfd)  # leave the clone exactly as found
+                raise
+        finally:
+            os.close(pfd)
+    except CloneError as error:
+        _result_row(home, session, agent, audit_id, False, False, ['refused before any deletion: %s' % str(error)[:200]])
+        raise
+    except OSError as error:
+        _result_row(home, session, agent, audit_id, False, False, ['stopped before any deletion (%s)' % type(error).__name__])
+        raise CloneError('refused', 'stopped before any deletion (%s)' % type(error).__name__)
     return _finish(home, session, agent, audit_id, quarantine, intent, ident)
 
 
@@ -791,19 +804,48 @@ def _write_marker(quarantine, audit_id, digest):
         os.close(fd)
 
 
+def _restore(parent, qname, intent, ident):
+    """Rename the quarantine back to the recorded clone name (refuses when that name is taken or the parent changed)."""
+    pfd = _open_parent(parent, (ident['parent_dev'], ident['parent_ino']))
+    try:
+        name = os.path.basename(intent['path'])
+        try:
+            os.stat(name, dir_fd=pfd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            refuse('the original name %s is taken, so the clone cannot be put back' % name[:40])
+        os.rename(qname, name, src_dir_fd=pfd, dst_dir_fd=pfd)
+    finally:
+        os.close(pfd)
+
+
+def _result_row(home, session, agent, audit_id, removed, directory_removed, left):
+    try:
+        audit(home, {'kind': 'clone-result', 'session': session, 'agent': agent, 'audit_id': audit_id, 'removed': removed,
+                     'directory_removed': directory_removed, 'left': left, 'bytes_freed': None})
+    except (OSError, ValueError, TypeError):
+        pass
+
+
 def _finish(home, session, agent, audit_id, quarantine, intent, ident, marker_ino=None):
     parent, qname = os.path.split(quarantine)
+    resumed = marker_ino is not None
     if marker_ino is None:
-        marker_ino = _write_marker(quarantine, audit_id, intent['snapshot_sha256'])
+        try:
+            marker_ino = _write_marker(quarantine, audit_id, intent['snapshot_sha256'])
+        except OSError as error:
+            _restore(parent, qname, intent, ident)
+            _result_row(home, session, agent, audit_id, False, False, ['restored: marker could not be written (%s)' % type(error).__name__])
+            raise CloneError('refused', 'the marker could not be written (%s); the clone was left in place' % type(error).__name__)
         try:
             audit(home, {'kind': 'clone-marker', 'audit_id': audit_id, 'session': session, 'marker_ino': marker_ino})
         except (OSError, ValueError, TypeError) as error:
-            os.unlink(os.path.join(quarantine, MARKER_NAME))
-            pfd = _open_parent(parent, (ident['parent_dev'], ident['parent_ino']))
             try:
-                os.rename(qname, os.path.basename(intent['path']), src_dir_fd=pfd, dst_dir_fd=pfd)
-            finally:
-                os.close(pfd)
+                os.unlink(os.path.join(quarantine, MARKER_NAME))
+            except OSError:
+                pass
+            _restore(parent, qname, intent, ident)
             raise CloneError('refused', 'the marker audit row could not be written (%s); the clone was left in place' % type(error).__name__)
     result = {'audit_id': audit_id, 'path': intent['path'], 'quarantine': quarantine, 'removed': None,
               'directory_removed': False, 'left': [], 'bytes_freed': None, 'size_estimate': intent.get('size_estimate')}
@@ -812,7 +854,7 @@ def _finish(home, session, agent, audit_id, quarantine, intent, ident, marker_in
         if _fd_ident(qfd) != (ident['dev'], ident['ino']):
             raise CloneError('unknown', 'the quarantine identity changed before the walk')
         fcntl.flock(qfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        stats = walk_delete(qfd, intent['cutoff_ns'], exempt={MARKER_NAME: marker_ino}, dev=ident['dev'])
+        stats = walk_delete(qfd, intent['cutoff_ns'], exempt={MARKER_NAME: marker_ino}, dev=ident['dev'], resumed=resumed)
         result['left'] = stats['left']
         if not stats['left']:
             try:
@@ -874,6 +916,20 @@ def resume_clone(audit_id, session, home, agent=''):
     if (info.st_dev, info.st_ino) != (intent['dev'], intent['ino']) or (parent.st_dev, parent.st_ino) != (intent['parent_dev'], intent['parent_ino']):
         refuse('the quarantine directory is not the one recorded')
     markers = [r for r in rows if r.get('kind') == 'clone-marker']
+    if not markers:
+        # The run stopped between the rename and the marker row: nothing was deleted. Put the clone back under its name.
+        original = intent.get('path')
+        if not isinstance(original, str) or os.path.dirname(original) != receipts or not os.path.basename(original).startswith('wt-'):
+            refuse('no marker row for that audit id')
+        if os.path.exists(os.path.join(quarantine, MARKER_NAME)):
+            try:
+                os.unlink(os.path.join(quarantine, MARKER_NAME))
+            except OSError:
+                refuse('the marker file could not be removed')
+        ident = {'dev': intent['dev'], 'ino': intent['ino'], 'parent_dev': intent['parent_dev'], 'parent_ino': intent['parent_ino']}
+        _restore(receipts, os.path.basename(quarantine), intent, ident)
+        _result_row(home, session, agent, audit_id, False, False, ['restored by --resume: the run stopped before any deletion'])
+        return {'audit_id': audit_id, 'removed': False, 'restored': True, 'path': original, 'left': []}
     if len(markers) != 1:
         refuse('no marker row for that audit id')
     marker_path = os.path.join(quarantine, MARKER_NAME)

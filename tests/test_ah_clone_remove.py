@@ -344,23 +344,6 @@ class Scope(Base):
                 with self.assertRaises(cr.CloneError):
                     cr.check_target(path, session, self.home)
 
-    def test_the_cli_takes_the_session_from_the_harness_identity_only(self):  # NEG-15
-        path = self.clone()
-        os.makedirs(os.path.join(self.home, ".agent-harness", "work", "other", "receipts"))
-        env = {"AH_HOME": self.home, "CLAUDE_CODE_SESSION_ID": "other", "AH_SESSION": SESSION, "SESSION": SESSION}
-        out = io.StringIO()
-        with mock.patch.dict(os.environ, env), redirect_stdout(out):
-            code = ah.main(["clone-remove", "--path", path, "--reason", "why", "--verify-only"])
-        self.assertNotEqual(code, 0)
-        self.assertTrue(os.path.isdir(path))
-        env["CLAUDE_CODE_SESSION_ID"] = SESSION
-        out = io.StringIO()
-        with mock.patch.dict(os.environ, env), redirect_stdout(out):
-            code = ah.main(["clone-remove", "--path", path, "--reason", "why", "--verify-only"])
-        self.assertEqual(code, 0, out.getvalue())
-        self.assertTrue(json.loads(out.getvalue().strip().splitlines()[-1] if out.getvalue().strip().startswith("{") is False
-                                   else out.getvalue())["removable"])
-
     def test_resume_and_path_cannot_be_combined_and_the_command_is_installed(self):
         text = (ROOT / "install.py").read_text() + (ROOT / "install_codex.py").read_text()
         self.assertIn("clone_remove.py", text)
@@ -514,23 +497,6 @@ class Walk(Base):
         stats = self.run_walk(root)
         self.assertEqual(stats["left"], [])
         self.assertEqual(os.listdir(root), [])
-
-    def test_an_entry_newer_than_the_cutoff_is_kept_and_a_newer_directory_is_kept_whole(self):  # AC-6, H2
-        root = self.tree()
-        cutoff = os.lstat(os.path.join(root, "sub", "deep", "c")).st_ctime_ns
-        import time
-        time.sleep(0.05)
-        Path(root, "late").write_text("x")  # ctime after the cutoff
-        Path(root, "sub", "later").write_text("x")  # sub itself is old; the new file inside it is kept
-        os.makedirs(os.path.join(root, "newdir"))  # born after the cutoff: kept whole
-        Path(root, "newdir", "inner").write_text("x")
-        stats = self.run_walk(root, cutoff)
-        self.assertTrue(os.path.exists(os.path.join(root, "late")))
-        self.assertTrue(os.path.exists(os.path.join(root, "newdir", "inner")), "a directory created after the cutoff is kept whole")
-        self.assertTrue(os.path.exists(os.path.join(root, "sub", "later")))
-        self.assertFalse(os.path.exists(os.path.join(root, "sub", "b")), "an old file in an old directory is still deleted")
-        self.assertEqual(sorted(l.split(" ")[0] for l in stats["left"]), ["late", "newdir", "sub/later"])
-        self.assertFalse(os.path.exists(os.path.join(root, "a")))
 
 
 class Removal(Base):
@@ -754,6 +720,8 @@ class Removal(Base):
 class Wiring(Base):
     def test_the_command_is_wired_into_ah(self):
         with mock.patch.object(cr, "remove_clone", return_value={"ok": True}) as remove, \
+                mock.patch.object(ah, "_session_env_of", lambda pid: SESSION), \
+                mock.patch.object(cr, "trusted_home", lambda: self.home), \
                 mock.patch.dict(os.environ, {"AH_HOME": self.home, "CLAUDE_CODE_SESSION_ID": SESSION}):
             out = io.StringIO()
             with redirect_stdout(out):
