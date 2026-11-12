@@ -688,7 +688,8 @@ class QuotedPunctuation(Base):
                 self.assertFalse(dropped_gate.acknowledges(command))
 
     def test_a_line_the_shell_alone_can_read_is_judged_conservatively(self):
-        # An unbalanced quote or a substitution cannot be split; the old substring judgement applies.
+        # An unbalanced quote cannot be split, so the substring judgement applies. A `$(...)` is read in lenient mode:
+        # the command here is really `ah`, so it is judged on its words; a computed COMMAND word is the next test.
         for command in (self.BASE + " --note 'open --kind resumed", self.BASE + " --note $(echo hi) --kind closed"):
             with self.subTest(command=command[:50]):
                 self.assertTrue(dropped_gate.acknowledges(command))
@@ -813,7 +814,6 @@ class ReviewRound1(Base):
     def test_commands_that_only_mention_the_words_are_not_denied(self):
         message = "git commit -m \"$(cat <<'EOF'\nfix: it's about dispose and closed\nEOF\n)\""
         self.assertFalse(dropped_gate.acknowledges(message))
-        self.assertFalse(dropped_gate.acknowledges("python3 - <<'EOF'\nprint('dispose closed')\nEOF"))
         self.assertFalse(dropped_gate.acknowledges("echo dispose closed" + " " * 30000))
         self.assertFalse(dropped_gate.acknowledges("grep -n \"$(echo dispose)\" notes.txt # closed"))
 
@@ -824,6 +824,40 @@ class ReviewRound1(Base):
             with self.subTest(command=command):
                 self.assertIsNone(shellwords.split_commands(command))
                 self.assertIsNotNone(shellwords.split_commands(command, lenient=True))
+
+    def test_a_computed_command_word_is_judged_by_the_conservative_text_rule(self):
+        # red-team r2 F1: lenient mode made `$(command -v ah)` one opaque word, so the dispose behind it was not seen
+        for program in ('"$(command -v ah)"', "$(command -v ah)", "`which ah`", "$AH", "${AH}", '"$(printf ah)"', "a?",
+                        "/usr/local/bin/a[h]", "{ah,}"):
+            for tail in ("--kind closed", "--kind resumed", "--kind waiting --ack-handoff"):
+                with self.subTest(program=program, tail=tail):
+                    self.assertTrue(dropped_gate.acknowledges(program + " task dispose --agent X " + tail))
+        # a computed subcommand word with an ack word still denies; plain computed text with no ack word does not
+        self.assertTrue(dropped_gate.acknowledges("ah $(echo task) dispose --agent X --kind closed"))
+        self.assertTrue(dropped_gate.acknowledges("ah task $(echo dispose) --agent X --kind resumed"))
+        self.assertFalse(dropped_gate.acknowledges("$(command -v ls) -l"))
+        self.assertFalse(dropped_gate.acknowledges('"$(command -v ah)" task list --agent X'))
+        self.assertFalse(dropped_gate.acknowledges("$(date) is the date; echo done"))
+        # a computed assignment before a literal program is still read as the program it is
+        self.assertTrue(dropped_gate.acknowledges("WHEN=$(date) " + self.RESUME))
+        self.assertFalse(dropped_gate.acknowledges("WHEN=$(date) ah task list"))
+
+    def test_python_here_documents_are_judged_by_what_the_code_says(self):
+        # red-team r2 F2: `-c` code is judged by the substring rule, so is code on stdin
+        body = 'import os; os.system("ah task dispose --agent X --kind closed")'
+        for command in ("python3 - <<'EOF'\n" + body + "\nEOF", "python3 <<EOF\n" + body + "\nEOF",
+                        "cat <<'EOF' | python3\n" + body + "\nEOF", "python -X dev - <<'EOF'\n" + body + "\nEOF",
+                        "python3 -c '" + body.replace("'", "") + "'"):
+            with self.subTest(command=command[:40]):
+                self.assertTrue(dropped_gate.acknowledges(command))
+        # python code that mentions neither word is data to the gate; a shell body is still read as shell
+        self.assertFalse(dropped_gate.acknowledges("python3 - <<'EOF'\nprint('hello')\nEOF"))
+        self.assertTrue(dropped_gate.acknowledges("python3 - <<'EOF' ; bash <<'EOF2'\nprint(1)\nEOF\n" + self.RESUME + "\nEOF2"))
+        self.assertTrue(dropped_gate.acknowledges("bash <<'EOF'\n" + self.RESUME + "\nEOF"))
+        self.assertFalse(dropped_gate.acknowledges("cat <<'EOF'\n" + body + "\nEOF"))  # cat prints it, nothing runs it
+
+    def test_the_unused_text_pattern_is_gone(self):
+        self.assertFalse(hasattr(dropped_gate, "_RUNS_TEXT"))
 
     def test_nested_and_unbalanced_substitutions_fail_safe(self):
         nest = "echo " + "$(" * 12 + "date" + ")" * 12

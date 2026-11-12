@@ -243,7 +243,6 @@ _WRAPPER_VALUE_OPTIONS = {"-u", "-n", "-s", "-k", "-g", "-C", "-U", "-S", "-p", 
 _DURATION = re.compile(r"^[0-9]+(?:\.[0-9]+)?[smhd]?$")
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
-_RUNS_TEXT = re.compile(r"(?:^|[\s;&|(])(?:(?:ba|z|da|k)?sh|fish|python[0-9.]*|eval|source|\.)(?:\s|$)")
 _SHELL_C = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")  # a short-option cluster that carries -c
 _KIND_WORD = re.compile(r"\b(?:" + "|".join(ACK_KINDS) + r")\b|ack[-_]handoff")
 
@@ -305,6 +304,11 @@ def _dispose_rest(seg: list):
 def _acks(seg: list, depth: int = 0) -> bool:
     """Whether one simple command is `[wrappers] [python] .../ah[.py] [global opts] task dispose ... --kind <ack>`."""
     i = _skip_wrappers(seg)
+    if i < len(seg) and getattr(seg[i], "computed", False):
+        # `"$(command -v ah)" task dispose ...`, backticks, `$AH`, a glob: the program is whatever the shell computes, so
+        # the words cannot say what runs. The same conservative text rule an unreadable line gets (red-team r2 F1).
+        code = " ".join(seg)
+        return "dispose" in code and bool(_KIND_WORD.search(code))
     flag = None
     if i < len(seg) and os.path.basename(seg[i]) in _SHELLS:  # `bash -c`, and clusters: `bash -lc`, `sh -ec` (24a786c F2)
         flag = next((j for j in range(i + 1, len(seg)) if _SHELL_C.match(seg[j])), None)
@@ -321,6 +325,9 @@ def _acks(seg: list, depth: int = 0) -> bool:
         return False
     rest = [t for t in seg[i + 1:]]
     words = [t for t in rest if not t.startswith("-")]
+    if any(getattr(t, "computed", False) for t in words[:3]) and any(
+            _KIND_WORD.search(t) or t.startswith("--kind") or t.startswith("--ack") for t in rest):
+        return True  # `ah $(echo task) dispose --kind closed`: the subcommand is computed, an ack word is not
     if words[:2] != ["task", "dispose"]:
         return False
     for j, tok in enumerate(rest):
@@ -334,12 +341,16 @@ def _acks(seg: list, depth: int = 0) -> bool:
     return False
 
 
-def _runs_text(seg: list) -> bool:
-    """Whether this simple command executes text it reads (a shell, python, eval, source or `.`), so a here-document or a
-    pipe feeding it is code, not data."""
+def _runs_text(seg: list):
+    """What this simple command executes from its input: 'shell' (a shell, eval, source or `.`), 'python' or None. A
+    here-document or a pipe feeding it is code, not data."""
     i = _skip_wrappers(seg)
-    return i < len(seg) and (os.path.basename(seg[i]) in _SHELLS or os.path.basename(seg[i]).startswith("python")
-                             or seg[i] in ("eval", "source", "."))
+    if i >= len(seg):
+        return None
+    name = os.path.basename(seg[i])
+    if name in _SHELLS or seg[i] in ("eval", "source", "."):
+        return "shell"
+    return "python" if name.startswith("python") else None
 
 
 def acknowledges(cmd: str, depth: int = 0) -> bool:
@@ -355,9 +366,15 @@ def acknowledges(cmd: str, depth: int = 0) -> bool:
         return True  # `$(ah task dispose ...)` and backticks run too (24a786c F2); judged as their own command line
     if any(_acks(s, depth) for s in segs):
         return True
-    if any(_runs_text(s) for s in segs):  # `bash <<EOF`, `cat <<EOF | bash`: a here-document body that a shell runs
-        return any(acknowledges(body, depth + 1) if depth < 3 else "dispose" in body and bool(_KIND_WORD.search(body))
-                   for s in segs for body in s.heredocs)
+    kinds = {kind for kind in (_runs_text(s) for s in segs) if kind}
+    if kinds:  # `bash <<EOF`, `cat <<'EOF' | bash`, `python3 - <<EOF`: a here-document a shell or python runs
+        for s in segs:
+            for body in s.heredocs:
+                if "shell" in kinds and (acknowledges(body, depth + 1) if depth < 3
+                                         else "dispose" in body and bool(_KIND_WORD.search(body))):
+                    return True
+                if "python" in kinds and "dispose" in body and _KIND_WORD.search(body):
+                    return True  # python code is judged by what it says, as `-c` is
     return False
 
 
