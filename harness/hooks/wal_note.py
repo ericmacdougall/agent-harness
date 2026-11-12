@@ -50,7 +50,7 @@ SECRET_PATTERN = re.compile(
 )
 
 
-def provenance_check(event, source):
+def provenance_check(event, source, allow_mc=False):
     """(mode, problem-or-None, is_assumption). Never raises: a resolver failure is a problem, not a crash."""
     try:
         import provenance
@@ -62,7 +62,7 @@ def provenance_check(event, source):
             return mode, None, False
         if not source:
             return mode, f'{event} has no --source', False
-        result = provenance.resolve(source)
+        result = provenance.resolve(source, {'allow_mc': True} if allow_mc else None)
         if not result['ok']:
             first = result['problems'][0] if result['problems'] else {'code': 'rejected', 'message': 'rejected'}
             return mode, f"source rejected ({first['code']}): {first['message']}", result['assumption']
@@ -73,6 +73,26 @@ def provenance_check(event, source):
         return mode, None, result['assumption']
     except Exception as error:
         return 'enforce' if event in ('requirement', 'ask') else 'warn', f'provenance check failed ({type(error).__name__})', False
+
+
+def ask_entry(path, ref: str):
+    """The last `ask` entry with id `ref` in this WAL (bounded tail read), or None."""
+    try:
+        import safe_input  # noqa: PLC0415
+        tail = safe_input.read_tail(path, 4 << 20)
+    except Exception:  # noqa: BLE001
+        return None
+    found = None
+    for raw in tail.splitlines():
+        if ref.encode() not in raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and rec.get('event') == 'ask' and rec.get('id') == ref:
+            found = rec
+    return found
 
 
 def open_ask_exists(path, ref: str) -> bool:
@@ -180,15 +200,25 @@ def main():
                               'hint': 'cite the answer: user:<session>/<uuid> "words", answer:<id> or queue:<id> (ah user-msg)'}),
                   file=sys.stderr)
             return 2
-        if not re.match(r'^(user:|uuid:|answer:|queue:|ticket:)', args.source.strip()):
-            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved source must be the answer: user:, answer:, queue: or ticket:',
+        if not re.match(r'^(user:|uuid:|answer:|queue:|mc:|ticket:)', args.source.strip()):
+            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved source must be the answer: user:, answer:, queue:, mc: or ticket:',
                               'hint': 'an ask cannot be closed on an inferred: or file: source'}), file=sys.stderr)
             return 2
-        mode, problem, assumption = provenance_check('ask', args.source)  # the answer is sourced like an ask (M1)
+        mode, problem, assumption = provenance_check('ask', args.source, allow_mc=True)  # the answer is sourced like an ask (M1)
         if problem:
             print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': problem[:300],
                               'hint': 'the resolution source must resolve: user:, answer:, queue: or ticket:'}), file=sys.stderr)
             return 2
+        if args.source.strip().lower().startswith('mc:'):
+            import provenance as _prov  # noqa: PLC0415
+            # The decision must be for THIS session's ask as it reads in THIS main WAL now (spec rev 2: ids repeat
+            # across sessions and WALs, and an ask an owner registered is never closed by a dashboard click).
+            bound = _prov.mc_bind(args.source.strip(), args.ref, args.decision, ask=ask_entry(path, args.ref),
+                                  session=path.parent.name, wal=path.stem if ask_wal is None else ask_wal)
+            if bound:
+                print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': bound[:300],
+                                  'hint': 'an mc: source closes only the ask it names, with its own decision'}), file=sys.stderr)
+                return 2
         record['ref'] = args.ref
         if ask_wal:
             record['ask_wal'] = ask_wal

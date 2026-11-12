@@ -38,6 +38,12 @@ PATTERNS = [
     ('aws-key', re.compile(r'\b(?:AKIA|ASIA|AGPA|AIDA|AROA)[A-Z0-9]{16}\b')),
     ('aws-secret', re.compile(r'(?i)\baws[_-]?secret[_-]?(?:access[_-]?)?key[\x22\x27]?\s*[:=]\s*[\x22\x27]?'
                               r'[A-Za-z0-9/+]{40}')),
+    # Stripe secret/restricted keys and webhook secrets, Hugging Face, GitLab and SendGrid (GoodQA #15585)
+    ('stripe', re.compile(r'\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}')),
+    ('stripe-webhook', re.compile(r'\bwhsec_[A-Za-z0-9]{16,}')),
+    ('huggingface', re.compile(r'\bhf_[A-Za-z0-9]{20,}')),
+    ('gitlab', re.compile(r'\bglpat-[A-Za-z0-9_-]{20,}')),
+    ('sendgrid', re.compile(r'\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}')),
     ('google-oauth', re.compile(r'\bya29\.[A-Za-z0-9_-]{20,}')),
     ('google-api', re.compile(r'\bAIza[A-Za-z0-9_-]{30,}')),
     ('google-refresh', re.compile(r'\b1//[A-Za-z0-9_-]{30,}')),

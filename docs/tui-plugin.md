@@ -162,6 +162,30 @@ running Terminal app can have its own environment; the final Go process still
 receives the restricted environment. This does not erase credentials from the
 parent client or promise that a reference's text contains no secrets.
 
+## Mission Control chat tools
+
+The same MCP server also offers three tools for answering
+[Mission Control](mission-control.md) chat from Claude desktop. Desktop apps
+have no Stop hook, so the app never wakes on its own. Ask it to "check the
+dashboard", and it uses these tools:
+
+- `mc_pending` attaches the app as its own chat target, `claude-desktop`. You
+  can then pick that target in the dashboard's session picker. The tool also
+  lists its unread messages with no text: ids with status `queued` or
+  `delivered` (read, not yet answered), at most 50 plus a count of the rest,
+  and a count of messages for other sessions. A message stays listed until
+  `mc_reply` answers it.
+- `mc_read` returns one message addressed to `claude-desktop`, only if its
+  server signature verifies, in the framed and fenced form with the
+  authority notice.
+- `mc_reply` posts the answer, which appears in the dashboard.
+
+The tools never list, read or answer a message addressed to a terminal
+session (they answer `NOT_YOURS` and leave it untouched). A forged or renamed
+record is refused. If Mission Control is not installed, every tool returns
+`NOT_INSTALLED`. The tools read and write only
+`~/.agent-harness/mission-control/chat/`.
+
 ## Launch outcomes and terminal use
 
 `LAUNCH_REQUESTED` means macOS Terminal accepted a request. It does not prove the
