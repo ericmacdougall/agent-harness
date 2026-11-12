@@ -301,33 +301,98 @@ def _dispose_rest(seg: list):
     return rest if [t for t in rest if not t.startswith("-")][:2] == ["task", "dispose"] else None
 
 
-def _acks(seg: list, depth: int = 0) -> bool:
-    """Whether one simple command is `[wrappers] [python] .../ah[.py] [global opts] task dispose ... --kind <ack>`."""
+def _says(text: str) -> bool:
+    """The conservative text rule: the text mentions dispose and an acknowledging kind (or `--ack-handoff`)."""
+    return "dispose" in text and bool(_KIND_WORD.search(text))
+
+
+# Options of `ah task dispose` whose value cannot change what it acknowledges. A computed value of one of these, when
+# the shell cannot split it (quoted), reaches ah as that option's value; argparse refuses an option-looking value.
+_SAFE_VALUE_OPTIONS = {"--agent", "--ref", "--until", "--reason", "--deployed", "--live-test", "--evidence",
+                       "--session", "--key"}
+
+
+def _computed(word) -> bool:
+    return bool(getattr(word, "computed", False))
+
+
+def _read_rest(rest: list):
+    """(literal positional words, a computed word sits where the subcommand is read, any unsafe computed word, a
+    literal `--kind`/`--ack...` flag) for the words after the program. A computed word is unsafe unless it is the
+    unsplittable value of a _SAFE_VALUE_OPTIONS option (`--until "$(date)"`, `--agent="$A"`): anywhere else it may be
+    `task`, `dispose`, a kind, or (unquoted) several words such as `--kind closed`."""
+    literal, pos_unsafe, unsafe, kind_flag, value_of = [], False, False, False, None
+    for tok in rest:
+        opt, value_of = value_of, None
+        if opt is not None:  # the value of the option before it
+            if _computed(tok) and (opt == "--kind" or getattr(tok, "splits", False)):
+                unsafe = True
+            continue
+        name, eq, _ = tok.partition("=")
+        if name.startswith(("--kind", "--ack")):
+            kind_flag = True
+        if _computed(tok):
+            if eq and name in _SAFE_VALUE_OPTIONS and not getattr(tok, "splits", False):
+                continue  # `--until="$(date)"`: the literal option name, an unsplittable value
+            unsafe = True
+            pos_unsafe = pos_unsafe or len(literal) < 2
+        elif tok.startswith("-"):
+            if not eq and (tok in _SAFE_VALUE_OPTIONS or tok == "--kind"):
+                value_of = tok
+        else:
+            literal.append(tok)
+    return literal, pos_unsafe, unsafe, kind_flag
+
+
+def _computed_acks(seg: list, i: int, ctx: str) -> bool:
+    """The conservative judgement for a simple command whose program (seg[i]) may be ah and whose words hold a computed
+    word in a position that can change what ah receives (red-team r2 F1, r3 F1: one position at a time was not enough).
+    `ctx` is this command's own text plus every `NAME=value` word of the line (`K=closed; $AH ... --kind "$K"`).
+    - A literal ah whose literal words already name another subcommand (`ah ticket comment ... "$(cat f)"`) is not a
+      dispose. Otherwise a literal ah with an unsafe computed word is denied when it may be the dispose.
+    - A computed program (`"$(command -v ah)"`, `$AH`, a glob, a computed python script) is denied when the line can
+      say dispose and an ack (as text, or through an unsafe computed word in the subcommand or kind positions)."""
+    literal, pos_unsafe, unsafe, kind_flag = _read_rest(seg[i + 1:])
+    if not _computed(seg[i]):
+        if not unsafe:
+            return False  # judged on its words by the caller
+        if not pos_unsafe and len(literal) >= 2 and literal[:2] != ["task", "dispose"]:
+            return False
+        return pos_unsafe or "dispose" in ctx
+    acks = bool(_KIND_WORD.search(ctx))
+    return ("dispose" in ctx and (acks or unsafe)) or (pos_unsafe and (acks or kind_flag))
+
+
+def _acks(seg: list, depth: int = 0, ctx: str = "") -> bool:
+    """Whether one simple command is `[wrappers] [python] .../ah[.py] [global opts] task dispose ... --kind <ack>`, or
+    may be one: any word the shell computes is judged by the conservative rules (_computed_acks, _says)."""
+    ctx = " ".join(seg) + " " + ctx
     i = _skip_wrappers(seg)
-    if i < len(seg) and getattr(seg[i], "computed", False):
-        # `"$(command -v ah)" task dispose ...`, backticks, `$AH`, a glob: the program is whatever the shell computes, so
-        # the words cannot say what runs. The same conservative text rule an unreadable line gets (red-team r2 F1).
-        code = " ".join(seg)
-        return "dispose" in code and bool(_KIND_WORD.search(code))
+    if i < len(seg) and _computed(seg[i]):
+        return _computed_acks(seg, i, ctx)
     flag = None
     if i < len(seg) and os.path.basename(seg[i]) in _SHELLS:  # `bash -c`, and clusters: `bash -lc`, `sh -ec` (24a786c F2)
         flag = next((j for j in range(i + 1, len(seg)) if _SHELL_C.match(seg[j])), None)
     if i < len(seg) and (seg[i] == "eval" or flag is not None):
-        code = " ".join(seg[flag + 1:] if flag is not None else seg[i + 1:])
-        return acknowledges(code, depth + 1) if depth < 3 else ("dispose" in code and bool(_KIND_WORD.search(code)))
+        words = seg[flag + 1:] if flag is not None else seg[i + 1:]
+        code = " ".join(words)
+        if any(_computed(w) for w in words) and _says(ctx):
+            return True  # `X='ah task dispose ...'; eval "$X"`: the code is computed from text the line holds
+        return acknowledges(code, depth + 1) if depth < 3 else _says(code)
     if i < len(seg) and os.path.basename(seg[i]).startswith("python"):
         rest = seg[i + 1:]
         if "-c" in rest:  # inline code: judged by what it says
             code = " ".join(rest[rest.index("-c") + 1:])
-            return "dispose" in code and bool(_KIND_WORD.search(code))
+            return _says(code) or (any(_computed(w) for w in rest) and _says(ctx))
         i = _after_python(seg, i)
+        if i < len(seg) and _computed(seg[i]):  # `python3 "$AHPY" task dispose ...`: a computed script
+            return _computed_acks(seg, i, ctx)
     if i >= len(seg) or os.path.basename(seg[i]) not in ("ah", "ah.py"):
-        return False
-    rest = [t for t in seg[i + 1:]]
+        return False  # a literal program that is not ah: computed arguments cannot make it run ah (bodies are judged)
+    if _computed_acks(seg, i, ctx):
+        return True
+    rest = list(seg[i + 1:])
     words = [t for t in rest if not t.startswith("-")]
-    if any(getattr(t, "computed", False) for t in words[:3]) and any(
-            _KIND_WORD.search(t) or t.startswith("--kind") or t.startswith("--ack") for t in rest):
-        return True  # `ah $(echo task) dispose --kind closed`: the subcommand is computed, an ack word is not
     if words[:2] != ["task", "dispose"]:
         return False
     for j, tok in enumerate(rest):
@@ -342,11 +407,13 @@ def _acks(seg: list, depth: int = 0) -> bool:
 
 
 def _runs_text(seg: list):
-    """What this simple command executes from its input: 'shell' (a shell, eval, source or `.`), 'python' or None. A
-    here-document or a pipe feeding it is code, not data."""
+    """What this simple command executes from its input: 'shell' (a shell, eval, source or `.`), 'python', 'any' (a
+    computed program: it may be either) or None. A here-document, here-string or pipe feeding it is code, not data."""
     i = _skip_wrappers(seg)
     if i >= len(seg):
         return None
+    if _computed(seg[i]):
+        return "any"
     name = os.path.basename(seg[i])
     if name in _SHELLS or seg[i] in ("eval", "source", "."):
         return "shell"
@@ -355,26 +422,32 @@ def _runs_text(seg: list):
 
 def acknowledges(cmd: str, depth: int = 0) -> bool:
     """Whether a Bash command runs an `ah task dispose` that resumes, reassigns, closes, supersedes, wontdoes or legacies
-    an owner."""
+    an owner.
+
+    Residual (red-team r3 F3, goodqa#15734): code that builds the words at run time (python `"clo" + "sed"`, printf
+    escapes piped into a shell, a script file, a variable set by an earlier command) is judged only by the text the
+    line holds. The gate is advisory against a sub-agent that hides the call; the dispose guard does not rely on it."""
     if len(cmd) > PRETOOL_MAX:
-        return "dispose" in cmd and bool(_KIND_WORD.search(cmd))
+        return _says(cmd)
     bodies = []
     segs = _segments(cmd, bodies)
     if segs is None:
-        return "dispose" in cmd and bool(_KIND_WORD.search(cmd))
+        return _says(cmd)
     if depth < 3 and any(acknowledges(body, depth + 1) for body in bodies):
         return True  # `$(ah task dispose ...)` and backticks run too (24a786c F2); judged as their own command line
-    if any(_acks(s, depth) for s in segs):
+    assigned = " ".join(w for s in segs for w in s if _ASSIGNMENT.match(w))
+    if any(_acks(s, depth, assigned) for s in segs):
         return True
     kinds = {kind for kind in (_runs_text(s) for s in segs) if kind}
-    if kinds:  # `bash <<EOF`, `cat <<'EOF' | bash`, `python3 - <<EOF`: a here-document a shell or python runs
-        for s in segs:
-            for body in s.heredocs:
-                if "shell" in kinds and (acknowledges(body, depth + 1) if depth < 3
-                                         else "dispose" in body and bool(_KIND_WORD.search(body))):
-                    return True
-                if "python" in kinds and "dispose" in body and _KIND_WORD.search(body):
-                    return True  # python code is judged by what it says, as `-c` is
+    if any(s.piped and _runs_text(s) for s in segs) and _says(cmd):
+        return True  # `printf '...' | python3`, `echo ... | sh`: text piped into a shell or python is code (r3 F2)
+    shell, python = bool(kinds & {"shell", "any"}), bool(kinds & {"python", "any"})
+    for s in segs:  # `bash <<EOF`, `cat <<'EOF' | bash`, `python3 - <<EOF`, `bash <<< '...'`: code on stdin
+        for body in s.heredocs:
+            if shell and (acknowledges(body, depth + 1) if depth < 3 else _says(body)):
+                return True
+            if python and _says(body):
+                return True  # python code is judged by what it says, as `-c` is
     return False
 
 

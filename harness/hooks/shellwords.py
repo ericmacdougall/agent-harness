@@ -6,10 +6,12 @@ on PR 179; goodqa#15684). A line whose words only the shell itself can know (an 
 `<(...)`, `$'...'`, a here-document) raises Unparsed, and the callers choose their own safe side: the stamp hooks mint
 nothing, the dropped-owner gate falls back to its conservative substring judgement.
 
-`lenient=True` (dropped_gate) reads the two forms a real command line uses all the time instead of giving up: a
+`lenient=True` (dropped_gate) reads the forms a real command line uses all the time instead of giving up: a
 balanced `$(...)` or backtick span is one computed word (its body is reported through `bodies` so the caller can judge
-what it runs), and a here-document is recognised only where the shell would see one (an unquoted `<<` operator; never
-in a quoted word, a comment or a `<<<` here-string), its body skipped and handed back on the command it feeds.
+what it runs), an ANSI-C `$'...'` span is a computed piece of its word (kept raw: its escapes are not decoded), a
+here-document is recognised only where the shell would see one (an unquoted `<<` operator; never in a quoted word, a
+comment or a `<<<` here-string), its body skipped and handed back on the command it feeds, and a `<<<` here-string's
+word is handed back the same way. A Command records whether a pipe feeds it (`piped`).
 
 Stdlib only, Python 3.9 compatible. Used by mission_gate.py and dropped_gate.py.
 """
@@ -31,15 +33,19 @@ class Unparsed(ValueError):
 
 class Word(str):
     """One shell word after quote removal. `computed`: it holds a `$` expansion or an unquoted glob or brace the
-    shell may rewrite, so the process could see other text; `tilde`: it starts with an unquoted `~` (bash expands `~`
+    shell may rewrite, so the process could see other text; `splits`: some of that expansion is unquoted, so the
+    shell may also split it into several words (or none); `tilde`: it starts with an unquoted `~` (bash expands `~`
     and `~/...`)."""
     computed = False
+    splits = False
     tilde = False
 
 
 class Command(list):
-    """The words of one simple command. `heredocs`: the here-document bodies (str) that feed it (lenient mode)."""
+    """The words of one simple command. `heredocs`: the here-document and here-string bodies (str) that feed it
+    (lenient mode); `piped`: a `|` or `|&` feeds its standard input."""
     heredocs = ()
+    piped = False
 
 
 def shell_tokens(cmd: str, lenient: bool = False, bodies: list = None) -> list:
@@ -96,16 +102,29 @@ def _scan(cmd: str, i: int, nested: bool, lenient: bool, bodies, level: int):
     if level > MAX_NEST:
         raise Unparsed("substitutions nested too deeply")
     out, n = [], len(cmd)
-    buf, computed, tilde, quoted = None, False, False, False
+    buf, computed, split, tilde, quoted = None, False, False, False, False
     depth, pending = 0, []
 
     def flush():
-        nonlocal buf, computed, tilde, quoted
+        nonlocal buf, computed, split, tilde, quoted
         if buf is not None:
             word = Word("".join(buf))
-            word.computed, word.tilde = computed, tilde
+            word.computed, word.splits, word.tilde = computed, split, tilde
             out.append(("word", word))
-        buf, computed, tilde, quoted = None, False, False, False
+        buf, computed, split, tilde, quoted = None, False, False, False, False
+
+    def ansi_c(start):
+        """Index after the `$'...'` span at start, kept raw as a computed (not split) piece of the current word."""
+        nonlocal buf, computed
+        j = start + 2
+        while j < n and cmd[j] != "'":
+            j += 2 if cmd[j] == "\\" else 1
+        if j >= n:
+            raise Unparsed("unbalanced $'")
+        buf = [] if buf is None else buf
+        buf.append(cmd[start:j + 1])
+        computed = True
+        return j + 1
 
     def substitution(start):
         """Index after the `$(...)` or backtick span at start, as one computed piece of the current word."""
@@ -169,9 +188,13 @@ def _scan(cmd: str, i: int, nested: bool, lenient: bool, bodies, level: int):
                 buf.append(d)
                 i += 1
         elif c == "`" or cmd.startswith("$(", i) or cmd.startswith("$'", i):
-            if cmd.startswith("$'", i) or not lenient:
+            if not lenient:
                 raise Unparsed("command substitution or ANSI-C quoting")
-            i = substitution(i)
+            if cmd.startswith("$'", i):
+                i = ansi_c(i)
+            else:
+                i = substitution(i)
+                split = True  # an unquoted substitution: its output is split into words
         elif c in " \t\r":
             flush()
             i += 1
@@ -185,7 +208,7 @@ def _scan(cmd: str, i: int, nested: bool, lenient: bool, bodies, level: int):
             if op in HEREDOCS and not lenient:
                 raise Unparsed("here-document")
             if op in REDIRECTS and buf is not None and not quoted and "".join(buf).isdigit():
-                buf, computed, tilde, quoted = None, False, False, False  # `2>&1`: the fd number belongs to the operator
+                buf, computed, split, tilde, quoted = None, False, False, False, False  # `2>&1`: the fd belongs to the op
             flush()
             i += len(op)
             if op in ("<<-", "<<"):
@@ -213,7 +236,8 @@ def _scan(cmd: str, i: int, nested: bool, lenient: bool, bodies, level: int):
         else:
             if buf is None:
                 buf, tilde = [], c == "~"
-            computed = computed or c in "$*?[{"  # an expansion or a glob: the process may see other words
+            if c in "$*?[{":  # an unquoted expansion or a glob: the process may see other, or more, words
+                computed = split = True
             buf.append(c)
             i += 1
     if nested:
@@ -269,6 +293,10 @@ def split_commands(cmd: str, lenient: bool = False, bodies: list = None, limit: 
         elif text in SEPARATORS:
             out.append(cur)
             cur = Command()
+            cur.piped = text in ("|", "|&")
+        elif text == "<<<" and lenient and i + 1 < len(tokens) and tokens[i + 1][0] == "word":
+            cur.heredocs = tuple(cur.heredocs) + (tokens[i + 1][1],)  # a here-string feeds its word on stdin
+            i += 1
         elif text in ("<<-", "<<"):
             pass  # a here-document operator: its delimiter was consumed by the scanner
         elif i + 1 < len(tokens) and tokens[i + 1][0] == "word":  # a redirection: drop its target too

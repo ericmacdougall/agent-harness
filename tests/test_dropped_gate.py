@@ -866,5 +866,100 @@ class ReviewRound1(Base):
         self.assertTrue(dropped_gate.acknowledges("echo $(" + self.RESUME))  # unbalanced: judged by the text rule
 
 
+class ReviewRound3(Base):
+    """PR 208 red-team r3 (goodqa#15684), rescue: a word the shell computes, in ANY position of a command that may run
+    ah, hides what ah receives (a computed `--kind`, `--agent`, `task` or `dispose`, `${VAR}`, `$'...'`), and text
+    piped into a shell or python is code. Two rounds fixed one position at a time; these cover the class."""
+    WAIT = " --kind waiting --ref wa5b00000006 --until 2026-11-12T00:00:00Z"
+
+    stamped = QuotedPunctuation.stamped
+
+    def test_a_computed_kind_value_is_denied_behind_any_program(self):
+        for command in ('K=closed; "$(command -v ah)" task dispose --agent X --kind "$K"',
+                        '$AH task dispose --agent X --kind "${K}"',
+                        "$AH task dispose --agent X --kind=$K",
+                        '"$(command -v ah)" task dispose --agent X --kind "$(printf clo)sed"',
+                        "`which ah` task dispose --agent X --kind `printf resumed`",
+                        'python3 "$AHPY" task dispose --agent X --kind "$K"',
+                        "ah task dispose --agent X --kind clos?d",
+                        "ah task dispose --agent X --kind {closed,}"):
+            with self.subTest(command=command):
+                self.assertTrue(dropped_gate.acknowledges(command))
+
+    def test_a_computed_agent_or_option_word_that_can_split_into_flags_is_denied(self):
+        for command in ("A='X --kind closed'; ah task dispose --agent $A",
+                        "ah task dispose --agent $(cat /x/agent-id)" + self.WAIT,
+                        "ah task dispose --agent X ${F}",
+                        'ah task dispose --agent X "$F"' + self.WAIT,
+                        "ah task dispose --agent X --until=$(date -u +%FT%TZ) --kind waiting --ref wa5b00000006",
+                        '"$AH" task dispose --agent X "$F"'):
+            with self.subTest(command=command):
+                self.assertTrue(dropped_gate.acknowledges(command))
+
+    def test_computed_task_and_dispose_words_are_denied(self):
+        for command in ('$AH "$T" "$D" --agent X --kind closed',
+                        "$AH task $(printf dis)pose --agent X --kind resumed",
+                        '"$(command -v ah)" "$T" dispose --agent X --kind "$K"',
+                        'python3 "$AHPY" task "$(echo dispose)" --agent X --kind closed',
+                        '${AH} task dispose --agent X --kind "${K}"',
+                        'ah task "$D" --agent X --kind waiting --ref wa5b00000006 --until X',
+                        "X='ah task dispose --agent Y --kind closed'; $X",
+                        "X='ah task dispose --agent Y --kind closed'; eval \"$X\""):
+            with self.subTest(command=command):
+                self.assertTrue(dropped_gate.acknowledges(command))
+
+    def test_ansi_c_quoting_is_a_computed_word_not_a_hole(self):
+        for command in ("ah task dispose --agent X --kind $'\\x63losed'",
+                        "ah task $'dis'pose --agent X --kind $'clo'sed",
+                        "$'\\x61h' task dispose --agent X --kind $'resumed'",
+                        "ah task dispose --agent X $'--kind=\\x63losed'"):
+            with self.subTest(command=command):
+                self.assertTrue(dropped_gate.acknowledges(command))
+        import shellwords
+        self.assertIsNone(shellwords.split_commands("echo $'x'"))  # the strict tokenizer still refuses it
+        word = shellwords.split_commands("echo $'a b'", lenient=True)[0][1]
+        self.assertTrue(word.computed)
+        self.assertFalse(word.splits)  # quoted: one word
+
+    def test_text_piped_or_here_stringed_into_a_shell_or_python_is_code(self):
+        code = 'import os; os.system("ah task dispose --agent X --kind closed")'
+        for command in ("printf '%s' '" + code + "' | python3",
+                        "printf 'ah task dispose --agent X --kind closed\\n' | sh",
+                        "echo 'ah task dispose --agent X --kind resumed' | bash -s",
+                        "echo ah task dispose --agent X --kind resumed | zsh",
+                        "echo 'ah task dispose --agent X --kind closed' | source /dev/stdin",
+                        "echo 'ah task dispose --agent X --kind closed' |& sh",
+                        "echo 'ah task dispose --agent X --kind closed' | \"$SHELL\"",
+                        "bash <<< 'ah task dispose --agent X --kind closed'",
+                        "python3 <<< '" + code + "'"):
+            with self.subTest(command=command[:60]):
+                self.assertTrue(dropped_gate.acknowledges(command))
+
+    def test_harmless_forms_stay_allowed(self):
+        for command in ("git commit -m \"$(cat <<'EOF'\nfix(dropped-gate): dispose acks are closed to sub-agents\nEOF\n)\"",
+                        "git commit -F - <<'EOF'\nfix: ah task dispose --kind closed is main's\nEOF",
+                        "echo dispose closed", "printf '%s\\n' 'ah task dispose --agent X --kind closed'",
+                        'echo "$(date) dispose closed"', "echo $HOME dispose resumed",
+                        "ah task dispose --agent X --kind waiting --ref wa5b00000006 --until \"$(date -u +%FT%TZ)\"",
+                        'ah task dispose --agent "$(cat /x/agent-id)"' + self.WAIT,
+                        '"$AH" task dispose --agent X' + self.WAIT,
+                        "$AH task dispose --agent X --kind waiting --ref wa5b00000006 --until \"$(date)\"",
+                        'ah ticket comment goodqa#1 --body "$(cat /x/note.md)"',
+                        'ah ticket comment goodqa#1 --body "$(cat /x/note.md)" --note closed',
+                        'ah ticket comment goodqa#1 --body "$(cat /x/dispose-plan.md)"',
+                        '"$PY" -m pytest "$T"', "$HOME/bin/tool --flag value",
+                        "printf 'echo hi\\n' | sh", "cat notes.txt | python3 x.py",
+                        "cat <<< 'ah task dispose --agent X --kind closed'",
+                        "grep -c dispose log.txt | sh -c 'read n; echo $n'"):
+            with self.subTest(command=command[:60]):
+                self.assertFalse(dropped_gate.acknowledges(command))
+
+    def test_main_ack_handoff_with_a_literal_until_is_still_stamped(self):
+        command = ("ah task dispose --agent A --kind waiting --ack-handoff --ref wa5b00000006 "
+                   "--until 2026-11-12T00:00:00Z")
+        self.assertEqual(self.stamped(command, ["A"]), ["A"])
+        self.assertEqual(self.stamped(command.replace("2026-11-12T00:00:00Z", '"$(date -u +%FT%TZ)"'), ["A"]), ["A"])
+
+
 if __name__ == "__main__":
     unittest.main()
