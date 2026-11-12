@@ -41,6 +41,47 @@ class Hooks(Repo):
         self.assertTrue(removed["removed"], removed)
         self.assertFalse(self.marker.exists(), "a hook ran: %s" % (self.marker.read_text() if self.marker.exists() else ""))
 
+    # The real proof on t2-dev showed the CLI never used the delegated policy: main() loads the user policy and passed it
+    # down, so verify_worktree used the hook defaults (no scaled budget, hooks refused). Run the actual CLI.
+    def run_cli(self, *argv):
+        import io
+        import json
+        from contextlib import redirect_stdout
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = cg.main(list(argv))
+        return code, json.loads(out.getvalue())
+
+    def test_the_command_line_uses_the_delegated_policy_not_the_hook_default(self):
+        code, report = self.run_cli("verify-worktree", "--path", str(self.linked))
+        self.assertEqual((code, report["removable"]), (0, True), report)
+        used = []
+        real = cg.linked_worktree_remove_refusal
+        with mock.patch.object(cg, "linked_worktree_remove_refusal",
+                               lambda path, cwd, policy=None, remote_ls=None: used.append(policy) or real(path, cwd, policy, remote_ls)):
+            self.run_cli("verify-worktree", "--path", str(self.linked))
+        cfg = used[0]["reproducible_clone"]
+        self.assertIs(cfg["allow_hooks"], True)
+        self.assertEqual(cfg["scale"], 15.0)
+        self.assertEqual(cfg["total_seconds"], cg.VERIFY_SECONDS)
+        code, report = self.run_cli("remove-worktree", "--path", str(self.linked))
+        self.assertEqual((code, report["removed"]), (0, True), report)
+        self.assertFalse(self.marker.exists())
+
+    def test_a_user_policy_is_the_base_but_cannot_loosen_the_delegated_rules_or_turn_the_route_back_on(self):
+        for base in (None, {}, {"reproducible_clone": {"allow_hooks": False, "scale": 1.0, "total_seconds": 4.0}}):
+            used = []
+            real = cg.linked_worktree_remove_refusal
+            with mock.patch.object(cg, "linked_worktree_remove_refusal",
+                                   lambda path, cwd, policy=None, remote_ls=None: used.append(policy) or real(path, cwd, policy, remote_ls)):
+                cg.verify_worktree(str(self.linked), policy=base)
+            self.assertIs(used[0]["reproducible_clone"]["allow_hooks"], True)
+            self.assertEqual(used[0]["reproducible_clone"]["scale"], 15.0)
+        # the user policy can still switch the exemption off
+        off = {"reproducible_clone": {"enabled": False}}
+        self.assertFalse(cg.verify_worktree(str(self.linked), policy=off)["removable"])
+        self.assertIn("switched off", cg.verify_worktree(str(self.linked), policy=off)["reason"])
+
     # ---- NEG-5
     def test_hook_files_of_odd_shapes_are_ignored_and_nothing_runs(self):
         (self.hooks / "pre-rebase").symlink_to(self.hooks / "pre-push")

@@ -428,7 +428,7 @@ class RedTeamRound2(Repo):
         with mock.patch.object(cg, "linked_worktree_remove_refusal",
                                lambda path, cwd, policy=None, remote_ls=None: used.append(policy) or real_refusal(path, cwd, policy, remote_ls)):
             cg.verify_worktree(str(self.linked))
-        self.assertIs(used[0], cg.WORKTREE_POLICY)
+        self.assertEqual(used[0]["reproducible_clone"], cg.WORKTREE_POLICY["reproducible_clone"])  # the delegated rules, laid over the user policy
 
 
 class GuardMessage(Repo):

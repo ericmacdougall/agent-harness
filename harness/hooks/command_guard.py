@@ -1937,6 +1937,18 @@ WORKTREE_POLICY = {'reproducible_clone': {'total_seconds': VERIFY_SECONDS, 'remo
                                          'allow_hooks': True}}
 
 
+def delegated_policy(base=None):
+    """The user policy (when given) with the delegated route's own rules laid over its reproducible_clone section: the
+    scaled budget and allow_hooks. The route always applies them, whatever the caller loaded (the real t2-dev proof showed
+    the command line passed the loaded user policy straight down, so the delegated rules were never in force); a policy
+    can still switch the exemption off with enabled false."""
+    base = base if isinstance(base, dict) else {}
+    section = base.get('reproducible_clone')
+    merged = dict(section) if isinstance(section, dict) else {}
+    merged.update(WORKTREE_POLICY['reproducible_clone'])
+    return dict(base, reproducible_clone=merged)
+
+
 def verify_worktree(path, authenticated=False, policy=None):
     """Read-only verdict as a dict {removable, reason, head, repo, urls, verifier}. `authenticated` reads the remote with
     this host's own credentials (authenticated_remote_refs) instead of the guard's anonymous ls-remote."""
@@ -1944,7 +1956,7 @@ def verify_worktree(path, authenticated=False, policy=None):
               'verifier': VERIFIER_VERSION}
     reason = worktree_scope_refusal(path) if isinstance(path, str) and os.path.isabs(path) else 'not a literal absolute path'
     if reason is None:
-        reason = linked_worktree_remove_refusal(path, os.sep, WORKTREE_POLICY if policy is None else policy,
+        reason = linked_worktree_remove_refusal(path, os.sep, delegated_policy(policy),
                                                 remote_ls=authenticated_remote_refs if authenticated else None)
         try:
             report['head'] = _git_out(path, ['rev-parse', '--verify', 'HEAD'], 2.0).strip()
