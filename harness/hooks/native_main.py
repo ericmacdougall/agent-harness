@@ -268,7 +268,9 @@ def _is_desktop_root(payload, pid, backend, read_thread):
 
 
 def is_desktop_review_root(payload):
-    """Current review hook only. The existing caller owns command and receipt policy."""
+    """The user-driven Codex Desktop root session. Callers: the review stamp and, by the user's decision (answer
+    b6714826, goodqa#15565: a Codex Desktop root may record merge waivers), merge_gate._may_record_waiver. The caller
+    owns command and receipt policy; a spawned child, standalone CLI or unqualified row is never a root."""
     if sys.platform != "darwin" or _current_session(payload) is None:
         return False
     try:
