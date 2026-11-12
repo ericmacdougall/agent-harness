@@ -1,5 +1,5 @@
 """Scenario B2.5: status lists come from evidence, never from memory. `ah status --since` classifies WAL entries as
-VERIFIED (REALLY_TESTED), LIVE (DONE_LIVE only when a REALLY_TESTED shares a ticket/sha token, else LIVE_UNTESTED),
+VERIFIED (REALLY_TESTED), LIVE (LINKED_LIVE only when a REALLY_TESTED shares a ticket/sha token, else LIVE_UNTESTED),
 PENDING, CLAIMED (narrative only), BLOCKED, open ASKS, and ASSUMPTION / TARGET_MISMATCH (B2.4: an unsourced decision
 that moved a target). Also B3.16: a live `waiting` disposition acknowledges a handoff."""
 
@@ -72,7 +72,7 @@ class StatusReport(unittest.TestCase):
         # goodqa#15754: prose live claims are not deploy records; they keep their label under LIVE_LEGACY
         self.assertEqual(r['live'], [])
         live = {e['note'].split()[0]: e['label'] for e in r['live_legacy']}
-        self.assertEqual(live['ParentProof'], 'LEGACY_DONE_LIVE')  # shares sha a67ab74f with the REALLY_TESTED
+        self.assertEqual(live['ParentProof'], 'LEGACY_LINKED_LIVE')  # shares sha a67ab74f with the REALLY_TESTED
         self.assertEqual(live['blog'], 'LEGACY_LIVE_UNTESTED')
         self.assertEqual(live['lead'], 'LEGACY_LIVE_TARGET_MISMATCH')  # tested and live, but against a narrowed target
         self.assertNotIn('course PR #43 merged, not live', [e['note'] for e in r['live_legacy']])
@@ -109,8 +109,8 @@ class StatusReport(unittest.TestCase):
         live = {e['note'].split()[0]: e for e in self.report()['live_legacy']}
         self.assertEqual(live['widget']['label'], 'LEGACY_LIVE_UNTESTED')
         self.assertEqual(live['widget']['shared_evidence'], [])
-        self.assertEqual(live['gadget']['label'], 'LEGACY_DONE_LIVE')
-        self.assertEqual(live['ParentProof']['label'], 'LEGACY_DONE_LIVE')  # a67ab74f still links
+        self.assertEqual(live['gadget']['label'], 'LEGACY_LINKED_LIVE')
+        self.assertEqual(live['ParentProof']['label'], 'LEGACY_LINKED_LIVE')  # a67ab74f still links
 
     def test_a_wal_that_could_not_be_read_is_listed(self):
         # Review F9: an evidence report must say which WALs it did not read instead of skipping them silently.

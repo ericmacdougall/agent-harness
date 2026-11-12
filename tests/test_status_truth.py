@@ -32,7 +32,7 @@ WRONG = """Very little of the four goals is done by your standard (deployed and 
 **2. GoodQA lead finding, user tokens, self-update, 1000 leads:**
 - **Self-update:** the harness tool that installs files on another machine (#15742) has its tests written. GoodQA's own self-update has had no work this stretch.
 - **1000 leads in the CRM view: nobody is working on it right now.** It waits on the browser."""
-RIGHT = """You're right, my last answer was wrong.
+RIGHT_R2 = """You're right, my last answer was wrong.
 
 **1. Prod move: done.** dev2 was powered off on Nov 10, and every service checked healthy on t2 right after.
 
@@ -40,6 +40,16 @@ RIGHT = """You're right, my last answer was wrong.
 - **1000 leads: the count is met.** On Nov 9 the CRM had 1416 people, and the saved view showed 1415.
 - **User tokens:** minting keys with a user token is built and tested. The refusal above is the part still open.
 - **Self-update: done and tested live.** On Nov 9 the desktop app updated itself to 0.2.57."""
+# Rev 3 (main's ruling on red-team M2: only DONE_LIVE is done): the ledger-true version of the corrected answer.
+RIGHT = """You're right, my last answer was wrong.
+
+**1. Prod move: tested live, not DONE_LIVE.** dev2 was powered off on Nov 10 and every service checked healthy on t2
+right after; no deploy record is attached, so it is LIVE_TESTED.
+
+**2. GoodQA lead finding, user tokens, self-update, 1000 leads:**
+- **1000 leads: LIVE_TESTED.** On Nov 9 the CRM had 1416 people, and the saved view showed 1415.
+- **User tokens:** UNKNOWN in the ledger; the machine-route refusal (goodqa#15638) is open.
+- **Self-update: LIVE_TESTED.** On Nov 9 the desktop app updated itself to 0.2.57."""
 
 
 def iso(ts):
@@ -69,7 +79,7 @@ class Base(unittest.TestCase):
         self.addCleanup(mode.stop)
 
     def seed(self):
-        aliases = {"prod-move": ["prod move"], "leads": ["leads", "1000 leads", "crm"],
+        aliases = {"prod-move": ["prod move"], "leads": ["leads", "1000 leads"],  # as SEED-KIT (no "crm")
                    "self-update": ["self-update", "self update"], "user-tokens": ["user tokens", "user token"],
                    "harness-asks": ["harness asks"], "parentproof": ["parentproof"]}
         ev = {"prod-move": "w16dc0f5dd6b", "leads": "w53ff16565a1", "self-update": "wa6c1d52d985"}
@@ -107,14 +117,39 @@ class Lint(Base):
         self.seed()
         doc = st.goals_doc()
         wrong = st.classify(WRONG, doc)
-        self.assertEqual({c["goal"] for c in wrong["contradictions"]}, {"prod-move", "leads", "self-update"})
+        # rev 3: "can't call the move done" and "nobody is working on it right now" are true of LIVE_TESTED goals
+        # (only DONE_LIVE is done; no live owner); "has had no work" is false (a live PASS is attached)
+        self.assertEqual({(c["goal"], c["rule"]) for c in wrong["contradictions"]}, {("self-update", "no-work")})
         self.assertEqual(st.classify(RIGHT, doc)["contradictions"], [])
+        over = {(c["goal"], c["rule"]) for c in st.classify(RIGHT_R2, doc)["contradictions"]}
+        self.assertEqual(over, {("prod-move", "over-claim-done"), ("self-update", "over-claim-done")})
+
+    def test_true_statements_are_not_flagged(self):  # red-team M2: the reviewer's five and five of the author's
+        self.seed()
+        doc = st.goals_doc()
+        true_lines = [
+            "The CRM view is not live on staging yet; the leads goal itself is met.",
+            "ParentProof accessibility run 2: done, results posted.",
+            "Leads export script is not done, but the 1000 leads goal was live-tested Nov 9.",
+            "Leads is not done against the target: 1416 people found, and the user asked for proof per lead.",
+            "The updater test rig is not built.",
+            "Prod move is not done: it is LIVE_TESTED with no deploy record attached.",
+            "Self-update is not DONE_LIVE yet; the 0.2.57 live test passed.",
+            "Nobody is working on leads right now; the count was met on Nov 9.",
+            "User tokens: status unknown in the ledger.",
+            "Harness asks remain open; two are waiting on the user.",
+        ]
+        flagged = [line for line in true_lines if st.classify(line, doc)["contradictions"]]
+        self.assertEqual(flagged, [])
+        # the reviewer's fifth line ("Prod move is done; ...") is an over-claim under the rev-3 ruling
+        self.assertEqual([c["rule"] for c in st.classify("Prod move is done; the updater test rig is not built.",
+                                                         doc)["contradictions"]], ["over-claim-done"])
 
     def test_pre_registered_recall_set(self):
         self.seed()
         doc = st.goals_doc()
         caught = [line for line in RECALL["positive"] if st.classify(line, doc)["contradictions"]]
-        self.assertGreaterEqual(len(caught), 11, set(RECALL["positive"]) - set(caught))
+        self.assertEqual(set(RECALL["positive"]) - set(caught), set())
         flagged = [line for line in RECALL["clean"] if st.classify(line, doc)["contradictions"]]
         self.assertEqual(flagged, [])
 
@@ -122,9 +157,21 @@ class Lint(Base):
         self.seed()
         out = self.stop("whats left", WRONG)
         self.assertEqual(out.get("decision"), "block")
-        self.assertIn("prod-move", out["reason"])
+        self.assertIn("self-update", out["reason"])
         again = self.stop("whats left", WRONG, stop_hook_active=True)
         self.assertNotEqual(again.get("decision"), "block")  # never twice in one turn
+
+    def test_every_flag_is_logged_with_ids_and_rules_only(self):  # rev 3 (main's ruling M4)
+        self.seed()
+        with mock.patch.object(st, "_policy_mode", return_value="warn"):
+            out = self.stop("whats left", WRONG)
+        self.assertIn("status-truth warning", out.get("systemMessage", ""))
+        log = (self.home / ".agent-harness" / "state" / "status-truth" / "flags.jsonl").read_text().splitlines()
+        row = json.loads(log[-1])
+        self.assertEqual((row["mode"], row["prompt_id"], row["answer_id"]), ("warn", "u-prompt-1", "a1"))
+        self.assertIn({"rule": "no-work", "goal": "self-update", "state": "LIVE_TESTED"}, row["rules"])
+        self.assertNotIn("no work", json.dumps(row))  # no message text
+        self.assertNotIn("stretch", json.dumps(row))
 
     def test_block_is_not_skipped_when_another_hook_blocked_first(self):
         self.seed()
@@ -136,6 +183,10 @@ class Lint(Base):
         out = self.stop("whats left", RIGHT)
         self.assertIn("`ah goals` was not run", out.get("reason", ""))
         self.assertEqual(self.stop("whats left", RIGHT, tool_cmds=["python3 ~/.claude/hooks/ah.py goals"]), {})
+        # red-team L2: quoting or grepping for the goals text is not running `ah goals`
+        quoted = self.stop("whats left", RIGHT, tool_cmds=["grep 'ah goals' notes.md",
+                                                          "echo Goals from the mission ledger"])
+        self.assertIn("was not run", quoted.get("systemMessage", ""))  # same turn: already blocked once, so a warning
 
     def test_done_about_a_file_edit_is_not_flagged(self):
         self.seed()
@@ -150,6 +201,7 @@ class Lint(Base):
         self.assertEqual(self.stop("here is what I see:\n" + WRONG, "Thanks, noted the file path."), {})
 
     def test_missing_ledger_says_unknown_and_never_blocks(self):
+        st._remember_mission(SESSION)  # the hooks saw an ok ledger before it went missing
         out = self.stop("whats left", WRONG)
         self.assertNotEqual(out.get("decision"), "block")
         self.assertIn("GOALS UNAVAILABLE", out.get("systemMessage", ""))
@@ -202,6 +254,7 @@ class Lint(Base):
         self.assertEqual((turn["prompt"], turn["prompt_id"]), ("whats left", "src-whats-left"))
 
     def test_queued_status_question_with_absent_ledger_says_unavailable(self):
+        st._remember_mission(SESSION)
         out = self.stop_raw([self.QUEUED, self.NOTE_USER, self.answer(WRONG)])
         self.assertIn("GOALS UNAVAILABLE", out.get("systemMessage", ""))
 
@@ -260,14 +313,44 @@ class Inject(Base):
         self.assertEqual(st.cmd_prompt({"session_id": OTHER, "prompt": "whats left"}), {})
 
     def test_missing_ledger_injects_unavailable(self):
+        st._remember_mission(SESSION)
         text = self.ctx(st.cmd_prompt({"session_id": SESSION, "prompt": "whats left"}))
         self.assertIn("GOALS UNAVAILABLE (absent)", text)
 
     def test_error_injects_unavailable(self):
         self.seed()
+        st._remember_mission(SESSION)
         with mock.patch.object(st, "goals_doc", side_effect=RuntimeError("boom")):
             text = self.ctx(st.cmd_prompt({"session_id": SESSION, "prompt": "whats left"}))
         self.assertIn("GOALS UNAVAILABLE (error RuntimeError)", text)
+
+    def test_broken_ledger_never_widens_scope(self):  # rev 3 NEG-8 (red-team M1, repro case E)
+        # no ledger and no remembered mission session: nothing anywhere (the state between install and seeding)
+        self.assertEqual(st.cmd_prompt({"session_id": SESSION, "prompt": "whats left"}), {})
+        self.assertEqual(st.cmd_prompt({"session_id": OTHER, "prompt": "whats left"}), {})
+        self.seed()
+        st.cmd_prompt({"session_id": SESSION, "prompt": "whats left"})  # an ok read remembers the mission session
+        self.assertEqual(st._remembered_mission(), SESSION)
+        with open(mc.goals_path(self.home), "a") as fh:
+            fh.write(" ")  # one byte: the ledger no longer verifies
+        self.assertEqual(st.cmd_prompt({"session_id": OTHER, "prompt": "whats left on the refactor?"}), {})
+        self.assertEqual(st.cmd_session_start({"session_id": OTHER, "source": "compact"}), {})
+        self.assertIn("GOALS UNAVAILABLE", self.ctx(st.cmd_prompt({"session_id": SESSION, "prompt": "whats left"})))
+        out = io.StringIO()
+        import safe_input  # noqa: PLC0415
+        with mock.patch.object(st, "_watchdog"), mock.patch.object(st, "cmd_prompt", side_effect=KeyError("x")), \
+                mock.patch.object(safe_input, "read_stdin_bounded",
+                                  return_value=json.dumps({"session_id": OTHER, "prompt": "whats left"})), \
+                mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(st.main(["prompt"]), 0)
+        self.assertEqual(out.getvalue(), "")  # the crash fallback is scoped too
+
+    def test_missing_redactor_gives_a_fixed_unavailable_line(self):  # rev 3 (red-team M6)
+        self.seed()
+        with mock.patch.dict(sys.modules, {"redact": None}):
+            text = self.ctx(st.cmd_prompt({"session_id": SESSION, "prompt": "whats left"}))
+        self.assertIn("GOALS UNAVAILABLE (redactor)", text)
+        self.assertNotIn("withheld", text)
 
     def test_compact_start_reinjects_and_other_starts_do_not(self):
         self.seed()
@@ -277,6 +360,7 @@ class Inject(Base):
 
     def test_cli_fails_open_and_still_injects_on_crash(self):
         self.seed()
+        st._remember_mission(SESSION)
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": SESSION, "prompt": "whats left"}))), \
                 mock.patch.object(st, "_watchdog"), mock.patch.object(st, "cmd_prompt", side_effect=KeyError("x")), \

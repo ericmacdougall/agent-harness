@@ -95,7 +95,7 @@ class Status(unittest.TestCase):
         self.assertEqual([v["check"] for v in r["verified"]], ["pp-615", "legacy-ok"])
         self.assertEqual([v["verdict"] for v in r["verified"]], ["PASS", "UNSTATED"])  # legacy kept, labelled
         self.assertEqual([f["check"] for f in r["failed"]], ["s5b2-live-controls", "df1-merged"])
-        self.assertEqual([(e["note"][:8], e["label"]) for e in r["live"]], [("deployed", "DONE_LIVE")])
+        self.assertEqual([(e["note"][:8], e["label"]) for e in r["live"]], [("deployed", "LINKED_LIVE")])
         legacy = [e["note"] for e in r["live_legacy"]]
         self.assertIn("blog worker ae83610c deployed to prod", legacy)  # prose: never LIVE
         self.assertTrue(all(e["label"].startswith("LEGACY_") for e in r["live_legacy"]))

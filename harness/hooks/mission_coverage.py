@@ -997,6 +997,9 @@ def attach_evidence(home: Path, goal_id: str, wid: str, *, kind: str = "", sessi
 
     def change(doc):
         g = _find(doc["goals"], goal_id)
+        if stamp is None and any(r.get("id") == wid and r.get("by") == "main" for r in g.get("evidence") or []):
+            # spec rev 3 NEG-4 (red-team H3): a re-attach would rewrite main's row (by, kind); only main changes it
+            raise MissionError(f"{wid} is already attached to {goal_id} by main; only main can change or remove it")
         rows = [r for r in g.get("evidence") or [] if r.get("id") != wid]
         rows.append({"id": wid, "session": session, "wal": wal_name, "kind": kind, "at": iso(time.time()), "by": by})
         if len(rows) > MAX_ATTACHED:

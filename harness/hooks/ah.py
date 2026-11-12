@@ -2376,7 +2376,7 @@ def _tokens(note: str) -> set:
 
 def status_report(home: Path, session: str, since_s: float, now: float | None = None) -> dict:
     """What the WALs prove, by class. Narrative is never promoted: VERIFIED needs a REALLY_TESTED entry, LIVE needs a
-    deploy/live note, DONE_LIVE needs both to share a ticket or sha token; a note that only says "done" is CLAIMED.
+    deploy/live note, LINKED_LIVE needs both to share a ticket or sha token; a note that only says "done" is CLAIMED.
     Targets changed without a user source are TARGET_MISMATCH; other unsourced decisions are ASSUMPTION."""
     now = time.time() if now is None else now
     cutoff = now - since_s
@@ -2465,7 +2465,9 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
             mismatch_tokens |= _tokens(a["note"])
     for entry in live + live_legacy:
         shared = _tokens(entry["note"]) & verified_tokens
-        entry["label"] = "DONE_LIVE" if shared else "LIVE_UNTESTED"
+        # LINKED_LIVE, not DONE_LIVE: any agent's rows can share a token; DONE_LIVE is `ah goals`'s word for main's
+        # attached deploy plus live PASS (goodqa#15754 red-team L3)
+        entry["label"] = "LINKED_LIVE" if shared else "LIVE_UNTESTED"
         entry["shared_evidence"] = sorted(shared)
         if _tokens(entry["note"]) & mismatch_tokens:
             # 50bca42: a stream whose target was moved without the user never reads as done against that target
