@@ -81,3 +81,12 @@ Checkpoint: not required (under 10 min per step); every step is idempotent and a
 - A directory source hides a hook file inside it: stated limit, as with the existing `cp` rule; the guard sees command text only and the sanctioned route is the one that is audited.
 - A single-letter host alias followed by a slash or backslash (`C:/x`) is read as a Windows drive path, not a remote operand: stated limit (L7).
 - sftp batch commands and any other program that speaks ssh itself stay invisible to a command-text guard: stated limit, accident prevention and not an access control.
+
+## Reviews
+
+Spec core sha256: `9098189e7b4111e9d733286d4150acb8f9a2f0f4dca91590de00d8af91b4b61e`
+
+| Role | Verdict | Reviewer | Kind | Source | Bound to |
+|---|---|---|---|---|---|
+| adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | current |
+| acceptance | ACCEPT | a5d878417503c1093 (red-team) | agent | WAL-verified red-team agent | current |
