@@ -717,7 +717,7 @@ class Removal(Base):
 class Wiring(Base):
     def test_the_command_is_wired_into_ah(self):
         with mock.patch.object(cr, "remove_clone", return_value={"ok": True}) as remove, \
-                mock.patch.object(ah, "_session_env_of", lambda pid: SESSION), \
+                mock.patch.object(cr, "parent_session_env", lambda pid: SESSION), \
                 mock.patch.object(cr, "trusted_home", lambda: self.home), \
                 mock.patch.dict(os.environ, {"AH_HOME": self.home, "CLAUDE_CODE_SESSION_ID": SESSION}):
             out = io.StringIO()

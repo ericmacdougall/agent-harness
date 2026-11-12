@@ -19,7 +19,7 @@ class Identity(T.Base):
     def cli(self, env, parent_session, trusted, *extra):
         out = io.StringIO()
         with mock.patch.dict(os.environ, env), redirect_stdout(out), \
-                mock.patch.object(ah, "_session_env_of", lambda pid: parent_session), \
+                mock.patch.object(cr, "parent_session_env", lambda pid: parent_session), \
                 mock.patch.object(cr, "trusted_home", lambda: trusted or self.home):
             code = ah.main(["clone-remove", "--reason", "why", "--verify-only", *extra])
         return code, out.getvalue()
@@ -40,6 +40,106 @@ class Identity(T.Base):
         code, text = self.cli(dict(base, CLAUDE_CODE_SESSION_ID=SESSION), SESSION, "/somewhere/else", "--path", path)
         self.assertNotEqual(code, 0, text)  # an AH_HOME that is not the account's real home
         self.assertTrue(os.path.isdir(path))
+
+
+class ParentEnvironment(T.Base):
+    """The parser that decides the calling session runs UNMOCKED against real child processes (receipt r2, F1)."""
+
+    def child(self, argv_tail, env):
+        proc = __import__("subprocess").Popen([sys.executable, "-c", "import time; time.sleep(60)", *argv_tail], env=env)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.terminate)
+        time.sleep(0.4)
+        return proc
+
+    def clean_env(self, **extra):
+        env = {k: v for k, v in os.environ.items() if k != cr.SESSION_VAR}
+        env.update(extra)
+        return env
+
+    def test_the_command_line_is_never_read_only_the_environment(self):
+        proc = self.child([cr.SESSION_VAR + "=OTHER"], self.clean_env(**{cr.SESSION_VAR: "REAL"}))
+        self.assertEqual(cr.parent_session_env(proc.pid), "REAL")
+
+    def test_a_command_line_override_with_no_variable_in_the_environment_reads_as_none(self):
+        proc = self.child([cr.SESSION_VAR + "=OTHER"], self.clean_env())
+        self.assertIsNone(cr.parent_session_env(proc.pid))
+
+    def test_a_missing_process_and_a_duplicate_variable_read_as_none(self):
+        self.assertIsNone(cr.parent_session_env(2 ** 22 + 12345))
+        with mock.patch.object(cr, "process_environment", lambda pid: [cr.SESSION_VAR + "=A", cr.SESSION_VAR + "=B"]):
+            self.assertIsNone(cr.parent_session_env(1))
+        with mock.patch.object(cr, "process_environment", lambda pid: [cr.SESSION_VAR + "="]):
+            self.assertIsNone(cr.parent_session_env(1))
+
+    def test_the_buffer_parser_separates_arguments_from_the_environment(self):
+        buf = (2).to_bytes(4, "little") + b"/usr/bin/zsh\x00\x00\x00zsh\x00" + (cr.SESSION_VAR + "=ARGV").encode() + b"\x00" \
+            + (cr.SESSION_VAR + "=ENV").encode() + b"\x00PATH=/bin\x00\x00junk"
+        self.assertEqual(cr.parse_procargs2(buf), [cr.SESSION_VAR + "=ENV", "PATH=/bin"])
+        with self.assertRaises(ValueError):
+            cr.parse_procargs2(b"\x01\x00")
+
+    def run_ah_under_parent(self, parent_env, inline_value):
+        """A real parent process with parent_env whose command line carries an inline override, running the real `ah`
+        with that override in ITS environment, exactly what `zsh -c 'CLAUDE_CODE_SESSION_ID=x ah ...'` does."""
+        import subprocess
+        ah_py = str(T.HOOKS / "ah.py")
+        code = ("import subprocess, sys, os\n"
+                "env = dict(os.environ, AH_HOME=sys.argv[3])\n"
+                "env[%s] = sys.argv[1]\n"
+                "r = subprocess.run([sys.executable, sys.argv[2], 'clone-remove', '--path', '/x/y', '--reason', 'r', '--verify-only'],"
+                " env=env, capture_output=True, text=True)\n"
+                "print(r.returncode); print(r.stdout + r.stderr)\n") % repr(cr.SESSION_VAR)
+        done = subprocess.run([sys.executable, "-c", code, inline_value, ah_py, self.home, cr.SESSION_VAR + "=" + inline_value],
+                              env=parent_env, capture_output=True, text=True, timeout=120)
+        lines = done.stdout.splitlines()
+        return int(lines[0]), "\n".join(lines[1:])
+
+    def test_an_inline_override_against_the_real_ah_is_refused_by_the_parsers_own_reading(self):  # r2 F1 end to end
+        code, text = self.run_ah_under_parent(self.clean_env(**{cr.SESSION_VAR: "REAL-SESSION"}), "OTHER-SESSION")
+        self.assertNotEqual(code, 0, text)
+        self.assertIn("session", text)
+        code, text = self.run_ah_under_parent(self.clean_env(), "OTHER-SESSION")
+        self.assertNotEqual(code, 0, text)
+        self.assertIn("session", text)
+
+
+class IntentFields(T.Base):
+    def interrupted(self):
+        path = self.clone()
+        real = os.unlink
+        count = []
+
+        def failing(name, *a, **kw):
+            count.append(name)
+            if len(count) > 3:
+                raise OSError(5, "io")
+            return real(name, *a, **kw)
+        with mock.patch.object(os, "unlink", failing):
+            return self.remove(path)
+
+    def test_an_intent_row_without_a_directory_set_refuses_with_a_clone_error(self):  # r2 F2
+        result = self.interrupted()
+        real = cr.audit_rows
+
+        def stripped(home, audit_id):
+            return [{k: v for k, v in r.items() if k not in ("dirs_sha256", "dirs_count")} if r.get("kind") == "clone-intent" else r
+                    for r in real(home, audit_id)]
+        with mock.patch.object(cr, "audit_rows", stripped):
+            with self.assertRaises(cr.CloneError) as caught:
+                cr.resume_clone(result["audit_id"], SESSION, self.home)
+        self.assertIn("no verified directory set", str(caught.exception))
+
+    def test_the_directory_set_file_is_deleted_once_the_removal_is_recorded_and_kept_until_then(self):  # r2 F3
+        result = self.interrupted()
+        sidecar = cr.dirs_path(self.home, result["audit_id"])
+        self.assertTrue(os.path.exists(sidecar))
+        done = cr.resume_clone(result["audit_id"], SESSION, self.home)
+        self.assertIs(done["removed"], True)
+        self.assertFalse(os.path.exists(sidecar))
+        path = self.clone("wt-second")
+        whole = self.remove(path)
+        self.assertFalse(os.path.exists(cr.dirs_path(self.home, whole["audit_id"])))
 
 
 class VerifiedTree(T.Walk):

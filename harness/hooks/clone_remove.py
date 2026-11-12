@@ -121,6 +121,67 @@ def run_git(repo, args, timeout, stdin=None, check=True):
 
 
 # ----------------------------------------------------------------------------- scope
+SESSION_VAR = 'CLAUDE_CODE_SESSION_ID'
+
+
+def parse_procargs2(buf):
+    """The ENVIRONMENT strings of a macOS KERN_PROCARGS2 buffer, never the command line: int argc, the executable path,
+    NUL padding, argc argument strings, then the environment strings up to the first empty one. Raises ValueError when the
+    buffer is malformed."""
+    if len(buf) < 8:
+        raise ValueError('short buffer')
+    argc = int.from_bytes(buf[:4], 'little')
+    rest = buf[4:]
+    end = rest.find(b'\x00')
+    if end < 0 or not 0 <= argc < 100000:
+        raise ValueError('bad header')
+    rest = rest[end:].lstrip(b'\x00')
+    parts = rest.split(b'\x00')
+    if len(parts) < argc + 1:
+        raise ValueError('truncated arguments')
+    env = []
+    for item in parts[argc:]:
+        if not item:
+            break
+        env.append(item.decode('utf-8', 'surrogateescape'))
+    return env
+
+
+def process_environment(pid):
+    """The environment a process was started with, as a list of NAME=value strings (no command line), or None when it cannot
+    be read (another user's process, a gone process, a platform without a reader)."""
+    try:
+        if os.path.exists('/proc/self/environ'):
+            with open('/proc/%d/environ' % pid, 'rb') as handle:
+                return [e.decode('utf-8', 'surrogateescape') for e in handle.read(4 * 1024 * 1024).split(b'\x00') if e]
+        import ctypes
+        import ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+        mib = (ctypes.c_int * 3)(1, 49, int(pid))  # CTL_KERN, KERN_PROCARGS2
+        size = ctypes.c_size_t(0)
+        if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value < 8 or size.value > 8 * 1024 * 1024:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        return parse_procargs2(buf.raw[:size.value])
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
+def parent_session_env(pid):
+    """CLAUDE_CODE_SESSION_ID from the parent's real ENVIRONMENT. The command line is never read: an inline
+    `CLAUDE_CODE_SESSION_ID=x ah ...` sits in the parent's argv, not in its environment. None (refuse) when the environment
+    cannot be read or the variable is absent, empty or appears more than once."""
+    env = process_environment(pid)
+    if env is None:
+        return None
+    values = [e[len(SESSION_VAR) + 1:] for e in env if e.startswith(SESSION_VAR + '=')]
+    if len(values) != 1 or not values[0]:
+        return None
+    return values[0]
+
+
 def trusted_home():
     """The account's real home directory (never a caller-set HOME or AH_HOME). Replaced in tests."""
     import pwd
@@ -479,6 +540,8 @@ def write_dirs(home, audit_id, dirs):
 
 
 def read_dirs(home, audit_id, sha256, count):
+    if not isinstance(sha256, str) or not isinstance(count, int):
+        refuse('the intent row carries no verified directory set')
     try:
         with open(dirs_path(home, audit_id), 'rb') as handle:
             raw = handle.read(256 * 1024 * 1024)
@@ -944,6 +1007,11 @@ def _finish(home, session, agent, audit_id, quarantine, intent, ident, marker_in
     try:
         audit(home, dict({'kind': 'clone-result', 'session': session, 'agent': agent}, **{k: result[k] for k in
               ('audit_id', 'removed', 'directory_removed', 'left', 'bytes_freed')}))
+        if result['removed'] is True:
+            try:
+                os.unlink(dirs_path(home, audit_id))  # the directory set has done its job once the removal is recorded
+            except OSError:
+                pass
     except (OSError, ValueError, TypeError):
         result['audit_warning'] = 'the result row could not be written'
     return result
@@ -1007,4 +1075,4 @@ def resume_clone(audit_id, session, home, agent=''):
     check_processes(quarantine)
     ident = {'dev': intent['dev'], 'ino': intent['ino'], 'parent_dev': intent['parent_dev'], 'parent_ino': intent['parent_ino']}
     return _finish(home, session, agent, audit_id, quarantine, intent, ident, marker_ino=minfo.st_ino,
-                   allowed_dirs=read_dirs(home, audit_id, intent["dirs_sha256"], intent["dirs_count"]))
+                   allowed_dirs=read_dirs(home, audit_id, intent.get('dirs_sha256'), intent.get('dirs_count')))

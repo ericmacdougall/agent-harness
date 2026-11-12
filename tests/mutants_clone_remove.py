@@ -36,6 +36,17 @@ MUTANTS = {
                                             ["review:Rollback.test_any_promisor_value_git_reads_as_true_refuses_in_the_hook_form"]),
     "hook-form linked route accepts a partial clone": ("bad = _config_refusal(shared, allow_worktree_config=True)", "bad = _config_refusal(shared, allow_worktree_config=True, allow_partial_clone=True)",
                                                        ["review:Rollback.test_a_linked_worktree_of_a_partial_clone_is_refused_by_the_reclaim_route"]),
+    "ah-session read from the ps command line": ("parent_session = clone_remove.parent_session_env(os.getppid())", "parent_session = _session_env_of(os.getppid())",
+                                                 ["review:ParentEnvironment.test_an_inline_override_against_the_real_ah_is_refused_by_the_parsers_own_reading"]),
+    "duplicate session variable accepted": ("if len(values) != 1 or not values[0]:", "if not values or not values[0]:",
+                                            ["review:ParentEnvironment.test_a_missing_process_and_a_duplicate_variable_read_as_none"]),
+    "arguments parsed as environment": ("for item in parts[argc:]:", "for item in parts[1:]:",
+                                        ["review:ParentEnvironment.test_the_buffer_parser_separates_arguments_from_the_environment",
+                                         "review:ParentEnvironment.test_the_command_line_is_never_read_only_the_environment"]),
+    "missing directory set crashes": ("if not isinstance(sha256, str) or not isinstance(count, int):", "if False:",
+                                      ["review:IntentFields.test_an_intent_row_without_a_directory_set_refuses_with_a_clone_error"]),
+    "directory set file kept": ("                os.unlink(dirs_path(home, audit_id))  # the directory set has done its job once the removal is recorded", "                pass",
+                                ["review:IntentFields.test_the_directory_set_file_is_deleted_once_the_removal_is_recorded_and_kept_until_then"]),
     "unwritable marker not restored": ("            _restore(parent, qname, intent, ident)\n            _result_row(", "            raise\n            _result_row(",
                                        ["review:Rollback.test_an_unwritable_marker_puts_the_clone_back_and_records_it"]),
     "relative alternates mis-resolved": ("os.path.join(os.path.dirname(os.path.dirname(candidate)), line))", "os.path.join(os.path.dirname(candidate), line))",
@@ -78,7 +89,7 @@ def main():
             shutil.copy(ROOT / "tests" / "test_ah_clone_remove_review.py", tmp / "tests")
             for extra in ("install.py", "install_codex.py"):
                 shutil.copy(ROOT / extra, tmp / extra)
-            target = tmp / "harness" / "hooks" / ("command_guard.py" if name.startswith("hook-form") else "clone_remove.py")
+            target = tmp / "harness" / "hooks" / ("command_guard.py" if name.startswith("hook-form") else "ah.py" if name.startswith("ah-") else "clone_remove.py")
             text = target.read_text()
             olds, news = (old, new) if isinstance(old, list) else ([old], [new])
             if any(o not in text for o in olds):
