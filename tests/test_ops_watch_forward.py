@@ -1,6 +1,7 @@
 """goodqa#15827 (B3 of goodqa#15805): a critical raise or clear that a foreign source (fabd-health, a script) wrote to the local
 ring with `ops_watch.py emit` must reach the GoodQA digest and the deadman mail, like ops-watch's own critical transitions.
 Stdlib only, no network; the sinks are fakes that record what they were asked to deliver."""
+import os
 import sys
 import time
 import unittest
@@ -153,6 +154,102 @@ class Forwarding(Base):
         self.assertEqual(self.run_once(), 0)  # the fourth mail goes out and nothing is stuck
         self.assertEqual(self.delivered(f"`{KEY}`"), 1)  # and the seq advanced past them
         self.assertEqual(len(self.dead), 4)
+
+    # receipt r1 F1 and F2: a failed or empty ring read is "unknown", never a reset
+    def standing_then(self):
+        self.run_once()
+        self.emit()
+        self.emit(key="fabric:second")
+        self.run_once()
+        self.assertEqual(self.delivered(f"`{KEY}`"), 1)
+        return ow.ring_path(self.home)
+
+    def test_an_unreadable_ring_after_a_forward_does_not_resend_the_history(self):
+        ring = self.standing_then()
+        saved = ring.with_name("alerts.saved")
+        ring.rename(saved)
+        ring.mkdir()  # the ring path is briefly not a regular file: read_ring returns []
+        self.run_once()
+        ring.rmdir()
+        saved.rename(ring)
+        self.run_once()
+        self.assertEqual(self.delivered(f"`{KEY}`"), 1)
+        self.assertEqual(self.delivered("`fabric:second`"), 1)
+        self.assertEqual(len(self.dead), 2)
+        self.assertGreaterEqual(ow.load_state(self.home).get("fwd_seq", 0), 2)  # the position was never lowered
+
+    def test_an_empty_ring_read_after_a_forward_does_not_resend_the_history(self):
+        ring = self.standing_then()
+        data = ring.read_bytes()
+        ring.write_bytes(b"")  # a truncated or not yet written ring
+        self.run_once()
+        ring.write_bytes(data)
+        self.run_once()
+        self.assertEqual(self.delivered(f"`{KEY}`"), 1)
+        self.assertEqual(self.delivered("`fabric:second`"), 1)
+        self.assertEqual(len(self.dead), 2)
+
+    def test_one_torn_newest_slot_is_not_a_reset(self):
+        ring = self.standing_then()
+        top = max(e["seq"] for e in ow.read_ring(ring))
+        offset = (top % ow.RING_SLOTS) * ow.SLOT_BYTES
+        fd = os.open(str(ring), os.O_RDWR)
+        try:
+            good = os.pread(fd, ow.SLOT_BYTES, offset)
+            os.pwrite(fd, b"x" * ow.SLOT_BYTES, offset)  # the newest slot cannot be parsed: the visible top drops by one
+            self.run_once()
+            os.pwrite(fd, good, offset)
+        finally:
+            os.close(fd)
+        self.run_once()
+        self.assertEqual(self.delivered(f"`{KEY}`"), 1)
+        self.assertEqual(self.delivered("`fabric:second`"), 1)
+        self.assertEqual(len(self.dead), 2)
+
+    def test_a_clear_made_while_the_ring_was_unreadable_is_still_forwarded_afterwards(self):
+        ring = self.standing_then()
+        saved = ring.with_name("alerts.saved")
+        ring.rename(saved)
+        ring.mkdir()
+        self.run_once()
+        ring.rmdir()
+        saved.rename(ring)
+        self.emit(event="clear", severity="info")
+        self.run_once()
+        self.assertEqual(self.delivered("CLEAR"), 1)
+
+    # receipt r1 F3: an expiry clear carries updated=true and must still close a forwarded raise
+    def test_a_clear_row_marked_updated_still_clears_a_forwarded_raise(self):
+        self.run_once()
+        self.emit()
+        self.run_once()
+        self.emit(event="clear", severity="info", detail={"updated": True})
+        self.run_once()
+        self.assertEqual(self.delivered("CLEAR"), 1)
+
+    # receipt r1 F4: a row whose key is not a string must not stop run_once
+    def test_a_ring_row_with_an_unhashable_key_does_not_stop_the_alert_path(self):
+        self.run_once()
+        ring = ow.ring_path(self.home)
+        self.emit(key="fabric:before", severity="info")
+        seq = max(e["seq"] for e in ow.read_ring(ring)) + 1
+        row = {"schema": 1, "at": "2026-11-12T00:00:00Z", "host": "testhost", "source": "x", "event": "raise",
+               "severity": "critical", "key": ["a"], "message": "bad", "detail": {}, "seq": seq}
+        fd = os.open(str(ring), os.O_RDWR)
+        try:
+            os.pwrite(fd, ow.encode_slot(row), (seq % ow.RING_SLOTS) * ow.SLOT_BYTES)
+        finally:
+            os.close(fd)
+        self.emit()
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.delivered(f"`{KEY}`"), 1)
+
+    def test_emit_refuses_a_non_string_key_source_or_host(self):
+        for field in ("key", "source", "host"):
+            row = {"host": "testhost", "source": "x", "event": "raise", "severity": "info", "key": "k", "message": "m"}
+            row[field] = ["no"]
+            with self.assertRaises(ValueError):
+                ow.emit(row, home=self.home)
 
     def test_no_deadman_configured_still_feeds_the_digest(self):
         self.cfg["sinks"] = dict(self.cfg["sinks"], deadman=[])

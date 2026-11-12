@@ -223,8 +223,9 @@ def _parse_slots(data: bytes) -> list:
             obj = json.loads(data[i:i + SLOT_BYTES].decode("utf-8", "replace").strip())
         except ValueError:
             continue
-        if isinstance(obj, dict) and isinstance(obj.get("seq"), int):
-            out.append(obj)
+        if (isinstance(obj, dict) and isinstance(obj.get("seq"), int)
+                and all(isinstance(obj.get(k), (str, type(None))) for k in ("host", "source", "key"))):
+            out.append(obj)  # a row whose host, source or key is not a string would crash every reader
     return sorted(out, key=lambda e: e["seq"])
 
 
@@ -243,6 +244,8 @@ def emit(event: dict, path: Path | None = None, home: Path | None = None) -> int
     missing = [k for k in REQUIRED if not event.get(k)]
     if missing:
         raise ValueError(f"alert event missing {missing}")
+    if not all(isinstance(event.get(k), str) for k in ("host", "source", "key")):
+        raise ValueError("alert event host, source and key must be strings")
     if event["severity"] not in SEVERITIES or event["event"] not in ("raise", "clear"):
         raise ValueError("bad severity or event")
     event = dict(event, message=redact(event["message"]), detail=redact_obj(event.get("detail") or {}))
@@ -2000,13 +2003,32 @@ def forward_foreign(cfg: dict, home: Path, state: dict, ring: Path, now: float) 
     whose sequence restarted below the stored one) forwards only what is standing, never the history."""
     host = cfg["host"]
     rows = sorted(read_ring(ring), key=lambda e: e.get("seq") or 0)
+    try:
+        info = os.stat(ring)
+    except FileNotFoundError:
+        state.setdefault("fwd_seq", 0)  # no ring yet: everything that appears later is new
+        return []
+    except OSError:
+        return []  # the ring cannot be examined: unknown, never a reset; position and keys stay as they are
+    ring_id = f"{info.st_dev}:{info.st_ino}"
     top = max([e.get("seq") or 0 for e in rows] or [0])
     seen = state.get("fwd_seq")
+    if isinstance(seen, int) and not rows:
+        return []  # an unreadable or empty read after a forward is "unknown": keep fwd_seq, never replay on the next good read
     active = state.setdefault("fwd_active", {})  # key -> seq of the raise that was forwarded
+    stored_id = state.get("fwd_ring")
+    low = isinstance(seen, int) and top < seen
+    state["fwd_low"] = (state.get("fwd_low") or 0) + 1 if low else 0
+    # a real reset needs a positive signal: the ring file itself was replaced, or the sequence stayed below the stored
+    # position on three consecutive runs; one low read (a torn newest slot) is not one
+    recreated = isinstance(seen, int) and ((bool(stored_id) and stored_id != ring_id) or state["fwd_low"] >= 3)
+    if low and not recreated:
+        return []
     out = []
-    if not isinstance(seen, int) or top < seen:  # first run or a recreated ring
+    if not isinstance(seen, int) or recreated:  # first run or a recreated ring
         before = dict(active)
         active.clear()
+        state["fwd_low"] = 0
         for (h, src, key), e in latest_by_key(rows).items():
             if h != host or src == SOURCE:
                 continue
@@ -2020,18 +2042,19 @@ def forward_foreign(cfg: dict, home: Path, state: dict, ring: Path, now: float) 
             if (e.get("seq") or 0) <= seen or ring_host(e) != host or e.get("source") == SOURCE:
                 continue
             detail = e.get("detail") if isinstance(e.get("detail"), dict) else {}  # emit() lets any JSON through as detail
-            if detail.get("updated") or detail.get("reasserted"):
-                continue
             if not isinstance(e.get("key"), str) or not isinstance(e.get("source"), str):
                 continue  # one malformed foreign row must never stop the alert path
             ident = f"{e.get('source')}/{e.get('key')}"
             if e.get("event") == "raise" and e.get("severity") == "critical":
+                if detail.get("updated") or detail.get("reasserted"):
+                    continue  # a text refresh is not a new alert
                 active[ident] = e.get("seq") or 0
                 out.append(e)
-            elif e.get("event") == "clear" and ident in active:
+            elif e.get("event") == "clear" and ident in active:  # an expiry clear carries updated=true and still closes the raise
                 del active[ident]
                 out.append(e)
     state["fwd_seq"] = top
+    state["fwd_ring"] = ring_id
     while len(active) > FWD_KEYS_MAX:
         active.pop(min(active, key=active.get))
     return out
