@@ -772,6 +772,7 @@ class Rollback(Base):
         with self.assertRaises(ai.InstallError):
             ai.rollback(run2, TICKET, (), self.mac, "s", "a", self.runner, lambda t, x: None)
         self.assertEqual(self.live("ah.py"), sha(self.base_bytes("ah.py") + b"\n# c1\n"))
+        self.assertEqual(ai.unfinished_runs(self.mac, "t2-dev"), [])  # r1c H1: a refusal before any write must not wedge the host
 
     def test_unknown_run_other_hosts_run_and_another_unfinished_run_refuse(self):  # AC-8, NEG-9
         with self.assertRaises(ai.InstallError):

@@ -560,13 +560,14 @@ def audit(home, row):
 def audit_rows(home):
     rows = []
     try:
-        for line in open(audit_path(home), errors="replace"):
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(row, dict):
-                rows.append(row)
+        with open(audit_path(home), errors="replace") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
     except OSError:
         pass
     return rows
@@ -913,6 +914,7 @@ def rollback(run_id, ticket, force_files=(), home=None, session="", agent="", ru
             refuse("%s on %s no longer holds run %s's new bytes%s (use --force-file %s to restore anyway)" % (
                 name, host, run_id, " (a later run %s installed it)" % later[0] if later else "", name), "live_changed")
         to_restore.append(name)
+    items, payload = _restore_items(home, remote, run_id, plan, to_restore, None) if to_restore else ([], b"")  # a plain refusal BEFORE the start row: unusable backups must not open an attempt
     start = {"event": "start", "kind": "rollback", "run": run_id, "host": host, "files": {n: plan[n] for n in to_restore}, "forced": sorted(force_files),
              "script_sha256": SCRIPT_SHA256, "session": session or None, "agent": agent or None, "ticket": ticket}
     try:
@@ -923,7 +925,6 @@ def rollback(run_id, ticket, force_files=(), home=None, session="", agent="", ru
     try:
         remote.call("lock", {"run": run_id})
         locked = True
-        items, payload = _restore_items(home, remote, run_id, plan, to_restore, None) if to_restore else ([], b"")
         got = remote.call("restore", {"items": items}, data=payload, write=True) if items else {"live": {}}
         after = remote.call("selftest", timeout=SELFTEST_TIMEOUT)
     except InstallError as error:
