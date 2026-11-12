@@ -9,3 +9,7 @@ VERDICT: ACCEPT
 Second acceptance reviewer, agent aa71c2b0206796fc0 (red-team, opus), fresh review: BLOCK on (1) network policy not stated (deny list, per-origin egress, 64 MB budget) and unworkable live-check site, (2) Keychain read method (shortcut via /usr/bin/security defeats the human gate). Both fixed in the spec (AC-8 purego in-process, no child process except osascript, click Allow; AC-15 network policy stated as ASSUMPTION/TARGET_MISMATCH; AC-20 added). Re-check: both BLOCKs resolved, notes 3-10 addressed, residual notes: TARGET_MISMATCH must reach the user as a sourced ask via main (done below), capability gate wording fixed. The reviewer's claim that wildcards exist was corrected by the adversarial reviewer (exact origins only); spec says exact origins only.
 
 VERDICT: ACCEPT
+
+Delta round (agent aa71c2b0206796fc0): BLOCK on stale text saying an agent runs the helper (Outcome, AC-8, Risks) and NEG-13 vs AC-17. Fixed. Re-check: all three resolved; notes folded in (AC-21 wildcard removed, AC-17 key-file sentence rewritten and labelled agent-accepted, server-side cap on user-token grants suggested as a follow-up ticket).
+
+VERDICT: ACCEPT
