@@ -162,6 +162,88 @@ class Listed(Base):
         self.assertEqual(self.calls, [])
 
 
+class Hardening(Base):
+    """Findings of the code review (M2 to M6, L3 to L6)."""
+
+    def test_a_host_guard_that_already_fails_open_refuses_before_any_write(self):  # M2
+        (self.hooks / "command_guard.py").write_bytes(b"import sys\nprint('{\"verdict\": \"allow\", \"message\": \"\"}')\n")
+        before = {n: self.live(n) for n in NAMES}
+        error = self.refused(files=("ah.py", "command_guard.py"))
+        self.assertIn("self-test cannot run", str(error))
+        self.assertEqual({n: self.live(n) for n in NAMES}, before)
+        self.assertFalse(ai.selftest_ok_to_start({"guard": {"allow": {"exit": 0, "verdict": "allow"}, "deny_wal": {"exit": 0, "verdict": "allow"}}}))
+
+    def test_an_older_ref_that_would_downgrade_a_file_refuses_unless_allow_older_is_given_and_audited(self):  # M3
+        side = Path(self.tmp, "side-newer")
+        git(self.tmp, "clone", "-q", str(self.origin), str(side))
+        (side / "harness" / "hooks" / "ah.py").write_bytes(b"# newest\n")
+        git(side, "add", "-A")
+        git(side, "commit", "-q", "-m", "newer ah.py")
+        git(side, "push", "-q", "origin", "main")
+        error = self.refused(ref=self.c1, files=("ah.py",))
+        self.assertEqual(error.code, "older_ref")
+        self.assertIn("DOWNGRADE", str(error))
+        self.assertEqual(self.calls, [])
+        out = ai.install_files("t2-dev", self.c1, ["ah.py"], TICKET, False, self.mac, "s", "a", self.runner, lambda t, x: None, allow_older=True)
+        self.assertEqual(out["result"], "installed")
+        self.assertTrue(self.rows("start")[0]["allow_older"])
+        # a file with no newer merged version is unaffected
+        self.assertEqual(ai.install_files("t2-dev", self.c1, ["extra.py"], TICKET, False, self.mac, "s", "a", self.runner, lambda t, x: None)["result"], "installed")
+
+    def test_a_hooks_directory_that_is_a_symlink_or_owned_by_another_user_refuses(self):  # M4
+        real = self.host_home / ".claude" / "hooks-real"
+        self.hooks.rename(real)
+        os.symlink(real, self.hooks)
+        error = self.refused(files=("ah.py",))
+        self.assertIn("symlink", str(error))
+        self.assertEqual(sha((real / "ah.py").read_bytes()), sha(self.base_bytes("ah.py")))
+
+    def test_an_unexpected_error_after_the_first_live_write_is_unknown_with_json_not_a_traceback(self):  # M6
+        real = ai.Remote.call
+
+        def boom(self_, op, args=None, data=None, **kw):
+            out = real(self_, op, args, data, **kw)
+            if op == "commit":
+                return {"unexpected": "shape"}  # a KeyError for done["live"]
+            return out
+        with mock.patch.object(ai.Remote, "call", boom):
+            with self.assertRaises(ai.InstallError) as caught:
+                self.install()
+        self.assertEqual(caught.exception.exit_code, 5)
+        self.assertEqual(caught.exception.data["result"], "unknown")
+        self.assertIn("check t2-dev", str(caught.exception.data["reason"]))
+
+    def test_a_non_literal_hooks_tuple_is_a_refusal_not_a_traceback(self):  # L5
+        side = Path(self.tmp, "side-nonliteral")
+        git(self.tmp, "clone", "-q", str(self.origin), str(side))
+        (side / "install.py").write_text("HOOKS = ('a.py',) + tuple(x for x in ('b.py',))\n")
+        git(side, "add", "-A")
+        git(side, "commit", "-q", "-m", "non literal")
+        git(side, "push", "-q", "origin", "main")
+        error = self.refused(ref=git(side, "rev-parse", "HEAD"), files=("ah.py",))
+        self.assertIn("plain literal", str(error))
+
+    def test_a_lost_answer_taking_the_lock_says_a_lock_may_remain(self):  # L6
+        self.inject = ("lock", 1, "after")
+        error = self.refused()
+        self.assertEqual(error.exit_code, 2)
+        self.assertIn("lock may remain", str(error.data["reason"]))
+
+    def test_prune_keeps_ten_run_directories_and_ignores_other_entries(self):  # L4
+        backups = self.hooks / ".ah-install" / "backups"
+        backups.mkdir(parents=True)
+        for i in range(12):
+            d = backups / ("ins-%012x" % i)
+            d.mkdir()
+            os.utime(d, (1000 + i, 1000 + i))
+        (backups / "not-a-run").mkdir()
+        argv = ai.ssh_argv("t2-dev", "prune", {})
+        self.assertEqual(subprocess.run(["sh", "-c", argv[-1]], capture_output=True, env=self.env()).returncode, 0)
+        names = sorted(p.name for p in backups.iterdir())
+        self.assertEqual(len([n for n in names if n.startswith("ins-")]), 10)
+        self.assertIn("not-a-run", names)
+
+
 class Source(Base):
     def test_an_unmerged_commit_refuses_before_any_remote_call(self):  # AC-2, NEG-2
         side = Path(self.tmp, "side")
@@ -522,8 +604,23 @@ class Lock(Base):
         os.utime(lock, (old, old))
         out = self.install()
         self.assertEqual(out["result"], "installed")
-        self.assertTrue([p for p in (self.hooks / ".ah-install").iterdir() if p.name.startswith("lock.stale-")])
+        self.assertFalse([p for p in (self.hooks / ".ah-install").iterdir() if p.name.startswith("lock.stale-")])  # pruned after the run
         self.assertFalse(lock.exists())
+
+    def test_a_run_takes_its_own_leftover_lock_back_and_a_slow_run_does_not_look_stale(self):  # review M5
+        out = self.install()
+        run = out["run"]
+        lock = self.hooks / ".ah-install" / "lock"
+        lock.mkdir()
+        (lock / "run").write_text(run)
+        old = __import__("time").time() - 100
+        os.utime(lock, (old, old))
+        argv = ai.ssh_argv("t2-dev", "lock", {"run": run})
+        done = subprocess.run(["sh", "-c", argv[-1]], capture_output=True, text=True, env=self.env())
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertGreater(lock.stat().st_mtime, old + 50)  # touched, and taken back although fresh
+        other = ai.ssh_argv("t2-dev", "lock", {"run": "ins-dddddddddddd"})
+        self.assertNotEqual(subprocess.run(["sh", "-c", other[-1]], capture_output=True, text=True, env=self.env()).returncode, 0)
 
     def test_the_lock_is_released_only_by_its_own_run_id(self):  # NEG-7
         lock = self.hooks / ".ah-install" / "lock"

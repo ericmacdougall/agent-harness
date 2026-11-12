@@ -59,6 +59,28 @@ class Forms(unittest.TestCase):
                 self.assertEqual(code, 2, message)
                 self.assertIn("install-files", message)
 
+    def test_everyday_evasions_are_refused_for_a_sub_agent_and_the_real_form_with_redirects_passes_for_main(self):  # review M1, L1
+        sub = {
+            "quote-split name": GOOD.replace("install-files", 'install-file""s'),
+            "bash -c wrapper": "bash -c '" + GOOD.replace('"', "") .replace("GoodQA goodqa#15742", "GoodQA-goodqa#15742") + "'",
+            "sh -c wrapper": 'sh -c "' + GOOD.replace('"GoodQA goodqa#15742"', "'GoodQA goodqa#15742'") + '"',
+            "env wrapper": "env FOO=1 " + GOOD,
+            "heredoc import": "python3 - <<'EOF'\nimport ah_install\nEOF",
+            "concatenated import": "python3 -c \"import importlib; importlib.import_module('ah_'+'install')\"",
+        }
+        for label, text in sub.items():
+            with self.subTest(label):
+                self.assertIsNotNone(cg.install_files_refusal(text, False), text)
+                self.assertEqual(hook(text, False)[0], 2, text)
+        worktree_in_bash = "bash -c 'python3 harness/hooks/ah.py install-files --host t2-dev'"
+        self.assertIsNotNone(cg.install_files_refusal(worktree_in_bash, True))  # not even main, from a worktree copy
+        for text in (GOOD + " > out.json", GOOD + " > out.json 2>&1", GOOD + " 2>&1 | tee out.txt", GOOD + " --allow-older"):
+            with self.subTest(text[-30:]):
+                self.assertIsNone(cg.install_files_refusal(text, True), text)
+        for viewer in ("grep -rn install-files harness/", "rg install-files", "git log -S install-files", "sed -n 1,5p harness/hooks/ah_install.py"):
+            with self.subTest(viewer):
+                self.assertIsNone(cg.install_files_refusal(viewer, False), viewer)
+
     def test_a_sub_agent_is_refused_even_in_the_literal_form(self):  # AC-9, NEG-11
         self.assertIn("only the main agent", cg.install_files_refusal(GOOD, False))
         code, message = hook(GOOD, False)

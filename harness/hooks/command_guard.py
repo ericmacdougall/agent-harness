@@ -7305,30 +7305,45 @@ INSTALL_FILES_FORM = ('the sanctioned form is `python3 -I ~/.claude/hooks/ah.py 
                       'the INSTALLED copy')
 
 
-def install_files_refusal(command, is_main, home=None):
-    """None, or the refusal text for a command that runs `ah install-files` (goodqa#15742) outside its exact literal form:
-    the INSTALLED ah.py (or a bare `ah` that resolves to it), the flags of the install grammar only, and only for main.
-    ACCIDENT PREVENTION, NOT AN ACCESS CONTROL: the guard sees command text only, so a script that imports ah_install or any
-    program that speaks ssh itself is invisible to it; the controls that hold are the merged-code proof, the allowlists
-    and the audit inside ah_install."""
-    text = command if isinstance(command, str) else ' '.join(map(str, command))
-    if 'install-files' not in text and 'ah_install' not in text:
-        return None
-    home = home or os.path.expanduser('~')
-    installed = os.path.realpath(os.path.join(home, '.claude', 'hooks', 'ah.py'))
-    literal = ('~/.claude/hooks/ah.py', '$HOME/.claude/hooks/ah.py', os.path.join(home, '.claude', 'hooks', 'ah.py'))
+INSTALL_FILES_FLAGS['--allow-older'] = 0
+INSTALL_FILES_VIEWERS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'cat', 'less', 'more', 'head', 'tail', 'git', 'ls', 'sed', 'awk', 'echo',
+                         'printf', 'diff', 'wc', 'tee', 'man', 'find', 'vi', 'vim', 'nano', 'open', 'test', 'true', 'false', 'wal_note.py'}
+INSTALL_FILES_WRAPPERS = {'env', 'sudo', 'nohup', 'time', 'command', 'exec', 'stdbuf', 'nice', 'xargs'}
+INSTALL_FILES_SHELLS = {'bash', 'sh', 'zsh', 'dash', 'ksh'}
+INSTALL_FILES_REDIRECT = re.compile(r'^(?:[0-9]*[<>]{1,2}&?[0-9-]*|[0-9]*[<>]{1,2}.+|&>.*|\|&)$')
+
+
+def _install_files_segment(text, is_main, home, installed, literal, depth=0):
+    """None, or the refusal for one command string (recursing into `bash -c` bodies, at most three levels)."""
+    flat = re.sub(r'[\'"\\]', '', text)
+    if re.search(r'(?:^|\n)\s*(?:import|from)\s+ah_install\b|(?<![A-Za-z0-9_])ah_\W{0,6}install', flat) and not re.match(
+            r'\s*(?:git|cat|grep|egrep|rg|less|head|tail|ls|sed|awk|diff|wc|echo|printf|find|vi|vim|nano|man)\b', text):
+        if re.search(r'python|importlib|(?:^|\n)\s*(?:import|from)\s', flat):
+            return 'ah install-files: importing ah_install from python is refused; ' + INSTALL_FILES_FORM
     for segment in re.split(r'[;&|\n]+', text):
         try:
             tokens = shlex.split(segment, comments=False, posix=True)
         except ValueError:
-            if 'install-files' in segment or 'ah_install' in segment:
+            if 'install' in segment and ('install-files' in segment or 'ah_install' in segment):
                 return 'ah install-files: the command could not be parsed; ' + INSTALL_FILES_FORM
             continue
         while tokens and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', tokens[0]):
             tokens = tokens[1:]
+        while tokens and os.path.basename(tokens[0]) in INSTALL_FILES_WRAPPERS:
+            tokens = tokens[1:]
+            while tokens and (tokens[0].startswith('-') or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', tokens[0])):
+                tokens = tokens[1:]
         if not tokens:
             continue
         first = os.path.basename(tokens[0])
+        if first in INSTALL_FILES_SHELLS and depth < 3:
+            for pos, tok in enumerate(tokens[1:], 1):
+                if tok.startswith('-') and not tok.startswith('--') and 'c' in tok[1:] and pos + 1 < len(tokens):
+                    inner = _install_files_segment(tokens[pos + 1], is_main, home, installed, literal, depth + 1)
+                    if inner:
+                        return inner
+        if first in INSTALL_FILES_VIEWERS:
+            continue
         interpreter = re.fullmatch(r'python[0-9.]*', first) is not None
         code_import = False
         if interpreter:
@@ -7337,7 +7352,7 @@ def install_files_refusal(command, is_main, home=None):
                 if tok == '-m' and nxt == 'ah_install':
                     code_import = True
                 if tok.startswith('-') and not tok.startswith('--') and 'c' in tok[1:] and re.search(
-                        r'\b(?:import|from)\s+ah_install\b|__import__\(\s*[\'"]ah_install|importlib[^\n]*ah_install', nxt):
+                        r'\b(?:import|from)\s+ah_install\b|__import__\(\s*[\'"]ah_install|importlib[^\n]*install|(?<![A-Za-z0-9_])ah_\W{0,6}install', nxt):
                     code_import = True
         if code_import:
             return 'ah install-files: importing ah_install from python is refused; ' + INSTALL_FILES_FORM
@@ -7357,11 +7372,15 @@ def install_files_refusal(command, is_main, home=None):
                 return 'ah install-files: a bare `ah` must resolve to the installed ~/.claude/hooks/ah.py; ' + INSTALL_FILES_FORM
         else:
             return 'ah install-files: only the installed ah may run it; ' + INSTALL_FILES_FORM
-        args = tokens[index + 1:]
+        args = [t for t in tokens[index + 1:] if not INSTALL_FILES_REDIRECT.match(t)]  # redirections (`> out.json`, `2>&1`) are not flags
         i = 0
         while i < len(args):
             flag = args[i]
             if flag not in INSTALL_FILES_FLAGS:
+                # a redirection target (`> out.json` leaves `out.json`) is the only bare word allowed
+                if i > 0 and not flag.startswith('-') and tokens[tokens.index(flag) - 1] in ('>', '>>', '2>', '&>'):
+                    i += 1
+                    continue
                 return 'ah install-files: the flag %s is not part of the install grammar; %s' % (re.sub(r'[^\w=-]', '?', flag)[:40], INSTALL_FILES_FORM)
             i += 1 + INSTALL_FILES_FLAGS[flag]
             if i > len(args):
@@ -7369,6 +7388,24 @@ def install_files_refusal(command, is_main, home=None):
         if not is_main:
             return 'ah install-files: only the main agent may run it (a sub-agent may not deploy hook files); ' + INSTALL_FILES_FORM
     return None
+
+
+def install_files_refusal(command, is_main, home=None):
+    """None, or the refusal text for a command that runs `ah install-files` (goodqa#15742) outside its exact literal form:
+    the INSTALLED ah.py (or a bare `ah` that resolves to it), the flags of the install grammar only (redirections allowed),
+    and only for main. Quotes are removed before matching (`install-file""s` is still the command), `bash -c` bodies are
+    inspected, a python import of ah_install is refused for any caller, and programs that only VIEW the name (grep, cat,
+    git ...) pass. ACCIDENT PREVENTION, NOT AN ACCESS CONTROL: the guard sees command text only, so a script that imports
+    ah_install through sys.path, or any program that speaks ssh itself, is invisible to it; the controls that hold are the
+    merged-code proof, the allowlists and the audit inside ah_install."""
+    text = command if isinstance(command, str) else ' '.join(map(str, command))
+    flat = re.sub(r'[\'"\\]', '', text)
+    if 'install' not in flat:
+        return None
+    home = home or os.path.expanduser('~')
+    installed = os.path.realpath(os.path.join(home, '.claude', 'hooks', 'ah.py'))
+    literal = ('~/.claude/hooks/ah.py', '$HOME/.claude/hooks/ah.py', os.path.join(home, '.claude', 'hooks', 'ah.py'))
+    return _install_files_segment(text, is_main, home, installed, literal)
 
 
 def payload_cwd(payload):
@@ -7423,7 +7460,7 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
         if command is None:
             return 0
         install_text = command if isinstance(command, str) else ' '.join(map(str, command))
-        if 'install-files' in install_text or 'ah_install' in install_text:
+        if 'install' in re.sub(r'[\'"\\]', '', install_text):  # after quote removal: install-file""s is still the command
             try:
                 import caller_identity  # noqa: PLC0415 - positive main proof from the hook payload, never an environment variable
                 is_main = bool(caller_identity.is_main(payload))

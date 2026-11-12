@@ -103,7 +103,8 @@ def mkdir_private(path):
         os.mkdir(path, 0o700)
     except FileExistsError:
         pass
-    if kind(path) != "other" or os.path.islink(path):
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode):
         raise SystemExit("not a plain directory: " + os.path.basename(path))
 
 def fsync_dir(path):
@@ -113,10 +114,12 @@ def fsync_dir(path):
     finally:
         os.close(fd)
 
-def write_exclusive(path, data, mode):
+def write_exclusive(path, data, mode, final=None):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
     try:
         os.write(fd, data)
+        if final is not None:
+            os.fchmod(fd, final)
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -127,8 +130,7 @@ def replace_with(name, data, mode):
         os.unlink(t)
     elif kind(t) != "absent":
         raise SystemExit("temporary name is not a regular file: " + name)
-    write_exclusive(t, data, 0o600)
-    os.chmod(t, mode)
+    write_exclusive(t, data, 0o600, mode)
     return t
 
 def selftest():
@@ -165,9 +167,23 @@ def selftest():
             res["doctor"] = {"flags": True, "failing": None, "error": type(e).__name__}
     return res
 
+def check_hooks():
+    st = os.lstat(HOOKS)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise SystemExit("the hooks directory is a symlink, not a directory or owned by another user")
+
+def touch_lock(run):
+    try:
+        if open(os.path.join(LOCK, "run")).read() == run:
+            os.utime(LOCK)
+    except OSError:
+        pass
+
 op = sys.argv[1]
 args = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
+check_hooks()
 if op == "probe":
+    out["hooks_realpath"] = os.path.realpath(HOOKS)
     items = {}
     for name in args["names"]:
         p = live(name)
@@ -183,6 +199,15 @@ elif op == "lock":
     mkdir_private(STATE)
     stale = False
     if kind(LOCK) != "absent":
+        try:
+            holder = open(os.path.join(LOCK, "run")).read()
+        except OSError:
+            holder = ""
+        if holder == args["run"]:  # the same run (a resume after an interruption) takes its own lock back
+            os.utime(LOCK)
+            out["stale_taken_over"] = False
+            print(json.dumps(out))
+            sys.exit(0)
         age = time.time() - os.lstat(LOCK).st_mtime
         if age < STALE:
             raise SystemExit("locked by another run")
@@ -213,6 +238,7 @@ elif op == "stage":
         raise SystemExit("target is a " + k)
     mkdir_private(STATE)
     mkdir_private(BACKUPS)
+    touch_lock(args["run"])
     bdir = os.path.join(BACKUPS, args["run"])
     mkdir_private(bdir)
     if k == "file":
@@ -236,6 +262,7 @@ elif op == "stage":
     out["temp_sha"] = sha(t)
 elif op == "commit":
     out["live"] = {}
+    touch_lock(args["run"])
     for name in args["names"]:
         t, p = temp(name), live(name)
         if kind(t) != "file":
@@ -246,6 +273,7 @@ elif op == "commit":
         out["live"][name] = sha(live(name))
 elif op == "restore":
     out["live"] = {}
+    touch_lock(args.get("run", ""))
     for item in args["items"]:
         name = need(item["name"])
         if item.get("remove_if_sha"):
@@ -288,11 +316,15 @@ elif op == "audit":
     finally:
         os.close(fd)
 elif op == "prune":
-    if kind(BACKUPS) == "other":
-        runs = sorted(os.listdir(BACKUPS), key=lambda n: os.lstat(os.path.join(BACKUPS, n)).st_mtime)
+    if os.path.isdir(BACKUPS) and not os.path.islink(BACKUPS):
+        runs = sorted((n for n in os.listdir(BACKUPS) if re.fullmatch(r"ins-[0-9a-f]{12}", n)),
+                      key=lambda n: os.lstat(os.path.join(BACKUPS, n)).st_mtime)
         for old in runs[:-10]:
-            if re.fullmatch(r"ins-[0-9a-f]{12}", old):
-                shutil.rmtree(os.path.join(BACKUPS, old))
+            shutil.rmtree(os.path.join(BACKUPS, old))
+    if os.path.isdir(STATE) and not os.path.islink(STATE):
+        for n in os.listdir(STATE):
+            if re.fullmatch(r"lock\.stale-[0-9a-f]{8}", n) and os.path.isdir(os.path.join(STATE, n)) and not os.path.islink(os.path.join(STATE, n)):
+                shutil.rmtree(os.path.join(STATE, n))
 elif op == "cleanup":
     for name in args["names"]:
         t = temp(name)
@@ -338,7 +370,7 @@ class Remote:
 
 
 # ----------------------------------------------------------------------------- input and source proof
-def check_inputs(host, ref, files, ticket, dry_run, resume, rollback, force_files):
+def check_inputs(host, ref, files, ticket, dry_run, resume, rollback, force_files, allow_older=False):
     if host not in HOSTS:
         refuse("--host must be one of %s" % ", ".join(HOSTS))
     if resume and rollback:
@@ -351,6 +383,8 @@ def check_inputs(host, ref, files, ticket, dry_run, resume, rollback, force_file
                 refuse("%s takes the run id only: no --file or --from-ref" % label)
     if force_files and not rollback:
         refuse("--force-file is accepted only with --rollback")
+    if allow_older and (resume or rollback):
+        refuse("--allow-older is accepted only with a new install")
     if ticket is None:
         if not dry_run:
             refuse("--ticket GoodQA project#N is required for a real run, a resume and a rollback")
@@ -410,7 +444,7 @@ def tree_entries(body):
     return out
 
 
-def fetch_source(ref, names, home):
+def fetch_source(ref, names, home, allow_older=False):
     """Fetch the canonical main into a FRESH repository, prove REF is merged, return {name: (bytes, blob id)} and the list of
     HOOKS names at REF. The fresh repository is deleted afterwards."""
     root = Path(home) / ".agent-harness" / "install-cache"
@@ -465,13 +499,21 @@ def fetch_source(ref, names, home):
         listed = None
         for stmt in ast.parse(install_py.decode()).body:
             if isinstance(stmt, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "HOOKS" for t in stmt.targets):
-                listed = [str(x) for x in ast.literal_eval(stmt.value)]
+                try:
+                    listed = [str(x) for x in ast.literal_eval(stmt.value)]
+                except (ValueError, SyntaxError, TypeError):
+                    refuse("the HOOKS tuple in install.py at that commit is not a plain literal")
         if not listed:
             refuse("install.py at that commit has no HOOKS tuple")
         out = {}
         for name in names:
             if name not in listed:
                 refuse("%s is not in the installer's HOOKS list at that commit" % name)
+            if not allow_older:
+                newer = git(repo, ["log", "--format=%H", "%s..%s" % (ref, main), "--", "harness/hooks/" + name], home).stdout.decode().split()
+                if newer:
+                    refuse("%s has %d newer merged version(s) on main (latest commit %s): installing this ref would DOWNGRADE it; use a newer "
+                           "--from-ref, or --allow-older (audited) if that is intended" % (name, len(newer), newer[0][:12]), "older_ref")
             data, oid, mode = blob_at("harness/hooks/" + name)
             if len(data) > MAX_BLOB:
                 refuse("%s is larger than %d bytes" % (name, MAX_BLOB))
@@ -559,10 +601,12 @@ def selftest_worse(before, after):
 
 
 def selftest_ok_to_start(result):
+    """The baseline must be able to run AND the host's guard must already deny the foundational probe: a guard that fails
+    open before the install would let any replacement pass the comparison."""
     guard = result.get("guard") or {}
     if not guard or any(v.get("exit") is None for v in guard.values()):
         return False
-    return True
+    return (guard.get("deny_wal") or {}).get("verdict") == "block" and (guard.get("allow") or {}).get("verdict") == "allow"
 
 
 # ----------------------------------------------------------------------------- the run
@@ -615,9 +659,9 @@ def results_of(home, run):
     return [r.get("result") for r in audit_rows(home) if r.get("run") == run and r.get("event") == "result"]
 
 
-def install_files(host, ref, files, ticket, dry_run=False, home=None, session="", agent="", runner=subprocess.run, poster=None):
-    check_inputs(host, ref, files, ticket, dry_run, None, None, ())
-    return _run(host, ref, list(files), ticket, dry_run, Path(home or Path.home()), session, agent, runner, poster, None, None, "install")
+def install_files(host, ref, files, ticket, dry_run=False, home=None, session="", agent="", runner=subprocess.run, poster=None, allow_older=False):
+    check_inputs(host, ref, files, ticket, dry_run, None, None, (), allow_older)
+    return _run(host, ref, list(files), ticket, dry_run, Path(home or Path.home()), session, agent, runner, poster, None, None, "install", allow_older)
 
 
 def resume(run_id, ticket, home=None, session="", agent="", runner=subprocess.run, poster=None):
@@ -645,8 +689,8 @@ def _plan_for(names, sources, state, run):
     return plan
 
 
-def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster, resume_of, baseline, kind_):
-    sources, listed, main = fetch_source(ref, files, home)
+def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster, resume_of, baseline, kind_, allow_older=False):
+    sources, listed, main = fetch_source(ref, files, home, allow_older or bool(resume_of))
     remote = Remote(host, runner)
     run = resume_of or new_run_id()
     names = order(files)
@@ -682,7 +726,8 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
     applied = [n for n in names if plan[n]["action"] in ("new", "replaced")]
     todo = [n for n in applied if not plan[n].get("resumed_already_applied")]
     start = {"event": "start", "kind": kind_, "run": run, "host": host, "url": CANONICAL_URL, "main": main, "ref": ref, "files": plan,
-             "baseline": before, "script_sha256": SCRIPT_SHA256, "session": session or None, "agent": agent or None, "ticket": ticket}
+             "baseline": before, "script_sha256": SCRIPT_SHA256, "session": session or None, "agent": agent or None, "ticket": ticket,
+             "allow_older": bool(allow_older)}
     try:
         audit(home, start)  # fail closed: nothing is written remotely when this row cannot be written and fsynced
     except OSError:
@@ -715,8 +760,10 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
         why = selftest_worse(before, after)
         if why:
             raise InstallError("selftest_worse", why, 4)
-    except InstallError as error:
-        if remote.started and error.code == "lost":
+    except Exception as error:  # noqa: BLE001 - an unexpected failure after the first live write must not leave a bare traceback
+        if not isinstance(error, InstallError):
+            error = InstallError("unexpected", "%s: %s" % (type(error).__name__, str(error)[:120]), 5 if remote.started else 2)
+        if remote.started and error.code in ("lost", "unexpected"):
             return finish(home, run, host, "unknown", 5, {"ref": ref, "files": plan, "reason": "%s; check %s before retrying" % (error, host)}, ticket, poster, kind_)
         if remote.started:
             return _roll_back(home, run, host, plan, applied, remote, error, ticket, poster, kind_, ref)
@@ -724,7 +771,8 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
             remote.call("cleanup", {"names": todo})
         except InstallError:
             pass
-        return finish(home, run, host, "refused", 2, {"ref": ref, "files": plan, "reason": str(error)[:300]}, ticket, poster, kind_)
+        note = "; a lock may remain on %s until it is stale (30 minutes)" % host if error.code == "lost" and not locked else ""
+        return finish(home, run, host, "refused", 2, {"ref": ref, "files": plan, "reason": (str(error)[:300] + note)}, ticket, poster, kind_)
     finally:
         if locked:
             try:
