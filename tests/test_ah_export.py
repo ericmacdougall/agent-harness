@@ -225,10 +225,10 @@ class Redaction(Base):
         jl(self.w / 'agent-owner1.jsonl', [{'at': iso(NOW - 300 + i), 'event': 'status', 'note': n}
                                            for i, n in enumerate(notes)])
         raw = self.html(self.export())
+        for seg in segments(ANTHROPIC, 12):  # leak checks first, so a failing run names the leaked segment
+            self.assertNotIn(seg, raw, repr(seg))
         self.assertIn('keepshort words', raw)  # a short word beside a removed character is not over-redacted
         self.assertIn('[REDACTED:split]', raw)
-        for seg in segments(ANTHROPIC, 12):
-            self.assertNotIn(seg, raw, repr(seg))
         for secret in (GITHUB, GITHUB2):
             for seg in segments(secret, 4):
                 self.assertNotIn(seg, raw, repr(seg))
