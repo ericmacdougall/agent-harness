@@ -1,0 +1,85 @@
+{
+ "v": 1,
+ "reviews": [
+  {
+   "kind": "agent",
+   "identity": "a4ffb12f1f937dad5",
+   "verdict": "ACCEPT",
+   "model": "red-team",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-a9343b594cfa8f893/notes/goodqa-15745/review-adversarial.md",
+    "sha256": "20d4df4c8e8ba762d0fc3426467c19fc7d20735571f3113e58d3c0b8df20a445"
+   },
+   "role": "adversarial",
+   "core_sha": "15ae46e1abb4e7c0bcb189f65dc6ea610a0360bb71dbf9128da371e72717165c",
+   "at": "2026-11-12T04:23:28.241742+00:00",
+   "key": "agent:a4ffb12f1f937dad5"
+  },
+  {
+   "kind": "agent",
+   "identity": "a4ffb12f1f937dad5",
+   "verdict": "ACCEPT",
+   "model": "red-team",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-a9343b594cfa8f893/notes/goodqa-15745/review-adversarial.md",
+    "sha256": "7ae91d94d035e0170349407360277278307722a76b4d7d1575d33076fe32f18b"
+   },
+   "role": "adversarial",
+   "core_sha": "842d3ac6782cffada1f76b25d971f2528496740991ea1df6a268aef175cee684",
+   "at": "2026-11-12T04:29:29.988086+00:00",
+   "key": "agent:a4ffb12f1f937dad5"
+  },
+  {
+   "kind": "agent",
+   "identity": "aa71c2b0206796fc0",
+   "verdict": "ACCEPT",
+   "model": "red-team",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-a9343b594cfa8f893/notes/goodqa-15745/review-acceptance.md",
+    "sha256": "935660a6ad2cef164434c494966f9e3a60b03bf1d8d78d4386508f9af37bad5b"
+   },
+   "role": "acceptance",
+   "core_sha": "842d3ac6782cffada1f76b25d971f2528496740991ea1df6a268aef175cee684",
+   "at": "2026-11-12T04:29:30.095159+00:00",
+   "key": "agent:aa71c2b0206796fc0"
+  },
+  {
+   "kind": "agent",
+   "identity": "a4ffb12f1f937dad5",
+   "verdict": "ACCEPT",
+   "model": "red-team",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-a9343b594cfa8f893/notes/goodqa-15745/review-adversarial.md",
+    "sha256": "6c9d1dc2621e20aa4192cbf9f67759dbed6944725d1e84f591b5aafdb311945a"
+   },
+   "role": "adversarial",
+   "core_sha": "1e949779b3ac7a8aefd6dabb11b1e6231a5862fff4c9babed4f684bd304b4432",
+   "at": "2026-11-12T06:20:54.258365+00:00",
+   "key": "agent:a4ffb12f1f937dad5"
+  },
+  {
+   "kind": "agent",
+   "identity": "aa71c2b0206796fc0",
+   "verdict": "ACCEPT",
+   "model": "red-team",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-a9343b594cfa8f893/notes/goodqa-15745/review-acceptance.md",
+    "sha256": "a6d2ed622411e767dd3bd8489e5b65766301d6a7a169c4ca4b8e98926d62d5ad"
+   },
+   "role": "acceptance",
+   "core_sha": "1e949779b3ac7a8aefd6dabb11b1e6231a5862fff4c9babed4f684bd304b4432",
+   "at": "2026-11-12T06:20:54.367645+00:00",
+   "key": "agent:aa71c2b0206796fc0"
+  }
+ ]
+}
