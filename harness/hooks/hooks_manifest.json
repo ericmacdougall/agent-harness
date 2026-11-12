@@ -614,6 +614,48 @@
    "rules": []
   },
   {
+   "id": "mission-gate:posttool",
+   "script": "mission_gate.py",
+   "arg": "posttool",
+   "event": "PostToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "mission-gate:posttool-failure",
+   "script": "mission_gate.py",
+   "arg": "posttool",
+   "event": "PostToolUseFailure",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "mission-gate:permission-denied",
+   "script": "mission_gate.py",
+   "arg": "posttool",
+   "event": "PermissionDenied",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
    "id": "dropped-gate:pretool",
    "script": "dropped_gate.py",
    "arg": "pretool",
