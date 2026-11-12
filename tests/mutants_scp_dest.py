@@ -13,11 +13,16 @@ GUARD = "command_guard.py"
 
 MUTANTS = {
     "scp not dispatched": ("'rsync', 'scp', 'rclone'", "'rsync', 'rclone'"),
-    "scp branch does nothing": ("elif name == 'scp':\n            self.remote_copy_dest(name, nd)", "elif name == 'scp':\n            pass"),
-    "rsync not checked": ("elif name == 'rsync':\n            self.remote_copy_dest(name, nd)\n", "elif name == 'rsync':\n"),
-    "relative remote path not read as home": ("if not path.startswith(('/', '~')):\n            path = '~/' + path", "if False:\n            path = '~/' + path"),
-    "directory destination ignores the sources": ("if base and not self._remote_spec(source.text):", "if False:"),
-    "scp url not read": ("if text.startswith('scp://'):", "if False:"),
+    "scp branch does nothing": ("elif name == 'scp':\n            self.remote_copy_dest(name, args, texts)", "elif name == 'scp':\n            pass"),
+    "rsync not checked": ("elif name == 'rsync':\n            self.remote_copy_dest(name, args, texts)\n", "elif name == 'rsync':\n"),
+    "relative remote path not read as home": ("return [rest if rest.startswith(('/', '~')) else '~/' + rest]", "return [rest]"),
+    "directory destination ignores the sources": ("if base and not self.remote_paths(source.text):", "if False:"),
+    "option values not skipped": ("if key in flags and '=' not in text:\n                    skip = True", "if False:\n                    skip = True"),
+    "ipv6 hosts not read": ("(?:[A-Za-z0-9_.-]+|\\[[0-9a-fA-F:.%]+\\]):(?!:)(.*)$'", "(?:[A-Za-z0-9_.-]+):(?!:)(.*)$'"),
+    "url not home-relative": ("out = ['/' + rest.lstrip('/'), '~/' + rest.lstrip('/')]", "out = ['/' + rest.lstrip('/')]"),
+    "url not decoded": ("rest = unquote(rest) if urlish else rest", "rest = rest"),
+    "recursive and delete into a container allowed": ("contains = cls == 'ancestor' and (recursive or deleting)", "contains = False"),
+    "daemon forms ignored": ("match = self.REMOTE_DAEMON.match(text)", "match = None"),
 }
 
 

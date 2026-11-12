@@ -37,6 +37,28 @@ BLOCKED = [
     "rsync -a x user@t2-dev:/home/eric/.claude/hooks/command_guard.py",
     "scp x t2-dev:~/.claude/wals/s/main.jsonl",
     "scp -i key -o BatchMode=yes x t2-dev:~/.claude/hooks/command_guard.py",
+    # option values AFTER the destination do not hide it (review M1)
+    "rsync x t2-dev:~/.claude/hooks/command_guard.py -e ssh",
+    "rsync x t2-dev:~/.claude/hooks/command_guard.py --chmod 644",
+    "scp x t2-dev:~/.claude/hooks/command_guard.py -P 22",
+    # IPv6 hosts (review M2)
+    "scp x [::1]:~/.claude/hooks/command_guard.py",
+    "scp x 'eric@[fe80::1]:~/.claude/hooks/command_guard.py'",
+    # url forms, home-relative, with a user, a port, an escape (review M3)
+    "scp x scp://t2-dev/.claude/hooks/command_guard.py",
+    "scp x scp://eric@t2-dev/~/.claude/hooks/command_guard.py",
+    "scp x scp://t2-dev:22/.claude/hooks/command_guard.py",
+    "scp x scp://t2-dev/%2Eclaude/hooks/command_guard.py",
+    # rsync daemon forms (review L1)
+    "rsync x rsync://t2-dev/mod/.claude/hooks/command_guard.py",
+    "rsync x t2-dev::mod/.claude/hooks/command_guard.py",
+    # a sync or a recursive copy into a directory that CONTAINS protected files, and the delete flags (review H1, M4)
+    "rsync -a --del src/ t2-dev:~/.claude/hooks/",
+    "rsync -a --delete-after src/ t2-dev:~/.claude/hooks/",
+    "rsync -a --delete src/ t2-dev:~/.claude/wals/",
+    "rsync -av ./hooks/ t2-dev:~/.claude/hooks/",
+    "scp -r hooks t2-dev:~/.claude/",
+    "scp -r hooks/ t2-dev:~/.claude/hooks",
 ]
 ALLOWED = [
     "scp t2-dev:~/.claude/hooks/command_guard.py /tmp/x",
@@ -49,6 +71,11 @@ ALLOWED = [
     "rsync -av src/ user@host:/srv/app/",
     "scp -P 2222 report.txt user@host:reports/",
     "scp a.txt b.txt t2-dev:/tmp/",
+    "scp t2-dev:~/.claude/hooks/command_guard.py /tmp/x -P 22",
+    "rsync -a --del src/ t2-dev:~/project/",
+    "rsync -av -e 'ssh -p 22' t2-dev:~/.claude/hooks/ /tmp/h/",
+    "scp -r src t2-dev:~/project/",
+    "scp x scp://t2-dev/tmp/x",
 ]
 
 

@@ -5445,9 +5445,9 @@ class Analyzer:
                     if not self.state_dest(w):
                         self.refuse(name + ' -i (rewrites in place)', w, tiers=('log', 'unknown'))
         elif name == 'scp':
-            self.remote_copy_dest(name, nd)
+            self.remote_copy_dest(name, args, texts)
         elif name == 'rsync':
-            self.remote_copy_dest(name, nd)
+            self.remote_copy_dest(name, args, texts)
             if any(t.startswith('--delete') or t.startswith('--del') or t == '--remove-source-files'
                    or t == '--remove-sent-files' for t in texts):
                 pos = [a for a in nd if not self._remote_spec(a.text)]
@@ -5503,41 +5503,100 @@ class Analyzer:
         return bool(re.match(r'^[A-Za-z0-9_.@-]+:(?!/)', text)) or bool(re.match(r'^[A-Za-z0-9_.@-]+::', text)) \
             or bool(re.match(r'^[A-Za-z0-9_.@-]+:/', text) and not text.startswith('/'))
 
-    REMOTE_DEST = re.compile(r'^(?:[A-Za-z0-9_.-]+@)?(?:[A-Za-z0-9_.-]+|\[[0-9a-fA-F:]+\]):(?!:)(.*)$', re.S)
+    REMOTE_DEST = re.compile(r'^(?:[A-Za-z0-9_.-]+@)?(?:[A-Za-z0-9_.-]+|\[[0-9a-fA-F:.%]+\]):(?!:)(.*)$', re.S)
+    REMOTE_URL = re.compile(r'^(?:scp|sftp|ssh)://(?:[^@/]+@)?(?:\[[^\]]+\]|[^/:]+)(?::\d+)?(?:/(.*))?$', re.S)
+    REMOTE_DAEMON = re.compile(r'^(?:(?:[A-Za-z0-9_.-]+@)?(?:[A-Za-z0-9_.-]+|\[[0-9a-fA-F:.%]+\])::|rsync://(?:[^@/]+@)?(?:\[[^\]]+\]|[^/:]+)(?::\d+)?/)'
+                               r'(?:[^/]*)(?:/(.*))?$', re.S)
+    SCP_VALUE_FLAGS = {'-P', '-i', '-o', '-F', '-c', '-l', '-S', '-J', '-D', '-X'}
+    RSYNC_VALUE_FLAGS = {'-e', '-f', '-T', '-B', '-M', '--rsh', '--chmod', '--exclude', '--include', '--filter', '--rsync-path', '--files-from',
+                         '--log-file', '--exclude-from', '--include-from', '--bwlimit', '--timeout', '--contimeout', '--port', '--backup-dir',
+                         '--partial-dir', '--suffix', '--compare-dest', '--copy-dest', '--link-dest', '--max-size', '--min-size', '--block-size',
+                         '--modify-window', '--protocol', '--chown', '--usermap', '--groupmap', '--iconv', '--out-format', '--password-file',
+                         '--address', '--sockopts', '--write-batch', '--only-write-batch', '--read-batch', '--info', '--debug',
+                         '--compress-level', '--skip-compress', '--temp-dir', '--max-delete', '--checksum-choice', '--cc', '--stop-after',
+                         '--stop-at', '--outbuf', '--remote-option', '-M'}
 
-    def remote_copy_dest(self, name, nd):
-        """scp and rsync copying TO a remote path that names a protected harness location (hooks, WALs, state): the same
-        refusal as a local cp or an ssh-wrapped cp (goodqa#15759; the 2026-11-11 t2-dev install of command_guard.py used scp
-        after the cp was refused). A path relative to the remote home is read as `~/path`. A download (a remote SOURCE, a
-        local destination) is not touched. sftp batch commands are not parsed (stated limit)."""
-        if len(nd) < 2:
-            return
-        dest = nd[-1]
-        text = dest.text
-        if text.startswith('scp://'):
-            match = re.match(r'^scp://[^/]+/(.*)$', text, re.S)
-            path = '/' + match.group(1) if match else None
+    def _copy_operands(self, name, args):
+        """The positional operands of scp or rsync with option VALUES skipped (a value after the destination must not hide it)."""
+        flags = self.SCP_VALUE_FLAGS if name == 'scp' else self.RSYNC_VALUE_FLAGS
+        out, skip, ended = [], False, False
+        for word in args:
+            text = word.text
+            if skip:
+                skip = False
+                continue
+            if not ended and text == '--':
+                ended = True
+                continue
+            if not ended and text.startswith('-') and len(text) > 1:
+                key = text.split('=', 1)[0] if text.startswith('--') else text
+                if key in flags and '=' not in text:
+                    skip = True
+                continue
+            out.append(word)
+        return out
+
+    def remote_paths(self, text):
+        """Candidate remote paths when `text` is a remote operand (host:path, user@[v6]:path, scp:// and rsync:// urls, host::module),
+        else None. A path relative to the remote home reads as `~/relative`; a url path is judged both absolute and home-relative
+        and url-decoded (the module root of an rsync daemon is unknown, so its rest is judged the same way)."""
+        from urllib.parse import unquote
+        if not text or text.startswith(('/', './', '../', '~')) or re.match(r'^[A-Za-z]:[\\/]', text):
+            return None
+        rest, urlish = None, False
+        match = self.REMOTE_URL.match(text)
+        if match:
+            rest, urlish = match.group(1) or '', True
         else:
-            match = self.REMOTE_DEST.match(text) if self._remote_spec(text) or re.match(r'^[A-Za-z0-9_.@-]+:~', text) else None
-            path = match.group(1) if match else None
-        if path is None or path == '':
+            match = self.REMOTE_DAEMON.match(text)
+            if match:
+                rest, urlish = match.group(1) or '', True
+            else:
+                match = self.REMOTE_DEST.match(text)
+                if match:
+                    rest = match.group(1)
+        if rest is None or rest == '':
+            return None
+        rest = unquote(rest) if urlish else rest
+        if urlish:
+            rest = rest[2:] if rest.startswith(('/~/', '~/')) else rest
+            out = ['/' + rest.lstrip('/'), '~/' + rest.lstrip('/')]
+            return out
+        return [rest if rest.startswith(('/', '~')) else '~/' + rest]
+
+    def remote_copy_dest(self, name, args, texts):
+        """scp and rsync copying TO a remote path that names a protected harness location (hooks, WALs, state): the same refusal
+        as a local or ssh-wrapped cp (goodqa#15759; the 2026-11-11 t2-dev install of command_guard.py used scp after the cp was
+        refused). Option values never hide the destination; IPv6 hosts, scp:// and rsync:// urls and `host::module` are read; a
+        recursive copy or an rsync --delete into a directory that CONTAINS protected files is refused too (it overwrites or
+        removes them in one command). Downloads (a remote SOURCE, a local destination) are not touched. Stated limits: sftp batch
+        commands, tar | ssh and a directory SOURCE (its contents are not expanded) are not seen; a variable in the file position is
+        judged like the local cp."""
+        operands = self._copy_operands(name, args)
+        if len(operands) < 2:
             return
-        if not path.startswith(('/', '~')):
-            path = '~/' + path
-        # the destination itself, and (for a directory destination) each source file name placed inside it: a hook file that
-        # already exists there is what gets overwritten, exactly as with a local cp (a directory source is not expanded: limit)
-        candidates = [path]
-        for source in nd[:-1]:
+        dest = operands[-1]
+        paths = self.remote_paths(dest.text)
+        if not paths:
+            return
+        letters = _flag_letters(args)
+        recursive = bool(letters & {'r', 'R'}) or '--recursive' in texts or (name == 'rsync' and (bool(letters & {'a'}) or '--archive' in texts or
+                                                                                        any(s.text.endswith('/') for s in operands[:-1])))
+        deleting = name == 'rsync' and any(t.startswith('--del') or t in ('--remove-source-files', '--remove-sent-files') for t in texts)
+        candidates = list(paths)
+        for source in operands[:-1]:
             base = posixpath.basename(source.text.rstrip('/'))
-            if base and not self._remote_spec(source.text):
-                candidates.append(path.rstrip('/') + '/' + base)
+            if base and not self.remote_paths(source.text):
+                candidates += [p.rstrip('/') + '/' + base for p in paths]
         for candidate in candidates:
             fake = Word()
             fake.alts = [candidate]
             fake.dynamic, fake.subs, fake.vars = dest.dynamic, dest.subs, dest.vars
             cls, _resolved, _literal = self.target_class(fake)
-            if cls in ('log', 'unknown'):
-                self.refuse(name + ' to a remote harness path (the sanctioned route is `ah install-files`)', fake, tiers=('log', 'unknown'))
+            contains = cls == 'ancestor' and (recursive or deleting)
+            if cls in ('log', 'unknown') or contains:
+                self.refuse(name + ' to a remote harness path (the sanctioned route is `ah install-files`)', fake,
+                            tiers=('log', 'unknown', 'ancestor') if contains else ('log', 'unknown'))
                 return
 
     def overwrite_dest(self, what, word):
