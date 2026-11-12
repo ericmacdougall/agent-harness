@@ -78,9 +78,16 @@ def _argv(host, path, authenticated):
     return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", host, cmd]
 
 
+# The longest a healthy call can take, from command_guard's own bounds: verification VERIFY_SECONDS (120), the process
+# scan (lsof 20), git's removal REMOVE_SECONDS (900), the ssh connect (10) and slack for JSON and startup (50). A large
+# removal is a long call: run it in the background, it is not meant for a foreground tool call.
+VERIFY_SECONDS, SCAN_SECONDS, REMOVE_SECONDS, CONNECT_SECONDS, SLACK_SECONDS = 120, 20, 900, 10, 50
+CALL_TIMEOUT = VERIFY_SECONDS + SCAN_SECONDS + REMOVE_SECONDS + CONNECT_SECONDS + SLACK_SECONDS
+
+
 def _call(runner, host, path, authenticated):
     try:
-        done = runner(_argv(host, path, authenticated), capture_output=True, text=True, timeout=420)
+        done = runner(_argv(host, path, authenticated), capture_output=True, text=True, timeout=CALL_TIMEOUT)
         data = json.loads(done.stdout)
     except (OSError, subprocess.SubprocessError, ValueError):
         raise WorktreeError("host_unreachable", "could not run the verifier on %s" % host, 3)
@@ -113,8 +120,10 @@ def remove(host, path, reason, authenticated=False, session="", agent="", home=N
                      "remote_auth": bool(authenticated), "caller": who})
     except OSError:
         raise WorktreeError("audit_failed", "could not write the audit row; nothing was removed", 3)
+    # Once the runner has been started the outcome is UNKNOWN until the verifier answers: a killed ssh client does not stop
+    # the remote command, so "no answer" is never recorded as "not removed" (removed: null).
     outcome = {"event": "result", "run": run_id, "host": host, "path": path, "removed": None,
-               "why": "no answer from the verifier"}
+               "why": "no answer from the verifier (outcome unknown)"}
     try:
         result = _call(runner, host, path, authenticated)
         removed = result.get("removed") is True and result.get("removable") is True
@@ -122,7 +131,7 @@ def remove(host, path, reason, authenticated=False, session="", agent="", home=N
                        directory_removed=result.get("directory_removed"),
                        registry_entry_left=result.get("registry_entry_left"), why=result.get("reason"))
     except WorktreeError as error:
-        outcome.update(removed=False, why="%s: %s" % (error.code, error))
+        outcome.update(why="%s: %s (outcome unknown, check the host)" % (error.code, error))
         raise
     finally:
         try:

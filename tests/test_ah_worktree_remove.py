@@ -1,6 +1,7 @@
 """`ah worktree-remove` and the verifier it runs (goodqa#15565): real temporary repositories, fake network and ssh.
 
 The removal under test only ever touches temporary directories under a temporary HOME."""
+import errno
 import io
 import json
 import os
@@ -299,13 +300,118 @@ class MoreVerifier(Repo):
         def link(path):
             pid = path.split("/")[2]
             if pid not in cwd:
-                raise OSError("gone")
+                raise OSError(errno.ENOENT, "gone")
             return cwd[pid]
         real_isdir = os.path.isdir
         with mock.patch.object(cg.os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
                 mock.patch.object(cg.os, "listdir", lambda p: ["111", "222", "333", "444", "self"] if p == "/proc" else []), \
                 mock.patch.object(cg.os, "readlink", link):
             self.assertEqual(cg.busy_processes(str(self.linked)), [(111, "pid")])
+
+
+class RedTeamRound2(Repo):
+    # F1: git killed partway through the removal
+    def test_a_timeout_partway_through_the_removal_still_reports_what_is_left_and_writes_the_result_row(self):
+        real = subprocess.run
+
+        def killed(argv, *args, **kwargs):
+            if "worktree" in argv and "remove" in argv:
+                (self.linked / "a.txt").unlink()  # half the tree is gone, the registry entry is not
+                raise subprocess.TimeoutExpired(argv, 900)
+            return real(argv, *args, **kwargs)
+        with mock.patch.object(cg.subprocess, "run", killed):
+            report = cg.remove_worktree(str(self.linked), policy=self.policy)
+        self.assertIs(report["removed"], False)
+        self.assertFalse(report["directory_removed"])  # the directory is still there, half emptied
+        self.assertIs(report["registry_entry_left"], True)
+        self.assertIn("TimeoutExpired", report["reason"])
+        rows = [json.loads(line) for line in (self.home / ".agent-harness/worktree-audit.jsonl").read_text().splitlines()]
+        self.assertEqual([row["event"] for row in rows], ["remove", "result"])
+        self.assertEqual(rows[1]["problem"], "TimeoutExpired")
+
+    def test_the_cli_prints_json_even_when_git_times_out(self):
+        real = subprocess.run
+
+        def killed(argv, *args, **kwargs):
+            if "worktree" in argv and "remove" in argv:
+                shutil.rmtree(self.linked)  # the directory went, then the call timed out before the registry cleanup
+                raise subprocess.TimeoutExpired(argv, 900)
+            return real(argv, *args, **kwargs)
+        out = io.StringIO()
+        with redirect_stdout(out), mock.patch.object(cg.subprocess, "run", killed):
+            code = cg.main(["remove-worktree", "--path", str(self.linked)])
+        data = json.loads(out.getvalue())
+        self.assertEqual(code, 1)
+        self.assertTrue(data["directory_removed"])
+        self.assertIs(data["removed"], False)
+
+    def test_a_failing_registry_check_or_disk_probe_is_reported_unknown_not_a_crash(self):
+        with mock.patch.object(cg, "registry_lists", side_effect=ValueError("git failed")), \
+                mock.patch.object(cg.shutil, "disk_usage", side_effect=OSError("no")):
+            report = cg.remove_worktree(str(self.linked), policy=self.policy)
+        self.assertIsNone(report["registry_entry_left"])
+        self.assertIs(report["removed"], False)  # an unknown registry state is never a confirmed removal
+        self.assertIsNone(report["freed_bytes"])
+        self.assertIn("registry entry unknown", report["reason"])
+
+    # F5: exact registry compare
+    def test_the_registry_check_compares_whole_paths_not_substrings(self):
+        listing = "worktree /x/primary\nHEAD aaa\n\nworktree /x/wt-10\nHEAD bbb\n\nworktree /x/wt-1x\n"
+        with mock.patch.object(cg, "_git_out", return_value=listing):
+            self.assertFalse(cg.registry_lists("/x/primary", "/x/wt-1"))
+            self.assertTrue(cg.registry_lists("/x/primary", "/x/wt-10"))
+            self.assertFalse(cg.registry_lists("/x/primary", "/x/primary/sub"))
+        with mock.patch.object(cg, "_git_out", side_effect=ValueError("git failed")):
+            with self.assertRaises(ValueError):
+                cg.registry_lists("/x/primary", "/x/wt-1")
+
+    # F3: processes the check cannot see
+    def test_a_process_it_cannot_inspect_fails_closed_but_an_exited_one_is_skipped(self):
+        real_isdir = os.path.isdir
+
+        def denied(path):
+            raise PermissionError(errno.EACCES, "denied")
+
+        def exited(path):
+            raise OSError(errno.ESRCH, "no such process")
+        for link, expected in ((denied, None), (exited, [])):
+            with mock.patch.object(cg.os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
+                    mock.patch.object(cg.os, "listdir", lambda p: ["555"] if p == "/proc" else []), \
+                    mock.patch.object(cg.os, "readlink", link):
+                self.assertEqual(cg.busy_processes(str(self.linked)), expected)
+
+    def test_lsof_exit_one_means_nothing_found_only_when_it_said_nothing_else(self):
+        real_isdir = os.path.isdir
+        for code, out, err, expected in ((1, "", "", []), (1, "", "lsof: WARNING: can't stat() fuse file system", None),
+                                         (0, "", "", []), (2, "", "", None), (1, "p9\ncx\nn/elsewhere\n", "", [])):
+            with self.subTest(code=code, err=err[:10]), \
+                    mock.patch.object(cg.os.path, "isdir", lambda p: False if p == "/proc/self" else real_isdir(p)), \
+                    mock.patch.object(cg.subprocess, "run", return_value=subprocess.CompletedProcess([], code, out, err)):
+                self.assertEqual(cg.busy_processes(str(self.linked)), expected)
+
+    # F6: the delegated verifier has its own, larger, budget
+    def test_the_verifier_uses_its_own_scaled_budget_and_the_hook_default_is_unchanged(self):
+        seen = []
+        real = cg._git_out
+
+        def spy(repo, args, timeout, stdin=None):
+            seen.append(timeout)
+            return real(repo, args, timeout, stdin)
+        with mock.patch.object(cg, "_git_out", spy):
+            self.assertIsNone(cg.linked_worktree_remove_refusal(str(self.linked), os.sep, cg.WORKTREE_POLICY))
+            scaled = max(seen)
+            seen.clear()
+            self.assertIsNone(cg.linked_worktree_remove_refusal(str(self.linked), str(self.primary), self.policy))
+            default = max(seen)
+        self.assertLessEqual(default, 3.0)
+        self.assertGreater(scaled, 30.0)
+        self.assertGreaterEqual(cg.WORKTREE_POLICY["reproducible_clone"]["total_seconds"], 120)
+        used = []
+        real_refusal = cg.linked_worktree_remove_refusal
+        with mock.patch.object(cg, "linked_worktree_remove_refusal",
+                               lambda path, cwd, policy=None, remote_ls=None: used.append(policy) or real_refusal(path, cwd, policy, remote_ls)):
+            cg.verify_worktree(str(self.linked))
+        self.assertIs(used[0], cg.WORKTREE_POLICY)
 
 
 class GuardMessage(Repo):
@@ -330,6 +436,35 @@ class GuardMessage(Repo):
         self.assertIn("--remote-auth", text)
         self.assertNotIn("--remote-heads-from", text)
         self.assertNotIn(str(self.home), text.replace(str(self.linked), ""))
+
+    def test_a_reason_belongs_to_its_own_segment_only(self):
+        dirty = self.base / "dirty"
+        git(self.primary, "worktree", "add", "-q", "-b", "dirty", str(dirty))
+        git(self.primary, "update-ref", "refs/remotes/origin/dirty", git(dirty, "rev-parse", "HEAD"))
+        self.live["refs/heads/dirty"] = git(dirty, "rev-parse", "HEAD")
+        (dirty / "a.txt").write_text("changed\n")
+        compiled = cg.Compiled(self.policy, home=str(self.home), cwd=str(self.primary))
+
+        def text(command):
+            return cg.decide(command, compiled, cwd=str(self.primary))
+
+        # The exemption (and so a verifier reason) exists only for ONE standalone remove command; any multi-segment line
+        # is judged by the generic rule and must never carry a reason from another segment or an earlier command.
+        for command in ("git worktree remove %s ; git worktree prune" % dirty,
+                        "git worktree prune ; git worktree remove %s" % dirty,
+                        "git worktree remove %s ; git worktree remove %s" % (self.linked, dirty),
+                        "git worktree remove %s %s" % (self.linked, dirty)):
+            with self.subTest(command=command.replace(str(self.base), "~")):
+                verdict, message = text(command)
+                self.assertEqual(verdict, "block")
+                self.assertNotIn("verifier:", message)
+        # the standalone form still explains itself, and a later standalone command does not inherit it
+        verdict, message = text("git worktree remove %s" % dirty)
+        self.assertEqual(message.count("verifier: the working tree is not clean"), 1)
+        verdict, message = text("git worktree remove %s" % self.linked)
+        self.assertEqual(verdict, "allow")
+        verdict, message = text("git worktree prune")
+        self.assertNotIn("verifier:", message)
 
     def test_a_reason_from_one_segment_is_not_shown_for_another(self):
         self.assertIsNone(cg._worktree_instead(None))
@@ -423,7 +558,7 @@ class Delegation(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaises(SystemExit), redirect_stderr_null():
                 parser.parse_args(base + extra)
 
-    def test_an_unanswerable_or_malformed_verifier_removes_nothing_and_is_audited(self):
+    def test_an_unknown_outcome_after_the_runner_started_is_recorded_as_unknown_never_as_not_removed(self):
         for answer in ({"out": ""}, {"out": "not json"}, {"out": "[]"}, {"out": json.dumps({"removed": True})},
                        {"out": json.dumps({"removable": "yes", "verifier": 2})}, OSError("ssh failed"),
                        subprocess.TimeoutExpired("ssh", 1),
@@ -434,7 +569,22 @@ class Delegation(unittest.TestCase):
                     self.remove(FakeRun(answer))
                 rows = self.audit_rows()[before:]
                 self.assertEqual([row["event"] for row in rows], ["start", "result"])
-                self.assertIs(rows[1]["removed"], False)
+                self.assertIsNone(rows[1]["removed"])  # unknown: the remote command may have run
+                self.assertIn("unknown", rows[1]["why"])
+
+    def test_a_definite_answer_is_recorded_as_a_definite_outcome(self):
+        self.remove(FakeRun(verdict(removable=False, removed=False, reason="the working tree is not clean")))
+        self.assertIs(self.audit_rows()[-1]["removed"], False)
+        self.remove(FakeRun(verdict()))
+        self.assertIs(self.audit_rows()[-1]["removed"], True)
+
+    def test_the_call_timeout_covers_the_verifiers_own_worst_case(self):
+        self.assertEqual(ah_worktree.VERIFY_SECONDS, cg.VERIFY_SECONDS)
+        self.assertEqual(ah_worktree.REMOVE_SECONDS, cg.REMOVE_SECONDS)
+        self.assertGreater(ah_worktree.CALL_TIMEOUT, cg.VERIFY_SECONDS + cg.REMOVE_SECONDS + 20 + 10)
+        run = FakeRun(verdict())
+        self.remove(run)
+        self.assertEqual(run.calls[0][1]["timeout"], ah_worktree.CALL_TIMEOUT)
 
     def test_an_old_verifier_on_the_target_is_refused_by_version(self):
         for answer in (verdict(verifier=1), {"out": json.dumps({"removable": True, "removed": True})},
