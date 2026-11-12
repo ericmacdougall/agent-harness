@@ -88,7 +88,7 @@ What the page contains:
 Redaction:
 - Every string in every row goes through `redact.py`, keys and values alike.
 - E-mail local parts, home-directory paths and IPv4 addresses are masked.
-- Redaction runs on the original text, then again after control, bidi and zero-width characters are removed, so neither a token split by an invisible character nor one whose only boundary was a control character slips through. Each field is capped at 2,000 characters, and each evidence section shows at most 500 entries plus a count of the rest.
+- Redaction runs on the original text, then again after control, bidi and zero-width characters are removed; a long token-like run that held or touched a removed character is masked as `[REDACTED:split]`. So neither a token split by an invisible character nor one whose only boundary was a control character slips through. Each field is capped at 2,000 characters, and each evidence section shows at most 500 entries plus a count of the rest.
 - The evidence classes are computed on the raw rows, so a cap or mask cannot change a verdict. Each entry is then displayed from its redacted row.
 - Redaction is pattern-based, so names, hostnames, ticket text and phone numbers stay. The page says so in a banner.
 
