@@ -7,8 +7,11 @@ deliberately absent: this module opens no network connection and never shares th
 Pipeline:
 - Read: each WAL is read once. Symlinks, non-regular files and files over WAL_LIMIT are not read; they are listed
   under "Unread WALs".
-- Redact: every string in every row (keys and values) is pre-trimmed, run through redact.redact, masked (e-mail
-  local parts, home paths, IPv4 addresses, control and bidi characters) and capped at FIELD_CAP.
+- Redact: every string in every row (keys and values) is run whole through redact.redact (which works in bounded
+  chunks), masked (e-mail local parts, home paths, IPv4 addresses, control and bidi characters) and only then capped
+  at FIELD_CAP. Nothing is cut before redaction: a cut can leave a secret too short for its pattern, and a long
+  match that shrinks to a placeholder would pull that stub into view (PR 223 receipt F1). The work stays bounded by
+  the read limits (WAL_LIMIT per file, TOTAL_LIMIT per session) and each row is redacted at most once.
 - Evidence: the raw, typed rows go to ah.status_report(rows=...), so the classes are exactly the ones `ah status`
   computes (a cap or a mask could change a verdict or a deploy match). The report's own text is never rendered:
   each entry names its source row and is rendered from that row's redacted copy.
@@ -34,7 +37,6 @@ import stat
 import time
 
 FIELD_CAP = 2000  # characters kept per field after redaction
-PRE_TRIM = FIELD_CAP + 10240  # wider than every bounded redact pattern; PEM blocks redact to the end of the string
 MAX_ROWS = 5000
 MAX_OUTPUT = 16 << 20
 WAL_LIMIT = 64 << 20  # per file
@@ -119,7 +121,6 @@ class _Scrubber:
     def text(self, value) -> str:
         if not isinstance(value, str):
             value = json.dumps(value, default=str, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
-        value = value[:PRE_TRIM]
         before = value.count("[REDACTED:")
         # Redact, remove controls, mask rejoined runs, redact again. Pass 1 catches a token whose word boundary is a
         # control character (word + CR + token). Removal rejoins a token an invisible character split, but can also
@@ -141,8 +142,11 @@ class _Scrubber:
             return "[nested too deep]"
         if isinstance(value, dict):
             out, seen = {}, {}
-            for key, item in itertools.islice(value.items(), MAX_KEYS):  # code inspection 1-2: keys are capped
-                clean_key = self.text(key)
+            pairs = [(key, item, self.text(key)) for key, item in itertools.islice(value.items(), MAX_KEYS)]
+            # PR 223 receipt F3: keys that scrub to themselves claim their names first, so "​note" (which
+            # scrubs to "note") can never take the name of the real `note` field; it becomes "note #2".
+            pairs.sort(key=lambda p: p[2] != p[0])
+            for key, item, clean_key in pairs:  # code inspection 1-2: keys are capped
                 base = clean_key
                 while clean_key in out:  # two keys that redact to the same text must not overwrite each other
                     seen[base] = seen.get(base, 1) + 1
@@ -211,6 +215,9 @@ def _read(ah, sd: Path):
                 continue
             if not isinstance(rec, dict) or not isinstance(rec.get("event"), str) or not rec.get("event"):
                 skipped += 1  # code inspection 3: a non-string event is malformed, never a crash
+                continue
+            if any(isinstance(rec.get(key), (dict, list)) for key in ("id", "ref")):
+                skipped += 1  # PR 223 receipt F2: ids and refs are dict keys in status_report; a container is malformed
                 continue
             rows.append((agent, rec))
     return rows, unread, skipped, agents

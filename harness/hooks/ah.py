@@ -2461,9 +2461,11 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
         elif ev == "blocker":
             blockers.append(item(agent, at, rec))
         elif ev == "ask":
-            asks[rec.get("id")] = item(agent, at, rec, {"reason": str(rec.get("reason") or "")[:200]})
+            if not isinstance(rec.get("id"), (dict, list)):  # a container id is malformed, never a crash (PR 223 F2)
+                asks[rec.get("id")] = item(agent, at, rec, {"reason": str(rec.get("reason") or "")[:200]})
         elif ev == "ask_resolved":
-            resolved.add(rec.get("ref"))
+            if not isinstance(rec.get("ref"), (dict, list)):
+                resolved.add(rec.get("ref"))
         if ev in ("decision", "scope", "requirement"):
             source = str(rec.get("source") or "")
             unsourced = bool(rec.get("assumption")) or bool(rec.get("unsourced")) or not source or source.startswith("inferred")
