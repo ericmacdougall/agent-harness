@@ -9,4 +9,6 @@ Round 2 (v3 delta): all three high findings closed by AC-8 and NEG-10, AC-6 and 
 
 Not examined by the reviewer: implementation code (none yet), APFS ctime behaviour (probe refused by the isolation guard, not routed around), live state of receipts/wt-pp768.
 
+Round 3 (final confirmation of the working tree): ACCEPT with one medium and two lows, all applied by the author in the final spec text: compare refs before writing the marker (a difference leaves no marker), fsync the marker-inode row before any deletion, exact-or-slash lsof prefix match, the Known-limits wording; NEG-16 added.
+
 Verdict: ACCEPT
