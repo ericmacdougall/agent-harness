@@ -1362,6 +1362,7 @@ def _read_unit(out, rec, key, host, unit, svc, tmr, now, max_age):
 
 POOL_STORAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}")
 POOL_MOUNT = re.compile(r"/[A-Za-z0-9._/-]{1,100}")
+POOL_LOCAL_FILE = re.compile(r"/[A-Za-z0-9._/-]{1,200}")  # ssh_config / known_hosts on the watching host
 POOL_DISK = re.compile(r"^(?:scsi|virtio|sata|ide|efidisk|tpmstate)\d+:\s*([A-Za-z0-9_-]+):[^,\s]*(?P<rest>.*)$")
 POOL_SIZE = re.compile(r"(?:^|,)size=(\d+(?:\.\d+)?)([KMGT]?)(?:,|$)")
 POOL_UNITS = {"": 1 / GIB, "K": KIB / GIB, "M": KIB ** 2 / GIB, "G": 1.0, "T": 1024.0}
@@ -1388,7 +1389,16 @@ def _pool_num(text):
 def parse_pool_status(text: str, storage: str):
     """(total, used, avail) in bytes from `pvesm status` output, or None for anything unusable."""
     lines = [l.split() for l in (text or "").splitlines() if l.strip()]
-    if not lines or lines[0][:6] != ["Name", "Type", "Status", "Total", "Used", "Available"]:
+    if not lines:
+        return None
+    # pve 8 prints "Total (KiB)  Used (KiB) Available (KiB)"; older output has no unit. Either all three size columns say
+    # (KiB) or none does; any other unit is refused rather than misread.
+    head = lines[0]
+    units = [t for t in head if t.startswith("(")]
+    if units not in ([], ["(KiB)"] * 3) or (units and head[3:9] != ["Total", "(KiB)", "Used", "(KiB)", "Available",
+                                                                     "(KiB)"]):
+        return None
+    if [t for t in head if not t.startswith("(")][:6] != ["Name", "Type", "Status", "Total", "Used", "Available"]:
         return None
     rows = [l for l in lines[1:] if l[0] == storage]
     if len(rows) != 1 or len(rows[0]) != 7 or rows[0][2] != "active":
@@ -1459,16 +1469,22 @@ def check_proxmox_pool(cfg, state, runner, now):
         storage = str(entry.get("storage", "local"))
         mount = str(entry.get("mount", "/var/lib/vz")).rstrip("/") or "/"
         watch = entry.get("watch_vms", [])
+        jump, ssh_config, known_hosts = (str(entry.get(k, "")) for k in ("jump", "ssh_config", "known_hosts"))
         base = f"{host[:64]}:{mount[:100]}"
         if (not REMOTE_HOST.fullmatch(host) or not POOL_STORAGE.fullmatch(storage) or not POOL_MOUNT.fullmatch(mount)
                 or ".." in mount or not isinstance(watch, list)
-                or any(type(v) is not int or not 0 < v < 10 ** 10 for v in watch)):
+                or any(type(v) is not int or not 0 < v < 10 ** 10 for v in watch)
+                or (jump and not REMOTE_HOST.fullmatch(jump))
+                or any(p and (not POOL_LOCAL_FILE.fullmatch(p) or ".." in p) for p in (ssh_config, known_hosts))):
             out.append(alert("proxmox_pool", f"disk:config:{base}", "warning",
                              "proxmox pool entry has an unsafe host, storage, mount or VM id", {"host": host[:64]}))
             continue
         rec = seen.setdefault(base, {"first_try": now, "samples": []})
         try:
-            rc, text = runner(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", host,
+            # optional jump host, ssh config and a pinned known_hosts file (host-key checking stays strict)
+            opts = (["-F", ssh_config] if ssh_config else []) + (["-J", jump] if jump else []) + (
+                ["-o", f"UserKnownHostsFile={known_hosts}", "-o", "StrictHostKeyChecking=yes"] if known_hosts else [])
+            rc, text = runner(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", *opts, "--", host,
                                pool_script(storage, mount)], 25)
         except (subprocess.TimeoutExpired, OSError):
             rc, text, why = 255, "", "unreachable or timed out"

@@ -109,7 +109,16 @@ Host and unit names must be plain words, and `max_age_h` must be a finite positi
 {"proxmox_pools": [{"host": "t2-proxmox", "storage": "local", "mount": "/var/lib/vz", "watch_vms": [102, 103]}]}
 ```
 
-Each run makes one read-only call: `ssh -o BatchMode=yes -o ConnectTimeout=5 -- HOST SCRIPT` with 25 s in total. The script is fixed text: `pvesm status --storage STORAGE`, `qm list` and `qm config` for every VM, and `du -sk MOUNT/images/*`. Host, storage and mount are checked against plain-word patterns and VM ids must be integers, so a bad entry is refused as `disk:config:...` before ssh. Nothing changes on the hypervisor. Alerts (key suffix `HOST:MOUNT`):
+A host reachable only through another one takes three optional keys, with no edit to `~/.ssh/config`: `jump` (a plain-word ssh host, passed as `-J`), `ssh_config` (an absolute path, passed as `-F`) and `known_hosts` (an absolute path to a pinned known_hosts file; it turns on `StrictHostKeyChecking=yes`). The Mac reaches t2-proxmox this way:
+
+```json
+{"proxmox_pools": [{"host": "root@100.83.24.47", "jump": "t2-dev", "ssh_config": "/Users/eric/.ssh/config_fleetops",
+  "known_hosts": "<work dir>/t2-proxmox.known_hosts", "storage": "local", "mount": "/var/lib/vz", "watch_vms": [102, 103]}]}
+```
+
+Copy the known_hosts lines from the jump host's own trusted file (`ssh-keygen -F ADDRESS` there), never by trust on first use.
+
+Each run makes one read-only call: `ssh -o BatchMode=yes -o ConnectTimeout=5 [-F CFG] [-J JUMP] [-o UserKnownHostsFile=KH -o StrictHostKeyChecking=yes] -- HOST SCRIPT` with 25 s in total. `pvesm status` headers with or without `(KiB)` after each size column (pve 8 prints them) both parse; any other unit is UNKNOWN. The script is fixed text: `pvesm status --storage STORAGE`, `qm list` and `qm config` for every VM, and `du -sk MOUNT/images/*`. Host, storage and mount are checked against plain-word patterns and VM ids must be integers, so a bad entry is refused as `disk:config:...` before ssh. Nothing changes on the hypervisor. Alerts (key suffix `HOST:MOUNT`):
 
 - `disk:volume:` warning at 85% used, high at 92%, critical at 97% or under 20 GiB free. The overcommit ratio is reported in this alert and not alerted on its own: it is a standing condition, decided by the disk options in goodqa#15771. The detail holds `overcommit_ratio` (disk sizes on this storage over pool total), `provisioned_gib`, and for each watched VM `allocated_gib`, `actual_gib` (du of its image dir) and `growth_gib_day`.
 - `disk:growth:` more than 10 GiB/day, measured against the stored sample 6 to 48 h old that is closest to 24 h (samples every 30 min, kept 48 h, from good reads only). High when the pool would fill within 3 days at that rate, else warning.

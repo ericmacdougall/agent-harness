@@ -328,6 +328,46 @@ class CommandAndConfigTests(Base):
                 self.assertEqual([a["severity"] for a in got.values()], ["warning"])
                 self.assertTrue(list(got)[0].startswith("disk:config:"))
 
+    def test_jump_ssh_config_and_pinned_known_hosts_build_a_strict_command(self):
+        # goodqa#15771: the Mac reaches t2-proxmox only through t2-dev, with no edit to ~/.ssh/config (main's ruling).
+        self.cfg["proxmox_pools"] = [{"host": "root@100.83.24.47", "storage": "local", "mount": "/var/lib/vz",
+                                      "watch_vms": [102, 103], "jump": "t2-dev",
+                                      "ssh_config": "/Users/x/.ssh/config_fleetops",
+                                      "known_hosts": "/Users/x/work/t2-proxmox.known_hosts"}]
+        got, _, runner = self.run_check((0, probe()))
+        (argv, _), = runner.calls
+        self.assertEqual(argv[:5], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
+        self.assertEqual(argv[5:13], ["-F", "/Users/x/.ssh/config_fleetops", "-J", "t2-dev",
+                                      "-o", "UserKnownHostsFile=/Users/x/work/t2-proxmox.known_hosts",
+                                      "-o", "StrictHostKeyChecking=yes"])
+        self.assertEqual(argv[13:15], ["--", "root@100.83.24.47"])
+        self.assertEqual(got["disk:volume:root@100.83.24.47:/var/lib/vz"]["severity"], "high")
+
+    def test_unsafe_jump_or_paths_are_refused_before_ssh(self):
+        base = {"host": "t2-proxmox"}
+        bad = [{"jump": "-oProxyCommand=x"}, {"jump": "t2-dev,evil"}, {"jump": "t2 dev"},
+               {"ssh_config": "relative/config"}, {"ssh_config": "/a/../etc/passwd"}, {"ssh_config": "/a b"},
+               {"known_hosts": "-o"}, {"known_hosts": "/a/../../k"}, {"known_hosts": "/k;reboot"}]
+        for extra in bad:
+            with self.subTest(extra=extra):
+                self.cfg["proxmox_pools"] = [dict(base, **extra)]
+                got, _, runner = self.run_check((0, probe()))
+                self.assertEqual(runner.calls, [])
+                self.assertTrue(list(got)[0].startswith("disk:config:"))
+
+    def test_real_pvesm_header_with_kib_units_parses(self):
+        # recorded from t2-proxmox on 2026-11-12 (pve 8): the header names the unit in each size column
+        real = ("Name         Type     Status     Total (KiB)      Used (KiB) Available (KiB)        %\n"
+                "local         dir     active       916398132       848361792        58698404   92.58%\n")
+        self.assertEqual(ow.parse_pool_status(real, "local"),
+                         (916398132 * 1024, 848361792 * 1024, 58698404 * 1024))
+        got = self.run_check((0, probe(real)))[0]
+        self.assertEqual(got["disk:volume:t2-proxmox:/var/lib/vz"]["severity"], "high")
+        for header in ("Name Type Status Total (MiB) Used (MiB) Available (MiB) %",
+                       "Name Type Status Total (KiB) Used Available (KiB) %"):
+            with self.subTest(header=header):
+                self.assertIsNone(ow.parse_pool_status(header + "\n" + real.splitlines()[1], "local"))
+
     def test_disabled_by_default_and_registered(self):
         self.assertEqual(ow.load_config(Path(self.tmp.name), host="h", overrides={})["proxmox_pools"], [])
         self.assertIs(ow.DEFAULT_CHECKS["proxmox_pool"], ow.check_proxmox_pool)
