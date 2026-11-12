@@ -219,6 +219,9 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
             "hooks": [spec_gate],
         }],
     }
+    # Dispatch records (goodqa#15794): PostToolUse closes the spawn's dispatch with the models the harness reported, and a
+    # SendMessage to an indexed agent reopens it (a resume). Silent and fail-open; it cannot block, so no onFailure.
+    managed.setdefault("PostToolUse", []).append({"matcher": "Agent|Task|SendMessage", "hooks": [ladder("dispatch")]})
     if command_guard:
         managed["PreToolUse"].insert(0, command_guard_group(claude))
         managed["PreToolUse"].insert(1, kill_guard_group(claude))

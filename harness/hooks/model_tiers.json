@@ -39,6 +39,8 @@
            "owner_types": ["task-owner", "general-purpose", "claude", "fork", ""],
            "helper_types": ["red-team", "click-tester", "reviewer", "fixer", "Explore", "Plan", "claude-code-guide", "statusline-setup"],
            "top_assent_max_age_seconds": 43200,
+           "dispatch_exclude_below_rung": false,
+           "_dispatch_doc": "goodqa#15794 H17: true lets a FAIL produced while only proven below-rung runs were active be NOT_COUNTED. Shipped false (PR 225 receipt F1): dispatches are recorded and the would-be decision is logged as would_exclude; main flips it after the AC-8 live proof. dispatch_narrow_by_stop_effort (absent = false) stays off until AC-9.",
            "_doc": "owner cap (memory feedback-token-budget: at most 8 active owners, raised from 4 by the user on 2026-11-09): owner_types count toward session_owner_agents; helpers (red-team, click-tester, fixer, Explore, Plan) count only toward session_live_agents. The owner count comes from ah owners liveness when the session has a main WAL, else from the SubagentStart live map."},
   "default_effort": "medium",
   "efforts": ["low", "medium", "high", "xhigh", "max"]
