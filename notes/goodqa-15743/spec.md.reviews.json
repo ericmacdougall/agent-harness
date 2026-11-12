@@ -16,6 +16,22 @@
    "core_sha": "cc5e6dbdcdbd2a0b05fa2db5027dc126b1f0a899b4c4e4a49e944baf3fab08e4",
    "at": "2026-11-12T04:51:41.385179+00:00",
    "key": "agent:a0c568dfa08e7eb86"
+  },
+  {
+   "kind": "agent",
+   "identity": "a5d878417503c1093",
+   "verdict": "ACCEPT",
+   "model": "red-team",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/notes/goodqa-15743/review-sonnet-delta.md",
+    "sha256": "d0991eca51d945dc97a89762b23b16a8e3434a44ab59818192dbb5bf57768419"
+   },
+   "role": "acceptance",
+   "core_sha": "c7dc6a618789a95df8cdd2231c03ead01e6d0e49a7a4925d8b5b67e0498c9a09",
+   "at": "2026-11-12T04:53:25.129293+00:00",
+   "key": "agent:a5d878417503c1093"
   }
  ]
 }
