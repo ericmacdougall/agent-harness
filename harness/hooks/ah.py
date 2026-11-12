@@ -3060,6 +3060,16 @@ def build_parser():
     kp.add_argument("--agent", help="calling agent id for the audit row")
     kp.add_argument("--wal", help="caller WAL path (default: this session's main WAL)")
     kp.add_argument("--via", help=argparse.SUPPRESS)
+    wp = sub.add_parser("worktree-remove", help="remove ONE verified clean, published linked worktree here or on t2-dev "
+                        "(audited; see ah_worktree.py; no --force exists)")
+    wp.add_argument("--host", required=True, help="local or t2-dev")
+    wp.add_argument("--path", required=True, help="one literal absolute path")
+    wp.add_argument("--reason", required=True, help="why (mandatory, logged)")
+    wp.add_argument("--remote-auth", dest="remote_auth", action="store_true",
+                    help="private repository: the verifier reads the remote with the TARGET host's own credentials in a "
+                         "scrubbed environment (branch refs cannot be supplied by the caller)")
+    wp.add_argument("--session")
+    wp.add_argument("--agent", help="calling agent id for the audit row")
     _no_abbrev(p)
     return p
 
@@ -3204,6 +3214,14 @@ def run(args, home: Path) -> dict:
                                       via=args.via, foreign=args.foreign, session_scope=args.session_scope,
                                       approved_by=args.approved_by)
         except ah_kill.KillError as e:
+            raise AhError(e.code, str(e), e.exit_code)
+    if cmd == "worktree-remove":
+        import ah_worktree
+        try:
+            return ah_worktree.remove(args.host, args.path, args.reason, args.remote_auth,
+                                      args.session or env_session() or "", args.agent or os.environ.get("AH_AGENT_ID", ""),
+                                      home)
+        except ah_worktree.WorktreeError as e:
             raise AhError(e.code, str(e), e.exit_code)
     raise AhError("unknown_command", cmd)
 
