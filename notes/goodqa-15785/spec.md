@@ -81,3 +81,12 @@ Domain-gate: self-update-e2e waived (the install of the guard is the normal harn
 Domain-gate: transport-proof waived (no integration transport is added)
 Domain-gate: rollback-not-blocked waived (no release or rollback path is touched)
 Domain-gate: staging-exists waived (a local guard rule; the harness batch install is rehearsed by its own process)
+
+## Reviews
+
+Spec core sha256: `0f968b46fcbf3b6fc5f8c2912f76a2e2a5abf557da85d4f0349b6e37acc4cdec`
+
+| Role | Verdict | Reviewer | Kind | Source | Bound to |
+|---|---|---|---|---|---|
+| adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | current |
+| acceptance | ACCEPT | a5d878417503c1093 (red-team) | agent | WAL-verified red-team agent | current |
