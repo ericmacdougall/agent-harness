@@ -149,6 +149,19 @@ class Inputs(Base):
         self.assertEqual(self.calls, [])
 
 
+class Listed(Base):
+    def test_a_blob_that_exists_but_is_not_in_the_installer_list_refuses(self):  # AC-1, NEG-1
+        side = Path(self.tmp, "side-unlisted")
+        git(self.tmp, "clone", "-q", str(self.origin), str(side))
+        (side / "harness" / "hooks" / "unlisted.py").write_text("# not listed\n")
+        git(side, "add", "-A")
+        git(side, "commit", "-q", "-m", "adds an unlisted blob")
+        git(side, "push", "-q", "origin", "main")
+        error = self.refused(ref=git(side, "rev-parse", "HEAD"), files=("unlisted.py",))
+        self.assertIn("HOOKS list", str(error))
+        self.assertEqual(self.calls, [])
+
+
 class Source(Base):
     def test_an_unmerged_commit_refuses_before_any_remote_call(self):  # AC-2, NEG-2
         side = Path(self.tmp, "side")
@@ -348,6 +361,25 @@ class SelfTest(Base):
         self.assertEqual(caught.exception.data["result"], "rolled_back")
         self.assertEqual({n: self.live(n) for n in NAMES}, before)
         self.assertFalse((self.hooks / ".ah-install" / "lock").exists())
+
+    def test_a_read_back_sha_that_differs_after_the_rename_rolls_back_with_the_guard_first(self):  # AC-3, NEG-3
+        real = ai.Remote.call
+        restores = []
+
+        def lie(self_, op, args=None, data=None, **kw):
+            out = real(self_, op, args, data, **kw)
+            if op == "commit":
+                out = {"live": dict(out["live"], **{args["names"][0]: "0" * 64})}
+            if op == "restore":
+                restores.append([i["name"] for i in args["items"]])
+            return out
+        before = {n: self.live(n) for n in NAMES}
+        with mock.patch.object(ai.Remote, "call", lie):
+            with self.assertRaises(ai.InstallError) as caught:
+                self.install(files=("ah.py", "command_guard.py"))
+        self.assertEqual(caught.exception.data["result"], "rolled_back")
+        self.assertEqual({n: self.live(n) for n in NAMES}, before)
+        self.assertEqual(restores[0][0], "command_guard.py")  # the guard is restored FIRST
 
     def test_a_crashing_guard_rolls_back(self):  # AC-4, NEG-4
         ref = self.broken_commit(b"raise SystemExit(3)\n")
@@ -571,6 +603,25 @@ class Rollback(Base):
         (self.hooks / "doctor.py").write_bytes(b"import sys\nprint('not json')\nsys.exit(0)\n")
         done = ai.rollback(run, TICKET, (), self.mac, "s", "a", self.runner, lambda t, x: None)
         self.assertEqual(done["result"], "restored")
+
+
+def ssh_localhost_works():
+    try:
+        return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "localhost", "true"], capture_output=True, timeout=15).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+@unittest.skipUnless(ssh_localhost_works(), "this machine does not accept ssh to localhost with a key (BatchMode)")
+class RealSsh(Base):
+    """AC-3/AC-6: the real ssh transport and the remote login shell, on a disposable HOME (a `HOME=` prefix, test only)."""
+
+    def test_a_real_ssh_install_and_a_bad_file_two_that_changes_nothing(self):
+        prefix = "HOME=%s " % __import__("shlex").quote(str(self.host_home))
+        with mock.patch.object(ai, "HOSTS", ("localhost",)), mock.patch.object(ai, "REMOTE_PREFIX", prefix):
+            out = ai.install_files("localhost", self.c1, ["ah.py", "extra.py"], TICKET, False, self.mac, "s", "a", subprocess.run, lambda t, x: None)
+        self.assertEqual(out["result"], "installed")
+        self.assertEqual(self.live("ah.py"), out["files"]["ah.py"]["new_sha"])
 
 
 class Wiring(Base):

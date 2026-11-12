@@ -32,6 +32,7 @@ from pathlib import Path
 HOSTS = ("t2-dev", "ah-mac-mini")
 CANONICAL_URL = "https://github.com/ericmacdougall/agent-harness.git"
 ALLOW_FILE = False  # tests only: lets the fetch read a local bare repository standing in for the canonical URL
+REMOTE_PREFIX = ""  # tests only: a `HOME=... ` assignment so a real ssh-to-localhost run uses a disposable home
 MAX_FILES = 20
 MAX_BLOB = 4 * 1024 * 1024
 NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
@@ -307,7 +308,7 @@ SCRIPT_SHA256 = hashlib.sha256(REMOTE_SCRIPT.encode()).hexdigest()
 # ----------------------------------------------------------------------------- remote calls
 def ssh_argv(host, op, args):
     """One command string, every argument shell-quoted, passed after `--` so a host can never be read as an option."""
-    command = "python3 -I -c %s %s %s" % (shlex.quote(REMOTE_SCRIPT), shlex.quote(op), shlex.quote(json.dumps(args)))
+    command = "%spython3 -I -c %s %s %s" % (REMOTE_PREFIX, shlex.quote(REMOTE_SCRIPT), shlex.quote(op), shlex.quote(json.dumps(args)))
     return ["ssh", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes", "-o", "ConnectTimeout=10", "--", host, command]
 
 
