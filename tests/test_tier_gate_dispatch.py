@@ -874,13 +874,39 @@ class ResumeHookPath(Fixture):
         self.assertEqual(list(self.root.glob('*.dispatch-open.jsonl')), [])
 
     def test_forged_resume_line_only_reopens(self):
-        self.positive('r10f')
-        with open(self.side('r10f'), 'a') as handle:
-            handle.write(json.dumps({'tool_use_id': 'resume-x', 'kind': 'resume', 'agent_id': 'agpos-r10f'}) + '\n')
-            handle.write(json.dumps({'tool_use_id': 'resume-y', 'kind': 'resume', 'agent_id': 'bad/id'}) + '\n')
-        reasons = [d.get('reason') for d in self.dispatches('r10f')]
-        self.assertIn('resumed_unknown', reasons)
+        """Inspection R1: a valid forged resume line alone must never turn a counting window into an exclusion."""
+        # an ended Sonnet owner from before the climb; nothing else runs in the R2 window, so the FAIL counts
+        self.owner('r10f', 'old-son', SONNET, status='completed', agent_id='agson0')
+        self.climb_to('r10f', 'R2')
         self.assertEqual(self.fail_once('r10f')['event']['class'], 'FAIL')
+        with open(self.side('r10f'), 'a') as handle:
+            handle.write(json.dumps({'tool_use_id': 'forged-r1', 'kind': 'resume', 'agent_id': 'agson0'}) + '\n')
+        [old] = [d for d in self.dispatches('r10f') if d['tool_use_id'] == 'old-son']
+        self.assertEqual((old['phase'], old.get('reason')), ('open', 'resumed'))
+        self.assertEqual(self.fail_once('r10f')['event']['class'], 'FAIL')
+        # a malformed id adds one resumed_unknown, which also blocks
+        self.positive('r10g')
+        with open(self.side('r10g'), 'a') as handle:
+            handle.write(json.dumps({'tool_use_id': 'resume-y', 'kind': 'resume', 'agent_id': 'bad/id'}) + '\n')
+        self.assertIn('resumed_unknown', [d.get('reason') for d in self.dispatches('r10g')])
+        self.assertEqual(self.fail_once('r10g')['event']['class'], 'FAIL')
+
+    def test_resumed_dispatch_ends_and_leaves_later_windows(self):
+        """A resumed run blocks only windows it overlaps: after its stop and a later climb, it is no longer considered."""
+        self.owner('r10h', 'son-h', SONNET, status='completed', agent_id='agh')
+        self.climb_to('r10h', 'R1')
+        self.hook('start', {'agent_id': 'agh', 'agent_type': 'task-owner', 'session_id': 'sdisp',
+                            'hook_event_name': 'SubagentStart'})
+        self.stop('agh')
+        self.climb_to('r10h', 'R2')
+        self.owner('r10h', 'son-h2', SONNET)
+        self.assertEqual(self.fail_once('r10h')['event']['class'], 'NOT_COUNTED')
+        # m4: a stop also ends a resumed_unknown with the same agent id
+        esc.index_agent(self.root, 'aggone2', 'r10i')
+        self.hook('start', {'agent_id': 'aggone2', 'session_id': 's', 'hook_event_name': 'SubagentStart'})
+        self.stop('aggone2')
+        [syn] = [d for d in self.dispatches('r10i') if d.get('reason') == 'resumed_unknown']
+        self.assertIn('ended_at', syn)
 
     def test_agent_task_run_one_posttool_entry(self):
         sys.path.insert(0, str(ROOT))

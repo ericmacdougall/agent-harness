@@ -592,7 +592,10 @@ def _apply_resume(state, agent_id, t):
         dispatch['after_seq'] = seq
     dispatch.pop('ended_at', None)
     dispatch.pop('ended_seq', None)
-    dispatch.update(resumed_seq=seq, t=t)
+    # Inspection R1: a resumed run is never proven below (a forged or idle resume could otherwise revive an ended
+    # below-rung owner into a window it never ran in). It reopens as phase open, so every window it overlaps counts.
+    dispatch.update(resumed_seq=seq, t=t, phase='open', reason='resumed' if dispatch.get('reason') is None
+                    else dispatch.get('reason'))
 
 
 class Ledger:
@@ -900,6 +903,10 @@ class Ledger:
             _, rename = self._merge_side(task, state)
             dispatch = next((d for d in reversed(state['dispatches']) if isinstance(d, dict)
                              and d.get('agent_id') == agent_id), None)
+            for synthetic in state['dispatches']:  # inspection m4: a resumed_unknown for this agent ends with it
+                if (isinstance(synthetic, dict) and synthetic.get('reason') == 'resumed_unknown'
+                        and synthetic.get('agent_id') == agent_id and not synthetic.get('ended_at')):
+                    synthetic['ended_at'], synthetic['ended_seq'] = now(), len(state['events'])
             if dispatch is not None:
                 if not dispatch.get('ended_at'):
                     dispatch['ended_at'], dispatch['ended_seq'] = now(), len(state['events'])
@@ -919,7 +926,7 @@ class Ledger:
     def reopen_dispatch(self, task, agent_id):
         """SubagentStart or SendMessage on an indexed agent (inspection F5): append one resume line to the side file.
         Like open_dispatch it takes no ledger lock (spec r7 AC-10: no added wait on the hook path); the next locked
-        operation's merge reopens the dispatch. A forged resume line can only make a window count, never exclude."""
+        operation's merge reopens the dispatch as phase open, so a forged resume line can only make windows count."""
         if not isinstance(agent_id, str) or not AGENT_ID.fullmatch(agent_id):
             return False
         import time
