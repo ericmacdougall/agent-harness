@@ -677,6 +677,7 @@ class Ledger:
                     return changed[0], None  # replaced between lstat and open: the next merge reads it
                 handle.seek(offset)
                 chunk = handle.read(SIDE_LIMIT)  # input-ok: bounded by SIDE_LIMIT
+            self._after_side_read(task)
         except OSError:
             synthetic('side_not_regular', 'open-%d' % info.st_ino)
             return changed[0], None
@@ -726,6 +727,9 @@ class Ledger:
             changed[0] = True
         _evict(dispatches, t)
         return changed[0], rename
+
+    def _after_side_read(self, task):
+        """Test seam (NEG-14): an appender may run here, between the merge's read and the ledger write."""
 
     @staticmethod
     def _after_write(rename):

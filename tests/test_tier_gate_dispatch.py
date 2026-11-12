@@ -504,23 +504,23 @@ class SideFile(Fixture):
     def test_append_interleaved_with_merge_survives(self):
         self.climb_to('ki', 'R2')
         self.owner('ki', 'first', SONNET)
-        real_merge = esc.Ledger._merge_side
         state = {'done': False}
 
-        def interleaving(ledger, task, ledger_state):
-            result = real_merge(ledger, task, ledger_state)
+        def append_now(ledger, task):
             if task == 'ki' and not state['done']:
-                state['done'] = True  # an append lands after this merge read the file, before the ledger write
+                state['done'] = True  # appends land after this merge read the file, before the ledger write
                 ledger.open_dispatch('ki', {'tool_use_id': 'raced', 'kind': 'agent', 'subagent_type': 'task-owner',
                                             'owner': True})
                 with open(self.root / 'ki.dispatch-open.jsonl', 'ab') as handle:
                     handle.write(b'{"tool_use_id":"partial","owner":true')  # an append still in progress
-            return result
-        with mock.patch.object(esc.Ledger, '_merge_side', interleaving):
+        self.ledger.open_dispatch('ki', {'tool_use_id': 'before', 'kind': 'agent', 'owner': False})
+        with mock.patch.object(esc.Ledger, '_after_side_read', append_now):
             self.ledger.load('ki')
+        self.assertTrue(state['done'])
         with open(self.root / 'ki.dispatch-open.jsonl', 'ab') as handle:
             handle.write(b',"kind":"agent"}\n')  # the partial append completes
         ids = {d['tool_use_id']: d for d in self.dispatches('ki')}
+        self.assertIn('before', ids)
         self.assertIn('raced', ids)
         self.assertIn('partial', ids)
         self.assertEqual(ids['raced']['phase'], 'open')

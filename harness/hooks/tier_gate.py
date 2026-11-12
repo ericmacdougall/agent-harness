@@ -690,6 +690,8 @@ def open_spawn_dispatch(data, tool, command, decision, updated, facts, policy, m
         return  # an enforced deny never runs
     tool_input = data.get('tool_input') if isinstance(data.get('tool_input'), dict) else {}
     tool_use_id = data.get('tool_use_id')
+    if not esc.clean_str(tool_use_id, 64):
+        return  # nothing could ever close it; the harness always sends one on a real PreToolUse
     if tool in SPAWN_TOOLS:
         prompt, description = str(tool_input.get('prompt') or ''), str(tool_input.get('description') or '')
         task = facts.get('task')
