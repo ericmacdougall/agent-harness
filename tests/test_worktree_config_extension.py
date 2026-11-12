@@ -353,7 +353,8 @@ class CallerAndMessages(Extension):
         def fake(argv, **kwargs):
             seen.update(kwargs)
             return subprocess.CompletedProcess(argv, 0, b"/x/.git\n", b"")
-        poisoned = {"LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8", "LANGUAGE": "de", "GIT_DIR": "/nowhere"}
+        poisoned = {"LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8", "LANGUAGE": "de", "GIT_DIR": "/nowhere",
+                    "GIT_CEILING_DIRECTORIES": "/"}
         with mock.patch.dict(os.environ, poisoned), mock.patch.object(cg.subprocess, "run", fake):
             cg._git_try("/", ["rev-parse"], 5)
         env = seen["env"]
@@ -361,6 +362,9 @@ class CallerAndMessages(Extension):
         self.assertNotIn("LANGUAGE", env)
         self.assertEqual(env["GIT_DISCOVERY_ACROSS_FILESYSTEM"], "1")
         self.assertNotIn("GIT_DIR", env)
+        # receipt r1b F3: the sanitized environment forces a ceiling of the filesystem root, which the real command does not
+        # have; the lookup must not search less widely than the real git (a repository at the root itself)
+        self.assertNotIn("GIT_CEILING_DIRECTORIES", env)
 
     def test_only_a_first_line_that_says_not_a_git_repository_skips_the_callers_file(self):
         skipped = (128, "", "fatal: not a git repository (or any of the parent directories): .git\n")

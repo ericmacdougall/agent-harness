@@ -1342,6 +1342,7 @@ def _try_env():
     env = _clone_env()
     env['LC_ALL'] = 'C'
     env.pop('LANGUAGE', None)
+    env.pop('GIT_CEILING_DIRECTORIES', None)  # _clone_env pins it to /, the real command has none
     env['GIT_DISCOVERY_ACROSS_FILESYSTEM'] = '1'
     return env
 
@@ -1424,8 +1425,12 @@ def _per_worktree_config_refusal(path, common, git_dir, cwd, step):
     $common/worktrees/ID/config.worktree for a linked one. The programs a removal can start are decided by the worktrees
     whose git commands run: the PRIMARY (the delegated removal runs from there), the TARGET (the cleanliness check runs
     in it) and the worktree the caller stands in (the hook form runs from the caller's directory). Each of those files
-    is vetted (lstat first, plain file, size cap, `git config --file` read) before any other command that reads the
-    worktree; a missing file is fine. An unrelated linked worktree's file is never read by this removal and does not
+    is vetted (lstat first, plain file, size cap, `git config --file` read) before any git command that could start a
+    program named by config (`ls-files`, `status`, the removal); a missing file is fine. Four git calls run earlier and do
+    read an unvetted config.worktree (`rev-parse` in the target, `rev-parse` in the caller, `worktree list`, `config
+    --local --list`): they are safe because every git call here carries `core.fsmonitor=false` and `core.hooksPath=/dev/null`
+    and none refreshes the index or runs a filter or helper; the call-order test pins that the vetting precedes `ls-files`
+    and `status`. An unrelated linked worktree's file is never read by this removal and does not
     decide it."""
     files = [os.path.join(common, 'config.worktree'), os.path.join(git_dir, 'config.worktree')]
     if cwd and os.path.isdir(cwd):
@@ -1610,7 +1615,10 @@ def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None):
     Only the checkout being removed is judged; unrelated branches and other worktrees stay out of the decision.
 
     Known window (#134 red-team P6): this runs in the PreToolUse hook, before the command. A file that appears
-    after this check and before `git worktree remove` runs is not seen here. Git itself refuses a worktree with
+    after this check and before `git worktree remove` runs is not seen here. That includes CONFIG files: a
+    `config.worktree` written after the vetting is read by the real command, and in the hook form the user's command
+    carries no `-c core.fsmonitor=false` (the delegated `ah worktree-remove` route does), so a program-valued key added in
+    that window can run (goodqa#15741 tracks the wider hook-form environment gap). Git itself refuses a worktree with
     modified or untracked files, but it removes ignored files (for example a fresh `.env`) without `--force`.
     The guard cannot close that window. Callers must not remove a worktree that another process may still be
     writing to: stop its servers and agents first.
