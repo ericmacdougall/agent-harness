@@ -51,7 +51,7 @@ Checkpoint: not required (under 10 min and 4 GB)
 ## Risks
 
 - A capability name drifts from what the installer greps: mitigation, the exact name is pinned in the test and the ticket.
-- The gate checks the PROBED file, not the file the service runs (found by acceptance review, confirmed read-only on t2-dev: `systemctl --user cat ops-watch.service` runs `~/.agent-harness/bin/ops_watch.py run`, dated Nov 5 and different from the hooks copy; `install()` renders the unit from `Path(__file__)`, so the unit points at whichever copy last ran `install --apply`). Until the unit is re-pointed, updating `~/.claude/hooks` makes the gate pass while the timer keeps running a copy without the forwarder, and fabd criticals would again reach only the local ring. Mitigations, both follow-ups: the fabd installer probes the script from `systemctl --user show -p ExecStart ops-watch.service` (launchd ProgramArguments on the Mac) and requires the timer active; the t2-dev install step runs `python3 ~/.claude/hooks/ops_watch.py install --apply` and the live test checks that the unit's ExecStart path is the hooks copy. The fabd install must not go ahead before one of them is done.
+- The gate checks the PROBED file, not the file the service runs (found by acceptance review, confirmed read-only on t2-dev: `systemctl --user cat ops-watch.service` runs `~/.agent-harness/bin/ops_watch.py run`, dated Nov 5 and different from the hooks copy; `install()` renders the unit from `Path(__file__)`, so the unit points at whichever copy last ran `install --apply`). Until the unit is re-pointed, updating `~/.claude/hooks` makes the gate pass while the timer keeps running a copy without the forwarder, and fabd criticals would again reach only the local ring. Mitigations, both tracked as goodqa#15837 (linked to goodqa#15805): the fabd installer probes the script from `systemctl --user show -p ExecStart ops-watch.service` (launchd ProgramArguments on the Mac) and requires the timer active; the t2-dev install step runs `python3 ~/.claude/hooks/ops_watch.py install --apply` and the live test checks that the unit's ExecStart path is the hooks copy. The fabd install must not go ahead before one of them is done.
 - A host with the default config (comment mode none, no deadman) passes the gate although nothing would be delivered; t2-dev has sinks configured today. The installer may also check `ops_watch.py config` for at least one comment or deadman sink. Stated limit.
 - The gate proves capability, not liveness: a host whose ops-watch timer is not installed, disabled or failing still passes it, and fabd criticals would then reach only the local ring. Stated limit; the installer may also check the heartbeat file `~/.agent-harness/logs/ops-watch.last-ok` (at most about 30 minutes old), which is the Fabric owner's decision.
 - The capability is a presence check of the functions in the same file, a version marker rather than a proof; the run_once wiring is proved by the tests, not by the probe at run time.
@@ -93,3 +93,12 @@ Domain-gate: self-update-e2e waived (no such behaviour is added or changed; a re
 Domain-gate: transport-proof waived (no such behaviour is added or changed; a read-only CLI probe)
 Domain-gate: rollback-not-blocked waived (no such behaviour is added or changed; a read-only CLI probe)
 Domain-gate: staging-exists waived (no such behaviour is added or changed; a read-only CLI probe)
+
+## Reviews
+
+Spec core sha256: `11c7c7bd1c429fe5a9e6a1f5bc3b42933ee138e8cc232062e5f332fae7d258a0`
+
+| Role | Verdict | Reviewer | Kind | Source | Bound to |
+|---|---|---|---|---|---|
+| adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | current |
+| acceptance | ACCEPT | a5d878417503c1093 (red-team) | agent | WAL-verified red-team agent | current |
