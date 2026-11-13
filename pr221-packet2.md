@@ -1,6 +1,6 @@
 # PR review packet 2 (delta for receipt r1): the guard blocks shell reads of the GoodQA token and lease keys (agent-harness PR 221, GoodQA goodqa#15785)
 
-Base: 617cfed675c5f66e0ec8a892f69a11cfa8209b84 (merge base with origin/main; use `--snapshot-base 617cfed675c5f66e0ec8a892f69a11cfa8209b84`). Head: bfc145253ea6e5c18c86e98d10d045f6ec59b725 (branch af9e-gq-credential-paths). Claude-authored: `--author-harness claude`. Previous packet: pr221-packet.md (head a65fdcbd331382437f77fe73cfd1707b89901869, receipt r1 = BLOCK). Everything in that packet still holds except where this delta says otherwise.
+Base: 1eba3e291c1f8bac2613e74515a360ecb933eeb8 (origin/main, the merge of PR 230, and the merge base; use `--snapshot-base 1eba3e291c1f8bac2613e74515a360ecb933eeb8`). Head: b3d900ef947b5aab59e1b9483bcb0de574258a8e (branch af9e-gq-credential-paths; a plain merge of origin/main 1eba3e29 into the delta head bfc145253ea6e5c18c86e98d10d045f6ec59b725, no history rewritten and no conflict; the PR's own diff against main is unchanged; PR 230 and this PR both touch command_guard.py, so the guard suites were run on the merged result). Claude-authored: `--author-harness claude`. Previous packet: pr221-packet.md (head a65fdcbd331382437f77fe73cfd1707b89901869, receipt r1 = BLOCK). Everything in that packet still holds except where this delta says otherwise.
 Delta commits since a65fdcbd: 3c2f6549 (F1, F2), f7dcb5b7 and 41a7c1e0 (gaps found by the two delta reviews), b0311fc6 and bfc14525 (spec text and review reports only).
 Changed code paths in the delta: harness/hooks/command_guard.py (policy list credential_parent_dirs, Compiled.cred_parent_dirs, under_cred_parent, read_creds, the find -exec branch, ARCHIVE_CMDS and its dispatch, _count_only), tests/test_command_guard_gq_credentials.py, tests/mutants_gq_credentials.py (new), notes/goodqa-15785/ (spec.md, review-opus-r1-delta.md, review-sonnet-r1-delta.md).
 
@@ -18,7 +18,15 @@ Opus adversarial: BLOCK at 3c2f6549 (H1 the no-path search, M1 cpio, M2 bsdtar a
 
 Risk and rollback: revert the commits; the change only adds refusals for commands that name these two directories, a recursive search from inside or above them, or an archive or copy of them.
 
-## Validation (exact head bfc145253ea6e5c18c86e98d10d045f6ec59b725, code as at 41a7c1e0, run in the owner worktree)
+## Validation (exact head b3d900ef947b5aab59e1b9483bcb0de574258a8e = the delta head merged with origin/main 1eba3e29, run in the owner worktree)
+$ python3 -B -m unittest tests.test_command_guard tests.test_command_guard_owned_checkout tests.test_command_guard_no_backup tests.test_command_guard_gq_credentials tests.test_worktree_inuse tests.test_worktree_hooks_rule tests.test_ah_worktree_remove
+Ran 323 tests in 186.642s
+OK (skipped=2)
+exit 0
+$ python3 -B tests/mutants_gq_credentials.py
+origin/main (no change) FAILS (good); all 16 broken variants FAILS (good); none PASSES, none NOT APPLIED; exit 0
+(the two runs above are at the exact head; the runs below were at the delta head before the merge)
+## Earlier validation (delta head bfc145253ea6e5c18c86e98d10d045f6ec59b725, code as at 41a7c1e0)
 $ python3 -B -m unittest tests.test_command_guard tests.test_command_guard_owned_checkout tests.test_command_guard_no_backup tests.test_command_guard_gq_credentials
 Ran 232 tests in 90.295s
 OK
