@@ -213,6 +213,25 @@ class Route(ServerHarness):
         self.assertEqual(self.req("wr1")["bucket"], "live")
         self.assertEqual(self.app.ledger.snapshot()["requirements"]["summary"]["manual_user"], 0)
 
+    def test_every_user_source_kind_gets_the_badge_and_the_count(self):
+        """NEG-20 for queue: and uuid: sources (the user's own words in provenance), not only user: and answer:."""
+        sources = {"wr1": 'queue:baab765b-d85c-46b4-b7b9-588eb912c770/2026-11-13T17:33:02.321Z#3a69eba31644 "x"',
+                   "wr2": 'uuid:baab765b-d85c-46b4-b7b9-588eb912c770/1b0a0685-cc50-4b90-9b63-c9cd33a7750f "x"'}
+        reqs = dict(REQS, requirements=[dict(r, source=sources.get(r["id"], r["source"])) for r in REQS["requirements"]])
+        self.app.runner.outputs["ah-requirements"] = lambda *_a: (0, json.dumps(reqs))
+        self.app.ledger.run(time.time() + 61)
+        for i, rid in enumerate(("wr1", "wr2")):
+            self.assertTrue(self.req(rid)["user_sourced"], rid)
+            self.assertEqual(self.click(rid=rid, key=f"click-key-10{i}")[0], 201)
+            self.assertEqual((self.req(rid)["rule"], self.req(rid)["user_sourced"]), ("M", True))
+        self.assertEqual(self.app.ledger.snapshot()["requirements"]["summary"]["manual_user"], 2)
+
+    def test_a_same_key_retry_after_the_row_changed_state_is_answered_with_the_same_row(self):
+        status, first = self.click(key="click-key-0200")
+        self.assertEqual(status, 201)
+        status, again = self.click(key="click-key-0200", digest=self.req()["digest"])
+        self.assertEqual((status, again["id"], again["created"]), (200, first["id"], False))
+
     def test_the_write_routes_in_the_server_match_the_coverage_map(self):
         import re
         server = (REPO / "harness" / "mission_control" / "server.py").read_text()

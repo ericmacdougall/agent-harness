@@ -81,6 +81,13 @@ class ReqActions:
         """Every verified row, oldest first: the audit trail."""
         return self._read_rows()
 
+    def by_key(self, client_key) -> dict | None:
+        """The verified row a client key already produced, so a retry after a lost response is answered with it."""
+        if not isinstance(client_key, str) or not mc_chat.CLIENT_KEY_RE.fullmatch(client_key):
+            return None
+        row_id = "ra-" + hashlib.sha256(client_key.encode("utf-8")).hexdigest()[:20]
+        return next((r for r in self._read_rows() if r["id"] == row_id), None)
+
     def latest(self) -> dict:
         """requirement id -> its latest verified archive or restore row."""
         try:

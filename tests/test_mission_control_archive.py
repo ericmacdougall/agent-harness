@@ -124,7 +124,8 @@ class Rules(unittest.TestCase):
         self.assertIn("30 d", out["reason"])
 
     def test_r4_never_archives_a_user_sourced_requirement_by_age(self):
-        for source in ('user:s/u "get 1000 leads"', 'answer:q1 "yes"'):
+        for source in ('user:s/u "get 1000 leads"', 'answer:q1 "yes"', 'queue:baab765b-d85c-46b4-b7b9-588eb912c770/2026-11-13T17:33:02.321Z#3a69eba31644 "x"',
+                       'uuid:baab765b-d85c-46b4-b7b9-588eb912c770/1b0a0685-cc50-4b90-9b63-c9cd33a7750f "x"', 'QUEUE : s/t#abc "x"', ' user:s/u "x"'):
             out = one(req(age=400 * DAY, source=source))
             self.assertEqual(out["bucket"], "live", source)
             self.assertIn("yours", out["unowned_note"])
@@ -199,6 +200,22 @@ class Determinism(unittest.TestCase):
         back = one(done, overrides=rest)
         self.assertEqual((back["bucket"], back["manual"]["action"]), ("live", "restore"))
         self.assertEqual(one(req("wz"), overrides=arch)["bucket"], "live")  # another id is untouched
+
+    def test_the_user_source_kinds_are_the_ones_provenance_treats_as_the_users_words(self):
+        """Drift guard: archive.is_user_source must agree with provenance.parse_source on every kind."""
+        import provenance
+        sid, uid = "baab765b-d85c-46b4-b7b9-588eb912c770", "1b0a0685-cc50-4b90-9b63-c9cd33a7750f"
+        samples = {"user": f'user:{sid}/{uid} "x"', "uuid": f'uuid:{sid}/{uid} "x"', "answer": f'answer:{sid}/{uid} "x"',
+                   "queue": f'queue:{sid}/2026-11-13T17:33:02.321Z#3a69eba31644 "x"', "pasted": f'pasted:{sid}/{uid} "x"',
+                   "ticket": "ticket:GoodQA goodqa#1", "wal": "wal:/x#y", "file": 'file:a.py:1@abc "x"', "inferred": "inferred: from a ; b -- c"}
+        for name, source in samples.items():
+            try:
+                mine = provenance.parse_source(source)["kind"] == "user"
+            except provenance.Problem:
+                continue  # a sample that does not parse here says nothing about the kind
+            self.assertEqual(archive.is_user_source(source), mine, name)
+        self.assertTrue(all(archive.is_user_source(samples[k]) for k in ("user", "uuid", "answer", "queue")))
+        self.assertFalse(any(archive.is_user_source(samples[k]) for k in ("pasted", "ticket", "wal", "file", "inferred")))
 
     def test_a_manual_archive_names_the_dashboard_session_never_the_user(self):
         arch = {"wm": {"action": "archive", "at": iso(60), "reason": "x", "id": "ra-1", "source": "mc:s/ra-1", "session": "abcdef12-0000"}}

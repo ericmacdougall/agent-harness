@@ -19,7 +19,7 @@ First match wins:
                             newer row is itself live. Near-duplicates (a changed word) stay live: only an exact match
                             of the full text counts.
     R4  expired             a requirement is older than REQUIREMENT_TTL_S with no owner, ticket or evidence AND it is not
-                            sourced to the user (`user:` or `answer:`). An ask is never archived by age or `until`: it
+                            sourced to the user (`user:`, `uuid:`, `answer:` or `queue:`). An ask is never archived by age or `until`: it
                             stays live, answerable, with a stale mark. The 30 days is an ASSUMPTION, tunable.
 
 Everything else is live. A user-sourced requirement with no owner stays live with a note saying so; only the user's own
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 
 REQUIREMENT_TTL_S = 30 * 86400
@@ -38,7 +39,16 @@ TERMINAL_STATES = frozenset({"resolved", "closed", "done", "superseded", "expire
 CLEARED_RULES = {"resolved": "R1", "owner-reassigned": "R1", "ticket-closed": "R2", "duplicate": "R3"}
 RULE_TITLES = {"M": "archived from the dashboard", "R1": "terminal state", "R2": "done live or ticket closed", "R3": "superseded",
                "R4": "expired", "live": "open"}
-USER_SOURCES = ("user:", "answer:")
+# The kinds provenance.parse_source maps to the user's own words: user:, its uuid: spelling (as `ah user-msg` prints it),
+# answer: and queue:. tests.test_mission_control_archive checks this list against provenance itself, so it cannot drift.
+USER_SOURCE_KINDS = frozenset({"user", "uuid", "answer", "queue"})
+_KIND_RE = re.compile(r"^\s*([A-Za-z]+)\s*:")
+
+
+def is_user_source(source) -> bool:
+    """True when a `Source:` string is one of the user's own words in provenance's sense."""
+    match = _KIND_RE.match(source) if isinstance(source, str) else None
+    return bool(match) and match.group(1).lower() in USER_SOURCE_KINDS
 
 
 def digest_of(row_id: str, text: str) -> str:
@@ -139,7 +149,7 @@ def _normalise(row: dict, kind: str) -> dict:
         "state": _text(state, 40).lower() if isinstance(state, str) else "",
         "session": _text(row.get("session"), 80), "owner": _text(row.get("owner"), 80),
         "ticket": row.get("ticket") if isinstance(row.get("ticket"), str) else "",
-        "source": source, "user_sourced": source.startswith(USER_SOURCES), "until": _text(row.get("until"), 40),
+        "source": source, "user_sourced": is_user_source(source), "until": _text(row.get("until"), 40),
         "resolved_at": _text(row.get("resolved_at"), 40), "resolution": _text(row.get("resolution"), 300),
         "decision": _text(row.get("decision"), 40), "resolved_by": _text(row.get("resolved_by"), 80),
         "reason_in": _text(row.get("reason"), 300),
@@ -198,7 +208,7 @@ def _first_pass(row: dict, now: float, overrides: dict, ticket_closed):
             extra["past_until"] = True
     elif kind == "requirement":
         guarded = bool(row["owner"] or row["ticket"] or row["evidence"] or row["evidence_in"])
-        by_user = row["source"].startswith(USER_SOURCES)
+        by_user = is_user_source(row["source"])
         if age is not None and not guarded:
             if by_user:
                 if age > REQUIREMENT_TTL_S:

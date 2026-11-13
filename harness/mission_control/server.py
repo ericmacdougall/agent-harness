@@ -537,6 +537,12 @@ class App:
         session = self.owners.session or ""
         if not session:
             return 409, {"error": "no-main", "message": "Mission Control does not know main's session yet"}
+        # A retry with the same key after a lost response is answered with the row it already made, whatever state
+        # the requirement is in now (the row's own archive made the "already archived" check below true).
+        prior = self.actions.by_key(body.get("client_key"))
+        if prior and (prior["req"], prior["action"]) == (req, action) and isinstance(body.get("reason"), str) \
+                and prior["reason"] == " ".join(mc_chat._redact(body["reason"]).split()):
+            return 200, {"id": prior["id"], "created": False, "req": req, "action": action, "at": prior["at"]}
         item = next((r for r in self.ledger.parts["requirements"].get("items", []) if r["id"] == req), None) \
             if isinstance(req, str) else None
         if item is None:
