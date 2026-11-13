@@ -92,7 +92,8 @@ class Base(unittest.TestCase):
         with it before parsing (claim_main); the test then calls the library function the CLI would call."""
         import caller_identity  # noqa: PLC0415
         argv = [cmd] + ([] if goal == "*" else ["--goal", goal])
-        caller_identity.put_stamp("mission-main", [cmd, mc.argv_key(argv)], session=SESSION, home=self.home)
+        caller_identity.put_stamp("mission-main", [cmd, mc.argv_key(argv)], session=SESSION, home=self.home,
+                                  tool_use_id="toolu_01ASMAIN0000000000000001", transcript=self.transcript)
         mc.claim_main(argv, self.home)
         self.addCleanup(mc._PROOF.clear)
 
@@ -104,8 +105,9 @@ class Base(unittest.TestCase):
 
     def hook(self, cmd, session=SESSION, transcript=None):
         """main's PreToolUse(Bash) hook seeing `cmd` in session `session` (a top-level transcript of its own)."""
+        # a running call's id (goodqa#15754 F1: stamps are bound to it; no tool_result for it is ever written here)
         return mission_gate.cmd_pretool({"tool_name": "Bash", "tool_input": {"command": cmd}, "session_id": session,
-                                         "hook_event_name": "PreToolUse",
+                                         "hook_event_name": "PreToolUse", "tool_use_id": "toolu_01HOOK00000000000000001",
                                          "transcript_path": str(transcript or self.transcript)})
 
     def cli(self, argv):
@@ -733,7 +735,7 @@ class RedTeam179(Base):
         key = ["set", mc.argv_key(["set", "--goal", "leads", "--ticket", "goodqa#1"])]
         self.assertIsNone(caller_identity.take_stamp("mission-main", key))
         mission_gate.cmd_pretool({"tool_name": "Bash", "tool_input": {"command": cmd}, "session_id": SESSION,
-                                  "transcript_path": str(self.transcript)})
+                                  "transcript_path": str(self.transcript), "tool_use_id": "toolu_01PRETOOL000000000001"})
         self.assertIsNotNone(caller_identity.take_stamp("mission-main", key))
 
     # M1b: an ah registration (any caller, any source, 8-char prefix) never binds; main binds an exact live owner id

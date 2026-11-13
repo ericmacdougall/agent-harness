@@ -3251,7 +3251,7 @@ def run(args, home: Path) -> dict:
         import goals_view  # noqa: PLC0415
         if args.candidates:
             return dict(goals_view.candidates(home, session=args.session), candidates=True)
-        return goals_view.goals_report(home, session=args.session)
+        return goals_view.goals_report(home, session=args.session, budget_s=goals_view.CLI_BUDGET_S)
     if cmd == "approve-top":
         return approve_top_cmd(home, args)
     if cmd == "doctor":

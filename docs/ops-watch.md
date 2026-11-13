@@ -103,4 +103,28 @@ systemctl --user disable --now ops-watch.timer                # stop (Linux)
 
 Host and unit names must be plain words, and `max_age_h` must be a finite positive number; any other entry is refused as `:config` and never reaches ssh.
 
+`proxmox_pools` (goodqa#15771) watches the capacity of a dir-type Proxmox storage pool whose thin guest disks can fill it. It is empty by default; enable it per host in `ops-watch.json`:
+
+```json
+{"proxmox_pools": [{"host": "t2-proxmox", "storage": "local", "mount": "/var/lib/vz", "watch_vms": [102, 103]}]}
+```
+
+A host reachable only through another one takes three optional keys, with no edit to `~/.ssh/config`: `ssh_config` (an absolute path, passed as `-F`), `jump` (a plain-word ssh host, passed as `-J`) and `known_hosts` (an absolute path to a pinned known_hosts file; it turns on `StrictHostKeyChecking=yes`). Prefer a dedicated `ssh_config` file that defines the host alias: the alias then names the alert (`disk:volume:t2-proxmox:...`, never an address), and the jump hop gets its own settings from that file (an `-J` hop does not inherit BatchMode, ConnectTimeout or the pinned known_hosts). The Mac reaches t2-proxmox this way, with both files kept in `~/.agent-harness/ops-watch/` (0600):
+
+```json
+{"proxmox_pools": [{"host": "t2-proxmox", "ssh_config": "/Users/eric/.agent-harness/ops-watch/ssh_config.t2-proxmox",
+  "storage": "local", "mount": "/var/lib/vz", "watch_vms": [102, 103]}]}
+```
+
+`ssh_config.t2-proxmox` starts with `Include ~/.ssh/config_fleetops` at top level, so the jump host t2-dev resolves. An Include placed after a `Host` block belongs to that block and is never read for t2-dev; check with `ssh -G -F FILE t2-dev`. It then holds `Host t2-proxmox` (HostName, `User root`, `ProxyJump t2-dev`, `StrictHostKeyChecking yes`, `UserKnownHostsFile ~/.agent-harness/ops-watch/known_hosts.t2-proxmox`) and a final `Host *` with `BatchMode yes` and `ConnectTimeout 5`, so the jump hop never prompts either. Copy the known_hosts lines from the jump host's own trusted file (`ssh-keygen -F ADDRESS` there), never by trust on first use. Any exception while probing or parsing (undecodable bytes, a corrupt saved sample) is `disk:unknown`, which turns high after 30 minutes without a good read.
+
+Each run makes one read-only call: `ssh -o BatchMode=yes -o ConnectTimeout=5 [-F CFG] [-J JUMP] [-o UserKnownHostsFile=KH -o StrictHostKeyChecking=yes] -- HOST SCRIPT` with 25 s in total. `pvesm status` headers with or without `(KiB)` after each size column (pve 8 prints them) both parse; any other unit is UNKNOWN. The script is fixed text: `pvesm status --storage STORAGE`, `qm list` and `qm config` for every VM, and `du -sk MOUNT/images/*`. Host, storage and mount are checked against plain-word patterns and VM ids must be integers, so a bad entry is refused as `disk:config:...` before ssh. Nothing changes on the hypervisor. Alerts (key suffix `HOST:MOUNT`):
+
+- `disk:volume:` warning at 85% used, high at 92%, critical at 97% or under 20 GiB free. The overcommit ratio is reported in this alert and not alerted on its own: it is a standing condition, decided by the disk options in goodqa#15771. The detail holds `overcommit_ratio` (disk sizes on this storage over pool total), `provisioned_gib`, and for each watched VM `allocated_gib`, `actual_gib` (du of its image dir) and `growth_gib_day`.
+- `disk:growth:` more than 10 GiB/day, measured against the stored sample 6 to 48 h old that is closest to 24 h (samples every 30 min, kept 48 h, from good reads only). High when the pool would fill within 3 days at that rate, else warning.
+- `disk:vmunknown:` (warning) a watched VM has no config or disk usage in the probe, so a partial read cannot pass silently even below every threshold.
+- `disk:unknown:` UNKNOWN: the host cannot be reached or the output is unusable (missing marker, inactive storage, non-numeric or inconsistent numbers). Warning at first, high after 30 min without a good read. The last good alerts stay active meanwhile, so an outage is never green. Alert text never carries remote output or addresses, only the configured host name.
+
+Tests: `python3 -m unittest tests.test_ops_watch_proxmox`.
+
 Tests: `python3 -m unittest tests.test_ops_watch`.
