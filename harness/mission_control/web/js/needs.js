@@ -9,6 +9,7 @@ import { trailOf, waitingOnUser, askProgress, replyStatus, decisionOf, decisionS
 
 const BASE_TITLE = 'Mission Control';
 const REPLY_MAX = 3900;
+export const ASKS_SHOWN = 5;
 
 const time = iso => { const d = new Date(iso); return Number.isFinite(d.getTime()) ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''; };
 function gap(from, to) {
@@ -66,6 +67,8 @@ export function mountNeeds() {
   const arming = new Map();     // ask id -> 'approve' | 'deny' while the confirm step is showing
   const announced = new Map();  // ask id -> last decision status read out
   const rows = new Map();
+  let showAll = false;
+  document.getElementById('needs-more').addEventListener('click', () => { showAll = !showAll; paint(getState()); });
   // The list is part of the page (not a dialog): the top-bar button takes you to it.
   const visible = () => panel.offsetParent !== null;
 
@@ -151,13 +154,18 @@ export function mountNeeds() {
     open.classList.toggle('has-asks', waiting > 0);
     open.setAttribute('aria-label', (waiting ? `Needs you: ${waiting} open ask${waiting === 1 ? '' : 's'}` : 'Needs you: nothing waiting on you') + (stale ? `, ${stale} stale` : ''));
     document.title = waiting ? `(${waiting}) ${BASE_TITLE}` : BASE_TITLE;
-    const wanted = new Set(sections.flatMap(section => state[section.key].map(a => a.id)));
+    const shown = key => (key === 'asks' && !showAll ? state.asks.slice(0, ASKS_SHOWN) : state[key]);
+    const more = document.getElementById('needs-more');
+    more.hidden = state.asks.length <= ASKS_SHOWN;
+    more.textContent = showAll ? 'Show fewer asks' : `Show ${state.asks.length - ASKS_SHOWN} more asks`;
+    more.setAttribute('aria-expanded', String(showAll));
+    const wanted = new Set(sections.flatMap(section => shown(section.key).map(a => a.id)));
     for (const [id, parts] of rows) if (!wanted.has(id)) { parts.row.remove(); rows.delete(id); drafts.delete(id); arming.delete(id); announced.delete(id); }
     list.querySelector('.empty-state')?.remove();
     if (!state.asks.length) list.append(el('li', 'empty-state', stale ? 'Nothing new needs you. Older open asks are under Stale.' : 'Nothing needs you right now.'));
     for (const section of sections) {
       if (section.box) { section.box.hidden = !state[section.key].length; section.count.textContent = String(state[section.key].length); }
-      state[section.key].forEach((ask, index) => paintAsk(state, section, ask, index));
+      shown(section.key).forEach((ask, index) => paintAsk(state, section, ask, index));
     }
   }
 

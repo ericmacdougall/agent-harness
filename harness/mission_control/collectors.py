@@ -798,6 +798,7 @@ class Asks(Collector):
         self.flagged: list[dict] = []
         self.cleared: list[dict] = []
         self.swept_at = ""
+        self.archive_total = 0
         self.session = ""
         self.lock = threading.Lock()  # one ledger read at a time, and its view is published before the next starts
         self.dirty = False      # set when a WAL ask or ask_resolved line was seen: read the ledger at the next tick
@@ -942,17 +943,18 @@ class Asks(Collector):
         rows: dict[str, dict] = {}
         for row in archive.classify_all(self.resolved, "ask", now):
             rows[row["id"]] = row
-        expired = [dict(r, reason="expired", evidence="until") for r in self.stale if r.get("stale") == "past its until time"]
-        for row in archive.classify_all(list(self.cleared) + expired, "cleared", now):
+        # An ask past its own `until` is not archived: it stays in the stale list, answerable.
+        for row in archive.classify_all(list(self.cleared), "cleared", now):
             rows.setdefault(row["id"], row)
         found = [r for r in rows.values() if r["bucket"] == "archived"]
         found.sort(key=lambda r: (r["at"], r["id"]), reverse=True)
+        self.archive_total = len(found)
         return found[:self.ARCHIVE_SHOWN]
 
     def snapshot(self) -> dict:
         return {"items": self.items, "resolved": self.resolved, "session": self.session, "stale": self.stale,
                 "flagged": self.flagged, "cleared": self.cleared, "swept_at": self.swept_at,
-                "archive": self.archived()}
+                "archive": self.archived(), "archive_total": self.archive_total}
 
 
 class Ledger(Collector):
@@ -970,13 +972,18 @@ class Ledger(Collector):
     MAX_GOALS = 60
     MAX_EVIDENCE = 12
     MAX_REQUIREMENTS = 1000
+    MAX_REQ_EVIDENCE = 100
+    REQ_LIMIT = 4 * 1024 * 1024  # requirements are the biggest source: a busy session must not stay stale for its size
     MAX_STATUS = 30
     STATUS_LISTS = ("verified", "live", "pending", "failed", "claimed", "blockers", "commits", "asks_open",
                     "decisions", "assumptions", "live_legacy")
 
-    def __init__(self, hub, health, runner, session_fn, root=None):
+    def __init__(self, hub, health, runner, session_fn, root=None, actions=None):
         super().__init__(hub, health)
         self.runner, self.session_fn, self.root = runner, session_fn, root
+        self.actions = actions  # req_actions.ReqActions: the user's archive and restore clicks
+        self.raw_requirements: list[dict] = []
+        self.raw_total, self.raw_truncated = 0, False
         self.parts = {name: {"stale": False, "error": "", "at": ""} for name in ("goals", "requirements", "status")}
         self.parts["goals"]["items"] = []
         self.parts["requirements"].update(items=[], total=0, truncated=False, summary=archive.summary([]))
@@ -989,12 +996,13 @@ class Ledger(Collector):
     # -- one source
     def _read(self, part: str, label: str, kind: str, args: tuple, parse, now: float) -> str:
         try:
-            code, out = self.runner.run(kind, *args, timeout=90, limit=self.LIMIT + 1)
+            cap = self.REQ_LIMIT if kind == "ah-requirements" else self.LIMIT
+            code, out = self.runner.run(kind, *args, timeout=90, limit=cap + 1)
             if code != 0:
                 raise ValueError(f"{label} exited {code}")
             raw = out.encode("utf-8", "replace") if isinstance(out, str) else bytes(out or b"")
-            if len(raw) > self.LIMIT:
-                raise ValueError(f"{label} output is over {self.LIMIT // 1024} KiB")
+            if len(raw) > cap:
+                raise ValueError(f"{label} output is over {cap // 1024} KiB")
             try:
                 data = json.loads(raw)
             except ValueError:
@@ -1032,6 +1040,7 @@ class Ledger(Collector):
     def _evidence_row(raw: dict) -> dict:
         return {"id": ev.short(raw.get("id"), 40), "kind": ev.short(raw.get("kind"), 20), "verdict": ev.short(raw.get("verdict"), 12),
                 "at": ev.short(raw.get("at"), 40), "check": ev.short(raw.get("check"), 80), "by": ev.short(raw.get("by"), 40),
+                "ticket": ev.short(raw.get("ticket"), 40), "commit": ev.short(raw.get("commit"), 40),
                 "note": ev.short(raw.get("note"), 300)}
 
     @staticmethod
@@ -1059,6 +1068,10 @@ class Ledger(Collector):
                 "evidence": evidence[:self.MAX_EVIDENCE], "evidence_total": len(evidence)})
         return {"items": items}
 
+    def overrides(self) -> dict:
+        """The user's latest archive or restore click per requirement (signed rows only; see req_actions)."""
+        return self.actions.latest() if self.actions is not None else {}
+
     def _ticket_closed(self):
         """True, False or None (unknown) per ticket, from the sweeper's own ticket cache. Reads no tickets itself."""
         if self.root is None:
@@ -1080,17 +1093,29 @@ class Ledger(Collector):
                 continue
             ticket = str(raw.get("ticket") or "")
             evidence = raw.get("evidence")
+            # every evidence record is kept for the archive rule (it sorts by time before it takes the newest)
             evidence = [self._evidence_row(e) for e in (evidence if isinstance(evidence, list) else [evidence])
-                        if isinstance(e, dict)][:5] if evidence else []
-            rows.append({"id": re.sub(r"[^A-Za-z0-9._-]", "_", str(raw["id"]))[:64], "session": ev.short(raw.get("session"), 64),
+                        if isinstance(e, dict)][:self.MAX_REQ_EVIDENCE] if evidence else []
+            full = raw.get("text") if isinstance(raw.get("text"), str) else ""
+            rid = str(raw["id"])
+            if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", rid):  # never merge two ids by rewriting them
+                rid = "x-" + hashlib.sha256(rid.encode("utf-8", "replace")).hexdigest()[:16]
+            rows.append({"id": rid, "session": ev.short(raw.get("session"), 64),
+                         "digest": archive.digest_of(rid, full),
+                         "words": hashlib.sha256(" ".join(full.split()).lower().encode("utf-8", "replace")).hexdigest(),
                          "text": ev.short(raw.get("text"), 600), "source": ev.short(raw.get("source"), 300),
                          "at": ev.short(raw.get("at"), 40),
                          "state": ev.short(raw.get("state"), 40) if isinstance(raw.get("state"), str) else "",
                          "ticket": ticket if TICKET_RE.match(ticket) else "",
                          "owner": ev.short(raw.get("owner"), 60) if raw.get("owner") else "", "evidence": evidence})
         rows.sort(key=lambda r: r["at"], reverse=True)
-        truncated = len(rows) > self.MAX_REQUIREMENTS or data.get("truncated") is True
-        classified = archive.classify_all(rows[:self.MAX_REQUIREMENTS], "requirement", time.time(), self._ticket_closed())
+        self.raw_requirements = rows
+        self.raw_total = self._int(data.get("total"), len(rows))
+        self.raw_truncated = data.get("truncated") is True
+        truncated = len(rows) > self.MAX_REQUIREMENTS or self.raw_truncated
+        classified = archive.classify_all(rows, "requirement", time.time(), self._ticket_closed(), self.overrides())
+        truncated = truncated or len(classified) > self.MAX_REQUIREMENTS
+        classified = classified[:self.MAX_REQUIREMENTS]
         return {"items": classified, "total": self._int(data.get("total"), len(rows)), "truncated": truncated,
                 "summary": archive.summary(classified)}
 
@@ -1115,6 +1140,17 @@ class Ledger(Collector):
                          "attention": names("attention"), "live": names("live"), "undisposed": names("undisposed")}
         out["since_s"], out["entries"] = self._int(data.get("since_s")), self._int(data.get("entries"))
         return out
+
+    def reclassify(self) -> None:
+        """Apply the user's latest archive and restore clicks to the rows already read: no `ah` run, one publish."""
+        if not self.raw_requirements and not self.parts["requirements"].get("at"):
+            return
+        classified = archive.classify_all(self.raw_requirements, "requirement", time.time(), self._ticket_closed(), self.overrides())
+        truncated = self.raw_truncated or len(classified) > self.MAX_REQUIREMENTS
+        classified = classified[:self.MAX_REQUIREMENTS]
+        self.parts["requirements"] = dict(self.parts["requirements"], items=classified, truncated=truncated,
+                                          total=self.raw_total, summary=archive.summary(classified))
+        self.publish()
 
     # -- publication
     def snapshot(self) -> dict:

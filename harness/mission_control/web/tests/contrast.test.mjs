@@ -21,9 +21,17 @@ for (const [name, t] of [['dark', dark], ['light', light]]) {
     assert.ok(ratio(t['accent-ink'], t.ok) >= 4.5, 'ink on ok');
     assert.ok(ratio(t['accent-ink'], t.bad) >= 4.5, 'ink on bad');
     assert.ok(ratio(t.focus, t.bg) >= 3, 'focus ring vs page');
+    for (const surface of ['bg', 'panel', 'panel-2']) assert.ok(ratio(t['line-strong'], t[surface]) >= 3, `control border on ${surface}: ${ratio(t['line-strong'], t[surface]).toFixed(2)}`);
   });
 }
 test('no text is set below 12px', () => {
   const small = [...css.matchAll(/font(?:-size)?:\s*(\d+(?:\.\d+)?)px/g)].filter(m => Number(m[1]) < 12);
   assert.deepEqual(small.map(m => m[0]), []);
+});
+
+test('the system-light path (no data-theme) gets the light tokens through theme.js, and forced-colors has its own rules', () => {
+  const theme = readFileSync(new URL('../js/theme.js', import.meta.url), 'utf8');
+  assert.match(theme, /prefers-color-scheme: light/);
+  assert.match(css, /@media \(forced-colors: active\)/);
+  assert.match(css, /@media \(max-width: 760px\)/);
 });

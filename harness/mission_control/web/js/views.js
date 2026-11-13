@@ -1,6 +1,6 @@
 // View tabs, section routing and the ledger-backed panels' mounting (goodqa#15920). One live page, no polling: every
 // repaint is driven by the store (an SSE snapshot or event) and coalesced into one animation frame.
-import { getState, subscribe, setTab, TABS } from './store.js';
+import { getState, subscribe, setTab, TABS, requirementAction } from './store.js';
 import * as v from './ledger-views.js';
 
 const SECTIONS = [
@@ -23,7 +23,24 @@ export function mountViews() {
   let ticks = 0;
 
   const ui = {
-    goalsLimit: 6, dealsLimit: 8, blockersLimit: 8, reqFilter: 'live', reqQuery: '', reqLimit: v.PAGE, archiveKind: 'all', archiveLimit: v.PAGE,
+    goalsLimit: 5, dealsLimit: 5, blockersLimit: 5, reqFilter: 'live', reqQuery: '', reqLimit: v.PAGE, archiveKind: 'all', archiveLimit: v.PAGE,
+    armed: null, draft: '', busy: false, error: '', notice: {},
+    arm(row, action) { this.armed = { id: row.id, action }; this.draft = ''; this.error = ''; this.busy = false; repaint(['requirements-body', 'archive-body'], true); },
+    cancel() { const id = this.armed?.id; this.armed = null; this.draft = ''; this.error = ''; repaint(['requirements-body', 'archive-body'], true); document.querySelector(`[data-id="${id}"] .req-action`)?.focus(); },
+    async submit(row) {
+      if (this.busy || !this.armed) return;
+      this.busy = true; this.error = '';
+      repaint(['requirements-body', 'archive-body'], true);
+      const action = this.armed.action;
+      const result = await requirementAction(row, action, this.draft);
+      this.busy = false;
+      if (result.ok) {
+        this.notice = { [row.id]: action === 'archive' ? 'Archived. It is in the Archive view; Restore brings it back.' : 'Restored to live.' };
+        this.armed = null; this.draft = '';
+        document.getElementById('requirement-announcer').textContent = `Requirement ${row.id} ${action === 'archive' ? 'archived' : 'restored'}.`;
+      } else this.error = result.message;
+      repaint(['requirements-body', 'archive-body'], true);
+    },
     set(key, value) {
       this[key] = value;
       if (key === 'reqFilter' || key === 'reqQuery') this.reqLimit = v.PAGE;

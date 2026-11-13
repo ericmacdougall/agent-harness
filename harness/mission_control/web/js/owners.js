@@ -1,6 +1,7 @@
 import { getState, subscribe, select, update, highlight } from './store.js';
 import { el, button, age, freshness, stateClass } from './ui.js';
 
+export const OWNERS_SHOWN = 8;
 const ACTIVE = /^(live|working|finishing|waiting|blocked|error|offline|observed|stale|unknown)/;
 
 // What the owner itself or a recorded disposition says, beside the ah owners state (never instead of it).
@@ -16,6 +17,7 @@ export function holdLine(owner) {
 export function mountOwners() {
   const list = document.getElementById('owners-list');
   const rows = new Map();
+  document.getElementById('owners-more').addEventListener('click', () => update({ ownersAll: !getState().ownersAll }, 'owner-filter'));
   document.getElementById('owner-filter').addEventListener('change', event => update({ ownerFilter: event.target.value }, 'owner-filter'));
   function render(state) {
     const severe = owner => owner.severe;
@@ -24,7 +26,12 @@ export function mountOwners() {
     const matches = owner => state.ownerFilter === 'all' || (state.ownerFilter === 'active' ? active(owner)
       : owner.state.startsWith(state.ownerFilter) || (state.ownerFilter === 'codex' && owner.runtime === 'codex'));
     const owners = state.owners.filter(matches)
-      .sort((a, b) => rank(a) - rank(b) || Date.parse(b.last_item.active || 0) - Date.parse(a.last_item.active || 0)).slice(0, 80);
+      .sort((a, b) => rank(a) - rank(b) || Date.parse(b.last_item.active || 0) - Date.parse(a.last_item.active || 0)).slice(0, state.ownersAll ? 80 : OWNERS_SHOWN);
+    const total = state.owners.filter(matches).length;
+    const more = document.getElementById('owners-more');
+    more.hidden = total <= OWNERS_SHOWN;
+    more.textContent = state.ownersAll ? 'Show fewer owners' : `Show all ${total} owners`;
+    more.setAttribute('aria-expanded', String(!!state.ownersAll));
     const wanted = new Set(owners.map(owner => owner.agent_id));
     for (const [id, parts] of rows) if (!wanted.has(id)) { parts.row.remove(); rows.delete(id); }
     list.querySelector('.empty-state')?.remove();
@@ -77,7 +84,7 @@ export function mountOwners() {
     if (!owners.length) list.append(el('p', 'empty-state', state.owners.length ? 'No owners in this state.' : 'Waiting for the owner list…'));
     const count = document.getElementById('owner-count');
     count.textContent = String(owners.length).padStart(2, '0');
-    count.title = `${owners.length} shown of ${state.owners.length} owners`;
+    count.title = `${owners.length} shown of ${total} matching, ${state.owners.length} owners in all`;
   }
   render(getState());
   subscribe((state, reason) => {

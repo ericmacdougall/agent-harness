@@ -1,9 +1,9 @@
 {
   "state": {"version": "internal", "started": "sources-panel", "host": "sources-panel", "initiatives": "initiatives-panel", "owners": "owners-panel",
-    "health": "health-panel", "events": "activity-panel", "chat": "chat-panel", "asks": "needs-panel", "ledger": "mission-panel", "limits": "chat-panel", "csrf": "internal"},
+    "health": "health-panel", "events": "activity-panel", "chat": "chat-panel", "asks": "needs-panel", "ledger": "mission-panel", "limits": "chat-panel", "csrf": "internal", "requirement_actions": "requirements-body"},
   "sse": {"event": "activity-panel", "initiatives": "initiatives-panel", "owners": "owners-panel", "health": "health-panel", "chat": "chat-panel",
     "codex": "chat-panel", "asks": "needs-panel", "ledger": "mission-panel"},
-  "asks": {"items": "needs-panel", "stale": "needs-panel", "flagged": "blockers-panel", "cleared": "archive", "resolved": "archive", "archive": "archive",
+  "asks": {"items": "needs-panel", "stale": "needs-panel", "flagged": "blockers-panel", "cleared": "archive", "resolved": "archive", "archive": "archive", "archive_total": "archive",
     "swept_at": "sources-panel", "session": "chat-panel"},
   "ledger": {"goals": "goals-list", "requirements": "requirements-body", "status": "deploys-panel", "generated": "sources-panel"}
 }

@@ -3,7 +3,7 @@
    below is checked at 4.5:1 or better by web/tests/contrast.test.mjs. theme.js sets data-theme before first paint. */
 :root {
   color-scheme: dark;
-  --bg: #0e1113; --panel: #151a1d; --panel-2: #1b2125; --line: #2e373c; --line-strong: #46535a;
+  --bg: #0e1113; --panel: #151a1d; --panel-2: #1b2125; --line: #2e373c; --line-strong: #6f7e86;
   --text: #e9eef0; --muted: #a9b4ba; --dim: #8f9ba2;
   --accent: #9fd8c8; --accent-ink: #0b1512; --ok: #86d9a5; --warn: #f0c36d; --bad: #ff9f9a; --info: #a4c2ff;
   --focus: #ffd866;
@@ -14,7 +14,7 @@
 }
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg: #f4f5f3; --panel: #ffffff; --panel-2: #eef1ef; --line: #d2d9d6; --line-strong: #98a6a1;
+  --bg: #f4f5f3; --panel: #ffffff; --panel-2: #eef1ef; --line: #d2d9d6; --line-strong: #6b7a74;
   --text: #14191c; --muted: #46525a; --dim: #56636a;
   --accent: #0d6652; --accent-ink: #ffffff; --ok: #146a37; --warn: #7d5200; --bad: #ac2019; --info: #1c47a6;
   --focus: #8a4b00;
@@ -391,6 +391,15 @@ dialog::backdrop { background: #000a; }
 }
 @media (max-width: 760px) {
   .shell { padding: 0 16px 24px; }
+  .panel-sub { display: none; }
+  .topbar { min-height: 48px; padding: 4px 0; }
+  .panel-heading { padding: 12px 14px 8px; }
+  .panel-body { padding: 4px 14px 14px; }
+  .tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+  .tile { padding: 8px 10px; }
+  .tile-value { font-size: 20px; }
+  .tile-label { font-size: 12px; }
+  .tile-note { display: none; }
   .two-col { grid-template-columns: minmax(0, 1fr); }
   .detail-field { grid-template-columns: 1fr; gap: 2px; }
   .topbar-tools { gap: 6px; }
@@ -410,3 +419,13 @@ body.motion-off *, body.motion-off *::before { animation: none !important; }
   .segment[aria-pressed="true"], .tabs button[aria-selected="true"] { outline: 2px solid Highlight; }
 }
 .node-label .node-short { display: none; }
+
+.req-actions { display: grid; gap: 6px; }
+.req-action { justify-self: start; min-height: 36px; padding: 0 14px; border: 1px solid var(--line-strong); border-radius: 8px; font-size: 13px; font-weight: 600; color: var(--text); }
+.req-action:hover:not(:disabled) { background: var(--panel); }
+.req-action.confirm { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.req-action.cancel { color: var(--muted); }
+.req-form { display: grid; gap: 6px; max-width: 560px; }
+.req-status, .req-notice, .count-line { font-size: 12px; color: var(--muted); }
+.count-line { margin-bottom: 4px; }
+.owners-more { margin: 4px 18px 12px; }

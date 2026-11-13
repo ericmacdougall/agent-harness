@@ -4,18 +4,20 @@
 import { el, button, age, stateClass } from './ui.js';
 import { GOAL_STATE, missionTiles, dealRows, blockerRows, archiveRows } from './adapt.js';
 
-export const PAGE = 50;
+export const PAGE = 25;  // default rows per list; "show more" adds one page
 const clip = (text, max) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
-const when = (iso, now) => (iso ? age(iso, now) : 'no time recorded');
+const when = (iso, now) => (iso ? age(iso, now) : 'time unknown');
 const daysLeft = seconds => (seconds >= 86400 ? `${Math.ceil(seconds / 86400)} d` : `${Math.max(1, Math.ceil(seconds / 3600))} h`);
 export const TARGETS = Object.freeze({ requirements: 'tab', archive: 'tab' });
 
 // A long text shows its first lines, and the whole of it one click away. Never hidden outright.
 export function longText(text, className = 'text', max = 240) {
   const wrap = el('div', className);
-  if (text.length <= max) { wrap.append(el('p', 'clamp', text || '(no text recorded)')); return wrap; }
+  if (text.length <= max) { const p = el('p', 'clamp', text || '(no text recorded)'); p.setAttribute('dir', 'auto'); wrap.append(p); return wrap; }
   const details = el('details', 'more');
-  details.append(el('summary', '', `${clip(text, max)} Show all ${text.length} characters`), el('p', 'full', text));
+  const full = el('p', 'full', text);
+  full.setAttribute('dir', 'auto');
+  details.append(el('summary', '', `${clip(text, max)} Show all ${text.length} characters`), full);
   wrap.append(details);
   return wrap;
 }
@@ -89,6 +91,7 @@ export function deals(state, ui) {
   const out = [];
   if (status.error) out.push(el('p', 'notice warn', `${status.stale ? 'Showing the last good read. ' : ''}Status: ${status.error}`));
   if (!all.length) out.push(el('p', 'empty', 'No deploys or live tests recorded in the last 12 hours.'));
+  if (all.length) out.push(el('p', 'count-line', `Showing ${Math.min(all.length, ui.dealsLimit)} of ${all.length} records from the last ${Math.round(status.since_s / 3600) || 12} hours.`));
   const list = el('ul', 'deals');
   all.slice(0, ui.dealsLimit).forEach(row => {
     const item = el('li', `deal tone-${row.tone}`);
@@ -121,18 +124,56 @@ function ruleLine(row) {
   return row.bucket === 'archived' ? `Archived · ${row.rule} ${row.rule_title || ''}`.trim() : 'Live';
 }
 
-export function requirementItem(row, now) {
+function actionArea(row, ui) {
+  const area = el('div', 'req-actions');
+  const action = row.bucket === 'archived' ? 'restore' : 'archive';
+  const armed = ui.armed && ui.armed.id === row.id ? ui.armed : null;
+  if (!armed) {
+    const open = button('req-action', action === 'archive' ? 'Archive…' : 'Restore…', () => ui.arm?.(row, action));
+    open.setAttribute('aria-label', `${action === 'archive' ? 'Archive' : 'Restore'} requirement ${row.id}`);
+    area.append(open);
+    if (ui.notice?.[row.id]) area.append(el('span', 'req-notice', ui.notice[row.id]));
+    return area;
+  }
+  const form = el('form', 'req-form');
+  const input = el('textarea');
+  input.id = `req-reason-${row.id}`;
+  input.rows = 2;
+  input.maxLength = 300;
+  input.value = ui.draft || '';
+  const label = el('label', 'needs-label', armed.action === 'archive' ? 'Why are you archiving this? (required, recorded with your click)' : 'Why are you restoring this? (required, recorded with your click)');
+  label.htmlFor = input.id;
+  const confirm = el('button', `req-action confirm ${armed.action}`, armed.action === 'archive' ? 'Confirm archive' : 'Confirm restore');
+  confirm.type = 'submit';
+  confirm.disabled = !input.value.trim() || !!ui.busy;
+  confirm.setAttribute('aria-label', `Confirm ${armed.action} of requirement ${row.id}`);
+  input.addEventListener('input', () => { ui.draft = input.value; confirm.disabled = !input.value.trim() || !!ui.busy; });
+  const cancel = button('req-action cancel', 'Cancel', () => ui.cancel?.());
+  const buttons = el('div', 'needs-actions');
+  buttons.append(confirm, cancel);
+  form.append(label, input, buttons);
+  form.addEventListener('submit', event => { event.preventDefault(); if (!confirm.disabled) ui.submit?.(row); });
+  area.append(form);
+  const status = el('p', 'req-status', ui.busy ? 'Recording…' : ui.error || 'Nothing is deleted. The row moves between Requirements and Archive, and the click is logged.');
+  status.setAttribute('role', 'status');
+  area.append(status);
+  return area;
+}
+
+export function requirementItem(row, now, ui = {}) {
   const item = el('li', `req ${row.bucket}`);
   item.dataset.id = row.id;
   const top = el('div', 'req-top');
   top.append(badge(ruleLine(row), row.bucket === 'archived' ? 'archived' : 'live'), el('span', 'req-id', row.id), el('time', 'req-age', when(row.at, now)));
   item.append(top, longText(row.text, 'req-text', 300));
-  const meta = [row.source ? `Source: ${row.source}` : '', row.owner ? `owner ${row.owner}` : '', row.ticket].filter(Boolean).join(' · ');
-  if (meta) item.append(el('p', 'req-meta', meta));
+  const meta = [`Source: ${row.source || 'unknown'}`, row.owner ? `owner ${row.owner}` : 'no owner recorded', row.ticket || 'no ticket'].join(' · ');
+  item.append(el('p', 'req-meta', meta));
   item.append(el('p', 'req-why', `${row.bucket === 'archived' ? 'Archived because' : 'Live because'}: ${row.reason}${row.evidence_ref ? ` (evidence ${row.evidence_ref})` : ''}`));
   if (row.bucket === 'live' && row.expires_in_s != null) {
-    item.append(el('p', 'req-expiry', `Moves to the archive in ${daysLeft(row.expires_in_s)} unless an owner, ticket or evidence is recorded.`));
+    item.append(el('p', 'req-expiry', `ASSUMPTION: moves to the archive in ${daysLeft(row.expires_in_s)} (30 days with no owner, ticket or evidence, and not sourced to you) unless one is recorded.`));
   }
+  if (row.unowned_note) item.append(el('p', 'req-expiry', row.unowned_note));
+  item.append(actionArea(row, ui));
   return item;
 }
 
@@ -160,13 +201,13 @@ export function requirements(state, ui) {
   const matches = part.items.filter(r => (ui.reqFilter === 'all' || r.bucket === ui.reqFilter) && (!query || r.text.toLowerCase().includes(query) || r.id.toLowerCase().includes(query)));
   if (!matches.length) out.push(el('p', 'empty', part.items.length ? 'No requirements match.' : part.error ? 'The requirements could not be read.' : 'No requirements recorded.'));
   const list = el('ul', 'req-list');
-  matches.slice(0, ui.reqLimit).forEach(row => list.append(requirementItem(row, state.now)));
+  matches.slice(0, ui.reqLimit).forEach(row => list.append(requirementItem(row, state.now, ui)));
   out.push(list);
   if (matches.length > ui.reqLimit) out.push(button('more-button', `Show ${Math.min(PAGE, matches.length - ui.reqLimit)} more of ${matches.length - ui.reqLimit}`, () => ui.more('reqLimit')));
   return out;
 }
 
-export function archiveItem(row, now) {
+export function archiveItem(row, now, ui = {}) {
   const item = el('li', `req archived kind-${row.kind}`);
   item.dataset.id = row.id;
   const top = el('div', 'req-top');
@@ -174,21 +215,24 @@ export function archiveItem(row, now) {
   item.append(top, longText(row.text, 'req-text', 300));
   item.append(el('p', 'req-why', `Archived because: ${row.reason}${row.evidence_ref ? ` (evidence ${row.evidence_ref})` : ''}`));
   const prov = row.kind === 'ask'
-    ? [row.owner ? `registered by ${row.owner}` : '', row.ticket, row.decision ? `decision ${row.decision}` : '', row.resolution ? `resolution: ${row.resolution}` : '', row.ask_reason ? `asked because: ${row.ask_reason}` : '']
-    : [row.source ? `Source: ${row.source}` : '', row.owner ? `owner ${row.owner}` : '', row.ticket];
+    ? [`registered by ${row.owner || 'unknown'}`, row.ticket, row.decision ? `decision ${row.decision}` : '', row.resolution ? `resolution: ${row.resolution}` : '', row.ask_reason ? `asked because: ${row.ask_reason}` : '']
+    : [`Source: ${row.source || 'unknown'}`, row.owner ? `owner ${row.owner}` : 'no owner recorded', row.ticket];
   const line = prov.filter(Boolean).join(' · ');
   if (line) item.append(el('p', 'req-meta', line));
+  if (row.kind === 'requirement') item.append(actionArea(row, ui));
   return item;
 }
 
 export function archive(state, ui) {
   const rows = archiveRows(state.asksArchive, state.ledger.requirements.items);
   const kinds = { all: rows.length, ask: rows.filter(r => r.kind === 'ask').length, requirement: rows.filter(r => r.kind === 'requirement').length };
-  const out = [filterBar('archive-kind', 'Show archived items', [['all', `All ${kinds.all}`], ['ask', `Asks ${kinds.ask}`], ['requirement', `Requirements ${kinds.requirement}`]], ui.archiveKind, key => ui.set('archiveKind', key))];
+  const out = [];
+  if (state.asksArchiveTotal > state.asksArchive.length) out.push(el('p', 'notice', `Showing the newest ${state.asksArchive.length} of ${state.asksArchiveTotal} archived asks. The rest are in the asks ledger (provenance.py asks).`));
+  out.push(filterBar('archive-kind', 'Show archived items', [['all', `All ${kinds.all}`], ['ask', `Asks ${kinds.ask}`], ['requirement', `Requirements ${kinds.requirement}`]], ui.archiveKind, key => ui.set('archiveKind', key)));
   const matches = rows.filter(r => ui.archiveKind === 'all' || r.kind === ui.archiveKind);
   if (!matches.length) out.push(el('p', 'empty', 'Nothing is archived.'));
   const list = el('ul', 'req-list');
-  matches.slice(0, ui.archiveLimit).forEach(row => list.append(archiveItem(row, state.now)));
+  matches.slice(0, ui.archiveLimit).forEach(row => list.append(archiveItem(row, state.now, ui)));
   out.push(list);
   if (matches.length > ui.archiveLimit) out.push(button('more-button', `Show ${Math.min(PAGE, matches.length - ui.archiveLimit)} more of ${matches.length - ui.archiveLimit}`, () => ui.more('archiveLimit')));
   return out;
@@ -196,6 +240,8 @@ export function archive(state, ui) {
 
 // Every dataset the server holds, where it is shown, and how fresh it is. The honest list of what has no UI is at the end.
 export const GAPS = Object.freeze([
+  'Requirements of earlier sessions: only main\'s current session is read.',
+  'Who registered a requirement: ah requirements has an owner field, always empty today, shown as no owner recorded.',
   'Peer-review receipts: Mission Control has no read path for them.',
   'Full ticket comment threads: only checkpoint comments arrive, as feed events.',
   'Release-kit deploy records outside the WALs: no read path.',

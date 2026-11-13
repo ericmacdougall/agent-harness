@@ -116,3 +116,92 @@ test('coverage map names a UI section for every state key, SSE event and ledger 
   const sse = [...live.matchAll(/addEventListener\('([a-z]+)', message/g)].map(m => m[1]);
   assert.deepEqual(sse.sort(), Object.keys(map.sse).sort());
 });
+
+// ---- spec v2 additions
+const SENT = n => `SENTINEL_${n}`;
+test('every ledger field the server sends is rendered: a unique sentinel per field is found in its section', () => {
+  const ev = { id: SENT('evid'), kind: 'live_test', verdict: 'PASS', at: iso(60), check: SENT('evcheck'), note: SENT('evnote'), by: SENT('evby') };
+  const s = {
+    now: NOW, events: [], asks: [], messages: [], decisions: {}, initiatives: [], owners: [], asksFlagged: [], asksArchive: [], asksArchiveTotal: 0, asksStale: [], sessions: [],
+    ledger: ledger({
+      goals: { items: [{ id: 'g', title: SENT('gtitle'), target: SENT('gtarget'), ticket: 'goodqa#1', state: 'IN_PROGRESS', priority: 2, owners: [SENT('gowner')], deferral: SENT('gdefer'), evidence: [ev], problems: { missing: 2 } }] },
+      requirements: { items: [{ id: 'r', text: SENT('rtext'), source: SENT('rsource'), owner: SENT('rowner'), ticket: 'goodqa#2', at: iso(5), bucket: 'archived', rule: 'R1', reason: SENT('rreason'), evidence_ref: SENT('rref') }] },
+      status: { verified: [{ id: 'v', note: SENT('vnote'), check: SENT('vcheck'), agent: SENT('vagent'), at: iso(5), verdict: 'PASS' }], live: [{ id: 'l', note: SENT('lnote'), at: iso(6) }],
+        failed: [{ id: 'f', note: SENT('fnote'), at: iso(7), verdict: 'FAIL' }], pending: [{ id: 'p', note: SENT('pnote'), at: iso(8) }], blockers: [{ id: 'b', note: SENT('bnote'), agent: SENT('bagent'), at: iso(4) }] },
+    }),
+  };
+  const sections = { goals: v.goals(s, ui), deals: v.deals(s, { ...ui, dealsLimit: 50 }), blockers: v.blockers(s, ui), requirements: v.requirements(s, ui), archive: v.archive(s, ui) };
+  const want = {
+    goals: ['gtitle', 'gtarget', 'gowner', 'gdefer', 'evcheck', 'evnote'], deals: ['vnote', 'vcheck', 'lnote', 'fnote', 'pnote'], blockers: ['bnote', 'bagent'],
+    requirements: ['rtext', 'rsource', 'rowner', 'rreason', 'rref'], archive: ['rtext', 'rsource', 'rreason', 'rref'],
+  };
+  for (const [name, keys] of Object.entries(want)) for (const k of keys) assert.ok(text(sections[name]).includes(SENT(k)), `${name} lacks ${k}`);
+  assert.match(text(sections.goals), /Ledger problems: 2 missing/);
+});
+
+test('missing who, when or source shows "unknown", never a blank', () => {
+  const s = { now: NOW, ledger: ledger({ requirements: { items: [{ id: 'r', text: 'x', bucket: 'live', reason: 'open' }, { id: 'r2', text: 'y', bucket: 'archived', rule: 'R1', reason: 'done' }] } }), asksArchive: [{ id: 'wa', text: 'z', rule: 'R1', reason: 'done' }], asksArchiveTotal: 1 };
+  const t = text([...v.requirements(s, { ...ui, reqFilter: 'all' }), ...v.archive(s, ui)]);
+  assert.match(t, /Source: unknown/);
+  assert.match(t, /time unknown/);
+  assert.match(t, /no owner recorded/);
+  assert.match(t, /registered by unknown/);
+});
+
+test('calm defaults: five goals, five deploys, five blockers and one page of requirements, with the rest behind a button', () => {
+  const many = n => Array.from({ length: n }, (_, i) => ({ id: `i${i}`, note: `n${i}`, at: iso(i), verdict: 'PASS', check: `c${i}` }));
+  const s = { now: NOW, events: [], owners: [], initiatives: [], asksFlagged: [], asksArchive: [], asksArchiveTotal: 0,
+    ledger: ledger({ goals: { items: many(40).map(r => ({ id: r.id, title: r.note, state: 'UNKNOWN', evidence: [] })) },
+      requirements: { items: many(200).map(r => ({ id: r.id, text: r.note, at: r.at, bucket: 'live', reason: 'x' })) }, status: { verified: many(40), blockers: many(40) } }) };
+  const count = (nodes, cls) => walk(nodes).filter(n => n.className.split(' ').includes(cls)).length;
+  assert.equal(count(v.goals(s, { ...ui, goalsLimit: 5 }), 'goal'), 5);
+  assert.equal(count(v.deals(s, { ...ui, dealsLimit: 5 }), 'deal'), 5);
+  assert.equal(count(v.blockers(s, { ...ui, blockersLimit: 5 }), 'blocker'), 5);
+  assert.equal(count(v.requirements(s, { ...ui, reqFilter: 'live' }), 'req'), 25);
+  assert.match(text(v.goals(s, { ...ui, goalsLimit: 5 })), /Show 35 more goals/);
+  const views = readFileSync(`${here}js/views.js`, 'utf8');
+  assert.match(views, /goalsLimit: 5, dealsLimit: 5, blockersLimit: 5/);
+  assert.equal(v.PAGE, 25);
+  assert.match(readFileSync(`${here}js/owners.js`, 'utf8'), /OWNERS_SHOWN = 8/);
+  assert.match(readFileSync(`${here}js/needs.js`, 'utf8'), /ASKS_SHOWN = 5/);
+});
+
+test('details are collapsed by default and nothing is open on first render', () => {
+  const s = hostile('plain');
+  const nodes = [...v.goals(s, ui), ...v.requirements(s, ui), ...v.archive(s, ui)];
+  const open = walk(nodes).filter(n => n.tagName === 'DETAILS' && n.open === true);
+  assert.equal(open.length, 0);
+  assert.ok(!/<details[^>]* open/.test(html.replace(/<details id="needs-[a-z]+"[^>]*hidden>/g, '')), 'no details starts open in the page');
+});
+
+test('Archive and Restore are explicit: a button, then a reason, then a confirm that stays disabled until there is a reason', () => {
+  const calls = [];
+  const row = ledger({ requirements: { items: [{ id: 'r1', text: 'x', bucket: 'live', reason: 'open', digest: 'abc' }] } }).requirements.items[0];
+  const idle = v.requirementItem(row, NOW, { arm: (r, a) => calls.push(['arm', r.id, a]) });
+  const open = walk(idle).find(n => n.tagName === 'BUTTON' && n.attrs['aria-label'] === 'Archive requirement r1');
+  assert.ok(open && !walk(idle).some(n => n.tagName === 'TEXTAREA'));
+  open.click();
+  assert.deepEqual(calls, [['arm', 'r1', 'archive']]);
+  const armed = v.requirementItem(row, NOW, { armed: { id: 'r1', action: 'archive' }, draft: '', submit: r => calls.push(['submit', r.id]) });
+  const confirm = walk(armed).find(n => n.tagName === 'BUTTON' && /^Confirm archive/.test(n.attrs['aria-label']));
+  assert.equal(confirm.disabled, true);
+  assert.ok(walk(armed).some(n => n.tagName === 'TEXTAREA' && n.maxLength === 300));
+  const withReason = v.requirementItem(row, NOW, { armed: { id: 'r1', action: 'archive' }, draft: 'because' });
+  assert.equal(walk(withReason).find(n => /^Confirm archive/.test(n.attrs['aria-label'] || '')).disabled, false);
+  const archived = ledger({ requirements: { items: [{ id: 'r2', text: 'x', bucket: 'archived', rule: 'M', reason: 'by you', digest: 'abc' }] } }).requirements.items[0];
+  assert.ok(walk(v.requirementItem(archived, NOW, {})).some(n => n.attrs['aria-label'] === 'Restore requirement r2'));
+});
+
+test('every sink that could turn data into markup, script or a link is absent from the scripts', () => {
+  const sinks = ['innerHTML', 'outerHTML', 'insertAdjacentHTML', 'document.write', 'eval(', 'new Function', 'DOMParser', 'srcdoc', 'cssText', 'window.open', 'location.href', 'location.assign', 'createContextualFragment'];
+  for (const f of readdirSync(`${here}js`)) {
+    const src = readFileSync(`${here}js/${f}`, 'utf8');
+    for (const sink of sinks) assert.ok(!src.includes(sink), `${f} uses ${sink}`);
+    assert.ok(!/setAttribute\(\s*['"`](on[a-z]+|href|src|srcdoc|style)['"`]/i.test(src), `${f} sets a dangerous attribute`);
+  }
+});
+
+test('requirement text is isolated for bidirectional scripts (dir=auto)', () => {
+  const node = v.longText('‮evil', 'x', 240);
+  assert.ok(walk(node).some(n => n.attrs.dir === 'auto'));
+});

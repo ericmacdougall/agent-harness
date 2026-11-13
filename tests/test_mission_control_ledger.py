@@ -108,9 +108,10 @@ class LedgerCollector(unittest.TestCase):
         ledger.run(1000.0)
         reqs = {r["id"]: r for r in hub.snapshots["ledger"]["requirements"]["items"]}
         self.assertEqual(reqs["wr1"]["bucket"], "live")
-        self.assertEqual((reqs["wr2"]["bucket"], reqs["wr2"]["rule"]), ("archived", "R4"))
+        self.assertEqual(reqs["wr2"]["bucket"], "live")  # user-sourced: age never archives it
+        self.assertIn("yours", reqs["wr2"]["unowned_note"])
         self.assertEqual((reqs["wr3"]["bucket"], reqs["wr3"]["rule"]), ("archived", "R1"))
-        self.assertEqual(hub.snapshots["ledger"]["requirements"]["summary"], {"live": 1, "archived": 2, "rules": {"R1": 1, "R4": 1, "live": 1}})
+        self.assertEqual(hub.snapshots["ledger"]["requirements"]["summary"], {"live": 2, "archived": 1, "rules": {"R1": 1, "live": 2}})
         self.assertEqual(hub.snapshots["ledger"]["requirements"]["total"], 3)
 
     def test_markup_is_kept_as_plain_text(self):
@@ -170,11 +171,21 @@ class LedgerCollector(unittest.TestCase):
         self.assertLess(len(json.dumps(snap)), 2 * 1024 * 1024)
 
     def test_oversize_output_is_refused_not_truncated_into_valid_data(self):
-        runner = Fake(reqs=json.dumps(REQS) + " " * (col.Ledger.LIMIT + 10))
+        runner = Fake(reqs=json.dumps(REQS) + " " * (col.Ledger.REQ_LIMIT + 10))
         ledger, hub, _ = make(runner)
         ledger.run(1000.0)
         self.assertEqual(hub.snapshots["ledger"]["requirements"]["items"], [])
         self.assertIn("ah requirements", hub.snapshots["ledger"]["requirements"]["error"])
+
+    def test_a_two_mib_requirements_read_is_paged_not_stale(self):
+        reqs = dict(REQS, total=4000, requirements=[
+            {"id": f"w{i:06d}", "session": SID, "text": "t%d " % i + "A" * 480, "at": iso(i), "state": "recorded"} for i in range(4000)])
+        self.assertGreater(len(json.dumps(reqs)), 2 * 1024 * 1024 - 400000)
+        ledger, hub, health = make(Fake(reqs=reqs))
+        ledger.run(1000.0)
+        part = hub.snapshots["ledger"]["requirements"]
+        self.assertFalse(part["stale"] or part["error"], part["error"])
+        self.assertEqual((len(part["items"]), part["truncated"], part["total"]), (col.Ledger.MAX_REQUIREMENTS, True, 4000))
 
     def test_no_session_reads_goals_only(self):
         runner = Fake()
@@ -227,7 +238,7 @@ class ServerIntegration(unittest.TestCase):
         cookie, _ = self.h.login()
         resp, data = self.h.request("GET", "/api/state", {"Cookie": cookie, "Sec-Fetch-Site": "same-origin"})
         state = json.loads(data)
-        self.assertEqual(state["ledger"]["requirements"]["summary"]["archived"], 2)
+        self.assertEqual(state["ledger"]["requirements"]["summary"]["archived"], 1)
         self.assertEqual(state["ledger"]["goals"]["items"][0]["id"], "leads")
         self.assertIn("ledger", [r["name"] for r in state["health"]])
 
@@ -264,7 +275,8 @@ class AsksArchive(unittest.TestCase):
         self.assertEqual([a["id"] for a in snap["items"]], ["wlive0000001"])
         rules = {a["id"]: (a["rule"], a["bucket"]) for a in snap["archive"]}
         self.assertEqual(rules["wres00000001"], ("R1", "archived"))
-        self.assertEqual(rules["wuntil000001"], ("R4", "archived"))
+        self.assertNotIn("wuntil000001", rules)  # past its until: still live, answerable, in the stale list
+        self.assertIn("wuntil000001", [a["id"] for a in snap["items"] + snap["stale"]])
         self.assertIn("answered by the user: yes", next(a for a in snap["archive"] if a["id"] == "wres00000001")["reason"])
         self.assertEqual([a["id"] for a in snap["resolved"]], ["wres00000001"])  # the original lists are untouched
 

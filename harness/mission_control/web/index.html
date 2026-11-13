@@ -55,6 +55,7 @@
             <section id="owners-panel" class="panel" tabindex="-1" aria-labelledby="owners-heading">
               <header class="panel-heading"><div><h2 id="owners-heading">Live owners and streams <span id="owner-count" class="count-badge"></span></h2><p class="panel-sub">The age beside each owner is its heartbeat: time since it last wrote.</p></div><label class="sr-only" for="owner-filter">Filter owners by state</label><select id="owner-filter" class="compact-select"><option value="active" selected>Live + attention</option><option value="all">All owners</option><option value="live">Live</option><option value="DROPPED">Dropped</option><option value="SILENT">Silent</option><option value="finishing">Finishing</option><option value="codex">Codex</option><option value="returned">Returned</option><option value="done">Done</option></select></header>
               <div id="owners-list" class="panel-scroll owners-list"></div>
+              <button id="owners-more" class="more-button owners-more" type="button" aria-expanded="false" hidden></button>
               <div class="owner-legend"><span><i class="status-dot"></i>under 5 min</span><span><i class="status-dot warm"></i>under 30 min</span><span><i class="status-dot stale"></i>30 min or more</span></div>
             </section>
 
@@ -63,6 +64,7 @@
               <div class="panel-scroll needs-scroll">
                 <p class="needs-intro"><strong>Approve</strong> or <strong>Deny</strong> records your decision on exactly the text shown; a reply sends main your own words. Guarded actions (other sessions’ processes, production deletion, credentials, top-rung models) still get your word in the terminal. The questions are written by agents.</p>
                 <ul id="needs-list" class="needs-list"></ul>
+                <button id="needs-more" class="more-button" type="button" aria-expanded="false" hidden></button>
                 <details id="needs-stale" class="needs-history" hidden><summary>Stale · open with no activity <span id="needs-stale-count" class="count-badge">0</span></summary><p class="needs-section-note">Still open and still yours to answer. Nothing has happened on them for three days.</p><ul id="needs-stale-list" class="needs-list"></ul></details>
                 <details id="needs-flagged" class="needs-history" hidden><summary><span class="needs-flag">Untraceable</span> · not shown as valid asks <span id="needs-flagged-count" class="count-badge">0</span></summary><p class="needs-section-note">These do not trace to a real source, so they cannot be decided or answered here. Main has to restate them with their source.</p><ul id="needs-flagged-list" class="needs-list"></ul></details>
               </div>
@@ -86,7 +88,7 @@
             <header class="panel-heading"><div><h2 id="requirements-heading">Requirements</h2><p class="panel-sub">Each requirement is live or archived by one fixed rule, and says why. Nothing is deleted.</p></div>
               <label class="search"><span class="sr-only">Search requirements</span><input id="req-search" type="search" placeholder="Search requirements" autocomplete="off"></label></header>
             <details class="disclosure rules"><summary>How the archive rule works</summary>
-              <ol><li><b>R1 terminal state</b>: the record says resolved, closed, done, superseded, expired, declined or withdrawn.</li><li><b>R2 proven or closed</b>: the newest deploy or live test is PASS, or its ticket is closed. FAIL or unknown never archives.</li><li><b>R3 superseded</b>: a newer record in the same session has the same words.</li><li><b>R4 expired</b>: an ask is past its own deadline, or a requirement is over 30 days old with no owner, ticket or evidence (the 30 days is an assumption, shown on the row before it applies).</li></ol>
+              <ol><li><b>M archived by you</b>: you archived it with the button on the row, with a reason. A restore keeps it live whatever the rules say. Both are recorded (who, when, why) and neither deletes anything.</li><li><b>R1 terminal state</b>: the record says resolved, closed, done, superseded, expired, declined or withdrawn.</li><li><b>R2 done live</b>: a deploy and a live test for the same ticket or commit, the newest of each by time, the test passing and not older than the deploy; or its ticket is closed. A local test pass, a lone deploy or a failing test never archives.</li><li><b>R3 superseded</b>: a newer record in the same session has exactly the same words and is itself live. Near-duplicates stay live.</li><li><b>R4 expired</b>: a requirement over 30 days old with no owner, ticket or evidence that is not sourced to you (the 30 days is an assumption). Anything you said yourself is never archived by age. An ask is never archived by age or deadline: an ask past its deadline stays in Needs you.</li></ol>
               <p>Anything else is live. The first matching rule wins, and a reopened ticket or newer failing evidence brings the item back on the next read.</p></details>
             <div id="requirements-body" class="panel-body"></div>
           </section>
@@ -161,6 +163,7 @@
   <div id="activity-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
   <div id="chat-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
   <div id="needs-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+  <div id="requirement-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
   <div id="connection-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
   <noscript><div class="noscript">Mission Control needs JavaScript to show your fleet.</div></noscript>
   <script type="module" src="./js/main.js"></script>
