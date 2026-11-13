@@ -4656,12 +4656,64 @@ class Analyzer:
     def _count_only(args):
         return bool(_flag_letters(args) & set('cqlL') or _longs(args) & {'--count', '--quiet', '--silent', '--files-with-matches', '--files-without-match', '--files'})
 
+    @staticmethod
+    def _grep_directories_recurse(texts):
+        """grep -d recurse, -drecurse, --directories=recurse and --directories recurse all walk the directory like -r."""
+        for i, t in enumerate(texts):
+            if t in ('-d', '--directories') and i + 1 < len(texts) and texts[i + 1] == 'recurse':
+                return True
+            if t in ('-drecurse', '--directories=recurse'):
+                return True
+        return False
+
+    @staticmethod
+    def _local_destinations(name, args):
+        """The words of a copy or archive command that only DESTINATION a write or name an extraction target, never a source
+        that is read: the last operand of scp, rsync and sftp, the value of wget -P and -O, curl -o and -D, tar -C in extract or
+        list mode, every operand of tar, bsdtar, gtar and pax in extract or list mode, and the first operand (the archive)
+        of zip and 7z. They are still judged as files by name; only the ancestor-or-equal directory rule skips them."""
+        words, texts = list(args), [a.text for a in args]
+        skip = []
+        if name in ('scp', 'rsync', 'sftp'):
+            operands = [w for w in words if not w.text.startswith('-')]
+            if len(operands) >= 2:
+                skip.append(operands[-1])
+        elif name in ('wget', 'curl'):
+            flags = ('-P', '--directory-prefix', '-O', '--output-document', '-o', '--output', '-D', '--dump-header', '-c', '--cookie-jar')
+            for i, t in enumerate(texts[:-1]):
+                if t in flags:
+                    skip.append(words[i + 1])
+        elif name in ('tar', 'bsdtar', 'gtar', 'pax'):
+            letters = _flag_letters(args)
+            first = texts[0] if texts else ''
+            old_style = set(first) if first and not first.startswith('-') and re.fullmatch(r'[A-Za-z]+', first) else set()
+            letters = set(letters) | old_style
+            longs = _longs(args)
+            create = bool(letters & set('cru')) or bool(longs & {'--create', '--append', '--update'}) or (name == 'pax' and 'w' in letters)
+            reading = bool(letters & set('xt')) or bool(longs & {'--extract', '--get', '--list', '--diff', '--compare'}) or (name == 'pax' and 'r' in letters and 'w' not in letters)
+            if reading and not create:
+                skip.extend(words)  # extract or list: nothing named here is read as a source tree
+        elif name in ('zip', '7z', '7za', '7zr'):
+            operands = [w for w in words if not w.text.startswith('-') and w.text not in ('a', 'u', 'd', 'x', 'e', 'l', 't')]
+            if operands:
+                skip.append(operands[0])
+        return skip
+
     def read_creds(self, name, args, pl, idx):
         ctx = self.ctx
         texts = [a.text for a in args]
         words = list(args)
         if name in GREP_CMDS:
-            skip_next = {'-e', '-f', '-m', '-A', '-B', '-C', '--regexp', '--file', '--max-count', '--include', '--exclude', '-g', '--glob'}
+            skip_next = {'-e', '-f', '-m', '-A', '-B', '-C', '--regexp', '--file', '--max-count', '--include', '--exclude', '-g', '--glob',
+                         '--exclude-dir', '--exclude-from', '--include-dir', '--label', '--context', '--after-context', '--before-context'}
+            if name in ('grep', 'egrep', 'fgrep', 'zgrep'):
+                skip_next |= {'-d', '-D', '--directories', '--devices'}  # grep -d ACTION, -D ACTION take a separate value
+            elif name == 'rg':
+                skip_next |= {'-t', '-T', '--type', '--type-not', '--type-add', '--max-depth', '--maxdepth', '-j', '--threads', '-M',
+                              '--max-columns', '--max-filesize', '-E', '--encoding', '--sort', '--sortr', '--iglob', '--ignore-file',
+                              '--pre', '--pre-glob', '--replace', '-r', '--colors', '--context-separator', '--path-separator'}
+            elif name == 'ag':
+                skip_next |= {'--depth', '-G', '--file-search-regex', '-p', '--path-to-ignore', '-W', '--width', '--ignore', '-A', '-B'}
             kept, i, pattern_taken = [], 0, any(t in ('-e', '--regexp', '-f', '--file') or t.startswith('--regexp=') for t in texts)
             while i < len(words):
                 t = words[i].text
@@ -4686,7 +4738,8 @@ class Analyzer:
             words = words[1:] if words else words  # first positional is the program
         if name in EXFIL_CMDS:
             words = [w for w in args]
-        recursive = name in GREP_CMDS and (_flag_letters(args) & set('rR') or name in ('rg', 'ag', 'ack') or '--recursive' in _longs(args))
+        recursive = name in GREP_CMDS and (_flag_letters(args) & set('rR') or name in ('rg', 'ag', 'ack') or '--recursive' in _longs(args)
+                                          or self._grep_directories_recurse(texts))
         reads_stdin = idx > 0 and name in ('rg', 'ag', 'ack')  # a piped rg reads stdin; GNU grep -r with no operand still walks the directory
         if recursive and not words and not reads_stdin and self.under_cred_parent(ctx.cwd, below=True):
             # a recursive search with no path operand searches the working directory: `cd ~/.config/goodqa && rg .`, or any
@@ -4697,6 +4750,7 @@ class Analyzer:
                         '`%s` with no path searches the working directory, which holds or contains a credential file' % name,
                         'name a path outside the credential directories, or search with `grep -c` / `rg -c` to count')
                 return
+        destinations = self._local_destinations(name, args) if name in ARCHIVE_CMDS or name in EXFIL_CMDS else []
         for w in words:
             t = w.text
             if name in EXFIL_CMDS:
@@ -4708,7 +4762,7 @@ class Analyzer:
                     continue
             hit = self.is_cred_path(t, w) if t == w.text else self._cred_one(t)
             dir_hit = recursive and self.under_cred_dir(norm_path(t, ctx), or_above=True)
-            if not dir_hit and (recursive or name in ARCHIVE_CMDS or name in EXFIL_CMDS):
+            if not dir_hit and (recursive or name in ARCHIVE_CMDS or name in EXFIL_CMDS) and not any(w is d for d in destinations):
                 dir_hit = self.under_cred_parent(norm_path(t, ctx), below=True)  # the directory, an ancestor, or a key directory inside (config.json excepted)
             if hit or dir_hit:
                 ctx.secret_seen += 1

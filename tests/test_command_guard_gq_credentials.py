@@ -47,7 +47,19 @@ DIRECTORY_NEIGHBOURS = ["grep -rc . ~/.config/goodqa", "grep -r . ~/.config/good
                         "find ~/.config/goodqa -name config.json", "find ~/.config/goodqa -maxdepth 1 -print",
                         "tar tf backup.tar", "grep -r token docs", "scp host:~/x /tmp/x",
                         "cd ~/project && rg .", "cd /tmp && grep -r tok", "cat data.txt | rg tok", "cd ~ && rg --files", "cd ~ && echo x | rg tok","cd ~/.config/goodqa && rg -c .",
-                        "cd ~/.config/goodqa && ls", "gzip -k notes.txt", "xz -9 build.log", "bsdtar tf archive.tar"]
+                        "cd ~/.config/goodqa && ls", "gzip -k notes.txt", "xz -9 build.log", "bsdtar tf archive.tar",
+                        # a home directory or the root as a DESTINATION or an extraction target is not a read (receipt r3 F1)
+                        "scp host:file ~/", "scp host:file .", "rsync -a host:dotfiles/ ~/", "rsync -a host:x/ ~/.config/", "wget -P ~ http://example.com/x",
+                        "wget --directory-prefix=~ http://example.com/x", "curl -o ~/x.txt http://example.com/x",
+                        "tar -xzf pkg.tgz -C ~", "tar -xf x.tar -C /", "tar xzf pkg.tgz -C ~", "tar -tf pkg.tgz -C ~", "bsdtar -xf x.tar -C ~",
+                        "pax -r -f x.tar", "unzip x.zip -d ~", "zip ~/out.zip project.txt"]
+# a search whose option takes a separate value still has no path operand (receipt r3 F2)
+NO_PATH_OPTIONS = ["cd ~ && rg --max-depth 6 token", "cd ~ && rg -t py token", "cd ~ && rg -T py token", "cd ~ && rg --type py token",
+                   "cd ~ && rg -j 4 token", "cd ~ && rg -M 200 token", "cd ~ && grep -r --exclude-dir node_modules tok",
+                   "cd ~ && grep -r -D skip tok", "cd ~ && grep -d recurse tok", "cd ~ && grep --directories=recurse tok",
+                   "cd ~/.config/goodqa && grep -d recurse .", "grep -d recurse tok ~/.config/goodqa", "cd ~ && ag --depth 5 tok"]
+NO_PATH_NEIGHBOURS = ["cd ~/project && rg --max-depth 6 token", "cd ~ && rg -c --max-depth 6 token", "cd ~ && grep -d skip tok file.txt",
+                      "cd ~ && echo x | rg -t py token", "cd ~ && grep tok file.txt"]
 RULE = "[secret_dump/"
 
 
@@ -77,6 +89,16 @@ class GoodqaCredentialPaths(unittest.TestCase):
         for command in DIRECTORIES:
             with self.subTest(command):
                 self.blocked_by_the_credential_rule(command)
+
+    def test_a_search_with_no_path_is_judged_even_when_an_option_takes_a_separate_value(self):
+        for command in NO_PATH_OPTIONS:
+            with self.subTest(command):
+                self.blocked_by_the_credential_rule(command)
+
+    def test_those_options_in_a_harmless_directory_or_with_a_file_stay_allowed(self):
+        for command in NO_PATH_NEIGHBOURS:
+            with self.subTest(command):
+                self.assertNotEqual(self.verdict(command), "block", command)
 
     def test_directory_commands_that_do_not_print_a_secret_stay_allowed(self):
         for command in DIRECTORY_NEIGHBOURS:
