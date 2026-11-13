@@ -13,7 +13,10 @@ TEST = "tests.test_worktree_inuse"
 GUARD = "command_guard.py"
 
 MUTANTS = {
-    "an unreadable process always blocks": ("if unreadable_verdict(entry, status['name'], path, created) is None:", "if False:"),
+    "an unreadable process always blocks": ("if int(entry) in ancestors or unreadable_verdict(entry, status['name'], path, created) is None:", "if False:"),
+    "the scanner's ancestors are not excluded": ("if int(entry) in ancestors or unreadable_verdict(", "if unreadable_verdict("),
+    "known helpers are not exempt": ("            return None  # a known long-lived helper: skipped whatever its start time", "            pass"),
+    "known helpers matched by name only": ("if base == helper and marker in (' ' + args + ' ' if marker.startswith(' ') else args):", "if base == helper:"),
     "an unreadable process is always skipped": ("    base = (name or '').strip().lower()\n    args = _proc_args(pid)", "    return None\n    base = (name or '').strip().lower()\n    args = _proc_args(pid)"),
     "the command line is ignored": ("if path in args or os.path.realpath(path) in args:", "if False:"),
     "shells and wrappers are skipped": ("    if base in UNREADABLE_ALWAYS_REFUSES:", "    if False:"),

@@ -1974,14 +1974,19 @@ def _worktree_created(path):
 # privilege wrapper or a build tool. An unreadable one of these always refuses (an interactive shell run through sg is the
 # real t2-dev finding of goodqa#15739).
 UNREADABLE_ALWAYS_REFUSES = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'busybox', 'mksh', 'pwsh',
-                             'powershell', 'sg', 'su', 'sudo', 'doas', 'newgrp', 'script', 'tmux', 'screen', 'vi', 'vim',
-                             'nvim', 'nano', 'emacs', 'less', 'more', 'man', 'make', 'git', 'ssh', 'env', 'nohup', 'xargs',
-                             'watch', 'python', 'python2', 'python3', 'node', 'nodejs', 'perl', 'ruby', 'php', 'deno', 'bun',
-                             'lua', 'java', 'go', 'cargo', 'npm', 'pnpm', 'yarn', 'pip', 'uv'}
-# Client workloads that do not change directory after they start: unreadable ones refuse only when they started after the
-# worktree was created (a docker client launched from it), and are skipped when they started before it.
-UNREADABLE_REFUSES_IF_STARTED_AFTER = {'docker', 'docker-compose', 'docker-buildx', 'podman', 'chrome', 'chromium',
-                                       'chrome-headless', 'chrome-headless-shell', 'firefox', 'geckodriver', 'chromedriver'}
+                             'powershell', 'tmux', 'screen', 'vi', 'vim', 'nvim', 'nano', 'emacs', 'less', 'more', 'man',
+                             'make', 'git', 'ssh', 'xargs', 'watch', 'python', 'python2', 'python3', 'node', 'nodejs',
+                             'perl', 'ruby', 'php', 'deno', 'bun', 'lua', 'java', 'go', 'cargo', 'npm', 'pnpm', 'yarn',
+                             'pip', 'uv'}
+# Known long-lived helpers that never work in a project directory: an unreadable one is skipped whatever its start time
+# (the user systemd manager and its sd-pam helper, the ssh and gpg agents, a tailscaled session helper, and the harness's own
+# pgpool test server started through `sg docker`). The name AND the command line must agree; both can be set by the process
+# itself, which is a stated limit (accident prevention, not an access control).
+UNREADABLE_KNOWN_HELPERS = (('(sd-pam)', ''), ('systemd', '--user'), ('ssh-agent', ''), ('gpg-agent', '--supervised'),
+                            ('tailscaled', ' be-child '), ('docker', '--label pgpool.tool='))
+# Every other unreadable process (a wrapper such as sg, an agent CLI, pytest, a compiler, a node app that renamed itself) is
+# judged by time: it cannot have been launched from the worktree before the worktree existed, so one that started BEFORE the
+# worktree was created is skipped, and one that started after it, or whose start time or the creation time is unknown, refuses.
 
 
 def unreadable_verdict(pid, name, path, created):
@@ -2000,10 +2005,12 @@ def unreadable_verdict(pid, name, path, created):
         return 'its command line names the worktree'
     if base in UNREADABLE_ALWAYS_REFUSES:
         return 'it is a %s, which may sit in the worktree' % base
-    if base in UNREADABLE_REFUSES_IF_STARTED_AFTER:
-        started = _proc_start(pid)
-        if started is None or created is None or started >= created:
-            return 'it is a %s that started after the worktree was created, or its start time is unknown' % base
+    for helper, marker in UNREADABLE_KNOWN_HELPERS:
+        if base == helper and marker in (' ' + args + ' ' if marker.startswith(' ') else args):
+            return None  # a known long-lived helper: skipped whatever its start time
+    started = _proc_start(pid)
+    if started is None or created is None or started >= created:
+        return 'it started after the worktree was created, or a start time is unknown'
     return None
 
 
@@ -2017,6 +2024,16 @@ def busy_scan(path, skip_names=(), created=None):
     only by exact Name in `skip_names`. Limits, stated: other users' processes are invisible without root, and open files
     other than the working directory are not checked; plain `git worktree remove` also deletes ignored files."""
     result = {'busy': [], 'unreadable': [], 'skipped': [], 'failed': False}
+    ancestors, walk = set(), os.getpid()
+    for _ in range(64):  # the parent chain of this scanner, from /proc/PID/status (readable for every process)
+        try:
+            status = _proc_status(str(walk))
+        except Exception:  # noqa: BLE001 - best effort: not learning the ancestors only means fewer skips (fail closed)
+            break
+        if not isinstance(status, dict) or not isinstance(status.get('ppid'), int) or status['ppid'] <= 1:
+            break
+        walk = status['ppid']
+        ancestors.add(walk)
     try:
         if os.path.isdir('/proc/self'):
             for entry in os.listdir('/proc'):
@@ -2056,7 +2073,9 @@ def busy_scan(path, skip_names=(), created=None):
                             continue
                         # Judged from the worktree side (goodqa#15870): a setgid or sd-pam helper that cannot be read is
                         # skipped and reported unless something ties it to the worktree (see unreadable_verdict).
-                        if unreadable_verdict(entry, status['name'], path, created) is None:
+                        # the scanner's own ancestors are the caller's session (on t2-dev an ssh login runs under an unreadable
+                        # `tailscaled be-child` whose command line carries the very command being run): never a reason to refuse
+                        if int(entry) in ancestors or unreadable_verdict(entry, status['name'], path, created) is None:
                             result['skipped'].append((int(entry), status['name'] or '?'))
                             continue
                         result['unreadable'].append((int(entry), status['name'] or '?'))

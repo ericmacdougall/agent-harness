@@ -20,6 +20,7 @@ ME = os.getuid()
 REAL_SCAN = cg.busy_scan
 # the real t2-dev unreadable set (read-only ps on 2026-11-13), with the command lines that matter
 T2_DEV = {
+    "2033": ("sg", "/usr/bin/sg docker -c exec /usr/bin/python3 /home/eric/repos/tools/pgpool.py serve"),
     "1738": ("(sd-pam)", "(sd-pam)"),
     "1988": ("(sd-pam)", "(sd-pam)"),
     "2060": ("docker", "docker run --rm --init --name testpg-pool --label pgpool.tool=testpg-pool --env-file "
@@ -34,7 +35,10 @@ class FakeProc:
     """A fake /proc for busy_scan: cwd links, same-user status, command lines and start times."""
 
     def __init__(self, test, procs):
-        self.test, self.procs = test, procs  # pid -> dict(link=path or errno, name, args, start)
+        self.test, self.procs = test, procs  # pid -> dict(link=path or errno, name, args, start, ppid)
+        self.scanner_pid = 999999  # not a listed process, so it needs no entry of its own
+        self.procs.setdefault("999999", {"link": "/tmp", "name": "python3", "args": "python3 command_guard.py", "start": 1.0,
+                                         "ppid": 1})
 
     def scan(self, created=None, skip=()):
         real_isdir = os.path.isdir
@@ -47,8 +51,9 @@ class FakeProc:
 
         def status(pid):
             proc = self.procs[str(pid)]
-            return {"name": proc["name"], "uid": ME, "ppid": 1}
+            return {"name": proc["name"], "uid": ME, "ppid": proc.get("ppid", 1)}
         with mock.patch.object(cg.os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
+                mock.patch.object(cg.os, "getpid", lambda: self.scanner_pid), \
                 mock.patch.object(cg.os, "listdir", lambda p: list(self.procs) if p == "/proc" else []), \
                 mock.patch.object(cg.os, "readlink", link), mock.patch.object(cg, "_proc_status", status), \
                 mock.patch.object(cg, "_proc_args", lambda pid: self.procs[str(pid)].get("args"), create=True), \
@@ -101,8 +106,8 @@ class Inuse(Repo):
         scan = self.t2_dev(**{"778": unreadable("docker", "docker compose -f %s/compose.yml up" % self.linked, 100.0)}).scan(created=200.0)
         self.assertEqual(scan["unreadable"], [(778, "docker")])
 
-    def test_an_unreadable_shell_or_wrapper_still_blocks_even_when_it_started_before_the_worktree(self):
-        for name in ("bash", "sg", "python3", "vim", "sudo", "git", "make"):
+    def test_an_unreadable_shell_editor_or_interpreter_still_blocks_even_when_it_started_before_the_worktree(self):
+        for name in ("bash", "python3", "vim", "git", "make", "node", "tmux"):
             with self.subTest(name=name):
                 scan = self.t2_dev(**{"779": unreadable(name, name, 1.0)}).scan(created=200.0)
                 self.assertEqual(scan["unreadable"], [(779, name)])
@@ -110,6 +115,52 @@ class Inuse(Repo):
     def test_an_unreadable_docker_client_started_after_the_worktree_still_blocks(self):
         scan = self.t2_dev(**{"780": unreadable("docker", "docker run --rm busybox", 300.0)}).scan(created=200.0)
         self.assertEqual(scan["unreadable"], [(780, "docker")])
+
+    # review H1: the real tree is sg (the long-lived pgpool wrapper) -> docker; sg must not block every worktree
+    def test_the_real_sg_parent_of_the_pgpool_client_is_skipped_when_it_started_before_the_worktree(self):
+        scan = self.t2_dev().scan(created=200.0)
+        self.assertIn((2033, "sg"), scan["skipped"])
+        self.assertEqual(scan["unreadable"], [])
+
+    def test_an_sg_wrapper_started_after_the_worktree_blocks(self):
+        scan = self.t2_dev(**{"784": unreadable("sg", "/usr/bin/sg docker -c exec /usr/bin/python3 run.py", 300.0)}).scan(created=200.0)
+        self.assertEqual(scan["unreadable"], [(784, "sg")])
+
+    # review H1: any other unreadable program is judged by time, not skipped by name
+    def test_an_unreadable_agent_cli_test_runner_or_compiler_started_after_the_worktree_blocks_before_it_is_skipped(self):
+        for name in ("claude", "pytest", "python3.12", "rg", "cc1", "vite", "headless_shell", "codex"):
+            with self.subTest(name=name):
+                after = self.t2_dev(**{"785": unreadable(name, name + " --watch", 300.0)}).scan(created=200.0)
+                self.assertEqual(after["unreadable"], [(785, name)])
+                before = self.t2_dev(**{"785": unreadable(name, name + " --watch", 100.0)}).scan(created=200.0)
+                self.assertEqual(before["unreadable"], [])
+                self.assertIn((785, name), before["skipped"])
+
+    def test_the_known_helpers_are_skipped_whatever_their_start_time(self):
+        scan = self.t2_dev().scan(created=50.0)  # every fixture process started AFTER this worktree was created
+        skipped = {name for _pid, name in scan["skipped"]}
+        self.assertEqual({"(sd-pam)", "tailscaled", "gpg-agent", "docker"} - skipped, set())
+        # but the name must agree with the command line: a docker client without the pgpool label is a workload
+        self.assertIn((2033, "sg"), scan["unreadable"])  # a wrapper has no such exemption
+        other = self.t2_dev(**{"786": unreadable("docker", "docker run --rm busybox", 100.0)}).scan(created=50.0)
+        self.assertIn((786, "docker"), other["unreadable"])
+        spoof = self.t2_dev(**{"787": unreadable("tailscaled", "tailscaled serve", 100.0)}).scan(created=50.0)
+        self.assertIn((787, "tailscaled"), spoof["unreadable"])
+
+    # review H2: the scanner's own unreadable ancestors (an ssh login's tailscaled be-child carries the command) never block
+    def test_the_scanners_own_ancestor_chain_is_not_a_reason_to_refuse(self):
+        fake = self.t2_dev(**{"5000": unreadable("tailscaled", "/usr/sbin/tailscaled be-child ssh --cmd=remove-worktree %s" % self.linked, 300.0),
+                              "5001": unreadable("sshd", "sshd: eric", 300.0)})
+        fake.procs["5000"]["ppid"] = 5001
+        fake.procs["999999"]["ppid"] = 5000
+        fake.procs["5001"]["ppid"] = 1
+        scan = fake.scan(created=200.0)
+        self.assertEqual(scan["unreadable"], [])
+        self.assertIn((5000, "tailscaled"), scan["skipped"])
+        self.assertIn((5001, "sshd"), scan["skipped"])
+        # a NON-ancestor process whose command line names the worktree still blocks
+        stranger = self.t2_dev(**{"6000": unreadable("tailscaled", "tailscaled be-child ssh --cmd=%s" % self.linked, 300.0)}).scan(created=200.0)
+        self.assertIn((6000, "tailscaled"), stranger["unreadable"])
 
     def test_unknown_times_or_an_unreadable_command_line_fail_closed(self):
         self.assertEqual(self.t2_dev(**{"781": unreadable("docker", "docker ps", None)}).scan(created=200.0)["unreadable"], [(781, "docker")])
