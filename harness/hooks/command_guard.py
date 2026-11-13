@@ -1473,6 +1473,28 @@ def _per_worktree_config_refusal(path, common, git_dir, cwd, step):
     return None
 
 
+def _ignored_offenders(status, ignored_ok, ignored_top_ok):
+    """The ignored paths in a `git status --ignored` listing that are not a whole regenerable build directory."""
+    out = []
+    for entry in filter(None, status.split('\x00')):
+        if entry.startswith('!! '):
+            name = entry[3:]
+            leaf = name.rstrip('/').rsplit('/', 1)[-1]
+            top = '/' not in name.rstrip('/')
+            if not (name.endswith('/') and (leaf in ignored_ok or (top and leaf in ignored_top_ok))):
+                out.append(name)
+    return out
+
+
+def _ignored_refusal(names):
+    """The refusal text for ignored files that are not a regenerable build directory, listing up to five of them so an
+    operator can see what to clean (a printable-ASCII, bounded list: names come from the worktree)."""
+    shown = [re.sub(r'[^\x20-\x7e]', '?', n)[:80] for n in names[:5]]
+    more = len(names) - len(shown)
+    return ('it holds an ignored file or folder that is not a whole regenerable build directory: %s%s'
+            % (', '.join(shown) or '?', ' (and %d more)' % more if more > 0 else ''))
+
+
 def _nested_repo(directory, limit=250000, deep=False, seconds=1.5):
     """True for a repository (.git or a bare repo) in the directory or below it (one level for caches, eight for
     generic build dirs); 'large' when the scan hit its entry or time bound; False otherwise."""
@@ -1550,7 +1572,7 @@ def reproducible_clone_refusal(path, policy=None, now=None):
                 leaf = name.rstrip('/').rsplit('/', 1)[-1]
                 top = '/' not in name.rstrip('/')
                 if not (name.endswith('/') and (leaf in ignored_ok or (top and leaf in ignored_top_ok))):
-                    return 'it holds an ignored file or folder that is not a whole regenerable build directory'
+                    return _ignored_refusal(_ignored_offenders(status, ignored_ok, ignored_top_ok))
                 found = _nested_repo(os.path.join(path, name), deep=leaf not in ignored_ok)
                 if found == 'large':
                     return 'an ignored build directory is too large to check for nested repositories in time'
@@ -1730,7 +1752,7 @@ def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None):
                 leaf = name.rstrip('/').rsplit('/', 1)[-1]
                 top_ignored = '/' not in name.rstrip('/')
                 if not (name.endswith('/') and (leaf in ignored_ok or (top_ignored and leaf in ignored_top_ok))):
-                    return 'it holds an ignored file or folder that is not a whole regenerable build directory'
+                    return _ignored_refusal(_ignored_offenders(status, ignored_ok, ignored_top_ok))
                 found = _nested_repo(os.path.join(path, name), limit=int(250000 * scale), deep=leaf not in ignored_ok,
                                      seconds=max(0.2, min(left(), 1.5 * scale)))  # inside the budget that is left
                 if found == 'large':
@@ -1922,7 +1944,85 @@ def _proc_cmd0(pid):
     return os.path.basename(first.decode('utf-8', 'replace')) or None
 
 
-def busy_scan(path, skip_names=()):
+def _proc_args(pid):
+    """The command line of PID from /proc/PID/cmdline as one string (NULs read as spaces, bounded), '' when the process has
+    an empty command line, None when it cannot be read."""
+    try:
+        with open('/proc/%s/cmdline' % pid, 'rb') as handle:
+            return handle.read(8192).replace(b'\x00', b' ').decode('utf-8', 'replace')
+    except OSError:
+        return None
+
+
+def _proc_start(pid):
+    """When PID started, as seconds since the epoch (/proc/PID/stat field 22 and the boot time in /proc/stat), or None."""
+    try:
+        with open('/proc/%s/stat' % pid) as handle:
+            fields = handle.read().rpartition(')')[2].split()
+        ticks = int(fields[19])  # field 22 overall; the first two (pid, comm) are before the closing parenthesis
+        with open('/proc/stat') as handle:
+            boot = next(int(line.split()[1]) for line in handle if line.startswith('btime '))
+        return boot + ticks / float(os.sysconf('SC_CLK_TCK'))
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
+
+
+def _worktree_created(path):
+    """When the linked worktree was created: the modification time of its `.git` file (written once by `git worktree add`),
+    or None when it cannot be read."""
+    try:
+        return os.lstat(os.path.join(path, '.git')).st_mtime
+    except OSError:
+        return None
+
+
+# What may sit in a working directory and was started by a person or an agent: a shell, an interpreter, an editor, a
+# privilege wrapper or a build tool. An unreadable one of these always refuses (an interactive shell run through sg is the
+# real t2-dev finding of goodqa#15739).
+UNREADABLE_ALWAYS_REFUSES = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'busybox', 'mksh', 'pwsh',
+                             'powershell', 'tmux', 'screen', 'vi', 'vim', 'nvim', 'nano', 'emacs', 'less', 'more', 'man',
+                             'make', 'git', 'ssh', 'xargs', 'watch', 'python', 'python2', 'python3', 'node', 'nodejs',
+                             'perl', 'ruby', 'php', 'deno', 'bun', 'lua', 'java', 'go', 'cargo', 'npm', 'pnpm', 'yarn',
+                             'pip', 'uv'}
+# Known long-lived helpers that never work in a project directory: an unreadable one is skipped whatever its start time
+# (the user systemd manager and its sd-pam helper, the ssh and gpg agents, a tailscaled session helper, and the harness's own
+# pgpool test server started through `sg docker`). The name AND the command line must agree; both can be set by the process
+# itself, which is a stated limit (accident prevention, not an access control).
+UNREADABLE_KNOWN_HELPERS = (('(sd-pam)', ''), ('systemd', '--user'), ('ssh-agent', ''), ('gpg-agent', ''),
+                            ('tailscaled', ' be-child '), ('docker', '--label pgpool.tool='), ('sg', 'lanes/pgpool.py serve'))
+# Every other unreadable process (a wrapper such as sg, an agent CLI, pytest, a compiler, a node app that renamed itself) is
+# judged by time: it cannot have been launched from the worktree before the worktree existed, so one that started BEFORE the
+# worktree was created is skipped, and one that started after it, or whose start time or the creation time is unknown, refuses.
+
+
+def unreadable_verdict(pid, name, path, created):
+    """None when an unreadable same-user process may be skipped, else a short reason it still refuses. The process' own
+    working directory cannot be read (a setgid or privilege-separation helper, an sd-pam or sg-docker wrapper), so this is
+    judged from the worktree side, in this order: an unreadable command line refuses; a command line naming the worktree
+    refuses; a shell, editor or interpreter always refuses; a known long-lived helper (name AND command line agree) is
+    skipped whatever its start time; every other process is judged by time, because it cannot have been launched from the
+    worktree before the worktree existed: it is skipped and REPORTED only when it started before the worktree was created,
+    and refuses when it started after or when a start time is unknown. Stated limit: names and command lines can be set by the process itself, and a skipped process may still
+    have the worktree as its working directory (its directory is then deleted under it, no data is lost: the worktree is
+    clean and published); this protects against accident, not against a hostile same-user process."""
+    base = (name or '').strip().lower()
+    args = _proc_args(pid)
+    if args is None:
+        return 'its command line cannot be read'
+    if path in args or os.path.realpath(path) in args:
+        return 'its command line names the worktree'
+    if base in UNREADABLE_ALWAYS_REFUSES:
+        return 'it is a %s, which may sit in the worktree' % base
+    for helper, marker in UNREADABLE_KNOWN_HELPERS:
+        if base == helper and marker in (' ' + args + ' ' if marker.startswith(' ') else args):
+            return None  # a known long-lived helper: skipped whatever its start time
+    started = _proc_start(pid)
+    if started is None or created is None or started >= created:
+        return 'it started after the worktree was created, or a start time is unknown'
+    return None
+
+
+def busy_scan(path, skip_names=(), created=None):
     """Scan the processes for one whose working directory is the worktree or inside it. Returns {'busy': [(pid, command)],
     'unreadable': [(pid, name)], 'failed': bool}: `unreadable` lists processes of THIS user whose cwd link cannot be read
     and that are not on the service list (a shell run through sg or sudo, a setgid helper), `failed` is set when the scan
@@ -1931,7 +2031,17 @@ def busy_scan(path, skip_names=()):
     root daemons whose /proc/PID/cwd a normal user cannot read; goodqa#15739); a same-user unreadable process is skipped
     only by exact Name in `skip_names`. Limits, stated: other users' processes are invisible without root, and open files
     other than the working directory are not checked; plain `git worktree remove` also deletes ignored files."""
-    result = {'busy': [], 'unreadable': [], 'failed': False}
+    result = {'busy': [], 'unreadable': [], 'skipped': [], 'failed': False}
+    ancestors, walk = set(), os.getpid()
+    for _ in range(64):  # the parent chain of this scanner, from /proc/PID/status (readable for every process)
+        try:
+            status = _proc_status(str(walk))
+        except Exception:  # noqa: BLE001 - best effort: not learning the ancestors only means fewer skips (fail closed)
+            break
+        if not isinstance(status, dict) or not isinstance(status.get('ppid'), int) or status['ppid'] <= 1:
+            break
+        walk = status['ppid']
+        ancestors.add(walk)
     try:
         if os.path.isdir('/proc/self'):
             for entry in os.listdir('/proc'):
@@ -1968,6 +2078,13 @@ def busy_scan(path, skip_names=()):
                         # hostile same-user process; it is a standing limit, not a control. Anything else (a shell run through
                         # sg, the docker client, a helper, any other name, an unreadable command line) is reported and refuses.
                         if skip_names and status['name'] in skip_names and _proc_cmd0(entry) == status['name']:
+                            continue
+                        # Judged from the worktree side (goodqa#15870): a setgid or sd-pam helper that cannot be read is
+                        # skipped and reported unless something ties it to the worktree (see unreadable_verdict).
+                        # the scanner's own ancestors are the caller's session (on t2-dev an ssh login runs under an unreadable
+                        # `tailscaled be-child` whose command line carries the very command being run): never a reason to refuse
+                        if int(entry) in ancestors or unreadable_verdict(entry, status['name'], path, created) is None:
+                            result['skipped'].append((int(entry), status['name'] or '?'))
                             continue
                         result['unreadable'].append((int(entry), status['name'] or '?'))
                         continue
@@ -2051,7 +2168,11 @@ def verify_worktree(path, authenticated=False, policy=None):
         except (ValueError, OSError, subprocess.SubprocessError):
             pass
     if reason is None:
-        scan = busy_scan(path, tuple(delegated_policy(policy)['reproducible_clone'].get('busy_skip_names') or ()))
+        scan = busy_scan(path, tuple(delegated_policy(policy)['reproducible_clone'].get('busy_skip_names') or ()),
+                         _worktree_created(path))
+        # the processes that could not be inspected and were skipped are always reported, never silently ignored
+        report['skipped_processes'] = ['pid %d (%s)' % (pid, re.sub(r'[^A-Za-z0-9_.()-]', '?', name)[:20])
+                                       for pid, name in scan.get('skipped', [])[:20]]
         if scan['busy']:
             reason = 'a process is using the worktree as its working directory (pid %d, %s)' % scan['busy'][0]
         elif scan['failed']:
@@ -2061,8 +2182,8 @@ def verify_worktree(path, authenticated=False, policy=None):
                               for pid, name in scan['unreadable'][:3])
             more = len(scan['unreadable']) - 3
             reason = ('could not check for processes using the worktree: %d process(es) of this user cannot be inspected '
-                      '(%s%s); let them end, then retry' % (len(scan['unreadable']), named,
-                                                            ' and %d more' % more if more > 0 else ''))
+                      'and may be using it (%s%s); let them end, then retry' % (len(scan['unreadable']), named,
+                                                                              ' and %d more' % more if more > 0 else ''))
     report['reason'] = reason
     report['removable'] = reason is None and bool(report['repo']) and bool(report['head'])
     return report
@@ -2264,7 +2385,7 @@ SHELLS = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'bus
 PS_SHELLS = {'pwsh', 'powershell'}
 INTERPRETERS = {'python', 'python3', 'python2', 'node', 'nodejs', 'perl', 'ruby', 'php', 'deno', 'bun', 'lua', 'rscript',
                 'osascript', 'pypy', 'pypy3', 'tclsh', 'awk-script'}
-WRAPPER_VALUE_OPTS = {'nice': ('-n', '--adjustment'), 'ionice': ('-c', '-n', '-p', '-t'), 'chrt': ('-p',),
+WRAPPER_VALUE_OPTS = {'sshpass': ('-f', '-d', '-p', '-P'), 'nice': ('-n', '--adjustment'), 'ionice': ('-c', '-n', '-p', '-t'), 'chrt': ('-p',),
                       'stdbuf': ('-i', '-o', '-e'), 'caffeinate': ('-t', '-w'), 'watch': ('-n', '-d', '--interval'),
                       'strace': ('-o', '-e', '-p', '-s', '-u'), 'ltrace': ('-o', '-e', '-p', '-s', '-u'),
                       'runuser': ('-u', '-g', '-G'), 'su': ('-s', '-g', '-G'), 'sg': (), 'setsid': (),
@@ -2273,7 +2394,7 @@ WRAPPER_VALUE_OPTS = {'nice': ('-n', '--adjustment'), 'ionice': ('-c', '-n', '-p
 WRAPPERS_SIMPLE = {'command', 'builtin', 'exec', 'nohup', 'time', 'nice', 'ionice', 'setsid', 'stdbuf', 'caffeinate',
                    'noglob', 'unbuffer', 'chrt', 'taskset', 'doas', 'sudo', 'env', 'xargs', 'timeout', 'watch', 'gosu',
                    'chroot', 'runuser', 'strace', 'ltrace', 'script', 'dtruss', 'arch', 'nsenter', 'firejail', 'sandbox-exec',
-                   'start-process', 'invoke-expression', 'iex', 'invoke-command', 'icm', 'call', 'start'}
+                   'start-process', 'invoke-expression', 'iex', 'invoke-command', 'icm', 'call', 'start', 'sshpass'}
 RM_CMDS = {'rm', 'unlink', 'rmdir', 'shred', 'srm', 'trash', 'trash-put', 'remove-item', 'ri', 'del', 'erase', 'rd',
            'rimraf', 'gio-trash'}
 MV_CMDS = {'mv', 'move-item', 'mi', 'move', 'rename-item', 'ren', 'rni'}
@@ -3462,7 +3583,7 @@ class Analyzer:
         if name in PRINT_FILE_CMDS or name in GREP_CMDS or name in EXFIL_CMDS or name in ARCHIVE_CMDS or name in ('openssl', 'source'):
             self.read_creds(name, args, pl, idx)
         if name in RM_CMDS or name in MV_CMDS or name in OVERWRITE_CMDS or name in (
-                'sed', 'perl', 'ruby', 'awk', 'gawk', 'rsync', 'rclone', 'tar', 'zip', 'dd', 'truncate', 'set-content',
+                'sed', 'perl', 'ruby', 'awk', 'gawk', 'rsync', 'scp', 'rclone', 'tar', 'zip', 'dd', 'truncate', 'set-content',
                 'out-file', 'curl', 'wget', 'touch', 'mkdir', 'unzip', 'bsdtar', 'gtar'):
             self.destructive(name, args, texts)
         if not (name in PRINT_FILE_CMDS or name in GREP_CMDS or name in EXFIL_CMDS):
@@ -3702,7 +3823,7 @@ class Analyzer:
             while i < len(args) and (texts[i].startswith('-') or i == 0 and False):
                 i += 2 if texts[i] in ('-s', '-k', '--signal', '--kill-after') else 1
             i += 1  # duration
-        elif name in ('nice', 'ionice', 'chrt', 'taskset', 'stdbuf', 'caffeinate', 'watch', 'strace', 'ltrace', 'setsid', 'arch', 'nohup', 'unbuffer', 'dtruss', 'chroot', 'nsenter', 'firejail', 'sandbox-exec', 'script', 'gosu', 'runuser', 'su', 'sg', 'time', 'noglob', 'command', 'builtin', 'exec', 'start-process', 'start', 'call', 'invoke-command', 'icm'):
+        elif name in ('nice', 'ionice', 'chrt', 'taskset', 'stdbuf', 'caffeinate', 'watch', 'strace', 'ltrace', 'setsid', 'arch', 'nohup', 'unbuffer', 'dtruss', 'chroot', 'nsenter', 'firejail', 'sandbox-exec', 'script', 'gosu', 'runuser', 'su', 'sg', 'time', 'noglob', 'command', 'builtin', 'exec', 'start-process', 'start', 'call', 'invoke-command', 'icm', 'sshpass'):
             valued = WRAPPER_VALUE_OPTS.get(name, ())
             while i < len(args) and texts[i].startswith('-'):
                 i += 2 if texts[i] in valued else 1
@@ -5474,7 +5595,10 @@ class Analyzer:
                 for w in (nd[1:] if name == 'sed' and nd else nd):
                     if not self.state_dest(w):
                         self.refuse(name + ' -i (rewrites in place)', w, tiers=('log', 'unknown'))
+        elif name == 'scp':
+            self.remote_copy_dest(name, args, texts)
         elif name == 'rsync':
+            self.remote_copy_dest(name, args, texts)
             if any(t.startswith('--delete') or t.startswith('--del') or t == '--remove-source-files'
                    or t == '--remove-sent-files' for t in texts):
                 pos = [a for a in nd if not self._remote_spec(a.text)]
@@ -5529,6 +5653,144 @@ class Analyzer:
     def _remote_spec(text):
         return bool(re.match(r'^[A-Za-z0-9_.@-]+:(?!/)', text)) or bool(re.match(r'^[A-Za-z0-9_.@-]+::', text)) \
             or bool(re.match(r'^[A-Za-z0-9_.@-]+:/', text) and not text.startswith('/'))
+
+    REMOTE_DEST = re.compile(r'^(?:[A-Za-z0-9_.-]+@)?(?:[A-Za-z0-9_.-]+|\[[0-9a-fA-F:.%]+\]):(?!:)(.*)$', re.S)
+    REMOTE_URL = re.compile(r'^(?:scp|sftp|ssh)://(?:[^@/]+@)?(?:\[[^\]]+\]|[^/:]+)(?::\d+)?(?:/(.*))?$', re.S)
+    REMOTE_DAEMON = re.compile(r'^(?:(?:[A-Za-z0-9_.-]+@)?(?:[A-Za-z0-9_.-]+|\[[0-9a-fA-F:.%]+\])::|rsync://(?:[^@/]+@)?(?:\[[^\]]+\]|[^/:]+)(?::\d+)?/)'
+                               r'(?:[^/]*)(?:/(.*))?$', re.S)
+    SCP_VALUE_FLAGS = {'-P', '-i', '-o', '-F', '-c', '-l', '-S', '-J', '-D', '-X'}
+    RSYNC_VALUE_FLAGS = {'-e', '-f', '-T', '-B', '-M', '--rsh', '--chmod', '--exclude', '--include', '--filter', '--rsync-path', '--files-from',
+                         '--log-file', '--exclude-from', '--include-from', '--bwlimit', '--timeout', '--contimeout', '--port', '--backup-dir',
+                         '--partial-dir', '--suffix', '--compare-dest', '--copy-dest', '--link-dest', '--max-size', '--min-size', '--block-size',
+                         '--modify-window', '--protocol', '--chown', '--usermap', '--groupmap', '--iconv', '--out-format', '--password-file',
+                         '--address', '--sockopts', '--write-batch', '--only-write-batch', '--read-batch', '--info', '--debug',
+                         '--compress-level', '--skip-compress', '--temp-dir', '--max-delete', '--checksum-choice', '--cc', '--stop-after',
+                         '--stop-at', '--outbuf', '--remote-option', '-M', '--zc', '--zl', '--compress-choice', '--log-file-format', '--copy-as',
+                         '--checksum-seed', '--max-alloc', '--early-input', '--dparam', '--files-from', '--exclude-from', '-@'}
+
+    def _copy_operands(self, name, args):
+        """The positional operands of scp or rsync with option VALUES skipped (a value after the destination must not hide it).
+        A short cluster such as `-avze ssh` or `-rP 22` ends in a value flag whose value is the NEXT word; `-P22` carries it."""
+        flags = self.SCP_VALUE_FLAGS if name == 'scp' else self.RSYNC_VALUE_FLAGS
+        letters = {f[1] for f in flags if len(f) == 2}
+        out, skip, ended = [], False, False
+        for word in args:
+            text = word.text
+            if skip:
+                skip = False
+                continue
+            if not ended and text == '--':
+                ended = True
+                continue
+            if not ended and text.startswith('-') and len(text) > 1:
+                if text.startswith('--'):
+                    key = text.split('=', 1)[0]
+                    if key in flags and '=' not in text:
+                        skip = True
+                else:
+                    for k, ch in enumerate(text[1:]):
+                        if ch in letters:
+                            skip = k == len(text) - 2  # a value flag LAST in the cluster takes the next word; otherwise the rest is its value
+                            break
+                continue
+            out.append(word)
+        return out
+
+    def remote_paths(self, text):
+        """Candidate remote paths when `text` is a remote operand (host:path, user@[v6]:path, scp:// and rsync:// urls, host::module),
+        else None. A path relative to the remote home reads as `~/relative`; a url path is judged both absolute and home-relative
+        and url-decoded (the module root of an rsync daemon is unknown, so its rest is judged the same way)."""
+        from urllib.parse import unquote
+        if not text or text.startswith(('/', './', '../', '~')) or re.match(r'^[A-Za-z]:[\\/]', text):
+            return None
+        rest, urlish = None, False
+        match = self.REMOTE_URL.match(text)
+        if match:
+            rest, urlish = match.group(1) or '', True
+        else:
+            match = self.REMOTE_DAEMON.match(text)
+            if match:
+                rest, urlish = match.group(1) or '', True
+            else:
+                match = self.REMOTE_DEST.match(text)
+                if match:
+                    rest = match.group(1)
+        if rest is None:
+            return None
+        if rest == '':
+            return ['~']  # `host:` is the remote home
+        rest = unquote(rest) if urlish else rest
+        if urlish:
+            rest = rest[2:] if rest.startswith(('/~/', '~/')) else rest
+            out = ['/' + rest.lstrip('/'), '~/' + rest.lstrip('/')]
+            return out
+        return [rest if rest.startswith(('/', '~')) else '~/' + rest]
+
+    @staticmethod
+    def _relative_tail(text):
+        """The part of a source path rsync -R rebuilds under the destination: after a `/./` marker, else without a leading `/` or `./`."""
+        if '/./' in text:
+            return text.split('/./', 1)[1].strip('/')
+        text = text.lstrip('/')
+        while text.startswith('./'):
+            text = text[2:].lstrip('/')
+        return '' if text in ('.', '..') else text.strip('/')
+
+    def remote_copy_dest(self, name, args, texts):
+        """scp and rsync copying TO a remote path that names a protected harness location (hooks, WALs, state): the same refusal
+        as a local or ssh-wrapped cp (goodqa#15759; the 2026-11-11 t2-dev install of command_guard.py used scp after the cp was
+        refused). Option values never hide the destination; IPv6 hosts, scp:// and rsync:// urls and `host::module` are read; a
+        recursive copy or an rsync --delete into a directory that CONTAINS protected files is refused too (it overwrites or
+        removes them in one command). Downloads (a remote SOURCE, a local destination) are not touched. Stated limits: sftp batch
+        commands, tar | ssh and a directory SOURCE (its contents are not expanded) are not seen; a variable in the file position is
+        judged like the local cp."""
+        operands = self._copy_operands(name, args)
+        if len(operands) < 2:
+            return
+        letters = _flag_letters(args)
+        recursive = bool(letters & {'r', 'R'}) or '--recursive' in texts or (name == 'rsync' and (bool(letters & {'a'}) or '--archive' in texts or
+                                                                                        any(s.text.endswith('/') for s in operands[:-1])))
+        deleting = name == 'rsync' and any(t.startswith('--del') or t in ('--remove-source-files', '--remove-sent-files') for t in texts)
+        relative = name == 'rsync' and (bool(letters & {'R'}) or '--relative' in texts or any(t.startswith('--files-from') for t in texts))
+        hidden = name == 'rsync' and any(t.startswith('--files-from') for t in texts)  # the sources are in a file the guard cannot read
+        # the destination is the last operand, and every remote operand that follows a local one is an upload target too (an
+        # unknown option value after the destination must not hide it)
+        dests, seen_local = [], False
+        for index, operand in enumerate(operands):
+            if self.remote_paths(operand.text):
+                if index == len(operands) - 1 or seen_local:
+                    dests.append(operand)
+            else:
+                seen_local = True
+        for dest in dests:
+            paths = self.remote_paths(dest.text)
+            sources = [o for o in operands if o is not dest and not self.remote_paths(o.text)]
+            named, roots = list(paths), []
+            for source in sources:
+                text = source.text
+                base = posixpath.basename(text.rstrip('/'))
+                contents = text.endswith('/') or text.rstrip('/') in ('.', '..')
+                rel = self._relative_tail(text) if relative else ''
+                for path in paths:
+                    if rel:  # rsync -R rebuilds the source path under the destination (cut at a /./ marker)
+                        named.append(path.rstrip('/') + '/' + rel)
+                        roots.append(path.rstrip('/') + '/' + rel)
+                    elif contents or not base:
+                        roots.append(path)
+                    else:
+                        named.append(path.rstrip('/') + '/' + base)
+                        roots.append(path.rstrip('/') + '/' + base)
+            if not sources or deleting or hidden:
+                roots += paths
+            for candidate, tiers in [(c, ('log', 'unknown')) for c in named] + \
+                    [(r, ('log', 'unknown', 'ancestor')) for r in roots if recursive or deleting or hidden]:
+                fake = Word()
+                fake.alts = [candidate]
+                fake.dynamic, fake.subs, fake.vars = dest.dynamic, dest.subs, dest.vars
+                cls, _resolved, _literal = self.target_class(fake)
+                if cls in tiers:
+                    self.refuse(name + ' to a remote harness path (the sanctioned route is `ah install-files`)', fake, tiers=tiers)
+                    return
 
     def overwrite_dest(self, what, word):
         """cp/mv/ln/install onto an existing Tier A file (or into a protected dir by glob/variable)."""

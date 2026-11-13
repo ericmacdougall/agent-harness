@@ -578,6 +578,81 @@ class SelfTest(Base):
         self.assertIn("new failing", ai.selftest_worse(before, {"guard": guard, "doctor": {"flags": True, "failing": ["a", "b", "c"]}}))
         self.assertIn("could not run", ai.selftest_worse(before, {"guard": guard, "doctor": {"flags": True, "failing": None}}))
 
+    def manifest_commit(self, extra_rows, first=False):
+        """A merged commit whose installer also lists hooks_manifest.json, with `extra_rows` added to the manifest."""
+        side = Path(self.tmp, "manifest-side")
+        git(self.tmp, "clone", "-q", str(self.origin), str(side))
+        (side / "install.py").write_text("HOOKS = %r\n" % (NAMES + ("hooks_manifest.json",),))
+        manifest = json.loads((self.hooks / "hooks_manifest.json").read_text())
+        manifest["hooks"] = list(extra_rows) + manifest["hooks"] if first else manifest["hooks"] + list(extra_rows)
+        (side / "harness" / "hooks" / "hooks_manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+        git(side, "add", "-A")
+        git(side, "commit", "-q", "-m", "manifest adds rows")
+        git(side, "push", "-q", "origin", "main")
+        return git(side, "rev-parse", "HEAD")
+
+    ROW = {"id": "newhook:stop", "script": "extra.py", "arg": "stop", "event": "Stop", "tools": [], "flavors": ["claude"],
+           "status": "installed", "rules": []}
+
+    def test_a_manifest_that_only_adds_an_unregistered_hook_installs_and_says_so(self):  # goodqa#15754 AC-10
+        """t2-dev 2026-11-12, run ins-d882276cc2a3: the new manifest declared three status-truth rows, settings.json does
+        not register them (install-files never edits settings), doctor called them MISSING and the run rolled back.
+        On main 6e318911 this test fails with "new failing doctor checks: newhook:stop"."""
+        ref = self.manifest_commit([self.ROW])
+        posted = []
+        out = self.install(ref=ref, files=("hooks_manifest.json", "extra.py"), posted=posted)
+        self.assertEqual(out["result"], "installed")
+        self.assertEqual(out["unregistered"], ["newhook:stop"])
+        self.assertIs(out["registration_needed"], True)
+        self.assertIn("not registered in settings.json", out["note"])
+        self.assertIn("newhook:stop", posted[-1][1])  # the ticket comment says it too
+
+    def test_newly_declared_but_broken_rows_and_lost_wiring_still_roll_back(self):  # goodqa#15754 AC-10 NEG
+        guard = {"allow": {"exit": 0, "verdict": "allow", "rule": ""}}
+
+        def doc(states):
+            failing = sorted(i for i, st in states.items() if st not in ("WIRED", "PENDING"))
+            return {"guard": guard, "doctor": {"flags": True, "failing": failing, "states": states}}
+        before = doc({"a:stop": "WIRED", "b:stop": "MISSING"})
+        # a new row that is only unregistered is reported, not a regression
+        self.assertIsNone(ai.selftest_worse(before, doc({"a:stop": "WIRED", "b:stop": "MISSING", "new:stop": "MISSING"})))
+        self.assertEqual(ai.newly_declared_unregistered(before, doc({"a:stop": "WIRED", "b:stop": "MISSING",
+                                                                     "new:stop": "MISSING"})), ["new:stop"])
+        # a pending row promoted to installed and still unregistered is the same case (review a36299f2 finding 2)
+        pend = doc({"a:stop": "WIRED", "p:stop": "PENDING"})
+        self.assertIsNone(ai.selftest_worse(pend, doc({"a:stop": "WIRED", "p:stop": "MISSING"})))
+        self.assertEqual(ai.newly_declared_unregistered(pend, doc({"a:stop": "WIRED", "p:stop": "MISSING"})), ["p:stop"])
+        # a new row that is registered but whose script is missing is a regression (CANARY_FAIL is covered for a
+        # doctor run with canaries; the install self-test runs --no-canary)
+        for state in ("SCRIPT_MISSING", "CANARY_FAIL"):
+            self.assertIn("new:stop", ai.selftest_worse(before, doc({"a:stop": "WIRED", "b:stop": "MISSING",
+                                                                       "new:stop": state})) or "")
+        # a row wired before that is unregistered after, or renamed away, is a regression
+        self.assertIn("a:stop", ai.selftest_worse(before, doc({"a:stop": "MISSING", "b:stop": "MISSING"})) or "")
+        self.assertIn("a:stop", ai.selftest_worse(before, doc({"a2:stop": "MISSING", "b:stop": "MISSING"})) or "")
+        # a baseline without states (an older journal row) keeps the strict rule
+        old = {"guard": guard, "doctor": {"flags": True, "failing": ["b:stop"]}}
+        self.assertIn("new:stop", ai.selftest_worse(old, doc({"a:stop": "WIRED", "b:stop": "MISSING",
+                                                               "new:stop": "MISSING"})) or "")
+        self.assertEqual(ai.newly_declared_unregistered(old, doc({"new:stop": "MISSING"})), [])
+
+    def test_a_doctor_past_the_state_bound_records_no_states_and_stays_strict(self):  # review a36299f2 finding 1
+        rows = [dict(self.ROW, id="bulk%03d:stop" % n) for n in range(400)]
+        # placed FIRST, so a map cut at 400 rows would hold exactly the new rows and pass them all (on 949fb22d this
+        # installs); with no map past the bound the strict rule rolls back
+        ref = self.manifest_commit(rows, first=True)
+        with self.assertRaises(ai.InstallError) as caught:
+            self.install(ref=ref, files=("hooks_manifest.json", "extra.py"))
+        self.assertEqual(caught.exception.data["result"], "rolled_back")
+        self.assertIn("new failing doctor checks", str(caught.exception))
+
+    def test_the_host_self_test_records_each_doctor_state(self):  # goodqa#15754 AC-10
+        ref = self.manifest_commit([self.ROW])
+        out = self.install(ref=ref, files=("hooks_manifest.json", "extra.py"))
+        states = out["selftest_after"]["doctor"]["states"]
+        self.assertEqual(states["newhook:stop"], "MISSING")
+        self.assertTrue(all(isinstance(k, str) and isinstance(v, str) for k, v in states.items()))
+
     def test_a_self_test_that_cannot_run_before_any_write_refuses(self):  # AC-4, NEG-4
         (self.hooks / "command_guard.py").write_bytes(b"raise SystemExit(7)\n")
         before = {n: self.live(n) for n in NAMES}

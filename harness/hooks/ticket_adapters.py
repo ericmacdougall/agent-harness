@@ -178,8 +178,22 @@ class GoodQAAdapter:
             envelope = json.loads(frames[-1] if frames else text)
             result = envelope["result"]
             content = result["content"][0]["text"]
-            data = json.loads(content)
         except (ValueError, KeyError, IndexError, TypeError):
+            raise TicketSystemUnavailable(f"GoodQA returned an unexpected shape for {tool}") from None
+        try:
+            data = json.loads(content)
+        except (ValueError, TypeError):
+            if isinstance(result, dict) and result.get("isError") and isinstance(content, str):
+                # A protocol-level error is plain text ("MCP error -32602: Input validation error: ... at projectId").
+                # Report only the code and, for a validation error, the field name: the text can echo argument values.
+                # It raises (as before) rather than returning {"__error__": ...}, so callers keep their
+                # unavailable/retry path instead of reading it as a domain answer such as "project not visible".
+                code = re.match(r"MCP error -(\d{1,6})\b", content)
+                what = "MCP error -%s" % code.group(1) if code else "a plain-text error"
+                if code and code.group(1) == "32602":
+                    field = re.search(r"\bat ([A-Za-z_][A-Za-z0-9_]{0,40})\s*$", content)
+                    what += " (invalid arguments%s)" % (" at " + field.group(1) if field else "")
+                raise TicketSystemUnavailable(f"GoodQA returned {what} for {tool}") from None
             raise TicketSystemUnavailable(f"GoodQA returned an unexpected shape for {tool}") from None
         if result.get("isError"):
             # GoodQA wraps payloads as {"dataTrust": ..., "data": {...}}; errors sit under data.error.

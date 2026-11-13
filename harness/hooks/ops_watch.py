@@ -106,6 +106,8 @@ def defaults(host: str) -> dict:
         "point_events": {"prefixes": ["heavy:", "ah-" + "kill:", "bgwait:"], "ttl_h": 6},  # bgwait: a waiter gave up (goodqa#15565)
         # goodqa#15070: timer jobs on other hosts, read over ssh: [{"host", "unit", "user": bool, "max_age_h"}]
         "remote_units": [],
+        # goodqa#15771: read-only capacity watch of a Proxmox pool: [{"host", "storage", "mount", "watch_vms": [ids]}]
+        "proxmox_pools": [],
         "sinks": {"comment": {"mode": "none"}, "deadman": [], "comment_min_interval_s": 1800},
     }
 
@@ -223,8 +225,9 @@ def _parse_slots(data: bytes) -> list:
             obj = json.loads(data[i:i + SLOT_BYTES].decode("utf-8", "replace").strip())
         except ValueError:
             continue
-        if isinstance(obj, dict) and isinstance(obj.get("seq"), int):
-            out.append(obj)
+        if (isinstance(obj, dict) and isinstance(obj.get("seq"), int)
+                and all(isinstance(obj.get(k), (str, type(None))) for k in ("host", "source", "key"))):
+            out.append(obj)  # a row whose host, source or key is not a string would crash every reader
     return sorted(out, key=lambda e: e["seq"])
 
 
@@ -243,6 +246,8 @@ def emit(event: dict, path: Path | None = None, home: Path | None = None) -> int
     missing = [k for k in REQUIRED if not event.get(k)]
     if missing:
         raise ValueError(f"alert event missing {missing}")
+    if not all(isinstance(event.get(k), str) for k in ("host", "source", "key")):
+        raise ValueError("alert event host, source and key must be strings")
     if event["severity"] not in SEVERITIES or event["event"] not in ("raise", "clear"):
         raise ValueError("bad severity or event")
     event = dict(event, message=redact(event["message"]), detail=redact_obj(event.get("detail") or {}))
@@ -1352,6 +1357,231 @@ def _read_unit(out, rec, key, host, unit, svc, tmr, now, max_age):
                          {"host": host, "unit": unit, "age_h": round(hours, 1)}))
 
 
+# ---------------------------------------------------------------- 7c. Proxmox storage pool (goodqa#15771)
+# Read-only capacity watch of a dir-type Proxmox pool whose thin guest disks can fill it. One bounded ssh call
+# runs a fixed script (pvesm status, qm list/config, du -sk of the image dirs). The only caller input is a
+# validated host, storage name, mount path and integer VM ids. A failed or unusable read is UNKNOWN, never OK,
+# and nothing the remote side prints is copied into an alert.
+
+POOL_STORAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}")
+POOL_MOUNT = re.compile(r"/[A-Za-z0-9._/-]{1,100}")
+POOL_LOCAL_FILE = re.compile(r"/[A-Za-z0-9._/-]{1,200}")  # ssh_config / known_hosts on the watching host
+POOL_DISK = re.compile(r"^(?:scsi|virtio|sata|ide|efidisk|tpmstate)\d+:\s*([A-Za-z0-9_-]+):[^,\s]*(?P<rest>.*)$")
+POOL_SIZE = re.compile(r"(?:^|,)size=(\d+(?:\.\d+)?)([KMGT]?)(?:,|$)")
+POOL_UNITS = {"": 1 / GIB, "K": KIB / GIB, "M": KIB ** 2 / GIB, "G": 1.0, "T": 1024.0}
+POOL_WARN_PCT, POOL_HIGH_PCT, POOL_CRIT_PCT, POOL_FLOOR_GIB = 85.0, 92.0, 97.0, 20.0
+POOL_GROWTH_GIB_DAY, POOL_GROWTH_MIN_S, POOL_GROWTH_MAX_S = 10.0, 6 * 3600, 48 * 3600
+POOL_SAMPLE_GAP_S, POOL_SAMPLE_KEEP_S, POOL_SAMPLE_MAX = 1800, 48 * 3600, 120
+POOL_UNKNOWN_HIGH_S = 1800
+
+
+def pool_script(storage: str, mount: str) -> str:
+    return (f"echo '##PVESM'; pvesm status --storage {storage}; echo '##QM'; "
+            "for v in $(qm list | awk 'NR>1{print $1}'); do echo \"##VM $v\"; qm config \"$v\"; done; "
+            f"echo '##DU'; du -sk {mount}/images/*; echo '##END'")
+
+
+def _pool_num(text):
+    try:
+        v = float(text)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v >= 0 else None
+
+
+def parse_pool_status(text: str, storage: str):
+    """(total, used, avail) in bytes from `pvesm status` output, or None for anything unusable."""
+    lines = [l.split() for l in (text or "").splitlines() if l.strip()]
+    if not lines:
+        return None
+    # pve 8 prints "Total (KiB)  Used (KiB) Available (KiB)"; older output has no unit. Either all three size columns say
+    # (KiB) or none does; any other unit is refused rather than misread.
+    head = lines[0]
+    units = [t for t in head if t.startswith("(")]
+    if units not in ([], ["(KiB)"] * 3) or (units and head[3:9] != ["Total", "(KiB)", "Used", "(KiB)", "Available",
+                                                                     "(KiB)"]):
+        return None
+    if [t for t in head if not t.startswith("(")][:6] != ["Name", "Type", "Status", "Total", "Used", "Available"]:
+        return None
+    rows = [l for l in lines[1:] if l[0] == storage]
+    if len(rows) != 1 or len(rows[0]) != 7 or rows[0][2] != "active":
+        return None
+    total, used, avail = (_pool_num(x) for x in rows[0][3:6])
+    if None in (total, used, avail) or total <= 0 or used > total or avail > total:
+        return None
+    return total * KIB, used * KIB, avail * KIB
+
+
+def parse_pool_probe(text: str, storage: str):
+    """{status, vms: {id: {sizes: gib|None}}, du: {id: bytes}} or None when the output is unusable or truncated."""
+    sections, cur, vm = {}, None, None
+    for line in (text or "").splitlines():
+        m = re.fullmatch(r"##(PVESM|QM|DU|END)", line)
+        if m:
+            cur, vm = m.group(1), None
+            sections.setdefault(cur, [])
+            continue
+        m = re.fullmatch(r"##VM (\d{1,10})", line)
+        if m and cur == "QM":
+            vm = int(m.group(1))
+            sections.setdefault("VM", {}).setdefault(vm, [])
+            continue
+        if cur == "QM" and vm is not None:
+            sections["VM"][vm].append(line)
+        elif cur in ("PVESM", "DU"):
+            sections[cur].append(line)
+    if "END" not in sections:
+        return None
+    status = parse_pool_status("\n".join(sections.get("PVESM", [])), storage)
+    if status is None:
+        return None
+    vms = {}
+    for vm_id, cfg in sections.get("VM", {}).items():
+        total, unsized = 0.0, False
+        for line in cfg:
+            m = POOL_DISK.match(line.strip())
+            if not m or m.group(1) != storage or "media=cdrom" in m.group("rest"):
+                continue
+            size = POOL_SIZE.search(m.group("rest"))
+            if not size:
+                unsized = True
+                continue
+            total += float(size.group(1)) * POOL_UNITS[size.group(2)]
+        # no config lines at all: unknown, not zero; a disk without a size keeps the sized ones and is flagged
+        vms[vm_id] = {"gib": None if not cfg or (unsized and not total) else total, "unsized": unsized}
+    du = {}
+    for line in sections.get("DU", []):
+        m = re.fullmatch(r"(\d+)\s+\S*/images/(\d{1,10})", line.strip())
+        if m:
+            du[int(m.group(2))] = int(m.group(1)) * KIB
+    return {"status": status, "vms": vms, "du": du}
+
+
+def pool_baseline(samples: list, now: float):
+    """The stored sample 6 h to 48 h old that is closest to 24 h, else None."""
+    ok = [s for s in samples if POOL_GROWTH_MIN_S <= now - s[0] <= POOL_GROWTH_MAX_S]
+    return min(ok, key=lambda s: abs(now - s[0] - 24 * 3600)) if ok else None
+
+
+def _pool_sample_ok(s) -> bool:
+    """A stored sample is [time, used_bytes, {vm id: bytes}] as _pool_alerts writes it."""
+    num = (int, float)
+    return (isinstance(s, (list, tuple)) and len(s) == 3 and type(s[0]) in num and type(s[1]) in num
+            and isinstance(s[2], dict) and all(type(v) in num for v in s[2].values()))
+
+
+def check_proxmox_pool(cfg, state, runner, now):
+    out = []
+    seen = state.setdefault("proxmox_pools", {})
+    for entry in cfg.get("proxmox_pools") or []:
+        entry = entry if isinstance(entry, dict) else {}
+        host = str(entry.get("host", ""))
+        storage = str(entry.get("storage", "local"))
+        mount = str(entry.get("mount", "/var/lib/vz")).rstrip("/") or "/"
+        watch = entry.get("watch_vms", [])
+        jump, ssh_config, known_hosts = (str(entry.get(k, "")) for k in ("jump", "ssh_config", "known_hosts"))
+        base = f"{host[:64]}:{mount[:100]}"
+        if (not REMOTE_HOST.fullmatch(host) or not POOL_STORAGE.fullmatch(storage) or not POOL_MOUNT.fullmatch(mount)
+                or ".." in mount or not isinstance(watch, list)
+                or any(type(v) is not int or not 0 < v < 10 ** 10 for v in watch)
+                or (jump and not REMOTE_HOST.fullmatch(jump))
+                or any(p and (not POOL_LOCAL_FILE.fullmatch(p) or ".." in p) for p in (ssh_config, known_hosts))):
+            out.append(alert("proxmox_pool", f"disk:config:{base}", "warning",
+                             "proxmox pool entry has an unsafe host, storage, mount or VM id", {"host": host[:64]}))
+            continue
+        rec = seen.get(base)
+        if not isinstance(rec, dict) or not isinstance(rec.get("first_try"), (int, float)):
+            rec = seen[base] = {"first_try": now, "samples": []}  # a corrupt saved record restarts, never crashes
+        mark = len(out)
+        try:
+            # optional jump host, ssh config and a pinned known_hosts file (host-key checking stays strict)
+            opts = (["-F", ssh_config] if ssh_config else []) + (["-J", jump] if jump else []) + (
+                ["-o", f"UserKnownHostsFile={known_hosts}", "-o", "StrictHostKeyChecking=yes"] if known_hosts else [])
+            try:
+                rc, text = runner(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", *opts, "--", host,
+                                   pool_script(storage, mount)], 25)
+            except (subprocess.TimeoutExpired, OSError):
+                rc, text, why = 255, "", "unreachable or timed out"
+            else:
+                why = "unreachable or ssh failed" if rc != 0 else "unusable output"
+            parsed = parse_pool_probe(text, storage) if rc == 0 and len(text or "") <= 1048576 else None
+            if parsed is not None:
+                total, used, avail = parsed["status"]
+                _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, used, avail, now)
+                rec["ok_at"] = now
+                rec["alerts"] = out[mark:]
+                continue
+        except Exception:  # undecodable output, a corrupt sample, anything else: UNKNOWN, never a generic check error
+            del out[mark:]
+            why = "probe or parse error"
+            if not isinstance(rec.get("samples"), list) or not all(_pool_sample_ok(s) for s in rec["samples"]):
+                rec["samples"] = []
+        prior = rec.get("alerts") if isinstance(rec.get("alerts"), list) else []
+        out.extend(a for a in prior if isinstance(a, dict) and a.get("check") == "proxmox_pool")
+        ok_at = rec.get("ok_at") if isinstance(rec.get("ok_at"), (int, float)) else rec["first_try"]
+        stale = now - ok_at > POOL_UNKNOWN_HIGH_S
+        out.append(alert("proxmox_pool", f"disk:unknown:{base}", "high" if stale else "warning",
+                         f"UNKNOWN: cannot read {host} {storage} pool ({why}); capacity is not being watched",
+                         {"host": host[:64], "reason": why}))
+    return out
+
+
+def _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, used, avail, now):
+    pct = 100.0 * used / total
+    free_gib = avail / GIB
+    samples = rec.setdefault("samples", [])
+    samples[:] = [s for s in samples if 0 <= now - s[0] <= POOL_SAMPLE_KEEP_S]  # also drops clock-skewed future rows
+    vm_used = {str(v): parsed["du"].get(v) for v in watch}
+    last = max((s[0] for s in samples), default=None)
+    base_sample = pool_baseline(samples, now)
+    if last is None or now - last >= POOL_SAMPLE_GAP_S:
+        samples.append([now, int(used), {k: v for k, v in vm_used.items() if v is not None}])
+        del samples[:-POOL_SAMPLE_MAX]
+    days = (now - base_sample[0]) / 86400 if base_sample else None
+
+    def per_day(delta):
+        return round(max(delta, 0) / GIB / days, 2) if days else None
+
+    provisioned = [v["gib"] for v in parsed["vms"].values()]
+    unsized = sorted(str(k) for k, v in parsed["vms"].items() if v["gib"] is None or v.get("unsized"))
+    prov_gib = round(sum(g for g in provisioned if g), 2)
+    vms = {}
+    for v in watch:
+        gib = (parsed["vms"].get(v) or {}).get("gib")
+        actual = parsed["du"].get(v)
+        old = (base_sample[2].get(str(v)) if base_sample else None)
+        vms[str(v)] = {"allocated_gib": None if gib is None else round(gib, 2),
+                       "actual_gib": None if actual is None else round(actual / GIB, 2),
+                       "growth_gib_day": per_day(actual - old) if actual is not None and old is not None else None}
+    detail = {"host": host[:64], "storage": storage, "used_pct": round(pct, 1), "free_bytes": int(avail),
+              "total_bytes": int(total), "total_gib": round(total / GIB, 2), "provisioned_gib": prov_gib,
+              "overcommit_ratio": round(prov_gib / (total / GIB), 2), "vms": vms, "unsized_vms": unsized}
+    sev = None
+    if pct >= POOL_CRIT_PCT or free_gib < POOL_FLOOR_GIB:
+        sev = "critical"
+    elif pct >= POOL_HIGH_PCT:
+        sev = "high"
+    elif pct >= POOL_WARN_PCT:
+        sev = "warning"
+    if sev:
+        out.append(alert("proxmox_pool", f"disk:volume:{base}", sev,
+                         f"{host} {storage} pool {pct:.1f}% used, {free_gib:.0f} GiB free, "
+                         f"{detail['overcommit_ratio']}x overcommitted", detail))
+    for v in watch:  # a watched VM that cannot be read must be visible even when the pool is below every threshold
+        if (parsed["vms"].get(v) or {}).get("gib") is None or parsed["du"].get(v) is None:
+            out.append(alert("proxmox_pool", f"disk:vmunknown:{base}:{v}", "warning",
+                             f"UNKNOWN: VM {v} config or disk usage missing from the {host} {storage} probe; "
+                             "its growth is not being watched", {"host": host[:64], "vm": v}))
+    if base_sample:
+        rate = per_day(used - base_sample[1])
+        if rate is not None and rate > POOL_GROWTH_GIB_DAY:
+            to_full = free_gib / rate
+            out.append(alert("proxmox_pool", f"disk:growth:{base}", "high" if to_full <= 3 else "warning",
+                             f"{host} {storage} pool growing {rate:.0f} GiB/day, full in about {to_full:.1f} days",
+                             {"host": host[:64], "growth_gib_day": rate, "free_gib": round(free_gib, 1),
+                              "days_to_full": round(to_full, 1), "threshold_gib_day": POOL_GROWTH_GIB_DAY}))
+
+
 # ---------------------------------------------------------------- 8. owner liveness
 
 TERMINAL_EVENTS = ("handoff", "result", "done", "delivered")
@@ -1787,6 +2017,7 @@ DEFAULT_CHECKS = {
     "liveness": lambda c, s, r, n: check_liveness(c, s, r, n) if c["liveness"].get("enabled") else [],
     "peers": check_peers,
     "remote_units": check_remote_units,
+    "proxmox_pool": check_proxmox_pool,
     "deploys": lambda c, s, r, n: check_deploys(c, s, r, n) if (c.get("deploys") or {}).get("enabled", True) else [],
     "mission": lambda c, s, r, n: check_mission(c, s, r, n) if (c.get("mission") or {}).get("enabled", True) else [],
 }
@@ -1976,6 +2207,87 @@ def compact(e: dict) -> dict:
     return {k: e.get(k) for k in ("host", "event", "severity", "key", "message", "detail", "seq", "at")}
 
 
+def queue_events(cfg: dict, state: dict, news: list, now: float) -> None:
+    """Queue alert transitions for the digest and, for critical raises, the deadman mail (at most one mail per key per 6 h,
+    so a flapping threshold does not flood; no deadman configured: nothing to queue)."""
+    state["pending_comment"] = ((state.get("pending_comment") or []) + [compact(e) for e in news])[-500:]
+    sent = state.setdefault("deadman_sent", {})
+    for e in news:
+        if (cfg["sinks"].get("deadman") and e["event"] == "raise" and e["severity"] == "critical"
+                and now - sent.get(e["key"], 0) > 6 * 3600):
+            state.setdefault("pending_deadman", []).append(compact(e))
+            sent[e["key"]] = now
+
+
+FWD_KEYS_MAX = 200  # keys remembered as forwarded-raised (a bounded state slot)
+
+
+def forward_foreign(cfg: dict, home: Path, state: dict, ring: Path, now: float) -> list:
+    """goodqa#15827: critical raise and clear events that a foreign source wrote to this host's ring (fabd-health, any script
+    using `ops_watch.py emit`) never reached the digest or the deadman queue, because only run_once's own transitions are
+    queued. Returns the ring rows to queue now and advances state["fwd_seq"] (persisted with the queues in one state write, so
+    a crash re-forwards rather than loses). Rules: source other than ops-watch, this host, severity critical for a raise, a
+    clear only for a key that was forwarded as raised, text refreshes (updated, reasserted) skipped. The first run (or a ring
+    whose sequence restarted below the stored one) forwards only what is standing, never the history."""
+    host = cfg["host"]
+    rows = sorted(read_ring(ring), key=lambda e: e.get("seq") or 0)
+    try:
+        info = os.stat(ring)
+    except FileNotFoundError:
+        state.setdefault("fwd_seq", 0)  # no ring yet: everything that appears later is new
+        return []
+    except OSError:
+        return []  # the ring cannot be examined: unknown, never a reset; position and keys stay as they are
+    ring_id = f"{info.st_dev}:{info.st_ino}"
+    top = max([e.get("seq") or 0 for e in rows] or [0])
+    seen = state.get("fwd_seq")
+    if isinstance(seen, int) and not rows:
+        return []  # an unreadable or empty read after a forward is "unknown": keep fwd_seq, never replay on the next good read
+    active = state.setdefault("fwd_active", {})  # key -> seq of the raise that was forwarded
+    stored_id = state.get("fwd_ring")
+    low = isinstance(seen, int) and top < seen
+    state["fwd_low"] = (state.get("fwd_low") or 0) + 1 if low else 0
+    # a real reset needs a positive signal: the ring file itself was replaced, or the sequence stayed below the stored
+    # position on three consecutive runs; one low read (a torn newest slot) is not one
+    recreated = isinstance(seen, int) and ((bool(stored_id) and stored_id != ring_id) or state["fwd_low"] >= 3)
+    if low and not recreated:
+        return []
+    out = []
+    if not isinstance(seen, int) or recreated:  # first run or a recreated ring
+        before = dict(active)
+        active.clear()
+        state["fwd_low"] = 0
+        for (h, src, key), e in latest_by_key(rows).items():
+            if h != host or src == SOURCE:
+                continue
+            if e.get("event") == "raise" and e.get("severity") == "critical":
+                out.append(e)
+                active[f"{src}/{key}"] = e.get("seq") or 0
+            elif e.get("event") == "clear" and f"{src}/{key}" in before:
+                out.append(e)  # a clear the old sequence never delivered: the digest must not keep it standing
+    else:
+        for e in rows:
+            if (e.get("seq") or 0) <= seen or ring_host(e) != host or e.get("source") == SOURCE:
+                continue
+            detail = e.get("detail") if isinstance(e.get("detail"), dict) else {}  # emit() lets any JSON through as detail
+            if not isinstance(e.get("key"), str) or not isinstance(e.get("source"), str):
+                continue  # one malformed foreign row must never stop the alert path
+            ident = f"{e.get('source')}/{e.get('key')}"
+            if e.get("event") == "raise" and e.get("severity") == "critical":
+                if detail.get("updated") or detail.get("reasserted"):
+                    continue  # a text refresh is not a new alert
+                active[ident] = e.get("seq") or 0
+                out.append(e)
+            elif e.get("event") == "clear" and ident in active:  # an expiry clear carries updated=true and still closes the raise
+                del active[ident]
+                out.append(e)
+    state["fwd_seq"] = top
+    state["fwd_ring"] = ring_id
+    while len(active) > FWD_KEYS_MAX:
+        active.pop(min(active, key=active.get))
+    return out
+
+
 def _transition(host, kind, key, a, extra=None) -> dict:
     return {"host": host, "source": SOURCE, "event": kind, "severity": a.get("severity", "info"), "key": key,
             "message": a.get("message", ""), "detail": {**(a.get("detail") or {}), **(extra or {})},
@@ -2094,14 +2406,7 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
                 rc = 2
                 print(f"ops-watch: alert ring write failed ({type(exc).__name__}): {e['key']}", file=sys.stderr)
                 active.get(e["key"], {}).pop("written", None)  # not written: next run reads what the ring really says
-        news = [e for e in evs if not (e.get("detail") or {}).get("updated")]  # a text refresh alerts nobody
-        state["pending_comment"] = ((state.get("pending_comment") or []) + [compact(e) for e in news])[-500:]
-        sent = state.setdefault("deadman_sent", {})
-        for e in news:  # critical raises, at most one deadman mail per key per 6 h (flapping thresholds)
-            if (cfg["sinks"].get("deadman") and e["event"] == "raise" and e["severity"] == "critical"
-                    and now - sent.get(e["key"], 0) > 6 * 3600):  # no deadman configured: nothing to queue
-                state.setdefault("pending_deadman", []).append(compact(e))
-                sent[e["key"]] = now
+        queue_events(cfg, state, [e for e in evs if not (e.get("detail") or {}).get("updated")], now)  # a text refresh alerts nobody
         try:
             save_state(home, state)
         except (OSError, ValueError) as exc:
@@ -2110,6 +2415,14 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
 
     events += expire_point_events(cfg, latest_by_key(read_ring(ring)), active, now, ring)
     persist(events)  # durable before any slow sink: a crash or timeout below cannot re-raise these
+    foreign = forward_foreign(cfg, home, state, ring, now)
+    if foreign:
+        queue_events(cfg, state, [dict(e, detail=e["detail"] if isinstance(e.get("detail"), dict) else {}) for e in foreign], now)
+        try:
+            save_state(home, state)  # queues and the forwarded seq in one write: idempotent across a restart
+        except (OSError, ValueError) as exc:
+            rc = 2
+            print(f"ops-watch: state write failed ({type(exc).__name__})", file=sys.stderr)
     latest = latest_by_key(read_ring(ring))
     reassert = [_transition(host, "raise", k, a, {"reasserted": True}) for k, a in sorted(active.items())
                 if latest.get((host, SOURCE, k), {}).get("event") != "raise"]

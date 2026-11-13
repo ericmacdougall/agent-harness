@@ -70,7 +70,11 @@ class Base(unittest.TestCase):
     def as_main(self, argv):
         import caller_identity  # noqa: PLC0415
         """main's PreToolUse hook stamps exactly this argv; the next mc.main(argv) claims it."""
-        caller_identity.put_stamp("mission-main", [argv[0], mc.argv_key(argv)], session=SESSION, home=self.home)
+        main_tr = self.home / ".claude" / "projects" / "p" / f"{SESSION}.jsonl"  # F1: stamps are bound to a call
+        main_tr.parent.mkdir(parents=True, exist_ok=True)
+        main_tr.touch()
+        caller_identity.put_stamp("mission-main", [argv[0], mc.argv_key(argv)], session=SESSION, home=self.home,
+                                  tool_use_id="toolu_01ASMAIN0000000000000001", transcript=main_tr)
         self.addCleanup(mc._PROOF.clear)
 
     def cli(self, mod, argv):

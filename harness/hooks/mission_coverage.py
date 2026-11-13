@@ -12,7 +12,8 @@ Goals live in ONE canonical file, ~/.agent-harness/mission/goals.json (dir 0700,
      source, renewal}, wait_count, bound [full agent ids main bound to the goal], retire {source},
      done_evidence [{kind: 'deploy'|'really_tested', ref, session}], repos [paths], dashboard {...informational},
      target {text, source} (main-only; the source resolves to the user's own words), aliases [words the status lint
-     matches], evidence [{id, session, wal, kind: 'deploy'|'live_test'|'test', at, by}] (goodqa#15754: WAL rows that
+     matches], evidence [{id, session, wal, kind: 'deploy'|'live_test'|'test', at, by, row_sha, row_verdict, row_at}]
+     (row_*: the row as attach saw it, so a later rewrite reads TAMPERED, red-team F2) (goodqa#15754: WAL rows that
      `ah goals` reads with no time window; `attach` checks each id exists)}]}
 Every write goes through this tool and appends a hash-chained row to ~/.agent-harness/state/mission-goals-audit.jsonl
 (rotated into chained segments past MAX_AUDIT_BYTES); a goals file that no longer matches the chain head is tampered.
@@ -21,7 +22,10 @@ Main-only commands (set --ticket/--repo, defer --user-source/--ticket, import-in
 set-session, bind, retire) need a one-shot stamp that main's own PreToolUse hook (mission_gate.py pretool,
 caller_identity.is_main) writes for that exact argument list (argv_key) when the script runs at shell command
 position; the command consumes it first, before parsing (claim_main). A sub-agent's shell, a copied script, a cron job,
-an echoed or here-document line, and a leftover stamp from a different command find none. Once goals.json names a
+an echoed or here-document line, and a leftover stamp from a different command find none. The stamp is bound to main's
+tool call (goodqa#15754 red-team F1): it carries main's tool_use_id and is honoured only while that call is still running
+and at most MAIN_STAMP_TTL_SECONDS old, so a stamp of a call that never ran (denied by another hook, rejected, or
+`cd /nonexistent && ...`) is dead for every later process. Once goals.json names a
 mission session, only that session's main passes (require_main; set_session has the hand-over rule). Each of them
 raises a high `mission:goals:changed` ops alert, as does every ask or ticket wait. Stamps are not signed: a same-user
 process can write one (the documented threat model, see caller_identity.py and docs/operations.md).
@@ -100,11 +104,14 @@ GENESIS = "0" * 64
 MAIN_ONLY = ("set", "defer", "import-initiatives", "reseal", "activate", "set-session", "bind", "retire", "attach")
 # attach is open to an owner whose evidence row (or its WAL) names the goal; main's stamp lifts that and allows --remove
 ATTACH_KINDS = ("deploy", "live_test", "test")
+PIN_VERDICTS = ("DEPLOY", "PASS", "FAIL", "UNSTATED")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_ATTACHED = 50
 MAX_ALIASES = 12
 WAL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}\.jsonl$")
 ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9 ./#+-]{1,39}$")
 STAMP_PURPOSE = "mission-main"
+MAIN_STAMP_TTL_SECONDS = 60  # F1: the stamp lives only as long as main's own call (bound to its tool_use_id)
 # Every user quote (defer, retire, takeover) is judged by user_words_ok on the whole sentence, as written: no word
 # is ever removed to make a phrase pass (r14 F3: eade6bd deleted "not now" before the refusal check).
 REFUSAL_WORDS = re.compile(r"\b(?:don't|dont|do not|never|not|no|nor|neither|if|unless|maybe|perhaps|whether|should|"
@@ -191,6 +198,35 @@ def parse_ts(value) -> float:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
     return parsed.timestamp()
+
+
+def row_digest(rec) -> str:
+    """sha256 of a WAL row as canonical JSON (sorted keys, no spaces, ASCII escapes): what attach pins and ah goals
+    re-checks (F2). Canonical rather than the raw line, so re-serialising an unchanged row (key order, spacing) is not
+    a change. ensure_ascii=True (PR 226 review L2): every character, a lone surrogate included, has its own escape, so
+    no two different rows share one serialisation (ensure_ascii=False with utf-8 "replace" mapped lone surrogates and
+    "?" to the same bytes)."""
+    return hashlib.sha256(json.dumps(rec, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+                          .encode("ascii")).hexdigest()
+
+
+def legacy_row_digest(rec):
+    """The first pinning digest (ensure_ascii=False, utf-8), for pins written before row_digest changed; None for a
+    row the old digest cannot tell apart from another (one holding a lone surrogate, which "replace" turned into
+    "?"). For an ASCII-only row both digests are equal."""
+    try:
+        data = json.dumps(rec, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return hashlib.sha256(data).hexdigest()
+
+
+def row_matches(pin_sha, rec) -> bool:
+    """Whether a pinned row_sha still matches the WAL row: the current digest, or the legacy one where it is
+    collision-free (pins made by the first PR 226 build stay valid rather than all reading TAMPERED)."""
+    if not isinstance(pin_sha, str) or not pin_sha:
+        return False
+    return pin_sha == row_digest(rec) or pin_sha == legacy_row_digest(rec)
 
 
 def sha(data: bytes) -> str:
@@ -481,6 +517,12 @@ def _check_goal(g, index: int) -> dict:
                     or r.get("kind") not in ATTACH_KINDS:
                 raise ValueError(f"{where}: evidence rows need id (w + 11 hex), session, wal and kind "
                                  f"{'|'.join(ATTACH_KINDS)}")
+            pinned = [k for k in ("row_sha", "row_verdict", "row_at") if k in r]
+            if pinned and (len(pinned) != 3 or not isinstance(r["row_sha"], str) or not SHA256_RE.match(r["row_sha"])
+                           or r["row_verdict"] not in PIN_VERDICTS or not isinstance(r["row_at"], str)
+                           or len(r["row_at"]) > 64):
+                raise ValueError(f"{where}: an evidence pin needs row_sha (sha256 hex), row_verdict "
+                                 f"{'|'.join(PIN_VERDICTS)} and row_at (a timestamp string)")
     return g
 
 
@@ -750,13 +792,14 @@ def claim_main(argv, home: Path) -> None:
     if not argv or argv[0] not in MAIN_ONLY:
         return
     import caller_identity  # noqa: PLC0415
-    stamp = caller_identity.take_stamp(STAMP_PURPOSE, [argv[0], argv_key(argv)], home=home)
+    stamp = caller_identity.take_stamp(STAMP_PURPOSE, [argv[0], argv_key(argv)], home=home, bound=True,
+                                       ttl=MAIN_STAMP_TTL_SECONDS)
     if stamp is not None:
         _PROOF.update(cmd=argv[0], stamp=stamp)
 
 
 def require_main(home: Path, cmd: str, handover: bool = False) -> dict:
-    """The stamp claim_main took for this command (single use, at most 10 minutes old) from the main session that
+    """The stamp claim_main took for this command (single use, bound to main's still-running call, at most 60 s old) from the main session that
     owns the mission; MissionError otherwise. Once goals.json names a mission session, another top-level session
     (another main, or a sub-agent's own `claude -p`) is refused even with a stamp of its own (M1). handover=True
     (set-session only) returns a foreign stamp so set_session can apply its hand-over rule."""
@@ -764,8 +807,8 @@ def require_main(home: Path, cmd: str, handover: bool = False) -> dict:
     _PROOF.clear()
     if stamp is None:
         raise MissionError(f"`{cmd}` is main-only: only the main agent may run it, and main's PreToolUse hook saw no "
-                           f"main command `{SCRIPT} {cmd} ...` with exactly these arguments in the last 10 minutes (run "
-                           "it as a plain command, not inside echo, a here-document, bash -c or a script). A sub-agent "
+                           f"main command `{SCRIPT} {cmd} ...` with exactly these arguments in this still-running call (run "
+                           "it as a plain foreground command, not inside echo, a here-document, bash -c or a script). A sub-agent "
                            "asks main to run it.")
     mission = mission_session_of(home)
     caller = str(stamp.get("session") or "").lower()
@@ -985,6 +1028,7 @@ def attach_evidence(home: Path, goal_id: str, wid: str, *, kind: str = "", sessi
                            "(event deploy/release/install or a DEPLOYED/INSTALLED/RELEASED note naming a sha or "
                            "version) are evidence")
     kind = kind or found_kind
+    pin_verdict = goals_view.verdict(rec) or ("DEPLOY" if found_kind == "deploy" else "UNSTATED")
     if kind not in ATTACH_KINDS or (found_kind == "deploy") != (kind == "deploy"):
         raise MissionError(f"--kind {clean(kind, 20)} does not fit a {found_kind} row")
     loaded = load_goals(home)
@@ -1000,8 +1044,17 @@ def attach_evidence(home: Path, goal_id: str, wid: str, *, kind: str = "", sessi
         if stamp is None and any(r.get("id") == wid and r.get("by") == "main" for r in g.get("evidence") or []):
             # spec rev 3 NEG-4 (red-team H3): a re-attach would rewrite main's row (by, kind); only main changes it
             raise MissionError(f"{wid} is already attached to {goal_id} by main; only main can change or remove it")
+        if stamp is None and any(r.get("id") == wid and r.get("row_sha") and not row_matches(r["row_sha"], rec)
+                                 for r in g.get("evidence") or []):
+            # PR 226 review H1 (probe_b3): an owner who rewrote its own attached row must not re-pin it; the changed
+            # row keeps scoring by its pinned verdict until main reads it and re-attaches (or removes) it
+            raise MissionError(f"{wid} changed since it was attached to {goal_id}; only main can re-attach it "
+                               "(ask main to read the row and re-attach or remove it)")
         rows = [r for r in g.get("evidence") or [] if r.get("id") != wid]
-        rows.append({"id": wid, "session": session, "wal": wal_name, "kind": kind, "at": iso(time.time()), "by": by})
+        # F2: pin the row as attach saw it; ah goals marks it TAMPERED when the WAL row changes later (a re-attach
+        # re-pins: main's re-attach is how a legacy, unpinned entry gets its pin)
+        rows.append({"id": wid, "session": session, "wal": wal_name, "kind": kind, "at": iso(time.time()), "by": by,
+                     "row_sha": row_digest(rec), "row_verdict": pin_verdict, "row_at": str(rec.get("at") or "")[:64]})
         if len(rows) > MAX_ATTACHED:
             raise MissionError(f"goal {goal_id} already has {MAX_ATTACHED} evidence rows; main removes stale ones")
         g["evidence"] = rows
