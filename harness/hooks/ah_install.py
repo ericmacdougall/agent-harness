@@ -16,6 +16,12 @@ around a guard. This command is the sanctioned route:
   * an audit row on the Mac before the first remote write and after the run, one on the host; an unknown outcome is never
     reported as installed or refused; a host with an unfinished run refuses new runs until it is resumed or rolled back.
 
+This machine (goodqa#15913): `--host local` (~/.claude/hooks) and `--host local-codex` (~/.codex/agent-harness, names from
+install_codex.py's DELIVERY_HELPERS at the commit) run the SAME constant program as a local subprocess, with no shell and no
+ssh, an allowlisted environment and a fixed root token (never a path), so every step above is unchanged. The host-side audit
+row is skipped there: that file is the caller's own audit file, which already holds the start and result rows. `--host local`
+also reports the Codex copies that differ from the bytes it installed, so the Codex home is never silently left behind.
+
 Threat model: careless or hurried agents, not one that edits this module or the audit file.
 """
 from __future__ import annotations
@@ -28,11 +34,16 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
 
 HOSTS = ("t2-dev", "ah-mac-mini")
+LOCAL_TARGETS = {"local": "claude", "local-codex": "codex"}  # this machine, by a fixed root token the program maps to a fixed directory
+LOCAL_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "SHELL")  # plus HOME; nothing else of the caller's environment
+NAME_LISTS = {"claude": ("install.py", "HOOKS"), "codex": ("install_codex.py", "DELIVERY_HELPERS")}
+CODEX_DIR = (".codex", "agent-harness")
 CANONICAL_URL = "https://github.com/ericmacdougall/agent-harness.git"
 ALLOW_FILE = False  # tests only: lets the fetch read a local bare repository standing in for the canonical URL
 REMOTE_PREFIX = ""  # tests only: a `HOME=... ` assignment so a real ssh-to-localhost run uses a disposable home
@@ -59,13 +70,17 @@ def refuse(message, code="refused", exit_code=2, data=None):
 
 
 # ----------------------------------------------------------------------------- the constant remote program
-# Runs on the host as `python3 -I -c SCRIPT OP JSON`, file bytes on stdin for `stage`. Python 3.9 compatible, standard
-# library only. Every path is built from the fixed hooks directory and a name matched against NAME_RE; it never reads a
-# path from the caller.
+# Runs on the host as `python3 -I -c SCRIPT OP JSON [ROOT]`, file bytes on stdin for `stage`. Python 3.9 compatible, standard
+# library only. Every path is built from a fixed hooks directory and a name matched against NAME_RE; it never reads a
+# path from the caller. ROOT is a token from ROOTS (absent over ssh: claude).
 REMOTE_SCRIPT = r'''
 import hashlib, json, os, re, shutil, stat, subprocess, sys, time, uuid
 NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
-HOOKS = os.path.expanduser("~/.claude/hooks")
+ROOTS = {"claude": "~/.claude/hooks", "codex": "~/.codex/agent-harness"}
+ROOT = sys.argv[3] if len(sys.argv) > 3 else "claude"
+if ROOT not in ROOTS:
+    raise SystemExit("bad root")
+HOOKS = os.path.expanduser(ROOTS[ROOT])
 STATE = os.path.join(HOOKS, ".ah-install")
 LOCK = os.path.join(STATE, "lock")
 BACKUPS = os.path.join(STATE, "backups")
@@ -185,7 +200,10 @@ def selftest():
     return res
 
 def check_hooks():
-    st = os.lstat(HOOKS)
+    try:
+        st = os.lstat(HOOKS)
+    except FileNotFoundError:
+        raise SystemExit("the hooks directory does not exist")
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
         raise SystemExit("the hooks directory is a symlink, not a directory or owned by another user")
 
@@ -361,17 +379,39 @@ def ssh_argv(host, op, args):
     return ["ssh", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes", "-o", "ConnectTimeout=10", "--", host, command]
 
 
+def local_argv(root, op, args):
+    """The same constant program on this machine (goodqa#15913): an argv list, no shell, no ssh; `root` is a ROOTS token."""
+    return [sys.executable, "-I", "-c", REMOTE_SCRIPT, op, json.dumps(args), root]
+
+
+def local_env(home):
+    """An allowlisted environment whose HOME is the caller's home: the caller's AH_*, guard switches or PYTHON* settings
+    never reach the program or its self-test."""
+    env = {k: os.environ[k] for k in LOCAL_ENV_KEYS if k in os.environ}
+    env["PATH"] = os.pathsep.join(p for p in env.get("PATH", "").split(os.pathsep) if p.startswith("/")) or "/usr/bin:/bin"
+    env["HOME"] = str(home)
+    return env
+
+
 class Remote:
-    def __init__(self, host, runner):
+    def __init__(self, host, runner, home=None):
         self.host, self.runner, self.started = host, runner, False
+        self.root = LOCAL_TARGETS.get(host)  # None: a fleet host, over ssh
+        self.home = home
+        if self.root and (not sys.executable or home is None):
+            refuse("the local target needs this python's own executable and the caller's home")
 
     def call(self, op, args=None, data=None, timeout=SSH_TIMEOUT, write=False):
         """Run one remote operation. After the first WRITE operation has started, any failure is `unknown`: a killed ssh
-        client does not stop the remote command."""
+        client does not stop the remote command, and a local program killed at its timeout may have stopped part way."""
         if write:
             self.started = True
         try:
-            done = self.runner(ssh_argv(self.host, op, args or {}), input=data, capture_output=True, timeout=timeout)
+            if self.root:
+                done = self.runner(local_argv(self.root, op, args or {}), input=data, capture_output=True, timeout=timeout,
+                                   env=local_env(self.home))
+            else:
+                done = self.runner(ssh_argv(self.host, op, args or {}), input=data, capture_output=True, timeout=timeout)
         except (OSError, subprocess.SubprocessError) as error:
             raise InstallError("lost", "no answer from %s for %s (%s)" % (self.host, op, type(error).__name__), 5 if self.started else 2,
                                {"unknown": self.started})
@@ -388,8 +428,8 @@ class Remote:
 
 # ----------------------------------------------------------------------------- input and source proof
 def check_inputs(host, ref, files, ticket, dry_run, resume, rollback, force_files, allow_older=False):
-    if host not in HOSTS:
-        refuse("--host must be one of %s" % ", ".join(HOSTS))
+    if not isinstance(host, str) or (host not in HOSTS and host not in LOCAL_TARGETS):
+        refuse("--host must be one of %s" % ", ".join(HOSTS + tuple(LOCAL_TARGETS)))
     if resume and rollback:
         refuse("--resume and --rollback cannot be combined")
     for label, run in (("--resume", resume), ("--rollback", rollback)):
@@ -461,9 +501,11 @@ def tree_entries(body):
     return out
 
 
-def fetch_source(ref, names, home, allow_older=False):
+def fetch_source(ref, names, home, allow_older=False, target="claude"):
     """Fetch the canonical main into a FRESH repository, prove REF is merged, return {name: (bytes, blob id)} and the list of
-    HOOKS names at REF. The fresh repository is deleted afterwards."""
+    names at REF that the target's installer ships (NAME_LISTS: install.py HOOKS, or install_codex.py DELIVERY_HELPERS for
+    the Codex harness directory). The fresh repository is deleted afterwards."""
+    list_file, list_name = NAME_LISTS[target]
     root = Path(home) / ".agent-harness" / "install-cache"
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if root.is_symlink() or root.stat().st_uid != os.getuid():
@@ -512,20 +554,20 @@ def fetch_source(ref, names, home, allow_older=False):
                 refuse("%s is not a regular file in the commit (mode %s)" % (path, mode))
             return verified_object(repo, home, "blob", oid), oid, mode
 
-        install_py = blob_at("install.py")[0]
+        install_py = blob_at(list_file)[0]
         listed = None
         for stmt in ast.parse(install_py.decode()).body:
-            if isinstance(stmt, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "HOOKS" for t in stmt.targets):
+            if isinstance(stmt, ast.Assign) and any(isinstance(t, ast.Name) and t.id == list_name for t in stmt.targets):
                 try:
                     listed = [str(x) for x in ast.literal_eval(stmt.value)]
                 except (ValueError, SyntaxError, TypeError):
-                    refuse("the HOOKS tuple in install.py at that commit is not a plain literal")
+                    refuse("the %s tuple in %s at that commit is not a plain literal" % (list_name, list_file))
         if not listed:
-            refuse("install.py at that commit has no HOOKS tuple")
+            refuse("%s at that commit has no %s tuple" % (list_file, list_name))
         out = {}
         for name in names:
             if name not in listed:
-                refuse("%s is not in the installer's HOOKS list at that commit" % name)
+                refuse("%s is not in the installer's %s list at that commit" % (name, list_name))
             if not allow_older:
                 newer = git(repo, ["log", "--format=%H", "%s..%s" % (ref, main), "--", "harness/hooks/" + name], home).stdout.decode().split()
                 if newer:
@@ -750,9 +792,38 @@ def _plan_for(names, sources, state, run):
     return plan
 
 
+def codex_differs(home, plan):
+    """`--host local`: names of this run whose Codex harness copy exists and differs from the bytes just installed. Read only;
+    a missing Codex directory, a missing copy or a symlink is not listed."""
+    folder = Path(home).joinpath(*CODEX_DIR)
+    if not folder.is_dir() or folder.is_symlink():
+        return []
+    out = []
+    for name, item in plan.items():
+        path = folder / name
+        if path.is_file() and not path.is_symlink() and sha256(path.read_bytes()) != item["new_sha"]:
+            out.append(name)
+    return sorted(out)
+
+
+def _with_codex_note(home, remote, plan, extra):
+    if remote.root != "claude":
+        return extra
+    differs = codex_differs(home, plan)
+    if differs:
+        extra["codex_differs"] = differs
+        note = ("the Codex harness copies of %s on this machine differ from the installed bytes; install them with --host "
+                "local-codex" % ", ".join(differs[:10]))
+        extra["note"] = (str(extra["note"]) + "; " + note) if extra.get("note") else note
+    return extra
+
+
 def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster, resume_of, baseline, kind_, allow_older=False):
-    sources, listed, main = fetch_source(ref, files, home, allow_older or bool(resume_of))
-    remote = Remote(host, runner)
+    root = LOCAL_TARGETS.get(host)
+    if root == "codex" and not Path(home).joinpath(*CODEX_DIR).is_dir():
+        refuse("the Codex harness directory ~/%s does not exist on this machine; nothing was changed" % "/".join(CODEX_DIR))
+    sources, listed, main = fetch_source(ref, files, home, allow_older or bool(resume_of), root or "claude")
+    remote = Remote(host, runner, home)
     run = resume_of or new_run_id()
     names = order(files)
     if not dry_run:
@@ -794,7 +865,7 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
     except OSError:
         raise InstallError("audit_failed", "could not write the audit row; nothing was changed", 3, {"ok": False})
     if not applied:
-        return finish(home, run, host, "already_current", 0, {"ref": ref, "files": plan}, ticket, poster, kind_)
+        return finish(home, run, host, "already_current", 0, _with_codex_note(home, remote, plan, {"ref": ref, "files": plan}), ticket, poster, kind_)
     if resume_of:
         remote.started = True  # the interrupted run may have reached its commit: a failure is never a clean refusal, it is unknown or a rollback
     locked = False
@@ -851,6 +922,8 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
                 pass
     for op, args in (("prune", {}), ("audit", {"row": {"event": "result", "run": run, "kind": kind_, "files": {n: {"old": plan[n]["old_sha"], "new": plan[n]["new_sha"]} for n in todo},
                                                        "script_sha256": SCRIPT_SHA256, "agent": agent or None}})):
+        if op == "audit" and remote.root:
+            continue  # this machine: the host audit file IS the caller's audit file, which already holds the start and result rows
         try:
             remote.call(op, args)
         except InstallError:
@@ -863,7 +936,7 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
         extra["registration_needed"] = True
         extra["note"] = ("hooks declared by the new manifest but not registered in settings.json on %s (they do not run "
                          "until registered): %s" % (host, ", ".join(unregistered[:10])))
-    return finish(home, run, host, "installed", 0, extra, ticket, poster, kind_)
+    return finish(home, run, host, "installed", 0, _with_codex_note(home, remote, plan, extra), ticket, poster, kind_)
 
 
 def _keep_mac_copy(home, remote, run, name, old_sha):
@@ -947,7 +1020,7 @@ def rollback(run_id, ticket, force_files=(), home=None, session="", agent="", ru
         refuse("host %s has another unfinished run (%s)" % (host, busy[0]), "unfinished_run")
     plan = row["files"]
     names = order([n for n in plan if plan[n]["action"] in ("new", "replaced")])
-    remote = Remote(host, runner)
+    remote = Remote(host, runner, home)
     state = remote.call("probe", {"names": names})["files"]
     to_restore, notes = [], {}
     for name in names:

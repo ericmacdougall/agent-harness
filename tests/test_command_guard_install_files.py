@@ -89,6 +89,35 @@ class Forms(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("main agent", message)
 
+    def test_the_local_targets_pass_for_main_and_are_refused_for_a_sub_agent(self):  # goodqa#15913 AC-5, NEG-1
+        forms = [GOOD.replace("--host t2-dev", "--host " + host) for host in ("local", "local-codex")]
+        forms += ['python3 -I ~/.claude/hooks/ah.py install-files --host local --rollback ins-0123456789ab --ticket "GoodQA a#1"',
+                  'python3 -I ~/.claude/hooks/ah.py install-files --host local-codex --resume ins-0123456789ab --ticket "GoodQA a#1"',
+                  'python3 -I ~/.claude/hooks/ah.py install-files --host local --from-ref %s --file command_guard.py --dry-run' % ("a" * 40)]
+        for text in forms:
+            with self.subTest(text[:80]):
+                self.assertIsNone(cg.install_files_refusal(text, True))
+                self.assertEqual(hook(text, True)[0], 0)
+                self.assertIn("only the main agent", cg.install_files_refusal(text, False))
+                code, message = hook(text, False)
+                self.assertEqual(code, 2)
+                self.assertIn("main agent", message)
+        for text in (forms[0].replace("~/.claude/hooks/ah.py", "harness/hooks/ah.py"), "bash -c '%s'" % forms[0].replace('"', "")):
+            with self.subTest(text[:60]):
+                self.assertIsNotNone(cg.install_files_refusal(text, False))
+        self.assertIsNotNone(cg.install_files_refusal(forms[0].replace("~/.claude/hooks/ah.py", "harness/hooks/ah.py"), True))
+
+    def test_a_direct_write_into_the_hooks_directory_stays_refused_even_for_main(self):  # goodqa#15913 NEG-6
+        for text in ("cp /tmp/x/command_guard.py ~/.claude/hooks/command_guard.py",
+                     "cp /tmp/x/command_guard.py $HOME/.claude/hooks/command_guard.py",
+                     "mv /tmp/x/command_guard_hook.py ~/.claude/hooks/command_guard_hook.py",
+                     "cat /tmp/x/ah.py > ~/.claude/hooks/ah.py",
+                     "tee ~/.claude/hooks/command_guard.py < /tmp/x/command_guard.py",
+                     "cp /tmp/x/command_guard.py ~/.codex/agent-harness/command_guard.py"):
+            for main in (True, False):
+                with self.subTest(text, main=main):
+                    self.assertEqual(hook(text, main)[0], 2, text)
+
     def test_a_script_named_ah_earlier_on_path_does_not_pass(self):  # AC-9, NEG-11
         text = 'ah install-files --host t2-dev --from-ref %s --file ah.py --ticket "GoodQA a#1"' % ("a" * 40)
         with mock.patch.object(cg.shutil, "which", return_value="/tmp/evil/ah"):

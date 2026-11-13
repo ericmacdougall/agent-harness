@@ -915,6 +915,247 @@ class Wiring(Base):
         self.assertEqual(code, 5)
         self.assertIn('"result": "unknown"', text)
 
+    def test_the_local_targets_are_wired_and_an_unknown_name_exits_2(self):  # goodqa#15913 AC-1, NEG-2
+        for host in ("local", "local-codex"):
+            with self.subTest(host), mock.patch.object(ai, "install_files", return_value={"ok": True, "result": "dry_run"}) as run:
+                code, _text = self.cli("--host", host, "--from-ref", self.c1, "--file", "ah.py", "--dry-run")
+                self.assertEqual(code, 0)
+                self.assertEqual(run.call_args[0][0], host)
+        code, _text = self.cli("--host", "mac", "--from-ref", self.c1, "--file", "ah.py", "--ticket", TICKET)
+        self.assertEqual(code, 2)
+
+
+CODEX_NAMES = ("command_guard.py", "ah.py", "extra.py")  # doctor.py is a Claude-only hook here, as in the real lists
+
+
+class LocalBase(Base):
+    """goodqa#15913: the local targets run the SAME constant program as a local subprocess, never ssh. On one machine the
+    caller's home and the target's home are one directory, so the audit file, the local backup copies and the hooks share it."""
+
+    def setUp(self):
+        super().setUp()
+        self.mac = self.host_home
+        self.codex = self.host_home / ".codex" / "agent-harness"
+        self.envs = []
+
+    def write_commit(self, files, message, branch=None):
+        (self.work / "install_codex.py").write_text("DELIVERY_HELPERS = (\n    # a comment, as in the real file\n    %s)\n"
+                                                    % "".join("%r, " % n for n in CODEX_NAMES))
+        super().write_commit(files, message, branch)
+
+    def make_codex(self):
+        shutil.copytree(HOOKS, self.codex, ignore=shutil.ignore_patterns("__pycache__", "doctor.py"))
+        for n in CODEX_NAMES:
+            (self.codex / n).write_bytes(self.base_bytes(n))
+
+    def push(self, files, label):
+        side = Path(self.tmp, "side-" + label)
+        git(self.tmp, "clone", "-q", str(self.origin), str(side))
+        for name, data in files.items():
+            (side / "harness" / "hooks" / name).write_bytes(data)
+        git(side, "add", "-A")
+        git(side, "commit", "-q", "-m", label)
+        git(side, "push", "-q", "origin", "main")
+        return git(side, "rev-parse", "HEAD")
+
+    def runner(self, argv, input=None, capture_output=True, timeout=None, env=None, **kw):
+        self.calls.append(list(argv))
+        self.assertEqual(argv[:3], [sys.executable, "-I", "-c"])
+        self.assertNotIn("ssh", " ".join(argv[:1] + argv[4:]))
+        key = argv[4]
+        self.envs.append(dict(env or {}))
+        self.counts[key] = self.counts.get(key, 0) + 1
+        if self.inject and self.inject[0] == key and self.counts[key] == self.inject[1]:
+            if len(self.inject) > 2 and self.inject[2] == "after":
+                subprocess.run(argv, input=input, env=env, capture_output=True, timeout=300)
+            raise subprocess.TimeoutExpired(argv, 1)
+        return subprocess.run(argv, input=input, env=env, capture_output=True, timeout=300)
+
+    def install(self, ref=None, files=("ah.py", "extra.py"), dry_run=False, ticket=TICKET, host="local", **kw):
+        posted = kw.setdefault("posted", [])
+        return ai.install_files(host, ref or self.c1, list(files), ticket, dry_run, self.mac, "sess", "agent-x", self.runner,
+                                lambda t, text: posted.append((t, text)))
+
+    def codex_sha(self, name):
+        return sha((self.codex / name).read_bytes())
+
+
+class LocalTarget(LocalBase):
+    def test_a_local_install_runs_the_same_program_without_ssh_and_reports_every_sha(self):  # AC-1, NEG-8, NEG-9
+        old = {n: self.live(n) for n in NAMES}
+        posted = []
+        with mock.patch.dict(os.environ, {"AH_AGENT_ID": "agent-sub", "PYTHONPATH": "/tmp/evil", "AH_GUARD_OFF": "1",
+                                          "PATH": ".:relbin:" + os.environ.get("PATH", "/usr/bin:/bin")}):
+            out = self.install(files=("ah.py", "extra.py", "command_guard.py"), posted=posted)
+        self.assertEqual(out["result"], "installed")
+        self.assertEqual(out["host"], "local")
+        for n in ("ah.py", "extra.py", "command_guard.py"):
+            self.assertEqual(out["files"][n]["old_sha"], old[n])
+            self.assertEqual(self.live(n), out["files"][n]["new_sha"])
+            self.assertEqual(sha((self.hooks / ".ah-install" / "backups" / out["run"] / n).read_bytes()), old[n])
+            self.assertEqual(sha((self.mac / ".agent-harness" / "install-backups" / out["run"] / n).read_bytes()), old[n])
+            self.assertFalse((self.hooks / ("." + n + ".ah-install-tmp")).exists())
+        self.assertEqual(self.live("doctor.py"), old["doctor.py"])
+        self.assertTrue(self.calls)
+        self.assertTrue(all(c[-1] == "claude" for c in self.calls))
+        for env in self.envs:
+            self.assertEqual(env.get("HOME"), str(self.mac))
+            self.assertLessEqual(set(env), {"HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "SHELL"})
+            self.assertTrue(all(p.startswith("/") for p in env["PATH"].split(os.pathsep)), env["PATH"])  # no relative entry
+        rows = self.rows()
+        self.assertEqual([(r["event"], r.get("host")) for r in rows], [("start", "local"), ("result", "local")])  # no second host row
+        self.assertEqual(rows[1]["result"], "installed")
+        self.assertEqual(len(posted), 1)
+        self.assertIn("on local: installed (run %s)" % out["run"], posted[0][1])
+        self.assertFalse((self.hooks / ".ah-install" / "lock").exists())
+
+    def test_an_allow_all_guard_after_a_local_install_is_rolled_back_guard_first(self):  # AC-1, NEG-3
+        ref = self.push({"command_guard.py": b"import sys\nprint('{\"verdict\": \"allow\", \"message\": \"\"}')\n"}, "allow-all")
+        before = {n: self.live(n) for n in NAMES}
+        restores = []
+        real = ai.Remote.call
+
+        def spy(self_, op, args=None, data=None, **kw):
+            if op == "restore":
+                restores.append([i["name"] for i in args["items"]])
+            return real(self_, op, args, data, **kw)
+        with mock.patch.object(ai.Remote, "call", spy), self.assertRaises(ai.InstallError) as caught:
+            self.install(ref=ref, files=("ah.py", "command_guard.py"))
+        self.assertEqual(caught.exception.exit_code, 4)
+        self.assertEqual(caught.exception.data["result"], "rolled_back")
+        self.assertEqual(restores[0][0], "command_guard.py")
+        self.assertEqual({n: self.live(n) for n in NAMES}, before)
+        self.assertEqual(self.rows("result")[-1]["host"], "local")
+
+    def test_a_local_rollback_and_a_local_resume_by_run_id(self):  # AC-4
+        old = {n: self.live(n) for n in NAMES}
+        run = self.install()["run"]
+        done = ai.rollback(run, TICKET, (), self.mac, "s", "a", self.runner, lambda t, x: None)
+        self.assertEqual(done["result"], "restored")
+        self.assertEqual({n: self.live(n) for n in NAMES}, old)
+        self.inject = ("commit", self.counts.get("commit", 0) + 1, "after")  # the commit ran and its answer was lost: unknown
+        with self.assertRaises(ai.InstallError) as caught:
+            self.install()
+        self.inject = None
+        self.assertEqual(caught.exception.data["result"], "unknown")
+        again = ai.resume(caught.exception.data["run"], TICKET, self.mac, "s", "a", self.runner, lambda t, x: None)
+        self.assertEqual(again["result"], "installed")
+        self.assertEqual(self.live("ah.py"), again["files"]["ah.py"]["new_sha"])
+
+    def test_a_local_dry_run_changes_nothing_and_takes_no_lock(self):  # AC-1, NEG-11
+        before = sorted((p.name, p.stat().st_size, p.stat().st_mtime_ns, p.stat().st_ino) for p in self.hooks.iterdir())
+        out = self.install(dry_run=True, ticket=None, files=("ah.py", "command_guard.py"))
+        self.assertEqual(out["result"], "dry_run")
+        self.assertEqual({n: v["action"] for n, v in out["files"].items()}, {"ah.py": "replaced", "command_guard.py": "replaced"})
+        self.assertEqual(sorted((p.name, p.stat().st_size, p.stat().st_mtime_ns, p.stat().st_ino) for p in self.hooks.iterdir()), before)
+        self.assertFalse((self.hooks / ".ah-install").exists())
+        self.assertEqual(self.counts.get("stage"), None)
+
+    def test_a_local_rollback_is_never_blocked_by_a_failing_self_test(self):  # AC-4, NEG-12
+        old = self.live("ah.py")
+        run = self.install()["run"]
+        (self.hooks / "doctor.py").write_bytes(b"import sys\nprint('not json')\nsys.exit(0)\n")
+        done = ai.rollback(run, TICKET, (), self.mac, "s", "a", self.runner, lambda t, x: None)
+        self.assertEqual(done["result"], "restored")
+        self.assertIn("selftest_note", done)
+        self.assertEqual(self.live("ah.py"), old)
+
+    def test_an_unfinished_local_run_blocks_only_its_own_target(self):  # AC-4, NEG-7
+        self.inject = ("commit", 1, "after")
+        with self.assertRaises(ai.InstallError):
+            self.install()
+        self.inject = None
+        self.assertEqual(len(ai.unfinished_runs(self.mac, "local")), 1)
+        self.assertEqual(ai.unfinished_runs(self.mac, "local-codex"), [])
+        self.assertEqual(ai.unfinished_runs(self.mac, "t2-dev"), [])
+        error = self.refused()
+        self.assertEqual(error.code, "unfinished_run")
+        ai.audit(self.mac, {"event": "start", "kind": "install", "run": "ins-00000000000a", "host": "t2-dev", "files": {}})
+        self.assertEqual(len(ai.unfinished_runs(self.mac, "local")), 1)  # a remote run never counts for the local target
+
+    def test_names_that_only_look_local_refuse_before_any_call(self):  # NEG-2
+        good = dict(host="local", ref=self.c1, files=["ah.py"], ticket=TICKET, dry_run=False, resume=None, rollback=None, force_files=())
+        ai.check_inputs(**good)
+        ai.check_inputs(**dict(good, host="local-codex"))
+        for host in ("mac", "localhost", "local;ls", "LOCAL", "local ", "local-claude", "./local", "local-codex2"):
+            with self.subTest(host), self.assertRaises(ai.InstallError) as caught:
+                ai.check_inputs(**dict(good, host=host))
+            self.assertEqual(caught.exception.exit_code, 2)
+        self.assertEqual(self.calls, [])
+
+    def test_the_script_refuses_an_unknown_root_and_the_remote_argv_has_none(self):  # NEG-10, AC-6
+        env = {"HOME": str(self.mac), "PATH": "/usr/bin:/bin"}
+        done = subprocess.run([sys.executable, "-I", "-c", ai.REMOTE_SCRIPT, "probe", json.dumps({"names": ["ah.py"]}), "other"],
+                              capture_output=True, text=True, env=env)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("bad root", done.stderr)
+        done = subprocess.run(ai.local_argv("codex", "probe", {"names": ["ah.py"]}), capture_output=True, text=True, env=env)
+        self.assertNotEqual(done.returncode, 0)  # the program itself refuses a missing directory, with a reason, not a traceback
+        self.assertEqual(done.stderr.strip().splitlines()[-1], "the hooks directory does not exist")
+        argv = ai.ssh_argv("t2-dev", "probe", {"names": ["ah.py"]})
+        self.assertTrue(argv[-1].endswith(__import__("shlex").quote(json.dumps({"names": ["ah.py"]}))))
+
+    def test_local_reports_the_codex_copies_that_differ_from_what_it_installed(self):  # AC-3
+        self.make_codex()
+        out = self.install(files=("ah.py", "doctor.py"))
+        self.assertEqual(out["result"], "installed")
+        self.assertEqual(out["codex_differs"], ["ah.py"])  # doctor.py has no Codex copy
+        self.assertIn("--host local-codex", out["note"])
+        self.assertEqual(self.codex_sha("ah.py"), sha(self.base_bytes("ah.py")))  # reported, never written
+        self.install(host="local-codex", files=("ah.py",))
+        again = self.install(files=("ah.py", "doctor.py"))
+        self.assertEqual(again["result"], "already_current")
+        self.assertEqual(again.get("codex_differs", []), [])
+
+
+class LocalCodex(LocalBase):
+    def test_local_codex_installs_into_the_codex_harness_directory_only(self):  # AC-2
+        self.make_codex()
+        claude_before = {n: self.live(n) for n in NAMES}
+        out = self.install(host="local-codex", files=("ah.py", "command_guard.py"))
+        self.assertEqual(out["result"], "installed")
+        self.assertEqual(out["host"], "local-codex")
+        for n in ("ah.py", "command_guard.py"):
+            self.assertEqual(self.codex_sha(n), out["files"][n]["new_sha"])
+            self.assertEqual(sha((self.codex / ".ah-install" / "backups" / out["run"] / n).read_bytes()), sha(self.base_bytes(n)))
+        self.assertEqual({n: self.live(n) for n in NAMES}, claude_before)
+        self.assertFalse((self.hooks / ".ah-install").exists())
+        self.assertTrue(all(c[-1] == "codex" for c in self.calls))
+        self.assertEqual({r.get("host") for r in self.rows()}, {"local-codex"})
+
+    def test_a_name_outside_the_codex_list_refuses_before_any_call(self):  # NEG-5
+        self.make_codex()
+        error = self.refused(host="local-codex", files=("doctor.py",))
+        self.assertIn("DELIVERY_HELPERS", str(error))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.rows(), [])
+
+    def test_no_codex_harness_directory_refuses_and_creates_nothing(self):  # NEG-4
+        with mock.patch.object(ai, "fetch_source", side_effect=AssertionError("fetched before checking the directory")):
+            error = self.refused(host="local-codex", files=("ah.py",))
+        self.assertEqual(error.exit_code, 2)
+        self.assertIn("does not exist", str(error))
+        self.assertFalse((self.host_home / ".codex").exists())
+        self.assertEqual(self.rows("start"), [])
+
+    def test_a_symlinked_codex_directory_refuses(self):  # adversarial: a planted link must not redirect the write
+        self.make_codex()
+        real = self.host_home / ".codex" / "elsewhere"
+        self.codex.rename(real)
+        os.symlink(real, self.codex)
+        error = self.refused(host="local-codex", files=("ah.py",))
+        self.assertIn("symlink", str(error))
+        self.assertEqual(sha((real / "ah.py").read_bytes()), sha(self.base_bytes("ah.py")))
+
+    def test_an_allow_all_guard_in_the_codex_directory_is_rolled_back(self):  # AC-2, NEG-3
+        self.make_codex()
+        ref = self.push({"command_guard.py": b"import sys\nprint('{\"verdict\": \"allow\", \"message\": \"\"}')\n"}, "codex-allow-all")
+        before = {n: self.codex_sha(n) for n in CODEX_NAMES}
+        with self.assertRaises(ai.InstallError) as caught:
+            self.install(host="local-codex", ref=ref, files=("ah.py", "command_guard.py"))
+        self.assertEqual(caught.exception.data["result"], "rolled_back")
+        self.assertEqual({n: self.codex_sha(n) for n in CODEX_NAMES}, before)
+
 
 if __name__ == "__main__":
     unittest.main()
