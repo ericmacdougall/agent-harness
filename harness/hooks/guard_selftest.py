@@ -21,7 +21,6 @@ shipped rule, not every shape.
 """
 
 import argparse
-import ast
 import hashlib
 import json
 import os
@@ -83,43 +82,18 @@ def blob_id(data):
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
-def _sibling_names(path):
-    """Import statements and string literals in one Python file that could name a sibling file."""
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, SyntaxError, ValueError):
-        return set(), set()
-    mods, literals = set(), set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            mods.update(a.name.split(".")[0] for a in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            mods.add(node.module.split(".")[0])
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and re.fullmatch(r"[A-Za-z0-9_.-]+\.(py|json)", node.value):
-            literals.add(node.value)
-    return mods, literals
+# The files a hook run for a rule executes, reviewed by hand: the launcher, the analyser, the two sibling modules the analyser loads
+# on the paths the table exercises (safe_input via load_policy, redact), and this tool, so a stale self-test cannot pass. Nothing
+# else is pinned: unrelated files (ah.py and the rest) may differ between hosts without making the run unreliable.
+# provenance.py is loaded only by the no-backup override path, which no case in the table reaches.
+PINNED = ("command_guard.py", "command_guard_hook.py", "guard_selftest.py", "redact.py", "safe_input.py")
 
 
-def manifest(hooks_dir):
-    """[(name, blob id)] of the launcher, the guard and every sibling module and data file they name (imports, and string
-    literals naming an existing .py or .json file), sorted; the policy file is pinned separately."""
+def manifest(hooks_dir, rule="bulk_staging"):
+    """[(name, blob id)] of the files a hook run for the rule executes (PINNED), sorted; the policy file is pinned separately."""
     hooks_dir = Path(hooks_dir)
-    names, todo = {LAUNCHER, GUARD}, [LAUNCHER, GUARD]
-    seen = set()
-    while todo:
-        name = todo.pop()
-        if name in seen:
-            continue
-        seen.add(name)
-        if not name.endswith(".py"):
-            continue
-        mods, literals = _sibling_names(hooks_dir / name)
-        for found in [m + ".py" for m in mods] + sorted(literals):
-            if found != POLICY and (hooks_dir / found).is_file() and found not in names:
-                names.add(found)
-                todo.append(found)
     out = []
-    for name in sorted(names):
+    for name in sorted(PINNED):
         try:
             out.append((name, blob_id((hooks_dir / name).read_bytes())))
         except OSError:
@@ -134,8 +108,12 @@ def manifest_digest(items):
 def policy_state(hooks_dir):
     """('absent', None) or (sha256 of the policy file, parsed JSON)."""
     path = Path(hooks_dir) / POLICY
-    if not path.exists():
+    try:
+        st = os.lstat(str(path))
+    except FileNotFoundError:
         return "absent", None
+    if not stat.S_ISREG(st.st_mode):
+        raise Refused("the policy file is not a regular file")
     data = path.read_bytes()
     try:
         parsed = json.loads(data.decode("utf-8"))
@@ -370,6 +348,9 @@ def run_selftest(rule, expect_manifest, expect_policy, hooks_dir=None, home=None
             audit.update(verdict="setup failed", reason=str(error))
         except subprocess.SubprocessError as error:
             result.update(ok=False, exit_code=4, setup_failed="a subprocess failed (%s)" % type(error).__name__)
+            audit.update(verdict="setup failed", reason=type(error).__name__)
+        except OSError as error:
+            result.update(ok=False, exit_code=4, setup_failed="a file operation failed (%s)" % type(error).__name__)
             audit.update(verdict="setup failed", reason=type(error).__name__)
         return result
     finally:

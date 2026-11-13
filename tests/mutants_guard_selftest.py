@@ -36,8 +36,10 @@ MUTANTS = {
     "the audit values are not bounded": ("def _bound(value):\n    return re.sub(r\"[^\\x20-\\x7e]\", \"?\", str(value))[:80]", "def _bound(value):\n    return str(value)"),
     "the child is started with a shell": ("    argv = [sys.executable, \"-I\", str(Path(hooks_dir) / LAUNCHER), \"hook\"]",
                                           "    argv = [sys.executable, str(Path(hooks_dir) / LAUNCHER), \"hook\"]"),
-    "a data file named by a literal is not pinned": ("        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and re.fullmatch(r\"[A-Za-z0-9_.-]+\\.(py|json)\", node.value):",
-                                                      "        elif False:"),
+    "this tool is not pinned": ('PINNED = ("command_guard.py", "command_guard_hook.py", "guard_selftest.py", "redact.py", "safe_input.py")',
+                                'PINNED = ("command_guard.py", "command_guard_hook.py", "redact.py", "safe_input.py")'),
+    "a policy symlink reads as absent": ("    if not stat.S_ISREG(st.st_mode):\n        raise Refused(\"the policy file is not a regular file\")", "    pass"),
+    "an OS error escapes as a traceback": ("        except OSError as error:\n            result.update(ok=False, exit_code=4", "        except KeyError as error:\n            result.update(ok=False, exit_code=4"),
     "the cleanup is skipped on an error": ("            if created.get(\"dir_fd\") is not None:\n                try:\n                    remove_own_directory",
                                            "            if False:\n                try:\n                    remove_own_directory"),
 }

@@ -186,12 +186,39 @@ class Pins(Base):
             self.assertIn("manifest digest", self.refused(gs.run_selftest("bulk_staging", expected, "absent", hooks_dir=self.hooks, home=self.home, cli=False)))
             path.write_bytes(original)
 
-    def test_a_data_file_named_by_a_string_literal_is_pinned_too(self):
-        (self.hooks / "selftest_probe.json").write_text("{}")
+    def test_only_the_files_of_the_hook_run_and_this_tool_are_pinned(self):
+        names = [n for n, _b in gs.manifest(self.hooks)]
+        self.assertEqual(names, ["command_guard.py", "command_guard_hook.py", "guard_selftest.py", "redact.py", "safe_input.py"])
         before = self.digest()
-        self.edit("command_guard.py", "#!/usr/bin/env python3\n", "#!/usr/bin/env python3\n_PROBE = 'selftest_probe.json'\n")
-        self.assertIn("selftest_probe.json", [n for n, _b in gs.manifest(self.hooks)])
+        for unrelated in ("ah.py", "model_tiers.json", "ticket_adapters.py"):  # differ between hosts without mattering
+            path = self.hooks / unrelated
+            path.write_bytes(path.read_bytes() + b"\n")
+        self.assertEqual(self.digest(), before)
+        self.edit("guard_selftest.py", "", "# a stale self-test\n")
         self.assertNotEqual(self.digest(), before)
+
+    def test_the_pinned_files_cover_the_modules_the_hook_run_imports(self):
+        import ast
+        for name in ("command_guard_hook.py", "command_guard.py"):
+            tree = ast.parse((HOOKS / name).read_text(encoding="utf-8"))
+            for node in tree.body:  # module-level imports run on every invocation
+                mods = [a.name.split(".")[0] for a in node.names] if isinstance(node, ast.Import) else \
+                       [node.module.split(".")[0]] if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module else []
+                for mod in mods:
+                    if (HOOKS / (mod + ".py")).is_file():
+                        self.assertIn(mod + ".py", gs.PINNED, "%s imports %s at module level" % (name, mod))
+
+    def test_a_policy_symlink_is_refused_not_read_as_absent(self):
+        policy = self.hooks / "command_guard_policy.json"
+        policy.symlink_to(self.hooks / "no-such-target")
+        self.assertIn("regular file", self.refused(gs.run_selftest("bulk_staging", self.digest(), "absent", hooks_dir=self.hooks, home=self.home, cli=False)))
+
+    def test_an_os_error_during_setup_is_exit_4_with_json(self):
+        with mock.patch.object(gs, "build_repositories", side_effect=OSError("disk full")):
+            result = gs.run_selftest("bulk_staging", self.digest(), "absent", hooks_dir=self.hooks, home=self.home, cli=False)
+        self.assertEqual(result["exit_code"], 4)
+        self.assertIn("file operation failed", result["setup_failed"])
+        self.assertTrue(result.get("removed"))
 
     def test_unknown_rule_and_malformed_hashes_are_refused(self):
         with mock.patch.object(gs, "run_hook", side_effect=AssertionError("a hook ran")):
