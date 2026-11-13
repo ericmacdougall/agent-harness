@@ -130,3 +130,5 @@ Spec core sha256: `dcac82844390d15eeee21d1eb32d550c27092de9cb67dfbac12a492e7b997
 | acceptance | ACCEPT | a5d878417503c1093 (red-team) | agent | WAL-verified red-team agent | stale |
 | adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | stale |
 | acceptance | ACCEPT | a5d878417503c1093 (red-team) | agent | WAL-verified red-team agent | stale |
+| adversarial | ACCEPT | ac4cab2809a5b4309 (red-team) | agent | WAL-verified red-team agent | current |
+| acceptance | ACCEPT | a78630cdfdc90dfad (red-team) | agent | WAL-verified red-team agent | current |
