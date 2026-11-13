@@ -268,3 +268,8 @@ test('a user-sourced requirement archived from the dashboard keeps a distinct ba
   assert.equal(walk(only).filter(n => n.tagName === 'LI' && n.className.includes('req ')).length, 1);
   assert.match(text(v.archive(s, ui)), /Dashboard-archived, your words 1/);
 });
+
+test('textual evidence from the producer is shown on the requirement row', () => {
+  const row = ledger({ requirements: { items: [{ id: 'r', text: 'x', bucket: 'live', reason: 'open', evidence_text: 'REALLY_TESTED a: PASS on the live host', has_evidence: true }] } }).requirements.items[0];
+  assert.match(text(v.requirementItem(row, NOW, {})), /Evidence recorded: REALLY_TESTED a: PASS on the live host/);
+});

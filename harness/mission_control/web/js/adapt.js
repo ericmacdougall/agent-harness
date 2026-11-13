@@ -332,7 +332,7 @@ export function ledger(snapshot) {
     id: str(r.id, 64), kind: 'requirement', text: str(r.text, 700), at: validIso(r.at) || '', session: str(r.session, 64), owner: str(r.owner, 60), ticket: str(r.ticket, 60),
     source: str(r.source, 300), state: str(r.state, 40), bucket: r.bucket === 'archived' ? 'archived' : 'live', rule: str(r.rule, 8) || 'live', rule_title: str(r.rule_title, 40),
     reason: str(r.reason, 300), evidence_ref: str(r.evidence_ref, 120), has_evidence: r.has_evidence === true,
-    expires_in_s: Number.isFinite(r.expires_in_s) ? r.expires_in_s : null, digest: str(r.digest, 40), unowned_note: str(r.unowned_note, 200), user_sourced: r.user_sourced === true,
+    expires_in_s: Number.isFinite(r.expires_in_s) ? r.expires_in_s : null, digest: str(r.digest, 40), unowned_note: str(r.unowned_note, 200), user_sourced: r.user_sourced === true, evidence_text: str(r.evidence_text, 300),
     manual: r.manual && typeof r.manual === 'object' ? { action: r.manual.action === 'restore' ? 'restore' : 'archive', at: str(r.manual.at, 40), reason: str(r.manual.reason, 300), id: str(r.manual.id, 40), by: str(r.manual.by, 80) } : null,
   })).filter(r => r.id);
   const summary = { live: 0, archived: 0, rules: {}, manual_user: 0 };

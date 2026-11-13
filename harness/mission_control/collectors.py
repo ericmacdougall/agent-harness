@@ -1093,21 +1093,27 @@ class Ledger(Collector):
                 continue
             ticket = str(raw.get("ticket") or "")
             evidence = raw.get("evidence")
-            # every evidence record is kept for the archive rule (it sorts by time before it takes the newest)
+            # `ah requirements` returns evidence as clipped text. Text is kept whole as a guard and a display reference;
+            # dict records (a future producer) are kept for the archive rule, which sorts them by time before use.
+            evidence_text = ev.short(evidence, 300) if isinstance(evidence, str) else ""
             evidence = [self._evidence_row(e) for e in (evidence if isinstance(evidence, list) else [evidence])
-                        if isinstance(e, dict)][:self.MAX_REQ_EVIDENCE] if evidence else []
+                        if isinstance(e, dict)][:self.MAX_REQ_EVIDENCE] if isinstance(evidence, (list, dict)) and evidence else []
             full = raw.get("text") if isinstance(raw.get("text"), str) else ""
+            sha = raw.get("text_sha") if isinstance(raw.get("text_sha"), str) and re.fullmatch(r"[0-9a-f]{64}", raw["text_sha"]) else ""
+            complete = bool(sha) or len(full) < 600  # the producer clips at 600: a clipped text without its hash is not whole
             rid = str(raw["id"])
             if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", rid):  # never merge two ids by rewriting them
                 rid = "x-" + hashlib.sha256(rid.encode("utf-8", "replace")).hexdigest()[:16]
             rows.append({"id": rid, "session": ev.short(raw.get("session"), 64),
-                         "digest": archive.digest_of(rid, full),
-                         "words": hashlib.sha256(" ".join(full.split()).lower().encode("utf-8", "replace")).hexdigest(),
+                         "digest": archive.digest_of(rid, sha or full),
+                         # the words the duplicate rule compares: the producer's hash of the whole text, or the text itself when
+                         # it was not clipped; empty (the rule refuses) when completeness is unknown
+                         "words": (sha or hashlib.sha256(" ".join(full.split()).lower().encode("utf-8", "replace")).hexdigest()) if complete else "",
                          "text": ev.short(raw.get("text"), 600), "source": ev.short(raw.get("source"), 300),
                          "at": ev.short(raw.get("at"), 40),
                          "state": ev.short(raw.get("state"), 40) if isinstance(raw.get("state"), str) else "",
                          "ticket": ticket if TICKET_RE.match(ticket) else "",
-                         "owner": ev.short(raw.get("owner"), 60) if raw.get("owner") else "", "evidence": evidence})
+                         "owner": ev.short(raw.get("owner"), 60) if raw.get("owner") else "", "evidence": evidence or evidence_text})
         rows.sort(key=lambda r: r["at"], reverse=True)
         self.raw_requirements = rows
         self.raw_total = self._int(data.get("total"), len(rows))

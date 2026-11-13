@@ -2948,9 +2948,12 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
             if len(rows) >= VIEW_ROW_CAP:
                 continue
             at = _epoch(rec.get("at"))
+            full = redact.redact(str(rec.get("note") or ""))
             rows.append({
                 "id": str(rec.get("id") or "")[:40], "session": s,
-                "text": redact.redact(str(rec.get("note") or ""))[:600],
+                # `text` is a display clip; `text_sha` and `text_len` identify the whole text, so a consumer can tell two
+                # requirements that only differ after the clip apart (goodqa#15920)
+                "text": full[:600], "text_len": len(full), "text_sha": hashlib.sha256(full.encode("utf-8", "replace")).hexdigest(),
                 "source": redact.redact(str(rec.get("source") or ""))[:300],
                 "at": rec.get("at") or None, "age_s": int(now - at) if at else None,
                 "state": str(rec.get("state") or "recorded")[:20],

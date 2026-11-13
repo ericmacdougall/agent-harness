@@ -171,6 +171,7 @@ export function requirementItem(row, now, ui = {}) {
   const meta = [`Source: ${row.source || 'unknown'}`, row.owner ? `owner ${row.owner}` : 'no owner recorded', row.ticket || 'no ticket'].join(' · ');
   item.append(el('p', 'req-meta', meta));
   item.append(el('p', 'req-why', `${row.bucket === 'archived' ? 'Archived because' : 'Live because'}: ${row.reason}${row.evidence_ref ? ` (evidence ${row.evidence_ref})` : ''}`));
+  if (row.evidence_text) item.append(el('p', 'req-meta', `Evidence recorded: ${row.evidence_text}`));
   if (row.bucket === 'live' && row.expires_in_s != null) {
     item.append(el('p', 'req-expiry', `ASSUMPTION: moves to the archive in ${daysLeft(row.expires_in_s)} (30 days with no owner, ticket or evidence, and not sourced to you) unless one is recorded.`));
   }

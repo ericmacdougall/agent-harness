@@ -157,8 +157,8 @@ def _normalise(row: dict, kind: str) -> dict:
         "evidence": _evidence(row.get("evidence")),
         "full_len": len(full),
         # the words the duplicate rule compares: the whole text, so two long texts that only differ late never merge
-        "words": row.get("words") if isinstance(row.get("words"), str) and row.get("words") else
-        hashlib.sha256(" ".join(full.split()).lower().encode("utf-8", "replace")).hexdigest(),
+        "words": row["words"] if isinstance(row.get("words"), str) else
+        hashlib.sha256(" ".join(full.split()).lower().encode("utf-8", "replace")).hexdigest(),  # "" means completeness is unknown
         "digest": row.get("digest") if isinstance(row.get("digest"), str) else digest_of(row.get("id"), full),
     }
 
@@ -266,6 +266,7 @@ def classify_all(items, kind: str, now: float, ticket_closed=None, overrides=Non
         done["ask_reason"] = row["reason_in"] if kind == "ask" else ""
         done.update(bucket=bucket, rule=rule, rule_title=RULE_TITLES[rule], reason=reason, evidence_ref=ref, **extra)
         done["has_evidence"] = bool(row["evidence"] or row["evidence_in"])
+        done["evidence_text"] = row["evidence_in"]
         out.append(done)
     out.sort(key=lambda r: (-(_epoch(r["at"]) or 0.0), r["id"]))
     return out
@@ -274,7 +275,7 @@ def classify_all(items, kind: str, now: float, ticket_closed=None, overrides=Non
 def _group(row: dict):
     if row["kind"] == "cleared":
         return None
-    return (row["kind"], row["session"] if row["kind"] == "requirement" else row["owner"], row["words"]) if row["full_len"] else None
+    return (row["kind"], row["session"] if row["kind"] == "requirement" else row["owner"], row["words"]) if row["full_len"] and row["words"] else None
 
 
 def summary(rows) -> dict:

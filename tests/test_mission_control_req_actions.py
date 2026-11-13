@@ -108,6 +108,55 @@ class Log(unittest.TestCase):
         self.assertEqual((again["id"], created), (row["id"], False))
         self.assertEqual(len(self.a.all()), 2)
 
+    def test_f3_every_accepted_action_stays_readable_at_the_size_cap_and_a_full_log_refuses_cleanly(self):
+        probe = acts(tempfile.mkdtemp())
+        one_row, _ = rec(probe, req="w000", client_key="cap-key-0000")
+        width = os.stat(probe.path).st_size
+        old = req_actions.MAX_BYTES
+        self.addCleanup(setattr, req_actions, "MAX_BYTES", old)
+        req_actions.MAX_BYTES = 3 * width + 5  # three rows fit, a fourth would cross the cap
+        accepted = []
+        for i in range(6):
+            try:
+                row, _ = rec(self.a, req=f"w{i:03d}", client_key=f"cap-key-{i:04d}")
+                accepted.append(row)
+            except req_actions.ActionError as exc:
+                self.assertEqual((exc.code, exc.status), ("log-full", 507))
+                break
+        self.assertEqual(len(accepted), 3)
+        size = os.stat(self.a.path).st_size
+        self.assertLessEqual(size, req_actions.MAX_BYTES)
+        self.a._cache = None
+        self.assertEqual([r["id"] for r in self.a.all()], [r["id"] for r in accepted])  # every success is readable
+        self.assertEqual(sorted(self.a.latest()), ["w000", "w001", "w002"])
+        with self.assertRaises(req_actions.ActionError):
+            rec(self.a, req="w009", client_key="cap-key-0009")
+        self.assertEqual(os.stat(self.a.path).st_size, size, "a refused action writes nothing")
+        again, created = rec(self.a, req="w001", client_key="cap-key-0001")  # idempotent even when the log is full
+        self.assertEqual((again["id"], created), (accepted[1]["id"], False))
+
+    def test_f3_the_torn_line_newline_counts_toward_the_cap(self):
+        probe = acts(tempfile.mkdtemp())
+        rec(probe, req="w000", client_key="cap-key-0000")
+        width = os.stat(probe.path).st_size
+        old = req_actions.MAX_BYTES
+        self.addCleanup(setattr, req_actions, "MAX_BYTES", old)
+        rec(self.a, req="w000", client_key="cap-key-0000")
+        with open(self.a.path, "a") as handle:
+            handle.write("torn")
+        size = os.stat(self.a.path).st_size
+        req_actions.MAX_BYTES = size + width  # a row fits only if the extra newline is ignored
+        with self.assertRaises(req_actions.ActionError) as ctx:
+            rec(self.a, req="w001", client_key="cap-key-0001")
+        self.assertEqual(ctx.exception.code, "log-full")
+        self.assertEqual(os.stat(self.a.path).st_size, size)
+        req_actions.MAX_BYTES = size + width + 1
+        row, created = rec(self.a, req="w001", client_key="cap-key-0001")
+        self.assertTrue(created)
+        self.a._cache = None
+        self.assertIn("w001", self.a.latest())
+        self.assertLessEqual(os.stat(self.a.path).st_size, req_actions.MAX_BYTES)
+
     def test_a_symlinked_log_is_refused(self):
         self.a._ensure()
         os.symlink("/etc/hosts", self.a.path)

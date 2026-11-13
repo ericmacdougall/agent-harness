@@ -131,8 +131,6 @@ class ReqActions:
                         if (row["req"], row["action"], row["digest"], row["reason"]) != (req, action, digest, clean):
                             raise ActionError("key-conflict", "this request id was already used for a different action", 409)
                         return row, False
-                if os.fstat(fd).st_size > MAX_BYTES:
-                    raise ActionError("log-full", "the action log is full; nothing was recorded", 507)
                 stamp = mc_chat.now_iso(time.time() if now is None else now)
                 row = mc_chat.sign({
                     "v": 1, "id": row_id, "at": stamp, "session": session, "req": req, "action": action, "reason": clean,
@@ -143,6 +141,8 @@ class ReqActions:
                 size = os.fstat(fd).st_size
                 if size > 0 and os.pread(fd, 1, size - 1) != b"\n":
                     line = b"\n" + line  # a cut-off last line must not swallow this row
+                if size + len(line) > MAX_BYTES:  # the reader stops at MAX_BYTES: never write a row it could not read back
+                    raise ActionError("log-full", "the action log is full; nothing was recorded", 507)
                 os.write(fd, line)
                 os.fsync(fd)
             finally:
