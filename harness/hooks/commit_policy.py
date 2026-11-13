@@ -1562,6 +1562,8 @@ def block_text(problems, message, policy, *, wal=None, kind="message", subject=N
 
 def run_hook(payload: dict, policy: dict) -> tuple:
     """Return (exit_code, stderr_text)."""
+    if is_edit_tool(payload):
+        return 0, ""  # edit contents are data, even when carried under a command key
     if policy.get("enforcement") == "off":
         return 0, ""
     command = command_text(payload.get("tool_input"))
@@ -1659,6 +1661,13 @@ def _check_pr_create(target, policy, session_dir):
 PREFILTER_ACTION = re.compile(r"\b(?:commit|commit-tree|revert|merge)\b|\bpr\s+create\b")
 SHELL_TOOLS = {"bash", "shell", "local_shell", "exec_command", "unified_exec", "write_stdin", "container.exec",
                "powershell"}
+EDIT_TOOLS = frozenset({"apply_patch", "write", "edit", "multiedit", "notebookedit"})
+
+
+def is_edit_tool(payload) -> bool:
+    """Only exact edit primitives are exempt; a present canonical name takes precedence."""
+    name = payload.get("tool_name", payload.get("toolName", ""))
+    return isinstance(name, str) and name.casefold() in EDIT_TOOLS
 
 
 def shell_like(payload) -> bool:
@@ -1669,6 +1678,8 @@ def shell_like(payload) -> bool:
 
 def may_commit(payload) -> bool:
     """Cheap test run before the policy file is even loaded."""
+    if is_edit_tool(payload):
+        return False
     command = command_text(payload.get("tool_input"))
     if not command:
         raw = json.dumps(payload.get("tool_input"), ensure_ascii=False) if payload.get("tool_input") else ""
