@@ -2655,6 +2655,16 @@ def lower_priority() -> None:
         subprocess.run(["ionice", "-c3", "-p", str(os.getpid())], capture_output=True, timeout=10)
 
 
+def capabilities() -> list:
+    """What this installed ops_watch.py can do, one name per line, for installers that must not depend on a missing feature
+    (goodqa#15827: the fabd installer refuses to install without forward-foreign-critical). A name is listed only when the code
+    behind it is present."""
+    caps = ["emit"]
+    if callable(globals().get("forward_foreign")) and callable(globals().get("queue_events")):
+        caps.append("forward-foreign-critical")  # critical raise and clear rows of a foreign ring source reach the digest and the deadman queue
+    return caps
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd")
@@ -2669,10 +2679,14 @@ def main(argv=None) -> int:
     u = sub.add_parser("uninstall")
     u.add_argument("--apply", action="store_true")
     sub.add_parser("config")
+    sub.add_parser("capabilities", help="print one capability per line (an installer can grep -qx for one)")
     sub.add_parser("relay-comment", help="post stdin as one comment on the ops-watch alerts ticket (peer relay)")
     args = ap.parse_args(argv)
-    home = Path.home()
     cmd = args.cmd or "run"
+    if cmd == "capabilities":  # no home, no config, no state, no ring: a pure probe (works with HOME unset)
+        print("\n".join(capabilities()))
+        return 0
+    home = Path.home()
     try:
         if cmd == "emit":
             print(emit(json.loads(args.json), home=home))
