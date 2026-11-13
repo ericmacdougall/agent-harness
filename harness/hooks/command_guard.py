@@ -60,7 +60,7 @@ POLICY_FILE = HERE / 'command_guard_policy.json'
 
 DEFAULT_POLICY = {
     'version': 1,
-    'modes': {'secret_dump': 'enforce', 'log_delete': 'enforce', 'broad_kill': 'warn'},
+    'modes': {'secret_dump': 'enforce', 'log_delete': 'enforce', 'broad_kill': 'warn', 'bulk_staging': 'warn'},
     'limits': {'max_command_bytes': 262144, 'max_depth': 8, 'max_nodes': 600000, 'max_seconds': 3.0,
                'max_stdin_bytes': 4194304},
     # Tier A: logs, WALs and approval state. Every destructive form is refused, including overwrites.
@@ -154,6 +154,7 @@ DEFAULT_POLICY = {
 }
 
 SECRET_DUMP, LOG_DELETE, BROAD_KILL = 'secret_dump', 'log_delete', 'broad_kill'
+BULK_STAGING = 'bulk_staging'  # goodqa#15787: git add -A, git commit -a in a dirty original checkout; warn by default
 PARSE = 'parse'  # warn-only notes: input the guard could not fully parse
 ALWAYS_ENFORCED = (SECRET_DUMP, LOG_DELETE)
 
@@ -190,6 +191,8 @@ def _merge(base, override):
     modes = override.get('modes')
     if isinstance(modes, dict) and modes.get(BROAD_KILL) in ('warn', 'enforce'):
         out['modes'][BROAD_KILL] = modes[BROAD_KILL]
+    if isinstance(modes, dict) and modes.get(BULK_STAGING) in ('warn', 'enforce'):
+        out['modes'][BULK_STAGING] = modes[BULK_STAGING]
     return out
 
 
@@ -206,7 +209,7 @@ def load_policy(path=None):
         pass
     modes = policy.get('modes') if isinstance(policy.get('modes'), dict) else {}
     clean = {}
-    for category in (SECRET_DUMP, LOG_DELETE, BROAD_KILL):
+    for category in (SECRET_DUMP, LOG_DELETE, BROAD_KILL, BULK_STAGING):
         mode = modes.get(category, DEFAULT_POLICY['modes'][category])
         if mode not in ('warn', 'enforce'):
             mode = DEFAULT_POLICY['modes'][category]
@@ -4232,6 +4235,153 @@ class Analyzer:
                     'use git checkout %s alone' % branch)
             return
 
+    # ---- bulk staging (goodqa#15787): git add -A, ., :/, -u and git commit -a in a dirty ORIGINAL checkout
+    COMMIT_VALUE_SHORT = frozenset('mFCct')  # -m MSG, -F FILE, -C COMMIT, -c COMMIT, -t FILE take a value (attached or the next word)
+    COMMIT_VALUE_LONG = frozenset(('--message', '--file', '--author', '--date', '--template', '--reuse-message', '--reedit-message',
+                                   '--fixup', '--squash', '--cleanup', '--pathspec-from-file', '--trailer', '--gpg-sign'))
+
+    @staticmethod
+    def _bulk_pathspec(text, place, top):
+        """A pathspec that means the whole working directory or the whole tree: `.` (also `./`, `sub/..`), `:/`, `:(top)`, a bare
+        glob, or a path that is the repository top or contains it (`..`, `../orig`). `sub/.` and `./sub/file` are explicit."""
+        t = text.strip()
+        if re.fullmatch(r':\((?:[a-z,]*)top(?:,[a-z,]*)?\):?\.?', t) or t in (':/', ':/:', ':/.', '*', '**', ':/*'):
+            return True
+        if not t or t.startswith(':'):
+            return False  # other pathspec magic (an exclusion, :(glob)x) names something explicit
+        norm = posixpath.normpath(t)
+        if norm == '.':
+            return True
+        absolute = norm if norm.startswith('/') else posixpath.normpath(posixpath.join(place, norm))
+        return absolute == top or (top + '/').startswith(absolute.rstrip('/') + '/')
+
+    def _bulk_add_form(self, words, place, top):
+        """True when the words after `git add` or `git stage` stage everything: -A, --all, -u, --update (abbreviations git accepts
+        included) or a whole-tree pathspec. An interactive selection (-p, -i, -e) is an explicit choice."""
+        pathspecs, ended = [], False
+        for word in words:
+            if ended:
+                pathspecs.append(word)
+                continue
+            if word == '--':
+                ended = True
+            elif word.startswith('--'):
+                key = word.split('=', 1)[0]
+                if key in ('--patch', '--interactive', '--edit'):
+                    return False
+                if len(key) >= 3 and ('--all'.startswith(key) or '--update'.startswith(key)):
+                    return True
+            elif word.startswith('-') and len(word) > 1:
+                if set(word[1:]) & set('pie'):
+                    return False
+                if set(word[1:]) & set('Au'):
+                    return True
+            else:
+                pathspecs.append(word)
+        return any(self._bulk_pathspec(p, place, top) for p in pathspecs)
+
+    def _bulk_commit_form(self, words):
+        """True when `git commit` is given -a or --all, also inside a short cluster (-am, -sa); the text of -m, -F and the other
+        value options is not read as a flag (-ma is the message `a`)."""
+        i = 0
+        while i < len(words):
+            word = words[i]
+            i += 1
+            if word == '--':
+                return False
+            if word.startswith('--'):
+                key = word.split('=', 1)[0]
+                if key == '--all':
+                    return True
+                if key in self.COMMIT_VALUE_LONG and '=' not in word:
+                    i += 1
+            elif word.startswith('-') and len(word) > 1:
+                for k, letter in enumerate(word[1:]):
+                    if letter == 'a':
+                        return True
+                    if letter in self.COMMIT_VALUE_SHORT:
+                        if k == len(word) - 2:
+                            i += 1  # the value is the next word
+                        break
+                    if letter in 'uS':
+                        break  # an optional attached mode or key id
+        return False
+
+    def _bulk_alias_form(self, sub, alias_values, place, top):
+        """The alias that was defined on the command line with -c alias.NAME=... and invoked, judged on its expansion."""
+        import shlex
+        for value in alias_values:
+            name, _, body = value.partition('=')
+            if name[len('alias.'):].casefold() != sub.casefold():
+                continue
+            try:
+                tokens = shlex.split(body[1:] if body.startswith('!') else body)
+            except ValueError:
+                return True  # cannot be read: judged as a possible bulk form
+            for k, token in enumerate(tokens):
+                if token in ('add', 'stage') and (k == 0 or body.startswith('!')):
+                    return self._bulk_add_form(tokens[k + 1:], place, top)
+                if token == 'commit' and (k == 0 or body.startswith('!')):
+                    return self._bulk_commit_form(tokens[k + 1:])
+        return False
+
+    @staticmethod
+    def _original_checkout_top(path):
+        """The top of the nearest checkout whose `.git` is a DIRECTORY (the original checkout), None for a linked worktree (a `.git`
+        file), a submodule or a path that is not in a checkout."""
+        current = path
+        for _ in range(64):
+            marker = os.path.join(current, '.git')
+            if os.path.isdir(marker):
+                return current
+            if os.path.exists(marker):
+                return None
+            parent = os.path.dirname(current)
+            if parent == current:
+                return None
+            current = parent
+        return None
+
+    def bulk_staging(self, sub, rest, cwd_words, locations, alias_values):
+        """goodqa#15787: git add -A, `.`, `:/`, -u and git commit -a in the original checkout while it has uncommitted changes sweep
+        other sessions' work into one commit. A linked worktree (the agent's own), a clean checkout, explicit paths, and a path
+        that is not a repository are left alone. The status call is the hardened one (2 s); a failure reports nothing."""
+        ctx = self.ctx
+        where = ctx.cwd
+        for word in (cwd_words if isinstance(cwd_words, list) else [cwd_words] if cwd_words is not None else []):
+            where = norm_path(word.text, ctx, where)  # git -C a -C b: each is relative to the one before
+        places = [where]
+        for text in locations:
+            path = norm_path(text, ctx, where)
+            places.append(path[:-len('/.git')] if path.endswith('/.git') else path)
+        for place in places:
+            if not place or '$' in place or not os.path.isdir(place):
+                continue
+            top = self._original_checkout_top(place)
+            if top is None:
+                continue
+            if sub in ('add', 'stage'):
+                bulk = self._bulk_add_form(rest, place, top)
+            elif sub == 'commit':
+                bulk = self._bulk_commit_form(rest)
+            elif alias_values:
+                bulk = self._bulk_alias_form(sub, alias_values, place, top)
+            else:
+                bulk = False
+            if not bulk:
+                continue
+            try:
+                code, out, _err = _git_try(top, ['status', '--porcelain=v1', '-z', '--untracked-files=normal'], 2.0)
+            except (OSError, subprocess.SubprocessError, ValueError):
+                continue
+            if code != 0 or not out:
+                continue  # a clean tree has nothing to sweep; an unreadable one reports nothing
+            ctx.add(BULK_STAGING, 'bulk-staging',
+                    '`git %s` here stages or commits EVERY change in %s, a shared original checkout that has uncommitted changes '
+                    '(other sessions\' work can be swept into your commit)' % (sub, top),
+                    'stage explicit paths (git add PATH ...) and commit those, or work in your own linked worktree (git worktree add)')
+            return
+
     def _owned_change(self, sub, rest, alias):
         if alias and sub not in self.OWNED_READ_SUBS and sub not in self.OWNED_CHANGES:
             return True  # an alias.* from -c may expand to anything
@@ -4293,6 +4443,7 @@ class Analyzer:
         cwd_words = []
         locations = []
         alias = False
+        alias_values = []
         while i < len(texts):
             t = texts[i]
             if t in ('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env'):
@@ -4304,6 +4455,7 @@ class Analyzer:
                     locations.append(args[i + 1].text)
                 if t == '-c' and i + 1 < len(args) and args[i + 1].text.casefold().startswith('alias.'):
                     alias = True
+                    alias_values.append(args[i + 1].text)
                 i += 2
             elif t.startswith(('--git-dir=', '--work-tree=')):
                 locations.append(t.split('=', 1)[1])
@@ -4322,6 +4474,7 @@ class Analyzer:
         sub = texts[i] if i < len(texts) else ''
         rest = texts[i + 1:]
         self.owned_checkout(sub, rest, cwd_words, locations, alias)
+        self.bulk_staging(sub, rest, cwd_words, locations, alias_values)
         if sub == 'clean':
             self.git_clean(args[i + 1:], rest, cwd_word)
         if sub == 'worktree' and rest[:1] == ['remove'] and self._removable_linked_worktree(args[i + 1:], cwd_words):
