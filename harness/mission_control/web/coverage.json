@@ -1,0 +1,66 @@
+{
+ "state": {
+  "version": "internal",
+  "started": "sources-panel",
+  "host": "sources-panel",
+  "initiatives": "initiatives-panel",
+  "owners": "owners-panel",
+  "health": "health-panel",
+  "events": "activity-panel",
+  "chat": "chat-panel",
+  "asks": "needs-panel",
+  "ledger": "mission-panel",
+  "limits": "chat-panel",
+  "csrf": "internal",
+  "requirement_actions": "requirements-body"
+ },
+ "sse": {
+  "event": "activity-panel",
+  "initiatives": "initiatives-panel",
+  "owners": "owners-panel",
+  "health": "health-panel",
+  "chat": "chat-panel",
+  "codex": "chat-panel",
+  "asks": "needs-panel",
+  "ledger": "mission-panel"
+ },
+ "asks": {
+  "items": "needs-panel",
+  "stale": "needs-panel",
+  "flagged": "blockers-panel",
+  "cleared": "archive",
+  "resolved": "archive",
+  "archive": "archive",
+  "archive_total": "archive",
+  "swept_at": "sources-panel",
+  "session": "chat-panel"
+ },
+ "ledger": {
+  "goals": "goals-list",
+  "requirements": "requirements-body",
+  "status": "deploys-panel",
+  "generated": "sources-panel"
+ },
+ "routes": {
+  "GET /api/state": "main",
+  "GET /api/events": "connection",
+  "POST /api/chat": "chat-form",
+  "POST /api/approve": "needs-panel",
+  "POST /api/requirements/archive": "requirements-body"
+ },
+ "controls": {
+  "session pick": "chat-session",
+  "Claude or Codex switch": "responder-claude",
+  "owner filter": "owner-filter",
+  "event filters": "event-filters",
+  "pause feed": "activity-pause",
+  "tool activity": "activity-quiet",
+  "theme": "theme-toggle",
+  "motion": "motion-toggle",
+  "requirement search": "req-search",
+  "show more owners": "owners-more",
+  "show more asks": "needs-more",
+  "tabs": "tabs",
+  "needs button": "needs-button"
+ }
+}

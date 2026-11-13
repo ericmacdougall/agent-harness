@@ -3,53 +3,118 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-  <meta name="theme-color" content="#000000">
+  <meta name="theme-color" content="#0e1113">
   <title>Mission Control</title>
-  <link rel="stylesheet" href="./tokens.css">
-  <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./mission.css">
   <script src="./js/theme.js"></script>
 </head>
 <body data-tab="overview">
-  <a class="skip-link" href="#initiatives-panel">Skip to initiatives</a>
+  <a class="skip-link" href="#main">Skip to the page</a>
+  <a class="skip-link skip-chat" href="#chat-input">Skip to chat</a>
   <div id="scene-layer" aria-hidden="true"></div>
-  <div class="app-shell">
+  <div class="shell">
     <header class="topbar">
       <a class="brand" href="./" aria-label="Harness mission control home">
         <svg class="brand-mark" viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M5 7v18M12 3v26M20 3v26M27 7v18M5 16h22" stroke="currentColor" stroke-width="2"/><path d="m5 7 7-4h8l7 4M5 25l7 4h8l7-4" stroke="currentColor" stroke-width="1.2"/></svg>
-        <span>harness<span class="brand-divider">/</span><span class="brand-product">mission control</span></span>
+        <span>Mission Control</span>
       </a>
       <div class="topbar-tools">
         <span id="connection" class="connection connecting" role="status"><i></i><span>Connecting</span></span>
-        <time id="live-clock" class="mono">00:00:00</time><span class="clock-zone">LOCAL</span>
-        <button id="needs-button" class="quiet-button needs-button" type="button" aria-haspopup="dialog" aria-controls="needs-dialog"><span aria-hidden="true">?</span> Needs you <span id="needs-count" class="needs-count">0</span></button>
+        <span id="last-update" class="last-update">waiting for data</span>
+        <button id="needs-button" class="quiet-button needs-button" type="button" aria-controls="needs-panel"><span aria-hidden="true">?</span> Needs you <span id="needs-count" class="needs-count">0</span></button>
         <button id="theme-toggle" class="quiet-button theme-control" type="button" data-mode="auto"><svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7.5"/><path class="theme-half" d="M12 4.5a7.5 7.5 0 0 1 0 15z"/></svg><span id="theme-label">Theme: auto</span></button>
-        <button id="motion-toggle" class="quiet-button motion-control" type="button" aria-pressed="true"><svg class="motion-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7.5" stroke-dasharray="2.2 2.6"/><circle cx="12" cy="12" r="2"/></svg><span id="motion-label">Motion on</span></button>
       </div>
     </header>
 
-    <div class="workspace-bar">
-      <div><div class="eyebrow">LOCAL WORKSPACE <span class="slash">/</span> <span id="workspace-host">LOCAL</span></div><h1>Your fleet, in focus<span class="accent">.</span></h1></div>
-      <div class="fleet-metrics" aria-label="Fleet summary">
-        <div><strong id="metric-live">—</strong><span><i class="status-dot"></i>live owners</span></div>
-        <div><strong id="metric-initiatives">—</strong><span>initiatives</span></div>
-        <div><strong id="metric-attention">—</strong><span>need attention</span></div>
-      </div>
-    </div>
-
-    <nav class="filter-bar" aria-label="Filter activity by event kind">
-      <span class="filter-label">SIGNAL FILTER</span><div id="event-filters" class="filter-chips"></div>
-      <span class="filter-hint">Every signal has a shape.</span>
+    <nav id="tabs" class="tabs" role="tablist" aria-label="Views">
+      <button id="tab-overview" role="tab" data-tab="overview" aria-selected="true" aria-controls="view-overview">Overview</button>
+      <button id="tab-requirements" role="tab" data-tab="requirements" aria-selected="false" tabindex="-1" aria-controls="view-requirements">Requirements</button>
+      <button id="tab-archive" role="tab" data-tab="archive" aria-selected="false" tabindex="-1" aria-controls="view-archive">Archive</button>
+      <button id="tab-activity" role="tab" data-tab="activity" aria-selected="false" tabindex="-1" aria-controls="view-activity">Activity</button>
+      <button id="tab-topology" role="tab" data-tab="topology" aria-selected="false" tabindex="-1" aria-controls="view-topology">Topology</button>
+      <button id="tab-sources" role="tab" data-tab="sources" aria-selected="false" tabindex="-1" aria-controls="view-sources">Sources</button>
+      <button id="tab-chat" class="tab-chat" role="tab" data-tab="chat" aria-selected="false" tabindex="-1" aria-controls="chat-panel">Chat</button>
     </nav>
 
-    <main class="dashboard">
-      <section id="initiatives-panel" class="panel initiatives-panel" tabindex="-1" aria-labelledby="initiatives-heading">
-        <header class="panel-heading"><h2 id="initiatives-heading"><span class="section-index">01</span> Initiatives <span id="initiative-count" class="count-badge"></span></h2><span class="micro-label">THE BIG PICTURE</span></header>
-        <section id="at-risk" class="at-risk" aria-labelledby="at-risk-heading"><h3 id="at-risk-heading" class="at-risk-heading">Slowest / at risk <span class="micro-label">by time since real progress</span></h3><ol id="at-risk-list" class="at-risk-list"></ol></section>
-        <div id="initiatives-list" class="panel-scroll initiatives-list"></div>
-        <div class="panel-foot"><span class="status-dot"></span> Read from initiatives.json · estimates name their estimator</div>
-      </section>
+    <div class="layout">
+      <main id="main" class="views" tabindex="-1">
+        <section id="view-overview" data-view="overview" role="tabpanel" aria-labelledby="tab-overview">
+          <section id="mission-panel" class="panel" tabindex="-1" aria-labelledby="mission-heading">
+            <header class="panel-heading"><div><h2 id="mission-heading">Mission</h2><p class="panel-sub">Goals from the ledger, with the evidence behind each one.</p></div></header>
+            <div id="mission-tiles" class="panel-body"></div>
+            <div id="goals-list" class="panel-body goals"></div>
+            <details id="initiatives-panel" class="disclosure">
+              <summary>Initiatives <span id="initiative-count" class="count-badge"></span></summary>
+              <section id="at-risk" class="at-risk" aria-labelledby="at-risk-heading"><h3 id="at-risk-heading" class="at-risk-heading">Slowest or at risk <span class="micro-label">by time since real progress</span></h3><ol id="at-risk-list" class="at-risk-list"></ol></section>
+              <div id="initiatives-list" class="initiatives-list"></div>
+              <p class="panel-foot-note">Read from initiatives.json. Estimates name their estimator.</p>
+            </details>
+          </section>
 
-      <section id="topology-panel" class="topology-panel" aria-labelledby="topology-heading">
+          <div class="two-col">
+            <section id="owners-panel" class="panel" tabindex="-1" aria-labelledby="owners-heading">
+              <header class="panel-heading"><div><h2 id="owners-heading">Live owners and streams <span id="owner-count" class="count-badge"></span></h2><p class="panel-sub">The age beside each owner is its heartbeat: time since it last wrote.</p></div><label class="sr-only" for="owner-filter">Filter owners by state</label><select id="owner-filter" class="compact-select"><option value="active" selected>Live + attention</option><option value="all">All owners</option><option value="live">Live</option><option value="DROPPED">Dropped</option><option value="SILENT">Silent</option><option value="finishing">Finishing</option><option value="codex">Codex</option><option value="returned">Returned</option><option value="done">Done</option></select></header>
+              <div id="owners-list" class="panel-scroll owners-list"></div>
+              <button id="owners-more" class="more-button owners-more" type="button" aria-expanded="false" hidden></button>
+              <div class="owner-legend"><span><i class="status-dot"></i>under 5 min</span><span><i class="status-dot warm"></i>under 30 min</span><span><i class="status-dot stale"></i>30 min or more</span></div>
+            </section>
+
+            <section id="needs-panel" class="panel" tabindex="-1" aria-labelledby="needs-heading">
+              <header class="panel-heading"><div><h2 id="needs-heading">Needs you <span id="needs-panel-count" class="count-badge">0</span></h2><p class="panel-sub">Questions your agents have for you. Settled ones are in the Archive.</p></div></header>
+              <div class="panel-scroll needs-scroll">
+                <p class="needs-intro"><strong>Approve</strong> or <strong>Deny</strong> records your decision on exactly the text shown; a reply sends main your own words. Guarded actions (other sessions’ processes, production deletion, credentials, top-rung models) still get your word in the terminal. The questions are written by agents.</p>
+                <ul id="needs-list" class="needs-list"></ul>
+                <button id="needs-more" class="more-button" type="button" aria-expanded="false" hidden></button>
+                <details id="needs-stale" class="needs-history" hidden><summary>Stale · open with no activity <span id="needs-stale-count" class="count-badge">0</span></summary><p class="needs-section-note">Still open and still yours to answer. Nothing has happened on them for three days.</p><ul id="needs-stale-list" class="needs-list"></ul></details>
+                <details id="needs-flagged" class="needs-history" hidden><summary><span class="needs-flag">Untraceable</span> · not shown as valid asks <span id="needs-flagged-count" class="count-badge">0</span></summary><p class="needs-section-note">These do not trace to a real source, so they cannot be decided or answered here. Main has to restate them with their source.</p><ul id="needs-flagged-list" class="needs-list"></ul></details>
+              </div>
+            </section>
+          </div>
+
+          <div class="two-col">
+            <section id="deploys-panel" class="panel" tabindex="-1" aria-labelledby="deploys-heading">
+              <header class="panel-heading"><div><h2 id="deploys-heading">Recent deploys and live tests</h2><p class="panel-sub">From the evidence-only status of the last 12 hours, plus deploys on the live feed.</p></div></header>
+              <div id="deploys-list" class="panel-body"></div>
+            </section>
+            <section id="blockers-panel" class="panel" tabindex="-1" aria-labelledby="blockers-heading">
+              <header class="panel-heading"><div><h2 id="blockers-heading">Blockers</h2><p class="panel-sub">Recorded blockers, untraceable asks, dropped owners and blocked initiatives.</p></div></header>
+              <div id="blockers-list" class="panel-body"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="view-requirements" data-view="requirements" role="tabpanel" aria-labelledby="tab-requirements" hidden>
+          <section id="requirements" class="panel" tabindex="-1" aria-labelledby="requirements-heading">
+            <header class="panel-heading"><div><h2 id="requirements-heading">Requirements</h2><p class="panel-sub">Each requirement is live or archived by one fixed rule, and says why. Nothing is deleted.</p></div>
+              <label class="search"><span class="sr-only">Search requirements</span><input id="req-search" type="search" placeholder="Search requirements" autocomplete="off"></label></header>
+            <details class="disclosure rules"><summary>How the archive rule works</summary>
+              <ol><li><b>M archived from the dashboard</b>: someone archived it with the button on the row, with a reason. The page can only say which dashboard session clicked, not who. A restore keeps it live whatever the rules say. Both are recorded (session, when, why) and neither deletes anything. Your own requirements archived this way are counted on the Overview until you review them.</li><li><b>R1 terminal state</b>: the record says resolved, closed, done, superseded, expired, declined or withdrawn.</li><li><b>R2 done live</b>: a deploy and a live test for the same ticket or commit, the newest of each by time, the test passing and not older than the deploy; or its ticket is closed. A local test pass, a lone deploy or a failing test never archives.</li><li><b>R3 superseded</b>: a newer record in the same session has exactly the same words and is itself live. Near-duplicates stay live.</li><li><b>R4 expired</b>: a requirement over 30 days old with no owner, ticket or evidence that is not sourced to you (the 30 days is an assumption). Anything you said yourself is never archived by age. An ask is never archived by age or deadline: an ask past its deadline stays in Needs you.</li></ol>
+              <p>Anything else is live. The first matching rule wins, and a reopened ticket or newer failing evidence brings the item back on the next read.</p></details>
+            <div id="requirements-body" class="panel-body"></div>
+          </section>
+        </section>
+
+        <section id="view-archive" data-view="archive" role="tabpanel" aria-labelledby="tab-archive" hidden>
+          <section id="archive" class="panel" tabindex="-1" aria-labelledby="archive-heading">
+            <header class="panel-heading"><div><h2 id="archive-heading">Archive</h2><p class="panel-sub">Asks and requirements that are resolved, closed, superseded or expired, with their provenance and resolution. Viewing only: no record is deleted.</p></div></header>
+            <div id="archive-body" class="panel-body"></div>
+          </section>
+        </section>
+
+        <section id="view-activity" data-view="activity" role="tabpanel" aria-labelledby="tab-activity" hidden>
+          <nav class="filter-bar" aria-label="Filter activity by event kind"><span class="filter-label">Show</span><div id="event-filters" class="filter-chips"></div></nav>
+<section id="activity-panel" class="panel activity-panel" tabindex="-1" aria-labelledby="activity-heading">
+        <header class="panel-heading"><h2 id="activity-heading">Activity <span class="live-mini">live</span></h2><span class="activity-tools"><button id="activity-quiet" class="quiet-button" aria-pressed="false">Show tool activity</button><button id="activity-pause" class="quiet-button" aria-pressed="false"><span aria-hidden="true">Ⅱ</span> Pause feed</button></span></header>
+        <div id="activity-buffer" class="activity-buffer" hidden><button id="activity-resume" class="text-button"></button></div>
+        <div id="activity-list" class="panel-scroll activity-list" aria-label="Recent events"></div>
+        <div class="panel-foot"><span id="activity-summary">Listening for signals</span><span class="mono">mc.event/1</span></div>
+      </section>
+        </section>
+
+        <section id="view-topology" data-view="topology" role="tabpanel" aria-labelledby="tab-topology" hidden>
+          <p id="scene-load-note" class="notice warn" hidden></p>
+          <div class="topology-tools"><button id="motion-toggle" class="quiet-button motion-control" type="button" aria-pressed="true"><svg class="motion-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7.5" stroke-dasharray="2.2 2.6"/><circle cx="12" cy="12" r="2"/></svg><span id="motion-label">Motion on</span></button></div>
+<section id="topology-panel" class="topology-panel" aria-labelledby="topology-heading">
         <div class="topology-heading"><div><span class="eyebrow">LIVE TOPOLOGY</span><h2 id="topology-heading">One connected current.</h2></div><span class="scene-mode" id="scene-mode"><i></i> SPATIAL VIEW</span></div>
         <div id="scene-stage" class="scene-stage">
           <svg id="scene-poster" class="scene-poster" viewBox="0 0 640 320" role="img" aria-label="Static constellation: initiative cores linked to owners and repositories">
@@ -64,22 +129,19 @@
         </div>
         <div class="scene-caption"><span><i class="status-dot"></i><span id="scene-status">Owners linked. Signals flowing.</span></span><button id="scene-reset" class="text-button">Reset view <span aria-hidden="true">↺</span></button></div>
       </section>
+        </section>
 
-      <section id="activity-panel" class="panel activity-panel" tabindex="-1" aria-labelledby="activity-heading">
-        <header class="panel-heading"><h2 id="activity-heading"><span class="section-index">02</span> Activity <span class="live-mini">LIVE</span></h2><span class="activity-tools"><button id="activity-quiet" class="quiet-button" aria-pressed="false">Show tool activity</button><button id="activity-pause" class="quiet-button" aria-pressed="false"><span aria-hidden="true">Ⅱ</span> Pause feed</button></span></header>
-        <div id="activity-buffer" class="activity-buffer" hidden><button id="activity-resume" class="text-button"></button></div>
-        <div id="activity-list" class="panel-scroll activity-list" aria-label="Recent events"></div>
-        <div class="panel-foot"><span id="activity-summary">Listening for signals</span><span class="mono">mc.event/1</span></div>
-      </section>
+        <section id="view-sources" data-view="sources" role="tabpanel" aria-labelledby="tab-sources" hidden>
+          <section id="sources-panel" class="panel" tabindex="-1" aria-labelledby="sources-heading">
+            <header class="panel-heading"><div><h2 id="sources-heading">Sources and data</h2><p class="panel-sub">Every dataset this page holds, when it was last read, and where it is shown.</p></div></header>
+            <div id="inventory-body" class="panel-body"></div>
+          </section>
+        </section>
+      </main>
 
-      <section id="owners-panel" class="panel owners-panel" tabindex="-1" aria-labelledby="owners-heading">
-        <header class="panel-heading"><h2 id="owners-heading"><span class="section-index">03</span> Owners <span id="owner-count" class="count-badge"></span></h2><label class="sr-only" for="owner-filter">Filter owners by state</label><select id="owner-filter" class="compact-select"><option value="active" selected>Live + attention</option><option value="all">All owners</option><option value="live">Live</option><option value="DROPPED">Dropped</option><option value="SILENT">Silent</option><option value="finishing">Finishing</option><option value="codex">Codex</option><option value="returned">Returned</option><option value="done">Done</option></select></header>
-        <div id="owners-list" class="panel-scroll owners-list"></div>
-        <div class="owner-legend"><span><i class="status-dot"></i>&lt; 5 m</span><span><i class="status-dot warm"></i>&lt; 30 m</span><span><i class="status-dot stale"></i>30 m +</span><span>since last activity</span></div>
-      </section>
-
-      <section id="chat-panel" class="panel chat-panel" tabindex="-1" aria-labelledby="chat-heading">
-        <header class="panel-heading"><h2 id="chat-heading"><span class="section-index">04</span> Command channel</h2><span id="chat-presence" class="micro-label accent">READY</span></header>
+      <aside id="chat-dock" class="chat-dock" aria-label="Chat">
+<section id="chat-panel" class="panel chat-panel" tabindex="-1" aria-labelledby="chat-heading">
+        <header class="panel-heading"><h2 id="chat-heading">Chat</h2><span id="chat-presence" class="micro-label accent">ready</span></header>
         <div class="chat-routing"><div class="responder-switch" role="group" aria-label="Chat responder"><button id="responder-claude" aria-pressed="true"><span class="runtime-symbol" aria-hidden="true">✳</span> Claude <span class="responder-main">main</span></button><button id="responder-codex" aria-pressed="false"><span class="runtime-symbol" aria-hidden="true">◇</span> Codex</button></div><label id="session-label" class="session-label"><span class="sr-only">Claude target session</span><select id="chat-session"><option value="">no main attached</option></select></label></div>
         <div id="chat-log" class="chat-log" role="log" aria-label="Conversation" aria-live="off" tabindex="0"></div>
         <div id="chat-notice" class="chat-notice" role="status" hidden></div>
@@ -89,19 +151,20 @@
           <div class="composer-bottom"><span class="approval-notice"><button id="approval-help" type="button" aria-haspopup="dialog" aria-controls="approval-dialog" aria-describedby="approval-description" title="Chat steers ordinary work. Decisions on your agents' questions are made in Needs you.">About approvals <svg class="info-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.5"/><path d="M8 7.2v4M8 4.6v.2"/></svg></button><span id="approval-description" class="sr-only">Chat steers ordinary work and never counts as an approval. Decisions on your agents' questions are made in Needs you.</span></span><span id="composer-hint">↵ send <span>· Shift + ↵ new line</span></span><span id="chat-counter" class="mono">0 / 4000</span><button id="chat-send" type="submit" aria-label="Send message" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg></button></div>
         </form>
       </section>
-    </main>
+      </aside>
+    </div>
 
-    <footer id="health-panel" class="health-strip" aria-label="Source health"><div class="health-title"><span class="status-dot"></span><span>SOURCE HEALTH</span></div><div id="health-list" class="health-list"></div><span class="local-badge" title="Served on 127.0.0.1 only. This page reads your fleet; it sends only your chat messages and your decisions on asks.">LOCAL ONLY</span></footer>
-    <nav class="bottom-tabs" aria-label="Dashboard views"><button data-tab="overview" aria-current="page"><span aria-hidden="true">◈</span>Overview</button><button data-tab="activity"><span aria-hidden="true">≋</span>Activity</button><button data-tab="owners"><span aria-hidden="true">⠿</span>Owners</button><button data-tab="chat"><span aria-hidden="true">▱</span>Chat</button></nav>
+    <footer id="health-panel" class="health-strip" aria-label="Source health"><div class="health-title"><span class="status-dot"></span><span>Source health</span></div><div id="health-list" class="health-list"></div><span class="local-badge" title="Served on 127.0.0.1 only. This page reads your fleet; it sends only your chat messages and your decisions on asks.">Local only</span></footer>
   </div>
 
   <dialog id="approval-dialog" aria-labelledby="approval-title" aria-describedby="approval-copy"><div class="dialog-top"><h2 id="approval-title">What this page can decide</h2><button class="icon-button" id="approval-close" type="button" aria-label="Close explanation">×</button></div><div id="approval-copy" class="approval-copy"><p><strong>Chat</strong> reaches your agents labelled as dashboard text. It can start or steer ordinary work. It never counts as an approval.</p><p><strong>Needs you</strong> lists the questions main has for you. Approve or Deny records a signed decision for exactly that question and its text; main reads it and closes the question. A decision main has not read within 30 minutes expires and counts for nothing.</p><p><strong>The terminal</strong> is still where guarded actions get your word: stopping another session’s processes, production or deletion guards, credentials and accounts, and top-rung models. Main will ask you there.</p></div></dialog>
-  <dialog id="needs-dialog" class="needs-dialog" aria-labelledby="needs-title"><div class="dialog-top"><h2 id="needs-title">Needs you</h2><button class="icon-button" id="needs-close" type="button" aria-label="Close needs you">×</button></div><p class="needs-intro">Questions your agents have for you. <strong>Approve</strong> or <strong>Deny</strong> records your decision on exactly the text shown; a reply sends main your own words. Guarded actions (other sessions’ processes, production deletion, credentials, top-rung models) still get your word in the terminal. The questions are written by agents.</p><ul id="needs-list" class="needs-list"></ul><details id="needs-stale" class="needs-history" hidden><summary>Stale · open with no activity <span id="needs-stale-count" class="count-badge">0</span></summary><p class="needs-section-note">Still open and still yours to answer. The sweeper moved them here because nothing has happened on them for three days or they passed their own deadline.</p><ul id="needs-stale-list" class="needs-list"></ul></details><details id="needs-flagged" class="needs-history" hidden><summary><span class="needs-flag">Untraceable</span> · not shown as valid asks <span id="needs-flagged-count" class="count-badge">0</span></summary><p class="needs-section-note">These do not trace to a real source, so they cannot be decided or answered here. Main has to restate them with their source.</p><ul id="needs-flagged-list" class="needs-list"></ul></details><details id="needs-cleared" class="needs-history" hidden><summary>Cleared recently <span id="needs-cleared-count" class="count-badge">0</span></summary><p id="needs-swept" class="needs-section-note"></p><ul id="needs-cleared-list" class="needs-cleared"></ul></details><details id="needs-history" class="needs-history" hidden><summary>Answered · last 7 days <span id="needs-history-count" class="count-badge">0</span></summary><ul id="needs-history-list" class="needs-list"></ul></details></dialog>
   <dialog id="inspector" class="inspector"><div class="dialog-top"><span class="eyebrow" id="inspector-type">DETAIL</span><button class="icon-button" id="inspector-close" aria-label="Close details">×</button></div><div id="inspector-content"></div></dialog>
   <div id="page-error" class="page-error" role="alert" hidden></div>
   <div id="activity-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
   <div id="chat-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
   <div id="needs-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+  <div id="requirement-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+  <div id="connection-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
   <noscript><div class="noscript">Mission Control needs JavaScript to show your fleet.</div></noscript>
   <script type="module" src="./js/main.js"></script>
 </body>

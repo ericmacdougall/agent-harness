@@ -19,7 +19,8 @@ try { const theme = localStorage.getItem('mc-theme'); if (['light', 'dark'].incl
 let state = {
   initiatives: [], initiativesStale: false, initiativesError: '', owners: [], ownerRows: [], events: [], messages: [], sources: [],
   host: '', chat: null, pending: [], sessions: [], mainSession: '', asks: [], asksResolved: [], asksSession: '',
-  asksStale: [], asksFlagged: [], asksCleared: [], asksSweptAt: '',
+  asksStale: [], asksFlagged: [], asksCleared: [], asksSweptAt: '', asksArchive: [], asksArchiveTotal: 0,
+  ledger: adapt.ledger(null), lastData: 0,
   decisions: {},  // ask id -> this page's own Approve/Deny click while it is in flight or after it was refused
   connection: 'connecting', now: Date.now(), filters: Object.keys(KINDS),
   selection: null, highlight: null, tab: 'overview', responder: 'claude', session: '',
@@ -33,8 +34,10 @@ const seen = new Set();
 let transport;
 export const getState = () => state;
 export function subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); }
+// A server message (a snapshot or an event) is what "last update" counts; ticks and local clicks are not.
+const DATA_REASONS = new Set(['initiatives', 'owners', 'health', 'seed', 'event', 'chat', 'asks', 'ledger', 'availability']);
 export function update(patch, reason = 'update') {
-  state = { ...state, ...patch };
+  state = DATA_REASONS.has(reason) ? { ...state, ...patch, lastData: Date.now() } : { ...state, ...patch };
   listeners.forEach(fn => { try { fn(state, reason); } catch (error) { reportError(error, reason); } });
 }
 // A broken panel must not hide silently: show a short notice and keep the rest of the page running.
@@ -50,7 +53,8 @@ window.addEventListener('unhandledrejection', event => reportError(event.reason,
 export function tick() { update({ now: Date.now() }, 'tick'); }
 export function select(kind, id) { update({ selection: kind ? { kind, id } : null }, 'selection'); }
 export function highlight(id) { if (state.highlight !== id) update({ highlight: id }, 'highlight'); }
-export function setTab(tab) { update({ tab }, 'tab'); }
+export const TABS = Object.freeze(['overview', 'requirements', 'archive', 'activity', 'topology', 'sources', 'chat']);
+export function setTab(tab) { if (TABS.includes(tab) && tab !== state.tab) update({ tab }, 'tab'); }
 export function toggleFilter(kind) {
   const all = Object.keys(KINDS);
   const filters = kind === 'all' ? all : state.filters.length === all.length ? [kind] : state.filters.includes(kind) ? state.filters.filter(k => k !== kind) : [...state.filters, kind];
@@ -102,6 +106,7 @@ export function ingestEvent(raw) {
   const counted = state.feedPaused && !event.historic && (!event.quiet || state.showQuiet);
   update({ events, owners, lastEvent: event, buffered: counted ? state.buffered + 1 : state.buffered }, 'event');
 }
+export function setLedger(snapshot) { update({ ledger: adapt.ledger(snapshot) }, 'ledger'); }
 export function setConnection(connection) { if (state.connection !== connection) update({ connection }, 'connection'); }
 export function setChat(chat) {
   if (!chat || typeof chat !== 'object') return;
@@ -190,7 +195,10 @@ export function setAsks(snapshot) {
   const list = key => (Array.isArray(snapshot?.[key]) ? snapshot[key].filter(a => a && /^[A-Za-z0-9_-]{1,40}$/.test(String(a.id))) : []);
   // the sweeper's sections: stale asks are still open and answerable; flagged ones are not valid asks; cleared rows
   // are settled asks it hid, each with its reason
-  update({ asks: items, asksResolved: resolved, asksStale: list('stale'), asksFlagged: list('flagged'), asksCleared: list('cleared'),
+  // an expired ask is archived by the archive rule, so it leaves the stale section: it is shown once, with its reason
+  const archive = adapt.archiveRows(Array.isArray(snapshot?.archive) ? snapshot.archive.filter(a => a && /^[A-Za-z0-9_-]{1,40}$/.test(String(a.id))) : [], []);
+  const archived = new Set(archive.map(a => a.id));
+  update({ asks: items, asksResolved: resolved, asksStale: list('stale').filter(a => !archived.has(a.id)), asksFlagged: list('flagged'), asksCleared: list('cleared'), asksArchive: archive, asksArchiveTotal: Number.isInteger(snapshot?.archive_total) ? snapshot.archive_total : archive.length,
     asksSweptAt: typeof snapshot?.swept_at === 'string' ? snapshot.swept_at : '', asksSession: String(snapshot?.session || '') }, 'asks');
 }
 export function askReplyAccess(ask, current = state) { return chatAccess(current, 'claude', ask?.session || current.asksSession); }
@@ -237,5 +245,23 @@ export function decideAsk(ask, decision, note = '') {
     () => { if (state.decisions[ask.id]?.client_key === client_key) setDecision(ask.id, { ...item, status: 'sent' }); },
     error => { if (state.decisions[ask.id]?.client_key === client_key) setDecision(ask.id, { ...item, status: 'failed', retryable: !!error?.retryable, reason: String(error?.message || 'no answer from Mission Control').slice(0, 200) }); });
   return true;
+}
+// ---- requirements: Archive and Restore are the only writes the cleanup has. One click, one explicit confirm, one
+// reason; the same exact request reuses its client key, so a lost response and a retry record once.
+let requirementTransport;
+export function setRequirementTransport(send) { requirementTransport = send; }
+const requirementKeys = new Map();
+export async function requirementAction(row, action, reason) {
+  const clean = String(reason || '').trim();
+  if (!row?.id || !row.digest || !['archive', 'restore'].includes(action) || !clean || clean.length > 300 || !requirementTransport) return { ok: false, message: 'a reason of 1 to 300 characters is required' };
+  const sig = `${row.id}|${action}|${clean}|${row.digest}`;  // the digest is part of the request: a changed requirement is a new request
+  if (!requirementKeys.has(sig)) requirementKeys.set(sig, adapt.newClientKey());
+  try {
+    await requirementTransport({ req_id: row.id, action, reason: clean, digest: row.digest, client_key: requirementKeys.get(sig) });
+    requirementKeys.delete(sig);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, retryable: !!error?.retryable, message: String(error?.message || 'not recorded').slice(0, 200) };
+  }
 }
 export const messageSession = id => state.messages.find(m => m.id === id)?.session || state.session;

@@ -1,14 +1,15 @@
 // "Needs you": the open asks of main's session, each decided with Approve / Deny or answered in the user's own
-// words, and a history of asks resolved in the last 7 days. Ask text is agent-written, so it is only ever set with
+// words, and, in the Archive view, the asks that are settled. Ask text is agent-written, so it is only ever set with
 // textContent, never parsed as HTML, and it is shown whole: the digest a decision signs covers exactly this text.
 // A decision is a signed server record (POST /api/approve); a reply is an ordinary chat message to main prefixed
-// `[ask:<id>]`. Main resolves the ask from either, and the next ledger read moves it to the history.
+// `[ask:<id>]`. Main resolves the ask from either, and the next ledger read moves it to the Archive view.
 import { getState, subscribe, askReplyAccess, sendAskReply, decisionAccess, decideAsk, DECISION_NOTE_MAX } from './store.js';
 import { el, button, age } from './ui.js';
 import { trailOf, waitingOnUser, askProgress, replyStatus, decisionOf, decisionStatus } from './adapt.js';
 
 const BASE_TITLE = 'Mission Control';
 const REPLY_MAX = 3900;
+export const ASKS_SHOWN = 5;
 
 const time = iso => { const d = new Date(iso); return Number.isFinite(d.getTime()) ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''; };
 function gap(from, to) {
@@ -53,27 +54,23 @@ function renderTrail(box, trail, decision = null) {
 export function mountNeeds() {
   const open = document.getElementById('needs-button');
   const count = document.getElementById('needs-count');
-  const dialog = document.getElementById('needs-dialog');
+  const panelCount = document.getElementById('needs-panel-count');
+  const panel = document.getElementById('needs-panel');
   const list = document.getElementById('needs-list');
-  const history = document.getElementById('needs-history');
-  const historyList = document.getElementById('needs-history-list');
-  const historyCount = document.getElementById('needs-history-count');
   const announcer = document.getElementById('needs-announcer');
   const sections = [
     { key: 'asks', list, box: null, count: null },
     { key: 'asksStale', list: document.getElementById('needs-stale-list'), box: document.getElementById('needs-stale'), count: document.getElementById('needs-stale-count') },
     { key: 'asksFlagged', list: document.getElementById('needs-flagged-list'), box: document.getElementById('needs-flagged'), count: document.getElementById('needs-flagged-count') },
   ];
-  const clearedBox = document.getElementById('needs-cleared'), clearedList = document.getElementById('needs-cleared-list');
-  const clearedCount = document.getElementById('needs-cleared-count'), swept = document.getElementById('needs-swept');
-  const CLEARED_WHY = { resolved: 'resolved', 'ticket-closed': 'its ticket is closed', 'owner-reassigned': 'its owner is gone and the work was reassigned', duplicate: 'duplicate of an older ask' };
   const drafts = new Map();     // ask id -> unsent text; kept across re-renders, cleared once a send is accepted
   const arming = new Map();     // ask id -> 'approve' | 'deny' while the confirm step is showing
   const announced = new Map();  // ask id -> last decision status read out
   const rows = new Map();
-  open.addEventListener('click', () => { if (!dialog.open) dialog.showModal(); });
-  document.getElementById('needs-close').addEventListener('click', () => dialog.close());
-  dialog.addEventListener('close', () => { arming.clear(); paint(getState()); });
+  let showAll = false;
+  document.getElementById('needs-more').addEventListener('click', () => { showAll = !showAll; paint(getState()); });
+  // The list is part of the page (not a dialog): the top-bar button takes you to it.
+  const visible = () => panel.offsetParent !== null;
 
   function build(ask) {
     const row = el('li', 'needs-item');
@@ -149,54 +146,27 @@ export function mountNeeds() {
     return parts;
   }
 
-  function paintHistory(state) {
-    const resolved = state.asksResolved || [];
-    historyCount.textContent = String(resolved.length);
-    history.hidden = !resolved.length;
-    historyList.replaceChildren();
-    for (const ask of resolved) {
-      const item = el('li', 'needs-item resolved');
-      const top = el('div', 'needs-top');
-      top.append(el('span', 'needs-kind done', ask.decision ? `Resolved · ${ask.decision}` : 'Resolved'),
-        el('span', 'ticket-id', origin(ask)), el('time', 'needs-age', age(ask.resolved_at, state.now)));
-      item.append(top, el('p', 'needs-text', ask.text || '(no text recorded)'));
-      if (ask.resolution) item.append(el('p', 'needs-why', `How: ${ask.resolution}`));
-      const trail = el('ul', 'needs-trail');
-      renderTrail(trail, trailOf(state.messages, ask.id), decisionOf(state.messages, ask));
-      item.append(trail);
-      historyList.append(item);
-    }
-  }
-
   function paint(state) {
     const waiting = state.asks.filter(ask => waitingOnUser(state.messages, ask) && state.decisions[ask.id]?.status !== 'sending').length;
     const stale = state.asksStale.length;
     count.textContent = String(waiting);
+    panelCount.textContent = String(waiting);
     open.classList.toggle('has-asks', waiting > 0);
     open.setAttribute('aria-label', (waiting ? `Needs you: ${waiting} open ask${waiting === 1 ? '' : 's'}` : 'Needs you: nothing waiting on you') + (stale ? `, ${stale} stale` : ''));
     document.title = waiting ? `(${waiting}) ${BASE_TITLE}` : BASE_TITLE;
-    const wanted = new Set(sections.flatMap(section => state[section.key].map(a => a.id)));
+    const shown = key => (key === 'asks' && !showAll ? state.asks.slice(0, ASKS_SHOWN) : state[key]);
+    const more = document.getElementById('needs-more');
+    more.hidden = state.asks.length <= ASKS_SHOWN;
+    more.textContent = showAll ? 'Show fewer asks' : `Show ${state.asks.length - ASKS_SHOWN} more asks`;
+    more.setAttribute('aria-expanded', String(showAll));
+    const wanted = new Set(sections.flatMap(section => shown(section.key).map(a => a.id)));
     for (const [id, parts] of rows) if (!wanted.has(id)) { parts.row.remove(); rows.delete(id); drafts.delete(id); arming.delete(id); announced.delete(id); }
     list.querySelector('.empty-state')?.remove();
     if (!state.asks.length) list.append(el('li', 'empty-state', stale ? 'Nothing new needs you. Older open asks are under Stale.' : 'Nothing needs you right now.'));
     for (const section of sections) {
       if (section.box) { section.box.hidden = !state[section.key].length; section.count.textContent = String(state[section.key].length); }
-      state[section.key].forEach((ask, index) => paintAsk(state, section, ask, index));
+      shown(section.key).forEach((ask, index) => paintAsk(state, section, ask, index));
     }
-    paintCleared(state);
-    paintHistory(state);
-  }
-
-  function paintCleared(state) {
-    const cleared = state.asksCleared;
-    clearedBox.hidden = !cleared.length;
-    clearedCount.textContent = String(cleared.length);
-    swept.textContent = state.asksSweptAt ? `Settled asks the sweeper hid, with the reason and its evidence. Last sweep ${age(state.asksSweptAt, state.now)}.` : '';
-    clearedList.replaceChildren(...cleared.map(row => {
-      const item = el('li');
-      item.append(el('b', '', CLEARED_WHY[row.reason] || String(row.reason || 'cleared')), document.createTextNode(` · ${row.text || row.id} · ${row.evidence || 'no evidence recorded'} · ${age(row.at, state.now)}`));
-      return item;
-    }));
   }
 
   function paintAsk(state, section, ask, index) {
@@ -274,7 +244,7 @@ export function mountNeeds() {
   subscribe((state, reason) => {
     if (reason === 'tick') {
       for (const parts of rows.values()) parts.when.textContent = age(parts.ask.at, state.now);
-      if (dialog.open && [...state.asks, ...state.asksStale].some(ask => decisionOf(state.messages, ask)?.status === 'queued')) paint(state);  // the expiry countdown
+      if (visible() && [...state.asks, ...state.asksStale].some(ask => decisionOf(state.messages, ask)?.status === 'queued')) paint(state);  // the expiry countdown
       return;
     }
     if (['asks', 'chat', 'connection', 'routing', 'availability', 'update'].includes(reason)) paint(state);

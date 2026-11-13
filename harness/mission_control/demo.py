@@ -253,11 +253,77 @@ class DemoRunner:
                               "resolved_at": _iso(time.time() - 86000), "decision": "approved",
                               "resolved_by": "wdemores0900",
                               "resolution": "answered by the user: yes, staging first"}]})
+        if kind == "ah-goals" and not args:
+            return 0, json.dumps(goals_payload(time.time()))
+        if kind == "ah-requirements" and len(args) == 1:
+            return 0, json.dumps(requirements_payload(time.time()))
+        if kind == "ah-status" and len(args) == 1:
+            return 0, json.dumps(status_payload(time.time()))
         if kind == "ah-ticket-get" and len(args) == 1:
             return 0, json.dumps({"issue": {"closedAt": None, "archivedAt": None}})
         if kind == "gh-user" and not args:
             return 1, ""  # the GitHub source shows as failing, so the page's error notice can be checked
         raise PermissionError(f"demo mode runs no commands ({kind})")
+
+
+def goals_payload(now: float) -> dict:
+    """Mission goals for the demo: one live-tested, one in progress, one with a failing test, one hostile title."""
+    def proof(ident, kind, verdict, age, check, note):
+        return {"id": ident, "kind": kind, "verdict": verdict, "at": _iso(now - age), "check": check, "by": "main", "note": note}
+    return {"generated": _iso(now), "session": DEMO_SESSION, "state": "OK", "warnings": [], "goals": [
+        {"id": "checkout", "title": "Checkout redesign live for everyone", "ticket": "demo#101", "ledger_status": "active",
+         "state": "IN_PROGRESS", "priority": 1, "target": "checkout redesign live and click-tested", "owners": ["a1live0demo"],
+         "deferral": None, "missing": [], "tampered": [], "unpinned": [],
+         "evidence": [proof("wev0001", "live_test", "PASS", 5400, "checkout-staging", "REALLY_TESTED checkout-staging: PASS on staging")]},
+        {"id": "reports", "title": "Reports table migrated without downtime", "ticket": "demo#104", "ledger_status": "active",
+         "state": "BLOCKED", "priority": 2, "target": "reports migration live", "owners": ["a4held0demo"], "deferral": None,
+         "missing": ["backup"], "tampered": [], "unpinned": [],
+         "evidence": [proof("wev0002", "live_test", "FAIL", 7200, "reports-canary", "REALLY_TESTED reports-canary: FAIL, 3 rows differ")]},
+        {"id": "release", "title": "Release 0.4 deployed and tested live", "ticket": "demo#103", "ledger_status": "active",
+         "state": "LIVE_TESTED", "priority": 2, "target": "0.4 live", "owners": [], "deferral": None, "missing": [],
+         "tampered": [], "unpinned": [],
+         "evidence": [proof("wev0003", "deploy", "PASS", 9000, "release-0.4", "DEPLOYED demo/shop 0.4.0 to live"),
+                      proof("wev0004", "live_test", "PASS", 8400, "release-0.4-live", "REALLY_TESTED release-0.4-live: PASS")]},
+        {"id": "xss", "title": "<img src=x onerror=alert(1)> goal title", "ticket": "", "ledger_status": "imported",
+         "state": "UNKNOWN", "priority": 3, "target": "<script>alert(2)</script>", "owners": [], "deferral": None,
+         "missing": [], "tampered": [], "unpinned": [], "evidence": []}]}
+
+
+def requirements_payload(now: float) -> dict:
+    """Recorded requirements: live ones, a done one, a superseded pair, an old unowned one that has expired."""
+    def row(ident, text, age, state="recorded", **extra):
+        return {"id": ident, "session": DEMO_SESSION, "text": text, "source": 'user:demo/' + ident + ' "..."',
+                "at": _iso(now - age), "state": state, "ticket": None, "owner": None, "evidence": None, **extra}
+    return {"generated": _iso(now), "total": 7, "truncated": False, "requirements": [
+        row("wdemoreq001", "Checkout must show a clear error state when the payment fails.", 3600, ticket="demo#101"),
+        row("wdemoreq002", "Back up all transcripts and keep the status of all work in tickets.", 2 * 86400),
+        row("wdemoreq003", "Back up all transcripts and keep  the status of all work in tickets.", 5 * 86400),
+        row("wdemoreq004", "Release notes ship with every release.", 6 * 86400, state="done"),
+        row("wdemoreq005", "Use the staging database for the reports rehearsal.", 40 * 86400),
+        row("wdemoreq006", "<img src=x onerror=alert(1)> must stay text.", 3600),
+        row("wdemoreq007", "Release 0.4 is deployed and tested live.", 86400,
+            evidence={"id": "wev0004", "kind": "live_test", "verdict": "PASS", "at": _iso(now - 8400)})]}
+
+
+def status_payload(now: float) -> dict:
+    def entry(ident, agent, event, note, age, **extra):
+        return {"agent": agent, "at": _iso(now - age), "id": ident, "event": event, "note": note, **extra}
+    return {"session": DEMO_SESSION, "since_s": 43200, "generated": _iso(now), "entries": 240, "unread": 0,
+            "verified": [entry("wst001", "a3fini0demo", "check", "REALLY_TESTED release-0.4-live: PASS on live", 8400,
+                               check="release-0.4-live", verdict="PASS")],
+            "live": [entry("wst002", "a3fini0demo", "deploy", "DEPLOYED demo/shop 0.4.0 to live", 9000)],
+            "live_legacy": [], "pending": [entry("wst003", "a1live0demo", "check", "PENDING_REAL_TEST checkout-staging: error state shown", 1200,
+                                                 check="checkout-staging", verdict="")],
+            "failed": [entry("wst004", "a4held0demo", "check", "REALLY_TESTED reports-canary: FAIL, 3 rows differ", 7200,
+                             check="reports-canary", verdict="FAIL")],
+            "claimed": [entry("wst005", "main", "status", "Merged demo#103; deploy still to do", 3000)],
+            "blockers": [entry("wst006", "a5drop0demo", "blocker", "index build failed twice; needs a larger disk", 5400),
+                         entry("wst007", "a4held0demo", "blocker", "<script>alert(3)</script> waiting on the nightly backup", 2400)],
+            "commits": [entry("wst008", "a1live0demo", "commit", "feat(checkout): payment form errors", 1800)],
+            "asks_open": [], "decisions": [entry("wst009", "main", "decision", "Flag first, 10 percent for a day", 4000)],
+            "assumptions": [],
+            "owners": {"counts": {"live": 1, "working": 1, "DROPPED": 2, "done": 4}, "undisposed": ["a5drop0demo"],
+                       "attention": ["a5drop0demo"], "live": ["a1live0demo"]}}
 
 
 def owners_payload(now: float) -> dict:

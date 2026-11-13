@@ -55,6 +55,7 @@ sys.path.insert(1, str(HOOKS))
 import collectors as col  # noqa: E402
 import demo as demo_mode  # noqa: E402
 import events as ev  # noqa: E402
+import req_actions  # noqa: E402
 import mc_chat  # noqa: E402
 from codex_responder import CodexResponder  # noqa: E402
 from safeio import Reader, Runner  # noqa: E402
@@ -350,6 +351,9 @@ class App:
         self.asks = col.Asks(self.hub, self.health, self.runner, lambda: self.owners.session, root=root,
                              owners_fn=lambda: self.owners.rows)
         self.tailer.on_ask = self.asks.mark_dirty
+        self.actions = req_actions.ReqActions(root, self.key)
+        self.ledger = col.Ledger(self.hub, self.health, self.runner, lambda: self.owners.session, root=root,
+                                 actions=self.actions)
         self.collectors = [self.tailer, self.initiatives, self.drop, self.owners, self.github, self.tickets,
                            self.remote]
         self.codex = CodexResponder(self.hub, self.health, self.runner, codex_binary(), root,
@@ -368,7 +372,7 @@ class App:
 
     def start(self) -> None:
         loops = [(self.loop, "collectors"), (self.codex.loop, "codex"), (self.chat_loop, "chat"),
-                 (self.asks_loop, "asks")]
+                 (self.asks_loop, "asks"), (self.ledger_loop, "ledger")]
         if self.supervised:
             loops.append((self.supervised_loop, 'supervised-owners'))
         if self.demo:
@@ -388,7 +392,7 @@ class App:
     def wake(self) -> None:
         """A page attached: sources that were on their idle cadence refresh now."""
         now = time.time()
-        for collector in self.collectors:
+        for collector in self.collectors + [self.ledger]:
             collector.wake(now)
 
     def asks_loop(self) -> None:
@@ -398,6 +402,14 @@ class App:
             now = time.time()
             if self.asks.due(now):
                 self.asks.run(now)
+            self.stop.wait(1.0)
+
+    def ledger_loop(self) -> None:
+        """Goals, requirements and status: three `ah` reads that take seconds, so they have their own thread."""
+        while not self.stop.is_set():
+            now = time.time()
+            if self.ledger.due(now):
+                self.ledger.run(now)
             self.stop.wait(1.0)
 
     def loop(self) -> None:
@@ -479,6 +491,7 @@ class App:
                 "initiatives": self.initiatives.snapshot(), "owners": self.owners.rows,
                 "health": self.health.snapshot(), "events": self.hub.recent(limit=200),
                 "chat": self.chat_snapshot(), "asks": self.asks.snapshot(),
+                "ledger": self.ledger.snapshot(), "requirement_actions": len(self.actions.latest()),
                 "limits": {"chat_max": mc_chat.MAX_TEXT, "approval_note_max": mc_chat.APPROVAL_NOTE_MAX,
                            "approval_ttl_s": mc_chat.APPROVAL_TTL_S}}
 
@@ -513,6 +526,48 @@ class App:
         self.refresh_chat(force=True)
         return (201 if created else 200), {"id": record["id"], "created": created,
                                            "status": mc_chat.state(record["id"], self.root).get("status")}
+
+    def post_requirement(self, body: dict) -> tuple[int, dict]:
+        """One Archive or Restore click on a requirement. The page names the requirement, the digest of the text it
+        showed, the action and a reason; whether the requirement exists, and its current text, come from the server's
+        own ledger read, never from the request. It records a signed row and never deletes anything."""
+        if not isinstance(body, dict):
+            return 400, {"error": "bad-json"}
+        req, action, digest = body.get("req_id"), body.get("action"), body.get("digest")
+        session = self.owners.session or ""
+        if not session:
+            return 409, {"error": "no-main", "message": "Mission Control does not know main's session yet"}
+        # A retry with the same key after a lost response is answered with the row it already made, whatever state
+        # the requirement is in now (the row's own archive made the "already archived" check below true).
+        prior = self.actions.by_key(body.get("client_key"))
+        if prior:
+            # The same key must mean the same request: requirement, action, reason, digest and main session. Anything
+            # else is a conflict, never an acknowledgement of something that was not recorded.
+            same = (prior["req"], prior["action"], prior["session"]) == (req, action, session) \
+                and isinstance(body.get("reason"), str) and prior["reason"] == " ".join(mc_chat._redact(body["reason"]).split()) \
+                and isinstance(digest, str) and hmac.compare_digest(digest.encode("utf-8", "replace"), str(prior["digest"]).encode())
+            if not same:
+                return 409, {"error": "key-conflict", "message": "this request id was already used for a different request"}
+            return 200, {"id": prior["id"], "created": False, "req": req, "action": action, "at": prior["at"]}
+        item = next((r for r in self.ledger.parts["requirements"].get("items", []) if r["id"] == req), None) \
+            if isinstance(req, str) else None
+        if item is None:
+            return 409, {"error": "unknown-requirement", "message": "this requirement is not in the current ledger read"}
+        if not isinstance(digest, str) or not hmac.compare_digest(digest.encode("utf-8", "replace"), item["digest"].encode()):
+            return 409, {"error": "stale-digest", "message": "the requirement changed since it was shown; read it again"}
+        if action == "archive" and item["bucket"] == "archived":
+            return 409, {"error": "already-archived", "message": "this requirement is already archived"}
+        if action == "restore" and item["bucket"] == "live":
+            return 409, {"error": "not-archived", "message": "this requirement is not archived"}
+        try:
+            row, created = self.actions.record(session=session, req=req, action=action, reason=body.get("reason"),
+                                               digest=digest, client_key=body.get("client_key"))
+        except req_actions.ActionError as exc:
+            return exc.status, {"error": exc.code, "message": str(exc)}
+        self.ledger.reclassify()
+        self.hub.publish(ev.make("system", "dashboard", f"dashboard session {session[:8]} {action}d requirement {req}", eid=f"req:{row['id']}",
+                                 actor={"runtime": "dashboard"}, subject={"initiative": ""}))
+        return (201 if created else 200), {"id": row["id"], "created": created, "req": req, "action": action, "at": row["at"]}
 
     def post_approve(self, body: dict) -> tuple[int, dict]:
         """One Approve or Deny click on an open ask of main's session. The request names the ask, the digest of
@@ -674,7 +729,7 @@ class Handler(BaseHTTPRequestHandler):
         if not hmac.compare_digest(str(self.headers.get("X-MC-CSRF") or ""), info["csrf"]):
             return self.deny(403, "csrf")
         route = urlsplit(self.path).path
-        if route not in ("/api/chat", "/api/approve"):
+        if route not in ("/api/chat", "/api/approve", "/api/requirements/archive"):
             return self.deny(404, "not-found")
         if "application/json" not in (self.headers.get("Content-Type") or ""):
             return self.deny(415, "content-type")
@@ -688,7 +743,8 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length).decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return self.deny(400, "bad-json")
-        status, value = self.app.post_approve(body) if route == "/api/approve" else self.app.post_chat(body)
+        handler = {"/api/approve": self.app.post_approve, "/api/requirements/archive": self.app.post_requirement}.get(route, self.app.post_chat)
+        status, value = handler(body)
         if self.app.demo and self.app.demo_drop_first and status == 201:
             self.app.demo_drop_first = False  # demo knob: the message is stored but its response is lost, once
             self.close_connection = True

@@ -1,4 +1,4 @@
-import { getState, subscribe, tick, select, setTab, setResponder, toggleFilter, toggleMotion, cycleTheme, KINDS } from './store.js';
+import { getState, subscribe, tick, select, setTab, setResponder, toggleFilter, toggleMotion, cycleTheme, KINDS, TABS } from './store.js';
 import { el, button, progress, checklist, field, eta, age, stateClass } from './ui.js';
 import { mountInitiatives } from './initiatives.js';
 import { liveFields } from './adapt.js';
@@ -7,14 +7,15 @@ import { mountOwners } from './owners.js';
 import { mountChat } from './chat.js';
 import { mountNeeds } from './needs.js';
 import { mountHealth } from './health.js';
-import { mountScene } from './scene.js';
+import { mountViews } from './views.js';
 import * as live from './live.js';
 
 mountInitiatives(); mountActivity(); mountOwners(); mountChat(); mountHealth(); mountNeeds();
-mountScene();
+const { go } = mountViews();  // the 3D topology loads only when its tab is first opened
+document.getElementById('needs-button').addEventListener('click', () => go('needs-panel'));
 
 const filters = document.getElementById('event-filters');
-const all = button('filter-chip all', 'All signals', () => toggleFilter('all'));
+const all = button('filter-chip all', 'All', () => toggleFilter('all'));
 all.dataset.kind = 'all'; filters.append(all);
 Object.entries(KINDS).forEach(([key, kind]) => {
   const chip = button('filter-chip', '', () => toggleFilter(key));
@@ -38,31 +39,33 @@ function applyTheme(state) {
 scheme.addEventListener('change', () => applyTheme(getState()));
 applyTheme(getState());
 subscribe((state, reason) => { if (reason === 'theme') applyTheme(state); });
-document.querySelectorAll('.bottom-tabs button').forEach(tab => tab.addEventListener('click', () => setTab(tab.dataset.tab)));
 
 const CONNECTION_TEXT = { live: 'Live', connecting: 'Connecting', reconnecting: 'Reconnecting', offline: 'Offline', expired: 'Signed out' };
+const CONNECTION_NOTE = {
+  live: 'Connected. Updates arrive as they happen.', connecting: 'Connecting to Mission Control.',
+  reconnecting: 'Connection dropped. Reconnecting; the last data stays on screen.', offline: 'Offline. Showing the last data received; retrying with a growing delay.',
+  expired: 'Session ended. Run `mc` in a terminal for a fresh link.',
+};
 const SCENE_TEXT = {
   live: 'Owners linked. Signals flowing.', connecting: 'Connecting to Mission Control…',
   reconnecting: 'Reconnecting. Last known fleet retained.', offline: 'Offline. Showing the last known fleet.',
   expired: 'Session ended. Run `server.py open` in a terminal for a fresh link.',
 };
+let announcedConnection = '';
 function shell(state, reason) {
-  const time = new Date(state.now);
-  const clock = document.getElementById('live-clock');
-  clock.textContent = time.toLocaleTimeString([], { hour12: false });
-  clock.dateTime = time.toISOString();
+  const lastUpdate = document.getElementById('last-update');
+  lastUpdate.textContent = state.lastData ? `Updated ${age(new Date(state.lastData).toISOString(), state.now)}` : 'waiting for data';
+  lastUpdate.title = state.lastData ? `Last data from the server: ${new Date(state.lastData).toLocaleTimeString()}` : '';
+  lastUpdate.classList.toggle('old', !!state.lastData && state.connection === 'live' && state.now - state.lastData > 180000);
   if (reason === 'tick' || reason === 'highlight') return;
   const connection = document.getElementById('connection');
   connection.className = `connection ${state.connection}`;
   connection.querySelector('span').textContent = CONNECTION_TEXT[state.connection] || state.connection;
-  const severeOwners = state.owners.filter(owner => owner.severe).length;
-  const riskyInitiatives = state.initiatives.filter(item => /at risk|blocked/i.test(item.state)).length;
-  document.getElementById('metric-live').textContent = String(state.owners.filter(owner => owner.state === 'live').length).padStart(2, '0');
-  document.getElementById('metric-initiatives').textContent = String(state.initiatives.length).padStart(2, '0');
-  const attention = document.getElementById('metric-attention');
-  attention.textContent = String(severeOwners + riskyInitiatives).padStart(2, '0');
-  attention.parentElement.title = `${riskyInitiatives} initiatives at risk or blocked · ${severeOwners} owners dropped or silent with no recorded hold`;
-  document.getElementById('workspace-host').textContent = (state.host || 'local').toUpperCase();
+  connection.title = CONNECTION_NOTE[state.connection] || '';
+  if (announcedConnection !== state.connection) {
+    if (announcedConnection) document.getElementById('connection-announcer').textContent = CONNECTION_NOTE[state.connection] || state.connection;
+    announcedConnection = state.connection;
+  }
   filters.querySelectorAll('button').forEach(chip => chip.setAttribute('aria-pressed', String(chip.dataset.kind === 'all' ? state.filters.length === Object.keys(KINDS).length : state.filters.includes(chip.dataset.kind))));
   document.body.classList.toggle('motion-off', !state.motion);
   const motion = document.getElementById('motion-toggle');
@@ -72,11 +75,6 @@ function shell(state, reason) {
   motion.title = state.reducedMotion ? 'Your system reduced motion setting takes precedence' : 'Toggle ambient motion';
   document.getElementById('motion-label').textContent = state.reducedMotion ? 'Reduced motion' : state.motion ? 'Motion on' : 'Motion off';
   document.getElementById('scene-status').textContent = SCENE_TEXT[state.connection] || '';
-  document.body.dataset.tab = state.tab;
-  document.querySelectorAll('.bottom-tabs button').forEach(tab => {
-    if (tab.dataset.tab === state.tab) tab.setAttribute('aria-current', 'page'); else tab.removeAttribute('aria-current');
-  });
-  if (reason === 'tab' && window.innerWidth < 768) window.scrollTo({ top: 0, behavior: 'instant' });
 }
 shell(getState(), 'initial');
 subscribe(shell);
@@ -204,6 +202,6 @@ window.addEventListener('pagehide', () => { clearInterval(timer); live.stop(); }
 window.addEventListener('pageshow', event => { if (event.persisted) { tick(); timer = setInterval(() => { if (!document.hidden) tick(); }, 1000); live.start(); } });
 // Deep links such as #tab=chat&to=codex (a phone bookmark straight to the chat) set view preferences only.
 const hash = new URLSearchParams(location.hash.slice(1));
-if (['overview', 'activity', 'owners', 'chat'].includes(hash.get('tab'))) setTab(hash.get('tab'));
+if (TABS.includes(hash.get('tab'))) setTab(hash.get('tab'));
 if (['claude', 'codex'].includes(hash.get('to'))) setResponder(hash.get('to'));
 live.start();
