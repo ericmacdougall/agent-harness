@@ -20,7 +20,7 @@ ME = os.getuid()
 REAL_SCAN = cg.busy_scan
 # the real t2-dev unreadable set (read-only ps on 2026-11-13), with the command lines that matter
 T2_DEV = {
-    "2033": ("sg", "/usr/bin/sg docker -c exec /usr/bin/python3 /home/eric/repos/tools/pgpool.py serve"),
+    "2033": ("sg", "/usr/bin/sg docker -c exec /usr/bin/python3 /home/eric/repos/harness/lanes/pgpool.py serve"),
     "1738": ("(sd-pam)", "(sd-pam)"),
     "1988": ("(sd-pam)", "(sd-pam)"),
     "2060": ("docker", "docker run --rm --init --name testpg-pool --label pgpool.tool=testpg-pool --env-file "
@@ -141,7 +141,9 @@ class Inuse(Repo):
         skipped = {name for _pid, name in scan["skipped"]}
         self.assertEqual({"(sd-pam)", "tailscaled", "gpg-agent", "docker"} - skipped, set())
         # but the name must agree with the command line: a docker client without the pgpool label is a workload
-        self.assertIn((2033, "sg"), scan["unreadable"])  # a wrapper has no such exemption
+        self.assertIn((2033, "sg"), scan["skipped"])  # the pgpool serve wrapper is a known helper too
+        other_sg = self.t2_dev(**{"788": unreadable("sg", "/usr/bin/sg docker -c exec /usr/bin/python3 run.py", 100.0)}).scan(created=50.0)
+        self.assertIn((788, "sg"), other_sg["unreadable"])  # any other wrapper has no such exemption
         other = self.t2_dev(**{"786": unreadable("docker", "docker run --rm busybox", 100.0)}).scan(created=50.0)
         self.assertIn((786, "docker"), other["unreadable"])
         spoof = self.t2_dev(**{"787": unreadable("tailscaled", "tailscaled serve", 100.0)}).scan(created=50.0)

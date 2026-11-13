@@ -1982,8 +1982,8 @@ UNREADABLE_ALWAYS_REFUSES = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish', 
 # (the user systemd manager and its sd-pam helper, the ssh and gpg agents, a tailscaled session helper, and the harness's own
 # pgpool test server started through `sg docker`). The name AND the command line must agree; both can be set by the process
 # itself, which is a stated limit (accident prevention, not an access control).
-UNREADABLE_KNOWN_HELPERS = (('(sd-pam)', ''), ('systemd', '--user'), ('ssh-agent', ''), ('gpg-agent', '--supervised'),
-                            ('tailscaled', ' be-child '), ('docker', '--label pgpool.tool='))
+UNREADABLE_KNOWN_HELPERS = (('(sd-pam)', ''), ('systemd', '--user'), ('ssh-agent', ''), ('gpg-agent', ''),
+                            ('tailscaled', ' be-child '), ('docker', '--label pgpool.tool='), ('sg', 'lanes/pgpool.py serve'))
 # Every other unreadable process (a wrapper such as sg, an agent CLI, pytest, a compiler, a node app that renamed itself) is
 # judged by time: it cannot have been launched from the worktree before the worktree existed, so one that started BEFORE the
 # worktree was created is skipped, and one that started after it, or whose start time or the creation time is unknown, refuses.
