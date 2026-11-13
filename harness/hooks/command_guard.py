@@ -9118,17 +9118,26 @@ INSTALL_FILES_FLAGS = {'--host': 1, '--from-ref': 1, '--file': 1, '--ticket': 1,
                        '--force-file': 1, '--agent': 1}
 INSTALL_FILES_FORM = ('the sanctioned form is `python3 -I ~/.claude/hooks/ah.py install-files --host HOST --from-ref SHA --file '
                       'NAME ... --ticket "GoodQA project#N"` (or `--resume RUN` / `--rollback RUN`), run by the main agent from '
-                      'the INSTALLED copy as a plain command: no environment assignment, wrapper or shell -c around it')
+                      'the INSTALLED copy as a plain command: first in the command line, with no environment assignment, '
+                      'wrapper or shell -c around it')
 
 
 INSTALL_FILES_FLAGS['--allow-older'] = 0
 INSTALL_FILES_VIEWERS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'cat', 'less', 'more', 'head', 'tail', 'git', 'ls', 'sed', 'awk', 'echo',
                          'printf', 'diff', 'wc', 'tee', 'man', 'find', 'vi', 'vim', 'nano', 'open', 'test', 'true', 'false', 'wal_note.py'}
-INSTALL_FILES_WRAPPERS = {'env', 'sudo', 'nohup', 'time', 'command', 'exec', 'stdbuf', 'nice', 'xargs'}
+# precommand words that run the rest of the segment (builtin, command, noglob, nocorrect and `-` are shell modifiers: the
+# word after them can still be a builtin such as export)
+INSTALL_FILES_WRAPPERS = {'env', 'sudo', 'nohup', 'time', 'command', 'exec', 'stdbuf', 'nice', 'xargs', 'builtin', 'noglob',
+                          'nocorrect', '-'}
+# shell grammar words that open a compound command around the rest of the segment
+INSTALL_FILES_KEYWORDS = {'{', '(', '!', 'if', 'then', 'else', 'elif', 'while', 'until', 'do', 'coproc'}
 INSTALL_FILES_SHELLS = {'bash', 'sh', 'zsh', 'dash', 'ksh'}
-# a segment that changes what a later segment of the same text runs or sees (HOME for `~`, PATH, a function named python3)
+# a segment that changes what a later segment of the same text runs or sees (HOME for `~`, PATH, the directory, shell options,
+# a function or alias named python3)
 INSTALL_FILES_ENV_CHANGERS = {'export', 'unset', 'declare', 'typeset', 'local', 'readonly', 'source', '.', 'eval', 'alias', 'hash',
-                              'function'}
+                              'function', 'cd', 'chdir', 'pushd', 'popd', 'set', 'setopt', 'unsetopt', 'shopt', 'emulate', 'enable',
+                              'disable', 'unalias', 'unfunction', 'functions', 'autoload', 'zmodload', 'read', 'getopts', 'mapfile',
+                              'readarray', 'vared', 'let', 'integer', 'float', 'trap', 'umask', 'rehash', 'fc', 'zparseopts'}
 INSTALL_FILES_ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\+?=.*')
 INSTALL_FILES_REDIRECT = re.compile(r'^(?:[0-9]*[<>]{1,2}&?[0-9-]*|[0-9]*[<>]{1,2}.+|&>.*|\|&)$')
 
@@ -9168,32 +9177,61 @@ def _install_files_segments(text):
         return out
 
 
+def _install_files_words(tokens):
+    """(words, prefixed): the command words of one segment once every assignment prefix, compound-command keyword and
+    wrapper (with its options) in front is removed, in any order and nesting: `HOME=/x builtin command export Y=1` is
+    `export Y=1` (goodqa#15913 r6 F1: classify only after this, or `builtin export` hides an export)."""
+    prefixed = False
+    while tokens:
+        first = tokens[0]
+        if first[:1] in '({!' and len(first) > 1 and first not in INSTALL_FILES_KEYWORDS:
+            tokens, prefixed = [first.lstrip('({!')] + tokens[1:], True  # `(export` from the per-line fallback split
+        elif INSTALL_FILES_ASSIGNMENT.fullmatch(first) or first in INSTALL_FILES_KEYWORDS:
+            tokens, prefixed = tokens[1:], True
+        elif os.path.basename(first) in INSTALL_FILES_WRAPPERS:
+            tokens, prefixed = tokens[1:], True
+            while tokens and (tokens[0].startswith('-') or INSTALL_FILES_ASSIGNMENT.fullmatch(tokens[0])):
+                tokens = tokens[1:]
+        else:
+            break
+    return tokens, prefixed
+
+
+def _install_files_changes_env(tokens):
+    """True for a segment that can change what a later segment runs or sees: an environment-changing builtin behind any
+    prefix or wrapper, a bare assignment, a function definition, or `printf -v` / `print -v`."""
+    if not tokens:
+        return False
+    words, _prefixed = _install_files_words(tokens)
+    if not words:
+        return any(INSTALL_FILES_ASSIGNMENT.fullmatch(t) for t in tokens)  # `HOME=/x` alone sets it for the rest of the text
+    first = os.path.basename(words[0])
+    return (first in INSTALL_FILES_ENV_CHANGERS or words[0].endswith('()') or words[1:3] == ['(', ')']
+            or (first in ('printf', 'print') and any(w.startswith('-') and 'v' in w for w in words[1:])))
+
+
 def _install_files_segment(text, is_main, home, literal, depth=0):
     """None, or the refusal for one command string (recursing into `bash -c` bodies, at most three levels). Any run of
     install-files found inside a shell -c body (depth > 0), behind an environment assignment or a wrapper, or in a text with a
     segment that changes the environment of later segments is refused, for main too (goodqa#15913: HOME= moves `~` and
-    the audit file, PYTHONPATH= or a function named python3 replaces the code that holds the merged-code proof)."""
+    the audit file, PYTHONPATH= or a function named python3 replaces the code that holds the merged-code proof). Segments
+    are classified only after their prefixes and wrappers are removed, the install command must be the first segment of the
+    text, and none of its words but the script may hold a `$` expansion or a backquote (r6 F1)."""
     flat = re.sub(r'[\'"\\]', '', text)
     if re.search(r'(?:^|\n)\s*(?:import|from)\s+ah_install\b|(?<![A-Za-z0-9_])ah_\W{0,6}install', flat) and not re.match(
             r'\s*(?:git|cat|grep|egrep|rg|less|head|tail|ls|sed|awk|diff|wc|echo|printf|find|vi|vim|nano|man)\b', text):
         if re.search(r'python|importlib|(?:^|\n)\s*(?:import|from)\s', flat):
             return 'ah install-files: importing ah_install from python is refused; ' + INSTALL_FILES_FORM
     segments = _install_files_segments(text)
-    changes_env = any(tokens and (os.path.basename(tokens[0]) in INSTALL_FILES_ENV_CHANGERS or tokens[0].endswith('()')
-                                  or tokens[1:3] == ['(', ')'] or all(INSTALL_FILES_ASSIGNMENT.fullmatch(t) for t in tokens))
-                      for tokens, _segment in segments)  # `name() {` tokenizes as name ( ) {
+    changes_env = any(_install_files_changes_env(tokens) for tokens, _segment in segments)  # `name() {` tokenizes as name ( ) {
+    seen = False  # a non-empty segment came before this one
     for tokens, segment in segments:
+        earlier, seen = seen, seen or tokens is None or bool(tokens)
         if tokens is None:
             if 'install' in segment and ('install-files' in segment or 'ah_install' in segment):
                 return 'ah install-files: the command could not be parsed; ' + INSTALL_FILES_FORM
             continue
-        prefixed = False
-        while tokens and INSTALL_FILES_ASSIGNMENT.fullmatch(tokens[0]):
-            tokens, prefixed = tokens[1:], True
-        while tokens and os.path.basename(tokens[0]) in INSTALL_FILES_WRAPPERS:
-            tokens, prefixed = tokens[1:], True
-            while tokens and (tokens[0].startswith('-') or INSTALL_FILES_ASSIGNMENT.fullmatch(tokens[0])):
-                tokens = tokens[1:]
+        tokens, prefixed = _install_files_words(tokens)
         if not tokens:
             continue
         first = os.path.basename(tokens[0])
@@ -9237,8 +9275,17 @@ def _install_files_segment(text, is_main, home, literal, depth=0):
             return 'ah install-files: only the installed ah may run it; ' + INSTALL_FILES_FORM
         if depth or prefixed or changes_env:
             return ('ah install-files: run it as a plain command: no environment assignment, no wrapper (env, sudo, nohup, time, '
-                    'xargs ...), no shell -c around it and no segment that changes the environment (export, unset, source, a '
-                    'function ...) in the same command; ' + INSTALL_FILES_FORM)
+                    'xargs, builtin, command ...), no shell -c around it and no segment that changes the environment (export, '
+                    'unset, source, cd, set, a function ...) in the same command; ' + INSTALL_FILES_FORM)
+        if earlier:
+            # fail closed (goodqa#15913 r6 F1): no earlier segment is treated as inert, since a builtin behind any spelling,
+            # an alias or an assigning expansion there can change HOME, PATH or what `python3` means for this one
+            return ('ah install-files: run it as the first command of the text: nothing may come before it in the same command '
+                    'line (an earlier command can change HOME, PATH or the functions the shell uses to run it); ' + INSTALL_FILES_FORM)
+        if any('$' in t or '`' in t for t in tokens if t != rest[0]):
+            # zsh `${HOME::=/x}` or `$((HOME=1))` assigns while the words are expanded, and python3 inherits the new HOME
+            return ('ah install-files: no $ expansion or backquote in its words (only the script may be spelled '
+                    '$HOME/.claude/hooks/ah.py); ' + INSTALL_FILES_FORM)
         args = [t for t in tokens[index + 1:] if not INSTALL_FILES_REDIRECT.match(t)]  # redirections (`> out.json`, `2>&1`) are not flags
         i = 0
         while i < len(args):

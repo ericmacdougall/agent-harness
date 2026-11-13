@@ -155,6 +155,8 @@ class Forms(unittest.TestCase):
             "dot first": ". /tmp/x/env.sh && " + local,
             "function named python3": "python3() { /tmp/evil/python3 \"$@\"; }; " + local,
             "hash -p": "hash -p /tmp/evil/python3 python3; " + local,
+            "cd first": "cd ~ && " + local,  # r6 F1: nothing may come before it, cd included
+            "assignment segment after it": local + "; HOME=/tmp/x",
         }
         for label, text in bad.items():
             with self.subTest(label):
@@ -163,12 +165,61 @@ class Forms(unittest.TestCase):
                 self.assertEqual(code, 2, message)
                 self.assertIn("install-files", message)
         for text in (local, local.replace("python3 -I", "python3 -B -I"), local.replace("python3 -I", "python3 -I -B"),
-                     "cd ~ && " + local, local + " > /tmp/out.json 2>&1"):  # the plain form stays allowed for main
+                     local + " > /tmp/out.json 2>&1"):  # the plain form stays allowed for main
             with self.subTest(text[:50]):
                 self.assertIsNone(cg.install_files_refusal(text, True), text)
                 self.assertEqual(hook(text, True)[0], 0)
         for viewer in ("FOO=1 git commit -m 'install-files: plain form only'", "env grep -rn install-files harness/",
                        "export X=1; grep install-files notes/x.md", "time git log -S install-files"):  # viewers stay allowed
+            with self.subTest(viewer):
+                self.assertIsNone(cg.install_files_refusal(viewer, False), viewer)
+
+    def test_wrapped_or_prefixed_environment_changers_and_anything_before_it_are_refused_for_main_and_sub_agents(self):  # NEG-27
+        local = GOOD.replace("--host t2-dev", "--host local")
+        reasons = ("run it as a plain command", "run it as the first command", "no $ expansion or backquote")
+        bad = {
+            "builtin export": "builtin export HOME=/tmp/x; " + local,
+            "command export": "command export HOME=/tmp/x; " + local,
+            "noglob export": "noglob export HOME=/tmp/x; " + local,
+            "nested builtin command": "builtin command export HOME=/tmp/x; " + local,
+            "nested command builtin": "command builtin export HOME=/tmp/x && " + local,
+            "builtin source": "builtin source /tmp/x/env.sh && " + local,
+            "command dot": "command . /tmp/x/env.sh && " + local,
+            "assignment then export": "FOO=1 export HOME=/tmp/x; " + local,
+            "assignment then builtin source": "FOO=1 builtin source /tmp/x/env.sh; " + local,
+            "builtin typeset -x": "builtin typeset -x HOME=/tmp/x; " + local,
+            "command declare -x": "command declare -x HOME=/tmp/x; " + local,
+            "builtin cd": "builtin cd /tmp/x && " + local,
+            "pushd": "pushd /tmp/x && " + local,
+            "setopt": "setopt no_rcs; " + local,
+            "builtin eval": "builtin eval 'export HOME=/tmp/x'; " + local,
+            "builtin alias": "builtin alias python3=/tmp/evil/python3; " + local,
+            "grouped builtin export": "{ builtin export HOME=/tmp/x; }; " + local,
+            "if then builtin export": "if true; then builtin export HOME=/tmp/x; fi; " + local,
+            "an assigning expansion in an inert command first": "echo ${HOME::=/tmp/x}; " + local,
+            "true first": "true && " + local,
+            "an assigning expansion in a flag": local.replace('"GoodQA goodqa#15742"', '"${HOME::=/tmp/x}GoodQA a#1"'),
+            "a backquote in a flag": local.replace('"GoodQA goodqa#15742"', '"`touch /tmp/x`GoodQA a#1"'),
+            "builtin export after it": local + "; builtin export HOME=/tmp/x",
+            "assignment and command export after it": local + "; FOO=1 command export X=1",
+            "grouped export after it": local + "; { export X=1; }",
+            "printf -v after it": local + "; printf -v HOME %s /tmp/x",
+            "subshell export on a later line": local + "\n(export HOME=/tmp/x)",
+        }
+        for label, text in bad.items():
+            for main in (True, False):
+                with self.subTest(label, main=main):
+                    reason = cg.install_files_refusal(text, main)
+                    self.assertIsNotNone(reason, text)
+                    self.assertTrue(any(r in reason for r in reasons), reason)  # refused for this, not only for being a sub-agent
+                    code, message = hook(text, main)
+                    self.assertEqual(code, 2, message)
+                    self.assertTrue(any(r in message for r in reasons), message)
+        for text in (local, GOOD.replace("~", "$HOME"), local + " 2>&1 | tee /tmp/out.txt"):  # still allowed for main
+            with self.subTest(text[-40:]):
+                self.assertIsNone(cg.install_files_refusal(text, True), text)
+                self.assertEqual(hook(text, True)[0], 0)
+        for viewer in ("builtin cd /tmp && grep -rn install-files .", "command export X=1; rg install-files"):  # viewers stay allowed
             with self.subTest(viewer):
                 self.assertIsNone(cg.install_files_refusal(viewer, False), viewer)
 

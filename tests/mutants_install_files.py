@@ -13,6 +13,7 @@ GUARD = "command_guard.py"
 AH = "ah.py"
 T ="tests.test_ah_install."
 G = "tests.test_command_guard_install_files."
+W7 = "test_wrapped_or_prefixed_environment_changers_and_anything_before_it_are_refused_for_main_and_sub_agents"
 
 # name -> (file, old text or list, new text or list, tests that must fail)
 MUTANTS = {
@@ -203,6 +204,25 @@ MUTANTS = {
                                                           [T + "LocalTarget.test_a_codex_copy_swapped_for_a_fifo_or_a_link_after_its_lookup_is_never_waited_on_or_followed"]),
     "an unchecked drift is not reported": (INST, '    if unchecked:\n        extra["codex_unchecked"] = unchecked[:20]', '    if False:\n        extra["codex_unchecked"] = unchecked[:20]',
                                            [T + "LocalTarget.test_an_unreadable_codex_copy_never_stops_an_install_from_being_recorded"]),
+    # goodqa#15913 round 7 (r6 F1): segments classified after their wrappers, nothing before the command, no $ in its words
+    "guard rule classifies a segment before its wrappers": (GUARD, "    words, _prefixed = _install_files_words(tokens)\n    if not words:",
+                                                            "    words, _prefixed = tokens, False\n    if not words:", [G + "Forms." + W7]),
+    "guard rule does not unwrap builtin": (GUARD, "'xargs', 'builtin', 'noglob',", "'xargs', 'noglob',", [G + "Forms." + W7]),
+    "guard rule does not unwrap a compound keyword": (GUARD, "elif INSTALL_FILES_ASSIGNMENT.fullmatch(first) or first in INSTALL_FILES_KEYWORDS:",
+                                                      "elif INSTALL_FILES_ASSIGNMENT.fullmatch(first):", [G + "Forms." + W7]),
+    "guard rule does not unwrap a glued paren": (GUARD, "        if first[:1] in '({!' and len(first) > 1 and first not in INSTALL_FILES_KEYWORDS:",
+                                                 "        if False:", [G + "Forms." + W7]),
+    "guard rule misses printf -v": (GUARD, "            or (first in ('printf', 'print') and any(w.startswith('-') and 'v' in w for w in words[1:])))",
+                                    "            or False)", [G + "Forms." + W7]),
+    "guard rule misses a lone assignment": (GUARD, "        return any(INSTALL_FILES_ASSIGNMENT.fullmatch(t) for t in tokens)  #",
+                                            "        return False  #",
+                                            [G + "Forms.test_environment_wrappers_shells_and_a_missing_dash_i_are_refused_for_main_too"]),
+    "guard rule trusts an earlier segment": (GUARD, "        if earlier:\n", "        if False:\n", [G + "Forms." + W7]),
+    "guard rule allows a $ expansion in a flag": (GUARD, "        if any('$' in t or '`' in t for t in tokens if t != rest[0]):", "        if False:",
+                                                  [G + "Forms." + W7]),
+    "guard rule refuses the $HOME script spelling": (GUARD, "for t in tokens if t != rest[0]):", "for t in tokens):",
+                                                     [G + "Forms.test_the_installed_literal_form_passes_for_main_and_every_other_form_is_refused",
+                                                      G + "Forms." + W7]),
     # goodqa#15913 round 4 (L2): the session leader check
     "an inherited marker is trusted": (INST, 'return os.environ.get(IN_SESSION_ENV) == "1" and os.getsid(0) == os.getpid()', 'return os.environ.get(IN_SESSION_ENV) == "1"',
                                        [T + "Wiring.test_local_real_runs_resumes_and_rollbacks_run_whole_in_their_own_session_and_nothing_else"]),
