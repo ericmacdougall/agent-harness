@@ -1,5 +1,6 @@
 // The page's single state store. Panels read state and subscribe; transport (live.js) writes through these setters.
 import * as adapt from './adapt.js';
+import * as ops from './ops-views.js';
 
 export const KINDS = Object.freeze({
   wal: { label: 'Work log', icon: '≋', color: '#eaff9e' },
@@ -21,6 +22,7 @@ let state = {
   host: '', chat: null, pending: [], sessions: [], mainSession: '', asks: [], asksResolved: [], asksSession: '',
   asksStale: [], asksFlagged: [], asksCleared: [], asksSweptAt: '', asksArchive: [], asksArchiveTotal: 0,
   ledger: adapt.ledger(null), lastData: 0,
+  alerts: ops.adaptAlerts(null), capacity: ops.adaptCapacity(null),  // goodqa#15934: the ops-watch ring and the owner cap
   decisions: {},  // ask id -> this page's own Approve/Deny click while it is in flight or after it was refused
   connection: 'connecting', now: Date.now(), filters: Object.keys(KINDS),
   selection: null, highlight: null, tab: 'overview', responder: 'claude', session: '',
@@ -35,7 +37,7 @@ let transport;
 export const getState = () => state;
 export function subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); }
 // A server message (a snapshot or an event) is what "last update" counts; ticks and local clicks are not.
-const DATA_REASONS = new Set(['initiatives', 'owners', 'health', 'seed', 'event', 'chat', 'asks', 'ledger', 'availability']);
+const DATA_REASONS = new Set(['initiatives', 'owners', 'health', 'seed', 'event', 'chat', 'asks', 'ledger', 'availability', 'alerts', 'capacity']);
 export function update(patch, reason = 'update') {
   state = DATA_REASONS.has(reason) ? { ...state, ...patch, lastData: Date.now() } : { ...state, ...patch };
   listeners.forEach(fn => { try { fn(state, reason); } catch (error) { reportError(error, reason); } });
@@ -107,6 +109,8 @@ export function ingestEvent(raw) {
   update({ events, owners, lastEvent: event, buffered: counted ? state.buffered + 1 : state.buffered }, 'event');
 }
 export function setLedger(snapshot) { update({ ledger: adapt.ledger(snapshot) }, 'ledger'); }
+export function setAlerts(snapshot) { update({ alerts: ops.adaptAlerts(snapshot) }, 'alerts'); }
+export function setCapacity(snapshot) { update({ capacity: ops.adaptCapacity(snapshot) }, 'capacity'); }
 export function setConnection(connection) { if (state.connection !== connection) update({ connection }, 'connection'); }
 export function setChat(chat) {
   if (!chat || typeof chat !== 'object') return;

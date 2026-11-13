@@ -326,11 +326,23 @@ def status_payload(now: float) -> dict:
                        "attention": ["a5drop0demo"], "live": ["a1live0demo"]}}
 
 
+def alerts_payload(now: float) -> list:
+    """Fixture alerts in the ring's row shape: one per severity, one that blocks main's stop. No file is read."""
+    def row(seq, severity, key, message, age, **detail):
+        return {"host": "demo", "source": "ops-watch", "event": "raise", "severity": severity, "key": key,
+                "message": message, "detail": detail, "seq": seq, "at": _iso(now - age)}
+    return [row(4, "critical", "liveness:demo/agent-demo-owner-3", "Demo: an owner went silent with work open (demo#103)",
+                5400, agent="demo-owner-3", stop_block=True),
+            row(3, "high", "ask:wdemoask0004:due", "Demo: an ask has waited four days for an answer (demo#109)", 3600),
+            row(2, "high", "deploy:demo-app:merged-not-deployed", "Demo: a merged change is not deployed yet (demo#101)", 1800),
+            row(1, "warning", "disk:volume:demo:/var", "Demo: a volume is 88% full", 600)]
+
+
 def owners_payload(now: float) -> dict:
     rows = []
     for agent, state, task, ticket, idle, disposition, _note in OWNERS:
         row = {"agent_id": agent, "state": state, "task": task, "ticket": ticket, "idle_s": idle,
-               "type": "task-owner", "last_activity": _iso(now - idle)}
+               "type": "task-owner", "owner": True, "last_activity": _iso(now - idle)}
         if disposition:
             row["disposition"] = {**disposition, "until": now + 6 * 3600}
         rows.append(row)
