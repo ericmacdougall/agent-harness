@@ -537,8 +537,8 @@ class Word:
         if self.overflow is None:
             return self.alts[:32]
         raw = self.overflow
-        more = brace_expand(raw, limit=4096) if raw.count('{') <= 64 and len(raw) <= 65536 else []
-        if more and len(more) <= 4096:
+        more, complete = brace_expand(raw, limit=4096) if raw.count('{') <= 64 and len(raw) <= 65536 else ([], False)
+        if more and complete:
             return [_unq(a) for a in more]
         return None
 
@@ -660,10 +660,18 @@ def scan_backtick(s, i):
     return n + 1
 
 
+BRACE_WORK = 1 << 22  # characters (4 MiB) one brace expansion may build before it reports an overflow
+
+
 def brace_expand(text, limit=32):
-    """Bash brace expansion on a string whose quoted braces were replaced by sentinels."""
-    out = [text]
-    for _ in range(6):
+    """Bash brace expansion on a string whose quoted braces were replaced by sentinels, run to a fixed point. Each round
+    expands the leftmost group of every item, and every expansion removes that group's `{`, so `text.count('{')` rounds
+    always finish (receipt r11 F1: a fixed six rounds left a seventh group as literal text and still looked complete).
+    Returns (items, complete). complete is False when there are more than `limit` alternatives, when building them
+    passes BRACE_WORK characters, or when an expandable group is left; items then holds at most `limit` partial
+    expansions and the caller treats the word as overflowed."""
+    out, work = [text], 0
+    for _ in range(text.count('{') + 1):
         changed, nxt = False, []
         for item in out:
             m = _find_brace(item)
@@ -674,12 +682,13 @@ def brace_expand(text, limit=32):
             start, end, parts = m
             for part in parts:
                 nxt.append(item[:start] + part + item[end:])
-                if len(nxt) > limit:
-                    return nxt[:limit + 1]  # one extra item tells the caller the expansion overflowed
+                work += len(nxt[-1])
+                if len(nxt) > limit or work > BRACE_WORK:
+                    return nxt[:limit], False
         out = nxt
         if not changed:
-            break
-    return out[:limit]
+            return out[:limit], True
+    return out[:limit], False  # a group is still expandable: never report a half-expanded word as complete
 
 
 # a brace sequence expression, `{1..40}`, `{a..z}`, `{01..10..2}` (bash and zsh): receipt r7, `goodq{a..a}` is goodqa
@@ -832,11 +841,12 @@ class Lexer:
         alts = [raw]
         if '{' in raw and (',' in raw or '..' in raw):
             expandable = raw.count('{') <= 24 and len(raw) <= 2048
+            complete = False
             if expandable:
-                alts = brace_expand(raw)
-            if len(alts) > 32 or not expandable:
-                # too many alternatives (or too big to expand): target checks re-expand it with a larger cap
-                # and treat anything past that as unknown (see Analyzer.target_class)
+                alts, complete = brace_expand(raw)
+            if not complete:
+                # too many alternatives, too big to expand, or not fully expanded: target checks re-expand it with a
+                # larger cap and treat anything past that as unknown (see Analyzer.target_class)
                 w.overflow = raw
                 alts = alts[:32]
         w.alts = [_unq(a) for a in alts]

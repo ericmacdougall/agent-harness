@@ -200,6 +200,25 @@ MUTANTS = {
     "ack -x is not a name list": ("return name if any(t.startswith('--files') for t in texts) or any('x' in t for t in short) else None", "return None"),
     "curl -K is not a name list": ("return name if any('K' in t for t in short) or any(t.startswith('--conf') for t in texts) else None", "return None"),
     "sftp batch input is not a name list": ("        if name == 'sftp':\n            return name", "        if False:\n            return name"),
+    # receipt r11 F1: brace expansion runs to a fixed point and reports an overflow; the first mutant is c99a7c86's behaviour
+    "brace expansion stops after six rounds, unreported": [
+        ("    for _ in range(text.count('{') + 1):", "    for _ in range(6):"),
+        ("    return out[:limit], False  # a group is still expandable", "    return out[:limit], True  # a group is still expandable")],
+    "brace expansion capped at six rounds": ("    for _ in range(text.count('{') + 1):", "    for _ in range(6):"),
+    "brace overflow reported as complete": ("                    return nxt[:limit], False", "                    return nxt[:limit], True"),
+    "brace work budget ignored": ("                if len(nxt) > limit or work > BRACE_WORK:", "                if len(nxt) > limit:"),
+    "lexer ignores an unfinished expansion": ("            if not complete:\n                # too many alternatives",
+                                              "            if not expandable:\n                # too many alternatives"),
+    "all_alts ignores an unfinished expansion": ("        if more and complete:", "        if more:"),
+    # receipt r11 F2 and F3: the rule each failure path refuses under, and the launcher's reason
+    "decide stop refusal names another rule": ("                else SECRET_DUMP\n            return 'block', format_block(Finding(category, "
+                                               "'unanalysable'",
+                                               "                else PARSE\n            return 'block', format_block(Finding(category, "
+                                               "'unanalysable'"),
+    "hook alarm refusal names another rule": ("Finding(SECRET_DUMP if verdict == 'block' else PARSE, 'unanalysable',",
+                                              "Finding(PARSE, 'unanalysable',"),
+    "launcher reason omits credential locations": ("command_guard_hook.py", "'harness location, a credential location, a secret source",
+                                                   "'harness location, a secret source"),
 }
 
 

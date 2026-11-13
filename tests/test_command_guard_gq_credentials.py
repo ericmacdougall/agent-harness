@@ -268,6 +268,45 @@ R7_BRACES = ["tar -cf - ~/.config/" + "{a,b,c,d,e,f,g,}" * 4 + "{x,goodqa}",
              "tar -cf - ~/.config/{a..z}{a..z}{a..z}{x,goodqa}", "cat ~/.agent-harness/gq-browser/0123456789abcde{a..f}/key"]
 R7_BRACE_NEIGHBOURS = ["cat file{1..3}.txt", "echo {1..10}", "cp notes{,.bak}", "ls ~/proj/{a..c}", "mkdir -p build/{01..05}",
                        "cat part{1..5000}.txt", "wc -l src/{" + ",".join("m%d" % i for i in range(300)) + "}.py"]
+
+
+def seq(text):
+    """Every letter and digit of `text` as a one-member sequence expression: bash and zsh expand `{g..g}` to `g`."""
+    return "".join("{%s..%s}" % (ch, ch) if ch.isalnum() else ch for ch in text)
+
+
+PAD = "{,}"  # two empty alternatives: `a{,}b` is `ab ab`
+# receipt r11 F1: a word with seven or more brace groups is expanded to the end (a fixed six rounds left the seventh group
+# as literal text and the word looked complete), and past the expansion caps it is judged as one glob. Seven groups of
+# one-member sequences or {,} padding; 25 groups (past the lexer's 24, so all_alts expands them); 2**13 and 2**17
+# alternatives (past all_alts' 4096: the overflow glob); and 65 groups (past all_alts' 64 braces).
+R11_BRACE_GROUPS = [
+    "cat ~/.config/" + seq("goodqa") + "/user-toke{n..n}",
+    "cat ~/.agent-harness/gq-browser/" + seq("012345") + "6789abcdef/ke{y..y}",
+    "cat ~/." + seq("ssh") + "/" + seq("id") + "_" + seq("rsa"),
+    "tar -cf - ~/.config/" + seq("goodqa") + PAD,
+    "grep -r . ~/.agent-harness/" + seq("gq") + "-" + seq("browser"),
+    "cat ~/" + PAD * 6 + ".config/goodqa/user-toke{n,}",
+    "cat ~/" + PAD * 6 + ".agent-harness/gq-browser/0123456789abcdef/ke{y,}",
+    "cat ~/" + PAD * 6 + ".ssh/id_rs{a,}",
+    "tar -cf - ~/" + PAD * 6 + ".config/goodq{a,}",
+    "cat ~/" + PAD * 4 + "." + seq("config/goodqa/user-token"),
+    "cat ~/." + seq("agent-harness/gq-browser/0123456789abcdef/key"),
+    "cat ~/" + PAD * 17 + "." + seq("ssh/id_rsa"),
+    "tar -cf - ~/" + PAD * 13 + "." + seq("config/goodqa"),
+    "grep -r . ~/" + PAD * 4 + "." + seq("agent-harness/gq-browser"),
+    "cat ~/" + PAD * 44 + "." + seq("config/goodqa/user-token"),
+]
+R11_BRACE_NEIGHBOURS = [
+    "echo " + seq("abcdefg"),
+    "mkdir -p build/{a,b}/{c,d}/{e,f}/{g,h}/{i,j}/{k,l}/{m,n}",
+    "cat src/" + seq("module") + PAD + ".py",
+    "ls ~/proj/" + seq("abcdefghij"),
+    "echo " + seq("abcdefghijklmnopqrstuvwxyz"),
+    "cat ~/.config/" + seq("goodqa") + "/config.jso{n..n}",
+    "rm -rf /tmp/build/" + seq("abcdefg"),
+    "cat ~/.agent-harness/gq-browser/" + seq("012345") + "6789abcdef/lease.jso{n..n}",
+]
 # receipt r7 spec pins: metadata of either file is not a read; a working directory below ~/.agent-harness is not a parent
 R7_METADATA_AND_DESCENDANTS = ["stat " + KEY, "chmod 600 " + KEY, "test -e " + KEY, "ls -l " + KEY, "stat " + TOKEN,
                                "chmod 600 " + TOKEN, "test -e " + TOKEN, "ls -l " + TOKEN, "[ -f " + TOKEN + " ] && echo yes",
@@ -290,6 +329,18 @@ FAIL_CLOSED = ["tar -cf - ~/.config/goodqa", "cat " + TOKEN, "cat " + KEY, "grep
                "tar -cf - ~/.config/good*", "zip -r - ~/.agent-harness/gq-browser"]
 FAIL_OPEN_NEIGHBOURS = ["echo hello", "ls -la", "git status"]
 RULE = "[secret_dump/"
+
+
+def stop_rule(command, name="unanalysable"):
+    """receipt r11 F2: the rule a decide() failure path refuses under (AC-9). Text naming the protected ~/.agent-harness
+    root takes log_delete, the rest secret_dump; hook_main's paths always take secret_dump, and the launcher, which cannot
+    load the analyser, takes guard_failure (asserted in their tests)."""
+    return ("log_delete/" if ".agent-harness" in command else "secret_dump/") + name
+
+
+def internal_error_rule(command):
+    """An internal error first runs the raw-text scan, which names a credential file itself; otherwise it is the stop rule."""
+    return "secret_dump/credential-file-text" if command in ("cat " + TOKEN, "cat " + KEY) else stop_rule(command, "guard-error")
 
 
 class GoodqaCredentialPaths(unittest.TestCase):
@@ -487,6 +538,43 @@ class GoodqaCredentialPaths(unittest.TestCase):
     def test_r7_brace_neighbours_stay_allowed(self):
         self.allowed_each(R7_BRACE_NEIGHBOURS)
 
+    def test_r11_f1_seven_or_more_brace_groups_are_judged(self):
+        self.blocked_each(R11_BRACE_GROUPS)
+
+    def test_r11_f1_an_expansion_stopped_by_its_work_budget_is_judged_as_a_glob(self):
+        # 16 alternatives, half of them 64 kB long: all_alts passes BRACE_WORK long before the 40 sequence groups that
+        # spell the lease key are expanded, with far fewer than cred_alts' 256 alternatives, so only the "not complete"
+        # report makes cred_alts judge the overflow glob
+        self.blocked_each(["cat ~/" + PAD * 3 + "{," + "y" * 64000 + "}." + seq("agent-harness/gq-browser/0123456789abcdef/key")])
+
+    def test_r11_f1_words_with_many_brace_groups_that_name_no_credential_stay_allowed(self):
+        self.allowed_each(R11_BRACE_NEIGHBOURS)
+
+    def test_r11_f1_brace_expansion_runs_to_a_fixed_point(self):
+        cases = [
+            ((seq("abcdefg") + "x",), (["abcdefgx"], True)),
+            ((seq("a" * 24),), (["a" * 24], True)),
+            ((seq("b" * 64), 4096), (["b" * 64], True)),
+            (("{a,{b,{c,{d,{e,{f,{g,h}}}}}}}",), (list("abcdefgh"), True)),
+            ((PAD * 7, 4096), ([""] * 128, True)),
+            (("x" * 1000 + "{a,b}" * 10, 4096), (None, True)),  # about 1 MB of expansion: inside the work budget
+        ]
+        for args, (items, complete) in cases:
+            with self.subTest(args[0][:40]):
+                got, done = cg.brace_expand(*args)
+                self.assertEqual(done, complete)
+                if items is not None:
+                    self.assertEqual(got, items)
+                else:
+                    self.assertEqual(len(got), 1024)
+
+    def test_r11_f1_an_expansion_past_its_caps_reports_an_overflow(self):
+        got, done = cg.brace_expand(PAD * 7)  # 128 alternatives past the default 32
+        self.assertEqual((len(got), done), (32, False))
+        got, done = cg.brace_expand("x" * 40000 + "{a,b}" * 10, 4096)  # about 41 MB, past BRACE_WORK
+        self.assertFalse(done)
+        self.assertLessEqual(len(got), 4096)
+
     def test_r7_metadata_and_descendant_working_directories_stay_allowed(self):
         self.allowed_each(R7_METADATA_AND_DESCENDANTS)
 
@@ -506,17 +594,20 @@ class GoodqaFailClosed(unittest.TestCase):
     """receipt r7 (Opus spec finding 4): when the analysis cannot finish, a command naming a GoodQA credential is refused,
     never allowed and never only warned about; a harmless command is not."""
 
-    def verdicts(self, commands, compiled=None):
+    def results(self, commands, compiled=None):
         compiled = compiled or cg.Compiled(cg.load_policy())
-        return {c: cg.decide(c, compiled)[0] for c in commands}
+        return {c: cg.decide(c, compiled)[:2] for c in commands}
 
-    def assert_refused(self, commands, compiled=None):
-        for command, verdict in self.verdicts(commands, compiled).items():
+    def assert_refused(self, commands, compiled=None, rule=None):
+        """Refused, and (receipt r11 F2) under the rule `rule(command)` names, not only with the verdict."""
+        for command, (verdict, message) in self.results(commands, compiled).items():
             with self.subTest(command):
                 self.assertEqual(verdict, "block", command)
+                if rule is not None:
+                    self.assertIn("[%s]" % rule(command), message, command)
 
     def assert_not_refused(self, commands, compiled=None):
-        for command, verdict in self.verdicts(commands, compiled).items():
+        for command, (verdict, _message) in self.results(commands, compiled).items():
             with self.subTest(command):
                 self.assertNotEqual(verdict, "block", command)
 
@@ -527,7 +618,7 @@ class GoodqaFailClosed(unittest.TestCase):
         def boom(*_args, **_kwargs):
             raise ValueError("injected")
         with mock.patch.object(cg.Analyzer, "run", boom), mock.patch("sys.stderr", new=io.StringIO()):
-            self.assert_refused(FAIL_CLOSED)
+            self.assert_refused(FAIL_CLOSED, rule=internal_error_rule)
             self.assert_not_refused(FAIL_OPEN_NEIGHBOURS)
 
     def test_a_recursion_error_refuses(self):
@@ -536,21 +627,21 @@ class GoodqaFailClosed(unittest.TestCase):
         def deep(*_args, **_kwargs):
             raise RecursionError("injected")
         with mock.patch.object(cg.Analyzer, "run", deep):
-            self.assert_refused(FAIL_CLOSED)
+            self.assert_refused(FAIL_CLOSED, rule=stop_rule)
 
     def test_the_node_budget_refuses(self):
         compiled = cg.Compiled(cg.load_policy())
         compiled.limits = dict(compiled.limits, max_nodes=10)
-        self.assert_refused(FAIL_CLOSED, compiled)
+        self.assert_refused(FAIL_CLOSED, compiled, rule=stop_rule)
         self.assertEqual(cg.decide("echo hello", compiled)[0], "warn")  # the same stop on a harmless command only warns
 
     def test_the_time_budget_refuses(self):
         compiled = cg.Compiled(cg.load_policy())
         compiled.limits = dict(compiled.limits, max_seconds=0.0)
-        self.assert_refused([c + " x" * 400 for c in FAIL_CLOSED], compiled)
+        self.assert_refused([c + " x" * 400 for c in FAIL_CLOSED], compiled, rule=stop_rule)
 
     def test_an_oversized_command_refuses(self):
-        self.assert_refused([c + " " + "x" * 270000 for c in FAIL_CLOSED])
+        self.assert_refused([c + " " + "x" * 270000 for c in FAIL_CLOSED], rule=stop_rule)
 
     def test_nesting_past_the_depth_limit_refuses(self):
         commands = []
@@ -559,11 +650,13 @@ class GoodqaFailClosed(unittest.TestCase):
             for _ in range(10):
                 nested = "echo $(%s)" % nested
             commands.append(nested)
-        self.assert_refused(commands)
+        self.assert_refused(commands, rule=stop_rule)
 
     def test_an_unterminated_quote_refuses(self):
+        # the analysis still finishes the words it read, so the credential rule itself refuses
         self.assert_refused(["tar -cf - \"$HOME/.config/goodqa", "tar -cf - ~/.config/goodqa '",
-                             "cat \"$HOME/.agent-harness/gq-browser/0123456789abcdef/key", "grep -r . \"$HOME/.config/goodqa"])
+                             "cat \"$HOME/.agent-harness/gq-browser/0123456789abcdef/key", "grep -r . \"$HOME/.config/goodqa"],
+                            rule=lambda _command: "secret_dump/credential-file")
 
     def test_the_hook_alarm_refuses(self):
         import io
@@ -574,9 +667,11 @@ class GoodqaFailClosed(unittest.TestCase):
             raise TimeoutError("injected")
         for command in FAIL_CLOSED:
             payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}).encode()
+            err, out = io.StringIO(), io.StringIO()
             with self.subTest(command), mock.patch.object(cg, "decide", alarm), \
-                    mock.patch("sys.stderr", new=io.StringIO()), mock.patch("sys.stdout", new=io.StringIO()):
+                    mock.patch("sys.stderr", new=err), mock.patch("sys.stdout", new=out):
                 self.assertEqual(cg.hook_main(stdin_bytes=payload, marker=False), 2, command)
+                self.assertIn("[secret_dump/unanalysable]", err.getvalue() + out.getvalue(), command)  # receipt r11 F2
 
     def test_the_launcher_refuses_when_the_analyser_crashes(self):
         import json
@@ -593,6 +688,9 @@ class GoodqaFailClosed(unittest.TestCase):
                                       env={"PATH": "/usr/bin:/bin", "HOME": tmp}, check=False)
                 with self.subTest(command):
                     self.assertEqual(done.returncode, 0 if command in FAIL_OPEN_NEIGHBOURS else 2, command)
+                    if command not in FAIL_OPEN_NEIGHBOURS:  # receipt r11 F2 and F3: the rule, and the reason names credentials
+                        self.assertIn(b"[guard_failure]", done.stderr, command)
+                        self.assertIn(b"a credential location", done.stderr, command)
 
 
 if __name__ == "__main__":

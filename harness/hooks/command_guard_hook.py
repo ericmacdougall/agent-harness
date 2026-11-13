@@ -98,7 +98,8 @@ def fallback(raw, why):
     guarded, text = guarded_text(raw)
     if guarded and sensitive(text, payload_cwd(raw)):
         sys.stderr.write('command_guard BLOCKED [guard_failure]: the analyser %s and the command names a protected '
-                         'harness location, a secret source or a code-execution step with a destructive verb. Safe '
+                         'harness location, a credential location, a secret source or a code-execution step with a '
+                         'destructive verb. Safe '
                          'alternative: split the command into simple steps; run `python3 %s doctor` to check the '
                          'guard.\n' % (why, GUARD))
         return 2
