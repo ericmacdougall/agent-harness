@@ -72,7 +72,7 @@ export function owners(rows, items = []) {
 }
 
 const SOURCE_NAMES = { wals: 'Claude + Codex WALs', initiatives: 'Initiatives file', owners: 'Owners', github: 'GitHub', goodqa: 'GoodQA tickets',
-  't2-dev': 't2-dev', 'file-drop': 'Event drops', codex: 'Codex chat', chat: 'Chat store', 'codex-owners': 'OpenAI supervised owners' };
+  't2-dev': 't2-dev', 'file-drop': 'Event drops', codex: 'Codex chat', chat: 'Chat store', 'codex-owners': 'OpenAI supervised owners', ledger: 'Goals, requirements and status' };
 export function sources(rows) {
   if (!Array.isArray(rows)) return [];
   return rows.filter(r => r && r.name).map(r => ({
@@ -301,4 +301,114 @@ export function atRisk(initiatives = [], owners = [], events = [], now = Date.no
   }
   const order = { uncovered: 0, stalled: 1, moving: 2 };
   return rows.sort((a, b) => order[a.status] - order[b.status] || b.since - a.since).slice(0, limit);
+}
+
+
+// ---- ledger (goodqa#15920): goals, requirements and evidence-only status, as the server's Ledger source reports them.
+// Everything is clamped again here: the page never trusts a field's type or length, and renders with textContent only.
+export const GOAL_STATE = Object.freeze({
+  LIVE_TESTED: 'Live and tested', LIVE: 'Live, not tested', MERGED: 'Merged, not live', IN_PROGRESS: 'In progress', BLOCKED: 'Blocked',
+  DEFERRED: 'Deferred', DONE: 'Done', FAILED: 'Failed', UNKNOWN: 'No evidence yet',
+});
+const LIST_CAP = 2000;
+const rows = value => (Array.isArray(value) ? value.filter(x => x && typeof x === 'object' && !Array.isArray(x)) : []);
+const int = value => (Number.isInteger(value) ? value : 0);
+const part = (raw, extra) => ({ stale: raw?.stale === true, error: str(raw?.error, 300), at: validIso(raw?.at) || '', ...extra });
+
+function evidenceRow(raw) {
+  return { id: str(raw.id, 40), kind: str(raw.kind, 20), verdict: str(raw.verdict, 12).toUpperCase(), at: validIso(raw.at) || '', check: str(raw.check, 80), by: str(raw.by, 40), note: str(raw.note, 400) };
+}
+function statusRow(raw) {
+  return { id: str(raw.id, 40), agent: str(raw.agent, 40), at: validIso(raw.at) || '', event: str(raw.event, 20), note: str(raw.note, 500), check: str(raw.check, 80), verdict: str(raw.verdict, 12).toUpperCase() };
+}
+const STATUS_LISTS = ['verified', 'live', 'pending', 'failed', 'claimed', 'blockers', 'commits', 'asks_open', 'decisions', 'assumptions', 'live_legacy'];
+
+export function ledger(snapshot) {
+  const root = snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot) ? snapshot : {};
+  const goals = root.goals && typeof root.goals === 'object' ? root.goals : {};
+  const reqs = root.requirements && typeof root.requirements === 'object' ? root.requirements : {};
+  const status = root.status && typeof root.status === 'object' ? root.status : {};
+  const requirementItems = rows(reqs.items).slice(0, LIST_CAP).map(r => ({
+    id: str(r.id, 64), kind: 'requirement', text: str(r.text, 700), at: validIso(r.at) || '', session: str(r.session, 64), owner: str(r.owner, 60), ticket: str(r.ticket, 60),
+    source: str(r.source, 300), state: str(r.state, 40), bucket: r.bucket === 'archived' ? 'archived' : 'live', rule: str(r.rule, 8) || 'live', rule_title: str(r.rule_title, 40),
+    reason: str(r.reason, 300), evidence_ref: str(r.evidence_ref, 120), has_evidence: r.has_evidence === true,
+    expires_in_s: Number.isFinite(r.expires_in_s) ? r.expires_in_s : null,
+  })).filter(r => r.id);
+  const summary = { live: 0, archived: 0, rules: {} };
+  for (const r of requirementItems) { summary[r.bucket] += 1; summary.rules[r.rule] = (summary.rules[r.rule] || 0) + 1; }
+  const out = {
+    goals: part(goals, { items: rows(goals.items).slice(0, 100).map(g => {
+      const evidence = rows(g.evidence).slice(0, 20).map(evidenceRow);
+      const problems = g.problems && typeof g.problems === 'object' ? g.problems : {};
+      return { id: str(g.id, 64), title: str(g.title, 300), ticket: str(g.ticket, 60), state: (typeof g.state === 'string' ? g.state.slice(0, 40).toUpperCase().replace(/[^A-Z_]/g, '') : '') || 'UNKNOWN',
+        ledger_status: str(g.ledger_status, 40), priority: Number.isInteger(g.priority) ? g.priority : null, target: str(g.target, 400),
+        owners: Array.isArray(g.owners) ? g.owners.slice(0, 10).map(o => str(o, 60)) : [], deferral: str(g.deferral, 300),
+        problems: { missing: int(problems.missing), tampered: int(problems.tampered), unpinned: int(problems.unpinned) },
+        evidence, evidence_total: Number.isInteger(g.evidence_total) ? g.evidence_total : evidence.length };
+    }).filter(g => g.id) }),
+    requirements: part(reqs, { items: requirementItems, total: Number.isInteger(reqs.total) ? reqs.total : requirementItems.length, truncated: reqs.truncated === true, summary }),
+    status: part(status, { counts: status.counts && typeof status.counts === 'object' ? Object.fromEntries(Object.entries(status.counts).slice(0, 20).map(([k, v]) => [str(k, 30), int(v)])) : {},
+      owners: { counts: {}, attention: [], live: [], undisposed: [], ...(status.owners && typeof status.owners === 'object' ? { attention: arr(status.owners.attention), live: arr(status.owners.live), undisposed: arr(status.owners.undisposed) } : {}) },
+      since_s: int(status.since_s), entries: int(status.entries), ...Object.fromEntries(STATUS_LISTS.map(k => [k, rows(status[k]).slice(0, 60).map(statusRow)])) }),
+    generated: validIso(root.generated) || '',
+  };
+  return out;
+}
+function arr(value) { return Array.isArray(value) ? value.slice(0, 20).map(v => str(v, 40)) : []; }
+
+// Archived asks (server) and archived requirements (ledger) as one list, newest first. Each row keeps the rule and reason
+// that put it there. The page removes nothing: a row that stops matching comes back on the next snapshot.
+export function archiveAsk(raw) {
+  return { id: str(raw.id, 40), kind: 'ask', text: str(raw.text, 700), at: validIso(raw.at) || '', owner: str(raw.owner, 60), ticket: str(raw.ticket, 60), session: str(raw.session, 64),
+    rule: str(raw.rule, 8) || 'R1', rule_title: str(raw.rule_title, 40), reason: str(raw.reason, 300), evidence_ref: str(raw.evidence_ref, 120), decision: str(raw.decision, 40),
+    resolution: str(raw.resolution, 300), resolved_at: validIso(raw.resolved_at) || '', ask_reason: str(raw.ask_reason, 300), bucket: 'archived' };
+}
+export function archiveRows(asks, requirements) {
+  const list = [...rows(asks).map(archiveAsk), ...rows(requirements).filter(r => r.bucket === 'archived')];
+  return list.sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0) || (a.id < b.id ? -1 : 1));
+}
+
+const DEAL_KIND = {
+  pending: { label: 'PENDING', symbol: '…', tone: 'pending' }, failed: { label: 'FAILED', symbol: '✕', tone: 'bad' },
+  live: { label: 'DEPLOYED', symbol: '↑', tone: 'ok' }, verified: { label: 'TESTED', symbol: '✓', tone: 'ok' },
+};
+// Recent deploys and live tests: ledger records first-class, plus deploy and release events from the live feed.
+export function dealRows(status, events = [], limit = 8) {
+  const out = [];
+  for (const key of ['pending', 'failed', 'live', 'verified']) {
+    for (const row of status?.[key] || []) out.push({ id: row.id, ...DEAL_KIND[key], at: row.at, text: row.note, check: row.check, agent: row.agent, source: 'ledger', verdict: row.verdict });
+  }
+  for (const event of Array.isArray(events) ? events : []) {
+    if (!event || event.historic || !['deploy', 'release'].includes(event.kind)) continue;
+    out.push({ id: `event:${event.id}`, label: event.kind === 'deploy' ? 'DEPLOYED' : 'RELEASED', symbol: '↑', tone: 'ok', at: event.ts, text: event.summary, check: event.subject?.repo || '', agent: event.actor?.agent || '', source: 'feed', verdict: '' });
+  }
+  return out.sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0) || (a.id < b.id ? -1 : 1)).slice(0, limit);
+}
+
+export function blockerRows(status, flagged = [], owners = [], initiatives = []) {
+  const out = [];
+  for (const row of status?.blockers || []) out.push({ id: row.id, source: 'status', title: 'Blocker', text: row.note, at: row.at, agent: row.agent });
+  for (const ask of flagged || []) out.push({ id: `ask:${ask.id}`, source: 'ask', title: 'Untraceable ask', text: `${ask.text || ask.id} (${ask.flagged || 'no traceable source'})`, at: ask.at || '', agent: ask.owner || '' });
+  for (const owner of owners || []) if (owner.severe) out.push({ id: `owner:${owner.agent_id}`, source: 'owner', title: `Owner ${owner.state}`, text: `${owner.name}: ${owner.task || ''}`, at: owner.last_item?.active || '', agent: owner.agent_id });
+  for (const item of initiatives || []) if (/blocked/i.test(item.state)) out.push({ id: `initiative:${item.id}`, source: 'initiative', title: 'Initiative blocked', text: `${item.initiative}: ${item.next_step || item.note || ''}`, at: '', agent: item.owner || '' });
+  return out.sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0) || (a.id < b.id ? -1 : 1));
+}
+
+export function missionTiles(state) {
+  const led = state.ledger || ledger(null);
+  const goals = led.goals.items;
+  const tested = goals.filter(g => g.state === 'LIVE_TESTED').length;
+  const live = (state.owners || []).filter(o => o.state === 'live').length;
+  const attention = (state.owners || []).filter(o => o.severe).length;
+  const waiting = (state.asks || []).filter(ask => waitingOnUser(state.messages, ask) && state.decisions?.[ask.id]?.status !== 'sending').length;
+  const blockers = blockerRows(led.status, state.asksFlagged || [], state.owners || [], state.initiatives || []).length;
+  const reqs = led.requirements.summary;
+  const risky = (state.initiatives || []).filter(i => /at risk|blocked/i.test(i.state)).length;
+  return [
+    { id: 'goals', label: 'Goals live and tested', value: `${tested} / ${goals.length}`, note: led.goals.error ? 'ledger error' : `${goals.length - tested} still open`, target: 'mission-panel' },
+    { id: 'owners', label: 'Owners live', value: String(live), note: attention ? `${attention} need attention` : 'none need attention', target: 'owners-panel' },
+    { id: 'asks', label: 'Needs you', value: String(waiting), note: waiting ? 'waiting on your answer' : 'nothing waiting', target: 'needs-panel' },
+    { id: 'blockers', label: 'Blockers', value: String(blockers), note: risky ? `${risky} initiatives at risk` : 'across status, asks, owners', target: 'blockers-panel' },
+    { id: 'requirements', label: 'Requirements live', value: String(reqs.live), note: `${reqs.archived} archived`, target: 'requirements' },
+  ];
 }

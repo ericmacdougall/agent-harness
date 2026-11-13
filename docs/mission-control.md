@@ -12,6 +12,37 @@ It runs on your Mac as a launchd user agent bound to `127.0.0.1`, and it is read
 
 The event and chat formats are in [mission-control-events.md](mission-control-events.md).
 
+## The page
+
+One scrolling page with six views (Overview, Requirements, Archive, Activity, Topology, Sources) and a docked chat. The Overview reads top to bottom:
+
+1. **Mission**: five summary tiles (goals live and tested, live owners, asks waiting on you, blockers, live requirements), the goals from the ledger with their evidence one click down, and the initiatives behind a disclosure.
+2. **Live owners and streams** and **Needs you**, side by side. The age beside each owner is its heartbeat (time since it last wrote). Needs you is part of the page, not a dialog; the top-bar button jumps to it.
+3. **Recent deploys and live tests** and **Blockers**, side by side.
+
+The top bar always shows the connection (Live, Reconnecting, Offline, Signed out) and the age of the last server message. The page opens one SSE stream and never polls `/api/state` on a timer; after a drop it resyncs once on reconnect. The 3D topology loads only when its tab is first opened (`#gl=off` still forces the static view). Every long text is clamped with a disclosure, and every list shows one page with "show more", so volume does not take over the page.
+
+### Requirements, Archive and the archive rule
+
+Asks and requirements are live or archived by one deterministic rule (`archive.py`). The first match wins, each row says which rule and why, nothing is deleted, and an item returns to live on the next read if its cause reverses.
+
+| Rule | Archived when |
+| --- | --- |
+| R1 terminal state | the record says resolved, closed, done, superseded, expired, declined or withdrawn; an ask has `resolved_at`; the sweeper cleared it as resolved or because its owner was reassigned |
+| R2 proven or closed | the newest deploy or live-test evidence is PASS, or the linked ticket is closed (from the sweeper's ticket cache). FAIL, UNSTATED and unknown never archive |
+| R3 superseded | a newer record of the same session (same owner for asks) has the same words |
+| R4 expired | an ask is past its own `until`, or a requirement is older than 30 days with no owner, ticket or evidence. The 30 days is an assumption, shown on the row ("moves to the archive in N d") before it applies |
+
+An ask that is only quiet for 72 hours stays live with a stale mark. The Archive view lists archived asks and requirements with who registered them, their source, the resolution or reason, the evidence id and the rule.
+
+### Ledger source
+
+`ah goals --json`, `ah requirements --session S` and `ah status --session S --since 12h` are read through three allowlisted read-only runner shapes by the Ledger collector: once per cadence (60 s with a page attached, 300 s without, plus the attach refresh; never on a client request), at most 1 MiB each, 60 goals with 12 evidence records each, 1000 requirements, 30 rows per status list. A failing source keeps its last good rows marked stale and shows in Source health. The snapshot is published as the SSE event `ledger` (and in `/api/state`) only when its content changed.
+
+### Data with no UI today
+
+Peer-review receipts, full ticket comment threads (only checkpoint comments arrive, as feed events) and release-kit deploy records outside the WALs have no read path in Mission Control. `web/coverage.json` maps every `/api/state` key, SSE event and ledger field to the page section that shows it; a test fails when a new key has no section.
+
 ## Run kit
 
 | Task | Command |
@@ -51,6 +82,7 @@ Every source has a fixed interval. A failing source is never retried faster, and
 | GoodQA tickets | Checkpoint comments on tickets that initiatives reference | One ticket read every 10 s, round robin, at most 12 tickets |
 | t2-dev | One fixed WAL probe over ssh | At most one ssh connection every 60 s |
 | Event drops | `~/.agent-harness/mission-control/sources/*.jsonl`, written by external sources such as Fabric | Every 5 s |
+| Ledger | `ah goals`, `ah requirements`, `ah status` (see Ledger source) | 60 s attached, 300 s idle |
 
 Two kinds of WAL line are not work items:
 

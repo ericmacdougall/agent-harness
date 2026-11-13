@@ -1022,6 +1022,7 @@ class Ledger(Collector):
             raise RuntimeError("; ".join(errors)[:300])
         reqs = self.parts["requirements"]
         if not session:
+            self.next_at = min(self.next_at, now + 10)  # main's session is learned from the owners read, seconds after start
             return "goals only: no main session known yet"
         return (f"{len(self.parts['goals']['items'])} goals, {reqs['summary']['live']} live and "
                 f"{reqs['summary']['archived']} archived requirements")

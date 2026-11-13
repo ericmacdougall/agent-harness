@@ -182,6 +182,7 @@ class LedgerCollector(unittest.TestCase):
         ledger.run(1000.0)
         self.assertEqual([k for k, _ in runner.calls], ["ah-goals"])
         self.assertEqual(hub.snapshots["ledger"]["requirements"]["items"], [])
+        self.assertEqual(ledger.next_at, 1010.0)  # retried soon, not after a full cadence
 
     def test_cadence_is_60_s_attached_and_300_s_idle(self):
         ledger, hub, _ = make(Fake())
@@ -266,6 +267,32 @@ class AsksArchive(unittest.TestCase):
         self.assertEqual(rules["wuntil000001"], ("R4", "archived"))
         self.assertIn("answered by the user: yes", next(a for a in snap["archive"] if a["id"] == "wres00000001")["reason"])
         self.assertEqual([a["id"] for a in snap["resolved"]], ["wres00000001"])  # the original lists are untouched
+
+
+class Coverage(unittest.TestCase):
+    """AC-4: every key the server sends has a named UI section in web/coverage.json (the node test checks the ids exist)."""
+
+    def test_every_state_key_and_snapshot_field_is_mapped(self):
+        mapping = json.loads((REPO / "harness" / "mission_control" / "web" / "coverage.json").read_text())
+        sys.path.insert(0, str(REPO / "tests"))
+        from test_mission_control import ServerHarness  # noqa: PLC0415
+
+        class H(ServerHarness):
+            def runTest(self):
+                pass
+        h = H()
+        h.setUp()
+        self.addCleanup(h.tearDown)
+        h.app.owners.session = SID
+        state = h.app.state()
+        self.assertEqual(sorted(set(state) - set(mapping["state"])), [])
+        self.assertEqual(sorted(set(state["asks"]) - set(mapping["asks"])), [])
+        self.assertEqual(sorted(set(state["ledger"]) - set(mapping["ledger"])), [])
+
+    def test_the_page_never_polls_state_on_a_timer(self):
+        live = (REPO / "harness" / "mission_control" / "web" / "js" / "live.js").read_text()
+        self.assertNotIn("setInterval", live)
+        self.assertEqual(live.count("'/api/state'"), 1)
 
 
 if __name__ == "__main__":
