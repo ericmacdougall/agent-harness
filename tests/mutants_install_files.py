@@ -75,7 +75,7 @@ MUTANTS = {
     "prune counts any entry": (INST, 'runs = sorted((n for n in os.listdir(BACKUPS) if re.fullmatch(r"ins-[0-9a-f]{12}", n)),', 'runs = sorted((n for n in os.listdir(BACKUPS)),',
                                [T + "Hardening.test_prune_keeps_ten_run_directories_and_ignores_other_entries"]),
     # goodqa#15913: the local targets
-    "local target runs over ssh": (INST, "            if self.root:\n                done = self.runner(local_argv(", "            if False:\n                done = self.runner(local_argv(",
+    "local target runs over ssh": (INST, "            if self.root:\n                inherit = ", "            if False:\n                inherit = ",
                                    [T + "LocalTarget.test_a_local_install_runs_the_same_program_without_ssh_and_reports_every_sha"]),
     "local root ignored": (INST, 'return [sys.executable, "-I", "-c", REMOTE_SCRIPT, op, json.dumps(args), root]',
                            'return [sys.executable, "-I", "-c", REMOTE_SCRIPT, op, json.dumps(args), "claude"]',
@@ -99,10 +99,11 @@ MUTANTS = {
                                                [T + "LocalTarget.test_a_local_install_runs_the_same_program_without_ssh_and_reports_every_sha"]),
     "local host names matched loosely": (INST, "(host not in HOSTS and host not in LOCAL_TARGETS)", '(host not in HOSTS and not host.startswith("local"))',
                                          [T + "LocalTarget.test_names_that_only_look_local_refuse_before_any_call"]),
-    "rollback loses the local home": (INST, 'remote = Remote(host, runner, home)\n    state = remote.call("probe"', 'remote = Remote(host, runner)\n    state = remote.call("probe"',
+    "rollback loses the local home": (INST, 'remote = Remote(host, runner, home, keep_fds)\n    state = remote.call("probe"', 'remote = Remote(host, runner, None, keep_fds)\n    state = remote.call("probe"',
                                       [T + "LocalTarget.test_a_local_rollback_and_a_local_resume_by_run_id"]),
     # goodqa#15913 round 2: the program in its own session, the hook-entry probes, the comment exit, CODEX_HOME, parents
-    "local program shares the caller's session": (INST, "start_new_session=True, close_fds=True)", "start_new_session=False, close_fds=True)",
+    "local program shares the caller's session": (INST, "start_new_session=True, close_fds=True, pass_fds=tuple(pass_fds))",
+                                                  "start_new_session=False, close_fds=True, pass_fds=tuple(pass_fds))",
                                                   [T + "LocalKill.test_a_caller_side_timeout_leaves_the_local_program_running_in_its_own_session",
                                                    T + "LocalKill.test_a_caller_killed_after_one_of_three_renames_does_not_stop_the_program"]),
     "a caller timeout kills the local program": (INST, "    except subprocess.TimeoutExpired:\n        for stream in (proc.stdin, proc.stdout, proc.stderr):",
