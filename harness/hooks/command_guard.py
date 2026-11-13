@@ -38,6 +38,7 @@ import errno
 import fnmatch
 import hashlib
 import hmac
+import itertools
 import json
 import os
 import posixpath
@@ -521,6 +522,15 @@ class Word:
     def text(self):
         return self.alts[0]
 
+    def cred_alts(self, cap=256):
+        """The expansions the credential checks judge: every one (`all_alts`) up to `cap`, past that the first 32 plus the
+        whole word as one glob (`_overflow_glob`), so a credential among them is never skipped (receipt r7: the 1001st of
+        1001 alternatives, or one of 8192 past the 4096 cap)."""
+        alts = self.all_alts()
+        if alts is None or len(alts) > cap:
+            return self.alts[:32] + [_overflow_glob(self.overflow)]
+        return alts or self.alts[:32]
+
     def all_alts(self):
         """Every expansion for target checks: an overflowed brace word is re-expanded with a 4096 cap.
         None means it is still too large, so its targets are unknown."""
@@ -672,6 +682,24 @@ def brace_expand(text, limit=32):
     return out[:limit]
 
 
+# a brace sequence expression, `{1..40}`, `{a..z}`, `{01..10..2}` (bash and zsh): receipt r7, `goodq{a..a}` is goodqa
+_BRACE_SEQ = re.compile(r'(-?\d{1,18})\.\.(-?\d{1,18})(?:\.\.(-?\d{1,18}))?|([A-Za-z])\.\.([A-Za-z])(?:\.\.(-?\d{1,18}))?')
+
+
+def _brace_sequence(m, cap=4097):
+    """The members of a sequence expression, at most `cap` of them (past every expansion limit the caller uses, so a longer
+    one still reads as an overflow). Numbers keep bash's zero padding (`{01..10}`)."""
+    step = abs(int(m.group(3) or m.group(6) or 1)) or 1
+    if m.group(1) is not None:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        pad = max(len(m.group(1)), len(m.group(2))) if re.match(r'-?0\d', m.group(1)) or re.match(r'-?0\d', m.group(2)) else 0
+        seq = range(lo, hi + 1, step) if lo <= hi else range(lo, hi - 1, -step)
+        return ['%0*d' % (pad, v) for v in itertools.islice(seq, cap)]
+    lo, hi = ord(m.group(4)), ord(m.group(5))
+    seq = range(lo, hi + 1, step) if lo <= hi else range(lo, hi - 1, -step)
+    return [chr(v) for v in itertools.islice(seq, cap)]
+
+
 def _find_brace(text):
     i = text.find('{')
     while i >= 0:
@@ -691,8 +719,28 @@ def _find_brace(text):
                 last = c + 1
             parts.append(text[last:j - 1])
             return i, j, parts
+        seq = _BRACE_SEQ.fullmatch(text[i + 1:j - 1]) if depth == 0 else None
+        if seq:
+            return i, j, _brace_sequence(seq)
         i = text.find('{', i + 1)
     return None
+
+
+def _overflow_glob(raw):
+    """A brace word past every expansion cap as ONE glob for the credential checks (receipt r7, fail closed): each outermost
+    `{...}` group, a list or a sequence, becomes `*`, which matches every member (`_cred_one` lets `*` cross a `/`, and
+    `under_cred_parent` matches a glob segment), so a credential among 8192 alternatives is still seen."""
+    out, depth = [], 0
+    for ch in raw:
+        if ch == '{':
+            if depth == 0:
+                out.append('*')
+            depth += 1
+        elif ch == '}' and depth:
+            depth -= 1
+        elif depth == 0:
+            out.append(ch)
+    return _unq(''.join(out))
 
 
 # zsh clobber forms (the Bash tool may run zsh): judged as the bash operator with the same effect
@@ -782,7 +830,7 @@ class Lexer:
             return None, i
         raw = ''.join(buf)
         alts = [raw]
-        if '{' in raw and ',' in raw:
+        if '{' in raw and (',' in raw or '..' in raw):
             expandable = raw.count('{') <= 24 and len(raw) <= 2048
             if expandable:
                 alts = brace_expand(raw)
@@ -2651,6 +2699,13 @@ _TAR_VALUE_ANY = 'bCfFgHIKLNsTVX'
 # every short letter GNU tar, bsdtar or busybox tar accepts; a letter outside it belongs to no tar the guard knows, so
 # what it takes is unknown and the mode is in doubt (receipt r6: a skip needs every option recognised)
 _TAR_KNOWN_LETTERS = 'ABCFGHIJKLMNOPRSTUVWXZabcdfghijklmnopqrstuvwxyz'
+# tar options whose value is a file of member NAMES the tool then reads from disk (receipt r7 F1). GNU tar: -T and
+# --files-from. bsdtar (also macOS /usr/bin/tar): -T, -I ("Synonym for -T", bsdtar(1)) and --files-from. Plain `tar` may be
+# either, so it takes both readings: its -I is also GNU's compress command (`_OPTION_COMMANDS`). gtar is GNU only. Not
+# here: -X/--exclude-from (patterns that leave files out), --newer-than/--older-than FILE (a time stamp only), @ARCHIVE
+# (entries of another archive) and -K/--starting-file (a member name); each value is still judged by name in read_creds.
+_TAR_NAME_LETTERS = {'tar': 'TI', 'bsdtar': 'TI', 'gtar': 'T'}
+_TAR_NAME_LONGS = ('files-from',)
 _PAX_VALUE_ALL = 'bfopsx'       # POSIX pax
 _PAX_VALUE_ANY = 'bfopsxBEGTU'  # BSD pax adds -B -E -G -T -U
 _TAR_CREATE_LONGS = ('create', 'append', 'update', 'catenate', 'concatenate', 'delete')
@@ -2875,6 +2930,35 @@ def _tar_mode(name, args):
     return 'read' if read else None
 
 
+def _tar_names_file(name, args):
+    """True when ANY reading of a tar command line takes member names from a file or stdin (`_TAR_NAME_LETTERS`): a names
+    letter in a dash cluster before the first letter that takes a value in every tar (`-T-`, `-cT -`, `-I/dev/stdin`,
+    `-cfI - -` read as -c -f -I by the letters; `-C/Tmp` is a directory), in the old-style first word whose values follow as
+    words (`cTf - -`, `cfI - -`), and --files-from in any abbreviation getopt accepts (`--files=-`). A dash word that may be
+    an earlier option's value counts too: the most dangerous reading wins."""
+    letters = _TAR_NAME_LETTERS.get(name, 'T')
+    for k, a in enumerate(args):
+        t = a.text
+        if t == '--':
+            break
+        if t.startswith('--'):
+            long_name = t[2:].partition('=')[0]
+            if len(long_name) >= 5 and any(full.startswith(long_name) for full in _TAR_NAME_LONGS):
+                return True
+            continue
+        if k == 0 and not t.startswith('-'):
+            if any(ch in letters for ch in t):
+                return True
+            continue
+        if len(t) > 1 and t[0] == '-':
+            for ch in t[1:]:
+                if ch in letters:
+                    return True
+                if ch in _TAR_VALUE_ALL:
+                    break
+    return False
+
+
 def _tar_bases(args, ctx):
     """Every directory tar may have changed to before it reads a relative operand: the working directory, then each
     `-C DIR` (separate, attached `-CDIR`, inside a cluster `-cC DIR`) and `--directory` (any abbreviation, `=DIR` or a
@@ -2978,7 +3062,7 @@ def _path_like(text):
 _OPTION_COMMANDS = {
     'tar': ('IF', ('use-compress-program', 'to-command', 'info-script', 'new-volume-script', 'rsh-command')),
     'gtar': ('IF', ('use-compress-program', 'to-command', 'info-script', 'new-volume-script', 'rsh-command')),
-    'bsdtar': ('I', ('use-compress-program',)),
+    'bsdtar': ('', ('use-compress-program',)),  # bsdtar -I is a names file (`_TAR_NAME_LETTERS`), not a command
     'rsync': ('e', ('rsh',)),
     'scp': ('S', ()), 'sftp': ('S', ()),
     'zip': ('', ('unzip-command',)),
@@ -3059,6 +3143,12 @@ _FIND_FLAGS = frozenset({
     '-noleaf', '-depth', '-ignore_readdir_race', '-noignore_readdir_race', '-color', '-nocolor', '-noerror', '-unique',
     '-status', '-warn', '-nowarn', '-help', '-version', '-not', '-a', '-o', '-and', '-or', '-exclude', '-acl', '-xattr',
     '-posix', '-P', '-H', '-L', '-E', '-X', '-d', '-s', '-x'})
+
+
+def _find_files0_values(args):
+    """The value words of GNU find's -files0-from: a file (or `-`, stdin) of NUL-separated start directories."""
+    texts = [a.text for a in args]
+    return [args[i + 1] for i, t in enumerate(texts[:-1]) if t == '-files0-from']
 
 
 def _find_exec_bodies(args):
@@ -4883,6 +4973,11 @@ class Analyzer:
             unknown.alts = ['$FILES0_FROM']
             unknown.dynamic = True
             roots.append(unknown)  # start directories read from a file: not known to the guard
+            # ...unless the file is a substitution or stdin whose command may print a credential name (receipt r7 F2:
+            # `find -files0-from <(printf '%s\0' ~/.config/goodqa) -type f -exec cat {} +`): that name is a start directory
+            listed = self._files0_hit(args, pl, idx)
+            if listed:
+                roots.append(_literal_word(listed))
         if not roots:
             roots = [Word()]
             roots[0].alts = ['.']
@@ -5346,7 +5441,7 @@ class Analyzer:
     def is_cred_path(self, text, word=None):
         ctx = self.ctx
         c = ctx.c
-        alts = (word.all_alts() or word.alts[:32]) if word is not None else [text]
+        alts = word.cred_alts() if word is not None else [text]
         for alt in alts:
             if self._cred_one(alt):
                 return True
@@ -5531,9 +5626,10 @@ class Analyzer:
     def _names_consumer(self, name, args):
         """The reader a command runs on a LIST OF FILE NAMES it takes from stdin, a names file or a process substitution, or
         None: xargs or parallel running a reader (`xargs -n 1 cat`, `xargs sh -c ...`; grep count-only excepted), tar, bsdtar
-        and gtar with -T/--files-from outside extract and list mode, zip -@/--names-stdin, cpio and pax (copy-out reads its
-        names from stdin), rsync --files-from, ack -x/--files-from, 7z @listfile, curl -K/--config and wget -i/--config (a
-        config may name a file URL or a post file), and sftp, whose batch commands (`put FILE`) come from stdin."""
+        and gtar with a names file outside extract and list mode (-T, bsdtar -I, --files-from: `_tar_names_file`), zip
+        -@/--names-stdin, cpio and pax (copy-out reads its names from stdin), rsync --files-from, ack -x/--files-from, 7z
+        @listfile, curl -K/--config and wget -i/--config (a config may name a file URL or a post file), and sftp, whose batch
+        commands (`put FILE`) come from stdin."""
         texts = [a.text for a in args]
         short = [t for t in texts if t.startswith('-') and not t.startswith('--')]
         if name in ('xargs', 'parallel'):
@@ -5550,10 +5646,7 @@ class Analyzer:
         if name in ('tar', 'bsdtar', 'gtar'):
             if _tar_mode(name, args) == 'read':
                 return None
-            bundled = bool(texts) and not texts[0].startswith('-') and 'T' in texts[0]
-            if bundled or any('T' in t for t in short) or any(t.startswith('--files') for t in texts):
-                return name
-            return None
+            return name if _tar_names_file(name, args) else None
         if name == 'zip':
             return name if any('@' in t for t in short) or '--names-stdin' in texts else None
         if name in ('cpio', 'bsdcpio', 'pax', 'afio'):
@@ -5585,15 +5678,15 @@ class Analyzer:
         real, rargs = _unwrap_command(words)
         if real is None:
             return None
-        cands = _find_cred_roots(rargs, []) if real in ('find', 'bfs', 'gfind') else list(rargs)
+        cands = _find_cred_roots(rargs, []) + _find_files0_values(rargs) if real in ('find', 'bfs', 'gfind') else list(rargs)
         for w in cands[:256]:
             if depth < 3:
                 for inner in w.subs[:4]:
                     hit = self._script_lists_creds(inner, depth + 1)
                     if hit:
                         return hit
-            alts = w.all_alts() or w.alts[:32] or [w.text]
-            for alt in alts[:32]:
+            alts = w.cred_alts() or [w.text]
+            for alt in alts:
                 for t in [alt] + (_derived_texts(alt, curl=True) if len(alts) <= 8 else []):
                     if self._cred_one(t, strict_glob=t is not alt):
                         return t
@@ -5721,6 +5814,25 @@ class Analyzer:
                             if not hasattr(self.ctx, 'read_binds'):
                                 self.ctx.read_binds = {}
                             self.ctx.read_binds[id(loop)] = hit
+
+    def _files0_hit(self, args, pl, idx):
+        """The credential name the -files0-from list of a find may give it, or None: a process substitution value
+        (`<(printf ...)`, `<(find DIR -print0)`), or `-` (stdin) fed by an earlier pipeline stage or the command's own
+        input redirect (`printf ... | find -files0-from - ...`, `find -files0-from - ... < <(find DIR -print0)`)."""
+        for value in _find_files0_values(args):
+            for inner in value.subs[:4]:
+                hit = self._script_lists_creds(inner)
+                if hit:
+                    return hit
+            if value.text in ('-', '/dev/stdin', '/dev/fd/0'):
+                for prev in (pl.cmds[:idx] if pl is not None else []):
+                    hit = self._producer_hit(self._skip_assigns(strip_reserved(prev.words))[1])
+                    if hit:
+                        return hit
+                hit = self._input_hit(pl.cmds[idx] if pl is not None and idx < len(pl.cmds) else None)
+                if hit:
+                    return hit
+        return None
 
     def _names_finding(self, reader, hit):
         ctx = self.ctx
@@ -5854,7 +5966,7 @@ class Analyzer:
             check_name, check_dir = id(w) not in exempt_name, walking and id(w) not in exempt_dir
             if not (check_name or check_dir):
                 continue
-            alts = w.all_alts() or w.alts[:32] or [w.text]
+            alts = w.cred_alts() or [w.text]
             hit, shown = check_name and self.is_cred_path(w.text, w), w.text  # every alternative, past the brace cap too
             for k, alt in enumerate(alts[:256]):
                 if hit:
@@ -7201,13 +7313,29 @@ SECRET_TEXT = re.compile(r'(?i)\brclone\b|\bauth\s+token\b|--show-token|\bprinte
                          r'internet)-password|dump-keychain|/environ\b|(?:TOKEN|SECRET|PASSWORD|API_?KEY)\b')
 
 
+# credential locations for the raw-text fallback (receipt r7, fail closed): when the analysis cannot finish (an internal
+# error, the time or node budget, nesting past max_depth, the hook's alarm or a crash of the analyser) a command naming
+# one is refused, never allowed or only warned about. Matched on the text and on the text with quotes and backslashes
+# removed (`~/.config/"goodqa"`, `goo\dqa`): a path segment `goodqa` (`~/.config/goodqa`, `~/.conf*/goodqa`), the lease
+# keys, a glob or brace right under ~/.config, and the policy's other credential directories. command_guard_hook.py keeps
+# an identical copy (it must not import this module).
+CRED_TEXT = re.compile(r'(?i)/goodqa(?![\w.-])|gq-browser|goodqa-hive|\.config/+[^\s/;&|<>()]*[*?\[{]'
+                       r'|(?:^|[\s/=~:])\.(?:ssh|aws|gnupg|kube|docker)(?![\w-])|\.config/+(?:gh|gcloud|rclone)(?![\w-])'
+                       r'|\.vault-token|\.git-credentials')
+
+
+def raw_credential(text):
+    """The raw text names a credential location (`CRED_TEXT`), as written or with quotes and backslashes removed."""
+    return bool(CRED_TEXT.search(text) or CRED_TEXT.search(re.sub(r'[\'"\\]', '', text)))
+
+
 def raw_sensitive(text, compiled=None, cwd=None):
-    """Cheap raw-text probe: does this text name a protected location or a secret source? A destructive verb run
-    from a working directory inside a harness root counts too (`cd ~/.claude` then `rm -rf projects`)."""
+    """Cheap raw-text probe: does this text name a protected location, a credential location or a secret source? A
+    destructive verb run from a working directory inside a harness root counts too (`cd ~/.claude` then `rm -rf projects`)."""
     if not isinstance(text, str):
         text = ' '.join(map(str, text))
     t = text[:4_000_000]
-    if PROTECTED_TEXT.search(t) or SECRET_TEXT.search(t):
+    if PROTECTED_TEXT.search(t) or SECRET_TEXT.search(t) or raw_credential(t):
         return True
     if cwd and DESTROY_TEXT.search(t):
         for place in (cwd, _realpath(cwd) or cwd):

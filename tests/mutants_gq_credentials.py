@@ -96,7 +96,7 @@ MUTANTS = {
     "7z -i wildcards read as literal": (" or (name in ('7z', '7za', '7zr', '7zz') and alt.startswith('-i'))", ""),
     "derived globs never literal": ("literal=not self_glob)", "literal=False)"),
     "parent globs not matched": ("if not all(_seg_eq(a, b) if globs else a == b for a, b in zip(segs, d)):", "if not all(a == b for a, b in zip(segs, d)):"),
-    "brace alternatives not judged as trees": ("            alts = w.all_alts() or w.alts[:32] or [w.text]\n            hit, shown", "            alts = [w.text]\n            hit, shown"),
+    "brace alternatives not judged as trees": ("            alts = w.cred_alts() or [w.text]\n            hit, shown", "            alts = [w.text]\n            hit, shown"),
     # receipt r6 F4: count-only exempts the searched operands only
     "count-only exempts option values": ("counted = {id(w) for w in sources}", "counted = {id(w) for w in words}"),
     # receipt r6 F3: ack reads an .ackrc in any parent and the global and user files
@@ -162,8 +162,39 @@ MUTANTS = {
     "xargs value options not skipped": [("'xargs': ('-n', '-I', '-J',", "'xargs-unused': ('-n', '-I', '-J',"),
                                         ("if real is None or not re.match(r'[A-Za-z_]', real):", "if False:")],
     "a misparsed xargs or parallel command is not searched for a reader": ("if real is None or not re.match(r'[A-Za-z_]', real):", "if False:"),
-    "tar -T is not a name list": ("            if bundled or any('T' in t for t in short) or any(t.startswith('--files') for t in texts):\n                return name",
-                                  "            if False:\n                return name"),
+    "tar names file is not a name list": ("            return name if _tar_names_file(name, args) else None", "            return None"),
+    # receipt r7 F1: the tar names-file table
+    "bsdtar -I is not a names file": ("_TAR_NAME_LETTERS = {'tar': 'TI', 'bsdtar': 'TI', 'gtar': 'T'}",
+                                      "_TAR_NAME_LETTERS = {'tar': 'T', 'bsdtar': 'T', 'gtar': 'T'}"),
+    "plain tar -I is not a names file": ("_TAR_NAME_LETTERS = {'tar': 'TI', 'bsdtar': 'TI', 'gtar': 'T'}",
+                                         "_TAR_NAME_LETTERS = {'tar': 'T', 'bsdtar': 'TI', 'gtar': 'T'}"),
+    "--files-from abbreviations not recognised": ("if len(long_name) >= 5 and any(full.startswith(long_name) for full in _TAR_NAME_LONGS):",
+                                                  "if long_name in _TAR_NAME_LONGS:"),
+    "old-style names letters ignored": ("        if k == 0 and not t.startswith('-'):\n            if any(ch in letters for ch in t):\n                return True",
+                                        "        if k == 0 and not t.startswith('-'):\n            if False:\n                return True"),
+    "names letter read inside an option value": ("                if ch in _TAR_VALUE_ALL:\n                    break\n    return False",
+                                                 "                if False:\n                    break\n    return False"),
+    "bsdtar -I still read as a command": ("    'bsdtar': ('', ('use-compress-program',)),", "    'bsdtar': ('I', ('use-compress-program',)),"),
+    # receipt r7 F2: find -files0-from
+    "files0-from list not judged": ("            listed = self._files0_hit(args, pl, idx)", "            listed = None"),
+    "files0-from stdin not judged": ("            if value.text in ('-', '/dev/stdin', '/dev/fd/0'):", "            if False:"),
+    "files0-from value is not a producer": ("_find_cred_roots(rargs, []) + _find_files0_values(rargs) if real", "_find_cred_roots(rargs, []) if real"),
+    # receipt r7 fail closed
+    "raw fallback ignores credential locations": ("if PROTECTED_TEXT.search(t) or SECRET_TEXT.search(t) or raw_credential(t):",
+                                                  "if PROTECTED_TEXT.search(t) or SECRET_TEXT.search(t):"),
+    "raw fallback ignores quoted forms": ("    return bool(CRED_TEXT.search(text) or CRED_TEXT.search(re.sub(r'[\\'\"\\\\]', '', text)))",
+                                          "    return bool(CRED_TEXT.search(text))"),
+    "launcher fallback ignores credential locations": ("command_guard_hook.py",
+                                                       "    if CRED_TEXT.search(t) or CRED_TEXT.search(re.sub(r'[\\'\"\\\\]', '', t)):\n        return True",
+                                                       "    if False:\n        return True"),
+    "brace sequences not expanded": ("        seq = _BRACE_SEQ.fullmatch(text[i + 1:j - 1]) if depth == 0 else None", "        seq = None"),
+    "lexer skips sequence-only braces": ("        if '{' in raw and (',' in raw or '..' in raw):", "        if '{' in raw and ',' in raw:"),
+    "overflow not judged as a glob": ("            return self.alts[:32] + [_overflow_glob(self.overflow)]", "            return self.alts[:32]"),
+    "credential alternatives not capped": ("        if alts is None or len(alts) > cap:", "        if alts is None:"),
+    "read_creds keeps the old alternatives": ("            alts = w.cred_alts() or [w.text]\n            hit, shown",
+                                              "            alts = w.all_alts() or w.alts[:32] or [w.text]\n            hit, shown"),
+    "name check keeps the old alternatives": ("        alts = word.cred_alts() if word is not None else [text]",
+                                              "        alts = (word.all_alts() or word.alts[:32]) if word is not None else [text]"),
     "zip -@ is not a name list": ("return name if any('@' in t for t in short) or '--names-stdin' in texts else None", "return None"),
     "cpio and pax are not name lists": ("        if name in ('cpio', 'bsdcpio', 'pax', 'afio'):\n            return name", "        if False:\n            return name"),
     "ack -x is not a name list": ("return name if any(t.startswith('--files') for t in texts) or any('x' in t for t in short) else None", "return None"),
@@ -198,9 +229,12 @@ def main():
         shutil.rmtree(tmp, ignore_errors=True)
     for name, spec in MUTANTS.items():
         pairs = spec if isinstance(spec, list) else [spec]  # a list breaks two independent layers at once
+        # a three-item spec names the hook file it breaks (the launcher keeps its own copy of the raw-text probe)
+        target = pairs[0][0] if len(pairs[0]) == 3 else GUARD
+        pairs = [p[-2:] for p in pairs]
         tmp = tree()
         try:
-            path = tmp / "harness" / "hooks" / GUARD
+            path = tmp / "harness" / "hooks" / target
             text = path.read_text()
             if any(old not in text for old, _ in pairs):
                 print("MUTANT NOT APPLIED:", name)

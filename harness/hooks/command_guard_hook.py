@@ -9,7 +9,7 @@ a secret source, or a code-execution step plus a destructive verb is blocked (ex
 with a note on stderr. It imports nothing outside the standard library and never imports command_guard.
 
 The probe here is deliberately duplicated from command_guard.py (PROTECTED_TEXT, SECRET_TEXT, EXEC_TEXT,
-DESTROY_TEXT) so that a broken or missing analyser cannot also break the fallback.
+DESTROY_TEXT, CRED_TEXT) so that a broken or missing analyser cannot also break the fallback.
 """
 
 import json
@@ -34,6 +34,9 @@ SECRET_TEXT = re.compile(r'(?i)\brclone\b|\bauth\s+token\b|--show-token|\bprinte
 EXEC_TEXT = re.compile(r'(?i)\|\s*(?:sudo\s+)?(?:ba|z|k|da|)sh\b|\beval\b|\b(?:ba|z|)sh\s+-[a-z]*c\b|'
                        r'\b(?:python[0-9.]*|node|perl|ruby)\s+-[a-z]*[ce]\b|base64\s+-[dD]|xxd\s+-r|\bsource\s+<\(')
 DESTROY_TEXT = re.compile(r'(?i)\b(?:rm|rmdir|unlink|shred|truncate|mv|rmtree|remove|unlinksync|rmsync|dd|find)\b')
+CRED_TEXT = re.compile(r'(?i)/goodqa(?![\w.-])|gq-browser|goodqa-hive|\.config/+[^\s/;&|<>()]*[*?\[{]'
+                       r'|(?:^|[\s/=~:])\.(?:ssh|aws|gnupg|kube|docker)(?![\w-])|\.config/+(?:gh|gcloud|rclone)(?![\w-])'
+                       r'|\.vault-token|\.git-credentials')
 
 
 def guarded_text(raw):
@@ -80,6 +83,8 @@ def sensitive(text, cwd=None):
     t = text[:4_000_000]
     if PROTECTED_TEXT.search(t) or SECRET_TEXT.search(t) or (EXEC_TEXT.search(t) and DESTROY_TEXT.search(t)):
         return True
+    if CRED_TEXT.search(t) or CRED_TEXT.search(re.sub(r'[\'"\\]', '', t)):
+        return True  # a credential location (receipt r7: fail closed when the analyser crashes or times out)
     if cwd and DESTROY_TEXT.search(t):
         try:
             real = os.path.realpath(cwd)
