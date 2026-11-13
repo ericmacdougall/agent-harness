@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -1162,6 +1163,106 @@ class LocalTarget(LocalBase):
         again = self.install(files=("ah.py", "doctor.py"))
         self.assertEqual(again["result"], "already_current")
         self.assertEqual(again.get("codex_differs", []), [])
+
+    def recorded(self, out, result, posted):
+        """The real result is finalized: ah.py at c1 is live, its row, one ticket comment naming the run, no unfinished run."""
+        self.assertEqual(self.live("ah.py"), sha(self.base_bytes("ah.py") + b"\n# c1\n"))
+        self.assertEqual((out["result"], out["exit_code"]), (result, 0))
+        self.assertEqual([r["result"] for r in self.rows("result") if r.get("run") == out["run"]], [result])
+        self.assertEqual(len(posted), 1)
+        self.assertIn("(run %s)" % out["run"], posted[0][1])
+        self.assertEqual(ai.unfinished_runs(self.mac, "local"), [])
+        self.assertIn("Codex drift could not be checked", out["note"])
+
+    def test_an_unreadable_codex_copy_never_stops_an_install_from_being_recorded(self):  # AC-3, NEG-26
+        self.make_codex()
+        copy = self.codex / "ah.py"
+        copy.chmod(0)
+        self.addCleanup(copy.chmod, 0o644)
+        posted = []
+        out = self.install(files=("ah.py",), posted=posted)
+        self.assertEqual(self.live("ah.py"), sha(self.base_bytes("ah.py") + b"\n# c1\n"))  # the install itself is done
+        self.assertEqual(out["codex_unchecked"], ["ah.py"])
+        self.recorded(out, "installed", posted)
+
+    def swap_after_lookup(self, replace):
+        """The Codex copy of ah.py is removed, then `replace(path)` runs, right after its first lstat succeeds: between the
+        lookup and the read, whatever the code under test uses for each."""
+        real, done = Path.lstat, []
+
+        def lstat(path):
+            st = real(path)
+            if not done and str(path).endswith("/.codex/agent-harness/ah.py"):
+                done.append(path)
+                os.unlink(path)
+                replace(path)
+            return st
+        return mock.patch.object(ai.Path, "lstat", lstat)
+
+    def test_a_codex_copy_removed_while_it_is_read_never_stops_an_already_current_run_from_being_recorded(self):  # AC-3, NEG-26
+        self.make_codex()
+        self.assertEqual(self.install(files=("ah.py",))["result"], "installed")
+        posted = []
+        with self.swap_after_lookup(lambda path: None):
+            out = self.install(files=("ah.py",), posted=posted)
+        self.assertFalse(os.path.lexists(self.codex / "ah.py"))
+        self.assertEqual(out["codex_unchecked"], ["ah.py"])
+        self.recorded(out, "already_current", posted)
+
+    def test_a_codex_copy_swapped_for_a_fifo_or_a_link_after_its_lookup_is_never_waited_on_or_followed(self):  # AC-3, NEG-26
+        self.make_codex()
+        decoy, stuck, timers = Path(self.tmp, "decoy"), [], []
+        decoy.write_bytes(b"decoy\n")
+
+        def fifo(path):
+            os.mkfifo(path)
+
+            def release():  # frees a reader blocked opening the FIFO; with no reader the open fails (ENXIO)
+                try:
+                    os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+                    stuck.append(str(path))
+                except OSError:
+                    pass
+            timers.append(threading.Timer(10, release))
+            timers[-1].daemon = True
+            timers[-1].start()
+        for replace, result in ((fifo, "installed"), (lambda path: os.symlink(decoy, path), "already_current")):
+            posted = []
+            with self.swap_after_lookup(replace):
+                out = self.install(files=("ah.py",), posted=posted)
+            for timer in timers:
+                timer.cancel()
+            self.assertEqual(stuck, [])  # it never waited on the FIFO
+            self.assertEqual(out["codex_unchecked"], ["ah.py"])
+            self.assertNotIn("codex_differs", out)  # nor hashed the decoy through the link
+            self.recorded(out, result, posted)
+            os.unlink(self.codex / "ah.py")
+            (self.codex / "ah.py").write_bytes(self.base_bytes("ah.py"))
+
+    def test_an_unreadable_codex_directory_never_stops_a_run_from_being_recorded(self):  # AC-3, NEG-26
+        self.make_codex()
+        # ~/.codex/agent-harness unsearchable: each copy's lookup fails; then ~/.codex itself: the directory check fails
+        for folder, result, unchecked in ((self.codex, "installed", ["ah.py"]),
+                                          (self.codex.parent, "already_current", ["~/.codex/agent-harness"])):
+            folder.chmod(0)
+            try:
+                posted = []
+                out = self.install(files=("ah.py",), posted=posted)
+            finally:
+                folder.chmod(0o755)
+            self.assertEqual(self.live("ah.py"), sha(self.base_bytes("ah.py") + b"\n# c1\n"))
+            self.assertEqual(out["codex_unchecked"], unchecked)
+            self.recorded(out, result, posted)
+
+    def test_a_drift_report_that_fails_some_other_way_never_stops_an_install_from_being_recorded(self):  # AC-3, NEG-26
+        self.make_codex()
+        posted = []
+        with mock.patch.object(ai, "codex_home_elsewhere", side_effect=RuntimeError("boom")):
+            out = self.install(files=("ah.py",), posted=posted)
+        self.assertEqual(self.live("ah.py"), sha(self.base_bytes("ah.py") + b"\n# c1\n"))
+        self.assertEqual(out["codex_differs"], ["ah.py"])  # what was checked before the failure is still reported
+        self.assertEqual(out["codex_unchecked"], ["(RuntimeError)"])
+        self.recorded(out, "installed", posted)
 
     def test_a_rerun_at_the_same_commit_is_already_current_with_no_backup_stage_or_lock(self):  # AC-9
         first = self.install(files=("ah.py", "command_guard.py"))

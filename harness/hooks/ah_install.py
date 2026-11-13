@@ -52,6 +52,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -1007,18 +1008,56 @@ def _plan_for(names, sources, state, run):
     return plan
 
 
-def codex_differs(home, plan):
+def codex_differs(home, plan, unchecked=None):
     """`--host local`: names of this run whose Codex harness copy exists and differs from the bytes just installed. Read only;
-    a missing Codex directory, a missing copy or a symlink is not listed."""
-    folder = Path(home).joinpath(*CODEX_DIR)
-    if not folder.is_dir() or folder.is_symlink():
+    a missing Codex directory, a missing copy or a symlink is not listed. A copy (or the directory) that cannot be read, or
+    that goes away or changes type while it is read, is never fatal and is never followed or waited on: its name goes into
+    `unchecked` (goodqa#15913 r5 F1). lstat, not is_dir/is_file: newer Pythons answer False for a permission error there,
+    which would hide an unreadable copy."""
+    unchecked = [] if unchecked is None else unchecked
+    folder, out = Path(home).joinpath(*CODEX_DIR), []
+    try:
+        if not stat.S_ISDIR(folder.lstat().st_mode):
+            return []  # a symlink or a file is not listed
+    except (FileNotFoundError, NotADirectoryError):
         return []
-    out = []
+    except OSError:
+        unchecked.append("~/" + "/".join(CODEX_DIR))
+        return []
     for name, item in plan.items():
         path = folder / name
-        if path.is_file() and not path.is_symlink() and sha256(path.read_bytes()) != item["new_sha"]:
+        try:
+            if not stat.S_ISREG(path.lstat().st_mode):
+                continue  # a symlink is not listed
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            unchecked.append(name)
+            continue
+        try:
+            digest = _regular_file_sha(path)
+        except OSError:
+            digest = None
+        if digest is None:
+            unchecked.append(name)  # unreadable, or removed or swapped for a link or a FIFO after the lstat
+        elif digest != item["new_sha"]:
             out.append(name)
     return sorted(out)
+
+
+def _regular_file_sha(path):
+    """sha256 of a regular file, or None when the path is not one (a FIFO or device swapped in after a lookup). Opened
+    without following a symlink (OSError) and without blocking on a FIFO; hashed in chunks, so a huge file costs no memory."""
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: os.read(fd, 1 << 20), b""):
+            digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
 
 
 def codex_home_elsewhere(home):
@@ -1035,18 +1074,28 @@ def _add_note(extra, note):
 
 
 def _with_codex_note(home, remote, plan, extra):
+    """The Codex drift report for `--host local`. It runs after the files are live and before finish(), so it must never
+    raise: a failure is reported as "could not be checked" and the real result is still recorded (goodqa#15913 r5 F1)."""
     if remote.root != "claude":
         return extra
-    differs = codex_differs(home, plan)
-    if differs:
-        extra["codex_differs"] = differs
-        _add_note(extra, "the Codex harness copies of %s on this machine differ from the installed bytes; install them with --host "
-                         "local-codex" % ", ".join(differs[:10]))
-    elsewhere = codex_home_elsewhere(home)
-    if elsewhere:
-        extra["codex_home"] = elsewhere[:300]
-        _add_note(extra, "CODEX_HOME is set to %s: Codex loads its harness from there, and this drift report read ~/%s "
-                         "instead" % (elsewhere[:200], "/".join(CODEX_DIR)))
+    unchecked = []
+    try:
+        differs = codex_differs(home, plan, unchecked)
+        if differs:
+            extra["codex_differs"] = differs
+            _add_note(extra, "the Codex harness copies of %s on this machine differ from the installed bytes; install them with "
+                             "--host local-codex" % ", ".join(differs[:10]))
+        elsewhere = codex_home_elsewhere(home)
+        if elsewhere:
+            extra["codex_home"] = elsewhere[:300]
+            _add_note(extra, "CODEX_HOME is set to %s: Codex loads its harness from there, and this drift report read ~/%s "
+                             "instead" % (elsewhere[:200], "/".join(CODEX_DIR)))
+    except Exception as error:  # noqa: BLE001 - a drift report never stops the real result from being recorded
+        unchecked.append("(%s)" % type(error).__name__)
+    if unchecked:
+        extra["codex_unchecked"] = unchecked[:20]
+        _add_note(extra, "the Codex drift could not be checked for %s (unreadable, or removed while it was read)"
+                  % ", ".join(unchecked[:10]))
     return extra
 
 
