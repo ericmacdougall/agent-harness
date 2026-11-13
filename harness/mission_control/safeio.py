@@ -77,9 +77,6 @@ class Runner:
         if kind == "ah-status" and len(args) == 1 and SESSION_RE.match(str(args[0])):
             # read-only: the evidence-only status report of one session (deploys, live tests, blockers)
             return [self.python, "-I", self.ah, "status", "--session", str(args[0]), "--since", "12h"]
-        if kind == "ops-watch-active" and not args:
-            # read-only: the active alerts of the ops-watch ring (goodqa#15934); no other ops_watch verb is reachable
-            return [self.python, "-I", str(Path(self.ah).with_name("ops_watch.py")), "active", "--json"]
         if kind == "gh-user" and not args:
             return [self.gh, "api", "user", "--method", "GET"]
         if kind == "gh-events" and len(args) == 1 and LOGIN_RE.match(str(args[0])):

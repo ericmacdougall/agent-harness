@@ -261,8 +261,6 @@ class DemoRunner:
             return 0, json.dumps(status_payload(time.time()))
         if kind == "ah-ticket-get" and len(args) == 1:
             return 0, json.dumps({"issue": {"closedAt": None, "archivedAt": None}})
-        if kind == "ops-watch-active" and not args:
-            return 0, json.dumps(alerts_payload(time.time()))
         if kind == "gh-user" and not args:
             return 1, ""  # the GitHub source shows as failing, so the page's error notice can be checked
         raise PermissionError(f"demo mode runs no commands ({kind})")
@@ -329,7 +327,7 @@ def status_payload(now: float) -> dict:
 
 
 def alerts_payload(now: float) -> list:
-    """Fixture alerts in the ops-watch `active --json` shape: one per severity, one that blocks main's stop."""
+    """Fixture alerts in the ring's row shape: one per severity, one that blocks main's stop. No file is read."""
     def row(seq, severity, key, message, age, **detail):
         return {"host": "demo", "source": "ops-watch", "event": "raise", "severity": severity, "key": key,
                 "message": message, "detail": detail, "seq": seq, "at": _iso(now - age)}

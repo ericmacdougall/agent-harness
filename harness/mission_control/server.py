@@ -338,7 +338,10 @@ class App:
         self.initiatives = col.Initiatives(self.hub, self.health, self.reader, initiatives)
         self.owners = col.Owners(self.hub, self.health, self.runner, self.tailer,
                                  cap_path=HOOKS / "model_tiers.json")
-        self.alerts = col.Alerts(self.hub, self.health, self.runner)
+        # in demo mode the ring of this machine is never read: fixture rows only
+        self.alerts = col.Alerts(self.hub, self.health,
+                                 (lambda: {"rows": demo_mode.alerts_payload(time.time()), "last_run": time.time() - 120})
+                                 if demo else (lambda: col.read_ring_active(home)))
         self.supervised = None
         if not demo:
             owner_root = home / '.agent-harness' / 'codex-owners'

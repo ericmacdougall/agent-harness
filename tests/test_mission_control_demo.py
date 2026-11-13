@@ -102,8 +102,7 @@ class Guards(Base):
             app.asks.run(now)
             app.codex.step()
         self.assertTrue(app.demo)
-        self.assertEqual({k for k, _ in app.runner.calls} - {"ah-owners", "ah-ticket-comments", "ah-ticket-get", "gh-user", "ops-watch-active",
-                                                               "provenance-asks"}, set())
+        self.assertEqual({k for k, _ in app.runner.calls} - {"ah-owners", "ah-ticket-comments", "ah-ticket-get", "gh-user", "provenance-asks"}, set())
         self.assertEqual(len(app.asks.items), len(demo.ASKS))  # canned "Needs you" fixture, no process
         with self.assertRaises(PermissionError):
             app.runner.run("remote-wal-probe")

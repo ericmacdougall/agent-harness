@@ -585,7 +585,7 @@ class Owners(Collector):
         super().__init__(hub, health)
         self.runner, self.tailer = runner, tailer
         self.cap_path = cap_path  # the installed tier policy; None: the cap is not shown
-        self.capacity = capacity([], None)
+        self.capacity = unknown_capacity()  # not read yet: the page says so, it never shows zero owners
         self.rows: list[dict] = []
         self.states: dict[str, str] = {}
         self.session = ""
@@ -634,8 +634,15 @@ class Owners(Collector):
             return self._tick(now)
         except Exception:
             self.claude_rows = [{**row, 'source_stale': True} for row in self.claude_rows]
+            if self.capacity.get("known"):
+                self._capacity(dict(self.capacity, stale=True))  # an old count never looks current
             self.publish()
             raise
+
+    def _capacity(self, summary: dict) -> None:
+        if summary != self.capacity:
+            self.capacity = summary
+            self.hub.snapshot("capacity", dict(summary))
 
     def _tick(self, now: float):
         code, out = self.runner.run("ah-owners", timeout=30)
@@ -645,10 +652,8 @@ class Owners(Collector):
         if not isinstance(data, dict) or not isinstance(data.get('owners'), list):
             raise ValueError('invalid Claude owner snapshot')
         self.session = str(data.get("session") or "")
-        summary = capacity(data["owners"], read_owner_cap(self.cap_path) if self.cap_path else None)
-        if summary != self.capacity:
-            self.capacity = summary
-            self.hub.snapshot("capacity", dict(summary))
+        self._capacity(capacity(data["owners"], read_tier_policy(self.cap_path) if self.cap_path else None,
+                                data.get("hidden")))
         rows = []
         for row in data.get("owners") or []:
             if not isinstance(row, dict):
@@ -1190,69 +1195,149 @@ ALERT_CLASS_RE = re.compile(r"[a-z][a-z0-9_-]{0,23}(?=:|$)")
 ALERT_AT_RE = re.compile(r"\d{4}-\d\d-\d\dT[0-9:.+Z-]{1,30}")
 AGENT_RE = re.compile(r"[A-Za-z0-9_-]{1,40}")
 OWNER_CAP_MAX = 64
+WATCHER_LATE_S = 1800  # ops-watch runs every few minutes; half an hour without a run means its alerts may be out of date
 
 
-def read_owner_cap(path) -> int | None:
-    """caps.session_owner_agents of the installed tier policy, or None when it cannot be read as a small positive
-    integer. One bounded read; a symlink is never followed. Unknown stays unknown: the page then shows no cap."""
+def read_tier_policy(path) -> dict | None:
+    """The installed tier policy (model_tiers.json) as a dict, or None. One bounded read; a symlink is never followed."""
     try:
         fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 return None
-            raw = os.read(fd, 256 * 1024)
+            data = json.loads(os.read(fd, 256 * 1024))
         finally:
             os.close(fd)
-        cap = json.loads(raw).get("caps", {}).get("session_owner_agents")
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError):
         return None
+    return data if isinstance(data, dict) else None
+
+
+def read_owner_cap(path) -> int | None:
+    """caps.session_owner_agents of the installed tier policy, or None when it is not a small positive integer.
+    Unknown stays unknown: the page then says the cap is not known."""
+    policy = read_tier_policy(path) or {}
+    caps = policy.get("caps") if isinstance(policy.get("caps"), dict) else {}
+    cap = caps.get("session_owner_agents")
     return cap if type(cap) is int and 0 < cap <= OWNER_CAP_MAX else None
 
 
-def capacity(rows, cap) -> dict:
-    """The owner cap line (goodqa#15934 AC-4), from the rows `ah owners` already returned. An owner holds a slot
-    while it is live; a silent or dropped owner with no recorded disposition needs a decision. The spawn gate keeps
-    its own count (tier_gate.live_owner_ids); this one says where it came from."""
-    live = silent = decisions = 0
-    for row in rows if isinstance(rows, list) else []:
-        if not isinstance(row, dict) or row.get("owner") is not True:
+def _gate():
+    """The spawn gate's own module (tier_gate.py, beside ah.py), or None when it cannot be loaded."""
+    try:
+        import tier_gate  # noqa: PLC0415 - lives with the hooks; the server puts them on sys.path
+        return tier_gate
+    except Exception:  # noqa: BLE001 - a partial install: capacity is then unknown, never guessed
+        return None
+
+
+def holds_slot(gate, row: dict, policy: dict) -> bool:
+    """The slot rule of tier_gate.live_owner_ids, row by row (a parity test fails if the two ever disagree): an
+    owner-type agent that is running, or quiet but not stale, holds a slot unless main disposed of it while silent."""
+    state = str(row.get("state") or "")
+    idle = gate._counts_while_idle(row)
+    return bool(gate.counts_as_owner(row.get("type"), policy, row.get("owner"))
+                and (state.startswith(gate.RUNNING_STATES) or idle)
+                and (state.startswith(("live", "working", "quiet")) or idle or not gate._slot_freed(row)))
+
+
+def unknown_capacity(error: str = "") -> dict:
+    return {"known": False, "cap": None, "held": 0, "live": 0, "silent": 0, "decisions": 0, "full": False,
+            "floor": False, "stale": False, "error": error, "source": "ah owners"}
+
+
+def capacity(rows, policy, hidden=0) -> dict:
+    """The owner cap line (goodqa#15934 AC-4), from the rows `ah owners` already returned and the spawn gate's own
+    slot rule. `held` is what the gate would count over these rows; `ah owners` lists a recent window, so with rows
+    hidden the count is a floor and says so. Without the gate's rule the capacity is unknown, never approximated."""
+    gate = _gate()
+    if gate is None:
+        return unknown_capacity("the spawn gate's slot rule could not be loaded")
+    if not isinstance(rows, list):
+        return unknown_capacity("ah owners returned no owner list")
+    policy = policy if isinstance(policy, dict) else {}
+    caps = policy.get("caps") if isinstance(policy.get("caps"), dict) else {}
+    cap = caps.get("session_owner_agents")
+    cap = cap if type(cap) is int and 0 < cap <= OWNER_CAP_MAX else None
+    held = live = silent = decisions = 0
+    for row in rows:
+        if not isinstance(row, dict):
             continue
         state = str(row.get("state") or "")
-        quiet = state.startswith("SILENT")
-        if state == "live":
-            live += 1
-        elif quiet:
-            silent += 1
-        if row.get("decision_required") is True or (
-                (quiet or state.startswith("DROPPED")) and not isinstance(row.get("disposition"), dict)):
+        try:
+            slot = holds_slot(gate, row, policy)
+        except Exception:  # noqa: BLE001 - one malformed row never decides the count
+            return unknown_capacity("an owner row could not be judged by the spawn gate's rule")
+        if slot:
+            held += 1
+            if state.startswith("SILENT"):
+                silent += 1
+            else:
+                live += 1
+        owner = gate.counts_as_owner(row.get("type"), policy, row.get("owner"))
+        if owner and (row.get("decision_required") is True or (
+                state.startswith(("SILENT", "DROPPED")) and not isinstance(row.get("disposition"), dict))):
             decisions += 1
-    cap = cap if type(cap) is int and 0 < cap <= OWNER_CAP_MAX else None
-    return {"cap": cap, "live": live, "silent": silent, "decisions": decisions,
-            "over": bool(cap is not None and live > cap), "source": "ah owners"}
+    return {"known": True, "cap": cap, "held": held, "live": live, "silent": silent, "decisions": decisions,
+            "full": bool(cap is not None and held >= cap), "floor": type(hidden) is int and hidden > 0,
+            "stale": False, "error": "", "source": "ah owners"}
+
+
+def read_ring_active(home: Path) -> dict:
+    """The active alerts of this machine's ops-watch ring, read in process: {"rows": [...], "last_run": ts or None}.
+
+    Read-only by construction: one bounded pread of the ring and one of the watcher's state file, through ops-watch's
+    own readers. No ops-watch command is run (its `active` verb loads the config and writes an internal-error row
+    to the ring when that fails, so a dashboard poll could push real alerts out of the ring). A ring that is missing,
+    empty, not a regular file or holds no readable row raises: that is unknown, never "no alerts"."""
+    import ops_watch  # noqa: PLC0415 - lives with the hooks; the server puts them on sys.path
+    path = ops_watch.ring_path(home)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        raise ValueError("the alert ring does not exist: ops-watch has not written on this machine") from None
+    except OSError as exc:
+        raise ValueError(f"the alert ring could not be checked ({type(exc).__name__})") from None
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("the alert ring is not a regular file")
+    try:
+        data = ops_watch.safe_read(path, ops_watch.RING_SLOTS * ops_watch.SLOT_BYTES)
+    except OSError as exc:
+        raise ValueError(f"the alert ring could not be read ({type(exc).__name__})") from None
+    events = ops_watch._parse_slots(data)
+    if not events:
+        raise ValueError("the alert ring holds no readable row")
+    rows = []
+    for (host, _source, _key), event in ops_watch.latest_by_key(events).items():
+        if event.get("event") == "raise":
+            rows.append(dict(ops_watch.compact(event), host=host))
+    last_run = ops_watch.load_state(home).get("last_run")
+    return {"rows": rows, "last_run": last_run if isinstance(last_run, (int, float)) and not isinstance(last_run, bool)
+            and last_run > 0 else None}
 
 
 class Alerts(Collector):
-    """The ops-watch ring's active alerts (goodqa#15934): `ops_watch.py active --json`, read-only.
+    """The ops-watch ring's active alerts (goodqa#15934), read-only.
 
     The ring already holds what the guards and watchers of the last week raise (silent owners, due asks, merged but
     not deployed, open PENDING ids, disk and memory, drifted hooks, failed remote timers), and Mission Control had no
-    read path for it. One bounded read per cadence, never on a client request. Only named fields leave: the detail
-    object is not forwarded, text is redacted and clipped, an unknown severity is shown as info and never promoted.
-    A failing read keeps the last good rows marked stale; a first read that fails is unknown, never "no alerts"."""
+    read path for it. One bounded in-process read per cadence, never on a client request, and no process is started.
+    Only named fields leave: the detail object is not forwarded, text is redacted and clipped, an unknown severity is
+    shown as info and never promoted. A failing read keeps the last good rows marked stale; a first read that fails
+    is unknown, never "no alerts". The watcher's own last run is carried, so a stopped watcher does not look calm."""
     name = "alerts"
     interval = 60.0
     idle_interval = 300.0
-    LIMIT = 2 * 1024 * 1024  # the ring is 1 MiB; more output is refused, never cut into valid-looking data
     MAX_ROWS = 200
     MAX_KEY = 200
     MAX_MESSAGE = 600
     MAX_CLASSES = 24
 
-    def __init__(self, hub, health, runner):
+    def __init__(self, hub, health, read):
         super().__init__(hub, health)
-        self.runner = runner
+        self.read = read  # () -> {"rows": [...], "last_run": ts or None}; raises when the ring cannot be trusted
         self.view = {"items": [], "total": 0, "truncated": False, "counts": dict.fromkeys(SEVERITIES, 0),
-                     "classes": {}, "stale": False, "error": "", "at": ""}
+                     "classes": {}, "stale": False, "error": "", "at": "", "watcher_at": "", "watcher_late": False}
         self.sig = None
 
     @staticmethod
@@ -1271,29 +1356,31 @@ class Alerts(Collector):
         seq = raw.get("seq")
         return {"key": ev.short(key, Alerts.MAX_KEY), "cls": cls.group(0) if cls else "other",
                 "severity": raw.get("severity") if raw.get("severity") in SEVERITIES else "info",
-                "host": ev._word(str(raw.get("host") or "")[:64]), "message": message,
-                "at": at if ALERT_AT_RE.fullmatch(at) else "",
+                "host": ev._word(ev.short(raw.get("host") if isinstance(raw.get("host"), str) else "", 64)),
+                "message": message, "at": at if ALERT_AT_RE.fullmatch(at) else "",
                 "seq": seq if type(seq) is int and seq >= 0 else 0,
                 "agent": agent if isinstance(agent, str) and AGENT_RE.fullmatch(agent) else "",
                 "stop_block": detail.get("stop_block") is True,
                 "ticket": ticket if isinstance(ticket, str) and TICKET_RE.match(ticket) else _ticket_in(message)}
 
-    def _read(self) -> dict:
-        code, out = self.runner.run("ops-watch-active", timeout=20, limit=self.LIMIT + 1)
-        if code != 0:
-            raise ValueError(f"ops-watch active exited {code}")
-        raw = out.encode("utf-8", "replace") if isinstance(out, str) else bytes(out or b"")
-        if len(raw) > self.LIMIT:
-            raise ValueError(f"ops-watch output is over {self.LIMIT // 1024} KiB")
+    @staticmethod
+    def _when(at: str) -> float:
+        """Seconds since the epoch of a row's `at`, whatever its offset; 0 when it is not a time."""
         try:
-            data = json.loads(raw)
-        except ValueError:
-            raise ValueError("ops-watch active returned unreadable output") from None
-        if not isinstance(data, list):
-            raise ValueError("ops-watch active returned an unexpected shape")
-        rows = [r for r in map(self.row, data) if r]
+            from datetime import datetime, timezone  # noqa: PLC0415
+            stamp = datetime.fromisoformat(at.replace("Z", "+00:00"))
+            return (stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)).timestamp()
+        except (ValueError, TypeError, OverflowError):
+            return 0.0
+
+    def _build(self, data, now: float) -> dict:
+        if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
+            raise ValueError("the alert ring read returned an unexpected shape")
+        if len(data["rows"]) > 4096:
+            raise ValueError("the alert ring read returned more rows than a ring can hold")
+        rows = [r for r in map(self.row, data["rows"]) if r]
         rows.sort(key=lambda r: r["key"])
-        rows.sort(key=lambda r: r["at"], reverse=True)
+        rows.sort(key=lambda r: self._when(r["at"]), reverse=True)
         rows.sort(key=lambda r: SEVERITIES.index(r["severity"]))
         counts = dict.fromkeys(SEVERITIES, 0)
         classes: dict[str, int] = {}
@@ -1301,12 +1388,16 @@ class Alerts(Collector):
             counts[r["severity"]] += 1
             classes[r["cls"]] = classes.get(r["cls"], 0) + 1
         top = sorted(classes.items(), key=lambda kv: (-kv[1], kv[0]))[:self.MAX_CLASSES]
+        last_run = data.get("last_run")
+        known = isinstance(last_run, (int, float)) and not isinstance(last_run, bool) and 0 < last_run <= now + 300
         return {"items": rows[:self.MAX_ROWS], "total": len(rows), "truncated": len(rows) > self.MAX_ROWS,
-                "counts": counts, "classes": dict(sorted(top))}
+                "counts": counts, "classes": dict(sorted(top)),
+                "watcher_at": ev.iso(last_run) if known else "",
+                "watcher_late": bool(known and now - last_run > WATCHER_LATE_S)}
 
     def tick(self, now: float):
         try:
-            self.view = dict(self._read(), stale=False, error="", at=ev.iso(now))
+            self.view = dict(self._build(self.read(), now), stale=False, error="", at=ev.iso(now))
         except Exception as exc:  # noqa: BLE001 - a failed read keeps its last good rows
             self.view = dict(self.view, stale=bool(self.view.get("at")), error=ev.short(str(exc), 160))
             self.publish()
@@ -1318,7 +1409,7 @@ class Alerts(Collector):
         return dict(self.view)
 
     def publish(self) -> None:
-        sig = json.dumps({k: v for k, v in self.view.items() if k != "at"}, sort_keys=True)
+        sig = json.dumps({k: v for k, v in self.view.items() if k not in ("at", "watcher_at")}, sort_keys=True)
         if sig != self.sig:
             self.sig = sig
             self.hub.snapshot("alerts", self.snapshot())

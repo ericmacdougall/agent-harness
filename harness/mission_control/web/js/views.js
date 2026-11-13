@@ -75,8 +75,13 @@ export function mountViews() {
     if (!box) return;
     if (!force && box.contains(document.activeElement) && document.activeElement !== document.body) return;  // never pull a focused control away
     const open = new Set([...box.querySelectorAll('details[open]')].map(d => `${d.closest('[data-id]')?.dataset.id || ''}:${d.className}`));
+    const refocus = section.id === 'alerts-list' && box.contains(document.activeElement) ? o.refocusSelectors(document.activeElement) : [];
     const nodes = section.build(state, ui, go);
     box.replaceChildren(...nodes);
+    for (const selector of refocus) {  // a keyboard user keeps their place after a filter or show-more click
+      const target = box.querySelector(selector);
+      if (target) { target.focus(); break; }
+    }
     box.querySelectorAll('details').forEach(d => { if (open.has(`${d.closest('[data-id]')?.dataset.id || ''}:${d.className}`)) d.open = true; });
   }
   const forced = new Set();

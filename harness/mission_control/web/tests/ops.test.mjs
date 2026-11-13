@@ -10,7 +10,7 @@ const here = new URL('..', import.meta.url).pathname;
 const NOW = Date.parse('2026-11-13T12:00:00Z');
 const iso = s => new Date(NOW - s * 1000).toISOString();
 const row = (key, severity = 'high', extra = {}) => ({ key, cls: key.split(':')[0], severity, host: 'mac', message: `message of ${key}`, at: iso(120), seq: 1, agent: '', stop_block: false, ticket: '', ...extra });
-const snap = (items, extra = {}) => ({ items, total: items.length, truncated: false, counts: { critical: 0, high: items.length, warning: 0, info: 0 }, classes: {}, stale: false, error: '', at: iso(30), ...extra });
+const snap = (items, extra = {}) => ({ items, total: items.length, truncated: false, counts: { critical: 0, high: items.length, warning: 0, info: 0 }, classes: {}, stale: false, error: '', at: iso(30), watcher_at: '', watcher_late: false, ...extra });
 const ui = (over = {}) => ({ alertsLimit: 8, alertSeverity: 'all', set(k, v) { this[k] = v; }, more(k) { this[k] += 8; }, ...over });
 const state = (alerts, capacity = null) => ({ now: NOW, alerts: o.adaptAlerts(alerts), capacity: o.adaptCapacity(capacity) });
 
@@ -64,7 +64,7 @@ test('hostile text never becomes an element or an attribute that loads anything'
     created.length = 0;
     const hostile = { key: payload, cls: payload, severity: payload, host: payload, message: payload, at: payload, seq: payload, agent: payload, stop_block: payload, ticket: payload };
     const s = state({ items: [hostile, null, 7, 'x'], total: payload, truncated: payload, counts: { critical: payload }, classes: { [payload]: payload }, stale: payload, error: payload, at: iso(5) },
-      { cap: payload, live: payload, silent: payload, decisions: payload, over: payload, source: payload });
+      { known: true, cap: payload, held: payload, live: payload, silent: payload, decisions: payload, full: payload, floor: payload, stale: payload, error: payload, source: payload });
     const out = [...o.alertsPanel(s, ui()), ...o.capacityLine(s)];
     assert.ok(text(out).length > 0);
     assert.deepEqual([...new Set(created)].filter(t => !allowed.has(t)), [], payload.slice(0, 20));
@@ -77,15 +77,45 @@ test('an unknown severity is shown as info, never promoted', () => {
   assert.deepEqual(a.items.map(i => i.severity), ['info', 'info']);
 });
 
-test('the capacity line shows live owners against the cap, silent owners and decisions, with its source', () => {
+test('the capacity line shows held slots against the cap by the gate rule, and never a guess', () => {
   const line = cap => text(o.capacityLine(state(null, cap)));
-  const full = line({ cap: 8, live: 4, silent: 1, decisions: 2, over: false, source: 'ah owners' });
-  for (const needle of ['4 of 8', '1 silent', '2 need a decision', 'ah owners']) assert.ok(full.includes(needle), needle);
-  assert.match(line({ cap: 8, live: 9, silent: 0, decisions: 0, over: true, source: 'ah owners' }), /over the cap/i);
-  const unknown = line({ cap: null, live: 3, silent: 0, decisions: 0, over: false, source: 'ah owners' });
-  assert.match(unknown, /3 live/);
-  assert.match(unknown, /cap not known/i);
+  const base = { known: true, cap: 8, held: 4, live: 3, silent: 1, decisions: 2, full: false, floor: false, stale: false, error: '', source: 'ah owners' };
+  const full = line(base);
+  for (const needle of ['4 of 8 held', '1 silent', '2 need a decision', 'ah owners', "spawn gate's slot rule"]) assert.ok(full.includes(needle), needle);
+  assert.doesNotMatch(full, /cap reached|at least|last good/);
+  assert.match(line({ ...base, held: 8, full: true }), /8 of 8 held · cap reached/);
+  assert.match(line({ ...base, floor: true }), /at least 4 of 8 held/);
+  assert.match(line({ ...base, floor: true }), /this is a floor/);
+  assert.match(line({ ...base, stale: true }), /last good count/);
+  const noCap = line({ ...base, cap: null, full: true });
+  assert.match(noCap, /Owner slots held: 4 · cap not known/);
+  assert.doesNotMatch(noCap, /cap reached/);
   assert.match(line(null), /not been read yet/i);
+  assert.match(line({ known: false, error: '' }), /not been read yet/i);
+  const unknown = line({ known: false, held: 0, error: "the spawn gate's slot rule could not be loaded" });
+  assert.match(unknown, /not known \(the spawn gate's slot rule could not be loaded\)/);
+  assert.doesNotMatch(unknown, /\b0\b/);   // unknown is never shown as zero owners
+});
+
+test('a watcher that stopped running is said so; an unknown run time is said so', () => {
+  const late = text(o.alertsPanel(state(snap([row('mem:swap')], { watcher_at: iso(7200), watcher_late: true })), ui()));
+  assert.match(late, /ops-watch last ran 2 h ago\. Its alerts may be out of date/);
+  const unknown = text(o.alertsPanel(state(snap([row('mem:swap')])), ui()));
+  assert.match(unknown, /last ops-watch run is not known/);
+  const fine = text(o.alertsPanel(state(snap([row('mem:swap')], { watcher_at: iso(60), watcher_late: false })), ui()));
+  assert.doesNotMatch(fine, /ops-watch last ran|not known/);
+});
+
+test('after a repaint the focus goes back to the same chip, or to show more, or to the last row', () => {
+  const chip = { dataset: { severity: 'high' }, classList: { contains: () => false } };
+  assert.deepEqual(o.refocusSelectors(chip), ['[data-severity="high"]']);
+  assert.deepEqual(o.refocusSelectors({ dataset: { severity: 'all' }, classList: { contains: () => false } }), ['[data-severity="all"]']);
+  assert.deepEqual(o.refocusSelectors({ dataset: {}, classList: { contains: c => c === 'more-button' } }), ['.more-button', '.alert-row:last-child']);
+  for (const other of [null, { dataset: { severity: '"] , body, [x="' }, classList: { contains: () => false } }, { dataset: {}, classList: { contains: () => false } }]) assert.deepEqual(o.refocusSelectors(other), []);
+  const views = readFileSync(`${here}js/views.js`, 'utf8');
+  assert.ok(views.includes('o.refocusSelectors(document.activeElement)'));
+  const rows = walk(o.alertsPanel(state(snap([row('a:1')], { watcher_at: iso(60) })), ui())).filter(n => n.tagName === 'LI');
+  assert.equal(rows[0].attrs.tabindex, '-1');   // a row can take the focus when "show more" is gone
 });
 
 test('the page wires both snapshots: seed, SSE listeners, sections, markup and coverage', () => {
