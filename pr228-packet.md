@@ -1,6 +1,6 @@
 # PR review packet: ops_watch capabilities subcommand for the fabd installer gate (agent-harness PR 228, GoodQA goodqa#15835)
 
-Base: a810795de1348761ad48de35ed4e49a8fb1f7d50 (merge of PR 227 and the merge base with origin/main; use `--snapshot-base a810795de1348761ad48de35ed4e49a8fb1f7d50`). Head: a8fbf5361532418e2258f533cd401b4038bccb16 (branch af9e-ops-capabilities). Claude-authored: `--author-harness claude`.
+Base: 1eba3e291c1f8bac2613e74515a360ecb933eeb8 (origin/main, the merge of PR 230, and the merge base; use `--snapshot-base 1eba3e291c1f8bac2613e74515a360ecb933eeb8`). Head: 6ea3789fd39c90ca186ca864467cb9f57f01afe8 (branch af9e-ops-capabilities; it is a plain merge of origin/main 1eba3e29 into the previously reviewed head a8fbf5361532418e2258f533cd401b4038bccb16, no history rewritten, no conflict; the PR's own diff against main is unchanged). Claude-authored: `--author-harness claude`.
 Changed code paths: harness/hooks/ops_watch.py (the `capabilities()` function, a `capabilities` subparser, an early branch in `main()`), tests/test_ops_watch_capabilities.py (new), tests/mutants_ops_capabilities.py (new), notes/goodqa-15835/ (spec.md, review-opus.md, review-sonnet.md). The last two commits add only spec text and review reports after the code at 1dde69e0.
 
 ## Outcome
@@ -18,7 +18,12 @@ KNOWN LIMITS (spec Risks, follow-up goodqa#15837 linked to goodqa#15805): the pr
 
 Risk and rollback: revert the commits; the change only adds a read-only subcommand.
 
-## Validation (exact head a8fbf5361532418e2258f533cd401b4038bccb16, code as at 1dde69e0, run in the owner worktree)
+## Validation (exact head 6ea3789fd39c90ca186ca864467cb9f57f01afe8 = the reviewed head merged with origin/main 1eba3e29, run in the owner worktree)
+$ python3 -B -m unittest tests.test_ops_watch tests.test_ops_watch_point_events tests.test_ops_watch_forward tests.test_ops_watch_capabilities
+Ran 160 tests in 137.140s
+OK
+exit 0
+(the run at the exact head; the older runs below were at the reviewed head before the merge)
 $ python3 -B -m unittest tests.test_ops_watch_capabilities
 Ran 7 tests in 0.733s
 OK
