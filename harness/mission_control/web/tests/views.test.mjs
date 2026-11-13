@@ -205,3 +205,41 @@ test('requirement text is isolated for bidirectional scripts (dir=auto)', () => 
   const node = v.longText('‮evil', 'x', 240);
   assert.ok(walk(node).some(n => n.attrs.dir === 'auto'));
 });
+
+test('live regions: activity is announced only as a batch every 4.5 s, and only the named regions exist', () => {
+  const regions = [...html.matchAll(/id="([a-z-]+)"[^>]*aria-live="polite"/g)].map(m => m[1]).sort();
+  assert.deepEqual(regions, ['activity-announcer', 'chat-announcer', 'connection-announcer', 'needs-announcer', 'requirement-announcer']);
+  assert.match(readFileSync(`${here}js/activity.js`, 'utf8'), /\}, 4500\)/);
+  for (const f of ['ledger-views.js', 'adapt.js']) assert.ok(!/announcer/.test(readFileSync(`${here}js/${f}`, 'utf8')), `${f} must not announce`);
+  assert.match(readFileSync(`${here}js/views.js`, 'utf8'), /requirement-announcer/);
+});
+
+test('the scene loads only through a guarded dynamic import, so a missing WebGL or bundle cannot blank the page', () => {
+  const views = readFileSync(`${here}js/views.js`, 'utf8');
+  const main = readFileSync(`${here}js/main.js`, 'utf8');
+  assert.ok(!/from '\.\/scene\.js'/.test(main) && !/from '\.\/scene\.js'/.test(views));
+  assert.match(views, /import\('\.\/scene\.js'\)[\s\S]*\.catch\(/);
+  assert.match(html, /id="scene-load-note"/);
+});
+
+test('a repaint never pulls a focused control away or loses an open details element', () => {
+  const views = readFileSync(`${here}js/views.js`, 'utf8');
+  assert.match(views, /box\.contains\(document\.activeElement\)[^\n]*return/);
+  assert.match(views, /details\[open\]/);
+});
+
+test('the scripts POST only to the three known write routes', () => {
+  const routes = new Set();
+  for (const f of readdirSync(`${here}js`)) for (const m of readFileSync(`${here}js/${f}`, 'utf8').matchAll(/fetch\('([^']+)',\s*\{\s*method: 'POST'/g)) routes.add(m[1]);
+  assert.deepEqual([...routes].sort(), ['/api/approve', '/api/chat', '/api/requirements/archive']);
+  const map = JSON.parse(readFileSync(`${here}coverage.json`, 'utf8'));
+  assert.ok(map.routes['POST /api/requirements/archive'] && map.routes['POST /api/chat'] && map.routes['POST /api/approve']);
+  assert.ok(!/fetch\(/.test(readFileSync(`${here}js/ledger-views.js`, 'utf8')), 'the archive view calls no endpoint');
+});
+
+test('coverage names a control for every route and control the page has', () => {
+  const map = JSON.parse(readFileSync(`${here}coverage.json`, 'utf8'));
+  const ids = new Set([...html.matchAll(/id="([^"]+)"/g)].map(m => m[1]));
+  for (const [name, where] of [...Object.entries(map.routes), ...Object.entries(map.controls)]) assert.ok(ids.has(where), `${name} -> ${where}`);
+  for (const control of ['session pick', 'Claude or Codex switch', 'owner filter', 'event filters', 'pause feed', 'tool activity', 'theme', 'motion', 'requirement search', 'show more owners', 'show more asks']) assert.ok(map.controls[control], control);
+});

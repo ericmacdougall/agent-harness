@@ -66,3 +66,10 @@ test('a 401 on state shows signed out', async () => {
   assert.equal(store.getState().connection, 'expired');
   live.stop();
 });
+
+test('a flood of 500 events in one burst keeps the store bounded and fast', async () => {
+  const start = performance.now();
+  for (let i = 0; i < 500; i++) store.ingestEvent({ schema: 'mc.event/1', id: `flood:${i}`, ts: new Date().toISOString(), kind: 'wal', summary: `event ${i}`, severity: 'info', count: 1, actor: {}, subject: {} });
+  assert.ok(store.getState().events.length <= 150);
+  assert.ok(performance.now() - start < 500, `took ${performance.now() - start} ms`);
+});

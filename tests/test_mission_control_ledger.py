@@ -301,6 +301,11 @@ class Coverage(unittest.TestCase):
         self.assertEqual(sorted(set(state["asks"]) - set(mapping["asks"])), [])
         self.assertEqual(sorted(set(state["ledger"]) - set(mapping["ledger"])), [])
 
+    def test_the_docs_name_every_rule_and_the_write_route(self):
+        docs = (REPO / "docs" / "mission-control.md").read_text()
+        for needle in ("M archived by you", "R1", "R2", "R3", "R4", "POST /api/requirements/archive", "actions.jsonl"):
+            self.assertIn(needle, docs, needle)
+
     def test_the_page_never_polls_state_on_a_timer(self):
         live = (REPO / "harness" / "mission_control" / "web" / "js" / "live.js").read_text()
         self.assertNotIn("setInterval", live)

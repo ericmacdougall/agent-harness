@@ -28,20 +28,34 @@ Asks and requirements are live or archived by one deterministic rule (`archive.p
 
 | Rule | Archived when |
 | --- | --- |
+| M archived by you | you archived it from the page (see below). A restore keeps it live whatever the other rules say |
 | R1 terminal state | the record says resolved, closed, done, superseded, expired, declined or withdrawn; an ask has `resolved_at`; the sweeper cleared it as resolved or because its owner was reassigned |
-| R2 proven or closed | the newest deploy or live-test evidence is PASS, or the linked ticket is closed (from the sweeper's ticket cache). FAIL, UNSTATED and unknown never archive |
-| R3 superseded | a newer record of the same session (same owner for asks) has the same words |
-| R4 expired | an ask is past its own `until`, or a requirement is older than 30 days with no owner, ticket or evidence. The 30 days is an assumption, shown on the row ("moves to the archive in N d") before it applies |
+| R2 done live | a deploy and a live test bound to the same ticket or commit, the newest of each by time, the test passing and not older than the deploy; or its ticket is closed (from the sweeper's cache). A local REALLY_TESTED pass, a lone deploy, an unbound pair, a FAIL or UNSTATED test, or a reopened ticket never archives |
+| R3 superseded | a newer record of the same session (same owner for asks) has exactly the same full text, and that newer record is itself live. Near-duplicates stay live |
+| R4 expired | a requirement is older than 30 days with no owner, ticket or evidence and is not sourced to you (`user:` or `answer:`). The 30 days is an assumption, shown on the row ("moves to the archive in N d") before it applies |
 
-An ask that is only quiet for 72 hours stays live with a stale mark. The Archive view lists archived asks and requirements with who registered them, their source, the resolution or reason, the evidence id and the rule.
+An ask is never archived by age or by its `until`: an unanswered ask past its deadline stays in Needs you, answerable, with a stale mark. A requirement you stated yourself is never archived by age; if it has no owner it says so and waits for your own click. The Archive view lists archived asks and requirements with who registered them, their source, the resolution or reason, the evidence id and the rule. A missing who, when or source shows "unknown".
+
+#### Archive and restore (the one write path of the cleanup)
+
+Each requirement row has an Archive button (or Restore on an archived row). It opens a reason box (required, 1 to 300 characters) and a confirm button that stays disabled until there is a reason. `POST /api/requirements/archive` takes `req_id`, `action` (archive or restore), `reason`, the `digest` of the text the page showed and a `client_key`; it needs the session cookie, the exact Origin and the CSRF header like chat and approve. The server checks the requirement against its own ledger read and the digest, then appends one signed row to `~/.agent-harness/mission-control/requirements/actions.jsonl`:
+
+| Field | Meaning |
+| --- | --- |
+| `at`, `session`, `req`, `action`, `reason` | when, whose main session, which requirement, what, why (redacted) |
+| `rule` | always `manual` |
+| `origin`, `source` | `dashboard` and `mc:<session>/<row id> "Dashboard click: ..."`. It is a dashboard click, never the user's own words (`user:`) |
+| `digest`, `client_key`, `sig` | the text it was shown, the idempotency key, the HMAC with the install secret |
+
+The log only grows and is the audit trail. The latest verified row per requirement overrides the automatic rules, including on the next `ah requirements` read. A row with a bad signature, a wrong shape or a source that does not start with `mc:` is ignored. Nothing is written to the harness ledgers: the archive is a view you control.
 
 ### Ledger source
 
-`ah goals --json`, `ah requirements --session S` and `ah status --session S --since 12h` are read through three allowlisted read-only runner shapes by the Ledger collector: once per cadence (60 s with a page attached, 300 s without, plus the attach refresh; never on a client request), at most 1 MiB each, 60 goals with 12 evidence records each, 1000 requirements, 30 rows per status list. A failing source keeps its last good rows marked stale and shows in Source health. The snapshot is published as the SSE event `ledger` (and in `/api/state`) only when its content changed.
+`ah goals --json`, `ah requirements --session S` and `ah status --session S --since 12h` are read through three allowlisted read-only runner shapes by the Ledger collector: once per cadence (60 s with a page attached, 300 s without, plus the attach refresh; never on a client request), at most 1 MiB each (4 MiB for requirements), 60 goals with 12 evidence records each, 1000 requirements, 30 rows per status list. A failing source keeps its last good rows marked stale and shows in Source health. The snapshot is published as the SSE event `ledger` (and in `/api/state`) only when its content changed.
 
 ### Data with no UI today
 
-Peer-review receipts, full ticket comment threads (only checkpoint comments arrive, as feed events) and release-kit deploy records outside the WALs have no read path in Mission Control. `web/coverage.json` maps every `/api/state` key, SSE event and ledger field to the page section that shows it; a test fails when a new key has no section.
+Requirements of earlier sessions (only main's current session is read), the owner of a requirement (`ah requirements` leaves it empty, shown as no owner recorded), peer-review receipts, full ticket comment threads (only checkpoint comments arrive, as feed events) and release-kit deploy records outside the WALs have no read path in Mission Control. `web/coverage.json` maps every `/api/state` key, SSE event and ledger field to the page section that shows it; a test fails when a new key has no section.
 
 ## Run kit
 
