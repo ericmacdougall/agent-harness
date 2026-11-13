@@ -28,9 +28,12 @@ MUTANTS = {
     "tar extract mode is not recognised": ("            if reading and not create:", "            if False:"),
     "the last scp operand is not a destination": ("            if len(operands) >= 2:\n                skip.append(operands[-1])", "            if False:\n                skip.append(operands[-1])"),
     "grep -d recurse is not recursive": ("or self._grep_directories_recurse(texts))", ")"),
-    "rg option values are not skipped": ("            elif name == 'rg':\n                skip_next |= {", "            elif name == 'rg':\n                skip_next |= set() and {"),
-    "grep -d and -D values are not skipped": ("                skip_next |= {'-d', '-D', '--directories', '--devices'}", "                skip_next |= set()"),
-    "search with no path operand not judged": ("if recursive and not words and not reads_stdin and self.under_cred_parent(ctx.cwd, below=True):", "if False:"),
+    # the per-tool skip_next lists are defence in depth: the fail-closed working-directory check (no existing path operand) now
+    # catches the same searches, so removing a list entry is no longer observable and has no mutant of its own
+    "zip - is not the archive operand": ("operands = [w for w in words if not w.text.startswith('-') or w.text == '-']", "operands = [w for w in words if not w.text.startswith('-')]"),
+    "7z sources after the archive are skipped": ("                        skip.append(rest[0])", "                        skip.extend(rest)"),
+    "an unlisted option value does not fail closed": ("no_real_path = not words or not any(os.path.exists(norm_path(w.text, ctx)) for w in words)", "no_real_path = not words"),
+    "search with no path operand not judged": ("if recursive and no_real_path and not reads_stdin and self.under_cred_parent(ctx.cwd, below=True):", "if False:"),
     "no-path search ignores a key directory as cwd": ("not reads_stdin and self.under_cred_parent(ctx.cwd, below=True):", "not reads_stdin and self.under_cred_parent(ctx.cwd):"),
     "grep exempt when piped": ("reads_stdin = idx > 0 and name in ('rg', 'ag', 'ack')", "reads_stdin = idx > 0"),
     "rg --files treated as a print": ("'--files-with-matches', '--files-without-match', '--files'})\n", "'--files-with-matches', '--files-without-match'})\n"),

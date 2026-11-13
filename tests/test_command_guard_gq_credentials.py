@@ -54,11 +54,19 @@ DIRECTORY_NEIGHBOURS = ["grep -rc . ~/.config/goodqa", "grep -r . ~/.config/good
                         "tar -xzf pkg.tgz -C ~", "tar -xf x.tar -C /", "tar xzf pkg.tgz -C ~", "tar -tf pkg.tgz -C ~", "bsdtar -xf x.tar -C ~",
                         "pax -r -f x.tar", "unzip x.zip -d ~", "zip ~/out.zip project.txt"]
 # a search whose option takes a separate value still has no path operand (receipt r3 F2)
+ARCHIVES_TO_STDOUT = ["zip -r - ~/.config/goodqa", "zip -qr - ~/.agent-harness/gq-browser", "7z a -so x ~/.config/goodqa",
+                      "7z a /tmp/x.7z ~/.config/goodqa", "zip -r /tmp/x.zip ~/.agent-harness/gq-browser"]
+UNLISTED_OPTION_VALUES = ["cd ~ && grep -r --binary-files text tok", "cd ~ && grep -r --group-separator x tok",
+                          "cd ~ && rg --color always tok", "cd ~ && rg --colour always tok", "cd ~ && rg --engine pcre2 tok",
+                          "cd ~ && rg --field-match-separator : tok", "cd ~ && rg --hyperlink-format none tok",
+                          "cd ~ && rg --dfa-size-limit 1G tok", "cd ~ && ag --color-match 1 tok", "cd ~ && ack --ignore-dir x tok",
+                          "cd ~ && ack --type-set x:ext:y tok"]
 NO_PATH_OPTIONS = ["cd ~ && rg --max-depth 6 token", "cd ~ && rg -t py token", "cd ~ && rg -T py token", "cd ~ && rg --type py token",
                    "cd ~ && rg -j 4 token", "cd ~ && rg -M 200 token", "cd ~ && grep -r --exclude-dir node_modules tok",
                    "cd ~ && grep -r -D skip tok", "cd ~ && grep -d recurse tok", "cd ~ && grep --directories=recurse tok",
                    "cd ~/.config/goodqa && grep -d recurse .", "grep -d recurse tok ~/.config/goodqa", "cd ~ && ag --depth 5 tok"]
-NO_PATH_NEIGHBOURS = ["cd ~/project && rg --max-depth 6 token", "cd ~ && rg -c --max-depth 6 token", "cd ~ && grep -d skip tok file.txt",
+NO_PATH_NEIGHBOURS = ["cd ~ && rg --hidden tok /tmp", "cd ~ && grep -r --binary-files text tok /tmp", "cd ~ && rg --engine pcre2 tok /tmp",
+                      "cd ~/project && rg --engine pcre2 tok", "cd ~ && rg -c --color always tok", "cd /tmp && grep -r --exclude-dir x tok","cd ~/project && rg --max-depth 6 token", "cd ~ && rg -c --max-depth 6 token", "cd ~ && grep -d skip tok file.txt",
                       "cd ~ && echo x | rg -t py token", "cd ~ && grep tok file.txt"]
 RULE = "[secret_dump/"
 
@@ -87,6 +95,16 @@ class GoodqaCredentialPaths(unittest.TestCase):
 
     def test_a_recursive_reader_an_archive_a_copy_or_a_find_exec_of_either_directory_is_blocked(self):
         for command in DIRECTORIES:
+            with self.subTest(command):
+                self.blocked_by_the_credential_rule(command)
+
+    def test_zip_and_7z_to_stdout_do_not_hide_the_directory_as_the_archive(self):
+        for command in ARCHIVES_TO_STDOUT:
+            with self.subTest(command):
+                self.blocked_by_the_credential_rule(command)
+
+    def test_an_option_the_guard_does_not_list_does_not_hide_a_no_path_search(self):
+        for command in UNLISTED_OPTION_VALUES:
             with self.subTest(command):
                 self.blocked_by_the_credential_rule(command)
 

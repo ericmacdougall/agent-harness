@@ -4693,10 +4693,21 @@ class Analyzer:
             reading = bool(letters & set('xt')) or bool(longs & {'--extract', '--get', '--list', '--diff', '--compare'}) or (name == 'pax' and 'r' in letters and 'w' not in letters)
             if reading and not create:
                 skip.extend(words)  # extract or list: nothing named here is read as a source tree
-        elif name in ('zip', '7z', '7za', '7zr'):
-            operands = [w for w in words if not w.text.startswith('-') and w.text not in ('a', 'u', 'd', 'x', 'e', 'l', 't')]
+        elif name == 'zip':
+            # the first operand is the archive; a bare `-` is that operand (the archive goes to stdout), so the directory after
+            # it is a source
+            operands = [w for w in words if not w.text.startswith('-') or w.text == '-']
             if operands:
                 skip.append(operands[0])
+        elif name in ('7z', '7za', '7zr'):
+            # `7z a ARCHIVE SOURCE...`: only the archive word after the command letter is a destination; with -so the archive
+            # name is a placeholder and the sources after it are still sources
+            for i, w in enumerate(words):
+                if w.text in ('a', 'u', 'd', 'rn', 'e', 'x', 'l', 't', 'h', 'b', 'i'):
+                    rest = [v for v in words[i + 1:] if not v.text.startswith('-')]
+                    if rest:
+                        skip.append(rest[0])
+                    break
         return skip
 
     def read_creds(self, name, args, pl, idx):
@@ -4741,7 +4752,11 @@ class Analyzer:
         recursive = name in GREP_CMDS and (_flag_letters(args) & set('rR') or name in ('rg', 'ag', 'ack') or '--recursive' in _longs(args)
                                           or self._grep_directories_recurse(texts))
         reads_stdin = idx > 0 and name in ('rg', 'ag', 'ack')  # a piped rg reads stdin; GNU grep -r with no operand still walks the directory
-        if recursive and not words and not reads_stdin and self.under_cred_parent(ctx.cwd, below=True):
+        # an option I do not know that takes a separate value makes the guard read the pattern as a path, so a recursive search
+        # whose operands do not include one existing path is judged on the working directory too (fail closed; a person adds an
+        # explicit path): `cd ~ && rg --engine pcre2 tok`
+        no_real_path = not words or not any(os.path.exists(norm_path(w.text, ctx)) for w in words)
+        if recursive and no_real_path and not reads_stdin and self.under_cred_parent(ctx.cwd, below=True):
             # a recursive search with no path operand searches the working directory: `cd ~/.config/goodqa && rg .`, or any
             # search from the home directory, which contains it
             ctx.secret_seen += 1
