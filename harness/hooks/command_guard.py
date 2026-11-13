@@ -9118,7 +9118,7 @@ INSTALL_FILES_FLAGS = {'--host': 1, '--from-ref': 1, '--file': 1, '--ticket': 1,
                        '--force-file': 1, '--agent': 1}
 INSTALL_FILES_FORM = ('the sanctioned form is `python3 -I ~/.claude/hooks/ah.py install-files --host HOST --from-ref SHA --file '
                       'NAME ... --ticket "GoodQA project#N"` (or `--resume RUN` / `--rollback RUN`), run by the main agent from '
-                      'the INSTALLED copy')
+                      'the INSTALLED copy as a plain command: no environment assignment, wrapper or shell -c around it')
 
 
 INSTALL_FILES_FLAGS['--allow-older'] = 0
@@ -9126,6 +9126,10 @@ INSTALL_FILES_VIEWERS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'cat', 'less', 'm
                          'printf', 'diff', 'wc', 'tee', 'man', 'find', 'vi', 'vim', 'nano', 'open', 'test', 'true', 'false', 'wal_note.py'}
 INSTALL_FILES_WRAPPERS = {'env', 'sudo', 'nohup', 'time', 'command', 'exec', 'stdbuf', 'nice', 'xargs'}
 INSTALL_FILES_SHELLS = {'bash', 'sh', 'zsh', 'dash', 'ksh'}
+# a segment that changes what a later segment of the same text runs or sees (HOME for `~`, PATH, a function named python3)
+INSTALL_FILES_ENV_CHANGERS = {'export', 'unset', 'declare', 'typeset', 'local', 'readonly', 'source', '.', 'eval', 'alias', 'hash',
+                              'function'}
+INSTALL_FILES_ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\+?=.*')
 INSTALL_FILES_REDIRECT = re.compile(r'^(?:[0-9]*[<>]{1,2}&?[0-9-]*|[0-9]*[<>]{1,2}.+|&>.*|\|&)$')
 
 
@@ -9164,23 +9168,31 @@ def _install_files_segments(text):
         return out
 
 
-def _install_files_segment(text, is_main, home, installed, literal, depth=0):
-    """None, or the refusal for one command string (recursing into `bash -c` bodies, at most three levels)."""
+def _install_files_segment(text, is_main, home, literal, depth=0):
+    """None, or the refusal for one command string (recursing into `bash -c` bodies, at most three levels). Any run of
+    install-files found inside a shell -c body (depth > 0), behind an environment assignment or a wrapper, or in a text with a
+    segment that changes the environment of later segments is refused, for main too (goodqa#15913: HOME= moves `~` and
+    the audit file, PYTHONPATH= or a function named python3 replaces the code that holds the merged-code proof)."""
     flat = re.sub(r'[\'"\\]', '', text)
     if re.search(r'(?:^|\n)\s*(?:import|from)\s+ah_install\b|(?<![A-Za-z0-9_])ah_\W{0,6}install', flat) and not re.match(
             r'\s*(?:git|cat|grep|egrep|rg|less|head|tail|ls|sed|awk|diff|wc|echo|printf|find|vi|vim|nano|man)\b', text):
         if re.search(r'python|importlib|(?:^|\n)\s*(?:import|from)\s', flat):
             return 'ah install-files: importing ah_install from python is refused; ' + INSTALL_FILES_FORM
-    for tokens, segment in _install_files_segments(text):
+    segments = _install_files_segments(text)
+    changes_env = any(tokens and (os.path.basename(tokens[0]) in INSTALL_FILES_ENV_CHANGERS or tokens[0].endswith('()')
+                                  or tokens[1:3] == ['(', ')'] or all(INSTALL_FILES_ASSIGNMENT.fullmatch(t) for t in tokens))
+                      for tokens, _segment in segments)  # `name() {` tokenizes as name ( ) {
+    for tokens, segment in segments:
         if tokens is None:
             if 'install' in segment and ('install-files' in segment or 'ah_install' in segment):
                 return 'ah install-files: the command could not be parsed; ' + INSTALL_FILES_FORM
             continue
-        while tokens and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', tokens[0]):
-            tokens = tokens[1:]
+        prefixed = False
+        while tokens and INSTALL_FILES_ASSIGNMENT.fullmatch(tokens[0]):
+            tokens, prefixed = tokens[1:], True
         while tokens and os.path.basename(tokens[0]) in INSTALL_FILES_WRAPPERS:
-            tokens = tokens[1:]
-            while tokens and (tokens[0].startswith('-') or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', tokens[0])):
+            tokens, prefixed = tokens[1:], True
+            while tokens and (tokens[0].startswith('-') or INSTALL_FILES_ASSIGNMENT.fullmatch(tokens[0])):
                 tokens = tokens[1:]
         if not tokens:
             continue
@@ -9188,7 +9200,7 @@ def _install_files_segment(text, is_main, home, installed, literal, depth=0):
         if first in INSTALL_FILES_SHELLS and depth < 3:
             for pos, tok in enumerate(tokens[1:], 1):
                 if tok.startswith('-') and not tok.startswith('--') and 'c' in tok[1:] and pos + 1 < len(tokens):
-                    inner = _install_files_segment(tokens[pos + 1], is_main, home, installed, literal, depth + 1)
+                    inner = _install_files_segment(tokens[pos + 1], is_main, home, literal, depth + 1)
                     if inner:
                         return inner
         if first in INSTALL_FILES_VIEWERS:
@@ -9215,12 +9227,18 @@ def _install_files_segment(text, is_main, home, installed, literal, depth=0):
             rest = [t for t in head[1:] if t not in ('-I', '-B', '-E', '-s', '-S')]
             if len(rest) != 1 or rest[0] not in literal:
                 return 'ah install-files: only the installed ~/.claude/hooks/ah.py may run it (not %s); %s' % (os.path.basename(rest[0]) if rest else 'this script', INSTALL_FILES_FORM)
-        elif first == 'ah' and len(head) == 1:
-            found = shutil.which('ah')
-            if not found or os.path.realpath(found) != installed:
-                return 'ah install-files: a bare `ah` must resolve to the installed ~/.claude/hooks/ah.py; ' + INSTALL_FILES_FORM
+            if head[-1] != rest[0] or '-I' not in head[1:-1]:
+                return ('ah install-files: the interpreter needs -I before the script (isolated mode: no PYTHON* variables, no user '
+                        'site, no script directory first on the path); ' + INSTALL_FILES_FORM)
+        elif first == 'ah':
+            return ('ah install-files: a bare `ah` is refused (its PATH lookup and interpreter flags are not the pinned form); '
+                    + INSTALL_FILES_FORM)
         else:
             return 'ah install-files: only the installed ah may run it; ' + INSTALL_FILES_FORM
+        if depth or prefixed or changes_env:
+            return ('ah install-files: run it as a plain command: no environment assignment, no wrapper (env, sudo, nohup, time, '
+                    'xargs ...), no shell -c around it and no segment that changes the environment (export, unset, source, a '
+                    'function ...) in the same command; ' + INSTALL_FILES_FORM)
         args = [t for t in tokens[index + 1:] if not INSTALL_FILES_REDIRECT.match(t)]  # redirections (`> out.json`, `2>&1`) are not flags
         i = 0
         while i < len(args):
@@ -9241,20 +9259,21 @@ def _install_files_segment(text, is_main, home, installed, literal, depth=0):
 
 def install_files_refusal(command, is_main, home=None):
     """None, or the refusal text for a command that runs `ah install-files` (goodqa#15742) outside its exact literal form:
-    the INSTALLED ah.py (or a bare `ah` that resolves to it), the flags of the install grammar only (redirections allowed),
-    and only for main. Quotes are removed before matching (`install-file""s` is still the command), `bash -c` bodies are
-    inspected, a python import of ah_install is refused for any caller, and programs that only VIEW the name (grep, cat,
-    git ...) pass. ACCIDENT PREVENTION, NOT AN ACCESS CONTROL: the guard sees command text only, so a script that imports
-    ah_install through sys.path, or any program that speaks ssh itself, is invisible to it; the controls that hold are the
-    merged-code proof, the allowlists and the audit inside ah_install."""
+    `python3 -I` (more of -B -E -s -S allowed) on the INSTALLED ah.py, the flags of the install grammar only (redirections
+    allowed), as a plain command, and only for main. A bare `ah`, an environment assignment, a wrapper (env, sudo, nohup,
+    time ...), a shell -c body or an environment-changing segment in the same text is refused for main too (goodqa#15913).
+    Quotes are removed before matching (`install-file""s` is still the command), `bash -c` bodies are inspected, a python
+    import of ah_install is refused for any caller, and programs that only VIEW the name (grep, cat, git ...) pass.
+    ACCIDENT PREVENTION, NOT AN ACCESS CONTROL: the guard sees command text only, so a script that imports ah_install
+    through sys.path, or any program that speaks ssh itself, is invisible to it; the controls that hold are the merged-code
+    proof, the allowlists and the audit inside ah_install."""
     text = command if isinstance(command, str) else ' '.join(map(str, command))
     flat = re.sub(r'[\'"\\]', '', text)
     if 'install' not in flat:
         return None
     home = home or os.path.expanduser('~')
-    installed = os.path.realpath(os.path.join(home, '.claude', 'hooks', 'ah.py'))
     literal = ('~/.claude/hooks/ah.py', '$HOME/.claude/hooks/ah.py', os.path.join(home, '.claude', 'hooks', 'ah.py'))
-    return _install_files_segment(text, is_main, home, installed, literal)
+    return _install_files_segment(text, is_main, home, literal)
 
 
 def payload_cwd(payload):

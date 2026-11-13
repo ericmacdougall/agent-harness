@@ -40,6 +40,8 @@ class Forms(unittest.TestCase):
         bad = {
             "worktree copy": 'python3 harness/hooks/ah.py install-files --host t2-dev --file ah.py',
             "absolute other path": 'python3 /tmp/x/ah.py install-files --host t2-dev --file ah.py',
+            "worktree copy with -I": 'python3 -I harness/hooks/ah.py install-files --host t2-dev --file ah.py',  # not caught by -I alone
+            "Codex copy with -I": 'python3 -I ~/.codex/agent-harness/ah.py install-files --host local --file ah.py',
             "relative dot": 'python3 ./ah.py install-files --host t2-dev --file ah.py',
             "-c import": 'python3 -c "import ah_install; ah_install.install_files()"',
             "-c from import": 'python3 -c "from ah_install import install_files"',
@@ -118,13 +120,57 @@ class Forms(unittest.TestCase):
                 with self.subTest(text, main=main):
                     self.assertEqual(hook(text, main)[0], 2, text)
 
-    def test_a_script_named_ah_earlier_on_path_does_not_pass(self):  # AC-9, NEG-11
+    def test_a_script_named_ah_earlier_on_path_does_not_pass(self):  # AC-9, NEG-11; goodqa#15913 NEG-17: a bare ah never passes
         text = 'ah install-files --host t2-dev --from-ref %s --file ah.py --ticket "GoodQA a#1"' % ("a" * 40)
-        with mock.patch.object(cg.shutil, "which", return_value="/tmp/evil/ah"):
-            self.assertIn("bare `ah`", cg.install_files_refusal(text, True))
         installed = os.path.join(HOME, ".claude", "hooks", "ah.py")
-        with mock.patch.object(cg.shutil, "which", return_value=installed):
-            self.assertIsNone(cg.install_files_refusal(text, True))
+        for found in ("/tmp/evil/ah", installed):  # even one that resolves to the installed copy: its flags are not pinned
+            with self.subTest(found), mock.patch.object(cg.shutil, "which", return_value=found):
+                self.assertIn("bare `ah`", cg.install_files_refusal(text, True))
+                self.assertIn("bare `ah`", cg.install_files_refusal("/usr/local/bin/" + text, True))
+                self.assertEqual(hook(text, True)[0], 2)
+
+    def test_environment_wrappers_shells_and_a_missing_dash_i_are_refused_for_main_too(self):  # goodqa#15913 AC-5, NEG-17
+        local = GOOD.replace("--host t2-dev", "--host local")
+        bad = {
+            "PYTHONPATH prefix": "PYTHONPATH=/tmp/evil " + local,
+            "HOME prefix": "HOME=/tmp/x " + local,
+            "env -i HOME": "env -i HOME=/tmp/x " + local,
+            "env wrapper": "env " + local,
+            "sudo": "sudo " + local,
+            "nohup": "nohup " + local,
+            "time": "time " + local,
+            "xargs": "echo | xargs " + local,
+            "missing -I": local.replace("python3 -I", "python3"),
+            "missing -I with -B": local.replace("python3 -I", "python3 -B"),
+            "-I after the script": local.replace("python3 -I ~/.claude/hooks/ah.py", "python3 ~/.claude/hooks/ah.py -I"),
+            "bare ah": local.replace("python3 -I ~/.claude/hooks/ah.py", "ah"),
+            "bash -c": "bash -c '%s'" % local.replace('"', ""),
+            "sh -c": 'sh -c "%s"' % local.replace('"GoodQA goodqa#15742"', "'GoodQA goodqa#15742'"),
+            "zsh -lc": "zsh -lc '%s'" % local.replace('"', ""),
+            "export HOME first": "export HOME=/tmp/x; " + local,
+            "assignment segment first": "HOME=/tmp/x; " + local,
+            "PATH assignment first": "PATH=/tmp/evil:$PATH && " + local,
+            "unset first": "unset HOME; " + local,
+            "source first": "source /tmp/x/env.sh && " + local,
+            "dot first": ". /tmp/x/env.sh && " + local,
+            "function named python3": "python3() { /tmp/evil/python3 \"$@\"; }; " + local,
+            "hash -p": "hash -p /tmp/evil/python3 python3; " + local,
+        }
+        for label, text in bad.items():
+            with self.subTest(label):
+                self.assertIsNotNone(cg.install_files_refusal(text, True), text)
+                code, message = hook(text, True)
+                self.assertEqual(code, 2, message)
+                self.assertIn("install-files", message)
+        for text in (local, local.replace("python3 -I", "python3 -B -I"), local.replace("python3 -I", "python3 -I -B"),
+                     "cd ~ && " + local, local + " > /tmp/out.json 2>&1"):  # the plain form stays allowed for main
+            with self.subTest(text[:50]):
+                self.assertIsNone(cg.install_files_refusal(text, True), text)
+                self.assertEqual(hook(text, True)[0], 0)
+        for viewer in ("FOO=1 git commit -m 'install-files: plain form only'", "env grep -rn install-files harness/",
+                       "export X=1; grep install-files notes/x.md", "time git log -S install-files"):  # viewers stay allowed
+            with self.subTest(viewer):
+                self.assertIsNone(cg.install_files_refusal(viewer, False), viewer)
 
     def test_everyday_commands_that_only_mention_the_names_are_not_refused(self):  # AC-9
         for text in ("git add harness/hooks/ah_install.py", "git commit -m 'feat(install-files): add it'", "cat harness/hooks/ah_install.py",

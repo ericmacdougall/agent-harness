@@ -8,100 +8,178 @@ Review-policy: standard
 
 ## Outcome
 
-The main agent can deploy merged hook files to the machine it runs on through the same audited route the fleet hosts use. `--host local` writes `~/.claude/hooks`, and `--host local-codex` writes `~/.codex/agent-harness`. Every step stays the same: the merged-code proof, the backups, staging every file and renaming with the guard last, reading the shas back, comparing the self-test with its baseline, automatic rollback guard first, the audit rows and the run id in the ticket comment. The guard still refuses every other writer to `~/.claude/hooks` and every caller that is not main. This unblocks the goodqa#15785 install on this Mac, whose Claude and Codex guards still allow plain reads of the GoodQA user token.
+The main agent can deploy merged hook files to the machine it runs on, through the same audited route the fleet hosts use. `--host local` writes `~/.claude/hooks`, and `--host local-codex` writes `~/.codex/agent-harness`.
+
+Every step stays the same:
+
+- the merged-code proof;
+- the backups;
+- staging every file, then renaming with the guard last;
+- reading the shas back;
+- comparing the self-test with its baseline;
+- automatic rollback, guard first;
+- the audit rows, and the run id in the ticket comment.
+
+The local program also has some new behaviour:
+
+- It starts in its own session, so a caller that is killed or times out never stops it part way.
+- Its self-test also runs the registered hook entry. After every install, that entry must block a sub-agent payload.
+
+The guard allows install-files only for main, only in its plain literal form, and only from the installed ah.py. It keeps refusing the direct writes that NEG-6 pins.
+
+The guard does NOT refuse every other writer to the hook directories:
+
+- **goodqa#15922 (HIGH, pre-existing):** the installers' `--apply --hooks-only` mode is allowed for any caller, from any checkout.
+- **goodqa#15914:** `install`, `rsync` and some `mv` forms get through.
+
+This unblocks the goodqa#15785 install on this Mac. The Claude and Codex guards there still allow plain reads of the GoodQA user token.
 
 ## Scope
 
 - In:
   - harness/hooks/ah_install.py:
-    - a local transport that runs the same constant program as a local subprocess (no shell, no ssh) with an allowlisted environment;
+    - a local transport, `detached_run`: the same constant program runs as a local subprocess in its own session, with no shell, no ssh and an allowlisted environment. A caller-side timeout leaves the program running;
     - a fixed root token, claude or codex, which the program maps to a fixed directory;
     - the Codex name list (install_codex.py `DELIVERY_HELPERS` at the commit);
-    - a check that the Codex directory exists before the fetch;
-    - the host audit row skipped for a local target;
+    - a check that the Codex directory exists before the fetch, and a refusal when `CODEX_HOME` names another directory;
+    - the program refuses a symlinked `~/.claude` or `~/.codex` parent;
+    - self-test probes through `command_guard_hook.py hook`, required after every install;
+    - the host audit row is skipped for a local target, and a local run whose ticket comment fails exits 6;
     - the Codex drift report on `--host local`.
+  - harness/hooks/command_guard.py, the install-files rule only. The allowed form needs `-I` before the script. These are refused for main too:
+    - an environment-assignment prefix;
+    - a wrapper;
+    - a shell `-c` body;
+    - an environment-changing segment;
+    - a bare `ah`.
   - harness/hooks/ah.py help text.
-  - tests/test_ah_install.py and tests/test_command_guard_install_files.py.
-  - tests/mutants_install_files.py.
+  - tests/test_ah_install.py, tests/test_command_guard_install_files.py and tests/mutants_install_files.py.
   - This spec.
+  - The AC-7 verify script. It lives in the work directory, not the repository: `agent-afefd4e93d22b0173/local-install/verify_bootstrap.py`.
 - Out:
-  - Any change to the guard code. `install_files_refusal` is already host-agnostic and main-only.
-  - The pre-existing guard gaps found while pinning NEG-6, filed as GoodQA goodqa#15914 (Risks):
-    - `install` and `rsync` into `~/.claude/hooks` are allowed;
-    - `mv` into `~/.codex/agent-harness` is allowed.
+  - goodqa#15922 (HIGH): make the installers main-only and merged-commit-only, and have them take `.ah-install/lock`. Owned next by this author.
+  - goodqa#15914: the `install`, `rsync` and `mv` writes into the hook directories.
   - Codex targets on fleet hosts.
   - settings.json, CLAUDE.md and install.py.
-  - goodqa#15912 (test portability; not tiny).
+  - goodqa#15912 (test portability).
   - The post-merge install itself, which main runs (AC-7).
 
 ## Acceptance criteria
 
-- AC-1: `--host local` installs merged files into this machine's `~/.claude/hooks` with the remote semantics: both backups (in the hooks directory and the caller's copy) read back by sha256, stage then rename with command_guard.py last, read-back shas, the self-test compared with the baseline, an automatic rollback guard first on a regression, audit start and result rows with host `local` and no duplicate host row, and one ticket comment naming the run id; no ssh argv is ever built, the program gets HOME and the allowlisted variables only, and a dry run changes nothing and takes no lock. Verify by: `python3 -B -m unittest tests.test_ah_install.LocalTarget`. Source: ticket:GoodQA goodqa#15913
-- AC-2: `--host local-codex` does the same into `~/.codex/agent-harness`, accepts only names in install_codex.py `DELIVERY_HELPERS` at the commit, and leaves `~/.claude/hooks` untouched. Verify by: `python3 -B -m unittest tests.test_ah_install.LocalCodex`. Source: ticket:GoodQA goodqa#15913
-- AC-3: after `--host local` (installed or already_current) the result lists every installed name whose Codex copy exists and differs (`codex_differs`), with a note naming `--host local-codex`; `--host local` never writes a Codex copy. Verify by: `python3 -B -m unittest tests.test_ah_install.LocalTarget.test_local_reports_the_codex_copies_that_differ_from_what_it_installed`. Source: inferred: from wal:baab765b-d85c-46b4-b7b9-588eb912c770/main.jsonl#w3d3ce13675d ; ticket:GoodQA goodqa#15913 -- main asked for this machine's hooks and the Codex home if present; with one directory per run, the drift report is what keeps the Codex home from being silently left behind
-- AC-4: `--rollback RUN` and `--resume RUN` work for both local targets; a rollback is never blocked by a failing self-test (the difference is reported); an unfinished local run blocks new runs on its own target only. Verify by: `python3 -B -m unittest tests.test_ah_install.LocalTarget`. Source: ticket:GoodQA goodqa#15913
-- AC-5: the guard allows the literal local forms only from the installed `~/.claude/hooks/ah.py` and only for main. Verify by: `python3 -B -m unittest tests.test_command_guard_install_files`. Source: ticket:GoodQA goodqa#15913
-- AC-6: the fleet path is unchanged: the same ssh argv (no root argument), and every earlier install-files test passes. Verify by: `python3 -B -m unittest tests.test_ah_install tests.test_command_guard_install_files` and `python3 -B tests/mutants_install_files.py` (every mutant KILLED). Source: ticket:GoodQA goodqa#15742
-- AC-7: live, after the merge, run by main on this Mac: the local target lives in the installed ah.py and ah_install.py, and the guard allows install-files only from the installed copy, so the first step is a one-time bootstrap through the sanctioned installers from a clean checkout of the merge commit (`install.py --apply --hooks-only`, preview first, and `install_codex.py --apply --hooks-only`; neither reads or writes CLAUDE.md or settings.json, and both keep per-file backups); then `--host local` and `--host local-codex` dry runs and real runs from the installed ah.py (at the merge commit they report already_current or install what the bootstrap missed), and the goodqa#15785 live kit (live_test.py, sha256 b753e423) and plain_probe.py pass against `~/.claude/hooks`, with plain_probe.py passing against `~/.codex/agent-harness`. Verify by: those runs, recorded as REALLY_TESTED entries naming the run ids and the installed sha256s. Source: wal:baab765b-d85c-46b4-b7b9-588eb912c770/main.jsonl#w3d3ce13675d
+- AC-1: `--host local` installs merged files into this machine's `~/.claude/hooks` with the remote semantics, each claim pinned by a named test: no ssh argv, an environment of HOME plus the allowlisted variables with absolute PATH entries, both backups (in the hooks directory and the caller's copy) read back by sha256, read-back shas equal to the blobs, no temporary file left, audit start and result rows with host `local` and no second host row, one ticket comment naming the run id, the lock released, and the self-test recording the hook-entry probes (`LocalTarget.test_a_local_install_runs_the_same_program_without_ssh_and_reports_every_sha`); every other file renamed first and command_guard.py last (`LocalKill.test_a_caller_killed_after_one_of_three_renames_does_not_stop_the_program` records each rename in order; the shared `order()` is pinned by `Install.test_the_guard_is_renamed_last_and_the_order_is_fixed`); a self-test regression rolls back automatically, guard first, exit 4 (`LocalTarget.test_an_allow_all_guard_after_a_local_install_is_rolled_back_guard_first`); the dry run (`LocalTarget.test_a_local_dry_run_changes_nothing_and_takes_no_lock`); host names (`LocalTarget.test_names_that_only_look_local_refuse_before_any_call`). Verify by: `python3 -B -m unittest tests.test_ah_install.LocalTarget tests.test_ah_install.LocalKill tests.test_ah_install.Install.test_the_guard_is_renamed_last_and_the_order_is_fixed`. Source: ticket:GoodQA goodqa#15913
+- AC-2: `--host local-codex` does the same into `~/.codex/agent-harness` and leaves `~/.claude/hooks` untouched (`LocalCodex.test_local_codex_installs_into_the_codex_harness_directory_only`), accepts only names in install_codex.py `DELIVERY_HELPERS` at the commit (`LocalCodex.test_a_name_outside_the_codex_list_refuses_before_any_call`), refuses a missing directory (`LocalCodex.test_no_codex_harness_directory_refuses_and_creates_nothing`) and a symlinked one (`LocalCodex.test_a_symlinked_codex_directory_refuses`), and rolls back a regression (`LocalCodex.test_an_allow_all_guard_in_the_codex_directory_is_rolled_back`). Verify by: `python3 -B -m unittest tests.test_ah_install.LocalCodex`. Source: ticket:GoodQA goodqa#15913
+- AC-3: after `--host local` (installed or already_current) the result lists every installed name whose Codex copy exists and differs (`codex_differs`), with a note naming `--host local-codex`, and `--host local` never writes a Codex copy (`LocalTarget.test_local_reports_the_codex_copies_that_differ_from_what_it_installed`); a `CODEX_HOME` naming another directory is reported as `codex_home` with a note that the drift report read `~/.codex/agent-harness` (`LocalTarget.test_codex_home_elsewhere_refuses_local_codex_and_is_noted_by_local`). Verify by: `python3 -B -m unittest tests.test_ah_install.LocalTarget.test_local_reports_the_codex_copies_that_differ_from_what_it_installed tests.test_ah_install.LocalTarget.test_codex_home_elsewhere_refuses_local_codex_and_is_noted_by_local`. Source: inferred: from wal:baab765b-d85c-46b4-b7b9-588eb912c770/main.jsonl#w3d3ce13675d ; ticket:GoodQA goodqa#15913 -- main asked for this machine's hooks and the Codex home if present; with one directory per run, the drift report is what keeps the Codex home from being silently left behind
+- AC-4: `--rollback RUN` and `--resume RUN` work for both local targets (`LocalTarget.test_a_local_rollback_and_a_local_resume_by_run_id`); a rollback is never blocked by a failing self-test, the difference is reported (`LocalTarget.test_a_local_rollback_is_never_blocked_by_a_failing_self_test`); an unfinished local run blocks new runs on its own target only (`LocalTarget.test_an_unfinished_local_run_blocks_only_its_own_target`). Verify by: `python3 -B -m unittest tests.test_ah_install.LocalTarget`. Source: ticket:GoodQA goodqa#15913
+- AC-5: the guard allows exactly these local forms, for main only, from the installed ah.py: `python3 -I ~/.claude/hooks/ah.py install-files --host local --from-ref SHA --file NAME ... --ticket "GoodQA p#N"`, the same with `--host local-codex`, either with `--dry-run` (no ticket needed), `--rollback RUN --ticket T` (optionally `--force-file NAME`) and `--resume RUN --ticket T`; `~` may be spelled `$HOME` or the absolute home, `-B -E -s -S` may sit next to `-I` before the script, plus `--allow-older` (new installs), a redirection or `| tee` after it and a separate `cd` segment before it; everything else that runs install-files is refused (NEG-1, NEG-6, NEG-17). Verify by: `python3 -B -m unittest tests.test_command_guard_install_files` (in particular `Forms.test_the_local_targets_pass_for_main_and_are_refused_for_a_sub_agent`, `Forms.test_environment_wrappers_shells_and_a_missing_dash_i_are_refused_for_main_too`, `Forms.test_a_script_named_ah_earlier_on_path_does_not_pass`, `Forms.test_a_direct_write_into_the_hooks_directory_stays_refused_even_for_main`). Source: ticket:GoodQA goodqa#15913
+- AC-6: the fleet path is unchanged: the same ssh argv with no root argument and `subprocess.run` as its runner; the program is shared, so the self-test probes (AC-10) and the parent check (NEG-20) apply to fleet hosts too; every earlier install-files test passes. Verify by: `python3 -B -m unittest tests.test_ah_install tests.test_command_guard_install_files` (including `LocalTarget.test_the_script_refuses_an_unknown_root_and_the_remote_argv_has_none` and the runner check in `LocalKill.test_a_caller_side_timeout_leaves_the_local_program_running_in_its_own_session`) and `python3 -B tests/mutants_install_files.py` (every mutant KILLED). Source: ticket:GoodQA goodqa#15742
+- AC-7: live, after the merge, run by main on this Mac (the local target lives in the installed ah.py and ah_install.py, and the guard allows install-files only from the installed copy, so it starts with a one-time bootstrap): (1) in a checkout of the merge commit M, `python3 -I verify_bootstrap.py CHECKOUT M` (this author's work directory) shows `head_is_merge: true`, `clean: true`, `merge_is_ancestor: true`, and its `mismatched` lists the files the bootstrap will change (a non-empty list shows the check is not vacuous); (2) `install.py` preview, `install.py --apply --hooks-only`, `install_codex.py --apply --hooks-only` (neither reads or writes CLAUDE.md or settings.json; both keep per-file backups); (3) the same verify exits 0 with `ok: true` and `mismatched: []` for claude and codex, so every installed sha256 equals its blob at M; (4) `--host local` and `--host local-codex` dry runs, through the Bash tool's `run_in_background` or a 600000 ms timeout (R7), each exit 0 with result `dry_run`, an unchanged hooks listing, and `selftest_baseline.hook` showing both probes at exit 2 with `log_delete/log-delete` and `log_delete/install-files`; (5) real runs of both targets with `--ticket "GoodQA goodqa#15913"` each exit 0 with result `already_current` (expected after the bootstrap) or `installed`, each run's ticket comment names its run id, and `~/.agent-harness/install-audit.jsonl` holds its start and result rows with host `local` or `local-codex`; (6) the goodqa#15785 live kit (live_test.py, sha256 b753e423) and plain_probe.py pass against `~/.claude/hooks`, and plain_probe.py passes against `~/.codex/agent-harness`. Disclosed limitation: after the bootstrap the real runs are expected to be already_current, so the self-test rollback (NEG-3, NEG-16) and the caller-kill behaviour (NEG-13, NEG-14) are proven only on disposable homes by the tests, never live on this Mac, and the bootstrap itself runs without install-files' self-test rollback (R9). Verify by: REALLY_TESTED entries naming the run ids, the two verify_bootstrap.py outputs and the installed sha256s. Source: wal:/Users/eric/.claude/wals/baab765b-d85c-46b4-b7b9-588eb912c770/main.jsonl#w3d3ce13675d
+- AC-8: the local program runs in its own session: a SIGKILL of the caller's whole process group after 1 of 3 renames, or during the automatic rollback, does not stop it; every rename completes and no temporary file remains; the run stays unfinished until `--rollback RUN`, which restores every file (or records `restored` when the program's own rollback already put them back); a caller-side timeout raises at once and leaves the program running; fleet hosts keep `subprocess.run` over ssh. Verify by: `python3 -B -m unittest tests.test_ah_install.LocalKill`. Source: inferred: from ticket:GoodQA goodqa#15913 -- adversarial spec review F2 as main routed it (my WAL w2faef0bacd8): a tool-call timeout kills the caller's process group and must not stop a run between two renames
+- AC-9: a rerun at the same commit reports `already_current` with exit 0, writes no backup (neither the host's nor the caller's copy), takes no lock and calls no stage, commit, restore or read_backup, writes a start row and an `already_current` result row with host `local`, and posts one ticket comment with the run id. Verify by: `python3 -B -m unittest tests.test_ah_install.LocalTarget.test_a_rerun_at_the_same_commit_is_already_current_with_no_backup_stage_or_lock`. Source: inferred: from ticket:GoodQA goodqa#15742 -- the acceptance spec review (F2) found no criterion for an idempotent rerun
+- AC-10: every target's self-test also runs the registered entry, `command_guard_hook.py hook`, on two sub-agent payloads: `rm -rf ~/.claude/wals/.ah-install-selftest-absent` (an absent path, so no delete approval can cover it or be consumed, D6) and the literal `--host local` form; after any install both must exit 2 with exactly `log_delete/log-delete` and `log_delete/install-files`, or the run rolls back; this is absolute, never compared with the baseline (the mini's guard lacks the install-files rule, R11). Verify by: `python3 -B -m unittest tests.test_ah_install.LocalTarget.test_the_hook_probes_are_absolute_after_the_install_and_never_compared_with_the_baseline tests.test_ah_install.LocalTarget.test_a_fail_open_hook_entry_is_rolled_back_on_both_local_targets tests.test_ah_install.LocalTarget.test_a_local_install_runs_the_same_program_without_ssh_and_reports_every_sha`. Source: inferred: from ticket:GoodQA goodqa#15913 -- adversarial spec review F3 as main routed it (my WAL w2faef0bacd8): the guard-only probes cannot see a broken hook entry or a dropped install-files rule
+- AC-11: a local run whose ticket comment fails (the poster raises or returns False, or `ah ticket comment` exits non-zero) exits 6 when it would exit 0, with `comment_failed: true`, `ok: false` and a reason to post it by hand, while the result row keeps the real result; a fleet run keeps its exit code (its host keeps an audit copy) and still reports `comment_failed`. Verify by: `python3 -B -m unittest tests.test_ah_install.LocalTarget.test_a_local_run_whose_ticket_comment_fails_exits_6_and_keeps_the_real_result_row tests.test_ah_install.Audit.test_a_failed_ticket_comment_on_a_fleet_run_is_reported_and_keeps_its_exit`. Source: inferred: from ticket:GoodQA goodqa#15913 -- adversarial spec review F5 as main routed it (my WAL w2faef0bacd8): locally the comment is the only off-machine record
 
 ## Negative cases
 
-- NEG-1 (AC-5): a sub-agent running any local form (the literal installed form, `--rollback`, `--resume`, `--dry-run`, `local-codex`) is refused under `log_delete/install-files` naming the main agent, and a worktree copy of ah.py is refused even for main. Source: ticket:GoodQA goodqa#15913
-- NEG-2 (AC-1): `--host` values that only look local are refused before any call: `mac`, `localhost`, `local;ls`, `LOCAL`, `local ` (trailing space), `local-claude`, `./local`, `local-codex2` (scope-pinning: a fixed allowlist of names). Source: ticket:GoodQA goodqa#15913
-- NEG-3 (AC-1, AC-2): an allow-all guard installed through a local target fails the self-test; every changed file is restored with command_guard.py first, the result is `rolled_back` with exit 4, and every live file equals its bytes from before the run (backup-before-delete: the restore reads the verified backups). Source: ticket:GoodQA goodqa#15742
-- NEG-4 (AC-2): `local-codex` with no `~/.codex/agent-harness` is refused before the fetch, creates nothing and writes no start row; the program itself also refuses a missing directory with a reason, not a traceback. Source: ticket:GoodQA goodqa#15913
-- NEG-5 (AC-2): `local-codex` with a name outside `DELIVERY_HELPERS` at the commit (doctor.py) is refused before any call and before any audit row (scope-pinning: names only from the target's installer list). Source: ticket:GoodQA goodqa#15913
-- NEG-6 (AC-5): a direct write into the hooks directories stays refused for main and for a sub-agent: `cp` into `~/.claude/hooks` (spelled `~` and `$HOME`), `mv` into it, a `cat >` redirect into it, `tee` into it, and `cp` of the guard into `~/.codex/agent-harness`. Source: wal:baab765b-d85c-46b4-b7b9-588eb912c770/main.jsonl#w3d3ce13675d
-- NEG-7 (AC-4): an unfinished local run (a lost answer after the commit) blocks a new local run with `unfinished_run` but not `local-codex` or `t2-dev`, and a fleet host's unfinished run never counts for a local target (cross-host-approval-portability: runs are keyed per target, and a rollback reads its host from the run's own start row; idempotent-retry: `--resume` finishes it). Source: ticket:GoodQA goodqa#15742
-- NEG-8 (AC-1): with `AH_AGENT_ID`, `PYTHONPATH` and a guard switch set in the caller's environment, the program's environment holds only HOME (the caller's home) and the allowlist PATH, LANG, LC_ALL, TMPDIR, USER, LOGNAME, SHELL. Source: inferred: from ticket:GoodQA goodqa#15913 -- the caller's switches must not change the self-test verdict that decides a rollback
-- NEG-9 (AC-1): a root token outside `ROOTS` makes the program exit with `bad root` before it touches any directory (scope-pinning: the root is a token, never a path). Source: inferred: from ticket:GoodQA goodqa#15913 -- the program must never take a directory from its caller
-- NEG-10 (AC-2): a `~/.codex/agent-harness` that is a symlink is refused and the link's target is unchanged (scope-pinning). Source: inferred: from ticket:GoodQA goodqa#15913 -- a planted link must not redirect the write
-- NEG-11 (AC-1): a local dry run lists the plan and leaves the hooks directory's names, sizes, mtimes and inodes unchanged, with no state directory and no stage call (dry-run-diff). Source: ticket:GoodQA goodqa#15742
-- NEG-12 (AC-4): a local `--rollback` while doctor is broken completes as `restored` and reports the self-test difference instead of refusing (rollback-not-blocked; remote-exec-audit: each run writes its start and result rows and one ticket comment, AC-1). Source: ticket:GoodQA goodqa#15742
+- NEG-1 (AC-5): a sub-agent running any local form (the literal installed form, `--rollback`, `--resume`, `--dry-run`, `local-codex`) is refused under `log_delete/install-files` naming the main agent, and a worktree copy of ah.py is refused even for main. Test: `Forms.test_the_local_targets_pass_for_main_and_are_refused_for_a_sub_agent`. Source: ticket:GoodQA goodqa#15913
+- NEG-2 (AC-1): `--host` values that only look local are refused before any call: `mac`, `localhost`, `local;ls`, `LOCAL`, `local ` (trailing space), `local-claude`, `./local`, `local-codex2` (scope-pinning: a fixed allowlist of names). Test: `LocalTarget.test_names_that_only_look_local_refuse_before_any_call`. Source: ticket:GoodQA goodqa#15913
+- NEG-3 (AC-1, AC-2): an allow-all guard installed through a local target fails the self-test; every changed file is restored with command_guard.py first, the result is `rolled_back` with exit 4, and every live file equals its bytes from before the run (backup-before-delete: the restore reads the verified backups). Tests: `LocalTarget.test_an_allow_all_guard_after_a_local_install_is_rolled_back_guard_first`, `LocalCodex.test_an_allow_all_guard_in_the_codex_directory_is_rolled_back`. Source: ticket:GoodQA goodqa#15742
+- NEG-4 (AC-2): `local-codex` with no `~/.codex/agent-harness` is refused before the fetch, creates nothing and writes no start row; the program itself also refuses a missing directory with a reason, not a traceback. Tests: `LocalCodex.test_no_codex_harness_directory_refuses_and_creates_nothing`, `LocalTarget.test_the_script_refuses_an_unknown_root_and_the_remote_argv_has_none`. Source: ticket:GoodQA goodqa#15913
+- NEG-5 (AC-2): `local-codex` with a name outside `DELIVERY_HELPERS` at the commit (doctor.py) is refused before any call and before any audit row (scope-pinning: names only from the target's installer list). Test: `LocalCodex.test_a_name_outside_the_codex_list_refuses_before_any_call`. Source: ticket:GoodQA goodqa#15913
+- NEG-6 (AC-5): a direct write into the hook directories stays refused for main and for a sub-agent: `cp` into `~/.claude/hooks` (spelled `~` and `$HOME`), `mv` into it, a `cat >` redirect into it, `tee` into it, and `cp` of the guard into `~/.codex/agent-harness`. Test: `Forms.test_a_direct_write_into_the_hooks_directory_stays_refused_even_for_main`. Source: wal:/Users/eric/.claude/wals/baab765b-d85c-46b4-b7b9-588eb912c770/main.jsonl#w3d3ce13675d
+- NEG-7 (AC-4): an unfinished local run (a lost answer after the commit) blocks a new local run with `unfinished_run` but not `local-codex` or `t2-dev`, and a fleet host's unfinished run never counts for a local target (cross-host-approval-portability: runs are keyed per target, and a rollback reads its host from the run's own start row; idempotent-retry: `--resume` finishes it). Test: `LocalTarget.test_an_unfinished_local_run_blocks_only_its_own_target`. Source: ticket:GoodQA goodqa#15742
+- NEG-8 (AC-1): with `AH_AGENT_ID`, `PYTHONPATH`, a guard switch and relative PATH entries set in the caller's environment, the program's environment holds only HOME (the caller's home) and the allowlist PATH (absolute entries only), LANG, LC_ALL, TMPDIR, USER, LOGNAME, SHELL. Test: `LocalTarget.test_a_local_install_runs_the_same_program_without_ssh_and_reports_every_sha`. Source: inferred: from ticket:GoodQA goodqa#15913 -- the caller's switches must not change the self-test verdict that decides a rollback
+- NEG-9 (AC-6): a root token outside `ROOTS` makes the program exit with `bad root` before it touches any directory, and the fleet argv carries no root token (scope-pinning: the root is a token, never a path). Test: `LocalTarget.test_the_script_refuses_an_unknown_root_and_the_remote_argv_has_none`. Source: inferred: from ticket:GoodQA goodqa#15913 -- the program must never take a directory from its caller
+- NEG-10 (AC-2): a `~/.codex/agent-harness` that is a symlink is refused and the link's target is unchanged (scope-pinning). Test: `LocalCodex.test_a_symlinked_codex_directory_refuses`. Source: inferred: from ticket:GoodQA goodqa#15913 -- a planted link must not redirect the write
+- NEG-11 (AC-1): a local dry run lists the plan and leaves the hooks directory's names, sizes, mtimes and inodes unchanged, with no state directory and no stage call (dry-run-diff). Test: `LocalTarget.test_a_local_dry_run_changes_nothing_and_takes_no_lock`. Source: ticket:GoodQA goodqa#15742
+- NEG-12 (AC-4): a local `--rollback` while doctor is broken completes as `restored` and reports the self-test difference instead of refusing (rollback-not-blocked). Test: `LocalTarget.test_a_local_rollback_is_never_blocked_by_a_failing_self_test`. Source: ticket:GoodQA goodqa#15742
+- NEG-13 (AC-8): the caller's whole process group is SIGKILLed after 1 of 3 renames: the program, in another session, completes all 3 renames in order (guard last) and leaves no temporary file; the run is listed by `unfinished_runs`; `--rollback RUN` on the default runner restores every file to its pre-run sha and clears it. Test: `LocalKill.test_a_caller_killed_after_one_of_three_renames_does_not_stop_the_program`. Source: inferred: from ticket:GoodQA goodqa#15913 -- adversarial spec review F2 (a caller SIGKILL between rename and rollback had no case)
+- NEG-14 (AC-8): the caller's process group is SIGKILLed during the automatic rollback of an allow-all guard, after the first restore rename: the program finishes the restore (guard first), every file is back at its pre-run bytes, no temporary file remains, and the run stays unfinished until `--rollback RUN` records `restored` with every file noted as already at its old sha. Test: `LocalKill.test_a_caller_killed_during_the_automatic_rollback_does_not_stop_the_restore`. Source: inferred: from ticket:GoodQA goodqa#15913 -- adversarial spec review F2
+- NEG-15 (AC-8): a caller-side timeout raises within the timeout without killing the program, which keeps running in a session other than the caller's; `Remote` picks `detached_run` for both local targets and `subprocess.run` for a fleet host. Test: `LocalKill.test_a_caller_side_timeout_leaves_the_local_program_running_in_its_own_session`. Source: inferred: from ticket:GoodQA goodqa#15913 -- adversarial spec review F2 (a killed ssh client leaves the remote program running; the local transport must match)
+- NEG-16 (AC-10): a fail-open hook entry (it reads the payload and exits 0, as a crashing hook does on Codex) installed through `local` and through `local-codex` rolls back with exit 4 and a reason naming `hook entry probe hook_deny_wal`; hook answers of exit 0, exit 2 with no rule (python cannot open the entry), a hang, the `guard_failure` fallback rule, or an old guard left in place without the install-files rule are each a regression, and a baseline without the rule is not compared. Tests: `LocalTarget.test_a_fail_open_hook_entry_is_rolled_back_on_both_local_targets`, `LocalTarget.test_the_hook_probes_are_absolute_after_the_install_and_never_compared_with_the_baseline`. Source: inferred: from ticket:GoodQA goodqa#15913 -- adversarial spec review F3
+- NEG-17 (AC-5): the guard refuses for main too, through `install_files_refusal` and through the hook: a `PYTHONPATH=`, `HOME=` or `env -i HOME=` prefix; an `env`, `sudo`, `nohup`, `time` or `xargs` wrapper; a missing `-I` or `-I` after the script; a bare `ah` (even one that resolves to the installed copy) or an absolute path to `ah`; a `bash -c`, `sh -c` or `zsh -lc` body; and an `export HOME=`, bare `HOME=` or `PATH=` assignment, `unset`, `source`, `.`, a function named python3 or `hash -p` segment in the same text; the plain form, `-B -I`, `-I -B`, a separate `cd ~ &&` segment and a redirection still pass, and viewers behind a prefix (`FOO=1 git commit`, `env grep`, `time git log`) still pass. Tests: `Forms.test_environment_wrappers_shells_and_a_missing_dash_i_are_refused_for_main_too`, `Forms.test_a_script_named_ah_earlier_on_path_does_not_pass`. Source: inferred: from ticket:GoodQA goodqa#15913 -- adversarial spec review F4 (HOME= moves `~` and the audit file; PYTHONPATH= replaces the code that holds the merged-code proof)
+- NEG-18 (AC-11): a local run whose poster raises exits 6 with `comment_failed` while the result row says `installed` and the files are installed; a poster that returns False on a rerun exits 6 with result `already_current`; `post_comment` returns False when `ah ticket comment` exits 1 and True when it exits 0. Test: `LocalTarget.test_a_local_run_whose_ticket_comment_fails_exits_6_and_keeps_the_real_result_row`. Source: inferred: from ticket:GoodQA goodqa#15913 -- adversarial spec review F5
+- NEG-19 (AC-2, AC-3): with `CODEX_HOME` naming another directory, `local-codex` is refused before the fetch with no start row, and `--host local` installs and reports `codex_home` with a note, with the Codex copy left unwritten; a `CODEX_HOME` spelled as `~/.codex`, or empty, is accepted. Test: `LocalTarget.test_codex_home_elsewhere_refuses_local_codex_and_is_noted_by_local`. Source: inferred: from ticket:GoodQA goodqa#15913 -- adversarial spec review F7 (Codex honours CODEX_HOME; the program writes ~/.codex)
+- NEG-20 (AC-1, AC-2): a symlinked `~/.claude` (for `local`) or `~/.codex` (for `local-codex`) is refused by the program before any write (`parent (~/.claude) is a symlink`), the link target's listing and mtimes are unchanged and there is no start row (scope-pinning). Test: `LocalTarget.test_a_symlinked_claude_or_codex_parent_refuses_before_any_write`. Source: inferred: from ticket:GoodQA goodqa#15913 -- adversarial spec review F7 (check_hooks lstat()ed only the leaf)
 
 ## Resource budget
 
 Host: mac
-Fan-out: agents=1 jobs=1 processes=2 browser_pages=0 test_workers=1
-Peak memory: 0.3 GB (method: one unittest process plus one short program subprocess)
+Fan-out: agents=1 jobs=1 processes=4 browser_pages=0 test_workers=1
+Peak memory: 0.4 GB (method: one unittest process; the caller-kill tests add a driver process and one program subprocess)
 CPU: 1 core (method: single-threaded unittest)
 Disk: 0.05 GB (method: temporary homes holding a copy of harness/hooks per test)
 Network: 0 MB (method: a local bare repository stands in for the canonical URL)
-Wall time: 6 min
-Cap and kill: none needed (focused tests and mutants, under 10 minutes)
-Checkpoint: not required (under 10 min and 4 GB)
+Wall time: 30 min (method: measured; the two suites took about 8 min and the mutants about 20 min)
+Cap and kill: each caller-kill test kills its own driver's process group in cleanup and waits for its program to end (bounded at 60 s)
+Checkpoint: durable output under the work dir (local-install/*.txt logs); every step is idempotent (each test and each mutant runs in its own temporary tree and leaves nothing behind); it resumes by rerunning the unfinished suite or tests/mutants_install_files.py
 
 ## Risks
 
-- R1: a local install breaks the guard of the session running it (main's own). Mitigation: dry run first; command_guard.py renamed last; the baseline must already deny the foundational probe; self-test compared with the baseline; automatic rollback guard first (NEG-3).
-- R2: a sub-agent writes `~/.claude/hooks` through the local route. Mitigation: the guard allows the command only from the installed ah.py and only for main, decided from the hook payload (NEG-1). This remains accident prevention, not access control: a program that writes the directory itself is invisible to a command-text guard, as before.
-- R3: the caller's environment changes the self-test result. Mitigation: `-I` and an allowlisted environment (NEG-8).
-- R4: the local "host" and the caller share one audit file. Mitigation: host keys `local` and `local-codex`; the host-side audit row is skipped (AC-1).
+- R1: a local install breaks the guard of the session running it (main's own). Mitigations:
+  - dry run first;
+  - command_guard.py renamed last;
+  - the baseline must already deny the foundational probe;
+  - the self-test is compared with the baseline, and the hook-entry probes are required after the install;
+  - automatic rollback, guard first (NEG-3, NEG-16).
+- R2: a sub-agent writes `~/.claude/hooks`. Through install-files this is refused: the guard allows it only from the installed ah.py, only for main and only as a plain command, and decides main from the hook payload (NEG-1, NEG-17). This is NOT a closed boundary:
+  - `install.py --apply --hooks-only` and `install_codex.py --apply --hooks-only` are allowed for any caller from any checkout, with no merged-code proof, self-test, audit or lock (pre-existing; goodqa#15922, HIGH; confirmed through the hook entry with a sub-agent payload on the worktree guard and on this Mac's installed guard, 2026-11-13);
+  - goodqa#15914 lists the `install`, `rsync` and `mv` forms (R8);
+  - a program that writes the directory itself is invisible to a command-text guard.
+- R3: the caller's environment changes the result. Mitigations:
+  - for the program: `-I` and an allowlisted environment (NEG-8);
+  - for the parent ah.py: the guard requires `-I` and refuses environment prefixes, wrappers and environment-changing segments (NEG-17). This is accident prevention only.
+- R4: the local "host" and the caller share one audit file. Mitigations:
+  - host keys `local` and `local-codex`;
+  - the host-side audit row is skipped (AC-1).
+
+  The ticket comment is therefore the only record off the machine, and a failed comment exits 6 (AC-11).
 - R5: Claude-only files are written into the Codex directory. Mitigation: names come from `DELIVERY_HELPERS` at the commit (NEG-5).
 - R6: the Claude Code sandbox refuses writes from the subprocess on main's first run. Effect: stage fails before any rename, the result is refused and nothing live changes. Main's dry run and first real run will show it.
-- R7: the program is killed by its timeout part way through. Mitigation: the result is unknown, and the unfinished run blocks reruns until `--resume` or `--rollback` (NEG-7).
-- R9: the bootstrap (AC-7). The Mac's installed ah.py (2e4cd2c6) and ah_install.py (0ccd1893) do not know the local target. The guard allows install-files only from the installed copy, so `--host local` cannot install itself. The one sanctioned route is the installers in `--hooks-only` mode from a clean checkout of the merge commit. They bring every listed hook file to that commit, c82ad2af's guard included, without the install-files self-test rollback, but with per-file backups and no CLAUDE.md or settings.json change. Mitigation: preview first; the Mac's guard self-test probes give identical verdicts and rules on the installed guard (6e318911), the Codex copy and c82ad2af (checked read-only, 2026-11-13); the live kit and plain probe run right after.
-- R8: these guard gaps exist on c82ad2af, independent of this change, for main and for a sub-agent alike:
+- R7: the caller is killed or times out part way. A Claude Code Bash call defaults to 120 s, and one run can exceed 400 s. Mitigations:
+  - the program starts in its own session, and a caller timeout does not kill it (AC-8);
+  - the run stays unfinished until `--resume` or `--rollback`;
+  - AC-7 runs local targets in the background or with a 600 s timeout.
+
+  Residual: a kill that walks the process tree by parent id, rather than the process group, can still reach the program. The program's own self-test deadline is 200 s.
+- R8: these guard gaps exist on c82ad2af, independent of this change, for main and for a sub-agent alike. They are filed as GoodQA goodqa#15914 and not changed here.
   - `install -m 644 x ~/.claude/hooks/ah.py` is allowed;
   - `rsync x ~/.claude/hooks/` is allowed;
   - `mv x ~/.codex/agent-harness/ah.py` is allowed.
+- R9: the bootstrap (AC-7). The Mac's installed ah.py (2e4cd2c6) and ah_install.py (0ccd1893) do not know the local target, and the guard allows install-files only from the installed copy. So `--host local` cannot install itself.
+  - The bootstrap uses the installers in `--hooks-only` mode, the route goodqa#15922 shows is open to any caller. Main runs it once, from a clean checkout of the merge commit.
+  - It brings every listed hook file to that commit, with c82ad2af's guard included. It runs without install-files' self-test rollback, but with per-file backups and no CLAUDE.md or settings.json change.
 
-  They are filed as GoodQA goodqa#15914 and not changed here, so that this packet stays reviewable.
+  Mitigations:
+  - verify_bootstrap.py before and after proves the checkout HEAD is the merge SHA, the checkout is clean, the commit is merged and every installed sha256 equals its blob;
+  - the installer preview first;
+  - the Mac's guard self-test probes give identical verdicts and rules on the installed guard (6e318911), the Codex copy and c82ad2af (checked read-only, 2026-11-13);
+  - the live kit and plain probe run right after.
+- R10: concurrency and the mixed-version window. Sessions share one `~/.claude/hooks`: up to 8 owners, Codex sessions and other main sessions.
+  - Rename invariant: files change one `os.replace` at a time. On install every other file goes first and command_guard.py LAST; on restore command_guard.py goes FIRST. At every instant each file holds its old or its new complete bytes.
+  - So a PreToolUse in the window gets the old guard's verdict, the new guard's verdict, or command_guard_hook.py's fail-closed fallback when a mix of modules makes the analyser crash.
+  - Tests:
+    - `Install.test_the_guard_is_renamed_last_and_the_order_is_fixed`;
+    - `LocalKill.test_a_caller_killed_after_one_of_three_renames_does_not_stop_the_program` (recorded order);
+    - `LocalKill.test_a_caller_killed_during_the_automatic_rollback_does_not_stop_the_restore` (guard first on restore);
+    - `SelfTest.test_a_read_back_sha_that_differs_after_the_rename_rolls_back_with_the_guard_first`.
+  - Two local runs are serialised by the mkdir lock and the unfinished-run check. The installers take no `.ah-install/lock`, so a bootstrap and an install-files run can interleave (goodqa#15922).
+- R11: the hook-entry probes are absolute for every target (decision D7, wal w9f87904679f). A fleet host whose guard lacks the install-files rule (the mini, 1342f53d) must take command_guard.py in the same run, or the run rolls back with a reason naming that. The two rule labels are pinned, so renaming either rule needs ah_install.py updated first.
+- R12: the hook-entry WAL probe. Hook mode honours and consumes delete approvals, so the probe uses an absent child of the WAL directory. An approval needs an existing path with a matching identity, so it never covers or consumes one (decision D6, wal w1dfc59fbe71). The hook entry writes no file on block (checked on a disposable home, decision D8, wal w1fcaf9ae32f).
 
 ## Domain checklist
 
 Domains: auth, delete, devices, money, release
 
-Detected from repository file names. This change touches only the install-files command.
+Detected from repository file names. This change touches only the install-files command and its guard rule.
 
 Covered:
 - backup-before-delete: AC-1 (both backups read back by sha256 before any rename) and NEG-3.
 - dry-run-diff: NEG-11.
-- scope-pinning: NEG-2, NEG-5, NEG-9, NEG-10 (fixed names, a fixed root token, symlinks refused).
+- scope-pinning: NEG-2, NEG-5, NEG-9, NEG-10, NEG-19, NEG-20 (fixed names, a fixed root token, symlinks and foreign Codex homes refused).
 - cross-host-approval-portability: NEG-7 (runs keyed per target; a rollback reads its host from the run's own start row).
-- idempotent-retry: AC-4 (`--resume` after a lost answer; a rerun is already_current).
-- remote-exec-audit: AC-1 (start and result rows, run id in the ticket comment).
-- rollback-not-blocked: NEG-12.
+- idempotent-retry: AC-4 and AC-9 (`--resume` after a lost answer; a rerun is already_current), NEG-13.
+- remote-exec-audit: AC-1 and AC-11 (start and result rows; the run id in the ticket comment; exit 6 when that comment fails locally).
+- rollback-not-blocked: NEG-12, NEG-14.
 
 Domain-gate: pre-account-hijack waived (no authentication flow is added or changed)
 Domain-gate: lookalike-identifier waived (no identifier handling; host names are a fixed allowlist, NEG-2)
@@ -112,8 +190,8 @@ Domain-gate: rate-limit-enumeration waived (no account lookup is involved)
 Domain-gate: store-billing-exposure waived (no account state or billing is touched)
 Domain-gate: unpushed-work-detection waived (no checkout, worktree or branch is removed)
 Domain-gate: device-identity-binding waived (no device enrollment or grant is touched)
-Domain-gate: unattended-recovery waived (a CLI run with no prompt; an interrupted run is recovered by --resume or --rollback, AC-4)
-Domain-gate: grant-durability waived (no grant or approval is created)
+Domain-gate: unattended-recovery waived (a CLI run with no prompt; an interrupted run is recovered by --resume or --rollback, AC-4, AC-8)
+Domain-gate: grant-durability waived (no grant or approval is created; the hook probe can never consume a delete approval, R12)
 Domain-gate: factory-reset-guard waived (no wipe or unenroll path is involved)
 Domain-gate: idempotency-key waived (no money movement is involved)
 Domain-gate: double-submit waived (no money flow or form is involved)
@@ -124,5 +202,14 @@ Domain-gate: authorization-vs-capture waived (no payment is involved)
 Domain-gate: derived-gate-floor-with-ratchet waived (no release gate with a numeric floor is touched)
 Domain-gate: artifact-inventory-mirrored waived (no signed artifact; the bytes come from the canonical git main)
 Domain-gate: self-update-e2e waived (not an updater feed; main's post-merge live install on this Mac is the end-to-end proof, AC-7)
-Domain-gate: transport-proof waived (the tests run the real local transport and the constant program on disposable homes; AC-7 uses the same transport)
+Domain-gate: transport-proof waived (the tests run the real local transport and the constant program on disposable homes, including a real SIGKILL of the caller; AC-7 uses the same transport)
 Domain-gate: staging-exists waived (a single-machine hook install; the dry run is the rehearsal and the self-test with automatic rollback is the canary)
+
+## Reviews
+
+Spec core sha256: `c3a2737033f82af70a04bcfd770361b8be4eb90516cafb28ca6aae41d2958343`
+
+| Role | Verdict | Reviewer | Kind | Source | Bound to |
+|---|---|---|---|---|---|
+| acceptance | ACCEPT | a55211891b58816d0 (red-team) | agent | WAL-verified red-team agent | current |
+| adversarial | BLOCK | a283a6e2967dbf1b9 (red-team) | agent | WAL-verified red-team agent | current |

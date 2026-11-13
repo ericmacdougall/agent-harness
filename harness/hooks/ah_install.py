@@ -18,9 +18,18 @@ around a guard. This command is the sanctioned route:
 
 This machine (goodqa#15913): `--host local` (~/.claude/hooks) and `--host local-codex` (~/.codex/agent-harness, names from
 install_codex.py's DELIVERY_HELPERS at the commit) run the SAME constant program as a local subprocess, with no shell and no
-ssh, an allowlisted environment and a fixed root token (never a path), so every step above is unchanged. The host-side audit
-row is skipped there: that file is the caller's own audit file, which already holds the start and result rows. `--host local`
-also reports the Codex copies that differ from the bytes it installed, so the Codex home is never silently left behind.
+ssh, an allowlisted environment and a fixed root token (never a path), so every step above is unchanged. The program starts
+in its own session (detached_run), so a killed or timed-out caller never stops it between two renames. The host-side audit
+row is skipped there: that file is the caller's own audit file, which already holds the start and result rows; so the ticket
+comment is the only record off the machine, and a local run whose comment fails exits 6. `--host local` also reports the
+Codex copies that differ from the bytes it installed, so the Codex home is never silently left behind; local-codex refuses
+a CODEX_HOME that points elsewhere. Every target's self-test also runs the registered hook entry (command_guard_hook.py) on
+two sub-agent payloads, which must both be blocked with their exact rules after any install.
+
+Rename invariant: files change one os.replace at a time, every other file first and command_guard.py LAST on install, and
+command_guard.py FIRST on restore; at every instant each hook file is either its old or its new complete bytes, so a session
+that runs the hook in the window gets the old guard's verdict, the new guard's verdict, or, when a mix of old and new modules
+makes the analyser crash, command_guard_hook.py's fail-closed fallback.
 
 Threat model: careless or hurried agents, not one that edits this module or the audit file.
 """
@@ -152,10 +161,15 @@ def replace_with(name, data, mode):
     return t
 
 PROBE_TIMEOUT, DOCTOR_TIMEOUT, TOTAL_DEADLINE = 60, 120, 200  # the whole self-test ends inside TOTAL_DEADLINE seconds, always
+# Through the REGISTERED entry (command_guard_hook.py hook), as a sub-agent payload (no transcript, so never main). The WAL
+# path does not exist, so no delete approval can cover it and the probe can never consume one. Data only, never executed.
+HOOK_PROBES = {"hook_deny_wal": "rm -rf ~/.claude/wals/.ah-install-selftest-absent",
+               "hook_subagent_local": "python3 -I ~/.claude/hooks/ah.py install-files --host local --from-ref "
+                                      + "0" * 40 + ' --file ah.py --ticket "GoodQA selftest#1"'}
 
 def selftest():
     guard = os.path.join(HOOKS, "command_guard.py")
-    res = {"guard": {}, "doctor": None}
+    res = {"guard": {}, "hook": {}, "doctor": None}
     deadline = time.time() + TOTAL_DEADLINE
     probes = {"allow": "ls -la",
               "deny_wal": "rm -rf ~/.claude/wals",
@@ -172,6 +186,20 @@ def selftest():
             res["guard"][key] = {"exit": p.returncode, "verdict": str(data.get("verdict")), "rule": rule.group(1) if rule else ""}
         except Exception as e:
             res["guard"][key] = {"exit": None, "verdict": "error:" + type(e).__name__, "rule": ""}
+    entry = os.path.join(HOOKS, "command_guard_hook.py")
+    for key, cmd in HOOK_PROBES.items():
+        if deadline - time.time() <= 0.5:
+            res["hook"][key] = {"exit": None, "rule": "", "error": "deadline"}
+            continue
+        payload = json.dumps({"session_id": "ah-install-selftest", "agent_id": "ah-install-selftest", "hook_event_name": "PreToolUse",
+                              "tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": os.path.expanduser("~")})
+        try:
+            p = subprocess.run([sys.executable, "-I", entry, "hook"], input=payload, capture_output=True, text=True,
+                               timeout=max(0.5, min(PROBE_TIMEOUT, deadline - time.time())), cwd=os.path.expanduser("~"))
+            rule = re.search(r"\[([A-Za-z0-9_/-]+)\]", p.stderr or "")
+            res["hook"][key] = {"exit": p.returncode, "rule": rule.group(1) if rule else ""}
+        except Exception as e:
+            res["hook"][key] = {"exit": None, "rule": "", "error": type(e).__name__}
     doctor = os.path.join(HOOKS, "doctor.py")
     if os.path.exists(doctor) and deadline - time.time() <= 0.5:
         res["doctor"] = {"flags": True, "failing": None, "timeout": True}
@@ -200,12 +228,14 @@ def selftest():
     return res
 
 def check_hooks():
-    try:
-        st = os.lstat(HOOKS)
-    except FileNotFoundError:
-        raise SystemExit("the hooks directory does not exist")
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
-        raise SystemExit("the hooks directory is a symlink, not a directory or owned by another user")
+    for path in (os.path.dirname(HOOKS), HOOKS):  # ~/.claude or ~/.codex first: a linked parent would redirect every write too
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            raise SystemExit("the hooks directory does not exist")
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            raise SystemExit(("the hooks directory" if path == HOOKS else "the hooks directory's parent (~/" + os.path.basename(path) + ")")
+                             + " is a symlink, not a directory or owned by another user")
 
 def touch_lock(run):
     try:
@@ -393,10 +423,30 @@ def local_env(home):
     return env
 
 
+def detached_run(argv, input=None, capture_output=True, timeout=None, env=None):
+    """The local transport (goodqa#15913). The program starts in its OWN session, so a caller that is killed (a tool-call
+    timeout or ^C signals the caller's process group) never stops it between two renames or inside a rollback; and, like a
+    killed ssh client, a caller-side timeout leaves it running to its end instead of killing it. The call is then reported
+    as lost (unknown after the first write). Not covered: a kill that walks the process tree by parent id."""
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                            start_new_session=True, close_fds=True)
+    try:
+        out, err = proc.communicate(input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                stream.close()  # the program's final print then fails harmlessly; every rename has happened by then
+            except OSError:
+                pass
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
 class Remote:
     def __init__(self, host, runner, home=None):
-        self.host, self.runner, self.started = host, runner, False
         self.root = LOCAL_TARGETS.get(host)  # None: a fleet host, over ssh
+        self.host, self.started = host, False
+        self.runner = runner or (detached_run if self.root else subprocess.run)
         self.home = home
         if self.root and (not sys.executable or home is None):
             refuse("the local target needs this python's own executable and the caller's home")
@@ -674,8 +724,19 @@ def newly_declared_unregistered(before, after):
                   if state == UNREGISTERED and (i not in s0 or s0[i] in NOT_REGISTERED_BEFORE))
 
 
+HOOK_RULES = {"hook_deny_wal": "log_delete/log-delete", "hook_subagent_local": "log_delete/install-files"}
+
+
 def selftest_worse(before, after):
-    """None when `after` is no worse than `before`, else the reason."""
+    """None when `after` is no worse than `before`, else the reason. The hook-entry probes are ABSOLUTE (goodqa#15913): after
+    any install the registered entry must block both with exactly these rules, whatever the baseline did (a host whose old
+    guard lacks the install-files rule must take command_guard.py in the same run). The rule label, not only exit 2, is
+    required: a missing or unreadable entry also exits 2, from python itself."""
+    for key, rule in HOOK_RULES.items():
+        now = (after.get("hook") or {}).get(key) or {}
+        if now.get("exit") != 2 or now.get("rule") != rule:
+            return ("the hook entry probe %s did not block with %s (exit %s, rule %s): install command_guard.py and "
+                    "command_guard_hook.py from one merged commit" % (key, rule, now.get("exit"), now.get("rule") or "-"))
     for key, was in (before.get("guard") or {}).items():
         now = (after.get("guard") or {}).get(key)
         if now is None or now.get("exit") != was.get("exit") or now.get("verdict") != was.get("verdict") or now.get("rule") != was.get("rule"):
@@ -720,22 +781,27 @@ def order(names):
 
 
 def post_comment(ticket, text, poster):
+    """True when the comment was posted: the poster did not raise and did not return False, or `ah ticket comment` exited 0."""
     if not ticket:
         return None
     try:
         if poster:
-            poster(ticket, text)
-        else:
-            subprocess.run(["python3", str(Path(__file__).resolve().parent / "ah.py"), "ticket", "comment", ticket, "--body", text],
-                           capture_output=True, timeout=60)
-        return True
-    except Exception:  # noqa: BLE001 - a failed comment is reported, never fatal
+            return poster(ticket, text) is not False
+        done = subprocess.run(["python3", str(Path(__file__).resolve().parent / "ah.py"), "ticket", "comment", ticket, "--body", text],
+                              capture_output=True, timeout=60)
+        return done.returncode == 0
+    except Exception:  # noqa: BLE001 - a failed comment is reported (and exits 6 locally), never a traceback
         return False
+
+
+COMMENT_FAILED_EXIT = 6
 
 
 def finish(home, run, host, result, exit_code, extra, ticket, poster, kind_):
     """Write the result row, post the one ticket comment and return (exit 0) or raise (any other exit). A resume or a rollback that
-    is refused is recorded as `attempt_refused`: it must not clear an unfinished run (the host may still be half installed)."""
+    is refused is recorded as `attempt_refused`: it must not clear an unfinished run (the host may still be half installed).
+    A local target keeps no host-side audit copy, so its ticket comment is the only record off this machine: when that
+    comment fails, a run that would exit 0 exits 6 (`comment_failed`; the result row still holds the real result)."""
     if result == "refused" and kind_ in ("resume", "rollback"):
         result = "attempt_refused"
     row = dict({"event": "result", "run": run, "host": host, "kind": kind_, "result": result}, **extra)
@@ -748,6 +814,14 @@ def finish(home, run, host, result, exit_code, extra, ticket, poster, kind_):
     out["ticket_comment"] = post_comment(ticket, "ah install-files %s on %s: %s (run %s) ref %s files %s" % (
         kind_, host, result, run, extra.get("ref"), json.dumps(summary)[:1500])
         + ("; " + str(extra["note"])[:500] if extra.get("note") else ""), poster)
+    if out["ticket_comment"] is False:
+        out["comment_failed"] = True
+        if host in LOCAL_TARGETS and exit_code == 0:
+            exit_code = COMMENT_FAILED_EXIT
+            out.update(ok=False, exit_code=exit_code, reason="the ticket comment for run %s could not be posted: post it by hand "
+                       "(the result row on this machine says %s)" % (run, result))
+    if exit_code == COMMENT_FAILED_EXIT:
+        raise InstallError("comment_failed", "%s on %s (run %s): %s" % (result, host, run, out["reason"]), exit_code, out)
     if exit_code != 0:
         raise InstallError(result, "%s on %s (run %s)%s" % (result, host, run, ": " + str(extra["reason"]) if extra.get("reason") else ""), exit_code, out)
     return out
@@ -762,12 +836,12 @@ def results_of(home, run):
     return [r.get("result") for r in audit_rows(home) if r.get("run") == run and r.get("event") == "result"]
 
 
-def install_files(host, ref, files, ticket, dry_run=False, home=None, session="", agent="", runner=subprocess.run, poster=None, allow_older=False):
+def install_files(host, ref, files, ticket, dry_run=False, home=None, session="", agent="", runner=None, poster=None, allow_older=False):
     check_inputs(host, ref, files, ticket, dry_run, None, None, (), allow_older)
     return _run(host, ref, list(files), ticket, dry_run, Path(home or Path.home()), session, agent, runner, poster, None, None, "install", allow_older)
 
 
-def resume(run_id, ticket, home=None, session="", agent="", runner=subprocess.run, poster=None):
+def resume(run_id, ticket, home=None, session="", agent="", runner=None, poster=None):
     home = Path(home or Path.home())
     if not isinstance(run_id, str) or not RUN_RE.fullmatch(run_id):
         refuse("--resume takes a run id like ins-0123456789ab")
@@ -806,15 +880,32 @@ def codex_differs(home, plan):
     return sorted(out)
 
 
+def codex_home_elsewhere(home):
+    """CODEX_HOME when it is set and names a directory other than ~/.codex, else None: Codex then loads its harness from
+    there, not from the ~/.codex/agent-harness that local-codex writes and the drift report reads."""
+    value = os.environ.get("CODEX_HOME") or ""
+    if not value or os.path.realpath(os.path.expanduser(value)) == os.path.realpath(str(Path(home) / CODEX_DIR[0])):
+        return None
+    return value
+
+
+def _add_note(extra, note):
+    extra["note"] = (str(extra["note"]) + "; " + note) if extra.get("note") else note
+
+
 def _with_codex_note(home, remote, plan, extra):
     if remote.root != "claude":
         return extra
     differs = codex_differs(home, plan)
     if differs:
         extra["codex_differs"] = differs
-        note = ("the Codex harness copies of %s on this machine differ from the installed bytes; install them with --host "
-                "local-codex" % ", ".join(differs[:10]))
-        extra["note"] = (str(extra["note"]) + "; " + note) if extra.get("note") else note
+        _add_note(extra, "the Codex harness copies of %s on this machine differ from the installed bytes; install them with --host "
+                         "local-codex" % ", ".join(differs[:10]))
+    elsewhere = codex_home_elsewhere(home)
+    if elsewhere:
+        extra["codex_home"] = elsewhere[:300]
+        _add_note(extra, "CODEX_HOME is set to %s: Codex loads its harness from there, and this drift report read ~/%s "
+                         "instead" % (elsewhere[:200], "/".join(CODEX_DIR)))
     return extra
 
 
@@ -822,6 +913,9 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
     root = LOCAL_TARGETS.get(host)
     if root == "codex" and not Path(home).joinpath(*CODEX_DIR).is_dir():
         refuse("the Codex harness directory ~/%s does not exist on this machine; nothing was changed" % "/".join(CODEX_DIR))
+    if root == "codex" and kind_ == "install" and codex_home_elsewhere(home):
+        refuse("CODEX_HOME is set to %s, so Codex does not load ~/%s, which local-codex writes; nothing was changed"
+               % (codex_home_elsewhere(home)[:200], "/".join(CODEX_DIR)))
     sources, listed, main = fetch_source(ref, files, home, allow_older or bool(resume_of), root or "claude")
     remote = Remote(host, runner, home)
     run = resume_of or new_run_id()
@@ -1001,7 +1095,7 @@ def _roll_back(home, run, host, plan, todo, remote, cause, ticket, poster, kind_
     return finish(home, run, host, "rolled_back", 4, {"ref": ref, "files": plan, "reason": str(cause)[:300], "selftest_after_rollback": again}, ticket, poster, kind_)
 
 
-def rollback(run_id, ticket, force_files=(), home=None, session="", agent="", runner=subprocess.run, poster=None):
+def rollback(run_id, ticket, force_files=(), home=None, session="", agent="", runner=None, poster=None):
     home = Path(home or Path.home())
     if not isinstance(run_id, str) or not RUN_RE.fullmatch(run_id):
         refuse("--rollback takes a run id like ins-0123456789ab")

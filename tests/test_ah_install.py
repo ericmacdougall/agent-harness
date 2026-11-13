@@ -6,9 +6,11 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -25,6 +27,8 @@ GIT_ENV.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1", GIT_AUTHO
                GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
 NAMES = ("command_guard.py", "doctor.py", "ah.py", "extra.py")
 TICKET = "GoodQA goodqa#15742"
+# what the registered hook entry answers after a good install (goodqa#15913 AC-10)
+HOOK_OK = {"hook_deny_wal": {"exit": 2, "rule": "log_delete/log-delete"}, "hook_subagent_local": {"exit": 2, "rule": "log_delete/install-files"}}
 
 
 def git(cwd, *args, check=True):
@@ -566,17 +570,17 @@ class SelfTest(Base):
         self.assertEqual({n: self.live(n) for n in NAMES}, before)
 
     def test_a_guard_that_stops_denying_the_hooks_copy_probe_is_worse(self):  # AC-4, NEG-4
-        before = {"guard": {"deny_hooks_copy": {"exit": 0, "verdict": "block", "rule": "log_delete/log-delete"}}, "doctor": {"flags": True, "failing": []}}
-        after = {"guard": {"deny_hooks_copy": {"exit": 0, "verdict": "allow", "rule": ""}}, "doctor": {"flags": True, "failing": []}}
+        before = {"guard": {"deny_hooks_copy": {"exit": 0, "verdict": "block", "rule": "log_delete/log-delete"}}, "hook": HOOK_OK, "doctor": {"flags": True, "failing": []}}
+        after = {"guard": {"deny_hooks_copy": {"exit": 0, "verdict": "allow", "rule": ""}}, "hook": HOOK_OK, "doctor": {"flags": True, "failing": []}}
         self.assertIn("changed", ai.selftest_worse(before, after))
         self.assertIsNone(ai.selftest_worse(before, before))
 
     def test_only_new_doctor_failures_count_and_a_baseline_with_failures_passes(self):  # AC-4, NEG-4
         guard = {"allow": {"exit": 0, "verdict": "allow", "rule": ""}}
         before = {"guard": guard, "doctor": {"flags": True, "failing": ["a", "b"]}}
-        self.assertIsNone(ai.selftest_worse(before, {"guard": guard, "doctor": {"flags": True, "failing": ["a"]}}))
-        self.assertIn("new failing", ai.selftest_worse(before, {"guard": guard, "doctor": {"flags": True, "failing": ["a", "b", "c"]}}))
-        self.assertIn("could not run", ai.selftest_worse(before, {"guard": guard, "doctor": {"flags": True, "failing": None}}))
+        self.assertIsNone(ai.selftest_worse(before, {"guard": guard, "hook": HOOK_OK, "doctor": {"flags": True, "failing": ["a"]}}))
+        self.assertIn("new failing", ai.selftest_worse(before, {"guard": guard, "hook": HOOK_OK, "doctor": {"flags": True, "failing": ["a", "b", "c"]}}))
+        self.assertIn("could not run", ai.selftest_worse(before, {"guard": guard, "hook": HOOK_OK, "doctor": {"flags": True, "failing": None}}))
 
     def manifest_commit(self, extra_rows, first=False):
         """A merged commit whose installer also lists hooks_manifest.json, with `extra_rows` added to the manifest."""
@@ -612,7 +616,7 @@ class SelfTest(Base):
 
         def doc(states):
             failing = sorted(i for i, st in states.items() if st not in ("WIRED", "PENDING"))
-            return {"guard": guard, "doctor": {"flags": True, "failing": failing, "states": states}}
+            return {"guard": guard, "hook": HOOK_OK, "doctor": {"flags": True, "failing": failing, "states": states}}
         before = doc({"a:stop": "WIRED", "b:stop": "MISSING"})
         # a new row that is only unregistered is reported, not a regression
         self.assertIsNone(ai.selftest_worse(before, doc({"a:stop": "WIRED", "b:stop": "MISSING", "new:stop": "MISSING"})))
@@ -759,6 +763,11 @@ class Audit(Base):
         self.assertEqual(len(posted), 1)
         self.assertEqual(posted[0][0], TICKET)
         self.assertIn(self.c1, posted[0][1])
+
+    def test_a_failed_ticket_comment_on_a_fleet_run_is_reported_and_keeps_its_exit(self):  # goodqa#15913 AC-11
+        out = ai.install_files("t2-dev", self.c1, ["ah.py"], TICKET, False, self.mac, "s", "a", self.runner, lambda t, x: False)
+        self.assertEqual((out["result"], out["exit_code"], out["ok"]), ("installed", 0, True))  # the host keeps its own audit copy
+        self.assertIs(out["comment_failed"], True)
 
 
 class Lock(Base):
@@ -926,6 +935,9 @@ class Wiring(Base):
 
 
 CODEX_NAMES = ("command_guard.py", "ah.py", "extra.py")  # doctor.py is a Claude-only hook here, as in the real lists
+HOOK_ENTRY = "command_guard_hook.py"  # listed by both installers here (as in the real lists); a commit adds it when a test needs it
+ALLOW_ALL = b"import sys\nprint('{\"verdict\": \"allow\", \"message\": \"\"}')\n"
+FAIL_OPEN_HOOK = b"import sys\nsys.stdin.buffer.read()\nsys.exit(0)\n"  # a hook entry that allows everything, as a crashing hook does on Codex
 
 
 class LocalBase(Base):
@@ -940,8 +952,11 @@ class LocalBase(Base):
 
     def write_commit(self, files, message, branch=None):
         (self.work / "install_codex.py").write_text("DELIVERY_HELPERS = (\n    # a comment, as in the real file\n    %s)\n"
-                                                    % "".join("%r, " % n for n in CODEX_NAMES))
+                                                    % "".join("%r, " % n for n in CODEX_NAMES + (HOOK_ENTRY,)))
         super().write_commit(files, message, branch)
+        (self.work / "install.py").write_text("HOOKS = %r\n" % (NAMES + (HOOK_ENTRY,),))
+        git(self.work, "add", "-A")
+        git(self.work, "commit", "-q", "--amend", "--no-edit")
 
     def make_codex(self):
         shutil.copytree(HOOKS, self.codex, ignore=shutil.ignore_patterns("__pycache__", "doctor.py"))
@@ -971,17 +986,20 @@ class LocalBase(Base):
             raise subprocess.TimeoutExpired(argv, 1)
         return subprocess.run(argv, input=input, env=env, capture_output=True, timeout=300)
 
-    def install(self, ref=None, files=("ah.py", "extra.py"), dry_run=False, ticket=TICKET, host="local", **kw):
+    def install(self, ref=None, files=("ah.py", "extra.py"), dry_run=False, ticket=TICKET, host="local", poster=None, **kw):
         posted = kw.setdefault("posted", [])
         return ai.install_files(host, ref or self.c1, list(files), ticket, dry_run, self.mac, "sess", "agent-x", self.runner,
-                                lambda t, text: posted.append((t, text)))
+                                poster or (lambda t, text: posted.append((t, text))))
 
     def codex_sha(self, name):
         return sha((self.codex / name).read_bytes())
 
+    def no_temp_files(self, folder):
+        return not [p.name for p in folder.iterdir() if p.name.endswith(".ah-install-tmp")]
+
 
 class LocalTarget(LocalBase):
-    def test_a_local_install_runs_the_same_program_without_ssh_and_reports_every_sha(self):  # AC-1, NEG-8, NEG-9
+    def test_a_local_install_runs_the_same_program_without_ssh_and_reports_every_sha(self):  # AC-1, NEG-8
         old = {n: self.live(n) for n in NAMES}
         posted = []
         with mock.patch.dict(os.environ, {"AH_AGENT_ID": "agent-sub", "PYTHONPATH": "/tmp/evil", "AH_GUARD_OFF": "1",
@@ -1008,6 +1026,7 @@ class LocalTarget(LocalBase):
         self.assertEqual(len(posted), 1)
         self.assertIn("on local: installed (run %s)" % out["run"], posted[0][1])
         self.assertFalse((self.hooks / ".ah-install" / "lock").exists())
+        self.assertEqual(out["selftest_after"]["hook"], HOOK_OK)  # the registered entry ran on both payloads (AC-10)
 
     def test_an_allow_all_guard_after_a_local_install_is_rolled_back_guard_first(self):  # AC-1, NEG-3
         ref = self.push({"command_guard.py": b"import sys\nprint('{\"verdict\": \"allow\", \"message\": \"\"}')\n"}, "allow-all")
@@ -1083,7 +1102,7 @@ class LocalTarget(LocalBase):
             self.assertEqual(caught.exception.exit_code, 2)
         self.assertEqual(self.calls, [])
 
-    def test_the_script_refuses_an_unknown_root_and_the_remote_argv_has_none(self):  # NEG-10, AC-6
+    def test_the_script_refuses_an_unknown_root_and_the_remote_argv_has_none(self):  # NEG-9, AC-6
         env = {"HOME": str(self.mac), "PATH": "/usr/bin:/bin"}
         done = subprocess.run([sys.executable, "-I", "-c", ai.REMOTE_SCRIPT, "probe", json.dumps({"names": ["ah.py"]}), "other"],
                               capture_output=True, text=True, env=env)
@@ -1106,6 +1125,236 @@ class LocalTarget(LocalBase):
         again = self.install(files=("ah.py", "doctor.py"))
         self.assertEqual(again["result"], "already_current")
         self.assertEqual(again.get("codex_differs", []), [])
+
+    def test_a_rerun_at_the_same_commit_is_already_current_with_no_backup_stage_or_lock(self):  # AC-9
+        first = self.install(files=("ah.py", "command_guard.py"))
+        self.assertEqual(first["result"], "installed")
+        self.counts.clear()
+        posted = []
+        out = self.install(files=("ah.py", "command_guard.py"), posted=posted)
+        self.assertEqual((out["result"], out["exit_code"]), ("already_current", 0))
+        self.assertEqual({n: v["action"] for n, v in out["files"].items()}, {"ah.py": "already_current", "command_guard.py": "already_current"})
+        self.assertFalse((self.hooks / ".ah-install" / "backups" / out["run"]).exists())
+        self.assertFalse((self.mac / ".agent-harness" / "install-backups" / out["run"]).exists())
+        self.assertEqual({k for k in self.counts if k in ("lock", "stage", "commit", "restore", "read_backup")}, set())
+        rows = [r for r in self.rows() if r.get("run") == out["run"]]
+        self.assertEqual([(r["event"], r.get("host"), r.get("result")) for r in rows],
+                         [("start", "local", None), ("result", "local", "already_current")])
+        self.assertEqual(len(posted), 1)
+        self.assertIn("on local: already_current (run %s)" % out["run"], posted[0][1])
+
+    def test_a_local_run_whose_ticket_comment_fails_exits_6_and_keeps_the_real_result_row(self):  # AC-11, NEG-18
+        def down(_ticket, _text):
+            raise RuntimeError("ticket service down")
+        with self.assertRaises(ai.InstallError) as caught:
+            self.install(files=("ah.py",), poster=down)
+        error = caught.exception
+        self.assertEqual((error.code, error.exit_code), ("comment_failed", 6))
+        self.assertEqual((error.data["result"], error.data["ok"], error.data["comment_failed"]), ("installed", False, True))
+        self.assertIn("post it by hand", error.data["reason"])
+        self.assertEqual(self.rows("result")[-1]["result"], "installed")  # the files are installed: the row says so
+        self.assertEqual(self.live("ah.py"), error.data["files"]["ah.py"]["new_sha"])
+        with self.assertRaises(ai.InstallError) as caught:  # a poster that reports failure counts too, on a rerun as well
+            self.install(files=("ah.py",), poster=lambda t, x: False)
+        self.assertEqual((caught.exception.exit_code, caught.exception.data["result"]), (6, "already_current"))
+        # `ah ticket comment` failing is seen through its exit status, not only through an exception
+        with mock.patch.object(ai.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"", b"")):
+            self.assertIs(ai.post_comment(TICKET, "x", None), False)
+        with mock.patch.object(ai.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+            self.assertIs(ai.post_comment(TICKET, "x", None), True)
+
+    def test_codex_home_elsewhere_refuses_local_codex_and_is_noted_by_local(self):  # AC-3, NEG-19
+        self.make_codex()
+        other = Path(self.tmp, "other-codex")
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(other)}):
+            with mock.patch.object(ai, "fetch_source", side_effect=AssertionError("fetched before checking CODEX_HOME")):
+                error = self.refused(host="local-codex", files=("ah.py",))
+            self.assertIn("CODEX_HOME", str(error))
+            self.assertEqual(self.rows("start"), [])
+            out = self.install(files=("ah.py",))
+            self.assertEqual(out["codex_home"], str(other))
+            self.assertIn("CODEX_HOME is set to %s" % other, out["note"])
+        self.assertEqual(self.codex_sha("ah.py"), sha(self.base_bytes("ah.py")))
+        for same in (str(self.host_home / ".codex"), ""):  # the default directory spelled out, or empty: accepted
+            with self.subTest(same), mock.patch.dict(os.environ, {"CODEX_HOME": same}):
+                self.assertIsNone(ai.codex_home_elsewhere(self.mac))
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.host_home / ".codex")}):
+            self.assertEqual(self.install(host="local-codex", files=("ah.py",))["result"], "installed")
+
+    def test_a_symlinked_claude_or_codex_parent_refuses_before_any_write(self):  # NEG-20
+        self.make_codex()
+        for host, parent, folder in (("local", ".claude", "hooks"), ("local-codex", ".codex", "agent-harness")):
+            with self.subTest(host):
+                real = self.host_home / ("real" + parent)
+                (self.host_home / parent).rename(real)
+                os.symlink(real, self.host_home / parent)
+                before = sorted((p.name, p.stat().st_mtime_ns) for p in (real / folder).iterdir())
+                error = self.refused(host=host, files=("ah.py",))
+                self.assertIn("parent (~/%s) is a symlink" % parent, str(error))
+                self.assertEqual(sorted((p.name, p.stat().st_mtime_ns) for p in (real / folder).iterdir()), before)
+                self.assertEqual(self.rows("start"), [])
+
+    def test_the_hook_probes_are_absolute_after_the_install_and_never_compared_with_the_baseline(self):  # AC-10, NEG-16
+        guard = {"allow": {"exit": 0, "verdict": "allow", "rule": ""}}
+        doctor = {"flags": True, "failing": []}
+        old_host = {"guard": guard, "doctor": doctor, "hook": {"hook_deny_wal": HOOK_OK["hook_deny_wal"],
+                                                                "hook_subagent_local": {"exit": 0, "rule": ""}}}
+        self.assertIsNone(ai.selftest_worse(old_host, {"guard": guard, "doctor": doctor, "hook": HOOK_OK}))  # the mini today
+        self.assertIn("hook_subagent_local", ai.selftest_worse(old_host, old_host))  # an old guard left in place
+        for bad in ({"exit": 0, "rule": ""}, {"exit": 2, "rule": ""}, {"exit": None, "rule": "", "error": "TimeoutExpired"},
+                    {"exit": 2, "rule": "guard_failure"}):  # allow, a missing entry (python exits 2), a hang, the fallback
+            with self.subTest(bad):
+                after = {"guard": guard, "doctor": doctor, "hook": dict(HOOK_OK, hook_deny_wal=bad)}
+                self.assertIn("hook_deny_wal", ai.selftest_worse({"guard": guard, "doctor": doctor, "hook": HOOK_OK}, after))
+        self.assertIn("hook_deny_wal", ai.selftest_worse({"guard": guard, "doctor": doctor}, {"guard": guard, "doctor": doctor}))
+
+    def test_a_fail_open_hook_entry_is_rolled_back_on_both_local_targets(self):  # AC-10, NEG-16
+        self.make_codex()
+        ref = self.push({HOOK_ENTRY: FAIL_OPEN_HOOK}, "fail-open-hook")
+        for host, folder in (("local", self.hooks), ("local-codex", self.codex)):
+            with self.subTest(host):
+                before = sha((folder / HOOK_ENTRY).read_bytes())
+                with self.assertRaises(ai.InstallError) as caught:
+                    self.install(host=host, ref=ref, files=(HOOK_ENTRY,))
+                self.assertEqual((caught.exception.exit_code, caught.exception.data["result"]), (4, "rolled_back"))
+                self.assertIn("hook entry probe hook_deny_wal", caught.exception.data["reason"])
+                self.assertEqual(sha((folder / HOOK_ENTRY).read_bytes()), before)
+                self.assertTrue(self.no_temp_files(folder))
+
+
+DRIVER = r'''
+import json, sys
+cfg = json.loads(open(sys.argv[1]).read())
+sys.path.insert(0, cfg["hooks"])
+import ah_install as ai
+ai.CANONICAL_URL, ai.ALLOW_FILE, ai.REMOTE_SCRIPT = cfg["url"], True, cfg["script"]
+try:
+    ai.install_files(cfg["host"], cfg["ref"], cfg["files"], cfg["ticket"], home=cfg["home"], session="s", agent="a",
+                     poster=lambda t, x: None)
+except ai.InstallError:
+    pass
+'''
+PROGRESS_FN = '''
+def progress(what, name):
+    with open(PROGRESS_PATH, "a") as f:
+        f.write("%s %s %d %d\\n" % (what, name, os.getpid(), os.getsid(0)))
+        f.flush()
+        os.fsync(f.fileno())
+    time.sleep(PROGRESS_DELAY)
+'''
+
+
+class LocalKill(LocalBase):
+    """AC-8: the caller (ah.py inside a tool call) is SIGKILLed with its whole process group, as a tool-call timeout does,
+    while the program is between two renames. A driver process stands in for the caller: it runs install_files with the
+    DEFAULT runner and a copy of the program that records each rename and then sleeps."""
+
+    FILES = ["ah.py", "extra.py", "command_guard.py"]
+
+    def drive(self, ref, progress):
+        script = ai.REMOTE_SCRIPT
+        for old, new in (("STALE = 1800\n", "STALE = 1800\nPROGRESS_PATH = %r\nPROGRESS_DELAY = 1.0\n%s" % (str(progress), PROGRESS_FN)),
+                         ("        os.replace(t, p)\n", "        os.replace(t, p)\n        progress('commit', name)\n"),
+                         ("        os.replace(t, live(name))\n", "        os.replace(t, live(name))\n        progress('restore', name)\n")):
+            self.assertEqual(script.count(old), 1, old)
+            script = script.replace(old, new)
+        cfg = Path(self.tmp, "driver.json")
+        cfg.write_text(json.dumps({"hooks": str(HOOKS), "url": "file://" + str(self.origin), "script": script, "host": "local",
+                                   "ref": ref, "files": self.FILES, "ticket": TICKET, "home": str(self.mac)}))
+        driver = Path(self.tmp, "driver.py")
+        driver.write_text(DRIVER)
+        env = {"HOME": str(self.mac), "PATH": self.pybin + ":/usr/bin:/bin", "LC_ALL": "C", "TMPDIR": os.environ.get("TMPDIR", "/tmp")}
+        proc = subprocess.Popen([sys.executable, "-I", str(driver), str(cfg)], env=env, start_new_session=True,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(self.reap, proc)
+        return proc
+
+    @staticmethod
+    def reap(proc):
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+
+    @staticmethod
+    def lines(progress, what):
+        return [line.split() for line in (progress.read_text().splitlines() if progress.exists() else []) if line.startswith(what + " ")]
+
+    def wait_for(self, progress, what, count, seconds, proc=None):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if len(self.lines(progress, what)) >= count:
+                return self.lines(progress, what)
+            if proc is not None and proc.poll() is not None:
+                self.fail("the driver ended before %d %s rename(s)" % (count, what))
+            time.sleep(0.02)
+        self.fail("only %d of %d %s rename(s) happened: the program stopped with its caller" % (len(self.lines(progress, what)), count, what))
+
+    def wait_gone(self, pid, seconds=60):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        self.fail("the program %d did not end" % pid)
+
+    def kill_after(self, proc, progress, what):
+        self.wait_for(progress, what, 1, 240, proc)
+        os.killpg(proc.pid, signal.SIGKILL)  # the caller and its whole process group, mid-run
+        proc.wait()
+        done = self.wait_for(progress, what, len(self.FILES), 20)
+        self.assertNotEqual(int(done[0][3]), proc.pid, "the program ran in the caller's session")
+        self.wait_gone(int(done[0][2]))
+        return [line[1] for line in done]
+
+    def test_a_caller_killed_after_one_of_three_renames_does_not_stop_the_program(self):  # AC-8, NEG-13
+        old = {n: self.live(n) for n in NAMES}
+        new = {n: sha(self.base_bytes(n) + b"\n# c1\n") for n in self.FILES}
+        progress = Path(self.tmp, "progress-commit.txt")
+        order = self.kill_after(self.drive(self.c1, progress), progress, "commit")
+        self.assertEqual(order, ["ah.py", "extra.py", "command_guard.py"])  # every other file first, the guard last
+        self.assertEqual({n: self.live(n) for n in self.FILES}, new)
+        self.assertTrue(self.no_temp_files(self.hooks))
+        run = self.rows("start")[0]["run"]
+        self.assertEqual(self.rows("result"), [])  # the caller died before its result row
+        self.assertEqual(ai.unfinished_runs(self.mac, "local"), [run])
+        done = ai.rollback(run, TICKET, (), self.mac, "s", "a", None, lambda t, x: None)  # the default (detached) runner
+        self.assertEqual(done["result"], "restored")
+        self.assertEqual({n: self.live(n) for n in NAMES}, old)
+        self.assertEqual(ai.unfinished_runs(self.mac, "local"), [])
+
+    def test_a_caller_killed_during_the_automatic_rollback_does_not_stop_the_restore(self):  # AC-8, NEG-14
+        ref = self.push({"command_guard.py": ALLOW_ALL}, "allow-all-kill")
+        old = {n: self.live(n) for n in NAMES}
+        progress = Path(self.tmp, "progress-restore.txt")
+        order = self.kill_after(self.drive(ref, progress), progress, "restore")
+        self.assertEqual(order[0], "command_guard.py")  # the guard first on restore
+        self.assertEqual({n: self.live(n) for n in NAMES}, old)
+        self.assertTrue(self.no_temp_files(self.hooks))
+        run = self.rows("start")[0]["run"]
+        self.assertEqual(ai.unfinished_runs(self.mac, "local"), [run])
+        done = ai.rollback(run, TICKET, (), self.mac, "s", "a", None, lambda t, x: None)
+        self.assertEqual(done["result"], "restored")
+        self.assertEqual(set(done["notes"]), set(self.FILES))  # every file was already back at its old sha
+        self.assertEqual(ai.unfinished_runs(self.mac, "local"), [])
+
+    def test_a_caller_side_timeout_leaves_the_local_program_running_in_its_own_session(self):  # AC-8, NEG-15
+        marker = Path(self.tmp, "marker")
+        code = ("import os, sys, time; time.sleep(1.5); open(sys.argv[1] + '.t', 'w').write(str(os.getsid(0))); "
+                "os.replace(sys.argv[1] + '.t', sys.argv[1])")
+        started = time.time()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            ai.detached_run([sys.executable, "-I", "-c", code, str(marker)], timeout=0.3, env={"PATH": "/usr/bin:/bin"})
+        self.assertLess(time.time() - started, 1.3)  # the caller is not held until the program ends
+        deadline = time.time() + 20
+        while not marker.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(marker.exists(), "the program was killed at the caller's timeout")
+        self.assertNotEqual(int(marker.read_text()), os.getsid(0))
+        for host in ("local", "local-codex"):
+            self.assertIs(ai.Remote(host, None, self.mac).runner, ai.detached_run)
+        self.assertIs(ai.Remote("t2-dev", None).runner, subprocess.run)  # the fleet transport is unchanged
 
 
 class LocalCodex(LocalBase):
@@ -1138,7 +1387,7 @@ class LocalCodex(LocalBase):
         self.assertFalse((self.host_home / ".codex").exists())
         self.assertEqual(self.rows("start"), [])
 
-    def test_a_symlinked_codex_directory_refuses(self):  # adversarial: a planted link must not redirect the write
+    def test_a_symlinked_codex_directory_refuses(self):  # NEG-10: a planted link must not redirect the write
         self.make_codex()
         real = self.host_home / ".codex" / "elsewhere"
         self.codex.rename(real)
