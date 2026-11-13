@@ -350,6 +350,7 @@ class App:
         self.asks = col.Asks(self.hub, self.health, self.runner, lambda: self.owners.session, root=root,
                              owners_fn=lambda: self.owners.rows)
         self.tailer.on_ask = self.asks.mark_dirty
+        self.ledger = col.Ledger(self.hub, self.health, self.runner, lambda: self.owners.session, root=root)
         self.collectors = [self.tailer, self.initiatives, self.drop, self.owners, self.github, self.tickets,
                            self.remote]
         self.codex = CodexResponder(self.hub, self.health, self.runner, codex_binary(), root,
@@ -368,7 +369,7 @@ class App:
 
     def start(self) -> None:
         loops = [(self.loop, "collectors"), (self.codex.loop, "codex"), (self.chat_loop, "chat"),
-                 (self.asks_loop, "asks")]
+                 (self.asks_loop, "asks"), (self.ledger_loop, "ledger")]
         if self.supervised:
             loops.append((self.supervised_loop, 'supervised-owners'))
         if self.demo:
@@ -388,7 +389,7 @@ class App:
     def wake(self) -> None:
         """A page attached: sources that were on their idle cadence refresh now."""
         now = time.time()
-        for collector in self.collectors:
+        for collector in self.collectors + [self.ledger]:
             collector.wake(now)
 
     def asks_loop(self) -> None:
@@ -398,6 +399,14 @@ class App:
             now = time.time()
             if self.asks.due(now):
                 self.asks.run(now)
+            self.stop.wait(1.0)
+
+    def ledger_loop(self) -> None:
+        """Goals, requirements and status: three `ah` reads that take seconds, so they have their own thread."""
+        while not self.stop.is_set():
+            now = time.time()
+            if self.ledger.due(now):
+                self.ledger.run(now)
             self.stop.wait(1.0)
 
     def loop(self) -> None:
@@ -479,6 +488,7 @@ class App:
                 "initiatives": self.initiatives.snapshot(), "owners": self.owners.rows,
                 "health": self.health.snapshot(), "events": self.hub.recent(limit=200),
                 "chat": self.chat_snapshot(), "asks": self.asks.snapshot(),
+                "ledger": self.ledger.snapshot(),
                 "limits": {"chat_max": mc_chat.MAX_TEXT, "approval_note_max": mc_chat.APPROVAL_NOTE_MAX,
                            "approval_ttl_s": mc_chat.APPROVAL_TTL_S}}
 

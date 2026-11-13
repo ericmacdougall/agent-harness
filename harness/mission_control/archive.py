@@ -28,7 +28,7 @@ ASK_STALE_S = 72 * 3600
 TEXT_MAX = 2000
 TERMINAL_STATES = frozenset({"resolved", "closed", "done", "superseded", "expired", "declined", "withdrawn"})
 PROOF_KINDS = frozenset({"deploy", "live_test", "really_tested"})
-CLEARED_RULES = {"resolved": "R1", "owner-reassigned": "R1", "ticket-closed": "R2", "duplicate": "R3"}
+CLEARED_RULES = {"resolved": "R1", "owner-reassigned": "R1", "ticket-closed": "R2", "duplicate": "R3", "expired": "R4"}
 RULE_TITLES = {
     "R1": "terminal state", "R2": "proven or closed", "R3": "superseded", "R4": "expired", "live": "open",
 }

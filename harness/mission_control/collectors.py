@@ -14,6 +14,7 @@ import threading
 import time
 from pathlib import Path
 
+import archive
 import events as ev
 from safeio import CURSOR_RE, Refused, TICKET_RE
 
@@ -932,9 +933,207 @@ class Asks(Collector):
         self.stale, self.flagged, self.cleared, self.swept_at = view["stale"], view["flagged"], view["cleared"], view["swept_at"]
         self.hub.snapshot("asks", self.snapshot())
 
+    ARCHIVE_SHOWN = 200
+
+    def archived(self) -> list[dict]:
+        """Settled and expired asks with the archive rule's verdict. A view only: every source list is kept as it
+        was, and an ask that is merely quiet (stale by inactivity) stays live."""
+        now = time.time()
+        rows: dict[str, dict] = {}
+        for row in archive.classify_all(self.resolved, "ask", now):
+            rows[row["id"]] = row
+        expired = [dict(r, reason="expired", evidence="until") for r in self.stale if r.get("stale") == "past its until time"]
+        for row in archive.classify_all(list(self.cleared) + expired, "cleared", now):
+            rows.setdefault(row["id"], row)
+        found = [r for r in rows.values() if r["bucket"] == "archived"]
+        found.sort(key=lambda r: (r["at"], r["id"]), reverse=True)
+        return found[:self.ARCHIVE_SHOWN]
+
     def snapshot(self) -> dict:
         return {"items": self.items, "resolved": self.resolved, "session": self.session, "stale": self.stale,
-                "flagged": self.flagged, "cleared": self.cleared, "swept_at": self.swept_at}
+                "flagged": self.flagged, "cleared": self.cleared, "swept_at": self.swept_at,
+                "archive": self.archived()}
+
+
+class Ledger(Collector):
+    """The harness ledgers the page shows: the mission goals (`ah goals`), the recorded requirements
+    (`ah requirements`) and the evidence-only status (`ah status`: deploys, live tests, blockers).
+
+    Read-only and bounded. Each source is read once per cadence (60 s with a page attached, 300 s without, plus the
+    attach refresh), never on a client poll. A failing source keeps its last good rows, marked stale, and shows in
+    the source health strip. The snapshot is published only when its content changed. Requirements carry the archive
+    verdict (archive.py): live or archived, with the rule and the reason."""
+    name = "ledger"
+    interval = 60.0
+    idle_interval = 300.0
+    LIMIT = 1024 * 1024          # one source's output; more is refused, never cut into valid-looking data
+    MAX_GOALS = 60
+    MAX_EVIDENCE = 12
+    MAX_REQUIREMENTS = 1000
+    MAX_STATUS = 30
+    STATUS_LISTS = ("verified", "live", "pending", "failed", "claimed", "blockers", "commits", "asks_open",
+                    "decisions", "assumptions", "live_legacy")
+
+    def __init__(self, hub, health, runner, session_fn, root=None):
+        super().__init__(hub, health)
+        self.runner, self.session_fn, self.root = runner, session_fn, root
+        self.parts = {name: {"stale": False, "error": "", "at": ""} for name in ("goals", "requirements", "status")}
+        self.parts["goals"]["items"] = []
+        self.parts["requirements"].update(items=[], total=0, truncated=False, summary=archive.summary([]))
+        self.parts["status"].update(counts={}, since_s=0, entries=0, owners={})
+        for key in self.STATUS_LISTS:
+            self.parts["status"][key] = []
+        self.sig = None
+        self.published_at = ""
+
+    # -- one source
+    def _read(self, part: str, label: str, kind: str, args: tuple, parse, now: float) -> str:
+        try:
+            code, out = self.runner.run(kind, *args, timeout=90, limit=self.LIMIT + 1)
+            if code != 0:
+                raise ValueError(f"{label} exited {code}")
+            raw = out.encode("utf-8", "replace") if isinstance(out, str) else bytes(out or b"")
+            if len(raw) > self.LIMIT:
+                raise ValueError(f"{label} output is over {self.LIMIT // 1024} KiB")
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                raise ValueError(f"{label} returned unreadable output") from None
+            if not isinstance(data, dict):
+                raise ValueError(f"{label} returned an unexpected shape")
+            value = parse(data, now)
+        except Exception as exc:  # noqa: BLE001 - a failed source keeps its last good rows
+            previous = self.parts[part]
+            message = ev.short(str(exc), 160)
+            self.parts[part] = dict(previous, stale=bool(previous.get("at")), error=message)
+            return message
+        self.parts[part] = dict(value, stale=False, error="", at=ev.iso(now))
+        return ""
+
+    def tick(self, now: float):
+        errors = [self._read("goals", "ah goals", "ah-goals", (), self._goals, now)]
+        session = self.session_fn() or ""
+        if session:
+            errors.append(self._read("requirements", "ah requirements", "ah-requirements", (session,), self._requirements, now))
+            errors.append(self._read("status", "ah status", "ah-status", (session,), self._status, now))
+        errors = [e for e in errors if e]
+        self.publish()
+        if errors:
+            raise RuntimeError("; ".join(errors)[:300])
+        reqs = self.parts["requirements"]
+        if not session:
+            return "goals only: no main session known yet"
+        return (f"{len(self.parts['goals']['items'])} goals, {reqs['summary']['live']} live and "
+                f"{reqs['summary']['archived']} archived requirements")
+
+    # -- parsers
+    @staticmethod
+    def _evidence_row(raw: dict) -> dict:
+        return {"id": ev.short(raw.get("id"), 40), "kind": ev.short(raw.get("kind"), 20), "verdict": ev.short(raw.get("verdict"), 12),
+                "at": ev.short(raw.get("at"), 40), "check": ev.short(raw.get("check"), 80), "by": ev.short(raw.get("by"), 40),
+                "note": ev.short(raw.get("note"), 300)}
+
+    @staticmethod
+    def _int(value, default=0):
+        return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+    def _goals(self, data: dict, now: float) -> dict:
+        items = []
+        for raw in (data.get("goals") if isinstance(data.get("goals"), list) else [])[:self.MAX_GOALS]:
+            if not isinstance(raw, dict) or not raw.get("id"):
+                continue
+            evidence = [self._evidence_row(e) for e in raw.get("evidence") or [] if isinstance(e, dict)]
+            evidence.sort(key=lambda e: e["at"], reverse=True)
+            ticket = str(raw.get("ticket") or "")
+            deferral = raw.get("deferral")
+            items.append({
+                "id": re.sub(r"[^A-Za-z0-9._-]", "_", str(raw["id"]))[:64], "title": ev.short(raw.get("title"), 200),
+                "ticket": ticket if TICKET_RE.match(ticket) else "", "state": ev.short(raw.get("state"), 40) or "UNKNOWN",
+                "ledger_status": ev.short(raw.get("ledger_status"), 40),
+                "priority": raw["priority"] if isinstance(raw.get("priority"), int) and not isinstance(raw.get("priority"), bool) else None,
+                "target": ev.short(raw.get("target"), 300),
+                "owners": [ev.short(o, 60) for o in (raw.get("owners") if isinstance(raw.get("owners"), list) else [])[:10]],
+                "deferral": ev.short(json.dumps(deferral, sort_keys=True), 300) if deferral else "",
+                "problems": {k: len(raw[k]) if isinstance(raw.get(k), list) else 0 for k in ("missing", "tampered", "unpinned")},
+                "evidence": evidence[:self.MAX_EVIDENCE], "evidence_total": len(evidence)})
+        return {"items": items}
+
+    def _ticket_closed(self):
+        """True, False or None (unknown) per ticket, from the sweeper's own ticket cache. Reads no tickets itself."""
+        if self.root is None:
+            return None
+        import mc_chat  # noqa: PLC0415
+        cache = mc_chat.read_json(Path(self.root) / "needs" / "tickets.json")
+        cache = cache if isinstance(cache, dict) else {}
+
+        def closed(ref):
+            known = cache.get(ref)
+            state = known.get("state") if isinstance(known, dict) else None
+            return True if state == "closed" else False if state == "open" else None
+        return closed
+
+    def _requirements(self, data: dict, now: float) -> dict:
+        rows = []
+        for raw in (data.get("requirements") if isinstance(data.get("requirements"), list) else []):
+            if not isinstance(raw, dict) or not raw.get("id"):
+                continue
+            ticket = str(raw.get("ticket") or "")
+            evidence = raw.get("evidence")
+            evidence = [self._evidence_row(e) for e in (evidence if isinstance(evidence, list) else [evidence])
+                        if isinstance(e, dict)][:5] if evidence else []
+            rows.append({"id": re.sub(r"[^A-Za-z0-9._-]", "_", str(raw["id"]))[:64], "session": ev.short(raw.get("session"), 64),
+                         "text": ev.short(raw.get("text"), 600), "source": ev.short(raw.get("source"), 300),
+                         "at": ev.short(raw.get("at"), 40),
+                         "state": ev.short(raw.get("state"), 40) if isinstance(raw.get("state"), str) else "",
+                         "ticket": ticket if TICKET_RE.match(ticket) else "",
+                         "owner": ev.short(raw.get("owner"), 60) if raw.get("owner") else "", "evidence": evidence})
+        rows.sort(key=lambda r: r["at"], reverse=True)
+        truncated = len(rows) > self.MAX_REQUIREMENTS or data.get("truncated") is True
+        classified = archive.classify_all(rows[:self.MAX_REQUIREMENTS], "requirement", time.time(), self._ticket_closed())
+        return {"items": classified, "total": self._int(data.get("total"), len(rows)), "truncated": truncated,
+                "summary": archive.summary(classified)}
+
+    def _status(self, data: dict, now: float) -> dict:
+        def entry(raw):
+            return {"id": ev.short(raw.get("id"), 40), "agent": ev.short(raw.get("agent"), 40), "at": ev.short(raw.get("at"), 40),
+                    "event": ev.short(raw.get("event"), 20), "note": ev.short(raw.get("note"), 400),
+                    "check": ev.short(raw.get("check"), 80), "verdict": ev.short(raw.get("verdict"), 12)}
+        out: dict = {"counts": {}}
+        for key in self.STATUS_LISTS:
+            rows = [r for r in (data.get(key) if isinstance(data.get(key), list) else []) if isinstance(r, dict)]
+            out["counts"][key] = len(rows)
+            rows.sort(key=lambda r: str(r.get("at", "")), reverse=True)
+            out[key] = [entry(r) for r in rows[:self.MAX_STATUS]]
+        owners = data.get("owners") if isinstance(data.get("owners"), dict) else {}
+        counts = owners.get("counts") if isinstance(owners.get("counts"), dict) else {}
+
+        def names(key):
+            value = owners.get(key)
+            return [ev.short(a, 40) for a in (value if isinstance(value, list) else [])[:20]]
+        out["owners"] = {"counts": {ev.short(k, 40): v for k, v in list(counts.items())[:30] if isinstance(v, int) and not isinstance(v, bool)},
+                         "attention": names("attention"), "live": names("live"), "undisposed": names("undisposed")}
+        out["since_s"], out["entries"] = self._int(data.get("since_s")), self._int(data.get("entries"))
+        return out
+
+    # -- publication
+    def snapshot(self) -> dict:
+        return {"goals": self.parts["goals"], "requirements": self.parts["requirements"], "status": self.parts["status"],
+                "generated": self.published_at}
+
+    def publish(self) -> None:
+        """Push the snapshot only when its content changed; the read time alone is not a change."""
+        def strip(value):
+            if isinstance(value, dict):
+                return {k: strip(v) for k, v in value.items() if not (k == "at" and "stale" in value)}
+            if isinstance(value, list):
+                return [strip(v) for v in value]
+            return value
+        sig = json.dumps(strip(self.parts), sort_keys=True, default=str)
+        if sig == self.sig:
+            return
+        self.sig = sig
+        self.published_at = ev.iso()
+        self.hub.snapshot("ledger", self.snapshot())
 
 
 class GitHub(Collector):
