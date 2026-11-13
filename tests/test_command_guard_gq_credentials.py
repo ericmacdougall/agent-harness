@@ -102,6 +102,29 @@ R4_NEIGHBOURS = ["cd ~ && ag --color-match 1 tok /tmp", "cd ~ && ack --ignore-di
                  "tar -zxvf pkg.tgz -C ~", "tar -xzfarchive.tgz -C ~", "tar --extract -f x.tar -C ~", "tar --extr -f x.tar -C ~",
                  "tar -x -f x.tar -C ~", "scp -P 22 host:file ~/", "rsync -avz --exclude .git host:x/ ~/", "rsync -a -e ssh host:x/ ~/",
                  "rsync -a host:x/ ~/ --log-file /tmp/rsync.log", "rsync -a /tmp/ ~/"]
+# receipt r5 F1: count-only is each tool's own letters and long names; rg -L is --follow and ag --silent only silences logs
+R5_COUNT_ONLY_PER_TOOL = ["rg -L . ~/.config/goodqa", "rg -uuL tok ~/.config/goodqa", "cd ~ && rg -L tok", "cd ~ && ag --silent tok",
+                          "ag --silent tok ~/.config/goodqa", "find ~/.config/goodqa -exec rg -L . {} +",
+                          "rg -L . < ~/.config/goodqa/user-token"]
+# receipt r5 F2: where tar implementations disagree the most dangerous reading wins: GNU -s and bsdtar -H and -L are flags,
+# so a later c is create; a word after a value option is its value, not a mode; an old-style word with a digit is in doubt;
+# TAR_OPTIONS may supply options the command line does not show
+R5_TAR_CLASH = ["tar -sc -V -x -f - ~", "tar -sc -V -x -f - ~/.config/goodqa", "tar -Lc -C -x -f - ~/.config/goodqa", "tar -Hc -f -x ~",
+                "tar c0f - ~/.config/goodqa", "tar -f -x -c ~/.config/goodqa", "tar --file -x -c ~/.config/goodqa",
+                "bsdtar -Hcf - ~/.config/goodqa", "TAR_OPTIONS=-cV tar -x -f - ~/.config/goodqa",
+                "export TAR_OPTIONS=-cV; tar -x -f - ~/.config/goodqa"]
+# receipt r5 F3: a file the search opens as an option value is judged by name
+R5_READ_VALUES = ["grep -f ~/.config/goodqa/user-token notes.txt", "grep --file=~/.config/goodqa/user-token notes.txt",
+                  "grep -f~/.config/goodqa/user-token notes.txt", "rg --ignore-file ~/.config/goodqa/user-token tok /tmp"]
+# the r5 sweep: pt is not trusted to read a pipe; curl -O takes no value (the next word is a source); options from the
+# environment or a config file make the reading uncertain
+R5_SWEEP = ["cd ~ && echo x | pt tok", "curl -O file:///Users/eric/.config/goodqa/",
+            "cd /tmp && RIPGREP_CONFIG_PATH=/tmp/rgc rg ~/.config/goodqa", "cd /tmp && GREP_OPTIONS=-e. grep -r ~/.config/goodqa",
+            "cd /tmp && ACK_OPTIONS=--match=. ack ~/.config/goodqa"]
+R5_NEIGHBOURS = ["rg -c . ~/.config/goodqa", "rg -l tok ~/.config/goodqa", "rg --files ~/.config/goodqa", "ag -l tok ~/.config/goodqa",
+                 "ack -c tok ~/.config/goodqa", "grep -rL tok ~/.config/goodqa", "cd ~ && echo x | rg tok", "tar -f x.tar -x -C ~",
+                 "tar -xv --strip-components=1 -f x.tar -C ~", "tar --verbose -x -f x.tar -C ~", "grep -f patterns.txt notes.txt",
+                 "wget -O ~/x.txt http://example.com/x", "curl -o ~/x.txt http://example.com/x"]
 RULE = "[secret_dump/"
 
 
@@ -185,6 +208,31 @@ class GoodqaCredentialPaths(unittest.TestCase):
 
     def test_r4_neighbours_stay_allowed(self):
         for command in R4_NEIGHBOURS:
+            with self.subTest(command):
+                self.assertNotEqual(self.verdict(command), "block", command)
+
+    def test_r5_count_only_letters_are_per_tool(self):
+        for command in R5_COUNT_ONLY_PER_TOOL:
+            with self.subTest(command):
+                self.blocked_by_the_credential_rule(command)
+
+    def test_r5_tar_takes_the_most_dangerous_reading(self):
+        for command in R5_TAR_CLASH:
+            with self.subTest(command):
+                self.blocked_by_the_credential_rule(command)
+
+    def test_r5_a_file_read_as_an_option_value_is_judged(self):
+        for command in R5_READ_VALUES:
+            with self.subTest(command):
+                self.blocked_by_the_credential_rule(command)
+
+    def test_r5_sweep_stdin_curl_and_option_sources(self):
+        for command in R5_SWEEP:
+            with self.subTest(command):
+                self.blocked_by_the_credential_rule(command)
+
+    def test_r5_neighbours_stay_allowed(self):
+        for command in R5_NEIGHBOURS:
             with self.subTest(command):
                 self.assertNotEqual(self.verdict(command), "block", command)
 

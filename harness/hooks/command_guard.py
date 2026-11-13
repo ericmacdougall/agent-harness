@@ -2434,7 +2434,7 @@ def _nondash(args):
 
 class OptScan:
     """What a getopt-style walk of a command's words found (see `_scan_options`)."""
-    __slots__ = ('operands', 'free', 'letters', 'longs', 'pattern_given', 'uncertain', 'after_unknown')
+    __slots__ = ('operands', 'free', 'letters', 'longs', 'pattern_given', 'uncertain', 'after_unknown', 'read_values')
 
     def __init__(self):
         self.operands = []          # words that are neither an option nor the value of a recognised option, in order
@@ -2444,6 +2444,7 @@ class OptScan:
         self.pattern_given = False  # a pattern came from an option (-e PAT, -ePAT, -f FILE, --regexp=PAT)
         self.uncertain = False      # an option the table does not know: it may take the next word, so operands are unsure
         self.after_unknown = set()  # id() of each word right after an unknown option (it may be that option's value)
+        self.read_values = []       # values of options that name a file the tool opens and reads (grep -f FILE)
 
 
 def _scan_options(args, table):
@@ -2459,6 +2460,7 @@ def _scan_options(args, table):
     lv, lf = table.get('long_values', frozenset()), table.get('long_flags', frozenset())
     lo = table.get('long_optional', frozenset())  # optional value: known with `=value`, uncertain without (it may take a word)
     ps, pls = table.get('pattern_short', ''), table.get('pattern_long', frozenset())
+    rs, rls = table.get('read_short', ''), table.get('read_long', frozenset())
     words, i, after_dd = list(args), 0, False
     while i < len(words):
         t = words[i].text
@@ -2476,8 +2478,12 @@ def _scan_options(args, table):
             if name in lv:
                 scan.longs.add(name)
                 scan.pattern_given = scan.pattern_given or name in pls
+                if eq and name in rls:
+                    scan.read_values.append(t.split('=', 1)[1])
                 if not eq and i + 1 < len(words):
                     i += 1  # the separate value
+                    if name in rls:
+                        scan.read_values.append(words[i].text)
                     if not words[i].text.startswith('-'):
                         scan.free.append(words[i])
             elif name in lf or (eq and name in lo):
@@ -2494,6 +2500,8 @@ def _scan_options(args, table):
             if ch in sv:
                 scan.pattern_given = scan.pattern_given or ch in ps
                 take_next = j + 1 == len(t)  # otherwise the rest of the cluster is the value
+                if ch in rs and not take_next:
+                    scan.read_values.append(t[j + 1:])
                 break
             if ch in sf:
                 scan.letters.add(ch)
@@ -2505,6 +2513,8 @@ def _scan_options(args, table):
             break
         if take_next and i + 1 < len(words):
             i += 1  # the separate value
+            if t[-1] in rs:
+                scan.read_values.append(words[i].text)
             if not words[i].text.startswith('-'):
                 scan.free.append(words[i])
         i += 1
@@ -2516,6 +2526,9 @@ def _scan_options(args, table):
 # The grep table is the union of GNU and BSD (macOS) grep; a letter that takes a value in either is a value letter.
 _GREP_TABLE = {
     'short_values': 'ABCDdefmX', 'short_flags': '0123456789EFGHIJLMOPRSTUVZabchilnopqrsuvwxyz',  # -5: context lines
+    # count-only: options that print no matching line in EVERY grep (GNU and BSD agree on these)
+    'count_short': 'cqlL', 'count_long': frozenset({'count', 'quiet', 'silent', 'files-with-matches', 'files-without-match'}),
+    'read_short': 'f', 'read_long': frozenset({'file', 'exclude-from'}),
     'pattern_short': 'ef', 'pattern_long': frozenset({'regexp', 'file'}), 'long_optional': frozenset({'context'}),
     'long_values': frozenset({'regexp', 'file', 'max-count', 'after-context', 'before-context', 'label', 'include', 'exclude',
                               'exclude-from', 'exclude-dir', 'include-dir', 'binary-files', 'devices', 'directories',
@@ -2530,6 +2543,10 @@ _GREP_TABLE = {
 }
 _RG_TABLE = {
     'short_values': 'ABCdEefgjMmrtT', 'short_flags': 'abcFHhIiLlNnoPpqSsUuVvwxz0.',
+    # rg -L is --follow and prints matches (receipt r5 F1), so it is not count-only here
+    'count_short': 'cql', 'count_long': frozenset({'count', 'count-matches', 'quiet', 'files-with-matches', 'files-without-match',
+                                                    'files'}),
+    'read_short': 'f', 'read_long': frozenset({'file', 'ignore-file'}),
     'pattern_short': 'ef', 'pattern_long': frozenset({'regexp', 'file'}),
     'long_values': frozenset({'after-context', 'before-context', 'context', 'max-depth', 'maxdepth', 'encoding', 'regexp', 'file',
                               'glob', 'iglob', 'threads', 'max-columns', 'max-count', 'replace', 'type', 'type-not', 'type-add',
@@ -2560,6 +2577,9 @@ _RG_TABLE = {
 # ag -A, -B and -C (and --after, --before, --context) are optional-valued in the long form, so they are in neither list
 _AG_TABLE = {
     'short_values': 'GgmpW', 'short_flags': 'acDFfHhiLlnoQRrSsvVtuUwz0', 'long_optional': frozenset({'after', 'before', 'context'}),
+    # ag --silent only silences log messages; it still prints matches
+    'count_short': 'clL', 'count_long': frozenset({'count', 'files-with-matches', 'files-without-matches'}),
+    'read_long': frozenset({'path-to-ignore'}), 'read_short': 'p',
     'long_values': frozenset({'depth', 'ignore', 'ignore-dir', 'file-search-regex', 'path-to-ignore', 'pager', 'color-line-number',
                               'color-match', 'color-path', 'max-count', 'width', 'workers'}),
     'long_flags': frozenset({'all-text', 'all-types', 'case-sensitive', 'color', 'nocolor', 'column', 'count', 'debug',
@@ -2573,6 +2593,7 @@ _AG_TABLE = {
 # ack -C is optional-valued, so it is in neither list; ack --TYPE and --noTYPE are unknown (fail closed)
 _ACK_TABLE = {
     'short_values': 'ABgm', 'short_flags': 'acfHhIiklLnosvwx1',
+    'count_short': 'clL', 'count_long': frozenset({'count', 'files-with-matches', 'files-without-matches'}),
     'pattern_long': frozenset({'match'}), 'long_optional': frozenset({'context'}),
     'long_values': frozenset({'type-set', 'type-add', 'type-del', 'ignore-dir', 'noignore-dir', 'ignore-directory',
                               'noignore-directory', 'ignore-file', 'match', 'max-count', 'after-context', 'before-context',
@@ -2589,14 +2610,31 @@ SEARCH_TABLES = {'grep': _GREP_TABLE, 'egrep': _GREP_TABLE, 'fgrep': _GREP_TABLE
 # searchers that walk the working directory when no path is named (pt, the platinum searcher, has no table: any option is
 # uncertain)
 RECURSIVE_SEARCHERS = {'rg', 'ag', 'ack', 'pt'}
+# searchers that read a pipe instead of the working directory when no path is named; pt is left out (most dangerous reading)
+STDIN_SEARCHERS = {'rg', 'ag', 'ack'}
 
-# tar, bsdtar and gtar letters that take a value (the union, so `-s` of bsdtar counts); a letter after one of them in a
-# cluster is part of the value, never a mode
-_TAR_VALUE_LETTERS = 'bCfFgHIKLNsTVX'
-_PAX_VALUE_LETTERS = 'bfopsxBEGTU'
+# tar letters. Where GNU tar, bsdtar (macOS) and busybox tar disagree, the guard takes the most dangerous reading
+# (receipt r5 F2): a letter that takes a value in EVERY one of them (C f T X) ends a cluster for every reading; a letter
+# that takes a value in only some (GNU -H -L -F -g -K -N -V -b, bsdtar -s -I) may be a plain flag, so the letters after it
+# may be options. Create mode is read from the MAXIMAL reading (stop only at an every-tar value letter, look at every
+# word), extract or list mode from the MINIMAL reading (stop at any value letter, skip a word that may be a value).
+_TAR_VALUE_ALL = 'CfTX'
+_TAR_VALUE_ANY = 'bCfFgHIKLNsTVX'
+_PAX_VALUE_ALL = 'bfopsx'       # POSIX pax
+_PAX_VALUE_ANY = 'bfopsxBEGTU'  # BSD pax adds -B -E -G -T -U
 _TAR_CREATE_LONGS = ('create', 'append', 'update', 'catenate', 'concatenate', 'delete')
 _TAR_READ_LONGS = ('extract', 'get', 'list', 'diff', 'compare')
-_TAR_MODE_LETTERS = {'c': 'create', 'r': 'create', 'u': 'create', 'A': 'create', 'x': 'read', 't': 'read', 'd': 'read'}
+# long tar options known to take no value; any other long option without `=value` may take the next word
+_TAR_FLAG_LONGS = frozenset({'verbose', 'gzip', 'gunzip', 'ungzip', 'bzip2', 'xz', 'lzma', 'lzip', 'lzop', 'zstd', 'compress',
+                             'uncompress', 'auto-compress', 'no-auto-compress', 'preserve-permissions', 'same-permissions',
+                             'no-same-permissions', 'preserve-order', 'same-order', 'same-owner', 'no-same-owner',
+                             'numeric-owner', 'overwrite', 'overwrite-dir', 'keep-old-files', 'keep-newer-files',
+                             'skip-old-files', 'unlink-first', 'recursive-unlink', 'totals', 'wildcards', 'no-wildcards',
+                             'recursion', 'no-recursion', 'dereference', 'absolute-names', 'one-file-system', 'sparse',
+                             'ignore-zeros', 'touch', 'no-overwrite-dir', 'show-transformed-names',
+                             'interactive', 'confirmation', 'check-links', 'ignore-failed-read', 'null', 'no-null',
+                             'acls', 'no-acls', 'xattrs', 'no-xattrs', 'selinux', 'no-selinux', 'fast-read', 'insecure',
+                             'help', 'version', 'usage', 'show-defaults'})
 
 # copy tools: options that take a separate value, so the value is never counted as a source or the destination
 _COPY_TABLES = {
@@ -2615,42 +2653,82 @@ _COPY_TABLES = {
 }
 
 
+# options a tool also takes from its environment or a config file; when one may be in force, the command line alone does
+# not show which words are options, so the reading is in doubt (receipt r5 sweep: `TAR_OPTIONS=-cV tar -x -f - DIR`
+# makes `-x` a volume label; `RIPGREP_CONFIG_PATH=c rg DIR` with `--regexp=.` in c makes DIR a path, not the pattern)
+OPTION_SOURCES = {'tar': ('TAR_OPTIONS',), 'gtar': ('TAR_OPTIONS',), 'grep': ('GREP_OPTIONS',), 'egrep': ('GREP_OPTIONS',),
+                  'fgrep': ('GREP_OPTIONS',), 'zgrep': ('GREP_OPTIONS',), 'rg': ('RIPGREP_CONFIG_PATH',),
+                  'ack': ('ACK_OPTIONS', 'ACKRC')}
+
+
+def _options_from_environment(name, raw_text, cwd=None):
+    """True when `name` may take options from outside its command line: the variable is named anywhere in the command
+    text (an assignment, export or env prefix) or set in this environment, or (ack) an .ackrc exists in the home or working
+    directory without --noenv."""
+    sources = OPTION_SOURCES.get(name, ())
+    if any(v in (raw_text or '') or os.environ.get(v) for v in sources):
+        return True
+    if name == 'ack':
+        if 'ackrc' in (raw_text or '') and '--noenv' not in (raw_text or ''):
+            return True
+        if '--noenv' not in (raw_text or ''):
+            for d in (os.path.expanduser('~'), cwd):
+                try:
+                    if d and os.path.exists(os.path.join(d, '.ackrc')):
+                        return True
+                except (OSError, ValueError):
+                    pass
+    return False
+
+
 def _tar_mode(name, args):
-    """'read' (extract or list), 'create', or None when the mode is in doubt. Letters are read the way tar reads them: in a
-    cluster a value letter (-f, -C, -V and the rest) takes the rest of the cluster, so `-Vt` is a volume label, not list
-    mode; the old-style first word (`tar xzf`) is a bundle of letters; any abbreviation of a long create option (`--cre`) is
-    create. Two modes, an unknown letter after which a mode could hide, or no mode at all is None (the caller skips nothing)."""
-    modes, words = set(), [a.text for a in args]
-    value_letters = _PAX_VALUE_LETTERS if name == 'pax' else _TAR_VALUE_LETTERS
+    """'read' (extract or list), 'create', or None when the mode is in doubt (the caller skips nothing unless 'read').
+    Create wins whenever ANY reading shows it: a create letter before the first every-tar value letter of any dash word
+    (`tar -sc`, `tar -Lc`, `tar -Hc`: GNU -s and bsdtar -H/-L are flags), the old-style first word, or any abbreviation of a
+    long create option (`--cre`), even in a word that may be an option value. Read needs EVERY reading: a read letter before
+    the first value letter of any tar, in a word that can not be the value of the option before it (`-f -x` names the
+    archive `-x`). An old-style first word that is not all letters (`c0f`) is None."""
+    pax = name == 'pax'
+    v_all, v_any = (_PAX_VALUE_ALL, _PAX_VALUE_ANY) if pax else (_TAR_VALUE_ALL, _TAR_VALUE_ANY)
+    create_letters, read_letters = ('w', 'r') if pax else ('cruA', 'xtd')
+    words = [a.text for a in args]
+    create = read = False
+    pending = 0  # how many of the next words may be the value of an option before them
     for k, t in enumerate(words):
         if t == '--':
             break
+        maybe_value, pending = pending > 0, max(pending - 1, 0)
         if t.startswith('--'):
-            long_name = t[2:].split('=', 1)[0]
-            if long_name and any(m.startswith(long_name) for m in _TAR_CREATE_LONGS):
-                modes.add('create')
-            elif len(long_name) >= 2 and any(m.startswith(long_name) for m in _TAR_READ_LONGS):
-                modes.add('read')
+            long_name, eq, _ = t[2:].partition('=')
+            is_create = bool(long_name) and any(m.startswith(long_name) for m in _TAR_CREATE_LONGS)
+            is_read = len(long_name) >= 2 and any(m.startswith(long_name) for m in _TAR_READ_LONGS)
+            create = create or is_create
+            read = read or (is_read and not maybe_value)
+            if not eq and not is_create and not is_read and long_name not in _TAR_FLAG_LONGS:
+                pending = max(pending, 1)
             continue
-        letters = ''
-        if k == 0 and name != 'pax' and t and not t.startswith('-') and re.fullmatch(r'[A-Za-z]+', t):
-            letters = t  # old style: every letter of the first word is an option, their values follow as words
-        elif len(t) > 1 and t[0] == '-':
-            for ch in t[1:]:
-                if ch in value_letters:
+        if k == 0 and not pax and not t.startswith('-'):
+            if not re.fullmatch(r'[A-Za-z]+', t):
+                return None  # old style with a digit or other character: in doubt
+            create = create or any(ch in create_letters for ch in t)
+            read = read or any(ch in read_letters for ch in t)
+            pending = max(pending, sum(ch in v_any for ch in t))  # old style: the values follow as words
+            continue
+        if len(t) > 1 and t[0] == '-':
+            for ch in t[1:]:  # maximal reading
+                if ch in v_all:
                     break
-                letters += ch
-        for ch in letters:
-            if name == 'pax':
-                modes.add({'w': 'create', 'r': 'read'}.get(ch, ''))
-            else:
-                modes.add(_TAR_MODE_LETTERS.get(ch, ''))
-    modes.discard('')
-    if name == 'pax':
-        if modes == {'read', 'create'}:
-            return 'create'  # pax -rw copies the named source trees
-        return 'read' if modes == {'read'} else ('create' if 'create' in modes else None)
-    return modes.pop() if len(modes) == 1 else None
+                create = create or ch in create_letters
+            if not maybe_value:
+                for ch in t[1:]:  # minimal reading
+                    if ch in v_any:
+                        break
+                    read = read or ch in read_letters
+            if t[-1] in v_any:
+                pending = max(pending, 1)  # in some reading the last letter takes the next word
+    if create:
+        return 'create'
+    return 'read' if read else None
 
 
 def _is_subseq(required, tokens):
@@ -3526,7 +3604,7 @@ class Analyzer:
             if r.op in ('<', '<>') and target:
                 if self.is_cred_path(target, r.target):
                     ctx.secret_seen += 1
-                    if not (name in NONPRINT_SINKS or name in ('test', '[') or (name in GREP_CMDS and self._count_only(words[1:], _scan_options(words[1:], SEARCH_TABLES[name]) if name in SEARCH_TABLES else None))):
+                    if not (name in NONPRINT_SINKS or name in ('test', '[') or (name in GREP_CMDS and self._count_only(name, _scan_options(words[1:], SEARCH_TABLES.get(name, {}))))):
                         if not has_command or self.out_visible(pl, idx, True):
                             ctx.add(SECRET_DUMP, 'credential-stdin',
                                     'feeds a credential file to a command that can print it',
@@ -4407,7 +4485,7 @@ class Analyzer:
                     p = norm_path(r.text, ctx, ctx.cwd)
                     if self.under_cred_dir(p) or self.under_cred_parent(p, below=True) or self.is_cred_path(r.text, r):
                         ctx.secret_seen += 1
-                        if self.out_visible(pl, idx, True) and not (bname in GREP_CMDS and self._count_only(body[1:])):
+                        if self.out_visible(pl, idx, True) and not (bname in GREP_CMDS and self._count_only(bname, _scan_options(body[1:], SEARCH_TABLES.get(bname, {})))):
                             ctx.add(SECRET_DUMP, 'find-exec-credentials',
                                     'find -exec prints files from a credential directory',
                                     'list names only: find DIR -name PATTERN -print')
@@ -4874,16 +4952,15 @@ class Analyzer:
         return False
 
     @staticmethod
-    def _count_only(args, scan=None):
-        """-c, -q, -l, -L, --count and the rest print no matching line. With a scan (a searcher with an option table) only
-        letters and long names the scan read as OPTIONS count, never the letters of a value (`grep -ec FILE` is the pattern
-        `c`, not -c) and never a value that looks like an option (`grep -e --count FILE`)."""
-        if scan is not None:
-            if scan.uncertain:
-                return False  # an unknown option may have hidden which letters are options; fail closed
-            return bool(scan.letters & set('cqlL') or scan.longs & {'count', 'quiet', 'silent', 'files-with-matches',
-                                                                      'files-without-match', 'files'})
-        return bool(_flag_letters(args) & set('cqlL') or _longs(args) & {'--count', '--quiet', '--silent', '--files-with-matches', '--files-without-match', '--files'})
+    def _count_only(name, scan):
+        """True when the search prints no matching line: the tool's OWN count-only letters and long names (receipt r5 F1:
+        rg -L is --follow, while grep, ag and ack -L list files), read by the scan as OPTIONS only, never the letters of a
+        value (`grep -ec FILE` is the pattern `c`) or a value that looks like an option (`grep -e --count FILE`). A tool with
+        no table (pt, select-string) and an uncertain scan are never count-only."""
+        table = SEARCH_TABLES.get(name)
+        if table is None or scan.uncertain:
+            return False
+        return bool(scan.letters & set(table.get('count_short', '')) or scan.longs & table.get('count_long', frozenset()))
 
     @staticmethod
     def _grep_recursive_long(texts):
@@ -4939,14 +5016,17 @@ class Analyzer:
             if len(operands) >= 2 and any(is_source(w) for w in operands[:-1] if id(w) not in scan.after_unknown):
                 skip.append(operands[-1])
         elif name in ('wget', 'curl'):
-            flags = ('-P', '--directory-prefix', '-O', '--output-document', '-o', '--output', '-D', '--dump-header', '-c', '--cookie-jar')
+            # per tool, because the letters clash (receipt r5 sweep): curl -O is --remote-name (no value, the next word is a
+            # URL or source), wget -c is --continue and curl -P is --ftp-port; only options that name a written file count
+            flags = {'wget': ('-P', '--directory-prefix', '-O', '--output-document', '-o', '--output-file', '-a', '--append-output'),
+                     'curl': ('-o', '--output', '-D', '--dump-header', '-c', '--cookie-jar', '--output-dir')}[name]
             for i, t in enumerate(texts[:-1]):
                 if t in flags:
                     skip.append(words[i + 1])
         elif name in ('tar', 'bsdtar', 'gtar', 'pax'):
             # extract or list: nothing named here is read as a source tree. Create, two modes or a mode in doubt skip nothing
             # (receipt r4 F2: `tar --cre -f - -Vt DIR` is create; the `t` is the volume label of -V)
-            if _tar_mode(name, args) == 'read':
+            if _tar_mode(name, args) == 'read' and not (ctx is not None and _options_from_environment(name, getattr(ctx, 'raw_top', ''))):
                 skip.extend(words)
         elif name == 'zip':
             # the first operand is the archive; a bare `-` is that operand (the archive goes to stdout), so the directory after
@@ -4969,7 +5049,7 @@ class Analyzer:
         ctx = self.ctx
         texts = [a.text for a in args]
         words = list(args)
-        uncertain = False
+        uncertain, read_values = False, []
         if name in GREP_CMDS:
             # a getopt walk with the tool's option table: a recognised value option takes its value (also attached: -etok,
             # -rnA3), the first free word is the pattern unless an option gave one. An option the table does not know makes
@@ -4977,12 +5057,15 @@ class Analyzer:
             # every free word, the presumed pattern included, is judged, and a recursive search is also judged on the
             # working directory whatever its operands (receipt r4 F1: `cd ~ && grep -r -e tok --group-separator /tmp`)
             scan = _scan_options(args, SEARCH_TABLES.get(name, {}))
+            if _options_from_environment(name, getattr(ctx, 'raw_top', ''), ctx.cwd):
+                scan.uncertain = True
             uncertain = scan.uncertain
             if uncertain:
                 words = scan.free
             else:
                 words = scan.operands if scan.pattern_given else scan.operands[1:]
-            count_only = self._count_only(args, scan)
+            count_only = self._count_only(name, scan)
+            read_values = scan.read_values
         else:
             words = [w for w in words if not (w.text.startswith('-') and len(w.text) > 1)]
             count_only = False
@@ -4992,7 +5075,7 @@ class Analyzer:
             words = [w for w in args]
         recursive = name in GREP_CMDS and (_flag_letters(args) & set('rR') or name in RECURSIVE_SEARCHERS or self._grep_recursive_long(texts)
                                           or self._grep_directories_recurse(texts))
-        reads_stdin = idx > 0 and name in RECURSIVE_SEARCHERS  # a piped rg reads stdin; GNU grep -r with no operand still walks the directory
+        reads_stdin = idx > 0 and name in STDIN_SEARCHERS  # a piped rg reads stdin; GNU grep -r with no operand still walks the directory
         # the working directory is judged when the search names no existing path, and ALWAYS when an option was not
         # recognised: that option may have taken the only path as its value, and the tool then searches the working
         # directory (`cd ~ && grep -r --group /tmp tok`, where --group abbreviates --group-separator); a person names a path
@@ -5007,6 +5090,16 @@ class Analyzer:
                         '`%s` with no path searches the working directory, which holds or contains a credential file' % name,
                         'name a path outside the credential directories, or search with `grep -c` / `rg -c` to count')
                 return
+        for value in read_values:
+            # grep -f FILE, --file=FILE, rg --ignore-file FILE: the tool opens that file, so a credential named there is a
+            # credential read (receipt r5 F3); judged by name like an operand
+            if self._cred_one(value):
+                ctx.secret_seen += 1
+                if not count_only and self.out_visible(pl, idx, True):
+                    ctx.add(SECRET_DUMP, 'credential-file',
+                            '`%s` reads a credential file as an option value (%s)' % (name, posixpath.basename(norm_path(value, ctx))[:40]),
+                            'check existence with `test -s FILE`; never feed a credential file to a search tool')
+                    return
         destinations = self._local_destinations(name, args, ctx) if name in ARCHIVE_CMDS or name in EXFIL_CMDS else []
         for w in words:
             t = w.text
