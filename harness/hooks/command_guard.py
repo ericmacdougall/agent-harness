@@ -2432,6 +2432,227 @@ def _nondash(args):
     return out
 
 
+class OptScan:
+    """What a getopt-style walk of a command's words found (see `_scan_options`)."""
+    __slots__ = ('operands', 'free', 'letters', 'longs', 'pattern_given', 'uncertain', 'after_unknown')
+
+    def __init__(self):
+        self.operands = []          # words that are neither an option nor the value of a recognised option, in order
+        self.free = []              # every word that does not start with `-` (or follows `--`), option values included
+        self.letters = set()        # short option letters read before any value (never letters of a value)
+        self.longs = set()          # long option names (without `--` or `=value`) that are recognised
+        self.pattern_given = False  # a pattern came from an option (-e PAT, -ePAT, -f FILE, --regexp=PAT)
+        self.uncertain = False      # an option the table does not know: it may take the next word, so operands are unsure
+        self.after_unknown = set()  # id() of each word right after an unknown option (it may be that option's value)
+
+
+def _scan_options(args, table):
+    """Walk args like getopt with a per-tool table {'short_values', 'short_flags', 'long_values', 'long_flags',
+    'long_optional', 'pattern_short', 'pattern_long'}. An option that is in neither list (an unknown letter, an unknown long
+    name, an abbreviation of a long option, an attached `--name=value` of an unknown name) sets `uncertain`; the scan does not
+    let it take the next word. Values of recognised options are consumed (never operands); a value letter that ends a short
+    cluster takes the next word. When the scan is uncertain the caller judges `free`, every word not starting with `-`: an
+    unknown option that really takes a value shifts what the later options take, so a word the scan consumed as a value may
+    be an operand (`grep -r -e tok --lab -m DIR`, where --lab takes `-m` and DIR is searched)."""
+    scan = OptScan()
+    sv, sf = table.get('short_values', ''), table.get('short_flags', '')
+    lv, lf = table.get('long_values', frozenset()), table.get('long_flags', frozenset())
+    lo = table.get('long_optional', frozenset())  # optional value: known with `=value`, uncertain without (it may take a word)
+    ps, pls = table.get('pattern_short', ''), table.get('pattern_long', frozenset())
+    words, i, after_dd = list(args), 0, False
+    while i < len(words):
+        t = words[i].text
+        if after_dd or t == '-' or not t.startswith('-'):
+            scan.operands.append(words[i])
+            scan.free.append(words[i])
+            i += 1
+            continue
+        if t == '--':
+            after_dd = True
+            i += 1
+            continue
+        if t.startswith('--'):
+            name, eq, _ = t[2:].partition('=')
+            if name in lv:
+                scan.longs.add(name)
+                scan.pattern_given = scan.pattern_given or name in pls
+                if not eq and i + 1 < len(words):
+                    i += 1  # the separate value
+                    if not words[i].text.startswith('-'):
+                        scan.free.append(words[i])
+            elif name in lf or (eq and name in lo):
+                scan.longs.add(name)  # an exact flag name; an attached `=value` (--color=always) can not take the next word
+            else:
+                scan.uncertain = True
+                if not eq and i + 1 < len(words):
+                    scan.after_unknown.add(id(words[i + 1]))
+            i += 1
+            continue
+        j, take_next = 1, False
+        while j < len(t):
+            ch = t[j]
+            if ch in sv:
+                scan.pattern_given = scan.pattern_given or ch in ps
+                take_next = j + 1 == len(t)  # otherwise the rest of the cluster is the value
+                break
+            if ch in sf:
+                scan.letters.add(ch)
+                j += 1
+                continue
+            scan.uncertain = True  # an unknown letter: it may take the rest of the cluster or the next word
+            if i + 1 < len(words):
+                scan.after_unknown.add(id(words[i + 1]))
+            break
+        if take_next and i + 1 < len(words):
+            i += 1  # the separate value
+            if not words[i].text.startswith('-'):
+                scan.free.append(words[i])
+        i += 1
+    return scan
+
+
+# Option tables of the recursive searchers. A letter or long name that is missing makes a search `uncertain` (fail closed:
+# the working directory and every free word are judged), so a missing entry can only over-block, never hide a path.
+# The grep table is the union of GNU and BSD (macOS) grep; a letter that takes a value in either is a value letter.
+_GREP_TABLE = {
+    'short_values': 'ABCDdefmX', 'short_flags': '0123456789EFGHIJLMOPRSTUVZabchilnopqrsuvwxyz',  # -5: context lines
+    'pattern_short': 'ef', 'pattern_long': frozenset({'regexp', 'file'}), 'long_optional': frozenset({'context'}),
+    'long_values': frozenset({'regexp', 'file', 'max-count', 'after-context', 'before-context', 'label', 'include', 'exclude',
+                              'exclude-from', 'exclude-dir', 'include-dir', 'binary-files', 'devices', 'directories',
+                              'group-separator'}),
+    # --context is optional-valued in BSD grep and required in GNU grep: known only as --context=N
+    'long_flags': frozenset({'extended-regexp', 'fixed-strings', 'basic-regexp', 'perl-regexp', 'ignore-case', 'no-ignore-case',
+                             'word-regexp', 'line-regexp', 'null-data', 'no-messages', 'invert-match', 'version', 'help',
+                             'byte-offset', 'line-number', 'line-buffered', 'with-filename', 'no-filename', 'only-matching',
+                             'quiet', 'silent', 'recursive', 'dereference-recursive', 'files-without-match',
+                             'files-with-matches', 'count', 'initial-tab', 'null', 'text', 'color', 'colour', 'binary',
+                             'unix-byte-offsets', 'no-group-separator', 'mmap'}),
+}
+_RG_TABLE = {
+    'short_values': 'ABCdEefgjMmrtT', 'short_flags': 'abcFHhIiLlNnoPpqSsUuVvwxz0.',
+    'pattern_short': 'ef', 'pattern_long': frozenset({'regexp', 'file'}),
+    'long_values': frozenset({'after-context', 'before-context', 'context', 'max-depth', 'maxdepth', 'encoding', 'regexp', 'file',
+                              'glob', 'iglob', 'threads', 'max-columns', 'max-count', 'replace', 'type', 'type-not', 'type-add',
+                              'type-clear', 'color', 'colors', 'context-separator', 'field-context-separator',
+                              'field-match-separator', 'path-separator', 'sort', 'sortr', 'max-filesize', 'ignore-file', 'pre',
+                              'pre-glob', 'dfa-size-limit', 'regex-size-limit', 'engine', 'hyperlink-format', 'generate',
+                              'hostname-bin'}),
+    'long_flags': frozenset({'hidden', 'no-hidden', 'no-ignore', 'ignore', 'no-ignore-vcs', 'ignore-vcs', 'no-ignore-dot',
+                             'ignore-dot', 'no-ignore-parent', 'ignore-parent', 'no-ignore-global', 'ignore-global',
+                             'no-ignore-exclude', 'ignore-exclude', 'no-ignore-files', 'ignore-files', 'no-ignore-messages',
+                             'follow', 'no-follow', 'files', 'files-with-matches', 'files-without-match', 'count',
+                             'count-matches', 'line-number', 'no-line-number', 'column', 'no-column', 'heading', 'no-heading',
+                             'with-filename', 'no-filename', 'ignore-case', 'smart-case', 'case-sensitive', 'fixed-strings',
+                             'no-fixed-strings', 'word-regexp', 'line-regexp', 'invert-match', 'no-invert-match',
+                             'only-matching', 'multiline', 'no-multiline', 'multiline-dotall', 'no-multiline-dotall', 'pcre2',
+                             'no-pcre2', 'pcre2-version', 'unrestricted', 'text', 'no-text', 'binary', 'no-binary',
+                             'search-zip', 'no-search-zip', 'null', 'null-data', 'json', 'no-json', 'vimgrep', 'stats',
+                             'no-stats', 'quiet', 'trim', 'no-trim', 'passthru', 'passthrough', 'byte-offset',
+                             'no-byte-offset', 'crlf', 'no-crlf', 'mmap', 'no-mmap', 'one-file-system',
+                             'no-one-file-system', 'no-messages', 'messages', 'no-config', 'debug', 'trace', 'pretty',
+                             'sort-files', 'no-sort-files', 'type-list', 'version', 'help', 'block-buffered',
+                             'no-block-buffered', 'line-buffered', 'no-line-buffered', 'no-unicode', 'unicode',
+                             'auto-hybrid-regex', 'no-auto-hybrid-regex', 'include-zero', 'no-include-zero',
+                             'max-columns-preview', 'no-max-columns-preview', 'no-require-git', 'require-git',
+                             'ignore-file-case-insensitive', 'no-ignore-file-case-insensitive', 'glob-case-insensitive',
+                             'no-glob-case-insensitive', 'no-context-separator', 'files-with-matches'}),
+}
+# ag -A, -B and -C (and --after, --before, --context) are optional-valued in the long form, so they are in neither list
+_AG_TABLE = {
+    'short_values': 'GgmpW', 'short_flags': 'acDFfHhiLlnoQRrSsvVtuUwz0', 'long_optional': frozenset({'after', 'before', 'context'}),
+    'long_values': frozenset({'depth', 'ignore', 'ignore-dir', 'file-search-regex', 'path-to-ignore', 'pager', 'color-line-number',
+                              'color-match', 'color-path', 'max-count', 'width', 'workers'}),
+    'long_flags': frozenset({'all-text', 'all-types', 'case-sensitive', 'color', 'nocolor', 'column', 'count', 'debug',
+                             'filename', 'nofilename', 'files-with-matches', 'files-without-matches', 'fixed-strings', 'follow',
+                             'group', 'nogroup', 'heading', 'noheading', 'hidden', 'ignore-case', 'literal', 'line-numbers',
+                             'list-file-types', 'no-numbers', 'numbers', 'one-device', 'only-matching', 'print-long-lines',
+                             'recurse', 'norecurse', 'search-binary', 'search-zip', 'silent', 'smart-case', 'stats',
+                             'unrestricted', 'skip-vcs-ignores', 'vimgrep', 'word-regexp', 'invert-match', 'null',
+                             'print0', 'version', 'help'}),
+}
+# ack -C is optional-valued, so it is in neither list; ack --TYPE and --noTYPE are unknown (fail closed)
+_ACK_TABLE = {
+    'short_values': 'ABgm', 'short_flags': 'acfHhIiklLnosvwx1',
+    'pattern_long': frozenset({'match'}), 'long_optional': frozenset({'context'}),
+    'long_values': frozenset({'type-set', 'type-add', 'type-del', 'ignore-dir', 'noignore-dir', 'ignore-directory',
+                              'noignore-directory', 'ignore-file', 'match', 'max-count', 'after-context', 'before-context',
+                              'output', 'pager', 'color-filename', 'color-match', 'color-lineno', 'color-colno', 'range-start',
+                              'range-end', 'type'}),
+    'long_flags': frozenset({'ignore-case', 'smart-case', 'nosmart-case', 'no-smart-case', 'word-regexp', 'line-regexp',
+                             'literal', 'invert-match', 'count', 'files-with-matches', 'files-without-matches', 'filter',
+                             'nofilter', 'follow', 'nofollow', 'column', 'nocolumn', 'heading', 'noheading', 'break',
+                             'nobreak', 'group', 'nogroup', 'color', 'nocolor', 'colour', 'nocolour', 'with-filename',
+                             'no-filename', 'noenv', 'env', 'flush', 'help', 'version', 'recurse', 'norecurse'}),
+}
+SEARCH_TABLES = {'grep': _GREP_TABLE, 'egrep': _GREP_TABLE, 'fgrep': _GREP_TABLE, 'zgrep': _GREP_TABLE, 'rg': _RG_TABLE,
+                 'ag': _AG_TABLE, 'ack': _ACK_TABLE}
+# searchers that walk the working directory when no path is named (pt, the platinum searcher, has no table: any option is
+# uncertain)
+RECURSIVE_SEARCHERS = {'rg', 'ag', 'ack', 'pt'}
+
+# tar, bsdtar and gtar letters that take a value (the union, so `-s` of bsdtar counts); a letter after one of them in a
+# cluster is part of the value, never a mode
+_TAR_VALUE_LETTERS = 'bCfFgHIKLNsTVX'
+_PAX_VALUE_LETTERS = 'bfopsxBEGTU'
+_TAR_CREATE_LONGS = ('create', 'append', 'update', 'catenate', 'concatenate', 'delete')
+_TAR_READ_LONGS = ('extract', 'get', 'list', 'diff', 'compare')
+_TAR_MODE_LETTERS = {'c': 'create', 'r': 'create', 'u': 'create', 'A': 'create', 'x': 'read', 't': 'read', 'd': 'read'}
+
+# copy tools: options that take a separate value, so the value is never counted as a source or the destination
+_COPY_TABLES = {
+    'rsync': {'short_values': 'efBTM@', 'short_flags': 'avrlptgoDzPhnucqiHAXxSWbdRkKLOJmy0C468sUNEI',
+              'long_values': frozenset({'rsh', 'rsync-path', 'exclude', 'include', 'exclude-from', 'include-from', 'files-from',
+                                        'filter', 'block-size', 'backup-dir', 'suffix', 'chmod', 'chown', 'temp-dir',
+                                        'compare-dest', 'copy-dest', 'link-dest', 'log-file', 'log-file-format', 'out-format',
+                                        'password-file', 'port', 'sockopts', 'timeout', 'contimeout', 'bwlimit', 'max-size',
+                                        'min-size', 'max-delete', 'partial-dir', 'skip-compress', 'usermap', 'groupmap',
+                                        'remote-option', 'iconv', 'checksum-choice', 'cc', 'compress-choice', 'zc',
+                                        'compress-level', 'zl', 'info', 'debug', 'modify-window', 'protocol', 'address',
+                                        'write-batch', 'read-batch', 'only-write-batch', 'stop-after', 'stop-at',
+                                        'checksum-seed', 'outbuf', 'max-alloc', 'mkpath-mode'})},
+    'scp': {'short_values': 'cFiJlloPSXD', 'short_flags': '346ABCOpqRrTv'},
+    'sftp': {'short_values': 'BbcDFiJloPRSsX', 'short_flags': '46AaCfNpqrv'},
+}
+
+
+def _tar_mode(name, args):
+    """'read' (extract or list), 'create', or None when the mode is in doubt. Letters are read the way tar reads them: in a
+    cluster a value letter (-f, -C, -V and the rest) takes the rest of the cluster, so `-Vt` is a volume label, not list
+    mode; the old-style first word (`tar xzf`) is a bundle of letters; any abbreviation of a long create option (`--cre`) is
+    create. Two modes, an unknown letter after which a mode could hide, or no mode at all is None (the caller skips nothing)."""
+    modes, words = set(), [a.text for a in args]
+    value_letters = _PAX_VALUE_LETTERS if name == 'pax' else _TAR_VALUE_LETTERS
+    for k, t in enumerate(words):
+        if t == '--':
+            break
+        if t.startswith('--'):
+            long_name = t[2:].split('=', 1)[0]
+            if long_name and any(m.startswith(long_name) for m in _TAR_CREATE_LONGS):
+                modes.add('create')
+            elif len(long_name) >= 2 and any(m.startswith(long_name) for m in _TAR_READ_LONGS):
+                modes.add('read')
+            continue
+        letters = ''
+        if k == 0 and name != 'pax' and t and not t.startswith('-') and re.fullmatch(r'[A-Za-z]+', t):
+            letters = t  # old style: every letter of the first word is an option, their values follow as words
+        elif len(t) > 1 and t[0] == '-':
+            for ch in t[1:]:
+                if ch in value_letters:
+                    break
+                letters += ch
+        for ch in letters:
+            if name == 'pax':
+                modes.add({'w': 'create', 'r': 'read'}.get(ch, ''))
+            else:
+                modes.add(_TAR_MODE_LETTERS.get(ch, ''))
+    modes.discard('')
+    if name == 'pax':
+        if modes == {'read', 'create'}:
+            return 'create'  # pax -rw copies the named source trees
+        return 'read' if modes == {'read'} else ('create' if 'create' in modes else None)
+    return modes.pop() if len(modes) == 1 else None
+
+
 def _is_subseq(required, tokens):
     it = iter(tokens)
     return all(any(r == t for t in it) for r in required)
@@ -3305,7 +3526,7 @@ class Analyzer:
             if r.op in ('<', '<>') and target:
                 if self.is_cred_path(target, r.target):
                     ctx.secret_seen += 1
-                    if not (name in NONPRINT_SINKS or name in ('test', '[') or (name in GREP_CMDS and self._count_only(words[1:]))):
+                    if not (name in NONPRINT_SINKS or name in ('test', '[') or (name in GREP_CMDS and self._count_only(words[1:], _scan_options(words[1:], SEARCH_TABLES[name]) if name in SEARCH_TABLES else None))):
                         if not has_command or self.out_visible(pl, idx, True):
                             ctx.add(SECRET_DUMP, 'credential-stdin',
                                     'feeds a credential file to a command that can print it',
@@ -4653,21 +4874,49 @@ class Analyzer:
         return False
 
     @staticmethod
-    def _count_only(args):
+    def _count_only(args, scan=None):
+        """-c, -q, -l, -L, --count and the rest print no matching line. With a scan (a searcher with an option table) only
+        letters and long names the scan read as OPTIONS count, never the letters of a value (`grep -ec FILE` is the pattern
+        `c`, not -c) and never a value that looks like an option (`grep -e --count FILE`)."""
+        if scan is not None:
+            if scan.uncertain:
+                return False  # an unknown option may have hidden which letters are options; fail closed
+            return bool(scan.letters & set('cqlL') or scan.longs & {'count', 'quiet', 'silent', 'files-with-matches',
+                                                                      'files-without-match', 'files'})
         return bool(_flag_letters(args) & set('cqlL') or _longs(args) & {'--count', '--quiet', '--silent', '--files-with-matches', '--files-without-match', '--files'})
 
     @staticmethod
-    def _grep_directories_recurse(texts):
-        """grep -d recurse, -drecurse, --directories=recurse and --directories recurse all walk the directory like -r."""
-        for i, t in enumerate(texts):
-            if t in ('-d', '--directories') and i + 1 < len(texts) and texts[i + 1] == 'recurse':
-                return True
-            if t in ('-drecurse', '--directories=recurse'):
-                return True
+    def _grep_recursive_long(texts):
+        """--recursive, --dereference-recursive and any abbreviation getopt accepts (`--recur`, `--deref`)."""
+        for t in texts:
+            if t.startswith('--') and len(t) > 3:
+                long_name = t[2:].split('=', 1)[0]
+                if 'recursive'.startswith(long_name) or 'dereference-recursive'.startswith(long_name):
+                    return True
         return False
 
     @staticmethod
-    def _local_destinations(name, args):
+    def _grep_directories_recurse(texts):
+        """grep -d recurse, -drecurse, --directories=recurse and --directories recurse all walk the directory like -r, and so do
+        the abbreviations getopt and argmatch accept (`--dir=rec`, `-d rec`)."""
+        def recurse(value):
+            return len(value) >= 3 and 'recurse'.startswith(value)
+        for i, t in enumerate(texts):
+            nxt = texts[i + 1] if i + 1 < len(texts) else ''
+            if t == '-d' and recurse(nxt):
+                return True
+            if len(t) > 2 and t[0] == '-' and t[1] != '-' and 'd' in t[1:]:
+                rest = t[t.index('d', 1) + 1:]  # -drecurse, -rndrec: the rest of the cluster after d is its value
+                if recurse(rest) or (not rest and recurse(nxt)):
+                    return True
+            if t.startswith('--') and len(t) > 3:
+                long_name, eq, value = t[2:].partition('=')
+                if 'directories'.startswith(long_name) and (recurse(value) if eq else recurse(nxt)):
+                    return True
+        return False
+
+    @staticmethod
+    def _local_destinations(name, args, ctx=None):
         """The words of a copy or archive command that only DESTINATION a write or name an extraction target, never a source
         that is read: the last operand of scp, rsync and sftp, the value of wget -P and -O, curl -o and -D, tar -C in extract or
         list mode, every operand of tar, bsdtar, gtar and pax in extract or list mode, and the first operand (the archive)
@@ -4675,8 +4924,19 @@ class Analyzer:
         words, texts = list(args), [a.text for a in args]
         skip = []
         if name in ('scp', 'rsync', 'sftp'):
-            operands = [w for w in words if not w.text.startswith('-')]
-            if len(operands) >= 2:
+            # option values (`--exclude foo`, `-e ssh`, `-i key`, scp `-P 22`) are not operands. The last operand is the
+            # destination only when another operand is a real SOURCE: a remote `host:path` or an existing local path. A word
+            # after an option the table does not know may be that option's value, so it never counts as the source
+            # (receipt r4 F3: `rsync -a --exclude foo ~/.config/goodqa/` lists the directory and is judged)
+            scan = _scan_options(args, _COPY_TABLES[name])
+            operands = scan.operands
+
+            def is_source(w):
+                t = w.text
+                if ':' in t and not t.startswith(('/', '.', '~')):
+                    return True  # host:path, the remote side
+                return ctx is not None and os.path.exists(norm_path(t, ctx))
+            if len(operands) >= 2 and any(is_source(w) for w in operands[:-1] if id(w) not in scan.after_unknown):
                 skip.append(operands[-1])
         elif name in ('wget', 'curl'):
             flags = ('-P', '--directory-prefix', '-O', '--output-document', '-o', '--output', '-D', '--dump-header', '-c', '--cookie-jar')
@@ -4684,15 +4944,10 @@ class Analyzer:
                 if t in flags:
                     skip.append(words[i + 1])
         elif name in ('tar', 'bsdtar', 'gtar', 'pax'):
-            letters = _flag_letters(args)
-            first = texts[0] if texts else ''
-            old_style = set(first) if first and not first.startswith('-') and re.fullmatch(r'[A-Za-z]+', first) else set()
-            letters = set(letters) | old_style
-            longs = _longs(args)
-            create = bool(letters & set('cru')) or bool(longs & {'--create', '--append', '--update'}) or (name == 'pax' and 'w' in letters)
-            reading = bool(letters & set('xt')) or bool(longs & {'--extract', '--get', '--list', '--diff', '--compare'}) or (name == 'pax' and 'r' in letters and 'w' not in letters)
-            if reading and not create:
-                skip.extend(words)  # extract or list: nothing named here is read as a source tree
+            # extract or list: nothing named here is read as a source tree. Create, two modes or a mode in doubt skip nothing
+            # (receipt r4 F2: `tar --cre -f - -Vt DIR` is create; the `t` is the volume label of -V)
+            if _tar_mode(name, args) == 'read':
+                skip.extend(words)
         elif name == 'zip':
             # the first operand is the archive; a bare `-` is that operand (the archive goes to stdout), so the directory after
             # it is a source
@@ -4714,34 +4969,20 @@ class Analyzer:
         ctx = self.ctx
         texts = [a.text for a in args]
         words = list(args)
+        uncertain = False
         if name in GREP_CMDS:
-            skip_next = {'-e', '-f', '-m', '-A', '-B', '-C', '--regexp', '--file', '--max-count', '--include', '--exclude', '-g', '--glob',
-                         '--exclude-dir', '--exclude-from', '--include-dir', '--label', '--context', '--after-context', '--before-context'}
-            if name in ('grep', 'egrep', 'fgrep', 'zgrep'):
-                skip_next |= {'-d', '-D', '--directories', '--devices'}  # grep -d ACTION, -D ACTION take a separate value
-            elif name == 'rg':
-                skip_next |= {'-t', '-T', '--type', '--type-not', '--type-add', '--max-depth', '--maxdepth', '-j', '--threads', '-M',
-                              '--max-columns', '--max-filesize', '-E', '--encoding', '--sort', '--sortr', '--iglob', '--ignore-file',
-                              '--pre', '--pre-glob', '--replace', '-r', '--colors', '--context-separator', '--path-separator'}
-            elif name == 'ag':
-                skip_next |= {'--depth', '-G', '--file-search-regex', '-p', '--path-to-ignore', '-W', '--width', '--ignore', '-A', '-B'}
-            kept, i, pattern_taken = [], 0, any(t in ('-e', '--regexp', '-f', '--file') or t.startswith('--regexp=') for t in texts)
-            while i < len(words):
-                t = words[i].text
-                if t in skip_next:
-                    i += 2
-                    continue
-                if t.startswith('-') and t != '-':
-                    i += 1
-                    continue
-                if not pattern_taken:
-                    pattern_taken = True
-                    i += 1
-                    continue
-                kept.append(words[i])
-                i += 1
-            words = kept
-            count_only = self._count_only(args)
+            # a getopt walk with the tool's option table: a recognised value option takes its value (also attached: -etok,
+            # -rnA3), the first free word is the pattern unless an option gave one. An option the table does not know makes
+            # the walk UNCERTAIN (it may have taken the next word as its value, or be an abbreviation of --regexp): then
+            # every free word, the presumed pattern included, is judged, and a recursive search is also judged on the
+            # working directory whatever its operands (receipt r4 F1: `cd ~ && grep -r -e tok --group-separator /tmp`)
+            scan = _scan_options(args, SEARCH_TABLES.get(name, {}))
+            uncertain = scan.uncertain
+            if uncertain:
+                words = scan.free
+            else:
+                words = scan.operands if scan.pattern_given else scan.operands[1:]
+            count_only = self._count_only(args, scan)
         else:
             words = [w for w in words if not (w.text.startswith('-') and len(w.text) > 1)]
             count_only = False
@@ -4749,13 +4990,14 @@ class Analyzer:
             words = words[1:] if words else words  # first positional is the program
         if name in EXFIL_CMDS:
             words = [w for w in args]
-        recursive = name in GREP_CMDS and (_flag_letters(args) & set('rR') or name in ('rg', 'ag', 'ack') or '--recursive' in _longs(args)
+        recursive = name in GREP_CMDS and (_flag_letters(args) & set('rR') or name in RECURSIVE_SEARCHERS or self._grep_recursive_long(texts)
                                           or self._grep_directories_recurse(texts))
-        reads_stdin = idx > 0 and name in ('rg', 'ag', 'ack')  # a piped rg reads stdin; GNU grep -r with no operand still walks the directory
-        # an option I do not know that takes a separate value makes the guard read the pattern as a path, so a recursive search
-        # whose operands do not include one existing path is judged on the working directory too (fail closed; a person adds an
-        # explicit path): `cd ~ && rg --engine pcre2 tok`
-        no_real_path = not words or not any(os.path.exists(norm_path(w.text, ctx)) for w in words)
+        reads_stdin = idx > 0 and name in RECURSIVE_SEARCHERS  # a piped rg reads stdin; GNU grep -r with no operand still walks the directory
+        # the working directory is judged when the search names no existing path, and ALWAYS when an option was not
+        # recognised: that option may have taken the only path as its value, and the tool then searches the working
+        # directory (`cd ~ && grep -r --group /tmp tok`, where --group abbreviates --group-separator); a person names a path
+        # outside the credential directories from a harmless working directory, or counts with -c
+        no_real_path = uncertain or not words or not any(os.path.exists(norm_path(w.text, ctx)) for w in words)
         if recursive and no_real_path and not reads_stdin and self.under_cred_parent(ctx.cwd, below=True):
             # a recursive search with no path operand searches the working directory: `cd ~/.config/goodqa && rg .`, or any
             # search from the home directory, which contains it
@@ -4765,7 +5007,7 @@ class Analyzer:
                         '`%s` with no path searches the working directory, which holds or contains a credential file' % name,
                         'name a path outside the credential directories, or search with `grep -c` / `rg -c` to count')
                 return
-        destinations = self._local_destinations(name, args) if name in ARCHIVE_CMDS or name in EXFIL_CMDS else []
+        destinations = self._local_destinations(name, args, ctx) if name in ARCHIVE_CMDS or name in EXFIL_CMDS else []
         for w in words:
             t = w.text
             if name in EXFIL_CMDS:

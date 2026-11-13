@@ -68,6 +68,40 @@ NO_PATH_OPTIONS = ["cd ~ && rg --max-depth 6 token", "cd ~ && rg -t py token", "
 NO_PATH_NEIGHBOURS = ["cd ~ && rg --hidden tok /tmp", "cd ~ && grep -r --binary-files text tok /tmp", "cd ~ && rg --engine pcre2 tok /tmp",
                       "cd ~/project && rg --engine pcre2 tok", "cd ~ && rg -c --color always tok", "cd /tmp && grep -r --exclude-dir x tok","cd ~/project && rg --max-depth 6 token", "cd ~ && rg -c --max-depth 6 token", "cd ~ && grep -d skip tok file.txt",
                       "cd ~ && echo x | rg -t py token", "cd ~ && grep tok file.txt"]
+# receipt r4 F1: an option the guard does not recognise may take the only path as its value, so the search walks the working
+# directory; a recursive search with such an option is judged on the working directory whatever its operands
+R4_UNKNOWN_OPTION_WITH_PATH = ["cd ~ && grep -r -e tok --group-separator /tmp", "cd ~ && grep -r --group-separator x --group-separator /tmp tok",
+                               "cd ~ && rg -uu -e tok --hostname-bin /bin/hostname", "cd ~ && grep -r --group /tmp tok",
+                               "cd ~ && grep -r -e tok -Q /tmp", "cd ~ && rg -e tok --hostname /bin/hostname",
+                               "cd ~ && ag --color-ma 1 tok /tmp", "cd ~ && ack --ignore-d x tok /tmp",
+                               "cd ~ && rg -e tok -g /tmp", "cd /tmp && grep -r -e tok --lab -m ~/.config/goodqa",
+                               "cd /tmp && grep -r -e tok --lab --max-count ~/.config/goodqa"]
+# the getopt walk: an attached pattern (-etok, -rnetok, --regex=PAT) is the pattern, so the path after it is still a path;
+# letters of a value are not count-only flags; grep --dereference-recursive, --recur, --dir=rec and -drec recurse; pt walks
+PATTERN_AND_FLAG_PARSING = ["cd /tmp && grep -r -etoken ~/.config/goodqa", "cd /tmp && grep -rnetoken ~/.config/goodqa",
+                            "cd /tmp && grep -r --regexp=token ~/.config/goodqa", "grep -e. ~/.config/goodqa/user-token",
+                            "grep -ie. ~/.config/goodqa/user-token", "grep --regex=. ~/.config/goodqa/user-token",
+                            "rg -e. ~/.config/goodqa/user-token", "sls -Path ~/.config/goodqa/user-token -Pattern .",
+                            "grep -r -ec ~/.config/goodqa", "grep -r -e --count . ~/.config/goodqa", "rg -e --files . ~/.config/goodqa",
+                            "grep -r --lab -c . ~/.config/goodqa", "grep -ec < ~/.config/goodqa/user-token",
+                            "grep --dereference-recursive tok ~/.config/goodqa", "grep --recur tok ~/.config/goodqa",
+                            "grep --dir=rec tok ~/.config/goodqa", "grep -drec tok ~/.config/goodqa", "pt tok ~/.config/goodqa",
+                            "cd ~ && pt tok"]
+# receipt r4 F2: tar create mode is never read as extract or list mode; a value letter takes the rest of its cluster (`-Vt`
+# is a volume label), an abbreviated long create option is create, and two modes skip nothing
+R4_TAR_CREATE = ["tar --cre -f - -Vt ~/.config/goodqa", "tar --app -f x.tar -Vx ~/.config/goodqa", "tar -Vt --create -f - ~/.config/goodqa",
+                 "tar -f - -c -Vt ~/.config/goodqa", "tar --cre -tf - ~/.config/goodqa", "pax -rw ~/.config/goodqa /tmp/x"]
+# receipt r4 F3: option values are not operands, and the last operand is a destination only beside a real source
+R4_COPY_SINGLE_OPERAND = ["rsync -a --exclude foo ~/.config/goodqa/", "rsync -a -e ssh ~/.config/goodqa/", "scp -i key ~/.config/goodqa/",
+                          "rsync -a --exc /tmp ~/.config/goodqa/", "rsync -a nosuchsrc-15785 ~/.config/goodqa/"]
+# known options with a path, abbreviations of read mode, attached tar values and copy option values stay allowed
+R4_NEIGHBOURS = ["cd ~ && ag --color-match 1 tok /tmp", "cd ~ && ack --ignore-dir x tok /tmp", "cd ~ && grep -rn -A 3 tok /tmp",
+                 "cd ~ && grep -rnA3 tok /tmp", "cd ~ && grep -rn -5 tok /tmp", "cd ~ && rg -n -g '*.py' tok /tmp",
+                 "cd ~ && rg --sort path -i tok /tmp", "cd ~ && grep -rn --include '*.py' tok /tmp", "cd ~ && grep -rn --color=always tok /tmp",
+                 "cd ~ && grep -rn --context=2 tok /tmp", "cd ~ && rg -l tok", "cd ~ && grep -c tok file.txt",
+                 "tar -zxvf pkg.tgz -C ~", "tar -xzfarchive.tgz -C ~", "tar --extract -f x.tar -C ~", "tar --extr -f x.tar -C ~",
+                 "tar -x -f x.tar -C ~", "scp -P 22 host:file ~/", "rsync -avz --exclude .git host:x/ ~/", "rsync -a -e ssh host:x/ ~/",
+                 "rsync -a host:x/ ~/ --log-file /tmp/rsync.log", "rsync -a /tmp/ ~/"]
 RULE = "[secret_dump/"
 
 
@@ -128,6 +162,31 @@ class GoodqaCredentialPaths(unittest.TestCase):
             with self.subTest(command):
                 self.assertNotEqual(self.verdict(command), "block", command)
 
+
+    def test_r4_an_unknown_option_before_a_path_does_not_hide_the_working_directory(self):
+        for command in R4_UNKNOWN_OPTION_WITH_PATH:
+            with self.subTest(command):
+                self.blocked_by_the_credential_rule(command)
+
+    def test_r4_patterns_counts_and_recursion_are_read_the_way_the_tool_reads_them(self):
+        for command in PATTERN_AND_FLAG_PARSING:
+            with self.subTest(command):
+                self.blocked_by_the_credential_rule(command)
+
+    def test_r4_tar_create_mode_is_never_read_as_extract(self):
+        for command in R4_TAR_CREATE:
+            with self.subTest(command):
+                self.blocked_by_the_credential_rule(command)
+
+    def test_r4_a_single_copy_operand_is_a_source(self):
+        for command in R4_COPY_SINGLE_OPERAND:
+            with self.subTest(command):
+                self.blocked_by_the_credential_rule(command)
+
+    def test_r4_neighbours_stay_allowed(self):
+        for command in R4_NEIGHBOURS:
+            with self.subTest(command):
+                self.assertNotEqual(self.verdict(command), "block", command)
 
 if __name__ == "__main__":
     unittest.main()
