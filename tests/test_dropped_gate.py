@@ -47,7 +47,9 @@ class Base(unittest.TestCase):
         self.addCleanup(clock.stop)
         p.start()
         self.addCleanup(p.stop)
-        for k in ("CLAUDE_CODE_CHILD_SESSION", "AH_AGENT_ID", "AGENT_ID"):  # the runner may itself be a sub-agent;
+        # CLAUDE_CONFIG_DIR: a runner that sets it (a temp HOME harness) moved claude_home away from self.home, so main's
+        # transcript under self.home/.claude no longer proved main (PR 226 review: fails under env -i with it set)
+        for k in ("CLAUDE_CODE_CHILD_SESSION", "AH_AGENT_ID", "AGENT_ID", "CLAUDE_CONFIG_DIR"):  # the runner may itself be a sub-agent;
             os.environ.pop(k, None)  # patch.dict restores them. Tests act as main unless they set an identity.
         w = self.home / ".claude" / "wals" / SESSION
         jl(w / "main.jsonl", [

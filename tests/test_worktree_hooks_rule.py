@@ -276,7 +276,7 @@ class OtherUsersProcesses(Repo):
         self.assertEqual(self.scan({"111": errno.ESRCH}, {}, ["111"]), [])
 
     # the real t2-dev scan: same-user daemons (ssh-agent, gpg-agent, tailscaled, systemd, sd-pam, docker) cannot be read
-    def scan_names(self, readlinks, owners, names, skip, listing, cmds=None, ppids=None):
+    def scan_names(self, readlinks, owners, names, skip, listing, cmds=None, ppids=None, args=None, starts=None, created=None, full=False):
         real_isdir = os.path.isdir
 
         def link(path):
@@ -292,10 +292,18 @@ class OtherUsersProcesses(Repo):
 
         def cmd0(pid):
             return (cmds or {}).get(str(pid), names.get(str(pid)))
+        def cmdline(pid):
+            return (args or {}).get(str(pid))
+
+        def start(pid):
+            return (starts or {}).get(str(pid))
         with mock.patch.object(cg.os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
                 mock.patch.object(cg.os, "listdir", lambda p: list(listing) if p == "/proc" else []), \
                 mock.patch.object(cg.os, "readlink", link), mock.patch.object(cg, "_proc_status", status), \
+                mock.patch.object(cg, "_proc_args", cmdline), mock.patch.object(cg, "_proc_start", start), \
                 mock.patch.object(cg, "_proc_cmd0", cmd0, create=True):
+            if full:
+                return cg.busy_scan(str(self.linked), skip, created)
             return cg.busy_processes(str(self.linked), skip)
 
     def test_a_same_user_unreadable_process_is_skipped_only_when_its_name_is_in_the_skip_list(self):
@@ -385,7 +393,7 @@ class OtherUsersProcesses(Repo):
         self.assertNotIn("busy_skip_names", cg.DEFAULT_POLICY["reproducible_clone"])
         seen = []
         real = cg.busy_scan
-        with mock.patch.object(cg, "busy_scan", lambda path, skip=(): seen.append(skip) or real(path, skip)):
+        with mock.patch.object(cg, "busy_scan", lambda path, skip=(), created=None: seen.append(skip) or real(path, skip, created)):
             cg.verify_worktree(str(self.linked))
         self.assertEqual(tuple(seen[0]), tuple(names))
 

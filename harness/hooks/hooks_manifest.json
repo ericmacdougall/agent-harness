@@ -389,6 +389,24 @@
    ]
   },
   {
+   "id": "tier_gate:dispatch",
+   "script": "tier_gate.py",
+   "arg": "dispatch",
+   "event": "PostToolUse",
+   "tools": [
+    "Agent",
+    "Task",
+    "SendMessage"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S25"
+   ]
+  },
+  {
    "id": "work_assignments:guard",
    "script": "work_assignments.py",
    "arg": null,
@@ -586,6 +604,48 @@
    "script": "mission_gate.py",
    "arg": "pretool",
    "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "mission-gate:posttool",
+   "script": "mission_gate.py",
+   "arg": "posttool",
+   "event": "PostToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "mission-gate:posttool-failure",
+   "script": "mission_gate.py",
+   "arg": "posttool",
+   "event": "PostToolUseFailure",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "mission-gate:permission-denied",
+   "script": "mission_gate.py",
+   "arg": "posttool",
+   "event": "PermissionDenied",
    "tools": [
     "Bash"
    ],

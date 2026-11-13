@@ -211,6 +211,36 @@ A refusal lists the live owner ids. The cap ships in warn mode with the rest of 
 
 `peer_review.py --task TASK [--author-rung R] [--author-harness claude|openai]` picks the reviewer from the table (one rung above the author, the other harness preferred, the same harness one effort up when the other is unavailable, an unknown author reviewed at Opus/Sol medium and flagged), writes a selection receipt under `~/.agent-harness/escalation/selections/`, stamps `Author-Rung`, `Reviewer-Rung` and `Reviewer-Selection` on the report, and records the FINAL receipt in the task ledger so reviews count where they are consumed. `rescue.py --task TASK` runs at the task's computed writing rung on the other harness; `--rung` overrides it; a rung that needs permission is refused before any launch unless `approve-top` recorded it.
 
+### Dispatch records
+
+The ladder records which model each spawn actually ran on (goodqa#15794). This stops an author who was run below the task's rung from pushing the ladder up with failures that the rung's model did not produce.
+
+- **Open:** PreToolUse appends one line to `~/.agent-harness/escalation/<task>.dispatch-open.jsonl` for every Agent, Task or Workflow spawn that will run (allowed, or denied in warn mode), and for claude/codex/rescue Bash launches whose task key resolves. It takes no ledger lock. Every locked ledger operation merges the complete lines past a stored (inode, offset). Merging never truncates the file in place; an over-bound file (over 256 KiB) is renamed to `.old` after the ledger write.
+- **Close:** the PostToolUse `tier_gate.py dispatch` action closes the record with `resolvedModel` and `modelsUsed` and indexes `agent_id -> task`. It prints nothing and cannot block a tool that already ran.
+- **End:** SubagentStop sets `ended_at` and `ended_seq` and records `observed_effort` from the hook's `effort.level`. A foreground stop that arrives before its close is held as a pending stop for up to an hour.
+- **Resume:** SubagentStart for an indexed agent, or a SendMessage to its agent id (the PostToolUse matcher includes SendMessage), appends a `resume` line to the side file without taking the ledger lock; the next merge clears `ended_at` and reopens the dispatch as `phase: open` (reason `resumed`), so it is live again and never proven below: every window it overlaps keeps counting, even after its next stop. A forged resume line can only make windows count. A resume of an agent whose record was already shed adds a synthetic unknown (`resumed_unknown`). A SendMessage resolves its agent from the response's `resumedAgentId` first, then from `to` when `to` is an agent id; only the response's key names are logged. LIMITATION until the live check (spec AC-8 step 5): if neither resolves and SubagentStart does not reopen the dispatch, that resumed run is invisible and can under-count. The index keeps the newest 4,096 agents, so an agent resumed after 4,096 newer spawns is not found either. A resume line written before the agent's last stop is ignored. A resumed owner is never proven below again in the windows it touches, so continuing a Sonnet owner by SendMessage stops exclusions there. Resuming a reviewer whose record was already shed adds a `resumed_unknown`, which also keeps counting.
+- **Switch:** the exclusion below is off until `caps.dispatch_exclude_below_rung` is true in `model_tiers.json`. It ships false; main turns it on after the AC-8 live proof. While it is false, every FAIL counts. A FAIL that the rule would have excluded records `dispatch_check.decision: would_exclude` and appears in status as `would_exclude_below_rung`. `exclusion_enabled` shows which mode is active.
+  - The value must be the JSON literal `true` or `false`. The same applies to `caps.dispatch_narrow_by_stop_effort`. Inside the ledger, only `true` counts as on.
+  - Any other value, such as a quoted `"false"` or `1`, makes the whole tier table fail validation. The table then fails closed: tier_gate denies every Agent, Task and Workflow spawn and every claude/codex launch line, even in warn mode, and `escalation.py record` cannot run, so FAILs go unrecorded until the table is fixed.
+  - After every hand edit of this table, whether a flip or a rollback, load it once before anything else: run `python3 ~/.claude/hooks/escalation.py status --task <T>`. If that run reports a tier-table error, revert the edit at once.
+  - `install.py` copies `model_tiers.json`, so a reinstall resets a flipped switch to the shipped `false`. Check `exclusion_enabled` after every install and record the flip again if needed.
+- **Rule:** a FAIL at rung R is NOT_COUNTED ("dispatched below rung") only when at least one owner dispatch is considered and every considered non-reviewer dispatch (owners, fixers and other helpers) is a closed agent run whose candidate rungs all sit below R. Considered means: opened, resumed or ended since the ledger entered R, or still live. A run that started before the window and ended inside it is considered.
+- **ASSUMPTION:** before a stop, only the model family is known, so only Sonnet under an Opus rung (or Opus under a Fable rung) is excluded. An opus run at the wrong effort keeps counting. It appears in `counted_requested_below` ("counted, requested below rung, effort unverified"). `observed_effort` narrows candidates only when `caps.dispatch_narrow_by_stop_effort` is true. That flag is false until a live check proves the field reports the subagent's own effort (spec AC-9).
+- **What keeps counting:** an open dispatch, an unknown model, a Workflow or Bash dispatch, an at-rung fixer, or a synthetic unknown dispatch. Synthetic unknowns come from an over-bound, garbled (for example a crashed mid-line append), rewritten or non-regular side file, and each carries a `reason`.
+- **Not seen:** main working directly under a task key leaves no dispatch. A FAIL from main's own work during a window holding only below-rung owner dispatches is therefore excluded.
+- **Bounds:** at most 64 dispatches. Shedding goes reviewers first, then records no window can consider, then closed below-rung runs, then other window records, then live ones. Shedding a record that could block an exclusion writes `dispatch_taint`, and a tainted window keeps counting (`window_tainted` in status, `tainted` in `dispatch_check`). A shed live record taints every window for up to 24 hours and survives a reset, so a flood of forged valid side-file lines can block exclusions for that long; that errs toward counting. Dispatch records are also shed before they could push the ledger over its size bound; a merge alone never resets a ledger.
+- **Reviewer types:** red-team and click-tester dispatches are left out of the decision even though those agents can write. The type is the boundary; do not route writing through a reviewer spawn.
+- **Staleness:** a dispatch with no `ended_at` is presumed ended after 24 hours. A SubagentStop that never fires only keeps failures counting for that long.
+
+Read it with `python3 ~/.claude/hooks/escalation.py status --task TASK`:
+- `last_dispatch`;
+- `window_dispatches` (up to 8, each with phase, models, observed_effort, requested and selected rung, candidates, match against the current rung, and a reason for synthetic entries);
+- `excluded_below_rung` (count and latest reason);
+- `below_rung_dispatches`;
+- `counted_requested_below`.
+
+Every dispatch also writes a `dispatch` line to `gate.jsonl`. Open failures appear there as `dispatch_open_failed`.
+
 ## Review and rescue
 
 ```sh
@@ -1327,9 +1357,27 @@ Readers take a shared lock on `mission-goals.lock`, so a concurrent write is nev
     mission_coverage.py reseal --reason "<what changed and why>" [--force]                                # main
     mission_coverage.py verify | report [--json] | check
 
-Main-only commands need a one-shot stamp (`caller_identity.put_stamp`, purpose `mission-main`, single use, 10
-minutes) that `mission_gate.py pretool` writes only when the PreToolUse payload proves main (`caller_identity.is_main`)
-and the Bash command runs `mission_coverage.py` itself:
+Main-only commands need a one-shot stamp (`caller_identity.put_stamp`, purpose `mission-main`, single use, 60 s,
+bound to main's tool call) that `mission_gate.py pretool` writes only when the PreToolUse payload proves main
+(`caller_identity.is_main`) and the Bash command runs `mission_coverage.py` itself:
+
+- The stamp carries the call's `tool_use_id`, main's transcript path and the transcript size at that moment
+  (goodqa#15754 red-team F1). The command honours it only while that call is still running: once main's transcript
+  holds the call's `tool_result` (the call ended, or another hook denied it, or the user rejected it), the stamp is
+  dead for every process. `mission_gate.py posttool` (PostToolUse, PostToolUseFailure and PermissionDenied, Bash) also
+  deletes the call's unconsumed stamps. A payload without `tool_use_id` gets no stamp. Run main-only commands in the
+  foreground: a `run_in_background` call returns its tool_result at once, so its command is refused.
+- `take_stamp` runs every check (purpose, TTL, the call still running) before it claims the stamp; a caller that fails
+  one leaves the stamp in place, so a probe cannot burn main's stamp (PR 226 review M1).
+- What the stamp proves today, and its window (PR 226 review M1, not closed): "main's PreToolUse hook saw exactly this
+  argument list in a main call that has not ended yet, at most 60 s ago". It does not prove that the consuming process
+  is main's. Any same-user process that runs the identical argument list inside that window (from PreToolUse until the
+  call's tool_result or Post hook, at most 60 s, including while a permission prompt is open) is taken for main. A
+  per-call nonce (PreToolUse `updatedInput` prefixing `AH_MAIN_NONCE=<random>`, the stamp holding only its hash) would
+  close it: Claude Code 2.1.322 applies `updatedInput` from a settings hook without a permission decision, but it also
+  stores every PreToolUse hook's stdout verbatim in main's transcript, so the nonce would sit in clear text in a Claude
+  log during the call. It was not shipped for that reason; it is the design to reuse for the `review-auth` and
+  `ack-handoff` stamps (goodqa#15829) if that copy is accepted.
 
 - The stamp is keyed by the sha256 of the exact argument list after the script (`argv_key`; `--flag=value` reads as
   `--flag value`), so it covers that one command and nothing else.
@@ -1476,9 +1524,31 @@ stalled goal, plus the option to queue the goal on its ticket.
   `--event deploy` (naming a sha or version). States: DONE_LIVE (main-attached deploy and a later main-attached live
   PASS), LIVE_TESTED (main-attached live PASS, no deploy), LIVE_UNTESTED, VERIFIED, FAILING (a main-attached FAIL
   clears only with a main-attached PASS of the same check), IN_PROGRESS, UNKNOWN (no record, never "not started").
+- Attach pins the row (red-team F2): the ledger entry stores `row_sha` (sha256 of the row as canonical JSON with
+  ASCII escapes), `row_verdict` and `row_at`. A row whose WAL content changed after attach shows as `TAMPERED` in
+  `ah goals`, a pinned row that no longer resolves as `MISSING`; both are named on a WARNING line.
+- A TAMPERED or MISSING pinned row is scored by its pin (PR 226 review H1): its pinned verdict at its pinned `at`, so
+  rewriting or deleting a FAIL row never removes the FAIL. The goal is also capped at `UNCONFIRMED` (unless it is
+  FAILING), with `cap.would_be` and the row ids in `ah goals --json` and a `capped:` line in the text, until main reads
+  the row and re-attaches it or removes it with `--remove`. An owner cannot re-attach (re-pin) a row that changed
+  since it was attached. The Stop lint treats UNCONFIRMED like any state below DONE_LIVE ("done" is an over-claim).
+  `ah status --since` does not read the goal ledger, so the cap shows in `ah goals` and the status-truth hooks only.
+- Entries attached before pinning still count but are flagged `(unpinned)`, and an unpinned row cannot carry a goal to
+  DONE_LIVE (review L3: the goal reads UNCONFIRMED with `cap.unpinned`). Rollout, once per host that has a ledger
+  (`~/.agent-harness/mission/goals.json`; the Mac has none yet): run `ah goals --json`, and for every id in a goal's
+  `unpinned` list main reads the WAL row and runs `mission_coverage.py attach --goal G --evidence ID --kind KIND`
+  (the same kind) to pin it, or `--remove` to drop it. A row edited before that re-pin cannot be detected; read it.
+- Pins written by the first PR 226 build (ensure_ascii=False digest) still match: `row_matches` accepts that digest
+  for any row without a lone surrogate (the only rows where it collided).
+- One pass per WAL file (red-team F5): `ah goals` and the hooks read each WAL file once for all attached ids and goal
+  tags, within one time budget (hooks 5 s, `ah goals` 20 s). A read that runs out of time is the state `timeout`
+  (`GOALS UNAVAILABLE (timeout)`, exit 2), never a partial answer. So is a WAL file cut at its 256 MB scan cap while
+  attached rows in it are still unresolved (PR 226 review H2); a capped file whose attached rows all resolved only
+  adds a warning.
   `ah status` calls a deploy record linked to a REALLY_TESTED row LINKED_LIVE; prose live claims are LIVE_LEGACY.
 - `status_truth.py` hooks, mission session only (decided from the ledger, remembered in
-  `~/.agent-harness/state/status-truth/mission-session` so a broken ledger never widens it): UserPromptSubmit injects
+  `~/.agent-harness/state/status-truth/mission-session` so a broken ledger never widens it; before the first remembered
+  value, from the verified ledger header, so a first-run timeout still says GOALS UNAVAILABLE there): UserPromptSubmit injects
   the goals for a status question; SessionStart re-injects them after a compaction; Stop lints the final assistant
   text (contradictions against the ledger, and a status answer given without running `ah goals`). Injected text holds
   only fixed-pattern fields (ids, check names, enums, ages, the main-set target). Policy key `status_lint` in

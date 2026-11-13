@@ -46,6 +46,14 @@ def _redact(text):
     return re.sub(r"(?i)(token|password|secret|key|authorization)[=: ]+\S+", r"\1=[redacted]", str(text))
 
 
+def _skipped(result):
+    """The verifier's list of unreadable processes it skipped (goodqa#15870), as at most 20 short printable strings, or None."""
+    items = result.get("skipped_processes")
+    if not isinstance(items, list):
+        return None
+    return [re.sub(r"[^\x20-\x7e]", "?", str(item))[:60] for item in items[:20]]
+
+
 def audit(home, record):
     """Append one JSON row; raises when it cannot (the caller stops before acting)."""
     path = Path(home) / ".agent-harness" / "worktree-audit.jsonl"
@@ -156,7 +164,8 @@ def remove(host, path, reason, authenticated=False, session="", agent="", home=N
             why = result.get("reason") if removed is not None else (result.get("reason") or "") + " (" + UNKNOWN + ")"
         outcome.update(removed=removed, head=result.get("head"), freed_bytes=result.get("freed_bytes"),
                        directory_removed=result.get("directory_removed"),
-                       registry_entry_left=result.get("registry_entry_left"), why=why)
+                       registry_entry_left=result.get("registry_entry_left"), why=why,
+                       skipped_processes=_skipped(result))
     except WorktreeError as error:
         outcome.update(why="%s: %s (outcome unknown, check the host)" % (error.code, error))
         raise
@@ -169,7 +178,8 @@ def remove(host, path, reason, authenticated=False, session="", agent="", home=N
               "head": result.get("head"), "freed_bytes": result.get("freed_bytes"),
               "reason": _redact(outcome["why"] or "") or None,
               "directory_removed": result.get("directory_removed"),
-              "registry_entry_left": result.get("registry_entry_left")}
+              "registry_entry_left": result.get("registry_entry_left"),
+              "skipped_processes": outcome.get("skipped_processes")}
     if "audit_warning" in outcome:
         answer["audit_warning"] = outcome["audit_warning"]
     return answer
