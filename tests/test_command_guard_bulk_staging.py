@@ -70,10 +70,17 @@ class Base(unittest.TestCase):
 BULK = ["git add -A", "git add --all", "git add .", "git add ./", "git add -- .", "git add :/", "git add ':(top)'", "git add -u",
         "git add --update", "git stage -A", "git add -Au", "git add -fA", "git add sub/..", "git add ../orig",
         "git commit -a -m x", "git commit -am x", "git commit --all -m x", "git commit -sa -m x", "git commit -m x -a",
-        "git add --a", "git add --upd", "git add -A -- .", "git add *", "git add ':/'"]
+        "git add --a", "git add --upd", "git add -A -- .", "git add *", "git add ':/'",
+        # review: a commit with a whole-tree pathspec, exclusion-only and magic whole-tree pathspecs, synonyms, optional-value options
+        "git commit -m x .", "git commit -m x :/", "git commit -m x -- .", "git add -- ':!x'", "git add ':^x'", "git add ':(exclude)x'",
+        "git add ':(top)*'", "git add ':/**'", "git add ':(top,glob)**'", "git add ':(icase)*'", "git add --no-ignore-removal",
+        "git commit --gpg-sign -a -m x", "git add -u .", "git add -A :/", "git commit -m x ':!x'"]
 EXPLICIT = ["git add a.txt", "git add sub/", "git add sub/.", "git add ./sub/b.txt", "git add -p", "git add -p .", "git add -i", "git add -N a.txt",
             "git commit -m x", "git commit -m '-a'", "git commit -ma", "git commit -m x a.txt", "git commit --amend --no-edit",
-            "git commit -m 'add -A'", "git status", "git diff", "git add --dry-run a.txt", "git commit -F msg.txt"]
+            "git commit -m 'add -A'", "git status", "git diff", "git add --dry-run a.txt", "git commit -F msg.txt",
+            # -A and -u limited to the named paths stage only those (review FP1); exclusions next to a path are explicit
+            "git add -A sub/", "git add -u sub/b.txt", "git add -A -- ./sub/b.txt", "git add -u a.txt", "git commit -m x -- a.txt",
+            "git add ':!sub' a.txt", "git commit -m x ':!sub' a.txt", "git commit --gpg-sign -m x a.txt"]
 
 
 class BulkStaging(Base):
@@ -113,6 +120,9 @@ class BulkStaging(Base):
         self.assertTrue(self.finding("git -c alias.a='add -A' a", self.orig))
         self.assertTrue(self.finding("git -c alias.ca='commit -a -m x' ca", self.orig))
         self.assertTrue(self.finding("git -c alias.b='!git add -A' b", self.orig))
+        self.assertTrue(self.finding("git -c alias.x='!sh -c \"git add -A\"' x", self.orig))
+        self.assertTrue(self.finding("git -c alias.x='!sh -c \"git commit -am x\"' x", self.orig))
+        self.assertFalse(self.finding("git -c alias.x='!./script.sh' x", self.orig))  # a stated limit: an opaque script is not read
         self.assertFalse(self.finding("git -c alias.l='log -1' l", self.orig))
         self.assertFalse(self.finding("git -c alias.a='add -A' a", self.wt))
 

@@ -4238,27 +4238,52 @@ class Analyzer:
     # ---- bulk staging (goodqa#15787): git add -A, ., :/, -u and git commit -a in a dirty ORIGINAL checkout
     COMMIT_VALUE_SHORT = frozenset('mFCct')  # -m MSG, -F FILE, -C COMMIT, -c COMMIT, -t FILE take a value (attached or the next word)
     COMMIT_VALUE_LONG = frozenset(('--message', '--file', '--author', '--date', '--template', '--reuse-message', '--reedit-message',
-                                   '--fixup', '--squash', '--cleanup', '--pathspec-from-file', '--trailer', '--gpg-sign'))
+                                   '--fixup', '--squash', '--cleanup', '--pathspec-from-file', '--trailer'))
 
     @staticmethod
-    def _bulk_pathspec(text, place, top):
-        """A pathspec that means the whole working directory or the whole tree: `.` (also `./`, `sub/..`), `:/`, `:(top)`, a bare
-        glob, or a path that is the repository top or contains it (`..`, `../orig`). `sub/.` and `./sub/file` are explicit."""
+    def _pathspec_parts(text):
+        """(top, exclude, rest) of one pathspec: the `top` and `exclude` magic read from the long form `:(top,glob)rest` and the short
+        forms `:/rest`, `:!rest`, `:^rest`; `rest` is the pattern after the magic."""
         t = text.strip()
-        if re.fullmatch(r':\((?:[a-z,]*)top(?:,[a-z,]*)?\):?\.?', t) or t in (':/', ':/:', ':/.', '*', '**', ':/*'):
-            return True
-        if not t or t.startswith(':'):
-            return False  # other pathspec magic (an exclusion, :(glob)x) names something explicit
-        norm = posixpath.normpath(t)
+        if t.startswith(':(') and ')' in t:
+            magic, rest = t[2:t.index(')')].split(','), t[t.index(')') + 1:]
+            return 'top' in magic, 'exclude' in magic, rest
+        if t.startswith(':'):
+            k = 1
+            while k < len(t) and t[k] in '/!^':
+                k += 1
+            marks = t[1:k]
+            rest = t[k + 1:] if t[k:k + 1] == ':' else t[k:]
+            return '/' in marks, '!' in marks or '^' in marks, rest
+        return False, False, t
+
+    def _bulk_pathspec(self, text, place, top):
+        """A pathspec that means the whole working directory or the whole tree: `.` (also `./`, `sub/..`), `:/`, `:(top)`, a bare
+        glob (`*`, `**`, `:(top)*`, `:/**`, `:(icase)*`), or a path that is the repository top or contains it (`..`, `../orig`).
+        `sub/.` and `./sub/file` are explicit; an exclusion alone is judged by the caller."""
+        is_top, exclude, rest = self._pathspec_parts(text)
+        if exclude:
+            return False
+        if rest in ('', '*', '**', '.', './'):
+            return True if (is_top or rest in ('', '*', '**') or text.strip() in ('.', './')) else False
+        norm = posixpath.normpath(rest)
         if norm == '.':
             return True
-        absolute = norm if norm.startswith('/') else posixpath.normpath(posixpath.join(place, norm))
+        base = top if is_top else place
+        absolute = norm if norm.startswith('/') else posixpath.normpath(posixpath.join(base, norm))
         return absolute == top or (top + '/').startswith(absolute.rstrip('/') + '/')
 
+    def _bulk_pathspecs(self, pathspecs, place, top):
+        """True when any pathspec is whole-tree, or when every pathspec is an exclusion (git then selects everything else)."""
+        if any(self._bulk_pathspec(p, place, top) for p in pathspecs):
+            return True
+        return bool(pathspecs) and all(self._pathspec_parts(p)[1] for p in pathspecs)
+
     def _bulk_add_form(self, words, place, top):
-        """True when the words after `git add` or `git stage` stage everything: -A, --all, -u, --update (abbreviations git accepts
-        included) or a whole-tree pathspec. An interactive selection (-p, -i, -e) is an explicit choice."""
-        pathspecs, ended = [], False
+        """True when `git add` or `git stage` stages everything: -A, --all, --no-ignore-removal, -u, --update (abbreviations git
+        accepts included) with no pathspec or a whole-tree one, or a whole-tree pathspec alone. `git add -u file` and `git add -A src/`
+        stage only that path. An interactive selection (-p, -i, -e) is an explicit choice."""
+        pathspecs, ended, everything = [], False, False
         for word in words:
             if ended:
                 pathspecs.append(word)
@@ -4269,27 +4294,33 @@ class Analyzer:
                 key = word.split('=', 1)[0]
                 if key in ('--patch', '--interactive', '--edit'):
                     return False
-                if len(key) >= 3 and ('--all'.startswith(key) or '--update'.startswith(key)):
-                    return True
+                if len(key) >= 3 and any(name.startswith(key) for name in ('--all', '--update', '--no-ignore-removal')):
+                    everything = True
             elif word.startswith('-') and len(word) > 1:
                 if set(word[1:]) & set('pie'):
                     return False
                 if set(word[1:]) & set('Au'):
-                    return True
+                    everything = True
             else:
                 pathspecs.append(word)
-        return any(self._bulk_pathspec(p, place, top) for p in pathspecs)
+        if everything and not pathspecs:
+            return True
+        return self._bulk_pathspecs(pathspecs, place, top)
 
-    def _bulk_commit_form(self, words):
-        """True when `git commit` is given -a or --all, also inside a short cluster (-am, -sa); the text of -m, -F and the other
-        value options is not read as a flag (-ma is the message `a`)."""
-        i = 0
+    def _bulk_commit_form(self, words, place, top):
+        """True when `git commit` is given -a or --all (also inside a short cluster: -am, -sa), or a whole-tree pathspec (`git commit
+        -m x .`); the text of -m, -F and the other value options is not read as a flag (-ma is the message `a`). --gpg-sign and -S
+        take only an attached optional value."""
+        pathspecs, ended, i = [], False, 0
         while i < len(words):
             word = words[i]
             i += 1
+            if ended:
+                pathspecs.append(word)
+                continue
             if word == '--':
-                return False
-            if word.startswith('--'):
+                ended = True
+            elif word.startswith('--'):
                 key = word.split('=', 1)[0]
                 if key == '--all':
                     return True
@@ -4305,24 +4336,34 @@ class Analyzer:
                         break
                     if letter in 'uS':
                         break  # an optional attached mode or key id
-        return False
+            else:
+                pathspecs.append(word)
+        return self._bulk_pathspecs(pathspecs, place, top)
 
     def _bulk_alias_form(self, sub, alias_values, place, top):
-        """The alias that was defined on the command line with -c alias.NAME=... and invoked, judged on its expansion."""
+        """The alias that was defined on the command line with -c alias.NAME=... and invoked, judged on its expansion. A `!` alias is a
+        shell command: every `git ... add|stage|commit WORDS` inside it is judged, however it is quoted or nested in `sh -c`."""
         import shlex
         for value in alias_values:
             name, _, body = value.partition('=')
             if name[len('alias.'):].casefold() != sub.casefold():
                 continue
+            if body.startswith('!'):
+                for match in re.finditer(r'\bgit\b(?:\s+-[cC]\s+\S+|\s+--\S+)*\s+(add|stage|commit)\b([^;&|\n]*)', body):
+                    words = [w for w in re.split(r'\s+', match.group(2).strip().strip('\'"')) if w]
+                    words = [w.strip('\'"') for w in words]
+                    form = self._bulk_add_form if match.group(1) in ('add', 'stage') else self._bulk_commit_form
+                    if form(words, place, top):
+                        return True
+                continue
             try:
-                tokens = shlex.split(body[1:] if body.startswith('!') else body)
+                tokens = shlex.split(body)
             except ValueError:
                 return True  # cannot be read: judged as a possible bulk form
-            for k, token in enumerate(tokens):
-                if token in ('add', 'stage') and (k == 0 or body.startswith('!')):
-                    return self._bulk_add_form(tokens[k + 1:], place, top)
-                if token == 'commit' and (k == 0 or body.startswith('!')):
-                    return self._bulk_commit_form(tokens[k + 1:])
+            if tokens and tokens[0] in ('add', 'stage'):
+                return self._bulk_add_form(tokens[1:], place, top)
+            if tokens and tokens[0] == 'commit':
+                return self._bulk_commit_form(tokens[1:], place, top)
         return False
 
     @staticmethod
@@ -4363,7 +4404,7 @@ class Analyzer:
             if sub in ('add', 'stage'):
                 bulk = self._bulk_add_form(rest, place, top)
             elif sub == 'commit':
-                bulk = self._bulk_commit_form(rest)
+                bulk = self._bulk_commit_form(rest, place, top)
             elif alias_values:
                 bulk = self._bulk_alias_form(sub, alias_values, place, top)
             else:
