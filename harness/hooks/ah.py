@@ -3144,8 +3144,9 @@ def build_parser():
     ip = sub.add_parser("install-files", help="install MERGED listed hook files on a fleet host or this machine (audited; see "
                         "ah_install.py; the bytes come only from a commit on the canonical main; main only, run as a plain "
                         "`python3 -I ~/.claude/hooks/ah.py install-files ...`; a local real run, resume or rollback runs in its "
-                        "own session and survives a kill of this call's process group, and a --resume or --rollback refuses "
-                        "with exit 7 while that session lives; a local run whose ticket comment fails exits 6)")
+                        "own session and survives a kill of this call's process group; another local run, resume or rollback "
+                        "of that target refuses with exit 7 while it or a program step it started still holds the target's "
+                        "writer lock; a local run whose ticket comment is not confirmed as posted exits 6)")
     ip.add_argument("--host", required=True, help="t2-dev, ah-mac-mini, local (this machine's ~/.claude/hooks) or local-codex "
                                                   "(this machine's ~/.codex/agent-harness)")
     ip.add_argument("--from-ref", dest="from_ref", help="a full 40-hex commit sha on the canonical main")
@@ -3356,10 +3357,8 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.cmd == "install-files":  # goodqa#15913: a local real run, resume or rollback runs whole in its own session
         import ah_install  # noqa: PLC0415
-        target = ah_install.own_session_target(args, home_dir())
-        if target:
-            return ah_install.run_in_own_session(given, home_dir(), target=target)
-        ah_install.register_own_session(args, home_dir())  # the session copy records itself until it exits (M1)
+        if ah_install.own_session_target(args, home_dir()):
+            return ah_install.run_in_own_session(given, home_dir())
     try:
         data = run(args, home_dir())
     except AhError as e:

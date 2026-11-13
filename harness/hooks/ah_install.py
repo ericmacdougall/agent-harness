@@ -21,11 +21,14 @@ install_codex.py's DELIVERY_HELPERS at the commit) run the SAME constant program
 ssh, an allowlisted environment and a fixed root token (never a path), so every step above is unchanged. A local real run,
 resume or rollback runs WHOLE in its own session (ah.main -> run_in_own_session), so a caller whose process group is killed
 after the commit never skips the self-test verdict or the automatic rollback; each program step also starts in its own
-session (detached_run). While that session lives (recorded with its pid and start time), `--resume` and `--rollback` of a
-run on that target refuse with exit 7 (still_running), so two actors never work one run. A kill that ends that session too
-leaves the run unfinished; `--resume RUN` applies the verdict and rolls back. The host-side audit
+session (detached_run). Every local writer (a run, a resume, a rollback) holds an exclusive flock on
+~/.agent-harness/install-locks/TARGET.lock from before its first probe to its end, and every program step it starts
+inherits that descriptor, so the lock stays held while the run's session OR any step it started still lives; another
+writer of that target refuses with exit 7 (still_running) until the kernel drops the lock with its last holder, so a
+recovery never races a live writer. A kill that ends that session leaves the run unfinished; once its last step has
+exited, `--resume RUN` applies the verdict and rolls back. The host-side audit
 row is skipped there: that file is the caller's own audit file, which already holds the start and result rows; so the ticket
-comment is the only record off the machine, and a local run whose comment fails exits 6. `--host local` also reports the
+comment is the only record off the machine, and a local run whose comment is not confirmed as posted exits 6. `--host local` also reports the
 Codex copies that differ from the bytes it installed, so the Codex home is never silently left behind; local-codex refuses
 a CODEX_HOME that points elsewhere. Every target's self-test also runs the registered hook entry (command_guard_hook.py) on
 two sub-agent payloads, which must both be blocked with their exact rules after any install.
@@ -40,7 +43,9 @@ Threat model: careless or hurried agents, not one that edits this module or the 
 from __future__ import annotations
 
 import ast
-import atexit
+import contextlib
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -428,13 +433,14 @@ def local_env(home):
     return env
 
 
-def detached_run(argv, input=None, capture_output=True, timeout=None, env=None):
+def detached_run(argv, input=None, capture_output=True, timeout=None, env=None, pass_fds=()):
     """The local transport (goodqa#15913). The program starts in its OWN session, so a caller that is killed with its
     process group never stops it between two renames or inside a rollback; and, like a
     killed ssh client, a caller-side timeout leaves it running to its end instead of killing it. The call is then reported
-    as lost (unknown after the first write). Not covered: a kill that walks the process tree by parent id."""
+    as lost (unknown after the first write). `pass_fds` carries the run's writer lock into the program, so the lock is held
+    until the program exits even when its caller is gone. Not covered: a kill that walks the process tree by parent id."""
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-                            start_new_session=True, close_fds=True)
+                            start_new_session=True, close_fds=True, pass_fds=tuple(pass_fds))
     try:
         out, err = proc.communicate(input, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -450,7 +456,8 @@ def detached_run(argv, input=None, capture_output=True, timeout=None, env=None):
 IN_SESSION_ENV = "AH_INSTALL_IN_SESSION"  # set on the copy that already runs in its own session: it never starts another
 AH_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ah.py")
 SESSION_DIR = (".agent-harness", "install-sessions")
-STILL_RUNNING_EXIT = 7  # a --resume or --rollback refused while the run's own session is still alive
+STILL_RUNNING_EXIT = 7  # a writer of this target (a run's session, or a program step it started) still holds the writer lock
+LOCK_DIR = (".agent-harness", "install-locks")
 
 
 def in_own_session():
@@ -459,87 +466,37 @@ def in_own_session():
     return os.environ.get(IN_SESSION_ENV) == "1" and os.getsid(0) == os.getpid()
 
 
-def _proc_start(pid):
-    """The process's start time as `ps -o lstart=` prints it, or None: with the pid it names one process, not a reused pid."""
+@contextlib.contextmanager
+def writer_lock(home, host):
+    """goodqa#15913 F2: the exclusive writer lock of a local target, held for the whole of a run, a resume or a rollback.
+    It is an flock on ~/.agent-harness/install-locks/HOST.lock, taken without waiting; it yields the descriptor for every
+    program step to inherit (Remote keep_fds -> detached_run pass_fds), so the lock stays held while this process OR any
+    step it started still lives, and the kernel drops it when the last of them exits: no pid or start-time bookkeeping.
+    A writer that cannot take it refuses with still_running (exit 7) before it reads anything, so a recovery never acts on
+    a probe that a live step can still change. A fleet host yields no descriptor (its program runs over ssh)."""
+    if host not in LOCAL_TARGETS:
+        yield ()
+        return
+    folder = Path(home).joinpath(*LOCK_DIR)
+    path = folder / (host + ".lock")
     try:
-        done = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True, timeout=10,
-                              env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"})
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None
-    return done.stdout.strip() or None
-
-
-def record_session(home, pid, target):
-    """Record a live session run as ~/.agent-harness/install-sessions/live-PID.json (pid, start time, target), 0600."""
-    folder = Path(home).joinpath(*SESSION_DIR)
-    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path, tmp = folder / ("live-%d.json" % pid), folder / (".live-%d-%s.tmp" % (pid, uuid.uuid4().hex[:6]))
-    with os.fdopen(os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "w") as fh:
-        json.dump({"pid": pid, "start": _proc_start(pid), "target": target}, fh)
-    os.replace(str(tmp), str(path))
-    return path
-
-
-def _drop(path):
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as error:
+        refuse("could not open the writer lock %s (%s); nothing was changed" % (path, type(error).__name__))
     try:
-        os.unlink(str(path))
-    except OSError:
-        pass
-
-
-def live_sessions(home, target, exclude=()):
-    """The recorded session runs on `target` that are still alive: the pid exists and, when both are known, its start time
-    is the recorded one (a reused pid is not the run). An unknown start time counts as alive (fail closed)."""
-    folder, out = Path(home).joinpath(*SESSION_DIR), []
-    try:
-        names = sorted(os.listdir(str(folder)))
-    except OSError:
-        return out
-    for name in names:
-        if not re.fullmatch(r"live-[0-9]+\.json", name):
-            continue
         try:
-            rec = json.loads((folder / name).read_text())
-            pid = int(rec["pid"])
-        except (OSError, ValueError, KeyError, TypeError):
-            continue
-        if rec.get("target") != target or pid in exclude:
-            continue
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            continue
-        except PermissionError:
-            pass
-        now = _proc_start(pid)
-        if rec.get("start") and now and now != rec["start"]:
-            continue
-        out.append(rec)
-    return out
-
-
-def refuse_while_running(home, host, run_id):
-    """goodqa#15913 M1: after a caller kill the run may still be working in its own session; a --resume or --rollback of it
-    then would race it (both may take the same run's lock). Refuse until that session has ended."""
-    busy = live_sessions(home, host, exclude=(os.getpid(),))
-    if busy:
-        refuse("run %s may still be running in its own session (pid %s on %s): wait for its result row in "
-               "~/.agent-harness/install-audit.jsonl, or for that pid to exit, then retry" % (run_id, busy[0]["pid"], host),
-               "still_running", STILL_RUNNING_EXIT)
-
-
-def register_own_session(args, home):
-    """The session copy records itself (its foreground does too), so a --resume or --rollback refuses while it lives; the
-    record goes when it exits."""
-    target = target_of(args, home) if in_own_session() else None
-    if target is None:
-        return None
-    try:
-        path = record_session(home, os.getpid(), target)
-    except OSError:
-        return None
-    atexit.register(_drop, path)
-    return path
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                refuse("could not take the writer lock %s (%s); nothing was changed" % (path, type(error).__name__))
+            refuse("another install-files writer on %s still holds %s: a run's own session, or a program step it started, is "
+                   "still working. Wait for that run's result row in ~/.agent-harness/install-audit.jsonl, or for the holder "
+                   "to exit (`lsof` on the lock file names it), then retry; nothing was changed" % (host, path),
+                   "still_running", STILL_RUNNING_EXIT)
+        yield (fd,)
+    finally:
+        os.close(fd)
 
 
 def own_session_target(args, home):
@@ -564,7 +521,7 @@ def target_of(args, home):
     return host if host in LOCAL_TARGETS else None
 
 
-def run_in_own_session(argv, home, launcher=None, target=None):
+def run_in_own_session(argv, home, launcher=None):
     """Run this install-files command line again in a NEW session and wait for it, relaying its stdout, stderr and exit
     status. The whole run (lock, renames, the self-test verdict, the automatic rollback, the result row and the ticket
     comment) then lives in that session, so a kill of the caller's process group no longer stops it after the commit;
@@ -587,19 +544,11 @@ def run_in_own_session(argv, home, launcher=None, target=None):
     finally:
         for fd in fds:
             os.close(fd)
-    record = None
-    if target:
-        try:
-            record = record_session(home, child.pid, target)  # a --resume or --rollback refuses while this session lives (M1)
-        except OSError:
-            pass  # the session copy records itself too
     sys.stderr.write("install-files: the run is in its own session (pid %d) and continues if this call's process group is "
-                     "killed; then wait for its result row or for that pid to exit before --resume or --rollback; its output: "
-                     "%s.out\n" % (child.pid, stem))
+                     "killed; a --resume or --rollback refuses (exit 7) until it and every program step it started have "
+                     "ended; its output: %s.out\n" % (child.pid, stem))
     sys.stderr.flush()
     code = child.wait()
-    if record:
-        _drop(record)
     for ext, stream in ((".out", sys.stdout), (".err", sys.stderr)):
         try:
             with open(stem + ext, errors="replace") as fh:
@@ -612,11 +561,12 @@ def run_in_own_session(argv, home, launcher=None, target=None):
 
 
 class Remote:
-    def __init__(self, host, runner, home=None):
+    def __init__(self, host, runner, home=None, keep_fds=()):
         self.root = LOCAL_TARGETS.get(host)  # None: a fleet host, over ssh
         self.host, self.started = host, False
         self.runner = runner or (detached_run if self.root else subprocess.run)
         self.home = home
+        self.keep_fds = tuple(keep_fds)  # the writer lock: every local program step inherits it (goodqa#15913 F2)
         if self.root and (not sys.executable or home is None):
             refuse("the local target needs this python's own executable and the caller's home")
 
@@ -627,8 +577,9 @@ class Remote:
             self.started = True
         try:
             if self.root:
+                inherit = {"pass_fds": self.keep_fds} if self.keep_fds else {}
                 done = self.runner(local_argv(self.root, op, args or {}), input=data, capture_output=True, timeout=timeout,
-                                   env=local_env(self.home))
+                                   env=local_env(self.home), **inherit)
             else:
                 done = self.runner(ssh_argv(self.host, op, args or {}), input=data, capture_output=True, timeout=timeout)
         except (OSError, subprocess.SubprocessError) as error:
@@ -949,18 +900,33 @@ def order(names):
     return rest + (["command_guard.py"] if "command_guard.py" in names else [])
 
 
-def post_comment(ticket, text, poster):
-    """True when the comment was posted: the poster did not raise and did not return False, or `ah ticket comment` exited 0."""
+def comment_state(ticket, text, poster):
+    """How the one ticket comment ended: "posted" only when it was confirmed. An injected poster: "posted" unless it raised
+    or returned False. `ah ticket comment`: its JSON reply must say ok true and comment "posted"; a zero exit with comment
+    "pending" (spooled), "parked" or "dead", a "duplicate" (no delivery state), or an unreadable reply is not delivery
+    (goodqa#15913 F1). None without a ticket."""
     if not ticket:
         return None
     try:
         if poster:
-            return poster(ticket, text) is not False
+            return "failed" if poster(ticket, text) is False else "posted"
         done = subprocess.run([sys.executable, "-I", AH_PY, "ticket", "comment", ticket, "--body", text],
                               capture_output=True, timeout=60)
-        return done.returncode == 0
+        if done.returncode != 0:
+            return "failed"
+        reply = json.loads(done.stdout)
     except Exception:  # noqa: BLE001 - a failed comment is reported (and exits 6 locally), never a traceback
-        return False
+        return "failed"
+    if not isinstance(reply, dict) or reply.get("ok") is not True:
+        return "unconfirmed"
+    state = reply.get("comment") or reply.get("result")
+    return state if state in ("posted", "pending", "parked", "dead", "duplicate") else "unconfirmed"
+
+
+def post_comment(ticket, text, poster):
+    """True only when the comment's delivery was confirmed (see comment_state); None without a ticket."""
+    state = comment_state(ticket, text, poster)
+    return None if state is None else state == "posted"
 
 
 COMMENT_FAILED_EXIT = 6
@@ -980,15 +946,17 @@ def finish(home, run, host, result, exit_code, extra, ticket, poster, kind_):
     except OSError:
         out["audit_warning"] = "the result row could not be written on this machine"
     summary = {n: {"old": v.get("old_sha"), "new": v.get("new_sha")} for n, v in (extra.get("files") or {}).items()}
-    out["ticket_comment"] = post_comment(ticket, "ah install-files %s on %s: %s (run %s) ref %s files %s" % (
+    state = comment_state(ticket, "ah install-files %s on %s: %s (run %s) ref %s files %s" % (
         kind_, host, result, run, extra.get("ref"), json.dumps(summary)[:1500])
         + ("; " + str(extra["note"])[:500] if extra.get("note") else ""), poster)
+    out["ticket_comment"] = None if state is None else state == "posted"
     if out["ticket_comment"] is False:
         out["comment_failed"] = True
+        out["ticket_comment_state"] = state
         if host in LOCAL_TARGETS and exit_code == 0:
             exit_code = COMMENT_FAILED_EXIT
-            out.update(ok=False, exit_code=exit_code, reason="the ticket comment for run %s could not be posted: post it by hand "
-                       "(the result row on this machine says %s)" % (run, result))
+            out.update(ok=False, exit_code=exit_code, reason="the ticket comment for run %s was not confirmed as posted (%s): check "
+                       "the ticket and post it by hand if it is missing (the result row on this machine says %s)" % (run, state, result))
     if exit_code == COMMENT_FAILED_EXIT:
         raise InstallError("comment_failed", "%s on %s (run %s): %s" % (result, host, run, out["reason"]), exit_code, out)
     if exit_code != 0:
@@ -1007,7 +975,10 @@ def results_of(home, run):
 
 def install_files(host, ref, files, ticket, dry_run=False, home=None, session="", agent="", runner=None, poster=None, allow_older=False):
     check_inputs(host, ref, files, ticket, dry_run, None, None, (), allow_older)
-    return _run(host, ref, list(files), ticket, dry_run, Path(home or Path.home()), session, agent, runner, poster, None, None, "install", allow_older)
+    home = Path(home or Path.home())
+    with (contextlib.nullcontext(()) if dry_run else writer_lock(home, host)) as keep_fds:  # a dry run writes nothing
+        return _run(host, ref, list(files), ticket, dry_run, home, session, agent, runner, poster, None, None, "install", allow_older,
+                    keep_fds)
 
 
 def resume(run_id, ticket, home=None, session="", agent="", runner=None, poster=None):
@@ -1017,12 +988,12 @@ def resume(run_id, ticket, home=None, session="", agent="", runner=None, poster=
     row = start_row(home, run_id)
     if row is None:
         refuse("no such run on this machine: %s" % run_id)
-    refuse_while_running(home, row["host"], run_id)
-    if ("installed" in results_of(home, run_id)) or ("rolled_back" in results_of(home, run_id)) or ("restored" in results_of(home, run_id)):
-        refuse("run %s already finished" % run_id)
-    check_inputs(row["host"], None, None, ticket, False, run_id, None, ())
-    return _run(row["host"], row["ref"], sorted(row["files"], key=lambda n: n), ticket, False, home, session, agent, runner, poster, run_id,
-                row.get("baseline"), "resume")
+    with writer_lock(home, row["host"]) as keep_fds:  # F2: no live writer of this target; only now read its results and files
+        if ("installed" in results_of(home, run_id)) or ("rolled_back" in results_of(home, run_id)) or ("restored" in results_of(home, run_id)):
+            refuse("run %s already finished" % run_id)
+        check_inputs(row["host"], None, None, ticket, False, run_id, None, ())
+        return _run(row["host"], row["ref"], sorted(row["files"], key=lambda n: n), ticket, False, home, session, agent, runner, poster,
+                    run_id, row.get("baseline"), "resume", False, keep_fds)
 
 
 def _plan_for(names, sources, state, run):
@@ -1079,7 +1050,7 @@ def _with_codex_note(home, remote, plan, extra):
     return extra
 
 
-def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster, resume_of, baseline, kind_, allow_older=False):
+def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster, resume_of, baseline, kind_, allow_older=False, keep_fds=()):
     root = LOCAL_TARGETS.get(host)
     if root == "codex" and not Path(home).joinpath(*CODEX_DIR).is_dir():
         refuse("the Codex harness directory ~/%s does not exist on this machine; nothing was changed" % "/".join(CODEX_DIR))
@@ -1087,7 +1058,7 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
         refuse("CODEX_HOME is set to %s, so Codex does not load ~/%s, which local-codex writes; nothing was changed"
                % (codex_home_elsewhere(home)[:200], "/".join(CODEX_DIR)))
     sources, listed, main = fetch_source(ref, files, home, allow_older or bool(resume_of), root or "claude")
-    remote = Remote(host, runner, home)
+    remote = Remote(host, runner, home, keep_fds)
     run = resume_of or new_run_id()
     names = order(files)
     if not dry_run:
@@ -1272,8 +1243,12 @@ def rollback(run_id, ticket, force_files=(), home=None, session="", agent="", ru
     row = start_row(home, run_id)
     if row is None:
         refuse("no such run on this machine: %s" % run_id)
+    with writer_lock(home, row["host"]) as keep_fds:  # F2: no live writer of this target; only now read the audit and probe
+        return _rollback(row, run_id, ticket, force_files, home, session, agent, runner, poster, keep_fds)
+
+
+def _rollback(row, run_id, ticket, force_files, home, session, agent, runner, poster, keep_fds):
     host = row["host"]
-    refuse_while_running(home, host, run_id)
     check_inputs(host, None, None, ticket, False, None, run_id, tuple(force_files))
     for name in force_files:
         if name not in row["files"]:
@@ -1285,7 +1260,7 @@ def rollback(run_id, ticket, force_files=(), home=None, session="", agent="", ru
         refuse("host %s has another unfinished run (%s)" % (host, busy[0]), "unfinished_run")
     plan = row["files"]
     names = order([n for n in plan if plan[n]["action"] in ("new", "replaced")])
-    remote = Remote(host, runner, home)
+    remote = Remote(host, runner, home, keep_fds)
     state = remote.call("probe", {"names": names})["files"]
     to_restore, notes = [], {}
     for name in names:

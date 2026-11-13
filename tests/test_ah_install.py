@@ -950,13 +950,12 @@ class Wiring(Base):
         done = {"ok": True, "result": "dry_run"}
         with mock.patch.object(ai, "run_in_own_session", return_value=4) as own, \
                 mock.patch.object(ai, "install_files", return_value=done), mock.patch.object(ai, "resume", return_value=done), \
-                mock.patch.object(ai, "rollback", return_value=done), mock.patch.object(ai, "register_own_session") as register:
-            for argv, target in zip(own_cases, ("local", "local-codex", "local", "local-codex")):
+                mock.patch.object(ai, "rollback", return_value=done):
+            for argv in own_cases:
                 with self.subTest(argv):
                     own.reset_mock()
                     self.assertEqual(self.cli(*argv)[0], 4)  # the session's exit status is the command's
                     self.assertEqual(own.call_args[0][0], ["install-files", *argv])  # the same command line, unchanged
-                    self.assertEqual(own.call_args[1]["target"], target)  # recorded under the run's own target (M1)
             for argv in inline_cases:
                 with self.subTest(argv):
                     own.reset_mock()
@@ -967,11 +966,9 @@ class Wiring(Base):
                 self.assertEqual(self.cli(*real)[0], 4)  # an inherited marker alone is not trusted: still its own session (L2)
                 own.assert_called_once()
                 own.reset_mock()
-                register.reset_mock()
                 with mock.patch.object(ai.os, "getsid", return_value=os.getpid()):
                     self.assertEqual(self.cli(*real)[0], 0)  # the copy that leads its own session runs the install itself
                 own.assert_not_called()
-                register.assert_called_once()  # and records itself, so a --resume or --rollback refuses while it lives
 
 
 CODEX_NAMES = ("command_guard.py", "ah.py", "extra.py")  # doctor.py is a Claude-only hook here, as in the real lists
@@ -1197,12 +1194,30 @@ class LocalTarget(LocalBase):
         with self.assertRaises(ai.InstallError) as caught:  # a poster that reports failure counts too, on a rerun as well
             self.install(files=("ah.py",), poster=lambda t, x: False)
         self.assertEqual((caught.exception.exit_code, caught.exception.data["result"]), (6, "already_current"))
-        # `ah ticket comment` failing is seen through its exit status, not only through an exception
-        with mock.patch.object(ai.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"", b"")):
-            self.assertIs(ai.post_comment(TICKET, "x", None), False)
-        with mock.patch.object(ai.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as run:
-            self.assertIs(ai.post_comment(TICKET, "x", None), True)
+        # `ah ticket comment` is read through its JSON reply (F1): a zero exit is delivery only with ok true and comment "posted"
+        posted = b'{\n  "ok": true,\n  "result": "applied",\n  "id": "ah0",\n  "seq": 1,\n  "comment": "posted"\n}\n'
+        replies = ((posted, True), (posted.replace(b'"posted"', b'"pending"'), False), (posted.replace(b'"posted"', b'"parked"'), False),
+                   (posted.replace(b'"posted"', b'"dead"'), False), (b'{"ok": true, "result": "duplicate", "id": "ah0", "seq": 1}', False),
+                   (b'{"ok": true, "result": "applied", "id": "ah0", "seq": 1}', False), (b'{"ok": false, "comment": "posted"}', False),
+                   (b"queued\n", False), (b"", False))
+        for stdout, delivered in replies:
+            with self.subTest(stdout), mock.patch.object(ai.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout, b"")) as run:
+                self.assertIs(ai.post_comment(TICKET, "x", None), delivered)
         self.assertEqual(run.call_args[0][0][:5], [sys.executable, "-I", ai.AH_PY, "ticket", "comment"])  # isolated, no PATH lookup
+        with mock.patch.object(ai.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, posted, b"")):
+            self.assertIs(ai.post_comment(TICKET, "x", None), False)  # a failing exit, whatever it printed
+        # end to end through the real call: a spooled comment ("pending", exit 0) is a comment_failed run, exit 6, its row kept
+        fake = Path(self.tmp, "fake_ah.py")
+        for state, code in (("pending", 6), ("posted", 0)):
+            fake.write_text("import json\nprint(json.dumps({'ok': True, 'result': 'applied', 'id': 'ah0', 'seq': 1, 'comment': %r}, indent=2))\n" % state)
+            with self.subTest(state), mock.patch.object(ai, "AH_PY", str(fake)):
+                try:
+                    out = ai.install_files("local", self.c1, ["ah.py"], TICKET, False, self.mac, "s", "a", self.runner, None)
+                except ai.InstallError as error:
+                    out = error.data
+                self.assertEqual((out["exit_code"], out["result"], out["ticket_comment"]), (code, "already_current", code == 0))
+                self.assertEqual(out.get("ticket_comment_state"), None if code == 0 else "pending")
+                self.assertEqual(self.rows("result")[-1]["result"], "already_current")
 
     def test_the_hook_probe_runs_the_entry_exactly_as_both_installers_register_it(self):  # AC-10
         self.assertIn('"command": "python3", "args": [str(claude / "hooks" / "command_guard_hook.py"), "hook"]', (ROOT / "install.py").read_text())
@@ -1288,11 +1303,7 @@ FOREGROUND = r'''
 import sys
 sys.path.insert(0, sys.argv[1])
 import ah_install as ai
-try:
-    code = ai.run_in_own_session(["install-files"], sys.argv[2], launcher=sys.argv[3:], target="local")
-except TypeError:  # an older ah_install without the session record (the failing-first run shows the race itself)
-    code = ai.run_in_own_session(["install-files"], sys.argv[2], launcher=sys.argv[3:])
-sys.exit(code)
+sys.exit(ai.run_in_own_session(["install-files"], sys.argv[2], launcher=sys.argv[3:]))
 '''
 PROGRESS_FN = '''
 def progress(what, name):
@@ -1308,6 +1319,11 @@ def slow_after_commit():
             time.sleep(SLOW_AFTER_COMMIT)
     except OSError:
         pass
+
+def barrier():
+    deadline = time.time() + 240
+    while BARRIER_PATH and not os.path.exists(BARRIER_PATH) and time.time() < deadline:
+        time.sleep(0.02)
 '''
 
 
@@ -1318,23 +1334,25 @@ class LocalKill(LocalBase):
 
     FILES = ["ah.py", "extra.py", "command_guard.py"]
 
-    def instrumented(self, progress, delay=1.0, slow=0.0):
-        """The program, recording each rename (then sleeping `delay`); `slow` seconds more in every self-test after a commit."""
+    def instrumented(self, progress, delay=1.0, slow=0.0, barrier=None):
+        """The program, recording each rename (then sleeping `delay`); `slow` seconds more in every self-test after a commit;
+        with `barrier`, each commit rename waits until that file exists (so the commit step pauses after its first rename)."""
         script = ai.REMOTE_SCRIPT
-        for old, new in (("STALE = 1800\n", "STALE = 1800\nPROGRESS_PATH = %r\nPROGRESS_DELAY = %r\nSLOW_AFTER_COMMIT = %r\n%s"
-                          % (str(progress), delay, slow, PROGRESS_FN)),
-                         ("        os.replace(t, p)\n", "        os.replace(t, p)\n        progress('commit', name)\n"),
+        for old, new in (("STALE = 1800\n", "STALE = 1800\nPROGRESS_PATH = %r\nPROGRESS_DELAY = %r\nSLOW_AFTER_COMMIT = %r\nBARRIER_PATH = %r\n%s"
+                          % (str(progress), delay, slow, barrier and str(barrier), PROGRESS_FN)),
+                         ("        os.replace(t, p)\n", "        os.replace(t, p)\n        progress('commit', name)\n        barrier()\n"),
                          ("        os.replace(t, live(name))\n", "        os.replace(t, live(name))\n        progress('restore', name)\n"),
                          ("def selftest():\n", "def selftest():\n    slow_after_commit()\n")):
             self.assertEqual(script.count(old), 1, old)
             script = script.replace(old, new)
         return script
 
-    def drive(self, ref, progress, foreground=False, slow=0.0):
+    def drive(self, ref, progress, foreground=False, slow=0.0, barrier=None):
         """The caller. foreground=False: install_files itself (each program step detached, the verdict in the caller).
         foreground=True: ah.main's foreground, which runs that same whole install in its own session and waits."""
         cfg = Path(self.tmp, "driver.json")
-        cfg.write_text(json.dumps({"hooks": str(HOOKS), "url": "file://" + str(self.origin), "script": self.instrumented(progress, slow=slow),
+        cfg.write_text(json.dumps({"hooks": str(HOOKS), "url": "file://" + str(self.origin),
+                                   "script": self.instrumented(progress, slow=slow, barrier=barrier),
                                    "host": "local", "ref": ref, "files": self.FILES, "ticket": TICKET, "home": str(self.mac)}))
         driver = Path(self.tmp, "driver.py")
         driver.write_text(DRIVER)
@@ -1504,7 +1522,7 @@ class LocalKill(LocalBase):
                 with self.assertRaises(ai.InstallError) as caught:
                     call()
                 self.assertEqual((caught.exception.code, caught.exception.exit_code), ("still_running", ai.STILL_RUNNING_EXIT))
-                self.assertIn("pid %d" % pid, str(caught.exception))
+                self.assertIn(str(self.mac.joinpath(*ai.LOCK_DIR) / "local.lock"), str(caught.exception))
         os.kill(pid, 0)  # the refusals came while the session run was alive (this raises if it had ended)
         self.assertEqual({n: self.live(n) for n in self.FILES}, new)
         self.wait_gone(pid, 240)
@@ -1514,31 +1532,65 @@ class LocalKill(LocalBase):
         self.assertEqual(ai.rollback(run, TICKET, (), self.mac, "s", "a", None, lambda t, x: None)["result"], "restored")  # now admitted
         self.assertEqual({n: self.live(n) for n in NAMES}, old)
 
-    def test_a_session_record_counts_only_while_its_pid_and_start_time_match(self):  # NEG-23
-        path = ai.record_session(self.mac, os.getpid(), "local")
-        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-        self.assertEqual([r["pid"] for r in ai.live_sessions(self.mac, "local")], [os.getpid()])
-        self.assertEqual(ai.live_sessions(self.mac, "local-codex"), [])  # another target
-        self.assertEqual(ai.live_sessions(self.mac, "local", exclude=(os.getpid(),)), [])  # the caller's own record
-        rec = json.loads(path.read_text())
-        path.write_text(json.dumps(dict(rec, start="Thu Jan  1 00:00:00 1970")))
-        self.assertEqual(ai.live_sessions(self.mac, "local"), [])  # the same pid with another start time is a reused pid
-        path.write_text(json.dumps(dict(rec, start=None)))
-        self.assertEqual(len(ai.live_sessions(self.mac, "local")), 1)  # an unknown start time counts as alive (fail closed)
-        ended = subprocess.Popen([sys.executable, "-I", "-c", "pass"])
-        ended.wait()
-        path.unlink()
-        ai.record_session(self.mac, ended.pid, "local")
-        self.assertEqual(ai.live_sessions(self.mac, "local"), [])  # an ended process
-        sleeper = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"])
-        self.addCleanup(sleeper.wait)
-        self.addCleanup(sleeper.kill)
-        ai.record_session(self.mac, sleeper.pid, "local")
-        with self.assertRaises(ai.InstallError) as caught:
-            ai.refuse_while_running(self.mac, "local", "ins-0123456789ab")
-        self.assertEqual((caught.exception.code, caught.exception.exit_code), ("still_running", 7))
-        self.assertIn("pid %d" % sleeper.pid, str(caught.exception))
-        ai.refuse_while_running(self.mac, "t2-dev", "ins-0123456789ab")  # a fleet host has no session records
+    def test_recovery_refuses_while_a_program_step_outlives_the_session_and_then_reconciles(self):  # AC-4, AC-8, NEG-24
+        old = {n: self.live(n) for n in NAMES}
+        new = {n: sha(self.base_bytes(n) + b"\n# c1\n") for n in self.FILES}
+        progress, gate = Path(self.tmp, "progress-gate.txt"), Path(self.tmp, "gate")
+        proc = self.drive(self.c1, progress, foreground=True, barrier=gate)  # a GOOD commit; its commit step pauses after one rename
+        worker = int(self.wait_for(progress, "commit", 1, 240, proc)[0][2])
+        os.killpg(proc.pid, signal.SIGKILL)  # the caller
+        proc.wait()
+        session = int(re.search(r"own session \(pid (\d+)\)", self.caller_err.read_text()).group(1))
+        os.killpg(session, signal.SIGKILL)  # and the run's whole session; the commit step runs in a session of its own
+        self.wait_gone(session, 60)
+        os.kill(worker, 0)  # the commit step is still alive, paused after its first rename
+        run = self.rows("start")[0]["run"]
+        mixed = {"ah.py": new["ah.py"], "extra.py": old["extra.py"], "command_guard.py": old["command_guard.py"]}
+        self.assertEqual({n: self.live(n) for n in self.FILES}, mixed)
+        calls = (("rollback", lambda: ai.rollback(run, TICKET, (), self.mac, "s", "a", None, lambda t, x: None)),
+                 ("resume", lambda: ai.resume(run, TICKET, self.mac, "s", "a", None, lambda t, x: None)))
+        for label, call in calls:
+            with self.subTest(label):
+                with self.assertRaises(ai.InstallError) as caught:
+                    call()
+                self.assertEqual((caught.exception.code, caught.exception.exit_code), ("still_running", ai.STILL_RUNNING_EXIT))
+        os.kill(worker, 0)  # both refusals came while the orphaned commit step was alive
+        self.assertEqual({n: self.live(n) for n in self.FILES}, mixed)  # they changed nothing
+        self.assertEqual(ai.results_of(self.mac, run), [])  # and wrote no result
+        gate.write_text("go")
+        self.wait_for(progress, "commit", len(self.FILES), 60)
+        self.wait_gone(worker, 60)
+        self.assertEqual(ai.unfinished_runs(self.mac, "local"), [run])  # the session died before its verdict
+        done = ai.resume(run, TICKET, self.mac, "s", "a", None, lambda t, x: None)  # now admitted: the verdict on the bytes now live
+        self.assertEqual(done["result"], "installed")
+        self.assertEqual(ai.results_of(self.mac, run), ["installed"])  # one result row, and it matches the live bytes
+        self.assertEqual({n: self.live(n) for n in self.FILES}, new)
+        self.assertEqual(ai.unfinished_runs(self.mac, "local"), [])
+
+    def test_the_writer_lock_is_held_while_any_holder_lives_and_only_on_local_targets(self):  # AC-4, NEG-23, NEG-24
+        lock = self.mac.joinpath(*ai.LOCK_DIR) / "local.lock"
+        with ai.writer_lock(self.mac, "local") as fds:
+            self.assertEqual((len(fds), stat.S_IMODE(lock.stat().st_mode)), (1, 0o600))
+            step = subprocess.Popen([sys.executable, "-I", "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE, pass_fds=fds)
+            self.addCleanup(step.wait)
+            self.addCleanup(step.stdin.close)
+            for label, call in (("a second writer", lambda: ai.writer_lock(self.mac, "local").__enter__()),
+                                ("a new run", lambda: self.install())):
+                with self.subTest(label), self.assertRaises(ai.InstallError) as caught:
+                    call()
+                self.assertEqual((caught.exception.code, caught.exception.exit_code), ("still_running", 7))
+            self.assertEqual(self.install(dry_run=True)["result"], "dry_run")  # a dry run writes nothing and takes no lock
+            with ai.writer_lock(self.mac, "local-codex") as other:  # another target has its own lock
+                self.assertEqual(len(other), 1)
+        with self.assertRaises(ai.InstallError) as caught:  # this holder let go; the step that inherited the descriptor still holds it
+            ai.writer_lock(self.mac, "local").__enter__()
+        self.assertEqual(caught.exception.code, "still_running")
+        step.stdin.close()
+        step.wait()
+        with ai.writer_lock(self.mac, "local") as fds:  # the kernel dropped it with its last holder; the file left behind does not block
+            self.assertEqual(len(fds), 1)
+        with ai.writer_lock(self.mac, "t2-dev") as fds:  # a fleet host takes no local lock
+            self.assertEqual(fds, ())
 
     def test_a_run_in_its_own_session_relays_its_output_and_exit_status_and_a_signal_is_unknown(self):  # AC-8
         code = ("import json, os, sys; print(json.dumps({'sid': os.getsid(0), 'marker': os.environ.get(%r)})); "
