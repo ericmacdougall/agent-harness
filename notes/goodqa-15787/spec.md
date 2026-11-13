@@ -1,85 +1,97 @@
-# Spec: command_guard: consider refusing bulk staging in shared original checkouts
+# Spec: command_guard: refuse bulk staging in a shared original checkout
 
 Ticket: GoodQA goodqa#15787
 Author: agent:af9e33704216a1ea1 (claude-sonnet-5-5)
-Click-test: required
+Click-test: not-applicable (a command-text guard rule with no UI; the proof is the real guard decision on the commands in the tests, plus one live Bash call by main after install)
 Sign-off: main
 Review-policy: standard
 
 ## Outcome
 
-<What the user can do or observe when this ticket is done, in one or two sentences.>
+In a shared original checkout (the main working tree, whose `.git` is a directory) that has uncommitted changes, an agent shell that stages or commits EVERYTHING (`git add -A`, `--all`, `.`, `:/`, `-u`, `git commit -a`) gets a finding that names the sanctioned form: stage explicit paths, or work in your own linked worktree. This stops one session from sweeping another session's uncommitted changes into its commit. The rule ships in warn mode (D2) and can be switched to enforce by policy.
 
 ## Scope
 
-- In: <the behavior this work changes>.
-- Out: <what this work deliberately leaves alone>.
+- In: `git add` and `git stage` with a tree-wide pathspec or `-A`, `--all`, `-u`, `--update`; `git commit` with `-a` or `--all` (also inside a short cluster such as `-am`); the target checkout is the one the command acts on (`-C`, `--work-tree`, `GIT_WORK_TREE`, the cwd); only when it is an original checkout with changes; `-c alias.X=...` with an unknown subcommand is judged as a possible bulk form; a new `bulk_staging` finding category with its own mode.
+- Out: persistent git aliases from a config file (`git ca` for `commit -a`; the guard sees command text only), a bulk staging done by a script or another tool that speaks git itself, `git checkout .` and `git restore .` (destructive discards, a separate rule), a stash or reset (already covered by the owned-checkout rule for owned checkouts), a linked worktree (the agent's own), a clean original checkout.
+
+## Assumptions (labelled; none is a user decision)
+
+- D1 "Shared original checkout" = the nearest `.git` above the target directory is a directory (not a `gitdir:` file) AND `git status --porcelain` is non-empty. A clean tree sweeps nothing, so it is allowed. Source: inferred: from ticket:GoodQA goodqa#15787 -- the ticket names the original checkout and "changes the agent did not make", which the guard cannot know, so any dirt counts.
+- D2 Default mode is `warn` (like broad_kill), enforceable per policy (`modes.bulk_staging`), because the ticket rates the false-positive risk medium and the guard is installed on every session. Recommendation to main: switch to enforce after the warn counts are checked. Source: inferred: from ticket:GoodQA goodqa#15787 -- "refuse or warn".
+- D3 The check fails open: if the directory is not a repository, git is missing or the status call times out (2 s), nothing is reported. Source: inferred: from ticket:GoodQA goodqa#15787 -- accident prevention, not an access control.
+- D4 The rule applies to every caller (main and sub-agents): the shared checkout is shared with main's own sessions too. Source: inferred: from ticket:GoodQA goodqa#15787.
 
 ## Acceptance criteria
 
-- AC-1: <observable result>. Verify by: <test command or live check>. Source: <user:<session>/<uuid> "verbatim words" | ticket:GoodQA <project>#<n> | wal:<path>#<id> | file:<path>:<line>@<sha> | inferred: from <source> -- <why>>
+- AC-1: in an original checkout with uncommitted changes, these commands produce a `bulk-staging` finding (a block under enforce mode, a warn in the default mode): `git add -A`, `git add --all`, `git add .`, `git add ./`, `git add -- .`, `git add :/`, `git add ':(top)'`, `git add -u`, `git add --update`, `git stage -A`, `git commit -a -m x`, `git commit -am x`, `git commit --all`, `git commit -sa -m x`, and the same behind `git -C the-original-checkout`, `--work-tree=the-original-checkout`, `GIT_WORK_TREE=the-original-checkout git ...` and a command that `cd`s into it. Verify by: `python3 -B -m unittest tests.test_command_guard_bulk_staging`. Source: ticket:GoodQA goodqa#15787
+- AC-2: these stay allowed with no finding: `git add path/file`, `git add sub/dir/`, `git add sub/.`, `git add -p`, `git add -N file`, `git commit -m "fix -a"`, `git commit -m msg path`, `git commit --amend --no-edit`, any of the bulk forms in a linked worktree (a `.git` file), in a clean original checkout, in a directory that is not a repository, and with `git -C a-linked-worktree` from an original checkout cwd. Verify by: the same suite. Source: ticket:GoodQA goodqa#15787
+- AC-3: `git -c alias.x='add -A' x` and any unknown subcommand behind a `-c alias.` produce the finding in a dirty original checkout; a known read subcommand behind an alias does not. Verify by: the same suite. Source: ticket:GoodQA goodqa#15787
+- AC-4: the finding names the sanctioned form (stage explicit paths, or `git worktree add`) and has its own category `bulk_staging`; under `modes.bulk_staging = enforce` the decision is `block`, in the default mode `warn`; the other categories' modes are unchanged. Verify by: the same suite. Source: ticket:GoodQA goodqa#15787
+- AC-5: existing guard behaviour does not change. Verify by: `python3 -B -m unittest tests.test_command_guard tests.test_command_guard_owned_checkout tests.test_command_guard_no_backup`. Source: inferred: from ticket:GoodQA goodqa#15787 -- a new rule must not alter other verdicts.
 
 ## Negative cases
 
-- NEG-1 (AC-1): <input or situation that must be refused or handled>. Source: <as above>
+- NEG-1 (AC-2): a path literally named `.` inside a subdirectory (`git add sub/.`, `git add ./sub/file`) is an explicit path and is not a tree-wide pathspec. Source: ticket:GoodQA goodqa#15787
+- NEG-2 (AC-1): a `-c alias.` expansion (`git -c alias.a='add -A' a`) is judged, not skipped. Source: ticket:GoodQA goodqa#15787
+- NEG-3 (AC-1, AC-2): `-C` with another directory judges THAT directory: `git -C the-original-checkout add -A` from a worktree cwd is a finding, and `git -C a-linked-worktree add -A` from the original checkout cwd is not. Source: ticket:GoodQA goodqa#15787
+- NEG-4 (AC-1): pathspec magic that means the whole tree (`:/`, `:(top)`) is a finding. Source: ticket:GoodQA goodqa#15787
+- NEG-5 (AC-2): `-m` and `-F` values are not read as flags: `git commit -m "-a"` and `git commit -ma` (message `a`) are allowed. Source: inferred: from ticket:GoodQA goodqa#15787 -- a message text must not trigger a refusal.
+- NEG-6 (AC-1): the failing-first control: with the rule removed the new suite fails (run against the unchanged code and against broken variants in tests/mutants_bulk_staging.py). Source: ticket:GoodQA goodqa#15787
+- NEG-7 (AC-1): a status call that cannot run (not a repository, git missing, timeout) reports nothing and never raises. Source: inferred: from ticket:GoodQA goodqa#15787 -- fail-open for accident prevention.
 
 ## Resource budget
 
-Host: <mac or dev2>
-Fan-out: agents=<n> jobs=<n> processes=<n> browser_pages=<n> test_workers=<n>
-Peak memory: <n GB> (method: <how estimated>)
-CPU: <n cores> (method: <how estimated>)
-Disk: <n GB> (method: <how estimated>)
-Network: <n MB> (method: <how estimated>)
-Wall time: <n min>
-Cap and kill: <run_capped.py cap, pause behavior, kill mechanism per heavy step>
-Checkpoint: <durable output under the work dir, idempotent steps, how it resumes; required over 10 min or 4 GB>
+Host: mac
+Fan-out: agents=2 jobs=1 processes=1 browser_pages=0 test_workers=1
+Peak memory: 0.3 GB (method: a unittest process with small temporary git repositories)
+CPU: 1 core (method: single-threaded unittest)
+Disk: 0.05 GB (method: a few temporary repositories)
+Network: 0 MB (method: none)
+Wall time: 5 min
+Cap and kill: none needed (short focused tests; the status call has a 2 s timeout)
+Checkpoint: not required (under 10 min and 4 GB)
 
 ## Risks
 
-- <risk>: <mitigation>.
+- A false warning or refusal on a legitimate bulk commit in a dirty original checkout: mitigation, warn by default, the sanctioned form is one explicit-path command, linked worktrees and clean trees are exempt, the allowed neighbours are pinned.
+- A persistent alias, a script, or another git front end stages everything unseen: stated limit, the guard sees command text only.
+- The status call runs git in a repository the caller controls: mitigation, the existing hardened helper (fsmonitor off, hooks off, sanitized environment, 2 s timeout, output bounded).
+- The status call adds latency to every `git add` and `git commit`: mitigation, only for bulk forms, only once per command, bounded at 2 s.
 
 ## Domain checklist
 
 Domains: auth, delete, devices, money, release
 
-Detected from: 6 auth path(s), e.g. auth_transition_test.go; 9 delete path(s), e.g. attachment_remove_unix.go; 3 devices path(s), e.g. remote_delete.py; 70 money path(s), e.g. ledger_clicktest_test.go; 5 release path(s), e.g. release.yml
+The change adds a command-text rule for `git add` and `git commit`; it adds no authentication, account, deletion, device, money or release behaviour.
 
-Cover each item below with a NEG case in the Negative cases section that names it, or waive it with one line
-`Domain-gate: <item-id> waived (<reason, 10+ chars>)`. Delete items that do not apply only by waiving them.
-
-### Authentication, sessions and account identity (auth)
-- pre-account-hijack: Pre-account hijack. NEG: the authentication flow must not let an attacker pre-register or pre-link an identifier (email, phone, social login) before the real owner signs up and then take over the account; test a pre-created unverified account against each sign-up, login, recovery, invite and session path and assert the later verified owner gets a fresh account or the squatter session and credentials are revoked. Verify by: Test: attacker registers victim email unverified, victim signs up via SSO or magic link, assert the attacker password and sessions no longer work. Verify that unverified identifiers never merge into verified accounts.
-- lookalike-identifier: Lookalike email and username identifiers. NEG: the authentication flow must treat Unicode homoglyph, case, plus-address and normalization variants of an email or username as distinct or as the same by one explicit rule; test confusable identifiers (Cyrillic a, fullwidth, trailing dot, NFC vs NFD) against each sign-up, login, recovery, invite and session path and assert no impersonation, duplicate account or collision bypass. Verify by: Table-driven test of confusable and normalization pairs for registration, login, invite and password reset; assert one canonicalization function is used on every path and that lookups and uniqueness constraints agree.
-- request-device-binding: Approval bound to the requesting device. NEG: the authentication flow must bind every approval, magic link or login code to the device and session that requested it; test approving a request from a second device or another account on each sign-up, login, recovery, invite and session path and assert it cannot complete the first device login. Verify by: Two-client test: device A requests, device B holds the link or code; assert B cannot mint a session for A and A cannot complete without its own binding secret (PKCE-style verifier or device code).
-- link-expiry-single-use: Link expiry and single use. NEG: the authentication flow must make every emailed link, code and token expire and work once; test replaying a consumed token, using an expired one and requesting a new one on each sign-up, login, recovery, invite and session path, and assert the old token is invalid, consumption is atomic under concurrent use, and tokens are stored hashed. Verify by: Replay and concurrent-redeem tests with a controlled clock; assert one success among N parallel redeems, expiry at the boundary, and invalidation of earlier tokens when a new one is issued.
-- session-fixation: Session fixation and rotation. NEG: the authentication flow must issue a new session identifier at login, privilege change and password change, and revoke other sessions where the spec says so; test a pre-set session id carried through each sign-up, login, recovery, invite and session path and assert it is not accepted after authentication. Verify by: Test: set a session cookie before login, authenticate, assert the identifier changed and the old one is rejected; assert logout and password change invalidate server-side state, not only the cookie.
-- rate-limit-enumeration: Rate limiting and account enumeration. NEG: the authentication flow must not reveal whether an account exists through response text, status code or timing, and must throttle guessing; test known and unknown identifiers against each sign-up, login, recovery, invite and session path and assert identical responses and a per-identifier and per-source limit that an attacker cannot reset or use to lock out the owner. Verify by: Compare response body, status and latency distributions for existing vs absent accounts; send a burst and assert 429 behavior, that the limit key cannot be rotated by header spoofing, and that lockout is not a denial of service on the owner.
-- store-billing-exposure: Account state that changes billing or entitlement. NEG: the authentication flow must not let an account merge, link, deletion, recovery or role change alter billing, subscription or entitlement without the paying owner; test each account-state transition on each sign-up, login, recovery, invite and session path and assert purchases, plans and store receipts stay with the verified owner. Verify by: Matrix test of account transitions (merge, link, delete, recover, transfer) against entitlement and billing state; assert no free upgrade, no loss of a paid plan and an audit entry for each change.
-### Destructive deletes and cleanup (delete)
-- backup-before-delete: Verified backup before delete. NEG: the delete or cleanup operation must not remove data until a verified copy exists elsewhere; test each path, record or checkout it can remove with a failed or truncated backup and assert the delete is refused, and that the copy was read back and checksummed, not just written. Verify by: Test: corrupt or truncate the backup and assert refusal; restore from the backup into a scratch location and compare checksums or counts before the delete runs.
-- unpushed-work-detection: Unpushed and uncommitted work detection. NEG: the delete or cleanup operation must detect unpushed commits, uncommitted and untracked files, stashes and unmerged branches before removing a checkout, worktree or branch; test each path, record or checkout it can remove with each kind of local-only work and assert nothing is deleted without an explicit override. Verify by: Fixture repo per case (dirty file, untracked file, unpushed commit, stash, unmerged branch); assert refusal and that the message names the at-risk item.
-- dry-run-diff: Dry run with an exact diff. NEG: the delete or cleanup operation must show exactly what each path, record or checkout it can remove will remove before it acts, and the deletion must act on that same list; test that an item added after the preview is not deleted. Verify by: Run the dry run, mutate the target set, then run apply with the previewed list and assert only previewed items change and the rest is reported as skipped.
-- scope-pinning: Scope pinning to an exact path list. NEG: the delete or cleanup operation must delete only an exact, resolved list of paths approved up front, never a glob or filter re-resolved at execution time; test symlinks, path traversal, a path replaced by a link and a pattern that now matches more on each path, record or checkout it can remove. Verify by: Test with symlink-to-outside, ../ traversal, case-fold collisions and a directory swapped after approval; assert realpath is checked inside the pinned root and the count matches the approved list.
-- cross-host-approval-portability: Approval does not travel across hosts. NEG: the delete or cleanup operation must not let an approval given for one host, path or environment authorize deletion on another; test replaying an approval recorded for host A against host B and for a production target on each path, record or checkout it can remove, and assert it is refused. Verify by: Test: approval token bound to host id, target path and expiry; replay on another host and after expiry and assert refusal with a message naming the mismatch.
-- idempotent-retry: Idempotent and resumable delete. NEG: the delete or cleanup operation must be safe to rerun after a crash or timeout; test killing each path, record or checkout it can remove midway and rerunning, and assert no double effects, no deletion of items that were re-created in between, and an accurate report of what remains. Verify by: Fault-injection test that kills after each step; rerun and compare final state to a clean run; assert re-created items are not removed and the journal shows completed vs pending.
-### Devices, enrollment and remote control (devices)
-- device-identity-binding: Device identity binding. NEG: the device or fleet feature must bind credentials and grants to a device identity that cannot be copied or spoofed by replaying an identifier; test a cloned identifier, a re-imaged device and a second device with the same name on each enrolled device, grant and remote command and assert they are rejected or re-enrolled explicitly. Verify by: Test: reuse another device id and token from a second client, reset the device and re-enroll; assert the old credential is revoked and the audit log names both devices.
-- unattended-recovery: Unattended recovery. NEG: the device or fleet feature must recover without a person at the machine unless the spec says a person is required; test a reboot, a lost session and a stuck prompt on each enrolled device, grant and remote command with nobody present, and assert it returns to a working state or raises a remote-visible alert. Verify by: Reboot and kill the agent on an idle headless host; assert automatic recovery within the stated bound, or a remote alert, with no dialog that needs a local click.
-- grant-durability: Grant durability. NEG: the device or fleet feature must not let approvals or grants expire or re-prompt silently; test the grant after a restart, an update and the passage of time on each enrolled device, grant and remote command, and assert it still holds or the loss is visible and recoverable. Verify by: Restart, update and advance the clock past any TTL; assert the grant persists, or that expiry is explicit in the spec, logged and alerted.
-- remote-exec-audit: Remote execution audit. NEG: the device or fleet feature must record who ran what, on which device and when, for every remote command on each enrolled device, grant and remote command, with secrets redacted; test a command, a failed command and a rejected command and assert each yields an audit entry that cannot be altered by the target. Verify by: Run allowed, denied and failing commands; assert complete append-only audit records with actor, device, command digest and result, and that secrets do not appear.
-- factory-reset-guard: Factory reset and wipe guard. NEG: the device or fleet feature must not factory reset, wipe or unenroll a device without a bound, fresh, explicit approval for that device; test a replayed approval, a wrong-device id and a bulk request on each enrolled device, grant and remote command and assert refusal and an audit entry. Verify by: Test with a stale approval, an approval for another device and a fleet-wide call; assert nothing is wiped and the refusal names the mismatch.
-### Payments, billing and ledgers (money)
-- idempotency-key: Idempotency key on money movement. NEG: the money flow must attach a stable idempotency key to every charge, payout and transfer, kept across retries and restarts; test a lost response and retry on each charge, payout, refund and balance change and assert exactly one movement and a conflict error for the same key with a different payload. Verify by: Test: send the same request twice and with a changed amount under one key; assert one ledger entry, the second returns the first result, and the key survives a process restart.
-- double-submit: Double submit and concurrent requests. NEG: the money flow must not move money twice on a double click, two tabs or concurrent requests; test parallel submissions on each charge, payout, refund and balance change and assert one effect, a disabled control while pending, and correct state after a delayed response. Verify by: Parallel request test (N identical submits) plus a UI test of double click and edit-while-pending; assert one transaction and consistent balance.
-- currency-precision: Currency and decimal precision. NEG: the money flow must hold amounts as integer minor units or exact decimals with an explicit currency and rounding rule; test fractional cents, zero-decimal and three-decimal currencies, overflow and mixed currencies on each charge, payout, refund and balance change, and assert no float arithmetic and no silent rounding. Verify by: Property test over amounts and splits asserting the parts sum to the whole; boundary tests for JPY, KWD, very large values and negative amounts; static check that no float type touches amounts.
-- refund-reversal-path: Refund and reversal path. NEG: the money flow must provide a tested reversal for every money movement, bounded by the original amount; test partial, repeated and post-settlement refunds and a chargeback on each charge, payout, refund and balance change, and assert totals never exceed what was captured and entitlements follow. Verify by: Test partial refund twice, refund above the original, refund after a payout and a dispute; assert the ledger balances and the customer-visible state matches.
-- ledger-reconciliation: Ledger reconciliation with the processor. NEG: the money flow must reconcile its ledger against the processor or bank records and surface a discrepancy; test a missing webhook, a duplicated webhook and an out-of-order event on each charge, payout, refund and balance change, and assert the ledger converges and an alert names the gap. Verify by: Replay a processor export against the ledger with injected drift; assert every mismatch is reported, webhooks are verified and idempotent, and the daily total equals the processor total.
-- authorization-vs-capture: Authorization versus capture. NEG: the money flow must distinguish an authorization from a capture and release uncaptured holds; test an expired authorization, a capture above the authorized amount and a cancelled order on each charge, payout, refund and balance change, and assert funds are never granted before capture and holds are released. Verify by: State-machine test across authorize, capture, void and expiry; assert no entitlement before capture and that the processor state and local state agree after each transition.
-### Release, deploy and update pipeline (release)
-- derived-gate-floor-with-ratchet: Derived gate floor with ratchet. NEG: the release process must derive any minimum (test count, coverage, size) from the previous release and only let it rise; test each gate, signed artifact, feed and rollback step by deleting tests and by adding tests, and assert the gate fails on a drop and the floor ratchets up, with no hard-coded number in the gate. Verify by: Delete a test and assert the gate fails against the derived floor; add tests and assert the stored floor rises; grep the gate source for literal counts.
-- artifact-inventory-mirrored: Artifact inventory mirrored at build time. NEG: the release process must store every signed artifact on at least two hosts or Dropbox at build time, listed in an inventory; test each gate, signed artifact, feed and rollback step with one host unavailable and assert the build fails or flags it when an artifact exists on only one host. Verify by: At build end, compare the inventory with each location by checksum; remove one copy and assert the check fails naming the artifact that exists on only one host.
-- self-update-e2e: Self-update from the previous version. NEG: the release process must prove an update from version N-1 to N on an idle headless host; test the real updater on each gate, signed artifact, feed and rollback step and assert the new version runs, state is preserved and a failed update leaves the old version working. Verify by: Install N-1 on an idle headless host, publish N to the feed, observe the update through logs and version output, then repeat with a corrupt payload and assert rollback to N-1.
-- transport-proof: Prove the transport you will use. NEG: the release process must be exercised over the exact transport the integration will use (for example MCP, not only REST) with real credentials, and error bodies must be captured; test each gate, signed artifact, feed and rollback step and assert a 403 or error over that transport is recorded verbatim in the evidence. Verify by: Smoke test through the production transport and auth path, saving status and body for success and for forced failures; assert the evidence contains response bodies, not only status codes.
-- rollback-not-blocked: Rollback is never blocked. NEG: the release process must never block an emergency rollback with a preflight, lock or gate; test a rollback on each gate, signed artifact, feed and rollback step while a gate is failing and while another release is in flight, and assert it proceeds with an audit note. Verify by: Force every preflight check to fail and run the rollback path; assert it still completes, restores the previous artifact and records who and why.
-- staging-exists: Staging rehearsal exists. NEG: the release process must be rehearsed in a staging environment that matches production for each gate, signed artifact, feed and rollback step before release; assert the release record names the staging run, its commit and result, and that a missing staging target fails the release. Verify by: Run the release against staging and capture the deployed commit and smoke result; assert the production step refuses when no matching staging evidence exists.
+Domain-gate: pre-account-hijack waived (no authentication flow is added or changed; one command-text rule for git add and git commit)
+Domain-gate: lookalike-identifier waived (no identifier handling is involved)
+Domain-gate: request-device-binding waived (no approval or login flow is involved)
+Domain-gate: link-expiry-single-use waived (no link or token is issued or consumed)
+Domain-gate: session-fixation waived (no session handling is touched)
+Domain-gate: rate-limit-enumeration waived (no account lookup is involved)
+Domain-gate: store-billing-exposure waived (no account state or billing is touched)
+Domain-gate: backup-before-delete waived (nothing is deleted; the rule only refuses or warns about staging)
+Domain-gate: unpushed-work-detection waived (nothing is deleted)
+Domain-gate: dry-run-diff waived (nothing is deleted)
+Domain-gate: scope-pinning waived (nothing is deleted)
+Domain-gate: cross-host-approval-portability waived (no approval or deletion is involved)
+Domain-gate: idempotent-retry waived (a stateless text rule; a rerun gives the same verdict)
+Domain-gate: device-identity-binding waived (no device enrollment or grant is touched)
+Domain-gate: unattended-recovery waived (a stateless text rule with nothing to recover)
+Domain-gate: grant-durability waived (no grant or approval is created)
+Domain-gate: remote-exec-audit waived (no remote execution is added)
+Domain-gate: factory-reset-guard waived (no wipe or unenroll path is involved)
+Domain-gate: idempotency-key waived (no money movement is involved)
+Domain-gate: double-submit waived (no money flow or form is involved)
+Domain-gate: currency-precision waived (no amounts are involved)
+Domain-gate: refund-reversal-path waived (no money movement is involved)
+Domain-gate: ledger-reconciliation waived (no ledger is involved)
+Domain-gate: authorization-vs-capture waived (no payment is involved)
+Domain-gate: derived-gate-floor-with-ratchet waived (no release gate is changed)
+Domain-gate: artifact-inventory-mirrored waived (no signed artifact is produced)
+Domain-gate: self-update-e2e waived (the install is the normal harness batch install with ah install-files)
+Domain-gate: transport-proof waived (no integration transport is added)
+Domain-gate: rollback-not-blocked waived (no release or rollback path is touched)
+Domain-gate: staging-exists waived (a local guard rule; a live Bash call by main after install is the real proof)
