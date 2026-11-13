@@ -13,6 +13,13 @@ import * as live from './live.js';
 mountInitiatives(); mountActivity(); mountOwners(); mountChat(); mountHealth(); mountNeeds();
 const { go } = mountViews();  // the 3D topology loads only when its tab is first opened
 document.getElementById('needs-button').addEventListener('click', () => go('needs-panel'));
+// Wrapped navigation and zoom change the sticky header's height. Share its actual size
+// with anchor offsets and the chat dock rather than assuming a fixed desktop height.
+const pageHeader = document.querySelector('.page-header');
+const measureHeader = () => document.documentElement.style.setProperty('--header-height', `${pageHeader.getBoundingClientRect().height}px`);
+if (typeof ResizeObserver !== 'undefined') new ResizeObserver(measureHeader).observe(pageHeader);
+window.addEventListener('resize', measureHeader);
+measureHeader();
 
 const filters = document.getElementById('event-filters');
 const all = button('filter-chip all', 'All', () => toggleFilter('all'));
@@ -30,7 +37,7 @@ const THEME_TEXT = { auto: 'Theme: auto', light: 'Theme: light', dark: 'Theme: d
 function applyTheme(state) {
   const resolved = state.theme === 'auto' ? (scheme.matches ? 'light' : 'dark') : state.theme;
   document.documentElement.dataset.theme = resolved;
-  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', resolved === 'light' ? '#f6f6f1' : '#000000');
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', resolved === 'light' ? '#f4f5f3' : '#0e1113');
   const toggle = document.getElementById('theme-toggle');
   toggle.dataset.mode = state.theme;
   document.getElementById('theme-label').textContent = THEME_TEXT[state.theme];
@@ -57,6 +64,9 @@ function shell(state, reason) {
   lastUpdate.textContent = state.lastData ? `Updated ${age(new Date(state.lastData).toISOString(), state.now)}` : 'waiting for data';
   lastUpdate.title = state.lastData ? `Last data from the server: ${new Date(state.lastData).toLocaleTimeString()}` : '';
   lastUpdate.classList.toggle('old', !!state.lastData && state.connection === 'live' && state.now - state.lastData > 180000);
+  const chatConnection = document.getElementById('chat-connection-status');
+  chatConnection.textContent = `${CONNECTION_TEXT[state.connection] || state.connection} · ${lastUpdate.textContent}`;
+  chatConnection.classList.toggle('old', state.connection !== 'live' || lastUpdate.classList.contains('old'));
   if (reason === 'tick' || reason === 'highlight') return;
   const connection = document.getElementById('connection');
   connection.className = `connection ${state.connection}`;
