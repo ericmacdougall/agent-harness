@@ -58,6 +58,7 @@ Checkpoint: not required (under 10 min and 4 GB)
 - A skipped process may still have the worktree as its working directory (its name or command line can be set by the process, and a setgid helper's cwd cannot be read): stated limit, accident prevention and not an access control; the worktree is clean and published, so the effect is a deleted working directory under that process. Skipped processes are always listed in the result and the audit row.
 - A program that started after the worktree was created but never used it still blocks (conservative); the operator lets it end. On t2-dev a worktree OLDER than a long-lived unreadable process that is not a known helper (for example a browser started after it) is refused until that process ends.
 - The worktree creation time is the `.git` file's mtime: `git worktree repair` and `git worktree move` rewrite it and `cp -a` or `rsync -t` of a worktree preserves an old one, either of which skews "created" (stated limit). A command line that names the worktree by a relative path, and a name or command line set by the process itself, are missed (accident prevention, not an access control).
+- An unreadable shell that is an ancestor of the scanner (the caller's own session, for example a shell run through sg that sits in the worktree) is skipped and reported; a shell with a readable cwd inside the worktree still blocks.
 - Review history: the first draft skipped any unreadable process whose name was not on a deny list; the independent review showed that the real sg parent of the pgpool client would block every worktree, that the caller's own tailscaled session ancestor would block `ssh t2-dev remove-worktree`, and that a deny list would skip an agent CLI or pytest started in the worktree (a live writer); the order above is the result.
 - Time-based reasoning: the worktree creation time is the `.git` file's mtime; a clock change or a restored file could mislead it; unknown values fail closed.
 - The real /proc readers run only on Linux; the Mac suite covers them with a faked /proc and the live run on t2-dev is main's proof.
@@ -98,3 +99,12 @@ Domain-gate: self-update-e2e waived (the install is the normal harness batch ins
 Domain-gate: transport-proof waived (no integration transport is added)
 Domain-gate: rollback-not-blocked waived (no release or rollback path is touched)
 Domain-gate: staging-exists waived (a local verifier change; the real run on t2-dev is main's live proof)
+
+## Reviews
+
+Spec core sha256: `22a60216e43e3863a1e554f8fb4f691cf31218cb1cc207c496b0515d93710699`
+
+| Role | Verdict | Reviewer | Kind | Source | Bound to |
+|---|---|---|---|---|---|
+| adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | current |
+| acceptance | ACCEPT | a5d878417503c1093 (red-team) | agent | WAL-verified red-team agent | current |

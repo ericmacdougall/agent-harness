@@ -1992,9 +1992,11 @@ UNREADABLE_KNOWN_HELPERS = (('(sd-pam)', ''), ('systemd', '--user'), ('ssh-agent
 def unreadable_verdict(pid, name, path, created):
     """None when an unreadable same-user process may be skipped, else a short reason it still refuses. The process' own
     working directory cannot be read (a setgid or privilege-separation helper, an sd-pam or sg-docker wrapper), so this is
-    judged from the worktree side: its command line must not name the worktree; a shell, interpreter, editor or wrapper
-    always refuses; a client workload refuses when it started after the worktree existed; every other process is skipped
-    and REPORTED. Stated limit: names and command lines can be set by the process itself, and a skipped process may still
+    judged from the worktree side, in this order: an unreadable command line refuses; a command line naming the worktree
+    refuses; a shell, editor or interpreter always refuses; a known long-lived helper (name AND command line agree) is
+    skipped whatever its start time; every other process is judged by time, because it cannot have been launched from the
+    worktree before the worktree existed: it is skipped and REPORTED only when it started before the worktree was created,
+    and refuses when it started after or when a start time is unknown. Stated limit: names and command lines can be set by the process itself, and a skipped process may still
     have the worktree as its working directory (its directory is then deleted under it, no data is lost: the worktree is
     clean and published); this protects against accident, not against a hostile same-user process."""
     base = (name or '').strip().lower()
