@@ -254,7 +254,7 @@ const requirementKeys = new Map();
 export async function requirementAction(row, action, reason) {
   const clean = String(reason || '').trim();
   if (!row?.id || !row.digest || !['archive', 'restore'].includes(action) || !clean || clean.length > 300 || !requirementTransport) return { ok: false, message: 'a reason of 1 to 300 characters is required' };
-  const sig = `${row.id}|${action}|${clean}`;
+  const sig = `${row.id}|${action}|${clean}|${row.digest}`;  // the digest is part of the request: a changed requirement is a new request
   if (!requirementKeys.has(sig)) requirementKeys.set(sig, adapt.newClientKey());
   try {
     await requirementTransport({ req_id: row.id, action, reason: clean, digest: row.digest, client_key: requirementKeys.get(sig) });

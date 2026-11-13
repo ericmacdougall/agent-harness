@@ -281,6 +281,24 @@ class Route(ServerHarness):
         status, again = self.click(key="click-key-0200", digest=self.req()["digest"])
         self.assertEqual((status, again["id"], again["created"]), (200, first["id"], False))
 
+    def test_f5_a_same_key_retry_with_a_changed_or_missing_digest_or_session_is_a_conflict_and_records_nothing(self):
+        status, first = self.click(key="click-key-0300")
+        self.assertEqual(status, 201)
+        rows = len(self.app.actions.all())
+        body = {"req_id": "wr1", "action": "archive", "reason": "not wanted any more", "client_key": "click-key-0300"}
+        for name, change in (("changed digest", {"digest": "0" * 16}), ("missing digest", {}), ("null digest", {"digest": None})):
+            with self.subTest(name):
+                status, value = self.post({**body, **change})
+                self.assertEqual((status, value.get("error")), (409, "key-conflict"), value)
+        self.assertEqual(len(self.app.actions.all()), rows)
+        self.app.owners.session = "ffffffff-0000-4000-8000-000000000000"  # another main session: not the original binding
+        status, value = self.post({**body, "digest": self.req()["digest"]})
+        self.assertEqual((status, value.get("error")), (409, "key-conflict"))
+        self.app.owners.session = SID
+        status, again = self.post({**body, "digest": self.req()["digest"]})  # the exact original payload is still acknowledged
+        self.assertEqual((status, again["id"], again["created"]), (200, first["id"], False))
+        self.assertEqual(len(self.app.actions.all()), rows)
+
     def test_the_write_routes_in_the_server_match_the_coverage_map(self):
         import re
         server = (REPO / "harness" / "mission_control" / "server.py").read_text()

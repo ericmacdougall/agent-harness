@@ -540,8 +540,14 @@ class App:
         # A retry with the same key after a lost response is answered with the row it already made, whatever state
         # the requirement is in now (the row's own archive made the "already archived" check below true).
         prior = self.actions.by_key(body.get("client_key"))
-        if prior and (prior["req"], prior["action"]) == (req, action) and isinstance(body.get("reason"), str) \
-                and prior["reason"] == " ".join(mc_chat._redact(body["reason"]).split()):
+        if prior:
+            # The same key must mean the same request: requirement, action, reason, digest and main session. Anything
+            # else is a conflict, never an acknowledgement of something that was not recorded.
+            same = (prior["req"], prior["action"], prior["session"]) == (req, action, session) \
+                and isinstance(body.get("reason"), str) and prior["reason"] == " ".join(mc_chat._redact(body["reason"]).split()) \
+                and isinstance(digest, str) and hmac.compare_digest(digest.encode("utf-8", "replace"), str(prior["digest"]).encode())
+            if not same:
+                return 409, {"error": "key-conflict", "message": "this request id was already used for a different request"}
             return 200, {"id": prior["id"], "created": False, "req": req, "action": action, "at": prior["at"]}
         item = next((r for r in self.ledger.parts["requirements"].get("items", []) if r["id"] == req), None) \
             if isinstance(req, str) else None
