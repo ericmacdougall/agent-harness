@@ -3340,6 +3340,15 @@ def main(argv=None) -> int:
     if given[:2] in (["task", "kit"], ["task", "succeed"], ["task", "kits"]):  # goodqa#15565: successor kit (successor.py)
         import successor  # noqa: PLC0415
         return successor._cli(["list" if given[1] == "kits" else given[1]] + given[2:])
+    if given[:1] == ["guard-selftest"]:  # goodqa#15876: a fixed live test of a guard rule; it takes no command, path or directory
+        try:
+            import guard_selftest  # noqa: PLC0415
+        except ImportError:
+            json.dump({"ok": False, "code": "missing", "message": "guard_selftest.py is not installed beside ah.py; install the "
+                                                                    "merged hook files first"}, sys.stdout)
+            sys.stdout.write("\n")
+            return 4
+        return guard_selftest.cli_main(given[1:])
     args = build_parser().parse_args(argv)
     try:
         data = run(args, home_dir())
