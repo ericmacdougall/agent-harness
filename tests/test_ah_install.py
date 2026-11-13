@@ -950,12 +950,13 @@ class Wiring(Base):
         done = {"ok": True, "result": "dry_run"}
         with mock.patch.object(ai, "run_in_own_session", return_value=4) as own, \
                 mock.patch.object(ai, "install_files", return_value=done), mock.patch.object(ai, "resume", return_value=done), \
-                mock.patch.object(ai, "rollback", return_value=done):
-            for argv in own_cases:
+                mock.patch.object(ai, "rollback", return_value=done), mock.patch.object(ai, "register_own_session") as register:
+            for argv, target in zip(own_cases, ("local", "local-codex", "local", "local-codex")):
                 with self.subTest(argv):
                     own.reset_mock()
                     self.assertEqual(self.cli(*argv)[0], 4)  # the session's exit status is the command's
                     self.assertEqual(own.call_args[0][0], ["install-files", *argv])  # the same command line, unchanged
+                    self.assertEqual(own.call_args[1]["target"], target)  # recorded under the run's own target (M1)
             for argv in inline_cases:
                 with self.subTest(argv):
                     own.reset_mock()
@@ -963,8 +964,14 @@ class Wiring(Base):
                     own.assert_not_called()
             own.reset_mock()
             with mock.patch.dict(os.environ, {ai.IN_SESSION_ENV: "1"}):
-                self.assertEqual(self.cli(*real)[0], 0)  # the copy in its own session runs the install itself
-            own.assert_not_called()
+                self.assertEqual(self.cli(*real)[0], 4)  # an inherited marker alone is not trusted: still its own session (L2)
+                own.assert_called_once()
+                own.reset_mock()
+                register.reset_mock()
+                with mock.patch.object(ai.os, "getsid", return_value=os.getpid()):
+                    self.assertEqual(self.cli(*real)[0], 0)  # the copy that leads its own session runs the install itself
+                own.assert_not_called()
+                register.assert_called_once()  # and records itself, so a --resume or --rollback refuses while it lives
 
 
 CODEX_NAMES = ("command_guard.py", "ah.py", "extra.py")  # doctor.py is a Claude-only hook here, as in the real lists
@@ -1281,7 +1288,11 @@ FOREGROUND = r'''
 import sys
 sys.path.insert(0, sys.argv[1])
 import ah_install as ai
-sys.exit(ai.run_in_own_session(["install-files"], sys.argv[2], launcher=sys.argv[3:]))
+try:
+    code = ai.run_in_own_session(["install-files"], sys.argv[2], launcher=sys.argv[3:], target="local")
+except TypeError:  # an older ah_install without the session record (the failing-first run shows the race itself)
+    code = ai.run_in_own_session(["install-files"], sys.argv[2], launcher=sys.argv[3:])
+sys.exit(code)
 '''
 PROGRESS_FN = '''
 def progress(what, name):
@@ -1290,6 +1301,13 @@ def progress(what, name):
         f.flush()
         os.fsync(f.fileno())
     time.sleep(PROGRESS_DELAY)
+
+def slow_after_commit():
+    try:
+        if "commit " in open(PROGRESS_PATH).read():
+            time.sleep(SLOW_AFTER_COMMIT)
+    except OSError:
+        pass
 '''
 
 
@@ -1300,20 +1318,23 @@ class LocalKill(LocalBase):
 
     FILES = ["ah.py", "extra.py", "command_guard.py"]
 
-    def instrumented(self, progress, delay=1.0):
+    def instrumented(self, progress, delay=1.0, slow=0.0):
+        """The program, recording each rename (then sleeping `delay`); `slow` seconds more in every self-test after a commit."""
         script = ai.REMOTE_SCRIPT
-        for old, new in (("STALE = 1800\n", "STALE = 1800\nPROGRESS_PATH = %r\nPROGRESS_DELAY = %r\n%s" % (str(progress), delay, PROGRESS_FN)),
+        for old, new in (("STALE = 1800\n", "STALE = 1800\nPROGRESS_PATH = %r\nPROGRESS_DELAY = %r\nSLOW_AFTER_COMMIT = %r\n%s"
+                          % (str(progress), delay, slow, PROGRESS_FN)),
                          ("        os.replace(t, p)\n", "        os.replace(t, p)\n        progress('commit', name)\n"),
-                         ("        os.replace(t, live(name))\n", "        os.replace(t, live(name))\n        progress('restore', name)\n")):
+                         ("        os.replace(t, live(name))\n", "        os.replace(t, live(name))\n        progress('restore', name)\n"),
+                         ("def selftest():\n", "def selftest():\n    slow_after_commit()\n")):
             self.assertEqual(script.count(old), 1, old)
             script = script.replace(old, new)
         return script
 
-    def drive(self, ref, progress, foreground=False):
+    def drive(self, ref, progress, foreground=False, slow=0.0):
         """The caller. foreground=False: install_files itself (each program step detached, the verdict in the caller).
         foreground=True: ah.main's foreground, which runs that same whole install in its own session and waits."""
         cfg = Path(self.tmp, "driver.json")
-        cfg.write_text(json.dumps({"hooks": str(HOOKS), "url": "file://" + str(self.origin), "script": self.instrumented(progress),
+        cfg.write_text(json.dumps({"hooks": str(HOOKS), "url": "file://" + str(self.origin), "script": self.instrumented(progress, slow=slow),
                                    "host": "local", "ref": ref, "files": self.FILES, "ticket": TICKET, "home": str(self.mac)}))
         driver = Path(self.tmp, "driver.py")
         driver.write_text(DRIVER)
@@ -1465,6 +1486,59 @@ class LocalKill(LocalBase):
         self.assertEqual({n: self.live(n) for n in NAMES}, old)
         self.assertEqual(ai.unfinished_runs(self.mac, "local"), [])
         self.assertTrue(self.no_temp_files(self.hooks))
+
+    def test_resume_and_rollback_refuse_while_the_session_run_is_alive_and_the_audit_stays_consistent(self):  # AC-4, AC-8, NEG-23
+        old = {n: self.live(n) for n in NAMES}
+        new = {n: sha(self.base_bytes(n) + b"\n# c1\n") for n in self.FILES}
+        progress = Path(self.tmp, "progress-live.txt")
+        proc = self.drive(self.c1, progress, foreground=True, slow=10.0)  # a GOOD commit whose after-install self-test is slow
+        self.wait_for(progress, "commit", len(self.FILES), 240, proc)
+        os.killpg(proc.pid, signal.SIGKILL)  # the caller dies after the commit; the session run is in its self-test
+        proc.wait()
+        pid = int(re.search(r"own session \(pid (\d+)\)", self.caller_err.read_text()).group(1))
+        run = self.wait_rows("start", 30)[0]["run"]
+        calls = (("rollback", lambda: ai.rollback(run, TICKET, (), self.mac, "s", "a", None, lambda t, x: None)),
+                 ("resume", lambda: ai.resume(run, TICKET, self.mac, "s", "a", None, lambda t, x: None)))
+        for label, call in calls:
+            with self.subTest(label):
+                with self.assertRaises(ai.InstallError) as caught:
+                    call()
+                self.assertEqual((caught.exception.code, caught.exception.exit_code), ("still_running", ai.STILL_RUNNING_EXIT))
+                self.assertIn("pid %d" % pid, str(caught.exception))
+        os.kill(pid, 0)  # the refusals came while the session run was alive (this raises if it had ended)
+        self.assertEqual({n: self.live(n) for n in self.FILES}, new)
+        self.wait_gone(pid, 240)
+        self.assertEqual(ai.results_of(self.mac, run), ["installed"])  # one result, the session's own, matching the live bytes
+        self.assertEqual({n: self.live(n) for n in self.FILES}, new)
+        self.assertEqual(ai.unfinished_runs(self.mac, "local"), [])
+        self.assertEqual(ai.rollback(run, TICKET, (), self.mac, "s", "a", None, lambda t, x: None)["result"], "restored")  # now admitted
+        self.assertEqual({n: self.live(n) for n in NAMES}, old)
+
+    def test_a_session_record_counts_only_while_its_pid_and_start_time_match(self):  # NEG-23
+        path = ai.record_session(self.mac, os.getpid(), "local")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual([r["pid"] for r in ai.live_sessions(self.mac, "local")], [os.getpid()])
+        self.assertEqual(ai.live_sessions(self.mac, "local-codex"), [])  # another target
+        self.assertEqual(ai.live_sessions(self.mac, "local", exclude=(os.getpid(),)), [])  # the caller's own record
+        rec = json.loads(path.read_text())
+        path.write_text(json.dumps(dict(rec, start="Thu Jan  1 00:00:00 1970")))
+        self.assertEqual(ai.live_sessions(self.mac, "local"), [])  # the same pid with another start time is a reused pid
+        path.write_text(json.dumps(dict(rec, start=None)))
+        self.assertEqual(len(ai.live_sessions(self.mac, "local")), 1)  # an unknown start time counts as alive (fail closed)
+        ended = subprocess.Popen([sys.executable, "-I", "-c", "pass"])
+        ended.wait()
+        path.unlink()
+        ai.record_session(self.mac, ended.pid, "local")
+        self.assertEqual(ai.live_sessions(self.mac, "local"), [])  # an ended process
+        sleeper = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"])
+        self.addCleanup(sleeper.wait)
+        self.addCleanup(sleeper.kill)
+        ai.record_session(self.mac, sleeper.pid, "local")
+        with self.assertRaises(ai.InstallError) as caught:
+            ai.refuse_while_running(self.mac, "local", "ins-0123456789ab")
+        self.assertEqual((caught.exception.code, caught.exception.exit_code), ("still_running", 7))
+        self.assertIn("pid %d" % sleeper.pid, str(caught.exception))
+        ai.refuse_while_running(self.mac, "t2-dev", "ins-0123456789ab")  # a fleet host has no session records
 
     def test_a_run_in_its_own_session_relays_its_output_and_exit_status_and_a_signal_is_unknown(self):  # AC-8
         code = ("import json, os, sys; print(json.dumps({'sid': os.getsid(0), 'marker': os.environ.get(%r)})); "

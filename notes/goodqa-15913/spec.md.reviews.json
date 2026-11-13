@@ -64,6 +64,22 @@
    "core_sha": "b22ec9007f4c3c9df756341d619ad20a5e6ec4056ad98ab546d6e2533e9f7188",
    "at": "2026-11-13T18:29:51.486862+00:00",
    "key": "agent:a3ed8c056f627688a"
+  },
+  {
+   "kind": "agent",
+   "identity": "a3ed8c056f627688a",
+   "verdict": "BLOCK",
+   "model": "red-team",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/agent-a3ed8c056f627688a/review-15913-spec-v3-adversarial.md",
+    "sha256": "80b6953866a6c6368c5fcec2695b6b4d8f87f2cc2b26277e35719070bcc20870"
+   },
+   "role": "adversarial",
+   "core_sha": "a906d4796954734a388ed4697d318e32e95bd4eade8c1879f11f57aace5f0306",
+   "at": "2026-11-13T18:57:35.149412+00:00",
+   "key": "agent:a3ed8c056f627688a"
   }
  ]
 }
