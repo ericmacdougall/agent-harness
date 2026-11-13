@@ -2,6 +2,7 @@
 // repaint is driven by the store (an SSE snapshot or event) and coalesced into one animation frame.
 import { getState, subscribe, setTab, TABS, requirementAction } from './store.js';
 import * as v from './ledger-views.js';
+import * as o from './ops-views.js';
 
 const SECTIONS = [
   // id, builder, store reasons that repaint it, view that must be showing (null: always)
@@ -9,6 +10,8 @@ const SECTIONS = [
   { id: 'goals-list', build: (s, ui) => v.goals(s, ui), on: ['ledger'], view: 'overview', slow: true },
   { id: 'deploys-list', build: (s, ui) => v.deals(s, ui), on: ['ledger', 'event'], view: 'overview', slow: true },
   { id: 'blockers-list', build: (s, ui) => v.blockers(s, ui), on: ['ledger', 'asks', 'owners', 'initiatives'], view: 'overview' },
+  { id: 'owner-cap', build: s => o.capacityLine(s), on: ['capacity'], view: 'overview' },
+  { id: 'alerts-list', build: (s, ui) => o.alertsPanel(s, ui), on: ['alerts'], view: 'overview', slow: true },
   { id: 'requirements-body', build: (s, ui) => v.requirements(s, ui), on: ['ledger'], view: 'requirements', slow: true },
   { id: 'archive-body', build: (s, ui) => v.archive(s, ui), on: ['ledger', 'asks'], view: 'archive', slow: true },
   { id: 'inventory-body', build: (s, ui, go) => v.inventory(s, go), on: ['ledger', 'asks', 'owners', 'initiatives', 'chat', 'health', 'seed'], view: 'sources', slow: true },
@@ -23,7 +26,7 @@ export function mountViews() {
   let ticks = 0;
 
   const ui = {
-    goalsLimit: 5, dealsLimit: 5, blockersLimit: 5, reqFilter: 'live', reqQuery: '', reqLimit: v.PAGE, archiveKind: 'all', archiveLimit: v.PAGE,
+    goalsLimit: 5, dealsLimit: 5, blockersLimit: 5, alertsLimit: 8, alertSeverity: 'all', reqFilter: 'live', reqQuery: '', reqLimit: v.PAGE, archiveKind: 'all', archiveLimit: v.PAGE,
     armed: null, draft: '', busy: false, error: '', notice: {},
     arm(row, action) { this.armed = { id: row.id, action }; this.draft = ''; this.error = ''; this.busy = false; repaint(['requirements-body', 'archive-body'], true); },
     cancel() { const id = this.armed?.id; this.armed = null; this.draft = ''; this.error = ''; repaint(['requirements-body', 'archive-body'], true); document.querySelector(`[data-id="${id}"] .req-action`)?.focus(); },
@@ -45,11 +48,12 @@ export function mountViews() {
       this[key] = value;
       if (key === 'reqFilter' || key === 'reqQuery') this.reqLimit = v.PAGE;
       if (key === 'archiveKind') this.archiveLimit = v.PAGE;
+      if (key === 'alertSeverity') { this.alertsLimit = 8; repaint(['alerts-list'], true); return; }
       repaint(['requirements-body', 'archive-body'], true);
     },
     more(key) {
       this[key] += key === 'goalsLimit' ? 6 : v.PAGE;
-      repaint(['goals-list', 'deploys-list', 'blockers-list', 'requirements-body', 'archive-body'], true);
+      repaint(['goals-list', 'deploys-list', 'blockers-list', 'alerts-list', 'requirements-body', 'archive-body'], true);
     },
   };
 

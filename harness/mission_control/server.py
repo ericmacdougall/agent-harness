@@ -336,7 +336,9 @@ class App:
                                        fabric_bin=fabric_bin)
         self.tailer = col.WalTailer(self.hub, self.health, self.reader, wal_roots)
         self.initiatives = col.Initiatives(self.hub, self.health, self.reader, initiatives)
-        self.owners = col.Owners(self.hub, self.health, self.runner, self.tailer)
+        self.owners = col.Owners(self.hub, self.health, self.runner, self.tailer,
+                                 cap_path=HOOKS / "model_tiers.json")
+        self.alerts = col.Alerts(self.hub, self.health, self.runner)
         self.supervised = None
         if not demo:
             owner_root = home / '.agent-harness' / 'codex-owners'
@@ -355,7 +357,7 @@ class App:
         self.ledger = col.Ledger(self.hub, self.health, self.runner, lambda: self.owners.session, root=root,
                                  actions=self.actions)
         self.collectors = [self.tailer, self.initiatives, self.drop, self.owners, self.github, self.tickets,
-                           self.remote]
+                           self.remote, self.alerts]
         self.codex = CodexResponder(self.hub, self.health, self.runner, codex_binary(), root,
                                     disabled="" if codex else "Codex chat is turned off for this instance")
         self.chat_sig = None
@@ -492,6 +494,7 @@ class App:
                 "health": self.health.snapshot(), "events": self.hub.recent(limit=200),
                 "chat": self.chat_snapshot(), "asks": self.asks.snapshot(),
                 "ledger": self.ledger.snapshot(), "requirement_actions": len(self.actions.latest()),
+                "alerts": self.alerts.snapshot(), "capacity": dict(self.owners.capacity),
                 "limits": {"chat_max": mc_chat.MAX_TEXT, "approval_note_max": mc_chat.APPROVAL_NOTE_MAX,
                            "approval_ttl_s": mc_chat.APPROVAL_TTL_S}}
 

@@ -19,6 +19,7 @@ One scrolling page with six views (Overview, Requirements, Archive, Activity, To
 1. **Mission**: five summary tiles (goals live and tested, live owners, asks waiting on you, blockers, live requirements), the goals from the ledger with their evidence one click down, and the initiatives behind a disclosure.
 2. **Live owners and streams** and **Needs you**, side by side. The age beside each owner is its heartbeat (time since it last wrote). Needs you is part of the page, not a dialog; the top-bar button jumps to it.
 3. **Recent deploys and live tests** and **Blockers**, side by side.
+4. **Ops alerts**: the active alerts of the ops-watch ring, most severe first, with the owner cap line above them (see Ops alerts and owner capacity).
 
 The top bar always shows the connection (Live, Reconnecting, Offline, Signed out) and the age of the last server message. The page opens one SSE stream and never polls `/api/state` on a timer; after a drop it resyncs once on reconnect. The 3D topology loads only when its tab is first opened (`#gl=off` still forces the static view). Every long text is clamped with a disclosure, and every list shows one page with "show more", so volume does not take over the page.
 
@@ -52,6 +53,18 @@ The manual archive's "who" is the dashboard session (`archived from dashboard se
 ### Ledger source
 
 `ah goals --json`, `ah requirements --session S` and `ah status --session S --since 12h` are read through three allowlisted read-only runner shapes by the Ledger collector: once per cadence (60 s with a page attached, 300 s without, plus the attach refresh; never on a client request), at most 1 MiB each (4 MiB for requirements), 60 goals with 12 evidence records each, 1000 requirements, 30 rows per status list. A failing source keeps its last good rows marked stale and shows in Source health. The snapshot is published as the SSE event `ledger` (and in `/api/state`) only when its content changed.
+
+### Ops alerts and owner capacity
+
+The ops-watch ring holds what the watchers and guards raise: silent or dropped owners, asks past their reminder, merged changes that are not deployed, open `PENDING_REAL_TEST` ids, disk and memory, drifted hooks, failed remote timers. The Alerts collector is its read path (GoodQA goodqa#15934). It runs one allowlisted, read-only shape, `ops_watch.py active --json`; no other ops-watch verb is reachable from Mission Control.
+
+- The panel shows the total, the count per severity and per kind (the key's prefix), a severity filter and the rows, 8 at a time. A row shows the severity as a word, the key, the message, the host, the age, the ticket if one is named, and whether the alert blocks main from stopping.
+- Only named fields leave the collector (`key`, `cls`, `severity`, `host`, `message`, `at`, `seq`, `agent`, `stop_block`, `ticket`). The alert's `detail` object is never forwarded. Text is redacted and clipped (key 200 characters, message 600). An unknown severity is shown as info and is never promoted.
+- At most 200 rows are sent, most severe first. The counts cover every alert, and the panel says when rows were cut.
+- A failed read keeps the last good rows, marked stale with the reason. A first read that fails says the alert state is not known; it never shows "No active alerts".
+- The panel is read-only. An alert clears when its cause does (ops-watch writes the clear). There is no acknowledge or dismiss button, by design: a dismissed alert is the "detected, reported, ignored" failure the dropped-owner gate was built against.
+
+The owner cap line comes from the `ah owners` read Mission Control already makes, with no extra process: live owners against `caps.session_owner_agents` of the installed `model_tiers.json`, how many owners are silent, and how many silent or dropped owners have no recorded disposition. The spawn gate keeps its own count (`tier_gate.live_owner_ids`), so the line names its source. If the cap cannot be read as a small positive integer, the line says the cap is not known.
 
 ### Data with no UI today
 
@@ -97,6 +110,7 @@ Every source has a fixed interval. A failing source is never retried faster, and
 | t2-dev | One fixed WAL probe over ssh | At most one ssh connection every 60 s |
 | Event drops | `~/.agent-harness/mission-control/sources/*.jsonl`, written by external sources such as Fabric | Every 5 s |
 | Ledger | `ah goals`, `ah requirements`, `ah status` (see Ledger source) | 60 s attached, 300 s idle |
+| Ops alerts | `ops_watch.py active --json`: the active alerts of the ring (see Ops alerts and owner capacity) | 60 s attached, 300 s idle; at most 2 MiB and 200 rows |
 
 Two kinds of WAL line are not work items:
 

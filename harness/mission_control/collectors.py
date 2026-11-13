@@ -581,9 +581,11 @@ class Owners(Collector):
     interval = 60.0
     idle_interval = 300.0  # `ah owners` costs about 6 CPU seconds a run: five times less often with no page open
 
-    def __init__(self, hub, health, runner, tailer):
+    def __init__(self, hub, health, runner, tailer, cap_path=None):
         super().__init__(hub, health)
         self.runner, self.tailer = runner, tailer
+        self.cap_path = cap_path  # the installed tier policy; None: the cap is not shown
+        self.capacity = capacity([], None)
         self.rows: list[dict] = []
         self.states: dict[str, str] = {}
         self.session = ""
@@ -643,6 +645,10 @@ class Owners(Collector):
         if not isinstance(data, dict) or not isinstance(data.get('owners'), list):
             raise ValueError('invalid Claude owner snapshot')
         self.session = str(data.get("session") or "")
+        summary = capacity(data["owners"], read_owner_cap(self.cap_path) if self.cap_path else None)
+        if summary != self.capacity:
+            self.capacity = summary
+            self.hub.snapshot("capacity", dict(summary))
         rows = []
         for row in data.get("owners") or []:
             if not isinstance(row, dict):
@@ -1177,6 +1183,145 @@ class Ledger(Collector):
         self.sig = sig
         self.published_at = ev.iso()
         self.hub.snapshot("ledger", self.snapshot())
+
+
+SEVERITIES = ("critical", "high", "warning", "info")
+ALERT_CLASS_RE = re.compile(r"[a-z][a-z0-9_-]{0,23}(?=:|$)")
+ALERT_AT_RE = re.compile(r"\d{4}-\d\d-\d\dT[0-9:.+Z-]{1,30}")
+AGENT_RE = re.compile(r"[A-Za-z0-9_-]{1,40}")
+OWNER_CAP_MAX = 64
+
+
+def read_owner_cap(path) -> int | None:
+    """caps.session_owner_agents of the installed tier policy, or None when it cannot be read as a small positive
+    integer. One bounded read; a symlink is never followed. Unknown stays unknown: the page then shows no cap."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            raw = os.read(fd, 256 * 1024)
+        finally:
+            os.close(fd)
+        cap = json.loads(raw).get("caps", {}).get("session_owner_agents")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return cap if type(cap) is int and 0 < cap <= OWNER_CAP_MAX else None
+
+
+def capacity(rows, cap) -> dict:
+    """The owner cap line (goodqa#15934 AC-4), from the rows `ah owners` already returned. An owner holds a slot
+    while it is live; a silent or dropped owner with no recorded disposition needs a decision. The spawn gate keeps
+    its own count (tier_gate.live_owner_ids); this one says where it came from."""
+    live = silent = decisions = 0
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or row.get("owner") is not True:
+            continue
+        state = str(row.get("state") or "")
+        quiet = state.startswith("SILENT")
+        if state == "live":
+            live += 1
+        elif quiet:
+            silent += 1
+        if row.get("decision_required") is True or (
+                (quiet or state.startswith("DROPPED")) and not isinstance(row.get("disposition"), dict)):
+            decisions += 1
+    cap = cap if type(cap) is int and 0 < cap <= OWNER_CAP_MAX else None
+    return {"cap": cap, "live": live, "silent": silent, "decisions": decisions,
+            "over": bool(cap is not None and live > cap), "source": "ah owners"}
+
+
+class Alerts(Collector):
+    """The ops-watch ring's active alerts (goodqa#15934): `ops_watch.py active --json`, read-only.
+
+    The ring already holds what the guards and watchers of the last week raise (silent owners, due asks, merged but
+    not deployed, open PENDING ids, disk and memory, drifted hooks, failed remote timers), and Mission Control had no
+    read path for it. One bounded read per cadence, never on a client request. Only named fields leave: the detail
+    object is not forwarded, text is redacted and clipped, an unknown severity is shown as info and never promoted.
+    A failing read keeps the last good rows marked stale; a first read that fails is unknown, never "no alerts"."""
+    name = "alerts"
+    interval = 60.0
+    idle_interval = 300.0
+    LIMIT = 2 * 1024 * 1024  # the ring is 1 MiB; more output is refused, never cut into valid-looking data
+    MAX_ROWS = 200
+    MAX_KEY = 200
+    MAX_MESSAGE = 600
+    MAX_CLASSES = 24
+
+    def __init__(self, hub, health, runner):
+        super().__init__(hub, health)
+        self.runner = runner
+        self.view = {"items": [], "total": 0, "truncated": False, "counts": dict.fromkeys(SEVERITIES, 0),
+                     "classes": {}, "stale": False, "error": "", "at": ""}
+        self.sig = None
+
+    @staticmethod
+    def row(raw) -> dict | None:
+        if not isinstance(raw, dict) or raw.get("event") != "raise":
+            return None
+        key = raw.get("key")
+        if not isinstance(key, str) or not key.strip():
+            return None
+        detail = raw.get("detail") if isinstance(raw.get("detail"), dict) else {}
+        message = ev.short(raw.get("message") if isinstance(raw.get("message"), str) else "", Alerts.MAX_MESSAGE)
+        cls = ALERT_CLASS_RE.match(key)
+        agent = detail.get("agent")
+        ticket = detail.get("ticket")
+        at = raw.get("at") if isinstance(raw.get("at"), str) else ""
+        seq = raw.get("seq")
+        return {"key": ev.short(key, Alerts.MAX_KEY), "cls": cls.group(0) if cls else "other",
+                "severity": raw.get("severity") if raw.get("severity") in SEVERITIES else "info",
+                "host": ev._word(str(raw.get("host") or "")[:64]), "message": message,
+                "at": at if ALERT_AT_RE.fullmatch(at) else "",
+                "seq": seq if type(seq) is int and seq >= 0 else 0,
+                "agent": agent if isinstance(agent, str) and AGENT_RE.fullmatch(agent) else "",
+                "stop_block": detail.get("stop_block") is True,
+                "ticket": ticket if isinstance(ticket, str) and TICKET_RE.match(ticket) else _ticket_in(message)}
+
+    def _read(self) -> dict:
+        code, out = self.runner.run("ops-watch-active", timeout=20, limit=self.LIMIT + 1)
+        if code != 0:
+            raise ValueError(f"ops-watch active exited {code}")
+        raw = out.encode("utf-8", "replace") if isinstance(out, str) else bytes(out or b"")
+        if len(raw) > self.LIMIT:
+            raise ValueError(f"ops-watch output is over {self.LIMIT // 1024} KiB")
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            raise ValueError("ops-watch active returned unreadable output") from None
+        if not isinstance(data, list):
+            raise ValueError("ops-watch active returned an unexpected shape")
+        rows = [r for r in map(self.row, data) if r]
+        rows.sort(key=lambda r: r["key"])
+        rows.sort(key=lambda r: r["at"], reverse=True)
+        rows.sort(key=lambda r: SEVERITIES.index(r["severity"]))
+        counts = dict.fromkeys(SEVERITIES, 0)
+        classes: dict[str, int] = {}
+        for r in rows:
+            counts[r["severity"]] += 1
+            classes[r["cls"]] = classes.get(r["cls"], 0) + 1
+        top = sorted(classes.items(), key=lambda kv: (-kv[1], kv[0]))[:self.MAX_CLASSES]
+        return {"items": rows[:self.MAX_ROWS], "total": len(rows), "truncated": len(rows) > self.MAX_ROWS,
+                "counts": counts, "classes": dict(sorted(top))}
+
+    def tick(self, now: float):
+        try:
+            self.view = dict(self._read(), stale=False, error="", at=ev.iso(now))
+        except Exception as exc:  # noqa: BLE001 - a failed read keeps its last good rows
+            self.view = dict(self.view, stale=bool(self.view.get("at")), error=ev.short(str(exc), 160))
+            self.publish()
+            raise
+        self.publish()
+        return f"{self.view['total']} active alerts"
+
+    def snapshot(self) -> dict:
+        return dict(self.view)
+
+    def publish(self) -> None:
+        sig = json.dumps({k: v for k, v in self.view.items() if k != "at"}, sort_keys=True)
+        if sig != self.sig:
+            self.sig = sig
+            self.hub.snapshot("alerts", self.snapshot())
 
 
 class GitHub(Collector):

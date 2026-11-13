@@ -12,7 +12,9 @@
   "ledger": "mission-panel",
   "limits": "chat-panel",
   "csrf": "internal",
-  "requirement_actions": "requirements-body"
+  "requirement_actions": "requirements-body",
+  "alerts": "alerts-panel",
+  "capacity": "owner-cap"
  },
  "sse": {
   "event": "activity-panel",
@@ -22,7 +24,9 @@
   "chat": "chat-panel",
   "codex": "chat-panel",
   "asks": "needs-panel",
-  "ledger": "mission-panel"
+  "ledger": "mission-panel",
+  "alerts": "alerts-panel",
+  "capacity": "owner-cap"
  },
  "asks": {
   "items": "needs-panel",
@@ -61,6 +65,8 @@
   "show more owners": "owners-more",
   "show more asks": "needs-more",
   "tabs": "tabs",
-  "needs button": "needs-button"
+  "needs button": "needs-button",
+  "alert severity filter": "alerts-list",
+  "show more alerts": "alerts-list"
  }
 }
