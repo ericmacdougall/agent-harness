@@ -18,8 +18,11 @@ around a guard. This command is the sanctioned route:
 
 This machine (goodqa#15913): `--host local` (~/.claude/hooks) and `--host local-codex` (~/.codex/agent-harness, names from
 install_codex.py's DELIVERY_HELPERS at the commit) run the SAME constant program as a local subprocess, with no shell and no
-ssh, an allowlisted environment and a fixed root token (never a path), so every step above is unchanged. The program starts
-in its own session (detached_run), so a killed or timed-out caller never stops it between two renames. The host-side audit
+ssh, an allowlisted environment and a fixed root token (never a path), so every step above is unchanged. A local real run,
+resume or rollback runs WHOLE in its own session (ah.main -> run_in_own_session), so a caller whose process group is killed
+after the commit never skips the self-test verdict or the automatic rollback; each program step also starts in its own
+session (detached_run). A kill that ends that session too leaves the run unfinished; `--resume RUN` applies the verdict and
+rolls back. The host-side audit
 row is skipped there: that file is the caller's own audit file, which already holds the start and result rows; so the ticket
 comment is the only record off the machine, and a local run whose comment fails exits 6. `--host local` also reports the
 Codex copies that differ from the bytes it installed, so the Codex home is never silently left behind; local-codex refuses
@@ -194,7 +197,7 @@ def selftest():
         payload = json.dumps({"session_id": "ah-install-selftest", "agent_id": "ah-install-selftest", "hook_event_name": "PreToolUse",
                               "tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": os.path.expanduser("~")})
         try:
-            p = subprocess.run([sys.executable, "-I", entry, "hook"], input=payload, capture_output=True, text=True,
+            p = subprocess.run(["python3", entry, "hook"], input=payload, capture_output=True, text=True,  # the registered form
                                timeout=max(0.5, min(PROBE_TIMEOUT, deadline - time.time())), cwd=os.path.expanduser("~"))
             rule = re.search(r"\[([A-Za-z0-9_/-]+)\]", p.stderr or "")
             res["hook"][key] = {"exit": p.returncode, "rule": rule.group(1) if rule else ""}
@@ -424,8 +427,8 @@ def local_env(home):
 
 
 def detached_run(argv, input=None, capture_output=True, timeout=None, env=None):
-    """The local transport (goodqa#15913). The program starts in its OWN session, so a caller that is killed (a tool-call
-    timeout or ^C signals the caller's process group) never stops it between two renames or inside a rollback; and, like a
+    """The local transport (goodqa#15913). The program starts in its OWN session, so a caller that is killed with its
+    process group never stops it between two renames or inside a rollback; and, like a
     killed ssh client, a caller-side timeout leaves it running to its end instead of killing it. The call is then reported
     as lost (unknown after the first write). Not covered: a kill that walks the process tree by parent id."""
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
@@ -440,6 +443,66 @@ def detached_run(argv, input=None, capture_output=True, timeout=None, env=None):
                 pass
         raise
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+IN_SESSION_ENV = "AH_INSTALL_IN_SESSION"  # set on the copy that already runs in its own session: it never starts another
+AH_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ah.py")
+SESSION_DIR = (".agent-harness", "install-sessions")
+
+
+def own_session_target(args, home):
+    """The local target of an install-files command line that must run in its own session: a real run, a --resume or a
+    --rollback on this machine (goodqa#15913 N1). None for a dry run, a fleet host, a run id this machine does not know
+    and the copy that already runs in its own session."""
+    if os.environ.get(IN_SESSION_ENV) == "1" or getattr(args, "dry_run", False):
+        return None
+    run_id = getattr(args, "resume", None) or getattr(args, "rollback", None)
+    if run_id:
+        try:
+            host = (start_row(Path(home), run_id) or {}).get("host") if isinstance(run_id, str) and RUN_RE.fullmatch(run_id) else None
+        except (OSError, ValueError):
+            host = None  # the run itself refuses with the real reason
+    else:
+        host = getattr(args, "host", None)
+    return host if host in LOCAL_TARGETS else None
+
+
+def run_in_own_session(argv, home, launcher=None):
+    """Run this install-files command line again in a NEW session and wait for it, relaying its stdout, stderr and exit
+    status. The whole run (lock, renames, the self-test verdict, the automatic rollback, the result row and the ticket
+    comment) then lives in that session, so a kill of the caller's process group no longer stops it after the commit;
+    the run's output stays in ~/.agent-harness/install-sessions/ until the caller has relayed it. A run ended by a signal
+    is exit 5 (unknown). Not covered: a kill that ends that session too, or walks the process tree (the run is then
+    unfinished and `--resume RUN` applies the verdict)."""
+    stem, fds = None, []
+    try:
+        folder = Path(home).joinpath(*SESSION_DIR)
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        stem = str(folder / ("%s-%d-%s" % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), os.getpid(), uuid.uuid4().hex[:6])))
+        for ext in (".out", ".err"):
+            fds.append(os.open(stem + ext, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+        child = subprocess.Popen(launcher or [sys.executable, "-I", AH_PY] + list(argv), stdin=subprocess.DEVNULL, stdout=fds[0],
+                                 stderr=fds[1], start_new_session=True, close_fds=True, env=dict(os.environ, **{IN_SESSION_ENV: "1"}))
+    except OSError as error:  # nothing has run: refuse, never fall back to a run in the caller's session
+        sys.stdout.write(json.dumps({"ok": False, "code": "session_failed", "message": "could not start the run in its own session "
+                                     "(%s); nothing was changed" % type(error).__name__}) + "\n")
+        return 2
+    finally:
+        for fd in fds:
+            os.close(fd)
+    sys.stderr.write("install-files: the run is in its own session (pid %d) and continues if this call is killed; its output: %s.out\n"
+                     % (child.pid, stem))
+    sys.stderr.flush()
+    code = child.wait()
+    for ext, stream in ((".out", sys.stdout), (".err", sys.stderr)):
+        try:
+            with open(stem + ext, errors="replace") as fh:
+                stream.write(fh.read())
+            stream.flush()
+            os.unlink(stem + ext)
+        except OSError:
+            pass
+    return code if code >= 0 else 5
 
 
 class Remote:
@@ -787,7 +850,7 @@ def post_comment(ticket, text, poster):
     try:
         if poster:
             return poster(ticket, text) is not False
-        done = subprocess.run(["python3", str(Path(__file__).resolve().parent / "ah.py"), "ticket", "comment", ticket, "--body", text],
+        done = subprocess.run([sys.executable, "-I", AH_PY, "ticket", "comment", ticket, "--body", text],
                               capture_output=True, timeout=60)
         return done.returncode == 0
     except Exception:  # noqa: BLE001 - a failed comment is reported (and exits 6 locally), never a traceback

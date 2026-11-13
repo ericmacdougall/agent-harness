@@ -10,7 +10,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 INST = "ah_install.py"
 GUARD = "command_guard.py"
-T = "tests.test_ah_install."
+AH = "ah.py"
+T ="tests.test_ah_install."
 G = "tests.test_command_guard_install_files."
 
 # name -> (file, old text or list, new text or list, tests that must fail)
@@ -130,6 +131,26 @@ MUTANTS = {
                                       [T + "LocalTarget.test_codex_home_elsewhere_refuses_local_codex_and_is_noted_by_local"]),
     "already_current runs the install steps": (INST, '    if not applied:\n        return finish(home, run, host, "already_current", 0,', '    if False:\n        return finish(home, run, host, "already_current", 0,',
                                                [T + "LocalTarget.test_a_rerun_at_the_same_commit_is_already_current_with_no_backup_stage_or_lock"]),
+    # goodqa#15913 round 3 (N1, N4): the whole local run in its own session, resume's verdict, the registered probe form
+    "local run not in its own session": (INST, "stderr=fds[1], start_new_session=True, close_fds=True,", "stderr=fds[1], start_new_session=False, close_fds=True,",
+                                         [T + "LocalKill.test_a_caller_killed_after_the_commit_still_gets_the_verdict_and_the_automatic_rollback",
+                                          T + "LocalKill.test_a_run_in_its_own_session_relays_its_output_and_exit_status_and_a_signal_is_unknown"]),
+    "local runs never use their own session": (AH, "        if ah_install.own_session_target(args, home_dir()):", "        if False:",
+                                               [T + "Wiring.test_local_real_runs_resumes_and_rollbacks_run_whole_in_their_own_session_and_nothing_else"]),
+    "a dry run uses its own session": (INST, 'if os.environ.get(IN_SESSION_ENV) == "1" or getattr(args, "dry_run", False):', 'if os.environ.get(IN_SESSION_ENV) == "1":',
+                                       [T + "Wiring.test_local_real_runs_resumes_and_rollbacks_run_whole_in_their_own_session_and_nothing_else"]),
+    "the session copy starts another": (INST, 'if os.environ.get(IN_SESSION_ENV) == "1" or getattr(args, "dry_run", False):', 'if getattr(args, "dry_run", False):',
+                                        [T + "Wiring.test_local_real_runs_resumes_and_rollbacks_run_whole_in_their_own_session_and_nothing_else"]),
+    "resume goes by --host": (INST, 'run_id = getattr(args, "resume", None) or getattr(args, "rollback", None)', "run_id = None",
+                              [T + "Wiring.test_local_real_runs_resumes_and_rollbacks_run_whole_in_their_own_session_and_nothing_else"]),
+    "a signalled session exits 0": (INST, "    return code if code >= 0 else 5", "    return max(code, 0)",
+                                    [T + "LocalKill.test_a_run_in_its_own_session_relays_its_output_and_exit_status_and_a_signal_is_unknown"]),
+    "resume skips the verdict": (INST, "        why = selftest_worse(before, after)\n", "        why = None if resume_of else selftest_worse(before, after)\n",
+                                 [T + "LocalKill.test_a_run_killed_after_the_commit_is_finished_by_resume_with_the_verdict_and_the_rollback"]),
+    "hook probe not in the registered form": (INST, '["python3", entry, "hook"]', '[sys.executable, "-I", entry, "hook"]',
+                                              [T + "LocalTarget.test_the_hook_probe_runs_the_entry_exactly_as_both_installers_register_it"]),
+    "ticket comment not isolated": (INST, '[sys.executable, "-I", AH_PY, "ticket", "comment"', '["python3", AH_PY, "ticket", "comment"',
+                                    [T + "LocalTarget.test_a_local_run_whose_ticket_comment_fails_exits_6_and_keeps_the_real_result_row"]),
     "guard rule allows an environment prefix or wrapper": (GUARD, "        if depth or prefixed or changes_env:", "        if depth or changes_env:",
                                                            [G + "Forms.test_environment_wrappers_shells_and_a_missing_dash_i_are_refused_for_main_too"]),
     "guard rule allows a shell -c body for main": (GUARD, "        if depth or prefixed or changes_env:", "        if prefixed or changes_env:",
