@@ -10,18 +10,19 @@
 </head>
 <body data-tab="overview">
   <a class="skip-link" href="#main">Skip to the page</a>
-  <a class="skip-link skip-chat" href="#chat-input">Skip to chat</a>
+  <a id="skip-chat" class="skip-link skip-chat" href="#chat-input">Skip to chat</a>
   <div id="scene-layer" aria-hidden="true"></div>
   <div class="shell">
+    <div class="page-header">
     <header class="topbar">
       <a class="brand" href="./" aria-label="Harness mission control home">
         <svg class="brand-mark" viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M5 7v18M12 3v26M20 3v26M27 7v18M5 16h22" stroke="currentColor" stroke-width="2"/><path d="m5 7 7-4h8l7 4M5 25l7 4h8l7-4" stroke="currentColor" stroke-width="1.2"/></svg>
-        <span>Mission Control</span>
+        <h1>Mission Control</h1>
       </a>
       <div class="topbar-tools">
+        <button id="needs-button" class="quiet-button needs-button" type="button" aria-controls="needs-panel"><span aria-hidden="true">?</span> Needs you <span id="needs-count" class="needs-count">0</span></button>
         <span id="connection" class="connection connecting" role="status"><i></i><span>Connecting</span></span>
         <span id="last-update" class="last-update">waiting for data</span>
-        <button id="needs-button" class="quiet-button needs-button" type="button" aria-controls="needs-panel"><span aria-hidden="true">?</span> Needs you <span id="needs-count" class="needs-count">0</span></button>
         <button id="theme-toggle" class="quiet-button theme-control" type="button" data-mode="auto"><svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7.5"/><path class="theme-half" d="M12 4.5a7.5 7.5 0 0 1 0 15z"/></svg><span id="theme-label">Theme: auto</span></button>
       </div>
     </header>
@@ -33,8 +34,9 @@
       <button id="tab-activity" role="tab" data-tab="activity" aria-selected="false" tabindex="-1" aria-controls="view-activity">Activity</button>
       <button id="tab-topology" role="tab" data-tab="topology" aria-selected="false" tabindex="-1" aria-controls="view-topology">Topology</button>
       <button id="tab-sources" role="tab" data-tab="sources" aria-selected="false" tabindex="-1" aria-controls="view-sources">Sources</button>
-      <button id="tab-chat" class="tab-chat" role="tab" data-tab="chat" aria-selected="false" tabindex="-1" aria-controls="chat-panel">Chat</button>
+      <button id="tab-chat" class="tab-chat" role="tab" data-tab="chat" aria-selected="false" tabindex="-1" aria-controls="chat-panel">Chat <span id="chat-unread" class="count-badge" hidden></span></button>
     </nav>
+    </div>
 
     <div class="layout">
       <main id="main" class="views" tabindex="-1">
@@ -141,14 +143,16 @@
 
       <aside id="chat-dock" class="chat-dock" aria-label="Chat">
 <section id="chat-panel" class="panel chat-panel" tabindex="-1" aria-labelledby="chat-heading">
-        <header class="panel-heading"><h2 id="chat-heading">Chat</h2><span id="chat-presence" class="micro-label accent">ready</span></header>
+        <p id="chat-connection-status" class="chat-connection-status">Connecting · waiting for data</p>
+        <header class="panel-heading"><h2 id="chat-heading">Chat</h2><span id="chat-presence" class="micro-label" data-state="unavailable">Connecting</span></header>
         <div class="chat-routing"><div class="responder-switch" role="group" aria-label="Chat responder"><button id="responder-claude" aria-pressed="true"><span class="runtime-symbol" aria-hidden="true">✳</span> Claude <span class="responder-main">main</span></button><button id="responder-codex" aria-pressed="false"><span class="runtime-symbol" aria-hidden="true">◇</span> Codex</button></div><label id="session-label" class="session-label"><span class="sr-only">Claude target session</span><select id="chat-session"><option value="">no main attached</option></select></label></div>
         <div id="chat-log" class="chat-log" role="log" aria-label="Conversation" aria-live="off" tabindex="0"></div>
+        <button id="chat-new" class="chat-new" type="button" aria-controls="chat-log" hidden>New replies · jump to latest ↓</button>
         <div id="chat-notice" class="chat-notice" role="status" hidden></div>
         <form id="chat-form" class="chat-composer">
           <label class="sr-only" for="chat-input">Message your coordinating agent</label>
           <textarea id="chat-input" rows="1" maxlength="4000" placeholder="Give your fleet a direction…" aria-describedby="composer-hint chat-counter"></textarea>
-          <div class="composer-bottom"><span class="approval-notice"><button id="approval-help" type="button" aria-haspopup="dialog" aria-controls="approval-dialog" aria-describedby="approval-description" title="Chat steers ordinary work. Decisions on your agents' questions are made in Needs you.">About approvals <svg class="info-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.5"/><path d="M8 7.2v4M8 4.6v.2"/></svg></button><span id="approval-description" class="sr-only">Chat steers ordinary work and never counts as an approval. Decisions on your agents' questions are made in Needs you.</span></span><span id="composer-hint">↵ send <span>· Shift + ↵ new line</span></span><span id="chat-counter" class="mono">0 / 4000</span><button id="chat-send" type="submit" aria-label="Send message" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg></button></div>
+          <div class="composer-bottom"><span class="approval-notice"><button id="approval-help" type="button" aria-haspopup="dialog" aria-controls="approval-dialog" aria-describedby="approval-description" title="Chat steers ordinary work. Decisions on your agents' questions are made in Needs you.">About approvals <svg class="info-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.5"/><path d="M8 7.2v4M8 4.6v.2"/></svg></button><span id="approval-description" class="sr-only">Chat steers ordinary work and never counts as an approval. Decisions on your agents' questions are made in Needs you.</span></span><span id="composer-hint">Enter to send <span>· Shift + Enter for a new line</span></span><span id="chat-counter" class="mono">0 / 4000</span><button id="chat-send" type="submit" aria-label="Send message" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg></button></div>
         </form>
       </section>
       </aside>
