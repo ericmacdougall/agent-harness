@@ -94,6 +94,20 @@ class Log(unittest.TestCase):
         row, _ = rec(self.a, reason="because token=abcdef1234567890abcdef was leaked")
         self.assertNotIn("abcdef1234567890abcdef", json.dumps(row))
 
+    def test_a_torn_last_line_does_not_swallow_the_next_click(self):
+        rec(self.a)
+        with open(self.a.path, "a") as handle:
+            handle.write('{"v": 1, "id": "ra-torn", "act')  # a crash or a full disk cut the last write short
+        self.a._cache = None
+        row, created = rec(self.a, req="wr2", client_key="click-key-0002")
+        self.assertTrue(created)
+        self.a._cache = None
+        self.assertEqual(self.a.latest()["wr2"]["id"], row["id"])
+        self.assertIn("wr1", self.a.latest())
+        again, created = rec(self.a, req="wr2", client_key="click-key-0002")
+        self.assertEqual((again["id"], created), (row["id"], False))
+        self.assertEqual(len(self.a.all()), 2)
+
     def test_a_symlinked_log_is_refused(self):
         self.a._ensure()
         os.symlink("/etc/hosts", self.a.path)
@@ -174,6 +188,37 @@ class Route(ServerHarness):
         self.app.owners.session = ""
         self.assertEqual(self.post(body)[1].get("error"), "no-main")
         self.assertEqual(self.app.actions.all(), [])
+
+    def test_an_unattended_client_with_a_launch_link_archives_a_user_sourced_requirement(self):
+        """NEG-20: a process that holds a launch link looks like the user to the server. The result must never be
+        attributed to the user, must be flagged as a user-sourced requirement archived from the dashboard, and must be
+        restorable."""
+        self.assertTrue(self.req("wr1")["source"].startswith("user:"))
+        status, value = self.click()
+        self.assertEqual(status, 201)
+        row = self.req("wr1")
+        self.assertEqual((row["bucket"], row["rule"], row["user_sourced"]), ("archived", "M", True))
+        short = SID[:8]
+        self.assertIn(f"dashboard session {short}", row["reason"])
+        self.assertIn(f"dashboard session {short}", row["manual"]["by"])
+        shown = json.dumps(row).lower() + " ".join(e["summary"] for e in self.app.hub.recent(limit=5)).lower()
+        for phrase in ("by you", "you archived", "you restored", "archived by you"):
+            self.assertNotIn(phrase, shown)
+        logged = self.app.actions.all()[-1]
+        self.assertEqual((logged["origin"], logged["session"]), ("dashboard", SID))
+        self.assertTrue(logged["source"].startswith("mc:") and "user:" not in logged["source"])
+        summary = self.app.ledger.snapshot()["requirements"]["summary"]
+        self.assertEqual(summary["manual_user"], 1)
+        self.assertEqual(self.click("restore", key="click-key-0007", reason="restored by a person")[0], 201)
+        self.assertEqual(self.req("wr1")["bucket"], "live")
+        self.assertEqual(self.app.ledger.snapshot()["requirements"]["summary"]["manual_user"], 0)
+
+    def test_the_write_routes_in_the_server_match_the_coverage_map(self):
+        import re
+        server = (REPO / "harness" / "mission_control" / "server.py").read_text()
+        routes = set(re.findall(r'"(/api/[a-z/]+)"', re.search(r"if route not in \(([^)]*)\)", server).group(1)))
+        mapped = {k.split(" ", 1)[1] for k in json.loads((REPO / "harness" / "mission_control" / "web" / "coverage.json").read_text())["routes"] if k.startswith("POST ")}
+        self.assertEqual(routes, mapped)
 
     def test_the_ledger_and_state_need_a_session_and_the_right_host(self):
         resp, _ = self.request("GET", "/api/state", {"Sec-Fetch-Site": "same-origin"})

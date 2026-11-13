@@ -36,7 +36,7 @@ ASK_STALE_S = 72 * 3600
 TEXT_MAX = 2000
 TERMINAL_STATES = frozenset({"resolved", "closed", "done", "superseded", "expired", "declined", "withdrawn"})
 CLEARED_RULES = {"resolved": "R1", "owner-reassigned": "R1", "ticket-closed": "R2", "duplicate": "R3"}
-RULE_TITLES = {"M": "archived by you", "R1": "terminal state", "R2": "done live or ticket closed", "R3": "superseded",
+RULE_TITLES = {"M": "archived from the dashboard", "R1": "terminal state", "R2": "done live or ticket closed", "R3": "superseded",
                "R4": "expired", "live": "open"}
 USER_SOURCES = ("user:", "answer:")
 
@@ -139,7 +139,7 @@ def _normalise(row: dict, kind: str) -> dict:
         "state": _text(state, 40).lower() if isinstance(state, str) else "",
         "session": _text(row.get("session"), 80), "owner": _text(row.get("owner"), 80),
         "ticket": row.get("ticket") if isinstance(row.get("ticket"), str) else "",
-        "source": source, "until": _text(row.get("until"), 40),
+        "source": source, "user_sourced": source.startswith(USER_SOURCES), "until": _text(row.get("until"), 40),
         "resolved_at": _text(row.get("resolved_at"), 40), "resolution": _text(row.get("resolution"), 300),
         "decision": _text(row.get("decision"), 40), "resolved_by": _text(row.get("resolved_by"), 80),
         "reason_in": _text(row.get("reason"), 300),
@@ -160,11 +160,15 @@ def _first_pass(row: dict, now: float, overrides: dict, ticket_closed):
     age = max(0.0, now - at) if at is not None else None
     manual = overrides.get(row["id"]) if kind == "requirement" else None
     if manual:
-        info = {"manual": {k: manual.get(k, "") for k in ("action", "at", "reason", "source", "id")}}
+        # A dashboard click is never attributed to the user: any process holding a launch link can make it. The row
+        # names the dashboard session that made the click, and nothing else.
+        by = f"dashboard session {_text(manual.get('session'), 80)[:8] or 'unknown'}"
+        info = {"manual": {**{k: manual.get(k, "") for k in ("action", "at", "reason", "source", "id")}, "by": by}}
+        verb = "archived" if manual.get("action") == "archive" else "restored"
+        why = f"{verb} from {by} at {manual.get('at', '')}: {manual.get('reason', '')}"
         if manual.get("action") == "archive":
-            return ("archived", "M", f"archived by you at {manual.get('at', '')}: {manual.get('reason', '')}",
-                    "action:" + str(manual.get("id", "")), info)
-        return ("live", "live", f"restored by you at {manual.get('at', '')}: {manual.get('reason', '')}", "action:" + str(manual.get("id", "")), info)
+            return "archived", "M", why, "action:" + str(manual.get("id", "")), info
+        return "live", "live", why, "action:" + str(manual.get("id", "")), info
     if kind == "cleared":
         rule = CLEARED_RULES.get(row["reason_in"])
         if rule:
@@ -264,8 +268,10 @@ def _group(row: dict):
 
 
 def summary(rows) -> dict:
-    counts = {"live": 0, "archived": 0, "rules": {}}
+    counts = {"live": 0, "archived": 0, "rules": {}, "manual_user": 0}
     for row in rows:
         counts[row["bucket"]] += 1
+        if row["bucket"] == "archived" and row["rule"] == "M" and row.get("user_sourced"):
+            counts["manual_user"] += 1  # a user-sourced requirement archived from the dashboard: shown on the Overview
         counts["rules"][row["rule"]] = counts["rules"].get(row["rule"], 0) + 1
     return counts

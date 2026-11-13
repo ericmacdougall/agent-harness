@@ -553,7 +553,7 @@ class App:
         except req_actions.ActionError as exc:
             return exc.status, {"error": exc.code, "message": str(exc)}
         self.ledger.reclassify()
-        self.hub.publish(ev.make("system", "dashboard", f"you {action}d requirement {req}", eid=f"req:{row['id']}",
+        self.hub.publish(ev.make("system", "dashboard", f"dashboard session {session[:8]} {action}d requirement {req}", eid=f"req:{row['id']}",
                                  actor={"runtime": "dashboard"}, subject={"initiative": ""}))
         return (201 if created else 200), {"id": row["id"], "created": created, "req": req, "action": action, "at": row["at"]}
 

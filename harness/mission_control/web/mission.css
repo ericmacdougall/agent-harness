@@ -429,3 +429,5 @@ body.motion-off *, body.motion-off *::before { animation: none !important; }
 .req-status, .req-notice, .count-line { font-size: 12px; color: var(--muted); }
 .count-line { margin-bottom: 4px; }
 .owners-more { margin: 4px 18px 12px; }
+.badge.manual-user { color: var(--warn); border-color: var(--warn); }
+.tile-manual-user { border-color: var(--warn); }

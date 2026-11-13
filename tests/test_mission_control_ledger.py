@@ -111,7 +111,7 @@ class LedgerCollector(unittest.TestCase):
         self.assertEqual(reqs["wr2"]["bucket"], "live")  # user-sourced: age never archives it
         self.assertIn("yours", reqs["wr2"]["unowned_note"])
         self.assertEqual((reqs["wr3"]["bucket"], reqs["wr3"]["rule"]), ("archived", "R1"))
-        self.assertEqual(hub.snapshots["ledger"]["requirements"]["summary"], {"live": 2, "archived": 1, "rules": {"R1": 1, "live": 2}})
+        self.assertEqual(hub.snapshots["ledger"]["requirements"]["summary"], {"live": 2, "archived": 1, "rules": {"R1": 1, "live": 2}, "manual_user": 0})
         self.assertEqual(hub.snapshots["ledger"]["requirements"]["total"], 3)
 
     def test_markup_is_kept_as_plain_text(self):
@@ -303,7 +303,7 @@ class Coverage(unittest.TestCase):
 
     def test_the_docs_name_every_rule_and_the_write_route(self):
         docs = (REPO / "docs" / "mission-control.md").read_text()
-        for needle in ("M archived by you", "R1", "R2", "R3", "R4", "POST /api/requirements/archive", "actions.jsonl"):
+        for needle in ("M archived from the dashboard", "R1", "R2", "R3", "R4", "POST /api/requirements/archive", "actions.jsonl"):
             self.assertIn(needle, docs, needle)
 
     def test_the_page_never_polls_state_on_a_timer(self):

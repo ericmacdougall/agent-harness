@@ -200,6 +200,15 @@ class Determinism(unittest.TestCase):
         self.assertEqual((back["bucket"], back["manual"]["action"]), ("live", "restore"))
         self.assertEqual(one(req("wz"), overrides=arch)["bucket"], "live")  # another id is untouched
 
+    def test_a_manual_archive_names_the_dashboard_session_never_the_user(self):
+        arch = {"wm": {"action": "archive", "at": iso(60), "reason": "x", "id": "ra-1", "source": "mc:s/ra-1", "session": "abcdef12-0000"}}
+        out = one(req("wm"), overrides=arch)
+        self.assertIn("dashboard session abcdef12", out["reason"])
+        self.assertEqual(out["manual"]["by"], "dashboard session abcdef12")
+        self.assertTrue(out["user_sourced"])
+        self.assertNotIn("you", (out["reason"] + out["rule_title"]).lower().replace("your", ""))
+        self.assertEqual(archive.summary([out])["manual_user"], 1)
+
     def test_input_order_never_changes_the_result(self):
         rows = [req(f"w{i}", age=(i % 40) * DAY, text=f"t{i % 7}", state="recorded" if i % 5 else "done") for i in range(120)]
         first = archive.classify_all(rows, "requirement", NOW)
@@ -229,7 +238,7 @@ class Determinism(unittest.TestCase):
     def test_summary_counts_by_rule(self):
         rows = [req("a", state="done"), req("b"), req("c", age=40 * DAY)]
         summary = archive.summary(archive.classify_all(rows, "requirement", NOW))
-        self.assertEqual(summary, {"live": 2, "archived": 1, "rules": {"R1": 1, "live": 2}})  # c is user-sourced: age never archives
+        self.assertEqual(summary, {"live": 2, "archived": 1, "rules": {"R1": 1, "live": 2}, "manual_user": 0})  # c is user-sourced: age never archives
 
 
 if __name__ == "__main__":

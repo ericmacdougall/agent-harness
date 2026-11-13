@@ -121,8 +121,10 @@ export function blockers(state, ui) {
 }
 
 function ruleLine(row) {
+  if (row.bucket === 'archived' && row.rule === 'M' && row.user_sourced) return 'Archived from the dashboard · your own words';
   return row.bucket === 'archived' ? `Archived · ${row.rule} ${row.rule_title || ''}`.trim() : 'Live';
 }
+const manualUser = row => row.bucket === 'archived' && row.rule === 'M' && row.user_sourced === true;
 
 function actionArea(row, ui) {
   const area = el('div', 'req-actions');
@@ -164,7 +166,7 @@ export function requirementItem(row, now, ui = {}) {
   const item = el('li', `req ${row.bucket}`);
   item.dataset.id = row.id;
   const top = el('div', 'req-top');
-  top.append(badge(ruleLine(row), row.bucket === 'archived' ? 'archived' : 'live'), el('span', 'req-id', row.id), el('time', 'req-age', when(row.at, now)));
+  top.append(badge(ruleLine(row), manualUser(row) ? 'manual-user' : row.bucket === 'archived' ? 'archived' : 'live'), el('span', 'req-id', row.id), el('time', 'req-age', when(row.at, now)));
   item.append(top, longText(row.text, 'req-text', 300));
   const meta = [`Source: ${row.source || 'unknown'}`, row.owner ? `owner ${row.owner}` : 'no owner recorded', row.ticket || 'no ticket'].join(' · ');
   item.append(el('p', 'req-meta', meta));
@@ -211,7 +213,7 @@ export function archiveItem(row, now, ui = {}) {
   const item = el('li', `req archived kind-${row.kind}`);
   item.dataset.id = row.id;
   const top = el('div', 'req-top');
-  top.append(badge(row.kind === 'ask' ? 'Ask' : 'Requirement', 'kind'), badge(`${row.rule} ${row.rule_title || ''}`.trim(), 'archived'), el('span', 'req-id', row.id), el('time', 'req-age', when(row.at, now)));
+  top.append(badge(row.kind === 'ask' ? 'Ask' : 'Requirement', 'kind'), badge(manualUser(row) ? 'Archived from the dashboard · your own words' : `${row.rule} ${row.rule_title || ''}`.trim(), manualUser(row) ? 'manual-user' : 'archived'), el('span', 'req-id', row.id), el('time', 'req-age', when(row.at, now)));
   item.append(top, longText(row.text, 'req-text', 300));
   item.append(el('p', 'req-why', `Archived because: ${row.reason}${row.evidence_ref ? ` (evidence ${row.evidence_ref})` : ''}`));
   const prov = row.kind === 'ask'
@@ -219,17 +221,18 @@ export function archiveItem(row, now, ui = {}) {
     : [`Source: ${row.source || 'unknown'}`, row.owner ? `owner ${row.owner}` : 'no owner recorded', row.ticket];
   const line = prov.filter(Boolean).join(' · ');
   if (line) item.append(el('p', 'req-meta', line));
+  if (row.manual) item.append(el('p', 'req-meta', `Click recorded from ${row.manual.by || 'a dashboard session'} at ${row.manual.at || 'unknown time'}. A dashboard click is not proof that you made it.`));
   if (row.kind === 'requirement') item.append(actionArea(row, ui));
   return item;
 }
 
 export function archive(state, ui) {
   const rows = archiveRows(state.asksArchive, state.ledger.requirements.items);
-  const kinds = { all: rows.length, ask: rows.filter(r => r.kind === 'ask').length, requirement: rows.filter(r => r.kind === 'requirement').length };
+  const kinds = { all: rows.length, ask: rows.filter(r => r.kind === 'ask').length, requirement: rows.filter(r => r.kind === 'requirement').length, 'manual-user': rows.filter(manualUser).length };
   const out = [];
   if (state.asksArchiveTotal > state.asksArchive.length) out.push(el('p', 'notice', `Showing the newest ${state.asksArchive.length} of ${state.asksArchiveTotal} archived asks. The rest are in the asks ledger (provenance.py asks).`));
-  out.push(filterBar('archive-kind', 'Show archived items', [['all', `All ${kinds.all}`], ['ask', `Asks ${kinds.ask}`], ['requirement', `Requirements ${kinds.requirement}`]], ui.archiveKind, key => ui.set('archiveKind', key)));
-  const matches = rows.filter(r => ui.archiveKind === 'all' || r.kind === ui.archiveKind);
+  out.push(filterBar('archive-kind', 'Show archived items', [['all', `All ${kinds.all}`], ['ask', `Asks ${kinds.ask}`], ['requirement', `Requirements ${kinds.requirement}`], ['manual-user', `Dashboard-archived, your words ${kinds['manual-user']}`]], ui.archiveKind, key => ui.set('archiveKind', key)));
+  const matches = rows.filter(r => ui.archiveKind === 'all' || (ui.archiveKind === 'manual-user' ? manualUser(r) : r.kind === ui.archiveKind));
   if (!matches.length) out.push(el('p', 'empty', 'Nothing is archived.'));
   const list = el('ul', 'req-list');
   matches.slice(0, ui.archiveLimit).forEach(row => list.append(archiveItem(row, state.now, ui)));

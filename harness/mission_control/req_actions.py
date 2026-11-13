@@ -132,7 +132,11 @@ class ReqActions:
                     "rule": "manual", "digest": digest, "client_key": client_key, "origin": "dashboard",
                     "source": f'mc:{session}/{row_id} "Dashboard click: {action} requirement {req}"',
                 }, self.key)
-                os.write(fd, (json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8"))
+                line = (json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+                size = os.fstat(fd).st_size
+                if size > 0 and os.pread(fd, 1, size - 1) != b"\n":
+                    line = b"\n" + line  # a cut-off last line must not swallow this row
+                os.write(fd, line)
                 os.fsync(fd)
             finally:
                 os.close(fd)

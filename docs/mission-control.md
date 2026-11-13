@@ -28,7 +28,7 @@ Asks and requirements are live or archived by one deterministic rule (`archive.p
 
 | Rule | Archived when |
 | --- | --- |
-| M archived by you | you archived it from the page (see below). A restore keeps it live whatever the other rules say |
+| M archived from the dashboard | someone archived it from the page (see below). The "who" is the dashboard session, never the user: any process that holds a launch link can make that click. A restore keeps it live whatever the other rules say |
 | R1 terminal state | the record says resolved, closed, done, superseded, expired, declined or withdrawn; an ask has `resolved_at`; the sweeper cleared it as resolved or because its owner was reassigned |
 | R2 done live | a deploy and a live test bound to the same ticket or commit, the newest of each by time, the test passing and not older than the deploy; or its ticket is closed (from the sweeper's cache). A local REALLY_TESTED pass, a lone deploy, an unbound pair, a FAIL or UNSTATED test, or a reopened ticket never archives |
 | R3 superseded | a newer record of the same session (same owner for asks) has exactly the same full text, and that newer record is itself live. Near-duplicates stay live |
@@ -47,7 +47,7 @@ Each requirement row has an Archive button (or Restore on an archived row). It o
 | `origin`, `source` | `dashboard` and `mc:<session>/<row id> "Dashboard click: ..."`. It is a dashboard click, never the user's own words (`user:`) |
 | `digest`, `client_key`, `sig` | the text it was shown, the idempotency key, the HMAC with the install secret |
 
-The log only grows and is the audit trail. The latest verified row per requirement overrides the automatic rules, including on the next `ah requirements` read. A row with a bad signature, a wrong shape or a source that does not start with `mc:` is ignored. Nothing is written to the harness ledgers: the archive is a view you control.
+The manual archive's "who" is the dashboard session (`archived from dashboard session <short id>`), in the page, the activity line and the log row; Mission Control never writes "you" for it. A `user:` or `answer:` sourced requirement archived this way keeps a distinct badge, and the Overview counts them with a one-click filter to review and restore them. The root cause (agents can obtain launch links, which also affects `/api/approve`) is goodqa#15926. The log only grows and is the audit trail. The latest verified row per requirement overrides the automatic rules, including on the next `ah requirements` read. A row with a bad signature, a wrong shape or a source that does not start with `mc:` is ignored. Nothing is written to the harness ledgers: the archive is a view you control.
 
 ### Ledger source
 

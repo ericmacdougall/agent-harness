@@ -332,11 +332,14 @@ export function ledger(snapshot) {
     id: str(r.id, 64), kind: 'requirement', text: str(r.text, 700), at: validIso(r.at) || '', session: str(r.session, 64), owner: str(r.owner, 60), ticket: str(r.ticket, 60),
     source: str(r.source, 300), state: str(r.state, 40), bucket: r.bucket === 'archived' ? 'archived' : 'live', rule: str(r.rule, 8) || 'live', rule_title: str(r.rule_title, 40),
     reason: str(r.reason, 300), evidence_ref: str(r.evidence_ref, 120), has_evidence: r.has_evidence === true,
-    expires_in_s: Number.isFinite(r.expires_in_s) ? r.expires_in_s : null, digest: str(r.digest, 40), unowned_note: str(r.unowned_note, 200),
-    manual: r.manual && typeof r.manual === 'object' ? { action: r.manual.action === 'restore' ? 'restore' : 'archive', at: str(r.manual.at, 40), reason: str(r.manual.reason, 300), id: str(r.manual.id, 40) } : null,
+    expires_in_s: Number.isFinite(r.expires_in_s) ? r.expires_in_s : null, digest: str(r.digest, 40), unowned_note: str(r.unowned_note, 200), user_sourced: r.user_sourced === true,
+    manual: r.manual && typeof r.manual === 'object' ? { action: r.manual.action === 'restore' ? 'restore' : 'archive', at: str(r.manual.at, 40), reason: str(r.manual.reason, 300), id: str(r.manual.id, 40), by: str(r.manual.by, 80) } : null,
   })).filter(r => r.id);
-  const summary = { live: 0, archived: 0, rules: {} };
-  for (const r of requirementItems) { summary[r.bucket] += 1; summary.rules[r.rule] = (summary.rules[r.rule] || 0) + 1; }
+  const summary = { live: 0, archived: 0, rules: {}, manual_user: 0 };
+  for (const r of requirementItems) {
+    summary[r.bucket] += 1; summary.rules[r.rule] = (summary.rules[r.rule] || 0) + 1;
+    if (r.bucket === 'archived' && r.rule === 'M' && r.user_sourced) summary.manual_user += 1;
+  }
   const out = {
     goals: part(goals, { items: rows(goals.items).slice(0, 100).map(g => {
       const evidence = rows(g.evidence).slice(0, 20).map(evidenceRow);
@@ -405,11 +408,14 @@ export function missionTiles(state) {
   const blockers = blockerRows(led.status, state.asksFlagged || [], state.owners || [], state.initiatives || []).length;
   const reqs = led.requirements.summary;
   const risky = (state.initiatives || []).filter(i => /at risk|blocked/i.test(i.state)).length;
-  return [
+  const tiles = [
     { id: 'goals', label: 'Goals live and tested', value: `${tested} / ${goals.length}`, note: led.goals.error ? 'ledger error' : `${goals.length - tested} still open`, target: 'mission-panel' },
     { id: 'owners', label: 'Owners live', value: String(live), note: attention ? `${attention} need attention` : 'none need attention', target: 'owners-panel' },
     { id: 'asks', label: 'Needs you', value: String(waiting), note: waiting ? 'waiting on your answer' : 'nothing waiting', target: 'needs-panel' },
     { id: 'blockers', label: 'Blockers', value: String(blockers), note: risky ? `${risky} initiatives at risk` : 'across status, asks, owners', target: 'blockers-panel' },
     { id: 'requirements', label: 'Requirements live', value: String(reqs.live), note: `${reqs.archived} archived`, target: 'requirements' },
   ];
+  // Your own requirements archived from the dashboard: any process holding a launch link can make that click, so they are counted here until looked at.
+  if (reqs.manual_user > 0) tiles.push({ id: 'manual-user', label: 'Your requirements archived from the dashboard', value: String(reqs.manual_user), note: 'review and restore', target: 'archive-manual-user', alert: true });
+  return tiles;
 }

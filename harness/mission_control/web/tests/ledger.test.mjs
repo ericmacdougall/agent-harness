@@ -103,3 +103,17 @@ test('5000 requirements stay cheap to adapt', () => {
   assert.equal(rows.length, 1000);
   assert.ok(performance.now() - start < 1500);
 });
+
+test('user-sourced requirements archived from the dashboard are counted on the Overview and never attributed to the user', () => {
+  const led = ledger({ requirements: { items: [
+    { id: 'r1', text: 'mine', bucket: 'archived', rule: 'M', rule_title: 'archived from the dashboard', user_sourced: true, reason: 'archived from dashboard session abcdef12 at t: x', at: iso(5), manual: { action: 'archive', by: 'dashboard session abcdef12', at: iso(4) } },
+    { id: 'r2', text: 'other', bucket: 'archived', rule: 'M', user_sourced: false, reason: 'x', at: iso(6) },
+    { id: 'r3', text: 'live', bucket: 'live', rule: 'live', reason: 'x', at: iso(7) }] } });
+  assert.equal(led.requirements.summary.manual_user, 1);
+  const tiles = missionTiles({ ledger: led, owners: [], asks: [], messages: [], decisions: {}, initiatives: [] });
+  const tile = tiles.find(t => t.id === 'manual-user');
+  assert.equal(tile.value, '1');
+  assert.equal(tile.target, 'archive-manual-user');
+  assert.ok(!/\byou\b/i.test(`${tile.label} ${tile.note}`.replace(/your/gi, '')));
+  assert.equal(missionTiles({ ledger: ledger(snapshot()), owners: [], asks: [], messages: [], decisions: {}, initiatives: [] }).some(t => t.id === 'manual-user'), false);
+});

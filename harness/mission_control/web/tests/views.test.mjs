@@ -243,3 +243,28 @@ test('coverage names a control for every route and control the page has', () => 
   for (const [name, where] of [...Object.entries(map.routes), ...Object.entries(map.controls)]) assert.ok(ids.has(where), `${name} -> ${where}`);
   for (const control of ['session pick', 'Claude or Codex switch', 'owner filter', 'event filters', 'pause feed', 'tool activity', 'theme', 'motion', 'requirement search', 'show more owners', 'show more asks']) assert.ok(map.controls[control], control);
 });
+
+test('the summary tiles show the live owner count and the dashboard-archived count when there is one', () => {
+  const s = { now: NOW, owners: [{ state: 'live', severe: false }, { state: 'live', severe: false }, { state: 'done', severe: false }], asks: [], messages: [], decisions: {}, initiatives: [],
+    ledger: ledger({ requirements: { items: [{ id: 'r', text: 'mine', bucket: 'archived', rule: 'M', user_sourced: true, reason: 'x', at: iso(5) }] } }) };
+  const t = text(v.tiles(s, () => {}));
+  assert.match(t, /Owners live[\s\S]*|2[\s\S]*Owners live/);
+  const owners = walk(v.tiles(s, () => {})).find(n => n.attrs['aria-label']?.startsWith('Owners live: 2'));
+  assert.ok(owners, 'the owners tile says 2');
+  assert.ok(walk(v.tiles(s, () => {})).some(n => /Your requirements archived from the dashboard: 1/.test(n.attrs['aria-label'] || '')));
+});
+
+test('a user-sourced requirement archived from the dashboard keeps a distinct badge and says whose click it was', () => {
+  const row = ledger({ requirements: { items: [{ id: 'r', text: 'mine', bucket: 'archived', rule: 'M', user_sourced: true, reason: 'archived from dashboard session abcdef12 at t: x', at: iso(5),
+    manual: { action: 'archive', by: 'dashboard session abcdef12', at: iso(4) } }] } }).requirements.items[0];
+  const nodes = [v.requirementItem(row, NOW, {}), v.archiveItem(row, NOW, {})];
+  const t = text(nodes);
+  assert.match(t, /Archived from the dashboard · your own words/);
+  assert.match(t, /Click recorded from dashboard session abcdef12/);
+  assert.match(t, /not proof that you made it/);
+  assert.ok(walk(nodes).some(n => n.className.includes('manual-user')));
+  const s = { now: NOW, asksArchive: [], asksArchiveTotal: 0, ledger: ledger({ requirements: { items: [{ id: 'r', text: 'mine', bucket: 'archived', rule: 'M', user_sourced: true, reason: 'x', at: iso(5) }, { id: 'q', text: 'other', bucket: 'archived', rule: 'R1', reason: 'x', at: iso(6) }] } }) };
+  const only = v.archive(s, { ...ui, archiveKind: 'manual-user' });
+  assert.equal(walk(only).filter(n => n.tagName === 'LI' && n.className.includes('req ')).length, 1);
+  assert.match(text(v.archive(s, ui)), /Dashboard-archived, your words 1/);
+});

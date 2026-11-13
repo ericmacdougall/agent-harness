@@ -54,6 +54,7 @@ export function mountViews() {
   };
 
   function go(target) {
+    if (target === 'archive-manual-user') { ui.archiveKind = 'manual-user'; ui.archiveLimit = v.PAGE; setTab('archive'); repaint(['archive-body'], true); document.getElementById('tab-archive')?.focus(); return; }
     if (TABS.includes(target)) { setTab(target); document.getElementById(`tab-${target}`)?.focus(); return; }
     setTab('overview');
     const node = document.getElementById(target);
