@@ -538,6 +538,10 @@ def check_response(home: Path, goal_id: str, cond: str, kind: str, ref: str, sou
             return (f"{cond} takes no response: take the action, or have the user park the goal "
                     "(`owner_rt.py ask-text --kind park`)")
         return f"{cond} takes a response of kind {', '.join(RESPONSE_KINDS[cond])}, not {kind}"
+    if cond == "MERGED_NOT_RELEASED":  # every kind answers one commit: the action key carries its sha12
+        problem = ticket_subject_problem(home, goal_id, cond, detail, goal)
+        if problem:
+            return problem
     mc = _mc()
     if kind == "ask":
         state, note = mc._ask(mc.ask_states(home, session), ref)
@@ -559,7 +563,7 @@ def check_response(home: Path, goal_id: str, cond: str, kind: str, ref: str, sou
     if kind == "ticket":
         if not TICKET_RE.match(ref or ""):
             return "ticket ref must look like goodqa#123"
-        problem = ticket_subject_problem(home, goal_id, cond, detail, goal)
+        problem = "" if cond == "MERGED_NOT_RELEASED" else ticket_subject_problem(home, goal_id, cond, detail, goal)
         if problem:
             return problem
         facts = (ticket_check or ticket_facts)(ref)
@@ -604,7 +608,7 @@ def respond(home: Path, goal_id: str, cond: str, kind: str, ref: str = "", sourc
     session = mission_session(home)
     if cond in ("HELP_OPEN", "REVIEW_LOOP") and not detail:
         raise DriveError(f"{cond} needs --detail <task id>")
-    if cond == "MERGED_NOT_RELEASED" and kind == "ticket" and not detail:
+    if cond == "MERGED_NOT_RELEASED" and not detail:
         raise DriveError(f"{cond} needs --detail <sha12 of the commit, as the drive table shows it>")
     key = action_key(goal_id, cond, detail)
     pre = not episode_on_record(home, key)

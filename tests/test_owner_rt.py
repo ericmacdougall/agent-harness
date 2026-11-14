@@ -748,6 +748,7 @@ BYPASS_PHRASES = (
     "Use bypassPermissions for the disposable test session.",               # v6 F1
     "What does bypassPermissions do?", "Should we use bypass", "If tests pass, use bypass",  # v4 F2
     "bypass would be nice", "maybe bypass", "use bypass when ready", "Can owners bypass",
+    "What does bypassPermissions do", "is bypass on", "I wonder about bypass", "owners in bypass mode",
     "Do not use bypassPermissions for owners.",                             # v5 F1 (quoted in part below)
     "Thanks. If it is safe, use bypassPermissions for owners.", "No. use bypassPermissions for owners!",
     "Would you use bypassPermissions for owners?", "Ok use bypassPermissions for owners. Actually no, keep auto.",
@@ -814,6 +815,10 @@ class BypassAuthorityTests(AuthorityBase):
                 self.assertIn("never comes from runtime.json", ort.runtime(self.home).get("note", ""))
                 # 2. the words cited to the grant command
                 with self.assertRaisesRegex(ort.OwnerError, "must be exactly answer:", msg=words):
+                    ort.grant_bypass(self.home, "*", 24, src)
+            for src in ("inferred:from x -- the user surely wants bypass", "wal:w0123456789a",
+                        f'queue:{fx.MISSION}/2026-11-14T10:00:00Z#0123456789ab "{words}"', "", words):
+                with self.assertRaisesRegex(ort.OwnerError, "must be exactly answer:", msg=src):
                     ort.grant_bypass(self.home, "*", 24, src)
             # 3. the words typed as the free-text "Other" reply to the exact grant question
             src = self.grant_answer(chosen=words)
@@ -889,6 +894,9 @@ class BypassAuthorityTests(AuthorityBase):
             (root / "authority.json").write_text(json.dumps({"bypass": [{"scope": "*", "hours": hours,
                                                                           "answer": answer}]}))
             self.assertEqual(self.launch_mode(), "auto", answer)
+        other = self.grant_answer(session="bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee")  # exact answer, other session
+        (root / "authority.json").write_text(json.dumps({"bypass": [{"scope": "*", "hours": 24, "answer": other}]}))
+        self.assertEqual(self.launch_mode(), "auto")  # the session binds at use, not only when recorded
         (root / "authority.json").write_text("{not json")
         self.assertEqual(self.launch_mode(), "auto")
         (root / "authority.json").write_text(json.dumps({"bypass": [{"scope": "*", "hours": 48,

@@ -298,7 +298,12 @@ def answer_at(home: Path, answer: str, question: str, label: str, now: float, ma
     _answer_format(answer)
     try:
         import command_guard  # noqa: PLC0415 - installed beside this file
-        got = command_guard.resolve_user_source(answer, now=now, max_age=max_age, home=str(home))
+        # The transcripts are read from the same home whose authority.json is being judged. Without AH_HOME that is
+        # the account home pinned from the password database (command_guard's default), never $HOME; with AH_HOME
+        # (tests, a relocated harness) the records and the transcripts move together, so a forged home grants only
+        # inside itself and the real tick never reads it.
+        pinned = None if not os.environ.get("AH_HOME") else str(home)
+        got = command_guard.resolve_user_source(answer, now=now, max_age=max_age, home=pinned)
     except ValueError as exc:
         raise OwnerError("the answer does not resolve: " + clean(str(exc), 200)) from None
     except Exception as exc:  # noqa: BLE001 - anything that cannot prove the answer refuses
@@ -414,6 +419,7 @@ def bypass_grant(home: Path, goal: str, now=None):
             continue
         try:
             hours = _check_hours(row.get("hours"))
+            _mission_answer(home, str(row.get("answer") or ""))  # at use too: a row citing another session is void
             at = answer_at(home, str(row.get("answer") or ""), bypass_question(row["scope"], hours), BYPASS_LABEL, now)
         except OwnerError:
             continue
@@ -460,6 +466,7 @@ def active_park(home: Path, goal: str, now=None):
         try:
             until = str(row.get("until") or "")
             end = until_ts(until)
+            _mission_answer(home, str(row.get("answer") or ""))  # at use too
             at = answer_at(home, str(row.get("answer") or ""), park_question(goal, until), park_label(goal, until),
                            now)
         except OwnerError:

@@ -258,8 +258,10 @@ PARK_PHRASES = (
     "park leads and keep pushing solve", "let's solve the bug later", "hold on, solve is broken",
     "park everything except solve",
     "Should we park solve?", "If the release fails we should park solve", "park solve?",  # v4
+    "Should we park solve", "do we park solve", "solve parked", "keep leads moving; park solve until Monday",
     "when leads ships, park solve", "maybe park solve", "we could defer solve", "unless it lands today, park solve",
     "Please don't park solve today.", "Never park solve for the rest of today.",  # v5 (quoted in part below)
+    "Please don't park solve.",
     "Keep going. If the build breaks, park solve today.", "No. park solve today.", "Yes, park solve today. Wait, don't.",
     "Thanks for the update. Yes, park solve today.", "park solve until Monday", "defer solve", "put solve on hold",
     "yes, park solve",
@@ -297,7 +299,7 @@ class ParkAuthorityTests(Base):
         self.assertEqual(fx.MISSION, MISSION)
         for words in PARK_PHRASES:
             uid = fx.human_turn(self.home, MISSION, words)
-            for quote in (words, "park solve today", "park solve for the rest of today"):
+            for quote in (words, "park solve", "park solve today", "park solve for the rest of today"):
                 if quote not in words:
                     continue
                 src = f'user:{MISSION}/{uid} "{quote}"'
@@ -306,6 +308,12 @@ class ParkAuthorityTests(Base):
                     drive.respond(self.home, "solve", "UNOWNED", "park", source=src, now=time.time())
                 # 2. the words cited to the park command
                 with self.assertRaisesRegex(ort.OwnerError, "must be exactly answer:", msg=words):
+                    ort.park_goal(self.home, "solve", self.until, src)
+            for src in ("inferred:from x -- y", "wal:w123", f'queue:{MISSION}/2026-11-14T10:00:00Z#0123456789ab "{words}"',
+                        ""):
+                with self.assertRaises(drive.DriveError, msg=src):
+                    drive.respond(self.home, "solve", "UNOWNED", "park", source=src, now=time.time())
+                with self.assertRaisesRegex(ort.OwnerError, "must be exactly answer:", msg=src):
                     ort.park_goal(self.home, "solve", self.until, src)
             # 3. typed as the free-text reply to the exact park question; 4. as the question itself
             with self.assertRaisesRegex(ort.OwnerError, "did not choose", msg=words):
@@ -357,7 +365,8 @@ class ParkAuthorityTests(Base):
         human = fx.human_turn(self.home, MISSION, "Park solve until next week.")
         root = self.home / ".agent-harness" / "owners"
         for answer in (f"answer:{MISSION}/{human}", self.park_answer(chosen="Keep solve active"),
-                       self.park_answer(goal="leads"), ""):
+                       self.park_answer(goal="leads"), "",
+                       self.park_answer(session="bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee")):  # session binds at use
             (root / "authority.json").write_text(json.dumps({"parks": [{"goal": "solve", "until": self.until,
                                                                          "answer": answer}]}))
             self.assertIsNone(ort.active_park(self.home, "solve", time.time()), answer)
@@ -458,6 +467,19 @@ class TicketAssociationTests(Base):
         with self.assertRaises(drive.DriveError):
             drive.respond(self.home, "solve", "MERGED_NOT_RELEASED", "ticket", "goodqa#43", now=NOW,
                           ticket_check=self.lookup)  # no --detail
+        import mission_coverage as mc
+        with mock.patch.object(mc, "ask_states", lambda h, sess: {"w00000000001": {"state": "open",
+                                                                                   "note": "release solve when?"}}):
+            with self.assertRaises(drive.DriveError):  # an ask must name the commit too: the key carries it
+                drive.respond(self.home, "solve", "MERGED_NOT_RELEASED", "ask", "w00000000001", now=NOW)
+            with self.assertRaises(drive.DriveError):
+                drive.respond(self.home, "solve", "MERGED_NOT_RELEASED", "ask", "w00000000001",
+                              detail="0123456789ab", now=NOW)
+            asked = drive.respond(self.home, "solve", "MERGED_NOT_RELEASED", "ask", "w00000000001",
+                                  detail=first[:12], now=NOW)
+        snap = {"at": NOW - 10, "rows": [{"goal": "solve", "actions": [dict(act, since=NOW - 10)]}]}
+        self.assertEqual(drive.unanswered(snap, [asked], NOW + 5), [])  # the accepted ask clears the action
+        self.assertEqual(len(drive.unanswered(snap, [], NOW + 5)), 1)
         row = self.respond("MERGED_NOT_RELEASED", "goodqa#43", first[:12])  # control
         self.assertEqual(row["key"], f"solve:MERGED_NOT_RELEASED:{first[:12]}")
         second = self.commit("fix(x): two\n\nRefs: GoodQA goodqa#11")
