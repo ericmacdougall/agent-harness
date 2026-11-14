@@ -363,7 +363,8 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                "state": verdict["state"], "severity": verdict["severity"],
                "last_activity": iso(last_wal), "idle_s": None if idle == float("inf") else int(idle),
                "ticket": summary["tickets"][0] if summary["tickets"] else None,
-               "ticket_comment_age_s": None}
+               "ticket_comment_age_s": None,
+               "active_1h": now - max(last_wal, tmtime) <= 3600}  # WAL or transcript write in the hour (goodqa#15943)
         if comments and row["ticket"]:
             row["ticket_comment_age_s"] = comments(row["ticket"], now)
         rows.append(row)
@@ -385,7 +386,8 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                      "parent": None, "owner": True, "registered": name in registered, "flags": ["task-wal"],
                      "state": verdict["state"], "severity": verdict["severity"],
                      "last_activity": iso(summary["last_at"]), "idle_s": None if idle == float("inf") else int(idle),
-                     "ticket": summary["tickets"][0] if summary["tickets"] else None, "ticket_comment_age_s": None})
+                     "ticket": summary["tickets"][0] if summary["tickets"] else None, "ticket_comment_age_s": None,
+                     "active_1h": now - summary["last_at"] <= 3600})
     asks = ask_states(main)
     for r in rows:  # round 5 MJ-1: a wait on an ask holds only while that ask is open in this session
         target = r["state"][len("waiting-on-"):] if r["state"].startswith("waiting-on-") else ""
@@ -492,6 +494,8 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     dls = deadlines(home, session, now, led)
     missed = [d for d in dls if d["state"] == "missed" and not liveness.disposition_live(disp.get(d["id"]), now)]
     return {"session": session, "generated": iso(now), "counts": counts, "owners": rows, "source": "direct",
+            "agents_active_1h": sum(1 for r in rows if r.get("active_1h")),
+            "agents_active_1h": sum(1 for r in rows if r.get("active_1h")),
             "deadlines": dls,
             "undisposed": sorted([r["agent_id"] for r in rows if r["decision_required"]] + [d["id"] for d in missed]),
             "attention": sorted(r["agent_id"] for r in rows if r.get("attention")),
@@ -1498,6 +1502,8 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
             state = ask_states(main_wal).get(ref)
             raise AhError("bad_request", f"task.dispose waiting: ask {ref} " + ("is already answered (ask_resolved)"
                           if state == "resolved" else "is not in this session's WAL"), 3)
+        if args["kind"] == "waiting" and ASK_ID_RE.match(ref):
+            narrow_wait(home, main_wal, args["session"], args["agent"], ref)
         if args["kind"] == "reassigned" and not (_wal_has(main_wal, "subagent", None, agent=ref)
                                                 or (main_wal.parent / f"{ref}.jsonl").is_file()):
             raise AhError("bad_request", f"task.dispose reassigned: {ref} is not an agent of this session", 3)
@@ -1621,6 +1627,33 @@ def leftover_waiters(home: Path, agent: str, session: str, ps_rows=None, session
             continue
         found.append({"kind": "process", "pid": pid, "elapsed": elapsed, "scope": scope, "command": redact.redact(command)[:200]})
     return found
+
+
+def narrow_wait(home: Path, main_wal: Path, session: str, agent: str, ref: str) -> None:
+    """goodqa#15943: a wait on a user ask excuses only the owner whose stream the ask belongs to. Refused when the ask
+    names another owner (`owner` field, wal_note --owner) or is already the live wait of another owner; an ask that
+    names nobody and is unused stays allowed (back-compat)."""
+    try:
+        with open(main_wal, "rb") as handle:
+            for raw in handle:
+                if b'"ask"' not in raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("event") == "ask" and rec.get("id") == ref:
+                    owner = rec.get("owner")
+                    if isinstance(owner, str) and owner and owner != agent:
+                        raise AhError("bad_request", f"waiting: ask {ref} belongs to {owner}, not {agent}; "
+                                                     "a wait on one ask excuses only its own owner", 3)
+    except OSError:
+        pass
+    now = time.time()
+    for other, d in dispositions(home, session).items():
+        if other != agent and d.get("kind") == "waiting" and d.get("ref") == ref and float(d.get("until") or 0.0) > now:
+            raise AhError("bad_request", f"waiting: ask {ref} is already {other}'s wait; one ask excuses one "
+                                         "owner. Raise a separate ask for this owner (wal_note --event ask --owner)", 3)
 
 
 def ask_states(main_wal: Path) -> dict:
@@ -2502,6 +2535,7 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
             raise LookupError("owners view not computed for supplied rows")
         data = owners(home, session, now=now)
         owners_summary = {"counts": data.get("counts"), "undisposed": data.get("undisposed"),
+                          "agents_active_1h": data.get("agents_active_1h"),
                           "attention": data.get("attention"),
                           "live": sorted(r["agent_id"] for r in data.get("owners") or []
                                          if r.get("owner") and str(r.get("state")).startswith(("live", "working")))}

@@ -100,6 +100,7 @@ def defaults(host: str) -> dict:
                      "lookback_h": 24, "lookback_active_h": 168, "retire_h": 6, "ticket_quiet_h": 3, "max_ticket_lookups": 10,
                      "ticket_budget_s": 90, "gq": "~/.claude/goodqa-p0p1/gq.py",
                      "projects": {"goodqa": "1ae27b6b-f8f2-4e61-ab2d-c9c43fd162c3"}},
+        "idle_guard": {"enabled": True, "idle_min": 30, "wal_root": "~/.claude/wals", "lookback_h": 12},
         "peers": [],
         # goodqa#15234: point events (a refused copy, a foreign process stop) describe something that happened, not a
         # condition that can stop being true, so nothing ever cleared them. They expire after ttl_h without a repeat.
@@ -1836,6 +1837,39 @@ def check_liveness(cfg, state, runner, now):
     return out
 
 
+def check_idle_guard(cfg, state, runner, now):
+    """goodqa#15943: one high alert idle-guard:<session8> per recent session whose main and owners made no progress for
+    idle_min minutes while a stream holds a non-user next step (idle_guard.assess). The alert ends when progress
+    resumes or nothing actionable is left. A session that cannot be assessed raises nothing (the Stop hook fails open
+    too)."""
+    ic = cfg["idle_guard"]
+    home = Path(home_of(cfg))
+    root = Path(expand(home, ic["wal_root"]))
+    if root != home / ".claude" / "wals":
+        return []  # the owner view reads the real session root only
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import idle_guard  # noqa: PLC0415 - installed beside this file
+    out = []
+    try:
+        sessions = [e for e in os.scandir(root) if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        return []
+    for sess in sorted(sessions, key=lambda e: e.name):
+        try:
+            if os.stat(os.path.join(sess.path, "main.jsonl")).st_mtime < now - ic["lookback_h"] * 3600:
+                continue
+            a = idle_guard.assess(home, sess.name, now, float(ic["idle_min"]))
+        except Exception:  # noqa: BLE001 - one unreadable session never hides the others
+            continue
+        if a["idle"]:
+            names = ", ".join(s["agent"] for s in a["streams"][:6])
+            out.append(alert("idle_guard", f"idle-guard:{sess.name[:8]}", "high",
+                             f"main idle {round(a['idle_s'] / 60)}m with {len(a['streams'])} stream(s) holding a non-user next step: {names}",
+                             {"session": sess.name[:8], "idle_min": round(a["idle_s"] / 60),
+                              "streams": [{"agent": s["agent"], "next": s["next"]} for s in a["streams"][:12]]}))
+    return out
+
+
 def check_mission(cfg, state, runner, now):
     """Mission coverage (goodqa#15565): mission:<goal>:uncovered (high, stop_block) and mission:<goal>:stalled
     (warning) from mission_coverage.assess for the mission session (goals.json mission_session);
@@ -2019,6 +2053,7 @@ DEFAULT_CHECKS = {
     "remote_units": check_remote_units,
     "proxmox_pool": check_proxmox_pool,
     "deploys": lambda c, s, r, n: check_deploys(c, s, r, n) if (c.get("deploys") or {}).get("enabled", True) else [],
+    "idle_guard": lambda c, s, r, n: check_idle_guard(c, s, r, n) if (c.get("idle_guard") or {}).get("enabled", True) else [],
     "mission": lambda c, s, r, n: check_mission(c, s, r, n) if (c.get("mission") or {}).get("enabled", True) else [],
 }
 RUN_CHECK = "_run"    # internal errors; cleared by any completed run

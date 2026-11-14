@@ -44,6 +44,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "mission_coverage.py", "mission_gate.py",  # mission goals: owner, disposition or done evidence (goodqa#15565)
          "goals_view.py", "status_truth.py", "stop_blocks.py",  # `ah goals`, status lint and injection (goodqa#15754)
          "gq_browser.py",  # GoodQA worker browser CLI and stdio MCP server; main registers the MCP (goodqa#15745)
+         "idle_guard.py",  # main-idle detector, Stop block and rejected-question reminder (goodqa#15943)
          "shellwords.py")  # quote-aware command splitting shared by mission_gate and dropped_gate (goodqa#15684)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
@@ -95,7 +96,7 @@ def managed_scripts(claude: Path) -> set[str]:
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
                          "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",
-                         "mc_inbox.py", "mission_gate.py", "status_truth.py")}
+                         "mc_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -245,6 +246,14 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     # disposition and no done evidence. Main only, bounded per signature, silent where no goals file exists.
     managed.setdefault("Stop", []).append({"hooks": [{"type": "command", "command": "python3",
                                                        "args": [str(claude / "hooks" / "mission_gate.py")], "timeout": 15}]})
+    # Idle guard (goodqa#15943): blocks main's turn end while the session is idle with a non-user next step, and adds
+    # one reminder line after a user rejection. Main only, bounded per signature, fails open.
+    idle = str(claude / "hooks" / "idle_guard.py")
+    managed.setdefault("Stop", []).append({"hooks": [{"type": "command", "command": "python3", "args": [idle, "stop"],
+                                                       "timeout": 15}]})
+    for event in ("PostToolUseFailure", "PermissionDenied", "UserPromptSubmit"):
+        managed.setdefault(event, []).append({"hooks": [{"type": "command", "command": "python3",
+                                                         "args": [idle, "reject"], "timeout": 5}]})
     # Status truth (goodqa#15754): a status question gets the goal ledger, a compaction re-injects it, and main's Stop
     # lint catches a goal-status answer that contradicts it. Mission session only; fails open; mode status_lint.
     truth = str(claude / "hooks" / "status_truth.py")
