@@ -35,7 +35,6 @@ PROJECT_ID_PREFIXES = {"1ae27b6b": "goodqa"}  # GoodQA project id (first 8 hex) 
 DEFAULT_PROJECT = "goodqa"
 KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 EXTERNAL_MIN = 15  # characters of reason an --external wait must give
-RESUMED_ACTIVITY_S = 60  # activity this long after a wait means the owner was resumed (goodqa#15949)
 QUOTA_REF_RE = re.compile(r"^quota:[a-z0-9][a-z0-9_-]{1,40}$")
 ASK_ID_RE = re.compile(r"^w[0-9a-f]{11}$")
 OWNER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -211,11 +210,12 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
         raise AhError("schema_newer", "index written by a newer ah; update this install", 4)
     summary["schema"] = SCHEMA
     meta = summary.setdefault("meta", {})
-    if "outcome_at" not in summary:
-        meta.clear()  # an index written before outcome_at existed: rescan from the start (goodqa#15943 r5)
+    if "outcome_at" not in summary or "work_at" not in summary:
+        meta.clear()  # an index written before outcome_at / note_at existed: rescan from the start (goodqa#15943 r5, #15949)
     lines, rebuilt = read_new_lines(path, meta)
-    if rebuilt or "first" not in summary or "outcome_at" not in summary:
-        summary.update(first=None, last_at=0.0, outcome=None, outcome_at=0.0, last_note="", tickets=[], events=0)
+    if rebuilt or "first" not in summary or "outcome_at" not in summary or "work_at" not in summary:
+        summary.update(first=None, last_at=0.0, outcome=None, outcome_at=0.0, last_note="", note_at=0.0, work_at=0.0,
+                       tickets=[], events=0)
     for _off, raw in lines:
         try:
             rec = json.loads(raw)
@@ -224,10 +224,12 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
         if not isinstance(rec, dict):
             continue
         at = parse_ts(rec.get("at"))
+        event, note = rec.get("event"), rec.get("note") if isinstance(rec.get("note"), str) else ""
         if not rec.get("by") or rec.get("by") == own:  # a record another actor wrote on this owner's behalf is not its activity (review H2)
             summary["last_at"] = max(summary["last_at"], at)
+            if event and event not in liveness.HOOK_EVENTS:
+                summary["work_at"] = max(summary["work_at"], at)  # the owner's own words: what supersedes a wait (#15949)
         summary["events"] += 1
-        event, note = rec.get("event"), rec.get("note") if isinstance(rec.get("note"), str) else ""
         if event == "intent":
             summary["outcome"], summary["outcome_at"] = None, 0.0  # new work after an earlier result/handoff: not finished
             if summary["first"] is None and note:
@@ -237,7 +239,7 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
             # main's acknowledgement and ages the result
             summary["outcome"], summary["outcome_at"] = event, at
         if event in ("handoff", "result", "status", "blocker", "decision") and note:
-            summary["last_note"] = note[:300]
+            summary["last_note"], summary["note_at"] = note[:300], at  # the note's own time ages and orders its wait
         for match in TICKET_IN_NOTE.findall(note):
             if match not in summary["tickets"] and len(summary["tickets"]) < 8:
                 summary["tickets"].append(match)
@@ -317,7 +319,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     if not main.is_file():
         raise AhError("session_unknown", f"no main WAL for session {session!r}")
     index_dir = state_dir(home, "ah-index")
-    spawned, stopped, named, stop_at = {}, set(), [], {}
+    spawned, stopped, named, stop_at, stops = {}, set(), [], {}, {}
     with open(main, "rb") as handle:
         for raw in handle:
             try:
@@ -334,6 +336,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             elif rec.get("event") == "subagent_stop":
                 stopped.add(rec["agent_id"])
                 stop_at[rec["agent_id"]] = parse_ts(rec.get("at"))
+                stops.setdefault(rec["agent_id"], []).append(stop_at[rec["agent_id"]])  # every stop: wait_current
     for agent, meta in discover_agents(home, session, wal).items():
         info = spawned.setdefault(agent, {"type": None, "at": 0.0})
         info["type"] = info["type"] or meta.get("type")
@@ -343,23 +346,32 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     pending = pending_stops(home, session, led)
     sub_dirs = subagent_dirs(home, session)
     named_text = "\n".join(named)
+    # goodqa#15949: loaded before classification, because a newer disposition replaces an older WAL-note wait
+    disp = dispositions(home, session, led)
+    activity = {}  # agent id -> the wait_current inputs for that owner; the one rule reads them for notes and dispositions
     rows = []
     for agent, info in spawned.items():
         path = wal / f"agent-{agent}.jsonl"
         summary = summarize_agent_wal(path, index_dir) if path.is_file() else {
-            "first": None, "last_at": 0.0, "outcome": None, "outcome_at": 0.0, "last_note": "", "tickets": []}
+            "first": None, "last_at": 0.0, "outcome": None, "outcome_at": 0.0, "last_note": "", "note_at": 0.0,
+            "work_at": 0.0, "tickets": []}
         last_wal = max(summary["last_at"], 0.0) or info["at"]
         tmtime = transcript_mtime(home, session, agent, sub_dirs)
         if info.get("finished") and agent not in stopped:  # transcript meta says it ended; hook never saw the stop
             stopped.add(agent)
             stop_at[agent] = max(tmtime, last_wal)
+            stops.setdefault(agent, []).append(stop_at[agent])
         is_stopped = agent in stopped and max(last_wal, tmtime) <= stop_at.get(agent, 0.0) + 10
         by_name = info["type"] in liveness.NAMEABLE_TYPES and agent in named_text
         is_owner = agent in registered or info["type"] in liveness.OWNER_TYPES or by_name
         grace = 0.0 if pending.get(agent, 0.0) >= max(last_wal, tmtime) - 10 else None  # I7: no finishing grace (10 s, as is_stopped)
+        activity[agent] = {"work_at": summary.get("work_at") or 0.0, "active_at": max(last_wal, tmtime),
+                           "stops": stops.get(agent, [])}
         verdict = liveness.classify(now, last_wal, tmtime, is_stopped,
                                     summary["outcome"], summary["last_note"], info["type"],
-                                    agent in registered, owner=is_owner, finish_grace=grace)
+                                    agent in registered, owner=is_owner, finish_grace=grace,
+                                    note_at=summary.get("note_at") or 0.0,
+                                    activity=dict(activity[agent], replaced_at=(disp.get(agent) or {}).get("at")))
         idle = verdict["idle_s"]
         text = " ".join(filter(None, [info.get("description"), summary["first"]]))
         restricted = bool(RESTRICTED.search(text))
@@ -372,8 +384,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                "ticket": summary["tickets"][0] if summary["tickets"] else None,
                "ticket_comment_age_s": None,
                "result_at": iso(summary["outcome_at"]) if summary.get("outcome") and summary.get("outcome_at") else None,
-               "active_1h": now - max(last_wal, tmtime) <= 3600,  # WAL or transcript write in the hour (goodqa#15943)
-               "active_at": max(last_wal, tmtime)}  # latest WAL or transcript write (goodqa#15949); task WAL rows lack it
+               "active_1h": now - max(last_wal, tmtime) <= 3600}  # WAL or transcript write in the hour (goodqa#15943)
         if comments and row["ticket"]:
             row["ticket_comment_age_s"] = comments(row["ticket"], now)
         rows.append(row)
@@ -387,7 +398,10 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         except OSError:
             continue
         summary = summarize_agent_wal(f, index_dir)
-        verdict = liveness.classify_task_wal(now, summary["last_at"], summary["outcome"], summary["last_note"])
+        activity[name] = {"work_at": summary.get("work_at") or 0.0}  # no process behind it: its notes alone
+        verdict = liveness.classify_task_wal(now, summary["last_at"], summary["outcome"], summary["last_note"],
+                                             note_at=summary.get("note_at") or 0.0,
+                                             activity=dict(activity[name], replaced_at=(disp.get(name) or {}).get("at")))
         idle = verdict["idle_s"]
         text = summary["first"] or ""
         restricted = bool(RESTRICTED.search(text))
@@ -404,17 +418,18 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         if r["owner"] and ASK_ID_RE.match(target) and asks.get(target) != "open":
             r["flags"] = list(r.get("flags") or []) + [f"wait-ask-{asks.get(target, 'missing')}"]
             r["state"], r["severity"] = "DROPPED", "high"
-    disp = dispositions(home, session, led)
     for d in disp.values():
         if d.get("kind") == "waiting" and ASK_ID_RE.match(str(d.get("ref") or "")) and asks.get(d["ref"]) != "open":
             d["until"] = min(float(d.get("until") or 0.0), float(d.get("at") or 0.0))  # answered: the wait is over
-    # goodqa#15949 (receipt r2 F1): activity after a wait disposition supersedes it everywhere (liveness, wait
-    # classification, alerts) and stays superseded as the activity ages. A main-acknowledged handoff wait is kept: it
-    # takes the owner's result, which later notes must not revoke.
+    # goodqa#15949 (receipts r2 and r3 F1): a waiting disposition that liveness.wait_current() finds superseded is
+    # dropped here, before liveness, covered(), the silent check, wait classification and the result-ack rule read it,
+    # so every consumer (ahd, ops-watch, idle_guard, tier_gate read these rows) sees the same answer. The WAL-note
+    # fallback asked the same rule in classify() above. A main-acknowledged handoff wait is kept: it takes the
+    # owner's result, which later notes must not revoke.
     for r in rows:
         d = disp.get(r["agent_id"])
         if r["owner"] and d and d.get("kind") == "waiting" and not d.get("ack_handoff") \
-                and (r.get("active_at") or parse_ts(r["last_activity"]) or 0.0) > float(d.get("at") or 0.0) + RESUMED_ACTIVITY_S:
+                and not liveness.wait_current(float(d.get("at") or 0.0), activity.get(r["agent_id"])):
             del disp[r["agent_id"]]
     # a returned parent with live children is still doing the work through them (main's finding: a4720127 and its 7
     # reviewers), so it counts as live for a reassignment (dispose guard). Only a child with recent activity counts:

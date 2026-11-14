@@ -128,9 +128,50 @@ NOTE_WAIT_MAX_S = 24 * 3600  # a "waiting on <x>" WAL note holds at most this lo
 # `ah task dispose --kind waiting`, which checks the ask or ticket and allows up to 7 days.
 
 
-def note_wait(note: str, note_at: float, now: float):
-    """waiting_on(note) while the note is younger than NOTE_WAIT_MAX_S; None once it has expired."""
-    if not note_at or now - note_at >= NOTE_WAIT_MAX_S:
+# wal.py metadata rows, not an owner's own words (as dropped_gate.LIFECYCLE_EVENTS)
+HOOK_EVENTS = frozenset(("pretool", "subagent", "subagent_stop", "pending_stop", "session", "prompt"))
+WAIT_SUPERSEDE_S = 60  # owner work this long after a wait means the owner moved on from it (goodqa#15949)
+STOP_SLACK_S = 10  # as ah's is_stopped: writes this close to a stop row belong to the turn that stopped
+
+
+def wait_current(wait_at: float, activity: dict | None = None) -> bool:
+    """The one rule for whether a wait (a waiting disposition or a `waiting on <x>` WAL note) still holds (goodqa#15949,
+    receipts r2 and r3 F1): only while no qualifying activity has come after it. Every reader of a wait asks this.
+
+    `activity` (all epoch seconds, each optional):
+      work_at      the owner's latest own WAL note that is not hook metadata (pretool, subagent, subagent_stop,
+                   pending_stop, session, prompt) and not written by another actor
+      replaced_at  the time of a newer wait or disposition for the same owner: the newest wait wins
+      active_at    the owner's latest activity of any kind (WAL row or transcript write)
+      stops        the owner's recorded stop times
+
+    Qualifying activity is (a) a work note more than WAIT_SUPERSEDE_S after the wait, (b) a newer wait or disposition,
+    or (c) any activity more than STOP_SLACK_S after the stop boundary: the first stop at or after the wait (the
+    turn that recorded the wait ended there, so its closing tool rows, stop row and last transcript write are not new
+    work), or, when no stop follows the wait, the owner's last stop before it (it was between turns and has since been
+    resumed). An owner that never stopped is judged by its notes alone. Every input only grows with time, so a
+    superseded wait stays superseded, with one bounded exception: an owner resumed before it recorded the wait counts
+    its tool and transcript writes under (c) only until the turn that recorded the wait stops; that stop makes them
+    the wait's own closing tail, as for any owner that records a wait and then ends its turn."""
+    act = activity or {}
+    wait_at = float(wait_at or 0.0)
+    if float(act.get("replaced_at") or 0.0) > wait_at:
+        return False
+    if float(act.get("work_at") or 0.0) > wait_at + WAIT_SUPERSEDE_S:
+        return False
+    stops = sorted(float(s) for s in (act.get("stops") or ()) if s)
+    after = [s for s in stops if s >= wait_at - STOP_SLACK_S]
+    before = [s for s in stops if s < wait_at - STOP_SLACK_S]
+    boundary = after[0] if after else (before[-1] if before else None)
+    if boundary is not None and float(act.get("active_at") or 0.0) > max(boundary + STOP_SLACK_S, wait_at + WAIT_SUPERSEDE_S):
+        return False
+    return True
+
+
+def note_wait(note: str, note_at: float, now: float, activity: dict | None = None):
+    """waiting_on(note) while the note is younger than NOTE_WAIT_MAX_S (counted from the note's own time) and
+    wait_current(note_at, activity); None otherwise."""
+    if not note_at or now - note_at >= NOTE_WAIT_MAX_S or not wait_current(note_at, activity):
         return None
     return waiting_on(note)
 
@@ -138,14 +179,16 @@ def note_wait(note: str, note_at: float, now: float):
 TASK_ABANDON_S = 6 * 3600  # a task-named WAL (no process behind it) silent this long without a terminal note is DROPPED
 
 
-def classify_task_wal(now: float, last_at: float, outcome: str | None, last_note: str = "") -> dict:
-    """The one rule for task-named WALs (goodqa#14791 I8): shared by `ah owners`, ops-watch and the dropped scan."""
+def classify_task_wal(now: float, last_at: float, outcome: str | None, last_note: str = "",
+                      note_at: float | None = None, activity: dict | None = None) -> dict:
+    """The one rule for task-named WALs (goodqa#14791 I8): shared by `ah owners`, ops-watch and the dropped scan.
+    `note_at` is the time of the record that wrote `last_note` (default: last_at); `activity` goes to wait_current."""
     idle = max(0.0, now - last_at) if last_at else float("inf")
     if outcome in ("result", "done", "delivered"):
         return {"state": "done", "idle_s": idle, "severity": "info"}
     if outcome == "handoff":
         return {"state": "handoff", "idle_s": idle, "severity": "info"}
-    wait = note_wait(last_note, last_at, now)
+    wait = note_wait(last_note, last_at if note_at is None else note_at, now, activity)
     if wait:
         return {"state": f"waiting-on-{wait}", "idle_s": idle, "severity": "info"}
     if idle >= TASK_ABANDON_S:
@@ -159,8 +202,11 @@ def classify_task_wal(now: float, last_at: float, outcome: str | None, last_note
 
 def classify(now: float, last_wal: float, transcript_mtime: float, stopped: bool, outcome: str | None,
              last_note: str = "", agent_type: str | None = None, registered: bool = False,
-             owner: bool | None = None, finish_grace: float | None = None) -> dict:
-    """Return {"state", "idle_s", "severity"}; `outcome` is the last done/handoff/result kind or None."""
+             owner: bool | None = None, finish_grace: float | None = None, note_at: float | None = None,
+             activity: dict | None = None) -> dict:
+    """Return {"state", "idle_s", "severity"}; `outcome` is the last done/handoff/result kind or None. A stopped
+    owner's `last_note` names a wait only while note_wait() holds: `note_at` is that note's own time (default:
+    last_wal) and `activity` goes to wait_current."""
     last = max(last_wal or 0.0, transcript_mtime or 0.0)
     idle = max(0.0, now - last) if last else float("inf")
     if stopped:
@@ -169,7 +215,7 @@ def classify(now: float, last_wal: float, transcript_mtime: float, stopped: bool
         elif outcome == "handoff":
             state = "handoff"
         else:
-            wait = note_wait(last_note, last_wal, now)  # the note is the last WAL entry
+            wait = note_wait(last_note, last_wal if note_at is None else note_at, now, activity)
             if wait:
                 state = f"waiting-on-{wait}"
             else:

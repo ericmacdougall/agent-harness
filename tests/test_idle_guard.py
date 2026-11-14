@@ -364,6 +364,166 @@ class Goodqa15949Tests(Base):
                 self.assertIsNone(row["wait_on"], row)
 
 
+class WaitRestoreTests(Base):
+    """goodqa#15949 receipt r3 F1: one rule decides whether a wait is current. A wait, from a disposition or a WAL note,
+    holds only while no qualifying activity has come after it, and no other path (the note fallback, an older note under
+    an expired disposition, the 24 h note cap) may bring a superseded wait back."""
+
+    WAITS = {"ordinary": {"ref": "GoodQA goodqa#15943"},
+             "external": {"ref": "GoodQA goodqa#15643", "external": "Codex quota resets 2026-11-16"},
+             "ask": {"ref": "wa5b00000001"}}
+    AGES = (("fresh", 0), ("45m", 45 * 60), ("7h", 7 * HOUR))
+
+    def look(self, later=0.0):
+        rows = {r["agent_id"]: r for r in ah.owners(self.home, SESSION, now=NOW + later)["owners"]}
+        streams = [s["agent"] for s in self.ig.assess(self.home, SESSION, NOW + later)["streams"]]
+        return rows, streams
+
+    def stop(self, agent, at):  # wal.py writes the stop row to both the main and the owner's WAL
+        row = {"at": iso(at), "event": "subagent_stop", "agent_id": agent, "agent_type": "task-owner"}
+        jl(self.w / "main.jsonl", [row])
+        jl(self.w / f"agent-{agent}.jsonl", [row])
+
+    def wait_note_then(self, agent, kind, key, then_event, then_at, wait_at):
+        """A `waiting on <ref>` note, a waiting disposition a minute later (live past +7 h), then `then_event`."""
+        wait = dict(self.WAITS[kind])
+        wal = self.w / f"{agent}.jsonl" if agent.startswith("tw") else self.w / f"agent-{agent}.jsonl"
+        jl(wal, [{"at": iso(wait_at), "event": "status", "note": f"blocked, waiting on {wait['ref']}"}])
+        self.dispose(agent, "waiting", key, until=iso(NOW + 8 * HOUR), at=iso(wait_at + 60), **wait)
+        jl(wal, [{"at": iso(then_at), "event": then_event, "note": "back on it: next slice"}])
+        return wal
+
+    def test_stopped_owner_resumed_after_a_note_and_disposition_is_not_excused(self):  # r3 F1, sub-agent row
+        for kind in self.WAITS:
+            for then in ("intent", "check"):
+                with self.subTest(kind=kind, then=then):
+                    self.setUp()
+                    self.wait_note_then("tick", kind, f"tick-r3-{kind}-{then}", then, NOW - 2 * HOUR, NOW - 3 * HOUR)
+                    self.stop("tick", NOW - 2 * HOUR + 30)
+                    for label, later in self.AGES:
+                        rows, streams = self.look(later)
+                        row = rows["tick"]
+                        with self.subTest(age=label):
+                            self.assertIsNone(row["wait_on"], row)
+                            self.assertIsNone(row["disposition"], row)
+                            self.assertEqual(row["state"], "DROPPED", row)
+                            self.assertTrue(row["decision_required"], row)
+                            self.assertIn("tick", streams)
+
+    def test_task_wal_resumed_after_a_note_and_disposition_is_not_excused(self):  # r3 F1, the reviewer's repro
+        for kind in self.WAITS:
+            for then in ("intent", "check"):
+                with self.subTest(kind=kind, then=then):
+                    self.setUp()
+                    wal = self.wait_note_then("tw15949", kind, f"tw-r3-{kind}-{then}", then, NOW - 120, NOW - 3 * HOUR)
+                    os.utime(wal, (NOW - 120, NOW - 120))  # the clock is faked; the task-WAL window reads mtime
+                    for label, later in self.AGES:
+                        rows, streams = self.look(later)
+                        row = rows["tw15949"]
+                        with self.subTest(age=label):
+                            self.assertIsNone(row["wait_on"], row)
+                            self.assertIsNone(row["disposition"], row)
+                            self.assertFalse(row["state"].startswith("waiting-on-"), row)
+                            if label == "7h":  # past TASK_ABANDON_S: no stale wait keeps it out of the dropped scan
+                                self.assertEqual(row["state"], "DROPPED", row)
+                                self.assertTrue(row["decision_required"], row)
+                                self.assertIn("tw15949", streams)
+
+    def test_an_expired_disposition_does_not_fall_back_to_an_older_note(self):  # newest wait wins
+        jl(self.w / "agent-tick.jsonl", [{"at": iso(NOW - 3 * HOUR), "event": "status", "note": "waiting on wa5b00000001"}])
+        self.stop("tick", NOW - 3 * HOUR + 30)
+        self.dispose("tick", "waiting", "tick-newer-wait", until=iso(NOW - HOUR), at=iso(NOW - 2 * HOUR),
+                     ref="GoodQA goodqa#15943")
+        rows, streams = self.look()
+        self.assertIsNone(rows["tick"]["wait_on"], rows["tick"])
+        self.assertTrue(rows["tick"]["decision_required"], rows["tick"])
+        self.assertIn("tick", streams)
+
+    def test_the_note_cap_runs_from_the_note_not_from_later_hook_rows(self):  # 24 h from the note's own time
+        jl(self.w / "agent-tick.jsonl", [{"at": iso(NOW - 4 * HOUR + 30), "event": "status",
+                                          "note": "waiting on GoodQA goodqa#15943"},
+                                         {"at": iso(NOW - 3 * HOUR), "event": "pretool", "agent_id": "tick", "tool": "Bash"}])
+        self.stop("tick", NOW - 3 * HOUR + 20)
+        rows, _ = self.look(21 * HOUR)  # 25 h after the note, under 24 h after the last hook row
+        self.assertIsNone(rows["tick"]["wait_on"], rows["tick"])
+        self.assertEqual(rows["tick"]["state"], "DROPPED", rows["tick"])
+
+    # ---- controls: these hold at 79ebb269 too, except where noted, and must keep holding
+
+    def closing_tail(self, agent, start):
+        """What follows an owner's own wait in a real turn: tool rows (a ticket post), the stop row, the last
+        transcript write, all within a few minutes and none of it new work."""
+        jl(self.w / f"agent-{agent}.jsonl", [{"at": iso(start + 90), "event": "pretool", "agent_id": agent, "tool": "Bash"},
+                                             {"at": iso(start + 150), "event": "pretool", "agent_id": agent, "tool": "Bash"}])
+        self.stop(agent, start + 200)
+        sub = self.home / ".claude" / "projects" / "p" / SESSION / "subagents"
+        sub.mkdir(parents=True, exist_ok=True)
+        (sub / f"agent-{agent}.jsonl").write_text("{}\n")
+        os.utime(sub / f"agent-{agent}.jsonl", (start + 200, start + 200))
+
+    def test_a_note_wait_followed_by_its_own_closing_tail_holds(self):
+        jl(self.w / "agent-tick.jsonl", [{"at": iso(NOW - 3 * HOUR), "event": "status", "note": "waiting on GoodQA goodqa#15943"}])
+        self.closing_tail("tick", NOW - 3 * HOUR)
+        for label, later in self.AGES:
+            with self.subTest(age=label):
+                row = self.look(later)[0]["tick"]
+                self.assertEqual(row["wait_on"], "GoodQA goodqa#15943", row)
+                self.assertFalse(row["decision_required"], row)
+
+    def test_an_owners_own_disposition_followed_by_its_closing_tail_holds(self):  # fails at 79ebb269: false DROPPED
+        jl(self.w / "agent-tick.jsonl", [{"at": iso(NOW - 3 * HOUR - 30), "event": "intent", "note": "park on the ask"}])
+        self.dispose("tick", "waiting", "tick-own-wait", until=iso(NOW + 8 * HOUR), at=iso(NOW - 3 * HOUR), ref="wa5b00000001")
+        self.closing_tail("tick", NOW - 3 * HOUR)
+        for label, later in self.AGES:
+            with self.subTest(age=label):
+                rows, streams = self.look(later)
+                self.assertEqual(rows["tick"]["wait_on"], "wa5b00000001", rows["tick"])
+                self.assertTrue(rows["tick"]["disposition"]["live"], rows["tick"])
+                self.assertFalse(rows["tick"]["decision_required"], rows["tick"])
+                self.assertNotIn("tick", streams)
+
+    def test_a_wait_written_after_resuming_holds_from_its_own_time(self):
+        jl(self.w / "agent-tick.jsonl", [
+            {"at": iso(NOW - 3 * HOUR), "event": "status", "note": "waiting on GoodQA goodqa#15943"},
+            {"at": iso(NOW - 2 * HOUR), "event": "intent", "note": "resumed"},
+            {"at": iso(NOW - 2 * HOUR + 60), "event": "status", "note": "blocked again, waiting on wa5b00000001"}])
+        self.stop("tick", NOW - 2 * HOUR + 90)
+        for label, later in self.AGES:
+            with self.subTest(age=label):
+                rows, streams = self.look(later)
+                self.assertEqual(rows["tick"]["wait_on"], "wa5b00000001", rows["tick"])
+                self.assertNotIn("tick", streams)
+
+    def test_a_record_written_by_another_actor_does_not_supersede(self):
+        wal = self.w / "tw15950.jsonl"
+        jl(wal, [{"at": iso(NOW - 3 * HOUR), "event": "status", "note": "waiting on wa5b00000001"},
+                 {"at": iso(NOW - 120), "event": "check", "by": "ah-sweeper", "note": "swept"}])
+        os.utime(wal, (NOW - 120, NOW - 120))
+        self.assertEqual(self.look()[0]["tw15950"]["wait_on"], "wa5b00000001")
+
+    def test_main_acknowledged_handoff_wait_survives_later_notes(self):
+        self.close_done1()
+        jl(self.w / "agent-done1.jsonl", [{"at": iso(NOW + 300), "event": "check", "note": "tidying after the handoff"}])
+        rows, streams = self.look(600)
+        self.assertEqual(rows["done1"]["disposition"]["kind"], "waiting", rows["done1"])
+        self.assertNotIn("done1", streams)
+
+    def test_an_index_written_before_note_times_is_rescanned(self):
+        wal = self.w / "tw15951.jsonl"
+        jl(wal, [{"at": iso(NOW - 3 * HOUR), "event": "status", "note": "waiting on wa5b00000001"},
+                 {"at": iso(NOW - 2 * HOUR), "event": "intent", "note": "resumed"}])
+        index = ah.state_dir(self.home, "ah-index")
+        ah.summarize_agent_wal(wal, index)
+        for cache in index.glob("wal-*.json"):
+            doc = json.loads(cache.read_text())
+            for k in ("note_at", "work_at"):
+                doc.pop(k, None)
+            cache.write_text(json.dumps(doc))
+        summary = ah.summarize_agent_wal(wal, index)
+        self.assertEqual(summary.get("note_at"), ah.parse_ts(iso(NOW - 3 * HOUR)))
+        self.assertEqual(summary.get("work_at"), ah.parse_ts(iso(NOW - 2 * HOUR)))
+
+
 class ReminderTests(Base):
     def test_rejection_injects_the_exact_line(self):  # AC-7
         out = self.ig.cmd_reject({"hook_event_name": "PostToolUseFailure", "tool_name": "AskUserQuestion",
