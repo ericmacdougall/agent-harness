@@ -80,8 +80,33 @@ export async function mountScene() {
   }
 
   // ---- list view: a WAI-ARIA tree with a roving tabindex
+  function fillRow(row, node) {
+    row.replaceChildren(el('span', 'org-kind', TYPE_COLORS[node.kind]?.label || node.label || node.kind),
+      el('span', 'org-name', node.kind === 'group' ? node.label : node.kind === 'work' ? `${node.ref} · ${node.title}` : labelText(node)));
+    if (node.kind !== 'group') {
+      const fields = el('div', 'org-fields');
+      for (const [k, v] of describe(node, byId)) { const f = el('span'); f.append(document.createTextNode(`${k}: `), el('b', '', v)); fields.append(f); }
+      row.append(fields);
+    }
+  }
+  let listShape = '';
+  const listRows = new Map();
   function renderList() {
+    const entries = tree(graph);
+    const flat = [];
+    const walk = (items, level) => items.forEach(entry => { flat.push([entry, level]); walk(entry.children, level + 1); });
+    walk(entries, 1);
+    const shape = flat.map(([entry, level]) => `${entry.node.id}:${level}:${entry.children.length}`).join('|');
+    if (shape === listShape && listRows.size) {
+      // Same tree, new details (PR 243 review F2): update each row in place, so a collapsed subtree stays collapsed
+      // and the focused row keeps focus without being re-announced.
+      for (const [entry] of flat) { const row = listRows.get(entry.node.id); if (row) fillRow(row, entry.node); }
+      return;
+    }
     const focusedId = document.activeElement?.closest?.('#org-list [role="treeitem"]')?.dataset.nodeId;
+    const collapsed = new Set([...list.querySelectorAll('[role="treeitem"][aria-expanded="false"]')].map(i => i.dataset.nodeId));
+    listShape = shape;
+    listRows.clear();
     list.replaceChildren();
     const build = (entries, parent, level) => {
       entries.forEach((entry, index) => {
@@ -94,16 +119,11 @@ export async function mountScene() {
         li.dataset.kind = entry.node.kind;
         li.tabIndex = -1;
         const row = el('div', 'org-row');
-        row.append(el('span', 'org-kind', TYPE_COLORS[entry.node.kind]?.label || entry.node.label || entry.node.kind),
-          el('span', 'org-name', entry.node.kind === 'group' ? entry.node.label : entry.node.kind === 'work' ? `${entry.node.ref} · ${entry.node.title}` : labelText(entry.node)));
-        if (entry.node.kind !== 'group') {
-          const fields = el('div', 'org-fields');
-          for (const [k, v] of describe(entry.node, byId)) { const f = el('span'); f.append(document.createTextNode(`${k}: `), el('b', '', v)); fields.append(f); }
-          row.append(fields);
-        }
+        fillRow(row, entry.node);
+        listRows.set(entry.node.id, row);
         li.append(row);
         if (entry.children.length) {
-          li.setAttribute('aria-expanded', 'true');
+          li.setAttribute('aria-expanded', collapsed.has(entry.node.id) ? 'false' : 'true');
           const ul = el('ul'); ul.setAttribute('role', 'group');
           build(entry.children, ul, level + 1);
           li.append(ul);
@@ -111,7 +131,7 @@ export async function mountScene() {
         parent.append(li);
       });
     };
-    build(tree(graph), list, 1);
+    build(entries, list, 1);
     const items = visibleItems();
     const target = items.find(i => i.dataset.nodeId === focusedId) || items[0];
     if (target) { target.tabIndex = 0; if (focusedId) target.focus(); }

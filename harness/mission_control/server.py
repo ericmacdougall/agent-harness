@@ -388,10 +388,14 @@ class App:
             escalation_root=None if demo else (escalation_root or home / ".agent-harness" / "escalation"),
             host="demo-host" if demo else ev.HOST, inbox_fn=self._open_asks)
         # The Initiatives panel comes from live owners and GoodQA, not the hand-written file alone (goodqa#15950).
+        # PR 243 review F1: file rows on restricted tickets are dropped; before the first owner read (the loop runs
+        # initiatives first) the restricted set is unknown (None) and every ticketed file row is withheld.
         self.initiatives.derive = lambda snap: org_graph.derive_initiatives(
             snap, self.owners.rows, self.org.tickets, time.time(),
-            restricted_tickets=getattr(self.owners, "restricted_tickets", frozenset()))   # PR 243 review F1
+            restricted_tickets=self.owners.restricted_tickets if self.owners.restricted_known else None)
         self.org.on_initiatives = lambda: self.initiatives.publish(None)
+        # a change in the restricted set republishes the panel, even when no live owner row changed
+        self.org.restricted_fn = lambda: [self.owners.restricted_known, sorted(self.owners.restricted_tickets)]
         self.collectors = [self.tailer, self.initiatives, self.drop, self.owners, self.github, self.tickets,
                            self.remote, self.org]
         self.codex = CodexResponder(self.hub, self.health, self.runner, codex_binary(), root,

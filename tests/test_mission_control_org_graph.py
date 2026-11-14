@@ -647,9 +647,11 @@ class RestrictedProducerShape(unittest.TestCase):
 
 class RestrictedFileRowIntegration(unittest.TestCase):
     """PR 243 review F1: a fresh initiatives-file row on a restricted owner's ticket must not publish its title, ticket
-    or plan through /api/state or the SSE initiatives snapshot. Runs the real App wiring (owners -> initiatives)."""
+    or plan through /api/state or any SSE initiatives frame. Runs the real App wiring (owners -> initiatives)."""
 
-    def test_fresh_file_row_on_a_restricted_ticket_never_reaches_state_or_sse(self):
+    SECRETS = ("SECRET-TITLE", "SECRET-PLAN", "SECRET-NOTE", "SECRET-TICKET", "goodqa#777")
+
+    def app(self, owners):
         from unittest import mock
         sys.path.insert(0, str(REPO / "tests"))
         import server as mcs
@@ -663,14 +665,11 @@ class RestrictedFileRowIntegration(unittest.TestCase):
         (h.home / "mc").mkdir()
         path = h.home / "mc" / "initiatives.json"
         path.write_text(json.dumps([
-            {"id": "hush", "initiative": "SECRET-TITLE interview loop", "ticket": "GoodQA goodqa#777",
+            {"id": "hush", "initiative": "SECRET-TITLE loop", "ticket": "GoodQA goodqa#777",
              "next_step": "SECRET-PLAN call the candidate", "note": "SECRET-NOTE", "milestones_done": 1,
-             "milestones_total": 3, "owner": "a1234567890abcdef"},
+             "milestones_total": 3},
             {"id": "plain", "initiative": "Visible plan row", "ticket": "goodqa#15950", "next_step": "ship PR"}]))
-        owner = {"agent_id": "a1234567890abcdef", "type": "task-owner", "task": None, "restricted": True,
-                 "owner": True, "state": "live", "severity": "info", "idle_s": 5, "ticket": "goodqa#777",
-                 "last_activity": "", "role": "live"}
-        runner = FakeRunner({"ah-owners": lambda *a: (0, json.dumps({"session": a[0], "owners": [owner]})),
+        runner = FakeRunner({"ah-owners": lambda *a: (0, json.dumps({"session": a[0], "owners": list(owners)})),
                              "ah-ticket-get": (0, json.dumps({"issue": {"title": "SECRET-TICKET", "status": "todo"}}))})
         app = mcs.App(port=47998, root=h.home / "mc", initiatives=str(path), remote=False, fabric_bin=None,
                       runner=runner, wal_roots=[(h.home / "nowals", "claude")], start_threads=False, session=MAIN,
@@ -679,18 +678,66 @@ class RestrictedFileRowIntegration(unittest.TestCase):
         real = app.hub.snapshot
         app.hub.snapshot = lambda name, data: (frames.append((name, json.loads(json.dumps(data, default=str)))),
                                                real(name, data))[1]
+        return app, frames
+
+    @staticmethod
+    def owner(**extra):
+        return {"agent_id": "a1234567890abcdef", "type": "task-owner", "task": None, "restricted": True, "owner": True,
+                "state": "live", "severity": "info", "idle_s": 5, "ticket": "goodqa#777", "last_activity": "",
+                "role": "live", **extra}
+
+    def assert_hidden(self, app, frames, *, visible=True):
+        state = json.dumps(app.state(), default=str)
+        initiatives = [d for n, d in frames if n == "initiatives"]
+        self.assertTrue(initiatives, "the initiatives snapshot was published")
+        for text in [state] + [json.dumps(d) for d in initiatives]:
+            for secret in self.SECRETS:
+                self.assertNotIn(secret, text)
+        if visible:   # the check is not vacuous: unrestricted file rows still show, in state and the latest frame
+            self.assertIn("Visible plan row", state)
+            self.assertIn("Visible plan row", json.dumps(initiatives[-1]))
+
+    def test_restricted_owner_read_first(self):
+        app, frames = self.app([self.owner()])
         now = time.time()
         app.owners.run(now)
         self.assertEqual(app.owners.restricted_tickets, frozenset({"goodqa#777"}))
         app.initiatives.run(now)
         app.org.run(now)
-        state = json.dumps(app.state(), default=str)
-        sse = json.dumps([d for n, d in frames if n == "initiatives"])
-        self.assertIn("Visible plan row", state)   # the check is not vacuous: unrestricted file rows still show
-        self.assertIn("Visible plan row", sse)
-        for text in (state, sse):
-            for secret in ("SECRET-TITLE", "SECRET-PLAN", "SECRET-NOTE", "SECRET-TICKET", "goodqa#777"):
-                self.assertNotIn(secret, text)
+        self.assert_hidden(app, frames)
+
+    def test_initiatives_published_before_the_first_owner_read(self):  # the server loop's real collector order
+        app, frames = self.app([self.owner()])
+        self.assertLess(app.collectors.index(app.initiatives), app.collectors.index(app.owners))
+        now = time.time()
+        app.initiatives.run(now)      # no owner read yet: ticketed file rows are withheld (fail closed)
+        app.owners.run(now)
+        app.org.run(now)              # the restricted set is known now: republished with the plain row back
+        self.assert_hidden(app, frames)
+
+    def test_owner_scrubbed_by_restricted_text_hides_its_ticket_row(self):  # ah says restricted False, text says so
+        app, frames = self.app([self.owner(restricted=False, task="mock interview prep")])
+        now = time.time()
+        app.owners.run(now)
+        app.initiatives.run(now)
+        app.org.run(now)
+        self.assert_hidden(app, frames)
+
+    def test_a_restricted_owner_appearing_later_republishes_without_the_row(self):  # not live: the org sig is unchanged
+        owners = []
+        app, frames = self.app(owners)
+        now = time.time()
+        app.owners.run(now)
+        app.initiatives.run(now)
+        app.org.run(now)
+        self.assertIn("SECRET-TITLE", json.dumps([d for n, d in frames if n == "initiatives"][-1]))   # not known yet
+        owners.append(self.owner(state="done", idle_s=60, role="parked"))
+        app.owners.run(now + 10)
+        app.org.run(now + 10)
+        latest = [d for n, d in frames if n == "initiatives"][-1]
+        self.assertNotIn("SECRET-TITLE", json.dumps(latest))
+        self.assertNotIn("SECRET-TITLE", json.dumps(app.state(), default=str))
+        self.assertIn("Visible plan row", json.dumps(latest))
 
 
 if __name__ == "__main__":

@@ -525,6 +525,7 @@ class OrgGraph:
         self.transcripts, self.escalation_root, self.host = transcripts, escalation_root, host
         self.inbox_fn = inbox_fn or (lambda: (0, 0))
         self.on_initiatives, self.initiatives_sig = None, None
+        self.restricted_fn = None   # -> the owners' restricted-ticket state; part of the initiatives signature
         self.snapshot_data: dict | None = None
         self.metas: dict[str, tuple] = {}   # agent id -> (meta file fingerprint, fields)
         self.tickets: dict[str, dict] = {}
@@ -665,8 +666,8 @@ class OrgGraph:
                          stale=self.ticket_stale)
         live_rows = [[r.get("agent_id"), r.get("ticket"), r.get("task")] for r in (self.owners_fn() or [])
                      if isinstance(r, dict) and r.get("role") == "live"]
-        sig = json.dumps([live_rows, sorted((k, v.get("title"), v.get("status")) for k, v in self.tickets.items())],
-                         default=str)
+        sig = json.dumps([live_rows, sorted((k, v.get("title"), v.get("status")) for k, v in self.tickets.items()),
+                          self.restricted_fn() if self.restricted_fn else None], default=str)
         if sig != self.initiatives_sig and self.on_initiatives:
             self.initiatives_sig = sig
             self.on_initiatives()
@@ -729,11 +730,14 @@ def derive_initiatives(file_snapshot: dict, owner_rows: list, tickets: dict, now
     `ah owners`), titled and stated from GoodQA when read. A file row with the same ticket adds its plan fields; other
     file rows stay only while the hand-written file is under a day old, and the hidden count is reported.
     A file row on a ticket restricted work holds (`restricted_tickets`, from the last owner read) is dropped before
-    anything is merged or published (PR 243 review F1): its title, ticket and plan never reach the page."""
+    anything is merged or published (PR 243 review F1): its title, ticket and plan never reach the page. None means no
+    owner read has landed yet: every file row naming a ticket is withheld until one does (fail closed)."""
     snap = file_snapshot or {}
     mtime = snap.get("mtime")
+    unknown = restricted_tickets is None
     hidden_keys = {_ticket_key(t) for t in restricted_tickets or ()} - {None}
     file_items = [i for i in (snap.get("items") or []) if isinstance(i, dict)
+                  and not (unknown and _ticket_key(i.get("ticket")))
                   and _ticket_key(i.get("ticket")) not in hidden_keys]
     by_ticket = {ticket_ref(i.get("ticket")): i for i in file_items if ticket_ref(i.get("ticket"))}
     derived, seen, untracked = [], set(), 0

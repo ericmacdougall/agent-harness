@@ -733,6 +733,10 @@ class Owners(Collector):
         self.unrestricted: tuple = ("", frozenset())
         self.restricted: tuple = ("", frozenset())   # the same read's restricted ids (asks they registered are hidden)
         self.restricted_tickets: frozenset = frozenset()
+        # PR 243 review F1: the read's restricted tickets, kept apart so publish() can add the tickets of rows it
+        # scrubs on restricted text; and whether any owner read has landed (before one, ticketed file rows are hidden)
+        self.read_restricted_tickets: frozenset = frozenset()
+        self.restricted_known = False
 
     def publish(self):
         managed = []
@@ -784,7 +788,14 @@ class Owners(Collector):
         # freshness of the ah snapshot is tracked apart from runtime freshness: a merged Codex row's own
         # source_stale must never make a cached ah role look current (code inspection F1)
         ah_stale = any(r.get('source_stale') for r in self.claude_rows)
-        rows = [scrub_restricted_row(r) for r in rows]
+        scrubbed, hidden = [], set()
+        for r in rows:
+            clean = scrub_restricted_row(r)
+            if clean.get('restricted') is True and r.get('ticket'):
+                hidden.add(str(r['ticket']).lower())   # PR 243 review F1: a text-scrubbed row's ticket is restricted too
+            scrubbed.append(clean)
+        rows = scrubbed
+        self.restricted_tickets = self.read_restricted_tickets | frozenset(hidden)
         for r in rows:
             if r.get('source') != 'ah':  # rows from ah carry the cap's role; Codex rows get the same three roles
                 r['role'] = codex_role(r)
@@ -842,9 +853,10 @@ class Owners(Collector):
             str(r.get("agent_id")) for r in data.get("owners") or []
             if isinstance(r, dict) and r.get("restricted") is True and isinstance(r.get("agent_id"), str)))
         # tickets restricted work is on: never fetched or shown, even when the initiatives file also names them
-        self.restricted_tickets = frozenset(
+        self.read_restricted_tickets = self.restricted_tickets = frozenset(
             str(r.get("ticket")).lower() for r in data.get("owners") or []
             if isinstance(r, dict) and r.get("restricted") is True and r.get("ticket"))
+        self.restricted_known = True
         for row in data.get("owners") or []:
             if not isinstance(row, dict):
                 continue

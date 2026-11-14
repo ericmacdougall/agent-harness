@@ -139,3 +139,27 @@ test('a details-only update refreshes the list view\'s visible text (task, missi
   assert.ok(items.some(i => i.dataset.nodeId === 'sub1'), 'the list is a tree of treeitems');
   document.getElementById('org-view-toggle').click();
 });
+
+test('a details-only update keeps the list\'s collapsed subtrees and focused row (no re-expand, no refocus)', () => {
+  store.setOrgGraph(snapshot(6, BEFORE));
+  document.getElementById('org-view-toggle').click();   // Show as list
+  const tree = document.getElementById('org-list');
+  const item = id => tree.querySelectorAll('[role="treeitem"]').find(i => i.dataset.nodeId === id);
+  const owner = item('own1');
+  assert.equal(owner.getAttribute('aria-expanded'), 'true');
+  owner.setAttribute('aria-expanded', 'false');           // the reader collapsed the owner's subtree
+  const focused = item('coordinator');
+  focused.focus();
+  let refocused = 0;
+  const realFocus = El.prototype.focus;
+  El.prototype.focus = function () { refocused++; realFocus.call(this); };
+  try {
+    store.setOrgGraph(snapshot(7, AFTER));                // a last-activity / details tick
+  } finally { El.prototype.focus = realFocus; }
+  assert.equal(item('own1').getAttribute('aria-expanded'), 'false', 'a collapsed subtree stays collapsed');
+  assert.equal(document.activeElement, focused, 'the focused row is the same element');
+  assert.equal(refocused, 0, 'no focus() call, so a screen reader does not re-announce the row');
+  assert.ok(tree.textContent.includes('Mission-Beta') && tree.textContent.includes('Title-Beta'), 'the text still updates');
+  assert.ok(!tree.textContent.includes('Mission-Alpha'));
+  document.getElementById('org-view-toggle').click();
+});
