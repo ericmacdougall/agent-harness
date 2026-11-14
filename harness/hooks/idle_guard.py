@@ -140,8 +140,20 @@ def lines(streams: list) -> str:
     return "\n".join(f"  - {s['agent']} {s.get('ticket') or 'no ticket'}: {s['why']}; next: {s['next']}" for s in streams[:12])
 
 
+def _human_turn(rec: dict) -> bool:
+    """A human-typed prompt, by provenance.user_authorship()'s rules (receipt r6 F1): string or text-block content
+    with origin kind `human`; never a task notification, peer message, reminder, meta or compaction record, scheduled
+    wakeup or tool result. Without provenance.py (a partial install) only an unmarked plain-string turn counts."""
+    try:
+        import provenance  # noqa: PLC0415 - installed beside this file
+    except ImportError:
+        return isinstance((rec.get("message") or {}).get("content"), str) and "toolUseResult" not in rec
+    _text, reason = provenance.user_authorship(rec)
+    return reason is None
+
+
 def rejected_this_turn(transcript) -> bool:
-    """True when a user rejection sits after the last real user prompt in the transcript tail."""
+    """True when a user rejection sits after the last human prompt in the transcript tail."""
     if not transcript:
         return False
     seen = False
@@ -153,8 +165,8 @@ def rejected_this_turn(transcript) -> bool:
         if not isinstance(rec, dict) or rec.get("type") != "user":
             continue
         content = (rec.get("message") or {}).get("content")
-        if isinstance(content, str):
-            seen = False  # a plain-text user turn starts a new turn
+        if _human_turn(rec):
+            seen = False  # a human prompt starts a new turn
         elif isinstance(content, list) and any(isinstance(c, dict) and c.get("type") == "tool_result" and REJECT_RE.search(str(c.get("content"))) for c in content):
             seen = True
         if rec.get("toolDenialKind") == "user-rejected":

@@ -185,6 +185,60 @@ class StopHookTests(Base):
         self.assertIn("rejected", out["reason"])
 
 
+class TurnBoundaryTests(Base):
+    """Receipt r6 F1: turn boundaries follow provenance.user_authorship(): a human prompt in any supported format ends
+    the rejected turn; injected notifications, reminders and tool results do not."""
+
+    REJECT = {"type": "user", "toolDenialKind": "user-rejected", "message": {"role": "user", "content": [
+        {"type": "tool_result", "is_error": True, "content": "The user doesn't want to proceed with this tool use."}]}}
+
+    def setUp(self):
+        super().setUp()
+        self.park_tick_on_ask()
+        jl(self.w / "main.jsonl", [{"at": iso(NOW - 60), "event": "commit", "note": "fresh progress"}])
+        self.close_done1()
+        jl(self.w / "agent-done1.jsonl", [{"at": iso(NOW - 30), "event": "result", "note": "again"}])
+        self.dispose("done1", "waiting", "done1-wait-tb", until=iso(NOW + HOUR), ref="GoodQA goodqa#15944")
+        self.assertFalse(self.assess()["idle"])  # only the rejection rule can block here
+        self.assertTrue(self.assess()["streams"])
+
+    def stop_after(self, *records):
+        t = self.home / "tb.jsonl"
+        if t.exists():
+            t.unlink()
+        jl(t, [{"type": "user", "origin": {"kind": "human"}, "message": {"role": "user", "content": "go"}},
+               self.REJECT, *records])
+        return self.ig.cmd_stop({"session_id": SESSION, "stop_hook_active": False, "transcript_path": str(t)}, now=NOW)
+
+    def test_a_text_block_human_prompt_ends_the_rejected_turn(self):
+        prompt = {"type": "user", "origin": {"kind": "human"},
+                  "message": {"role": "user", "content": [{"type": "text", "text": "now do the next thing"}]}}
+        self.assertEqual(self.stop_after(prompt), {})
+        self.assertFalse(self.ig.rejected_this_turn(str(self.home / "tb.jsonl")))
+
+    def test_a_string_human_prompt_ends_the_rejected_turn(self):
+        self.assertEqual(self.stop_after({"type": "user", "origin": {"kind": "human"},
+                                          "message": {"role": "user", "content": "next"}}), {})
+
+    def test_injected_records_do_not_end_the_rejected_turn(self):
+        injected = {
+            "task-notification": {"type": "user", "origin": {"kind": "task-notification"}, "message": {"role": "user",
+                                  "content": [{"type": "text", "text": "<task-notification>agent done</task-notification>"}]}},
+            "unmarked wrapper": {"type": "user", "message": {"role": "user",
+                                 "content": "<task-notification>agent done</task-notification>"}},
+            "system reminder": {"type": "user", "isMeta": True, "origin": {"kind": "human"}, "message": {"role": "user",
+                                "content": [{"type": "text", "text": "<system-reminder>x</system-reminder>"}]}},
+            "peer message": {"type": "user", "origin": {"kind": "peer", "from": "a1"},
+                             "message": {"role": "user", "content": "checkpoint"}},
+            "tool result": {"type": "user", "origin": {"kind": "human"}, "toolUseResult": {},
+                            "message": {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]}},
+        }
+        for name, rec in injected.items():
+            with self.subTest(name):
+                out = self.stop_after(rec)
+                self.assertIn("rejected", out.get("reason") or out.get("systemMessage") or "")
+
+
 class ReminderTests(Base):
     def test_rejection_injects_the_exact_line(self):  # AC-7
         out = self.ig.cmd_reject({"hook_event_name": "PostToolUseFailure", "tool_name": "AskUserQuestion",
