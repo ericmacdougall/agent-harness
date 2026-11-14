@@ -576,8 +576,8 @@ class IngestValidationTests(Base):
         elsewhere.mkdir()
         real_check = core.inbox_path
 
-        def check_then_swap(paths, owner, name):
-            result = real_check(paths, owner, name)
+        def check_then_swap(paths, owner, name, resolve=True):
+            result = real_check(paths, owner, name, resolve=resolve)
             if _sys._getframe(1).f_code.co_name == "send":   # only the delivery-time check
                 target = paths.inbox / owner
                 if target.is_dir() and not target.is_symlink():
@@ -600,6 +600,41 @@ class IngestValidationTests(Base):
             ledger.close()
         self.assertNotEqual(row["status"], "done")
         self.assertIn("refused", row["result"] or "")
+
+    def test_symlink_planted_at_the_notice_name_is_not_delivered(self):
+        iid = self.submit()
+        self.paths.ensure()
+        owner_dir = self.paths.inbox / "agent-abc123"
+        owner_dir.mkdir(mode=0o700)
+        decoy = self.home / "decoy.md"
+        decoy.write_text("anything")
+        (owner_dir / ("%s-blocked.md" % iid)).symlink_to(decoy)
+        deps = Deps(verdict="BLOCK")
+        self.run_all(deps)
+        self.assertEqual(self.state(iid), "blocked")
+        self.assertEqual(decoy.read_text(), "anything", "the decoy target was written through the link")
+        ledger = runner.Ledger(self.paths)
+        try:
+            row = ledger.db.execute("SELECT status, result, payload FROM effects WHERE item=? AND kind='inbox'",
+                                    (iid,)).fetchone()
+        finally:
+            ledger.close()
+        self.assertNotEqual(row["status"], "done", "a planted symlink made the notice look delivered")
+        self.assertIn("refused", row["result"] or "")
+        worker = runner.Worker(self.paths, self.config, deps, runner.Ledger(self.paths))
+        try:
+            self.assertFalse(worker.readback("inbox", json.loads(row["payload"])))
+        finally:
+            worker.led.close()
+
+    def test_inbox_readback_requires_a_regular_file_with_the_written_bytes(self):
+        self.paths.ensure()
+        runner._write_inbox(self.paths.inbox, "agent-abc123", "n.md", "body one")
+        self.assertTrue(runner._inbox_delivered(self.paths.inbox, "agent-abc123", "n.md", "body one"))
+        self.assertFalse(runner._inbox_delivered(self.paths.inbox, "agent-abc123", "n.md", "body two"))
+        self.assertFalse(runner._inbox_delivered(self.paths.inbox, "agent-abc123", "missing.md", "body one"))
+        with self.assertRaises(OSError):   # a different notice already occupies the name: refuse, never overwrite
+            runner._write_inbox(self.paths.inbox, "agent-abc123", "n.md", "body two")
 
 
 class DeliveryTests(Base):

@@ -709,7 +709,9 @@ class Worker:
             return
         effects = [("ticket", {"ticket": req["ticket"], "body": body, "key": "ahc-" + nkey.replace(":", "-")})]
         if audience == "owner":
-            effects.append(("inbox", {"path": str(core.inbox_path(self.paths, req["owner"], "%s-%s.md" % (iid, state))),
+            # lexical only: filesystem state (a planted symlink) must never make the state-change transaction raise
+            name = "%s-%s.md" % (iid, state)
+            effects.append(("inbox", {"path": str(core.inbox_path(self.paths, req["owner"], name, resolve=False)),
                                       "body": body}))
         if audience == "user" or state in ALERT_STATES:
             effects.append(("alert", _alert_payload(iid, req, state, body)))
@@ -749,7 +751,9 @@ class Worker:
 
     def readback(self, kind, payload):
         if kind == "inbox":
-            return Path(payload["path"]).exists()
+            path = Path(payload["path"])
+            return path.parent.parent == self.paths.inbox and _inbox_delivered(
+                self.paths.inbox, path.parent.name, path.name, payload["body"])
         if kind == "digest":
             try:
                 return ("[k:%s]" % payload["key"]) in self.paths.digest.read_text(encoding="utf-8")
@@ -1059,11 +1063,11 @@ def _write_inbox(inbox, owner, name, text):
         except OSError as error:
             raise _InboxRefused("owner inbox is not a real directory: %s" % type(error).__name__) from None
         try:
-            try:
-                os.stat(name, dir_fd=owner_fd, follow_symlinks=False)
-                return  # already delivered
-            except FileNotFoundError:
-                pass
+            present = _notice_state(owner_fd, name, text)
+            if present == "match":
+                return  # already delivered with exactly this content
+            if present != "absent":
+                raise _InboxRefused("notice name is occupied by a %s entry" % present)
             tmp = "." + name + ".tmp"
             try:
                 os.unlink(tmp, dir_fd=owner_fd)
@@ -1076,6 +1080,49 @@ def _write_inbox(inbox, owner, name, text):
                 handle.flush()
                 os.fsync(handle.fileno())
             os.rename(tmp, name, src_dir_fd=owner_fd, dst_dir_fd=owner_fd)
+        finally:
+            os.close(owner_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _notice_state(owner_fd, name, text):
+    """'absent', 'match', or why the entry at `name` (relative to owner_fd, never followed) is not our notice:
+    'symlink', 'non-regular' or 'mismatched'."""
+    try:
+        info = os.stat(name, dir_fd=owner_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return "absent"
+    if stat.S_ISLNK(info.st_mode):
+        return "symlink"
+    if not stat.S_ISREG(info.st_mode):
+        return "non-regular"
+    want = text.encode("utf-8")
+    if info.st_size != len(want):
+        return "mismatched"
+    try:
+        fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=owner_fd)
+    except OSError:
+        return "non-regular"
+    with os.fdopen(fd, "rb") as handle:
+        have = handle.read(len(want) + 1)
+    return "match" if have == want else "mismatched"
+
+
+def _inbox_delivered(inbox, owner, name, text):
+    """Readback for an inbox effect: delivered only if the notice is a regular file, reached without following any
+    symlink, whose bytes equal what was written. A symlink or any mismatch is not delivered (r2 F5 follow-up)."""
+    try:
+        root_fd = os.open(str(inbox), _DIR_FLAGS)
+    except OSError:
+        return False
+    try:
+        try:
+            owner_fd = os.open(owner, _DIR_FLAGS, dir_fd=root_fd)
+        except OSError:
+            return False
+        try:
+            return _notice_state(owner_fd, name, text) == "match"
         finally:
             os.close(owner_fd)
     finally:

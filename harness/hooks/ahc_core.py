@@ -195,13 +195,17 @@ def validate_queued(config, rec, now):
     return norm
 
 
-def inbox_path(paths, owner, name):
-    """The owner's inbox file, or Refused if it would leave the inbox directory (F5 defense in depth)."""
+def inbox_path(paths, owner, name, resolve=True):
+    """The owner's inbox file, or Refused if it would leave the inbox directory (F5 defense in depth).
+    resolve=False does only the lexical checks; it is for building a notice inside a ledger transaction, where the
+    filesystem state must not be able to raise. The write itself is fd-based and never follows a symlink."""
     if not isinstance(owner, str) or not OWNER_RE.fullmatch(owner) or owner in (".", ".."):
         raise Refused("owner is not a plain agent id")
     if not isinstance(name, str) or "/" in name or "\x00" in name or name in ("", ".", ".."):
         raise Refused("inbox file name is not plain")
     path = paths.inbox / owner / name
+    if not resolve:
+        return path
     root = os.path.realpath(str(paths.inbox))
     real = os.path.realpath(str(path))  # resolves a symlinked owner directory or file before the check
     if os.path.dirname(os.path.dirname(real)) != root or not real.startswith(root + os.sep):
