@@ -73,6 +73,14 @@ export function mountInitiatives() {
       else if (/at risk|blocked/i.test(item.state) && item.note) card.append(el('p', 'initiative-note', `↳ ${item.note.slice(0, 160)}`));
       fragment.append(card);
     });
+    // The file is written by hand and nothing refreshes it: say how old it is, and warn past a day (goodqa#15950).
+    const ageMs = state.initiativesMtime ? state.now - state.initiativesMtime : null;
+    const old = ageMs !== null && ageMs > 24 * 3600 * 1000;
+    const fileAge = el('p', `initiatives-file-age${old ? ' stale' : ''}`, state.initiativesMtime
+      ? `From a hand-written file last edited ${age(new Date(state.initiativesMtime).toISOString(), state.now)}.${old ? ' Nothing updates it automatically, so it is likely out of date. Live work is in the Topology tab and the owners panel.' : ''}`
+      : 'From a hand-written file; its edit time is not known.');
+    fileAge.id = 'initiatives-file-age';
+    fragment.prepend(fileAge);
     if (!state.initiatives.length) fragment.append(el('p', 'empty-state', state.initiativesError ? `Initiatives file: ${state.initiativesError}` : 'Waiting for the initiatives file…'));
     list.replaceChildren(fragment);
     document.getElementById('initiatives-panel').classList.toggle('stale', state.initiativesStale);

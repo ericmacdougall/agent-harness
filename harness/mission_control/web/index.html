@@ -117,19 +117,18 @@
           <p id="scene-load-note" class="notice warn" hidden></p>
           <div class="topology-tools"><button id="motion-toggle" class="quiet-button motion-control" type="button" aria-pressed="true"><svg class="motion-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7.5" stroke-dasharray="2.2 2.6"/><circle cx="12" cy="12" r="2"/></svg><span id="motion-label">Motion on</span></button></div>
 <section id="topology-panel" class="topology-panel" aria-labelledby="topology-heading">
-        <div class="topology-heading"><div><span class="eyebrow">LIVE TOPOLOGY</span><h2 id="topology-heading">One connected current.</h2></div><span class="scene-mode" id="scene-mode"><i></i> SPATIAL VIEW</span></div>
+        <div class="topology-heading"><div><span class="eyebrow">LIVE ORG GRAPH</span><h2 id="topology-heading">Coordinator, owners, sub-agents, reviewers and their work</h2><p id="org-meta" class="panel-sub">Waiting for the org graph…</p></div>
+          <div class="org-tools"><span class="scene-mode" id="scene-mode"><i></i> SPATIAL VIEW</span><button id="org-view-toggle" class="quiet-button" type="button" aria-pressed="false" aria-controls="org-list">Show as list</button></div></div>
         <div id="scene-stage" class="scene-stage">
-          <svg id="scene-poster" class="scene-poster" viewBox="0 0 640 320" role="img" aria-label="Static constellation: initiative cores linked to owners and repositories">
-            <defs><radialGradient id="poster-glow"><stop stop-color="#eaff9e" stop-opacity=".14"/><stop offset="1" stop-color="#eaff9e" stop-opacity="0"/></radialGradient></defs>
-            <ellipse cx="320" cy="164" rx="255" ry="125" fill="url(#poster-glow)"/>
-            <g fill="none" stroke="#566044" stroke-width=".8"><ellipse cx="320" cy="164" rx="264" ry="102" transform="rotate(-13 320 164)"/><ellipse cx="320" cy="164" rx="229" ry="72" transform="rotate(15 320 164)"/><ellipse cx="320" cy="164" rx="185" ry="118" transform="rotate(-24 320 164)"/><path d="M81 163Q184 70 320 164T567 183M190 97Q320 164 451 91M194 239Q320 164 455 231M279 61Q320 164 371 262"/></g>
-            <g fill="#eaff9e" stroke="#eaff9e"><circle cx="320" cy="164" r="8"/><circle cx="190" cy="97" r="5"/><circle cx="451" cy="91" r="5"/><circle cx="194" cy="239" r="5"/><circle cx="455" cy="231" r="5"/><circle cx="279" cy="61" r="4"/><circle cx="371" cy="262" r="4"/></g>
-            <g fill="#c9d3d0"><circle cx="81" cy="163" r="3"/><circle cx="567" cy="183" r="3"/><circle cx="147" cy="192" r="3"/><circle cx="496" cy="145" r="3"/><circle cx="352" cy="99" r="3"/><circle cx="245" cy="197" r="3"/></g>
-          </svg>
-          <div id="scene-labels" class="scene-labels" aria-label="Explore constellation nodes"></div>
-          <div class="scene-coordinates mono" aria-hidden="true">SYS.01 <span>↗ 49.28° N</span></div>
+          <p id="scene-poster" class="scene-poster org-empty" hidden>The 3D view needs WebGL. The list below shows the same graph.</p>
+          <div id="scene-labels" class="scene-labels" role="group" aria-label="Org graph nodes: open one for its details"></div>
         </div>
-        <div class="scene-caption"><span><i class="status-dot"></i><span id="scene-status">Owners linked. Signals flowing.</span></span><button id="scene-reset" class="text-button">Reset view <span aria-hidden="true">↺</span></button></div>
+        <div class="scene-caption"><span><i class="status-dot"></i><span id="scene-status">Owners linked. Signals flowing.</span></span><span id="org-cue" class="org-cue" aria-hidden="true"></span><button id="scene-reset" class="text-button">Reset view <span aria-hidden="true">↺</span></button></div>
+        <div id="org-legend" class="org-legend" aria-label="Legend"></div>
+        <div id="org-list-wrap" class="org-list-wrap" hidden><h3 class="org-list-heading" id="org-list-heading">Org graph as a list</h3><ul id="org-list" class="org-list" role="tree" aria-labelledby="org-list-heading"></ul></div>
+        <details class="disclosure org-events"><summary>What each animation means, and where it comes from</summary><table class="org-event-table"><thead><tr><th scope="col">Event</th><th scope="col">Source</th><th scope="col">Animation</th></tr></thead><tbody id="org-event-rows"></tbody></table></details>
+        <ul id="org-gaps" class="org-gaps"></ul>
+        <div id="org-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
       </section>
         </section>
 

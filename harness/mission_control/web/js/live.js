@@ -1,6 +1,6 @@
 // Transport to the local Mission Control server: GET /api/state, SSE /api/events, POST /api/chat, POST /api/approve.
 // Same-origin only; the session cookie is HttpOnly and the CSRF token lives in memory, never in storage.
-import { setInitiatives, setOwners, setSources, setHost, seedEvents, ingestEvent, setConnection, setChat, setCodex, setChatTransport, setApproveTransport, setAsks, setLedger, setRequirementTransport } from './store.js';
+import { setInitiatives, setOwners, setSources, setHost, seedEvents, ingestEvent, setConnection, setChat, setCodex, setChatTransport, setApproveTransport, setAsks, setLedger, setRequirementTransport, setOrgGraph } from './store.js';
 
 let csrf = '';
 let source = null;
@@ -25,6 +25,7 @@ async function loadState() {
   setChat(state.chat);
   setAsks(state.asks);
   setLedger(state.ledger);
+  setOrgGraph(state.orggraph);
   return true;
 }
 
@@ -61,6 +62,7 @@ function connect() {
   source.addEventListener('codex', message => { const data = parse(message); if (data) setCodex(data); });
   source.addEventListener('asks', message => { const data = parse(message); if (data) setAsks(data); });
   source.addEventListener('ledger', message => { const data = parse(message); if (data) setLedger(data); });
+  source.addEventListener('orggraph', message => { const data = parse(message); if (data) setOrgGraph(data); });
 }
 
 function resync() {

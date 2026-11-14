@@ -353,7 +353,18 @@ def _meaningful(entry: dict) -> bool:
     kind = str(entry.get("event", ""))
     if kind in TOOL_EVENTS or kind in LIFECYCLE_EVENTS:
         return False
+    if kind in REVIEW_EVENTS and _verdict(entry):
+        return True  # a review record carries its verdict, not a note (goodqa#15950: reviewer approved/rejected)
     return bool(isinstance(entry.get("note"), str) and entry["note"].strip())
+
+
+REVIEW_EVENTS = ("review", "review_result")
+VERDICT_RE = re.compile(r"^[A-Z_]{2,24}$")
+
+
+def _verdict(entry: dict) -> str:
+    value = str(entry.get("verdict") or "").strip().upper()
+    return value if VERDICT_RE.match(value) else ""
 
 
 def _lifecycle_summary(entry: dict, kind: str, note: str) -> str:
@@ -371,6 +382,9 @@ def _lifecycle_summary(entry: dict, kind: str, note: str) -> str:
 
 
 def _note(entry: dict) -> str:
+    if str(entry.get("event", "")) in REVIEW_EVENTS and _verdict(entry):
+        target = " ".join(str(entry.get(k) or "") for k in ("ticket", "range", "commit") if entry.get(k))
+        return f"{_verdict(entry)} {target}".strip()
     for field in ("note", "summary", "reason", "task", "source"):
         value = entry.get(field)
         if isinstance(value, str) and value.strip():

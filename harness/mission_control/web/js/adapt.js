@@ -26,7 +26,9 @@ export function initiative(row) {
 
 export function initiatives(snapshot) {
   const items = Array.isArray(snapshot?.items) ? snapshot.items.filter(x => x && typeof x === 'object').map(initiative) : [];
-  return { items, stale: !!snapshot?.stale, error: str(snapshot?.error, 300) };
+  // mtime: when the hand-written file was last edited (seconds), so the page can say how old it is (goodqa#15950).
+  const mtime = Number.isFinite(snapshot?.mtime) && snapshot.mtime > 0 ? snapshot.mtime * 1000 : null;
+  return { items, stale: !!snapshot?.stale, error: str(snapshot?.error, 300), mtime };
 }
 
 // An initiative's free-text owner ("a095f32d (waiting)", "none live", "main") links to an owner row by id prefix.

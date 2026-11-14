@@ -5,6 +5,7 @@
   "host": "sources-panel",
   "initiatives": "initiatives-panel",
   "owners": "owners-panel",
+  "orggraph": "topology-panel",
   "health": "health-panel",
   "events": "activity-panel",
   "chat": "chat-panel",
@@ -22,7 +23,8 @@
   "chat": "chat-panel",
   "codex": "chat-panel",
   "asks": "needs-panel",
-  "ledger": "mission-panel"
+  "ledger": "mission-panel",
+  "orggraph": "topology-panel"
  },
  "asks": {
   "items": "needs-panel",
@@ -57,6 +59,7 @@
   "tool activity": "activity-quiet",
   "theme": "theme-toggle",
   "motion": "motion-toggle",
+  "org graph list view": "org-view-toggle",
   "requirement search": "req-search",
   "show more owners": "owners-more",
   "show more asks": "needs-more",

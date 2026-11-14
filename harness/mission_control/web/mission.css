@@ -55,7 +55,20 @@ textarea { resize: none; }
 #scene-layer { position: fixed; inset: 0; z-index: 0; pointer-events: none; display: none; }
 body[data-tab="topology"] #scene-layer { display: block; }
 #scene-layer canvas { width: 100%; height: 100%; display: block; }
-:root[data-theme="light"] #scene-layer canvas { filter: invert(1) hue-rotate(180deg) saturate(1.6) contrast(1.15); }
+/* Org graph palette (goodqa#15950): one color per node type, and a separate warm ramp for severity and escalation.
+   The scene reads these, so the legend and the canvas always match; the light theme has its own darker set. */
+:root {
+  --org-user: #f4b5d4; --org-coordinator: #eaff9e; --org-owner: #9ebfff; --org-subagent: #7edbca; --org-reviewer: #d4b5ff;
+  --org-work: #f1c782; --org-repo: #c7c9ce; --org-done: #7c8580; --org-edge: #8b967f;
+  --org-sev-warn: #ffa94d; --org-sev-high: #ff6b5b; --org-esc-1: #ffd166; --org-esc-2: #ff9f43; --org-esc-3: #ff5c5c;
+  --org-ok: #7edb8a;
+}
+:root[data-theme="light"] {
+  --org-user: #a8327a; --org-coordinator: #5c7400; --org-owner: #2457c5; --org-subagent: #0f7a6a; --org-reviewer: #7040b8;
+  --org-work: #9a6200; --org-repo: #5b6168; --org-done: #8a948c; --org-edge: #6b7a74;
+  --org-sev-warn: #b35c00; --org-sev-high: #c4281d; --org-esc-1: #a87b00; --org-esc-2: #c25e00; --org-esc-3: #c41d1d;
+  --org-ok: #1d7a3a;
+}
 .shell { position: relative; z-index: 1; max-width: 1560px; margin: 0 auto; padding: 0 var(--space-5) var(--space-6); }
 .page-header { position: sticky; top: 0; z-index: 20; background: var(--bg); padding-top: env(safe-area-inset-top, 0px); }
 .brand h1 { font-size: inherit; font-weight: inherit; line-height: 1.2; letter-spacing: -.025em; }
@@ -333,6 +346,50 @@ body[data-tab="topology"] #scene-layer { display: block; }
 .scene-caption { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 4px; color: var(--muted); font-size: 13px; }
 .scene-caption > span { display: flex; gap: 8px; align-items: center; }
 .topology-panel { background: color-mix(in srgb, var(--panel) 82%, transparent); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; }
+.org-tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.scene-poster.org-empty { display: flex; align-items: flex-start; justify-content: center; text-align: center; padding: 16px; color: var(--muted); }
+.node-label[data-kind] { border-left: 4px solid var(--kind, var(--line-strong)); }
+.node-label[data-kind="user"] { --kind: var(--org-user); }
+.node-label[data-kind="coordinator"] { --kind: var(--org-coordinator); }
+.node-label[data-kind="owner"] { --kind: var(--org-owner); }
+.node-label[data-kind="subagent"] { --kind: var(--org-subagent); }
+.node-label[data-kind="reviewer"] { --kind: var(--org-reviewer); }
+.node-label[data-kind="work"] { --kind: var(--org-work); }
+.node-label[data-kind="repo"] { --kind: var(--org-repo); }
+.node-label[data-sev="high"], .node-label[data-sev="critical"] { box-shadow: 0 0 0 2px var(--org-sev-high); }
+.node-label[data-sev="warn"], .node-label[data-sev="medium"] { box-shadow: 0 0 0 2px var(--org-sev-warn); }
+.node-label .org-esc { margin-left: 4px; color: var(--warn); }
+.org-cue { font-size: 13px; color: var(--muted); flex: 1; min-width: 0; text-align: center; }
+.org-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 8px 4px; font-size: 13px; color: var(--muted); }
+.org-legend .legend-group { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
+.org-legend .legend-title { color: var(--text); font-weight: 600; }
+.org-swatch { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; background: var(--swatch); }
+.org-swatch.ring { background: transparent; border: 3px solid var(--swatch); }
+.org-list-wrap { border-top: 1px solid var(--line); padding-top: 10px; }
+.org-list-heading { font-size: 15px; margin-bottom: 6px; }
+.org-list, .org-list ul { list-style: none; margin: 0; padding: 0; }
+.org-list ul { padding-left: 18px; border-left: 1px dashed var(--line); margin-left: 6px; }
+.org-list [role="treeitem"] { margin: 2px 0; }
+.org-list [role="treeitem"] > .org-row { display: block; padding: 6px 8px; border-radius: var(--radius-control); border-left: 4px solid var(--kind, var(--line-strong)); }
+.org-list [role="treeitem"]:focus { outline: none; }
+.org-list [role="treeitem"]:focus > .org-row { outline: 2px solid var(--focus); outline-offset: 1px; }
+.org-row .org-kind { font: 12px var(--mono); color: var(--muted); margin-right: 6px; text-transform: uppercase; }
+.org-row .org-name { font-weight: 600; }
+.org-row .org-fields { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 13px; color: var(--muted); margin-top: 2px; }
+.org-row .org-fields b { color: var(--text); font-weight: 500; }
+.org-list [data-kind="user"] > .org-row { --kind: var(--org-user); }
+.org-list [data-kind="coordinator"] > .org-row { --kind: var(--org-coordinator); }
+.org-list [data-kind="owner"] > .org-row { --kind: var(--org-owner); }
+.org-list [data-kind="subagent"] > .org-row { --kind: var(--org-subagent); }
+.org-list [data-kind="reviewer"] > .org-row { --kind: var(--org-reviewer); }
+.org-list [data-kind="work"] > .org-row { --kind: var(--org-work); }
+.org-list .org-flash > .org-row { background: var(--panel-2); }
+.org-event-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+.org-event-table th, .org-event-table td { text-align: left; vertical-align: top; padding: 4px 6px; border-top: 1px solid var(--line); }
+.org-gaps { font-size: 13px; color: var(--warn); padding: 4px; }
+.org-gaps li::before { content: "Gap: "; font-weight: 600; }
+body[data-org-view="list"] #scene-layer { display: none; }
+body[data-org-view="list"] .scene-stage, body[data-org-view="list"] .scene-caption #scene-reset { display: none; }
 
 /* ---- chat */
 .chat-panel { overflow: auto; scrollbar-width: thin; }
@@ -479,3 +536,5 @@ body.motion-off *, body.motion-off *::before { animation: none !important; }
 .owners-more { margin: 4px 18px 12px; }
 .badge.manual-user { color: var(--warn); border-color: var(--warn); }
 .tile-manual-user { border-color: var(--warn); }
+.initiatives-file-age { font-size: 13px; color: var(--muted); margin: 4px 0 8px; }
+.initiatives-file-age.stale { color: var(--warn); }
