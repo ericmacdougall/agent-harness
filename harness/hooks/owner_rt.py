@@ -91,7 +91,12 @@ NEXT = {"queued": ("planned", "blocked", "dropped"),
         "blocked": OPEN + ("dropped",),
         "done": (), "dropped": ()}
 DEFAULT_RUNTIME = {"enabled": False, "permission_mode": "auto", "max_launches_per_hour": 4, "min_gap_s": 300,
-                   "fresh_bytes": 8_000_000, "model": "", "claude": "claude"}
+                   "fresh_bytes": 8_000_000, "model": "", "permission_source": ""}
+# Brakes an agent-writable runtime.json cannot loosen (red-team r1 M1).
+BRAKES = {"max_launches_per_hour": (1, 6), "min_gap_s": (120, 86400), "fresh_bytes": (200_000, 50_000_000)}
+# Owners run Opus or Sonnet; the top rungs (Fable/Astra) are never launched by the tick (CLAUDE.md, r1 M2).
+MODEL_RE = re.compile(r"^(?:|opus|sonnet|claude-(?:opus|sonnet)-[0-9][0-9a-z.-]{0,30})$")
+CLAUDE_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin")
 PERMISSION_MODES = ("auto", "acceptEdits", "default", "dontAsk", "bypassPermissions")
 SCRIPT = "python3 ~/.claude/hooks/owner_rt.py"
 
@@ -228,12 +233,36 @@ def runtime(home: Path) -> dict:
         cfg["error"] = "runtime.json unreadable"
         return cfg
     if isinstance(data, dict):
-        for k in DEFAULT_RUNTIME:
-            if k in data and isinstance(data[k], type(DEFAULT_RUNTIME[k])):
+        for k, default in DEFAULT_RUNTIME.items():
+            if type(data.get(k)) is type(default):  # exact type: a bool is never read as a number or back
                 cfg[k] = data[k]
+    for k, (lo, hi) in BRAKES.items():
+        cfg[k] = min(max(int(cfg[k]), lo), hi)
+    if not MODEL_RE.match(cfg["model"]):
+        cfg["model"] = ""
     if cfg["permission_mode"] not in PERMISSION_MODES:
         cfg["permission_mode"] = "auto"
+    if cfg["permission_mode"] == "bypassPermissions" and not user_decided(cfg.get("permission_source")):
+        cfg["permission_mode"], cfg["note"] = "auto", "bypassPermissions needs permission_source with the user's words"
+    cfg["claude"] = claude_bin()
     return cfg
+
+
+def user_decided(source) -> bool:
+    """True only for a user:/answer: source that provenance resolves to the user's own words (r1 M3)."""
+    try:
+        import mission_coverage  # noqa: PLC0415
+        return bool(source) and mission_coverage.verify_user_source(source)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def claude_bin() -> str:
+    """The absolute `claude` path from fixed install locations, never from a data file (r1 M1). launchd gives ops_watch
+    no PATH, so ~/.local/bin is searched explicitly (r1 m5)."""
+    import shutil  # noqa: PLC0415
+    found = shutil.which("claude", path=os.pathsep.join(os.path.expanduser(d) for d in CLAUDE_DIRS))
+    return found or ""
 
 
 # ------------------------------------------------------------------ state + inbox
@@ -317,7 +346,14 @@ def ac_file_problem(path: str) -> str:
     """'' when the file holds at least one AC-n line each followed (before the next AC) by a `Verify by:` line, and at
     least one NEG line; else the reason."""
     try:
-        text = Path(path).read_text(encoding="utf-8", errors="replace")[:200_000]
+        import stat as _stat  # noqa: PLC0415
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as fh:
+            if not _stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                return "AC file must be a regular file"
+            text = fh.read(200_001).decode("utf-8", "replace")
+        if len(text) > 200_000:
+            return "AC file is larger than 200 KB"
     except OSError as exc:
         return f"AC file unreadable: {exc.__class__.__name__}"
     acs = list(re.finditer(r"(?m)^\W*(AC-\d+)\b", text))
@@ -339,6 +375,9 @@ def init_owner(home: Path, goal: str, cwd: str, source: str, model: str = "", ti
         raise OwnerError(f"goal {goal} is not in goals.json; add it with mission_coverage.py add first")
     if not SOURCE_RE.match(source or ""):
         raise OwnerError("--source must be user:/answer:/queue:/ticket:/wal:/file:/inferred:")
+    if not MODEL_RE.match(model or ""):
+        raise OwnerError("--model must be opus, sonnet or a claude-opus/claude-sonnet id; the top rungs need the "
+                         "user's named approval and are never launched by the tick")
     work = Path(cwd).expanduser()
     if not work.is_dir():
         raise OwnerError(f"cwd {cwd} is not a directory")
@@ -395,15 +434,21 @@ def move_task(home: Path, goal: str, task: str, to: str, *, ac_file: str = "", r
                                  f"an escalation or a park first ({SCRIPT} task break)")
             if verdict != "ACCEPT" or not AGENT_RE.match(reviewer or ""):
                 raise OwnerError("converged needs --reviewer <agent id> and --verdict ACCEPT")
+            last = t["rounds"][-1] if t["rounds"] else None
+            if not last or last.get("verdict") != "ACCEPT" or last.get("reviewer") != reviewer:
+                raise OwnerError(f"record the reviewer's ACCEPT round first (`task round --task {task} --reviewer "
+                                 f"{reviewer} --verdict ACCEPT`); the latest round must be that ACCEPT")
             row["reviewer"] = reviewer
         if to == "blocked":
             if not clean(help_text):
                 raise OwnerError("blocked needs --help: what you need, so main can unblock it")
             row["help"] = clean(help_text)
         if to == "done":
-            ev = [e for e in (evidence or []) if evidence_ok(home, goal, e)]
+            since = parse_ts(t.get("at"))
+            ev = [e for e in (evidence or []) if evidence_ts(home, goal, e) > since]
             if not ev:
-                raise OwnerError("done needs --evidence that resolves (commit:<sha> in the owner repo or wal:<id>)")
+                raise OwnerError("done needs --evidence made after the task was queued (commit:<sha> in the owner "
+                                 "repo, or wal:<id> of a check, result, deploy or commit row)")
             row["evidence"] = ev
         if to == "dropped":
             if not SOURCE_RE.match(source or "") or source.startswith("inferred:"):
@@ -474,47 +519,98 @@ def _session_wal_dirs(home: Path, state: dict) -> list:
     return out
 
 
-def evidence_ok(home: Path, goal: str, ev: str, state=None) -> bool:
+def evidence_ts(home: Path, goal: str, ev: str, state=None) -> float:
+    """When the evidence happened (commit time, or the WAL row's `at`); 0.0 when it does not resolve."""
     try:
         state = state or load_state(home, goal)
     except (OSError, ValueError, OwnerError):
-        return False
+        return 0.0
     kind, _, ref = str(ev or "").partition(":")
     if kind == "commit" and SHA_RE.match(ref):
         try:
-            r = subprocess.run(["git", "-C", state["cwd"], "cat-file", "-e", f"{ref}^{{commit}}"],
-                               capture_output=True, timeout=10)
-            return r.returncode == 0
+            r = subprocess.run(["git", "-C", state["cwd"], "log", "-1", "--format=%ct", f"{ref}^{{commit}}", "--"],
+                               capture_output=True, text=True, timeout=10)
+            return float(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else 0.0
         except (OSError, subprocess.SubprocessError):
-            return False
+            return 0.0
     if kind == "wal" and WAL_ID_RE.match(ref):
-        needle = f'"id": "{ref}"'.encode(), f'"id":"{ref}"'.encode()
+        needle = (f'"id": "{ref}"'.encode(), f'"id":"{ref}"'.encode())
         for d in _session_wal_dirs(home, state):
             try:
                 for f in d.glob("*.jsonl"):
-                    data = _read(f, 64 << 20)
-                    if needle[0] in data or needle[1] in data:
-                        return True
+                    for line in _read(f, 64 << 20).splitlines():
+                        if needle[0] in line or needle[1] in line:
+                            try:
+                                rec = json.loads(line)
+                            except ValueError:
+                                return 0.0
+                            if rec.get("event") not in PROOF_EVENTS:
+                                return 0.0
+                            return parse_ts(rec.get("at"))
             except (OSError, OwnerError):
                 continue
-    return False
+    return 0.0
 
 
-def beat(home: Path, goal: str, evidence, next_text: str) -> dict:
+def parse_ts(value) -> float:
+    import datetime as dt  # noqa: PLC0415
+    try:
+        return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def evidence_ok(home: Path, goal: str, ev: str, state=None) -> bool:
+    return evidence_ts(home, goal, ev, state) > 0
+
+
+FIRST_PROOF_WINDOW_S = 2 * 3600
+PROOF_EVENTS = ("check", "result", "deploy", "commit")
+
+
+def beat(home: Path, goal: str, evidence, next_text: str, now=None) -> dict:
+    """A proof counts only with evidence that resolves AND happened after the previous proof (or, for the first proof,
+    within FIRST_PROOF_WINDOW_S): re-citing old work never resets the clock or clears `stuck`."""
+    now = time.time() if now is None else now
     with locked(home, goal):
         state = load_state(home, goal)
-        good = [e for e in evidence or [] if evidence_ok(home, goal, e, state)]
-        bad = [e for e in evidence or [] if e not in good]
+        prev_ts = float((state.get("last_beat") or {}).get("ts") or 0.0)
+        floor = prev_ts if prev_ts else now - FIRST_PROOF_WINDOW_S
+        stamped = {e: evidence_ts(home, goal, e, state) for e in evidence or []}
+        good = [e for e, ts in stamped.items() if ts > floor]
+        bad = [e for e in stamped if e not in good]
         if not good:
-            raise OwnerError("a proof needs evidence that resolves: commit:<sha> in "
-                             f"{state['cwd']} or wal:<id> in this owner's WAL (unresolved: {', '.join(bad) or 'none'})")
-        prev = set(state.get("last_beat", {}).get("evidence") or [])
-        state["last_beat"] = {"at": now_iso(), "ts": time.time(), "evidence": good, "unresolved": bad,
-                              "next": clean(next_text, 300), "new": bool(set(good) - prev)}
-        if set(good) - prev:
-            state["no_progress_launches"], state["stuck"] = 0, False
+            raise OwnerError("a proof needs new evidence: commit:<sha> in "
+                             f"{state['cwd']} or wal:<id> in this owner's WAL, made after the last proof "
+                             f"(not new or unresolved: {', '.join(bad) or 'none'})")
+        state["last_beat"] = {"at": now_iso(now), "ts": now, "evidence": good, "unresolved": bad,
+                              "next": clean(next_text, 300)}
+        state["no_progress_launches"], state["stuck"] = 0, False
         save_state(home, goal, state)
         return state["last_beat"]
+
+
+def set_flag(home: Path, goal: str, flag: str, source: str) -> dict:
+    """unstick (clear `stuck` and the no-progress count), pause (tick leaves the owner alone) or unpause. Each needs
+    a source; pause also refuses inferred: (a pause stops a product, so it needs a decision someone made)."""
+    if not SOURCE_RE.match(source or ""):
+        raise OwnerError("--source is required")
+    if flag == "pause" and source.startswith("inferred:"):
+        raise OwnerError("pausing an owner needs a user:, answer:, queue:, ticket: or wal: source, not inferred:")
+    with locked(home, goal):
+        state = load_state(home, goal)
+        if flag == "unstick":
+            state["stuck"], state["no_progress_launches"] = False, 0
+        elif flag == "pause":
+            state["paused"] = {"at": now_iso(), "source": clean(source, 300)}
+        elif flag == "unpause":
+            state["paused"] = {}
+        else:
+            raise OwnerError(f"unknown flag {flag}")
+        state.setdefault("flags", []).append({"flag": flag, "at": now_iso(), "source": clean(source, 300)})
+        state["flags"] = state["flags"][-50:]
+        save_state(home, goal, state)
+        return {"goal": goal, "flag": flag, "stuck": state["stuck"], "paused": state["paused"]}
 
 
 def checkpoint(home: Path, goal: str, text: str) -> dict:
@@ -554,6 +650,8 @@ def owner_prompt(home: Path, goal: str, resume: bool = False) -> str:
         "the ledger, add it as a task, and work it.",
         *open_lines,
         f"Last checkpoint: {cp[:800]}" if cp else "No checkpoint yet.",
+        f"Inbox head: {inbox_head(home, goal)} (generation {int(state.get('generation', 0))}). First action of this run: "
+        "record a WAL intent with wal_note.py that cites this inbox head and the task you take next.",
         "How you work, every time:",
         f"  1. Plan each task; write an AC file (AC-n lines each with `Verify by:`, plus NEG-n cases); "
         f"`{cmd} task move {g} --task tN --to planned --ac-file F`.",
@@ -574,6 +672,14 @@ def owner_prompt(home: Path, goal: str, resume: bool = False) -> str:
     return "\n".join(lines)
 
 
+def inbox_head(home: Path, goal: str) -> str:
+    """sha256 prefix of the inbox file: which tasks this run was given."""
+    try:
+        return hashlib.sha256(_read(goal_dir(home, goal) / "inbox.jsonl", MAX_INBOX)).hexdigest()[:12]
+    except (OSError, OwnerError):
+        return "empty"
+
+
 # ------------------------------------------------------------------ tick (lifetime)
 
 def _run(argv, timeout=60, cwd=None):
@@ -590,15 +696,21 @@ def bg_sessions(cfg: dict, runner=_run) -> list:
     return [a for a in data if isinstance(a, dict)]
 
 
+def owner_sessions(state: dict, sessions: list) -> list:
+    """Live (pid) background sessions of this owner: its recorded session id, or any session named owner-<goal>
+    (a launch whose id lookup failed is still found by name)."""
+    sid, name = state.get("session_id"), f"owner-{state.get('goal')}"
+    return [a for a in sessions if a.get("pid") and ((sid and a.get("sessionId") == sid) or a.get("name") == name)]
+
+
 def session_status(state: dict, sessions: list) -> str:
-    """busy | idle | gone for the owner's current session."""
-    sid = state.get("session_id")
-    for a in sessions:
-        if sid and a.get("sessionId") == sid:
-            if a.get("pid") and a.get("status") not in ("idle", None) and a.get("state") != "done":
-                return "busy"
-            return "idle" if a.get("pid") else "gone"
-    return "gone"
+    """busy | idle | gone over every live session of this owner. Observed 2026-11-14: a session mid-turn, or whose turn
+    ended while a background sub-agent still runs, reads status busy / state working; it reads idle / done only when
+    nothing runs. Anything not plainly idle counts as busy, so the tick never stops a working owner."""
+    live = owner_sessions(state, sessions)
+    if any(not (a.get("status") == "idle" and a.get("state") == "done") for a in live):
+        return "busy"
+    return "idle" if live else "gone"
 
 
 def transcript_bytes(home: Path, state: dict) -> int:
@@ -663,8 +775,12 @@ def tick_one(home: Path, goal: str, goal_row: dict, cfg: dict, sessions: list, n
         size = transcript_bytes(home, state)
         fresh = size < 0 or size > cfg["fresh_bytes"]
         argv = [cfg["claude"], "--bg", "--permission-mode", cfg["permission_mode"], "--name", f"owner-{goal}"]
-        if cfg.get("model") or state.get("model"):
-            argv += ["--model", state.get("model") or cfg["model"]]
+        model = state.get("model") or cfg["model"]
+        if model and not MODEL_RE.match(model):
+            out.update(action="launch-failed", reason=f"model {clean(model, 40)} is not allowed for owners")
+            return out
+        if model:
+            argv += ["--model", model]
         if not fresh:
             argv += ["--resume", state["session_id"]]
         prompt = owner_prompt(home, goal, resume=not fresh)
@@ -672,23 +788,23 @@ def tick_one(home: Path, goal: str, goal_row: dict, cfg: dict, sessions: list, n
         if dry_run:
             out["argv"] = argv
             return out
-        if status == "idle":
-            for a in sessions:
-                if a.get("sessionId") == state.get("session_id") and a.get("id"):
+        if status == "idle":  # stop every idle session of this owner first: never two at once
+            for a in owner_sessions(state, sessions):
+                if a.get("id"):
                     runner([cfg["claude"], "stop", str(a["id"])], 30)
         code, text = runner(argv + [prompt], 90, cwd=state["cwd"])  # the session's workspace is its cwd
         m = re.search(r"backgrounded\s*\S*\s*([0-9a-f]{6,12})", text)
         entry = {"ts": now, "at": now_iso(now), "reason": reason, "fresh": fresh, "code": code,
                  "bg_id": m.group(1) if m else "", "out": clean(text, 200)}
-        if code == 0 and m:
+        if code == 0:
             sid = ""
             with contextlib.suppress(Exception):
                 for a in bg_sessions(cfg, runner):
                     if a.get("id") == entry["bg_id"]:
                         sid = a.get("sessionId", "")
             entry["session_id"] = sid
-            state["generation"] = int(state.get("generation", 0)) + (1 if fresh else 0)
-            state["session_id"], state["bg_id"] = sid or state.get("session_id", ""), entry["bg_id"]
+            state["generation"] = int(state.get("generation", 0)) + 1  # every run is a generation (G2)
+            state["session_id"], state["bg_id"] = sid, entry["bg_id"]  # unknown id: found by name next tick
             state["no_progress_launches"] = int(state.get("no_progress_launches", 0)) + 1
             state["resume"] = {}
             out["bg_id"] = entry["bg_id"]
@@ -709,13 +825,24 @@ def owner_goals(home: Path) -> list:
                   and (p / "state.json").exists())
 
 
-def tick(home: Path, now=None, runner=_run, dry_run: bool = False) -> list:
+def tick(home: Path, now=None, runner=_run, dry_run: bool = False, only: str = "") -> list:
     now = time.time() if now is None else now
     cfg = runtime(home)
     goals = mission_goals(home)
-    names = owner_goals(home)
+    names = [g for g in owner_goals(home) if not only or g == only]
     if not names:
         return []
+    if not cfg.get("enabled") or not cfg.get("claude"):  # nothing runs a program while disabled (r1 M1)
+        why = "runtime disabled" if not cfg.get("enabled") else "claude binary not found in " + ", ".join(CLAUDE_DIRS)
+        out = []
+        for g in names:
+            with contextlib.suppress(Exception):
+                st = load_state(home, g)
+                reason = due_reason(home, g, st, now)
+                out.append({"goal": g, "action": "would-launch" if reason and cfg.get("enabled") is False else
+                            ("error" if reason else "none"), "reason": (reason + f" ({why})") if reason else
+                            "nothing due"})
+        return out
     try:
         sessions = bg_sessions(cfg, runner)
     except Exception as exc:  # noqa: BLE001
@@ -731,9 +858,20 @@ def tick(home: Path, now=None, runner=_run, dry_run: bool = False) -> list:
 
 # ------------------------------------------------------------------ Stop hook (inside the owner session)
 
-def owner_for_session(home: Path, session: str):
+def _same_dir(a, b) -> bool:
+    try:
+        return bool(a) and bool(b) and Path(a).resolve() == Path(b).resolve()
+    except (OSError, ValueError):
+        return False
+
+
+def owner_for_session(home: Path, session: str, cwd: str = ""):
+    """The owner state of this session: by recorded session id, or by the owner's dedicated workspace (`claude --bg`
+    assigns its own id and ignores --session-id, so a run's first Stop can come before tick records the id; live test
+    2026-11-14). A workspace match adopts the id."""
     if not session:
         return None
+    by_cwd = None
     for g in owner_goals(home):
         try:
             st = load_state(home, g)
@@ -741,13 +879,21 @@ def owner_for_session(home: Path, session: str):
             continue
         if st.get("session_id") == session:
             return st
-    return None
+        if by_cwd is None and _same_dir(cwd, st.get("cwd")):
+            by_cwd = st
+    if by_cwd is not None and SESSION_RE.match(session):
+        with contextlib.suppress(Exception), locked(home, by_cwd["goal"]):
+            s2 = load_state(home, by_cwd["goal"])
+            s2["session_id"] = session
+            save_state(home, by_cwd["goal"], s2)
+            by_cwd = s2
+    return by_cwd
 
 
 def stop_decision(home: Path, payload: dict, now=None) -> dict:
     now = time.time() if now is None else now
     session = str(payload.get("session_id") or "")
-    st = owner_for_session(home, session)
+    st = owner_for_session(home, session, str(payload.get("cwd") or ""))
     if st is None:
         return {}
     goal = st["goal"]
@@ -886,23 +1032,96 @@ def build_parser():
     pr.add_argument("--resume", action="store_true")
     k = sub.add_parser("tick", help="resume every idle owner with work due (ops_watch runs this)")
     k.add_argument("--dry-run", action="store_true")
+    for flag, text in (("unstick", "clear stuck after looking at the owner"), ("pause", "tick leaves the owner alone"),
+                       ("unpause", "resume ticking the owner")):
+        f = sub.add_parser(flag, help=text)
+        f.add_argument("--goal", required=True)
+        f.add_argument("--source", required=True)
     sub.add_parser("stop", help="Stop hook (reads the hook payload on stdin)")
     return p
+
+
+STAMP_PURPOSE = "owner-main"
+STAMP_TTL_S = 60
+# (command, needs): "main" = main of the mission session; "main-or-owner" = that, or the goal's own owner session.
+GUARDED = {"init": "main", "pause": "main", "unpause": "main", "unstick": "main", "task add": "main-or-owner",
+           "task drop": "main-or-owner"}
+
+
+def guarded_name(argv) -> str:
+    argv = [str(a) for a in argv or []]
+    if argv[:1] == ["task"] and len(argv) > 1:
+        if argv[1] == "move" and ("dropped" in argv or "--to=dropped" in argv):
+            return "task drop"
+        return f"task {argv[1]}"
+    return argv[0] if argv else ""
+
+
+def argv_key(argv) -> str:
+    """Digest of the exact argument list (`--flag=value` read as `--flag value`), the same as mission_gate's stamp key."""
+    words = []
+    for a in argv:
+        a = str(a)
+        words.extend(a.split("=", 1) if a.startswith("--") and "=" in a else [a])
+    return hashlib.sha256(json.dumps(words, separators=(",", ":")).encode("utf-8", "replace")).hexdigest()
+
+
+def authorize(argv, home: Path, goal: str) -> None:
+    """Consume main's one-shot stamp for exactly this argument list (bound to main's still-running tool call, as
+    mission_coverage's main-only commands) and check whose session wrote it. A sub-agent's shell, a cron job, a copied
+    script or `ah own` (no stamp is written for it) is refused (red-team r1 M7). Same-user threat model."""
+    name = guarded_name(argv)
+    need = GUARDED.get(name)
+    if not need:
+        return
+    import caller_identity  # noqa: PLC0415
+    stamp = caller_identity.take_stamp(STAMP_PURPOSE, [name, argv_key(argv)], home=home, bound=True, ttl=STAMP_TTL_S)
+    if stamp is None:
+        raise OwnerError(f"`{name}` is main-only: run `{SCRIPT} ...` as a plain foreground command from main (or, for "
+                         "task add and drop, from the goal's own owner session); a sub-agent asks main")
+    caller = str(stamp.get("session") or "").lower()
+    mission = ""
+    with contextlib.suppress(Exception):
+        import mission_coverage  # noqa: PLC0415
+        mission = (mission_coverage.mission_session_of(home) or "").lower()
+    if mission and caller == mission:
+        return
+    if need == "main-or-owner":
+        with contextlib.suppress(Exception):
+            if caller and caller == str(load_state(home, goal).get("session_id") or "").lower():
+                return
+    raise OwnerError(f"`{name}` is refused for session {clean(caller, 40) or 'unknown'}: only the mission's main"
+                     + (" or this goal's owner session" if need == "main-or-owner" else "") + " may run it")
+
+
+def _goal_arg(argv) -> str:
+    argv = [str(a) for a in argv]
+    for i, a in enumerate(argv):
+        if a == "--goal" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--goal="):
+            return a.split("=", 1)[1]
+    return ""
 
 
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["stop"]:
         return cmd_stop(sys.stdin)
-    args = build_parser().parse_args(argv)
     home = home_dir()
+    try:
+        authorize(argv, home, _goal_arg(argv))  # before parsing: a failing command still burns its stamp
+    except OwnerError as exc:
+        print(f"owner_rt: {exc}", file=sys.stderr)
+        return 2
+    args = build_parser().parse_args(argv)
     try:
         if args.cmd == "init":
             out = init_owner(home, args.goal, args.cwd, args.source, args.model, args.ticket)
         elif args.cmd == "task" and args.tcmd == "add":
             out = add_task(home, args.goal, args.text, args.source, args.by)
             if args.wake:
-                out = {"task": out, "tick": [r for r in tick(home) if r.get("goal") == args.goal]}
+                out = {"task": out, "tick": tick(home, only=args.goal)}
         elif args.cmd == "task" and args.tcmd == "move":
             out = move_task(home, args.goal, args.task, args.to, ac_file=args.ac_file, reviewer=args.reviewer,
                             verdict=args.verdict, help_text=args.help_text, evidence=args.evidence,
@@ -922,6 +1141,8 @@ def main(argv=None) -> int:
         elif args.cmd == "prompt":
             print(owner_prompt(home, args.goal, resume=args.resume))
             return 0
+        elif args.cmd in ("unstick", "pause", "unpause"):
+            out = set_flag(home, args.goal, args.cmd, args.source)
         elif args.cmd == "tick":
             out = tick(home, dry_run=args.dry_run)
         else:

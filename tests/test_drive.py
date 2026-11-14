@@ -39,9 +39,15 @@ class Base(unittest.TestCase):
         self.repo.mkdir()
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
         self.commit("init")
+        for g in self.goals:
+            g.setdefault("repos", [str(self.repo)])
+        self.write_goals()
         p2 = mock.patch.object(drive, "mission_session", return_value=MISSION)
         p2.start()
         self.addCleanup(p2.stop)
+        p3 = mock.patch.object(drive, "owner_rows_of", return_value=[])  # a fresh, empty signed owner list
+        p3.start()
+        self.addCleanup(p3.stop)
 
     def commit(self, msg):
         subprocess.run(["git", "-C", str(self.repo), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
@@ -66,7 +72,7 @@ class Base(unittest.TestCase):
 
 class TableTests(Base):
     def test_table_lists_every_goal_whatever_status(self):
-        a = drive.assess(self.home, MISSION, NOW, with_git=False)
+        a = drive.assess(self.home, MISSION, NOW, owner_rows=[], with_git=False)
         self.assertEqual(sorted(r["goal"] for r in a["rows"]), ["leads", "old", "pp", "solve"])
         self.assertEqual(self.conds(a, "old"), [])
         self.assertEqual(self.row(a, "old")["distance"], "done")
@@ -82,12 +88,12 @@ class TableTests(Base):
 
 class ConditionTests(Base):
     def test_condition_imported_and_unowned(self):
-        a = drive.assess(self.home, MISSION, NOW, with_git=False)
+        a = drive.assess(self.home, MISSION, NOW, owner_rows=[], with_git=False)
         self.assertEqual(self.conds(a, "leads"), ["IMPORTED", "UNOWNED"])
         self.assertEqual(self.conds(a, "solve"), ["UNOWNED"])
 
     def test_condition_user_deferral_suppresses(self):
-        a = drive.assess(self.home, MISSION, NOW, with_git=False)
+        a = drive.assess(self.home, MISSION, NOW, owner_rows=[], with_git=False)
         self.assertEqual(self.conds(a, "pp"), [])
 
     def test_condition_legacy_owner_counts(self):
@@ -103,10 +109,10 @@ class ConditionTests(Base):
         st = ort.load_state(self.home, "solve")
         st["last_beat"] = {"ts": NOW - 29 * 60}
         ort.save_state(self.home, "solve", st)
-        self.assertEqual(self.conds(drive.assess(self.home, MISSION, NOW, with_git=False), "solve"), [])
+        self.assertEqual(self.conds(drive.assess(self.home, MISSION, NOW, owner_rows=[], with_git=False), "solve"), [])
         st["last_beat"] = {"ts": NOW - 31 * 60}
         ort.save_state(self.home, "solve", st)
-        self.assertEqual(self.conds(drive.assess(self.home, MISSION, NOW, with_git=False), "solve"), ["STALLED"])
+        self.assertEqual(self.conds(drive.assess(self.home, MISSION, NOW, owner_rows=[], with_git=False), "solve"), ["STALLED"])
 
     def test_condition_stuck_help_and_loop(self):
         self.owner()
@@ -121,7 +127,7 @@ class ConditionTests(Base):
         ort.move_task(self.home, "solve", "t2", "planned", ac_file=str(ac))
         ort.review_round(self.home, "solve", "t2", "a1234567890abcdef", "REJECT")
         ort.review_round(self.home, "solve", "t2", "a1234567890abcdef", "REJECT")
-        a = drive.assess(self.home, MISSION, NOW, with_git=False)
+        a = drive.assess(self.home, MISSION, NOW, owner_rows=[], with_git=False)
         self.assertEqual(self.conds(a, "solve"), ["STUCK", "HELP_OPEN", "REVIEW_LOOP"])
         keys = [x["key"] for x in self.row(a, "solve")["actions"]]
         self.assertIn("solve:HELP_OPEN:t1", keys)
@@ -132,15 +138,15 @@ class ConditionTests(Base):
         self.write_goals()
         self.commit("fix(x): thing\n\nRefs: GoodQA goodqa#11")
         subprocess.run(["git", "-C", str(self.repo), "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
-        a = drive.assess(self.home, MISSION, time.time())
+        a = drive.assess(self.home, MISSION, time.time(), owner_rows=[])
         self.assertIn("MERGED_NOT_RELEASED", self.conds(a, "solve"))
         self.goals[0]["evidence"] = [{"kind": "deploy", "at": time.time() + 60}]
         self.write_goals()
-        self.assertNotIn("MERGED_NOT_RELEASED", self.conds(drive.assess(self.home, MISSION, time.time()), "solve"))
+        self.assertNotIn("MERGED_NOT_RELEASED", self.conds(drive.assess(self.home, MISSION, time.time(), owner_rows=[]), "solve"))
 
     def test_condition_pending_gates_never_replaces_owner(self):
         with mock.patch.object(drive, "lifecycle_state", return_value="pending"):
-            a = drive.assess(self.home, MISSION, NOW, with_git=False)
+            a = drive.assess(self.home, MISSION, NOW, owner_rows=[], with_git=False)
         self.assertEqual(self.conds(a, "solve"), ["UNOWNED", "PENDING_GATES"])
 
     def test_condition_no_capacity_action_exists(self):
@@ -185,6 +191,29 @@ class ResponseTests(Base):
         with self.assertRaises(drive.DriveError):
             drive.respond(self.home, "solve", "UNOWNED", "ticket", "goodqa#5", now=NOW)
 
+    def test_response_ticket_must_be_open(self):
+        self.owner()
+        ac = self.home / "ac.md"
+        ac.write_text("AC-1 x\nVerify by: pytest x\nNEG-1 y\n")
+        ort.add_task(self.home, "solve", "a", "ticket:goodqa#11")
+        ort.move_task(self.home, "solve", "t1", "planned", ac_file=str(ac))
+        for state in ("closed", "missing", None):
+            with self.assertRaises(drive.DriveError, msg=state):
+                drive.respond(self.home, "solve", "REVIEW_LOOP", "ticket", "goodqa#1", detail="t1", now=NOW,
+                              ticket_check=lambda ref, s=state: s)
+        drive.respond(self.home, "solve", "REVIEW_LOOP", "ticket", "goodqa#1", detail="t1", now=NOW,
+                      ticket_check=lambda ref: "open")
+
+    def test_response_raw_append_and_forged_snapshot_ignored(self):
+        drive.tick(self.home, MISSION, now=NOW, owner_rows=[])
+        for key in [a["key"] for r in drive.load_snapshot(self.home)["rows"] for a in r["actions"]]:
+            ort._append(drive._safe_dir(self.home) / "responses.jsonl", {"key": key, "ts": NOW + 2})  # unsigned
+        self.assertEqual(drive.read_responses(self.home), [])
+        (drive._safe_dir(self.home) / "snapshot.json").write_text(json.dumps({"at": NOW, "rows": []}))
+        self.assertIsNone(drive.load_snapshot(self.home))
+        out = drive.stop_decision(self.home, {"session_id": MISSION}, now=NOW + 3, is_main=True)
+        self.assertEqual(out.get("decision"), "block")
+
     def test_response_owner_needs_successful_launch(self):
         with self.assertRaises(drive.DriveError):
             drive.respond(self.home, "solve", "STALLED", "owner", now=NOW)  # no owner
@@ -192,7 +221,11 @@ class ResponseTests(Base):
         with self.assertRaises(drive.DriveError):
             drive.respond(self.home, "solve", "STALLED", "owner", now=NOW)  # no launch
         st = ort.load_state(self.home, "solve")
-        st["launches"] = [{"ts": NOW, "code": 0}]
+        st["launches"] = [{"ts": NOW - 3 * 86400, "code": 0}]  # an old launch (r1 M5)
+        ort.save_state(self.home, "solve", st)
+        with self.assertRaises(drive.DriveError):
+            drive.respond(self.home, "solve", "STALLED", "owner", now=NOW)
+        st["launches"].append({"ts": NOW, "code": 0})
         ort.save_state(self.home, "solve", st)
         drive.respond(self.home, "solve", "STALLED", "owner", now=NOW)
 
@@ -202,17 +235,75 @@ class ResponseTests(Base):
                 drive.respond(self.home, "solve", "UNOWNED", "park", source=src, now=NOW)
 
     def test_response_stale_episode_not_counted(self):
-        snap = drive.with_episodes(self.home, drive.assess(self.home, MISSION, NOW, with_git=False), prev={})
+        snap = drive.with_episodes(self.home, drive.assess(self.home, MISSION, NOW, owner_rows=[], with_git=False), prev={})
         ort._append(drive._safe_dir(self.home) / "responses.jsonl",
-                    {"key": "solve:UNOWNED", "ts": NOW - 10})  # recorded before the episode began
+                    drive._sign(self.home, {"key": "solve:UNOWNED", "ts": NOW - 10}))  # recorded before the episode began
         todo = [t["key"] for t in drive.unanswered(snap, drive.read_responses(self.home), NOW + 5)]
         self.assertIn("solve:UNOWNED", todo)
-        ort._append(drive._safe_dir(self.home) / "responses.jsonl", {"key": "solve:UNOWNED", "ts": NOW + 1})
+        ort._append(drive._safe_dir(self.home) / "responses.jsonl",
+                    drive._sign(self.home, {"key": "solve:UNOWNED", "ts": NOW + 1}))
         todo = [t["key"] for t in drive.unanswered(snap, drive.read_responses(self.home), NOW + 5)]
         self.assertNotIn("solve:UNOWNED", todo)
         todo = [t["key"] for t in drive.unanswered(snap, drive.read_responses(self.home),
                                                    NOW + drive.RESPONSE_TTL_S + 10)]
         self.assertIn("solve:UNOWNED", todo)  # expired
+
+
+class NewConditionTests(Base):
+    def test_condition_owners_unknown_never_claims_unowned(self):
+        a = drive.assess(self.home, MISSION, NOW, owner_rows=None, with_git=False)
+        self.assertNotIn("UNOWNED", self.conds(a, "solve"))
+        self.assertIn("unknown", self.row(a, "solve")["owner"])
+
+    def test_condition_blocked_user_and_release_check_off(self):
+        self.goals[0]["deferral"] = {"by": "ask", "ref": "w00000000001"}
+        self.goals[0]["repos"] = []
+        self.write_goals()
+        conds = self.conds(drive.assess(self.home, MISSION, NOW, owner_rows=[], with_git=False), "solve")
+        self.assertIn("BLOCKED_USER", conds)
+        self.assertIn("RELEASE_CHECK_OFF", conds)
+        self.assertIn("UNOWNED", conds)  # blocked on the user never excuses an ownerless goal
+
+    def test_condition_legacy_owner_stalled(self):
+        with mock.patch.object(drive, "legacy_owners", side_effect=lambda h, s, g, r: ["a1234567890abcdef0"]
+                               if g["id"] == "solve" else []), \
+                mock.patch.object(drive, "legacy_progress", return_value=NOW - 31 * 60):
+            self.assertEqual(self.conds(drive.assess(self.home, MISSION, NOW, owner_rows=[], with_git=False),
+                                        "solve"), ["STALLED"])
+
+    def test_condition_full_cap_names_a_lane_owner(self):
+        import mission_coverage as mc
+        rows = [{"agent_id": "a1234567890abcdef0"}]
+        with mock.patch.object(mc, "owner_cap", return_value=1), mock.patch.object(mc, "live_owner",
+                                                                                   return_value=True):
+            text = drive.unowned_action("solve", rows)
+        self.assertIn("add a lane to live owner a1234567890abcdef", text)
+
+
+class LegacyOwnerTests(Base):
+    """The real matcher (mission_coverage.live_owner + _matches), not a mock (red-team r1 m7)."""
+
+    def rows(self, **over):
+        row = {"agent_id": "a1234567890abcdef0", "type": "task-owner", "state": "live", "ticket": "GoodQA goodqa#11"}
+        row.update(over)
+        return [row]
+
+    def test_legacy_live_owner_by_ticket_counts(self):
+        self.assertNotIn("UNOWNED", self.conds(drive.assess(self.home, MISSION, NOW, owner_rows=self.rows(),
+                                                            with_git=False), "solve"))
+
+    def test_legacy_dead_helper_or_other_ticket_does_not_count(self):
+        for over in ({"state": "DROPPED"}, {"type": "red-team"}, {"ticket": "GoodQA goodqa#999"}):
+            conds = self.conds(drive.assess(self.home, MISSION, NOW, owner_rows=self.rows(**over), with_git=False),
+                               "solve")
+            self.assertIn("UNOWNED", conds, over)
+
+    def test_legacy_bound_agent_counts(self):
+        self.goals[0]["bound"] = ["a1234567890abcdef0"]
+        self.write_goals()
+        rows = self.rows(ticket="")
+        self.assertNotIn("UNOWNED", self.conds(drive.assess(self.home, MISSION, NOW, owner_rows=rows,
+                                                            with_git=False), "solve"))
 
 
 class StopTests(Base):
@@ -225,7 +316,7 @@ class StopTests(Base):
         self.assertEqual(out.get("decision"), "block")
         self.assertIn("solve UNOWNED", out["reason"])
         for key in [a["key"] for r in drive.load_snapshot(self.home)["rows"] for a in r["actions"]]:
-            ort._append(drive._safe_dir(self.home) / "responses.jsonl", {"key": key, "ts": NOW + 2})
+            ort._append(drive._safe_dir(self.home) / "responses.jsonl", drive._sign(self.home, {"key": key, "ts": NOW + 2}))
         self.assertEqual(drive.stop_decision(self.home, self.payload(), now=NOW + 3, is_main=True), {})
 
     def test_stop_non_main_or_other_session_never_blocked(self):
@@ -241,6 +332,15 @@ class StopTests(Base):
         self.assertEqual([o.get("decision") for o in outs].count("block"), drive.MAX_STOP_BLOCKS)
         self.assertIn("block budget spent", outs[-1]["systemMessage"])
         self.assertTrue(any(c.args[1] == "raise" for c in ring.call_args_list))
+
+    def test_stop_stale_path_keeps_episode_so_responses_count(self):
+        out = drive.stop_decision(self.home, {"session_id": MISSION}, now=NOW, is_main=True)  # no tick snapshot
+        self.assertEqual(out.get("decision"), "block")
+        for key in [a["key"] for r in drive.load_snapshot(self.home)["rows"] for a in r["actions"]]:
+            ort._append(drive._safe_dir(self.home) / "responses.jsonl", drive._sign(self.home, {"key": key, "ts": NOW + 1}))
+        for t in (2, 60, 600):  # r1 M6: before the fix the episode restarted on every Stop
+            self.assertEqual(drive.stop_decision(self.home, {"session_id": MISSION}, now=NOW + t, is_main=True), {},
+                             t)
 
     def test_stop_stale_snapshot_still_checks(self):
         out = drive.stop_decision(self.home, self.payload(), now=NOW, is_main=True)  # no snapshot at all

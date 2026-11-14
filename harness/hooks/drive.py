@@ -57,7 +57,8 @@ import owner_rt as ort  # noqa: E402
 RESPONSE_TTL_S = 4 * 3600
 SNAPSHOT_MAX_S = 30 * 60
 MAX_STOP_BLOCKS = 3
-CONDITIONS = ("IMPORTED", "UNOWNED", "STALLED", "STUCK", "HELP_OPEN", "REVIEW_LOOP", "MERGED_NOT_RELEASED",
+CONDITIONS = ("IMPORTED", "UNOWNED", "STALLED", "STUCK", "HELP_OPEN", "BLOCKED_USER", "REVIEW_LOOP",
+              "RELEASE_CHECK_OFF", "MERGED_NOT_RELEASED",
               "PENDING_GATES")
 ACTIONS = {
     "IMPORTED": "activate it (`mission_coverage.py activate --goal {g}`) or retire it with the user's words",
@@ -66,13 +67,17 @@ ACTIONS = {
     "STALLED": "resume the owner (`owner_rt.py tick`), escalate it a rung, or replace it",
     "STUCK": "the owner was relaunched with no new proof: read `owner_rt.py show --goal {g}`, re-scope or replace it",
     "HELP_OPEN": "unblock {detail}, ask the user one question, or route it to a ticket",
+    "BLOCKED_USER": "keep the one question in front of the user ({detail}) and keep every other facet moving",
+    "RELEASE_CHECK_OFF": "set the goal's repos (`mission_coverage.py set --goal {g} --repo <path>`) so merged but "
+                         "unreleased work is caught",
     "REVIEW_LOOP": "break the loop on {detail}: redesign, escalate a rung, or park it on a ticket",
     "MERGED_NOT_RELEASED": "schedule the release of {detail} (deploy + live test)",
     "PENDING_GATES": "propose its gates to the user (one AskUserQuestion naming the goal); keep building meanwhile",
 }
 RESPONSE_KINDS = {
     "IMPORTED": ("park",), "UNOWNED": ("owner", "park"), "STALLED": ("owner", "park"), "STUCK": ("owner", "park"),
-    "HELP_OPEN": ("ask", "ticket", "park"), "REVIEW_LOOP": ("ticket", "park"),
+    "HELP_OPEN": ("ask", "ticket", "park"), "REVIEW_LOOP": ("ticket", "park"), "BLOCKED_USER": ("ask", "park"),
+    "RELEASE_CHECK_OFF": ("park",),
     "MERGED_NOT_RELEASED": ("ticket", "ask", "park"), "PENDING_GATES": ("ask", "park"),
 }
 TICKET_RE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9-]{0,62})?#[1-9][0-9]{0,9}$")
@@ -216,9 +221,38 @@ def distance(goal: dict, owner, conds: set, done: bool) -> str:
     return "not started" if not owner else "owner, no tasks"
 
 
+def legacy_progress(home: Path, session: str, agents) -> float:
+    """Newest own WAL activity of the given sub-agent owners (mission_coverage.owner_progress); 0 when unknown."""
+    best = 0.0
+    for a in agents or []:
+        with contextlib.suppress(Exception):
+            best = max(best, float(_mc().owner_progress(home, session, a) or 0.0))
+    return best
+
+
+def unowned_action(gid: str, owner_rows) -> str:
+    """At or over the owner cap, name the least-loaded live owner for a lane; never 'queue' (the user: capacity is
+    arbitrary, w49d75e5fccf)."""
+    text = ACTIONS["UNOWNED"].format(g=gid, detail=gid)
+    try:
+        mc = _mc()
+        cap = mc.owner_cap()
+        live = [r for r in owner_rows or [] if mc.live_owner(r)]
+        if cap and len(live) >= cap and live:
+            name = sorted(live, key=lambda r: str(r.get("agent_id")))[0].get("agent_id", "")
+            text = (f"add a lane to live owner {str(name)[:17]} (`owner_rt.py task add` / SendMessage) or create its "
+                    f"owner anyway: " + text)
+    except Exception:  # noqa: BLE001
+        pass
+    return text
+
+
 def assess(home: Path, session: str = "", now=None, owner_rows=None, with_git: bool = True) -> dict:
+    """owner_rows None means the owner list is UNKNOWN (no fresh signed snapshot): UNOWNED and legacy STALLED are not
+    claimed then; the row says so (advisor + red-team r1 M6)."""
     now = time.time() if now is None else now
     goals = ort.mission_goals(home)
+    owners_known = owner_rows is not None
     rows_out = []
     for gid, g in goals.items():
         done = ort.goal_done(g)
@@ -230,8 +264,12 @@ def assess(home: Path, session: str = "", now=None, owner_rows=None, with_git: b
         if not done and not (status == "deferred" and _deferral_by_user(g)):
             if status == "imported":
                 conds.append(("IMPORTED", ""))
-            if owner is None and not legacy:
+            if owner is None and not legacy and owners_known:
                 conds.append(("UNOWNED", ""))
+            if owner is None and legacy and owners_known:
+                seen = legacy_progress(home, session, legacy)
+                if seen and now - seen > ort.PROOF_S:
+                    conds.append(("STALLED", ""))
             if owner and not owner.get("error"):
                 age = owner.get("proof_age_s")
                 start = max(owner.get("created_ts") or 0.0, owner.get("last_launch_ts") or 0.0)
@@ -243,6 +281,11 @@ def assess(home: Path, session: str = "", now=None, owner_rows=None, with_git: b
                     conds.append(("HELP_OPEN", f"{h['task']}: {h['need']}"))
                 for t in owner["loops"]:
                     conds.append(("REVIEW_LOOP", t))
+            deferral0 = g.get("deferral") if isinstance(g.get("deferral"), dict) else {}
+            if deferral0.get("by") == "ask":
+                conds.append(("BLOCKED_USER", f"ask {deferral0.get('ref') or '?'}"))
+            if not [r for r in (g.get("repos") or []) if isinstance(r, str)] and ticket_number(g.get("ticket")):
+                conds.append(("RELEASE_CHECK_OFF", ""))
             if with_git:
                 mts = merged_commit_ts(g)
                 if mts and mts > deploy_ts(g):
@@ -258,12 +301,14 @@ def assess(home: Path, session: str = "", now=None, owner_rows=None, with_git: b
         elif owner and owner.get("help"):
             blocker = "; ".join(f"{h['task']}: {h['need']}" for h in owner["help"])[:200]
         actions = [{"cond": c, "detail": d, "key": action_key(gid, c, d),
-                    "action": ACTIONS[c].format(g=gid, detail=d or gid)} for c, d in conds]
+                    "action": unowned_action(gid, owner_rows) if c == "UNOWNED" else
+                    ACTIONS[c].format(g=gid, detail=d or gid)} for c, d in conds]
         rows_out.append({
             "goal": gid, "title": ort.clean(g.get("title"), 80), "ticket": g.get("ticket") or "",
             "priority": g.get("priority", 9), "status": status, "lifecycle": lc, "done": done,
             "owner": ("owner_rt gen %s" % owner.get("generation")) if owner and not owner.get("error") else
-                     (("agents " + ", ".join(a[:8] for a in legacy)) if legacy else "NONE"),
+                     (("agents " + ", ".join(a[:8] for a in legacy)) if legacy else
+                      ("NONE" if owners_known else "unknown (owner list unavailable)")),
             "owner_detail": owner, "legacy_owners": legacy,
             "proof_age_s": (owner or {}).get("proof_age_s"),
             "next": (owner or {}).get("next") or (owner or {}).get("first_open") or
@@ -304,12 +349,53 @@ def responses_path(home: Path) -> Path:
     return state_dir(home) / "responses.jsonl"
 
 
-def load_snapshot(home: Path):
+def _key(home: Path, create: bool = False):
+    with contextlib.suppress(Exception):
+        return _mc().hmac_key(home, create=create)
+    return None
+
+
+def _sign(home: Path, obj: dict) -> dict:
+    key = _key(home, create=True)
+    body = {k: v for k, v in obj.items() if k != "mac"}
+    if key is not None:
+        body["mac"] = _mc()._mac(key, body)
+    return body
+
+
+def _signed_ok(home: Path, obj) -> bool:
+    """A row or snapshot counts only with a valid HMAC from the harness key (red-team r1 M4: a raw append or an
+    overwritten snapshot is not a response). Same-user threat model: the key is readable by the same user."""
+    if not isinstance(obj, dict) or not isinstance(obj.get("mac"), str):
+        return False
+    key = _key(home)
+    if key is None:
+        return False
+    import hmac as _hmac  # noqa: PLC0415
+    body = {k: v for k, v in obj.items() if k != "mac"}
+    return _hmac.compare_digest(obj["mac"], _mc()._mac(key, body))
+
+
+def load_snapshot(home: Path, goals=None):
+    """The signed snapshot, or None. A snapshot whose goal set differs from goals.json is not trusted either."""
     try:
         data = json.loads(ort._read(snapshot_path(home), 8 << 20).decode("utf-8"))
-        return data if isinstance(data, dict) and isinstance(data.get("rows"), list) else None
     except (OSError, ValueError, ort.OwnerError):
         return None
+    if not isinstance(data, dict) or not isinstance(data.get("rows"), list) or not _signed_ok(home, data):
+        return None
+    with contextlib.suppress(Exception):
+        ids = set(goals if goals is not None else ort.mission_goals(home))
+        if {r.get("goal") for r in data["rows"]} != ids:
+            return None
+    return data
+
+
+def save_snapshot(home: Path, a: dict) -> dict:
+    d = _safe_dir(home)
+    signed = _sign(home, a)
+    ort._atomic(d / "snapshot.json", signed)
+    return signed
 
 
 def with_episodes(home: Path, assessment: dict, prev=None) -> dict:
@@ -329,13 +415,19 @@ def with_episodes(home: Path, assessment: dict, prev=None) -> dict:
 def tick(home: Path, session: str = "", now=None, owner_rows=None) -> dict:
     session = session or mission_session(home)
     if owner_rows is None and session:
-        with contextlib.suppress(Exception):
-            snap = _mc().load_owner_snapshot(home, session, now)
-            owner_rows = (snap or {}).get("rows")
+        owner_rows = owner_rows_of(home, session, now)
     a = with_episodes(home, assess(home, session, now, owner_rows))
-    d = _safe_dir(home)
-    ort._atomic(d / "snapshot.json", a)
-    return a
+    a["partial"] = False
+    return save_snapshot(home, a)
+
+
+def owner_rows_of(home: Path, session: str, now=None):
+    """Rows of ops-watch's signed owner snapshot, or None when it is missing, forged or stale."""
+    with contextlib.suppress(Exception):
+        snap = _mc().load_owner_snapshot(home, session, now)
+        if snap is not None:
+            return snap.get("rows")
+    return None
 
 
 def read_responses(home: Path) -> list:
@@ -347,13 +439,22 @@ def read_responses(home: Path) -> list:
     for line in raw.splitlines():
         with contextlib.suppress(ValueError):
             r = json.loads(line)
-            if isinstance(r, dict):
+            if isinstance(r, dict) and _signed_ok(home, r):
                 out.append(r)
     return out
 
 
+def episode_start(home: Path, key: str, now: float) -> float:
+    snap = load_snapshot(home) or {}
+    for r in snap.get("rows") or []:
+        for a in r.get("actions") or []:
+            if a.get("key") == key and isinstance(a.get("since"), (int, float)):
+                return float(a["since"])
+    return now - 3600  # no episode on record: a launch must be from the last hour
+
+
 def check_response(home: Path, goal_id: str, cond: str, kind: str, ref: str, source: str, session: str,
-                   goal: dict, now: float) -> str:
+                   goal: dict, now: float, since=None, ticket_check=None) -> str:
     """'' when the response is a fact for this goal and condition; else why not."""
     if cond not in CONDITIONS:
         return f"unknown condition {cond}"
@@ -372,12 +473,16 @@ def check_response(home: Path, goal_id: str, cond: str, kind: str, ref: str, sou
             st = ort.load_state(home, goal_id)
         except Exception:  # noqa: BLE001
             return f"goal {goal_id} has no owner_rt owner"
-        launches = st.get("launches") or []
-        if not launches or launches[-1].get("code") != 0:
-            return "the owner has no successful launch"
+        since = now - 3600 if since is None else since
+        ok = [x for x in st.get("launches") or [] if x.get("code") == 0 and float(x.get("ts", 0)) >= since]
+        if not ok:
+            return "the owner has no successful launch since this condition appeared"
         return ""
     if kind == "ticket":
-        return "" if TICKET_RE.match(ref or "") else "ticket ref must look like goodqa#123"
+        if not TICKET_RE.match(ref or ""):
+            return "ticket ref must look like goodqa#123"
+        state = (ticket_check or _mc().ticket_state)(ref)
+        return "" if state == "open" else f"ticket {ref} is not open ({state or 'unknown'})"
     if kind == "park":
         if not mc.verify_user_source(source):
             return "a park needs a user:/answer: source that resolves to the user's own words"
@@ -389,20 +494,21 @@ def check_response(home: Path, goal_id: str, cond: str, kind: str, ref: str, sou
 
 
 def respond(home: Path, goal_id: str, cond: str, kind: str, ref: str = "", source: str = "", detail: str = "",
-            now=None) -> dict:
+            now=None, ticket_check=None) -> dict:
     now = time.time() if now is None else now
     goals = ort.mission_goals(home)
     if goal_id not in goals:
         raise DriveError(f"goal {goal_id} is not in goals.json")
     session = mission_session(home)
-    problem = check_response(home, goal_id, cond, kind, ref, source, session, goals[goal_id], now)
-    if problem:
-        raise DriveError(problem)
     if cond in ("HELP_OPEN", "REVIEW_LOOP") and not detail:
         raise DriveError(f"{cond} needs --detail <task id>")
     key = action_key(goal_id, cond, detail)
-    row = {"goal": goal_id, "cond": cond, "key": key, "kind": kind, "ref": ort.clean(ref, 120),
-           "source": ort.clean(source, 300), "ts": now, "at": ort.now_iso(now)}
+    problem = check_response(home, goal_id, cond, kind, ref, source, session, goals[goal_id], now,
+                             since=episode_start(home, key, now), ticket_check=ticket_check)
+    if problem:
+        raise DriveError(problem)
+    row = _sign(home, {"goal": goal_id, "cond": cond, "key": key, "kind": kind, "ref": ort.clean(ref, 120),
+                       "source": ort.clean(source, 300), "ts": now, "at": ort.now_iso(now)})
     d = _safe_dir(home)
     ort._append(d / "responses.jsonl", row)
     return row
@@ -495,13 +601,19 @@ def stop_decision(home: Path, payload: dict, now=None, is_main=None) -> dict:
     if not is_main:
         return {}
     session = str(payload.get("session_id") or "").lower()
-    mission = mission_session(home)
+    mission = mission_session(home).lower()
     if not mission or mission != session:
         return {}
     snap = load_snapshot(home)
-    stale = snap is None or not 0 <= now - float(snap.get("at", 0)) <= SNAPSHOT_MAX_S
-    if stale:  # cheap live view: no owner scan, no git; never a reason to pass silently
-        snap = with_episodes(home, assess(home, session, now, None, with_git=False), prev=snap or {})
+    stale = snap is None or bool(snap.get("partial")) or not 0 <= now - float(snap.get("at", 0)) <= SNAPSHOT_MAX_S
+    if stale:  # cheap live view: signed owner list if fresh, no git; episodes persist in a partial snapshot
+        live = with_episodes(home, assess(home, session, now, owner_rows_of(home, session, now), with_git=False),
+                             prev=snap or {})
+        live["partial"] = True
+        with contextlib.suppress(Exception):
+            if snap is None or snap.get("partial"):
+                live = save_snapshot(home, live)  # never overwrite a full tick snapshot with a partial one
+        snap = live
     todo = unanswered(snap, read_responses(home), now)
     if not todo:
         _ring(home, "clear", "drive: every initiative action answered", {})

@@ -121,6 +121,14 @@ class ConvergeLoopTests(Base):
             ort.move_task(self.home, "solve", "t1", "building")
         with self.assertRaises(ort.OwnerError):
             ort.move_task(self.home, "solve", "t1", "converged", reviewer="a1234567890abcdef", verdict="REJECT")
+        with self.assertRaises(ort.OwnerError):  # no recorded review round yet (r1 m2)
+            ort.move_task(self.home, "solve", "t1", "converged", reviewer="a1234567890abcdef", verdict="ACCEPT")
+        ort.review_round(self.home, "solve", "t1", "a1234567890abcdef", "REJECT")
+        with self.assertRaises(ort.OwnerError):  # latest round is a REJECT
+            ort.move_task(self.home, "solve", "t1", "converged", reviewer="a1234567890abcdef", verdict="ACCEPT")
+        ort.review_round(self.home, "solve", "t1", "a1234567890abcdef", "ACCEPT")
+        with self.assertRaises(ort.OwnerError):  # a different reviewer than the one who accepted
+            ort.move_task(self.home, "solve", "t1", "converged", reviewer="b1234567890abcdef", verdict="ACCEPT")
         ort.move_task(self.home, "solve", "t1", "converged", reviewer="a1234567890abcdef", verdict="ACCEPT")
         ort.move_task(self.home, "solve", "t1", "building")
 
@@ -158,12 +166,20 @@ class ConvergeLoopTests(Base):
 
     def test_done_needs_resolving_evidence(self):
         ort.move_task(self.home, "solve", "t1", "planned", ac_file=str(self.ac))
+        ort.review_round(self.home, "solve", "t1", "a1234567890abcdef", "ACCEPT")
         ort.move_task(self.home, "solve", "t1", "converged", reviewer="a1234567890abcdef", verdict="ACCEPT")
         ort.move_task(self.home, "solve", "t1", "building")
         ort.move_task(self.home, "solve", "t1", "verifying")
         with self.assertRaises(ort.OwnerError):
             ort.move_task(self.home, "solve", "t1", "done", evidence=["commit:deadbeefdeadbeef"])
-        ort.move_task(self.home, "solve", "t1", "done", evidence=[f"commit:{self.sha}"])
+        with self.assertRaises(ort.OwnerError):  # the repo's first commit predates the task (r1 M8)
+            ort.move_task(self.home, "solve", "t1", "done", evidence=[f"commit:{self.sha}"])
+        time.sleep(1.1)
+        subprocess.run(["git", "-C", str(self.repo), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                        "--allow-empty", "-m", "work"], check=True)
+        new = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD"], capture_output=True,
+                             text=True).stdout.strip()
+        ort.move_task(self.home, "solve", "t1", "done", evidence=[f"commit:{new}"])
 
 
 class ProofTests(Base):
@@ -179,8 +195,24 @@ class ProofTests(Base):
         self.set_session()
         wal = self.home / ".claude" / "wals" / SID
         wal.mkdir(parents=True)
-        (wal / "main.jsonl").write_text(json.dumps({"event": "check", "id": "w0123456789a"}) + "\n")
+        (wal / "main.jsonl").write_text(json.dumps({"event": "check", "id": "w0123456789a",
+                                                     "at": ort.now_iso()}) + "\n")
         ort.beat(self.home, "solve", ["wal:w0123456789a"], "")
+
+    def test_proof_old_evidence_cannot_reset_clock_or_clear_stuck(self):
+        self.init()
+        ort.beat(self.home, "solve", [f"commit:{self.sha}"], "first")
+        st = ort.load_state(self.home, "solve")
+        st["stuck"], st["no_progress_launches"] = True, 3
+        ort.save_state(self.home, "solve", st)
+        with self.assertRaises(ort.OwnerError):  # same commit again, made before the last proof
+            ort.beat(self.home, "solve", [f"commit:{self.sha}"], "again", now=time.time() + 5)
+        self.assertTrue(ort.load_state(self.home, "solve")["stuck"])
+
+    def test_proof_first_beat_rejects_stale_commit(self):
+        self.init()
+        with self.assertRaises(ort.OwnerError):
+            ort.beat(self.home, "solve", [f"commit:{self.sha}"], "", now=time.time() + 3 * 3600)
 
     def test_proof_age_29_and_31_minutes(self):
         self.init()
@@ -203,6 +235,15 @@ class SubagentStopTests(Base):
 
     def decide(self, sid=SID, now=None):
         return ort.stop_decision(self.home, {"session_id": sid, "hook_event_name": "Stop"}, now=now)
+
+    def test_subagent_stop_unrecorded_session_in_owner_workspace_is_gated_and_adopted(self):
+        other = "99999999-2222-3333-4444-555555555555"
+        ort.add_task(self.home, "solve", "x", "ticket:goodqa#2")
+        out = ort.stop_decision(self.home, {"session_id": other, "cwd": str(self.repo)})
+        self.assertEqual(out.get("decision"), "block")
+        self.assertEqual(ort.load_state(self.home, "solve")["session_id"], other)
+        self.assertEqual(ort.stop_decision(self.home, {"session_id": "88888888-2222-3333-4444-555555555555",
+                                                       "cwd": str(self.home)}), {})  # another directory
 
     def test_subagent_stop_non_owner_session_never_blocked(self):
         ort.add_task(self.home, "solve", "x", "ticket:goodqa#2")
@@ -261,6 +302,9 @@ class TickTests(Base):
         self.set_session()
         (self.home / ".agent-harness" / "owners" / "runtime.json").write_text(json.dumps({"enabled": True}))
         self.calls, self.cwds = [], []
+        p = mock.patch.object(ort, "claude_bin", return_value="claude")
+        p.start()
+        self.addCleanup(p.stop)
         self.sessions = [{"id": "8d84dcef", "sessionId": SID, "pid": 1, "status": "idle", "state": "done"}]
 
     def runner(self, argv, timeout=60, cwd=None):
@@ -297,6 +341,58 @@ class TickTests(Base):
         self.assertNotIn("--resume", launch)
         self.assertIn("OWNER CHARTER", launch[-1])
         self.assertEqual(ort.load_state(self.home, "solve")["generation"], 1)
+
+    def test_tick_observed_busy_states_never_stopped(self):
+        # observed live: mid-turn, and turn ended while a background sub-agent runs, both read busy/working
+        self.sessions[0].update(status="busy", state="working")
+        ort.add_task(self.home, "solve", "fix login", "ticket:goodqa#2")
+        self.assertEqual(ort.tick(self.home, now=NOW, runner=self.runner)[0]["reason"], "running")
+        self.assertFalse([c for c in self.calls if c[1:2] == ["stop"] or "--bg" in c])
+
+    def test_tick_finds_owner_by_name_and_stops_every_idle_duplicate(self):
+        self.sessions.append({"id": "aa11bb22", "sessionId": "other-0001", "pid": 2, "status": "idle", "state": "done",
+                              "name": "owner-solve"})
+        ort.add_task(self.home, "solve", "fix login", "ticket:goodqa#2")
+        ort.tick(self.home, now=NOW, runner=self.runner)
+        stops = [c[2] for c in self.calls if c[1:2] == ["stop"]]
+        self.assertEqual(sorted(stops), ["8d84dcef", "aa11bb22"])
+
+    def test_tick_unknown_name_session_busy_blocks_second_launch(self):
+        st = ort.load_state(self.home, "solve")
+        st["session_id"] = ""  # id lookup failed after the last launch
+        ort.save_state(self.home, "solve", st)
+        self.sessions[:] = [{"id": "aa11bb22", "sessionId": "x", "pid": 2, "status": "busy", "state": "working",
+                             "name": "owner-solve"}]
+        ort.add_task(self.home, "solve", "fix login", "ticket:goodqa#2")
+        self.assertEqual(ort.tick(self.home, now=NOW, runner=self.runner)[0]["reason"], "running")
+
+    def test_tick_every_launch_is_a_generation_and_lost_id_cleared(self):
+        def runner(argv, timeout=60, cwd=None):
+            if argv[1:2] == ["agents"]:
+                return 0, json.dumps(self.sessions)  # the new session is not listed: lookup fails
+            return (0, "backgrounded · c9f43044 · owner-solve") if "--bg" in argv else (0, "")
+        ort.add_task(self.home, "solve", "fix login", "ticket:goodqa#2")
+        ort.tick(self.home, now=NOW, runner=runner)
+        st = ort.load_state(self.home, "solve")
+        self.assertEqual((st["generation"], st["session_id"]), (1, ""))
+
+    def test_tick_prompt_cites_inbox_head(self):
+        ort.add_task(self.home, "solve", "fix login", "ticket:goodqa#2")
+        ort.tick(self.home, now=NOW, runner=self.runner)
+        prompt = [c for c in self.calls if "--bg" in c][0][-1]
+        self.assertIn("Inbox head: " + ort.inbox_head(self.home, "solve"), prompt)
+
+    def test_flags_unstick_pause(self):
+        st = ort.load_state(self.home, "solve")
+        st["stuck"], st["no_progress_launches"] = True, 3
+        ort.save_state(self.home, "solve", st)
+        with self.assertRaises(ort.OwnerError):
+            ort.set_flag(self.home, "solve", "pause", "inferred:from x -- y")
+        ort.set_flag(self.home, "solve", "unstick", "ticket:goodqa#2")
+        self.assertFalse(ort.load_state(self.home, "solve")["stuck"])
+        ort.set_flag(self.home, "solve", "pause", "ticket:goodqa#2")
+        ort.add_task(self.home, "solve", "fix login", "ticket:goodqa#2")
+        self.assertIn("paused", ort.tick(self.home, now=NOW, runner=self.runner)[0]["reason"])
 
     def test_tick_busy_owner_left_alone(self):
         self.sessions[0].update(status="busy", state="running")
@@ -346,6 +442,119 @@ class TickTests(Base):
         out = ort.tick(self.home, now=NOW, runner=runner)
         self.assertEqual(out[0]["action"], "launch-failed")
         self.assertIn("trusted", (self.home / ".agent-harness/owners/solve/launch.log").read_text())
+
+
+class HardeningTests(Base):
+    """Red-team r1 fixes: M1 M2 M3 M7 M8 m4."""
+
+    def write_runtime(self, data):
+        root = self.home / ".agent-harness" / "owners"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "runtime.json").write_text(json.dumps(data))
+
+    def test_runtime_claude_field_ignored_and_brakes_clamped(self):
+        self.write_runtime({"enabled": True, "claude": "/tmp/evil.sh", "min_gap_s": 0, "max_launches_per_hour": 999,
+                            "fresh_bytes": 1})
+        with mock.patch.object(ort, "claude_bin", return_value="/x/claude"):
+            cfg = ort.runtime(self.home)
+        self.assertEqual(cfg["claude"], "/x/claude")
+        self.assertEqual((cfg["min_gap_s"], cfg["max_launches_per_hour"], cfg["fresh_bytes"]), (120, 6, 200_000))
+
+    def test_runtime_disabled_runs_no_program(self):
+        self.write_runtime({"enabled": False})
+        self.init()
+        ort.add_task(self.home, "solve", "x", "ticket:goodqa#2")
+        calls = []
+        out = ort.tick(self.home, now=NOW, runner=lambda *a, **k: calls.append(a) or (0, "[]"))
+        self.assertEqual(calls, [])
+        self.assertEqual(out[0]["action"], "would-launch")
+
+    def test_runtime_bypass_needs_user_words(self):
+        self.write_runtime({"enabled": True, "permission_mode": "bypassPermissions"})
+        self.assertEqual(ort.runtime(self.home)["permission_mode"], "auto")
+        self.write_runtime({"enabled": True, "permission_mode": "bypassPermissions",
+                            "permission_source": "answer:s/u \"Bypass, like main\""})
+        with mock.patch.object(ort, "user_decided", return_value=True):
+            self.assertEqual(ort.runtime(self.home)["permission_mode"], "bypassPermissions")
+
+    def test_model_top_rungs_refused(self):
+        for bad in ("fable", "astra", "claude-fable-5", "x; rm"):
+            with self.assertRaises(ort.OwnerError, msg=bad):
+                ort.init_owner(self.home, "solve", str(self.repo), "ticket:goodqa#1", model=bad)
+        ort.init_owner(self.home, "solve", str(self.repo), "ticket:goodqa#1", model="opus")
+
+    def test_ac_file_fifo_and_huge_refused(self):
+        fifo = self.home / "fifo"
+        os.mkfifo(fifo)
+        self.assertIn("regular", ort.ac_file_problem(str(fifo)))
+        big = self.home / "big.md"
+        big.write_text("AC-1 x\nVerify by: y z\nNEG-1 q\n" + "x" * 300_000)
+        self.assertIn("larger", ort.ac_file_problem(str(big)))
+
+    def test_proof_wal_row_must_be_a_proof_event(self):
+        self.init()
+        self.set_session()
+        wal = self.home / ".claude" / "wals" / SID
+        wal.mkdir(parents=True)
+        (wal / "main.jsonl").write_text(json.dumps({"event": "intent", "id": "w0123456789b", "at": ort.now_iso()})
+                                        + "\n")
+        with self.assertRaises(ort.OwnerError):
+            ort.beat(self.home, "solve", ["wal:w0123456789b"], "")
+
+    def test_cli_main_only_commands_need_main_stamp(self):
+        self.init()
+        import caller_identity
+        with mock.patch.object(caller_identity, "take_stamp", return_value=None):
+            for argv in (["init", "--goal", "x", "--cwd", ".", "--source", "ticket:goodqa#1"],
+                         ["task", "add", "--goal", "solve", "--text", "t", "--source", "ticket:goodqa#1"],
+                         ["pause", "--goal", "solve", "--source", "ticket:goodqa#1"],
+                         ["task", "move", "--goal", "solve", "--task", "t1", "--to", "dropped"]):
+                with mock.patch("sys.stderr"):
+                    self.assertEqual(ort.main(argv), 2, argv)
+        self.assertEqual(ort.inbox_rows(self.home, "solve"), [])
+
+    def test_cli_task_add_by_owner_session_or_main(self):
+        self.init()
+        self.set_session()
+        import caller_identity
+        import mission_coverage
+        argv = ["task", "add", "--goal", "solve", "--text", "t", "--source", "ticket:goodqa#1"]
+        with mock.patch.object(mission_coverage, "mission_session_of", return_value="main-session-0000"), \
+                mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            with mock.patch.object(caller_identity, "take_stamp", return_value={"session": SID}):
+                self.assertEqual(ort.main(argv), 0)  # the goal's own owner session
+            with mock.patch.object(caller_identity, "take_stamp", return_value={"session": "main-session-0000"}):
+                self.assertEqual(ort.main(argv), 0)  # main
+            with mock.patch.object(caller_identity, "take_stamp", return_value={"session": "other-owner-0000"}):
+                self.assertEqual(ort.main(argv), 2)  # another owner's session
+            with mock.patch.object(caller_identity, "take_stamp", return_value={"session": SID}):
+                self.assertEqual(ort.main(["pause", "--goal", "solve", "--source", "ticket:goodqa#1"]), 2)
+
+
+class MissionGateStampTests(unittest.TestCase):
+    def test_gate_stamps_only_guarded_owner_commands_with_matching_key(self):
+        import mission_gate
+        line = "python3 ~/.claude/hooks/owner_rt.py task add --goal solve --text 'fix it' --source ticket:goodqa#1"
+        got = mission_gate.owner_stamps_for(line)
+        argv = ["task", "add", "--goal", "solve", "--text", "fix it", "--source", "ticket:goodqa#1"]
+        self.assertEqual(got, [("task add", ort.argv_key(argv))])
+        for line in ("echo python3 owner_rt.py init --goal x", "python3 owner_rt.py beat --goal x --evidence a:b",
+                     "cat owner_rt.py | grep init", "python3 owner_rt.py show --goal x"):
+            self.assertEqual(mission_gate.owner_stamps_for(line), [], line)
+
+    def test_gate_pretool_writes_owner_stamp_for_main_only(self):
+        import caller_identity
+        import mission_gate
+        payload = {"tool_name": "Bash", "session_id": "s1", "tool_use_id": "toolu_0123456789abcdefABCDEF",
+                   "tool_input": {"command": "python3 owner_rt.py pause --goal solve --source ticket:goodqa#1"}}
+        with mock.patch.object(caller_identity, "put_stamp") as put:
+            with mock.patch.object(caller_identity, "is_main", return_value=False):
+                mission_gate.cmd_pretool(payload)
+            self.assertFalse(put.called)
+            with mock.patch.object(caller_identity, "is_main", return_value=True):
+                mission_gate.cmd_pretool(payload)
+        self.assertEqual(put.call_args.args[0], "owner-main")
+        self.assertEqual(put.call_args.args[1][0], "pause")
 
 
 if __name__ == "__main__":

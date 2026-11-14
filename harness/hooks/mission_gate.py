@@ -45,6 +45,7 @@ OWNER_SCAN_BUDGET_S = 9  # the hook has 15 s; `ah owners` took ~24 s on a 2,089-
 VALVE_KEY = "mission:gate-valve"
 SCAN_KEY = "mission:scan:unavailable"
 STAMP_PURPOSE = "mission-main"
+OWNER_STAMP_PURPOSE = "owner-main"  # owner_rt.STAMP_PURPOSE
 MAIN_ONLY = ("set", "defer", "import-initiatives", "reseal", "activate", "set-session", "bind", "retire",
              "attach")
 
@@ -107,6 +108,37 @@ from shellwords import (HEREDOCS, OPERATOR_START, OPERATORS, REDIRECTS, SEPARATO
                         shell_tokens, simple_commands)
 
 
+def script_argv(words: list, script: str):
+    """The argv after `script` when this simple command runs it at command position (see mission_argv)."""
+    i = 0
+    while i < len(words) and ASSIGN.match(words[i]):
+        i += 1
+    if i < len(words) and PYTHON.match(os.path.basename(words[i])):
+        i += 1
+        while i < len(words) and re.match(r"^-[A-Za-z]+$", words[i]) and words[i] not in ("-c", "-m"):
+            i += 1
+    if i < len(words) and os.path.basename(words[i]) == script:
+        return words[i + 1:]
+    return None
+
+
+def owner_stamps_for(cmd: str) -> list:
+    """[(command name, argv key)] for each main-only owner_rt.py command this Bash line runs (goodqa#15968): init,
+    pause, unpause, unstick, task add, task drop. Same parsing rules as stamps_for; owner_rt.authorize consumes them."""
+    import owner_rt  # noqa: PLC0415
+    out = []
+    for words in simple_commands(cmd):
+        argv = script_argv(words, "owner_rt.py")
+        if not argv or any(getattr(w, "computed", False) for w in argv):
+            continue
+        argv = [os.path.expanduser(w) if getattr(w, "tilde", False) and (w == "~" or w.startswith("~/")) else str(w)
+                for w in argv]
+        name = owner_rt.guarded_name(argv)
+        if name in owner_rt.GUARDED:
+            out.append((name, owner_rt.argv_key(argv)))
+    return out
+
+
 def mission_argv(words: list):
     """The argv after the script when this simple command runs mission_coverage.py itself (`[VAR=x ...] [python3
     [-flags]] .../mission_coverage.py SUB ...`); None when the script name is only an argument (echo, grep, cat)."""
@@ -152,7 +184,7 @@ def cmd_pretool(payload: dict) -> dict:
         return {}
     tool_input = payload.get("tool_input")
     cmd = str((tool_input if isinstance(tool_input, dict) else {}).get("command") or "")
-    if "mission_coverage" not in cmd:
+    if "mission_coverage" not in cmd and "owner_rt" not in cmd:
         return {}
     import caller_identity  # noqa: PLC0415
     if not caller_identity.is_main(payload):
@@ -161,9 +193,13 @@ def cmd_pretool(payload: dict) -> dict:
     tool_use_id = payload.get("tool_use_id")
     if not isinstance(tool_use_id, str) or not caller_identity.TOOL_USE_ID.match(tool_use_id):
         return {}  # F1: a stamp must be bound to this one call; without its id there is nothing to bind to
-    for sub, key in stamps_for(cmd)[:10]:
+    for sub, key in stamps_for(cmd)[:10] if "mission_coverage" in cmd else []:
         caller_identity.put_stamp(STAMP_PURPOSE, [sub, key], session=session, home=home_dir(),
                                   tool_use_id=tool_use_id, transcript=str(payload.get("transcript_path") or ""))
+    if "owner_rt" in cmd:  # goodqa#15968: the owner runtime's main-only commands, under their own purpose
+        for name, key in owner_stamps_for(cmd)[:10]:
+            caller_identity.put_stamp(OWNER_STAMP_PURPOSE, [name, key], session=session, home=home_dir(),
+                                      tool_use_id=tool_use_id, transcript=str(payload.get("transcript_path") or ""))
     return {}
 
 
