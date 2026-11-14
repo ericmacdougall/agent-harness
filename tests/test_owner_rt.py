@@ -260,11 +260,13 @@ class TickTests(Base):
         self.init()
         self.set_session()
         (self.home / ".agent-harness" / "owners" / "runtime.json").write_text(json.dumps({"enabled": True}))
-        self.calls = []
+        self.calls, self.cwds = [], []
         self.sessions = [{"id": "8d84dcef", "sessionId": SID, "pid": 1, "status": "idle", "state": "done"}]
 
-    def runner(self, argv, timeout=60):
+    def runner(self, argv, timeout=60, cwd=None):
         self.calls.append(argv)
+        if "--bg" in argv:
+            self.cwds.append(cwd)
         if argv[1:2] == ["agents"]:
             return 0, json.dumps(self.sessions + [{"id": "c9f43044", "sessionId": "new-session-id-0001"}])
         if "--bg" in argv:
@@ -286,6 +288,7 @@ class TickTests(Base):
         self.assertEqual(st["bg_id"], "c9f43044")
         self.assertEqual(st["session_id"], "new-session-id-0001")
         self.assertIn(["claude", "stop", "8d84dcef"], self.calls)
+        self.assertEqual(self.cwds, [str(self.repo.resolve())])  # launched in the owner's workspace (live G2 bug)
 
     def test_tick_fresh_generation_when_transcript_missing(self):
         ort.add_task(self.home, "solve", "fix login", "ticket:goodqa#2")
@@ -333,7 +336,7 @@ class TickTests(Base):
         self.assertEqual(ort.tick(self.home, now=NOW, runner=self.runner)[0]["reason"], "goal done")
 
     def test_tick_untrusted_workspace_failure_logged(self):
-        def runner(argv, timeout=60):
+        def runner(argv, timeout=60, cwd=None):
             if argv[1:2] == ["agents"]:
                 return 0, json.dumps(self.sessions)
             if "--bg" in argv:

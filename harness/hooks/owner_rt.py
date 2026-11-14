@@ -96,6 +96,15 @@ PERMISSION_MODES = ("auto", "acceptEdits", "default", "dontAsk", "bypassPermissi
 SCRIPT = "python3 ~/.claude/hooks/owner_rt.py"
 
 
+def script_cmd() -> str:
+    """The command an owner session must run: the installed path, or this file when it runs from elsewhere (a
+    checkout), prefixed with AH_HOME when this process uses a non-default home, so the owner writes the same state."""
+    here = Path(__file__).resolve()
+    base = SCRIPT if here == (Path.home() / ".claude" / "hooks" / "owner_rt.py").resolve() else f"python3 {here}"
+    ah_home = os.environ.get("AH_HOME")
+    return f"AH_HOME={ah_home} {base}" if ah_home and Path(ah_home) != Path.home() else base
+
+
 class OwnerError(ValueError):
     pass
 
@@ -533,30 +542,31 @@ def owner_prompt(home: Path, goal: str, resume: bool = False) -> str:
                   for t in sorted(tmap.values(), key=lambda t: t["id"]) if t["state"] not in ("done", "dropped")]
     cp = (state.get("checkpoint") or {}).get("text", "")
     g = f"--goal {goal}"
+    cmd = script_cmd()
     head = ("OWNER RESUME (owner_rt tick, not typed by the user). " if resume else
             "OWNER CHARTER (owner_rt, written by the harness, not typed by the user). ")
     lines = [
         head + f"You are the long-lived owner of goal `{goal}`: {state.get('title', '')} "
         f"(ticket {state.get('ticket') or 'none'}). You own its delivery until the user declares it done; tasks come "
         f"and go, you stay.",
-        f"State: {goal_dir(home, goal)}/state.json; inbox: `{SCRIPT} show {g}`.",
+        f"State: {goal_dir(home, goal)}/state.json; inbox: `{cmd} show {g}`.",
         "Open tasks:" if open_lines else "Open tasks: none queued. Find the next step toward live from the ticket and "
         "the ledger, add it as a task, and work it.",
         *open_lines,
         f"Last checkpoint: {cp[:800]}" if cp else "No checkpoint yet.",
         "How you work, every time:",
         f"  1. Plan each task; write an AC file (AC-n lines each with `Verify by:`, plus NEG-n cases); "
-        f"`{SCRIPT} task move {g} --task tN --to planned --ac-file F`.",
+        f"`{cmd} task move {g} --task tN --to planned --ac-file F`.",
         f"  2. Get adversarial convergence before building: spawn a reviewer one rung above the builder; record each "
-        f"round with `{SCRIPT} task round {g} --task tN --reviewer <agent id> --verdict ACCEPT|REJECT`; then "
+        f"round with `{cmd} task round {g} --task tN --reviewer <agent id> --verdict ACCEPT|REJECT`; then "
         f"`task move --to converged --reviewer <id> --verdict ACCEPT`. Two rejected rounds = a loop: "
         f"`task break --how redesign|escalate|park`.",
         "  3. Delegate building, fixing and testing to sub-agents; integrate, verify and push each green step.",
-        f"  4. Prove progress at least every 30 minutes: `{SCRIPT} beat {g} --evidence commit:<sha> "
+        f"  4. Prove progress at least every 30 minutes: `{cmd} beat {g} --evidence commit:<sha> "
         f"--evidence wal:<id> --next \"...\"`. Post checkpoints to the ticket.",
-        f"  5. A blocked facet is a help request, never a pause: `{SCRIPT} task move {g} --task tN --to blocked "
+        f"  5. A blocked facet is a help request, never a pause: `{cmd} task move {g} --task tN --to blocked "
         f"--help \"what you need\"`, then keep working every other task.",
-        f"  6. Before you end a turn: `{SCRIPT} checkpoint {g} --text \"...\"`. The Stop hook refuses an end while "
+        f"  6. Before you end a turn: `{cmd} checkpoint {g} --text \"...\"`. The Stop hook refuses an end while "
         "any task is actionable. You will be resumed automatically.",
         "Follow CLAUDE.md, the repo rules and every guard. Done means deployed to live and tested live; only the user "
         "declares the goal done.",
@@ -566,8 +576,8 @@ def owner_prompt(home: Path, goal: str, resume: bool = False) -> str:
 
 # ------------------------------------------------------------------ tick (lifetime)
 
-def _run(argv, timeout=60):
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+def _run(argv, timeout=60, cwd=None):
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, cwd=cwd)
     return r.returncode, (r.stdout or "") + (r.stderr or "")
 
 
@@ -664,7 +674,7 @@ def tick_one(home: Path, goal: str, goal_row: dict, cfg: dict, sessions: list, n
             for a in sessions:
                 if a.get("sessionId") == state.get("session_id") and a.get("id"):
                     runner([cfg["claude"], "stop", str(a["id"])], 30)
-        code, text = runner(argv + [prompt], 90)
+        code, text = runner(argv + [prompt], 90, cwd=state["cwd"])  # the session's workspace is its cwd
         m = re.search(r"backgrounded\s*\S*\s*([0-9a-f]{6,12})", text)
         entry = {"ts": now, "at": now_iso(now), "reason": reason, "fresh": fresh, "code": code,
                  "bg_id": m.group(1) if m else "", "out": clean(text, 200)}
