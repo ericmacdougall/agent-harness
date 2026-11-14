@@ -1875,6 +1875,28 @@ def check_idle_guard(cfg, state, runner, now):
     return out
 
 
+def check_drive(cfg, state, runner, now):
+    """goodqa#15968: the owner runtime tick (owner_rt: resume idle owners that have work due) and the drive loop
+    (drive.py): one high alert drive:<goal>:<condition> per initiative action with no counting response, plus
+    owner:<goal>:stuck|launch-failed|error. When the unanswered set gains a key it wakes main through Mission Control
+    (drive.notify_main). Silent on a host without a goals file and without owners."""
+    home = Path(home_of(cfg))
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import drive  # noqa: PLC0415 - installed beside this file
+    except ImportError as error:
+        return [alert("drive", "drive:unavailable", "warning",
+                      f"drive.py/owner_rt.py are not installed beside ops_watch.py ({type(error).__name__}); the drive "
+                      "loop and owner resume are off", {"fix": "reinstall the harness"})]
+    alerts = drive.ops_alerts(home, now)
+    keys = sorted(a["key"] for a in alerts if a["key"].startswith("drive:"))
+    seen = [k for k in state.get("drive_notified") or [] if isinstance(k, str)]
+    if set(keys) - set(seen):
+        drive.notify_main(home, sorted(set(keys) - set(seen)))
+    state["drive_notified"] = keys
+    return [alert(a["check"], a["key"], a["severity"], a["message"], a.get("detail") or {}) for a in alerts]
+
+
 def check_mission(cfg, state, runner, now):
     """Mission coverage (goodqa#15565): mission:<goal>:uncovered (high, stop_block) and mission:<goal>:stalled
     (warning) from mission_coverage.assess for the mission session (goals.json mission_session);
@@ -2060,6 +2082,7 @@ DEFAULT_CHECKS = {
     "deploys": lambda c, s, r, n: check_deploys(c, s, r, n) if (c.get("deploys") or {}).get("enabled", True) else [],
     "idle_guard": lambda c, s, r, n: check_idle_guard(c, s, r, n) if (c.get("idle_guard") or {}).get("enabled", True) else [],
     "mission": lambda c, s, r, n: check_mission(c, s, r, n) if (c.get("mission") or {}).get("enabled", True) else [],
+    "drive": lambda c, s, r, n: check_drive(c, s, r, n) if (c.get("drive") or {}).get("enabled", True) else [],
 }
 RUN_CHECK = "_run"    # internal errors; cleared by any completed run
 SINK_CHECK = "_sink"  # delivery failures; cleared when that sink recovers

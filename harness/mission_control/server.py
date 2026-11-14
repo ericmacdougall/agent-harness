@@ -478,9 +478,31 @@ class App:
         return {"version": VERSION, "started": ev.iso(self.started), "host": "demo" if self.demo else ev.HOST,
                 "initiatives": self.initiatives.snapshot(), "owners": self.owners.rows,
                 "health": self.health.snapshot(), "events": self.hub.recent(limit=200),
-                "chat": self.chat_snapshot(), "asks": self.asks.snapshot(),
+                "chat": self.chat_snapshot(), "asks": self.asks.snapshot(), "drive": self.drive_snapshot(),
                 "limits": {"chat_max": mc_chat.MAX_TEXT, "approval_note_max": mc_chat.APPROVAL_NOTE_MAX,
                            "approval_ttl_s": mc_chat.APPROVAL_TTL_S}}
+
+    def drive_snapshot(self) -> dict:
+        """The drive table (goodqa#15968) as ops_watch's drive tick last wrote it, with each action marked required or
+        answered. Read only; never computed here. {} in demo mode or when the drive loop is not installed."""
+        if self.demo:
+            return {}
+        try:
+            import drive  # noqa: PLC0415 - installed in the hooks directory
+            home = Path(os.environ.get("AH_HOME") or Path.home())
+            snap = drive.load_snapshot(home)
+            if not snap:
+                return {"rows": [], "state": "no-snapshot"}
+            open_keys = {a["key"] for a in drive.unanswered(snap, drive.read_responses(home), time.time())}
+            rows = []
+            for r in snap.get("rows", [])[:200]:
+                rows.append({k: r.get(k) for k in ("goal", "title", "ticket", "status", "lifecycle", "owner",
+                                                    "proof_age_s", "next", "blocker", "distance")} |
+                            {"actions": [{"cond": a.get("cond"), "action": a.get("action"),
+                                          "required": a.get("key") in open_keys} for a in r.get("actions", [])]})
+            return {"at": snap.get("at"), "state": "ok", "rows": rows}
+        except Exception as exc:  # noqa: BLE001 - the dashboard never fails because of this panel
+            return {"rows": [], "state": f"error: {type(exc).__name__}"}
 
     def post_chat(self, body: dict) -> tuple[int, dict]:
         if not isinstance(body, dict):

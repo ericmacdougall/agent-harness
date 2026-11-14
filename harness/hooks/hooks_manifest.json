@@ -612,6 +612,30 @@
    "rules": []
   },
   {
+   "id": "owner-rt:stop",
+   "script": "owner_rt.py",
+   "arg": "stop",
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "drive:stop",
+   "script": "drive.py",
+   "arg": "stop",
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
    "id": "idle-guard:reject-posttoolusefailure",
    "script": "idle_guard.py",
    "arg": "reject",
