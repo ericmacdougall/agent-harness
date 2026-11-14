@@ -45,6 +45,12 @@ MAX_TEXT = 8000
 MAX_ATTEMPTS = 2
 WORKER_TIMEOUT_S = 900
 KINDS = ("status", "agent", "chat")
+CAPS = ("answer", "run-commands", "write-worktree", "browser")  # what a task may require of a lane
+# What each lane can do today. A capability is listed only when it has been shown to work on this host.
+LANE_CAPS = {"codex-pool-build": {"answer"}}
+# Lanes whose rerun cannot repeat an external effect (read-only; the ticket report is an upsert by task id).
+REPLAY_SAFE = ("builtin-status", "codex-pool-build", "chat")
+TERMINAL = ("done", "failed", "blocked", "outcome-unknown")
 TICKET_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}#[0-9]{1,9}$")
 KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{3,80}$")
 ID_RE = re.compile(r"^t-[0-9a-f]{12}$")
@@ -88,6 +94,8 @@ def db(root: Path) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS events(
             n INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, task TEXT, what TEXT NOT NULL, detail TEXT);
     """)
+    if "needs" not in [r["name"] for r in con.execute("PRAGMA table_info(tasks)")]:
+        con.execute("ALTER TABLE tasks ADD COLUMN needs TEXT NOT NULL DEFAULT 'answer'")
     return con
 
 
@@ -112,7 +120,11 @@ def mc_drop(task_id: str, what: str, summary: str, ticket: str | None, severity:
 
 
 # ---------------------------------------------------------------- intake
-def submit(con, kind: str, text: str, ticket: str | None, origin: str, key: str | None) -> dict:
+def submit(con, kind: str, text: str, ticket: str | None, origin: str, key: str | None,
+           needs: str | None = None) -> dict:
+    wanted = sorted(set((needs or "answer").replace(" ", "").split(",")))
+    if any(w not in CAPS for w in wanted):
+        raise ValueError(f"needs must be a comma list of {CAPS}")
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}")
     text = (text or "").strip()
@@ -128,8 +140,8 @@ def submit(con, kind: str, text: str, ticket: str | None, origin: str, key: str 
             return dict(row) | {"deduplicated": True}
     tid = "t-" + secrets.token_hex(6)
     ts = now_iso()
-    con.execute("INSERT INTO tasks(id,key,kind,text,ticket,origin,state,created,updated) VALUES(?,?,?,?,?,?,?,?,?)",
-                (tid, key, kind, text, ticket, origin, "queued", ts, ts))
+    con.execute("INSERT INTO tasks(id,key,kind,text,ticket,origin,state,created,updated,needs) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)", (tid, key, kind, text, ticket, origin, "queued", ts, ts, ",".join(wanted)))
     log_event(con, tid, "accepted", f"kind={kind} origin={origin}")
     mc_drop(tid, "accepted", f"coordinator accepted {kind} task {tid}", ticket)
     return dict(con.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
@@ -170,6 +182,11 @@ def route(task: dict) -> tuple[str | None, str]:
     if kind == "status":
         return "builtin-status", "status is answered from host facts, no model"
     if kind == "agent":
+        needs = set((task.get("needs") or "answer").split(","))
+        able = [lane for lane, caps in LANE_CAPS.items() if needs <= caps]
+        if not able:
+            missing = sorted(needs - set().union(*LANE_CAPS.values()))
+            return None, "blocked-unavailable: no lane on this host provides " + ", ".join(missing or sorted(needs))
         if codex_pool_bin():
             return "codex-pool-build", "read-only build worker through the budget-capped Codex pool"
         return None, "no worker lane: codex_pool.py is not installed on this host"
@@ -258,7 +275,12 @@ def lane_chat(con, task: dict, root: Path) -> tuple[bool, str]:
         m = re.search(r"\bticket:([a-z0-9-]+#[0-9]+)\b", rest)
         if m:
             ticket, rest = m.group(1), rest.replace(m.group(0), "").strip()
-        new = submit(con, "agent", rest, ticket, f"chat:{task['id']}", None)
+        needs = None
+        m = re.search(r"\bneeds:([a-z,-]+)\b", rest)
+        if m:
+            needs, rest = m.group(1), rest.replace(m.group(0), "").strip()
+        # Keyed by the chat task, so a replay of this chat message after a restart queues nothing twice.
+        new = submit(con, "agent", rest, ticket, f"chat:{task['id']}", f"chatrun:{task['id']}", needs)
         return True, f"queued {new['id']} (agent task" + (f", reports to {ticket}" if ticket else "") + "). Ask `show " + new["id"] + "`."
     sub = subscription_cli()
     if not sub:
@@ -292,7 +314,7 @@ def report(con, task: dict, ok: bool, body: str, root: Path) -> None:
     con.execute("INSERT OR IGNORE INTO effects(key,task,effect,state,created,updated) VALUES(?,?,?,?,?,?)",
                 (key, task["id"], "ticket-comment", "intent", ts, ts))
     goodqa = shutil.which("goodqa") or str(Path.home() / ".local" / "bin" / "goodqa")
-    text = (f"coordd (host coordinator) task {task['id']} {'DONE' if ok else 'FAILED'}\n"
+    text = (f"coordd (host coordinator) task {task['id']} {str(task.get('state') or ('done' if ok else 'failed')).upper()}\n"
             f"kind: {task['kind']}  lane: {task['lane']}  origin: {task['origin']}  attempts: {task['attempts']}\n\n{body[:5000]}\n")
     f = root / "runs" / task["id"]
     f.mkdir(parents=True, exist_ok=True)
@@ -309,20 +331,24 @@ def report(con, task: dict, ok: bool, body: str, root: Path) -> None:
 def retry_reports(con, root: Path) -> None:
     for e in con.execute("SELECT task FROM effects WHERE effect='ticket-comment' AND state!='done'").fetchall():
         t = con.execute("SELECT * FROM tasks WHERE id=?", (e["task"],)).fetchone()
-        if t and t["state"] in ("done", "failed"):
+        if t and t["state"] in TERMINAL:
             report(con, dict(t), t["state"] == "done", t["result"] or t["error"] or "", root)
 
 
 # ---------------------------------------------------------------- loop
 def recover(con) -> None:
-    for row in con.execute("SELECT id, attempts FROM tasks WHERE state='running'").fetchall():
-        if row["attempts"] < MAX_ATTEMPTS:
+    """A task found running after a restart is requeued only when its lane is replay-safe and it has budget.
+    Anything else becomes outcome-unknown: it is never declared failed, and never rerun, without a readback."""
+    for row in con.execute("SELECT id, attempts, lane FROM tasks WHERE state='running'").fetchall():
+        if row["lane"] in REPLAY_SAFE and row["attempts"] < MAX_ATTEMPTS:
             con.execute("UPDATE tasks SET state='queued', updated=? WHERE id=?", (now_iso(), row["id"]))
-            log_event(con, row["id"], "requeued-after-restart", f"attempts={row['attempts']}")
+            log_event(con, row["id"], "requeued-after-restart", f"attempts={row['attempts']} lane={row['lane']}")
         else:
-            con.execute("UPDATE tasks SET state='failed', error=?, updated=? WHERE id=?",
-                        ("interrupted by a restart and out of attempts", now_iso(), row["id"]))
-            log_event(con, row["id"], "failed", "restart, attempt budget spent")
+            why = ("interrupted by a restart; lane is not replay-safe" if row["lane"] not in REPLAY_SAFE
+                   else "interrupted by a restart with the attempt budget spent")
+            con.execute("UPDATE tasks SET state='outcome-unknown', error=?, updated=? WHERE id=?",
+                        (why + "; needs a readback before any rerun", now_iso(), row["id"]))
+            log_event(con, row["id"], "outcome-unknown", why)
 
 
 def run_one(con, root: Path, chat_only: bool) -> bool:
@@ -357,12 +383,15 @@ def run_one(con, root: Path, chat_only: bool) -> bool:
         con.execute("UPDATE tasks SET state='queued', error=?, updated=? WHERE id=?", (body, now_iso(), task["id"]))
         log_event(con, task["id"], "retry-transient", body[:300])
         return True
+    # blocked (could not be attempted or verified) is kept apart from failed (attempted and went wrong).
+    state = "done" if ok else ("blocked" if body.startswith(("blocked-unavailable", "worker reported blocked")) else "failed")
     con.execute("UPDATE tasks SET state=?, result=?, error=?, updated=? WHERE id=?",
-                ("done" if ok else "failed", body if ok else None, None if ok else body, now_iso(), task["id"]))
-    log_event(con, task["id"], "done" if ok else "failed", body[:300])
+                (state, body if ok else None, None if ok else body, now_iso(), task["id"]))
+    log_event(con, task["id"], state, body[:300])
     if task["kind"] != "chat":
-        mc_drop(task["id"], "finished", f"coordinator task {task['id']} {'done' if ok else 'FAILED'} via {lane}",
+        mc_drop(task["id"], "finished", f"coordinator task {task['id']} {state.upper()} via {lane}",
                 task["ticket"], "info" if ok else "warn")
+    task["state"] = state
     report(con, task, ok, body, root)
     return True
 
@@ -418,7 +447,7 @@ document.getElementById("tf").onsubmit=async e=>{e.preventDefault();tok=document
 document.getElementById("cf").onsubmit=async e=>{e.preventDefault();const m=document.getElementById("msg");const text=m.value.trim();if(!text)return;m.value="";add("me","you: "+text);
  const btn=e.target.querySelector("button");btn.disabled=true;
  try{const t=await api("/api/chat",{text,key:"web-"+crypto.randomUUID()});let cur=t;
-  for(let i=0;i<300&&cur.state!=="done"&&cur.state!=="failed";i++){await new Promise(r=>setTimeout(r,1000));cur=await api("/api/tasks/"+t.id)}
+  for(let i=0;i<300&&!["done","failed","blocked","outcome-unknown"].includes(cur.state);i++){await new Promise(r=>setTimeout(r,1000));cur=await api("/api/tasks/"+t.id)}
   add(cur.state==="done"?"card":"err",cur.state==="done"?cur.result:(cur.error||"no answer yet; ask: show "+t.id))}
  catch(x){add("err","Send failed: "+x.message+". Your message was not lost if it shows under `tasks`.")}
  finally{btn.disabled=false;m.focus()}};
@@ -492,7 +521,7 @@ class Handler(BaseHTTPRequestHandler):
                 task = submit(con, "chat", str(body.get("text") or ""), None, "chat", body.get("key"))
             elif self.path == "/api/tasks":
                 task = submit(con, str(body.get("kind") or ""), str(body.get("text") or ""), body.get("ticket"),
-                              str(body.get("origin") or "api")[:80], body.get("key"))
+                              str(body.get("origin") or "api")[:80], body.get("key"), body.get("needs"))
             else:
                 return self._send(404, {"error": "not found"})
             return self._send(200, task)
@@ -545,7 +574,7 @@ def wait_task(args, tid: str, seconds: int) -> dict:
     end = time.time() + seconds
     while True:
         t = client(args, f"/api/tasks/{tid}")
-        if t["state"] in ("done", "failed") or time.time() > end:
+        if t["state"] in TERMINAL or time.time() > end:
             return t
         time.sleep(1)
 
@@ -560,6 +589,7 @@ def main(argv=None) -> int:
     s.add_argument("--text", required=True)
     s.add_argument("--ticket")
     s.add_argument("--key")
+    s.add_argument("--needs", help="comma list of required capabilities, e.g. run-commands")
     s.add_argument("--origin", default="cli")
     s.add_argument("--wait", type=int, default=0)
     c = sub.add_parser("chat")
@@ -576,11 +606,11 @@ def main(argv=None) -> int:
         return 0
     if args.cmd == "submit":
         t = client(args, "/api/tasks", {"kind": args.kind, "text": args.text, "ticket": args.ticket,
-                                        "key": args.key, "origin": args.origin})
+                                        "key": args.key, "origin": args.origin, "needs": args.needs})
         if args.wait:
             t = wait_task(args, t["id"], args.wait)
         print(json.dumps(t, indent=1))
-        return 0 if t["state"] != "failed" else 1
+        return 0 if t["state"] in ("done", "queued", "running") else 1
     if args.cmd == "chat":
         t = client(args, "/api/chat", {"text": " ".join(args.text)})
         t = wait_task(args, t["id"], 320)

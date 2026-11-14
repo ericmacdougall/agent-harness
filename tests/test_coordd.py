@@ -51,15 +51,34 @@ class CoorddTest(unittest.TestCase):
     def test_restart_requeues_once_then_fails_and_never_reruns_done(self):
         t = coordd.submit(self.con, "agent", "x", None, "t", None)
         d = coordd.submit(self.con, "status", "x", None, "t", None)
-        self.con.execute("UPDATE tasks SET state='running', attempts=1 WHERE id=?", (t["id"],))
+        u = coordd.submit(self.con, "agent", "y", None, "t", None)
+        self.con.execute("UPDATE tasks SET state='running', attempts=1, lane='codex-pool-build' WHERE id=?", (t["id"],))
+        self.con.execute("UPDATE tasks SET state='running', attempts=1, lane='some-writing-lane' WHERE id=?", (u["id"],))
         self.con.execute("UPDATE tasks SET state='done', result='r', attempts=1 WHERE id=?", (d["id"],))
         coordd.recover(self.con)
         get = lambda i: self.con.execute("SELECT state FROM tasks WHERE id=?", (i,)).fetchone()[0]  # noqa: E731
         self.assertEqual(get(t["id"]), "queued")
         self.assertEqual(get(d["id"]), "done")
+        self.assertEqual(get(u["id"]), "outcome-unknown")  # not replay-safe: never rerun, never called failed
         self.con.execute("UPDATE tasks SET state='running', attempts=2 WHERE id=?", (t["id"],))
         coordd.recover(self.con)
-        self.assertEqual(get(t["id"]), "failed")
+        self.assertEqual(get(t["id"]), "outcome-unknown")
+
+    def test_task_needing_commands_is_blocked_not_dispatched(self):
+        os.environ["COORD_CODEX_POOL"] = __file__
+        orig = coordd.lane_codex_pool
+        coordd.lane_codex_pool = lambda task, root: self.fail("dispatched a task no lane can serve")
+        try:
+            t = coordd.submit(self.con, "agent", "run ls", None, "t", None, "run-commands")
+            coordd.run_one(self.con, self.root, chat_only=False)
+        finally:
+            coordd.lane_codex_pool = orig
+            os.environ["COORD_CODEX_POOL"] = ""
+        row = self.con.execute("SELECT state, error FROM tasks WHERE id=?", (t["id"],)).fetchone()
+        self.assertEqual(row["state"], "blocked")
+        self.assertIn("run-commands", row["error"])
+        with self.assertRaises(ValueError):
+            coordd.submit(self.con, "agent", "x", None, "t", None, "root-shell")
 
     def test_chat_commands_and_freeform_without_subscription(self):
         t = coordd.submit(self.con, "chat", "run check the build ticket:goodqa#1", None, "chat", None)
@@ -68,6 +87,9 @@ class CoorddTest(unittest.TestCase):
         self.assertEqual(row["state"], "done")
         q = self.con.execute("SELECT text, ticket, state FROM tasks WHERE kind='agent'").fetchone()
         self.assertEqual((q["text"], q["ticket"], q["state"]), ("check the build", "goodqa#1", "queued"))
+        self.con.execute("UPDATE tasks SET state='queued' WHERE id=?", (t["id"],))  # replay after a restart
+        coordd.run_one(self.con, self.root, chat_only=True)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM tasks WHERE kind='agent'").fetchone()[0], 1)
         orig = coordd.subscription_cli
         coordd.subscription_cli = lambda: None
         try:
