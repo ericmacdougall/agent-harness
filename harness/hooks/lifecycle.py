@@ -203,13 +203,16 @@ def _clean_answer(text: str) -> str:
     return re.sub(r"\(recommended\)", " ", text or "", flags=re.I).strip()
 
 
-def _bound_answer(pairs: dict, needles) -> tuple:
-    """(question, answer) of the one question that carries every needle; ambiguity or absence -> (None, why)."""
-    hits = [(q, a) for q, a in pairs.items() if isinstance(q, str) and all(n.lower() in q.lower() for n in needles)]
+def _bound_answer(pairs: dict, needles, goal_id: str = "") -> tuple:
+    """(question, answer) of the one question that carries every needle (substring) and names goal_id as a whole
+    token; ambiguity or absence -> (None, why)."""
+    hits = [(q, a) for q, a in pairs.items() if isinstance(q, str) and all(n.lower() in q.lower() for n in needles)
+            and (not goal_id or _names_goal(q, goal_id))]
+    wanted = ", ".join(list(needles) + ([goal_id] if goal_id else []))
     if not hits:
-        return None, "no question in that answer record carries " + ", ".join(needles)
+        return None, "no question in that answer record carries " + wanted
     if len(hits) > 1:
-        return None, "more than one question in that answer record carries " + ", ".join(needles)
+        return None, "more than one question in that answer record carries " + wanted
     return hits[0], ""
 
 
@@ -219,65 +222,86 @@ def _assent(answer: str, words=ASSENT) -> bool:
 
 
 def _names_goal(text: str, goal_id: str) -> bool:
-    folded = re.sub(r"[_-]+", " ", (text or "").lower())
-    target = re.sub(r"[_-]+", " ", goal_id.lower())
-    return bool(re.search(r"(?<![a-z0-9])" + re.escape(target) + r"(?![a-z0-9])", folded))
+    """goal_id as a whole token: its - and _ may be written as -, _ or a space, but a longer id that extends it
+    (lc-goal-two for lc-goal) does not count."""
+    parts = [re.escape(x) for x in re.split(r"[_-]+", goal_id.lower()) if x]
+    if not parts:
+        return False
+    pattern = r"(?<![a-z0-9_-])" + r"[-_ ]+".join(parts) + r"(?![a-z0-9_]|[-_ ]?-[a-z0-9]|[-_][a-z0-9])"
+    return bool(re.search(pattern, (text or "").lower()))
 
 
-def agreement_problem(source, goal_id: str, lc: dict, resolver=None) -> str:
-    """'' when `source` is the user's agreement to exactly this proposal, else why not."""
+def agreement_check(source, goal_id: str, lc: dict, resolver=None) -> tuple:
+    """(why, at): why is '' when `source` is the user's agreement to exactly this proposal; at is the verified time of
+    the user's words (the agreement time: evidence must not predate it). Order: source kind, binding, then time."""
     sha, ask, proposed = lc.get("gates_sha") or "", lc.get("ask") or "", parse_ts(lc.get("proposed_at"))
     if not SHA_RE.match(sha):
-        return "no proposed gates to agree: run propose first"
+        return "no proposed gates to agree: run propose first", ""
     try:
         body, ts, kind = (resolver or _resolve)(source, None)
     except LifecycleError as error:
-        return str(error)
-    when = parse_ts(ts)
-    if not when or (proposed and when < proposed):
-        return "the user's words predate this proposal (proposed_at); ask again about the current gates"
+        return str(error), ""
     prefix = sha[:SHA_PREFIX]
     if kind == "answer":
         if not ask:
-            return "this proposal has no ask id; an answer can be bound only to a registered ask"
-        found, why = _bound_answer(body if isinstance(body, dict) else {}, [f"[ask:{ask}]", goal_id, prefix])
+            return "this proposal has no ask id; an answer can be bound only to a registered ask", ""
+        found, why = _bound_answer(body if isinstance(body, dict) else {}, [f"[ask:{ask}]", prefix], goal_id)
         if found is None:
-            return why
+            return why, ""
         if not _assent(found[1]):
-            return f"the answer to the bound question is not an agreement: {found[1][:80]!r}"
+            return f"the answer to the bound question is not an agreement: {found[1][:80]!r}", ""
+    else:
+        text = str(body or "")
+        if not _names_goal(text, goal_id) or not (prefix in text or (ask and ask in text)):
+            return f"the user's turn must name {goal_id} and the gates ({prefix}) or the ask id", ""
+        if not _assent(text):
+            return "the user's turn does not plainly agree (agree word missing, or a refusal, condition or question)", ""
+    when = parse_ts(ts)
+    if not when or (proposed and when < proposed):
+        return "the user's words predate this proposal (proposed_at); ask again about the current gates", ""
+    return "", now_iso(when)
+
+
+def agreement_problem(source, goal_id: str, lc: dict, resolver=None) -> str:
+    return agreement_check(source, goal_id, lc, resolver)[0]
+
+
+def source_kind_problem(source) -> str:
+    """'' for a user:/answer: source; otherwise the refusal (checked before anything else, so the reason is the
+    source kind whatever the goal's state)."""
+    kind = _source_kind(source)
+    if kind in ("user", "answer"):
         return ""
-    text = str(body or "")
-    if not _names_goal(text, goal_id) or not (prefix in text or (ask and ask in text)):
-        return f"the user's turn must name {goal_id} and the gates ({prefix}) or the ask id"
-    if not _assent(text):
-        return "the user's turn does not plainly agree (agree word missing, or a refusal, condition or question)"
-    return ""
+    return (f"a {kind or 'malformed'}: source is not the user's decision: cite an answer: (the AskUserQuestion answer) "
+            "or user: turn (ah user-msg prints it); queue:, wal:, ticket:, inferred: and agent text never count")
 
 
-def done_problem(source, goal_id: str, lc: dict, resolver=None, after=None) -> str:
-    """'' when `source` is the user saying this goal is done, else why not. `after`: an ISO time the words must follow
-    (the READY record for a lifecycle goal)."""
+def done_problem(source, goal_id: str, lc: dict, resolver=None, after=None, ask=None) -> str:
+    """'' when `source` is the user saying this goal is done, else why not. An answer: must answer the question that
+    carries the done ask (`ready --ask`, or `done --ask` for a legacy goal) and names the goal as a token. `after`: an
+    ISO time the words must follow (the READY record for a lifecycle goal)."""
     try:
         body, ts, kind = (resolver or _resolve)(source, None)
     except LifecycleError as error:
         return str(error)
-    when = parse_ts(ts)
-    if after and (not when or when < parse_ts(after)):
-        return "the user's words predate READY; ask about the current state"
     if kind == "answer":
-        ask = (lc.get("ready") or {}).get("ask") or ""
-        needles = [goal_id] + ([f"[ask:{ask}]"] if ask else [])
-        found, why = _bound_answer(body if isinstance(body, dict) else {}, needles)
+        ask = ask or (lc.get("ready") or {}).get("ask") or ""
+        if not ask:
+            return "an answer: can close a goal only through a registered done ask (ready --ask or done --ask)"
+        found, why = _bound_answer(body if isinstance(body, dict) else {}, [f"[ask:{ask}]"], goal_id)
         if found is None:
             return why
         if not _assent(found[1], ASSENT) and not _assent(found[1], DONE_WORDS):
             return f"the answer to the bound question does not say done: {found[1][:80]!r}"
-        return ""
-    text = str(body or "")
-    if not _names_goal(text, goal_id):
-        return f"the user's turn must name {goal_id}"
-    if not DONE_WORDS.search(text) or REFUSAL.search(text):
-        return "the user's turn does not plainly say it is done (done word missing, or a refusal or condition)"
+    else:
+        text = str(body or "")
+        if not _names_goal(text, goal_id):
+            return f"the user's turn must name {goal_id}"
+        if not DONE_WORDS.search(text) or REFUSAL.search(text):
+            return "the user's turn does not plainly say it is done (done word missing, or a refusal or condition)"
+    when = parse_ts(ts)
+    if after and (not when or when < parse_ts(after)):
+        return "the user's words predate READY; ask about the current state"
     return ""
 
 
@@ -401,6 +425,8 @@ def effective_state(goal: dict, audit_rows=None, chain_ok: bool = True) -> tuple
     which every caller treats as pending. audit_rows=None skips the audit comparison (unit use only)."""
     state = raw_state(goal)
     lc = goal.get("lifecycle") if isinstance(goal.get("lifecycle"), dict) else {}
+    if not chain_ok and not (isinstance(goal.get("lifecycle"), dict) and state == "pending"):
+        return "unverified", "the ledger's audit chain does not verify"
     if not isinstance(goal.get("lifecycle"), dict) and audit_rows is not None \
             and not any(isinstance(r, dict) and r.get("action") == "migrate-lifecycle" for r in audit_rows):
         # a ledger never migrated: its goals predate the lifecycle (main runs migrate-lifecycle once after install)

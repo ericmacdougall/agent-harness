@@ -320,9 +320,10 @@ class Agree(LBase):
 class Ready(LBase):
     def test_ready_computed_full_flow(self):
         self.to_active()
-        self.refused(["ready", "--goal", GID], "not READY", "G1 unmet", "G2 unmet", "G3 unmet")
+        self.refused(["ready", "--goal", GID, "--ask", DONE_ASK], "not READY", "G1 unmet", "G2 unmet", "G3 unmet")
         self.evidence_all()
-        self.ok(["ready", "--goal", GID])
+        self.refused(["ready", "--goal", GID, "--ask", "nope"], "--ask takes")
+        self.ok(["ready", "--goal", GID, "--ask", DONE_ASK])
         self.assertEqual(self.state(), "ready")
 
     def _one_bad(self, attach, needle):
@@ -331,7 +332,7 @@ class Ready(LBase):
         self.ok(["attach", "--goal", GID, "--evidence", self.deploy_row(), "--gate", "G2"])
         self.ok(["attach", "--goal", GID, "--evidence", self.check_row("pg-c", live=False), "--gate", "G3"])
         attach()
-        out = self.refused(["ready", "--goal", GID], "G1 unmet")
+        out = self.refused(["ready", "--goal", GID, "--ask", DONE_ASK], "G1 unmet")
         self.assertIn(needle, out)
 
     def test_ready_owner_attached_row_does_not_count(self):
@@ -401,7 +402,7 @@ class Ready(LBase):
         self.propose(ask=ASK2, gates_file=path, sha=lcm.gates_sha(new))
         self.ok(["agree", "--goal", GID, "--user-source", self.agreed_answer(ask=ASK2, sha=lcm.gates_sha(new))])
         self.ok(["activate", "--goal", GID])
-        self.refused(["ready", "--goal", GID], "earlier gate revision")
+        self.refused(["ready", "--goal", GID, "--ask", DONE_ASK], "earlier gate revision")
 
 
 class Done(LBase):
@@ -432,6 +433,31 @@ class Done(LBase):
     def test_done_before_ready_is_refused(self):
         self.to_active()
         self.refused(["done", "--goal", GID, "--user-source", self.user_turn("lc-goal is done")], "not READY")
+        # the source kind is judged first, whatever the state (gate G1's live check)
+        self.refused(["done", "--goal", GID, "--user-source",
+                      'queue:%s/2026-11-14T04:40:13.499Z#69c80ac14ad8 "from now on"' % SESSION], "not the user's decision")
+
+    def test_done_answer_must_carry_the_done_ask(self):
+        self.to_ready()
+        other = self.answer({f"[ask:w66666666666] Should lc-goal get a new logo?": "Yes, approved"})
+        self.refused(["done", "--goal", GID, "--user-source", other], "no question in that answer record carries")
+        prefixed = self.answer({f"[ask:{DONE_ASK}] Is lc-goal-two done?": "Yes, it is done"})
+        self.refused(["done", "--goal", GID, "--user-source", prefixed], "no question in that answer record carries")
+        self.assertEqual(self.state(), "ready")
+
+    def test_agreement_time_is_the_users_words_so_an_earlier_deploy_counts(self):
+        self.seed_old_goals(ids=())
+        self.propose()
+        src = self.agreed_answer()  # the user's words, now
+        time.sleep(1.1)
+        dep = self.deploy_row()  # deployed after the user agreed, before main recorded the agreement
+        time.sleep(1.1)
+        self.ok(["agree", "--goal", GID, "--user-source", src])
+        self.ok(["activate", "--goal", GID])
+        self.ok(["attach", "--goal", GID, "--evidence", dep, "--gate", "G2"])
+        self.ok(["attach", "--goal", GID, "--evidence", self.check_row("pg-a"), "--gate", "G1"])
+        self.ok(["attach", "--goal", GID, "--evidence", self.check_row("pg-c", live=False), "--gate", "G3"])
+        self.ok(["ready", "--goal", GID, "--ask", DONE_ASK])
 
     def test_done_words_older_than_ready_are_refused(self):
         early = self.done_answer()
@@ -487,7 +513,7 @@ class Done(LBase):
         self.assertEqual(self.state(), "unverified")  # chain broken
         self.ok(["reseal", "--reason", "test: swap the gates for weaker ones by hand"])
         self.assertEqual(self.state(), "unverified")  # lc_sha no longer matches the activate row
-        self.refused(["ready", "--goal", GID], "unverified")
+        self.refused(["ready", "--goal", GID, "--ask", DONE_ASK], "unverified")
 
 
 class Migrate(LBase):
@@ -519,8 +545,9 @@ class Migrate(LBase):
         self.ok(["migrate-lifecycle"])
         self.seed_old_goals(ids=("late",))  # an old writer's add after migration: no lifecycle object
         self.assertEqual(self.state("late"), "pending")
-        self.ok(["migrate-lifecycle"])  # main runs it again: it must not grandfather the late goal...
-        self.assertEqual(self.state("late"), "legacy") if False else None
+        again = json.loads(self.ok(["migrate-lifecycle"]))  # main runs it again: it must not grandfather the late goal
+        self.assertEqual(again["migrated"], [])
+        self.assertEqual(self.state("late"), "pending")
 
     def test_legacy_hand_written_marker_is_unverified(self):
         self.seed_old_goals(ids=("old-a",))
@@ -537,7 +564,14 @@ class Migrate(LBase):
 
     def test_legacy_goal_closes_on_the_users_words_only(self):
         self.seed_old_goals(ids=("old-a",))
+        self.refused(["done", "--goal", "old-a", "--user-source", self.user_turn("old-a is done, thanks")],
+                     "migrate-lifecycle")
         self.ok(["migrate-lifecycle"])
+        loose = self.answer({"Is old-a done?": "Yes, it is done"})
+        self.refused(["done", "--goal", "old-a", "--user-source", loose], "done ask")
+        bound = self.answer({"[ask:w77777777777] Is old-a done?": "Yes, it is done"})
+        self.refused(["done", "--goal", "old-a", "--user-source", bound, "--ask", "w88888888888"],
+                     "no question in that answer record carries")
         self.refused(["done", "--goal", "old-a", "--user-source", self.user_turn("old-b is done")], "must name old-a")
         self.ok(["done", "--goal", "old-a", "--user-source", self.user_turn("old-a is done, thanks")])
         self.assertEqual(self.state("old-a"), "done")
