@@ -321,6 +321,18 @@ class Goodqa15949Tests(Base):
         self.assertNotIn("tick", self.tick_streams())
 
 
+    def test_fresh_transcript_with_a_stale_wal_clears_the_wait(self):  # receipt r1 F1: resumed by SendMessage
+        self.dispose("tick", "waiting", "tick-tr-wait", until=iso(NOW + 3 * HOUR), ref="GoodQA goodqa#15943", at=iso(NOW - 600))
+        self.assertIn("tick", self.tick_streams())
+        sub = self.home / ".claude" / "projects" / "p" / SESSION / "subagents"
+        sub.mkdir(parents=True)
+        (sub / "agent-tick.jsonl").write_text("{}\n")  # the WAL stays as it was, before the wait
+        os.utime(sub / "agent-tick.jsonl", (NOW - 20, NOW - 20))
+        row = [r for r in ah.owners(self.home, SESSION, now=NOW)["owners"] if r["agent_id"] == "tick"][0]
+        self.assertIsNone(row["wait_on"], row)
+        self.assertNotIn("tick", self.tick_streams())
+
+
 class ReminderTests(Base):
     def test_rejection_injects_the_exact_line(self):  # AC-7
         out = self.ig.cmd_reject({"hook_event_name": "PostToolUseFailure", "tool_name": "AskUserQuestion",

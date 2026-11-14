@@ -372,7 +372,8 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                "ticket": summary["tickets"][0] if summary["tickets"] else None,
                "ticket_comment_age_s": None,
                "result_at": iso(summary["outcome_at"]) if summary.get("outcome") and summary.get("outcome_at") else None,
-               "active_1h": now - max(last_wal, tmtime) <= 3600}  # WAL or transcript write in the hour (goodqa#15943)
+               "active_1h": now - max(last_wal, tmtime) <= 3600,  # WAL or transcript write in the hour (goodqa#15943)
+               "active_at": max(last_wal, tmtime)}  # latest WAL or transcript write (goodqa#15949); task WAL rows lack it
         if comments and row["ticket"]:
             row["ticket_comment_age_s"] = comments(row["ticket"], now)
         rows.append(row)
@@ -476,7 +477,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         if d.get("kind") in liveness.ENDING_DISPOSITIONS:
             continue  # a terminal disposition stays terminal, whatever the owner's last note says
         if d.get("kind") == "waiting" and d.get("live") and str(r["state"]).startswith(("live", "working")) \
-                and (parse_ts(r["last_activity"]) or 0.0) > float(d.get("at") or 0.0) + RESUMED_ACTIVITY_S:
+                and (r.get("active_at") or parse_ts(r["last_activity"]) or 0.0) > float(d.get("at") or 0.0) + RESUMED_ACTIVITY_S:
             continue  # goodqa#15949: fresh activity after the wait wins; a live, working owner is not waiting
         ref = str(d.get("ref") or "") if d.get("kind") == "waiting" and d.get("live") else \
             (r["state"][len("waiting-on-"):] if r["state"].startswith("waiting-on-") else "")
