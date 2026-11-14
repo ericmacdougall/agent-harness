@@ -371,6 +371,7 @@ class DerivedInitiatives(unittest.TestCase):  # stale topology/initiatives fix: 
         out = og.derive_initiatives(snap, self.rows(), tickets, now=1000.0 + 4 * 86400)
         ids = {i["ticket"]: i for i in out["items"]}
         self.assertEqual(set(ids), {"goodqa#15950", "goodqa#15961"})       # parked, helper and restricted rows: no
+        self.assertEqual(out["untracked"], 0)
         mc = ids["goodqa#15950"]
         self.assertEqual((mc["initiative"], mc["state"], mc["source"]), ("Live org graph", "In progress", "live"))
         self.assertEqual((mc["milestones_done"], mc["next_step"]), (1, "PR"))  # the file still adds its plan
@@ -384,6 +385,27 @@ class DerivedInitiatives(unittest.TestCase):  # stale topology/initiatives fix: 
         out = og.derive_initiatives(snap, [], {}, now=2000.0)
         self.assertEqual([i["source"] for i in out["items"]], ["file", "file"])
         self.assertEqual(out["hidden_file_rows"], 0)
+
+    def test_live_owner_without_ticket_gets_a_flagged_row(self):  # PR 242 panel: no live owner left unlinked
+        rows = [{"agent_id": "a534e2ba26fdfb490", "role": "live", "source": "ah", "ticket": "", "task": "PR 238 rescue"},
+                {"agent_id": "a950cdca38f9f893e", "role": "live", "source": "ah", "ticket": "", "task": ""},
+                {"agent_id": "a92175d46df0c8388", "role": "live", "source": "ah", "ticket": "", "task": "solve tuning"}]
+        out = og.derive_initiatives({"items": [], "mtime": None}, rows, {}, now=1.0)
+        titles = {i["owner"]: (i["initiative"], i["state"]) for i in out["items"]}
+        self.assertEqual(titles["a534e2ba26fdfb490"], ("PR 238 rescue", "No ticket"))
+        self.assertEqual(titles["a950cdca38f9f893e"][0], "Untracked work (no ticket)")
+        self.assertEqual(titles["a92175d46df0c8388"][0], "Untracked work (no ticket)")   # restricted: no task text
+        self.assertEqual(out["untracked"], 3)
+
+    def test_stale_owner_read_is_a_gap_line(self):
+        fx = Fixture()
+        graph, _, _ = collector(fx, [dict(row("bbbb2222"), role="live", source="ah", ah_stale=True)])
+        graph.tick(1.0)
+        self.assertTrue(any("last ah owners read failed" in g for g in graph.snapshot()["gaps"]))
+        codex, _, _ = collector(fx, [dict(row("bbbb2222"), role="live", source="ah"),
+                                     {"agent_id": "codex-x", "runtime": "codex", "source_stale": True}])
+        codex.tick(1.0)
+        self.assertFalse(any("last ah owners read failed" in g for g in codex.snapshot()["gaps"]))
 
     def test_restricted_task_never_becomes_a_title(self):
         rows = [{"agent_id": "a9", "role": "live", "source": "ah", "ticket": "goodqa#1", "task": "solve interview prep"}]

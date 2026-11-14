@@ -78,10 +78,10 @@ export function mountInitiatives() {
     // hidden once it is over a day old (goodqa#15950). Say both, with the file's age.
     const ageMs = state.initiativesMtime ? state.now - state.initiativesMtime : null;
     const old = ageMs !== null && ageMs > 24 * 3600 * 1000;
-    const derived = state.initiativesDerived || 0, hidden = state.initiativesHidden || 0;
+    const derived = state.initiativesDerived || 0, hidden = state.initiativesHidden || 0, untracked = state.initiativesUntracked || 0;
     const fileText = state.initiativesMtime ? `the hand-written file was last edited ${age(new Date(state.initiativesMtime).toISOString(), state.now)}` : 'the hand-written file has no known edit time';
     const fileAge = el('p', `initiatives-file-age${old ? ' stale' : ''}`,
-      `${derived} from live owners and GoodQA; ${fileText}${hidden ? `, so its other ${hidden} row${hidden === 1 ? ' is' : 's are'} hidden as out of date` : ''}.`);
+      `${derived} from live owners and GoodQA${untracked ? ` (${untracked} with no ticket)` : ''}; ${fileText}${hidden ? `, so its other ${hidden} row${hidden === 1 ? ' is' : 's are'} hidden as out of date` : ''}.`);
     fileAge.id = 'initiatives-file-age';
     fragment.prepend(fileAge);
     if (!state.initiatives.length) fragment.append(el('p', 'empty-state', state.initiativesError ? `Initiatives file: ${state.initiativesError}` : 'No live owner holds a ticket yet, and the hand-written file has no current rows.'));

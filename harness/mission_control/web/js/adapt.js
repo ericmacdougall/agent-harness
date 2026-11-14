@@ -32,7 +32,7 @@ export function initiatives(snapshot) {
   const mtime = Number.isFinite(snapshot?.mtime) && snapshot.mtime > 0 ? snapshot.mtime * 1000 : null;
   // derived: rows built from live owners + GoodQA; hiddenFileRows: file rows dropped because the file is over a day old
   const count = v => (Number.isInteger(v) && v >= 0 ? v : 0);
-  return { items, stale: !!snapshot?.stale, error: str(snapshot?.error, 300), mtime, derived: count(snapshot?.derived), hiddenFileRows: count(snapshot?.hidden_file_rows) };
+  return { items, stale: !!snapshot?.stale, error: str(snapshot?.error, 300), mtime, derived: count(snapshot?.derived), untracked: count(snapshot?.untracked), hiddenFileRows: count(snapshot?.hidden_file_rows) };
 }
 
 // An initiative's free-text owner ("a095f32d (waiting)", "none live", "main") links to an owner row by id prefix.

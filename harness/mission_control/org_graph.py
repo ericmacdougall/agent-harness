@@ -628,6 +628,10 @@ class OrgGraph:
         if sig != self.initiatives_sig and self.on_initiatives:
             self.initiatives_sig = sig
             self.on_initiatives()
+        if any(isinstance(r, dict) and r.get("source") == "ah" and (r.get("ah_stale") or r.get("source_stale"))
+               for r in (self.owners_fn() or [])):   # as owner-groups ownersStale: Codex native rows do not count
+            snapshot["gaps"].insert(0, "The last ah owners read failed: owners and their roles are from the previous good "
+                                       "read and may be out of date.")
         if not session:
             snapshot["gaps"].insert(0, "No session is selected yet: ah owners has not reported one.")
         elif main_path is None:
@@ -679,12 +683,23 @@ def derive_initiatives(file_snapshot: dict, owner_rows: list, tickets: dict, now
     mtime = snap.get("mtime")
     file_items = [i for i in (snap.get("items") or []) if isinstance(i, dict)]
     by_ticket = {ticket_ref(i.get("ticket")): i for i in file_items if ticket_ref(i.get("ticket"))}
-    derived, seen = [], set()
+    derived, seen, untracked = [], set(), 0
     for row in owner_rows or []:
         if not isinstance(row, dict) or row.get("role") != "live" or row.get("source", "ah") != "ah":
             continue
         task = str(row.get("task") or "")
         ref = ticket_ref(row.get("ticket")) or ticket_ref(task)
+        agent = str(row.get("agent_id") or "")
+        if not ref and AGENT_RE.match(agent):
+            # A live owner with no ticket still gets a row (linked by its id), flagged: every stream should have one.
+            restricted = bool(row.get("restricted")) or bool(RESTRICTED.search(task))
+            derived.append({"id": "live-" + agent[:40], "initiative": "Untracked work (no ticket)" if restricted or not task
+                            else ev.short(task, 200), "state": "No ticket", "ticket": "", "owner": agent,
+                            "source": "live", "updated": str(row.get("last_activity") or "")[:40],
+                            "milestones_done": None, "milestones_total": None, "pct": None,
+                            "note": "This live owner holds no GoodQA ticket."})
+            untracked += 1
+            continue
         if not ref or ref in seen or row.get("restricted") or RESTRICTED.search(task):
             continue
         seen.add(ref)
@@ -703,7 +718,7 @@ def derive_initiatives(file_snapshot: dict, owner_rows: list, tickets: dict, now
     fresh = isinstance(mtime, (int, float)) and now - mtime < FILE_FRESH_S
     kept = [dict(i, source="file") for i in file_items if ticket_ref(i.get("ticket")) not in seen] if fresh else []
     hidden = 0 if fresh else sum(1 for i in file_items if ticket_ref(i.get("ticket")) not in seen)
-    return {**snap, "items": derived + kept, "derived": len(derived), "hidden_file_rows": hidden}
+    return {**snap, "items": derived + kept, "derived": len(derived), "untracked": untracked, "hidden_file_rows": hidden}
 
 
 def _shape(snapshot: dict) -> str:
