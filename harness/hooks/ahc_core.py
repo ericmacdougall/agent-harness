@@ -41,25 +41,45 @@ def run_argv(argv, timeout, cwd=None, env=None):
         out, err = proc.communicate(timeout=timeout)
         return proc.returncode, out, err
     except subprocess.TimeoutExpired:
-        _kill_group(proc)
+        gone = _kill_group(proc)
         try:
             out, err = proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
             out, err = "", ""
-        return TIMEOUT_RC, out or "", (err or "") + "\ntimeout after %ss; process group killed" % timeout
+        status = "process group killed" if gone else "process group cleanup incomplete"
+        return TIMEOUT_RC, out or "", (err or "") + "\ntimeout after %ss; %s" % (timeout, status)
 
 
-def _kill_group(proc):
-    for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
+def _group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _kill_group(proc, grace=5.0):
+    """Terminate the whole process group and supervise it until it is gone, independent of the leader's exit
+    (code-inspection r1 F2). Returns True only when no member of the group remains."""
+    pgid = proc.pid
+    for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
-            os.killpg(proc.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            return
-        try:
-            proc.wait(timeout=wait)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            proc.poll()
+            return True
+        except PermissionError:
+            return False
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            proc.poll()  # reap the leader so a zombie does not keep the group id alive
+            if not _group_alive(pgid):
+                return True
+            time.sleep(0.05)
+    proc.poll()
+    return not _group_alive(pgid)
 
 
 class Refused(ValueError):
@@ -199,8 +219,36 @@ def resolve(req, run):
     return facts
 
 
-_HEADER = re.compile(r"^(Stage|Reviewed HEAD|Reviewed packet SHA-256):[ \t]*(\S+)[ \t]*$", re.M)
-_VERDICT = re.compile(r"^(?:VERDICT|PR_RESULT):[ \t]*(PASS-WITH-TICKETS|PASS|BLOCK)(?![A-Za-z0-9_-])", re.M)
+_REQUIRED = ("Stage", "Reviewed HEAD", "Reviewed packet SHA-256")
+_HEADER_LINE = re.compile(r"^([A-Za-z][A-Za-z0-9 -]{0,60}):[ \t]*(.*?)[ \t]*$")
+_PASS_LINE = re.compile(r"VERDICT: (PASS-WITH-TICKETS|PASS)")
+_BLOCK_LINE = re.compile(r"VERDICT: BLOCK(?![A-Za-z0-9_-]).*")
+
+
+def _parse_report(text):
+    """(headers, verdict line) or raise ValueError. The header block is every line before the first blank line;
+    each required header must appear there exactly once. The authoritative verdict is the first non-blank line after
+    that block, as peer_review writes it; nothing later in the body (quotes, examples) counts (r1 F4)."""
+    head, sep, body = text.replace("\r\n", "\n").partition("\n\n")
+    if not sep:
+        raise ValueError("report has no header block")
+    fields = {}
+    for line in head.split("\n"):
+        match = _HEADER_LINE.match(line)
+        if not match:
+            continue
+        name, value = match.group(1), match.group(2)
+        if name in _REQUIRED:
+            if name in fields:
+                raise ValueError("duplicate %s header" % name)
+            fields[name] = value
+    missing = [name for name in _REQUIRED if name not in fields]
+    if missing:
+        raise ValueError("missing header(s): " + ", ".join(missing))
+    first = next((line.strip() for line in body.split("\n") if line.strip()), "")
+    return fields, first
+
+
 EXIT_PASS, EXIT_ERROR, EXIT_BLOCK, EXIT_ADVISORY = 0, 2, 3, 4   # peer_review.py main()
 
 
@@ -219,9 +267,10 @@ def verify_receipt(rc, report_path, head, packet_path):
         text = Path(report_path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return {"verdict": "ERROR", "reason": "no report was written"}
-    fields = {}
-    for name, value in _HEADER.findall(text):
-        fields.setdefault(name, value)
+    try:
+        fields, first = _parse_report(text)
+    except ValueError as error:
+        return {"verdict": "INVALID", "reason": str(error)}
     packet_sha = hashlib.sha256(Path(packet_path).read_bytes()).hexdigest()
     if fields.get("Stage") != "pr":
         return {"verdict": "INVALID", "reason": "report stage is not pr"}
@@ -229,12 +278,12 @@ def verify_receipt(rc, report_path, head, packet_path):
         return {"verdict": "INVALID", "reason": "Reviewed HEAD does not match"}
     if fields.get("Reviewed packet SHA-256") != packet_sha:
         return {"verdict": "INVALID", "reason": "Reviewed packet SHA-256 does not match the packet bytes"}
-    match = _VERDICT.search(text)
-    if not match:
-        return {"verdict": "INVALID", "reason": "no verdict line"}
-    verdict = match.group(1)
-    if verdict == "BLOCK":
+    if _BLOCK_LINE.fullmatch(first):
         return {"verdict": "BLOCK", "reason": ""}
+    match = _PASS_LINE.fullmatch(first)
+    if not match:
+        return {"verdict": "INVALID", "reason": "the first line after the header block is not a supported verdict"}
+    verdict = match.group(1)
     if rc != EXIT_PASS:
         return {"verdict": "ERROR", "reason": f"verdict {verdict} with exit {rc}"}
     return {"verdict": verdict, "reason": ""}

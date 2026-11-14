@@ -48,6 +48,7 @@ STOP_AFTER = None   # test hook: raise after this state is persisted (simulates 
 TERMINAL = {"refused", "lint-failed", "stale-head", "superseded", "review-error", "needs-attention", "blocked",
             "merged", "closed"}
 NON_TERMINAL = {"queued", "deferred", "reviewing", "routed-to-main"}
+ALERT_STATES = {"refused", "lint-failed", "review-error", "needs-attention"}  # terminal-unsuccessful (D14)
 OWNER_NOTICE_STATES = {"refused", "lint-failed", "stale-head", "review-error", "needs-attention", "blocked"}
 REVIEW_TIMEOUT = 720                     # per provider, peer_review's cap
 REVIEW_WALL = core.TIMEOUTS["review"]    # primary plus one fallback (D21)
@@ -107,7 +108,9 @@ def retry_policy(failure_class, attempts, now, retry_at=None, first_at=None, con
     quota               durable retry_at from the reset time (default 1 h), no probing; needs-attention once the
                         quota deadline (24 h from the first quota failure) passes
     auth                opens the provider circuit; never retried on a timer
-    contention          pool busy: wait, and waiting is not an attempt
+    contention          pool busy (REVIEW_NOT_STARTED on a held pool): wait; waiting is not an attempt
+    unknown-outcome     launch or supervision outcome unknown: needs-attention until usage_guard reconciliation
+    environment         local reviewer environment defect (EXEC_*, SNAPSHOT_*): needs-attention
     advisory            an advisory opinion is not a signoff: review-error, no retry
     inconsistent        a receipt whose verdict contradicts its exit status: review-error, no retry
     block               never re-run unchanged
@@ -137,6 +140,8 @@ def retry_policy(failure_class, attempts, now, retry_at=None, first_at=None, con
         return "deferred", now + 120
     if failure_class in ("advisory", "inconsistent"):
         return "review-error", None
+    if failure_class in ("unknown-outcome", "environment"):
+        return "needs-attention", None
     if failure_class == "block":
         return "blocked", None
     if failure_class == "stale":
@@ -146,19 +151,33 @@ def retry_policy(failure_class, attempts, now, retry_at=None, first_at=None, con
     raise ValueError("unknown failure class: " + str(failure_class))
 
 
-def classify_review_failure(stderr):
-    """Map peer_review's REVIEW_DIAGNOSTIC code to a retry class (unknown is transient, never success)."""
+TRANSIENT_CODES = {"PROVIDER_UNAVAILABLE", "PROVIDER_TIMEOUT", "BUDGET_EXHAUSTED", "REVIEW_NOT_STARTED",
+                   "SNAPSHOT_TIMEOUT", "SNAPSHOT_SOURCE_CHANGED", "SNAPSHOT_GIT_FAILED"}
+UNKNOWN_CODES = {"REVIEW_LAUNCH_UNCONFIRMED", "PROVIDER_IO_UNKNOWN", "ISOLATION_FAILED"}
+CONTENTION = re.compile(r"\b(?:pool|reservation|reserved|cooldown|held by)\b", re.I)
+
+
+def classify_review_failure(stderr, rc=None):
+    """Map peer_review's exit and REVIEW_DIAGNOSTIC code to a retry class. Only an explicit list is transient; an
+    uncertain launch or supervision outcome, our own timeout (124), a missing executable (127) or a missing code is
+    `unknown-outcome`, which is never retried until usage_guard reconciliation (code-inspection r1 F3)."""
+    if rc in (core.TIMEOUT_RC, 127):
+        return "unknown-outcome", "AHC_CHILD_%s" % rc
     codes = DIAG.findall(stderr or "")
     code = codes[-1] if codes else ""
-    if code == "PROVIDER_USAGE_LIMIT" or code == "BUDGET_EXHAUSTED":
+    if not code or code in UNKNOWN_CODES:
+        return "unknown-outcome", code or "NO_DIAGNOSTIC"
+    if code == "PROVIDER_USAGE_LIMIT":
         return "quota", code
     if code == "PROVIDER_AUTH":
         return "auth", code
     if code in ("PROVIDER_INVALID_OUTPUT", "FALLBACK_NO_RESULT"):
         return "invalid-output", code
-    if "CONTENTION" in code or "POOL_BUSY" in code or "COOLDOWN" in code:
+    if code == "REVIEW_NOT_STARTED" and CONTENTION.search(stderr or ""):
         return "contention", code
-    return "provider-transient", code or "UNKNOWN"
+    if code in TRANSIENT_CODES:
+        return "provider-transient", code
+    return "environment", code   # EXEC_*, other SNAPSHOT_*, PYTHON_UNSUPPORTED: a local defect, not a retry
 
 
 def _reset_time(stderr):
@@ -408,7 +427,10 @@ class Worker:
                                 (token, now + LEASE_SECONDS, iid))
         return token
 
-    def settle(self, iid, token, state, next_action_at=None, event=None, **data):
+    def settle(self, iid, token, state, next_action_at=None, event=None, notice=None, **data):
+        """Change the item's state under its lease. `notice` (dict: state, audience, reason or body, requires_ack)
+        is inserted with its effects in the SAME transaction, so a crash can never leave a settled item without
+        its notice (code-inspection r1 F1)."""
         if state in NON_TERMINAL and next_action_at is None:
             raise ValueError("non-terminal state %s needs next_action_at (I2)" % state)
         now = self.now()
@@ -422,6 +444,13 @@ class Worker:
             if cur.rowcount != 1:
                 raise Fenced(iid)
             self.led.event(iid, event or state, now, **data)
+            if notice is not None:
+                req = json.loads(row["request"])
+                body = notice.get("body")
+                if body is None:
+                    body = _owner_body(iid, req, merged, notice["state"], notice.get("reason", ""))
+                self._insert_notice(iid, req, notice["state"], notice["audience"], body, notice["requires_ack"],
+                                    now)
         _mirror(self.paths, iid, event or state, now, data)
         if STOP_AFTER == state and state != "reviewing":  # "reviewing" stops after the review returns (review())
             raise _Stop(state)
@@ -442,16 +471,15 @@ class Worker:
         return attempts[failure_class]
 
     def fail(self, iid, token, failure_class, reason, retry_at=None, **data):
-        count = self.bump(iid, failure_class)
+        count = self.bump(iid, failure_class) if failure_class != "contention" else 0  # waiting is not an attempt
         first_key = "first_" + failure_class.replace("-", "_") + "_at"
         first_at = json.loads(self.led.item(iid)["data"]).get(first_key, self.now())
         data.setdefault(first_key, first_at)
         state, next_at = retry_policy(failure_class, count, self.now(), retry_at, first_at=first_at,
                                       config=self.config)
+        notice = _owner_notice(state, reason) if state in OWNER_NOTICE_STATES else None
         self.settle(iid, token, state, next_at, event="%s:%s" % (state, failure_class), reason=reason,
-                    failure_class=failure_class, **data)
-        if state in OWNER_NOTICE_STATES:
-            self.notify_owner(iid, state, reason)
+                    failure_class=failure_class, notice=notice, **data)
         return state
 
     # --- the pipeline
@@ -479,8 +507,8 @@ class Worker:
         fix = ahc_packet.fix_packet(decoded, req["head"], source_path=req["packet"])
         if fix["status"] == "unfixable":
             body = "Packet lint failed; no provider was launched.\n" + "\n".join("- " + p for p in fix["problems"])
-            self.settle(iid, token, "lint-failed", event="lint-failed", reason=body)
-            self.notify_owner(iid, "lint-failed", body)
+            self.settle(iid, token, "lint-failed", event="lint-failed", reason=body,
+                        notice=_owner_notice("lint-failed", body))
             return "lint-failed"
         # 3. live PR facts (never trust the request)
         try:
@@ -514,19 +542,22 @@ class Worker:
                                       (iid,)).fetchone()["n"] + 1
         row = self.led.item(iid)
         prior = json.loads(row["data"]).get("repeat_reason")
-        if attempt > 1 and not prior:
+        relaunch_ok = json.loads(row["data"]).get("relaunch_ok")
+        if attempt > 1 and not (prior or relaunch_ok):
             # one attempt per item unless retry_policy deferred it with a declared repeat reason (D7)
-            return self.settle(iid, token, "needs-attention", event="relaunch-refused",
-                               reason="a review attempt already exists for this item")
+            reason = "a review attempt already exists for this item"
+            return self.settle(iid, token, "needs-attention", event="relaunch-refused", reason=reason,
+                               notice=_owner_notice("needs-attention", reason))
         report = self.paths.reports / ("%s-a%d.md" % (iid, attempt))
         if report.exists():
-            return self.settle(iid, token, "needs-attention", event="report-path-taken",
-                               reason="report path already exists; refusing to overwrite a receipt")
+            reason = "report path already exists; refusing to overwrite a receipt"
+            return self.settle(iid, token, "needs-attention", event="report-path-taken", reason=reason,
+                               notice=_owner_notice("needs-attention", reason))
         argv = [sys.executable, str(self.config.get("peer_review", Path.home() / ".claude/hooks/peer_review.py")),
                 "pr", "--repo", clone, "--packet", str(fixed_path), "--output", str(report),
                 "--expected-head", facts["head"], "--snapshot-base", merge_base, "--base", merge_base,
                 "--timeout", str(REVIEW_TIMEOUT), "--owner", "ahc"]
-        if attempt > 1:
+        if attempt > 1 and prior:
             argv += ["--repeat-reason", prior]
         key = "review:%s:%d" % (iid, attempt)
         now = self.now()
@@ -537,7 +568,7 @@ class Worker:
         self.settle(iid, token, "reviewing", now + REVIEW_WALL, report=str(report), packet=str(fixed_path),
                     review_key=key, clone=clone, merge_base=merge_base, base_note=facts.get("base_repaired_from", ""),
                     fix_actions=fix["actions"], protected=protected_note, attempt=attempt,
-                    repeat_reason=None)  # a declared repeat is spent by this launch
+                    repeat_reason=None, relaunch_ok=None)  # a declared repeat is spent by this launch
         result = self.deps.review(argv, REVIEW_WALL)
         rc, stderr = (result if isinstance(result, tuple) else (result, ""))
         with self.led.tx():  # readback recorded before the verdict is acted on
@@ -558,15 +589,16 @@ class Worker:
         if name == "PASS" or name == "PASS-WITH-TICKETS":
             reason = "pass-gate1" + ("; " + data["protected"] if data.get("protected") else "")
             self.settle(iid, token, "routed-to-main", self.now() + PASS_RECHECK, event="pass", verdict=name,
-                        routed_at=self.now(), routed_reason=reason)
-            self.notify_pass(iid, req, data, name)
+                        routed_at=self.now(), routed_reason=reason,
+                        notice={"state": "pass", "audience": "main", "body": _pass_body(iid, req, data, name),
+                                "requires_ack": False})
             return "routed-to-main"
         if name == "BLOCK":
             with self.led.tx():
                 self.led.db.execute("UPDATE lineage SET block_rounds=block_rounds+1 WHERE lineage=?",
                                     (row["lineage"],))
-            self.settle(iid, token, "blocked", event="blocked", verdict="BLOCK")
-            self.notify_owner(iid, "blocked", _report_body(data["report"]))
+            self.settle(iid, token, "blocked", event="blocked", verdict="BLOCK",
+                        notice=_owner_notice("blocked", _report_body(data["report"])))
             return "blocked"
         if name == "ADVISORY":
             return self.fail(iid, token, "advisory", "peer_review returned an advisory opinion, not a signoff")
@@ -575,19 +607,25 @@ class Worker:
                              repeat_reason="RECEIPT_INVALID: " + verdict["reason"])
         if result["rc"] in (core.EXIT_PASS, core.EXIT_BLOCK):
             return self.fail(iid, token, "inconsistent", "receipt contradicts its exit status: " + verdict["reason"])
-        failure_class, code = classify_review_failure(result.get("stderr", ""))
+        failure_class, code = classify_review_failure(result.get("stderr", ""), result["rc"])
         if failure_class == "auth":
             with self.led.tx():
                 self.led.db.execute("INSERT OR REPLACE INTO circuits(provider, opened, reason) VALUES (?,?,?)",
                                     ("review", self.now(), code))
+        if failure_class == "unknown-outcome":
+            reason = ("review outcome unknown (%s, exit %s). Reconcile the run with usage_guard (python3 "
+                      "~/.claude/hooks/usage_guard.py inspect/reconcile) before any retry; ahc will not relaunch it."
+                      % (code, result["rc"]))
+            return self.fail(iid, token, failure_class, reason)
+        if failure_class == "contention":
+            return self.fail(iid, token, failure_class, "reviewer pool busy (%s); waiting" % code, relaunch_ok=True)
         repeat = "%s: ahc deferred retry after %s" % (code, verdict["reason"])
         state = self.fail(iid, token, failure_class, "review error (%s): %s" % (code, verdict["reason"]),
                           retry_at=_reset_time(result.get("stderr", "")), repeat_reason=repeat)
         return state
 
     def refuse(self, iid, token, reason):
-        self.settle(iid, token, "refused", event="refused", reason=reason)
-        self.notify_owner(iid, "refused", reason)
+        self.settle(iid, token, "refused", event="refused", reason=reason, notice=_owner_notice("refused", reason))
         return "refused"
 
     def recover(self, row):
@@ -602,8 +640,8 @@ class Worker:
             return self.conclude(iid, token, req, key)
         reason = ("the previous daemon stopped during the review; its outcome is unknown. Reconcile the run with "
                   "usage_guard (python3 ~/.claude/hooks/usage_guard.py inspect/reconcile) before any retry.")
-        self.settle(iid, token, "needs-attention", event="review-outcome-unknown", reason=reason)
-        self.notify_owner(iid, "needs-attention", reason)
+        self.settle(iid, token, "needs-attention", event="review-outcome-unknown", reason=reason,
+                    notice=_owner_notice("needs-attention", reason))
         return "needs-attention"
 
     def recheck_pass(self, iid, token, req):
@@ -630,12 +668,13 @@ class Worker:
         due = (now - routed_at >= ROUTED_FIRST) if last is None else (now - float(last) >= ROUTED_REPEAT)
         if due:
             count = int(data.get("routed_escalations", 0)) + 1
-            self.settle(iid, token, "routed-to-main", now + PASS_RECHECK, event="routed-escalated",
-                        routed_escalated_at=now, routed_escalations=count)
+            notice_state = "routed-overdue-%d" % count
             body = ("Routed to main (%s) for %s#%s at %s; still waiting after %d h.\nReceipt: %s\nMain runs: %s"
                     % (data.get("routed_reason", "pass-gate1"), req["repo"], req["pr"], req["head"],
                        int((now - routed_at) // 3600), data.get("report"), merge_command(req)))
-            self.queue_notice(iid, "routed-overdue-%d" % count, "user", body, requires_ack=False)
+            self.settle(iid, token, "routed-to-main", now + PASS_RECHECK, event="routed-escalated",
+                        routed_escalated_at=now, routed_escalations=count,
+                        notice={"state": notice_state, "audience": "user", "body": body, "requires_ack": False})
             return "routed-to-main"
         return self.settle(iid, token, "routed-to-main", now + PASS_RECHECK, event="recheck")
 
@@ -644,42 +683,32 @@ class Worker:
         return self.led.db.execute("SELECT 1 FROM circuits WHERE provider='review'").fetchone() is not None
 
     # --- notices and effects
-    def notify_owner(self, iid, state, reason):
-        row = self.led.item(iid)
-        req = json.loads(row["request"])
-        data = json.loads(row["data"])
-        body = _owner_body(iid, req, data, state, reason)
-        self.queue_notice(iid, state, "owner", body, requires_ack=True)
-
-    def notify_pass(self, iid, req, data, verdict):
-        body = _pass_body(iid, req, data, verdict)
-        self.queue_notice(iid, "pass", "main", body, requires_ack=False)
-
-    def queue_notice(self, iid, state, audience, body, requires_ack):
-        """One notice per (item, state): its effects are ticket comment, owner inbox (owner audience) and digest."""
-        row = self.led.item(iid)
-        req = json.loads(row["request"])
+    def _insert_notice(self, iid, req, state, audience, body, requires_ack, now):
+        """Insert one notice and its effects; the caller holds the transaction. One notice per (item, state)
+        (NEG-34). Effects: ticket comment always; owner inbox for owner notices; a high alert (v15 sink: dashboard,
+        and email through the GoodQA deadman route) for user-audience notices and terminal-unsuccessful states;
+        the digest as a courtesy copy for main."""
         nkey = "%s:%s" % (iid, state)
-        now = self.now()
         body = redact.redact(body)
-        with self.led.tx():
-            cur = self.led.db.execute(
-                "INSERT OR IGNORE INTO notices(key, item, state, audience, requires_ack, deadline, created)"
-                " VALUES (?,?,?,?,?,?,?)",
-                (nkey, iid, state, audience, int(requires_ack),
-                 now + bounds(self.config)["block_ack_seconds"] if requires_ack else None, now))
-            if cur.rowcount != 1:
-                return  # NEG-34: the same state change never produces a second message
-            effects = [("ticket", {"ticket": req["ticket"], "body": body, "key": "ahc-" + nkey.replace(":", "-")})]
-            if audience == "owner":
-                effects.append(("inbox", {"path": str(self.paths.inbox / req["owner"] / ("%s-%s.md" % (iid, state))),
-                                          "body": body}))
-            effects.append(("digest", {"line": _digest_line(iid, req, state, body), "key": nkey}))
-            for kind, payload in effects:
-                self.led.db.execute(
-                    "INSERT OR IGNORE INTO effects(key, item, kind, status, attempts, next_action_at, payload, updated)"
-                    " VALUES (?,?,?,?,?,?,?,?)",
-                    ("%s:%s" % (kind, nkey), iid, kind, "pending", 0, now, json.dumps(payload), now))
+        cur = self.led.db.execute(
+            "INSERT OR IGNORE INTO notices(key, item, state, audience, requires_ack, deadline, created)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (nkey, iid, state, audience, int(requires_ack),
+             now + bounds(self.config)["block_ack_seconds"] if requires_ack else None, now))
+        if cur.rowcount != 1:
+            return
+        effects = [("ticket", {"ticket": req["ticket"], "body": body, "key": "ahc-" + nkey.replace(":", "-")})]
+        if audience == "owner":
+            effects.append(("inbox", {"path": str(self.paths.inbox / req["owner"] / ("%s-%s.md" % (iid, state))),
+                                      "body": body}))
+        if audience == "user" or state in ALERT_STATES:
+            effects.append(("alert", _alert_payload(iid, req, state, body)))
+        effects.append(("digest", {"line": _digest_line(iid, req, state, body), "key": nkey}))
+        for kind, payload in effects:
+            self.led.db.execute(
+                "INSERT OR IGNORE INTO effects(key, item, kind, status, attempts, next_action_at, payload, updated)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                ("%s:%s" % (kind, nkey), iid, kind, "pending", 0, now, json.dumps(payload), now))
 
     def dispatch_effects(self):
         now = self.now()
@@ -733,11 +762,10 @@ class Worker:
                 if not self.readback("digest", payload):
                     _append_private(self.paths.digest, payload["line"])
                 return True, "appended"
-            if kind == "sink":
-                sink = self.config.get("user_sink")
-                if not sink:
-                    return True, "no direct user channel configured (decision U3); ticket and digest carry it"
-                rc, _out, err = self.deps.ah(list(sink) + ["--body", payload["body"]], 60)
+            if kind == "alert":
+                rc, _out, err = self.deps.ah(["ah", "alert", "raise", "--severity", "high", "--alert-key",
+                                              payload["alert_key"], "--source", "ahc", "--key", payload["key"],
+                                              "--message", payload["message"]], 60)
                 return rc == 0, "rc=%s %s" % (rc, _short(err))
         except (OSError, subprocess.SubprocessError) as error:
             return False, _short(error)
@@ -756,18 +784,9 @@ class Worker:
                     "the ticket and the user channel. Acknowledge with: python3 ~/.claude/hooks/ahc_runner.py ack %s "
                     "--owner %s" % (req["owner"], notice["state"], req["repo"], req["pr"], notice["item"],
                                     bounds(self.config)["block_ack_seconds"] // 60, notice["item"], req["owner"]))
-            ekey = "%s:escalation" % notice["key"]
             with self.led.tx():
                 self.led.db.execute("UPDATE notices SET escalated_at=? WHERE key=?", (now, notice["key"]))
-                for kind, payload in (
-                        ("ticket", {"ticket": req["ticket"], "body": body, "key": "ahc-" + ekey.replace(":", "-")}),
-                        ("sink", {"body": body}),
-                        ("digest", {"line": _digest_line(notice["item"], req, "escalated", body), "key": ekey})):
-                    self.led.db.execute(
-                        "INSERT OR IGNORE INTO effects(key, item, kind, status, attempts, next_action_at, payload,"
-                        " updated) VALUES (?,?,?,?,?,?,?,?)",
-                        ("%s:%s" % (kind, ekey), notice["item"], kind, "pending", 0, now, json.dumps(payload), now))
-
+                self._insert_notice(notice["item"], req, "%s-escalated" % notice["state"], "user", body, False, now)
 
 # ---------------------------------------------------------------- tick
 
@@ -872,6 +891,16 @@ def _report_body(report_path):
         return "(the report could not be read)"
     head, _sep, body = text.partition("\n\n")
     return body.strip()[:MAX_BODY] or text[:MAX_BODY]
+
+
+def _owner_notice(state, reason):
+    return {"state": state, "audience": "owner", "reason": reason, "requires_ack": True}
+
+
+def _alert_payload(iid, req, state, body):
+    message = "ahc %s: %s#%s %s | %s" % (state, req["repo"], req["pr"], req["head"][:12],
+                                       " ".join(body.split())[:400])
+    return {"alert_key": "ahc:" + iid, "key": "ahc-%s-%s" % (iid, state), "message": message}
 
 
 def _owner_body(iid, req, data, state, reason):

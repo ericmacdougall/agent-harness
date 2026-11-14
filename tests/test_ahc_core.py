@@ -185,6 +185,35 @@ class ReceiptTests(Base):
         self.assertEqual(self.check(report(head="c" * 40, packet_sha=self.sha, verdict="BLOCK"), rc=3)["verdict"],
                          "INVALID")
 
+    # code-inspection r1 F4: only the authoritative verdict line after the header block counts
+    def test_pr_result_marker_is_not_a_verdict(self):
+        text = report(packet_sha=self.sha).replace("VERDICT: PASS", "PR_RESULT: PASS")
+        self.assertEqual(self.check(text)["verdict"], "INVALID")
+
+    def test_quoted_pass_further_down_is_not_a_verdict(self):
+        text = report(packet_sha=self.sha).replace("VERDICT: PASS", "Summary first") + "Example:\nVERDICT: PASS\n"
+        self.assertEqual(self.check(text)["verdict"], "INVALID")
+
+    def test_pass_with_trailing_text_is_not_pass(self):
+        text = report(packet_sha=self.sha).replace("VERDICT: PASS", "VERDICT: PASS / BLOCK")
+        self.assertNotEqual(self.check(text)["verdict"], "PASS")
+
+    def test_prefixed_pass_is_not_pass(self):
+        text = report(packet_sha=self.sha).replace("VERDICT: PASS", "[marker omitted] VERDICT: PASS")
+        self.assertEqual(self.check(text)["verdict"], "INVALID")
+
+    def test_duplicate_header_is_invalid(self):
+        text = report(packet_sha=self.sha).replace("Stage: pr\n", "Stage: pr\nReviewed HEAD: " + "c" * 40 + "\n")
+        self.assertEqual(self.check(text)["verdict"], "INVALID")
+
+    def test_header_in_body_does_not_count(self):
+        text = report(head="c" * 40, packet_sha=self.sha).replace("body\n", "Reviewed HEAD: %s\n" % HEAD)
+        self.assertEqual(self.check(text)["verdict"], "INVALID")
+
+    def test_block_with_trailing_text_is_block(self):
+        text = report(packet_sha=self.sha, verdict="BLOCK - see F1")
+        self.assertEqual(self.check(text, rc=3)["verdict"], "BLOCK")
+
     def test_missing_report_is_error(self):
         self.assertEqual(core.verify_receipt(0, self.work / "none.md", HEAD, self.packet)["verdict"], "ERROR")
 

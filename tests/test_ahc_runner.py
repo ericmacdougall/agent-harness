@@ -309,6 +309,152 @@ class RetryTests(Base):
         self.assertEqual(lineage["gh-transient"], 2)
 
 
+class AtomicNoticeTests(Base):
+    """code-inspection r1 F1: a state change and its notice commit together; a crash in between loses neither."""
+
+    def crash_once(self):
+        real = runner.Worker._insert_notice
+        calls = {"n": 0}
+
+        def boom(worker, *a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("injected crash during notice insertion")
+            return real(worker, *a, **kw)
+        runner.Worker._insert_notice = boom
+        self.addCleanup(setattr, runner.Worker, "_insert_notice", real)
+
+    def rows(self, sql, *args):
+        ledger = runner.Ledger(self.paths)
+        try:
+            return ledger.db.execute(sql, args).fetchall()
+        finally:
+            ledger.close()
+
+    def test_crash_in_notice_insert_rolls_back_the_block_and_redelivers_once(self):
+        iid, deps = self.submit(), Deps(verdict="BLOCK")
+        self.crash_once()
+        with self.assertRaises(RuntimeError):
+            self.run_all(deps)
+        self.assertNotEqual(self.state(iid), "blocked", "item settled without its notice (F1)")
+        self.assertEqual(self.rows("SELECT * FROM notices WHERE item=?", iid), [])
+        for _ in range(3):
+            self.run_all(deps)
+            deps.now += 120
+        self.assertEqual(self.state(iid), "blocked")
+        self.assertEqual(len(deps.review_calls), 1, "the crash must not cause a second review")
+        self.assertEqual(len(self.rows("SELECT * FROM notices WHERE item=?", iid)), 1)
+        comments = [a for a in deps.ah_calls if a[:3] == ["ah", "ticket", "comment"]]
+        self.assertEqual(len(comments), 1)
+
+    def test_crash_in_notice_insert_rolls_back_a_refusal(self):
+        iid, deps = self.submit(), Deps()
+        closed = {"number": 7, "state": "CLOSED", "headRefOid": HEAD, "baseRefOid": BASE, "baseRefName": "main",
+                  "isCrossRepository": False}
+        deps.gh = lambda argv, timeout: (0, json.dumps(closed), "")
+        self.crash_once()
+        with self.assertRaises(RuntimeError):
+            self.run_all(deps)
+        self.assertNotEqual(self.state(iid), "refused")
+        self.run_all(deps)
+        self.assertEqual(self.state(iid), "refused")
+        self.assertEqual(len(self.rows("SELECT * FROM notices WHERE item=?", iid)), 1)
+
+    def test_terminal_unsuccessful_gets_ticket_and_alert(self):
+        iid, deps = self.submit(), ErrDeps("PROVIDER_AUTH")
+        self.run_all(deps)
+        self.assertEqual(self.state(iid), "needs-attention")
+        alerts = [a for a in deps.ah_calls if a[:3] == ["ah", "alert", "raise"]]
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0][alerts[0].index("--alert-key") + 1], "ahc:" + iid)
+        self.assertEqual(alerts[0][alerts[0].index("--severity") + 1], "high")
+        self.assertTrue([a for a in deps.ah_calls if a[:3] == ["ah", "ticket", "comment"]])
+        kinds = {r["kind"] for r in self.rows("SELECT kind FROM effects WHERE item=?", iid)}
+        self.assertTrue({"alert", "ticket"} <= kinds)
+        self.assertNotIn("sink", kinds)
+
+    def test_block_alone_does_not_alert_until_no_ack(self):
+        iid, deps = self.submit(), Deps(verdict="BLOCK")
+        self.run_all(deps)
+        self.assertEqual([a for a in deps.ah_calls if a[:3] == ["ah", "alert", "raise"]], [])
+        deps.now += 4 * 3600 + 1
+        self.run_all(deps)
+        alerts = [a for a in deps.ah_calls if a[:3] == ["ah", "alert", "raise"]]
+        self.assertEqual(len(alerts), 1, "an unacked block escalates exactly once with an alert")
+        self.run_all(deps)
+        self.assertEqual(len([a for a in deps.ah_calls if a[:3] == ["ah", "alert", "raise"]]), 1)
+
+
+class OutcomeClassTests(Base):
+    """code-inspection r1 F3: only listed codes are transient; an unknown outcome is never retried automatically."""
+
+    def test_classification_table(self):
+        cls = runner.classify_review_failure
+        diag = "REVIEW_DIAGNOSTIC code=%s reason=x"
+        for code in ("PROVIDER_UNAVAILABLE", "PROVIDER_TIMEOUT", "BUDGET_EXHAUSTED", "SNAPSHOT_TIMEOUT",
+                     "SNAPSHOT_SOURCE_CHANGED", "SNAPSHOT_GIT_FAILED", "REVIEW_NOT_STARTED"):
+            self.assertEqual(cls(diag % code, 2)[0], "provider-transient", code)
+        self.assertEqual(cls(diag % "PROVIDER_USAGE_LIMIT", 2)[0], "quota")
+        self.assertEqual(cls(diag % "PROVIDER_AUTH", 2)[0], "auth")
+        self.assertEqual(cls(diag % "FALLBACK_NO_RESULT", 2)[0], "invalid-output")
+        self.assertEqual(cls(diag % "REVIEW_NOT_STARTED" + " pool held by run 12", 2)[0], "contention")
+        for code in ("REVIEW_LAUNCH_UNCONFIRMED", "PROVIDER_IO_UNKNOWN", "ISOLATION_FAILED"):
+            self.assertEqual(cls(diag % code, 2)[0], "unknown-outcome", code)
+        self.assertEqual(cls("", 2)[0], "unknown-outcome")
+        self.assertEqual(cls(diag % "PROVIDER_UNAVAILABLE", core.TIMEOUT_RC)[0], "unknown-outcome")
+        self.assertEqual(cls("", 127)[0], "unknown-outcome")
+        for code in ("EXEC_FAILED", "SNAPSHOT_TOO_LARGE", "PYTHON_UNSUPPORTED", "SOMETHING_NEW"):
+            self.assertEqual(cls(diag % code, 2)[0], "environment", code)
+
+    def test_unknown_outcome_is_needs_attention_and_never_relaunched(self):
+        iid, deps = self.submit(), ErrDeps("REVIEW_LAUNCH_UNCONFIRMED")
+        for _ in range(4):
+            self.run_all(deps)
+            deps.now += 7200
+        self.assertEqual(len(deps.review_calls), 1)
+        self.assertEqual(self.state(iid), "needs-attention")
+        inbox = list((self.paths.inbox / "agent-abc123").glob("*.md"))
+        self.assertIn("usage_guard", inbox[0].read_text())
+
+    def test_missing_diagnostic_is_not_transient(self):
+        iid, deps = self.submit(), ErrDeps("")
+
+        def review(argv, timeout):
+            deps.review_calls.append(argv)
+            return 2, "boom"
+        deps.review = review
+        for _ in range(3):
+            self.run_all(deps)
+            deps.now += 7200
+        self.assertEqual(len(deps.review_calls), 1)
+        self.assertEqual(self.state(iid), "needs-attention")
+
+    def test_contention_waits_without_counting_or_repeat_reason(self):
+        iid, deps = self.submit(), ErrDeps("REVIEW_NOT_STARTED")
+
+        def review(argv, timeout):
+            deps.review_calls.append(argv)
+            return 2, "REVIEW_DIAGNOSTIC code=REVIEW_NOT_STARTED reason=pool held"
+        deps.review = review
+        for _ in range(4):
+            self.run_all(deps)
+            deps.now += 130
+        self.assertGreaterEqual(len(deps.review_calls), 3, "contention must keep waiting, not give up")
+        self.assertEqual(self.state(iid), "deferred")
+        for argv in deps.review_calls:
+            self.assertNotIn("--repeat-reason", argv)
+        ledger = runner.Ledger(self.paths)
+        try:
+            attempts = json.loads(ledger.item(iid)["attempts"])
+        finally:
+            ledger.close()
+        self.assertNotIn("contention", attempts)
+
+    def test_policy_for_new_classes(self):
+        self.assertEqual(runner.retry_policy("unknown-outcome", 1, 0.0), ("needs-attention", None))
+        self.assertEqual(runner.retry_policy("environment", 1, 0.0), ("needs-attention", None))
+
+
 class DeliveryTests(Base):
     """AC-19 / NEG-26 / NEG-34: an inbox file is not delivery; only the owner's ack is; no ack escalates once."""
 
@@ -566,6 +712,36 @@ class TimeoutTests(unittest.TestCase):
                 _time.sleep(0.1)
             else:
                 self.fail("the grandchild survived the timeout")
+
+    def test_grandchild_that_ignores_sigterm_is_killed(self):
+        # code-inspection r1 F2: the leader exits on SIGTERM; its child ignores SIGTERM and must still die.
+        import os
+        import time as _time
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "grandchild.pid"
+            script = Path(tmp) / "fake_gh.py"
+            script.write_text(
+                "import signal, subprocess, sys, time\n"
+                "p = subprocess.Popen([sys.executable, '-c', 'import signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)'])\n"
+                f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+                "signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))\n"
+                "time.sleep(600)\n")
+            rc, _out, err = core.run_argv([sys.executable, str(script)], 1.5)
+            self.assertEqual(rc, core.TIMEOUT_RC)
+            grandchild = int(pidfile.read_text())
+            alive = True
+            for _ in range(50):
+                try:
+                    os.kill(grandchild, 0)
+                except ProcessLookupError:
+                    alive = False
+                    break
+                _time.sleep(0.1)
+            if alive:
+                os.kill(grandchild, 9)
+            self.assertFalse(alive, "a SIGTERM-ignoring grandchild survived")
+            self.assertIn("process group killed", err)
 
     def test_lease_is_review_timeout_plus_60(self):
         self.assertEqual(runner.LEASE_SECONDS, core.TIMEOUTS["review"] + 60)
