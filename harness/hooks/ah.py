@@ -408,6 +408,14 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     for d in disp.values():
         if d.get("kind") == "waiting" and ASK_ID_RE.match(str(d.get("ref") or "")) and asks.get(d["ref"]) != "open":
             d["until"] = min(float(d.get("until") or 0.0), float(d.get("at") or 0.0))  # answered: the wait is over
+    # goodqa#15949 (receipt r2 F1): activity after a wait disposition supersedes it everywhere (liveness, wait
+    # classification, alerts) and stays superseded as the activity ages. A main-acknowledged handoff wait is kept: it
+    # takes the owner's result, which later notes must not revoke.
+    for r in rows:
+        d = disp.get(r["agent_id"])
+        if r["owner"] and d and d.get("kind") == "waiting" and not d.get("ack_handoff") \
+                and (r.get("active_at") or parse_ts(r["last_activity"]) or 0.0) > float(d.get("at") or 0.0) + RESUMED_ACTIVITY_S:
+            del disp[r["agent_id"]]
     # a returned parent with live children is still doing the work through them (main's finding: a4720127 and its 7
     # reviewers), so it counts as live for a reassignment (dispose guard). Only a child with recent activity counts:
     # a crashed child stays idle-helper or SILENT for ever (PR review of 24a786c, F3)
@@ -476,9 +484,6 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         d = r.get("disposition") or {}
         if d.get("kind") in liveness.ENDING_DISPOSITIONS:
             continue  # a terminal disposition stays terminal, whatever the owner's last note says
-        if d.get("kind") == "waiting" and d.get("live") and str(r["state"]).startswith(("live", "working")) \
-                and (r.get("active_at") or parse_ts(r["last_activity"]) or 0.0) > float(d.get("at") or 0.0) + RESUMED_ACTIVITY_S:
-            continue  # goodqa#15949: fresh activity after the wait wins; a live, working owner is not waiting
         ref = str(d.get("ref") or "") if d.get("kind") == "waiting" and d.get("live") else \
             (r["state"][len("waiting-on-"):] if r["state"].startswith("waiting-on-") else "")
         if not ref and d.get("kind") == "waiting" and d.get("live"):

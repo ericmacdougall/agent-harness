@@ -333,6 +333,37 @@ class Goodqa15949Tests(Base):
         self.assertNotIn("tick", self.tick_streams())
 
 
+    def _resumed_then_aged(self, **wait):  # receipt r2 F1: a wait, activity 10 min later, then the clock moves on
+        self.dispose("tick", "waiting", wait.pop("key"), until=iso(NOW + 3 * HOUR), at=iso(NOW - 700), **wait)
+        jl(self.w / "agent-tick.jsonl", [{"at": iso(NOW - 100), "event": "check", "note": "resumed and working"}])
+        out = {}
+        for label, later in (("fresh", 0), ("silent", 45 * 60), ("hours", 7 * HOUR)):  # past the live and SILENT windows and the undisposed-silent report
+            data = ah.owners(self.home, SESSION, now=NOW + later)
+            row = [r for r in data["owners"] if r["agent_id"] == "tick"][0]
+            out[label] = (row, "tick" in [x["agent"] for x in self.ig.assess(self.home, SESSION, NOW + later)["streams"]])
+        return out
+
+    def test_activity_supersedes_an_ordinary_ticket_wait_as_it_ages(self):
+        for label, (row, _listed) in self._resumed_then_aged(key="tick-r2-ordinary", ref="GoodQA goodqa#15943").items():
+            with self.subTest(label):
+                self.assertIsNone(row["disposition"], row)
+                self.assertIsNone(row["wait_on"], row)
+
+    def test_activity_supersedes_an_external_wait_as_it_ages(self):
+        out = self._resumed_then_aged(key="tick-r2-external", ref="GoodQA goodqa#15643", external="Codex quota resets 11-16")
+        for label, (row, _listed) in out.items():
+            with self.subTest(label):
+                self.assertIsNone(row["disposition"], row)
+                self.assertNotIn("wait-not-user", row["attention"])
+        self.assertTrue(out["hours"][1], "a silent resumed owner is no longer excused by the old external wait")
+
+    def test_activity_supersedes_an_open_ask_wait_as_it_ages(self):
+        for label, (row, _listed) in self._resumed_then_aged(key="tick-r2-ask", ref="wa5b00000001").items():
+            with self.subTest(label):
+                self.assertIsNone(row["disposition"], row)
+                self.assertIsNone(row["wait_on"], row)
+
+
 class ReminderTests(Base):
     def test_rejection_injects_the_exact_line(self):  # AC-7
         out = self.ig.cmd_reject({"hook_event_name": "PostToolUseFailure", "tool_name": "AskUserQuestion",
