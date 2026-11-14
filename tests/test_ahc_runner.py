@@ -198,13 +198,46 @@ class RecoveryTests(Base):
         self.assertEqual(self.state(iid), "routed-to-main")
         self.assertEqual(len(deps.review_calls), 1)
 
-    def test_restart_mid_review_without_report_needs_attention_no_relaunch(self):
+    def test_restart_mid_review_without_report_is_outcome_unknown_no_relaunch(self):
         iid, deps = self.submit(), Deps()
         journal = runner.Journal(self.paths, iid)
         journal.append("reviewing", report=str(self.paths.reports / "missing.md"), packet=str(self.packet))
         self.run_all(deps)
-        self.assertEqual(self.state(iid), "needs-attention")
+        self.assertEqual(self.state(iid), "outcome-unknown")
         self.assertEqual(deps.review_calls, [])
+
+    def test_neg51_unknown_outcome_never_records_failure_or_relaunches(self):
+        """D26 / NEG-51: an in-flight review found on restart is not replay-safe: no relaunch, no failure or success
+        verdict, an escalation past main on D20 timing, and the item's owner can dispose after reconciling."""
+        iid, deps = self.submit(), Deps()
+        runner.Journal(self.paths, iid).append("reviewing", report=str(self.paths.reports / "x.md"),
+                                               packet=str(self.packet))
+        for _ in range(6):
+            self.run_all(deps)
+            deps.now += 3600
+        self.assertEqual(deps.review_calls, [], "a review is never replayed after a crash")
+        self.assertEqual(self.state(iid), "outcome-unknown")
+        ledger = runner.Ledger(self.paths)
+        try:
+            events = [r["event"] for r in ledger.db.execute("SELECT event FROM events WHERE item=?", (iid,))]
+        finally:
+            ledger.close()
+        self.assertFalse([e for e in events if e in ("blocked", "pass", "review-error") or e.startswith("review-error")])
+        criticals = [a for a in deps.ah_calls if a[:3] == ["ah", "alert", "raise"]
+                     and a[a.index("--severity") + 1] == "critical"]
+        self.assertEqual(len(criticals), 1, "escalated past main once by 6 h")
+
+    def test_queued_items_are_replayed_after_restart(self):
+        """Replay-safe steps (read-only resolve, lint) are requeued: a crash before the review just runs again."""
+        iid, deps = self.submit(), Deps()
+        deps.gh_rc = 1
+        self.run_all(deps)
+        self.assertIn(self.state(iid), ("queued", "deferred"))
+        deps.gh_rc = 0
+        deps.now += 3600
+        self.run_all(deps)
+        self.assertEqual(self.state(iid), "routed-to-main")
+        self.assertEqual(len(deps.review_calls), 1)
 
     def test_torn_journal_line_is_ignored(self):
         iid, deps = self.submit(), Deps()
@@ -420,13 +453,13 @@ class OutcomeClassTests(Base):
         # spec owner ruling (v16b): an unlisted code may mean the provider launched
         self.assertEqual(cls(diag % "SOMETHING_NEW", 2)[0], "unknown-outcome")
 
-    def test_unknown_outcome_is_needs_attention_and_never_relaunched(self):
+    def test_unknown_outcome_is_outcome_unknown_and_never_relaunched(self):
         iid, deps = self.submit(), ErrDeps("REVIEW_LAUNCH_UNCONFIRMED")
         for _ in range(4):
             self.run_all(deps)
             deps.now += 7200
         self.assertEqual(len(deps.review_calls), 1)
-        self.assertEqual(self.state(iid), "needs-attention")
+        self.assertEqual(self.state(iid), "outcome-unknown")
         inbox = list((self.paths.inbox / "agent-abc123").glob("*.md"))
         self.assertIn("usage_guard", inbox[0].read_text())
 
@@ -441,7 +474,7 @@ class OutcomeClassTests(Base):
             self.run_all(deps)
             deps.now += 7200
         self.assertEqual(len(deps.review_calls), 1)
-        self.assertEqual(self.state(iid), "needs-attention")
+        self.assertEqual(self.state(iid), "outcome-unknown")  # an unlisted failure may have launched (v16b ruling)
 
     def test_contention_waits_without_counting_or_repeat_reason(self):
         iid, deps = self.submit(), ErrDeps("REVIEW_NOT_STARTED")
@@ -465,7 +498,7 @@ class OutcomeClassTests(Base):
         self.assertNotIn("contention", attempts)
 
     def test_policy_for_new_classes(self):
-        self.assertEqual(runner.retry_policy("unknown-outcome", 1, 0.0), ("needs-attention", None))
+        self.assertEqual(runner.retry_policy("unknown-outcome", 1, 0.0), ("outcome-unknown", None))
         self.assertEqual(runner.retry_policy("environment", 1, 0.0), ("needs-attention", None))
 
 

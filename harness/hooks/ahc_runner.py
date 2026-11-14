@@ -11,7 +11,7 @@ Ledger (spec D13): one SQLite database in WAL mode. Invariants enforced here:
   I3  a worker settles an item only while it holds the item's lease token (fencing);
   I4  every external effect has an intent row committed before dispatch; an effect left at `intent` is read back
       (file present, digest key present, idempotent ticket key) before any redispatch, and a review left at
-      `intent` is never relaunched: it goes to needs-attention for usage_guard reconciliation;
+      `intent` is never relaunched: it goes to outcome-unknown (D26) for usage_guard reconciliation;
   I5  attempt counts live on the item and on its PR lineage and survive restart and resubmission;
   I9  a missing observation (gh failure, unknown review outcome) is never read as success.
 Retry classes live in one function, `retry_policy`.
@@ -68,7 +68,17 @@ STATE_TABLE = {
     "lint-failed": {"settled": True, "waits_on": "owner", "cover": "ack", "alert": True, "notice": True},
     "review-error": {"settled": True, "waits_on": "owner", "cover": "ack", "alert": True, "notice": True},
     "stale-head": {"settled": True, "waits_on": "owner", "cover": "ack", "notice": True},
-    "blocked": {"settled": True, "waits_on": "owner", "cover": "ack", "notice": True},
+    # D26 recovery states (spec v23b). blocked = the receipt's BLOCK verdict: the owner notice needs an ack and the
+    # item is under D20 until the owner resubmits, the PR closes, or a disposition.
+    "blocked": {"settled": True, "waits_on": "owner", "cover": "d20", "notice": True, "dispose": ("owner", "main")},
+    # outcome-unknown: a step that is not replay-safe (a provider review) was in flight or its result could not be
+    # read; nothing is relaunched and no failure or success is recorded until a readback (usage_guard reconcile).
+    "outcome-unknown": {"settled": True, "waits_on": "owner-or-main", "cover": "d20", "alert": True, "notice": True,
+                        "dispose": ("owner", "main")},
+    # cancel-requested: a cancel the daemon has not yet confirmed (the cancel request arrives with the submit API);
+    # it escalates under D20 if the confirmation never comes. cancelled-confirmed: the cancel was read back.
+    "cancel-requested": {"settled": False, "waits_on": "daemon", "cover": "d20", "dispose": ("main",)},
+    "cancelled-confirmed": {"settled": True, "waits_on": None},
     "superseded": {"settled": True, "waits_on": None},
     "merged": {"settled": True, "waits_on": None},
     "closed": {"settled": True, "waits_on": None},
@@ -79,6 +89,7 @@ ALERT_STATES = {s for s, row in STATE_TABLE.items() if row.get("alert")}  # term
 OWNER_NOTICE_STATES = {s for s, row in STATE_TABLE.items() if row.get("notice")}
 D20_STATES = {s for s, row in STATE_TABLE.items() if row.get("cover") == "d20"}
 PERSON_ACTORS = ("owner", "main", "owner-or-main")
+UNKNOWN_OUTCOME = "outcome-unknown"
 REVIEW_TIMEOUT = 720                     # per provider, peer_review's cap
 REVIEW_WALL = core.TIMEOUTS["review"]    # primary plus one fallback (D21)
 LEASE_SECONDS = REVIEW_WALL + 60         # lease = timeout + 60 s; a reclaim mints a new fencing token
@@ -146,7 +157,7 @@ def retry_policy(failure_class, attempts, now, retry_at=None, first_at=None, con
                         quota deadline (24 h from the first quota failure) passes
     auth                opens the provider circuit; never retried on a timer
     contention          pool busy (REVIEW_NOT_STARTED on a held pool): wait; waiting is not an attempt
-    unknown-outcome     launch or supervision outcome unknown: needs-attention until usage_guard reconciliation
+    unknown-outcome     launch or supervision outcome unknown: outcome-unknown until usage_guard reconciliation
     environment         local reviewer environment defect (EXEC_*, SNAPSHOT_*): needs-attention
     advisory            an advisory opinion is not a signoff: review-error, no retry
     inconsistent        a receipt whose verdict contradicts its exit status: review-error, no retry
@@ -177,7 +188,9 @@ def retry_policy(failure_class, attempts, now, retry_at=None, first_at=None, con
         return "deferred", now + 120
     if failure_class in ("advisory", "inconsistent"):
         return "review-error", None
-    if failure_class in ("unknown-outcome", "environment"):
+    if failure_class == "unknown-outcome":
+        return UNKNOWN_OUTCOME, None   # D26 / NEG-51: never a failure without a readback
+    if failure_class == "environment":
         return "needs-attention", None
     if failure_class == "block":
         return "blocked", None
@@ -756,9 +769,9 @@ class Worker:
             return self.conclude(iid, token, req, key)
         reason = ("the previous daemon stopped during the review; its outcome is unknown. Reconcile the run with "
                   "usage_guard (python3 ~/.claude/hooks/usage_guard.py inspect/reconcile) before any retry.")
-        self.settle(iid, token, "needs-attention", event="review-outcome-unknown", reason=reason,
-                    notice=_owner_notice("needs-attention", reason))
-        return "needs-attention"
+        self.settle(iid, token, UNKNOWN_OUTCOME, event="review-outcome-unknown", reason=reason,
+                    notice=_owner_notice(UNKNOWN_OUTCOME, reason))
+        return UNKNOWN_OUTCOME
 
     def recheck_pass(self, iid, token, req):
         row = self.led.item(iid)
@@ -1316,6 +1329,13 @@ def ack(paths, iid, owner, now=None, disposition=None, main_proven=False, config
                 cur = ledger.db.execute("UPDATE notices SET acked_at=? WHERE item=? AND audience='owner' AND "
                                         "acked_at IS NULL", (now, iid))
                 ledger.event(iid, "acked", now, owner=owner, notices=cur.rowcount)
+                owner_only = STATE_TABLE.get(row["state"], {}).get("waits_on") == "owner"
+                if row["state"] in D20_STATES and row["disposed_at"] is None and owner_only:
+                    # the only party D20 waits on has acknowledged (a BLOCK): that is its disposition; states that
+                    # also wait on main (routed-to-main, needs-attention, outcome-unknown) need an explicit one
+                    ledger.db.execute("UPDATE items SET disposed_at=? WHERE id=?", (now, iid))
+                    ledger.event(iid, "disposed", now, actor="owner " + owner, reason="owner acknowledged")
+                    row = ledger.item(iid)
                 if row["state"] not in D20_STATES or row["disposed_at"] is not None:
                     Worker(paths, config or {}, deps, ledger)._clear_criticals(iid, now)
             return cur.rowcount
@@ -1401,6 +1421,8 @@ def _owner_body(iid, req, data, state, reason):
         "review-error": "No receipt was produced. Read the reason; a quota or provider outage is retried by the "
                         "daemon, anything else needs you.",
         "needs-attention": "The daemon stopped automatic work on this item. Read the reason and resubmit or ask main.",
+        UNKNOWN_OUTCOME: "The review's outcome is unknown and it will not be relaunched. Reconcile the run with "
+                         "usage_guard, then record a disposition (ack --disposition) or resubmit.",
     }
     lines = ["ahc %s: %s#%s at %s (item %s)" % (state, req["repo"], req["pr"], req["head"], iid),
              "Report: %s" % data.get("report", "none"),
