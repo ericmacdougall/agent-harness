@@ -334,6 +334,63 @@ class Demo(unittest.TestCase):
                                               "payload": {"action": "closed", "pull_request": {"merged": False}}}))
 
 
+class CapRole(unittest.TestCase):  # goodqa#15920: the collector's owner-cap role decides, as the owner panel does
+    def test_role_from_collector_wins(self):
+        fx = Fixture()
+        rows = [dict(row("aaaa1111", state="live", kind="general-purpose"), role="helper", serves="bbbb2222"),
+                dict(row("bbbb2222", state="live", kind="task-owner"), role="live"),
+                dict(row("cccc3333", state="live", kind="task-owner"), role="parked")]   # running, but slot freed
+        graph, _, _ = collector(fx, rows)
+        graph.tick(1.0)
+        snap = graph.snapshot()
+        owners = nodes(snap, "owner")
+        self.assertEqual(set(owners), {"bbbb2222", "cccc3333"})
+        self.assertEqual(nodes(snap)["aaaa1111"]["owner"], "bbbb2222")       # nested under the owner it serves
+        self.assertEqual(snap["counts"]["live_owners"], 1)                   # the cap's number, not running states
+        self.assertEqual((owners["bbbb2222"]["live"], owners["cccc3333"]["live"]), (True, False))
+
+
+class DerivedInitiatives(unittest.TestCase):  # stale topology/initiatives fix: live owners + GoodQA, not the file
+    FILE = [{"id": "prodmove", "initiative": "Production move", "ticket": "goodqa#14518", "state": "In progress"},
+            {"id": "mc", "initiative": "Mission control", "ticket": "goodqa#15950", "milestones_done": 1,
+             "milestones_total": 4, "next_step": "PR"}]
+
+    def rows(self):
+        return [
+            {"agent_id": "a1", "role": "live", "source": "ah", "ticket": "GoodQA goodqa#15950", "task": "org graph"},
+            {"agent_id": "a2", "role": "live", "source": "ah", "ticket": "", "task": "fix goodqa#15961 session pin"},
+            {"agent_id": "a3", "role": "parked", "source": "ah", "ticket": "goodqa#14518", "task": "old"},
+            {"agent_id": "a4", "role": "helper", "source": "ah", "ticket": "goodqa#15999", "task": "review"},
+            {"agent_id": "a5", "role": "live", "source": "ah", "ticket": "goodqa#16000", "task": "solve tuning"},
+        ]
+
+    def test_live_tickets_become_rows_and_stale_file_rows_are_hidden(self):
+        tickets = {"goodqa#15950": {"title": "Live org graph", "status": "in_progress"}}
+        snap = {"items": [col.clean_initiative(r, n) for n, r in enumerate(self.FILE)], "stale": False, "error": "",
+                "mtime": 1000.0}
+        out = og.derive_initiatives(snap, self.rows(), tickets, now=1000.0 + 4 * 86400)
+        ids = {i["ticket"]: i for i in out["items"]}
+        self.assertEqual(set(ids), {"goodqa#15950", "goodqa#15961"})       # parked, helper and restricted rows: no
+        mc = ids["goodqa#15950"]
+        self.assertEqual((mc["initiative"], mc["state"], mc["source"]), ("Live org graph", "In progress", "live"))
+        self.assertEqual((mc["milestones_done"], mc["next_step"]), (1, "PR"))  # the file still adds its plan
+        self.assertEqual(mc["owner"], "a1")
+        self.assertEqual(ids["goodqa#15961"]["initiative"], "fix goodqa#15961 session pin")  # no ticket read: task text
+        self.assertEqual(ids["goodqa#15961"]["state"], "unknown")
+        self.assertEqual((out["derived"], out["hidden_file_rows"]), (2, 1))  # prodmove hidden: the file is 4 d old
+
+    def test_fresh_file_rows_stay(self):
+        snap = {"items": [col.clean_initiative(r, n) for n, r in enumerate(self.FILE)], "mtime": 1000.0}
+        out = og.derive_initiatives(snap, [], {}, now=2000.0)
+        self.assertEqual([i["source"] for i in out["items"]], ["file", "file"])
+        self.assertEqual(out["hidden_file_rows"], 0)
+
+    def test_restricted_task_never_becomes_a_title(self):
+        rows = [{"agent_id": "a9", "role": "live", "source": "ah", "ticket": "goodqa#1", "task": "solve interview prep"}]
+        out = og.derive_initiatives({"items": [], "mtime": None}, rows, {}, now=1.0)
+        self.assertEqual(out["items"], [])
+
+
 class FeedAdditions(unittest.TestCase):
     def test_review_verdict_becomes_a_feed_row(self):  # reviewer approved/rejected cue source
         entry = {"event": "review_result", "verdict": "BLOCK", "ticket": "GoodQA #15585", "range": "a..b"}

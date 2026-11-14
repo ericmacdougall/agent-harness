@@ -6,6 +6,8 @@ export const UNKNOWN = 'unknown';
 const ID = /^[A-Za-z0-9_:#.-]{1,80}$/;
 const KINDS = ['user', 'coordinator', 'owner', 'subagent', 'reviewer', 'work'];
 const LIVE = new Set(['live', 'working', 'quiet', 'observed']);
+// Live = holds an owner-cap slot when the server says so (goodqa#15920 role), else a running state.
+export const isLive = node => (typeof node?.live === 'boolean' ? node.live : LIVE.has(node?.state));
 
 // One color per node type. Severity and escalation use a separate warm ramp drawn as a halo and rings, never as the
 // node's own fill, so type and alarm are read independently.
@@ -81,10 +83,10 @@ export function layout(graph, repos = []) {
   pos.set('user', [0, LEVELS.user, 0]);
   pos.set('coordinator', [0, LEVELS.coordinator, 0]);
   const owners = graph.nodes.filter(n => n.kind === 'owner')
-    .sort((a, b) => (LIVE.has(b.state) - LIVE.has(a.state)) || a.id.localeCompare(b.id));
+    .sort((a, b) => (isLive(b) - isLive(a)) || a.id.localeCompare(b.id));
   // Live owners form the inner ring of pods; idle owners (done, returned, parked) an outer ring, so the work in
   // progress stays central and readable however many finished owners the session still lists.
-  const live = owners.filter(o => LIVE.has(o.state)), idle = owners.filter(o => !LIVE.has(o.state));
+  const live = owners.filter(o => isLive(o)), idle = owners.filter(o => !isLive(o));
   const liveRadius = Math.max(2.1, live.length * 0.62);
   const idleRadius = Math.max(liveRadius + 1.5, idle.length * 0.16);
   const podRadius = idle.length ? idleRadius : liveRadius;
@@ -186,7 +188,7 @@ export function tree(graph) {
   if (byId.get('user')) roots.push(item(byId.get('user')));
   const coord = byId.get('coordinator') ? item(byId.get('coordinator')) : null;
   if (coord) roots.push(coord);
-  const owners = graph.nodes.filter(n => n.kind === 'owner').sort((a, b) => (LIVE.has(b.state) - LIVE.has(a.state)) || a.id.localeCompare(b.id));
+  const owners = graph.nodes.filter(n => n.kind === 'owner').sort((a, b) => (isLive(b) - isLive(a)) || a.id.localeCompare(b.id));
   for (const owner of owners) {
     const entry = item(owner);
     for (const agent of graph.nodes.filter(n => (n.kind === 'subagent' || n.kind === 'reviewer') && n.owner === owner.id)) entry.children.push(withWork(item(agent)));

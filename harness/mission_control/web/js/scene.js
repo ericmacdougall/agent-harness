@@ -1,7 +1,7 @@
 import { getState, subscribe, select, highlight } from './store.js';
 import { button, el } from './ui.js';
 import { layout, describe, tree, cueForChange, cueForEvent, repos as recentRepos, nodeColor, severityColor, escalationColor,
-  TYPE_COLORS, EVENT_MAP, LEVELS, UNKNOWN, ageText } from './org.js';
+  TYPE_COLORS, EVENT_MAP, LEVELS, UNKNOWN, ageText, isLive } from './org.js';
 
 // The live org graph (goodqa#15950). It replaces the old constellation, which laid out a hand-written
 // initiatives.json. One canvas and one animation clock; every node also has an HTML button, and a list view shows the
@@ -19,7 +19,7 @@ function labelText(node) {
   if (node.kind === 'coordinator') return `Main · ${shortModel(node.model)} · ${node.effort}`;
   if (node.kind === 'work') return `${node.ref}${node.done ? ' ✓' : ''}`;
   if (node.kind === 'repo') return `⌘ ${node.label}`;
-  const state = node.kind === 'owner' && !['live', 'working', 'quiet'].includes(node.state) ? ' · idle' : '';
+  const state = node.kind === 'owner' && !isLive(node) ? ' · idle' : '';
   return `${node.label} · ${shortModel(node.model)}${state}`;
 }
 function ariaText(node, byId) {
@@ -263,7 +263,7 @@ export async function mountScene() {
       const base = node.kind === 'repo' ? colors.types.repo : node.kind === 'work' && node.done ? colors.done : colors.types[node.kind] || colors.edge;
       const mesh = new THREE.Mesh(geometry(node.kind), new THREE.MeshStandardMaterial({ color: base, emissive: base, emissiveIntensity: .35, roughness: .4, metalness: .2,
         transparent: node.kind === 'work' && node.done, opacity: node.kind === 'work' && node.done ? .6 : 1 }));
-      if (node.kind === 'owner' && !['live', 'working', 'quiet'].includes(node.state)) { mesh.material.transparent = true; mesh.material.opacity = .45; }
+      if (node.kind === 'owner' && !isLive(node)) { mesh.material.transparent = true; mesh.material.opacity = .45; }
       core.add(mesh);
       // Severity: a halo ring. Escalation: one thin ring per ladder step, stacked above the node.
       const sev = node.severity === 'high' || node.severity === 'critical' ? colors.sev.high : node.severity === 'warn' || node.severity === 'medium' ? colors.sev.warn : '';
@@ -290,7 +290,7 @@ export async function mountScene() {
     byId = new Map((graph?.nodes || []).map(n => [n.id, n]));
     positions = layout(graph, recentRepos(state.events));
     // Frame the live part of the pyramid; the outer ring of idle owners may run past the edge.
-    extent = Math.max(3, ...[...positions.entries()].filter(([id]) => { const n = byId.get(id); return !(n?.kind === 'owner' && !['live', 'working', 'quiet', 'observed'].includes(n.state)) && !id.startsWith('repo:'); }).map(([, p]) => Math.hypot(p[0], p[2])));
+    extent = Math.max(3, ...[...positions.entries()].filter(([id]) => { const n = byId.get(id); return !(n?.kind === 'owner' && !isLive(n)) && !id.startsWith('repo:'); }).map(([, p]) => Math.hypot(p[0], p[2])));
     const sig = signature();
     renderMeta(state);
     if (sig === modelSig) return false;
@@ -333,8 +333,7 @@ export async function mountScene() {
     cull();
   }
   // Labels never overlap: place them by priority, hide (not remove) the rest; a hidden label stays focusable.
-  const LIVE_STATES = ['live', 'working', 'quiet', 'observed'];
-  const rank = node => (node.severity === 'high' || node.severity === 'critical' ? .5 : node.kind === 'owner' ? (LIVE_STATES.includes(node.state) ? 1 : 4.5) : PRIORITY[node.kind] ?? 6);
+  const rank = node => (node.severity === 'high' || node.severity === 'critical' ? .5 : node.kind === 'owner' ? (isLive(node) ? 1 : 4.5) : PRIORITY[node.kind] ?? 6);
   const PRIORITY = { coordinator: 0, user: 0, subagent: 2, reviewer: 2.5, work: 3, repo: 5 };
   function cull() {
     const state = getState();

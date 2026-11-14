@@ -80,8 +80,8 @@ media.addEventListener('change', event => update({ reducedMotion: event.matches,
 
 // ---- server snapshots
 export function setInitiatives(snapshot) {
-  const { items, stale, error, mtime } = adapt.initiatives(snapshot);
-  update({ initiatives: items, initiativesStale: stale, initiativesError: error, initiativesMtime: mtime, owners: adapt.owners(state.ownerRows, items) }, 'initiatives');
+  const { items, stale, error, mtime, derived, hiddenFileRows } = adapt.initiatives(snapshot);
+  update({ initiatives: items, initiativesStale: stale, initiativesError: error, initiativesMtime: mtime, initiativesDerived: derived, initiativesHidden: hiddenFileRows, owners: adapt.owners(state.ownerRows, items) }, 'initiatives');
   update({}, 'owners');
 }
 export function setOwners(rows) { update({ ownerRows: Array.isArray(rows) ? rows : [], owners: adapt.owners(rows, state.initiatives) }, 'owners'); }

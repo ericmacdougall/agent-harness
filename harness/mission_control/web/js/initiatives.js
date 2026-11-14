@@ -41,7 +41,8 @@ export function mountInitiatives() {
       const card = el('article', 'initiative-card');
       card.dataset.id = item.id;
       const top = el('div', 'initiative-topline');
-      top.append(el('span', 'ticket-id', item.ticket || 'no ticket'), el('span', `state-badge ${stateClass(item.state)}`, item.state));
+      top.append(el('span', 'ticket-id', item.ticket || 'no ticket'), el('span', `state-badge ${stateClass(item.state)}`, item.state),
+        el('span', 'initiative-source', item.source === 'live' ? 'live' : 'from file'));
       const title = button('initiative-title', '', () => select('initiative', item.id));
       title.setAttribute('aria-label', `Open ${item.initiative} details`);
       title.append(el('span', '', item.initiative), el('span', '', '↗'));
@@ -73,15 +74,17 @@ export function mountInitiatives() {
       else if (/at risk|blocked/i.test(item.state) && item.note) card.append(el('p', 'initiative-note', `↳ ${item.note.slice(0, 160)}`));
       fragment.append(card);
     });
-    // The file is written by hand and nothing refreshes it: say how old it is, and warn past a day (goodqa#15950).
+    // Rows come from live owners' GoodQA tickets; the hand-written file only adds plan fields, and its other rows are
+    // hidden once it is over a day old (goodqa#15950). Say both, with the file's age.
     const ageMs = state.initiativesMtime ? state.now - state.initiativesMtime : null;
     const old = ageMs !== null && ageMs > 24 * 3600 * 1000;
-    const fileAge = el('p', `initiatives-file-age${old ? ' stale' : ''}`, state.initiativesMtime
-      ? `From a hand-written file last edited ${age(new Date(state.initiativesMtime).toISOString(), state.now)}.${old ? ' Nothing updates it automatically, so it is likely out of date. Live work is in the Topology tab and the owners panel.' : ''}`
-      : 'From a hand-written file; its edit time is not known.');
+    const derived = state.initiativesDerived || 0, hidden = state.initiativesHidden || 0;
+    const fileText = state.initiativesMtime ? `the hand-written file was last edited ${age(new Date(state.initiativesMtime).toISOString(), state.now)}` : 'the hand-written file has no known edit time';
+    const fileAge = el('p', `initiatives-file-age${old ? ' stale' : ''}`,
+      `${derived} from live owners and GoodQA; ${fileText}${hidden ? `, so its other ${hidden} row${hidden === 1 ? ' is' : 's are'} hidden as out of date` : ''}.`);
     fileAge.id = 'initiatives-file-age';
     fragment.prepend(fileAge);
-    if (!state.initiatives.length) fragment.append(el('p', 'empty-state', state.initiativesError ? `Initiatives file: ${state.initiativesError}` : 'Waiting for the initiatives file…'));
+    if (!state.initiatives.length) fragment.append(el('p', 'empty-state', state.initiativesError ? `Initiatives file: ${state.initiativesError}` : 'No live owner holds a ticket yet, and the hand-written file has no current rows.'));
     list.replaceChildren(fragment);
     document.getElementById('initiatives-panel').classList.toggle('stale', state.initiativesStale);
     document.getElementById('initiative-count').textContent = String(state.initiatives.length).padStart(2, '0');

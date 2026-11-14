@@ -251,6 +251,11 @@ def _role(agent: dict, helpers: tuple) -> str:
     kind = agent.get("type") or ""
     if kind in REVIEWER_TYPES:
         return "reviewer"
+    cap = agent.get("cap_role")
+    if cap == "helper":
+        return "subagent"                               # goodqa#15920 owner_role: the cap's own classification
+    if cap in ("live", "parked"):
+        return "owner" if not agent.get("parent") else "subagent"
     if agent.get("owner_flag") or kind not in helpers:
         # the owner-cap rule (tier_gate.counts_as_owner): only a known helper type is not an owner.
         return "owner" if not agent.get("parent") else "subagent"
@@ -284,6 +289,8 @@ def build(*, session: str, coordinator: dict, agents: list, tickets: dict, escal
         if not AGENT_RE.match(agent_id):
             continue
         agent = dict(raw)
+        if not agent.get("parent") and agent.get("serves") and agent.get("cap_role") == "helper":
+            agent["parent"] = agent["serves"]           # the owner the collector says this helper serves
         if agent.get("parent") == agent_id:
             agent["parent"] = None
         agent["role"] = _role(agent, helpers)
@@ -325,7 +332,10 @@ def build(*, session: str, coordinator: dict, agents: list, tickets: dict, escal
                 "task": "restricted" if restricted else (mission or UNKNOWN), "restricted": restricted,
                 "mission": ("idle" if state not in LIVE_STATES else (mission or UNKNOWN)) if role == "owner" else "",
                 "ticket": ticket, "owner": owner or "", "parent": parent if parent_known else "",
-                "parent_known": parent_known}
+                "parent_known": parent_known,
+                # live = holds an owner-cap slot (goodqa#15920 role) when the collector says so, else a running state
+                "live": (agent.get("cap_role") == "live") if agent.get("cap_role") in ("live", "parked")
+                else state in LIVE_STATES}
         if role == "owner":
             edges.append({"from": coord_id, "to": agent_id, "kind": "spawn"})
         elif parent and parent_known:
@@ -410,7 +420,7 @@ def build(*, session: str, coordinator: dict, agents: list, tickets: dict, escal
                 edges.append({"from": epic["id"], "to": work[ref]["id"], "kind": "parent"})
     nodes.extend(work.values())
     counts = {kind: sum(1 for n in nodes if n["kind"] == kind) for kind in ("owner", "subagent", "reviewer", "work")}
-    counts["live_owners"] = sum(1 for n in nodes if n["kind"] == "owner" and n["state"] in LIVE_STATES)
+    counts["live_owners"] = sum(1 for n in nodes if n["kind"] == "owner" and n.get("live"))
     counts["hidden_agents"] = hidden
     links = sum(len((tickets.get(r) or {}).get("blocks") or []) + len((tickets.get(r) or {}).get("blocked_by") or [])
                 for r in work)
@@ -488,6 +498,7 @@ class OrgGraph:
         self.owners_fn, self.session_fn = owners_fn, session_fn
         self.transcripts, self.escalation_root, self.host = transcripts, escalation_root, host
         self.inbox_fn = inbox_fn or (lambda: (0, 0))
+        self.on_initiatives, self.initiatives_sig = None, None
         self.snapshot_data: dict | None = None
         self.metas: dict[str, dict] = {}
         self.tickets: dict[str, dict] = {}
@@ -595,7 +606,9 @@ class OrgGraph:
                            "parent": meta.get("parent"), "depth": meta.get("depth"), "state": row.get("state"),
                            "severity": row.get("severity"), "last_activity": row.get("last_activity"),
                            "idle_s": row.get("idle_s"), "task": row.get("task") or "", "ticket": row.get("ticket") or "",
-                           "restricted": bool(row.get("restricted")), "owner_flag": bool(row.get("owner")),
+                           "restricted": bool(row.get("restricted")), "owner_flag": row.get("owner") is True,
+                           "cap_role": row.get("role") if row.get("role") in ("helper", "live", "parked") else None,
+                           "serves": row.get("serves") if AGENT_RE.match(str(row.get("serves") or "")) else None,
                            "description": meta.get("description") or "", **facts})
         wanted = []
         for agent in agents:
@@ -608,6 +621,13 @@ class OrgGraph:
         snapshot = build(session=session, coordinator=coordinator, agents=agents, tickets=self.tickets,
                          escalation=self.escalation_cache[1], host=self.host, now=now, helpers=self.helpers,
                          stale=self.ticket_stale)
+        live_rows = [[r.get("agent_id"), r.get("ticket"), r.get("task")] for r in (self.owners_fn() or [])
+                     if isinstance(r, dict) and r.get("role") == "live"]
+        sig = json.dumps([live_rows, sorted((k, v.get("title"), v.get("status")) for k, v in self.tickets.items())],
+                         default=str)
+        if sig != self.initiatives_sig and self.on_initiatives:
+            self.initiatives_sig = sig
+            self.on_initiatives()
         if not session:
             snapshot["gaps"].insert(0, "No session is selected yet: ah owners has not reported one.")
         elif main_path is None:
@@ -642,6 +662,48 @@ class OrgGraph:
     def snapshot(self) -> dict:
         return self.snapshot_data or {"schema": SCHEMA, "generated": "", "nodes": [], "edges": [], "counts": {},
                                       "gaps": [], "changes": [], "seq": 0}
+
+
+# ---------------------------------------------------------------- initiatives from live data (pure)
+
+FILE_FRESH_S = 24 * 3600
+STATUS_LABELS = {"in_progress": "In progress", "in_review": "In review", "todo": "Not started", "backlog": "Not started",
+                 "blocked": "Blocked", "done": "Done", "closed": "Done", "canceled": "Done"}
+
+
+def derive_initiatives(file_snapshot: dict, owner_rows: list, tickets: dict, now: float) -> dict:
+    """The Initiatives panel from live data: one row per GoodQA ticket a live owner holds (the owner cap's role, from
+    `ah owners`), titled and stated from GoodQA when read. A file row with the same ticket adds its plan fields; other
+    file rows stay only while the hand-written file is under a day old, and the hidden count is reported."""
+    snap = file_snapshot or {}
+    mtime = snap.get("mtime")
+    file_items = [i for i in (snap.get("items") or []) if isinstance(i, dict)]
+    by_ticket = {ticket_ref(i.get("ticket")): i for i in file_items if ticket_ref(i.get("ticket"))}
+    derived, seen = [], set()
+    for row in owner_rows or []:
+        if not isinstance(row, dict) or row.get("role") != "live" or row.get("source", "ah") != "ah":
+            continue
+        task = str(row.get("task") or "")
+        ref = ticket_ref(row.get("ticket")) or ticket_ref(task)
+        if not ref or ref in seen or row.get("restricted") or RESTRICTED.search(task):
+            continue
+        seen.add(ref)
+        info = tickets.get(ref) or {}
+        status = str(info.get("status") or "")
+        base = dict(by_ticket.get(ref) or {})
+        title = ev.short(info.get("title") or base.get("initiative") or task or ref, 200)
+        base.update({"id": "live-" + re.sub(r"[^A-Za-z0-9._-]", "_", ref)[:58], "initiative": title,
+                     "state": STATUS_LABELS.get(status, status.replace("_", " ").capitalize() or "unknown"),
+                     "ticket": ref, "owner": str(row.get("agent_id") or "")[:40], "source": "live",
+                     "updated": str(row.get("last_activity") or "")[:40]})
+        if base.get("pct") is None:
+            base.setdefault("milestones_done", None)
+            base.setdefault("milestones_total", None)
+        derived.append(base)
+    fresh = isinstance(mtime, (int, float)) and now - mtime < FILE_FRESH_S
+    kept = [dict(i, source="file") for i in file_items if ticket_ref(i.get("ticket")) not in seen] if fresh else []
+    hidden = 0 if fresh else sum(1 for i in file_items if ticket_ref(i.get("ticket")) not in seen)
+    return {**snap, "items": derived + kept, "derived": len(derived), "hidden_file_rows": hidden}
 
 
 def _shape(snapshot: dict) -> str:

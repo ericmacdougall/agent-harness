@@ -512,6 +512,7 @@ class Initiatives(Collector):
         super().__init__(hub, health)
         self.reader, self.path = reader, Path(path) if path else None
         self.sig = None
+        self.derive = None   # goodqa#15950: the server derives the shown rows from live owners and GoodQA
         self.items: list[dict] = []
         self.stale = False
         self.error = ""
@@ -558,8 +559,9 @@ class Initiatives(Collector):
 
     def snapshot(self, mtime=None) -> dict:
         # The file's edit time rides in every snapshot, /api/state too, so the page can say how old the file is.
-        return {"items": self.items, "stale": self.stale, "error": self.error,
+        snap = {"items": self.items, "stale": self.stale, "error": self.error,
                 "mtime": mtime if mtime is not None else getattr(self, "mtime", None)}
+        return self.derive(snap) if self.derive else snap
 
 
 def _num(value):

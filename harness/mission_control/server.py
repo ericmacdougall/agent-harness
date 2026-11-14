@@ -362,6 +362,10 @@ class App:
             transcripts=org_graph.Transcripts(projects_root or home / ".claude" / "projects"),
             escalation_root=None if demo else (escalation_root or home / ".agent-harness" / "escalation"),
             host="demo-host" if demo else ev.HOST, inbox_fn=self._open_asks)
+        # The Initiatives panel comes from live owners and GoodQA, not the hand-written file alone (goodqa#15950).
+        self.initiatives.derive = lambda snap: org_graph.derive_initiatives(snap, self.owners.rows, self.org.tickets,
+                                                                            time.time())
+        self.org.on_initiatives = lambda: self.initiatives.publish(None)
         self.collectors = [self.tailer, self.initiatives, self.drop, self.owners, self.github, self.tickets,
                            self.remote, self.org]
         self.codex = CodexResponder(self.hub, self.health, self.runner, codex_binary(), root,

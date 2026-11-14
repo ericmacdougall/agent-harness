@@ -148,3 +148,11 @@ test('user node says loading before the asks source reports, never a false 0', (
   const ready = Object.fromEntries(org.describe({ id: 'user', kind: 'user', inbox: 0, inbox_stale: 2 }, new Map()));
   assert.equal(ready['Open asks (Needs you)'], '0');
 });
+
+test('initiatives snapshot carries live-derived and hidden file row counts', async () => {
+  const adapt = await import('../js/adapt.js');
+  const out = adapt.initiatives({ items: [{ id: 'live-goodqa_15950', initiative: 'Live org graph', ticket: 'goodqa#15950', source: 'live' }, { id: 'x', initiative: 'Old' }], mtime: 1, derived: 1, hidden_file_rows: 11 });
+  assert.deepEqual([out.derived, out.hiddenFileRows], [1, 11]);
+  assert.deepEqual(out.items.map(i => i.source), ['live', 'file']);
+  assert.deepEqual([adapt.initiatives({ derived: -3 }).derived, adapt.initiatives({ hidden_file_rows: 'x' }).hiddenFileRows], [0, 0]);
+});
