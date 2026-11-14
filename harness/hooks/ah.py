@@ -102,7 +102,8 @@ def state_dir(home: Path, *parts) -> Path:
 
 
 def atomic_json(path: Path, data) -> None:
-    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    # pid first (the stale-tmp cleanup reads it), then a random tag, so two threads of one process never share a tmp
+    tmp = path.with_name(path.name + f".{os.getpid()}.{os.urandom(4).hex()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as handle:
         json.dump(data, handle)
@@ -302,6 +303,9 @@ RESTRICTED = re.compile(r"\b(solve|interview)", re.I)  # fail-closed: show liven
 # offset and tail hash). This cache only lets an UNCHANGED file (same inode, size and mtime_ns) skip being opened:
 # one read of one file instead of ~2.4k index reads, 2.4k WAL tail checks and 2.4k meta reads per call.
 OWNERS_CACHE_SCHEMA = 1
+# Bump SUMMARY_FORMAT whenever summarize_agent_wal or the meta fields change shape: unchanged files would otherwise
+# keep serving old-shape summaries from this cache (review B-2). The cache is valid only for the same pair.
+SUMMARY_FORMAT = "wal:first,last_at,outcome,outcome_at,last_note,tickets,events;meta:type,description,parent,finished,depth"
 
 
 def _fingerprint(st) -> list:
@@ -317,7 +321,8 @@ def _load_owners_cache(path: Path) -> dict:
         data = json.loads(_bounded(path))
     except (OSError, ValueError):
         data = None
-    if not isinstance(data, dict) or data.get("schema") != OWNERS_CACHE_SCHEMA:
+    if not isinstance(data, dict) or data.get("schema") != OWNERS_CACHE_SCHEMA \
+            or data.get("format") != [SCHEMA, SUMMARY_FORMAT]:
         data = {}  # missing, corrupt or another version: rebuilt from the per-file state, never trusted
     return {"schema": OWNERS_CACHE_SCHEMA, "wal": data.get("wal") if isinstance(data.get("wal"), dict) else {},
             "meta": data.get("meta") if isinstance(data.get("meta"), dict) else {}, "dirty": False, "seen": set(),
@@ -336,19 +341,28 @@ def _save_owners_cache(path: Path, cache: dict, prune: bool = True) -> None:
             cache[part] = {k: v for k, v in cache[part].items() if k in seen}
     cache["dirty"] = False
     try:
-        atomic_json(path, {"schema": OWNERS_CACHE_SCHEMA, "wal": cache["wal"], "meta": cache["meta"]})
+        atomic_json(path, {"schema": OWNERS_CACHE_SCHEMA, "format": [SCHEMA, SUMMARY_FORMAT], "wal": cache["wal"],
+                           "meta": cache["meta"]})
     except OSError:
         pass  # a cache that cannot be saved costs time on the next call, never correctness
 
 
 def _cleanup_stale_tmp(index_dir: Path, now: float) -> None:
-    """Remove `<name>.json.<pid>.tmp` left by an interrupted atomic_json: over an hour old and its pid gone (M1)."""
+    """Remove `<name>.json.<pid>[.<tag>].tmp` left by an interrupted atomic_json: over an hour old and its pid gone
+    (M1). Best effort: nothing in here may fail the owners read (review B-1: an out-of-range pid raised OverflowError)."""
+    try:
+        _cleanup_stale_tmp_inner(index_dir, now)
+    except Exception:  # noqa: BLE001 - cleanup is housekeeping, never a reason to fail `ah owners`
+        pass
+
+
+def _cleanup_stale_tmp_inner(index_dir: Path, now: float) -> None:
     try:
         entries = list(os.scandir(index_dir))
     except OSError:
         return
     for e in entries:
-        m = re.fullmatch(r".+\.json\.(\d+)\.tmp", e.name)
+        m = re.fullmatch(r".+\.json\.(\d{1,7})(?:\.[0-9a-f]{1,32})?\.tmp", e.name)
         if not m:
             continue
         try:

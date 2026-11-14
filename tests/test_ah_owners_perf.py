@@ -188,6 +188,46 @@ class Counts(Base):
         ah.owners(self.home, SESSION, now=NOW)
         self.assertEqual((old_dead.exists(), old_alive.exists(), young_dead.exists()), (False, True, True))
 
+    def test_an_out_of_range_pid_tmp_never_fails_the_read(self):  # review B-1
+        good = strip(ah.owners(self.home, SESSION, now=NOW))
+        index = ah.state_dir(self.home, "ah-index")
+        for name in ("x.json.99999999999.tmp", "y.json.1.99999999999999999999.tmp"):
+            p = index / name
+            p.write_text("{}")
+            os.utime(p, (NOW - 7200, NOW - 7200))
+        with mock.patch.object(ah.os, "kill", side_effect=OverflowError("signed integer is greater than maximum")):
+            self.assertEqual(strip(ah.owners(self.home, SESSION, now=NOW)), good)
+
+    def test_a_cache_from_another_summary_format_is_ignored(self):  # review B-2
+        ah.owners(self.home, SESSION, now=NOW)
+        path = ah._owners_cache_path(ah.state_dir(self.home, "ah-index"), SESSION)
+        data = json.loads(path.read_text())
+        aid = "a" + f"{0:016x}"
+        key = next(k for k in data["wal"] if aid in k)
+        data["wal"][key]["s"] = dict(data["wal"][key]["s"], outcome="handoff", outcome_at=NOW - 50)  # old-shape lie
+        data["format"] = [0, "older"]
+        path.write_text(json.dumps(data))
+        row = {r["agent_id"]: r for r in ah.owners(self.home, SESSION, now=NOW)["owners"]}[aid]
+        self.assertIsNone(row["result_at"])
+
+    def test_two_threads_never_share_a_tmp_name(self):  # review B-4
+        import threading
+        names = []
+        real = os.replace
+
+        def spy(src, dst):
+            names.append(os.fspath(src))
+            return real(src, dst)
+        target = ah.state_dir(self.home, "ah-index") / "probe.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(os, "replace", spy):
+            threads = [threading.Thread(target=ah.atomic_json, args=(target, {"n": i})) for i in range(2)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
+        self.assertEqual(len(set(names)), 2, names)
+
     def test_an_interrupted_cold_run_still_leaves_progress(self):  # NEG-6 (R8)
         calls = {"n": 0}
         real = ah.summarize_agent_wal
@@ -204,30 +244,34 @@ class Counts(Base):
         self.assertGreaterEqual(len(cache["wal"]), 100)
 
 
+GOLDEN = REPO / "tests" / "data" / "ah_owners_golden.json"   # origin/main 98e33c5d's owners() on build(140, 60)
+
+
 class Golden(Base):
-    """Same rows as origin/main for the same input, cold, warm and over an index the old code wrote (R5)."""
+    """Same rows as the previous implementation for the same input, cold, warm and over an index the old code wrote
+    (R5). The frozen rows were produced by origin/main 98e33c5d, so this runs on every test run (review B-3);
+    AH_OLD_PY additionally runs a live old copy, which also writes the old-format index for the mixed case."""
 
     def setUp(self):
         super().setUp()
-        self.old = load_old()
-        if self.old is None:
-            self.skipTest("set AH_OLD_PY to origin/main's harness/hooks/ah.py to run the golden comparison")
         build(self.home, 140, 60)
+        self.want = json.loads(GOLDEN.read_text())
+
+    def test_frozen_rows_cover_every_state(self):
+        states = {r["state"] for r in self.want["owners"]}
+        self.assertTrue({"live", "DROPPED", "done", "returned", "handoff", "idle-helper", "SILENT-HIGH"} <= states, states)
+        self.assertTrue(any(r["restricted"] for r in self.want["owners"]))
 
     def test_same_output_as_the_previous_implementation(self):
-        old_home, new_home, mixed = self.home_copy("old"), self.home_copy("new"), self.home_copy("mixed")
-        with mock.patch.dict(os.environ, {"AH_HOME": str(old_home), "HOME": str(old_home)}):
-            want = strip(self.old.owners(old_home, SESSION, now=NOW))
-        states = {r["state"] for r in want["owners"]}
-        self.assertTrue({"live", "DROPPED", "done", "returned", "handoff", "idle-helper"} <= states, states)
-        self.assertTrue(any(s.startswith("SILENT") for s in states), states)
-        self.assertTrue(any(r["restricted"] for r in want["owners"]))
-        with mock.patch.dict(os.environ, {"AH_HOME": str(new_home), "HOME": str(new_home)}):
-            self.assertEqual(strip(ah.owners(new_home, SESSION, now=NOW)), want, "cold")
-            self.assertEqual(strip(ah.owners(new_home, SESSION, now=NOW)), want, "warm")
-        with mock.patch.dict(os.environ, {"AH_HOME": str(mixed), "HOME": str(mixed)}):
-            self.old.owners(mixed, SESSION, now=NOW)   # an index the old code wrote, then the new code reads it
-            self.assertEqual(strip(ah.owners(mixed, SESSION, now=NOW)), want, "old index")
+        self.assertEqual(strip(ah.owners(self.home, SESSION, now=NOW)), self.want, "cold")
+        self.assertEqual(strip(ah.owners(self.home, SESSION, now=NOW)), self.want, "warm")
+
+    def test_same_output_over_an_index_the_old_code_wrote(self):
+        old = load_old()
+        if old is None:
+            self.skipTest("set AH_OLD_PY to origin/main's harness/hooks/ah.py for the mixed-index case")
+        self.assertEqual(strip(old.owners(self.home, SESSION, now=NOW)), self.want, "old code, frozen rows")
+        self.assertEqual(strip(ah.owners(self.home, SESSION, now=NOW)), self.want, "new code over the old index")
 
 
 if __name__ == "__main__":
