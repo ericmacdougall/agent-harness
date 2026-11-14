@@ -219,6 +219,58 @@ class ReceiptTests(Base):
         self.assertEqual(core.verify_receipt(0, self.work / "none.md", HEAD, self.packet)["verdict"], "ERROR")
 
 
+class ReadRegularTests(Base):
+    """r3 class fix: read_regular never follows a link, never blocks on a FIFO and never reads past its cap."""
+
+    def setUp(self):
+        super().setUp()
+        import signal
+
+        def blocked(signum, frame):
+            raise AssertionError("read_regular blocked")
+        self._old = signal.signal(signal.SIGALRM, blocked)
+        signal.alarm(10)
+
+    def tearDown(self):
+        import signal
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, self._old)
+        super().tearDown()
+
+    def kind(self, path, cap=100, **kw):
+        with self.assertRaises(core.Unreadable) as ctx:
+            core.read_regular(path, cap, **kw)
+        return ctx.exception.kind
+
+    def test_regular_file_within_cap_is_read(self):
+        self.assertEqual(core.read_regular(self.packet, 1000), self.packet.read_bytes())
+
+    def test_absent_symlink_fifo_and_oversize_are_refused(self):
+        self.assertEqual(self.kind(self.work / "missing"), "absent")
+        link = self.work / "link"
+        link.symlink_to(self.packet)
+        self.assertEqual(self.kind(link, 1000), "symlink")
+        fifo = self.work / "fifo"
+        os.mkfifo(fifo)
+        self.assertEqual(self.kind(fifo), "non-regular")
+        self.assertEqual(self.kind(self.work), "non-regular")
+        self.assertEqual(self.kind(self.packet, cap=5), "oversize")
+
+    def test_dir_fd_relative_read(self):
+        fd = os.open(str(self.work), os.O_RDONLY)
+        try:
+            self.assertEqual(core.read_regular("packet.md", 1000, dir_fd=fd), self.packet.read_bytes())
+            os.mkfifo(self.work / "f2")
+            self.assertEqual(self.kind("f2", dir_fd=fd), "non-regular")
+        finally:
+            os.close(fd)
+
+    def test_fifo_report_is_not_a_verdict(self):
+        fifo = self.work / "r.md"
+        os.mkfifo(fifo)
+        self.assertEqual(core.verify_receipt(0, fifo, HEAD, self.packet)["verdict"], "INVALID")
+
+
 def _lands_a_pr(argv):
     """True when a child argv would land (merge) a PR or push to a branch: the AC-31 surface P0 must never reach."""
     words = [str(a) for a in argv]

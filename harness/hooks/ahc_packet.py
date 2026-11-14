@@ -280,7 +280,12 @@ def main(argv=None):
     parser.add_argument('--output', help='write the repaired packet here (must not be the input)')
     args = parser.parse_args(argv)
     source = Path(args.packet)
-    text = source.read_text(encoding='utf-8')
+    import ahc_core
+    try:
+        text = ahc_core.read_regular(source, ahc_core.PACKET_MAX_BYTES).decode('utf-8')
+    except (ahc_core.Unreadable, UnicodeDecodeError) as error:
+        print('status: unreadable (%s)' % error)
+        return 2
     result = fix_packet(text, args.expected_head, source_path=str(source.resolve()))
     print('status: %s' % result['status'])
     for action in result['actions']:

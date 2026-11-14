@@ -6,6 +6,7 @@ GitHub and must match. Stdlib only.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -109,6 +110,54 @@ class Paths:
     def ensure(self):
         for path in (self.root, self.queue, self.items, self.inbox, self.clones, self.reports):
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+
+REPORT_MAX_BYTES = 2_000_000
+CONFIG_MAX_BYTES = 1_000_000
+
+
+class Unreadable(Refused):
+    """read_regular refused a file. `kind` is absent, symlink, non-regular, oversize or error."""
+    def __init__(self, kind, message):
+        super().__init__(message)
+        self.kind = kind
+
+
+def read_regular(path, cap, dir_fd=None):
+    """The only way ahc reads a file another actor can write or replace (r3 F5/F6 class fix). It opens with
+    O_NOFOLLOW|O_NONBLOCK so neither a symlink nor a FIFO or device can redirect or block it, checks the OPENED
+    descriptor with fstat (regular file, size <= cap) and reads at most cap+1 bytes. Every failure is Unreadable;
+    it never blocks and never follows a link."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(str(path), flags, dir_fd=dir_fd) if dir_fd is not None else os.open(str(path), flags)
+    except FileNotFoundError:
+        raise Unreadable("absent", "file does not exist") from None
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise Unreadable("symlink", "file is a symlink") from None
+        raise Unreadable("error", "file cannot be opened: %s" % type(error).__name__) from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise Unreadable("non-regular", "not a regular file")
+        if info.st_size > cap:
+            raise Unreadable("oversize", "file is %d bytes; the cap is %d" % (info.st_size, cap))
+        chunks, total = [], 0
+        while total <= cap:
+            chunk = os.read(fd, min(65536, cap + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    except OSError as error:
+        raise Unreadable("error", "file cannot be read: %s" % type(error).__name__) from None
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    if len(data) > cap:
+        raise Unreadable("oversize", "file grew past the cap of %d bytes while reading" % cap)
+    return data
 
 
 def _full(value, field):
@@ -235,7 +284,7 @@ def _atomic_write(path, data):
 def submit(paths, config, req, now=None):
     """Validate and enqueue. Returns {"id", "duplicate"}. Raises Refused; writes nothing on refusal."""
     norm = validate(config, req)
-    packet_sha = hashlib.sha256(Path(norm["packet"]).read_bytes()).hexdigest()
+    packet_sha = hashlib.sha256(read_regular(norm["packet"], PACKET_MAX_BYTES)).hexdigest()
     norm.update(packet_sha256=packet_sha, submitted=now or time.time())
     iid = item_id(norm, packet_sha)
     norm["id"] = iid
@@ -321,14 +370,19 @@ def verify_receipt(rc, report_path, head, packet_path):
     if rc not in (EXIT_PASS, EXIT_BLOCK):
         return {"verdict": "ERROR", "reason": f"peer_review exited {rc}"}
     try:
-        text = Path(report_path).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return {"verdict": "ERROR", "reason": "no report was written"}
+        text = read_regular(report_path, REPORT_MAX_BYTES).decode("utf-8", errors="replace")
+    except Unreadable as error:
+        if error.kind == "absent":
+            return {"verdict": "ERROR", "reason": "no report was written"}
+        return {"verdict": "INVALID", "reason": "report unreadable: %s" % error}
     try:
         fields, first = _parse_report(text)
     except ValueError as error:
         return {"verdict": "INVALID", "reason": str(error)}
-    packet_sha = hashlib.sha256(Path(packet_path).read_bytes()).hexdigest()
+    try:
+        packet_sha = hashlib.sha256(read_regular(packet_path, PACKET_MAX_BYTES)).hexdigest()
+    except Unreadable as error:
+        return {"verdict": "INVALID", "reason": "reviewed packet unreadable: %s" % error}
     if fields.get("Stage") != "pr":
         return {"verdict": "INVALID", "reason": "report stage is not pr"}
     if fields.get("Reviewed HEAD") != head:

@@ -637,6 +637,132 @@ class IngestValidationTests(Base):
             runner._write_inbox(self.paths.inbox, "agent-abc123", "n.md", "body two")
 
 
+class UntrustedReadTests(Base):
+    """code-inspection r3 F5 (continued) and F6: no file another actor can write or replace (packet, notice, review
+    report) can block the tick or exhaust memory. A SIGALRM guard turns a regression into a failure, not a hang."""
+
+    def setUp(self):
+        super().setUp()
+        import signal
+
+        def blocked(signum, frame):
+            raise AssertionError("the tick blocked on an untrusted file (FIFO/oversize)")
+        self._old_alarm = signal.signal(signal.SIGALRM, blocked)
+        signal.alarm(15)
+
+    def tearDown(self):
+        import signal
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, self._old_alarm)
+        super().tearDown()
+
+    def plant_record(self, packet_path, pr):
+        good = self.submit()
+        rec = json.loads((self.paths.queue / (good + ".json")).read_text())
+        bad = dict(rec, pr=pr, packet=str(packet_path))
+        bad["id"] = core.item_id(bad, bad["packet_sha256"])
+        (self.paths.queue / (bad["id"] + ".json")).write_text(json.dumps(bad))
+        return good, bad["id"]
+
+    def assert_tick_survives(self, good, bad, deps):
+        self.assertEqual(self.state(good), "routed-to-main", "a valid item stopped behind an untrusted packet")
+        self.assertEqual(self.state(bad), "refused")
+        self.assertTrue([a for a in deps.ah_calls if a[:3] == ["ah", "heartbeat", "beat"]])
+        inbox = list((self.paths.inbox / "agent-abc123").glob(bad + "-refused.md"))
+        self.assertEqual(len(inbox), 1, "the owner was not told why the packet was refused")
+
+    def test_fifo_packet_is_refused_without_blocking(self):
+        import os
+        fifo = self.packet.parent / "fifo.md"
+        os.mkfifo(fifo)
+        good, bad = self.plant_record(fifo, 12)
+        deps = Deps()
+        for _ in range(2):
+            self.run_all(deps)
+            deps.now += 120
+        self.assert_tick_survives(good, bad, deps)
+
+    def test_oversized_packet_is_refused_without_reading_it_all(self):
+        big = self.packet.parent / "big.md"
+        big.write_bytes(b"x" * (core.PACKET_MAX_BYTES + 1))
+        good, bad = self.plant_record(big, 13)
+        deps = Deps()
+        for _ in range(2):
+            self.run_all(deps)
+            deps.now += 120
+        self.assert_tick_survives(good, bad, deps)
+
+    def test_packet_replaced_by_fifo_after_submit_is_refused(self):
+        import os
+        other = self.packet.parent / "p2.md"
+        other.write_text(GOOD_PACKET)
+        good = self.submit()
+        req = {"repo": REPO, "pr": 14, "head": HEAD, "base": BASE, "packet": str(other),
+               "ticket": "GoodQA goodqa#16034", "owner": "agent-abc123"}
+        bad = core.submit(self.paths, self.config, req)["id"]
+        other.unlink()
+        os.mkfifo(other)
+        deps = Deps()
+        for _ in range(2):
+            self.run_all(deps)
+            deps.now += 120
+        self.assert_tick_survives(good, bad, deps)
+
+    def test_fifo_at_the_notice_name_is_not_delivered_and_does_not_block(self):
+        import os
+        iid = self.submit()
+        self.paths.ensure()
+        owner_dir = self.paths.inbox / "agent-abc123"
+        owner_dir.mkdir(mode=0o700)
+        os.mkfifo(owner_dir / ("%s-blocked.md" % iid))
+        deps = Deps(verdict="BLOCK")
+        self.run_all(deps)
+        self.assertEqual(self.state(iid), "blocked")
+        self.assertTrue([a for a in deps.ah_calls if a[:3] == ["ah", "heartbeat", "beat"]])
+        ledger = runner.Ledger(self.paths)
+        try:
+            row = ledger.db.execute("SELECT status, result FROM effects WHERE item=? AND kind='inbox'",
+                                    (iid,)).fetchone()
+        finally:
+            ledger.close()
+        self.assertNotEqual(row["status"], "done")
+        self.assertIn("refused", row["result"] or "")
+
+    def test_notice_swapped_to_fifo_between_check_and_open_does_not_block(self):
+        """F6 race, deterministic: a correct notice exists; the first open of that name swaps it for a FIFO."""
+        import os
+        self.paths.ensure()
+        runner._write_inbox(self.paths.inbox, "agent-abc123", "n.md", "body one")
+        real_open = os.open
+        swapped = {"done": False}
+
+        def swapping_open(path, flags, *args, **kwargs):
+            if path == "n.md" and kwargs.get("dir_fd") is not None and not swapped["done"]:
+                swapped["done"] = True
+                target = self.paths.inbox / "agent-abc123" / "n.md"
+                target.unlink()
+                os.mkfifo(target)
+            return real_open(path, flags, *args, **kwargs)
+        os.open = swapping_open
+        self.addCleanup(setattr, os, "open", real_open)
+        self.assertFalse(runner._inbox_delivered(self.paths.inbox, "agent-abc123", "n.md", "body one"))
+        self.assertTrue(swapped["done"], "the race was not exercised")
+
+    def test_fifo_review_report_does_not_block(self):
+        import os
+        iid = self.submit()
+        deps = Deps()
+
+        def fifo_review(argv, timeout):
+            deps.review_calls.append(argv)
+            os.mkfifo(argv[argv.index("--output") + 1])
+            return 0
+        deps.review = fifo_review
+        self.run_all(deps)
+        self.assertTrue([a for a in deps.ah_calls if a[:3] == ["ah", "heartbeat", "beat"]])
+        self.assertNotEqual(self.state(iid), "routed-to-main", "a FIFO report must never verify as PASS")
+
+
 class DeliveryTests(Base):
     """AC-19 / NEG-26 / NEG-34: an inbox file is not delivery; only the owner's ack is; no ack escalates once."""
 

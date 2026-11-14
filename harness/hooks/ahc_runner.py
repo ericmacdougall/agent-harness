@@ -32,7 +32,6 @@ import os
 import re
 import shutil
 import sqlite3
-import stat
 import subprocess
 import sys
 import time
@@ -313,11 +312,13 @@ class Ledger:
             return row
         qfile = self.paths.queue / (iid + ".json")
         try:
-            text = _read_nofollow(qfile)
-        except FileNotFoundError:
-            return None
-        except (OSError, UnicodeDecodeError) as error:
-            raise core.Refused("queue file unreadable or not a regular file: %s" % type(error).__name__) from None
+            text = core.read_regular(qfile, core.PACKET_MAX_BYTES).decode("utf-8")
+        except core.Unreadable as error:
+            if error.kind == "absent":
+                return None
+            raise core.Refused("queue file unreadable: %s" % error) from None
+        except UnicodeDecodeError:
+            raise core.Refused("queue file is not UTF-8") from None
         try:
             raw = json.loads(text)
         except ValueError:
@@ -503,10 +504,12 @@ class Worker:
         if self.circuit_open():
             return self.settle(iid, token, state, self.now() + 1800, event="circuit-open-wait")
         # 1. packet integrity: the bytes reviewed must be the bytes submitted
+        if not core._inside(req["packet"], self.config.get("work_roots", [])):
+            return self.refuse(iid, token, "the packet path is no longer inside a work root")
         try:
-            text = Path(req["packet"]).read_bytes()
-        except OSError:
-            return self.refuse(iid, token, "the submitted packet can no longer be read")
+            text = core.read_regular(req["packet"], core.PACKET_MAX_BYTES)
+        except core.Unreadable as error:
+            return self.refuse(iid, token, "the submitted packet can no longer be read safely (%s)" % error)
         if hashlib.sha256(text).hexdigest() != req["packet_sha256"]:
             return self.refuse(iid, token, "the packet changed after submit; submit again with the final packet")
         # 2. lint and the deterministic move-only fix (never an LLM, NEG-33)
@@ -559,7 +562,7 @@ class Worker:
             return self.settle(iid, token, "needs-attention", event="relaunch-refused", reason=reason,
                                notice=_owner_notice("needs-attention", reason))
         report = self.paths.reports / ("%s-a%d.md" % (iid, attempt))
-        if report.exists():
+        if os.path.lexists(str(report)):
             reason = "report path already exists; refusing to overwrite a receipt"
             return self.settle(iid, token, "needs-attention", event="report-path-taken", reason=reason,
                                notice=_owner_notice("needs-attention", reason))
@@ -837,21 +840,6 @@ def ingest(ledger, paths, config, now=None):
     return rejected
 
 
-def _read_nofollow(path):
-    """Read a queue file without following a symlink (O_NOFOLLOW) and only if it is a regular file."""
-    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise IsADirectoryError("not a regular file")
-        with os.fdopen(fd, "rb", closefd=False) as handle:
-            data = handle.read(core.PACKET_MAX_BYTES + 1)
-    finally:
-        os.close(fd)
-    if len(data) > core.PACKET_MAX_BYTES:
-        raise OSError("queue file too large")
-    return data.decode("utf-8")
-
-
 def _quarantine(paths, qfile, reason):
     """Atomically rename the queue entry itself (a symlink is moved, never followed) into rejected/, with a reason
     file. Returns the quarantined name, which keys the one alert for it, or None if it could not be moved."""
@@ -966,8 +954,8 @@ def _is_protected(path):
 
 def _report_body(report_path):
     try:
-        text = Path(report_path).read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        text = core.read_regular(report_path, core.REPORT_MAX_BYTES).decode("utf-8", errors="replace")
+    except core.Unreadable:
         return "(the report could not be read)"
     head, _sep, body = text.partition("\n\n")
     return body.strip()[:MAX_BODY] or text[:MAX_BODY]
@@ -1089,23 +1077,13 @@ def _write_inbox(inbox, owner, name, text):
 def _notice_state(owner_fd, name, text):
     """'absent', 'match', or why the entry at `name` (relative to owner_fd, never followed) is not our notice:
     'symlink', 'non-regular' or 'mismatched'."""
-    try:
-        info = os.stat(name, dir_fd=owner_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return "absent"
-    if stat.S_ISLNK(info.st_mode):
-        return "symlink"
-    if not stat.S_ISREG(info.st_mode):
-        return "non-regular"
     want = text.encode("utf-8")
-    if info.st_size != len(want):
-        return "mismatched"
     try:
-        fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=owner_fd)
-    except OSError:
-        return "non-regular"
-    with os.fdopen(fd, "rb") as handle:
-        have = handle.read(len(want) + 1)
+        have = core.read_regular(name, len(want), dir_fd=owner_fd)
+    except core.Unreadable as error:
+        if error.kind in ("absent", "symlink", "non-regular"):
+            return error.kind
+        return "mismatched"   # oversize (a different notice) or unreadable: never counted as delivered
     return "match" if have == want else "mismatched"
 
 
@@ -1199,8 +1177,10 @@ class LiveDeps:
 def load_config(paths):
     path = paths.root / "config.json"
     try:
-        config = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        config = json.loads(core.read_regular(path, core.CONFIG_MAX_BYTES).decode("utf-8"))
+        if not isinstance(config, dict):
+            config = {}
+    except (core.Unreadable, ValueError):
         config = {}
     config.setdefault("repos", ["ericmacdougall/bugtracker", "ericmacdougall/Android-security",
                                 "ericmacdougall/agent-harness", "ericmacdougall/agent-fabric"])
@@ -1215,7 +1195,8 @@ def submit_with_lint(paths, config, req):
     ledger = Ledger(paths)
     try:
         ingest(ledger, paths, config)
-        existing = ledger.item(core.item_id(norm, hashlib.sha256(Path(norm["packet"]).read_bytes()).hexdigest()))
+        raw = core.read_regular(norm["packet"], core.PACKET_MAX_BYTES)
+        existing = ledger.item(core.item_id(norm, hashlib.sha256(raw).hexdigest()))
         depth = ledger.db.execute("SELECT COUNT(*) AS n FROM items WHERE state IN (%s)" % ",".join(
             "?" * len(NON_TERMINAL)), sorted(NON_TERMINAL)).fetchone()["n"]
     finally:
@@ -1223,7 +1204,10 @@ def submit_with_lint(paths, config, req):
     if existing is None and depth >= capacity:  # NEG-38; a duplicate resubmit stays a no-op
         raise core.Refused("the ahc queue is full: %d items waiting (capacity %d); try again later or ask main"
                            % (depth, capacity))
-    text = Path(norm["packet"]).read_text(encoding="utf-8")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise core.Refused("the packet is not UTF-8") from None
     fix = ahc_packet.fix_packet(text, norm["head"], source_path=norm["packet"])
     if fix["status"] == "unfixable":
         import review_diagnostics
