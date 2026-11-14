@@ -244,6 +244,8 @@ class WalTailer(Collector):
         self.last_scan = 0.0
         self.last_items: dict[tuple, dict] = {}
         self.max_events_per_tick = 60
+        # review R-2: fn(runtime, session, agent) -> may this agent's WAL note text be shown? None shows main only.
+        self.note_visible = None
 
     def _discover(self, now: float, initial: bool) -> None:
         for root, runtime in self.roots:
@@ -400,10 +402,22 @@ class WalTailer(Collector):
     def _actor(self, tail: _Tail) -> dict:
         return {"runtime": tail.runtime, "session": tail.session, "agent": tail.agent}
 
+    def _shown(self, tail: _Tail, note: str) -> bool:
+        """Fail closed (review R-2): restricted text never reaches the feed, and a Claude sub-agent's note shows only
+        when the last owner read marked that agent not restricted."""
+        if RESTRICTED_TEXT.search(note):
+            return False
+        if tail.runtime != "claude" or tail.agent == "main":
+            return True
+        return bool(self.note_visible and self.note_visible(tail.runtime, tail.session, tail.agent))
+
     def _emit(self, tail: _Tail, entry: dict, kind: str, offset=None) -> int:
         if kind in ("ask", "ask_resolved") and self.on_ask:
             self.on_ask()
         note = _note(entry)
+        deploy = bool(DEPLOY_RE.search(note)) or kind in ("deploy", "deployed")   # decided on the real text
+        if note and not self._shown(tail, note):
+            note = "note hidden (restricted or not in the current owner read)"
         actor = self._actor(tail)
         subject = {"ticket": _ticket_in(note)}
         meaningful = _meaningful(entry)
@@ -413,7 +427,7 @@ class WalTailer(Collector):
                                  eid="wal:" + hashlib.sha256(location.encode()).hexdigest(),
                                  actor=actor, subject=subject, quiet=not meaningful,
                                  severity="warn" if kind in ("blocker", "risk", "incident") else "info"))
-        if DEPLOY_RE.search(note) or kind in ("deploy", "deployed"):
+        if deploy:
             self.hub.publish(ev.make("deploy", f"{tail.runtime}-wal", note or kind, actor=actor, subject=subject,
                                      eid="deploy:" + hashlib.sha256(location.encode()).hexdigest()))
             return 2
@@ -858,7 +872,7 @@ class Owners(Collector):
             # and the ticket (whose GoodQA title would be fetched and shown), stream and last reply are dropped too
             item["restricted"] = row.get("restricted") is True
             if item["restricted"]:
-                item.update(task="", stream="", last_reply="", ticket="")
+                item.update(task="", stream="", last_reply="", ticket="", last_item=None)   # R-1: last WAL note too
             item["role"] = owner_role(item)
             rows.append(item)
             previous = self.states.get(agent)

@@ -538,5 +538,35 @@ class RestrictedProducerShape(unittest.TestCase):
         self.assertTrue(all(notes[k].startswith(("note hidden", "restricted")) for k in ("w1", "w2", "w3", "w4")))
 
 
+    def test_restricted_row_drops_its_last_wal_note(self):  # review R-1
+        class Tailer:
+            last_items = {}
+
+            def last_for(self, *a):
+                return {"at": "2026-11-13T01:00:00Z", "event": "result", "note": "candidate Jane scored 7/10"}
+        hub = Hub()
+        hub.publish = lambda *a, **k: None
+        owners = col.Owners(hub, self.Health(), runner=None, tailer=Tailer())
+        owners._rows({"session": "s", "owners": [dict(self.ROWS[0], state="live", idle_s=5)]}, 1.0)
+        self.assertIsNone(owners.rows[0]["last_item"])
+        self.assertNotIn("Jane", json.dumps(owners.rows))
+
+    def test_feed_hides_restricted_and_unknown_agents_notes(self):  # review R-2
+        published = []
+        hub = Hub()
+        hub.publish = lambda e, *a, **k: published.append(e)
+        tailer = col.WalTailer(hub, self.Health(), reader=None, roots=[])
+        tailer.note_visible = lambda runtime, session, agent: agent == "aknown"
+        cases = [("aknown", "org graph shipped"), ("aknown", "mock interview loop notes"),
+                 ("a1234567890abcdef", "candidate Jane scored 7/10"), ("main", "merged PR 245")]
+        for i, (agent, note) in enumerate(cases):
+            tail = col._Tail(i + 1, 0, "claude", "s", agent)
+            tailer._emit(tail, {"event": "result", "note": note, "at": "2026-11-13T01:00:00Z"}, "result")
+        text = json.dumps(published)
+        self.assertIn("org graph shipped", text)
+        self.assertIn("merged PR 245", text)
+        self.assertNotIn("interview", text)
+        self.assertNotIn("Jane", text)
+
 if __name__ == "__main__":
     unittest.main()
