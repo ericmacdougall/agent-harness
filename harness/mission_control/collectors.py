@@ -100,7 +100,8 @@ def codex_role(row: dict) -> str:
 def _serves(rows: list[dict]) -> None:
     """Point each helper at the owner it serves: up its parent chain (cycle-safe) to the first non-helper row, else a
     non-helper row with the same ticket (live first), else none (the page lists it as 'no owner', never hides it)."""
-    by_id = {r.get("agent_id"): r for r in rows}
+    by_id = {alias: r for r in rows for alias in (r.get("alias_ids") or [])}
+    by_id.update({r.get("agent_id"): r for r in rows})  # a surviving id always wins over an alias
     by_ticket: dict[str, list] = {}
     for r in rows:
         if r.get("role") != "helper" and r.get("ticket"):
@@ -117,8 +118,8 @@ def _serves(rows: list[dict]) -> None:
         seen, parent = {r.get("agent_id")}, r.get("parent")
         while isinstance(parent, str) and parent in by_id and parent not in seen and len(seen) < 16:
             seen.add(parent)
-            if by_id[parent].get("role") != "helper":
-                r["serves"] = parent
+            if by_id[parent].get("role") != "helper" and by_id[parent] is not r:
+                r["serves"] = by_id[parent].get("agent_id")  # the surviving id, even when the link named an alias
                 break
             parent = by_id[parent].get("parent")
         if r["serves"] is None and r.get("ticket") in by_ticket:
@@ -723,10 +724,24 @@ class Owners(Collector):
             merged = {**previous, **row}
             for field in ('name', 'model', 'stream', 'ticket'):
                 merged[field] = row.get(field) or previous.get(field, '')
+            # the ids a combined row replaced, so a helper's parent link to an ah id still finds it (inspection F2)
+            merged['alias_ids'] = list(previous.get('alias_ids') or []) + (
+                [previous['agent_id']] if previous.get('agent_id') and previous.get('agent_id') != merged.get('agent_id') else [])
             combined[key] = merged
-        aliases = {'codex-' + r.get('name', '') for r in managed}
-        rows = [r for r in combined.values() if not (r.get('runtime') == 'codex' and
-                r.get('agent_id') in aliases and not r.get('thread'))]
+        aliases = {'codex-' + r.get('name', ''): 'openai:' + r.get('name', '') for r in managed}
+        dropped = [r for r in combined.values() if r.get('runtime') == 'codex' and r.get('agent_id') in aliases
+                   and not r.get('thread')]
+        rows = [r for r in combined.values() if not any(r is d for d in dropped)]
+        # an ah alias row (codex-<name>, no thread) folds into its supervisor row, keeping ah's classification and
+        # provenance: it is the row the owner cap counts (inspection F1)
+        for alias in dropped:
+            target = next((r for r in rows if r.get('agent_id') == aliases[alias['agent_id']]), None)
+            if target is None or alias.get('source') != 'ah':
+                continue
+            for field in ('source', 'role', 'session', 'owner', 'decision_required', 'disposition', 'parent'):
+                if field in alias:
+                    target[field] = alias[field]
+            target['alias_ids'] = list(target.get('alias_ids') or []) + [alias['agent_id']] + list(alias.get('alias_ids') or [])
         # freshness of the ah snapshot is tracked apart from runtime freshness: a merged Codex row's own
         # source_stale must never make a cached ah role look current (code inspection F1)
         ah_stale = any(r.get('source_stale') for r in self.claude_rows)

@@ -165,6 +165,51 @@ class AhFreshness(Base):
         self.assertFalse([r for r in owners.rows if r.get("thread") == "T1"][0]["ah_stale"])
 
 
+class Identity(Base):
+    """Code inspection F1/F2 at e6f4032: identity changes in publish() must keep ah's count and helper links."""
+
+    def make(self, owners_rows, code=None):
+        from types import SimpleNamespace
+        payload = {"session": "s1", "owners": owners_rows}
+        state = {"code": 0}
+        runner = SimpleNamespace(run=lambda kind, *a, **k: (state["code"], json.dumps(payload)))
+        owners = col.Owners(self.hub, self.health, runner, None)
+        owners.supervised = SimpleNamespace(rows=[{"agent_id": "openai:sup", "name": "sup", "runtime": "codex",
+                                                   "state": "live", "source_stale": False, "type": "owner"}])
+        return owners, state
+
+    def test_threadless_ah_alias_keeps_headline_parity_session_staleness_and_recovers(self):
+        rows = [{"agent_id": "codex-sup", "type": "task-owner", "owner": True, "state": "live", "idle_s": 5}]
+        with mock.patch.object(tier_gate, "_owners_with_deadline", return_value={"owners": rows}):
+            expected = set(tier_gate.live_owner_ids("s1", tier_gate.tiers.load_policy(REPO / "harness" / "hooks" / "model_tiers.json")))
+        self.assertEqual(expected, {"codex-sup"})
+        owners, state = self.make(rows)
+        owners.run(time.time())
+        sup = [r for r in owners.rows if r["agent_id"] == "openai:sup"]
+        self.assertEqual(len(owners.rows), 1, "the alias folds into the supervisor row, shown once")
+        self.assertEqual((sup[0]["source"], sup[0]["role"], sup[0]["session"]), ("ah", "live", "s1"))
+        self.assertIn("codex-sup", sup[0]["alias_ids"])
+        self.assertEqual(sum(1 for r in owners.rows if r.get("source") == "ah" and r.get("role") == "live"), len(expected))
+        state["code"] = 1
+        owners.run(time.time() + 61)
+        self.assertTrue([r for r in owners.rows if r["agent_id"] == "openai:sup"][0]["ah_stale"])
+        state["code"] = 0
+        owners.run(time.time() + 122)
+        sup = [r for r in owners.rows if r["agent_id"] == "openai:sup"][0]
+        self.assertFalse(sup["ah_stale"])
+        self.assertEqual(sup["source"], "ah")
+
+    def test_helper_parent_link_follows_a_combined_owner(self):
+        rows = [{"agent_id": "codex-sup", "type": "task-owner", "owner": True, "state": "live", "idle_s": 5},
+                {"agent_id": "a00000000000c0de", "type": "red-team", "owner": False, "state": "live", "idle_s": 5,
+                 "parent": "codex-sup"},
+                {"agent_id": "a00000000000beef", "type": "task-owner", "owner": True, "state": "live", "idle_s": 5}]
+        owners, _ = self.make(rows)
+        owners.run(time.time())
+        helper = [r for r in owners.rows if r["agent_id"] == "a00000000000c0de"][0]
+        self.assertEqual(helper["serves"], "openai:sup", "explicit parent resolved through the alias, not lost")
+
+
 class Serves(Base):
     def test_helpers_point_at_the_owner_they_serve(self):
         mc = {r["agent_id"]: r for r in self.collect(ah_rows())}
