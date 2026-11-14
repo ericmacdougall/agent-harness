@@ -94,6 +94,9 @@ def assess(home: Path, session: str, now: float | None = None, idle_minutes: flo
         last = ah.parse_ts(r.get("last_activity")) or 0.0
         progress = max(progress, last, ah.transcript_mtime(home, session, agent, dirs) if r.get("type") != "task-wal" else 0.0)
         d = r.get("disposition") if isinstance(r.get("disposition"), dict) else None
+        if d and d.get("kind") not in liveness.ENDING_DISPOSITIONS and state in RETURNED_STATES \
+                and float(d.get("at") or 0.0) < last - 10:
+            d = None  # receipt r2 F1: a result is acknowledged only by a disposition at or after it (as ah's handoff ack)
         live = bool(d and d.get("live"))
         if d and d.get("kind") in liveness.ENDING_DISPOSITIONS:
             continue  # a terminal disposition stays terminal: the owner is retired, whatever its notes say

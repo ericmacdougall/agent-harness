@@ -63,7 +63,8 @@ class Base(unittest.TestCase):
     def dispose(self, agent, kind, key, **extra):
         args = {"agent": agent, "session": SESSION, "kind": kind, "at": iso(NOW)}
         args.update(extra)
-        return ah.write(self.home, "task.dispose", args, SESSION, key)
+        with mock.patch.object(ah, "server_now", side_effect=lambda: args["at"]):  # the ledger stamps its own clock
+            return ah.write(self.home, "task.dispose", args, SESSION, key)
 
     def assess(self, **kw):
         return self.ig.assess(self.home, SESSION, NOW, **kw)
@@ -280,6 +281,43 @@ class NoteWaitTests(Base):
         flagged = [a for a in ("tick", "tock") if "wait-ask-shared" in rows[a]["flags"]]
         self.assertEqual(len(flagged), 1)
         self.assertIn(flagged[0], {s["agent"] for s in self.assess()["streams"]})
+
+
+class LaterResultTests(Base):
+    """Receipt r2 F1: only a disposition at or after a result acknowledges it."""
+
+    def resume_then_new_result(self, kind="resumed"):
+        self.park_tick_on_ask()  # the other owner waits on its own user ask
+        extra = {"until": iso(NOW + 3 * HOUR), "ref": "wa5b00000003"} if kind == "waiting" else {}
+        if kind == "waiting":
+            jl(self.w / "main.jsonl", [{"at": iso(NOW - 3 * HOUR), "event": "ask", "id": "wa5b00000003", "owner": "done1",
+                                        "note": "need approval", "source": "user:x/y \"w\""}])
+        self.dispose("done1", kind, "done1-early-" + kind, at=iso(NOW - 3 * HOUR), **extra)
+        jl(self.w / "agent-done1.jsonl", [{"at": iso(NOW - 3 * HOUR + 60), "event": "intent", "note": "new work GoodQA goodqa#15944"},
+                                          {"at": iso(NOW - 2 * HOUR), "event": "result", "note": "to main: second result ready"}])
+        jl(self.w / "main.jsonl", [{"at": iso(NOW - 2 * HOUR + 5), "event": "subagent_stop", "agent_id": "done1",
+                                    "agent_type": "task-owner"}])
+
+    def check(self):
+        a = self.assess()
+        self.assertIn("done1", {s["agent"] for s in a["returned"]})
+        self.assertTrue(a["all_waiting_on_user"])
+        out = self.ig.cmd_stop({"session_id": SESSION, "stop_hook_active": False}, now=NOW)
+        self.assertEqual(out.get("decision"), "block")
+        self.assertIn("done1", out["reason"])
+
+    def test_earlier_resume_does_not_acknowledge_a_later_result(self):
+        self.resume_then_new_result("resumed")
+        self.check()
+
+    def test_earlier_wait_does_not_acknowledge_a_later_result(self):
+        self.resume_then_new_result("waiting")
+        self.check()
+
+    def test_a_disposition_after_the_result_does_acknowledge_it(self):
+        self.resume_then_new_result("resumed")
+        self.dispose("done1", "resumed", "done1-late-res", at=iso(NOW - 60))
+        self.assertNotIn("done1", {s["agent"] for s in self.assess()["returned"]})
 
 
 class DisposeNarrowTests(Base):
