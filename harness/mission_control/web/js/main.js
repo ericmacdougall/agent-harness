@@ -4,6 +4,7 @@ import { mountInitiatives } from './initiatives.js';
 import { liveFields } from './adapt.js';
 import { mountActivity } from './activity.js';
 import { mountOwners } from './owners.js';
+import { ownerCounts } from './owner-groups.js';
 import { mountChat } from './chat.js';
 import { mountNeeds } from './needs.js';
 import { mountHealth } from './health.js';
@@ -180,7 +181,7 @@ function renderInspector(state) {
   } else if (kind === 'hub') {
     title.textContent = 'Main coordinator';
     content.append(title, el('p', 'detail-intro', 'Every initiative and owner reports into the coordinating session.'));
-    fields.append(field('Session', state.mainSession || '—'), field('Host', state.host || '—'), field('Owners', String(state.owners.length)), field('Initiatives', String(state.initiatives.length)));
+    fields.append(field('Session', state.mainSession || '—'), field('Host', state.host || '—'), field('Live owners', String(ownerCounts(state.owners).live)), field('Initiatives', String(state.initiatives.length)));
     content.append(fields);
   }
   if (!inspector.open) inspector.showModal();

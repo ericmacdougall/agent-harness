@@ -3,6 +3,7 @@
 // Each long text is clamped with a disclosure, and each list is bounded with "show more", so volume never takes over.
 import { el, button, age, stateClass } from './ui.js';
 import { GOAL_STATE, missionTiles, dealRows, blockerRows, archiveRows } from './adapt.js';
+import { ownerCounts } from './owner-groups.js';
 
 export const PAGE = 25;  // default rows per list; "show more" adds one page
 const clip = (text, max) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
@@ -255,7 +256,7 @@ export function inventory(state, go) {
   const rowsOut = [
     ['Goals', led.goals.at, led.goals.stale, led.goals.error, `${led.goals.items.length} goals`, 'Overview', 'overview'],
     ['Initiatives', '', state.initiativesStale, state.initiativesError, `${state.initiatives.length} initiatives`, 'Overview', 'overview'],
-    ['Owners', '', false, '', `${state.owners.length} owners`, 'Overview', 'overview'],
+    ['Owners', '', false, '', (c => `${c.live} live owners, ${c.codexLive} live Codex, ${c.parked} parked or history, ${c.helpers} helpers`)(ownerCounts(state.owners)), 'Overview', 'overview'],
     ['Open asks', state.asksSweptAt, false, '', `${state.asks.length} open, ${state.asksStale.length} stale, ${state.asksFlagged.length} untraceable`, 'Overview', 'overview'],
     ['Deploys and live tests', led.status.at, led.status.stale, led.status.error, `${led.status.live.length} deploys, ${led.status.verified.length} tested, ${led.status.failed.length} failed, ${led.status.pending.length} pending`, 'Overview', 'overview'],
     ['Blockers', led.status.at, led.status.stale, led.status.error, `${led.status.blockers.length} recorded`, 'Overview', 'overview'],

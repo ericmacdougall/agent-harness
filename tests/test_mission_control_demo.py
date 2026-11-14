@@ -108,7 +108,7 @@ class Guards(Base):
             app.runner.run("remote-wal-probe")
         # The fixture `ah owners` also lists sub-agents and reviewers (goodqa#15950), as the real one does.
         helpers = len(demo.SUBAGENTS) + (1 if demo.cycling_live(now) else 0)
-        self.assertEqual(len(app.owners.rows), len(demo.OWNERS) + helpers)
+        self.assertEqual(len(app.owners.rows), len(demo.OWNERS) + len(demo.HELPERS) + helpers)
         self.assertEqual(app.health.rows["org-graph"]["status"], "ok")
         self.assertTrue(app.org.snapshot()["nodes"], "the org graph is built from the fixture transcripts")
         states = {r["agent_id"]: r for r in app.owners.rows}
