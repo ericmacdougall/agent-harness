@@ -24,11 +24,11 @@ KIT_VERSION = re.compile(r"^v[0-9]{1,3}$")
 STAMP = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 STREAM = re.compile(r"^stream-[0-9a-f]{12}$")
 LIVE_VALUE = re.compile(r"^[A-Za-z0-9:/._,-]{1,300}$")
-SOURCE = re.compile(r"^(user|answer|ticket|file|wal|queue):[A-Za-z0-9:/#._@-]{1,200}$")
+SOURCE = re.compile(r"^(user|answer|ticket|file|wal|queue):[A-Za-z0-9:/#._@ \"'-]{1,240}$")
 PROFILES = ("python-hooks", "generic")
 DOMAINS = ("auth", "delete", "devices", "money", "release", "blockchain")
 REPO_KINDS = ("remote", "remote-origin", "local")
-REASONS = ("initial", "canary", "rollback", "regenerate")
+REASONS = ("initial", "canary", "rollback", "regenerate", "live-target")
 LIVE_KINDS = ("web-origin", "install-hosts")
 FIELDS = ("schema", "revision", "revision_reason", "prev_sha256", "lane_id", "key", "ticket", "repo_identity", "repo_kind",
           "host_alias", "branch", "worktree", "profile", "domains", "session", "stream_key", "predecessor",

@@ -28,7 +28,7 @@ MAX_LANE_DIR = 8 << 20
 LOCK_TIMEOUT = 10.0
 # Kinds shipped by S1 (each later slice adds only kinds it ships behaviour for, by a new revision).
 KINDS = frozenset({"created", "queued", "start_reserved", "start_released", "holder_bound", "holder_released",
-                   "checkpoint", "ledger_resolved"})
+                   "checkpoint", "ledger_resolved", "live_target_set"})
 EFFECT_STATES = ("pending", "done", "failed", "uncertain")
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,95}$")
 
@@ -133,8 +133,12 @@ class Store:
         if os.path.islink(str(self.root)):
             raise RefusedInput("lane store root is a symlink")
         if not self.root.exists():
-            self.root.mkdir(mode=0o700, parents=True)
-            os.chmod(str(self.root), 0o700)
+            try:
+                self.root.mkdir(mode=0o700, parents=True)
+            except FileExistsError:  # another process created it first; the checks below judge it
+                pass
+            else:
+                os.chmod(str(self.root), 0o700)
         info = os.lstat(str(self.root))
         if not stat.S_ISDIR(info.st_mode):
             raise RefusedInput("lane store root is not a directory")
@@ -257,6 +261,7 @@ class Store:
             path = lane_dir / "journal.jsonl"
             size = os.lstat(str(path)).st_size if os.path.lexists(str(path)) else 0
             if size + len(line) > MAX_FILE:
+                atomic_write(lane_dir / "journal-full", b"1\n")  # bounded marker that stays writable; refresh shows it
                 raise JournalFull("journal would pass the %d byte input cap; start a successor lane" % MAX_FILE)
             if os.path.islink(str(path)):
                 raise RefusedInput("journal is a symlink")

@@ -201,6 +201,8 @@ def reconcile_lane(store: st.Store, lane_id) -> list:
                 tmp.unlink()
                 done.append("removed " + tmp.name)
         if os.path.lexists(str(old_dir)):
+            if mf.verify_chain(lane_dir):
+                return done  # an unanchored or broken revision decides nothing: keep both kits, verify reports it
             try:
                 recorded = mf.read_current(lane_dir)["kit_digests"]
             except (mf.ManifestError, st.StoreError):

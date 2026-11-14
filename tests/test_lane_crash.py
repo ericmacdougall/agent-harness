@@ -161,6 +161,23 @@ class UncommittedReplacementTests(CrashBase):
                                            default_version="v1")["problems"], [])
 
 
+class ForgedRevisionTests(CrashBase):
+    def test_a_forged_unanchored_revision_never_deletes_the_prior_kit(self):  # Codex delta F1
+        self.make_v2()
+        lane = self.new(ticket="GoodQA goodqa#870")["lane_id"]
+        d = self.store.lane_dir(lane)
+        self.assertEqual(run_child("regen", "regen:after_swapped", str(self.store.root), str(self.templates),
+                                   str(self.repo), lane), 17)
+        m = mf.read_current(d)
+        files = kit.render_files("v2", lanes._inputs(m, "v2"), self.templates)
+        forged = dict(m, revision=2, kit_version="v2", kit_digests=kit.digests(files),
+                      prev_sha256=mf._sha((d / "manifest.r0001.json").read_bytes()), revision_reason="canary")
+        (d / "manifest.r0002.json").write_text(json.dumps(forged, sort_keys=True) + "\n")
+        lanes.reconcile_lane(self.store, lane)
+        self.assertTrue((d / ".kit-old").is_dir(), "prior kit retained: the forged revision is not anchored")
+        self.assertTrue(mf.verify_chain(d))
+
+
 class RevisionChainTests(CrashBase):
     def setUp(self):
         super().setUp()
