@@ -1472,6 +1472,53 @@ class ProcessDeltaTests(Base):
             sys.platform = orig
 
 
+class DeadmanDeliveredTests(Base):
+    """goodqa#16034 v19 D19: `deadman_delivered` is the only delivery receipt. It is written only after the deadman
+    command succeeds (deadman_sent stays the queue and rate-limit marker), bounded to 500 keys, and readable through
+    the read-only `delivered` query."""
+
+    run_with = ReconcileAndRunTests.run_with
+    CRIT = {"check": "disk", "key": "disk:volume:/", "severity": "critical", "message": "98%", "detail": {}}
+
+    def test_receipt_written_only_after_a_successful_send(self):
+        _rcs, _posted, dead = self.run_with([[self.CRIT]], deadman_ok=False)
+        st = ow.load_state(self.home)
+        self.assertEqual(len(dead), 1)
+        self.assertIn("disk:volume:/", st.get("deadman_sent", {}), "queued and rate-limited")
+        self.assertNotIn("disk:volume:/", st.get("deadman_delivered", {}), "a failed send must not be a receipt")
+        _rcs, _posted, dead = self.run_with([[self.CRIT]], deadman_ok=True)   # the queued mail is retried
+        self.assertEqual(len(dead), 1)
+        self.assertIn("disk:volume:/", ow.load_state(self.home)["deadman_delivered"])
+
+    def test_receipt_map_is_bounded(self):
+        state = {"deadman_delivered": {"k%d" % i: float(i) for i in range(500)}}
+        ow.record_delivered(state, "new", 1000.0)
+        self.assertEqual(len(state["deadman_delivered"]), 500)
+        self.assertNotIn("k0", state["deadman_delivered"], "the oldest receipt is evicted first")
+        self.assertEqual(state["deadman_delivered"]["new"], 1000.0)
+
+    def query(self, key):
+        out = io.StringIO()
+        with mock.patch.object(ow.Path, "home", return_value=self.home), contextlib.redirect_stdout(out):
+            rc = ow.main(["delivered", "--key", key, "--json"])
+        return rc, json.loads(out.getvalue())
+
+    def test_delivered_query_hit_miss_and_malformed_state(self):
+        self.run_with([[self.CRIT]], deadman_ok=True)
+        rc, hit = self.query("disk:volume:/")
+        self.assertEqual(rc, 0)
+        self.assertEqual(hit["key"], "disk:volume:/")
+        self.assertIsInstance(hit["delivered_at"], float)
+        self.assertIsNone(self.query("never-sent")[1]["delivered_at"])
+        ow.state_path(self.home).write_bytes(b"{garbage" * 10)
+        rc, bad = self.query("disk:volume:/")
+        self.assertEqual(rc, 0)
+        self.assertIsNone(bad["delivered_at"], "malformed state is never a receipt")
+
+    def test_capability_is_listed(self):
+        self.assertIn("deadman-delivered", ow.capabilities())
+
+
 class ReadOnlyTests(unittest.TestCase):
     def test_command_allowlist(self):
         src = (HOOKS / "ops_watch.py").read_text()
