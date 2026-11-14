@@ -47,7 +47,7 @@ def probe(pvesm_text=None, qm=None, du=None, end=True, extra=""):
     du = DU if du is None else du
     out = "##PVESM\n" + (pvesm() if pvesm_text is None else pvesm_text) + "##QM\n"
     for vm, cfg in qm.items():
-        out += f"##VM {vm}\n{cfg}"
+        out += f"##VM {vm}\n{cfg}" + ("name: vm\n" if "scsi" in cfg and "name:" not in cfg else "")
     out += "##DU\n" + "".join(f"{gib_kib(g)}\t/var/lib/vz/images/{vm}\n" for vm, g in du.items())
     return out + extra + ("##END\n" if end else "")
 
@@ -292,6 +292,60 @@ class RedTeamRound1Tests(Base):
         self.assertEqual(list(state["proxmox_pools"]), ["t2-proxmox:/var/lib/vz"])
 
 
+REAL_PVESM = ("Name         Type     Status     Total (KiB)      Used (KiB) Available (KiB)        %\n"
+              "local         dir     active       916398132       856463396        50596800   93.46%\n")
+
+
+class IncompleteConfigTests(Base):
+    """Plan review F3: a garbled or partial VM config must never read as a valid zero allocation."""
+
+    def unknown_vms(self, qm):
+        got = self.run_check((0, probe(PVESM_LOW, qm={**QM, **qm})))[0]
+        return sorted(k.rsplit(":", 1)[1] for k in got if "vmunknown" in k)
+
+    def test_error_only_config_is_unknown_below_thresholds(self):
+        self.assertEqual(self.unknown_vms({102: "Configuration file 'nodes/pve/qemu-server/102.conf' does not exist\n"}),
+                         ["102"])
+
+    def test_malformed_disk_declaration_is_unknown(self):
+        self.assertEqual(self.unknown_vms({103: "name: x\nscsi0: local:103/a.raw,size=400G\nscsi1: broken\n"}), ["103"])
+
+    def test_sized_plus_unsized_sibling_is_unknown(self):
+        self.assertEqual(self.unknown_vms({103: "name: x\nscsi0: local:103/a.raw,size=400G\nscsi1: local:103/b.raw\n"}),
+                         ["103"])
+
+    def test_vm_with_no_disk_on_this_pool_is_valid_zero(self):
+        self.assertEqual(self.unknown_vms({102: "name: x\nscsi0: other:102/a.raw,size=10G\nide2: none,media=cdrom\n"}), [])
+
+
+PVESM_LOW = pvesm(total_g=1000, used_g=500, avail_g=500)
+
+
+class RealFormatTests(Base):
+    """Recorded from the live t2-proxmox pool on 2026-11-13: the header carries (KiB) units."""
+
+    def test_real_pvesm_header_with_kib_units_parses(self):
+        got = self.run_check((0, probe(REAL_PVESM)))[0]
+        self.assertNotIn(UNKNOWN, got)
+        self.assertEqual(got[KEY]["severity"], "high")
+        self.assertIn("93.5% used", got[KEY]["message"])
+        self.assertEqual(got[KEY]["detail"]["free_bytes"], 50596800 * 1024)  # absolute units, not just percentages
+        self.assertEqual(got[KEY]["detail"]["total_gib"], round(916398132 / 1048576, 2))
+
+    def test_login_user_is_used_for_ssh_but_never_shown_in_alerts(self):
+        self.cfg["proxmox_pools"][0]["host"] = "root@t2-proxmox"
+        got, _, runner = self.run_check((0, probe(REAL_PVESM)))
+        self.assertIn("root@t2-proxmox", runner.calls[0][0])
+        self.assertIn(KEY, got)
+        self.assertNotIn("root", json.dumps(got))
+
+    def test_both_header_styles_parse_to_the_same_numbers(self):
+        a = ow.parse_pool_status(REAL_PVESM, "local")
+        b = ow.parse_pool_status(pvesm(total_g=916, used_g=848, avail_g=56), "local")
+        self.assertEqual(a, (916398132 * 1024, 856463396 * 1024, 50596800 * 1024))
+        self.assertIsNotNone(b)
+
+
 class CommandAndConfigTests(Base):
     READ_WORDS = {"echo", "pvesm", "status", "--storage", "qm", "list", "awk", "config", "du", "-sk", "for", "in",
                   "do", "done", "local"}
@@ -299,20 +353,24 @@ class CommandAndConfigTests(Base):
     def test_the_remote_script_is_one_fixed_read_only_call(self):
         runner = self.run_check((0, probe()))[2]
         (argv, timeout), = runner.calls
-        self.assertEqual(argv[:5], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
-        self.assertEqual(argv[5:7], ["--", "t2-proxmox"])
+        self.assertEqual(argv[:6], ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
+        for opt in ("StrictHostKeyChecking=yes", "ControlMaster=no", "ControlPath=none"):
+            self.assertIn(opt, argv)
+        self.assertEqual(argv[-3:-1], ["--", "t2-proxmox"])
         self.assertLessEqual(timeout, 30)
         script = argv[-1]
         for verb in ("fstrim", "resize", "destroy", "set", "create", "start", "stop", "shutdown", "migrate", "rm ",
                      "mv ", "delete", "move", "restore", "unlock", "template", "snapshot", "rollback", "reboot",
                      ">", "<", "`", "&", "|", "sudo", "tee"):
-            self.assertNotIn(verb, re.sub(r"'##[A-Z ]+'", "", script).replace("$(qm list | awk 'NR>1{print $1}')", ""),
+            self.assertNotIn(verb, re.sub(r"'##[A-Z ]+'", "", script).replace("$(timeout 5 qm list | awk 'NR>1{print $1}')", ""),
                              verb)
-        self.assertIn("pvesm status --storage local", script)
+        self.assertIn("timeout 8 pvesm status --storage local", script)
+        self.assertIn("timeout 8 du -sk /var/lib/vz/images/102 /var/lib/vz/images/103;", script)
+        self.assertNotIn("images/*", script)  # unwatched VM directories are never traversed
         self.assertIn("qm config", script)
         for cmd in re.split(r";", script):
             first = cmd.strip().split(" ")[0]
-            self.assertIn(first, {"echo", "pvesm", "qm", "du", "for", "do", "done", "", "awk"}, cmd)
+            self.assertIn(first, {"echo", "timeout", "for", "do", "done", ""}, cmd)
 
     def test_unsafe_config_is_refused_before_ssh(self):
         bad = [{"host": "-oProxyCommand=x"}, {"host": "t2-proxmox; reboot"}, {"host": ""},

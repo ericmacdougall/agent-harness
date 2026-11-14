@@ -1363,6 +1363,8 @@ def _read_unit(out, rec, key, host, unit, svc, tmr, now, max_age):
 POOL_STORAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}")
 POOL_MOUNT = re.compile(r"/[A-Za-z0-9._/-]{1,100}")
 POOL_DISK = re.compile(r"^(?:scsi|virtio|sata|ide|efidisk|tpmstate)\d+:\s*([A-Za-z0-9_-]+):[^,\s]*(?P<rest>.*)$")
+POOL_DISK_KEY = re.compile(r"^(?:scsi|virtio|sata|ide|efidisk|tpmstate)\d+:")
+POOL_CFG_KEY = re.compile(r"^(?:memory|cores|name|boot):")
 POOL_SIZE = re.compile(r"(?:^|,)size=(\d+(?:\.\d+)?)([KMGT]?)(?:,|$)")
 POOL_UNITS = {"": 1 / GIB, "K": KIB / GIB, "M": KIB ** 2 / GIB, "G": 1.0, "T": 1024.0}
 POOL_WARN_PCT, POOL_HIGH_PCT, POOL_CRIT_PCT, POOL_FLOOR_GIB = 85.0, 92.0, 97.0, 20.0
@@ -1371,10 +1373,14 @@ POOL_SAMPLE_GAP_S, POOL_SAMPLE_KEEP_S, POOL_SAMPLE_MAX = 1800, 48 * 3600, 120
 POOL_UNKNOWN_HIGH_S = 1800
 
 
-def pool_script(storage: str, mount: str) -> str:
-    return (f"echo '##PVESM'; pvesm status --storage {storage}; echo '##QM'; "
-            "for v in $(qm list | awk 'NR>1{print $1}'); do echo \"##VM $v\"; qm config \"$v\"; done; "
-            f"echo '##DU'; du -sk {mount}/images/*; echo '##END'")
+def pool_script(storage: str, mount: str, watch=()) -> str:
+    """Every command is bounded by remote `timeout`. qm config of every VM is needed for the overcommit total, but
+    only the watched VMs' image directories are measured."""
+    dirs = " ".join(f"{mount}/images/{int(v)}" for v in watch)
+    du = f"timeout 8 du -sk {dirs}; " if dirs else ""
+    return (f"echo '##PVESM'; timeout 8 pvesm status --storage {storage}; echo '##QM'; "
+            "for v in $(timeout 5 qm list | awk 'NR>1{print $1}'); do echo \"##VM $v\"; timeout 3 qm config \"$v\"; done; "
+            f"echo '##DU'; {du}echo '##END'")
 
 
 def _pool_num(text):
@@ -1387,7 +1393,8 @@ def _pool_num(text):
 
 def parse_pool_status(text: str, storage: str):
     """(total, used, avail) in bytes from `pvesm status` output, or None for anything unusable."""
-    lines = [l.split() for l in (text or "").splitlines() if l.strip()]
+    # recorded live: current pvesm prints "Total (KiB)  Used (KiB)  Available (KiB)"; older output has no units
+    lines = [l.split() for l in (text or "").replace("(KiB)", "").splitlines() if l.strip()]
     if not lines or lines[0][:6] != ["Name", "Type", "Status", "Total", "Used", "Available"]:
         return None
     rows = [l for l in lines[1:] if l[0] == storage]
@@ -1425,8 +1432,13 @@ def parse_pool_probe(text: str, storage: str):
     vms = {}
     for vm_id, cfg in sections.get("VM", {}).items():
         total, unsized = 0.0, False
+        valid = any(POOL_CFG_KEY.match(l) for l in cfg)  # a real qm config always has memory/cores/name
         for line in cfg:
             m = POOL_DISK.match(line.strip())
+            if not m and POOL_DISK_KEY.match(line.strip()) and "media=cdrom" not in line and ":" in line \
+                    and not line.split(":", 1)[1].strip().startswith("none"):
+                unsized = True  # a disk declaration this parser cannot read: incomplete, never a zero
+                continue
             if not m or m.group(1) != storage or "media=cdrom" in m.group("rest"):
                 continue
             size = POOL_SIZE.search(m.group("rest"))
@@ -1435,7 +1447,8 @@ def parse_pool_probe(text: str, storage: str):
                 continue
             total += float(size.group(1)) * POOL_UNITS[size.group(2)]
         # no config lines at all: unknown, not zero; a disk without a size keeps the sized ones and is flagged
-        vms[vm_id] = {"gib": None if not cfg or (unsized and not total) else total, "unsized": unsized}
+        vms[vm_id] = {"gib": None if not valid or (unsized and not total) else total,
+                      "unsized": unsized or not valid}
     du = {}
     for line in sections.get("DU", []):
         m = re.fullmatch(r"(\d+)\s+\S*/images/(\d{1,10})", line.strip())
@@ -1459,17 +1472,19 @@ def check_proxmox_pool(cfg, state, runner, now):
         storage = str(entry.get("storage", "local"))
         mount = str(entry.get("mount", "/var/lib/vz")).rstrip("/") or "/"
         watch = entry.get("watch_vms", [])
-        base = f"{host[:64]}:{mount[:100]}"
+        shown = host.rsplit("@", 1)[-1]  # alerts name the host, never the login user
+        base = f"{shown[:64]}:{mount[:100]}"
         if (not REMOTE_HOST.fullmatch(host) or not POOL_STORAGE.fullmatch(storage) or not POOL_MOUNT.fullmatch(mount)
                 or ".." in mount or not isinstance(watch, list)
                 or any(type(v) is not int or not 0 < v < 10 ** 10 for v in watch)):
             out.append(alert("proxmox_pool", f"disk:config:{base}", "warning",
-                             "proxmox pool entry has an unsafe host, storage, mount or VM id", {"host": host[:64]}))
+                             "proxmox pool entry has an unsafe host, storage, mount or VM id", {"host": shown[:64]}))
             continue
         rec = seen.setdefault(base, {"first_try": now, "samples": []})
         try:
-            rc, text = runner(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", host,
-                               pool_script(storage, mount)], 25)
+            rc, text = runner(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                               "-o", "StrictHostKeyChecking=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none",
+                               "--", host, pool_script(storage, mount, watch)], 25)
         except (subprocess.TimeoutExpired, OSError):
             rc, text, why = 255, "", "unreachable or timed out"
         else:
@@ -1479,12 +1494,12 @@ def check_proxmox_pool(cfg, state, runner, now):
             out.extend(a for a in rec.get("alerts") or [] if isinstance(a, dict) and a.get("check") == "proxmox_pool")
             stale = now - rec.get("ok_at", rec["first_try"]) > POOL_UNKNOWN_HIGH_S
             out.append(alert("proxmox_pool", f"disk:unknown:{base}", "high" if stale else "warning",
-                             f"UNKNOWN: cannot read {host} {storage} pool ({why}); capacity is not being watched",
-                             {"host": host[:64], "reason": why}))
+                             f"UNKNOWN: cannot read {shown} {storage} pool ({why}); capacity is not being watched",
+                             {"host": shown[:64], "reason": why}))
             continue
         total, used, avail = parsed["status"]
         mark = len(out)
-        _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, used, avail, now)
+        _pool_alerts(out, rec, base, shown, storage, mount, watch, parsed, total, used, avail, now)
         rec["ok_at"] = now
         rec["alerts"] = out[mark:]
     return out
@@ -1532,7 +1547,8 @@ def _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, use
                          f"{host} {storage} pool {pct:.1f}% used, {free_gib:.0f} GiB free, "
                          f"{detail['overcommit_ratio']}x overcommitted", detail))
     for v in watch:  # a watched VM that cannot be read must be visible even when the pool is below every threshold
-        if (parsed["vms"].get(v) or {}).get("gib") is None or parsed["du"].get(v) is None:
+        vm = parsed["vms"].get(v) or {}
+        if vm.get("gib") is None or vm.get("unsized") or parsed["du"].get(v) is None:
             out.append(alert("proxmox_pool", f"disk:vmunknown:{base}:{v}", "warning",
                              f"UNKNOWN: VM {v} config or disk usage missing from the {host} {storage} probe; "
                              "its growth is not being watched", {"host": host[:64], "vm": v}))

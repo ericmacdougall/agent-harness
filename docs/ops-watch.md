@@ -106,10 +106,10 @@ Host and unit names must be plain words, and `max_age_h` must be a finite positi
 `proxmox_pools` (goodqa#15771) watches the capacity of a dir-type Proxmox storage pool whose thin guest disks can fill it. It is empty by default; enable it per host in `ops-watch.json`:
 
 ```json
-{"proxmox_pools": [{"host": "t2-proxmox", "storage": "local", "mount": "/var/lib/vz", "watch_vms": [102, 103]}]}
+{"proxmox_pools": [{"host": "root@t2-proxmox", "storage": "local", "mount": "/var/lib/vz", "watch_vms": [102, 103]}]}
 ```
 
-Each run makes one read-only call: `ssh -o BatchMode=yes -o ConnectTimeout=5 -- HOST SCRIPT` with 25 s in total. The script is fixed text: `pvesm status --storage STORAGE`, `qm list` and `qm config` for every VM, and `du -sk MOUNT/images/*`. Host, storage and mount are checked against plain-word patterns and VM ids must be integers, so a bad entry is refused as `disk:config:...` before ssh. Nothing changes on the hypervisor. Alerts (key suffix `HOST:MOUNT`):
+Each run makes one read-only call: `ssh -o BatchMode=yes -o ConnectTimeout=5 -- HOST SCRIPT` with 25 s in total. The script is fixed text, each command under a remote `timeout` (3 to 8 s): `pvesm status --storage STORAGE`, `qm list` and `qm config` for every VM (config files only, needed for the overcommit total), and `du -sk` of the watched VMs image directories only. ssh runs with `-n`, `StrictHostKeyChecking=yes` and no ControlMaster, so the host key must already be in known_hosts. The host may carry a login (`root@t2-proxmox`: the hypervisor admits root only); alerts show the host without it. Host, storage and mount are checked against plain-word patterns and VM ids must be integers, so a bad entry is refused as `disk:config:...` before ssh. Nothing changes on the hypervisor. Alerts (key suffix `HOST:MOUNT`):
 
 - `disk:volume:` warning at 85% used, high at 92%, critical at 97% or under 20 GiB free. The overcommit ratio is reported in this alert and not alerted on its own: it is a standing condition, decided by the disk options in goodqa#15771. The detail holds `overcommit_ratio` (disk sizes on this storage over pool total), `provisioned_gib`, and for each watched VM `allocated_gib`, `actual_gib` (du of its image dir) and `growth_gib_day`.
 - `disk:growth:` more than 10 GiB/day, measured against the stored sample 6 to 48 h old that is closest to 24 h (samples every 30 min, kept 48 h, from good reads only). High when the pool would fill within 3 days at that rate, else warning.
