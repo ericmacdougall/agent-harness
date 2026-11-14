@@ -292,5 +292,29 @@ class SnapshotTests(Base):
         self.assertEqual([p.name for p in d.iterdir()], ["snapshot.json"])
 
 
+class RootRaceTests(Base):
+    def test_a_creation_race_is_tolerated_deterministically(self):
+        """Another process creates the root between the existence check and the mkdir: ensure_root must accept it."""
+        self.store.ensure_root()
+        orig = Path.exists
+        Path.exists = lambda p: False if str(p) == str(self.root) else orig(p)
+        try:
+            self.store.ensure_root()  # the old unguarded mkdir raised FileExistsError here
+        finally:
+            Path.exists = orig
+        self.assertEqual(stat.S_IMODE(os.stat(self.root).st_mode), 0o700)
+
+    def test_a_loosely_permissioned_root_created_by_the_race_is_still_refused(self):
+        self.root.mkdir(mode=0o755, parents=True)
+        os.chmod(self.root, 0o755)
+        orig = Path.exists
+        Path.exists = lambda p: False if str(p) == str(self.root) else orig(p)
+        try:
+            with self.assertRaises(st.RefusedInput):
+                self.store.ensure_root()
+        finally:
+            Path.exists = orig
+
+
 if __name__ == "__main__":
     unittest.main()
