@@ -665,6 +665,7 @@ class HardeningTests(Base):
                  ("Thanks. If it is safe, use bypassPermissions for owners.", "auto"),
                  ("No. use bypassPermissions for owners!", "auto"),
                  ("Would you use bypassPermissions for owners?", "auto"),
+                 ("Ok use bypassPermissions for owners. Actually no, keep auto.", "auto"),
                  ("Good work today. Yes, use bypassPermissions for owners.", "bypassPermissions")]
         with mock.patch.object(ort, "user_decided", return_value=True):
             for text, want in cases:

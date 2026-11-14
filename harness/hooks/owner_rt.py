@@ -275,7 +275,8 @@ SENTENCE_END = re.compile(r"[.!?\n]+")
 
 def decision_context(source) -> str:
     """The user's own words a decision is judged on (receipt v5 F1): the sentence holding the quoted excerpt, from the
-    start of the sentence before it to the end of the sentence where the excerpt ends, read from the real user turn
+    start of the sentence before it to the end of the sentence after the one where the excerpt ends (a retraction
+    right after the quote counts too), read from the real user turn
     (or AskUserQuestion answer). A partial quote such as "use bypassPermissions for owners" out of "Do not use
     bypassPermissions for owners." is judged with its "Do not". '' when the turn cannot be read or the excerpt is not
     a faithful quote: fail closed."""
@@ -307,8 +308,10 @@ def decision_context(source) -> str:
         return ""
     starts = [0] + [m.end() for m in SENTENCE_END.finditer(body, 0, first)]
     start = starts[-2] if len(starts) >= 2 else 0  # the sentence before, too: "No. Park solve." stays undecided
-    tail = SENTENCE_END.search(body, pos)
-    end = tail.end() if tail else len(body)
+    end = pos
+    for _ in range(2):  # the quoted sentence's end, then the sentence after it: "... Actually no, don't." retracts it
+        tail = SENTENCE_END.search(body, end)
+        end = tail.end() if tail else len(body)
     return body[start:end]
 
 

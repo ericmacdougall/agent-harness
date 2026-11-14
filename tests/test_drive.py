@@ -287,6 +287,7 @@ class ResponseTests(Base):
                  ("park solve today", "Please don't park solve today.", False),
                  ("park solve today", "Keep going. If the build breaks, park solve today.", False),
                  ("park solve today", "No. park solve today.", False),
+                 ("park solve today", "Yes, park solve today. Wait, don't.", False),
                  ("park solve today", "Thanks for the update. Yes, park solve today.", True)]
         with mock.patch.object(mc, "verify_user_source", return_value=True):
             for excerpt, text, ok in cases:
