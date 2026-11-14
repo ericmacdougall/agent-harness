@@ -13,10 +13,13 @@ from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import owner_rt as ort  # noqa: E402
+import authority_fixture as fx  # noqa: E402
 
 NOW = 1_800_000_000.0
 SID = "11111111-2222-3333-4444-555555555555"
+NEW_SID = "99999999-8888-7777-6666-555555555555"
 GOAL_AC = """# t1
 AC-1 the page loads
 Verify by: pytest tests/test_page.py -k load
@@ -25,13 +28,6 @@ Verify by: curl -sf localhost/save
 NEG-1 (AC-2) a double click saves once
 """
 
-
-
-def whole_turn():
-    """The quoted excerpt is the user's whole turn (older decision tests); receipt v5 tests read real turns."""
-    import provenance
-    return mock.patch.object(ort, "decision_context",
-                             side_effect=lambda s: provenance.parse_source(s).get("excerpt") or "")
 
 
 class Base(unittest.TestCase):
@@ -357,7 +353,7 @@ class TickTests(Base):
         if "--bg" in argv:
             self.cwds.append(cwd)
         if argv[1:2] == ["agents"]:
-            return 0, json.dumps(self.sessions + [{"id": "c9f43044", "sessionId": "new-session-id-0001"}])
+            return 0, json.dumps(self.sessions + [{"id": "c9f43044", "sessionId": NEW_SID}])
         if "--bg" in argv:
             return 0, "backgrounded · c9f43044 · owner-solve"
         if argv[1:2] == ["stop"]:
@@ -366,7 +362,7 @@ class TickTests(Base):
             if not getattr(self, "stop_ignored", False):
                 for a in self.sessions:
                     if a.get("id") == argv[2]:
-                        a["pid"] = None
+                        a.pop("pid", None)  # the real listing drops pid for a stopped session
         return 0, ""
 
     def test_tick_replace_refused_unless_old_session_proven_stopped(self):
@@ -416,7 +412,8 @@ class TickTests(Base):
                 return 0, json.dumps([a for a in self.sessions if a.get("pid")])
             if argv[1:2] == ["stop"]:
                 for a in self.sessions:
-                    a["pid"] = None if a.get("id") == argv[2] else a.get("pid")
+                    if a.get("id") == argv[2]:
+                        a.pop("pid", None)
                 return 0, ""
             if "--bg" in argv:
                 seen.append(ort.load_state(self.home, "solve")["launches"][-1]["code"])
@@ -459,7 +456,7 @@ class TickTests(Base):
         self.assertIn("t1", launch[-1])
         st = ort.load_state(self.home, "solve")
         self.assertEqual(st["bg_id"], "c9f43044")
-        self.assertEqual(st["session_id"], "new-session-id-0001")
+        self.assertEqual(st["session_id"], NEW_SID)
         self.assertIn(["claude", "stop", "8d84dcef"], self.calls)
         self.assertEqual(self.cwds, [str(self.repo.resolve())])  # launched in the owner's workspace (live G2 bug)
 
@@ -479,7 +476,7 @@ class TickTests(Base):
         self.assertFalse([c for c in self.calls if c[1:2] == ["stop"] or "--bg" in c])
 
     def test_tick_finds_owner_by_name_and_stops_every_idle_duplicate(self):
-        self.sessions.append({"id": "aa11bb22", "sessionId": "other-0001", "pid": 2, "status": "idle", "state": "done",
+        self.sessions.append({"id": "aa11bb22", "sessionId": "22222222-0000-0000-0000-000000000001", "pid": 2, "status": "idle", "state": "done",
                               "name": "owner-solve"})
         ort.add_task(self.home, "solve", "fix login", "ticket:goodqa#2")
         ort.tick(self.home, now=NOW, runner=self.runner)
@@ -490,7 +487,7 @@ class TickTests(Base):
         st = ort.load_state(self.home, "solve")
         st["session_id"] = ""  # id lookup failed after the last launch
         ort.save_state(self.home, "solve", st)
-        self.sessions[:] = [{"id": "aa11bb22", "sessionId": "x", "pid": 2, "status": "busy", "state": "working",
+        self.sessions[:] = [{"id": "aa11bb22", "sessionId": "22222222-0000-0000-0000-000000000002", "pid": 2, "status": "busy", "state": "working",
                              "name": "owner-solve"}]
         ort.add_task(self.home, "solve", "fix login", "ticket:goodqa#2")
         self.assertEqual(ort.tick(self.home, now=NOW, runner=self.runner)[0]["reason"], "running")
@@ -499,7 +496,8 @@ class TickTests(Base):
         def runner(argv, timeout=60, cwd=None):
             if argv[1:2] == ["stop"]:
                 for a in self.sessions:
-                    a["pid"] = None if a.get("id") == argv[2] else a.get("pid")
+                    if a.get("id") == argv[2]:
+                        a.pop("pid", None)
             if argv[1:2] == ["agents"]:
                 return 0, json.dumps(self.sessions)  # the new session is not listed: lookup fails
             return (0, "backgrounded · c9f43044 · owner-solve") if "--bg" in argv else (0, "")
@@ -567,7 +565,8 @@ class TickTests(Base):
         def runner(argv, timeout=60, cwd=None):
             if argv[1:2] == ["stop"]:
                 for a in self.sessions:
-                    a["pid"] = None if a.get("id") == argv[2] else a.get("pid")
+                    if a.get("id") == argv[2]:
+                        a.pop("pid", None)
             if argv[1:2] == ["agents"]:
                 return 0, json.dumps(self.sessions)
             if "--bg" in argv:
@@ -629,62 +628,6 @@ class HardeningTests(Base):
         out = ort.tick(self.home, now=NOW, runner=lambda *a, **k: calls.append(a) or (0, "[]"))
         self.assertEqual(calls, [])
         self.assertEqual(out[0]["action"], "would-launch")
-
-    def test_runtime_bypass_needs_user_words(self):
-        self.write_runtime({"enabled": True, "permission_mode": "bypassPermissions"})
-        self.assertEqual(ort.runtime(self.home)["permission_mode"], "auto")
-        sess = "baab765b-d85c-46b4-b7b9-588eb912c770/ecc9bdf8-0000-4000-8000-000000000000"
-        self.write_runtime({"enabled": True, "permission_mode": "bypassPermissions",
-                            "permission_source": f'answer:{sess} "Bypass, like main"'})
-        with mock.patch.object(ort, "user_decided", return_value=True), whole_turn():
-            self.assertEqual(ort.runtime(self.home)["permission_mode"], "bypassPermissions")
-        with mock.patch.object(ort, "user_decided", return_value=False):  # not the user's own turn
-            self.assertEqual(ort.runtime(self.home)["permission_mode"], "auto")
-
-    def test_runtime_bypass_questions_and_conditionals_never_decide(self):
-        """Receipt v4 F2: a question, conditional or hedge is not a decision; an explicit imperative is."""
-        sess = "baab765b-d85c-46b4-b7b9-588eb912c770/ecc9bdf8-0000-4000-8000-000000000000"
-        with mock.patch.object(ort, "user_decided", return_value=True), whole_turn():
-            for words in ("What does bypassPermissions do", "What does bypassPermissions do?", "Should we use bypass",
-                          "If tests pass, use bypass", "bypass would be nice", "maybe bypass", "use bypass when ready",
-                          "is bypass on", "I wonder about bypass", "owners in bypass mode", "Can owners bypass"):
-                self.write_runtime({"enabled": True, "permission_mode": "bypassPermissions",
-                                    "permission_source": f'user:{sess} "{words}"'})
-                self.assertEqual(ort.runtime(self.home)["permission_mode"], "auto", words)
-            for words in ("Bypass, like main", "yes, use bypassPermissions for owners", "ok bypass"):
-                self.write_runtime({"enabled": True, "permission_mode": "bypassPermissions",
-                                    "permission_source": f'user:{sess} "{words}"'})
-                self.assertEqual(ort.runtime(self.home)["permission_mode"], "bypassPermissions", words)
-
-    def test_runtime_bypass_partial_quote_judged_on_whole_sentence(self):
-        """Receipt v5 F1: a quote cut out of a refusal never authorizes; the user's whole sentence is judged."""
-        import provenance
-        src = 'user:baab765b-d85c-46b4-b7b9-588eb912c770/11111111-2222-4333-8444-555555555555 "use bypassPermissions for owners"'
-        self.write_runtime({"enabled": True, "permission_mode": "bypassPermissions", "permission_source": src})
-        cases = [("Do not use bypassPermissions for owners.", "auto"),
-                 ("Thanks. If it is safe, use bypassPermissions for owners.", "auto"),
-                 ("No. use bypassPermissions for owners!", "auto"),
-                 ("Would you use bypassPermissions for owners?", "auto"),
-                 ("Ok use bypassPermissions for owners. Actually no, keep auto.", "auto"),
-                 ("Good work today. Yes, use bypassPermissions for owners.", "bypassPermissions")]
-        with mock.patch.object(ort, "user_decided", return_value=True):
-            for text, want in cases:
-                with mock.patch.object(provenance, "user_turn", return_value={"text": text}):
-                    self.assertTrue(ort.decision_context(src), text)  # the quote is found: never vacuous
-                    self.assertEqual(ort.runtime(self.home)["permission_mode"], want, text)
-            with mock.patch.object(provenance, "user_turn", side_effect=RuntimeError("no transcript")):
-                self.assertEqual(ort.runtime(self.home)["permission_mode"], "auto")  # unreadable: fail closed
-            with mock.patch.object(provenance, "user_turn", return_value={"text": "something else entirely"}):
-                self.assertEqual(ort.runtime(self.home)["permission_mode"], "auto")  # not a faithful quote
-
-    def test_runtime_bypass_words_must_choose_bypass(self):
-        """Delta D3: a genuine user turn that does not choose bypass never unlocks it."""
-        sess = "baab765b-d85c-46b4-b7b9-588eb912c770/ecc9bdf8-0000-4000-8000-000000000000"
-        with mock.patch.object(ort, "user_decided", return_value=True), whole_turn():
-            for words in ("ok go ahead", "yes", "do not bypass permissions", "never use bypass", "don't bypass"):
-                self.write_runtime({"enabled": True, "permission_mode": "bypassPermissions",
-                                    "permission_source": f'user:{sess} "{words}"'})
-                self.assertEqual(ort.runtime(self.home)["permission_mode"], "auto", words)
 
     def test_init_workspace_must_be_dedicated(self):
         """Delta D1: the workspace identifies the owner session, so it is never a home dir or shared."""
@@ -796,6 +739,261 @@ class HardeningTests(Base):
                 self.assertEqual(ort.main(argv), 2)  # another owner's session
             with mock.patch.object(caller_identity, "take_stamp", return_value={"session": SID}):
                 self.assertEqual(ort.main(["pause", "--goal", "solve", "--source", "ticket:goodqa#1"]), 2)
+
+
+# Every bypass phrase the earlier review rounds used (receipts v2-v6, delta D3): none may grant, whatever form it
+# arrives in. The last group were positives under the text parser; they are refusals now.
+BYPASS_PHRASES = (
+    "Use bypass cache for this request.",                                   # v6 F1
+    "Use bypassPermissions for the disposable test session.",               # v6 F1
+    "What does bypassPermissions do?", "Should we use bypass", "If tests pass, use bypass",  # v4 F2
+    "bypass would be nice", "maybe bypass", "use bypass when ready", "Can owners bypass",
+    "Do not use bypassPermissions for owners.",                             # v5 F1 (quoted in part below)
+    "Thanks. If it is safe, use bypassPermissions for owners.", "No. use bypassPermissions for owners!",
+    "Would you use bypassPermissions for owners?", "Ok use bypassPermissions for owners. Actually no, keep auto.",
+    "do not bypass permissions", "never use bypass", "don't bypass", "ok go ahead", "yes",  # delta D3
+    "Bypass, like main", "yes, use bypassPermissions for owners", "ok bypass",
+    "Good work today. Yes, use bypassPermissions for owners.",
+)
+
+
+class AuthorityBase(Base):
+    def setUp(self):
+        super().setUp()
+        self.init()
+        self.set_session()
+        ort.add_task(self.home, "solve", "fix login", "ticket:goodqa#2")
+        p = mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.home / ".claude")})
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(ort, "claude_bin", return_value="claude")
+        p.start()
+        self.addCleanup(p.stop)
+        import mission_coverage
+        p = mock.patch.object(mission_coverage, "mission_session_of", return_value=fx.MISSION)
+        p.start()
+        self.addCleanup(p.stop)
+        self.write_runtime({"enabled": True})
+
+    def write_runtime(self, data):
+        root = self.home / ".agent-harness" / "owners"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "runtime.json").write_text(json.dumps(data))
+
+    def launch_mode(self, now=None):
+        """The --permission-mode the tick would launch this owner with (dry run, no program runs)."""
+        out = ort.tick(self.home, now=time.time() if now is None else now, dry_run=True,
+                       runner=lambda *a, **k: (0, "[]"))
+        argv = out[0].get("argv")
+        self.assertTrue(argv, out)  # the tick did reach the launch: never vacuous
+        return argv[argv.index("--permission-mode") + 1]
+
+    def grant_answer(self, scope="*", hours=24, chosen=None, **kw):
+        q = ort.bypass_question(scope, hours) if "question" not in kw else kw.pop("question")
+        chosen = ort.BYPASS_LABEL if chosen is None else chosen
+        options = kw.pop("options", [ort.BYPASS_LABEL, "No bypass: keep the configured mode"])
+        session = kw.pop("session", fx.MISSION)
+        uid = fx.answer(self.home, session, q, chosen, options=options, **kw)
+        return f"answer:{session}/{uid}"
+
+
+class BypassAuthorityTests(AuthorityBase):
+    """Receipt v6 F1: bypassPermissions only from the user's structured answer to the exact grant question."""
+
+    def test_bypass_no_text_ever_grants_bypass(self):
+        for words in BYPASS_PHRASES:
+            uid = fx.human_turn(self.home, fx.MISSION, words)
+            for quote in (words, "use bypassPermissions for owners"):
+                if quote not in words:
+                    continue
+                src = f'user:{fx.MISSION}/{uid} "{quote}"'
+                # 1. runtime.json naming bypass with the user's words as permission_source (the old path)
+                self.write_runtime({"enabled": True, "permission_mode": "bypassPermissions",
+                                    "permission_source": src})
+                self.assertEqual(self.launch_mode(), "auto", words)
+                self.assertIn("never comes from runtime.json", ort.runtime(self.home).get("note", ""))
+                # 2. the words cited to the grant command
+                with self.assertRaisesRegex(ort.OwnerError, "must be exactly answer:", msg=words):
+                    ort.grant_bypass(self.home, "*", 24, src)
+            # 3. the words typed as the free-text "Other" reply to the exact grant question
+            src = self.grant_answer(chosen=words)
+            with self.assertRaisesRegex(ort.OwnerError, "did not choose", msg=words):
+                ort.grant_bypass(self.home, "*", 24, src)
+            # 4. the words as the question itself, with the user choosing the grant label
+            src = self.grant_answer(question=words)
+            with self.assertRaisesRegex(ort.OwnerError, "different question", msg=words):
+                ort.grant_bypass(self.home, "*", 24, src)
+        self.write_runtime({"enabled": True})
+        self.assertEqual(self.launch_mode(), "auto")
+        self.assertEqual(ort.load_authority(self.home)["bypass"], [])
+        # positive control on the same fixture home: the exact structured answer does grant, and revoking ends it
+        ort.grant_bypass(self.home, "*", 24, self.grant_answer())
+        self.assertEqual(self.launch_mode(), "bypassPermissions")
+        ort.revoke_bypass(self.home, "*")
+        self.assertEqual(self.launch_mode(), "auto")
+
+    def test_bypass_answer_must_fit_scope_hours_and_shape(self):
+        cases = [
+            ("declined", dict(chosen="No bypass: keep the configured mode"), "did not choose"),
+            ("other hours", dict(question=ort.bypass_question("*", 48)), "different question"),
+            ("other scope", dict(question=ort.bypass_question("solve", 24)), "different question"),
+            ("multi-select", dict(multi=True), "single question"),
+            ("two questions", dict(questions=[
+                {"question": ort.bypass_question("*", 24), "multiSelect": False,
+                 "options": [{"label": ort.BYPASS_LABEL}, {"label": "No"}]},
+                {"question": "Anything else?", "multiSelect": False, "options": [{"label": "No"}]}],
+                answers={ort.bypass_question("*", 24): ort.BYPASS_LABEL, "Anything else?": "No"}), "single question"),
+            ("sub-agent", dict(sidechain=True), "resolve"),
+            ("stale", dict(ts=time.time() - 25 * 3600), "older than"),
+            ("not main's session", dict(session="bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee"), "mission session"),
+        ]
+        for name, kw, why in cases:
+            with self.assertRaisesRegex(ort.OwnerError, why, msg=name):
+                ort.grant_bypass(self.home, "*", 24, self.grant_answer(**kw))
+        self.assertEqual(ort.load_authority(self.home)["bypass"], [])
+        for bad in (0, 169, "24", True):
+            with self.assertRaises(ort.OwnerError, msg=bad):
+                ort.grant_bypass(self.home, "*", bad, self.grant_answer())
+        with self.assertRaisesRegex(ort.OwnerError, "--scope"):
+            ort.grant_bypass(self.home, "nope", 24, self.grant_answer(scope="nope"))
+        ort.grant_bypass(self.home, "*", 24, self.grant_answer())  # control: the exact answer is accepted
+        self.assertEqual(self.launch_mode(), "bypassPermissions")
+
+    def test_bypass_scope_is_per_goal(self):
+        (self.home / "repo2").mkdir()
+        ort.init_owner(self.home, "shipped", str(self.home / "repo2"), "ticket:goodqa#1")
+        self.goals[1]["status"] = "active"
+        self.write_goals()
+        ort.add_task(self.home, "shipped", "x", "ticket:goodqa#1")
+        ort.grant_bypass(self.home, "shipped", 24, self.grant_answer(scope="shipped"))
+        out = {r["goal"]: r for r in ort.tick(self.home, now=time.time(), dry_run=True,
+                                              runner=lambda *a, **k: (0, "[]"))}
+        self.assertEqual(out["shipped"]["permission_mode"], "bypassPermissions")
+        self.assertEqual(out["solve"]["permission_mode"], "auto")
+
+    def test_bypass_window_ends_from_the_answer_time(self):
+        ort.grant_bypass(self.home, "*", 2, self.grant_answer(hours=2, ts=time.time() - 3600))
+        self.assertEqual(self.launch_mode(), "bypassPermissions")
+        self.assertEqual(self.launch_mode(now=time.time() + 3700), "auto")  # 2 h after the answer
+        with self.assertRaisesRegex(ort.OwnerError, "already ended"):
+            ort.grant_bypass(self.home, "*", 1, self.grant_answer(hours=1, ts=time.time() - 2 * 3600))
+
+    def test_bypass_record_file_alone_grants_nothing(self):
+        """A hand-written grant is re-resolved at every launch: without the user's real answer it is ignored."""
+        human = fx.human_turn(self.home, fx.MISSION, "Use bypassPermissions for owners.")
+        declined = self.grant_answer(chosen="No bypass: keep the configured mode")
+        wrong_hours = self.grant_answer(hours=48)
+        root = self.home / ".agent-harness" / "owners"
+        for answer, hours in ((f"answer:{fx.MISSION}/{human}", 24), (declined, 24), (wrong_hours, 24),
+                              (f"answer:{fx.MISSION}/00000000-0000-4000-8000-000000000000", 24), ("", 24)):
+            (root / "authority.json").write_text(json.dumps({"bypass": [{"scope": "*", "hours": hours,
+                                                                          "answer": answer}]}))
+            self.assertEqual(self.launch_mode(), "auto", answer)
+        (root / "authority.json").write_text("{not json")
+        self.assertEqual(self.launch_mode(), "auto")
+        (root / "authority.json").write_text(json.dumps({"bypass": [{"scope": "*", "hours": 48,
+                                                                      "answer": wrong_hours}]}))
+        self.assertEqual(self.launch_mode(), "bypassPermissions")  # control: a real, matching answer
+
+    def test_bypass_grant_and_park_are_main_only(self):
+        import caller_identity
+        src = self.grant_answer()
+        with mock.patch.object(caller_identity, "take_stamp", return_value=None), mock.patch("sys.stderr"), \
+                mock.patch("sys.stdout"):
+            self.assertEqual(ort.main(["grant-bypass", "--scope", "*", "--hours", "24", "--answer", src]), 2)
+            self.assertEqual(ort.main(["park", "--goal", "solve", "--until", "2099-01-01", "--answer", src]), 2)
+        self.assertEqual(ort.load_authority(self.home), {"bypass": [], "parks": []})
+        self.assertEqual(ort.guarded_name(["grant-bypass"]), "grant-bypass")
+        import mission_gate
+        line = f"python3 ~/.claude/hooks/owner_rt.py grant-bypass --scope '*' --hours 24 --answer {src}"
+        self.assertEqual(mission_gate.owner_stamps_for(line),
+                         [("grant-bypass", ort.argv_key(["grant-bypass", "--scope", "*", "--hours", "24",
+                                                         "--answer", src]))])
+
+    def test_bypass_ask_text_is_the_question_the_grant_checks(self):
+        text = ort.ask_text("bypass", "*", 24)
+        self.assertEqual(text["question"], ort.bypass_question("*", 24))
+        self.assertEqual(text["options"][0], ort.BYPASS_LABEL)
+        ort.grant_bypass(self.home, "*", 24, self.grant_answer(options=text["options"]))
+        self.assertEqual(self.launch_mode(), "bypassPermissions")
+
+    def test_bypass_text_heuristics_are_gone(self):
+        for name in ("chooses_bypass", "decision_context", "decision_clauses", "affirms", "user_decided",
+                     "BYPASS_WORD", "NEGATION", "UNDECIDED"):
+            self.assertFalse(hasattr(ort, name), name)
+        self.assertNotIn("permission_source", ort.DEFAULT_RUNTIME)
+        self.assertNotIn("bypassPermissions", ort.PERMISSION_MODES)
+
+
+class ListingTests(Base):
+    """Receipt v6 F2: an unreadable session listing is never proof that no owner session runs."""
+    BAD = ("", "   \n", "not json", "Update available!\n[]", "{}", '{"sessions": []}', "[1]", '[{"id": "x"}]',
+           '[{"sessionId": 5}]', '[{"sessionId": "not a session id!"}]',
+           json.dumps([{"sessionId": SID, "pid": "1", "status": "idle"}]),
+           json.dumps([{"sessionId": SID, "pid": 0, "status": "idle"}]),
+           json.dumps([{"sessionId": SID, "pid": True, "status": "idle"}]),
+           json.dumps([{"sessionId": SID, "pid": None, "status": "idle"}]),
+           json.dumps([{"sessionId": SID, "pid": 7}]),
+           json.dumps([{"sessionId": SID, "name": 3}]), "[{]")
+
+    def setUp(self):
+        super().setUp()
+        self.init()
+        self.set_session()
+        ort.add_task(self.home, "solve", "fix login", "ticket:goodqa#2")
+        (self.home / ".agent-harness" / "owners" / "runtime.json").write_text(json.dumps({"enabled": True}))
+        p = mock.patch.object(ort, "claude_bin", return_value="claude")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_listing_parse_rejects_every_malformed_shape(self):
+        for out in self.BAD:
+            with self.assertRaises(ort.OwnerError, msg=out):
+                ort.parse_sessions(out)
+        real = [{"id": "8d84dcef", "cwd": "/x", "kind": "background", "startedAt": 1, "sessionId": SID,
+                 "name": "owner-solve", "state": "done"},
+                {"pid": 42, "cwd": "/x", "kind": "interactive", "startedAt": 1, "sessionId": NEW_SID, "name": "m",
+                 "status": "waiting", "waitingFor": "input"}]
+        self.assertEqual(ort.parse_sessions(json.dumps(real) + "\nsome stderr line"), real)  # stderr follows stdout
+        self.assertEqual(ort.parse_sessions("[]"), [])
+
+    def test_listing_unreadable_launches_nothing_and_is_logged(self):
+        for i, listing in enumerate(self.BAD):
+            calls = []
+
+            def runner(argv, timeout=60, cwd=None, listing=listing):
+                calls.append(argv)
+                return (0, listing) if argv[1:2] == ["agents"] else (0, "backgrounded · c9f43044 · owner-solve")
+            out = ort.tick(self.home, now=NOW + i * 4000, runner=runner)
+            self.assertEqual(out[0]["action"], "error", listing)
+            self.assertIn("nothing launched", out[0]["reason"])
+            self.assertEqual([c for c in calls if "--bg" in c or c[1:2] == ["stop"]], [], listing)
+        log = (self.home / ".agent-harness/owners/solve/launch.log").read_text().splitlines()
+        self.assertEqual(len(log), len(self.BAD))
+        self.assertEqual(ort.load_state(self.home, "solve")["generation"], 0)
+        calls = []
+        out = ort.tick(self.home, now=NOW + 99 * 4000,
+                       runner=lambda argv, timeout=60, cwd=None: calls.append(argv) or
+                       ((0, "[]") if argv[1:2] == ["agents"] else (0, "backgrounded · c9f43044 · owner-solve")))
+        self.assertEqual(out[0]["action"], "launch")  # control: a valid empty listing does launch
+
+    def test_listing_unreadable_after_stop_never_confirms_the_stop(self):
+        idle = [{"id": "8d84dcef", "sessionId": SID, "pid": 1, "status": "idle", "state": "done"}]
+        for i, after in enumerate(("", "not json", '[{"id": "8d84dcef"}]', "Error: x")):
+            calls, listings = [], iter([json.dumps(idle), json.dumps(idle), after])
+
+            def runner(argv, timeout=60, cwd=None, listings=listings):
+                calls.append(argv)
+                if argv[1:2] == ["agents"]:
+                    return 0, next(listings)
+                return (0, "backgrounded · c9f43044 · owner-solve") if "--bg" in argv else (0, "")
+            out = ort.tick(self.home, now=NOW + i * 4000, runner=runner)
+            self.assertEqual(out[0]["action"], "launch-failed", after)
+            self.assertIn("could not confirm the stop", out[0]["reason"])
+            self.assertIn(["claude", "stop", "8d84dcef"], calls)  # the stop ran; its effect was not proven
+            self.assertEqual([c for c in calls if "--bg" in c], [], after)
+        st = ort.load_state(self.home, "solve")
+        self.assertEqual([x["code"] for x in st["launches"]], [-1, -1, -1, -1])
 
 
 class MissionGateStampTests(unittest.TestCase):

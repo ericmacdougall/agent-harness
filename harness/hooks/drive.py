@@ -16,6 +16,7 @@ condition carries the action that must follow:
   HELP_OPEN            an owner task is blocked with a help request -> unblock it, ask the user, or route a ticket
   REVIEW_LOOP          an owner task had 2+ rejected review rounds -> redesign, escalate, or park on a ticket
   MERGED_NOT_RELEASED  a commit naming the goal's ticket on a goal repo is newer than its last deploy -> release it
+                       (the action is keyed by that commit, so a newer one is a new action)
   PENDING_GATES        lifecycle pending with no gate proposal -> propose gates (an ask); building never pauses
 Capacity is never a reason for no action: there is no "queue" or "none" action for an open condition.
 DONE goals (status done/retired, or a lifecycle done block) show with no conditions. BLOCKED on the user (a deferral
@@ -26,9 +27,13 @@ counts only as a FACT checked when it is recorded and bound to the condition's e
 moment the condition appeared, and younger than RESPONSE_TTL_S):
   ask      an open ask in the mission session's main WAL whose text names the goal
   owner    an owner_rt launch for the goal newer than the episode (STALLED, STUCK, UNOWNED)
-  ticket   a ticket reference (REVIEW_LOOP park, HELP_OPEN routed, MERGED_NOT_RELEASED release scheduled)
-  park     a user:/answer: source that provenance resolves to the user's own words naming the goal
-Agent text, inferred:, wal: and queue: sources never park anything.
+  ticket   an open ticket whose title carries the action's marker (receipt v6 F3): [drive:<goal>:<task>] for
+           HELP_OPEN / REVIEW_LOOP on that task, [drive:<goal>:release:<sha12>] for MERGED_NOT_RELEASED at that
+           commit. Any other open ticket answers nothing.
+Parking (receipt v6 F1): a goal is parked only by an owner_rt park record, the user's structured answer to the exact
+park question for that goal and date (`owner_rt.py ask-text --kind park`, then `owner_rt.py park`), re-resolved on
+every assessment. A parked goal shows no conditions until the date passes. No user prose, agent text or source string
+parks anything.
 
 Enforcement: `drive.py stop` is a Stop hook for the main session that owns the mission. It reads the snapshot that
 `drive.py tick` writes (ops_watch runs it every cycle, after owner_rt tick) and the response ledger; it never scans
@@ -66,19 +71,21 @@ ACTIONS = {
                "`owner_rt.py task add --goal {g} --text <next step> --source <src> --wake`",
     "STALLED": "resume the owner (`owner_rt.py tick`), escalate it a rung, or replace it",
     "STUCK": "the owner was relaunched with no new proof: read `owner_rt.py show --goal {g}`, re-scope or replace it",
-    "HELP_OPEN": "unblock {detail}, ask the user one question, or route it to a ticket",
+    "HELP_OPEN": "unblock {detail}, ask the user one question, or route it to a ticket titled [drive:{g}:<task>]",
     "BLOCKED_USER": "keep the one question in front of the user ({detail}) and keep every other facet moving",
     "RELEASE_CHECK_OFF": "set the goal's repos (`mission_coverage.py set --goal {g} --repo <path>`) so merged but "
                          "unreleased work is caught",
-    "REVIEW_LOOP": "break the loop on {detail}: redesign, escalate a rung, or park it on a ticket",
-    "MERGED_NOT_RELEASED": "schedule the release of {detail} (deploy + live test)",
+    "REVIEW_LOOP": "break the loop on {detail}: redesign, escalate a rung, or park it on a ticket titled "
+                   "[drive:{g}:{detail}]",
+    "MERGED_NOT_RELEASED": "schedule the release of {g} up to commit {detail} (deploy + live test), or route it to "
+                           "a ticket titled [drive:{g}:release:{detail}]",
     "PENDING_GATES": "propose its gates to the user (one AskUserQuestion naming the goal); keep building meanwhile",
 }
-RESPONSE_KINDS = {
-    "IMPORTED": ("park",), "UNOWNED": ("owner", "park"), "STALLED": ("owner", "park"), "STUCK": ("owner", "park"),
-    "HELP_OPEN": ("ask", "ticket", "park"), "REVIEW_LOOP": ("ticket", "park"), "BLOCKED_USER": ("ask", "park"),
-    "RELEASE_CHECK_OFF": ("park",),
-    "MERGED_NOT_RELEASED": ("ticket", "ask", "park"), "PENDING_GATES": ("ask", "park"),
+RESPONSE_KINDS = {  # no "park" kind: parking is the user's structured answer (owner_rt park), never a response
+    "IMPORTED": (), "UNOWNED": ("owner",), "STALLED": ("owner",), "STUCK": ("owner",),
+    "HELP_OPEN": ("ask", "ticket"), "REVIEW_LOOP": ("ticket",), "BLOCKED_USER": ("ask",),
+    "RELEASE_CHECK_OFF": (),
+    "MERGED_NOT_RELEASED": ("ticket", "ask"), "PENDING_GATES": ("ask",),
 }
 TICKET_RE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9-]{0,62})?#[1-9][0-9]{0,9}$")
 SCRIPT = "python3 ~/.claude/hooks/drive.py"
@@ -165,23 +172,25 @@ def ort_parse(value) -> float:
     return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
 
 
-def merged_commit_ts(goal: dict, runner=None) -> float:
-    """Newest commit naming the goal's ticket on a repo's default remote branch (merged), 0 when none."""
+def merged_commit(goal: dict) -> tuple:
+    """(time, sha12) of the newest commit naming the goal's ticket on a repo's default remote branch (merged);
+    (0.0, '') when none."""
     number = ticket_number(goal.get("ticket"))
     repos = [r for r in (goal.get("repos") or []) if isinstance(r, str)][:6]
     if not number or not repos:
-        return 0.0
-    best = 0.0
+        return 0.0, ""
+    best = (0.0, "")
     for repo in repos:
         for ref in ("origin/HEAD", "origin/main", "origin/master"):
             try:
-                p = subprocess.run(["git", "-C", repo, "log", ref, "-1", "--since=30.days", "--format=%ct", "-E", "-i",
-                                    f"--grep=#{number}([^0-9]|$)"], capture_output=True, text=True, timeout=5)
+                p = subprocess.run(["git", "-C", repo, "log", ref, "-1", "--since=30.days", "--format=%ct %H", "-E",
+                                    "-i", f"--grep=#{number}([^0-9]|$)"], capture_output=True, text=True, timeout=5)
             except (OSError, subprocess.SubprocessError):
                 break
             if p.returncode == 0:
-                if p.stdout.strip().isdigit():
-                    best = max(best, float(p.stdout.strip()))
+                ts, _, sha = p.stdout.strip().partition(" ")
+                if ts.isdigit() and re.match(r"^[0-9a-f]{40}$", sha) and float(ts) > best[0]:
+                    best = (float(ts), sha[:12])
                 break
     return best
 
@@ -267,7 +276,8 @@ def assess(home: Path, session: str = "", now=None, owner_rows=None, with_git: b
         legacy = legacy_owners(home, session, g, owner_rows)
         lc = lifecycle_state(home, g)
         conds = []
-        if not done and not (status == "deferred" and _deferral_by_user(g)):
+        park = None if done else ort.active_park(home, gid, now)  # receipt v6 F1: the user's structured answer only
+        if not done and not park and not (status == "deferred" and _deferral_by_user(g, now)):
             if status == "imported":
                 conds.append(("IMPORTED", ""))
             if owner is None and not legacy and owners_known:
@@ -293,16 +303,18 @@ def assess(home: Path, session: str = "", now=None, owner_rows=None, with_git: b
             if not [r for r in (g.get("repos") or []) if isinstance(r, str)] and ticket_number(g.get("ticket")):
                 conds.append(("RELEASE_CHECK_OFF", ""))
             if with_git:
-                mts = merged_commit_ts(g)
+                mts, msha = merged_commit(g)
                 if mts and mts > deploy_ts(g, now):
-                    conds.append(("MERGED_NOT_RELEASED", f"ticket {g.get('ticket')}"))
+                    conds.append(("MERGED_NOT_RELEASED", msha))
             if lc == "pending":
                 lcd = g.get("lifecycle") if isinstance(g.get("lifecycle"), dict) else {}
                 if not lcd.get("ask") and not lcd.get("gates"):
                     conds.append(("PENDING_GATES", ""))
         deferral = g.get("deferral") if isinstance(g.get("deferral"), dict) else {}
         blocker = ""
-        if deferral:
+        if park:
+            blocker = f"parked by the user's answer until {park.get('until')}"
+        elif deferral:
             blocker = f"waits on {deferral.get('by')} {deferral.get('ref') or ''}".strip()
         elif owner and owner.get("help"):
             blocker = "; ".join(f"{h['task']}: {h['need']}" for h in owner["help"])[:200]
@@ -326,15 +338,24 @@ def assess(home: Path, session: str = "", now=None, owner_rows=None, with_git: b
 
 
 def action_key(goal_id: str, cond: str, detail: str = "") -> str:
-    """goal:cond, plus the task id for the per-task conditions (HELP_OPEN, REVIEW_LOOP)."""
-    if cond in ("HELP_OPEN", "REVIEW_LOOP") and detail:
+    """goal:cond, plus the task id for the per-task conditions (HELP_OPEN, REVIEW_LOOP) and the commit for
+    MERGED_NOT_RELEASED (receipt v6 F3: a response for one commit never covers a later one)."""
+    if cond in ("HELP_OPEN", "REVIEW_LOOP", "MERGED_NOT_RELEASED") and detail:
         return f"{goal_id}:{cond}:{detail.split(':')[0].strip()[:40]}"
     return f"{goal_id}:{cond}"
 
 
-def _deferral_by_user(goal: dict) -> bool:
+def _deferral_by_user(goal: dict, now=None) -> bool:
+    """The ledger's own user deferral (mission_coverage.defer_goal, main-only), honoured only until its `until`."""
     d = goal.get("deferral")
-    return isinstance(d, dict) and d.get("by") == "user"
+    if not (isinstance(d, dict) and d.get("by") == "user"):
+        return False
+    if not d.get("until"):
+        return True
+    try:
+        return ort_parse(d["until"]) > (time.time() if now is None else now)
+    except (TypeError, ValueError):
+        return False
 
 
 # ------------------------------------------------------------------ episodes, snapshot, responses
@@ -474,35 +495,48 @@ def episode_start(home: Path, key: str, now: float) -> float:
 
 
 PRE_EPISODE_S = 3600
-PARK_LEAD = r"(?:park|defer|pause|shelve|deprioriti[sz]e|backburner|put|move|set|mark|hold)"
-PARK_INTENT = re.compile(r"\b(?:park|parked|parking|defer|deferred|deferring|pause|paused|on hold|shelve|shelved|"
-                         r"deprioriti[sz]e[d]?|backburner|back burner)\b", re.I)  # no bare "later"/"hold"
-
-
-def park_binds(excerpt: str, goal_id: str, goals: dict) -> bool:
-    """Receipt v3 F1: the park verb must govern the requested goal. Some clause of the user's words holds a park verb
-    and names exactly one goal of goals.json, the requested one; "keep solve moving; park leads" never parks solve,
-    nor does "park leads until solve ships". No negation anywhere (owner_rt.affirms)."""
-    mc = _mc()
-    for clause in ort.decision_clauses(excerpt, PARK_INTENT, PARK_LEAD):  # receipt v4 F2: imperative, fail closed
-        named = {gid for gid, g in goals.items()
-                 if gid.lower() in re.findall(r"[a-z0-9_-]+", clause.lower()) or mc.names_goal(clause, dict(g, id=gid))}
-        if named == {goal_id}:
-            return True
-    return False
-
-
 def episode_on_record(home: Path, key: str) -> bool:
     snap = load_snapshot(home) or {}
     return any(a.get("key") == key for r in snap.get("rows") or [] for a in r.get("actions") or [])
 
 
+def ticket_marker(goal_id: str, cond: str, detail: str) -> str:
+    """The tag a ticket's title must carry to answer this action (receipt v6 F3)."""
+    if cond == "MERGED_NOT_RELEASED":
+        return f"[drive:{goal_id}:release:{detail}]"
+    return f"[drive:{goal_id}:{detail}]"
+
+
+def ticket_facts(ref: str) -> dict:
+    """{"state": open|closed|missing|None, "title": str} from GoodQA (ah's adapter, quick mode), bounded in time;
+    anything unknown is {"state": None}."""
+    import threading  # noqa: PLC0415
+    box = {"state": None, "title": ""}
+
+    def work():
+        try:
+            import ah  # noqa: PLC0415
+            adapter, mod = ah.load_adapter(quick=True)
+            project, number = ah.ticket_ref(ref, "goodqa")
+            t = ah.ticket_issue(adapter, mod, project, number)
+            box.update(state="closed" if getattr(t, "closed", False) else "open", title=str(t.title or ""))
+        except Exception as error:  # noqa: BLE001 - unknown is never "open"
+            box["state"] = "missing" if getattr(error, "code", "") == "not_found" else None
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    worker.join(10.0)
+    return dict(box)
+
+
 def check_response(home: Path, goal_id: str, cond: str, kind: str, ref: str, source: str, session: str,
-                   goal: dict, now: float, since=None, ticket_check=None) -> str:
+                   goal: dict, now: float, since=None, ticket_check=None, detail: str = "") -> str:
     """'' when the response is a fact for this goal and condition; else why not."""
     if cond not in CONDITIONS:
         return f"unknown condition {cond}"
     if kind not in RESPONSE_KINDS[cond]:
+        if not RESPONSE_KINDS[cond]:
+            return (f"{cond} takes no response: take the action, or have the user park the goal "
+                    "(`owner_rt.py ask-text --kind park`)")
         return f"{cond} takes a response of kind {', '.join(RESPONSE_KINDS[cond])}, not {kind}"
     mc = _mc()
     if kind == "ask":
@@ -525,21 +559,40 @@ def check_response(home: Path, goal_id: str, cond: str, kind: str, ref: str, sou
     if kind == "ticket":
         if not TICKET_RE.match(ref or ""):
             return "ticket ref must look like goodqa#123"
-        state = (ticket_check or _mc().ticket_state)(ref)
-        return "" if state == "open" else f"ticket {ref} is not open ({state or 'unknown'})"
-    if kind == "park":
-        if not mc.verify_user_source(source):
-            return "a park needs a user:/answer: source that resolves to the user's own words"
-        excerpt = ort.decision_context(source)  # receipt v5 F1: the whole sentence, never the quote alone
-        if not excerpt:
-            return "the user's words around the quote could not be read; nothing is parked"
-        if goal_id not in excerpt.lower() and not mc.names_goal(excerpt, goal):
-            return f"the user's words do not name goal {goal_id}"
-        if not park_binds(excerpt, goal_id, ort.mission_goals(home)):  # receipt F1 (v2, v3)
-            return ("the user's words must park or defer this goal itself: a clause with a park verb that names only "
-                    f"{goal_id}, and no negation")
+        problem = ticket_subject_problem(home, goal_id, cond, detail, goal)
+        if problem:
+            return problem
+        facts = (ticket_check or ticket_facts)(ref)
+        facts = facts if isinstance(facts, dict) else {"state": None}
+        if facts.get("state") != "open":
+            return f"ticket {ref} is not open ({facts.get('state') or 'unknown'})"
+        marker = ticket_marker(goal_id, cond, detail)
+        if marker not in str(facts.get("title") or ""):
+            return (f"ticket {ref} is not about this action: its title must carry {marker} (an open ticket of another "
+                    "goal, task or commit answers nothing)")
         return ""
     return "unknown response kind"
+
+
+def ticket_subject_problem(home: Path, goal_id: str, cond: str, detail: str, goal: dict) -> str:
+    """The thing a ticket response names must be what the condition is about right now: the blocked task, the task
+    in a review loop, or the newest commit naming the goal's ticket that is not yet released."""
+    if cond == "MERGED_NOT_RELEASED":
+        _ts, sha = merged_commit(goal)
+        if not sha or detail != sha:
+            return f"--detail must be the newest commit naming the goal's ticket ({sha or 'none found'})"
+        return ""
+    try:
+        t = ort.tasks(ort.inbox_rows(home, goal_id)).get(detail)
+    except Exception:  # noqa: BLE001
+        t = None
+    if t is None:
+        return f"goal {goal_id} has no owner task {detail}"
+    if cond == "HELP_OPEN" and t["state"] != "blocked":
+        return f"task {detail} is {t['state']}, not blocked"
+    if cond == "REVIEW_LOOP" and not t["loop"]:
+        return f"task {detail} is not in a review loop"
+    return ""
 
 
 def respond(home: Path, goal_id: str, cond: str, kind: str, ref: str = "", source: str = "", detail: str = "",
@@ -551,10 +604,13 @@ def respond(home: Path, goal_id: str, cond: str, kind: str, ref: str = "", sourc
     session = mission_session(home)
     if cond in ("HELP_OPEN", "REVIEW_LOOP") and not detail:
         raise DriveError(f"{cond} needs --detail <task id>")
+    if cond == "MERGED_NOT_RELEASED" and kind == "ticket" and not detail:
+        raise DriveError(f"{cond} needs --detail <sha12 of the commit, as the drive table shows it>")
     key = action_key(goal_id, cond, detail)
     pre = not episode_on_record(home, key)
     problem = check_response(home, goal_id, cond, kind, ref, source, session, goals[goal_id], now,
-                             since=episode_start(home, key, now), ticket_check=ticket_check)
+                             since=episode_start(home, key, now), ticket_check=ticket_check,
+                             detail=detail.split(":")[0].strip())
     if problem:
         raise DriveError(problem)
     row = _sign(home, {"goal": goal_id, "cond": cond, "key": key, "kind": kind, "ref": ort.clean(ref, 120),
@@ -674,7 +730,8 @@ def stop_decision(home: Path, payload: dict, now=None, is_main=None) -> dict:
         lines.append(f"- ... and {len(todo) - 12} more (`{SCRIPT} table`)")
     text = ("DRIVE LOOP (owner-runtime-drive): these initiatives have a required action with no recorded response. "
             "Take each action now, or record a response that is a fact: "
-            f"`{SCRIPT} respond --goal G --cond C --kind ask|owner|ticket|park --ref R [--source user:...]`. "
+            f"`{SCRIPT} respond --goal G --cond C --kind ask|owner|ticket --ref R [--detail tN|sha12]`; only the "
+            "user's answer parks a goal (`owner_rt.py ask-text --kind park`). "
             "Capacity is not a reason to leave an initiative idle.\n" + "\n".join(lines))
     if stale:
         text += "\n(drive snapshot stale: computed without owner scan or git; ops_watch refreshes it)"
@@ -748,10 +805,10 @@ def build_parser():
     r = sub.add_parser("respond", help="record a response to a required action (checked as a fact)")
     r.add_argument("--goal", required=True)
     r.add_argument("--cond", required=True, choices=CONDITIONS)
-    r.add_argument("--kind", required=True, choices=("ask", "owner", "ticket", "park"))
+    r.add_argument("--kind", required=True, choices=("ask", "owner", "ticket"))
     r.add_argument("--ref", default="")
-    r.add_argument("--source", default="")
-    r.add_argument("--detail", default="", help="the task id for HELP_OPEN / REVIEW_LOOP")
+    r.add_argument("--detail", default="", help="the task id for HELP_OPEN / REVIEW_LOOP; the commit sha12 for "
+                   "MERGED_NOT_RELEASED")
     sub.add_parser("stop", help="Stop hook (payload on stdin)")
     return p
 
@@ -772,7 +829,7 @@ def main(argv=None) -> int:
                 print(render(snap, read_responses(home)))
             return 0
         if args.cmd == "respond":
-            row = respond(home, args.goal, args.cond, args.kind, args.ref, args.source, args.detail)
+            row = respond(home, args.goal, args.cond, args.kind, args.ref, detail=args.detail)
             print(json.dumps(row))
             return 0
     except (DriveError, ort.OwnerError, OSError, ValueError) as exc:

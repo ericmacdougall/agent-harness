@@ -18,7 +18,10 @@ stop, a crash or a context limit loses nothing:
     inbox.jsonl   append-only task rows and transitions (0600)
     launch.log    one line per launch attempt
   ~/.agent-harness/owners/runtime.json  {"enabled": true, "permission_mode": "auto", "max_launches_per_hour": 4,
-                  "min_gap_s": 300, "fresh_bytes": 8000000}  (absent or enabled=false: tick never launches)
+                  "min_gap_s": 300, "fresh_bytes": 8000000}  (absent or enabled=false: tick never launches;
+                  permission_mode is auto, acceptEdits, default or dontAsk, never bypassPermissions)
+  ~/.agent-harness/owners/authority.json  bypass grants and drive parks, each bound to the user's structured
+                  AskUserQuestion answer and re-resolved at every use (see "user authority" below)
 
 Lifetime: `tick` (run by ops_watch every cycle, or by hand) resumes every owner whose session is idle or gone while the
 goal is not done and work is due (an actionable task, a due resume, or no proof for PROOF_S). Resume is
@@ -91,13 +94,13 @@ NEXT = {"queued": ("planned", "blocked", "dropped"),
         "blocked": OPEN + ("dropped",),
         "done": (), "dropped": ()}
 DEFAULT_RUNTIME = {"enabled": False, "permission_mode": "auto", "max_launches_per_hour": 4, "min_gap_s": 300,
-                   "fresh_bytes": 8_000_000, "model": "", "permission_source": ""}
+                   "fresh_bytes": 8_000_000, "model": ""}
 # Brakes an agent-writable runtime.json cannot loosen (red-team r1 M1).
 BRAKES = {"max_launches_per_hour": (1, 6), "min_gap_s": (120, 86400), "fresh_bytes": (200_000, 50_000_000)}
 # Owners run Opus or Sonnet; the top rungs (Fable/Astra) are never launched by the tick (CLAUDE.md, r1 M2).
 MODEL_RE = re.compile(r"^(?:|opus|sonnet|claude-(?:opus|sonnet)-[0-9][0-9a-z.-]{0,30})$")
 CLAUDE_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin")
-PERMISSION_MODES = ("auto", "acceptEdits", "default", "dontAsk", "bypassPermissions")
+PERMISSION_MODES = ("auto", "acceptEdits", "default", "dontAsk")  # runtime.json; bypass only by grant
 SCRIPT = "python3 ~/.claude/hooks/owner_rt.py"
 
 
@@ -242,111 +245,240 @@ def runtime(home: Path) -> dict:
         cfg["model"] = ""
     if cfg["permission_mode"] not in PERMISSION_MODES:
         cfg["permission_mode"] = "auto"
-    if cfg["permission_mode"] == "bypassPermissions" and not chooses_bypass(cfg.get("permission_source")):
-        cfg["permission_mode"], cfg["note"] = "auto", ("bypassPermissions needs permission_source: the user's own "
-                                                       "words choosing bypass")
+        if isinstance(data, dict) and data.get("permission_mode") == "bypassPermissions":
+            cfg["note"] = ("bypassPermissions never comes from runtime.json: only a grant bound to the user's answer "
+                           f"({SCRIPT} grant-bypass)")
     cfg["claude"] = claude_bin()
     return cfg
 
 
-def user_decided(source) -> bool:
-    """True only for a user:/answer: source that provenance resolves to the user's own words (r1 M3)."""
+# ------------------------------------------------------------------ user authority (receipt v6 F1)
+# The runtime never reads authority out of the user's prose: every heuristic over free text (receipts v2-v6) found a
+# new way to misread it. Two decisions need the user: running owners with bypassPermissions, and parking a goal in the
+# drive loop. Each is the user's answer to an AskUserQuestion whose question and option label this module generates
+# from the decision's own scope. An answer counts only when the transcript's structured answer
+# (toolUseResult.answers) keys exactly that question with exactly that label, from a single-question, single-choice
+# AskUserQuestion of the main conversation (command_guard.resolve_user_source; no excerpt, no prose). Main records
+# the decision with a main-only command; every use re-resolves the answer, so the record file alone grants nothing.
+# No grant: the configured mode (auto by default). No park record: the goal is not parked.
+
+AUTH_FILE = "authority.json"
+ANSWER_RE = re.compile(r"^answer:([A-Za-z0-9._-]{1,80})/([0-9a-fA-F-]{8,64})$")
+DATE_RE = re.compile(r"^(\d{4})-(\d\d)-(\d\d)$")
+BYPASS_LABEL = "Allow bypassPermissions"
+BYPASS_MAX_H = 168
+PARK_MAX_DAYS = 30
+ANSWER_MAX_AGE_S = 24 * 3600
+
+
+def bypass_question(scope: str, hours: int) -> str:
+    who = "every owner_rt owner" if scope == "*" else f"the owner_rt owner of goal {scope}"
+    return (f"Run {who} with --permission-mode bypassPermissions (no permission prompts at all) for the next "
+            f"{int(hours)} hours?")
+
+
+def park_question(goal: str, until: str) -> str:
+    return f"Park goal {goal} in the drive loop until {until} (no required actions for it until then)?"
+
+
+def park_label(goal: str, until: str) -> str:
+    return f"Park {goal} until {until}"
+
+
+def _answer_format(answer) -> None:
+    if not isinstance(answer, str) or not ANSWER_RE.match(answer):
+        raise OwnerError("--answer must be exactly answer:<session>/<uuid>: the user's AskUserQuestion reply "
+                         "(`ah user-msg --recent 3` prints it); a user: turn, an excerpt or any prose never counts")
+
+
+def answer_at(home: Path, answer: str, question: str, label: str, now: float, max_age=None) -> float:
+    """The time of the user's answer when `answer` (answer:<session>/<uuid>) is a single-question, single-choice
+    AskUserQuestion reply of the main conversation whose structured answer keys exactly `question` with exactly the
+    predefined option `label`; else OwnerError. Whole-string equality only: nothing in the user's words is parsed."""
+    _answer_format(answer)
     try:
+        import command_guard  # noqa: PLC0415 - installed beside this file
+        got = command_guard.resolve_user_source(answer, now=now, max_age=max_age, home=str(home))
+    except ValueError as exc:
+        raise OwnerError("the answer does not resolve: " + clean(str(exc), 200)) from None
+    except Exception as exc:  # noqa: BLE001 - anything that cannot prove the answer refuses
+        raise OwnerError("the answer does not resolve: " + clean(type(exc).__name__, 60)) from None
+    if got.get("question") != question:
+        raise OwnerError("the user answered a different question; ask exactly: " + question)
+    if got.get("text") != label or not got.get("predefined"):
+        raise OwnerError(f"the user did not choose the option {label!r}")
+    return float(got["at"])
+
+
+def _answer_session(answer: str) -> str:
+    m = ANSWER_RE.match(answer or "")
+    return m.group(1).lower() if m else ""
+
+
+def _mission_answer(home: Path, answer: str) -> None:
+    """Recording a decision needs the answer to come from the mission session's main conversation."""
+    _answer_format(answer)
+    mission = ""
+    with contextlib.suppress(Exception):
         import mission_coverage  # noqa: PLC0415
-        return bool(source) and mission_coverage.verify_user_source(source)
-    except Exception:  # noqa: BLE001
-        return False
+        mission = (mission_coverage.mission_session_of(home) or "").lower()
+    if not mission:
+        raise OwnerError("no mission session is recorded, so no answer can be bound to main")
+    if _answer_session(answer) != mission:
+        raise OwnerError("the answer is not from the mission session's main conversation")
 
 
-BYPASS_WORD = re.compile(r"\bbypass", re.I)
-NEGATION = re.compile(r"\b(?:no|not|never|don'?t|do not|without|stop|disable|isn'?t|except|excluding|other than|"
-                      r"besides|apart from|aside from|instead of|rather than)\b|n't\b", re.I)  # also exclusions
-
-
-def chooses_bypass(source) -> bool:
-    """Delta D3: the cited user words must themselves choose bypass (provenance checks the quoted excerpt is in that
-    turn), not merely be any genuine user turn. A negated excerpt never counts."""
-    context = decision_context(source)  # receipt v5 F1: judge the user's whole sentence, never the quote alone
-    return bool(context) and bool(decision_clauses(context, BYPASS_WORD, BYPASS_LEAD)) and user_decided(source)
-
-
-SENTENCE_END = re.compile(r"[.!?\n]+")
-
-
-def decision_context(source) -> str:
-    """The user's own words a decision is judged on (receipt v5 F1): the sentence holding the quoted excerpt, from the
-    start of the sentence before it to the end of the sentence after the one where the excerpt ends (a retraction
-    right after the quote counts too), read from the real user turn
-    (or AskUserQuestion answer). A partial quote such as "use bypassPermissions for owners" out of "Do not use
-    bypassPermissions for owners." is judged with its "Do not". '' when the turn cannot be read or the excerpt is not
-    a faithful quote: fail closed."""
+def load_authority(home: Path) -> dict:
+    """{"bypass": [...], "parks": [...]}; a missing or malformed file holds nothing (fail closed)."""
+    out = {"bypass": [], "parks": []}
     try:
-        import mission_coverage  # noqa: PLC0415
-        import provenance  # noqa: PLC0415
-        parsed = provenance.parse_source(source)
-        variant = parsed.get("variant", "user")
-        if parsed.get("kind") != "user" or variant not in ("user", "answer"):
-            return ""
-        home = mission_coverage.claude_dir()
-        turn = (provenance.answer_turn(parsed["session"], parsed["ident"], home) if variant == "answer"
-                else provenance.user_turn(parsed["session"], parsed["uuid"], home))
-        text = str(turn.get("text") or "")
-        if provenance.excerpt_in(text, parsed["excerpt"]) is not None:
-            return ""
-        body = provenance.norm(text.replace(provenance.SENTINEL, " . "))
-        segments = [seg.strip() for seg in provenance.norm(parsed["excerpt"]).split("...") if seg.strip()]
-    except Exception:  # noqa: BLE001
-        return ""
-    first, pos = None, 0
-    for seg in segments:
-        index = body.find(seg, pos)
-        if index < 0:
-            return ""
-        first = index if first is None else first
-        pos = index + len(seg)
-    if first is None:
-        return ""
-    starts = [0] + [m.end() for m in SENTENCE_END.finditer(body, 0, first)]
-    start = starts[-2] if len(starts) >= 2 else 0  # the sentence before, too: "No. Park solve." stays undecided
-    end = pos
-    for _ in range(2):  # the quoted sentence's end, then the sentence after it: "... Actually no, don't." retracts it
-        tail = SENTENCE_END.search(body, end)
-        end = tail.end() if tail else len(body)
-    return body[start:end]
-
-
-BYPASS_LEAD = r"(?:bypass(?:permissions)?|use|choose|pick|go with|switch to|run with|run in|set|enable|allow)"
-# receipt v4 F2: questions, conditionals and hedges are never decisions (fail closed)
-UNDECIDED = re.compile(r"\?|\b(?:if|when|whenever|unless|once|in case|provided|assuming|suppose|supposing|should|"
-                       r"could|would|might|may|maybe|perhaps|probably|possibly|whether|wonder|consider|thinking)\b",
-                       re.I)
-OPENER = re.compile(r"^\s*(?:what|why|how|which|who|whom|where|do|does|did|is|are|was|were|can|will|shall|have|has)\b",
-                    re.I)
-FILLERS = (r"(?:(?:yes|yeah|yep|ok|okay|sure|please|just|now|then|and|so|right|go ahead and|let'?s|lets|you can|"
-           r"i want you to|i'd like you to|we will|we'll)[\s,]+)*")
-CLAUSE_SPLIT = re.compile(r"[;,.!?:\n()]+|\b(?:and|but|then|while|whereas|so|also)\b", re.I)
-
-
-def decision_clauses(excerpt: str, word: "re.Pattern", lead: str) -> list:
-    """The clauses of the user's excerpt that state the intent `word` as an explicit affirmative imperative: the
-    clause begins (after fillers such as "yes", "ok", "please") with one of the `lead` verbs. Nothing counts when the
-    excerpt carries a question, a conditional or hedge, an interrogative opener, or a negation or exclusion anywhere
-    ("What does bypassPermissions do?", "Should we park solve?", "If the release fails we should park solve",
-    "never park solve"). Fail closed: [] means no decision."""
-    text = excerpt or ""
-    if not text.strip() or NEGATION.search(text) or UNDECIDED.search(text) or OPENER.match(text):
-        return []
-    lead_re = re.compile(r"^\s*" + FILLERS + lead + r"\b", re.I)
-    out = []
-    for clause in CLAUSE_SPLIT.split(text):
-        if clause and word.search(clause) and lead_re.match(clause):
-            out.append(clause)
+        data = json.loads(_read(owners_root(home) / AUTH_FILE, 262144).decode("utf-8"))
+    except (OSError, ValueError, OwnerError):
+        return out
+    if isinstance(data, dict):
+        for k in out:
+            if isinstance(data.get(k), list):
+                out[k] = [r for r in data[k] if isinstance(r, dict)][:200]
     return out
 
 
-def affirms(excerpt: str, word: "re.Pattern", lead: str = "") -> bool:
-    """True when some clause states `word` as an explicit affirmative imperative (see decision_clauses)."""
-    return bool(decision_clauses(excerpt, word, lead or r"\w+"))
+@contextlib.contextmanager
+def _authority_lock(home: Path):
+    root = owners_root(home)
+    _ensure_dir(root, home)
+    fd = os.open(str(root / ".authority.lock"), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield root
+    finally:
+        os.close(fd)
+
+
+def _check_scope(home: Path, scope: str) -> None:
+    if scope != "*" and scope not in mission_goals(home):
+        raise OwnerError("--scope must be * (every owner) or a goal id in goals.json")
+
+
+def _check_hours(hours) -> int:
+    if isinstance(hours, bool) or not isinstance(hours, int) or not 1 <= hours <= BYPASS_MAX_H:
+        raise OwnerError(f"--hours must be a whole number from 1 to {BYPASS_MAX_H}")
+    return hours
+
+
+def until_ts(until: str) -> float:
+    """End of the named UTC day."""
+    import datetime as dt  # noqa: PLC0415
+    m = DATE_RE.match(until or "")
+    if not m:
+        raise OwnerError("--until must be a date YYYY-MM-DD")
+    try:
+        day = dt.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=dt.timezone.utc)
+    except ValueError:
+        raise OwnerError("--until is not a real date") from None
+    return (day + dt.timedelta(days=1)).timestamp()
+
+
+def grant_bypass(home: Path, scope: str, hours: int, answer: str, now=None) -> dict:
+    now = time.time() if now is None else now
+    _check_scope(home, scope)
+    hours = _check_hours(hours)
+    _mission_answer(home, answer)
+    at = answer_at(home, answer, bypass_question(scope, hours), BYPASS_LABEL, now, ANSWER_MAX_AGE_S)
+    if at + hours * 3600 <= now:
+        raise OwnerError("that answer's window has already ended")
+    row = {"scope": scope, "hours": hours, "answer": answer, "answered_at": now_iso(at),
+           "expires_at": now_iso(at + hours * 3600), "recorded_at": now_iso(now)}
+    with _authority_lock(home):
+        data = load_authority(home)
+        data["bypass"] = [r for r in data["bypass"] if r.get("scope") != scope] + [row]
+        _atomic(owners_root(home) / AUTH_FILE, data)
+    return row
+
+
+def revoke_bypass(home: Path, scope: str) -> dict:
+    with _authority_lock(home):
+        data = load_authority(home)
+        before = len(data["bypass"])
+        data["bypass"] = [r for r in data["bypass"] if r.get("scope") != scope]
+        _atomic(owners_root(home) / AUTH_FILE, data)
+    return {"scope": scope, "removed": before - len(data["bypass"])}
+
+
+def bypass_grant(home: Path, goal: str, now=None):
+    """The grant that lets this goal's owner run with bypassPermissions now, or None. Each candidate is re-resolved:
+    its answer must still key the exact question for the grant's own scope and hours, and the window (from the
+    answer's own time) must still be open."""
+    now = time.time() if now is None else now
+    for row in load_authority(home)["bypass"]:
+        if row.get("scope") not in ("*", goal):
+            continue
+        try:
+            hours = _check_hours(row.get("hours"))
+            at = answer_at(home, str(row.get("answer") or ""), bypass_question(row["scope"], hours), BYPASS_LABEL, now)
+        except OwnerError:
+            continue
+        if at <= now + 300 and now < at + hours * 3600:
+            return dict(row, expires_ts=at + hours * 3600)
+    return None
+
+
+def park_goal(home: Path, goal: str, until: str, answer: str, now=None) -> dict:
+    now = time.time() if now is None else now
+    if goal not in mission_goals(home):
+        raise OwnerError(f"goal {goal} is not in goals.json")
+    end = until_ts(until)
+    _mission_answer(home, answer)
+    at = answer_at(home, answer, park_question(goal, until), park_label(goal, until), now, ANSWER_MAX_AGE_S)
+    if end <= now:
+        raise OwnerError("--until is in the past")
+    if end - at > PARK_MAX_DAYS * 86400:
+        raise OwnerError(f"a park lasts at most {PARK_MAX_DAYS} days from the user's answer")
+    row = {"goal": goal, "until": until, "answer": answer, "answered_at": now_iso(at), "recorded_at": now_iso(now)}
+    with _authority_lock(home):
+        data = load_authority(home)
+        data["parks"] = [r for r in data["parks"] if r.get("goal") != goal] + [row]
+        _atomic(owners_root(home) / AUTH_FILE, data)
+    return row
+
+
+def unpark_goal(home: Path, goal: str) -> dict:
+    with _authority_lock(home):
+        data = load_authority(home)
+        before = len(data["parks"])
+        data["parks"] = [r for r in data["parks"] if r.get("goal") != goal]
+        _atomic(owners_root(home) / AUTH_FILE, data)
+    return {"goal": goal, "removed": before - len(data["parks"])}
+
+
+def active_park(home: Path, goal: str, now=None):
+    """The park record for this goal when its answer re-resolves to the exact park question and label and the park
+    has not ended; else None."""
+    now = time.time() if now is None else now
+    for row in load_authority(home)["parks"]:
+        if row.get("goal") != goal:
+            continue
+        try:
+            until = str(row.get("until") or "")
+            end = until_ts(until)
+            at = answer_at(home, str(row.get("answer") or ""), park_question(goal, until), park_label(goal, until),
+                           now)
+        except OwnerError:
+            continue
+        if now < end and end - at <= PARK_MAX_DAYS * 86400:
+            return dict(row, until_ts=end)
+    return None
+
+
+def ask_text(kind: str, scope: str = "", hours: int = 0, goal: str = "", until: str = "") -> dict:
+    """The exact AskUserQuestion main must ask (one question, single choice) for a grant or a park."""
+    if kind == "bypass":
+        q, label = bypass_question(scope, _check_hours(hours)), BYPASS_LABEL
+        other = "No bypass: keep the configured mode"
+    else:
+        until_ts(until)
+        q, label, other = park_question(goal, until), park_label(goal, until), f"Keep {goal} active"
+    return {"question": q, "options": [label, other], "multiSelect": False,
+            "rule": "ask this one question alone, word for word; only the first option grants"}
 
 
 def claude_bin() -> str:
@@ -790,12 +922,50 @@ def _run(argv, timeout=60, cwd=None):
 
 
 def bg_sessions(cfg: dict, runner=_run) -> list:
+    """Every session `claude agents --json --all` lists, validated (receipt v6 F2). Anything but a JSON array of
+    valid session records raises: an unreadable listing is never proof that no owner session runs."""
     code, out = runner([cfg["claude"], "agents", "--json", "--all"], 30)
     if code != 0:
         raise OwnerError("claude agents failed: " + clean(out, 200))
-    start = out.find("[")
-    data = json.loads(out[start:]) if start >= 0 else []
-    return [a for a in data if isinstance(a, dict)]
+    return parse_sessions(out)
+
+
+def parse_sessions(out) -> list:
+    """The listing must start with a JSON array (stdout; the runner appends stderr after it, which is ignored) whose
+    every element is a session record. Observed 2026-11-14 (claude agents --json --all, 14 records): each has a
+    sessionId, kind, name, cwd and startedAt; a live session has an integer pid and a status; a stopped one has no
+    pid key."""
+    text = str(out or "").lstrip()
+    if not text.startswith("["):
+        raise OwnerError("claude agents printed no JSON array; nothing is assumed about running sessions")
+    try:
+        data, _end = json.JSONDecoder().raw_decode(text)
+    except ValueError:
+        raise OwnerError("claude agents printed malformed JSON; nothing is assumed about running sessions") from None
+    if not isinstance(data, list):
+        raise OwnerError("claude agents did not print a list")
+    for i, rec in enumerate(data):
+        problem = session_problem(rec)
+        if problem:
+            raise OwnerError(f"claude agents record {i} is invalid ({problem}); nothing is assumed about sessions")
+    return data
+
+
+def session_problem(rec) -> str:
+    if not isinstance(rec, dict):
+        return "not an object"
+    if not isinstance(rec.get("sessionId"), str) or not SESSION_RE.match(rec["sessionId"]):
+        return "no valid sessionId"
+    for key in ("id", "name", "status", "state", "kind", "cwd"):
+        if key in rec and not isinstance(rec[key], str):
+            return f"{key} is not text"
+    if "pid" in rec:
+        pid = rec["pid"]
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return "pid is not a positive integer"
+        if not isinstance(rec.get("status"), str):
+            return "a live session has no status"
+    return ""
 
 
 def stop_idle_sessions(cfg: dict, state: dict, runner=_run) -> str:
@@ -901,7 +1071,10 @@ def tick_one(home: Path, goal: str, goal_row: dict, cfg: dict, sessions: list, n
             return out
         size = transcript_bytes(home, state)
         fresh = size < 0 or size > cfg["fresh_bytes"]
-        argv = [cfg["claude"], "--bg", "--permission-mode", cfg["permission_mode"], "--name", f"owner-{goal}"]
+        grant = bypass_grant(home, goal, now)  # receipt v6 F1: only a re-resolved grant, per goal, never text
+        mode = "bypassPermissions" if grant else cfg["permission_mode"]
+        out["permission_mode"] = mode
+        argv = [cfg["claude"], "--bg", "--permission-mode", mode, "--name", f"owner-{goal}"]
         model = state.get("model") or cfg["model"]
         if model and not MODEL_RE.match(model):
             out.update(action="launch-failed", reason=f"model {clean(model, 40)} is not allowed for owners")
@@ -990,8 +1163,13 @@ def tick(home: Path, now=None, runner=_run, dry_run: bool = False, only: str = "
         return out
     try:
         sessions = bg_sessions(cfg, runner)
-    except Exception as exc:  # noqa: BLE001
-        return [{"goal": g, "action": "error", "reason": clean(str(exc), 200)} for g in names]
+    except Exception as exc:  # noqa: BLE001 - receipt v6 F2: no listing, no launch; each owner's log says why
+        reason = "session listing refused, nothing launched: " + clean(str(exc), 200)
+        for g in names:
+            with contextlib.suppress(Exception), locked(home, g) as d:
+                _append(d / "launch.log", {"ts": now, "at": now_iso(now), "code": None, "launched": False,
+                                           "out": reason})
+        return [{"goal": g, "action": "error", "reason": reason} for g in names]
     out = []
     for g in names:
         try:
@@ -1235,6 +1413,24 @@ def build_parser():
         f = sub.add_parser(flag, help=text)
         f.add_argument("--goal", required=True)
         f.add_argument("--source", required=True)
+    q = sub.add_parser("ask-text", help="print the exact AskUserQuestion for a bypass grant or a park")
+    q.add_argument("--kind", required=True, choices=("bypass", "park"))
+    q.add_argument("--scope", default="*", help="bypass: * (every owner) or a goal id")
+    q.add_argument("--hours", type=int, default=0)
+    q.add_argument("--goal", default="")
+    q.add_argument("--until", default="", help="park: YYYY-MM-DD (UTC, inclusive)")
+    gb = sub.add_parser("grant-bypass", help="main only: record the user's answer allowing bypassPermissions")
+    gb.add_argument("--scope", required=True)
+    gb.add_argument("--hours", type=int, required=True)
+    gb.add_argument("--answer", required=True, help="answer:<session>/<uuid> of the user's AskUserQuestion reply")
+    rb = sub.add_parser("revoke-bypass", help="remove a bypass grant (anyone may lower authority)")
+    rb.add_argument("--scope", required=True)
+    pk = sub.add_parser("park", help="main only: record the user's answer parking a goal in the drive loop")
+    pk.add_argument("--goal", required=True)
+    pk.add_argument("--until", required=True)
+    pk.add_argument("--answer", required=True)
+    up = sub.add_parser("unpark", help="remove a park record (anyone may)")
+    up.add_argument("--goal", required=True)
     sub.add_parser("stop", help="Stop hook (reads the hook payload on stdin)")
     _no_abbrev(p)
     return p
@@ -1244,7 +1440,7 @@ STAMP_PURPOSE = "owner-main"
 STAMP_TTL_S = 60
 # (command, needs): "main" = main of the mission session; "main-or-owner" = that, or the goal's own owner session.
 GUARDED = {"init": "main", "pause": "main", "unpause": "main", "unstick": "main", "task add": "main-or-owner",
-           "task drop": "main-or-owner"}
+           "task drop": "main-or-owner", "grant-bypass": "main", "park": "main"}
 
 
 def guarded_name(argv) -> str:
@@ -1387,6 +1583,16 @@ def main(argv=None) -> int:
             out = set_flag(home, args.goal, args.cmd, args.source)
         elif args.cmd == "tick":
             out = tick(home, dry_run=args.dry_run)
+        elif args.cmd == "ask-text":
+            out = ask_text(args.kind, args.scope, args.hours, args.goal, args.until)
+        elif args.cmd == "grant-bypass":
+            out = grant_bypass(home, args.scope, args.hours, args.answer)
+        elif args.cmd == "revoke-bypass":
+            out = revoke_bypass(home, args.scope)
+        elif args.cmd == "park":
+            out = park_goal(home, args.goal, args.until, args.answer)
+        elif args.cmd == "unpark":
+            out = unpark_goal(home, args.goal)
         else:
             return 2
     except (OwnerError, OSError, ValueError) as exc:

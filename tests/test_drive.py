@@ -12,19 +12,14 @@ from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import drive  # noqa: E402
 import owner_rt as ort  # noqa: E402
+import authority_fixture as fx  # noqa: E402
 
 NOW = 1_800_000_000.0
 MISSION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
-
-
-def whole_turn():
-    """The quoted excerpt is the user's whole turn (older decision tests); receipt v5 tests read real turns."""
-    import provenance
-    return mock.patch.object(ort, "decision_context",
-                             side_effect=lambda s: provenance.parse_source(s).get("excerpt") or "")
 
 
 class Base(unittest.TestCase):
@@ -199,19 +194,6 @@ class ResponseTests(Base):
         with self.assertRaises(drive.DriveError):
             drive.respond(self.home, "solve", "UNOWNED", "ticket", "goodqa#5", now=NOW)
 
-    def test_response_ticket_must_be_open(self):
-        self.owner()
-        ac = self.home / "ac.md"
-        ac.write_text("AC-1 x\nVerify by: pytest x\nNEG-1 y\n")
-        ort.add_task(self.home, "solve", "a", "ticket:goodqa#11")
-        ort.move_task(self.home, "solve", "t1", "planned", ac_file=str(ac))
-        for state in ("closed", "missing", None):
-            with self.assertRaises(drive.DriveError, msg=state):
-                drive.respond(self.home, "solve", "REVIEW_LOOP", "ticket", "goodqa#1", detail="t1", now=NOW,
-                              ticket_check=lambda ref, s=state: s)
-        drive.respond(self.home, "solve", "REVIEW_LOOP", "ticket", "goodqa#1", detail="t1", now=NOW,
-                      ticket_check=lambda ref: "open")
-
     def test_response_raw_append_and_forged_snapshot_ignored(self):
         drive.tick(self.home, MISSION, now=NOW, owner_rows=[])
         for key in [a["key"] for r in drive.load_snapshot(self.home)["rows"] for a in r["actions"]]:
@@ -237,70 +219,6 @@ class ResponseTests(Base):
         ort.save_state(self.home, "solve", st)
         drive.respond(self.home, "solve", "STALLED", "owner", now=NOW)
 
-    def test_response_inferred_or_agent_park_refused(self):
-        for src in ("inferred:from x -- y", "wal:w123", "queue:s/2026#abc \"park solve\"", ""):
-            with self.assertRaises(drive.DriveError, msg=src):
-                drive.respond(self.home, "solve", "UNOWNED", "park", source=src, now=NOW)
-
-    def test_response_park_needs_user_words_that_park(self):
-        """Receipt F1: a verified user turn naming the goal is not enough; its words must park it, unnegated."""
-        import mission_coverage as mc
-        sess = "baab765b-d85c-46b4-b7b9-588eb912c770/11111111-2222-4333-8444-555555555555"
-        with mock.patch.object(mc, "verify_user_source", return_value=True), whole_turn():
-            for words in ("never park solve", "do not defer solve", "solve is the top priority", "don't pause solve",
-                          "solve: keep going, no hold"):
-                with self.assertRaises(drive.DriveError, msg=words):
-                    drive.respond(self.home, "solve", "UNOWNED", "park", source=f'user:{sess} "{words}"', now=NOW)
-            for words in ("park solve until Monday", "defer solve", "put solve on hold"):
-                drive.respond(self.home, "solve", "UNOWNED", "park", source=f'user:{sess} "{words}"', now=NOW)
-
-    def test_response_park_must_govern_the_requested_goal(self):
-        """Receipt v3 F1: the park verb must apply to this goal, not to another goal in the same sentence."""
-        import mission_coverage as mc
-        sess = "baab765b-d85c-46b4-b7b9-588eb912c770/11111111-2222-4333-8444-555555555555"
-        with mock.patch.object(mc, "verify_user_source", return_value=True), whole_turn():
-            for words in ("keep solve moving; park leads until Monday", "solve is fine, park leads",
-                          "park leads until solve ships", "park leads and keep pushing solve",
-                          "let's solve the bug later", "hold on, solve is broken", "park everything except solve"):
-                with self.assertRaises(drive.DriveError, msg=words):
-                    drive.respond(self.home, "solve", "UNOWNED", "park", source=f'user:{sess} "{words}"', now=NOW)
-            for words in ("keep leads moving; park solve until Monday", "put solve on hold"):
-                drive.respond(self.home, "solve", "UNOWNED", "park", source=f'user:{sess} "{words}"', now=NOW)
-
-    def test_response_park_questions_and_conditionals_refused(self):
-        """Receipt v4 F2: "Should we park solve?" or a conditional park is not the user parking solve."""
-        import mission_coverage as mc
-        sess = "baab765b-d85c-46b4-b7b9-588eb912c770/11111111-2222-4333-8444-555555555555"
-        with mock.patch.object(mc, "verify_user_source", return_value=True), whole_turn():
-            for words in ("Should we park solve?", "Should we park solve", "If the release fails we should park solve",
-                          "park solve?", "when leads ships, park solve", "do we park solve", "maybe park solve",
-                          "we could defer solve", "unless it lands today, park solve", "solve parked"):
-                with self.assertRaises(drive.DriveError, msg=words):
-                    drive.respond(self.home, "solve", "UNOWNED", "park", source=f'user:{sess} "{words}"', now=NOW)
-            drive.respond(self.home, "solve", "UNOWNED", "park", source=f'user:{sess} "yes, park solve"', now=NOW)
-
-    def test_response_park_partial_quote_judged_on_whole_sentence(self):
-        """Receipt v5 F1: "park solve" quoted out of "please don't park solve" never parks solve."""
-        import mission_coverage as mc
-        import provenance
-        cases = [("park solve", "Please don't park solve.", False),  # too short to quote alone, and negated
-                 ("park solve today", "Please don't park solve today.", False),
-                 ("park solve today", "Keep going. If the build breaks, park solve today.", False),
-                 ("park solve today", "No. park solve today.", False),
-                 ("park solve today", "Yes, park solve today. Wait, don't.", False),
-                 ("park solve today", "Thanks for the update. Yes, park solve today.", True)]
-        with mock.patch.object(mc, "verify_user_source", return_value=True):
-            for excerpt, text, ok in cases:
-                src = 'user:baab765b-d85c-46b4-b7b9-588eb912c770/11111111-2222-4333-8444-555555555555 "' + excerpt + '"'
-                with mock.patch.object(provenance, "user_turn", return_value={"text": text}):
-                    if len(excerpt) >= 12:  # a quote long enough to resolve is found: the refusal is not vacuous
-                        self.assertTrue(ort.decision_context(src), text)
-                    if ok:
-                        drive.respond(self.home, "solve", "UNOWNED", "park", source=src, now=NOW)
-                    else:
-                        with self.assertRaises(drive.DriveError, msg=text):
-                            drive.respond(self.home, "solve", "UNOWNED", "park", source=src, now=NOW)
-
     def test_release_uses_deploy_event_time_not_attach_time(self):
         """Receipt v3 F2: an older deploy attached after the merge is not a newer release."""
         import datetime as dt
@@ -309,7 +227,7 @@ class ResponseTests(Base):
         self.assertEqual(drive.deploy_ts(g, NOW), NOW - 86400)
         self.assertEqual(drive.deploy_ts({"evidence": [{"kind": "deploy", "at": iso(NOW)}]}, NOW), 0.0)  # no row_at
         self.assertEqual(drive.deploy_ts({"evidence": [{"kind": "deploy", "row_at": iso(NOW + 3600)}]}, NOW), 0.0)
-        with mock.patch.object(drive, "merged_commit_ts", return_value=NOW - 3600):
+        with mock.patch.object(drive, "merged_commit", return_value=(NOW - 3600, "0123456789ab")):
             self.goals[0]["evidence"] = g["evidence"]
             self.goals[0]["repos"] = [str(self.repo)]
             self.write_goals()
@@ -329,6 +247,226 @@ class ResponseTests(Base):
         todo = [t["key"] for t in drive.unanswered(snap, drive.read_responses(self.home),
                                                    NOW + drive.RESPONSE_TTL_S + 10)]
         self.assertIn("solve:UNOWNED", todo)  # expired
+
+
+# Every park phrase the earlier review rounds used (receipts v2-v5): none may park, whatever form it arrives in. The
+# last group were positives under the text parser; they are refusals now.
+PARK_PHRASES = (
+    "keep solve moving; never park solve", "never park solve", "do not defer solve", "don't pause solve",  # v2
+    "solve is the top priority", "solve: keep going, no hold",
+    "keep solve moving; park leads until Monday", "solve is fine, park leads", "park leads until solve ships",  # v3
+    "park leads and keep pushing solve", "let's solve the bug later", "hold on, solve is broken",
+    "park everything except solve",
+    "Should we park solve?", "If the release fails we should park solve", "park solve?",  # v4
+    "when leads ships, park solve", "maybe park solve", "we could defer solve", "unless it lands today, park solve",
+    "Please don't park solve today.", "Never park solve for the rest of today.",  # v5 (quoted in part below)
+    "Keep going. If the build breaks, park solve today.", "No. park solve today.", "Yes, park solve today. Wait, don't.",
+    "Thanks for the update. Yes, park solve today.", "park solve until Monday", "defer solve", "put solve on hold",
+    "yes, park solve",
+)
+
+
+class ParkAuthorityTests(Base):
+    """Receipt v6 F1: a goal is parked only by the user's structured answer to the exact park question."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.home / ".claude")})
+        p.start()
+        self.addCleanup(p.stop)
+        import mission_coverage
+        p = mock.patch.object(mission_coverage, "mission_session_of", return_value=MISSION)
+        p.start()
+        self.addCleanup(p.stop)
+        self.until = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 3 * 86400))
+
+    def park_answer(self, goal="solve", until=None, chosen=None, **kw):
+        until = until or self.until
+        q = kw.pop("question", None) or ort.park_question(goal, until)
+        chosen = ort.park_label(goal, until) if chosen is None else chosen
+        session = kw.pop("session", MISSION)
+        uid = fx.answer(self.home, session, q, chosen, options=[ort.park_label(goal, until), f"Keep {goal} active"],
+                        **kw)
+        return f"answer:{session}/{uid}"
+
+    def required(self, goal="solve"):
+        out = drive.stop_decision(self.home, {"session_id": MISSION}, now=time.time(), is_main=True)
+        return goal + " " in out.get("reason", "") + out.get("systemMessage", "")
+
+    def test_park_no_text_ever_parks(self):
+        self.assertEqual(fx.MISSION, MISSION)
+        for words in PARK_PHRASES:
+            uid = fx.human_turn(self.home, MISSION, words)
+            for quote in (words, "park solve today", "park solve for the rest of today"):
+                if quote not in words:
+                    continue
+                src = f'user:{MISSION}/{uid} "{quote}"'
+                # 1. the old path: a park response citing the user's words
+                with self.assertRaises(drive.DriveError, msg=words):
+                    drive.respond(self.home, "solve", "UNOWNED", "park", source=src, now=time.time())
+                # 2. the words cited to the park command
+                with self.assertRaisesRegex(ort.OwnerError, "must be exactly answer:", msg=words):
+                    ort.park_goal(self.home, "solve", self.until, src)
+            # 3. typed as the free-text reply to the exact park question; 4. as the question itself
+            with self.assertRaisesRegex(ort.OwnerError, "did not choose", msg=words):
+                ort.park_goal(self.home, "solve", self.until, self.park_answer(chosen=words))
+            with self.assertRaisesRegex(ort.OwnerError, "different question", msg=words):
+                ort.park_goal(self.home, "solve", self.until, self.park_answer(question=words))
+        self.assertTrue(self.required("solve"))
+        self.assertIn("UNOWNED", self.conds(drive.assess(self.home, MISSION, time.time(), owner_rows=[],
+                                                         with_git=False), "solve"))
+        # positive control on the same fixture home
+        ort.park_goal(self.home, "solve", self.until, self.park_answer())
+        a = drive.assess(self.home, MISSION, time.time(), owner_rows=[], with_git=False)
+        self.assertEqual(self.conds(a, "solve"), [])
+        self.assertIn("parked by the user's answer", self.row(a, "solve")["blocker"])
+        self.assertIn("UNOWNED", self.conds(a, "leads"))  # only the named goal
+        self.assertFalse(self.required("solve"))
+        ort.unpark_goal(self.home, "solve")
+        self.assertIn("UNOWNED", self.conds(drive.assess(self.home, MISSION, time.time(), owner_rows=[],
+                                                         with_git=False), "solve"))
+
+    def test_park_answer_must_fit_goal_date_and_shape(self):
+        other = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 5 * 86400))
+        far = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 40 * 86400))
+        past = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 2 * 86400))
+        cases = [("declined", dict(chosen="Keep solve active"), "did not choose"),
+                 ("other goal", dict(question=ort.park_question("leads", self.until)), "different question"),
+                 ("other date", dict(question=ort.park_question("solve", other)), "different question"),
+                 ("sub-agent", dict(sidechain=True), "resolve"),
+                 ("stale", dict(ts=time.time() - 25 * 3600), "older than"),
+                 ("other session", dict(session="bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee"), "mission session")]
+        for name, kw, why in cases:
+            with self.assertRaisesRegex(ort.OwnerError, why, msg=name):
+                ort.park_goal(self.home, "solve", self.until, self.park_answer(**kw))
+        with self.assertRaisesRegex(ort.OwnerError, "at most 30 days"):
+            ort.park_goal(self.home, "solve", far, self.park_answer(until=far))
+        with self.assertRaisesRegex(ort.OwnerError, "past"):
+            ort.park_goal(self.home, "solve", past, self.park_answer(until=past))
+        for bad in ("Monday", "2026-13-40", ""):
+            with self.assertRaises(ort.OwnerError, msg=bad):
+                ort.park_goal(self.home, "solve", bad, self.park_answer())
+        self.assertEqual(ort.load_authority(self.home)["parks"], [])
+        ort.park_goal(self.home, "solve", self.until, self.park_answer())  # control
+        self.assertEqual(len(ort.load_authority(self.home)["parks"]), 1)
+
+    def test_park_ends_on_its_date_and_record_alone_parks_nothing(self):
+        ort.park_goal(self.home, "solve", self.until, self.park_answer())
+        self.assertIsNotNone(ort.active_park(self.home, "solve", time.time()))
+        self.assertIsNone(ort.active_park(self.home, "solve", time.time() + 5 * 86400))
+        human = fx.human_turn(self.home, MISSION, "Park solve until next week.")
+        root = self.home / ".agent-harness" / "owners"
+        for answer in (f"answer:{MISSION}/{human}", self.park_answer(chosen="Keep solve active"),
+                       self.park_answer(goal="leads"), ""):
+            (root / "authority.json").write_text(json.dumps({"parks": [{"goal": "solve", "until": self.until,
+                                                                         "answer": answer}]}))
+            self.assertIsNone(ort.active_park(self.home, "solve", time.time()), answer)
+            self.assertIn("UNOWNED", self.conds(drive.assess(self.home, MISSION, time.time(), owner_rows=[],
+                                                             with_git=False), "solve"))
+
+    def test_park_ledger_user_deferral_honours_until(self):
+        import datetime as dt
+        iso = lambda t: dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat()  # noqa: E731
+        pp = self.goals[3]
+        pp["deferral"]["until"] = iso(time.time() - 60)
+        self.write_goals()
+        self.assertIn("UNOWNED", self.conds(drive.assess(self.home, MISSION, time.time(), owner_rows=[],
+                                                         with_git=False), "pp"))
+        pp["deferral"]["until"] = iso(time.time() + 3600)
+        self.write_goals()
+        self.assertEqual(self.conds(drive.assess(self.home, MISSION, time.time(), owner_rows=[], with_git=False),
+                                    "pp"), [])
+
+    def test_park_response_kind_is_gone(self):
+        self.assertNotIn("park", [k for kinds in drive.RESPONSE_KINDS.values() for k in kinds])
+        for name in ("park_binds", "PARK_LEAD", "PARK_INTENT"):
+            self.assertFalse(hasattr(drive, name), name)
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            drive.build_parser().parse_args(["respond", "--goal", "solve", "--cond", "UNOWNED", "--kind", "park"])
+
+
+class TicketAssociationTests(Base):
+    """Receipt v6 F3: a ticket answers an action only when it is durably about that goal and task or commit."""
+
+    def setUp(self):
+        super().setUp()
+        self.owner()
+        ac = self.home / "ac.md"
+        ac.write_text("AC-1 x\nVerify by: pytest x\nNEG-1 y\n")
+        ort.add_task(self.home, "solve", "a", "ticket:goodqa#11")
+        ort.add_task(self.home, "solve", "b", "ticket:goodqa#11")
+        ort.move_task(self.home, "solve", "t1", "planned", ac_file=str(ac))
+        ort.review_round(self.home, "solve", "t1", "a1234567890abcdef", "REJECT")
+        ort.review_round(self.home, "solve", "t1", "a1234567890abcdef", "REJECT")
+        ort.move_task(self.home, "solve", "t2", "blocked", help_text="need a grant")
+        self.tickets = {}
+
+    def lookup(self, ref):
+        return self.tickets.get(ref, {"state": "missing"})
+
+    def respond(self, cond, ref, detail):
+        return drive.respond(self.home, "solve", cond, "ticket", ref, detail=detail, now=NOW, ticket_check=self.lookup)
+
+    def test_ticket_open_but_unrelated_never_answers(self):
+        self.tickets = {"goodqa#21": {"state": "open", "title": "[drive:leads:t1] another goal's loop"},
+                        "goodqa#22": {"state": "open", "title": "[drive:solve:t2] the other task of this goal"},
+                        "goodqa#23": {"state": "open", "title": "solve: misc cleanup"},
+                        "goodqa#11": {"state": "open", "title": "Solve working live"},  # the goal's own ticket
+                        "goodqa#24": {"state": "open", "title": "[drive:solve:t11] a task id that only starts alike"},
+                        "goodqa#25": {"state": "closed", "title": "[drive:solve:t1] closed"}}
+        for ref in sorted(self.tickets):
+            with self.assertRaises(drive.DriveError, msg=ref):
+                self.respond("REVIEW_LOOP", ref, "t1")
+        for ref in ("goodqa#21", "goodqa#23", "goodqa#11"):
+            with self.assertRaises(drive.DriveError, msg=ref):
+                self.respond("HELP_OPEN", ref, "t2")
+        self.assertEqual(drive.read_responses(self.home), [])
+        self.tickets["goodqa#30"] = {"state": "open", "title": "[drive:solve:t1] redesign the login flow"}
+        self.tickets["goodqa#31"] = {"state": "open", "title": "[drive:solve:t2] grant for the deploy key"}
+        self.respond("REVIEW_LOOP", "goodqa#30", "t1")  # controls: the associated tickets do answer
+        self.respond("HELP_OPEN", "goodqa#31", "t2")
+        with self.assertRaises(drive.DriveError):
+            self.respond("HELP_OPEN", "goodqa#30", "t1")  # t1 is not blocked: the condition is not about it
+        with self.assertRaises(drive.DriveError):
+            self.respond("REVIEW_LOOP", "goodqa#31", "t2")  # t2 is not in a loop
+
+    def test_ticket_unknown_state_never_answers(self):
+        self.tickets = {"goodqa#30": {"state": None, "title": "[drive:solve:t1] x"}}
+        with self.assertRaises(drive.DriveError):
+            self.respond("REVIEW_LOOP", "goodqa#30", "t1")
+        with self.assertRaises(drive.DriveError):
+            drive.respond(self.home, "solve", "REVIEW_LOOP", "ticket", "goodqa#30", detail="t1", now=NOW,
+                          ticket_check=lambda ref: "open")  # the old string-only answer carries no title
+
+    def test_ticket_release_bound_to_the_commit(self):
+        self.goals[0]["repos"] = [str(self.repo)]
+        self.write_goals()
+        first = self.commit("fix(x): one\n\nRefs: GoodQA goodqa#11")
+        subprocess.run(["git", "-C", str(self.repo), "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
+        a = drive.assess(self.home, MISSION, time.time(), owner_rows=[])
+        act = next(x for x in self.row(a, "solve")["actions"] if x["cond"] == "MERGED_NOT_RELEASED")
+        self.assertEqual((act["detail"], act["key"]), (first[:12], f"solve:MERGED_NOT_RELEASED:{first[:12]}"))
+        self.tickets = {"goodqa#40": {"state": "open", "title": "release solve"},
+                        "goodqa#41": {"state": "open", "title": "[drive:leads:release:%s]" % first[:12]},
+                        "goodqa#42": {"state": "open", "title": "[drive:solve:release:0123456789ab]"},
+                        "goodqa#43": {"state": "open", "title": "[drive:solve:release:%s] ship it" % first[:12]}}
+        for ref in ("goodqa#40", "goodqa#41", "goodqa#42"):
+            with self.assertRaises(drive.DriveError, msg=ref):
+                self.respond("MERGED_NOT_RELEASED", ref, first[:12])
+        with self.assertRaises(drive.DriveError):
+            self.respond("MERGED_NOT_RELEASED", "goodqa#42", "0123456789ab")  # not the newest commit
+        with self.assertRaises(drive.DriveError):
+            drive.respond(self.home, "solve", "MERGED_NOT_RELEASED", "ticket", "goodqa#43", now=NOW,
+                          ticket_check=self.lookup)  # no --detail
+        row = self.respond("MERGED_NOT_RELEASED", "goodqa#43", first[:12])  # control
+        self.assertEqual(row["key"], f"solve:MERGED_NOT_RELEASED:{first[:12]}")
+        second = self.commit("fix(x): two\n\nRefs: GoodQA goodqa#11")
+        subprocess.run(["git", "-C", str(self.repo), "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
+        a = drive.assess(self.home, MISSION, time.time(), owner_rows=[])
+        keys = [x["key"] for x in self.row(a, "solve")["actions"]]
+        self.assertIn(f"solve:MERGED_NOT_RELEASED:{second[:12]}", keys)  # a newer merge is a new, unanswered action
+        with self.assertRaises(drive.DriveError):
+            self.respond("MERGED_NOT_RELEASED", "goodqa#43", second[:12])
 
 
 class NewConditionTests(Base):
