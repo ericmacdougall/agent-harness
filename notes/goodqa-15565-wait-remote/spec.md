@@ -110,3 +110,12 @@ Domain-gate: self-update-e2e waived (installed by the normal ah install-files ba
 Domain-gate: transport-proof waived (the live run over the real ssh route to t2-dev is the proof)
 Domain-gate: rollback-not-blocked waived (no release or rollback path is touched)
 Domain-gate: staging-exists waived (a local helper; the t2-dev run after install is the live proof)
+
+## Reviews
+
+Spec core sha256: `6cf8696a92f3196d8ea6562080f040d3efdf98e1c8670159af7b3ca7f21ee2cc`
+
+| Role | Verdict | Reviewer | Kind | Source | Bound to |
+|---|---|---|---|---|---|
+| adversarial | ACCEPT | a0c568dfa08e7eb86 (red-team) | agent | WAL-verified red-team agent | current |
+| acceptance | ACCEPT | a5d878417503c1093 (red-team) | agent | WAL-verified red-team agent | current |

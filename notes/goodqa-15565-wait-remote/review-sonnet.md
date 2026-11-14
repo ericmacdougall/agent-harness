@@ -1,0 +1,5 @@
+# Sonnet acceptance review, goodqa#15565 wait-remote (agent a5d878417503c1093)
+
+Spec at 64092686: BLOCK, H1 tail exit codes cannot tell not-yet from unreadable (the AC-5 test would pass on a stub real tail never produces), H2 a quoted tilde path never matches, H3 the item 7 narrowing (no wrapper for arbitrary remote commands) needs a labelled decision for main (D1, ASSUMPTION), plus stale match and no failure line. Spec at f430418e: BLOCK narrowly, the offset advance, the baseline for an absent file or connection failures, and the launch-then-wait race (D4: fresh log with --include-existing, or --from-offset); folded in (AC-1, AC-2, D4, AC-10, NEG-13 to NEG-16).
+Code at cc5386a8: ACCEPT, each of AC-1 to AC-10 traced in code and tests, with one correction: NEG-15 promised a find the code cannot make (a line written while the link was down is indistinguishable from an earlier run's line); NEG-15 reworded, a test pins both halves, the docstring states it. Mutant run by the reviewer: all variants failed, none vacuous or unapplied.
+Verdict: ACCEPT
