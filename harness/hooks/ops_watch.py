@@ -1847,13 +1847,18 @@ def check_idle_guard(cfg, state, runner, now):
     root = Path(expand(home, ic["wal_root"]))
     if root != home / ".claude" / "wals":
         return []  # the owner view reads the real session root only
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import idle_guard  # noqa: PLC0415 - installed beside this file
     out = []
     try:
         sessions = [e for e in os.scandir(root) if e.is_dir(follow_symlinks=False)]
     except OSError:
-        return []
+        return []  # no session WALs on this host (a Codex-only install): nothing to assess, nothing to import
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import idle_guard  # noqa: PLC0415 - installed beside this file
+    except ImportError as error:  # a partial install: say so, never a check-error (receipt r3 F1)
+        return [alert("idle_guard", "idle-guard:unavailable", "warning",
+                      f"idle_guard.py is not installed beside ops_watch.py ({type(error).__name__}); main-idle detection is off",
+                      {"fix": "reinstall the harness"})]
     for sess in sorted(sessions, key=lambda e: e.name):
         try:
             if os.stat(os.path.join(sess.path, "main.jsonl")).st_mtime < now - ic["lookback_h"] * 3600:
