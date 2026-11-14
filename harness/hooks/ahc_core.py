@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -137,6 +138,12 @@ def _packet_ok(path_value, roots):
 
 def validate(config, req):
     """A normalized request, or Refused. `config` holds `repos` (allowlist) and `work_roots`."""
+    norm = _fields(config, req)
+    norm["packet"] = _packet_ok(req.get("packet"), config.get("work_roots", []))
+    return norm
+
+
+def _fields(config, req):
     if not isinstance(req, dict):
         raise Refused("request must be a JSON object")
     repo = req.get("repo")
@@ -152,8 +159,54 @@ def validate(config, req):
     if not isinstance(owner, str) or not OWNER_RE.fullmatch(owner):
         raise Refused("owner must be a plain agent id")
     return {"repo": repo.lower(), "pr": pr, "head": _full(req.get("head"), "head"),
-            "base": _full(req.get("base"), "base"), "packet": _packet_ok(req.get("packet"), config.get("work_roots", [])),
-            "ticket": ticket, "owner": owner}
+            "base": _full(req.get("base"), "base"), "ticket": ticket, "owner": owner}
+
+
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+CLOCK_SKEW = 300
+
+
+def _inside(path_value, roots):
+    real = os.path.realpath(path_value)
+    return any(real == r or real.startswith(r.rstrip(os.sep) + os.sep) for r in map(os.path.realpath, roots))
+
+
+def validate_queued(config, rec, now):
+    """Re-validate a queue file at ingest (code-inspection r2 F5): the queue directory is not trusted just because
+    submit wrote it. Same field rules as submit; the packet is checked lexically (its bytes are rechecked before
+    review, and a vanished packet is an owner notice, not a quarantine); the id must be the recomputed item id."""
+    if not isinstance(rec, dict):
+        raise Refused("queue record must be a JSON object")
+    norm = _fields(config, rec)
+    packet = rec.get("packet")
+    if not isinstance(packet, str) or "\x00" in packet or not os.path.isabs(packet) or not _inside(
+            packet, config.get("work_roots", [])):
+        raise Refused("queue record packet is not an absolute path inside a work root")
+    sha = rec.get("packet_sha256")
+    if not isinstance(sha, str) or not SHA256_RE.fullmatch(sha):
+        raise Refused("queue record packet_sha256 must be 64 lowercase hex characters")
+    submitted = rec.get("submitted")
+    if type(submitted) not in (int, float) or not math.isfinite(submitted) or not 0 < submitted <= now + CLOCK_SKEW:
+        raise Refused("queue record submitted time is missing, non-finite or in the future")
+    norm.update(packet=packet, packet_sha256=sha, submitted=float(submitted))
+    if rec.get("id") != item_id(norm, sha):
+        raise Refused("queue record id does not match its content")
+    norm["id"] = rec["id"]
+    return norm
+
+
+def inbox_path(paths, owner, name):
+    """The owner's inbox file, or Refused if it would leave the inbox directory (F5 defense in depth)."""
+    if not isinstance(owner, str) or not OWNER_RE.fullmatch(owner) or owner in (".", ".."):
+        raise Refused("owner is not a plain agent id")
+    if not isinstance(name, str) or "/" in name or "\x00" in name or name in ("", ".", ".."):
+        raise Refused("inbox file name is not plain")
+    path = paths.inbox / owner / name
+    root = os.path.realpath(str(paths.inbox))
+    real = os.path.realpath(str(path))  # resolves a symlinked owner directory or file before the check
+    if os.path.dirname(os.path.dirname(real)) != root or not real.startswith(root + os.sep):
+        raise Refused("inbox path escapes the inbox directory")
+    return path
 
 
 def item_id(req, packet_sha):

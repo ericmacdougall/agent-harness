@@ -403,8 +403,10 @@ class OutcomeClassTests(Base):
         self.assertEqual(cls("", 2)[0], "unknown-outcome")
         self.assertEqual(cls(diag % "PROVIDER_UNAVAILABLE", core.TIMEOUT_RC)[0], "unknown-outcome")
         self.assertEqual(cls("", 127)[0], "unknown-outcome")
-        for code in ("EXEC_FAILED", "SNAPSHOT_TOO_LARGE", "PYTHON_UNSUPPORTED", "SOMETHING_NEW"):
+        for code in ("EXEC_FAILED", "SNAPSHOT_TOO_LARGE", "PYTHON_UNSUPPORTED"):
             self.assertEqual(cls(diag % code, 2)[0], "environment", code)
+        # spec owner ruling (v16b): an unlisted code may mean the provider launched
+        self.assertEqual(cls(diag % "SOMETHING_NEW", 2)[0], "unknown-outcome")
 
     def test_unknown_outcome_is_needs_attention_and_never_relaunched(self):
         iid, deps = self.submit(), ErrDeps("REVIEW_LAUNCH_UNCONFIRMED")
@@ -453,6 +455,107 @@ class OutcomeClassTests(Base):
     def test_policy_for_new_classes(self):
         self.assertEqual(runner.retry_policy("unknown-outcome", 1, 0.0), ("needs-attention", None))
         self.assertEqual(runner.retry_policy("environment", 1, 0.0), ("needs-attention", None))
+
+
+class IngestValidationTests(Base):
+    """code-inspection r2 F5: a queue file is re-validated at ingest; a bad one is quarantined with one alert and never
+    stops the tick (heartbeat written, the valid item alongside it completes); inbox paths stay inside the inbox."""
+
+    def plant(self, name, text):
+        self.paths.ensure()
+        path = self.paths.queue / name
+        path.write_text(text)
+        return path
+
+    def valid_record(self):
+        iid = self.submit()
+        return iid, json.loads((self.paths.queue / (iid + ".json")).read_text())
+
+    def assert_isolated(self, bad_name, deps):
+        """The bad file is quarantined with a reason, alerted once, and the valid item still completes."""
+        rejected = self.paths.root / "rejected"
+        self.assertFalse((self.paths.queue / bad_name).exists() or (self.paths.queue / bad_name).is_symlink())
+        moved = [p for p in rejected.iterdir() if not p.name.endswith(".reason")]
+        self.assertEqual(len(moved), 1)
+        self.assertTrue((rejected / (moved[0].name + ".reason")).read_text().strip())
+        heartbeats = [a for a in deps.ah_calls if a[:3] == ["ah", "heartbeat", "beat"]]
+        self.assertGreaterEqual(len(heartbeats), 1, "the tick died before its heartbeat")
+        alerts = [a for a in deps.ah_calls if a[:3] == ["ah", "alert", "raise"]
+                  and a[a.index("--alert-key") + 1].startswith("ahc:rejected:")]
+        self.assertEqual(len(alerts), 1, "exactly one alert per rejected file, also across re-scans")
+        self.assertEqual(alerts[0][alerts[0].index("--key") + 1], "ahc-rejected-" + moved[0].name)
+        self.assertEqual(alerts[0][alerts[0].index("--alert-key") + 1], "ahc:rejected:" + moved[0].name)
+
+    def run_with_bad(self, bad_name, bad_text):
+        good, _rec = self.valid_record()
+        self.plant(bad_name, bad_text)
+        deps = Deps()
+        self.run_all(deps)
+        deps.now += 120
+        self.run_all(deps)  # a re-scan must not re-alert or re-raise
+        self.assertEqual(self.state(good), "routed-to-main", "a poisoned queue file stopped a valid item")
+        self.assert_isolated(bad_name, deps)
+        return deps
+
+    def test_missing_fields_are_quarantined_and_tick_continues(self):
+        name = "ahc-00000000000000000000.json"
+        self.run_with_bad(name, json.dumps({"id": "ahc-00000000000000000000"}))
+
+    def test_non_finite_or_future_timestamp_is_quarantined(self):
+        for submitted in (float("inf"), 1_800_000_000.0 + 86400, "1", None):
+            with self.subTest(submitted=submitted):
+                self.setUp()
+                good, rec = self.valid_record()
+                bad = dict(rec, pr=8, submitted=submitted)
+                bad["id"] = core.item_id(bad, bad["packet_sha256"])
+                self.plant(bad["id"] + ".json", json.dumps(bad))
+                deps = Deps()
+                self.run_all(deps)
+                self.assertEqual(self.state(good), "routed-to-main")
+                self.assert_isolated(bad["id"] + ".json", deps)
+                self.tearDown()
+
+    def test_forged_id_is_quarantined(self):
+        _good, rec = self.valid_record()
+        forged = dict(rec, pr=9)   # content changed, id kept: not the recomputed identity
+        forged["id"] = "ahc-" + "1" * 20
+        self.run_with_bad(forged["id"] + ".json", json.dumps(forged))
+
+    def test_owner_traversal_is_quarantined_and_nothing_written_outside_inbox(self):
+        _good, rec = self.valid_record()
+        evil = dict(rec, pr=10, owner="../../../../escape")
+        evil["id"] = core.item_id(evil, evil["packet_sha256"])
+        self.run_with_bad(evil["id"] + ".json", json.dumps(evil))
+        self.assertFalse(list(self.home.rglob("escape*")), "a notice was written outside the inbox")
+
+    def test_symlinked_queue_entry_is_moved_not_followed(self):
+        good, rec = self.valid_record()
+        planted = dict(rec, pr=11)  # a fully valid record: only the symlink makes it unacceptable
+        planted["id"] = core.item_id(planted, planted["packet_sha256"])
+        outside = self.home / "outside.json"
+        outside.write_text(json.dumps(planted))
+        link = self.paths.queue / (planted["id"] + ".json")
+        link.symlink_to(outside)
+        deps = Deps()
+        self.run_all(deps)
+        self.assertEqual(self.state(good), "routed-to-main")
+        self.assertIsNone(self.state(planted["id"]), "a symlinked queue entry was followed and accepted")
+        self.assertTrue(outside.exists(), "the symlink target must not be moved or deleted")
+        moved = self.paths.root / "rejected" / link.name
+        self.assertTrue(moved.is_symlink(), "the link itself is quarantined")
+
+    def test_inbox_path_rejects_escape_after_resolving(self):
+        with self.assertRaises(core.Refused):
+            core.inbox_path(self.paths, "..", "x.md")
+        with self.assertRaises(core.Refused):
+            core.inbox_path(self.paths, "agent-abc123", "../x.md")
+        self.paths.ensure()
+        elsewhere = self.home / "elsewhere"
+        elsewhere.mkdir()
+        (self.paths.inbox / "agent-evil1").symlink_to(elsewhere)
+        with self.assertRaises(core.Refused):
+            core.inbox_path(self.paths, "agent-evil1", "x.md")
+        self.assertEqual(core.inbox_path(self.paths, "agent-abc123", "x.md"), self.paths.inbox / "agent-abc123" / "x.md")
 
 
 class DeliveryTests(Base):

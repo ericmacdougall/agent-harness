@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -177,7 +178,9 @@ def classify_review_failure(stderr, rc=None):
         return "contention", code
     if code in TRANSIENT_CODES:
         return "provider-transient", code
-    return "environment", code   # EXEC_*, other SNAPSHOT_*, PYTHON_UNSUPPORTED: a local defect, not a retry
+    if code.startswith("EXEC_") or code.startswith("SNAPSHOT_") or code == "PYTHON_UNSUPPORTED":
+        return "environment", code   # a named local environment defect, not a retry
+    return "unknown-outcome", code   # unlisted: the provider may have launched; reconcile before any retry
 
 
 def _reset_time(stderr):
@@ -302,25 +305,32 @@ class Ledger:
     def item(self, iid):
         return self.db.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
 
-    def ensure_item(self, iid):
-        """Accept the queued request into the ledger (I1). Returns the row, or None if no request exists."""
+    def ensure_item(self, iid, config, now=None):
+        """Accept the queued request into the ledger (I1) after re-validating it (r2 F5). Returns the row, None if
+        no request file exists, or raises core.Refused for a record that must be quarantined."""
         row = self.item(iid)
         if row is not None:
             return row
         qfile = self.paths.queue / (iid + ".json")
         try:
-            req = json.loads(qfile.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            text = _read_nofollow(qfile)
+        except FileNotFoundError:
             return None
-        if not isinstance(req, dict) or req.get("id") != iid:
-            return None
+        except (OSError, UnicodeDecodeError) as error:
+            raise core.Refused("queue file unreadable or not a regular file: %s" % type(error).__name__) from None
+        try:
+            raw = json.loads(text)
+        except ValueError:
+            raise core.Refused("queue file is not valid JSON") from None
+        req = core.validate_queued(config, raw, now if now is not None else time.time())
+        if req["id"] != iid:
+            raise core.Refused("queue file name does not match its id")
         with self.tx():
             self.db.execute(
                 "INSERT OR IGNORE INTO items(id, lineage, owner, ticket, state, next_action_at, submitted, request,"
                 " updated) VALUES (?,?,?,?,?,?,?,?,?)",
                 (iid, "%s|%s" % (req["repo"], req["pr"]), req["owner"], req["ticket"], "queued",
-                 float(req.get("submitted") or 0), float(req.get("submitted") or 0), json.dumps(req, sort_keys=True),
-                 time.time()))
+                 req["submitted"], req["submitted"], json.dumps(req, sort_keys=True), time.time()))
             self.db.execute("INSERT OR IGNORE INTO lineage(lineage) VALUES (?)", ("%s|%s" % (req["repo"], req["pr"]),))
             self.db.execute("INSERT INTO events(item, event, at, data) VALUES (?,?,?,?)",
                             (iid, "accepted", time.time(), "{}"))
@@ -373,7 +383,7 @@ class Journal:
     def append(self, event, **data):
         ledger = Ledger(self.paths)
         try:
-            if ledger.ensure_item(self.iid) is None:
+            if ledger.ensure_item(self.iid, load_config(self.paths)) is None:
                 raise KeyError("no such item: " + self.iid)
             now = time.time()
             with ledger.tx():
@@ -699,7 +709,7 @@ class Worker:
             return
         effects = [("ticket", {"ticket": req["ticket"], "body": body, "key": "ahc-" + nkey.replace(":", "-")})]
         if audience == "owner":
-            effects.append(("inbox", {"path": str(self.paths.inbox / req["owner"] / ("%s-%s.md" % (iid, state))),
+            effects.append(("inbox", {"path": str(core.inbox_path(self.paths, req["owner"], "%s-%s.md" % (iid, state))),
                                       "body": body}))
         if audience == "user" or state in ALERT_STATES:
             effects.append(("alert", _alert_payload(iid, req, state, body)))
@@ -755,6 +765,12 @@ class Worker:
                 return rc == 0, "rc=%s %s" % (rc, _short(err))
             if kind == "inbox":
                 path = Path(payload["path"])
+                try:
+                    core.inbox_path(self.paths, path.parent.name, path.name)
+                except core.Refused as error:
+                    return False, "refused: %s" % error
+                if path.parent.parent != self.paths.inbox:
+                    return False, "refused: inbox path escapes the inbox directory"
                 if not path.exists():
                     _write_private(path, payload["body"])
                 return True, "written"
@@ -790,13 +806,61 @@ class Worker:
 
 # ---------------------------------------------------------------- tick
 
-def ingest(ledger, paths):
+def ingest(ledger, paths, config, now=None):
+    """Accept queue files into the ledger. A file that fails validation, or whose ingestion raises anything, is moved
+    to `rejected/` with a reason file and reported; it never stops the other items (r2 F5). Returns the rejections as
+    (file name, reason)."""
     try:
         files = sorted(paths.queue.glob("ahc-*.json"))
     except OSError:
         files = []
+    rejected = []
     for qfile in files:
-        ledger.ensure_item(qfile.stem)
+        try:
+            ledger.ensure_item(qfile.stem, config, now)
+        except Exception as error:  # noqa: BLE001 - any per-file failure is quarantined, never fatal to the tick
+            reason = str(error) if isinstance(error, core.Refused) else "ingest error: %s" % type(error).__name__
+            try:
+                if ledger.db.in_transaction:
+                    ledger.db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            moved = _quarantine(paths, qfile, reason)
+            # an unmovable file is skipped and reported again next tick under the same deterministic alert key
+            rejected.append((moved or qfile.name, reason if moved else reason + "; quarantine move failed"))
+    return rejected
+
+
+def _read_nofollow(path):
+    """Read a queue file without following a symlink (O_NOFOLLOW) and only if it is a regular file."""
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise IsADirectoryError("not a regular file")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            data = handle.read(core.PACKET_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > core.PACKET_MAX_BYTES:
+        raise OSError("queue file too large")
+    return data.decode("utf-8")
+
+
+def _quarantine(paths, qfile, reason):
+    """Atomically rename the queue entry itself (a symlink is moved, never followed) into rejected/, with a reason
+    file. Returns the quarantined name, which keys the one alert for it, or None if it could not be moved."""
+    target_dir = paths.root / "rejected"
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        target = target_dir / qfile.name
+        if os.path.lexists(str(target)):
+            target = target_dir / ("%s.%d.json" % (qfile.stem, time.time_ns()))
+        os.rename(str(qfile), str(target))  # same filesystem: atomic; renames the link, not its referent
+        _write_private(target.with_name(target.name + ".reason"), redact.redact(reason) + "\n")
+        return target.name
+    except OSError as error:
+        log.warning("could not quarantine %s: %s", qfile.name, type(error).__name__)
+        return None
 
 
 def supersede(worker):
@@ -818,9 +882,19 @@ def tick(paths, config, deps):
     """One reconcile pass. Returns a summary dict. Raises nothing for item-level failures."""
     ledger = Ledger(paths)
     worker = Worker(paths, config, deps, ledger)
-    summary = {"processed": [], "recovered": [], "defects": []}
+    summary = {"processed": [], "recovered": [], "defects": [], "rejected": []}
     try:
-        ingest(ledger, paths)
+        summary["rejected"] = ingest(ledger, paths, config, worker.now())
+        for name, reason in summary["rejected"]:
+            message = "ahc rejected queue file %s: %s (moved to coordinator/rejected/)" % (name, reason)
+            try:
+                rc, _out, _err = deps.ah(["ah", "alert", "raise", "--severity", "high", "--alert-key",
+                                          "ahc:rejected:" + name, "--source", "ahc", "--key", "ahc-rejected-" + name,
+                                          "--message", redact.redact(message)[:500]], 60)
+                if rc != 0:
+                    log.warning("rejection alert for %s exited %s; the reason file in rejected/ remains", name, rc)
+            except Exception:  # noqa: BLE001 - the file is already quarantined with its reason; the alert is best effort
+                log.warning("rejection alert failed for %s; the reason file in rejected/ remains", name)
         for row in ledger.db.execute("SELECT * FROM items WHERE state='reviewing'").fetchall():
             summary["recovered"].append((row["id"], worker.recover(row)))
         supersede(worker)
@@ -1042,7 +1116,7 @@ def submit_with_lint(paths, config, req):
     capacity = int(bounds(config)["queue_capacity"])
     ledger = Ledger(paths)
     try:
-        ingest(ledger, paths)
+        ingest(ledger, paths, config)
         existing = ledger.item(core.item_id(norm, hashlib.sha256(Path(norm["packet"]).read_bytes()).hexdigest()))
         depth = ledger.db.execute("SELECT COUNT(*) AS n FROM items WHERE state IN (%s)" % ",".join(
             "?" * len(NON_TERMINAL)), sorted(NON_TERMINAL)).fetchone()["n"]
