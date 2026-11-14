@@ -239,6 +239,88 @@ class TurnBoundaryTests(Base):
                 self.assertIn("rejected", out.get("reason") or out.get("systemMessage") or "")
 
 
+class Goodqa15949Tests(Base):
+    """goodqa#15949: a quoted phrase is not a rejection, the Stop signature ignores progress, the counter keeps history."""
+
+    def _transcript(self, *records):
+        t = self.home / "q.jsonl"
+        if t.exists():
+            t.unlink()
+        jl(t, [{"type": "user", "origin": {"kind": "human"}, "message": {"role": "user", "content": "go"}}, *records])
+        return str(t)
+
+    def test_a_successful_tool_result_quoting_the_phrase_is_not_a_rejection(self):
+        quoted = {"type": "user", "toolUseResult": {}, "message": {"role": "user", "content": [
+            {"type": "tool_result", "content": "grep: The user doesn't want to proceed with this tool use. (user-rejected)"}]}}
+        self.assertFalse(self.ig.rejected_this_turn(self._transcript(quoted)))
+        mid = {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "is_error": True, "content": "exit 1: log says The user doesn't want to proceed with this tool use"}]}}
+        self.assertFalse(self.ig.rejected_this_turn(self._transcript(mid)))
+
+    def test_a_real_denial_is_a_rejection(self):
+        denial = {"type": "user", "toolDenialKind": "user-rejected", "message": {"role": "user", "content": [
+            {"type": "tool_result", "is_error": True, "content": "x"}]}}
+        self.assertTrue(self.ig.rejected_this_turn(self._transcript(denial)))
+        text = {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "is_error": True,
+                "content": [{"type": "text", "text": "The user doesn't want to proceed with this tool use. STOP"}]}]}}
+        self.assertTrue(self.ig.rejected_this_turn(self._transcript(text)))
+
+    def test_same_streams_with_changing_progress_block_at_most_the_cap(self):
+        self.park_tick_on_ticket()
+        blocks = 0
+        for i in range(8):
+            jl(self.w / "main.jsonl", [{"at": iso(NOW - 1000 + i), "event": "check", "note": f"turn {i}"}])
+            out = self.ig.cmd_stop({"session_id": SESSION, "stop_hook_active": False}, now=NOW + 4 * HOUR + i)
+            blocks += out.get("decision") == "block"
+        self.assertEqual(blocks, self.ig.MAX_STOP_BLOCKS)
+
+    def test_alternating_signatures_do_not_reset_each_other(self):
+        for sig in ("A", "B", "A"):
+            self.ig._count(SESSION, sig, bump=True)
+        self.assertEqual(self.ig._count(SESSION, "A", bump=False), 2)
+        self.assertEqual(self.ig._count(SESSION, "B", bump=False), 1)
+
+    def test_counter_retention_is_bounded(self):
+        for i in range(self.ig.MAX_SIGS + 20):
+            self.ig._count(SESSION, f"s{i}", bump=True)
+        blocks = json.loads(self.ig.state_path(SESSION).read_text())["blocks"]
+        self.assertLessEqual(len(blocks), self.ig.MAX_SIGS)
+        self.assertEqual(self.ig._count(SESSION, f"s{self.ig.MAX_SIGS + 19}", bump=False), 1)
+
+
+    def tick_streams(self):
+        return [x["agent"] for x in self.assess()["streams"]]
+
+    def test_external_wait_is_excused_until_it_expires(self):  # goodqa#15949 item 1
+        self.dispose("tick", "waiting", "tick-ext", until=iso(NOW + 3 * HOUR), ref="GoodQA goodqa#15643",
+                     external="Codex quota resets 2026-11-16")
+        self.assertNotIn("tick", self.tick_streams())
+        late = self.ig.assess(self.home, SESSION, NOW + 4 * HOUR)
+        self.assertIn("tick", [x["agent"] for x in late["streams"]])  # expired: flagged again
+
+    def test_ordinary_ticket_wait_stays_actionable(self):
+        self.park_tick_on_ticket()
+        self.assertIn("tick", self.tick_streams())
+
+    def test_external_needs_a_reason_and_a_waiting_kind(self):
+        for kind, ext in (("waiting", "short"), ("legacy", "Codex quota resets 11-16")):
+            with self.subTest(kind):
+                with self.assertRaises(ah.AhError):
+                    self.dispose("tick", kind, "tick-bad-key1", until=iso(NOW + HOUR), ref="GoodQA goodqa#15643", external=ext)
+
+    def test_quota_ref_only_with_external(self):
+        self.dispose("tick", "waiting", "tick-quota-1", until=iso(NOW + HOUR), ref="quota:codex", external="Codex quota resets 11-16")
+        with self.assertRaises(ah.AhError):
+            self.dispose("done1", "waiting", "done1-quota-1", until=iso(NOW + HOUR), ref="quota:codex")
+
+    def test_an_owner_working_after_its_wait_is_not_a_ticket_wait_stream(self):  # goodqa#15949 item 2
+        self.dispose("tick", "waiting", "tick-old-wait", until=iso(NOW + 3 * HOUR), ref="GoodQA goodqa#15943", at=iso(NOW - 600))
+        self.assertIn("tick", self.tick_streams())  # activity before the wait does not lift it
+        jl(self.w / "main.jsonl", [{"at": iso(NOW - 120), "event": "subagent", "agent_id": "tick", "agent_type": "task-owner"}])
+        jl(self.w / "agent-tick.jsonl", [{"at": iso(NOW - 20), "event": "check", "note": "back and working"}])
+        self.assertNotIn("tick", self.tick_streams())
+
+
 class ReminderTests(Base):
     def test_rejection_injects_the_exact_line(self):  # AC-7
         out = self.ig.cmd_reject({"hook_event_name": "PostToolUseFailure", "tool_name": "AskUserQuestion",

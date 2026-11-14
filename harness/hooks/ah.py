@@ -34,6 +34,9 @@ _REF_FORMS = re.compile(r"(?:(?i:goodqa)(?:\s+([A-Za-z0-9][A-Za-z0-9-]{0,62})\s*
 PROJECT_ID_PREFIXES = {"1ae27b6b": "goodqa"}  # GoodQA project id (first 8 hex) -> slug
 DEFAULT_PROJECT = "goodqa"
 KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
+EXTERNAL_MIN = 15  # characters of reason an --external wait must give
+RESUMED_ACTIVITY_S = 60  # activity this long after a wait means the owner was resumed (goodqa#15949)
+QUOTA_REF_RE = re.compile(r"^quota:[a-z0-9][a-z0-9_-]{1,40}$")
 ASK_ID_RE = re.compile(r"^w[0-9a-f]{11}$")
 OWNER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 # ahd's writes (goodqa#14848): heartbeat beat, alert raise|clear, apply --batch
@@ -472,6 +475,9 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         d = r.get("disposition") or {}
         if d.get("kind") in liveness.ENDING_DISPOSITIONS:
             continue  # a terminal disposition stays terminal, whatever the owner's last note says
+        if d.get("kind") == "waiting" and d.get("live") and str(r["state"]).startswith(("live", "working")) \
+                and (parse_ts(r["last_activity"]) or 0.0) > float(d.get("at") or 0.0) + RESUMED_ACTIVITY_S:
+            continue  # goodqa#15949: fresh activity after the wait wins; a live, working owner is not waiting
         ref = str(d.get("ref") or "") if d.get("kind") == "waiting" and d.get("live") else \
             (r["state"][len("waiting-on-"):] if r["state"].startswith("waiting-on-") else "")
         if not ref and d.get("kind") == "waiting" and d.get("live"):
@@ -481,7 +487,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         r["wait_on"] = ref
         if ASK_ID_RE.match(ref) and asks.get(ref) == "open":
             holders.setdefault(ref, []).append(r)
-        elif not ASK_ID_RE.match(ref):
+        elif not ASK_ID_RE.match(ref) and not (d.get("external") and d.get("kind") == "waiting" and d.get("live")):
             r["attention"] = list(r.get("attention") or []) + ["wait-not-user"]
     for ref, held in holders.items():
         held.sort(key=lambda r: (parse_ts(r["last_activity"]) or 0.0, r["agent_id"]))
@@ -1086,6 +1092,10 @@ def precheck(op: str, args: dict) -> None:
             raise AhError("bad_request", "task.dispose: agent must be an agent id or a task WAL name")
         if parse_ts(args["at"]) is None:
             raise AhError("bad_request", "task.dispose: at must be an ISO timestamp")
+        ext = args.get("external")
+        if ext is not None and (args["kind"] != "waiting" or not isinstance(ext, str) or len(ext.strip()) < EXTERNAL_MIN):
+            raise AhError("bad_request", f"task.dispose: --external goes with --kind waiting and needs a reason of {EXTERNAL_MIN}+ "
+                                         "characters naming the outside blocker (a quota reset, a vendor, a date)")
         if args.get("ack_handoff") not in (None, True) or (args.get("ack_handoff") and args["kind"] != "waiting"):
             raise AhError("bad_request", "task.dispose: --ack-handoff goes with --kind waiting only")
         if args["kind"] == "waiting":
@@ -1097,9 +1107,9 @@ def precheck(op: str, args: dict) -> None:
                                              + (" (GoodQA could not confirm the ticket)" if args.get("ref_unverified") else "")
                                              + "; renew the wait when it expires")
             ref = args.get("ref") or ""
-            if not (ASK_ID_RE.match(ref) or TICKET_RE.match(ref)):
-                raise AhError("bad_request", "task.dispose waiting: --ref must be an ask id (w + 11 hex) or 'GoodQA <project>#N'; "
-                                             "a wait must name what it waits on")
+            if not (ASK_ID_RE.match(ref) or TICKET_RE.match(ref) or (ext and QUOTA_REF_RE.match(ref))):
+                raise AhError("bad_request", "task.dispose waiting: --ref must be an ask id (w + 11 hex) or 'GoodQA <project>#N' "
+                                             "(or quota:<provider> with --external); a wait must name what it waits on")
         elif args["kind"] == "reassigned":
             if not OWNER_ID_RE.match(args.get("ref") or ""):
                 raise AhError("bad_request", "task.dispose reassigned: --ref <replacement agent id> is required")
@@ -1566,7 +1576,7 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
             _closing_checks(args, ledger, time.time())
         rec = {"at": now, "event": "disposition", "id": wid, "agent": args["agent"], "kind": args["kind"],
                "note": f"owner {args['agent']} {args['kind']}: {args.get('reason') or args.get('ref') or ''}"[:300]}
-        for k in ("until", "ref", "reason", "deployed", "live_test", "gate_epoch", "owner_last"):
+        for k in ("until", "ref", "reason", "deployed", "live_test", "gate_epoch", "owner_last", "external"):
             if args.get(k):
                 rec[k] = args[k]
         _wal_append(home, main_wal, rec)
@@ -1820,7 +1830,7 @@ def dispositions(home: Path, session: str, ledger=None) -> dict:
         if r.get("op") == "task.dispose" and a.get("session") == session:
             d = {"kind": a.get("kind"), "at": parse_ts(a.get("at")) or 0.0, "ref": a.get("ref"),
                  "reason": a.get("reason"), "evidence": a.get("evidence"), "seq": r.get("seq")}
-            for k in ("deployed", "live_test", "gate_epoch", "ack_handoff"):
+            for k in ("deployed", "live_test", "gate_epoch", "ack_handoff", "external"):
                 if a.get(k):
                     d[k] = a[k]
             if a.get("until"):
@@ -3135,6 +3145,8 @@ def build_parser():
     dp.add_argument("--kind", required=True, choices=list(liveness.DISPOSITIONS))
     dp.add_argument("--ref", help="waiting: ask id or ticket; reassigned: replacement agent id")
     dp.add_argument("--until", help="waiting: ISO time when the wait expires")
+    dp.add_argument("--external", help="waiting: the outside blocker (quota reset, vendor, date); the wait is excused until "
+                                       "--until, then flagged wait-expired. Ref may be quota:<provider>")
     dp.add_argument("--ack-handoff", dest="ack_handoff", action="store_true",
                     help="waiting: main acknowledges this owner's handoff while the wait is live (main only)")
     dp.add_argument("--reason", help="closed, superseded, wontdo: what you verified about this owner (40+ characters)")
@@ -3324,7 +3336,7 @@ def run(args, home: Path) -> dict:
             return write(home, "task.register", a, s, args.key)
         if args.sub == "dispose":
             a = {"agent": args.agent, "session": s or "", "kind": args.kind, "at": iso(time.time())}
-            for opt in ("ref", "until", "reason", "evidence", "deployed", "live_test", "ack_handoff"):
+            for opt in ("ref", "until", "reason", "evidence", "deployed", "live_test", "ack_handoff", "external"):
                 if getattr(args, opt):
                     a[opt] = getattr(args, opt)
             return write(home, "task.dispose", a, s, args.key)

@@ -36,11 +36,12 @@ sys.path.insert(0, str(HERE))
 
 IDLE_MIN_DEFAULT = 30
 MAX_STOP_BLOCKS = 2
+MAX_SIGS = 50  # signatures kept per session
 TAIL_BYTES = 1 << 20
 REMINDER = "A rejected question pauses only that question; keep every independent stream moving."
 MAIN_PROGRESS = {"commit", "check", "intent", "subagent", "subagent_stop", "result", "handoff", "deploy"}
 MAIN_PROGRESS_TOOLS = {"Agent", "Write", "Edit", "NotebookEdit"}
-REJECT_RE = re.compile(r"doesn't want to proceed with this tool use|user-rejected|User rejected tool use", re.I)
+REJECT_RE = re.compile(r"(?:the )?user (?:doesn't want to proceed with this tool use|rejected tool use)|user-rejected", re.I)  # use .match: text must START with it
 
 
 def idle_min() -> float:
@@ -152,6 +153,20 @@ def _human_turn(rec: dict) -> bool:
     return reason is None
 
 
+def _result_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(str(c.get("text")) for c in content if isinstance(c, dict) and c.get("type") == "text")
+    return ""
+
+
+def _denial_result(block) -> bool:
+    """A real denial: an error tool_result whose text STARTS with the rejection text (output that quotes it does not)."""
+    return (isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error") is True
+            and bool(REJECT_RE.match(_result_text(block.get("content")).lstrip())))
+
+
 def rejected_this_turn(transcript) -> bool:
     """True when a user rejection sits after the last human prompt in the transcript tail."""
     if not transcript:
@@ -167,7 +182,7 @@ def rejected_this_turn(transcript) -> bool:
         content = (rec.get("message") or {}).get("content")
         if _human_turn(rec):
             seen = False  # a human prompt starts a new turn
-        elif isinstance(content, list) and any(isinstance(c, dict) and c.get("type") == "tool_result" and REJECT_RE.search(str(c.get("content"))) for c in content):
+        elif isinstance(content, list) and any(_denial_result(c) for c in content):
             seen = True
         if rec.get("toolDenialKind") == "user-rejected":
             seen = True
@@ -184,14 +199,18 @@ def _count(session: str, sig: str, bump: bool) -> int:
         state = json.loads(path.read_text())
     except (OSError, ValueError):
         state = {}
-    n = int((state.get("blocks") or {}).get(sig, 0)) if isinstance(state, dict) else 0
+    blocks = state.get("blocks") if isinstance(state, dict) else None
+    blocks = {k: v for k, v in blocks.items() if isinstance(k, str) and isinstance(v, int)} if isinstance(blocks, dict) else {}
+    n = blocks.get(sig, 0)
     if bump:
         try:
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             tmp = path.with_suffix(".tmp")
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as fh:
-                json.dump({"blocks": {sig: n + 1}}, fh)
+                blocks.pop(sig, None)
+                blocks[sig] = n + 1  # most recently bumped last; keep the newest MAX_SIGS
+                json.dump({"blocks": dict(list(blocks.items())[-MAX_SIGS:])}, fh)
             os.replace(tmp, path)
         except OSError:
             pass
@@ -221,7 +240,7 @@ def cmd_stop(payload: dict, now: float | None = None) -> dict:
     else:
         return {}
     text = head + lines(a["streams"]) + "\n" + REMINDER
-    sig = hashlib.sha256((",".join(sorted(s["agent"] for s in a["streams"])) + f"|{int(a['last_progress'])}").encode()).hexdigest()[:16]
+    sig = hashlib.sha256("|".join(sorted(f"{s['agent']}:{s['why']}" for s in a["streams"])).encode()).hexdigest()[:16]
     count = _count(session, sig, bump=False)
     if payload.get("stop_hook_active") or count >= MAX_STOP_BLOCKS:
         return {"systemMessage": "idle guard: " + text}
@@ -235,8 +254,8 @@ def cmd_reject(payload: dict) -> dict:
     if event == "UserPromptSubmit":
         hit = rejected_this_turn(payload.get("transcript_path"))
     else:
-        blob = " ".join(str(payload.get(k) or "") for k in ("error", "tool_response", "reason", "message"))
-        hit = bool(REJECT_RE.search(blob) or payload.get("is_interrupt") is True or event == "PermissionDenied")
+        fields = [str(payload.get(k) or "").lstrip() for k in ("error", "tool_response", "reason", "message")]
+        hit = bool(any(REJECT_RE.match(f) for f in fields) or payload.get("is_interrupt") is True or event == "PermissionDenied")
     if not hit:
         return {}
     return {"hookSpecificOutput": {"hookEventName": event or "PostToolUseFailure", "additionalContext": REMINDER}}
