@@ -95,13 +95,21 @@ def assess(home: Path, session: str, now: float | None = None, idle_minutes: flo
         progress = max(progress, last, ah.transcript_mtime(home, session, agent, dirs) if r.get("type") != "task-wal" else 0.0)
         d = r.get("disposition") if isinstance(r.get("disposition"), dict) else None
         live = bool(d and d.get("live"))
-        ref = str((d or {}).get("ref") or "")
-        if live and d.get("kind") == "waiting":
-            if ah.ASK_ID_RE.match(ref):
+        if d and d.get("kind") in liveness.ENDING_DISPOSITIONS:
+            continue  # a terminal disposition stays terminal: the owner is retired, whatever its notes say
+        # a wait is a live waiting disposition, or a `waiting-on-<x>` state derived from the owner's last WAL note
+        ref = str(d.get("ref") or "") if live and d.get("kind") == "waiting" else (
+            state[len("waiting-on-"):] if state.startswith("waiting-on-") else None)
+        if ref is not None:
+            if "wait-invalid" in (r.get("attention") or []):
+                streams.append({"agent": agent, "ticket": r.get("ticket"),
+                                "why": f"its wait on {ref} is not its own ({'/'.join(f for f in r.get('flags') or [] if f.startswith('wait-ask-'))})",
+                                "next": "work an independent item, or raise an ask that names this owner"})
+            elif ah.ASK_ID_RE.match(ref):
                 user_waiters += 1
-                continue
-            streams.append({"agent": agent, "ticket": r.get("ticket"), "why": f"waiting on {ref or 'a ticket'}, not a user ask",
-                            "next": f"work {ref or 'the ticket'} now, or record the real user ask it needs"})
+            else:
+                streams.append({"agent": agent, "ticket": r.get("ticket"), "why": f"waiting on {ref or 'a ticket'}, not a user ask",
+                                "next": f"work {ref or 'the ticket'} now, or record the real user ask it needs"})
             continue
         if state.startswith(("live", "working")):
             active += 1

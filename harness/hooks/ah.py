@@ -452,6 +452,26 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             label = "unverified-legacy" if d["kind"] == "legacy" else d["kind"]
             r["state"], r["severity"] = label, "info"  # ended, never "done"
             r["flags"] = list(r.get("flags") or []) + [label]
+    # goodqa#15943 (receipt r1 F2): a wait on a user ask excuses only the owner the ask belongs to, whether it is a
+    # note or a disposition. A wait on another owner's ask, or a second holder of one unowned ask, is reported in
+    # `attention` (it never sets decision_required: the owner is not dropped, its wait is simply not its own).
+    owned, holders = ask_owners(main), {}
+    for r in rows:
+        if not r["owner"]:
+            continue
+        d = r.get("disposition") or {}
+        ref = str(d.get("ref") or "") if d.get("kind") == "waiting" and d.get("live") else \
+            (r["state"][len("waiting-on-"):] if r["state"].startswith("waiting-on-") else "")
+        if ASK_ID_RE.match(ref) and asks.get(ref) == "open":
+            holders.setdefault(ref, []).append(r)
+    for ref, held in holders.items():
+        held.sort(key=lambda r: (parse_ts(r["last_activity"]) or 0.0, r["agent_id"]))
+        for i, r in enumerate(held):
+            own = owned.get(ref)
+            flag = "wait-ask-foreign" if own and own != r["agent_id"] else "wait-ask-shared" if not own and i > 0 else None
+            if flag:
+                r["flags"] = list(r.get("flags") or []) + [flag]
+                r["attention"] = list(r.get("attention") or []) + ["wait-invalid"]
     for r in rows:  # I9: a handoff is real only once someone takes it (a disposition at/after the handoff)
         if r["owner"] and r["state"] == "handoff":
             handed = parse_ts(r["last_activity"]) or 0.0
@@ -1627,6 +1647,26 @@ def leftover_waiters(home: Path, agent: str, session: str, ps_rows=None, session
             continue
         found.append({"kind": "process", "pid": pid, "elapsed": elapsed, "scope": scope, "command": redact.redact(command)[:200]})
     return found
+
+
+def ask_owners(main_wal: Path) -> dict:
+    """{ask id: owner agent id} for the asks of the session main WAL that name an owner (wal_note --owner)."""
+    out = {}
+    try:
+        with open(main_wal, "rb") as handle:
+            for raw in handle:
+                if b'"owner"' not in raw or b'"ask"' not in raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("event") == "ask" and ASK_ID_RE.match(str(rec.get("id") or "")) \
+                        and isinstance(rec.get("owner"), str) and rec["owner"]:
+                    out[rec["id"]] = rec["owner"]
+    except OSError:
+        pass
+    return out
 
 
 def narrow_wait(home: Path, main_wal: Path, session: str, agent: str, ref: str) -> None:

@@ -220,6 +220,68 @@ class OpsWatchTests(Base):
         self.assertEqual(self.alerts(), [])
 
 
+class NoteWaitTests(Base):
+    """Receipt r1 F1/F2: waits recorded in WAL notes (no disposition) must not hide idleness or bypass ask ownership."""
+
+    def note_wait(self, agent, target):
+        # written before the owner's stop row (old+60) so the owner stays stopped and the note is its last entry
+        jl(self.w / f"agent-{agent}.jsonl", [{"at": iso(NOW - 4 * HOUR + 30), "event": "status",
+                                              "note": f"blocked, waiting on {target}"}])
+
+    def by(self):
+        return {r["agent_id"]: r for r in ah.owners(self.home, SESSION, now=NOW)["owners"]}
+
+    def test_stopped_owner_waiting_on_a_ticket_by_note_is_actionable(self):  # F1
+        self.note_wait("tick", "GoodQA goodqa#15943")
+        self.assertTrue(self.by()["tick"]["state"].startswith("waiting-on-GoodQA"))
+        a = self.assess()
+        self.assertTrue(a["idle"])
+        self.assertIn("tick", {s["agent"] for s in a["streams"]})
+
+    def test_task_wal_waiting_on_a_ticket_by_note_is_actionable(self):  # F1
+        jl(self.w / "taskwal.jsonl", [{"at": iso(NOW - 3 * HOUR), "event": "status",
+                                       "note": "waiting on GoodQA goodqa#15943"}])
+        os.utime(self.w / "taskwal.jsonl", (NOW - 3 * HOUR, NOW - 3 * HOUR))  # the clock is faked; the window reads mtime
+        a = self.assess()
+        self.assertIn("taskwal", {s["agent"] for s in a["streams"]})
+
+    def test_terminal_disposition_stays_terminal(self):  # F1: a retired owner is not a stream
+        self.note_wait("tick", "GoodQA goodqa#15943")
+        with mock.patch.object(ah, "_ticket_exists", return_value=True):
+            self.dispose("tick", "wontdo", "tick-wontdo-1", ref="GoodQA goodqa#15943",
+                         reason="verified that nobody will do this and the scope was dropped by main")
+        self.assertNotIn("tick", {s["agent"] for s in self.assess()["streams"]})
+
+    def test_note_wait_on_own_open_ask_needs_only_the_user(self):  # NEG-1 via notes
+        self.note_wait("tick", "wa5b00000001")
+        self.close_done1()
+        a = self.assess()
+        self.assertFalse(a["idle"])
+        self.assertEqual(a["streams"], [])
+
+    def test_note_wait_on_another_owners_ask_is_invalid(self):  # F2
+        jl(self.w / "main.jsonl", [{"at": iso(NOW - 3 * HOUR), "event": "ask", "id": "wa5b00000002", "owner": "done1",
+                                    "note": "need approval", "source": "user:x/y \"w\""}])
+        self.note_wait("tick", "wa5b00000002")
+        row = self.by()["tick"]
+        self.assertIn("wait-ask-foreign", row["flags"])
+        self.assertIn("wait-invalid", row["attention"])
+        self.assertIn("tick", ah.owners(self.home, SESSION, now=NOW)["attention"])
+        self.assertIn("tick", {s["agent"] for s in self.assess()["streams"]})
+
+    def test_two_owners_citing_one_ask_only_the_first_holds_it(self):  # F2
+        old = NOW - 4 * HOUR
+        jl(self.w / "main.jsonl", [{"at": iso(old), "event": "subagent", "agent_id": "tock", "agent_type": "task-owner"},
+                                   {"at": iso(old + 60), "event": "subagent_stop", "agent_id": "tock", "agent_type": "task-owner"}])
+        jl(self.w / "agent-tock.jsonl", [{"at": iso(old), "event": "intent", "note": "GoodQA goodqa#15945 work"}])
+        self.note_wait("tick", "wa5b00000001")
+        self.note_wait("tock", "wa5b00000001")
+        rows = self.by()
+        flagged = [a for a in ("tick", "tock") if "wait-ask-shared" in rows[a]["flags"]]
+        self.assertEqual(len(flagged), 1)
+        self.assertIn(flagged[0], {s["agent"] for s in self.assess()["streams"]})
+
+
 class DisposeNarrowTests(Base):
     def test_ask_naming_another_owner_is_refused(self):  # AC-5
         jl(self.w / "main.jsonl", [{"at": iso(NOW - 50), "event": "ask", "id": "wa5b00000002", "owner": "done1",
