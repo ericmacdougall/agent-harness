@@ -21,12 +21,20 @@ refresh authorization, grant lookup).
 
 ## Round 2 (review r2 at 6f5ef181; Opus rescue owner)
 
-Code head for this round: 8fd0e309513f99bcdab2dbdfedcba1396368441c. Later commits change only `notes/goodqa-15946/`;
-check the logs against any later head with `git rev-parse <head>:harness <head>:tests <head>:install.py` (the trees are
-in each log header).
+The round-1 files above (`suites-a9807c67.txt`, `mutants-a9807c67.txt`) are superseded history: they were produced at
+a commit outside later review snapshots.
 
-- `r2-failing-first-prefix.txt`: raw `-v` output of the new r2 tests (tests/test_lane_r2.py, tests/test_spec_flow.py
-  LaneSpecState) run against the pre-fix code at 6f5ef181: 7 failures and 5 errors, each the defect r2 named.
-- `suites-r2-8fd0e309.txt`: raw `-v` unittest output of every touched suite (`run_suites_r2.py`), in a clean clone
-  detached at the code head on t2-dev (Linux, Python 3.12), per the heavy-jobs-off-the-Mac rule.
-- `run_suites_r2.py`: the runner.
+Code head for this round: 0e1bc98ac8f6c86f31823d6911e020e629d6a5ad. Later commits change only `notes/goodqa-15946/`;
+check any log against a later head with `git rev-parse <head>:harness <head>:tests <head>:install.py` (each log header
+carries the trees).
+
+- `suites-r2-0e1bc98a.txt`: raw `-v` unittest output of all 28 touched suites (`run_suites_r2.py`), clean clone detached
+  at the code head on t2-dev (Linux, Python 3.12; the Mac's heavy-job guard refuses the clone).
+- `mac-r2-0e1bc98a.txt`: raw `-v` output on the Mac (Python 3.9) of test_lane_r2, LaneSpecState and the wal suites.
+- `mutants-r2-0e1bc98a.txt`: raw output of `run_mutants_r2.py`, one mutant per fix (F1 source, F1 bind refusal, F2
+  persisted id, F3 ready fallback, F4 dedupe, F4 per-op lock). Each is KILLED, then the restored source passes.
+- `r2-failing-first-prefix.txt`: the first 13 new tests run against the pre-fix trees (6f5ef181). 12 of 13 fail (7
+  failures, 5 errors); the ungrounded-ticket negative passes there too. Its F1 failure is exit 2 (no session passed),
+  so the provenance rejection itself is shown by the F1-source mutant (`exit 3, provenance`).
+- `suites-r2-8fd0e309.txt`: the same suites at the intermediate code head 8fd0e309 (superseded by 0e1bc98a).
+- `run_suites_r2.py`, `run_mutants_r2.py`: the runners.

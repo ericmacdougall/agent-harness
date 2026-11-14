@@ -1,0 +1,213 @@
+# run_mutants_r2.py at code head 0e1bc98ac8f6c86f31823d6911e020e629d6a5ad on the Mac (python 3.9.6); tree harness 7cf3647606f9eee97b91ac0ad62267bf44e28572 tests 9254ca7d251bee85cc1bb85b48875feb0d56a563 install.py c40b93ff8a651e6022326098074f49833f9cad0a
+== mutant F1 source: old ungrounded literal: exit 1 -> KILLED
+test_real_register_succeeds_with_a_grounded_source_and_a_retry_is_a_duplicate (tests.test_lane_r2.RealTaskRegisterTests) ... ERROR
+test_bind_through_the_real_register_reaches_holder_bound (tests.test_lane_r2.RealTaskRegisterTests) ... FAIL
+
+======================================================================
+ERROR: test_real_register_succeeds_with_a_grounded_source_and_a_retry_is_a_duplicate (tests.test_lane_r2.RealTaskRegisterTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15946/tests/test_lane_r2.py", line 109, in test_real_register_succeeds_with_a_grounded_source_and_a_retry_is_a_duplicate
+    cid = self.register()
+  File "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15946/tests/test_lane_r2.py", line 105, in register
+    return self.real.task_register(task=task, agent=agent, ticket=TICKET, branch="lane/goodqa-15946",
+  File "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15946/harness/hooks/ah_lane.py", line 199, in task_register
+    raise RuntimeError("task register failed (exit %d, %s)" % (done.returncode, str(answer.get("code"))[:40]))
+RuntimeError: task register failed (exit 3, provenance)
+
+======================================================================
+FAIL: test_bind_through_the_real_register_reaches_holder_bound (tests.test_lane_r2.RealTaskRegisterTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15946/tests/test_lane_r2.py", line 142, in test_bind_through_the_real_register_reaches_holder_bound
+    self.assertEqual(r.code, cmd.OK, r.lines)
+AssertionError: 6 != 0 : ['bind incomplete (RuntimeError); op bind-lane_01-g1-A1; rerun to finish']
+
+----------------------------------------------------------------------
+Ran 2 tests in 3.318s
+
+FAILED (failures=1, errors=1)
+
+== mutant F1 bind: refusal swallowed as PARTIAL: exit 1 -> KILLED
+test_bind_of_a_stream_registered_to_another_holder_is_refused_not_partial (tests.test_lane_r2.RealTaskRegisterTests) ... FAIL
+
+======================================================================
+FAIL: test_bind_of_a_stream_registered_to_another_holder_is_refused_not_partial (tests.test_lane_r2.RealTaskRegisterTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15946/tests/test_lane_r2.py", line 155, in test_bind_of_a_stream_registered_to_another_holder_is_refused_not_partial
+    self.assertEqual(r.code, cmd.REFUSED, r.lines)
+AssertionError: 6 != 3 : ['bind incomplete (LaneRefusal); op bind-lane_01-g1-A1; rerun to finish']
+
+----------------------------------------------------------------------
+Ran 1 test in 2.080s
+
+FAILED (failures=1)
+
+== mutant F2: comments never send the persisted id (the pre-fix in-process list is lost on restart): exit 1 -> KILLED
+test_killed_between_ticket_steps_then_a_fresh_retry_links_exactly_one_attachment (tests.test_lane_r2.NewCrashTests) ... test_the_attachment_effect_is_not_done_until_the_comment_linked_it (tests.test_lane_r2.NewCrashTests) ... ok
+
+======================================================================
+FAIL: test_killed_between_ticket_steps_then_a_fresh_retry_links_exactly_one_attachment (tests.test_lane_r2.NewCrashTests) (point='after-upload')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15946/tests/test_lane_r2.py", line 242, in test_killed_between_ticket_steps_then_a_fresh_retry_links_exactly_one_attachment
+    self.assertEqual(retry.code, cmd.OK, retry.lines)
+AssertionError: 6 != 0 : ['lane lane_r2crash created; ticket write incomplete (RuntimeError); op new-lane_r2crash; rerun to finish']
+
+======================================================================
+FAIL: test_killed_between_ticket_steps_then_a_fresh_retry_links_exactly_one_attachment (tests.test_lane_r2.NewCrashTests) (point='before-comment')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15946/tests/test_lane_r2.py", line 242, in test_killed_between_ticket_steps_then_a_fresh_retry_links_exactly_one_attachment
+    self.assertEqual(retry.code, cmd.OK, retry.lines)
+AssertionError: 6 != 0 : ['lane lane_r2crash created; ticket write incomplete (RuntimeError); op new-lane_r2crash; rerun to finish']
+
+======================================================================
+FAIL: test_killed_between_ticket_steps_then_a_fresh_retry_links_exactly_one_attachment (tests.test_lane_r2.NewCrashTests) (point='after-comment')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15946/tests/test_lane_r2.py", line 242, in test_killed_between_ticket_steps_then_a_fresh_retry_links_exactly_one_attachment
+    self.assertEqual(retry.code, cmd.OK, retry.lines)
+AssertionError: 6 != 0 : ['lane lane_r2crash created; ticket write incomplete (RuntimeError); op new-lane_r2crash; rerun to finish']
+
+----------------------------------------------------------------------
+Ran 2 tests in 3.548s
+
+FAILED (failures=3)
+
+== mutant F3: spec_state falls back to ready: exit 1 -> KILLED
+test_lane_spec_state_reads_acceptance_not_completion (tests.test_spec_flow.LaneSpecState) ... FAIL
+test_lane_spec_state_without_the_fields_is_unknown_not_ready (tests.test_spec_flow.LaneSpecState) ... FAIL
+test_no_spec_means_neither_verified_nor_accepted (tests.test_spec_flow.LaneSpecState) ... ok
+test_same_reviewer_for_both_roles_is_not_accepted (tests.test_spec_flow.LaneSpecState) ... ok
+test_status_reports_spec_acceptance_separately_from_completion (tests.test_spec_flow.LaneSpecState) ... ok
+
+======================================================================
+FAIL: test_lane_spec_state_reads_acceptance_not_completion (tests.test_spec_flow.LaneSpecState)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15946/tests/test_spec_flow.py", line 1471, in test_lane_spec_state_reads_acceptance_not_completion
+    self.assertEqual((state["verified"], state["reviews_accepted"]), (True, True))
+AssertionError: Tuples differ: (False, False) != (True, True)
+
+First differing element 0:
+False
+True
+
+- (False, False)
++ (True, True)
+
+======================================================================
+FAIL: test_lane_spec_state_without_the_fields_is_unknown_not_ready (tests.test_spec_flow.LaneSpecState)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15946/tests/test_spec_flow.py", line 1480, in test_lane_spec_state_without_the_fields_is_unknown_not_ready
+    ports.spec_state("GoodQA harness#168")
+AssertionError: RuntimeError not raised
+
+----------------------------------------------------------------------
+Ran 5 tests in 3.288s
+
+FAILED (failures=2)
+
+== mutant F4: keyed append does not dedupe: exit 1 -> KILLED
+test_killed_after_the_real_append_then_a_fresh_retry_leaves_one_note (tests.test_lane_r2.CheckpointExactlyOnceTests) ... FAIL
+test_two_concurrent_checkpoints_leave_one_note_and_one_comment (tests.test_lane_r2.CheckpointExactlyOnceTests) ... ok
+test_four_concurrent_writers_with_one_key_leave_one_row (tests.test_lane_r2.WalNoteOpKeyTests) ... FAIL
+test_same_key_twice_writes_one_row_and_answers_its_id (tests.test_lane_r2.WalNoteOpKeyTests) ... FAIL
+test_without_a_key_nothing_changes_and_a_bad_key_is_refused (tests.test_lane_r2.WalNoteOpKeyTests) ... ok
+
+======================================================================
+FAIL: test_killed_after_the_real_append_then_a_fresh_retry_leaves_one_note (tests.test_lane_r2.CheckpointExactlyOnceTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15946/tests/test_lane_r2.py", line 351, in test_killed_after_the_real_append_then_a_fresh_retry_leaves_one_note
+    self.assertEqual(len(notes), 1, "the retry did not append a second note")
+AssertionError: 2 != 1 : the retry did not append a second note
+
+======================================================================
+FAIL: test_four_concurrent_writers_with_one_key_leave_one_row (tests.test_lane_r2.WalNoteOpKeyTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15946/tests/test_lane_r2.py", line 397, in test_four_concurrent_writers_with_one_key_leave_one_row
+    self.assertEqual(sorted(a["status"] for a in answers), ["DUPLICATE"] * 3 + ["WROTE"])
+AssertionError: Lists differ: ['WROTE', 'WROTE', 'WROTE', 'WROTE'] != ['DUPLICATE', 'DUPLICATE', 'DUPLICATE', 'WROTE']
+
+First differing element 0:
+'WROTE'
+'DUPLICATE'
+
+- ['WROTE', 'WROTE', 'WROTE', 'WROTE']
++ ['DUPLICATE', 'DUPLICATE', 'DUPLICATE', 'WROTE']
+
+======================================================================
+FAIL: test_same_key_twice_writes_one_row_and_answers_its_id (tests.test_lane_r2.WalNoteOpKeyTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15946/tests/test_lane_r2.py", line 378, in test_same_key_twice_writes_one_row_and_answers_its_id
+    self.assertEqual((a["status"], b["status"], a["id"]), ("WROTE", "DUPLICATE", b["id"]))
+AssertionError: Tuples differ: ('WROTE', 'WROTE', 'wfe23f294c79') != ('WROTE', 'DUPLICATE', 'wfe23f294c79')
+
+First differing element 1:
+'WROTE'
+'DUPLICATE'
+
+- ('WROTE', 'WROTE', 'wfe23f294c79')
+?            ^^^
+
++ ('WROTE', 'DUPLICATE', 'wfe23f294c79')
+?            ^^^^^^^
+
+
+----------------------------------------------------------------------
+Ran 5 tests in 8.821s
+
+FAILED (failures=3)
+
+== mutant F4: no per-op lock: exit 1 -> KILLED
+test_two_concurrent_checkpoints_leave_one_note_and_one_comment (tests.test_lane_r2.CheckpointExactlyOnceTests) ... FAIL
+
+======================================================================
+FAIL: test_two_concurrent_checkpoints_leave_one_note_and_one_comment (tests.test_lane_r2.CheckpointExactlyOnceTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15946/tests/test_lane_r2.py", line 365, in test_two_concurrent_checkpoints_leave_one_note_and_one_comment
+    self.assertEqual([len(v) for v in FileTicket(self.ticket_file).comments().values()], [1])
+AssertionError: Lists differ: [2] != [1]
+
+First differing element 0:
+2
+1
+
+- [2]
++ [1]
+
+----------------------------------------------------------------------
+Ran 1 test in 1.859s
+
+FAILED (failures=1)
+
+== restored source: exit 0
+test_real_register_succeeds_with_a_grounded_source_and_a_retry_is_a_duplicate (tests.test_lane_r2.RealTaskRegisterTests) ... ok
+test_bind_through_the_real_register_reaches_holder_bound (tests.test_lane_r2.RealTaskRegisterTests) ... ok
+test_bind_of_a_stream_registered_to_another_holder_is_refused_not_partial (tests.test_lane_r2.RealTaskRegisterTests) ... ok
+test_killed_between_ticket_steps_then_a_fresh_retry_links_exactly_one_attachment (tests.test_lane_r2.NewCrashTests) ... ok
+test_the_attachment_effect_is_not_done_until_the_comment_linked_it (tests.test_lane_r2.NewCrashTests) ... ok
+test_lane_spec_state_reads_acceptance_not_completion (tests.test_spec_flow.LaneSpecState) ... ok
+test_lane_spec_state_without_the_fields_is_unknown_not_ready (tests.test_spec_flow.LaneSpecState) ... ok
+test_no_spec_means_neither_verified_nor_accepted (tests.test_spec_flow.LaneSpecState) ... ok
+test_same_reviewer_for_both_roles_is_not_accepted (tests.test_spec_flow.LaneSpecState) ... ok
+test_status_reports_spec_acceptance_separately_from_completion (tests.test_spec_flow.LaneSpecState) ... ok
+test_killed_after_the_real_append_then_a_fresh_retry_leaves_one_note (tests.test_lane_r2.CheckpointExactlyOnceTests) ... ok
+test_two_concurrent_checkpoints_leave_one_note_and_one_comment (tests.test_lane_r2.CheckpointExactlyOnceTests) ... ok
+test_four_concurrent_writers_with_one_key_leave_one_row (tests.test_lane_r2.WalNoteOpKeyTests) ... ok
+test_same_key_twice_writes_one_row_and_answers_its_id (tests.test_lane_r2.WalNoteOpKeyTests) ... ok
+test_without_a_key_nothing_changes_and_a_bad_key_is_refused (tests.test_lane_r2.WalNoteOpKeyTests) ... ok
+test_two_concurrent_checkpoints_leave_one_note_and_one_comment (tests.test_lane_r2.CheckpointExactlyOnceTests) ... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 22.346s
+
+OK
+

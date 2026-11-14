@@ -1,0 +1,73 @@
+# Mac (python 3.9.6) worktree at 0e1bc98ac8f6c86f31823d6911e020e629d6a5ad, clean: 2 changes outside notes; tree harness 7cf3647606f9eee97b91ac0ad62267bf44e28572 tests 9254ca7d251bee85cc1bb85b48875feb0d56a563
+$ python3 -m unittest -v tests.test_lane_r2 tests.test_spec_flow.LaneSpecState tests.test_wal tests.test_wal_note_structured tests.test_wal_note_sibling_ask
+test_killed_after_the_real_append_then_a_fresh_retry_leaves_one_note (tests.test_lane_r2.CheckpointExactlyOnceTests) ... ok
+test_two_concurrent_checkpoints_leave_one_note_and_one_comment (tests.test_lane_r2.CheckpointExactlyOnceTests) ... ok
+test_killed_between_ticket_steps_then_a_fresh_retry_links_exactly_one_attachment (tests.test_lane_r2.NewCrashTests) ... ok
+test_the_attachment_effect_is_not_done_until_the_comment_linked_it (tests.test_lane_r2.NewCrashTests) ... ok
+test_a_second_holder_of_a_registered_stream_is_a_refusal_not_a_retry_loop (tests.test_lane_r2.RealTaskRegisterTests) ... ok
+test_an_ungrounded_ticket_is_refused_and_nothing_is_registered (tests.test_lane_r2.RealTaskRegisterTests) ... ok
+test_bind_of_a_stream_registered_to_another_holder_is_refused_not_partial (tests.test_lane_r2.RealTaskRegisterTests) ... ok
+test_bind_through_the_real_register_reaches_holder_bound (tests.test_lane_r2.RealTaskRegisterTests) ... ok
+test_real_register_succeeds_with_a_grounded_source_and_a_retry_is_a_duplicate (tests.test_lane_r2.RealTaskRegisterTests) ... ok
+test_four_concurrent_writers_with_one_key_leave_one_row (tests.test_lane_r2.WalNoteOpKeyTests) ... ok
+test_same_key_twice_writes_one_row_and_answers_its_id (tests.test_lane_r2.WalNoteOpKeyTests) ... ok
+test_without_a_key_nothing_changes_and_a_bad_key_is_refused (tests.test_lane_r2.WalNoteOpKeyTests) ... ok
+test_lane_spec_state_reads_acceptance_not_completion (tests.test_spec_flow.LaneSpecState) ... ok
+test_lane_spec_state_without_the_fields_is_unknown_not_ready (tests.test_spec_flow.LaneSpecState) ... ok
+test_no_spec_means_neither_verified_nor_accepted (tests.test_spec_flow.LaneSpecState) ... ok
+test_same_reviewer_for_both_roles_is_not_accepted (tests.test_spec_flow.LaneSpecState) ... ok
+test_status_reports_spec_acceptance_separately_from_completion (tests.test_spec_flow.LaneSpecState) ... ok
+test_missing_workdir_module_never_blocks_hooks (tests.test_wal.DurableWorkDirHookTests) ... ok
+test_oversized_and_malformed_inputs_stay_fast_and_silent (tests.test_wal.DurableWorkDirHookTests) ... ok
+test_pretool_kill_switch_disables_advisory (tests.test_wal.DurableWorkDirHookTests) ... ok
+test_pretool_quiet_for_ordinary_and_disposable_writes (tests.test_wal.DurableWorkDirHookTests) ... ok
+test_pretool_tmp_script_gets_non_blocking_advisory_without_logging_path (tests.test_wal.DurableWorkDirHookTests) ... ok
+test_session_prompt_and_subagent_announce_private_work_dir (tests.test_wal.DurableWorkDirHookTests) ... ok
+test_session_warns_when_scratchpad_is_still_in_tmp (tests.test_wal.DurableWorkDirHookTests) ... ok
+test_symlinked_work_dir_is_refused_and_hook_still_succeeds (tests.test_wal.DurableWorkDirHookTests) ... ok
+test_agent_named_main_cannot_alias_the_main_wal (tests.test_wal.WalTests) ... ok
+test_append_recovers_only_an_unterminated_crash_tail (tests.test_wal.WalTests) ... ok
+test_case_variants_and_uppercase_escape_cannot_alias_on_casefolded_disks (tests.test_wal.WalTests) ... ok
+test_common_secret_formats_are_rejected_in_human_notes (tests.test_wal.WalTests) ... ok
+test_concurrent_writers_leave_parseable_complete_records (tests.test_wal.WalTests) ... ok
+test_dot_session_ids_stay_inside_the_wal_directory (tests.test_wal.WalTests) ... ok
+test_escaped_id_cannot_alias_an_explicit_identifier (tests.test_wal.WalTests) ... ok
+test_existing_wal_and_directories_become_private (tests.test_wal.WalTests) ... ok
+test_hook_records_omit_working_directory_for_every_event (tests.test_wal.WalTests) ... ok
+test_human_note_omits_process_working_directory (tests.test_wal.WalTests) ... ok
+test_long_dot_id_can_receive_a_note (tests.test_wal.WalTests) ... ok
+test_missing_session_refuses_shared_wal (tests.test_wal.WalTests) ... ok
+test_open_refuses_claude_ancestor_symlink_before_write (tests.test_wal.WalTests) ... ok
+test_open_refuses_directory_moved_before_write (tests.test_wal.WalTests) ... ok
+test_open_refuses_log_file_replacement_before_write (tests.test_wal.WalTests) ... ok
+test_oversized_crash_tail_is_left_for_manual_inspection (tests.test_wal.WalTests) ... ok
+test_prompt_writes_length_without_prompt (tests.test_wal.WalTests) ... ok
+test_repeated_missing_file_is_bounded (tests.test_wal.WalTests) ... ok
+test_retry_refuses_directory_moved_during_backoff (tests.test_wal.WalTests) ... ok
+test_retry_refuses_replaced_session_directory (tests.test_wal.WalTests) ... ok
+test_retry_refuses_wals_ancestor_symlink_during_backoff (tests.test_wal.WalTests) ... ok
+test_sanitized_ids_do_not_alias_distinct_sessions (tests.test_wal.WalTests) ... ok
+test_short_prompt_has_no_dictionary_reversible_digest (tests.test_wal.WalTests) ... ok
+test_short_tool_target_has_no_dictionary_reversible_digest (tests.test_wal.WalTests) ... ok
+test_transient_missing_file_during_create_retries_without_losing_record (tests.test_wal.WalTests) ... ok
+test_write_refuses_directory_moved_before_success (tests.test_wal.WalTests) ... ok
+test_write_refuses_log_file_replacement_before_success (tests.test_wal.WalTests) ... ok
+test_write_refuses_wals_ancestor_symlink_before_success (tests.test_wal.WalTests) ... ok
+test_writers_refuse_hardlinks_and_fifos (tests.test_wal.WalTests) ... ok
+test_writers_refuse_symlinked_directories_and_files (tests.test_wal.WalTests) ... ok
+test_fail_rows_leave_verified_and_live_comes_from_deploy_records (tests.test_wal_note_structured.Status) ... ok
+test_bad_values_are_refused (tests.test_wal_note_structured.WalNote) ... ok
+test_deploy_event_needs_a_sha_or_version (tests.test_wal_note_structured.WalNote) ... ok
+test_structured_fields_land_and_goals_view_reads_them (tests.test_wal_note_structured.WalNote) ... ok
+test_control_unknown_and_other_session_asks_still_refuse (tests.test_wal_note_sibling_ask.SiblingAsk) ... ok
+test_m2_fifo_and_unbounded_files_refuse_instead_of_hanging (tests.test_wal_note_sibling_ask.SiblingAsk) ... ok
+test_main_resolves_an_ask_held_by_an_owner_wal (tests.test_wal_note_sibling_ask.SiblingAsk) ... ok
+test_red_team_owner_cannot_close_main_or_other_owner_asks (tests.test_wal_note_sibling_ask.SiblingAsk) ... ok
+test_red_team_second_resolution_is_refused_after_the_wal_grows_past_4_mib (tests.test_wal_note_sibling_ask.SiblingAsk) ... ok
+test_red_team_symlinked_sibling_wal_does_not_reach_another_session (tests.test_wal_note_sibling_ask.SiblingAsk) ... ok
+
+----------------------------------------------------------------------
+Ran 65 tests in 47.796s
+
+OK
+exit 0
