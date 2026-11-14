@@ -124,8 +124,85 @@ class CoorddTest(unittest.TestCase):
         self.assertEqual(self.con.execute("SELECT state FROM tasks WHERE id=?", (t["id"],)).fetchone()[0], "failed")
         self.assertEqual(len(calls), 2)
 
+    def test_device_login_rules(self):
+        c, t0 = self.con, 1_000_000.0
+        a = coordd.login_start(c, "browser A", now=t0)
+        b = coordd.login_start(c, "browser B", now=t0)
+        self.assertRegex(a["code"], coordd.CODE_RE)
+        self.assertEqual(coordd.login_poll(c, a["poll"], now=t0 + 1), ("pending", None))
+        for bad in ("", "AAAA-AAA", a["code"].replace("-", ""), "0O1I-LU00", "ZZZZ-ZZZZ"):
+            with self.assertRaises(ValueError):  # malformed, look-alike characters, or simply not issued
+                coordd.login_approve(c, bad, "t", now=t0 + 2)
+        self.assertEqual(coordd.login_approve(c, a["code"].lower(), "t", now=t0 + 2)["client"], "browser A")
+        with self.assertRaises(ValueError):  # a code is approved once
+            coordd.login_approve(c, a["code"], "t", now=t0 + 3)
+        # Only the browser that started the login holds its poll secret: B's poll and a guess get nothing.
+        self.assertEqual(coordd.login_poll(c, b["poll"], now=t0 + 3), ("pending", None))
+        self.assertEqual(coordd.login_poll(c, "guess", now=t0 + 3), ("gone", None))
+        state, sid = coordd.login_poll(c, a["poll"], now=t0 + 4)
+        self.assertEqual(state, "approved")
+        self.assertTrue(coordd.session_ok(c, sid, now=t0 + 5))
+        self.assertEqual(coordd.login_poll(c, a["poll"], now=t0 + 6), ("gone", None))  # consumed: second poll gets nothing
+        self.assertFalse(coordd.session_ok(c, sid, now=t0 + coordd.SESSION_TTL_S + 10))
+        self.assertFalse(coordd.session_ok(c, "", now=t0))
+        self.assertNotIn(sid, [r[0] for r in c.execute("SELECT sid_hash FROM sessions")])  # stored hashed
+        with self.assertRaises(ValueError):  # B's code expired before anyone approved it
+            coordd.login_approve(c, b["code"], "t", now=t0 + coordd.LOGIN_TTL_S + 1)
+        self.assertEqual(coordd.login_poll(c, b["poll"], now=t0 + coordd.LOGIN_TTL_S + 1), ("gone", None))
+
+    def test_device_login_start_is_rate_limited(self):
+        t0 = 2_000_000.0
+        for i in range(coordd.LOGIN_STARTS_PER_MIN):
+            coordd.login_start(self.con, "x", now=t0 + i)
+        with self.assertRaises(PermissionError):
+            coordd.login_start(self.con, "x", now=t0 + 10)
+
+    def test_http_browser_session(self):
+        coordd.Handler.root, coordd.Handler.token = self.root, (self.root / "token").read_text().strip()
+        coordd.Handler.hosts = {"127.0.0.1", "localhost"}
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), coordd.Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+        def call(path, body=None, cookie=None, token=None, origin=None):
+            h = {"Content-Type": "application/json"}
+            if cookie:
+                h["Cookie"] = cookie
+            if token:
+                h["Authorization"] = "Bearer " + token
+            if origin:
+                h["Origin"] = origin
+            req = urllib.request.Request(base + path, headers=h, data=json.dumps(body).encode() if body is not None else None)
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status, json.loads(r.read()), r.headers.get("Set-Cookie")
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read() or b"{}"), None
+        try:
+            _, login, _ = call("/api/login/start", {})
+            self.assertEqual(call("/api/login/poll", {"poll": login["poll"]})[1], {"state": "pending"})
+            self.assertEqual(call("/api/login/approve", {"code": login["code"]})[0], 401)  # nobody signed in
+            self.assertEqual(call("/api/login/approve", {"code": login["code"]}, token=coordd.Handler.token)[0], 200)
+            code, body, setc = call("/api/login/poll", {"poll": login["poll"]})
+            self.assertEqual(body, {"state": "approved"})
+            self.assertIn("HttpOnly", setc)
+            self.assertIn("SameSite=Strict", setc)
+            cookie = setc.split(";")[0]
+            self.assertEqual(call("/api/status", cookie=cookie)[0], 200)
+            self.assertEqual(call("/api/chat", {"text": "help"}, cookie=cookie, origin=base)[0], 200)
+            self.assertEqual(call("/api/chat", {"text": "help"}, cookie=cookie, origin="https://evil.example")[0], 401)
+            # A browser session cannot approve other sign-ins or list them: that stays a host action.
+            _, second, _ = call("/api/login/start", {})
+            self.assertEqual(call("/api/login/approve", {"code": second["code"]}, cookie=cookie)[0], 403)
+            self.assertEqual(call("/api/logins", cookie=cookie)[0], 403)
+            self.assertEqual(call("/api/logout-all", {"all": True}, token=coordd.Handler.token)[0], 200)
+            self.assertEqual(call("/api/status", cookie=cookie)[0], 401)
+        finally:
+            httpd.shutdown()
+
     def test_http_needs_token_and_loopback_host(self):
         coordd.Handler.root, coordd.Handler.token = self.root, (self.root / "token").read_text().strip()
+        coordd.Handler.hosts = {"127.0.0.1", "localhost"}
         httpd = ThreadingHTTPServer(("127.0.0.1", 0), coordd.Handler)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{httpd.server_address[1]}"

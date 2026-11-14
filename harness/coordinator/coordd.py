@@ -8,6 +8,7 @@ ledger, the routing decision and the report duty, so none of them depend on a ch
     coordd.py submit --kind K --text T [--ticket REF] [--key KEY]
     coordd.py chat TEXT...              direct chat with the coordinator
     coordd.py status | tasks | show ID
+    coordd.py logins | approve CODE | logout-all     browser sign-ins (device approval)
 
 Design rules (same as the ahc spec: deterministic control plane, LLMs only as bounded workers):
 - No LLM call decides routing, retries or reporting. `route()` is a table.
@@ -15,7 +16,8 @@ Design rules (same as the ahc spec: deterministic control plane, LLMs only as bo
   action (intent) and updated after it (readback). A finished task is never run again.
 - On start, tasks left `running` by a dead process are requeued once (attempt budget 2), then failed.
 - A task that no lane can serve fails with the reason. It is never dropped silently.
-- Listens on 127.0.0.1 only. Every request needs the bearer token in STATE/token (0600).
+- Listens on 127.0.0.1 only. The CLI authenticates with the token in STATE/token (0600), which never leaves the
+  host. A browser signs in by device approval: it shows a code, `coordd.py approve CODE` on the host approves it.
 
 State lives in ~/.agent-harness/coordinator (override with COORD_HOME): ledger.sqlite, token, runs/<id>/.
 """
@@ -23,6 +25,7 @@ State lives in ~/.agent-harness/coordinator (override with COORD_HOME): ledger.s
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import os
@@ -51,6 +54,12 @@ LANE_CAPS = {"codex-pool-build": {"answer"}}
 # Lanes whose rerun cannot repeat an external effect (read-only; the ticket report is an upsert by task id).
 REPLAY_SAFE = ("builtin-status", "codex-pool-build", "chat")
 TERMINAL = ("done", "failed", "blocked", "outcome-unknown")
+LOGIN_TTL_S = 300          # a shown code can be approved for this long
+SESSION_TTL_S = 12 * 3600  # an approved browser session
+LOGIN_MAX_PENDING = 10     # unapproved logins kept at once
+LOGIN_STARTS_PER_MIN = 6
+CODE_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789"  # no 0/O, 1/I/L, U: look-alikes cannot be confused
+CODE_RE = re.compile(r"^[A-HJKMNP-TV-Z2-9]{4}-[A-HJKMNP-TV-Z2-9]{4}$")
 TICKET_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}#[0-9]{1,9}$")
 KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{3,80}$")
 ID_RE = re.compile(r"^t-[0-9a-f]{12}$")
@@ -91,6 +100,11 @@ def db(root: Path) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS effects(
             key TEXT PRIMARY KEY, task TEXT NOT NULL, effect TEXT NOT NULL, state TEXT NOT NULL,
             detail TEXT, created TEXT NOT NULL, updated TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS logins(
+            code TEXT PRIMARY KEY, poll_hash TEXT NOT NULL, state TEXT NOT NULL, client TEXT NOT NULL,
+            created REAL NOT NULL, approved_by TEXT);
+        CREATE TABLE IF NOT EXISTS sessions(
+            sid_hash TEXT PRIMARY KEY, created REAL NOT NULL, expires REAL NOT NULL, client TEXT NOT NULL, code TEXT);
         CREATE TABLE IF NOT EXISTS events(
             n INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, task TEXT, what TEXT NOT NULL, detail TEXT);
     """)
@@ -117,6 +131,95 @@ def mc_drop(task_id: str, what: str, summary: str, ticket: str | None, severity:
             f.write(json.dumps(ev) + "\n")
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------- web login (device approval)
+# The browser never receives or types a secret that exists anywhere else. It shows a short code; someone who is
+# already authenticated on the host approves that exact code; only the browser that started the login (it alone
+# holds the poll secret) receives the session cookie. Codes expire, are single use, and starts are rate limited.
+def _h(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def login_start(con, client: str, now: float | None = None) -> dict:
+    now = time.time() if now is None else now
+    con.execute("DELETE FROM logins WHERE created < ?", (now - LOGIN_TTL_S,))
+    con.execute("DELETE FROM sessions WHERE expires < ?", (now,))
+    pending = con.execute("SELECT COUNT(*) FROM logins WHERE state='pending'").fetchone()[0]
+    recent = con.execute("SELECT COUNT(*) FROM logins WHERE created > ?", (now - 60,)).fetchone()[0]
+    if pending >= LOGIN_MAX_PENDING or recent >= LOGIN_STARTS_PER_MIN:
+        raise PermissionError("too many sign-in attempts; wait a minute")
+    raw = "".join(secrets.choice(CODE_ALPHABET) for _ in range(8))
+    code, poll = raw[:4] + "-" + raw[4:], secrets.token_urlsafe(32)
+    con.execute("INSERT INTO logins(code,poll_hash,state,client,created) VALUES(?,?,?,?,?)",
+                (code, _h(poll), "pending", client[:300], now))
+    log_event(con, None, "login-started", client[:300])
+    return {"code": code, "poll": poll, "expires_in": LOGIN_TTL_S}
+
+
+def login_pending(con, now: float | None = None) -> list[dict]:
+    now = time.time() if now is None else now
+    rows = con.execute("SELECT code, client, created FROM logins WHERE state='pending' AND created >= ? ORDER BY created",
+                       (now - LOGIN_TTL_S,))
+    return [{"code": r["code"], "client": r["client"], "age_s": int(now - r["created"])} for r in rows]
+
+
+def login_approve(con, code: str, approver: str, now: float | None = None) -> dict:
+    now = time.time() if now is None else now
+    code = (code or "").strip().upper()
+    if not CODE_RE.match(code):
+        raise ValueError("a code looks like ABCD-EFGH")
+    cur = con.execute("UPDATE logins SET state='approved', approved_by=? WHERE code=? AND state='pending' AND created >= ?",
+                      (approver[:80], code, now - LOGIN_TTL_S))
+    if cur.rowcount != 1:
+        raise ValueError("no pending sign-in has that code (expired, already used, or mistyped)")
+    row = con.execute("SELECT client FROM logins WHERE code=?", (code,)).fetchone()
+    log_event(con, None, "login-approved", f"code={code} by={approver[:80]} client={row['client']}")
+    return {"approved": code, "client": row["client"]}
+
+
+def login_poll(con, poll: str, now: float | None = None) -> tuple[str, str | None]:
+    """('pending'|'approved'|'gone', session id or None). The approved login is consumed here, exactly once."""
+    now = time.time() if now is None else now
+    row = con.execute("SELECT code, state, client, created FROM logins WHERE poll_hash=?", (_h(poll or ""),)).fetchone()
+    if not row or row["created"] < now - LOGIN_TTL_S:
+        return "gone", None
+    if row["state"] == "pending":
+        return "pending", None
+    if row["state"] != "approved":
+        return "gone", None
+    cur = con.execute("UPDATE logins SET state='used' WHERE code=? AND state='approved'", (row["code"],))
+    if cur.rowcount != 1:
+        return "gone", None
+    sid = secrets.token_urlsafe(32)
+    con.execute("INSERT INTO sessions(sid_hash,created,expires,client,code) VALUES(?,?,?,?,?)",
+                (_h(sid), now, now + SESSION_TTL_S, row["client"], row["code"]))
+    log_event(con, None, "session-created", f"code={row['code']}")
+    return "approved", sid
+
+
+def session_ok(con, sid: str, now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    if not sid:
+        return False
+    return con.execute("SELECT 1 FROM sessions WHERE sid_hash=? AND expires > ?", (_h(sid), now)).fetchone() is not None
+
+
+def allowed_hosts() -> set[str]:
+    """Loopback names plus this machine's own private-network name, read from the network daemon at start.
+    Nothing is written to a file. COORD_ALLOWED_HOSTS can add names (comma list)."""
+    hosts = {"127.0.0.1", "localhost"}
+    hosts |= {h.strip().lower() for h in (os.environ.get("COORD_ALLOWED_HOSTS") or "").split(",") if h.strip()}
+    ts = shutil.which("tailscale")
+    if ts:
+        try:
+            out = subprocess.run([ts, "status", "--json", "--peers=false"], capture_output=True, text=True, timeout=10).stdout
+            name = (json.loads(out or "{}").get("Self") or {}).get("DNSName") or ""
+            if name:
+                hosts.add(name.rstrip(".").lower())
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    return hosts
 
 
 # ---------------------------------------------------------------- intake
@@ -431,19 +534,30 @@ button:focus-visible,input:focus-visible{outline:3px solid var(--acc);outline-of
 </style></head><body><main>
 <h1>Coordinator (host service)</h1>
 <p class="me">Direct chat with the coordinator process on this host. Commands: status, tasks, show &lt;id&gt;, run &lt;task&gt; [ticket:slug#n], help.</p>
-<div id="auth"><label for="tok">Access token (from <code>coordd.py token</code> on the host; kept in this tab only)</label>
-<form id="tf"><input id="tok" type="password" autocomplete="off" required><button>Unlock</button></form></div>
+<div id="auth" class="card" role="status"><p id="authmsg">Checking sign-in...</p>
+<p id="codebox" hidden>Sign-in code: <strong id="code" style="font-size:22px;letter-spacing:2px"></strong></p>
+<p id="authhelp" class="me" hidden>Ask someone already signed in to approve this exact code (on the host: <code>coordd.py approve CODE</code>). Check that the code matches before approving. It expires in 5 minutes and works once, for this browser only.</p>
+<button id="again" hidden>Get a new code</button></div>
 <div id="log" aria-live="polite"></div>
 <form id="cf" hidden><label for="msg" style="position:absolute;left:-9999px">Message</label>
 <input id="msg" type="text" maxlength="4000" placeholder="Message the coordinator" required><button>Send</button></form>
 <script>
-let tok="";const log=document.getElementById("log");
+const log=document.getElementById("log");const $=i=>document.getElementById(i);
 function add(cls,t){const d=document.createElement("pre");d.className=cls;d.textContent=t;log.appendChild(d);d.scrollIntoView()}
-async function api(path,body){const r=await fetch(path,{method:body?"POST":"GET",headers:{"Authorization":"Bearer "+tok,"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined});
+async function api(path,body){const r=await fetch(path,{method:body?"POST":"GET",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined});
  if(!r.ok)throw new Error((await r.json().catch(()=>({}))).error||("HTTP "+r.status));return r.json()}
-document.getElementById("tf").onsubmit=async e=>{e.preventDefault();tok=document.getElementById("tok").value.trim();
- try{const s=await api("/api/status");document.getElementById("auth").hidden=true;document.getElementById("cf").hidden=false;add("card",s.text);document.getElementById("msg").focus()}
- catch(x){add("err","Could not unlock: "+x.message)}};
+async function enter(){const s=await api("/api/status");$("auth").hidden=true;$("cf").hidden=false;add("card",s.text);$("msg").focus()}
+async function signin(){$("again").hidden=true;
+ try{await enter();return}catch(x){}
+ let L;try{L=await api("/api/login/start",{})}catch(x){$("authmsg").textContent="Cannot start sign-in: "+x.message;$("again").hidden=false;return}
+ $("authmsg").textContent="Not signed in on this browser.";$("code").textContent=L.code;$("codebox").hidden=false;$("authhelp").hidden=false;
+ const end=Date.now()+L.expires_in*1000;
+ while(Date.now()<end){await new Promise(r=>setTimeout(r,2000));
+  let r;try{r=await api("/api/login/poll",{poll:L.poll})}catch(x){continue}
+  if(r.state==="approved"){$("codebox").hidden=true;$("authhelp").hidden=true;try{await enter()}catch(x){$("authmsg").textContent="Signed in, but the page could not load: "+x.message}return}
+  if(r.state==="gone")break}
+ $("authmsg").textContent="That code expired or was already used.";$("codebox").hidden=true;$("authhelp").hidden=true;$("again").hidden=false;$("again").focus()}
+$("again").onclick=signin;signin();
 document.getElementById("cf").onsubmit=async e=>{e.preventDefault();const m=document.getElementById("msg");const text=m.value.trim();if(!text)return;m.value="";add("me","you: "+text);
  const btn=e.target.querySelector("button");btn.disabled=true;
  try{const t=await api("/api/chat",{text,key:"web-"+crypto.randomUUID()});let cur=t;
@@ -470,16 +584,52 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if self.set_cookie:
+            self.send_header("Set-Cookie", self.set_cookie)
+            self.set_cookie = None
         self.end_headers()
         self.wfile.write(body)
 
-    def _authed(self) -> bool:
+    hosts: set = {"127.0.0.1", "localhost"}
+    set_cookie: str | None = None
+
+    def _bearer(self) -> bool:
         got = self.headers.get("Authorization", "")
         return got.startswith("Bearer ") and hmac.compare_digest(got[7:].strip(), self.token)
 
+    def _sid(self) -> str:
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == "coord_sid":
+                return value
+        return ""
+
+    def _authed(self) -> bool:
+        """The host token (CLI) or an approved browser session. A session POST must also come from this page:
+        the cookie is SameSite=Strict and the Origin, when sent, must name the host that was asked."""
+        if self._bearer():
+            return True
+        if not session_ok(db(self.root), self._sid()):
+            return False
+        origin = self.headers.get("Origin")
+        if self.command == "POST" and origin is not None:
+            if origin.split("://", 1)[-1].rsplit(":", 1)[0].lower() != self._host():
+                return False
+        return True
+
+    def _host(self) -> str:
+        return (self.headers.get("Host") or "").rsplit(":", 1)[0].lower()
+
     def _host_ok(self) -> bool:
-        host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
-        return host in ("127.0.0.1", "localhost")  # DNS-rebinding guard
+        return self._host() in self.hosts  # DNS-rebinding guard: only names this service is published under
+
+    def _client(self) -> str:
+        """Shown to the approver so a code started by someone else can be recognized. Display only, never auth."""
+        who = self.headers.get("Tailscale-User-Login") or "unknown user"
+        via = self.headers.get("X-Forwarded-For") or self.client_address[0]
+        agent = (self.headers.get("User-Agent") or "unknown browser")[:120]
+        return f"{who} from {via} using {agent}"
 
     def do_GET(self):  # noqa: N802
         if not self._host_ok():
@@ -489,8 +639,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/":
             return self._send(200, PAGE, "text/html; charset=utf-8")
         if not self._authed():
-            return self._send(401, {"error": "token required"})
+            return self._send(401, {"error": "sign-in required"})
         con = db(self.root)
+        if self.path == "/api/logins":
+            return self._send(200, {"pending": login_pending(con)}) if self._bearer() else self._send(403, {"error": "host CLI only"})
         if self.path == "/api/status":
             return self._send(200, {"text": lane_status(con)})
         if self.path == "/api/tasks":
@@ -505,8 +657,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         if not self._host_ok():
             return self._send(403, {"error": "bad host"})
-        if not self._authed():
-            return self._send(401, {"error": "token required"})
         if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
             return self._send(415, {"error": "json only"})
         try:
@@ -517,6 +667,29 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ValueError("object expected")
             con = db(self.root)
+            if self.path == "/api/login/start":  # the only unauthenticated writes: start and poll
+                try:
+                    return self._send(200, login_start(con, self._client()))
+                except PermissionError as exc:
+                    return self._send(429, {"error": str(exc)})
+            if self.path == "/api/login/poll":
+                state, sid = login_poll(con, str(body.get("poll") or ""))
+                if sid:
+                    secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" or self._host() not in ("127.0.0.1", "localhost") else ""
+                    self.set_cookie = f"coord_sid={sid}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL_S}{secure}"
+                return self._send(200, {"state": state})
+            if not self._authed():
+                return self._send(401, {"error": "sign-in required"})
+            if self.path == "/api/login/approve":
+                if not self._bearer():  # a browser session cannot mint another session; approval is a host action
+                    return self._send(403, {"error": "approve from the host CLI"})
+                return self._send(200, login_approve(con, str(body.get("code") or ""), "host-cli"))
+            if self.path == "/api/logout-all":
+                if not self._bearer():
+                    return self._send(403, {"error": "host CLI only"})
+                con.execute("DELETE FROM sessions")
+                con.execute("DELETE FROM logins")
+                return self._send(200, {"ok": True})
             if self.path == "/api/chat":
                 task = submit(con, "chat", str(body.get("text") or ""), None, "chat", body.get("key"))
             elif self.path == "/api/tasks":
@@ -534,6 +707,7 @@ def cmd_serve(args) -> int:
     con = db(root)
     recover(con)
     Handler.root, Handler.token = root, (root / "token").read_text().strip()
+    Handler.hosts = allowed_hosts()
     try:
         httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     except OSError as exc:
@@ -594,15 +768,26 @@ def main(argv=None) -> int:
     s.add_argument("--wait", type=int, default=0)
     c = sub.add_parser("chat")
     c.add_argument("text", nargs="+")
-    for name in ("status", "tasks", "token"):
+    for name in ("status", "tasks", "logins", "logout-all"):
         sub.add_parser(name)
+    apv = sub.add_parser("approve", help="approve a sign-in code shown in a browser; check the client line first")
+    apv.add_argument("code")
     sh = sub.add_parser("show")
     sh.add_argument("id")
     args = ap.parse_args(argv)
     if args.cmd == "serve":
         return cmd_serve(args)
-    if args.cmd == "token":  # for the web page; printed to the caller's own terminal only
-        print((ensure_home() / "token").read_text().strip())
+    if args.cmd == "logins":
+        for r in client(args, "/api/logins")["pending"]:
+            print(f"{r['code']}  started {r['age_s']}s ago  by {r['client']}")
+        return 0
+    if args.cmd == "approve":
+        r = client(args, "/api/login/approve", {"code": args.code})
+        print(f"approved {r['approved']} for: {r['client']}")
+        return 0
+    if args.cmd == "logout-all":
+        client(args, "/api/logout-all", {"all": True})
+        print("all browser sessions and pending sign-ins removed")
         return 0
     if args.cmd == "submit":
         t = client(args, "/api/tasks", {"kind": args.kind, "text": args.text, "ticket": args.ticket,
