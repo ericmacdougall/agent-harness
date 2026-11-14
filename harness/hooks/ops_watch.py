@@ -151,6 +151,42 @@ RUN_MAX_BYTES = 64 * 1024 * 1024  # default per-stream bound for every runner ca
 RUN_OVERFLOW_RC = -1000  # sentinel return code: output passed max_bytes; the child was killed and reaped
 
 
+def _read_capped(sel, data, deadline, max_bytes, argv, timeout, read=None, write=None):
+    """Drive the selector until every stream is at EOF: (stdout bytes, overflow). Overflow is irreversible: the
+    moment either stream passes max_bytes it returns (out, True) without handling the rest of the batch, so a
+    later small chunk on the other stream cannot hide it. Raises TimeoutExpired at the deadline. read/write are
+    injectable so the event order can be tested without real streams."""
+    read, write = read or os.read, write or os.write
+    out, err, offset = bytearray(), 0, 0
+    while sel.get_map():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        for key, _ in sel.select(left):
+            if key.data == "in":
+                try:
+                    offset += write(key.fd, data[offset:offset + 512])
+                except BrokenPipeError:
+                    offset = len(data)
+                if offset >= len(data):
+                    sel.unregister(key.fileobj)
+                    key.fileobj.close()
+                continue
+            chunk = read(key.fd, 65536)
+            if not chunk:
+                sel.unregister(key.fileobj)
+                continue
+            if key.data == "out":
+                out += chunk
+                if len(out) > max_bytes:
+                    return out, True
+            else:
+                err += len(chunk)  # discarded, but counted against the same cap
+                if err > max_bytes:
+                    return out, True
+    return out, False
+
+
 def run(argv, timeout, stdin=None, env=None, cwd=None, max_bytes=RUN_MAX_BYTES):
     """Default runner: (returncode, stdout). Raises subprocess.TimeoutExpired; stderr is discarded.
 
@@ -164,7 +200,6 @@ def run(argv, timeout, stdin=None, env=None, cwd=None, max_bytes=RUN_MAX_BYTES):
     p = subprocess.Popen(argv, stdin=subprocess.PIPE if data is not None else None, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, env=env, cwd=cwd)
     deadline = time.monotonic() + timeout
-    out, err, offset, overflow = bytearray(), 0, 0, False
     sel = selectors.DefaultSelector()
     try:
         sel.register(p.stdout, selectors.EVENT_READ, "out")
@@ -174,30 +209,7 @@ def run(argv, timeout, stdin=None, env=None, cwd=None, max_bytes=RUN_MAX_BYTES):
                 sel.register(p.stdin, selectors.EVENT_WRITE, "in")
             else:
                 p.stdin.close()
-        while sel.get_map() and not overflow:
-            left = deadline - time.monotonic()
-            if left <= 0:
-                raise subprocess.TimeoutExpired(argv, timeout)
-            for key, _ in sel.select(left):
-                if key.data == "in":
-                    try:
-                        offset += os.write(key.fd, data[offset:offset + 512])
-                    except BrokenPipeError:
-                        offset = len(data)
-                    if offset >= len(data):
-                        sel.unregister(key.fileobj)
-                        key.fileobj.close()
-                    continue
-                chunk = os.read(key.fd, 65536)
-                if not chunk:
-                    sel.unregister(key.fileobj)
-                    continue
-                if key.data == "out":
-                    out += chunk
-                    overflow = len(out) > max_bytes
-                else:
-                    err += len(chunk)  # discarded, but counted against the same cap
-                    overflow = err > max_bytes
+        out, overflow = _read_capped(sel, data, deadline, max_bytes, argv, timeout)
         if overflow:
             p.kill()
             p.wait()

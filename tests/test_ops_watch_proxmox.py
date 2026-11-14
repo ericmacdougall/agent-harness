@@ -1,6 +1,7 @@
 """ops_watch proxmox_pool check (goodqa#15771): thresholds, growth, overcommit, fail-closed UNKNOWN, read-only command.
 Recorded fixture output only; stdlib only; no network."""
 import json
+import os
 import re
 import subprocess
 import sys
@@ -8,6 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
@@ -682,6 +684,97 @@ class BoundedRunTests(unittest.TestCase):
         self.assertEqual(runner.kw.get("max_bytes"), 1048576)
         self.assertIn(UNKNOWN, got)
         self.assertIn("output over the size limit", got[UNKNOWN]["message"])
+
+
+class FakeKey:
+    def __init__(self, fileobj, data, fd):
+        self.fileobj, self.data, self.fd = fileobj, data, fd
+
+
+class FakeSelector:
+    """A scripted selector: each select() returns the next batch of (stream, chunk) events, in that order, and
+    stages the chunks for the fake read. No real fd is polled and no process is signalled."""
+
+    def __init__(self, batches):
+        self.batches, self.keys, self.staged, self.reads = [list(b) for b in batches], {}, {}, []
+
+    def register(self, fileobj, events, data):
+        self.keys[data] = FakeKey(fileobj, data, 9000 + len(self.keys))
+
+    def unregister(self, fileobj):
+        self.keys = {d: k for d, k in self.keys.items() if k.fileobj is not fileobj}
+
+    def get_map(self):
+        return self.keys if self.batches else {}
+
+    def select(self, timeout=None):
+        batch = self.batches.pop(0)
+        for name, chunk in batch:
+            self.staged.setdefault(self.keys[name].fd, []).append(chunk)
+        return [(self.keys[name], 1) for name, _ in batch]
+
+    def read(self, fd, n):
+        self.reads.append(fd)
+        return self.staged[fd].pop(0)
+
+    def close(self):
+        pass
+
+
+class OverflowOrderTests(unittest.TestCase):
+    """PR review r5 F1: the overflow flag was reassigned on every chunk, so in one select batch a small chunk on
+    the other stream reset an overflow seen just before it. Overflow must be irreversible and stop the batch at
+    once, in either order. Deterministic: a scripted selector and read, no real streams, no signals."""
+    CAP = 1000
+    EOF = [("out", b""), ("err", b"")]
+
+    def read_capped(self, batches):
+        sel = FakeSelector(batches)
+        sel.register(object(), 1, "out")
+        sel.register(object(), 1, "err")
+        out, overflow = ow._read_capped(sel, None, time.monotonic() + 30, self.CAP, ["x"], 30, read=sel.read)
+        return out, overflow, sel
+
+    def test_stdout_overflow_then_small_stderr_in_one_batch_stays_overflow(self):
+        _, overflow, sel = self.read_capped([[("out", b"x" * (self.CAP + 1)), ("err", b"e")], self.EOF])
+        self.assertTrue(overflow)
+        self.assertEqual(len(sel.reads), 1)  # stopped at once: the stderr chunk was never read
+
+    def test_stderr_overflow_then_small_stdout_in_one_batch_stays_overflow(self):
+        _, overflow, sel = self.read_capped([[("err", b"e" * (self.CAP + 1)), ("out", b"o")], self.EOF])
+        self.assertTrue(overflow)
+        self.assertEqual(len(sel.reads), 1)
+
+    def test_overflow_across_batches_and_exact_cap_is_not_overflow(self):
+        _, overflow, _ = self.read_capped([[("out", b"x" * 600)], [("err", b"e" * 10), ("out", b"x" * 401)], self.EOF])
+        self.assertTrue(overflow)
+        out, overflow, _ = self.read_capped([[("out", b"x" * self.CAP), ("err", b"e" * self.CAP)], self.EOF])
+        self.assertFalse(overflow)
+        self.assertEqual(len(out), self.CAP)
+
+    def run_with(self, batches):
+        """run() end to end with the scripted selector in place of the real one; the Popen object is recorded so
+        reaping is checked from its returncode."""
+        sel, procs = FakeSelector(batches), []
+        real_read, real_popen = os.read, subprocess.Popen
+
+        def popen(*a, **kw):
+            procs.append(real_popen(*a, **kw))
+            return procs[-1]
+        argv = [sys.executable, "-c", "import time; time.sleep(5)"]
+        with mock.patch("selectors.DefaultSelector", lambda: sel), mock.patch("subprocess.Popen", popen), \
+                mock.patch("os.read", lambda fd, n: sel.read(fd, n) if fd in sel.staged else real_read(fd, n)):
+            got = ow.run(argv, 30, max_bytes=self.CAP)
+        return got, procs[0]
+
+    def test_run_returns_overflow_with_empty_output_in_either_order(self):
+        for first, second in (("out", "err"), ("err", "out")):
+            with self.subTest(first=first):
+                start = time.monotonic()
+                got, proc = self.run_with([[(first, b"z" * (self.CAP + 1)), (second, b"s")], self.EOF])
+                self.assertEqual(got, (ow.RUN_OVERFLOW_RC, ""))
+                self.assertIsNotNone(proc.returncode)  # waited for: reaped, not left as a zombie
+                self.assertLess(time.monotonic() - start, 4)  # stopped, not waited out
 
 
 class RealFormatTests(Base):
