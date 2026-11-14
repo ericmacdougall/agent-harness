@@ -29,31 +29,52 @@ def pvesm(total_g=916, used_g=848, avail_g=56, status="active", name="local"):
             f"   {100.0 * used_g / total_g:.2f}%\n")
 
 
-QM = {
-    100: "scsi0: local:100/vm-100-disk-0.qcow2,size=664G\nscsi1: other:100/vm-100-disk-1.raw,size=999G\nname: t2-dev\n",
-    102: "scsi0: local:102/vm-102-disk-0.raw,discard=on,size=200G\nname: gq-prod-app\n",
-    103: "scsi0: local:103/vm-103-disk-0.raw,discard=on,size=400G\nscsi1: local:103/vm-103-disk-1.raw,size=100G\n",
-    105: "scsi0: local:105/vm-105-disk-0.raw,size=16G\n",
-    106: "scsi0: local:106/vm-106-disk-0.raw,size=40G\n",
-    108: "scsi0: local:108/vm-108-disk-0.qcow2,size=60G\n",
-    109: "scsi0: local:109/vm-109-disk-0.raw,size=16G\n",
-    15662: "scsi0: local:15662/vm-15662-disk-0.qcow2,size=40G\nide2: none,media=cdrom\n",
-}  # local disks sum to 1536G; the 999G disk is on another storage and must not count
+VOLS = {
+    100: [("vm-100-disk-0.qcow2", 664)],
+    102: [("vm-102-disk-0.raw", 200)],
+    103: [("vm-103-disk-0.raw", 400), ("vm-103-disk-1.raw", 100)],
+    105: [("vm-105-disk-0.raw", 16)],
+    106: [("vm-106-disk-0.raw", 40)],
+    108: [("vm-108-disk-0.qcow2", 60)],
+    109: [("vm-109-disk-0.raw", 16)],
+    15662: [("vm-15662-disk-0.qcow2", 40)],
+}  # guest volumes on local, GiB: 1536 in all
+# non-guest content on the same storage never counts as provisioned, even a backup that names a VM
+OTHER_ROWS = ("local:iso/noble-server-cloudimg-amd64.img             iso     iso          625256960\n"
+              "local:snippets/dev-user.yaml                          snippet snippets           635\n"
+              "local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst tzst    vztmpl       123731847\n"
+              "local:backup/vzdump-qemu-103-2026_11_01-00_00_00.vma.zst vma.zst backup 999999999999 103\n")
+VOLS_HEADER = "Volid                                                 Format  Type              Size VMID\n"
 DU = {100: 653, 102: 15, 103: 28, 105: 8, 106: 9, 108: 57, 109: 5, 15662: 13}
 
 
-def probe(pvesm_text=None, qm=None, du=None, end=True, extra="", rc=None, list_rc=0):
-    """rc maps a VM id to its qm config exit status (default 0); list_rc is qm list's, None drops that line."""
-    qm = QM if qm is None else qm
+def vol_row(vm, name, size, kind="images"):
+    """One `pvesm list` row as recorded live (PVE 9.2): Size in bytes, VMID last. size may be a raw string."""
+    fmt = name.rsplit(".", 1)[-1]
+    size = int(size * GIB) if isinstance(size, (int, float)) else size
+    return f"local:{vm}/{name:<45} {fmt:<7} {kind:<12} {size:>14} {vm}\n"
+
+
+def vols_text(vols=None, rows=""):
+    vols = VOLS if vols is None else vols
+    return VOLS_HEADER + "".join(vol_row(vm, n, g) for vm, disks in vols.items() for n, g in disks) + OTHER_ROWS + rows
+
+
+def files_text(vols=None, extra=()):
+    vols = VOLS if vols is None else vols
+    names = [f"/var/lib/vz/images/{vm}/{n}" for vm, disks in vols.items() for n, _ in disks] + list(extra)
+    return "".join(n + "\n" for n in names)
+
+
+def probe(pvesm_text=None, vols=None, du=None, end=True, extra="", vols_rc=0, files_rc=0, vols_out=None,
+          files_out=None):
+    """The fixed script's output. vols/files default to the VOLS fixture; vols_rc/files_rc None drops that ##RC."""
     du = DU if du is None else du
-    rc = rc or {}
-    out = "##PVESM\n" + (pvesm() if pvesm_text is None else pvesm_text) + "##RC PVESM 0\n##QM\n"
-    if list_rc is not None:
-        out += f"##RC LIST {list_rc}\n"
-    for vm, cfg in qm.items():
-        out += f"##VM {vm}\n{cfg}" + ("name: vm\n" if "scsi" in cfg and "name:" not in cfg else "")
-        if rc.get(vm, 0) is not None:
-            out += f"##RC {vm} {rc.get(vm, 0)}\n"
+    out = "##PVESM\n" + (pvesm() if pvesm_text is None else pvesm_text) + "##RC PVESM 0\n"
+    out += "##VOLS\n" + (vols_text(vols) if vols_out is None else vols_out)
+    out += "" if vols_rc is None else f"##RC VOLS {vols_rc}\n"
+    out += "##FILES\n" + (files_text(vols) if files_out is None else files_out)
+    out += "" if files_rc is None else f"##RC FILES {files_rc}\n"
     out += "##DU\n" + "".join(f"{gib_kib(g)}\t/var/lib/vz/images/{vm}\n" for vm, g in du.items())
     return out + extra + ("##END\n" if end else "")
 
@@ -117,8 +138,8 @@ class ThresholdTests(Base):
         self.assertEqual(got[KEY]["severity"], "critical")
         self.assertNotIn(KEY, self.pool(total_g=100, used_g=70, avail_g=30))
 
-    def test_provisioned_counts_only_the_pool_storage(self):
-        self.assertEqual(self.pool()[KEY]["detail"]["provisioned_gib"], 1536.0)
+    def test_provisioned_counts_only_guest_volumes_not_iso_template_or_backup(self):
+        self.assertEqual(self.pool()[KEY]["detail"]["provisioned_gib"], 1536.0)  # OTHER_ROWS hold a 931G backup
 
 
 class UnknownTests(Base):
@@ -185,17 +206,17 @@ class UnknownTests(Base):
 
 class VmDetailTests(Base):
     def test_garbled_vm_lines_degrade_that_vm_not_the_pool_alert(self):
-        qm = {**QM, 102: "scsi0: local:102/vm-102-disk-0.raw,size=garbage\n", 103: ""}
+        vols = {**VOLS, 102: [("vm-102-disk-0.raw", "garbage")]}
         du = {k: v for k, v in DU.items() if k != 103}
-        got = self.run_check((0, probe(qm=qm, du=du)))[0][KEY]
+        got = self.run_check((0, probe(vols=vols, du=du)))[0][KEY]
         self.assertEqual(got["severity"], "high")
         self.assertIsNone(got["detail"]["vms"]["102"]["allocated_gib"])
         self.assertIsNone(got["detail"]["vms"]["103"]["actual_gib"])
         self.assertIn("102", got["detail"]["unsized_vms"])
 
-    def test_size_units(self):
-        qm = {102: "scsi0: local:102/a.raw,size=2T\nscsi1: local:102/b.raw,size=512M\nscsi2: local:102/c.raw,size=1024K\n"}
-        d = self.run_check((0, probe(qm=qm, du={102: 1})))[0][KEY]["detail"]
+    def test_sizes_are_bytes(self):
+        vols = {102: [("a.raw", str(2 * 1024 ** 4)), ("b.raw", str(512 * 1024 ** 2)), ("c.raw", str(1024 ** 2))]}
+        d = self.run_check((0, probe(vols=vols, du={102: 1})))[0][KEY]["detail"]
         self.assertEqual(d["vms"]["102"]["allocated_gib"], round(2048 + 0.5 + 1 / 1024, 2))
 
 
@@ -256,15 +277,15 @@ class RedTeamRound1Tests(Base):
     """F1 partial read is visible, F3 window to 48 h, F4 unsized/cdrom, F6 mount normalised."""
 
     def test_partial_read_below_every_threshold_still_raises_unknown_for_watched_vms(self):
-        text = "##PVESM\n" + pvesm(total_g=1000, used_g=500, avail_g=500) + "##RC PVESM 0\n##QM\n##DU\n##END\n"
+        text = "##PVESM\n" + pvesm(total_g=1000, used_g=500, avail_g=500) + "##RC PVESM 0\n##DU\n##END\n"
         got = self.run_check((0, text))[0]
         self.assertEqual(sorted(k for k in got if k.startswith("disk:vmunknown:")),
                          [f"disk:vmunknown:t2-proxmox:/var/lib/vz:{v}" for v in (102, 103)])
         self.assertTrue(all(a["message"].startswith("UNKNOWN") for k, a in got.items() if "vmunknown" in k))
 
-    def test_a_watched_vm_missing_from_qm_list_is_unknown_even_with_other_vms_present(self):
-        qm = {k: v for k, v in QM.items() if k != 103}
-        got = self.run_check((0, probe(qm=qm)))[0]
+    def test_a_watched_vm_with_no_volume_on_the_pool_is_unknown_even_with_other_vms_present(self):
+        vols = {k: v for k, v in VOLS.items() if k != 103}
+        got = self.run_check((0, probe(vols=vols)))[0]
         self.assertIn("disk:vmunknown:t2-proxmox:/var/lib/vz:103", got)
         self.assertNotIn("disk:vmunknown:t2-proxmox:/var/lib/vz:102", got)
 
@@ -285,9 +306,9 @@ class RedTeamRound1Tests(Base):
         samples = [[NOW - 40 * 3600, 1, {}], [NOW - 25 * 3600, 2, {}], [NOW - 7 * 3600, 3, {}]]
         self.assertEqual(ow.pool_baseline(samples, NOW)[1], 2)
 
-    def test_unsized_disk_keeps_sized_siblings_and_cdrom_does_not_count(self):
-        qm = {**QM, 103: QM[103] + "scsi2: local:103/vm-103-disk-2.raw\nide2: local:iso/x.iso,media=cdrom,size=4G\n"}
-        d = self.run_check((0, probe(qm=qm)))[0][KEY]["detail"]
+    def test_unsized_volume_keeps_sized_siblings_and_iso_does_not_count(self):
+        vols = {**VOLS, 103: VOLS[103] + [("subvol-103-disk-2.subvol", "0")]}  # dir-storage subvol: no size
+        d = self.run_check((0, probe(vols=vols)))[0][KEY]["detail"]
         self.assertEqual(d["vms"]["103"]["allocated_gib"], 500.0)
         self.assertIn("103", d["unsized_vms"])
 
@@ -302,49 +323,76 @@ REAL_PVESM = ("Name         Type     Status     Total (KiB)      Used (KiB) Avai
               "local         dir     active       916398132       856463396        50596800   93.46%\n")
 
 
-class IncompleteConfigTests(Base):
-    """Plan review F3: a garbled or partial VM config must never read as a valid zero allocation."""
+class VolumeListFormatTests(Base):
+    """Plan review F3, carried to pvesm list: garbled or partial listing output is never a valid zero allocation."""
+    ALLOC = "disk:allocunknown:t2-proxmox:/var/lib/vz"
 
-    def unknown_vms(self, qm):
-        got = self.run_check((0, probe(PVESM_LOW, qm={**QM, **qm})))[0]
+    def got(self, **kw):
+        return self.run_check((0, probe(PVESM_LOW, **kw)))[0]
+
+    def unknown_vms(self, got):
         return sorted(k.rsplit(":", 1)[1] for k in got if "vmunknown" in k)
 
-    def test_error_only_config_is_unknown_below_thresholds(self):
-        self.assertEqual(self.unknown_vms({102: "Configuration file 'nodes/pve/qemu-server/102.conf' does not exist\n"}),
-                         ["102"])
+    def test_error_only_listing_is_unknown_below_thresholds(self):
+        got = self.got(vols_out="storage 'local' does not exist\n", files_out="")
+        self.assertIn(self.ALLOC, got)
+        self.assertEqual(self.unknown_vms(got), ["102", "103"])
 
-    def test_malformed_disk_declaration_is_unknown(self):
-        self.assertEqual(self.unknown_vms({103: "name: x\nscsi0: local:103/a.raw,size=400G\nscsi1: broken\n"}), ["103"])
+    def test_missing_or_changed_header_is_unknown(self):
+        for out in (vols_text().split("\n", 1)[1], vols_text().replace("VMID", "Owner")):
+            with self.subTest(out=out[:20]):
+                self.assertIn(self.ALLOC, self.got(vols_out=out))
 
-    def test_sized_plus_unsized_sibling_is_unknown(self):
-        self.assertEqual(self.unknown_vms({103: "name: x\nscsi0: local:103/a.raw,size=400G\nscsi1: local:103/b.raw\n"}),
-                         ["103"])
+    def test_guest_row_that_cannot_be_tied_to_one_vm_is_unknown(self):
+        rows = ("local:103/vm-103-disk-5.raw raw images 1073741824\n",  # no VMID column
+                "local:103/vm-103-disk-5.raw raw images 1073741824 xyz\n",  # non-numeric VMID
+                "local:104/vm-103-disk-5.raw raw images 1073741824 103\n",  # volid owner is not the VMID
+                "other:103/vm-103-disk-5.raw raw images 1073741824 103\n",  # another storage
+                "garbled\n")
+        for row in rows:
+            with self.subTest(row=row):
+                got = self.got(vols_out=vols_text(rows=row))
+                self.assertIn(self.ALLOC, got)
+                self.assertEqual(self.unknown_vms(got), ["102", "103"])
 
-    def test_vm_with_no_disk_on_this_pool_is_valid_zero(self):
-        self.assertEqual(self.unknown_vms({102: "name: x\nscsi0: other:102/a.raw,size=10G\nide2: none,media=cdrom\n"}), [])
+    def test_non_numeric_or_zero_size_flags_that_vm_only(self):
+        for size in ("garbage", "0", "-5", "1.5e3"):
+            with self.subTest(size=size):
+                got = self.got(vols={**VOLS, 105: [("vm-105-disk-0.raw", size)]})
+                self.assertIn(self.ALLOC, got)
+                self.assertEqual(self.unknown_vms(got), [])
+
+    def test_unwatched_vm_without_volumes_is_fine(self):
+        got = self.got(vols={k: v for k, v in VOLS.items() if k != 109})
+        self.assertNotIn(self.ALLOC, got)
+        self.assertEqual(self.unknown_vms(got), [])
 
 
 PVESM_LOW = pvesm(total_g=1000, used_g=500, avail_g=500)
 
 
 class CompletionStatusTests(Base):
-    """PR review F1: the script exits 0 and prints ##END even when qm list or a qm config failed or timed out, so
-    each command's own status (##RC) decides whether its data is complete."""
+    """PR review F1: the script exits 0 and prints ##END even when a command failed or timed out, so each
+    command's own status (##RC) decides whether its data is complete. Carried over from qm list/config to pvesm list
+    and the file listing: a listing that failed or was cut leaves every VM subtotal unknown."""
     ALLOC = "disk:allocunknown:t2-proxmox:/var/lib/vz"
 
     def got(self, text):
         return self.run_check((0, text))[0]
 
-    def test_config_that_fails_after_a_valid_prefix_is_unknown_not_zero(self):
-        qm = {**QM, 103: "name: gq-prod-db\nmemory: 8192\n"}  # prefix of a config that then timed out
-        got = self.got(probe(PVESM_LOW, qm=qm, rc={103: 124}))
+    def cut(self, upto):
+        """The listing as printed before a timeout: header and the rows before `upto`, no non-guest rows."""
+        rows = [vol_row(vm, n, g) for vm, disks in VOLS.items() for n, g in disks]
+        return VOLS_HEADER + "".join(rows[:upto])
+
+    def test_listing_that_fails_after_a_valid_prefix_is_unknown_not_partial(self):
+        got = self.got(probe(PVESM_LOW, vols_out=self.cut(2), vols_rc=124))  # 100 and 102 printed, 103 cut off
         self.assertIn("disk:vmunknown:t2-proxmox:/var/lib/vz:103", got)
+        self.assertIn("disk:vmunknown:t2-proxmox:/var/lib/vz:102", got)  # a printed prefix is not trusted either
         self.assertIn(self.ALLOC, got)
-        self.assertNotIn("disk:vmunknown:t2-proxmox:/var/lib/vz:102", got)
 
     def test_failure_after_one_sized_disk_does_not_pass_as_a_complete_subtotal(self):
-        qm = {**QM, 103: "name: gq-prod-db\nscsi0: local:103/vm-103-disk-0.raw,size=400G\n"}  # scsi1 (100G) was cut off
-        got = self.got(probe(qm=qm, rc={103: 124}))
+        got = self.got(probe(vols_out=self.cut(3), vols_rc=124))  # 103's first 400G disk printed, its 100G cut off
         d = got[KEY]["detail"]
         self.assertIn("disk:vmunknown:t2-proxmox:/var/lib/vz:103", got)
         self.assertIsNone(d["vms"]["103"]["allocated_gib"])
@@ -353,26 +401,31 @@ class CompletionStatusTests(Base):
         self.assertFalse(d["allocation_complete"])
         self.assertEqual(got[KEY]["severity"], "high")  # usable pool capacity numbers are kept
 
-    def test_missing_status_line_for_a_vm_is_incomplete(self):
-        got = self.got(probe(rc={102: None}))
-        self.assertIn("disk:vmunknown:t2-proxmox:/var/lib/vz:102", got)
+    def test_missing_status_line_for_the_listing_is_incomplete(self):
+        got = self.got(probe(vols_rc=None))
         self.assertIn(self.ALLOC, got)
+        self.assertIn("disk:vmunknown:t2-proxmox:/var/lib/vz:102", got)
 
-    def test_failed_vm_enumeration_is_unknown_and_keeps_pool_capacity(self):
-        got = self.got(probe(PVESM_LOW, qm={}, du=DU, list_rc=1))
+    def test_failed_listing_is_unknown_and_keeps_pool_capacity(self):
+        got = self.got(probe(PVESM_LOW, vols_out="", du=DU, vols_rc=2))
         self.assertIn(self.ALLOC, got)
         self.assertEqual(sorted(k[-3:] for k in got if "vmunknown" in k), ["102", "103"])
-        high = self.got(probe(qm={}, list_rc=124))
+        high = self.got(probe(vols_rc=124))
         self.assertEqual(high[KEY]["severity"], "high")
         self.assertIsNone(high[KEY]["detail"]["overcommit_ratio"])
         self.assertIn("unknown", high[KEY]["message"])
 
-    def test_missing_list_status_is_a_failed_enumeration(self):
-        self.assertIn(self.ALLOC, self.got(probe(list_rc=None)))
+    def test_failed_or_missing_file_listing_status_is_incomplete(self):
+        for rc in (1, 124, None):
+            with self.subTest(rc=rc):
+                got = self.got(probe(files_rc=rc))
+                self.assertIn(self.ALLOC, got)
+                self.assertFalse(got[KEY]["detail"]["allocation_complete"])
+                self.assertIsNone(got[KEY]["detail"]["overcommit_ratio"])
+                self.assertIn("disk:vmunknown:t2-proxmox:/var/lib/vz:103", got)  # a skipped file could be 103's
 
-    def test_partial_enumeration_with_one_failed_config_marks_allocation_unknown(self):
-        qm = {k: v for k, v in QM.items() if k in (102, 103, 105)}
-        got = self.got(probe(PVESM_LOW, qm=qm, rc={105: 1}))
+    def test_one_unsized_unwatched_volume_marks_allocation_unknown_only(self):
+        got = self.got(probe(PVESM_LOW, vols={**VOLS, 105: [("vm-105-disk-0.raw", "0")]}))
         self.assertIn(self.ALLOC, got)
         self.assertNotIn("disk:vmunknown:t2-proxmox:/var/lib/vz:102", got)
 
@@ -388,8 +441,77 @@ class CompletionStatusTests(Base):
 
     def test_script_records_each_command_status(self):
         script = ow.pool_script("local", "/var/lib/vz", [102])
-        for marker in ('echo "##RC PVESM $?"', 'echo "##RC LIST $?"', 'echo "##RC $v $?"'):
+        for marker in ('echo "##RC PVESM $?"', 'echo "##RC VOLS $?"', 'echo "##RC FILES $?"'):
             self.assertIn(marker, script)
+
+
+class AllVolumesTests(Base):
+    """PR review r2 F1: qm list/qm config missed container volumes and detached unusedN disks, so allocation read
+    complete with a low overcommit. pvesm list covers every volume on the storage; the file listing catches an image
+    pvesm skips (it drops a file it cannot size with only a stderr warning and exit 0)."""
+    ALLOC = "disk:allocunknown:t2-proxmox:/var/lib/vz"
+
+    def detail(self, **kw):
+        got = self.run_check((0, probe(**kw)))[0]
+        return got, got[KEY]["detail"]
+
+    def test_container_rootdir_volume_counts(self):
+        # ASSUMPTION: rootdir row layout as for images (the live pool has no container today); a raw CT rootfs on a
+        # dir storage lives under images/<ctid>/ like a VM disk
+        rows = vol_row(120, "vm-120-disk-0.raw", 300, kind="rootdir")
+        got, d = self.detail(vols_out=vols_text(rows=rows), files_out=files_text(extra=["/var/lib/vz/images/120/vm-120-disk-0.raw"]))
+        self.assertTrue(d["allocation_complete"])
+        self.assertEqual(d["provisioned_gib"], 1836.0)
+        self.assertEqual(d["overcommit_ratio"], 2.0)
+        self.assertNotIn(self.ALLOC, got)
+
+    def test_detached_unused_disk_counts_toward_its_vm(self):
+        vols = {**VOLS, 103: VOLS[103] + [("vm-103-disk-2.raw", 300)]}  # unused0 in the config: listed all the same
+        got, d = self.detail(vols=vols)
+        self.assertTrue(d["allocation_complete"])
+        self.assertEqual(d["provisioned_gib"], 1836.0)
+        self.assertEqual(d["vms"]["103"]["allocated_gib"], 800.0)
+        self.assertNotIn("disk:vmunknown:t2-proxmox:/var/lib/vz:103", got)
+
+    def test_subvol_container_volume_without_size_is_incomplete(self):
+        rows = vol_row(121, "subvol-121-disk-0.subvol", "0", kind="rootdir")
+        got, d = self.detail(vols_out=vols_text(rows=rows),
+                             files_out=files_text(extra=["/var/lib/vz/images/121/subvol-121-disk-0.subvol"]))
+        self.assertFalse(d["allocation_complete"])
+        self.assertIsNone(d["overcommit_ratio"])
+        self.assertIn("121", d["unsized_vms"])
+        self.assertIn(self.ALLOC, got)
+
+    def test_image_file_pvesm_did_not_list_is_incomplete(self):
+        got, d = self.detail(files_out=files_text(extra=["/var/lib/vz/images/103/vm-103-disk-2.qcow2"]))
+        self.assertFalse(d["allocation_complete"])
+        self.assertIsNone(d["provisioned_gib"])
+        self.assertIn("disk:vmunknown:t2-proxmox:/var/lib/vz:103", got)
+        self.assertEqual(d["vms"]["103"]["allocated_gib"], 500.0)  # the sized siblings stay visible
+        self.assertIn(self.ALLOC, got)
+
+    def test_unusable_file_listing_line_is_incomplete(self):
+        for line in ("/var/lib/vz/images/abc/x.raw", "/elsewhere/images/103/x.raw", "/var/lib/vz/images/103/a b.raw",
+                     "find: '/var/lib/vz/images/7': Permission denied"):
+            with self.subTest(line=line):
+                got, d = self.detail(files_out=files_text(extra=[line]))
+                self.assertFalse(d["allocation_complete"])
+                self.assertIn(self.ALLOC, got)
+                self.assertIsNone(d["vms"]["102"]["allocated_gib"])
+
+    def test_linked_clone_volid_is_tied_to_its_owner(self):
+        row = "local:100/base-100-disk-0.raw/104/vm-104-disk-0.qcow2 qcow2 images 10737418240 104\n"
+        got, d = self.detail(vols_out=vols_text(rows=row),
+                             files_out=files_text(extra=["/var/lib/vz/images/104/vm-104-disk-0.qcow2"]))
+        self.assertTrue(d["allocation_complete"])
+        self.assertEqual(d["provisioned_gib"], 1546.0)
+
+    def test_truncated_listing_with_status_zero_cannot_hide_a_volume(self):
+        # pvesm printed only part of its rows yet exited 0: the files it did not list still flag allocation
+        got, d = self.detail(vols_out=VOLS_HEADER + vol_row(102, "vm-102-disk-0.raw", 200))
+        self.assertFalse(d["allocation_complete"])
+        self.assertIn(self.ALLOC, got)
+        self.assertIn("disk:vmunknown:t2-proxmox:/var/lib/vz:103", got)
 
 
 class RealFormatTests(Base):
@@ -418,8 +540,8 @@ class RealFormatTests(Base):
 
 
 class CommandAndConfigTests(Base):
-    READ_WORDS = {"echo", "pvesm", "status", "--storage", "qm", "list", "awk", "config", "du", "-sk", "for", "in",
-                  "do", "done", "local"}
+    READ_WORDS = {"echo", "timeout", "pvesm", "status", "--storage", "list", "find", "-mindepth", "-maxdepth", "du",
+                  "-sk", "local"}
 
     def test_the_remote_script_is_one_fixed_read_only_call(self):
         runner = self.run_check((0, probe()))[2]
@@ -431,19 +553,25 @@ class CommandAndConfigTests(Base):
         self.assertLessEqual(timeout, 30)
         script = argv[-1]
         scrubbed = re.sub(r"'##[A-Z ]+'", "", script)
-        scrubbed = re.sub(r'"##[A-Za-z ]*(\$[a-z?]|[A-Z]+)[^"]*"', "", scrubbed)  # echoed markers and their $? / $v
-        scrubbed = scrubbed.replace("l=$(timeout 5 qm list)", "").replace("""$(echo "$l" | awk 'NR>1{print $1}')""", "")
+        scrubbed = re.sub(r'"##RC [A-Z]+ \$\?"', "", scrubbed)  # echoed status markers and their $?
         for verb in ("fstrim", "resize", "destroy", "set", "create", "start", "stop", "shutdown", "migrate", "rm ",
-                     "mv ", "delete", "move", "restore", "unlock", "template", "snapshot", "rollback", "reboot",
-                     ">", "<", "`", "&", "|", "sudo", "tee"):
+                     "mv ", "delete", "move", "restore", "unlock", "template", "snapshot", "rollback", "reboot", "qm",
+                     "-exec", "-delete", "-fprint", "$", ">", "<", "`", "&", "|", "sudo", "tee", "*"):
             self.assertNotIn(verb, scrubbed, verb)
         self.assertIn("timeout 8 pvesm status --storage local", script)
+        self.assertIn("timeout 8 pvesm list local;", script)
+        self.assertIn("timeout 3 find /var/lib/vz/images -mindepth 2 -maxdepth 2;", script)
         self.assertIn("timeout 8 du -sk /var/lib/vz/images/102 /var/lib/vz/images/103;", script)
-        self.assertNotIn("images/*", script)  # unwatched VM directories are never traversed
-        self.assertIn("qm config", script)
-        for cmd in re.split(r";", script):
-            first = cmd.strip().split(" ")[0]
-            self.assertIn(first, {"echo", "timeout", "for", "do", "done", "l=$(timeout", ""}, cmd)
+        self.assertNotIn("images/*", script)  # unwatched VM directories are never traversed by du
+        for cmd in script.split(";"):
+            words = cmd.split()
+            if not words:
+                continue
+            self.assertIn(words[0], {"echo", "timeout"}, cmd)
+            if words[0] == "timeout":
+                self.assertTrue(words[1].isdigit(), cmd)
+                rest = [w for w in words[2:] if not w.startswith("/var/lib/vz/images")]
+                self.assertTrue(set(rest) <= self.READ_WORDS | {"2"}, cmd)
 
     def test_unsafe_config_is_refused_before_ssh(self):
         bad = [{"host": "-oProxyCommand=x"}, {"host": "t2-proxmox; reboot"}, {"host": ""},
