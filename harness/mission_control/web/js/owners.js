@@ -133,8 +133,8 @@ export function mountOwners() {
         parts = { section, heading, liveBox, empty, fold, body };
         groups.set(id, parts);
       }
-      parts.heading.textContent = `${group.label} · ${group.liveCount} live`;
-      const liveNodes = group.live.flatMap(entry => [place(entry.owner, group, null), ...entry.helpers.map(h => place(h, group, entry.owner))]);
+      parts.heading.textContent = `${group.label} · ${group.liveCount} live${group.decide.length ? ` · ${group.decide.length} need a decision` : ''}`;
+      const liveNodes = [...group.live, ...group.decide].flatMap(entry => [place(entry.owner, group, null), ...entry.helpers.map(h => place(h, group, entry.owner))]);
       syncChildren(parts.liveBox, liveNodes.length ? liveNodes : [parts.empty]);
       const open = Boolean(folds[group.id]) && group.foldCount > 0;
       parts.fold.hidden = group.foldCount === 0;
@@ -144,7 +144,7 @@ export function mountOwners() {
       parts.body.hidden = !open;
       const foldNodes = !open ? [] : [
         ...group.parked.flatMap(entry => [place(entry.owner, group, null), ...entry.helpers.map(h => place(h, group, entry.owner))]),
-        ...group.live.flatMap(entry => entry.doneHelpers.map(h => place(h, group, entry.owner))),
+        ...[...group.live, ...group.decide].flatMap(entry => entry.doneHelpers.map(h => place(h, group, entry.owner))),
         ...group.loose.map(h => place(h, group, null)),
       ];
       syncChildren(parts.body, foldNodes);

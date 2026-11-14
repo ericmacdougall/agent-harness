@@ -21,7 +21,8 @@ export function ownerCounts(owners = []) {
   return counts;
 }
 
-// Groups by initiative. Each group: live owners with their working helpers shown, then one fold holding parked owners
+// Groups by initiative. Each group: live owners with their working helpers shown, parked owners that need a decision
+// (shown, never counted), then one fold holding the other parked owners
 // (with all their helpers), finished helpers of live owners and helpers that serve no listed owner. Every row lands in
 // exactly one place, so nothing is hidden for good.
 export function ownerGroups(owners = [], initiatives = []) {
@@ -30,7 +31,7 @@ export function ownerGroups(owners = [], initiatives = []) {
   const group = id => {
     if (!groups.has(id)) {
       const item = initiatives.find(i => i.id === id);
-      groups.set(id, { id, label: item ? item.initiative : 'Not linked to an initiative', live: [], parked: [], loose: [], attention: 0, liveCount: 0, foldCount: 0 });
+      groups.set(id, { id, label: item ? item.initiative : 'Not linked to an initiative', live: [], decide: [], parked: [], loose: [], attention: 0, liveCount: 0, foldCount: 0 });
     }
     return groups.get(id);
   };
@@ -41,6 +42,8 @@ export function ownerGroups(owners = [], initiatives = []) {
     const entry = { owner, helpers: [], doneHelpers: [] };
     entries.set(owner.agent_id, entry);
     if (owner.role === 'live') { g.live.push(entry); g.liveCount++; }
+    // a parked owner that needs main's decision never folds away: it shows under the live owners, uncounted
+    else if (owner.decision_required) g.decide.push(entry);
     else { g.parked.push(entry); g.foldCount++; if (needsAttention(owner)) g.attention++; }
   }
   for (const helper of owners) {
@@ -48,8 +51,9 @@ export function ownerGroups(owners = [], initiatives = []) {
     const entry = helper.serves && byId.get(helper.serves) && entries.get(helper.serves);
     if (!entry) { const g = group(helper.initiative_id || UNLINKED); g.loose.push(helper); g.foldCount++; if (needsAttention(helper)) g.attention++; continue; }
     const g = group(entry.owner.initiative_id || UNLINKED);
-    if (entry.owner.role === 'live' && helperActive(helper)) entry.helpers.push(helper);
-    else if (entry.owner.role === 'live') { entry.doneHelpers.push(helper); g.foldCount++; if (needsAttention(helper)) g.attention++; }
+    const shown = entry.owner.role === 'live' || entry.owner.decision_required;
+    if (shown && helperActive(helper)) entry.helpers.push(helper);
+    else if (shown) { entry.doneHelpers.push(helper); g.foldCount++; if (needsAttention(helper)) g.attention++; }
     else { entry.helpers.push(helper); g.foldCount++; if (needsAttention(helper)) g.attention++; }
   }
   const order = new Map(initiatives.map((item, index) => [item.id, index]));

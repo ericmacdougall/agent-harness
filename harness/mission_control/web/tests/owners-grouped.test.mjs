@@ -75,7 +75,7 @@ test('groups by initiative: live owners shown, every other row in exactly one fo
   // every published row appears exactly once across live, helpers, done helpers, parked and loose
   const seen = [];
   for (const group of groups) {
-    for (const e of group.live) seen.push(e.owner.agent_id, ...e.helpers.map(h => h.agent_id), ...e.doneHelpers.map(h => h.agent_id));
+    for (const e of [...group.live, ...group.decide]) seen.push(e.owner.agent_id, ...e.helpers.map(h => h.agent_id), ...e.doneHelpers.map(h => h.agent_id));
     for (const e of group.parked) seen.push(e.owner.agent_id, ...e.helpers.map(h => h.agent_id));
     seen.push(...group.loose.map(h => h.agent_id));
   }
@@ -99,8 +99,15 @@ test('helpers nest under the owner they serve and never add to a count (AC-4, NE
 test('the fold names its size and how many rows need attention (NEG-8)', () => {
   const g = byGroup(ownerGroups(OWNERS, INITS));
   assert.equal(foldLabel(g.checkout), 'Parked / history (3) · 1 need attention', 'handoff, DROPPED, finished reviewer');
-  assert.equal(foldLabel(g.reports), 'Parked / history (3) · 1 need attention', 'decision_required counts as attention');
+  assert.equal(foldLabel(g.reports), 'Parked / history (2)', 'the decision-required owner is not folded');
   assert.match(foldLabel(g[UNLINKED]), /need attention/, 'a DROPPED helper with no owner still raises attention');
+});
+
+test('a parked owner that needs a decision stays visible, uncounted (M5)', () => {
+  const g = byGroup(ownerGroups(OWNERS, INITS));
+  assert.deepEqual(g.reports.decide.map(e => e.owner.agent_id), ['a2park000000000005']);
+  assert.equal(g.reports.liveCount, 2, 'not counted as live');
+  assert.equal(g.reports.parked.some(e => e.owner.agent_id === 'a2park000000000005'), false);
 });
 
 test('zero live owners still shows the count 0 and an expandable fold (NEG-4)', () => {

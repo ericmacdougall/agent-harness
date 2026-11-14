@@ -127,6 +127,17 @@ class CapParity(Base):
         self.assertEqual(mc["deploy-fix-wal"]["role"], "live", "a task-named WAL owner counts, whatever its runtime")
 
 
+class Session(Base):
+    def test_rows_name_the_session_ah_counted_and_follow_a_change(self):
+        payload = {"session": "s1", "owners": ah_rows()[:2]}
+        owners = col.Owners(self.hub, self.health, Runner(payload), None)
+        owners.run(time.time())
+        self.assertEqual({r["session"] for r in owners.rows}, {"s1"})
+        payload["session"] = "s2-newer"
+        owners.run(time.time() + 61)
+        self.assertEqual({r["session"] for r in owners.rows}, {"s2-newer"}, "the label follows the session ah reports")
+
+
 class Serves(Base):
     def test_helpers_point_at_the_owner_they_serve(self):
         mc = {r["agent_id"]: r for r in self.collect(ah_rows())}
