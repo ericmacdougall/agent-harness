@@ -342,10 +342,10 @@ body[data-tab="topology"] #scene-layer { display: block; }
 .eyebrow { font-size: 12px; color: var(--muted); }
 .scene-mode { font-size: 12px; color: var(--muted); display: flex; gap: 6px; align-items: center; }
 .scene-mode i { width: 6px; height: 6px; border: 1px solid var(--accent); border-radius: 50%; }
-.scene-stage { flex: 1; position: relative; min-height: min(640px, 70vh); touch-action: pan-y; cursor: grab; isolation: isolate; }
+.scene-stage { flex: 1; position: relative; min-height: min(640px, 70vh); touch-action: pan-y; cursor: grab; isolation: isolate; overflow: hidden; }
 .scene-poster { position: absolute; width: 100%; height: 100%; inset: 0; pointer-events: none; opacity: .9; }
 .scene-poster.webgl-active { visibility: hidden; }
-.scene-labels { position: absolute; inset: 0; }
+.scene-labels { position: absolute; inset: 0; overflow: hidden; }
 .node-label { max-width: calc(100% - 24px); overflow-wrap: anywhere; position: absolute; transform: translate(-50%, -50%); padding: 6px 9px; color: var(--text); font: 12px var(--mono); border: 1px solid var(--line-strong); border-radius: 4px; background: var(--panel); white-space: normal; min-height: 28px; cursor: pointer; }
 .node-label:hover, .node-label:focus-visible, .node-label.active { border-color: var(--accent); color: var(--accent); z-index: 5; }
 .node-label.central { color: var(--accent); border-color: var(--accent); }

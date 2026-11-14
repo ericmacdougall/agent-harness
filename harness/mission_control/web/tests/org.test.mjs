@@ -156,3 +156,8 @@ test('initiatives snapshot carries live-derived and hidden file row counts', asy
   assert.deepEqual(out.items.map(i => i.source), ['live', 'file']);
   assert.deepEqual([adapt.initiatives({ derived: -3 }).derived, adapt.initiatives({ hidden_file_rows: 'x' }).hiddenFileRows], [0, 0]);
 });
+
+test('normalize keeps the followed session for the meta line (goodqa#15961)', () => {
+  assert.equal(org.normalize({ schema: 'mc.orggraph/1', nodes: [], session: 'baab765b-d85c' }).session, 'baab765b-d85c');
+  assert.equal(org.normalize({ schema: 'mc.orggraph/1', nodes: [] }).session, '');
+});

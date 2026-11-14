@@ -62,7 +62,7 @@ export function normalize(raw) {
   }
   const edges = (Array.isArray(raw.edges) ? raw.edges : []).filter(e => e && ids.has(e.from) && ids.has(e.to)).slice(0, 800);
   const changes = (Array.isArray(raw.changes) ? raw.changes : []).slice(0, 120);
-  return { generated: str(raw.generated, 40), seq: Number(raw.seq) || 0, nodes, edges, changes, counts: raw.counts || {},
+  return { generated: str(raw.generated, 40), session: str(raw.session, 64), seq: Number(raw.seq) || 0, nodes, edges, changes, counts: raw.counts || {},
     gaps: (Array.isArray(raw.gaps) ? raw.gaps : []).map(g => str(g, 300)).slice(0, 10) };
 }
 
