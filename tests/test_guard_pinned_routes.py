@@ -728,9 +728,14 @@ class TableTests(unittest.TestCase):
              cg.DEV_DECOM_EXPIRES),
             (BASE + PY_REL, '30c688923554c09f93128a7d9b89831557acd06d1f04949c235b09ea05cf89a6', cg.PINNED_ROUTES[1][2],
              cg.DEV_DECOM_EXPIRES),
-            (FAB_REL, '445d07aa069233b478f7360220f05f975a327e73d377deef38e404028d0e949a', '/bin/bash -p {path}',
+            (FAB_REL, 'c979bc116ec0f252b8e0916c2c48f7aefa984a61b0825a16f6f58a57e364ad0b', '/bin/bash -p {path}',
              cg.FABRIC_DO_AUTH_EXPIRES),
         ])
+
+    def test_the_fabric_pin_is_the_reviewed_script(self):
+        # The pinned digest must be the bytes in tests/fixtures, which tests/test_fabric_do_auth_script.py exercises.
+        fixture = ROOT / 'tests' / 'fixtures' / 'pinned_routes' / 'doctl-auth-fabric.sh'
+        self.assertEqual([r[1] for r in cg.PINNED_ROUTES if r[0] == FAB_REL], [sha(fixture.read_bytes())])
 
     def test_expiries_are_fixed(self):
         self.assertEqual(time_string(cg.DEV_DECOM_EXPIRES), '2026-11-09T00:00:00Z')

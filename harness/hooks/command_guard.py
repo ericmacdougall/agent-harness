@@ -370,7 +370,7 @@ PINNED_ROUTES = (
     # passing through argv, an environment variable, a log or this machine. No arguments.
     # Source: answer:baab765b-d85c-46b4-b7b9-588eb912c770/1259f6f0-b88d-40f3-834a-4275dbf8ec01 (ask we0224a94f24).
     ('.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/agent-ad1ff08b576984a4d/do-auth/doctl-auth-fabric.sh',
-     '445d07aa069233b478f7360220f05f975a327e73d377deef38e404028d0e949a',
+     'c979bc116ec0f252b8e0916c2c48f7aefa984a61b0825a16f6f58a57e364ad0b',
      r'/bin/bash -p {path}',
      FABRIC_DO_AUTH_EXPIRES),
 )
