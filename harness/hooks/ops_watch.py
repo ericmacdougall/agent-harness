@@ -2003,7 +2003,19 @@ def check_deploys(cfg, state, runner, now):
     return out
 
 
+def check_lanes(cfg):
+    """Lane flags from snapshots only (goodqa#15946): no write, no network, no process; empty on any store problem."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from lane import ops as lane_ops  # noqa: PLC0415
+        root = home_of(cfg) / ".agent-harness" / "state" / "lanes"
+        return [alert("lanes", key, sev, msg) for key, sev, msg in lane_ops.lane_alerts(root)]
+    except Exception:  # noqa: BLE001 - a broken lane store must never break the other checks
+        return []
+
+
 DEFAULT_CHECKS = {
+    "lanes": lambda c, s, r, n: check_lanes(c),
     "disk": check_disk,
     "units": lambda c, s, r, n: check_units(c, s, r, n) if c["units"].get("enabled") and shutil.which("systemctl") else [],
     "crashes": lambda c, s, r, n: check_crashes(c, s, n) if c["crashes"].get("enabled") else [],

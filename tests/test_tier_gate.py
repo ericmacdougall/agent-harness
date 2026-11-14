@@ -453,7 +453,9 @@ class ModesAndCap(GateFixture):
         data = {'tool_name': 'Agent', 'tool_input': {'prompt': 'x [task:k11]', 'model': 'sonnet'}, 'session_id': 's2'}
         self.assertEqual(self.run_hook(data, 'enforce')['permissionDecision'], 'deny')
         gate.live_update('s2', 'agent-0', start=False)
-        self.assertIsNone(self.run_hook(data, 'enforce'))  # matching rung, nothing to say
+        out = self.run_hook(data, 'enforce')  # matching rung: no decision; only the lane advisory (goodqa#15946) may speak
+        self.assertTrue(out is None or (set(out) <= {'hookEventName', 'additionalContext'}
+                                        and out['additionalContext'].startswith('no lane: run `ah lane new`')), out)
 
 
 if __name__ == '__main__':

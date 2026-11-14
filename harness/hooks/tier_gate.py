@@ -912,16 +912,27 @@ def _main(action, data, tool, command, applies):
     except BaseException as error:  # noqa: BLE001  the decision and output never depend on the dispatch record
         _gate_log({'at': esc.now(), 'tool': tool, 'decision': 'dispatch_open_failed',
                    'error': '%s: %s' % (type(error).__name__, str(error)[:120])})
+    advisory = None
+    if tool in ('Agent', 'Task') and decision != 'deny':
+        try:  # goodqa#15946: advisory only; it reads nothing and can never change the decision or the owner count
+            from lane import ops as lane_ops  # noqa: PLC0415
+            advisory = lane_ops.advisory_text(facts.get('task'), facts.get('subagent_type'), policy)
+        except Exception:  # noqa: BLE001
+            advisory = None
     if decision == 'allow' and updated is None:
-        return 0  # nothing to change; the decision and its reason are in gate.jsonl
+        if advisory:
+            print(json.dumps(hook_result('context', context=advisory)))
+        return 0  # nothing to change; the decision and its reason are in the gate record
     if mode == 'warn':
         # Warn mode only speaks, and only about a refusal: the "would apply updatedInput" chatter for an allowed
         # spawn was ceremony with no effect (scenario B24: enforce it or say nothing).
         if decision != 'deny':
+            if advisory:
+                print(json.dumps(hook_result('context', context=advisory)))
             return 0
         print(json.dumps(hook_result('context', context='ladder (warn mode): would deny: %s' % reason)))
         return 0
-    print(json.dumps(hook_result(decision, reason, updated)))
+    print(json.dumps(hook_result(decision, reason, updated, context=advisory)))
     return 0
 
 

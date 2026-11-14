@@ -44,7 +44,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "mission_coverage.py", "mission_gate.py",  # mission goals: owner, disposition or done evidence (goodqa#15565)
          "goals_view.py", "status_truth.py", "stop_blocks.py",  # `ah goals`, status lint and injection (goodqa#15754)
          "gq_browser.py",  # GoodQA worker browser CLI and stdio MCP server; main registers the MCP (goodqa#15745)
-         "lane/__init__.py", "lane/identity.py", "lane/store.py", "lane/manifest.py", "lane/kit.py", "lane/lanes.py", "lane/sources.py", "lane/commands.py",
+         "lane/__init__.py", "lane/identity.py", "lane/store.py", "lane/manifest.py", "lane/kit.py", "lane/lanes.py", "lane/sources.py", "lane/commands.py", "lane/auth.py", "lane/ops.py", "ah_lane.py",
          "lane/templates/v1/README.md", "lane/templates/v1/brief.md", "lane/templates/v1/gates.json",
          "lane/templates/v1/handoff.md",  # lane factory slice S1 (goodqa#15946)
          "shellwords.py")  # quote-aware command splitting shared by mission_gate and dropped_gate (goodqa#15684)
