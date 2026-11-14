@@ -110,6 +110,22 @@ test('a parked owner that needs a decision stays visible, uncounted (M5)', () =>
   assert.equal(g.reports.parked.some(e => e.owner.agent_id === 'a2park000000000005'), false);
 });
 
+test('helpers of a decision-required owner: working ones shown under it, finished ones folded, once each (C1)', () => {
+  const raw = [
+    row('a5dec0000000000001', 'parked', 'SILENT', { decision_required: true }),
+    row('a5dec0000000000002', 'helper', 'live', { type: 'red-team', serves: 'a5dec0000000000001' }),
+    row('a5dec0000000000003', 'helper', 'DROPPED', { type: 'reviewer', serves: 'a5dec0000000000001' }),
+  ];
+  const [group] = ownerGroups(adaptOwners(raw, []), []);
+  const [entry] = group.decide;
+  assert.deepEqual(entry.helpers.map(h => h.agent_id), ['a5dec0000000000002']);
+  assert.deepEqual(entry.doneHelpers.map(h => h.agent_id), ['a5dec0000000000003']);
+  assert.equal(group.liveCount, 0);
+  assert.equal(group.foldCount, 1, 'only the finished helper folds');
+  assert.equal(group.attention, 1, 'the DROPPED helper in the fold raises attention');
+  assert.equal(foldLabel(group), 'Parked / history (1) · 1 need attention');
+});
+
 test('zero live owners still shows the count 0 and an expandable fold (NEG-4)', () => {
   const only = adaptOwners([row('a2park000000000009', 'parked', 'done')], []);
   assert.equal(ownerCounts(only).live, 0);

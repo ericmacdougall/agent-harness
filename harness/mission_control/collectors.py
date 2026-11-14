@@ -38,19 +38,28 @@ _owner_policy_cache: dict = {}
 
 
 def owner_policy(hooks_dir=None) -> dict:
-    """caps.owner_types / caps.helper_types from the hooks' model_tiers.json (the file tier_gate reads), else defaults."""
+    """caps.owner_types / caps.helper_types from the table tier_gate reads (AGENT_HARNESS_TIER_POLICY, else the hooks'
+    model_tiers.json), re-read when the file changes; defaults when unreadable, with `fallback` set so it is visible."""
     hooks = Path(hooks_dir or os.environ.get("MC_HOOKS") or Path.home() / ".claude" / "hooks")
-    key = str(hooks)
+    path = Path(os.environ.get("AGENT_HARNESS_TIER_POLICY") or hooks / "model_tiers.json") if not hooks_dir \
+        else hooks / "model_tiers.json"
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        stamp = None
+    key = (str(path), stamp)
     if key not in _owner_policy_cache:
-        caps = {}
+        caps, fallback = {}, False
         try:
-            caps = json.loads((hooks / "model_tiers.json").read_text()).get("caps") or {}
+            caps = json.loads(path.read_text()).get("caps") or {}
         except (OSError, ValueError, AttributeError):
-            caps = {}
+            caps, fallback = {}, True
         owner = caps.get("owner_types") if isinstance(caps.get("owner_types"), list) else None
         helper = caps.get("helper_types") if isinstance(caps.get("helper_types"), list) else None
+        _owner_policy_cache.clear()
         _owner_policy_cache[key] = {"owner_types": frozenset(map(str, owner or OWNER_TYPES_DEFAULT)),
-                                    "helper_types": frozenset(map(str, helper or HELPER_TYPES_DEFAULT))}
+                                    "helper_types": frozenset(map(str, helper or HELPER_TYPES_DEFAULT)),
+                                    "fallback": fallback or owner is None or helper is None}
     return _owner_policy_cache[key]
 
 
@@ -791,6 +800,11 @@ class Owners(Collector):
                                  else 2 if r["role"] == "parked" else 3, r["idle_s"] or 0))
         self.claude_rows = rows[:60]
         self.publish()
+        if owner_policy().get("fallback"):
+            # the panel still counts, but by default owner/helper types: say so instead of drifting silently
+            self.health.error("owner-policy", "model_tiers caps unreadable: owner/helper types are defaults; count may differ from the cap")
+        else:
+            self.health.ok("owner-policy", "owner/helper types from model_tiers caps")
         return f"{len(rows)} owners"
 
     def codex_rows(self, now: float) -> list[dict]:

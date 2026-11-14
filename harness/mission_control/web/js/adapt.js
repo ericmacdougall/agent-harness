@@ -82,7 +82,7 @@ export function owners(rows, items = []) {
 }
 
 const SOURCE_NAMES = { wals: 'Claude + Codex WALs', initiatives: 'Initiatives file', owners: 'Owners', github: 'GitHub', goodqa: 'GoodQA tickets',
-  't2-dev': 't2-dev', 'file-drop': 'Event drops', codex: 'Codex chat', chat: 'Chat store', 'codex-owners': 'OpenAI supervised owners', ledger: 'Goals, requirements and status' };
+  't2-dev': 't2-dev', 'file-drop': 'Event drops', codex: 'Codex chat', chat: 'Chat store', 'codex-owners': 'OpenAI supervised owners', 'owner-policy': 'Owner/helper type policy', ledger: 'Goals, requirements and status' };
 export function sources(rows) {
   if (!Array.isArray(rows)) return [];
   return rows.filter(r => r && r.name).map(r => ({

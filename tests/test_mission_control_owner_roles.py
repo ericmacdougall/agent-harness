@@ -194,10 +194,29 @@ class Policy(unittest.TestCase):
         self.assertEqual(policy["helper_types"], frozenset(caps["helper_types"]))
         self.assertEqual(policy["owner_types"], frozenset(caps["owner_types"]))
 
-    def test_missing_policy_falls_back_to_defaults(self):
+    def test_missing_policy_falls_back_to_defaults_and_says_so(self):
         with tempfile.TemporaryDirectory() as tmp:
             policy = col.owner_policy(tmp)
         self.assertIn("red-team", policy["helper_types"])
+        self.assertTrue(policy["fallback"])
+        self.assertFalse(col.owner_policy(REPO / "harness" / "hooks")["fallback"])
+
+    def test_policy_honours_the_tier_policy_override_and_rereads_on_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tiers.json"
+            path.write_text(json.dumps({"caps": {"owner_types": ["task-owner"], "helper_types": ["red-team", "custom-helper"]}}))
+            with mock.patch.dict(os.environ, {"AGENT_HARNESS_TIER_POLICY": str(path)}):
+                self.assertIn("custom-helper", col.owner_policy()["helper_types"])
+                path.write_text(json.dumps({"caps": {"owner_types": ["task-owner"], "helper_types": ["red-team"]}}))
+                os.utime(path, ns=(time.time_ns(), time.time_ns() + 10**9))
+                self.assertNotIn("custom-helper", col.owner_policy()["helper_types"])
+
+    def test_mirrored_constants_equal_tier_gate(self):
+        self.assertEqual(col.OWNER_RUNNING, tier_gate.RUNNING_STATES)
+        self.assertEqual(col.IDLE_OWNER_MAX_S, tier_gate.IDLE_OWNER_MAX_S)
+        self.assertEqual(list(col.HELPER_TYPES_DEFAULT), tier_gate.HELPER_TYPES_DEFAULT)
+        self.assertEqual(set(col.OWNER_TYPES_DEFAULT), tier_gate.owner_types({}))
+        self.assertEqual(set(col.HELPER_TYPES_DEFAULT), tier_gate.helper_types({}))
 
 
 if __name__ == "__main__":
