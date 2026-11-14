@@ -26,7 +26,9 @@ def ledger(items):
 
 
 def item(ask=ASK, note="May main push branch feat/x to origin?", owner="main", reason="it changes a shared branch"):
-    return {"id": ask, "kind": "traced", "at": "2026-11-11T10:00:00+00:00", "note": note, "reason": reason,
+    # A fresh ask: a fixed date went stale under the 72 h sweep TTL three days after it was written (time bomb)
+    at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() - 60))
+    return {"id": ask, "kind": "traced", "at": at, "note": note, "reason": reason,
             "owner": owner}
 
 
