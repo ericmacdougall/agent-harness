@@ -3,6 +3,7 @@ NEG-5). Scratch HOME per test, fake gh runner, no network. GoodQA goodqa#16034."
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -216,6 +217,147 @@ class ReceiptTests(Base):
 
     def test_missing_report_is_error(self):
         self.assertEqual(core.verify_receipt(0, self.work / "none.md", HEAD, self.packet)["verdict"], "ERROR")
+
+
+def _lands_a_pr(argv):
+    """True when a child argv would land (merge) a PR or push to a branch: the AC-31 surface P0 must never reach."""
+    words = [str(a) for a in argv]
+    for i, word in enumerate(words[:-1]):
+        if word == "pr" and words[i + 1] == "merge":
+            return True
+    if "api" in words and any(re.search(r"/pulls/\d+/merge\b|/merges\b", w) for w in words):
+        return True
+    if words and os.path.basename(words[0]) == "git" and ("push" in words or "merge" in words):
+        return True
+    return False
+
+
+class P0SurfaceTests(unittest.TestCase):
+    """AC-31 (P0): P0 never executes a merge and has no `authority enable` subcommand. A suggested merge command in the
+    notice for main is text inside a ticket-comment body, never an argv."""
+
+    ALLOWED_AH = {("ticket", "comment"), ("alert", "raise"), ("heartbeat", "beat")}
+
+    class Recorder:
+        def __init__(self, verdict="PASS", review_rc=0, code=None, pr_head=HEAD):
+            self.verdict, self.review_rc, self.code, self.pr_head = verdict, review_rc, code, pr_head
+            self.argvs = []
+            self.now = 1_800_000_000.0
+
+        def gh(self, argv, timeout):
+            self.argvs.append(list(argv))
+            return 0, json.dumps(live_pr(headRefOid=self.pr_head)), ""
+
+        def clone(self, repo, head, base):
+            self.argvs.append(["git", "clone", repo])
+            return "/clones/x"
+
+        def merge_base(self, clone, head, base):
+            self.argvs.append(["git", "merge-base", head, base])
+            return base
+
+        def changed_paths(self, clone, merge_base, head):
+            self.argvs.append(["git", "diff", "--name-only", merge_base, head])
+            return ["docs/x.md"]
+
+        def review(self, argv, timeout):
+            self.argvs.append(list(argv))
+            if self.code:
+                return 2, "REVIEW_DIAGNOSTIC code=%s reason=x" % self.code
+            out = Path(argv[argv.index("--output") + 1])
+            packet = Path(argv[argv.index("--packet") + 1])
+            sha = hashlib.sha256(packet.read_bytes()).hexdigest()
+            out.write_text(f"Stage: pr\nReviewed HEAD: {HEAD}\nReviewed packet SHA-256: {sha}\n\n"
+                           f"VERDICT: {self.verdict}\n\nF1 - High - x\n")
+            return self.review_rc
+
+        def ah(self, argv, timeout):
+            self.argvs.append(list(argv))
+            return 0, "{}", ""
+
+        def clock(self):
+            return self.now
+
+    def setUp(self):
+        import ahc_runner
+        self.runner = ahc_runner
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.paths = core.Paths(self.home)
+        work = self.home / ".agent-harness" / "work" / "s"
+        work.mkdir(parents=True)
+        self.packet = work / "p.md"
+        self.packet.write_text(f"head {HEAD}\n```\n$ python3 -m unittest\nRan 1 test\nOK\nexit 0\n```\n")
+        self.config = {"repos": [REPO], "work_roots": [str(work.parent)]}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def drive(self, rec, ticks=3):
+        req = {"repo": REPO, "pr": 7, "head": HEAD, "base": BASE, "packet": str(self.packet),
+               "ticket": "GoodQA goodqa#16034", "owner": "agent-abc123"}
+        core.submit(self.paths, self.config, req)
+        for _ in range(ticks):
+            self.runner.tick(self.paths, self.config, rec)
+            rec.now += 5 * 3600   # cross retry, ack and routed escalation deadlines
+        return rec.argvs
+
+    def assert_no_merge(self, argvs):
+        self.assertTrue(argvs, "the fake recorded nothing; the test would be vacuous")
+        for argv in argvs:
+            self.assertFalse(_lands_a_pr(argv), "P0 executed a merge/landing argv: %r" % (argv,))
+            if argv and argv[0] == "ah":
+                self.assertIn(tuple(argv[1:3]), self.ALLOWED_AH, "unexpected ah call %r" % (argv[:3],))
+
+    def test_pass_flow_never_merges_and_only_suggests_text(self):
+        argvs = self.drive(self.Recorder(verdict="PASS"))
+        self.assert_no_merge(argvs)
+        bodies = [a[a.index("--body") + 1] for a in argvs if a[:3] == ["ah", "ticket", "comment"]]
+        self.assertTrue(any("--match-head-commit" in b for b in bodies) or
+                        "--match-head-commit" in self.paths.digest.read_text(),
+                        "the suggested command for main should still be offered as text")
+
+    def test_block_stale_and_error_flows_never_merge(self):
+        for rec in (self.Recorder(verdict="BLOCK", review_rc=3), self.Recorder(pr_head="c" * 40),
+                    self.Recorder(code="PROVIDER_AUTH"), self.Recorder(code="PROVIDER_INVALID_OUTPUT"),
+                    self.Recorder(verdict="PASS-WITH-TICKETS")):
+            with self.subTest(verdict=rec.verdict, code=rec.code, head=rec.pr_head[:4]):
+                self.tearDown()
+                self.setUp()
+                self.assert_no_merge(self.drive(rec))
+
+    def test_source_has_no_merge_argv_literal(self):
+        import ast
+        for name in ("ahc_core.py", "ahc_runner.py", "ahc_clone.py", "ahc_packet.py"):
+            tree = ast.parse((HOOKS / name).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    self.assertNotEqual(node.value.strip(), "merge", "%s has a bare 'merge' argv element" % name)
+                    self.assertIsNone(re.search(r"/pulls/[^ ]*/merge\b", node.value), name)
+                    self.assertNotEqual(node.value.strip(), "push", "%s has a bare 'push' argv element" % name)
+
+    def test_cli_has_no_enable_or_merge_subcommand(self):
+        parser = self.runner.build_parser()
+        actions = [a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction"]
+        self.assertEqual(len(actions), 1)
+        commands = set(actions[0].choices)
+        self.assertEqual(commands, {"submit", "ack", "status", "run"})
+        for word in ("enable", "authority", "merge"):
+            self.assertNotIn(word, commands)
+        with self.assertRaises(SystemExit):
+            with open(os.devnull, "w") as devnull:
+                stderr, sys.stderr = sys.stderr, devnull
+                try:
+                    parser.parse_args(["authority", "enable"])
+                finally:
+                    sys.stderr = stderr
+
+    def test_detector_is_not_vacuous(self):
+        self.assertTrue(_lands_a_pr(["gh", "pr", "merge", "7", "-R", REPO, "--merge"]))
+        self.assertTrue(_lands_a_pr(["gh", "api", "-X", "PUT", "repos/%s/pulls/7/merge" % REPO]))
+        self.assertTrue(_lands_a_pr(["git", "push", "origin", "HEAD:main"]))
+        self.assertFalse(_lands_a_pr(["git", "merge-base", HEAD, BASE]))
+        self.assertFalse(_lands_a_pr(["ah", "ticket", "comment", "t", "--body", "gh pr merge 7 --match-head-commit x"]))
 
 
 if __name__ == "__main__":

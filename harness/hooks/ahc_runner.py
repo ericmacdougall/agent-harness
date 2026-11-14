@@ -1241,7 +1241,8 @@ def _setup_logging(paths):
     log.setLevel(logging.INFO)
 
 
-def main(argv=None):
+def build_parser():
+    """The P0 CLI. It has no merge or `authority enable` subcommand (AC-31); those arrive only with P1/Gate 2."""
     parser = argparse.ArgumentParser(description="ahc coordinator (Gate 1: receipts only, never merges)")
     sub = parser.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("submit", help="queue an exact-head PR receipt request")
@@ -1255,7 +1256,11 @@ def main(argv=None):
     r = sub.add_parser("run", help="run ticks (the daemon loop under launchd)")
     r.add_argument("--once", action="store_true")
     r.add_argument("--interval", type=int, default=60)
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
     paths = core.Paths()
     config = load_config(paths)
     if args.cmd == "submit":
