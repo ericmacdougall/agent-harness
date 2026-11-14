@@ -1,0 +1,70 @@
+module: ops_watch.py at c887363983f5d1f4af7f81bc37114cd1a67ec0f5; tests from the fix tree
+test_overflow_across_batches_and_exact_cap_is_not_overflow (tests.test_ops_watch_proxmox.OverflowOrderTests) ... ERROR
+test_run_returns_overflow_with_empty_output_in_either_order (tests.test_ops_watch_proxmox.OverflowOrderTests) ... test_stderr_overflow_then_small_stdout_in_one_batch_stays_overflow (tests.test_ops_watch_proxmox.OverflowOrderTests) ... ERROR
+test_stdout_overflow_then_small_stderr_in_one_batch_stays_overflow (tests.test_ops_watch_proxmox.OverflowOrderTests) ... ERROR
+
+======================================================================
+ERROR: test_overflow_across_batches_and_exact_cap_is_not_overflow (tests.test_ops_watch_proxmox.OverflowOrderTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 749, in test_overflow_across_batches_and_exact_cap_is_not_overflow
+    _, overflow, _ = self.read_capped([[("out", b"x" * 600)], [("err", b"e" * 10), ("out", b"x" * 401)], self.EOF])
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 735, in read_capped
+    out, overflow = ow._read_capped(sel, None, time.monotonic() + 30, self.CAP, ["x"], 30, read=sel.read)
+AttributeError: module 'ops_watch' has no attribute '_read_capped'
+
+======================================================================
+ERROR: test_stderr_overflow_then_small_stdout_in_one_batch_stays_overflow (tests.test_ops_watch_proxmox.OverflowOrderTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 744, in test_stderr_overflow_then_small_stdout_in_one_batch_stays_overflow
+    _, overflow, sel = self.read_capped([[("err", b"e" * (self.CAP + 1)), ("out", b"o")], self.EOF])
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 735, in read_capped
+    out, overflow = ow._read_capped(sel, None, time.monotonic() + 30, self.CAP, ["x"], 30, read=sel.read)
+AttributeError: module 'ops_watch' has no attribute '_read_capped'
+
+======================================================================
+ERROR: test_stdout_overflow_then_small_stderr_in_one_batch_stays_overflow (tests.test_ops_watch_proxmox.OverflowOrderTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 739, in test_stdout_overflow_then_small_stderr_in_one_batch_stays_overflow
+    _, overflow, sel = self.read_capped([[("out", b"x" * (self.CAP + 1)), ("err", b"e")], self.EOF])
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 735, in read_capped
+    out, overflow = ow._read_capped(sel, None, time.monotonic() + 30, self.CAP, ["x"], 30, read=sel.read)
+AttributeError: module 'ops_watch' has no attribute '_read_capped'
+
+======================================================================
+FAIL: test_run_returns_overflow_with_empty_output_in_either_order (tests.test_ops_watch_proxmox.OverflowOrderTests) (first='out')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 775, in test_run_returns_overflow_with_empty_output_in_either_order
+    self.assertEqual(got, (ow.RUN_OVERFLOW_RC, ""))
+AssertionError: Tuples differ: (0, 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz[961 chars]zzz') != (-1000, '')
+
+First differing element 0:
+0
+-1000
+
+Diff is 1028 characters long. Set self.maxDiff to None to see it.
+
+======================================================================
+FAIL: test_run_returns_overflow_with_empty_output_in_either_order (tests.test_ops_watch_proxmox.OverflowOrderTests) (first='err')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 775, in test_run_returns_overflow_with_empty_output_in_either_order
+    self.assertEqual(got, (ow.RUN_OVERFLOW_RC, ""))
+AssertionError: Tuples differ: (0, 's') != (-1000, '')
+
+First differing element 0:
+0
+-1000
+
+- (0, 's')
++ (-1000, '')
+
+----------------------------------------------------------------------
+Ran 4 tests in 10.112s
+
+FAILED (failures=2, errors=3)
+
+exit 1

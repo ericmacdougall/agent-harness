@@ -1,0 +1,5 @@
+script format: qm list/config (db2f6b11)
+FAIL: container rootdir 300G (qm list does not show CT 120): allocation_complete=True provisioned_gib=1536.0 overcommit_ratio=1.76 allocunknown=False (needs provisioned>=1836 or incomplete)
+FAIL: unused0 detached 300G disk on VM 103: allocation_complete=True provisioned_gib=1536.0 overcommit_ratio=1.76 allocunknown=False (needs provisioned>=1836 or incomplete)
+2 of 2 scenarios under-report
+exit 1

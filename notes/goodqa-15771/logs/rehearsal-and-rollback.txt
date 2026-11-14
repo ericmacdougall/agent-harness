@@ -1,0 +1,15 @@
+HEAD a3b054087e8a5e74417c508d30f7f3572a39c4de
+$ python3 -B rehearsal.py <worktree> <fresh home>
+ops-watch rehearsal: 1 active, 1 transition(s), rc=0
+{"run": "run1 good", "rc": 0, "seconds": 2.81, "ring_events": [["raise", "disk:volume:<pve-host>:/var/lib/vz", "high"]], "active": ["disk:volume:<pve-host>:/var/lib/vz"], "samples": 1, "last_sample_vms": ["102", "103"]}
+ops-watch rehearsal: 2 active, 1 transition(s), rc=0
+{"run": "run2 bad storage", "rc": 0, "seconds": 1.59, "ring_events": [["raise", "disk:unknown:<pve-host>:/var/lib/vz", "warning"]], "active": ["disk:unknown:<pve-host>:/var/lib/vz", "disk:volume:<pve-host>:/var/lib/vz"], "samples": 1, "last_sample_vms": ["102", "103"]}
+ops-watch rehearsal: 1 active, 1 transition(s), rc=0
+{"run": "run3 good", "rc": 0, "seconds": 2.77, "ring_events": [["clear", "disk:unknown:<pve-host>:/var/lib/vz", "warning"]], "active": ["disk:volume:<pve-host>:/var/lib/vz"], "samples": 1, "last_sample_vms": ["102", "103"]}
+exit 0
+$ python3 -B rollback_rehearsal.py <worktree> <same home>
+ops-watch rehearsal: 0 active, 1 transition(s), rc=0
+{"run": "disabled (proxmox_pools = [])", "ssh_calls": 0, "ring_events": [["clear", "disk:volume:<pve-host>:/var/lib/vz"]], "active": [], "stored_samples": 1}
+ops-watch rehearsal: 1 active, 1 transition(s), rc=0
+{"run": "re-enabled", "ssh_calls": 1, "ring_events": [["raise", "disk:volume:<pve-host>:/var/lib/vz"]], "active": ["disk:volume:<pve-host>:/var/lib/vz"], "stored_samples": 1}
+exit 0

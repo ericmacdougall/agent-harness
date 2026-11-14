@@ -1,0 +1,6 @@
+HEAD a3b054087e8a5e74417c508d30f7f3572a39c4de
+$ python3 -B live_probe.py <worktree>
+head script: pvesm list + find
+ssh calls: [{"rc": 0, "seconds": 2.8, "bytes": 3489, "markers": ["##RC PVESM 0", "##RC VOLS 0", "##RC FILES 0", "##RC DU 102 0", "##RC DU 103 0"]}]
+{"detail": {"allocation_complete": true, "free_bytes": 51849797632, "host": "<pve-host>", "overcommit_ratio": 1.8, "provisioned_gib": 1576.04, "storage": "local", "total_bytes": 938391687168, "total_gib": 873.95, "unsized_vms": [], "used_pct": 93.5, "vms": {"102": {"actual_gib": 17.08, "allocated_gib": 200.0, "growth_gib_day": null}, "103": {"actual_gib": 28.19, "allocated_gib": 500.0, "growth_gib_day": null}}}, "key": "disk:volume:<pve-host>:/var/lib/vz", "message": "<pve-host> local pool 93.5% used, 48 GiB free, 1.8x overcommitted", "severity": "high"}
+exit 0

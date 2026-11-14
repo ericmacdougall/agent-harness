@@ -1,0 +1,325 @@
+HEAD a3b054087e8a5e74417c508d30f7f3572a39c4de
+$ python3 -B -m unittest -v tests.test_ops_watch tests.test_ops_watch_proxmox tests.test_deploy_drift
+test_a_failed_refresh_is_written_by_a_later_run (tests.test_ops_watch.AlertTextRefreshTests) ... ok
+test_a_refresh_is_not_a_new_alert_for_digests_or_mail (tests.test_ops_watch.AlertTextRefreshTests) ... ok
+test_a_refresh_sends_no_deadman_mail (tests.test_ops_watch.AlertTextRefreshTests) ... ops-watch: deadman delivery failed; 1 queued
+ops-watch: deadman delivery failed; 1 queued
+ok
+test_alert_active_before_this_fix_catches_up_on_the_first_run (tests.test_ops_watch.AlertTextRefreshTests) ... ok
+test_changed_words_refresh_the_active_alert (tests.test_ops_watch.AlertTextRefreshTests) ... ok
+test_flapping_text_is_bounded (tests.test_ops_watch.AlertTextRefreshTests) ... ok
+test_non_string_ring_message_does_not_break_a_run (tests.test_ops_watch.AlertTextRefreshTests) ... ok
+test_number_only_changes_refresh_at_most_hourly_and_never_get_lost (tests.test_ops_watch.AlertTextRefreshTests) ... ok
+test_unchanged_text_writes_nothing (tests.test_ops_watch.AlertTextRefreshTests) ... ok
+test_hash_matches_live_verified_algorithm (tests.test_ops_watch.CodexTrustTests) ... ok
+test_missing_and_tampered (tests.test_ops_watch.CodexTrustTests) ... ok
+test_trusted_is_silent (tests.test_ops_watch.CodexTrustTests) ... ok
+test_old_reports_ignored (tests.test_ops_watch.CrashTests) ... ok
+test_other_crash_is_warning (tests.test_ops_watch.CrashTests) ... ok
+test_python_sandbox_sigkill_high_and_redacted (tests.test_ops_watch.CrashTests) ... ok
+test_dirty_and_off_main (tests.test_ops_watch.DeliveryTests) ... ok
+test_missing_checkout (tests.test_ops_watch.DeliveryTests) ... ok
+test_codex_hash_drops_unhashed_fields (tests.test_ops_watch.DeltaTests) ... ok
+test_comment_fallback_list (tests.test_ops_watch.DeltaTests) ... ok
+test_deadman_remote_tilde_kept_and_subject_safe (tests.test_ops_watch.DeltaTests) ... ok
+test_heavy_suite_on_no_heavy_host (tests.test_ops_watch.DeltaTests) ... ok
+test_macos_reads_data_volume_first (tests.test_ops_watch.DeltaTests) ... ok
+test_same_device_reported_once_under_first_path (tests.test_ops_watch.DeltaTests) ... ok
+test_one_digest_per_interval (tests.test_ops_watch.DigestAndUninstallTests) ... ok
+test_uninstall_plan_moves_not_deletes (tests.test_ops_watch.DigestAndUninstallTests) ... ok
+test_a_measurement_older_than_three_hours_is_not_called_over (tests.test_ops_watch.DiskTests) ... ok
+test_back_under_budget_clears_the_flag_and_keeps_the_dir (tests.test_ops_watch.DiskTests) ... ok
+test_du_timeout_splits_and_flags_unmeasured (tests.test_ops_watch.DiskTests) ... ok
+test_free_floor_is_critical (tests.test_ops_watch.DiskTests) ... ok
+test_growth_names_top_three (tests.test_ops_watch.DiskTests) ... ok
+test_kit_can_declare_a_bigger_budget_but_not_an_unbounded_one (tests.test_ops_watch.DiskTests) ... ok
+test_malformed_kit_budget_cannot_break_the_disk_check (tests.test_ops_watch.DiskTests) ... ok
+test_owner_over_budget_alerts_by_name_and_writes_state (tests.test_ops_watch.DiskTests) ... ok
+test_thresholds (tests.test_ops_watch.DiskTests) ... ok
+test_unmeasured_owner_is_never_called_over (tests.test_ops_watch.DiskTests) ... ok
+test_volume_growth_unattributed (tests.test_ops_watch.DiskTests) ... ok
+test_claude_block_and_hooks (tests.test_ops_watch.DriftTests) ... ok
+test_no_repo_skips (tests.test_ops_watch.DriftTests) ... ok
+test_76g_orphan_is_critical_and_names_pid_cwd_owner (tests.test_ops_watch.FootprintTests) ... ok
+test_failed_top_raises_so_alerts_are_kept (tests.test_ops_watch.FootprintTests) ... ok
+test_growth_rate_and_pid_reuse (tests.test_ops_watch.FootprintTests) ... ok
+test_jetsam_counts_names_only (tests.test_ops_watch.FootprintTests) ... ok
+test_thresholds (tests.test_ops_watch.FootprintTests) ... ok
+test_new_activity_clears (tests.test_ops_watch.LivenessTests) ... ok
+test_open_ticket_quiet_three_hours (tests.test_ops_watch.LivenessTests) ... ok
+test_silent_owner_and_exemptions (tests.test_ops_watch.LivenessTests) ... ok
+test_injection_folds_liveness (tests.test_ops_watch.LivenessV2Tests) ... ok
+test_new_activity_clears (tests.test_ops_watch.LivenessV2Tests) ... ok
+test_open_ticket_quiet_three_hours (tests.test_ops_watch.LivenessV2Tests) ... ok
+test_silent_owner_and_exemptions (tests.test_ops_watch.LivenessV2Tests) ... ok
+test_closed_ticket_retires_task_wal (tests.test_ops_watch.OwnerRuleTests) ... ok
+test_dead_session_is_history_unless_already_alerting (tests.test_ops_watch.OwnerRuleTests) ... ok
+test_grace_before_dropped (tests.test_ops_watch.OwnerRuleTests) ... ok
+test_named_general_purpose_owner_counts (tests.test_ops_watch.OwnerRuleTests) ... ok
+test_new_activity_clears (tests.test_ops_watch.OwnerRuleTests) ... ok
+test_open_ticket_quiet_three_hours (tests.test_ops_watch.OwnerRuleTests) ... ok
+test_outcomes_helpers_and_waits_do_not_drop (tests.test_ops_watch.OwnerRuleTests) ... ok
+test_running_owner_silence_severity (tests.test_ops_watch.OwnerRuleTests) ... ok
+test_silent_owner_and_exemptions (tests.test_ops_watch.OwnerRuleTests) ... ok
+test_stop_then_resume_is_live_and_true_stop_drops (tests.test_ops_watch.OwnerRuleTests) ... ok
+test_task_text_stays_out_of_alerts (tests.test_ops_watch.OwnerRuleTests) ... ok
+test_task_wal_retires (tests.test_ops_watch.OwnerRuleTests) ... ok
+test_agent_spawned_shells_and_ssh (tests.test_ops_watch.ProcessDeltaTests) ... ok
+test_swap_and_pressure_macos (tests.test_ops_watch.ProcessDeltaTests) ... ok
+test_swap_linux_meminfo (tests.test_ops_watch.ProcessDeltaTests) ... ok
+test_orphans_runaway_and_counts (tests.test_ops_watch.ProcessTests) ... ok
+test_quiet_host (tests.test_ops_watch.ProcessTests) ... ok
+test_cap_raises_instead_of_cutting (tests.test_ops_watch.ReadCapTests) ... ok
+test_oversized_file_keeps_the_alert_and_reports_check_error (tests.test_ops_watch.ReadCapTests) ... ops-watch: drift check failed: OSError
+ok
+test_command_allowlist (tests.test_ops_watch.ReadOnlyTests) ... ok
+test_check_error_does_not_clear_and_alerts (tests.test_ops_watch.ReconcileAndRunTests) ... ops-watch: disk check failed: RuntimeError
+ok
+test_dedup_clear_reraise (tests.test_ops_watch.ReconcileAndRunTests) ... ok
+test_escalation_and_critical_deadman (tests.test_ops_watch.ReconcileAndRunTests) ... ok
+test_injection_never_raises_on_garbage (tests.test_ops_watch.ReconcileAndRunTests) ... ok
+test_injection_text (tests.test_ops_watch.ReconcileAndRunTests) ... ok
+test_sink_failure_exit2_and_retry (tests.test_ops_watch.ReconcileAndRunTests) ... ops-watch: comment delivery failed; 1 queued
+ops-watch: comment delivery failed; 2 queued
+ok
+test_new_activity_clears (tests.test_ops_watch.RedTeamRound1Tests) ... ok
+test_open_ticket_quiet_three_hours (tests.test_ops_watch.RedTeamRound1Tests) ... ok
+test_planted_secret_and_instruction_never_injected (tests.test_ops_watch.RedTeamRound1Tests) ... ok
+test_silent_owner_and_exemptions (tests.test_ops_watch.RedTeamRound1Tests) ... ok
+test_a_failed_run_alerts_high (tests.test_ops_watch.RemoteUnitTests) ... ok
+test_a_missing_unit_or_an_inactive_timer_alerts (tests.test_ops_watch.RemoteUnitTests) ... ok
+test_a_recent_success_is_silent_and_the_ssh_call_is_read_only_and_bounded (tests.test_ops_watch.RemoteUnitTests) ... ok
+test_a_run_job_with_no_stored_success_is_not_called_stale (tests.test_ops_watch.RemoteUnitTests) ... ok
+test_a_success_older_than_the_limit_alerts_stale (tests.test_ops_watch.RemoteUnitTests) ... ok
+test_an_unreadable_host_keeps_the_last_alerts_instead_of_clearing_them (tests.test_ops_watch.RemoteUnitTests) ... ok
+test_bad_max_age_is_a_config_alert_and_long_names_keep_distinct_keys (tests.test_ops_watch.RemoteUnitTests) ... ok
+test_never_run_counts_from_the_timer_start (tests.test_ops_watch.RemoteUnitTests) ... ok
+test_result_success_wins_over_a_nonzero_success_exit_status (tests.test_ops_watch.RemoteUnitTests) ... ok
+test_the_check_is_registered (tests.test_ops_watch.RemoteUnitTests) ... ok
+test_unreachable_warns_only_after_a_grace_period (tests.test_ops_watch.RemoteUnitTests) ... ok
+test_unsafe_host_or_unit_names_are_never_sent_to_ssh (tests.test_ops_watch.RemoteUnitTests) ... ok
+test_downgrade_replaces_message_and_deadman_once (tests.test_ops_watch.ReviewFixTests) ... ok
+test_fifo_ring_does_not_hang_injection (tests.test_ops_watch.ReviewFixTests) ... ok
+test_growth_rate_keeps_baseline_pair (tests.test_ops_watch.ReviewFixTests) ... ok
+test_injection_sanitizes (tests.test_ops_watch.ReviewFixTests) ... ok
+test_large_queue_posts_in_chunks_without_loss (tests.test_ops_watch.ReviewFixTests) ... ok
+test_lost_state_still_clears (tests.test_ops_watch.ReviewFixTests) ... ok
+test_ring_write_failure_exit2 (tests.test_ops_watch.ReviewFixTests) ... ops-watch: alert ring write failed (OSError): disk:volume:/
+ops-watch: alert ring write failed (OSError): disk:volume:/
+ok
+test_sink_failure_reaches_ring_then_clears (tests.test_ops_watch.ReviewFixTests) ... ops-watch: comment delivery failed; 1 queued
+ok
+test_stray_append_keeps_ring (tests.test_ops_watch.ReviewFixTests) ... ok
+test_unknown_comment_mode_does_not_strand_state (tests.test_ops_watch.ReviewFixTests) ... ops-watch: comment delivery failed; 1 queued
+ops-watch: comment delivery failed; 2 queued
+ops-watch: comment delivery failed; 2 queued
+ok
+test_default_sinks_critical_does_not_wedge (tests.test_ops_watch.ReviewRound2Tests) ... ok
+test_hysteresis_no_flap (tests.test_ops_watch.ReviewRound2Tests) ... ok
+test_lost_response_resends_identical_chunk (tests.test_ops_watch.ReviewRound2Tests) ... ok
+test_suite_kind (tests.test_ops_watch.ReviewRound2Tests) ... ok
+test_a_clear_under_the_current_name_clears_a_raise_written_under_an_old_name (tests.test_ops_watch.RingHostLabelTests) ... ok
+test_one_ask_under_two_host_names_is_one_active_alert (tests.test_ops_watch.RingHostLabelTests) ... ok
+test_other_sources_keep_their_own_host_identity (tests.test_ops_watch.RingHostLabelTests) ... ok
+test_corrupt_slot_tolerated (tests.test_ops_watch.RingTests) ... ok
+test_preallocated_fixed_size_and_wrap (tests.test_ops_watch.RingTests) ... ok
+test_required_fields (tests.test_ops_watch.RingTests) ... ok
+test_only_the_real_drop_alerts (tests.test_ops_watch.SharedOwnerRuleTests) ... ok
+test_stopped_helper_returned_and_new_stop_is_not_a_drop (tests.test_ops_watch.SharedRuleClassifyTests) ... ok
+test_a_scan_that_raises_is_silent_not_a_crash (tests.test_ops_watch.StaleRuntimeTests) ... ok
+test_message_and_detail_are_bounded_and_clean (tests.test_ops_watch.StaleRuntimeTests) ... ok
+test_nothing_stale_is_silent (tests.test_ops_watch.StaleRuntimeTests) ... ok
+test_stale_runtimes_raise_one_warning_naming_pids_and_the_remedy (tests.test_ops_watch.StaleRuntimeTests) ... ok
+test_the_check_is_registered_and_can_be_disabled (tests.test_ops_watch.StaleRuntimeTests) ... ok
+test_failed_and_reclaim (tests.test_ops_watch.UnitsTests) ... ok
+test_healthy_is_silent (tests.test_ops_watch.UnitsTests) ... ok
+test_corrupt_ring_never_blocks_prompt (tests.test_ops_watch.WalInjectionTests) ... ok
+test_prompt_and_subagent_carry_active_alerts (tests.test_ops_watch.WalInjectionTests) ... ok
+test_container_on_a_storage_without_rootdir_content_is_incomplete (tests.test_ops_watch_proxmox.AllVolumesTests) ... ok
+test_detached_unused_disk_counts_toward_its_vm (tests.test_ops_watch_proxmox.AllVolumesTests) ... ok
+test_image_file_pvesm_did_not_list_is_incomplete (tests.test_ops_watch_proxmox.AllVolumesTests) ... ok
+test_linked_clone_volid_is_tied_to_its_owner (tests.test_ops_watch_proxmox.AllVolumesTests) ... ok
+test_orphan_volume_without_a_guest_counts (tests.test_ops_watch_proxmox.AllVolumesTests) ... ok
+test_raw_container_volume_counts (tests.test_ops_watch_proxmox.AllVolumesTests) ... ok
+test_snapshot_chain_file_pvesm_skips_is_incomplete (tests.test_ops_watch_proxmox.AllVolumesTests) ... ok
+test_subvol_container_volume_without_size_is_incomplete (tests.test_ops_watch_proxmox.AllVolumesTests) ... ok
+test_truncated_listing_with_status_zero_cannot_hide_a_volume (tests.test_ops_watch_proxmox.AllVolumesTests) ... ok
+test_unusable_file_listing_line_is_incomplete (tests.test_ops_watch_proxmox.AllVolumesTests) ... ok
+test_output_under_the_cap_is_returned_and_stderr_discarded (tests.test_ops_watch_proxmox.BoundedRunTests) ... ok
+test_pool_probe_is_capped_at_1_mib_and_overflow_is_unknown (tests.test_ops_watch_proxmox.BoundedRunTests) ... ok
+test_stderr_overflow_is_capped_too (tests.test_ops_watch_proxmox.BoundedRunTests) ... ok
+test_stdout_overflow_kills_reaps_and_reports_overflow (tests.test_ops_watch_proxmox.BoundedRunTests) ... ok
+test_timeout_still_raises_and_reaps (tests.test_ops_watch_proxmox.BoundedRunTests) ... ok
+test_disabled_by_default_and_registered (tests.test_ops_watch_proxmox.CommandAndConfigTests) ... ok
+test_the_remote_script_is_one_fixed_read_only_call (tests.test_ops_watch_proxmox.CommandAndConfigTests) ... ok
+test_unsafe_config_is_refused_before_ssh (tests.test_ops_watch_proxmox.CommandAndConfigTests) ... ok
+test_complete_read_reports_overcommit_and_no_allocunknown (tests.test_ops_watch_proxmox.CompletionStatusTests) ... ok
+test_failed_listing_is_unknown_and_keeps_pool_capacity (tests.test_ops_watch_proxmox.CompletionStatusTests) ... ok
+test_failed_or_missing_file_listing_status_is_incomplete (tests.test_ops_watch_proxmox.CompletionStatusTests) ... ok
+test_failed_pvesm_status_is_unusable_even_with_a_good_looking_table (tests.test_ops_watch_proxmox.CompletionStatusTests) ... ok
+test_failure_after_one_sized_disk_does_not_pass_as_a_complete_subtotal (tests.test_ops_watch_proxmox.CompletionStatusTests) ... ok
+test_listing_that_fails_after_a_valid_prefix_is_unknown_not_partial (tests.test_ops_watch_proxmox.CompletionStatusTests) ... ok
+test_missing_status_line_for_the_listing_is_incomplete (tests.test_ops_watch_proxmox.CompletionStatusTests) ... ok
+test_one_unsized_unwatched_volume_marks_allocation_unknown_only (tests.test_ops_watch_proxmox.CompletionStatusTests) ... ok
+test_script_records_each_command_status (tests.test_ops_watch_proxmox.CompletionStatusTests) ... ok
+test_a_status_without_its_subtotal_or_a_duplicate_subtotal_is_unknown (tests.test_ops_watch_proxmox.DuStatusTests) ... ok
+test_du_that_fails_but_prints_a_plausible_subtotal_is_unknown (tests.test_ops_watch_proxmox.DuStatusTests) ... ok
+test_du_that_times_out_after_a_valid_prefix_is_unknown (tests.test_ops_watch_proxmox.DuStatusTests) ... ok
+test_du_with_missing_status_is_unknown (tests.test_ops_watch_proxmox.DuStatusTests) ... ok
+test_every_remote_command_reports_its_own_status (tests.test_ops_watch_proxmox.DuStatusTests) ... ok
+test_failed_du_does_not_feed_vm_growth (tests.test_ops_watch_proxmox.DuStatusTests) ... ok
+test_clock_going_backwards_does_not_divide_by_zero (tests.test_ops_watch_proxmox.GrowthTests) ... ok
+test_fast_growth_with_little_headroom_is_high (tests.test_ops_watch_proxmox.GrowthTests) ... ok
+test_growth_over_threshold_alerts_and_fills_vm_growth (tests.test_ops_watch_proxmox.GrowthTests) ... ok
+test_samples_are_bounded_and_ignore_failed_reads (tests.test_ops_watch_proxmox.GrowthTests) ... ok
+test_shrink_and_counter_reset_give_no_growth_alert (tests.test_ops_watch_proxmox.GrowthTests) ... ok
+test_slow_growth_is_silent (tests.test_ops_watch_proxmox.GrowthTests) ... ok
+test_too_fresh_baseline_gives_no_growth_alert (tests.test_ops_watch_proxmox.GrowthTests) ... ok
+test_overflow_across_batches_and_exact_cap_is_not_overflow (tests.test_ops_watch_proxmox.OverflowOrderTests) ... ok
+test_run_returns_overflow_with_empty_output_in_either_order (tests.test_ops_watch_proxmox.OverflowOrderTests) ... ok
+test_stderr_overflow_then_small_stdout_in_one_batch_stays_overflow (tests.test_ops_watch_proxmox.OverflowOrderTests) ... ok
+test_stdout_overflow_then_small_stderr_in_one_batch_stays_overflow (tests.test_ops_watch_proxmox.OverflowOrderTests) ... ok
+test_both_header_styles_parse_to_the_same_numbers (tests.test_ops_watch_proxmox.RealFormatTests) ... ok
+test_login_user_is_used_for_ssh_but_never_shown_in_alerts (tests.test_ops_watch_proxmox.RealFormatTests) ... ok
+test_real_pvesm_header_with_kib_units_parses (tests.test_ops_watch_proxmox.RealFormatTests) ... ok
+test_a_watched_vm_with_no_volume_on_the_pool_is_unknown_even_with_other_vms_present (tests.test_ops_watch_proxmox.RedTeamRound1Tests) ... ok
+test_baseline_closest_to_a_day_is_preferred (tests.test_ops_watch_proxmox.RedTeamRound1Tests) ... ok
+test_complete_read_has_no_vmunknown (tests.test_ops_watch_proxmox.RedTeamRound1Tests) ... ok
+test_growth_window_reaches_48_hours (tests.test_ops_watch_proxmox.RedTeamRound1Tests) ... ok
+test_partial_read_below_every_threshold_still_raises_unknown_for_watched_vms (tests.test_ops_watch_proxmox.RedTeamRound1Tests) ... ok
+test_trailing_slash_mount_keeps_one_key_and_state_record (tests.test_ops_watch_proxmox.RedTeamRound1Tests) ... ok
+test_unsized_volume_keeps_sized_siblings_and_iso_does_not_count (tests.test_ops_watch_proxmox.RedTeamRound1Tests) ... ok
+test_ring_holds_the_high_alert_through_run_once (tests.test_ops_watch_proxmox.RunOnceTests) ... ok
+test_current_pool_state_is_high_with_overcommit_and_vm_detail (tests.test_ops_watch_proxmox.ThresholdTests) ... ok
+test_each_threshold_and_the_floor (tests.test_ops_watch_proxmox.ThresholdTests) ... ok
+test_free_floor_is_critical_even_at_a_low_percentage (tests.test_ops_watch_proxmox.ThresholdTests) ... ok
+test_provisioned_counts_only_guest_volumes_not_iso_template_or_backup (tests.test_ops_watch_proxmox.ThresholdTests) ... ok
+test_last_good_alerts_are_carried_forward_during_an_outage (tests.test_ops_watch_proxmox.UnknownTests) ... ok
+test_malformed_pvesm_output_fails_closed (tests.test_ops_watch_proxmox.UnknownTests) ... ok
+test_no_remote_text_secret_or_address_reaches_the_alert (tests.test_ops_watch_proxmox.UnknownTests) ... ok
+test_recovery_clears_unknown (tests.test_ops_watch_proxmox.UnknownTests) ... ok
+test_truncated_probe_without_end_marker_is_unknown (tests.test_ops_watch_proxmox.UnknownTests) ... ok
+test_unknown_turns_high_after_30_minutes_without_a_good_read (tests.test_ops_watch_proxmox.UnknownTests) ... ok
+test_unreachable_nonzero_exit_and_timeout_are_unknown_never_green (tests.test_ops_watch_proxmox.UnknownTests) ... ok
+test_garbled_vm_lines_degrade_that_vm_not_the_pool_alert (tests.test_ops_watch_proxmox.VmDetailTests) ... ok
+test_sizes_are_bytes (tests.test_ops_watch_proxmox.VmDetailTests) ... ok
+test_error_only_listing_is_unknown_below_thresholds (tests.test_ops_watch_proxmox.VolumeListFormatTests) ... ok
+test_guest_row_that_cannot_be_tied_to_one_vm_is_unknown (tests.test_ops_watch_proxmox.VolumeListFormatTests) ... ok
+test_missing_or_changed_header_is_unknown (tests.test_ops_watch_proxmox.VolumeListFormatTests) ... ok
+test_non_numeric_or_zero_size_flags_that_vm_only (tests.test_ops_watch_proxmox.VolumeListFormatTests) ... ok
+test_unwatched_vm_without_volumes_is_fine (tests.test_ops_watch_proxmox.VolumeListFormatTests) ... ok
+test_a_deploy_at_head_or_a_young_merge_is_quiet (tests.test_deploy_drift.MergedNotDeployed) ... ok
+test_commits_merged_but_not_deployed_for_over_two_hours_alarm (tests.test_deploy_drift.MergedNotDeployed) ... ok
+test_no_deploy_record_or_a_foreign_sha_is_reported_not_trusted (tests.test_deploy_drift.MergedNotDeployed) ... ok
+test_the_check_is_registered_and_can_be_switched_off (tests.test_deploy_drift.MergedNotDeployed) ... ok
+test_a_pending_id_older_than_six_hours_with_no_test_alarms_per_session (tests.test_deploy_drift.OpenPending) ... ok
+test_a_pending_raised_again_after_a_test_is_open_again (tests.test_deploy_drift.OpenPending) ... ok
+test_a_tested_id_in_another_session_does_not_close_it_and_a_clean_session_is_quiet (tests.test_deploy_drift.OpenPending) ... ok
+test_an_unreadable_wal_is_reported_not_skipped_so_a_real_alarm_cannot_clear (tests.test_deploy_drift.OpenPending) ... ok
+test_restating_a_pending_in_a_recap_does_not_restart_its_clock (tests.test_deploy_drift.OpenPending) ... ok
+test_a_deployed_sha_unknown_to_the_repo_is_reported (tests.test_deploy_drift.RealGitAncestry) ... ok
+test_a_failing_git_call_is_a_check_error_not_silence (tests.test_deploy_drift.RealGitAncestry) ... ok
+test_behind_young_is_quiet_and_behind_old_alerts_as_behind (tests.test_deploy_drift.RealGitAncestry) ... ok
+test_deployed_ahead_of_head_or_at_head_is_quiet (tests.test_deploy_drift.RealGitAncestry) ... ok
+test_diverged_with_old_commits_is_divergence_not_merely_behind (tests.test_deploy_drift.RealGitAncestry) ... ok
+test_diverged_with_young_commits_only_on_head_alerts_naming_both_shas (tests.test_deploy_drift.RealGitAncestry) ... ok
+
+----------------------------------------------------------------------
+Ran 211 tests in 278.454s
+
+OK
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=2
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 2 active, 2 transition(s), rc=2
+ops-watch testhost: 2 active, 1 transition(s), rc=2
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 2 transition(s), rc=0
+ops-watch testhost: 1 active, 2 transition(s), rc=0
+ops-watch testhost: 1 active, 2 transition(s), rc=0
+ops-watch testhost: 0 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 0 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 0 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 0 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 2 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 2 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 0 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 2 active, 2 transition(s), rc=2
+ops-watch testhost: 2 active, 0 transition(s), rc=2
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 0 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 0 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=2
+ops-watch testhost: 2 active, 2 transition(s), rc=2
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 2 active, 2 transition(s), rc=2
+ops-watch testhost: 2 active, 0 transition(s), rc=2
+ops-watch testhost: 2 active, 0 transition(s), rc=2
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 0 transition(s), rc=0
+ops-watch testhost: 1 active, 1 transition(s), rc=0
+ops-watch testhost: 2 active, 1 transition(s), rc=0
+exit 0

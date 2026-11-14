@@ -1,0 +1,47 @@
+7bb3aa2951fdaf193a49a4cc8fe788be40093877
+EEEEE
+======================================================================
+ERROR: test_output_under_the_cap_is_returned_and_stderr_discarded (tests.test_ops_watch_proxmox.BoundedRunTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 621, in test_output_under_the_cap_is_returned_and_stderr_discarded
+    self.assertEqual(ow.run([sys.executable, "-c", code], 20, stdin="abc", max_bytes=self.CAP), (3, "ABC\n"))
+TypeError: run() got an unexpected keyword argument 'max_bytes'
+
+======================================================================
+ERROR: test_pool_probe_is_capped_at_1_mib_and_overflow_is_unknown (tests.test_ops_watch_proxmox.BoundedRunTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 634, in test_pool_probe_is_capped_at_1_mib_and_overflow_is_unknown
+    runner = Runner((ow.RUN_OVERFLOW_RC, ""))
+AttributeError: module 'ops_watch' has no attribute 'RUN_OVERFLOW_RC'
+
+======================================================================
+ERROR: test_stderr_overflow_is_capped_too (tests.test_ops_watch_proxmox.BoundedRunTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 616, in test_stderr_overflow_is_capped_too
+    self.assertEqual(ow.run(argv, 20, max_bytes=self.CAP), (ow.RUN_OVERFLOW_RC, ""))
+TypeError: run() got an unexpected keyword argument 'max_bytes'
+
+======================================================================
+ERROR: test_stdout_overflow_kills_reaps_and_reports_overflow (tests.test_ops_watch_proxmox.BoundedRunTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 610, in test_stdout_overflow_kills_reaps_and_reports_overflow
+    self.assertEqual(ow.run(argv, 20, max_bytes=self.CAP), (ow.RUN_OVERFLOW_RC, ""))
+TypeError: run() got an unexpected keyword argument 'max_bytes'
+
+======================================================================
+ERROR: test_timeout_still_raises_and_reaps (tests.test_ops_watch_proxmox.BoundedRunTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 628, in test_timeout_still_raises_and_reaps
+    ow.run(argv, 1, max_bytes=self.CAP)
+TypeError: run() got an unexpected keyword argument 'max_bytes'
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.002s
+
+FAILED (errors=5)
+exit 1

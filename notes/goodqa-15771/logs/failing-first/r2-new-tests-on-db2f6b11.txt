@@ -1,0 +1,9 @@
+ops-watch testhost: 4 active, 4 transition(s), rc=0
+ops-watch testhost: 5 active, 1 transition(s), rc=0
+new tests on db2f6b11: Ran 55, 21 failures, 0 errors
+AllVolumesTests failing: ['test_container_rootdir_volume_counts', 'test_detached_unused_disk_counts_toward_its_vm', 'test_image_file_pvesm_did_not_list_is_incomplete', 'test_linked_clone_volid_is_tied_to_its_owner', 'test_subvol_container_volume_without_size_is_incomplete']
+AllVolumesTests passing: ['test_truncated_listing_with_status_zero_cannot_hide_a_volume', 'test_unusable_file_listing_line_is_incomplete']
+CompletionStatusTests failing: ['test_complete_read_reports_overcommit_and_no_allocunknown', 'test_one_unsized_unwatched_volume_marks_allocation_unknown_only', 'test_script_records_each_command_status']
+CompletionStatusTests passing: ['test_failed_listing_is_unknown_and_keeps_pool_capacity', 'test_failed_or_missing_file_listing_status_is_incomplete', 'test_failed_pvesm_status_is_unusable_even_with_a_good_looking_table', 'test_failure_after_one_sized_disk_does_not_pass_as_a_complete_subtotal', 'test_listing_that_fails_after_a_valid_prefix_is_unknown_not_partial', 'test_missing_status_line_for_the_listing_is_incomplete']
+VolumeListFormatTests failing: ['test_unwatched_vm_without_volumes_is_fine']
+VolumeListFormatTests passing: ['test_error_only_listing_is_unknown_below_thresholds', 'test_guest_row_that_cannot_be_tied_to_one_vm_is_unknown', 'test_missing_or_changed_header_is_unknown', 'test_non_numeric_or_zero_size_flags_that_vm_only']
