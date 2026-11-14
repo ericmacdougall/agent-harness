@@ -29,7 +29,41 @@ def safe_id(value: object) -> str:
     return f"z-{stem}-{digest}"
 
 
-def append(path: Path, record: dict) -> None:
+OP_KEY_RE = re.compile(r"[A-Za-z0-9._:-]{8,160}")
+OP_KEY_SCAN_LIMIT = 64 * 1024 * 1024  # a keyed append reads the whole log under its lock; beyond this it refuses
+
+
+def _find_op_key(fd: int, key: str):
+    """The record carrying ``"op_key": key`` in the open log, else None. Caller holds the file lock."""
+    end = os.lseek(fd, 0, os.SEEK_END)
+    if end > OP_KEY_SCAN_LIMIT:
+        raise ValueError("WAL too large for a keyed append")
+    data, offset = bytearray(), 0
+    while offset < end:
+        chunk = os.pread(fd, min(1 << 20, end - offset), offset)
+        if not chunk:
+            break
+        data += chunk
+        offset += len(chunk)
+    needle = b'"op_key":' + json.dumps(key).encode()
+    for line in bytes(data).splitlines():
+        if needle in line:
+            try:
+                found = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(found, dict) and found.get("op_key") == key:
+                return found
+    return None
+
+
+def append(path: Path, record: dict, unique_key=None):
+    """Append one record. With ``unique_key`` (also stored as the record's ``op_key``), an earlier record with that
+    key wins: it is returned and nothing is written. Returns None when the record was appended."""
+    if unique_key is not None:
+        if not isinstance(unique_key, str) or not OP_KEY_RE.fullmatch(unique_key):
+            raise ValueError("op key must be 8-160 characters of [A-Za-z0-9._:-]")
+        record = dict(record, op_key=unique_key)
     root = Path.home() / ".claude" / "wals"
     if (path.parent.parent != root or path.suffix != ".jsonl"
             or not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", path.parent.name)
@@ -114,6 +148,12 @@ def append(path: Path, record: dict) -> None:
             os.ftruncate(fd, end - scan + last_newline + 1)
             if not current_target():
                 raise ValueError("WAL target changed during crash recovery")
+        if unique_key is not None:
+            # Exactly once per key (goodqa#15946 r2 F4): the check and the append share this file lock, so a retry
+            # after a crash and a concurrent writer both find the first record instead of adding a second.
+            existing = _find_op_key(fd, unique_key)
+            if existing is not None:
+                return existing
         # A short write must not silently report a complete record.
         with os.fdopen(fd, "ab", closefd=False) as handle:
             handle.write(payload)

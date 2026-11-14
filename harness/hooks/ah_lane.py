@@ -14,7 +14,6 @@ import re
 import subprocess
 import sys
 import time
-import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -38,7 +37,6 @@ class TicketPort:
         self.sf = sf
         self.policy = sf.load_spec_policy()
         _, _, self.config = sf.ticket_config(self.policy)
-        self._pending = []
         self._issue = {}
 
     def _adapter(self, project):
@@ -63,20 +61,25 @@ class TicketPort:
 
     def list_attachments(self, ref):
         ad, t = self._ticket(ref)
-        return [{"id": a.get("id"), "name": a.get("filename") or a.get("name"), "sha256": a.get("sha256")}
-                for a in ad.attachments(t.id)]
+        def name(a):
+            meta = a.get("metadata") if isinstance(a.get("metadata"), dict) else {}
+            return a.get("filename") or a.get("name") or meta.get("filename")
+        # issue_attachments_list answers only files a comment on this issue linked; unlinked uploads never appear
+        return [{"id": a.get("id"), "name": name(a), "sha256": a.get("sha256")} for a in ad.attachments(t.id)]
 
     def upload(self, ref, name, data):
+        """A project-surface upload: the file is NOT on the issue until a comment names its id. The caller persists
+        the returned id before commenting; nothing is kept in this process."""
         import hashlib  # noqa: PLC0415
         ad, t = self._ticket(ref)
-        attachment = ad.upload(t.project_id, name, "text/plain", data, hashlib.sha256(data).hexdigest())
-        self._pending.append(attachment)
-        return attachment
+        return ad.upload(t.project_id, name, "text/plain", data, hashlib.sha256(data).hexdigest())
 
-    def comment(self, ref, body, key):
+    def comment(self, ref, body, key, attachment_ids=()):
+        """Post once per key: the body carries `[op key]` (find_comment reads it back) and GoodQA's operationId is the
+        same uuid on every retry, so a lost response is never a second comment."""
         ad, t = self._ticket(ref)
-        ids, self._pending = self._pending, []
-        c = ad.comment_with_files(t.id, "%s\n\n[op %s]" % (body, key), key, ids)
+        c = ad.comment_with_files(t.id, "%s\n\n[op %s]" % (body, key), self.sf.op_id(t.id, "lane:" + key),
+                                  list(attachment_ids))
         return c["id"]
 
     def find_comment(self, ref, key):
@@ -173,26 +176,48 @@ class RealPorts:
             pass
         return False
 
+    @staticmethod
+    def register_source(ticket, task, agent):
+        """A Source provenance.resolve accepts (`inferred: from <source> -- <rationale>`), grounded on the lane's
+        ticket, the requirement the lane serves. Deterministic, so a retry is the same ah request (a duplicate)."""
+        return ("inferred: from ticket:%s -- ah lane bind: main bound agent %s, whose spawn the hook recorded for "
+                "stream %s, as the holder of this ticket's lane" % (ticket, agent, task))
+
     def task_register(self, *, task, agent, ticket, branch, worktree, op):
         argv = [sys.executable, str(HERE / "ah.py"), "task", "register", "--task", task, "--owner-agent", agent,
-                "--scope", "lane brief " + task, "--ticket", ticket, "--source", "inferred: ah lane bind by main",
-                "--branch", branch, "--worktree", worktree]
+                "--scope", "lane brief " + task, "--ticket", ticket, "--source", self.register_source(ticket, task, agent),
+                "--branch", branch, "--worktree", worktree, "--session", self.session, "--key", op]
         done = subprocess.run(argv, capture_output=True, text=True, timeout=120)
         if done.returncode:
-            raise RuntimeError("task register failed (exit %d)" % done.returncode)
-        return self.ticket.comment(ticket, "Lane holder %s registered for %s." % (agent[:12], task), op)
+            try:
+                answer = json.loads((done.stdout or "").strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                answer = {}
+            if answer.get("code") == "task_exists":
+                raise lanes.LaneRefusal("stream %s is already registered to another holder; reassigning a lane is a "
+                                        "later slice (adopt), not a bind" % task)
+            raise RuntimeError("task register failed (exit %d, %s)" % (done.returncode, str(answer.get("code"))[:40]))
+        body = "Lane holder %s registered for %s." % (agent[:12], task)
+        return self.ticket.find_comment(ticket, op) or self.ticket.comment(ticket, body, op)
 
-    def wal_note(self, lane, kind, note):
+    def wal_target(self):
+        """The caller's session log. checkpoint records it before appending, so a retry writes to the same file."""
         folder = _home() / ".claude" / "wals" / self.session
         agent = self._caller.get("id")
-        target = folder / ("agent-%s.jsonl" % agent if agent and agent != "main" else "main.jsonl")
+        return str(folder / ("agent-%s.jsonl" % agent if agent and agent != "main" else "main.jsonl"))
+
+    def wal_note(self, lane, kind, note, *, op_key, target):
+        """Exactly once per op_key: wal_note dedupes under the session-log file lock and answers the existing id."""
         argv = [sys.executable, str(HERE / "wal_note.py"), "--wal", str(target), "--event", "status",
-                "--note", "lane %s checkpoint %s: %s" % (lane, kind, note)]
+                "--op-key", op_key, "--note", "lane %s checkpoint %s: %s" % (lane, kind, note)]
         done = subprocess.run(argv, capture_output=True, text=True, timeout=60)
         try:
-            return json.loads(done.stdout).get("id", "unknown")
+            answer = json.loads(done.stdout)
         except ValueError:
-            raise RuntimeError("wal note failed")
+            answer = {}
+        if done.returncode or answer.get("status") not in ("WROTE", "DUPLICATE") or not answer.get("id"):
+            raise RuntimeError("wal note failed (exit %d)" % done.returncode)
+        return answer["id"]
 
     def make_worktree(self, branch, worktree, repo_path):
         if os.path.lexists(worktree):
@@ -206,14 +231,18 @@ class RealPorts:
         return None
 
     def spec_state(self, ref):
-        done = subprocess.run([sys.executable, str(HERE / "spec_flow.py"), "status", "--ticket", ref, "--json"],
-                              capture_output=True, text=True, timeout=120)
+        """G2 inputs from spec_flow's own evaluation: a verified spec record, and its required reviews accepted on the
+        current core. `ready` (full completion: evidence, logs, live test, sign-off) is used for neither; a status
+        without the two fields is unknown, never guessed."""
+        import spec_flow as sf  # noqa: PLC0415
         try:
-            data = json.loads(done.stdout)
-        except ValueError:
-            raise RuntimeError("spec status unreadable")
-        return {"verified": bool(data.get("spec_attached", data.get("ready"))),
-                "reviews_accepted": bool(data.get("reviews_accepted", data.get("ready"))), "core": data.get("spec_core_sha")}
+            _, data, _ = sf.ticket_status(ref, sf.load_spec_policy())
+        except sf.SpecError as error:
+            raise RuntimeError("spec status unreadable (%s)" % str(error)[:80])
+        verified, accepted = data.get("spec_verified"), data.get("reviews_accepted")
+        if not isinstance(verified, bool) or not isinstance(accepted, bool):
+            raise RuntimeError("spec status has no spec_verified/reviews_accepted fields")
+        return {"verified": verified, "reviews_accepted": accepted, "core": data.get("spec_core_sha")}
 
     def ls_remote(self, worktree, branch):
         done = subprocess.run(["git", "-C", worktree, "ls-remote", "--heads", "origin", branch], capture_output=True,

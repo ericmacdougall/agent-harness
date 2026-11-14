@@ -1137,7 +1137,8 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
     if not specs:
         missing.append("No verified spec is attached. Fix: spec_flow.py new --ticket '<ref>' --out spec.md; "
                        "get adversarial + acceptance reviews (spec_flow.py review); spec_flow.py attach spec.md")
-        return {"ready": False, "missing": missing, "self_attested": attested, "notes": notes}
+        return {"ready": False, "missing": missing, "self_attested": attested, "notes": notes,
+                "spec_verified": False, "reviews_accepted": False}
     spec = specs[-1]
     core = spec.get("spec_core_sha")
     attested.append("spec core sha, criteria and review verdicts are read from the spec record; the attached spec "
@@ -1152,9 +1153,11 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
         notes.append("review policy metadata is missing, old or ambiguous; ordinary two-review requirement applies")
     reviews = {entry.get("role"): entry for entry in spec.get("reviews") or [] if isinstance(entry, dict)}
     review_keys, valid_roles = set(), 0
+    reviews_ok = True  # goodqa#15946: "spec verified and reviews accepted" is reported apart from `ready`
     for role in required_roles:
         entry = reviews.get(role)
         if not entry or entry.get("verdict") != "ACCEPT" or entry.get("core_sha") != core:
+            reviews_ok = False
             missing.append(f"{role} spec review: no ACCEPT bound to spec core {str(core)[:12]}. Fix: "
                            f"spec_flow.py review spec.md --role {role} ...; then spec_flow.py attach spec.md")
             continue
@@ -1163,8 +1166,10 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
         if entry.get("kind") in ("human",):
             attested.append(f"{role} review by human {safe(entry.get('identity'))!r} (name not verified)")
     if valid_roles == 2 and len(review_keys) == 1:
+        reviews_ok = False
         missing.append("both spec reviews come from the same reviewer/model")
     if author in review_keys:
+        reviews_ok = False
         missing.append("a spec reviewer is the spec author")
     owners = {author} | {r.get("actor") for r in records if r["kind"] in ("spec", "evidence", "click_test")}
     owners.discard(None)
@@ -1263,7 +1268,7 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
         attested.append(f"sign-off by {safe(signer.get('signer_kind'))} {safe(signer.get('by'))!r} (identity is self-declared; independence is checked only "
                         "against the declared author, reviewer, poster and tester ids)")
     return {"ready": not missing, "missing": missing, "self_attested": attested, "notes": notes,
-            "spec_core_sha": core}
+            "spec_core_sha": core, "spec_verified": True, "reviews_accepted": reviews_ok}
 
 
 def format_result(label: str, result: dict) -> str:
@@ -2013,6 +2018,16 @@ def legacy_evaluate(args) -> dict:
     return {"ready": not missing, "missing": missing, "self_attested": [], "notes": notes, "report_only": True}
 
 
+def ticket_status(ticket: str, spec_policy) -> tuple:
+    """(session, evaluate() result, label) for one ticket: what `status --json` prints, for in-process callers
+    (`ah lane refresh` reads spec_verified and reviews_accepted from it)."""
+    session = Session(ticket, spec_policy)
+    records, ignored, index = session.records()
+    issue = session.adapter.issue(session.ticket.id) or {}
+    issue["_label"] = session.ticket.label
+    return session, evaluate(records, index, issue, ignored), session.ticket.label
+
+
 def cmd_done(args, spec_policy, apply=False):
     legacy = getattr(args, "legacy", False)
     if legacy and apply:
@@ -2025,12 +2040,7 @@ def cmd_done(args, spec_policy, apply=False):
         label = args.ticket
         result = legacy_evaluate(args)
     else:
-        session = Session(args.ticket, spec_policy)
-        records, ignored, index = session.records()
-        issue = session.adapter.issue(session.ticket.id) or {}
-        issue["_label"] = session.ticket.label
-        result = evaluate(records, index, issue, ignored)
-        label = session.ticket.label
+        session, result, label = ticket_status(args.ticket, spec_policy)
     if args.json:
         print(json.dumps(dict(result, ticket=label), indent=1))
     else:

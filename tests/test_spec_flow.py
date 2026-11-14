@@ -1417,6 +1417,69 @@ class PlanGate(SpecFlowCase):
         self.assertIn("TICKETS_UNVERIFIED", text)
 
 
+class LaneSpecState(SpecFlowCase):
+    """goodqa#15946 r2 F3: the lane's G2 gate needs "spec verified and reviews accepted", which is not `ready`
+    (`ready` also needs evidence, logs, a live test and sign-off)."""
+
+    def status_json(self):
+        code, out, err = self.run_cli("status", "--ticket", "GoodQA harness#168", "--json")
+        return json.loads(out)
+
+    def lane_ports(self):
+        sys.path.insert(0, str(HOOKS))
+        import ah_lane  # noqa: PLC0415
+        ports = ah_lane.RealPorts.__new__(ah_lane.RealPorts)
+
+        def in_process(argv, **kw):  # the pre-fix port shelled out; answer with the same command run in-process
+            code, out, err = self.run_cli(*[a for a in argv[2:]])
+            return subprocess.CompletedProcess(argv, code, out, err)
+        return ah_lane, ports, mock.patch.object(ah_lane.subprocess, "run", in_process)
+
+    def test_status_reports_spec_acceptance_separately_from_completion(self):
+        self.attached()
+        data = self.status_json()
+        self.assertFalse(data["ready"], "no evidence, no click-test, no sign-off")
+        self.assertIs(data["spec_verified"], True)
+        self.assertIs(data["reviews_accepted"], True)
+
+    def test_no_spec_means_neither_verified_nor_accepted(self):
+        data = self.status_json()
+        self.assertEqual((data["ready"], data["spec_verified"], data["reviews_accepted"]), (False, False, False))
+
+    def test_same_reviewer_for_both_roles_is_not_accepted(self):
+        self.attached()
+        adapter = sf.make_adapter(self.config, self.spec_policy, "harness", time.monotonic() + 30)
+        records, ignored = sf.ticket_records(adapter.all_comments(ISSUE), 65536)
+        index = {row["id"]: row for row in adapter.attachments(ISSUE)}
+        real_verified = sf.verified
+
+        def one_key(recs, idx, kind):
+            good, bad = real_verified(recs, idx, kind)
+            if kind == "spec":
+                good = [dict(r, reviews=[dict(e, key="same") for e in r.get("reviews") or []]) for r in good]
+            return good, bad
+        with mock.patch.object(sf, "verified", one_key):
+            result = sf.evaluate(records, index, dict(self.fake.issues[ISSUE], _label="GoodQA harness#168"), ignored)
+        self.assertIs(result["spec_verified"], True)
+        self.assertIs(result["reviews_accepted"], False)
+
+    def test_lane_spec_state_reads_acceptance_not_completion(self):
+        self.attached()
+        ah_lane, ports, patch = self.lane_ports()
+        with patch:
+            state = ports.spec_state("GoodQA harness#168")
+        self.assertEqual((state["verified"], state["reviews_accepted"]), (True, True))
+        self.assertEqual(state["core"], self.status_json()["spec_core_sha"])
+
+    def test_lane_spec_state_without_the_fields_is_unknown_not_ready(self):
+        ah_lane, ports, _ = self.lane_ports()
+        fake = subprocess.CompletedProcess([], 0, json.dumps({"ready": True, "spec_core_sha": "abc"}), "")
+        with mock.patch.object(ah_lane.subprocess, "run", lambda *a, **k: fake), \
+                mock.patch.object(sf, "ticket_status", lambda *a, **k: (None, {"ready": True}, "x"), create=True):
+            with self.assertRaises(RuntimeError):
+                ports.spec_state("GoodQA harness#168")
+
+
 class WalStop(unittest.TestCase):
     def test_subagent_stop_recorded_only_for_logged_agents(self):
         home = Path(tempfile.mkdtemp())

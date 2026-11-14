@@ -313,6 +313,33 @@ class Store:
             atomic_write(path, (canonical_json(record) + "\n").encode())
             return record
 
+    @contextmanager
+    def op_lock(self, lane_dir, op, timeout: float = 180.0):
+        """One runner per operation (goodqa#15946 r2 F4): a concurrent call with the same op waits, then sees the
+        first one's effects done. Taken before, never inside, the store lock; held across port calls."""
+        path = self._op_path(lane_dir, op).with_suffix(".lock")
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise LockTimeout("operation %s is still running elsewhere (waited %.0f s)" % (op, timeout))
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def read_op(self, lane_dir, op):
+        return _load_json(self._op_path(lane_dir, op), "operation record")
+
     def set_effect(self, lane_dir, op, name, state, ref=None, ts=None):
         if state not in EFFECT_STATES:
             raise RefusedInput("invalid effect state %r" % str(state)[:20])

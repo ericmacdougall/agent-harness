@@ -148,29 +148,69 @@ def new(ports, store, *, ticket, repo, profile="generic", branch=None, worktree=
     if not (lane_dir / "source.md").exists():
         _write_source_block(lane_dir, ticket_data, ports.now())
     op = "new-" + lane_id
-    store.begin_op(lane_dir, op=op, kind="checkpoint", lane=lane_id, key=op, content={"digests": m["kit_digests"]},
-                   effects=["attach", "comment"], ts=ports.now())
-    pending = {e["name"] for e in store.pending_effects(store.begin_op(
-        lane_dir, op=op, kind="checkpoint", lane=lane_id, key=op, content={"digests": m["kit_digests"]},
-        effects=["attach", "comment"], ts=ports.now()))}
-    digest_text = "".join("%s  %s\n" % (d, n) for n, d in sorted(m["kit_digests"].items()))
-    name = "kit-digests-%s.txt" % lane_id
-    sha = hashlib.sha256(digest_text.encode()).hexdigest()
     try:
-        if "attach" in pending:
-            have = [a for a in ports.ticket.list_attachments(m["ticket"]) if a.get("name") == name and a.get("sha256") == sha]
-            ref = have[0].get("id") if have else ports.ticket.upload(m["ticket"], name, digest_text.encode())
-            store.set_effect(lane_dir, op, "attach", "done", ref=str(ref), ts=ports.now())
-        if "comment" in pending:
-            body = "Lane %s created (kit %s, stream %s). Kit digest list attached as %s (sha256 %s)." % (
-                lane_id, m["kit_version"], m["stream_key"], name, sha)
-            cid = ports.ticket.comment(m["ticket"], body, op)
-            store.set_effect(lane_dir, op, "comment", "done", ref=str(cid), ts=ports.now())
+        with store.op_lock(lane_dir, op):
+            _attach_digests(ports, store, lane_dir, lane_id, m, op)
     except Exception as error:  # noqa: BLE001
         return Result(PARTIAL, ["lane %s created; ticket write incomplete (%s); op %s; rerun to finish" %
                                 (lane_id, type(error).__name__, op)], dict(result, op=op))
     return Result(OK, ["lane %s %s" % (lane_id, "created" if result["created"] else "already exists"),
                        "stream key %s" % m["stream_key"]], result)
+
+
+def _attach_digests(ports, store, lane_dir, lane_id, m, op):
+    """Attach the kit digest list to the ticket exactly once, recoverably (goodqa#15946 r2 F2).
+
+    GoodQA uploads to the project surface; a file is on the issue only once a comment names its id. So: the upload id
+    is persisted in the op record (effect `attach`, state `uncertain`, ref = id) BEFORE the comment; the comment passes
+    that persisted id explicitly; `attach` and `comment` become `done` only after the comment returned and the issue's
+    attachment list shows the file. A retry first looks for the comment by its `[op]` marker (a lost comment response),
+    then reuses the persisted id; it uploads only when no id was persisted. A lost upload RESPONSE can leave one extra
+    unlinked project file: GoodQA has no lookup for an upload no comment linked, and only the persisted id is ever
+    linked, so the issue still ends with exactly one digest attachment.
+    """
+    content = {"digests": m["kit_digests"]}
+    rec = store.begin_op(lane_dir, op=op, kind="checkpoint", lane=lane_id, key=op, content=content,
+                         effects=["attach", "comment"], ts=ports.now())
+    eff = {e["name"]: e for e in rec["effects"]}
+    if eff["attach"]["state"] == "done" and eff["comment"]["state"] == "done":
+        return
+    digest_text = "".join("%s  %s\n" % (d, n) for n, d in sorted(m["kit_digests"].items()))
+    name = "kit-digests-%s.txt" % lane_id
+    sha = hashlib.sha256(digest_text.encode()).hexdigest()
+    body = "Lane %s created (kit %s, stream %s). Kit digest list attached as %s (sha256 %s)." % (
+        lane_id, m["kit_version"], m["stream_key"], name, sha)
+
+    def on_issue():
+        return [a for a in ports.ticket.list_attachments(m["ticket"]) if a.get("name") == name and a.get("sha256") == sha]
+
+    cid = ports.ticket.find_comment(m["ticket"], op)
+    if not cid:
+        att = eff["attach"]["ref"] if eff["attach"]["state"] in ("uncertain", "done") else None
+        ids = []
+        if not att:
+            linked = on_issue()  # already on the issue (an earlier run linked it): adopt, do not link again
+            if linked:
+                att = linked[0].get("id")
+            else:
+                att = ports.ticket.upload(m["ticket"], name, digest_text.encode())
+                ids = [att]
+            store.set_effect(lane_dir, op, "attach", "uncertain", ref=str(att), ts=ports.now())
+        elif not any(a.get("id") == att for a in on_issue()):
+            ids = [att]
+        cid = ports.ticket.comment(m["ticket"], body, op, attachment_ids=ids)
+    have = on_issue()
+    persisted = next(e["ref"] for e in store.read_op(lane_dir, op)["effects"] if e["name"] == "attach")
+    if not have and persisted:  # the comment exists but did not link the file: one bounded re-link, keyed
+        link = op + "-link"
+        if not ports.ticket.find_comment(m["ticket"], link):
+            ports.ticket.comment(m["ticket"], "Kit digest list for lane %s (re-link of %s)." % (lane_id, name), link,
+                                 attachment_ids=[persisted])
+        have = on_issue()
+    if not have:
+        raise RuntimeError("the creation comment exists but the digest list is not on the issue")
+    store.set_effect(lane_dir, op, "attach", "done", ref=str(have[0].get("id")), ts=ports.now())
+    store.set_effect(lane_dir, op, "comment", "done", ref=str(cid), ts=ports.now())
 
 
 # ---------------------------------------------------------------------------------------- set-live-target
@@ -452,16 +492,31 @@ def checkpoint(ports, store, *, lane, kind, note, evidence=None, key=None, main=
     content = {"kind": kind, "note": note, "evidence": evidence}
     op = key or "ckpt-" + hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()[:16]
     try:
-        rec = store.begin_op(lane_dir, op=op, kind="checkpoint", lane=lane, key=op, content=content,
-                             effects=["note", "comment", "kit", "journal"], ts=ports.now())
+        store.begin_op(lane_dir, op=op, kind="checkpoint", lane=lane, key=op, content=content,
+                       effects=["note", "comment", "kit", "journal"], ts=ports.now())
     except st.KeyConflict as error:
         return refuse(str(error), "same key with different content", CONFLICT)
+    try:
+        with store.op_lock(lane_dir, op):  # a concurrent run of the same op waits, then finds the effects done
+            return _checkpoint_effects(ports, store, lane_dir, m, lane=lane, op=op, kind=kind, note=note, gen=gen)
+    except st.LockTimeout as error:
+        return refuse(str(error), "wait for the other run to finish, then retry with the same key", CONFLICT)
+
+
+def _checkpoint_effects(ports, store, lane_dir, m, *, lane, op, kind, note, gen):
+    rec = store.read_op(lane_dir, op)  # re-read under the op lock: another run may have finished effects
     drain_spool(ports, store, lane_dir, m["ticket"])
     pending = {e["name"] for e in store.pending_effects(rec)}
     flags, lagging = [], False
-    note_ref = next((e["ref"] for e in rec["effects"] if e["name"] == "note"), None)
+    note_eff = next(e for e in rec["effects"] if e["name"] == "note")
+    note_ref = note_eff["ref"] if note_eff["state"] == "done" else None
     if "note" in pending:
-        note_ref = ports.wal_note(lane, kind, note)
+        # exactly once (r2 F4): the target log is recorded before the append, so a retry (even by another caller)
+        # writes to the same file, and the append is keyed, so a retry after a crash finds the first row
+        prior = str(note_eff.get("ref") or "")
+        target = prior[len("target:"):] if prior.startswith("target:") else ports.wal_target()
+        store.set_effect(lane_dir, op, "note", "uncertain", ref="target:" + target, ts=ports.now())
+        note_ref = ports.wal_note(lane, kind, note, op_key="lane:%s:%s" % (lane, op), target=target)
         store.set_effect(lane_dir, op, "note", "done", ref=str(note_ref), ts=ports.now())
     if "comment" in pending:
         body = "Checkpoint (%s) on %s: %s [wal %s]" % (kind, lane, note, note_ref)

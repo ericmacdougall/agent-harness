@@ -2,6 +2,7 @@
 """Append a human-readable event to this user's Claude Code WAL."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -10,7 +11,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from wal import append
+from wal import append, OP_KEY_RE
 
 
 EVENTS = {'intent', 'scope', 'decision', 'risk', 'check', 'commit', 'blocker', 'status', 'handoff', 'result',
@@ -170,6 +171,9 @@ def main():
     parser.add_argument('--ticket', help='ticket this row is about, e.g. goodqa#123')
     parser.add_argument('--result', choices=('PASS', 'FAIL'), help='REALLY_TESTED rows: the stated result')
     parser.add_argument('--live', action='store_true', help='REALLY_TESTED rows: the test ran against the live system')
+    parser.add_argument('--op-key', dest='op_key',
+                        help='write exactly once per key: if this WAL already has a row with this key, print '
+                             'DUPLICATE with that row\'s id and write nothing (retries and concurrent callers)')
     args = parser.parse_args()
     root = Path.home() / '.claude' / 'wals'
     path = args.wal.absolute()
@@ -193,8 +197,11 @@ def main():
         parser.error('--result and --live apply to a note starting REALLY_TESTED <check id>')
     if args.event == 'deploy' and not SHA_OR_VERSION_RE.search(note):
         parser.error('a deploy row names the deployed sha or version (merged is not live)')
+    if args.op_key is not None and not OP_KEY_RE.fullmatch(args.op_key):
+        parser.error('--op-key: 8-160 characters of [A-Za-z0-9._:-]')
     record = {'at': datetime.now(timezone.utc).isoformat(), 'event': args.event, 'note': note,
-              'id': 'w' + uuid.uuid4().hex[:11]}
+              'id': 'w' + (hashlib.sha256(('op:' + args.op_key).encode()).hexdigest()[:11] if args.op_key
+                           else uuid.uuid4().hex[:11])}
     if args.goal:
         record['goal'] = args.goal
     if args.ticket:
@@ -284,7 +291,11 @@ def main():
         if not re.fullmatch(r'w[0-9a-f]{11}', args.recites) or not args.source:
             parser.error('--recites needs an entry id (w + 11 hex) and a --source on this row')
         record['recites'] = args.recites
-    append(path, record)
+    existing = append(path, record, unique_key=args.op_key) if args.op_key else append(path, record)
+    if existing is not None:
+        print(json.dumps({'status': 'DUPLICATE', 'event': existing.get('event'), 'id': existing.get('id'),
+                          'wal': str(path)}))
+        return 0
     for warning in warnings:
         print('wal_note: provenance warning: ' + warning, file=sys.stderr)
     print(json.dumps({'status': 'WROTE', 'event': args.event, 'id': record['id'], 'wal': str(path),

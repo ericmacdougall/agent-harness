@@ -50,7 +50,7 @@ class UnstampedCallerTests(Cmd):
                      "last_remote_head", "spec_state", "ls_remote", "local_git", "is_ancestor"):
             setattr(real, name, getattr(self.p, name))
         self.effects = []
-        real.wal_note = lambda lane, kind, note: self.effects.append("wal") or "row1"
+        real.wal_note = lambda lane, kind, note, op_key, target: self.effects.append("wal") or "row1"
         self.real = real
 
     def tearDown(self):

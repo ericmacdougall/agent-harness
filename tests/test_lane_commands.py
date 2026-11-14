@@ -25,8 +25,12 @@ POLICY = model_tiers.load_policy()
 
 
 class FakeTicket:
+    """The GoodQA contract as the real adapter has it (r2 F2): an upload is a project file that is NOT on the issue;
+    a comment naming its id links it; the issue's attachment list shows linked files only."""
+
     def __init__(self):
         self.calls, self.comments, self.attachments, self.down = [], {}, [], False
+        self.project_files = {}
 
     def read(self, ref):
         self.calls.append(("read", ref))
@@ -41,15 +45,17 @@ class FakeTicket:
     def upload(self, ref, name, data):
         import hashlib
         self.calls.append(("upload", name))
-        self.attachments.append({"id": "att%d" % len(self.attachments), "name": name,
-                                 "sha256": hashlib.sha256(data).hexdigest()})
-        return self.attachments[-1]["id"]
+        aid = "att%d" % len(self.project_files)
+        self.project_files[aid] = {"id": aid, "name": name, "sha256": hashlib.sha256(data).hexdigest()}
+        return aid
 
-    def comment(self, ref, body, key):
+    def comment(self, ref, body, key, attachment_ids=()):
         self.calls.append(("comment", key))
         if self.down:
             raise OSError("down")
-        self.comments.setdefault(key, body)
+        if key not in self.comments:
+            self.comments[key] = body
+            self.attachments.extend(self.project_files[a] for a in attachment_ids)
         return "c-" + key
 
     def find_comment(self, ref, key):
@@ -94,7 +100,8 @@ class Cmd(Base):
             reviewer_line=lambda r: "R1", dispatch_task_key=lambda a: self.dispatch.get(a),
             subagent_start_seen=lambda a: a in self.dispatch,
             task_register=lambda **kw: (self.registered.append(kw), "c-" + kw["op"])[1] and self._reg(kw),
-            wal_note=lambda lane, kind, note: (self.notes.append((kind, note)), "row%d" % len(self.notes))[1],
+            wal_note=lambda lane, kind, note, op_key, target: (self.notes.append((kind, note)), "row%d" % len(self.notes))[1],
+            wal_target=lambda: "main.jsonl",
             last_remote_head=lambda lane: "r" * 7,
             spec_state=lambda ref: {"verified": True, "reviews_accepted": True, "core": "abc"},
             ls_remote=lambda wt, br: "rem1", local_git=lambda wt: {"head": "rem1", "dirty": False, "base": "base0"},
