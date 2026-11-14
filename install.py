@@ -44,7 +44,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "mission_coverage.py", "mission_gate.py",  # mission goals: owner, disposition or done evidence (goodqa#15565)
          "goals_view.py", "status_truth.py", "stop_blocks.py",  # `ah goals`, status lint and injection (goodqa#15754)
          "gq_browser.py",  # GoodQA worker browser CLI and stdio MCP server; main registers the MCP (goodqa#15745)
-         "lane/__init__.py", "lane/identity.py", "lane/store.py", "lane/manifest.py", "lane/kit.py", "lane/lanes.py", "lane/sources.py", "lane/commands.py", "lane/auth.py", "lane/ops.py", "ah_lane.py",
+         "lane/__init__.py", "lane/identity.py", "lane/store.py", "lane/manifest.py", "lane/kit.py", "lane/lanes.py", "lane/sources.py", "lane/commands.py", "lane/auth.py", "lane/ops.py", "ah_lane.py", "lane_stamp.py",
          "lane/templates/v1/README.md", "lane/templates/v1/brief.md", "lane/templates/v1/gates.json",
          "lane/templates/v1/handoff.md",  # lane factory slice S1 (goodqa#15946)
          "shellwords.py")  # quote-aware command splitting shared by mission_gate and dropped_gate (goodqa#15684)
@@ -106,7 +106,7 @@ def managed_scripts(claude: Path) -> set[str]:
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
                          "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",
-                         "mc_inbox.py", "mission_gate.py", "status_truth.py")}
+                         "mc_inbox.py", "mission_gate.py", "status_truth.py", "lane_stamp.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -214,7 +214,10 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
             # Commit message policy: validates git commit / gh pr merge --squash before they run.
             "matcher": "Bash",
             "hooks": [policy, {"type": "command", "command": "python3",  # advisory bg_lint: warns, never blocks
-                               "args": [str(claude / "hooks" / "bg_lint.py")], "timeout": 5}],
+                               "args": [str(claude / "hooks" / "bg_lint.py")], "timeout": 5},
+                      # Lane factory (goodqa#15946): one-shot caller stamps for `ah lane`; silent, fails open.
+                      {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "lane_stamp.py")],
+                       "timeout": 5}],
         }, {
             # Route heavy Mac work (browsers, full suites, builds) to dev2; advisory for hostile probes.
             "matcher": "Bash",

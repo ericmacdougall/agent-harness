@@ -184,5 +184,52 @@ class HeldTargetTests(unittest.TestCase):
         self.assertIsNone(ident.held_rule(identity=identity))
 
 
+class NoExecTests(unittest.TestCase):
+    """AC-8: repository identity is read from .git files in Python; no process is started."""
+
+    def test_identity_and_held_check_start_no_process_and_agree_with_git(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(os.path.realpath(tmp))
+            main = make_repo(root / "main", [("origin", "https://github.com/Owner/Repo.git"),
+                                             ("up", "https://github.com/up/stream.git")])
+            git(main, "worktree", "add", "-q", str(root / "wt"), "-b", "side")
+            plain = make_repo(root / "plain")
+            bare = root / "bare.git"
+            subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True, capture_output=True, timeout=30)
+            expected = {p: ident.canonical_repo(str(p)) for p in (main, root / "wt", plain)}  # reference run (may exec)
+            hits = []
+            original = subprocess.Popen.__init__
+            subprocess.Popen.__init__ = lambda s, *a, **k: hits.append(a) or (_ for _ in ()).throw(OSError("no exec"))
+            try:
+                got = {p: ident.canonical_repo(str(p)) for p in (main, root / "wt", plain)}
+                held = [ident.held_rule(path=str(p)) for p in (main, root / "wt", plain, bare)]
+            finally:
+                subprocess.Popen.__init__ = original
+            self.assertEqual(hits, [])
+            self.assertEqual(got, expected)
+            self.assertEqual(got[main], ("github.com/owner/repo", "remote-origin"))
+            self.assertEqual(held, [None, None, None, None])
+            self.assertEqual(ident.canonical_repo(str(bare))[1], "local")
+
+    def test_gitdir_file_pointing_outside_or_garbage_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(os.path.realpath(tmp))
+            (root / "a").mkdir()
+            (root / "a" / ".git").write_text("gitdir: " + str(root / "nowhere") + "\n")
+            with self.assertRaises(ident.IdentityError):
+                ident.canonical_repo(str(root / "a"))
+            (root / "b").mkdir()
+            (root / "b" / ".git").write_text("garbage\n")
+            with self.assertRaises(ident.IdentityError):
+                ident.canonical_repo(str(root / "b"))
+
+    def test_url_with_a_credential_in_the_config_is_reduced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(os.path.realpath(tmp))
+            repo = make_repo(root / "r", [("origin", "https://user:hunter2@github.com/owner/repo.git")])
+            identity, _ = ident.canonical_repo(str(repo))
+            self.assertEqual(identity, "github.com/owner/repo")
+
+
 if __name__ == "__main__":
     unittest.main()

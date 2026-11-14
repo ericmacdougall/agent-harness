@@ -633,8 +633,7 @@ class RefreshStatusTests(Cmd):
 
 class NetworkSpyTests(Cmd):
     """AC-8: an in-process spy beside the fixture ticket's own call log: any direct connection or process start by
-    a command that must not make one fails. (`new` and `start` run read-only local git for identity, so only
-    sockets are denied for them.)"""
+    a command that must not make one fails. (`new` and `start` read repository identity from .git files, so they are denied processes too.)"""
 
     def deny(self, sockets=True, procs=True):
         import socket
@@ -668,8 +667,8 @@ class NetworkSpyTests(Cmd):
         cmd.refresh(self.p, self.store, lane=lane)
         self.assertEqual(self.hits, [])
 
-    def test_new_and_start_open_no_socket(self):
-        self.deny(sockets=True, procs=False)
+    def test_new_and_start_open_no_socket_and_start_no_process(self):  # AC-8: identity is read without exec
+        self.deny(sockets=True, procs=True)
         lane = self.mk()
         cmd.start(self.p, self.store, lane=lane)
         self.assertEqual(self.hits, [])

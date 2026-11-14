@@ -14,10 +14,9 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-import subprocess
+import stat
 from pathlib import Path
 
-GIT_TIMEOUT = 30
 PART = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 HOST = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
 SCP = re.compile(r"^(?:[^@/\s]+@)?([^:/\s]+):(?!//)(.+)$")
@@ -36,15 +35,57 @@ class IdentityError(ValueError):
     """Malformed or unusable repository or ticket input (a specific refusal, nothing written)."""
 
 
-def _run_git(path, *args) -> str:
+MAX_GIT_FILE = 1 << 20
+
+
+def _read_text(path) -> str:
+    """Bounded read of a small git file: regular, not a symlink, within the size cap."""
     try:
-        done = subprocess.run(["git", "-C", str(path)] + list(args), capture_output=True, text=True,
-                              timeout=GIT_TIMEOUT)
-    except (OSError, subprocess.SubprocessError):
-        raise IdentityError("git could not be run on %s" % path) from None
-    if done.returncode:
-        raise IdentityError("not a git repository: %s" % path)
-    return done.stdout
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        raise IdentityError("not a git repository: %s" % path) from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_GIT_FILE:
+            raise IdentityError("unusable git file: %s" % os.path.basename(str(path)))
+        return os.read(fd, MAX_GIT_FILE + 1).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
+
+
+def _is_gitdir(path) -> bool:
+    return os.path.isfile(os.path.join(str(path), "HEAD")) and os.path.isdir(os.path.join(str(path), "objects"))
+
+
+def _git_dir(path) -> str:
+    """The git directory of ``path`` (a work tree, a linked work tree, a subdirectory or a bare repository), read
+    from the file system without starting a process."""
+    current = os.path.realpath(str(path))
+    for _ in range(64):
+        dot = os.path.join(current, ".git")
+        if os.path.islink(dot):
+            raise IdentityError("not a git repository (symlinked .git): %s" % path)
+        if os.path.isdir(dot):
+            return os.path.realpath(dot) if _is_gitdir(dot) else _fail(path)
+        if os.path.isfile(dot):
+            text = _read_text(dot).strip()
+            if not text.startswith("gitdir:"):
+                raise IdentityError("not a git repository (bad .git file): %s" % path)
+            target = text[len("gitdir:"):].strip()
+            target = target if os.path.isabs(target) else os.path.join(current, target)
+            target = os.path.realpath(target)
+            return target if _is_gitdir(target) or os.path.isfile(os.path.join(target, "commondir")) else _fail(path)
+        if _is_gitdir(current):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    raise IdentityError("not a git repository: %s" % path)
+
+
+def _fail(path):
+    raise IdentityError("not a git repository: %s" % path)
 
 
 def _clean_path(path_text: str, original: str) -> str:
@@ -86,20 +127,37 @@ def _looks_like_url(text: str) -> bool:
 
 
 def _common_git_dir(path) -> str:
-    out = _run_git(path, "rev-parse", "--git-common-dir").strip()
-    common = Path(out)
-    if not common.is_absolute():
-        common = Path(path) / common
-    return os.path.realpath(common)
+    gitdir = _git_dir(path)
+    common_file = os.path.join(gitdir, "commondir")
+    if os.path.isfile(common_file):
+        rel = _read_text(common_file).strip()
+        common = os.path.realpath(rel if os.path.isabs(rel) else os.path.join(gitdir, rel))
+        if not _is_gitdir(common):
+            raise IdentityError("not a git repository: %s" % path)
+        return common
+    return gitdir
+
+
+SECTION = re.compile(r'^\s*\[\s*([A-Za-z0-9.-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\]\s*(?:[#;].*)?$')
+KEYVAL = re.compile(r"^\s*([A-Za-z][A-Za-z0-9-]*)\s*=\s*(.*?)\s*$")
 
 
 def _remotes(path) -> list:
-    names = [n for n in _run_git(path, "remote").split() if n]
-    found = []
-    for name in names:
-        urls = _run_git(path, "remote", "get-url", "--all", name).split("\n")
-        found.append((name, urls[0].strip() if urls and urls[0].strip() else ""))
-    return found
+    """``[(name, first url)]`` from the common git directory's config, in file order."""
+    text = _read_text(os.path.join(_common_git_dir(path), "config"))
+    remotes, current = [], None
+    for line in text.splitlines():
+        sect = SECTION.match(line)
+        if sect:
+            current = None
+            if sect.group(1).lower() == "remote" and sect.group(2) is not None:
+                current = {"name": sect.group(2).replace('\\"', '"'), "url": ""}
+                remotes.append(current)
+            continue
+        kv = KEYVAL.match(line)
+        if current is not None and kv and kv.group(1).lower() == "url" and not current["url"]:
+            current["url"] = kv.group(2).strip().strip('"')
+    return [(r["name"], r["url"]) for r in remotes]
 
 
 def canonical_repo(path_or_url: str):
