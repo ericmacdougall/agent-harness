@@ -6,6 +6,7 @@ ledger, the routing decision and the report duty, so none of them depend on a ch
 
     coordd.py serve [--port P]          run the service (loopback only)
     coordd.py submit --kind K --text T [--ticket REF] [--key KEY]
+    coordd.py review --repo O/N --pr N --packet FILE|- --ticket REF [--owner ID]   queue an exact-head PR review
     coordd.py chat TEXT...              direct chat with the coordinator
     coordd.py status | tasks | show ID
     coordd.py logins | approve CODE | logout-all     browser sign-ins (device approval)
@@ -47,12 +48,16 @@ DEFAULT_PORT = 47625
 MAX_TEXT = 8000
 MAX_ATTEMPTS = 2
 WORKER_TIMEOUT_S = 900
-KINDS = ("status", "agent", "chat")
+KINDS = ("status", "agent", "chat", "review")
 CAPS = ("answer", "run-commands", "write-worktree", "browser")  # what a task may require of a lane
 # What each lane can do today. A capability is listed only when it has been shown to work on this host.
 LANE_CAPS = {"codex-pool-build": {"answer"}}
 # Lanes whose rerun cannot repeat an external effect (read-only; the ticket report is an upsert by task id).
-REPLAY_SAFE = ("builtin-status", "codex-pool-build", "chat")
+REPLAY_SAFE = ("builtin-status", "codex-pool-build", "chat", "review-receipt")
+REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,60}/[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+PACKET_MAX = 150_000       # peer_review.py refuses larger packets
+REVIEW_TIMEOUT_S = 1500    # two providers at 720 s each, plus the snapshot
 TERMINAL = ("done", "failed", "blocked", "outcome-unknown")
 LOGIN_TTL_S = 300          # a shown code can be approved for this long
 SESSION_TTL_S = 12 * 3600  # an approved browser session
@@ -68,7 +73,7 @@ CODE_RE = re.compile(r"^[A-HJKMNP-TV-Z2-9]{4}-[A-HJKMNP-TV-Z2-9]{4}$")
 TICKET_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}#[0-9]{1,9}$")
 KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{3,80}$")
 ID_RE = re.compile(r"^t-[0-9a-f]{12}$")
-HELP = ("Commands: status | tasks | show <id> | run <task text> [ticket:<slug>#<n>] | help. "
+HELP = ("Commands: status | tasks | unreviewed | show <id> | run <task text> [ticket:<slug>#<n>] | help. "
         "Anything else is free-form chat, which needs a subscription-signed-in agent CLI on this host.")
 
 
@@ -274,6 +279,11 @@ def submit(con, kind: str, text: str, ticket: str | None, origin: str, key: str 
             raise PermissionError("too many messages from browser sessions this hour")
     if ticket and TICKET_RE.match(ticket) and not ticket_allowed(ticket):
         raise ValueError("ticket project is not on this service's allowlist")
+    if kind == "review":
+        spec = parse_review(text)  # raises ValueError with the reason
+        if not ticket:
+            raise ValueError("a review needs --ticket: findings are written there")
+        text = json.dumps(spec, sort_keys=True)
     wanted = sorted(set((needs or "answer").replace(" ", "").split(",")))
     if any(w not in CAPS for w in wanted):
         raise ValueError(f"needs must be a comma list of {CAPS}")
@@ -287,6 +297,7 @@ def submit(con, kind: str, text: str, ticket: str | None, origin: str, key: str 
     if key and not KEY_RE.match(key):
         raise ValueError("bad key")
     if key:
+        key = ("web:" if origin == WEB_ORIGIN else "host:") + key  # a browser session cannot pre-claim a host key
         row = con.execute("SELECT * FROM tasks WHERE key=?", (key,)).fetchone()
         if row:  # idempotent resubmit: same key returns the same task, nothing runs twice
             return dict(row) | {"deduplicated": True}
@@ -297,6 +308,158 @@ def submit(con, kind: str, text: str, ticket: str | None, origin: str, key: str 
     log_event(con, tid, "accepted", f"kind={kind} origin={origin}")
     mc_drop(tid, "accepted", f"coordinator accepted {kind} task {tid}", ticket)
     return dict(con.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
+
+
+# ---------------------------------------------------------------- review receipts
+def review_repos() -> list[str]:
+    return [x.strip() for x in (os.environ.get("COORD_REVIEW_REPOS") or "").split(",") if x.strip()]
+
+
+def parse_review(text: str) -> dict:
+    """A review task's text is JSON: repo (owner/name, allowlisted), pr (number), owner (who gets the findings)."""
+    try:
+        spec = json.loads(text)
+    except ValueError:
+        raise ValueError("review text must be JSON with repo, pr and owner") from None
+    if not isinstance(spec, dict):
+        raise ValueError("review text must be a JSON object")
+    repo, pr, owner = spec.get("repo"), spec.get("pr"), spec.get("owner") or "unknown"
+    if not isinstance(repo, str) or not REPO_RE.match(repo):
+        raise ValueError("repo must look like owner/name")
+    if repo not in review_repos():
+        raise ValueError("repo is not on COORD_REVIEW_REPOS for this service")
+    if not isinstance(pr, int) or isinstance(pr, bool) or not 0 < pr < 10**7:
+        raise ValueError("pr must be a positive number")
+    if not isinstance(owner, str) or not re.match(r"^[A-Za-z0-9._:-]{1,80}$", owner):
+        raise ValueError("owner must be a short identifier")
+    return {"repo": repo, "pr": pr, "owner": owner}
+
+
+def parse_receipt(text: str, head: str) -> tuple[str | None, str]:
+    """(verdict, why). A receipt counts only when it names the exact head that was requested."""
+    m = re.search(r"^Reviewed HEAD: ([0-9a-f]{40})\s*$", text, re.M)
+    v = re.search(r"^VERDICT: (PASS|BLOCK)\b", text, re.M)
+    if not m or not v:
+        return None, "the reviewer output has no Reviewed HEAD or VERDICT line"
+    if m.group(1) != head:
+        return None, f"the receipt names head {m.group(1)[:12]}, not the requested {head[:12]}"
+    return v.group(1), ""
+
+
+def discover(con, lister=None) -> list[dict]:
+    """Find open PR heads in the allowlisted repos that have no receipt and no queued review, and record each
+    once as `unsubmitted`. Discovery reports; it never reviews without a packet and never authorizes anything.
+    A failed listing is recorded as scan-failed, never as zero work."""
+    tool = shutil.which("gh") or str(Path.home() / ".local" / "bin" / "gh")
+    found = []
+    for repo in review_repos():
+        if lister:
+            code, out, err = lister(repo)
+        else:
+            code, out, err = run_cmd([tool, "pr", "list", "-R", repo, "--state", "open", "--limit", "200",
+                                      "--json", "number,headRefOid,isDraft,title"], 90)
+        try:
+            prs = json.loads(out) if code == 0 else None
+        except ValueError:
+            prs = None
+        if not isinstance(prs, list):
+            log_event(con, None, "scan-failed", f"{repo}: exit {code} {str(err).strip()[-200:]}")
+            found.append({"repo": repo, "scan": "failed"})
+            continue
+        queued = [json.loads(r["text"]) for r in con.execute(
+            "SELECT text FROM tasks WHERE kind='review' AND state IN ('queued','running')")]
+        for pr in prs:
+            n, head = pr.get("number"), pr.get("headRefOid") or ""
+            if not isinstance(n, int) or not SHA_RE.match(head):
+                continue
+            if con.execute("SELECT 1 FROM effects WHERE effect='review-receipt' AND state='done' AND key LIKE ?",
+                           (f"receipt:{repo}#{n}@{head}:%",)).fetchone():
+                continue
+            if any(q["repo"] == repo and q["pr"] == n for q in queued):
+                continue
+            item = {"repo": repo, "pr": n, "head": head, "draft": bool(pr.get("isDraft")),
+                    "title": printable(pr.get("title") or "", 80)}
+            found.append(item)
+            key, ts = f"unsubmitted:{repo}#{n}@{head}", now_iso()
+            cur = con.execute("INSERT OR IGNORE INTO effects(key,task,effect,state,detail,created,updated) "
+                              "VALUES(?,?,?,?,?,?,?)", (key, "-", "unsubmitted", "open", item["title"], ts, ts))
+            if cur.rowcount:
+                log_event(con, None, "unsubmitted", f"{repo}#{n}@{head[:12]}")
+                mc_drop(f"pr-{n}-{head[:12]}", "unsubmitted",
+                        f"{repo}#{n} has no review receipt at head {head[:10]}; submit a packet with coordd review",
+                        None, "warn")
+    return found
+
+
+def lane_review(con, task: dict, root: Path) -> tuple[bool, str]:
+    """Exact-head PR review through peer_review.py. The receipt is UNBOUND: it tells the owner PASS or BLOCK with
+    findings and never authorizes a merge. One run per (repo, pr, head, packet); an unchanged head is not re-run."""
+    spec = parse_review(task["text"])
+    repo, pr = spec["repo"], spec["pr"]
+    run_dir = root / "runs" / task["id"]
+    packet = run_dir / "packet.md"
+    if not packet.is_file() or packet.stat().st_size == 0:
+        return False, "blocked-unavailable: no packet was stored for this review"
+    gh = shutil.which("gh") or str(Path.home() / ".local" / "bin" / "gh")
+    peer = os.environ.get("COORD_PEER_REVIEW") or str(Path.home() / ".claude" / "hooks" / "peer_review.py")
+    if not os.path.isfile(peer):
+        return False, "blocked-unavailable: peer_review.py is not installed on this host"
+    code, out, err = run_cmd([gh, "pr", "view", str(pr), "-R", repo, "--json", "headRefOid,baseRefName,state"], 60)
+    if code != 0:
+        return False, f"cannot read the PR (gh exit {code}): {err.strip()[-200:]}"
+    info = json.loads(out)
+    head, base_ref = info.get("headRefOid") or "", info.get("baseRefName") or ""
+    if info.get("state") != "OPEN" or not SHA_RE.match(head) or not re.match(r"^[A-Za-z0-9._/-]{1,100}$", base_ref):
+        return False, f"blocked-unavailable: PR is {info.get('state')} or its head or base could not be read"
+    key = f"receipt:{repo}#{pr}@{head}:{_h(packet.read_text(errors='replace'))[:16]}"
+    prior = con.execute("SELECT state, detail FROM effects WHERE key=?", (key,)).fetchone()
+    if prior and prior["state"] == "done":
+        return True, f"already reviewed at this head with this packet: {prior['detail']}. Not re-run."
+    ts = now_iso()
+    con.execute("INSERT OR IGNORE INTO effects(key,task,effect,state,created,updated) VALUES(?,?,?,?,?,?)",
+                (key, task["id"], "review-receipt", "intent", ts, ts))
+    clone = root / "clones" / repo.replace("/", "__")
+    clone.parent.mkdir(exist_ok=True)
+    if not (clone / ".git").exists():
+        code, _, err = run_cmd([gh, "repo", "clone", repo, str(clone), "--", "--quiet"], 900)
+        if code != 0:
+            return False, f"clone failed: {err.strip()[-200:]}"
+    code, _, err = run_cmd(["git", "-C", str(clone), "fetch", "--quiet", "origin", base_ref,
+                            f"+refs/pull/{pr}/head:refs/coordd/pr-{pr}"], 900)
+    if code != 0:
+        return False, f"fetch failed: {err.strip()[-200:]}"
+    code, got, _ = run_cmd(["git", "-C", str(clone), "rev-parse", f"refs/coordd/pr-{pr}"], 30)
+    if got.strip() != head:
+        return False, "timed out waiting for a stable head: the PR head moved during fetch; resubmit"
+    code, base, err = run_cmd(["git", "-C", str(clone), "merge-base", head, f"origin/{base_ref}"], 30)
+    if code != 0 or not SHA_RE.match(base.strip()):
+        return False, f"no merge base with {base_ref}: {err.strip()[-200:]}"
+    wt = run_dir / "wt"
+    if wt.exists():
+        run_cmd(["git", "-C", str(clone), "worktree", "remove", "--force", str(wt)], 60)
+    code, _, err = run_cmd(["git", "-C", str(clone), "worktree", "add", "--quiet", "--detach", str(wt), head], 300)
+    if code != 0:
+        return False, f"worktree failed: {err.strip()[-200:]}"
+    receipt = run_dir / f"pr-review-{head[:12]}-{int(time.time())}.md"  # fresh path: the tool refuses to overwrite
+    try:
+        code, out, err = run_cmd([sys.executable, peer, "pr", "--repo", str(wt), "--packet", str(packet),
+                                  "--output", str(receipt), "--expected-head", head, "--snapshot-base", base.strip(),
+                                  "--base", f"origin/{base_ref}", "--github-repo", repo, "--pr", str(pr),
+                                  "--owner", "coordd"], REVIEW_TIMEOUT_S)
+    finally:
+        run_cmd(["git", "-C", str(clone), "worktree", "remove", "--force", str(wt)], 60)
+    (run_dir / "peer_review.log").write_text((out + "\n--- stderr ---\n" + err)[-40000:], encoding="utf-8")
+    text = receipt.read_text(errors="replace") if receipt.is_file() else ""
+    verdict, why = parse_receipt(text, head)
+    if not verdict:
+        tail = ((err.strip() or out.strip()).splitlines() or ["no output"])[-1][:300]
+        con.execute("UPDATE effects SET state='failed', detail=?, updated=? WHERE key=?", (tail, now_iso(), key))
+        return False, f"review did not produce a receipt (peer_review exit {code}): {why or tail}"
+    con.execute("UPDATE effects SET state='done', detail=?, updated=? WHERE key=?",
+                (f"{verdict} ({receipt.name})", now_iso(), key))
+    return True, (f"REVIEW {verdict} for {repo}#{pr} at head {head} (owner {spec['owner']}).\n"
+                  "This is an unbound receipt from the host coordinator: it reports the review and does not authorize "
+                  f"a merge.\nFull receipt on the build host: runs/{task['id']}/{receipt.name}\n\n" + text[:4200])
 
 
 # ---------------------------------------------------------------- lanes
@@ -344,6 +507,8 @@ def route(task: dict) -> tuple[str | None, str]:
         return None, "no worker lane: codex_pool.py is not installed on this host"
     if kind == "chat":
         return "chat", "chat command table, then a subscription CLI for free-form text"
+    if kind == "review":
+        return "review-receipt", "exact-head PR review through peer_review.py; unbound receipt, findings to the ticket"
     return None, f"unknown kind {kind}"
 
 
@@ -419,11 +584,15 @@ def lane_chat(con, task: dict, root: Path) -> tuple[bool, str]:
     if word == "tasks":
         rows = con.execute("SELECT id,kind,state,lane,updated FROM tasks WHERE kind!='chat' ORDER BY created DESC LIMIT 15")
         return True, "\n".join(f"{r['id']} {r['kind']} {r['state']} lane={r['lane'] or '-'} {r['updated']}" for r in rows) or "no tasks"
+    if word == "unreviewed":
+        rows = discover(con)
+        lines = [("scan FAILED for " + r["repo"]) if r.get("scan") else
+                 f"{r['repo']}#{r['pr']} {r['head'][:10]} {'draft ' if r['draft'] else ''}{r['title']}" for r in rows]
+        return True, "\n".join(lines[:60]) or "every open PR head in the allowlisted repos has a receipt or a queued review"
     if word == "show" and ID_RE.match(rest.strip()):
         row = con.execute("SELECT * FROM tasks WHERE id=?", (rest.strip(),)).fetchone()
         return True, json.dumps(dict(row), indent=1)[:6000] if row else "no such task"
-    web = task["origin"] == WEB_ORIGIN
-    if web and word not in ("help", "?", "status", "tasks", "show"):
+    if task["origin"] == WEB_ORIGIN:  # help, status, tasks and show <id> returned above; nothing else is open
         return False, ("blocked-unavailable: a browser session can use status, tasks, show and help. Running tasks "
                        "and free-form chat are host-CLI or Remote Control actions until workers run confined.")
     if word == "run" and rest.strip():
@@ -529,6 +698,8 @@ def run_one(con, root: Path, chat_only: bool) -> bool:
                 ok, body = True, lane_status(con)
             elif lane == "codex-pool-build":
                 ok, body = lane_codex_pool(task, root)
+            elif lane == "review-receipt":
+                ok, body = lane_review(con, task, root)
             else:
                 ok, body = lane_chat(con, task, root)
         except Exception as exc:  # noqa: BLE001 - a lane crash is a failed task, never a dead service
@@ -554,13 +725,16 @@ def run_one(con, root: Path, chat_only: bool) -> bool:
 
 def worker_loop(root: Path, stop: threading.Event, chat_only: bool) -> None:
     con = db(root)
-    last_retry = 0.0
+    last_retry = last_scan = 0.0
     while not stop.is_set():
         try:
             busy = run_one(con, root, chat_only)
             if not chat_only and time.time() - last_retry > 120:
                 last_retry = time.time()
                 retry_reports(con, root)
+            if not chat_only and not busy and time.time() - last_scan > 600:
+                last_scan = time.time()
+                discover(con)
         except Exception as exc:  # noqa: BLE001
             try:
                 con.execute("ROLLBACK")
@@ -657,7 +831,7 @@ class Handler(BaseHTTPRequestHandler):
     def _sid(self) -> str:
         for part in (self.headers.get("Cookie") or "").split(";"):
             name, _, value = part.strip().partition("=")
-            if name in ("__Host-coord_sid", "coord_sid"):
+            if name == "__Host-coord_sid" or (name == "coord_sid" and self._host() in ("127.0.0.1", "localhost")):
                 return value
         return ""
 
@@ -677,7 +851,7 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _addr(self) -> str:
-        return (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip()
+        return (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[-1].strip()
 
     def _host(self) -> str:
         return (self.headers.get("Host") or "").rsplit(":", 1)[0].lower()
@@ -722,7 +896,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(415, {"error": "json only"})
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            if n <= 0 or n > 64_000:
+            if n <= 0 or n > 400_000:
                 raise ValueError("bad length")
             body = json.loads(self.rfile.read(n))
             if not isinstance(body, dict):
@@ -759,6 +933,24 @@ class Handler(BaseHTTPRequestHandler):
                               body.get("key"))
             elif self.path == "/api/tasks":
                 origin = ("cli:" + printable(body.get("origin") or "api", 60)) if host_cli else WEB_ORIGIN
+                packet = body.get("packet")
+                if str(body.get("kind")) == "review":
+                    if not host_cli:
+                        raise PermissionError("reviews are submitted from the host CLI")
+                    if not isinstance(packet, str) or not packet.strip() or len(packet.encode()) > PACKET_MAX:
+                        raise ValueError(f"a review needs a packet of 1 to {PACKET_MAX} bytes")
+                    con.execute("BEGIN IMMEDIATE")  # the loop cannot pick the task up before its packet exists
+                    try:
+                        task = submit(con, "review", str(body.get("text") or ""), body.get("ticket"), origin, body.get("key"))
+                        if not task.get("deduplicated"):
+                            d = self.root / "runs" / task["id"]
+                            d.mkdir(parents=True, exist_ok=True)
+                            (d / "packet.md").write_text(packet, encoding="utf-8")
+                        con.execute("COMMIT")
+                    except BaseException:
+                        con.execute("ROLLBACK")
+                        raise
+                    return self._send(200, task)
                 task = submit(con, str(body.get("kind") or ""), str(body.get("text") or ""), body.get("ticket"),
                               origin, body.get("key"), body.get("needs"))
             else:
@@ -834,6 +1026,13 @@ def main(argv=None) -> int:
     s.add_argument("--needs", help="comma list of required capabilities, e.g. run-commands")
     s.add_argument("--origin", default="cli")
     s.add_argument("--wait", type=int, default=0)
+    rv = sub.add_parser("review", help="queue an exact-head PR review; findings go to the ticket")
+    rv.add_argument("--repo", required=True, help="owner/name (must be on COORD_REVIEW_REPOS)")
+    rv.add_argument("--pr", required=True, type=int)
+    rv.add_argument("--packet", required=True, help="review packet file, or - for stdin")
+    rv.add_argument("--ticket", required=True)
+    rv.add_argument("--owner", default="unknown", help="agent id that should act on the findings")
+    rv.add_argument("--wait", type=int, default=0)
     c = sub.add_parser("chat")
     c.add_argument("text", nargs="+")
     for name in ("status", "tasks", "logins", "logout-all"):
@@ -880,6 +1079,14 @@ def main(argv=None) -> int:
         if args.wait:
             t = wait_task(args, t["id"], args.wait)
         print(json.dumps(t, indent=1))
+        return 0 if t["state"] in ("done", "queued", "running") else 1
+    if args.cmd == "review":
+        packet = sys.stdin.read() if args.packet == "-" else Path(args.packet).read_text(encoding="utf-8")
+        t = client(args, "/api/tasks", {"kind": "review", "ticket": args.ticket, "packet": packet, "origin": "review-cli",
+                                        "text": json.dumps({"repo": args.repo, "pr": args.pr, "owner": args.owner})})
+        if args.wait:
+            t = wait_task(args, t["id"], args.wait)
+        print(json.dumps({k: t.get(k) for k in ("id", "state", "lane", "ticket", "result", "error")}, indent=1))
         return 0 if t["state"] in ("done", "queued", "running") else 1
     if args.cmd == "chat":
         t = client(args, "/api/chat", {"text": " ".join(args.text)})
