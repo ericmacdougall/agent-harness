@@ -981,6 +981,27 @@ Hawkeye's `HAWKEYE_*` names for these settings are still accepted.
 
 Run `python3 -m unittest tests.test_worktree_hygiene`. This runs Hawkeye's 108-check scenario suite (`tests/worktree_hygiene_scenarios.py`) and the harness-default cases. Both use temporary homes, bare origins and real worktrees.
 
+## Waiting on a remote log (bg_job wait-remote, goodqa#15565 items 7 and 8)
+
+`python3 ~/.claude/hooks/bg_job.py wait-remote --host H --file F --until-file-line TEXT --timeout S` replaces the hand-written `until ...; done; cmd | tail` loop. It polls one fixed, read-only ssh command (`/usr/bin/ssh` with fixed options; only the shell-quoted file and an integer offset vary) and waits for TEXT, a fixed substring and not a pattern, in bytes appended to the remote file. It prints no remote content.
+
+| Exit | Output | Meaning |
+|---|---|---|
+| 0 | `LINE_FOUND` | TEXT appeared in the examined bytes |
+| 1 | `FAIL_LINE_FOUND` | `--fail-line TEXT` appeared first, or in the same poll (the failure wins) |
+| 2 | `UNPROVEN` | remote command failed, the file is not a readable regular file, the read failed (tail status), the reply was malformed or over the byte cap, or ssh refused (Permission denied, Host key verification failed, Could not resolve hostname; not retried) |
+| 3 | `TIMEOUT` | `--timeout` (required, 1 to 86400 s) ran out; it bounds the whole wait: each ssh attempt is cut at the remaining budget, no retry starts past the deadline, and a match arriving after it is not accepted |
+| 5 | `INFRA` | the link kept failing: a poll's attempt and one retry both returned 255 (or hit the 30 s call bound), `--max-infra-polls` times in a row (default 3) |
+| 64 | `UNPROVEN reason=...` | bad arguments (host, a file starting with `~`, ranges), or the file is a path command_guard refuses to read (credential locations; the found or timeout answer would otherwise be a substring oracle on any remote file) |
+
+`wait --name N --ssh-job` reports a job whose status is 255 (ssh's own connection failure) as `INFRA` with exit 5 instead of a plain failure; without the flag nothing changes.
+
+Which bytes count (the baseline). By default only bytes appended after the first successful look count, so a reused log's earlier result cannot end the wait. A run launched before the wait can therefore finish first and be missed. Two patterns avoid that: give the run its own fresh log and add `--include-existing`; or, for a log appended across runs, read its size before the launch and pass `--from-offset N`. A line written before the first successful look, including while the link was down, counts as existing.
+
+Limits. Wait on an append-only log: a rewrite that regrows past the old offset within one poll is not seen, and a truncation between the size read and the tail can skip the new file's first bytes. A dangling symlink at the file ends as TIMEOUT; a remote symlink is followed. A path command_guard does not know is not judged. ssh config `ProxyCommand`, `LocalCommand` and `RemoteCommand` for the host apply as for plain ssh. The remote needs a POSIX login shell. There is no producer check: use `--fail-line` for a run that can crash before it writes anything. Item 7 (a retry-once wrapper) is only partly met: the retry and the INFRA exit exist inside `wait-remote` polls (a read-only, idempotent command); a wrapper for an arbitrary remote command is not built because a retry can run a non-idempotent command twice (follow-up ticket for an idempotent-only wrapper).
+
+Tests: `python3 -B -m unittest tests.test_bg_job_remote tests.test_bg_job`; failing-first: `python3 -B tests/mutants_bg_job_remote.py`.
+
 ## Spec-driven tickets
 
 Every want, need, finding or bug is a GoodQA ticket. When an agent picks one up, it writes a spec, gets the spec reviewed and attaches it to the ticket. As it works, it attaches proof for each acceptance criterion. After deploy, it attaches the click-test record. Once signed off, the ticket can be marked done.

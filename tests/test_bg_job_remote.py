@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -29,7 +30,7 @@ def serve(content, command):
     if content == "dir":
         return 11, b"", ""
     off = int(re.search(r"tail -c \+(\d+) --", command).group(1))
-    return 0, b"%d\n" % len(content) + content[off - 1:off - 1 + bg_job.READ_CAP], ""
+    return 0, b"%d\n" % len(content) + content[off - 1:off - 1 + bg_job.READ_CAP], "__bgjob_rc=0\n"
 
 
 class Remote:
@@ -39,8 +40,9 @@ class Remote:
     def __init__(self, *steps):
         self.steps, self.calls = list(steps), []
 
-    def __call__(self, host, command):
+    def __call__(self, host, command, budget=None):
         self.calls.append((host, command))
+        self.budgets = getattr(self, "budgets", []) + [budget]
         step = self.steps[min(len(self.calls) - 1, len(self.steps) - 1)]
         if callable(step):
             step = step(len(self.calls) - 1)
@@ -225,38 +227,215 @@ class Errors(unittest.TestCase):
         self.assertNotIn("\x1b", line)
 
     def test_a_hung_ssh_call_counts_as_a_connection_failure(self):
-        with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 30)):
-            self.assertEqual(bg_job._ssh_once(GOOD_HOST, "x")[0], 255)
+        with StubSsh("exec sleep 30") as stub:
+            t0 = time.monotonic()
+            status, out, err = bg_job._ssh_once(GOOD_HOST, "x", 0.5)
+        self.assertEqual(status, 255)
+        self.assertIn("timed out", err)
+        self.assertLess(time.monotonic() - t0, 5)
+        stub.assert_reaped()
+
+
+class StubSsh:
+    """A stand-in for /usr/bin/ssh: a shell script (argv ignored unless the body reads it) in a private directory, patched into
+    bg_job.SSH. Its pid is written to a file so a test can prove the process was stopped and reaped."""
+
+    def __init__(self, body):
+        self.body = body
+
+    def __enter__(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.pidfile = self.dir / "pid"
+        self.argfile = self.dir / "args"
+        script = self.dir / "ssh"
+        script.write_text("#!/bin/sh\necho $$ > %s\nfor a in \"$@\"; do printf '%%s\\n' \"$a\" >> %s; done\n%s\n"
+                          % (self.pidfile, self.argfile, self.body))
+        script.chmod(0o700)
+        self.patch = mock.patch.object(bg_job, "SSH", str(script))
+        self.patch.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.patch.stop()
+        try:
+            self.pid = int(self.pidfile.read_text())
+        except (OSError, ValueError):
+            self.pid = None
+        self.tmp.cleanup()
+
+    def assert_reaped(self):
+        import os
+        assert self.pid, "the stub never ran"
+        try:
+            os.kill(self.pid, 0)
+        except ProcessLookupError:
+            return  # gone: stopped and reaped, not left running or as a zombie
+        raise AssertionError("the ssh process %d is still there" % self.pid)
 
 
 class Command(unittest.TestCase):
     def test_the_ssh_argv_is_fixed_and_the_file_is_one_quoted_word(self):
-        seen = {}
-
-        def fake_run(argv, **kw):
-            seen["argv"], seen["kw"] = argv, kw
-            return subprocess.CompletedProcess(argv, 0, b"0\n", b"")
-
-        hostile = "x; touch /tmp/pwn $(id) `id` 'q' -rf"
-        with mock.patch.object(subprocess, "run", fake_run):
-            bg_job._poll(GOOD_HOST, __import__("shlex").quote(hostile), 7)
-        argv = seen["argv"]
-        self.assertEqual(argv[0], "/usr/bin/ssh")
-        self.assertEqual(argv[1:9], ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=5",
-                                     "-o", "ServerAliveCountMax=2"])
-        self.assertEqual(argv[9:11], ["--", GOOD_HOST])
-        self.assertEqual(len(argv), 12)
         import shlex
-        expected = bg_job.REMOTE_TEMPLATE.format(f=shlex.quote(hostile), off=8)
-        self.assertEqual(argv[11], expected)
-        self.assertIs(seen["kw"].get("shell"), None)
-        self.assertEqual(seen["kw"]["timeout"], bg_job.SSH_CALL_BOUND)
+        hostile = "x; touch /tmp/pwn $(id) `id` 'q' -rf"
+        with StubSsh("printf '0\\n'; echo __bgjob_rc=0 >&2") as stub:
+            bg_job._poll(GOOD_HOST, shlex.quote(hostile), 7, time.monotonic() + 10)
+            argv = stub.argfile.read_text().split("\n")[:-1]
+        self.assertEqual(argv[:8], ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=5",
+                                    "-o", "ServerAliveCountMax=2"])
+        self.assertEqual(argv[8:10], ["--", GOOD_HOST])
+        self.assertEqual(len(argv), 11)
+        self.assertEqual(argv[10], bg_job.REMOTE_TEMPLATE.format(f=shlex.quote(hostile), off=8))
         self.assertNotIn("ssh_binary", dir(bg_job.cmd_wait_remote))
 
     def test_the_template_distinguishes_absent_from_unreadable(self):
         self.assertIn("exit 10", bg_job.REMOTE_TEMPLATE)
         self.assertIn("exit 11", bg_job.REMOTE_TEMPLATE)
         self.assertIn("head -c 65536", bg_job.REMOTE_TEMPLATE)
+
+
+class RealTemplate(unittest.TestCase):
+    """The real template run in a local POSIX sh (F2): what the remote shell would do with it."""
+
+    def sh(self, path, offset=1, fake_tail=None):
+        import shlex
+        import os
+        command = bg_job.REMOTE_TEMPLATE.format(f=shlex.quote(str(path)), off=offset)
+        env = {"PATH": os.environ["PATH"]}
+        if fake_tail:
+            env["PATH"] = fake_tail + ":" + env["PATH"]
+        done = subprocess.run(["/bin/sh", "-c", command], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=30)
+        return done.returncode, done.stdout, done.stderr.decode()
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_missing_file_and_directory_have_their_own_exit_codes(self):
+        self.assertEqual(self.sh(self.tmp / "nope")[0], 10)
+        self.assertEqual(self.sh(self.tmp)[0], 11)
+
+    def test_a_normal_read_gives_the_size_the_bytes_and_a_zero_marker(self):
+        f = self.tmp / "log"
+        f.write_bytes(b"hello world")
+        code, out, err = self.sh(f, offset=7)
+        self.assertEqual((code, out.split(b"\n")[0].strip(), out.split(b"\n")[1], err.strip()), (0, b"11", b"world", "__bgjob_rc=0"))
+
+    def test_a_failing_tail_is_visible_not_hidden_by_head(self):
+        # F2: `tail | head` returns head's status; a tail that fails must show in the marker and make _poll UNPROVEN
+        f = self.tmp / "log"
+        f.write_bytes(b"data")
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        (bindir / "tail").write_text("#!/bin/sh\nprintf partial\nexit 1\n")
+        (bindir / "tail").chmod(0o700)
+        code, out, err = self.sh(f, fake_tail=str(bindir))
+        self.assertEqual(code, 0)  # head's status: exactly what the marker exists to expose
+        self.assertEqual(out.split(b"\n")[1], b"partial")
+        self.assertIn("__bgjob_rc=1", err)
+        with mock.patch.object(bg_job, "_ssh_once", return_value=(code, out, err)):
+            kind, _s, _d, note = bg_job._poll(GOOD_HOST, "'x'", 0, time.monotonic() + 5)
+        self.assertEqual(kind, "failed")
+        self.assertIn("tail exit 1", note)
+
+    def test_a_missing_read_marker_is_unproven(self):
+        with mock.patch.object(bg_job, "_ssh_once", return_value=(0, b"4\ndata", "")):
+            self.assertEqual(bg_job._poll(GOOD_HOST, "'x'", 0, time.monotonic() + 5)[0], "failed")
+
+    def test_a_read_cut_off_by_head_at_the_cap_is_a_full_read(self):
+        f = self.tmp / "big"
+        f.write_bytes(b"x" * (bg_job.READ_CAP * 3))
+        code, out, err = self.sh(f)
+        self.assertEqual(len(out.partition(b"\n")[2]), bg_job.READ_CAP)
+        with mock.patch.object(bg_job, "_ssh_once", return_value=(code, out, err)):
+            self.assertEqual(bg_job._poll(GOOD_HOST, "'x'", 0, time.monotonic() + 5)[0], "ok")
+        with mock.patch.object(bg_job, "_ssh_once", return_value=(0, b"5\nab", "__bgjob_rc=141\n")):  # 141 on a short read
+            self.assertEqual(bg_job._poll(GOOD_HOST, "'x'", 0, time.monotonic() + 5)[0], "failed")
+
+
+class Capture(unittest.TestCase):
+    """F3: both streams are read with a hard byte cap; on overflow the process is stopped and reaped."""
+
+    def test_stdout_past_the_cap_stops_and_reaps_the_process(self):
+        with StubSsh("exec yes aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") as stub:
+            t0 = time.monotonic()
+            status, out, err = bg_job._ssh_once(GOOD_HOST, "x", 20)
+        self.assertEqual(status, bg_job.OVERFLOW)
+        read = int(re.search(r"after (\d+) bytes", err).group(1))
+        self.assertEqual(read, bg_job.READ_CAP + 64)  # capture stopped exactly at the cap, never buffered more
+        self.assertLess(time.monotonic() - t0, 10)
+        stub.assert_reaped()
+
+    def test_stderr_past_the_cap_is_bounded_and_reaped_too(self):
+        with StubSsh("exec yes bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb >&2") as stub:
+            status, out, err = bg_job._ssh_once(GOOD_HOST, "x", 20)
+        self.assertEqual(status, 255)
+        self.assertLessEqual(len(err), 2000)
+        stub.assert_reaped()
+
+    def test_a_poll_reports_an_overflow_as_unproven_not_a_match(self):
+        with StubSsh("exec yes cccccccccccccccccccccccccccccccc") as stub:
+            kind, _s, _d, note = bg_job._poll(GOOD_HOST, "'x'", 0, time.monotonic() + 20)
+        self.assertEqual(kind, "failed")
+        self.assertIn("read cap", note)
+        stub.assert_reaped()
+
+    def test_the_call_bound_applies_even_when_the_budget_is_larger(self):
+        with mock.patch.object(bg_job, "SSH_CALL_BOUND", 0.5), StubSsh("exec sleep 30") as stub:
+            t0 = time.monotonic()
+            status, _o, _e = bg_job._ssh_once(GOOD_HOST, "x", 1000)
+        self.assertEqual(status, 255)
+        self.assertLess(time.monotonic() - t0, 5)
+        stub.assert_reaped()
+
+    def test_a_small_normal_answer_passes_through(self):
+        with StubSsh("printf '3\\nabc'; echo __bgjob_rc=0 >&2"):
+            self.assertEqual(bg_job._ssh_once(GOOD_HOST, "x", 10), (0, b"3\nabc", "__bgjob_rc=0\n"))
+
+
+class Deadline(unittest.TestCase):
+    """F1: --timeout bounds the whole wait, retries and late answers included."""
+
+    def test_each_attempt_is_capped_at_the_remaining_budget(self):
+        remote = Remote(b"", b"")
+        run(remote, timeout=2.0)
+        self.assertTrue(remote.budgets)
+        self.assertTrue(all(b is not None and 0 < b <= 2.0 for b in remote.budgets), remote.budgets)
+
+    def test_a_slow_failed_attempt_leaves_no_time_for_the_retry(self):
+        def slow_reset(_i):
+            time.sleep(1.3)
+            return (255, b"", "Connection reset by peer")
+
+        remote = Remote(slow_reset)
+        t0 = time.monotonic()
+        code, out, _a = run(remote, timeout=1.0)
+        self.assertEqual(code, 3)
+        self.assertIn("TIMEOUT", out)
+        self.assertEqual(len(remote.calls), 1)  # the retry is not attempted past the deadline
+        self.assertLess(time.monotonic() - t0, 4)
+
+    def test_a_match_that_arrives_after_the_deadline_is_not_accepted(self):
+        def late_match(i):
+            if i == 0:
+                return b""
+            time.sleep(1.2)
+            return b"ALL PASSED\n"
+
+        code, out, _a = run(Remote(late_match), timeout=1.0)
+        self.assertEqual(code, 3)
+        self.assertIn("TIMEOUT", out)
+        self.assertNotIn("LINE_FOUND", out)
+
+    def test_a_real_slow_ssh_is_cut_at_the_remaining_budget_not_the_call_bound(self):
+        with StubSsh("exec sleep 30"):
+            t0 = time.monotonic()
+            status, _o, err = bg_job._ssh_once(GOOD_HOST, "x", 0.4)
+        self.assertEqual(status, 255)
+        self.assertLess(time.monotonic() - t0, 3)
 
 
 class Refusals(unittest.TestCase):
@@ -319,9 +498,9 @@ class Refusals(unittest.TestCase):
         class Endless:
             calls = 0
 
-            def __call__(self, host, command):
+            def __call__(self, host, command, budget=None):
                 Endless.calls += 1
-                return 0, b"%d\n" % (10 ** 17) + b"a" * bg_job.READ_CAP, ""
+                return 0, b"%d\n" % (10 ** 17) + b"a" * bg_job.READ_CAP, "__bgjob_rc=0\n"
 
         t0 = __import__("time").time()
         code, out, _a = run(Endless(), timeout=1.0, include_existing=True)

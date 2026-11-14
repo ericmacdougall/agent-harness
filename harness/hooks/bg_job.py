@@ -454,8 +454,8 @@ SSH = "/usr/bin/ssh"
 SSH_OPTIONS = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2")
 SSH_CALL_BOUND = 30  # seconds per ssh call: a hung connection counts as an infrastructure failure
 READ_CAP = 65536
-REMOTE_TEMPLATE = ("[ -e {f} ] || exit 10; [ -f {f} ] && [ -r {f} ] || exit 11; wc -c < {f}; "
-                   "tail -c +{off} -- {f} | head -c %d" % READ_CAP)
+REMOTE_TEMPLATE = ("[ -e {f} ] || exit 10; [ -f {f} ] && [ -r {f} ] || exit 11; wc -c < {f} || exit 12; "
+                   "{{ tail -c +{off} -- {f}; echo __bgjob_rc=$? >&2; }} | head -c %d" % READ_CAP)
 EXIT_ABSENT, EXIT_UNREADABLE = 10, 11
 HOST_RE = re.compile(r"^([A-Za-z0-9._-]{1,32}@)?[A-Za-z0-9][A-Za-z0-9.-]{0,62}$")
 SSH_REFUSED = re.compile(r"Permission denied|Host key verification failed|Could not resolve hostname")
@@ -519,26 +519,83 @@ def _bounded_line(text):
     return ""
 
 
-def _ssh_once(host, command):
-    """(status, stdout bytes, stderr text). A hung call returns status 255 with a timeout note."""
+OVERFLOW = -2  # _ssh_once: stdout went past its cap and the process was stopped
+
+
+def _stop_and_reap(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.send_signal(signal.SIGKILL)
+        proc.wait()
+
+
+def _ssh_once(host, command, budget=SSH_CALL_BOUND):
+    """(status, stdout bytes, stderr text) for one ssh call, bounded in time (`budget` seconds, at most SSH_CALL_BOUND) and in
+    bytes (both streams are read with a hard cap, never buffered whole). A hung call returns 255 with a timeout note; stdout
+    past its cap stops and reaps the process and returns OVERFLOW; stderr past its cap does the same and returns 255."""
+    import selectors
     argv = [SSH, *SSH_OPTIONS, "--", host, command]
     env = {k: os.environ[k] for k in ("PATH", "HOME", "SSH_AUTH_SOCK", "LANG") if k in os.environ}
+    budget = min(SSH_CALL_BOUND, max(0.0, budget))
     try:
-        done = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-                              timeout=SSH_CALL_BOUND)
-    except subprocess.TimeoutExpired:
-        return 255, b"", "ssh call timed out after %d s" % SSH_CALL_BOUND
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     except OSError as exc:
         return 255, b"", "ssh could not start (%s)" % type(exc).__name__
-    return done.returncode, done.stdout[:READ_CAP + 64], done.stderr[:2000].decode("utf-8", "replace")
+    caps = {proc.stdout: READ_CAP + 64, proc.stderr: 2000}
+    bufs = {proc.stdout: b"", proc.stderr: b""}
+    stop, outcome = time.monotonic() + budget, None
+    sel = selectors.DefaultSelector()
+    try:
+        for stream in caps:
+            sel.register(stream, selectors.EVENT_READ)
+        while sel.get_map() and outcome is None:
+            left = stop - time.monotonic()
+            if left <= 0:
+                outcome = "timeout"
+                break
+            for key, _events in sel.select(min(left, 1.0)):
+                stream = key.fileobj
+                chunk = os.read(stream.fileno(), 65536)
+                if not chunk:
+                    sel.unregister(stream)
+                    continue
+                room = caps[stream] - len(bufs[stream])
+                bufs[stream] += chunk[:room]
+                if len(chunk) > room:
+                    outcome = "overflow-out" if stream is proc.stdout else "overflow-err"
+                    break
+        if outcome is None:
+            try:
+                proc.wait(timeout=max(0.1, stop - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                outcome = "timeout"
+    finally:
+        sel.close()
+        if outcome is not None or proc.poll() is None:
+            _stop_and_reap(proc)
+        for stream in (proc.stdout, proc.stderr):
+            stream.close()
+    err = bufs[proc.stderr].decode("utf-8", "replace")
+    if outcome == "timeout":
+        return 255, b"", "ssh call timed out after %d s" % budget
+    if outcome == "overflow-out":
+        return OVERFLOW, b"", "ssh output went past its cap after %d bytes" % len(bufs[proc.stdout])
+    return (255 if outcome else proc.returncode), bufs[proc.stdout], err
 
 
-def _poll(host, quoted, offset):
-    """One poll, with the single retry on a connection failure: (kind, size, data, note); kind is ok, absent, unreadable,
-    refused (not infrastructure), infra or failed."""
+def _poll(host, quoted, offset, end):
+    """One poll, with the single retry on a connection failure, never past the deadline `end` (a time.monotonic value):
+    (kind, size, data, note); kind is ok, absent, unreadable, refused (not infrastructure), infra, failed or deadline."""
     command = REMOTE_TEMPLATE.format(f=quoted, off=offset + 1)
     for attempt in (0, 1):
-        status, out, err = _ssh_once(host, command)
+        budget = end - time.monotonic()
+        if budget <= 0:  # no time left for this attempt (or for the retry)
+            return "deadline", 0, b"", ""
+        status, out, err = _ssh_once(host, command, min(SSH_CALL_BOUND, budget))
+        if status == OVERFLOW:
+            return "failed", 0, b"", "the remote sent more than the read cap"
         if status == 255:
             if SSH_REFUSED.search(err):
                 return "refused", 0, b"", _bounded_line(err)
@@ -555,8 +612,15 @@ def _poll(host, quoted, offset):
     head, _, data = out.partition(b"\n")
     if not re.fullmatch(rb"\s*[0-9]{1,18}\s*", head):  # a banner, empty output or a garbled size is never a reset
         return "failed", 0, b"", "no size line"
-    size = int(head)
-    return "ok", size, data[:READ_CAP], ""
+    size, data = int(head), data[:READ_CAP]
+    # the template's `tail | head` pipeline reports head's status, so the read status travels in a marker on stderr
+    marker = re.search(r"__bgjob_rc=([0-9]+)", err)
+    if marker is None:
+        return "failed", 0, b"", "no read status"
+    code = int(marker.group(1))
+    if code != 0 and not (code == 141 and len(data) >= READ_CAP):  # 141: tail stopped by head at the cap, a full read
+        return "failed", 0, b"", "the remote read failed (tail exit %d)" % code
+    return "ok", size, data, ""
 
 
 def cmd_wait_remote(args):
@@ -572,7 +636,7 @@ def cmd_wait_remote(args):
     until, fail = args.until_file_line.encode(), (args.fail_line.encode() if args.fail_line else None)
     keep = max(len(until), len(fail or b"")) - 1
     name = os.path.basename(args.file)[:40] or "file"
-    end = time.time() + args.timeout
+    end = time.monotonic() + args.timeout  # one deadline for the whole wait, passed into every ssh attempt
     # offset = bytes of the file already examined. It starts at 0 and moves only by the bytes RECEIVED (never by the reported
     # size, which the read cap can outrun), except for the first look at an existing file: that sets it to the size, so only
     # appended bytes count, unless --include-existing or the caller's own baseline --from-offset (taken before the launch).
@@ -580,8 +644,12 @@ def cmd_wait_remote(args):
     if args.from_offset is not None:
         offset, first = args.from_offset, False
     while True:
-        kind, size, data, note = _poll(args.host, quoted, offset)
-        if kind == "infra":
+        kind, size, data, note = _poll(args.host, quoted, offset, end)
+        if kind in ("ok", "absent", "infra") and time.monotonic() >= end:
+            kind = "deadline"  # a result that arrives after the deadline is not accepted, a match included
+        if kind == "deadline":
+            pass
+        elif kind == "infra":
             infra_polls += 1
             if infra_polls >= args.max_infra_polls:
                 print("INFRA host=%s polls=%d %s" % (args.host, infra_polls, note))
@@ -611,15 +679,15 @@ def cmd_wait_remote(args):
                 if until in buf:
                     print("LINE_FOUND host=%s file=%s" % (args.host, args.file))
                     return EXIT_OK
-                if len(data) >= READ_CAP and time.time() < end:
+                if len(data) >= READ_CAP and time.monotonic() < end:
                     continue  # more is waiting: read on without sleeping, but never past the deadline
             else:  # absent: not there yet; a file that appears later holds only new bytes
                 first = False
-        if time.time() >= end:
+        if time.monotonic() >= end:
             print("TIMEOUT host=%s file=%s line not seen after %ss" % (args.host, args.file, args.timeout))
             _wait_alert(name, "timeout", "%s on %s did not show the line after %ss" % (args.file, args.host, args.timeout))
             return EXIT_TIMEOUT
-        time.sleep(max(0.05, min(args.poll, end - time.time())))
+        time.sleep(max(0.05, min(args.poll, end - time.monotonic())))
 
 
 def cmd_status(args):
