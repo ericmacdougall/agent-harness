@@ -266,12 +266,50 @@ NEGATION = re.compile(r"\b(?:no|not|never|don'?t|do not|without|stop|disable|isn
 def chooses_bypass(source) -> bool:
     """Delta D3: the cited user words must themselves choose bypass (provenance checks the quoted excerpt is in that
     turn), not merely be any genuine user turn. A negated excerpt never counts."""
+    context = decision_context(source)  # receipt v5 F1: judge the user's whole sentence, never the quote alone
+    return bool(context) and bool(decision_clauses(context, BYPASS_WORD, BYPASS_LEAD)) and user_decided(source)
+
+
+SENTENCE_END = re.compile(r"[.!?\n]+")
+
+
+def decision_context(source) -> str:
+    """The user's own words a decision is judged on (receipt v5 F1): the sentence holding the quoted excerpt, from the
+    start of the sentence before it to the end of the sentence where the excerpt ends, read from the real user turn
+    (or AskUserQuestion answer). A partial quote such as "use bypassPermissions for owners" out of "Do not use
+    bypassPermissions for owners." is judged with its "Do not". '' when the turn cannot be read or the excerpt is not
+    a faithful quote: fail closed."""
     try:
+        import mission_coverage  # noqa: PLC0415
         import provenance  # noqa: PLC0415
-        excerpt = str(provenance.parse_source(source).get("excerpt") or "")
+        parsed = provenance.parse_source(source)
+        variant = parsed.get("variant", "user")
+        if parsed.get("kind") != "user" or variant not in ("user", "answer"):
+            return ""
+        home = mission_coverage.claude_dir()
+        turn = (provenance.answer_turn(parsed["session"], parsed["ident"], home) if variant == "answer"
+                else provenance.user_turn(parsed["session"], parsed["uuid"], home))
+        text = str(turn.get("text") or "")
+        if provenance.excerpt_in(text, parsed["excerpt"]) is not None:
+            return ""
+        body = provenance.norm(text.replace(provenance.SENTINEL, " . "))
+        segments = [seg.strip() for seg in provenance.norm(parsed["excerpt"]).split("...") if seg.strip()]
     except Exception:  # noqa: BLE001
-        return False
-    return bool(decision_clauses(excerpt, BYPASS_WORD, BYPASS_LEAD)) and user_decided(source)
+        return ""
+    first, pos = None, 0
+    for seg in segments:
+        index = body.find(seg, pos)
+        if index < 0:
+            return ""
+        first = index if first is None else first
+        pos = index + len(seg)
+    if first is None:
+        return ""
+    starts = [0] + [m.end() for m in SENTENCE_END.finditer(body, 0, first)]
+    start = starts[-2] if len(starts) >= 2 else 0  # the sentence before, too: "No. Park solve." stays undecided
+    tail = SENTENCE_END.search(body, pos)
+    end = tail.end() if tail else len(body)
+    return body[start:end]
 
 
 BYPASS_LEAD = r"(?:bypass(?:permissions)?|use|choose|pick|go with|switch to|run with|run in|set|enable|allow)"

@@ -19,6 +19,14 @@ NOW = 1_800_000_000.0
 MISSION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
 
+
+def whole_turn():
+    """The quoted excerpt is the user's whole turn (older decision tests); receipt v5 tests read real turns."""
+    import provenance
+    return mock.patch.object(ort, "decision_context",
+                             side_effect=lambda s: provenance.parse_source(s).get("excerpt") or "")
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -238,7 +246,7 @@ class ResponseTests(Base):
         """Receipt F1: a verified user turn naming the goal is not enough; its words must park it, unnegated."""
         import mission_coverage as mc
         sess = "baab765b-d85c-46b4-b7b9-588eb912c770/11111111-2222-4333-8444-555555555555"
-        with mock.patch.object(mc, "verify_user_source", return_value=True):
+        with mock.patch.object(mc, "verify_user_source", return_value=True), whole_turn():
             for words in ("never park solve", "do not defer solve", "solve is the top priority", "don't pause solve",
                           "solve: keep going, no hold"):
                 with self.assertRaises(drive.DriveError, msg=words):
@@ -250,7 +258,7 @@ class ResponseTests(Base):
         """Receipt v3 F1: the park verb must apply to this goal, not to another goal in the same sentence."""
         import mission_coverage as mc
         sess = "baab765b-d85c-46b4-b7b9-588eb912c770/11111111-2222-4333-8444-555555555555"
-        with mock.patch.object(mc, "verify_user_source", return_value=True):
+        with mock.patch.object(mc, "verify_user_source", return_value=True), whole_turn():
             for words in ("keep solve moving; park leads until Monday", "solve is fine, park leads",
                           "park leads until solve ships", "park leads and keep pushing solve",
                           "let's solve the bug later", "hold on, solve is broken", "park everything except solve"):
@@ -263,13 +271,34 @@ class ResponseTests(Base):
         """Receipt v4 F2: "Should we park solve?" or a conditional park is not the user parking solve."""
         import mission_coverage as mc
         sess = "baab765b-d85c-46b4-b7b9-588eb912c770/11111111-2222-4333-8444-555555555555"
-        with mock.patch.object(mc, "verify_user_source", return_value=True):
+        with mock.patch.object(mc, "verify_user_source", return_value=True), whole_turn():
             for words in ("Should we park solve?", "Should we park solve", "If the release fails we should park solve",
                           "park solve?", "when leads ships, park solve", "do we park solve", "maybe park solve",
                           "we could defer solve", "unless it lands today, park solve", "solve parked"):
                 with self.assertRaises(drive.DriveError, msg=words):
                     drive.respond(self.home, "solve", "UNOWNED", "park", source=f'user:{sess} "{words}"', now=NOW)
             drive.respond(self.home, "solve", "UNOWNED", "park", source=f'user:{sess} "yes, park solve"', now=NOW)
+
+    def test_response_park_partial_quote_judged_on_whole_sentence(self):
+        """Receipt v5 F1: "park solve" quoted out of "please don't park solve" never parks solve."""
+        import mission_coverage as mc
+        import provenance
+        cases = [("park solve", "Please don't park solve.", False),  # too short to quote alone, and negated
+                 ("park solve today", "Please don't park solve today.", False),
+                 ("park solve today", "Keep going. If the build breaks, park solve today.", False),
+                 ("park solve today", "No. park solve today.", False),
+                 ("park solve today", "Thanks for the update. Yes, park solve today.", True)]
+        with mock.patch.object(mc, "verify_user_source", return_value=True):
+            for excerpt, text, ok in cases:
+                src = 'user:baab765b-d85c-46b4-b7b9-588eb912c770/11111111-2222-4333-8444-555555555555 "' + excerpt + '"'
+                with mock.patch.object(provenance, "user_turn", return_value={"text": text}):
+                    if len(excerpt) >= 12:  # a quote long enough to resolve is found: the refusal is not vacuous
+                        self.assertTrue(ort.decision_context(src), text)
+                    if ok:
+                        drive.respond(self.home, "solve", "UNOWNED", "park", source=src, now=NOW)
+                    else:
+                        with self.assertRaises(drive.DriveError, msg=text):
+                            drive.respond(self.home, "solve", "UNOWNED", "park", source=src, now=NOW)
 
     def test_release_uses_deploy_event_time_not_attach_time(self):
         """Receipt v3 F2: an older deploy attached after the merge is not a newer release."""

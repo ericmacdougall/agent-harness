@@ -530,7 +530,9 @@ def check_response(home: Path, goal_id: str, cond: str, kind: str, ref: str, sou
     if kind == "park":
         if not mc.verify_user_source(source):
             return "a park needs a user:/answer: source that resolves to the user's own words"
-        excerpt = mc.source_excerpt(source)
+        excerpt = ort.decision_context(source)  # receipt v5 F1: the whole sentence, never the quote alone
+        if not excerpt:
+            return "the user's words around the quote could not be read; nothing is parked"
         if goal_id not in excerpt.lower() and not mc.names_goal(excerpt, goal):
             return f"the user's words do not name goal {goal_id}"
         if not park_binds(excerpt, goal_id, ort.mission_goals(home)):  # receipt F1 (v2, v3)

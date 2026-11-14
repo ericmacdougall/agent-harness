@@ -26,6 +26,14 @@ NEG-1 (AC-2) a double click saves once
 """
 
 
+
+def whole_turn():
+    """The quoted excerpt is the user's whole turn (older decision tests); receipt v5 tests read real turns."""
+    import provenance
+    return mock.patch.object(ort, "decision_context",
+                             side_effect=lambda s: provenance.parse_source(s).get("excerpt") or "")
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -628,7 +636,7 @@ class HardeningTests(Base):
         sess = "baab765b-d85c-46b4-b7b9-588eb912c770/ecc9bdf8-0000-4000-8000-000000000000"
         self.write_runtime({"enabled": True, "permission_mode": "bypassPermissions",
                             "permission_source": f'answer:{sess} "Bypass, like main"'})
-        with mock.patch.object(ort, "user_decided", return_value=True):
+        with mock.patch.object(ort, "user_decided", return_value=True), whole_turn():
             self.assertEqual(ort.runtime(self.home)["permission_mode"], "bypassPermissions")
         with mock.patch.object(ort, "user_decided", return_value=False):  # not the user's own turn
             self.assertEqual(ort.runtime(self.home)["permission_mode"], "auto")
@@ -636,7 +644,7 @@ class HardeningTests(Base):
     def test_runtime_bypass_questions_and_conditionals_never_decide(self):
         """Receipt v4 F2: a question, conditional or hedge is not a decision; an explicit imperative is."""
         sess = "baab765b-d85c-46b4-b7b9-588eb912c770/ecc9bdf8-0000-4000-8000-000000000000"
-        with mock.patch.object(ort, "user_decided", return_value=True):
+        with mock.patch.object(ort, "user_decided", return_value=True), whole_turn():
             for words in ("What does bypassPermissions do", "What does bypassPermissions do?", "Should we use bypass",
                           "If tests pass, use bypass", "bypass would be nice", "maybe bypass", "use bypass when ready",
                           "is bypass on", "I wonder about bypass", "owners in bypass mode", "Can owners bypass"):
@@ -648,10 +656,30 @@ class HardeningTests(Base):
                                     "permission_source": f'user:{sess} "{words}"'})
                 self.assertEqual(ort.runtime(self.home)["permission_mode"], "bypassPermissions", words)
 
+    def test_runtime_bypass_partial_quote_judged_on_whole_sentence(self):
+        """Receipt v5 F1: a quote cut out of a refusal never authorizes; the user's whole sentence is judged."""
+        import provenance
+        src = 'user:baab765b-d85c-46b4-b7b9-588eb912c770/11111111-2222-4333-8444-555555555555 "use bypassPermissions for owners"'
+        self.write_runtime({"enabled": True, "permission_mode": "bypassPermissions", "permission_source": src})
+        cases = [("Do not use bypassPermissions for owners.", "auto"),
+                 ("Thanks. If it is safe, use bypassPermissions for owners.", "auto"),
+                 ("No. use bypassPermissions for owners!", "auto"),
+                 ("Would you use bypassPermissions for owners?", "auto"),
+                 ("Good work today. Yes, use bypassPermissions for owners.", "bypassPermissions")]
+        with mock.patch.object(ort, "user_decided", return_value=True):
+            for text, want in cases:
+                with mock.patch.object(provenance, "user_turn", return_value={"text": text}):
+                    self.assertTrue(ort.decision_context(src), text)  # the quote is found: never vacuous
+                    self.assertEqual(ort.runtime(self.home)["permission_mode"], want, text)
+            with mock.patch.object(provenance, "user_turn", side_effect=RuntimeError("no transcript")):
+                self.assertEqual(ort.runtime(self.home)["permission_mode"], "auto")  # unreadable: fail closed
+            with mock.patch.object(provenance, "user_turn", return_value={"text": "something else entirely"}):
+                self.assertEqual(ort.runtime(self.home)["permission_mode"], "auto")  # not a faithful quote
+
     def test_runtime_bypass_words_must_choose_bypass(self):
         """Delta D3: a genuine user turn that does not choose bypass never unlocks it."""
         sess = "baab765b-d85c-46b4-b7b9-588eb912c770/ecc9bdf8-0000-4000-8000-000000000000"
-        with mock.patch.object(ort, "user_decided", return_value=True):
+        with mock.patch.object(ort, "user_decided", return_value=True), whole_turn():
             for words in ("ok go ahead", "yes", "do not bypass permissions", "never use bypass", "don't bypass"):
                 self.write_runtime({"enabled": True, "permission_mode": "bypassPermissions",
                                     "permission_source": f'user:{sess} "{words}"'})
