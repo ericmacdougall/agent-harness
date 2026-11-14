@@ -464,3 +464,112 @@ def effective_state(goal: dict, audit_rows=None, chain_ok: bool = True) -> tuple
 
 def owners_allowed(state: str) -> bool:
     return state in ("active", "ready", "legacy")
+
+
+# ------------------------------------------------------------------ spawn gate (tier_gate.py calls these)
+
+GOAL_TAG_RE = re.compile(r"\[goal:([^\]\s]{0,100})\]")
+TAG_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")  # mission_coverage.ID_RE
+FENCED_RE = re.compile(r"```.*?(?:```|\Z)|~~~.*?(?:~~~|\Z)|`[^`\n]*`", re.S)
+SCOPING_TTL_S = 24 * 3600
+SCOPING_PER_GOAL = 1
+SCOPING_PER_SESSION = 2
+SCOPING_CONTEXT = ("lifecycle: scoping owner for a PENDING goal: survey, draft the spec and propose gates only; "
+                   "no code, no commits")
+TAG_TEXT_MAX = 400_000
+
+
+def goal_tags(texts) -> tuple:
+    """((goal_id, scoping) or None, problem). Tags inside code spans or fences do not count (prompt text is
+    untrusted, NEG-7). A malformed tag (bad id or suffix) counts as no tag; two different tags conflict."""
+    found, bad = set(), []
+    for text in texts:
+        body = FENCED_RE.sub(" ", str(text or "")[:TAG_TEXT_MAX])
+        for inner in GOAL_TAG_RE.findall(body):
+            gid, _sep, suffix = inner.partition(":")
+            if TAG_ID_RE.match(gid) and suffix in ("", "scoping"):
+                found.add((gid, suffix == "scoping"))
+            else:
+                bad.append(inner[:40])
+    if len(found) > 1:
+        return None, "conflicting goal tags: " + ", ".join(sorted(f"[goal:{g}{':scoping' if s else ''}]" for g, s in found))
+    if found:
+        return next(iter(found)), ""
+    if bad:
+        return None, "malformed goal tag [goal:%s] (counts as untagged)" % bad[0]
+    return None, ""
+
+
+def spawn_verdict(tag, problem: str, goals_by_id: dict, audit_rows, chain_ok: bool) -> tuple:
+    """(verdict, reason, context): verdict 'allow', 'scoping' (allowed once a quota slot is reserved) or 'deny'.
+    The ledger was read and parsed by the caller."""
+    fix = ("tag the spawn [goal:<id>] with an ACTIVE, READY or LEGACY goal, or [goal:<id>:scoping] on a PENDING goal "
+           "main created (survey and gate proposal only); see `ah goals`")
+    if tag is None:
+        return "deny", (problem or "owner spawn without a [goal:<id>] tag") + ": " + fix, ""
+    gid, scoping = tag
+    goal = goals_by_id.get(gid)
+    if goal is None:
+        return "deny", f"goal {gid} is not in the mission ledger: " + fix, ""
+    state, note = effective_state(goal, audit_rows, chain_ok)
+    if state == "unverified":
+        state = "pending"
+    if state in ("active", "ready"):
+        return "allow", "", ""
+    if state == "legacy":
+        return "allow", "", f"lifecycle: {gid} is a LEGACY goal (predates gates): propose gates for it"
+    if state == "pending" and scoping:
+        if not main_created(audit_rows, gid):
+            return "deny", (f"goal {gid} was not created or proposed by main, so no scoping owner may be spawned for "
+                            "it: main adds or proposes the goal first"), ""
+        return "scoping", "", SCOPING_CONTEXT
+    hint = {"pending": "its gates are not agreed: spawn a [goal:%s:scoping] owner, or propose gates and ask the user" % gid,
+            "agreed": "gates are agreed but it is not active: main runs activate",
+            "done": "the user closed it"}.get(state, state)
+    return "deny", f"goal {gid} is {state.upper()}{' (' + note + ')' if note else ''}: {hint}", ""
+
+
+def reserve_scoping(state_dir, goal_id: str, session: str, now: float, commit: bool) -> str:
+    """'' when a scoping slot is free (and, with commit, reserved), else why not. Under an exclusive flock: count the
+    unexpired reservations for the goal and the session, then append. A reservation is never released (a failed
+    launch keeps it): that fails safe. Expired rows are dropped on each committed write."""
+    import fcntl  # noqa: PLC0415  (POSIX; the hook hosts are macOS and Linux)
+    import os  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+    folder = Path(state_dir)
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path, lock_path = folder / "lifecycle-scoping.jsonl", folder / "lifecycle-scoping.lock"
+    for p in (path, lock_path):
+        if p.is_symlink():
+            raise LifecycleError(f"{p.name} is a symlink")
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        rows = []
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read(1 << 20)
+        except FileNotFoundError:
+            data = b""
+        for line in data.splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and isinstance(rec.get("at"), (int, float)) and now - rec["at"] < SCOPING_TTL_S:
+                rows.append(rec)
+        if sum(1 for r in rows if r.get("goal") == goal_id) >= SCOPING_PER_GOAL:
+            return f"goal {goal_id} already had a scoping owner in the last 24 hours (a second counts as untagged)"
+        if sum(1 for r in rows if r.get("session") == session) >= SCOPING_PER_SESSION:
+            return f"this session already spawned {SCOPING_PER_SESSION} scoping owners in the last 24 hours"
+        if commit:
+            rows.append({"at": now, "goal": goal_id, "session": session, "at_iso": now_iso(now)})
+            tmp = path.with_name(path.name + ".tmp")
+            with open(tmp, "w") as handle:
+                handle.write("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        return ""
+    finally:
+        os.close(fd)

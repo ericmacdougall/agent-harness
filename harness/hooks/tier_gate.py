@@ -654,6 +654,88 @@ def owner_cap_decision(session_id, tool_input, policy):
                                                       Path(__file__).resolve().parent / 'ah.py')), owners
 
 
+def lifecycle_mode(policy):
+    """caps.lifecycle_gate: 'warn' (default) or 'enforce'. HARNESS_LIFECYCLE_GATE=enforce can only strengthen it (a
+    hook's environment is not something a model may use to weaken a guard)."""
+    mode = str(policy.get('caps', {}).get('lifecycle_gate') or 'warn')
+    mode = mode if mode in ('warn', 'enforce') else 'warn'
+    return 'enforce' if os.environ.get('HARNESS_LIFECYCLE_GATE') == 'enforce' else mode
+
+
+def lifecycle_gate(data, tool, command, policy, session_id, ladder_denies):
+    """goodqa#15952 AC-2: an owner spawn names the goal it works on, and the goal must be ACTIVE, READY or LEGACY, or
+    PENDING with a scoping tag. Returns {mode, verdict: none|allow|deny, reason, context, facts}. Its own failures
+    stay inside it (never the ladder's enforce deny): warn context, or a one-line deny in enforce mode."""
+    out = {'mode': lifecycle_mode(policy), 'verdict': 'none', 'reason': '', 'context': '', 'facts': {}}
+    tool_input = data.get('tool_input') if isinstance(data.get('tool_input'), dict) else {}
+    if tool == 'Bash':
+        if not BASH_DISPATCH.search(command) or REVIEW_MARK.search(command) or not _launches_agent(command):
+            return out
+        out['mode'], texts = 'warn', [command]  # ASSUMPTION A3: Bash launches warn only in phase 1
+    elif tool in SPAWN_TOOLS:
+        sub_type = str(tool_input.get('subagent_type') or '')
+        if tool != 'Workflow' and not counts_as_owner(sub_type, policy):
+            return out  # helpers are untouched
+        texts = [tool_input.get('prompt'), tool_input.get('description')]
+        if tool == 'Workflow':
+            texts.append(json.dumps(tool_input, sort_keys=True)[:400000])
+    else:
+        return out
+    try:
+        import lifecycle as lcm  # noqa: PLC0415
+        import mission_coverage as mc  # noqa: PLC0415
+        home = mc.home_dir()
+        loaded = mc.load_goals(home)
+        if loaded['state'] == 'absent':
+            # ASSUMPTION A6: never a deny; said once per spawn only in enforce mode (warn mode stays quiet)
+            out.update(verdict='allow', facts={'ledger': 'absent'},
+                       context=('lifecycle: no mission ledger on this host; owner spawns are not checked against goals '
+                                'here') if out['mode'] == 'enforce' else '')
+            return out
+        if loaded['state'] != 'ok':
+            raise lcm.LifecycleError('mission ledger unreadable: %s' % loaded.get('error'))
+        audit = mc.verify_audit(home)
+        if not audit['ok']:
+            raise lcm.LifecycleError('mission ledger audit chain: %s' % audit['problem'])
+        tag, problem = lcm.goal_tags(texts)
+        verdict, reason, context = lcm.spawn_verdict(tag, problem, {g['id']: g for g in loaded['goals']},
+                                                     mc.read_audit_rows(home), True)
+        out['facts'] = {'goal': tag[0] if tag else None, 'scoping': bool(tag and tag[1]), 'verdict': verdict}
+        if verdict == 'scoping':
+            # Warn mode never consumes a reservation (it reports only); enforce reserves unless the ladder refused.
+            commit = out['mode'] == 'enforce' and not ladder_denies
+            why = lcm.reserve_scoping(mc.state_root(home), tag[0], str(session_id or ''), lcm.time.time(), commit)
+            if why:
+                verdict, reason, context = 'deny', why + '; handled as an untagged owner', ''
+            else:
+                verdict = 'allow'
+                out['facts']['reserved'] = commit
+        out.update(verdict=verdict, reason=reason, context=context)
+    except BaseException as error:  # noqa: BLE001  never falls into the ladder's handler
+        out.update(verdict='deny', reason='lifecycle gate cannot check this spawn (%s: %s)'
+                   % (type(error).__name__, str(error)[:160]), facts={'error': type(error).__name__})
+    return out
+
+
+def _launches_agent(command):
+    """A segment whose program in command position is claude, codex or rescue.py (prose that only mentions them,
+    such as a commit message, is not a launch)."""
+    for segment in split_segments(command[:MAX_LAUNCH_LINE]):
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            continue
+        if command_program(words) in ('claude', 'codex', 'rescue.py'):
+            return True
+    return False
+
+
+def _lifecycle_lines(lc):
+    if lc['verdict'] == 'deny':
+        return ['lifecycle gate (warn mode): would deny: ' + lc['reason']] if lc['mode'] == 'warn' else []
+    return [lc['context']] if lc['context'] else []
+
+
 ACTIONS = ('hook', 'start', 'stop', 'dispatch')
 BASH_DISPATCH = re.compile(r'(^|[\s;&|(/`\'"=\\])(claude|codex|rescue\.py)(\s|$|[\'"`)])', re.IGNORECASE)
 
@@ -905,6 +987,13 @@ def _main(action, data, tool, command, applies):
         decision, reason, updated, facts = decide_bash(data, policy, ledger)
     else:
         return 0
+    lc = lifecycle_gate(data, tool, command, policy, session_id, decision == 'deny' and mode == 'enforce')
+    lc_enforced = lc['verdict'] == 'deny' and lc['mode'] == 'enforce' and not (decision == 'deny' and mode == 'enforce')
+    if lc_enforced:
+        decision, reason, updated = 'deny', 'lifecycle gate: ' + lc['reason'], None
+    if lc['verdict'] != 'none':
+        facts = dict(facts or {}, lifecycle=dict(lc['facts'], mode=lc['mode'], verdict=lc['verdict'],
+                                                 reason=lc['reason'][:200]))
     record = {'at': esc.now(), 'tool': tool, 'decision': decision, 'reason': reason, 'mode': mode, 'facts': facts}
     _gate_log(record)
     try:
@@ -912,16 +1001,22 @@ def _main(action, data, tool, command, applies):
     except BaseException as error:  # noqa: BLE001  the decision and output never depend on the dispatch record
         _gate_log({'at': esc.now(), 'tool': tool, 'decision': 'dispatch_open_failed',
                    'error': '%s: %s' % (type(error).__name__, str(error)[:120])})
+    if lc_enforced:
+        print(json.dumps(hook_result('deny', reason)))
+        return 0
+    extra = '\n'.join(_lifecycle_lines(lc)) or None
     if decision == 'allow' and updated is None:
+        if extra:
+            print(json.dumps(hook_result('context', context=extra)))
         return 0  # nothing to change; the decision and its reason are in gate.jsonl
     if mode == 'warn':
         # Warn mode only speaks, and only about a refusal: the "would apply updatedInput" chatter for an allowed
         # spawn was ceremony with no effect (scenario B24: enforce it or say nothing).
-        if decision != 'deny':
-            return 0
-        print(json.dumps(hook_result('context', context='ladder (warn mode): would deny: %s' % reason)))
+        lines = (['ladder (warn mode): would deny: %s' % reason] if decision == 'deny' else []) + ([extra] if extra else [])
+        if lines:
+            print(json.dumps(hook_result('context', context='\n'.join(lines))))
         return 0
-    print(json.dumps(hook_result(decision, reason, updated)))
+    print(json.dumps(hook_result(decision, reason, updated, context=extra)))
     return 0
 
 
