@@ -219,6 +219,22 @@ class JournalTests(Base):
             self.append(d)
 
 
+class JournalCapTests(Base):
+    def test_a_row_past_the_cap_is_refused_before_the_lane_becomes_unreadable(self):  # NEG-90
+        d = self.lane()
+        big = {"pad": "x" * 200000}
+        for i in range(4):
+            self.store.journal_append(d, kind="queued", lane="lane_A", generation=0, writer={"id": "m", "session": "s"},
+                                      idem="k%d" % i, source="inferred: t", data=big, ts=NOW)
+        with self.assertRaises(st.JournalFull) as caught:
+            for i in range(4, 10):
+                self.store.journal_append(d, kind="queued", lane="lane_A", generation=0,
+                                          writer={"id": "m", "session": "s"}, idem="k%d" % i, source="inferred: t",
+                                          data=big, ts=NOW)
+        self.assertEqual(caught.exception.exit_code, 5)
+        self.assertEqual(self.store.verify_journal(d)[0], True)  # still readable and intact
+
+
 class OpRecordTests(Base):
     def test_retry_completes_only_missing_effects(self):
         d = self.lane()

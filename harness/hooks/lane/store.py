@@ -49,6 +49,10 @@ class KeyConflict(StoreError):
     exit_code = 5
 
 
+class JournalFull(StoreError):
+    exit_code = 5
+
+
 def canonical_json(obj) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
@@ -251,6 +255,9 @@ class Store:
             row["hash"] = self._row_hash(prev, row)
             line = (canonical_json(row) + "\n").encode()
             path = lane_dir / "journal.jsonl"
+            size = os.lstat(str(path)).st_size if os.path.lexists(str(path)) else 0
+            if size + len(line) > MAX_FILE:
+                raise JournalFull("journal would pass the %d byte input cap; start a successor lane" % MAX_FILE)
             if os.path.islink(str(path)):
                 raise RefusedInput("journal is a symlink")
             fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)

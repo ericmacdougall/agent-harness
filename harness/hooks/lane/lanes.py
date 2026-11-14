@@ -188,10 +188,6 @@ def reconcile_lane(store: st.Store, lane_id) -> list:
     done = []
     with store.lock():
         new_dir, old_dir, kit_dir = lane_dir / ".kit-new", lane_dir / ".kit-old", lane_dir / "kit"
-        for tmp in sorted(lane_dir.glob(".manifest.*.tmp")):
-            if not tmp.is_symlink():
-                tmp.unlink()
-                done.append("removed " + tmp.name)
         if not os.path.lexists(str(kit_dir)) and old_dir.is_dir() and not old_dir.is_symlink():
             os.rename(str(old_dir), str(kit_dir))
             done.append("restored kit from .kit-old")
@@ -200,6 +196,10 @@ def reconcile_lane(store: st.Store, lane_id) -> list:
             done.append("discarded stale .kit-new")
         if mf.repair_head(lane_dir):
             done.append("repaired manifest.head")
+        for tmp in sorted(lane_dir.glob(".manifest.*.tmp")):
+            if not tmp.is_symlink():
+                tmp.unlink()
+                done.append("removed " + tmp.name)
         if os.path.lexists(str(old_dir)):
             try:
                 recorded = mf.read_current(lane_dir)["kit_digests"]

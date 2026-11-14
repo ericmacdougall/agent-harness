@@ -200,9 +200,14 @@ class RevisionChainTests(CrashBase):
         problems = mf.verify_chain(self.d)
         self.assertTrue(any("r0002" in x for x in problems), problems)
 
-    def test_head_left_behind_by_a_crash_is_repaired_on_retry(self):
+    def test_head_one_behind_without_the_writers_residue_is_not_adopted(self):  # NEG-89
         (self.d / "manifest.head").write_text(mf._sha((self.d / "manifest.r0002.json").read_bytes()) + "\n")
+        self.assertFalse(mf.repair_head(self.d))
         self.assertTrue(mf.verify_chain(self.d))
+
+    def test_head_one_behind_with_the_writers_residue_is_repaired(self):  # crash between link and head
+        (self.d / "manifest.head").write_text(mf._sha((self.d / "manifest.r0002.json").read_bytes()) + "\n")
+        shutil.copy(self.d / "manifest.r0003.json", self.d / ".manifest.4242.tmp")
         self.assertTrue(mf.repair_head(self.d))
         self.assertEqual(mf.verify_chain(self.d), [])
 

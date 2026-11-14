@@ -157,15 +157,20 @@ def write_revision(lane_dir, m: dict, number=None) -> int:
     _crash_hook("rev:after_tmp")
     try:
         os.link(str(tmp), str(final))  # atomic create-if-absent
-    finally:
+    except BaseException:
         os.unlink(str(tmp))
+        raise
     _crash_hook("rev:after_link")
     st.atomic_write(_head_path(lane_dir), (_sha(data) + "\n").encode())
+    os.unlink(str(tmp))  # the temp file is the proof of an interrupted writer until the head is written
     return number
 
 
 def repair_head(lane_dir) -> bool:
-    """Complete an interrupted write_revision (revision present, head one behind). True when it changed the head."""
+    """Complete an interrupted write_revision: the head is one behind AND the interrupted writer's temp file, holding
+    exactly the newest revision, is still present. A revision appended without that residue is not adopted
+    (``verify_chain`` reports it; same-user limit as for any store file). True when it changed the head."""
+    lane_dir = Path(lane_dir)
     revs = _revisions(lane_dir)
     if not revs:
         return False
@@ -178,9 +183,15 @@ def repair_head(lane_dir) -> bool:
         prev = json.loads(top.decode()).get("prev_sha256")
     except ValueError:
         return False
-    if prev is not None and head == prev:
-        st.atomic_write(head_file, (_sha(top) + "\n").encode())
-        return True
+    if prev is None or head != prev:
+        return False
+    for tmp in lane_dir.glob(".manifest.*.tmp"):
+        try:
+            if not tmp.is_symlink() and st.read_input(tmp) == top:
+                st.atomic_write(head_file, (_sha(top) + "\n").encode())
+                return True
+        except st.StoreError:
+            continue
     return False
 
 
