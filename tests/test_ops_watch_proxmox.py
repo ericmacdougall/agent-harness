@@ -67,15 +67,19 @@ def files_text(vols=None, extra=()):
 
 
 def probe(pvesm_text=None, vols=None, du=None, end=True, extra="", vols_rc=0, files_rc=0, vols_out=None,
-          files_out=None):
-    """The fixed script's output. vols/files default to the VOLS fixture; vols_rc/files_rc None drops that ##RC."""
+          files_out=None, du_rc=None):
+    """The fixed script's output. vols/files default to the VOLS fixture; vols_rc/files_rc None drops that ##RC.
+    du_rc maps a VM id to its du exit status (default 0; None drops that ##RC line)."""
     du = DU if du is None else du
+    du_rc = du_rc or {}
     out = "##PVESM\n" + (pvesm() if pvesm_text is None else pvesm_text) + "##RC PVESM 0\n"
     out += "##VOLS\n" + (vols_text(vols) if vols_out is None else vols_out)
     out += "" if vols_rc is None else f"##RC VOLS {vols_rc}\n"
     out += "##FILES\n" + (files_text(vols) if files_out is None else files_out)
     out += "" if files_rc is None else f"##RC FILES {files_rc}\n"
-    out += "##DU\n" + "".join(f"{gib_kib(g)}\t/var/lib/vz/images/{vm}\n" for vm, g in du.items())
+    out += "##DU\n" + "".join(f"{gib_kib(g)}\t/var/lib/vz/images/{vm}\n"
+                               + ("" if du_rc.get(vm, 0) is None else f"##RC DU {vm} {du_rc.get(vm, 0)}\n")
+                               for vm, g in du.items())
     return out + extra + ("##END\n" if end else "")
 
 
@@ -514,6 +518,68 @@ class AllVolumesTests(Base):
         self.assertIn("disk:vmunknown:t2-proxmox:/var/lib/vz:103", got)
 
 
+class DuStatusTests(Base):
+    """PR review r3 F1: du can print a plausible subtotal and still fail (I/O or traversal error, timeout), so each
+    watched directory's du carries its own ##RC DU line and only a status-0 subtotal is trusted. A failed one is
+    unknown usage, raises disk:vmunknown and never enters the stored growth sample; the pool sample, read by
+    pvesm status with its own status, is still kept."""
+    VMUNK = "disk:vmunknown:t2-proxmox:/var/lib/vz:"
+
+    def check(self, **kw):
+        got, state, _ = self.run_check((0, probe(PVESM_LOW, **kw)))
+        (rec,) = state["proxmox_pools"].values()
+        return got, rec["samples"][-1]
+
+    def assert_103_unknown(self, got, sample):
+        self.assertIn(self.VMUNK + "103", got)
+        self.assertNotIn(self.VMUNK + "102", got)
+        self.assertNotIn("103", sample[2])  # no growth sample from a failed read
+        self.assertEqual(sample[2].get("102"), 15 * GIB)  # the independently valid read is kept
+        self.assertEqual(sample[1], 500 * GIB)  # pool usage sample kept (pvesm status had status 0)
+
+    def detail(self, **kw):
+        got = self.run_check((0, probe(**kw)))[0]
+        return got[KEY]["detail"]["vms"]
+
+    def test_du_that_fails_but_prints_a_plausible_subtotal_is_unknown(self):
+        got, sample = self.check(du_rc={103: 1})
+        self.assert_103_unknown(got, sample)
+        vms = self.detail(du_rc={103: 1})
+        self.assertIsNone(vms["103"]["actual_gib"])
+        self.assertEqual(vms["102"]["actual_gib"], 15.0)
+
+    def test_du_with_missing_status_is_unknown(self):
+        got, sample = self.check(du_rc={103: None})
+        self.assert_103_unknown(got, sample)
+
+    def test_du_that_times_out_after_a_valid_prefix_is_unknown(self):
+        got, sample = self.check(du={102: 15, 103: 3}, du_rc={103: 124})  # 102 done; 103 cut with a low partial
+        self.assert_103_unknown(got, sample)
+        self.assertIsNone(self.detail(du={102: 15, 103: 3}, du_rc={103: 124})["103"]["actual_gib"])
+
+    def test_failed_du_does_not_feed_vm_growth(self):
+        state = {}
+        GrowthTests.sample(self, state, 800, NOW - 24 * 3600, v103=10)
+        got = self.run_check((0, probe(pvesm(used_g=848, avail_g=68), du_rc={103: 1})), state, NOW)[0]
+        self.assertIsNone(got[KEY]["detail"]["vms"]["103"]["growth_gib_day"])
+        self.assertEqual(got[KEY]["detail"]["vms"]["102"]["growth_gib_day"], 0.0)
+
+    def test_a_status_without_its_subtotal_or_a_duplicate_subtotal_is_unknown(self):
+        got = self.run_check((0, probe(PVESM_LOW, du={102: 15}, extra="##RC DU 103 0\n")))[0]
+        self.assertIn(self.VMUNK + "103", got)
+        dup = probe(PVESM_LOW).replace("##RC DU 103 0\n", f"{gib_kib(1)}\t/var/lib/vz/images/103\n##RC DU 103 0\n")
+        self.assertIn(self.VMUNK + "103", self.run_check((0, dup))[0])
+
+    def test_every_remote_command_reports_its_own_status(self):
+        script = ow.pool_script("local", "/var/lib/vz", [102, 103])
+        cmds = [c.strip() for c in script.split(";") if c.strip()]
+        timed = [i for i, c in enumerate(cmds) if c.startswith("timeout ")]
+        self.assertEqual(len(timed), 5)  # pvesm status, pvesm list, find, du 102, du 103
+        for i in timed:
+            self.assertRegex(cmds[i + 1], r'^echo "##RC [A-Z]+( \d+)? \$\?"$', cmds[i])
+        self.assertTrue(all(c.startswith(("timeout ", "echo ")) for c in cmds))
+
+
 class RealFormatTests(Base):
     """Recorded from the live t2-proxmox pool on 2026-11-13: the header carries (KiB) units."""
 
@@ -553,7 +619,7 @@ class CommandAndConfigTests(Base):
         self.assertLessEqual(timeout, 30)
         script = argv[-1]
         scrubbed = re.sub(r"'##[A-Z ]+'", "", script)
-        scrubbed = re.sub(r'"##RC [A-Z]+ \$\?"', "", scrubbed)  # echoed status markers and their $?
+        scrubbed = re.sub(r'"##RC [A-Z]+( \d+)? \$\?"', "", scrubbed)  # echoed status markers and their $?
         for verb in ("fstrim", "resize", "destroy", "set", "create", "start", "stop", "shutdown", "migrate", "rm ",
                      "mv ", "delete", "move", "restore", "unlock", "template", "snapshot", "rollback", "reboot", "qm",
                      "-exec", "-delete", "-fprint", "$", ">", "<", "`", "&", "|", "sudo", "tee", "*"):
@@ -561,7 +627,8 @@ class CommandAndConfigTests(Base):
         self.assertIn("timeout 8 pvesm status --storage local", script)
         self.assertIn("timeout 8 pvesm list local;", script)
         self.assertIn("timeout 3 find /var/lib/vz/images -mindepth 2 -maxdepth 2;", script)
-        self.assertIn("timeout 8 du -sk /var/lib/vz/images/102 /var/lib/vz/images/103;", script)
+        self.assertIn('timeout 5 du -sk /var/lib/vz/images/102; echo "##RC DU 102 $?"; '
+                      'timeout 5 du -sk /var/lib/vz/images/103; echo "##RC DU 103 $?";', script)
         self.assertNotIn("images/*", script)  # unwatched VM directories are never traversed by du
         for cmd in script.split(";"):
             words = cmd.split()

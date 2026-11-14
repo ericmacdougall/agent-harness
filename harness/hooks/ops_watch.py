@@ -1374,11 +1374,10 @@ def pool_script(storage: str, mount: str, watch=()) -> str:
     """Every command is bounded by remote `timeout`. `pvesm list` gives the size of every volume on the storage
     (VM disks, detached unusedN disks and container volumes alike); `find` lists the image files by name only
     (readdir, no reads), because pvesm skips a file whose size it cannot read with nothing but a stderr warning.
-    Only the watched VMs' image directories are measured with du."""
-    dirs = " ".join(f"{mount}/images/{int(v)}" for v in watch)
-    du = f"timeout 8 du -sk {dirs}; " if dirs else ""
-    # ##RC lines carry each command's own exit status: the script's final echo would otherwise make a failed or
-    # timed out command look complete
+    Only the watched VMs' image directories are measured with du, one call each."""
+    du = "".join(f"timeout 5 du -sk {mount}/images/{int(v)}; echo \"##RC DU {int(v)} $?\"; " for v in watch)
+    # every command is followed by its own ##RC line: the script's final echo would otherwise make a failed or
+    # timed out command look complete, and du can print a plausible subtotal and still fail
     return (f"echo '##PVESM'; timeout 8 pvesm status --storage {storage}; echo \"##RC PVESM $?\"; "
             f"echo '##VOLS'; timeout 8 pvesm list {storage}; echo \"##RC VOLS $?\"; "
             f"echo '##FILES'; timeout 3 find {mount}/images -mindepth 2 -maxdepth 2; echo \"##RC FILES $?\"; "
@@ -1460,7 +1459,7 @@ def parse_pool_probe(text: str, storage: str, mount: str = "/var/lib/vz"):
             cur = m.group(1)
             sections.setdefault(cur, [])
             continue
-        m = re.fullmatch(r"##RC (PVESM|VOLS|FILES) (\d{1,3})", line)
+        m = re.fullmatch(r"##RC (PVESM|VOLS|FILES|DU \d{1,10}) (\d{1,3})", line)
         if m:
             sections.setdefault("RC", {})[m.group(1)] = int(m.group(2))
             continue
@@ -1478,11 +1477,14 @@ def parse_pool_probe(text: str, storage: str, mount: str = "/var/lib/vz"):
     if not (list_ok and files_ok):  # every subtotal is untrusted, including a prefix printed before a failure
         for vm in vms.values():
             vm["gib"] = None
-    du = {}
+    du_lines = {}
     for line in sections.get("DU", []):
-        m = re.fullmatch(r"(\d+)\s+\S*/images/(\d{1,10})", line.strip())
+        m = re.fullmatch(r"(\d+)\s+" + re.escape(mount) + r"/images/(\d{1,10})", line.strip())
         if m:
-            du[int(m.group(2))] = int(m.group(1)) * KIB
+            du_lines.setdefault(int(m.group(2)), []).append(int(m.group(1)) * KIB)
+    # a subtotal counts only with its own du status 0 and exactly one line: a failed, timed out or status-less du
+    # is unknown usage however plausible its number
+    du = {vm: vals[0] for vm, vals in du_lines.items() if len(vals) == 1 and rcs.get(f"DU {vm}") == 0}
     return {"status": status, "vms": vms, "du": du, "list_ok": list_ok, "files_ok": files_ok}
 
 
