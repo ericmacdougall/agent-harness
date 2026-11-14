@@ -384,6 +384,11 @@ class WaitRestoreTests(Base):
         jl(self.w / "main.jsonl", [row])
         jl(self.w / f"agent-{agent}.jsonl", [row])
 
+    def resume(self, agent, at):  # wal.py's SubagentStart row: written on spawn and on every SendMessage resume
+        row = {"at": iso(at), "event": "subagent", "agent_id": agent, "agent_type": "task-owner"}
+        jl(self.w / "main.jsonl", [row])
+        jl(self.w / f"agent-{agent}.jsonl", [row])
+
     def wait_note_then(self, agent, kind, key, then_event, then_at, wait_at):
         """A `waiting on <ref>` note, a waiting disposition a minute later (live past +7 h), then `then_event`."""
         wait = dict(self.WAITS[kind])
@@ -440,11 +445,12 @@ class WaitRestoreTests(Base):
         self.assertIn("tick", streams)
 
     def test_the_note_cap_runs_from_the_note_not_from_later_hook_rows(self):  # 24 h from the note's own time
-        t = NOW - 4 * HOUR + 120  # resumed after the fixture's stop; the note, 20 min of tool rows, then the stop
+        t = NOW - 4 * HOUR + 120  # resumed after the fixture's stop; the note, 4 min of tool rows, then the stop
+        self.resume("tick", t - 30)
         jl(self.w / "agent-tick.jsonl", [{"at": iso(t), "event": "status", "note": "waiting on GoodQA goodqa#15943"},
-                                         {"at": iso(t + 20 * 60), "event": "pretool", "agent_id": "tick", "tool": "Bash"}])
-        self.stop("tick", t + 21 * 60)
-        later = t + 24 * HOUR + 10 * 60 - NOW  # 24 h 10 m after the note, 23 h 49 m after the last row
+                                         {"at": iso(t + 240), "event": "pretool", "agent_id": "tick", "tool": "Bash"}])
+        self.stop("tick", t + 270)
+        later = t + 24 * HOUR + 120 - NOW  # 24 h 2 m after the note, 23 h 57.5 m after the last row
         self.assertEqual(self.look(later - HOUR)[0]["tick"]["wait_on"], "GoodQA goodqa#15943")  # inside the cap: holds
         rows, _ = self.look(later)
         self.assertIsNone(rows["tick"]["wait_on"], rows["tick"])
@@ -536,14 +542,6 @@ class WaitRestoreTests(Base):
                 self.assertIsNone(row["disposition"], row)
                 self.assertIsNone(row["wait_on"], row)
 
-    def test_stopped_at_wait_is_stamped_by_ah_not_the_caller(self):
-        jl(self.w / "agent-tick.jsonl", [{"at": iso(NOW - 60), "event": "intent", "note": "resumed and working"}])
-        self.dispose("tick", "waiting", "tick-r4-stamp", until=iso(NOW + HOUR), ref="wa5b00000001", stopped_at_wait=True)
-        self.assertIs(ah.dispositions(self.home, SESSION).get("tick", {}).get("stopped_at_wait"), False)
-        self.dispose("done1", "waiting", "done1-r4-stamp", until=iso(NOW + HOUR), ref="GoodQA goodqa#15944",
-                     stopped_at_wait=False)  # done1 stopped at old+60 and wrote nothing since
-        self.assertIs(ah.dispositions(self.home, SESSION).get("done1", {}).get("stopped_at_wait"), True)
-
     def running_owner(self, agent):
         jl(self.w / "main.jsonl", [{"at": iso(NOW - 5 * HOUR), "event": "subagent", "agent_id": agent, "agent_type": "task-owner"}])
         jl(self.w / f"agent-{agent}.jsonl", [{"at": iso(NOW - 5 * HOUR), "event": "intent", "note": "GoodQA goodqa#15952 work"}])
@@ -585,6 +583,7 @@ class WaitRestoreTests(Base):
         os.utime(sub / f"agent-{agent}.jsonl", (start + 200, start + 200))
 
     def test_a_note_wait_followed_by_its_own_closing_tail_holds(self):
+        self.resume("tick", NOW - 3 * HOUR - 120)
         jl(self.w / "agent-tick.jsonl", [{"at": iso(NOW - 3 * HOUR), "event": "status", "note": "waiting on GoodQA goodqa#15943"}])
         self.closing_tail("tick", NOW - 3 * HOUR)
         for label, later in self.AGES:
@@ -594,6 +593,7 @@ class WaitRestoreTests(Base):
                 self.assertFalse(row["decision_required"], row)
 
     def test_an_owners_own_disposition_followed_by_its_closing_tail_holds(self):  # fails at 79ebb269: false DROPPED
+        self.resume("tick", NOW - 3 * HOUR - 60)
         jl(self.w / "agent-tick.jsonl", [{"at": iso(NOW - 3 * HOUR - 30), "event": "intent", "note": "park on the ask"}])
         self.dispose("tick", "waiting", "tick-own-wait", until=iso(NOW + 8 * HOUR), at=iso(NOW - 3 * HOUR), ref="wa5b00000001")
         self.closing_tail("tick", NOW - 3 * HOUR)
@@ -606,6 +606,7 @@ class WaitRestoreTests(Base):
                 self.assertNotIn("tick", streams)
 
     def test_a_wait_written_after_resuming_holds_from_its_own_time(self):
+        self.resume("tick", NOW - 2 * HOUR - 10)  # the resume the intent below belongs to
         jl(self.w / "agent-tick.jsonl", [
             {"at": iso(NOW - 3 * HOUR), "event": "status", "note": "waiting on GoodQA goodqa#15943"},
             {"at": iso(NOW - 2 * HOUR), "event": "intent", "note": "resumed"},
@@ -639,12 +640,337 @@ class WaitRestoreTests(Base):
         ah.summarize_agent_wal(wal, index)
         for cache in index.glob("wal-*.json"):
             doc = json.loads(cache.read_text())
-            for k in ("note_at", "work_at", "note_own"):
+            for k in ("note_at", "work_at", "intent_at"):
                 doc.pop(k, None)
             cache.write_text(json.dumps(doc))
         summary = ah.summarize_agent_wal(wal, index)
         self.assertEqual(summary.get("note_at"), ah.parse_ts(iso(NOW - 3 * HOUR)))
         self.assertEqual(summary.get("work_at"), ah.parse_ts(iso(NOW - 2 * HOUR)))
+        self.assertEqual(summary.get("intent_at"), ah.parse_ts(iso(NOW - 2 * HOUR)))
+
+
+class WaitProbeTests(Base):
+    """goodqa#15949 rescue2: every review probe (r1-r5b) as an incremental sequence, with `ah owners` and
+    idle_guard.assess read after each transition and again as the clock moves on. The rule reads recorded rows only
+    (turn starts, recorded stops, own WAL rows, the transcript time) and offsets fixed by the wait, so a wait, once
+    superseded, never comes back. Assertions use ah.owners rows and assess() only."""
+
+    WAITS = {"ordinary": {"ref": "GoodQA goodqa#15943"},
+             "external": {"ref": "GoodQA goodqa#15643", "external": "Codex quota resets 2026-11-16"},
+             "ask": {"ref": "wa5b00000001"}}
+    AGES = (("fresh", 0), ("45m", 45 * 60), ("7h", 7 * HOUR))
+
+    # ---- recorders: what wal.py and Claude Code write
+
+    def look(self, later=0.0):
+        rows = {r["agent_id"]: r for r in ah.owners(self.home, SESSION, now=NOW + later)["owners"]}
+        streams = [s["agent"] for s in self.ig.assess(self.home, SESSION, NOW + later)["streams"]]
+        return rows, streams
+
+    def start(self, agent, at):  # SubagentStart: spawn and every SendMessage resume, to both WALs
+        row = {"at": iso(at), "event": "subagent", "agent_id": agent, "agent_type": "task-owner"}
+        jl(self.w / "main.jsonl", [row])
+        jl(self.w / f"agent-{agent}.jsonl", [row])
+
+    def stop(self, agent, at):  # SubagentStop, to both WALs
+        row = {"at": iso(at), "event": "subagent_stop", "agent_id": agent, "agent_type": "task-owner"}
+        jl(self.w / "main.jsonl", [row])
+        jl(self.w / f"agent-{agent}.jsonl", [row])
+
+    def note(self, agent, at, event, text="next slice"):
+        jl(self.w / f"agent-{agent}.jsonl", [{"at": iso(at), "event": event, "note": text}])
+
+    def tool(self, agent, at):
+        jl(self.w / f"agent-{agent}.jsonl", [{"at": iso(at), "event": "pretool", "agent_id": agent, "tool": "Bash"}])
+
+    def transcript(self, agent, at, finished=None):
+        sub = self.home / ".claude" / "projects" / "p" / SESSION / "subagents"
+        sub.mkdir(parents=True, exist_ok=True)
+        jl(sub / f"agent-{agent}.jsonl", [{"type": "assistant"}])
+        os.utime(sub / f"agent-{agent}.jsonl", (at, at))
+        if finished is not None:  # transcript metadata: Claude Code marks the agent finished (no stop hook row)
+            (sub / f"agent-{agent}.meta.json").write_text(json.dumps({"agentType": "task-owner", "finished": finished}))
+
+    def wait(self, agent, kind, key, at, **extra):
+        self.dispose(agent, "waiting", key, until=iso(NOW + 8 * HOUR), at=iso(at), **dict(self.WAITS[kind], **extra))
+
+    def ack(self, agent, kind, key, at):  # main's --ack-handoff (its hook writes the stamp)
+        import caller_identity  # noqa: PLC0415
+        caller_identity.put_stamp("ack-handoff", [agent], home=self.home)
+        self.wait(agent, kind, key, at, ack_handoff=True, **self.hand_ref(kind))
+
+    @staticmethod
+    def hand_ref(kind):  # `hand` waits on its own ask, not tick's
+        return {"ref": "wa5b0000000e"} if kind == "ask" else {}
+
+    # ---- expectations
+
+    def holds(self, agent, ref, label):
+        row = self.look()[0][agent]
+        with self.subTest(step=label, expect="holds"):
+            self.assertEqual(row["wait_on"], ref, row)
+            self.assertFalse(row["decision_required"], row)
+
+    def gone(self, agent, label):
+        row = self.look()[0][agent]
+        with self.subTest(step=label, expect="superseded"):
+            self.assertIsNone(row["wait_on"], row)
+            self.assertFalse(row["disposition"] and row["disposition"].get("kind") == "waiting", row)
+
+    def dropped(self, agent, label, ages=None):
+        for age, later in ages or self.AGES:
+            rows, streams = self.look(later)
+            row = rows[agent]
+            with self.subTest(step=label, age=age, expect="dropped"):
+                self.assertIsNone(row["wait_on"], row)
+                self.assertFalse(row["disposition"] and row["disposition"].get("kind") == "waiting", row)
+                self.assertEqual(row["state"], "DROPPED", row)
+                self.assertTrue(row["decision_required"], row)
+                self.assertIn(agent, streams)
+
+    def per_kind(self, body, kinds=None):
+        """Run body(kind) on a fresh fixture for each wait kind."""
+        for kind in kinds or self.WAITS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                body(kind)
+
+    # ---- receipt r5b F1: main's acknowledged handoff wait, then new work, then a stop with no result
+
+    def handoff_owner(self, agent, t0):
+        """Spawned at t0, works, hands off at t0+600, stops at t0+620; it owns ask wa5b0000000e."""
+        self.start(agent, t0)
+        self.note(agent, t0, "intent", "GoodQA goodqa#15960 work")
+        self.note(agent, t0 + 600, "handoff", "to main: PR ready")
+        self.stop(agent, t0 + 620)
+        jl(self.w / "main.jsonl", [{"at": iso(t0 - 60), "event": "ask", "id": "wa5b0000000e", "owner": agent,
+                                    "note": "need approval", "source": "user:x/y \"w\""}])
+
+    def test_r5b_f1_acked_handoff_then_new_intent_then_stop(self):
+        for kind in self.WAITS:
+            for resumed in (True, False):  # a recorded SendMessage resume, or none (the strict path)
+                for gap in (30, 120):  # the intent inside and past the 60 s slack
+                    with self.subTest(kind=kind, resumed=resumed, gap=gap):
+                        self.setUp()
+                        t0, ack = NOW - 6 * HOUR, NOW - 5 * HOUR
+                        self.handoff_owner("hand", t0)
+                        self.ack("hand", kind, f"hand-ack-{kind}-{resumed}-{gap}", ack)
+                        row = self.look()[0]["hand"]
+                        with self.subTest(step="acked"):  # control: main took the handoff and the wait holds
+                            self.assertTrue(row["disposition"]["live"], row)
+                            self.assertFalse(row["decision_required"], row)
+                            self.assertNotIn("result-unacked", row["attention"], row)
+                        if resumed:
+                            self.start("hand", ack + gap - 5)
+                        self.note("hand", ack + gap, "intent", "new slice: GoodQA goodqa#15961")
+                        self.gone("hand", "intent")
+                        self.tool("hand", ack + gap + 20)
+                        self.gone("hand", "tool row")
+                        self.stop("hand", ack + gap + 40)
+                        self.transcript("hand", ack + gap + 40)
+                        self.dropped("hand", "stopped without a result")
+
+    def test_r5b_f1_a_bound_ack_survives_a_tidy_note_and_a_tool_only_resume(self):  # INFERRED: kept, for main
+        def body(kind):
+            t0, ack = NOW - 6 * HOUR, NOW - 5 * HOUR
+            self.handoff_owner("hand", t0)
+            self.ack("hand", kind, f"hand-bound-{kind}", ack)
+            self.note("hand", ack + 300, "check", "tidied the PR body")  # PR 237 r5 F2: a later note never un-takes it
+            self.start("hand", ack + 600)  # main asks a question; the owner answers with tools only and stops
+            self.tool("hand", ack + 620)
+            self.stop("hand", ack + 640)
+            for age, later in self.AGES:
+                rows, streams = self.look(later)
+                with self.subTest(age=age):
+                    self.assertEqual(rows["hand"]["state"], "handoff", rows["hand"])
+                    self.assertTrue(rows["hand"]["disposition"]["live"], rows["hand"])
+                    self.assertNotIn("result-unacked", rows["hand"]["attention"], rows["hand"])
+                    self.assertFalse(rows["hand"]["decision_required"], rows["hand"])
+                    if kind != "ordinary":  # an ordinary ticket wait stays a stream main can act on, by design
+                        self.assertNotIn("hand", streams)
+        self.per_kind(body)
+
+    def test_r5b_f1_a_newer_result_is_not_taken_by_an_older_ack(self):
+        t0, ack = NOW - 6 * HOUR, NOW - 5 * HOUR
+        self.handoff_owner("hand", t0)
+        self.ack("hand", "ask", "hand-newer", ack)
+        self.start("hand", ack + 600)
+        self.note("hand", ack + 660, "handoff", "to main: a second PR")
+        self.stop("hand", ack + 680)
+        row = self.look()[0]["hand"]
+        self.assertEqual(row["state"], "handoff", row)
+        self.assertIn("result-unacked", row["attention"], row)
+        self.assertTrue(row["decision_required"], row)  # an untaken handoff older than HANDOFF_ACK_S
+
+    # ---- receipt r5b F2: a metadata-only completion (no stop row), a tool-only resume, a second completion
+
+    def test_r5b_f2_metadata_only_completion_then_tool_only_resume(self):
+        kinds = {"note-ticket": ("note", "GoodQA goodqa#15943"), "note-ask": ("note", "wa5b00000001"),
+                 "disp-ordinary": ("ordinary", "GoodQA goodqa#15943"), "disp-external": ("external", "GoodQA goodqa#15643"),
+                 "disp-ask": ("ask", "wa5b00000001")}
+        for label, (kind, ref) in kinds.items():
+            for order in ("transcript-first", "wal-first", "recorded-resume"):
+                with self.subTest(wait=label, order=order):
+                    self.setUp()
+                    t = NOW - 5 * HOUR
+                    self.start("meta1", t - 600)
+                    self.note("meta1", t - 600, "intent", "GoodQA goodqa#15962 work")
+                    if kind == "note":
+                        self.note("meta1", t, "status", f"blocked, waiting on {ref}")
+                    else:
+                        self.wait("meta1", kind, f"meta1-{label}-{order}", t)
+                    self.transcript("meta1", t + 200, finished=True)  # completion seen only in the metadata
+                    self.holds("meta1", ref, "first completion (closing tail inside the turn)")
+                    tool, later_write = (lambda: self.tool("meta1", t + 450)), (lambda: self.transcript("meta1", t + 500))
+                    if order == "recorded-resume":
+                        self.start("meta1", t + 400)
+                        self.gone("meta1", "resume row")
+                        steps = (tool, later_write)
+                    elif order == "transcript-first":
+                        steps = (later_write, tool)
+                    else:
+                        steps = (tool, later_write)
+                    for i, step in enumerate(steps):
+                        step()
+                        self.gone("meta1", f"resume step {i}")
+                    self.transcript("meta1", t + 510, finished=True)  # the second completion, metadata only again
+                    self.dropped("meta1", "second completion")
+
+    # ---- unambiguous new work inside the 60 s slack (an intent, a recorded turn start)
+
+    def test_an_intent_inside_the_slack_supersedes_an_in_turn_wait(self):
+        def body(kind):
+            s = NOW - 3 * HOUR
+            self.start("tick", s)
+            self.wait("tick", kind, f"tick-slack-intent-{kind}", s + 60)
+            self.holds("tick", self.WAITS[kind]["ref"], "wait")
+            self.note("tick", s + 90, "intent", "next slice")
+            self.gone("tick", "intent at +30 s")
+            self.stop("tick", s + 110)
+            self.dropped("tick", "stopped")
+        self.per_kind(body)
+
+    def test_a_turn_start_inside_the_slack_supersedes_a_wait_on_a_stopped_owner(self):
+        def body(kind):
+            w = NOW - 3 * HOUR  # tick stopped at the fixture's old+60
+            self.wait("tick", kind, f"tick-slack-start-{kind}", w)
+            self.holds("tick", self.WAITS[kind]["ref"], "wait")
+            self.start("tick", w + 20)
+            self.gone("tick", "resume at +20 s")
+            self.note("tick", w + 30, "check", "looked at it")
+            self.gone("tick", "check")
+            self.stop("tick", w + 50)
+            self.dropped("tick", "stopped")
+        self.per_kind(body)
+
+    def test_in_turn_wait_then_stop_then_tool_only_resume_inside_the_tail(self):  # r4 shape, wait written in a turn
+        def body(kind):
+            s = NOW - 3 * HOUR
+            w = s + 60
+            self.start("tick", s)
+            self.wait("tick", kind, f"tick-inturn-{kind}", w)
+            self.stop("tick", w + 20)
+            self.holds("tick", self.WAITS[kind]["ref"], "the turn's own stop")
+            self.tool("tick", w + 100)  # no start row: past the recorded stop + 10 s
+            self.gone("tick", "tool-only resume")
+            self.stop("tick", w + 250)
+            self.dropped("tick", "second stop")
+        self.per_kind(body)
+
+    def test_a_long_same_turn_continuation_is_work_not_a_closing_tail(self):
+        def body(kind):
+            s = NOW - 3 * HOUR
+            self.start("tick", s)
+            self.wait("tick", kind, f"tick-long-{kind}", s + 60)
+            self.tool("tick", s + 60 + 240)
+            self.holds("tick", self.WAITS[kind]["ref"], "4 min tail")
+            self.tool("tick", s + 60 + 20 * 60)
+            self.gone("tick", "20 min of tool rows")
+            self.stop("tick", s + 60 + 21 * 60)
+            self.dropped("tick", "stopped")
+        self.per_kind(body)
+
+    # ---- the earlier probes (r1-r4), incremental
+
+    def test_r1_transcript_activity_after_a_wait_clears_it(self):  # resumed by SendMessage; WAL predates the wait
+        for kind in self.WAITS:
+            for recorded in (False, True):
+                with self.subTest(kind=kind, recorded_start=recorded):
+                    self.setUp()
+                    self.wait("tick", kind, f"tick-r1-{kind}-{recorded}", NOW - 600)
+                    self.holds("tick", self.WAITS[kind]["ref"], "wait")
+                    if recorded:
+                        self.start("tick", NOW - 30)
+                    self.transcript("tick", NOW - 20)
+                    rows, streams = self.look()
+                    with self.subTest(step="transcript"):
+                        self.assertIsNone(rows["tick"]["wait_on"], rows["tick"])
+                        self.assertNotIn("wait-not-user", rows["tick"]["attention"], rows["tick"])
+                        self.assertNotIn("tick", streams)
+
+    def test_r2_resumed_activity_keeps_the_wait_superseded_as_it_ages(self):
+        def body(kind):
+            self.wait("tick", kind, f"tick-r2-{kind}", NOW - 700)
+            self.holds("tick", self.WAITS[kind]["ref"], "wait")
+            self.note("tick", NOW - 100, "check", "resumed and working")
+            self.gone("tick", "check")
+            for age, later in self.AGES:
+                rows, streams = self.look(later)
+                with self.subTest(age=age):
+                    self.assertIsNone(rows["tick"]["disposition"], rows["tick"])
+                    self.assertIsNone(rows["tick"]["wait_on"], rows["tick"])
+                    self.assertNotIn("wait-not-user", rows["tick"]["attention"], rows["tick"])
+                    if age == "7h":
+                        self.assertIn("tick", streams)
+        self.per_kind(body)
+
+    def test_r3_note_and_disposition_then_new_work(self):
+        for kind in self.WAITS:
+            for then in ("intent", "check"):
+                for agent in ("tick", "tw15949"):
+                    with self.subTest(kind=kind, then=then, agent=agent):
+                        self.setUp()
+                        ref = self.WAITS[kind]["ref"]
+                        wal = self.w / (f"{agent}.jsonl" if agent.startswith("tw") else f"agent-{agent}.jsonl")
+                        w0 = NOW - 3 * HOUR
+                        if agent == "tick":
+                            self.start("tick", w0 - 30)
+                        jl(wal, [{"at": iso(w0), "event": "status", "note": f"blocked, waiting on {ref}"}])
+                        if agent == "tick":
+                            self.stop("tick", w0 + 20)
+                        os.utime(wal, (NOW - 60, NOW - 60))  # the task-WAL window reads mtime; the clock is faked
+                        self.holds(agent, ref, "note")
+                        self.wait(agent, kind, f"{agent}-r3-{kind}-{then}", w0 + 60)
+                        self.holds(agent, ref, "disposition")
+                        if agent == "tick":
+                            self.start("tick", NOW - 2 * HOUR - 30)
+                        jl(wal, [{"at": iso(NOW - 2 * HOUR), "event": then, "note": "back on it: next slice"}])
+                        os.utime(wal, (NOW - 60, NOW - 60))
+                        self.gone(agent, then)
+                        if agent == "tick":
+                            self.stop("tick", NOW - 2 * HOUR + 30)
+                            self.dropped(agent, "stopped")
+                        else:
+                            self.dropped(agent, "abandoned", ages=(("7h", 7 * HOUR),))
+
+    def test_r4_stop_wait_tool_only_resume_stop_in_each_observation_order(self):
+        for kind in self.WAITS:
+            for order in ("transcript-first", "wal-first"):
+                with self.subTest(kind=kind, order=order):
+                    self.setUp()
+                    stop = NOW - 4 * HOUR + 60  # the fixture's stop; tick's own rows straddle it
+                    self.tool("tick", stop - 10)
+                    self.tool("tick", stop + 5)
+                    self.wait("tick", kind, f"tick-r4-{kind}-{order}", stop + 100)
+                    self.holds("tick", self.WAITS[kind]["ref"], "wait while stopped")
+                    steps = [lambda: self.transcript("tick", stop + 200), lambda: self.tool("tick", stop + 200)]
+                    if order == "wal-first":
+                        steps.reverse()
+                    for i, step in enumerate(steps):
+                        step()
+                        self.gone("tick", f"observation {i}")
+                    self.stop("tick", stop + 250)
+                    self.dropped("tick", "later stop")
 
 
 class ReminderTests(Base):
