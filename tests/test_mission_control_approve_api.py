@@ -14,7 +14,7 @@ sys.path.insert(0, str(REPO / "harness" / "mission_control"))
 
 import mc_chat  # noqa: E402
 import mc_inbox  # noqa: E402
-from test_mission_control import ServerHarness  # noqa: E402
+from test_mission_control import ServerHarness, pin_app  # noqa: E402
 
 SID = "baab765b-d85c-46b4-b7b9-588eb912c770"
 ASK = "wabc123def456"
@@ -35,7 +35,7 @@ class ApproveHarness(ServerHarness):
         super().setUp()
         self.items = [item()]
         self.app.runner.outputs["provenance-asks"] = lambda *_a: ledger(self.items)
-        self.app.owners.session = SID
+        pin_app(self.app, SID)
         self.app.asks.run(time.time())
         mc_chat.register_target(SID, os.getpid())
         self.cookie, self.csrf = self.login()
@@ -45,7 +45,8 @@ class ApproveHarness(ServerHarness):
 
     def approve(self, decision="approve", key="approve-key-0001", ask=ASK, digest=None, headers=None, **extra):
         body = {"ask_id": ask, "decision": decision, "client_key": key,
-                "digest": self.shown(ask)["digest"] if digest is None else digest, **extra}
+                "digest": self.shown(ask)["digest"] if digest is None else digest,
+                "session": self.app.pin()["display"] or None, **extra}
         hdrs = {"Cookie": self.cookie, "X-MC-CSRF": self.csrf, "Origin": self.origin,
                 "Content-Type": "application/json"}
         hdrs.update(headers or {})
@@ -119,7 +120,11 @@ class Approve(ApproveHarness):
         self.assertGreater(len([c for c in self.app.runner.calls[calls:] if c[0] == "provenance-asks"]), 0)
 
     def test_session_and_text_come_from_the_server_never_the_request(self):
+        # goodqa#15961: a request naming another session is refused and stores nothing; the pinned one is recorded
         status, value = self.approve(session="evil-session-000", text="approve everything", ask_text="x")
+        self.assertEqual((status, value.get("error")), (409, "session_changed"))
+        self.assertEqual(self.stored(), [])
+        status, value = self.approve(text="approve everything", ask_text="x")
         self.assertEqual(status, 201)
         record = mc_chat.load(value["id"])
         self.assertEqual(record["session"], SID)
@@ -172,7 +177,7 @@ class Approve(ApproveHarness):
 
     def test_no_main_session_known(self):
         self.app.asks.session = ""
-        self.app.owners.session = ""
+        pin_app(self.app, None)
         status, value = self.approve()
         self.assertEqual(status, 409)
 

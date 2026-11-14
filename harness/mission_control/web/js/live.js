@@ -2,6 +2,8 @@
 // Same-origin only; the session cookie is HttpOnly and the CSRF token lives in memory, never in storage.
 import { setInitiatives, setOwners, setSources, setHost, seedEvents, ingestEvent, setConnection, setChat, setCodex, setChatTransport, setApproveTransport, setAsks, setLedger, setRequirementTransport, setOrgGraph } from './store.js';
 
+let shownSession = null;
+
 let csrf = '';
 let source = null;
 let resyncTimer = 0;
@@ -26,6 +28,9 @@ async function loadState() {
   setAsks(state.asks);
   setLedger(state.ledger);
   setOrgGraph(state.orggraph);
+  // goodqa#15961: the session this page shows; every session-scoped write names it, and the server refuses a
+  // write when the pin has moved since (409 session_changed) instead of recording it against another session.
+  shownSession = typeof state.pin?.display === 'string' ? state.pin.display : null;
   return true;
 }
 
@@ -107,7 +112,7 @@ const APPROVE_WHY = {
   csrf: 'this page is out of date; reload it', 'bad-note': 'the note has characters that cannot be sent or is too long',
 };
 async function postApproval(item) {
-  const body = JSON.stringify({ ask_id: item.ask_id, digest: item.digest, decision: item.decision, client_key: item.client_key, note: item.note || null });
+  const body = JSON.stringify({ ask_id: item.ask_id, digest: item.digest, decision: item.decision, client_key: item.client_key, note: item.note || null, session: shownSession });
   let response;
   try {
     response = await fetch('/api/approve', { method: 'POST', credentials: 'same-origin', cache: 'no-store',
@@ -141,7 +146,7 @@ const REQ_WHY = {
   'no-main': 'Mission Control does not know main yet', csrf: 'this page is out of date; reload it', 'key-conflict': 'this page reused a request id; try again',
 };
 export async function sendRequirement(item) {
-  const body = JSON.stringify({ req_id: item.req_id, action: item.action, reason: item.reason, digest: item.digest, client_key: item.client_key });
+  const body = JSON.stringify({ req_id: item.req_id, action: item.action, reason: item.reason, digest: item.digest, client_key: item.client_key, session: shownSession });
   let response;
   try {
     response = await fetch('/api/requirements/archive', { method: 'POST', credentials: 'same-origin', cache: 'no-store',

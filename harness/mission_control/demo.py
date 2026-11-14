@@ -271,7 +271,7 @@ class DemoRunner:
 
     def run(self, kind, *args, timeout=20.0, limit=0):
         self.calls.append((kind, args))
-        if kind == "ah-owners" and not args:
+        if kind == "ah-owners" and args == (DEMO_SESSION,):
             return 0, json.dumps(owners_payload(time.time()))
         if kind == "ah-ticket-comments" and len(args) == 1:
             return 0, json.dumps({"comments": [

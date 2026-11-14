@@ -17,7 +17,7 @@ os.environ.setdefault("MC_HOOKS", str(REPO / "harness" / "hooks"))
 import archive  # noqa: E402
 import mc_chat  # noqa: E402
 import req_actions  # noqa: E402
-from test_mission_control import ServerHarness  # noqa: E402
+from test_mission_control import ServerHarness, pin_app  # noqa: E402
 from test_mission_control_ledger import GOALS, REQS, STATUS, iso, SID  # noqa: E402
 
 KEY = b"k" * 32
@@ -169,7 +169,7 @@ class Route(ServerHarness):
         super().setUp()
         self.app.runner.outputs.update({"ah-goals": (0, json.dumps(GOALS)), "ah-requirements": lambda *_a: (0, json.dumps(REQS)),
                                         "ah-status": lambda *_a: (0, json.dumps(STATUS))})
-        self.app.owners.session = SID
+        pin_app(self.app, SID)
         self.app.ledger.run(time.time())
         self.cookie, self.csrf = self.login()
 
@@ -180,6 +180,8 @@ class Route(ServerHarness):
         hdrs = {"Cookie": self.cookie, "X-MC-CSRF": self.csrf, "Origin": self.origin, "Content-Type": "application/json"}
         hdrs.update(headers or {})
         hdrs = {k: v for k, v in hdrs.items() if v is not None}
+        if isinstance(body, dict) and "session" not in body:   # the page names the session it showed (goodqa#15961)
+            body = {**body, "session": self.app.pin()["display"] or None}
         resp, data = self.request("POST", "/api/requirements/archive", hdrs, json.dumps(body).encode())
         try:
             return resp.status, json.loads(data)
@@ -234,8 +236,8 @@ class Route(ServerHarness):
         self.assertEqual(self.post(body, {"Origin": "http://evil.example"})[0], 403)
         self.assertEqual(self.post(body, {"Cookie": None})[0], 401)
         self.assertEqual(self.post(body, {"Content-Type": "text/plain"})[0], 415)
-        self.app.owners.session = ""
-        self.assertEqual(self.post(body)[1].get("error"), "no-main")
+        pin_app(self.app, None)
+        self.assertEqual(self.post(body)[1].get("error"), "unpinned")
         self.assertEqual(self.app.actions.all(), [])
 
     def test_an_unattended_client_with_a_launch_link_archives_a_user_sourced_requirement(self):
@@ -291,10 +293,10 @@ class Route(ServerHarness):
                 status, value = self.post({**body, **change})
                 self.assertEqual((status, value.get("error")), (409, "key-conflict"), value)
         self.assertEqual(len(self.app.actions.all()), rows)
-        self.app.owners.session = "ffffffff-0000-4000-8000-000000000000"  # another main session: not the original binding
+        pin_app(self.app, "ffffffff-0000-4000-8000-000000000000")  # another main session: not the original binding
         status, value = self.post({**body, "digest": self.req()["digest"]})
         self.assertEqual((status, value.get("error")), (409, "key-conflict"))
-        self.app.owners.session = SID
+        pin_app(self.app, SID)
         status, again = self.post({**body, "digest": self.req()["digest"]})  # the exact original payload is still acknowledged
         self.assertEqual((status, again["id"], again["created"]), (200, first["id"], False))
         self.assertEqual(len(self.app.actions.all()), rows)

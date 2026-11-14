@@ -56,6 +56,7 @@ import collectors as col  # noqa: E402
 import demo as demo_mode  # noqa: E402
 import events as ev  # noqa: E402
 import org_graph  # noqa: E402
+import session_pin  # noqa: E402
 import req_actions  # noqa: E402
 import mc_chat  # noqa: E402
 from codex_responder import CodexResponder  # noqa: E402
@@ -305,8 +306,14 @@ def codex_binary() -> str | None:
 class App:
     def __init__(self, *, port: int, root: Path, initiatives: str | None, remote: bool, fabric_bin: str | None,
                  runner: Runner | None = None, wal_roots=None, start_threads: bool = True, codex: bool = True,
-                 demo: bool = False, projects_root: Path | None = None, escalation_root: Path | None = None):
+                 demo: bool = False, projects_root: Path | None = None, escalation_root: Path | None = None,
+                 session: str | None = None, wals_root: Path | None = None):
         self.port, self.root = port, root
+        # goodqa#15961: the session pin. A flag beats MC_HOME/config.json "session"; both are validated on every use.
+        config = mc_chat.read_json(root / "config.json")
+        self.config_pin = session if session is not None else (config.get("session") if isinstance(config, dict) else None)
+        self.claude_wals = wals_root or Path.home() / ".claude" / "wals"
+        self.pin_last_good, self.pin_reason, self.pin_demo = "", None, demo
         self.demo = demo
         self.build = demo_mode.build_identity(HERE, HOOKS) if demo else None
         self.demo_delay_s = 0.0
@@ -338,6 +345,7 @@ class App:
         self.tailer = col.WalTailer(self.hub, self.health, self.reader, wal_roots)
         self.initiatives = col.Initiatives(self.hub, self.health, self.reader, initiatives)
         self.owners = col.Owners(self.hub, self.health, self.runner, self.tailer)
+        self.owners.pin_fn = lambda: self.pin()["display"]
         self.supervised = None
         if not demo:
             owner_root = home / '.agent-harness' / 'codex-owners'
@@ -377,6 +385,24 @@ class App:
         self.threads: list[threading.Thread] = []
         if start_threads:
             self.start()
+
+    def pin(self) -> dict:
+        """The session Mission Control follows and the one it may write against (session_pin; goodqa#15961).
+        Cheap: two lstat calls and the Ledger's cached `ah goals` fields; no subprocess, no write."""
+        if self.pin_demo:
+            pin = {"display": demo_mode.DEMO_SESSION, "write": demo_mode.DEMO_SESSION, "write_error": "", "source": "demo",
+                   "reason": "demo fixture session", "warnings": []}
+        else:
+            pin = session_pin.resolve(config_pin=self.config_pin, ledger=getattr(self.ledger, "mission", None),
+                                      wals_root=self.claude_wals, last_good=self.pin_last_good)
+            if pin["source"] in ("config", "ledger"):
+                self.pin_last_good = pin["display"]   # memory only: a restart starts unpinned until the ledger reads
+        key = (pin["display"], pin["source"], tuple(pin["warnings"]))
+        if key != self.pin_reason:
+            self.pin_reason = key
+            detail = f"{pin['display'][:8] or 'none'}: {pin['reason']}" + (f"; {pin['warnings'][0]}" if pin["warnings"] else "")
+            (self.health.ok if pin["write"] and not pin["warnings"] else self.health.error)("session-pin", detail)
+        return pin
 
     def _open_asks(self) -> tuple:
         """The user node's inbox: open asks (the "Needs you" count) and the stale ones listed below them;
@@ -501,13 +527,14 @@ class App:
                                         "ts": reply.get("created"), "final": bool(reply.get("final"))}
         self.approval_watch = (min(w[0] for w in waiting), [w[1] for w in waiting]) if waiting else None
         return {"messages": messages, "replies": list(replies.values())[-60:],
-                "targets": mc_chat.targets(self.root), "main_session": self.owners.session,
+                "targets": mc_chat.targets(self.root), "main_session": self.pin()["display"],
                 "codex": {"available": self.codex.available[0], "reason": self.codex.available[1],
                           "busy": self.codex.busy}}
 
     def state(self) -> dict:
         return {"version": VERSION, "started": ev.iso(self.started), "host": "demo" if self.demo else ev.HOST,
                 "initiatives": self.initiatives.snapshot(), "owners": self.owners.rows, "orggraph": self.org.snapshot(),
+                "pin": {k: v for k, v in self.pin().items() if k in ("display", "source", "reason", "warnings")} | {"writable": bool(self.pin()["write"])},
                 "health": self.health.snapshot(), "events": self.hub.recent(limit=200),
                 "chat": self.chat_snapshot(), "asks": self.asks.snapshot(),
                 "ledger": self.ledger.snapshot(), "requirement_actions": len(self.actions.latest()),
@@ -553,9 +580,12 @@ class App:
         if not isinstance(body, dict):
             return 400, {"error": "bad-json"}
         req, action, digest = body.get("req_id"), body.get("action"), body.get("digest")
-        session = self.owners.session or ""
-        if not session:
-            return 409, {"error": "no-main", "message": "Mission Control does not know main's session yet"}
+        # goodqa#15961: only a pinned, writable session; the page names the session it showed (R6, D1, D2)
+        pin = self.pin()
+        refusal = session_pin.write_check(pin, body.get("session"))
+        if refusal:
+            return refusal
+        session = pin["write"]
         # A retry with the same key after a lost response is answered with the row it already made, whatever state
         # the requirement is in now (the row's own archive made the "already archived" check below true).
         prior = self.actions.by_key(body.get("client_key"))
@@ -605,9 +635,12 @@ class App:
         if note is not None and (not isinstance(note, str) or len(note) > mc_chat.APPROVAL_NOTE_MAX):
             return 400, {"error": "bad-note",
                          "message": f"the note must be text of at most {mc_chat.APPROVAL_NOTE_MAX} characters"}
-        session = self.owners.session or ""
-        if not session:
-            return 409, {"error": "no-main", "message": "Mission Control does not know main's session yet"}
+        # goodqa#15961: only a pinned, writable session; the page names the session it showed (R6, D1, D2)
+        pin = self.pin()
+        refusal = session_pin.write_check(pin, body.get("session"))
+        if refusal:
+            return refusal
+        session = pin["write"]
         if self.demo_delay_s:
             time.sleep(self.demo_delay_s)  # demo knob: the 'Sending' state stays visible for the whole delay
         with self.approve_lock:
@@ -1048,7 +1081,8 @@ def build_app(args) -> App:
         return app
     root = mc_chat.home()
     return App(port=args.port, root=root, initiatives=args.initiatives or default_initiatives(),
-               remote=not args.no_remote, fabric_bin=args.fabric_bin, start_threads=False, codex=not args.no_codex)
+               remote=not args.no_remote, fabric_bin=args.fabric_bin, start_threads=False, codex=not args.no_codex,
+               session=getattr(args, "session", None))
 
 
 def cmd_serve(args) -> int:
@@ -1096,6 +1130,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("serve")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--initiatives")
+    p.add_argument("--session", help="pin Mission Control to this Claude session (default: the mission ledger's)")
     p.add_argument("--no-remote", action="store_true")
     p.add_argument("--no-codex", action="store_true", help="never run codex exec (disposable or test instances)")
     p.add_argument("--fabric-bin")

@@ -713,6 +713,7 @@ class Owners(Collector):
         self.supervised = None
         self.native_projects = {}
         self.native_observation = {}
+        self.pin_fn = None   # the server's pinned display session (goodqa#15961)
 
     def publish(self):
         managed = []
@@ -782,13 +783,36 @@ class Owners(Collector):
             raise
 
     def _tick(self, now: float):
-        code, out = self.runner.run("ah-owners", timeout=30)
+        if self.pin_fn is None:
+            # Unwired (unit tests with a fake runner): the real Runner refuses a session-less `ah-owners`, so the
+            # server can never fall back to "newest session"; App always wires pin_fn.
+            code, out = self.runner.run("ah-owners", timeout=30)
+            if code != 0:
+                raise RuntimeError(f"ah owners exited {code}")
+            data = json.loads(out)
+            if not isinstance(data, dict) or not isinstance(data.get('owners'), list):
+                raise ValueError('invalid Claude owner snapshot')
+            self.session = str(data.get("session") or "")
+            return self._rows(data, now)
+        pinned = self.pin_fn()
+        if not pinned:
+            # goodqa#15961: never guess a session; an explicit "unpinned" state, never a silent 0 from another one
+            self.session, self.claude_rows = "", []
+            self.next_at = min(self.next_at, now + 5)   # the ledger read pins it seconds after start
+            self.publish()
+            raise RuntimeError("unpinned: no Claude session is pinned yet (waiting for the mission ledger)")
+        code, out = self.runner.run("ah-owners", pinned, timeout=30)
         if code != 0:
             raise RuntimeError(f"ah owners exited {code}")
         data = json.loads(out)
         if not isinstance(data, dict) or not isinstance(data.get('owners'), list):
             raise ValueError('invalid Claude owner snapshot')
-        self.session = str(data.get("session") or "")
+        if str(data.get("session") or "") != pinned:   # a guard only: ah echoes --session back
+            raise ValueError("ah owners answered for a different session than the pin")
+        self.session = pinned
+        return self._rows(data, now)
+
+    def _rows(self, data: dict, now: float):
         rows = []
         for row in data.get("owners") or []:
             if not isinstance(row, dict):
@@ -1144,6 +1168,7 @@ class Ledger(Collector):
         self.raw_requirements: list[dict] = []
         self.raw_total, self.raw_truncated = 0, False
         self.parts = {name: {"stale": False, "error": "", "at": ""} for name in ("goals", "requirements", "status")}
+        self.mission: dict = {}
         self.parts["goals"]["items"] = []
         self.parts["requirements"].update(items=[], total=0, truncated=False, summary=archive.summary([]))
         self.parts["status"].update(counts={}, since_s=0, entries=0, owners={})
@@ -1179,6 +1204,8 @@ class Ledger(Collector):
 
     def tick(self, now: float):
         errors = [self._read("goals", "ah goals", "ah-goals", (), self._goals, now)]
+        if errors[0]:
+            self.mission = {"state": "error", "mission_session": ""}   # a failed read never keeps a writable pin (D1)
         session = self.session_fn() or ""
         if session:
             errors.append(self._read("requirements", "ah requirements", "ah-requirements", (session,), self._requirements, now))
@@ -1207,6 +1234,9 @@ class Ledger(Collector):
         return value if isinstance(value, int) and not isinstance(value, bool) else default
 
     def _goals(self, data: dict, now: float) -> dict:
+        # goodqa#15961: the session pin reads the ledger's own session here, never the ledger file itself
+        self.mission = {"state": str(data.get("state") or "")[:20],
+                        "mission_session": str(data.get("mission_session") or "")[:64]}
         items = []
         for raw in (data.get("goals") if isinstance(data.get("goals"), list) else [])[:self.MAX_GOALS]:
             if not isinstance(raw, dict) or not raw.get("id"):

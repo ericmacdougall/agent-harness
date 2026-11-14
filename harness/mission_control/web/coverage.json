@@ -5,7 +5,7 @@
   "host": "sources-panel",
   "initiatives": "initiatives-panel",
   "owners": "owners-panel",
-  "orggraph": "topology-panel",
+  "orggraph": "topology-panel", "pin": "sources-panel",
   "health": "health-panel",
   "events": "activity-panel",
   "chat": "chat-panel",
