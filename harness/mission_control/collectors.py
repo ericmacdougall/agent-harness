@@ -449,11 +449,14 @@ class Initiatives(Collector):
         raise ValueError(message)
 
     def publish(self, mtime) -> None:
+        if mtime is not None:
+            self.mtime = mtime
         self.hub.snapshot("initiatives", self.snapshot(mtime))
 
     def snapshot(self, mtime=None) -> dict:
+        # The file's edit time rides in every snapshot, /api/state too, so the page can say how old the file is.
         return {"items": self.items, "stale": self.stale, "error": self.error,
-                "mtime": mtime}
+                "mtime": mtime if mtime is not None else getattr(self, "mtime", None)}
 
 
 def _num(value):

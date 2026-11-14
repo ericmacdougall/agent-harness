@@ -290,7 +290,8 @@ def build(*, session: str, coordinator: dict, agents: list, tickets: dict, escal
         by_id[agent_id] = agent
     nodes, edges = [], []
     coord_id = "coordinator"
-    nodes.append({"id": "user", "kind": "user", "label": "You", "inbox": coordinator.get("inbox", 0)})
+    nodes.append({"id": "user", "kind": "user", "label": "You", "inbox": coordinator.get("inbox", 0),
+                  "inbox_stale": coordinator.get("inbox_stale", 0)})
     nodes.append({"id": coord_id, "kind": "coordinator", "label": "Main", "session": session,
                   "model": coordinator.get("model", UNKNOWN), "advisor_model": coordinator.get("advisor_model", UNKNOWN),
                   "effort": coordinator.get("effort", UNKNOWN), "machine": host if coordinator.get("read") else UNKNOWN,
@@ -480,13 +481,13 @@ class OrgGraph:
     idle_interval = 60.0
 
     def __init__(self, hub, health, runner, *, owners_fn, session_fn, transcripts: Transcripts,
-                 escalation_root: Path | None, host: str, inbox_fn=None, wal_events_fn=None):
+                 escalation_root: Path | None, host: str, inbox_fn=None):
         from collectors import Collector  # noqa: PLC0415 - avoid an import cycle at module load
         self._base = Collector(hub, health)
         self.hub, self.health, self.runner = hub, health, runner
         self.owners_fn, self.session_fn = owners_fn, session_fn
         self.transcripts, self.escalation_root, self.host = transcripts, escalation_root, host
-        self.inbox_fn = inbox_fn or (lambda: 0)
+        self.inbox_fn = inbox_fn or (lambda: (0, 0))
         self.snapshot_data: dict | None = None
         self.metas: dict[str, dict] = {}
         self.tickets: dict[str, dict] = {}
@@ -578,7 +579,9 @@ class OrgGraph:
                 and AGENT_RE.match(str(r.get("agent_id") or ""))]
         main_path = self.transcripts.main_path(session) if session else None
         coordinator = self.transcripts.facts(main_path)
-        coordinator = dict(coordinator, inbox=self.inbox_fn())
+        inbox = self.inbox_fn()
+        open_asks, stale_asks = inbox if isinstance(inbox, tuple) else (int(inbox or 0), 0)
+        coordinator = dict(coordinator, inbox=open_asks, inbox_stale=stale_asks)
         agents = []
         for row in rows:
             agent_id = str(row["agent_id"])

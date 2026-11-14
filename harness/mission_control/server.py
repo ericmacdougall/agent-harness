@@ -374,9 +374,9 @@ class App:
         if start_threads:
             self.start()
 
-    def _open_asks(self) -> int:
-        """Open asks waiting on the user (the "Needs you" list plus its stale part): the user node's inbox count."""
-        return len(getattr(self.asks, "items", None) or []) + len(getattr(self.asks, "stale", None) or [])
+    def _open_asks(self) -> tuple:
+        """The user node's inbox: open asks (the "Needs you" count) and the stale ones listed below them."""
+        return len(getattr(self.asks, "items", None) or []), len(getattr(self.asks, "stale", None) or [])
 
     def tracked_tickets(self):
         refs = [i.get("ticket") for i in self.initiatives.items if i.get("ticket")]

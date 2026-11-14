@@ -334,5 +334,32 @@ class Demo(unittest.TestCase):
                                               "payload": {"action": "closed", "pull_request": {"merged": False}}}))
 
 
+class FeedAdditions(unittest.TestCase):
+    def test_review_verdict_becomes_a_feed_row(self):  # reviewer approved/rejected cue source
+        entry = {"event": "review_result", "verdict": "BLOCK", "ticket": "GoodQA #15585", "range": "a..b"}
+        self.assertTrue(col._meaningful(entry))
+        self.assertEqual(col._note(entry), "BLOCK GoodQA #15585 a..b")
+        self.assertFalse(col._meaningful({"event": "review_result", "verdict": "<b>x</b>"}))
+
+    def test_inbox_counts_open_and_stale_asks(self):
+        fx = Fixture()
+        hub = Hub()
+        graph = og.OrgGraph(hub, col.Health(hub), Runner(), owners_fn=lambda: [], session_fn=lambda: SESSION,
+                            transcripts=og.Transcripts(fx.root), escalation_root=None, host="h", inbox_fn=lambda: (3, 1))
+        graph.tick(1.0)
+        user = nodes(graph.snapshot())["user"]
+        self.assertEqual((user["inbox"], user["inbox_stale"]), (3, 1))
+
+    def test_initiatives_snapshot_keeps_the_file_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "initiatives.json")
+            path.write_text(json.dumps([{"id": "x", "initiative": "X"}]))
+            hub = Hub()
+            from safeio import Reader
+            item = col.Initiatives(hub, col.Health(hub), Reader([tmp]), str(path))
+            item.tick(1.0)
+            self.assertEqual(item.snapshot()["mtime"], path.stat().st_mtime)
+
+
 if __name__ == "__main__":
     unittest.main()

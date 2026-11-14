@@ -237,13 +237,13 @@ export async function mountScene() {
   function dispose(object) { object.traverse(child => { child.geometry?.dispose(); const m = child.material; (Array.isArray(m) ? m : m ? [m] : []).forEach(x => x.dispose()); }); }
   function geometry(kind) {
     switch (kind) {
-      case 'user': return new THREE.TorusGeometry(.16, .05, 10, 28);
-      case 'coordinator': return new THREE.IcosahedronGeometry(.3, 1);
-      case 'owner': return new THREE.OctahedronGeometry(.2);
-      case 'reviewer': return new THREE.TetrahedronGeometry(.13);
-      case 'work': return new THREE.BoxGeometry(.18, .12, .18);
-      case 'repo': return new THREE.BoxGeometry(.12, .12, .12);
-      default: return new THREE.SphereGeometry(.11, 16, 12);
+      case 'user': return new THREE.TorusGeometry(.26, .08, 12, 32);
+      case 'coordinator': return new THREE.IcosahedronGeometry(.42, 1);
+      case 'owner': return new THREE.OctahedronGeometry(.32);
+      case 'reviewer': return new THREE.TetrahedronGeometry(.22);
+      case 'work': return new THREE.BoxGeometry(.3, .2, .3);
+      case 'repo': return new THREE.BoxGeometry(.2, .2, .2);
+      default: return new THREE.SphereGeometry(.18, 18, 14);
     }
   }
   function build() {
@@ -267,10 +267,10 @@ export async function mountScene() {
       core.add(mesh);
       // Severity: a halo ring. Escalation: one thin ring per ladder step, stacked above the node.
       const sev = node.severity === 'high' || node.severity === 'critical' ? colors.sev.high : node.severity === 'warn' || node.severity === 'medium' ? colors.sev.warn : '';
-      if (sev) { const halo = new THREE.Mesh(new THREE.RingGeometry(.24, .29, 40), new THREE.MeshBasicMaterial({ color: sev, side: THREE.DoubleSide, transparent: true, opacity: .9, depthWrite: false })); halo.rotation.x = -Math.PI / 2; core.add(halo); }
+      if (sev) { const halo = new THREE.Mesh(new THREE.RingGeometry(.4, .48, 40), new THREE.MeshBasicMaterial({ color: sev, side: THREE.DoubleSide, transparent: true, opacity: .9, depthWrite: false })); halo.rotation.x = -Math.PI / 2; core.add(halo); }
       for (let i = 0; i < Math.min(3, node.escalation || 0); i++) {
-        const esc = new THREE.Mesh(new THREE.TorusGeometry(.17 + i * .045, .012, 6, 32), new THREE.MeshBasicMaterial({ color: colors.esc[Math.min(3, node.escalation)] }));
-        esc.rotation.x = -Math.PI / 2; esc.position.y = .16 + i * .04; core.add(esc);
+        const esc = new THREE.Mesh(new THREE.TorusGeometry(.3 + i * .07, .02, 6, 32), new THREE.MeshBasicMaterial({ color: colors.esc[Math.min(3, node.escalation)] }));
+        esc.rotation.x = -Math.PI / 2; esc.position.y = .26 + i * .06; core.add(esc);
       }
       nodes.set(node.id, { core, position, mesh, node });
     }
@@ -289,7 +289,8 @@ export async function mountScene() {
     graph = state.orggraph;
     byId = new Map((graph?.nodes || []).map(n => [n.id, n]));
     positions = layout(graph, recentRepos(state.events));
-    extent = Math.max(3, ...[...positions.values()].map(p => Math.hypot(p[0], p[2])));
+    // Frame the live part of the pyramid; the outer ring of idle owners may run past the edge.
+    extent = Math.max(3, ...[...positions.entries()].filter(([id]) => { const n = byId.get(id); return !(n?.kind === 'owner' && !['live', 'working', 'quiet', 'observed'].includes(n.state)) && !id.startsWith('repo:'); }).map(([, p]) => Math.hypot(p[0], p[2])));
     const sig = signature();
     renderMeta(state);
     if (sig === modelSig) return false;
@@ -305,15 +306,15 @@ export async function mountScene() {
     const g = state.orggraph;
     if (!g) { meta.textContent = 'Waiting for the org graph from the server…'; return; }
     const c = g.counts || {};
-    meta.textContent = `${c.live_owners ?? 0} live of ${c.owner ?? 0} owners · ${c.subagent ?? 0} sub-agents · ${c.reviewer ?? 0} reviewers · ${c.work ?? 0} work items${c.hidden_agents ? ` · ${c.hidden_agents} older agents not drawn` : ''} · built ${ageText(g.generated, state.now)} from ah owners, transcripts and GoodQA`;
+    meta.textContent = `${c.live_owners ?? 0} live of ${c.owner ?? 0} owners · ${c.subagent ?? 0} sub-agents · ${c.reviewer ?? 0} reviewers · ${c.work ?? 0} work items${c.hidden_agents ? ` · ${c.hidden_agents} older agents not drawn` : ''} · graph last changed ${ageText(g.generated, state.now)} · from ah owners, transcripts and GoodQA`;
     const gaps = document.getElementById('org-gaps');
     gaps.replaceChildren(...(g.gaps || []).map(text => el('li', '', text)));
   }
   function fitCamera() {
     if (!camera) return;
-    const d = (4.5 + extent * 1.6) * zoom;
-    camera.position.set(0, 2.2 + d * .38, d);
-    camera.lookAt(0, .2, 0);
+    const d = (3 + extent * 1.45) * zoom;
+    camera.position.set(0, 1.4 + d * .32, d);
+    camera.lookAt(0, -.1, 0);
   }
   const scratch = { v: null };
   function projectLabels() {
@@ -324,17 +325,20 @@ export async function mountScene() {
       entry.core.getWorldPosition(v); v.project(camera);
       const x = (v.x * .5 + .5) * window.innerWidth - stageRect.left;
       const y = (-v.y * .5 + .5) * window.innerHeight - stageRect.top + 20;
-      const half = label.offsetWidth / 2 + 6, halfHeight = label.offsetHeight / 2 + 6;
-      label.style.left = `${Math.max(half, Math.min(stageRect.width - half, x))}px`;
-      label.style.top = `${Math.max(halfHeight, Math.min(stageRect.height - halfHeight, y))}px`;
+      // A label whose node is off the stage is hidden (still focusable), never squeezed against the edge.
+      label.classList.toggle('offstage', v.z > 1 || x < 0 || y < 0 || x > stageRect.width || y > stageRect.height);
+      label.style.left = `${x}px`;
+      label.style.top = `${y}px`;
     }
     cull();
   }
   // Labels never overlap: place them by priority, hide (not remove) the rest; a hidden label stays focusable.
-  const PRIORITY = { coordinator: 0, user: 0, owner: 1, reviewer: 3, subagent: 2, work: 4, repo: 5 };
+  const LIVE_STATES = ['live', 'working', 'quiet', 'observed'];
+  const rank = node => (node.severity === 'high' || node.severity === 'critical' ? .5 : node.kind === 'owner' ? (LIVE_STATES.includes(node.state) ? 1 : 4.5) : PRIORITY[node.kind] ?? 6);
+  const PRIORITY = { coordinator: 0, user: 0, subagent: 2, reviewer: 2.5, work: 3, repo: 5 };
   function cull() {
     const state = getState();
-    const entries = [...labelNodes.values()].map(entry => ({ entry, p: state.highlight === entry.node.id || state.selection?.id === entry.node.id ? -1 : (entry.node.severity === 'high' ? .5 : PRIORITY[entry.node.kind] ?? 6),
+    const entries = [...labelNodes.values()].filter(entry => !entry.label.classList.contains('offstage')).map(entry => ({ entry, p: state.highlight === entry.node.id || state.selection?.id === entry.node.id ? -1 : rank(entry.node),
       x: parseFloat(entry.label.style.left), y: parseFloat(entry.label.style.top), w: entry.label.offsetWidth + 6, h: entry.label.offsetHeight + 4 })).sort((a, b) => a.p - b.p);
     const placed = [];
     for (const item of entries) {

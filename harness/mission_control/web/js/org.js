@@ -82,9 +82,15 @@ export function layout(graph, repos = []) {
   pos.set('coordinator', [0, LEVELS.coordinator, 0]);
   const owners = graph.nodes.filter(n => n.kind === 'owner')
     .sort((a, b) => (LIVE.has(b.state) - LIVE.has(a.state)) || a.id.localeCompare(b.id));
-  const podRadius = Math.max(2.1, owners.length * 0.62);
+  // Live owners form the inner ring of pods; idle owners (done, returned, parked) an outer ring, so the work in
+  // progress stays central and readable however many finished owners the session still lists.
+  const live = owners.filter(o => LIVE.has(o.state)), idle = owners.filter(o => !LIVE.has(o.state));
+  const liveRadius = Math.max(2.1, live.length * 0.62);
+  const idleRadius = Math.max(liveRadius + 1.5, idle.length * 0.16);
+  const podRadius = idle.length ? idleRadius : liveRadius;
   const pods = new Map([['', [0, 0]]]);  // agents with no known owner cluster under the coordinator
-  ring(owners.length, podRadius, -Math.PI / 2).forEach(([x, z], i) => { pods.set(owners[i].id, [x, z]); pos.set(owners[i].id, [x, LEVELS.owner, z]); });
+  ring(live.length, liveRadius, -Math.PI / 2).forEach(([x, z], i) => { pods.set(live[i].id, [x, z]); pos.set(live[i].id, [x, LEVELS.owner, z]); });
+  ring(idle.length, idleRadius, -Math.PI / 2 + 0.2).forEach(([x, z], i) => { pods.set(idle[i].id, [x, z]); pos.set(idle[i].id, [x, LEVELS.owner + 0.35, z]); });
   const members = new Map();
   for (const node of graph.nodes) {
     if (node.kind !== 'subagent' && node.kind !== 'reviewer') continue;
@@ -147,7 +153,7 @@ export function describe(node, byId = new Map()) {
   if (node.severity && node.severity !== 'info') alarm.push(['Severity', node.severity]);
   if (node.escalation) alarm.push(['Escalation', `${node.escalation} step${node.escalation > 1 ? 's' : ''}${node.escalation_to ? ` to ${node.escalation_to}` : ''}${node.escalation_reason ? ` · ${node.escalation_reason}` : ''}`]);
   switch (node.kind) {
-    case 'user': return [['Open asks', String(node.inbox ?? 0)]];
+    case 'user': return [['Open asks (Needs you)', String(node.inbox ?? 0)], ['Stale asks, still open', String(node.inbox_stale ?? 0)]];
     case 'coordinator': return [['State', node.state], ...agent];
     case 'owner': return [['Mission', node.mission || UNKNOWN], ['State', node.state], ...agent, ['Ticket', node.ticket || '—'], ...alarm];
     case 'subagent': return [['Task', node.task || UNKNOWN], ['Owner', name(node.owner)], ['State', node.state], ...agent, ['Ticket', node.ticket || '—'], ...alarm];
