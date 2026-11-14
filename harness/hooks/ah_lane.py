@@ -195,7 +195,9 @@ class RealPorts:
             raise RuntimeError("wal note failed")
 
     def make_worktree(self, branch, worktree, repo_path):
-        if os.path.exists(worktree):
+        if os.path.lexists(worktree):
+            from lane import worktrees  # noqa: PLC0415
+            worktrees.verify_worktree(worktree, repo_path, branch)  # raises LaneRefusal unless it is the right worktree
             return
         subprocess.run(["git", "-C", repo_path, "worktree", "add", "-b", branch, worktree], check=True,
                        capture_output=True, timeout=120)

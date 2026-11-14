@@ -339,7 +339,10 @@ def start(ports, store, *, lane, reconcile=False, release=False, reason=None):
         if not open_res:
             if not m.get("repo_path"):
                 return refuse("this lane was created from a URL and has no local repository path", "create it from a checkout", USAGE)
-            ports.make_worktree(m["branch"], m["worktree"], m["repo_path"])
+            try:
+                ports.make_worktree(m["branch"], m["worktree"], m["repo_path"])  # before any reservation is journalled
+            except lanes.LaneRefusal as error:
+                return refuse(str(error), "pass a fresh --worktree path or the lane's own worktree")
             store.journal_append(lane_dir, kind="start_reserved", lane=lane, generation=gen, writer=_writer(ports),
                                  idem="reserve-g%d" % gen, source="inferred: ah lane start by main",
                                  data={"rung": rung}, ts=ports.now())
@@ -435,8 +438,11 @@ def checkpoint(ports, store, *, lane, kind, note, evidence=None, key=None, main=
     holder, gen = _holder(rows)
     if main is None:
         main = ports.is_main("checkpoint", lane)  # the stamp is one-shot: decide once, here or in the caller
-    if not main:
-        if caller.get("id") != holder or caller.get("generation", gen) != gen:
+    if main is not True:
+        who = caller.get("id")
+        # a non-empty authenticated caller AND a non-empty current holder, equal; None == None is not a proof
+        if not isinstance(who, str) or not who or not isinstance(holder, str) or not holder or who != holder \
+                or caller.get("generation", gen) != gen:
             return refuse("this agent is not the current-generation holder of %s" % lane,
                           "ask main to bind it, or hand the checkpoint to the current holder")
     from . import kit as _kit  # noqa: PLC0415
