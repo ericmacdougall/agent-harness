@@ -138,6 +138,33 @@ class Session(Base):
         self.assertEqual({r["session"] for r in owners.rows}, {"s2-newer"}, "the label follows the session ah reports")
 
 
+class AhFreshness(Base):
+    def test_a_healthy_codex_row_never_hides_a_stale_ah_read(self):
+        """Code inspection F1: an ah row merged with a supervised Codex row keeps ah's role; the merge must not let the
+        supervisor's fresh source_stale make that cached role look current."""
+        from types import SimpleNamespace
+        payload = {"session": "s1", "owners": [{"agent_id": "codex-sup", "agent": "main", "thread": "T1", "runtime": "codex",
+                                                "type": "task-owner", "owner": True, "state": "live", "idle_s": 5}]}
+        calls = {"code": 0}
+        runner = SimpleNamespace(run=lambda kind, *a, **k: (calls["code"], json.dumps(payload)))
+        owners = col.Owners(self.hub, self.health, runner, None)
+        owners.supervised = SimpleNamespace(rows=[{"agent_id": "openai:sup", "name": "sup", "runtime": "codex", "thread": "T1",
+                                                   "state": "live", "source_stale": False, "type": "owner"}])
+        owners.run(time.time())
+        merged = [r for r in owners.rows if r.get("thread") == "T1"]
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["source"], "ah")
+        self.assertFalse(merged[0]["ah_stale"])
+        calls["code"] = 1                                   # ah read fails; the supervisor stays healthy
+        owners.run(time.time() + 61)
+        merged = [r for r in owners.rows if r.get("thread") == "T1"][0]
+        self.assertFalse(merged["source_stale"], "the supervisor's own freshness wins the merge")
+        self.assertTrue(merged["ah_stale"], "but the ah snapshot is still marked stale")
+        calls["code"] = 0                                   # recovery
+        owners.run(time.time() + 122)
+        self.assertFalse([r for r in owners.rows if r.get("thread") == "T1"][0]["ah_stale"])
+
+
 class Serves(Base):
     def test_helpers_point_at_the_owner_they_serve(self):
         mc = {r["agent_id"]: r for r in self.collect(ah_rows())}

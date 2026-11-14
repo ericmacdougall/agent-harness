@@ -160,15 +160,27 @@ export function mountOwners() {
     const grouped = state.ownerFilter === 'active';
     if (mode !== (grouped ? 'grouped' : 'flat')) { list.replaceChildren(); groups.clear(); mode = grouped ? 'grouped' : 'flat'; }
     const focused = document.activeElement;
-    const focusedId = focused && list.contains(focused) ? focused.dataset?.id : null;
+    const inList = Boolean(focused && list.contains(focused));
+    const focusedId = inList ? focused.dataset?.id : null;
     const used = new Set(), placed = new Map();
     if (grouped) renderGrouped(state, used, placed); else renderFlat(state, used);
     for (const id of [...rows.keys()]) if (!used.has(id)) rows.delete(id);
-    // a focused row that folded away or vanished hands focus to its group's fold button, never to the page body
-    if (focusedId && !focused.isConnected) groups.get(lastPlaced.get(focusedId))?.fold.focus();
+    // Focus follows the row (code inspection F2): a row that moved and lost focus gets it back; a row that folded away
+    // or vanished hands focus to its group's fold, else the first visible fold, else the panel; never the page body.
+    if (focusedId && document.activeElement !== focused) {
+      const row = rows.get(focusedId)?.row;
+      const fold = groups.get(placed.get(focusedId) || lastPlaced.get(focusedId))?.fold;
+      const target = row && row.isConnected ? row
+        : fold && fold.isConnected && !fold.hidden ? fold
+          : list.querySelector('.owner-fold:not([hidden])') || document.getElementById('owners-panel');
+      target?.focus({ preventScroll: true });
+    } else if (inList && !focusedId && !list.contains(focused)) {
+      // the focused fold's whole group went away
+      (list.querySelector('.owner-fold:not([hidden])') || document.getElementById('owners-panel'))?.focus({ preventScroll: true });
+    }
     lastPlaced = placed.size ? placed : lastPlaced;
     const counts = ownerCounts(state.owners);
-    const stale = state.owners.some(owner => owner.source === 'ah' && owner.source_stale);
+    const stale = state.owners.some(owner => owner.source === 'ah' && (owner.ah_stale || owner.source_stale));
     const session = state.owners.find(owner => owner.source === 'ah' && owner.session)?.session || '';
     const count = document.getElementById('owner-count');
     count.textContent = String(counts.live).padStart(2, '0');

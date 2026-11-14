@@ -727,9 +727,14 @@ class Owners(Collector):
         aliases = {'codex-' + r.get('name', '') for r in managed}
         rows = [r for r in combined.values() if not (r.get('runtime') == 'codex' and
                 r.get('agent_id') in aliases and not r.get('thread'))]
+        # freshness of the ah snapshot is tracked apart from runtime freshness: a merged Codex row's own
+        # source_stale must never make a cached ah role look current (code inspection F1)
+        ah_stale = any(r.get('source_stale') for r in self.claude_rows)
         for r in rows:
             if r.get('source') != 'ah':  # rows from ah carry the cap's role; Codex rows get the same three roles
                 r['role'] = codex_role(r)
+            else:
+                r['ah_stale'] = ah_stale
         _serves(rows)
         self.rows = rows
         self.hub.snapshot('owners', self.rows)

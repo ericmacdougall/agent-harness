@@ -73,6 +73,7 @@ export function owners(rows, items = []) {
       serves: r.serves ? str(r.serves, 80) : null,
       decision_required: r.decision_required === true,
       session: str(r.session, 64),
+      ah_stale: r.ah_stale === true,
     };
   });
   // a helper takes the initiative of the owner it serves
