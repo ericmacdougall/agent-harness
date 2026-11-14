@@ -1650,3 +1650,47 @@ directory under `~/.agent-harness/work/<session>/` that is a clean, pushed workt
 - A `waiting` disposition on an ask is per owner: `ah task dispose --kind waiting` refuses an ask that names another owner (`wal_note.py --event ask --owner <agent>`) or is already another owner's live wait.
 - `ah owners` carries `agents_active_1h` (and each row `active_1h`); `ah status` repeats it under `owners`. Collectors that read transcripts skip an unreadable file, never the section.
 - Limits: unreviewed PRs and specs are not looked up over the network; SendMessage is not hooked, so it is not progress.
+
+### Owner runtime and drive loop (goodqa#15968)
+
+Owners are long-lived product owners, not one-task sub-agents. `owner_rt.py` (`ah own`) and `drive.py` (`ah drive`) make that enforced rather than remembered.
+
+- An owner is one Claude Code background session (`claude --bg`) per mission goal, named `owner-<goal>`. It keeps all of its state under `~/.agent-harness/owners/<goal>/` (0700):
+  - `state.json`: session id, generation, last proof, checkpoint, resume schedule, launches.
+  - `inbox.jsonl`: append-only task rows and transitions.
+  - `launch.log`: one line per launch attempt.
+- Create an owner with `owner_rt.py init --goal G --cwd <workspace> --source <src>`. The goal must already be in goals.json. Hand it work with `owner_rt.py task add --goal G --text ... --source ... [--wake]`. Nobody spawns an agent per task.
+- Task flow:
+  - `queued`
+  - `planned`: an AC file with AC-n lines, each followed by `Verify by:`, plus at least one NEG-n line.
+  - `converged`: `--reviewer <agent id> --verdict ACCEPT`.
+  - `building`, then `verifying`.
+  - `done`: evidence that resolves.
+  - `blocked`: a help request; the owner keeps working every other task.
+- Review-loop breaker: `task round` records each review. After 2 non-ACCEPT rounds the task takes no more rounds until `task break --how redesign` (with a new AC file), `--how escalate --ref <rung and agent>`, or `--how park --ref goodqa#N`.
+- Proof: `owner_rt.py beat --goal G --evidence commit:<sha> | wal:<id> --next ...` accepts only evidence that resolves, meaning the commit exists in the owner's workspace repo or the WAL id exists in the owner's session WALs.
+- Lifetime: `owner_rt.py tick` runs from ops-watch's `drive` check every cycle. It resumes every owner whose session is idle or gone while the goal is not done and work is due. Work is due when a task is actionable, a resume is due, or there has been no proof for 30 minutes.
+  - Resume is `claude --bg --resume <session>`, which keeps context.
+  - A missing or oversized transcript (`fresh_bytes`) starts a fresh generation from the state file instead.
+  - Bounds: at most `max_launches_per_hour` (4), at least `min_gap_s` (300) apart. After 3 launches with no new proof the owner is `stuck`, tick stops relaunching it and the high alert `owner:<goal>:stuck` is raised.
+  - Nothing launches unless `~/.agent-harness/owners/runtime.json` has `"enabled": true`. Its `permission_mode` defaults to `auto`.
+  - The harness never writes Claude's workspace trust, so a launch in an untrusted directory fails and is logged. Owner workspaces live under an already-trusted root.
+- Owner contract: the `owner_rt.py stop` Stop hook applies only to a registered owner session of a goal that is not done. It refuses the end while any task is actionable, or without a checkpoint younger than 15 minutes. It is bounded at 3 blocks per signature and 40 per session, and fails open. A checkpointed stop with every task blocked schedules a resume in 30 minutes.
+- Drive table: `ah drive table [--json]` lists every goal whatever its status, with owner, proof age, next step, blocker and distance to live. Each condition carries a required action:
+  - `IMPORTED`: activate or retire with the user's words.
+  - `UNOWNED`: create its owner.
+  - `STALLED`: no resolving proof in 30 minutes.
+  - `STUCK`
+  - `HELP_OPEN`
+  - `REVIEW_LOOP`
+  - `MERGED_NOT_RELEASED`: a commit naming the goal's ticket on a repo's default remote branch is newer than its last deploy evidence; needs the goal's `repos`.
+  - `PENDING_GATES`: goodqa#15952 lifecycle pending with no proposal. It is added alongside an owner and never pauses building.
+  Capacity is never a reason for "no action".
+- Responses: `ah drive respond --goal G --cond C --kind ask|owner|ticket|park --ref R [--source user:...] [--detail tN]` counts only as a fact checked when recorded:
+  - an open ask in the mission session that names the goal;
+  - a successful owner launch;
+  - a ticket reference;
+  - a park on a `user:`/`answer:` source that resolves to the user's words naming the goal.
+  A response counts only for the episode it answers (recorded after the condition appeared) and for at most 4 hours.
+- Enforcement: the `drive.py stop` Stop hook, for main of the mission session only, reads the snapshot written by the ops-watch drive tick plus the response ledger. A missing or stale snapshot falls back to a cheap live view without an owner scan or git. It blocks at most 3 times per signature; after that it lets the turn end, keeps the action open and raises the high `drive:valve` alert. ops-watch raises `drive:<goal>:<cond>` per unanswered action and wakes main through Mission Control. Mission Control `/api/state` carries `drive`.
+- Limits: same-user threat model as `caller_identity.py`. Legacy sub-agent owners count only through ops-watch's signed owner snapshot (stream ticket or `bind`).
