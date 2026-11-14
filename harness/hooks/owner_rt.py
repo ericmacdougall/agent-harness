@@ -605,9 +605,11 @@ def transcript_bytes(home: Path, state: dict) -> int:
     sid = state.get("session_id") or ""
     if not SESSION_RE.match(sid):
         return -1
-    for p in (home / ".claude" / "projects").glob(f"*/{sid}.jsonl"):
-        with contextlib.suppress(OSError):
-            return p.stat().st_size
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    for root in dict.fromkeys((home / ".claude" / "projects", config / "projects")):  # Claude writes to its config dir
+        for p in root.glob(f"*/{sid}.jsonl"):
+            with contextlib.suppress(OSError):
+                return p.stat().st_size
     return -1
 
 
