@@ -242,8 +242,9 @@ def runtime(home: Path) -> dict:
         cfg["model"] = ""
     if cfg["permission_mode"] not in PERMISSION_MODES:
         cfg["permission_mode"] = "auto"
-    if cfg["permission_mode"] == "bypassPermissions" and not user_decided(cfg.get("permission_source")):
-        cfg["permission_mode"], cfg["note"] = "auto", "bypassPermissions needs permission_source with the user's words"
+    if cfg["permission_mode"] == "bypassPermissions" and not chooses_bypass(cfg.get("permission_source")):
+        cfg["permission_mode"], cfg["note"] = "auto", ("bypassPermissions needs permission_source: the user's own "
+                                                       "words choosing bypass")
     cfg["claude"] = claude_bin()
     return cfg
 
@@ -255,6 +256,21 @@ def user_decided(source) -> bool:
         return bool(source) and mission_coverage.verify_user_source(source)
     except Exception:  # noqa: BLE001
         return False
+
+
+BYPASS_WORD = re.compile(r"\bbypass", re.I)
+NEGATION = re.compile(r"\b(?:no|not|never|don'?t|do not|without|stop|disable|isn'?t)\b|n't\b", re.I)
+
+
+def chooses_bypass(source) -> bool:
+    """Delta D3: the cited user words must themselves choose bypass (provenance checks the quoted excerpt is in that
+    turn), not merely be any genuine user turn. A negated excerpt never counts."""
+    try:
+        import provenance  # noqa: PLC0415
+        excerpt = str(provenance.parse_source(source).get("excerpt") or "")
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(BYPASS_WORD.search(excerpt)) and not NEGATION.search(excerpt) and user_decided(source)
 
 
 def claude_bin() -> str:
@@ -381,6 +397,16 @@ def init_owner(home: Path, goal: str, cwd: str, source: str, model: str = "", ti
     work = Path(cwd).expanduser()
     if not work.is_dir():
         raise OwnerError(f"cwd {cwd} is not a directory")
+    # delta D1: the workspace identifies the owner session, so it must be dedicated to this one owner
+    if any(_same_dir(work, p) for p in (home, Path.home(), Path("/"))):
+        raise OwnerError("the owner workspace must be a dedicated directory, not a home or root directory")
+    for g in owner_goals(home):
+        try:
+            other = load_state(home, g).get("cwd") if g != goal else None
+        except Exception:  # noqa: BLE001
+            other = None
+        if _same_dir(work, other):
+            raise OwnerError(f"workspace {work} already belongs to owner {g}; give each owner its own")
     with locked(home, goal) as d:
         if (d / "state.json").exists():
             raise OwnerError(f"owner for {goal} already exists ({SCRIPT} show --goal {goal})")
@@ -865,12 +891,59 @@ def _same_dir(a, b) -> bool:
         return False
 
 
-def owner_for_session(home: Path, session: str, cwd: str = ""):
+ADOPT_WINDOW_S = 2 * 3600
+OWNER_MARKERS = ("OWNER CHARTER (owner_rt", "OWNER RESUME (owner_rt")
+
+
+def transcript_file(home: Path, session: str):
+    if not SESSION_RE.match(session or ""):
+        return None
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    for root in dict.fromkeys((home / ".claude" / "projects", config / "projects")):
+        for p in root.glob(f"*/{session}.jsonl"):
+            if p.is_file() and not p.is_symlink():
+                return p
+    return None
+
+
+def launched_by_tick(home: Path, session: str, goal: str) -> bool:
+    """True when this session's transcript is one the tick launched for `goal`: named owner-<goal> (the --name the
+    tick passes) and its first user turn is the harness's owner prompt (observed on tick launches 2026-11-14)."""
+    p = transcript_file(home, session)
+    if p is None:
+        return False
+    try:
+        with open(p, "rb") as fh:
+            head = fh.read(256 << 10).decode("utf-8", "replace").splitlines()
+    except OSError:
+        return False
+    named = False
+    for line in head:
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(d, dict):
+            continue
+        if d.get("type") == "agent-name" and d.get("agentName") == f"owner-{goal}":
+            named = True
+        if d.get("type") == "user":
+            c = (d.get("message") or {}).get("content")
+            if isinstance(c, list):
+                c = next((b.get("text") for b in c if isinstance(b, dict) and b.get("type") == "text"), "")
+            return named and isinstance(c, str) and c.startswith(OWNER_MARKERS)
+    return False
+
+
+def owner_for_session(home: Path, session: str, cwd: str = "", now=None):
     """The owner state of this session: by recorded session id, or by the owner's dedicated workspace (`claude --bg`
     assigns its own id and ignores --session-id, so a run's first Stop can come before tick records the id; live test
-    2026-11-14). A workspace match adopts the id."""
+    2026-11-14). A workspace match adopts the id only when (delta D1) no id is recorded yet, a launch succeeded within
+    ADOPT_WINDOW_S, and the session's transcript shows the tick launched it for this goal. Any other session in the
+    workspace (main, a reviewer, a `claude -p` run) is never adopted."""
     if not session:
         return None
+    now = time.time() if now is None else now
     by_cwd = None
     for g in owner_goals(home):
         try:
@@ -881,19 +954,25 @@ def owner_for_session(home: Path, session: str, cwd: str = ""):
             return st
         if by_cwd is None and _same_dir(cwd, st.get("cwd")):
             by_cwd = st
-    if by_cwd is not None and SESSION_RE.match(session):
-        with contextlib.suppress(Exception), locked(home, by_cwd["goal"]):
-            s2 = load_state(home, by_cwd["goal"])
+    if by_cwd is None or not SESSION_RE.match(session) or by_cwd.get("session_id"):
+        return None
+    recent = [x for x in by_cwd.get("launches") or [] if isinstance(x, dict) and x.get("code") == 0
+              and isinstance(x.get("ts"), (int, float)) and 0 <= now - x["ts"] <= ADOPT_WINDOW_S]
+    if not recent or not launched_by_tick(home, session, by_cwd["goal"]):
+        return None
+    with contextlib.suppress(Exception), locked(home, by_cwd["goal"]):
+        s2 = load_state(home, by_cwd["goal"])
+        if not s2.get("session_id"):
             s2["session_id"] = session
             save_state(home, by_cwd["goal"], s2)
-            by_cwd = s2
-    return by_cwd
+            return s2
+    return None
 
 
 def stop_decision(home: Path, payload: dict, now=None) -> dict:
     now = time.time() if now is None else now
     session = str(payload.get("session_id") or "")
-    st = owner_for_session(home, session, str(payload.get("cwd") or ""))
+    st = owner_for_session(home, session, str(payload.get("cwd") or ""), now)
     if st is None:
         return {}
     goal = st["goal"]

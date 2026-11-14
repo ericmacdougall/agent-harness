@@ -398,17 +398,31 @@ def save_snapshot(home: Path, a: dict) -> dict:
     return signed
 
 
-def with_episodes(home: Path, assessment: dict, prev=None) -> dict:
-    """Carry each action's first-seen time (episode start) over from the previous snapshot; new actions start now."""
+def with_episodes(home: Path, assessment: dict, prev=None, responses=None) -> dict:
+    """Carry each action's first-seen time (episode start) over from the previous snapshot; new actions start now, or
+    at the earliest signed response recorded for that key in the last hour while no snapshot had it yet (delta D2:
+    respond checked those against the same one-hour window, so they answer this episode)."""
     prev = prev if prev is not None else (load_snapshot(home) or {})
-    since = {}
+    responses = read_responses(home) if responses is None else responses
+    at = float(assessment["at"])
+    early = {}
+    for x in responses:
+        ts = x.get("ts")
+        if x.get("pre") is True and isinstance(ts, (int, float)) and 0 <= at - ts <= PRE_EPISODE_S:
+            early[x.get("key")] = min(ts, early.get(x.get("key"), ts))
+    carry = prev.get("carry")
+    since = {k: v for k, v in carry.items() if isinstance(v, (int, float))} if isinstance(carry, dict) else {}
     for r in prev.get("rows") or []:
         for a in r.get("actions") or []:
             if isinstance(a, dict) and isinstance(a.get("since"), (int, float)):
                 since[a.get("key")] = a["since"]
     for r in assessment["rows"]:
         for a in r["actions"]:
-            a["since"] = since.get(a["key"], assessment["at"])
+            a["since"] = since.get(a["key"], early.get(a["key"], assessment["at"]))
+    seen = {a["key"] for r in assessment["rows"] for a in r["actions"]}
+    # episodes a cheap partial view cannot see (git conditions) are carried, so the next full tick keeps their start
+    assessment["carry"] = dict(list({k: v for k, v in since.items() if k not in seen and isinstance(k, str)}
+                                    .items())[:500])
     return assessment
 
 
@@ -417,7 +431,7 @@ def tick(home: Path, session: str = "", now=None, owner_rows=None) -> dict:
     if owner_rows is None and session:
         owner_rows = owner_rows_of(home, session, now)
     a = with_episodes(home, assess(home, session, now, owner_rows))
-    a["partial"] = False
+    a["partial"], a["carry"] = False, {}  # a full tick sees every condition: a key it lacks is resolved
     return save_snapshot(home, a)
 
 
@@ -450,7 +464,15 @@ def episode_start(home: Path, key: str, now: float) -> float:
         for a in r.get("actions") or []:
             if a.get("key") == key and isinstance(a.get("since"), (int, float)):
                 return float(a["since"])
-    return now - 3600  # no episode on record: a launch must be from the last hour
+    return now - PRE_EPISODE_S  # no episode on record: a launch must be from the last hour
+
+
+PRE_EPISODE_S = 3600
+
+
+def episode_on_record(home: Path, key: str) -> bool:
+    snap = load_snapshot(home) or {}
+    return any(a.get("key") == key for r in snap.get("rows") or [] for a in r.get("actions") or [])
 
 
 def check_response(home: Path, goal_id: str, cond: str, kind: str, ref: str, source: str, session: str,
@@ -503,12 +525,13 @@ def respond(home: Path, goal_id: str, cond: str, kind: str, ref: str = "", sourc
     if cond in ("HELP_OPEN", "REVIEW_LOOP") and not detail:
         raise DriveError(f"{cond} needs --detail <task id>")
     key = action_key(goal_id, cond, detail)
+    pre = not episode_on_record(home, key)
     problem = check_response(home, goal_id, cond, kind, ref, source, session, goals[goal_id], now,
                              since=episode_start(home, key, now), ticket_check=ticket_check)
     if problem:
         raise DriveError(problem)
     row = _sign(home, {"goal": goal_id, "cond": cond, "key": key, "kind": kind, "ref": ort.clean(ref, 120),
-                       "source": ort.clean(source, 300), "ts": now, "at": ort.now_iso(now)})
+                       "source": ort.clean(source, 300), "ts": now, "at": ort.now_iso(now), "pre": pre})
     d = _safe_dir(home)
     ort._append(d / "responses.jsonl", row)
     return row
@@ -611,8 +634,9 @@ def stop_decision(home: Path, payload: dict, now=None, is_main=None) -> dict:
                              prev=snap or {})
         live["partial"] = True
         with contextlib.suppress(Exception):
-            if snap is None or snap.get("partial"):
-                live = save_snapshot(home, live)  # never overwrite a full tick snapshot with a partial one
+            # delta D2: a stale full snapshot is replaced too, or new keys would restart their episode on every Stop;
+            # a fresh full snapshot never reaches here, and `carry` keeps the episodes the partial view cannot see
+            live = save_snapshot(home, live)
         snap = live
     todo = unanswered(snap, read_responses(home), now)
     if not todo:

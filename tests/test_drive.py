@@ -342,6 +342,55 @@ class StopTests(Base):
             self.assertEqual(drive.stop_decision(self.home, {"session_id": MISSION}, now=NOW + t, is_main=True), {},
                              t)
 
+    def test_stop_stale_full_snapshot_keeps_new_episodes(self):
+        """Delta D2: once a full tick snapshot goes stale, a new action's episode still persists across Stops."""
+        drive.tick(self.home, MISSION, now=NOW, owner_rows=[])
+        later = NOW + drive.SNAPSHOT_MAX_S + 60
+        self.goals[0]["repos"] = []  # same goal set; a new RELEASE_CHECK_OFF action appears after the tick
+        self.write_goals()
+        self.assertIsNotNone(drive.load_snapshot(self.home))  # the stale full snapshot is still a valid one
+        out = drive.stop_decision(self.home, {"session_id": MISSION}, now=later, is_main=True)
+        self.assertEqual(out.get("decision"), "block")
+        for key in [a["key"] for r in drive.load_snapshot(self.home)["rows"] for a in r["actions"]]:
+            ort._append(drive._safe_dir(self.home) / "responses.jsonl",
+                        drive._sign(self.home, {"key": key, "ts": later + 1}))
+        self.assertIn("solve:RELEASE_CHECK_OFF", [a["key"] for r in drive.load_snapshot(self.home)["rows"]
+                                                  for a in r["actions"]])
+        for t in (5, 120):
+            self.assertEqual(drive.stop_decision(self.home, {"session_id": MISSION}, now=later + t, is_main=True),
+                             {}, t)
+
+    def test_response_before_any_snapshot_saw_condition_counts(self):
+        """Delta D2 (probe): a valid respond made before drive's snapshot had the key answers that episode, once."""
+        self.owner()
+        st = ort.load_state(self.home, "solve")
+        st["last_beat"], st["launches"] = {"ts": NOW}, [{"ts": NOW, "code": 0}]
+        ort.save_state(self.home, "solve", st)
+        drive.tick(self.home, MISSION, now=NOW, owner_rows=[])
+        later = NOW + 45 * 60  # snapshot stale; the owner is now STALLED, a key no snapshot has yet
+        st["launches"].append({"ts": later, "code": 0})
+        ort.save_state(self.home, "solve", st)
+        drive.respond(self.home, "solve", "STALLED", "owner", now=later)
+        for t in (5, 120):
+            out = drive.stop_decision(self.home, {"session_id": MISSION}, now=later + t, is_main=True)
+            self.assertNotIn("solve STALLED", json.dumps(out), t)
+        # a pre-episode response older than the one-hour window never anchors a new episode
+        snap = {"at": later + 4000, "rows": [{"goal": "solve", "actions": [{"key": "solve:NEWTHING"}]}]}
+        old = [{"key": "solve:NEWTHING", "ts": later, "pre": True}]
+        self.assertEqual(drive.with_episodes(self.home, snap, prev={}, responses=old)["rows"][0]["actions"][0]["since"],
+                         later + 4000)
+
+    def test_partial_view_carries_unseen_episodes_until_full_tick(self):
+        snap = {"at": NOW, "rows": [{"goal": "solve", "actions": [{"key": "solve:MERGED_NOT_RELEASED",
+                                                                   "since": NOW - 500}]}]}
+        live = drive.with_episodes(self.home, {"at": NOW + 10, "rows": [{"goal": "solve", "actions": []}]}, prev=snap)
+        self.assertEqual(live["carry"], {"solve:MERGED_NOT_RELEASED": NOW - 500})
+        again = drive.with_episodes(self.home, {"at": NOW + 20, "rows": [
+            {"goal": "solve", "actions": [{"key": "solve:MERGED_NOT_RELEASED"}]}]}, prev=live)
+        self.assertEqual(again["rows"][0]["actions"][0]["since"], NOW - 500)
+        full = drive.tick(self.home, MISSION, now=NOW + 30, owner_rows=[])
+        self.assertEqual(full["carry"], {})
+
     def test_stop_stale_snapshot_still_checks(self):
         out = drive.stop_decision(self.home, self.payload(), now=NOW, is_main=True)  # no snapshot at all
         self.assertEqual(out.get("decision"), "block")

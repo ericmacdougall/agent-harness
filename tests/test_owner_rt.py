@@ -236,14 +236,51 @@ class SubagentStopTests(Base):
     def decide(self, sid=SID, now=None):
         return ort.stop_decision(self.home, {"session_id": sid, "hook_event_name": "Stop"}, now=now)
 
+    def transcript(self, sid, name="owner-solve", first="OWNER CHARTER (owner_rt, written by the harness)"):
+        d = self.home / ".claude" / "projects" / "-ws"
+        d.mkdir(parents=True, exist_ok=True)
+        rows = [{"type": "agent-name", "agentName": name, "sessionId": sid},
+                {"type": "user", "message": {"role": "user", "content": first}, "sessionId": sid}]
+        (d / f"{sid}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+
     def test_subagent_stop_unrecorded_session_in_owner_workspace_is_gated_and_adopted(self):
         other = "99999999-2222-3333-4444-555555555555"
         ort.add_task(self.home, "solve", "x", "ticket:goodqa#2")
-        out = ort.stop_decision(self.home, {"session_id": other, "cwd": str(self.repo)})
+        self.set_session("")
+        st = ort.load_state(self.home, "solve")
+        st["launches"] = [{"ts": NOW - 60, "code": 0}]
+        ort.save_state(self.home, "solve", st)
+        self.transcript(other)
+        out = ort.stop_decision(self.home, {"session_id": other, "cwd": str(self.repo)}, now=NOW)
         self.assertEqual(out.get("decision"), "block")
         self.assertEqual(ort.load_state(self.home, "solve")["session_id"], other)
         self.assertEqual(ort.stop_decision(self.home, {"session_id": "88888888-2222-3333-4444-555555555555",
-                                                       "cwd": str(self.home)}), {})  # another directory
+                                                       "cwd": str(self.home)}, now=NOW), {})  # another directory
+
+    def test_subagent_stop_foreign_session_in_workspace_never_adopted(self):
+        """Delta D1: main, a reviewer or a `claude -p` run stopping in the owner workspace is not the owner."""
+        foreign = "77777777-2222-3333-4444-555555555555"
+        ort.add_task(self.home, "solve", "x", "ticket:goodqa#2")
+        payload = {"session_id": foreign, "cwd": str(self.repo)}
+        self.transcript(foreign)
+        self.assertEqual(ort.stop_decision(self.home, payload, now=NOW), {})  # an id is already recorded
+        self.assertEqual(ort.load_state(self.home, "solve")["session_id"], SID)
+        self.set_session("")
+        self.assertEqual(ort.stop_decision(self.home, payload, now=NOW), {})  # no recent successful launch
+        st = ort.load_state(self.home, "solve")
+        st["launches"] = [{"ts": NOW - 3 * 3600, "code": 0}, {"ts": NOW - 60, "code": 1}]
+        ort.save_state(self.home, "solve", st)
+        self.assertEqual(ort.stop_decision(self.home, payload, now=NOW), {})  # old or failed launches only
+        st["launches"].append({"ts": NOW - 60, "code": 0})
+        ort.save_state(self.home, "solve", st)
+        for name, first in (("main", "OWNER CHARTER (owner_rt"), ("owner-solve", "please review this diff"),
+                            ("owner-other", "OWNER RESUME (owner_rt")):
+            self.transcript(foreign, name=name, first=first)
+            self.assertEqual(ort.stop_decision(self.home, payload, now=NOW), {}, name)
+        self.assertEqual(ort.load_state(self.home, "solve")["session_id"], "")
+        st = ort.load_state(self.home, "solve")
+        out = ort.tick(self.home, now=NOW + 600, dry_run=True, runner=lambda *a, **k: (0, "[]"))
+        self.assertNotIn(foreign, json.dumps(out))
 
     def test_subagent_stop_non_owner_session_never_blocked(self):
         ort.add_task(self.home, "solve", "x", "ticket:goodqa#2")
@@ -472,10 +509,31 @@ class HardeningTests(Base):
     def test_runtime_bypass_needs_user_words(self):
         self.write_runtime({"enabled": True, "permission_mode": "bypassPermissions"})
         self.assertEqual(ort.runtime(self.home)["permission_mode"], "auto")
+        sess = "baab765b-d85c-46b4-b7b9-588eb912c770/ecc9bdf8-0000-4000-8000-000000000000"
         self.write_runtime({"enabled": True, "permission_mode": "bypassPermissions",
-                            "permission_source": "answer:s/u \"Bypass, like main\""})
+                            "permission_source": f'answer:{sess} "Bypass, like main"'})
         with mock.patch.object(ort, "user_decided", return_value=True):
             self.assertEqual(ort.runtime(self.home)["permission_mode"], "bypassPermissions")
+        with mock.patch.object(ort, "user_decided", return_value=False):  # not the user's own turn
+            self.assertEqual(ort.runtime(self.home)["permission_mode"], "auto")
+
+    def test_runtime_bypass_words_must_choose_bypass(self):
+        """Delta D3: a genuine user turn that does not choose bypass never unlocks it."""
+        sess = "baab765b-d85c-46b4-b7b9-588eb912c770/ecc9bdf8-0000-4000-8000-000000000000"
+        with mock.patch.object(ort, "user_decided", return_value=True):
+            for words in ("ok go ahead", "yes", "do not bypass permissions", "never use bypass", "don't bypass"):
+                self.write_runtime({"enabled": True, "permission_mode": "bypassPermissions",
+                                    "permission_source": f'user:{sess} "{words}"'})
+                self.assertEqual(ort.runtime(self.home)["permission_mode"], "auto", words)
+
+    def test_init_workspace_must_be_dedicated(self):
+        """Delta D1: the workspace identifies the owner session, so it is never a home dir or shared."""
+        for bad in (str(self.home), str(Path.home()), "/"):
+            with self.assertRaises(ort.OwnerError, msg=bad):
+                ort.init_owner(self.home, "solve", bad, "ticket:goodqa#1")
+        self.init()
+        with self.assertRaises(ort.OwnerError):
+            ort.init_owner(self.home, "shipped", str(self.repo), "ticket:goodqa#1")
 
     def test_model_top_rungs_refused(self):
         for bad in ("fable", "astra", "claude-fable-5", "x; rm"):
