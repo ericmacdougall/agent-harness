@@ -984,6 +984,8 @@ class Ledger(Collector):
         self.actions = actions  # req_actions.ReqActions: the user's archive and restore clicks
         self.raw_requirements: list[dict] = []
         self.raw_total, self.raw_truncated = 0, False
+        # the session the requirement rows on hand were read for: set only by a successful read (review PR 234 F3)
+        self.req_session = ""
         self.parts = {name: {"stale": False, "error": "", "at": ""} for name in ("goals", "requirements", "status")}
         self.parts["goals"]["items"] = []
         self.parts["requirements"].update(items=[], total=0, truncated=False, summary=archive.summary([]))
@@ -1022,7 +1024,10 @@ class Ledger(Collector):
         errors = [self._read("goals", "ah goals", "ah-goals", (), self._goals, now)]
         session = self.session_fn() or ""
         if session:
-            errors.append(self._read("requirements", "ah requirements", "ah-requirements", (session,), self._requirements, now))
+            failed = self._read("requirements", "ah requirements", "ah-requirements", (session,), self._requirements, now)
+            if not failed:
+                self.req_session = session
+            errors.append(failed)
             errors.append(self._read("status", "ah status", "ah-status", (session,), self._status, now))
         errors = [e for e in errors if e]
         self.publish()
@@ -1072,17 +1077,35 @@ class Ledger(Collector):
         """The user's latest archive or restore click per requirement (signed rows only; see req_actions)."""
         return self.actions.latest() if self.actions is not None else {}
 
-    def _ticket_closed(self):
-        """True, False or None (unknown) per ticket, from the sweeper's own ticket cache. Reads no tickets itself."""
+    def _ticket_lookup(self, ref: str):
+        """'closed', 'open' or None for one ticket, through the allowlisted read-only runner (as the sweeper does)."""
+        code, out = self.runner.run("ah-ticket-get", ref, timeout=15, limit=256 * 1024)
+        issue = (_json(out.encode("utf-8", "replace")) or {}).get("issue") if code == 0 and out else None
+        if not isinstance(issue, dict):
+            return None
+        return "closed" if issue.get("closedAt") or issue.get("archivedAt") else "open"
+
+    def _ticket_closed(self, refresh=()):
+        """True, False or None (unknown) per ticket, from the sweeper's ticket cache. Only an answer younger than
+        TICKET_RECHECK_S counts (review PR 234 F1): an expired entry is unknown, which never archives. `refresh` names
+        the requirement tickets to recheck first, a bounded number per read, since no ask may name them."""
         if self.root is None:
             return None
         import mc_chat  # noqa: PLC0415
-        cache = mc_chat.read_json(Path(self.root) / "needs" / "tickets.json")
+        import needs_sweep  # noqa: PLC0415
+        cache = None
+        if refresh:
+            try:
+                cache = needs_sweep.refresh_tickets(Path(self.root), refresh, self._ticket_lookup)
+            except Exception:  # noqa: BLE001 - a failed refresh decides nothing; expired entries stay unknown
+                cache = None
+        if cache is None:
+            cache = mc_chat.read_json(Path(self.root) / "needs" / "tickets.json")
         cache = cache if isinstance(cache, dict) else {}
+        now = time.time()
 
         def closed(ref):
-            known = cache.get(ref)
-            state = known.get("state") if isinstance(known, dict) else None
+            state = needs_sweep.fresh_state(cache, ref, now)
             return True if state == "closed" else False if state == "open" else None
         return closed
 
@@ -1119,7 +1142,8 @@ class Ledger(Collector):
         self.raw_total = self._int(data.get("total"), len(rows))
         self.raw_truncated = data.get("truncated") is True
         truncated = len(rows) > self.MAX_REQUIREMENTS or self.raw_truncated
-        classified = archive.classify_all(rows, "requirement", time.time(), self._ticket_closed(), self.overrides())
+        tickets = [r["ticket"] for r in rows if r["ticket"] and not archive.TERMINAL_STATES.intersection({r["state"].lower()})]
+        classified = archive.classify_all(rows, "requirement", time.time(), self._ticket_closed(tickets), self.overrides())
         truncated = truncated or len(classified) > self.MAX_REQUIREMENTS
         classified = classified[:self.MAX_REQUIREMENTS]
         return {"items": classified, "total": self._int(data.get("total"), len(rows)), "truncated": truncated,

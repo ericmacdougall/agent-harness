@@ -136,6 +136,7 @@ export async function sendApproval(item) {
 const REQ_WHY = {
   'unknown-requirement': 'this requirement is no longer in the ledger read', 'stale-digest': 'the requirement changed since you read it; read it again',
   'already-archived': 'it is already archived', 'not-archived': 'it is not archived', 'bad-reason': 'a reason of 1 to 300 characters is required',
+  'session_changed': 'main moved to another session and its list has not loaded yet; nothing was recorded. Try again in a minute',
   'no-main': 'Mission Control does not know main yet', csrf: 'this page is out of date; reload it', 'key-conflict': 'this page reused a request id; try again',
 };
 export async function sendRequirement(item) {
