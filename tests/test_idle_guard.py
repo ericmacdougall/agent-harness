@@ -474,6 +474,76 @@ class WaitRestoreTests(Base):
                         self.assertTrue(rows["tick"]["decision_required"], rows["tick"])
                         self.assertIn("tick", streams)
 
+    # ---- receipt r4 F1: the stopped-at-wait answer is frozen when the wait is written, never re-derived later
+
+    def straddling_stop(self):
+        """The reviewer's shape on the fixture clock: tick's own rows at stop-10 and stop+5 (inside the stop slack),
+        its stop at old+60. Returns the stop time."""
+        stop = NOW - 4 * HOUR + 60
+        jl(self.w / "agent-tick.jsonl", [{"at": iso(stop - 10), "event": "pretool", "agent_id": "tick", "tool": "Bash"},
+                                         {"at": iso(stop + 5), "event": "pretool", "agent_id": "tick", "tool": "Bash"}])
+        return stop
+
+    def assert_superseded_and_dropped(self, label=""):
+        for age, later in self.AGES:
+            rows, streams = self.look(later)
+            with self.subTest(step=label, age=age):
+                self.assertIsNone(rows["tick"]["disposition"], rows["tick"])
+                self.assertIsNone(rows["tick"]["wait_on"], rows["tick"])
+                self.assertEqual(rows["tick"]["state"], "DROPPED", rows["tick"])
+                self.assertTrue(rows["tick"]["decision_required"], rows["tick"])
+                self.assertIn("tick", streams)
+
+    def test_r4_reviewer_sequence_transcript_then_wal_row_then_stop(self):  # receipt r4 F1, the exact sequence
+        for kind in self.WAITS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                stop = self.straddling_stop()  # 1000 -> stop; rows at 990 and 1005
+                self.dispose("tick", "waiting", f"tick-r4-{kind}", until=iso(NOW + 8 * HOUR), at=iso(stop + 100),
+                             **self.WAITS[kind])  # 1100: recorded while tick is stopped
+                self.transcript("tick", stop + 200)  # 1200: transcript activity seen first
+                self.assertIsNone(self.look()[0]["tick"]["disposition"])
+                jl(self.w / "agent-tick.jsonl", [{"at": iso(stop + 200), "event": "pretool", "agent_id": "tick",
+                                                  "tool": "Bash"}])  # 1200: the WAL tool row lands afterwards
+                self.assertIsNone(self.look()[0]["tick"]["disposition"])
+                self.stop("tick", stop + 250)  # 1250: the later stop
+                self.assert_superseded_and_dropped()
+
+    def test_r4_closely_spaced_stop_wait_resume_stop_within_the_merge_window(self):
+        for kind in self.WAITS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                stop = self.straddling_stop()
+                self.dispose("tick", "waiting", f"tick-r4c-{kind}", until=iso(NOW + 8 * HOUR), at=iso(stop + 30),
+                             **self.WAITS[kind])
+                jl(self.w / "agent-tick.jsonl", [{"at": iso(stop + 120), "event": "pretool", "agent_id": "tick",
+                                                  "tool": "Bash"}])  # tool-only resume, all inside 300 s
+                self.stop("tick", stop + 200)
+                self.assert_superseded_and_dropped()
+
+    def test_r4_incremental_reads_never_bring_the_wait_back(self):  # ah owners read after every step
+        stop = self.straddling_stop()
+        self.dispose("tick", "waiting", "tick-r4i", until=iso(NOW + 8 * HOUR), at=iso(stop + 100), ref="wa5b00000001")
+        self.assertTrue(self.look()[0]["tick"]["disposition"]["live"])  # nothing after it yet: the wait holds
+        steps = (("transcript", lambda: self.transcript("tick", stop + 200)),
+                 ("wal-row", lambda: jl(self.w / "agent-tick.jsonl", [{"at": iso(stop + 200), "event": "pretool",
+                                                                        "agent_id": "tick", "tool": "Bash"}])),
+                 ("stop", lambda: self.stop("tick", stop + 250)))
+        for label, step in steps:
+            step()
+            row = self.look()[0]["tick"]
+            with self.subTest(step=label):
+                self.assertIsNone(row["disposition"], row)
+                self.assertIsNone(row["wait_on"], row)
+
+    def test_stopped_at_wait_is_stamped_by_ah_not_the_caller(self):
+        jl(self.w / "agent-tick.jsonl", [{"at": iso(NOW - 60), "event": "intent", "note": "resumed and working"}])
+        self.dispose("tick", "waiting", "tick-r4-stamp", until=iso(NOW + HOUR), ref="wa5b00000001", stopped_at_wait=True)
+        self.assertIs(ah.dispositions(self.home, SESSION).get("tick", {}).get("stopped_at_wait"), False)
+        self.dispose("done1", "waiting", "done1-r4-stamp", until=iso(NOW + HOUR), ref="GoodQA goodqa#15944",
+                     stopped_at_wait=False)  # done1 stopped at old+60 and wrote nothing since
+        self.assertIs(ah.dispositions(self.home, SESSION).get("done1", {}).get("stopped_at_wait"), True)
+
     def running_owner(self, agent):
         jl(self.w / "main.jsonl", [{"at": iso(NOW - 5 * HOUR), "event": "subagent", "agent_id": agent, "agent_type": "task-owner"}])
         jl(self.w / f"agent-{agent}.jsonl", [{"at": iso(NOW - 5 * HOUR), "event": "intent", "note": "GoodQA goodqa#15952 work"}])
@@ -569,7 +639,7 @@ class WaitRestoreTests(Base):
         ah.summarize_agent_wal(wal, index)
         for cache in index.glob("wal-*.json"):
             doc = json.loads(cache.read_text())
-            for k in ("note_at", "work_at", "bursts"):
+            for k in ("note_at", "work_at", "note_own"):
                 doc.pop(k, None)
             cache.write_text(json.dumps(doc))
         summary = ah.summarize_agent_wal(wal, index)
