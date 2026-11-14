@@ -224,6 +224,33 @@ class Wiring(unittest.TestCase):
         self.assertEqual((status, body["error"]), (409, "session_changed"))
         self.assertEqual(app.actions.all(), [])
 
+    def test_restricted_owners_asks_never_reach_any_asks_list(self):  # review P-2 (items, resolved, cleared, archive)
+        text = "Please approve the rubric for candidate Jane D"
+        app, _ = self.app({"state": "ok", "mission_session": MAIN, "goals": []})
+        app.runner.outputs["ah-owners"] = lambda s: (0, json.dumps({"session": s, "owners": [
+            {"agent_id": "a1234567890abcdef", "type": "task-owner", "task": None, "restricted": True, "owner": True,
+             "state": "live", "idle_s": 5, "ticket": "goodqa#777"},
+            {"agent_id": "a0000000000000001", "type": "task-owner", "task": "x", "restricted": False, "owner": True,
+             "state": "live", "idle_s": 5, "ticket": ""}]}))
+        app.ledger.run(time.time())
+        app.owners.run(time.time())
+        ledger = {"items": [{"id": "w1", "owner": "agent-a1234567890abcdef", "note": text, "kind": "ask",
+                             "at": "2026-11-14T00:00:00Z"}],
+                  "resolved": [{"id": "w2", "owner": "agent-a1234567890abcdef", "note": text,
+                                "at": "2026-11-14T00:00:00Z", "resolved_at": "2026-11-14T00:01:00Z"}]}
+        app.runner.outputs["provenance-asks"] = lambda s: (0, json.dumps(ledger))
+        try:
+            app.asks.refresh(MAIN)
+        except Exception:  # noqa: BLE001 - a sweep that cannot run still must not show the text
+            pass
+        ledger["items"] = []   # the ask leaves the open list: the sweeper lists it as cleared
+        try:
+            app.asks.refresh(MAIN)
+        except Exception:  # noqa: BLE001
+            pass
+        self.assertNotIn("Jane", json.dumps(app.asks.snapshot()))
+        self.assertNotIn("Jane", json.dumps(app.state()["asks"]))
+
     def test_unpinning_clears_the_previous_sessions_asks(self):  # review N-1
         app, _ = self.app({"state": "error"})
         app.asks.session, app.asks.items = MAIN, [{"id": "wabc", "text": "old ask"}]

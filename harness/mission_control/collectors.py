@@ -1093,6 +1093,16 @@ class Asks(Collector):
                                       owners=self.owners_fn() if self.owners_fn else (), ticket_status=self.ticket_status,
                                       activity=self.activity(), now=now)
             status, view["cleared"], view["swept_at"] = swept["status"], swept["cleared"], ev.iso(swept["swept_at"])
+            # P-2 recheck (af72d863): cleared rows (and the Archive built from them) follow the same owner rule; the
+            # owner comes from the ledger rows by id, and an ask whose owner is unknown shows no text (fail closed)
+            owner_of = {str(r.get("id")): str(r.get("owner", "")) for r in
+                        raw + blocked + [x for x in (data.get("resolved") or []) if isinstance(x, dict)]}
+            restricted_now, unrestricted_now = self.restricted_ids(), self.unrestricted_ids()
+            view["cleared"] = [
+                row if self.owner_text_ok(owner_of.get(str(row.get("id")), ""), restricted_now, unrestricted_now)
+                and not RESTRICTED_TEXT.search(" ".join(str(row.get(k) or "") for k in ("text", "reason", "evidence")))
+                else dict(row, text=HIDDEN_NOTE, reason="hidden", evidence="")
+                for row in view["cleared"]]
         import needs_sweep as _sweep  # noqa: PLC0415
         pending = [r for r in blocked if _sweep.unchecked(r)]
         blocked = [r for r in blocked if not _sweep.unchecked(r)]
@@ -1171,7 +1181,7 @@ class Asks(Collector):
         return bare not in restricted and unrestricted is not None and bare in unrestricted
 
     @staticmethod
-    def item(session: str, raw: dict, restricted: frozenset = frozenset(), unrestricted=frozenset({"*"})) -> dict:
+    def item(session: str, raw: dict, restricted: frozenset, unrestricted: frozenset) -> dict:
         """One open ask as the page shows it. `text` and `why` are the whole ask (redacted, never clipped) and
         `digest` covers exactly them, so what the user reads is what a decision signs. An ask that cannot be shown
         whole, that an owner registered, or that needs the terminal carries `blocked` and is not approvable."""
@@ -1180,7 +1190,7 @@ class Asks(Collector):
         note, reason = str(raw.get("note", "")), str(raw.get("reason", ""))
         text, why, digest, blocked = ev.short(note, mc_chat.MAX_TEXT), ev.short(reason, mc_chat.REASON_MAX), "", ""
         bare = owner[len("agent-"):] if owner.startswith("agent-") else owner
-        known_ok = owner == "main" or "*" in (unrestricted or ()) or bare in (unrestricted or ())
+        known_ok = owner == "main" or bare in (unrestricted or ())
         if bare in restricted or not known_ok or RESTRICTED_TEXT.search(note + " " + reason):
             # review P-2: restricted work is never shown here, whoever registered it; answer it in the terminal
             text, why = "Restricted ask: open it in the terminal session that registered it.", ""

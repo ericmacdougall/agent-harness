@@ -581,14 +581,15 @@ class RestrictedProducerShape(unittest.TestCase):
     def test_asks_naming_restricted_work_or_from_restricted_owners_are_hidden(self):  # review P-2
         sys.path.insert(0, str(REPO / "harness" / "hooks"))
         by_text = col.Asks.item("s", {"id": "w1", "owner": "a2", "note": "interview rubric for candidate Jane D",
-                                      "reason": "needs your call"})
+                                      "reason": "needs your call"}, frozenset(), frozenset({"a2"}))
         # provenance names the owner by its WAL stem, `agent-<id>` (P recheck); the owner reads use the bare id
         by_owner = col.Asks.item("s", {"id": "w2", "owner": "agent-a1234567890abcdef", "note": "pick a slot",
                                        "reason": "x"}, frozenset({"a1234567890abcdef"}), frozenset({"a2"}))
         unknown = col.Asks.item("s", {"id": "w4", "owner": "agent-a9", "note": "rubric for candidate Jane D",
                                       "reason": "x"}, frozenset(), frozenset({"a2"}))
         self.assertNotIn("Jane", json.dumps(unknown))   # fail closed: an owner not known unrestricted
-        plain = col.Asks.item("s", {"id": "w3", "owner": "a2", "note": "approve PR 245 merge", "reason": "gate"})
+        plain = col.Asks.item("s", {"id": "w3", "owner": "a2", "note": "approve PR 245 merge", "reason": "gate"},
+                              frozenset(), frozenset({"a2"}))
         self.assertNotIn("Jane", json.dumps(by_text))
         self.assertNotIn("pick a slot", json.dumps(by_owner))
         self.assertFalse(by_text["approvable"] or by_owner["approvable"])
