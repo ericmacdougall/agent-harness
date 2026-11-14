@@ -56,8 +56,13 @@ REPLAY_SAFE = ("builtin-status", "codex-pool-build", "chat")
 TERMINAL = ("done", "failed", "blocked", "outcome-unknown")
 LOGIN_TTL_S = 300          # a shown code can be approved for this long
 SESSION_TTL_S = 12 * 3600  # an approved browser session
-LOGIN_MAX_PENDING = 10     # unapproved logins kept at once
-LOGIN_STARTS_PER_MIN = 6
+LOGIN_MAX_PENDING = 30     # unapproved logins kept at once, all clients
+LOGIN_STARTS_PER_MIN = 60  # all clients
+LOGIN_PER_CLIENT_PENDING = 3
+LOGIN_PER_CLIENT_PER_MIN = 6
+TOKEN_MIN = 32
+WEB_ORIGIN = "web-session"  # stamped by the handler; a request body can never choose its own origin class
+WEB_TASKS_PER_HOUR = 60
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789"  # no 0/O, 1/I/L, U: look-alikes cannot be confused
 CODE_RE = re.compile(r"^[A-HJKMNP-TV-Z2-9]{4}-[A-HJKMNP-TV-Z2-9]{4}$")
 TICKET_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}#[0-9]{1,9}$")
@@ -81,11 +86,28 @@ def ensure_home() -> Path:
     os.chmod(root, 0o700)
     (root / "runs").mkdir(exist_ok=True)
     token = root / "token"
-    if not token.exists():
-        fd = os.open(token, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    if not token.exists():  # written whole, then renamed: an interrupted first start cannot leave an empty token
+        tmp = root / f"token.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(secrets.token_hex(24))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, token)
     return root
+
+
+def read_token(root: Path) -> str:
+    """An empty or short token would make an empty bearer value full authority, so it is refused outright."""
+    value = (root / "token").read_text().strip()
+    if len(value) < TOKEN_MIN:
+        raise SystemExit(f"coordd: {root / 'token'} is missing or too short; remove it and restart to mint a new one")
+    return value
+
+
+def printable(text: str, limit: int = 300) -> str:
+    """Caller-supplied text shown to an operator: printable ASCII only, so it cannot rewrite the terminal."""
+    return "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in str(text))[:limit]
 
 
 def db(root: Path) -> sqlite3.Connection:
@@ -108,6 +130,8 @@ def db(root: Path) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS events(
             n INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, task TEXT, what TEXT NOT NULL, detail TEXT);
     """)
+    if "addr" not in [r["name"] for r in con.execute("PRAGMA table_info(logins)")]:
+        con.execute("ALTER TABLE logins ADD COLUMN addr TEXT NOT NULL DEFAULT ''")
     if "needs" not in [r["name"] for r in con.execute("PRAGMA table_info(tasks)")]:
         con.execute("ALTER TABLE tasks ADD COLUMN needs TEXT NOT NULL DEFAULT 'answer'")
     return con
@@ -141,18 +165,23 @@ def _h(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def login_start(con, client: str, now: float | None = None) -> dict:
+def login_start(con, client: str, now: float | None = None, addr: str = "") -> dict:
     now = time.time() if now is None else now
+    client, addr = printable(client), printable(addr, 80)
     con.execute("DELETE FROM logins WHERE created < ?", (now - LOGIN_TTL_S,))
     con.execute("DELETE FROM sessions WHERE expires < ?", (now,))
+    one = "SELECT COUNT(*) FROM logins WHERE addr=? AND "
+    if (con.execute(one + "state='pending'", (addr,)).fetchone()[0] >= LOGIN_PER_CLIENT_PENDING
+            or con.execute(one + "created > ?", (addr, now - 60)).fetchone()[0] >= LOGIN_PER_CLIENT_PER_MIN):
+        raise PermissionError("too many sign-in attempts from this client; wait a minute")
     pending = con.execute("SELECT COUNT(*) FROM logins WHERE state='pending'").fetchone()[0]
     recent = con.execute("SELECT COUNT(*) FROM logins WHERE created > ?", (now - 60,)).fetchone()[0]
     if pending >= LOGIN_MAX_PENDING or recent >= LOGIN_STARTS_PER_MIN:
         raise PermissionError("too many sign-in attempts; wait a minute")
     raw = "".join(secrets.choice(CODE_ALPHABET) for _ in range(8))
     code, poll = raw[:4] + "-" + raw[4:], secrets.token_urlsafe(32)
-    con.execute("INSERT INTO logins(code,poll_hash,state,client,created) VALUES(?,?,?,?,?)",
-                (code, _h(poll), "pending", client[:300], now))
+    con.execute("INSERT INTO logins(code,poll_hash,state,client,created,addr) VALUES(?,?,?,?,?,?)",
+                (code, _h(poll), "pending", client, now, addr))
     log_event(con, None, "login-started", client[:300])
     return {"code": code, "poll": poll, "expires_in": LOGIN_TTL_S}
 
@@ -223,8 +252,28 @@ def allowed_hosts() -> set[str]:
 
 
 # ---------------------------------------------------------------- intake
+def ticket_allowed(ticket: str) -> bool:
+    projects = [x.strip() for x in (os.environ.get("COORD_TICKET_PROJECTS") or "goodqa").split(",") if x.strip()]
+    return ticket.split("#", 1)[0] in projects
+
+
 def submit(con, kind: str, text: str, ticket: str | None, origin: str, key: str | None,
            needs: str | None = None) -> dict:
+    for name, value in (("text", text), ("ticket", ticket), ("key", key), ("needs", needs), ("origin", origin)):
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{name} must be text")
+    if origin == WEB_ORIGIN:
+        # A browser session reaches no model-backed lane and writes to no ticket: workers are not yet confined
+        # from the service account's files, so only the built-in read-only commands are open to it.
+        if kind != "chat" or ticket:
+            raise PermissionError("a browser session can only use chat commands; submit tasks from the host CLI")
+        since = (datetime.now(timezone.utc).timestamp() - 3600)
+        recent = con.execute("SELECT COUNT(*) FROM tasks WHERE origin=? AND created > ?",
+                             (WEB_ORIGIN, datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))).fetchone()[0]
+        if recent >= WEB_TASKS_PER_HOUR:
+            raise PermissionError("too many messages from browser sessions this hour")
+    if ticket and TICKET_RE.match(ticket) and not ticket_allowed(ticket):
+        raise ValueError("ticket project is not on this service's allowlist")
     wanted = sorted(set((needs or "answer").replace(" ", "").split(",")))
     if any(w not in CAPS for w in wanted):
         raise ValueError(f"needs must be a comma list of {CAPS}")
@@ -373,6 +422,10 @@ def lane_chat(con, task: dict, root: Path) -> tuple[bool, str]:
     if word == "show" and ID_RE.match(rest.strip()):
         row = con.execute("SELECT * FROM tasks WHERE id=?", (rest.strip(),)).fetchone()
         return True, json.dumps(dict(row), indent=1)[:6000] if row else "no such task"
+    web = task["origin"] == WEB_ORIGIN
+    if web and word not in ("help", "?", "status", "tasks", "show"):
+        return False, ("blocked-unavailable: a browser session can use status, tasks, show and help. Running tasks "
+                       "and free-form chat are host-CLI or Remote Control actions until workers run confined.")
     if word == "run" and rest.strip():
         ticket = None
         m = re.search(r"\bticket:([a-z0-9-]+#[0-9]+)\b", rest)
@@ -570,6 +623,7 @@ document.getElementById("cf").onsubmit=async e=>{e.preventDefault();const m=docu
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "coordd/0.1"
+    timeout = 15  # a stalled client cannot hold a server thread
     root: Path = None  # type: ignore[assignment]
     token: str = ""
 
@@ -596,12 +650,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _bearer(self) -> bool:
         got = self.headers.get("Authorization", "")
-        return got.startswith("Bearer ") and hmac.compare_digest(got[7:].strip(), self.token)
+        if len(self.token) < TOKEN_MIN or not got.startswith("Bearer "):
+            return False
+        return hmac.compare_digest(got[7:].strip().encode("utf-8", "replace"), self.token.encode())
 
     def _sid(self) -> str:
         for part in (self.headers.get("Cookie") or "").split(";"):
             name, _, value = part.strip().partition("=")
-            if name == "coord_sid":
+            if name in ("__Host-coord_sid", "coord_sid"):
                 return value
         return ""
 
@@ -614,9 +670,14 @@ class Handler(BaseHTTPRequestHandler):
             return False
         origin = self.headers.get("Origin")
         if self.command == "POST" and origin is not None:
-            if origin.split("://", 1)[-1].rsplit(":", 1)[0].lower() != self._host():
+            # Scheme, host and port must all be this page's own.
+            host = (self.headers.get("Host") or "").lower()
+            if origin.lower() not in (f"https://{host}", f"http://{host}"):
                 return False
         return True
+
+    def _addr(self) -> str:
+        return (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip()
 
     def _host(self) -> str:
         return (self.headers.get("Host") or "").rsplit(":", 1)[0].lower()
@@ -629,7 +690,7 @@ class Handler(BaseHTTPRequestHandler):
         who = self.headers.get("Tailscale-User-Login") or "unknown user"
         via = self.headers.get("X-Forwarded-For") or self.client_address[0]
         agent = (self.headers.get("User-Agent") or "unknown browser")[:120]
-        return f"{who} from {via} using {agent}"
+        return printable(f"{who} from {via} using {agent}")
 
     def do_GET(self):  # noqa: N802
         if not self._host_ok():
@@ -669,14 +730,15 @@ class Handler(BaseHTTPRequestHandler):
             con = db(self.root)
             if self.path == "/api/login/start":  # the only unauthenticated writes: start and poll
                 try:
-                    return self._send(200, login_start(con, self._client()))
+                    return self._send(200, login_start(con, self._client(), addr=self._addr()))
                 except PermissionError as exc:
                     return self._send(429, {"error": str(exc)})
             if self.path == "/api/login/poll":
                 state, sid = login_poll(con, str(body.get("poll") or ""))
                 if sid:
                     secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" or self._host() not in ("127.0.0.1", "localhost") else ""
-                    self.set_cookie = f"coord_sid={sid}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL_S}{secure}"
+                    name = "__Host-coord_sid" if secure else "coord_sid"  # __Host-: this origin only, never a sibling port's
+                    self.set_cookie = f"{name}={sid}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL_S}{secure}"
                 return self._send(200, {"state": state})
             if not self._authed():
                 return self._send(401, {"error": "sign-in required"})
@@ -690,23 +752,29 @@ class Handler(BaseHTTPRequestHandler):
                 con.execute("DELETE FROM sessions")
                 con.execute("DELETE FROM logins")
                 return self._send(200, {"ok": True})
+            # The origin class comes from how the caller authenticated, never from the request body.
+            host_cli = self._bearer()
             if self.path == "/api/chat":
-                task = submit(con, "chat", str(body.get("text") or ""), None, "chat", body.get("key"))
+                task = submit(con, "chat", str(body.get("text") or ""), None, "chat" if host_cli else WEB_ORIGIN,
+                              body.get("key"))
             elif self.path == "/api/tasks":
+                origin = ("cli:" + printable(body.get("origin") or "api", 60)) if host_cli else WEB_ORIGIN
                 task = submit(con, str(body.get("kind") or ""), str(body.get("text") or ""), body.get("ticket"),
-                              str(body.get("origin") or "api")[:80], body.get("key"), body.get("needs"))
+                              origin, body.get("key"), body.get("needs"))
             else:
                 return self._send(404, {"error": "not found"})
             return self._send(200, task)
-        except (ValueError, json.JSONDecodeError) as exc:
-            return self._send(400, {"error": str(exc)[:200]})
+        except PermissionError as exc:
+            return self._send(403, {"error": str(exc)[:200]})
+        except (ValueError, TypeError, RecursionError, UnicodeError, json.JSONDecodeError) as exc:
+            return self._send(400, {"error": str(exc)[:200] or type(exc).__name__})
 
 
 def cmd_serve(args) -> int:
     root = ensure_home()
     con = db(root)
     recover(con)
-    Handler.root, Handler.token = root, (root / "token").read_text().strip()
+    Handler.root, Handler.token = root, read_token(root)
     Handler.hosts = allowed_hosts()
     try:
         httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
@@ -733,7 +801,7 @@ def client(args, path: str, body: dict | None = None) -> dict:
     root = ensure_home()
     req = urllib.request.Request(f"http://127.0.0.1:{args.port}{path}", method="POST" if body is not None else "GET",
                                  data=json.dumps(body).encode() if body is not None else None,
-                                 headers={"Authorization": "Bearer " + (root / "token").read_text().strip(),
+                                 headers={"Authorization": "Bearer " + read_token(root),
                                           "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -772,6 +840,7 @@ def main(argv=None) -> int:
         sub.add_parser(name)
     apv = sub.add_parser("approve", help="approve a sign-in code shown in a browser; check the client line first")
     apv.add_argument("code")
+    apv.add_argument("--yes", action="store_true", help="skip the question (only after reading `logins`)")
     sh = sub.add_parser("show")
     sh.add_argument("id")
     args = ap.parse_args(argv)
@@ -782,8 +851,24 @@ def main(argv=None) -> int:
             print(f"{r['code']}  started {r['age_s']}s ago  by {r['client']}")
         return 0
     if args.cmd == "approve":
-        r = client(args, "/api/login/approve", {"code": args.code})
-        print(f"approved {r['approved']} for: {r['client']}")
+        code = args.code.strip().upper()
+        match = [r for r in client(args, "/api/logins")["pending"] if r["code"] == code]
+        if not match:
+            print("no pending sign-in has that code (expired, already used, or mistyped)")
+            return 1
+        # Shown BEFORE approving: someone else may have started this sign-in and asked you to approve it.
+        print(f"sign-in {code}, started {match[0]['age_s']}s ago")
+        print(f"requested by: {printable(match[0]['client'])}")
+        print("The requester line is what the browser and proxy reported; only the code is proof it is your browser.")
+        if not args.yes:
+            if not sys.stdin.isatty():
+                print("not approved: run in a terminal, or pass --yes after checking the line above")
+                return 1
+            if input("Is this the browser you (or your tester) just opened? Approve? [y/N] ").strip().lower() != "y":
+                print("not approved")
+                return 1
+        r = client(args, "/api/login/approve", {"code": code})
+        print(f"approved {r['approved']}")
         return 0
     if args.cmd == "logout-all":
         client(args, "/api/logout-all", {"all": True})

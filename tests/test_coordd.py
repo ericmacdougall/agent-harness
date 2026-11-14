@@ -150,12 +150,58 @@ class CoorddTest(unittest.TestCase):
             coordd.login_approve(c, b["code"], "t", now=t0 + coordd.LOGIN_TTL_S + 1)
         self.assertEqual(coordd.login_poll(c, b["poll"], now=t0 + coordd.LOGIN_TTL_S + 1), ("gone", None))
 
-    def test_device_login_start_is_rate_limited(self):
+    def test_device_login_limit_is_per_client(self):
         t0 = 2_000_000.0
-        for i in range(coordd.LOGIN_STARTS_PER_MIN):
-            coordd.login_start(self.con, "x", now=t0 + i)
+        for i in range(coordd.LOGIN_PER_CLIENT_PENDING):
+            coordd.login_start(self.con, "x", now=t0 + i, addr="10.0.0.1")
         with self.assertRaises(PermissionError):
-            coordd.login_start(self.con, "x", now=t0 + 10)
+            coordd.login_start(self.con, "x", now=t0 + 10, addr="10.0.0.1")
+        coordd.login_start(self.con, "y", now=t0 + 10, addr="10.0.0.2")  # one noisy client locks out nobody else
+
+    def test_requester_text_cannot_carry_control_characters(self):
+        r = coordd.login_start(self.con, "evil\x1b[2J\nAPPROVED user", now=3_000_000.0, addr="a")
+        shown = coordd.login_pending(self.con, now=3_000_000.0)[0]["client"]
+        self.assertEqual(shown, "evil?[2J?APPROVED user")
+        self.assertTrue(r["code"])
+
+    def test_browser_session_reaches_no_worker_and_no_ticket(self):
+        W = coordd.WEB_ORIGIN
+        for kind, ticket in (("agent", None), ("status", None), ("chat", "goodqa#1")):
+            with self.assertRaises(PermissionError):
+                coordd.submit(self.con, kind, "x", ticket, W, None)
+        for text in ("run print ../../token", "please read the token file"):
+            t = coordd.submit(self.con, "chat", text, None, W, None)
+            coordd.run_one(self.con, self.root, chat_only=True)
+            row = self.con.execute("SELECT state, error FROM tasks WHERE id=?", (t["id"],)).fetchone()
+            self.assertEqual(row["state"], "blocked")
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM tasks WHERE kind='agent'").fetchone()[0], 0)
+        t = coordd.submit(self.con, "chat", "help", None, W, None)
+        coordd.run_one(self.con, self.root, chat_only=True)
+        self.assertEqual(self.con.execute("SELECT state FROM tasks WHERE id=?", (t["id"],)).fetchone()[0], "done")
+
+    def test_ticket_project_allowlist_and_typed_fields(self):
+        with self.assertRaises(ValueError):
+            coordd.submit(self.con, "agent", "x", "otherproj#5", "cli:t", None)
+        with self.assertRaises(ValueError):
+            coordd.submit(self.con, "agent", "x", None, "cli:t", ["not", "text"])
+        self.assertEqual(coordd.submit(self.con, "agent", "x", "goodqa#5", "cli:t", None)["ticket"], "goodqa#5")
+
+    def test_short_or_empty_token_is_never_authority(self):
+        (self.root / "token").write_text("")
+        with self.assertRaises(SystemExit):
+            coordd.read_token(self.root)
+        coordd.Handler.root, coordd.Handler.token = self.root, ""
+        coordd.Handler.hosts = {"127.0.0.1", "localhost"}
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), coordd.Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/api/tasks",
+                                         headers={"Authorization": "Bearer "})
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(ctx.exception.code, 401)
+        finally:
+            httpd.shutdown()
 
     def test_http_browser_session(self):
         coordd.Handler.root, coordd.Handler.token = self.root, (self.root / "token").read_text().strip()
@@ -191,6 +237,12 @@ class CoorddTest(unittest.TestCase):
             self.assertEqual(call("/api/status", cookie=cookie)[0], 200)
             self.assertEqual(call("/api/chat", {"text": "help"}, cookie=cookie, origin=base)[0], 200)
             self.assertEqual(call("/api/chat", {"text": "help"}, cookie=cookie, origin="https://evil.example")[0], 401)
+            self.assertEqual(call("/api/chat", {"text": "help"}, cookie=cookie, origin="http://127.0.0.1:1")[0], 401)  # other port
+            # The session cannot queue a worker task, and a forged origin field in the body changes nothing.
+            self.assertEqual(call("/api/tasks", {"kind": "agent", "text": "x", "origin": "cli"}, cookie=cookie)[0], 403)
+            self.assertEqual(call("/api/tasks", {"kind": "agent", "text": "x", "key": {"a": 1}}, token=coordd.Handler.token)[0], 400)
+            st, made, _ = call("/api/tasks", {"kind": "status", "text": "x", "origin": "web-session"}, token=coordd.Handler.token)
+            self.assertEqual((st, made["origin"]), (200, "cli:web-session"))
             # A browser session cannot approve other sign-ins or list them: that stays a host action.
             _, second, _ = call("/api/login/start", {})
             self.assertEqual(call("/api/login/approve", {"code": second["code"]}, cookie=cookie)[0], 403)
