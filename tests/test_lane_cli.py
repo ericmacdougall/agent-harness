@@ -115,5 +115,32 @@ class EntryTests(unittest.TestCase):
             self.assertNotIn("Traceback", done.stderr)
 
 
+class RealPortFailureTests(unittest.TestCase):
+    def test_a_failing_real_port_is_a_message_and_exit_6_not_a_traceback(self):
+        import subprocess as sp
+        import ah_lane
+        orig = ah_lane.run
+        for exc in (sp.CalledProcessError(1, "git"), RuntimeError("registry down"), OSError("no route")):
+            ah_lane.run = lambda a, p, s, exc=exc: (_ for _ in ()).throw(exc)
+            try:
+                with tempfile.TemporaryDirectory() as tmp:
+                    os.environ["AH_HOME"] = tmp
+                    os.environ["CLAUDE_CODE_SESSION_ID"] = SESSION
+                    out = ah_lane.main(["status", "--lane", "lane_x"])
+            finally:
+                ah_lane.run = orig
+                os.environ.pop("AH_HOME", None)
+                os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+            self.assertEqual(out, 6, repr(exc))
+
+    def test_unknown_session_refuses_the_commands_that_need_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": tmp, "AH_HOME": tmp}
+            done = subprocess.run([sys.executable, str(HOOKS / "ah.py"), "lane", "start", "--lane", "lane_x"],
+                                  capture_output=True, text=True, env=env, timeout=60)
+            self.assertEqual(done.returncode, 4, done.stdout + done.stderr)
+            self.assertIn("session unknown", done.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

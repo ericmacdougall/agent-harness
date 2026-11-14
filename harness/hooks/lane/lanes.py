@@ -104,7 +104,7 @@ def reconcile(store: st.Store) -> list:
 
 def create_lane(store: st.Store, *, ticket, repo, profile, host_alias, branch, worktree, session, now, new_id,
                 templates_root, env, source, dry_run=False, policy_files=None, default_version="v1",
-                live_target=None) -> dict:
+                live_target=None, repo_path=None) -> dict:
     try:
         ticket_ref = ident.normalise_ticket(ticket)
     except ident.IdentityError as error:
@@ -148,7 +148,8 @@ def create_lane(store: st.Store, *, ticket, repo, profile, host_alias, branch, w
                             host_alias=host_alias, branch=branch, worktree=worktree, profile=profile, domains=[],
                             session=session, stream_key=stream, kit_version=version, kit_digests={},
                             template_digest=kit.template_digest(version, templates_root),
-                            policy_digests=_policy_digests(policy_files), created_at=now, live_target=live_target)
+                            policy_digests=_policy_digests(policy_files), created_at=now, live_target=live_target,
+                            repo_path=repo_path)
         files = kit.render_files(version, _inputs(m, version), templates_root)  # raises KitError, nothing created
         m["kit_digests"] = kit.digests(files)
         tmp = store.root / (".tmp-" + lane_id)

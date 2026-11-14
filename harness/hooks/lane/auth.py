@@ -14,7 +14,7 @@ import os
 import re
 import shlex
 
-MAIN_ONLY = ("new", "start", "bind", "set-live-target", "resolve-ledger")
+MAIN_ONLY = ("new", "start", "bind", "set-live-target", "resolve-ledger", "regenerate")
 LANE_ID = re.compile(r"^lane_[0-9A-Z]{26}$|^lane_[A-Za-z0-9._:-]{1,90}$")
 TICKET = re.compile(r"^GoodQA [a-z0-9][a-z0-9-]{0,60}#[0-9]{1,9}$")
 

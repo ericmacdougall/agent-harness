@@ -574,6 +574,20 @@
    "rules": []
   },
   {
+   "id": "lane_stamp:pretool",
+   "script": "lane_stamp.py",
+   "arg": null,
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
    "id": "dropped-gate:stop",
    "script": "dropped_gate.py",
    "arg": null,

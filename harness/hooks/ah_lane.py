@@ -93,7 +93,9 @@ class RealPorts:
         import model_tiers  # noqa: PLC0415
         self.esc, self.tiers = esc, model_tiers
         self.tier_policy = model_tiers.load_policy()
-        self.session = os.environ.get("CLAUDE_SESSION_ID", "unknown")
+        # the same resolution `ah` uses (ah.env_session); empty means unknown and the commands that need it refuse
+        self.session = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID") or ""
+        self._caller = {"id": "main"}
         self.host_alias = os.environ.get("AH_HOST_ALIAS", "local")
         self.templates_root = HERE / "lane" / "templates"
         self.default_kit_version = "v1"
@@ -126,7 +128,10 @@ class RealPorts:
         return auth.is_main(command, key)
 
     def caller(self):
-        return {"id": "main", "session": self.session}
+        return {"id": self._caller.get("id"), "session": self.session}
+
+    def set_caller(self, agent_id):
+        self._caller = {"id": agent_id}
 
     def holder_caller(self, lane):
         agent = auth.holder_identity(lane)
@@ -178,8 +183,10 @@ class RealPorts:
         return self.ticket.comment(ticket, "Lane holder %s registered for %s." % (agent[:12], task), op)
 
     def wal_note(self, lane, kind, note):
-        wal = _home() / ".claude" / "wals" / self.session
-        argv = [sys.executable, str(HERE / "wal_note.py"), "--wal", str(wal / "main.jsonl"), "--event", "status",
+        folder = _home() / ".claude" / "wals" / self.session
+        agent = self._caller.get("id")
+        target = folder / ("agent-%s.jsonl" % agent if agent and agent != "main" else "main.jsonl")
+        argv = [sys.executable, str(HERE / "wal_note.py"), "--wal", str(target), "--event", "status",
                 "--note", "lane %s checkpoint %s: %s" % (lane, kind, note)]
         done = subprocess.run(argv, capture_output=True, text=True, timeout=60)
         try:
@@ -187,11 +194,11 @@ class RealPorts:
         except ValueError:
             raise RuntimeError("wal note failed")
 
-    def make_worktree(self, branch, worktree, lane):
+    def make_worktree(self, branch, worktree, repo_path):
         if os.path.exists(worktree):
             return
-        repo = os.environ.get("AH_LANE_REPO") or os.getcwd()
-        subprocess.run(["git", "-C", repo, "worktree", "add", "-b", branch, worktree], check=True, capture_output=True, timeout=120)
+        subprocess.run(["git", "-C", repo_path, "worktree", "add", "-b", branch, worktree], check=True,
+                       capture_output=True, timeout=120)
 
     def last_remote_head(self, lane):
         return None
@@ -233,6 +240,8 @@ def build_parser():
     n.add_argument("--repo", required=True)
     n.add_argument("--profile", choices=("python-hooks", "generic"), default="generic")
     n.add_argument("--goal")
+    n.add_argument("--branch")
+    n.add_argument("--worktree")
     n.add_argument("--live-target")
     n.add_argument("--live-kind", choices=("web-origin", "install-hosts"), default="web-origin")
     n.add_argument("--source")
@@ -261,6 +270,10 @@ def build_parser():
         q = sub.add_parser(name)
         q.add_argument("--lane", required=True)
         q.add_argument("--json", action="store_true")
+    g = sub.add_parser("regenerate")
+    g.add_argument("--lane", required=True)
+    g.add_argument("--version", required=True)
+    g.add_argument("--reason", choices=("canary", "rollback"), required=True)
     r = sub.add_parser("resolve-ledger")
     r.add_argument("--lane", required=True)
     r.add_argument("--reset", required=True)
@@ -274,8 +287,10 @@ def run(args, ports, store) -> "commands.Result":
     c = args.cmd
     if c == "new":
         live = (args.live_kind, args.live_target) if args.live_target else None
+        env = {k: os.environ[k] for k in ("LANE_KIT_VERSION",) if k in os.environ}  # honoured only after the main stamp
         return commands.new(ports, store, ticket=args.ticket, repo=args.repo, profile=args.profile, dry_run=args.dry_run,
-                            live_target=live, live_source=args.source)
+                            live_target=live, live_source=args.source, branch=args.branch, worktree=args.worktree,
+                            env=env)
     if c == "set-live-target":
         return commands.set_live_target(ports, store, lane=args.lane, kind=args.kind, value=args.value, source=args.source,
                                         dry_run=args.dry_run)
@@ -284,8 +299,14 @@ def run(args, ports, store) -> "commands.Result":
     if c == "bind":
         return commands.bind(ports, store, lane=args.lane, agent=args.agent)
     if c == "checkpoint":
+        main = ports.is_main("checkpoint", args.lane)  # the stamp is one-shot: decided once, passed down
+        if not main:
+            who = ports.holder_caller(args.lane)
+            ports.set_caller(who["id"] if who else None)
         return commands.checkpoint(ports, store, lane=args.lane, kind=args.kind, note=args.note, evidence=args.evidence,
-                                   key=args.key)
+                                   key=args.key, main=main)
+    if c == "regenerate":
+        return commands.regenerate(ports, store, lane=args.lane, version=args.version, reason=args.reason)
     if c == "resolve-ledger":
         return commands.resolve_ledger(ports, store, lane=args.lane, reset=args.reset, rung=args.rung, reason=args.reason,
                                        source=args.source)
@@ -296,13 +317,18 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     ports = RealPorts()
     store = st.Store(_home() / ".agent-harness" / "state" / "lanes")
-    if args.cmd == "checkpoint" and not ports.is_main("checkpoint", args.lane):
-        who = ports.holder_caller(args.lane)
-        ports.caller = lambda who=who: who or {"id": None, "session": ports.session}
     try:
-        result = run(args, ports, store)
+        if args.cmd in ("new", "start", "bind", "checkpoint") and not ports.session and not getattr(args, "dry_run", False):
+            result = commands.Result(commands.NOT_KNOWN, ["session unknown: set CLAUDE_CODE_SESSION_ID (the session of "
+                                                           "the main agent that owns this lane)"])
+        else:
+            result = run(args, ports, store)
     except (st.StoreError, lanes.LaneRefusal, kit.KitError, manifest.ManifestError) as error:
         result = commands.Result(getattr(error, "exit_code", 3), ["refused: %s" % error])
+    except (subprocess.SubprocessError, RuntimeError, OSError, LookupError, ValueError) as error:
+        # a real port failed (ticket, git, registry): effects already recorded are kept; the op records make a rerun safe
+        result = commands.Result(commands.PARTIAL, ["failed: %s (%s); nothing was guessed, rerun to continue" %
+                                                     (type(error).__name__, str(error)[:120])])
     if getattr(args, "json", False):
         print(json.dumps({"code": result.code, "lines": result.lines, "data": result.data}, sort_keys=True, default=str))
     else:

@@ -31,7 +31,7 @@ REPO_KINDS = ("remote", "remote-origin", "local")
 REASONS = ("initial", "canary", "rollback", "regenerate", "live-target")
 LIVE_KINDS = ("web-origin", "install-hosts")
 FIELDS = ("schema", "revision", "revision_reason", "prev_sha256", "lane_id", "key", "ticket", "repo_identity", "repo_kind",
-          "host_alias", "branch", "worktree", "profile", "domains", "session", "stream_key", "predecessor",
+          "host_alias", "branch", "worktree", "repo_path", "profile", "domains", "session", "stream_key", "predecessor",
           "live_target", "generation", "kit_version", "kit_digests", "template_digest", "policy_digests",
           "spec_path", "scope_paths", "brief_version", "budget", "created_at")
 
@@ -82,6 +82,7 @@ def validate(m: dict) -> dict:
     _need(isinstance(m["host_alias"], str) and ID.match(m["host_alias"]), "host_alias")
     _need(isinstance(m["branch"], str) and BRANCH.match(m["branch"]), "branch")
     _need(isinstance(m["worktree"], str) and PATH.match(m["worktree"]), "worktree")
+    _need(m["repo_path"] is None or (isinstance(m["repo_path"], str) and PATH.match(m["repo_path"])), "repo_path")
     _need(m["profile"] in PROFILES, "profile")
     _need(isinstance(m["domains"], list) and all(d in DOMAINS for d in m["domains"]), "domains")
     _need(isinstance(m["session"], str) and ID.match(m["session"]), "session")
@@ -112,10 +113,11 @@ def validate(m: dict) -> dict:
 
 def new_manifest(*, lane_id, key, ticket, repo_identity, repo_kind, host_alias, branch, worktree, profile, domains,
                  session, stream_key, kit_version, kit_digests, template_digest, policy_digests, created_at,
-                 live_target=None, spec_path=None, scope_paths=(), predecessor=None, reason="initial") -> dict:
+                 live_target=None, spec_path=None, scope_paths=(), predecessor=None, reason="initial",
+                 repo_path=None) -> dict:
     m = {"schema": SCHEMA, "revision": 1, "revision_reason": reason, "prev_sha256": None, "lane_id": lane_id, "key": key, "ticket": ticket,
          "repo_identity": repo_identity, "repo_kind": repo_kind, "host_alias": host_alias, "branch": branch,
-         "worktree": worktree, "profile": profile, "domains": list(domains), "session": session,
+         "worktree": worktree, "repo_path": repo_path, "profile": profile, "domains": list(domains), "session": session,
          "stream_key": stream_key, "predecessor": predecessor, "live_target": live_target, "generation": 0,
          "kit_version": kit_version, "kit_digests": dict(kit_digests), "template_digest": template_digest,
          "policy_digests": dict(policy_digests), "spec_path": spec_path, "scope_paths": list(scope_paths),

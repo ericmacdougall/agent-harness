@@ -82,14 +82,14 @@ class Cmd(Base):
         self.caller_id = "main"
         self.owner_rows, self.owner_complete = [], True
         self.ledger_result = {"status": "new", "rung": "R0", "wiping_resets": [], "mtime": None, "error": None}
-        self.registered, self.notes, self.dispatch = [], [], {}
+        self.registered, self.notes, self.dispatch, self.made = [], [], {}, []
         self.p = SimpleNamespace(
             host_alias="mac", session="sess", now=self.clock, new_id=lambda: next(self.ids),
             templates_root=self.templates, policy_files=lambda: {}, default_kit_version="v1", ticket=self.ticket,
             is_main=lambda c, k: self.main, caller=lambda: {"id": self.caller_id, "session": "sess"},
             owners=lambda: (self.owner_rows, self.owner_complete, None if self.owner_complete else "partial", 0),
             tier_policy=POLICY, ledger=lambda s, prior_activity=False: self.ledger_result,
-            escalation_root=self.base / "esc", grant_for=lambda s, r: False, make_worktree=lambda b, w, l: None,
+            escalation_root=self.base / "esc", grant_for=lambda s, r: False, make_worktree=lambda b, w, r: self.made.append((b, w, r)),
             spawn_observed=lambda s: None, spawn_spec=lambda r: model_tiers.spawn_spec(POLICY, r),
             reviewer_line=lambda r: "R1", dispatch_task_key=lambda a: self.dispatch.get(a),
             subagent_start_seen=lambda a: a in self.dispatch,
@@ -629,6 +629,108 @@ class RefreshStatusTests(Cmd):
         self.assertEqual(cmd.verify(self.p, self.store, lane=lane).code, 0)
         (self.store.lane_dir(lane) / "kit" / "brief.md").write_text("x")
         self.assertEqual(cmd.verify(self.p, self.store, lane=lane).code, cmd.PARTIAL)
+
+
+class RealCliPathTests(Cmd):
+    """The paths the live check (AC-44) uses through ah_lane: one stamp per call, repo path and worktree, regenerate."""
+
+    def setUp(self):
+        super().setUp()
+        import ah_lane
+        self.ah_lane = ah_lane
+        self.tokens = 0
+        self.consumed = 0
+
+        def consuming(command, key):
+            self.consumed += 1
+            if self.tokens > 0:
+                self.tokens -= 1
+                return True
+            return False
+        self.p.is_main = consuming
+        self.p.set_caller = lambda a: setattr(self, "_c", a)
+        self.p.holder_caller = lambda lane: None
+
+    def mk(self, ticket="GoodQA goodqa#15946", **kw):
+        self.tokens = 1
+        return super().mk(ticket, **kw)
+
+    def call(self, *argv):
+        self.tokens, self.consumed = 1, 0  # exactly one stamp is available, like the real hook gives
+        args = self.ah_lane.build_parser().parse_args(list(argv))
+        return self.ah_lane.run(args, self.p, self.store)
+
+    def test_every_main_command_consumes_at_most_one_stamp(self):
+        r = self.call("new", "--ticket", "GoodQA goodqa#15946", "--repo", str(self.repo))
+        self.assertEqual((r.code, self.consumed), (0, 1), r.lines)
+        lane = r.data["lane_id"]
+        for argv in (("set-live-target", "--lane", lane, "--kind", "install-hosts", "--value", "mac:/a/b", "--source",
+                      "ticket:GoodQA goodqa#15946"), ("start", "--lane", lane),
+                     ("regenerate", "--lane", lane, "--version", "v1", "--reason", "rollback")):
+            with self.subTest(cmd=argv[0]):
+                out = self.call(*argv)
+                self.assertEqual(out.code, 0, out.lines)
+                self.assertLessEqual(self.consumed, 1)
+
+    def test_main_checkpoint_through_the_real_entry_succeeds_on_one_stamp(self):
+        lane = self.mk()
+        r = self.call("checkpoint", "--lane", lane, "--kind", "plan", "--note", "plan from main")
+        self.assertEqual((r.code, self.consumed), (0, 1), r.lines)
+
+    def test_checkpoint_without_a_stamp_and_without_a_holder_is_refused(self):
+        lane = self.mk()
+        self.tokens, self.consumed = 0, 0
+        args = self.ah_lane.build_parser().parse_args(["checkpoint", "--lane", lane, "--kind", "plan", "--note", "x"])
+        self.assertEqual(self.ah_lane.run(args, self.p, self.store).code, cmd.REFUSED)
+
+    def test_new_records_the_repo_path_and_a_sibling_worktree_and_start_uses_them(self):
+        lane = self.mk()
+        m = mf.read_current(self.store.lane_dir(lane))
+        self.assertEqual(m["repo_path"], os.path.realpath(str(self.repo)))
+        self.assertEqual(m["worktree"], os.path.join(os.path.dirname(m["repo_path"]), "repo-lane-goodqa-15946"))
+        self.assertNotEqual(m["worktree"], "/unset")
+        self.tokens = 1
+        cmd.start(self.p, self.store, lane=lane)
+        self.assertEqual(self.made, [(m["branch"], m["worktree"], m["repo_path"])])
+
+    def test_explicit_branch_and_worktree_flags_are_used(self):
+        r = self.call("new", "--ticket", "GoodQA goodqa#7", "--repo", str(self.repo), "--branch", "feat/x",
+                      "--worktree", str(self.base / "wt7"))
+        m = mf.read_current(self.store.lane_dir(r.data["lane_id"]))
+        self.assertEqual((m["branch"], m["worktree"]), ("feat/x", str(self.base / "wt7")))
+
+    def test_url_repo_without_a_worktree_is_a_usage_refusal(self):
+        self.tokens = 1
+        r = cmd.new(self.p, self.store, ticket="GoodQA goodqa#8", repo="https://github.com/o/r.git")
+        self.assertEqual(r.code, cmd.USAGE)
+        self.assertFalse(self.store.root.exists())
+
+    def test_canary_then_rollback_through_the_command_is_byte_identical(self):  # AC-43 via the CLI path
+        shutil.copytree(self.templates / "v1", self.templates / "v2")
+        (self.templates / "v2" / "brief.md").write_text((self.templates / "v2" / "brief.md").read_text() + "\nv2\n")
+        lane = self.mk()
+        d = self.store.lane_dir(lane)
+        before = dict(mf.read_current(d)["kit_digests"])
+        self.assertEqual(self.call("regenerate", "--lane", lane, "--version", "v2", "--reason", "canary").code, 0)
+        self.assertNotEqual(mf.read_current(d)["kit_digests"], before)
+        self.assertEqual(self.call("regenerate", "--lane", lane, "--version", "v1", "--reason", "rollback").code, 0)
+        self.assertEqual(mf.read_current(d)["kit_digests"], before)
+
+    def test_regenerate_is_main_only(self):
+        lane = self.mk()
+        self.tokens, self.consumed = 0, 0
+        args = self.ah_lane.build_parser().parse_args(["regenerate", "--lane", lane, "--version", "v1",
+                                                       "--reason", "rollback"])
+        self.assertEqual(self.ah_lane.run(args, self.p, self.store).code, cmd.REFUSED)
+
+    def test_kit_version_override_from_the_environment_reaches_new(self):
+        shutil.copytree(self.templates / "v1", self.templates / "v2")
+        os.environ["LANE_KIT_VERSION"] = "GoodQA goodqa#20=v2"
+        try:
+            r = self.call("new", "--ticket", "GoodQA goodqa#20", "--repo", str(self.repo))
+        finally:
+            os.environ.pop("LANE_KIT_VERSION", None)
+        self.assertEqual(mf.read_current(self.store.lane_dir(r.data["lane_id"]))["kit_version"], "v2")
 
 
 class NetworkSpyTests(Cmd):

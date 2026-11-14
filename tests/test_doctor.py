@@ -73,7 +73,9 @@ class Check(unittest.TestCase):
         for name in install.HOOKS:
             src = ROOT / "harness" / "hooks" / name
             if name.endswith(".py"):
-                (self.claude / "hooks" / name).write_text(src.read_text() if src.exists() else "")
+                target = self.claude / "hooks" / name
+                target.parent.mkdir(parents=True, exist_ok=True)  # lane/*.py are nested names (goodqa#15946)
+                target.write_text(src.read_text() if src.exists() else "")
         self.live = {"hooks": install.managed_hooks(self.claude, True)}
 
     def tearDown(self):

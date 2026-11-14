@@ -116,14 +116,20 @@ def new(ports, store, *, ticket, repo, profile="generic", branch=None, worktree=
     except ident.IdentityError as error:
         return refuse(str(error), "write the ticket as 'GoodQA <project>#<n>'", USAGE)
     slug_branch = branch or "lane/" + norm.split()[1].replace("#", "-")
+    repo_dir = os.path.realpath(str(repo)) if os.path.isdir(str(repo)) else None
+    if worktree is None:
+        if repo_dir is None:
+            return refuse("--worktree is required when the repository is given as a URL", "pass --worktree", USAGE)
+        worktree = os.path.join(os.path.dirname(repo_dir), "%s-lane-%s" % (os.path.basename(repo_dir),
+                                                                        norm.split()[1].replace("#", "-")))
     try:
         result = lanes.create_lane(
             store, ticket=ticket, repo=repo, profile=profile, host_alias=ports.host_alias, branch=slug_branch,
-            worktree=worktree or "/unset", session=ports.session, now=ports.now(), new_id=ports.new_id,
+            worktree=worktree, session=ports.session, now=ports.now(), new_id=ports.new_id,
             templates_root=ports.templates_root, env=env or {}, source="inferred: ah lane new by main",
             dry_run=dry_run, policy_files=ports.policy_files(), default_version=ports.default_kit_version,
             live_target=({"kind": live_target[0], "value": live_target[1], "source": live_source}
-                         if live_target else None))
+                         if live_target else None), repo_path=repo_dir)
     except lanes.HeldTarget as held:
         return refuse(str(held), "held targets are never worked on; see the user's memory rules")
     except lanes.LaneRefusal as error:
@@ -331,7 +337,9 @@ def start(ports, store, *, lane, reconcile=False, release=False, reason=None):
             return Result(NOT_KNOWN, ["needs approve-top for %s" % m["stream_key"], "no packet printed"])
         gen = _generation(rows) + 1
         if not open_res:
-            ports.make_worktree(m["branch"], m["worktree"], lane)
+            if not m.get("repo_path"):
+                return refuse("this lane was created from a URL and has no local repository path", "create it from a checkout", USAGE)
+            ports.make_worktree(m["branch"], m["worktree"], m["repo_path"])
             store.journal_append(lane_dir, kind="start_reserved", lane=lane, generation=gen, writer=_writer(ports),
                                  idem="reserve-g%d" % gen, source="inferred: ah lane start by main",
                                  data={"rung": rung}, ts=ports.now())
@@ -418,14 +426,16 @@ def drain_spool(ports, store, lane_dir, ticket_ref):
             continue
 
 
-def checkpoint(ports, store, *, lane, kind, note, evidence=None, key=None):
+def checkpoint(ports, store, *, lane, kind, note, evidence=None, key=None, main=None):
     if kind not in ("plan", "pr", "live-test", "blocker", "handoff"):
         return refuse("unknown checkpoint kind", "plan|pr|live-test|blocker|handoff", USAGE)
     lane_dir, m = _lane(store, lane)
     caller = ports.caller()
     rows = _journal(store, lane_dir)
     holder, gen = _holder(rows)
-    if not ports.is_main("checkpoint", lane):
+    if main is None:
+        main = ports.is_main("checkpoint", lane)  # the stamp is one-shot: decide once, here or in the caller
+    if not main:
         if caller.get("id") != holder or caller.get("generation", gen) != gen:
             return refuse("this agent is not the current-generation holder of %s" % lane,
                           "ask main to bind it, or hand the checkpoint to the current holder")
@@ -596,3 +606,21 @@ def verify(ports, store, *, lane):
                             policy_files=ports.policy_files())
     lines = ["state: %s" % rep["state"]] + ["problem: " + p for p in rep["problems"]] + rep["drift_diff"]
     return Result(OK if rep["state"] == "ok" else PARTIAL, lines, rep)
+
+
+# ------------------------------------------------------------------------------------------------- regenerate
+def regenerate(ports, store, *, lane, version, reason):
+    """Canary a kit version on one lane, or roll it back (AC-43). Main only; no network, no process."""
+    denied = _main_only(ports, "regenerate", lane)
+    if denied:
+        return denied
+    if reason not in ("canary", "rollback"):
+        return refuse("--reason is canary or rollback", "pass --reason", USAGE)
+    try:
+        out = lanes.regenerate_kit(store, lane, version=version, now=ports.now(), templates_root=ports.templates_root,
+                                   reason=reason)
+    except lanes.LaneRefusal as error:
+        return refuse(str(error), "a rollback is never blocked; a canary needs a lint-clean kit version")
+    except kit.KitError as error:
+        return refuse(str(error), "the kit version cannot be rendered", REFUSED)
+    return Result(OK, ["kit %s on %s at manifest revision %d (%s)" % (version, lane, out["revision"], reason)], out)
