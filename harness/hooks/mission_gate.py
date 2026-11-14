@@ -46,7 +46,7 @@ VALVE_KEY = "mission:gate-valve"
 SCAN_KEY = "mission:scan:unavailable"
 STAMP_PURPOSE = "mission-main"
 MAIN_ONLY = ("set", "defer", "import-initiatives", "reseal", "activate", "set-session", "bind", "retire",
-             "attach")
+             "attach", "add", "propose", "agree", "ready", "done", "migrate-lifecycle")  # goodqa#15952 lifecycle
 
 
 def home_dir() -> Path:

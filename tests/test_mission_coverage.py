@@ -98,8 +98,16 @@ class Base(unittest.TestCase):
         self.addCleanup(mc._PROOF.clear)
 
     def write_goals(self, goals):
+        """Goals as the pre-lifecycle `add` wrote them (status active, no lifecycle object). goodqa#15952: on a ledger
+        never migrated they read legacy, so these coverage tests keep exercising the legacy rules; a new `add` now
+        creates a PENDING goal instead (tests/test_lifecycle.py)."""
         for g in goals:
-            mc.add_goal(self.home, g["id"], g.get("title") or g["id"], g.get("ticket", ""), g.get("priority", 3))
+            def change(doc, g=g):
+                doc["goals"].append({"id": g["id"], "title": (g.get("title") or g["id"])[:300],
+                                     "priority": int(g.get("priority", 3)), "status": "active",
+                                     "ticket": (mc.ticket_key(g.get("ticket")) or "") if g.get("ticket") else ""})
+                return doc
+            mc._mutate(self.home, "add", g["id"], change, {"title": g["id"]})
         if mc.load_goals(self.home).get("mission_session") != SESSION:
             self.assertEqual(self.main_cli(["set-session", "--session", SESSION])[0], 0)
 
@@ -288,13 +296,15 @@ class DoneEvidence(Base):
         self.assertFalse(mc.verify_done_evidence(self.home, only_deploy))
 
     def test_agent_marking_done_without_evidence_is_refused(self):
+        """goodqa#15952: agent evidence never marks a goal done any more, with or without it (the user's words do)."""
         self.write_goals([goal()])
         with self.assertRaises(mc.MissionError):
             mc.done_goal(self.home, "leads", deploy="w0000000dep1", live_test="leads-live", session=SESSION)
         self.assertEqual(mc.load_goals(self.home)["goals"][0]["status"], "active")
         self.add_evidence()
-        mc.done_goal(self.home, "leads", deploy="w0000000dep1", live_test="leads-live", session=SESSION)
-        self.assertEqual(mc.load_goals(self.home)["goals"][0]["status"], "done")
+        with self.assertRaisesRegex(mc.MissionError, "no longer takes agent evidence"):
+            mc.done_goal(self.home, "leads", deploy="w0000000dep1", live_test="leads-live", session=SESSION)
+        self.assertEqual(mc.load_goals(self.home)["goals"][0]["status"], "active")
 
     def test_set_cannot_mark_done(self):
         self.write_goals([goal()])
@@ -531,11 +541,13 @@ class Import(Base):
     def test_dashboard_owner_field_never_covers(self):
         self.as_main("import-initiatives")
         mc.import_initiatives(self.home, self.FIXTURE)
-        self.as_main("activate", "tokens")
-        mc.activate_goal(self.home, "tokens")
         goals = mc.load_goals(self.home)["goals"]
+        # goodqa#15952: an imported goal is PENDING (it cannot be activated before the user agrees its gates), and
+        # the Stop gate enforces it; the dashboard's owner field still never covers it
+        rows = mc.read_audit_rows(self.home)
+        life = {g["id"]: mc.lcm.effective_state(g, rows, True) for g in goals}
         res = {r["id"]: r for r in mc.evaluate(goals, [], NOW, asks={}, verify_source=never,
-                                               verify_evidence=lambda g: False)}
+                                               verify_evidence=lambda g: False, lifecycle=life)}
         self.assertEqual(res["tokens"]["state"], "UNCOVERED")  # dashboard says owner aaef3bc7; ah owners has none
 
 
@@ -1021,7 +1033,7 @@ class RedTeam179(Base):
     # minor 10
     def test_done_evidence_must_come_from_the_mission_session(self):
         self.write_goals([goal()])
-        with self.assertRaisesRegex(mc.MissionError, "mission session"):
+        with self.assertRaisesRegex(mc.MissionError, "no longer takes agent evidence"):  # goodqa#15952
             mc.done_goal(self.home, "leads", deploy="w0000000dep1", live_test="leads-live",
                          session="44444444-5555-4666-8777-888888888888")
 
@@ -1054,13 +1066,16 @@ class RedTeam179(Base):
         self.assertTrue(all(g["status"] == "imported" for g in loaded["goals"]))
         res = {r["id"]: r for r in mc.evaluate(loaded["goals"], [], NOW, asks={}, verify_source=never)}
         self.assertEqual(res["leads"]["state"], "IMPORTED")
-        self.assertNotIn("decision", self.stop())
+        # goodqa#15952: an imported goal is a PENDING initiative; with no gate proposal before the user it is uncovered
+        self.assertTrue(all(g["lifecycle"]["state"] == "pending" for g in loaded["goals"]))
+        self.assertIn("PENDING", self.stop().get("reason", ""))
         self.as_main("activate", "leads")
-        mc.activate_goal(self.home, "leads")
+        with self.assertRaisesRegex(mc.MissionError, "owners start only after the user agrees"):
+            mc.activate_goal(self.home, "leads")
         self.as_main("import-initiatives")
         mc.import_initiatives(self.home, fixture)  # M21: an import never overwrites a status
         statuses = {g["id"]: g["status"] for g in mc.load_goals(self.home)["goals"]}
-        self.assertEqual(statuses["leads"], "active")
+        self.assertEqual(statuses["leads"], "imported")
         self.assertEqual(statuses["tokens"], "imported")
         self.assertEqual(self.stop().get("decision"), "block")
 

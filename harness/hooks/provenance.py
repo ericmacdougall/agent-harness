@@ -623,11 +623,20 @@ def answer_text(record, ask_ids):
         return None
     # Only the user's selections count (toolUseResult.answers: question -> answer). The rendered tool_result string
     # embeds the agent's own question text, so it is never parsed; no structured answers means no answer.
-    answers = record["toolUseResult"].get("answers") if isinstance(record["toolUseResult"], dict) else None
-    if not isinstance(answers, dict):
+    answers = answer_map(record)
+    if not answers:
         return None
-    values = [v.strip() for v in answers.values() if isinstance(v, str) and v.strip()]
-    return "\n".join(values) if values else None
+    return "\n".join(answers.values())
+
+
+def answer_map(record) -> dict:
+    """{question: answer} of a tool result's structured AskUserQuestion selections (non-empty strings only). Callers
+    must have bound the record to an AskUserQuestion tool_use first (answer_text, answer_pairs)."""
+    result = record.get("toolUseResult") if isinstance(record, dict) else None
+    answers = result.get("answers") if isinstance(result, dict) else None
+    if not isinstance(answers, dict):
+        return {}
+    return {q: v.strip() for q, v in answers.items() if isinstance(q, str) and isinstance(v, str) and v.strip()}
 
 
 def excerpt_in(text: str, excerpt: str):
@@ -718,6 +727,15 @@ def answer_turn(session: str, uid: str, home=None) -> dict:
     if text is None:
         raise Problem("not-user-authored", "record is not an AskUserQuestion answer bound to an AskUserQuestion tool_use")
     return {"text": text, "timestamp": record.get("timestamp"), "uuid": uid, "session": session}
+
+
+def answer_pairs(session: str, uid: str, home=None) -> tuple:
+    """({question: answer}, timestamp) of a verified AskUserQuestion answer record (the same binding answer_turn
+    checks), so a caller can judge the answer to one bound question, never the whole record (goodqa#15952)."""
+    turn = answer_turn(session, uid, home)  # raises Problem unless the record answers a main AskUserQuestion
+    path = find_transcript(session, home)
+    record = load_record(path, "uuid", uid)
+    return answer_map(record), turn.get("timestamp")
 
 
 def _has_human_turn(path: Path) -> bool:
