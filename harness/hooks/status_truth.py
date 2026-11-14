@@ -545,7 +545,8 @@ def cmd_stop(payload: dict) -> dict:
     _log_flags(payload, turn, mode, rules)
     text = ("Status-truth: your answer disagrees with or skipped the goal ledger. Run `python3 ~/.claude/hooks/ah.py "
             "goals` and restate from it. Only DONE_LIVE is done; for anything below it say the state and name the "
-            "unmet part of the target:\n" + "\n".join(problems))
+            "unmet part of the target. A goal's lifecycle DONE is the user's own decision: never say the user's DONE "
+            "for a goal that reads READY or below:\n" + "\n".join(problems))
     if mode == "enforce" and turn["prompt_id"]:  # no known turn: fail open to a warning (receipt r1 F2)
         import stop_blocks  # noqa: PLC0415
         if stop_blocks.allow(str(payload.get("session_id") or ""), turn["prompt_id"], "status_truth"):

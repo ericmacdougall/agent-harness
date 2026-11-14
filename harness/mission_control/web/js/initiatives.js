@@ -31,6 +31,14 @@ function renderAtRisk(state) {
   document.getElementById('at-risk').classList.toggle('has-risk', flagged > 0);
 }
 
+// goodqa#15952 AC-6: lifecycle from the mission ledger (PENDING, AGREED, ACTIVE, READY, DONE = the user's words only).
+export function lifecycleBadge(item) {
+  const badge = el('span', `state-badge lifecycle-badge lc-${stateClass(item.lifecycle)}`, item.lifecycle);
+  badge.setAttribute('aria-label', `Lifecycle ${item.lifecycle}`);
+  badge.title = 'Lifecycle from the goal ledger: PENDING (gates not agreed), AGREED, ACTIVE, READY (every gate has evidence), DONE (the user said so), LEGACY (predates gates)';
+  return badge;
+}
+
 export function mountInitiatives() {
   const list = document.getElementById('initiatives-list');
   function render(state) {
@@ -42,6 +50,7 @@ export function mountInitiatives() {
       card.dataset.id = item.id;
       const top = el('div', 'initiative-topline');
       top.append(el('span', 'ticket-id', item.ticket || 'no ticket'), el('span', `state-badge ${stateClass(item.state)}`, item.state));
+      top.append(lifecycleBadge(item));
       const title = button('initiative-title', '', () => select('initiative', item.id));
       title.setAttribute('aria-label', `Open ${item.initiative} details`);
       title.append(el('span', '', item.initiative), el('span', '', '↗'));

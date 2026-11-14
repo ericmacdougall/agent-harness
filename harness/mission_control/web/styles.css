@@ -155,3 +155,5 @@ dialog{background:var(--k-111512);border:1px solid var(--k-454d3b);border-radius
 .needs-item.flagged{border-color:var(--k-f1a6a666)}
 .needs-answer[hidden]{display:none}
 .needs-history+.needs-history{margin-top:0}
+/* goodqa#15952: lifecycle badge (ledger state); DONE only on the user's words, READY waits on the user */
+.initiative-topline{flex-wrap:wrap}.lifecycle-badge{margin-left:auto;border:1px solid var(--k-343839);background:transparent}.lifecycle-badge.lc-ready{color:var(--warm);border-color:currentColor}.lifecycle-badge.lc-done{color:var(--accent);border-color:currentColor}.lifecycle-badge.lc-pending,.lifecycle-badge.lc-unverified,.lifecycle-badge.lc-unknown{color:var(--k-c7b8eb)}

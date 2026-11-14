@@ -316,3 +316,8 @@ test('decision status lines say exactly how far a decision got', () => {
   assert.match(line('failed', { d: { reason: 'main is not attached', decision: 'deny' } }), /^Your denial was not recorded: main is not attached\. Nothing was sent\.$/);
   assert.equal(adapt.askProgress([], { ...base, status: 'delivered', live: true }), 'Approved by you · read by main');
 });
+
+test('goodqa#15952: an initiative carries the ledger lifecycle state, UNKNOWN when absent', () => {
+  const { items } = adapt.initiatives({ items: [{ id: 'a', lifecycle: 'READY' }, { id: 'b' }] });
+  assert.deepEqual(items.map(i => i.lifecycle), ['READY', 'UNKNOWN']);
+});

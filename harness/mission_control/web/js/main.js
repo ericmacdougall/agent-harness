@@ -1,6 +1,6 @@
 import { getState, subscribe, tick, select, setTab, setResponder, toggleFilter, toggleMotion, cycleTheme, KINDS } from './store.js';
 import { el, button, progress, checklist, field, eta, age, stateClass } from './ui.js';
-import { mountInitiatives } from './initiatives.js';
+import { mountInitiatives, lifecycleBadge } from './initiatives.js';
 import { liveFields } from './adapt.js';
 import { mountActivity } from './activity.js';
 import { mountOwners } from './owners.js';
@@ -93,7 +93,7 @@ function renderInspector(state) {
   if (kind === 'initiative') {
     const item = state.initiatives.find(entry => entry.id === id); if (!item) return select(null);
     title.textContent = item.initiative;
-    content.append(title, el('span', `state-badge ${stateClass(item.state)}`, item.state));
+    content.append(title, el('span', `state-badge ${stateClass(item.state)}`, item.state), lifecycleBadge(item));
     if (item.note) content.append(el('p', 'detail-intro', item.note));
     if (item.error) content.append(el('p', 'detail-error', `Data error: ${item.error}`));
     content.append(progress(item), checklist(item, true));
