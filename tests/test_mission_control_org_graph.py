@@ -582,13 +582,27 @@ class RestrictedProducerShape(unittest.TestCase):
         sys.path.insert(0, str(REPO / "harness" / "hooks"))
         by_text = col.Asks.item("s", {"id": "w1", "owner": "a2", "note": "interview rubric for candidate Jane D",
                                       "reason": "needs your call"})
-        by_owner = col.Asks.item("s", {"id": "w2", "owner": "a1234567890abcdef", "note": "pick a slot",
-                                       "reason": "x"}, frozenset({"a1234567890abcdef"}))
+        # provenance names the owner by its WAL stem, `agent-<id>` (P recheck); the owner reads use the bare id
+        by_owner = col.Asks.item("s", {"id": "w2", "owner": "agent-a1234567890abcdef", "note": "pick a slot",
+                                       "reason": "x"}, frozenset({"a1234567890abcdef"}), frozenset({"a2"}))
+        unknown = col.Asks.item("s", {"id": "w4", "owner": "agent-a9", "note": "rubric for candidate Jane D",
+                                      "reason": "x"}, frozenset(), frozenset({"a2"}))
+        self.assertNotIn("Jane", json.dumps(unknown))   # fail closed: an owner not known unrestricted
         plain = col.Asks.item("s", {"id": "w3", "owner": "a2", "note": "approve PR 245 merge", "reason": "gate"})
         self.assertNotIn("Jane", json.dumps(by_text))
         self.assertNotIn("pick a slot", json.dumps(by_owner))
         self.assertFalse(by_text["approvable"] or by_owner["approvable"])
         self.assertEqual(plain["text"], "approve PR 245 merge")
+
+    def test_a_restricted_owners_ticket_is_never_tracked(self):  # P recheck: the initiatives-file edge
+        import server as mcs
+        self.assertTrue(mcs._same_ticket_in("GoodQA goodqa#777", frozenset({"goodqa#777"})))
+        self.assertFalse(mcs._same_ticket_in("goodqa#7770", frozenset({"goodqa#777"})))
+        hub = Hub()
+        hub.publish = lambda *a, **k: None
+        owners = col.Owners(hub, self.Health(), runner=None, tailer=None)
+        owners._rows({"session": "s", "owners": [dict(self.ROWS[0], state="live", idle_s=5)]}, 1.0)
+        self.assertEqual(owners.restricted_tickets, frozenset({"goodqa#777"}))
 
 if __name__ == "__main__":
     unittest.main()

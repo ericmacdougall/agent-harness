@@ -303,6 +303,16 @@ def codex_binary() -> str | None:
     return None
 
 
+def _same_ticket_in(ref, hidden) -> bool:
+    """`GoodQA goodqa#N`, `goodqa#N` and `#N` spellings name one ticket."""
+    import re as _re  # noqa: PLC0415
+    def norm(x):
+        m = _re.search(r"([a-z0-9-]*)#(\d+)", str(x or "").lower())
+        return (m.group(1) or "goodqa", m.group(2)) if m else None
+    key = norm(ref)
+    return key is not None and any(norm(h) == key for h in hidden)
+
+
 class App:
     def __init__(self, *, port: int, root: Path, initiatives: str | None, remote: bool, fabric_bin: str | None,
                  runner: Runner | None = None, wal_roots=None, start_threads: bool = True, codex: bool = True,
@@ -363,6 +373,7 @@ class App:
                              owners_fn=lambda: self.owners.rows)
         self.tailer.on_ask = self.asks.mark_dirty
         self.asks.restricted_fn = lambda: self.owners.restricted[1]   # review P-2
+        self.asks.unrestricted_fn = self._status_visible   # owner-registered asks show text only for these owners
         self.tailer.note_visible = lambda runtime, session, agent: (
             session == self.owners.unrestricted[0] and agent in self.owners.unrestricted[1])   # review R-2
         self.actions = req_actions.ReqActions(root, self.key)
@@ -425,7 +436,8 @@ class App:
 
     def tracked_tickets(self):
         refs = [i.get("ticket") for i in self.initiatives.items if i.get("ticket")]
-        return refs + self.owners.tickets()
+        hidden = getattr(self.owners, "restricted_tickets", frozenset())
+        return [r for r in refs + self.owners.tickets() if not _same_ticket_in(r, hidden)]
 
     def start(self) -> None:
         loops = [(self.loop, "collectors"), (self.codex.loop, "codex"), (self.chat_loop, "chat"),

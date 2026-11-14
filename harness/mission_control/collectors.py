@@ -732,6 +732,7 @@ class Owners(Collector):
         # the 6 h and 60-row cuts. The Status view shows notes only from main and these agents.
         self.unrestricted: tuple = ("", frozenset())
         self.restricted: tuple = ("", frozenset())   # the same read's restricted ids (asks they registered are hidden)
+        self.restricted_tickets: frozenset = frozenset()
 
     def publish(self):
         managed = []
@@ -840,6 +841,10 @@ class Owners(Collector):
         self.restricted = (str(data.get("session") or ""), frozenset(
             str(r.get("agent_id")) for r in data.get("owners") or []
             if isinstance(r, dict) and r.get("restricted") is True and isinstance(r.get("agent_id"), str)))
+        # tickets restricted work is on: never fetched or shown, even when the initiatives file also names them
+        self.restricted_tickets = frozenset(
+            str(r.get("ticket")).lower() for r in data.get("owners") or []
+            if isinstance(r, dict) and r.get("restricted") is True and r.get("ticket"))
         for row in data.get("owners") or []:
             if not isinstance(row, dict):
                 continue
@@ -1072,7 +1077,8 @@ class Asks(Collector):
             if not isinstance(row, dict) or not ASK_ID_RE.match(str(row.get("id", ""))):
                 continue
             note = ev.short(str(row.get("note", "")), 400)
-            if RESTRICTED_TEXT.search(note + " " + str(row.get("resolution", ""))) or str(row.get("owner", "")) in self.restricted_ids():
+            if RESTRICTED_TEXT.search(note + " " + str(row.get("resolution", ""))) or not self.owner_text_ok(
+                    str(row.get("owner", "")), self.restricted_ids(), self.unrestricted_ids()):
                 note, row = HIDDEN_NOTE, dict(row, resolution="")
             resolved.append({"id": str(row["id"]), "at": str(row.get("at", ""))[:40], "text": note,
                              "ticket": _ticket_in(note), "owner": ev.short(str(row.get("owner", "")), 60),
@@ -1091,11 +1097,13 @@ class Asks(Collector):
         pending = [r for r in blocked if _sweep.unchecked(r)]
         blocked = [r for r in blocked if not _sweep.unchecked(r)]
         restricted = self.restricted_ids()
+        unrestricted = self.unrestricted_ids()
+        unrestricted = frozenset() if unrestricted is None else unrestricted   # unknown: only main's asks show text
         for row in raw + pending:
             verdict = status.get(str(row["id"]), {"state": "active"})
             if verdict["state"] == "cleared":
                 continue  # settled: listed under cleared-recently with its reason, never as an open ask
-            item = self.item(session, row, restricted)
+            item = self.item(session, row, restricted, unrestricted)
             if row in pending:
                 # Listed so the user sees it, but nothing verified its source: never a signed Approve or Deny.
                 item.update(unchecked="Its source could not be checked this sweep: " + ev.short(str(row.get("problem", "")), 120),
@@ -1107,7 +1115,7 @@ class Asks(Collector):
                 view["items"].append(item)
         for row in blocked:
             verdict = status.get(str(row["id"]))
-            item = self.item(session, row, restricted)
+            item = self.item(session, row, restricted, unrestricted)
             why = verdict["reason"] if verdict else "no traceable source: " + ev.short(str(row.get("problem", "")), 160)
             view["flagged"].append(dict(item, digest="", approvable=False, flagged=why,
                                         blocked="This ask does not trace to a real source, so it is not shown as a valid ask. Main has to restate it with its source."))
@@ -1146,8 +1154,24 @@ class Asks(Collector):
         fn = getattr(self, "restricted_fn", None)
         return frozenset(fn() or ()) if fn else frozenset()
 
+    def unrestricted_ids(self):
+        """Owners the pinned session's last full owner read marked NOT restricted, or None when unknown."""
+        fn = getattr(self, "unrestricted_fn", None)
+        return fn() if fn else None
+
     @staticmethod
-    def item(session: str, raw: dict, restricted: frozenset = frozenset()) -> dict:
+    def owner_id(owner: str) -> str:
+        """Provenance names an ask's owner by its WAL stem (`agent-<id>`); the owner reads use the bare id."""
+        return owner[len("agent-"):] if owner.startswith("agent-") else owner
+
+    def owner_text_ok(self, owner: str, restricted: frozenset, unrestricted) -> bool:
+        if owner == "main":
+            return True
+        bare = self.owner_id(owner)
+        return bare not in restricted and unrestricted is not None and bare in unrestricted
+
+    @staticmethod
+    def item(session: str, raw: dict, restricted: frozenset = frozenset(), unrestricted=frozenset({"*"})) -> dict:
         """One open ask as the page shows it. `text` and `why` are the whole ask (redacted, never clipped) and
         `digest` covers exactly them, so what the user reads is what a decision signs. An ask that cannot be shown
         whole, that an owner registered, or that needs the terminal carries `blocked` and is not approvable."""
@@ -1155,7 +1179,9 @@ class Asks(Collector):
         ask_id, owner = str(raw["id"]), ev.short(str(raw.get("owner", "")), 60)
         note, reason = str(raw.get("note", "")), str(raw.get("reason", ""))
         text, why, digest, blocked = ev.short(note, mc_chat.MAX_TEXT), ev.short(reason, mc_chat.REASON_MAX), "", ""
-        if owner in restricted or RESTRICTED_TEXT.search(note + " " + reason):
+        bare = owner[len("agent-"):] if owner.startswith("agent-") else owner
+        known_ok = owner == "main" or "*" in (unrestricted or ()) or bare in (unrestricted or ())
+        if bare in restricted or not known_ok or RESTRICTED_TEXT.search(note + " " + reason):
             # review P-2: restricted work is never shown here, whoever registered it; answer it in the terminal
             text, why = "Restricted ask: open it in the terminal session that registered it.", ""
             blocked = "Restricted work is not shown in Mission Control. Answer it in the terminal."
@@ -1578,7 +1604,10 @@ class Tickets(Collector):
                 continue
             seen.add(cid)
             ts = ev.parse_ts(comment.get("createdAt"), now)
-            self.hub.publish(ev.make("ticket", "goodqa", f"{ref}: {comment.get('body') or ''}", eid=f"goodqa:{cid}",
+            body = str(comment.get('body') or '')
+            if RESTRICTED_TEXT.search(body):
+                body = HIDDEN_NOTE   # review P recheck: a tracked ticket's comment can carry restricted work
+            self.hub.publish(ev.make("ticket", "goodqa", f"{ref}: {body}", eid=f"goodqa:{cid}",
                                      ts=ts, subject={"ticket": ref}, historic=first))
         self.seen[ref] = seen
         return f"{ref} ({len(tickets)} tracked)"
