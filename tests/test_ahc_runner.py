@@ -1323,6 +1323,163 @@ class MainStampTests(Base):
                          "a command run on another host is never stamped here")
 
 
+class PacketRetentionTests(Base):
+    """v6c: a stdin-staged packet is kept while its item is non-terminal and for 7 days after it turns terminal;
+    then the core pass removes it. The ledger keeps the SHA-256. Injected clock throughout."""
+
+    DAY = 86400
+
+    def setUp(self):
+        super().setUp()
+        import io
+        self.config["work_roots"].append(str(self.paths.packets))
+        self.deps = Deps()
+        self.staged, self.sha = runner.stage_packet(self.paths, io.BytesIO(GOOD_PACKET.encode()))
+        os.utime(str(self.staged), (self.deps.now, self.deps.now))
+
+    def submit_staged(self, head=HEAD):
+        self.deps.now += 1
+        req = {"repo": REPO, "pr": 7, "head": head, "base": BASE, "packet": str(self.staged),
+               "ticket": "GoodQA goodqa#16034", "owner": "agent-abc123", "submitted": self.deps.now}
+        return core.submit(self.paths, self.config, req)["id"]
+
+    def set_state(self, iid, state, at):
+        ledger = runner.Ledger(self.paths)
+        try:
+            with ledger.tx():
+                ledger.db.execute("UPDATE items SET state=?, entered_at=?, updated=? WHERE id=?", (state, at, at, iid))
+        finally:
+            ledger.close()
+
+    def core_tick(self, at):
+        self.deps.now = at
+        return runner.tick(self.paths, self.config, self.deps, role="core")
+
+    def test_non_terminal_item_keeps_its_packet_indefinitely(self):
+        iid = self.submit_staged()
+        start = self.deps.now
+        summary = self.core_tick(start + 30 * self.DAY)
+        self.assertEqual(summary["pruned_packets"], [])
+        self.assertTrue(self.staged.exists())
+        self.assertIn(self.ledger_state(iid), runner.NON_TERMINAL)
+
+    def ledger_state(self, iid):
+        ledger = runner.Ledger(self.paths)
+        try:
+            return ledger.item(iid)["state"]
+        finally:
+            ledger.close()
+
+    def test_terminal_item_packet_removed_after_seven_days_sha_kept(self):
+        iid = self.submit_staged()
+        ended = self.deps.now + 100
+        self.set_state(iid, "closed", ended)
+        self.core_tick(ended + 7 * self.DAY - 1)
+        self.assertTrue(self.staged.exists(), "removed before 7 days after the terminal state")
+        summary = self.core_tick(ended + 7 * self.DAY + 1)
+        self.assertEqual(summary["pruned_packets"], [self.sha + ".md"])
+        self.assertFalse(self.staged.exists())
+        self.assertEqual(self.record(iid)["packet_sha256"], self.sha, "the ledger keeps the SHA-256")
+
+    def test_shared_packet_kept_while_any_item_is_live(self):
+        done, live = self.submit_staged(), self.submit_staged(head="c" * 40)
+        self.set_state(done, "superseded", self.deps.now)
+        self.core_tick(self.deps.now + 30 * self.DAY)
+        self.assertTrue(self.staged.exists(), "a packet another live item names was removed")
+        self.set_state(live, "closed", self.deps.now)
+        self.core_tick(self.deps.now + 7 * self.DAY + 1)
+        self.assertFalse(self.staged.exists())
+
+    def test_unreferenced_staged_file_goes_after_seven_days_others_untouched(self):
+        outside = self.home / "outside.md"
+        outside.write_text("not ours")
+        link = self.paths.packets / ("d" * 64 + ".md")
+        os.symlink(str(outside), str(link))
+        stray = self.paths.packets / "notes.txt"
+        stray.write_text("x")
+        self.core_tick(self.deps.now + 7 * self.DAY - 1)
+        self.assertTrue(self.staged.exists())
+        self.core_tick(self.deps.now + 2)
+        self.assertFalse(self.staged.exists(), "an orphan staged packet (refused submit) is never removed")
+        self.assertTrue(link.is_symlink() and outside.exists() and stray.exists(),
+                        "only regular <sha>.md files in the staging root are touched")
+
+
+class DisposeStampHookTests(unittest.TestCase):
+    """v6c: the ahc-dispose stamp end to end against the REAL caller_identity, written by the real mission_gate
+    PreToolUse hook (no hand-made stamps): main's call is stamped; a sub-agent's is not; no other purpose can take
+    it; a changed argument list cannot consume it."""
+
+    SESSION = "11111111-2222-4333-8444-555555555555"
+    TOOL = "toolu_01DISPOSE000000000000001"
+    ARGV = ["ack", "ahc-x", "--owner", "main", "--disposition", "held for release"]
+    LINE = "ahc ack ahc-x --owner main --disposition 'held for release'"
+
+    def setUp(self):
+        from unittest import mock
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        env = mock.patch.dict(os.environ, {"AH_HOME": str(self.home), "HOME": str(self.home),
+                                           "CLAUDE_CONFIG_DIR": str(self.home / ".claude")})
+        env.start()
+        self.addCleanup(env.stop)
+        self.transcript = self.home / ".claude" / "projects" / "proj" / (self.SESSION + ".jsonl")
+        self.transcript.parent.mkdir(parents=True)
+        self.transcript.write_text('{"type":"user"}\n')
+
+    def pretool(self, line=LINE, **extra):
+        import mission_gate
+        payload = {"tool_name": "Bash", "tool_input": {"command": line}, "session_id": self.SESSION,
+                   "hook_event_name": "PreToolUse", "tool_use_id": self.TOOL, "transcript_path": str(self.transcript)}
+        payload.update(extra)
+        self.assertEqual(mission_gate.cmd_pretool(payload), {}, "the hook never denies")
+
+    def stamps(self):
+        import caller_identity
+        folder = caller_identity.stamp_dir(self.home)
+        return sorted(p.name for p in folder.glob("*.json")) if folder.exists() else []
+
+    def test_main_call_is_stamped_and_claims_once(self):
+        import caller_identity
+        self.assertTrue(caller_identity.is_main({"session_id": self.SESSION, "transcript_path": str(self.transcript)}),
+                        "fixture: this payload must be main's by the real caller_identity rule")
+        self.pretool()
+        self.assertEqual(len(self.stamps()), 1)
+        self.assertTrue(runner.claim_main(self.ARGV))
+        self.assertFalse(runner.claim_main(self.ARGV), "single use")
+
+    def test_sub_agent_call_is_not_stamped(self):
+        for extra in ({"agent_id": "a1234567"}, {"agent_type": "task-owner"},
+                      {"agent_id": "a1234567", "agent_type": "task-owner"}):
+            self.pretool(**extra)
+            self.assertEqual(self.stamps(), [], "a sub-agent payload %r got a stamp" % (extra,))
+            self.assertFalse(runner.claim_main(self.ARGV))
+
+    def test_other_purpose_cannot_take_the_stamp(self):
+        import caller_identity
+        self.pretool()
+        parts = core.dispose_stamp_parts(self.ARGV)
+        for purpose in ("review-auth", "mission-main", "ahc-dispose-x", ""):
+            self.assertIsNone(caller_identity.take_stamp(purpose, parts, home=self.home, bound=True),
+                              "purpose %r took the ahc-dispose stamp" % purpose)
+            self.assertIsNone(caller_identity.take_stamp(purpose, parts, home=self.home))
+        self.assertEqual(len(self.stamps()), 1, "a refused probe must not burn main's stamp")
+        self.assertTrue(runner.claim_main(self.ARGV), "the stamp is still main's to use")
+
+    def test_changed_argv_cannot_consume_the_stamp(self):
+        self.pretool()
+        changed = [
+            ["ack", "ahc-y", "--owner", "main", "--disposition", "held for release"],     # another item
+            ["ack", "ahc-x", "--owner", "main", "--disposition", "dropped, not needed"],  # another disposition
+            ["ack", "ahc-x", "--owner", "main", "--disposition", "held for release", "--owner", "o2"],
+        ]
+        for argv in changed:
+            self.assertFalse(runner.claim_main(argv), "changed argv %r consumed main's stamp" % (argv,))
+        self.assertEqual(len(self.stamps()), 1)
+        self.assertTrue(runner.claim_main(self.ARGV))
+
+
 class EmailRouteTests(Base):
     """D19 / AC-19: the daemon's critical escalations reach the mail command only through the REAL ops-watch
     forward_foreign, queue_events and deadman drain, in a temporary home with a fake deadman command. The daemon

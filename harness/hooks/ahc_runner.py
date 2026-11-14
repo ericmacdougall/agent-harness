@@ -874,6 +874,50 @@ class Worker:
                 ("clear:" + payload["alert_key"], iid, "clear", "pending", 0, now,
                  json.dumps({"alert_key": payload["alert_key"], "key": "ahc-clear-" + payload["alert_key"]}), now))
 
+    def prune_packets(self):
+        """v6c: a packet staged by `ahc submit --packet -` is kept while any item that names it is non-terminal and
+        for PACKET_RETENTION_SECONDS after the last such item turned terminal; then the core removes it (the receipt
+        and the ledger keep its SHA-256). A staged file no item names (its submit was refused) goes after the same
+        period from its own mtime. Only regular `<sha>.md` files directly in the staging root are touched; a
+        symlink or anything else there is left alone. Returns the removed names."""
+        root = self.paths.packets
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            return []
+        now = self.now()
+        real_root = os.path.realpath(str(root))   # submit records the packet's resolved path
+        keep_until = {}
+        for row in self.led.db.execute("SELECT state, entered_at, updated, request FROM items"):
+            try:
+                path = str(json.loads(row["request"]).get("packet") or "")
+            except ValueError:
+                continue
+            if not path or os.path.dirname(os.path.realpath(path)) != real_root:
+                continue
+            name = os.path.basename(path)
+            if row["state"] in NON_TERMINAL:
+                keep_until[name] = float("inf")
+            else:
+                ended = float(row["entered_at"] or row["updated"] or now)
+                keep_until[name] = max(keep_until.get(name, 0.0), ended + PACKET_RETENTION_SECONDS)
+        removed = []
+        for entry in entries:
+            if not STAGED_NAME.match(entry.name):
+                continue
+            try:
+                info = os.lstat(str(entry))
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                until = keep_until.get(entry.name, info.st_mtime + PACKET_RETENTION_SECONDS)
+                if now < until:
+                    continue
+                os.unlink(str(entry))
+                removed.append(entry.name)
+            except OSError:
+                continue  # retried next pass
+        return removed
+
     def escalate_overdue(self):
         """D20: every item in a covered state escalates past main 4 h after entering it, then every 24 h, until a
         disposition, a newer submission for the same PR, or the PR merging or closing. Reads only the ledger, plus
@@ -1322,6 +1366,7 @@ def _core_outbound(worker, ledger, summary):
     worker.escalate()
     worker.escalate_overdue()
     worker.dispatch_effects()
+    summary["pruned_packets"] = worker.prune_packets()
     missing = ledger.db.execute("SELECT id FROM items WHERE state IN (%s) AND next_action_at IS NULL"
                                 % ",".join("?" * len(NON_TERMINAL)), sorted(NON_TERMINAL)).fetchall()
     summary["defects"] = ["I2: %s has no next_action_at" % row["id"] for row in missing]
@@ -1699,6 +1744,8 @@ def load_config(paths):
 
 
 REPO_HOURLY_LIMIT = 6        # NEG-52: submissions admitted per repo per rolling hour
+PACKET_RETENTION_SECONDS = 7 * 86400   # v6c: staged packets outlive their item's terminal state by 7 days
+STAGED_NAME = re.compile(r"^[0-9a-f]{64}\.md$")
 
 
 def admit(paths, config, norm, now=None):

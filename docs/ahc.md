@@ -29,6 +29,26 @@ A migration runs only after a proven backup:
    together as `ledger.sqlite3.failed-<ns>[-wal|-shm]`; they are never deleted. The daemon then refuses to start
    with a `SchemaError` that names both files.
 
+## Admission and staged packets
+
+`ahc submit` is the only way work enters the ledger. Each submit runs in one `BEGIN IMMEDIATE` transaction that
+does three things in order:
+
+1. A duplicate item id returns the existing item.
+2. The submit is refused when 50 items are non-terminal, or when the repo already had 6 submissions in the last
+   hour.
+3. Otherwise the item is inserted.
+
+A file placed in the queue directory admits nothing. It is quarantined unread and raises an alert.
+
+`ahc submit --packet -` reads the packet from stdin and checks it against `--expect-sha` when that flag is given.
+It then writes the packet once to `<coordinator root>/packets/<sha256>.md` (mode 0600, in a 0700 directory).
+
+The core pass removes a staged packet 7 days after the last item that names it turned terminal. It never
+removes a packet while any item that names it is non-terminal. A staged file that no item names (its submit was
+refused) is removed 7 days after its mtime. Only regular `<sha256>.md` files in that directory are touched. The
+ledger and the receipt keep the SHA-256 after the file is gone.
+
 ## Digest readback
 
 The digest (`<coordinator root>/digest.md`) is a courtesy copy for main. Before re-appending an entry left at `intent`,
