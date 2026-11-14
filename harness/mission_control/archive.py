@@ -101,20 +101,34 @@ def _newest(records: list[dict]):
     return max(records, key=lambda r: (_epoch(r.get("at")) or 0.0, json.dumps(r, sort_keys=True, default=str)))
 
 
+# A whole ticket id: "goodqa#9" never matches inside "goodqa#90" or "xgoodqa#9" (review PR 234 F2).
+TICKET_ID_RE = re.compile(r"(?<![A-Za-z0-9_-])([A-Za-z][A-Za-z0-9-]{1,30}#\d{1,7})(?![0-9])")
+
+
+def _tickets_in(text: str) -> set:
+    return {m.lower() for m in TICKET_ID_RE.findall(text or "")}
+
+
 def _binding(row: dict, deploy: dict, test: dict):
     """The ticket or commit both records are bound to, or None. Bound means: both name the same non-empty commit or
-    ticket, or the row's own ticket is named by both (in a ticket or commit field, or in the check or note)."""
+    ticket, or the row's own ticket is named by both (in a ticket or commit field, or in the check or note), compared
+    as whole ticket ids. An explicit ticket field that names a different ticket (from the other record, or from the
+    row's own ticket) is a conflict and never binds."""
+    ticket = (row.get("ticket") or "").lower()
+    explicit = [_text(rec.get("ticket"), 80).lower() for rec in (deploy, test)]
+    named = [e for e in explicit if e]
+    if len(set(named)) > 1 or (ticket and any(e != ticket for e in named)):
+        return None
     for key in ("commit", "ticket"):
         a, b = _text(deploy.get(key), 80), _text(test.get(key), 80)
         if a and a == b:
             return f"{key}:{a}"
-    ticket = row.get("ticket") or ""
     if ticket:
         for rec in (deploy, test):
             blob = " ".join(_text(rec.get(k), 400) for k in ("ticket", "commit", "check", "note"))
-            if ticket.lower() not in blob.lower():
+            if ticket not in _tickets_in(blob):
                 return None
-        return f"ticket:{ticket}"
+        return f"ticket:{row.get('ticket')}"
     return None
 
 

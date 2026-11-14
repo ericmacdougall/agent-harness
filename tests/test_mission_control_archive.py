@@ -78,6 +78,21 @@ class Rules(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(one(req(evidence=evidence))["bucket"], "live", name)
 
+    def test_r2_ticket_fallback_matches_whole_ticket_ids_never_a_prefix(self):
+        # review PR 234 F2: goodqa#90 and goodqa#91 both contain "goodqa#9" as text, and neither is goodqa#9
+        dep = {"id": "wd1", "kind": "deploy", "verdict": "PASS", "at": iso(2000), "note": "deployed goodqa#90"}
+        test = {"id": "wt1", "kind": "live_test", "verdict": "PASS", "at": iso(1000), "check": "goodqa#91 smoke"}
+        self.assertEqual(one(req(ticket="goodqa#9", evidence=[dep, test]))["bucket"], "live")
+        same = [dict(dep, note="deployed goodqa#9."), dict(test, check="GoodQA#9 smoke")]
+        self.assertEqual(one(req(ticket="goodqa#9", evidence=same))["rule"], "R2")
+
+    def test_r2_a_conflicting_explicit_ticket_never_binds(self):
+        dep = {"id": "wd1", "kind": "deploy", "verdict": "PASS", "at": iso(2000), "ticket": "goodqa#10", "note": "goodqa#9"}
+        test = {"id": "wt1", "kind": "live_test", "verdict": "PASS", "at": iso(1000), "ticket": "goodqa#9"}
+        self.assertEqual(one(req(ticket="goodqa#9", evidence=[dep, test]))["bucket"], "live")
+        both_other = [dict(dep, ticket="goodqa#10"), dict(test, ticket="goodqa#10", note="goodqa#9")]
+        self.assertEqual(one(req(ticket="goodqa#9", evidence=both_other))["bucket"], "live")
+
     def test_r2_takes_the_newest_record_by_time_not_by_position(self):
         dep = {"id": "wd1", "kind": "deploy", "verdict": "PASS", "at": iso(9000), "commit": "abc123"}
         old_pass = {"id": "wt1", "kind": "live_test", "verdict": "PASS", "at": iso(8000), "commit": "abc123"}
