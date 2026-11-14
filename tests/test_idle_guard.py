@@ -440,13 +440,66 @@ class WaitRestoreTests(Base):
         self.assertIn("tick", streams)
 
     def test_the_note_cap_runs_from_the_note_not_from_later_hook_rows(self):  # 24 h from the note's own time
-        jl(self.w / "agent-tick.jsonl", [{"at": iso(NOW - 4 * HOUR + 30), "event": "status",
-                                          "note": "waiting on GoodQA goodqa#15943"},
-                                         {"at": iso(NOW - 3 * HOUR), "event": "pretool", "agent_id": "tick", "tool": "Bash"}])
-        self.stop("tick", NOW - 3 * HOUR + 20)
-        rows, _ = self.look(21 * HOUR)  # 25 h after the note, under 24 h after the last hook row
+        t = NOW - 4 * HOUR + 120  # resumed after the fixture's stop; the note, 20 min of tool rows, then the stop
+        jl(self.w / "agent-tick.jsonl", [{"at": iso(t), "event": "status", "note": "waiting on GoodQA goodqa#15943"},
+                                         {"at": iso(t + 20 * 60), "event": "pretool", "agent_id": "tick", "tool": "Bash"}])
+        self.stop("tick", t + 21 * 60)
+        later = t + 24 * HOUR + 10 * 60 - NOW  # 24 h 10 m after the note, 23 h 49 m after the last row
+        self.assertEqual(self.look(later - HOUR)[0]["tick"]["wait_on"], "GoodQA goodqa#15943")  # inside the cap: holds
+        rows, _ = self.look(later)
         self.assertIsNone(rows["tick"]["wait_on"], rows["tick"])
         self.assertEqual(rows["tick"]["state"], "DROPPED", rows["tick"])
+
+    def transcript(self, agent, at):
+        sub = self.home / ".claude" / "projects" / "p" / SESSION / "subagents"
+        sub.mkdir(parents=True, exist_ok=True)
+        jl(sub / f"agent-{agent}.jsonl", [{}])
+        os.utime(sub / f"agent-{agent}.jsonl", (at, at))
+
+    def test_a_wait_recorded_between_turns_stays_superseded_after_the_next_stop(self):  # d9439acd advisor repro
+        for kind in self.WAITS:
+            with self.subTest(kind=kind):
+                self.setUp()  # tick stopped at the fixture's old+60; main records the wait while it is stopped
+                self.dispose("tick", "waiting", f"tick-between-{kind}", until=iso(NOW + 8 * HOUR), at=iso(NOW - 3 * HOUR),
+                             **self.WAITS[kind])
+                jl(self.w / "agent-tick.jsonl", [{"at": iso(NOW - 2 * HOUR), "event": "pretool", "agent_id": "tick",
+                                                  "tool": "Bash"}])  # resumed: tool rows and transcript only, no notes
+                self.transcript("tick", NOW - 2 * HOUR + 60)
+                self.stop("tick", NOW - 2 * HOUR + 65)
+                for label, later in self.AGES:
+                    rows, streams = self.look(later)
+                    with self.subTest(age=label):
+                        self.assertIsNone(rows["tick"]["disposition"], rows["tick"])
+                        self.assertIsNone(rows["tick"]["wait_on"], rows["tick"])
+                        self.assertTrue(rows["tick"]["decision_required"], rows["tick"])
+                        self.assertIn("tick", streams)
+
+    def running_owner(self, agent):
+        jl(self.w / "main.jsonl", [{"at": iso(NOW - 5 * HOUR), "event": "subagent", "agent_id": agent, "agent_type": "task-owner"}])
+        jl(self.w / f"agent-{agent}.jsonl", [{"at": iso(NOW - 5 * HOUR), "event": "intent", "note": "GoodQA goodqa#15952 work"}])
+        self.dispose(agent, "waiting", f"{agent}-main-wait", until=iso(NOW + 8 * HOUR), at=iso(NOW - 4 * HOUR),
+                     ref="GoodQA goodqa#15643", external="Codex quota resets 2026-11-16")
+
+    def test_a_never_stopped_owner_working_well_past_a_wait_has_moved_on(self):
+        self.running_owner("runr")
+        jl(self.w / "agent-runr.jsonl", [{"at": iso(NOW - 4 * HOUR + 40 * 60), "event": "pretool", "agent_id": "runr",
+                                          "tool": "Bash"}])  # 40 min of tool work after the wait, no notes
+        for label, later in self.AGES:
+            rows, streams = self.look(later)
+            with self.subTest(age=label):
+                self.assertIsNone(rows["runr"]["disposition"], rows["runr"])
+                self.assertIsNone(rows["runr"]["wait_on"], rows["runr"])
+                if label == "7h":
+                    self.assertIn("silent-undisposed", rows["runr"]["attention"], rows["runr"])
+                    self.assertIn("runr", streams)
+
+    def test_a_never_stopped_owner_idle_under_a_wait_keeps_it(self):  # control
+        self.running_owner("runr")
+        for label, later in self.AGES:
+            rows, streams = self.look(later)
+            with self.subTest(age=label):
+                self.assertTrue(rows["runr"]["disposition"]["live"], rows["runr"])
+                self.assertNotIn("runr", streams)
 
     # ---- controls: these hold at 79ebb269 too, except where noted, and must keep holding
 
@@ -516,7 +569,7 @@ class WaitRestoreTests(Base):
         ah.summarize_agent_wal(wal, index)
         for cache in index.glob("wal-*.json"):
             doc = json.loads(cache.read_text())
-            for k in ("note_at", "work_at"):
+            for k in ("note_at", "work_at", "bursts"):
                 doc.pop(k, None)
             cache.write_text(json.dumps(doc))
         summary = ah.summarize_agent_wal(wal, index)

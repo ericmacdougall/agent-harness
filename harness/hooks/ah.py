@@ -210,12 +210,13 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
         raise AhError("schema_newer", "index written by a newer ah; update this install", 4)
     summary["schema"] = SCHEMA
     meta = summary.setdefault("meta", {})
-    if "outcome_at" not in summary or "work_at" not in summary:
+    stale_index = any(k not in summary for k in ("outcome_at", "note_at", "work_at", "bursts"))
+    if stale_index:
         meta.clear()  # an index written before outcome_at / note_at existed: rescan from the start (goodqa#15943 r5, #15949)
     lines, rebuilt = read_new_lines(path, meta)
-    if rebuilt or "first" not in summary or "outcome_at" not in summary or "work_at" not in summary:
+    if rebuilt or "first" not in summary or stale_index:
         summary.update(first=None, last_at=0.0, outcome=None, outcome_at=0.0, last_note="", note_at=0.0, work_at=0.0,
-                       tickets=[], events=0)
+                       bursts=[], tickets=[], events=0)
     for _off, raw in lines:
         try:
             rec = json.loads(raw)
@@ -229,6 +230,8 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
             summary["last_at"] = max(summary["last_at"], at)
             if event and event not in liveness.HOOK_EVENTS:
                 summary["work_at"] = max(summary["work_at"], at)  # the owner's own words: what supersedes a wait (#15949)
+            if event not in ("subagent", "subagent_stop", "pending_stop"):
+                liveness.add_burst(summary["bursts"], at)  # its own activity: was it between turns at a wait (#15949)
         summary["events"] += 1
         if event == "intent":
             summary["outcome"], summary["outcome_at"] = None, 0.0  # new work after an earlier result/handoff: not finished
@@ -354,7 +357,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         path = wal / f"agent-{agent}.jsonl"
         summary = summarize_agent_wal(path, index_dir) if path.is_file() else {
             "first": None, "last_at": 0.0, "outcome": None, "outcome_at": 0.0, "last_note": "", "note_at": 0.0,
-            "work_at": 0.0, "tickets": []}
+            "work_at": 0.0, "bursts": [], "tickets": []}
         last_wal = max(summary["last_at"], 0.0) or info["at"]
         tmtime = transcript_mtime(home, session, agent, sub_dirs)
         if info.get("finished") and agent not in stopped:  # transcript meta says it ended; hook never saw the stop
@@ -366,7 +369,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         is_owner = agent in registered or info["type"] in liveness.OWNER_TYPES or by_name
         grace = 0.0 if pending.get(agent, 0.0) >= max(last_wal, tmtime) - 10 else None  # I7: no finishing grace (10 s, as is_stopped)
         activity[agent] = {"work_at": summary.get("work_at") or 0.0, "active_at": max(last_wal, tmtime),
-                           "stops": stops.get(agent, [])}
+                           "stops": stops.get(agent, []), "bursts": summary.get("bursts") or []}
         verdict = liveness.classify(now, last_wal, tmtime, is_stopped,
                                     summary["outcome"], summary["last_note"], info["type"],
                                     agent in registered, owner=is_owner, finish_grace=grace,

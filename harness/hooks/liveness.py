@@ -134,6 +134,32 @@ WAIT_SUPERSEDE_S = 60  # owner work this long after a wait means the owner moved
 STOP_SLACK_S = 10  # as ah's is_stopped: writes this close to a stop row belong to the turn that stopped
 
 
+BURST_GAP_S = 300  # own WAL rows this close together form one burst of activity (summarize_agent_wal's `bursts`)
+BURSTS_KEPT = 128  # bursts an index keeps; enough to tell whether an owner was between turns at a recent wait
+
+
+def add_burst(bursts: list, at: float) -> None:
+    """Fold one own WAL row time into `bursts` ([start, end] pairs, oldest first, at most BURSTS_KEPT)."""
+    if not at:
+        return
+    if bursts and at <= bursts[-1][1] + BURST_GAP_S:
+        bursts[-1][0], bursts[-1][1] = min(bursts[-1][0], at), max(bursts[-1][1], at)
+    else:
+        bursts.append([at, at])
+        del bursts[:-BURSTS_KEPT]
+
+
+def between_turns(wait_at: float, stops, bursts) -> bool:
+    """Was the owner stopped when the wait was recorded? It had a stop at or before `wait_at` and no own WAL row after
+    that stop up to `wait_at`. Only rows at or before the wait decide it, so the answer never changes later.
+    A resume seen only in the transcript (no WAL row) before the wait is not visible here: it reads as stopped."""
+    before = [float(s) for s in (stops or ()) if s and float(s) <= wait_at]
+    if not before:
+        return False
+    last = max(before)
+    return not any(float(e) > last + STOP_SLACK_S and float(b) <= wait_at for b, e in (bursts or ()))
+
+
 def wait_current(wait_at: float, activity: dict | None = None) -> bool:
     """The one rule for whether a wait (a waiting disposition or a `waiting on <x>` WAL note) still holds (goodqa#15949,
     receipts r2 and r3 F1): only while no qualifying activity has come after it. Every reader of a wait asks this.
@@ -144,28 +170,33 @@ def wait_current(wait_at: float, activity: dict | None = None) -> bool:
       replaced_at  the time of a newer wait or disposition for the same owner: the newest wait wins
       active_at    the owner's latest activity of any kind (WAL row or transcript write)
       stops        the owner's recorded stop times
+      bursts       the owner's own WAL activity as [start, end] pairs (add_burst)
 
     Qualifying activity is (a) a work note more than WAIT_SUPERSEDE_S after the wait, (b) a newer wait or disposition,
-    or (c) any activity more than STOP_SLACK_S after the stop boundary: the first stop at or after the wait (the
-    turn that recorded the wait ended there, so its closing tool rows, stop row and last transcript write are not new
-    work), or, when no stop follows the wait, the owner's last stop before it (it was between turns and has since been
-    resumed). An owner that never stopped is judged by its notes alone. Every input only grows with time, so a
-    superseded wait stays superseded, with one bounded exception: an owner resumed before it recorded the wait counts
-    its tool and transcript writes under (c) only until the turn that recorded the wait stops; that stop makes them
-    the wait's own closing tail, as for any owner that records a wait and then ends its turn."""
+    or (c) any activity after a threshold fixed by how the wait was recorded:
+      - recorded while the owner was stopped (between_turns): anything more than WAIT_SUPERSEDE_S after the wait is
+        a resume;
+      - recorded while the owner was in a turn (every WAL-note wait, an owner's own disposition, main's wait on a
+        running owner): the turn's closing tail (tool rows, the stop row, the last transcript write) is not new work,
+        so the threshold is the earlier of the first stop after the wait (+ STOP_SLACK_S) and FINISH_GRACE_S after the
+        wait. An owner still working half an hour after its wait, with no new note, has moved on from it.
+    between_turns depends only on rows at or before the wait, and the first stop after the wait never moves once
+    recorded, so the threshold can only fall and the inputs only grow: once superseded, a wait stays superseded."""
     act = activity or {}
     wait_at = float(wait_at or 0.0)
     if float(act.get("replaced_at") or 0.0) > wait_at:
         return False
     if float(act.get("work_at") or 0.0) > wait_at + WAIT_SUPERSEDE_S:
         return False
-    stops = sorted(float(s) for s in (act.get("stops") or ()) if s)
-    after = [s for s in stops if s >= wait_at - STOP_SLACK_S]
-    before = [s for s in stops if s < wait_at - STOP_SLACK_S]
-    boundary = after[0] if after else (before[-1] if before else None)
-    if boundary is not None and float(act.get("active_at") or 0.0) > max(boundary + STOP_SLACK_S, wait_at + WAIT_SUPERSEDE_S):
-        return False
-    return True
+    stops = act.get("stops") or ()
+    if between_turns(wait_at, stops, act.get("bursts")):
+        threshold = wait_at
+    else:
+        after = [float(s) for s in stops if s and float(s) > wait_at]
+        threshold = wait_at + FINISH_GRACE_S
+        if after:
+            threshold = min(threshold, min(after) + STOP_SLACK_S)
+    return float(act.get("active_at") or 0.0) <= max(threshold, wait_at + WAIT_SUPERSEDE_S)
 
 
 def note_wait(note: str, note_at: float, now: float, activity: dict | None = None):
