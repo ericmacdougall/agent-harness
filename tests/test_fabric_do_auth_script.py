@@ -87,30 +87,48 @@ class RemoteTests(Base):
         victim = self.root / 'victim'
         victim.write_text('keep\n')
         self.conf.symlink_to(victim)
-        self.assertNotEqual(self.run_remote('printf %s ' + TOKEN), 0)
+        self.assertEqual(self.run_remote('printf %s ' + TOKEN), 4)
         self.assertTrue(self.conf.is_symlink())
         self.assertEqual(victim.read_text(), 'keep\n')
         self.assertEqual(self.leftovers(), [])
 
     def test_failure_without_output_keeps_the_previous_config(self):
         self.old_config()
-        self.assertNotEqual(self.run_remote('exit 1'), 0)
+        self.assertEqual(self.run_remote('exit 1'), 6)
         self.assertEqual(self.conf.read_text(), OLD)
         self.assertEqual(self.leftovers(), [])
 
     def test_failure_after_partial_output_keeps_the_previous_config(self):
         self.old_config()
-        self.assertNotEqual(self.run_remote('printf %s ' + TOKEN + '; exit 1'), 0)
+        self.assertEqual(self.run_remote('printf %s ' + TOKEN + '; exit 1'), 6)
         self.assertEqual(self.conf.read_text(), OLD)
         self.assertEqual(self.leftovers(), [])
 
-    def test_malformed_values_are_refused(self):
-        for out in ('printf %s short', "printf '%s\\n%s' " + TOKEN + ' ' + TOKEN, "printf '%s' 'dop_v1_ab cd" + 'e' * 40 + "'"):
+    def test_malformed_values_are_refused_with_their_class(self):
+        rows = (('printf %s short', 7), ("printf '%s' " + 'a' * 513, 7),
+                ("printf '%s\\n%s' " + TOKEN + ' ' + TOKEN, 9),
+                ("printf '%s' 'dop_v1_ab cd" + 'e' * 40 + "'", 8), ("printf '%s' 'dop_v1_" + 'e' * 40 + "$x'", 8),
+                ('true', 5), ("printf '\\n \\r\\n'", 5))
+        for out, code in rows:
             with self.subTest(out=out):
                 self.old_config()
-                self.assertNotEqual(self.run_remote(out), 0)
+                self.assertEqual(self.run_remote(out), code)
                 self.assertEqual(self.conf.read_text(), OLD)
                 self.assertEqual(self.leftovers(), [])
+
+    def test_trailing_whitespace_and_blank_lines_are_ignored(self):
+        for out in ("printf '%s\\r\\n' " + TOKEN, "printf '%s  \\n\\n\\n' " + TOKEN, "printf '%s\\t' " + TOKEN):
+            with self.subTest(out=out):
+                self.old_config()
+                self.assertEqual(self.run_remote(out), 0)
+                self.assertEqual(self.conf.read_text(), 'access-token: ' + TOKEN + '\n')
+                self.assertEqual(stat.S_IMODE(self.conf.stat().st_mode), 0o600)
+
+    def test_the_exit_status_never_carries_the_value(self):
+        # Only the documented class codes can come back; a value byte cannot become the status.
+        for out in ('printf %s ' + TOKEN, 'printf %s short', 'exit 1', 'true'):
+            with self.subTest(out=out):
+                self.assertIn(self.run_remote(out), (0, 5, 6, 7, 8, 9))
 
 
 class LocalTests(Base):
