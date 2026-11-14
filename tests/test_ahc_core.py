@@ -393,7 +393,7 @@ class P0SurfaceTests(unittest.TestCase):
         actions = [a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction"]
         self.assertEqual(len(actions), 1)
         commands = set(actions[0].choices)
-        self.assertEqual(commands, {"submit", "ack", "status", "run"})
+        self.assertEqual(commands, {"submit", "ack", "status", "run", "install", "uninstall"})
         for word in ("enable", "authority", "merge"):
             self.assertNotIn(word, commands)
         with self.assertRaises(SystemExit):

@@ -2,6 +2,7 @@
 and digest, with a journal that makes every step idempotent and restart-safe. All children are fakes; no network.
 GoodQA goodqa#16034 AC-6, AC-7, AC-9; NEG-9 (Gate 1 part), NEG-12, NEG-15, NEG-16."""
 import hashlib
+import os
 import json
 import sys
 import tempfile
@@ -1590,6 +1591,147 @@ class _OpsRunner:
             if tuple(argv[:len(prefix)]) == prefix:
                 return fn(argv, timeout, stdin)
         return (127, "")
+
+
+class FakeHost:
+    """systemctl and loginctl on a fake Linux host: records argv, keeps linger and unit state."""
+
+    def __init__(self, linger="no", fail=()):
+        self.linger, self.fail, self.calls, self.active = linger, set(fail), [], set()
+
+    def __call__(self, argv, timeout=60):
+        self.calls.append(list(argv))
+        verb = " ".join(argv[:3])
+        if verb in self.fail or argv[0] in self.fail:
+            return 1, ""
+        if argv[:2] == ["loginctl", "show-user"]:
+            return 0, self.linger + "\n"
+        if argv[:2] == ["loginctl", "enable-linger"]:
+            self.linger = "yes"
+        if argv[:2] == ["loginctl", "disable-linger"]:
+            self.linger = "no"
+        if argv[:3] == ["systemctl", "--user", "enable"]:
+            self.active |= {a.split(".")[0] for a in argv if a.endswith(".service")}
+        if argv[:3] == ["systemctl", "--user", "disable"]:
+            self.active -= {a.split(".")[0] for a in argv if a.endswith(".service")}
+        if argv[:3] == ["systemctl", "--user", "is-active"]:
+            unit = argv[3].split(".")[0]
+            return (0, "active\n") if unit in self.active else (3, "inactive\n")
+        return 0, ""
+
+
+class _HostBase(Base):
+    def setUp(self):
+        super().setUp()
+        import ahc_install
+        self.inst = ahc_install
+        self.out = []
+
+    def install(self, host, apply=True, system="Linux"):
+        return self.inst.install(self.paths, self.home, apply, run=host, system=system, out=self.out.append)
+
+    def uninstall(self, host, apply=True, system="Linux"):
+        return self.inst.uninstall(self.paths, self.home, apply, run=host, system=system, out=self.out.append)
+
+    def unit(self, name):
+        return self.home / ".config" / "systemd" / "user" / ("%s.service" % name)
+
+
+class InstallTests(_HostBase):
+    """AC-11 / AC-29: `ahc install --apply` writes and starts both user units with lingering on; dry run changes
+    nothing; a non-systemd host is refused."""
+
+    def test_apply_writes_units_enables_linger_and_starts_both(self):
+        host = FakeHost(linger="no")
+        self.assertEqual(self.install(host), 0)
+        for name in ("ahc-core", "ahc-review"):
+            text = self.unit(name).read_text()
+            self.assertIn("ahc_runner.py run --role %s" % name.split("-")[1], text)
+            self.assertIn("Restart=always", text)
+            self.assertIn("RestartPreventExitStatus=3 75", text, "a schema refusal or lockout must not loop")
+            self.assertIn("MemoryMax=", text)
+            self.assertIn("WantedBy=default.target", text)
+        self.assertIn(["loginctl", "enable-linger", self.inst._user()], host.calls)
+        self.assertIn(["systemctl", "--user", "enable", "--now", "ahc-core.service", "ahc-review.service"], host.calls)
+        self.assertEqual(host.active, {"ahc-core", "ahc-review"})
+        self.assertEqual(json.loads((self.paths.root / "config.json").read_text())["ops_ticket"], "GoodQA goodqa#16034")
+        wrapper = self.home / ".local" / "bin" / "ahc"
+        self.assertTrue(os.access(str(wrapper), os.X_OK))
+        self.assertIn("ahc_runner.py", wrapper.read_text())
+
+    def test_dry_run_changes_nothing(self):
+        host = FakeHost()
+        self.assertEqual(self.install(host, apply=False), 0)
+        self.assertFalse(self.unit("ahc-core").exists())
+        self.assertFalse([c for c in host.calls if c[:2] != ["loginctl", "show-user"]], "a dry run runs nothing")
+        self.assertTrue(any(line.startswith("would run systemctl") for line in self.out))
+
+    def test_non_systemd_host_is_refused(self):
+        host = FakeHost()
+        self.assertEqual(self.install(host, system="Darwin"), 2)
+        self.assertEqual(host.calls, [])
+        self.assertFalse(self.unit("ahc-core").exists())
+
+    def test_existing_config_keeps_its_ops_ticket_and_keys(self):
+        self.paths.ensure()
+        (self.paths.root / "config.json").write_text(json.dumps({"ops_ticket": "GoodQA x#1", "repos": ["a/b"]}))
+        self.install(FakeHost())
+        self.assertEqual(json.loads((self.paths.root / "config.json").read_text()),
+                         {"ops_ticket": "GoodQA x#1", "repos": ["a/b"]})
+
+    def test_a_failed_systemctl_is_a_nonzero_exit(self):
+        self.assertEqual(self.install(FakeHost(fail={"systemctl --user enable"})), 1)
+
+
+class UninstallTests(_HostBase):
+    """spec P0 uninstall: stop and disable both units, remove the unit files, put lingering back as the install
+    found it, and keep the ledger, clones and inbox with their paths printed."""
+
+    def test_uninstall_restores_linger_off_and_keeps_data(self):
+        host = FakeHost(linger="no")
+        self.install(host)
+        runner.Ledger(self.paths).close()
+        (self.paths.inbox / "agent-x").mkdir(parents=True, exist_ok=True)
+        self.out.clear()
+        self.assertEqual(self.uninstall(host), 0)
+        self.assertIn(["systemctl", "--user", "disable", "--now", "ahc-core.service", "ahc-review.service"],
+                      host.calls)
+        self.assertFalse(self.unit("ahc-core").exists() or self.unit("ahc-review").exists())
+        self.assertEqual(host.linger, "no", "lingering was off before ahc, so it is off again")
+        self.assertEqual(host.active, set())
+        self.assertTrue((self.paths.root / "ledger.sqlite3").exists(), "the ledger is kept")
+        self.assertTrue((self.paths.inbox / "agent-x").exists(), "the inbox is kept")
+        printed = "\n".join(self.out)
+        for path in (self.paths.root / "ledger.sqlite3", self.paths.clones, self.paths.inbox):
+            self.assertIn(str(path), printed)
+        self.assertFalse((self.home / ".local" / "bin" / "ahc").exists())
+
+    def test_uninstall_leaves_linger_on_when_it_was_on(self):
+        host = FakeHost(linger="yes")
+        self.install(host)
+        self.uninstall(host)
+        self.assertEqual(host.linger, "yes")
+        self.assertFalse([c for c in host.calls if c[:2] == ["loginctl", "disable-linger"]])
+
+    def test_reinstall_never_overwrites_the_first_linger_record(self):
+        host = FakeHost(linger="no")
+        self.install(host)            # lingering turned on here
+        self.install(host)            # a re-install sees it on; the record must still say "off before ahc"
+        self.uninstall(host)
+        self.assertEqual(host.linger, "no")
+
+    def test_no_record_leaves_linger_alone(self):
+        host = FakeHost(linger="yes")
+        self.uninstall(host)
+        self.assertEqual(host.linger, "yes")
+        self.assertTrue(any("no record" in line for line in self.out))
+
+    def test_foreign_ahc_on_path_is_not_removed(self):
+        wrapper = self.home / ".local" / "bin" / "ahc"
+        wrapper.parent.mkdir(parents=True)
+        wrapper.write_text("#!/bin/sh\necho someone else's ahc\n")
+        self.uninstall(FakeHost())
+        self.assertTrue(wrapper.exists(), "uninstall removes only the wrapper it wrote")
 
 
 class SchemaTests(Base):

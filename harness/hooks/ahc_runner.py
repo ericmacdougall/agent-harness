@@ -1780,7 +1780,11 @@ def build_parser():
     a.add_argument("--owner", required=True)
     a.add_argument("--disposition", help="reason text: stop D20 escalation for this item (owner or verified main, "
                                          "per the state's rule)")
-    sub.add_parser("status", help="item states and pending effects")
+    sub.add_parser("status", help="item states, pending effects, the email route and the units")
+    for name, text in (("install", "write and start the systemd user units ahc-core and ahc-review (t2-dev)"),
+                       ("uninstall", "stop and remove the units; keep the ledger, clones and inbox")):
+        p = sub.add_parser(name, help=text)
+        p.add_argument("--apply", action="store_true", help="make the changes (default: print what would change)")
     r = sub.add_parser("run", help="run ticks (the daemon loop; one systemd user unit per role)")
     r.add_argument("--role", choices=ROLES, default="all")
     r.add_argument("--once", action="store_true")
@@ -1826,7 +1830,14 @@ def main(argv=None):
             print("refused: %s" % error, file=sys.stderr)
             return 2
         return 0
+    if args.cmd in ("install", "uninstall"):
+        import ahc_install  # noqa: PLC0415
+        action = ahc_install.install if args.cmd == "install" else ahc_install.uninstall
+        return action(paths, paths.home, args.apply)
     if args.cmd == "status":
+        import ahc_install  # noqa: PLC0415
+        for unit, state in ahc_install.unit_states().items():
+            print("unit %s: %s" % (unit, state))
         ledger = Ledger(paths, migrate=False)
         try:
             for row in ledger.db.execute("SELECT id, state, next_action_at, request FROM items ORDER BY submitted"):

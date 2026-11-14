@@ -46,7 +46,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "gq_browser.py",  # GoodQA worker browser CLI and stdio MCP server; main registers the MCP (goodqa#15745)
          "idle_guard.py",  # main-idle detector, Stop block and rejected-question reminder (goodqa#15943)
          "shellwords.py",  # quote-aware command splitting shared by mission_gate and dropped_gate (goodqa#15684)
-         "ahc_core.py", "ahc_packet.py", "ahc_clone.py", "ahc_runner.py")  # ahc coordinator daemon (goodqa#16034)
+         "ahc_core.py", "ahc_packet.py", "ahc_clone.py", "ahc_runner.py", "ahc_install.py")  # ahc coordinator daemon (goodqa#16034)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
