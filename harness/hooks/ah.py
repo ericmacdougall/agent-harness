@@ -203,7 +203,7 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
     cache = index_dir / ("wal-" + hashlib.sha256(str(path).encode()).hexdigest()[:16] + ".json")
     try:
         summary = json.loads(_bounded(cache))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         summary = {}
     before = json.dumps(summary, sort_keys=True)  # goodqa#15963: rewrite the index only when it changed
     if summary.get("schema", 1) > SCHEMA:
@@ -218,7 +218,7 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
     for _off, raw in lines:
         try:
             rec = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if not isinstance(rec, dict):
             continue
@@ -319,7 +319,7 @@ def _owners_cache_path(index_dir: Path, session: str) -> Path:
 def _load_owners_cache(path: Path) -> dict:
     try:
         data = json.loads(_bounded(path))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):   # review B-5: a nested cache file is rebuilt, never fatal
         data = None
     if not isinstance(data, dict) or data.get("schema") != OWNERS_CACHE_SCHEMA \
             or data.get("format") != [SCHEMA, SUMMARY_FORMAT]:

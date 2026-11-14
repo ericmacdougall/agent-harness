@@ -173,6 +173,18 @@ class Counts(Base):
         cache.write_text(json.dumps({"schema": 1, "wal": {k: {"fp": [0, 0, 0], "s": {"bogus": 1}}
                                                            for k in ("a", "b")}, "meta": []}))
         self.assertEqual(strip(ah.owners(self.home, SESSION, now=NOW)), good)
+        cache.write_text("[" * 20000 + "]" * 20000)   # review B-5: RecursionError is not a ValueError
+        self.assertEqual(strip(ah.owners(self.home, SESSION, now=NOW)), good)
+
+    def test_a_deeply_nested_wal_line_is_skipped(self):  # review B-5 (the same parser, per WAL line)
+        good = strip(ah.owners(self.home, SESSION, now=NOW))
+        aid = "a" + f"{3:016x}"
+        path = self.home / ".claude" / "wals" / SESSION / f"agent-{aid}.jsonl"
+        jl(path, ["[" * 20000 + "]" * 20000])
+        os.utime(path, (NOW - 200, NOW - 200))
+        row = {r["agent_id"]: r for r in ah.owners(self.home, SESSION, now=NOW)["owners"]}[aid]
+        want = {r["agent_id"]: r for r in good["owners"]}[aid]
+        self.assertEqual(row["state"], want["state"])
 
     def test_stale_tmp_files_are_cleaned_only_when_old_and_orphaned(self):  # M1
         index = ah.state_dir(self.home, "ah-index")
