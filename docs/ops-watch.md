@@ -117,6 +117,8 @@ Each run makes one read-only call: `ssh -o BatchMode=yes -o ConnectTimeout=5 -- 
 - `disk:allocunknown:` (warning) the volume inventory is incomplete: `pvesm list` or the file listing failed, timed out or was cut (each command reports its own exit status, `##RC`), a header or row is malformed, a guest volume has an unreadable or zero size (a size-less subvol), or an image file is missing from `pvesm list`. Overcommit is then shown as unknown and never as a low figure. Pool capacity alerts keep working.
 - `disk:unknown:` UNKNOWN: the host cannot be reached or the output is unusable (missing marker, inactive storage, non-numeric or inconsistent numbers). Warning at first, high after 30 min without a good read. The last good alerts stay active meanwhile, so an outage is never green. Alert text never carries remote output or addresses, only the configured host name.
 
+The ssh output is read with a 1 MiB cap on stdout and on stderr; a probe that prints more is stopped and reads as `disk:unknown` (output over the size limit). To roll back, set `proxmox_pools` to `[]`: the next run makes no ssh call and clears the pool alerts (that clear means the check is off, not that the pool is fine). The stored samples stay in the ops-watch state; on re-enable they are reused and samples older than 48 h are dropped, so a stale sample cannot raise a growth alert.
+
 Tests: `python3 -m unittest tests.test_ops_watch_proxmox`.
 
 Tests: `python3 -m unittest tests.test_ops_watch`.

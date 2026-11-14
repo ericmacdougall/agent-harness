@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -40,24 +41,44 @@ VOLS = {
     15662: [("vm-15662-disk-0.qcow2", 40)],
 }  # guest volumes on local, GiB: 1536 in all
 # non-guest content on the same storage never counts as provisioned, even a backup that names a VM
-OTHER_ROWS = ("local:iso/noble-server-cloudimg-amd64.img             iso     iso          625256960\n"
-              "local:snippets/dev-user.yaml                          snippet snippets           635\n"
-              "local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst tzst    vztmpl       123731847\n"
-              "local:backup/vzdump-qemu-103-2026_11_01-00_00_00.vma.zst vma.zst backup 999999999999 103\n")
-VOLS_HEADER = "Volid                                                 Format  Type              Size VMID\n"
+OTHER = [("local:iso/noble-server-cloudimg-amd64.img", "iso", "iso", 625256960, None),
+         ("local:snippets/dev-user.yaml", "snippet", "snippets", 635, None),
+         ("local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst", "tzst", "vztmpl", 123731847, None),
+         ("local:backup/vzdump-qemu-103-2026_11_01-00_00_00.vma.zst", "vma.zst", "backup", 999999999999, 103)]
 DU = {100: 653, 102: 15, 103: 28, 105: 8, 106: 9, 108: 57, 109: 5, 15662: 13}
 
 
-def vol_row(vm, name, size, kind="images"):
-    """One `pvesm list` row as recorded live (PVE 9.2): Size in bytes, VMID last. size may be a raw string."""
-    fmt = name.rsplit(".", 1)[-1]
-    size = int(size * GIB) if isinstance(size, (int, float)) else size
-    return f"local:{vm}/{name:<45} {fmt:<7} {kind:<12} {size:>14} {vm}\n"
+def pvesm_list(rows):
+    """`pvesm list STORAGE` text exactly as libpve-storage-perl 9.1.10 prints it: $print_content in
+    /usr/share/perl5/PVE/CLI/pvesm.pm (lines 197-241 on t2-proxmox, read 2026-11-13). rows are
+    (volid, format, content, size, vmid); PVE::Storage::volume_list hands them over sorted by lowercase volid; rows
+    with a VMID print first in that order, the rest after, sorted by format; an undefined size prints "-". A str
+    size is passed through untouched (a deliberately garbled fixture). The renderer was checked byte for byte
+    against the live `pvesm list local` output (see the PR packet)."""
+    rows = sorted(rows, key=lambda r: r[0].lower())
+    name_w = max([len(r[0]) for r in rows], default=0)
+    size_w = len(str(max([r[3] for r in rows if isinstance(r[3], int)] + [0])))
+
+    def line(r):
+        size = "-" if r[3] is None else str(r[3])
+        return f"{r[0]:<{name_w}} {r[1]:<7} {r[2]:<9} {size:>{size_w}}"
+    out = f"{'Volid':<{name_w}} {'Format':<7} {'Type':<9} {'Size':>{size_w}} VMID\n"
+    out += "".join(f"{line(r)} {r[4]}\n" for r in rows if r[4])
+    return out + "".join(f"{line(r)}\n" for r in sorted((r for r in rows if not r[4]), key=lambda r: r[1]))
 
 
-def vols_text(vols=None, rows=""):
+def guest_rows(vols=None, content="images"):
+    """Rows for VM disks as Plugin.pm list_images reports them on a dir storage: volid STORAGE:<vmid>/<name>,
+    format from the extension, size in bytes (GiB in the fixture), VMID the owner directory."""
     vols = VOLS if vols is None else vols
-    return VOLS_HEADER + "".join(vol_row(vm, n, g) for vm, disks in vols.items() for n, g in disks) + OTHER_ROWS + rows
+    return [(f"local:{vm}/{n}", n.rsplit(".", 1)[-1], content, int(g * GIB) if isinstance(g, (int, float)) else g, vm)
+            for vm, disks in vols.items() for n, g in disks]
+
+
+def vols_text(vols=None, rows="", extra=()):
+    """The listing for `vols` plus the non-guest content and any `extra` rows, then raw `rows` text appended (for
+    malformed lines that print_content never produces)."""
+    return pvesm_list(guest_rows(vols) + OTHER + list(extra)) + rows
 
 
 def files_text(vols=None, extra=()):
@@ -87,8 +108,9 @@ class Runner:
     def __init__(self, result):
         self.result, self.calls = result, []
 
-    def __call__(self, argv, timeout, stdin=None, env=None, cwd=None):
+    def __call__(self, argv, timeout, stdin=None, env=None, cwd=None, **kw):
         self.calls.append((list(argv), timeout))
+        self.kw = kw
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
@@ -143,7 +165,7 @@ class ThresholdTests(Base):
         self.assertNotIn(KEY, self.pool(total_g=100, used_g=70, avail_g=30))
 
     def test_provisioned_counts_only_guest_volumes_not_iso_template_or_backup(self):
-        self.assertEqual(self.pool()[KEY]["detail"]["provisioned_gib"], 1536.0)  # OTHER_ROWS hold a 931G backup
+        self.assertEqual(self.pool()[KEY]["detail"]["provisioned_gib"], 1536.0)  # OTHER holds a 931G backup
 
 
 class UnknownTests(Base):
@@ -360,7 +382,7 @@ class VolumeListFormatTests(Base):
                 self.assertEqual(self.unknown_vms(got), ["102", "103"])
 
     def test_non_numeric_or_zero_size_flags_that_vm_only(self):
-        for size in ("garbage", "0", "-5", "1.5e3"):
+        for size in ("garbage", "0", "-5", "1.5e3", "-", "~1073741824"):  # "-" and "~N": print_content forms
             with self.subTest(size=size):
                 got = self.got(vols={**VOLS, 105: [("vm-105-disk-0.raw", size)]})
                 self.assertIn(self.ALLOC, got)
@@ -386,8 +408,8 @@ class CompletionStatusTests(Base):
 
     def cut(self, upto):
         """The listing as printed before a timeout: header and the rows before `upto`, no non-guest rows."""
-        rows = [vol_row(vm, n, g) for vm, disks in VOLS.items() for n, g in disks]
-        return VOLS_HEADER + "".join(rows[:upto])
+        lines = pvesm_list(guest_rows()).splitlines(keepends=True)
+        return "".join(lines[:upto + 1])  # header plus the first `upto` rows
 
     def test_listing_that_fails_after_a_valid_prefix_is_unknown_not_partial(self):
         got = self.got(probe(PVESM_LOW, vols_out=self.cut(2), vols_rc=124))  # 100 and 102 printed, 103 cut off
@@ -459,15 +481,41 @@ class AllVolumesTests(Base):
         got = self.run_check((0, probe(**kw)))[0]
         return got, got[KEY]["detail"]
 
-    def test_container_rootdir_volume_counts(self):
-        # ASSUMPTION: rootdir row layout as for images (the live pool has no container today); a raw CT rootfs on a
-        # dir storage lives under images/<ctid>/ like a VM disk
-        rows = vol_row(120, "vm-120-disk-0.raw", 300, kind="rootdir")
-        got, d = self.detail(vols_out=vols_text(rows=rows), files_out=files_text(extra=["/var/lib/vz/images/120/vm-120-disk-0.raw"]))
+    # Container fixtures come from the plugin source on t2-proxmox (libpve-storage-perl 9.1.10, pve-container
+    # 6.1.14), not from a live container (none exists and none is created): PVE::LXC allocates a dir-storage rootfs
+    # as raw "vm-<ct>-disk-N.raw" when it has a size, or as a size-less "subvol-<ct>-disk-N.subvol" directory
+    # (Plugin.pm alloc_image refuses a subvol with a size there); list_images sizes a directory as 0; list_volumes
+    # marks a volume "rootdir" when its owner is an LXC guest, and drops it when the storage's enabled content
+    # types (volume_list) leave rootdir out.
+    def test_raw_container_volume_counts(self):
+        ct = ("local:120/vm-120-disk-0.raw", "raw", "rootdir", 300 * GIB, 120)
+        got, d = self.detail(vols_out=vols_text(extra=[ct]),
+                             files_out=files_text(extra=["/var/lib/vz/images/120/vm-120-disk-0.raw"]))
         self.assertTrue(d["allocation_complete"])
         self.assertEqual(d["provisioned_gib"], 1836.0)
         self.assertEqual(d["overcommit_ratio"], 2.0)
         self.assertNotIn(self.ALLOC, got)
+
+    def test_container_on_a_storage_without_rootdir_content_is_incomplete(self):
+        # volume_list asks only for enabled content types: the CT row is missing, its file is not
+        got, d = self.detail(files_out=files_text(extra=["/var/lib/vz/images/120/vm-120-disk-0.raw"]))
+        self.assertFalse(d["allocation_complete"])
+        self.assertIn("120", d["unsized_vms"])
+        self.assertIn(self.ALLOC, got)
+
+    def test_orphan_volume_without_a_guest_counts(self):
+        orphan = ("local:130/vm-130-disk-0.raw", "raw", "images", 10 * GIB, 130)  # owner not in the vmlist
+        got, d = self.detail(vols_out=vols_text(extra=[orphan]),
+                             files_out=files_text(extra=["/var/lib/vz/images/130/vm-130-disk-0.raw"]))
+        self.assertTrue(d["allocation_complete"])
+        self.assertEqual(d["provisioned_gib"], 1546.0)
+
+    def test_snapshot_chain_file_pvesm_skips_is_incomplete(self):
+        # restricted layout: list_images skips snap-*.qcow2 (parse_name_dir dies on it), so a host using qcow2
+        # snapshot chains on this storage reads allocation unknown rather than a low total
+        got, d = self.detail(files_out=files_text(extra=["/var/lib/vz/images/103/snap-pre-vm-103-disk-0.qcow2"]))
+        self.assertFalse(d["allocation_complete"])
+        self.assertIn("disk:vmunknown:t2-proxmox:/var/lib/vz:103", got)
 
     def test_detached_unused_disk_counts_toward_its_vm(self):
         vols = {**VOLS, 103: VOLS[103] + [("vm-103-disk-2.raw", 300)]}  # unused0 in the config: listed all the same
@@ -478,8 +526,8 @@ class AllVolumesTests(Base):
         self.assertNotIn("disk:vmunknown:t2-proxmox:/var/lib/vz:103", got)
 
     def test_subvol_container_volume_without_size_is_incomplete(self):
-        rows = vol_row(121, "subvol-121-disk-0.subvol", "0", kind="rootdir")
-        got, d = self.detail(vols_out=vols_text(rows=rows),
+        ct = ("local:121/subvol-121-disk-0.subvol", "subvol", "rootdir", 0, 121)
+        got, d = self.detail(vols_out=vols_text(extra=[ct]),
                              files_out=files_text(extra=["/var/lib/vz/images/121/subvol-121-disk-0.subvol"]))
         self.assertFalse(d["allocation_complete"])
         self.assertIsNone(d["overcommit_ratio"])
@@ -504,15 +552,15 @@ class AllVolumesTests(Base):
                 self.assertIsNone(d["vms"]["102"]["allocated_gib"])
 
     def test_linked_clone_volid_is_tied_to_its_owner(self):
-        row = "local:100/base-100-disk-0.raw/104/vm-104-disk-0.qcow2 qcow2 images 10737418240 104\n"
-        got, d = self.detail(vols_out=vols_text(rows=row),
+        clone = ("local:100/base-100-disk-0.raw/104/vm-104-disk-0.qcow2", "qcow2", "images", 10 * GIB, 104)
+        got, d = self.detail(vols_out=vols_text(extra=[clone]),
                              files_out=files_text(extra=["/var/lib/vz/images/104/vm-104-disk-0.qcow2"]))
         self.assertTrue(d["allocation_complete"])
         self.assertEqual(d["provisioned_gib"], 1546.0)
 
     def test_truncated_listing_with_status_zero_cannot_hide_a_volume(self):
         # pvesm printed only part of its rows yet exited 0: the files it did not list still flag allocation
-        got, d = self.detail(vols_out=VOLS_HEADER + vol_row(102, "vm-102-disk-0.raw", 200))
+        got, d = self.detail(vols_out=pvesm_list(guest_rows({102: VOLS[102]})))
         self.assertFalse(d["allocation_complete"])
         self.assertIn(self.ALLOC, got)
         self.assertIn("disk:vmunknown:t2-proxmox:/var/lib/vz:103", got)
@@ -578,6 +626,62 @@ class DuStatusTests(Base):
         for i in timed:
             self.assertRegex(cmds[i + 1], r'^echo "##RC [A-Z]+( \d+)? \$\?"$', cmds[i])
         self.assertTrue(all(c.startswith(("timeout ", "echo ")) for c in cmds))
+
+
+class BoundedRunTests(unittest.TestCase):
+    """Plan review 1b F3: subprocess.run(capture_output=True) buffered everything before the 1 MiB check, so a
+    runaway producer could grow this process without bound. The default runner now reads both streams
+    incrementally under a byte cap; on overflow it kills and reaps the child and the pool reads UNKNOWN."""
+    CAP = 1 << 20
+
+    def child(self, stream, size):
+        """A child that records its pid, floods `stream` with `size` bytes, then sleeps for 30 s."""
+        pidfile = Path(self.tmp.name) / f"{stream}.pid"
+        code = (f"import os, sys, time; open({str(pidfile)!r}, 'w').write(str(os.getpid())); "
+                f"sys.{stream}.write('x' * {size}); sys.{stream}.flush(); time.sleep(30)")
+        return [sys.executable, "-c", code], pidfile
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def assert_gone(self, pidfile):
+        pid = pidfile.read_text().strip()
+        state = subprocess.run(["ps", "-o", "stat=", "-p", pid], capture_output=True, text=True).stdout.strip()
+        self.assertEqual(state, "", f"child {pid} still present (state {state!r}): not killed or not reaped")
+
+    def test_stdout_overflow_kills_reaps_and_reports_overflow(self):
+        argv, pidfile = self.child("stdout", 3 * self.CAP)
+        start = time.monotonic()
+        self.assertEqual(ow.run(argv, 20, max_bytes=self.CAP), (ow.RUN_OVERFLOW_RC, ""))
+        self.assertLess(time.monotonic() - start, 10)  # did not wait out the 30 s sleep
+        self.assert_gone(pidfile)
+
+    def test_stderr_overflow_is_capped_too(self):
+        argv, pidfile = self.child("stderr", 3 * self.CAP)
+        self.assertEqual(ow.run(argv, 20, max_bytes=self.CAP), (ow.RUN_OVERFLOW_RC, ""))
+        self.assert_gone(pidfile)
+
+    def test_output_under_the_cap_is_returned_and_stderr_discarded(self):
+        code = "import sys; d = sys.stdin.read(); sys.stderr.write('noise'); print(d.upper()); sys.exit(3)"
+        self.assertEqual(ow.run([sys.executable, "-c", code], 20, stdin="abc", max_bytes=self.CAP), (3, "ABC\n"))
+        big = ow.run([sys.executable, "-c", f"print('y' * {self.CAP - 100})"], 20, max_bytes=self.CAP)
+        self.assertEqual((big[0], len(big[1])), (0, self.CAP - 99))
+
+    def test_timeout_still_raises_and_reaps(self):
+        argv, pidfile = self.child("stdout", 10)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            ow.run(argv, 1, max_bytes=self.CAP)
+        self.assert_gone(pidfile)
+
+    def test_pool_probe_is_capped_at_1_mib_and_overflow_is_unknown(self):
+        cfg = ow.load_config(Path(self.tmp.name), host="testhost", overrides={})
+        cfg["proxmox_pools"] = [{"host": "t2-proxmox", "storage": "local", "watch_vms": [102]}]
+        runner = Runner((ow.RUN_OVERFLOW_RC, ""))
+        got = {a["key"]: a for a in ow.check_proxmox_pool(cfg, {}, runner, NOW)}
+        self.assertEqual(runner.kw.get("max_bytes"), 1048576)
+        self.assertIn(UNKNOWN, got)
+        self.assertIn("output over the size limit", got[UNKNOWN]["message"])
 
 
 class RealFormatTests(Base):

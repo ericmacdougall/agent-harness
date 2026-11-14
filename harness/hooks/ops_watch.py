@@ -147,11 +147,77 @@ def now_iso(ts: float | None = None) -> str:
     return datetime.fromtimestamp(time.time() if ts is None else ts, timezone.utc).isoformat()
 
 
-def run(argv, timeout, stdin=None, env=None, cwd=None):
-    """Default runner: (returncode, stdout). Raises subprocess.TimeoutExpired; stderr is discarded."""
-    p = subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=timeout,
-                       env=env, cwd=cwd)
-    return p.returncode, p.stdout
+RUN_MAX_BYTES = 64 * 1024 * 1024  # default per-stream bound for every runner call
+RUN_OVERFLOW_RC = -1000  # sentinel return code: output passed max_bytes; the child was killed and reaped
+
+
+def run(argv, timeout, stdin=None, env=None, cwd=None, max_bytes=RUN_MAX_BYTES):
+    """Default runner: (returncode, stdout). Raises subprocess.TimeoutExpired; stderr is discarded.
+
+    stdout and stderr are read incrementally and each is capped at max_bytes while reading, so a runaway producer
+    cannot grow this process: on overflow the child is killed and reaped and (RUN_OVERFLOW_RC, "") is returned.
+    On timeout the child is killed and reaped before TimeoutExpired is raised."""
+    import locale
+    import selectors
+    enc = locale.getpreferredencoding(False)
+    data = stdin.encode(enc) if stdin is not None else None
+    p = subprocess.Popen(argv, stdin=subprocess.PIPE if data is not None else None, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, env=env, cwd=cwd)
+    deadline = time.monotonic() + timeout
+    out, err, offset, overflow = bytearray(), 0, 0, False
+    sel = selectors.DefaultSelector()
+    try:
+        sel.register(p.stdout, selectors.EVENT_READ, "out")
+        sel.register(p.stderr, selectors.EVENT_READ, "err")
+        if data is not None:
+            if data:
+                sel.register(p.stdin, selectors.EVENT_WRITE, "in")
+            else:
+                p.stdin.close()
+        while sel.get_map() and not overflow:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            for key, _ in sel.select(left):
+                if key.data == "in":
+                    try:
+                        offset += os.write(key.fd, data[offset:offset + 512])
+                    except BrokenPipeError:
+                        offset = len(data)
+                    if offset >= len(data):
+                        sel.unregister(key.fileobj)
+                        key.fileobj.close()
+                    continue
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    sel.unregister(key.fileobj)
+                    continue
+                if key.data == "out":
+                    out += chunk
+                    overflow = len(out) > max_bytes
+                else:
+                    err += len(chunk)  # discarded, but counted against the same cap
+                    overflow = err > max_bytes
+        if overflow:
+            p.kill()
+            p.wait()
+            return RUN_OVERFLOW_RC, ""
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        rc = p.wait(timeout=left)
+    except BaseException:
+        if p.poll() is None:
+            p.kill()
+        p.wait()
+        raise
+    finally:
+        sel.close()
+        for f in (p.stdin, p.stdout, p.stderr):
+            if f is not None and not f.closed:
+                f.close()
+    text = out.decode(enc, errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    return rc, text
 
 
 def alert(check, key, severity, message, detail=None) -> dict:
@@ -1368,6 +1434,7 @@ POOL_WARN_PCT, POOL_HIGH_PCT, POOL_CRIT_PCT, POOL_FLOOR_GIB = 85.0, 92.0, 97.0, 
 POOL_GROWTH_GIB_DAY, POOL_GROWTH_MIN_S, POOL_GROWTH_MAX_S = 10.0, 6 * 3600, 48 * 3600
 POOL_SAMPLE_GAP_S, POOL_SAMPLE_KEEP_S, POOL_SAMPLE_MAX = 1800, 48 * 3600, 120
 POOL_UNKNOWN_HIGH_S = 1800
+POOL_MAX_BYTES = 1048576  # the probe prints a few KB; anything near this is not a pvesm answer
 
 
 def pool_script(storage: str, mount: str, watch=()) -> str:
@@ -1515,12 +1582,13 @@ def check_proxmox_pool(cfg, state, runner, now):
         try:
             rc, text = runner(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
                                "-o", "StrictHostKeyChecking=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none",
-                               "--", host, pool_script(storage, mount, watch)], 25)
+                               "--", host, pool_script(storage, mount, watch)], 25, max_bytes=POOL_MAX_BYTES)
         except (subprocess.TimeoutExpired, OSError):
             rc, text, why = 255, "", "unreachable or timed out"
         else:
-            why = "unreachable or ssh failed" if rc != 0 else "unusable output"
-        parsed = parse_pool_probe(text, storage, mount) if rc == 0 and len(text or "") <= 1048576 else None
+            why = ("output over the size limit" if rc == RUN_OVERFLOW_RC or len(text or "") > POOL_MAX_BYTES
+                   else "unreachable or ssh failed" if rc != 0 else "unusable output")
+        parsed = parse_pool_probe(text, storage, mount) if rc == 0 and len(text or "") <= POOL_MAX_BYTES else None
         if parsed is None:
             out.extend(a for a in rec.get("alerts") or [] if isinstance(a, dict) and a.get("check") == "proxmox_pool")
             stale = now - rec.get("ok_at", rec["first_try"]) > POOL_UNKNOWN_HIGH_S
