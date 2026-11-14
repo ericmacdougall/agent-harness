@@ -557,6 +557,50 @@ class IngestValidationTests(Base):
             core.inbox_path(self.paths, "agent-evil1", "x.md")
         self.assertEqual(core.inbox_path(self.paths, "agent-abc123", "x.md"), self.paths.inbox / "agent-abc123" / "x.md")
 
+    def test_inbox_write_never_follows_a_symlinked_owner_dir(self):
+        self.paths.ensure()
+        elsewhere = self.home / "elsewhere"
+        elsewhere.mkdir()
+        (self.paths.inbox / "agent-evil1").symlink_to(elsewhere)
+        with self.assertRaises(OSError):
+            runner._write_inbox(self.paths.inbox, "agent-evil1", "n.md", "body")
+        self.assertEqual(list(elsewhere.iterdir()), [], "a notice was written through a symlink")
+        runner._write_inbox(self.paths.inbox, "agent-abc123", "n.md", "body")
+        self.assertEqual((self.paths.inbox / "agent-abc123" / "n.md").read_text(), "body")
+
+    def test_owner_dir_swapped_after_the_check_is_not_followed(self):
+        """Race: the owner directory becomes a symlink between inbox_path's check and the write (check-then-write)."""
+        import shutil
+        import sys as _sys
+        elsewhere = self.home / "elsewhere"
+        elsewhere.mkdir()
+        real_check = core.inbox_path
+
+        def check_then_swap(paths, owner, name):
+            result = real_check(paths, owner, name)
+            if _sys._getframe(1).f_code.co_name == "send":   # only the delivery-time check
+                target = paths.inbox / owner
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                if not target.is_symlink():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.symlink_to(elsewhere)
+            return result
+        core.inbox_path = check_then_swap
+        self.addCleanup(setattr, core, "inbox_path", real_check)
+        iid, deps = self.submit(), Deps(verdict="BLOCK")
+        self.run_all(deps)
+        self.assertEqual(self.state(iid), "blocked")
+        self.assertEqual(list(elsewhere.iterdir()), [], "the inbox write followed a swapped-in symlink")
+        ledger = runner.Ledger(self.paths)
+        try:
+            row = ledger.db.execute("SELECT status, result FROM effects WHERE item=? AND kind='inbox'",
+                                    (iid,)).fetchone()
+        finally:
+            ledger.close()
+        self.assertNotEqual(row["status"], "done")
+        self.assertIn("refused", row["result"] or "")
+
 
 class DeliveryTests(Base):
     """AC-19 / NEG-26 / NEG-34: an inbox file is not delivery; only the owner's ack is; no ack escalates once."""

@@ -771,8 +771,10 @@ class Worker:
                     return False, "refused: %s" % error
                 if path.parent.parent != self.paths.inbox:
                     return False, "refused: inbox path escapes the inbox directory"
-                if not path.exists():
-                    _write_private(path, payload["body"])
+                try:
+                    _write_inbox(self.paths.inbox, path.parent.name, path.name, payload["body"])
+                except _InboxRefused as error:
+                    return False, "refused: %s" % error
                 return True, "written"
             if kind == "digest":
                 if not self.readback("digest", payload):
@@ -1029,6 +1031,55 @@ def _digest_line(iid, req, state, body):
     detail = " | ".join(line.strip() for line in rest if line.strip()).replace(iid, "<item>")[:1500]
     return "- %s %s %s#%s %s [k:%s:%s]\n  %s\n" % (stamp, state.upper(), req["repo"], req["pr"], req["head"][:12],
                                                  iid, state, detail)
+
+
+class _InboxRefused(OSError):
+    """The inbox directory or owner directory is not a real directory (for example a symlink swapped in)."""
+
+
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _write_inbox(inbox, owner, name, text):
+    """Write an owner notice without a check-then-write gap (r2 F5 follow-up): the inbox and owner directories are
+    opened with O_NOFOLLOW|O_DIRECTORY and the file is created relative to the owner directory's fd with
+    O_EXCL|O_NOFOLLOW, then renamed within that directory. A symlink swapped in after inbox_path's check makes the open
+    fail; nothing is ever written through it. An existing notice is left as is (idempotent)."""
+    try:
+        root_fd = os.open(str(inbox), _DIR_FLAGS)
+    except OSError as error:
+        raise _InboxRefused("inbox directory is not a real directory: %s" % type(error).__name__) from None
+    try:
+        try:
+            os.mkdir(owner, 0o700, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+        try:
+            owner_fd = os.open(owner, _DIR_FLAGS, dir_fd=root_fd)
+        except OSError as error:
+            raise _InboxRefused("owner inbox is not a real directory: %s" % type(error).__name__) from None
+        try:
+            try:
+                os.stat(name, dir_fd=owner_fd, follow_symlinks=False)
+                return  # already delivered
+            except FileNotFoundError:
+                pass
+            tmp = "." + name + ".tmp"
+            try:
+                os.unlink(tmp, dir_fd=owner_fd)
+            except FileNotFoundError:
+                pass
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600,
+                         dir_fd=owner_fd)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.rename(tmp, name, src_dir_fd=owner_fd, dst_dir_fd=owner_fd)
+        finally:
+            os.close(owner_fd)
+    finally:
+        os.close(root_fd)
 
 
 def _write_private(path, text):
