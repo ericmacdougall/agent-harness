@@ -21,6 +21,7 @@
 | `domain_gates.py`, `domain_checklists.json` | Blockchain domain gates: detect blockchain work from repo signals and supply a risk checklist, test scaffolds and follow-up prompts to specs and review prompts. |
 | `worktree_hygiene.py` | Stop/SubagentStop gate (rule S18): no turn ends with uncommitted work in a worktree it touched; reports unpushed, merged and duplicate worktrees (vendored from Hawkeye). |
 | `wal_cadence.py` | Stop/SubagentStop nudge (rule W04): one bounded block when a big uncommitted diff has no recent human-readable WAL entry (ported from Hawkeye). |
+| `lifecycle.py` | Initiative lifecycle (goodqa#15952): gate form, the user's agreement and done words, READY from evidence, the audit-checked state, the spawn-tag rules (see Initiative lifecycle). |
 | `mission_coverage.py`, `mission_gate.py` | Mission goals (goodqa#15565): the goals file and its audit chain, the coverage rule, and the Stop gate that blocks main while a goal has no live owner, live disposition or done evidence (see Mission coverage). |
 | `prod_delete_guard.py` | PreToolUse gate on destructive SQL against production databases, lifted only by a user-sourced, target-bound grant (ported from Hawkeye). |
 | `spec_flow.py`, `spec_policy.json`, `spec_template.md` | Spec-driven tickets: spec documents, spec reviews, per-criterion evidence, click-test records, sign-off and the done gate (CLI, plan-review ticket gate, PreToolUse hook on GoodQA status changes). |
@@ -1328,7 +1329,8 @@ One canonical file, `~/.agent-harness/mission/goals.json` (directory 0700 and no
 | `wait_count` | integer | ask/ticket waits in a row without the user's word |
 | `bound` | list of full agent ids | owners main bound to the goal (`bind`) |
 | `retire` | `{source}` | the user's words that cancelled the goal |
-| `done_evidence` | `[{kind: deploy\|really_tested, ref, session}]` | WAL ids proving it is live and tested |
+| `done_evidence` | `[{kind: deploy\|really_tested, ref, session}]` | WAL ids proving it is live and tested (pre-lifecycle goals) |
+| `lifecycle` | object, optional | the initiative lifecycle (goodqa#15952, see Initiative lifecycle); a goal without it reads PENDING once the ledger is migrated |
 | `repos` | list of paths, optional | repositories whose commits naming the ticket count as progress (main only) |
 | `dashboard` | object, informational | copied from the dashboard on import; never read by the rule (its `owner` field covers nothing) |
 
@@ -1352,7 +1354,12 @@ Readers take a shared lock on `mission-goals.lock`, so a concurrent write is nev
     mission_coverage.py defer --goal leads --ticket <open blocking ticket> --until <ISO, at most 7 days ahead>  # main
     mission_coverage.py defer --goal leads --user-source "<user: or answer: source>" [--until <ISO>]     # main
     mission_coverage.py retire --goal leads --user-source "<user: or answer: source>"                    # main
-    mission_coverage.py done --goal leads --deploy <deploy WAL id> --live-test <REALLY_TESTED id>
+    mission_coverage.py propose --goal G --gates-file gates.json --ask <registered ask id> [--ticket T]   # main
+    mission_coverage.py agree --goal G --user-source "<answer: or user: source>"                       # main
+    mission_coverage.py attach --goal G --evidence <WAL id> --gate G1                                   # main
+    mission_coverage.py ready --goal G --ask <registered done ask id>                                   # main
+    mission_coverage.py done --goal G --user-source "<answer: or user: source>" [--ask <id>]           # main
+    mission_coverage.py migrate-lifecycle                                                               # main, once
     mission_coverage.py set-session [--session S] | --user-source "<user: source in this session>"       # main
     mission_coverage.py reseal --reason "<what changed and why>" [--force]                                # main
     mission_coverage.py verify | report [--json] | check
@@ -1561,6 +1568,65 @@ stalled goal, plus the option to queue the goal on its ticket.
   disposition (row reason `wait-expired` or `silent-undisposed`); `ah status` prints the same list on its owners line.
   It is a report for main to look at: it does not set `decision_required`, so the dropped-owner Stop gate and ahd
   successor requests ignore it (a silent owner may be a long build that writes no WAL lines).
+
+### Initiative lifecycle (goodqa#15952)
+
+The user's rule (queue 2026-11-14T04:40:13Z #69c80ac14ad8): owner-worthy work "starts as pending - and requires us to
+agree on acceptence gates/definition of done -- that you [coordinator] agree can be meaured/tested/computed without
+external forces -- so you can drive it to 'ready' and i can agree its 'done'". `harness/hooks/lifecycle.py` holds the
+rules; `mission_coverage.py` writes the `lifecycle` object of a goal; `goals_view`, `ah status`, Mission Control and
+`tier_gate.py` read it.
+
+States: PENDING (gates not agreed) > AGREED > ACTIVE > READY (every gate has qualifying evidence) > DONE (the user's own
+words only); LEGACY (the goals present when `migrate-lifecycle` ran); UNVERIFIED (a state the audit chain does not
+back; treated as PENDING).
+
+- *New goals.* `add` and `import-initiatives` create `status: imported` goals with lifecycle PENDING. `set --status
+  active` is refused for a goal with a lifecycle; `activate` needs AGREED.
+- *Gates.* `propose --gates-file` takes 1..20 gates `{id: G<n>, text, check: {kind: test|live_test|deploy, name,
+  verify_by}}`. A gate that reads as needing a person, an outside party or an opinion is refused (a form check: whether
+  a check is truly autonomous stays the coordinator's judgement, and the user's agreement is the backstop). The gate
+  list hashes to `gates_sha` (canonical JSON). `--ask` names an ask already registered in main's WAL whose note carries
+  the goal id and the first 12 characters of `gates_sha`. A new proposal voids an earlier agreement.
+- *Agreement.* `agree --user-source` accepts only `answer:` (the AskUserQuestion answer whose question carries
+  `[ask:<id>]`, the sha prefix and the goal id as a whole token, and whose answer assents) or `user:` (a human turn naming
+  the goal and the sha prefix or ask id, with a plain agree word and no refusal, condition or question). `queue:`,
+  `wal:`, `ticket:`, `inferred:` and agent text never count. `agreed.at` is the time of the user's words, so evidence
+  recorded after the user agreed (even before main ran `agree`) counts.
+- *READY is computed.* `attach --gate Gn` records the gate and the gate revision with the evidence row. A gate is met
+  only by a row main attached under the current `gates_sha`, newer than the agreement, pinned and unchanged, with an
+  explicit PASS (DEPLOY for a deploy gate) of the gate's kind and check name; a `live_test` row must carry the live
+  flag and be no older than the newest qualifying deploy, and a newer FAIL for the gate disqualifies it. `ready --ask`
+  records READY only when every gate is met and names the registered done ask. A READY whose gates stop being met
+  reads ACTIVE ("READY stale") in every reader.
+- *DONE is the user's.* `done --user-source` takes the user's own words naming the goal, after READY; an `answer:` must
+  answer the question carrying the done ask. The old `done --deploy --live-test` path no longer closes a goal. Readers
+  re-resolve the recorded agreement and done sources (cached), so a hand-written block reads UNVERIFIED or NOT DONE.
+- *Coverage.* The Stop gate treats a PENDING goal as covered while its agreement ask is open or a scoping owner holds
+  it, AGREED as uncovered until `activate`, READY as waiting on the user.
+- *Migration and rollback.* `migrate-lifecycle` (main, once) backs up `goals.json` and the audit chain under
+  `state/lifecycle-backups/<time>/`, reads the backup back, then marks every goal present LEGACY; later goals stay
+  PENDING. Readers of the previous release ignore the new key (tests/test_lifecycle_rehearsal.py runs the 98e33c5d
+  readers and writer against a migrated ledger). To roll back, reinstall the previous commit; never restore the backup
+  over a ledger with later updates. While rolled back, the spawn check, agent-`done` refusal and pending coverage are
+  off; a block an old writer changed reads UNVERIFIED after reinstall until main repeats the lifecycle step.
+- *Spawn check (`tier_gate.py`, AC-2).* An owner-type Agent/Task spawn and every Workflow carries `[goal:<id>]` (in the
+  prompt, description or workflow input; tags inside code spans or fences do not count; a malformed tag counts as
+  none; two different tags are refused). ACTIVE, READY and LEGACY goals pass (LEGACY with a "propose gates" note).
+  `[goal:<id>:scoping]` on a PENDING goal main added or proposed passes with a "survey, spec and gate proposal only"
+  note, at most 1 per goal and 2 per session per 24 h, reserved under a flock in
+  `state/lifecycle-scoping.jsonl` (enforce only; a failed launch keeps its reservation). Helpers are untouched; Bash
+  launches of claude, codex or rescue.py without `[review:...]` are warn-only; a host with no ledger is never denied.
+  `model_tiers.json` `caps.lifecycle_gate` is `warn` (shipped: context lines only) or `enforce`;
+  `HARNESS_LIFECYCLE_GATE=enforce` can only strengthen it. `caps.lifecycle_pending_build` (default false) is the draft
+  amendment AC-2a from main's C1 ruling, not agreed by the user: true lets an owner build on a PENDING goal whose gate
+  proposal and ask are registered. Main switches either only after the warn log shows no false refusals and, for
+  AC-2a, the user's decision.
+- *Display.* `ah goals` prints a `lifecycle:` line per goal (state, gates met, unmet gates); `ah status` has an
+  INITIATIVES section (INITIATIVES UNAVAILABLE when the ledger cannot be read); Mission Control shows a lifecycle badge
+  per initiative from the ledger (NOT IN LEDGER for a dashboard row that is not a goal, NO LEDGER, or UNKNOWN for an
+  unreadable or tampered ledger; a value in initiatives.json is ignored).
+- Phase 2 (Agent Fabric) is designed in `docs/fabric-lifecycle.md` (goodqa#15962).
 
 ## Design limits
 

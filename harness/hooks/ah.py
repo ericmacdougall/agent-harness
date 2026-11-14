@@ -2615,7 +2615,9 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
                                          if r.get("owner") and str(r.get("state")).startswith(("live", "working")))}
     except Exception:  # noqa: BLE001 - the evidence report must not fail on the owner view
         owners_summary = {"error": "owners view not included (run ah owners)" if supplied else "owners view unavailable"}
+    initiatives = {"error": "not included (run ah goals)"} if supplied else initiatives_view(home)
     return {"session": session, "since_s": since_s, "generated": iso(now), "entries": len(rows),
+            "initiatives": initiatives,
             "verified": sorted(verified.values(), key=lambda e: e["at"]),
             "pending": sorted((v for k, v in pending.items() if k not in verified), key=lambda e: e["at"]),
             "live": live, "live_legacy": live_legacy,
@@ -2624,6 +2626,26 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
             "asks_open": [a for k, a in asks.items() if k not in resolved],
             "assumptions": assumptions, "decisions": decisions, "owners": owners_summary, "unread": unread,
             "rule": "edit this report; never write a status list from memory (nov-7-issues-2 B2.5)"}
+
+
+def initiatives_view(home: Path) -> dict:
+    """goodqa#15952 AC-6: every goal's lifecycle state for `ah status` ({"goals": [...]}, or {"error"} when the ledger
+    cannot be read: NEG-12, never an empty list). The same report `ah goals` prints, without the tag scan."""
+    try:
+        import goals_view  # noqa: PLC0415
+        doc = goals_view.goals_report(home, scan_budget_s=0)
+    except Exception as error:  # noqa: BLE001 - the evidence report must not fail on the initiatives view
+        return {"error": f"{type(error).__name__}: {str(error)[:160]}"}
+    if doc.get("state") != "ok" and doc.get("error"):
+        return {"error": str(doc["error"])[:240]}
+    rows = []
+    for g in doc.get("goals") or []:
+        life = g.get("lifecycle") or {}
+        gates = life.get("gates") or []
+        rows.append({"id": g.get("id"), "ticket": g.get("ticket") or "", "state": str(life.get("state") or "?").upper(),
+                     "evidence": g.get("state"), "gates_met": sum(1 for x in gates if x.get("met")),
+                     "gates": len(gates), "unmet": life.get("unmet") or [], "note": str(life.get("note") or "")[:160]})
+    return {"goals": rows}
 
 
 def status_text(data: dict) -> str:
@@ -2645,6 +2667,20 @@ def status_text(data: dict) -> str:
     lines += block("ASSUMPTIONS and TARGET_MISMATCH (no user source)", data["assumptions"], lambda r: f"  {r['label']:<16} {r['agent'][:12]:<12} {r['note'][:100]}")
     lines += block("COMMITS", data["commits"], lambda r: f"  {r['agent'][:12]:<12} {r['note'][:120]}")
     lines += block("UNREAD WALs", data.get("unread") or [], lambda r: f"  {r['wal']:<40} {r['reason'][:80]}")
+    ini = data.get("initiatives") or {"error": "not computed"}
+    if "goals" in ini:
+        lines.append(f"## INITIATIVES ({len(ini['goals'])}): lifecycle PENDING > AGREED > ACTIVE > READY (every gate "
+                     "has evidence) > DONE (the user's own words only); LEGACY predates gates")
+        for r in ini["goals"]:
+            gates = f" gates {r['gates_met']}/{r['gates']}" if r["gates"] else ""
+            unmet = f" unmet {','.join(r['unmet'][:8])}" if r["unmet"] else ""
+            ticket = f" ({r['ticket']})" if r["ticket"] else ""
+            note = f" - {r['note'][:100]}" if r["note"] else ""
+            lines.append(f"  {r['state']:<10} {r['id']}{ticket}{gates}{unmet}; evidence {r['evidence']}{note}")
+        if not ini["goals"]:
+            lines.append("  (the ledger holds no goals)")
+    else:
+        lines.append("## INITIATIVES UNAVAILABLE: " + str(ini.get("error", ""))[:200])
     o = data.get("owners") or {}
     if "counts" in o:
         lines.append(f"## OWNERS live {len(o.get('live') or [])}: {', '.join(a[:12] for a in o.get('live') or [])}; "

@@ -19,6 +19,7 @@ export function initiative(row) {
     milestone_items: Array.isArray(row.milestone_items) ? row.milestone_items.map(m => ({ done: !!m.done, text: str(m.text, 200).replace(/^(Done:|Not yet:)\s*/i, '') })) : [],
     next_step: str(row.next_step, 600), next_eta: str(row.next_eta, 80) || null, full_eta: str(row.full_eta, 80) || null,
     estimate_by: str(row.estimate_by, 80) || 'main', note: str(row.note, 600), updated: str(row.updated, 60), error: str(row.error, 300),
+    lifecycle: str(row.lifecycle, 20) || 'UNKNOWN',  // goodqa#15952: the mission ledger's state, not the file's
   };
   if (item.pct === null) item.milestones_done = item.milestones_total = null;
   return item;

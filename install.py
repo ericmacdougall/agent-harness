@@ -41,7 +41,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "backup_watch.py", "kimi_review.py", "installer_scan.py",
          "trivy_gate.py",  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
          "mc_chat.py", "mc_inbox.py",  # Mission Control chat store and inbox CLI/hook (goodqa#15585)
-         "mission_coverage.py", "mission_gate.py",  # mission goals: owner, disposition or done evidence (goodqa#15565)
+         "mission_coverage.py", "mission_gate.py", "lifecycle.py",  # mission goals: owner, disposition or done evidence (goodqa#15565)
          "goals_view.py", "status_truth.py", "stop_blocks.py",  # `ah goals`, status lint and injection (goodqa#15754)
          "gq_browser.py",  # GoodQA worker browser CLI and stdio MCP server; main registers the MCP (goodqa#15745)
          "idle_guard.py",  # main-idle detector, Stop block and rejected-question reminder (goodqa#15943)

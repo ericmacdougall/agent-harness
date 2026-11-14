@@ -74,6 +74,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import safe_input  # noqa: E402
+import lifecycle as lcm  # noqa: E402
 
 STALL_S = 45 * 60
 WAIT_MAX_S = 7 * 86400  # an ask or ticket wait is renewed at least weekly, never parked (same bound as ah dispositions)
@@ -101,7 +102,12 @@ HELPERS_DEFAULT = ("red-team", "click-tester", "reviewer", "fixer", "Explore", "
 DONE_LIKE = ("done", "live", "complete", "completed", "shipped", "retire", "retired")
 SCRIPT = "python3 ~/.claude/hooks/mission_coverage.py"
 GENESIS = "0" * 64
-MAIN_ONLY = ("set", "defer", "import-initiatives", "reseal", "activate", "set-session", "bind", "retire", "attach")
+MAIN_ONLY = ("set", "defer", "import-initiatives", "reseal", "activate", "set-session", "bind", "retire", "attach",
+             "add", "propose", "agree", "ready", "done", "migrate-lifecycle")
+# attach and add are open to every caller; main's stamp only marks the audit row as main's (goodqa#15952: a scoping
+# owner may be spawned only for a goal main created or proposed). The others refuse without the stamp.
+OPTIONAL_MAIN = ("attach", "add")
+LC_BACKUPS = "lifecycle-backups"
 # attach is open to an owner whose evidence row (or its WAL) names the goal; main's stamp lifts that and allows --remove
 ATTACH_KINDS = ("deploy", "live_test", "test")
 PIN_VERDICTS = ("DEPLOY", "PASS", "FAIL", "UNSTATED")
@@ -506,6 +512,13 @@ def _check_goal(g, index: int) -> dict:
     if aliases is not None and (not isinstance(aliases, list) or len(aliases) > MAX_ALIASES
                                 or not all(isinstance(a, str) and ALIAS_RE.match(a) for a in aliases)):
         raise ValueError(f"{where}: aliases must be up to {MAX_ALIASES} short lower-case words")
+    lc = g.get("lifecycle")
+    if lc is not None:
+        if not isinstance(lc, dict) or lc.get("state") not in lcm.STATES:
+            raise ValueError(f"{where}: lifecycle must be an object with state {'|'.join(lcm.STATES)}")
+        gates = lc.get("gates")
+        if gates is not None and (not isinstance(gates, list) or len(gates) > lcm.MAX_GATES):
+            raise ValueError(f"{where}: lifecycle.gates must be a list of up to {lcm.MAX_GATES} gates")
     attached = g.get("evidence")
     if attached is not None:
         if not isinstance(attached, list) or len(attached) > MAX_ATTACHED:
@@ -789,7 +802,7 @@ def claim_main(argv, home: Path) -> None:
     validates it: a command that then fails, prints --help or exits on an argparse error leaves no stamp behind."""
     _PROOF.clear()
     argv = [str(a) for a in argv or []]
-    if not argv or argv[0] not in MAIN_ONLY:
+    if not argv or argv[0] not in MAIN_ONLY + OPTIONAL_MAIN:
         return
     import caller_identity  # noqa: PLC0415
     stamp = caller_identity.take_stamp(STAMP_PURPOSE, [argv[0], argv_key(argv)], home=home, bound=True,
@@ -846,7 +859,11 @@ def changed_alert(home: Path, message: str, detail: dict) -> None:
 # ------------------------------------------------------------------ write commands
 
 def add_goal(home: Path, goal_id: str, title: str, ticket: str = "", priority: int = 3) -> dict:
-    """Open to every caller: a new goal can only add work to cover."""
+    """Open to every caller: a new goal can only add work to cover. goodqa#15952: it starts PENDING (status imported,
+    lifecycle pending) and its owners may be spawned only after the user agrees its gates; main's stamp, when main
+    ran it, marks the audit row as main's."""
+    stamp = _PROOF.get("stamp") if _PROOF.get("cmd") == "add" else None
+    _PROOF.clear()
     if not ID_RE.match(goal_id or ""):
         raise MissionError("goal id: lower-case letters, digits, - and _, up to 64 characters")
     if ticket and not ticket_key(ticket):
@@ -855,11 +872,14 @@ def add_goal(home: Path, goal_id: str, title: str, ticket: str = "", priority: i
     def change(doc):
         if any(g["id"] == goal_id for g in doc["goals"]):
             raise MissionError(f"goal {goal_id} already exists; change it with `{SCRIPT} set`")
-        doc["goals"].append({"id": goal_id, "title": (title or goal_id)[:300], "priority": int(priority),
-                             "ticket": (ticket_key(ticket) or "") if ticket else "", "status": "active"})
+        g = {"id": goal_id, "title": (title or goal_id)[:300], "priority": int(priority),
+             "ticket": (ticket_key(ticket) or "") if ticket else "", "status": "imported",
+             "lifecycle": {"state": "pending", "created_at": iso(time.time())}}
+        doc["goals"].append(g)
+        detail["lc_sha"] = lcm.lc_sha(g["lifecycle"])
         return doc
-    return _mutate(home, "add", goal_id, change, {"title": clean(title, 120), "ticket": ticket_key(ticket) or "",
-                                                  "priority": priority})
+    detail = {"title": clean(title, 120), "ticket": ticket_key(ticket) or "", "priority": priority}
+    return _mutate(home, "add", goal_id, change, detail, stamp=stamp)
 
 
 def set_goal(home: Path, goal_id: str, *, title=None, ticket=None, priority=None, status=None, repos=None,
@@ -882,8 +902,8 @@ def set_goal(home: Path, goal_id: str, *, title=None, ticket=None, priority=None
         if len(aliases) > MAX_ALIASES or not all(ALIAS_RE.match(a) for a in aliases):
             raise MissionError(f"--alias: up to {MAX_ALIASES} short lower-case words (2-40 characters)")
     if status == "done":
-        raise MissionError(f"a goal is marked done only with evidence: `{SCRIPT} done --goal {goal_id} --deploy <deploy "
-                           f"WAL id> --live-test <REALLY_TESTED id>`")
+        raise MissionError(f"a goal is done only on the user's own words (goodqa#15952): main runs `{SCRIPT} done "
+                           f"--goal {goal_id} --user-source \"answer:<session>/<uuid> ...\"` once it is READY")
     if status in ("deferred", "retired", "imported"):
         raise MissionError(f"status {status} has its own command (defer, retire; imported comes from import-initiatives)")
     if status not in (None, "active"):
@@ -915,6 +935,9 @@ def set_goal(home: Path, goal_id: str, *, title=None, ticket=None, priority=None
         if aliases is not None:
             g["aliases"] = aliases
         if status == "active":
+            if lcm.raw_state(g) != "legacy":
+                raise MissionError(f"goal {goal_id} is a lifecycle goal ({lcm.raw_state(g)}): it becomes active only "
+                                   f"through `{SCRIPT} activate --goal {goal_id}` after the user agrees its gates")
             if g.get("status") == "imported":
                 raise MissionError(f"an imported goal is activated by main: `{SCRIPT} activate --goal {goal_id}`")
             g["status"] = "active"
@@ -992,7 +1015,8 @@ def _row_names_goal(home: Path, session: str, wal_name: str, rec: dict, goal: di
     return False
 
 
-def attach_evidence(home: Path, goal_id: str, wid: str, *, kind: str = "", session=None, remove: bool = False) -> dict:
+def attach_evidence(home: Path, goal_id: str, wid: str, *, kind: str = "", session=None, remove: bool = False,
+                    gate: str = "") -> dict:
     """Attach WAL entry `wid` (a REALLY_TESTED row or a deploy event) to a goal, so `ah goals` shows it whatever its age.
     Open to an owner whose row or WAL names the goal; main (stamp) may attach any row and --remove one."""
     stamp = _PROOF.get("stamp") if _PROOF.get("cmd") == "attach" else None
@@ -1035,6 +1059,10 @@ def attach_evidence(home: Path, goal_id: str, wid: str, *, kind: str = "", sessi
     goal = next((g for g in loaded.get("goals") or [] if g["id"] == goal_id), None)
     if goal is None:
         raise MissionError(f"no goal {clean(goal_id)!r}; list them with `{SCRIPT} report`")
+    lc = goal.get("lifecycle") if isinstance(goal.get("lifecycle"), dict) else {}
+    if gate and gate not in [x.get("id") for x in lc.get("gates") or [] if isinstance(x, dict)]:
+        raise MissionError(f"goal {goal_id} has no gate {clean(gate, 8)!r}; its gates: "
+                           + (", ".join(str(x.get("id")) for x in lc.get("gates") or []) or "none (propose them first)"))
     if stamp is None and not _row_names_goal(home, session, wal_name, rec, goal):
         raise MissionError(f"{wid} comes from {wal_name}, which never names goal {goal_id} or its ticket "
                            f"{goal.get('ticket') or '(none)'}; tag your row with `--goal {goal_id}` or ask main")
@@ -1053,13 +1081,18 @@ def attach_evidence(home: Path, goal_id: str, wid: str, *, kind: str = "", sessi
         rows = [r for r in g.get("evidence") or [] if r.get("id") != wid]
         # F2: pin the row as attach saw it; ah goals marks it TAMPERED when the WAL row changes later (a re-attach
         # re-pins: main's re-attach is how a legacy, unpinned entry gets its pin)
-        rows.append({"id": wid, "session": session, "wal": wal_name, "kind": kind, "at": iso(time.time()), "by": by,
-                     "row_sha": row_digest(rec), "row_verdict": pin_verdict, "row_at": str(rec.get("at") or "")[:64]})
+        entry = {"id": wid, "session": session, "wal": wal_name, "kind": kind, "at": iso(time.time()), "by": by,
+                 "row_sha": row_digest(rec), "row_verdict": pin_verdict, "row_at": str(rec.get("at") or "")[:64]}
+        if gate:  # goodqa#15952 F1: the row counts for this gate only under the gate revision it was attached under
+            glc = g.get("lifecycle") if isinstance(g.get("lifecycle"), dict) else {}
+            entry.update(gate=gate, gates_sha=str(glc.get("gates_sha") or ""), live=rec.get("live") is True)
+        rows.append(entry)
         if len(rows) > MAX_ATTACHED:
             raise MissionError(f"goal {goal_id} already has {MAX_ATTACHED} evidence rows; main removes stale ones")
         g["evidence"] = rows
         return doc
-    return _mutate(home, "attach", goal_id, change, {"id": wid, "kind": kind, "wal": wal_name, "by": by}, stamp=stamp)
+    return _mutate(home, "attach", goal_id, change, {"id": wid, "kind": kind, "wal": wal_name, "by": by,
+                                                     "gate": gate or None}, stamp=stamp)
 
 
 def ask_states(home: Path, session: str) -> dict:
@@ -1211,47 +1244,333 @@ def defer_goal(home: Path, goal_id: str, *, ask=None, ticket=None, user_source=N
     return doc
 
 
-def done_goal(home: Path, goal_id: str, *, deploy: str, live_test: str, session=None) -> dict:
-    loaded = load_goals(home)
-    mission = loaded.get("mission_session") or ""
-    if mission and session and session.lower() != mission:
-        raise MissionError(f"done evidence must come from the mission session's WALs ({mission}); --session points "
-                           "elsewhere")
-    session = mission or session or main_session(home)
-    if not session:
-        raise MissionError("no session: pass --session (the session whose WALs hold the evidence)")
-    for ref in (deploy, live_test):
-        if not isinstance(ref, str) or not REF_RE.match(ref):
-            raise MissionError("--deploy and --live-test take WAL ids")
-    evidence = [{"kind": "deploy", "ref": deploy, "session": session},
-                {"kind": "really_tested", "ref": live_test, "session": session}]
-    g = next((x for x in loaded.get("goals") or [] if x["id"] == goal_id), None)
+def done_goal(home: Path, goal_id: str, *, user_source=None, deploy=None, live_test=None, session=None,
+              resolver=None, ask=None) -> dict:
+    """Main-only, and the authority is the user's words (goodqa#15952: "so you can drive it to 'ready' and i can agree
+    its 'done'"). A goal with gates must be READY (recorded and still derived from its evidence) and the user's bound
+    words must follow READY; a legacy goal needs only the user's words naming it. The old agent path (a deploy plus a
+    live test) no longer marks anything done: that evidence makes a goal READY, never DONE."""
+    if deploy or live_test:
+        raise MissionError("done no longer takes agent evidence: attach it to the gates (`attach --gate`), run `ready`, "
+                           f"then record the user's words: `{SCRIPT} done --goal {goal_id} --user-source "
+                           "\"answer:<session>/<uuid> ...\"` (an agent can never make a goal done)")
+    stamp = require_main(home, "done")
+    if not user_source:
+        raise MissionError("done needs --user-source: the user's own words saying this goal is done")
+    why = lcm.source_kind_problem(user_source)
+    if why:
+        raise MissionError(f"done refused: {why}")
+    if ask is not None and not ASK_ID_RE.match(ask):
+        raise MissionError("--ask takes an ask id (w + 11 hex)")
+    loaded = read_consistent(home)
+    if loaded.get("state") != "ok":
+        raise MissionError(f"goals ledger not usable: {clean(loaded.get('error'), 160)}")
+    g = next((x for x in loaded["goals"] if x["id"] == goal_id), None)
     if g is None:
         raise MissionError(f"no goal {clean(goal_id)!r}")
-    why = done_evidence_problem(home, dict(g, done_evidence=evidence))
+    state, note = lifecycle_state(home, g)
+    lc = g.get("lifecycle") if isinstance(g.get("lifecycle"), dict) else {}
+    if lc.get("gates"):
+        if state != "ready":
+            raise MissionError(f"goal {goal_id} is {state}{(' (' + note + ')') if note else ''}, not READY: "
+                               f"run `{SCRIPT} ready --goal {goal_id}` once every gate has evidence")
+        why = lcm.agreement_problem((lc.get("agreed") or {}).get("source"), goal_id, lc, resolver)
+        if why:
+            raise MissionError(f"the recorded agreement no longer verifies: {clean(why, 200)}")
+        problems = lcm.ready_problems(g, goal_items(home, g))
+        if problems:
+            raise MissionError("READY no longer holds: " + clean("; ".join(problems), 300))
+        why = lcm.done_problem(user_source, goal_id, lc, resolver, after=(lc.get("ready") or {}).get("at"))
+    elif state == "legacy" and note.startswith("unmigrated"):
+        raise MissionError("the ledger has not been migrated to the lifecycle yet: main runs "
+                           f"`{SCRIPT} migrate-lifecycle` first")
+    elif state == "legacy":
+        why = lcm.done_problem(user_source, goal_id, lc, resolver, ask=ask)
+    else:
+        raise MissionError(f"goal {goal_id} is {state}: it has no agreed gates; propose gates and get the user's "
+                           "agreement first")
     if why:
-        raise MissionError(f"done refused: {clean(why, 200)}. Done means deployed to live and tested live")
+        raise MissionError(f"done refused: {clean(why, 240)}")
+    detail = {"source": clean(user_source, 300)}
+
+    validated = lcm.lc_sha(g.get("lifecycle"))
 
     def change(doc):
         x = _find(doc["goals"], goal_id)
-        x["status"], x["done_evidence"] = "done", evidence
+        if lcm.lc_sha(x.get("lifecycle")) != validated:
+            raise MissionError("the goal's lifecycle changed while it was being checked; run the command again")
+        xl = dict(x.get("lifecycle") or {"state": "legacy"})
+        xl["state"], xl["done"] = "done", {"source": user_source.strip()[:2000], "at": iso(time.time())}
+        x["lifecycle"], x["status"] = xl, "done"
         x.pop("deferral", None)
         x["wait_count"] = 0
+        detail["lc_sha"] = lcm.lc_sha(xl)
         return doc
-    return _mutate(home, "done", goal_id, change, {"deploy": deploy, "live_test": live_test, "session": session})
+    doc = _mutate(home, "done", goal_id, change, detail, stamp=stamp)
+    changed_alert(home, f"mission goal {goal_id} DONE on the user's words", {"goal": goal_id})
+    return doc
+
+
+# ------------------------------------------------------------------ lifecycle (goodqa#15952)
+
+def read_audit_rows(home: Path) -> list:
+    """Every audit row, oldest first (bounded by the audit size caps); unparseable lines are skipped (the chain check
+    reports them)."""
+    out = []
+    for path in audit_segments(home):
+        try:
+            data = safe_input.read_bounded(path, MAX_AUDIT_BYTES + (1 << 20))
+        except (safe_input.InputRejected, OSError):
+            continue
+        for line in data.splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict):
+                out.append(rec)
+    return out
+
+
+def lifecycle_state(home: Path, goal: dict, rows=None, chain_ok=None) -> tuple:
+    """(effective state, note) of one goal: lifecycle.effective_state against this ledger's audit chain."""
+    if chain_ok is None:
+        chain_ok = verify_audit(home).get("ok", False)
+    return lcm.effective_state(goal, read_audit_rows(home) if rows is None else rows, chain_ok)
+
+
+def goal_items(home: Path, goal: dict) -> list:
+    """The goal's attached evidence as goals_view items (one verdict rule with ah goals)."""
+    import goals_view  # noqa: PLC0415
+    return goals_view.evidence_items(home, goal)
+
+
+def _load_gates(path) -> list:
+    try:
+        raw = safe_input.read_bounded(path, 256 * 1024)
+        return safe_input.safe_json_loads(raw, max_depth=MAX_DEPTH)
+    except (safe_input.InputRejected, ValueError, OSError) as error:
+        raise MissionError(f"gates file unreadable: {clean(str(error), 120)}") from None
+
+
+def propose_goal(home: Path, goal_id: str, gates_file, ask: str, title=None, ticket=None) -> dict:
+    """Main-only. Record proposed gates for a goal (creating it when new) and bind them to the registered ask the user
+    will answer. The goal becomes (or returns to) PENDING; any earlier agreement is void because gates_sha changes."""
+    stamp = require_main(home, "propose")
+    if not ID_RE.match(goal_id or ""):
+        raise MissionError("goal id: lower-case letters, digits, - and _, up to 64 characters")
+    gates = _load_gates(gates_file)
+    problems = lcm.gate_problems(gates)
+    if problems:
+        raise MissionError("gates refused (each must be measurable, testable or computable by agents unaided): "
+                           + clean(" | ".join(problems), 1500))
+    gsha = lcm.gates_sha(gates)
+    if not ASK_ID_RE.match(ask or ""):
+        raise MissionError("--ask takes the registered ask id (wal_note.py --event ask) whose question names the goal "
+                           "and the gates sha prefix")
+    session = (mission_session_of(home) or str(stamp.get("session") or "")).lower()
+    _wal, rec = find_wal_row(home, session, ask)
+    if not rec or rec.get("event") != "ask":
+        raise MissionError(f"no ask {ask} in session {session}'s WALs; register it first (wal_note.py --event ask)")
+    text = " ".join(str(rec.get(k) or "") for k in ("note", "question", "reason"))
+    if goal_id not in text or gsha[:lcm.SHA_PREFIX] not in text:
+        raise MissionError(f"ask {ask} must name {goal_id} and the gates sha prefix {gsha[:lcm.SHA_PREFIX]} so the "
+                           "user's answer is bound to these gates")
+    if ticket and not ticket_key(ticket):
+        raise MissionError("ticket must look like goodqa#123 or Project#123")
+    detail = {"gates_sha": gsha, "ask": ask, "gates": len(gates)}
+
+    def change(doc):
+        g = next((x for x in doc["goals"] if x["id"] == goal_id), None)
+        if g is None:
+            g = {"id": goal_id, "title": (title or goal_id)[:300], "priority": 3,
+                 "ticket": (ticket_key(ticket) or "") if ticket else "", "status": "imported"}
+            doc["goals"].append(g)
+        old = g.get("lifecycle") if isinstance(g.get("lifecycle"), dict) else {}
+        if old.get("state") == "done":
+            raise MissionError(f"goal {goal_id} is DONE on the user's words; open a new goal instead")
+        lc = {"state": "pending", "gates": gates, "gates_sha": gsha, "ask": ask,
+              "proposed_at": str(rec.get("at") or iso(time.time()))[:64]}
+        if old.get("legacy"):
+            lc["legacy"] = old["legacy"]
+        g["lifecycle"] = lc
+        detail["lc_sha"] = lcm.lc_sha(lc)
+        return doc
+    doc = _mutate(home, "propose", goal_id, change, detail, stamp=stamp)
+    changed_alert(home, f"mission goal {goal_id} PENDING: gates {gsha[:12]} proposed (ask {ask})", {"goal": goal_id})
+    return doc
+
+
+def agree_goal(home: Path, goal_id: str, user_source: str, resolver=None) -> dict:
+    """Main-only, authority the user's words bound to the proposal (lifecycle.agreement_problem)."""
+    stamp = require_main(home, "agree")
+    loaded = read_consistent(home)
+    if loaded.get("state") != "ok":
+        raise MissionError(f"goals ledger not usable: {clean(loaded.get('error'), 160)}")
+    g = next((x for x in loaded["goals"] if x["id"] == goal_id), None)
+    if g is None:
+        raise MissionError(f"no goal {clean(goal_id)!r}")
+    lc = g.get("lifecycle") if isinstance(g.get("lifecycle"), dict) else {}
+    rows = lcm.lifecycle_rows(read_audit_rows(home), goal_id)
+    if lc.get("state") != "pending" or not lc.get("gates"):
+        raise MissionError(f"goal {goal_id} has no pending proposal (state {lcm.raw_state(g)}); run propose first")
+    if not rows or rows[-1][0] != "propose" or rows[-1][1] != lcm.lc_sha(lc):
+        raise MissionError("the proposal was not written by propose (or changed since); propose it again")
+    why = lcm.source_kind_problem(user_source)
+    if why:
+        raise MissionError(f"agreement refused: {why}")
+    why, agreed_at = lcm.agreement_check(user_source, goal_id, lc, resolver)
+    if why:
+        raise MissionError(f"agreement refused: {clean(why, 240)}")
+    detail = {"gates_sha": lc["gates_sha"], "source": clean(user_source, 300)}
+
+    validated = lcm.lc_sha(g.get("lifecycle"))
+
+    def change(doc):
+        x = _find(doc["goals"], goal_id)
+        if lcm.lc_sha(x.get("lifecycle")) != validated:
+            raise MissionError("the goal's lifecycle changed while it was being checked; run the command again")
+        xl = dict(x["lifecycle"])
+        xl["state"] = "agreed"
+        # the agreement time is when the user said it (verified), so evidence gathered after their words counts
+        xl["agreed"] = {"source": user_source.strip()[:2000], "at": agreed_at, "gates_sha": xl["gates_sha"],
+                        "recorded_at": iso(time.time())}
+        x["lifecycle"] = xl
+        detail["lc_sha"] = lcm.lc_sha(xl)
+        return doc
+    doc = _mutate(home, "agree", goal_id, change, detail, stamp=stamp)
+    changed_alert(home, f"mission goal {goal_id} gates agreed by the user; activate it to start owners",
+                  {"goal": goal_id})
+    return doc
+
+
+def ready_goal(home: Path, goal_id: str, ask=None, resolver=None) -> dict:
+    """Main-only, computed: every gate has qualifying evidence (lifecycle.gate_status) and the agreement still
+    verifies. --ask: the registered ask main will put to the user for the done decision."""
+    stamp = require_main(home, "ready")
+    loaded = read_consistent(home)
+    if loaded.get("state") != "ok":
+        raise MissionError(f"goals ledger not usable: {clean(loaded.get('error'), 160)}")
+    g = next((x for x in loaded["goals"] if x["id"] == goal_id), None)
+    if g is None:
+        raise MissionError(f"no goal {clean(goal_id)!r}")
+    state, note = lifecycle_state(home, g)
+    if state not in ("active", "ready"):
+        raise MissionError(f"goal {goal_id} is {state}{(' (' + note + ')') if note else ''}; only an ACTIVE goal can "
+                           "become READY")
+    lc = g["lifecycle"]
+    why = lcm.agreement_problem((lc.get("agreed") or {}).get("source"), goal_id, lc, resolver)
+    if why:
+        raise MissionError(f"the recorded agreement no longer verifies: {clean(why, 240)}")
+    items = goal_items(home, g)
+    problems = lcm.ready_problems(g, items)
+    if problems:
+        raise MissionError("not READY: " + clean("; ".join(problems), 1200))
+    if not ASK_ID_RE.match(ask or ""):
+        raise MissionError("--ask takes the registered done ask id (w + 11 hex): the question main will put to the user "
+                           "must carry [ask:<id>] and the goal id, so only that answer can close it")
+    met = [x["row"] for x in lcm.gate_status(g, items)]
+    detail = {"gates_sha": lc["gates_sha"], "evidence": met, "ask": ask}
+
+    validated = lcm.lc_sha(g.get("lifecycle"))
+
+    def change(doc):
+        x = _find(doc["goals"], goal_id)
+        if lcm.lc_sha(x.get("lifecycle")) != validated:
+            raise MissionError("the goal's lifecycle changed while it was being checked; run the command again")
+        xl = dict(x["lifecycle"])
+        xl["state"] = "ready"
+        xl["ready"] = {"at": iso(time.time()), "gates_sha": xl["gates_sha"], "evidence": met}
+        if ask:
+            xl["ready"]["ask"] = ask
+        x["lifecycle"] = xl
+        detail["lc_sha"] = lcm.lc_sha(xl)
+        return doc
+    doc = _mutate(home, "ready", goal_id, change, detail, stamp=stamp)
+    changed_alert(home, f"mission goal {goal_id} READY: every gate has evidence; the user decides done",
+                  {"goal": goal_id})
+    return doc
+
+
+def migrate_lifecycle(home: Path) -> dict:
+    """Main-only, idempotent. Every goal with no lifecycle object becomes legacy (keeping every other key as it is),
+    after a verified copy of goals.json and the audit chain is written under state/lifecycle-backups/<time>/."""
+    stamp = require_main(home, "migrate-lifecycle")
+    loaded = load_goals(home)
+    if loaded.get("state") != "ok":
+        raise MissionError(f"goals ledger not usable: {clean(loaded.get('error'), 160)}")
+    if any(r.get("action") == "migrate-lifecycle" for r in read_audit_rows(home)):
+        # once only (review: G10/NEG-15): a goal created later without a lifecycle object stays PENDING
+        return {"migrated": [], "backup": None, "note": "already migrated; later goals stay pending"}
+    if not any(not isinstance(g.get("lifecycle"), dict) for g in loaded["goals"]):
+        return {"migrated": [], "backup": None}
+    result = {"migrated": [], "backup": None}
+    detail = {"lc_shas": {}}
+
+    def change(doc):
+        todo = [g for g in doc["goals"] if not isinstance(g.get("lifecycle"), dict)]
+        if not todo:
+            raise MissionError("nothing to migrate")
+        result["backup"] = _backup_ledger(home)
+        detail["backup"] = result["backup"]
+        stamp_at = iso(time.time())
+        for g in todo:
+            g["lifecycle"] = {"state": "legacy", "legacy": {"from_status": g.get("status", "active"),
+                                                            "migrated_at": stamp_at}}
+            detail["lc_shas"][g["id"]] = lcm.lc_sha(g["lifecycle"])
+            result["migrated"].append(g["id"])
+        return doc
+    _mutate(home, "migrate-lifecycle", "*", change, detail, stamp=stamp)
+    changed_alert(home, f"mission goals migrated to the lifecycle: {len(result['migrated'])} legacy",
+                  {"migrated": result["migrated"][:50]})
+    return result
+
+
+def _backup_ledger(home: Path) -> str:
+    """Copy goals.json, the audit segments and the head into a fresh 0700 folder; read each copy back and compare."""
+    root = state_root(home) / LC_BACKUPS / time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    root = root.with_name(root.name + "-" + uuid.uuid4().hex[:6])
+    root.mkdir(parents=True, mode=0o700)
+    sources = [goals_path(home)] + list(audit_segments(home)) + ([head_path(home)] if head_path(home).exists() else [])
+    for src in sources:
+        data = safe_input.read_bounded(src, MAX_AUDIT_BYTES + (2 << 20))
+        dst = root / src.name
+        _atomic(dst, data)
+        if sha(safe_input.read_bounded(dst, MAX_AUDIT_BYTES + (2 << 20))) != sha(data):
+            raise MissionError(f"backup copy of {src.name} does not read back identically; nothing migrated")
+    return str(root)
 
 
 def activate_goal(home: Path, goal_id: str) -> dict:
     """Main-only: an imported goal becomes active (enforced)."""
     stamp = require_main(home, "activate")
 
+    loaded = read_consistent(home)
+    target = next((x for x in loaded.get("goals") or [] if x["id"] == goal_id), None)
+    lifecycle = target is not None and lcm.raw_state(target) != "legacy"
+    if lifecycle:
+        state, note = lifecycle_state(home, target)
+        if state != "agreed":
+            raise MissionError(f"goal {goal_id} is {state}{(' (' + note + ')') if note else ''}: owners start only "
+                               "after the user agrees its gates (propose, then agree with the user's words)")
+    detail = {}
+
     def change(doc):
         g = _find(doc["goals"], goal_id)
+        if lifecycle:
+            if lcm.lc_sha(g.get("lifecycle")) != lcm.lc_sha(target.get("lifecycle")):
+                raise MissionError("the goal's lifecycle changed while it was being checked; run the command again")
+            gl = dict(g["lifecycle"])
+            gl["state"] = "active"
+            g["lifecycle"], g["status"] = gl, "active"
+            g.pop("deferral", None)
+            detail.update(lc_sha=lcm.lc_sha(gl), gates_sha=gl.get("gates_sha"))
+            return doc
         if g.get("status") != "imported":
             raise MissionError(f"goal {goal_id} is {g.get('status')}, not imported")
         g["status"] = "active"
         return doc
-    doc = _mutate(home, "activate", goal_id, change, {}, stamp=stamp)
+    doc = _mutate(home, "activate", goal_id, change, detail, stamp=stamp)
     changed_alert(home, f"mission goal {goal_id} activated by main", {"goal": goal_id})
     return doc
 
@@ -1401,6 +1720,7 @@ def import_initiatives(home: Path, path) -> dict:
     if not isinstance(rows, list):
         raise MissionError("initiatives file must be a JSON list")
     counts = {"added": 0, "updated": 0, "skipped": 0, "tickets_filled": 0}
+    lc_shas = {}  # goodqa#15952 review F2: an import attests only the goals it creates
 
     def info(r):
         keep = ("state", "status", "owner", "pct", "next_step", "updated")
@@ -1418,8 +1738,10 @@ def import_initiatives(home: Path, path) -> dict:
             ticket = ticket_key(r.get("ticket")) or ""
             g = by_id.get(gid)
             if g is None:
-                g = {"id": gid, "title": clean(title, 300), "ticket": ticket, "priority": 3, "status": "imported"}
+                g = {"id": gid, "title": clean(title, 300), "ticket": ticket, "priority": 3, "status": "imported",
+                     "lifecycle": {"state": "pending", "created_at": iso(time.time())}}
                 doc["goals"].append(g)
+                lc_shas[gid] = lcm.lc_sha(g["lifecycle"])
                 by_id[gid] = g
                 counts["added"] += 1
             else:
@@ -1436,7 +1758,8 @@ def import_initiatives(home: Path, path) -> dict:
         if len(doc["goals"]) > MAX_GOALS:
             raise MissionError(f"more than {MAX_GOALS} goals")
         return doc
-    _mutate(home, "import", "*", change, {"file": clean(os.path.basename(str(path)), 120)}, stamp=stamp)
+    _mutate(home, "import", "*", change, {"file": clean(os.path.basename(str(path)), 120), "lc_shas": lc_shas},
+            stamp=stamp)
     changed_alert(home, f"mission goals imported by main: {counts['added']} added (not enforced until activated), "
                         f"{counts['tickets_filled']} tickets filled", dict(counts))
     return counts
@@ -1834,7 +2157,7 @@ def _matches(row, goal, key) -> bool:
 
 
 def evaluate(goals, rows, now, asks=None, verify_source=None, verify_evidence=None, progress=None, commits=None,
-             pol=None, stall_s: int = STALL_S, tickets=None, words_ok=None) -> list:
+             pol=None, stall_s: int = STALL_S, tickets=None, words_ok=None, lifecycle=None) -> list:
     """One result per goal: {id, title, ticket, priority, status, state, reason, owners, progress_age_s}. state is
     UNCOVERED, STALLED, COVERED, WAITING, DEFERRED, DONE, RETIRED or IMPORTED. Owners come only from `rows`.
     tickets and words_ok: see deferral_status."""
@@ -1851,6 +2174,35 @@ def evaluate(goals, rows, now, asks=None, verify_source=None, verify_evidence=No
                "priority": g.get("priority", 3), "status": g.get("status", "active"), "owners": [],
                "progress_age_s": None, "state": "UNCOVERED", "reason": ""}
         out.append(res)
+        life = (lifecycle or {}).get(g["id"])  # goodqa#15952: (effective state, note) from assess
+        if life and res["status"] not in ("retired",):
+            lstate, lnote = life
+            res["lifecycle"] = lstate
+            if lstate == "done":
+                res["state"], res["reason"] = "DONE", "DONE on the user's words"
+                continue
+            if lstate == "ready":
+                res["state"], res["reason"] = "WAITING", "READY: every gate has evidence; waiting on the user's done"
+                continue
+            if lstate == "agreed":
+                res["reason"] = f"gates agreed by the user; activate it: {SCRIPT} activate --goal {g['id']}"
+                continue
+            if lstate in ("pending", "unverified") and res["status"] != "deferred":
+                lc = g.get("lifecycle") if isinstance(g.get("lifecycle"), dict) else {}
+                ask_state, _note = _ask(asks, lc.get("ask")) if lc.get("ask") else ("", "")
+                scouts = [r for r in live if _matches(r, g, key)]
+                if lstate == "unverified":
+                    res["reason"] = f"lifecycle UNVERIFIED ({clean(lnote, 160)}); main repeats the lifecycle step"
+                elif ask_state == "open":
+                    res["state"] = "WAITING"
+                    res["reason"] = f"PENDING: waiting on the user's gate agreement (ask {lc.get('ask')})"
+                elif scouts:
+                    res["state"], res["owners"] = "COVERED", sorted(r["agent_id"] for r in scouts)
+                    res["reason"] = "PENDING: scoping owner " + ", ".join(clean(a, 40) for a in res["owners"][:3])
+                else:
+                    res["reason"] = (f"PENDING with no proposal before the user: propose gates ({SCRIPT} propose) "
+                                     "and ask the user")
+                continue
         if res["status"] == "done":
             if verify_evidence(g):
                 res["state"], res["reason"] = "DONE", "done with deploy and live-test evidence"
@@ -2036,8 +2388,9 @@ def gate_message(results, advice: str = "", limit: int = GATE_LIMIT) -> str:
     lines.append("Fix each: start an owner whose first WAL ticket is the goal's ticket; or main binds a live owner: "
                  "mission_coverage.py bind --goal ID --agent FULL_AGENT_ID --source ticket:goodqa#N; or a wait: "
                  "defer --goal ID --ask ASKID|--ticket T --until ISO; or the user's own deferral naming the goal: "
-                 "defer --goal ID --user-source \"user:SESSION/UUID \\\"words\\\"\"; or "
-                 "done --goal ID --deploy WALID --live-test ID.")
+                 "defer --goal ID --user-source \"user:SESSION/UUID \\\"words\\\"\"; or, for a PENDING goal, "
+                 "propose gates and put them to the user (propose --goal ID --gates-file F --ask ASKID); a goal is "
+                 "done only on the user's words (done --goal ID --user-source ...).")
     text = "\n".join(lines)
     if advice:
         text += "\n" + clean(advice, max(0, GATE_MAX_CHARS - len(text) - 1))
@@ -2135,7 +2488,17 @@ def assess(home: Path, session: str, now=None, with_commits: bool = False, deadl
             if key and g.get("repos"):
                 commits[key] = max(commits.get(key, 0.0), commit_progress(g["repos"], key))
     asks = ask_states(home, session)
-    results = evaluate(goals, rows, now, asks=asks,
+    audit_rows = read_audit_rows(home)  # read_consistent above verified the chain
+    life = {g["id"]: lcm.effective_state(g, audit_rows, True) for g in goals}
+    for g in goals:  # the Stop gate trusts a READY only while it still derives from the evidence
+        if life[g["id"]][0] == "ready":
+            try:
+                problems = lcm.ready_problems(g, goal_items(home, g))
+            except Exception as error:  # noqa: BLE001 - unreadable evidence never reads as READY
+                problems = [f"evidence unreadable: {clean(str(error), 80)}"]
+            if problems:
+                life[g["id"]] = ("active", "READY stale: " + clean("; ".join(problems), 160))
+    results = evaluate(goals, rows, now, asks=asks, lifecycle=life,
                        verify_source=lambda s: _cached(home, "source", str(s), lambda: verify_user_source(s)),
                        verify_evidence=lambda g: _cached(home, "evidence", json.dumps(
                            [g.get("ticket"), g.get("done_evidence"), mission], sort_keys=True),
@@ -2209,6 +2572,7 @@ def build_parser():
     at.add_argument("--kind", choices=ATTACH_KINDS)
     at.add_argument("--session")
     at.add_argument("--remove", action="store_true", help="(main) detach this id")
+    at.add_argument("--gate", default="", help="the lifecycle gate this evidence is for (G1, G2, ...)")
     d = sub.add_parser("defer", help="record what a goal waits on, or (main) the user's deferral")
     d.add_argument("--goal", required=True)
     d.add_argument("--ask")
@@ -2216,11 +2580,26 @@ def build_parser():
     d.add_argument("--user-source")
     d.add_argument("--until")
     d.add_argument("--session")
-    n = sub.add_parser("done", help="mark a goal done with deploy + live-test evidence")
+    n = sub.add_parser("done", help="(main) record the user's words that a READY (or legacy) goal is done")
     n.add_argument("--goal", required=True)
-    n.add_argument("--deploy", required=True)
-    n.add_argument("--live-test", required=True)
-    n.add_argument("--session")
+    n.add_argument("--user-source", help="answer:<session>/<uuid> \"...\" or user:<session>/<uuid> \"...\"")
+    n.add_argument("--ask", help="(legacy goal, answer: source) the registered done ask the answer must carry")
+    n.add_argument("--deploy", help=argparse.SUPPRESS)
+    n.add_argument("--live-test", help=argparse.SUPPRESS)
+    n.add_argument("--session", help=argparse.SUPPRESS)
+    pr = sub.add_parser("propose", help="(main) propose acceptance gates for a goal, bound to a registered ask")
+    pr.add_argument("--goal", required=True)
+    pr.add_argument("--gates-file", required=True)
+    pr.add_argument("--ask", required=True)
+    pr.add_argument("--title")
+    pr.add_argument("--ticket")
+    ag = sub.add_parser("agree", help="(main) record the user's agreement to the proposed gates")
+    ag.add_argument("--goal", required=True)
+    ag.add_argument("--user-source", required=True)
+    rd = sub.add_parser("ready", help="(main) mark an ACTIVE goal READY when every gate has qualifying evidence")
+    rd.add_argument("--goal", required=True)
+    rd.add_argument("--ask", required=True, help="the registered ask main will put to the user for the done decision")
+    sub.add_parser("migrate-lifecycle", help="(main, once) mark every goal without a lifecycle as legacy")
     v = sub.add_parser("activate", help="(main) enforce an imported goal")
     v.add_argument("--goal", required=True)
     t = sub.add_parser("retire", help="(main) the user cancelled the goal")
@@ -2257,15 +2636,28 @@ def run(args, home: Path) -> tuple:
                  target_source=args.target_source, aliases=args.aliases)
         return {"ok": True, "goal": args.goal}, 0
     if args.cmd == "attach":
-        attach_evidence(home, args.goal, args.evidence, kind=args.kind or "", session=args.session, remove=args.remove)
+        attach_evidence(home, args.goal, args.evidence, kind=args.kind or "", session=args.session, remove=args.remove,
+                        gate=args.gate or "")
         return {"ok": True, "goal": args.goal, "evidence": args.evidence}, 0
     if args.cmd == "defer":
         defer_goal(home, args.goal, ask=args.ask, ticket=args.ticket, user_source=args.user_source, until=args.until,
                    session=args.session)
         return {"ok": True, "goal": args.goal}, 0
     if args.cmd == "done":
-        done_goal(home, args.goal, deploy=args.deploy, live_test=args.live_test, session=args.session)
-        return {"ok": True, "goal": args.goal}, 0
+        done_goal(home, args.goal, user_source=args.user_source, deploy=args.deploy, live_test=args.live_test,
+                  session=args.session, ask=args.ask)
+        return {"ok": True, "goal": args.goal, "lifecycle": "done"}, 0
+    if args.cmd == "propose":
+        propose_goal(home, args.goal, args.gates_file, args.ask, title=args.title, ticket=args.ticket)
+        return {"ok": True, "goal": args.goal, "lifecycle": "pending"}, 0
+    if args.cmd == "agree":
+        agree_goal(home, args.goal, args.user_source)
+        return {"ok": True, "goal": args.goal, "lifecycle": "agreed"}, 0
+    if args.cmd == "ready":
+        ready_goal(home, args.goal, ask=args.ask)
+        return {"ok": True, "goal": args.goal, "lifecycle": "ready"}, 0
+    if args.cmd == "migrate-lifecycle":
+        return dict(migrate_lifecycle(home), ok=True), 0
     if args.cmd == "activate":
         activate_goal(home, args.goal)
         return {"ok": True, "goal": args.goal}, 0

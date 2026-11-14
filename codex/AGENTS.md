@@ -13,6 +13,7 @@ User-wide defaults. Follow higher-priority instructions and repository rules. We
 
 ## Finish what you start
 
+- Owner-worthy work starts PENDING in the mission ledger until the user agrees machine-checkable gates; main drives it to READY with evidence for every gate and only the user's own words make it DONE (goodqa#15952; operations.md, Initiative lifecycle). Name the goal in owner work as `[goal:<id>]`.
 - One owner drives one stream to live and tested. Main owns scope, the owner cap (8 live owners; the Claude spawn hook warns on a ninth, main keeps it), merges and user communication; it does not relay. Owners report at checkpoints; routine notes need no reply.
 - Fast path for small, localized, reversible fixes in the current checkout with a WAL intent, one focused check and a diff review. Substantive work (behavior or data contracts, auth, security, privacy, migrations, dependencies, unclear product choices, anything not quickly checkable) goes to a background owner on a feature branch in its own worktree, started asynchronously so the main chat stays available.
 - Commit each coherent green step and push the feature branch at least every 30 minutes; reviews gate the merge, not the push.

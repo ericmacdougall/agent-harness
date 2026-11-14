@@ -99,6 +99,11 @@ def validate(policy):
     for key in BOOL_CAPS:
         if key in caps and type(caps[key]) is not bool:
             raise TierError('caps.%s must be true or false' % key)
+    if 'lifecycle_gate' in caps and caps['lifecycle_gate'] not in ('warn', 'enforce'):
+        # goodqa#15952: a typo must not silently mean warn (or anything else)
+        raise TierError('caps.lifecycle_gate must be "warn" or "enforce"')
+    if 'lifecycle_pending_build' in caps and type(caps['lifecycle_pending_build']) is not bool:
+        raise TierError('caps.lifecycle_pending_build must be true or false')
     families = policy.get('families')
     if not isinstance(families, dict) or set(families) != {'claude', 'openai'}:
         raise TierError('families must cover claude and openai')

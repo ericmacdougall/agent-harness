@@ -623,11 +623,20 @@ def answer_text(record, ask_ids):
         return None
     # Only the user's selections count (toolUseResult.answers: question -> answer). The rendered tool_result string
     # embeds the agent's own question text, so it is never parsed; no structured answers means no answer.
-    answers = record["toolUseResult"].get("answers") if isinstance(record["toolUseResult"], dict) else None
-    if not isinstance(answers, dict):
+    answers = answer_map(record)
+    if not answers:
         return None
-    values = [v.strip() for v in answers.values() if isinstance(v, str) and v.strip()]
-    return "\n".join(values) if values else None
+    return "\n".join(answers.values())
+
+
+def answer_map(record) -> dict:
+    """{question: answer} of a tool result's structured AskUserQuestion selections (non-empty strings only). Callers
+    must have bound the record to an AskUserQuestion tool_use first (answer_text, answer_pairs)."""
+    result = record.get("toolUseResult") if isinstance(record, dict) else None
+    answers = result.get("answers") if isinstance(result, dict) else None
+    if not isinstance(answers, dict):
+        return {}
+    return {q: v.strip() for q, v in answers.items() if isinstance(q, str) and isinstance(v, str) and v.strip()}
 
 
 def excerpt_in(text: str, excerpt: str):
@@ -699,6 +708,12 @@ def askuser_bound(path: Path, use_id) -> set:
 
 
 def answer_turn(session: str, uid: str, home=None) -> dict:
+    turn = _answer_record(session, uid, home)
+    turn.pop("_record", None)
+    return turn
+
+
+def _answer_record(session: str, uid: str, home=None) -> dict:
     path = find_transcript(session, home)
     record = load_record(path, "uuid", uid)
     if record == "malformed":
@@ -717,7 +732,22 @@ def answer_turn(session: str, uid: str, home=None) -> dict:
     text = answer_text(record, ids)
     if text is None:
         raise Problem("not-user-authored", "record is not an AskUserQuestion answer bound to an AskUserQuestion tool_use")
-    return {"text": text, "timestamp": record.get("timestamp"), "uuid": uid, "session": session}
+    return {"text": text, "timestamp": record.get("timestamp"), "uuid": uid, "session": session, "_record": record}
+
+
+def answer_detail(session: str, uid: str, home=None) -> dict:
+    """{text, timestamp, pairs} of a verified AskUserQuestion answer record, with one record scan (the transcript can
+    be ~500 MB): the same binding answer_turn checks (goodqa#15952)."""
+    turn = _answer_record(session, uid, home)  # raises Problem unless the record answers a main AskUserQuestion
+    record = turn.pop("_record")
+    return dict(turn, pairs=answer_map(record))
+
+
+def answer_pairs(session: str, uid: str, home=None) -> tuple:
+    """({question: answer}, timestamp) of a verified AskUserQuestion answer record (the same binding answer_turn
+    checks), so a caller can judge the answer to one bound question, never the whole record (goodqa#15952)."""
+    detail = answer_detail(session, uid, home)
+    return detail["pairs"], detail.get("timestamp")
 
 
 def _has_human_turn(path: Path) -> bool:

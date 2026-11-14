@@ -390,9 +390,11 @@ class Initiatives(Collector):
     FIELDS = ("id", "initiative", "state", "milestones_done", "milestones_total", "pct", "owner", "ticket",
               "milestones", "next_step", "next_eta", "full_eta", "note", "updated", "estimate_by")
 
-    def __init__(self, hub, health, reader, path):
+    def __init__(self, hub, health, reader, path, lifecycle=None):
         super().__init__(hub, health)
         self.reader, self.path = reader, Path(path) if path else None
+        self.lifecycle = lifecycle or ledger_lifecycle  # goodqa#15952: {goal id: state} from the mission ledger
+        self.lc_sig, self.lc = None, {"state": "absent", "goals": {}}
         self.sig = None
         self.items: list[dict] = []
         self.stale = False
@@ -406,8 +408,13 @@ class Initiatives(Collector):
             info = os.stat(self.path, follow_symlinks=False)
         except OSError:
             return self._fail("initiatives file missing")
+        lc_changed = self._refresh_lifecycle()
         sig = (info.st_ino, info.st_size, info.st_mtime_ns)
         previous = self.sig
+        if sig == self.sig and lc_changed and not self.error:
+            self.items = [with_lifecycle(i, self.lc) for i in self.items]
+            self.publish(info.st_mtime)
+            return f"{len(self.items)} initiatives"
         if sig == self.sig:
             if self.error:
                 raise ValueError(self.error)
@@ -420,13 +427,28 @@ class Initiatives(Collector):
         rows = data.get("initiatives") if isinstance(data, dict) else data
         if not isinstance(rows, list):
             return self._fail("initiatives file must be a list")
-        self.items = [clean_initiative(r, n) for n, r in enumerate(rows[:100])]
+        self.items = [with_lifecycle(clean_initiative(r, n), self.lc) for n, r in enumerate(rows[:100])]
         self.stale, self.error = False, ""
         self.publish(info.st_mtime)
         if previous is not None:
             self.hub.publish(ev.make("initiative", "initiatives", f"{len(self.items)} initiatives updated",
                                      eid=f"initiatives:{info.st_mtime_ns}"))
         return f"{len(self.items)} initiatives"
+
+    def _refresh_lifecycle(self) -> bool:
+        """Re-read the ledger's lifecycle states when goals.json or its audit head changed. True when they changed."""
+        try:
+            sig, read = self.lifecycle(None)
+        except Exception as error:  # noqa: BLE001 - a ledger problem never breaks the initiatives panel
+            sig, read = ("error", str(error)[:120]), None
+        if sig == self.lc_sig:
+            return False
+        self.lc_sig = sig
+        try:
+            self.lc = read() if callable(read) else {"state": "error", "error": str(sig[1] if isinstance(sig, tuple) else sig)}
+        except Exception as error:  # noqa: BLE001
+            self.lc = {"state": "error", "error": f"{type(error).__name__}: {str(error)[:120]}"}
+        return True
 
     def _fail(self, message: str):
         self.stale, self.error = True, message
@@ -439,6 +461,61 @@ class Initiatives(Collector):
     def snapshot(self, mtime=None) -> dict:
         return {"items": self.items, "stale": self.stale, "error": self.error,
                 "mtime": mtime}
+
+
+def ledger_lifecycle(_unused=None):
+    """(signature, reader) for the mission ledger's lifecycle states. The signature is cheap (two stats), so the 2 s
+    tick re-reads the ledger only when it changed. The reader returns {"state": ok|absent|error|tampered, "goals":
+    {id: STATE}, "error"}. States are lifecycle.effective_state (audit-checked); the user's words are re-resolved by
+    `ah goals`, not here (a transcript read is too heavy for this tick)."""
+    import mission_coverage as mcov  # noqa: PLC0415 - the hooks dir is on sys.path (server.py)
+    home = mcov.home_dir()
+    parts = []
+    for path in (mcov.goals_path(home), mcov.head_path(home)):
+        try:
+            info = os.stat(path, follow_symlinks=False)
+            parts.append((info.st_ino, info.st_size, info.st_mtime_ns))
+        except OSError:
+            parts.append(None)
+
+    def read():
+        loaded = mcov.load_goals(home)
+        if loaded["state"] == "absent":
+            return {"state": "absent", "goals": {}}
+        if loaded["state"] != "ok":
+            return {"state": "error", "goals": {}, "error": str(loaded.get("error") or "")[:160]}
+        audit = mcov.verify_audit(home)
+        if not audit.get("ok"):
+            return {"state": "tampered", "goals": {}, "error": str(audit.get("problem") or "")[:160]}
+        import lifecycle as lcm  # noqa: PLC0415
+        rows = mcov.read_audit_rows(home)
+        out = {}
+        for goal in loaded["goals"]:
+            state, _note = lcm.effective_state(goal, rows, True)
+            out[goal["id"]] = state.upper()
+        return {"state": "ok", "goals": out}
+    return tuple(parts), read
+
+
+LIFECYCLE_CLASSES = {"PENDING", "AGREED", "ACTIVE", "READY", "DONE", "LEGACY", "UNVERIFIED"}
+
+
+def with_lifecycle(item: dict, lc: dict) -> dict:
+    """goodqa#15952 AC-6: the goal ledger's lifecycle state on a dashboard row. A row whose id is not a ledger goal reads
+    NOT IN LEDGER (the dashboard file and the ledger are separate; main imports rows with import-initiatives). No
+    ledger reads NO LEDGER; an unreadable or tampered one reads UNKNOWN, never a state."""
+    item = dict(item)
+    state = (lc or {}).get("state")
+    if state == "ok":
+        item["lifecycle"] = (lc.get("goals") or {}).get(item.get("id"), "NOT IN LEDGER")
+    elif state == "absent":
+        item["lifecycle"] = "NO LEDGER"
+    else:
+        item["lifecycle"] = "UNKNOWN"
+        item["lifecycle_error"] = ev.short(str((lc or {}).get("error") or state or ""), 200)
+    if item["lifecycle"] not in LIFECYCLE_CLASSES | {"NOT IN LEDGER", "NO LEDGER", "UNKNOWN"}:
+        item["lifecycle"] = "UNKNOWN"
+    return item
 
 
 def _num(value):
