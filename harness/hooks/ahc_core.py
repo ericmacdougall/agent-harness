@@ -10,7 +10,9 @@ import hashlib
 import json
 import os
 import re
+import signal
 import stat
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -20,7 +22,44 @@ REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
 TICKET_RE = re.compile(r"GoodQA (?:[A-Za-z0-9_-]{1,40})?#\d{1,9}")
 OWNER_RE = re.compile(r"[A-Za-z0-9_.:-]{3,80}")
 PACKET_MAX_BYTES = 150_000
-GH_TIMEOUT = 60
+GH_TIMEOUT = 60  # = TIMEOUTS["gh"]
+
+
+TIMEOUTS = {"gh": 60, "git": 900, "ah": 60, "review": 1440}   # spec D21; leases are timeout + 60 s
+TIMEOUT_RC = 124
+
+
+def run_argv(argv, timeout, cwd=None, env=None):
+    """Run one child (argv list, never a shell) in its own process group. On timeout the whole group gets SIGTERM,
+    then SIGKILL after 5 s, so a hung gh or git cannot leave helpers behind. Returns (rc, stdout, stderr)."""
+    try:
+        proc = subprocess.Popen(list(argv), cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, start_new_session=True)
+    except OSError as error:
+        return 127, "", str(error)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode, out, err
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        try:
+            out, err = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        return TIMEOUT_RC, out or "", (err or "") + "\ntimeout after %ss; process group killed" % timeout
+
+
+def _kill_group(proc):
+    for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            proc.wait(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
 
 
 class Refused(ValueError):

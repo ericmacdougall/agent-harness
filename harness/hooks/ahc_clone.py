@@ -14,8 +14,12 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ahc_core  # noqa: E402
 
 SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
         "-c", "protocol.ext.allow=never", "-c", "advice.detachedHead=false"]
@@ -29,10 +33,10 @@ class CloneError(RuntimeError):
 
 
 def _git(args, cwd=None, env=None, timeout=GIT_TIMEOUT, check=True):
-    done = subprocess.run(["git", *SAFE, *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
-    if check and done.returncode != 0:
-        raise CloneError(f"git {args[0]} failed (exit {done.returncode}): {done.stderr.strip()[-300:]}")
-    return done
+    rc, out, err = ahc_core.run_argv(["git", *SAFE, *args], timeout, cwd=cwd, env=env)
+    if check and rc != 0:
+        raise CloneError(f"git {args[0]} failed (exit {rc}): {err.strip()[-300:]}")
+    return SimpleNamespace(returncode=rc, stdout=out, stderr=err)
 
 
 def _canonical_config(path, url):
@@ -63,7 +67,7 @@ def prepare(root, repo, url, head, base, env=None):
     path = clone_dir(root, repo)
     Path(root).mkdir(parents=True, exist_ok=True, mode=0o700)
     if not (path / ".git").is_dir():
-        _git(["clone", "--quiet", "--no-checkout", "--", url, str(path)], env=env)
+        _git(["clone", "--quiet", "--no-checkout", "--", url, str(path)], cwd=str(root), env=env)
     _canonical_config(path, url)
     if (path / ".git" / "shallow").exists():
         _git(["fetch", "--quiet", "--unshallow", "origin"], cwd=path, env=env)

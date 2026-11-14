@@ -47,13 +47,14 @@ STOP_AFTER = None   # test hook: raise after this state is persisted (simulates 
 
 TERMINAL = {"refused", "lint-failed", "stale-head", "superseded", "review-error", "needs-attention", "blocked",
             "merged", "closed"}
-NON_TERMINAL = {"queued", "deferred", "reviewing", "pass-awaiting-main"}
+NON_TERMINAL = {"queued", "deferred", "reviewing", "routed-to-main"}
 OWNER_NOTICE_STATES = {"refused", "lint-failed", "stale-head", "review-error", "needs-attention", "blocked"}
-REVIEW_TIMEOUT = 720            # per provider, peer_review's cap
-REVIEW_WALL = 2 * REVIEW_TIMEOUT + 300
-LEASE_SECONDS = REVIEW_WALL + 300
-PASS_RECHECK = 3600             # pass-awaiting-main: re-read the PR this often
-PASS_ESCALATE = 4 * 3600        # then tell the ticket and the user channel once
+REVIEW_TIMEOUT = 720                     # per provider, peer_review's cap
+REVIEW_WALL = core.TIMEOUTS["review"]    # primary plus one fallback (D21)
+LEASE_SECONDS = REVIEW_WALL + 60         # lease = timeout + 60 s; a reclaim mints a new fencing token
+PASS_RECHECK = 3600             # routed-to-main: re-read the PR this often
+ROUTED_FIRST = 4 * 3600         # D20: ticket escalation 4 h after routing to main ...
+ROUTED_REPEAT = 24 * 3600       # ... then every 24 h while it still waits
 MAX_BODY = 6000
 PROTECTED = ("merge_gate*", "peer_review*", "caller_identity*", "native_main*", "ahc*", "usage_guard*",
              "commit_policy*", "review_diagnostics*", "settings.json", "settings.local.json", "hooks_manifest.json",
@@ -197,17 +198,81 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 """
 
 
+SCHEMA_VERSION = 1
+# Forward-only migrations: MIGRATIONS[n] takes a database at version n-1 to version n. Version 0 is a ledger written
+# before schema_version existed (same tables). Each runs inside one transaction after a file copy (spec v14, NEG-37).
+MIGRATIONS = {1: []}
+
+
+class SchemaError(RuntimeError):
+    """The ledger's schema is unknown or newer than this code; the daemon must not start."""
+
+
 class Ledger:
     def __init__(self, paths):
         paths.ensure()
         self.paths = paths
         self.path = paths.root / "ledger.sqlite3"
+        fresh = not self.path.exists()
         self.db = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=FULL")
-        self.db.executescript(SCHEMA)
+        try:
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=FULL")
+            self._schema(fresh)
+        except Exception:
+            self.db.close()
+            raise
         os.chmod(self.path, 0o600)
+
+    def _version(self):
+        has_meta = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
+        if not has_meta:
+            has_items = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='items'").fetchone()
+            return 0 if has_items else None
+        row = self.db.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row["v"])
+        except (TypeError, ValueError):
+            raise SchemaError("unreadable schema_version %r in %s" % (row["v"], self.path)) from None
+
+    def _schema(self, fresh):
+        version = None if fresh else self._version()
+        if version is None:
+            with self.tx():
+                for statement in _statements(SCHEMA):
+                    self.db.execute(statement)
+                self.db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('schema_version', ?)",
+                                (str(SCHEMA_VERSION),))
+            return
+        if version > SCHEMA_VERSION or version < 0:
+            raise SchemaError("ledger schema_version %d is not supported by this ahc (knows %d); refusing to start"
+                              % (version, SCHEMA_VERSION))
+        if version == SCHEMA_VERSION:
+            return
+        self.backup("pre-v%d" % SCHEMA_VERSION)
+        with self.tx():
+            for step in range(version + 1, SCHEMA_VERSION + 1):
+                if step == 1:
+                    for statement in _statements(SCHEMA):
+                        self.db.execute(statement)
+                for statement in MIGRATIONS[step]:
+                    self.db.execute(statement)
+            self.db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('schema_version', ?)",
+                            (str(SCHEMA_VERSION),))
+
+    def backup(self, label):
+        """Copy the whole database (SQLite online backup) before a migration; returns the copy path."""
+        target = self.path.with_name("%s.%s.%d.bak" % (self.path.name, label, int(time.time())))
+        copy = sqlite3.connect(str(target))
+        try:
+            self.db.backup(copy)
+        finally:
+            copy.close()
+        os.chmod(target, 0o600)
+        return target
 
     def close(self):
         self.db.close()
@@ -251,6 +316,10 @@ class Ledger:
         token = int(row["v"]) + 1 if row else 1
         self.db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('fence', ?)", (str(token),))
         return token
+
+
+def _statements(script):
+    return [part.strip() for part in script.split(";") if part.strip()]
 
 
 class _Tx:
@@ -391,7 +460,7 @@ class Worker:
         req = json.loads(row["request"])
         token = self.lease(iid)
         state = row["state"]
-        if state == "pass-awaiting-main":
+        if state == "routed-to-main":
             return self.recheck_pass(iid, token, req)
         if self.circuit_open():
             return self.settle(iid, token, state, self.now() + 1800, event="circuit-open-wait")
@@ -487,10 +556,11 @@ class Worker:
         verdict = core.verify_receipt(result["rc"], data["report"], req["head"], data["packet"])
         name = verdict["verdict"]
         if name == "PASS" or name == "PASS-WITH-TICKETS":
-            self.settle(iid, token, "pass-awaiting-main", self.now() + PASS_RECHECK, event="pass", verdict=name,
-                        pass_at=self.now())
+            reason = "pass-gate1" + ("; " + data["protected"] if data.get("protected") else "")
+            self.settle(iid, token, "routed-to-main", self.now() + PASS_RECHECK, event="pass", verdict=name,
+                        routed_at=self.now(), routed_reason=reason)
             self.notify_pass(iid, req, data, name)
-            return "pass-awaiting-main"
+            return "routed-to-main"
         if name == "BLOCK":
             with self.led.tx():
                 self.led.db.execute("UPDATE lineage SET block_rounds=block_rounds+1 WHERE lineage=?",
@@ -547,7 +617,7 @@ class Worker:
             pr = None
         now = self.now()
         if not isinstance(pr, dict):
-            return self.settle(iid, token, "pass-awaiting-main", now + PASS_RECHECK, event="recheck-unreadable")
+            return self.settle(iid, token, "routed-to-main", now + PASS_RECHECK, event="recheck-unreadable")
         if pr.get("state") == "MERGED":
             return self.settle(iid, token, "merged", event="merged-by-main",
                                merge_commit=(pr.get("mergeCommit") or {}).get("oid"))
@@ -555,14 +625,20 @@ class Worker:
             return self.settle(iid, token, "closed", event="closed")
         if pr.get("headRefOid") != req["head"]:
             return self.settle(iid, token, "stale-head", event="head-moved-after-pass")
-        if now - float(data.get("pass_at", now)) >= PASS_ESCALATE and not data.get("pass_escalated"):
-            self.settle(iid, token, "pass-awaiting-main", now + PASS_RECHECK, event="pass-escalated",
-                        pass_escalated=now)
-            body = ("PASS receipt for %s#%s at %s has waited %d h for main's merge.\nReceipt: %s"
-                    % (req["repo"], req["pr"], req["head"], PASS_ESCALATE // 3600, data.get("report")))
-            self.queue_notice(iid, "pass-overdue", "user", body, requires_ack=False)
-            return "pass-awaiting-main"
-        return self.settle(iid, token, "pass-awaiting-main", now + PASS_RECHECK, event="recheck")
+        routed_at = float(data.get("routed_at", now))
+        last = data.get("routed_escalated_at")
+        due = (now - routed_at >= ROUTED_FIRST) if last is None else (now - float(last) >= ROUTED_REPEAT)
+        if due:
+            count = int(data.get("routed_escalations", 0)) + 1
+            self.settle(iid, token, "routed-to-main", now + PASS_RECHECK, event="routed-escalated",
+                        routed_escalated_at=now, routed_escalations=count)
+            body = ("Routed to main (%s) for %s#%s at %s; still waiting after %d h.\nReceipt: %s\nMain runs: %s"
+                    % (data.get("routed_reason", "pass-gate1"), req["repo"], req["pr"], req["head"],
+                       int((now - routed_at) // 3600), data.get("report"), merge_command(req)))
+            self.queue_notice(iid, "routed-overdue-%d" % count, "user", body, requires_ack=False)
+            return "routed-to-main"
+        return self.settle(iid, token, "routed-to-main", now + PASS_RECHECK, event="recheck")
+
 
     def circuit_open(self):
         return self.led.db.execute("SELECT 1 FROM circuits WHERE provider='review'").fetchone() is not None
@@ -712,7 +788,7 @@ def supersede(worker):
     newest = {}
     for row in rows:
         live = led.db.execute("SELECT id FROM items WHERE lineage=? AND state IN ('queued','deferred','reviewing',"
-                              "'pass-awaiting-main') ORDER BY submitted DESC, id LIMIT 1", (row["lineage"],)).fetchone()
+                              "'routed-to-main') ORDER BY submitted DESC, id LIMIT 1", (row["lineage"],)).fetchone()
         newest[row["lineage"]] = live["id"]
         if row["id"] != live["id"]:
             token = worker.lease(row["id"])
@@ -730,24 +806,24 @@ def tick(paths, config, deps):
             summary["recovered"].append((row["id"], worker.recover(row)))
         supersede(worker)
         now = worker.now()
-        due = ledger.db.execute("SELECT * FROM items WHERE state IN ('queued', 'deferred', 'pass-awaiting-main') "
+        due = ledger.db.execute("SELECT * FROM items WHERE state IN ('queued', 'deferred', 'routed-to-main') "
                                 "AND next_action_at <= ? ORDER BY next_action_at, submitted, id", (now,)).fetchall()
         reviewed = False
         for row in due:
-            if row["state"] != "pass-awaiting-main" and reviewed:
+            if row["state"] != "routed-to-main" and reviewed:
                 continue  # one review per tick on this host (D7)
             current = ledger.item(row["id"])
             if current["state"] != row["state"]:
                 continue
             outcome = worker.process(current)
             summary["processed"].append((row["id"], outcome))
-            if row["state"] != "pass-awaiting-main" and ledger.db.execute(
+            if row["state"] != "routed-to-main" and ledger.db.execute(
                     "SELECT 1 FROM effects WHERE item=? AND kind='review'", (row["id"],)).fetchone():
                 reviewed = True
         worker.escalate()
         worker.dispatch_effects()
         missing = ledger.db.execute("SELECT id FROM items WHERE state IN ('queued','deferred','reviewing',"
-                                    "'pass-awaiting-main') AND next_action_at IS NULL").fetchall()
+                                    "'routed-to-main') AND next_action_at IS NULL").fetchall()
         summary["defects"] = ["I2: %s has no next_action_at" % row["id"] for row in missing]
     except _Stop:
         summary["stopped"] = True
@@ -886,20 +962,14 @@ class LiveDeps:
         return time.time()
 
     def _run(self, argv, timeout):
-        try:
-            done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
-        except subprocess.TimeoutExpired:
-            return 124, "", "timeout after %ss" % timeout
-        except OSError as error:
-            return 127, "", str(error)
-        return done.returncode, done.stdout, done.stderr
+        return core.run_argv(argv, timeout)
 
     def gh(self, argv, timeout):
-        return self._run(argv, timeout)
+        return self._run(argv, min(timeout, core.TIMEOUTS["gh"]))
 
     def ah(self, argv, timeout):
         script = str(self.config.get("ah", Path.home() / ".claude/hooks/ah.py"))
-        return self._run([sys.executable, script] + list(argv[1:]), timeout)
+        return self._run([sys.executable, script] + list(argv[1:]), min(timeout, core.TIMEOUTS["ah"]))
 
     def review(self, argv, timeout):
         rc, _out, err = self._run(argv, timeout)
@@ -910,7 +980,8 @@ class LiveDeps:
         floor = int(self.config.get("disk_floor_bytes", 20 * 1024 ** 3))
         if shutil.disk_usage(str(self.paths.clones)).free < floor:
             raise RuntimeError("disk floor: less than %d GiB free for clones" % (floor // 1024 ** 3))
-        return ahc_clone.prepare(self.paths.clones, repo, "https://github.com/%s.git" % repo, head, base)
+        url = self.config.get("clone_urls", {}).get(repo, "https://github.com/%s.git" % repo)
+        return ahc_clone.prepare(self.paths.clones, repo, url, head, base)
 
     def merge_base(self, clone, head, base):
         import ahc_clone
@@ -939,6 +1010,18 @@ def load_config(paths):
 def submit_with_lint(paths, config, req):
     """`ahc submit`: validate, lint synchronously (AC-25) and enqueue. Rejects with the lint tool's exact text."""
     norm = core.validate(config, req)
+    capacity = int(bounds(config)["queue_capacity"])
+    ledger = Ledger(paths)
+    try:
+        ingest(ledger, paths)
+        existing = ledger.item(core.item_id(norm, hashlib.sha256(Path(norm["packet"]).read_bytes()).hexdigest()))
+        depth = ledger.db.execute("SELECT COUNT(*) AS n FROM items WHERE state IN (%s)" % ",".join(
+            "?" * len(NON_TERMINAL)), sorted(NON_TERMINAL)).fetchone()["n"]
+    finally:
+        ledger.close()
+    if existing is None and depth >= capacity:  # NEG-38; a duplicate resubmit stays a no-op
+        raise core.Refused("the ahc queue is full: %d items waiting (capacity %d); try again later or ask main"
+                           % (depth, capacity))
     text = Path(norm["packet"]).read_text(encoding="utf-8")
     fix = ahc_packet.fix_packet(text, norm["head"], source_path=norm["packet"])
     if fix["status"] == "unfixable":
@@ -1009,7 +1092,14 @@ def main(argv=None):
     _setup_logging(paths)
     deps = LiveDeps(paths, config)
     while True:
-        summary = tick(paths, config, deps)
+        try:
+            summary = tick(paths, config, deps)
+        except SchemaError as error:
+            log.error("schema refusal: %s", error)
+            print("ahc: %s" % error, file=sys.stderr)
+            deps.ah(["ah", "alert", "raise", "--alert-key", "ahc-schema", "--source", "ahc", "--severity", "high",
+                     "--message", "ahc refused to start: " + _short(error)], 60)
+            return 3
         log.info("tick %s", json.dumps(summary, default=str))
         if args.once:
             print(json.dumps(summary, default=str))
