@@ -14,8 +14,9 @@ All commands run on the build host. `C` is `python3 ~/coordinator-v2/agent-harne
 | List tasks | `C tasks` |
 | One task | `C show t-<id>` |
 | Submit a task | `C submit --kind agent --text "..." [--ticket goodqa#N] [--needs run-commands] [--key K] [--wait 300]` |
-| Chat | `C chat status`, `C chat run <task> ticket:goodqa#N`, `C chat help` |
-| Approve a browser sign-in | `C logins`, then `C approve ABCD-EFGH` |
+| Chat | `C chat status`, `C chat unreviewed`, `C chat run <task> ticket:goodqa#N`, `C chat help` |
+| Queue a PR review | `C review --repo owner/name --pr N --packet FILE --ticket goodqa#N --owner <agent id>` (repo must be in `COORD_REVIEW_REPOS` in `~/.config/coordd.env`) |
+| Approve a browser sign-in | `C logins`, then `C approve ABCD-EFGH` (shows the requester and asks; `--yes` skips the question for scripted use after reading `logins`) |
 | Remove every browser session | `C logout-all` |
 | Service state | `systemctl --user status coordd.service mission-control.service` |
 | Restart | `systemctl --user restart coordd.service` |
@@ -40,7 +41,8 @@ Both services listen on loopback only (coordinator page 47625, Mission Control 4
 | --- | --- | --- |
 | `status` | built in | Host facts, no model. |
 | `agent` | `codex-pool-build` | A read-only worker through the budget-capped Codex pool. It can answer; it cannot run commands on this host today, so a task with `--needs run-commands` is `blocked` instead of dispatched. |
-| `chat` | command table | `status`, `tasks`, `show`, `run`, `help`. Free-form text needs an agent CLI signed in with a subscription on the host; API keys are never used for chat. |
+| `review` | `review-receipt` | Runs `peer_review.py pr` at the PR's exact head in a service-owned clone and writes PASS or BLOCK with findings to the ticket. The receipt is unbound: it never authorizes a merge. An unchanged head and packet is not re-run. Needs a reviewer CLI signed in on the host; a packet that fails lint is `blocked` with the lint lines. |
+| `chat` | command table | `status`, `tasks`, `unreviewed`, `show`, `run`, `help`. Free-form text needs an agent CLI signed in with a subscription on the host; API keys are never used for chat. |
 
 Task states: `queued`, `running`, `done`, `failed` (tried and went wrong), `blocked` (could not be attempted or verified), `outcome-unknown` (interrupted where a rerun is not known to be safe).
 
@@ -51,3 +53,5 @@ Rules the code keeps:
 - After a restart, a running task is requeued only on a replay-safe lane and within its attempt budget of 2.
 - A transient provider failure (quota, rate limit, overload, timeout) is retried once.
 - Chat runs on its own loop, so a long worker never blocks it.
+- A browser session can use `status`, `tasks`, `unreviewed`, `show` and `help` only. It cannot queue worker or review tasks, name a ticket, reach any model, or approve or list sign-ins; those are host-CLI actions.
+- Every 10 minutes the service lists open PR heads in the allowlisted repos that have no receipt and records each once (`unsubmitted`). A failed listing is recorded as `scan-failed`, never as nothing to do.
