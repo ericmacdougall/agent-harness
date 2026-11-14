@@ -1,0 +1,5 @@
+# Opus adversarial spec review, goodqa#15876 (agent a0c568dfa08e7eb86)
+
+At 12531ec7: BLOCK. G1 which copy runs was not pinned (a worktree copy or a copied ah.py tests itself with its own hash); G2 only command_guard.py was hashed, not the launcher or the modules it imports; G3 the launcher's fallback turns a broken analyser into exit 0 so every negative case passes; G4 the hook child's interpreter and entry were unspecified; mediums: private fixed parent with descriptor-based removal and TMPDIR ignored, argparse abbreviations, expected hashes from the merged commit, git hardening list, payload fields. No way to make it run caller text was found. All folded into the spec at 5dbe780f.
+At 5dbe780f: ACCEPT (spec only; no remaining path to arbitrary text or to deleting something not created). Lows folded in afterwards: L1 pin the string-literal siblings and data files as well as the import closure (D6), L2 any non-empty stderr in an allow or warn case fails (D3), L3 --print-manifest applies the installed-copy check and prints the resolved directory (D6), L4 the tool's own 20 s timeout per launcher run (AC-4).
+Verdict: ACCEPT

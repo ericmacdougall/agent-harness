@@ -253,7 +253,7 @@ class InstallerTests(unittest.TestCase):
         install(self.home, apply=True)
         self.assertEqual([e for e in self.provenance_entries() if e[0] == "Stop"], [("Stop", None, "stop-lint")])
         stop = json.loads((self.claude / "settings.json").read_text())["hooks"]["Stop"]
-        self.assertEqual([h["timeout"] for g in stop for h in g["hooks"]], [10, 15, 15, 30, 20, 5])  # managed stop-lint replaced the manual one; dropped-owner gate, mission gate, WAL cadence, worktree hygiene, Mission Control inbox follow
+        self.assertEqual([h["timeout"] for g in stop for h in g["hooks"]], [10, 15, 15, 15, 10, 30, 20, 5])  # managed stop-lint replaced the manual one; dropped-owner gate, mission gate, idle guard (goodqa#15943), status truth, WAL cadence, worktree hygiene, Mission Control inbox follow
 
     def test_foreign_hook_sharing_a_group_and_users_empty_event_list_survive(self):
         script = str(self.claude / "hooks" / "provenance_hooks.py")
@@ -263,9 +263,23 @@ class InstallerTests(unittest.TestCase):
         (self.claude / "settings.json").write_text(json.dumps(mixed))
         install(self.home, apply=True, provenance=False)
         hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
-        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["other-stop", "python3", "python3", "python3", "python3", "python3"])  # foreign kept; dropped gate, mission gate, WAL cadence, worktree hygiene, Mission Control inbox are not provenance hooks
+        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["other-stop", "python3", "python3", "python3", "python3", "python3", "python3", "python3"])  # foreign kept; dropped gate, mission gate, idle guard (goodqa#15943), status truth (goodqa#15754), WAL cadence, worktree hygiene, Mission Control inbox are not provenance hooks
         self.assertTrue(any("dropped_gate.py" in str(h.get("args")) for g in hooks["Stop"] for h in g["hooks"]))
         self.assertEqual(hooks["Notification"], [])  # untouched, not ours
+
+    def test_idle_guard_registrations_survive_reinstall_once_each(self):  # goodqa#15943 (receipt r6 F2)
+        def idle_entries():
+            hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
+            return sorted((event, h["args"][1], h["timeout"]) for event, groups in hooks.items() for g in groups
+                          for h in g["hooks"] if "idle_guard.py" in str(h.get("args")))
+        expected = [("PermissionDenied", "reject", 5), ("PostToolUseFailure", "reject", 5), ("Stop", "stop", 15),
+                    ("UserPromptSubmit", "reject", 5)]
+        install(self.home, apply=True)
+        self.assertEqual(idle_entries(), expected)
+        install(self.home, apply=True)
+        install(self.home, apply=True, provenance=False)
+        self.assertEqual(idle_entries(), expected)  # neither dropped nor duplicated
+        self.assertTrue((self.claude / "hooks" / "idle_guard.py").is_file())
 
     def test_no_provenance_hooks_flag_unregisters_and_default_restores(self):
         install(self.home, apply=True)

@@ -29,7 +29,8 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "heavy_job_guard.py", "dropbox_budget.conf", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py", "ops_watch.py", "resource_limits.json",
          "domain_gates.py", "domain_checklists.json",
          "command_guard.py", "command_guard_hook.py", "redact.py", "kill_guard.py", "kill_guard_policy.json",
-         "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "ah_kill.py", "ah_worktree.py", "ah_ticket.py", "liveness.py",
+         "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "ah_kill.py", "ah_worktree.py", "ah_install.py", "guard_selftest.py", "ah_ticket.py", "liveness.py",
+         "ah_export.py",  # ah export: redacted local HTML of a session (goodqa#15788)
          "remote_delete.py", "remote_delete_agent.py",
          "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
          "ahd.py", "ahd_peek.py", "ahd_policy.json",
@@ -41,6 +42,9 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "trivy_gate.py",  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
          "mc_chat.py", "mc_inbox.py",  # Mission Control chat store and inbox CLI/hook (goodqa#15585)
          "mission_coverage.py", "mission_gate.py",  # mission goals: owner, disposition or done evidence (goodqa#15565)
+         "goals_view.py", "status_truth.py", "stop_blocks.py",  # `ah goals`, status lint and injection (goodqa#15754)
+         "gq_browser.py",  # GoodQA worker browser CLI and stdio MCP server; main registers the MCP (goodqa#15745)
+         "idle_guard.py",  # main-idle detector, Stop block and rejected-question reminder (goodqa#15943)
          "shellwords.py")  # quote-aware command splitting shared by mission_gate and dropped_gate (goodqa#15684)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
@@ -92,7 +96,7 @@ def managed_scripts(claude: Path) -> set[str]:
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
                          "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",
-                         "mc_inbox.py", "mission_gate.py")}
+                         "mc_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -216,6 +220,9 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
             "hooks": [spec_gate],
         }],
     }
+    # Dispatch records (goodqa#15794): PostToolUse closes the spawn's dispatch with the models the harness reported, and a
+    # SendMessage to an indexed agent reopens it (a resume). Silent and fail-open; it cannot block, so no onFailure.
+    managed.setdefault("PostToolUse", []).append({"matcher": "Agent|Task|SendMessage", "hooks": [ladder("dispatch")]})
     if command_guard:
         managed["PreToolUse"].insert(0, command_guard_group(claude))
         managed["PreToolUse"].insert(1, kill_guard_group(claude))
@@ -239,6 +246,20 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     # disposition and no done evidence. Main only, bounded per signature, silent where no goals file exists.
     managed.setdefault("Stop", []).append({"hooks": [{"type": "command", "command": "python3",
                                                        "args": [str(claude / "hooks" / "mission_gate.py")], "timeout": 15}]})
+    # Idle guard (goodqa#15943): blocks main's turn end while the session is idle with a non-user next step, and adds
+    # one reminder line after a user rejection. Main only, bounded per signature, fails open.
+    idle = str(claude / "hooks" / "idle_guard.py")
+    managed.setdefault("Stop", []).append({"hooks": [{"type": "command", "command": "python3", "args": [idle, "stop"],
+                                                       "timeout": 15}]})
+    for event in ("PostToolUseFailure", "PermissionDenied", "UserPromptSubmit"):
+        managed.setdefault(event, []).append({"hooks": [{"type": "command", "command": "python3",
+                                                         "args": [idle, "reject"], "timeout": 5}]})
+    # Status truth (goodqa#15754): a status question gets the goal ledger, a compaction re-injects it, and main's Stop
+    # lint catches a goal-status answer that contradicts it. Mission session only; fails open; mode status_lint.
+    truth = str(claude / "hooks" / "status_truth.py")
+    for event, arg in (("UserPromptSubmit", "prompt"), ("SessionStart", "session-start"), ("Stop", "stop")):
+        managed.setdefault(event, []).append({"hooks": [{"type": "command", "command": "python3", "args": [truth, arg],
+                                                         "timeout": 10}]})
     # WAL cadence (rule W04, goodqa#14908): one bounded nudge when a big uncommitted diff has no recent WAL note.
     # Fails open on its own errors, so no onFailure.
     cadence = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "wal_cadence.py")], "timeout": 30}
@@ -258,6 +279,12 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     managed.setdefault("PreToolUse", []).append({"matcher": "Bash", "hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "mission_gate.py"), "pretool"],
         "timeout": 5}]})
+    # ... and deletes that stamp when the call ends, fails or is denied (goodqa#15754 red-team F1): a stamp of a call
+    # that never ran must not be honoured by a later process. Never denies anything; fails open.
+    for event in ("PostToolUse", "PostToolUseFailure", "PermissionDenied"):
+        managed.setdefault(event, []).append({"matcher": "Bash", "hooks": [{
+            "type": "command", "command": "python3", "args": [str(claude / "hooks" / "mission_gate.py"), "posttool"],
+            "timeout": 5}]})
     # Local-ledger reminder (docs/ledger.md): rate limited and dismissible; fails open, so no onFailure.
     reminder = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "ledger_reminder.py")], "timeout": 3}
     for event in ("SessionStart", "UserPromptSubmit"):

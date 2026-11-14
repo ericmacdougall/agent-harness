@@ -44,7 +44,7 @@ EXCERPT_MIN, EXCERPT_MAX, EXCERPT_SEGMENTS = 12, 300, 3
 RATIONALE_MIN = 10
 MODES = ("off", "warn", "enforce")
 DEFAULT_POLICY = {
-    "schema": 1, "spec": "enforce", "plan_packet": "warn", "ask_user_question": "enforce", "stop_lint": "warn", "ticket_lookup": "enforce",
+    "schema": 1, "spec": "enforce", "plan_packet": "warn", "ask_user_question": "enforce", "stop_lint": "warn", "ticket_lookup": "enforce", "status_lint": "warn",
     "wal": {"requirement": "enforce", "ask": "enforce", "blocker": "warn", "scope": "warn", "decision": "warn"},
 }
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,40}$")
@@ -102,7 +102,7 @@ def read_text_arg(path, limit: int = 4 * SMALL_FILE) -> str:
 
 
 MODE_RANK = {"off": 0, "warn": 1, "enforce": 2}
-POLICY_KEYS = ("spec", "plan_packet", "ask_user_question", "stop_lint", "ticket_lookup")
+POLICY_KEYS = ("spec", "plan_packet", "ask_user_question", "stop_lint", "ticket_lookup", "status_lint")
 
 
 def stricter(current, wanted):

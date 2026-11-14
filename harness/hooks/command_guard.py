@@ -38,6 +38,7 @@ import errno
 import fnmatch
 import hashlib
 import hmac
+import itertools
 import json
 import os
 import posixpath
@@ -51,6 +52,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+import urllib.parse
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -60,7 +62,7 @@ POLICY_FILE = HERE / 'command_guard_policy.json'
 
 DEFAULT_POLICY = {
     'version': 1,
-    'modes': {'secret_dump': 'enforce', 'log_delete': 'enforce', 'broad_kill': 'warn'},
+    'modes': {'secret_dump': 'enforce', 'log_delete': 'enforce', 'broad_kill': 'warn', 'bulk_staging': 'warn'},
     'limits': {'max_command_bytes': 262144, 'max_depth': 8, 'max_nodes': 600000, 'max_seconds': 3.0,
                'max_stdin_bytes': 4194304},
     # Tier A: logs, WALs and approval state. Every destructive form is refused, including overwrites.
@@ -121,10 +123,14 @@ DEFAULT_POLICY = {
         r'(^|/)\.npmrc$', r'(^|/)\.netrc$', r'(^|/)\.pgpass$', r'(^|/)\.git-credentials$',
         r'(^|/)\.docker/config\.json$', r'(^|/)\.config/gh/hosts\.yml$', r'(^|/)\.kube/config$',
         r'(^|/)\.vault-token$',
+        r'(^|/)\.config/goodqa/user-token$', r'(^|/)\.agent-harness/gq-browser/[0-9a-f]{16}/key$',
         r'(^|/)\.config/gcloud/(?:credentials\.db|access_tokens\.db|application_default_credentials\.json|legacy_credentials/.*)$',
         r'(^|/)\.gnupg/(?:private-keys-v1\.d/.*|secring\.gpg)$',
         r'^/proc/(?:self|[0-9]+|\*)/environ$', r'^/proc/[^/]+/environ$'],
     'credential_allow_regexes': [r'\.pub$', r'\.env\.(?:example|sample|template|dist|defaults)$', r'-cert\.pub$'],
+    # directories that HOLD a credential file among harmless ones (config.json, lease files): a recursive reader, an archive to
+    # stdout, a copy tool or a find -exec naming the directory prints the secret; a plain read of a neighbour stays allowed
+    'credential_parent_dirs': ['{home}/.config/goodqa', '{home}/.agent-harness/gq-browser'],
     'credential_dirs': ['{home}/.ssh', '{home}/.aws', '{home}/.config/rclone', '{home}/.claude/goodqa-hive',
                         '{home}/.gnupg', '{home}/.docker', '{home}/.config/gh', '{home}/.config/gcloud',
                         '{home}/.kube'],
@@ -132,7 +138,8 @@ DEFAULT_POLICY = {
                            '{home}/.aws/credentials', '{home}/.config/rclone/rclone.conf', '{home}/.npmrc',
                            '{home}/.netrc', '{home}/.docker/config.json', '{home}/.claude/goodqa-hive/member.key',
                            '{home}/.config/gh/hosts.yml', '{home}/.claude/.credentials.json',
-                           '{home}/.codex/auth.json', '{home}/.pgpass', '{home}/.git-credentials', '{cwd}/.env'],
+                           '{home}/.codex/auth.json', '{home}/.pgpass', '{home}/.git-credentials', '{cwd}/.env',
+                           '{home}/.config/goodqa/user-token', '{home}/.agent-harness/gq-browser/0000000000000000/key'],
     'secret_env_regex': r'(?:SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|APIKEY|ACCESSKEY|PRIVATEKEY)|(?:^|_)(?:KEY|PAT)(?:_|$)',
     'secret_env_exclude_regex': r'(?:_FILE|_PATH|_DIR|_NAME|_COUNT|_LIMIT|_BUDGET|_URL|_ID|_TTL|_EXPIRY|_TIMEOUT)$|^(?:KEYCHAIN|SSH_AUTH_SOCK)',
     'rclone_blocked_config': ['show', 'dump', 'reconnect', 'file', 'redacted', 'paste'],
@@ -154,6 +161,7 @@ DEFAULT_POLICY = {
 }
 
 SECRET_DUMP, LOG_DELETE, BROAD_KILL = 'secret_dump', 'log_delete', 'broad_kill'
+BULK_STAGING = 'bulk_staging'  # goodqa#15787: git add -A, git commit -a in a dirty original checkout; warn by default
 PARSE = 'parse'  # warn-only notes: input the guard could not fully parse
 ALWAYS_ENFORCED = (SECRET_DUMP, LOG_DELETE)
 
@@ -165,7 +173,7 @@ ALWAYS_ENFORCED = (SECRET_DUMP, LOG_DELETE)
 # written or replaced policy cannot switch the guard off.
 ADDITIVE_LISTS = ('protected_log_roots', 'protected_segment_names', 'protected_file_names', 'protected_file_suffixes',
                   'protected_roots', 'keep_names', 'keep_suffixes', 'keep_segments', 'generic_homes', 'ancestor_roots',
-                  'state_files', 'credential_path_regexes', 'credential_dirs', 'credential_samples',
+                  'state_files', 'credential_path_regexes', 'credential_dirs', 'credential_parent_dirs', 'credential_samples',
                   'rclone_blocked_config', 'guard_files', 'owned_checkouts')
 
 
@@ -190,6 +198,8 @@ def _merge(base, override):
     modes = override.get('modes')
     if isinstance(modes, dict) and modes.get(BROAD_KILL) in ('warn', 'enforce'):
         out['modes'][BROAD_KILL] = modes[BROAD_KILL]
+    if isinstance(modes, dict) and modes.get(BULK_STAGING) in ('warn', 'enforce'):
+        out['modes'][BULK_STAGING] = modes[BULK_STAGING]
     return out
 
 
@@ -206,7 +216,7 @@ def load_policy(path=None):
         pass
     modes = policy.get('modes') if isinstance(policy.get('modes'), dict) else {}
     clean = {}
-    for category in (SECRET_DUMP, LOG_DELETE, BROAD_KILL):
+    for category in (SECRET_DUMP, LOG_DELETE, BROAD_KILL, BULK_STAGING):
         mode = modes.get(category, DEFAULT_POLICY['modes'][category])
         if mode not in ('warn', 'enforce'):
             mode = DEFAULT_POLICY['modes'][category]
@@ -270,6 +280,7 @@ class Compiled:
         self.cred = [re.compile(r, re.I) for r in policy['credential_path_regexes']]
         self.cred_allow = [re.compile(r, re.I) for r in policy['credential_allow_regexes']]
         self.cred_dirs = [self._segs(fmt(t, h)) for t in policy['credential_dirs'] for h in homes]
+        self.cred_parent_dirs = [self._segs(fmt(t, h)) for t in policy['credential_parent_dirs'] for h in homes]
         self.cred_samples = [fmt(t, h) for t in policy['credential_samples'] for h in homes]
         self.secret_env = re.compile(policy['secret_env_regex'])
         self.secret_env_excl = re.compile(policy['secret_env_exclude_regex'])
@@ -514,14 +525,23 @@ class Word:
     def text(self):
         return self.alts[0]
 
+    def cred_alts(self, cap=256):
+        """The expansions the credential checks judge: every one (`all_alts`) up to `cap`, past that the first 32 plus the
+        whole word as one glob (`_overflow_glob`), so a credential among them is never skipped (receipt r7: the 1001st of
+        1001 alternatives, or one of 8192 past the 4096 cap)."""
+        alts = self.all_alts()
+        if alts is None or len(alts) > cap:
+            return self.alts[:32] + [_overflow_glob(self.overflow)]
+        return alts or self.alts[:32]
+
     def all_alts(self):
         """Every expansion for target checks: an overflowed brace word is re-expanded with a 4096 cap.
         None means it is still too large, so its targets are unknown."""
         if self.overflow is None:
             return self.alts[:32]
         raw = self.overflow
-        more = brace_expand(raw, limit=4096) if raw.count('{') <= 64 and len(raw) <= 65536 else []
-        if more and len(more) <= 4096:
+        more, complete = brace_expand(raw, limit=4096) if raw.count('{') <= 64 and len(raw) <= 65536 else ([], False)
+        if more and complete:
             return [_unq(a) for a in more]
         return None
 
@@ -643,10 +663,18 @@ def scan_backtick(s, i):
     return n + 1
 
 
+BRACE_WORK = 1 << 22  # characters (4 MiB) one brace expansion may build before it reports an overflow
+
+
 def brace_expand(text, limit=32):
-    """Bash brace expansion on a string whose quoted braces were replaced by sentinels."""
-    out = [text]
-    for _ in range(6):
+    """Bash brace expansion on a string whose quoted braces were replaced by sentinels, run to a fixed point. Each round
+    expands the leftmost group of every item, and every expansion removes that group's `{`, so `text.count('{')` rounds
+    always finish (receipt r11 F1: a fixed six rounds left a seventh group as literal text and still looked complete).
+    Returns (items, complete). complete is False when there are more than `limit` alternatives, when building them
+    passes BRACE_WORK characters, or when an expandable group is left; items then holds at most `limit` partial
+    expansions and the caller treats the word as overflowed."""
+    out, work = [text], 0
+    for _ in range(text.count('{') + 1):
         changed, nxt = False, []
         for item in out:
             m = _find_brace(item)
@@ -657,12 +685,31 @@ def brace_expand(text, limit=32):
             start, end, parts = m
             for part in parts:
                 nxt.append(item[:start] + part + item[end:])
-                if len(nxt) > limit:
-                    return nxt[:limit + 1]  # one extra item tells the caller the expansion overflowed
+                work += len(nxt[-1])
+                if len(nxt) > limit or work > BRACE_WORK:
+                    return nxt[:limit], False
         out = nxt
         if not changed:
-            break
-    return out[:limit]
+            return out[:limit], True
+    return out[:limit], False  # a group is still expandable: never report a half-expanded word as complete
+
+
+# a brace sequence expression, `{1..40}`, `{a..z}`, `{01..10..2}` (bash and zsh): receipt r7, `goodq{a..a}` is goodqa
+_BRACE_SEQ = re.compile(r'(-?\d{1,18})\.\.(-?\d{1,18})(?:\.\.(-?\d{1,18}))?|([A-Za-z])\.\.([A-Za-z])(?:\.\.(-?\d{1,18}))?')
+
+
+def _brace_sequence(m, cap=4097):
+    """The members of a sequence expression, at most `cap` of them (past every expansion limit the caller uses, so a longer
+    one still reads as an overflow). Numbers keep bash's zero padding (`{01..10}`)."""
+    step = abs(int(m.group(3) or m.group(6) or 1)) or 1
+    if m.group(1) is not None:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        pad = max(len(m.group(1)), len(m.group(2))) if re.match(r'-?0\d', m.group(1)) or re.match(r'-?0\d', m.group(2)) else 0
+        seq = range(lo, hi + 1, step) if lo <= hi else range(lo, hi - 1, -step)
+        return ['%0*d' % (pad, v) for v in itertools.islice(seq, cap)]
+    lo, hi = ord(m.group(4)), ord(m.group(5))
+    seq = range(lo, hi + 1, step) if lo <= hi else range(lo, hi - 1, -step)
+    return [chr(v) for v in itertools.islice(seq, cap)]
 
 
 def _find_brace(text):
@@ -684,8 +731,28 @@ def _find_brace(text):
                 last = c + 1
             parts.append(text[last:j - 1])
             return i, j, parts
+        seq = _BRACE_SEQ.fullmatch(text[i + 1:j - 1]) if depth == 0 else None
+        if seq:
+            return i, j, _brace_sequence(seq)
         i = text.find('{', i + 1)
     return None
+
+
+def _overflow_glob(raw):
+    """A brace word past every expansion cap as ONE glob for the credential checks (receipt r7, fail closed): each outermost
+    `{...}` group, a list or a sequence, becomes `*`, which matches every member (`_cred_one` lets `*` cross a `/`, and
+    `under_cred_parent` matches a glob segment), so a credential among 8192 alternatives is still seen."""
+    out, depth = [], 0
+    for ch in raw:
+        if ch == '{':
+            if depth == 0:
+                out.append('*')
+            depth += 1
+        elif ch == '}' and depth:
+            depth -= 1
+        elif depth == 0:
+            out.append(ch)
+    return _unq(''.join(out))
 
 
 # zsh clobber forms (the Bash tool may run zsh): judged as the bash operator with the same effect
@@ -775,13 +842,14 @@ class Lexer:
             return None, i
         raw = ''.join(buf)
         alts = [raw]
-        if '{' in raw and ',' in raw:
+        if '{' in raw and (',' in raw or '..' in raw):
             expandable = raw.count('{') <= 24 and len(raw) <= 2048
+            complete = False
             if expandable:
-                alts = brace_expand(raw)
-            if len(alts) > 32 or not expandable:
-                # too many alternatives (or too big to expand): target checks re-expand it with a larger cap
-                # and treat anything past that as unknown (see Analyzer.target_class)
+                alts, complete = brace_expand(raw)
+            if not complete:
+                # too many alternatives, too big to expand, or not fully expanded: target checks re-expand it with a
+                # larger cap and treat anything past that as unknown (see Analyzer.target_class)
                 w.overflow = raw
                 alts = alts[:32]
         w.alts = [_unq(a) for a in alts]
@@ -1467,6 +1535,28 @@ def _per_worktree_config_refusal(path, common, git_dir, cwd, step):
     return None
 
 
+def _ignored_offenders(status, ignored_ok, ignored_top_ok):
+    """The ignored paths in a `git status --ignored` listing that are not a whole regenerable build directory."""
+    out = []
+    for entry in filter(None, status.split('\x00')):
+        if entry.startswith('!! '):
+            name = entry[3:]
+            leaf = name.rstrip('/').rsplit('/', 1)[-1]
+            top = '/' not in name.rstrip('/')
+            if not (name.endswith('/') and (leaf in ignored_ok or (top and leaf in ignored_top_ok))):
+                out.append(name)
+    return out
+
+
+def _ignored_refusal(names):
+    """The refusal text for ignored files that are not a regenerable build directory, listing up to five of them so an
+    operator can see what to clean (a printable-ASCII, bounded list: names come from the worktree)."""
+    shown = [re.sub(r'[^\x20-\x7e]', '?', n)[:80] for n in names[:5]]
+    more = len(names) - len(shown)
+    return ('it holds an ignored file or folder that is not a whole regenerable build directory: %s%s'
+            % (', '.join(shown) or '?', ' (and %d more)' % more if more > 0 else ''))
+
+
 def _nested_repo(directory, limit=250000, deep=False, seconds=1.5):
     """True for a repository (.git or a bare repo) in the directory or below it (one level for caches, eight for
     generic build dirs); 'large' when the scan hit its entry or time bound; False otherwise."""
@@ -1544,7 +1634,7 @@ def reproducible_clone_refusal(path, policy=None, now=None):
                 leaf = name.rstrip('/').rsplit('/', 1)[-1]
                 top = '/' not in name.rstrip('/')
                 if not (name.endswith('/') and (leaf in ignored_ok or (top and leaf in ignored_top_ok))):
-                    return 'it holds an ignored file or folder that is not a whole regenerable build directory'
+                    return _ignored_refusal(_ignored_offenders(status, ignored_ok, ignored_top_ok))
                 found = _nested_repo(os.path.join(path, name), deep=leaf not in ignored_ok)
                 if found == 'large':
                     return 'an ignored build directory is too large to check for nested repositories in time'
@@ -1724,7 +1814,7 @@ def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None):
                 leaf = name.rstrip('/').rsplit('/', 1)[-1]
                 top_ignored = '/' not in name.rstrip('/')
                 if not (name.endswith('/') and (leaf in ignored_ok or (top_ignored and leaf in ignored_top_ok))):
-                    return 'it holds an ignored file or folder that is not a whole regenerable build directory'
+                    return _ignored_refusal(_ignored_offenders(status, ignored_ok, ignored_top_ok))
                 found = _nested_repo(os.path.join(path, name), limit=int(250000 * scale), deep=leaf not in ignored_ok,
                                      seconds=max(0.2, min(left(), 1.5 * scale)))  # inside the budget that is left
                 if found == 'large':
@@ -1916,7 +2006,85 @@ def _proc_cmd0(pid):
     return os.path.basename(first.decode('utf-8', 'replace')) or None
 
 
-def busy_scan(path, skip_names=()):
+def _proc_args(pid):
+    """The command line of PID from /proc/PID/cmdline as one string (NULs read as spaces, bounded), '' when the process has
+    an empty command line, None when it cannot be read."""
+    try:
+        with open('/proc/%s/cmdline' % pid, 'rb') as handle:
+            return handle.read(8192).replace(b'\x00', b' ').decode('utf-8', 'replace')
+    except OSError:
+        return None
+
+
+def _proc_start(pid):
+    """When PID started, as seconds since the epoch (/proc/PID/stat field 22 and the boot time in /proc/stat), or None."""
+    try:
+        with open('/proc/%s/stat' % pid) as handle:
+            fields = handle.read().rpartition(')')[2].split()
+        ticks = int(fields[19])  # field 22 overall; the first two (pid, comm) are before the closing parenthesis
+        with open('/proc/stat') as handle:
+            boot = next(int(line.split()[1]) for line in handle if line.startswith('btime '))
+        return boot + ticks / float(os.sysconf('SC_CLK_TCK'))
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
+
+
+def _worktree_created(path):
+    """When the linked worktree was created: the modification time of its `.git` file (written once by `git worktree add`),
+    or None when it cannot be read."""
+    try:
+        return os.lstat(os.path.join(path, '.git')).st_mtime
+    except OSError:
+        return None
+
+
+# What may sit in a working directory and was started by a person or an agent: a shell, an interpreter, an editor, a
+# privilege wrapper or a build tool. An unreadable one of these always refuses (an interactive shell run through sg is the
+# real t2-dev finding of goodqa#15739).
+UNREADABLE_ALWAYS_REFUSES = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'busybox', 'mksh', 'pwsh',
+                             'powershell', 'tmux', 'screen', 'vi', 'vim', 'nvim', 'nano', 'emacs', 'less', 'more', 'man',
+                             'make', 'git', 'ssh', 'xargs', 'watch', 'python', 'python2', 'python3', 'node', 'nodejs',
+                             'perl', 'ruby', 'php', 'deno', 'bun', 'lua', 'java', 'go', 'cargo', 'npm', 'pnpm', 'yarn',
+                             'pip', 'uv'}
+# Known long-lived helpers that never work in a project directory: an unreadable one is skipped whatever its start time
+# (the user systemd manager and its sd-pam helper, the ssh and gpg agents, a tailscaled session helper, and the harness's own
+# pgpool test server started through `sg docker`). The name AND the command line must agree; both can be set by the process
+# itself, which is a stated limit (accident prevention, not an access control).
+UNREADABLE_KNOWN_HELPERS = (('(sd-pam)', ''), ('systemd', '--user'), ('ssh-agent', ''), ('gpg-agent', ''),
+                            ('tailscaled', ' be-child '), ('docker', '--label pgpool.tool='), ('sg', 'lanes/pgpool.py serve'))
+# Every other unreadable process (a wrapper such as sg, an agent CLI, pytest, a compiler, a node app that renamed itself) is
+# judged by time: it cannot have been launched from the worktree before the worktree existed, so one that started BEFORE the
+# worktree was created is skipped, and one that started after it, or whose start time or the creation time is unknown, refuses.
+
+
+def unreadable_verdict(pid, name, path, created):
+    """None when an unreadable same-user process may be skipped, else a short reason it still refuses. The process' own
+    working directory cannot be read (a setgid or privilege-separation helper, an sd-pam or sg-docker wrapper), so this is
+    judged from the worktree side, in this order: an unreadable command line refuses; a command line naming the worktree
+    refuses; a shell, editor or interpreter always refuses; a known long-lived helper (name AND command line agree) is
+    skipped whatever its start time; every other process is judged by time, because it cannot have been launched from the
+    worktree before the worktree existed: it is skipped and REPORTED only when it started before the worktree was created,
+    and refuses when it started after or when a start time is unknown. Stated limit: names and command lines can be set by the process itself, and a skipped process may still
+    have the worktree as its working directory (its directory is then deleted under it, no data is lost: the worktree is
+    clean and published); this protects against accident, not against a hostile same-user process."""
+    base = (name or '').strip().lower()
+    args = _proc_args(pid)
+    if args is None:
+        return 'its command line cannot be read'
+    if path in args or os.path.realpath(path) in args:
+        return 'its command line names the worktree'
+    if base in UNREADABLE_ALWAYS_REFUSES:
+        return 'it is a %s, which may sit in the worktree' % base
+    for helper, marker in UNREADABLE_KNOWN_HELPERS:
+        if base == helper and marker in (' ' + args + ' ' if marker.startswith(' ') else args):
+            return None  # a known long-lived helper: skipped whatever its start time
+    started = _proc_start(pid)
+    if started is None or created is None or started >= created:
+        return 'it started after the worktree was created, or a start time is unknown'
+    return None
+
+
+def busy_scan(path, skip_names=(), created=None):
     """Scan the processes for one whose working directory is the worktree or inside it. Returns {'busy': [(pid, command)],
     'unreadable': [(pid, name)], 'failed': bool}: `unreadable` lists processes of THIS user whose cwd link cannot be read
     and that are not on the service list (a shell run through sg or sudo, a setgid helper), `failed` is set when the scan
@@ -1925,7 +2093,17 @@ def busy_scan(path, skip_names=()):
     root daemons whose /proc/PID/cwd a normal user cannot read; goodqa#15739); a same-user unreadable process is skipped
     only by exact Name in `skip_names`. Limits, stated: other users' processes are invisible without root, and open files
     other than the working directory are not checked; plain `git worktree remove` also deletes ignored files."""
-    result = {'busy': [], 'unreadable': [], 'failed': False}
+    result = {'busy': [], 'unreadable': [], 'skipped': [], 'failed': False}
+    ancestors, walk = set(), os.getpid()
+    for _ in range(64):  # the parent chain of this scanner, from /proc/PID/status (readable for every process)
+        try:
+            status = _proc_status(str(walk))
+        except Exception:  # noqa: BLE001 - best effort: not learning the ancestors only means fewer skips (fail closed)
+            break
+        if not isinstance(status, dict) or not isinstance(status.get('ppid'), int) or status['ppid'] <= 1:
+            break
+        walk = status['ppid']
+        ancestors.add(walk)
     try:
         if os.path.isdir('/proc/self'):
             for entry in os.listdir('/proc'):
@@ -1962,6 +2140,13 @@ def busy_scan(path, skip_names=()):
                         # hostile same-user process; it is a standing limit, not a control. Anything else (a shell run through
                         # sg, the docker client, a helper, any other name, an unreadable command line) is reported and refuses.
                         if skip_names and status['name'] in skip_names and _proc_cmd0(entry) == status['name']:
+                            continue
+                        # Judged from the worktree side (goodqa#15870): a setgid or sd-pam helper that cannot be read is
+                        # skipped and reported unless something ties it to the worktree (see unreadable_verdict).
+                        # the scanner's own ancestors are the caller's session (on t2-dev an ssh login runs under an unreadable
+                        # `tailscaled be-child` whose command line carries the very command being run): never a reason to refuse
+                        if int(entry) in ancestors or unreadable_verdict(entry, status['name'], path, created) is None:
+                            result['skipped'].append((int(entry), status['name'] or '?'))
                             continue
                         result['unreadable'].append((int(entry), status['name'] or '?'))
                         continue
@@ -2045,7 +2230,11 @@ def verify_worktree(path, authenticated=False, policy=None):
         except (ValueError, OSError, subprocess.SubprocessError):
             pass
     if reason is None:
-        scan = busy_scan(path, tuple(delegated_policy(policy)['reproducible_clone'].get('busy_skip_names') or ()))
+        scan = busy_scan(path, tuple(delegated_policy(policy)['reproducible_clone'].get('busy_skip_names') or ()),
+                         _worktree_created(path))
+        # the processes that could not be inspected and were skipped are always reported, never silently ignored
+        report['skipped_processes'] = ['pid %d (%s)' % (pid, re.sub(r'[^A-Za-z0-9_.()-]', '?', name)[:20])
+                                       for pid, name in scan.get('skipped', [])[:20]]
         if scan['busy']:
             reason = 'a process is using the worktree as its working directory (pid %d, %s)' % scan['busy'][0]
         elif scan['failed']:
@@ -2055,8 +2244,8 @@ def verify_worktree(path, authenticated=False, policy=None):
                               for pid, name in scan['unreadable'][:3])
             more = len(scan['unreadable']) - 3
             reason = ('could not check for processes using the worktree: %d process(es) of this user cannot be inspected '
-                      '(%s%s); let them end, then retry' % (len(scan['unreadable']), named,
-                                                            ' and %d more' % more if more > 0 else ''))
+                      'and may be using it (%s%s); let them end, then retry' % (len(scan['unreadable']), named,
+                                                                              ' and %d more' % more if more > 0 else ''))
     report['reason'] = reason
     report['removable'] = reason is None and bool(report['repo']) and bool(report['head'])
     return report
@@ -2249,6 +2438,8 @@ PRINT_FILE_CMDS = {'cat', 'head', 'tail', 'less', 'more', 'most', 'bat', 'batcat
                    'emacs', 'pr', 'column', 'jq', 'yq', 'tee', 'type', 'get-content', 'gc', 'select-string', 'sls',
                    'openssl', 'cmp', 'xargs-cat', 'highlight', 'ccat', 'pygmentize', 'tr', 'look', 'expand', 'unexpand',
                    'split', 'csplit', 'tar', 'zip', 'gzip', 'bzip2', 'xz', 'zstd', 'lz4', '7z', 'zcat', 'cpio'}
+ARCHIVE_CMDS = {'tar', 'bsdtar', 'gtar', 'zip', '7z', 'cpio', 'pax', 'gzip', 'bzip2', 'xz', 'zstd',
+                '7za', '7zr', '7zz', 'ditto', 'pigz', 'lz4', 'lzip', 'lzop', 'bsdcpio'}
 GREP_CMDS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'zgrep', 'select-string', 'sls', 'pt'}
 EXFIL_CMDS = {'curl', 'wget', 'scp', 'sftp', 'nc', 'ncat', 'netcat', 'socat', 'rsync', 'http', 'https', 'xh', 'telnet'}
 ECHO_CMDS = {'echo', 'printf', 'print', 'write-output', 'write-host', 'out-host', 'out-string', 'say', 'logger',
@@ -2257,16 +2448,20 @@ SHELLS = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'bus
 PS_SHELLS = {'pwsh', 'powershell'}
 INTERPRETERS = {'python', 'python3', 'python2', 'node', 'nodejs', 'perl', 'ruby', 'php', 'deno', 'bun', 'lua', 'rscript',
                 'osascript', 'pypy', 'pypy3', 'tclsh', 'awk-script'}
-WRAPPER_VALUE_OPTS = {'nice': ('-n', '--adjustment'), 'ionice': ('-c', '-n', '-p', '-t'), 'chrt': ('-p',),
+WRAPPER_VALUE_OPTS = {'sshpass': ('-f', '-d', '-p', '-P'), 'nice': ('-n', '--adjustment'), 'ionice': ('-c', '-n', '-p', '-t'), 'chrt': ('-p',),
                       'stdbuf': ('-i', '-o', '-e'), 'caffeinate': ('-t', '-w'), 'watch': ('-n', '-d', '--interval'),
                       'strace': ('-o', '-e', '-p', '-s', '-u'), 'ltrace': ('-o', '-e', '-p', '-s', '-u'),
                       'runuser': ('-u', '-g', '-G'), 'su': ('-s', '-g', '-G'), 'sg': (), 'setsid': (),
                       'nsenter': ('-t', '--target'), 'firejail': ('--profile',), 'sandbox-exec': ('-f', '-p', '-n'),
-                      'start-process': ('-FilePath', '-ArgumentList'), 'unbuffer': (), 'time': ('-o', '-f')}
+                      'start-process': ('-FilePath', '-ArgumentList'), 'unbuffer': (), 'time': ('-o', '-f'),
+                      # GNU and BSD xargs options that take the next word (receipt r6 sweep: `xargs -n 1 cat`, `xargs -I {} cat {}`)
+                      'xargs': ('-n', '-I', '-J', '-L', '-P', '-R', '-S', '-s', '-d', '-E', '-a', '--max-args', '--replace',
+                                '--max-lines', '--max-procs', '--max-chars', '--delimiter', '--eof', '--arg-file',
+                                '--process-slot-var')}
 WRAPPERS_SIMPLE = {'command', 'builtin', 'exec', 'nohup', 'time', 'nice', 'ionice', 'setsid', 'stdbuf', 'caffeinate',
                    'noglob', 'unbuffer', 'chrt', 'taskset', 'doas', 'sudo', 'env', 'xargs', 'timeout', 'watch', 'gosu',
                    'chroot', 'runuser', 'strace', 'ltrace', 'script', 'dtruss', 'arch', 'nsenter', 'firejail', 'sandbox-exec',
-                   'start-process', 'invoke-expression', 'iex', 'invoke-command', 'icm', 'call', 'start'}
+                   'start-process', 'invoke-expression', 'iex', 'invoke-command', 'icm', 'call', 'start', 'sshpass'}
 RM_CMDS = {'rm', 'unlink', 'rmdir', 'shred', 'srm', 'trash', 'trash-put', 'remove-item', 'ri', 'del', 'erase', 'rd',
            'rimraf', 'gio-trash'}
 MV_CMDS = {'mv', 'move-item', 'mi', 'move', 'rename-item', 'ren', 'rni'}
@@ -2302,6 +2497,760 @@ def _nondash(args):
         elif t == '--':
             after_dd = True
     return out
+
+
+class OptScan:
+    """What a getopt-style walk of a command's words found (see `_scan_options`)."""
+    __slots__ = ('operands', 'letters', 'longs', 'pattern_given', 'uncertain', 'values', 'flag_words')
+
+    def __init__(self):
+        self.operands = []          # words that are neither an option nor the value of a recognised option, in order
+        self.letters = set()        # short option letters read before any value (never letters of a value)
+        self.longs = set()          # long option names (without `--` or `=value`) that are recognised
+        self.pattern_given = False  # a pattern came from an option (-e PAT, -ePAT, -f FILE, --regexp=PAT)
+        self.uncertain = False      # an option the table does not know: it may take the next word, so operands are unsure
+        # every value a recognised option took: ((kind, key), word, attached). kind is 's' (short letter) or 'l' (long
+        # name); attached means the value sits inside the option word itself (-fFILE, --file=FILE), so `word` is that word
+        self.values = []
+        self.flag_words = []        # option words that the table proves hold no value at all (-rn, --count)
+
+
+def _scan_options(args, table):
+    """Walk args like getopt with a per-tool table {'short_values', 'short_flags', 'long_values', 'long_flags',
+    'long_optional', 'pattern_short', 'pattern_long', 'no_equals', 'negatable'}. An option that is in neither list (an
+    unknown letter, an unknown long name, an abbreviation of a long option, an attached `--name=value` of an unknown name)
+    sets `uncertain`; the scan does not let it take the next word. Values of recognised options are consumed (never
+    operands); a value letter that ends a short cluster takes the next word. Nothing a scan finds grants a skip on its own:
+    a caller exempts a word only when the scan is certain (receipt r6: every option recognised, with the same number of
+    values in every implementation the table covers), and judges every word, option words included, otherwise."""
+    scan = OptScan()
+    sv, sf = table.get('short_values', ''), table.get('short_flags', '')
+    lv, lf = table.get('long_values', frozenset()), table.get('long_flags', frozenset())
+    lo = table.get('long_optional', frozenset())  # optional value: known with `=value`, uncertain without (it may take a word)
+    ps, pls = table.get('pattern_short', ''), table.get('pattern_long', frozenset())
+    no_eq = table.get('no_equals', False)         # curl reads `--output=x` as an unknown option, not as --output x
+    negatable = table.get('negatable', False)     # --no-NAME of a known flag is a flag (curl, wget, rsync)
+    words, i, after_dd = list(args), 0, False
+    while i < len(words):
+        w = words[i]
+        t = w.text
+        if after_dd or t == '-' or not t.startswith('-'):
+            scan.operands.append(w)
+            i += 1
+            continue
+        if t == '--':
+            after_dd = True
+            i += 1
+            continue
+        if t.startswith('--'):
+            name, eq, _ = t[2:].partition('=')
+            negated = name[3:] if negatable and name.startswith('no-') else None
+            if eq and no_eq:
+                name = None
+            if name in lv:
+                scan.longs.add(name)
+                scan.pattern_given = scan.pattern_given or name in pls
+                if eq:
+                    scan.values.append((('l', name), w, True))
+                elif i + 1 < len(words):
+                    i += 1  # the separate value
+                    scan.values.append((('l', name), words[i], False))
+            elif name in lf or (eq and name in lo) or (not eq and negated in lf):
+                scan.longs.add(name)  # an exact flag name; an attached `=value` (--color=always) can not take the next word
+                if eq:
+                    scan.values.append((('l', name), w, True))
+                else:
+                    scan.flag_words.append(w)
+            else:
+                scan.uncertain = True  # an unknown name: it may take the next word, which every caller then judges
+            i += 1
+            continue
+        j, take_next, key = 1, False, None
+        while j < len(t):
+            ch = t[j]
+            if ch in sv:
+                scan.pattern_given = scan.pattern_given or ch in ps
+                key = ('s', ch)
+                take_next = j + 1 == len(t)  # otherwise the rest of the cluster is the value
+                break
+            if ch in sf:
+                scan.letters.add(ch)
+                j += 1
+                continue
+            scan.uncertain = True  # an unknown letter: it may take the rest of the cluster or the next word
+            break
+        if key is not None and not take_next:
+            scan.values.append((key, w, True))
+        elif key is None and j >= len(t):
+            scan.flag_words.append(w)
+        if take_next and i + 1 < len(words):
+            i += 1  # the separate value
+            scan.values.append((key, words[i], False))
+        i += 1
+    return scan
+
+
+# Option tables of the recursive searchers. A letter or long name that is missing makes a search `uncertain` (fail closed:
+# the working directory and every word are judged), so a missing entry can only over-block, never hide a path.
+# The grep table covers GNU grep, BSD (macOS) grep, ugrep (the `grep` of the agent's own shell: Claude Code runs grep as
+# ugrep 7.x) and busybox grep. A letter is listed only where every one of them that accepts it gives it the same number
+# of values (receipt r6 sweep): ugrep -X (--hex) is a flag where GNU -X takes a matcher, and ugrep -J/-M/-O take a value
+# where BSD -J/-M/-O are flags, and ugrep -Z takes an optional attached value, so those letters are in neither list.
+# A letter that one implementation rejects is safe in either list: that grep exits before reading anything.
+# `free_short`/`free_long`: options whose value is never opened as a file (a pattern, glob, number or keyword); the value
+# of every other recognised option is judged as a file name, so a missing entry there can only over-block too.
+_GREP_TABLE = {
+    'short_values': 'ABCDdefm', 'short_flags': '0123456789EFGHILPRSTUVWYabchijklnopqrsuvwxyz',  # -5: context lines
+    # count-only: options that print no matching line in EVERY grep (GNU, BSD and ugrep agree on these)
+    'count_short': 'cqlL', 'count_long': frozenset({'count', 'quiet', 'silent', 'files-with-matches', 'files-without-match'}),
+    'free_short': 'ABCDdem', 'free_long': frozenset({'regexp', 'max-count', 'after-context', 'before-context', 'context', 'label',
+                                                    'include', 'exclude', 'exclude-dir', 'include-dir', 'binary-files',
+                                                    'devices', 'directories', 'group-separator', 'color', 'colour', 'mmap'}),
+    'pattern_short': 'ef', 'pattern_long': frozenset({'regexp', 'file'}),
+    # --context is optional-valued in BSD grep and --group-separator in ugrep: known only with `=value`
+    'long_optional': frozenset({'context', 'group-separator'}),
+    'long_values': frozenset({'regexp', 'file', 'max-count', 'after-context', 'before-context', 'label', 'include', 'exclude',
+                              'exclude-from', 'exclude-dir', 'include-dir', 'binary-files', 'devices', 'directories'}),
+    'long_flags': frozenset({'extended-regexp', 'fixed-strings', 'basic-regexp', 'perl-regexp', 'ignore-case', 'no-ignore-case',
+                             'word-regexp', 'line-regexp', 'null-data', 'no-messages', 'invert-match', 'version',
+                             'byte-offset', 'line-number', 'line-buffered', 'with-filename', 'no-filename', 'only-matching',
+                             'quiet', 'silent', 'recursive', 'dereference-recursive', 'files-without-match',
+                             'files-with-matches', 'count', 'initial-tab', 'null', 'text', 'color', 'colour', 'binary',
+                             'unix-byte-offsets', 'no-group-separator', 'mmap'}),
+}
+_RG_TABLE = {
+    'short_values': 'ABCdEefgjMmrtT', 'short_flags': 'abcFHhIiLlNnoPpqSsUuVvwxz0.',
+    # rg -L is --follow and prints matches (receipt r5 F1), so it is not count-only here
+    'count_short': 'cql', 'count_long': frozenset({'count', 'count-matches', 'quiet', 'files-with-matches', 'files-without-match',
+                                                    'files'}),
+    'free_short': 'ABCdEegjMmrtT',
+    'free_long': frozenset({'after-context', 'before-context', 'context', 'max-depth', 'maxdepth', 'encoding', 'regexp', 'glob',
+                            'iglob', 'threads', 'max-columns', 'max-count', 'replace', 'type', 'type-not', 'type-add',
+                            'type-clear', 'color', 'colors', 'context-separator', 'field-context-separator',
+                            'field-match-separator', 'path-separator', 'sort', 'sortr', 'max-filesize', 'pre-glob',
+                            'dfa-size-limit', 'regex-size-limit', 'engine', 'hyperlink-format', 'generate'}),
+    'pattern_short': 'ef', 'pattern_long': frozenset({'regexp', 'file'}),
+    'long_values': frozenset({'after-context', 'before-context', 'context', 'max-depth', 'maxdepth', 'encoding', 'regexp', 'file',
+                              'glob', 'iglob', 'threads', 'max-columns', 'max-count', 'replace', 'type', 'type-not', 'type-add',
+                              'type-clear', 'color', 'colors', 'context-separator', 'field-context-separator',
+                              'field-match-separator', 'path-separator', 'sort', 'sortr', 'max-filesize', 'ignore-file', 'pre',
+                              'pre-glob', 'dfa-size-limit', 'regex-size-limit', 'engine', 'hyperlink-format', 'generate',
+                              'hostname-bin'}),
+    'long_flags': frozenset({'hidden', 'no-hidden', 'no-ignore', 'ignore', 'no-ignore-vcs', 'ignore-vcs', 'no-ignore-dot',
+                             'ignore-dot', 'no-ignore-parent', 'ignore-parent', 'no-ignore-global', 'ignore-global',
+                             'no-ignore-exclude', 'ignore-exclude', 'no-ignore-files', 'ignore-files', 'no-ignore-messages',
+                             'follow', 'no-follow', 'files', 'files-with-matches', 'files-without-match', 'count',
+                             'count-matches', 'line-number', 'no-line-number', 'column', 'no-column', 'heading', 'no-heading',
+                             'with-filename', 'no-filename', 'ignore-case', 'smart-case', 'case-sensitive', 'fixed-strings',
+                             'no-fixed-strings', 'word-regexp', 'line-regexp', 'invert-match', 'no-invert-match',
+                             'only-matching', 'multiline', 'no-multiline', 'multiline-dotall', 'no-multiline-dotall', 'pcre2',
+                             'no-pcre2', 'pcre2-version', 'unrestricted', 'text', 'no-text', 'binary', 'no-binary',
+                             'search-zip', 'no-search-zip', 'null', 'null-data', 'json', 'no-json', 'vimgrep', 'stats',
+                             'no-stats', 'quiet', 'trim', 'no-trim', 'passthru', 'passthrough', 'byte-offset',
+                             'no-byte-offset', 'crlf', 'no-crlf', 'mmap', 'no-mmap', 'one-file-system',
+                             'no-one-file-system', 'no-messages', 'messages', 'no-config', 'debug', 'trace', 'pretty',
+                             'sort-files', 'no-sort-files', 'type-list', 'version', 'help', 'block-buffered',
+                             'no-block-buffered', 'line-buffered', 'no-line-buffered', 'no-unicode', 'unicode',
+                             'auto-hybrid-regex', 'no-auto-hybrid-regex', 'include-zero', 'no-include-zero',
+                             'max-columns-preview', 'no-max-columns-preview', 'no-require-git', 'require-git',
+                             'ignore-file-case-insensitive', 'no-ignore-file-case-insensitive', 'glob-case-insensitive',
+                             'no-glob-case-insensitive', 'no-context-separator', 'files-with-matches'}),
+}
+# ag -A, -B and -C (and --after, --before, --context) are optional-valued in the long form, so they are in neither list
+_AG_TABLE = {
+    'short_values': 'GgmpW', 'short_flags': 'acDFfHhiLlnoQRrSsvVtuUwz0', 'long_optional': frozenset({'after', 'before', 'context'}),
+    # ag --silent only silences log messages; it still prints matches
+    'count_short': 'clL', 'count_long': frozenset({'count', 'files-with-matches', 'files-without-matches'}),
+    'free_short': 'GgmW', 'free_long': frozenset({'depth', 'ignore', 'ignore-dir', 'file-search-regex', 'color-line-number',
+                                                  'color-match', 'color-path', 'max-count', 'width', 'workers', 'after',
+                                                  'before', 'context'}),
+    'long_values': frozenset({'depth', 'ignore', 'ignore-dir', 'file-search-regex', 'path-to-ignore', 'pager', 'color-line-number',
+                              'color-match', 'color-path', 'max-count', 'width', 'workers'}),
+    'long_flags': frozenset({'all-text', 'all-types', 'case-sensitive', 'color', 'nocolor', 'column', 'count', 'debug',
+                             'filename', 'nofilename', 'files-with-matches', 'files-without-matches', 'fixed-strings', 'follow',
+                             'group', 'nogroup', 'heading', 'noheading', 'hidden', 'ignore-case', 'literal', 'line-numbers',
+                             'list-file-types', 'no-numbers', 'numbers', 'one-device', 'only-matching', 'print-long-lines',
+                             'recurse', 'norecurse', 'search-binary', 'search-zip', 'silent', 'smart-case', 'stats',
+                             'unrestricted', 'skip-vcs-ignores', 'vimgrep', 'word-regexp', 'invert-match', 'null',
+                             'print0', 'version', 'help'}),
+}
+# ack -C is optional-valued, so it is in neither list; ack --TYPE and --noTYPE are unknown (fail closed)
+_ACK_TABLE = {
+    'short_values': 'ABgm', 'short_flags': 'acfHhIiklLnosvwx1',
+    'count_short': 'clL', 'count_long': frozenset({'count', 'files-with-matches', 'files-without-matches'}),
+    'free_short': 'ABgm', 'free_long': frozenset({'type-set', 'type-add', 'type-del', 'ignore-dir', 'noignore-dir',
+                                                  'ignore-directory', 'noignore-directory', 'match', 'max-count',
+                                                  'after-context', 'before-context', 'color-filename', 'color-match',
+                                                  'color-lineno', 'color-colno', 'range-start', 'range-end', 'type',
+                                                  'context'}),
+    'pattern_long': frozenset({'match'}), 'long_optional': frozenset({'context'}),
+    'long_values': frozenset({'type-set', 'type-add', 'type-del', 'ignore-dir', 'noignore-dir', 'ignore-directory',
+                              'noignore-directory', 'ignore-file', 'match', 'max-count', 'after-context', 'before-context',
+                              'output', 'pager', 'color-filename', 'color-match', 'color-lineno', 'color-colno', 'range-start',
+                              'range-end', 'type'}),
+    'long_flags': frozenset({'ignore-case', 'smart-case', 'nosmart-case', 'no-smart-case', 'word-regexp', 'line-regexp',
+                             'literal', 'invert-match', 'count', 'files-with-matches', 'files-without-matches', 'filter',
+                             'nofilter', 'follow', 'nofollow', 'column', 'nocolumn', 'heading', 'noheading', 'break',
+                             'nobreak', 'group', 'nogroup', 'color', 'nocolor', 'colour', 'nocolour', 'with-filename',
+                             'no-filename', 'noenv', 'env', 'flush', 'help', 'version', 'recurse', 'norecurse'}),
+}
+# pt (the platinum searcher), select-string and sls have no table: they are always read as uncertain
+SEARCH_TABLES = {'grep': _GREP_TABLE, 'egrep': _GREP_TABLE, 'fgrep': _GREP_TABLE, 'zgrep': _GREP_TABLE, 'rg': _RG_TABLE,
+                 'ag': _AG_TABLE, 'ack': _ACK_TABLE}
+# searchers that walk the working directory when no path is named
+RECURSIVE_SEARCHERS = {'rg', 'ag', 'ack', 'pt'}
+# searchers that read a pipe instead of the working directory when no path is named; pt is left out (most dangerous reading)
+STDIN_SEARCHERS = {'rg', 'ag', 'ack'}
+
+# tar letters. Where GNU tar, bsdtar (macOS) and busybox tar disagree, the guard takes the most dangerous reading
+# (receipt r5 F2): a letter that takes a value in EVERY one of them (C f T X) ends a cluster for every reading; a letter
+# that takes a value in only some (GNU -H -L -F -g -K -N -V -b, bsdtar -s -I) may be a plain flag, so the letters after it
+# may be options. Create mode is read from the MAXIMAL reading (stop only at an every-tar value letter, look at every
+# word), extract or list mode from the MINIMAL reading (stop at any value letter, skip a word that may be a value).
+_TAR_VALUE_ALL = 'CfTX'
+_TAR_VALUE_ANY = 'bCfFgHIKLNsTVX'
+# every short letter GNU tar, bsdtar or busybox tar accepts; a letter outside it belongs to no tar the guard knows, so
+# what it takes is unknown and the mode is in doubt (receipt r6: a skip needs every option recognised)
+_TAR_KNOWN_LETTERS = 'ABCFGHIJKLMNOPRSTUVWXZabcdfghijklmnopqrstuvwxyz'
+# tar options whose value is a file of member NAMES the tool then reads from disk (receipt r7 F1). GNU tar: -T and
+# --files-from. bsdtar (also macOS /usr/bin/tar): -T, -I ("Synonym for -T", bsdtar(1)) and --files-from. Plain `tar` may be
+# either, so it takes both readings: its -I is also GNU's compress command (`_OPTION_COMMANDS`). gtar is GNU only. Not
+# here: -X/--exclude-from (patterns that leave files out), --newer-than/--older-than FILE (a time stamp only), @ARCHIVE
+# (entries of another archive) and -K/--starting-file (a member name); each value is still judged by name in read_creds.
+_TAR_NAME_LETTERS = {'tar': 'TI', 'bsdtar': 'TI', 'gtar': 'T'}
+_TAR_NAME_LONGS = ('files-from',)
+_PAX_VALUE_ALL = 'bfopsx'       # POSIX pax
+_PAX_VALUE_ANY = 'bfopsxBEGTU'  # BSD pax adds -B -E -G -T -U
+_TAR_CREATE_LONGS = ('create', 'append', 'update', 'catenate', 'concatenate', 'delete')
+_TAR_READ_LONGS = ('extract', 'get', 'list', 'diff', 'compare')
+# long tar options known to take no value; any other long option without `=value` may take the next word
+_TAR_FLAG_LONGS = frozenset({'verbose', 'gzip', 'gunzip', 'ungzip', 'bzip2', 'xz', 'lzma', 'lzip', 'lzop', 'zstd', 'compress',
+                             'uncompress', 'auto-compress', 'no-auto-compress', 'preserve-permissions', 'same-permissions',
+                             'no-same-permissions', 'preserve-order', 'same-order', 'same-owner', 'no-same-owner',
+                             'numeric-owner', 'overwrite', 'overwrite-dir', 'keep-old-files', 'keep-newer-files',
+                             'skip-old-files', 'unlink-first', 'recursive-unlink', 'totals', 'wildcards', 'no-wildcards',
+                             'recursion', 'no-recursion', 'dereference', 'absolute-names', 'one-file-system', 'sparse',
+                             'ignore-zeros', 'touch', 'no-overwrite-dir', 'show-transformed-names',
+                             'interactive', 'confirmation', 'check-links', 'ignore-failed-read', 'null', 'no-null',
+                             'acls', 'no-acls', 'xattrs', 'no-xattrs', 'selinux', 'no-selinux', 'fast-read', 'insecure',
+                             'help', 'version', 'usage', 'show-defaults'})
+
+_RSYNC_LONG_FLAGS = frozenset({
+    'verbose', 'quiet', 'no-motd', 'checksum', 'archive', 'recursive', 'relative', 'no-implied-dirs', 'implied-dirs', 'backup',
+    'update', 'inplace', 'append', 'append-verify', 'dirs', 'old-dirs', 'mkpath', 'links', 'copy-links', 'copy-unsafe-links',
+    'safe-links', 'munge-links', 'copy-dirlinks', 'keep-dirlinks', 'hard-links', 'perms', 'executability', 'acls', 'xattrs',
+    'extended-attributes', 'owner', 'group', 'devices', 'copy-devices', 'write-devices', 'specials', 'times', 'atimes',
+    'open-noatime', 'crtimes', 'omit-dir-times', 'omit-link-times', 'super', 'fake-super', 'sparse', 'preallocate', 'dry-run',
+    'whole-file', 'one-file-system', 'existing', 'ignore-existing', 'ignore-non-existing', 'remove-source-files',
+    'remove-sent-files', 'del', 'delete', 'delete-before', 'delete-during', 'delete-delay', 'delete-after', 'delete-excluded',
+    'ignore-missing-args', 'delete-missing-args', 'ignore-errors', 'force', 'partial', 'delay-updates', 'prune-empty-dirs',
+    'numeric-ids', 'ignore-times', 'size-only', 'fuzzy', 'compress', 'from0', 'old-args', 'secluded-args', 'protect-args',
+    'trust-sender', '8-bit-output', 'human-readable', 'progress', 'itemize-changes', 'stats', 'list-only', 'ipv4', 'ipv6',
+    'version', 'help', 'blocking-io', 'msgs2stderr', 'cvs-exclude', 'cache', 'no-detach', 'detach'})
+# copy tools: options that take a separate value, so the value is never counted as a source or the destination
+_COPY_TABLES = {
+    'rsync': {'short_values': 'efBTM@', 'short_flags': 'avrlptgoDzPhnucqiHAXxSWbdRkKLOJmy0C468sUNEIFV', 'negatable': True,
+              'long_flags': _RSYNC_LONG_FLAGS,
+              'long_values': frozenset({'rsh', 'rsync-path', 'exclude', 'include', 'exclude-from', 'include-from', 'files-from',
+                                        'filter', 'block-size', 'backup-dir', 'suffix', 'chmod', 'chown', 'temp-dir',
+                                        'compare-dest', 'copy-dest', 'link-dest', 'log-file', 'log-file-format', 'out-format',
+                                        'password-file', 'port', 'sockopts', 'timeout', 'contimeout', 'bwlimit', 'max-size',
+                                        'min-size', 'max-delete', 'partial-dir', 'skip-compress', 'usermap', 'groupmap',
+                                        'remote-option', 'iconv', 'checksum-choice', 'cc', 'compress-choice', 'zc',
+                                        'compress-level', 'zl', 'info', 'debug', 'modify-window', 'protocol', 'address',
+                                        'write-batch', 'read-batch', 'only-write-batch', 'stop-after', 'stop-at',
+                                        'checksum-seed', 'outbuf', 'max-alloc', 'mkpath-mode', 'copy-as', 'stderr',
+                                        'early-input'})},
+    # OpenSSH 10 scp and sftp (`man scp`, `man sftp` on this host)
+    'scp': {'short_values': 'cFiJlloPSXD', 'short_flags': '346ABCOpqRrsTv'},
+    'sftp': {'short_values': 'BbcDFiJloPRSsX', 'short_flags': '46AaCfNpqrv'},
+    # macOS ditto: the last operand is the destination (an archive with -c, `-` for stdout)
+    'ditto': {'short_values': '', 'short_flags': 'vVXcxkzjh',
+              'long_values': frozenset({'arch', 'bom', 'zlibCompressionLevel'}),
+              'long_flags': frozenset({'rsrc', 'norsrc', 'extattr', 'noextattr', 'qtn', 'noqtn', 'acl', 'noacl',
+                                       'persistRootless', 'nopersistRootless', 'sequesterRsrc', 'keepParent',
+                                       'hfsCompression', 'nohfsCompression', 'preserveHFSCompression',
+                                       'nopreserveHFSCompression', 'clone', 'noclone', 'password', 'nocache'})},
+}
+
+# curl and wget, for the options that name a file they WRITE (receipt r6 F1: `curl -H -o file://DIR` reads -o as the
+# header value of -H and the file URL as a URL, so a destination is known only from a certain walk of the whole command).
+# curl 8.7.1 (`curl --help all` on this host); curl reads `--name=value` as an unknown option. GNU Wget 1.21.
+_CURL_TABLE = {
+    'short_values': 'AbcCdDeEFHKmoPQrtTuUwxXyYz', 'short_flags': ':#012346aBfgGIijJklLMnNOpqRsSvVZ',
+    'no_equals': True, 'negatable': True,
+    'long_values': frozenset({
+        'user-agent', 'cookie', 'cookie-jar', 'continue-at', 'data', 'dump-header', 'cert', 'referer', 'form', 'header',
+        'config', 'max-time', 'output', 'ftp-port', 'quote', 'range', 'telnet-option', 'upload-file', 'proxy-user', 'user',
+        'write-out', 'proxy', 'request', 'speed-limit', 'speed-time', 'time-cond',
+        'abstract-unix-socket', 'alt-svc', 'aws-sigv4', 'cacert', 'capath', 'cert-type', 'ciphers', 'connect-timeout',
+        'connect-to', 'create-file-mode', 'crlfile', 'curves', 'data-ascii', 'data-binary', 'data-raw', 'data-urlencode',
+        'delegation', 'dns-interface', 'dns-ipv4-addr', 'dns-ipv6-addr', 'dns-servers', 'doh-url', 'egd-file', 'engine',
+        'etag-compare', 'etag-save', 'expect100-timeout', 'form-string', 'ftp-account', 'ftp-alternative-to-user',
+        'ftp-method', 'ftp-ssl-ccc-mode', 'happy-eyeballs-timeout-ms', 'haproxy-clientip', 'hostpubmd5', 'hostpubsha256',
+        'hsts', 'interface', 'ipfs-gateway', 'json', 'keepalive-time', 'key', 'key-type', 'krb', 'libcurl', 'limit-rate',
+        'local-port', 'login-options', 'mail-auth', 'mail-from', 'mail-rcpt', 'max-filesize', 'max-redirs', 'netrc-file',
+        'noproxy', 'oauth2-bearer', 'output-dir', 'parallel-max', 'pass', 'pinnedpubkey', 'proto', 'proto-default',
+        'proto-redir', 'proxy-cacert', 'proxy-capath', 'proxy-cert', 'proxy-cert-type', 'proxy-ciphers', 'proxy-crlfile',
+        'proxy-header', 'proxy-key', 'proxy-key-type', 'proxy-pass', 'proxy-pinnedpubkey', 'proxy-service-name',
+        'proxy-tls13-ciphers', 'proxy-tlsauthtype', 'proxy-tlspassword', 'proxy-tlsuser', 'proxy1.0', 'pubkey', 'random-file',
+        'rate', 'request-target', 'resolve', 'retry', 'retry-delay', 'retry-max-time', 'sasl-authzid', 'service-name',
+        'socks4', 'socks4a', 'socks5', 'socks5-gssapi-service', 'socks5-hostname', 'stderr', 'tftp-blksize', 'tls-max',
+        'tls13-ciphers', 'tlsauthtype', 'tlspassword', 'tlsuser', 'trace', 'trace-ascii', 'trace-config', 'unix-socket', 'url',
+        'url-query', 'variable'}),
+    'long_flags': frozenset({
+        'next', 'progress-bar', 'http1.0', 'tlsv1', 'sslv2', 'sslv3', 'ipv4', 'ipv6', 'append', 'use-ascii', 'fail', 'globoff',
+        'get', 'head', 'include', 'junk-session-cookies', 'remote-header-name', 'insecure', 'list-only', 'location', 'manual',
+        'netrc', 'no-buffer', 'remote-name', 'proxytunnel', 'disable', 'remote-time', 'show-error', 'silent', 'verbose',
+        'version', 'parallel',
+        'anyauth', 'basic', 'ca-native', 'cert-status', 'compressed', 'compressed-ssh', 'create-dirs', 'crlf', 'digest',
+        'disable-eprt', 'disable-epsv', 'disallow-username-in-url', 'doh-cert-status', 'doh-insecure', 'fail-early',
+        'fail-with-body', 'false-start', 'form-escape', 'ftp-create-dirs', 'ftp-pasv', 'ftp-pret', 'ftp-skip-pasv-ip',
+        'ftp-ssl-ccc', 'ftp-ssl-control', 'haproxy-protocol', 'http0.9', 'http1.1', 'http2', 'http2-prior-knowledge', 'http3',
+        'http3-only', 'ignore-content-length', 'location-trusted', 'mail-rcpt-allowfails', 'metalink', 'negotiate',
+        'netrc-optional', 'no-alpn', 'no-clobber', 'no-keepalive', 'no-npn', 'no-progress-meter', 'no-sessionid', 'ntlm',
+        'ntlm-wb', 'parallel-immediate', 'path-as-is', 'post301', 'post302', 'post303', 'proxy-anyauth', 'proxy-basic',
+        'proxy-ca-native', 'proxy-digest', 'proxy-http2', 'proxy-insecure', 'proxy-negotiate', 'proxy-ntlm',
+        'proxy-ssl-allow-beast', 'proxy-ssl-auto-client-cert', 'proxy-tlsv1', 'raw', 'remote-name-all', 'remove-on-error',
+        'retry-all-errors', 'retry-connrefused', 'sasl-ir', 'socks5-basic', 'socks5-gssapi', 'socks5-gssapi-nec', 'ssl',
+        'ssl-allow-beast', 'ssl-auto-client-cert', 'ssl-no-revoke', 'ssl-reqd', 'ssl-revoke-best-effort', 'styled-output',
+        'suppress-connect-headers', 'tcp-fastopen', 'tcp-nodelay', 'tftp-no-options', 'tlsv1.0', 'tlsv1.1', 'tlsv1.2',
+        'tlsv1.3', 'tr-encoding', 'trace-ids', 'trace-time', 'xattr'}),
+    'destinations': frozenset({('s', 'o'), ('s', 'D'), ('s', 'c'), ('l', 'output'), ('l', 'dump-header'), ('l', 'cookie-jar'),
+                               ('l', 'output-dir'), ('l', 'etag-save'), ('l', 'libcurl'), ('l', 'stderr'), ('l', 'trace'),
+                               ('l', 'trace-ascii')}),
+}
+_WGET_TABLE = {
+    # -n takes the rest of its cluster (-nv, -nc, -nd, -nH, -np)
+    'short_values': 'eoaiBtOTwQPlARDIXUn', 'short_flags': 'VhbdqvFcNSxrkKEpHLm46', 'negatable': True,
+    'long_values': frozenset({
+        'output-file', 'append-output', 'execute', 'config', 'input-file', 'base', 'bind-address', 'bind-dns-address',
+        'dns-servers', 'tries', 'retry-on-http-error', 'output-document', 'backups', 'timeout', 'dns-timeout',
+        'connect-timeout', 'read-timeout', 'wait', 'waitretry', 'quota', 'limit-rate', 'user', 'password', 'use-askpass',
+        'local-encoding', 'remote-encoding', 'directory-prefix', 'cut-dirs', 'default-page', 'http-user', 'http-password',
+        'header', 'compression', 'max-redirect', 'proxy-user', 'proxy-password', 'referer', 'save-cookies', 'load-cookies',
+        'post-data', 'post-file', 'method', 'body-data', 'body-file', 'user-agent', 'secure-protocol', 'certificate',
+        'certificate-type', 'private-key', 'private-key-type', 'ca-certificate', 'ca-directory', 'crl-file', 'pinnedpubkey',
+        'random-file', 'egd-file', 'ciphers', 'hsts-file', 'ftp-user', 'ftp-password', 'warc-file', 'warc-header',
+        'warc-max-size', 'warc-tempdir', 'warc-dedup', 'level', 'accept', 'reject', 'accept-regex', 'reject-regex',
+        'regex-type', 'domains', 'exclude-domains', 'follow-tags', 'ignore-tags', 'include-directories', 'exclude-directories',
+        'restrict-file-names', 'report-speed', 'prefer-family', 'rejected-log', 'progress', 'start-pos'}),
+    'long_flags': frozenset({
+        'version', 'help', 'background', 'debug', 'quiet', 'verbose', 'no-verbose', 'force-html', 'continue', 'show-progress',
+        'timestamping', 'no-if-modified-since', 'no-use-server-timestamps', 'server-response', 'spider', 'no-dns-cache',
+        'inet4-only', 'inet6-only', 'retry-connrefused', 'no-clobber', 'no-directories', 'force-directories',
+        'no-host-directories', 'protocol-directories', 'no-cache', 'no-cookies', 'keep-session-cookies', 'ignore-length',
+        'no-http-keep-alive', 'auth-no-challenge', 'content-disposition', 'content-on-error', 'trust-server-names',
+        'no-check-certificate', 'check-certificate', 'https-only', 'no-hsts', 'no-glob', 'glob', 'no-passive-ftp',
+        'preserve-permissions', 'recursive', 'delete-after', 'convert-links', 'convert-file-only', 'backup-converted', 'mirror',
+        'page-requisites', 'strict-comments', 'adjust-extension', 'html-extension', 'span-hosts', 'relative', 'no-parent',
+        'ignore-case', 'no-config', 'random-wait', 'no-proxy', 'no-netrc', 'ask-password', 'unlink', 'xattr', 'retr-symlinks',
+        'no-remove-listing', 'iri', 'no-iri', 'warc-cdx', 'no-warc-compression', 'no-warc-digests', 'no-warc-keep-log'}),
+    'destinations': frozenset({('s', 'O'), ('s', 'o'), ('s', 'a'), ('s', 'P'), ('l', 'output-document'), ('l', 'output-file'),
+                               ('l', 'append-output'), ('l', 'directory-prefix'), ('l', 'save-cookies'), ('l', 'warc-file'),
+                               ('l', 'rejected-log')}),
+}
+_FETCH_TABLES = {'curl': _CURL_TABLE, 'wget': _WGET_TABLE}
+
+
+# options a tool also takes from its environment or a config file; when one may be in force, the command line alone does
+# not show which words are options, so the reading is in doubt (receipt r5 sweep: `TAR_OPTIONS=-cV tar -x -f - DIR`
+# makes `-x` a volume label; `RIPGREP_CONFIG_PATH=c rg DIR` with `--regexp=.` in c makes DIR a path, not the pattern)
+OPTION_SOURCES = {'tar': ('TAR_OPTIONS',), 'gtar': ('TAR_OPTIONS',), 'grep': ('GREP_OPTIONS',), 'egrep': ('GREP_OPTIONS',),
+                  'fgrep': ('GREP_OPTIONS',), 'zgrep': ('GREP_OPTIONS',), 'rg': ('RIPGREP_CONFIG_PATH',),
+                  'ack': ('ACK_OPTIONS', 'ACKRC')}
+# ack's global and user files (receipt r6 F3); the project file is an .ackrc in the working directory or any parent
+ACK_RC_FILES = ('/etc/ackrc', '~/.ackrc', '~/.config/ack/ackrc')
+
+
+def _options_from_environment(name, raw_text, cwd=None):
+    """True when `name` may take options from outside its command line: the variable is named anywhere in the command
+    text (an assignment, export or env prefix) or set in this environment, or (ack, unless --noenv) a global, user or
+    project .ackrc exists: /etc/ackrc, ~/.ackrc, or an .ackrc in the working directory or any directory above it."""
+    raw = raw_text or ''
+    sources = OPTION_SOURCES.get(name, ())
+    if any(v in raw or os.environ.get(v) for v in sources):
+        return True
+    if name == 'ack' and '--noenv' not in raw:
+        if 'ackrc' in raw:
+            return True
+        candidates = [os.path.expanduser(p) for p in ACK_RC_FILES]
+        d = cwd if isinstance(cwd, str) and cwd.startswith('/') else None
+        for _ in range(64):
+            if not d:
+                break
+            candidates.append(os.path.join(d, '.ackrc'))
+            parent = os.path.dirname(d)
+            d = parent if parent != d else None
+        for path in candidates:
+            try:
+                if os.path.exists(path):
+                    return True
+            except (OSError, ValueError):
+                pass
+    return False
+
+
+def _tar_mode(name, args):
+    """'read' (extract or list), 'create', or None when the mode is in doubt (the caller skips nothing unless 'read').
+    Create wins whenever ANY reading shows it: a create letter before the first every-tar value letter of any dash word
+    (`tar -sc`, `tar -Lc`, `tar -Hc`: GNU -s and bsdtar -H/-L are flags), the old-style first word, or any abbreviation of a
+    long create option (`--cre`), even in a word that may be an option value. Read needs EVERY reading: a read letter before
+    the first value letter of any tar, in a word that can not be the value of the option before it (`-f -x` names the
+    archive `-x`). An old-style first word that is not all letters (`c0f`), and a letter no known tar accepts, give None."""
+    pax = name == 'pax'
+    v_all, v_any = (_PAX_VALUE_ALL, _PAX_VALUE_ANY) if pax else (_TAR_VALUE_ALL, _TAR_VALUE_ANY)
+    create_letters, read_letters = ('w', 'r') if pax else ('cruA', 'xtd')
+    words = [a.text for a in args]
+    create = read = False
+    pending = 0  # how many of the next words may be the value of an option before them
+    for k, t in enumerate(words):
+        if t == '--':
+            break
+        maybe_value, pending = pending > 0, max(pending - 1, 0)
+        if t.startswith('--'):
+            long_name, eq, _ = t[2:].partition('=')
+            is_create = bool(long_name) and any(m.startswith(long_name) for m in _TAR_CREATE_LONGS)
+            is_read = len(long_name) >= 2 and any(m.startswith(long_name) for m in _TAR_READ_LONGS)
+            create = create or is_create
+            read = read or (is_read and not maybe_value)
+            if not eq and not is_create and not is_read and long_name not in _TAR_FLAG_LONGS:
+                pending = max(pending, 1)
+            continue
+        if k == 0 and not pax and not t.startswith('-'):
+            if not re.fullmatch(r'[A-Za-z]+', t) or any(ch not in _TAR_KNOWN_LETTERS for ch in t):
+                return None  # old style with a digit, another character or a letter no tar knows: in doubt
+            create = create or any(ch in create_letters for ch in t)
+            read = read or any(ch in read_letters for ch in t)
+            pending = max(pending, sum(ch in v_any for ch in t))  # old style: the values follow as words
+            continue
+        if len(t) > 1 and t[0] == '-':
+            for ch in t[1:]:  # maximal reading
+                if ch in v_all:
+                    break
+                create = create or ch in create_letters
+            if not maybe_value:
+                for ch in t[1:]:  # minimal reading
+                    if ch in v_any:
+                        break
+                    if not pax and ch not in _TAR_KNOWN_LETTERS:
+                        return None  # an option letter no known tar accepts: what it takes is unknown
+                    read = read or ch in read_letters
+            if t[-1] in v_any:
+                pending = max(pending, 1)  # in some reading the last letter takes the next word
+    if create:
+        return 'create'
+    return 'read' if read else None
+
+
+def _tar_names_file(name, args):
+    """True when ANY reading of a tar command line takes member names from a file or stdin (`_TAR_NAME_LETTERS`): a names
+    letter in a dash cluster before the first letter that takes a value in every tar (`-T-`, `-cT -`, `-I/dev/stdin`,
+    `-cfI - -` read as -c -f -I by the letters; `-C/Tmp` is a directory), in the old-style first word whose values follow as
+    words (`cTf - -`, `cfI - -`), and --files-from in any abbreviation getopt accepts (`--files=-`). A dash word that may be
+    an earlier option's value counts too: the most dangerous reading wins."""
+    letters = _TAR_NAME_LETTERS.get(name, 'T')
+    for k, a in enumerate(args):
+        t = a.text
+        if t == '--':
+            break
+        if t.startswith('--'):
+            long_name = t[2:].partition('=')[0]
+            if len(long_name) >= 5 and any(full.startswith(long_name) for full in _TAR_NAME_LONGS):
+                return True
+            continue
+        if k == 0 and not t.startswith('-'):
+            if any(ch in letters for ch in t):
+                return True
+            continue
+        if len(t) > 1 and t[0] == '-':
+            for ch in t[1:]:
+                if ch in letters:
+                    return True
+                if ch in _TAR_VALUE_ALL:
+                    break
+    return False
+
+
+def _tar_bases(args, ctx):
+    """Every directory tar may have changed to before it reads a relative operand: the working directory, then each
+    `-C DIR` (separate, attached `-CDIR`, inside a cluster `-cC DIR`) and `--directory` (any abbreviation, `=DIR` or a
+    separate word), applied in order and on top of each other (GNU tar -C is relative to the previous one). Receipt r6
+    sweep: `tar -C /usr -cf - ../Users/u/.config/goodqa` reads the credential directory from a working directory that does
+    not lead there. Bounded at 8 bases."""
+    texts = [a.text for a in args]
+    values = []
+    for i, t in enumerate(texts):
+        if t.startswith('--') and len(t) > 3:
+            long_name, eq, value = t[2:].partition('=')
+            if len(long_name) >= 2 and 'directory'.startswith(long_name):
+                if eq:
+                    values.append(value)
+                elif i + 1 < len(texts):
+                    values.append(texts[i + 1])
+        elif len(t) > 1 and t[0] == '-' and t[1] != '-' and 'C' in t[1:]:
+            rest = t[t.index('C', 1) + 1:]
+            if rest:
+                values.append(rest)
+            elif i + 1 < len(texts):
+                values.append(texts[i + 1])
+    bases = [ctx.cwd_value()] if hasattr(ctx, 'cwd_value') else [ctx.cwd]
+    for value in values:
+        bases = (bases + [norm_path(value, ctx, b) for b in bases])[:8]
+    return bases[1:]
+
+
+def _curl_glob(path, limit=64):
+    """curl's own URL globbing of a file URL: each `{a,b}` set (also a set of one, `{goodqa}`) expands to its members.
+    `[a-z]` ranges are left for the glob match. Empty when the path has no set or expands past `limit`."""
+    if '{' not in path:
+        return []
+    parts = re.split(r'\{([^{}]*)\}', path)
+    results = ['']
+    for k, part in enumerate(parts):
+        choices = part.split(',') if k % 2 else [part]
+        results = [r + c for r in results for c in choices]
+        if len(results) > limit:
+            return []
+    return results
+
+
+_DERIVE_DELIMS = '=@<!'
+
+
+def _derived_texts(text, colon=False, curl=False):
+    """Substrings of one word that a tool may open as a path besides the word itself (receipt r6 F2): the text after each
+    `=`, `@`, `<` or `!` (`--files-from=F`, `-d@F`, `-F x=<F`, 7z `-i!F`), every possible attached value of a short option
+    cluster (`-T~/F`, `-rnfF`, `-C$HOME/.config`: the text after each leading option letter), ugrep's `---F`, with `colon`
+    the text after each `:` cut at a `,` (socat `FILE:F,rdonly`), the path of a file URL, raw, percent-decoded and
+    with curl's `{}` sets expanded (`file://localhost/P`, `file:///%67oodqa`, `file:///.config/{goodqa}/user-token`), and
+    with `curl` the `{}` sets of any word (curl globs the file of `-T '{F}'` too)."""
+    out = []
+    if not text or len(text) > 4096:
+        return out
+    if text.startswith('---'):
+        out.append(text[3:])
+    elif len(text) > 2 and text[0] == '-' and text[1] != '-':
+        k = 2
+        while k < len(text) and k < 42 and (text[k - 1].isalnum() or text[k - 1] in '#:@.%+^?'):
+            out.append(text[k:])
+            k += 1
+    for d in _DERIVE_DELIMS + (':' if colon else ''):
+        start = 0
+        for _ in range(8):
+            pos = text.find(d, start)
+            if pos < 0:
+                break
+            rest = text[pos + 1:]
+            out.append(rest)
+            if d == ':' and ',' in rest:
+                out.append(rest.split(',', 1)[0])
+            start = pos + 1
+    if curl:
+        out.extend(_curl_glob(text))
+    for t in [text] + out[:]:
+        m = re.match(r'(?is)file:(?://[^/]*)?(/.*)', t)
+        if m:
+            path = m.group(1)
+            decoded = urllib.parse.unquote(path)
+            out.extend([path, decoded] + _curl_glob(decoded))
+    seen, result = set(), []
+    for t in out:
+        if t and t not in seen:
+            seen.add(t)
+            result.append(t)
+    return result[:96]
+
+
+def _path_like(text):
+    """A derived text that can name a directory on its own: it has a `/` or starts with `~`, `.` or `$`. A bare word
+    after an option letter (`-kv`, `-n.gz`) is judged as a file name only, so a cluster run inside a credential directory is
+    not read as a path inside it; a relative directory a tool changes to is covered by `_tar_bases`."""
+    return '/' in text or text[:1] in ('~', '.', '$')
+
+
+# options whose value is a COMMAND the tool runs (receipt r6 sweep: GNU tar runs -I/--use-compress-program and
+# --to-command through /bin/sh, so `tar -cf - -I 'cat ~/.config/goodqa/user-token #' /dev/null` prints the token). The
+# value is analysed like `sh -c` text. Long names match any abbreviation of three or more letters (GNU getopt).
+_OPTION_COMMANDS = {
+    'tar': ('IF', ('use-compress-program', 'to-command', 'info-script', 'new-volume-script', 'rsh-command')),
+    'gtar': ('IF', ('use-compress-program', 'to-command', 'info-script', 'new-volume-script', 'rsh-command')),
+    'bsdtar': ('', ('use-compress-program',)),  # bsdtar -I is a names file (`_TAR_NAME_LETTERS`), not a command
+    'rsync': ('e', ('rsh',)),
+    'scp': ('S', ()), 'sftp': ('S', ()),
+    'zip': ('', ('unzip-command',)),
+    'ack': ('', ('pager',)), 'ag': ('', ('pager',)), 'rg': ('', ('pre', 'hostname-bin')),
+    'grep': ('', ('pager', 'filter', 'view')), 'egrep': ('', ('pager', 'filter', 'view')),
+    'fgrep': ('', ('pager', 'filter', 'view')),
+}
+_SSH_COMMAND_KEYS = ('proxycommand', 'localcommand', 'knownhostscommand')
+
+
+def _option_commands(name, args):
+    """The command texts `name` runs from its option values: the short letters and long names in `_OPTION_COMMANDS`
+    (attached, `=value` or the next word), tar --checkpoint-action=exec=CMD, zip -TT CMD, ugrep --filter=EXT:CMD, and an
+    ssh option ProxyCommand, LocalCommand or KnownHostsCommand given to scp or sftp with -o."""
+    if name not in _OPTION_COMMANDS:
+        return []
+    letters, longs = _OPTION_COMMANDS[name]
+    texts = [a.text for a in args]
+    out = []
+
+    def nxt(i):
+        return texts[i + 1] if i + 1 < len(texts) else None
+    for i, t in enumerate(texts):
+        if t == '--':
+            break
+        if t.startswith('--') and len(t) > 2:
+            long_name, eq, value = t[2:].partition('=')
+            value = value if eq else nxt(i)
+            if value is None:
+                continue
+            if any(len(long_name) >= 3 and m.startswith(long_name) for m in longs):
+                if long_name.startswith('fil'):
+                    out.extend(part.split(':', 1)[1] for part in value.split(',') if ':' in part)
+                else:
+                    out.append(value)
+            if name in ('tar', 'gtar') and len(long_name) >= 3 and 'checkpoint-action'.startswith(long_name) \
+                    and value.startswith('exec='):
+                out.append(value[len('exec='):])
+            continue
+        if name == 'zip' and t == '-TT' and nxt(i) is not None:
+            out.append(nxt(i))
+            continue
+        if len(t) > 1 and t[0] == '-':
+            if name in ('scp', 'sftp') and 'o' in t[1:]:
+                rest = t[t.index('o', 1) + 1:]
+                parts = re.split(r'[=\s]+', (rest or nxt(i) or '').strip(), 1)
+                if len(parts) == 2 and parts[0].casefold() in _SSH_COMMAND_KEYS:
+                    out.append(parts[1])
+            for k, ch in enumerate(t[1:], 1):
+                if ch in letters:
+                    rest = t[k + 1:]
+                    if rest:
+                        out.append(rest)
+                    elif nxt(i) is not None:
+                        out.append(nxt(i))
+                    break
+    return [c for c in out if c and c.strip()]
+
+
+# find -exec bodies that print what they are given: the readers, archivers and copy tools, and any shell or interpreter
+FIND_EXEC_READERS = (PRINT_FILE_CMDS | GREP_CMDS | EXFIL_CMDS | ARCHIVE_CMDS | SHELLS | PS_SHELLS | INTERPRETERS
+                     | {'openssl', 'source', 'dd'})
+# commands that print the names of the files under a directory (or the working directory when given none), for a later
+# reader of a name list (receipt r6 sweep: `find ~/.config -name user-token | xargs cat`, `cd DIR && ls | xargs cat`)
+NAME_LISTERS = frozenset(('find', 'bfs', 'gfind', 'fd', 'fdfind', 'ls', 'gls', 'exa', 'eza', 'lsd', 'tree', 'du', 'gdu',
+                          'dir', 'vdir', 'locate', 'glocate', 'plocate', 'mdfind'))
+# primaries of GNU find, BSD find and bfs that take one value (bfs is the agent shell's `find`: it reads start directories
+# anywhere among the flags and the expression); -fprintf takes two
+_FIND_VALUE_PRIMARIES = frozenset({
+    '-name', '-iname', '-path', '-ipath', '-wholename', '-iwholename', '-regex', '-iregex', '-lname', '-ilname', '-type',
+    '-xtype', '-user', '-group', '-uid', '-gid', '-perm', '-size', '-mtime', '-mmin', '-atime', '-amin', '-ctime', '-cmin',
+    '-Btime', '-Bmin', '-newer', '-anewer', '-cnewer', '-Bnewer', '-samefile', '-inum', '-links', '-maxdepth', '-mindepth',
+    '-fstype', '-context', '-used', '-printf', '-fprint', '-fprint0', '-fls', '-regextype', '-files0-from', '-D', '-S',
+    '-flags', '-xattrname', '-limit'})
+_FIND_FLAGS = frozenset({
+    '-print', '-print0', '-printx', '-ls', '-delete', '-prune', '-quit', '-empty', '-true', '-false', '-follow', '-xdev',
+    '-mount', '-nouser', '-nogroup', '-readable', '-writable', '-executable', '-hidden', '-nohidden', '-sparse', '-daystart',
+    '-noleaf', '-depth', '-ignore_readdir_race', '-noignore_readdir_race', '-color', '-nocolor', '-noerror', '-unique',
+    '-status', '-warn', '-nowarn', '-help', '-version', '-not', '-a', '-o', '-and', '-or', '-exclude', '-acl', '-xattr',
+    '-posix', '-P', '-H', '-L', '-E', '-X', '-d', '-s', '-x'})
+
+
+def _find_files0_values(args):
+    """The value words of GNU find's -files0-from: a file (or `-`, stdin) of NUL-separated start directories."""
+    texts = [a.text for a in args]
+    return [args[i + 1] for i, t in enumerate(texts[:-1]) if t == '-files0-from']
+
+
+def _find_exec_bodies(args):
+    """Each -exec/-execdir/-ok/-okdir body up to its real end: `;`, or `+` right after `{}` (a `+` elsewhere is an
+    argument)."""
+    texts = [a.text for a in args]
+    bodies = []
+    for i, t in enumerate(texts):
+        if t in ('-exec', '-execdir', '-ok', '-okdir'):
+            j = i + 1
+            while j < len(texts) and texts[j] not in (';', '\\;') and not (texts[j] == '+' and texts[j - 1] == '{}'):
+                j += 1
+            bodies.append(list(args[i + 1:j]))
+    return bodies
+
+
+def _find_cred_roots(args, roots):
+    """Every directory find may start from, for the credential check (receipt r6 sweep). bfs, the agent shell's `find`,
+    reads start directories anywhere: `find -type f DIR -exec cat {} +`, `find -S dfs DIR`, a directory after `-exec ...
+    +`. So every word outside the -exec bodies (each body ends at its first `;` or `+`, the shorter reading) that is not
+    the value of a known primary is a start directory, after the leading ones the classic parse found; an unknown primary
+    may take no value, so the word after it is one too. `.` is added unless a start directory is certain."""
+    texts = [a.text for a in args]
+    found, certain, unknown, i = [], False, False, 0
+    leading = [r for r in roots if r.text != '.']
+    while i < len(texts):
+        t = texts[i]
+        if t in ('-exec', '-execdir', '-ok', '-okdir'):
+            j = i + 1
+            while j < len(texts) and texts[j] not in (';', '+', '\\;'):
+                j += 1
+            i = j + 1
+            continue
+        if t in ('(', ')', '!', ',', '--'):
+            i += 1
+            continue
+        if t.startswith('-') and t != '-':
+            if t == '-f' and i + 1 < len(texts):
+                found.append(args[i + 1])
+                certain = True
+                i += 2
+            elif t in _FIND_VALUE_PRIMARIES or re.fullmatch(r'-newer[aBcmt][aBcmt]', t):
+                i += 2
+            elif t == '-fprintf':
+                i += 3
+            elif t in _FIND_FLAGS or re.fullmatch(r'-[EHLPXdsx]+', t) or re.fullmatch(r'-[Oj][0-9]*', t):
+                i += 1
+            else:
+                unknown = True  # an unknown primary: the next word may be its value or a start directory
+                i += 1
+            continue
+        found.append(args[i])
+        certain = certain or not unknown
+        i += 1
+    out = list(roots) + [w for w in found if not any(w is r for r in roots)]
+    if not (leading or certain) and not any(r.text == '.' for r in out):
+        dot = Word()
+        dot.alts = ['.']
+        out.append(dot)
+    return out
+
+
+def _unwrap_command(body):
+    """(name, args) of the command a find -exec body, a pipeline stage or an xargs really runs: past env, nice, timeout,
+    xargs, sudo and the other simple wrappers, their options and values (WRAPPER_VALUE_OPTS), `NAME=value` assignments and
+    timeout's duration. (None, []) when nothing is left."""
+    words = list(body)
+    for _ in range(8):
+        if not words:
+            return None, []
+        name = norm_name(words[0].text)
+        if name not in WRAPPERS_SIMPLE:
+            return name, words[1:]
+        value_opts = WRAPPER_VALUE_OPTS.get(name, ())
+        k = 1
+        while k < len(words):
+            t = words[k].text
+            if t in value_opts:
+                k += 2
+            elif t.startswith('-') and t != '-':
+                k += 1
+            elif re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', t, re.S):
+                k += 1
+            elif name == 'timeout' and re.fullmatch(r'[0-9.]+[smhd]?', t):
+                k += 1
+            else:
+                break
+        words = words[k:]
+    return None, []
 
 
 def _is_subseq(required, tokens):
@@ -2754,7 +3703,9 @@ class Analyzer:
 
     def _run_tokens(self, tokens, depth):
         self.check_tokens(tokens)
-        for pipeline in parse(tokens):
+        pipelines = parse(tokens)
+        self._prebind_loop_input(pipelines)
+        for pipeline in pipelines:
             self.pipeline(pipeline, depth)
 
     def _both_readings(self, zsh_tokens, text, depth):
@@ -2910,6 +3861,7 @@ class Analyzer:
                 ctx.secret_seen += 1
                 ctx.add(SECRET_DUMP, 'credential-file', 'xargs %s prints credential files listed by an earlier stage'
                         % inner[0][:20], 'list names only: find DIR -type f, or ls -l')
+        self._names_pipeline(pl)
         # a kill verb anywhere in the pipeline makes the pid-finding stages relevant
         kills = [i for i, cmd in enumerate(pl.cmds) if self._is_kill_stage(cmd)]
         if kills:
@@ -3052,7 +4004,10 @@ class Analyzer:
             ctx.add(SECRET_DUMP, 'indirect-var', 'printing ${!name} prints the value of whatever variable name holds',
                     'print variable names only (compgen -v), never their values')
         before = ctx.secret_seen
+        self._substituted_names(rest, pl, idx)
         self.dispatch(rest, cmd, pl, idx, depth)
+        if outer == 'read':
+            self._bind_read_vars(rest, pl, idx, cmd)  # after dispatch, which forgets what the variables held
         if outer in ('cp', 'install', 'ditto', 'ln', 'rsync', 'mv') and len(rest) >= 3:
             ops = _nondash(rest[1:])
             if len(ops) >= 2 and any(self._cred_one(norm_path(o.text, ctx)) for o in ops[:-1]):
@@ -3095,7 +4050,14 @@ class Analyzer:
                 if not hasattr(self.ctx, 'flow_vars'):
                     self.ctx.flow_vars = set()
                 self.ctx.flow_vars.add(name)
-            self.ctx.vars[name] = chosen.text
+            value = chosen.text
+            # `for f in $(find ~/.config/goodqa -type f)`: the items are the names a substitution lists (receipt r6 sweep)
+            for item in items[:64]:
+                hit = next((h for h in (self._script_lists_creds(inner) for inner in item.subs[:4]) if h), None)
+                if hit:
+                    value = self._cred_sample(hit)
+                    break
+            self.ctx.vars[name] = value
             self.ctx.tainted.discard(name)
             # `for t in "$GH_TOKEN"`: the loop variable carries whatever secret its items expand to
             if any(self.c.secret_name(v.lstrip('!')) or v in self.ctx.tainted for item in items for v in item.vars):
@@ -3177,7 +4139,7 @@ class Analyzer:
             if r.op in ('<', '<>') and target:
                 if self.is_cred_path(target, r.target):
                     ctx.secret_seen += 1
-                    if not (name in NONPRINT_SINKS or name in ('test', '[') or (name in GREP_CMDS and self._count_only(words[1:]))):
+                    if not (name in NONPRINT_SINKS or name in ('test', '[') or (name in GREP_CMDS and self._count_only(name, self._search_scan(name, words[1:])))):
                         if not has_command or self.out_visible(pl, idx, True):
                             ctx.add(SECRET_DUMP, 'credential-stdin',
                                     'feeds a credential file to a command that can print it',
@@ -3452,10 +4414,14 @@ class Analyzer:
             if k + 1 < len(texts) and texts[k + 1] in ('json.tool', 'base64', 'tokenize', 'pickletools', 'quopri',
                                                        'uu', 'zipfile', 'tarfile', 'gzip', 'http.server'):
                 self.read_creds('cat', args[k + 2:], pl, idx)
-        if name in PRINT_FILE_CMDS or name in GREP_CMDS or name in EXFIL_CMDS or name in ('openssl', 'source'):
+        for inner in _option_commands(name, args):
+            # a command the tool runs from an option value (tar -I/--to-command, rsync -e, scp -S or -o ProxyCommand, zip -TT,
+            # a pager or filter) is judged like `sh -c` text (receipt r6 sweep)
+            self.script(inner, depth + 1, tail_visible=True)
+        if name in PRINT_FILE_CMDS or name in GREP_CMDS or name in EXFIL_CMDS or name in ARCHIVE_CMDS or name in ('openssl', 'source'):
             self.read_creds(name, args, pl, idx)
         if name in RM_CMDS or name in MV_CMDS or name in OVERWRITE_CMDS or name in (
-                'sed', 'perl', 'ruby', 'awk', 'gawk', 'rsync', 'rclone', 'tar', 'zip', 'dd', 'truncate', 'set-content',
+                'sed', 'perl', 'ruby', 'awk', 'gawk', 'rsync', 'scp', 'rclone', 'tar', 'zip', 'dd', 'truncate', 'set-content',
                 'out-file', 'curl', 'wget', 'touch', 'mkdir', 'unzip', 'bsdtar', 'gtar'):
             self.destructive(name, args, texts)
         if not (name in PRINT_FILE_CMDS or name in GREP_CMDS or name in EXFIL_CMDS):
@@ -3695,7 +4661,7 @@ class Analyzer:
             while i < len(args) and (texts[i].startswith('-') or i == 0 and False):
                 i += 2 if texts[i] in ('-s', '-k', '--signal', '--kill-after') else 1
             i += 1  # duration
-        elif name in ('nice', 'ionice', 'chrt', 'taskset', 'stdbuf', 'caffeinate', 'watch', 'strace', 'ltrace', 'setsid', 'arch', 'nohup', 'unbuffer', 'dtruss', 'chroot', 'nsenter', 'firejail', 'sandbox-exec', 'script', 'gosu', 'runuser', 'su', 'sg', 'time', 'noglob', 'command', 'builtin', 'exec', 'start-process', 'start', 'call', 'invoke-command', 'icm'):
+        elif name in ('nice', 'ionice', 'chrt', 'taskset', 'stdbuf', 'caffeinate', 'watch', 'strace', 'ltrace', 'setsid', 'arch', 'nohup', 'unbuffer', 'dtruss', 'chroot', 'nsenter', 'firejail', 'sandbox-exec', 'script', 'gosu', 'runuser', 'su', 'sg', 'time', 'noglob', 'command', 'builtin', 'exec', 'start-process', 'start', 'call', 'invoke-command', 'icm', 'sshpass'):
             valued = WRAPPER_VALUE_OPTS.get(name, ())
             while i < len(args) and texts[i].startswith('-'):
                 i += 2 if texts[i] in valued else 1
@@ -4020,9 +4986,15 @@ class Analyzer:
             unknown.alts = ['$FILES0_FROM']
             unknown.dynamic = True
             roots.append(unknown)  # start directories read from a file: not known to the guard
+            # ...unless the file is a substitution or stdin whose command may print a credential name (receipt r7 F2:
+            # `find -files0-from <(printf '%s\0' ~/.config/goodqa) -type f -exec cat {} +`): that name is a start directory
+            listed = self._files0_hit(args, pl, idx)
+            if listed:
+                roots.append(_literal_word(listed))
         if not roots:
             roots = [Word()]
             roots[0].alts = ['.']
+        cred_roots = _find_cred_roots(args, roots)
         exec_cmds = []
         for i, t in enumerate(texts):
             if t in ('-exec', '-execdir', '-ok', '-okdir'):
@@ -4053,12 +5025,16 @@ class Analyzer:
                     if w.text in ('{}', ';', '+', '\\;') or w.text.startswith('-') or '{}' in w.text:
                         continue
                     self.protected_target('find -exec %s' % bname, w)
-            if bname in PRINT_FILE_CMDS or bname in GREP_CMDS or bname in EXFIL_CMDS:
-                for r in roots:
+            # the command the body really runs (past env, nice, xargs, sudo...); an archiver, a shell or an interpreter given
+            # the found files prints them as surely as cat does (receipt r6 sweep: `-exec bsdtar -cf - {} +`, `-exec sh -c
+            # 'cat "$1"' _ {} \;`, `-exec env cat {} +`)
+            real, real_args = _unwrap_command(body)
+            if real in FIND_EXEC_READERS:
+                for r in cred_roots:
                     p = norm_path(r.text, ctx, ctx.cwd)
-                    if self.under_cred_dir(p) or self.is_cred_path(r.text, r):
+                    if self.under_cred_dir(p) or self.under_cred_parent(p, below=True) or self.is_cred_path(r.text, r):
                         ctx.secret_seen += 1
-                        if self.out_visible(pl, idx, True) and not (bname in GREP_CMDS and self._count_only(body[1:])):
+                        if self.out_visible(pl, idx, True) and not (real in GREP_CMDS and self._count_only(real, self._search_scan(real, real_args))):
                             ctx.add(SECRET_DUMP, 'find-exec-credentials',
                                     'find -exec prints files from a credential directory',
                                     'list names only: find DIR -name PATTERN -print')
@@ -4067,6 +5043,14 @@ class Analyzer:
                 cmd.words = list(body)
                 for name in self.names_for(body[0]):
                     self.apply(name, body, cmd, pl, idx, depth + 1)
+        # the words of each body are a command of their own: `-exec cat ~/.config/goodqa/user-token \;` and `-exec tar cf -
+        # DIR \;` read what they name whatever find found; {} stands for a start directory (receipt r6 sweep)
+        anchor = (cred_roots[0].text if cred_roots else '.') or '.'
+        for body in _find_exec_bodies(args):
+            real, real_args = _unwrap_command(body)
+            if real in PRINT_FILE_CMDS or real in GREP_CMDS or real in EXFIL_CMDS or real in ARCHIVE_CMDS or real in ('openssl', 'source'):
+                self.read_creds(real, [_literal_word(w.text.replace('{}', anchor)) if '{}' in w.text else w for w in real_args],
+                                pl, idx)
         for r in roots:
             self.subs(r, depth, visible=False)
 
@@ -4109,6 +5093,194 @@ class Analyzer:
                     'git %s changes %s, a checkout owned by %s that a timer or service builds from' % (sub, place, owner),
                     'work in your own git worktree (git worktree add) or export (git archive); to restore the owner\'s state '
                     'use git checkout %s alone' % branch)
+            return
+
+    # ---- bulk staging (goodqa#15787): git add -A, ., :/, -u and git commit -a in a dirty ORIGINAL checkout
+    COMMIT_VALUE_SHORT = frozenset('mFCct')  # -m MSG, -F FILE, -C COMMIT, -c COMMIT, -t FILE take a value (attached or the next word)
+    COMMIT_VALUE_LONG = frozenset(('--message', '--file', '--author', '--date', '--template', '--reuse-message', '--reedit-message',
+                                   '--fixup', '--squash', '--cleanup', '--pathspec-from-file', '--trailer'))
+
+    @staticmethod
+    def _pathspec_parts(text):
+        """(top, exclude, rest) of one pathspec: the `top` and `exclude` magic read from the long form `:(top,glob)rest` and the short
+        forms `:/rest`, `:!rest`, `:^rest`; `rest` is the pattern after the magic."""
+        t = text.strip()
+        if t.startswith(':(') and ')' in t:
+            magic, rest = t[2:t.index(')')].split(','), t[t.index(')') + 1:]
+            return 'top' in magic, 'exclude' in magic, rest
+        if t.startswith(':'):
+            k = 1
+            while k < len(t) and t[k] in '/!^':
+                k += 1
+            marks = t[1:k]
+            rest = t[k + 1:] if t[k:k + 1] == ':' else t[k:]
+            return '/' in marks, '!' in marks or '^' in marks, rest
+        return False, False, t
+
+    def _bulk_pathspec(self, text, place, top):
+        """A pathspec that means the whole working directory or the whole tree: `.` (also `./`, `sub/..`), `:/`, `:(top)`, a bare
+        glob (`*`, `**`, `:(top)*`, `:/**`, `:(icase)*`), or a path that is the repository top or contains it (`..`, `../orig`).
+        `sub/.` and `./sub/file` are explicit; an exclusion alone is judged by the caller."""
+        is_top, exclude, rest = self._pathspec_parts(text)
+        if exclude:
+            return False
+        if rest in ('', '*', '**', '.', './'):
+            return True if (is_top or rest in ('', '*', '**') or text.strip() in ('.', './')) else False
+        norm = posixpath.normpath(rest)
+        if norm == '.':
+            return True
+        base = top if is_top else place
+        absolute = norm if norm.startswith('/') else posixpath.normpath(posixpath.join(base, norm))
+        return absolute == top or (top + '/').startswith(absolute.rstrip('/') + '/')
+
+    def _bulk_pathspecs(self, pathspecs, place, top):
+        """True when any pathspec is whole-tree, or when every pathspec is an exclusion (git then selects everything else)."""
+        if any(self._bulk_pathspec(p, place, top) for p in pathspecs):
+            return True
+        return bool(pathspecs) and all(self._pathspec_parts(p)[1] for p in pathspecs)
+
+    def _bulk_add_form(self, words, place, top):
+        """True when `git add` or `git stage` stages everything: -A, --all, --no-ignore-removal, -u, --update (abbreviations git
+        accepts included) with no pathspec or a whole-tree one, or a whole-tree pathspec alone. `git add -u file` and `git add -A src/`
+        stage only that path. An interactive selection (-p, -i, -e) is an explicit choice."""
+        pathspecs, ended, everything = [], False, False
+        for word in words:
+            if ended:
+                pathspecs.append(word)
+                continue
+            if word == '--':
+                ended = True
+            elif word.startswith('--'):
+                key = word.split('=', 1)[0]
+                if key in ('--patch', '--interactive', '--edit'):
+                    return False
+                if len(key) >= 3 and any(name.startswith(key) for name in ('--all', '--update', '--no-ignore-removal')):
+                    everything = True
+            elif word.startswith('-') and len(word) > 1:
+                if set(word[1:]) & set('pie'):
+                    return False
+                if set(word[1:]) & set('Au'):
+                    everything = True
+            else:
+                pathspecs.append(word)
+        if everything and not pathspecs:
+            return True
+        return self._bulk_pathspecs(pathspecs, place, top)
+
+    def _bulk_commit_form(self, words, place, top):
+        """True when `git commit` is given -a or --all (also inside a short cluster: -am, -sa), or a whole-tree pathspec (`git commit
+        -m x .`); the text of -m, -F and the other value options is not read as a flag (-ma is the message `a`). --gpg-sign and -S
+        take only an attached optional value."""
+        pathspecs, ended, i = [], False, 0
+        while i < len(words):
+            word = words[i]
+            i += 1
+            if ended:
+                pathspecs.append(word)
+                continue
+            if word == '--':
+                ended = True
+            elif word.startswith('--'):
+                key = word.split('=', 1)[0]
+                if key == '--all':
+                    return True
+                if key in self.COMMIT_VALUE_LONG and '=' not in word:
+                    i += 1
+            elif word.startswith('-') and len(word) > 1:
+                for k, letter in enumerate(word[1:]):
+                    if letter == 'a':
+                        return True
+                    if letter in self.COMMIT_VALUE_SHORT:
+                        if k == len(word) - 2:
+                            i += 1  # the value is the next word
+                        break
+                    if letter in 'uS':
+                        break  # an optional attached mode or key id
+            else:
+                pathspecs.append(word)
+        return self._bulk_pathspecs(pathspecs, place, top)
+
+    def _bulk_alias_form(self, sub, alias_values, place, top):
+        """The alias that was defined on the command line with -c alias.NAME=... and invoked, judged on its expansion. A `!` alias is a
+        shell command: every `git ... add|stage|commit WORDS` inside it is judged, however it is quoted or nested in `sh -c`."""
+        import shlex
+        for value in alias_values:
+            name, _, body = value.partition('=')
+            if name[len('alias.'):].casefold() != sub.casefold():
+                continue
+            if body.startswith('!'):
+                for match in re.finditer(r'\bgit\b(?:\s+-[cC]\s+\S+|\s+--\S+)*\s+(add|stage|commit)\b([^;&|\n]*)', body):
+                    words = [w for w in re.split(r'\s+', match.group(2).strip().strip('\'"')) if w]
+                    words = [w.strip('\'"') for w in words]
+                    form = self._bulk_add_form if match.group(1) in ('add', 'stage') else self._bulk_commit_form
+                    if form(words, place, top):
+                        return True
+                continue
+            try:
+                tokens = shlex.split(body)
+            except ValueError:
+                return True  # cannot be read: judged as a possible bulk form
+            if tokens and tokens[0] in ('add', 'stage'):
+                return self._bulk_add_form(tokens[1:], place, top)
+            if tokens and tokens[0] == 'commit':
+                return self._bulk_commit_form(tokens[1:], place, top)
+        return False
+
+    @staticmethod
+    def _original_checkout_top(path):
+        """The top of the nearest checkout whose `.git` is a DIRECTORY (the original checkout), None for a linked worktree (a `.git`
+        file), a submodule or a path that is not in a checkout."""
+        current = path
+        for _ in range(64):
+            marker = os.path.join(current, '.git')
+            if os.path.isdir(marker):
+                return current
+            if os.path.exists(marker):
+                return None
+            parent = os.path.dirname(current)
+            if parent == current:
+                return None
+            current = parent
+        return None
+
+    def bulk_staging(self, sub, rest, cwd_words, locations, alias_values):
+        """goodqa#15787: git add -A, `.`, `:/`, -u and git commit -a in the original checkout while it has uncommitted changes sweep
+        other sessions' work into one commit. A linked worktree (the agent's own), a clean checkout, explicit paths, and a path
+        that is not a repository are left alone. The status call is the hardened one (2 s); a failure reports nothing."""
+        ctx = self.ctx
+        where = ctx.cwd
+        for word in (cwd_words if isinstance(cwd_words, list) else [cwd_words] if cwd_words is not None else []):
+            where = norm_path(word.text, ctx, where)  # git -C a -C b: each is relative to the one before
+        places = [where]
+        for text in locations:
+            path = norm_path(text, ctx, where)
+            places.append(path[:-len('/.git')] if path.endswith('/.git') else path)
+        for place in places:
+            if not place or '$' in place or not os.path.isdir(place):
+                continue
+            top = self._original_checkout_top(place)
+            if top is None:
+                continue
+            if sub in ('add', 'stage'):
+                bulk = self._bulk_add_form(rest, place, top)
+            elif sub == 'commit':
+                bulk = self._bulk_commit_form(rest, place, top)
+            elif alias_values:
+                bulk = self._bulk_alias_form(sub, alias_values, place, top)
+            else:
+                bulk = False
+            if not bulk:
+                continue
+            try:
+                code, out, _err = _git_try(top, ['status', '--porcelain=v1', '-z', '--untracked-files=normal'], 2.0)
+            except (OSError, subprocess.SubprocessError, ValueError):
+                continue
+            if code != 0 or not out:
+                continue  # a clean tree has nothing to sweep; an unreadable one reports nothing
+            ctx.add(BULK_STAGING, 'bulk-staging',
+                    '`git %s` here stages or commits EVERY change in %s, a shared original checkout that has uncommitted changes '
+                    '(other sessions\' work can be swept into your commit)' % (sub, top),
+                    'stage explicit paths (git add PATH ...) and commit those, or work in your own linked worktree (git worktree add)')
             return
 
     def _owned_change(self, sub, rest, alias):
@@ -4172,6 +5344,7 @@ class Analyzer:
         cwd_words = []
         locations = []
         alias = False
+        alias_values = []
         while i < len(texts):
             t = texts[i]
             if t in ('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env'):
@@ -4183,6 +5356,7 @@ class Analyzer:
                     locations.append(args[i + 1].text)
                 if t == '-c' and i + 1 < len(args) and args[i + 1].text.casefold().startswith('alias.'):
                     alias = True
+                    alias_values.append(args[i + 1].text)
                 i += 2
             elif t.startswith(('--git-dir=', '--work-tree=')):
                 locations.append(t.split('=', 1)[1])
@@ -4201,6 +5375,7 @@ class Analyzer:
         sub = texts[i] if i < len(texts) else ''
         rest = texts[i + 1:]
         self.owned_checkout(sub, rest, cwd_words, locations, alias)
+        self.bulk_staging(sub, rest, cwd_words, locations, alias_values)
         if sub == 'clean':
             self.git_clean(args[i + 1:], rest, cwd_word)
         if sub == 'worktree' and rest[:1] == ['remove'] and self._removable_linked_worktree(args[i + 1:], cwd_words):
@@ -4470,13 +5645,17 @@ class Analyzer:
     def is_cred_path(self, text, word=None):
         ctx = self.ctx
         c = ctx.c
-        alts = (word.all_alts() or word.alts[:32]) if word is not None else [text]
+        alts = word.cred_alts() if word is not None else [text]
         for alt in alts:
             if self._cred_one(alt):
                 return True
         return False
 
-    def _cred_one(self, text):
+    def _cred_one(self, text, strict_glob=False, literal=False):
+        """text names a credential file. With `strict_glob` a glob is matched segment by segment over the whole path (`*`
+        never crosses a `/`); with `literal` glob characters are plain characters. Both are for a value inside an option
+        word, which no shell expands: literal unless the tool globs it itself (curl's file URL ranges, 7z -i!), so
+        `--exclude=.*` run from the home directory is not read as ~/.netrc."""
         ctx = self.ctx
         c = ctx.c
         if not text or len(text) > 4096:
@@ -4493,9 +5672,14 @@ class Analyzer:
         for p in candidates:
             if any(rx.search(p) for rx in c.cred) and not any(rx.search(p) for rx in c.cred_allow):
                 return True
-        if any(ch in text for ch in '*?['):
+        if not literal and any(ch in text for ch in '*?['):
             for sample in c.cred_samples:
-                if _fnmatchcase(norm_path(sample, ctx, ctx.cwd).casefold(), path.casefold()):
+                folded = norm_path(sample, ctx, ctx.cwd).casefold()
+                if strict_glob:
+                    want, have = Compiled._segs(folded), Compiled._segs(path)
+                    if len(want) == len(have) and all(_fnmatchcase(a, b) for a, b in zip(want, have)):
+                        return True
+                elif _fnmatchcase(folded, path.casefold()):
                     return True
         if is_dynamic_path(text):
             tail = path.split('$')[-1] if '$' in path else ''
@@ -4513,65 +5697,540 @@ class Analyzer:
                 return True
         return False
 
+    def under_cred_parent(self, path, below=False, globs=True):
+        """path is a directory that holds a credential among harmless files (or an ancestor of one); with `below` also a path
+        inside it (a key directory), for readers that walk their operand. A glob segment matches what the shell may expand
+        it to (receipt r6 sweep: `rg . ~/.config/goodq?`, `tar cf - ~/.agent-harness/gq-browse?`)."""
+        segs = Compiled._segs(path)
+        for d in self.c.cred_parent_dirs:
+            if not all(_seg_eq(a, b) if globs else a == b for a, b in zip(segs, d)):
+                continue
+            if len(segs) <= len(d):
+                return True
+            if below and segs[-1] != 'config.json':
+                return True
+        return False
+
     @staticmethod
-    def _count_only(args):
-        return bool(_flag_letters(args) & set('cqlL') or _longs(args) & {'--count', '--quiet', '--silent', '--files-with-matches', '--files-without-match'})
+    def _count_only(name, scan):
+        """True when the search prints no matching line: the tool's OWN count-only letters and long names (receipt r5 F1:
+        rg -L is --follow, while grep, ag and ack -L list files), read by the scan as OPTIONS only, never the letters of a
+        value (`grep -ec FILE` is the pattern `c`) or a value that looks like an option (`grep -e --count FILE`). A tool with
+        no table (pt, select-string) and an uncertain scan are never count-only."""
+        table = SEARCH_TABLES.get(name)
+        if table is None or scan.uncertain:
+            return False
+        return bool(scan.letters & set(table.get('count_short', '')) or scan.longs & table.get('count_long', frozenset()))
+
+    def _search_scan(self, name, args):
+        """The option walk of a search, read as uncertain when the tool has no table (pt, select-string) or may take options
+        from its environment or a config file (TAR_OPTIONS-like variables, an .ackrc in any parent directory). The search,
+        its stdin form and a find -exec body all use it, so count-only means the same in each."""
+        scan = _scan_options(args, SEARCH_TABLES.get(name, {}))
+        if name not in SEARCH_TABLES or _options_from_environment(name, getattr(self.ctx, 'raw_top', ''), self.ctx.cwd):
+            scan.uncertain = True
+        return scan
+
+    @staticmethod
+    def _grep_recursive_long(texts):
+        """--recursive, --dereference-recursive and any abbreviation getopt accepts (`--recur`, `--deref`)."""
+        for t in texts:
+            if t.startswith('--') and len(t) > 3:
+                long_name = t[2:].split('=', 1)[0]
+                if 'recursive'.startswith(long_name) or 'dereference-recursive'.startswith(long_name):
+                    return True
+        return False
+
+    @staticmethod
+    def _grep_directories_recurse(texts):
+        """grep -d recurse, -drecurse, --directories=recurse and --directories recurse all walk the directory like -r, and so do
+        the abbreviations getopt and argmatch accept (`--dir=rec`, `-d rec`)."""
+        def recurse(value):
+            return len(value) >= 3 and 'recurse'.startswith(value)
+        for i, t in enumerate(texts):
+            nxt = texts[i + 1] if i + 1 < len(texts) else ''
+            if t == '-d' and recurse(nxt):
+                return True
+            if len(t) > 2 and t[0] == '-' and t[1] != '-' and 'd' in t[1:]:
+                rest = t[t.index('d', 1) + 1:]  # -drecurse, -rndrec: the rest of the cluster after d is its value
+                if recurse(rest) or (not rest and recurse(nxt)):
+                    return True
+            if t.startswith('--') and len(t) > 3:
+                long_name, eq, value = t[2:].partition('=')
+                if 'directories'.startswith(long_name) and (recurse(value) if eq else recurse(nxt)):
+                    return True
+        return False
+
+    @staticmethod
+    def _local_destinations(name, args, ctx=None):
+        """The words of a copy or archive command that only DESTINATION a write or name an extraction target, never a source
+        that is read. Each skip needs proof (receipt r6): the last operand of scp, rsync, sftp and ditto, and the values of
+        the curl and wget options that name a written file, only when a walk with the tool's own table recognised EVERY
+        option; every operand of tar, bsdtar, gtar and pax only in extract or list mode with no options from the environment;
+        the archive of zip (its first operand) and 7z (the word after the command letter, and the -o/-w directories); every
+        operand of cpio, whose sources only ever come from stdin. They are still judged as files by name; only the
+        ancestor-or-equal directory rule skips them."""
+        words = list(args)
+        skip = []
+        if name in _COPY_TABLES:
+            # option values (`--exclude foo`, `-e ssh`, `-i key`, scp `-P 22`) are not operands. The last operand is the
+            # destination only when the walk is certain and another operand is a real SOURCE: a remote `host:path` or an
+            # existing local path (receipt r4 F3: `rsync -a --exclude foo ~/.config/goodqa/` lists the directory)
+            scan = _scan_options(args, _COPY_TABLES[name])
+            operands = scan.operands
+
+            def is_source(w):
+                if Analyzer._remote_operand(w.text):
+                    return True  # host:path, the remote side
+                return ctx is not None and os.path.exists(norm_path(w.text, ctx))
+            if not scan.uncertain and len(operands) >= 2 and any(is_source(w) for w in operands[:-1]):
+                skip.append(operands[-1])
+        elif name in _FETCH_TABLES:
+            # receipt r6 F1: `curl -H -o file://DIR` reads -o as the value of -H, so the file URL is a URL that curl reads.
+            # Only a certain walk of the whole command shows which word an output option really took
+            table = _FETCH_TABLES[name]
+            scan = _scan_options(args, table)
+            if not scan.uncertain:
+                skip.extend(w for key, w, _attached in scan.values if key in table['destinations'])
+        elif name in ('tar', 'bsdtar', 'gtar', 'pax'):
+            # extract or list: nothing named here is read as a source tree. Create, two modes or a mode in doubt skip nothing
+            # (receipt r4 F2: `tar --cre -f - -Vt DIR` is create; the `t` is the volume label of -V)
+            if _tar_mode(name, args) == 'read' and not (ctx is not None and _options_from_environment(name, getattr(ctx, 'raw_top', ''))):
+                skip.extend(words)
+        elif name == 'zip':
+            # the first operand is the archive; a bare `-` is that operand (the archive goes to stdout), so the directory after
+            # it is a source
+            operands = [w for w in words if not w.text.startswith('-') or w.text == '-']
+            if operands:
+                skip.append(operands[0])
+        elif name in ('7z', '7za', '7zr', '7zz'):
+            # `7z a ARCHIVE SOURCE...`: only the archive word after the command letter is a destination; with -so the archive
+            # name is a placeholder and the sources after it are still sources. -oDIR and -wDIR name the output and work
+            # directories (7z switches always carry their value attached)
+            for i, w in enumerate(words):
+                if w.text in ('a', 'u', 'd', 'rn', 'e', 'x', 'l', 't', 'h', 'b', 'i'):
+                    rest = [v for v in words[i + 1:] if not v.text.startswith('-')]
+                    if rest:
+                        skip.append(rest[0])
+                    break
+            skip.extend(w for w in words if re.match(r'-[ow].', w.text))
+        elif name in ('cpio', 'bsdcpio'):
+            skip.extend(w for w in words if not w.text.startswith('-'))
+        return skip
+
+    @staticmethod
+    def _remote_operand(text):
+        """scp, rsync and sftp read `host:path` as the remote side: a colon with no `/` before it (scp's own rule), in a word
+        that does not start like a local path."""
+        if ':' not in text or text.startswith(('/', '.', '~', '-')):
+            return False
+        return '/' not in text.split(':', 1)[0]
+
+    # ---- name lists (receipt r6 sweep): a reader given the NAMES another command prints
+    def _names_consumer(self, name, args):
+        """The reader a command runs on a LIST OF FILE NAMES it takes from stdin, a names file or a process substitution, or
+        None: xargs or parallel running a reader (`xargs -n 1 cat`, `xargs sh -c ...`; grep count-only excepted), tar, bsdtar
+        and gtar with a names file outside extract and list mode (-T, bsdtar -I, --files-from: `_tar_names_file`), zip
+        -@/--names-stdin, cpio and pax (copy-out reads its names from stdin), rsync --files-from, ack -x/--files-from, 7z
+        @listfile, curl -K/--config and wget -i/--config (a config may name a file URL or a post file), and sftp, whose batch
+        commands (`put FILE`) come from stdin."""
+        texts = [a.text for a in args]
+        short = [t for t in texts if t.startswith('-') and not t.startswith('--')]
+        if name in ('xargs', 'parallel'):
+            real, real_args = _unwrap_command([_literal_word('xargs')] + list(args))
+            if real is None or not re.match(r'[A-Za-z_]', real):
+                # an option value the walk took for the command (`parallel -j 4 cat`): the first reader word is the command
+                for k, a in enumerate(args):
+                    if norm_name(a.text) in FIND_EXEC_READERS:
+                        real, real_args = norm_name(a.text), list(args[k + 1:])
+                        break
+            if real in FIND_EXEC_READERS and not (real in GREP_CMDS and self._count_only(real, self._search_scan(real, real_args))):
+                return real
+            return None
+        if name in ('tar', 'bsdtar', 'gtar'):
+            if _tar_mode(name, args) == 'read':
+                return None
+            return name if _tar_names_file(name, args) else None
+        if name == 'zip':
+            return name if any('@' in t for t in short) or '--names-stdin' in texts else None
+        if name in ('cpio', 'bsdcpio', 'pax', 'afio'):
+            return name
+        if name == 'rsync':
+            return name if any(t.startswith('--files') for t in texts) else None
+        if name == 'ack':
+            return name if any(t.startswith('--files') for t in texts) or any('x' in t for t in short) else None
+        if name in ('7z', '7za', '7zr', '7zz'):
+            return name if any('@' in t for t in texts) else None
+        if name == 'curl':
+            return name if any('K' in t for t in short) or any(t.startswith('--conf') for t in texts) else None
+        if name == 'wget':
+            return name if any('i' in t for t in short) or any(t.startswith(('--input', '--conf')) for t in texts) else None
+        if name == 'sftp':
+            return name
+        return None
+
+    def _producer_hit(self, words, depth=0):
+        """The text by which a command (its words, the name first) may print the name of a credential file or of a directory
+        holding or containing one, for a reader of names, or None: a word naming one (glob-aware, any brace alternative, any
+        value inside the word, any substitution in it), a start directory of find, or the working directory of a lister or a
+        recursive search that names no existing path. Ancestors count as they do for `find -exec`: `find ~ -name X`
+        lists ~/.config/goodqa/user-token."""
+        ctx = self.ctx
+        words = [self.resolve(w) for w in words]
+        if not words:
+            return None
+        real, rargs = _unwrap_command(words)
+        if real is None:
+            return None
+        cands = _find_cred_roots(rargs, []) + _find_files0_values(rargs) if real in ('find', 'bfs', 'gfind') else list(rargs)
+        for w in cands[:256]:
+            if depth < 3:
+                for inner in w.subs[:4]:
+                    hit = self._script_lists_creds(inner, depth + 1)
+                    if hit:
+                        return hit
+            alts = w.cred_alts() or [w.text]
+            for alt in alts:
+                for t in [alt] + (_derived_texts(alt, curl=True) if len(alts) <= 8 else []):
+                    if self._cred_one(t, strict_glob=t is not alt):
+                        return t
+                    if t is alt or _path_like(t):
+                        path = norm_path(t, ctx)
+                        if self.under_cred_dir(path) or self.under_cred_parent(path, below=True):
+                            return t
+        if real in NAME_LISTERS or real in GREP_CMDS:
+            operands = [w for w in rargs if not w.text.startswith('-')]
+            if real in GREP_CMDS:
+                texts = [w.text for w in rargs]
+                if not (_flag_letters(rargs) & set('rR') or real in RECURSIVE_SEARCHERS or self._grep_recursive_long(texts)
+                        or self._grep_directories_recurse(texts)):
+                    return None
+                operands = operands[1:]
+            if not any(os.path.exists(norm_path(w.text, ctx)) for w in operands) and (
+                    self.under_cred_dir(ctx.cwd) or self.under_cred_parent(ctx.cwd, below=True)):
+                return ctx.cwd
+        return None
+
+    def _script_lists_creds(self, text, depth=0):
+        """The first credential name any command of a command line (a substitution's text) may print, or None."""
+        ctx = self.ctx
+        if not text or len(text) > 200000:
+            return None
+        try:
+            pipelines = parse(Lexer(ctx, ctx.ps).lex(text))
+        except (Blocked, ValueError, IndexError, RecursionError):
+            return None  # the substitution itself is judged (and refused when unreadable) where it runs
+        for pl in pipelines[:64]:
+            for cmd in pl.cmds[:32]:
+                hit = self._producer_hit(self._skip_assigns(strip_reserved(cmd.words))[1], depth)
+                if hit:
+                    return hit
+        return None
+
+    def _input_hit(self, cmd):
+        """The credential name a command's own stdin may list: `< <(find DIR)`, a here-string or a heredoc, or None. A plain
+        `< FILE` names a file whose contents the guard does not read."""
+        for r in cmd.redirs if cmd is not None else []:
+            if r.op in ('<', '<>') and r.fd in (None, '0') and r.target is not None:
+                for inner in r.target.subs[:4]:
+                    hit = self._script_lists_creds(inner)
+                    if hit:
+                        return hit
+            elif r.op == '<<<' and r.target is not None:
+                words = [_literal_word(t) for alt in r.target.alts[:8] for t in alt.split()[:256]]
+                hit = self._producer_hit([_literal_word('echo')] + words) or any(
+                    self._script_lists_creds(inner) for inner in r.target.subs[:4])
+                if hit:
+                    return hit if isinstance(hit, str) else r.target.text
+            elif r.op in ('<<', '<<-') and r.body:
+                words = [_literal_word(t.strip('\'"')) for t in r.body.split()[:2000]]
+                hit = self._producer_hit([_literal_word('echo')] + words)
+                if hit:
+                    return hit
+        return None
+
+    def _cred_sample(self, hit):
+        """A credential file a name list that hit by `hit` may contain: the text itself when it names one, else the first
+        known credential file at or below the directory it names."""
+        ctx = self.ctx
+        if self._cred_one(hit):
+            return norm_path(hit, ctx)
+        segs = Compiled._segs(norm_path(hit, ctx))
+        for sample in self.c.cred_samples:
+            path = norm_path(sample, ctx, ctx.cwd)
+            if Compiled._segs(path)[:len(segs)] == segs:
+                return path
+        return norm_path(self.c.cred_samples[0], ctx, ctx.cwd) if self.c.cred_samples else norm_path(hit, ctx)
+
+    def _bind_read_vars(self, rest, pl, idx, cmd):
+        """`find DIR -type f | while read f; do cat "$f"; done`: bind the variables of a `read` whose input lists a
+        credential name to a credential file, so the loop body is judged on what it really reads."""
+        ctx = self.ctx
+        hit = None
+        if pl is not None:
+            for prev in pl.cmds[:idx]:
+                hit = self._producer_hit(self._skip_assigns(strip_reserved(prev.words))[1])
+                if hit:
+                    break
+        hit = hit or self._input_hit(cmd) or getattr(ctx, 'read_binds', {}).get(id(cmd))
+        if not hit:
+            return
+        sample = self._cred_sample(hit)
+        texts = [w.text for w in rest]
+        k = 1
+        while k < len(texts):
+            t = texts[k]
+            if t in ('-d', '-i', '-n', '-N', '-p', '-t', '-u', '-k'):
+                k += 2
+                continue
+            if t in ('-a', '-A') and k + 1 < len(texts):
+                t = texts[k + 1]
+                k += 1
+            elif t.startswith('-'):
+                k += 1
+                continue
+            name = t.split('?', 1)[0]
+            if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
+                if not hasattr(ctx, 'flow_vars'):
+                    ctx.flow_vars = set()
+                ctx.flow_vars.add(name)
+                ctx.vars[name] = sample
+                ctx.tainted.discard(name)
+            k += 1
+
+    def _prebind_loop_input(self, pipelines):
+        """`while read f; do cat "$f"; done < <(find DIR -type f)`: a loop's input is redirected on its `done`, after the body
+        the guard has already judged, so find each loop's input first and bind its `read` before the body is seen."""
+        stack = []
+        for pl in pipelines:
+            for cmd in pl.cmds:
+                ws = cmd.words
+                if not ws or ws[0].quoted:
+                    continue
+                if ws[0].text in ('while', 'until', 'for', 'select'):
+                    head = self._skip_assigns(strip_reserved(ws))[1]
+                    stack.append(cmd if head and head[0].text == 'read' else None)
+                elif ws[0].text == 'done' and stack:
+                    loop = stack.pop()
+                    if loop is not None and cmd.redirs:
+                        hit = self._input_hit(cmd)
+                        if hit:
+                            if not hasattr(self.ctx, 'read_binds'):
+                                self.ctx.read_binds = {}
+                            self.ctx.read_binds[id(loop)] = hit
+
+    def _files0_hit(self, args, pl, idx):
+        """The credential name the -files0-from list of a find may give it, or None: a process substitution value
+        (`<(printf ...)`, `<(find DIR -print0)`), or `-` (stdin) fed by an earlier pipeline stage or the command's own
+        input redirect (`printf ... | find -files0-from - ...`, `find -files0-from - ... < <(find DIR -print0)`)."""
+        for value in _find_files0_values(args):
+            for inner in value.subs[:4]:
+                hit = self._script_lists_creds(inner)
+                if hit:
+                    return hit
+            if value.text in ('-', '/dev/stdin', '/dev/fd/0'):
+                for prev in (pl.cmds[:idx] if pl is not None else []):
+                    hit = self._producer_hit(self._skip_assigns(strip_reserved(prev.words))[1])
+                    if hit:
+                        return hit
+                hit = self._input_hit(pl.cmds[idx] if pl is not None and idx < len(pl.cmds) else None)
+                if hit:
+                    return hit
+        return None
+
+    def _names_finding(self, reader, hit):
+        ctx = self.ctx
+        ctx.add(SECRET_DUMP, 'credential-file',
+                '`%s` reads the files a name list gives it, and that list may name a credential file (%s)'
+                % (reader[:20], posixpath.basename(norm_path(hit, ctx).rstrip('/'))[:40] or hit[:40]),
+                'list names only (find DIR -type f, ls -l); read what you need with the owning tool\'s own command')
+
+    def _names_pipeline(self, pl):
+        """A stage that reads the files named by an earlier stage, its own stdin redirect or a process substitution it is
+        given: `find ~/.config/goodqa -type f | xargs cat`, `| tar -cf - -T -`, `| zip -@ -`, `| cpio -o`, `xargs cat <
+        <(find DIR)`, `xargs -a <(find DIR) cat`, `echo 'put F' | sftp -b - host`."""
+        ctx = self.ctx
+        for idx, cmd in enumerate(pl.cmds):
+            words = [self.resolve(w) for w in self._skip_assigns(strip_reserved(cmd.words))[1]]
+            if not words:
+                continue
+            name, args = norm_name(words[0].text), words[1:]
+            if name in WRAPPERS_SIMPLE and name != 'xargs':
+                real, rargs = _unwrap_command(words)
+                lead = words[:len(words) - len(rargs)]
+                xs = [k for k, w in enumerate(lead) if norm_name(w.text) == 'xargs']
+                name, args = ('xargs', words[xs[0] + 1:]) if xs else (real, rargs)
+            reader = self._names_consumer(name, args) if name else None
+            if reader is None:
+                continue
+            hit = None
+            for prev in pl.cmds[:idx]:
+                hit = self._producer_hit(self._skip_assigns(strip_reserved(prev.words))[1])
+                if hit:
+                    break
+            hit = hit or self._input_hit(cmd)
+            if not hit:
+                for a in args:
+                    if a.subs and (a.raw or '').lstrip('"\'').startswith('<('):
+                        hit = next((h for h in (self._script_lists_creds(t) for t in a.subs[:4]) if h), None)
+                        if hit:
+                            break
+            if not hit:
+                continue
+            ctx.secret_seen += 1
+            if name in EXFIL_CMDS or reader in EXFIL_CMDS or self.out_visible(pl, idx, True):
+                self._names_finding(reader, hit)
+
+    def _substituted_names(self, rest, pl, idx):
+        """`cat $(find ~/.config -name user-token)`, `tar -cf - $(find DIR -type f)`, `` bash `ls -d DIR/*` ``: a reader
+        whose arguments are the output of a command substitution that may list a credential name (receipt r6 sweep). A
+        process substitution `<(..)` is a file of names, which only a reader of names reads as files."""
+        real, rargs = _unwrap_command(rest)
+        if real is None or real not in FIND_EXEC_READERS:
+            return
+        if real in GREP_CMDS and self._count_only(real, self._search_scan(real, rargs)):
+            return
+        for w in rargs:
+            if not w.subs or (w.raw or '').lstrip('"\'').startswith(('<(', '>(')):
+                continue
+            for inner in w.subs[:8]:
+                hit = self._script_lists_creds(inner)
+                if hit:
+                    self.ctx.secret_seen += 1
+                    if real in EXFIL_CMDS or self.out_visible(pl, idx, True):
+                        self._names_finding(real, hit)
+                    return
 
     def read_creds(self, name, args, pl, idx):
+        """Refuse a command that reads a credential file or walks a directory holding one. Every word is judged unless a
+        rule PROVES it is not read (receipt r6): by name, the word, each brace or variable alternative and every value it may
+        carry (`_derived_texts`); as a source tree (recursive searches, archives and copy tools), the same texts plus each
+        relative operand under every `tar -C` directory. A word is exempt only when:
+        - a search walk is certain (every option in the tool's table, nothing from the environment): the pattern word and
+          the option words and values are not read as trees, and pattern, glob and number values not as files either;
+          with a count-only option the searched operands print no line;
+        - a copy, fetch or archive rule proves it is a destination (`_local_destinations`);
+        - scp, rsync or sftp name the remote side (`host:path`).
+        An uncertain search also judges the working directory whatever its operands."""
         ctx = self.ctx
         texts = [a.text for a in args]
         words = list(args)
+        uncertain, count_only = False, False
+        exempt_name, exempt_dir, counted = set(), set(), set()
+        sources = words
         if name in GREP_CMDS:
-            skip_next = {'-e', '-f', '-m', '-A', '-B', '-C', '--regexp', '--file', '--max-count', '--include', '--exclude', '-g', '--glob'}
-            kept, i, pattern_taken = [], 0, any(t in ('-e', '--regexp', '-f', '--file') or t.startswith('--regexp=') for t in texts)
-            while i < len(words):
-                t = words[i].text
-                if t in skip_next:
-                    i += 2
-                    continue
-                if t.startswith('-') and t != '-':
-                    i += 1
-                    continue
-                if not pattern_taken:
-                    pattern_taken = True
-                    i += 1
-                    continue
-                kept.append(words[i])
-                i += 1
-            words = kept
-            count_only = self._count_only(args)
-        else:
-            words = [w for w in words if not (w.text.startswith('-') and len(w.text) > 1)]
-            count_only = False
-        if name == 'sed' or name == 'awk' or name in ('gawk', 'mawk', 'jq', 'yq'):
-            words = words[1:] if words else words  # first positional is the program
-        if name in EXFIL_CMDS:
-            words = [w for w in args]
-        recursive = name in GREP_CMDS and (_flag_letters(args) & set('rR') or name in ('rg', 'ag', 'ack') or '--recursive' in _longs(args))
-        for w in words:
-            t = w.text
-            if name in EXFIL_CMDS:
-                t = t[1:] if t.startswith('@') else t
-                t = t[len('file://'):] if t.startswith('file://') else t
-                if '=@' in t:
-                    t = t.split('=@', 1)[1]
-                if ':' in t and not t.startswith('/') and name in ('scp', 'rsync', 'sftp'):
-                    continue
-            hit = self.is_cred_path(t, w) if t == w.text else self._cred_one(t)
-            dir_hit = recursive and self.under_cred_dir(norm_path(t, ctx), or_above=True)
-            if hit or dir_hit:
-                ctx.secret_seen += 1
+            # a getopt walk with the tool's option table: a recognised value option takes its value (also attached: -etok,
+            # -rnA3), the first free word is the pattern unless an option gave one. An option the table does not know makes
+            # the walk UNCERTAIN (it may have taken the next word as its value, or be an abbreviation of --regexp): then
+            # every word, the presumed pattern and option words included, is judged, and a recursive search is also judged
+            # on the working directory whatever its operands (receipt r4 F1: `cd ~ && grep -r -e tok --group-separator /tmp`)
+            scan = self._search_scan(name, args)
+            uncertain = scan.uncertain
+            count_only = self._count_only(name, scan)
+            if not uncertain:  # an uncertain walk exempts nothing: every word, the presumed pattern included, is judged
+                table = SEARCH_TABLES[name]
+                pattern = None if scan.pattern_given or not scan.operands else scan.operands[0]
+                sources = [w for w in scan.operands if w is not pattern]
+                free_short, free_long = table.get('free_short', ''), table.get('free_long', frozenset())
+                for w in ([pattern] if pattern is not None else []) + scan.flag_words:
+                    exempt_name.add(id(w))
+                    exempt_dir.add(id(w))
+                for (kind, key), w, _attached in scan.values:
+                    exempt_dir.add(id(w))
+                    if key in (free_short if kind == 's' else free_long):
+                        exempt_name.add(id(w))  # a pattern, glob, number or keyword; any other value is judged as a file
                 if count_only:
+                    counted = {id(w) for w in sources}  # the searched files print a count or a name, never a line
+        recursive = name in GREP_CMDS and (_flag_letters(args) & set('rR') or name in RECURSIVE_SEARCHERS or self._grep_recursive_long(texts)
+                                          or self._grep_directories_recurse(texts))
+        reads_stdin = idx > 0 and name in STDIN_SEARCHERS  # a piped rg reads stdin; GNU grep -r with no operand still walks the directory
+        # the working directory is judged when the search names no existing path, and ALWAYS when an option was not
+        # recognised: that option may have taken the only path as its value, and the tool then searches the working
+        # directory (`cd ~ && grep -r --group /tmp tok`, where --group abbreviates --group-separator); a person names a path
+        # outside the credential directories from a harmless working directory, or counts with -c
+        no_real_path = uncertain or not sources or not any(os.path.exists(norm_path(w.text, ctx)) for w in sources)
+        if recursive and no_real_path and not reads_stdin and self.under_cred_parent(ctx.cwd, below=True):
+            # a recursive search with no path operand searches the working directory: `cd ~/.config/goodqa && rg .`, or any
+            # search from the home directory, which contains it
+            ctx.secret_seen += 1
+            if not count_only and self.out_visible(pl, idx, True):
+                ctx.add(SECRET_DUMP, 'credential-file',
+                        '`%s` with no path searches the working directory, which holds or contains a credential file' % name,
+                        'name a path outside the credential directories, or search with `grep -c` / `rg -c` to count')
+                return
+        walking = bool(recursive) or name in ARCHIVE_CMDS or name in EXFIL_CMDS
+        if walking:
+            exempt_dir.update(id(d) for d in self._local_destinations(name, args, ctx))
+        bases = _tar_bases(args, ctx) if name in ('tar', 'bsdtar', 'gtar') and _tar_mode(name, args) != 'read' else []
+        grep_path = self._grep_path_dirs() if name in GREP_CMDS else []
+        copy_tool = name in ('scp', 'rsync', 'sftp')
+        for w in words:
+            if copy_tool and self._remote_operand(w.text):
+                continue  # the remote side of scp, rsync or sftp
+            check_name, check_dir = id(w) not in exempt_name, walking and id(w) not in exempt_dir
+            if not (check_name or check_dir):
+                continue
+            alts = w.cred_alts() or [w.text]
+            hit, shown = check_name and self.is_cred_path(w.text, w), w.text  # every alternative, past the brace cap too
+            for k, alt in enumerate(alts[:256]):
+                if hit:
+                    break
+                derived = _derived_texts(alt, colon=name == 'socat', curl=name == 'curl') if k < 8 else []
+                # a value inside a word is not expanded by the shell; only curl (file URL ranges) and 7z (-i! wildcards)
+                # glob it themselves
+                self_glob = 'file:' in alt.casefold() or name == 'curl' or (name in ('7z', '7za', '7zr', '7zz') and alt.startswith('-i'))
+                if check_name:
+                    for cand in derived:
+                        rel = not cand.startswith(('/', '~', '$'))
+                        if self._cred_one(cand, strict_glob=True, literal=not self_glob) or (
+                                rel and grep_path and self._grep_path_hit(cand, grep_path)):
+                            hit, shown = True, cand
+                            break
+                if not hit and check_dir:
+                    for cand in [alt] + [d for d in derived if _path_like(d) or self_glob]:
+                        paths = [norm_path(cand, ctx)]
+                        if bases and not cand.startswith(('/', '~', '$')):
+                            paths.extend(norm_path(cand, ctx, b) for b in bases)
+                        # a glob in the word itself is the shell's to expand; one inside an option value is literal, except
+                        # 7z's own wildcards after `!` (`-ir!~/.c*`)
+                        globs = cand is alt or self_glob
+                        if any((recursive and self.under_cred_dir(p, or_above=True)) or self.under_cred_parent(p, below=True, globs=globs)
+                               for p in paths):
+                            hit, shown = True, cand
+                            break
+            if not hit and grep_path and check_name and self._grep_path_hit(w.text, grep_path):
+                hit = True
+            if hit:
+                ctx.secret_seen += 1
+                if id(w) in counted:
                     continue
-                if name in EXFIL_CMDS:
-                    visible = True
-                else:
-                    visible = self.out_visible(pl, idx, True)
+                visible = True if name in EXFIL_CMDS else self.out_visible(pl, idx, True)
                 if visible:
                     ctx.add(SECRET_DUMP, 'credential-file',
-                            '`%s` of a credential file can print or send secrets (%s)' % (name, posixpath.basename(norm_path(t, ctx))[:40]),
+                            '`%s` of a credential file can print or send secrets (%s)' % (name, posixpath.basename(norm_path(shown, ctx))[:40]),
                             'check existence with `test -s FILE` or `ls -l FILE`; use the owning tool\'s own config flag; to count entries use `grep -c`')
                     return
+
+    def _grep_path_dirs(self):
+        """ugrep opens `-f FILE` under $GREP_PATH when FILE is not in the working directory: the directories GREP_PATH names
+        in the command text or this environment, or [''] (any directory) when the command sets it to something unreadable."""
+        raw = getattr(self.ctx, 'raw_top', '') or ''
+        dirs = [m.group(1).strip('\'"') for m in re.finditer(r'GREP_PATH=(\S+)', raw)]
+        if os.environ.get('GREP_PATH'):
+            dirs.append(os.environ['GREP_PATH'])
+        if not dirs and 'GREP_PATH' in raw:
+            dirs.append('')
+        return dirs
+
+    def _grep_path_hit(self, text, dirs):
+        for d in dirs:
+            if d == '':
+                base = posixpath.basename(text)
+                if any(posixpath.basename(s) == base for s in self.c.cred_samples):
+                    return True
+            elif self._cred_one(posixpath.join(d, text), strict_glob=True):
+                return True
+        return False
 
     def interpreter(self, name, args, texts, depth, words=None):
         code = None
@@ -5444,7 +7103,10 @@ class Analyzer:
                 for w in (nd[1:] if name == 'sed' and nd else nd):
                     if not self.state_dest(w):
                         self.refuse(name + ' -i (rewrites in place)', w, tiers=('log', 'unknown'))
+        elif name == 'scp':
+            self.remote_copy_dest(name, args, texts)
         elif name == 'rsync':
+            self.remote_copy_dest(name, args, texts)
             if any(t.startswith('--delete') or t.startswith('--del') or t == '--remove-source-files'
                    or t == '--remove-sent-files' for t in texts):
                 pos = [a for a in nd if not self._remote_spec(a.text)]
@@ -5499,6 +7161,144 @@ class Analyzer:
     def _remote_spec(text):
         return bool(re.match(r'^[A-Za-z0-9_.@-]+:(?!/)', text)) or bool(re.match(r'^[A-Za-z0-9_.@-]+::', text)) \
             or bool(re.match(r'^[A-Za-z0-9_.@-]+:/', text) and not text.startswith('/'))
+
+    REMOTE_DEST = re.compile(r'^(?:[A-Za-z0-9_.-]+@)?(?:[A-Za-z0-9_.-]+|\[[0-9a-fA-F:.%]+\]):(?!:)(.*)$', re.S)
+    REMOTE_URL = re.compile(r'^(?:scp|sftp|ssh)://(?:[^@/]+@)?(?:\[[^\]]+\]|[^/:]+)(?::\d+)?(?:/(.*))?$', re.S)
+    REMOTE_DAEMON = re.compile(r'^(?:(?:[A-Za-z0-9_.-]+@)?(?:[A-Za-z0-9_.-]+|\[[0-9a-fA-F:.%]+\])::|rsync://(?:[^@/]+@)?(?:\[[^\]]+\]|[^/:]+)(?::\d+)?/)'
+                               r'(?:[^/]*)(?:/(.*))?$', re.S)
+    SCP_VALUE_FLAGS = {'-P', '-i', '-o', '-F', '-c', '-l', '-S', '-J', '-D', '-X'}
+    RSYNC_VALUE_FLAGS = {'-e', '-f', '-T', '-B', '-M', '--rsh', '--chmod', '--exclude', '--include', '--filter', '--rsync-path', '--files-from',
+                         '--log-file', '--exclude-from', '--include-from', '--bwlimit', '--timeout', '--contimeout', '--port', '--backup-dir',
+                         '--partial-dir', '--suffix', '--compare-dest', '--copy-dest', '--link-dest', '--max-size', '--min-size', '--block-size',
+                         '--modify-window', '--protocol', '--chown', '--usermap', '--groupmap', '--iconv', '--out-format', '--password-file',
+                         '--address', '--sockopts', '--write-batch', '--only-write-batch', '--read-batch', '--info', '--debug',
+                         '--compress-level', '--skip-compress', '--temp-dir', '--max-delete', '--checksum-choice', '--cc', '--stop-after',
+                         '--stop-at', '--outbuf', '--remote-option', '-M', '--zc', '--zl', '--compress-choice', '--log-file-format', '--copy-as',
+                         '--checksum-seed', '--max-alloc', '--early-input', '--dparam', '--files-from', '--exclude-from', '-@'}
+
+    def _copy_operands(self, name, args):
+        """The positional operands of scp or rsync with option VALUES skipped (a value after the destination must not hide it).
+        A short cluster such as `-avze ssh` or `-rP 22` ends in a value flag whose value is the NEXT word; `-P22` carries it."""
+        flags = self.SCP_VALUE_FLAGS if name == 'scp' else self.RSYNC_VALUE_FLAGS
+        letters = {f[1] for f in flags if len(f) == 2}
+        out, skip, ended = [], False, False
+        for word in args:
+            text = word.text
+            if skip:
+                skip = False
+                continue
+            if not ended and text == '--':
+                ended = True
+                continue
+            if not ended and text.startswith('-') and len(text) > 1:
+                if text.startswith('--'):
+                    key = text.split('=', 1)[0]
+                    if key in flags and '=' not in text:
+                        skip = True
+                else:
+                    for k, ch in enumerate(text[1:]):
+                        if ch in letters:
+                            skip = k == len(text) - 2  # a value flag LAST in the cluster takes the next word; otherwise the rest is its value
+                            break
+                continue
+            out.append(word)
+        return out
+
+    def remote_paths(self, text):
+        """Candidate remote paths when `text` is a remote operand (host:path, user@[v6]:path, scp:// and rsync:// urls, host::module),
+        else None. A path relative to the remote home reads as `~/relative`; a url path is judged both absolute and home-relative
+        and url-decoded (the module root of an rsync daemon is unknown, so its rest is judged the same way)."""
+        from urllib.parse import unquote
+        if not text or text.startswith(('/', './', '../', '~')) or re.match(r'^[A-Za-z]:[\\/]', text):
+            return None
+        rest, urlish = None, False
+        match = self.REMOTE_URL.match(text)
+        if match:
+            rest, urlish = match.group(1) or '', True
+        else:
+            match = self.REMOTE_DAEMON.match(text)
+            if match:
+                rest, urlish = match.group(1) or '', True
+            else:
+                match = self.REMOTE_DEST.match(text)
+                if match:
+                    rest = match.group(1)
+        if rest is None:
+            return None
+        if rest == '':
+            return ['~']  # `host:` is the remote home
+        rest = unquote(rest) if urlish else rest
+        if urlish:
+            rest = rest[2:] if rest.startswith(('/~/', '~/')) else rest
+            out = ['/' + rest.lstrip('/'), '~/' + rest.lstrip('/')]
+            return out
+        return [rest if rest.startswith(('/', '~')) else '~/' + rest]
+
+    @staticmethod
+    def _relative_tail(text):
+        """The part of a source path rsync -R rebuilds under the destination: after a `/./` marker, else without a leading `/` or `./`."""
+        if '/./' in text:
+            return text.split('/./', 1)[1].strip('/')
+        text = text.lstrip('/')
+        while text.startswith('./'):
+            text = text[2:].lstrip('/')
+        return '' if text in ('.', '..') else text.strip('/')
+
+    def remote_copy_dest(self, name, args, texts):
+        """scp and rsync copying TO a remote path that names a protected harness location (hooks, WALs, state): the same refusal
+        as a local or ssh-wrapped cp (goodqa#15759; the 2026-11-11 t2-dev install of command_guard.py used scp after the cp was
+        refused). Option values never hide the destination; IPv6 hosts, scp:// and rsync:// urls and `host::module` are read; a
+        recursive copy or an rsync --delete into a directory that CONTAINS protected files is refused too (it overwrites or
+        removes them in one command). Downloads (a remote SOURCE, a local destination) are not touched. Stated limits: sftp batch
+        commands, tar | ssh and a directory SOURCE (its contents are not expanded) are not seen; a variable in the file position is
+        judged like the local cp."""
+        operands = self._copy_operands(name, args)
+        if len(operands) < 2:
+            return
+        letters = _flag_letters(args)
+        recursive = bool(letters & {'r', 'R'}) or '--recursive' in texts or (name == 'rsync' and (bool(letters & {'a'}) or '--archive' in texts or
+                                                                                        any(s.text.endswith('/') for s in operands[:-1])))
+        deleting = name == 'rsync' and any(t.startswith('--del') or t in ('--remove-source-files', '--remove-sent-files') for t in texts)
+        relative = name == 'rsync' and (bool(letters & {'R'}) or '--relative' in texts or any(t.startswith('--files-from') for t in texts))
+        hidden = name == 'rsync' and any(t.startswith('--files-from') for t in texts)  # the sources are in a file the guard cannot read
+        # the destination is the last operand, and every remote operand that follows a local one is an upload target too (an
+        # unknown option value after the destination must not hide it)
+        dests, seen_local = [], False
+        for index, operand in enumerate(operands):
+            if self.remote_paths(operand.text):
+                if index == len(operands) - 1 or seen_local:
+                    dests.append(operand)
+            else:
+                seen_local = True
+        for dest in dests:
+            paths = self.remote_paths(dest.text)
+            sources = [o for o in operands if o is not dest and not self.remote_paths(o.text)]
+            named, roots = list(paths), []
+            for source in sources:
+                text = source.text
+                base = posixpath.basename(text.rstrip('/'))
+                contents = text.endswith('/') or text.rstrip('/') in ('.', '..')
+                rel = self._relative_tail(text) if relative else ''
+                for path in paths:
+                    if rel:  # rsync -R rebuilds the source path under the destination (cut at a /./ marker)
+                        named.append(path.rstrip('/') + '/' + rel)
+                        roots.append(path.rstrip('/') + '/' + rel)
+                    elif contents or not base:
+                        roots.append(path)
+                    else:
+                        named.append(path.rstrip('/') + '/' + base)
+                        roots.append(path.rstrip('/') + '/' + base)
+            if not sources or deleting or hidden:
+                roots += paths
+            for candidate, tiers in [(c, ('log', 'unknown')) for c in named] + \
+                    [(r, ('log', 'unknown', 'ancestor')) for r in roots if recursive or deleting or hidden]:
+                fake = Word()
+                fake.alts = [candidate]
+                fake.dynamic, fake.subs, fake.vars = dest.dynamic, dest.subs, dest.vars
+                cls, _resolved, _literal = self.target_class(fake)
+                if cls in tiers:
+                    self.refuse(name + ' to a remote harness path (the sanctioned route is `ah install-files`)', fake, tiers=tiers)
+                    return
 
     def overwrite_dest(self, what, word):
         """cp/mv/ln/install onto an existing Tier A file (or into a protected dir by glob/variable)."""
@@ -5717,13 +7517,29 @@ SECRET_TEXT = re.compile(r'(?i)\brclone\b|\bauth\s+token\b|--show-token|\bprinte
                          r'internet)-password|dump-keychain|/environ\b|(?:TOKEN|SECRET|PASSWORD|API_?KEY)\b')
 
 
+# credential locations for the raw-text fallback (receipt r7, fail closed): when the analysis cannot finish (an internal
+# error, the time or node budget, nesting past max_depth, the hook's alarm or a crash of the analyser) a command naming
+# one is refused, never allowed or only warned about. Matched on the text and on the text with quotes and backslashes
+# removed (`~/.config/"goodqa"`, `goo\dqa`): a path segment `goodqa` (`~/.config/goodqa`, `~/.conf*/goodqa`), the lease
+# keys, a glob or brace right under ~/.config, and the policy's other credential directories. command_guard_hook.py keeps
+# an identical copy (it must not import this module).
+CRED_TEXT = re.compile(r'(?i)/goodqa(?![\w.-])|gq-browser|goodqa-hive|\.config/+[^\s/;&|<>()]*[*?\[{]'
+                       r'|(?:^|[\s/=~:])\.(?:ssh|aws|gnupg|kube|docker)(?![\w-])|\.config/+(?:gh|gcloud|rclone)(?![\w-])'
+                       r'|\.vault-token|\.git-credentials')
+
+
+def raw_credential(text):
+    """The raw text names a credential location (`CRED_TEXT`), as written or with quotes and backslashes removed."""
+    return bool(CRED_TEXT.search(text) or CRED_TEXT.search(re.sub(r'[\'"\\]', '', text)))
+
+
 def raw_sensitive(text, compiled=None, cwd=None):
-    """Cheap raw-text probe: does this text name a protected location or a secret source? A destructive verb run
-    from a working directory inside a harness root counts too (`cd ~/.claude` then `rm -rf projects`)."""
+    """Cheap raw-text probe: does this text name a protected location, a credential location or a secret source? A
+    destructive verb run from a working directory inside a harness root counts too (`cd ~/.claude` then `rm -rf projects`)."""
     if not isinstance(text, str):
         text = ' '.join(map(str, text))
     t = text[:4_000_000]
-    if PROTECTED_TEXT.search(t) or SECRET_TEXT.search(t):
+    if PROTECTED_TEXT.search(t) or SECRET_TEXT.search(t) or raw_credential(t):
         return True
     if cwd and DESTROY_TEXT.search(t):
         for place in (cwd, _realpath(cwd) or cwd):
@@ -7298,6 +9114,149 @@ def extract_command(payload):
     return None, False
 
 
+INSTALL_FILES_FLAGS = {'--host': 1, '--from-ref': 1, '--file': 1, '--ticket': 1, '--dry-run': 0, '--resume': 1, '--rollback': 1,
+                       '--force-file': 1, '--agent': 1}
+INSTALL_FILES_FORM = ('the sanctioned form is `python3 -I ~/.claude/hooks/ah.py install-files --host HOST --from-ref SHA --file '
+                      'NAME ... --ticket "GoodQA project#N"` (or `--resume RUN` / `--rollback RUN`), run by the main agent from '
+                      'the INSTALLED copy')
+
+
+INSTALL_FILES_FLAGS['--allow-older'] = 0
+INSTALL_FILES_VIEWERS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'cat', 'less', 'more', 'head', 'tail', 'git', 'ls', 'sed', 'awk', 'echo',
+                         'printf', 'diff', 'wc', 'tee', 'man', 'find', 'vi', 'vim', 'nano', 'open', 'test', 'true', 'false', 'wal_note.py'}
+INSTALL_FILES_WRAPPERS = {'env', 'sudo', 'nohup', 'time', 'command', 'exec', 'stdbuf', 'nice', 'xargs'}
+INSTALL_FILES_SHELLS = {'bash', 'sh', 'zsh', 'dash', 'ksh'}
+INSTALL_FILES_REDIRECT = re.compile(r'^(?:[0-9]*[<>]{1,2}&?[0-9-]*|[0-9]*[<>]{1,2}.+|&>.*|\|&)$')
+
+
+def _install_files_segments(text):
+    """[(tokens, raw segment)] for the simple commands of `text`. Quote-aware first (a `;` or `&` inside a quoted commit message
+    does not split it); when the whole text does not tokenize (a heredoc body, an odd quote) it falls back to a plain split,
+    and a segment that does not tokenize comes back as (None, segment)."""
+    separators = set(';&|\n')
+    try:
+        lex = shlex.shlex(re.sub(r'([<>])&', r'\1@AMP@', text), posix=True, punctuation_chars=';&|')  # `2>&1` is not a separator
+        lex.whitespace = ' \t\r'
+        lex.commenters = ''
+        lex.wordchars += '=:,./~$-+@%^<>'
+        out, current = [], []
+        for token in lex:
+            token = token.replace('@AMP@', '&')
+            if token and all(ch in separators for ch in token):
+                if current:
+                    out.append((current, ' '.join(current)))
+                current = []
+            else:
+                current.append(token)
+        if current:
+            out.append((current, ' '.join(current)))
+        # newlines are plain characters inside this tokenizer: a multi-line text is split on them first
+        if '\n' in text:
+            raise ValueError('multi-line text')
+        return out
+    except ValueError:
+        out = []
+        for segment in re.split(r'[;&|\n]+', text):
+            try:
+                out.append((shlex.split(segment, comments=False, posix=True), segment))
+            except ValueError:
+                out.append((None, segment))
+        return out
+
+
+def _install_files_segment(text, is_main, home, installed, literal, depth=0):
+    """None, or the refusal for one command string (recursing into `bash -c` bodies, at most three levels)."""
+    flat = re.sub(r'[\'"\\]', '', text)
+    if re.search(r'(?:^|\n)\s*(?:import|from)\s+ah_install\b|(?<![A-Za-z0-9_])ah_\W{0,6}install', flat) and not re.match(
+            r'\s*(?:git|cat|grep|egrep|rg|less|head|tail|ls|sed|awk|diff|wc|echo|printf|find|vi|vim|nano|man)\b', text):
+        if re.search(r'python|importlib|(?:^|\n)\s*(?:import|from)\s', flat):
+            return 'ah install-files: importing ah_install from python is refused; ' + INSTALL_FILES_FORM
+    for tokens, segment in _install_files_segments(text):
+        if tokens is None:
+            if 'install' in segment and ('install-files' in segment or 'ah_install' in segment):
+                return 'ah install-files: the command could not be parsed; ' + INSTALL_FILES_FORM
+            continue
+        while tokens and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', tokens[0]):
+            tokens = tokens[1:]
+        while tokens and os.path.basename(tokens[0]) in INSTALL_FILES_WRAPPERS:
+            tokens = tokens[1:]
+            while tokens and (tokens[0].startswith('-') or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', tokens[0])):
+                tokens = tokens[1:]
+        if not tokens:
+            continue
+        first = os.path.basename(tokens[0])
+        if first in INSTALL_FILES_SHELLS and depth < 3:
+            for pos, tok in enumerate(tokens[1:], 1):
+                if tok.startswith('-') and not tok.startswith('--') and 'c' in tok[1:] and pos + 1 < len(tokens):
+                    inner = _install_files_segment(tokens[pos + 1], is_main, home, installed, literal, depth + 1)
+                    if inner:
+                        return inner
+        if first in INSTALL_FILES_VIEWERS:
+            continue
+        interpreter = re.fullmatch(r'python[0-9.]*', first) is not None
+        code_import = False
+        if interpreter:
+            for pos, tok in enumerate(tokens[1:], 1):
+                nxt = tokens[pos + 1] if pos + 1 < len(tokens) else ''
+                if tok == '-m' and nxt == 'ah_install':
+                    code_import = True
+                if tok.startswith('-') and not tok.startswith('--') and 'c' in tok[1:] and re.search(
+                        r'\b(?:import|from)\s+ah_install\b|__import__\(\s*[\'"]ah_install|importlib[^\n]*install|(?<![A-Za-z0-9_])ah_\W{0,6}install', nxt):
+                    code_import = True
+        if code_import:
+            return 'ah install-files: importing ah_install from python is refused; ' + INSTALL_FILES_FORM
+        if 'install-files' not in tokens:
+            if interpreter and any(os.path.basename(t) == 'ah_install.py' for t in tokens[1:]):
+                return 'ah install-files: running ah_install.py directly is refused; ' + INSTALL_FILES_FORM
+            continue
+        index = tokens.index('install-files')
+        head = tokens[:index]
+        if interpreter:
+            rest = [t for t in head[1:] if t not in ('-I', '-B', '-E', '-s', '-S')]
+            if len(rest) != 1 or rest[0] not in literal:
+                return 'ah install-files: only the installed ~/.claude/hooks/ah.py may run it (not %s); %s' % (os.path.basename(rest[0]) if rest else 'this script', INSTALL_FILES_FORM)
+        elif first == 'ah' and len(head) == 1:
+            found = shutil.which('ah')
+            if not found or os.path.realpath(found) != installed:
+                return 'ah install-files: a bare `ah` must resolve to the installed ~/.claude/hooks/ah.py; ' + INSTALL_FILES_FORM
+        else:
+            return 'ah install-files: only the installed ah may run it; ' + INSTALL_FILES_FORM
+        args = [t for t in tokens[index + 1:] if not INSTALL_FILES_REDIRECT.match(t)]  # redirections (`> out.json`, `2>&1`) are not flags
+        i = 0
+        while i < len(args):
+            flag = args[i]
+            if flag not in INSTALL_FILES_FLAGS:
+                # a redirection target (`> out.json` leaves `out.json`) is the only bare word allowed
+                if i > 0 and not flag.startswith('-') and tokens[tokens.index(flag) - 1] in ('>', '>>', '2>', '&>'):
+                    i += 1
+                    continue
+                return 'ah install-files: the flag %s is not part of the install grammar; %s' % (re.sub(r'[^\w=-]', '?', flag)[:40], INSTALL_FILES_FORM)
+            i += 1 + INSTALL_FILES_FLAGS[flag]
+            if i > len(args):
+                return 'ah install-files: %s needs a value; %s' % (flag, INSTALL_FILES_FORM)
+        if not is_main:
+            return 'ah install-files: only the main agent may run it (a sub-agent may not deploy hook files); ' + INSTALL_FILES_FORM
+    return None
+
+
+def install_files_refusal(command, is_main, home=None):
+    """None, or the refusal text for a command that runs `ah install-files` (goodqa#15742) outside its exact literal form:
+    the INSTALLED ah.py (or a bare `ah` that resolves to it), the flags of the install grammar only (redirections allowed),
+    and only for main. Quotes are removed before matching (`install-file""s` is still the command), `bash -c` bodies are
+    inspected, a python import of ah_install is refused for any caller, and programs that only VIEW the name (grep, cat,
+    git ...) pass. ACCIDENT PREVENTION, NOT AN ACCESS CONTROL: the guard sees command text only, so a script that imports
+    ah_install through sys.path, or any program that speaks ssh itself, is invisible to it; the controls that hold are the
+    merged-code proof, the allowlists and the audit inside ah_install."""
+    text = command if isinstance(command, str) else ' '.join(map(str, command))
+    flat = re.sub(r'[\'"\\]', '', text)
+    if 'install' not in flat:
+        return None
+    home = home or os.path.expanduser('~')
+    installed = os.path.realpath(os.path.join(home, '.claude', 'hooks', 'ah.py'))
+    literal = ('~/.claude/hooks/ah.py', '$HOME/.claude/hooks/ah.py', os.path.join(home, '.claude', 'hooks', 'ah.py'))
+    return _install_files_segment(text, is_main, home, installed, literal)
+
+
 def payload_cwd(payload):
     """Working directory for relative paths: Codex tool_input.workdir, else the payload cwd."""
     if not isinstance(payload, dict):
@@ -7349,6 +9308,17 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
         command, ps = extract_command(payload)
         if command is None:
             return 0
+        install_text = command if isinstance(command, str) else ' '.join(map(str, command))
+        if 'install' in re.sub(r'[\'"\\]', '', install_text):  # after quote removal: install-file""s is still the command
+            try:
+                import caller_identity  # noqa: PLC0415 - positive main proof from the hook payload, never an environment variable
+                is_main = bool(caller_identity.is_main(payload))
+            except Exception:  # noqa: BLE001 - an unprovable caller is not main
+                is_main = False
+            refusal = install_files_refusal(command, is_main)
+            if refusal:
+                return emit('block', format_block(Finding(LOG_DELETE, 'install-files', refusal.replace('ah install-files: ', ''),
+                                                          INSTALL_FILES_FORM)), fmt)
         approvals = Approvals(compiled=c) if marker else None
         verdict, message = decide(command, c, cwd=cwd, ps=ps, marker=approvals)
         if verdict != 'block' and approvals is not None and approvals.used and not approvals.consume():

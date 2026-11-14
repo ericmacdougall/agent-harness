@@ -389,6 +389,24 @@
    ]
   },
   {
+   "id": "tier_gate:dispatch",
+   "script": "tier_gate.py",
+   "arg": "dispatch",
+   "event": "PostToolUse",
+   "tools": [
+    "Agent",
+    "Task",
+    "SendMessage"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S25"
+   ]
+  },
+  {
    "id": "work_assignments:guard",
    "script": "work_assignments.py",
    "arg": null,
@@ -582,10 +600,100 @@
    "rules": []
   },
   {
+   "id": "idle-guard:stop",
+   "script": "idle_guard.py",
+   "arg": "stop",
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "idle-guard:reject-posttoolusefailure",
+   "script": "idle_guard.py",
+   "arg": "reject",
+   "event": "PostToolUseFailure",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "idle-guard:reject-permissiondenied",
+   "script": "idle_guard.py",
+   "arg": "reject",
+   "event": "PermissionDenied",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "idle-guard:reject-userpromptsubmit",
+   "script": "idle_guard.py",
+   "arg": "reject",
+   "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
    "id": "mission-gate:pretool",
    "script": "mission_gate.py",
    "arg": "pretool",
    "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "mission-gate:posttool",
+   "script": "mission_gate.py",
+   "arg": "posttool",
+   "event": "PostToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "mission-gate:posttool-failure",
+   "script": "mission_gate.py",
+   "arg": "posttool",
+   "event": "PostToolUseFailure",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "mission-gate:permission-denied",
+   "script": "mission_gate.py",
+   "arg": "posttool",
+   "event": "PermissionDenied",
    "tools": [
     "Bash"
    ],
@@ -719,6 +827,42 @@
    "script": "mc_inbox.py",
    "arg": "hook",
    "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "status-truth:prompt",
+   "script": "status_truth.py",
+   "arg": "prompt",
+   "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "status-truth:session-start",
+   "script": "status_truth.py",
+   "arg": "session-start",
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "status-truth:stop",
+   "script": "status_truth.py",
+   "arg": "stop",
+   "event": "Stop",
    "tools": [],
    "flavors": [
     "claude"

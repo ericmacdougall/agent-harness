@@ -38,13 +38,19 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'spec_flow.py', 'spec_policy.json', 'spec_template.md', 'provenance.py', 'provenance_policy.json',
                     'provenance_hooks.py', 'safe_input.py', 'caller_identity.py', 'domain_gates.py', 'domain_checklists.json',
                     'native_context.py', 'native_user_source.py', 'native_admission.py', 'native_main.py',
+                    'idle_guard.py',  # ops_watch's default idle_guard check imports it (goodqa#15943)
                     'wal_note.py',  # ah task/ticket writes and doctor import this helper.
                     'commit_policy.local.json.example', 'spec_policy.local.json.example',
                     'model_tiers.py', 'model_tiers.json', 'escalation.py', 'tier_gate.py',
                     # Destructive and config-dump command guard (GoodQA #14471): launcher plus analyser.
                     'command_guard.py', 'command_guard_hook.py', 'redact.py', 'kill_guard.py', 'kill_guard_policy.json', 'merge_gate.py', 'bg_job.py',
                     # Dropped-owner gate on Codex Stop and its reads (goodqa#14791 P18)
-                    'dropped_gate.py', 'ah.py', 'ah_worktree.py', 'liveness.py',
+                    'dropped_gate.py', 'ah.py', 'ah_worktree.py', 'ah_install.py', 'guard_selftest.py', 'liveness.py',
+                    # ah export and ah status: status_report imports goals_view (goodqa#15788)
+                    'ah_export.py', 'goals_view.py',
+                    # goals_view imports mission_coverage at load; spec_flow and others import these lazily
+                    # (tests/test_ah_export.py walks the chain).
+                    'mission_coverage.py', 'resource_budget.py', 'workdir.py',
                     'shellwords.py',  # dropped_gate's pretool path imports it (PR 208 red-team)
                     # Heavy-job guard (goodqa#14817): keeps large copies, suites and builds off the Mac for Codex too.
                     'heavy_job_guard.py', 'dropbox_budget.conf', 'resource_limits.json',

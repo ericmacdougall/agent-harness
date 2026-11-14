@@ -165,6 +165,8 @@ class ThresholdTests(Base):
         got = self.pool(total_g=30, used_g=11, avail_g=19)
         self.assertEqual(got[KEY]["severity"], "critical")
         self.assertNotIn(KEY, self.pool(total_g=100, used_g=70, avail_g=30))
+        # acceptance review r2 F2: exactly 20 GiB free is not under the floor
+        self.assertNotIn(KEY, self.pool(total_g=100, used_g=80, avail_g=20))
 
     def test_provisioned_counts_only_guest_volumes_not_iso_template_or_backup(self):
         self.assertEqual(self.pool()[KEY]["detail"]["provisioned_gib"], 1536.0)  # OTHER holds a 931G backup
@@ -267,6 +269,15 @@ class GrowthTests(Base):
         state = {}
         self.sample(state, 800, NOW - 24 * 3600)
         self.assertEqual(self.run_check((0, probe(pvesm(used_g=848, avail_g=56))), state, NOW)[0][GROWTH]["severity"], "high")
+
+    def test_growth_boundary_is_strictly_more_than_10_gib_a_day(self):
+        # acceptance review r2 F2: exactly 10 GiB/day is silent, just over alerts
+        state = {}
+        self.sample(state, 800, NOW - 24 * 3600)
+        self.assertNotIn(GROWTH, self.run_check((0, probe(pvesm(used_g=810, avail_g=106))), state, NOW)[0])
+        state = {}
+        self.sample(state, 800, NOW - 24 * 3600)
+        self.assertIn(GROWTH, self.run_check((0, probe(pvesm(used_g=811, avail_g=105))), state, NOW)[0])
 
     def test_slow_growth_is_silent(self):
         state = {}
@@ -851,11 +862,90 @@ class CommandAndConfigTests(Base):
                 self.assertEqual([a["severity"] for a in got.values()], ["warning"])
                 self.assertTrue(list(got)[0].startswith("disk:config:"))
 
+    def test_jump_ssh_config_and_pinned_known_hosts_build_a_strict_command(self):
+        # goodqa#15771: the Mac reaches t2-proxmox only through t2-dev, with no edit to ~/.ssh/config (main's ruling).
+        self.cfg["proxmox_pools"] = [{"host": "t2-proxmox", "storage": "local", "mount": "/var/lib/vz",
+                                      "watch_vms": [102, 103], "jump": "t2-dev",
+                                      "ssh_config": "/Users/x/.ssh/config_fleetops",
+                                      "known_hosts": "/Users/x/work/t2-proxmox.known_hosts"}]
+        got, _, runner = self.run_check((0, probe()))
+        (argv, _), = runner.calls
+        self.assertEqual(argv[:6], ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
+        for opt in ("StrictHostKeyChecking=yes", "ControlMaster=no", "ControlPath=none"):
+            self.assertIn(opt, argv[:argv.index("--")])
+        sep = argv.index("--")
+        self.assertEqual(argv[sep - 8:sep], ["-F", "/Users/x/.ssh/config_fleetops", "-J", "t2-dev",
+                                             "-o", "UserKnownHostsFile=/Users/x/work/t2-proxmox.known_hosts",
+                                             "-o", "StrictHostKeyChecking=yes"])
+        self.assertEqual(argv[sep:sep + 2], ["--", "t2-proxmox"])
+        # AC-1 key and NEG-4: the alias names the alert, never an address
+        self.assertEqual(got["disk:volume:t2-proxmox:/var/lib/vz"]["severity"], "high")
+
+    def test_unsafe_jump_or_paths_are_refused_before_ssh(self):
+        base = {"host": "t2-proxmox"}
+        bad = [{"jump": "-oProxyCommand=x"}, {"jump": "t2-dev,evil"}, {"jump": "t2 dev"},
+               {"ssh_config": "relative/config"}, {"ssh_config": "/a/../etc/passwd"}, {"ssh_config": "/a b"},
+               {"known_hosts": "-o"}, {"known_hosts": "/a/../../k"}, {"known_hosts": "/k;reboot"}]
+        for extra in bad:
+            with self.subTest(extra=extra):
+                self.cfg["proxmox_pools"] = [dict(base, **extra)]
+                got, _, runner = self.run_check((0, probe()))
+                self.assertEqual(runner.calls, [])
+                self.assertTrue(list(got)[0].startswith("disk:config:"))
+
+    def test_real_pvesm_header_with_kib_units_parses(self):
+        # recorded from t2-proxmox on 2026-11-12 (pve 8): the header names the unit in each size column
+        real = ("Name         Type     Status     Total (KiB)      Used (KiB) Available (KiB)        %\n"
+                "local         dir     active       916398132       848361792        58698404   92.58%\n")
+        self.assertEqual(ow.parse_pool_status(real, "local"),
+                         (916398132 * 1024, 848361792 * 1024, 58698404 * 1024))
+        got = self.run_check((0, probe(real)))[0]
+        self.assertEqual(got["disk:volume:t2-proxmox:/var/lib/vz"]["severity"], "high")
+        for header in ("Name Type Status Total (MiB) Used (MiB) Available (MiB) %",
+                       "Name Type Status Total (KiB) Used Available (KiB) %"):
+            with self.subTest(header=header):
+                self.assertIsNone(ow.parse_pool_status(header + "\n" + real.splitlines()[1], "local"))
+
     def test_disabled_by_default_and_registered(self):
         self.assertEqual(ow.load_config(Path(self.tmp.name), host="h", overrides={})["proxmox_pools"], [])
         self.assertIs(ow.DEFAULT_CHECKS["proxmox_pool"], ow.check_proxmox_pool)
         self.cfg["proxmox_pools"] = []
         self.assertEqual(ow.check_proxmox_pool(self.cfg, {}, Runner((0, "")), NOW), [])
+
+
+class RedTeamRound2Tests(Base):
+    """goodqa#15771 adversarial spec review: any exception in probe or parse is UNKNOWN, never a generic check error."""
+
+    def test_undecodable_output_is_unknown_and_escalates(self):
+        boom = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        got, state, _ = self.run_check(boom)
+        self.assertEqual(got["disk:unknown:t2-proxmox:/var/lib/vz"]["severity"], "warning")
+        self.assertIn("probe or parse error", got["disk:unknown:t2-proxmox:/var/lib/vz"]["message"])
+        got = self.run_check(boom, state=state, now=NOW + 1801)[0]
+        self.assertEqual(got["disk:unknown:t2-proxmox:/var/lib/vz"]["severity"], "high")
+
+    def test_corrupt_saved_samples_give_unknown_then_recover(self):
+        state = {"proxmox_pools": {"t2-proxmox:/var/lib/vz": {"first_try": NOW - 60, "samples": [["x"], None]}}}
+        got = self.run_check((0, probe()), state=state)[0]
+        self.assertIn("disk:unknown:t2-proxmox:/var/lib/vz", got)
+        got = self.run_check((0, probe()), state=state, now=NOW + 60)[0]
+        self.assertEqual(got["disk:volume:t2-proxmox:/var/lib/vz"]["severity"], "high")
+        self.assertNotIn("disk:unknown:t2-proxmox:/var/lib/vz", got)
+
+    def test_sample_with_good_time_but_bad_values_is_reset_not_stuck(self):
+        # delta review d2: a row like [t, "x", {}] must not keep the pool UNKNOWN until it ages out (48 h)
+        state = {"proxmox_pools": {"t2-proxmox:/var/lib/vz": {"first_try": NOW - 60,
+                                                              "samples": [[NOW - 86400, "x", {}]]}}}
+        got = self.run_check((0, probe()), state=state)[0]
+        self.assertIn("disk:unknown:t2-proxmox:/var/lib/vz", got)
+        got = self.run_check((0, probe()), state=state, now=NOW + 60)[0]
+        self.assertNotIn("disk:unknown:t2-proxmox:/var/lib/vz", got)
+        self.assertEqual(got["disk:volume:t2-proxmox:/var/lib/vz"]["severity"], "high")
+
+    def test_corrupt_saved_record_restarts(self):
+        state = {"proxmox_pools": {"t2-proxmox:/var/lib/vz": "junk"}}
+        got = self.run_check((0, probe()), state=state)[0]
+        self.assertEqual(got["disk:volume:t2-proxmox:/var/lib/vz"]["severity"], "high")
 
 
 class RunOnceTests(Base):

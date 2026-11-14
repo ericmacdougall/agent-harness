@@ -69,6 +69,37 @@ Both WAL writers refuse symlinks from `.claude` down to the log, hardlinked logs
 
 For behavior changes, use matching `PENDING_REAL_TEST <id>:` and `REALLY_TESTED <id>:` notes through `wal_note.py` before editing and after observation. Use `status` for the pending note and `check` for the verified note. The latter names the command or live steps, result, and applicable commit; any unmatched pending ID stays visible in the handoff. This is a concise audit trail, not an automated Stop gate. A disposable live slug-fix trial recorded `V1` before the edit, observed the baseline test fail, reran it successfully after the edit, and recorded the matched proof. A separate Stop-hook probe showed why the global gate was rejected: it ran on a simple arithmetic answer and forced an unnecessary second turn when configured to demand a test.
 
+### Exporting a session (`ah export`)
+
+`ah export --session SESSION_ID` writes one self-contained HTML file. It is meant for reading a handoff or review without opening the raw WALs. The idea comes from Pi's `/export` (pi.dev, MIT); Pi's `/share` upload has no counterpart here (goodqa#15788).
+
+```sh
+python3 ~/.claude/hooks/ah.py export --session SESSION_ID                    # all rows
+python3 ~/.claude/hooks/ah.py export --session SESSION_ID --since 6h --agent AGENT_ID
+python3 ~/.claude/hooks/ah.py export --session SESSION_ID --out ~/exports/handoff.html
+```
+
+What the page contains:
+- The agent tree.
+- Every row that carries a note: intents, decisions, asks, results, commits, blockers, handoffs and the like.
+- The evidence classes, computed by the same `status_report` rules as `ah status`.
+- A list of the WALs it did not read: symlinks, non-regular files, files over 64 MB, and anything past the 256 MB or 4,096-file session caps.
+
+Redaction:
+- Every string in every row goes through `redact.py`, keys and values alike.
+- E-mail local parts, home-directory paths and IPv4 addresses are masked.
+- Redaction runs on the original text, then again after control, bidi and zero-width characters are removed; a long token-like run that held or touched a removed character is masked as `[REDACTED:split]`. So neither a token split by an invisible character nor one whose only boundary was a control character slips through. Each field is capped at 2,000 characters, and each evidence section shows at most 500 entries plus a count of the rest.
+- The evidence classes are computed on the raw rows, so a cap or mask cannot change a verdict. Each entry is then displayed from its redacted row.
+- Redaction is pattern-based, so names, hostnames, ticket text and phone numbers stay. The page says so in a banner.
+
+The page has no script, no external reference and a strict CSP.
+
+Where the file goes:
+- By default it goes under `~/.agent-harness/work/SESSION_ID/exports/`, with the file 0600 and the directory 0700.
+- `--out` writes a new file elsewhere. It refuses an existing name, a symlink, any folder inside a repository work tree, and sync folders (Dropbox, OneDrive, Google Drive, Box, `~/Library/CloudStorage`, `~/Library/Mobile Documents`). Desktop and Documents only get a `sync_warning`.
+- `ah` never uploads the file. Note that the hourly log backup copies `~/.agent-harness/work`, together with the raw WALs it was built from, to your private backup. Use `--out` for a folder outside it.
+- If the redactor is missing, the export refuses. Review the file before sharing it with anyone.
+
 ## Usage guard
 
 Both editions install the same standard-library helper: `~/.claude/hooks/usage_guard.py` or `~/.codex/agent-harness/usage_guard.py`. It guards commands routed through it. Direct shell commands and native agents remain workflow-governed; no daemon, global Stop gate, permission reduction or distributed account enforcement is installed. Tiny fixes need no new receipt or model call.
@@ -179,6 +210,36 @@ A refusal lists the live owner ids. The cap ships in warn mode with the rest of 
 `tier_gate.py` is the PreToolUse hook for Agent, Task, Workflow and Bash. Bash lines launching `claude`, `codex`, `rescue.py` or `peer_review.py` are checked segment by segment (the line is split on unquoted `;`, `&&`, `||`, `|`, `&` and newlines; any denied segment denies the line; a review line at a permission rung needs the installed ledger's permission). A spawn names its task with `[task:KEY]` in the prompt or description; without it the hook generates a key and resets to the lowest rung. The requested model and effort must match the task's rung: above it is downgraded through `updatedInput`, below it needs a `[rung-below:REASON]` token, review-only rungs never write, reviewer spawns (red-team, click-tester, reviewer) sit one rung above, and the top writing rung needs the recorded permission. `mode` in `model_tiers.json` is `warn` (the hook only adds context and logs what enforce would do to `~/.agent-harness/escalation/gate.jsonl`) or `enforce`; an unreadable table denies. SubagentStart and SubagentStop keep a per-session live-agent count under `caps.session_live_agents` (default 40).
 
 `peer_review.py --task TASK [--author-rung R] [--author-harness claude|openai]` picks the reviewer from the table (one rung above the author, the other harness preferred, the same harness one effort up when the other is unavailable, an unknown author reviewed at Opus/Sol medium and flagged), writes a selection receipt under `~/.agent-harness/escalation/selections/`, stamps `Author-Rung`, `Reviewer-Rung` and `Reviewer-Selection` on the report, and records the FINAL receipt in the task ledger so reviews count where they are consumed. `rescue.py --task TASK` runs at the task's computed writing rung on the other harness; `--rung` overrides it; a rung that needs permission is refused before any launch unless `approve-top` recorded it.
+
+### Dispatch records
+
+The ladder records which model each spawn actually ran on (goodqa#15794). This stops an author who was run below the task's rung from pushing the ladder up with failures that the rung's model did not produce.
+
+- **Open:** PreToolUse appends one line to `~/.agent-harness/escalation/<task>.dispatch-open.jsonl` for every Agent, Task or Workflow spawn that will run (allowed, or denied in warn mode), and for claude/codex/rescue Bash launches whose task key resolves. It takes no ledger lock. Every locked ledger operation merges the complete lines past a stored (inode, offset). Merging never truncates the file in place; an over-bound file (over 256 KiB) is renamed to `.old` after the ledger write.
+- **Close:** the PostToolUse `tier_gate.py dispatch` action closes the record with `resolvedModel` and `modelsUsed` and indexes `agent_id -> task`. It prints nothing and cannot block a tool that already ran.
+- **End:** SubagentStop sets `ended_at` and `ended_seq` and records `observed_effort` from the hook's `effort.level`. A foreground stop that arrives before its close is held as a pending stop for up to an hour.
+- **Resume:** SubagentStart for an indexed agent, or a SendMessage to its agent id (the PostToolUse matcher includes SendMessage), appends a `resume` line to the side file without taking the ledger lock; the next merge clears `ended_at` and reopens the dispatch as `phase: open` (reason `resumed`), so it is live again and never proven below: every window it overlaps keeps counting, even after its next stop. A forged resume line can only make windows count. A resume of an agent whose record was already shed adds a synthetic unknown (`resumed_unknown`). A SendMessage resolves its agent from the response's `resumedAgentId` first, then from `to` when `to` is an agent id; only the response's key names are logged. LIMITATION until the live check (spec AC-8 step 5): if neither resolves and SubagentStart does not reopen the dispatch, that resumed run is invisible and can under-count. The index keeps the newest 4,096 agents, so an agent resumed after 4,096 newer spawns is not found either. A resume line written before the agent's last stop is ignored. A resumed owner is never proven below again in the windows it touches, so continuing a Sonnet owner by SendMessage stops exclusions there. Resuming a reviewer whose record was already shed adds a `resumed_unknown`, which also keeps counting.
+- **Switch:** the exclusion below is off until `caps.dispatch_exclude_below_rung` is true in `model_tiers.json`. It ships false; main turns it on after the AC-8 live proof. While it is false, every FAIL counts. A FAIL that the rule would have excluded records `dispatch_check.decision: would_exclude` and appears in status as `would_exclude_below_rung`. `exclusion_enabled` shows which mode is active.
+  - The value must be the JSON literal `true` or `false`. The same applies to `caps.dispatch_narrow_by_stop_effort`. Inside the ledger, only `true` counts as on.
+  - Any other value, such as a quoted `"false"` or `1`, makes the whole tier table fail validation. The table then fails closed: tier_gate denies every Agent, Task and Workflow spawn and every claude/codex launch line, even in warn mode, and `escalation.py record` cannot run, so FAILs go unrecorded until the table is fixed.
+  - After every hand edit of this table, whether a flip or a rollback, load it once before anything else: run `python3 ~/.claude/hooks/escalation.py status --task <T>`. If that run reports a tier-table error, revert the edit at once.
+  - `install.py` copies `model_tiers.json`, so a reinstall resets a flipped switch to the shipped `false`. Check `exclusion_enabled` after every install and record the flip again if needed.
+- **Rule:** a FAIL at rung R is NOT_COUNTED ("dispatched below rung") only when at least one owner dispatch is considered and every considered non-reviewer dispatch (owners, fixers and other helpers) is a closed agent run whose candidate rungs all sit below R. Considered means: opened, resumed or ended since the ledger entered R, or still live. A run that started before the window and ended inside it is considered.
+- **ASSUMPTION:** before a stop, only the model family is known, so only Sonnet under an Opus rung (or Opus under a Fable rung) is excluded. An opus run at the wrong effort keeps counting. It appears in `counted_requested_below` ("counted, requested below rung, effort unverified"). `observed_effort` narrows candidates only when `caps.dispatch_narrow_by_stop_effort` is true. That flag is false until a live check proves the field reports the subagent's own effort (spec AC-9).
+- **What keeps counting:** an open dispatch, an unknown model, a Workflow or Bash dispatch, an at-rung fixer, or a synthetic unknown dispatch. Synthetic unknowns come from an over-bound, garbled (for example a crashed mid-line append), rewritten or non-regular side file, and each carries a `reason`.
+- **Not seen:** main working directly under a task key leaves no dispatch. A FAIL from main's own work during a window holding only below-rung owner dispatches is therefore excluded.
+- **Bounds:** at most 64 dispatches. Shedding goes reviewers first, then records no window can consider, then closed below-rung runs, then other window records, then live ones. Shedding a record that could block an exclusion writes `dispatch_taint`, and a tainted window keeps counting (`window_tainted` in status, `tainted` in `dispatch_check`). A shed live record taints every window for up to 24 hours and survives a reset, so a flood of forged valid side-file lines can block exclusions for that long; that errs toward counting. Dispatch records are also shed before they could push the ledger over its size bound; a merge alone never resets a ledger.
+- **Reviewer types:** red-team and click-tester dispatches are left out of the decision even though those agents can write. The type is the boundary; do not route writing through a reviewer spawn.
+- **Staleness:** a dispatch with no `ended_at` is presumed ended after 24 hours. A SubagentStop that never fires only keeps failures counting for that long.
+
+Read it with `python3 ~/.claude/hooks/escalation.py status --task TASK`:
+- `last_dispatch`;
+- `window_dispatches` (up to 8, each with phase, models, observed_effort, requested and selected rung, candidates, match against the current rung, and a reason for synthetic entries);
+- `excluded_below_rung` (count and latest reason);
+- `below_rung_dispatches`;
+- `counted_requested_below`.
+
+Every dispatch also writes a `dispatch` line to `gate.jsonl`. Open failures appear there as `dispatch_open_failed`.
 
 ## Review and rescue
 
@@ -510,7 +571,7 @@ Two one-off routes are the only exceptions: a fixed table in `command_guard.py`,
 
 ### How it decides
 
-The command is lexed like a shell before any rule runs. The lexer handles quotes, `$'..'`, escapes, line continuations, heredocs (the body ends at its delimiter and the rest of the text is commands again), `$(..)`, backticks, pipes, redirects, brace expansion, prefix assignments, wrappers (`sudo`, `env`, `nice -n`, `timeout`, `xargs` including its here-string, heredoc, `< <(..)` and `-a` input, package runners `npx`, `bunx`, `pnpm dlx`, `yarn dlx`, `npm exec`, `uvx`, `pipx run`, `yarn`/`pnpm` (and `yarn run`) with a deleter bin, `shx`, `cross-env` and `cross-env-shell`, `eval "$(..)"`, `flock`, `script -c`, `tmux send-keys`, `osascript`, `at`), `sh -c` strings, `ssh` and `docker exec` commands, scripts written and then run in the same command, `$(which rm)`, absolute binary paths, and case and Unicode lookalikes. An unterminated quote or substitution, nesting that is too deep, or input over the analysis budget is blocked when the raw text names a protected location, a secret source, or a code-execution step (a pipe into a shell, `eval`, `-c` or `-e` code, a decoder) together with a destructive verb. Otherwise it is a warning. Block messages are passed through `redact.py` and never echo a secret.
+The command is lexed like a shell before any rule runs. The lexer handles quotes, `$'..'`, escapes, line continuations, heredocs (the body ends at its delimiter and the rest of the text is commands again), `$(..)`, backticks, pipes, redirects, brace expansion, prefix assignments, wrappers (`sudo`, `env`, `nice -n`, `timeout`, `xargs` including its here-string, heredoc, `< <(..)` and `-a` input, package runners `npx`, `bunx`, `pnpm dlx`, `yarn dlx`, `npm exec`, `uvx`, `pipx run`, `yarn`/`pnpm` (and `yarn run`) with a deleter bin, `shx`, `cross-env` and `cross-env-shell`, `eval "$(..)"`, `flock`, `script -c`, `tmux send-keys`, `osascript`, `at`), `sh -c` strings, `ssh` and `docker exec` commands, scripts written and then run in the same command, `$(which rm)`, absolute binary paths, and case and Unicode lookalikes. An unterminated quote or substitution, nesting that is too deep, or input over the analysis budget is blocked when the raw text names a protected location, a secret source, a credential location (`CRED_TEXT`: the GoodQA token and gq-browser directories, `.ssh`, `.aws` and the other credential paths, matched as written and with quotes and backslashes removed), or a code-execution step (a pipe into a shell, `eval`, `-c` or `-e` code, a decoder) together with a destructive verb. Otherwise it is a warning. When the analyser itself crashes or times out, the launcher `command_guard_hook.py` applies the same raw-text checks, its own copy of `CRED_TEXT` included, and allows a command that matches none of them. These raw-text checks decode nothing, so a credential path spelled with an ANSI-C escape (`goodq$'\x61'`), a segment held in a variable or a glob that hides its parent is not refused on that path: it is a warning, or allowed under the launcher. This is an accepted known limit (GoodQA goodqa#15905; OS-level redesign goodqa#15906). Block messages are passed through `redact.py` and never echo a secret.
 
 zsh and bash read `>!` differently, and the guard cannot tell which shell will run the text. zsh takes `>! w`, `>>! w`, `&>! w`, `>&! w`, `&>>! w` and `>>&! w` as a single clobber or append operator with `w` as its target. bash stops the operator before the `!`, so it writes a file named `!` and `w` is a command word; it rejects `>>&!` as a syntax error. A script containing one of these operators, quoted forms excepted, is analysed once under each reading, each starting from the same state, and refused if either reading refuses. This happens at every parse, including `bash -c`, `eval`, `ssh` and `$(..)` text, because a nested shell can read the operator differently from its parent.
 
@@ -1296,9 +1357,27 @@ Readers take a shared lock on `mission-goals.lock`, so a concurrent write is nev
     mission_coverage.py reseal --reason "<what changed and why>" [--force]                                # main
     mission_coverage.py verify | report [--json] | check
 
-Main-only commands need a one-shot stamp (`caller_identity.put_stamp`, purpose `mission-main`, single use, 10
-minutes) that `mission_gate.py pretool` writes only when the PreToolUse payload proves main (`caller_identity.is_main`)
-and the Bash command runs `mission_coverage.py` itself:
+Main-only commands need a one-shot stamp (`caller_identity.put_stamp`, purpose `mission-main`, single use, 60 s,
+bound to main's tool call) that `mission_gate.py pretool` writes only when the PreToolUse payload proves main
+(`caller_identity.is_main`) and the Bash command runs `mission_coverage.py` itself:
+
+- The stamp carries the call's `tool_use_id`, main's transcript path and the transcript size at that moment
+  (goodqa#15754 red-team F1). The command honours it only while that call is still running: once main's transcript
+  holds the call's `tool_result` (the call ended, or another hook denied it, or the user rejected it), the stamp is
+  dead for every process. `mission_gate.py posttool` (PostToolUse, PostToolUseFailure and PermissionDenied, Bash) also
+  deletes the call's unconsumed stamps. A payload without `tool_use_id` gets no stamp. Run main-only commands in the
+  foreground: a `run_in_background` call returns its tool_result at once, so its command is refused.
+- `take_stamp` runs every check (purpose, TTL, the call still running) before it claims the stamp; a caller that fails
+  one leaves the stamp in place, so a probe cannot burn main's stamp (PR 226 review M1).
+- What the stamp proves today, and its window (PR 226 review M1, not closed): "main's PreToolUse hook saw exactly this
+  argument list in a main call that has not ended yet, at most 60 s ago". It does not prove that the consuming process
+  is main's. Any same-user process that runs the identical argument list inside that window (from PreToolUse until the
+  call's tool_result or Post hook, at most 60 s, including while a permission prompt is open) is taken for main. A
+  per-call nonce (PreToolUse `updatedInput` prefixing `AH_MAIN_NONCE=<random>`, the stamp holding only its hash) would
+  close it: Claude Code 2.1.322 applies `updatedInput` from a settings hook without a permission decision, but it also
+  stores every PreToolUse hook's stdout verbatim in main's transcript, so the nonce would sit in clear text in a Claude
+  log during the call. It was not shipped for that reason; it is the design to reuse for the `review-auth` and
+  `ack-handoff` stamps (goodqa#15829) if that copy is accepted.
 
 - The stamp is keyed by the sha256 of the exact argument list after the script (`argv_key`; `--flag=value` reads as
   `--flag value`), so it covers that one command and nothing else.
@@ -1434,6 +1513,55 @@ stalled goal, plus the option to queue the goal on its ticket.
   `coverage` map for Mission Control, keyed by goal id and ticket, with `{status: uncovered|stalled|moving, reason,
   action}`.
 
+### Goal status: `ah goals` and the status lint (goodqa#15754)
+
+- `ah goals` reports every goal of the ledger with its state and its evidence of any age (`--json` for all of it,
+  `--candidates` for unattached deploy and REALLY_TESTED rows that name a goal, read only). It is the source for a
+  "whats left" answer; `ah status --since` lists recent evidence only.
+- Evidence: main attaches rows with `mission_coverage.py attach --goal G --evidence wID --kind test|live_test|deploy`;
+  owners may attach rows from WALs that name the goal, with an explicit PASS or FAIL, and never re-attach main's
+  rows. Owners tag rows with `wal_note.py --goal G --result PASS|FAIL [--live]` and write deploy records with
+  `--event deploy` (naming a sha or version). States: DONE_LIVE (main-attached deploy and a later main-attached live
+  PASS), LIVE_TESTED (main-attached live PASS, no deploy), LIVE_UNTESTED, VERIFIED, FAILING (a main-attached FAIL
+  clears only with a main-attached PASS of the same check), IN_PROGRESS, UNKNOWN (no record, never "not started").
+- Attach pins the row (red-team F2): the ledger entry stores `row_sha` (sha256 of the row as canonical JSON with
+  ASCII escapes), `row_verdict` and `row_at`. A row whose WAL content changed after attach shows as `TAMPERED` in
+  `ah goals`, a pinned row that no longer resolves as `MISSING`; both are named on a WARNING line.
+- A TAMPERED or MISSING pinned row is scored by its pin (PR 226 review H1): its pinned verdict at its pinned `at`, so
+  rewriting or deleting a FAIL row never removes the FAIL. The goal is also capped at `UNCONFIRMED` (unless it is
+  FAILING), with `cap.would_be` and the row ids in `ah goals --json` and a `capped:` line in the text, until main reads
+  the row and re-attaches it or removes it with `--remove`. An owner cannot re-attach (re-pin) a row that changed
+  since it was attached. The Stop lint treats UNCONFIRMED like any state below DONE_LIVE ("done" is an over-claim).
+  `ah status --since` does not read the goal ledger, so the cap shows in `ah goals` and the status-truth hooks only.
+- Entries attached before pinning still count but are flagged `(unpinned)`, and an unpinned row cannot carry a goal to
+  DONE_LIVE (review L3: the goal reads UNCONFIRMED with `cap.unpinned`). Rollout, once per host that has a ledger
+  (`~/.agent-harness/mission/goals.json`; the Mac has none yet): run `ah goals --json`, and for every id in a goal's
+  `unpinned` list main reads the WAL row and runs `mission_coverage.py attach --goal G --evidence ID --kind KIND`
+  (the same kind) to pin it, or `--remove` to drop it. A row edited before that re-pin cannot be detected; read it.
+- Pins written by the first PR 226 build (ensure_ascii=False digest) still match: `row_matches` accepts that digest
+  for any row without a lone surrogate (the only rows where it collided).
+- One pass per WAL file (red-team F5): `ah goals` and the hooks read each WAL file once for all attached ids and goal
+  tags, within one time budget (hooks 5 s, `ah goals` 20 s). A read that runs out of time is the state `timeout`
+  (`GOALS UNAVAILABLE (timeout)`, exit 2), never a partial answer. So is a WAL file cut at its 256 MB scan cap while
+  attached rows in it are still unresolved (PR 226 review H2); a capped file whose attached rows all resolved only
+  adds a warning.
+  `ah status` calls a deploy record linked to a REALLY_TESTED row LINKED_LIVE; prose live claims are LIVE_LEGACY.
+- `status_truth.py` hooks, mission session only (decided from the ledger, remembered in
+  `~/.agent-harness/state/status-truth/mission-session` so a broken ledger never widens it; before the first remembered
+  value, from the verified ledger header, so a first-run timeout still says GOALS UNAVAILABLE there): UserPromptSubmit injects
+  the goals for a status question; SessionStart re-injects them after a compaction; Stop lints the final assistant
+  text (contradictions against the ledger, and a status answer given without running `ah goals`). Injected text holds
+  only fixed-pattern fields (ids, check names, enums, ages, the main-set target). Policy key `status_lint` in
+  provenance_policy.json: `warn` (shipped: a systemMessage the user sees, and a flag row in
+  `~/.agent-harness/state/status-truth/flags.jsonl` with ids and rules only), `enforce` (blocks once per human turn
+  through `stop_blocks.py`; main switches it only on the spec's precision bound) or `off`. When the transcript tail
+  holds no user prompt the turn is unknown and the lint only warns, in enforce too.
+  `status_truth.py calibrate <transcript>` replays both rules over a transcript.
+- `ah owners` lists in `attention` each SILENT owner whose recorded wait expired, or that has been silent 6 h with no
+  disposition (row reason `wait-expired` or `silent-undisposed`); `ah status` prints the same list on its owners line.
+  It is a report for main to look at: it does not set `decision_required`, so the dropped-owner Stop gate and ahd
+  successor requests ignore it (a silent owner may be a long build that writes no WAL lines).
+
 ## Design limits
 
 The policy is intentionally risk-scaled. The small fix path skips worktrees and review loops. A normal code task gets only relevant tests and documents. The agents must not infer that the presence of a test or a reviewer PASS proves quality. Independent checks, reviewer availability, UI tool access and remote permissions vary by environment; handoffs must say exactly what ran and what did not.
@@ -1509,3 +1637,16 @@ directory under `~/.agent-harness/work/<session>/` that is a clean, pushed workt
   are rotated and narrowed before agent login authority widens; transcript backups get secret scanning.
 - B29 ref regrowth: auto-delete-on-merge everywhere, TTL ownership for `claude/*` and `codex/*` branches, backup-ref
   expiry, and replay tests for the ten known repo-guard bypasses (#128).
+
+
+### Main-idle guard (goodqa#15943)
+
+`idle_guard.py` stops main from sitting idle while work that does not need the user exists. A user rejecting one question pauses that question only.
+
+- Stop hook (`idle_guard.py stop`, main only, bounded to 2 blocks per problem signature, fails open): blocks with the named streams and next steps when no progress happened for `AH_IDLE_GUARD_MIN` minutes (default 30) and a stream holds a non-user next step; also when every owner waits on a user ask while another owner holds a returned result nobody took; also when a user rejection is in this turn and independent work exists. A Bash-only checkpoint script is not progress.
+- ops-watch check `idle_guard` raises the high `idle-guard:<session8>` alert from the same `assess()`.
+- `ah owners` is the only judge of whether an owner needs main; `assess()` re-derives no rule. An owner is actionable exactly when its row is `decision_required` or has `attention`, and a user wait only when it is not actionable and its `wait_on` is an open ask. `attention` now also carries `result-unacked` (a done, handoff or returned result younger than 24 h that nobody took: taken only by a resume, reassignment, terminal disposition or main's `--ack-handoff` wait recorded at or after the result's own WAL time (whole seconds, no slack; each row's `result_at`), or by the live parent of a nested helper; later owner notes neither revoke an ack nor restart the 24 h window) and `wait-not-user` (a live wait on a ticket, agent or main). An owner's own `waiting` disposition never takes its result. `decision_required` is unchanged.
+- `idle_guard.py reject` (PostToolUseFailure, PermissionDenied, UserPromptSubmit) adds "A rejected question pauses only that question; keep every independent stream moving." after a user rejection. A rejection may produce no Post event, so the next prompt and the Stop hook also catch it from the transcript. A turn starts only at a human prompt as `provenance.user_authorship()` defines one (string or text blocks, origin `human`); task notifications, peer messages, reminders and tool results do not end the rejected turn.
+- A `waiting` disposition on an ask is per owner: `ah task dispose --kind waiting` refuses an ask that names another owner (`wal_note.py --event ask --owner <agent>`) or is already another owner's live wait.
+- `ah owners` carries `agents_active_1h` (and each row `active_1h`); `ah status` repeats it under `owners`. Collectors that read transcripts skip an unreadable file, never the section.
+- Limits: unreviewed PRs and specs are not looked up over the network; SendMessage is not hooked, so it is not progress.

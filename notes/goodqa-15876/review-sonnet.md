@@ -1,0 +1,5 @@
+# Sonnet acceptance spec review, goodqa#15876 (agent a5d878417503c1093)
+
+At 12531ec7: BLOCK. H1 the warn finding is on stdout (JSON additionalContext, exit 0), a block is exit 2 with stderr, so the spec's stderr expectation would fail every bulk case live; H2 no acceptance criterion for the live run on t2-dev and no provenance for the expected hash (it must come from the merged commit, not the installed file); H3 the hook child needs a fixed PATH containing git, or the rule fails open; M1 AC-7 cannot prove a sub-agent may run it (isolation is Claude Code's, not command_guard's), the live AC must be run by a worktree-isolated sub-agent; the audit row must bound the caller's values. Folded in at 5dbe780f.
+At 5dbe780f: ACCEPT. Non-blocking nits folded in afterwards: the trusted git is a fixed candidate list (usr/bin, opt/homebrew/bin, usr/local/bin) first regular file owned by root or the user, else exit 4; the launcher is started as the installed argument list ending in `hook`; the manifest assumes the installer copies hook files byte for byte (D7). D1 (the caller names the expected hashes) is left for main to confirm.
+Verdict: ACCEPT

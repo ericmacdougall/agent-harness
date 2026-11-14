@@ -208,9 +208,11 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
         raise AhError("schema_newer", "index written by a newer ah; update this install", 4)
     summary["schema"] = SCHEMA
     meta = summary.setdefault("meta", {})
+    if "outcome_at" not in summary:
+        meta.clear()  # an index written before outcome_at existed: rescan from the start (goodqa#15943 r5)
     lines, rebuilt = read_new_lines(path, meta)
-    if rebuilt or "first" not in summary:
-        summary.update(first=None, last_at=0.0, outcome=None, last_note="", tickets=[], events=0)
+    if rebuilt or "first" not in summary or "outcome_at" not in summary:
+        summary.update(first=None, last_at=0.0, outcome=None, outcome_at=0.0, last_note="", tickets=[], events=0)
     for _off, raw in lines:
         try:
             rec = json.loads(raw)
@@ -224,11 +226,13 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
         summary["events"] += 1
         event, note = rec.get("event"), rec.get("note") if isinstance(rec.get("note"), str) else ""
         if event == "intent":
-            summary["outcome"] = None  # new work after an earlier result/handoff: not finished
+            summary["outcome"], summary["outcome_at"] = None, 0.0  # new work after an earlier result/handoff: not finished
             if summary["first"] is None and note:
                 summary["first"] = note[:160]
         if event in ("handoff", "result"):
-            summary["outcome"] = event
+            # outcome_at is the time of this result record itself, never later activity (receipt r5 F2): it orders
+            # main's acknowledgement and ages the result
+            summary["outcome"], summary["outcome_at"] = event, at
         if event in ("handoff", "result", "status", "blocker", "decision") and note:
             summary["last_note"] = note[:300]
         for match in TICKET_IN_NOTE.findall(note):
@@ -300,6 +304,9 @@ def discover_agents(home: Path, session: str, wal: Path) -> dict:
     return found
 
 
+SILENT_UNDISPOSED_S = 6 * 3600  # as liveness.TASK_ABANDON_S: silent this long with no disposition is reported
+
+
 def owners(home: Path, session: str, now: float | None = None, comments=None) -> dict:
     now = time.time() if now is None else now
     wal = session_dir(home, session)
@@ -337,7 +344,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     for agent, info in spawned.items():
         path = wal / f"agent-{agent}.jsonl"
         summary = summarize_agent_wal(path, index_dir) if path.is_file() else {
-            "first": None, "last_at": 0.0, "outcome": None, "last_note": "", "tickets": []}
+            "first": None, "last_at": 0.0, "outcome": None, "outcome_at": 0.0, "last_note": "", "tickets": []}
         last_wal = max(summary["last_at"], 0.0) or info["at"]
         tmtime = transcript_mtime(home, session, agent, sub_dirs)
         if info.get("finished") and agent not in stopped:  # transcript meta says it ended; hook never saw the stop
@@ -360,7 +367,9 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                "state": verdict["state"], "severity": verdict["severity"],
                "last_activity": iso(last_wal), "idle_s": None if idle == float("inf") else int(idle),
                "ticket": summary["tickets"][0] if summary["tickets"] else None,
-               "ticket_comment_age_s": None}
+               "ticket_comment_age_s": None,
+               "result_at": iso(summary["outcome_at"]) if summary.get("outcome") and summary.get("outcome_at") else None,
+               "active_1h": now - max(last_wal, tmtime) <= 3600}  # WAL or transcript write in the hour (goodqa#15943)
         if comments and row["ticket"]:
             row["ticket_comment_age_s"] = comments(row["ticket"], now)
         rows.append(row)
@@ -382,7 +391,9 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                      "parent": None, "owner": True, "registered": name in registered, "flags": ["task-wal"],
                      "state": verdict["state"], "severity": verdict["severity"],
                      "last_activity": iso(summary["last_at"]), "idle_s": None if idle == float("inf") else int(idle),
-                     "ticket": summary["tickets"][0] if summary["tickets"] else None, "ticket_comment_age_s": None})
+                     "ticket": summary["tickets"][0] if summary["tickets"] else None, "ticket_comment_age_s": None,
+                     "result_at": iso(summary["outcome_at"]) if summary.get("outcome") and summary.get("outcome_at") else None,
+                     "active_1h": now - summary["last_at"] <= 3600})
     asks = ask_states(main)
     for r in rows:  # round 5 MJ-1: a wait on an ask holds only while that ask is open in this session
         target = r["state"][len("waiting-on-"):] if r["state"].startswith("waiting-on-") else ""
@@ -433,21 +444,75 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                                                                 and covered(d.get("ref"), (r["agent_id"],))))
         r["disposition"] = dict(d, live=alive) if d else None
         r["decision_required"] = bool(r["owner"] and r["state"] == "DROPPED" and not alive)
+        r["attention"] = []
+        if r["owner"] and str(r["state"]).startswith("SILENT") and not alive \
+                and ((d is not None and d.get("kind") in ("waiting", "resumed", "reassigned"))
+                     or (d is None and (r["idle_s"] or 0) >= SILENT_UNDISPOSED_S)):
+            # goodqa#15754 (receipt r1 F1, main's ruling): a silent owner whose recorded wait expired, or one silent
+            # SILENT_UNDISPOSED_S with no disposition, is REPORTED in `attention` for main to look at. It does not set
+            # decision_required, which drives the dropped-owner Stop gate, ahd successor requests and tier_gate: a
+            # silent owner may be a live process (a long build) and must not get a successor or block main's Stop.
+            r["attention"] = ["wait-expired" if d is not None else "silent-undisposed"]
         if d and d.get("kind") in ("legacy", "superseded", "wontdo") and r["state"] not in ("done", "handoff", "returned") \
                 and not r["state"].startswith(("live", "working", "waiting")):
             label = "unverified-legacy" if d["kind"] == "legacy" else d["kind"]
             r["state"], r["severity"] = label, "info"  # ended, never "done"
             r["flags"] = list(r.get("flags") or []) + [label]
-    for r in rows:  # I9: a handoff is real only once someone takes it (a disposition at/after the handoff)
-        if r["owner"] and r["state"] == "handoff":
-            handed = parse_ts(r["last_activity"]) or 0.0
+    # goodqa#15943 (receipt r1 F2): a wait on a user ask excuses only the owner the ask belongs to, whether it is a
+    # note or a disposition. A wait on another owner's ask, or a second holder of one unowned ask, is reported in
+    # `attention` (it never sets decision_required: the owner is not dropped, its wait is simply not its own).
+    # `wait_on` is the one reading of what an owner waits on (a live waiting disposition, else a `waiting-on-<x>`
+    # state from its last WAL note); idle_guard reads it instead of re-deriving it. A wait on anything but a user ask
+    # (a ticket, an agent, main) is a next step main can take: `attention: wait-not-user` (never decision_required).
+    owned, holders = ask_owners(main), {}
+    for r in rows:
+        r["wait_on"] = None
+        if not r["owner"]:
+            continue
+        d = r.get("disposition") or {}
+        if d.get("kind") in liveness.ENDING_DISPOSITIONS:
+            continue  # a terminal disposition stays terminal, whatever the owner's last note says
+        ref = str(d.get("ref") or "") if d.get("kind") == "waiting" and d.get("live") else \
+            (r["state"][len("waiting-on-"):] if r["state"].startswith("waiting-on-") else "")
+        if not ref and d.get("kind") == "waiting" and d.get("live"):
+            ref = "a ticket"
+        if not ref:
+            continue
+        r["wait_on"] = ref
+        if ASK_ID_RE.match(ref) and asks.get(ref) == "open":
+            holders.setdefault(ref, []).append(r)
+        elif not ASK_ID_RE.match(ref):
+            r["attention"] = list(r.get("attention") or []) + ["wait-not-user"]
+    for ref, held in holders.items():
+        held.sort(key=lambda r: (parse_ts(r["last_activity"]) or 0.0, r["agent_id"]))
+        for i, r in enumerate(held):
+            own = owned.get(ref)
+            flag = "wait-ask-foreign" if own and own != r["agent_id"] else "wait-ask-shared" if not own and i > 0 else None
+            if flag:
+                r["flags"] = list(r.get("flags") or []) + [flag]
+                r["attention"] = list(r.get("attention") or []) + ["wait-invalid"]
+    # I9: a handoff is real only once someone takes it (a disposition at/after the handoff). goodqa#15943 (receipts r2
+    # and r4): the same rule decides whether ANY returned result (done, handoff, returned) was taken, so ah owners and
+    # idle_guard agree. An untaken result younger than RESULT_ACK_WINDOW_S is `attention: result-unacked`; a handoff
+    # untaken for HANDOFF_ACK_S is also decision_required (unchanged). An earlier disposition never takes a later
+    # result, and an owner's own wait (no --ack-handoff) never takes it.
+    for r in rows:
+        if r["owner"] and r["state"] in RESULT_STATES:
+            # receipt r5: the result's own WAL time, not last_activity (a later note must not revoke an ack or make an
+            # old result fresh). A row with no recorded result time (a helper's `returned`) falls back to its activity.
+            handed = parse_ts(r.get("result_at")) or parse_ts(r["last_activity"]) or 0.0
+            handed = float(int(handed))  # like with like: ledger stamps (server_now) and result_at carry whole seconds
             d = disp.get(r["agent_id"])
             kind = d.get("kind") if d else None
             # #134 red-team P4: only main's wait acknowledges, marked --ack-handoff (an owner cannot set it)
             acknowledged = kind in ("resumed", "reassigned") + GUARDED_KINDS or (
                 kind == "waiting" and d.get("ack_handoff") is True
                 and liveness.disposition_live(d, now, last_activity=handed))
-            acked = bool(acknowledged and float(d.get("at") or 0) >= handed - 10)
+            # strictly at or after this result (receipt r5 F1): the old 10 s slack let an earlier disposition take a
+            # later result. Both are UTC from the same host clock; the WAL time is floored to the ledger's whole
+            # seconds, so an ack in the same second as the result counts (it cannot be ordered) and one a second
+            # earlier never does.
+            acked = bool(acknowledged and float(d.get("at") or 0) >= handed)
             # A helper spawned by another agent hands its result back to that parent, which takes it by design. The
             # claim is honoured only when it is believable and the parent is plainly receiving: the child is a nested
             # spawn (meta spawnDepth >= 2; main's own spawns are depth 1 and never carry a parent), the parent is
@@ -460,7 +525,9 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                     and (parse_ts(prow["last_activity"]) or 0.0) >= handed:
                 acked = True
                 r["flags"] = list(r.get("flags") or []) + ["handoff-to-parent"]
-            if not acked and now - handed >= HANDOFF_ACK_S:
+            if not acked and now - handed <= RESULT_ACK_WINDOW_S:
+                r["attention"] = list(r.get("attention") or []) + ["result-unacked"]
+            if not acked and r["state"] == "handoff" and now - handed >= HANDOFF_ACK_S:
                 r["decision_required"] = True
                 r["flags"] = list(r.get("flags") or []) + ["handoff-unacked"]
     # a wait on another agent holds only while that agent is live; a wait on a DROPPED, done or unknown agent is a drop
@@ -480,8 +547,10 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     dls = deadlines(home, session, now, led)
     missed = [d for d in dls if d["state"] == "missed" and not liveness.disposition_live(disp.get(d["id"]), now)]
     return {"session": session, "generated": iso(now), "counts": counts, "owners": rows, "source": "direct",
+            "agents_active_1h": sum(1 for r in rows if r.get("active_1h")),
             "deadlines": dls,
             "undisposed": sorted([r["agent_id"] for r in rows if r["decision_required"]] + [d["id"] for d in missed]),
+            "attention": sorted(r["agent_id"] for r in rows if r.get("attention")),
             "legacy_unverified": sorted(a for a, d in disp.items() if d.get("kind") == "legacy")}
 
 
@@ -1485,6 +1554,8 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
             state = ask_states(main_wal).get(ref)
             raise AhError("bad_request", f"task.dispose waiting: ask {ref} " + ("is already answered (ask_resolved)"
                           if state == "resolved" else "is not in this session's WAL"), 3)
+        if args["kind"] == "waiting" and ASK_ID_RE.match(ref):
+            narrow_wait(home, main_wal, args["session"], args["agent"], ref)
         if args["kind"] == "reassigned" and not (_wal_has(main_wal, "subagent", None, agent=ref)
                                                 or (main_wal.parent / f"{ref}.jsonl").is_file()):
             raise AhError("bad_request", f"task.dispose reassigned: {ref} is not an agent of this session", 3)
@@ -1610,6 +1681,53 @@ def leftover_waiters(home: Path, agent: str, session: str, ps_rows=None, session
     return found
 
 
+def ask_owners(main_wal: Path) -> dict:
+    """{ask id: owner agent id} for the asks of the session main WAL that name an owner (wal_note --owner)."""
+    out = {}
+    try:
+        with open(main_wal, "rb") as handle:
+            for raw in handle:
+                if b'"owner"' not in raw or b'"ask"' not in raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("event") == "ask" and ASK_ID_RE.match(str(rec.get("id") or "")) \
+                        and isinstance(rec.get("owner"), str) and rec["owner"]:
+                    out[rec["id"]] = rec["owner"]
+    except OSError:
+        pass
+    return out
+
+
+def narrow_wait(home: Path, main_wal: Path, session: str, agent: str, ref: str) -> None:
+    """goodqa#15943: a wait on a user ask excuses only the owner whose stream the ask belongs to. Refused when the ask
+    names another owner (`owner` field, wal_note --owner) or is already the live wait of another owner; an ask that
+    names nobody and is unused stays allowed (back-compat)."""
+    try:
+        with open(main_wal, "rb") as handle:
+            for raw in handle:
+                if b'"ask"' not in raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("event") == "ask" and rec.get("id") == ref:
+                    owner = rec.get("owner")
+                    if isinstance(owner, str) and owner and owner != agent:
+                        raise AhError("bad_request", f"waiting: ask {ref} belongs to {owner}, not {agent}; "
+                                                     "a wait on one ask excuses only its own owner", 3)
+    except OSError:
+        pass
+    now = time.time()
+    for other, d in dispositions(home, session).items():
+        if other != agent and d.get("kind") == "waiting" and d.get("ref") == ref and float(d.get("until") or 0.0) > now:
+            raise AhError("bad_request", f"waiting: ask {ref} is already {other}'s wait; one ask excuses one "
+                                         "owner. Raise a separate ask for this owner (wal_note --event ask --owner)", 3)
+
+
 def ask_states(main_wal: Path) -> dict:
     """{ask id: "open" | "resolved"} from the session main WAL (an `ask` entry, closed by `ask_resolved --ref`)."""
     states = {}
@@ -1680,6 +1798,8 @@ def deadlines(home: Path, session: str, now: float, ledger=None) -> list:
 
 
 HANDOFF_ACK_S = 3600  # a handoff nobody acknowledged within this window is a drop in disguise (I9)
+RESULT_STATES = ("done", "handoff", "returned")  # an owner that returned something main must take
+RESULT_ACK_WINDOW_S = 24 * 3600  # an untaken result older than this is history, not attention (goodqa#15943)
 
 
 def pending_stops(home: Path, session: str, ledger=None) -> dict:
@@ -2364,40 +2484,60 @@ def _tokens(note: str) -> set:
     return {t.lower() for t in _TOKEN.findall(note or "")}
 
 
-def status_report(home: Path, session: str, since_s: float, now: float | None = None) -> dict:
+def status_report(home: Path, session: str, since_s: float, now: float | None = None, *, rows=None,
+                  unread=None) -> dict:
     """What the WALs prove, by class. Narrative is never promoted: VERIFIED needs a REALLY_TESTED entry, LIVE needs a
-    deploy/live note, DONE_LIVE needs both to share a ticket or sha token; a note that only says "done" is CLAIMED.
-    Targets changed without a user source are TARGET_MISMATCH; other unsourced decisions are ASSUMPTION."""
+    deploy/live note, LINKED_LIVE needs both to share a ticket or sha token; a note that only says "done" is CLAIMED.
+    Targets changed without a user source are TARGET_MISMATCH; other unsourced decisions are ASSUMPTION.
+
+    rows: already-read (agent, record) pairs from a caller that read the WALs itself (ah export, goodqa#15788). The
+    report then opens no file and skips the owners view, and every entry carries "row", the index of its source
+    pair, so the caller can render the entry from its own redacted copy instead of the report's text cuts.
+    unread: that caller's list of WALs it did not read."""
     now = time.time() if now is None else now
     cutoff = now - since_s
-    sd = session_dir(home, session)
-    if not (sd / "main.jsonl").is_file():
-        raise AhError("session_unknown", f"no main WAL for session {session!r}")
-    rows, unread = [], []
-    for path in sorted(sd.glob("*.jsonl")):
-        agent = "main" if path.name == "main.jsonl" else path.stem[len("agent-"):] if path.stem.startswith("agent-") else path.stem
-        try:
-            text = _bounded(path).decode("utf-8", "replace")
-        except OSError as e:  # F9: an evidence report names what it did not read (over 64 MB, not a regular file)
-            unread.append({"wal": path.name, "agent": agent, "reason": str(e) or type(e).__name__})
-            continue
-        for raw in text.splitlines():
-            try:
-                rec = json.loads(raw)
-            except ValueError:
-                continue
-            if not isinstance(rec, dict) or not rec.get("event"):
-                continue
-            at = parse_ts(rec.get("at"))
-            if at < cutoff:
-                continue
+    given = rows
+    supplied = given is not None
+    row_index = {id(rec): i for i, (_agent, rec) in enumerate(given)} if supplied else {}
+    rows, unread = [], list(unread or [])
+
+    def consider(agent, rec):
+        if not isinstance(rec, dict) or not rec.get("event"):
+            return
+        at = parse_ts(rec.get("at"))
+        if at >= cutoff:
             rows.append((agent, at, rec))
+
+    if given is None:  # ah status: filter while reading, so only rows in the window are kept (code inspection 6)
+        sd = session_dir(home, session)
+        if not (sd / "main.jsonl").is_file():
+            raise AhError("session_unknown", f"no main WAL for session {session!r}")
+        for path in sorted(sd.glob("*.jsonl")):
+            agent = "main" if path.name == "main.jsonl" else path.stem[len("agent-"):] if path.stem.startswith("agent-") else path.stem
+            try:
+                text = _bounded(path).decode("utf-8", "replace")
+            except OSError as e:  # F9: an evidence report names what it did not read (over 64 MB, not a regular file)
+                unread.append({"wal": path.name, "agent": agent, "reason": str(e) or type(e).__name__})
+                continue
+            for raw in text.splitlines():
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                consider(agent, rec)
+    else:
+        for agent, rec in given:
+            consider(agent, rec)
     rows.sort(key=lambda r: r[1])
+    import goals_view  # noqa: PLC0415 - one verdict and deploy-record rule with ah goals (goodqa#15754)
     verified, pending, live, claimed, blockers, commits, asks, resolved, assumptions, decisions = {}, {}, [], [], [], [], {}, set(), [], []
+    failed, live_legacy = {}, []
 
     def item(agent, at, rec, extra=None):
         out = {"agent": agent, "at": iso(at), "id": rec.get("id"), "event": rec.get("event"),
                "note": re.sub(r"\s+", " ", str(rec.get("note") or ""))[:240]}
+        if supplied:
+            out["row"] = row_index.get(id(rec))
         if extra:
             out.update(extra)
         return out
@@ -2407,7 +2547,17 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
         ev = rec.get("event")
         m = _RT.match(note)
         if m:
-            verified[m.group(1)] = item(agent, at, rec, {"check": m.group(1)})
+            verdict = goals_view.verdict(rec)  # PASS, FAIL or UNSTATED (legacy row without a stated result)
+            entry = item(agent, at, rec, {"check": m.group(1), "verdict": verdict})
+            if verdict == "FAIL":
+                failed[m.group(1)] = entry
+                verified.pop(m.group(1), None)
+            else:
+                verified[m.group(1)] = entry
+                failed.pop(m.group(1), None)
+            continue
+        if goals_view.is_deploy_record(rec):
+            live.append(item(agent, at, rec))  # LIVE comes from deploy records only
             continue
         m = _PT.match(note)
         if m:
@@ -2418,9 +2568,11 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
         elif ev == "blocker":
             blockers.append(item(agent, at, rec))
         elif ev == "ask":
-            asks[rec.get("id")] = item(agent, at, rec, {"reason": str(rec.get("reason") or "")[:200]})
+            if not isinstance(rec.get("id"), (dict, list)):  # a container id is malformed, never a crash (PR 223 F2)
+                asks[rec.get("id")] = item(agent, at, rec, {"reason": str(rec.get("reason") or "")[:200]})
         elif ev == "ask_resolved":
-            resolved.add(rec.get("ref"))
+            if not isinstance(rec.get("ref"), (dict, list)):
+                resolved.add(rec.get("ref"))
         if ev in ("decision", "scope", "requirement"):
             source = str(rec.get("source") or "")
             unsourced = bool(rec.get("assumption")) or bool(rec.get("unsourced")) or not source or source.startswith("inferred")
@@ -2431,7 +2583,7 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
                 decisions.append(item(agent, at, rec, {"source": source[:160]}))
         if ev in ("status", "result", "handoff", "check", "commit", "decision"):
             if _LIVE.search(note) and not _NOT_LIVE.search(note):
-                live.append(item(agent, at, rec))
+                live_legacy.append(item(agent, at, rec))  # prose "deployed/live": kept, labelled, never LIVE
             elif ev in ("status", "result", "handoff") and _CLAIM.search(note):
                 claimed.append(item(agent, at, rec))
     verified_tokens = set()
@@ -2441,24 +2593,34 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
     for a in assumptions:
         if a["label"] == "TARGET_MISMATCH":
             mismatch_tokens |= _tokens(a["note"])
-    for entry in live:
+    for entry in live + live_legacy:
         shared = _tokens(entry["note"]) & verified_tokens
-        entry["label"] = "DONE_LIVE" if shared else "LIVE_UNTESTED"
+        # LINKED_LIVE, not DONE_LIVE: any agent's rows can share a token; DONE_LIVE is `ah goals`'s word for main's
+        # attached deploy plus live PASS (goodqa#15754 red-team L3)
+        entry["label"] = "LINKED_LIVE" if shared else "LIVE_UNTESTED"
         entry["shared_evidence"] = sorted(shared)
         if _tokens(entry["note"]) & mismatch_tokens:
             # 50bca42: a stream whose target was moved without the user never reads as done against that target
             entry["label"] = "LIVE_TARGET_MISMATCH"
+    for entry in live_legacy:  # goodqa#15754: a prose claim is not a deploy record
+        entry["label"] = "LEGACY_" + entry["label"]
     try:
+        if supplied:  # the owners view reads WALs itself; a caller that supplied its rows gets none of it
+            raise LookupError("owners view not computed for supplied rows")
         data = owners(home, session, now=now)
         owners_summary = {"counts": data.get("counts"), "undisposed": data.get("undisposed"),
+                          "agents_active_1h": data.get("agents_active_1h"),
+                          "attention": data.get("attention"),
                           "live": sorted(r["agent_id"] for r in data.get("owners") or []
                                          if r.get("owner") and str(r.get("state")).startswith(("live", "working")))}
     except Exception:  # noqa: BLE001 - the evidence report must not fail on the owner view
-        owners_summary = {"error": "owners view unavailable"}
+        owners_summary = {"error": "owners view not included (run ah owners)" if supplied else "owners view unavailable"}
     return {"session": session, "since_s": since_s, "generated": iso(now), "entries": len(rows),
             "verified": sorted(verified.values(), key=lambda e: e["at"]),
             "pending": sorted((v for k, v in pending.items() if k not in verified), key=lambda e: e["at"]),
-            "live": live, "claimed": claimed, "blockers": blockers, "commits": commits,
+            "live": live, "live_legacy": live_legacy,
+            "failed": sorted(failed.values(), key=lambda e: e["at"]),
+            "claimed": claimed, "blockers": blockers, "commits": commits,
             "asks_open": [a for k, a in asks.items() if k not in resolved],
             "assumptions": assumptions, "decisions": decisions, "owners": owners_summary, "unread": unread,
             "rule": "edit this report; never write a status list from memory (nov-7-issues-2 B2.5)"}
@@ -2471,7 +2633,11 @@ def status_text(data: dict) -> str:
         return out
     lines = [f"# Evidence status for {data['session'][:12]} over the last {int(data['since_s'] // 3600)}h ({data['entries']} WAL entries)"]
     lines += block("VERIFIED (REALLY_TESTED)", data["verified"], lambda r: f"  {r['check']:<24} {r['agent'][:12]:<12} {r['note'][:110]}")
-    lines += block("LIVE", data["live"], lambda r: f"  {r['label']:<14} {r['agent'][:12]:<12} {r['note'][:110]}")
+    lines += block("FAILED (REALLY_TESTED ... FAIL; never proof)", data.get("failed") or [],
+                   lambda r: f"  {r['check']:<24} {r['agent'][:12]:<12} {r['note'][:110]}")
+    lines += block("LIVE (deploy records)", data["live"], lambda r: f"  {r['label']:<14} {r['agent'][:12]:<12} {r['note'][:110]}")
+    lines += block("LIVE_LEGACY (prose live claims, not deploy records)", data.get("live_legacy") or [],
+                   lambda r: f"  {r['label']:<21} {r['agent'][:12]:<12} {r['note'][:100]}")
     lines += block("PENDING checks (declared, not yet REALLY_TESTED)", data["pending"], lambda r: f"  {r['check']:<24} {r['agent'][:12]:<12} {r['note'][:100]}")
     lines += block("CLAIMED only (narrative, no evidence entry)", data["claimed"], lambda r: f"  {r['agent'][:12]:<12} {r['note'][:120]}")
     lines += block("BLOCKED", data["blockers"], lambda r: f"  {r['agent'][:12]:<12} {r['note'][:120]}")
@@ -2482,7 +2648,8 @@ def status_text(data: dict) -> str:
     o = data.get("owners") or {}
     if "counts" in o:
         lines.append(f"## OWNERS live {len(o.get('live') or [])}: {', '.join(a[:12] for a in o.get('live') or [])}; "
-                     f"undisposed: {', '.join(o.get('undisposed') or []) or 'none'}")
+                     f"undisposed: {', '.join(o.get('undisposed') or []) or 'none'}; "
+                     f"attention (silent, wait expired, wait not on a user ask, result untaken, or none): {', '.join(o.get('attention') or []) or 'none'}")
     else:
         lines.append("## OWNERS " + str(o.get("error", "")))
     lines.append("(" + data["rule"] + ")")
@@ -2983,6 +3150,12 @@ def build_parser():
         v.add_argument("--all", action="store_true", help="every session with a main WAL")
         v.add_argument("--json", action="store_true", help="accepted for symmetry; output is always JSON")
     sub.add_parser("sessions", help="sessions with a main WAL, newest first")
+    ex = sub.add_parser("export", help="write one session's WALs as a redacted, local-only HTML file (goodqa#15788); "
+                                       "never uploaded")
+    ex.add_argument("--session")
+    ex.add_argument("--since", help="window: <n>m|h|d (default: every row)")
+    ex.add_argument("--agent", action="append", default=[], help="timeline for this agent only (repeatable)")
+    ex.add_argument("--out", help="FILE.html outside any repository or sync folder (default: the session work dir)")
     dl = sub.add_parser("deadline", help="dated one-shot obligations (goodqa#14791 G3)")
     dls = dl.add_subparsers(dest="sub", required=True)
     da = dls.add_parser("add")
@@ -3000,6 +3173,12 @@ def build_parser():
     stt = sub.add_parser("status", help="evidence-only status report from the session WALs: VERIFIED, LIVE, PENDING, CLAIMED, ASSUMPTIONS")
     stt.add_argument("--session")
     stt.add_argument("--since", default="12h", help="window: <n>m|h|d (default 12h)")
+    gl = sub.add_parser("goals", help="per-goal status from the mission goal ledger, evidence of any age (goodqa#15754); "
+                                      "the entry point for 'what is left'")
+    gl.add_argument("--session")
+    gl.add_argument("--json", action="store_true", help="the full report as JSON (text is capped at 4 KB)")
+    gl.add_argument("--candidates", action="store_true", help="list unattached deploy and REALLY_TESTED rows naming "
+                                                              "each goal, for main to attach or decline (read only)")
     ap = sub.add_parser("approve-top", help="record the user's permission for the top writing rung for one task: "
                                             "verifies the user's own words ask for it, writes the ask pair, records the task grant")
     ap.add_argument("--task", required=True, help="the [task:<key>] the spawn will carry")
@@ -3070,6 +3249,19 @@ def build_parser():
                          "scrubbed environment (branch refs cannot be supplied by the caller)")
     wp.add_argument("--session")
     wp.add_argument("--agent", help="calling agent id for the audit row")
+    ip = sub.add_parser("install-files", help="install MERGED listed hook files on a remote host (audited; see ah_install.py; "
+                        "the bytes come only from a commit on the canonical main; main only)")
+    ip.add_argument("--host", required=True, help="t2-dev or ah-mac-mini")
+    ip.add_argument("--from-ref", dest="from_ref", help="a full 40-hex commit sha on the canonical main")
+    ip.add_argument("--file", dest="files", action="append", help="a bare hook file name (repeatable)")
+    ip.add_argument("--ticket", help="GoodQA project#N (required for a real run, a resume and a rollback)")
+    ip.add_argument("--dry-run", dest="dry_run", action="store_true", help="print the plan, change nothing on the host")
+    ip.add_argument("--resume", metavar="RUN_ID", help="finish an interrupted run with its original self-test baseline")
+    ip.add_argument("--rollback", metavar="RUN_ID", help="undo a run from its backups")
+    ip.add_argument("--force-file", dest="force_files", action="append", help="rollback only: restore this file even if a later run changed it")
+    ip.add_argument("--allow-older", dest="allow_older", action="store_true",
+                    help="install a ref even when a newer merged version of a file exists on main (a downgrade; audited)")
+    ip.add_argument("--agent", help="calling agent id for the audit row")
     _no_abbrev(p)
     return p
 
@@ -3160,6 +3352,14 @@ def run(args, home: Path) -> dict:
         if not s:
             raise AhError("session_unknown", "no session: pass --session or set CLAUDE_CODE_SESSION_ID")
         return status_report(home, s, parse_since(args.since))
+    if cmd == "export":  # goodqa#15788: local, redacted HTML; never uploaded (pi-dev-port H1)
+        import ah_export  # noqa: PLC0415
+        return ah_export.export(sys.modules[__name__], home, args)
+    if cmd == "goals":  # goodqa#15754: no time window on attached evidence; a missing or tampered ledger exits 2
+        import goals_view  # noqa: PLC0415
+        if args.candidates:
+            return dict(goals_view.candidates(home, session=args.session), candidates=True)
+        return goals_view.goals_report(home, session=args.session, budget_s=goals_view.CLI_BUDGET_S)
     if cmd == "approve-top":
         return approve_top_cmd(home, args)
     if cmd == "doctor":
@@ -3223,6 +3423,23 @@ def run(args, home: Path) -> dict:
                                       home)
         except ah_worktree.WorktreeError as e:
             raise AhError(e.code, str(e), e.exit_code)
+    if cmd == "install-files":
+        import ah_install
+        session = env_session() or ""
+        agent = args.agent or os.environ.get("AH_AGENT_ID", "")
+        try:
+            ah_install.check_inputs(args.host, args.from_ref, args.files, args.ticket, args.dry_run, args.resume, args.rollback,
+                                    tuple(args.force_files or ()), args.allow_older)
+            if args.rollback:
+                return ah_install.rollback(args.rollback, args.ticket, tuple(args.force_files or ()), home, session, agent)
+            if args.resume:
+                return ah_install.resume(args.resume, args.ticket, home, session, agent)
+            return ah_install.install_files(args.host, args.from_ref, args.files, args.ticket, args.dry_run, home, session, agent,
+                                            allow_older=args.allow_older)
+        except ah_install.InstallError as e:
+            if e.data:  # a definite non-success result (rolled_back, unknown, refused after the start row): the full JSON, exit code kept
+                print(json.dumps(e.data, indent=2, default=str))
+            raise AhError(e.code, str(e), e.exit_code)
     raise AhError("unknown_command", cmd)
 
 
@@ -3231,6 +3448,15 @@ def main(argv=None) -> int:
     if given[:2] in (["task", "kit"], ["task", "succeed"], ["task", "kits"]):  # goodqa#15565: successor kit (successor.py)
         import successor  # noqa: PLC0415
         return successor._cli(["list" if given[1] == "kits" else given[1]] + given[2:])
+    if given[:1] == ["guard-selftest"]:  # goodqa#15876: a fixed live test of a guard rule; it takes no command, path or directory
+        try:
+            import guard_selftest  # noqa: PLC0415
+        except ImportError:
+            json.dump({"ok": False, "code": "missing", "message": "guard_selftest.py is not installed beside ah.py; install the "
+                                                                    "merged hook files first"}, sys.stdout)
+            sys.stdout.write("\n")
+            return 4
+        return guard_selftest.cli_main(given[1:])
     args = build_parser().parse_args(argv)
     try:
         data = run(args, home_dir())
@@ -3244,6 +3470,11 @@ def main(argv=None) -> int:
         json.dump({"ok": False, "code": "internal", "type": type(e).__name__}, sys.stdout)
         sys.stdout.write("\n")
         return 4
+    if args.cmd == "goals":
+        import goals_view  # noqa: PLC0415
+        text = goals_view.candidates_text(data) if data.get("candidates") else goals_view.goals_text(data)
+        sys.stdout.write((json.dumps(data, indent=2) if args.json else text) + "\n")
+        return 0 if data.get("state") == "ok" else 2
     if args.text:
         sys.stdout.write(render_text(args.cmd, data) + "\n")
     else:

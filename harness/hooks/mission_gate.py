@@ -5,6 +5,9 @@ main-only mission commands (`mission_gate.py pretool`): one stamp per command th
 command position, keyed by its exact argument list; echoed, quoted, grepped or here-document text is never stamped.
 The command line is split by a quote-aware tokenizer (shell_tokens): quoted or escaped punctuation is a word
 character, never a separator (r14 F1), and a line whose words only the shell knows gets no stamp at all.
+Each stamp is bound to main's tool_use_id (goodqa#15754 red-team F1): the process honours it only while that call is
+still running, and `mission_gate.py posttool` (PostToolUse, PostToolUseFailure, PermissionDenied) deletes it when the
+call ends; a call that never ran leaves nothing another process can use (caller_identity, "Bound stamps").
 
 Evidence: 2026-11-10 the leads goal (goodqa#15095) had no owner all night; the user had to ask "whats moving the
 slowest" and then "why doesnt the dashboard and harness deal with this?". The dropped-owner gate only sees owners that
@@ -42,7 +45,8 @@ OWNER_SCAN_BUDGET_S = 9  # the hook has 15 s; `ah owners` took ~24 s on a 2,089-
 VALVE_KEY = "mission:gate-valve"
 SCAN_KEY = "mission:scan:unavailable"
 STAMP_PURPOSE = "mission-main"
-MAIN_ONLY = ("set", "defer", "import-initiatives", "reseal", "activate", "set-session", "bind", "retire")
+MAIN_ONLY = ("set", "defer", "import-initiatives", "reseal", "activate", "set-session", "bind", "retire",
+             "attach")
 
 
 def home_dir() -> Path:
@@ -130,7 +134,7 @@ def stamps_for(cmd: str) -> list:
         if any(getattr(w, "computed", False) for w in argv):
             continue  # the process would see what the shell computed, not these words
         flags = {x.split("=", 1)[0] for x in argv[1:] if x.startswith("--")}
-        if argv[0] == "set" and not flags & {"--ticket", "--repo"}:
+        if argv[0] == "set" and not flags & {"--ticket", "--repo", "--target", "--target-source", "--alias"}:
             continue
         if argv[0] == "defer" and not flags & {"--user-source", "--ticket"}:
             continue
@@ -154,8 +158,27 @@ def cmd_pretool(payload: dict) -> dict:
     if not caller_identity.is_main(payload):
         return {}
     session = str(payload.get("session_id") or "")
+    tool_use_id = payload.get("tool_use_id")
+    if not isinstance(tool_use_id, str) or not caller_identity.TOOL_USE_ID.match(tool_use_id):
+        return {}  # F1: a stamp must be bound to this one call; without its id there is nothing to bind to
     for sub, key in stamps_for(cmd)[:10]:
-        caller_identity.put_stamp(STAMP_PURPOSE, [sub, key], session=session, home=home_dir())
+        caller_identity.put_stamp(STAMP_PURPOSE, [sub, key], session=session, home=home_dir(),
+                                  tool_use_id=tool_use_id, transcript=str(payload.get("transcript_path") or ""))
+    return {}
+
+
+POST_EVENTS = ("PostToolUse", "PostToolUseFailure", "PermissionDenied")
+
+
+def cmd_posttool(payload: dict) -> dict:
+    """PostToolUse / PostToolUseFailure / PermissionDenied (Bash): the call is over (ran, failed, or was refused), so
+    any stamp still unconsumed for its tool_use_id is deleted (goodqa#15754 red-team F1). A stamp of a call denied by
+    another PreToolUse hook or rejected at the prompt gets no Post event; take_stamp(bound=True) refuses it once the
+    refusal is in main's transcript. Never denies anything; a tool_use_id of another agent matches no stamp."""
+    if payload.get("tool_name") != "Bash" or payload.get("hook_event_name", POST_EVENTS[0]) not in POST_EVENTS:
+        return {}
+    import caller_identity  # noqa: PLC0415
+    caller_identity.drop_tool_stamps(payload.get("tool_use_id"), home=home_dir())
     return {}
 
 
@@ -226,7 +249,8 @@ def main(argv=None) -> int:
     payload = payload if isinstance(payload, dict) else {}
     mode = (argv if argv is not None else sys.argv[1:])[:1]
     try:
-        out = cmd_pretool(payload) if mode == ["pretool"] else cmd_stop(payload)
+        out = cmd_pretool(payload) if mode == ["pretool"] else cmd_posttool(payload) if mode == ["posttool"] \
+            else cmd_stop(payload)
     except Exception as exc:  # noqa: BLE001 - a gate crash must not trap the turn silently
         out = {"systemMessage": f"mission gate failed open ({type(exc).__name__})"}
     if out:

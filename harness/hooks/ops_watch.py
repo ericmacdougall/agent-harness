@@ -100,6 +100,7 @@ def defaults(host: str) -> dict:
                      "lookback_h": 24, "lookback_active_h": 168, "retire_h": 6, "ticket_quiet_h": 3, "max_ticket_lookups": 10,
                      "ticket_budget_s": 90, "gq": "~/.claude/goodqa-p0p1/gq.py",
                      "projects": {"goodqa": "1ae27b6b-f8f2-4e61-ab2d-c9c43fd162c3"}},
+        "idle_guard": {"enabled": True, "idle_min": 30, "wal_root": "~/.claude/wals", "lookback_h": 12},
         "peers": [],
         # goodqa#15234: point events (a refused copy, a foreign process stop) describe something that happened, not a
         # condition that can stop being true, so nothing ever cleared them. They expire after ttl_h without a repeat.
@@ -303,8 +304,9 @@ def _parse_slots(data: bytes) -> list:
             obj = json.loads(data[i:i + SLOT_BYTES].decode("utf-8", "replace").strip())
         except ValueError:
             continue
-        if isinstance(obj, dict) and isinstance(obj.get("seq"), int):
-            out.append(obj)
+        if (isinstance(obj, dict) and isinstance(obj.get("seq"), int)
+                and all(isinstance(obj.get(k), (str, type(None))) for k in ("host", "source", "key"))):
+            out.append(obj)  # a row whose host, source or key is not a string would crash every reader
     return sorted(out, key=lambda e: e["seq"])
 
 
@@ -323,6 +325,8 @@ def emit(event: dict, path: Path | None = None, home: Path | None = None) -> int
     missing = [k for k in REQUIRED if not event.get(k)]
     if missing:
         raise ValueError(f"alert event missing {missing}")
+    if not all(isinstance(event.get(k), str) for k in ("host", "source", "key")):
+        raise ValueError("alert event host, source and key must be strings")
     if event["severity"] not in SEVERITIES or event["event"] not in ("raise", "clear"):
         raise ValueError("bad severity or event")
     event = dict(event, message=redact(event["message"]), detail=redact_obj(event.get("detail") or {}))
@@ -1440,6 +1444,7 @@ def _read_unit(out, rec, key, host, unit, svc, tmr, now, max_age):
 
 POOL_STORAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}")
 POOL_MOUNT = re.compile(r"/[A-Za-z0-9._/-]{1,100}")
+POOL_LOCAL_FILE = re.compile(r"/[A-Za-z0-9._/-]{1,200}")  # ssh_config / known_hosts on the watching host
 POOL_VOLS_HEADER = ["Volid", "Format", "Type", "Size", "VMID"]
 POOL_GUEST_TYPES = ("images", "rootdir")  # VM disks (incl. unusedN), container volumes; iso/backup/... never count
 POOL_WARN_PCT, POOL_HIGH_PCT, POOL_CRIT_PCT, POOL_FLOOR_GIB = 85.0, 92.0, 97.0, 20.0
@@ -1473,9 +1478,17 @@ def _pool_num(text):
 
 def parse_pool_status(text: str, storage: str):
     """(total, used, avail) in bytes from `pvesm status` output, or None for anything unusable."""
-    # recorded live: current pvesm prints "Total (KiB)  Used (KiB)  Available (KiB)"; older output has no units
-    lines = [l.split() for l in (text or "").replace("(KiB)", "").splitlines() if l.strip()]
-    if not lines or lines[0][:6] != ["Name", "Type", "Status", "Total", "Used", "Available"]:
+    lines = [l.split() for l in (text or "").splitlines() if l.strip()]
+    if not lines:
+        return None
+    # pve 8 prints "Total (KiB)  Used (KiB) Available (KiB)"; older output has no unit. Either all three size columns say
+    # (KiB) or none does; any other unit is refused rather than misread.
+    head = lines[0]
+    units = [t for t in head if t.startswith("(")]
+    if units not in ([], ["(KiB)"] * 3) or (units and head[3:9] != ["Total", "(KiB)", "Used", "(KiB)", "Available",
+                                                                     "(KiB)"]):
+        return None
+    if [t for t in head if not t.startswith("(")][:6] != ["Name", "Type", "Status", "Total", "Used", "Available"]:
         return None
     rows = [l for l in lines[1:] if l[0] == storage]
     if len(rows) != 1 or len(rows[0]) != 7 or rows[0][2] != "active":
@@ -1573,6 +1586,13 @@ def pool_baseline(samples: list, now: float):
     return min(ok, key=lambda s: abs(now - s[0] - 24 * 3600)) if ok else None
 
 
+def _pool_sample_ok(s) -> bool:
+    """A stored sample is [time, used_bytes, {vm id: bytes}] as _pool_alerts writes it."""
+    num = (int, float)
+    return (isinstance(s, (list, tuple)) and len(s) == 3 and type(s[0]) in num and type(s[1]) in num
+            and isinstance(s[2], dict) and all(type(v) in num for v in s[2].values()))
+
+
 def check_proxmox_pool(cfg, state, runner, now):
     out = []
     seen = state.setdefault("proxmox_pools", {})
@@ -1582,37 +1602,54 @@ def check_proxmox_pool(cfg, state, runner, now):
         storage = str(entry.get("storage", "local"))
         mount = str(entry.get("mount", "/var/lib/vz")).rstrip("/") or "/"
         watch = entry.get("watch_vms", [])
+        jump, ssh_config, known_hosts = (str(entry.get(k, "")) for k in ("jump", "ssh_config", "known_hosts"))
         shown = host.rsplit("@", 1)[-1]  # alerts name the host, never the login user
         base = f"{shown[:64]}:{mount[:100]}"
         if (not REMOTE_HOST.fullmatch(host) or not POOL_STORAGE.fullmatch(storage) or not POOL_MOUNT.fullmatch(mount)
                 or ".." in mount or not isinstance(watch, list)
-                or any(type(v) is not int or not 0 < v < 10 ** 10 for v in watch)):
+                or any(type(v) is not int or not 0 < v < 10 ** 10 for v in watch)
+                or (jump and not REMOTE_HOST.fullmatch(jump))
+                or any(p and (not POOL_LOCAL_FILE.fullmatch(p) or ".." in p) for p in (ssh_config, known_hosts))):
             out.append(alert("proxmox_pool", f"disk:config:{base}", "warning",
-                             "proxmox pool entry has an unsafe host, storage, mount or VM id", {"host": shown[:64]}))
+                             "proxmox pool entry has an unsafe host, storage, mount, VM id or ssh option",
+                             {"host": shown[:64]}))
             continue
-        rec = seen.setdefault(base, {"first_try": now, "samples": []})
-        try:
-            rc, text = runner(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-                               "-o", "StrictHostKeyChecking=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none",
-                               "--", host, pool_script(storage, mount, watch)], 25, max_bytes=POOL_MAX_BYTES)
-        except (subprocess.TimeoutExpired, OSError):
-            rc, text, why = 255, "", "unreachable or timed out"
-        else:
-            why = ("output over the size limit" if rc == RUN_OVERFLOW_RC or len(text or "") > POOL_MAX_BYTES
-                   else "unreachable or ssh failed" if rc != 0 else "unusable output")
-        parsed = parse_pool_probe(text, storage, mount) if rc == 0 and len(text or "") <= POOL_MAX_BYTES else None
-        if parsed is None:
-            out.extend(a for a in rec.get("alerts") or [] if isinstance(a, dict) and a.get("check") == "proxmox_pool")
-            stale = now - rec.get("ok_at", rec["first_try"]) > POOL_UNKNOWN_HIGH_S
-            out.append(alert("proxmox_pool", f"disk:unknown:{base}", "high" if stale else "warning",
-                             f"UNKNOWN: cannot read {shown} {storage} pool ({why}); capacity is not being watched",
-                             {"host": shown[:64], "reason": why}))
-            continue
-        total, used, avail = parsed["status"]
+        rec = seen.get(base)
+        if not isinstance(rec, dict) or not isinstance(rec.get("first_try"), (int, float)):
+            rec = seen[base] = {"first_try": now, "samples": []}  # a corrupt saved record restarts, never crashes
         mark = len(out)
-        _pool_alerts(out, rec, base, shown, storage, mount, watch, parsed, total, used, avail, now)
-        rec["ok_at"] = now
-        rec["alerts"] = out[mark:]
+        try:
+            # optional ssh config, jump host and pinned known_hosts file; host-key checking is strict either way
+            opts = (["-F", ssh_config] if ssh_config else []) + (["-J", jump] if jump else []) + (
+                ["-o", f"UserKnownHostsFile={known_hosts}", "-o", "StrictHostKeyChecking=yes"] if known_hosts else [])
+            try:
+                rc, text = runner(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                                   "-o", "StrictHostKeyChecking=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none",
+                                   *opts, "--", host, pool_script(storage, mount, watch)], 25, max_bytes=POOL_MAX_BYTES)
+            except (subprocess.TimeoutExpired, OSError):
+                rc, text, why = 255, "", "unreachable or timed out"
+            else:
+                why = ("output over the size limit" if rc == RUN_OVERFLOW_RC or len(text or "") > POOL_MAX_BYTES
+                       else "unreachable or ssh failed" if rc != 0 else "unusable output")
+            parsed = parse_pool_probe(text, storage, mount) if rc == 0 and len(text or "") <= POOL_MAX_BYTES else None
+            if parsed is not None:
+                total, used, avail = parsed["status"]
+                _pool_alerts(out, rec, base, shown, storage, mount, watch, parsed, total, used, avail, now)
+                rec["ok_at"] = now
+                rec["alerts"] = out[mark:]
+                continue
+        except Exception:  # undecodable output, a corrupt sample, anything else: UNKNOWN, never a generic check error
+            del out[mark:]
+            why = "probe or parse error"
+            if not isinstance(rec.get("samples"), list) or not all(_pool_sample_ok(s) for s in rec["samples"]):
+                rec["samples"] = []
+        prior = rec.get("alerts") if isinstance(rec.get("alerts"), list) else []
+        out.extend(a for a in prior if isinstance(a, dict) and a.get("check") == "proxmox_pool")
+        ok_at = rec.get("ok_at") if isinstance(rec.get("ok_at"), (int, float)) else rec["first_try"]
+        stale = now - ok_at > POOL_UNKNOWN_HIGH_S
+        out.append(alert("proxmox_pool", f"disk:unknown:{base}", "high" if stale else "warning",
+                         f"UNKNOWN: cannot read {shown} {storage} pool ({why}); capacity is not being watched",
+                         {"host": shown[:64], "reason": why}))
     return out
 
 
@@ -1935,6 +1972,44 @@ def check_liveness(cfg, state, runner, now):
     return out
 
 
+def check_idle_guard(cfg, state, runner, now):
+    """goodqa#15943: one high alert idle-guard:<session8> per recent session whose main and owners made no progress for
+    idle_min minutes while a stream holds a non-user next step (idle_guard.assess). The alert ends when progress
+    resumes or nothing actionable is left. A session that cannot be assessed raises nothing (the Stop hook fails open
+    too)."""
+    ic = cfg["idle_guard"]
+    home = Path(home_of(cfg))
+    root = Path(expand(home, ic["wal_root"]))
+    if root != home / ".claude" / "wals":
+        return []  # the owner view reads the real session root only
+    out = []
+    try:
+        sessions = [e for e in os.scandir(root) if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        return []  # no session WALs on this host (a Codex-only install): nothing to assess, nothing to import
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import idle_guard  # noqa: PLC0415 - installed beside this file
+    except ImportError as error:  # a partial install: say so, never a check-error (receipt r3 F1)
+        return [alert("idle_guard", "idle-guard:unavailable", "warning",
+                      f"idle_guard.py is not installed beside ops_watch.py ({type(error).__name__}); main-idle detection is off",
+                      {"fix": "reinstall the harness"})]
+    for sess in sorted(sessions, key=lambda e: e.name):
+        try:
+            if os.stat(os.path.join(sess.path, "main.jsonl")).st_mtime < now - ic["lookback_h"] * 3600:
+                continue
+            a = idle_guard.assess(home, sess.name, now, float(ic["idle_min"]))
+        except Exception:  # noqa: BLE001 - one unreadable session never hides the others
+            continue
+        if a["idle"]:
+            names = ", ".join(s["agent"] for s in a["streams"][:6])
+            out.append(alert("idle_guard", f"idle-guard:{sess.name[:8]}", "high",
+                             f"main idle {round(a['idle_s'] / 60)}m with {len(a['streams'])} stream(s) holding a non-user next step: {names}",
+                             {"session": sess.name[:8], "idle_min": round(a["idle_s"] / 60),
+                              "streams": [{"agent": s["agent"], "next": s["next"]} for s in a["streams"][:12]]}))
+    return out
+
+
 def check_mission(cfg, state, runner, now):
     """Mission coverage (goodqa#15565): mission:<goal>:uncovered (high, stop_block) and mission:<goal>:stalled
     (warning) from mission_coverage.assess for the mission session (goals.json mission_session);
@@ -2118,6 +2193,7 @@ DEFAULT_CHECKS = {
     "remote_units": check_remote_units,
     "proxmox_pool": check_proxmox_pool,
     "deploys": lambda c, s, r, n: check_deploys(c, s, r, n) if (c.get("deploys") or {}).get("enabled", True) else [],
+    "idle_guard": lambda c, s, r, n: check_idle_guard(c, s, r, n) if (c.get("idle_guard") or {}).get("enabled", True) else [],
     "mission": lambda c, s, r, n: check_mission(c, s, r, n) if (c.get("mission") or {}).get("enabled", True) else [],
 }
 RUN_CHECK = "_run"    # internal errors; cleared by any completed run
@@ -2306,6 +2382,87 @@ def compact(e: dict) -> dict:
     return {k: e.get(k) for k in ("host", "event", "severity", "key", "message", "detail", "seq", "at")}
 
 
+def queue_events(cfg: dict, state: dict, news: list, now: float) -> None:
+    """Queue alert transitions for the digest and, for critical raises, the deadman mail (at most one mail per key per 6 h,
+    so a flapping threshold does not flood; no deadman configured: nothing to queue)."""
+    state["pending_comment"] = ((state.get("pending_comment") or []) + [compact(e) for e in news])[-500:]
+    sent = state.setdefault("deadman_sent", {})
+    for e in news:
+        if (cfg["sinks"].get("deadman") and e["event"] == "raise" and e["severity"] == "critical"
+                and now - sent.get(e["key"], 0) > 6 * 3600):
+            state.setdefault("pending_deadman", []).append(compact(e))
+            sent[e["key"]] = now
+
+
+FWD_KEYS_MAX = 200  # keys remembered as forwarded-raised (a bounded state slot)
+
+
+def forward_foreign(cfg: dict, home: Path, state: dict, ring: Path, now: float) -> list:
+    """goodqa#15827: critical raise and clear events that a foreign source wrote to this host's ring (fabd-health, any script
+    using `ops_watch.py emit`) never reached the digest or the deadman queue, because only run_once's own transitions are
+    queued. Returns the ring rows to queue now and advances state["fwd_seq"] (persisted with the queues in one state write, so
+    a crash re-forwards rather than loses). Rules: source other than ops-watch, this host, severity critical for a raise, a
+    clear only for a key that was forwarded as raised, text refreshes (updated, reasserted) skipped. The first run (or a ring
+    whose sequence restarted below the stored one) forwards only what is standing, never the history."""
+    host = cfg["host"]
+    rows = sorted(read_ring(ring), key=lambda e: e.get("seq") or 0)
+    try:
+        info = os.stat(ring)
+    except FileNotFoundError:
+        state.setdefault("fwd_seq", 0)  # no ring yet: everything that appears later is new
+        return []
+    except OSError:
+        return []  # the ring cannot be examined: unknown, never a reset; position and keys stay as they are
+    ring_id = f"{info.st_dev}:{info.st_ino}"
+    top = max([e.get("seq") or 0 for e in rows] or [0])
+    seen = state.get("fwd_seq")
+    if isinstance(seen, int) and not rows:
+        return []  # an unreadable or empty read after a forward is "unknown": keep fwd_seq, never replay on the next good read
+    active = state.setdefault("fwd_active", {})  # key -> seq of the raise that was forwarded
+    stored_id = state.get("fwd_ring")
+    low = isinstance(seen, int) and top < seen
+    state["fwd_low"] = (state.get("fwd_low") or 0) + 1 if low else 0
+    # a real reset needs a positive signal: the ring file itself was replaced, or the sequence stayed below the stored
+    # position on three consecutive runs; one low read (a torn newest slot) is not one
+    recreated = isinstance(seen, int) and ((bool(stored_id) and stored_id != ring_id) or state["fwd_low"] >= 3)
+    if low and not recreated:
+        return []
+    out = []
+    if not isinstance(seen, int) or recreated:  # first run or a recreated ring
+        before = dict(active)
+        active.clear()
+        state["fwd_low"] = 0
+        for (h, src, key), e in latest_by_key(rows).items():
+            if h != host or src == SOURCE:
+                continue
+            if e.get("event") == "raise" and e.get("severity") == "critical":
+                out.append(e)
+                active[f"{src}/{key}"] = e.get("seq") or 0
+            elif e.get("event") == "clear" and f"{src}/{key}" in before:
+                out.append(e)  # a clear the old sequence never delivered: the digest must not keep it standing
+    else:
+        for e in rows:
+            if (e.get("seq") or 0) <= seen or ring_host(e) != host or e.get("source") == SOURCE:
+                continue
+            detail = e.get("detail") if isinstance(e.get("detail"), dict) else {}  # emit() lets any JSON through as detail
+            if not isinstance(e.get("key"), str) or not isinstance(e.get("source"), str):
+                continue  # one malformed foreign row must never stop the alert path
+            ident = f"{e.get('source')}/{e.get('key')}"
+            if e.get("event") == "raise" and e.get("severity") == "critical":
+                if detail.get("updated") or detail.get("reasserted"):
+                    continue  # a text refresh is not a new alert
+                active[ident] = e.get("seq") or 0
+                out.append(e)
+            elif e.get("event") == "clear" and ident in active:  # an expiry clear carries updated=true and still closes the raise
+                del active[ident]
+                out.append(e)
+    state["fwd_seq"] = top
+    state["fwd_ring"] = ring_id
+    while len(active) > FWD_KEYS_MAX:
+        active.pop(min(active, key=active.get))
+    return out
+
+
 def _transition(host, kind, key, a, extra=None) -> dict:
     return {"host": host, "source": SOURCE, "event": kind, "severity": a.get("severity", "info"), "key": key,
             "message": a.get("message", ""), "detail": {**(a.get("detail") or {}), **(extra or {})},
@@ -2424,14 +2581,7 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
                 rc = 2
                 print(f"ops-watch: alert ring write failed ({type(exc).__name__}): {e['key']}", file=sys.stderr)
                 active.get(e["key"], {}).pop("written", None)  # not written: next run reads what the ring really says
-        news = [e for e in evs if not (e.get("detail") or {}).get("updated")]  # a text refresh alerts nobody
-        state["pending_comment"] = ((state.get("pending_comment") or []) + [compact(e) for e in news])[-500:]
-        sent = state.setdefault("deadman_sent", {})
-        for e in news:  # critical raises, at most one deadman mail per key per 6 h (flapping thresholds)
-            if (cfg["sinks"].get("deadman") and e["event"] == "raise" and e["severity"] == "critical"
-                    and now - sent.get(e["key"], 0) > 6 * 3600):  # no deadman configured: nothing to queue
-                state.setdefault("pending_deadman", []).append(compact(e))
-                sent[e["key"]] = now
+        queue_events(cfg, state, [e for e in evs if not (e.get("detail") or {}).get("updated")], now)  # a text refresh alerts nobody
         try:
             save_state(home, state)
         except (OSError, ValueError) as exc:
@@ -2440,6 +2590,14 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
 
     events += expire_point_events(cfg, latest_by_key(read_ring(ring)), active, now, ring)
     persist(events)  # durable before any slow sink: a crash or timeout below cannot re-raise these
+    foreign = forward_foreign(cfg, home, state, ring, now)
+    if foreign:
+        queue_events(cfg, state, [dict(e, detail=e["detail"] if isinstance(e.get("detail"), dict) else {}) for e in foreign], now)
+        try:
+            save_state(home, state)  # queues and the forwarded seq in one write: idempotent across a restart
+        except (OSError, ValueError) as exc:
+            rc = 2
+            print(f"ops-watch: state write failed ({type(exc).__name__})", file=sys.stderr)
     latest = latest_by_key(read_ring(ring))
     reassert = [_transition(host, "raise", k, a, {"reasserted": True}) for k, a in sorted(active.items())
                 if latest.get((host, SOURCE, k), {}).get("event") != "raise"]
@@ -2508,7 +2666,7 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
 SAFE_TEXT = re.compile(r"[^A-Za-z0-9 ._:/%+()\[\],=@#~-]")
 
 
-def injection_text(home: Path | None = None, max_chars: int = 700) -> str:
+def injection_text(home: Path | None = None, max_chars: int = 700, session: str = "") -> str:
     """Context line for wal.py. Never raises; "" when nothing is active. Alert text can carry dir, unit, branch
     or process names, so it is reduced to a safe character set and labelled as data."""
     try:
@@ -2536,9 +2694,13 @@ def injection_text(home: Path | None = None, max_chars: int = 700) -> str:
         for h, group in live.items():
             group.sort(key=lambda x: -SEVERITIES.get(x[0], 0))
             top = max(SEVERITIES.get(g[0], 0) for g in group)
-            names = ", ".join(str(g[1]).split("/", 1)[-1] for g in group[:4])
+            # goodqa#15754: one owner can hold several alert rows (a critical and a high under one key); count owners
+            seen = list(dict.fromkeys(str(g[1]) for g in group))
+            names = ", ".join(k.split("/", 1)[-1] for k in seen[:4])
+            mine = sum(1 for k in seen if session and k.split(":", 1)[-1].startswith(session[:8] + "/"))
+            share = f" ({mine} in this session)" if session else ""
             rest.append(([k for k, v in SEVERITIES.items() if v == top][0], h, "liveness",
-                         f"{len(group)} owner(s) silent or dropped: {names}{', ...' if len(group) > 4 else ''}"))
+                         f"{len(seen)} owner(s) silent or dropped{share}: {names}{', ...' if len(seen) > 4 else ''}"))
         items = sorted(rest, key=lambda x: -SEVERITIES.get(x[0], 0))
 
         def clean(v, n):
@@ -2668,6 +2830,16 @@ def lower_priority() -> None:
         subprocess.run(["ionice", "-c3", "-p", str(os.getpid())], capture_output=True, timeout=10)
 
 
+def capabilities() -> list:
+    """What this installed ops_watch.py can do, one name per line, for installers that must not depend on a missing feature
+    (goodqa#15827: the fabd installer refuses to install without forward-foreign-critical). A name is listed only when the code
+    behind it is present."""
+    caps = ["emit"]
+    if callable(globals().get("forward_foreign")) and callable(globals().get("queue_events")):
+        caps.append("forward-foreign-critical")  # critical raise and clear rows of a foreign ring source reach the digest and the deadman queue
+    return caps
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd")
@@ -2682,10 +2854,14 @@ def main(argv=None) -> int:
     u = sub.add_parser("uninstall")
     u.add_argument("--apply", action="store_true")
     sub.add_parser("config")
+    sub.add_parser("capabilities", help="print one capability per line (an installer can grep -qx for one)")
     sub.add_parser("relay-comment", help="post stdin as one comment on the ops-watch alerts ticket (peer relay)")
     args = ap.parse_args(argv)
-    home = Path.home()
     cmd = args.cmd or "run"
+    if cmd == "capabilities":  # no home, no config, no state, no ring: a pure probe (works with HOME unset)
+        print("\n".join(capabilities()))
+        return 0
+    home = Path.home()
     try:
         if cmd == "emit":
             print(emit(json.loads(args.json), home=home))
