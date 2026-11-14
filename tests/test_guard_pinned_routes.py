@@ -728,7 +728,7 @@ class TableTests(unittest.TestCase):
              cg.DEV_DECOM_EXPIRES),
             (BASE + PY_REL, '30c688923554c09f93128a7d9b89831557acd06d1f04949c235b09ea05cf89a6', cg.PINNED_ROUTES[1][2],
              cg.DEV_DECOM_EXPIRES),
-            (FAB_REL, 'c979bc116ec0f252b8e0916c2c48f7aefa984a61b0825a16f6f58a57e364ad0b', '/bin/bash -p {path}',
+            (FAB_REL, '419863b6538f16b6d66c03faf06ecc42f76d8aa765069a447d28f36959f7985f', '/bin/bash -p {path}',
              cg.FABRIC_DO_AUTH_EXPIRES),
         ])
 
