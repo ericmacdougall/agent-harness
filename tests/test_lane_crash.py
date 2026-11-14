@@ -25,6 +25,7 @@ def _child(action, point, store_root, templates, repo, lane_id):
         if p == point:
             os._exit(17)
     lanes._crash_hook = hook
+    mf._crash_hook = hook
     s = st.Store(store_root)
     if action == "create":
         ids = iter(["lane_crash1"])
@@ -106,7 +107,8 @@ class CreateCrashTests(CrashBase):
 
 
 class RegenCrashTests(CrashBase):
-    POINTS = ("regen:after_staged", "regen:after_old_moved", "regen:after_swapped", "regen:after_manifest")
+    POINTS = ("regen:after_staged", "regen:after_old_moved", "regen:after_swapped", "rev:after_tmp", "rev:after_link",
+              "regen:after_manifest")
 
     def test_killed_at_each_boundary_then_retry_gives_consistent_kit_and_manifest(self):
         for n, point in enumerate(self.POINTS):
@@ -116,8 +118,8 @@ class RegenCrashTests(CrashBase):
                 lane = self.new(ticket=ticket)["lane_id"]
                 code = run_child("regen", point, str(self.store.root), str(self.templates), str(self.repo), lane)
                 self.assertEqual(code, 17)
-                if point != "regen:after_manifest":
-                    self.assertTrue(self.verify(lane)["problems"] or point == "regen:after_staged",
+                if point not in ("regen:after_manifest", "regen:after_staged"):
+                    self.assertTrue(self.verify(lane)["problems"],
                                     "interruption must be visible to verify, not silent")
                 lanes.regenerate_kit(self.store, lane, version="v2", now=NOW, templates_root=self.templates,
                                      reason="canary")
@@ -127,7 +129,7 @@ class RegenCrashTests(CrashBase):
                 self.assertEqual(cur["kit_version"], "v2")
                 self.assertIn("v2", (self.store.lane_dir(lane) / "kit" / "brief.md").read_text())
                 names = [p.name for p in self.store.lane_dir(lane).iterdir()]
-                self.assertFalse([x for x in names if x.startswith(".kit-")])
+                self.assertFalse([x for x in names if x.startswith(".kit-") or x.endswith(".tmp")])
                 self.assertEqual(mf.verify_chain(self.store.lane_dir(lane)), [])
 
     def test_prior_kit_is_retained_until_the_manifest_commits(self):
@@ -139,6 +141,24 @@ class RegenCrashTests(CrashBase):
         self.assertEqual(code, 17)
         self.assertEqual((d / ".kit-old" / "brief.md").read_bytes(), before)
         self.assertEqual(mf.read_current(d)["kit_version"], "v1")
+
+
+class UncommittedReplacementTests(CrashBase):
+    def test_retry_that_cannot_commit_restores_the_prior_kit(self):
+        self.make_v2()
+        lane = self.new(ticket="GoodQA goodqa#860")["lane_id"]
+        d = self.store.lane_dir(lane)
+        before = (d / "kit" / "brief.md").read_bytes()
+        self.assertEqual(run_child("regen", "regen:after_swapped", str(self.store.root), str(self.templates),
+                                   str(self.repo), lane), 17)
+        # the retry fails before it can commit (the template is now missing a file): the prior kit must survive
+        os.unlink(self.templates / "v2" / "handoff.md")
+        with self.assertRaises((lanes.LaneRefusal, kit.KitError)):
+            lanes.regenerate_kit(self.store, lane, version="v2", now=NOW, templates_root=self.templates,
+                                 reason="canary")
+        self.assertEqual((d / "kit" / "brief.md").read_bytes(), before)
+        self.assertEqual(lanes.verify_lane(self.store, lane, templates_root=self.templates,
+                                           default_version="v1")["problems"], [])
 
 
 class RevisionChainTests(CrashBase):

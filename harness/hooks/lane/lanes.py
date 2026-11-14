@@ -178,11 +178,20 @@ def create_lane(store: st.Store, *, ticket, repo, profile, host_alias, branch, w
 
 
 def reconcile_lane(store: st.Store, lane_id) -> list:
-    """Under the lock: finish or discard an interrupted regeneration of one lane."""
+    """Under the lock: finish or discard an interrupted regeneration of one lane.
+
+    Commitment is decided from the validated manifest and the kit digests, never from which paths exist: the prior
+    kit (``.kit-old``) is dropped only once the kit on disk matches the manifest; if the replacement did not commit,
+    the prior kit is restored.
+    """
     lane_dir = store.lane_dir(lane_id)
     done = []
     with store.lock():
         new_dir, old_dir, kit_dir = lane_dir / ".kit-new", lane_dir / ".kit-old", lane_dir / "kit"
+        for tmp in sorted(lane_dir.glob(".manifest.*.tmp")):
+            if not tmp.is_symlink():
+                tmp.unlink()
+                done.append("removed " + tmp.name)
         if not os.path.lexists(str(kit_dir)) and old_dir.is_dir() and not old_dir.is_symlink():
             os.rename(str(old_dir), str(kit_dir))
             done.append("restored kit from .kit-old")
@@ -191,9 +200,21 @@ def reconcile_lane(store: st.Store, lane_id) -> list:
             done.append("discarded stale .kit-new")
         if mf.repair_head(lane_dir):
             done.append("repaired manifest.head")
-        if os.path.lexists(str(old_dir)) and os.path.lexists(str(kit_dir)):
-            _cleanup(store.root, old_dir)  # the replacement committed (kit present, manifest written)
-            done.append("removed committed .kit-old")
+        if os.path.lexists(str(old_dir)):
+            try:
+                recorded = mf.read_current(lane_dir)["kit_digests"]
+            except (mf.ManifestError, st.StoreError):
+                return done  # cannot decide: keep both, report through verify
+            current, problems = _tree(kit_dir)
+            if not problems and kit.digests(current) == recorded:
+                _cleanup(store.root, old_dir)  # committed: the manifest describes the kit on disk
+                done.append("removed committed .kit-old")
+            else:
+                old, old_problems = _tree(old_dir)
+                if not old_problems and kit.digests(old) == recorded:
+                    _cleanup(store.root, kit_dir)  # uncommitted replacement: restore the prior kit
+                    os.rename(str(old_dir), str(kit_dir))
+                    done.append("restored prior kit; replacement had not committed")
     return done
 
 
@@ -201,11 +222,12 @@ def regenerate_kit(store: st.Store, lane_id, *, version, now, templates_root, re
     """Canary a kit version on one lane, or roll it back. Rollback is never blocked by lint of any version."""
     if reason not in ("canary", "rollback", "regenerate"):
         raise LaneRefusal("unknown regeneration reason")
+    lane_dir = store.lane_dir(lane_id)
+    reconcile_lane(store, lane_id)  # first: a refused retry must still leave a consistent lane
     if reason != "rollback":
         problems = kit.lint_version(version, templates_root)
         if problems:
             raise LaneRefusal("kit version %s refused by lint: %s" % (version, "; ".join(problems[:3])))
-    lane_dir = store.lane_dir(lane_id)
     with store.lock():
         reconcile_lane(store, lane_id)
         try:

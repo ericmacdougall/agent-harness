@@ -36,6 +36,10 @@ FIELDS = ("schema", "revision", "revision_reason", "prev_sha256", "lane_id", "ke
           "spec_path", "scope_paths", "brief_version", "budget", "created_at")
 
 
+def _crash_hook(point: str) -> None:  # tests replace this to terminate the process inside revision publication
+    return None
+
+
 class ManifestError(ValueError):
     pass
 
@@ -150,10 +154,12 @@ def write_revision(lane_dir, m: dict, number=None) -> int:
     tmp = lane_dir / (".manifest.%d.tmp" % os.getpid())
     data = (st.canonical_json(m) + "\n").encode()
     st.atomic_write(tmp, data)
+    _crash_hook("rev:after_tmp")
     try:
         os.link(str(tmp), str(final))  # atomic create-if-absent
     finally:
         os.unlink(str(tmp))
+    _crash_hook("rev:after_link")
     st.atomic_write(_head_path(lane_dir), (_sha(data) + "\n").encode())
     return number
 
