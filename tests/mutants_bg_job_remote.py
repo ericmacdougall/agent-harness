@@ -30,13 +30,18 @@ MUTANTS = {
     "the infra count is never reset": ("bg_job.py", "            infra_polls = 0\n            if kind == \"ok\":", "            if kind == \"ok\":"),
     "the stderr line is not bounded": ("bg_job.py", "[^\\x20-\\x7e]\", \"?\", line.strip())[:160]", "[^\\x20-\\x7e]\", \"?\", line.strip())[:100000]"),
     "the ssh call has no bound": ("bg_job.py", "                              timeout=SSH_CALL_BOUND)", "                              timeout=None)"),
+    "the read-on shortcut skips the deadline": ("bg_job.py", "                if len(data) >= READ_CAP and time.time() < end:", "                if len(data) >= READ_CAP:"),
+    "the guard check uses the broad probe": ("bg_job.py", "            if command_guard.raw_credential(text):", "            if command_guard.raw_sensitive(text):"),
     "the lint advice is removed": ("bg_lint.py", "% (hit, SAFE, REMOTE_HINT if re.search(r\"\\bssh\\b\", command) else \"\")", "% (hit, SAFE, \"\")"),
 }
 
 
 def run(tmp, label):
-    done = subprocess.run([sys.executable, "-B", "-m", "unittest", TEST], cwd=str(tmp), capture_output=True, text=True, timeout=300)
-    killed = done.returncode != 0
+    try:
+        done = subprocess.run([sys.executable, "-B", "-m", "unittest", TEST], cwd=str(tmp), capture_output=True, text=True, timeout=90)
+        killed = done.returncode != 0
+    except subprocess.TimeoutExpired:  # a variant that hangs (an unbounded wait) is caught by the test run not finishing
+        killed = True
     print("%-52s %s" % (label, "FAILS (good)" if killed else "PASSES (test is vacuous)"))
     return killed
 

@@ -498,9 +498,11 @@ def file_judged_by_guard(path):
         import command_guard
         # a relative path is relative to the remote home: judge it as ~/PATH too (the Mac's home differs from the host's)
         forms = [shlex.quote(path)] if path.startswith("/") else [shlex.quote(path), '"$HOME"/' + shlex.quote(path)]
+        # raw_credential (credential locations), not raw_sensitive: run kits and job logs live under ~/.agent-harness and
+        # ~/.claude, and reading them is what this command is for; decide() below judges the read itself
         for text in [path] + ([] if path.startswith("/") else ["~/" + path]):
-            if command_guard.raw_sensitive(text):
-                return False, "the path names a credential, secret or protected location"
+            if command_guard.raw_credential(text):
+                return False, "the path names a credential location"
         for form in forms:
             verdict, message = command_guard.decide("cat -- " + form)
             if verdict == "block":
@@ -609,8 +611,8 @@ def cmd_wait_remote(args):
                 if until in buf:
                     print("LINE_FOUND host=%s file=%s" % (args.host, args.file))
                     return EXIT_OK
-                if len(data) >= READ_CAP:
-                    continue  # more is waiting: read on without sleeping
+                if len(data) >= READ_CAP and time.time() < end:
+                    continue  # more is waiting: read on without sleeping, but never past the deadline
             else:  # absent: not there yet; a file that appears later holds only new bytes
                 first = False
         if time.time() >= end:

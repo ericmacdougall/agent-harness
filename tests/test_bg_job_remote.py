@@ -104,7 +104,7 @@ class Matching(unittest.TestCase):
 
     def test_more_than_one_read_of_new_bytes_is_read_on_without_sleeping(self):
         big = b"a" * (bg_job.READ_CAP + 10) + b"ALL PASSED"
-        self.assertEqual(run(Remote(b"", big), poll=60)[0], 0)
+        self.assertEqual(run(Remote(b"", big), timeout=20)[0], 0)
 
     def test_a_fail_line_ends_the_wait_as_a_failure_and_wins_over_the_success_line(self):
         code, out, _a = run(Remote(b"", b"FAILED (errors=1)\nALL PASSED\n"), fail_line="FAILED (")
@@ -145,7 +145,7 @@ class Errors(unittest.TestCase):
     def test_text_at_byte_70000_and_in_the_middle_of_200_kib_is_found(self):
         for burst in (b"x" * 70000 + b"ALL PASSED", b"y" * 100000 + b"ALL PASSED" + b"z" * 100000):
             with self.subTest(len(burst)):
-                self.assertEqual(run(Remote(b"", burst), poll=60)[0], 0)
+                self.assertEqual(run(Remote(b"", burst), timeout=20)[0], 0)
 
     def test_the_offset_advances_by_bytes_received_not_by_the_reported_size(self):
         remote = Remote(b"", b"a" * 100000)
@@ -291,7 +291,7 @@ class Refusals(unittest.TestCase):
     def test_secret_and_protected_files_are_refused_before_ssh_by_command_guard(self):
         for name in (".config/goodqa/user-token", "/home/u/.config/gq-browser/key", ".ssh/id_ed25519",
                      "/home/eric/.ssh/id_ed25519", ".kube/config", "/home/u/.aws/credentials",
-                     "/home/u/.claude/projects/x/y.jsonl", ".claude/projects/x/y.jsonl"):
+                     ):
             with self.subTest(name):
                 remote = Remote(b"")
                 out = io.StringIO()
@@ -300,8 +300,27 @@ class Refusals(unittest.TestCase):
                 self.assertEqual((code, remote.calls), (64, []), name)
                 self.assertIn("command_guard", out.getvalue())
 
-    def test_an_ordinary_log_path_is_allowed_by_the_guard(self):
-        self.assertEqual(bg_job.file_judged_by_guard("/home/eric/logs/suite.log"), (True, ""))
+    def test_ordinary_logs_including_run_kit_and_claude_logs_are_allowed_by_the_guard(self):
+        # the tool's main use: job logs live under ~/.agent-harness/work and ~/.claude
+        for path in ("/home/eric/logs/suite.log", "/home/eric/.agent-harness/work/s1/suite.log",
+                     ".agent-harness/work/s1/suite.log", "/home/eric/.claude/hooks-test/out.log", "logs/suite.log"):
+            with self.subTest(path):
+                self.assertEqual(bg_job.file_judged_by_guard(path), (True, ""))
+
+    def test_a_wait_that_always_gets_a_full_read_is_still_bounded_by_the_timeout(self):
+        # H1: the read-on shortcut must not skip the deadline
+        class Endless:
+            calls = 0
+
+            def __call__(self, host, command):
+                Endless.calls += 1
+                return 0, b"%d\n" % (10 ** 9) + b"a" * bg_job.READ_CAP, ""
+
+        t0 = __import__("time").time()
+        code, out, _a = run(Endless(), timeout=1.0, include_existing=True)
+        self.assertEqual(code, 3)
+        self.assertIn("TIMEOUT", out)
+        self.assertLess(__import__("time").time() - t0, 5)
 
     def test_no_guard_means_no_wait(self):
         with mock.patch.dict(sys.modules, {"command_guard": None}):
