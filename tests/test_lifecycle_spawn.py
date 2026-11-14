@@ -148,6 +148,12 @@ class Verdicts(SpawnBase):
         self.denied(wf, "without a [goal:<id>] tag")
         wf["tool_input"]["args"]["note"] = f"[goal:{GID}]"
         self.allowed(wf)
+        # a tag inside a JS template literal of the script is the script's own text, not a quoted example
+        script = {"tool_name": "Workflow", "session_id": SID,
+                  "tool_input": {"script": "```js\nawait agent(`[goal:%s] build the parser`)\n```" % GID}}
+        self.allowed(script)
+        self.allowed({"tool_name": "Workflow", "session_id": SID,
+                      "tool_input": {"script": "const a = `x`;\nawait agent(`[goal:%s] go`)" % GID}})
         self.seed_old_goals(ids=())
         self.ok(["add", "--goal", "p1", "--title", "P"])
         self.denied({"tool_name": "Workflow", "session_id": SID, "tool_input": {"args": "[goal:p1]"}}, "is PENDING")

@@ -59,7 +59,7 @@ class Rehearsal(tl.LBase):
         """The temp home's main WAL for the copied mission session (the old `check` reads owners from it)."""
         folder = self.home / ".claude" / "wals" / session
         folder.mkdir(parents=True, exist_ok=True)
-        with open(folder / ("main" + ".jsonl"), "a") as handle:
+        with open(folder / "main.jsonl", "a") as handle:
             handle.write(json.dumps({"at": tmc.iso(tmc.NOW - 60), "event": "intent", "id": "w0000000000a",
                                      "note": "rehearsal"}) + "\n")
 

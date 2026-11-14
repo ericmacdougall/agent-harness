@@ -671,14 +671,16 @@ def lifecycle_gate(data, tool, command, policy, session_id, ladder_denies):
     if tool == 'Bash':
         if not BASH_DISPATCH.search(command) or REVIEW_MARK.search(command) or not _launches_agent(command):
             return out
-        out['mode'], texts = 'warn', [command]  # ASSUMPTION A3: Bash launches warn only in phase 1
+        out['mode'], texts, code = 'warn', [command], []  # ASSUMPTION A3: Bash launches warn only in phase 1
     elif tool in SPAWN_TOOLS:
         sub_type = str(tool_input.get('subagent_type') or '')
         if tool != 'Workflow' and not counts_as_owner(sub_type, policy):
             return out  # helpers are untouched
-        texts = [tool_input.get('prompt'), tool_input.get('description')]
+        texts, code = [tool_input.get('prompt'), tool_input.get('description')], []
         if tool == 'Workflow':
-            texts.append(json.dumps(tool_input, sort_keys=True)[:400000])
+            # a Workflow's input is code: a tag in a JS template literal counts (review: no false would-deny lines)
+            code = [json.dumps({k: v for k, v in tool_input.items() if k not in ('prompt', 'description')},
+                               sort_keys=True)[:400000]]
     else:
         return out
     try:
@@ -697,7 +699,7 @@ def lifecycle_gate(data, tool, command, policy, session_id, ladder_denies):
         audit = mc.verify_audit(home)
         if not audit['ok']:
             raise lcm.LifecycleError('mission ledger audit chain: %s' % audit['problem'])
-        tag, problem = lcm.goal_tags(texts)
+        tag, problem = lcm.goal_tags(texts, code)
         verdict, reason, context = lcm.spawn_verdict(tag, problem, {g['id']: g for g in loaded['goals']},
                                                      mc.read_audit_rows(home), True,
                                                      pending_build=policy.get('caps', {}).get('lifecycle_pending_build') is True)

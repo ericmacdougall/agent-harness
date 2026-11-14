@@ -484,12 +484,15 @@ SCOPING_CONTEXT = ("lifecycle: scoping owner for a PENDING goal: survey, draft t
 TAG_TEXT_MAX = 400_000
 
 
-def goal_tags(texts) -> tuple:
-    """((goal_id, scoping) or None, problem). Tags inside code spans or fences do not count (prompt text is
-    untrusted, NEG-7). A malformed tag (bad id or suffix) counts as no tag; two different tags conflict."""
+def goal_tags(texts, code_texts=()) -> tuple:
+    """((goal_id, scoping) or None, problem). In `texts` (prose: a prompt or description) tags inside code spans or
+    fences do not count (prompt text is untrusted, NEG-7). `code_texts` are code already (a Workflow's script and
+    args), where a JS template literal legitimately holds the tag, so they are read as they are. A malformed tag (bad
+    id or suffix) counts as no tag; two different tags conflict."""
     found, bad = set(), []
-    for text in texts:
-        body = FENCED_RE.sub(" ", str(text or "")[:TAG_TEXT_MAX])
+    bodies = [FENCED_RE.sub(" ", str(t or "")[:TAG_TEXT_MAX]) for t in texts]
+    bodies += [str(t or "")[:TAG_TEXT_MAX] for t in code_texts]
+    for body in bodies:
         for inner in GOAL_TAG_RE.findall(body):
             gid, _sep, suffix = inner.partition(":")
             if TAG_ID_RE.match(gid) and suffix in ("", "scoping"):

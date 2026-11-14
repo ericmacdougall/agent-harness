@@ -445,6 +445,16 @@ class Done(LBase):
         self.refused(["done", "--goal", GID, "--user-source", prefixed], "no question in that answer record carries")
         self.assertEqual(self.state(), "ready")
 
+    def test_real_order_ask_answer_then_propose_is_accepted(self):
+        # what happened live for pending-gates: ask registered 05:02, user answered 05:06, propose runs hours later
+        self.seed_old_goals(ids=())
+        self.ask(ASK1, f"Agree acceptance gates for {GID} (gates {P}) G1-G3", at=time.time() - 30)
+        src = self.agreed_answer()
+        time.sleep(1.1)
+        self.ok(["propose", "--goal", GID, "--gates-file", str(self.gates_file), "--ask", ASK1])
+        self.ok(["agree", "--goal", GID, "--user-source", src])
+        self.assertEqual(self.state(), "agreed")
+
     def test_agreement_time_is_the_users_words_so_an_earlier_deploy_counts(self):
         self.seed_old_goals(ids=())
         self.propose()
