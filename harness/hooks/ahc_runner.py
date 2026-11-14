@@ -299,13 +299,21 @@ def _migrate_v2(db):
 MIGRATIONS = {1: [], 2: [_migrate_v2]}
 
 
+SCHEMA_EXIT = 3
+
+
 class SchemaError(RuntimeError):
     """The ledger's schema is unknown or newer than this code; the daemon must not start."""
 
 
 class Ledger:
-    def __init__(self, paths):
+    """migrate=False (status, ack, the journal facade, the review role) refuses a ledger at an older schema instead
+    of migrating it: only ahc-core, holding its lock, migrates, so a failed migration can never move the database
+    aside under another process (advisor review of the unit split)."""
+
+    def __init__(self, paths, migrate=True):
         paths.ensure()
+        self.migrate = migrate
         self.paths = paths
         self.path = paths.root / "ledger.sqlite3"
         fresh = not self.path.exists()
@@ -347,6 +355,9 @@ class Ledger:
                               % (version, SCHEMA_VERSION))
         if version == SCHEMA_VERSION:
             return
+        if not self.migrate:
+            raise SchemaError("ledger schema_version %d is older than this ahc (%d); ahc-core migrates it at start, "
+                              "this process does not" % (version, SCHEMA_VERSION))
         copy = self.backup("pre-v%d" % SCHEMA_VERSION)
         try:
             with self.tx():
@@ -486,7 +497,7 @@ class Journal:
         self.path = paths.items / (iid + ".jsonl")
 
     def state(self):
-        ledger = Ledger(self.paths)
+        ledger = Ledger(self.paths, migrate=False)
         try:
             row = ledger.item(self.iid)
             return row["state"] if row else None
@@ -494,7 +505,7 @@ class Journal:
             ledger.close()
 
     def append(self, event, **data):
-        ledger = Ledger(self.paths)
+        ledger = Ledger(self.paths, migrate=False)
         try:
             if ledger.ensure_item(self.iid, load_config(self.paths)) is None:
                 raise KeyError("no such item: " + self.iid)
@@ -520,10 +531,26 @@ def _mirror(paths, iid, event, at, data):
         log.warning("journal mirror write failed for %s", iid)
 
 
-def acquire_lock(paths):
-    """Single instance: an exclusive non-blocking flock. Returns the open handle, or None when another holds it."""
+ROLES = ("core", "review", "all")
+LOCKED_OUT_EXIT = 75   # another instance holds this role's lock; the unit does not restart on it
+
+
+def acquire_lock(paths, role="all"):
+    """Single instance per role: an exclusive non-blocking flock on ahc-<role>.lock ("all" takes both, so a manual
+    all-in-one run never overlaps a unit). Returns an object to keep open, or None when another holds a lock."""
     paths.ensure()
-    handle = os.fdopen(_open_private(paths.root / "ahc.lock", os.O_WRONLY | os.O_CREAT | os.O_APPEND), "a")
+    if role == "all":
+        held = []
+        for one in ("core", "review"):
+            handle = acquire_lock(paths, one)
+            if handle is None:
+                for other in held:
+                    other.close()
+                return None
+            held.append(handle)
+        return held
+    handle = os.fdopen(_open_private(paths.root / ("ahc-%s.lock" % role), os.O_WRONLY | os.O_CREAT | os.O_APPEND),
+                       "a")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -1250,57 +1277,88 @@ def supersede(worker):
             worker.settle(row["id"], token, "superseded", event="superseded", by=live["id"])
 
 
-def tick(paths, config, deps):
-    """One reconcile pass. Returns a summary dict. Raises nothing for item-level failures."""
-    ledger = Ledger(paths)
+REVIEW_STATES = ("queued", "deferred")   # the review role's states; core never leases them or `reviewing`
+
+
+def tick(paths, config, deps, role="all"):
+    """One reconcile pass for one role. Returns a summary dict. Raises nothing for item-level failures.
+
+    The two units split the ledger by item state, so they never lease the same item:
+      core    ingest, email-route readiness, the routed-to-main recheck, no-ack and D20 escalation, effect dispatch,
+              invariant checks; it alone migrates the ledger;
+      review  recovery of `reviewing` items (any found at its start is an orphan: it holds the review lock), the
+              supersede pass, and one prepare-and-review of a due queued or deferred item;
+    "all" (tests, a manual run) does both in that order. Each role beats its own heartbeat service."""
+    if role not in ROLES:
+        raise ValueError("unknown role %r" % role)
+    core_role, review_role = role in ("core", "all"), role in ("review", "all")
+    ledger = Ledger(paths, migrate=core_role)
     worker = Worker(paths, config, deps, ledger)
-    summary = {"processed": [], "recovered": [], "defects": [], "rejected": []}
+    summary = {"role": role, "processed": [], "recovered": [], "defects": [], "rejected": []}
     try:
-        summary["email_route"] = "ready" if worker.email_route() else "unavailable"
-        summary["rejected"] = ingest(ledger, paths, config, worker.now())
-        for name, reason in summary["rejected"]:
-            message = "ahc rejected queue file %s: %s (moved to coordinator/rejected/)" % (name, reason)
-            try:
-                rc, _out, _err = deps.ah(["ah", "alert", "raise", "--severity", "high", "--alert-key",
-                                          "ahc:rejected:" + name, "--source", "ahc", "--key", "ahc-rejected-" + name,
-                                          "--message", redact.redact(message)[:500]], 60)
-                if rc != 0:
-                    log.warning("rejection alert for %s exited %s; the reason file in rejected/ remains", name, rc)
-            except Exception:  # noqa: BLE001 - the file is already quarantined with its reason; the alert is best effort
-                log.warning("rejection alert failed for %s; the reason file in rejected/ remains", name)
-        for row in ledger.db.execute("SELECT * FROM items WHERE state='reviewing'").fetchall():
-            summary["recovered"].append((row["id"], worker.recover(row)))
-        supersede(worker)
-        now = worker.now()
-        due = ledger.db.execute("SELECT * FROM items WHERE state IN ('queued', 'deferred', 'routed-to-main') "
-                                "AND next_action_at <= ? ORDER BY next_action_at, submitted, id", (now,)).fetchall()
-        reviewed = False
-        for row in due:
-            if row["state"] != "routed-to-main" and reviewed:
-                continue  # one review per tick on this host (D7)
-            current = ledger.item(row["id"])
-            if current["state"] != row["state"]:
-                continue
-            outcome = worker.process(current)
-            summary["processed"].append((row["id"], outcome))
-            if row["state"] != "routed-to-main" and ledger.db.execute(
-                    "SELECT 1 FROM effects WHERE item=? AND kind='review'", (row["id"],)).fetchone():
-                reviewed = True
-        worker.escalate()
-        worker.escalate_overdue()
-        worker.dispatch_effects()
-        missing = ledger.db.execute("SELECT id FROM items WHERE state IN ('queued','deferred','reviewing',"
-                                    "'routed-to-main') AND next_action_at IS NULL").fetchall()
-        summary["defects"] = ["I2: %s has no next_action_at" % row["id"] for row in missing]
+        if core_role:
+            _core_intake(worker, ledger, paths, config, deps, summary)
+        if review_role:
+            _review_pass(worker, ledger, summary)
+        if core_role:
+            _core_outbound(worker, ledger, summary)
     except _Stop:
         summary["stopped"] = True
     finally:
         ledger.close()
+    service = {"core": "ahc-core", "review": "ahc-review", "all": "ahc"}[role]
     try:
-        deps.ah(["ah", "heartbeat", "beat", "--service", "ahc"], 30)
+        deps.ah(["ah", "heartbeat", "beat", "--service", service], 30)
     except Exception:  # noqa: BLE001 - a heartbeat failure is visible to the observer as a stale beat
         log.warning("heartbeat failed")
     return summary
+
+
+def _core_intake(worker, ledger, paths, config, deps, summary):
+    summary["email_route"] = "ready" if worker.email_route() else "unavailable"
+    summary["rejected"] = ingest(ledger, paths, config, worker.now())
+    for name, reason in summary["rejected"]:
+        message = "ahc rejected queue file %s: %s (moved to coordinator/rejected/)" % (name, reason)
+        try:
+            rc, _out, _err = deps.ah(["ah", "alert", "raise", "--severity", "high", "--alert-key",
+                                      "ahc:rejected:" + name, "--source", "ahc", "--key", "ahc-rejected-" + name,
+                                      "--message", redact.redact(message)[:500]], 60)
+            if rc != 0:
+                log.warning("rejection alert for %s exited %s; the reason file in rejected/ remains", name, rc)
+        except Exception:  # noqa: BLE001 - the file is already quarantined with its reason; the alert is best effort
+            log.warning("rejection alert failed for %s; the reason file in rejected/ remains", name)
+    now = worker.now()
+    for row in ledger.db.execute("SELECT * FROM items WHERE state='routed-to-main' AND next_action_at <= ? "
+                                 "ORDER BY next_action_at, submitted, id", (now,)).fetchall():
+        current = ledger.item(row["id"])
+        if current["state"] == row["state"]:
+            summary["processed"].append((row["id"], worker.process(current)))
+
+
+def _review_pass(worker, ledger, summary):
+    for row in ledger.db.execute("SELECT * FROM items WHERE state='reviewing'").fetchall():
+        summary["recovered"].append((row["id"], worker.recover(row)))
+    supersede(worker)
+    now = worker.now()
+    marks = ",".join("?" * len(REVIEW_STATES))
+    due = ledger.db.execute("SELECT * FROM items WHERE state IN (%s) AND next_action_at <= ? ORDER BY next_action_at,"
+                            " submitted, id" % marks, list(REVIEW_STATES) + [now]).fetchall()
+    for row in due:
+        current = ledger.item(row["id"])
+        if current["state"] != row["state"]:
+            continue
+        summary["processed"].append((row["id"], worker.process(current)))
+        if ledger.db.execute("SELECT 1 FROM effects WHERE item=? AND kind='review'", (row["id"],)).fetchone():
+            break  # one review per tick on this host (D7)
+
+
+def _core_outbound(worker, ledger, summary):
+    worker.escalate()
+    worker.escalate_overdue()
+    worker.dispatch_effects()
+    missing = ledger.db.execute("SELECT id FROM items WHERE state IN (%s) AND next_action_at IS NULL"
+                                % ",".join("?" * len(NON_TERMINAL)), sorted(NON_TERMINAL)).fetchall()
+    summary["defects"] = ["I2: %s has no next_action_at" % row["id"] for row in missing]
 
 
 MAIN_ACTOR = "main"
@@ -1317,7 +1375,7 @@ def ack(paths, iid, owner, now=None, disposition=None, main_proven=False, config
     claiming to be main is refused and escalation continues. The disposition is an event with actor and reason, a
     ticket comment, and clears the item's critical alerts."""
     now = now if now is not None else time.time()
-    ledger = Ledger(paths)
+    ledger = Ledger(paths, migrate=False)
     try:
         row = ledger.item(iid)
         if row is None:
@@ -1676,7 +1734,7 @@ def submit_with_lint(paths, config, req):
     """`ahc submit`: validate, lint synchronously (AC-25) and enqueue. Rejects with the lint tool's exact text."""
     norm = core.validate(config, req)
     capacity = int(bounds(config)["queue_capacity"])
-    ledger = Ledger(paths)
+    ledger = Ledger(paths, migrate=False)
     try:
         ingest(ledger, paths, config)
         raw = core.read_regular(norm["packet"], core.PACKET_MAX_BYTES)
@@ -1723,7 +1781,8 @@ def build_parser():
     a.add_argument("--disposition", help="reason text: stop D20 escalation for this item (owner or verified main, "
                                          "per the state's rule)")
     sub.add_parser("status", help="item states and pending effects")
-    r = sub.add_parser("run", help="run ticks (the daemon loop under launchd)")
+    r = sub.add_parser("run", help="run ticks (the daemon loop; one systemd user unit per role)")
+    r.add_argument("--role", choices=ROLES, default="all")
     r.add_argument("--once", action="store_true")
     r.add_argument("--interval", type=int, default=60)
     return parser
@@ -1768,7 +1827,7 @@ def main(argv=None):
             return 2
         return 0
     if args.cmd == "status":
-        ledger = Ledger(paths)
+        ledger = Ledger(paths, migrate=False)
         try:
             for row in ledger.db.execute("SELECT id, state, next_action_at, request FROM items ORDER BY submitted"):
                 req = json.loads(row["request"])
@@ -1789,21 +1848,21 @@ def main(argv=None):
         finally:
             ledger.close()
         return 0
-    lock = acquire_lock(paths)
+    lock = acquire_lock(paths, args.role)
     if lock is None:
-        print("ahc: another instance holds the lock; exiting")
-        return 0
+        print("ahc: another instance holds the %s lock; exiting" % args.role, file=sys.stderr)
+        return LOCKED_OUT_EXIT
     _setup_logging(paths)
     deps = LiveDeps(paths, config)
     while True:
         try:
-            summary = tick(paths, config, deps)
+            summary = tick(paths, config, deps, role=args.role)
         except SchemaError as error:
             log.error("schema refusal: %s", error)
             print("ahc: %s" % error, file=sys.stderr)
             deps.ah(["ah", "alert", "raise", "--alert-key", "ahc-schema", "--source", "ahc", "--severity", "high",
                      "--message", "ahc refused to start: " + _short(error)], 60)
-            return 3
+            return SCHEMA_EXIT  # the unit does not restart on it (RestartPreventExitStatus), so no backup loop
         log.info("tick %s", json.dumps(summary, default=str))
         if args.once:
             print(json.dumps(summary, default=str))

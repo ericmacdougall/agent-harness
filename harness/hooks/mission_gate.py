@@ -126,10 +126,13 @@ def ahc_dispose_stamps(cmd: str) -> list:
     """[stamp parts] for each `ahc_runner.py ack ... --disposition ...` this Bash line runs at command position
     (goodqa#16034 D20: main's disposition of a main-only obligation must be proven). Same parsing rules as
     stamps_for: a word only the shell can compute gets no stamp."""
-    import ahc_core  # noqa: PLC0415
+    try:
+        import ahc_core  # noqa: PLC0415
+    except ImportError:
+        return []  # ahc not installed on this host: nothing to stamp, never a hook failure
     out = []
     for words in simple_commands(cmd):
-        argv = mission_argv(words, "ahc_runner.py")
+        argv = mission_argv(words, "ahc_runner.py") or mission_argv(words, "ahc")
         if not argv or any(getattr(w, "computed", False) for w in argv):
             continue
         argv = [os.path.expanduser(w) if getattr(w, "tilde", False) and (w == "~" or w.startswith("~/")) else str(w)
@@ -169,7 +172,7 @@ def cmd_pretool(payload: dict) -> dict:
         return {}
     tool_input = payload.get("tool_input")
     cmd = str((tool_input if isinstance(tool_input, dict) else {}).get("command") or "")
-    if "mission_coverage" not in cmd and "ahc_runner" not in cmd:
+    if "mission_coverage" not in cmd and "ahc" not in cmd:
         return {}
     import caller_identity  # noqa: PLC0415
     if not caller_identity.is_main(payload):
@@ -181,8 +184,11 @@ def cmd_pretool(payload: dict) -> dict:
     for sub, key in (stamps_for(cmd)[:10] if "mission_coverage" in cmd else []):
         caller_identity.put_stamp(STAMP_PURPOSE, [sub, key], session=session, home=home_dir(),
                                   tool_use_id=tool_use_id, transcript=str(payload.get("transcript_path") or ""))
-    if "ahc_runner" in cmd:
-        import ahc_core  # noqa: PLC0415
+    if "ahc" in cmd:
+        try:
+            import ahc_core  # noqa: PLC0415
+        except ImportError:
+            return {}
         for parts in ahc_dispose_stamps(cmd)[:10]:
             caller_identity.put_stamp(ahc_core.DISPOSE_STAMP, parts, session=session, home=home_dir(),
                                       tool_use_id=tool_use_id, transcript=str(payload.get("transcript_path") or ""))

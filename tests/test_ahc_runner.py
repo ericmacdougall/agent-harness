@@ -247,10 +247,77 @@ class RecoveryTests(Base):
         self.assertEqual(self.state(iid), "routed-to-main")
 
     def test_second_instance_exits_cleanly(self):
-        first = runner.acquire_lock(self.paths)
+        first = runner.acquire_lock(self.paths, "core")
         self.assertIsNotNone(first)
-        self.assertIsNone(runner.acquire_lock(self.paths))
+        self.assertIsNone(runner.acquire_lock(self.paths, "core"))
+        self.assertIsNone(runner.acquire_lock(self.paths, "all"), "an all-in-one run never overlaps a unit")
+        review = runner.acquire_lock(self.paths, "review")
+        self.assertIsNotNone(review, "the two roles lock independently")
         first.close()
+        review.close()
+
+    # --- the ahc-core / ahc-review split (advisor review; NEG-39)
+    def test_core_tick_never_touches_a_live_review(self):
+        iid, deps = self.submit(), Deps()
+        runner.tick(self.paths, self.config, deps, role="core")   # core ingests; it never reviews
+        self.assertEqual(deps.review_calls, [])
+        runner.STOP_AFTER = "reviewing"   # the review unit is mid-review: state reviewing, effect intent
+        try:
+            runner.tick(self.paths, self.config, deps, role="review")
+        finally:
+            runner.STOP_AFTER = None
+        ledger = runner.Ledger(self.paths)
+        try:
+            before = dict(ledger.item(iid))
+            ledger.db.execute("UPDATE effects SET status='intent' WHERE kind='review'")
+        finally:
+            ledger.close()
+        for _ in range(3):
+            runner.tick(self.paths, self.config, deps, role="core")
+            deps.now += 600
+        ledger = runner.Ledger(self.paths)
+        try:
+            after = dict(ledger.item(iid))
+        finally:
+            ledger.close()
+        self.assertEqual((after["state"], after["lease_token"]), (before["state"], before["lease_token"]),
+                         "core must neither recover nor lease an item the review unit holds")
+
+    def test_neg39_stale_worker_is_fenced_after_reclaim(self):
+        iid, _deps = self.submit(), Deps()
+        ledger = runner.Ledger(self.paths)
+        try:
+            ledger.ensure_item(iid, self.config, _deps.now)
+            stale = runner.Worker(self.paths, self.config, _deps, ledger)
+            old = stale.lease(iid)
+            stale.lease(iid)   # a reclaim mints a new fencing token
+            with self.assertRaises(runner.Fenced):
+                stale.settle(iid, old, "blocked", event="late-result")
+            self.assertEqual(ledger.item(iid)["state"], "queued", "the stale worker changed nothing")
+        finally:
+            ledger.close()
+
+    def test_roles_beat_their_own_heartbeat(self):
+        deps = Deps()
+        for role in ("core", "review"):
+            runner.tick(self.paths, self.config, deps, role=role)
+        services = [a[a.index("--service") + 1] for a in deps.ah_calls if a[:3] == ["ah", "heartbeat", "beat"]]
+        self.assertEqual(services, ["ahc-core", "ahc-review"])
+
+    def test_only_core_migrates(self):
+        import sqlite3
+        runner.Ledger(self.paths).close()
+        db = sqlite3.connect(str(self.paths.root / "ledger.sqlite3"))
+        db.execute("UPDATE meta SET v='1' WHERE k='schema_version'")
+        db.commit()
+        db.close()
+        with self.assertRaises(runner.SchemaError):
+            runner.tick(self.paths, self.config, Deps(), role="review")
+        with self.assertRaises(runner.SchemaError):
+            runner.Ledger(self.paths, migrate=False)
+        self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.pre-v*.bak")), "a non-core opener made no backup")
+        runner.tick(self.paths, self.config, Deps(), role="core")
+        self.assertEqual(len(list(self.paths.root.glob("ledger.sqlite3.pre-v*.bak"))), 1)
 
 
 class ErrDeps(Deps):
@@ -828,10 +895,10 @@ class UntrustedReadTests(Base):
         self.run_all(deps)
         self.assertEqual(self.state(iid), "blocked")
         self.assertTrue([a for a in deps.ah_calls if a[:3] == ["ah", "heartbeat", "beat"]])
-        lock = self.paths.root / "ahc.lock"
+        lock = self.paths.root / "ahc-core.lock"
         os.mkfifo(lock)
         with self.assertRaises(OSError):
-            runner.acquire_lock(self.paths)
+            runner.acquire_lock(self.paths, "core")
 
     def test_digest_readback_reads_only_a_bounded_tail(self):
         self.paths.ensure()
@@ -1242,6 +1309,10 @@ class MainStampTests(Base):
         self.assertEqual(mission_gate.ahc_dispose_stamps("echo ahc_runner.py ack ahc-x --disposition x"), [])
         self.assertEqual(mission_gate.ahc_dispose_stamps("python3 ahc_runner.py ack ahc-x --owner o"), [])
         self.assertEqual(mission_gate.ahc_dispose_stamps('python3 ahc_runner.py ack "$ID" --disposition x'), [])
+        self.assertEqual(mission_gate.ahc_dispose_stamps("ahc ack ahc-x --owner main --disposition 'held for release'"),
+                         [core.dispose_stamp_parts(self.ARGV)], "the installed `ahc` wrapper is stamped too")
+        self.assertEqual(mission_gate.ahc_dispose_stamps("ssh t2-dev ahc ack ahc-x --disposition x"), [],
+                         "a command run on another host is never stamped here")
 
 
 class EmailRouteTests(Base):
