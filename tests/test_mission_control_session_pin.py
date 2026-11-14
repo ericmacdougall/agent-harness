@@ -224,5 +224,11 @@ class Wiring(unittest.TestCase):
         self.assertEqual((status, body["error"]), (409, "session_changed"))
         self.assertEqual(app.actions.all(), [])
 
+    def test_unpinning_clears_the_previous_sessions_asks(self):  # review N-1
+        app, _ = self.app({"state": "error"})
+        app.asks.session, app.asks.items = MAIN, [{"id": "wabc", "text": "old ask"}]
+        self.assertEqual(app.asks.tick(time.time()), "off")
+        self.assertEqual((app.asks.items, app.asks.session), ([], ""))
+
 if __name__ == "__main__":
     unittest.main()

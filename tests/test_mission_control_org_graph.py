@@ -502,15 +502,41 @@ class RestrictedProducerShape(unittest.TestCase):
         self.assertNotIn("SECRET", json.dumps(snap))
         self.assertNotIn("goodqa#777", json.dumps(snap))
 
-    def test_status_view_hides_restricted_owners_notes(self):
+    def _owners_then_status(self, owner_rows, entries, read=True):
+        hub = Hub()
+        hub.publish = lambda *a, **k: None
+        owners = col.Owners(hub, self.Health(), runner=None, tailer=None)
+        if read:
+            owners._rows({"session": "s", "owners": owner_rows}, 1.0)
         ledger = col.Ledger(Hub(), self.Health(), runner=None, session_fn=lambda: "s",
-                            restricted_fn=lambda: ["a1234567890abcdef"])
-        out = ledger._status({"verified": [
-            {"id": "w1", "agent": "a1234567890abcdef", "at": "2026-11-13T01:00:00Z", "event": "result", "note": "candidate notes"},
-            {"id": "w2", "agent": "a2", "at": "2026-11-13T01:00:01Z", "event": "result", "note": "mock Interview prep"},
-            {"id": "w3", "agent": "a3", "at": "2026-11-13T01:00:02Z", "event": "result", "note": "org graph shipped"}]}, 0)
-        notes = {r["id"]: r["note"] for r in out["verified"]}
-        self.assertEqual(notes, {"w1": "restricted", "w2": "restricted", "w3": "org graph shipped"})
+                            visible_fn=lambda: owners.unrestricted[1] if owners.unrestricted[0] == "s" else None)
+        return {r["id"]: r["note"] for r in ledger._status({"verified": entries}, 0)["verified"]}
+
+    ROWS = [{"agent_id": "a1234567890abcdef", "type": "task-owner", "task": None, "restricted": True, "owner": True,
+             "state": "done", "severity": "info", "idle_s": 7 * 3600, "ticket": "goodqa#777", "last_activity": ""},
+            {"agent_id": "a3", "type": "fixer", "task": "org graph", "restricted": False, "state": "done",
+             "severity": "info", "idle_s": 7 * 3600, "ticket": "", "last_activity": ""}]
+    ENTRIES = [
+        {"id": "w1", "agent": "a1234567890abcdef", "at": "2026-11-13T01:00:00Z", "event": "result",
+         "note": "candidate Jane scored 7/10"},
+        {"id": "w2", "agent": "a3", "at": "2026-11-13T01:00:01Z", "event": "result", "note": "mock Interview prep"},
+        {"id": "w3", "agent": "a3", "at": "2026-11-13T01:00:02Z", "event": "result", "note": "org graph shipped"},
+        {"id": "w4", "agent": "a9", "at": "2026-11-13T01:00:03Z", "event": "result", "note": "unknown agent note"},
+        {"id": "w5", "agent": "main", "at": "2026-11-13T01:00:04Z", "event": "status", "note": "merged PR 245"}]
+
+    def test_status_view_hides_restricted_and_unknown_agents_notes(self):  # review A-2 and A-2b (7 h, filtered out)
+        notes = self._owners_then_status(self.ROWS, self.ENTRIES)
+        self.assertNotIn("Jane", json.dumps(notes))
+        self.assertEqual(notes["w2"], "restricted")
+        self.assertEqual(notes["w3"], "org graph shipped")   # known unrestricted, even though done 7 h ago
+        self.assertTrue(notes["w4"].startswith("note hidden"))
+        self.assertEqual(notes["w5"], "merged PR 245")
+
+    def test_before_the_first_owner_read_only_main_notes_show(self):  # review A-2b
+        notes = self._owners_then_status(self.ROWS, self.ENTRIES, read=False)
+        self.assertEqual(notes["w5"], "merged PR 245")
+        self.assertTrue(all(notes[k].startswith(("note hidden", "restricted")) for k in ("w1", "w2", "w3", "w4")))
+
 
 if __name__ == "__main__":
     unittest.main()

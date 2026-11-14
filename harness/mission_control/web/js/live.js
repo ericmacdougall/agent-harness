@@ -74,7 +74,9 @@ function connect() {
     // moved). Reload the whole state once, so the header, the lists and the session every write names agree.
     if (shownSession && typeof data.session === 'string' && data.session && data.session !== shownSession) {
       shownSession = null;   // writes are refused (409) until the reload names the new session
-      loadState().catch(() => setConnection('offline'));
+      // review N-2: a failed reload is retried (one timer at a time), so writes do not stay refused until a reconnect
+      const reload = () => loadState().catch(() => { setConnection('offline'); clearTimeout(resyncTimer); resyncTimer = setTimeout(reload, 5000); });
+      reload();
     }
   });
   source.addEventListener('orggraph', message => { const data = parse(message); if (data) setOrgGraph(data); });

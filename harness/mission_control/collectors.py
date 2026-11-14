@@ -714,6 +714,9 @@ class Owners(Collector):
         self.native_projects = {}
         self.native_observation = {}
         self.pin_fn = None   # the server's pinned display session (goodqa#15961)
+        # review A-2b: agents the last full `ah owners` read showed as NOT restricted, for (session, ids); taken before
+        # the 6 h and 60-row cuts. The Status view shows notes only from main and these agents.
+        self.unrestricted: tuple = ("", frozenset())
 
     def publish(self):
         managed = []
@@ -798,6 +801,7 @@ class Owners(Collector):
         if not pinned:
             # goodqa#15961: never guess a session; an explicit "unpinned" state, never a silent 0 from another one
             self.session, self.claude_rows = "", []
+            self.unrestricted = ("", frozenset())
             self.next_at = min(self.next_at, now + 5)   # the ledger read pins it seconds after start
             self.publish()
             raise RuntimeError("unpinned: no Claude session is pinned yet (waiting for the mission ledger)")
@@ -814,6 +818,9 @@ class Owners(Collector):
 
     def _rows(self, data: dict, now: float):
         rows = []
+        self.unrestricted = (str(data.get("session") or ""), frozenset(
+            str(r.get("agent_id")) for r in data.get("owners") or []
+            if isinstance(r, dict) and r.get("restricted") is False and isinstance(r.get("agent_id"), str)))
         for row in data.get("owners") or []:
             if not isinstance(row, dict):
                 continue
@@ -995,15 +1002,15 @@ class Asks(Collector):
 
     def tick(self, now: float):
         session = self.session_fn() or ""
-        if not session:
-            self.next_at = now + 10  # the owners collector learns main's session shortly after start
-            self.health.off(self.name, "no main session known yet")
-            return "off"
         if self.session and session != self.session:
             # the pin moved: never keep showing the previous session's asks while the new read runs or fails (A-1)
             with self.lock:
                 self.publish({"items": [], "stale": [], "flagged": [], "cleared": [], "resolved": [], "swept_at": ""},
                              session)
+        if not session:   # unpinned: nothing is shown (review N-1: the clear above runs first)
+            self.next_at = now + 10  # the owners collector learns main's session shortly after start
+            self.health.off(self.name, "no main session known yet")
+            return "off"
         self.refresh(session, now)
         return f"{len(self.items)} open, {len(self.stale)} stale, {len(self.flagged)} flagged"
 
@@ -1172,10 +1179,12 @@ class Ledger(Collector):
     STATUS_LISTS = ("verified", "live", "pending", "failed", "claimed", "blockers", "commits", "asks_open",
                     "decisions", "assumptions", "live_legacy")
 
-    def __init__(self, hub, health, runner, session_fn, root=None, actions=None, restricted_fn=None):
+    def __init__(self, hub, health, runner, session_fn, root=None, actions=None, visible_fn=None):
         super().__init__(hub, health)
         self.runner, self.session_fn, self.root = runner, session_fn, root
-        self.restricted_fn = restricted_fn  # agent ids `ah owners` flagged restricted (their notes are hidden)
+        # review A-2b: agent ids whose notes may be shown (known NOT restricted), or None when unknown. Fail closed:
+        # an agent that is restricted, filtered out of the owner read, or not read yet shows no note text.
+        self.visible_fn = visible_fn
         self.actions = actions  # req_actions.ReqActions: the user's archive and restore clicks
         self.raw_requirements: list[dict] = []
         self.raw_total, self.raw_truncated = 0, False
@@ -1342,12 +1351,15 @@ class Ledger(Collector):
                 "summary": archive.summary(classified)}
 
     def _status(self, data: dict, now: float) -> dict:
-        hidden = set(self.restricted_fn() or ()) if self.restricted_fn else set()
+        visible = self.visible_fn() if self.visible_fn else None
+        visible = visible if visible is not None else frozenset()
 
         def entry(raw):
             agent, note = ev.short(raw.get("agent"), 40), ev.short(raw.get("note"), 400)
-            if agent in hidden or RESTRICTED_TEXT.search(note):
-                note = "restricted"   # review A-2: a restricted owner's notes never reach the Status view
+            if RESTRICTED_TEXT.search(note):
+                note = "restricted"   # review A-2: restricted work never reaches the Status view
+            elif agent != "main" and agent not in visible:
+                note = "note hidden: this agent is not in the current owner read (restricted or older than 6 h)"
             return {"id": ev.short(raw.get("id"), 40), "agent": agent, "at": ev.short(raw.get("at"), 40),
                     "event": ev.short(raw.get("event"), 20), "note": note,
                     "check": ev.short(raw.get("check"), 80), "verdict": ev.short(raw.get("verdict"), 12)}

@@ -365,7 +365,7 @@ class App:
         self.actions = req_actions.ReqActions(root, self.key)
         self.ledger = col.Ledger(self.hub, self.health, self.runner, lambda: self.pin()["display"], root=root,
                                  actions=self.actions,
-                                 restricted_fn=lambda: [r["agent_id"] for r in self.owners.rows if r.get("restricted")])
+                                 visible_fn=self._status_visible)
         # The Topology tab's org graph: live owners, their transcripts' model/effort fields and their tickets.
         # Demo mode reads only its fixture transcripts and no escalation state (never the real ~/.claude).
         self.org = org_graph.OrgGraph(
@@ -406,6 +406,12 @@ class App:
             detail = f"{pin['display'][:8] or 'none'}: {pin['reason']}" + (f"; {pin['warnings'][0]}" if pin["warnings"] else "")
             (self.health.ok if pin["write"] and not pin["warnings"] else self.health.error)("session-pin", detail)
         return pin
+
+    def _status_visible(self):
+        """Agents whose WAL notes the Status view may show: the pinned session's last owner read, NOT restricted
+        rows only (review A-2b). None when that read is missing or for another session: only main's notes show."""
+        session, ids = self.owners.unrestricted
+        return ids if session and session == self.pin()["display"] else None
 
     def _open_asks(self) -> tuple:
         """The user node's inbox: open asks (the "Needs you" count) and the stale ones listed below them;
