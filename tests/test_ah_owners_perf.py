@@ -176,6 +176,13 @@ class Counts(Base):
         cache.write_text("[" * 20000 + "]" * 20000)   # review B-5: RecursionError is not a ValueError
         self.assertEqual(strip(ah.owners(self.home, SESSION, now=NOW)), good)
 
+    def test_a_deeply_nested_meta_file_is_skipped(self):  # delta review follow-up (discover_agents meta read)
+        aid = "a" + f"{5:016x}"
+        meta = self.home / ".claude" / "projects" / "-p0" / SESSION / "subagents" / f"agent-{aid}.meta.json"
+        meta.write_text("[" * 20000 + "]" * 20000)
+        rows = {r["agent_id"]: r for r in ah.owners(self.home, SESSION, now=NOW)["owners"]}
+        self.assertIn(aid, rows)
+
     def test_a_deeply_nested_wal_line_is_skipped(self):  # review B-5 (the same parser, per WAL line)
         good = strip(ah.owners(self.home, SESSION, now=NOW))
         aid = "a" + f"{3:016x}"

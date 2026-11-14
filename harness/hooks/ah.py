@@ -447,7 +447,7 @@ def discover_agents(home: Path, session: str, wal: Path, cache: dict | None = No
                                             cache["meta"][e.path] = {"fp": _fingerprint(st), "m": fields}
                                             cache["dirty"] = True
                                     info.update(fields)
-                            except (OSError, ValueError):
+                            except (OSError, ValueError, RecursionError):
                                 pass
                 except OSError:
                     continue
