@@ -38,6 +38,7 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'spec_flow.py', 'spec_policy.json', 'spec_template.md', 'provenance.py', 'provenance_policy.json',
                     'provenance_hooks.py', 'safe_input.py', 'caller_identity.py', 'domain_gates.py', 'domain_checklists.json',
                     'native_context.py', 'native_user_source.py', 'native_admission.py', 'native_main.py',
+                    'idle_guard.py',  # ops_watch's default idle_guard check imports it (goodqa#15943)
                     'wal_note.py',  # ah task/ticket writes and doctor import this helper.
                     'commit_policy.local.json.example', 'spec_policy.local.json.example',
                     'model_tiers.py', 'model_tiers.json', 'escalation.py', 'tier_gate.py',
