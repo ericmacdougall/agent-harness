@@ -79,3 +79,38 @@ The item's `ahc:<item>:*` criticals are cleared when:
 - a disposition is recorded;
 - a stop condition fires;
 - an owner ack leaves no live D20 obligation. An owner ack on a routed-to-main item clears nothing.
+
+## Email route (D19)
+
+The daemon never sends mail and holds no mail credentials. ops-watch mails only critical raises, through its
+`sinks.deadman` command.
+
+### Readiness
+
+At the start of every tick the daemon asks ops-watch:
+
+- `ops_watch.py capabilities` must list `forward-foreign-critical` and `deadman-delivered`;
+- `ops_watch.py config` must have a non-empty `sinks.deadman`. Only its emptiness is checked; that output holds the
+  mail argv and is never logged.
+
+The ops-watch path comes from config key `ops_watch` (default `~/.claude/hooks/ops_watch.py`).
+
+If either check fails, the route is `email route: unavailable` (`ahc_runner.py status` shows it with the reason):
+
+- One outage episode raises one high alert `ahc:email-route:<episode>` and posts one comment on the ticket in
+  config key `ops_ticket`. With no `ops_ticket`, only the alert is raised and a log line says so.
+- While unavailable, an escalation's ticket comment says it was NOT handed to the mail command.
+- When the route is ready again, the episode alert is cleared.
+
+### Receipt
+
+Each escalation that can be mailed gets a `mail` effect.
+
+- It is done only when `ops_watch.py delivered --key ahc:<item>:<n> --json` returns a time at or after the raise.
+  The raise time is recorded before the `ah alert raise` call. Done is reported as "handed to mail command", never
+  "emailed". Mailbox arrival is separate live evidence.
+- A failed, timed-out, malformed or mismatched answer counts as not delivered.
+- With no receipt 30 minutes after the raise, the escalation fires `email-undelivered` once: a ticket comment and a
+  high alert `ahc:email-undelivered:<item>:<n>`.
+- That alert is cleared if the receipt arrives later. Checks stop after 7 days.
+- Delivery is at-least-once. An ops-watch crash after the send but before its state save re-sends the mail once.

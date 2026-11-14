@@ -55,6 +55,18 @@ class Deps:
         self.ah_calls.append(argv)
         return 0, "{}", ""
 
+    # D19: a ready email route whose mail command hands every critical over at once (EmailRouteTests use the real
+    # ops-watch instead)
+    ops_caps = "emit\nforward-foreign-critical\ndeadman-delivered\n"
+    ops_config = {"sinks": {"deadman": [["fake-mail", "{SUBJECT}"]]}}
+
+    def ops_watch(self, argv, timeout):
+        if argv[0] == "capabilities":
+            return 0, self.ops_caps, ""
+        if argv[0] == "config":
+            return 0, json.dumps(self.ops_config), ""
+        return 0, json.dumps({"key": argv[argv.index("--key") + 1], "delivered_at": self.now}), ""
+
     def clock(self):
         return self.now
 
@@ -1197,6 +1209,283 @@ class MainStampTests(Base):
         self.assertEqual(mission_gate.ahc_dispose_stamps("echo ahc_runner.py ack ahc-x --disposition x"), [])
         self.assertEqual(mission_gate.ahc_dispose_stamps("python3 ahc_runner.py ack ahc-x --owner o"), [])
         self.assertEqual(mission_gate.ahc_dispose_stamps('python3 ahc_runner.py ack "$ID" --disposition x'), [])
+
+
+class EmailRouteTests(Base):
+    """D19 / AC-19: the daemon's critical escalations reach the mail command only through the REAL ops-watch
+    forward_foreign, queue_events and deadman drain, in a temporary home with a fake deadman command. The daemon
+    marks an escalation "handed to mail command" only on a `delivered` receipt at or after its raise."""
+
+    HOST = "testhost"
+
+    def setUp(self):
+        super().setUp()
+        import ops_watch as ow
+        self.ow = ow
+        self.ops_home = self.home / "opshome"
+        self.ops_home.mkdir()
+        self.cfg = ow.load_config(self.ops_home, host=self.HOST, overrides={})
+        self.cfg["processes"] = dict(self.cfg["processes"], meminfo=str(self.ops_home / "no-meminfo"))
+        self.cfg["liveness"] = dict(self.cfg["liveness"], wal_root=str(self.ops_home / "wals"), gq=None)
+        self.sinks = {"comment_min_interval_s": 0, "comment": {"mode": "none"},
+                      "deadman": [["fake-deadman", "{SUBJECT}"]]}
+        self.mail = []            # subjects the fake mail command was given
+        self.mail_mode = "ok"     # ok | fail | timeout
+        self.config["ops_ticket"] = "GoodQA goodqa#16034"
+
+    def deps(self, verdict="BLOCK"):
+        deps = Deps(verdict=verdict)
+        ow, test = self.ow, self
+
+        def ah(argv, timeout):
+            deps.ah_calls.append(argv)
+            if argv[:2] == ["ah", "alert"]:
+                arg = lambda name, default="": argv[argv.index(name) + 1] if name in argv else default  # noqa: E731
+                ow.emit({"host": test.HOST, "source": arg("--source"), "event": argv[2],
+                         "severity": arg("--severity", "info"), "key": arg("--alert-key"), "check": "ahc",
+                         "message": arg("--message", "cleared"), "detail": {}}, home=test.ops_home)
+            return 0, "{}", ""
+
+        def ops_watch(argv, timeout):
+            if argv[0] == "capabilities":
+                return 0, "\n".join(ow.capabilities()) + "\n", ""
+            if argv[0] == "config":
+                return 0, json.dumps({"sinks": test.sinks}), ""
+            key = argv[argv.index("--key") + 1]
+            return 0, json.dumps({"key": key, "delivered_at": ow.delivered_at(test.ops_home, key)}), ""
+        deps.ah, deps.ops_watch = ah, ops_watch
+        return deps
+
+    def ops_run(self, deps, save=None):
+        """One real ops-watch run at the daemon's clock, its deadman command faked."""
+        import subprocess as sp
+
+        def deadman(argv, t, stdin):
+            self.mail.append(argv[-1])
+            if self.mail_mode == "timeout":
+                raise sp.TimeoutExpired(argv, t)
+            return (0 if self.mail_mode == "ok" else 1, "")
+        cfg = dict(self.cfg, sinks=self.sinks)
+        runner_ = _OpsRunner({("fake-deadman",): deadman})
+        if save is None:
+            return self.ow.run_once(cfg, self.ops_home, runner=runner_, checks={}, now=deps.now)
+        from unittest import mock
+        with mock.patch.object(self.ow, "save_state", side_effect=save):
+            return self.ow.run_once(cfg, self.ops_home, runner=runner_, checks={}, now=deps.now)
+
+    def escalate(self):
+        """A BLOCK whose owner never acks: one critical escalation ahc:<item>:1 raised into the real ring."""
+        deps = self.deps()
+        iid = self.submit()
+        self.run_all(deps)
+        deps.now += runner.bounds(self.config)["block_ack_seconds"] + 1
+        self.run_all(deps)
+        self.assertIn(["--severity", "critical"], [a[3:5] for a in deps.ah_calls if a[:3] == ["ah", "alert", "raise"]])
+        return iid, deps, "ahc:%s:1" % iid
+
+    def mail_effect(self, iid):
+        ledger = runner.Ledger(self.paths)
+        try:
+            return dict(ledger.db.execute("SELECT * FROM effects WHERE item=? AND kind='mail'", (iid,)).fetchone())
+        finally:
+            ledger.close()
+
+    def bodies(self, deps):
+        return [a[a.index("--body") + 1] for a in deps.ah_calls if a[:3] == ["ah", "ticket", "comment"]]
+
+    def high_raises(self, deps, prefix):
+        return [a[a.index("--alert-key") + 1] for a in deps.ah_calls if a[:3] == ["ah", "alert", "raise"]
+                and a[a.index("--severity") + 1] == "high" and a[a.index("--alert-key") + 1].startswith(prefix)]
+
+    def test_success_marks_handed_only_after_the_mail_command(self):
+        iid, deps, key = self.escalate()
+        self.assertEqual(self.mail_effect(iid)["status"], "pending", "a raise alone is never delivery")
+        deps.now += 60
+        self.ops_run(deps)
+        self.assertEqual(len(self.mail), 1, "the mail command ran once for the escalation key")
+        self.assertIn(key, self.mail[0])
+        self.run_all(deps)
+        effect = self.mail_effect(iid)
+        self.assertEqual(effect["status"], "done")
+        self.assertIn("handed to mail command", effect["result"])
+        self.assertNotIn("emailed", " ".join(self.bodies(deps)).lower())
+
+    def test_high_raise_queues_no_mail(self):
+        deps = self.deps()
+        iid = self.submit()
+        deps.gh_rc = 1   # resolve fails repeatedly: a routine high path, never an escalation
+        self.run_all(deps)
+        ledger = runner.Ledger(self.paths)
+        try:
+            worker = runner.Worker(self.paths, self.config, deps, ledger)
+            ledger.ensure_item(iid, self.config, deps.now)
+            worker.refuse(iid, worker.lease(iid), "test refusal")
+        finally:
+            ledger.close()
+        self.run_all(deps)
+        self.assertTrue(self.high_raises(deps, "ahc:"), "the refusal raised its high alert")
+        deps.now += 60
+        self.ops_run(deps)
+        self.assertEqual(self.mail, [], "a high raise must never be mailed")
+
+    def test_missing_sink_is_unavailable_and_never_claims_mail(self):
+        self.sinks = dict(self.sinks, deadman=[])
+        iid, deps, key = self.escalate()
+        self.run_all(deps)
+        self.run_all(deps)
+        ledger = runner.Ledger(self.paths)
+        try:
+            route = ledger.db.execute("SELECT v FROM meta WHERE k='email_route'").fetchone()["v"]
+            mails = ledger.db.execute("SELECT COUNT(*) FROM effects WHERE kind='mail'").fetchone()[0]
+        finally:
+            ledger.close()
+        self.assertEqual(route, "unavailable")
+        self.assertEqual(mails, 0, "no receipt is awaited for an escalation that cannot be mailed")
+        self.assertEqual(self.high_raises(deps, "ahc:email-route:"), ["ahc:email-route:1"], "one alert per episode")
+        route_comments = [b for b in self.bodies(deps) if "email-route: unavailable" in b]
+        self.assertEqual(len(route_comments), 1, "one ops-ticket comment per episode")
+        self.assertTrue(any("NOT handed to the mail command" in b for b in self.bodies(deps)))
+        self.sinks = dict(self.sinks, deadman=[["fake-deadman", "{SUBJECT}"]])
+        self.run_all(deps)
+        clears = [a for a in deps.ah_calls if a[:3] == ["ah", "alert", "clear"]
+                  and a[a.index("--alert-key") + 1] == "ahc:email-route:1"]
+        self.assertEqual(len(clears), 1, "the episode alert clears when the route is ready again")
+
+    def test_no_ops_ticket_raises_alert_only(self):
+        self.sinks = dict(self.sinks, deadman=[])
+        del self.config["ops_ticket"]
+        deps = self.deps()
+        with self.assertLogs("ahc", level="WARNING") as logs:
+            self.run_all(deps)
+        self.assertEqual(self.high_raises(deps, "ahc:email-route:"), ["ahc:email-route:1"])
+        self.assertFalse([b for b in self.bodies(deps) if "email-route" in b])
+        self.assertTrue(any("no ops ticket configured" in line for line in logs.output))
+
+    def assert_undelivered_once(self, iid, deps, key):
+        st = self.ow.load_state(self.ops_home)
+        self.assertIn(key, st.get("deadman_sent", {}), "queued and rate-limited by ops-watch")
+        self.assertNotIn(key, st.get("deadman_delivered", {}), "a failed send is not a receipt")
+        self.run_all(deps)
+        self.assertEqual(self.mail_effect(iid)["status"], "pending")
+        deps.now += runner.EMAIL_UNDELIVERED_SECONDS + 1
+        self.run_all(deps)
+        self.run_all(deps)
+        undelivered = [b for b in self.bodies(deps) if "NOT handed to the mail command" in b]
+        self.assertEqual(len(undelivered), 1, "email-undelivered fires once on the ticket")
+        self.assertEqual(self.high_raises(deps, runner.UNDELIVERED_PREFIX), [runner.UNDELIVERED_PREFIX + iid + ":1"])
+
+    def test_mail_command_failure_fires_email_undelivered(self):
+        iid, deps, key = self.escalate()
+        self.mail_mode = "fail"
+        deps.now += 60
+        self.ops_run(deps)
+        self.assertEqual(len(self.mail), 1)
+        self.assert_undelivered_once(iid, deps, key)
+        # the queued mail succeeds later: the receipt arrives and the undelivered alert is cleared
+        self.mail_mode = "ok"
+        deps.now += 60
+        self.ops_run(deps)
+        self.run_all(deps)
+        self.run_all(deps)
+        self.assertEqual(self.mail_effect(iid)["status"], "done")
+        cleared = [a for a in deps.ah_calls if a[:3] == ["ah", "alert", "clear"]
+                   and a[a.index("--alert-key") + 1].startswith(runner.UNDELIVERED_PREFIX)]
+        self.assertEqual(len(cleared), 1)
+
+    def test_mail_command_timeout_is_not_delivery(self):
+        iid, deps, key = self.escalate()
+        self.mail_mode = "timeout"
+        deps.now += 60
+        self.ops_run(deps)
+        self.assert_undelivered_once(iid, deps, key)
+
+    def test_ops_watch_crash_after_send_resends_once_then_one_receipt(self):
+        iid, deps, key = self.escalate()
+        real = self.ow.save_state
+        calls = []
+
+        def crash_on_final_save(home, state):
+            calls.append(1)
+            if len(calls) > 1:   # the forward save succeeds; the end-of-run save (after the send) is lost
+                raise OSError("simulated crash before the final state save")
+            return real(home, state)
+        deps.now += 60
+        self.ops_run(deps, save=crash_on_final_save)
+        self.assertEqual(len(self.mail), 1)
+        self.assertGreaterEqual(len(calls), 2, "test setup: the end-of-run save must have been attempted")
+        self.assertIsNone(self.ow.delivered_at(self.ops_home, key), "the receipt was lost with the save")
+        before = self.esc_n(iid)
+        self.run_all(deps)
+        self.assertEqual(self.mail_effect(iid)["status"], "pending")
+        deps.now += 60
+        self.ops_run(deps)
+        self.assertEqual(len(self.mail), 2, "at-least-once: exactly one re-send")
+        self.run_all(deps)
+        self.assertEqual(self.mail_effect(iid)["status"], "done", "then exactly one receipt")
+        deps.now += 60
+        self.ops_run(deps)
+        self.assertEqual(len(self.mail), 2, "no further sends after the receipt")
+        self.assertEqual(self.esc_n(iid), before, "<n> is unchanged across the restart")
+
+    def test_truncation_past_50_is_never_a_receipt(self):
+        iid, deps, key = self.escalate()
+        self.mail_mode = "fail"
+        deps.now += 60
+        self.ops_run(deps)
+        for n in range(55):   # 55 newer criticals from another source push ours out of the last-50 window
+            self.ow.emit({"host": self.HOST, "source": "other", "event": "raise", "severity": "critical",
+                          "key": "other:%d" % n, "check": "x", "message": "m", "detail": {}}, home=self.ops_home)
+        deps.now += 60
+        self.ops_run(deps)
+        self.mail_mode = "ok"
+        for _ in range(3):
+            deps.now += 60
+            self.ops_run(deps)
+        self.assertIsNone(self.ow.delivered_at(self.ops_home, key), "truncated from the deadman queue")
+        self.assert_undelivered_once(iid, deps, key)
+
+    def test_receipt_before_the_raise_does_not_count(self):
+        iid, deps, key = self.escalate()
+        state = self.ow.load_state(self.ops_home)
+        state.setdefault("deadman_delivered", {})[key] = deps.now - 3600   # a stale receipt for the same key
+        self.ow.save_state(self.ops_home, state)
+        deps.now += 61   # past the per-tick recheck
+        self.run_all(deps)
+        self.assertEqual(self.mail_effect(iid)["status"], "pending")
+        self.assertIn("predates", self.mail_effect(iid)["result"])
+
+    def test_unreadable_or_mismatched_answer_is_not_delivered(self):
+        iid, deps, key = self.escalate()
+        for answer in ((1, "", "boom"), (0, "not json", ""), (0, json.dumps({"key": "other", "delivered_at": 9e12}), ""),
+                       (0, json.dumps({"key": key, "delivered_at": True}), "")):
+            with self.subTest(answer=answer[1][:20]):
+                deps.ops_watch = lambda argv, t, _a=answer: ((0, "\n".join(self.ow.capabilities()), "")
+                                                             if argv[0] == "capabilities" else
+                                                             (0, json.dumps({"sinks": self.sinks}), "")
+                                                             if argv[0] == "config" else _a)
+                deps.now += 61
+                self.run_all(deps)
+                self.assertEqual(self.mail_effect(iid)["status"], "pending")
+
+    def esc_n(self, iid):
+        ledger = runner.Ledger(self.paths)
+        try:
+            return ledger.item(iid)["esc_n"]
+        finally:
+            ledger.close()
+
+
+class _OpsRunner:
+    """ops-watch runner fake: an argv prefix to a callable; anything else exits 127."""
+
+    def __init__(self, table):
+        self.table = table
+
+    def __call__(self, argv, timeout, stdin=None, env=None, cwd=None):
+        for prefix, fn in self.table.items():
+            if tuple(argv[:len(prefix)]) == prefix:
+                return fn(argv, timeout, stdin)
+        return (127, "")
 
 
 class SchemaTests(Base):

@@ -83,6 +83,14 @@ REVIEW_TIMEOUT = 720                     # per provider, peer_review's cap
 REVIEW_WALL = core.TIMEOUTS["review"]    # primary plus one fallback (D21)
 LEASE_SECONDS = REVIEW_WALL + 60         # lease = timeout + 60 s; a reclaim mints a new fencing token
 PASS_RECHECK = 3600             # routed-to-main: re-read the PR this often
+# D19 email route: ops-watch mails only CRITICAL raises through its deadman command; the daemon never sends mail
+# itself and never reads ops-watch's private state. Proof of handoff is `ops_watch.py delivered --key K --json`.
+EMAIL_UNDELIVERED_SECONDS = 30 * 60   # no receipt this long after the raise: email-undelivered (ticket + high alert)
+MAIL_CHECK_MAX = 7 * 86400            # stop re-checking a receipt after this; the email-undelivered alert stands
+OPS_WATCH_TIMEOUT = 30
+EMAIL_CAPABILITIES = ("forward-foreign-critical", "deadman-delivered")
+SYSTEM_ITEM = "ahc-system"            # effects that belong to the daemon, not to an item (email-route readiness)
+UNDELIVERED_PREFIX = "ahc:email-undelivered:"
 D20_FIRST = 4 * 3600            # D20: escalate 4 h after entering a covered state ...
 D20_REPEAT = 24 * 3600          # ... then every 24 h while it still waits
 MAX_BODY = 6000
@@ -796,6 +804,10 @@ class Worker:
              now + bounds(self.config)["block_ack_seconds"] if requires_ack else None, now))
         if cur.rowcount != 1:
             return False
+        mail = audience == "user" and esc_n is not None and self.email_ready()
+        if audience == "user" and esc_n is not None and not mail:
+            body += ("\nEmail route unavailable (%s): this escalation is NOT handed to the mail command; it is on the "
+                     "dashboard and this ticket only." % (self._meta("email_route_reason") or "not checked"))
         effects = [("ticket", {"ticket": req["ticket"], "body": body, "key": "ahc-" + nkey.replace(":", "-")})]
         if audience == "owner":
             # lexical only: filesystem state (a planted symlink) must never make the state-change transaction raise
@@ -807,6 +819,8 @@ class Worker:
         elif audience != "record" and (audience == "user" or state in ALERT_STATES):
             effects.append(("alert", _alert_payload(iid, req, state, body)))
         effects.append(("digest", {"line": _digest_line(iid, req, state, body), "key": nkey}))
+        if mail:
+            effects.append(("mail", {"alert_key": "ahc:%s:%d" % (iid, esc_n), "n": esc_n}))
         for kind, payload in effects:
             self.led.db.execute(
                 "INSERT OR IGNORE INTO effects(key, item, kind, status, attempts, next_action_at, payload, updated)"
@@ -832,10 +846,12 @@ class Worker:
         any such raise not yet sent, so the dashboard does not keep them standing. The caller holds the
         transaction. Called when the item leaves a D20 state, on disposition, on a D20 stop, and on an owner ack
         that leaves no live D20 obligation."""
+        self.led.db.execute("UPDATE effects SET status='cancelled', next_action_at=NULL, updated=? WHERE item=? AND "
+                            "kind='mail' AND status='pending'", (now, iid))
         for effect in self.led.db.execute("SELECT key, status, payload FROM effects WHERE item=? AND kind='alert'",
                                           (iid,)).fetchall():
             payload = json.loads(effect["payload"])
-            if payload.get("severity") != "critical":
+            if payload.get("severity") != "critical" and not payload.get("alert_key", "").startswith(UNDELIVERED_PREFIX):
                 continue
             if effect["status"] == "pending":
                 self.led.db.execute("UPDATE effects SET status='cancelled', next_action_at=NULL, updated=? "
@@ -908,6 +924,11 @@ class Worker:
             " ORDER BY next_action_at, key", (now,)).fetchall()
         for row in rows:
             payload = json.loads(row["payload"])
+            if row["kind"] == "mail":
+                self.check_mail(row, payload, now)
+                continue
+            if row["kind"] == "alert" and payload.get("severity") == "critical":
+                self._note_raise(row["key"], now)
             if row["status"] == "intent" and self.readback(row["kind"], payload):
                 self._effect_done(row["key"], "readback")
                 continue
@@ -922,6 +943,165 @@ class Worker:
                 with self.led.tx():
                     self.led.db.execute("UPDATE effects SET status='pending', next_action_at=?, result=?, updated=?"
                                         " WHERE key=?", (next_at, detail, now, row["key"]))
+
+    def _note_raise(self, alert_key_row, now):
+        """Record, before the ah call, the first time this critical alert was raised: a receipt counts only at or
+        after it (D19)."""
+        mail_key = "mail:" + alert_key_row.split(":", 1)[1]
+        with self.led.tx():
+            row = self.led.db.execute("SELECT payload FROM effects WHERE key=?", (mail_key,)).fetchone()
+            if row is None:
+                return
+            payload = json.loads(row["payload"])
+            if payload.get("raised_at") is None:
+                payload["raised_at"] = now
+                self.led.db.execute("UPDATE effects SET payload=? WHERE key=?", (json.dumps(payload), mail_key))
+
+    def _insert_effect(self, key, iid, kind, payload, now):
+        self.led.db.execute(
+            "INSERT OR IGNORE INTO effects(key, item, kind, status, attempts, next_action_at, payload, updated)"
+            " VALUES (?,?,?,?,?,?,?,?)", (key, iid, kind, "pending", 0, now, json.dumps(payload), now))
+
+    def check_mail(self, row, payload, now):
+        """One escalation's mail receipt (D19). Done only when `ops_watch.py delivered` returns a time at or after
+        the raise: "handed to mail command", never "emailed". Until then it stays pending and is re-read each tick;
+        30 min after the raise without a receipt it fires email-undelivered once (ticket + high alert), which is
+        cleared if the receipt arrives later. Alert creation, a queued mail or an unreadable answer is never a
+        receipt."""
+        row = self.led.db.execute("SELECT * FROM effects WHERE key=?", (row["key"],)).fetchone()
+        payload = json.loads(row["payload"])  # current: _note_raise may have stamped raised_at in this same pass
+        nkey = row["key"].split(":", 1)[1]
+        iid, n = row["item"], payload.get("n")
+        alert = self.led.db.execute("SELECT status, updated FROM effects WHERE key=?", ("alert:" + nkey,)).fetchone()
+        tick = bounds(self.config)["tick_seconds"]
+        if alert is None or alert["status"] == "cancelled":
+            with self.led.tx():
+                self.led.db.execute("UPDATE effects SET status='cancelled', next_action_at=NULL, updated=? WHERE key=?",
+                                    (now, row["key"]))
+            return
+        raised_at = payload.get("raised_at")
+        if alert["status"] != "done" or raised_at is None:
+            with self.led.tx():
+                self.led.db.execute("UPDATE effects SET next_action_at=?, updated=? WHERE key=?",
+                                    (now + tick, now, row["key"]))
+            return
+        got = self.delivered_at(payload["alert_key"])
+        if got is not None and got >= float(raised_at):
+            with self.led.tx():
+                self.led.db.execute("UPDATE effects SET status='done', next_action_at=NULL, result=?, updated=? "
+                                    "WHERE key=?", ("handed to mail command at %.0f" % got, now, row["key"]))
+                self.led.event(iid, "email-handed", now, n=n, alert_key=payload["alert_key"], delivered_at=got)
+                if payload.get("undelivered_key"):
+                    self._insert_effect("clear:" + payload["undelivered_key"], iid, "clear",
+                                        {"alert_key": payload["undelivered_key"],
+                                         "key": "ahc-clear-" + payload["undelivered_key"]}, now)
+            return
+        waited = now - float(raised_at)
+        with self.led.tx():
+            if waited >= EMAIL_UNDELIVERED_SECONDS and not payload.get("undelivered_key"):
+                item = self.led.item(iid)
+                req = json.loads(item["request"]) if item is not None else None
+                ukey = "%s%s:%s" % (UNDELIVERED_PREFIX, iid, n)
+                payload["undelivered_key"] = ukey
+                if req is not None:
+                    body = ("Escalation %s (critical alert %s) has no mail receipt %d min after it was raised: it was NOT "
+                            "handed to the mail command. Check `python3 ~/.claude/hooks/ops_watch.py status` and the "
+                            "deadman sink on this host." % (n, payload["alert_key"], int(waited // 60)))
+                    self._insert_notice(iid, req, "email-undelivered-%s" % n, "record", body, False, now)
+                    self._insert_effect("alert:" + ukey, iid, "alert", {
+                        "alert_key": ukey, "key": "ahc-" + ukey.replace(":", "-"), "severity": "high",
+                        "message": "ahc email-undelivered: %s (no mail receipt after %d min)" % (
+                            payload["alert_key"], int(waited // 60))}, now)
+                self.led.event(iid, "email-undelivered", now, n=n, alert_key=payload["alert_key"])
+            expired = waited > MAIL_CHECK_MAX
+            self.led.db.execute("UPDATE effects SET status=?, next_action_at=?, payload=?, result=?, updated=? "
+                                "WHERE key=?", ("expired" if expired else "pending", None if expired else now + tick,
+                                                json.dumps(payload), "no receipt" if got is None else
+                                                "receipt predates the raise", now, row["key"]))
+
+    def delivered_at(self, alert_key):
+        """The receipt time from `ops_watch.py delivered --key K --json`, or None: any failure, timeout, malformed
+        or mismatched answer is "not delivered" (I9)."""
+        child = getattr(self.deps, "ops_watch", None)
+        if child is None:
+            return None
+        try:
+            rc, out, _err = child(["delivered", "--key", alert_key, "--json"], OPS_WATCH_TIMEOUT)
+            answer = json.loads(out) if rc == 0 else None
+        except Exception:  # noqa: BLE001 - an unreadable answer is never a receipt
+            return None
+        if not isinstance(answer, dict) or answer.get("key") != alert_key:
+            return None
+        value = answer.get("delivered_at")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    def _meta(self, key):
+        row = self.led.db.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()
+        return row["v"] if row else None
+
+    def email_ready(self):
+        return self._meta("email_route") == "ready"
+
+    def email_route(self):
+        """D19 readiness, at start and every tick: ops-watch must list both capabilities and have a non-empty
+        `sinks.deadman`. The config output holds the mail argv, so only its emptiness is used; it is never logged,
+        stored or quoted. A change to unavailable opens a new episode: one high alert ahc:email-route:<episode> and
+        one comment on `ops_ticket` (alert only, with a log line, when no ops ticket is configured); a change back
+        to ready clears that episode's alert. Returns True when ready."""
+        reason = self._email_reason()
+        now = self.now()
+        previous = self._meta("email_route")
+        state = "ready" if reason is None else "unavailable"
+        with self.led.tx():
+            episode = int(self._meta("email_episode") or 0)
+            self.led.db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('email_route', ?)", (state,))
+            self.led.db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('email_route_reason', ?)", (reason or "",))
+            if state == "unavailable" and previous != "unavailable":
+                episode += 1
+                self.led.db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('email_episode', ?)", (str(episode),))
+                key = "ahc:email-route:%d" % episode
+                message = ("ahc email-route: unavailable (%s). Escalations are NOT handed to the mail command until "
+                           "this clears; they still reach the dashboard and the ticket." % reason)
+                self._insert_effect("alert:" + key, SYSTEM_ITEM, "alert", {
+                    "alert_key": key, "key": "ahc-email-route-%d" % episode, "severity": "high",
+                    "message": message}, now)
+                ticket = self.config.get("ops_ticket")
+                if ticket:
+                    self._insert_effect("ticket:email-route:%d" % episode, SYSTEM_ITEM, "ticket", {
+                        "ticket": ticket, "body": message, "key": "ahc-email-route-%d" % episode}, now)
+                else:
+                    log.warning("email-route unavailable (%s); no ops ticket configured, alert only", reason)
+                self.led.event(SYSTEM_ITEM, "email-route-unavailable", now, reason=reason, episode=episode)
+            elif state == "ready" and previous == "unavailable" and episode:
+                key = "ahc:email-route:%d" % episode
+                self._insert_effect("clear:" + key, SYSTEM_ITEM, "clear", {"alert_key": key,
+                                                                           "key": "ahc-clear-" + key}, now)
+                self.led.event(SYSTEM_ITEM, "email-route-ready", now, episode=episode)
+        return state == "ready"
+
+    def _email_reason(self):
+        child = getattr(self.deps, "ops_watch", None)
+        if child is None:
+            return "no ops-watch child"
+        try:
+            rc, out, _err = child(["capabilities"], OPS_WATCH_TIMEOUT)
+            caps = set(out.split()) if rc == 0 else None
+            rc2, raw, _err2 = child(["config"], OPS_WATCH_TIMEOUT)
+            cfg = json.loads(raw) if rc2 == 0 else None
+        except Exception:  # noqa: BLE001 - unreadable is unavailable, never ready
+            return "ops-watch unreadable"
+        if caps is None or not isinstance(cfg, dict):
+            return "ops-watch unreadable"
+        for cap in EMAIL_CAPABILITIES:
+            if cap not in caps:
+                return "missing capability %s" % cap
+        sinks = cfg.get("sinks")
+        deadman = sinks.get("deadman") if isinstance(sinks, dict) else None
+        if not isinstance(deadman, list) or not [c for c in deadman if c]:
+            return "sinks.deadman is empty"
+        return None
 
     def _effect_done(self, key, detail):
         with self.led.tx():
@@ -971,7 +1151,7 @@ class Worker:
                 return rc == 0, "rc=%s %s" % (rc, _short(err))
         except (OSError, subprocess.SubprocessError) as error:
             return False, _short(error)
-        return False, "unknown effect kind"
+        return False, "unknown effect kind"  # includes "mail": a receipt is read back, never sent
 
     def escalate(self):
         """Owner notices not acknowledged by their deadline go to the ticket and the user channel, once (AC-19)."""
@@ -1063,6 +1243,7 @@ def tick(paths, config, deps):
     worker = Worker(paths, config, deps, ledger)
     summary = {"processed": [], "recovered": [], "defects": [], "rejected": []}
     try:
+        summary["email_route"] = "ready" if worker.email_route() else "unavailable"
         summary["rejected"] = ingest(ledger, paths, config, worker.now())
         for name, reason in summary["rejected"]:
             message = "ahc rejected queue file %s: %s (moved to coordinator/rejected/)" % (name, reason)
@@ -1428,6 +1609,13 @@ class LiveDeps:
         rc, _out, err = self._run(argv, timeout)
         return rc, err
 
+    def ops_watch(self, argv, timeout):
+        """Read-only ops-watch queries only: capabilities, config (emptiness of sinks.deadman), delivered."""
+        if not argv or argv[0] not in ("capabilities", "config", "delivered"):
+            raise ValueError("ops_watch: only read-only queries")
+        script = str(self.config.get("ops_watch", Path.home() / ".claude/hooks/ops_watch.py"))
+        return self._run([sys.executable, script] + list(argv), min(timeout, OPS_WATCH_TIMEOUT))
+
     def clone(self, repo, head, base):
         import ahc_clone
         floor = int(self.config.get("disk_floor_bytes", 20 * 1024 ** 3))
@@ -1564,8 +1752,18 @@ def main(argv=None):
                 req = json.loads(row["request"])
                 print("%s %-18s %s#%s %s next=%s" % (row["id"], row["state"], req["repo"], req["pr"], req["head"][:12],
                                                     row["next_action_at"]))
-            pending = ledger.db.execute("SELECT COUNT(*) AS n FROM effects WHERE status != 'done'").fetchone()["n"]
+            pending = ledger.db.execute("SELECT COUNT(*) AS n FROM effects WHERE status IN ('pending', 'intent')"
+                                        ).fetchone()["n"]
             print("pending effects: %d" % pending)
+            route = ledger.db.execute("SELECT k, v FROM meta WHERE k IN ('email_route', 'email_route_reason')")
+            route = {row["k"]: row["v"] for row in route}
+            print("email route: %s%s" % (route.get("email_route", "not checked"),
+                                         " (%s)" % route["email_route_reason"] if route.get("email_route_reason")
+                                         else ""))
+            for row in ledger.db.execute("SELECT item, status, result, payload FROM effects WHERE kind='mail' AND "
+                                         "status != 'cancelled' ORDER BY updated DESC LIMIT 20"):
+                print("mail %s %s %s: %s" % (row["item"], json.loads(row["payload"]).get("alert_key"), row["status"],
+                                             row["result"] or "awaiting receipt"))
         finally:
             ledger.close()
         return 0
