@@ -1,0 +1,20 @@
+# systemd USER unit: Mission Control on a Linux host (GoodQA goodqa#16043). Loopback only; reach it through
+# an SSH port forward. --no-remote: this host is the one the remote probe would call.
+[Unit]
+Description=Mission Control dashboard on the build host (loopback; goodqa#16043, goodqa#15585)
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/coordd.env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env python3 ${COORD_APP}/harness/mission_control/server.py serve --port 47615 --no-remote
+Restart=always
+RestartSec=5
+Nice=10
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target

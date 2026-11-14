@@ -1,0 +1,22 @@
+# systemd USER unit: host coordinator service (GoodQA goodqa#16043). Linger must be on for start at boot.
+# Install: copy to ~/.config/systemd/user/, set COORD_APP in ~/.config/coordd.env, then
+#   systemctl --user daemon-reload && systemctl --user enable --now coordd.service
+[Unit]
+Description=coordd: host coordinator service (task ledger, routing, reports; goodqa#16043)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/coordd.env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env python3 -I ${COORD_APP}/harness/coordinator/coordd.py serve
+Restart=always
+RestartSec=5
+Nice=5
+MemoryMax=1G
+
+[Install]
+WantedBy=default.target
