@@ -35,3 +35,18 @@ test('the system-light path (no data-theme) gets the light tokens through theme.
   assert.match(css, /@media \(forced-colors: active\)/);
   assert.match(css, /@media \(max-width: 760px\)/);
 });
+
+// goodqa#15950 AC-6: the org graph's node, severity and escalation colors stay visible on the page in both themes
+// (WCAG 1.4.11 non-text contrast, 3:1). `--org-done` and `--org-edge` are deliberately muted and excluded.
+const blocks = re => Object.assign({}, ...[...css.matchAll(re)].map(m => Object.fromEntries(
+  [...m[1].matchAll(/--([a-z0-9-]+):\s*(#[0-9a-f]{6})/gi)].map(x => [x[1], x[2]]))));
+const orgDark = { ...dark, ...blocks(/:root \{([^}]*)\}/g) };
+const orgLight = { ...orgDark, ...light, ...blocks(/:root\[data-theme="light"\] \{([^}]*)\}/g) };
+for (const [name, t] of [['dark', orgDark], ['light', orgLight]]) {
+  test(`${name} theme: org graph colors meet 3:1 on the page and panels`, () => {
+    const keys = Object.keys(t).filter(k => k.startsWith('org-') && !['org-done', 'org-edge'].includes(k));
+    assert.ok(keys.length >= 13, keys.join(','));
+    for (const surface of ['bg', 'panel', 'panel-2'])
+      for (const k of keys) assert.ok(ratio(t[k], t[surface]) >= 3, `${k} on ${surface} (${name}): ${ratio(t[k], t[surface]).toFixed(2)}`);
+  });
+}
