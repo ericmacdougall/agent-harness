@@ -106,7 +106,11 @@ class Guards(Base):
         self.assertEqual(len(app.asks.items), len(demo.ASKS))  # canned "Needs you" fixture, no process
         with self.assertRaises(PermissionError):
             app.runner.run("remote-wal-probe")
-        self.assertEqual(len(app.owners.rows), len(demo.OWNERS))
+        # The fixture `ah owners` also lists sub-agents and reviewers (goodqa#15950), as the real one does.
+        helpers = len(demo.SUBAGENTS) + (1 if demo.cycling_live(now) else 0)
+        self.assertEqual(len(app.owners.rows), len(demo.OWNERS) + helpers)
+        self.assertEqual(app.health.rows["org-graph"]["status"], "ok")
+        self.assertTrue(app.org.snapshot()["nodes"], "the org graph is built from the fixture transcripts")
         states = {r["agent_id"]: r for r in app.owners.rows}
         self.assertTrue(states["a4held0demo"]["disposition"]["live"], "a held owner is in the fixture")
         self.assertEqual(app.health.rows["github"]["status"], "error", "the failing source is in the fixture")

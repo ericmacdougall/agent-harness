@@ -55,6 +55,7 @@ sys.path.insert(1, str(HOOKS))
 import collectors as col  # noqa: E402
 import demo as demo_mode  # noqa: E402
 import events as ev  # noqa: E402
+import org_graph  # noqa: E402
 import req_actions  # noqa: E402
 import mc_chat  # noqa: E402
 from codex_responder import CodexResponder  # noqa: E402
@@ -304,7 +305,7 @@ def codex_binary() -> str | None:
 class App:
     def __init__(self, *, port: int, root: Path, initiatives: str | None, remote: bool, fabric_bin: str | None,
                  runner: Runner | None = None, wal_roots=None, start_threads: bool = True, codex: bool = True,
-                 demo: bool = False):
+                 demo: bool = False, projects_root: Path | None = None, escalation_root: Path | None = None):
         self.port, self.root = port, root
         self.demo = demo
         self.build = demo_mode.build_identity(HERE, HOOKS) if demo else None
@@ -312,8 +313,8 @@ class App:
         self.demo_drop_first = False
         self.demo_refuse_first = False
         if demo:
-            if runner is None or wal_roots is None:
-                raise demo_mode.DemoError("demo mode needs its DemoRunner and fixture WAL roots")
+            if runner is None or wal_roots is None or projects_root is None:
+                raise demo_mode.DemoError("demo mode needs its DemoRunner, fixture WAL roots and fixture transcripts")
             self.demo_delay_s = min(max(int(os.environ.get("MC_DEMO_CHAT_DELAY_MS") or 0), 0), 10_000) / 1000
             self.demo_drop_first = os.environ.get("MC_DEMO_DROP_FIRST") == "1"
             self.demo_refuse_first = os.environ.get("MC_DEMO_REFUSE_FIRST") == "1"
@@ -354,8 +355,15 @@ class App:
         self.actions = req_actions.ReqActions(root, self.key)
         self.ledger = col.Ledger(self.hub, self.health, self.runner, lambda: self.owners.session, root=root,
                                  actions=self.actions)
+        # The Topology tab's org graph: live owners, their transcripts' model/effort fields and their tickets.
+        # Demo mode reads only its fixture transcripts and no escalation state (never the real ~/.claude).
+        self.org = org_graph.OrgGraph(
+            self.hub, self.health, self.runner, owners_fn=lambda: self.owners.rows, session_fn=lambda: self.owners.session,
+            transcripts=org_graph.Transcripts(projects_root or home / ".claude" / "projects"),
+            escalation_root=None if demo else (escalation_root or home / ".agent-harness" / "escalation"),
+            host="demo-host" if demo else ev.HOST, inbox_fn=self._open_asks)
         self.collectors = [self.tailer, self.initiatives, self.drop, self.owners, self.github, self.tickets,
-                           self.remote]
+                           self.remote, self.org]
         self.codex = CodexResponder(self.hub, self.health, self.runner, codex_binary(), root,
                                     disabled="" if codex else "Codex chat is turned off for this instance")
         self.chat_sig = None
@@ -365,6 +373,10 @@ class App:
         self.threads: list[threading.Thread] = []
         if start_threads:
             self.start()
+
+    def _open_asks(self) -> int:
+        """Open asks waiting on the user (the "Needs you" list plus its stale part): the user node's inbox count."""
+        return len(getattr(self.asks, "items", None) or []) + len(getattr(self.asks, "stale", None) or [])
 
     def tracked_tickets(self):
         refs = [i.get("ticket") for i in self.initiatives.items if i.get("ticket")]
@@ -488,7 +500,7 @@ class App:
 
     def state(self) -> dict:
         return {"version": VERSION, "started": ev.iso(self.started), "host": "demo" if self.demo else ev.HOST,
-                "initiatives": self.initiatives.snapshot(), "owners": self.owners.rows,
+                "initiatives": self.initiatives.snapshot(), "owners": self.owners.rows, "orggraph": self.org.snapshot(),
                 "health": self.health.snapshot(), "events": self.hub.recent(limit=200),
                 "chat": self.chat_snapshot(), "asks": self.asks.snapshot(),
                 "ledger": self.ledger.snapshot(), "requirement_actions": len(self.actions.latest()),
@@ -1023,7 +1035,7 @@ def build_app(args) -> App:
         fixture = demo_mode.seed(root)
         app = App(port=args.port, root=root, initiatives=fixture["initiatives"], remote=False, fabric_bin=None,
                   runner=demo_mode.DemoRunner(), wal_roots=fixture["wal_roots"], start_threads=False, codex=False,
-                  demo=True)
+                  demo=True, projects_root=fixture["projects_root"])
         if args.demo_host:
             app.auth.allow_demo_host(args.demo_host)
         return app

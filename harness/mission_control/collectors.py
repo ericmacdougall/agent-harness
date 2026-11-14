@@ -1238,6 +1238,15 @@ class GitHub(Collector):
             tag = str(release.get("tag_name") or "")[:80]
             return ev.make("release", "github", f"{repo}: release {tag} {payload.get('action', '')}", eid=eid,
                            ts=ts, subject={"repo": repo, "ref": tag}, historic=historic)
+        if kind == "PullRequestEvent" and payload.get("action") == "closed":
+            pull = payload.get("pull_request") if isinstance(payload.get("pull_request"), dict) else {}
+            if not pull.get("merged"):
+                return None
+            number = pull.get("number") if isinstance(pull.get("number"), int) else payload.get("number")
+            base = str((pull.get("base") or {}).get("ref") or "")[:120] if isinstance(pull.get("base"), dict) else ""
+            head = str((pull.get("head") or {}).get("ref") or "")[:120] if isinstance(pull.get("head"), dict) else ""
+            return ev.make("push", "github", f"{repo}: merged PR #{number} {head} into {base}", eid=eid, ts=ts,
+                           subject={"repo": repo, "branch": base, "ref": f"merge:{number}"}, historic=historic)
         if kind == "CreateEvent" and payload.get("ref_type") == "branch":
             branch = str(payload.get("ref") or "")[:120]
             return ev.make("push", "github", f"{repo}: new branch {branch}", eid=eid, ts=ts,

@@ -179,6 +179,40 @@ OWNERS = [
     ("a8done0demo", "done", "Docs typo sweep", "demo#108", 4000, None, "result: merged"),
 ]
 
+# Sub-agents and reviewers for the org graph: agent, type, parent, state, task, ticket, idle s, model, effort.
+# a9cycl0demo exists only in odd minutes, so the page shows a spawn and a finish without any real agent.
+SUBAGENTS = [
+    ("b1sub00demo", "general-purpose", "a1live0demo", "live", "Payment form error states", "demo#110", 15,
+     "claude-sonnet-5", "medium"),
+    ("b2rev00demo", "red-team", "a1live0demo", "live", "Adversarial review of the payment form", "demo#110", 40,
+     "claude-opus-5-5", "high"),
+    ("b3sub00demo", "fixer", "a2work0demo", "working", "Stabilise the login test fixture", "demo#102", 60,
+     "claude-sonnet-5", "low"),
+    ("b4rev00demo", "click-tester", "a2work0demo", "returned", "Click-test login on staging", "demo#102", 700,
+     "claude-sonnet-5", "medium"),
+    ("b5orph0demo", "red-team", None, "live", "Spec review with no matching sub-agent", "demo#199", 30,
+     "claude-opus-5-5", "medium"),
+]
+CYCLING = ("a9cycl0demo", "general-purpose", "a1live0demo", "live", "Wire the receipt email", "demo#111", 5,
+           "claude-sonnet-5", "medium")
+OWNER_MODELS = {"a1live0demo": ("claude-opus-5-5", "high"), "a2work0demo": ("claude-opus-5-5", "medium")}
+# a3fini0demo has no model or effort in its transcript on purpose: the page must say "unknown".
+DEMO_TICKETS = {
+    "demo#101": {"title": "Checkout redesign", "status": "in_progress", "links": {"blocks": [109], "blockedBy": []}},
+    "demo#110": {"title": "Payment form error states", "status": "in_progress", "parent": 101,
+                 "links": {"blocks": [112], "blockedBy": []}},
+    "demo#112": {"title": "Checkout click-test on staging", "status": "todo", "links": {"blocks": [113], "blockedBy": [110]}},
+    "demo#113": {"title": "Checkout live for everyone", "status": "todo", "links": {"blocks": [], "blockedBy": [112]}},
+    "demo#111": {"title": "Receipt email", "status": "in_progress", "links": {"blocks": [112], "blockedBy": []}},
+    "demo#102": {"title": "Fix the flaky login test", "status": "in_review", "links": {"blocks": [], "blockedBy": []}},
+    "demo#109": {"title": "Onboarding emails", "status": "todo", "links": {"blocks": [], "blockedBy": [101]}},
+}
+
+
+def cycling_live(now: float) -> bool:
+    return int(now // 60) % 2 == 1
+
+
 INITIATIVES = [
     {"id": "demo#101", "initiative": "Checkout redesign", "state": "In progress", "milestones_done": 5,
      "milestones_total": 8, "milestones": "Done: Spec · Done: Design · Done: API · Done: Form · Done: Payments · "
@@ -260,6 +294,14 @@ class DemoRunner:
         if kind == "ah-status" and len(args) == 1:
             return 0, json.dumps(status_payload(time.time()))
         if kind == "ah-ticket-get" and len(args) == 1:
+            ticket = DEMO_TICKETS.get(str(args[0]).replace("GoodQA ", ""))
+            if ticket:
+                number = int(str(args[0]).split("#")[1])
+                links = {k: [{"number": n, "projectSlug": "demo"} for n in v] for k, v in ticket["links"].items()}
+                parent = {"number": ticket["parent"], "projectSlug": "demo"} if ticket.get("parent") else None
+                return 0, json.dumps({"issue": {"number": number, "title": ticket["title"], "status": ticket["status"],
+                                                "closedAt": None, "archivedAt": None, "links": links, "parent": parent,
+                                                "childrenCount": 0}})
             return 0, json.dumps({"issue": {"closedAt": None, "archivedAt": None}})
         if kind == "gh-user" and not args:
             return 1, ""  # the GitHub source shows as failing, so the page's error notice can be checked
@@ -334,7 +376,45 @@ def owners_payload(now: float) -> dict:
         if disposition:
             row["disposition"] = {**disposition, "until": now + 6 * 3600}
         rows.append(row)
+    for agent, kind, parent, state, task, ticket, idle, _model, _effort in SUBAGENTS + ([CYCLING] if cycling_live(now) else []):
+        rows.append({"agent_id": agent, "state": state, "task": task, "ticket": ticket, "idle_s": idle, "type": kind,
+                     "last_activity": _iso(now - idle), "parent": parent})
     return {"session": DEMO_SESSION, "owners": rows}
+
+
+def _transcript(model: str | None, effort: str | None, at: float, messages=()) -> str:
+    """A fixture transcript tail: the fields the org graph reads, and nothing else of interest."""
+    lines = [{"type": "user", "timestamp": _iso(at - 30), "message": {"role": "user", "content": "demo task"}}]
+    record = {"type": "assistant", "timestamp": _iso(at), "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "id": f"toolu_demo_{i}", "name": "SendMessage", "input": {"to": to, "message": "demo"}}
+        for i, to in enumerate(messages)]}}
+    if model:
+        record["message"]["model"] = model
+    if effort:
+        record["effort"] = effort
+        record["advisorModel"] = "claude-fable-5-2"
+    lines.append(record)
+    return "".join(json.dumps(line) + "\n" for line in lines)
+
+
+def seed_transcripts(base: Path, now: float) -> Path:
+    """Fixture transcripts under MC_HOME/demo/projects only (never ~/.claude)."""
+    projects = base / "projects"
+    session_dir = projects / "-demo" / DEMO_SESSION
+    subagents = session_dir / "subagents"
+    subagents.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _write(projects / "-demo" / f"{DEMO_SESSION}.jsonl", _transcript("claude-opus-5-5", "medium", now - 20))
+    for agent, _state, _task, _ticket, idle, _d, _n in OWNERS:
+        model, effort = OWNER_MODELS.get(agent, (None, None))
+        _write(subagents / f"agent-{agent}.jsonl", _transcript(model, effort, now - idle))
+        _write(subagents / f"agent-{agent}.meta.json", json.dumps({"agentType": "task-owner", "spawnDepth": 1}))
+    for agent, kind, parent, _state, _task, _ticket, idle, model, effort in SUBAGENTS + [CYCLING]:
+        _write(subagents / f"agent-{agent}.jsonl", _transcript(model, effort, now - idle))
+        meta = {"agentType": kind, "spawnDepth": 2 if parent else 1}
+        if parent:
+            meta["parentAgentId"] = parent
+        _write(subagents / f"agent-{agent}.meta.json", json.dumps(meta))
+    return projects
 
 
 def seed(root: Path) -> dict:
@@ -350,7 +430,9 @@ def seed(root: Path) -> dict:
     _write(wals / "main.jsonl", json.dumps({"at": _iso(now - 60), "event": "status",
                                             "note": "demo main: 3 owners live"}) + "\n")
     _write(base / "initiatives.json", json.dumps({"initiatives": INITIATIVES}, indent=1))
-    return {"wal_roots": [(base / "wals", "claude")], "initiatives": str(base / "initiatives.json")}
+    projects = seed_transcripts(base, now)
+    return {"wal_roots": [(base / "wals", "claude")], "initiatives": str(base / "initiatives.json"),
+            "projects_root": projects}
 
 
 class DemoLoop:
@@ -381,6 +463,16 @@ class DemoLoop:
                                         "kind": "wal", "summary": f"check: burst line {i + 1} of {BURST_SIZE}",
                                         "subject": {"ticket": "demo#101"}}) + "\n" for i in range(BURST_SIZE))
             _write(self.root / "sources" / "demo.jsonl", burst, append=True)
+        if self.n % 4 == 0:
+            # An owner messages its sub-agent or reviewer: a SendMessage record in the fixture transcript only.
+            sender, to = (("a1live0demo", "b1sub00demo"), ("a1live0demo", "b2rev00demo"),
+                          ("a2work0demo", "b3sub00demo"))[(self.n // 4) % 3]
+            transcript = self.root / "demo" / "projects" / "-demo" / DEMO_SESSION / "subagents" / f"agent-{sender}.jsonl"
+            model, effort = OWNER_MODELS.get(sender, (None, None))
+            _write(transcript, json.dumps({"type": "assistant", "timestamp": _iso(now), "effort": effort,
+                                           "message": {"role": "assistant", "model": model, "content": [
+                                               {"type": "tool_use", "id": f"toolu_demo_{self.n}", "name": "SendMessage",
+                                                "input": {"to": to, "message": "demo"}}]}}) + "\n", append=True)
         if self.n % 3 == 0:
             agent = OWNERS[self.n % 3][0]
             wal = self.root / "demo" / "wals" / DEMO_SESSION / f"agent-{agent}.jsonl"
