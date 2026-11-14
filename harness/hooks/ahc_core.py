@@ -123,6 +123,38 @@ class Unreadable(Refused):
         self.kind = kind
 
 
+_WALK_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def read_regular_resolved(real_path, cap):
+    """read_regular on an already-resolved absolute path (the exact path the caller's containment check approved),
+    opened one component at a time with O_DIRECTORY|O_NOFOLLOW from the filesystem root (r4 F1). It deliberately does
+    NOT resolve again: a directory swapped for a symlink after the check makes the open fail instead of being followed,
+    so the file read is the file whose path was checked."""
+    real = str(real_path)
+    if not os.path.isabs(real):
+        raise Unreadable("error", "path must be absolute and already resolved")
+    parts = [p for p in real.split(os.sep) if p]
+    if not parts:
+        raise Unreadable("non-regular", "not a regular file")
+    try:
+        fd = os.open(os.sep, _WALK_DIR_FLAGS)
+    except OSError as error:
+        raise Unreadable("error", "root cannot be opened: %s" % type(error).__name__) from None
+    try:
+        for part in parts[:-1]:
+            try:
+                nxt = os.open(part, _WALK_DIR_FLAGS, dir_fd=fd)
+            except OSError as error:
+                kind = "symlink" if error.errno in (errno.ELOOP, errno.ENOTDIR) else "error"
+                raise Unreadable(kind, "a directory on the path changed or is a symlink") from None
+            os.close(fd)
+            fd = nxt
+        return read_regular(parts[-1], cap, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
 def read_regular(path, cap, dir_fd=None):
     """The only way ahc reads a file another actor can write or replace (r3 F5/F6 class fix). It opens with
     O_NOFOLLOW|O_NONBLOCK so neither a symlink nor a FIFO or device can redirect or block it, checks the OPENED
@@ -281,10 +313,13 @@ def _atomic_write(path, data):
         os.unlink(tmp)
 
 
-def submit(paths, config, req, now=None):
-    """Validate and enqueue. Returns {"id", "duplicate"}. Raises Refused; writes nothing on refusal."""
+def submit(paths, config, req, now=None, data=None):
+    """Validate and enqueue. Returns {"id", "duplicate"}. Raises Refused; writes nothing on refusal. `data` is the
+    packet bytes the caller already read (and linted); when given they are the bytes hashed."""
     norm = validate(config, req)
-    packet_sha = hashlib.sha256(read_regular(norm["packet"], PACKET_MAX_BYTES)).hexdigest()
+    if data is None:
+        data = read_regular(norm["packet"], PACKET_MAX_BYTES)
+    packet_sha = hashlib.sha256(data).hexdigest()
     norm.update(packet_sha256=packet_sha, submitted=now or time.time())
     iid = item_id(norm, packet_sha)
     norm["id"] = iid

@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -401,9 +402,8 @@ class Journal:
 
 def _mirror(paths, iid, event, at, data):
     try:
-        paths.items.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with open(paths.items / (iid + ".jsonl"), "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"event": event, "at": at, **data}, sort_keys=True, default=str) + "\n")
+        _append_private(paths.items / (iid + ".jsonl"),
+                        json.dumps({"event": event, "at": at, **data}, sort_keys=True, default=str) + "\n")
     except OSError:
         log.warning("journal mirror write failed for %s", iid)
 
@@ -411,7 +411,7 @@ def _mirror(paths, iid, event, at, data):
 def acquire_lock(paths):
     """Single instance: an exclusive non-blocking flock. Returns the open handle, or None when another holds it."""
     paths.ensure()
-    handle = open(paths.root / "ahc.lock", "a")
+    handle = os.fdopen(_open_private(paths.root / "ahc.lock", os.O_WRONLY | os.O_CREAT | os.O_APPEND), "a")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -504,10 +504,11 @@ class Worker:
         if self.circuit_open():
             return self.settle(iid, token, state, self.now() + 1800, event="circuit-open-wait")
         # 1. packet integrity: the bytes reviewed must be the bytes submitted
-        if not core._inside(req["packet"], self.config.get("work_roots", [])):
+        real_packet = os.path.realpath(req["packet"])   # r4 F1: the path checked is the path opened
+        if not core._inside(real_packet, self.config.get("work_roots", [])):
             return self.refuse(iid, token, "the packet path is no longer inside a work root")
         try:
-            text = core.read_regular(req["packet"], core.PACKET_MAX_BYTES)
+            text = core.read_regular_resolved(real_packet, core.PACKET_MAX_BYTES)
         except core.Unreadable as error:
             return self.refuse(iid, token, "the submitted packet can no longer be read safely (%s)" % error)
         if hashlib.sha256(text).hexdigest() != req["packet_sha256"]:
@@ -758,10 +759,7 @@ class Worker:
             return path.parent.parent == self.paths.inbox and _inbox_delivered(
                 self.paths.inbox, path.parent.name, path.name, payload["body"])
         if kind == "digest":
-            try:
-                return ("[k:%s]" % payload["key"]) in self.paths.digest.read_text(encoding="utf-8")
-            except OSError:
-                return False
+            return _digest_has(self.paths.digest, payload["key"])
         return False  # ticket: ah applies an idempotency key once, so resending with the same key is the readback
 
     def send(self, kind, payload):
@@ -1107,11 +1105,46 @@ def _inbox_delivered(inbox, owner, name, text):
         os.close(root_fd)
 
 
+DIGEST_TAIL_BYTES = 1_000_000
+
+
+def _open_private(path, flags, mode=0o600):
+    """Open a coordinator-private file without following a symlink and without blocking on a FIFO (a write open of a
+    FIFO with no reader fails with ENXIO instead of waiting), then require a regular file on the opened descriptor
+    (r4 F2). Returns the fd; raises OSError."""
+    fd = os.open(str(path), flags | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), mode)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file: %s" % Path(path).name)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _digest_has(path, key):
+    """Digest readback: look for the line's key in the last DIGEST_TAIL_BYTES only (the digest only grows). The line
+    being checked was appended moments before a crash, so it is always inside the tail. Unreadable is not found."""
+    try:
+        fd = _open_private(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        size = os.fstat(fd).st_size
+        os.lseek(fd, max(0, size - DIGEST_TAIL_BYTES), os.SEEK_SET)
+        tail = os.read(fd, DIGEST_TAIL_BYTES)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return ("[k:%s]" % key).encode("utf-8") in tail
+
+
 def _write_private(path, text):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name("." + path.name + ".tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = _open_private(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(text)
         handle.flush()
@@ -1122,7 +1155,7 @@ def _write_private(path, text):
 def _append_private(path, text):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    fd = _open_private(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
     with os.fdopen(fd, "a", encoding="utf-8") as handle:
         handle.write(text)
         handle.flush()
@@ -1212,7 +1245,7 @@ def submit_with_lint(paths, config, req):
     if fix["status"] == "unfixable":
         import review_diagnostics
         raise core.Refused(review_diagnostics.render_lint(fix["problems"], "pr"))
-    return core.submit(paths, config, req)
+    return core.submit(paths, config, req, data=raw)   # r4 F3: the linted bytes are the hashed bytes
 
 
 def _setup_logging(paths):

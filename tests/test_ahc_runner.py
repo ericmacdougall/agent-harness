@@ -748,6 +748,72 @@ class UntrustedReadTests(Base):
         self.assertFalse(runner._inbox_delivered(self.paths.inbox, "agent-abc123", "n.md", "body one"))
         self.assertTrue(swapped["done"], "the race was not exercised")
 
+    def test_parent_dir_swapped_after_the_containment_check_is_not_followed(self):
+        """r4 F1: the work dir becomes a symlink to an identical packet outside the work roots right after the check."""
+        import os
+        work = self.packet.parent
+        outside = self.home / "outside"
+        outside.mkdir()
+        (outside / self.packet.name).write_text(GOOD_PACKET)   # same bytes, so only the path check can catch it
+        iid = self.submit()
+        real_inside = core._inside
+
+        def check_then_swap(path_value, roots):
+            ok = real_inside(path_value, roots)
+            # only the review-time check in Worker.process; ingest's validation also calls _inside
+            if ok and not work.is_symlink() and sys._getframe(1).f_code.co_name == "process":
+                os.rename(work, work.with_name("s-moved"))
+                work.symlink_to(outside)
+            return ok
+        core._inside = check_then_swap
+        self.addCleanup(setattr, core, "_inside", real_inside)
+        deps = Deps()
+        self.run_all(deps)
+        self.assertEqual(self.state(iid), "refused", "the packet was read through a swapped parent directory")
+        self.assertEqual(deps.review_calls, [])
+
+    def test_fifo_digest_and_lock_never_block(self):
+        import os
+        self.paths.ensure()
+        os.mkfifo(self.paths.digest)
+        self.assertFalse(runner._digest_has(self.paths.digest, "x"))
+        with self.assertRaises(OSError):
+            runner._append_private(self.paths.digest, "line\n")
+        iid, deps = self.submit(), Deps(verdict="BLOCK")
+        self.run_all(deps)
+        self.assertEqual(self.state(iid), "blocked")
+        self.assertTrue([a for a in deps.ah_calls if a[:3] == ["ah", "heartbeat", "beat"]])
+        lock = self.paths.root / "ahc.lock"
+        os.mkfifo(lock)
+        with self.assertRaises(OSError):
+            runner.acquire_lock(self.paths)
+
+    def test_digest_readback_reads_only_a_bounded_tail(self):
+        self.paths.ensure()
+        with open(self.paths.digest, "w") as handle:
+            handle.write("[k:early]\n" + "x" * (runner.DIGEST_TAIL_BYTES + 10) + "\n[k:late]\n")
+        self.assertTrue(runner._digest_has(self.paths.digest, "late"))
+        self.assertFalse(runner._digest_has(self.paths.digest, "early"), "readback must not scan the whole digest")
+
+    def test_submit_lints_and_hashes_the_same_bytes(self):
+        """r4 F3: a packet swapped between the lint read and the hash read cannot be queued under the swapped bytes."""
+        real = core.read_regular
+        calls = {"n": 0}
+
+        def swap_after_first(path, cap, dir_fd=None):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                self.packet.write_text(GOOD_PACKET + "\nswapped after lint\n")
+            return real(path, cap, dir_fd=dir_fd)
+        core.read_regular = swap_after_first
+        self.addCleanup(setattr, core, "read_regular", real)
+        req = {"repo": REPO, "pr": 7, "head": HEAD, "base": BASE, "packet": str(self.packet),
+               "ticket": "GoodQA goodqa#16034", "owner": "agent-abc123"}
+        original = hashlib.sha256(GOOD_PACKET.encode()).hexdigest()
+        iid = runner.submit_with_lint(self.paths, self.config, req)["id"]
+        queued = json.loads((self.paths.queue / (iid + ".json")).read_text())
+        self.assertEqual(queued["packet_sha256"], original, "the hashed bytes are not the linted bytes")
+
     def test_fifo_review_report_does_not_block(self):
         import os
         iid = self.submit()
