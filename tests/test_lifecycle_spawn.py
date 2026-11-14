@@ -230,6 +230,17 @@ class Scoping(SpawnBase):
         self.ok(["add", "--goal", "o1", "--title", "O"], owner=True)
         self.denied(agent("[goal:o1:scoping] survey"), "not created or proposed by main")
 
+    def test_draft_amendment_ac2a_is_off_by_default(self):
+        self.assertIs(self.policy["caps"]["lifecycle_pending_build"], False)
+        self.seed_old_goals(ids=())
+        self.ok(["add", "--goal", "np1", "--title", "N"])
+        self.propose()
+        self.denied(agent(f"[goal:{GID}] build"), "is PENDING")
+        self.policy["caps"]["lifecycle_pending_build"] = True
+        out = self.allowed(agent(f"[goal:{GID}] build"))
+        self.assertIn("AC-2a", out["context"])
+        self.denied(agent("[goal:np1] build"), "is PENDING")  # no proposal registered: still refused
+
     def test_scoping_on_active_goal_is_just_active(self):
         self.to_active()
         self.allowed(agent(f"[goal:{GID}:scoping] survey"))

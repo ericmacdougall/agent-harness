@@ -699,7 +699,8 @@ def lifecycle_gate(data, tool, command, policy, session_id, ladder_denies):
             raise lcm.LifecycleError('mission ledger audit chain: %s' % audit['problem'])
         tag, problem = lcm.goal_tags(texts)
         verdict, reason, context = lcm.spawn_verdict(tag, problem, {g['id']: g for g in loaded['goals']},
-                                                     mc.read_audit_rows(home), True)
+                                                     mc.read_audit_rows(home), True,
+                                                     pending_build=policy.get('caps', {}).get('lifecycle_pending_build') is True)
         out['facts'] = {'goal': tag[0] if tag else None, 'scoping': bool(tag and tag[1]), 'verdict': verdict}
         if verdict == 'scoping':
             # Warn mode never consumes a reservation (it reports only); enforce reserves unless the ladder refused.

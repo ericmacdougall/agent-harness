@@ -178,16 +178,21 @@ def _resolve(source, home):
     except provenance.Problem as problem:
         raise LifecycleError(f"source unreadable: {problem.message}") from None
     ctx = {"home": _claude_dir()}
+    if kind == "answer":
+        # One verified read of the answer record (provenance.resolve would scan the transcript again for the same
+        # answer_turn check plus the excerpt check, done here): measured 2.3 s -> see the PR notes on a 481 MB file.
+        try:
+            detail = provenance.answer_detail(parsed["session"], parsed.get("ident") or parsed["uuid"], ctx["home"])
+        except provenance.Problem as problem:
+            raise LifecycleError(f"source does not resolve to the user's own words: {problem.message}") from None
+        reason = provenance.excerpt_in(detail["text"], parsed.get("excerpt") or "")
+        if reason:
+            raise LifecycleError(f"source does not resolve to the user's own words: {reason}")
+        return detail["pairs"], detail.get("timestamp"), kind
     result = provenance.resolve(source, ctx)
     if not (result.get("ok") and result.get("origin") == "user" and not result.get("weak")):
         why = "; ".join(str(p) for p in (result.get("problems") or [])[:2]) or "not a human-authored turn"
         raise LifecycleError(f"source does not resolve to the user's own words: {why[:200]}")
-    if kind == "answer":
-        try:
-            pairs, ts = provenance.answer_pairs(parsed["session"], parsed["uuid"], ctx["home"])
-        except provenance.Problem as problem:
-            raise LifecycleError(f"answer unreadable: {problem.message}") from None
-        return pairs, ts, kind
     turn = provenance.user_turn(parsed["session"], parsed["uuid"], ctx["home"])
     return turn["text"], turn.get("timestamp"), kind
 
@@ -500,9 +505,11 @@ def goal_tags(texts) -> tuple:
     return None, ""
 
 
-def spawn_verdict(tag, problem: str, goals_by_id: dict, audit_rows, chain_ok: bool) -> tuple:
+def spawn_verdict(tag, problem: str, goals_by_id: dict, audit_rows, chain_ok: bool, pending_build: bool = False) -> tuple:
     """(verdict, reason, context): verdict 'allow', 'scoping' (allowed once a quota slot is reserved) or 'deny'.
-    The ledger was read and parsed by the caller."""
+    The ledger was read and parsed by the caller. pending_build: draft amendment AC-2a (caps.lifecycle_pending_build,
+    off by default and not agreed by the user): an owner may build on a PENDING goal while its gate proposal and ask
+    are registered."""
     fix = ("tag the spawn [goal:<id>] with an ACTIVE, READY or LEGACY goal, or [goal:<id>:scoping] on a PENDING goal "
            "main created (survey and gate proposal only); see `ah goals`")
     if tag is None:
@@ -523,6 +530,10 @@ def spawn_verdict(tag, problem: str, goals_by_id: dict, audit_rows, chain_ok: bo
             return "deny", (f"goal {gid} was not created or proposed by main, so no scoping owner may be spawned for "
                             "it: main adds or proposes the goal first"), ""
         return "scoping", "", SCOPING_CONTEXT
+    if state == "pending" and pending_build and SHA_RE.match(str((goal.get("lifecycle") or {}).get("gates_sha") or "")) \
+            and ASK_ID_RE.match(str((goal.get("lifecycle") or {}).get("ask") or "")):
+        return "allow", "", (f"lifecycle: {gid} is PENDING with gates proposed (ask {goal['lifecycle']['ask']}); building "
+                             "continues under draft amendment AC-2a until the user agrees or rejects the gates")
     hint = {"pending": "its gates are not agreed: spawn a [goal:%s:scoping] owner, or propose gates and ask the user" % gid,
             "agreed": "gates are agreed but it is not active: main runs activate",
             "done": "the user closed it"}.get(state, state)

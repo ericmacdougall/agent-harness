@@ -708,6 +708,12 @@ def askuser_bound(path: Path, use_id) -> set:
 
 
 def answer_turn(session: str, uid: str, home=None) -> dict:
+    turn = _answer_record(session, uid, home)
+    turn.pop("_record", None)
+    return turn
+
+
+def _answer_record(session: str, uid: str, home=None) -> dict:
     path = find_transcript(session, home)
     record = load_record(path, "uuid", uid)
     if record == "malformed":
@@ -726,16 +732,22 @@ def answer_turn(session: str, uid: str, home=None) -> dict:
     text = answer_text(record, ids)
     if text is None:
         raise Problem("not-user-authored", "record is not an AskUserQuestion answer bound to an AskUserQuestion tool_use")
-    return {"text": text, "timestamp": record.get("timestamp"), "uuid": uid, "session": session}
+    return {"text": text, "timestamp": record.get("timestamp"), "uuid": uid, "session": session, "_record": record}
+
+
+def answer_detail(session: str, uid: str, home=None) -> dict:
+    """{text, timestamp, pairs} of a verified AskUserQuestion answer record, with one record scan (the transcript can
+    be ~500 MB): the same binding answer_turn checks (goodqa#15952)."""
+    turn = _answer_record(session, uid, home)  # raises Problem unless the record answers a main AskUserQuestion
+    record = turn.pop("_record")
+    return dict(turn, pairs=answer_map(record))
 
 
 def answer_pairs(session: str, uid: str, home=None) -> tuple:
     """({question: answer}, timestamp) of a verified AskUserQuestion answer record (the same binding answer_turn
     checks), so a caller can judge the answer to one bound question, never the whole record (goodqa#15952)."""
-    turn = answer_turn(session, uid, home)  # raises Problem unless the record answers a main AskUserQuestion
-    path = find_transcript(session, home)
-    record = load_record(path, "uuid", uid)
-    return answer_map(record), turn.get("timestamp")
+    detail = answer_detail(session, uid, home)
+    return detail["pairs"], detail.get("timestamp")
 
 
 def _has_human_turn(path: Path) -> bool:
