@@ -629,11 +629,13 @@ class App:
             return 200, {"id": prior["id"], "created": False, "req": req, "action": action, "at": prior["at"]}
         item = next((r for r in self.ledger.parts["requirements"].get("items", []) if r["id"] == req), None) \
             if isinstance(req, str) else None
+        if self.ledger.req_session != session or self.ledger.read_session != session \
+                or (item is not None and item.get("session") not in ("", session)):
+            # review A-1 and PR 234 F3: the rows on hand were read for another main session (the pin moved, or the new
+            # session has not loaded yet): an action must never pair one session's requirement with another's provenance
+            return 409, {"error": "session_changed", "message": "the requirement list is from another session; reload"}
         if item is None:
             return 409, {"error": "unknown-requirement", "message": "this requirement is not in the current ledger read"}
-        if self.ledger.read_session != session or item.get("session") not in ("", session):
-            # review A-1: the list on hand was read for another session (the pin moved since the last ledger read)
-            return 409, {"error": "session_changed", "message": "the requirement list is from another session; reload"}
         if not isinstance(digest, str) or not hmac.compare_digest(digest.encode("utf-8", "replace"), item["digest"].encode()):
             return 409, {"error": "stale-digest", "message": "the requirement changed since it was shown; read it again"}
         if action == "archive" and item["bucket"] == "archived":

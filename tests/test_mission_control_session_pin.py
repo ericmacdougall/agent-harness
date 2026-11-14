@@ -207,7 +207,8 @@ class Wiring(unittest.TestCase):
             pass
         self.assertEqual(app.ledger.parts["requirements"]["items"], [])
         status, body = self._archive(app, old, OTHER)
-        self.assertEqual((status, body["error"]), (409, "unknown-requirement"))
+        # PR 234 F3: the new pin's list never loaded, so the refusal names the session, before any item lookup
+        self.assertEqual((status, body["error"]), (409, "session_changed"))
         self.assertEqual(app.actions.all(), [])
 
     def test_a_list_read_for_another_session_is_refused(self):

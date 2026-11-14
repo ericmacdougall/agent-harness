@@ -301,6 +301,37 @@ class Route(ServerHarness):
         self.assertEqual((status, again["id"], again["created"]), (200, first["id"], False))
         self.assertEqual(len(self.app.actions.all()), rows)
 
+    def test_review_f3_a_fresh_key_right_after_a_session_switch_is_refused_until_that_session_loads(self):
+        # review PR 234 F3: the items on hand were read for SID; main is now another session that has not loaded
+        other = "ffffffff-0000-4000-8000-000000000000"
+        digest = self.req()["digest"]
+        rows = len(self.app.actions.all())
+        pin_app(self.app, other)  # on this branch the write session is the pin (goodqa#15961)
+        status, value = self.click(key="click-key-0400", digest=digest)
+        self.assertEqual((status, value.get("error")), (409, "session_changed"), value)
+        self.assertEqual(len(self.app.actions.all()), rows)  # nothing recorded under the wrong session
+        # a failed read for the new session still leaves the old rows unusable
+        self.app.runner.outputs["ah-requirements"] = lambda *_a: (1, "")
+        try:
+            self.app.ledger.run(time.time() + 61)
+        except Exception:  # noqa: BLE001 - the collector reports the failed source; the route is what is tested
+            pass
+        status, value = self.post({"req_id": "wr1", "action": "archive", "reason": "not wanted any more",
+                                   "client_key": "click-key-0401", "digest": digest})  # the rows were reset on the switch
+        self.assertEqual((status, value.get("error")), (409, "session_changed"), value)
+        # once the new session has loaded, a row that belongs to it is accepted, and one from another session is not
+        foreign = dict(REQS, requirements=[dict(REQS["requirements"][0], session=SID)])
+        self.app.runner.outputs["ah-requirements"] = lambda *_a: (0, json.dumps(foreign))
+        self.app.ledger.run(time.time() + 122)
+        status, value = self.click(key="click-key-0402", digest=self.req()["digest"])
+        self.assertEqual((status, value.get("error")), (409, "session_changed"), value)
+        mine = dict(REQS, requirements=[dict(REQS["requirements"][0], session=other)])
+        self.app.runner.outputs["ah-requirements"] = lambda *_a: (0, json.dumps(mine))
+        self.app.ledger.run(time.time() + 183)
+        status, value = self.click(key="click-key-0403", digest=self.req()["digest"])
+        self.assertEqual(status, 201, value)
+        self.assertEqual(self.app.actions.all()[-1]["session"], other)
+
     def test_the_write_routes_in_the_server_match_the_coverage_map(self):
         import re
         server = (REPO / "harness" / "mission_control" / "server.py").read_text()

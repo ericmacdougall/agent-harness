@@ -216,6 +216,42 @@ class LedgerCollector(unittest.TestCase):
             ledger.run(1100.0)
             self.assertEqual(hub.snapshots["ledger"]["requirements"]["items"][0]["bucket"], "live")
 
+    def _ticket_case(self, cache_entry, lookup):
+        """A requirement on goodqa#9 with no ask naming it; returns (bucket, cache entry after one ledger read)."""
+        import tempfile
+        reqs = dict(REQS, requirements=[dict(REQS["requirements"][0], ticket="goodqa#9")])
+        runner = Fake(reqs=reqs)
+        runner.payload["ah-ticket-get"] = lookup
+        if lookup is None:
+            runner.codes["ah-ticket-get"] = 1
+            runner.payload["ah-ticket-get"] = ""
+        with tempfile.TemporaryDirectory() as tmp:
+            needs = Path(tmp) / "needs"
+            needs.mkdir()
+            (needs / "tickets.json").write_text(json.dumps({"goodqa#9": cache_entry}))
+            ledger, hub, _ = make(runner, root=Path(tmp))
+            ledger.run(1000.0)
+            after = json.loads((needs / "tickets.json").read_text()).get("goodqa#9")
+            return hub.snapshots["ledger"]["requirements"]["items"][0]["bucket"], after, runner
+
+    def test_an_expired_closed_cache_entry_with_a_failed_refresh_is_unknown_not_closed(self):
+        # review PR 234 F1: the sweeper only refreshes tickets its asks name; a requirement's ticket must not stay
+        # "closed" forever on a cache row nobody rechecks
+        bucket, after, runner = self._ticket_case({"state": "closed", "at": time.time() - 31 * 60}, None)
+        self.assertEqual(bucket, "live")
+        self.assertIn(("ah-ticket-get", ("goodqa#9",)), runner.calls)  # a bounded refresh was attempted
+        self.assertEqual(after["state"], "closed")  # a failed lookup decides nothing and erases nothing
+
+    def test_a_reopened_ticket_with_no_open_ask_restores_the_requirement(self):
+        bucket, after, _ = self._ticket_case({"state": "closed", "at": time.time() - 31 * 60},
+                                             {"issue": {"closedAt": None, "archivedAt": None}})
+        self.assertEqual((bucket, after["state"]), ("live", "open"))
+
+    def test_a_fresh_closed_entry_still_archives_without_a_lookup(self):
+        bucket, _, runner = self._ticket_case({"state": "closed", "at": time.time() - 60}, None)
+        self.assertEqual(bucket, "archived")
+        self.assertNotIn("ah-ticket-get", [k for k, _ in runner.calls])
+
 
 class ServerIntegration(unittest.TestCase):
     def setUp(self):

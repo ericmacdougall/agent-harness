@@ -121,6 +121,39 @@ def _ticket_state(ref: str, cache: dict, lookup, budget: list, now: float) -> st
     return None  # unknown: never a reason to hide an ask
 
 
+def fresh_state(cache: dict, ref: str, now: float) -> str | None:
+    """'open' or 'closed' only while the cached answer is younger than TICKET_RECHECK_S; otherwise None (unknown)."""
+    known = cache.get(ref) if isinstance(cache, dict) else None
+    if not isinstance(known, dict) or not isinstance(known.get("at"), (int, float)):
+        return None
+    state = known.get("state")
+    return state if state in ("open", "closed") and 0 <= now - known["at"] < TICKET_RECHECK_S else None
+
+
+def refresh_tickets(root: Path, refs, lookup, now: float | None = None, budget: int = 4) -> dict:
+    """Recheck the tickets other views depend on (requirements name tickets no ask may name), at most `budget`
+    lookups, least recently tried first. A failed lookup keeps the last answer and records only the attempt time,
+    so one ticket that keeps failing never starves the others. Returns the cache as written."""
+    now = time.time() if now is None else now
+    folder = needs_dir(root)
+    with _lock(folder):
+        cache = _tickets(folder)
+
+        def tried(ref):
+            known = cache.get(ref) if isinstance(cache.get(ref), dict) else {}
+            return max(float(known.get("at") or 0), float(known.get("tried") or 0))
+        due = sorted({r for r in refs if isinstance(r, str) and r and fresh_state(cache, r, now) is None}, key=lambda r: (tried(r), r))
+        left = [budget]
+        for ref in due:
+            if left[0] <= 0:
+                break
+            if _ticket_state(ref, cache, lookup, left, now) is None:
+                entry = cache.get(ref) if isinstance(cache.get(ref), dict) else {}
+                cache[ref] = dict(entry, tried=now)
+        mc_chat.write_json(folder / "tickets.json", cache)
+    return cache
+
+
 def _gone_owners(owners) -> dict:
     """agent id -> evidence, for owners that are gone AND whose stream was reassigned (a recorded disposition in
     force). A dropped owner with no such record keeps its asks in view."""
