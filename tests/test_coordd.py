@@ -79,6 +79,29 @@ class CoorddTest(unittest.TestCase):
         self.assertEqual(row["state"], "failed")
         self.assertIn("unavailable", row["error"])
 
+    def test_worker_result_must_claim_ok(self):
+        self.assertEqual(coordd.typed_result("did it\nCOORD_RESULT: ok"), (True, "did it"))
+        for out in ("I could not read the file: sandbox failed", "x\nCOORD_RESULT: blocked: sandbox failed",
+                    "COORD_RESULT: ok\ntrailing text", ""):
+            self.assertFalse(coordd.typed_result(out)[0], out)
+
+    def test_transient_worker_failure_retries_once(self):
+        os.environ["COORD_CODEX_POOL"] = __file__  # any existing file: the lane itself is stubbed below
+        calls = []
+        orig = coordd.lane_codex_pool
+        coordd.lane_codex_pool = lambda task, root: (calls.append(1), (False, "worker exit 4: ERROR: Quota exceeded."))[1]
+        try:
+            t = coordd.submit(self.con, "agent", "x", None, "t", None)
+            coordd.run_one(self.con, self.root, chat_only=False)
+            self.assertEqual(self.con.execute("SELECT state FROM tasks WHERE id=?", (t["id"],)).fetchone()[0], "queued")
+            coordd.run_one(self.con, self.root, chat_only=False)
+            coordd.run_one(self.con, self.root, chat_only=False)
+        finally:
+            coordd.lane_codex_pool = orig
+            os.environ["COORD_CODEX_POOL"] = ""
+        self.assertEqual(self.con.execute("SELECT state FROM tasks WHERE id=?", (t["id"],)).fetchone()[0], "failed")
+        self.assertEqual(len(calls), 2)
+
     def test_http_needs_token_and_loopback_host(self):
         coordd.Handler.root, coordd.Handler.token = self.root, (self.root / "token").read_text().strip()
         httpd = ThreadingHTTPServer(("127.0.0.1", 0), coordd.Handler)
