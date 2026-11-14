@@ -7,7 +7,7 @@ switched to whichever session wrote last. This module picks the session on purpo
 - else the mission goal ledger's `mission_session`, read from `ah goals --json` only when its state is "ok";
 - else the last good pin, kept in memory for display only.
 
-Session-scoped writes (requirement archive/restore, ask approvals, chat to main) are allowed only when this tick's
+Session-scoped writes (requirement archive/restore, ask approvals) are allowed only when this tick's
 pin comes from an agreeing config pin or an ok ledger (plan Revision 2, D1/D2). Pure: no writes, no subprocesses.
 """
 from __future__ import annotations
@@ -20,10 +20,18 @@ from pathlib import Path
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
-def claude_session_ok(session, wals_root: Path) -> bool:
-    """A lowercase UUID whose `<wals_root>/<id>/main.jsonl` is a regular file reached without symlinks.
-    The Claude WAL root only: a Codex session id has no directory there and is refused (R4, R5)."""
+def codex_root_for(wals_root: Path) -> Path:
+    """`~/.claude/wals` -> `~/.agent-harness/codex-wals` (the same home)."""
+    return Path(wals_root).parent.parent / ".agent-harness" / "codex-wals"
+
+
+def claude_session_ok(session, wals_root: Path, codex_root: Path | None = None) -> bool:
+    """A lowercase UUID whose `<wals_root>/<id>/main.jsonl` is a regular file reached without symlinks, and which is
+    not a Codex session (R4, R5). Codex sessions can also have a `~/.claude/wals/<id>/main.jsonl` (review A-4 found
+    two on this Mac), so an id present under the Codex WAL root is refused as well."""
     if not isinstance(session, str) or not UUID_RE.fullmatch(session):
+        return False
+    if os.path.lexists(Path(codex_root or codex_root_for(wals_root)) / session):
         return False
     try:
         folder = os.lstat(wals_root / session)

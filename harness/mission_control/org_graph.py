@@ -86,7 +86,7 @@ class Transcripts:
         self.root = Path(os.path.realpath(root))
         self.tail_bytes = tail_bytes
         self.cache: dict[str, tuple] = {}
-        self.dirs: dict[str, list] = {}
+        self.dirs: dict[str, tuple] = {}   # session -> (when, projects root mtime_ns, [session dirs])
 
     def _inside(self, path: Path) -> bool:
         real = Path(os.path.realpath(path))
@@ -97,15 +97,41 @@ class Transcripts:
         info = os.lstat(path)
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or not self._inside(path):
             raise Refused(f"{path.name} is not a regular transcript file under the projects root")
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        # O_NONBLOCK: a FIFO swapped in after the lstat cannot block the collectors thread (review A-5); the fstat
+        # then refuses anything that is not the same regular file the lstat saw
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                raise Refused(f"{path.name} changed while it was opened")
+        except BaseException:
+            os.close(fd)
+            raise
         return os.fdopen(fd, "rb"), info
 
+    DIRS_TTL_S = 30.0
+
     def session_dirs(self, session: str) -> list:
+        """The session's directory in each project. The projects root holds 590+ dirs, so the scan is kept for
+        DIRS_TTL_S (or until the root's mtime changes) instead of running for every agent on every tick (review
+        A-3: 60 lookups took 2.3 s)."""
+        now = time.monotonic()
+        try:
+            root_mtime = os.stat(self.root).st_mtime_ns
+        except OSError:
+            return []
+        hit = self.dirs.get(session)
+        if hit and now - hit[0] < self.DIRS_TTL_S and hit[1] == root_mtime:
+            return hit[2]
         try:
             projects = [Path(e.path) for e in os.scandir(self.root) if e.is_dir(follow_symlinks=False)]
         except OSError:
             return []
-        return [p / session for p in projects if (p / session).is_dir() and not (p / session).is_symlink()]
+        found = [p / session for p in projects if (p / session).is_dir() and not (p / session).is_symlink()]
+        if len(self.dirs) > 16:
+            self.dirs.clear()
+        self.dirs[session] = (now, root_mtime, found)
+        return found
 
     def main_path(self, session: str) -> Path | None:
         for project in self.session_dirs(session):
@@ -133,7 +159,7 @@ class Transcripts:
                 if info.st_size > META_LIMIT:
                     return {}
                 raw = json.loads(handle.read(META_LIMIT))
-        except (OSError, ValueError, Refused):
+        except (OSError, ValueError, RecursionError, Refused):
             return {}
         if not isinstance(raw, dict):
             return {}
@@ -172,8 +198,8 @@ class Transcripts:
                 continue
             try:
                 rec = json.loads(raw)
-            except ValueError:
-                continue  # a truncated or malformed line is skipped (NEG-1)
+            except (ValueError, RecursionError):
+                continue  # a truncated, malformed or absurdly nested line is skipped (NEG-1; review: nested JSON)
             if not isinstance(rec, dict):
                 continue
             if not out["last_ts"] and isinstance(rec.get("timestamp"), str):
@@ -227,7 +253,7 @@ def escalations(root: Path | None, *, max_files: int = 200, max_age_s: float = 8
             fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             with os.fdopen(fd, "rb") as handle:
                 state = json.loads(handle.read(limit))
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             continue
         if not isinstance(state, dict):
             continue
@@ -500,7 +526,7 @@ class OrgGraph:
         self.inbox_fn = inbox_fn or (lambda: (0, 0))
         self.on_initiatives, self.initiatives_sig = None, None
         self.snapshot_data: dict | None = None
-        self.metas: dict[str, dict] = {}
+        self.metas: dict[str, tuple] = {}   # agent id -> (meta file fingerprint, fields)
         self.tickets: dict[str, dict] = {}
         self.ticket_at: dict[str, float] = {}
         self.ticket_stale: dict[str, bool] = {}
@@ -580,7 +606,7 @@ class OrgGraph:
         if due:
             try:
                 self._ticket(due[0], now)
-            except (ValueError, OSError, Refused):
+            except (ValueError, OSError, RecursionError, Refused):
                 self.ticket_stale[due[0]] = True
                 self.ticket_at[due[0]] = now - TICKET_TTL_S / 2   # retry after half the TTL, not every tick
 
@@ -597,10 +623,19 @@ class OrgGraph:
         agents = []
         for row in rows:
             agent_id = str(row["agent_id"])
-            meta = self.metas.get(agent_id)
-            if meta is None or not meta:
+            # review A-8: the meta is re-read when its file changes (finished, type), not cached for ever
+            meta_path = self.transcripts.agent_path(session, agent_id, ".meta.json") if session else None
+            try:
+                st = os.lstat(meta_path) if meta_path else None
+                fp = (st.st_ino, st.st_size, st.st_mtime_ns) if st else None
+            except OSError:
+                fp = None
+            hit = self.metas.get(agent_id)
+            if hit and hit[0] == fp and fp is not None:
+                meta = hit[1]
+            else:
                 meta = self.transcripts.meta(session, agent_id) if session else {}
-                self.metas[agent_id] = meta
+                self.metas[agent_id] = (fp, meta)
             facts = self.transcripts.facts(self.transcripts.agent_path(session, agent_id, ".jsonl") if session else None)
             agents.append({"agent_id": agent_id, "type": row.get("type") or meta.get("type") or "",
                            "parent": meta.get("parent"), "depth": meta.get("depth"), "state": row.get("state"),
@@ -610,6 +645,8 @@ class OrgGraph:
                            "cap_role": row.get("role") if row.get("role") in ("helper", "live", "parked") else None,
                            "serves": row.get("serves") if AGENT_RE.match(str(row.get("serves") or "")) else None,
                            "description": meta.get("description") or "", **facts})
+        seen = {a["agent_id"] for a in agents}
+        self.metas = {k: v for k, v in self.metas.items() if k in seen}
         wanted = []
         for agent in agents:
             ref = ticket_ref(agent["ticket"]) or ticket_ref(agent["task"])

@@ -357,12 +357,15 @@ class App:
         self.remote = col.Remote(self.hub, self.health, self.runner, enabled=remote, fabric=bool(fabric_bin),
                                  drop_dir=root / "sources")
         self.drop = col.FileDrop(self.hub, self.health, self.reader, root / "sources")
-        self.asks = col.Asks(self.hub, self.health, self.runner, lambda: self.owners.session, root=root,
+        # goodqa#15961 review A-1: the asks and the ledger follow the pin itself, never the owners read's session,
+        # which lags a pin change by up to one owners tick
+        self.asks = col.Asks(self.hub, self.health, self.runner, lambda: self.pin()["display"], root=root,
                              owners_fn=lambda: self.owners.rows)
         self.tailer.on_ask = self.asks.mark_dirty
         self.actions = req_actions.ReqActions(root, self.key)
-        self.ledger = col.Ledger(self.hub, self.health, self.runner, lambda: self.owners.session, root=root,
-                                 actions=self.actions)
+        self.ledger = col.Ledger(self.hub, self.health, self.runner, lambda: self.pin()["display"], root=root,
+                                 actions=self.actions,
+                                 restricted_fn=lambda: [r["agent_id"] for r in self.owners.rows if r.get("restricted")])
         # The Topology tab's org graph: live owners, their transcripts' model/effort fields and their tickets.
         # Demo mode reads only its fixture transcripts and no escalation state (never the real ~/.claude).
         self.org = org_graph.OrgGraph(
@@ -602,6 +605,9 @@ class App:
             if isinstance(req, str) else None
         if item is None:
             return 409, {"error": "unknown-requirement", "message": "this requirement is not in the current ledger read"}
+        if self.ledger.read_session != session or item.get("session") not in ("", session):
+            # review A-1: the list on hand was read for another session (the pin moved since the last ledger read)
+            return 409, {"error": "session_changed", "message": "the requirement list is from another session; reload"}
         if not isinstance(digest, str) or not hmac.compare_digest(digest.encode("utf-8", "replace"), item["digest"].encode()):
             return 409, {"error": "stale-digest", "message": "the requirement changed since it was shown; read it again"}
         if action == "archive" and item["bucket"] == "archived":

@@ -220,7 +220,7 @@ class LedgerCollector(unittest.TestCase):
 class ServerIntegration(unittest.TestCase):
     def setUp(self):
         sys.path.insert(0, str(REPO / "tests"))
-        from test_mission_control import ServerHarness  # noqa: PLC0415
+        from test_mission_control import ServerHarness, pin_app  # noqa: PLC0415
 
         class H(ServerHarness):
             def runTest(self):
@@ -231,7 +231,7 @@ class ServerIntegration(unittest.TestCase):
         self.h.app.runner.outputs.update({
             "ah-goals": (0, json.dumps(GOALS)), "ah-requirements": lambda *_a: (0, json.dumps(REQS)),
             "ah-status": lambda *_a: (0, json.dumps(STATUS))})
-        self.h.app.owners.session = SID
+        pin_app(self.h.app, SID)   # goodqa#15961: the ledger follows the pin, not owners.session
 
     def test_state_carries_the_ledger_and_the_loop_reads_it(self):
         self.h.app.ledger.run(time.time())
@@ -287,7 +287,7 @@ class Coverage(unittest.TestCase):
     def test_every_state_key_and_snapshot_field_is_mapped(self):
         mapping = json.loads((REPO / "harness" / "mission_control" / "web" / "coverage.json").read_text())
         sys.path.insert(0, str(REPO / "tests"))
-        from test_mission_control import ServerHarness  # noqa: PLC0415
+        from test_mission_control import ServerHarness, pin_app  # noqa: PLC0415
 
         class H(ServerHarness):
             def runTest(self):

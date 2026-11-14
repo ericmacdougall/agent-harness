@@ -41,6 +41,7 @@
   "goals": "goals-list",
   "requirements": "requirements-body",
   "status": "deploys-panel",
+  "session": "internal",
   "generated": "sources-panel"
  },
  "routes": {

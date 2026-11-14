@@ -470,5 +470,47 @@ class FeedAdditions(unittest.TestCase):
             self.assertEqual(item.snapshot()["mtime"], path.stat().st_mtime)
 
 
+
+class RestrictedProducerShape(unittest.TestCase):
+    """Review A-2: the real `ah owners` shape for a restricted row is task None, restricted True and the ticket kept.
+    Run it end to end (collector, initiatives, graph): no ticket title or task text may reach the UI."""
+
+    class Health:
+        def ok(self, *a):
+            pass
+        error = off = ok
+
+    def test_restricted_ah_row_never_shows_its_ticket_or_title(self):
+        hub = Hub()
+        hub.publish = lambda *a, **k: None
+        owners = col.Owners(hub, self.Health(), runner=None, tailer=None)
+        ah_row = {"agent_id": "a1234567890abcdef", "type": "task-owner", "task": None, "restricted": True,
+                  "owner": True, "state": "live", "severity": "info", "idle_s": 5, "ticket": "goodqa#777",
+                  "last_activity": "", "last_reply": "secret reply", "stream": "secret stream"}
+        owners._rows({"session": "s", "owners": [ah_row]}, 1.0)
+        row = owners.rows[0]
+        self.assertEqual((row["restricted"], row["ticket"], row["task"], row["stream"], row["last_reply"]),
+                         (True, "", "", "", ""))
+        self.assertEqual(owners.tickets(), [])
+        tickets = {"goodqa#777": {"title": "SECRET interview loop", "status": "in_progress"}}
+        out = og.derive_initiatives({"items": [], "mtime": None}, owners.rows, tickets, now=2.0)
+        self.assertNotIn("SECRET", json.dumps(out))
+        agent = {"agent_id": row["agent_id"], "type": row["type"], "state": row["state"], "task": row["task"],
+                 "ticket": row["ticket"], "restricted": row["restricted"], "owner_flag": True,
+                 "cap_role": row.get("role"), "description": ""}
+        snap = og.build(session="s", coordinator={}, agents=[agent], tickets=tickets, escalation={}, host="h", now=2.0)
+        self.assertNotIn("SECRET", json.dumps(snap))
+        self.assertNotIn("goodqa#777", json.dumps(snap))
+
+    def test_status_view_hides_restricted_owners_notes(self):
+        ledger = col.Ledger(Hub(), self.Health(), runner=None, session_fn=lambda: "s",
+                            restricted_fn=lambda: ["a1234567890abcdef"])
+        out = ledger._status({"verified": [
+            {"id": "w1", "agent": "a1234567890abcdef", "at": "2026-11-13T01:00:00Z", "event": "result", "note": "candidate notes"},
+            {"id": "w2", "agent": "a2", "at": "2026-11-13T01:00:01Z", "event": "result", "note": "mock Interview prep"},
+            {"id": "w3", "agent": "a3", "at": "2026-11-13T01:00:02Z", "event": "result", "note": "org graph shipped"}]}, 0)
+        notes = {r["id"]: r["note"] for r in out["verified"]}
+        self.assertEqual(notes, {"w1": "restricted", "w2": "restricted", "w3": "org graph shipped"})
+
 if __name__ == "__main__":
     unittest.main()

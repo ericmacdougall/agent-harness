@@ -847,6 +847,11 @@ class Owners(Collector):
                     "parent": parent if isinstance(parent := row.get("parent"), str)
                     and re.fullmatch(r"[A-Za-z0-9_-]{1,40}", parent) else None,
                     "source": "ah", "session": ev.short(self.session, 64)}
+            # review A-2: `ah owners` blanks a restricted row's task but keeps its ticket; the flag must survive here
+            # and the ticket (whose GoodQA title would be fetched and shown), stream and last reply are dropped too
+            item["restricted"] = row.get("restricted") is True
+            if item["restricted"]:
+                item.update(task="", stream="", last_reply="", ticket="")
             item["role"] = owner_role(item)
             rows.append(item)
             previous = self.states.get(agent)
@@ -958,6 +963,7 @@ class Owners(Collector):
 
 
 ASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+RESTRICTED_TEXT = re.compile(r"\b(solve|interview)", re.I)  # as ah.py RESTRICTED: fail closed, liveness only
 
 
 class Asks(Collector):
@@ -993,6 +999,11 @@ class Asks(Collector):
             self.next_at = now + 10  # the owners collector learns main's session shortly after start
             self.health.off(self.name, "no main session known yet")
             return "off"
+        if self.session and session != self.session:
+            # the pin moved: never keep showing the previous session's asks while the new read runs or fails (A-1)
+            with self.lock:
+                self.publish({"items": [], "stale": [], "flagged": [], "cleared": [], "resolved": [], "swept_at": ""},
+                             session)
         self.refresh(session, now)
         return f"{len(self.items)} open, {len(self.stale)} stale, {len(self.flagged)} flagged"
 
@@ -1161,9 +1172,10 @@ class Ledger(Collector):
     STATUS_LISTS = ("verified", "live", "pending", "failed", "claimed", "blockers", "commits", "asks_open",
                     "decisions", "assumptions", "live_legacy")
 
-    def __init__(self, hub, health, runner, session_fn, root=None, actions=None):
+    def __init__(self, hub, health, runner, session_fn, root=None, actions=None, restricted_fn=None):
         super().__init__(hub, health)
         self.runner, self.session_fn, self.root = runner, session_fn, root
+        self.restricted_fn = restricted_fn  # agent ids `ah owners` flagged restricted (their notes are hidden)
         self.actions = actions  # req_actions.ReqActions: the user's archive and restore clicks
         self.raw_requirements: list[dict] = []
         self.raw_total, self.raw_truncated = 0, False
@@ -1176,6 +1188,18 @@ class Ledger(Collector):
             self.parts["status"][key] = []
         self.sig = None
         self.published_at = ""
+        self.read_session = ""   # the session the requirements and status parts were read for
+
+    def _reset_session_parts(self) -> None:
+        """A new pinned session never inherits the previous session's requirements or status, even when its own
+        first read fails (review A-1): an empty, unread part is shown instead."""
+        self.raw_requirements, self.raw_total, self.raw_truncated = [], 0, False
+        self.parts["requirements"] = {"stale": False, "error": "", "at": "", "items": [], "total": 0,
+                                      "truncated": False, "summary": archive.summary([])}
+        status = {"stale": False, "error": "", "at": "", "counts": {}, "since_s": 0, "entries": 0, "owners": {}}
+        for key in self.STATUS_LISTS:
+            status[key] = []
+        self.parts["status"] = status
 
     # -- one source
     def _read(self, part: str, label: str, kind: str, args: tuple, parse, now: float) -> str:
@@ -1207,6 +1231,9 @@ class Ledger(Collector):
         if errors[0]:
             self.mission = {"state": "error", "mission_session": ""}   # a failed read never keeps a writable pin (D1)
         session = self.session_fn() or ""
+        if session != self.read_session:
+            self._reset_session_parts()
+            self.read_session = session
         if session:
             errors.append(self._read("requirements", "ah requirements", "ah-requirements", (session,), self._requirements, now))
             errors.append(self._read("status", "ah status", "ah-status", (session,), self._status, now))
@@ -1315,9 +1342,14 @@ class Ledger(Collector):
                 "summary": archive.summary(classified)}
 
     def _status(self, data: dict, now: float) -> dict:
+        hidden = set(self.restricted_fn() or ()) if self.restricted_fn else set()
+
         def entry(raw):
-            return {"id": ev.short(raw.get("id"), 40), "agent": ev.short(raw.get("agent"), 40), "at": ev.short(raw.get("at"), 40),
-                    "event": ev.short(raw.get("event"), 20), "note": ev.short(raw.get("note"), 400),
+            agent, note = ev.short(raw.get("agent"), 40), ev.short(raw.get("note"), 400)
+            if agent in hidden or RESTRICTED_TEXT.search(note):
+                note = "restricted"   # review A-2: a restricted owner's notes never reach the Status view
+            return {"id": ev.short(raw.get("id"), 40), "agent": agent, "at": ev.short(raw.get("at"), 40),
+                    "event": ev.short(raw.get("event"), 20), "note": note,
                     "check": ev.short(raw.get("check"), 80), "verdict": ev.short(raw.get("verdict"), 12)}
         out: dict = {"counts": {}}
         for key in self.STATUS_LISTS:
@@ -1350,7 +1382,7 @@ class Ledger(Collector):
     # -- publication
     def snapshot(self) -> dict:
         return {"goals": self.parts["goals"], "requirements": self.parts["requirements"], "status": self.parts["status"],
-                "generated": self.published_at}
+                "session": self.read_session, "generated": self.published_at}
 
     def publish(self) -> None:
         """Push the snapshot only when its content changed; the read time alone is not a change."""

@@ -76,6 +76,14 @@ class Resolve(unittest.TestCase):
         self.assertEqual(ledger_codex["display"], "")
         self.assertTrue(any("not a Claude session" in w for w in ledger_codex["warnings"]))
 
+    def test_a_codex_session_with_a_claude_wal_dir_is_refused(self):  # review A-4: seen twice on the real Mac
+        (self.h.claude / CODEX).mkdir()
+        (self.h.claude / CODEX / "main.jsonl").write_text("{}\n")
+        self.assertFalse(sp.claude_session_ok(CODEX, self.h.claude))
+        pin = sp.resolve(config_pin=None, ledger={"state": "ok", "mission_session": CODEX}, wals_root=self.h.claude)
+        self.assertEqual((pin["display"], pin["write"]), ("", ""))
+        self.assertTrue(sp.claude_session_ok(MAIN, self.h.claude))
+
     def test_symlinked_session_or_main_wal_is_refused(self):  # NEG-1
         target = self.h.home / "elsewhere"
         target.mkdir()
@@ -158,6 +166,63 @@ class Wiring(unittest.TestCase):
         self.assertEqual(app.pin()["write_error"], "pin_mismatch")
         self.assertEqual(app.health.rows["session-pin"]["status"], "error")
 
+
+    # review A-1 (red-team of 85fe28f2): the requirement list must be the pinned session's, never a lagging read's
+    def _reqs(self, app):
+        app.runner.outputs["ah-requirements"] = lambda s: (0, json.dumps({"requirements": [
+            {"id": "w" + s[:11].replace("-", "0"), "session": s, "text": "req of " + s, "at": "2026-11-13T00:00:00Z"}]}))
+        app.runner.outputs["ah-status"] = (0, "{}")
+
+    def _archive(self, app, item, shown):
+        return app.post_requirement({"req_id": item["id"], "action": "archive", "reason": "done",
+                                     "digest": item["digest"], "client_key": "k" * 12, "session": shown})
+
+    def test_the_ledger_rereads_for_the_new_pin_in_the_same_tick(self):
+        goals = {"state": "ok", "mission_session": MAIN, "goals": []}
+        app, _ = self.app(goals)
+        self._reqs(app)
+        app.ledger.run(time.time())
+        self.assertEqual(app.ledger.parts["requirements"]["items"][0]["session"], MAIN)
+        app.runner.outputs["ah-goals"] = (0, json.dumps(dict(goals, mission_session=OTHER)))
+        app.ledger.next_at = 0
+        app.ledger.run(time.time())      # the owners collector has not ticked: owners.session is still MAIN or empty
+        item = app.ledger.parts["requirements"]["items"][0]
+        self.assertEqual((app.pin()["write"], item["session"], app.ledger.read_session), (OTHER, OTHER, OTHER))
+        status, _ = self._archive(app, item, OTHER)
+        self.assertEqual(status, 201)
+        self.assertEqual(app.actions.all()[-1]["session"], OTHER)
+
+    def test_a_failed_read_for_the_new_pin_never_keeps_the_old_sessions_list(self):
+        goals = {"state": "ok", "mission_session": MAIN, "goals": []}
+        app, _ = self.app(goals)
+        self._reqs(app)
+        app.ledger.run(time.time())
+        old = app.ledger.parts["requirements"]["items"][0]
+        app.runner.outputs["ah-goals"] = (0, json.dumps(dict(goals, mission_session=OTHER)))
+        app.runner.outputs["ah-requirements"] = (1, "")
+        app.ledger.next_at = 0
+        try:
+            app.ledger.run(time.time())
+        except RuntimeError:
+            pass
+        self.assertEqual(app.ledger.parts["requirements"]["items"], [])
+        status, body = self._archive(app, old, OTHER)
+        self.assertEqual((status, body["error"]), (409, "unknown-requirement"))
+        self.assertEqual(app.actions.all(), [])
+
+    def test_a_list_read_for_another_session_is_refused(self):
+        goals = {"state": "ok", "mission_session": MAIN, "goals": []}
+        app, _ = self.app(goals)
+        self._reqs(app)
+        app.ledger.run(time.time())
+        item = app.ledger.parts["requirements"]["items"][0]
+        app.runner.outputs["ah-goals"] = (0, json.dumps(dict(goals, mission_session=OTHER)))
+        app.ledger._read("goals", "ah goals", "ah-goals", (), app.ledger._goals, time.time())  # pin moves, list not yet
+        app.ledger.mission = {"state": "ok", "mission_session": OTHER}
+        self.assertEqual((app.pin()["write"], app.ledger.read_session), (OTHER, MAIN))
+        status, body = self._archive(app, item, OTHER)
+        self.assertEqual((status, body["error"]), (409, "session_changed"))
+        self.assertEqual(app.actions.all(), [])
 
 if __name__ == "__main__":
     unittest.main()
