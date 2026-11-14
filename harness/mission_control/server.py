@@ -362,6 +362,7 @@ class App:
         self.asks = col.Asks(self.hub, self.health, self.runner, lambda: self.pin()["display"], root=root,
                              owners_fn=lambda: self.owners.rows)
         self.tailer.on_ask = self.asks.mark_dirty
+        self.asks.restricted_fn = lambda: self.owners.restricted[1]   # review P-2
         self.tailer.note_visible = lambda runtime, session, agent: (
             session == self.owners.unrestricted[0] and agent in self.owners.unrestricted[1])   # review R-2
         self.actions = req_actions.ReqActions(root, self.key)

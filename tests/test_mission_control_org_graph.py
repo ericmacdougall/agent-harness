@@ -568,5 +568,27 @@ class RestrictedProducerShape(unittest.TestCase):
         self.assertNotIn("interview", text)
         self.assertNotIn("Jane", text)
 
+    def test_any_owner_row_naming_restricted_work_is_scrubbed(self):  # review P-1 (Codex and supervised rows)
+        codex = {"agent_id": "codex:t:main", "runtime": "codex", "task": "Observed native Codex WAL", "stream": "",
+                 "name": "proj", "last_reply": "", "state": "observed",
+                 "last_item": {"note": "solve tuning: candidate Jane", "progress_note": ""}}
+        plain = dict(codex, agent_id="codex:t2:main", last_item={"note": "org graph shipped"})
+        scrubbed = col.scrub_restricted_row(codex)
+        self.assertEqual((scrubbed["restricted"], scrubbed["last_item"]), (True, None))
+        self.assertNotIn("Jane", json.dumps(scrubbed))
+        self.assertEqual(col.scrub_restricted_row(plain)["last_item"]["note"], "org graph shipped")
+
+    def test_asks_naming_restricted_work_or_from_restricted_owners_are_hidden(self):  # review P-2
+        sys.path.insert(0, str(REPO / "harness" / "hooks"))
+        by_text = col.Asks.item("s", {"id": "w1", "owner": "a2", "note": "interview rubric for candidate Jane D",
+                                      "reason": "needs your call"})
+        by_owner = col.Asks.item("s", {"id": "w2", "owner": "a1234567890abcdef", "note": "pick a slot",
+                                       "reason": "x"}, frozenset({"a1234567890abcdef"}))
+        plain = col.Asks.item("s", {"id": "w3", "owner": "a2", "note": "approve PR 245 merge", "reason": "gate"})
+        self.assertNotIn("Jane", json.dumps(by_text))
+        self.assertNotIn("pick a slot", json.dumps(by_owner))
+        self.assertFalse(by_text["approvable"] or by_owner["approvable"])
+        self.assertEqual(plain["text"], "approve PR 245 merge")
+
 if __name__ == "__main__":
     unittest.main()

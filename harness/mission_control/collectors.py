@@ -731,6 +731,7 @@ class Owners(Collector):
         # review A-2b: agents the last full `ah owners` read showed as NOT restricted, for (session, ids); taken before
         # the 6 h and 60-row cuts. The Status view shows notes only from main and these agents.
         self.unrestricted: tuple = ("", frozenset())
+        self.restricted: tuple = ("", frozenset())   # the same read's restricted ids (asks they registered are hidden)
 
     def publish(self):
         managed = []
@@ -782,6 +783,7 @@ class Owners(Collector):
         # freshness of the ah snapshot is tracked apart from runtime freshness: a merged Codex row's own
         # source_stale must never make a cached ah role look current (code inspection F1)
         ah_stale = any(r.get('source_stale') for r in self.claude_rows)
+        rows = [scrub_restricted_row(r) for r in rows]
         for r in rows:
             if r.get('source') != 'ah':  # rows from ah carry the cap's role; Codex rows get the same three roles
                 r['role'] = codex_role(r)
@@ -835,6 +837,9 @@ class Owners(Collector):
         self.unrestricted = (str(data.get("session") or ""), frozenset(
             str(r.get("agent_id")) for r in data.get("owners") or []
             if isinstance(r, dict) and r.get("restricted") is False and isinstance(r.get("agent_id"), str)))
+        self.restricted = (str(data.get("session") or ""), frozenset(
+            str(r.get("agent_id")) for r in data.get("owners") or []
+            if isinstance(r, dict) and r.get("restricted") is True and isinstance(r.get("agent_id"), str)))
         for row in data.get("owners") or []:
             if not isinstance(row, dict):
                 continue
@@ -985,6 +990,20 @@ class Owners(Collector):
 
 ASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 RESTRICTED_TEXT = re.compile(r"\b(solve|interview)", re.I)  # as ah.py RESTRICTED: fail closed, liveness only
+HIDDEN_NOTE = "note hidden (restricted or not in the current owner read)"
+
+
+def scrub_restricted_row(row: dict) -> dict:
+    """The owners panel's one exit check (review P-1): any row, Claude, Codex or supervised, whose text fields name
+    restricted work loses them, and a row already marked restricted keeps none. Liveness fields stay."""
+    item = row.get("last_item") if isinstance(row.get("last_item"), dict) else {}
+    text = " ".join(str(row.get(k) or "") for k in ("task", "stream", "last_reply", "name")) + " " + \
+        " ".join(str(item.get(k) or "") for k in ("note", "progress_note"))
+    if row.get("restricted") is True or RESTRICTED_TEXT.search(text):
+        row = dict(row, restricted=True, task="", stream="", last_reply="", ticket="", last_item=None)
+        if RESTRICTED_TEXT.search(str(row.get("name") or "")):
+            row["name"] = "restricted"
+    return row
 
 
 class Asks(Collector):
@@ -1053,6 +1072,8 @@ class Asks(Collector):
             if not isinstance(row, dict) or not ASK_ID_RE.match(str(row.get("id", ""))):
                 continue
             note = ev.short(str(row.get("note", "")), 400)
+            if RESTRICTED_TEXT.search(note + " " + str(row.get("resolution", ""))) or str(row.get("owner", "")) in self.restricted_ids():
+                note, row = HIDDEN_NOTE, dict(row, resolution="")
             resolved.append({"id": str(row["id"]), "at": str(row.get("at", ""))[:40], "text": note,
                              "ticket": _ticket_in(note), "owner": ev.short(str(row.get("owner", "")), 60),
                              "resolved_at": str(row.get("resolved_at", ""))[:40],
@@ -1069,11 +1090,12 @@ class Asks(Collector):
         import needs_sweep as _sweep  # noqa: PLC0415
         pending = [r for r in blocked if _sweep.unchecked(r)]
         blocked = [r for r in blocked if not _sweep.unchecked(r)]
+        restricted = self.restricted_ids()
         for row in raw + pending:
             verdict = status.get(str(row["id"]), {"state": "active"})
             if verdict["state"] == "cleared":
                 continue  # settled: listed under cleared-recently with its reason, never as an open ask
-            item = self.item(session, row)
+            item = self.item(session, row, restricted)
             if row in pending:
                 # Listed so the user sees it, but nothing verified its source: never a signed Approve or Deny.
                 item.update(unchecked="Its source could not be checked this sweep: " + ev.short(str(row.get("problem", "")), 120),
@@ -1085,7 +1107,7 @@ class Asks(Collector):
                 view["items"].append(item)
         for row in blocked:
             verdict = status.get(str(row["id"]))
-            item = self.item(session, row)
+            item = self.item(session, row, restricted)
             why = verdict["reason"] if verdict else "no traceable source: " + ev.short(str(row.get("problem", "")), 160)
             view["flagged"].append(dict(item, digest="", approvable=False, flagged=why,
                                         blocked="This ask does not trace to a real source, so it is not shown as a valid ask. Main has to restate it with its source."))
@@ -1120,8 +1142,12 @@ class Asks(Collector):
                 out[ident] = max(out.get(ident, 0), stamp)
         return out
 
+    def restricted_ids(self) -> frozenset:
+        fn = getattr(self, "restricted_fn", None)
+        return frozenset(fn() or ()) if fn else frozenset()
+
     @staticmethod
-    def item(session: str, raw: dict) -> dict:
+    def item(session: str, raw: dict, restricted: frozenset = frozenset()) -> dict:
         """One open ask as the page shows it. `text` and `why` are the whole ask (redacted, never clipped) and
         `digest` covers exactly them, so what the user reads is what a decision signs. An ask that cannot be shown
         whole, that an owner registered, or that needs the terminal carries `blocked` and is not approvable."""
@@ -1129,7 +1155,11 @@ class Asks(Collector):
         ask_id, owner = str(raw["id"]), ev.short(str(raw.get("owner", "")), 60)
         note, reason = str(raw.get("note", "")), str(raw.get("reason", ""))
         text, why, digest, blocked = ev.short(note, mc_chat.MAX_TEXT), ev.short(reason, mc_chat.REASON_MAX), "", ""
-        if owner != "main":
+        if owner in restricted or RESTRICTED_TEXT.search(note + " " + reason):
+            # review P-2: restricted work is never shown here, whoever registered it; answer it in the terminal
+            text, why = "Restricted ask: open it in the terminal session that registered it.", ""
+            blocked = "Restricted work is not shown in Mission Control. Answer it in the terminal."
+        elif owner != "main":
             blocked = "Registered by an owner, not by main. Answer with a reply; main decides what to do with it."
         else:
             try:
@@ -1694,6 +1724,8 @@ class Remote(Collector):
             parts = path.rstrip("/").split("/")
             session, agent = (parts[-2] if len(parts) > 1 else ""), re.sub(r"^agent-|\.jsonl$", "", parts[-1])
             note = _note(entry) or str(entry.get("event") or "")
+            if RESTRICTED_TEXT.search(note):
+                note = HIDDEN_NOTE   # review P-3
             self.hub.publish(ev.make("wal", "t2-dev-wal", f"{entry.get('event', '')}: {note}",
                                      eid=f"t2wal:{session}:{agent}:{abs(hash(newest)) % 10**12}",
                                      actor={"runtime": "claude", "session": session, "agent": agent},
