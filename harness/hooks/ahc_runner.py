@@ -203,7 +203,8 @@ CREATE TABLE IF NOT EXISTS items (
   id TEXT PRIMARY KEY, lineage TEXT NOT NULL, owner TEXT NOT NULL, ticket TEXT NOT NULL,
   state TEXT NOT NULL, next_action_at REAL, submitted REAL NOT NULL,
   lease_token INTEGER NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0,
-  attempts TEXT NOT NULL DEFAULT '{}', request TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}', updated REAL);
+  attempts TEXT NOT NULL DEFAULT '{}', request TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}', updated REAL,
+  entered_at REAL, esc_n INTEGER NOT NULL DEFAULT 0, esc_at REAL, disposed_at REAL);
 CREATE INDEX IF NOT EXISTS items_due ON items(state, next_action_at);
 CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, item TEXT NOT NULL, event TEXT NOT NULL, at REAL NOT NULL, data TEXT);
@@ -220,10 +221,33 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 """
 
 
-SCHEMA_VERSION = 1
-# Forward-only migrations: MIGRATIONS[n] takes a database at version n-1 to version n. Version 0 is a ledger written
-# before schema_version existed (same tables). Each runs inside one transaction after a file copy (spec v14, NEG-37).
-MIGRATIONS = {1: []}
+SCHEMA_VERSION = 2
+# D20 timing columns (v2): entered_at = when the item entered its current state (a same-state settle keeps it);
+# esc_n = the escalation number <n> in the critical alert key ahc:<item>:<n>, bumped once per escalation in the same
+# transaction as its notice, never by a retry; esc_at = the last D20 escalation; disposed_at = a recorded disposition.
+V2_COLUMNS = (("entered_at", "REAL"), ("esc_n", "INTEGER NOT NULL DEFAULT 0"), ("esc_at", "REAL"),
+              ("disposed_at", "REAL"))
+
+
+def _migrate_v2(db):
+    have = {row[1] for row in db.execute("PRAGMA table_info(items)")}
+    for name, decl in V2_COLUMNS:
+        if name not in have:  # the v0 path ran SCHEMA (which already has them) first
+            db.execute("ALTER TABLE items ADD COLUMN %s %s" % (name, decl))
+    for row in db.execute("SELECT id, data, updated, submitted, entered_at, esc_n FROM items").fetchall():
+        try:
+            routed = int(json.loads(row[1] or "{}").get("routed_escalations", 0) or 0)
+        except (ValueError, TypeError, AttributeError):
+            routed = 0
+        db.execute("UPDATE items SET entered_at=COALESCE(entered_at, ?), esc_n=MAX(esc_n, ?) WHERE id=?",
+                   (row[2] if row[2] is not None else row[3], routed, row[0]))
+
+
+# Forward-only migrations: MIGRATIONS[n] takes a database at version n-1 to version n; each step is a list of SQL
+# statements or callables taking the connection. Version 0 is a ledger written before schema_version existed (same
+# tables). All steps run inside one transaction after a verified online backup (spec v14 NEG-37, v17 F2); a failure
+# restores that backup and moves the failed database files aside, never deleting them.
+MIGRATIONS = {1: [], 2: [_migrate_v2]}
 
 
 class SchemaError(RuntimeError):
@@ -274,27 +298,65 @@ class Ledger:
                               % (version, SCHEMA_VERSION))
         if version == SCHEMA_VERSION:
             return
-        self.backup("pre-v%d" % SCHEMA_VERSION)
-        with self.tx():
-            for step in range(version + 1, SCHEMA_VERSION + 1):
-                if step == 1:
-                    for statement in _statements(SCHEMA):
-                        self.db.execute(statement)
-                for statement in MIGRATIONS[step]:
-                    self.db.execute(statement)
-            self.db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('schema_version', ?)",
-                            (str(SCHEMA_VERSION),))
+        copy = self.backup("pre-v%d" % SCHEMA_VERSION)
+        try:
+            with self.tx():
+                for step in range(version + 1, SCHEMA_VERSION + 1):
+                    if step == 1:
+                        for statement in _statements(SCHEMA):
+                            self.db.execute(statement)
+                    for statement in MIGRATIONS[step]:
+                        statement(self.db) if callable(statement) else self.db.execute(statement)
+                self.db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('schema_version', ?)",
+                                (str(SCHEMA_VERSION),))
+        except Exception as error:
+            aside = self.restore(copy)
+            raise SchemaError("ledger migration v%d->v%d failed (%s); restored the verified backup %s and moved the "
+                              "failed database files aside as %s" % (version, SCHEMA_VERSION, type(error).__name__,
+                                                                      copy.name, ", ".join(aside))) from error
+
+    def _counts(self, db):
+        tables = [row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE "
+                                               "'sqlite_%' ORDER BY name")]
+        return {table: db.execute('SELECT COUNT(*) FROM "%s"' % table.replace('"', '""')).fetchone()[0]
+                for table in tables}
 
     def backup(self, label):
-        """Copy the whole database (SQLite online backup) before a migration; returns the copy path."""
-        target = self.path.with_name("%s.%s.%d.bak" % (self.path.name, label, int(time.time())))
+        """Copy the whole database with the SQLite online backup API (it includes committed rows still in the -wal
+        file), then prove the copy: integrity_check is ok and every table has the same row count as the source.
+        Returns the copy path; raises SchemaError (and the migration does not start) if the copy is not proven."""
+        target = self.path.with_name("%s.%s.%d.bak" % (self.path.name, label, time.time_ns()))
         copy = sqlite3.connect(str(target))
         try:
             self.db.backup(copy)
+            check = copy.execute("PRAGMA integrity_check").fetchall()
+            source, copied = self._counts(self.db), self._counts(copy)
         finally:
             copy.close()
         os.chmod(target, 0o600)
+        if [tuple(row) for row in check] != [("ok",)] or source != copied:
+            raise SchemaError("ledger backup %s failed verification (integrity %r, rows %r vs %r); not migrating"
+                              % (target.name, [tuple(r) for r in check][:3], source, copied))
         return target
+
+    def restore(self, copy):
+        """Put the verified backup back after a failed migration. The live database, -wal and -shm files are moved
+        aside together under one suffix (never deleted), then the backup is copied into place. Returns the moved
+        names. The connection is reopened on the restored file."""
+        self.db.close()
+        suffix = ".failed-%d" % time.time_ns()
+        moved = []
+        for extra in ("", "-wal", "-shm"):
+            source = Path(str(self.path) + extra)
+            if os.path.lexists(str(source)):
+                target = Path(str(self.path) + suffix + extra)
+                os.rename(str(source), str(target))
+                moved.append(target.name)
+        shutil.copyfile(str(copy), str(self.path))
+        os.chmod(self.path, 0o600)
+        self.db = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
+        self.db.row_factory = sqlite3.Row
+        return moved
 
     def close(self):
         self.db.close()
@@ -330,9 +392,9 @@ class Ledger:
         with self.tx():
             self.db.execute(
                 "INSERT OR IGNORE INTO items(id, lineage, owner, ticket, state, next_action_at, submitted, request,"
-                " updated) VALUES (?,?,?,?,?,?,?,?,?)",
+                " updated, entered_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (iid, "%s|%s" % (req["repo"], req["pr"]), req["owner"], req["ticket"], "queued",
-                 req["submitted"], req["submitted"], json.dumps(req, sort_keys=True), time.time()))
+                 req["submitted"], req["submitted"], json.dumps(req, sort_keys=True), time.time(), req["submitted"]))
             self.db.execute("INSERT OR IGNORE INTO lineage(lineage) VALUES (?)", ("%s|%s" % (req["repo"], req["pr"]),))
             self.db.execute("INSERT INTO events(item, event, at, data) VALUES (?,?,?,?)",
                             (iid, "accepted", time.time(), "{}"))
@@ -392,8 +454,9 @@ class Journal:
                 if event in TERMINAL or event in NON_TERMINAL:
                     row = ledger.item(self.iid)
                     merged = dict(json.loads(row["data"]), **data)
-                    ledger.db.execute("UPDATE items SET state=?, data=?, updated=? WHERE id=?",
-                                      (event, json.dumps(merged, sort_keys=True), now, self.iid))
+                    ledger.db.execute("UPDATE items SET entered_at=CASE WHEN state=? THEN entered_at ELSE ? END,"
+                                      " state=?, data=?, updated=? WHERE id=?",
+                                      (event, now, event, json.dumps(merged, sort_keys=True), now, self.iid))
                 ledger.event(self.iid, event, now, **data)
             _mirror(self.paths, self.iid, event, now, data)
         finally:
@@ -449,9 +512,10 @@ class Worker:
             row = self.led.item(iid)
             merged = dict(json.loads(row["data"]), **data)
             cur = self.led.db.execute(
-                "UPDATE items SET state=?, next_action_at=?, data=?, updated=? WHERE id=? AND lease_token=?",
-                (state, next_action_at if state in NON_TERMINAL else None, json.dumps(merged, sort_keys=True,
-                                                                                       default=str), now, iid, token))
+                "UPDATE items SET entered_at=CASE WHEN state=? THEN COALESCE(entered_at, ?) ELSE ? END, state=?,"
+                " next_action_at=?, data=?, updated=? WHERE id=? AND lease_token=?",
+                (state, now, now, state, next_action_at if state in NON_TERMINAL else None,
+                 json.dumps(merged, sort_keys=True, default=str), now, iid, token))
             if cur.rowcount != 1:
                 raise Fenced(iid)
             self.led.event(iid, event or state, now, **data)

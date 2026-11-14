@@ -1006,6 +1006,112 @@ class SchemaTests(Base):
         self.assertIsNone(version)
         self.assertTrue(list(self.paths.root.glob("ledger.sqlite3.pre-v*.bak")))
 
+    # --- v17 F2: the v1 -> v2 migration, its verified backup and the restore path
+    V1_ITEMS = ("CREATE TABLE items (id TEXT PRIMARY KEY, lineage TEXT NOT NULL, owner TEXT NOT NULL, ticket TEXT NOT "
+                "NULL, state TEXT NOT NULL, next_action_at REAL, submitted REAL NOT NULL, lease_token INTEGER NOT NULL "
+                "DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0, attempts TEXT NOT NULL DEFAULT '{}', request TEXT NOT "
+                "NULL, data TEXT NOT NULL DEFAULT '{}', updated REAL)")
+
+    def make_v1(self, rows=3):
+        """A version-1 ledger whose item rows are committed but NOT checkpointed: they live only in the -wal file,
+        held open by the returned connection (close it after the assertions)."""
+        import sqlite3
+        self.paths.ensure()
+        db = sqlite3.connect(str(self.paths.root / "ledger.sqlite3"), isolation_level=None)
+        db.execute("PRAGMA journal_mode=WAL")
+        for statement in runner._statements(runner.SCHEMA):
+            if statement.startswith("CREATE TABLE IF NOT EXISTS items"):
+                statement = self.V1_ITEMS
+            db.execute(statement)
+        db.execute("INSERT INTO meta(k, v) VALUES ('schema_version', '1')")
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        db.execute("PRAGMA wal_autocheckpoint=0")
+        for n in range(rows):
+            db.execute("INSERT INTO items(id, lineage, owner, ticket, state, next_action_at, submitted, request, data,"
+                       " updated) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                       ("ahc-%d" % n, "r|%d" % n, "o", "GoodQA #1", "routed-to-main", 5.0, 1.0, "{}",
+                        json.dumps({"routed_escalations": n}), 100.0 + n))
+        wal = Path(str(self.paths.root / "ledger.sqlite3") + "-wal")
+        self.assertGreater(wal.stat().st_size, 0, "test setup: the rows must sit uncheckpointed in the -wal file")
+        return db
+
+    def columns(self, path):
+        import sqlite3
+        db = sqlite3.connect(str(path))
+        try:
+            cols = {row[1] for row in db.execute("PRAGMA table_info(items)")}
+            version = db.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()
+            count = db.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        finally:
+            db.close()
+        return cols, version[0] if version else None, count
+
+    def test_v1_migrates_to_v2_keeping_uncheckpointed_rows(self):
+        held = self.make_v1()
+        try:
+            ledger = runner.Ledger(self.paths)
+            try:
+                rows = {r["id"]: (r["esc_n"], r["entered_at"]) for r in ledger.db.execute("SELECT * FROM items")}
+            finally:
+                ledger.close()
+        finally:
+            held.close()
+        self.assertEqual(rows, {"ahc-0": (0, 100.0), "ahc-1": (1, 101.0), "ahc-2": (2, 102.0)},
+                         "every uncheckpointed row survives; esc_n backfilled from routed_escalations")
+        backups = list(self.paths.root.glob("ledger.sqlite3.pre-v2.*.bak"))
+        self.assertEqual(len(backups), 1)
+        cols, version, count = self.columns(backups[0])
+        self.assertEqual((version, count), ("1", 3), "the backup is the v1 ledger with the -wal rows included")
+        self.assertNotIn("esc_n", cols)
+
+    def test_failed_v2_migration_restores_the_backup_and_moves_files_aside(self):
+        held = self.make_v1()
+
+        def boom(db):
+            raise RuntimeError("injected migration failure")
+        saved = dict(runner.MIGRATIONS)
+        runner.MIGRATIONS[2] = list(saved[2]) + [boom]
+        try:
+            with self.assertRaises(runner.SchemaError) as caught:
+                runner.Ledger(self.paths)
+        finally:
+            runner.MIGRATIONS.clear()
+            runner.MIGRATIONS.update(saved)
+            held.close()
+        self.assertIn("restored", str(caught.exception))
+        cols, version, count = self.columns(self.paths.root / "ledger.sqlite3")
+        self.assertEqual((version, count), ("1", 3), "the restored ledger is the v1 copy with every row")
+        self.assertNotIn("esc_n", cols, "no partial v2 change survives")
+        aside = sorted(p.name for p in self.paths.root.glob("ledger.sqlite3.failed-*"))
+        self.assertTrue(aside and aside[0].endswith(tuple("0123456789")), aside)
+        suffixes = {name.rsplit("-", 1)[-1] if name.endswith(("-wal", "-shm")) else "db" for name in aside}
+        self.assertIn("db", suffixes, "the failed database file is moved aside, never deleted")
+        self.assertEqual(len({name.split(".failed-")[1].split("-")[0] for name in aside}), 1,
+                         "db, -wal and -shm move together under one suffix")
+        # the restored ledger opens again and migrates cleanly once the defect is gone
+        runner.Ledger(self.paths).close()
+        self.assertEqual(self.columns(self.paths.root / "ledger.sqlite3")[1:], ("2", 3))
+
+    def test_unverified_backup_never_starts_the_migration(self):
+        held = self.make_v1()
+        real = runner.Ledger._counts
+        calls = []
+
+        def lying(ledger, db):
+            calls.append(1)
+            counts = real(ledger, db)
+            return dict(counts, items=counts.get("items", 0) - 1) if len(calls) == 2 else counts
+        runner.Ledger._counts = lying
+        try:
+            with self.assertRaises(runner.SchemaError) as caught:
+                runner.Ledger(self.paths)
+        finally:
+            runner.Ledger._counts = real
+            held.close()
+        self.assertIn("failed verification", str(caught.exception))
+        self.assertEqual(self.columns(self.paths.root / "ledger.sqlite3")[1:], ("1", 3), "the ledger is untouched")
+        self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.failed-*")))
+
 
 class AuditMirrorTests(Base):
     """SQLite is the only recovery authority: the JSONL audit export is never read back."""
