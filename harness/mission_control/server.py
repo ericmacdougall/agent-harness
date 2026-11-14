@@ -551,6 +551,10 @@ class App:
             return 200, {"id": prior["id"], "created": False, "req": req, "action": action, "at": prior["at"]}
         item = next((r for r in self.ledger.parts["requirements"].get("items", []) if r["id"] == req), None) \
             if isinstance(req, str) else None
+        if self.ledger.req_session != session or (item is not None and item.get("session") not in ("", session)):
+            # review PR 234 F3: the rows on hand were read for another main session (or the new one has not loaded
+            # yet): an action must never pair one session's requirement with another session's provenance
+            return 409, {"error": "session_changed", "message": "the requirement list is from another session; reload"}
         if item is None:
             return 409, {"error": "unknown-requirement", "message": "this requirement is not in the current ledger read"}
         if not isinstance(digest, str) or not hmac.compare_digest(digest.encode("utf-8", "replace"), item["digest"].encode()):
