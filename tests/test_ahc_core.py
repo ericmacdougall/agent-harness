@@ -288,7 +288,7 @@ class P0SurfaceTests(unittest.TestCase):
     """AC-31 (P0): P0 never executes a merge and has no `authority enable` subcommand. A suggested merge command in the
     notice for main is text inside a ticket-comment body, never an argv."""
 
-    ALLOWED_AH = {("ticket", "comment"), ("alert", "raise"), ("heartbeat", "beat")}
+    ALLOWED_AH = {("ticket", "comment"), ("alert", "raise"), ("alert", "clear"), ("heartbeat", "beat")}
 
     class Recorder:
         def __init__(self, verdict="PASS", review_rc=0, code=None, pr_head=HEAD):

@@ -46,17 +46,45 @@ import redact  # noqa: E402
 
 STOP_AFTER = None   # test hook: raise after this state is persisted (simulates a kill)
 
-TERMINAL = {"refused", "lint-failed", "stale-head", "superseded", "review-error", "needs-attention", "blocked",
-            "merged", "closed"}
-NON_TERMINAL = {"queued", "deferred", "reviewing", "routed-to-main"}
-ALERT_STATES = {"refused", "lint-failed", "review-error", "needs-attention"}  # terminal-unsuccessful (D14)
-OWNER_NOTICE_STATES = {"refused", "lint-failed", "stale-head", "review-error", "needs-attention", "blocked"}
+# The state table (spec D20 coverage rule, NEG-23): one row per item state, and the only place a state is declared.
+#   settled   no daemon action follows (next_action_at is NULL); otherwise the item is non-terminal (I2)
+#   waits_on  who acts next: daemon, owner, main, owner-or-main, or None (finished, nobody owes anything)
+#   cover     how a person-waiting state escalates past main: "d20" (age-based: 4 h after entry, then every 24 h,
+#             until disposition, supersession or the PR merging/closing) or "ack" (the owner notice needs an ack and
+#             escalates once at its deadline, AC-19)
+#   alert     terminal-unsuccessful: a high alert as well as the ticket (D14)
+#   notice    the owner gets a notice when the item enters the state
+#   dispose   who may record a disposition that stops D20 (main is verified, never just claimed)
+# P1 states (repo halt, review-invalid, authority expired, merged-not-delivered, waiting:cap) join this table with
+# their P1 code; the NEG-23 test enumerates whatever the table holds.
+STATE_TABLE = {
+    "queued": {"settled": False, "waits_on": "daemon"},
+    "deferred": {"settled": False, "waits_on": "daemon"},
+    "reviewing": {"settled": False, "waits_on": "daemon"},
+    "routed-to-main": {"settled": False, "waits_on": "main", "cover": "d20", "dispose": ("main",)},
+    "needs-attention": {"settled": True, "waits_on": "owner-or-main", "cover": "d20", "alert": True, "notice": True,
+                        "dispose": ("owner", "main")},
+    "refused": {"settled": True, "waits_on": "owner", "cover": "ack", "alert": True, "notice": True},
+    "lint-failed": {"settled": True, "waits_on": "owner", "cover": "ack", "alert": True, "notice": True},
+    "review-error": {"settled": True, "waits_on": "owner", "cover": "ack", "alert": True, "notice": True},
+    "stale-head": {"settled": True, "waits_on": "owner", "cover": "ack", "notice": True},
+    "blocked": {"settled": True, "waits_on": "owner", "cover": "ack", "notice": True},
+    "superseded": {"settled": True, "waits_on": None},
+    "merged": {"settled": True, "waits_on": None},
+    "closed": {"settled": True, "waits_on": None},
+}
+TERMINAL = {s for s, row in STATE_TABLE.items() if row["settled"]}
+NON_TERMINAL = {s for s, row in STATE_TABLE.items() if not row["settled"]}
+ALERT_STATES = {s for s, row in STATE_TABLE.items() if row.get("alert")}  # terminal-unsuccessful (D14)
+OWNER_NOTICE_STATES = {s for s, row in STATE_TABLE.items() if row.get("notice")}
+D20_STATES = {s for s, row in STATE_TABLE.items() if row.get("cover") == "d20"}
+PERSON_ACTORS = ("owner", "main", "owner-or-main")
 REVIEW_TIMEOUT = 720                     # per provider, peer_review's cap
 REVIEW_WALL = core.TIMEOUTS["review"]    # primary plus one fallback (D21)
 LEASE_SECONDS = REVIEW_WALL + 60         # lease = timeout + 60 s; a reclaim mints a new fencing token
 PASS_RECHECK = 3600             # routed-to-main: re-read the PR this often
-ROUTED_FIRST = 4 * 3600         # D20: ticket escalation 4 h after routing to main ...
-ROUTED_REPEAT = 24 * 3600       # ... then every 24 h while it still waits
+D20_FIRST = 4 * 3600            # D20: escalate 4 h after entering a covered state ...
+D20_REPEAT = 24 * 3600          # ... then every 24 h while it still waits
 MAX_BODY = 6000
 PROTECTED = ("merge_gate*", "peer_review*", "caller_identity*", "native_main*", "ahc*", "usage_guard*",
              "commit_policy*", "review_diagnostics*", "settings.json", "settings.local.json", "hooks_manifest.json",
@@ -518,6 +546,8 @@ class Worker:
                  json.dumps(merged, sort_keys=True, default=str), now, iid, token))
             if cur.rowcount != 1:
                 raise Fenced(iid)
+            if row["state"] in D20_STATES and state != row["state"]:
+                self._clear_criticals(iid, now)  # left the covered state (terminal, superseded, merged, closed)
             self.led.event(iid, event or state, now, **data)
             if notice is not None:
                 req = json.loads(row["request"])
@@ -741,19 +771,8 @@ class Worker:
             return self.settle(iid, token, "closed", event="closed")
         if pr.get("headRefOid") != req["head"]:
             return self.settle(iid, token, "stale-head", event="head-moved-after-pass")
-        routed_at = float(data.get("routed_at", now))
-        last = data.get("routed_escalated_at")
-        due = (now - routed_at >= ROUTED_FIRST) if last is None else (now - float(last) >= ROUTED_REPEAT)
-        if due:
-            count = int(data.get("routed_escalations", 0)) + 1
-            notice_state = "routed-overdue-%d" % count
-            body = ("Routed to main (%s) for %s#%s at %s; still waiting after %d h.\nReceipt: %s\nMain runs: %s"
-                    % (data.get("routed_reason", "pass-gate1"), req["repo"], req["pr"], req["head"],
-                       int((now - routed_at) // 3600), data.get("report"), merge_command(req)))
-            self.settle(iid, token, "routed-to-main", now + PASS_RECHECK, event="routed-escalated",
-                        routed_escalated_at=now, routed_escalations=count,
-                        notice={"state": notice_state, "audience": "user", "body": body, "requires_ack": False})
-            return "routed-to-main"
+        # D20 escalation is not here: it runs in escalate_overdue() from the ledger alone, so a GitHub outage (the
+        # recheck-unreadable return above) can never suppress it
         return self.settle(iid, token, "routed-to-main", now + PASS_RECHECK, event="recheck")
 
 
@@ -761,11 +780,13 @@ class Worker:
         return self.led.db.execute("SELECT 1 FROM circuits WHERE provider='review'").fetchone() is not None
 
     # --- notices and effects
-    def _insert_notice(self, iid, req, state, audience, body, requires_ack, now):
+    def _insert_notice(self, iid, req, state, audience, body, requires_ack, now, esc_n=None):
         """Insert one notice and its effects; the caller holds the transaction. One notice per (item, state)
-        (NEG-34). Effects: ticket comment always; owner inbox for owner notices; a high alert (v15 sink: dashboard,
-        and email through the GoodQA deadman route) for user-audience notices and terminal-unsuccessful states;
-        the digest as a courtesy copy for main."""
+        (NEG-34); returns False when it already existed. Effects: ticket comment always; owner inbox for owner
+        notices; for a user-audience escalation (esc_n given) a CRITICAL alert keyed ahc:<item>:<n>, the only
+        severity ops-watch mails through the deadman route (D19); a HIGH alert (dashboard and ticket, no mail) for
+        terminal-unsuccessful states; the digest as a courtesy copy for main. Audience "record" is ticket and
+        digest only (a disposition)."""
         nkey = "%s:%s" % (iid, state)
         body = redact.redact(body)
         cur = self.led.db.execute(
@@ -774,14 +795,16 @@ class Worker:
             (nkey, iid, state, audience, int(requires_ack),
              now + bounds(self.config)["block_ack_seconds"] if requires_ack else None, now))
         if cur.rowcount != 1:
-            return
+            return False
         effects = [("ticket", {"ticket": req["ticket"], "body": body, "key": "ahc-" + nkey.replace(":", "-")})]
         if audience == "owner":
             # lexical only: filesystem state (a planted symlink) must never make the state-change transaction raise
             name = "%s-%s.md" % (iid, state)
             effects.append(("inbox", {"path": str(core.inbox_path(self.paths, req["owner"], name, resolve=False)),
                                       "body": body}))
-        if audience == "user" or state in ALERT_STATES:
+        if audience == "user" and esc_n is not None:
+            effects.append(("alert", _alert_payload(iid, req, state, body, esc_n=esc_n)))
+        elif audience != "record" and (audience == "user" or state in ALERT_STATES):
             effects.append(("alert", _alert_payload(iid, req, state, body)))
         effects.append(("digest", {"line": _digest_line(iid, req, state, body), "key": nkey}))
         for kind, payload in effects:
@@ -789,6 +812,94 @@ class Worker:
                 "INSERT OR IGNORE INTO effects(key, item, kind, status, attempts, next_action_at, payload, updated)"
                 " VALUES (?,?,?,?,?,?,?,?)",
                 ("%s:%s" % (kind, nkey), iid, kind, "pending", 0, now, json.dumps(payload), now))
+        return True
+
+    def escalate_item(self, iid, req, notice_state, body, now, d20=False):
+        """The one escalation path past main (no-ack and D20): the caller holds the transaction. The item's
+        escalation number <n> is bumped in the same transaction as the notice and its critical alert
+        ahc:<item>:<n>, and only when the notice is new, so a retried delivery never counts (D19)."""
+        row = self.led.item(iid)
+        n = int(row["esc_n"] or 0) + 1
+        if not self._insert_notice(iid, req, notice_state, "user", body, False, now, esc_n=n):
+            return False
+        self.led.db.execute("UPDATE items SET esc_n=?, esc_at=CASE WHEN ? THEN ? ELSE esc_at END WHERE id=?",
+                            (n, int(bool(d20)), now, iid))
+        self.led.event(iid, "escalated", now, n=n, notice=notice_state, d20=bool(d20))
+        return True
+
+    def _clear_criticals(self, iid, now):
+        """Queue a clear for every critical alert this item raised (ahc:<item>:<n>) that has no clear yet, and cancel
+        any such raise not yet sent, so the dashboard does not keep them standing. The caller holds the
+        transaction. Called when the item leaves a D20 state, on disposition, on a D20 stop, and on an owner ack
+        that leaves no live D20 obligation."""
+        for effect in self.led.db.execute("SELECT key, status, payload FROM effects WHERE item=? AND kind='alert'",
+                                          (iid,)).fetchall():
+            payload = json.loads(effect["payload"])
+            if payload.get("severity") != "critical":
+                continue
+            if effect["status"] == "pending":
+                self.led.db.execute("UPDATE effects SET status='cancelled', next_action_at=NULL, updated=? "
+                                    "WHERE key=?", (now, effect["key"]))
+            self.led.db.execute(
+                "INSERT OR IGNORE INTO effects(key, item, kind, status, attempts, next_action_at, payload, updated)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                ("clear:" + payload["alert_key"], iid, "clear", "pending", 0, now,
+                 json.dumps({"alert_key": payload["alert_key"], "key": "ahc-clear-" + payload["alert_key"]}), now))
+
+    def escalate_overdue(self):
+        """D20: every item in a covered state escalates past main 4 h after entering it, then every 24 h, until a
+        disposition, a newer submission for the same PR, or the PR merging or closing. Reads only the ledger, plus
+        one PR read at escalation time; an unreadable PR is never read as merged or closed (I9)."""
+        now = self.now()
+        marks = ",".join("?" * len(D20_STATES))
+        rows = self.led.db.execute("SELECT * FROM items WHERE state IN (%s) AND disposed_at IS NULL ORDER BY id"
+                                   % marks, sorted(D20_STATES)).fetchall()
+        for row in rows:
+            start = row["entered_at"] if row["entered_at"] is not None else row["updated"]
+            last = row["esc_at"]
+            due = (now >= last + D20_REPEAT) if (last is not None and last >= start) else (now >= start + D20_FIRST)
+            if not due:
+                continue
+            req = json.loads(row["request"])
+            stop = self._d20_stop(row, req)
+            with self.led.tx():
+                current = self.led.item(row["id"])
+                if current["state"] != row["state"] or current["disposed_at"] is not None:
+                    continue
+                if stop:
+                    self.led.db.execute("UPDATE items SET disposed_at=? WHERE id=?", (now, row["id"]))
+                    self.led.event(row["id"], "d20-stopped", now, reason=stop)
+                    self._clear_criticals(row["id"], now)
+                    continue
+                n = int(current["esc_n"] or 0) + 1
+                data = json.loads(current["data"])
+                hours = int((now - start) // 3600)
+                body = ("D20 escalation %d: %s#%s at %s has waited %d h in `%s` for %s.\nReason: %s\nReceipt: %s\n"
+                        "Main runs: %s\nTo stop this escalation, act on the PR, or record a disposition: python3 "
+                        "~/.claude/hooks/ahc_runner.py ack %s --owner %s --disposition \"<reason>\""
+                        % (n, req["repo"], req["pr"], req["head"], hours, row["state"],
+                           STATE_TABLE[row["state"]]["waits_on"], data.get("routed_reason") or data.get("reason")
+                           or "-", data.get("report") or "-", merge_command(req), row["id"],
+                           " or ".join(STATE_TABLE[row["state"]].get("dispose", ("main",)))))
+                self.escalate_item(row["id"], req, "d20-%s-%d" % (row["state"], n), body, now, d20=True)
+
+    def _d20_stop(self, row, req):
+        """Why D20 (and an unacked notice's escalation) stops for this item without a disposition, or None: a newer submission for the same PR, or the
+        PR read as MERGED or CLOSED. A failed or unreadable read is None (keep escalating)."""
+        newer = self.led.db.execute("SELECT id FROM items WHERE lineage=? AND submitted > ? AND id != ? "
+                                    "ORDER BY submitted DESC LIMIT 1",
+                                    (row["lineage"], row["submitted"], row["id"])).fetchone()
+        if newer is not None:
+            return "superseded by %s" % newer["id"]
+        try:
+            rc, out, _err = self.deps.gh(["gh", "pr", "view", str(req["pr"]), "-R", req["repo"], "--json", "state"],
+                                         core.GH_TIMEOUT)
+            pr = json.loads(out) if rc == 0 else None
+        except (ValueError, OSError, subprocess.SubprocessError):
+            pr = None
+        if isinstance(pr, dict) and pr.get("state") in ("MERGED", "CLOSED"):
+            return "PR %s" % pr["state"].lower()
+        return None
 
     def dispatch_effects(self):
         now = self.now()
@@ -850,9 +961,13 @@ class Worker:
                     _append_private(self.paths.digest, payload["line"])
                 return True, "appended"
             if kind == "alert":
-                rc, _out, err = self.deps.ah(["ah", "alert", "raise", "--severity", "high", "--alert-key",
-                                              payload["alert_key"], "--source", "ahc", "--key", payload["key"],
-                                              "--message", payload["message"]], 60)
+                rc, _out, err = self.deps.ah(["ah", "alert", "raise", "--severity", payload.get("severity", "high"),
+                                              "--alert-key", payload["alert_key"], "--source", "ahc", "--key",
+                                              payload["key"], "--message", payload["message"]], 60)
+                return rc == 0, "rc=%s %s" % (rc, _short(err))
+            if kind == "clear":
+                rc, _out, err = self.deps.ah(["ah", "alert", "clear", "--alert-key", payload["alert_key"], "--source",
+                                              "ahc", "--key", payload["key"]], 60)
                 return rc == 0, "rc=%s %s" % (rc, _short(err))
         except (OSError, subprocess.SubprocessError) as error:
             return False, _short(error)
@@ -871,9 +986,17 @@ class Worker:
                     "the ticket and the user channel. Acknowledge with: python3 ~/.claude/hooks/ahc_runner.py ack %s "
                     "--owner %s" % (req["owner"], notice["state"], req["repo"], req["pr"], notice["item"],
                                     bounds(self.config)["block_ack_seconds"] // 60, notice["item"], req["owner"]))
+            stop = self._d20_stop(row, req)
             with self.led.tx():
                 self.led.db.execute("UPDATE notices SET escalated_at=? WHERE key=?", (now, notice["key"]))
-                self._insert_notice(notice["item"], req, "%s-escalated" % notice["state"], "user", body, False, now)
+                if stop:  # the owner already responded (newer submission) or the PR is merged or closed
+                    self.led.event(notice["item"], "ack-escalation-skipped", now, notice=notice["state"],
+                                   reason=stop)
+                    continue
+                # under a live D20 obligation this escalation is also the D20 one (sets esc_at), so the two clocks
+                # (both 4 h by default) never raise two criticals for the same wait
+                live_d20 = row["state"] in D20_STATES and row["disposed_at"] is None
+                self.escalate_item(notice["item"], req, "%s-escalated" % notice["state"], body, now, d20=live_d20)
 
 # ---------------------------------------------------------------- tick
 
@@ -970,6 +1093,7 @@ def tick(paths, config, deps):
                     "SELECT 1 FROM effects WHERE item=? AND kind='review'", (row["id"],)).fetchone():
                 reviewed = True
         worker.escalate()
+        worker.escalate_overdue()
         worker.dispatch_effects()
         missing = ledger.db.execute("SELECT id FROM items WHERE state IN ('queued','deferred','reviewing',"
                                     "'routed-to-main') AND next_action_at IS NULL").fetchall()
@@ -985,20 +1109,67 @@ def tick(paths, config, deps):
     return summary
 
 
-def ack(paths, iid, owner, now=None):
-    """Owner acknowledgement: the only way an owner notice becomes delivered (AC-19, NEG-26)."""
+MAIN_ACTOR = "main"
+DISPOSITION_MAX = 500
+
+
+def ack(paths, iid, owner, now=None, disposition=None, main_proven=False, config=None, deps=None):
+    """Owner acknowledgement: the only way an owner notice becomes delivered (AC-19, NEG-26). It clears the item's
+    critical alerts unless a D20 obligation is still live (an owner ack never silences main's obligation).
+
+    With `disposition` (required reason text) it records a disposition that stops D20 escalation (spec Q1 ruling):
+    for a state whose `dispose` lists "owner", the item's owner or main may record it; otherwise main only. `--owner
+    main` counts only with `main_proven` (the CLI's caller_identity stamp, bound to main's own tool call); a sub-agent
+    claiming to be main is refused and escalation continues. The disposition is an event with actor and reason, a
+    ticket comment, and clears the item's critical alerts."""
+    now = now if now is not None else time.time()
     ledger = Ledger(paths)
     try:
         row = ledger.item(iid)
         if row is None:
             raise core.Refused("no such item")
-        if row["owner"] != owner:
-            raise core.Refused("only the item's owner can acknowledge it")
+        if disposition is None:
+            if row["owner"] != owner:
+                raise core.Refused("only the item's owner can acknowledge it")
+            with ledger.tx():
+                cur = ledger.db.execute("UPDATE notices SET acked_at=? WHERE item=? AND audience='owner' AND "
+                                        "acked_at IS NULL", (now, iid))
+                ledger.event(iid, "acked", now, owner=owner, notices=cur.rowcount)
+                if row["state"] not in D20_STATES or row["disposed_at"] is not None:
+                    Worker(paths, config or {}, deps, ledger)._clear_criticals(iid, now)
+            return cur.rowcount
+        reason = " ".join(str(disposition).split())
+        if not reason:
+            raise core.Refused("a disposition needs a reason")
+        if len(reason) > DISPOSITION_MAX:
+            raise core.Refused("a disposition reason is at most %d characters" % DISPOSITION_MAX)
+        policy = STATE_TABLE.get(row["state"], {})
+        if policy.get("cover") != "d20":
+            raise core.Refused("item is %s, which is not under D20 escalation; nothing to dispose" % row["state"])
+        if row["disposed_at"] is not None:
+            raise core.Refused("a disposition is already recorded for this item")
+        allowed = policy.get("dispose", (MAIN_ACTOR,))
+        if owner == MAIN_ACTOR:
+            if not main_proven:
+                raise core.Refused("--owner main needs proof that the main session itself ran this command "
+                                   "(caller_identity stamp); a sub-agent cannot dispose for main")
+            actor = MAIN_ACTOR
+        elif owner == row["owner"] and "owner" in allowed:
+            actor = "owner " + owner
+        else:
+            raise core.Refused("only %s may dispose of a %s item" % (" or ".join(
+                "main" if a == MAIN_ACTOR else "the item's owner" for a in allowed), row["state"]))
+        req = json.loads(row["request"])
+        body = ("Disposition recorded for %s#%s at %s (item %s, state `%s`) by %s: %s\nD20 escalation for this item "
+                "stops; its critical alerts are cleared." % (req["repo"], req["pr"], req["head"], iid, row["state"],
+                                                              actor, redact.redact(reason)))
+        worker = Worker(paths, config or {}, deps, ledger)
         with ledger.tx():
-            cur = ledger.db.execute("UPDATE notices SET acked_at=? WHERE item=? AND audience='owner' AND acked_at "
-                                    "IS NULL", (now or time.time(), iid))
-            ledger.event(iid, "acked", now or time.time(), owner=owner, notices=cur.rowcount)
-        return cur.rowcount
+            ledger.db.execute("UPDATE items SET disposed_at=? WHERE id=?", (now, iid))
+            ledger.event(iid, "disposed", now, actor=actor, reason=redact.redact(reason))
+            worker._insert_notice(iid, req, "disposed", "record", body, False, now)
+            worker._clear_criticals(iid, now)
+        return 1
     finally:
         ledger.close()
 
@@ -1027,10 +1198,16 @@ def _owner_notice(state, reason):
     return {"state": state, "audience": "owner", "reason": reason, "requires_ack": True}
 
 
-def _alert_payload(iid, req, state, body):
+def _alert_payload(iid, req, state, body, esc_n=None):
+    """A routine terminal-unsuccessful state raises HIGH under ahc:<item> (dashboard, no mail). A user-audience
+    escalation raises CRITICAL under its own key ahc:<item>:<n>, so ops-watch's 6 h per-key mail limit never
+    suppresses a later escalation of the same item (D19)."""
     message = "ahc %s: %s#%s %s | %s" % (state, req["repo"], req["pr"], req["head"][:12],
                                        " ".join(body.split())[:400])
-    return {"alert_key": "ahc:" + iid, "key": "ahc-%s-%s" % (iid, state), "message": message}
+    if esc_n is None:
+        return {"alert_key": "ahc:" + iid, "key": "ahc-%s-%s" % (iid, state), "message": message, "severity": "high"}
+    return {"alert_key": "ahc:%s:%d" % (iid, esc_n), "key": "ahc-%s-%s" % (iid, state), "message": message,
+            "severity": "critical"}
 
 
 def _owner_body(iid, req, data, state, reason):
@@ -1330,9 +1507,11 @@ def build_parser():
     for name in ("--repo", "--head", "--base", "--packet", "--ticket", "--owner"):
         s.add_argument(name, required=True)
     s.add_argument("--pr", type=int, required=True)
-    a = sub.add_parser("ack", help="owner acknowledges an item's notice")
+    a = sub.add_parser("ack", help="owner acknowledges an item's notice, or records a D20 disposition")
     a.add_argument("item")
     a.add_argument("--owner", required=True)
+    a.add_argument("--disposition", help="reason text: stop D20 escalation for this item (owner or verified main, "
+                                         "per the state's rule)")
     sub.add_parser("status", help="item states and pending effects")
     r = sub.add_parser("run", help="run ticks (the daemon loop under launchd)")
     r.add_argument("--once", action="store_true")
@@ -1340,7 +1519,23 @@ def build_parser():
     return parser
 
 
+def claim_main(argv):
+    """Take main's one-shot stamp for exactly this argument list, before anything parses it (so a failing or --help
+    run still consumes it). True only for a disposition command that main's own hook stamped."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not core.is_dispose_argv(argv):
+        return False
+    try:
+        import caller_identity  # noqa: PLC0415
+        return caller_identity.take_stamp(core.DISPOSE_STAMP, core.dispose_stamp_parts(argv), bound=True,
+                                          ttl=core.DISPOSE_STAMP_TTL,
+                                          home=os.environ.get("AH_HOME") or None) is not None  # = mission_gate home
+    except Exception:  # noqa: BLE001 - no proof is "not main", never an error that lets the claim through
+        return False
+
+
 def main(argv=None):
+    main_proven = claim_main(argv)
     args = build_parser().parse_args(argv)
     paths = core.Paths()
     config = load_config(paths)
@@ -1355,7 +1550,9 @@ def main(argv=None):
         return 0
     if args.cmd == "ack":
         try:
-            print("acknowledged %d notice(s)" % ack(paths, args.item, args.owner))
+            count = ack(paths, args.item, args.owner, disposition=args.disposition, main_proven=main_proven,
+                        config=config)
+            print("disposition recorded" if args.disposition is not None else "acknowledged %d notice(s)" % count)
         except core.Refused as error:
             print("refused: %s" % error, file=sys.stderr)
             return 2

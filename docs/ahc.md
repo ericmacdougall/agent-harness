@@ -36,3 +36,46 @@ the runner checks whether its key is already present, but it reads only the last
 the file. Reading only the tail bounds the cost and never blocks on a hostile file. The tradeoff: a key older than
 the last 1 MB reads as missing and the entry is appended again. That duplicate is accepted, because delivery is
 at-least-once and the digest is never the only channel. (Accepted by the spec owner, 2026-11-14.)
+
+## Escalation past main (D20)
+
+`STATE_TABLE` in `ahc_runner.py` is the only place an item state is declared. Each state that waits on a person has
+one of two covers:
+
+- **`ack`** (refused, lint-failed, review-error, stale-head, blocked): the owner notice needs
+  `ahc_runner.py ack ITEM --owner OWNER`. If the deadline (`block_ack_seconds`, 4 h) passes without one, the notice
+  escalates once.
+- **`d20`** (routed-to-main, needs-attention): the item escalates 4 h after entering the state, then every 24 h.
+  This runs from the ledger alone, so a GitHub outage cannot suppress it.
+
+Every escalation does three things:
+
+- posts a ticket comment;
+- adds a digest line;
+- raises a critical alert `ahc:<item>:<n>`. `<n>` is `items.esc_n`.
+
+If the no-ack deadline passes while the item is under live D20, that escalation counts as the D20 one, so the two
+clocks never raise two criticals for the same wait.
+
+### What stops escalation
+
+- **A disposition** (required reason text):
+  `ahc_runner.py ack ITEM --owner OWNER --disposition "<reason>"`.
+  - needs-attention: the item's owner or main may record it.
+  - routed-to-main: main only.
+  - `--owner main` counts only when main's own `mission_gate.py pretool` hook stamped that exact command line.
+    The stamp is a caller_identity stamp, bound to main's still-running tool call. A sub-agent is refused.
+  - The stamp is local to the host. A main session on another host cannot dispose for main over SSH; its
+    obligation keeps escalating until the PR merges or closes.
+- **A newer submission** for the same PR. This also skips a pending no-ack escalation.
+- **The PR reads as merged or closed.** This also skips a pending no-ack escalation. An unreadable PR never counts
+  as either.
+
+### When criticals are cleared
+
+The item's `ahc:<item>:*` criticals are cleared when:
+
+- it leaves the covered state;
+- a disposition is recorded;
+- a stop condition fires;
+- an owner ack leaves no live D20 obligation. An owner ack on a routed-to-main item clears nothing.

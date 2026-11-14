@@ -891,7 +891,7 @@ class RoutedTests(Base):
     """D20: a PASS waits as routed-to-main; ticket escalation 4 h after routing, then every 24 h."""
 
     def overdue_comments(self, deps):
-        return [a for a in deps.ah_calls if a[:3] == ["ah", "ticket", "comment"] and "routed-overdue" in
+        return [a for a in deps.ah_calls if a[:3] == ["ah", "ticket", "comment"] and "-d20-routed-to-main-" in
                 a[a.index("--key") + 1]]
 
     def test_escalates_at_4h_then_every_24h(self):
@@ -942,6 +942,261 @@ class RoutedTests(Base):
         deps.now += 3601
         self.run_all(deps)
         self.assertEqual(self.state(iid), "merged")
+
+
+class D20Tests(Base):
+    """D20 (spec v19/v22, Q1-Q3 rulings): covered states escalate past main 4 h after entry, then every 24 h, from the
+    ledger alone; each escalation raises its own critical ahc:<item>:<n>; the repeat stops on disposition (owner or
+    verified main per state), a newer submission, or the PR merging/closing; criticals are cleared when resolved."""
+
+    def raises(self, deps, iid=None, severity="critical"):
+        out = []
+        for argv in deps.ah_calls:
+            if argv[:3] == ["ah", "alert", "raise"] and argv[argv.index("--severity") + 1] == severity:
+                key = argv[argv.index("--alert-key") + 1]
+                if iid is None or key.startswith("ahc:%s:" % iid):
+                    out.append(key)
+        return out
+
+    def standing(self, deps, iid):
+        """The ahc:<item>:* keys still raised after replaying every raise and clear in call order (the ring view)."""
+        up = set()
+        for argv in deps.ah_calls:
+            if argv[:2] != ["ah", "alert"]:
+                continue
+            key = argv[argv.index("--alert-key") + 1]
+            if not key.startswith("ahc:%s:" % iid):
+                continue
+            (up.add if argv[2] == "raise" else up.discard)(key)
+        return up
+
+    def d20_comments(self, deps, state="routed-to-main"):
+        return [a for a in deps.ah_calls if a[:3] == ["ah", "ticket", "comment"]
+                and ("-d20-%s-" % state) in a[a.index("--key") + 1]]
+
+    def routed(self):
+        iid, deps = self.submit(), Deps()
+        self.run_all(deps)
+        self.assertEqual(self.state(iid), "routed-to-main")
+        return iid, deps
+
+    def hours(self, deps, n, step=3600):
+        for _ in range(int(n * 3600 // step)):
+            deps.now += step
+            self.run_all(deps)
+
+    def enter(self, deps, state, iid=None):
+        """Settle a fresh item into `state` through the production settle path with the state's own notice."""
+        iid = iid or self.submit()
+        ledger = runner.Ledger(self.paths)
+        try:
+            ledger.ensure_item(iid, self.config, deps.now)
+            worker = runner.Worker(self.paths, self.config, deps, ledger)
+            token = worker.lease(iid)
+            notice = runner._owner_notice(state, "test entry") if state in runner.OWNER_NOTICE_STATES else None
+            nxt = deps.now + runner.PASS_RECHECK if state in runner.NON_TERMINAL else None
+            worker.settle(iid, token, state, nxt, event="test-enter", notice=notice, reason="test entry")
+        finally:
+            ledger.close()
+        return iid
+
+    def row(self, iid):
+        ledger = runner.Ledger(self.paths)
+        try:
+            return dict(ledger.item(iid))
+        finally:
+            ledger.close()
+
+    def test_gh_outage_cannot_suppress_d20(self):
+        iid, deps = self.routed()
+        deps.gh_rc = 1  # every PR read fails from here on
+        self.hours(deps, 4.5)
+        self.assertEqual(self.raises(deps, iid), ["ahc:%s:1" % iid], "D20 must escalate while GitHub is down")
+        self.assertEqual(len(self.d20_comments(deps)), 1)
+
+    def test_each_escalation_has_its_own_critical_key_and_n_survives_restart(self):
+        iid, deps = self.routed()
+        self.hours(deps, 4.5)
+        self.hours(deps, 24, step=6 * 3600)
+        self.assertEqual(self.raises(deps, iid), ["ahc:%s:1" % iid, "ahc:%s:2" % iid])
+        self.assertEqual(self.row(iid)["esc_n"], 2, "<n> is a ledger column")
+        for _ in range(3):  # restarts and retries never bump <n>
+            self.run_all(deps)
+        self.assertEqual(self.row(iid)["esc_n"], 2)
+        self.assertEqual(self.raises(deps, iid, severity="high"), [], "a user escalation is never only high")
+
+    def test_needs_attention_escalates_and_owner_disposition_stops_and_clears_it(self):
+        deps = Deps()
+        iid = self.enter(deps, "needs-attention")
+        self.hours(deps, 4.5)
+        self.assertEqual(self.raises(deps, iid), ["ahc:%s:1" % iid])
+        self.assertEqual(runner.ack(self.paths, iid, "agent-abc123", now=deps.now,
+                                    disposition="reconciled with usage_guard; run abc is dead"), 1)
+        self.run_all(deps)
+        self.assertEqual(self.standing(deps, iid), set(), "no ahc:<item>:* raise may stay open after disposition")
+        self.hours(deps, 48, step=12 * 3600)
+        self.assertEqual(self.raises(deps, iid), ["ahc:%s:1" % iid], "D20 stopped after the disposition")
+        bodies = [a[a.index("--body") + 1] for a in deps.ah_calls if a[:3] == ["ah", "ticket", "comment"]]
+        self.assertTrue(any("Disposition recorded" in b and "owner agent-abc123" in b and "usage_guard" in b
+                            for b in bodies), "the disposition is a ticket comment naming actor and reason")
+
+    def test_subagent_claiming_main_is_refused_and_escalation_continues(self):
+        iid, deps = self.routed()
+        with self.assertRaises(core.Refused) as caught:
+            runner.ack(self.paths, iid, "main", now=deps.now, disposition="looks fine", main_proven=False)
+        self.assertIn("sub-agent cannot dispose", str(caught.exception))
+        self.hours(deps, 4.5)
+        self.assertEqual(self.raises(deps, iid), ["ahc:%s:1" % iid])
+
+    def test_owner_cannot_silence_a_main_obligation(self):
+        iid, deps = self.routed()
+        with self.assertRaises(core.Refused):
+            runner.ack(self.paths, iid, "agent-abc123", now=deps.now, disposition="please stop")
+        runner.ack(self.paths, iid, "agent-abc123", now=deps.now)  # a plain owner ack is not a disposition
+        self.hours(deps, 4.5)
+        self.hours(deps, 24, step=6 * 3600)
+        self.assertEqual(len(self.raises(deps, iid)), 2, "routed-to-main keeps escalating after an owner ack")
+        self.assertEqual(len(self.standing(deps, iid)), 2, "an owner ack must not clear main's criticals")
+
+    def test_verified_main_disposition_stops_routed_and_clears(self):
+        iid, deps = self.routed()
+        self.hours(deps, 4.5)
+        with self.assertRaises(core.Refused):
+            runner.ack(self.paths, iid, "main", now=deps.now, disposition="   ", main_proven=True)
+        runner.ack(self.paths, iid, "main", now=deps.now, disposition="held for the release window", main_proven=True)
+        self.run_all(deps)
+        self.assertEqual(self.standing(deps, iid), set())
+        self.hours(deps, 30, step=6 * 3600)
+        self.assertEqual(self.raises(deps, iid), ["ahc:%s:1" % iid])
+        with self.assertRaises(core.Refused):
+            runner.ack(self.paths, iid, "main", now=deps.now, disposition="again", main_proven=True)
+
+    def test_leaving_the_state_clears_its_criticals(self):
+        iid, deps = self.routed()
+        self.hours(deps, 4.5)
+        gh = deps.gh
+
+        def merged(argv, timeout):
+            rc, out, err = gh(argv, timeout)
+            pr = json.loads(out)
+            pr.update(state="MERGED", mergeCommit={"oid": "d" * 40})
+            return rc, json.dumps(pr), err
+        deps.gh = merged
+        self.hours(deps, 2)
+        self.assertEqual(self.state(iid), "merged")
+        self.assertEqual(self.standing(deps, iid), set())
+
+    def test_newer_submission_or_closed_pr_stops_needs_attention(self):
+        deps = Deps()
+        first = self.enter(deps, "needs-attention")
+        newer = self.packet.with_name("p2.md")
+        newer.write_text(GOOD_PACKET + "\n")
+        self.submit(packet=newer)
+        self.hours(deps, 5)
+        self.assertEqual(self.raises(deps, first), [], "a newer submission for the PR stops D20")
+        self.assertIsNotNone(self.row(first)["disposed_at"])
+        self.tearDown()
+        self.setUp()
+        deps = Deps()
+        iid = self.enter(deps, "needs-attention")
+        gh = deps.gh
+
+        def closed(argv, timeout):
+            rc, out, err = gh(argv, timeout)
+            pr = json.loads(out)
+            pr.update(state="CLOSED")
+            return rc, json.dumps(pr), err
+        deps.gh = closed
+        self.hours(deps, 5)
+        self.assertEqual(self.raises(deps, iid), [], "a closed PR stops D20")
+
+    # --- NEG-23: enumerated from the state table, never a hand list
+    def test_every_person_waiting_state_has_an_escalation_past_main(self):
+        waiting = [s for s, row in runner.STATE_TABLE.items() if row["waits_on"] in runner.PERSON_ACTORS]
+        self.assertGreaterEqual(len(waiting), 7, "the enumeration would be vacuous")
+        for state in waiting:
+            with self.subTest(state=state):
+                self.tearDown()
+                self.setUp()
+                cover = runner.STATE_TABLE[state].get("cover")
+                self.assertIn(cover, ("d20", "ack"), "%s waits on a person but has no escalation" % state)
+                deps = Deps()
+                iid = self.enter(deps, state)
+                wait = runner.D20_FIRST if cover == "d20" else runner.bounds(self.config)["block_ack_seconds"]
+                self.assertFalse(self.raises(deps, iid))
+                deps.now += wait + 1
+                self.run_all(deps)
+                self.run_all(deps)
+                keys = self.raises(deps, iid)
+                self.assertEqual(keys, ["ahc:%s:1" % iid], "%s: one critical row past main" % state)
+                tickets = [a for a in deps.ah_calls if a[:3] == ["ah", "ticket", "comment"]
+                           and "escalat" in a[a.index("--body") + 1].lower() + a[a.index("--key") + 1]]
+                self.assertTrue(tickets or self.d20_comments(deps, state), "%s: a ticket row past main" % state)
+
+    def test_every_settled_state_literal_is_in_the_table(self):
+        import ast
+        tree = ast.parse((HOOKS / "ahc_runner.py").read_text(encoding="utf-8"))
+        seen = set()
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "settle"
+                    and len(node.args) >= 3 and isinstance(node.args[2], ast.Constant)):
+                seen.add(node.args[2].value)
+        self.assertGreaterEqual(len(seen), 8, "the scan found too few settle calls to be meaningful")
+        self.assertEqual(seen - set(runner.STATE_TABLE), set(), "a state is settled but missing from STATE_TABLE")
+
+
+class MainStampTests(Base):
+    """Q1: `ack --owner main --disposition` counts only with main's caller_identity stamp, bound to main's own still-
+    running tool call and keyed by the exact argument list (mission_gate.py pretool writes it)."""
+
+    def setUp(self):
+        super().setUp()
+        import os
+        self._env = os.environ.get("AH_HOME")
+        os.environ["AH_HOME"] = str(self.home)
+        self.transcript = self.home / "main.jsonl"
+        self.transcript.write_text('{"type":"user"}\n')
+
+    def tearDown(self):
+        import os
+        if self._env is None:
+            os.environ.pop("AH_HOME", None)
+        else:
+            os.environ["AH_HOME"] = self._env
+        super().tearDown()
+
+    ARGV = ["ack", "ahc-x", "--owner", "main", "--disposition", "held for release"]
+
+    def stamp(self, argv):
+        import caller_identity
+        caller_identity.put_stamp(core.DISPOSE_STAMP, core.dispose_stamp_parts(argv), session="s", home=self.home,
+                                  tool_use_id="toolu_01ABCDEFGHIJKLMNOPQRSTUV", transcript=str(self.transcript))
+
+    def test_no_stamp_is_not_main(self):
+        self.assertFalse(runner.claim_main(self.ARGV))
+
+    def test_stamp_for_exact_argv_is_main_once(self):
+        self.stamp(self.ARGV)
+        self.assertTrue(runner.claim_main(self.ARGV))
+        self.assertFalse(runner.claim_main(self.ARGV), "a stamp is single use")
+
+    def test_stamp_for_other_words_does_not_count(self):
+        self.stamp(self.ARGV[:-1] + ["something else"])
+        self.assertFalse(runner.claim_main(self.ARGV))
+
+    def test_finished_main_call_does_not_count(self):
+        self.stamp(self.ARGV)
+        with open(self.transcript, "a") as handle:
+            handle.write('{"tool_use_id":"toolu_01ABCDEFGHIJKLMNOPQRSTUV","type":"tool_result"}\n')
+        self.assertFalse(runner.claim_main(self.ARGV), "a stamp outliving main's call is dead")
+
+    def test_mission_gate_stamps_only_a_real_disposition_command(self):
+        import mission_gate
+        line = "python3 ~/.claude/hooks/ahc_runner.py ack ahc-x --owner main --disposition 'held for release'"
+        self.assertEqual(mission_gate.ahc_dispose_stamps(line), [core.dispose_stamp_parts(self.ARGV)])
+        self.assertEqual(mission_gate.ahc_dispose_stamps("echo ahc_runner.py ack ahc-x --disposition x"), [])
+        self.assertEqual(mission_gate.ahc_dispose_stamps("python3 ahc_runner.py ack ahc-x --owner o"), [])
+        self.assertEqual(mission_gate.ahc_dispose_stamps('python3 ahc_runner.py ack "$ID" --disposition x'), [])
 
 
 class SchemaTests(Base):

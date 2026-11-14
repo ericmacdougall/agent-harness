@@ -28,6 +28,29 @@ GH_TIMEOUT = 60  # = TIMEOUTS["gh"]
 
 
 TIMEOUTS = {"gh": 60, "git": 900, "ah": 60, "review": 1440}   # spec D21; leases are timeout + 60 s
+
+# A D20 disposition by main (`ahc_runner.py ack ITEM --owner main --disposition R`) must be proven, never claimed: main's
+# PreToolUse hook (mission_gate.py pretool, already registered) writes a caller_identity stamp bound to that one tool
+# call, keyed by the exact argument list; the ack process takes it before parsing. A sub-agent's shell gets no stamp.
+DISPOSE_STAMP = "ahc-dispose"
+DISPOSE_STAMP_TTL = 60
+
+
+def dispose_stamp_parts(argv) -> list:
+    """The stamp key parts for one ahc_runner.py argument list: a digest of its words, `--x=y` split as the shell
+    process would see either spelling."""
+    words = []
+    for arg in argv or []:
+        arg = str(arg)
+        words.extend(arg.split("=", 1) if arg.startswith("--") and "=" in arg else [arg])
+    return [hashlib.sha256(json.dumps(words, separators=(",", ":")).encode("utf-8", "replace")).hexdigest()]
+
+
+def is_dispose_argv(argv) -> bool:
+    """True for `ack ... --disposition ...`: the only ahc command that needs main's stamp."""
+    argv = [str(a) for a in argv or []]
+    return bool(argv) and argv[0] == "ack" and any(a == "--disposition" or a.startswith("--disposition=")
+                                                   for a in argv[1:])
 TIMEOUT_RC = 124
 
 

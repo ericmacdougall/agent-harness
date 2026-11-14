@@ -107,9 +107,9 @@ from shellwords import (HEREDOCS, OPERATOR_START, OPERATORS, REDIRECTS, SEPARATO
                         shell_tokens, simple_commands)
 
 
-def mission_argv(words: list):
-    """The argv after the script when this simple command runs mission_coverage.py itself (`[VAR=x ...] [python3
-    [-flags]] .../mission_coverage.py SUB ...`); None when the script name is only an argument (echo, grep, cat)."""
+def mission_argv(words: list, script: str = "mission_coverage.py"):
+    """The argv after the script when this simple command runs `script` itself (`[VAR=x ...] [python3 [-flags]]
+    .../mission_coverage.py SUB ...`); None when the script name is only an argument (echo, grep, cat)."""
     i = 0
     while i < len(words) and ASSIGN.match(words[i]):
         i += 1
@@ -117,9 +117,26 @@ def mission_argv(words: list):
         i += 1
         while i < len(words) and re.match(r"^-[A-Za-z]+$", words[i]) and words[i] not in ("-c", "-m"):
             i += 1
-    if i < len(words) and os.path.basename(words[i]) == "mission_coverage.py":
+    if i < len(words) and os.path.basename(words[i]) == script:
         return words[i + 1:]
     return None
+
+
+def ahc_dispose_stamps(cmd: str) -> list:
+    """[stamp parts] for each `ahc_runner.py ack ... --disposition ...` this Bash line runs at command position
+    (goodqa#16034 D20: main's disposition of a main-only obligation must be proven). Same parsing rules as
+    stamps_for: a word only the shell can compute gets no stamp."""
+    import ahc_core  # noqa: PLC0415
+    out = []
+    for words in simple_commands(cmd):
+        argv = mission_argv(words, "ahc_runner.py")
+        if not argv or any(getattr(w, "computed", False) for w in argv):
+            continue
+        argv = [os.path.expanduser(w) if getattr(w, "tilde", False) and (w == "~" or w.startswith("~/")) else str(w)
+                for w in argv]
+        if ahc_core.is_dispose_argv(argv):
+            out.append(ahc_core.dispose_stamp_parts(argv))
+    return out
 
 
 def stamps_for(cmd: str) -> list:
@@ -152,7 +169,7 @@ def cmd_pretool(payload: dict) -> dict:
         return {}
     tool_input = payload.get("tool_input")
     cmd = str((tool_input if isinstance(tool_input, dict) else {}).get("command") or "")
-    if "mission_coverage" not in cmd:
+    if "mission_coverage" not in cmd and "ahc_runner" not in cmd:
         return {}
     import caller_identity  # noqa: PLC0415
     if not caller_identity.is_main(payload):
@@ -161,9 +178,14 @@ def cmd_pretool(payload: dict) -> dict:
     tool_use_id = payload.get("tool_use_id")
     if not isinstance(tool_use_id, str) or not caller_identity.TOOL_USE_ID.match(tool_use_id):
         return {}  # F1: a stamp must be bound to this one call; without its id there is nothing to bind to
-    for sub, key in stamps_for(cmd)[:10]:
+    for sub, key in (stamps_for(cmd)[:10] if "mission_coverage" in cmd else []):
         caller_identity.put_stamp(STAMP_PURPOSE, [sub, key], session=session, home=home_dir(),
                                   tool_use_id=tool_use_id, transcript=str(payload.get("transcript_path") or ""))
+    if "ahc_runner" in cmd:
+        import ahc_core  # noqa: PLC0415
+        for parts in ahc_dispose_stamps(cmd)[:10]:
+            caller_identity.put_stamp(ahc_core.DISPOSE_STAMP, parts, session=session, home=home_dir(),
+                                      tool_use_id=tool_use_id, transcript=str(payload.get("transcript_path") or ""))
     return {}
 
 
