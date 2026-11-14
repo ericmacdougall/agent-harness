@@ -223,6 +223,23 @@ class Forms(unittest.TestCase):
             with self.subTest(viewer):
                 self.assertIsNone(cg.install_files_refusal(viewer, False), viewer)
 
+    def test_an_expansion_in_a_redirect_of_the_install_segment_is_refused_and_a_later_pipeline_element_may_hold_one(self):  # AC-5, NEG-27
+        local = GOOD.replace("--host t2-dev", "--host local")
+        for text in (local + " > $HOME/x", local + " > ${HOME::=/tmp/x}", local + " 2> `echo /tmp/x`"):  # the install segment itself
+            for main in (True, False):
+                with self.subTest(text[-22:], main=main):
+                    reason = cg.install_files_refusal(text, main)
+                    self.assertIsNotNone(reason, text)
+                    self.assertIn("no $ expansion or backquote", reason)
+                    self.assertEqual(hook(text, main)[0], 2)
+        # A later pipeline element is expanded in its own process, or in zsh's current shell only AFTER python3 was forked with
+        # its environment (checked: `sh -c 'echo $HOME > f' | cat ${HOME::=/x}` writes the old HOME to f in zsh -f), so it
+        # cannot change what python3 runs with or reads: AC-5 limits the rule to the install segment and these pass it for main.
+        for text in (local + " | tee $HOME/x", local + " 2>&1 | tee ${HOME::=/tmp/x}"):
+            with self.subTest(text[-30:]):
+                self.assertIsNone(cg.install_files_refusal(text, True), text)
+        self.assertEqual(hook(local + " | tee $HOME/x", True)[0], 0)  # (tee to an unresolvable `x}` is the log-delete rule's call)
+
     def test_everyday_commands_that_only_mention_the_names_are_not_refused(self):  # AC-9
         for text in ("git add harness/hooks/ah_install.py", "git commit -m 'feat(install-files): add it'", "cat harness/hooks/ah_install.py",
                      "python3 -B -m unittest tests.test_ah_install", "python3 ~/.claude/hooks/spec_flow.py lint notes/goodqa-15742/spec.md",

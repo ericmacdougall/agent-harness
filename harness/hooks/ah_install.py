@@ -94,7 +94,7 @@ def refuse(message, code="refused", exit_code=2, data=None):
 # library only. Every path is built from a fixed hooks directory and a name matched against NAME_RE; it never reads a
 # path from the caller. ROOT is a token from ROOTS (absent over ssh: claude).
 REMOTE_SCRIPT = r'''
-import hashlib, json, os, re, shutil, stat, subprocess, sys, time, uuid
+import hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time, uuid
 NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 ROOTS = {"claude": "~/.claude/hooks", "codex": "~/.codex/agent-harness"}
 ROOT = sys.argv[3] if len(sys.argv) > 3 else "claude"
@@ -177,6 +177,9 @@ PROBE_TIMEOUT, DOCTOR_TIMEOUT, TOTAL_DEADLINE = 60, 120, 200  # the whole self-t
 HOOK_PROBES = {"hook_deny_wal": "rm -rf ~/.claude/wals/.ah-install-selftest-absent",
                "hook_subagent_local": "python3 -I ~/.claude/hooks/ah.py install-files --host local --from-ref "
                                       + "0" * 40 + ' --file ah.py --ticket "GoodQA selftest#1"'}
+# goodqa#15913 M2: main's own recovery form, sent AS MAIN (no agent_id; a disposable Claude home whose projects folder holds
+# this session's transcript, caller_identity's proof). The run id is never looked up: the probe only asks the guard.
+MAIN_PROBE = 'python3 -I ~/.claude/hooks/ah.py install-files --host local --rollback ins-000000000000 --ticket "GoodQA selftest#1"'
 
 def selftest():
     guard = os.path.join(HOOKS, "command_guard.py")
@@ -211,6 +214,27 @@ def selftest():
             res["hook"][key] = {"exit": p.returncode, "rule": rule.group(1) if rule else ""}
         except Exception as e:
             res["hook"][key] = {"exit": None, "rule": "", "error": type(e).__name__}
+    # compared with the baseline, never absolute (selftest_worse): a caller that cannot prove main is refused before and after
+    if deadline - time.time() <= 0.5:
+        res["hook"]["hook_main_recovery"] = {"exit": None, "rule": "", "error": "deadline"}
+    else:
+        claude_dir = tempfile.mkdtemp(prefix="ah-install-selftest-")
+        try:
+            sid = str(uuid.uuid4())
+            os.makedirs(os.path.join(claude_dir, "projects", "selftest"), 0o700)
+            transcript = os.path.join(claude_dir, "projects", "selftest", sid + ".jsonl")
+            write_exclusive(transcript, b"", 0o600)
+            payload = json.dumps({"session_id": sid, "transcript_path": transcript, "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                                  "tool_input": {"command": MAIN_PROBE}, "cwd": os.path.expanduser("~")})
+            p = subprocess.run(["python3", entry, "hook"], input=payload, capture_output=True, text=True,
+                               env=dict(os.environ, CLAUDE_CONFIG_DIR=claude_dir),
+                               timeout=max(0.5, min(PROBE_TIMEOUT, deadline - time.time())), cwd=os.path.expanduser("~"))
+            rule = re.search(r"\[([A-Za-z0-9_/-]+)\]", p.stderr or "")
+            res["hook"]["hook_main_recovery"] = {"exit": p.returncode, "rule": rule.group(1) if rule else ""}
+        except Exception as e:
+            res["hook"]["hook_main_recovery"] = {"exit": None, "rule": "", "error": type(e).__name__}
+        finally:
+            shutil.rmtree(claude_dir, ignore_errors=True)
     doctor = os.path.join(HOOKS, "doctor.py")
     if os.path.exists(doctor) and deadline - time.time() <= 0.5:
         res["doctor"] = {"flags": True, "failing": None, "timeout": True}
@@ -852,12 +876,18 @@ def selftest_worse(before, after):
     """None when `after` is no worse than `before`, else the reason. The hook-entry probes are ABSOLUTE (goodqa#15913): after
     any install the registered entry must block both with exactly these rules, whatever the baseline did (a host whose old
     guard lacks the install-files rule must take command_guard.py in the same run). The rule label, not only exit 2, is
-    required: a missing or unreadable entry also exits 2, from python itself."""
+    required: a missing or unreadable entry also exits 2, from python itself. The main recovery probe (M2) is RELATIVE: allowed
+    before and not allowed after is worse; a baseline without it, or one that already refused it, is never compared."""
     for key, rule in HOOK_RULES.items():
         now = (after.get("hook") or {}).get(key) or {}
         if now.get("exit") != 2 or now.get("rule") != rule:
             return ("the hook entry probe %s did not block with %s (exit %s, rule %s): install command_guard.py and "
                     "command_guard_hook.py from one merged commit" % (key, rule, now.get("exit"), now.get("rule") or "-"))
+    was = (before.get("hook") or {}).get("hook_main_recovery") or {}
+    now = (after.get("hook") or {}).get("hook_main_recovery") or {}
+    if was.get("exit") == 0 and now.get("exit") != 0:
+        return ("the hook entry probe hook_main_recovery (main's --rollback form) was allowed before the install and is not "
+                "now (exit %s, rule %s): main could no longer recover this host" % (now.get("exit"), now.get("rule") or "-"))
     for key, was in (before.get("guard") or {}).items():
         now = (after.get("guard") or {}).get(key)
         if now is None or now.get("exit") != was.get("exit") or now.get("verdict") != was.get("verdict") or now.get("rule") != was.get("rule"):
@@ -1335,6 +1365,10 @@ def _rollback(row, run_id, ticket, force_files, home, session, agent, runner, po
         remote.call("lock", {"run": run_id})
         locked = True
         got = remote.call("restore", {"items": items}, data=payload, write=True) if items else {"live": {}}
+        try:  # NEG-28: a commit step killed part way leaves the unrenamed temps holding this run's new bytes; remove them all
+            remote.call("cleanup", {"names": sorted(plan)})
+        except InstallError:
+            pass  # best effort: the restore above already decided the live bytes
         after = remote.call("selftest", timeout=SELFTEST_TIMEOUT)
     except InstallError as error:
         if remote.started:

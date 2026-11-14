@@ -1064,7 +1064,9 @@ class LocalTarget(LocalBase):
         self.assertEqual(len(posted), 1)
         self.assertIn("on local: installed (run %s)" % out["run"], posted[0][1])
         self.assertFalse((self.hooks / ".ah-install" / "lock").exists())
-        self.assertEqual(out["selftest_after"]["hook"], HOOK_OK)  # the registered entry ran on both payloads (AC-10)
+        hook = out["selftest_after"]["hook"]
+        self.assertEqual({k: v for k, v in hook.items() if k in HOOK_OK}, HOOK_OK)  # the registered entry ran on both payloads (AC-10)
+        self.assertEqual(set(hook), set(HOOK_OK) | {"hook_main_recovery"})  # and on main's recovery form (M2)
 
     def test_an_allow_all_guard_after_a_local_install_is_rolled_back_guard_first(self):  # AC-1, NEG-3
         ref = self.push({"command_guard.py": b"import sys\nprint('{\"verdict\": \"allow\", \"message\": \"\"}')\n"}, "allow-all")
@@ -1327,7 +1329,8 @@ class LocalTarget(LocalBase):
         (self.hooks / HOOK_ENTRY).write_bytes(b"import os, sys\nsys.stdin.read()\nwith open(os.path.expanduser('~/probe-record.txt'), 'a') as f:\n"
                                               b"    f.write('%d %s\\n' % (sys.flags.isolated, ' '.join(sys.argv[1:])))\n")
         ai.Remote("local", self.runner, self.mac).call("selftest", timeout=ai.SELFTEST_TIMEOUT)
-        self.assertEqual((self.mac / "probe-record.txt").read_text().splitlines(), ["0 hook", "0 hook"])  # python3 ENTRY hook, no -I
+        # python3 ENTRY hook, no -I: the two sub-agent probes and main's recovery probe (M2)
+        self.assertEqual((self.mac / "probe-record.txt").read_text().splitlines(), ["0 hook", "0 hook", "0 hook"])
 
     def test_codex_home_elsewhere_refuses_local_codex_and_is_noted_by_local(self):  # AC-3, NEG-19
         self.make_codex()
@@ -1386,6 +1389,41 @@ class LocalTarget(LocalBase):
                 self.assertIn("hook entry probe hook_deny_wal", caught.exception.data["reason"])
                 self.assertEqual(sha((folder / HOOK_ENTRY).read_bytes()), before)
                 self.assertTrue(self.no_temp_files(folder))
+
+    def test_the_main_recovery_probe_is_compared_with_the_baseline_and_never_absolute(self):  # AC-10, R1 (M2)
+        guard, doctor = {"allow": {"exit": 0, "verdict": "allow", "rule": ""}}, {"flags": True, "failing": []}
+
+        def result(main):
+            return {"guard": guard, "doctor": doctor, "hook": dict(HOOK_OK) if main is None else dict(HOOK_OK, hook_main_recovery=main)}
+        allowed, refused = {"exit": 0, "rule": ""}, {"exit": 2, "rule": "log_delete/install-files"}
+        for after in (refused, {"exit": 2, "rule": "guard_failure"}, {"exit": None, "rule": "", "error": "deadline"}, None):
+            with self.subTest(after):
+                self.assertIn("hook_main_recovery", ai.selftest_worse(result(allowed), result(after)))
+        self.assertIsNone(ai.selftest_worse(result(allowed), result(allowed)))
+        self.assertIsNone(ai.selftest_worse(result(refused), result(refused)))  # a caller that cannot prove main, before and after
+        self.assertIsNone(ai.selftest_worse(result(None), result(refused)))  # a baseline recorded before the probe existed
+
+    def test_a_guard_that_refuses_mains_recovery_form_is_rolled_back(self):  # AC-10, R1 (M2)
+        src = self.base_bytes("command_guard.py").decode()
+        anchor = "    if 'install' not in flat:\n        return None\n"
+        self.assertEqual(src.count(anchor), 1)
+        variant = src.replace(anchor, anchor + "    if '--rollback' in flat:\n        return 'ah install-files: refused by a test variant'\n")
+        ref = self.push({"command_guard.py": variant.encode()}, "refuse-main-recovery")
+        before = self.live("command_guard.py")
+        baseline = self.install(ref=ref, files=("command_guard.py",), dry_run=True)["selftest_baseline"]["hook"]
+        self.assertIn("hook_main_recovery", baseline)  # the self-test sends main's recovery form
+        import native_context  # noqa: PLC0415 - the probe's own ancestry check, asked here about this test's process tree
+        denied = native_context.native_deny_reason({})
+        if denied and baseline["hook_main_recovery"].get("exit") != 0:  # never skipped where main can be proven (Claude, Linux)
+            self.skipTest("this process tree cannot prove a main caller (%s, for example under Codex): %r" % (denied, baseline["hook_main_recovery"]))
+        self.assertEqual(baseline["hook_main_recovery"], {"exit": 0, "rule": ""})  # the merged guard allows main's --rollback
+        with self.assertRaises(ai.InstallError) as caught:
+            self.install(ref=ref, files=("command_guard.py",))
+        self.assertEqual((caught.exception.exit_code, caught.exception.data["result"]), (4, "rolled_back"))
+        self.assertIn("hook_main_recovery", caught.exception.data["reason"])
+        self.assertEqual(self.live("command_guard.py"), before)
+        self.assertEqual(caught.exception.data["selftest_after_rollback"]["hook"]["hook_main_recovery"], {"exit": 0, "rule": ""})
+        self.assertTrue(self.no_temp_files(self.hooks))
 
 
 DRIVER = r'''
@@ -1667,6 +1705,48 @@ class LocalKill(LocalBase):
         self.assertEqual(ai.results_of(self.mac, run), ["installed"])  # one result row, and it matches the live bytes
         self.assertEqual({n: self.live(n) for n in self.FILES}, new)
         self.assertEqual(ai.unfinished_runs(self.mac, "local"), [])
+
+    def commit_step_killed(self, label):
+        """NEG-28: the caller, the run's session AND the commit step itself are SIGKILLed after the first of three renames, so
+        nothing finishes the commit: ah.py holds the new bytes; extra.py and command_guard.py are old, their staged temps
+        (the run's new bytes) beside them."""
+        old = {n: self.live(n) for n in NAMES}
+        new = {n: sha(self.base_bytes(n) + b"\n# c1\n") for n in self.FILES}
+        progress, gate = Path(self.tmp, "progress-%s.txt" % label), Path(self.tmp, "gate-%s" % label)
+        proc = self.drive(self.c1, progress, foreground=True, barrier=gate)  # the commit step pauses after its first rename
+        first = self.wait_for(progress, "commit", 1, 240, proc)[0]
+        os.killpg(proc.pid, signal.SIGKILL)  # the caller
+        proc.wait()
+        session = int(re.search(r"own session \(pid (\d+)\)", self.caller_err.read_text()).group(1))
+        os.killpg(session, signal.SIGKILL)  # the run's whole session
+        self.wait_gone(session, 60)
+        os.killpg(int(first[3]), signal.SIGKILL)  # and the commit step, in a session of its own
+        self.wait_gone(int(first[2]), 60)
+        self.assertEqual({n: self.live(n) for n in self.FILES}, {"ah.py": new["ah.py"], "extra.py": old["extra.py"],
+                                                                 "command_guard.py": old["command_guard.py"]})
+        temps = {p.name: sha(p.read_bytes()) for p in self.hooks.iterdir() if p.name.endswith(".ah-install-tmp")}
+        self.assertEqual(temps, {".extra.py.ah-install-tmp": new["extra.py"], ".command_guard.py.ah-install-tmp": new["command_guard.py"]})
+        run = self.rows("start")[0]["run"]
+        self.assertEqual((self.rows("result"), ai.unfinished_runs(self.mac, "local")), ([], [run]))
+        return run, old, new
+
+    def test_a_commit_step_killed_after_one_of_three_renames_is_finished_by_resume_with_no_temp_left(self):  # AC-1, AC-4, NEG-28
+        run, _old, new = self.commit_step_killed("resume")
+        done = ai.resume(run, TICKET, self.mac, "s", "a", None, lambda t, x: None)  # the default (detached) runner
+        self.assertEqual(done["result"], "installed")
+        self.assertEqual({n: self.live(n) for n in self.FILES}, new)
+        self.assertTrue(self.no_temp_files(self.hooks), sorted(p.name for p in self.hooks.iterdir()))
+        self.assertEqual(ai.unfinished_runs(self.mac, "local"), [])
+        self.assertFalse((self.hooks / ".ah-install" / "lock").exists())
+
+    def test_a_commit_step_killed_after_one_of_three_renames_is_rolled_back_with_no_temp_left(self):  # AC-1, AC-4, NEG-28
+        run, old, _new = self.commit_step_killed("rollback")
+        done = ai.rollback(run, TICKET, (), self.mac, "s", "a", None, lambda t, x: None)
+        self.assertEqual((done["result"], done["restored"]), ("restored", ["ah.py"]))  # the other two were still old
+        self.assertEqual({n: self.live(n) for n in NAMES}, old)  # every pre-run sha
+        self.assertTrue(self.no_temp_files(self.hooks), sorted(p.name for p in self.hooks.iterdir()))  # no copy of the new bytes left
+        self.assertEqual(ai.unfinished_runs(self.mac, "local"), [])
+        self.assertFalse((self.hooks / ".ah-install" / "lock").exists())
 
     def test_the_writer_lock_is_held_while_any_holder_lives_and_only_on_local_targets(self):  # AC-4, NEG-23, NEG-24
         lock = self.mac.joinpath(*ai.LOCK_DIR) / "local.lock"
