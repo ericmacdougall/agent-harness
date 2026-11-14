@@ -94,6 +94,14 @@ class Base(unittest.TestCase):
     def run_all(self, deps):
         return runner.tick(self.paths, self.config, deps)
 
+    def record(self, iid):
+        """The admitted request (spec v4 F2: it lives in the ledger, never in a queue file)."""
+        ledger = runner.Ledger(self.paths)
+        try:
+            return json.loads(ledger.item(iid)["request"])
+        finally:
+            ledger.close()
+
     def state(self, iid):
         return runner.Journal(self.paths, iid).state()
 
@@ -582,7 +590,7 @@ class IngestValidationTests(Base):
 
     def valid_record(self):
         iid = self.submit()
-        return iid, json.loads((self.paths.queue / (iid + ".json")).read_text())
+        return iid, self.record(iid)
 
     def assert_isolated(self, bad_name, deps):
         """The bad file is quarantined with a reason, alerted once, and the valid item still completes."""
@@ -770,11 +778,11 @@ class UntrustedReadTests(Base):
         super().tearDown()
 
     def plant_record(self, packet_path, pr):
+        """An admitted item whose packet path later turns hostile (admitted directly: submit's lint never saw it)."""
         good = self.submit()
-        rec = json.loads((self.paths.queue / (good + ".json")).read_text())
-        bad = dict(rec, pr=pr, packet=str(packet_path))
+        bad = dict(self.record(good), pr=pr, packet=str(packet_path))
         bad["id"] = core.item_id(bad, bad["packet_sha256"])
-        (self.paths.queue / (bad["id"] + ".json")).write_text(json.dumps(bad))
+        runner.admit(self.paths, self.config, bad)
         return good, bad["id"]
 
     def assert_tick_survives(self, good, bad, deps):
@@ -924,8 +932,7 @@ class UntrustedReadTests(Base):
                "ticket": "GoodQA goodqa#16034", "owner": "agent-abc123"}
         original = hashlib.sha256(GOOD_PACKET.encode()).hexdigest()
         iid = runner.submit_with_lint(self.paths, self.config, req)["id"]
-        queued = json.loads((self.paths.queue / (iid + ".json")).read_text())
-        self.assertEqual(queued["packet_sha256"], original, "the hashed bytes are not the linted bytes")
+        self.assertEqual(self.record(iid)["packet_sha256"], original, "the hashed bytes are not the linted bytes")
 
     def test_fifo_review_report_does_not_block(self):
         import os

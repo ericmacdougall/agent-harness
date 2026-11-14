@@ -123,6 +123,7 @@ class Paths:
     def __init__(self, home=None):
         self.home = Path(home or Path.home())
         self.root = self.home / ".agent-harness" / "coordinator"
+        self.packets = self.root / "packets"   # private staging root for `ahc submit --packet -` (adv-3 F2)
         self.queue = self.root / "queue"
         self.items = self.root / "items"
         self.inbox = self.root / "inbox"
@@ -346,13 +347,8 @@ def submit(paths, config, req, now=None, data=None):
     norm.update(packet_sha256=packet_sha, submitted=now or time.time())
     iid = item_id(norm, packet_sha)
     norm["id"] = iid
-    paths.ensure()
-    target = paths.queue / (iid + ".json")
-    try:
-        _atomic_write(target, json.dumps(norm, sort_keys=True))
-    except FileExistsError:
-        return {"id": iid, "duplicate": True}
-    return {"id": iid, "duplicate": False}
+    import ahc_runner  # noqa: PLC0415 - the ledger lives there; ahc_runner imports this module at load
+    return ahc_runner.admit(paths, config, norm)
 
 
 def resolve(req, run):

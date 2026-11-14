@@ -427,37 +427,9 @@ class Ledger:
     def item(self, iid):
         return self.db.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
 
-    def ensure_item(self, iid, config, now=None):
-        """Accept the queued request into the ledger (I1) after re-validating it (r2 F5). Returns the row, None if
-        no request file exists, or raises core.Refused for a record that must be quarantined."""
-        row = self.item(iid)
-        if row is not None:
-            return row
-        qfile = self.paths.queue / (iid + ".json")
-        try:
-            text = core.read_regular(qfile, core.PACKET_MAX_BYTES).decode("utf-8")
-        except core.Unreadable as error:
-            if error.kind == "absent":
-                return None
-            raise core.Refused("queue file unreadable: %s" % error) from None
-        except UnicodeDecodeError:
-            raise core.Refused("queue file is not UTF-8") from None
-        try:
-            raw = json.loads(text)
-        except ValueError:
-            raise core.Refused("queue file is not valid JSON") from None
-        req = core.validate_queued(config, raw, now if now is not None else time.time())
-        if req["id"] != iid:
-            raise core.Refused("queue file name does not match its id")
-        with self.tx():
-            self.db.execute(
-                "INSERT OR IGNORE INTO items(id, lineage, owner, ticket, state, next_action_at, submitted, request,"
-                " updated, entered_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (iid, "%s|%s" % (req["repo"], req["pr"]), req["owner"], req["ticket"], "queued",
-                 req["submitted"], req["submitted"], json.dumps(req, sort_keys=True), time.time(), req["submitted"]))
-            self.db.execute("INSERT OR IGNORE INTO lineage(lineage) VALUES (?)", ("%s|%s" % (req["repo"], req["pr"]),))
-            self.db.execute("INSERT INTO events(item, event, at, data) VALUES (?,?,?,?)",
-                            (iid, "accepted", time.time(), "{}"))
+    def ensure_item(self, iid, config=None, now=None):
+        """The admitted row, or None. Admission happens only in `admit` (ahc submit), inside one ledger
+        transaction (spec v4 F2); a queue file never admits work."""
         return self.item(iid)
 
     def event(self, iid, event, at, **data):
@@ -1230,18 +1202,12 @@ def ingest(ledger, paths, config, now=None):
         files = []
     rejected = []
     for qfile in files:
-        try:
-            ledger.ensure_item(qfile.stem, config, now)
-        except Exception as error:  # noqa: BLE001 - any per-file failure is quarantined, never fatal to the tick
-            reason = str(error) if isinstance(error, core.Refused) else "ingest error: %s" % type(error).__name__
-            try:
-                if ledger.db.in_transaction:
-                    ledger.db.rollback()
-            except Exception:  # noqa: BLE001
-                pass
-            moved = _quarantine(paths, qfile, reason)
-            # an unmovable file is skipped and reported again next tick under the same deterministic alert key
-            rejected.append((moved or qfile.name, reason if moved else reason + "; quarantine move failed"))
+        # spec v4 F2: only `ahc submit` admits work, inside the ledger transaction; a file placed in the queue
+        # directory admits nothing, whatever it contains, and is quarantined with an alert
+        reason = "a queue file admits nothing; submit with `ahc submit` (the file was not read)"
+        moved = _quarantine(paths, qfile, reason)
+        # an unmovable file is skipped and reported again next tick under the same deterministic alert key
+        rejected.append((moved or qfile.name, reason if moved else reason + "; quarantine move failed"))
     return rejected
 
 
@@ -1727,25 +1693,84 @@ def load_config(paths):
     config.setdefault("repos", ["ericmacdougall/bugtracker", "ericmacdougall/Android-security",
                                 "ericmacdougall/agent-harness", "ericmacdougall/agent-fabric"])
     config.setdefault("work_roots", [str(paths.home / ".agent-harness" / "work")])
+    if str(paths.packets) not in config["work_roots"]:
+        config["work_roots"] = list(config["work_roots"]) + [str(paths.packets)]  # staged stdin packets (adv-3 F2)
     return config
+
+
+REPO_HOURLY_LIMIT = 6        # NEG-52: submissions admitted per repo per rolling hour
+
+
+def admit(paths, config, norm, now=None):
+    """Admit one validated request (spec v4 F2): in ONE `BEGIN IMMEDIATE` transaction, a duplicate id returns the
+    existing item; otherwise the queue cap (non-terminal items) and the per-repo limit (items admitted for the repo in
+    the last hour) are checked and the row, its lineage and the `accepted` event are inserted. Concurrent submits
+    serialize on the write lock, so N racers against k free slots admit exactly k. Returns {"id", "duplicate"}."""
+    now = float(now if now is not None else norm.get("submitted") or time.time())
+    capacity = int(bounds(config)["queue_capacity"])
+    ledger = Ledger(paths, migrate=False)
+    try:
+        with ledger.tx():
+            if ledger.item(norm["id"]) is not None:
+                return {"id": norm["id"], "duplicate": True}
+            depth = ledger.db.execute("SELECT COUNT(*) FROM items WHERE state IN (%s)" % ",".join(
+                "?" * len(NON_TERMINAL)), sorted(NON_TERMINAL)).fetchone()[0]
+            if depth >= capacity:  # NEG-38
+                raise core.Refused("the ahc queue is full: %d items waiting (capacity %d); try again later or ask "
+                                   "main" % (depth, capacity))
+            prefix = norm["repo"] + "|"
+            recent = ledger.db.execute("SELECT COUNT(*) FROM items WHERE substr(lineage, 1, ?) = ? AND submitted > ?",
+                                       (len(prefix), prefix, now - 3600)).fetchone()[0]
+            if recent >= REPO_HOURLY_LIMIT:  # NEG-52
+                raise core.Refused("%s already has %d submissions in the last hour (limit %d); try again later"
+                                   % (norm["repo"], recent, REPO_HOURLY_LIMIT))
+            ledger.db.execute(
+                "INSERT INTO items(id, lineage, owner, ticket, state, next_action_at, submitted, request, updated,"
+                " entered_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (norm["id"], "%s|%s" % (norm["repo"], norm["pr"]), norm["owner"], norm["ticket"], "queued",
+                 norm["submitted"], norm["submitted"], json.dumps(norm, sort_keys=True), now, norm["submitted"]))
+            ledger.db.execute("INSERT OR IGNORE INTO lineage(lineage) VALUES (?)",
+                              ("%s|%s" % (norm["repo"], norm["pr"]),))
+            ledger.event(norm["id"], "accepted", now)
+        _mirror(paths, norm["id"], "accepted", now, {})
+        return {"id": norm["id"], "duplicate": False}
+    finally:
+        ledger.close()
+
+
+def stage_packet(paths, stream, expect_sha=None):
+    """`ahc submit --packet -` (adv-3 F2): read at most the packet cap from the stream, refuse anything larger or a
+    SHA-256 that differs from --expect-sha, and write the bytes once to the private staging root as <sha>.md (0600,
+    no-follow, never overwritten). Returns (path, sha)."""
+    data = stream.read(core.PACKET_MAX_BYTES + 1)
+    if len(data) > core.PACKET_MAX_BYTES:
+        raise core.Refused("the packet on stdin is larger than %d bytes" % core.PACKET_MAX_BYTES)
+    if not data:
+        raise core.Refused("no packet bytes on stdin")
+    sha = hashlib.sha256(data).hexdigest()
+    if expect_sha is not None and expect_sha.strip().lower() != sha:
+        raise core.Refused("the packet received has SHA-256 %s, not the expected %s; nothing was queued"
+                           % (sha, expect_sha.strip()))
+    paths.packets.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(str(paths.packets), 0o700)
+    target = paths.packets / (sha + ".md")
+    try:
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except FileExistsError:
+        if core.read_regular(target, core.PACKET_MAX_BYTES) != data:
+            raise core.Refused("a different staged packet already has this name; refusing") from None
+        return target, sha
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return target, sha
 
 
 def submit_with_lint(paths, config, req):
     """`ahc submit`: validate, lint synchronously (AC-25) and enqueue. Rejects with the lint tool's exact text."""
     norm = core.validate(config, req)
-    capacity = int(bounds(config)["queue_capacity"])
-    ledger = Ledger(paths, migrate=False)
-    try:
-        ingest(ledger, paths, config)
-        raw = core.read_regular(norm["packet"], core.PACKET_MAX_BYTES)
-        existing = ledger.item(core.item_id(norm, hashlib.sha256(raw).hexdigest()))
-        depth = ledger.db.execute("SELECT COUNT(*) AS n FROM items WHERE state IN (%s)" % ",".join(
-            "?" * len(NON_TERMINAL)), sorted(NON_TERMINAL)).fetchone()["n"]
-    finally:
-        ledger.close()
-    if existing is None and depth >= capacity:  # NEG-38; a duplicate resubmit stays a no-op
-        raise core.Refused("the ahc queue is full: %d items waiting (capacity %d); try again later or ask main"
-                           % (depth, capacity))
+    raw = core.read_regular(norm["packet"], core.PACKET_MAX_BYTES)
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -1754,7 +1779,10 @@ def submit_with_lint(paths, config, req):
     if fix["status"] == "unfixable":
         import review_diagnostics
         raise core.Refused(review_diagnostics.render_lint(fix["problems"], "pr"))
-    return core.submit(paths, config, req, data=raw)   # r4 F3: the linted bytes are the hashed bytes
+    # r4 F3: the linted bytes are the hashed bytes; admission (cap, hourly limit, dedupe) is one transaction
+    result = core.submit(paths, config, req, data=raw)
+    result["packet_sha256"] = hashlib.sha256(raw).hexdigest()
+    return result
 
 
 def _setup_logging(paths):
@@ -1775,6 +1803,7 @@ def build_parser():
     for name in ("--repo", "--head", "--base", "--packet", "--ticket", "--owner"):
         s.add_argument(name, required=True)
     s.add_argument("--pr", type=int, required=True)
+    s.add_argument("--expect-sha", help="with --packet -: refuse unless the stdin bytes have this SHA-256")
     a = sub.add_parser("ack", help="owner acknowledges an item's notice, or records a D20 disposition")
     a.add_argument("item")
     a.add_argument("--owner", required=True)
@@ -1816,6 +1845,11 @@ def main(argv=None):
         req = {"repo": args.repo, "pr": args.pr, "head": args.head, "base": args.base, "packet": args.packet,
                "ticket": args.ticket, "owner": args.owner}
         try:
+            if args.packet == "-":
+                staged, _sha = stage_packet(paths, sys.stdin.buffer, args.expect_sha)
+                req["packet"] = str(staged)
+            elif args.expect_sha is not None:
+                raise core.Refused("--expect-sha applies only to --packet -")
             print(json.dumps(submit_with_lint(paths, config, req)))
         except core.Refused as error:
             print("refused: %s" % error, file=sys.stderr)

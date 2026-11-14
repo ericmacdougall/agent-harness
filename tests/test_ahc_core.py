@@ -56,23 +56,214 @@ class Base(unittest.TestCase):
         return req
 
 
+REPOS4 = [REPO, "ericmacdougall/agent-fabric", "ericmacdougall/bugtracker", "ericmacdougall/Android-security"]
+
+
+def _race_submit(job):
+    """One child process of the admission race: a real core.submit against the shared ledger."""
+    home, repo, pr, start = job
+    sys.path.insert(0, str(HOOKS))
+    import time as _time
+    import ahc_core as _core
+    paths = _core.Paths(home)
+    config = {"repos": REPOS4, "work_roots": [str(Path(home) / ".agent-harness" / "work")]}
+    req = {"repo": repo, "pr": pr, "head": HEAD, "base": BASE,
+           "packet": str(Path(home) / ".agent-harness" / "work" / "s1" / "packet.md"),
+           "ticket": "GoodQA goodqa#16034", "owner": "agent-abc123"}
+    while _time.time() < start:   # release every child at once so they really race
+        _time.sleep(0.001)
+    try:
+        return "dup" if _core.submit(paths, config, req)["duplicate"] else "ok"
+    except _core.Refused as error:
+        return "refused: %s" % error
+
+
+class SubmitLimitTests(Base):
+    """NEG-52 / spec v4 F2: admission is one BEGIN IMMEDIATE ledger transaction. Concurrent submits never exceed
+    the queue cap or the per-repo hourly limit; a repo off the allowlist is refused; a file placed in the queue
+    directory admits nothing."""
+
+    def setUp(self):
+        super().setUp()
+        self.config["repos"] = REPOS4
+        import ahc_runner
+        self.runner = ahc_runner
+
+    def prefill(self, n, submitted=1_000.0):
+        """n waiting items admitted long ago (outside the hourly window), straight into the ledger."""
+        ledger = self.runner.Ledger(self.paths)
+        try:
+            with ledger.tx():
+                for i in range(n):
+                    ledger.db.execute(
+                        "INSERT INTO items(id, lineage, owner, ticket, state, next_action_at, submitted, request)"
+                        " VALUES (?,?,?,?,?,?,?,?)", ("ahc-old%d" % i, "x/y|%d" % i, "o", "t", "queued", 0, submitted,
+                                                      "{}"))
+        finally:
+            ledger.close()
+
+    def race(self, jobs):
+        import multiprocessing
+        import time
+        self.runner.Ledger(self.paths).close()   # the schema exists before the children race
+        start = time.time() + 1.5
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(len(jobs)) as pool:
+            return pool.map(_race_submit, [(str(self.home), repo, pr, start) for repo, pr in jobs])
+
+    def count(self, where="1=1", args=()):
+        ledger = self.runner.Ledger(self.paths)
+        try:
+            return ledger.db.execute("SELECT COUNT(*) FROM items WHERE " + where, args).fetchone()[0]
+        finally:
+            ledger.close()
+
+    def test_twenty_racers_against_ten_free_slots_admit_exactly_ten(self):
+        self.prefill(40)
+        jobs = [(REPOS4[i % 4], 100 + i) for i in range(20)]   # 5 per repo: the hourly limit never binds
+        results = self.race(jobs)
+        self.assertEqual(results.count("ok"), 10, results)
+        self.assertTrue(all(r == "ok" or "queue is full" in r for r in results), results)
+        self.assertEqual(self.count("state='queued'"), 50)
+
+    def test_seven_racers_for_one_repo_admit_six(self):
+        results = self.race([(REPO, 200 + i) for i in range(7)])
+        self.assertEqual(results.count("ok"), 6, results)
+        self.assertEqual(len([r for r in results if "in the last hour" in r]), 1, results)
+        self.assertEqual(self.count(), 6)
+
+    def test_hourly_window_rolls(self):
+        import time
+        for i in range(6):
+            core.submit(self.paths, self.config, self.request(pr=300 + i), now=time.time() - 3700)
+        core.submit(self.paths, self.config, self.request(pr=399))   # the six are older than an hour
+        with self.assertRaises(core.Refused):
+            for i in range(6):
+                core.submit(self.paths, self.config, self.request(pr=400 + i))
+        self.assertEqual(self.count("submitted > ?", (time.time() - 3600,)), 6)
+
+    def test_repo_off_the_allowlist_is_refused(self):
+        with self.assertRaises(core.Refused):
+            core.submit(self.paths, self.config, self.request(repo="someone/else"))
+        self.assertEqual(self.count() if (self.paths.root / "ledger.sqlite3").exists() else 0, 0)
+
+    def test_duplicate_is_not_counted_against_the_limit(self):
+        for _ in range(8):
+            core.submit(self.paths, self.config, self.request(pr=500))
+        self.assertEqual(self.count(), 1)
+
+    def test_planted_queue_file_admits_nothing(self):
+        good = core.submit(self.paths, self.config, self.request(pr=600))["id"]
+        rec = json.loads(self.runner.Ledger(self.paths).item(good)["request"])
+        forged = dict(rec, pr=601)
+        forged["id"] = core.item_id(forged, forged["packet_sha256"])
+        self.paths.queue.mkdir(parents=True, exist_ok=True)
+        (self.paths.queue / (forged["id"] + ".json")).write_text(json.dumps(forged))
+        calls = []
+
+        class Deps:
+            now = 2_000_000_000.0
+
+            def clock(self):
+                return self.now
+
+            def ah(self, argv, timeout):
+                calls.append(argv)
+                return 0, "{}", ""
+
+            def ops_watch(self, argv, timeout):
+                return 1, "", ""
+
+            def gh(self, argv, timeout):
+                return 1, "", ""
+        self.runner.tick(self.paths, self.config, Deps(), role="core")
+        self.assertEqual(self.count("id=?", (forged["id"],)), 0, "a well-formed planted file must not be admitted")
+        self.assertTrue(list((self.paths.root / "rejected").glob(forged["id"] + ".json")))
+        self.assertTrue([a for a in calls if a[:3] == ["ah", "alert", "raise"]
+                         and a[a.index("--alert-key") + 1].startswith("ahc:rejected:")])
+
+
+class StdinPacketTests(Base):
+    """adv-3 F2: `ahc submit --packet -` reads capped stdin into the private staging root and echoes its SHA-256."""
+
+    def setUp(self):
+        super().setUp()
+        import ahc_runner
+        self.runner = ahc_runner
+
+    def stream(self, data):
+        import io
+        return io.BytesIO(data)
+
+    def test_stage_writes_private_file_and_returns_sha(self):
+        data = ("packet " + HEAD + "\n").encode()
+        path, sha = self.runner.stage_packet(self.paths, self.stream(data))
+        self.assertEqual(sha, hashlib.sha256(data).hexdigest())
+        self.assertEqual(path.read_bytes(), data)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(self.paths.packets).st_mode & 0o777, 0o700)
+        self.assertEqual(self.runner.stage_packet(self.paths, self.stream(data))[0], path, "idempotent")
+
+    def test_over_the_cap_is_refused_and_nothing_staged(self):
+        with self.assertRaises(core.Refused):
+            self.runner.stage_packet(self.paths, self.stream(b"x" * (core.PACKET_MAX_BYTES + 1)))
+        self.assertFalse(self.paths.packets.exists() and list(self.paths.packets.iterdir()))
+
+    def test_sha_mismatch_is_refused(self):
+        with self.assertRaises(core.Refused) as caught:
+            self.runner.stage_packet(self.paths, self.stream(b"abc"), expect_sha="0" * 64)
+        self.assertIn("not the expected", str(caught.exception))
+        self.assertFalse(self.paths.packets.exists() and list(self.paths.packets.iterdir()))
+
+    def test_cli_submit_from_stdin_admits_and_echoes_sha(self):
+        import contextlib
+        import io
+        from unittest import mock
+        data = ("head %s\n```\n$ python3 -m unittest\nRan 1 test\nOK\nexit 0\n```\n" % HEAD).encode()
+        stdin = mock.Mock()
+        stdin.buffer = io.BytesIO(data)
+        out = io.StringIO()
+        argv = ["submit", "--repo", REPO, "--pr", "7", "--head", HEAD, "--base", BASE, "--packet", "-",
+                "--ticket", "GoodQA goodqa#16034", "--owner", "agent-abc123",
+                "--expect-sha", hashlib.sha256(data).hexdigest()]
+        (self.paths.root).mkdir(parents=True, exist_ok=True)
+        (self.paths.root / "config.json").write_text(json.dumps(self.config))
+        with mock.patch.object(Path, "home", return_value=self.home), mock.patch.object(sys, "stdin", stdin), \
+                contextlib.redirect_stdout(out):
+            rc = self.runner.main(argv)
+        self.assertEqual(rc, 0, out.getvalue())
+        result = json.loads(out.getvalue())
+        self.assertEqual(result["packet_sha256"], hashlib.sha256(data).hexdigest())
+        self.assertFalse(result["duplicate"])
+
+
 class SubmitTests(Base):
     def test_valid_request_is_queued_once(self):
         first = core.submit(self.paths, self.config, self.request())
         again = core.submit(self.paths, self.config, self.request())
         self.assertEqual(first["id"], again["id"])
         self.assertTrue(again["duplicate"])
-        self.assertEqual(len(list(self.paths.queue.glob("*.json"))), 1)
+        self.assertEqual(self.admitted(), [first["id"]])
+        self.assertEqual(list(self.paths.queue.glob("*.json")) if self.paths.queue.exists() else [], [],
+                         "v4 F2: admission is a ledger row, never a queue file")
 
-    def test_queue_file_is_private(self):
-        item = core.submit(self.paths, self.config, self.request())
-        mode = os.stat(self.paths.queue / (item["id"] + ".json")).st_mode & 0o777
+    def admitted(self):
+        import ahc_runner
+        ledger = ahc_runner.Ledger(self.paths)
+        try:
+            return [r["id"] for r in ledger.db.execute("SELECT id FROM items ORDER BY id")]
+        finally:
+            ledger.close()
+
+    def test_ledger_is_private(self):
+        core.submit(self.paths, self.config, self.request())
+        mode = os.stat(self.paths.root / "ledger.sqlite3").st_mode & 0o777
         self.assertEqual(mode, 0o600)
 
     def refused(self, **over):
         with self.assertRaises(core.Refused):
             core.submit(self.paths, self.config, self.request(**over))
-        self.assertEqual(list(self.paths.queue.glob("*.json")) if self.paths.queue.exists() else [], [])
+        self.assertEqual(self.admitted() if (self.paths.root / "ledger.sqlite3").exists() else [], [])
 
     def test_short_head_refused(self):
         self.refused(head="abc1234")
@@ -403,6 +594,74 @@ class P0SurfaceTests(unittest.TestCase):
                     parser.parse_args(["authority", "enable"])
                 finally:
                     sys.stderr = stderr
+
+    AHC_SOURCES = ("ahc_core.py", "ahc_runner.py", "ahc_clone.py", "ahc_packet.py", "ahc_install.py")
+
+    def stamp_violations(self, sources):
+        """Narrowed AC-31 rule (spec owner ruling): ahc_* never puts a stamp, never adds a review waiver, never imports
+        merge_gate or names its state, and takes only its own `ahc-dispose` stamp through core.DISPOSE_STAMP."""
+        import ast
+        bad = []
+        for name, text in sources.items():
+            tree = ast.parse(text)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    mods = [a.name for a in node.names] + ([node.module] if isinstance(node, ast.ImportFrom) else [])
+                    if any(m and m.split(".")[0] == "merge_gate" for m in mods):
+                        bad.append("%s imports merge_gate" % name)
+                if isinstance(node, ast.Constant) and isinstance(node.value, str) and (
+                        node.value in ("review-auth", "mission-main") or "waiver" in node.value.lower()):
+                    bad.append("%s names %r" % (name, node.value))
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+                if func in ("put_stamp", "add_review_waiver", "drop_tool_stamps"):
+                    bad.append("%s calls %s" % (name, func))
+                if func == "take_stamp":
+                    purpose = node.args[0] if node.args else None
+                    ok = (isinstance(purpose, ast.Attribute) and purpose.attr == "DISPOSE_STAMP"
+                          and isinstance(purpose.value, ast.Name) and purpose.value.id == "core")
+                    if not ok:
+                        bad.append("%s takes a stamp whose purpose is not core.DISPOSE_STAMP" % name)
+        return bad
+
+    def test_ahc_never_puts_stamps_or_waivers_and_takes_only_its_own(self):
+        sources = {n: (HOOKS / n).read_text(encoding="utf-8") for n in self.AHC_SOURCES}
+        self.assertEqual(self.stamp_violations(sources), [])
+        self.assertEqual(core.DISPOSE_STAMP, "ahc-dispose")
+        self.assertIn("take_stamp(core.DISPOSE_STAMP", sources["ahc_runner.py"], "the scan must see the one take")
+
+    def test_stamp_scan_is_not_vacuous(self):
+        runner_text = (HOOKS / "ahc_runner.py").read_text(encoding="utf-8")
+        for broken in (runner_text.replace("take_stamp(core.DISPOSE_STAMP", 'take_stamp("review-auth"', 1),
+                       runner_text.replace("take_stamp(core.DISPOSE_STAMP", "take_stamp(PURPOSE", 1),
+                       runner_text + "\ndef _x():\n    caller_identity.put_stamp(core.DISPOSE_STAMP, [])\n",
+                       runner_text + "\nimport merge_gate\n"):
+            self.assertTrue(self.stamp_violations({"ahc_runner.py": broken}))
+
+    def test_runtime_flow_leaves_main_stamps_unconsumed(self):
+        """Put main's review-auth stamp for this PR and a mission-main stamp; run submit, review, BLOCK, ack and a
+        disposition attempt through the real CLI claim path; both stamps must still be there."""
+        import caller_identity
+        os.environ["AH_HOME"] = str(self.home)
+        self.addCleanup(os.environ.pop, "AH_HOME", None)
+        caller_identity.put_stamp("review-auth", [REPO, 7], home=self.home)
+        caller_identity.put_stamp("mission-main", ["set", "k"], home=self.home)
+        folder = caller_identity.stamp_dir(self.home)
+        before = sorted(p.name for p in folder.glob("*.json"))
+        self.assertEqual(len(before), 2)
+        rec = self.Recorder(verdict="BLOCK", review_rc=3)
+        self.drive(rec, ticks=2)
+        ledger = self.runner.Ledger(self.paths)
+        try:
+            iid, state = ledger.db.execute("SELECT id, state FROM items").fetchone()
+        finally:
+            ledger.close()
+        self.assertEqual(state, "blocked", "the flow must reach BLOCK for the test to mean anything")
+        self.runner.ack(self.paths, iid, "agent-abc123", now=rec.now)
+        argv = ["ack", iid, "--owner", "main", "--disposition", "x"]
+        self.assertFalse(self.runner.claim_main(argv), "no ahc-dispose stamp was put, so not main")
+        self.assertEqual(sorted(p.name for p in folder.glob("*.json")), before, "main's stamps were consumed")
 
     def test_detector_is_not_vacuous(self):
         self.assertTrue(_lands_a_pr(["gh", "pr", "merge", "7", "-R", REPO, "--merge"]))
