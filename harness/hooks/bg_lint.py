@@ -36,6 +36,11 @@ TAIL_CMDS = {"ls", "cat", "tail", "grep", "head", "wc", "stat"}
 SAFE = "Use `python3 ~/.claude/hooks/bg_job.py launch|wait` (reports STARTED only on proof, wait returns the real exit status)."
 
 
+REMOTE_HINT = (" To wait for a line in a log on a remote host use `python3 ~/.claude/hooks/bg_job.py wait-remote --host H "
+               "--file F --until-file-line TEXT --timeout S`: it retries an ssh reset once and reports a dead link as INFRA "
+               "(exit 5), not as a failed task.")
+
+
 def split_top_level(command):
     """[(operator_before, text)] split at ; && || | & and newline outside quotes, $(...) and backticks."""
     segments, buf, op = [], [], ""
@@ -257,7 +262,8 @@ def lint(command, _depth=0):
     hit = find_wait_loop_tail(command, segments)
     if hit:
         out.append(("wait-loop-tail", "This wait/poll loop ends with `%s`; the loop's exit status is that command's, "
-                                      "not the job's, so a failed job can look like success. %s" % (hit, SAFE)))
+                                      "not the job's, so a failed job can look like success. %s%s"
+                                      % (hit, SAFE, REMOTE_HINT if re.search(r"\bssh\b", command) else "")))
     hit = find_self_matching_wait(segments)
     if hit:
         out.append(("self-match-pgrep", "This wait loop polls `%s`, and that pattern also occurs in the command line "
