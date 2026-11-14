@@ -143,6 +143,20 @@ class RealTaskRegisterTests(HomeCase):
         rows = self.store._rows(self.store.lane_dir(lane))
         self.assertEqual([x["data"]["agent"] for x in rows if x["kind"] == "holder_bound"], ["A1"])
 
+    def test_bind_of_a_stream_registered_to_another_holder_is_refused_not_partial(self):  # F1 through commands.bind
+        lane = self.mk()
+        cmd.start(self.p, self.store, lane=lane)
+        m = mf.read_current(self.store.lane_dir(lane))
+        self.register(agent="A0", op="bind-other-g1-A0", task=m["stream_key"])  # an earlier holder of the stream
+        self.dispatch["A1"] = m["stream_key"]
+        self.owner_rows = [owner(1)]
+        self.p.task_register = self.real.task_register
+        r = cmd.bind(self.p, self.store, lane=lane, agent="A1")
+        self.assertEqual(r.code, cmd.REFUSED, r.lines)
+        self.assertIn("already registered to another holder", " ".join(r.lines))
+        rows = self.store._rows(self.store.lane_dir(lane))
+        self.assertEqual([x for x in rows if x["kind"] == "holder_bound"], [])
+
 
 # ------------------------------------------------------------------------------------------------------------- F2
 def _new_child(store_root, repo, templates, cfg, point):

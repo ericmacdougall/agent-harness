@@ -181,8 +181,13 @@ def _attach_digests(ports, store, lane_dir, lane_id, m, op):
     body = "Lane %s created (kit %s, stream %s). Kit digest list attached as %s (sha256 %s)." % (
         lane_id, m["kit_version"], m["stream_key"], name, sha)
 
-    def on_issue():
-        return [a for a in ports.ticket.list_attachments(m["ticket"]) if a.get("name") == name and a.get("sha256") == sha]
+    def on_issue(att_id=None):
+        """The digest file on the issue: by the persisted id when there is one (the id is the binding fact), else by
+        name and sha256 (adoption of a file an earlier run linked)."""
+        rows = ports.ticket.list_attachments(m["ticket"])
+        if att_id:
+            return [a for a in rows if a.get("id") == att_id]
+        return [a for a in rows if a.get("name") == name and a.get("sha256") == sha]
 
     cid = ports.ticket.find_comment(m["ticket"], op)
     if not cid:
@@ -196,17 +201,17 @@ def _attach_digests(ports, store, lane_dir, lane_id, m, op):
                 att = ports.ticket.upload(m["ticket"], name, digest_text.encode())
                 ids = [att]
             store.set_effect(lane_dir, op, "attach", "uncertain", ref=str(att), ts=ports.now())
-        elif not any(a.get("id") == att for a in on_issue()):
+        elif not on_issue(att):
             ids = [att]
         cid = ports.ticket.comment(m["ticket"], body, op, attachment_ids=ids)
-    have = on_issue()
     persisted = next(e["ref"] for e in store.read_op(lane_dir, op)["effects"] if e["name"] == "attach")
+    have = on_issue(persisted)
     if not have and persisted:  # the comment exists but did not link the file: one bounded re-link, keyed
         link = op + "-link"
         if not ports.ticket.find_comment(m["ticket"], link):
             ports.ticket.comment(m["ticket"], "Kit digest list for lane %s (re-link of %s)." % (lane_id, name), link,
                                  attachment_ids=[persisted])
-        have = on_issue()
+        have = on_issue(persisted)
     if not have:
         raise RuntimeError("the creation comment exists but the digest list is not on the issue")
     store.set_effect(lane_dir, op, "attach", "done", ref=str(have[0].get("id")), ts=ports.now())
@@ -443,6 +448,8 @@ def bind(ports, store, *, lane, agent):
                                      idem="bound-g%d" % gen, source="inferred: ah lane bind by main",
                                      data={"agent": agent}, ts=ports.now())
                 store.set_effect(lane_dir, op, "journal", "done", ts=ports.now())
+        except lanes.LaneRefusal as error:  # a definite refusal (e.g. the stream has another holder): not a retry
+            return refuse(str(error), "release the reservation (`ah lane start --release`) or wait for the adopt slice")
         except Exception as error:  # noqa: BLE001
             return Result(PARTIAL, ["bind incomplete (%s); op %s; rerun to finish" % (type(error).__name__, op)])
         return Result(OK, ["agent %s bound at generation %d" % (agent, gen)], {"generation": gen})
