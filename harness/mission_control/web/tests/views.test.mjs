@@ -208,8 +208,10 @@ test('requirement text is isolated for bidirectional scripts (dir=auto)', () => 
 
 test('live regions: activity is announced only as a batch every 4.5 s, and only the named regions exist', () => {
   const regions = [...html.matchAll(/id="([a-z-]+)"[^>]*aria-live="polite"/g)].map(m => m[1]).sort();
-  assert.deepEqual(regions, ['activity-announcer', 'chat-announcer', 'connection-announcer', 'needs-announcer', 'requirement-announcer']);
+  assert.deepEqual(regions, ['activity-announcer', 'chat-announcer', 'connection-announcer', 'needs-announcer', 'org-announcer', 'requirement-announcer']);
   assert.match(readFileSync(`${here}js/activity.js`, 'utf8'), /\}, 4500\)/);
+  // the org graph announces at most one cue every 4 s (goodqa#15950)
+  assert.match(readFileSync(`${here}js/scene.js`, 'utf8'), /Date\.now\(\) - lastAnnounce > 4000/);
   for (const f of ['ledger-views.js', 'adapt.js']) assert.ok(!/announcer/.test(readFileSync(`${here}js/${f}`, 'utf8')), `${f} must not announce`);
   assert.match(readFileSync(`${here}js/views.js`, 'utf8'), /requirement-announcer/);
 });

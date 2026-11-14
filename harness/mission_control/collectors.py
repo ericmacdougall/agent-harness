@@ -244,6 +244,8 @@ class WalTailer(Collector):
         self.last_scan = 0.0
         self.last_items: dict[tuple, dict] = {}
         self.max_events_per_tick = 60
+        # review R-2: fn(runtime, session, agent) -> may this agent's WAL note text be shown? None shows main only.
+        self.note_visible = None
 
     def _discover(self, now: float, initial: bool) -> None:
         for root, runtime in self.roots:
@@ -400,10 +402,22 @@ class WalTailer(Collector):
     def _actor(self, tail: _Tail) -> dict:
         return {"runtime": tail.runtime, "session": tail.session, "agent": tail.agent}
 
+    def _shown(self, tail: _Tail, note: str) -> bool:
+        """Fail closed (review R-2): restricted text never reaches the feed, and a Claude sub-agent's note shows only
+        when the last owner read marked that agent not restricted."""
+        if RESTRICTED_TEXT.search(note):
+            return False
+        if tail.runtime != "claude" or tail.agent == "main":
+            return True
+        return bool(self.note_visible and self.note_visible(tail.runtime, tail.session, tail.agent))
+
     def _emit(self, tail: _Tail, entry: dict, kind: str, offset=None) -> int:
         if kind in ("ask", "ask_resolved") and self.on_ask:
             self.on_ask()
         note = _note(entry)
+        deploy = bool(DEPLOY_RE.search(note)) or kind in ("deploy", "deployed")   # decided on the real text
+        if note and not self._shown(tail, note):
+            note = "note hidden (restricted or not in the current owner read)"
         actor = self._actor(tail)
         subject = {"ticket": _ticket_in(note)}
         meaningful = _meaningful(entry)
@@ -413,7 +427,7 @@ class WalTailer(Collector):
                                  eid="wal:" + hashlib.sha256(location.encode()).hexdigest(),
                                  actor=actor, subject=subject, quiet=not meaningful,
                                  severity="warn" if kind in ("blocker", "risk", "incident") else "info"))
-        if DEPLOY_RE.search(note) or kind in ("deploy", "deployed"):
+        if deploy:
             self.hub.publish(ev.make("deploy", f"{tail.runtime}-wal", note or kind, actor=actor, subject=subject,
                                      eid="deploy:" + hashlib.sha256(location.encode()).hexdigest()))
             return 2
@@ -456,7 +470,18 @@ def _meaningful(entry: dict) -> bool:
     kind = str(entry.get("event", ""))
     if kind in TOOL_EVENTS or kind in LIFECYCLE_EVENTS:
         return False
+    if kind in REVIEW_EVENTS and _verdict(entry):
+        return True  # a review record carries its verdict, not a note (goodqa#15950: reviewer approved/rejected)
     return bool(isinstance(entry.get("note"), str) and entry["note"].strip())
+
+
+REVIEW_EVENTS = ("review", "review_result")
+VERDICT_RE = re.compile(r"^[A-Z_]{2,24}$")
+
+
+def _verdict(entry: dict) -> str:
+    value = str(entry.get("verdict") or "").strip().upper()
+    return value if VERDICT_RE.match(value) else ""
 
 
 def _lifecycle_summary(entry: dict, kind: str, note: str) -> str:
@@ -474,6 +499,9 @@ def _lifecycle_summary(entry: dict, kind: str, note: str) -> str:
 
 
 def _note(entry: dict) -> str:
+    if str(entry.get("event", "")) in REVIEW_EVENTS and _verdict(entry):
+        target = " ".join(str(entry.get(k) or "") for k in ("ticket", "range", "commit") if entry.get(k))
+        return f"{_verdict(entry)} {target}".strip()
     for field in ("note", "summary", "reason", "task", "source"):
         value = entry.get(field)
         if isinstance(value, str) and value.strip():
@@ -498,6 +526,7 @@ class Initiatives(Collector):
         super().__init__(hub, health)
         self.reader, self.path = reader, Path(path) if path else None
         self.sig = None
+        self.derive = None   # goodqa#15950: the server derives the shown rows from live owners and GoodQA
         self.items: list[dict] = []
         self.stale = False
         self.error = ""
@@ -538,11 +567,15 @@ class Initiatives(Collector):
         raise ValueError(message)
 
     def publish(self, mtime) -> None:
+        if mtime is not None:
+            self.mtime = mtime
         self.hub.snapshot("initiatives", self.snapshot(mtime))
 
     def snapshot(self, mtime=None) -> dict:
-        return {"items": self.items, "stale": self.stale, "error": self.error,
-                "mtime": mtime}
+        # The file's edit time rides in every snapshot, /api/state too, so the page can say how old the file is.
+        snap = {"items": self.items, "stale": self.stale, "error": self.error,
+                "mtime": mtime if mtime is not None else getattr(self, "mtime", None)}
+        return self.derive(snap) if self.derive else snap
 
 
 def _num(value):
@@ -694,6 +727,12 @@ class Owners(Collector):
         self.supervised = None
         self.native_projects = {}
         self.native_observation = {}
+        self.pin_fn = None   # the server's pinned display session (goodqa#15961)
+        # review A-2b: agents the last full `ah owners` read showed as NOT restricted, for (session, ids); taken before
+        # the 6 h and 60-row cuts. The Status view shows notes only from main and these agents.
+        self.unrestricted: tuple = ("", frozenset())
+        self.restricted: tuple = ("", frozenset())   # the same read's restricted ids (asks they registered are hidden)
+        self.restricted_tickets: frozenset = frozenset()
 
     def publish(self):
         managed = []
@@ -745,6 +784,7 @@ class Owners(Collector):
         # freshness of the ah snapshot is tracked apart from runtime freshness: a merged Codex row's own
         # source_stale must never make a cached ah role look current (code inspection F1)
         ah_stale = any(r.get('source_stale') for r in self.claude_rows)
+        rows = [scrub_restricted_row(r) for r in rows]
         for r in rows:
             if r.get('source') != 'ah':  # rows from ah carry the cap's role; Codex rows get the same three roles
                 r['role'] = codex_role(r)
@@ -763,14 +803,48 @@ class Owners(Collector):
             raise
 
     def _tick(self, now: float):
-        code, out = self.runner.run("ah-owners", timeout=30)
+        if self.pin_fn is None:
+            # Unwired (unit tests with a fake runner): the real Runner refuses a session-less `ah-owners`, so the
+            # server can never fall back to "newest session"; App always wires pin_fn.
+            code, out = self.runner.run("ah-owners", timeout=30)
+            if code != 0:
+                raise RuntimeError(f"ah owners exited {code}")
+            data = json.loads(out)
+            if not isinstance(data, dict) or not isinstance(data.get('owners'), list):
+                raise ValueError('invalid Claude owner snapshot')
+            self.session = str(data.get("session") or "")
+            return self._rows(data, now)
+        pinned = self.pin_fn()
+        if not pinned:
+            # goodqa#15961: never guess a session; an explicit "unpinned" state, never a silent 0 from another one
+            self.session, self.claude_rows = "", []
+            self.unrestricted = ("", frozenset())
+            self.next_at = min(self.next_at, now + 5)   # the ledger read pins it seconds after start
+            self.publish()
+            raise RuntimeError("unpinned: no Claude session is pinned yet (waiting for the mission ledger)")
+        code, out = self.runner.run("ah-owners", pinned, timeout=30)
         if code != 0:
             raise RuntimeError(f"ah owners exited {code}")
         data = json.loads(out)
         if not isinstance(data, dict) or not isinstance(data.get('owners'), list):
             raise ValueError('invalid Claude owner snapshot')
-        self.session = str(data.get("session") or "")
+        if str(data.get("session") or "") != pinned:   # a guard only: ah echoes --session back
+            raise ValueError("ah owners answered for a different session than the pin")
+        self.session = pinned
+        return self._rows(data, now)
+
+    def _rows(self, data: dict, now: float):
         rows = []
+        self.unrestricted = (str(data.get("session") or ""), frozenset(
+            str(r.get("agent_id")) for r in data.get("owners") or []
+            if isinstance(r, dict) and r.get("restricted") is False and isinstance(r.get("agent_id"), str)))
+        self.restricted = (str(data.get("session") or ""), frozenset(
+            str(r.get("agent_id")) for r in data.get("owners") or []
+            if isinstance(r, dict) and r.get("restricted") is True and isinstance(r.get("agent_id"), str)))
+        # tickets restricted work is on: never fetched or shown, even when the initiatives file also names them
+        self.restricted_tickets = frozenset(
+            str(r.get("ticket")).lower() for r in data.get("owners") or []
+            if isinstance(r, dict) and r.get("restricted") is True and r.get("ticket"))
         for row in data.get("owners") or []:
             if not isinstance(row, dict):
                 continue
@@ -804,6 +878,11 @@ class Owners(Collector):
                     "parent": parent if isinstance(parent := row.get("parent"), str)
                     and re.fullmatch(r"[A-Za-z0-9_-]{1,40}", parent) else None,
                     "source": "ah", "session": ev.short(self.session, 64)}
+            # review A-2: `ah owners` blanks a restricted row's task but keeps its ticket; the flag must survive here
+            # and the ticket (whose GoodQA title would be fetched and shown), stream and last reply are dropped too
+            item["restricted"] = row.get("restricted") is True
+            if item["restricted"]:
+                item.update(task="", stream="", last_reply="", ticket="", last_item=None)   # R-1: last WAL note too
             item["role"] = owner_role(item)
             rows.append(item)
             previous = self.states.get(agent)
@@ -915,6 +994,21 @@ class Owners(Collector):
 
 
 ASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+RESTRICTED_TEXT = re.compile(r"\b(solve|interview)", re.I)  # as ah.py RESTRICTED: fail closed, liveness only
+HIDDEN_NOTE = "note hidden (restricted or not in the current owner read)"
+
+
+def scrub_restricted_row(row: dict) -> dict:
+    """The owners panel's one exit check (review P-1): any row, Claude, Codex or supervised, whose text fields name
+    restricted work loses them, and a row already marked restricted keeps none. Liveness fields stay."""
+    item = row.get("last_item") if isinstance(row.get("last_item"), dict) else {}
+    text = " ".join(str(row.get(k) or "") for k in ("task", "stream", "last_reply", "name")) + " " + \
+        " ".join(str(item.get(k) or "") for k in ("note", "progress_note"))
+    if row.get("restricted") is True or RESTRICTED_TEXT.search(text):
+        row = dict(row, restricted=True, task="", stream="", last_reply="", ticket="", last_item=None)
+        if RESTRICTED_TEXT.search(str(row.get("name") or "")):
+            row["name"] = "restricted"
+    return row
 
 
 class Asks(Collector):
@@ -946,7 +1040,12 @@ class Asks(Collector):
 
     def tick(self, now: float):
         session = self.session_fn() or ""
-        if not session:
+        if self.session and session != self.session:
+            # the pin moved: never keep showing the previous session's asks while the new read runs or fails (A-1)
+            with self.lock:
+                self.publish({"items": [], "stale": [], "flagged": [], "cleared": [], "resolved": [], "swept_at": ""},
+                             session)
+        if not session:   # unpinned: nothing is shown (review N-1: the clear above runs first)
             self.next_at = now + 10  # the owners collector learns main's session shortly after start
             self.health.off(self.name, "no main session known yet")
             return "off"
@@ -978,6 +1077,9 @@ class Asks(Collector):
             if not isinstance(row, dict) or not ASK_ID_RE.match(str(row.get("id", ""))):
                 continue
             note = ev.short(str(row.get("note", "")), 400)
+            if RESTRICTED_TEXT.search(note + " " + str(row.get("resolution", ""))) or not self.owner_text_ok(
+                    str(row.get("owner", "")), self.restricted_ids(), self.unrestricted_ids()):
+                note, row = HIDDEN_NOTE, dict(row, resolution="")
             resolved.append({"id": str(row["id"]), "at": str(row.get("at", ""))[:40], "text": note,
                              "ticket": _ticket_in(note), "owner": ev.short(str(row.get("owner", "")), 60),
                              "resolved_at": str(row.get("resolved_at", ""))[:40],
@@ -991,14 +1093,27 @@ class Asks(Collector):
                                       owners=self.owners_fn() if self.owners_fn else (), ticket_status=self.ticket_status,
                                       activity=self.activity(), now=now)
             status, view["cleared"], view["swept_at"] = swept["status"], swept["cleared"], ev.iso(swept["swept_at"])
+            # P-2 recheck (af72d863): cleared rows (and the Archive built from them) follow the same owner rule; the
+            # owner comes from the ledger rows by id, and an ask whose owner is unknown shows no text (fail closed)
+            owner_of = {str(r.get("id")): str(r.get("owner", "")) for r in
+                        raw + blocked + [x for x in (data.get("resolved") or []) if isinstance(x, dict)]}
+            restricted_now, unrestricted_now = self.restricted_ids(), self.unrestricted_ids()
+            view["cleared"] = [
+                row if self.owner_text_ok(owner_of.get(str(row.get("id")), ""), restricted_now, unrestricted_now)
+                and not RESTRICTED_TEXT.search(" ".join(str(row.get(k) or "") for k in ("text", "reason", "evidence")))
+                else dict(row, text=HIDDEN_NOTE, reason="hidden", evidence="")
+                for row in view["cleared"]]
         import needs_sweep as _sweep  # noqa: PLC0415
         pending = [r for r in blocked if _sweep.unchecked(r)]
         blocked = [r for r in blocked if not _sweep.unchecked(r)]
+        restricted = self.restricted_ids()
+        unrestricted = self.unrestricted_ids()
+        unrestricted = frozenset() if unrestricted is None else unrestricted   # unknown: only main's asks show text
         for row in raw + pending:
             verdict = status.get(str(row["id"]), {"state": "active"})
             if verdict["state"] == "cleared":
                 continue  # settled: listed under cleared-recently with its reason, never as an open ask
-            item = self.item(session, row)
+            item = self.item(session, row, restricted, unrestricted)
             if row in pending:
                 # Listed so the user sees it, but nothing verified its source: never a signed Approve or Deny.
                 item.update(unchecked="Its source could not be checked this sweep: " + ev.short(str(row.get("problem", "")), 120),
@@ -1010,7 +1125,7 @@ class Asks(Collector):
                 view["items"].append(item)
         for row in blocked:
             verdict = status.get(str(row["id"]))
-            item = self.item(session, row)
+            item = self.item(session, row, restricted, unrestricted)
             why = verdict["reason"] if verdict else "no traceable source: " + ev.short(str(row.get("problem", "")), 160)
             view["flagged"].append(dict(item, digest="", approvable=False, flagged=why,
                                         blocked="This ask does not trace to a real source, so it is not shown as a valid ask. Main has to restate it with its source."))
@@ -1045,8 +1160,28 @@ class Asks(Collector):
                 out[ident] = max(out.get(ident, 0), stamp)
         return out
 
+    def restricted_ids(self) -> frozenset:
+        fn = getattr(self, "restricted_fn", None)
+        return frozenset(fn() or ()) if fn else frozenset()
+
+    def unrestricted_ids(self):
+        """Owners the pinned session's last full owner read marked NOT restricted, or None when unknown."""
+        fn = getattr(self, "unrestricted_fn", None)
+        return fn() if fn else None
+
     @staticmethod
-    def item(session: str, raw: dict) -> dict:
+    def owner_id(owner: str) -> str:
+        """Provenance names an ask's owner by its WAL stem (`agent-<id>`); the owner reads use the bare id."""
+        return owner[len("agent-"):] if owner.startswith("agent-") else owner
+
+    def owner_text_ok(self, owner: str, restricted: frozenset, unrestricted) -> bool:
+        if owner == "main":
+            return True
+        bare = self.owner_id(owner)
+        return bare not in restricted and unrestricted is not None and bare in unrestricted
+
+    @staticmethod
+    def item(session: str, raw: dict, restricted: frozenset, unrestricted: frozenset) -> dict:
         """One open ask as the page shows it. `text` and `why` are the whole ask (redacted, never clipped) and
         `digest` covers exactly them, so what the user reads is what a decision signs. An ask that cannot be shown
         whole, that an owner registered, or that needs the terminal carries `blocked` and is not approvable."""
@@ -1054,7 +1189,13 @@ class Asks(Collector):
         ask_id, owner = str(raw["id"]), ev.short(str(raw.get("owner", "")), 60)
         note, reason = str(raw.get("note", "")), str(raw.get("reason", ""))
         text, why, digest, blocked = ev.short(note, mc_chat.MAX_TEXT), ev.short(reason, mc_chat.REASON_MAX), "", ""
-        if owner != "main":
+        bare = owner[len("agent-"):] if owner.startswith("agent-") else owner
+        known_ok = owner == "main" or bare in (unrestricted or ())
+        if bare in restricted or not known_ok or RESTRICTED_TEXT.search(note + " " + reason):
+            # review P-2: restricted work is never shown here, whoever registered it; answer it in the terminal
+            text, why = "Restricted ask: open it in the terminal session that registered it.", ""
+            blocked = "Restricted work is not shown in Mission Control. Answer it in the terminal."
+        elif owner != "main":
             blocked = "Registered by an owner, not by main. Answer with a reply; main decides what to do with it."
         else:
             try:
@@ -1118,13 +1259,17 @@ class Ledger(Collector):
     STATUS_LISTS = ("verified", "live", "pending", "failed", "claimed", "blockers", "commits", "asks_open",
                     "decisions", "assumptions", "live_legacy")
 
-    def __init__(self, hub, health, runner, session_fn, root=None, actions=None):
+    def __init__(self, hub, health, runner, session_fn, root=None, actions=None, visible_fn=None):
         super().__init__(hub, health)
         self.runner, self.session_fn, self.root = runner, session_fn, root
+        # review A-2b: agent ids whose notes may be shown (known NOT restricted), or None when unknown. Fail closed:
+        # an agent that is restricted, filtered out of the owner read, or not read yet shows no note text.
+        self.visible_fn = visible_fn
         self.actions = actions  # req_actions.ReqActions: the user's archive and restore clicks
         self.raw_requirements: list[dict] = []
         self.raw_total, self.raw_truncated = 0, False
         self.parts = {name: {"stale": False, "error": "", "at": ""} for name in ("goals", "requirements", "status")}
+        self.mission: dict = {}
         self.parts["goals"]["items"] = []
         self.parts["requirements"].update(items=[], total=0, truncated=False, summary=archive.summary([]))
         self.parts["status"].update(counts={}, since_s=0, entries=0, owners={})
@@ -1132,6 +1277,18 @@ class Ledger(Collector):
             self.parts["status"][key] = []
         self.sig = None
         self.published_at = ""
+        self.read_session = ""   # the session the requirements and status parts were read for
+
+    def _reset_session_parts(self) -> None:
+        """A new pinned session never inherits the previous session's requirements or status, even when its own
+        first read fails (review A-1): an empty, unread part is shown instead."""
+        self.raw_requirements, self.raw_total, self.raw_truncated = [], 0, False
+        self.parts["requirements"] = {"stale": False, "error": "", "at": "", "items": [], "total": 0,
+                                      "truncated": False, "summary": archive.summary([])}
+        status = {"stale": False, "error": "", "at": "", "counts": {}, "since_s": 0, "entries": 0, "owners": {}}
+        for key in self.STATUS_LISTS:
+            status[key] = []
+        self.parts["status"] = status
 
     # -- one source
     def _read(self, part: str, label: str, kind: str, args: tuple, parse, now: float) -> str:
@@ -1160,7 +1317,12 @@ class Ledger(Collector):
 
     def tick(self, now: float):
         errors = [self._read("goals", "ah goals", "ah-goals", (), self._goals, now)]
+        if errors[0]:
+            self.mission = {"state": "error", "mission_session": ""}   # a failed read never keeps a writable pin (D1)
         session = self.session_fn() or ""
+        if session != self.read_session:
+            self._reset_session_parts()
+            self.read_session = session
         if session:
             errors.append(self._read("requirements", "ah requirements", "ah-requirements", (session,), self._requirements, now))
             errors.append(self._read("status", "ah status", "ah-status", (session,), self._status, now))
@@ -1188,6 +1350,9 @@ class Ledger(Collector):
         return value if isinstance(value, int) and not isinstance(value, bool) else default
 
     def _goals(self, data: dict, now: float) -> dict:
+        # goodqa#15961: the session pin reads the ledger's own session here, never the ledger file itself
+        self.mission = {"state": str(data.get("state") or "")[:20],
+                        "mission_session": str(data.get("mission_session") or "")[:64]}
         items = []
         for raw in (data.get("goals") if isinstance(data.get("goals"), list) else [])[:self.MAX_GOALS]:
             if not isinstance(raw, dict) or not raw.get("id"):
@@ -1266,9 +1431,17 @@ class Ledger(Collector):
                 "summary": archive.summary(classified)}
 
     def _status(self, data: dict, now: float) -> dict:
+        visible = self.visible_fn() if self.visible_fn else None
+        visible = visible if visible is not None else frozenset()
+
         def entry(raw):
-            return {"id": ev.short(raw.get("id"), 40), "agent": ev.short(raw.get("agent"), 40), "at": ev.short(raw.get("at"), 40),
-                    "event": ev.short(raw.get("event"), 20), "note": ev.short(raw.get("note"), 400),
+            agent, note = ev.short(raw.get("agent"), 40), ev.short(raw.get("note"), 400)
+            if RESTRICTED_TEXT.search(note):
+                note = "restricted"   # review A-2: restricted work never reaches the Status view
+            elif agent != "main" and agent not in visible:
+                note = "note hidden: this agent is not in the current owner read (restricted or older than 6 h)"
+            return {"id": ev.short(raw.get("id"), 40), "agent": agent, "at": ev.short(raw.get("at"), 40),
+                    "event": ev.short(raw.get("event"), 20), "note": note,
                     "check": ev.short(raw.get("check"), 80), "verdict": ev.short(raw.get("verdict"), 12)}
         out: dict = {"counts": {}}
         for key in self.STATUS_LISTS:
@@ -1301,7 +1474,7 @@ class Ledger(Collector):
     # -- publication
     def snapshot(self) -> dict:
         return {"goals": self.parts["goals"], "requirements": self.parts["requirements"], "status": self.parts["status"],
-                "generated": self.published_at}
+                "session": self.read_session, "generated": self.published_at}
 
     def publish(self) -> None:
         """Push the snapshot only when its content changed; the read time alone is not a change."""
@@ -1378,6 +1551,15 @@ class GitHub(Collector):
             tag = str(release.get("tag_name") or "")[:80]
             return ev.make("release", "github", f"{repo}: release {tag} {payload.get('action', '')}", eid=eid,
                            ts=ts, subject={"repo": repo, "ref": tag}, historic=historic)
+        if kind == "PullRequestEvent" and payload.get("action") == "closed":
+            pull = payload.get("pull_request") if isinstance(payload.get("pull_request"), dict) else {}
+            if not pull.get("merged"):
+                return None
+            number = pull.get("number") if isinstance(pull.get("number"), int) else payload.get("number")
+            base = str((pull.get("base") or {}).get("ref") or "")[:120] if isinstance(pull.get("base"), dict) else ""
+            head = str((pull.get("head") or {}).get("ref") or "")[:120] if isinstance(pull.get("head"), dict) else ""
+            return ev.make("push", "github", f"{repo}: merged PR #{number} {head} into {base}", eid=eid, ts=ts,
+                           subject={"repo": repo, "branch": base, "ref": f"merge:{number}"}, historic=historic)
         if kind == "CreateEvent" and payload.get("ref_type") == "branch":
             branch = str(payload.get("ref") or "")[:120]
             return ev.make("push", "github", f"{repo}: new branch {branch}", eid=eid, ts=ts,
@@ -1432,7 +1614,10 @@ class Tickets(Collector):
                 continue
             seen.add(cid)
             ts = ev.parse_ts(comment.get("createdAt"), now)
-            self.hub.publish(ev.make("ticket", "goodqa", f"{ref}: {comment.get('body') or ''}", eid=f"goodqa:{cid}",
+            body = str(comment.get('body') or '')
+            if RESTRICTED_TEXT.search(body):
+                body = HIDDEN_NOTE   # review P recheck: a tracked ticket's comment can carry restricted work
+            self.hub.publish(ev.make("ticket", "goodqa", f"{ref}: {body}", eid=f"goodqa:{cid}",
                                      ts=ts, subject={"ticket": ref}, historic=first))
         self.seen[ref] = seen
         return f"{ref} ({len(tickets)} tracked)"
@@ -1578,6 +1763,8 @@ class Remote(Collector):
             parts = path.rstrip("/").split("/")
             session, agent = (parts[-2] if len(parts) > 1 else ""), re.sub(r"^agent-|\.jsonl$", "", parts[-1])
             note = _note(entry) or str(entry.get("event") or "")
+            if RESTRICTED_TEXT.search(note):
+                note = HIDDEN_NOTE   # review P-3
             self.hub.publish(ev.make("wal", "t2-dev-wal", f"{entry.get('event', '')}: {note}",
                                      eid=f"t2wal:{session}:{agent}:{abs(hash(newest)) % 10**12}",
                                      actor={"runtime": "claude", "session": session, "agent": agent},

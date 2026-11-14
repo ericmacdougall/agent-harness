@@ -1,5 +1,6 @@
 // The page's single state store. Panels read state and subscribe; transport (live.js) writes through these setters.
 import * as adapt from './adapt.js';
+import { normalize as normalizeOrg } from './org.js';
 
 export const KINDS = Object.freeze({
   wal: { label: 'Work log', icon: '≋', color: '#eaff9e' },
@@ -20,7 +21,7 @@ let state = {
   initiatives: [], initiativesStale: false, initiativesError: '', owners: [], ownerRows: [], events: [], messages: [], sources: [],
   host: '', chat: null, pending: [], sessions: [], mainSession: '', asks: [], asksResolved: [], asksSession: '',
   asksStale: [], asksFlagged: [], asksCleared: [], asksSweptAt: '', asksArchive: [], asksArchiveTotal: 0,
-  ledger: adapt.ledger(null), lastData: 0,
+  ledger: adapt.ledger(null), lastData: 0, orggraph: null,
   decisions: {},  // ask id -> this page's own Approve/Deny click while it is in flight or after it was refused
   connection: 'connecting', now: Date.now(), filters: Object.keys(KINDS),
   selection: null, highlight: null, tab: 'overview', responder: 'claude', session: '',
@@ -35,7 +36,7 @@ let transport;
 export const getState = () => state;
 export function subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); }
 // A server message (a snapshot or an event) is what "last update" counts; ticks and local clicks are not.
-const DATA_REASONS = new Set(['initiatives', 'owners', 'health', 'seed', 'event', 'chat', 'asks', 'ledger', 'availability']);
+const DATA_REASONS = new Set(['initiatives', 'owners', 'health', 'seed', 'event', 'chat', 'asks', 'ledger', 'availability', 'orggraph']);
 export function update(patch, reason = 'update') {
   state = DATA_REASONS.has(reason) ? { ...state, ...patch, lastData: Date.now() } : { ...state, ...patch };
   listeners.forEach(fn => { try { fn(state, reason); } catch (error) { reportError(error, reason); } });
@@ -79,8 +80,8 @@ media.addEventListener('change', event => update({ reducedMotion: event.matches,
 
 // ---- server snapshots
 export function setInitiatives(snapshot) {
-  const { items, stale, error } = adapt.initiatives(snapshot);
-  update({ initiatives: items, initiativesStale: stale, initiativesError: error, owners: adapt.owners(state.ownerRows, items) }, 'initiatives');
+  const { items, stale, error, mtime, derived, untracked, hiddenFileRows } = adapt.initiatives(snapshot);
+  update({ initiatives: items, initiativesStale: stale, initiativesError: error, initiativesMtime: mtime, initiativesDerived: derived, initiativesUntracked: untracked, initiativesHidden: hiddenFileRows, owners: adapt.owners(state.ownerRows, items) }, 'initiatives');
   update({}, 'owners');
 }
 export function setOwners(rows) { update({ ownerRows: Array.isArray(rows) ? rows : [], owners: adapt.owners(rows, state.initiatives) }, 'owners'); }
@@ -105,6 +106,11 @@ export function ingestEvent(raw) {
     : { ...o, last_item: { at: event.ts, active: event.ts, event: event.kind, note: event.summary } });
   const counted = state.feedPaused && !event.historic && (!event.quiet || state.showQuiet);
   update({ events, owners, lastEvent: event, buffered: counted ? state.buffered + 1 : state.buffered }, 'event');
+}
+// The org graph (goodqa#15950): a snapshot with the changes since the previous one. A malformed one is ignored.
+export function setOrgGraph(snapshot) {
+  const graph = normalizeOrg(snapshot);
+  if (graph) update({ orggraph: graph }, 'orggraph');
 }
 export function setLedger(snapshot) { update({ ledger: adapt.ledger(snapshot) }, 'ledger'); }
 export function setConnection(connection) { if (state.connection !== connection) update({ connection }, 'connection'); }

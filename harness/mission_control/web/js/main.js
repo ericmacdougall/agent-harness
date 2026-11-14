@@ -10,6 +10,7 @@ import { mountNeeds } from './needs.js';
 import { mountHealth } from './health.js';
 import { mountViews } from './views.js';
 import * as live from './live.js';
+import { describe as describeOrg, TYPE_COLORS as ORG_TYPES } from './org.js';
 
 mountInitiatives(); mountActivity(); mountOwners(); mountChat(); mountHealth(); mountNeeds();
 const { go } = mountViews();  // the 3D topology loads only when its tab is first opened
@@ -165,6 +166,18 @@ function renderInspector(state) {
     title.textContent = id;
     content.append(title, el('p', 'detail-intro', 'Recent pushes, releases and deploys for this repository.'));
     state.events.filter(event => event.subject.repo === id).slice(0, 8).forEach(event => content.append(button('lab-button', `${KINDS[event.kind].icon} ${event.summary}`, () => select('event', event.id))));
+  } else if (kind === 'org') {
+    // A node of the live org graph (goodqa#15950): the fields the snapshot carries, "unknown" where none exists.
+    const graph = state.orggraph;
+    const node = graph?.nodes.find(entry => entry.id === id); if (!node) return select(null);
+    const byId = new Map(graph.nodes.map(entry => [entry.id, entry]));
+    document.getElementById('inspector-type').textContent = `${(ORG_TYPES[node.kind]?.label || node.kind).toUpperCase()} DETAIL`;
+    title.textContent = node.kind === 'work' ? `${node.ref} · ${node.title}` : node.kind === 'coordinator' ? 'Main coordinator' : node.kind === 'user' ? 'You' : `${node.label} · ${node.type}`;
+    content.append(title);
+    for (const [label, value] of describeOrg(node, byId)) fields.append(field(label, value));
+    if (!['user', 'coordinator', 'work'].includes(node.kind)) fields.append(field('Agent id', node.id));
+    content.append(fields);
+    if (node.kind === 'work' && node.ref) content.append(el('p', 'detail-note', `GoodQA ${node.ref}`));
   } else if (kind === 'hub') {
     title.textContent = 'Main coordinator';
     content.append(title, el('p', 'detail-intro', 'Every initiative and owner reports into the coordinating session.'));

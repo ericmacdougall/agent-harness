@@ -1,6 +1,8 @@
 // Transport to the local Mission Control server: GET /api/state, SSE /api/events, POST /api/chat, POST /api/approve.
 // Same-origin only; the session cookie is HttpOnly and the CSRF token lives in memory, never in storage.
-import { setInitiatives, setOwners, setSources, setHost, seedEvents, ingestEvent, setConnection, setChat, setCodex, setChatTransport, setApproveTransport, setAsks, setLedger, setRequirementTransport } from './store.js';
+import { setInitiatives, setOwners, setSources, setHost, seedEvents, ingestEvent, setConnection, setChat, setCodex, setChatTransport, setApproveTransport, setAsks, setLedger, setRequirementTransport, setOrgGraph } from './store.js';
+
+let shownSession = null;
 
 let csrf = '';
 let source = null;
@@ -25,6 +27,10 @@ async function loadState() {
   setChat(state.chat);
   setAsks(state.asks);
   setLedger(state.ledger);
+  setOrgGraph(state.orggraph);
+  // goodqa#15961: the session this page shows; every session-scoped write names it, and the server refuses a
+  // write when the pin has moved since (409 session_changed) instead of recording it against another session.
+  shownSession = typeof state.pin?.display === 'string' ? state.pin.display : null;
   return true;
 }
 
@@ -60,7 +66,20 @@ function connect() {
   source.addEventListener('chat', message => { const data = parse(message); if (data) setChat(data); });
   source.addEventListener('codex', message => { const data = parse(message); if (data) setCodex(data); });
   source.addEventListener('asks', message => { const data = parse(message); if (data) setAsks(data); });
-  source.addEventListener('ledger', message => { const data = parse(message); if (data) setLedger(data); });
+  source.addEventListener('ledger', message => {
+    const data = parse(message);
+    if (!data) return;
+    setLedger(data);
+    // goodqa#15961 review A-7: the ledger was read for another session than the one this page shows (the pin
+    // moved). Reload the whole state once, so the header, the lists and the session every write names agree.
+    if (shownSession && typeof data.session === 'string' && data.session && data.session !== shownSession) {
+      shownSession = null;   // writes are refused (409) until the reload names the new session
+      // review N-2: a failed reload is retried (one timer at a time), so writes do not stay refused until a reconnect
+      const reload = () => loadState().catch(() => { setConnection('offline'); clearTimeout(resyncTimer); resyncTimer = setTimeout(reload, 5000); });
+      reload();
+    }
+  });
+  source.addEventListener('orggraph', message => { const data = parse(message); if (data) setOrgGraph(data); });
 }
 
 function resync() {
@@ -103,9 +122,11 @@ const APPROVE_WHY = {
   'not-open': 'this ask is no longer open', 'stale-digest': 'the ask changed since you read it; read it again and decide',
   'key-conflict': 'this page reused a request id; decide again', 'asks-unavailable': 'the asks ledger could not be read',
   csrf: 'this page is out of date; reload it', 'bad-note': 'the note has characters that cannot be sent or is too long',
+  session_changed: 'Mission Control now follows another session; the page is reloading, try again', unpinned: 'Mission Control is not pinned to a main session yet',
+  pin_mismatch: 'the configured session differs from the mission ledger; writes are off until they agree',
 };
 async function postApproval(item) {
-  const body = JSON.stringify({ ask_id: item.ask_id, digest: item.digest, decision: item.decision, client_key: item.client_key, note: item.note || null });
+  const body = JSON.stringify({ ask_id: item.ask_id, digest: item.digest, decision: item.decision, client_key: item.client_key, note: item.note || null, session: shownSession });
   let response;
   try {
     response = await fetch('/api/approve', { method: 'POST', credentials: 'same-origin', cache: 'no-store',
@@ -137,9 +158,11 @@ const REQ_WHY = {
   'unknown-requirement': 'this requirement is no longer in the ledger read', 'stale-digest': 'the requirement changed since you read it; read it again',
   'already-archived': 'it is already archived', 'not-archived': 'it is not archived', 'bad-reason': 'a reason of 1 to 300 characters is required',
   'no-main': 'Mission Control does not know main yet', csrf: 'this page is out of date; reload it', 'key-conflict': 'this page reused a request id; try again',
+  session_changed: 'Mission Control now follows another session; the page is reloading, try again', unpinned: 'Mission Control is not pinned to a main session yet',
+  pin_mismatch: 'the configured session differs from the mission ledger; writes are off until they agree',
 };
 export async function sendRequirement(item) {
-  const body = JSON.stringify({ req_id: item.req_id, action: item.action, reason: item.reason, digest: item.digest, client_key: item.client_key });
+  const body = JSON.stringify({ req_id: item.req_id, action: item.action, reason: item.reason, digest: item.digest, client_key: item.client_key, session: shownSession });
   let response;
   try {
     response = await fetch('/api/requirements/archive', { method: 'POST', credentials: 'same-origin', cache: 'no-store',

@@ -55,6 +55,8 @@ sys.path.insert(1, str(HOOKS))
 import collectors as col  # noqa: E402
 import demo as demo_mode  # noqa: E402
 import events as ev  # noqa: E402
+import org_graph  # noqa: E402
+import session_pin  # noqa: E402
 import req_actions  # noqa: E402
 import mc_chat  # noqa: E402
 from codex_responder import CodexResponder  # noqa: E402
@@ -301,19 +303,35 @@ def codex_binary() -> str | None:
     return None
 
 
+def _same_ticket_in(ref, hidden) -> bool:
+    """`GoodQA goodqa#N`, `goodqa#N` and `#N` spellings name one ticket."""
+    import re as _re  # noqa: PLC0415
+    def norm(x):
+        m = _re.search(r"([a-z0-9-]*)#(\d+)", str(x or "").lower())
+        return (m.group(1) or "goodqa", m.group(2)) if m else None
+    key = norm(ref)
+    return key is not None and any(norm(h) == key for h in hidden)
+
+
 class App:
     def __init__(self, *, port: int, root: Path, initiatives: str | None, remote: bool, fabric_bin: str | None,
                  runner: Runner | None = None, wal_roots=None, start_threads: bool = True, codex: bool = True,
-                 demo: bool = False):
+                 demo: bool = False, projects_root: Path | None = None, escalation_root: Path | None = None,
+                 session: str | None = None, wals_root: Path | None = None):
         self.port, self.root = port, root
+        # goodqa#15961: the session pin. A flag beats MC_HOME/config.json "session"; both are validated on every use.
+        config = mc_chat.read_json(root / "config.json")
+        self.config_pin = session if session is not None else (config.get("session") if isinstance(config, dict) else None)
+        self.claude_wals = wals_root or Path.home() / ".claude" / "wals"
+        self.pin_last_good, self.pin_reason, self.pin_demo = "", None, demo
         self.demo = demo
         self.build = demo_mode.build_identity(HERE, HOOKS) if demo else None
         self.demo_delay_s = 0.0
         self.demo_drop_first = False
         self.demo_refuse_first = False
         if demo:
-            if runner is None or wal_roots is None:
-                raise demo_mode.DemoError("demo mode needs its DemoRunner and fixture WAL roots")
+            if runner is None or wal_roots is None or projects_root is None:
+                raise demo_mode.DemoError("demo mode needs its DemoRunner, fixture WAL roots and fixture transcripts")
             self.demo_delay_s = min(max(int(os.environ.get("MC_DEMO_CHAT_DELAY_MS") or 0), 0), 10_000) / 1000
             self.demo_drop_first = os.environ.get("MC_DEMO_DROP_FIRST") == "1"
             self.demo_refuse_first = os.environ.get("MC_DEMO_REFUSE_FIRST") == "1"
@@ -337,6 +355,7 @@ class App:
         self.tailer = col.WalTailer(self.hub, self.health, self.reader, wal_roots)
         self.initiatives = col.Initiatives(self.hub, self.health, self.reader, initiatives)
         self.owners = col.Owners(self.hub, self.health, self.runner, self.tailer)
+        self.owners.pin_fn = lambda: self.pin()["display"]
         self.supervised = None
         if not demo:
             owner_root = home / '.agent-harness' / 'codex-owners'
@@ -348,14 +367,32 @@ class App:
         self.remote = col.Remote(self.hub, self.health, self.runner, enabled=remote, fabric=bool(fabric_bin),
                                  drop_dir=root / "sources")
         self.drop = col.FileDrop(self.hub, self.health, self.reader, root / "sources")
-        self.asks = col.Asks(self.hub, self.health, self.runner, lambda: self.owners.session, root=root,
+        # goodqa#15961 review A-1: the asks and the ledger follow the pin itself, never the owners read's session,
+        # which lags a pin change by up to one owners tick
+        self.asks = col.Asks(self.hub, self.health, self.runner, lambda: self.pin()["display"], root=root,
                              owners_fn=lambda: self.owners.rows)
         self.tailer.on_ask = self.asks.mark_dirty
+        self.asks.restricted_fn = lambda: self.owners.restricted[1]   # review P-2
+        self.asks.unrestricted_fn = self._status_visible   # owner-registered asks show text only for these owners
+        self.tailer.note_visible = lambda runtime, session, agent: (
+            session == self.owners.unrestricted[0] and agent in self.owners.unrestricted[1])   # review R-2
         self.actions = req_actions.ReqActions(root, self.key)
-        self.ledger = col.Ledger(self.hub, self.health, self.runner, lambda: self.owners.session, root=root,
-                                 actions=self.actions)
+        self.ledger = col.Ledger(self.hub, self.health, self.runner, lambda: self.pin()["display"], root=root,
+                                 actions=self.actions,
+                                 visible_fn=self._status_visible)
+        # The Topology tab's org graph: live owners, their transcripts' model/effort fields and their tickets.
+        # Demo mode reads only its fixture transcripts and no escalation state (never the real ~/.claude).
+        self.org = org_graph.OrgGraph(
+            self.hub, self.health, self.runner, owners_fn=lambda: self.owners.rows, session_fn=lambda: self.owners.session,
+            transcripts=org_graph.Transcripts(projects_root or home / ".claude" / "projects"),
+            escalation_root=None if demo else (escalation_root or home / ".agent-harness" / "escalation"),
+            host="demo-host" if demo else ev.HOST, inbox_fn=self._open_asks)
+        # The Initiatives panel comes from live owners and GoodQA, not the hand-written file alone (goodqa#15950).
+        self.initiatives.derive = lambda snap: org_graph.derive_initiatives(snap, self.owners.rows, self.org.tickets,
+                                                                            time.time())
+        self.org.on_initiatives = lambda: self.initiatives.publish(None)
         self.collectors = [self.tailer, self.initiatives, self.drop, self.owners, self.github, self.tickets,
-                           self.remote]
+                           self.remote, self.org]
         self.codex = CodexResponder(self.hub, self.health, self.runner, codex_binary(), root,
                                     disabled="" if codex else "Codex chat is turned off for this instance")
         self.chat_sig = None
@@ -366,9 +403,41 @@ class App:
         if start_threads:
             self.start()
 
+    def pin(self) -> dict:
+        """The session Mission Control follows and the one it may write against (session_pin; goodqa#15961).
+        Cheap: two lstat calls and the Ledger's cached `ah goals` fields; no subprocess, no write."""
+        if self.pin_demo:
+            pin = {"display": demo_mode.DEMO_SESSION, "write": demo_mode.DEMO_SESSION, "write_error": "", "source": "demo",
+                   "reason": "demo fixture session", "warnings": []}
+        else:
+            pin = session_pin.resolve(config_pin=self.config_pin, ledger=getattr(self.ledger, "mission", None),
+                                      wals_root=self.claude_wals, last_good=self.pin_last_good)
+            if pin["source"] in ("config", "ledger"):
+                self.pin_last_good = pin["display"]   # memory only: a restart starts unpinned until the ledger reads
+        key = (pin["display"], pin["source"], tuple(pin["warnings"]))
+        if key != self.pin_reason:
+            self.pin_reason = key
+            detail = f"{pin['display'][:8] or 'none'}: {pin['reason']}" + (f"; {pin['warnings'][0]}" if pin["warnings"] else "")
+            (self.health.ok if pin["write"] and not pin["warnings"] else self.health.error)("session-pin", detail)
+        return pin
+
+    def _status_visible(self):
+        """Agents whose WAL notes the Status view may show: the pinned session's last owner read, NOT restricted
+        rows only (review A-2b). None when that read is missing or for another session: only main's notes show."""
+        session, ids = self.owners.unrestricted
+        return ids if session and session == self.pin()["display"] else None
+
+    def _open_asks(self) -> tuple:
+        """The user node's inbox: open asks (the "Needs you" count) and the stale ones listed below them;
+        None until the asks source has run once, so the page never shows a false 0 at startup."""
+        if getattr(self.asks, "ran_at", None) is None:
+            return None
+        return len(getattr(self.asks, "items", None) or []), len(getattr(self.asks, "stale", None) or [])
+
     def tracked_tickets(self):
         refs = [i.get("ticket") for i in self.initiatives.items if i.get("ticket")]
-        return refs + self.owners.tickets()
+        hidden = getattr(self.owners, "restricted_tickets", frozenset())
+        return [r for r in refs + self.owners.tickets() if not _same_ticket_in(r, hidden)]
 
     def start(self) -> None:
         loops = [(self.loop, "collectors"), (self.codex.loop, "codex"), (self.chat_loop, "chat"),
@@ -482,13 +551,14 @@ class App:
                                         "ts": reply.get("created"), "final": bool(reply.get("final"))}
         self.approval_watch = (min(w[0] for w in waiting), [w[1] for w in waiting]) if waiting else None
         return {"messages": messages, "replies": list(replies.values())[-60:],
-                "targets": mc_chat.targets(self.root), "main_session": self.owners.session,
+                "targets": mc_chat.targets(self.root), "main_session": self.pin()["display"],
                 "codex": {"available": self.codex.available[0], "reason": self.codex.available[1],
                           "busy": self.codex.busy}}
 
     def state(self) -> dict:
         return {"version": VERSION, "started": ev.iso(self.started), "host": "demo" if self.demo else ev.HOST,
-                "initiatives": self.initiatives.snapshot(), "owners": self.owners.rows,
+                "initiatives": self.initiatives.snapshot(), "owners": self.owners.rows, "orggraph": self.org.snapshot(),
+                "pin": {k: v for k, v in self.pin().items() if k in ("display", "source", "reason", "warnings")} | {"writable": bool(self.pin()["write"])},
                 "health": self.health.snapshot(), "events": self.hub.recent(limit=200),
                 "chat": self.chat_snapshot(), "asks": self.asks.snapshot(),
                 "ledger": self.ledger.snapshot(), "requirement_actions": len(self.actions.latest()),
@@ -534,9 +604,12 @@ class App:
         if not isinstance(body, dict):
             return 400, {"error": "bad-json"}
         req, action, digest = body.get("req_id"), body.get("action"), body.get("digest")
-        session = self.owners.session or ""
-        if not session:
-            return 409, {"error": "no-main", "message": "Mission Control does not know main's session yet"}
+        # goodqa#15961: only a pinned, writable session; the page names the session it showed (R6, D1, D2)
+        pin = self.pin()
+        refusal = session_pin.write_check(pin, body.get("session"))
+        if refusal:
+            return refusal
+        session = pin["write"]
         # A retry with the same key after a lost response is answered with the row it already made, whatever state
         # the requirement is in now (the row's own archive made the "already archived" check below true).
         prior = self.actions.by_key(body.get("client_key"))
@@ -553,6 +626,9 @@ class App:
             if isinstance(req, str) else None
         if item is None:
             return 409, {"error": "unknown-requirement", "message": "this requirement is not in the current ledger read"}
+        if self.ledger.read_session != session or item.get("session") not in ("", session):
+            # review A-1: the list on hand was read for another session (the pin moved since the last ledger read)
+            return 409, {"error": "session_changed", "message": "the requirement list is from another session; reload"}
         if not isinstance(digest, str) or not hmac.compare_digest(digest.encode("utf-8", "replace"), item["digest"].encode()):
             return 409, {"error": "stale-digest", "message": "the requirement changed since it was shown; read it again"}
         if action == "archive" and item["bucket"] == "archived":
@@ -586,9 +662,12 @@ class App:
         if note is not None and (not isinstance(note, str) or len(note) > mc_chat.APPROVAL_NOTE_MAX):
             return 400, {"error": "bad-note",
                          "message": f"the note must be text of at most {mc_chat.APPROVAL_NOTE_MAX} characters"}
-        session = self.owners.session or ""
-        if not session:
-            return 409, {"error": "no-main", "message": "Mission Control does not know main's session yet"}
+        # goodqa#15961: only a pinned, writable session; the page names the session it showed (R6, D1, D2)
+        pin = self.pin()
+        refusal = session_pin.write_check(pin, body.get("session"))
+        if refusal:
+            return refusal
+        session = pin["write"]
         if self.demo_delay_s:
             time.sleep(self.demo_delay_s)  # demo knob: the 'Sending' state stays visible for the whole delay
         with self.approve_lock:
@@ -1023,13 +1102,14 @@ def build_app(args) -> App:
         fixture = demo_mode.seed(root)
         app = App(port=args.port, root=root, initiatives=fixture["initiatives"], remote=False, fabric_bin=None,
                   runner=demo_mode.DemoRunner(), wal_roots=fixture["wal_roots"], start_threads=False, codex=False,
-                  demo=True)
+                  demo=True, projects_root=fixture["projects_root"])
         if args.demo_host:
             app.auth.allow_demo_host(args.demo_host)
         return app
     root = mc_chat.home()
     return App(port=args.port, root=root, initiatives=args.initiatives or default_initiatives(),
-               remote=not args.no_remote, fabric_bin=args.fabric_bin, start_threads=False, codex=not args.no_codex)
+               remote=not args.no_remote, fabric_bin=args.fabric_bin, start_threads=False, codex=not args.no_codex,
+               session=getattr(args, "session", None))
 
 
 def cmd_serve(args) -> int:
@@ -1077,6 +1157,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("serve")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--initiatives")
+    p.add_argument("--session", help="pin Mission Control to this Claude session (default: the mission ledger's)")
     p.add_argument("--no-remote", action="store_true")
     p.add_argument("--no-codex", action="store_true", help="never run codex exec (disposable or test instances)")
     p.add_argument("--fabric-bin")

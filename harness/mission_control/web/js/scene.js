@@ -1,118 +1,215 @@
-import { getState, subscribe, select, highlight, KINDS } from './store.js';
+import { getState, subscribe, select, highlight } from './store.js';
 import { button, el } from './ui.js';
-import { repos as recentRepos } from './adapt.js';
+import { layout, describe, tree, cueForChange, cueForEvent, repos as recentRepos, nodeColor, severityColor, escalationColor,
+  TYPE_COLORS, EVENT_MAP, LEVELS, UNKNOWN, ageText, isLive } from './org.js';
 
-// One canvas, one animation clock. HTML buttons mirror every meaningful node, so the scene is usable without WebGL.
-// Layout is data-driven: the coordinating main is the hub, initiatives orbit it, live or failing owners hang off
-// their initiative, and repositories with recent pushes sit on the outer ring.
-const MAX_OWNERS = 14;
-const RISK = /at risk|blocked/i;
-const DONE = /^done|complete/i;
+// The live org graph (goodqa#15950). It replaces the old constellation, which laid out a hand-written
+// initiatives.json. One canvas and one animation clock; every node also has an HTML button, and a list view shows the
+// same graph as a keyboard tree, so the page works without WebGL and under reduced motion.
+const MAX_PULSES = 40;
+const MAX_QUEUE = 60;
+const SHORT = { coordinator: 'Main', user: 'You' };
 
-function shortName(text) {
-  const words = String(text).replace(/^[A-Za-z]+:\s*/, '').split(/\s+/);
-  let out = '';
-  for (const word of words) { if ((out + ' ' + word).trim().length > 18) break; out = (out + ' ' + word).trim(); }
-  return out || String(text).slice(0, 18);
+function shortModel(model) {
+  if (!model || model === UNKNOWN) return UNKNOWN;
+  return String(model).replace(/^claude-/, '').replace(/-\d{8}$/, '');
 }
-
-function layout(state) {
-  const initiatives = state.initiatives.slice(0, 16);
-  const n = Math.max(initiatives.length, 1);
-  const nodes = [{ id: 'hub', kind: 'hub', name: 'Main', short: 'Main', pos: [0, .45, 0] }];
-  initiatives.forEach((item, i) => {
-    const a = i / n * Math.PI * 2 - Math.PI / 2;
-    const r = n > 9 ? 3.35 : n > 5 ? 3 : 2.6;
-    nodes.push({ id: item.id, kind: 'initiative', name: item.initiative, short: shortName(item.initiative), item,
-      pos: [Math.cos(a) * r, (i % 2 ? .35 : -.15) + Math.sin(i * 1.3) * .12, Math.sin(a) * r * .82] });
-  });
-  const shown = state.owners.filter(o => o.state === 'live' || o.severe || o.held).slice(0, MAX_OWNERS);
-  shown.forEach((owner, i) => {
-    const parent = nodes.find(node => node.id === owner.initiative_id) || nodes[0];
-    const a = i * 1.7;
-    nodes.push({ id: owner.agent_id, kind: 'owner', name: owner.name, short: owner.name, owner, parent: parent.id,
-      pos: [parent.pos[0] + Math.cos(a) * .75, parent.pos[1] + .35, parent.pos[2] + Math.sin(a) * .65] });
-  });
-  recentRepos(state.events).forEach((repo, i) => {
-    const a = i / 3 * Math.PI * 2 + .3;
-    nodes.push({ id: `repo:${repo}`, kind: 'repo', name: repo, short: `⌘ ${repo.split('/').pop()}`, repo, pos: [Math.cos(a) * 4.4, 0, Math.sin(a) * 4.4] });
-  });
-  return nodes;
+function labelText(node) {
+  if (node.kind === 'user') return node.inbox == null ? 'You · asks loading…' : `You · ${node.inbox} open ask${node.inbox === 1 ? '' : 's'}`;
+  if (node.kind === 'coordinator') return `Main · ${shortModel(node.model)} · ${node.effort}`;
+  if (node.kind === 'work') return `${node.ref}${node.done ? ' ✓' : ''}`;
+  if (node.kind === 'repo') return `⌘ ${node.label}`;
+  const state = node.kind === 'owner' && !isLive(node) ? ' · idle' : '';
+  return `${node.label} · ${shortModel(node.model)}${state}`;
 }
-
-const signature = nodes => nodes.map(node => `${node.kind}:${node.id}:${node.parent || ''}`).join('|');
+function ariaText(node, byId) {
+  const kind = TYPE_COLORS[node.kind]?.label || node.kind;
+  const fields = node.kind === 'repo' ? [] : describe(node, byId).map(([k, v]) => `${k}: ${v}`);
+  return `${kind} ${node.kind === 'work' ? node.ref : node.label}. ${fields.join('. ')}`.slice(0, 600);
+}
+function palette() {
+  const css = getComputedStyle(document.documentElement);
+  const read = (name, fallback) => (css.getPropertyValue(name).trim() || fallback);
+  const types = {};
+  for (const [kind, { color }] of Object.entries(TYPE_COLORS)) types[kind] = read(`--org-${kind}`, color);
+  return { types, done: read('--org-done', '#7c8580'), edge: read('--org-edge', '#8b967f'), ok: read('--org-ok', '#7edb8a'),
+    sev: { warn: read('--org-sev-warn', '#ffa94d'), high: read('--org-sev-high', '#ff6b5b') },
+    esc: ['', read('--org-esc-1', '#ffd166'), read('--org-esc-2', '#ff9f43'), read('--org-esc-3', '#ff5c5c')] };
+}
 
 export async function mountScene() {
   const stage = document.getElementById('scene-stage');
   const labels = document.getElementById('scene-labels');
   const poster = document.getElementById('scene-poster');
   const mode = document.getElementById('scene-mode');
+  const meta = document.getElementById('org-meta');
+  const cueLine = document.getElementById('org-cue');
+  const announcer = document.getElementById('org-announcer');
+  const listWrap = document.getElementById('org-list-wrap');
+  const list = document.getElementById('org-list');
+  const toggle = document.getElementById('org-view-toggle');
   const nodes = new Map(), labelNodes = new Map();
-  let model = layout(getState()), modelSig = '';
-  let THREE, renderer, camera, world, scene;
+  let graph = null, byId = new Map(), positions = new Map(), modelSig = '', lastSeq = -1;
+  let THREE, renderer, camera, world, scene, colors = palette();
   let available = false, visible = true, frame = 0, lastFrame = -Infinity, elapsed = 0, lastTime = 0;
-  let yaw = 0, targetYaw = 0, tilt = 0, targetTilt = 0, dragging = false, pointerStart = null;
-  let stageRect, pulses = [], flashTimers = new Map();
-  let renderWidth = 0, renderHeight = 0, renderRatio = 0;
-  let layers = [], packets = [];
-  let hoverX = 0, hoverY = 0, parallaxX = 0, parallaxY = 0;
+  let yaw = 0, targetYaw = 0, tilt = 0, targetTilt = 0, dragging = false, pointerStart = null, zoom = 1;
+  let stageRect, pulses = [], queue = [], flashTimers = new Map(), lastAnnounce = 0;
+  let renderWidth = 0, renderHeight = 0, renderRatio = 0, extent = 3;
+  let listMode = false;
 
-  function addLabel(node) {
-    const extra = node.kind === 'hub' ? 'central' : node.kind === 'owner' ? `owner-node${node.owner.severe ? ' severe' : ''}` : node.kind === 'repo' ? 'repo-node' : RISK.test(node.item.state) ? 'at-risk' : '';
-    const label = button(`node-label ${extra}`, '', event => {
-      if (pointerStart?.moved) return;
-      event.stopPropagation();
-      select(node.kind === 'repo' ? 'repo' : node.kind, node.kind === 'repo' ? node.repo : node.id);
-    });
-    label.replaceChildren(el('span', 'node-full', node.kind === 'initiative' ? node.short : node.name), el('span', 'node-short', node.short));
-    label.dataset.nodeId = node.id;
-    label.title = node.name;
-    const what = node.kind === 'initiative' ? `initiative ${node.name}, ${node.item.state}${node.item.pct !== null ? `, ${node.item.pct}%` : ''}` : node.kind === 'owner' ? `owner ${node.name}, ${node.owner.state}` : node.kind === 'repo' ? `repository ${node.repo}` : 'the main coordinator';
-    label.setAttribute('aria-label', `Open ${what}`);
-    const key = node.kind === 'repo' ? null : node.id;
-    label.addEventListener('pointerenter', () => highlight(key));
-    label.addEventListener('pointerleave', () => highlight(null));
-    label.addEventListener('focus', () => highlight(key));
-    label.addEventListener('blur', () => highlight(null));
-    labels.append(label);
-    labelNodes.set(node.id, { label, node });
+  // ---- legend and event table (static text, shown in every mode)
+  function legend() {
+    const box = document.getElementById('org-legend');
+    const group = (title, items) => {
+      const wrap = el('div', 'legend-group');
+      wrap.append(el('span', 'legend-title', title));
+      for (const [label, variable, ring] of items) {
+        const item = el('span', 'legend-item');
+        const swatch = el('span', `org-swatch${ring ? ' ring' : ''}`); swatch.style.setProperty('--swatch', `var(${variable})`); swatch.setAttribute('aria-hidden', 'true');
+        item.append(swatch, document.createTextNode(label));
+        wrap.append(item);
+      }
+      return wrap;
+    };
+    box.replaceChildren(
+      group('Node type', Object.entries(TYPE_COLORS).map(([kind, { label }]) => [label, `--org-${kind}`])),
+      group('Severity (halo)', [['warn', '--org-sev-warn', true], ['high', '--org-sev-high', true]]),
+      group('Escalation (rings, steps up the model ladder)', [['1 step', '--org-esc-1', true], ['2 steps', '--org-esc-2', true], ['3+ steps', '--org-esc-3', true]]));
+    const rows = document.getElementById('org-event-rows');
+    rows.replaceChildren(...EVENT_MAP.map(entry => { const tr = el('tr'); tr.append(el('td', '', entry.label), el('td', '', entry.source), el('td', '', entry.cue)); return tr; }));
   }
+
+  // ---- list view: a WAI-ARIA tree with a roving tabindex
+  function renderList() {
+    const focusedId = document.activeElement?.closest?.('#org-list [role="treeitem"]')?.dataset.nodeId;
+    list.replaceChildren();
+    const build = (entries, parent, level) => {
+      entries.forEach((entry, index) => {
+        const li = el('li');
+        li.setAttribute('role', 'treeitem');
+        li.setAttribute('aria-level', String(level));
+        li.setAttribute('aria-setsize', String(entries.length));
+        li.setAttribute('aria-posinset', String(index + 1));
+        li.dataset.nodeId = entry.node.id;
+        li.dataset.kind = entry.node.kind;
+        li.tabIndex = -1;
+        const row = el('div', 'org-row');
+        row.append(el('span', 'org-kind', TYPE_COLORS[entry.node.kind]?.label || entry.node.label || entry.node.kind),
+          el('span', 'org-name', entry.node.kind === 'group' ? entry.node.label : entry.node.kind === 'work' ? `${entry.node.ref} · ${entry.node.title}` : labelText(entry.node)));
+        if (entry.node.kind !== 'group') {
+          const fields = el('div', 'org-fields');
+          for (const [k, v] of describe(entry.node, byId)) { const f = el('span'); f.append(document.createTextNode(`${k}: `), el('b', '', v)); fields.append(f); }
+          row.append(fields);
+        }
+        li.append(row);
+        if (entry.children.length) {
+          li.setAttribute('aria-expanded', 'true');
+          const ul = el('ul'); ul.setAttribute('role', 'group');
+          build(entry.children, ul, level + 1);
+          li.append(ul);
+        }
+        parent.append(li);
+      });
+    };
+    build(tree(graph), list, 1);
+    const items = visibleItems();
+    const target = items.find(i => i.dataset.nodeId === focusedId) || items[0];
+    if (target) { target.tabIndex = 0; if (focusedId) target.focus(); }
+  }
+  const visibleItems = () => [...list.querySelectorAll('[role="treeitem"]')].filter(item => !item.parentElement.closest('[role="treeitem"][aria-expanded="false"]'));
+  function moveFocus(item) { if (!item) return; list.querySelectorAll('[role="treeitem"]').forEach(i => { i.tabIndex = -1; }); item.tabIndex = 0; item.focus(); }
+  list.addEventListener('keydown', event => {
+    const item = event.target.closest('[role="treeitem"]');
+    if (!item) return;
+    const items = visibleItems(), i = items.indexOf(item);
+    const expanded = item.getAttribute('aria-expanded');
+    let handled = true;
+    if (event.key === 'ArrowDown') moveFocus(items[i + 1]);
+    else if (event.key === 'ArrowUp') moveFocus(items[i - 1]);
+    else if (event.key === 'Home') moveFocus(items[0]);
+    else if (event.key === 'End') moveFocus(items[items.length - 1]);
+    else if (event.key === 'ArrowRight') { if (expanded === 'false') item.setAttribute('aria-expanded', 'true'); else if (expanded === 'true') moveFocus(item.querySelector('[role="treeitem"]')); }
+    else if (event.key === 'ArrowLeft') { if (expanded === 'true') item.setAttribute('aria-expanded', 'false'); else moveFocus(item.parentElement.closest('[role="treeitem"]')); }
+    else if (event.key === 'Enter' || event.key === ' ') { if (byId.has(item.dataset.nodeId)) select('org', item.dataset.nodeId); }
+    else handled = false;
+    if (handled) { event.preventDefault(); event.stopPropagation(); }
+  });
+  list.addEventListener('click', event => {
+    const item = event.target.closest('[role="treeitem"]');
+    if (!item) return;
+    moveFocus(item);
+    if (byId.has(item.dataset.nodeId)) select('org', item.dataset.nodeId);
+  });
+  list.addEventListener('focusin', event => { const item = event.target.closest('[role="treeitem"]'); if (item) highlight(item.dataset.nodeId); });
+  function setListMode(on) {
+    listMode = on;
+    listWrap.hidden = !on;
+    document.body.dataset.orgView = on ? 'list' : 'spatial';
+    toggle.setAttribute('aria-pressed', String(on));
+    toggle.textContent = on ? 'Show in 3D' : 'Show as list';
+    if (on) { stop(); renderList(); } else { size(); start(); }
+  }
+  toggle.addEventListener('click', () => setListMode(!listMode));
+
+  // ---- labels (every node has a focusable button)
   function rebuildLabels() {
-    labels.replaceChildren();
-    labelNodes.clear();
-    model.forEach(addLabel);
+    labels.replaceChildren(); labelNodes.clear();
+    const all = [...(graph?.nodes || []), ...repoNodes()];
+    for (const node of all) {
+      if (!positions.has(node.id)) continue;
+      const label = button('node-label', '', event => {
+        if (pointerStart?.moved) return;
+        event.stopPropagation();
+        if (node.kind === 'repo') select('repo', node.repo); else select('org', node.id);
+      });
+      label.dataset.nodeId = node.id; label.dataset.kind = node.kind;
+      if (node.severity && node.severity !== 'info') label.dataset.sev = node.severity;
+      label.append(el('span', 'node-full', labelText(node)));
+      if (node.escalation) { const esc = el('span', 'org-esc', `⇡${node.escalation}`); esc.setAttribute('aria-hidden', 'true'); label.append(esc); }
+      label.title = labelText(node);
+      label.setAttribute('aria-label', node.kind === 'repo' ? `Open repository ${node.repo}` : `Open ${ariaText(node, byId)}`);
+      label.addEventListener('pointerenter', () => highlight(node.id));
+      label.addEventListener('pointerleave', () => highlight(null));
+      label.addEventListener('focus', () => highlight(node.id));
+      label.addEventListener('blur', () => highlight(null));
+      labels.append(label);
+      labelNodes.set(node.id, { label, node });
+    }
   }
+  function repoNodes() { return recentRepos(getState().events).map(repo => ({ id: `repo:${repo}`, kind: 'repo', label: repo.split('/').pop(), repo })); }
   function positionStatic() {
+    // Without WebGL the labels sit on a front view of the same pyramid: x across, height down the page.
     const rect = stage.getBoundingClientRect();
-    const width = rect.width || 600, height = rect.height || 260;
+    const width = rect.width || 600, height = rect.height || 420;
+    const top = LEVELS.user + .3, bottom = Math.min(...[...positions.values()].map(p => p[1]), -1.5) - .3;
     for (const { label, node } of labelNodes.values()) {
-      const [x, , z] = node.pos;
+      const [x, y, z] = positions.get(node.id);
       const half = label.offsetWidth / 2 + 6, halfHeight = label.offsetHeight / 2 + 6;
-      label.style.left = `${Math.max(half, Math.min(width - half, width * (.5 + x / 4.8 * .44)))}px`;
-      label.style.top = `${Math.max(halfHeight, Math.min(height - halfHeight, height * (.5 + z / 4.8 * .42)))}px`;
+      label.style.left = `${Math.max(half, Math.min(width - half, width * (.5 + (x + z * .35) / (extent * 2.4))))}px`;
+      label.style.top = `${Math.max(halfHeight, Math.min(height - halfHeight, height * ((top - y) / (top - bottom))))}px`;
     }
     if (window.innerWidth >= 768) cull();
   }
   function fallback(reason = 'STATIC VIEW') {
     available = false;
     if (renderer) renderer.domElement.hidden = true;
-    poster.classList.remove('webgl-active');
+    poster.hidden = false;
     mode.textContent = reason;
     positionStatic();
     stop();
   }
-  function staticFlash(id) {
-    // On phones only the hub label is shown, so it is also the stationary event cue.
-    const item = labelNodes.get(window.innerWidth < 768 ? 'hub' : id) || labelNodes.get('hub');
-    if (!item) return;
-    const key = item.label.dataset.nodeId;
-    clearTimeout(flashTimers.get(key));
-    item.label.classList.add('static-flash');
-    flashTimers.set(key, setTimeout(() => { item.label.classList.remove('static-flash'); flashTimers.delete(key); }, 650));
+  function flash(id) {
+    const item = labelNodes.get(id);
+    const row = list.querySelector(`[data-node-id="${CSS.escape(id)}"]`);
+    for (const [target, cls] of [[item?.label, 'static-flash'], [row, 'org-flash']]) {
+      if (!target) continue;
+      const key = `${cls}:${id}`;
+      clearTimeout(flashTimers.get(key));
+      target.classList.add(cls);
+      flashTimers.set(key, setTimeout(() => { target.classList.remove(cls); flashTimers.delete(key); }, 900));
+    }
   }
-  function start() {
-    if (!frame && available && !getState().fallback && visible && !document.hidden) { lastTime = 0; frame = requestAnimationFrame(draw); }
-  }
+  function start() { if (!frame && available && !listMode && !getState().fallback && visible && !document.hidden) { lastTime = 0; frame = requestAnimationFrame(draw); } }
   function stop() { cancelAnimationFrame(frame); frame = 0; lastTime = 0; }
   function size() {
     stageRect = stage.getBoundingClientRect();
@@ -124,144 +221,134 @@ export async function mountScene() {
       renderer.setPixelRatio(ratio); renderer.setSize(width, height);
       renderWidth = width; renderHeight = height; renderRatio = ratio;
     }
-    // The canvas covers the viewport; the camera's optical centre follows the HUD gap.
     camera.setViewOffset(stageRect.width, stageRect.height, -stageRect.left, -stageRect.top, width, height);
-    camera.fov = width < 768 ? 27 : stageRect.width / stageRect.height < 1.6 ? 33 : 30;
+    camera.fov = width < 768 ? 40 : 34;
     camera.updateProjectionMatrix();
     start();
   }
+
+  // ---- the 3D scene
   const v3 = p => new THREE.Vector3(p[0], p[1], p[2]);
-  function line(points, color = '#8b967f', opacity = .22) {
+  function line(points, color, opacity = .35) {
     const object = new THREE.Line(new THREE.BufferGeometry().setFromPoints(points), new THREE.LineBasicMaterial({ color, transparent: true, opacity, depthWrite: false }));
     world.add(object); return object;
   }
-  function arc(radius, start = 0, length = Math.PI * 2, y = 0, segments = 100) {
-    return Array.from({ length: segments + 1 }, (_, i) => { const a = start + i / segments * length; return new THREE.Vector3(Math.cos(a) * radius, y, Math.sin(a) * radius); });
-  }
-  function glow(color, radius = .55, opacity = .6) {
-    // A procedural billboard: soft falloff, no bitmap, postprocessing or extra clock.
-    const material = new THREE.ShaderMaterial({
-      uniforms: { tint: { value: new THREE.Color(color) }, strength: { value: opacity } },
-      vertexShader: 'varying vec2 vUv; varying float vDepth; void main(){vUv=uv; vec4 p=modelViewMatrix*vec4(0.,0.,0.,1.); vDepth=-p.z; p.xy+=position.xy; gl_Position=projectionMatrix*p;}',
-      fragmentShader: 'uniform vec3 tint; uniform float strength; varying vec2 vUv; varying float vDepth; void main(){float r=length(vUv-.5)*2.; float a=pow(max(0.,1.-r),3.)*strength*(1.-smoothstep(8.,18.,vDepth)); gl_FragColor=vec4(tint,a);}',
-      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
-    });
-    return new THREE.Mesh(new THREE.PlaneGeometry(radius * 2, radius * 2), material);
-  }
-  function spark(color, radius = .07) {
-    const group = new THREE.Group();
-    group.add(new THREE.Mesh(new THREE.SphereGeometry(radius, 8, 8), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: .95, depthWrite: false })));
-    group.add(glow(color, radius * 5, .85));
-    return group;
-  }
-  function dispose(object) {
-    object.traverse(child => { child.geometry?.dispose(); const m = child.material; (Array.isArray(m) ? m : m ? [m] : []).forEach(x => x.dispose()); });
+  function circle(radius, segments = 64) { return Array.from({ length: segments + 1 }, (_, i) => { const a = i / segments * Math.PI * 2; return new THREE.Vector3(Math.cos(a) * radius, 0, Math.sin(a) * radius); }); }
+  function dispose(object) { object.traverse(child => { child.geometry?.dispose(); const m = child.material; (Array.isArray(m) ? m : m ? [m] : []).forEach(x => x.dispose()); }); }
+  function geometry(kind) {
+    switch (kind) {
+      case 'user': return new THREE.TorusGeometry(.26, .08, 12, 32);
+      case 'coordinator': return new THREE.IcosahedronGeometry(.42, 1);
+      case 'owner': return new THREE.OctahedronGeometry(.32);
+      case 'reviewer': return new THREE.TetrahedronGeometry(.22);
+      case 'work': return new THREE.BoxGeometry(.3, .2, .3);
+      case 'repo': return new THREE.BoxGeometry(.2, .2, .2);
+      default: return new THREE.SphereGeometry(.18, 18, 14);
+    }
   }
   function build() {
     if (world) { scene.remove(world); dispose(world); }
-    pulses = []; packets = []; layers = []; nodes.clear();
+    pulses = []; nodes.clear();
     world = new THREE.Group(); scene.add(world);
-    [3.55, 4.3, 4.8].forEach((radius, i) => {
-      const orbit = line(arc(radius), i === 1 ? '#d2dfb8' : '#a1b2a3', i === 1 ? .24 : .13);
-      orbit.rotation.x = (i - 1) * .22; orbit.rotation.z = (i - 1) * .16; orbit.position.y = (i - 1) * .32;
-    });
-    [-1.8, 1.1].forEach((height, layerIndex) => {
-      const stars = [];
-      for (let i = 0; i < 65; i++) { const a = i * 2.39996, r = 1.5 + (i % 23) / 23 * 5.3; stars.push(Math.cos(a) * r, height + Math.sin(i * 7.7) * .6, Math.sin(a) * r); }
-      const geometry = new THREE.BufferGeometry(); geometry.setAttribute('position', new THREE.Float32BufferAttribute(stars, 3));
-      const layer = new THREE.Points(geometry, new THREE.PointsMaterial({ color: '#b5c29d', size: layerIndex ? .025 : .016, transparent: true, opacity: layerIndex ? .4 : .22, depthWrite: false }));
-      world.add(layer); layers.push(layer);
-    });
-    const hub = model[0];
-    const currents = [];
-    for (const node of model) {
-      const position = v3(node.pos);
+    colors = palette();
+    // The planes of the pyramid: owners, agents and each DAG step, as faint rings sized to their content.
+    const planes = new Map();
+    for (const p of positions.values()) { const key = p[1].toFixed(2); planes.set(key, Math.max(planes.get(key) || 0, Math.hypot(p[0], p[2]))); }
+    for (const [y, r] of planes) { if (r < .2) continue; const ringLine = line(circle(r + .45), colors.edge, .12); ringLine.position.y = Number(y); }
+    const all = [...(graph?.nodes || []), ...repoNodes()];
+    for (const node of all) {
+      const p = positions.get(node.id); if (!p) continue;
+      const position = v3(p);
       const core = new THREE.Group(); core.position.copy(position); world.add(core);
-      let sphere;
-      if (node.kind === 'hub') {
-        sphere = new THREE.Mesh(new THREE.IcosahedronGeometry(.3, 2), new THREE.MeshPhysicalMaterial({ color: '#eaff9e', metalness: .8, roughness: .24, clearcoat: 1, emissive: '#a1c750', emissiveIntensity: .18 }));
-        core.add(sphere, glow('#eaff9e', .95, .85));
-        core.add(new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.IcosahedronGeometry(.42, 0)), new THREE.LineBasicMaterial({ color: '#eaff9e', transparent: true, opacity: .35 })));
-      } else if (node.kind === 'initiative') {
-        const risk = RISK.test(node.item.state), done = DONE.test(node.item.state);
-        const color = risk ? '#f1c782' : done ? '#7edbca' : '#d5e4bc';
-        sphere = new THREE.Mesh(new THREE.IcosahedronGeometry(.16, 2), new THREE.MeshPhysicalMaterial({ color, metalness: .8, roughness: .24, clearcoat: 1, emissive: risk ? '#8a5a12' : '#a1c750', emissiveIntensity: .08 }));
-        core.add(sphere, glow(risk ? '#f1c782' : '#eaff9e', .58, risk ? .7 : .5));
-        core.add(new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.IcosahedronGeometry(.21, 0)), new THREE.LineBasicMaterial({ color: '#eaff9e', transparent: true, opacity: .3 })));
-        core.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(arc(.38)), new THREE.LineBasicMaterial({ color: '#66764c', transparent: true, opacity: .45 })));
-        // The progress ring is the initiative's percentage, read from initiatives.json.
-        if (node.item.pct !== null && node.item.pct > 0) core.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(arc(.38, -Math.PI / 2, node.item.pct / 100 * Math.PI * 2, .015, 64)), new THREE.LineBasicMaterial({ color: risk ? '#f1c782' : '#eaff9e', transparent: true, opacity: .95 })));
-        const curve = new THREE.QuadraticBezierCurve3(position, new THREE.Vector3(position.x * .5, .75, position.z * .5), v3(hub.pos));
-        line(curve.getPoints(60), risk ? '#c9a46a' : '#b4c88c', .26);
-        currents.push(curve);
-      } else if (node.kind === 'owner') {
-        sphere = new THREE.Mesh(new THREE.OctahedronGeometry(.06), new THREE.MeshBasicMaterial({ color: node.owner.severe ? '#f1a6a6' : node.owner.runtime === 'codex' ? '#9ebfff' : '#cad9dc' }));
-        core.add(sphere);
-        if (node.owner.severe) core.add(glow('#f1a6a6', .3, .6));
-        line([v3(model.find(m => m.id === node.parent).pos), position], node.owner.severe ? '#c98787' : '#b5cad6', .26);
-      } else {
-        sphere = new THREE.Mesh(new THREE.BoxGeometry(.1, .1, .1), new THREE.MeshBasicMaterial({ color: '#9ebfff' }));
-        core.add(sphere);
-        line(arc(4.4, Math.atan2(position.z, position.x) - .25, .5, 0, 12), '#9ebfff', .3);
+      const base = node.kind === 'repo' ? colors.types.repo : node.kind === 'work' && node.done ? colors.done : colors.types[node.kind] || colors.edge;
+      const mesh = new THREE.Mesh(geometry(node.kind), new THREE.MeshStandardMaterial({ color: base, emissive: base, emissiveIntensity: .35, roughness: .4, metalness: .2,
+        transparent: node.kind === 'work' && node.done, opacity: node.kind === 'work' && node.done ? .6 : 1 }));
+      if (node.kind === 'owner' && !isLive(node)) { mesh.material.transparent = true; mesh.material.opacity = .45; }
+      core.add(mesh);
+      // Severity: a halo ring. Escalation: one thin ring per ladder step, stacked above the node.
+      const sev = node.severity === 'high' || node.severity === 'critical' ? colors.sev.high : node.severity === 'warn' || node.severity === 'medium' ? colors.sev.warn : '';
+      if (sev) { const halo = new THREE.Mesh(new THREE.RingGeometry(.4, .48, 40), new THREE.MeshBasicMaterial({ color: sev, side: THREE.DoubleSide, transparent: true, opacity: .9, depthWrite: false })); halo.rotation.x = -Math.PI / 2; core.add(halo); }
+      for (let i = 0; i < Math.min(3, node.escalation || 0); i++) {
+        const esc = new THREE.Mesh(new THREE.TorusGeometry(.3 + i * .07, .02, 6, 32), new THREE.MeshBasicMaterial({ color: colors.esc[Math.min(3, node.escalation)] }));
+        esc.rotation.x = -Math.PI / 2; esc.position.y = .26 + i * .06; core.add(esc);
       }
-      nodes.set(node.id, { core, position, sphere, node });
+      nodes.set(node.id, { core, position, mesh, node });
     }
-    // A slow ambient current runs from each initiative into the hub.
-    currents.forEach((curve, i) => {
-      const mesh = spark('#eaff9e', .03);
-      world.add(mesh); packets.push({ mesh, curve, phase: i * .17, speed: .07 + (i % 3) * .015 });
-    });
+    const edgeColor = kind => ({ spawn: colors.edge, review: colors.types.reviewer, works_on: colors.types.work, next: colors.types.work, depends: colors.types.work, parent: colors.edge, inbox: colors.types.user }[kind] || colors.edge);
+    for (const edge of graph?.edges || []) {
+      const a = nodes.get(edge.from)?.position, b = nodes.get(edge.to)?.position;
+      if (!a || !b) continue;
+      line([a, b], edgeColor(edge.kind), edge.kind === 'spawn' ? .28 : edge.kind === 'review' ? .7 : .5);
+    }
+  }
+  function signature() {
+    return [...positions.entries()].map(([id, p]) => `${id}:${p.map(v => v.toFixed(2)).join(',')}`).join('|') + '|' +
+      (graph?.nodes || []).map(n => `${n.id}:${n.state}:${n.severity}:${n.escalation}:${n.done}:${n.model}:${n.effort}:${n.inbox ?? ''}`).join('|') + '|' + (graph?.edges || []).length;
   }
   function rebuild(state) {
-    model = layout(state);
-    const sig = signature(model);
+    graph = state.orggraph;
+    byId = new Map((graph?.nodes || []).map(n => [n.id, n]));
+    positions = layout(graph, recentRepos(state.events));
+    // Frame the live part of the pyramid; the outer ring of idle owners may run past the edge.
+    extent = Math.max(3, ...[...positions.entries()].filter(([id]) => { const n = byId.get(id); return !(n?.kind === 'owner' && !isLive(n)) && !id.startsWith('repo:'); }).map(([, p]) => Math.hypot(p[0], p[2])));
+    const sig = signature();
+    renderMeta(state);
     if (sig === modelSig) return false;
     modelSig = sig;
     rebuildLabels();
-    if (available && THREE) build();
+    if (listMode) renderList();
+    if (available && THREE) { build(); fitCamera(); }
     if (!available) positionStatic();
     size(); start();
     return true;
+  }
+  function renderMeta(state) {
+    const g = state.orggraph;
+    if (!g) { meta.textContent = 'Waiting for the org graph from the server…'; return; }
+    const c = g.counts || {};
+    meta.textContent = `${c.live_owners ?? 0} live of ${c.owner ?? 0} owners · ${c.subagent ?? 0} sub-agents · ${c.reviewer ?? 0} reviewers · ${c.work ?? 0} work items${c.hidden_agents ? ` · ${c.hidden_agents} older agents not drawn` : ''} · graph last changed ${ageText(g.generated, state.now)} · session ${g.session ? String(g.session).slice(0, 8) : 'unknown'} · from ah owners, transcripts and GoodQA`;
+    const gaps = document.getElementById('org-gaps');
+    gaps.replaceChildren(...(g.gaps || []).map(text => el('li', '', text)));
+  }
+  function fitCamera() {
+    if (!camera) return;
+    const d = (3 + extent * 1.45) * zoom;
+    camera.position.set(0, 1.4 + d * .32, d);
+    camera.lookAt(0, -.1, 0);
   }
   const scratch = { v: null };
   function projectLabels() {
     if (!camera || !stageRect) return;
     const v = scratch.v ||= new THREE.Vector3();
-    const phone = window.innerWidth < 768;
-    for (const [id, { label, node }] of labelNodes) {
-      if (phone && id !== 'hub') continue;
+    for (const [id, { label }] of labelNodes) {
       const entry = nodes.get(id); if (!entry) continue;
       entry.core.getWorldPosition(v); v.project(camera);
       const x = (v.x * .5 + .5) * window.innerWidth - stageRect.left;
-      const y = (-v.y * .5 + .5) * window.innerHeight - stageRect.top + (node.kind === 'owner' ? 0 : node.kind === 'repo' ? 17 : 22);
-      const half = label.offsetWidth / 2 + 6, halfHeight = label.offsetHeight / 2 + 6;
-      label.style.left = `${Math.max(half, Math.min(stageRect.width - half, x))}px`;
-      label.style.top = `${Math.max(halfHeight, Math.min(stageRect.height - halfHeight, y))}px`;
+      const y = (-v.y * .5 + .5) * window.innerHeight - stageRect.top + 20;
+      // A label whose node is off the stage is hidden (still focusable), never squeezed against the edge.
+      label.classList.toggle('offstage', v.z > 1 || x < 0 || y < 0 || x > stageRect.width || y > stageRect.height);
+      label.style.left = `${x}px`;
+      label.style.top = `${y}px`;
     }
-    if (!phone) cull();
+    cull();
   }
-  // Labels never overlap: place them by priority and hide (not remove) the ones that would collide.
-  // A hidden label stays keyboard-focusable and reappears when its node is highlighted.
-  function priority({ node }, state) {
-    if (node.kind === 'hub' || state.highlight === node.id || state.selection?.id === node.id) return 0;
-    if (node.kind === 'initiative') return RISK.test(node.item.state) ? 1 : 2;
-    if (node.kind === 'owner') return node.owner.severe ? 1 : 4;
-    return 3;
-  }
+  // Labels never overlap: place them by priority, hide (not remove) the rest; a hidden label stays focusable.
+  const rank = node => (node.severity === 'high' || node.severity === 'critical' ? .5 : node.kind === 'owner' ? (isLive(node) ? 1 : 4.5) : PRIORITY[node.kind] ?? 6);
+  const PRIORITY = { coordinator: 0, user: 0, subagent: 2, reviewer: 2.5, work: 3, repo: 5 };
   function cull() {
     const state = getState();
-    const entries = [...labelNodes.values()].map(entry => ({ entry, p: priority(entry, state), x: parseFloat(entry.label.style.left), y: parseFloat(entry.label.style.top),
-      w: entry.label.offsetWidth + 6, h: entry.label.offsetHeight + 4 })).sort((a, b) => a.p - b.p);
+    const entries = [...labelNodes.values()].filter(entry => !entry.label.classList.contains('offstage')).map(entry => ({ entry, p: state.highlight === entry.node.id || state.selection?.id === entry.node.id ? -1 : rank(entry.node),
+      x: parseFloat(entry.label.style.left), y: parseFloat(entry.label.style.top), w: entry.label.offsetWidth + 6, h: entry.label.offsetHeight + 4 })).sort((a, b) => a.p - b.p);
     const placed = [];
     for (const item of entries) {
       const box = { l: item.x - item.w / 2, r: item.x + item.w / 2, t: item.y - item.h / 2, b: item.y + item.h / 2 };
       const clash = item.w > 6 && placed.some(o => box.l < o.r && box.r > o.l && box.t < o.b && box.b > o.t);
       item.entry.label.classList.toggle('culled', clash && item.p > 0);
-      if (!clash || item.p === 0) placed.push(box);
+      if (!clash || item.p <= 0) placed.push(box);
     }
   }
   function renderOnce() {
-    if (!available || getState().fallback || !visible || document.hidden) return;
+    if (!available || listMode || getState().fallback || !visible || document.hidden) return;
     try {
       renderer.setScissorTest(false); renderer.clear();
       renderer.setScissor(stageRect.left, window.innerHeight - stageRect.bottom, stageRect.width, stageRect.height);
@@ -272,26 +359,20 @@ export async function mountScene() {
   function disposePulse(pulse) { world.remove(pulse.mesh); dispose(pulse.mesh); }
   function draw(time) {
     frame = 0;
-    if (!available || getState().fallback || !visible || document.hidden) return;
+    if (!available || listMode || getState().fallback || !visible || document.hidden) return;
     const moving = getState().motion;
-    const interval = 1000 / (window.innerWidth < 768 ? 18 : 25);
-    if (time - lastFrame < interval) { frame = requestAnimationFrame(draw); return; }
+    if (time - lastFrame < 1000 / 30) { frame = requestAnimationFrame(draw); return; }
     const dt = lastTime ? Math.min((time - lastTime) / 1000, .1) : 0;
     lastTime = time; lastFrame = time;
     if (moving) elapsed += dt;
-    yaw += (targetYaw - yaw) * .08; tilt += (targetTilt - tilt) * .08;
-    parallaxX = moving ? parallaxX + (hoverX - parallaxX) * .07 : 0;
-    parallaxY = moving ? parallaxY + (hoverY - parallaxY) * .07 : 0;
-    world.rotation.y = yaw + (moving ? Math.sin(elapsed * .09) * .09 + parallaxX * .055 : 0);
-    world.rotation.x = -.12 + tilt + parallaxY * .025;
-    world.rotation.z = -.065;
-    layers.forEach((layer, i) => { layer.rotation.y = moving ? Math.sin(elapsed * .035 + i) * .045 + parallaxX * (i ? -.035 : .04) : 0; layer.position.x = parallaxX * (i ? .12 : -.15); });
-    packets.forEach(packet => { packet.mesh.visible = moving; packet.mesh.position.copy(packet.curve.getPoint((packet.phase + elapsed * packet.speed) % 1)); });
+    yaw += (targetYaw - yaw) * .1; tilt += (targetTilt - tilt) * .1;
+    world.rotation.y = yaw + (moving ? Math.sin(elapsed * .05) * .06 : 0);
+    world.rotation.x = tilt;
     const state = getState();
     for (const [id, entry] of nodes) {
-      const lit = state.highlight === id || state.selection?.id === id || (entry.node.kind === 'repo' && state.selection?.id === entry.node.repo);
-      entry.sphere.scale.setScalar(lit ? 1.4 : 1);
-      if (entry.node.kind === 'owner' && entry.node.owner.severe && moving) entry.sphere.scale.multiplyScalar(1 + Math.sin(elapsed * 4) * .15);
+      const lit = state.highlight === id || state.selection?.id === id;
+      entry.mesh.scale.setScalar(lit ? 1.45 : 1);
+      if (moving && entry.node.kind === 'coordinator') entry.mesh.rotation.y = elapsed * .3;
       labelNodes.get(id)?.label.classList.toggle('active', lit);
     }
     for (let i = pulses.length - 1; i >= 0; i--) {
@@ -300,81 +381,95 @@ export async function mountScene() {
       if (pulse.age < 0) continue;
       const t = pulse.age / pulse.duration;
       if (t >= 1 || !moving) { disposePulse(pulse); pulses.splice(i, 1); continue; }
-      if (pulse.kind === 'wave') { pulse.mesh.scale.setScalar(.3 + t * 4); pulse.mesh.material.opacity = (1 - t) * .7; }
+      if (pulse.kind === 'wave') { pulse.mesh.scale.setScalar(.4 + t * 2.6); pulse.mesh.material.opacity = (1 - t) * .85; }
       else pulse.mesh.position.copy(pulse.curve.getPoint(t));
     }
     renderOnce();
     if (moving || pulses.length || Math.abs(targetYaw - yaw) > .001 || Math.abs(targetTilt - tilt) > .001) frame = requestAnimationFrame(draw);
   }
-  function endpoints(event) {
-    const state = getState();
-    const owner = state.owners.find(o => o.agent_id === event.actor.agent);
-    const repoId = event.subject.repo ? `repo:${event.subject.repo}` : '';
-    const to = nodes.has(event.subject.initiative) ? event.subject.initiative : owner?.initiative_id && nodes.has(owner.initiative_id) ? owner.initiative_id : 'hub';
-    let from = nodes.has(event.actor.agent) ? event.actor.agent : nodes.has(repoId) ? repoId : to;
-    if (from === to) from = to === 'hub' ? (nodes.has(repoId) ? repoId : null) : 'hub';
-    return { from, to };
+
+  // ---- cues: every org change and every relevant feed event animates (or flashes, under reduced motion)
+  function describeCue(cue) {
+    const map = EVENT_MAP.find(e => e.id === cue.map);
+    const name = id => { const n = byId.get(id); return n ? (n.kind === 'work' ? n.ref : SHORT[n.kind] || n.label) : String(id || '').replace(/^repo:/, ''); };
+    const path = cue.from && cue.to ? `${name(cue.from)} → ${name(cue.to)}` : name(cue.ring || cue.to);
+    return `${map ? map.label : cue.map}${cue.verdict ? ` (${cue.verdict})` : ''}: ${path}`;
   }
-  function eventPulse(event) {
-    const { from, to } = endpoints(event);
-    // The static view has labels but no WebGL nodes, so an owner's label is found through labelNodes too.
-    const agent = event.actor.agent;
-    staticFlash(event.kind === 'wal' && (nodes.has(agent) || labelNodes.has(agent)) ? agent : to);
-    if (!available || getState().fallback || !getState().motion || document.hidden || !visible) return;
-    const color = KINDS[event.kind]?.color || '#eaff9e';
-    const end = nodes.get(to).position.clone();
-    if (event.quiet) {
-      // Tool calls and lifecycle: a small ripple where the owner sits, no travelling spark.
-      const at = nodes.get(event.actor.agent)?.position.clone() || end;
-      const ripple = new THREE.Mesh(new THREE.RingGeometry(.08, .095, 32), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: .45, side: THREE.DoubleSide, depthWrite: false }));
-      ripple.position.copy(at); ripple.rotation.x = -Math.PI / 2; world.add(ripple);
-      pulses.push({ mesh: ripple, kind: 'wave', age: 0, duration: .7 });
-      while (pulses.length > 32) disposePulse(pulses.shift());
-      start();
-      return;
+  function play(cue) {
+    if (!cue) return;
+    const target = cue.to && (nodes.has(cue.to) || labelNodes.has(cue.to)) ? cue.to : cue.ring;
+    if (target) flash(target);
+    if (cue.from && !cue.quiet) flash(cue.from);
+    if (!cue.quiet) {
+      cueLine.textContent = describeCue(cue);
+      if (Date.now() - lastAnnounce > 4000) { announcer.textContent = describeCue(cue); lastAnnounce = Date.now(); }
     }
-    if (from) {
-      const begin = nodes.get(from).position.clone();
-      const curve = event.kind === 'push' && from.startsWith('repo:')
-        ? new THREE.CatmullRomCurve3([begin, ...arc(4.3, Math.atan2(begin.z, begin.x), .6, 0, 10), end])
-        : new THREE.QuadraticBezierCurve3(begin, begin.clone().lerp(end, .5).add(new THREE.Vector3(0, .7, 0)), end);
-      const mesh = spark(color, .09); mesh.position.copy(begin); world.add(mesh);
-      pulses.push({ mesh, kind: 'travel', curve, age: 0, duration: 1.45 });
+    if (!available || listMode || !getState().motion || document.hidden || !visible) return;
+    const color = new THREE.Color(cue.color || colors.types.coordinator);
+    const end = nodes.get(cue.to)?.position || nodes.get(cue.ring)?.position;
+    const begin = cue.from ? nodes.get(cue.from)?.position : null;
+    if (begin && end && !cue.quiet) {
+      const lift = Math.max(.5, begin.distanceTo(end) * .3);
+      const curve = new THREE.QuadraticBezierCurve3(begin.clone(), begin.clone().lerp(end, .5).add(new THREE.Vector3(0, lift, 0)), end.clone());
+      const mesh = new THREE.Mesh(new THREE.SphereGeometry(cue.merge ? .1 : .07, 10, 10), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: .95, depthWrite: false }));
+      mesh.position.copy(begin); world.add(mesh);
+      pulses.push({ mesh, kind: 'travel', curve, age: 0, duration: 1.3 });
     }
-    const wave = new THREE.Mesh(new THREE.RingGeometry(.2, .225, 48), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: .7, side: THREE.DoubleSide, depthWrite: false }));
-    wave.position.copy(end); wave.rotation.x = -Math.PI / 2; wave.visible = false; world.add(wave);
-    pulses.push({ mesh: wave, kind: 'wave', age: from ? -1.45 : 0, duration: .9 });
-    while (pulses.length > 32) disposePulse(pulses.shift());
+    if (end) {
+      const wave = new THREE.Mesh(new THREE.RingGeometry(.18, .21, 40), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: .85, side: THREE.DoubleSide, depthWrite: false }));
+      wave.position.copy(end); wave.rotation.x = -Math.PI / 2; wave.visible = false; world.add(wave);
+      pulses.push({ mesh: wave, kind: 'wave', age: begin && !cue.quiet ? -1.3 : 0, duration: cue.quiet ? .6 : 1 });
+    }
+    while (pulses.length > MAX_PULSES) disposePulse(pulses.shift());
     start();
   }
+  // A burst is spread out: at most one cue every 250 ms, and the queue is bounded (NEG-8).
+  setInterval(() => { if (queue.length) play(queue.shift()); }, 250);
+  const enqueue = cue => { if (!cue) return; queue.push(cue); if (queue.length > MAX_QUEUE) queue.splice(0, queue.length - MAX_QUEUE); };
+
   subscribe((next, reason) => {
-    if (['initiatives', 'owners', 'seed'].includes(reason)) rebuild(next);
+    if (reason === 'orggraph' || reason === 'seed') {
+      rebuild(next);
+      const g = next.orggraph;
+      if (g && g.seq !== lastSeq) { if (lastSeq !== -1) g.changes.forEach(change => enqueue(cueForChange(change, g))); lastSeq = g.seq; }
+    }
     if (reason === 'event' && next.lastEvent && !next.lastEvent.historic) {
-      if (['push', 'release', 'deploy'].includes(next.lastEvent.kind)) rebuild(next);
-      eventPulse(next.lastEvent);
+      if (['push', 'release'].includes(next.lastEvent.kind)) rebuild(next);
+      enqueue(cueForEvent(next.lastEvent, next.orggraph));
     }
+    if (reason === 'tick') renderMeta(next);
     if (reason === 'motion') { pulses.forEach(disposePulse); pulses = []; stop(); start(); }
-    if (reason === 'highlight' || reason === 'selection') {
-      labelNodes.forEach(({ label }, id) => label.classList.toggle('active', next.highlight === id || next.selection?.id === id)); start();
-    }
+    if (reason === 'theme') { requestAnimationFrame(() => { if (available && THREE) { build(); start(); } }); }
+    if (reason === 'highlight' || reason === 'selection') { labelNodes.forEach(({ label }, id) => label.classList.toggle('active', next.highlight === id || next.selection?.id === id)); start(); }
     if (reason === 'tab') requestAnimationFrame(() => { size(); start(); });
   });
-  document.getElementById('scene-reset').addEventListener('click', () => { targetYaw = 0; targetTilt = 0; hoverX = hoverY = 0; if (!getState().motion) { yaw = 0; tilt = 0; } start(); });
+  document.getElementById('scene-reset').addEventListener('click', () => { targetYaw = 0; targetTilt = 0; zoom = 1; fitCamera(); if (!getState().motion) { yaw = 0; tilt = 0; } start(); });
   stage.addEventListener('pointerdown', event => {
     if (event.target.closest('button')) return;
     dragging = true; pointerStart = { x: event.clientX, y: event.clientY, yaw: targetYaw, tilt: targetTilt, moved: false }; stage.setPointerCapture(event.pointerId);
   });
   stage.addEventListener('pointermove', event => {
-    if (event.pointerType === 'mouse' && stageRect) { hoverX = (event.clientX - stageRect.left) / stageRect.width * 2 - 1; hoverY = (event.clientY - stageRect.top) / stageRect.height * 2 - 1; }
     if (!dragging || !pointerStart || !available) return;
     const dx = event.clientX - pointerStart.x, dy = event.clientY - pointerStart.y;
     pointerStart.moved = Math.abs(dx) + Math.abs(dy) > 5;
-    targetYaw = Math.max(-.6, Math.min(.6, pointerStart.yaw + dx * .0025));
-    targetTilt = Math.max(-.15, Math.min(.15, pointerStart.tilt + dy * .0015));
+    targetYaw = pointerStart.yaw + dx * .005;
+    targetTilt = Math.max(-.35, Math.min(.5, pointerStart.tilt + dy * .003));
     if (!getState().motion) { yaw = targetYaw; tilt = targetTilt; }
     start();
   });
-  stage.addEventListener('pointerleave', () => { hoverX = hoverY = 0; });
+  stage.addEventListener('wheel', event => { if (!available || !event.ctrlKey && !event.metaKey) return; event.preventDefault(); zoom = Math.max(.5, Math.min(2.2, zoom * (event.deltaY > 0 ? 1.08 : .92))); fitCamera(); start(); }, { passive: false });
+  // Keyboard: with focus on the stage background, arrows rotate and tilt, + and - zoom.
+  stage.tabIndex = 0;
+  stage.setAttribute('aria-label', 'Org graph 3D view. Arrow keys rotate and tilt, plus and minus zoom; Tab moves through the nodes.');
+  stage.addEventListener('keydown', event => {
+    if (event.target !== stage) return;
+    const steps = { ArrowLeft: [-.15, 0], ArrowRight: [.15, 0], ArrowUp: [0, -.06], ArrowDown: [0, .06] };
+    if (steps[event.key]) { targetYaw += steps[event.key][0]; targetTilt = Math.max(-.35, Math.min(.5, targetTilt + steps[event.key][1])); if (!getState().motion) { yaw = targetYaw; tilt = targetTilt; } }
+    else if (event.key === '+' || event.key === '=') { zoom = Math.max(.5, zoom * .9); fitCamera(); }
+    else if (event.key === '-') { zoom = Math.min(2.2, zoom * 1.1); fitCamera(); }
+    else return;
+    event.preventDefault(); start();
+  });
   const release = () => { dragging = false; pointerStart = null; };
   stage.addEventListener('pointerup', release); stage.addEventListener('pointercancel', release);
   new IntersectionObserver(entries => { visible = entries[0].isIntersecting; if (visible) { size(); start(); } else stop(); }).observe(stage);
@@ -382,24 +477,26 @@ export async function mountScene() {
   window.addEventListener('resize', size);
   window.addEventListener('scroll', () => { size(); start(); }, { passive: true });
   document.addEventListener('visibilitychange', () => { if (document.hidden) stop(); else { size(); start(); } });
+  legend();
+  const hash = new URLSearchParams(location.hash.slice(1));
   rebuild(getState());
+  lastSeq = getState().orggraph?.seq ?? -1;
+  if (hash.get('org') === 'list') setListMode(true);
   try {
-    // #gl=off forces the static view (a view preference, like #tab=), so the no-WebGL path can be tested anywhere.
-    if (new URLSearchParams(location.hash.slice(1)).get('gl') === 'off') throw new Error('gl=off');
+    // #gl=off forces the static view, so the no-WebGL path can be tested anywhere.
+    if (hash.get('gl') === 'off') throw new Error('gl=off');
     THREE = await import('../vendor/three.module.min.js');
     renderer = new THREE.WebGLRenderer({ alpha: true, antialias: window.innerWidth >= 768, powerPreference: 'low-power' });
     renderer.setClearColor(0x000000, 0);
     renderer.debug.onShaderError = () => fallback('SHADER FALLBACK');
     document.getElementById('scene-layer').append(renderer.domElement);
-    camera = new THREE.PerspectiveCamera(30, 1, .1, 80); camera.position.set(.3, 5.9, 9.4); camera.lookAt(0, 0, 0);
+    camera = new THREE.PerspectiveCamera(34, 1, .1, 120);
     scene = new THREE.Scene();
-    scene.fog = new THREE.Fog('#000000', 8, 18);
-    scene.add(new THREE.AmbientLight('#b4c6ab', 2));
-    const key = new THREE.DirectionalLight('#edffd4', 5); key.position.set(2, 5, 4); scene.add(key);
-    const rim = new THREE.PointLight('#d8eaff', 35, 15); rim.position.set(-4, 3, -2); scene.add(rim);
-    available = true; build();
+    scene.add(new THREE.AmbientLight('#ffffff', 1.6));
+    const key = new THREE.DirectionalLight('#ffffff', 2.2); key.position.set(3, 6, 5); scene.add(key);
+    available = true; poster.hidden = true; build(); fitCamera();
     renderer.domElement.addEventListener('webglcontextlost', event => { event.preventDefault(); fallback('CONTEXT LOST · STATIC'); });
-    renderer.domElement.addEventListener('webglcontextrestored', () => { available = true; renderer.domElement.hidden = false; poster.classList.add('webgl-active'); mode.textContent = 'SPATIAL VIEW'; build(); size(); start(); });
-    poster.classList.add('webgl-active'); size(); start();
-  } catch { fallback('STATIC VIEW'); }
+    renderer.domElement.addEventListener('webglcontextrestored', () => { available = true; renderer.domElement.hidden = false; poster.hidden = true; mode.textContent = 'SPATIAL VIEW'; build(); size(); start(); });
+    size(); start();
+  } catch { fallback(hash.get('gl') === 'off' ? 'STATIC VIEW' : 'STATIC VIEW · NO WEBGL'); }
 }

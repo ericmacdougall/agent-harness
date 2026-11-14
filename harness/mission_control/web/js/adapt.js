@@ -20,6 +20,7 @@ export function initiative(row) {
     milestone_items: Array.isArray(row.milestone_items) ? row.milestone_items.map(m => ({ done: !!m.done, text: str(m.text, 200).replace(/^(Done:|Not yet:)\s*/i, '') })) : [],
     next_step: str(row.next_step, 600), next_eta: str(row.next_eta, 80) || null, full_eta: str(row.full_eta, 80) || null,
     estimate_by: str(row.estimate_by, 80) || 'main', note: str(row.note, 600), updated: str(row.updated, 60), error: str(row.error, 300),
+    source: row.source === 'live' ? 'live' : 'file',
   };
   if (item.pct === null) item.milestones_done = item.milestones_total = null;
   return item;
@@ -27,7 +28,11 @@ export function initiative(row) {
 
 export function initiatives(snapshot) {
   const items = Array.isArray(snapshot?.items) ? snapshot.items.filter(x => x && typeof x === 'object').map(initiative) : [];
-  return { items, stale: !!snapshot?.stale, error: str(snapshot?.error, 300) };
+  // mtime: when the hand-written file was last edited (seconds), so the page can say how old it is (goodqa#15950).
+  const mtime = Number.isFinite(snapshot?.mtime) && snapshot.mtime > 0 ? snapshot.mtime * 1000 : null;
+  // derived: rows built from live owners + GoodQA; hiddenFileRows: file rows dropped because the file is over a day old
+  const count = v => (Number.isInteger(v) && v >= 0 ? v : 0);
+  return { items, stale: !!snapshot?.stale, error: str(snapshot?.error, 300), mtime, derived: count(snapshot?.derived), untracked: count(snapshot?.untracked), hiddenFileRows: count(snapshot?.hidden_file_rows) };
 }
 
 // An initiative's free-text owner ("a095f32d (waiting)", "none live", "main") links to an owner row by id prefix.
