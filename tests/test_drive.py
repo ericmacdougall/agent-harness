@@ -140,7 +140,7 @@ class ConditionTests(Base):
         subprocess.run(["git", "-C", str(self.repo), "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
         a = drive.assess(self.home, MISSION, time.time(), owner_rows=[])
         self.assertIn("MERGED_NOT_RELEASED", self.conds(a, "solve"))
-        self.goals[0]["evidence"] = [{"kind": "deploy", "at": time.time() + 60}]
+        self.goals[0]["evidence"] = [{"kind": "deploy", "at": time.time(), "row_at": time.time() + 60}]
         self.write_goals()
         self.assertNotIn("MERGED_NOT_RELEASED", self.conds(drive.assess(self.home, MISSION, time.time(), owner_rows=[]), "solve"))
 
@@ -245,6 +245,34 @@ class ResponseTests(Base):
                     drive.respond(self.home, "solve", "UNOWNED", "park", source=f'user:{sess} "{words}"', now=NOW)
             for words in ("park solve until Monday", "defer solve", "put solve on hold"):
                 drive.respond(self.home, "solve", "UNOWNED", "park", source=f'user:{sess} "{words}"', now=NOW)
+
+    def test_response_park_must_govern_the_requested_goal(self):
+        """Receipt v3 F1: the park verb must apply to this goal, not to another goal in the same sentence."""
+        import mission_coverage as mc
+        sess = "baab765b-d85c-46b4-b7b9-588eb912c770/11111111-2222-4333-8444-555555555555"
+        with mock.patch.object(mc, "verify_user_source", return_value=True):
+            for words in ("keep solve moving; park leads until Monday", "solve is fine, park leads",
+                          "park leads until solve ships", "park leads and keep pushing solve",
+                          "let's solve the bug later", "hold on, solve is broken", "park everything except solve"):
+                with self.assertRaises(drive.DriveError, msg=words):
+                    drive.respond(self.home, "solve", "UNOWNED", "park", source=f'user:{sess} "{words}"', now=NOW)
+            for words in ("keep leads moving; park solve until Monday", "put solve on hold"):
+                drive.respond(self.home, "solve", "UNOWNED", "park", source=f'user:{sess} "{words}"', now=NOW)
+
+    def test_release_uses_deploy_event_time_not_attach_time(self):
+        """Receipt v3 F2: an older deploy attached after the merge is not a newer release."""
+        import datetime as dt
+        iso = lambda t: dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat()  # noqa: E731
+        g = {"evidence": [{"kind": "deploy", "at": iso(NOW), "row_at": iso(NOW - 86400)}]}
+        self.assertEqual(drive.deploy_ts(g, NOW), NOW - 86400)
+        self.assertEqual(drive.deploy_ts({"evidence": [{"kind": "deploy", "at": iso(NOW)}]}, NOW), 0.0)  # no row_at
+        self.assertEqual(drive.deploy_ts({"evidence": [{"kind": "deploy", "row_at": iso(NOW + 3600)}]}, NOW), 0.0)
+        with mock.patch.object(drive, "merged_commit_ts", return_value=NOW - 3600):
+            self.goals[0]["evidence"] = g["evidence"]
+            self.goals[0]["repos"] = [str(self.repo)]
+            self.write_goals()
+            self.assertIn("MERGED_NOT_RELEASED",
+                          self.conds(drive.assess(self.home, MISSION, NOW, owner_rows=[]), "solve"))
 
     def test_response_stale_episode_not_counted(self):
         snap = drive.with_episodes(self.home, drive.assess(self.home, MISSION, NOW, owner_rows=[], with_git=False), prev={})

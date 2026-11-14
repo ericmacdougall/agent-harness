@@ -1674,6 +1674,7 @@ Owners are long-lived product owners, not one-task sub-agents. `owner_rt.py` (`a
 - Lifetime: `owner_rt.py tick` runs from ops-watch's `drive` check every cycle. That makes ops-watch more than a read-only observer: when the runtime is enabled it launches and stops owner sessions. It resumes every owner whose session is idle or gone while the goal is not done and work is due. Work is due when a task is actionable, a resume is due, or there has been no proof for 30 minutes.
   - Resume is `claude --bg --resume <session>`, which keeps context.
   - A missing or oversized transcript (`fresh_bytes`) starts a fresh generation from the state file instead.
+  - Before a relaunch the tick re-lists the owner's sessions, stops only those still idle, checks each `claude stop` exit code and re-lists again. If any stop fails, a session is working again, has no id, or is still live afterwards, it launches nothing and logs a failed attempt (which counts toward the hourly limit).
   - Bounds: at most `max_launches_per_hour` (4, clamped to 1-6), at least `min_gap_s` (300, clamped to 120-86400) apart; `fresh_bytes` is clamped to 200 KB-50 MB. After 3 launches with no new proof the owner is `stuck`, tick stops relaunching it and the high alert `owner:<goal>:stuck` is raised.
   - Nothing launches unless `~/.agent-harness/owners/runtime.json` has `"enabled": true`; disabled, tick reports `would-launch` and runs no program. Its `permission_mode` defaults to `auto`; `bypassPermissions` takes effect only with a `permission_source` that resolves to the user's words (`user:` or `answer:`) and whose quoted excerpt itself chooses bypass (a negated excerpt never counts). Every guard hook still runs in bypass.
   - The `claude` binary is found only in `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin` or `/usr/bin`; runtime.json cannot name one.
@@ -1687,7 +1688,7 @@ Owners are long-lived product owners, not one-task sub-agents. `owner_rt.py` (`a
   - `STUCK`
   - `HELP_OPEN`
   - `REVIEW_LOOP`
-  - `MERGED_NOT_RELEASED`: a commit naming the goal's ticket on a repo's default remote branch is newer than its last deploy evidence; needs the goal's `repos`.
+  - `MERGED_NOT_RELEASED`: a commit naming the goal's ticket on a repo's default remote branch is newer than its last deploy evidence, compared by the deploy row's own time (`row_at`), never the attach time; a deploy row without `row_at` or dated in the future is not release evidence. Needs the goal's `repos`.
   - `PENDING_GATES`: goodqa#15952 lifecycle pending with no proposal. It is added alongside an owner and never pauses building. It fires only once `lifecycle.py` is installed.
   - `BLOCKED_USER`: the goal is deferred on an ask; it never excuses `UNOWNED`.
   - `RELEASE_CHECK_OFF`: the goal has a ticket but no `repos`, so merged-not-released cannot be checked.
@@ -1698,7 +1699,7 @@ Owners are long-lived product owners, not one-task sub-agents. `owner_rt.py` (`a
   - an open ask in the mission session that names the goal;
   - a successful owner launch (exit 0) recorded after the condition appeared;
   - a ticket reference that GoodQA reports open;
-  - a park on a `user:`/`answer:` source that resolves to the user's words naming the goal, where those words themselves park or defer it with no negation anywhere ("never park solve" never counts).
+  - a park on a `user:`/`answer:` source that resolves to the user's words naming the goal, where a clause of those words holds a park verb (park, defer, pause, on hold, shelve, deprioritize) and names only that goal, with no negation or exclusion anywhere ("never park solve", "keep solve moving; park leads", "park everything except solve" never park solve). Ambiguous forms such as "solve: put it on hold" are refused; say "put solve on hold".
   A response counts only for the episode it answers (recorded after the condition appeared) and for at most 4 hours. Snapshot and response rows are HMAC-signed with Mission Control's key; an unsigned or forged row, or a snapshot whose goal set differs from goals.json, is ignored.
 - Enforcement: the `drive.py stop` Stop hook, for main of the mission session only, reads the snapshot written by the ops-watch drive tick plus the response ledger. A missing or stale snapshot falls back to a cheap live view without git, using the signed owner list, and saves a partial snapshot so episodes and responses persist; it replaces a stale full snapshot too and carries the episodes the partial view cannot see (git conditions) until the next full tick. A response recorded while no snapshot had its condition yet anchors that condition's episode when it appears, within one hour. It blocks at most 3 times per signature; after that it lets the turn end, keeps the action open and raises the high `drive:valve` alert. ops-watch raises `drive:<goal>:<cond>` per unanswered action and wakes main through Mission Control. Mission Control `/api/state` carries `drive`.
 - Limits: same-user threat model as `caller_identity.py`. Legacy sub-agent owners count only through ops-watch's signed owner snapshot (stream ticket or `bind`).

@@ -352,7 +352,51 @@ class TickTests(Base):
             return 0, json.dumps(self.sessions + [{"id": "c9f43044", "sessionId": "new-session-id-0001"}])
         if "--bg" in argv:
             return 0, "backgrounded · c9f43044 · owner-solve"
+        if argv[1:2] == ["stop"]:
+            if getattr(self, "stop_code", 0):
+                return self.stop_code, "stop failed"
+            if not getattr(self, "stop_ignored", False):
+                for a in self.sessions:
+                    if a.get("id") == argv[2]:
+                        a["pid"] = None
         return 0, ""
+
+    def test_tick_replace_refused_unless_old_session_proven_stopped(self):
+        """Receipt v3 F3: a failed or ineffective stop, an id-less session, or one working again: no new launch."""
+        ort.add_task(self.home, "solve", "fix login", "ticket:goodqa#2")
+        cases = [("stop_code", 1, "failed"), ("stop_ignored", True, "still live")]
+        for i, (attr, value, why) in enumerate(cases):
+            self.calls = []
+            self.sessions = [{"id": "8d84dcef", "sessionId": SID, "pid": 1, "status": "idle", "state": "done"}]
+            setattr(self, attr, value)
+            out = ort.tick(self.home, now=NOW + i * 4000, runner=self.runner)
+            setattr(self, attr, 0 if attr == "stop_code" else False)
+            self.assertEqual(out[0]["action"], "launch-failed", why)
+            self.assertIn(why, out[0]["reason"])
+            self.assertEqual([c for c in self.calls if "--bg" in c], [], why)
+        st = ort.load_state(self.home, "solve")
+        self.assertEqual([x["code"] for x in st["launches"]], [-1, -1])  # refusals count toward the hourly brake
+        self.assertEqual(st["generation"], 0)
+        self.calls = []
+        self.sessions = [{"id": "", "sessionId": SID, "pid": 1, "status": "idle", "state": "done"}]
+        out = ort.tick(self.home, now=NOW + 9000, runner=self.runner)
+        self.assertIn("no id", out[0]["reason"])
+        self.assertEqual([c for c in self.calls if "--bg" in c], [])
+
+    def test_tick_replace_never_stops_a_session_working_again(self):
+        ort.add_task(self.home, "solve", "fix login", "ticket:goodqa#2")
+        listings = iter([[{"id": "8d84dcef", "sessionId": SID, "pid": 1, "status": "idle", "state": "done"}],
+                         [{"id": "8d84dcef", "sessionId": SID, "pid": 1, "status": "busy", "state": "working"}]])
+
+        def runner(argv, timeout=60, cwd=None):
+            self.calls.append(argv)
+            if argv[1:2] == ["agents"]:
+                return 0, json.dumps(next(listings))
+            return 0, "backgrounded · c9f43044 · owner-solve" if "--bg" in argv else ""
+        out = ort.tick(self.home, now=NOW, runner=runner)
+        self.assertEqual(out[0]["action"], "launch-failed")
+        self.assertNotIn(["claude", "stop", "8d84dcef"], self.calls)
+        self.assertEqual([c for c in self.calls if "--bg" in c], [])
 
     def test_tick_resumes_idle_owner_with_actionable_task(self):
         proj = self.home / ".claude" / "projects" / "-x"
@@ -405,6 +449,9 @@ class TickTests(Base):
 
     def test_tick_every_launch_is_a_generation_and_lost_id_cleared(self):
         def runner(argv, timeout=60, cwd=None):
+            if argv[1:2] == ["stop"]:
+                for a in self.sessions:
+                    a["pid"] = None if a.get("id") == argv[2] else a.get("pid")
             if argv[1:2] == ["agents"]:
                 return 0, json.dumps(self.sessions)  # the new session is not listed: lookup fails
             return (0, "backgrounded · c9f43044 · owner-solve") if "--bg" in argv else (0, "")
@@ -470,6 +517,9 @@ class TickTests(Base):
 
     def test_tick_untrusted_workspace_failure_logged(self):
         def runner(argv, timeout=60, cwd=None):
+            if argv[1:2] == ["stop"]:
+                for a in self.sessions:
+                    a["pid"] = None if a.get("id") == argv[2] else a.get("pid")
             if argv[1:2] == ["agents"]:
                 return 0, json.dumps(self.sessions)
             if "--bg" in argv:

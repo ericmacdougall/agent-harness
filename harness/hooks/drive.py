@@ -143,12 +143,18 @@ def legacy_owners(home: Path, session: str, goal: dict, rows) -> list:
         return []
 
 
-def deploy_ts(goal: dict) -> float:
+def deploy_ts(goal: dict, now=None) -> float:
+    """Newest deploy EVENT time: the attached WAL row's own time (row_at), never the attach time (receipt v3 F2: an
+    older deploy attached after a merge is not a newer release). A row without row_at, or one dated in the future,
+    is no release evidence, so merged-not-released errs toward alerting."""
+    now = time.time() if now is None else now
     best = 0.0
-    for ev in (goal.get("evidence") or []) + (goal.get("done_evidence") or []):
-        if isinstance(ev, dict) and ev.get("kind") == "deploy":
+    for ev in goal.get("evidence") or []:
+        if isinstance(ev, dict) and ev.get("kind") == "deploy" and ev.get("row_at"):
             with contextlib.suppress(Exception):
-                best = max(best, ort_parse(ev.get("at")))
+                ts = ort_parse(ev.get("row_at"))
+                if ts <= now + 300:
+                    best = max(best, ts)
     return best
 
 
@@ -288,7 +294,7 @@ def assess(home: Path, session: str = "", now=None, owner_rows=None, with_git: b
                 conds.append(("RELEASE_CHECK_OFF", ""))
             if with_git:
                 mts = merged_commit_ts(g)
-                if mts and mts > deploy_ts(g):
+                if mts and mts > deploy_ts(g, now):
                     conds.append(("MERGED_NOT_RELEASED", f"ticket {g.get('ticket')}"))
             if lc == "pending":
                 lcd = g.get("lifecycle") if isinstance(g.get("lifecycle"), dict) else {}
@@ -468,8 +474,26 @@ def episode_start(home: Path, key: str, now: float) -> float:
 
 
 PRE_EPISODE_S = 3600
-PARK_INTENT = re.compile(r"\b(?:park|parked|parking|defer|deferred|deferring|pause|paused|hold|on hold|shelve|"
-                         r"shelved|later|deprioriti[sz]e[d]?|backburner|back burner)\b", re.I)
+PARK_INTENT = re.compile(r"\b(?:park|parked|parking|defer|deferred|deferring|pause|paused|on hold|shelve|shelved|"
+                         r"deprioriti[sz]e[d]?|backburner|back burner)\b", re.I)  # no bare "later"/"hold"
+CLAUSE_SPLIT = re.compile(r"[;,.!?:\n()]+|\b(?:and|but|then|while|whereas|so|also)\b", re.I)
+
+
+def park_binds(excerpt: str, goal_id: str, goals: dict) -> bool:
+    """Receipt v3 F1: the park verb must govern the requested goal. Some clause of the user's words holds a park verb
+    and names exactly one goal of goals.json, the requested one; "keep solve moving; park leads" never parks solve,
+    nor does "park leads until solve ships". No negation anywhere (owner_rt.affirms)."""
+    if not ort.affirms(excerpt, PARK_INTENT):
+        return False
+    mc = _mc()
+    for clause in CLAUSE_SPLIT.split(excerpt or ""):
+        if not clause or not PARK_INTENT.search(clause):
+            continue
+        named = {gid for gid, g in goals.items()
+                 if gid.lower() in re.findall(r"[a-z0-9_-]+", clause.lower()) or mc.names_goal(clause, dict(g, id=gid))}
+        if named == {goal_id}:
+            return True
+    return False
 
 
 def episode_on_record(home: Path, key: str) -> bool:
@@ -513,8 +537,9 @@ def check_response(home: Path, goal_id: str, cond: str, kind: str, ref: str, sou
         excerpt = mc.source_excerpt(source)
         if goal_id not in excerpt.lower() and not mc.names_goal(excerpt, goal):
             return f"the user's words do not name goal {goal_id}"
-        if not ort.affirms(excerpt, PARK_INTENT):  # receipt F1: naming the goal is not authorizing the park
-            return "the user's words must themselves park or defer the goal (no negation)"
+        if not park_binds(excerpt, goal_id, ort.mission_goals(home)):  # receipt F1 (v2, v3)
+            return ("the user's words must park or defer this goal itself: a clause with a park verb that names only "
+                    f"{goal_id}, and no negation")
         return ""
     return "unknown response kind"
 

@@ -259,7 +259,8 @@ def user_decided(source) -> bool:
 
 
 BYPASS_WORD = re.compile(r"\bbypass", re.I)
-NEGATION = re.compile(r"\b(?:no|not|never|don'?t|do not|without|stop|disable|isn'?t)\b|n't\b", re.I)
+NEGATION = re.compile(r"\b(?:no|not|never|don'?t|do not|without|stop|disable|isn'?t|except|excluding|other than|"
+                      r"besides|apart from|aside from|instead of|rather than)\b|n't\b", re.I)  # also exclusions
 
 
 def chooses_bypass(source) -> bool:
@@ -728,6 +729,31 @@ def bg_sessions(cfg: dict, runner=_run) -> list:
     return [a for a in data if isinstance(a, dict)]
 
 
+def stop_idle_sessions(cfg: dict, state: dict, runner=_run) -> str:
+    """Stop every live session of this owner and prove it: '' when none is left, else why not (receipt v3 F3).
+    Re-lists right before stopping and stops only sessions still idle, checks each `claude stop` exit code, then
+    re-lists and requires that no live session of this owner remains."""
+    try:
+        live = owner_sessions(state, bg_sessions(cfg, runner))
+    except Exception as exc:  # noqa: BLE001
+        return "could not list sessions before stopping: " + clean(str(exc), 120)
+    for a in live:
+        if not (a.get("status") == "idle" and a.get("state") == "done"):
+            return f"session {clean(a.get('id') or a.get('sessionId'), 40)} is working again"
+        if not a.get("id"):
+            return f"live session {clean(a.get('sessionId'), 40)} has no id to stop"
+        code, text = runner([cfg["claude"], "stop", str(a["id"])], 30)
+        if code != 0:
+            return f"claude stop {clean(a['id'], 20)} failed ({code}): " + clean(text, 120)
+    try:
+        left = owner_sessions(state, bg_sessions(cfg, runner))
+    except Exception as exc:  # noqa: BLE001
+        return "could not confirm the stop: " + clean(str(exc), 120)
+    if left:
+        return "still live after stop: " + ", ".join(clean(a.get("id") or a.get("sessionId"), 20) for a in left[:5])
+    return ""
+
+
 def owner_sessions(state: dict, sessions: list) -> list:
     """Live (pid) background sessions of this owner: its recorded session id, or any session named owner-<goal>
     (a launch whose id lookup failed is still found by name)."""
@@ -821,9 +847,15 @@ def tick_one(home: Path, goal: str, goal_row: dict, cfg: dict, sessions: list, n
             out["argv"] = argv
             return out
         if status == "idle":  # stop every idle session of this owner first: never two at once
-            for a in owner_sessions(state, sessions):
-                if a.get("id"):
-                    runner([cfg["claude"], "stop", str(a["id"])], 30)
+            problem = stop_idle_sessions(cfg, state, runner)
+            if problem:  # receipt v3 F3: no launch unless every old session is proven stopped
+                entry = {"ts": now, "at": now_iso(now), "reason": reason, "fresh": fresh, "code": -1, "bg_id": "",
+                         "out": clean("replace refused: " + problem, 200)}
+                state["launches"] = (state.get("launches") or [])[-49:] + [entry]  # counts toward the hourly brake
+                save_state(home, goal, state)
+                _append(goal_dir(home, goal) / "launch.log", entry)
+                out.update(action="launch-failed", reason="replace refused: " + problem)
+                return out
         code, text = runner(argv + [prompt], 90, cwd=state["cwd"])  # the session's workspace is its cwd
         m = re.search(r"backgrounded\s*\S*\s*([0-9a-f]{6,12})", text)
         entry = {"ts": now, "at": now_iso(now), "reason": reason, "fresh": fresh, "code": code,
