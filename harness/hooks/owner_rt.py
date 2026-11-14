@@ -271,13 +271,41 @@ def chooses_bypass(source) -> bool:
         excerpt = str(provenance.parse_source(source).get("excerpt") or "")
     except Exception:  # noqa: BLE001
         return False
-    return affirms(excerpt, BYPASS_WORD) and user_decided(source)
+    return bool(decision_clauses(excerpt, BYPASS_WORD, BYPASS_LEAD)) and user_decided(source)
 
 
-def affirms(excerpt: str, word: "re.Pattern") -> bool:
-    """True when the user's excerpt states the intent `word` names and carries no negation anywhere (a negated or
-    mixed excerpt never authorizes: "never park solve", "don't bypass")."""
-    return bool(word.search(excerpt or "")) and not NEGATION.search(excerpt or "")
+BYPASS_LEAD = r"(?:bypass(?:permissions)?|use|choose|pick|go with|switch to|run with|run in|set|enable|allow)"
+# receipt v4 F2: questions, conditionals and hedges are never decisions (fail closed)
+UNDECIDED = re.compile(r"\?|\b(?:if|when|whenever|unless|once|in case|provided|assuming|suppose|supposing|should|"
+                       r"could|would|might|may|maybe|perhaps|probably|possibly|whether|wonder|consider|thinking)\b",
+                       re.I)
+OPENER = re.compile(r"^\s*(?:what|why|how|which|who|whom|where|do|does|did|is|are|was|were|can|will|shall|have|has)\b",
+                    re.I)
+FILLERS = (r"(?:(?:yes|yeah|yep|ok|okay|sure|please|just|now|then|and|so|right|go ahead and|let'?s|lets|you can|"
+           r"i want you to|i'd like you to|we will|we'll)[\s,]+)*")
+CLAUSE_SPLIT = re.compile(r"[;,.!?:\n()]+|\b(?:and|but|then|while|whereas|so|also)\b", re.I)
+
+
+def decision_clauses(excerpt: str, word: "re.Pattern", lead: str) -> list:
+    """The clauses of the user's excerpt that state the intent `word` as an explicit affirmative imperative: the
+    clause begins (after fillers such as "yes", "ok", "please") with one of the `lead` verbs. Nothing counts when the
+    excerpt carries a question, a conditional or hedge, an interrogative opener, or a negation or exclusion anywhere
+    ("What does bypassPermissions do?", "Should we park solve?", "If the release fails we should park solve",
+    "never park solve"). Fail closed: [] means no decision."""
+    text = excerpt or ""
+    if not text.strip() or NEGATION.search(text) or UNDECIDED.search(text) or OPENER.match(text):
+        return []
+    lead_re = re.compile(r"^\s*" + FILLERS + lead + r"\b", re.I)
+    out = []
+    for clause in CLAUSE_SPLIT.split(text):
+        if clause and word.search(clause) and lead_re.match(clause):
+            out.append(clause)
+    return out
+
+
+def affirms(excerpt: str, word: "re.Pattern", lead: str = "") -> bool:
+    """True when some clause states `word` as an explicit affirmative imperative (see decision_clauses)."""
+    return bool(decision_clauses(excerpt, word, lead or r"\w+"))
 
 
 def claude_bin() -> str:
@@ -846,20 +874,35 @@ def tick_one(home: Path, goal: str, goal_row: dict, cfg: dict, sessions: list, n
         if dry_run:
             out["argv"] = argv
             return out
+        # receipt v4 F3: the attempt is on disk before any `claude stop` or launch runs, so an exception, a timeout
+        # or a killed tick still counts toward min_gap and the hourly brake; it is finalized below
+        entry = {"ts": now, "at": now_iso(now), "reason": reason, "fresh": fresh, "code": None, "bg_id": "",
+                 "out": "attempt started"}
+        state["launches"] = (state.get("launches") or [])[-49:] + [entry]
+        save_state(home, goal, state)
+
+        def finish(code, text):
+            entry.update(code=code, out=clean(text, 200))
+            save_state(home, goal, state)
+            _append(goal_dir(home, goal) / "launch.log", entry)
+
         if status == "idle":  # stop every idle session of this owner first: never two at once
-            problem = stop_idle_sessions(cfg, state, runner)
+            try:
+                problem = stop_idle_sessions(cfg, state, runner)
+            except Exception as exc:  # noqa: BLE001
+                problem = "stop raised " + clean(f"{type(exc).__name__}: {exc}", 120)
             if problem:  # receipt v3 F3: no launch unless every old session is proven stopped
-                entry = {"ts": now, "at": now_iso(now), "reason": reason, "fresh": fresh, "code": -1, "bg_id": "",
-                         "out": clean("replace refused: " + problem, 200)}
-                state["launches"] = (state.get("launches") or [])[-49:] + [entry]  # counts toward the hourly brake
-                save_state(home, goal, state)
-                _append(goal_dir(home, goal) / "launch.log", entry)
+                finish(-1, "replace refused: " + problem)
                 out.update(action="launch-failed", reason="replace refused: " + problem)
                 return out
-        code, text = runner(argv + [prompt], 90, cwd=state["cwd"])  # the session's workspace is its cwd
+        try:
+            code, text = runner(argv + [prompt], 90, cwd=state["cwd"])  # the session's workspace is its cwd
+        except Exception as exc:  # noqa: BLE001
+            finish(-2, f"launch raised {type(exc).__name__}: {exc}")
+            out.update(action="launch-failed", reason=clean(f"launch raised {type(exc).__name__}: {exc}", 200))
+            return out
         m = re.search(r"backgrounded\s*\S*\s*([0-9a-f]{6,12})", text)
-        entry = {"ts": now, "at": now_iso(now), "reason": reason, "fresh": fresh, "code": code,
-                 "bg_id": m.group(1) if m else "", "out": clean(text, 200)}
+        entry.update(code=code, bg_id=m.group(1) if m else "", out=clean(text, 200))
         if code == 0:
             sid = ""
             with contextlib.suppress(Exception):
@@ -874,10 +917,7 @@ def tick_one(home: Path, goal: str, goal_row: dict, cfg: dict, sessions: list, n
             out["bg_id"] = entry["bg_id"]
         else:
             out.update(action="launch-failed", reason=clean(text, 200))
-        state.setdefault("launches", []).append(entry)
-        state["launches"] = state["launches"][-50:]
-        save_state(home, goal, state)
-        _append(goal_dir(home, goal) / "launch.log", entry)
+        finish(code, text)
         return out
 
 
@@ -1155,6 +1195,7 @@ def build_parser():
         f.add_argument("--goal", required=True)
         f.add_argument("--source", required=True)
     sub.add_parser("stop", help="Stop hook (reads the hook payload on stdin)")
+    _no_abbrev(p)
     return p
 
 
@@ -1211,6 +1252,39 @@ def authorize(argv, home: Path, goal: str) -> None:
                      + (" or this goal's owner session" if need == "main-or-owner" else "") + " may run it")
 
 
+REPEATABLE = {"--evidence"}
+
+
+def argv_problem(argv) -> str:
+    """receipt v4 F1: authorization reads the goal and command from argv while argparse executes its own reading, so
+    the two must agree: a repeated option (`--goal a --goal b`: argparse keeps the last) is refused before anything
+    else. Abbreviations are off in build_parser, so `--goa b` is an error, not a second spelling of --goal."""
+    seen = set()
+    for a in argv or []:
+        a = str(a)
+        if not a.startswith("--"):
+            continue
+        flag = a.split("=", 1)[0]
+        if flag in seen and flag not in REPEATABLE:
+            return f"option {flag} is given more than once"
+        seen.add(flag)
+    return ""
+
+
+def canonical_name(args) -> str:
+    if args.cmd == "task":
+        return "task drop" if args.tcmd == "move" and getattr(args, "to", "") == "dropped" else f"task {args.tcmd}"
+    return str(args.cmd)
+
+
+def _no_abbrev(parser) -> None:
+    parser.allow_abbrev = False
+    for action in parser._actions:  # noqa: SLF001 - argparse keeps subparsers here
+        if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+            for sub in action.choices.values():
+                _no_abbrev(sub)
+
+
 def _goal_arg(argv) -> str:
     argv = [str(a) for a in argv]
     for i, a in enumerate(argv):
@@ -1226,12 +1300,22 @@ def main(argv=None) -> int:
     if argv[:1] == ["stop"]:
         return cmd_stop(sys.stdin)
     home = home_dir()
+    problem = argv_problem(argv)
+    if problem:
+        print(f"owner_rt: {problem}", file=sys.stderr)
+        return 2
+    name, goal = guarded_name(argv), _goal_arg(argv)
     try:
-        authorize(argv, home, _goal_arg(argv))  # before parsing: a failing command still burns its stamp
+        authorize(argv, home, goal)  # before parsing: a failing command still burns its stamp
     except OwnerError as exc:
         print(f"owner_rt: {exc}", file=sys.stderr)
         return 2
     args = build_parser().parse_args(argv)
+    canon = canonical_name(args)
+    if (canon in GUARDED or name in GUARDED) and (canon != name or str(getattr(args, "goal", "")) != goal):
+        print(f"owner_rt: authorized `{name}` for goal {goal!r} but the command parses as `{canon}` for goal "
+              f"{getattr(args, 'goal', '')!r}; refused", file=sys.stderr)
+        return 2
     try:
         if args.cmd == "init":
             out = init_owner(home, args.goal, args.cwd, args.source, args.model, args.ticket)

@@ -474,21 +474,17 @@ def episode_start(home: Path, key: str, now: float) -> float:
 
 
 PRE_EPISODE_S = 3600
+PARK_LEAD = r"(?:park|defer|pause|shelve|deprioriti[sz]e|backburner|put|move|set|mark|hold)"
 PARK_INTENT = re.compile(r"\b(?:park|parked|parking|defer|deferred|deferring|pause|paused|on hold|shelve|shelved|"
                          r"deprioriti[sz]e[d]?|backburner|back burner)\b", re.I)  # no bare "later"/"hold"
-CLAUSE_SPLIT = re.compile(r"[;,.!?:\n()]+|\b(?:and|but|then|while|whereas|so|also)\b", re.I)
 
 
 def park_binds(excerpt: str, goal_id: str, goals: dict) -> bool:
     """Receipt v3 F1: the park verb must govern the requested goal. Some clause of the user's words holds a park verb
     and names exactly one goal of goals.json, the requested one; "keep solve moving; park leads" never parks solve,
     nor does "park leads until solve ships". No negation anywhere (owner_rt.affirms)."""
-    if not ort.affirms(excerpt, PARK_INTENT):
-        return False
     mc = _mc()
-    for clause in CLAUSE_SPLIT.split(excerpt or ""):
-        if not clause or not PARK_INTENT.search(clause):
-            continue
+    for clause in ort.decision_clauses(excerpt, PARK_INTENT, PARK_LEAD):  # receipt v4 F2: imperative, fail closed
         named = {gid for gid, g in goals.items()
                  if gid.lower() in re.findall(r"[a-z0-9_-]+", clause.lower()) or mc.names_goal(clause, dict(g, id=gid))}
         if named == {goal_id}:

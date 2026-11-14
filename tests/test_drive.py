@@ -259,6 +259,18 @@ class ResponseTests(Base):
             for words in ("keep leads moving; park solve until Monday", "put solve on hold"):
                 drive.respond(self.home, "solve", "UNOWNED", "park", source=f'user:{sess} "{words}"', now=NOW)
 
+    def test_response_park_questions_and_conditionals_refused(self):
+        """Receipt v4 F2: "Should we park solve?" or a conditional park is not the user parking solve."""
+        import mission_coverage as mc
+        sess = "baab765b-d85c-46b4-b7b9-588eb912c770/11111111-2222-4333-8444-555555555555"
+        with mock.patch.object(mc, "verify_user_source", return_value=True):
+            for words in ("Should we park solve?", "Should we park solve", "If the release fails we should park solve",
+                          "park solve?", "when leads ships, park solve", "do we park solve", "maybe park solve",
+                          "we could defer solve", "unless it lands today, park solve", "solve parked"):
+                with self.assertRaises(drive.DriveError, msg=words):
+                    drive.respond(self.home, "solve", "UNOWNED", "park", source=f'user:{sess} "{words}"', now=NOW)
+            drive.respond(self.home, "solve", "UNOWNED", "park", source=f'user:{sess} "yes, park solve"', now=NOW)
+
     def test_release_uses_deploy_event_time_not_attach_time(self):
         """Receipt v3 F2: an older deploy attached after the merge is not a newer release."""
         import datetime as dt

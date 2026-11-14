@@ -398,6 +398,46 @@ class TickTests(Base):
         self.assertNotIn(["claude", "stop", "8d84dcef"], self.calls)
         self.assertEqual([c for c in self.calls if "--bg" in c], [])
 
+    def test_tick_attempt_recorded_before_launch_and_on_exception(self):
+        """Receipt v4 F3: the attempt is on disk before the launch runs; an exception still counts for the brakes."""
+        ort.add_task(self.home, "solve", "fix login", "ticket:goodqa#2")
+        seen = []
+
+        def runner(argv, timeout=60, cwd=None):
+            if argv[1:2] == ["agents"]:
+                return 0, json.dumps([a for a in self.sessions if a.get("pid")])
+            if argv[1:2] == ["stop"]:
+                for a in self.sessions:
+                    a["pid"] = None if a.get("id") == argv[2] else a.get("pid")
+                return 0, ""
+            if "--bg" in argv:
+                seen.append(ort.load_state(self.home, "solve")["launches"][-1]["code"])
+                raise subprocess.TimeoutExpired(argv[:2], 90)
+            return 0, ""
+        out = ort.tick(self.home, now=NOW, runner=runner)
+        self.assertEqual(seen, [None])  # pending attempt already saved when the launch ran
+        self.assertEqual(out[0]["action"], "launch-failed")
+        st = ort.load_state(self.home, "solve")
+        self.assertEqual([x["code"] for x in st["launches"]], [-2])
+        self.assertIn("TimeoutExpired", (self.home / ".agent-harness/owners/solve/launch.log").read_text())
+        self.assertEqual(ort.tick(self.home, now=NOW + 30, runner=runner)[0]["reason"], "min gap")
+
+    def test_tick_stop_exception_recorded_and_braked(self):
+        ort.add_task(self.home, "solve", "fix login", "ticket:goodqa#2")
+
+        def runner(argv, timeout=60, cwd=None):
+            if argv[1:2] == ["agents"]:
+                return 0, json.dumps(self.sessions)
+            if argv[1:2] == ["stop"]:
+                raise subprocess.TimeoutExpired(argv[:2], 30)
+            if "--bg" in argv:
+                self.fail("must not launch after a stop raised")
+            return 0, ""
+        out = ort.tick(self.home, now=NOW, runner=runner)
+        self.assertEqual(out[0]["action"], "launch-failed")
+        self.assertEqual([x["code"] for x in ort.load_state(self.home, "solve")["launches"]], [-1])
+        self.assertEqual(ort.tick(self.home, now=NOW + 30, runner=runner)[0]["reason"], "min gap")
+
     def test_tick_resumes_idle_owner_with_actionable_task(self):
         proj = self.home / ".claude" / "projects" / "-x"
         proj.mkdir(parents=True)
@@ -593,6 +633,21 @@ class HardeningTests(Base):
         with mock.patch.object(ort, "user_decided", return_value=False):  # not the user's own turn
             self.assertEqual(ort.runtime(self.home)["permission_mode"], "auto")
 
+    def test_runtime_bypass_questions_and_conditionals_never_decide(self):
+        """Receipt v4 F2: a question, conditional or hedge is not a decision; an explicit imperative is."""
+        sess = "baab765b-d85c-46b4-b7b9-588eb912c770/ecc9bdf8-0000-4000-8000-000000000000"
+        with mock.patch.object(ort, "user_decided", return_value=True):
+            for words in ("What does bypassPermissions do", "What does bypassPermissions do?", "Should we use bypass",
+                          "If tests pass, use bypass", "bypass would be nice", "maybe bypass", "use bypass when ready",
+                          "is bypass on", "I wonder about bypass", "owners in bypass mode", "Can owners bypass"):
+                self.write_runtime({"enabled": True, "permission_mode": "bypassPermissions",
+                                    "permission_source": f'user:{sess} "{words}"'})
+                self.assertEqual(ort.runtime(self.home)["permission_mode"], "auto", words)
+            for words in ("Bypass, like main", "yes, use bypassPermissions for owners", "ok bypass"):
+                self.write_runtime({"enabled": True, "permission_mode": "bypassPermissions",
+                                    "permission_source": f'user:{sess} "{words}"'})
+                self.assertEqual(ort.runtime(self.home)["permission_mode"], "bypassPermissions", words)
+
     def test_runtime_bypass_words_must_choose_bypass(self):
         """Delta D3: a genuine user turn that does not choose bypass never unlocks it."""
         sess = "baab765b-d85c-46b4-b7b9-588eb912c770/ecc9bdf8-0000-4000-8000-000000000000"
@@ -646,6 +701,55 @@ class HardeningTests(Base):
                 with mock.patch("sys.stderr"):
                     self.assertEqual(ort.main(argv), 2, argv)
         self.assertEqual(ort.inbox_rows(self.home, "solve"), [])
+
+    def test_cli_duplicate_or_abbreviated_goal_refused(self):
+        """Receipt v4 F1: authorization and execution must read the same goal: a repeated --goal (argparse keeps the
+        last) or an abbreviated spelling never lets one owner act on another goal."""
+        self.init()
+        self.set_session()
+        (self.home / "repo2").mkdir()
+        ort.init_owner(self.home, "shipped", str(self.home / "repo2"), "ticket:goodqa#1")
+        import caller_identity
+        import mission_coverage
+        add = ["task", "add", "--goal", "solve", "--text", "t", "--source", "ticket:goodqa#1"]
+        ort.add_task(self.home, "shipped", "victim", "ticket:goodqa#1")
+        bad = [add + ["--goal", "shipped"], add + ["--goal=shipped"], add[:4] + ["--goa", "shipped"] + add[4:],
+               ["task", "move", "--goal", "solve", "--task", "t1", "--to", "dropped", "--goal", "shipped"],
+               ["task", "move", "--goal=solve", "--task", "t1", "--to=dropped", "--goal=shipped"]]
+        with mock.patch.object(mission_coverage, "mission_session_of", return_value="main-session-0000"), \
+                mock.patch.object(caller_identity, "take_stamp", return_value={"session": SID}), \
+                mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            for argv in bad:
+                try:
+                    code = ort.main(argv)
+                except SystemExit as exc:
+                    code = exc.code
+                self.assertEqual(code, 2, argv)
+        rows = ort.inbox_rows(self.home, "shipped")
+        self.assertEqual([r.get("text") for r in rows if r.get("text")], ["victim"])
+        self.assertEqual(ort.tasks(rows)["t1"]["state"], "queued")
+
+    def test_cli_goal_layers_each_hold(self):
+        """Receipt v4 F1, each layer alone: the repeat check, the parser without abbreviations, and the post-parse
+        cross-check of command and goal."""
+        add = ["task", "add", "--goal", "solve", "--text", "t", "--source", "ticket:goodqa#1"]
+        self.assertIn("--goal", ort.argv_problem(add + ["--goal", "shipped"]))
+        self.assertIn("--goal", ort.argv_problem(add + ["--goal=shipped"]))
+        self.assertEqual(ort.argv_problem(["beat", "--goal", "solve", "--evidence", "a", "--evidence", "b"]), "")
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            ort.build_parser().parse_args(add[:4] + ["--goa", "shipped"] + add[4:])
+        self.init()
+        self.set_session()
+        (self.home / "repo2").mkdir()
+        ort.init_owner(self.home, "shipped", str(self.home / "repo2"), "ticket:goodqa#1")
+        import caller_identity
+        import mission_coverage
+        with mock.patch.object(ort, "argv_problem", return_value=""), \
+                mock.patch.object(mission_coverage, "mission_session_of", return_value="main-session-0000"), \
+                mock.patch.object(caller_identity, "take_stamp", return_value={"session": SID}), \
+                mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            self.assertEqual(ort.main(add + ["--goal", "shipped"]), 2)  # the cross-check alone refuses it
+        self.assertEqual(ort.inbox_rows(self.home, "shipped"), [])
 
     def test_cli_task_add_by_owner_session_or_main(self):
         self.init()
