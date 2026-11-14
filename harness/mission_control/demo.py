@@ -340,6 +340,8 @@ def owners_payload(now: float) -> dict:
                "type": "task-owner", "last_activity": _iso(now - idle)}
         if disposition:
             row["disposition"] = {**disposition, "until": now + 6 * 3600}
+        if agent == "a5drop0demo":
+            row["decision_required"] = True  # goodqa#15920: shows the never-folded "needs a decision" row
         rows.append(row)
     for agent, kind, state, ticket, idle, parent in HELPERS:
         rows.append({"agent_id": agent, "state": state, "task": f"{kind} pass", "ticket": ticket, "idle_s": idle,

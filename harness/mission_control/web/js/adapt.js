@@ -53,7 +53,8 @@ export function owners(rows, items = []) {
   if (!Array.isArray(rows)) return [];
   const out = rows.filter(r => r && typeof r === 'object' && r.agent_id).map(r => {
     const id = str(r.agent_id, 80);
-    const linked = items.find(i => (ownerKey(i.owner) && id.toLowerCase().startsWith(ownerKey(i.owner))) || (r.ticket && i.ticket === r.ticket));
+    // goodqa#15920: tickets compare by key, so "GoodQA goodqa#1" on an owner links to "goodqa#1" on an initiative
+    const linked = items.find(i => (ownerKey(i.owner) && id.toLowerCase().startsWith(ownerKey(i.owner))) || (r.ticket && i.ticket && ticketKey(i.ticket) === ticketKey(r.ticket)));
     const last = r.last_item && typeof r.last_item === 'object' ? r.last_item : null;
     const at = validIso(last?.at) || null;
     const active = [validIso(last?.active_at), at, validIso(r.last_activity)].filter(Boolean).sort().pop() || null;

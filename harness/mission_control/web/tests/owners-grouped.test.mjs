@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { owners as adaptOwners, initiatives as adaptInitiatives, missionTiles, ledger } from '../js/adapt.js';
-import { ownerGroups, ownerCounts, foldLabel, summaryLine, UNLINKED } from '../js/owner-groups.js';
+import { ownerGroups, ownerCounts, foldLabel, summaryLine, UNLINKED, ownersStale } from '../js/owner-groups.js';
 import { inventory } from '../js/ledger-views.js';
 import { text } from './dom-shim.mjs';
 
@@ -145,4 +145,22 @@ test('the default filter is the grouped live view and the panel has a summary li
   const html = readFileSync(`${here}index.html`, 'utf8');
   assert.match(html, /<option value="active" selected>Live owners by initiative<\/option>/);
   assert.match(html, /id="owner-summary"/);
+});
+
+test('a failed first ah read with no rows is shown as stale, not as a current 0', () => {
+  assert.equal(ownersStale({ owners: [], sources: [{ id: 'owners', state: 'error' }] }), true);
+  assert.equal(ownersStale({ owners: [], sources: [{ id: 'owners', state: 'ok' }] }), false);
+  assert.equal(ownersStale({ owners: adaptOwners([row('a1', 'live', 'live', { ah_stale: true })], []), sources: [] }), true);
+  assert.match(summaryLine(ownerCounts([]), { stale: ownersStale({ owners: [], sources: [{ id: 'owners', state: 'error' }] }) }), /^0 live owners per ah owners, STALE/);
+});
+
+test('group headings count ah slot holders, with live Codex apart, so they sum to the headline', () => {
+  const groups = ownerGroups(OWNERS, INITS);
+  assert.equal(groups.reduce((n, g) => n + g.liveCount, 0), ownerCounts(OWNERS).live);
+  assert.equal(groups.reduce((n, g) => n + g.codexLive, 0), ownerCounts(OWNERS).codexLive);
+});
+
+test('tickets link by key: "GoodQA goodqa#1" on an owner joins the goodqa#1 initiative', () => {
+  const [o] = adaptOwners([row('a7tick000000000001', 'live', 'live', { ticket: 'GoodQA goodqa#1' })], INITS);
+  assert.equal(o.initiative_id, 'checkout');
 });

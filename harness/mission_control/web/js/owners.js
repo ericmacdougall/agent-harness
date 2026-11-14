@@ -1,6 +1,6 @@
 import { getState, subscribe, select, update, highlight } from './store.js';
 import { el, button, age, freshness, stateClass } from './ui.js';
-import { ownerGroups, ownerCounts, foldLabel, summaryLine, isHelper } from './owner-groups.js';
+import { ownerGroups, ownerCounts, foldLabel, summaryLine, isHelper, ownersStale } from './owner-groups.js';
 
 export const OWNERS_SHOWN = 8;
 const ACTIVE = /^(live|working|finishing|waiting|blocked|error|offline|observed|stale|unknown)/;
@@ -133,7 +133,7 @@ export function mountOwners() {
         parts = { section, heading, liveBox, empty, fold, body };
         groups.set(id, parts);
       }
-      parts.heading.textContent = `${group.label} · ${group.liveCount} live${group.decide.length ? ` · ${group.decide.length} need a decision` : ''}`;
+      parts.heading.textContent = `${group.label} · ${group.liveCount} live${group.codexLive ? ` · ${group.codexLive} live Codex` : ''}${group.decide.length ? ` · ${group.decide.length} need a decision` : ''}`;
       const liveNodes = [...group.live, ...group.decide].flatMap(entry => [place(entry.owner, group, null), ...entry.helpers.map(h => place(h, group, entry.owner))]);
       syncChildren(parts.liveBox, liveNodes.length ? liveNodes : [parts.empty]);
       const open = Boolean(folds[group.id]) && group.foldCount > 0;
@@ -180,7 +180,7 @@ export function mountOwners() {
     }
     lastPlaced = placed.size ? placed : lastPlaced;
     const counts = ownerCounts(state.owners);
-    const stale = state.owners.some(owner => owner.source === 'ah' && (owner.ah_stale || owner.source_stale));
+    const stale = ownersStale(state);
     const session = state.owners.find(owner => owner.source === 'ah' && owner.session)?.session || '';
     const count = document.getElementById('owner-count');
     count.textContent = String(counts.live).padStart(2, '0');
@@ -189,7 +189,7 @@ export function mountOwners() {
   }
   render(getState());
   subscribe((state, reason) => {
-    if (['event', 'owners', 'owner-filter', 'initiatives'].includes(reason)) render(state);
+    if (['event', 'owners', 'owner-filter', 'initiatives', 'health'].includes(reason)) render(state);
     if (reason === 'tick') rows.forEach(({ time }) => { time.textContent = age(time.dateTime, state.now); time.className = `owner-age ${freshness(time.dateTime, state.now)}`; });
     if (reason === 'highlight') rows.forEach(({ row }, id) => row.classList.toggle('is-highlighted', id === state.highlight));
   });

@@ -31,7 +31,7 @@ export function ownerGroups(owners = [], initiatives = []) {
   const group = id => {
     if (!groups.has(id)) {
       const item = initiatives.find(i => i.id === id);
-      groups.set(id, { id, label: item ? item.initiative : 'Not linked to an initiative', live: [], decide: [], parked: [], loose: [], attention: 0, liveCount: 0, foldCount: 0 });
+      groups.set(id, { id, label: item ? item.initiative : 'Not linked to an initiative', live: [], decide: [], parked: [], loose: [], attention: 0, liveCount: 0, codexLive: 0, foldCount: 0 });
     }
     return groups.get(id);
   };
@@ -41,7 +41,8 @@ export function ownerGroups(owners = [], initiatives = []) {
     const g = group(owner.initiative_id || UNLINKED);
     const entry = { owner, helpers: [], doneHelpers: [] };
     entries.set(owner.agent_id, entry);
-    if (owner.role === 'live') { g.live.push(entry); g.liveCount++; }
+    // liveCount: ah slot holders (the headline's unit); codexLive apart, so group headings sum to the headline
+    if (owner.role === 'live') { g.live.push(entry); owner.source === 'ah' ? g.liveCount++ : g.codexLive++; }
     // a parked owner that needs main's decision never folds away: it shows under the live owners, uncounted
     else if (owner.decision_required) g.decide.push(entry);
     else { g.parked.push(entry); g.foldCount++; if (needsAttention(owner)) g.attention++; }
@@ -57,7 +58,7 @@ export function ownerGroups(owners = [], initiatives = []) {
     else { entry.helpers.push(helper); g.foldCount++; if (needsAttention(helper)) g.attention++; }
   }
   const order = new Map(initiatives.map((item, index) => [item.id, index]));
-  return [...groups.values()].sort((a, b) => (b.liveCount > 0) - (a.liveCount > 0)
+  return [...groups.values()].sort((a, b) => (b.live.length > 0) - (a.live.length > 0)
     || (a.id === UNLINKED) - (b.id === UNLINKED) || (order.get(a.id) ?? 1e9) - (order.get(b.id) ?? 1e9));
 }
 
@@ -69,4 +70,12 @@ export function summaryLine(counts, { session = '', stale = false } = {}) {
   return [`${counts.live} live ${counts.live === 1 ? 'owner' : 'owners'} per ah owners${session ? ` (session ${session.slice(0, 8)})` : ''}${stale ? ', STALE: last read failed' : ''}`,
     `${counts.codexLive} live Codex`, `${counts.parked} parked or history`, `${counts.helpers} helpers`,
     counts.attention ? `${counts.attention} need attention` : ''].filter(Boolean).join(' · ');
+}
+
+// The ah read is stale when the rows say so, or when the owners source itself failed (a first read that failed leaves
+// no rows to carry the flag, and "0 live" must not look current).
+export function ownersStale(state = {}) {
+  const rows = (state.owners || []).some(owner => owner.source === 'ah' && (owner.ah_stale || owner.source_stale));
+  const source = (state.sources || []).find(s => s.id === 'owners');
+  return rows || Boolean(source && ['error', 'stale'].includes(source.state));
 }
