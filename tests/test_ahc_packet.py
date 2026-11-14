@@ -87,6 +87,38 @@ class LintFixTests(unittest.TestCase):
         self.assertTrue(ahc_packet.conserved("a\n\n```\nb\n```\n", "a\n```\n\nb\n```"))
 
 
+    # spec-v8 adversarial delta F3: a same-lines rewrite can still change what the evidence means.
+    TWO = f"""head {HEAD}
+## Run at head
+```
+$ cmd-one
+# pass 5
+exit 0
+```
+## Failing-first on base
+```
+$ cmd-two
+# fail 3
+exit 1
+```
+"""
+
+    def test_conservation_rejects_swapped_result_lines(self):
+        swapped = self.TWO.replace("exit 0", "EXIT_A").replace("exit 1", "exit 0").replace("EXIT_A", "exit 1")
+        self.assertFalse(ahc_packet.conserved(self.TWO, swapped))
+
+    def test_conservation_rejects_evidence_moved_between_headings(self):
+        moved = self.TWO.replace("## Run at head\n", "").replace("## Failing-first on base\n", "## Run at head\n")
+        moved = "## Failing-first on base\n" + moved
+        self.assertFalse(ahc_packet.conserved(self.TWO, moved))
+
+    def test_fix_preserves_line_order(self):
+        fixed = ahc_packet.fix_layout(BROKEN)
+        def seq(text):
+            return [n for n in (ahc_packet._normalize(x) for x in text.splitlines()) if n is not None]
+        self.assertEqual(seq(BROKEN), seq(fixed))
+
+
 FULL_HEAD = "ad60fa6d9a6e97059326697aa99470afd8866576"
 LONG_CMD = "cd platform && node --test --test-reporter=tap test/one.test.js test/two.test.js"
 
@@ -177,6 +209,14 @@ class RealShapeTests(unittest.TestCase):
         far = far.replace("Result: 114 passed, 17 failed on base, exit 1 (expected).", "Result: see above")
         self.assertIsNone(ahc_packet.fix_layout(far))
 
+    def test_prose_exit_below_the_fence_is_not_associated(self):
+        # NEG-4: an earlier run's "exit 0" two lines below must not become this command's exit status.
+        prose = PR783_V1.replace(
+            "```\nResult: 131 passed, 0 failed, 6 skipped (no PG in this run), exit 0",
+            "```\nResult: see tap file\nEarlier run at abc1234: 48 passed, exit 0", 1)
+        prose = prose.replace("Result: 114 passed, 17 failed on base, exit 1 (expected).", "Result: see tap file")
+        self.assertIsNone(ahc_packet.fix_layout(prose))
+
     def test_head_problem_filter_matches_lint_wording(self):
         problems = review_diagnostics.lint_packet("pr", "no head here", FULL_HEAD)
         self.assertTrue(any(p.startswith(ahc_packet._HEAD_PROBLEM) for p in problems))
@@ -189,7 +229,7 @@ class NoiseTests(unittest.TestCase):
         self.assertEqual(result["status"], "fixed", result)
         text = result["text"]
         self.assertNotIn("ResourceWarning: unclosed", text)
-        self.assertEqual(text.splitlines()[1], ahc_packet.NOTE_TEMPLATE.format(n=13, sha=ahc_packet.sha256_text(NOISY)))
+        self.assertEqual(text.splitlines()[1], ahc_packet.NOTE_TEMPLATE.format(n=7, sha=ahc_packet.sha256_text(NOISY)))
         self.assertTrue(ahc_packet.conserved(NOISY, text))
         self.assertEqual(review_diagnostics.lint_packet("pr", text, FULL_HEAD), [])
 
@@ -200,12 +240,19 @@ class NoiseTests(unittest.TestCase):
 
     def test_note_with_wrong_count_or_sha_is_rejected(self):
         text = ahc_packet.fix_layout(NOISY)
-        self.assertFalse(ahc_packet.conserved(NOISY, text.replace("removed 13 ", "removed 12 ")))
+        self.assertFalse(ahc_packet.conserved(NOISY, text.replace("removed 7 ", "removed 6 ")))
         self.assertFalse(ahc_packet.conserved(NOISY, text.replace(ahc_packet.sha256_text(NOISY), "a" * 64)))
 
     def test_note_cannot_launder_a_dropped_evidence_line(self):
         text = ahc_packet.fix_layout(NOISY)
         self.assertFalse(ahc_packet.conserved(NOISY, text.replace("Ran 10 tests in 0.1s\n", "")))
+
+    def test_indented_output_after_a_warning_is_kept(self):
+        follower = NOISY.replace("  method()\n", "  AssertionError: expected 3, got 4\n", 1)
+        self.assertNotIn("AssertionError: expected 3, got 4", "\n".join(ahc_packet.noise_lines(follower)))
+        text = ahc_packet.fix_layout(follower)
+        if text is not None:
+            self.assertIn("  AssertionError: expected 3, got 4", text)
 
     def test_noise_outside_a_fence_is_not_removed(self):
         outside = NOISY.replace("```\n" + NOISE, NOISE + "```\n")

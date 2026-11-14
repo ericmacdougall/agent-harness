@@ -39,18 +39,15 @@ _PROBE_HEAD = '0' * 40
 _BACKTICK_CMD = re.compile(r'^\s*`([^`\n]{2,})`\s*$')
 _DOLLAR_CMD = re.compile(r'^\s*(?:> ?)?\$ (.+)$')
 _HEADING = re.compile(r'^#{1,6} \S')
-# Python's warnings.formatwarning: "<file>:<line>: ResourceWarning: <msg>", then "  <source line>", plus the
-# interpreter's "ResourceWarning: Enable tracemalloc ..." hint.
+# Python's warnings.formatwarning line "<file>:<line>: ResourceWarning: <msg>" and the interpreter's "ResourceWarning: Enable tracemalloc ..." hint.
 _RW_LOCATED = re.compile(r'^\s*\S[^\n]*:\d+: ResourceWarning: ')
 _RW_HINT = re.compile(r'^\s*ResourceWarning: Enable tracemalloc to get the object allocation traceback\s*$')
-_RW_SOURCE = re.compile(r'^  \S')
 NOTE_RE = re.compile(r'^> ahc-fixer: removed (\d+) Python ResourceWarning noise line\(s\) from fenced output; '
                      r'original packet sha256 ([0-9a-f]{64})$')
 NOTE_TEMPLATE = ('> ahc-fixer: removed {n} Python ResourceWarning noise line(s) from fenced output; '
                  'original packet sha256 {sha}')
 
 LOOKBEHIND = 4   # non-blank lines searched above a fence for its command
-LOOKAHEAD = 3    # non-blank lines searched below a fence for its result line
 
 
 def sha256_text(text):
@@ -67,6 +64,13 @@ def _canon(line):
     if match:
         text = match.group(1).strip()
     return text
+
+
+def _normalize(line):
+    """Comparison form of one line, or None for a blank or fence line (which conservation ignores)."""
+    if not line.strip() or _FENCE.match(line):
+        return None
+    return _canon(line)
 
 
 def _content_lines(text):
@@ -91,20 +95,12 @@ def _fence_states(lines):
 
 
 def _noise_indexes(lines):
-    """Indexes of ResourceWarning noise lines inside fenced blocks."""
+    """Indexes of ResourceWarning noise lines inside fenced blocks. Only lines that name ResourceWarning qualify:
+    the indented source line Python prints after a warning is kept, because it cannot be told apart from output."""
     before, _ = _fence_states(lines)
-    found = []
-    for index, line in enumerate(lines):
-        if before[index] is None or _FENCE.match(line):
-            continue
-        if _RW_LOCATED.match(line) or _RW_HINT.match(line):
-            found.append(index)
-            follower = index + 1
-            if (follower < len(lines) and before[follower] is not None and _RW_SOURCE.match(lines[follower])
-                    and not _FENCE.match(lines[follower]) and not _EXIT.search(lines[follower])
-                    and not review_diagnostics._COUNT.search(lines[follower])):
-                found.append(follower)
-    return sorted(set(found))
+    return [index for index, line in enumerate(lines)
+            if before[index] is not None and not _FENCE.match(line)
+            and (_RW_LOCATED.match(line) or _RW_HINT.match(line))]
 
 
 def noise_lines(text):
@@ -174,20 +170,15 @@ def _find_command(lines, before, start):
 
 
 def _find_result(lines, end):
-    seen = 0
+    """The result line must be the first non-blank line after the fence, so prose further down (an earlier run's
+    "exit 0", say) is never associated with this command."""
     for index in range(end + 1, len(lines)):
         line = lines[index]
-        if _FENCE.match(line) or _HEADING.match(line):
-            return None
         if not line.strip():
             continue
-        if _EXIT.search(line):
-            return index
-        if _COMMAND.search(line):
+        if _FENCE.match(line) or _HEADING.match(line) or _COMMAND.search(line) or not _EXIT.search(line):
             return None
-        seen += 1
-        if seen >= LOOKAHEAD:
-            return None
+        return index
     return None
 
 
