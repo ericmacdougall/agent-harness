@@ -1378,8 +1378,12 @@ def pool_script(storage: str, mount: str, watch=()) -> str:
     only the watched VMs' image directories are measured."""
     dirs = " ".join(f"{mount}/images/{int(v)}" for v in watch)
     du = f"timeout 8 du -sk {dirs}; " if dirs else ""
-    return (f"echo '##PVESM'; timeout 8 pvesm status --storage {storage}; echo '##QM'; "
-            "for v in $(timeout 5 qm list | awk 'NR>1{print $1}'); do echo \"##VM $v\"; timeout 3 qm config \"$v\"; done; "
+    # ##RC lines carry each command's own exit status: the script's final echo would otherwise make a failed or
+    # timed out qm list or qm config look complete
+    return (f"echo '##PVESM'; timeout 8 pvesm status --storage {storage}; echo \"##RC PVESM $?\"; echo '##QM'; "
+            "l=$(timeout 5 qm list); echo \"##RC LIST $?\"; "
+            "for v in $(echo \"$l\" | awk 'NR>1{print $1}'); do echo \"##VM $v\"; timeout 3 qm config \"$v\"; "
+            "echo \"##RC $v $?\"; done; "
             f"echo '##DU'; {du}echo '##END'")
 
 
@@ -1415,6 +1419,10 @@ def parse_pool_probe(text: str, storage: str):
             cur, vm = m.group(1), None
             sections.setdefault(cur, [])
             continue
+        m = re.fullmatch(r"##RC (PVESM|LIST|\d{1,10}) (\d{1,3})", line)
+        if m:
+            sections.setdefault("RC", {})[m.group(1)] = int(m.group(2))
+            continue
         m = re.fullmatch(r"##VM (\d{1,10})", line)
         if m and cur == "QM":
             vm = int(m.group(1))
@@ -1426,13 +1434,17 @@ def parse_pool_probe(text: str, storage: str):
             sections[cur].append(line)
     if "END" not in sections:
         return None
-    status = parse_pool_status("\n".join(sections.get("PVESM", [])), storage)
+    rcs = sections.get("RC", {})
+    status = parse_pool_status("\n".join(sections.get("PVESM", [])), storage) if rcs.get("PVESM") == 0 else None
     if status is None:
         return None
+    list_ok = rcs.get("LIST") == 0
     vms = {}
     for vm_id, cfg in sections.get("VM", {}).items():
         total, unsized = 0.0, False
-        valid = any(POOL_CFG_KEY.match(l) for l in cfg)  # a real qm config always has memory/cores/name
+        # a real qm config always has memory/cores/name, and a read that failed, timed out or was cut (no status
+        # line) is incomplete however good its prefix looks
+        valid = any(POOL_CFG_KEY.match(l) for l in cfg) and rcs.get(str(vm_id)) == 0
         for line in cfg:
             m = POOL_DISK.match(line.strip())
             if not m and POOL_DISK_KEY.match(line.strip()) and "media=cdrom" not in line and ":" in line \
@@ -1454,7 +1466,7 @@ def parse_pool_probe(text: str, storage: str):
         m = re.fullmatch(r"(\d+)\s+\S*/images/(\d{1,10})", line.strip())
         if m:
             du[int(m.group(2))] = int(m.group(1)) * KIB
-    return {"status": status, "vms": vms, "du": du}
+    return {"status": status, "vms": vms, "du": du, "list_ok": list_ok}
 
 
 def pool_baseline(samples: list, now: float):
@@ -1521,6 +1533,7 @@ def _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, use
     def per_day(delta):
         return round(max(delta, 0) / GIB / days, 2) if days else None
 
+    complete = parsed["list_ok"] and all(v["gib"] is not None and not v["unsized"] for v in parsed["vms"].values())
     provisioned = [v["gib"] for v in parsed["vms"].values()]
     unsized = sorted(str(k) for k, v in parsed["vms"].items() if v["gib"] is None or v.get("unsized"))
     prov_gib = round(sum(g for g in provisioned if g), 2)
@@ -1533,8 +1546,9 @@ def _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, use
                        "actual_gib": None if actual is None else round(actual / GIB, 2),
                        "growth_gib_day": per_day(actual - old) if actual is not None and old is not None else None}
     detail = {"host": host[:64], "storage": storage, "used_pct": round(pct, 1), "free_bytes": int(avail),
-              "total_bytes": int(total), "total_gib": round(total / GIB, 2), "provisioned_gib": prov_gib,
-              "overcommit_ratio": round(prov_gib / (total / GIB), 2), "vms": vms, "unsized_vms": unsized}
+              "total_bytes": int(total), "total_gib": round(total / GIB, 2), "provisioned_gib": prov_gib if complete else None,
+              "overcommit_ratio": round(prov_gib / (total / GIB), 2) if complete else None,
+              "allocation_complete": complete, "vms": vms, "unsized_vms": unsized}
     sev = None
     if pct >= POOL_CRIT_PCT or free_gib < POOL_FLOOR_GIB:
         sev = "critical"
@@ -1545,7 +1559,11 @@ def _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, use
     if sev:
         out.append(alert("proxmox_pool", f"disk:volume:{base}", sev,
                          f"{host} {storage} pool {pct:.1f}% used, {free_gib:.0f} GiB free, "
-                         f"{detail['overcommit_ratio']}x overcommitted", detail))
+                         f"{detail['overcommit_ratio'] if complete else 'unknown'}x overcommitted", detail))
+    if not complete:  # never a low overcommit figure from a partial inventory
+        out.append(alert("proxmox_pool", f"disk:allocunknown:{base}", "warning",
+                         f"UNKNOWN: VM allocation on the {host} {storage} pool is incomplete; overcommit not computed",
+                         {"host": host[:64], "vms_unreadable": unsized, "list_ok": parsed["list_ok"]}))
     for v in watch:  # a watched VM that cannot be read must be visible even when the pool is below every threshold
         vm = parsed["vms"].get(v) or {}
         if vm.get("gib") is None or vm.get("unsized") or parsed["du"].get(v) is None:

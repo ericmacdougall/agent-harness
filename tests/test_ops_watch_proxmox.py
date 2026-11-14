@@ -42,12 +42,18 @@ QM = {
 DU = {100: 653, 102: 15, 103: 28, 105: 8, 106: 9, 108: 57, 109: 5, 15662: 13}
 
 
-def probe(pvesm_text=None, qm=None, du=None, end=True, extra=""):
+def probe(pvesm_text=None, qm=None, du=None, end=True, extra="", rc=None, list_rc=0):
+    """rc maps a VM id to its qm config exit status (default 0); list_rc is qm list's, None drops that line."""
     qm = QM if qm is None else qm
     du = DU if du is None else du
-    out = "##PVESM\n" + (pvesm() if pvesm_text is None else pvesm_text) + "##QM\n"
+    rc = rc or {}
+    out = "##PVESM\n" + (pvesm() if pvesm_text is None else pvesm_text) + "##RC PVESM 0\n##QM\n"
+    if list_rc is not None:
+        out += f"##RC LIST {list_rc}\n"
     for vm, cfg in qm.items():
         out += f"##VM {vm}\n{cfg}" + ("name: vm\n" if "scsi" in cfg and "name:" not in cfg else "")
+        if rc.get(vm, 0) is not None:
+            out += f"##RC {vm} {rc.get(vm, 0)}\n"
     out += "##DU\n" + "".join(f"{gib_kib(g)}\t/var/lib/vz/images/{vm}\n" for vm, g in du.items())
     return out + extra + ("##END\n" if end else "")
 
@@ -250,7 +256,7 @@ class RedTeamRound1Tests(Base):
     """F1 partial read is visible, F3 window to 48 h, F4 unsized/cdrom, F6 mount normalised."""
 
     def test_partial_read_below_every_threshold_still_raises_unknown_for_watched_vms(self):
-        text = "##PVESM\n" + pvesm(total_g=1000, used_g=500, avail_g=500) + "##QM\n##DU\n##END\n"
+        text = "##PVESM\n" + pvesm(total_g=1000, used_g=500, avail_g=500) + "##RC PVESM 0\n##QM\n##DU\n##END\n"
         got = self.run_check((0, text))[0]
         self.assertEqual(sorted(k for k in got if k.startswith("disk:vmunknown:")),
                          [f"disk:vmunknown:t2-proxmox:/var/lib/vz:{v}" for v in (102, 103)])
@@ -321,6 +327,71 @@ class IncompleteConfigTests(Base):
 PVESM_LOW = pvesm(total_g=1000, used_g=500, avail_g=500)
 
 
+class CompletionStatusTests(Base):
+    """PR review F1: the script exits 0 and prints ##END even when qm list or a qm config failed or timed out, so
+    each command's own status (##RC) decides whether its data is complete."""
+    ALLOC = "disk:allocunknown:t2-proxmox:/var/lib/vz"
+
+    def got(self, text):
+        return self.run_check((0, text))[0]
+
+    def test_config_that_fails_after_a_valid_prefix_is_unknown_not_zero(self):
+        qm = {**QM, 103: "name: gq-prod-db\nmemory: 8192\n"}  # prefix of a config that then timed out
+        got = self.got(probe(PVESM_LOW, qm=qm, rc={103: 124}))
+        self.assertIn("disk:vmunknown:t2-proxmox:/var/lib/vz:103", got)
+        self.assertIn(self.ALLOC, got)
+        self.assertNotIn("disk:vmunknown:t2-proxmox:/var/lib/vz:102", got)
+
+    def test_failure_after_one_sized_disk_does_not_pass_as_a_complete_subtotal(self):
+        qm = {**QM, 103: "name: gq-prod-db\nscsi0: local:103/vm-103-disk-0.raw,size=400G\n"}  # scsi1 (100G) was cut off
+        got = self.got(probe(qm=qm, rc={103: 124}))
+        d = got[KEY]["detail"]
+        self.assertIn("disk:vmunknown:t2-proxmox:/var/lib/vz:103", got)
+        self.assertIsNone(d["vms"]["103"]["allocated_gib"])
+        self.assertIsNone(d["overcommit_ratio"])
+        self.assertIsNone(d["provisioned_gib"])
+        self.assertFalse(d["allocation_complete"])
+        self.assertEqual(got[KEY]["severity"], "high")  # usable pool capacity numbers are kept
+
+    def test_missing_status_line_for_a_vm_is_incomplete(self):
+        got = self.got(probe(rc={102: None}))
+        self.assertIn("disk:vmunknown:t2-proxmox:/var/lib/vz:102", got)
+        self.assertIn(self.ALLOC, got)
+
+    def test_failed_vm_enumeration_is_unknown_and_keeps_pool_capacity(self):
+        got = self.got(probe(PVESM_LOW, qm={}, du=DU, list_rc=1))
+        self.assertIn(self.ALLOC, got)
+        self.assertEqual(sorted(k[-3:] for k in got if "vmunknown" in k), ["102", "103"])
+        high = self.got(probe(qm={}, list_rc=124))
+        self.assertEqual(high[KEY]["severity"], "high")
+        self.assertIsNone(high[KEY]["detail"]["overcommit_ratio"])
+        self.assertIn("unknown", high[KEY]["message"])
+
+    def test_missing_list_status_is_a_failed_enumeration(self):
+        self.assertIn(self.ALLOC, self.got(probe(list_rc=None)))
+
+    def test_partial_enumeration_with_one_failed_config_marks_allocation_unknown(self):
+        qm = {k: v for k, v in QM.items() if k in (102, 103, 105)}
+        got = self.got(probe(PVESM_LOW, qm=qm, rc={105: 1}))
+        self.assertIn(self.ALLOC, got)
+        self.assertNotIn("disk:vmunknown:t2-proxmox:/var/lib/vz:102", got)
+
+    def test_complete_read_reports_overcommit_and_no_allocunknown(self):
+        got = self.got(probe())
+        self.assertNotIn(self.ALLOC, got)
+        self.assertEqual(got[KEY]["detail"]["overcommit_ratio"], 1.68)
+        self.assertTrue(got[KEY]["detail"]["allocation_complete"])
+
+    def test_failed_pvesm_status_is_unusable_even_with_a_good_looking_table(self):
+        text = probe().replace("##RC PVESM 0", "##RC PVESM 124")
+        self.assertIn(UNKNOWN, self.got(text))
+
+    def test_script_records_each_command_status(self):
+        script = ow.pool_script("local", "/var/lib/vz", [102])
+        for marker in ('echo "##RC PVESM $?"', 'echo "##RC LIST $?"', 'echo "##RC $v $?"'):
+            self.assertIn(marker, script)
+
+
 class RealFormatTests(Base):
     """Recorded from the live t2-proxmox pool on 2026-11-13: the header carries (KiB) units."""
 
@@ -359,18 +430,20 @@ class CommandAndConfigTests(Base):
         self.assertEqual(argv[-3:-1], ["--", "t2-proxmox"])
         self.assertLessEqual(timeout, 30)
         script = argv[-1]
+        scrubbed = re.sub(r"'##[A-Z ]+'", "", script)
+        scrubbed = re.sub(r'"##[A-Za-z ]*(\$[a-z?]|[A-Z]+)[^"]*"', "", scrubbed)  # echoed markers and their $? / $v
+        scrubbed = scrubbed.replace("l=$(timeout 5 qm list)", "").replace("""$(echo "$l" | awk 'NR>1{print $1}')""", "")
         for verb in ("fstrim", "resize", "destroy", "set", "create", "start", "stop", "shutdown", "migrate", "rm ",
                      "mv ", "delete", "move", "restore", "unlock", "template", "snapshot", "rollback", "reboot",
                      ">", "<", "`", "&", "|", "sudo", "tee"):
-            self.assertNotIn(verb, re.sub(r"'##[A-Z ]+'", "", script).replace("$(timeout 5 qm list | awk 'NR>1{print $1}')", ""),
-                             verb)
+            self.assertNotIn(verb, scrubbed, verb)
         self.assertIn("timeout 8 pvesm status --storage local", script)
         self.assertIn("timeout 8 du -sk /var/lib/vz/images/102 /var/lib/vz/images/103;", script)
         self.assertNotIn("images/*", script)  # unwatched VM directories are never traversed
         self.assertIn("qm config", script)
         for cmd in re.split(r";", script):
             first = cmd.strip().split(" ")[0]
-            self.assertIn(first, {"echo", "timeout", "for", "do", "done", ""}, cmd)
+            self.assertIn(first, {"echo", "timeout", "for", "do", "done", "l=$(timeout", ""}, cmd)
 
     def test_unsafe_config_is_refused_before_ssh(self):
         bad = [{"host": "-oProxyCommand=x"}, {"host": "t2-proxmox; reboot"}, {"host": ""},
