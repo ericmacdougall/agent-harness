@@ -321,7 +321,7 @@ class Refusals(unittest.TestCase):
 
             def __call__(self, host, command):
                 Endless.calls += 1
-                return 0, b"%d\n" % (10 ** 9) + b"a" * bg_job.READ_CAP, ""
+                return 0, b"%d\n" % (10 ** 17) + b"a" * bg_job.READ_CAP, ""
 
         t0 = __import__("time").time()
         code, out, _a = run(Endless(), timeout=1.0, include_existing=True)
