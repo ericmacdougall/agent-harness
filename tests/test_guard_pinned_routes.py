@@ -29,6 +29,10 @@ PY_REL = 'unit-mig/cf-dns/cf_dns_prod_move.py'
 BASE = '.agent-harness/work/dev-decom/'
 SH_TEXT = b'#!/bin/bash\nconf=~/.config/rclone/rclone.conf\n'
 PY_TEXT = b'#!/usr/bin/env python3\nSECRET = "GOODQA_CLOUDFLARE_API_TOKEN"\n'
+FAB_REL = ('.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/agent-ad1ff08b576984a4d/do-auth/'
+           'doctl-auth-fabric.sh')
+FAB_TEXT = (b'#!/bin/sh\nexec ssh t2-dev "gcloud secrets versions access latest '
+            b'--secret=DIGITALOCEAN_API_TOKEN | awk x"\n')
 PY_ARGS = ['list', 'set-ttl --name connect.example.test --ttl 60 --expect-ttl 300',
            'set-content --name example.test --content 192.0.2.1 --expect-content 192.0.2.2']
 
@@ -46,14 +50,14 @@ class Base(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         # A fixed clock, so these do not start failing on the expiry date before the table is removed.
-        clock = mock.patch.object(cg.time, 'time', return_value=cg.PINNED_ROUTE_EXPIRES - 86400)
+        clock = mock.patch.object(cg.time, 'time', return_value=cg.DEV_DECOM_EXPIRES - 86400)
         clock.start()
         self.addCleanup(clock.stop)
         self.sh = self.write(BASE + SH_REL, SH_TEXT)
         self.py = self.write(BASE + PY_REL, PY_TEXT)
         table = mock.patch.object(cg, 'PINNED_ROUTES', (
-            (SH_REL, sha(SH_TEXT), cg.PINNED_ROUTES[0][2] if hasattr(cg, 'PINNED_ROUTES') else ''),
-            (PY_REL, sha(PY_TEXT), cg.PINNED_ROUTES[1][2] if hasattr(cg, 'PINNED_ROUTES') else ''),
+            (BASE + SH_REL, sha(SH_TEXT), cg.PINNED_ROUTES[0][2], cg.DEV_DECOM_EXPIRES),
+            (BASE + PY_REL, sha(PY_TEXT), cg.PINNED_ROUTES[1][2], cg.DEV_DECOM_EXPIRES),
         ), create=True)
         table.start()
         self.addCleanup(table.stop)
@@ -155,9 +159,9 @@ class PinnedRouteTests(Base):
 
     def test_routes_end_at_expiry(self):
         command = '/bin/bash -p %s' % self.sh
-        self.assertTrue(cg.pinned_route(command, now=cg.PINNED_ROUTE_EXPIRES - 1))
-        self.assertFalse(cg.pinned_route(command, now=cg.PINNED_ROUTE_EXPIRES))
-        with mock.patch.object(cg.time, 'time', return_value=cg.PINNED_ROUTE_EXPIRES):
+        self.assertTrue(cg.pinned_route(command, now=cg.DEV_DECOM_EXPIRES - 1))
+        self.assertFalse(cg.pinned_route(command, now=cg.DEV_DECOM_EXPIRES))
+        with mock.patch.object(cg.time, 'time', return_value=cg.DEV_DECOM_EXPIRES):
             self.assertRefused(command)
 
     def test_read_failure_gives_no_route(self):
@@ -192,7 +196,7 @@ class PinnedRouteTests(Base):
         text = b'#!/bin/bash\ncat ~/.config/rclone/rclone.conf\n'
         # Under the routes' own base with its true hash, so only the table can be what refuses it.
         rogue = self.write(BASE + 'rogue.sh', text)
-        row = ['rogue.sh', sha(text), '/bin/bash -p {path}']
+        row = [BASE + 'rogue.sh', sha(text), '/bin/bash -p {path}', cg.DEV_DECOM_EXPIRES]
         policy.write_text(json.dumps({'PINNED_ROUTES': [row], 'pinned_routes': [row]}))
         compiled = cg.Compiled(cg.load_policy(path=str(policy)), cwd=str(self.home))
         self.assertEqual(cg.decide('/bin/bash -p %s' % rogue, compiled, cwd=str(self.home))[0], 'block')
@@ -205,7 +209,7 @@ class PinnedRouteTests(Base):
     def test_a_file_past_the_read_limit_gets_no_route(self):
         big = b'#' * (cg.CREDENTIAL_SCRIPT_READ + 1)
         self.sh.write_bytes(big)
-        table = ((SH_REL, sha(big), cg.PINNED_ROUTES[0][2]), cg.PINNED_ROUTES[1])
+        table = ((BASE + SH_REL, sha(big), cg.PINNED_ROUTES[0][2], cg.DEV_DECOM_EXPIRES), cg.PINNED_ROUTES[1])
         with mock.patch.object(cg, 'PINNED_ROUTES', table):
             self.assertFalse(cg.pinned_route('/bin/bash -p %s' % self.sh))
 
@@ -628,16 +632,109 @@ class CredentialScriptTests(Base):
         self.assertAllowed('python3 %s' % far)
 
 
+class FabricDoAuthRouteTests(unittest.TestCase):
+    """The goodqa#15976 route: one no-argument script, its own expiry, independent of the expired dev-decom pins."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name).resolve()
+        env = mock.patch.dict(os.environ, {'HOME': str(self.home)})
+        env.start()
+        self.addCleanup(env.stop)
+        clock = mock.patch.object(cg.time, 'time', return_value=cg.FABRIC_DO_AUTH_EXPIRES - 86400)
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.fab = self.home / FAB_REL
+        self.fab.parent.mkdir(parents=True)
+        self.fab.write_bytes(FAB_TEXT)
+        real = [r for r in cg.PINNED_ROUTES if r[0] == FAB_REL]
+        self.assertEqual(len(real), 1)
+        table = mock.patch.object(cg, 'PINNED_ROUTES', tuple(
+            (r[0], sha(FAB_TEXT), r[2], r[3]) if r[0] == FAB_REL else r for r in cg.PINNED_ROUTES))
+        table.start()
+        self.addCleanup(table.stop)
+
+    def verdict(self, command):
+        return cg.decide(command, cwd=str(self.home))[0]
+
+    def test_exact_invocation_is_allowed(self):
+        self.assertTrue(cg.pinned_route('/bin/bash -p %s' % self.fab))
+        self.assertEqual(self.verdict('/bin/bash -p %s' % self.fab), 'allow')
+
+    def test_changed_invocations_are_refused(self):
+        fab = self.fab
+        for command in ('/bin/bash -p %s extra' % fab, '/bin/bash -p %s --context x' % fab,
+                        '/bin/bash -p %s; true' % fab, '/bin/bash -p %s | cat' % fab,
+                        '/bin/bash -p %s > %s/out' % (fab, self.home), '/bin/bash %s' % fab,
+                        '/bin/sh -p %s' % fab, 'bash -p %s' % fab, 'sh %s' % fab, str(fab),
+                        'BASH_ENV=%s/e /bin/bash -p %s' % (self.home, fab), '/bin/bash -p -x %s' % fab):
+            with self.subTest(command=command):
+                self.assertFalse(cg.pinned_route(command))
+                self.assertEqual(self.verdict(command), 'block')
+
+    def test_modified_script_is_refused(self):
+        self.fab.write_bytes(FAB_TEXT + b'echo leak\n')
+        self.assertFalse(cg.pinned_route('/bin/bash -p %s' % self.fab))
+        self.assertEqual(self.verdict('/bin/bash -p %s' % self.fab), 'block')
+
+    def test_copy_elsewhere_and_symlink_are_refused(self):
+        copy = self.home / 'elsewhere/doctl-auth-fabric.sh'
+        copy.parent.mkdir(parents=True)
+        copy.write_bytes(FAB_TEXT)
+        self.assertFalse(cg.pinned_route('/bin/bash -p %s' % copy))
+        self.fab.unlink()
+        self.fab.symlink_to(copy)
+        self.assertFalse(cg.pinned_route('/bin/bash -p %s' % self.fab))
+
+    def test_route_ends_at_its_own_expiry(self):
+        command = '/bin/bash -p %s' % self.fab
+        self.assertTrue(cg.pinned_route(command, now=cg.FABRIC_DO_AUTH_EXPIRES - 1))
+        self.assertFalse(cg.pinned_route(command, now=cg.FABRIC_DO_AUTH_EXPIRES))
+        with mock.patch.object(cg.time, 'time', return_value=cg.FABRIC_DO_AUTH_EXPIRES):
+            self.assertEqual(self.verdict(command), 'block')
+
+    def test_other_scripts_naming_the_do_token_are_refused(self):
+        rows = (('a.sh', b'#!/bin/sh\ngcloud secrets versions access latest --secret=DIGITALOCEAN_API_TOKEN\n'),
+                ('b.py', b'#!/usr/bin/env python3\nNAME = "DIGITALOCEAN_API_TOKEN"\n'))
+        for name, text in rows:
+            path = self.home / 'other' / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(text)
+            runner = '/bin/bash -p' if name.endswith('.sh') else 'python3'
+            with self.subTest(name=name):
+                self.assertEqual(self.verdict('%s %s' % (runner, path)), 'block')
+
+    def test_a_lookalike_name_is_not_refused(self):
+        path = self.home / 'other/c.sh'
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b'#!/bin/sh\necho MY_DIGITALOCEAN_API_TOKEN_NOTE\n')
+        self.assertEqual(self.verdict('/bin/bash -p %s' % path), 'allow')
+
+    def test_dev_decom_pins_stay_expired(self):
+        sh = self.home / BASE / SH_REL
+        sh.parent.mkdir(parents=True)
+        sh.write_bytes(SH_TEXT)
+        table = tuple((r[0], sha(SH_TEXT), r[2], r[3]) if r[0] == BASE + SH_REL else r for r in cg.PINNED_ROUTES)
+        with mock.patch.object(cg, 'PINNED_ROUTES', table):
+            self.assertFalse(cg.pinned_route('/bin/bash -p %s' % sh))
+            self.assertTrue(cg.pinned_route('/bin/bash -p %s' % sh, now=cg.DEV_DECOM_EXPIRES - 1))
+
+
 class TableTests(unittest.TestCase):
-    def test_the_table_is_exactly_these_two_pins(self):
-        self.assertEqual([(r[0], r[1]) for r in cg.PINNED_ROUTES], [
-            (SH_REL, '92438a47d6b8083266e42922a2d151d0d0d65475fcc20744ea54359f2af501f3'),
-            (PY_REL, '30c688923554c09f93128a7d9b89831557acd06d1f04949c235b09ea05cf89a6'),
+    def test_the_table_is_exactly_these_pins(self):
+        self.assertEqual([(r[0], r[1], r[2], r[3]) for r in cg.PINNED_ROUTES], [
+            (BASE + SH_REL, '92438a47d6b8083266e42922a2d151d0d0d65475fcc20744ea54359f2af501f3', '/bin/bash -p {path}',
+             cg.DEV_DECOM_EXPIRES),
+            (BASE + PY_REL, '30c688923554c09f93128a7d9b89831557acd06d1f04949c235b09ea05cf89a6', cg.PINNED_ROUTES[1][2],
+             cg.DEV_DECOM_EXPIRES),
+            (FAB_REL, '445d07aa069233b478f7360220f05f975a327e73d377deef38e404028d0e949a', '/bin/bash -p {path}',
+             cg.FABRIC_DO_AUTH_EXPIRES),
         ])
 
-    def test_expiry_is_fixed(self):
-        self.assertEqual(time_string(cg.PINNED_ROUTE_EXPIRES), '2026-11-09T00:00:00Z')
-
+    def test_expiries_are_fixed(self):
+        self.assertEqual(time_string(cg.DEV_DECOM_EXPIRES), '2026-11-09T00:00:00Z')
+        self.assertEqual(time_string(cg.FABRIC_DO_AUTH_EXPIRES), '2026-11-21T00:00:00Z')
 
 
 def time_string(epoch):

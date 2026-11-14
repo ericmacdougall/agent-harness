@@ -344,24 +344,35 @@ def _pw_home():
 
 # --------------------------------------------------------------------------- one-off pinned routes
 
-# Two credential tools the user chose to allow for the pve evacuation (GoodQA goodqa#14518). A route is the whole command
-# string, a file with this exact SHA-256 at this exact path, and a time before the expiry. This is a fixed table on purpose:
-# no policy file, flag or environment variable can add to it, and a later change removes it.
-# Paths are relative to HOME's work folder so no home name is published. The tools check their own names and values, so the
-# argument shapes only need to rule out shell syntax.
-PINNED_ROUTE_BASE = '.agent-harness/work/dev-decom'
-PINNED_ROUTE_EXPIRES = 1794182400  # 2026-11-09T00:00:00Z, the day the host these routes serve shuts down
+# One-off credential routes the user chose to allow. A route is the whole command string, a file with this exact SHA-256
+# at this exact path, and a time before that route's own expiry. This is a fixed table on purpose: no policy file, flag or
+# environment variable can add to it, and a later change removes it.
+# Paths are relative to HOME so no home name is published. The tools check their own names and values, so the argument
+# shapes only need to rule out shell syntax.
+# Entry: (path relative to HOME, sha256, exact command shape with {path}, expiry as a UNIX time).
+DEV_DECOM_EXPIRES = 1794182400  # 2026-11-09T00:00:00Z, the day the host the pve evacuation routes served shut down
+FABRIC_DO_AUTH_EXPIRES = 1795219200  # 2026-11-21T00:00:00Z, seven days after the user approved it
 PINNED_ROUTES = (
-    ('unit-mig/t2-rclone/user-run-store-dropbox-secret.sh',
+    # The pve evacuation (GoodQA goodqa#14518).
+    ('.agent-harness/work/dev-decom/unit-mig/t2-rclone/user-run-store-dropbox-secret.sh',
      '92438a47d6b8083266e42922a2d151d0d0d65475fcc20744ea54359f2af501f3',
      # -p (privileged mode): bash then runs no $BASH_ENV or $ENV file and imports no exported function before the script,
      # which sets its own PATH and calls tools by absolute path
-     r'/bin/bash -p {path}'),
-    ('unit-mig/cf-dns/cf_dns_prod_move.py',
+     r'/bin/bash -p {path}',
+     DEV_DECOM_EXPIRES),
+    ('.agent-harness/work/dev-decom/unit-mig/cf-dns/cf_dns_prod_move.py',
      '30c688923554c09f93128a7d9b89831557acd06d1f04949c235b09ea05cf89a6',
      r'/usr/bin/python3 -I {path} (?:list'
      r'|set-ttl --name [a-z.]{{1,40}} --ttl [0-9]{{1,5}} --expect-ttl [0-9]{{1,5}}'
-     r'|set-content --name [a-z.]{{1,40}} --content [0-9.]{{7,15}} --expect-content [0-9.]{{7,15}})'),
+     r'|set-content --name [a-z.]{{1,40}} --content [0-9.]{{7,15}} --expect-content [0-9.]{{7,15}})',
+     DEV_DECOM_EXPIRES),
+    # Fabric droplet (GoodQA goodqa#15976): write a doctl config on t2-dev from GCP Secret Manager without the token
+    # passing through argv, an environment variable, a log or this machine. No arguments.
+    # Source: answer:baab765b-d85c-46b4-b7b9-588eb912c770/1259f6f0-b88d-40f3-834a-4275dbf8ec01 (ask we0224a94f24).
+    ('.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/agent-ad1ff08b576984a4d/do-auth/doctl-auth-fabric.sh',
+     '445d07aa069233b478f7360220f05f975a327e73d377deef38e404028d0e949a',
+     r'/bin/bash -p {path}',
+     FABRIC_DO_AUTH_EXPIRES),
 )
 # Existing scripts keep only log deletion and the credential-read rules (SCRIPT_CREDENTIAL_RULES); other printing rules
 # inside them still pass (goodqa#14993 follow-up). This also refuses
@@ -375,7 +386,8 @@ PINNED_ROUTES = (
 _CREDENTIAL_NAMES = (rb'\.config/rclone/?(?=["\'\s;|&)*$]|\Z)'  # the config directory as a whole word, or a glob or variable
                      rb'|/rclone/rclone\.conf(?![\w.-])'  # the file under any base, such as $XDG_CONFIG_HOME
                      rb'|["\']rclone\.conf["\']'  # the quoted file name: os.path.join, pathlib, read("...")
-                     rb'|\bGOODQA_CLOUDFLARE_API_TOKEN\b')
+                     rb'|\bGOODQA_CLOUDFLARE_API_TOKEN\b'
+                     rb'|\bDIGITALOCEAN_API_TOKEN\b')  # goodqa#15976: only its pinned route may read it
 # The option count is bounded: an unbounded loop here is quadratic, and a padded script could then outlast the time limit.
 _RCLONE_DUMP = rb'rclone(?:\s|\\)+(?:-\S+(?:\s+"?\$?\{?\w+\}?"?)?\s+){0,8}config(?:\s|\\)+"?(?:show|dump)\b'
 CREDENTIAL_SHELL_TEXT = re.compile(_CREDENTIAL_NAMES + rb'|\b' + _RCLONE_DUMP)
@@ -463,15 +475,18 @@ def _read_prefix(path, limit):
 
 def pinned_route(command, now=None):
     """True only for the exact command string of an unexpired route whose file is a regular file with the pinned hash."""
-    if not isinstance(command, str) or (time.time() if now is None else now) >= PINNED_ROUTE_EXPIRES:
+    if not isinstance(command, str):
         return False
     home = os.environ.get('HOME')
     if not home or not ROUTE_HOME.fullmatch(home):
         return False
-    for rel, digest, shape in PINNED_ROUTES:
-        path = os.path.join(home, PINNED_ROUTE_BASE, rel)
+    now = time.time() if now is None else now
+    for rel, digest, shape, expires in PINNED_ROUTES:
+        path = os.path.join(home, rel)
         if not re.fullmatch(shape.format(path=re.escape(path)), command):
             continue
+        if now >= expires:
+            return False
         try:
             if not stat.S_ISREG(os.lstat(path).st_mode):
                 return False
