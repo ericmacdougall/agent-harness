@@ -6,7 +6,10 @@ ran only the 30-minute checkpoint and reported "holding". dropped_gate stayed cl
 disposition) and nothing noticed that main was idle while non-user next steps existed.
 
 assess() answers one question from the WALs and the owner view: has nothing progressed for N minutes while some stream
-holds a next step that does not need the user? Modes (argv[1]):
+holds a next step that does not need the user? Whether a stream needs main is ah.owners()'s answer, never re-derived
+here: an owner is actionable exactly when its row is decision_required or has `attention` (an untaken result or
+handoff, an invalid wait, a wait on a ticket or agent, a silent owner); it is a genuine user wait only when it is not
+actionable and its `wait_on` is an open ask (owners() already checked the ask is its own). Modes (argv[1]):
   stop    Stop hook: block with the named streams (idle), or when every owner waits on a user ask while another owner
           holds a returned result nobody took (no idle time needed), or when this turn holds a user rejection and
           independent work exists. Bounded per problem signature; main only; fails open on any error.
@@ -32,13 +35,11 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 IDLE_MIN_DEFAULT = 30
-RETURNED_WINDOW_S = 24 * 3600
 MAX_STOP_BLOCKS = 2
 TAIL_BYTES = 1 << 20
 REMINDER = "A rejected question pauses only that question; keep every independent stream moving."
 MAIN_PROGRESS = {"commit", "check", "intent", "subagent", "subagent_stop", "result", "handoff", "deploy"}
 MAIN_PROGRESS_TOOLS = {"Agent", "Write", "Edit", "NotebookEdit"}
-RETURNED_STATES = ("done", "handoff", "returned")
 REJECT_RE = re.compile(r"doesn't want to proceed with this tool use|user-rejected|User rejected tool use", re.I)
 
 
@@ -76,10 +77,37 @@ def main_progress(wal_dir: Path) -> float:
     return best
 
 
+def actionable(r: dict) -> dict | None:
+    """The stream main must act on for one `ah owners` row, or None. Pure classification: an owner needs main exactly
+    when ah.owners() marks it decision_required or puts anything in its `attention` (goodqa#15943, rescue of r1-r4).
+    No acknowledgement, wait or ask-ownership rule is re-derived here; a missing signal is fixed in ah.owners()."""
+    attention = [str(a) for a in r.get("attention") or []]
+    flags = [str(f) for f in r.get("flags") or []]
+    if not (r.get("decision_required") or attention):
+        return None
+    signals = attention + (["decision_required"] if r.get("decision_required") else []) + \
+        [f for f in flags if f == "handoff-unacked" or f.startswith(("wait-target-", "wait-ask-"))]
+    state, ref = str(r.get("state") or ""), r.get("wait_on") or "a ticket"
+    if "handoff-unacked" in flags or "result-unacked" in attention:
+        why, nxt = f"returned a {state} nobody took", "review its result, then merge, resume or close it"
+    elif "wait-invalid" in attention:
+        why = f"its wait on {ref} is not its own ({'/'.join(f for f in flags if f.startswith('wait-ask-'))})"
+        nxt = "work an independent item, or raise an ask that names this owner"
+    elif "wait-not-user" in attention:
+        why, nxt = f"waiting on {ref}, not a user ask", f"work {ref} now, or record the real user ask it needs"
+    elif r.get("decision_required"):
+        why = f"{state} with no live disposition ({', '.join(f for f in flags if f != 'unregistered-owner') or 'decision required'})"
+        nxt = "resume, reassign or close it (ah task dispose)"
+    else:
+        why, nxt = f"{state}: {', '.join(attention)}", "look at it: resume it, or record what it waits on"
+    return {"agent": r["agent_id"], "ticket": r.get("ticket"), "why": why, "next": nxt, "signals": signals}
+
+
 def assess(home: Path, session: str, now: float | None = None, idle_minutes: float | None = None) -> dict:
-    """{idle, idle_s, last_progress, streams: [{agent, ticket, why, next}], returned, all_waiting_on_user}."""
+    """{idle, idle_s, last_progress, streams: [{agent, ticket, why, next, signals}], returned, user_waiters,
+    all_waiting_on_user}. ah.owners() is the single source of truth for whether an owner needs main; this only
+    classifies its rows into actionable streams and genuine user waits, plus main's own progress time."""
     import ah  # noqa: PLC0415
-    import liveness  # noqa: PLC0415
     now = time.time() if now is None else now
     limit = (idle_min() if idle_minutes is None else idle_minutes) * 60
     data = ah.owners(home, session, now=now)
@@ -90,37 +118,18 @@ def assess(home: Path, session: str, now: float | None = None, idle_minutes: flo
     for r in rows:
         if not r.get("owner"):
             continue
-        agent, state = r["agent_id"], str(r.get("state") or "")
+        agent = r["agent_id"]
         last = ah.parse_ts(r.get("last_activity")) or 0.0
         progress = max(progress, last, ah.transcript_mtime(home, session, agent, dirs) if r.get("type") != "task-wal" else 0.0)
-        d = r.get("disposition") if isinstance(r.get("disposition"), dict) else None
-        if d and d.get("kind") not in liveness.ENDING_DISPOSITIONS and state in RETURNED_STATES \
-                and float(d.get("at") or 0.0) < last - 10:
-            d = None  # receipt r2 F1: a result is acknowledged only by a disposition at or after it (as ah's handoff ack)
-        live = bool(d and d.get("live"))
-        if d and d.get("kind") in liveness.ENDING_DISPOSITIONS:
-            continue  # a terminal disposition stays terminal: the owner is retired, whatever its notes say
-        # a wait is a live waiting disposition, or a `waiting-on-<x>` state derived from the owner's last WAL note
-        ref = str(d.get("ref") or "") if live and d.get("kind") == "waiting" else (
-            state[len("waiting-on-"):] if state.startswith("waiting-on-") else None)
-        if ref is not None:
-            if "wait-invalid" in (r.get("attention") or []):
-                streams.append({"agent": agent, "ticket": r.get("ticket"),
-                                "why": f"its wait on {ref} is not its own ({'/'.join(f for f in r.get('flags') or [] if f.startswith('wait-ask-'))})",
-                                "next": "work an independent item, or raise an ask that names this owner"})
-            elif ah.ASK_ID_RE.match(ref):
-                user_waiters += 1
-            else:
-                streams.append({"agent": agent, "ticket": r.get("ticket"), "why": f"waiting on {ref or 'a ticket'}, not a user ask",
-                                "next": f"work {ref or 'the ticket'} now, or record the real user ask it needs"})
-            continue
-        if state.startswith(("live", "working")):
-            active += 1
-        elif state in RETURNED_STATES and now - last <= RETURNED_WINDOW_S and not (d and (live or d.get("kind") in liveness.ENDING_DISPOSITIONS)):
-            item = {"agent": agent, "ticket": r.get("ticket"), "why": f"returned a {state} nobody took",
-                    "next": "review its result, then merge, resume or close it"}
+        item = actionable(r)
+        if item:  # actionable always wins over a user wait (receipt r4 F1)
             streams.append(item)
-            returned.append(item)
+            if "result-unacked" in item["signals"] or "handoff-unacked" in item["signals"]:
+                returned.append(item)
+        elif r.get("wait_on") and ah.ASK_ID_RE.match(r["wait_on"]):
+            user_waiters += 1  # owners() raised nothing, so this is a live wait on the owner's own open ask
+        elif str(r.get("state") or "").startswith(("live", "working")):
+            active += 1
     idle_s = now - progress if progress else None
     return {"idle": bool(streams) and idle_s is not None and idle_s >= limit, "idle_s": idle_s, "last_progress": progress,
             "streams": streams, "returned": returned, "user_waiters": user_waiters,

@@ -455,15 +455,28 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     # goodqa#15943 (receipt r1 F2): a wait on a user ask excuses only the owner the ask belongs to, whether it is a
     # note or a disposition. A wait on another owner's ask, or a second holder of one unowned ask, is reported in
     # `attention` (it never sets decision_required: the owner is not dropped, its wait is simply not its own).
+    # `wait_on` is the one reading of what an owner waits on (a live waiting disposition, else a `waiting-on-<x>`
+    # state from its last WAL note); idle_guard reads it instead of re-deriving it. A wait on anything but a user ask
+    # (a ticket, an agent, main) is a next step main can take: `attention: wait-not-user` (never decision_required).
     owned, holders = ask_owners(main), {}
     for r in rows:
+        r["wait_on"] = None
         if not r["owner"]:
             continue
         d = r.get("disposition") or {}
+        if d.get("kind") in liveness.ENDING_DISPOSITIONS:
+            continue  # a terminal disposition stays terminal, whatever the owner's last note says
         ref = str(d.get("ref") or "") if d.get("kind") == "waiting" and d.get("live") else \
             (r["state"][len("waiting-on-"):] if r["state"].startswith("waiting-on-") else "")
+        if not ref and d.get("kind") == "waiting" and d.get("live"):
+            ref = "a ticket"
+        if not ref:
+            continue
+        r["wait_on"] = ref
         if ASK_ID_RE.match(ref) and asks.get(ref) == "open":
             holders.setdefault(ref, []).append(r)
+        elif not ASK_ID_RE.match(ref):
+            r["attention"] = list(r.get("attention") or []) + ["wait-not-user"]
     for ref, held in holders.items():
         held.sort(key=lambda r: (parse_ts(r["last_activity"]) or 0.0, r["agent_id"]))
         for i, r in enumerate(held):
@@ -472,8 +485,13 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             if flag:
                 r["flags"] = list(r.get("flags") or []) + [flag]
                 r["attention"] = list(r.get("attention") or []) + ["wait-invalid"]
-    for r in rows:  # I9: a handoff is real only once someone takes it (a disposition at/after the handoff)
-        if r["owner"] and r["state"] == "handoff":
+    # I9: a handoff is real only once someone takes it (a disposition at/after the handoff). goodqa#15943 (receipts r2
+    # and r4): the same rule decides whether ANY returned result (done, handoff, returned) was taken, so ah owners and
+    # idle_guard agree. An untaken result younger than RESULT_ACK_WINDOW_S is `attention: result-unacked`; a handoff
+    # untaken for HANDOFF_ACK_S is also decision_required (unchanged). An earlier disposition never takes a later
+    # result, and an owner's own wait (no --ack-handoff) never takes it.
+    for r in rows:
+        if r["owner"] and r["state"] in RESULT_STATES:
             handed = parse_ts(r["last_activity"]) or 0.0
             d = disp.get(r["agent_id"])
             kind = d.get("kind") if d else None
@@ -494,7 +512,9 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                     and (parse_ts(prow["last_activity"]) or 0.0) >= handed:
                 acked = True
                 r["flags"] = list(r.get("flags") or []) + ["handoff-to-parent"]
-            if not acked and now - handed >= HANDOFF_ACK_S:
+            if not acked and now - handed <= RESULT_ACK_WINDOW_S:
+                r["attention"] = list(r.get("attention") or []) + ["result-unacked"]
+            if not acked and r["state"] == "handoff" and now - handed >= HANDOFF_ACK_S:
                 r["decision_required"] = True
                 r["flags"] = list(r.get("flags") or []) + ["handoff-unacked"]
     # a wait on another agent holds only while that agent is live; a wait on a DROPPED, done or unknown agent is a drop
@@ -514,7 +534,6 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     dls = deadlines(home, session, now, led)
     missed = [d for d in dls if d["state"] == "missed" and not liveness.disposition_live(disp.get(d["id"]), now)]
     return {"session": session, "generated": iso(now), "counts": counts, "owners": rows, "source": "direct",
-            "agents_active_1h": sum(1 for r in rows if r.get("active_1h")),
             "agents_active_1h": sum(1 for r in rows if r.get("active_1h")),
             "deadlines": dls,
             "undisposed": sorted([r["agent_id"] for r in rows if r["decision_required"]] + [d["id"] for d in missed]),
@@ -1766,6 +1785,8 @@ def deadlines(home: Path, session: str, now: float, ledger=None) -> list:
 
 
 HANDOFF_ACK_S = 3600  # a handoff nobody acknowledged within this window is a drop in disguise (I9)
+RESULT_STATES = ("done", "handoff", "returned")  # an owner that returned something main must take
+RESULT_ACK_WINDOW_S = 24 * 3600  # an untaken result older than this is history, not attention (goodqa#15943)
 
 
 def pending_stops(home: Path, session: str, ledger=None) -> dict:
@@ -2615,7 +2636,7 @@ def status_text(data: dict) -> str:
     if "counts" in o:
         lines.append(f"## OWNERS live {len(o.get('live') or [])}: {', '.join(a[:12] for a in o.get('live') or [])}; "
                      f"undisposed: {', '.join(o.get('undisposed') or []) or 'none'}; "
-                     f"attention (silent, wait expired or none): {', '.join(o.get('attention') or []) or 'none'}")
+                     f"attention (silent, wait expired, wait not on a user ask, result untaken, or none): {', '.join(o.get('attention') or []) or 'none'}")
     else:
         lines.append("## OWNERS " + str(o.get("error", "")))
     lines.append("(" + data["rule"] + ")")

@@ -75,10 +75,14 @@ class Base(unittest.TestCase):
     def park_tick_on_ask(self):
         self.dispose("tick", "waiting", "tick-ask", until=iso(NOW + 3 * HOUR), ref="wa5b00000001")
 
-    def close_done1(self):  # done1 waits on its own user ask
+    def close_done1(self):  # main took done1's result (--ack-handoff) and done1 now waits on its own user ask
+        # receipt r4: only main's acknowledged wait takes a returned result; a plain wait would leave it actionable
+        import caller_identity  # noqa: PLC0415
         jl(self.w / "main.jsonl", [{"at": iso(NOW - 3 * HOUR), "event": "ask", "id": "wa5b00000003", "owner": "done1",
                                     "note": "need approval", "source": "user:x/y \"w\""}])
-        self.dispose("done1", "waiting", "done1-wait-ask", until=iso(NOW + 3 * HOUR), ref="wa5b00000003")
+        caller_identity.put_stamp("ack-handoff", ["done1"], home=self.home)  # what main's hook writes
+        self.dispose("done1", "waiting", "done1-wait-ask", until=iso(NOW + 3 * HOUR), ref="wa5b00000003",
+                     ack_handoff=True)
 
 
 class AssessTests(Base):
@@ -318,6 +322,157 @@ class LaterResultTests(Base):
         self.resume_then_new_result("resumed")
         self.dispose("done1", "resumed", "done1-late-res", at=iso(NOW - 60))
         self.assertNotIn("done1", {s["agent"] for s in self.assess()["returned"]})
+
+
+class OwnWaitHandoffTests(Base):
+    """Receipt r4 F1: an owner's own `waiting` disposition (no --ack-handoff) never hides an unacknowledged handoff;
+    main's acknowledgement does. ah.owners() and assess() must agree."""
+
+    def handoff_then_own_wait(self):
+        self.park_tick_on_ask()  # the other owner waits on its own user ask
+        jl(self.w / "main.jsonl", [{"at": iso(NOW - 3 * HOUR), "event": "ask", "id": "wa5b00000003", "owner": "done1",
+                                    "note": "need approval", "source": "user:x/y \"w\""}])
+        jl(self.w / "agent-done1.jsonl", [{"at": iso(NOW - 2 * HOUR), "event": "handoff", "note": "to main: PR ready"}])
+        jl(self.w / "main.jsonl", [{"at": iso(NOW - 2 * HOUR + 5), "event": "subagent_stop", "agent_id": "done1",
+                                    "agent_type": "task-owner"}])
+        with mock.patch.dict(os.environ, {"AH_AGENT_ID": "done1"}):  # the owner records its own wait
+            self.dispose("done1", "waiting", "done1-own-wait", at=iso(NOW - 2 * HOUR + 60), until=iso(NOW + 3 * HOUR),
+                         ref="wa5b00000003")
+
+    def row(self, now=NOW):
+        return {r["agent_id"]: r for r in ah.owners(self.home, SESSION, now=now)["owners"]}["done1"]
+
+    def stop(self):
+        return self.ig.cmd_stop({"session_id": SESSION, "stop_hook_active": False}, now=NOW)
+
+    def alerts(self):
+        os.utime(self.w / "main.jsonl", (NOW, NOW))
+        return ops_watch.check_idle_guard(ops_watch.load_config(self.home), {}, None, NOW)
+
+    def test_own_wait_does_not_suppress_the_stop_block_or_the_idle_alert(self):
+        self.handoff_then_own_wait()
+        row = self.row()
+        self.assertIn("handoff-unacked", row["flags"])
+        self.assertTrue(row["decision_required"])
+        a = self.assess()
+        self.assertIn("done1", {s["agent"] for s in a["streams"]})
+        self.assertTrue(a["idle"])
+        out = self.stop()
+        self.assertEqual(out.get("decision"), "block")
+        self.assertIn("done1", out["reason"])
+        self.assertEqual([x["key"] for x in self.alerts()], ["idle-guard:" + SESSION[:8]])
+
+    def test_own_wait_does_not_suppress_a_fresh_handoff_either(self):  # before HANDOFF_ACK_S: attention, not a drop
+        self.handoff_then_own_wait()
+        later = NOW - 2 * HOUR + 600
+        row = self.row(later)
+        self.assertFalse(row["decision_required"])
+        self.assertIn("result-unacked", row["attention"])
+        self.assertIn("done1", {s["agent"] for s in self.ig.assess(self.home, SESSION, later)["returned"]})
+
+    def test_mains_ack_suppresses_both(self):
+        self.handoff_then_own_wait()
+        import caller_identity  # noqa: PLC0415
+        caller_identity.put_stamp("ack-handoff", ["done1"], home=self.home)  # what main's hook writes
+        self.dispose("done1", "waiting", "done1-main-ack", at=iso(NOW - 60), until=iso(NOW + 3 * HOUR),
+                     ref="wa5b00000003", ack_handoff=True)
+        row = self.row()
+        self.assertFalse(row["decision_required"])
+        self.assertEqual(row["attention"], [])
+        a = self.assess()
+        self.assertEqual(a["streams"], [])
+        self.assertEqual(a["user_waiters"], 2)
+        self.assertEqual(self.stop(), {})
+        self.assertEqual(self.alerts(), [])
+
+    def test_own_wait_does_not_take_a_done_result(self):  # the same rule for a `result` (done), not only a handoff
+        self.park_tick_on_ask()
+        jl(self.w / "main.jsonl", [{"at": iso(NOW - 3 * HOUR), "event": "ask", "id": "wa5b00000003", "owner": "done1",
+                                    "note": "need approval", "source": "user:x/y \"w\""}])
+        with mock.patch.dict(os.environ, {"AH_AGENT_ID": "done1"}):
+            self.dispose("done1", "waiting", "done1-own-wait2", until=iso(NOW + 3 * HOUR), ref="wa5b00000003")
+        self.assertIn("result-unacked", self.row()["attention"])
+        self.assertIn("done1", {s["agent"] for s in self.assess()["returned"]})
+        self.assertEqual(self.stop().get("decision"), "block")
+
+
+class OwnersAgreementPropertyTests(Base):
+    """For a table of owner states, assess() reports an owner actionable exactly when ah.owners() marks it
+    decision_required or gives it attention, and counts it as a user wait exactly when it is not actionable and waits
+    on an open ask. The expected column proves the table spans both sides of the property."""
+
+    def owner(self, agent, rows, stop=True):
+        first = min(ah.parse_ts(r["at"]) for r in rows)
+        last = max(ah.parse_ts(r["at"]) for r in rows)
+        main = [{"at": iso(first - 30), "event": "subagent", "agent_id": agent, "agent_type": "task-owner"}]
+        if stop:
+            main.append({"at": iso(last + 5), "event": "subagent_stop", "agent_id": agent, "agent_type": "task-owner"})
+        jl(self.w / "main.jsonl", main)
+        jl(self.w / f"agent-{agent}.jsonl", rows)
+
+    def ask(self, ask_id, owner):
+        jl(self.w / "main.jsonl", [{"at": iso(NOW - 5 * HOUR), "event": "ask", "id": ask_id, "owner": owner,
+                                    "note": "need approval", "source": "user:x/y \"w\""}])
+
+    def main_ack(self, agent, key, ref):
+        import caller_identity  # noqa: PLC0415
+        caller_identity.put_stamp("ack-handoff", [agent], home=self.home)
+        self.dispose(agent, "waiting", key, until=iso(NOW + 3 * HOUR), ref=ref, ack_handoff=True)
+
+    def build(self):
+        h = HOUR
+        intent = lambda at, t="GoodQA goodqa#15950 work": {"at": iso(at), "event": "intent", "note": t}  # noqa: E731
+        # tick (Base): stopped with no result -> DROPPED; done1 (Base): result 4 h ago, untaken
+        self.owner("h_own", [intent(NOW - 3 * h), {"at": iso(NOW - 2 * h), "event": "handoff", "note": "to main: PR"}])
+        self.ask("wa5b0000000a", "h_own")
+        with mock.patch.dict(os.environ, {"AH_AGENT_ID": "h_own"}):
+            self.dispose("h_own", "waiting", "h-own-wait-1", until=iso(NOW + 3 * h), ref="wa5b0000000a")
+        self.owner("h_fresh", [intent(NOW - h), {"at": iso(NOW - 600), "event": "handoff", "note": "to main: PR"}])
+        self.owner("d_acked", [intent(NOW - 3 * h), {"at": iso(NOW - 2 * h), "event": "result", "note": "to main: ok"}])
+        self.ask("wa5b0000000b", "d_acked")
+        self.main_ack("d_acked", "d-acked-ack-1", "wa5b0000000b")
+        self.owner("d_old", [intent(NOW - 31 * h), {"at": iso(NOW - 30 * h), "event": "result", "note": "old"}])
+        self.owner("t_disp", [intent(NOW - 3 * h)])
+        self.dispose("t_disp", "waiting", "t-disp-wait-1", until=iso(NOW + 3 * h), ref="GoodQA goodqa#15943")
+        self.owner("t_note", [intent(NOW - 3 * h), {"at": iso(NOW - 3 * h + 30), "event": "status",
+                                                     "note": "blocked, waiting on GoodQA goodqa#15943"}])
+        self.ask("wa5b0000000c", "a_own")
+        self.owner("a_own", [intent(NOW - 3 * h), {"at": iso(NOW - 3 * h + 30), "event": "status",
+                                                    "note": "blocked, waiting on wa5b0000000c"}])
+        self.owner("a_foreign", [intent(NOW - 3 * h), {"at": iso(NOW - 3 * h + 30), "event": "status",
+                                                        "note": "blocked, waiting on wa5b0000000b"}])
+        self.owner("live1", [intent(NOW - 60)], stop=False)
+        self.owner("retired", [intent(NOW - 3 * h), {"at": iso(NOW - 3 * h + 30), "event": "status",
+                                                      "note": "blocked, waiting on GoodQA goodqa#15943"}])
+        with mock.patch.object(ah, "_ticket_exists", return_value=True):
+            self.dispose("retired", "wontdo", "retired-wontdo-1", ref="GoodQA goodqa#15943",
+                         reason="verified that nobody will do this and the scope was dropped by main")
+        self.owner("r_later", [intent(NOW - 4 * h)])
+        self.dispose("r_later", "resumed", "r-later-res-1", at=iso(NOW - 3 * h))
+        jl(self.w / "agent-r_later.jsonl", [{"at": iso(NOW - 2 * h), "event": "result", "note": "to main: second"}])
+        jl(self.w / "main.jsonl", [{"at": iso(NOW - 2 * h + 5), "event": "subagent_stop", "agent_id": "r_later",
+                                    "agent_type": "task-owner"}])
+        # expected: (actionable, user wait)
+        return {"tick": (True, False), "done1": (True, False), "h_own": (True, False), "h_fresh": (True, False),
+                "d_acked": (False, True), "d_old": (False, False), "t_disp": (True, False), "t_note": (True, False),
+                "a_own": (False, True), "a_foreign": (True, False), "live1": (False, False), "retired": (False, False),
+                "r_later": (True, False)}
+
+    def test_assess_agrees_with_owners_for_every_row(self):
+        expected = self.build()
+        rows = {r["agent_id"]: r for r in ah.owners(self.home, SESSION, now=NOW)["owners"] if r["owner"]}
+        self.assertEqual(set(rows), set(expected))
+        a = self.assess()
+        streams = {s["agent"] for s in a["streams"]}
+        for agent, r in rows.items():
+            with self.subTest(agent=agent, state=r["state"], attention=r["attention"], flags=r["flags"]):
+                says = bool(r["decision_required"] or r["attention"])
+                self.assertEqual(agent in streams, says)  # the property
+                self.assertEqual(says, expected[agent][0])  # the table is what it claims to be
+                user_wait = not says and bool(r.get("wait_on")) and bool(ah.ASK_ID_RE.match(r["wait_on"]))
+                self.assertEqual(user_wait, expected[agent][1])
+        self.assertEqual(a["user_waiters"], sum(1 for v in expected.values() if v[1]))
+        self.assertEqual({s["agent"] for s in a["returned"]}, {"done1", "h_own", "h_fresh", "r_later"})
 
 
 class DisposeNarrowTests(Base):
