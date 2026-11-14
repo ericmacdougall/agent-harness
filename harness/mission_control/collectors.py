@@ -25,6 +25,109 @@ DEPLOY_RE = re.compile(r"\bDEPLOYED\b|\bdeployed to (?:live|prod)|\blive deploy\
                        re.I)
 TERMINAL = ("done", "handoff", "returned", "idle-helper", "unverified-legacy", "superseded", "wontdo", "legacy")
 
+# ---- owner roles (goodqa#15920): the owners panel counts what the owner cap counts, nothing more.
+# These mirror tier_gate.live_owner_ids / counts_as_owner / _counts_while_idle / _slot_freed exactly (a parity test
+# runs tier_gate itself on the same fixture), so the headline equals the number the 8-owner cap enforces.
+OWNER_RUNNING = ("live", "working", "quiet", "SILENT")  # tier_gate.RUNNING_STATES; SILENT covers SILENT-HIGH
+OWNER_WORKING = ("live", "working", "quiet")
+IDLE_OWNER_MAX_S = 30 * 60                               # tier_gate.IDLE_OWNER_MAX_S (liveness.SILENT_S)
+OWNER_TYPES_DEFAULT = ("task-owner", "general-purpose", "claude", "fork", "")
+HELPER_TYPES_DEFAULT = ("red-team", "click-tester", "reviewer", "fixer", "Explore", "Plan", "claude-code-guide",
+                        "statusline-setup")
+_owner_policy_cache: dict = {}
+
+
+def owner_policy(hooks_dir=None) -> dict:
+    """caps.owner_types / caps.helper_types from the table tier_gate reads (AGENT_HARNESS_TIER_POLICY, else the hooks'
+    model_tiers.json), re-read when the file changes; defaults when unreadable, with `fallback` set so it is visible."""
+    hooks = Path(hooks_dir or os.environ.get("MC_HOOKS") or Path.home() / ".claude" / "hooks")
+    path = Path(os.environ.get("AGENT_HARNESS_TIER_POLICY") or hooks / "model_tiers.json") if not hooks_dir \
+        else hooks / "model_tiers.json"
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        stamp = None
+    key = (str(path), stamp)
+    if key not in _owner_policy_cache:
+        caps, fallback = {}, False
+        try:
+            caps = json.loads(path.read_text()).get("caps") or {}
+        except (OSError, ValueError, AttributeError):
+            caps, fallback = {}, True
+        owner = caps.get("owner_types") if isinstance(caps.get("owner_types"), list) else None
+        helper = caps.get("helper_types") if isinstance(caps.get("helper_types"), list) else None
+        _owner_policy_cache.clear()
+        _owner_policy_cache[key] = {"owner_types": frozenset(map(str, owner or OWNER_TYPES_DEFAULT)),
+                                    "helper_types": frozenset(map(str, helper or HELPER_TYPES_DEFAULT)),
+                                    "fallback": fallback or owner is None or helper is None}
+    return _owner_policy_cache[key]
+
+
+def _slot_freed(row: dict) -> bool:
+    disp = row.get("disposition")
+    if not isinstance(disp, dict) or row.get("decision_required") is True:
+        return False
+    kind = disp.get("kind")
+    if kind in ("closed", "superseded", "wontdo", "legacy"):
+        return True
+    return kind in ("reassigned", "waiting") and disp.get("live") is True
+
+
+def owner_role(row: dict, policy: dict | None = None) -> str:
+    """'helper' (a helper type `ah` did not flag as an owner), 'live' (holds a cap slot now) or 'parked' (everything
+    else: waiting, handoff, returned, done, DROPPED, finishing, a disposed SILENT owner)."""
+    policy = policy or owner_policy()
+    kind = str(row.get("type") or "")
+    if not (row.get("owner") is True or kind in policy["owner_types"] or kind not in policy["helper_types"]):
+        return "helper"
+    state = str(row.get("state") or "")
+    idle = row.get("idle_s")
+    quiet = state == "idle-helper" and isinstance(idle, (int, float)) and not isinstance(idle, bool) \
+        and idle < IDLE_OWNER_MAX_S
+    if (state.startswith(OWNER_RUNNING) or quiet) and (state.startswith(OWNER_WORKING) or quiet or not _slot_freed(row)):
+        return "live"
+    return "parked"
+
+
+def codex_role(row: dict) -> str:
+    """The same three roles for Codex rows `ah` never sees: a sub-agent of a thread is a helper of that thread's main;
+    a supervised owner is live only while running; a native thread only while observed active."""
+    if row.get("agent") not in (None, "", "main"):
+        return "helper"
+    return "live" if row.get("state") in ("live", "observed") else "parked"
+
+
+def _serves(rows: list[dict]) -> None:
+    """Point each helper at the owner it serves: up its parent chain (cycle-safe) to the first non-helper row, else a
+    non-helper row with the same ticket (live first), else none (the page lists it as 'no owner', never hides it)."""
+    by_id = {alias: r for r in rows for alias in (r.get("alias_ids") or [])}
+    by_id.update({r.get("agent_id"): r for r in rows})  # a surviving id always wins over an alias
+    by_ticket: dict[str, list] = {}
+    for r in rows:
+        if r.get("role") != "helper" and r.get("ticket"):
+            by_ticket.setdefault(r["ticket"], []).append(r)
+    for r in rows:
+        r["serves"] = None
+        if r.get("role") != "helper":
+            continue
+        if r.get("runtime") == "codex" and r.get("thread") and r.get("agent") not in (None, "", "main"):
+            main = next((o for o in rows if o.get("runtime") == "codex" and o.get("thread") == r["thread"]
+                         and o.get("role") != "helper"), None)
+            r["serves"] = main.get("agent_id") if main else None
+            continue
+        seen, parent = {r.get("agent_id")}, r.get("parent")
+        while isinstance(parent, str) and parent in by_id and parent not in seen and len(seen) < 16:
+            seen.add(parent)
+            if by_id[parent].get("role") != "helper" and by_id[parent] is not r:
+                r["serves"] = by_id[parent].get("agent_id")  # the surviving id, even when the link named an alias
+                break
+            parent = by_id[parent].get("parent")
+        if r["serves"] is None and r.get("ticket") in by_ticket:
+            candidates = sorted(by_ticket[r["ticket"]], key=lambda o: (o.get("role") != "live",
+                                                                    o.get("idle_s") if isinstance(o.get("idle_s"), (int, float)) else 1e12,
+                                                                    str(o.get("agent_id"))))
+            r["serves"] = candidates[0].get("agent_id")
+
 
 class Collector:
     name = "collector"
@@ -621,10 +724,34 @@ class Owners(Collector):
             merged = {**previous, **row}
             for field in ('name', 'model', 'stream', 'ticket'):
                 merged[field] = row.get(field) or previous.get(field, '')
+            # the ids a combined row replaced, so a helper's parent link to an ah id still finds it (inspection F2)
+            merged['alias_ids'] = list(previous.get('alias_ids') or []) + (
+                [previous['agent_id']] if previous.get('agent_id') and previous.get('agent_id') != merged.get('agent_id') else [])
             combined[key] = merged
-        aliases = {'codex-' + r.get('name', '') for r in managed}
-        self.rows = [r for r in combined.values() if not (r.get('runtime') == 'codex' and
-                     r.get('agent_id') in aliases and not r.get('thread'))]
+        aliases = {'codex-' + r.get('name', ''): 'openai:' + r.get('name', '') for r in managed}
+        dropped = [r for r in combined.values() if r.get('runtime') == 'codex' and r.get('agent_id') in aliases
+                   and not r.get('thread')]
+        rows = [r for r in combined.values() if not any(r is d for d in dropped)]
+        # an ah alias row (codex-<name>, no thread) folds into its supervisor row, keeping ah's classification and
+        # provenance: it is the row the owner cap counts (inspection F1)
+        for alias in dropped:
+            target = next((r for r in rows if r.get('agent_id') == aliases[alias['agent_id']]), None)
+            if target is None or alias.get('source') != 'ah':
+                continue
+            for field in ('source', 'role', 'session', 'owner', 'decision_required', 'disposition', 'parent'):
+                if field in alias:
+                    target[field] = alias[field]
+            target['alias_ids'] = list(target.get('alias_ids') or []) + [alias['agent_id']] + list(alias.get('alias_ids') or [])
+        # freshness of the ah snapshot is tracked apart from runtime freshness: a merged Codex row's own
+        # source_stale must never make a cached ah role look current (code inspection F1)
+        ah_stale = any(r.get('source_stale') for r in self.claude_rows)
+        for r in rows:
+            if r.get('source') != 'ah':  # rows from ah carry the cap's role; Codex rows get the same three roles
+                r['role'] = codex_role(r)
+            else:
+                r['ah_stale'] = ah_stale
+        _serves(rows)
+        self.rows = rows
         self.hub.snapshot('owners', self.rows)
 
     def tick(self, now: float):
@@ -672,7 +799,12 @@ class Owners(Collector):
                     "state": state[:24], "severity": str(row.get("severity") or "info")[:8],
                     "last_activity": str(row.get("last_activity") or "")[:40], "idle_s": idle,
                     "last_item": self.tailer.last_for(runtime, thread or self.session, worker) if self.tailer else None,
-                    "disposition": _disposition(row.get("disposition"))}
+                    "disposition": _disposition(row.get("disposition")),
+                    "owner": row.get("owner") is True, "decision_required": row.get("decision_required") is True,
+                    "parent": parent if isinstance(parent := row.get("parent"), str)
+                    and re.fullmatch(r"[A-Za-z0-9_-]{1,40}", parent) else None,
+                    "source": "ah", "session": ev.short(self.session, 64)}
+            item["role"] = owner_role(item)
             rows.append(item)
             previous = self.states.get(agent)
             if previous and previous != state:
@@ -682,9 +814,17 @@ class Owners(Collector):
                                          subject={"ticket": item["ticket"]},
                                          severity="high" if state.startswith(("DROPPED", "SILENT")) else "info"))
             self.states[agent] = state
-        rows.sort(key=lambda r: (r["state"] not in ("live", "working"), r["idle_s"] or 0))
+        # classified before the cap: an owner holding a slot (SILENT, quiet, idle-helper) is never cut by the 60-row limit
+        # then rows that need attention (DROPPED, SILENT, decision required), so an alarm is not cut either
+        rows.sort(key=lambda r: (0 if r["role"] == "live" else 1 if r["decision_required"] or r["state"].startswith(("DROPPED", "SILENT"))
+                                 else 2 if r["role"] == "parked" else 3, r["idle_s"] or 0))
         self.claude_rows = rows[:60]
         self.publish()
+        if owner_policy().get("fallback"):
+            # the panel still counts, but by default owner/helper types: say so instead of drifting silently
+            self.health.error("owner-policy", "model_tiers caps unreadable: owner/helper types are defaults; count may differ from the cap")
+        else:
+            self.health.ok("owner-policy", "owner/helper types from model_tiers caps")
         return f"{len(rows)} owners"
 
     def codex_rows(self, now: float) -> list[dict]:

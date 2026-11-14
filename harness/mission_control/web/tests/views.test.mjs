@@ -245,7 +245,7 @@ test('coverage names a control for every route and control the page has', () => 
 });
 
 test('the summary tiles show the live owner count and the dashboard-archived count when there is one', () => {
-  const s = { now: NOW, owners: [{ state: 'live', severe: false }, { state: 'live', severe: false }, { state: 'done', severe: false }], asks: [], messages: [], decisions: {}, initiatives: [],
+  const s = { now: NOW, owners: [{ state: 'live', severe: false, role: 'live', source: 'ah' }, { state: 'live', severe: false, role: 'live', source: 'ah' }, { state: 'done', severe: false, role: 'parked', source: 'ah' }], asks: [], messages: [], decisions: {}, initiatives: [],
     ledger: ledger({ requirements: { items: [{ id: 'r', text: 'mine', bucket: 'archived', rule: 'M', user_sourced: true, reason: 'x', at: iso(5) }] } }) };
   const t = text(v.tiles(s, () => {}));
   assert.match(t, /Owners live[\s\S]*|2[\s\S]*Owners live/);
