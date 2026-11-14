@@ -234,6 +234,18 @@ class ResponseTests(Base):
             with self.assertRaises(drive.DriveError, msg=src):
                 drive.respond(self.home, "solve", "UNOWNED", "park", source=src, now=NOW)
 
+    def test_response_park_needs_user_words_that_park(self):
+        """Receipt F1: a verified user turn naming the goal is not enough; its words must park it, unnegated."""
+        import mission_coverage as mc
+        sess = "baab765b-d85c-46b4-b7b9-588eb912c770/11111111-2222-4333-8444-555555555555"
+        with mock.patch.object(mc, "verify_user_source", return_value=True):
+            for words in ("never park solve", "do not defer solve", "solve is the top priority", "don't pause solve",
+                          "solve: keep going, no hold"):
+                with self.assertRaises(drive.DriveError, msg=words):
+                    drive.respond(self.home, "solve", "UNOWNED", "park", source=f'user:{sess} "{words}"', now=NOW)
+            for words in ("park solve until Monday", "defer solve", "put solve on hold"):
+                drive.respond(self.home, "solve", "UNOWNED", "park", source=f'user:{sess} "{words}"', now=NOW)
+
     def test_response_stale_episode_not_counted(self):
         snap = drive.with_episodes(self.home, drive.assess(self.home, MISSION, NOW, owner_rows=[], with_git=False), prev={})
         ort._append(drive._safe_dir(self.home) / "responses.jsonl",

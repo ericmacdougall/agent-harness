@@ -270,7 +270,13 @@ def chooses_bypass(source) -> bool:
         excerpt = str(provenance.parse_source(source).get("excerpt") or "")
     except Exception:  # noqa: BLE001
         return False
-    return bool(BYPASS_WORD.search(excerpt)) and not NEGATION.search(excerpt) and user_decided(source)
+    return affirms(excerpt, BYPASS_WORD) and user_decided(source)
+
+
+def affirms(excerpt: str, word: "re.Pattern") -> bool:
+    """True when the user's excerpt states the intent `word` names and carries no negation anywhere (a negated or
+    mixed excerpt never authorizes: "never park solve", "don't bypass")."""
+    return bool(word.search(excerpt or "")) and not NEGATION.search(excerpt or "")
 
 
 def claude_bin() -> str:
@@ -683,13 +689,13 @@ def owner_prompt(home: Path, goal: str, resume: bool = False) -> str:
         f"`{cmd} task move {g} --task tN --to planned --ac-file F`.",
         f"  2. Get adversarial convergence before building: spawn a reviewer one rung above the builder; record each "
         f"round with `{cmd} task round {g} --task tN --reviewer <agent id> --verdict ACCEPT|REJECT`; then "
-        f"`task move --to converged --reviewer <id> --verdict ACCEPT`. Two rejected rounds = a loop: "
-        f"`task break --how redesign|escalate|park`.",
+        f"`{cmd} task move {g} --task tN --to converged --reviewer <id> --verdict ACCEPT`. Two rejected rounds = a "
+        f"loop: `{cmd} task break {g} --task tN --how redesign|escalate|park`.",
         "  3. Delegate building, fixing and testing to sub-agents; integrate, verify and push each green step.",
         f"  4. Prove progress at least every 30 minutes: `{cmd} beat {g} --evidence commit:<sha> "
         f"--evidence wal:<id> --next \"...\"`. Post checkpoints to the ticket.",
         f"  5. A blocked facet is a help request, never a pause: `{cmd} task move {g} --task tN --to blocked "
-        f"--help \"what you need\"`, then keep working every other task.",
+        f"--need \"what you need\"`, then keep working every other task.",
         f"  6. Before you end a turn: `{cmd} checkpoint {g} --text \"...\"`. The Stop hook refuses an end while "
         "any task is actionable. You will be resumed automatically.",
         "Follow CLAUDE.md, the repo rules and every guard. Done means deployed to live and tested live; only the user "

@@ -481,6 +481,32 @@ class TickTests(Base):
         self.assertIn("trusted", (self.home / ".agent-harness/owners/solve/launch.log").read_text())
 
 
+class CharterTests(Base):
+    def test_charter_commands_parse(self):
+        """Receipt F2: every command the charter tells the owner to run parses with the real CLI parser."""
+        import re as _re
+        import shlex
+        self.init()
+        text = ort.owner_prompt(self.home, "solve", resume=False)
+        cmds = [c for c in _re.findall(r"`([^`]+)`", text) if "owner_rt" in c]
+        self.assertGreaterEqual(len(cmds), 6, cmds)
+        subs = ("task", "beat", "checkpoint", "show", "init", "prompt", "tick")
+        bare = [c for c in _re.findall(r"`([^`]+)`", text) if c.split() and c.split()[0] in subs]
+        self.assertEqual(bare, [], "charter commands must name the script so they run as written")
+        parser = ort.build_parser()
+        for c in cmds:
+            words = shlex.split(_re.sub(r"(\w+)(?:\|\w+)+", r"\1", _re.sub(r"<[^>]*>", "x", c)))
+            i = next(n for n, w in enumerate(words) if w.endswith("owner_rt.py"))
+            argv = [w for w in words[i + 1:]]
+            with mock.patch("sys.stderr"):
+                try:
+                    parser.parse_args(argv)
+                except SystemExit as exc:
+                    self.fail(f"charter command does not parse: {c} ({exc})")
+        self.assertIn("--need", text)
+        self.assertNotIn("--help \"", text)
+
+
 class HardeningTests(Base):
     """Red-team r1 fixes: M1 M2 M3 M7 M8 m4."""
 

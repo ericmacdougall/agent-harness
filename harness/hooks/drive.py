@@ -468,6 +468,8 @@ def episode_start(home: Path, key: str, now: float) -> float:
 
 
 PRE_EPISODE_S = 3600
+PARK_INTENT = re.compile(r"\b(?:park|parked|parking|defer|deferred|deferring|pause|paused|hold|on hold|shelve|"
+                         r"shelved|later|deprioriti[sz]e[d]?|backburner|back burner)\b", re.I)
 
 
 def episode_on_record(home: Path, key: str) -> bool:
@@ -511,6 +513,8 @@ def check_response(home: Path, goal_id: str, cond: str, kind: str, ref: str, sou
         excerpt = mc.source_excerpt(source)
         if goal_id not in excerpt.lower() and not mc.names_goal(excerpt, goal):
             return f"the user's words do not name goal {goal_id}"
+        if not ort.affirms(excerpt, PARK_INTENT):  # receipt F1: naming the goal is not authorizing the park
+            return "the user's words must themselves park or defer the goal (no negation)"
         return ""
     return "unknown response kind"
 
