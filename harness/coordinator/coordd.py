@@ -454,7 +454,10 @@ def lane_review(con, task: dict, root: Path) -> tuple[bool, str]:
     if not verdict:
         tail = ((err.strip() or out.strip()).splitlines() or ["no output"])[-1][:300]
         con.execute("UPDATE effects SET state='failed', detail=?, updated=? WHERE key=?", (tail, now_iso(), key))
-        return False, f"review did not produce a receipt (peer_review exit {code}): {why or tail}"
+        detail = printable(err.strip()[-1500:].replace("\n", " | "), 1500)
+        if "Packet lint failed" in err:  # the owner's packet is at fault: blocked with the lint lines, not a failure
+            return False, f"blocked-unavailable: the review packet failed lint, so no reviewer ran. {detail}"
+        return False, f"review did not produce a receipt (peer_review exit {code}): {why or tail}. {detail}"
     con.execute("UPDATE effects SET state='done', detail=?, updated=? WHERE key=?",
                 (f"{verdict} ({receipt.name})", now_iso(), key))
     return True, (f"REVIEW {verdict} for {repo}#{pr} at head {head} (owner {spec['owner']}).\n"
